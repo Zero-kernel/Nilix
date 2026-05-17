@@ -162,18 +162,23 @@ impl WaitQueue {
             return WaitOutcome::Closed;
         }
 
-        // 注册超时
+        // R158-1 FIX: register under IRQ-disable to prevent deadlock with
+        // process_waitqueue_timeouts() acquiring TIMED_WAITERS from timer IRQ.
         if let Some(deadline) = deadline_tick {
             ensure_waitqueue_timer_registered();
-            register_timed_wait(self as *const _ as usize, pid, deadline);
+            interrupts::without_interrupts(|| {
+                register_timed_wait(self as *const _ as usize, pid, deadline);
+            });
         }
 
         // 触发调度，让出CPU
         kernel_core::force_reschedule();
 
-        // 唤醒后清理超时登记
+        // R158-1 FIX: cancel under IRQ-disable (same lock ordering as register).
         if deadline_tick.is_some() {
-            cancel_timed_wait(self as *const _ as usize, pid);
+            interrupts::without_interrupts(|| {
+                cancel_timed_wait(self as *const _ as usize, pid);
+            });
         }
 
         // 检查是否因超时唤醒
