@@ -2140,6 +2140,29 @@ impl SocketTable {
         // Build UDP datagram
         let datagram = build_udp_datagram(src_ip, dst_ip, local_port, dst_port, payload)?;
 
+        // R158-2 FIX: Seed conntrack so reply packets are classified as ESTABLISHED.
+        // Use the IP that will appear in the outgoing IP header (network_config().our_ip)
+        // rather than the socket-layer src_ip, which may be 0.0.0.0 for unbound sockets.
+        #[cfg(feature = "conntrack")]
+        {
+            use crate::conntrack::ct_process_udp;
+            let ct_src = if src_ip == crate::Ipv4Addr([0, 0, 0, 0]) {
+                crate::stack::network_config().our_ip
+            } else {
+                src_ip
+            };
+            let now_ms = self.time_wait_now();
+            let _ = ct_process_udp(
+                sock.net_ns_id.0,
+                ct_src,
+                dst_ip,
+                local_port,
+                dst_port,
+                payload.len(),
+                now_ms,
+            );
+        }
+
         // Update statistics
         sock.tx_bytes
             .fetch_add(payload.len() as u64, Ordering::Relaxed);

@@ -754,10 +754,14 @@ fn process_tcp(
         // R157-10 FIX: Track the outbound reply through conntrack so
         // the completing ACK advances SynRecv→Established. Without this,
         // conntrack stays at SynRecv until the first data exchange.
+        // R158-11 FIX: Use parse_tcp_header instead of fragile byte offset.
         #[cfg(feature = "conntrack")]
         {
             use crate::conntrack::ct_process_tcp;
-            let resp_flags = if resp_seg.len() >= 14 { resp_seg[13] } else { 0 };
+            use crate::tcp::parse_tcp_header;
+            let resp_flags = parse_tcp_header(&resp_seg)
+                .map(|h| h.flags)
+                .unwrap_or(0);
             let _ = ct_process_tcp(
                 net_ns_id.0,
                 ip_hdr.dst,
