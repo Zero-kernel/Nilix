@@ -589,21 +589,23 @@ fn allocate_user_stack_tracked(
                     .allocate_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
+                // R158-9 FIX: Reserve tracking space BEFORE map_page so a failed
+                // reservation cannot leave a mapped-but-untracked page.
+                if tracked.try_reserve(1).is_err() || stack_mapped.try_reserve(1).is_err() {
+                    frame_alloc.deallocate_frame(frame);
+                    return Err(ElfLoadError::OutOfMemory);
+                }
+
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
                     klog!(Error,
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
                     );
-                    // Z-10 fix: 释放刚分配但未映射成功的帧
-                    // 调用方会使用 tracked 回滚所有已成功映射的页
                     frame_alloc.deallocate_frame(frame);
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                // Z-10 fix: 追加到本段和全局追踪向量
-                // R155-4 FIX: Fallible push to avoid kernel panic on OOM
-                tracked.try_reserve(1).map_err(|_| ElfLoadError::OutOfMemory)?;
                 stack_mapped.push((page, frame));
                 tracked.push((page, frame));
             }

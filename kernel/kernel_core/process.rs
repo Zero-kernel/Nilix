@@ -632,6 +632,13 @@ pub struct Process {
     /// 子进程列表
     pub children: Vec<ProcessId>,
 
+    /// R158-4 FIX: Reserved child slots not yet committed (prevents concurrent capacity theft).
+    pub children_reserved: usize,
+
+    /// R158-4 FIX: Set when reparent_orphans cannot push a child into this process's
+    /// children list. Signals sys_wait to perform a PROCESS_TABLE fallback scan.
+    pub children_incomplete: bool,
+
     /// CPU时间统计（毫秒）
     pub cpu_time: u64,
 
@@ -845,6 +852,8 @@ impl Process {
             pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
             children: Vec::new(),
+            children_reserved: 0,
+            children_incomplete: false,
             cpu_time: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
@@ -1271,6 +1280,85 @@ fn allocate_global_pid(
     Err(ProcessCreateError::PidExhausted)
 }
 
+/// R158-4 FIX: Reserve a child slot in the parent's children Vec BEFORE allocating
+/// any resources. Uses a reservation counter to prevent concurrent capacity theft.
+/// Returns Ok(()) on success or if ppid == 0 (kernel threads have no parent).
+pub fn reserve_child_slot(ppid: ProcessId) -> Result<(), ProcessCreateError> {
+    if ppid == 0 {
+        return Ok(());
+    }
+    let table = PROCESS_TABLE.lock();
+    if let Some(Some(parent_arc)) = table.get(ppid) {
+        let mut parent = parent_arc.lock();
+        let needed_capacity = parent.children.len() + parent.children_reserved + 1;
+        let current_capacity = parent.children.capacity();
+        if current_capacity < needed_capacity {
+            let additional = needed_capacity - current_capacity;
+            parent
+                .children
+                .try_reserve(additional)
+                .map_err(|_| ProcessCreateError::PidExhausted)?;
+        }
+        parent.children_reserved += 1;
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+/// R158-4 FIX: Commit a previously reserved child slot — push is infallible
+/// because capacity was pre-reserved.
+pub fn commit_child_slot(ppid: ProcessId, child_pid: ProcessId) {
+    if ppid == 0 {
+        return;
+    }
+    let table = PROCESS_TABLE.lock();
+    if let Some(Some(parent_arc)) = table.get(ppid) {
+        let mut parent = parent_arc.lock();
+        if parent.children_reserved > 0 {
+            parent.children_reserved -= 1;
+        }
+        parent.children.push(child_pid);
+    }
+}
+
+/// R158-4 FIX: Cancel a child-slot reservation on any error path before commit.
+pub fn cancel_child_slot(ppid: ProcessId) {
+    if ppid == 0 {
+        return;
+    }
+    let table = PROCESS_TABLE.lock();
+    if let Some(Some(parent_arc)) = table.get(ppid) {
+        let mut parent = parent_arc.lock();
+        if parent.children_reserved > 0 {
+            parent.children_reserved -= 1;
+        }
+    }
+}
+
+/// RAII guard that cancels a child-slot reservation on Drop unless committed.
+struct ChildSlotGuard {
+    ppid: ProcessId,
+    committed: bool,
+}
+
+impl ChildSlotGuard {
+    fn new(ppid: ProcessId) -> Self {
+        Self { ppid, committed: false }
+    }
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ChildSlotGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            cancel_child_slot(self.ppid);
+        }
+    }
+}
+
 /// 创建新进程
 ///
 /// # Arguments
@@ -1288,6 +1376,11 @@ pub fn create_process(
     ppid: ProcessId,
     priority: Priority,
 ) -> Result<ProcessId, ProcessCreateError> {
+    // R158-4 FIX: Reserve parent child slot BEFORE allocating any resources.
+    // If reservation fails, return ENOMEM with no cleanup needed.
+    reserve_child_slot(ppid)?;
+    let mut slot_guard = ChildSlotGuard::new(ppid);
+
     // R106-11 (P0-4): Allocate PID via recycling scan.
     // Lock ordering: NEXT_PID_HINT → PROCESS_TABLE (consistent with all paths).
     //
@@ -1428,21 +1521,37 @@ pub fn create_process(
     {
         let mut table = PROCESS_TABLE.lock();
 
-        // 确保进程表有足够的空间存储新进程
-        // PID 直接作为索引使用，因此表长度需要 >= pid + 1
-        while table.len() <= pid {
-            table.push(None);
+        // R158-5 FIX: fallible table growth — clean up all resources on failure.
+        if table.len() <= pid {
+            let needed = pid + 1 - table.len();
+            if table.try_reserve(needed).is_err() {
+                drop(table);
+                let chain = process.lock().pid_ns_chain.clone();
+                if !chain.is_empty() {
+                    crate::pid_namespace::detach_pid_chain(&chain, pid);
+                }
+                free_kernel_stack(pid, stack_base);
+                return Err(ProcessCreateError::PidExhausted);
+            }
+            while table.len() <= pid {
+                table.push(None);
+            }
         }
 
         // 将新进程存储在其 PID 对应的索引位置
         table[pid] = Some(process.clone());
 
-        // 如果有父进程，将此进程添加到父进程的子进程列表
+        // R158-4 FIX: Commit pre-reserved child slot — push is infallible.
         if ppid > 0 {
-            if let Some(Some(parent)) = table.get(ppid) {
-                parent.lock().children.push(pid);
+            if let Some(Some(parent_arc)) = table.get(ppid) {
+                let mut p = parent_arc.lock();
+                if p.children_reserved > 0 {
+                    p.children_reserved -= 1;
+                }
+                p.children.push(pid);
             }
         }
+        slot_guard.commit();
     }
 
     // Safe to release now — the PID slot is occupied in PROCESS_TABLE
@@ -1507,6 +1616,10 @@ pub fn create_process_in_namespace(
     priority: Priority,
     target_ns: Arc<crate::pid_namespace::PidNamespace>,
 ) -> Result<ProcessId, ProcessCreateError> {
+    // R158-4 FIX: Reserve parent child slot BEFORE allocating any resources.
+    reserve_child_slot(ppid)?;
+    let mut slot_guard = ChildSlotGuard::new(ppid);
+
     // Allocate PID and kernel stack (same as create_process)
     // R106-11 (P0-4): Allocate PID via recycling scan with AlreadyMapped retry.
     let mut hint_guard = NEXT_PID_HINT.lock();
@@ -1607,17 +1720,36 @@ pub fn create_process_in_namespace(
     {
         let mut table = PROCESS_TABLE.lock();
 
-        while table.len() <= pid {
-            table.push(None);
+        // R158-5 FIX: fallible table growth — clean up all resources on failure.
+        if table.len() <= pid {
+            let needed = pid + 1 - table.len();
+            if table.try_reserve(needed).is_err() {
+                drop(table);
+                let chain = process.lock().pid_ns_chain.clone();
+                if !chain.is_empty() {
+                    crate::pid_namespace::detach_pid_chain(&chain, pid);
+                }
+                free_kernel_stack(pid, stack_base);
+                return Err(ProcessCreateError::PidExhausted);
+            }
+            while table.len() <= pid {
+                table.push(None);
+            }
         }
 
         table[pid] = Some(process.clone());
 
+        // R158-4 FIX: Commit pre-reserved child slot — push is infallible.
         if ppid > 0 {
-            if let Some(Some(parent)) = table.get(ppid) {
-                parent.lock().children.push(pid);
+            if let Some(Some(parent_arc)) = table.get(ppid) {
+                let mut p = parent_arc.lock();
+                if p.children_reserved > 0 {
+                    p.children_reserved -= 1;
+                }
+                p.children.push(pid);
             }
         }
+        slot_guard.commit();
     }
 
     // Safe to release now — the PID slot is occupied in PROCESS_TABLE
@@ -3246,8 +3378,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             proc.state = ProcessState::Zombie;
             proc.exit_code = Some(exit_code);
             parent_pid = proc.ppid;
-            children_to_reparent = proc.children.clone();
-            proc.children.clear();
+            // R158-10 FIX: take() instead of clone()+clear() — avoids infallible alloc on exit.
+            children_to_reparent = core::mem::take(&mut proc.children);
             // 获取 clear_child_tid 信息用于线程退出通知
             clear_child_tid = proc.clear_child_tid;
             tgid = proc.tgid;
@@ -3415,11 +3547,11 @@ fn reparent_orphans(orphans: &[ProcessId]) {
         if let Some(adopter) = get_process(adopt_pid) {
             let mut adopter_proc = adopter.lock();
             if !adopter_proc.children.contains(&child_pid) {
-                // R157-7 FIX: Fallible push — skip on OOM. Orphan is still
-                // reparented (ppid set above), just not in children list.
-                // wait() will still find it via PROCESS_TABLE scan.
                 if adopter_proc.children.try_reserve(1).is_ok() {
                     adopter_proc.children.push(child_pid);
+                } else {
+                    // R158-4 Phase 2: Signal sys_wait to use PROCESS_TABLE fallback scan.
+                    adopter_proc.children_incomplete = true;
                 }
             }
         }

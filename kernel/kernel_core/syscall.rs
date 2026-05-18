@@ -436,6 +436,24 @@ fn stdin_prepare_to_wait() -> bool {
     true
 }
 
+/// R158-8 FIX: Cancel a prepared wait when data arrives on the double-check path.
+/// Removes PID from STDIN_WAITERS and resets state to Ready.
+fn stdin_cancel_wait() {
+    if let Some(pid) = current_pid() {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut waiters = STDIN_WAITERS.lock();
+            waiters.retain(|&p| p != pid);
+
+            if let Some(proc_arc) = get_process(pid) {
+                let mut proc = proc_arc.lock();
+                if proc.state == ProcessState::Blocked {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+        });
+    }
+}
+
 /// 完成等待（第二阶段）
 ///
 /// 在 prepare_to_wait 后调用，实际让出 CPU。
@@ -2859,13 +2877,17 @@ fn sys_clone(
         // the child lock block re-acquired parent.lock() for CLONE_FILES
         // and cap_table cloning, violating the parent→child lock order
         // used in enforce_lsm_task_fork().
+        // R158-7 FIX (LOW): Fallible fd_table snapshot (bounded by MAX_FD).
         let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> =
             if flags & CLONE_FILES != 0 {
-                parent
-                    .fd_table
-                    .iter()
-                    .map(|(&fd, desc)| (fd, desc.clone_box()))
-                    .collect()
+                let mut snap = Vec::new();
+                if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
+                    return Err(SyscallError::ENOMEM);
+                }
+                for (&fd, desc) in parent.fd_table.iter() {
+                    snap.push((fd, desc.clone_box()));
+                }
+                snap
             } else {
                 Vec::new()
             };
@@ -4409,20 +4431,49 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         let child_list = {
             let mut proc = parent.lock();
             if proc.children.is_empty() {
-                return Err(SyscallError::ECHILD);
+                if !proc.children_incomplete {
+                    return Err(SyscallError::ECHILD);
+                }
+                // R158-4 Phase 2: children_incomplete is set — do PROCESS_TABLE fallback scan.
+                drop(proc);
+                let mut found = Vec::new();
+                {
+                    let table = crate::process::PROCESS_TABLE.lock();
+                    for (idx, slot) in table.iter().enumerate() {
+                        if let Some(proc_arc) = slot {
+                            let p = proc_arc.lock();
+                            if p.ppid == pid && idx != pid {
+                                if found.try_reserve(1).is_ok() {
+                                    found.push(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                if found.is_empty() {
+                    // No orphan children found — clear stale flag and return ECHILD.
+                    let mut proc = parent.lock();
+                    proc.children_incomplete = false;
+                    return Err(SyscallError::ECHILD);
+                }
+                // Re-acquire and set wait state.
+                let mut proc = parent.lock();
+                proc.state = ProcessState::Blocked;
+                proc.waiting_child = Some(0);
+                found
+            } else {
+                // Normal fast path: use children list.
+                proc.state = ProcessState::Blocked;
+                proc.waiting_child = Some(0);
+                let mut snapshot = Vec::new();
+                if snapshot.try_reserve_exact(proc.children.len()).is_err() {
+                    proc.state = ProcessState::Ready;
+                    proc.waiting_child = None;
+                    return Err(SyscallError::ENOMEM);
+                }
+                snapshot.extend_from_slice(&proc.children);
+                snapshot
             }
-            // 先标记为等待状态
-            proc.state = ProcessState::Blocked;
-            proc.waiting_child = Some(0); // 0 表示等待任意子进程
-            // R156-14 FIX: Fallible clone to avoid panic on extreme OOM.
-            let mut snapshot = Vec::new();
-            if snapshot.try_reserve_exact(proc.children.len()).is_err() {
-                proc.state = ProcessState::Ready;
-                proc.waiting_child = None;
-                return Err(SyscallError::ENOMEM);
-            }
-            snapshot.extend_from_slice(&proc.children);
-            snapshot
         };
 
         // 查找已终止的僵尸子进程
@@ -5207,8 +5258,7 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // R23-5 fix: 阻塞模式 - 如果没有输入则等待
     // 使用 prepare-check-finish 模式避免丢失唤醒竞态
     if fd == 0 {
-        // Debug: print heap stats before allocation
-        kprintln!("[sys_read] fd=0 count={}", count);
+        // R158-I8 FIX: removed unconditional debug kprintln (log spam + info disclosure).
 
         // R156-3 FIX: Fallible allocation — infallible vec! panics on OOM.
         let mut tmp = Vec::new();
@@ -5231,10 +5281,8 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
             // 二次检查：入队后可能有新数据到达
             let bytes_read = drivers::keyboard_read(&mut tmp);
             if bytes_read > 0 {
-                // 有数据了，取消等待并返回
-                // 注意：我们已经在等待队列中，但进程已被标记为 Blocked
-                // 下次唤醒会将我们设为 Ready，但我们不会真正睡眠
-                // 这是安全的：最坏情况是多一次调度
+                // R158-8 FIX: cancel wait (dequeue + Blocked→Ready) before return.
+                stdin_cancel_wait();
                 copy_to_user(buf, &tmp[..bytes_read])?;
                 return Ok(bytes_read);
             }
@@ -5376,7 +5424,9 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     // P1-6 FIX: Removed outer UserAccessGuard — copy_from_user_safe creates
     // its own per-chunk guard internally.  An outer guard prevents the
     // inter-chunk interrupt-restore window, widening the SMAP-bypass.
-    let mut iov_array: Vec<Iovec> = Vec::with_capacity(iovcnt);
+    // R158-9 FIX: Fallible allocation (bounded by IOV_MAX but policy requires try_reserve).
+    let mut iov_array: Vec<Iovec> = Vec::new();
+    iov_array.try_reserve_exact(iovcnt).map_err(|_| SyscallError::ENOMEM)?;
     for i in 0..iovcnt {
         // R97-1 FIX: Use checked_mul/checked_add to prevent integer overflow
         let entry_offset = i
@@ -5993,12 +6043,17 @@ fn sys_brk(addr: usize) -> SyscallResult {
                             // 1) unmap pages and collect frames
                             // 2) cross-CPU TLB shootdown
                             // 3) deallocate frames after TLB is flushed
-                            // Without step 2, CLONE_VM siblings on other CPUs may
-                            // retain stale TLB entries pointing to freed frames.
+                            // R158-12 + R158-6 FIX: Fallible rollback Vec; immediate free on OOM.
                             let mut frames_to_free = Vec::new();
+                            let _ = frames_to_free.try_reserve(mapped_pages.len());
                             for &rollback_page in mapped_pages.iter().rev() {
                                 if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                    frames_to_free.push(freed_frame);
+                                    if frames_to_free.try_reserve(1).is_ok() {
+                                        frames_to_free.push(freed_frame);
+                                    } else {
+                                        mm::flush_current_as_page(rollback_page.start_address());
+                                        frame_alloc.deallocate_frame(freed_frame);
+                                    }
                                 }
                             }
                             if !frames_to_free.is_empty() {
@@ -6025,12 +6080,17 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     {
                         // Free the frame we just allocated
                         frame_alloc.deallocate_frame(frame);
-                        // R127-2 FIX: 3-phase rollback — collect frames, TLB
-                        // shootdown, then deallocate.
+                        // R127-2 + R158-6 FIX: 3-phase rollback; immediate free on OOM.
                         let mut frames_to_free = Vec::new();
+                        let _ = frames_to_free.try_reserve(mapped_pages.len());
                         for &rollback_page in mapped_pages.iter().rev() {
                             if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                frames_to_free.push(freed_frame);
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(freed_frame);
+                                } else {
+                                    mm::flush_current_as_page(rollback_page.start_address());
+                                    frame_alloc.deallocate_frame(freed_frame);
+                                }
                             }
                         }
                         if !frames_to_free.is_empty() {
@@ -6045,6 +6105,35 @@ fn sys_brk(addr: usize) -> SyscallResult {
                         return Err(SyscallError::ENOMEM);
                     }
 
+                    // R158-6 FIX: fallible push — unmap+free on OOM.
+                    if mapped_pages.try_reserve(1).is_err() {
+                        if let Ok(freed) = manager.unmap_page(page) {
+                            mm::flush_current_as_page(page.start_address());
+                            frame_alloc.deallocate_frame(freed);
+                        }
+                        let mut frames_to_free = Vec::new();
+                        let _ = frames_to_free.try_reserve(mapped_pages.len());
+                        for &rollback_page in mapped_pages.iter().rev() {
+                            if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(freed_frame);
+                                } else {
+                                    mm::flush_current_as_page(rollback_page.start_address());
+                                    frame_alloc.deallocate_frame(freed_frame);
+                                }
+                            }
+                        }
+                        if !frames_to_free.is_empty() {
+                            mm::flush_current_as_range(
+                                VirtAddr::new(old_top as u64),
+                                grow_size,
+                            );
+                            for f in frames_to_free {
+                                frame_alloc.deallocate_frame(f);
+                            }
+                        }
+                        return Err(SyscallError::ENOMEM);
+                    }
                     mapped_pages.push(page);
                 }
                 Ok(())
@@ -6407,17 +6496,19 @@ fn sys_mmap(
                 let frame = match frame_alloc.allocate_frame() {
                     Some(f) => f,
                     None => {
-                        // R127-2 FIX: 3-phase rollback — collect frames, TLB
-                        // shootdown, then deallocate. Without cross-CPU TLB flush,
-                        // CLONE_VM siblings retain stale TLB entries to freed frames.
+                        // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
                         let flush_len = mapped.len() * 0x1000;
                         let mut frames_to_free = vec::Vec::new();
+                        let _ = frames_to_free.try_reserve(mapped.len());
                         for (cleanup_page, cleanup_frame) in mapped.drain(..) {
                             if manager.unmap_page(cleanup_page).is_ok() {
-                                frames_to_free.push(cleanup_frame);
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(cleanup_frame);
+                                } else {
+                                    mm::flush_current_as_page(cleanup_page.start_address());
+                                    frame_alloc.deallocate_frame(cleanup_frame);
+                                }
                             }
-                            // unmap 失败时不释放帧，因为映射可能仍然存在
-                            // 这会导致帧泄漏，但比 UAF 更安全
                         }
                         if !frames_to_free.is_empty() {
                             mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
@@ -6436,17 +6527,20 @@ fn sys_mmap(
 
                 // 映射页，失败时回滚
                 if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
-                    // 释放当前分配但未映射的帧
                     frame_alloc.deallocate_frame(frame);
-                    // R127-2 FIX: 3-phase rollback — collect frames, TLB
-                    // shootdown, then deallocate.
+                    // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
                     let flush_len = mapped.len() * 0x1000;
                     let mut frames_to_free = vec::Vec::new();
+                    let _ = frames_to_free.try_reserve(mapped.len());
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
                         if manager.unmap_page(cleanup_page).is_ok() {
-                            frames_to_free.push(cleanup_frame);
+                            if frames_to_free.try_reserve(1).is_ok() {
+                                frames_to_free.push(cleanup_frame);
+                            } else {
+                                mm::flush_current_as_page(cleanup_page.start_address());
+                                frame_alloc.deallocate_frame(cleanup_frame);
+                            }
                         }
-                        // unmap 失败时不释放帧，因为映射可能仍然存在
                     }
                     if !frames_to_free.is_empty() {
                         mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
@@ -6457,22 +6551,23 @@ fn sys_mmap(
                     return Err(SyscallError::ENOMEM);
                 }
 
-                // R156-3 FIX: Fallible push for mmap page tracking.
-                // R157-1 FIX: Unmap current page before frame dealloc —
-                // map_page() succeeded, so without unmap the PTE dangles
-                // to a freed frame (cross-process memory corruption).
+                // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
                 if mapped.try_reserve(1).is_err() {
-                    // Unmap current page first; only free frame if unmap succeeded.
-                    // On unmap failure, leak the frame — safer than freeing a mapped frame.
                     if manager.unmap_page(page).is_ok() {
                         mm::flush_current_as_page(page.start_address());
                         frame_alloc.deallocate_frame(frame);
                     }
                     let flush_len = mapped.len() * 0x1000;
                     let mut frames_to_free = vec::Vec::new();
+                    let _ = frames_to_free.try_reserve(mapped.len());
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
                         if manager.unmap_page(cleanup_page).is_ok() {
-                            frames_to_free.push(cleanup_frame);
+                            if frames_to_free.try_reserve(1).is_ok() {
+                                frames_to_free.push(cleanup_frame);
+                            } else {
+                                mm::flush_current_as_page(cleanup_page.start_address());
+                                frame_alloc.deallocate_frame(cleanup_frame);
+                            }
                         }
                     }
                     if !frames_to_free.is_empty() {
@@ -7059,16 +7154,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     if is_target_prot_none && !real_regions.is_empty() {
         for &(region_base, region_len) in &real_regions {
             // Step 1: Unmap pages and free frames (COW-aware).
-            // Same pattern as sys_munmap Phase 2.
-            let _unmap_result: Result<(), SyscallError> = unsafe {
+            // R158-7 FIX: fallible frames_to_free with immediate free on OOM.
+            unsafe {
                 use mm::memory::FrameAllocator;
 
-                with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+                with_current_manager(VirtAddr::new(0), |manager| {
                     use alloc::vec::Vec;
                     use x86_64::structures::paging::PhysFrame;
 
                     let mut frame_alloc = FrameAllocator::new();
                     let mut frames_to_free: Vec<PhysFrame> = Vec::new();
+                    let _ = frames_to_free.try_reserve(region_len / 0x1000);
 
                     for offset in (0..region_len).step_by(0x1000) {
                         let page = Page::containing_address(
@@ -7091,34 +7187,32 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                 true
                             };
                             if should_free {
-                                frames_to_free.push(frame);
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(frame);
+                                } else {
+                                    mm::flush_current_as_page(page.start_address());
+                                    frame_alloc.deallocate_frame(frame);
+                                }
                             }
                         }
                     }
 
-                    // TLB shootdown then deallocate
-                    mm::flush_current_as_range(
-                        VirtAddr::new(region_base as u64),
-                        region_len,
-                    );
-                    for frame in frames_to_free {
-                        frame_alloc.deallocate_frame(frame);
+                    // Batch TLB shootdown then deallocate deferred frames
+                    if !frames_to_free.is_empty() {
+                        mm::flush_current_as_range(
+                            VirtAddr::new(region_base as u64),
+                            region_len,
+                        );
+                        for frame in frames_to_free {
+                            frame_alloc.deallocate_frame(frame);
+                        }
                     }
-
-                    Ok(())
                 })
             };
 
             // R146-1 FIX: Atomically commit bookkeeping under PROCESS_TABLE
-            // lock and propagate to all CLONE_VM siblings. Only the first
-            // sibling to observe non-PROT_NONE gets did_transition=true and
-            // should uncharge. This prevents two siblings from independently
-            // deciding to uncharge the same region → double-uncharge →
-            // memory.max bypass.
-            //
-            // R146-2 FIX: The atomic function re-reads cgroup_id under lock,
-            // so uncharge uses the post-migration cgroup if migration occurred
-            // during the PT operations above.
+            // lock and propagate to all CLONE_VM siblings.
+            // Charge uses region_len (virtual reservation), not physical frame count.
             let (did_transition, uncharge_cgroup_id) =
                 crate::process::atomic_mprotect_prot_none_transition(
                     pid,
@@ -7366,8 +7460,10 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     let total = insn_size.checked_mul(len).ok_or(SyscallError::EFAULT)?;
     validate_user_ptr(insn_ptr as *const u8, total)?;
 
-    // Read instructions from userspace
-    let mut raw_insns = vec![UserSeccompInsn::default(); len];
+    // R158-3 FIX: Fallible allocation — user-controlled len can exhaust kernel heap.
+    let mut raw_insns = Vec::new();
+    raw_insns.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+    raw_insns.resize(len, UserSeccompInsn::default());
     let raw_bytes =
         unsafe { core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total) };
     copy_from_user(raw_bytes, insn_ptr as *const u8)?;
@@ -7375,8 +7471,9 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     // Decode default action
     let default_action = decode_user_action(prog.default_action, 0)?;
 
-    // Translate all instructions
-    let mut program = Vec::with_capacity(len);
+    // R158-3 FIX: Fallible allocation for translated program.
+    let mut program = Vec::new();
+    program.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
     for insn in raw_insns.iter() {
         program.push(translate_user_insn(insn)?);
     }
