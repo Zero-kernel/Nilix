@@ -299,8 +299,17 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov cr0, rax",
 
         // R158-12 FIX: Zero DR7 to disable all hardware breakpoints.
-        // Prevents debug register state from leaking between processes.
+        // R159-11 FIX: Also zero DR0-DR3 (breakpoint addresses) and DR6
+        // (debug status). DR6 is sticky (Intel SDM Vol 3A §17.4.1) and
+        // must be cleared to prevent stale condition bits leaking to the
+        // next #DB handler invocation. DR0-DR3 could trigger spurious
+        // watchpoints if a future process hits the same virtual address.
         "xor eax, eax",
+        "mov dr0, rax",
+        "mov dr1, rax",
+        "mov dr2, rax",
+        "mov dr3, rax",
+        "mov dr6, rax",
         "mov dr7, rax",
 
         // 加载新上下文从 new_ctx (rcx)

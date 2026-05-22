@@ -54,7 +54,7 @@ use crate::fragment::{
 use crate::get_device;
 use crate::icmp::{
     build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE,
-    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST,
+    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
@@ -638,6 +638,22 @@ fn process_icmp(
             ETHERTYPE_IPV4,
             &ip_packet,
         );
+
+        // R159-14 FIX: Seed conntrack for the outbound echo reply so egress
+        // firewall rules requiring ESTABLISHED state can match it.
+        #[cfg(feature = "conntrack")]
+        {
+            use crate::conntrack::ct_process_icmp;
+            let _ = ct_process_icmp(
+                net_ns_id.0,
+                our_ip,
+                ip_hdr.src,
+                ICMP_TYPE_ECHO_REPLY,
+                0,
+                icmp_reply.len(),
+                now_ms,
+            );
+        }
 
         stats.inc_icmp_echo_tx();
         return ProcessResult::Reply(frame);

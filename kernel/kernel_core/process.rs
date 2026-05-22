@@ -3375,6 +3375,13 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         {
             let mut proc = process.lock();
+            // R159-5 FIX: Idempotency guard — prevent double-terminate from
+            // corrupting cgroup counters (fetch_sub underflow) and namespace
+            // state (double detach_pid_chain). Reachable via concurrent
+            // drain_deferred_irq_terminates + signal delivery.
+            if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+                return;
+            }
             proc.state = ProcessState::Zombie;
             proc.exit_code = Some(exit_code);
             parent_pid = proc.ppid;

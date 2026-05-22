@@ -573,9 +573,12 @@ impl SeccompState {
         result
     }
 
-    /// Add a filter to the stack.
-    pub fn add_filter(&mut self, filter: SeccompFilter) {
+    // R159-6 FIX: Fallible filter addition. The old infallible push + Arc::new
+    // could panic under OOM when a user installs many seccomp filters.
+    pub fn add_filter(&mut self, filter: SeccompFilter) -> Result<(), ()> {
+        self.filters.try_reserve(1).map_err(|_| ())?;
         self.filters.push(Arc::new(filter));
+        Ok(())
     }
 
     /// Check if any filters are active.

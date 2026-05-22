@@ -147,18 +147,15 @@ pub type GetCredentialsCallback = fn() -> Option<Credentials>;
 /// Callback type for getting current tick count (for timestamps)
 pub type GetTicksCallback = fn() -> u64;
 
-/// Context provider state
-struct ContextProvider {
-    get_pid: Option<GetPidCallback>,
-    get_credentials: Option<GetCredentialsCallback>,
-    get_ticks: Option<GetTicksCallback>,
-}
-
-static CONTEXT_PROVIDER: Mutex<ContextProvider> = Mutex::new(ContextProvider {
-    get_pid: None,
-    get_credentials: None,
-    get_ticks: None,
-});
+// R159-7 FIX: Replace Mutex<ContextProvider> with atomic function pointers.
+// These callbacks are set once at init and read on every syscall (hot path).
+// A Mutex on the hot path is both inefficient and structurally IRQ-unsafe:
+// if an IRQ handler ever calls an LSM hook while a syscall holds the lock,
+// deadlock occurs. AtomicU64 stores the fn pointer as a usize — zero-overhead
+// reads with Acquire ordering, no lock contention, no IRQ risk.
+static CTX_GET_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CTX_GET_CREDENTIALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CTX_GET_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Register callbacks for getting current process context.
 ///
@@ -168,32 +165,34 @@ pub fn register_context_provider(
     get_credentials: GetCredentialsCallback,
     get_ticks: GetTicksCallback,
 ) {
-    let mut provider = CONTEXT_PROVIDER.lock();
-    provider.get_pid = Some(get_pid);
-    provider.get_credentials = Some(get_credentials);
-    provider.get_ticks = Some(get_ticks);
+    CTX_GET_PID.store(get_pid as u64, core::sync::atomic::Ordering::Release);
+    CTX_GET_CREDENTIALS.store(get_credentials as u64, core::sync::atomic::Ordering::Release);
+    CTX_GET_TICKS.store(get_ticks as u64, core::sync::atomic::Ordering::Release);
 }
 
-/// Get current process ID using registered callback
 #[inline]
 fn current_pid() -> Option<ProcessId> {
-    let provider = CONTEXT_PROVIDER.lock();
-    provider.get_pid.and_then(|f| f())
+    let ptr = CTX_GET_PID.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 { return None; }
+    let f: GetPidCallback = unsafe { core::mem::transmute(ptr) };
+    f()
 }
 
-/// Get current credentials using registered callback
 #[inline]
 fn current_credentials() -> Option<Credentials> {
-    let provider = CONTEXT_PROVIDER.lock();
-    provider.get_credentials.and_then(|f| f())
+    let ptr = CTX_GET_CREDENTIALS.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 { return None; }
+    let f: GetCredentialsCallback = unsafe { core::mem::transmute(ptr) };
+    f()
 }
 
-/// Get current tick count using registered callback
 #[cfg(feature = "lsm")]
 #[inline]
 fn get_ticks() -> u64 {
-    let provider = CONTEXT_PROVIDER.lock();
-    provider.get_ticks.map(|f| f()).unwrap_or(0)
+    let ptr = CTX_GET_TICKS.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 { return 0; }
+    let f: GetTicksCallback = unsafe { core::mem::transmute(ptr) };
+    f()
 }
 
 // ============================================================================

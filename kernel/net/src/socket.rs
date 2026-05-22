@@ -5582,8 +5582,14 @@ impl SocketTable {
                 }
 
                 // Handle retransmitted FIN from peer
+                // R159-9 FIX: Only accept FIN at the exact expected sequence position.
+                // rcv_nxt was advanced past the original FIN, so a retransmitted FIN
+                // has seq == rcv_nxt - 1. Without this, any in-window FIN resets the
+                // 2MSL timer, enabling targeted port-exhaustion DoS.
                 let mut fin_ack = None;
-                if header.flags & TCP_FLAG_FIN != 0 {
+                let is_retransmitted_fin = header.flags & TCP_FLAG_FIN != 0
+                    && header.seq_num == tcp_state.control.rcv_nxt.wrapping_sub(1);
+                if is_retransmitted_fin {
                     let window_after = tcp_state
                         .control
                         .rcv_wnd

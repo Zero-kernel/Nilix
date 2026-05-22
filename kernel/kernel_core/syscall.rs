@@ -6188,21 +6188,18 @@ fn sys_brk(addr: usize) -> SyscallResult {
         unsafe {
             with_current_manager(VirtAddr::new(0), |manager| {
                 let mut frame_alloc = FrameAllocator::new();
+                // R159-2 FIX: Fallible frames_to_free (same pattern as R159-1/R158-7).
                 let mut frames_to_free = Vec::new();
+                let _ = frames_to_free.try_reserve(shrink_size / PAGE_SIZE);
 
-                // 阶段 1: 取消映射并收集需要释放的帧（检查 COW 引用计数）
                 for offset in (0..shrink_size).step_by(PAGE_SIZE) {
                     let vaddr = VirtAddr::new((new_top + offset) as u64);
                     let page = Page::containing_address(vaddr);
 
                     // R142-2 FIX: Mirror sys_munmap() fallback for non-present PTEs.
-                    // Without this, brk shrink after mprotect(PROT_NONE) silently
-                    // skips non-present PTEs → frames leak while cgroup IS uncharged
-                    // → memory_current undercount → memory.max bypass.
                     let frame_opt = match manager.unmap_page(page) {
                         Ok(frame) => Some(frame),
                         Err(mm::page_table::UnmapError::PageNotMapped) => {
-                            // PT_LOCK is held (we're inside with_current_manager).
                             manager.take_nonpresent_leaf_frame(page)
                         }
                         Err(_) => None,
@@ -6211,28 +6208,28 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     if let Some(frame) = frame_opt {
                         let phys_addr = frame.start_address().as_u64() as usize;
 
-                        // R126-1 FIX: 检查是否为 COW 共享页
-                        // 如果有引用计数，递减；只有当引用计数为 0 时才释放
                         let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
                             PAGE_REF_COUNT.decrement(phys_addr) == 0
                         } else {
-                            // 没有引用计数记录，说明不是 COW 页，可以直接释放
                             true
                         };
 
                         if should_free {
-                            frames_to_free.push(frame);
+                            if frames_to_free.try_reserve(1).is_ok() {
+                                frames_to_free.push(frame);
+                            } else {
+                                mm::flush_current_as_page(page.start_address());
+                                frame_alloc.deallocate_frame(frame);
+                            }
                         }
                     }
                 }
 
-                // 阶段 2: TLB shootdown
-                // 在释放物理帧之前，确保所有 CPU 都已清除 stale TLB 条目
-                mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
-
-                // 阶段 3: 释放物理帧（此时 TLB 已清除，安全释放）
-                for frame in frames_to_free {
-                    frame_alloc.deallocate_frame(frame);
+                if !frames_to_free.is_empty() {
+                    mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
+                    for frame in frames_to_free {
+                        frame_alloc.deallocate_frame(frame);
+                    }
                 }
             });
         }
@@ -6466,6 +6463,8 @@ fn sys_mmap(
         // so last-exit accounting and munmap are consistent across tasks.
         crate::process::sync_vm_siblings_add_mmap(memory_space, base, len_with_flags, pid);
 
+        // R159-17 FIX: Gate address-revealing log behind debug_assertions.
+        #[cfg(debug_assertions)]
         kprintln!(
             "sys_mmap: pid={}, reserved {} bytes at 0x{:x} (PROT_NONE, no frames)",
             pid, length_aligned, base
@@ -6631,8 +6630,8 @@ fn sys_mmap(
     // Note: Memory is already atomically charged via try_charge_memory() above.
     // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
 
-    // R102-10 FIX: Gate address-revealing log behind debug_assertions to prevent
-    // userspace ASLR bypass via kernel log output.
+    // R102-10 + R159-17 FIX: Gate address-revealing log behind debug_assertions.
+    #[cfg(debug_assertions)]
     kprintln!(
         "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
         pid, length_aligned, base
@@ -6719,21 +6718,21 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             use x86_64::structures::paging::PhysFrame;
 
             let mut frame_alloc = FrameAllocator::new();
+            // R159-1 FIX: Fallible frames_to_free with per-page inline-free fallback.
+            // Same pattern as R158-7 (mprotect Path B). Prevents kernel panic
+            // when munmap runs under OOM — the paradox of needing memory to free memory.
             let mut frames_to_free: Vec<PhysFrame> = Vec::new();
+            let _ = frames_to_free.try_reserve(length_aligned / 0x1000);
 
-            // 阶段 1: 取消映射并收集需要释放的帧
             for offset in (0..length_aligned).step_by(0x1000) {
                 let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
 
                 // R141-9 FIX: Try normal unmap first. If the page is non-present
                 // (e.g. after mprotect(PROT_NONE)), fall back to reclaiming the
-                // frame from the raw PTE. Without this, frames referenced by
-                // non-present PTEs leak permanently while the cgroup is uncharged
-                // (memory.max bypass).
+                // frame from the raw PTE.
                 let frame_opt = match manager.unmap_page(page) {
                     Ok(frame) => Some(frame),
                     Err(mm::page_table::UnmapError::PageNotMapped) => {
-                        // PT_LOCK is held (we're inside with_current_manager).
                         manager.take_nonpresent_leaf_frame(page)
                     }
                     Err(_) => None,
@@ -6742,29 +6741,29 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 if let Some(frame) = frame_opt {
                     let phys_addr = frame.start_address().as_u64() as usize;
 
-                    // 检查是否为 COW 共享页
-                    // 如果有引用计数，递减；只有当引用计数为 0 时才释放
                     let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
                         PAGE_REF_COUNT.decrement(phys_addr) == 0
                     } else {
-                        // 没有引用计数记录，说明不是 COW 页，可以直接释放
                         true
                     };
 
                     if should_free {
-                        frames_to_free.push(frame);
+                        if frames_to_free.try_reserve(1).is_ok() {
+                            frames_to_free.push(frame);
+                        } else {
+                            mm::flush_current_as_page(page.start_address());
+                            frame_alloc.deallocate_frame(frame);
+                        }
                     }
                 }
             }
 
-            // 阶段 2: R23-3 fix - TLB shootdown
-            // 在释放物理帧之前，确保所有 CPU 都已清除 stale TLB 条目
-            // 当前单核模式下，只做本地 flush；SMP 时需要 IPI
-            mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
-
-            // 阶段 3: 释放物理帧（此时 TLB 已清除，安全释放）
-            for frame in frames_to_free {
-                frame_alloc.deallocate_frame(frame);
+            // Batch TLB shootdown then deallocate deferred frames
+            if !frames_to_free.is_empty() {
+                mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
+                for frame in frames_to_free {
+                    frame_alloc.deallocate_frame(frame);
+                }
             }
 
             Ok(())
@@ -6816,7 +6815,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
     }
 
-    // R102-10 FIX: Gate address-revealing log behind debug_assertions.
+    // R102-10 + R159-17 FIX: Gate address-revealing log behind debug_assertions.
+    #[cfg(debug_assertions)]
     kprintln!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
         pid, length_aligned, addr
@@ -6888,6 +6888,15 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         let proc = process.lock();
         let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
         let mut real_regions: Vec<(usize, usize)> = Vec::new();
+        // R159-8 FIX: Pre-reserve based on region count to avoid infallible
+        // push under process lock. Bounded by MAX_MAP_COUNT but still must be
+        // fallible to prevent kernel panic on OOM.
+        let region_count = proc.mmap_regions.range(addr..end).count();
+        if prot_none_regions.try_reserve(region_count).is_err()
+            || real_regions.try_reserve(region_count).is_err()
+        {
+            return Err(SyscallError::ENOMEM);
+        }
 
         // R158-17 FIX: Track coverage to detect unmapped gaps in [addr, end).
         // Linux returns ENOMEM if any part of the range is unmapped.
@@ -7029,12 +7038,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         let frame = match frame_alloc.allocate_frame() {
                             Some(f) => f,
                             None => {
-                                // 3-phase rollback: unmap → TLB flush → deallocate
+                                // R159-4 FIX: Fallible rollback (same pattern as R158-7).
                                 let flush_len = mapped.len() * 0x1000;
                                 let mut frames_to_free = vec::Vec::new();
+                                let _ = frames_to_free.try_reserve(mapped.len());
                                 for (cp, cf) in mapped.drain(..) {
                                     if manager.unmap_page(cp).is_ok() {
-                                        frames_to_free.push(cf);
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(cf);
+                                        } else {
+                                            mm::flush_current_as_page(cp.start_address());
+                                            frame_alloc.deallocate_frame(cf);
+                                        }
                                     }
                                 }
                                 if !frames_to_free.is_empty() {
@@ -7056,11 +7071,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
                         if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
                             frame_alloc.deallocate_frame(frame);
+                            // R159-4 FIX: Fallible rollback.
                             let flush_len = mapped.len() * 0x1000;
                             let mut frames_to_free = vec::Vec::new();
+                            let _ = frames_to_free.try_reserve(mapped.len());
                             for (cp, cf) in mapped.drain(..) {
                                 if manager.unmap_page(cp).is_ok() {
-                                    frames_to_free.push(cf);
+                                    if frames_to_free.try_reserve(1).is_ok() {
+                                        frames_to_free.push(cf);
+                                    } else {
+                                        mm::flush_current_as_page(cp.start_address());
+                                        frame_alloc.deallocate_frame(cf);
+                                    }
                                 }
                             }
                             if !frames_to_free.is_empty() {
@@ -7081,11 +7103,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                 mm::flush_current_as_page(page.start_address());
                                 frame_alloc.deallocate_frame(frame);
                             }
+                            // R159-4 FIX: Fallible rollback.
                             let flush_len = mapped.len() * 0x1000;
                             let mut frames_to_free = vec::Vec::new();
+                            let _ = frames_to_free.try_reserve(mapped.len());
                             for (cp, cf) in mapped.drain(..) {
                                 if manager.unmap_page(cp).is_ok() {
-                                    frames_to_free.push(cf);
+                                    if frames_to_free.try_reserve(1).is_ok() {
+                                        frames_to_free.push(cf);
+                                    } else {
+                                        mm::flush_current_as_page(cp.start_address());
+                                        frame_alloc.deallocate_frame(cf);
+                                    }
                                 }
                             }
                             if !frames_to_free.is_empty() {
@@ -7518,13 +7547,16 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 }
 
 /// Get current seccomp mode for PR_GET_SECCOMP
+// R159-I3 FIX: Cache strict_filter ID to avoid heap allocation on every
+// PR_GET_SECCOMP call. Computed once on first use.
+static STRICT_FILTER_ID: spin::Once<u64> = spin::Once::new();
+
 fn current_seccomp_mode(state: &seccomp::SeccompState) -> usize {
     if state.filters.is_empty() {
         return SECCOMP_MODE_DISABLED;
     }
 
-    // Check if it's strict mode (only the strict filter installed)
-    let strict_id = seccomp::strict_filter().id;
+    let strict_id = *STRICT_FILTER_ID.call_once(|| seccomp::strict_filter().id);
     if state.filters.len() == 1 {
         if let Some(filter) = state.filters.first() {
             if filter.id == strict_id {
@@ -7608,7 +7640,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             // Installing any filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;
-            proc.seccomp_state.add_filter(filter);
+            // R159-6 FIX: Fallible add_filter.
+            if proc.seccomp_state.add_filter(filter).is_err() {
+                proc.seccomp_installing = false;
+                return Err(SyscallError::ENOMEM);
+            }
 
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
@@ -7685,7 +7721,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 proc.seccomp_state.log_violations = true;
             }
 
-            proc.seccomp_state.add_filter(filter);
+            // R159-6 FIX: Fallible add_filter.
+            if proc.seccomp_state.add_filter(filter).is_err() {
+                proc.seccomp_installing = false;
+                return Err(SyscallError::ENOMEM);
+            }
 
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
@@ -10202,6 +10242,10 @@ fn sys_recvfrom(
 ) -> SyscallResult {
     if len == 0 {
         return Ok(0);
+    }
+    // R159-12 FIX: Clamp to MAX_RW_SIZE, matching sys_read/sys_write.
+    if len > MAX_RW_SIZE {
+        return Err(SyscallError::EINVAL);
     }
 
     // Check flags

@@ -105,9 +105,13 @@ pub enum FirewallAction {
     },
 }
 
+// R159-16 FIX: Default to Drop (fail-closed). The previous Accept default was
+// a footgun: FirewallRuleBuilder::new() would silently create ACCEPT-all rules
+// if the caller forgot to call .action(). Drop-by-default ensures any
+// accidental omission is safe.
 impl Default for FirewallAction {
     fn default() -> Self {
-        Self::Accept
+        Self::Drop
     }
 }
 

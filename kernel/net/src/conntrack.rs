@@ -1237,13 +1237,18 @@ pub fn ct_process_icmp(
 
     let l4 = L4Meta::new(0, payload_len);
 
-    // For ICMP errors, we could try to find the original connection
-    // For now, treat as simple flow tracking
+    // R159-I2 FIX: ICMP error packets (Dest Unreachable, Time Exceeded,
+    // Parameter Problem) are classified as RELATED. Without parsing the
+    // embedded IP header we cannot verify the original flow, but returning
+    // Related is correct per RFC and allows firewall rules matching
+    // ESTABLISHED/RELATED to pass legitimate ICMP error feedback
+    // (e.g., path MTU discovery, traceroute TTL exceeded).
     if is_error_type {
-        // ICMP errors are typically RELATED - but without parsing the
-        // embedded packet, we can't confirm. Return NEW for now.
-        // A more sophisticated implementation would parse the embedded
-        // IP header to find the original connection.
+        return CtUpdateResult {
+            decision: CtDecision::Related,
+            state: CtProtoState::Icmp(IcmpCtState::EchoRequest),
+            dir: ConntrackDir::Original,
+        };
     }
 
     conntrack_table().update_on_packet(

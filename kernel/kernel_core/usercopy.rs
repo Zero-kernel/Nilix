@@ -924,7 +924,9 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
 
     // Validate that starting address is in user space
     let start_addr = src as usize;
-    if start_addr >= USER_SPACE_TOP {
+    // R159-10 FIX: Reject addresses below MMAP_MIN_ADDR, matching
+    // validate_user_range. Prevents reads near address zero with SMAP bypassed.
+    if start_addr < MMAP_MIN_ADDR || start_addr >= USER_SPACE_TOP {
         return Err(());
     }
 
