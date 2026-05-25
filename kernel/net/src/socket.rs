@@ -4672,16 +4672,36 @@ impl SocketTable {
                     } else {
                         // R161-12 FIX: Per RFC 793, accept in-window portion of partial
                         // retransmission overlaps (seq < rcv_nxt, seq+len > rcv_nxt).
+                        // R162-6-1/6-2 FIX: Pass FIN flag when FIN position is at seg_end,
+                        // and handle OOO-drain state transitions (wake waiters, set timers).
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
                             let skip = tcp_state.control.rcv_nxt
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
+                            let pass_fin = is_fin;
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, false,
+                                tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             data_received = true;
+                            if tcp_state.control.fin_received {
+                                if tcp_state.control.state == TcpState::TimeWait
+                                    && tcp_state.control.time_wait_start == 0
+                                {
+                                    tcp_state.control.time_wait_start = self.time_wait_now();
+                                }
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                drop(guard);
+                                sock.wake_tcp_waiters();
+                                sock.wake_tcp_data_waiters();
+                                return Some(ack);
+                            }
                         }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
@@ -4965,16 +4985,35 @@ impl SocketTable {
                         return Some(sack_ack);
                     } else {
                         // R161-12 FIX: Accept in-window portion of partial overlap.
+                        // R162-6-1/6-2 FIX: Pass FIN and handle OOO-drain transitions.
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
                             let skip = tcp_state.control.rcv_nxt
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
+                            let pass_fin = is_fin;
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, false,
+                                tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             data_received = true;
+                            if tcp_state.control.fin_received {
+                                if tcp_state.control.state == TcpState::TimeWait
+                                    && tcp_state.control.time_wait_start == 0
+                                {
+                                    tcp_state.control.time_wait_start = self.time_wait_now();
+                                }
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                drop(guard);
+                                sock.wake_tcp_waiters();
+                                sock.wake_tcp_data_waiters();
+                                return Some(ack);
+                            }
                         }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
@@ -5227,16 +5266,35 @@ impl SocketTable {
                         return Some(sack_ack);
                     } else {
                         // R161-12 FIX: Accept in-window portion of partial overlap.
+                        // R162-6-1/6-2 FIX: Pass FIN and handle OOO-drain transitions.
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
                             let skip = tcp_state.control.rcv_nxt
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
+                            let pass_fin = is_fin;
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, false,
+                                tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             data_received = true;
+                            if tcp_state.control.fin_received {
+                                if tcp_state.control.state == TcpState::TimeWait
+                                    && tcp_state.control.time_wait_start == 0
+                                {
+                                    tcp_state.control.time_wait_start = self.time_wait_now();
+                                }
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                drop(guard);
+                                sock.wake_tcp_waiters();
+                                sock.wake_tcp_data_waiters();
+                                return Some(ack);
+                            }
                         }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(

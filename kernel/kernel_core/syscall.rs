@@ -6939,6 +6939,11 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         // boundary points. This ensures the classification loop below only sees
         // entries fully contained within the mprotect range, so Path A/B process
         // exactly the correct pages and bookkeeping updates find entries by key.
+        // R162-2-1 FIX: Check MAX_MAP_COUNT before splitting to prevent unbounded
+        // region growth via repeated partial-range mprotect calls.
+        if proc.mmap_regions.len() + 2 >= MAX_MAP_COUNT {
+            return Err(SyscallError::ENOMEM);
+        }
 
         // Split preceding region whose tail extends into [addr, end).
         if let Some((&prev_base, &prev_lf)) = proc.mmap_regions.range(..addr).next_back() {

@@ -960,6 +960,11 @@ fn build_frame_and_transmit(
             (None, None)
         };
         let cfg_pre = network_config();
+        // R162-7-1 FIX: Pass Established for egress. All kernel-generated
+        // outbound packets originate from flows already seeded in conntrack
+        // (sys_connect/sys_sendto seed before TX). Passing None caused the
+        // default ESTABLISHED|RELATED ACCEPT rule to not match, triggering
+        // default-DROP on all egress.
         let fw_pkt = FirewallPacket {
             net_ns_id: 0,
             src_ip: cfg_pre.our_ip,
@@ -967,7 +972,7 @@ fn build_frame_and_transmit(
             proto,
             src_port,
             dst_port,
-            ct_state: None,
+            ct_state: Some(crate::conntrack::CtDecision::Established),
         };
         let fw_table = firewall_table_for_ns(0);
         let fw_verdict = fw_table.evaluate(&fw_pkt);
