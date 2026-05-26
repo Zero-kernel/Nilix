@@ -1554,7 +1554,8 @@ fn generate_maps(pid: u32) -> String {
 
         // Output mmap regions
         // R36-FIX: Use 16 hex digits for 64-bit addresses
-        for (&start, &size) in &proc.mmap_regions {
+        let mm = proc.mm.lock();
+        for (&start, &size) in &mm.mmap_regions {
             if entries >= MAX_MAPS_ENTRIES || result.len() > MAX_MAPS_OUTPUT {
                 truncated = true;
                 break;
@@ -1577,6 +1578,7 @@ fn generate_maps(pid: u32) -> String {
             result.push_str(&line);
             entries += 1;
         }
+        drop(mm);
 
         // Add stack mapping if present (only if budget allows)
         if !truncated {

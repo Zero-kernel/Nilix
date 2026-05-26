@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
 use x86_64::{
@@ -159,16 +159,19 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         // on exit exactly cancels the charge here, keeping memory_current
         // accurate for every process independently.
         //
-        // Locking note: fork_inner() copies mmap_regions, brk, and
-        // elf_charged_bytes verbatim from parent to child.  Rather than
-        // re-locking the child (which would nest parent→child locks and
-        // widen the critical section), we compute the inherited footprint
-        // directly from the already-held parent snapshot.
+        // Locking note: fork_inner() creates an independent MmState for the
+        // child via parent.mm.lock().  We compute the inherited footprint
+        // from the parent's MmState here (lock ordering: Process → MmState)
+        // rather than re-locking the child's mm.
         let fork_charge_bytes: u64 = {
             let mut bytes: u64 = 0;
 
+            // D3-ARC-MM-SHARED: Access mm fields through the shared MmState lock.
+            // Lock ordering: Process (held) → MmState — never reverse.
+            let parent_mm = parent.mm.lock();
+
             // Sum non-PROT_NONE mmap regions (inherited verbatim from parent)
-            for (&_base, &len_with_flags) in parent.mmap_regions.iter() {
+            for (&_base, &len_with_flags) in parent_mm.mmap_regions.iter() {
                 if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
                     continue;
                 }
@@ -179,16 +182,17 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             // Brk heap (inherited verbatim from parent)
             let heap_bytes = {
                 const PAGE_SIZE: usize = 0x1000;
-                let brk_aligned = (parent.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let brk_aligned = (parent_mm.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 let brk_start_aligned =
-                    (parent.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                    (parent_mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 brk_aligned.saturating_sub(brk_start_aligned) as u64
             };
             bytes = bytes.saturating_add(heap_bytes);
 
             // ELF loader charges (inherited verbatim from parent)
-            bytes = bytes.saturating_add(parent.elf_charged_bytes);
+            bytes = bytes.saturating_add(parent_mm.elf_charged_bytes);
 
+            drop(parent_mm);
             bytes
         };
 
@@ -231,12 +235,18 @@ fn fork_inner(
     // Returning MmapTransientState (mapped to EAGAIN) lets userspace retry.
     // This is fail-closed: any non-zero low bits block fork, covering future
     // transient flags as well.
-    if parent
-        .mmap_regions
-        .values()
-        .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK != 0)
+    //
+    // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
+    // Lock ordering: Process (held) → MmState — never reverse.
     {
-        return Err(ForkError::MmapTransientState);
+        let parent_mm = parent.mm.lock();
+        if parent_mm
+            .mmap_regions
+            .values()
+            .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK != 0)
+        {
+            return Err(ForkError::MmapTransientState);
+        }
     }
 
     if let Some(child_process) = get_process(child_pid) {
@@ -381,15 +391,51 @@ fn fork_inner(
         child.credentials = Arc::new(RwLock::new(parent_creds));
         child.umask = parent.umask;
 
-        // 复制堆管理状态
-        child.brk_start = parent.brk_start;
-        child.brk = parent.brk;
-
+        // D3-ARC-MM-SHARED: Build the child's independent MmState from the
+        // parent's shared mm. This replaces the old per-field copies of
+        // brk_start, brk, elf_charged_bytes, mmap_regions, and next_mmap_addr.
+        //
         // R138-1 FIX: Inherit parent's ELF loader charges so the child's cgroup
         // accounting is complete under worst-case COW semantics.  The actual
         // cgroup charge for the child's full inherited footprint (mmap_regions +
         // brk + elf_charged_bytes) happens in sys_fork() after fork_inner returns.
-        child.elf_charged_bytes = parent.elf_charged_bytes;
+        //
+        // R122-1 FIX: Strip transient PENDING_* flags when cloning committed
+        // regions into the child, preserving persistent per-region flags (e.g.
+        // PROT_NONE) so the child inherits correct region metadata.
+        //
+        // R157-3 FIX: Fallible pre-allocation — BTreeMap::collect() uses
+        // infallible allocation; 65536 entries can exhaust the 1 MiB kernel heap.
+        // We pre-allocate into a Vec first to detect OOM early.
+        //
+        // Lock ordering: Process (held) → MmState — never reverse.
+        {
+            let parent_mm = parent.mm.lock();
+
+            let region_count = parent_mm.mmap_regions.len();
+            let mut snap: Vec<(usize, usize)> = Vec::new();
+            if snap.try_reserve_exact(region_count).is_err() {
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            snap.extend(parent_mm.mmap_regions.iter().map(|(&base, &len_with_flags)| {
+                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+            }));
+
+            let child_mm = crate::process::MmState {
+                mmap_regions: snap.into_iter().collect(),
+                brk_start: parent_mm.brk_start,
+                brk: parent_mm.brk,
+                next_mmap_addr: parent_mm.next_mmap_addr,
+                vm_charged_bytes: parent_mm.vm_charged_bytes,
+                elf_charged_bytes: parent_mm.elf_charged_bytes,
+                // Transient pending counters reset for child — no in-flight
+                // operations can be inherited across fork.
+                brk_pending_growth: 0,
+                mprotect_pending_bytes: 0,
+                exec_pending_bytes: 0,
+            };
+            child.mm = Arc::new(Mutex::new(child_mm));
+        }
 
         // 复制 TLS 状态（FS/GS base）
         child.fs_base = parent.fs_base;
@@ -426,23 +472,6 @@ fn fork_inner(
         child.set_child_tid = 0;
         child.robust_list_head = 0;
         child.robust_list_len = 0;
-
-        // R122-1 FIX: Transient PENDING_* entries are rejected at fork_inner()
-        // entry above. Strip only transient in-flight flags when cloning committed
-        // regions into the child, preserving persistent per-region flags (e.g.
-        // PROT_NONE) so the child inherits correct region metadata.
-        // R157-3 FIX: Fallible pre-allocation — BTreeMap::collect() uses
-        // infallible allocation; 65536 entries can exhaust the 1 MiB kernel heap.
-        let region_count = parent.mmap_regions.len();
-        let mut snap: Vec<(usize, usize)> = Vec::new();
-        if snap.try_reserve_exact(region_count).is_err() {
-            return Err(ForkError::MemoryAllocationFailed);
-        }
-        snap.extend(parent.mmap_regions.iter().map(|(&base, &len_with_flags)| {
-            (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
-        }));
-        child.mmap_regions = snap.into_iter().collect();
-        child.next_mmap_addr = parent.next_mmap_addr;
 
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;

@@ -410,6 +410,83 @@ impl Default for Context {
     }
 }
 
+/// D3-ARC-MM-SHARED: Shared virtual memory metadata for an address space.
+///
+/// Under CLONE_VM (threads), all tasks sharing a physical address space (CR3)
+/// also share a single `MmState` via `Arc<Mutex<MmState>>`. This eliminates
+/// the prior per-task `mmap_regions`/`brk` snapshot model that required 7+
+/// sync_vm_siblings_* functions and caused systemic cgroup accounting bugs
+/// (D2-RES-CGROUP-CLONE: R123-R127, R139-R142, R146-R147, R161).
+///
+/// For non-CLONE_VM processes (regular fork), each child gets an independent
+/// `MmState` clone via `clone_for_fork()`.
+///
+/// Lock ordering: Process → MmState (never reverse).
+#[derive(Debug, Clone)]
+pub struct MmState {
+    /// mmap region tracking (base address -> length | flags)
+    pub mmap_regions: BTreeMap<usize, usize>,
+
+    /// Heap start address (page-aligned end of ELF BSS)
+    pub brk_start: usize,
+
+    /// Current program break
+    pub brk: usize,
+
+    /// Next auto-allocated mmap start address
+    pub next_mmap_addr: usize,
+
+    /// Cgroup memory bytes charged via sys_mmap / sys_brk.
+    /// Under shared MmState, this is per-address-space (not per-task).
+    /// Non-last CLONE_VM exit must NOT uncharge; last exit uncharges all.
+    pub vm_charged_bytes: u64,
+
+    /// Cgroup memory bytes charged by the ELF loader for PT_LOAD segments
+    /// and the initial user stack. Uncharged on last-exit or subsequent exec.
+    pub elf_charged_bytes: u64,
+
+    /// Transient: bytes charged to cgroup via sys_brk growth not yet
+    /// reflected in `brk`. Non-zero only while MmState lock is dropped
+    /// for PT operations. Included by `compute_cgroup_charged_bytes()`.
+    pub brk_pending_growth: u64,
+
+    /// Transient: bytes charged by mprotect(PROT_NONE → real) not yet
+    /// reflected in `mmap_regions`. Non-zero during PT operations.
+    pub mprotect_pending_bytes: u64,
+
+    /// Transient: bytes charged by sys_exec (ELF loader) not yet reflected
+    /// in `elf_charged_bytes`. Non-zero between load_elf() and exec commit.
+    pub exec_pending_bytes: u64,
+}
+
+impl MmState {
+    pub fn new(next_mmap_addr: usize) -> Self {
+        Self {
+            mmap_regions: BTreeMap::new(),
+            brk_start: 0,
+            brk: 0,
+            next_mmap_addr,
+            vm_charged_bytes: 0,
+            elf_charged_bytes: 0,
+            brk_pending_growth: 0,
+            mprotect_pending_bytes: 0,
+            exec_pending_bytes: 0,
+        }
+    }
+
+    /// Clone for fork: creates an independent copy with pending counters reset.
+    /// Committed charge counters (vm_charged_bytes, elf_charged_bytes) are
+    /// preserved because fork COW semantics mean the child inherits the
+    /// parent's charge state until pages are actually freed.
+    pub fn clone_for_fork(&self) -> Self {
+        let mut child = self.clone();
+        child.brk_pending_growth = 0;
+        child.mprotect_pending_bytes = 0;
+        child.exec_pending_bytes = 0;
+        child
+    }
+}
+
 /// 进程控制块（PCB）
 ///
 /// 注意：Process 不实现 Clone，因为 fd_table 包含不可克隆的 Box<dyn FileOps>。
@@ -530,59 +607,10 @@ pub struct Process {
     /// deallocated (no recursion into shared sub-tables).
     pub user_memory_space: usize,
 
-    /// mmap 区域跟踪 (起始地址 -> 长度)
-    pub mmap_regions: BTreeMap<usize, usize>,
-
-    /// R131-6: Per-task cgroup memory bytes independently charged via
-    /// sys_mmap / sys_brk since this task was created or cloned.
-    ///
-    /// R139-1 FIX: Do NOT uncharge these bytes on non-last CLONE_VM exit.
-    /// When `keep_address_space=true`, the backing pages remain mapped in the
-    /// shared page tables; uncharging would undercount cgroup `memory_current`
-    /// and enable `memory.max` bypass. We intentionally prefer safe over-
-    /// counting (leaked charges) over under-counting. The field is still
-    /// cleared on exit for bookkeeping cleanup.
-    ///
-    /// Invariant: uses saturating arithmetic — never underflows.
-    pub vm_charged_bytes: u64,
-
-    /// R144-1 FIX: Bytes already charged to cgroup via sys_brk growth that are
-    /// not yet reflected in `proc.brk`.  Non-zero only while the process lock is
-    /// dropped for PT operations (Phase 2 of sys_brk).  Included by
-    /// `compute_cgroup_charged_bytes()` so that cgroup migration during the
-    /// lock-drop window transfers the full charge amount, closing the TOCTOU gap.
-    pub brk_pending_growth: u64,
-
-    /// R147-1 FIX: Bytes charged to cgroup by mprotect(PROT_NONE → real) that
-    /// are not yet reflected in `mmap_regions`.  Non-zero only while the process
-    /// lock is dropped for PT operations (Step 2 of sys_mprotect Path A).
-    /// Included by `compute_cgroup_charged_bytes()` so that cgroup migration
-    /// during the lock-drop window transfers the full charge amount.
-    pub mprotect_pending_bytes: u64,
-
-    /// R149-3 FIX: Bytes charged to cgroup by sys_exec (ELF loader) that are
-    /// not yet reflected in `elf_charged_bytes`. Non-zero only between
-    /// successful load_elf() charge and exec commit. Included by
-    /// `compute_cgroup_charged_bytes()` so that cgroup migration during the
-    /// exec window transfers the full charge amount, closing the TOCTOU gap.
-    pub exec_pending_bytes: u64,
-
-    /// R137-1 FIX: Cgroup memory bytes charged by the ELF loader for PT_LOAD
-    /// segments and the initial user stack.
-    ///
-    /// `load_elf()` charges cgroup memory via `try_charge_memory()` but these
-    /// charges are not tracked in `mmap_regions`, `brk`, or `vm_charged_bytes`.
-    /// Without explicit tracking, exit and subsequent exec never uncharge them,
-    /// causing `memory_current` to leak ~2-8 MB per exec+exit cycle.
-    ///
-    /// Set on successful exec commit; uncharged on process exit (last-exit in
-    /// CLONE_VM group) and on subsequent exec (before loading the new image).
-    /// CLONE_VM children inherit this value via the clone snapshot so that
-    /// whichever task is last-exit can perform the uncharge.
-    pub elf_charged_bytes: u64,
-
-    /// 下一个自动分配的 mmap 起始地址
-    pub next_mmap_addr: usize,
+    /// D3-ARC-MM-SHARED: Shared virtual memory metadata.
+    /// Under CLONE_VM, siblings share the same Arc. Under fork, each gets a clone.
+    /// Lock ordering: Process → MmState (never reverse).
+    pub mm: Arc<Mutex<MmState>>,
 
     /// 文件描述符表（fd -> 描述符）
     ///
@@ -690,12 +718,7 @@ pub struct Process {
     /// 正值增加被杀概率，负值降低被杀概率
     pub oom_score_adj: i32,
 
-    // ========== 堆管理 (brk) ==========
-    /// 堆起始地址（ELF bss 段末尾，页对齐）
-    pub brk_start: usize,
-
-    /// 当前 program break（可能未页对齐）
-    pub brk: usize,
+    // ========== 堆管理 (brk) — moved to MmState ==========
 
     // ========== TLS 支持 ==========
     /// FS segment base (用于 TLS)
@@ -836,13 +859,7 @@ impl Process {
             user_stack: None,
             memory_space: 0,
             user_memory_space: 0,
-            mmap_regions: BTreeMap::new(),
-            vm_charged_bytes: 0,
-            brk_pending_growth: 0,
-            mprotect_pending_bytes: 0,
-            exec_pending_bytes: 0,
-            elf_charged_bytes: 0,
-            next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
+            mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(DEFAULT_MMAP_BASE)))),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
             cap_table: Arc::new(CapTable::new()),
@@ -877,9 +894,7 @@ impl Process {
             // OOM killer 支持 - 默认中立设置
             nice: 0,
             oom_score_adj: 0,
-            // 堆管理 - ELF 加载时设置实际值
-            brk_start: 0,
-            brk: 0,
+            // 堆管理 — moved to MmState (brk_start/brk initialized to 0 there)
             // TLS 支持
             fs_base: 0,
             gs_base: 0,
@@ -1864,500 +1879,18 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .count()
 }
 
-/// R142-1 FIX: Atomically remove an mmap_regions entry from the calling task
-/// and all CLONE_VM siblings sharing the same address space.
-///
-/// Under CLONE_VM, each task keeps its own `mmap_regions` snapshot
-/// (D3-ARC-MM-SHARED design limitation). Two siblings can concurrently
-/// munmap the same region and both reach Phase 3 bookkeeping. Without
-/// serialization, both remove from their own `mmap_regions` and both call
-/// `cgroup::uncharge_memory()` → double-uncharge drives `memory_current`
-/// below actual usage → `memory.max` bypass.
-///
-/// This function serializes the removal under `PROCESS_TABLE` lock so that
-/// only the first remover (the "winner") returns `true`. The loser finds
-/// its entry already removed by the winner's sibling-sync pass and returns
-/// `false`. Only the winner should proceed with cgroup uncharge.
-///
-/// Lock ordering: PROCESS_TABLE → Process (consistent with all sync_vm_*
-/// functions).
-///
-/// # Arguments
-///
-/// * `caller_pid` - PID of the calling task
-/// * `addr` - Base address of the mmap region to remove
-///
-/// # Returns
-///
-/// `true` if this caller was the first to remove the entry (should uncharge).
-pub fn atomic_remove_mmap_region(caller_pid: ProcessId, addr: usize) -> bool {
-    let table = PROCESS_TABLE.lock();
-
-    // Step 1: Remove from the caller's own mmap_regions
-    let Some(caller_arc) = table.get(caller_pid).and_then(|slot| slot.as_ref()) else {
-        return false;
-    };
-
-    let (removed, memory_space) = {
-        let mut proc = caller_arc.lock();
-        (proc.mmap_regions.remove(&addr).is_some(), proc.memory_space)
-    }; // Caller process lock dropped
-
-    if !removed {
-        // Another sibling already removed our entry via its sync pass.
-        return false;
-    }
-
-    // Step 2: Remove from all CLONE_VM siblings (same logic as
-    // sync_vm_siblings_remove_mmap, but executed atomically under the
-    // same PROCESS_TABLE lock acquisition that verified our own removal).
-    if memory_space != 0 {
-        for (idx, slot) in table.iter().enumerate() {
-            if idx == caller_pid {
-                continue;
-            }
-            if let Some(sib_arc) = slot {
-                let mut sib = sib_arc.lock();
-                if sib.memory_space == memory_space && sib.state != ProcessState::Terminated {
-                    sib.mmap_regions.remove(&addr);
-                }
-            }
-        }
-    }
-
-    true
-}
-
-/// R146-1 FIX: Atomically transition a region from real → PROT_NONE across
-/// the caller and all CLONE_VM siblings sharing the same address space.
-///
-/// Under CLONE_VM, each task keeps its own `mmap_regions` snapshot
-/// (D3-ARC-MM-SHARED design limitation). Two siblings can concurrently
-/// mprotect the same region from real permissions to PROT_NONE and both decide
-/// they were first, leading to double cgroup uncharge → `memory.max` bypass.
-///
-/// This function serializes the transition under `PROCESS_TABLE` lock:
-/// the first caller updates its own entry and propagates to all siblings,
-/// returning `(true, cgroup_id)`. A concurrent sibling finds its entry
-/// already marked PROT_NONE (by the winner's propagation) and returns
-/// `(false, cgroup_id)`, so it skips cgroup uncharge.
-///
-/// Also incorporates R146-2 FIX: returns the `cgroup_id` re-read under lock,
-/// so the caller uses the current (post-migration) cgroup for uncharge.
-///
-/// Lock ordering: PROCESS_TABLE → Process (consistent with all sync_vm_*
-/// functions).
-///
-/// # Arguments
-///
-/// * `caller_pid` - PID of the calling task
-/// * `region_base` - Base address of the mmap region to transition
-/// * `region_len` - Expected page-aligned length of the region
-///
-/// # Returns
-///
-/// `(did_transition, cgroup_id)` — `did_transition` is true only for the
-/// first sibling that performs the transition (should uncharge).
-pub fn atomic_mprotect_prot_none_transition(
-    caller_pid: ProcessId,
-    region_base: usize,
-    region_len: usize,
-) -> (bool, crate::cgroup::CgroupId) {
-    use crate::syscall::{
-        mmap_region_len, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_PROT_NONE,
-        MMAP_REGION_FLAG_PROT_READ, MMAP_REGION_FLAG_PROT_WRITE, MMAP_REGION_FLAG_PROT_EXEC,
-        MMAP_REGION_FLAG_TRANSIENT_MASK,
-    };
-
-    let prot_mask = MMAP_REGION_FLAG_PROT_READ
-        | MMAP_REGION_FLAG_PROT_WRITE
-        | MMAP_REGION_FLAG_PROT_EXEC;
-
-    let table = PROCESS_TABLE.lock();
-
-    // Step 0: Find the caller slot.
-    let Some(caller_arc) = table.get(caller_pid).and_then(|slot| slot.as_ref()) else {
-        return (false, 0);
-    };
-
-    // Step 1: Check + update the caller's bookkeeping under PROCESS_TABLE lock.
-    let (memory_space, cgroup_id) = {
-        let mut proc = caller_arc.lock();
-        let cgroup_id = proc.cgroup_id;
-        let memory_space = proc.memory_space;
-
-        let Some(entry) = proc.mmap_regions.get_mut(&region_base) else {
-            return (false, cgroup_id);
-        };
-
-        let old = *entry;
-        // Another sibling already performed the transition and propagated it.
-        if (old & MMAP_REGION_FLAG_PROT_NONE) != 0 {
-            return (false, cgroup_id);
-        }
-        // Defense-in-depth: reject if a concurrent munmap/mmap has set a
-        // transient flag since our Phase 0 check. This closes the window
-        // where mprotect and munmap could both uncharge the same region.
-        if (old & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
-            return (false, cgroup_id);
-        }
-        // Sanity: length must match what the caller captured in Phase 0.
-        if mmap_region_len(old) != region_len {
-            return (false, cgroup_id);
-        }
-
-        // Preserve transient flags; clear old prot display bits, set PROT_NONE.
-        let preserved = (old & MMAP_REGION_FLAG_MASK) & !prot_mask;
-        *entry = region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
-
-        proc.vm_charged_bytes = proc.vm_charged_bytes.saturating_sub(region_len as u64);
-
-        (memory_space, cgroup_id)
-    }; // Caller process lock dropped
-
-    // Step 2: Propagate to all CLONE_VM siblings under the same PROCESS_TABLE
-    // lock acquisition that verified our own transition (atomicity guarantee).
-    if memory_space != 0 {
-        for (idx, slot) in table.iter().enumerate() {
-            if idx == caller_pid {
-                continue;
-            }
-            if let Some(sib_arc) = slot {
-                let mut sib = sib_arc.lock();
-                if sib.memory_space == memory_space && sib.state != ProcessState::Terminated {
-                    if let Some(sib_entry) = sib.mmap_regions.get_mut(&region_base) {
-                        let sib_old = *sib_entry;
-                        let sib_len = mmap_region_len(sib_old);
-                        if sib_len == region_len
-                            && (sib_old & MMAP_REGION_FLAG_PROT_NONE) == 0
-                        {
-                            let preserved = (sib_old & MMAP_REGION_FLAG_MASK) & !prot_mask;
-                            *sib_entry =
-                                region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
-                            sib.vm_charged_bytes =
-                                sib.vm_charged_bytes.saturating_sub(region_len as u64);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (true, cgroup_id)
-}
-
-/// R140-1 FIX: Synchronize mmap_regions removal across all tasks sharing the
-/// same address space (CLONE_VM siblings).
-///
-/// Under CLONE_VM, page tables are shared but `mmap_regions` is snapshotted
-/// per-task (D3-ARC-MM-SHARED design limitation). When one sibling munmaps a
-/// region and uncharges the cgroup, other siblings retain a stale record of
-/// the region. If the last sibling exits with this stale record, it will
-/// double-uncharge the cgroup (`memory_current` undercount → `memory.max`
-/// bypass).
-///
-/// This function removes the given base address from ALL tasks that share
-/// `memory_space`, preventing the stale-record double-uncharge.
-///
-/// Must be called AFTER the current task's mmap_regions removal AND before the
-/// cgroup uncharge (sync must complete before charge is released).
-///
-/// # Arguments
-///
-/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
-/// * `addr` - Base address of the munmapped region to remove
-/// * `caller_pid` - PID of the caller (already handled, skip)
-pub fn sync_vm_siblings_remove_mmap(memory_space: usize, addr: usize, caller_pid: ProcessId) {
-    if memory_space == 0 {
-        return;
-    }
-    let table = PROCESS_TABLE.lock();
-    for (idx, slot) in table.iter().enumerate() {
-        if idx == caller_pid {
-            continue; // Already handled by caller
-        }
-        if let Some(proc_arc) = slot {
-            let mut proc = proc_arc.lock();
-            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
-                proc.mmap_regions.remove(&addr);
-            }
-        }
-    }
-}
-
-/// R161-10 FIX: Propagate mmap_regions boundary splits to CLONE_VM siblings.
-///
-/// When sys_mprotect splits a region at addr/end boundaries (because the
-/// mprotect range partially overlaps it), the same split must be propagated
-/// to all siblings sharing the address space to keep bookkeeping consistent.
-pub fn sync_vm_siblings_split_region(
-    memory_space: usize,
-    caller_pid: ProcessId,
-    addr: usize,
-    end: usize,
-) {
-    if memory_space == 0 {
-        return;
-    }
-
-    use crate::syscall::{mmap_region_len, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_TRANSIENT_MASK};
-
-    let table = PROCESS_TABLE.lock();
-    for (idx, slot) in table.iter().enumerate() {
-        if idx == caller_pid {
-            continue;
-        }
-        if let Some(proc_arc) = slot {
-            let mut proc = proc_arc.lock();
-            if proc.memory_space != memory_space || proc.state == ProcessState::Terminated {
-                continue;
-            }
-
-            // Split preceding region at addr
-            let preceding = proc
-                .mmap_regions
-                .range(..addr)
-                .next_back()
-                .map(|(&b, &lf)| (b, lf));
-            if let Some((prev_base, prev_lf)) = preceding {
-                let prev_len = mmap_region_len(prev_lf);
-                let prev_end = prev_base.saturating_add(prev_len);
-                if prev_end > addr
-                    && prev_len > 0
-                    && (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) == 0
-                {
-                    let prev_flags = prev_lf & MMAP_REGION_FLAG_MASK;
-                    let left_len = addr - prev_base;
-                    proc.mmap_regions.insert(prev_base, left_len | prev_flags);
-                    let tail_end = prev_end.min(end);
-                    let tail_len = tail_end - addr;
-                    proc.mmap_regions.insert(addr, tail_len | prev_flags);
-                    if prev_end > end {
-                        let right_len = prev_end - end;
-                        proc.mmap_regions.insert(end, right_len | prev_flags);
-                    }
-                }
-            }
-
-            // Split trailing region at end
-            let trailing = proc
-                .mmap_regions
-                .range(addr..end)
-                .next_back()
-                .map(|(&b, &lf)| (b, lf));
-            if let Some((last_base, last_lf)) = trailing {
-                let last_len = mmap_region_len(last_lf);
-                let last_end = last_base.saturating_add(last_len);
-                if last_end > end
-                    && last_len > 0
-                    && (last_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) == 0
-                {
-                    let last_flags = last_lf & MMAP_REGION_FLAG_MASK;
-                    let in_range_len = end - last_base;
-                    let right_len = last_end - end;
-                    proc.mmap_regions.insert(last_base, in_range_len | last_flags);
-                    proc.mmap_regions.insert(end, right_len | last_flags);
-                }
-            }
-        }
-    }
-}
-
-/// R140-1 FIX: Synchronize brk value across all tasks sharing the same
-/// address space (CLONE_VM siblings).
-///
-/// Same rationale as `sync_vm_siblings_remove_mmap`: under CLONE_VM, `brk` is
-/// snapshotted per-task. If one sibling shrinks the heap and uncharges, other
-/// siblings retain a stale (higher) brk value. The last sibling to exit would
-/// uncharge based on the stale brk, causing cgroup `memory_current` undercount.
-///
-/// # Arguments
-///
-/// * `memory_space` - Physical address of the shared PML4
-/// * `new_brk` - New brk value to propagate
-/// * `caller_pid` - PID of the caller (already handled, skip)
-pub fn sync_vm_siblings_brk(memory_space: usize, new_brk: usize, caller_pid: ProcessId) {
-    if memory_space == 0 {
-        return;
-    }
-    let table = PROCESS_TABLE.lock();
-    for (idx, slot) in table.iter().enumerate() {
-        if idx == caller_pid {
-            continue;
-        }
-        if let Some(proc_arc) = slot {
-            let mut proc = proc_arc.lock();
-            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
-                proc.brk = new_brk;
-            }
-        }
-    }
-}
-
-/// R141-1 FIX: Synchronize mmap_regions addition across all tasks sharing the
-/// same address space (CLONE_VM siblings).
-///
-/// Under CLONE_VM, page tables are shared but `mmap_regions` is snapshotted
-/// per-task (D3-ARC-MM-SHARED design limitation). When one sibling calls
-/// sys_mmap, the new region is only recorded in that task's bookkeeping.
-/// If a different sibling exits last, `free_process_resources()` iterates
-/// its stale `mmap_regions` that lack the new entry — the charge for that
-/// region is never uncharged → permanent `memory_current` inflation (DoS).
-///
-/// This function inserts the new entry into ALL tasks sharing `memory_space`
-/// and advances `next_mmap_addr` to prevent address collisions.
-///
-/// # Arguments
-///
-/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
-/// * `addr` - Base address of the new mmap region
-/// * `len_with_flags` - Length | flags word to insert into mmap_regions
-/// * `caller_pid` - PID of the caller (already updated, skip)
-pub fn sync_vm_siblings_add_mmap(
-    memory_space: usize,
-    addr: usize,
-    len_with_flags: usize,
-    caller_pid: ProcessId,
-) {
-    if memory_space == 0 {
-        return;
-    }
-
-    let end = addr.saturating_add(crate::syscall::mmap_region_len(len_with_flags));
-
-    let table = PROCESS_TABLE.lock();
-    for (idx, slot) in table.iter().enumerate() {
-        if idx == caller_pid {
-            continue; // Already handled by caller
-        }
-        if let Some(proc_arc) = slot {
-            let mut proc = proc_arc.lock();
-            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
-                proc.mmap_regions.insert(addr, len_with_flags);
-                if proc.next_mmap_addr < end {
-                    proc.next_mmap_addr = end;
-                }
-            }
-        }
-    }
-}
-
-/// Synchronize mmap_regions protection flag changes across all tasks sharing
-/// the same address space (CLONE_VM siblings).
-///
-/// When mprotect toggles the PROT_NONE flag or changes prot bits, siblings must
-/// see the same bookkeeping so exit-time cgroup accounting (which iterates
-/// each task's mmap_regions) stays consistent.
-///
-/// # Arguments
-///
-/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
-/// * `region_base` - Base address of the single region being updated
-/// * `region_end` - End address (exclusive) of the region
-/// * `new_len_with_flags` - Updated length|flags word to write for this region
-/// * `vm_charged_delta` - Signed delta applied to vm_charged_bytes (saturating):
-///   positive when PROT_NONE→real (charge added), negative when real→PROT_NONE
-///   (charge removed)
-/// * `caller_pid` - PID of the caller (already updated, skip)
-pub fn sync_vm_siblings_mprotect_flags(
-    memory_space: usize,
-    region_base: usize,
-    region_end: usize,
-    new_len_with_flags: usize,
-    vm_charged_delta: i64,
-    caller_pid: ProcessId,
-) {
-    if memory_space == 0 {
-        return;
-    }
-
-    let table = PROCESS_TABLE.lock();
-    for (idx, slot) in table.iter().enumerate() {
-        if idx == caller_pid {
-            continue; // Already handled by caller
-        }
-        if let Some(proc_arc) = slot {
-            let mut proc = proc_arc.lock();
-            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
-                // R146-4 FIX: Use exact-key get_mut with length verification
-                // instead of range_mut, preventing accidental overwrites if
-                // sibling bookkeeping has diverged.
-                let mut updated = false;
-                if let Some(len_flags) = proc.mmap_regions.get_mut(&region_base) {
-                    let existing_len = crate::syscall::mmap_region_len(*len_flags);
-                    let existing_end = region_base.saturating_add(existing_len);
-                    if existing_end == region_end {
-                        *len_flags = new_len_with_flags;
-                        updated = true;
-                    }
-                }
-
-                // Only adjust vm_charged_bytes if the entry was actually updated.
-                if updated {
-                    if vm_charged_delta >= 0 {
-                        proc.vm_charged_bytes = proc
-                            .vm_charged_bytes
-                            .saturating_add(vm_charged_delta as u64);
-                    } else {
-                        proc.vm_charged_bytes = proc
-                            .vm_charged_bytes
-                            .saturating_sub(vm_charged_delta.unsigned_abs());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// R147-5 FIX: Reconcile a CLONE_VM child's mmap_regions with the current
-/// parent state under PROCESS_TABLE lock.
-///
-/// Between `create_process()` insertion (child has `memory_space = 0`) and
-/// the sys_clone block that sets `memory_space` + copies `mmap_regions`, any
-/// `sync_vm_siblings_*` call from a concurrent sibling skips the child because
-/// its `memory_space` doesn't match.  After the child lock block, the child's
-/// snapshot may be stale (a sibling munmap was not propagated).
-///
-/// This function re-snapshots the parent's mmap_regions into the child under
-/// PROCESS_TABLE lock, serializing with all sync_vm_siblings_* functions.
-/// Transient flags are stripped (matching fork_inner semantics).
-///
-/// Lock ordering: PROCESS_TABLE → Process (one at a time; never two Process
-/// locks simultaneously to avoid future deadlock hazards).
-pub fn reconcile_clone_vm_mmap_regions(
-    parent_pid: ProcessId,
-    child_pid: ProcessId,
-) {
-    let table = PROCESS_TABLE.lock();
-
-    // Phase 1: Snapshot parent state into locals (single Process lock).
-    let parent_arc = match table.get(parent_pid).and_then(|s| s.as_ref()) {
-        Some(arc) => arc.clone(),
-        None => return,
-    };
-    let (snapshot_mmap, snapshot_brk, snapshot_brk_start, snapshot_next_mmap) = {
-        let parent = parent_arc.lock();
-        let mmap: alloc::collections::BTreeMap<usize, usize> = parent
-            .mmap_regions
-            .iter()
-            .map(|(&base, &len_with_flags)| {
-                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
-            })
-            .collect();
-        (mmap, parent.brk, parent.brk_start, parent.next_mmap_addr)
-    }; // parent lock dropped
-
-    // Phase 2: Write snapshot into child (single Process lock).
-    let child_arc = match table.get(child_pid).and_then(|s| s.as_ref()) {
-        Some(arc) => arc.clone(),
-        None => return,
-    };
-    let mut child = child_arc.lock();
-    child.mmap_regions = snapshot_mmap;
-    child.brk = snapshot_brk;
-    child.brk_start = snapshot_brk_start;
-    child.next_mmap_addr = snapshot_next_mmap;
-}
+// D3-ARC-MM-SHARED: The following sync_vm_siblings_* functions have been deleted.
+// With shared MmState (Arc<Mutex<MmState>>), CLONE_VM siblings share a single
+// MmState instance. Mutations are automatically visible to all siblings through
+// the shared Arc, eliminating the need for cross-task propagation:
+//   - atomic_remove_mmap_region()
+//   - atomic_mprotect_prot_none_transition() / atomic_mprotect_to_prot_none()
+//   - sync_vm_siblings_remove_mmap()
+//   - sync_vm_siblings_split_region()
+//   - sync_vm_siblings_brk()
+//   - sync_vm_siblings_add_mmap()
+//   - sync_vm_siblings_mprotect_flags()
+//   - reconcile_clone_vm_mmap_regions()
 
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
 ///
@@ -4055,10 +3588,16 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 /// * `proc` - 进程引用
 /// * `keep_address_space` - R24-1 fix: 如果为 true，不释放地址空间（其他线程仍在使用）
 fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTreeMap<i32, FileDescriptor> {
-    let region_count = proc.mmap_regions.len();
+    // D3-ARC-MM-SHARED: Lock the shared MmState to access mmap/brk metadata.
+    // For shared MmState (CLONE_VM), Arc::strong_count > 1 means other tasks
+    // still reference this mm — non-last exit must NOT uncharge cgroup memory.
+    let mm_shared = Arc::strong_count(&proc.mm) > 1;
+    let mut mm = proc.mm.lock();
+
+    let region_count = mm.mmap_regions.len();
     // R123-5 FIX: Mask low-bit flags (PENDING/PROT_NONE) before summing,
     // so diagnostic logs reflect actual region lengths, not inflated values.
-    let total_size: usize = proc
+    let total_size: usize = mm
         .mmap_regions
         .values()
         .map(|&v| crate::syscall::mmap_region_len(v))
@@ -4076,29 +3615,25 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
     // cgroup memory_current, eventually blocking all allocations in the cgroup
     // (user-triggerable container DoS).
     //
+    // D3-ARC-MM-SHARED: Under shared MmState, only the last task holding the
+    // Arc performs uncharge (mm_shared == false). Non-last exits skip uncharge
+    // to prevent double-uncharge / memory.max bypass.
+    //
     // Guard conditions:
     //   - !keep_address_space: When the address space is shared by threads
     //     (CLONE_VM), only the last thread to exit (keep_address_space=false)
     //     performs uncharge. This prevents double-uncharge of inherited entries.
+    //   - !mm_shared: Only the last MmState holder uncharges.
     //   - proc.memory_space != 0: Clone error paths zero memory_space before
     //     calling cleanup_unscheduled_process(). Those children inherited a
     //     snapshot of the parent's mmap_regions but never owned the charges;
     //     uncharging here would corrupt the parent's cgroup accounting.
     //
-    // R139-1 FIX: CLONE_VM snapshots mmap_regions at clone time (R123-3).
-    // Non-last tasks may have `vm_charged_bytes` from mmap()/brk(), but when
-    // keep_address_space=true the shared page tables (and their backing
-    // physical pages) remain alive. Do NOT uncharge vm_charged_bytes on
-    // non-last CLONE_VM exit: it would drop cgroup memory_current without
-    // freeing physical memory, enabling memory.max bypass via accounting
-    // undercount. Prefer safe over-counting (possible leaked charges) over
-    // under-counting.
-    //
     // Skip PROT_NONE reservations: they never allocated physical frames or
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
-    if !keep_address_space && proc.memory_space != 0 {
+    if !keep_address_space && !mm_shared && proc.memory_space != 0 {
         let cgroup_id = proc.cgroup_id;
-        for (&_base, &len_with_flags) in proc.mmap_regions.iter() {
+        for (&_base, &len_with_flags) in mm.mmap_regions.iter() {
             if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
                 continue;
             }
@@ -4109,13 +3644,10 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
         }
 
         // R127-3 FIX: Uncharge brk heap allocations from cgroup as well.
-        // sys_brk() charges via try_charge_memory() on growth, but exit/exec
-        // only uncharged mmap_regions — brk heap bytes remained permanently
-        // charged, leaking cgroup memory_current on every process exit.
         let heap_bytes = {
             const PAGE_SIZE: usize = 0x1000;
-            let brk_aligned = (proc.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            let brk_start_aligned = (proc.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let brk_aligned = (mm.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let brk_start_aligned = (mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             brk_aligned.saturating_sub(brk_start_aligned) as u64
         };
         if heap_bytes > 0 {
@@ -4123,24 +3655,22 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
         }
 
         // R137-1 FIX: Uncharge ELF loader allocations (PT_LOAD segments + user stack).
-        // load_elf() charges cgroup memory that is not tracked in mmap_regions or brk,
-        // so without this explicit uncharge, memory_current leaks ~2-8 MB per exec+exit.
-        let elf_bytes = proc.elf_charged_bytes;
+        let elf_bytes = mm.elf_charged_bytes;
         if elf_bytes > 0 {
             crate::cgroup::uncharge_memory(cgroup_id, elf_bytes);
-            proc.elf_charged_bytes = 0;
+            mm.elf_charged_bytes = 0;
         }
-    } else if keep_address_space && proc.memory_space != 0 {
-        // R139-1 FIX: Non-last CLONE_VM exit keeps the shared address space.
-        // The pages backing vm_charged_bytes remain mapped in the shared page
-        // tables, so uncharging here would undercount cgroup memory_current
-        // and enable memory.max bypass. Keep the cgroup charge (safe over-
-        // counting) and only clear the per-task counter for cleanup.
-        proc.vm_charged_bytes = 0;
+    } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
+        // Non-last CLONE_VM exit keeps the shared address space and MmState.
+        // Do NOT uncharge — pages remain mapped in the shared page tables.
+        mm.vm_charged_bytes = 0;
     }
 
-    // 清理 mmap 区域跟踪
-    proc.mmap_regions.clear();
+    // 清理 mmap 区域跟踪 (only clear if we are the last holder)
+    if !mm_shared {
+        mm.mmap_regions.clear();
+    }
+    drop(mm);
 
     // R154-3 FIX: Extract fd_table entries WITHOUT dropping them here.
     // Socket destructors (close → wake_all) can lock other Process PCBs,
@@ -4483,8 +4013,11 @@ pub fn get_process_stats() -> ProcessStats {
 ///
 /// This mirrors the uncharge logic in `free_process_resources()`.
 pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
+    // D3-ARC-MM-SHARED: Lock the shared MmState to read mmap/brk metadata.
+    let mm = proc.mm.lock();
+
     // Sum mmap region charges, skipping PROT_NONE reservations (never charged).
-    let mmap_bytes: u64 = proc
+    let mmap_bytes: u64 = mm
         .mmap_regions
         .iter()
         .filter_map(|(&_base, &len_with_flags)| {
@@ -4498,28 +4031,22 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
 
     // Compute brk heap charge (page-aligned).
     const PAGE_SIZE: usize = 0x1000;
-    let brk_aligned = (proc.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let brk_start_aligned = (proc.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let brk_aligned = (mm.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let brk_start_aligned = (mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let heap_bytes = brk_aligned.saturating_sub(brk_start_aligned) as u64;
 
     // R144-1 FIX: Include pending brk growth that has been charged to the
-    // cgroup but not yet reflected in proc.brk (lock dropped for PT ops).
-    // Without this, cgroup migration during the window reads stale brk and
-    // transfers insufficient charges to the destination cgroup.
-    let pending_brk = proc.brk_pending_growth;
+    // cgroup but not yet reflected in mm.brk (lock dropped for PT ops).
+    let pending_brk = mm.brk_pending_growth;
 
-    // R147-1 FIX: Include pending mprotect PROT_NONE→real charges that have
-    // been charged to the cgroup but not yet reflected in mmap_regions (lock
-    // dropped for PT operations in Step 2 of sys_mprotect Path A).
-    let pending_mprotect = proc.mprotect_pending_bytes;
+    // R147-1 FIX: Include pending mprotect PROT_NONE->real charges.
+    let pending_mprotect = mm.mprotect_pending_bytes;
 
-    // R149-3 FIX: Include pending exec (load_elf) charges that have been
-    // charged to the cgroup but not yet reflected in elf_charged_bytes.
-    // Non-zero only between load_elf() success and exec commit/rollback.
-    let pending_exec = proc.exec_pending_bytes;
+    // R149-3 FIX: Include pending exec (load_elf) charges.
+    let pending_exec = mm.exec_pending_bytes;
 
     // ELF loader charges (PT_LOAD segments + user stack).
-    let elf_bytes = proc.elf_charged_bytes;
+    let elf_bytes = mm.elf_charged_bytes;
 
     mmap_bytes
         .saturating_add(heap_bytes)
@@ -4581,12 +4108,15 @@ pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
 
             // 计算 RSS（简化实现：使用 mmap 区域大小估算）
             // R123-5 FIX: Mask low-bit flags before summing for accurate RSS.
-            let rss_pages = (proc
-                .mmap_regions
-                .values()
-                .map(|&v| crate::syscall::mmap_region_len(v))
-                .sum::<usize>()
-                / 4096) as u64;
+            // D3-ARC-MM-SHARED: Lock shared MmState to read mmap_regions.
+            let rss_pages = {
+                let mm = proc.mm.lock();
+                (mm.mmap_regions
+                    .values()
+                    .map(|&v| crate::syscall::mmap_region_len(v))
+                    .sum::<usize>()
+                    / 4096) as u64
+            };
 
             // R39-3 FIX: 使用共享凭证获取 uid/gid
             let creds = proc.credentials.read();
