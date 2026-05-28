@@ -1070,7 +1070,11 @@ impl ConntrackTable {
     /// Should be called periodically from timer context.
     /// Returns the number of entries removed.
     pub fn sweep(&self, now_ms: u64, budget: usize) -> usize {
+        // R163-24 FIX: Fallible allocation for timer-context sweep.
         let mut to_remove = Vec::new();
+        if to_remove.try_reserve(budget.min(CT_SWEEP_BUDGET)).is_err() {
+            return 0;
+        }
 
         // Collect expired keys with read lock
         {

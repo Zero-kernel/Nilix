@@ -323,8 +323,17 @@ impl Inode for ProcSelfSymlink {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        // R163-30 FIX: Check PID namespace visibility and access permission,
+        // not just existence. A recycled PID might be visible but belong to a
+        // different namespace than the caller expected.
         if !process_exists(self.target_pid) {
             return Err(FsError::NotFound);
+        }
+        if !is_pid_visible_in_caller_ns(self.target_pid as u32) {
+            return Err(FsError::NotFound);
+        }
+        if !can_access_pid(self.target_pid as u32) {
+            return Err(FsError::PermDenied);
         }
         self.pid_dir().readdir(offset)
     }

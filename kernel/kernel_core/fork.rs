@@ -307,9 +307,11 @@ fn fork_inner(
         // SMP: inherit CPU affinity from parent
         child.allowed_cpus = parent.allowed_cpus;
 
-        // E.5 Cpuset: inherit cpuset from parent and update task count
+        // E.5 Cpuset: inherit cpuset from parent.
+        // R163-4 FIX: Defer notify_cpuset_task_joined until after all fallible
+        // operations complete. If fork_inner fails after the notification,
+        // the counter is incremented but never decremented (cpuset DoS).
         child.cpuset_id = parent.cpuset_id;
-        crate::process::notify_cpuset_task_joined(parent.cpuset_id);
 
         // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
         // 复制父进程内核栈内容以保持返回路径一致
@@ -469,6 +471,10 @@ fn fork_inner(
         child.seccomp_state = parent.seccomp_state.try_clone()
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
         child.pledge_state = parent.pledge_state.clone();
+
+        // R163-4 FIX: All fallible operations above have succeeded. Safe to
+        // commit the cpuset counter increment now — no error path can leak it.
+        crate::process::notify_cpuset_task_joined(child.cpuset_id);
 
         // 复制线程支持状态
         // 【注意】fork 创建的是新进程，不是线程
@@ -955,12 +961,17 @@ impl CowClonePlan {
         }
     }
 
-    fn record_leaf(&mut self, entry: &mut PageTableEntry) {
+    // R163-36 FIX: Fallible push to prevent OOM panic during COW planning.
+    fn record_leaf(&mut self, entry: &mut PageTableEntry) -> Result<(), ForkError> {
+        if self.leaf_updates.try_reserve(1).is_err() {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
         self.leaf_updates.push(LeafUpdate {
             entry_ptr: entry as *mut PageTableEntry,
             original_flags: entry.flags(),
             phys_addr: entry.addr(),
         });
+        Ok(())
     }
 }
 
@@ -983,7 +994,7 @@ fn plan_clone_level(
 
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             // 叶子节点：记录到计划中
-            plan.record_leaf(entry);
+            plan.record_leaf(entry)?;
         } else {
             // 中间节点：计数并递归
             plan.tables_needed += 1;
@@ -1006,7 +1017,11 @@ fn preallocate_table_frames(
     count: usize,
     frame_alloc: &mut FrameAllocator,
 ) -> Result<Vec<PhysFrame<Size4KiB>>, ForkError> {
-    let mut frames = Vec::with_capacity(count);
+    // R163-5 FIX: Fallible allocation to prevent OOM panic during fork.
+    let mut frames = Vec::new();
+    if frames.try_reserve_exact(count).is_err() {
+        return Err(ForkError::MemoryAllocationFailed);
+    }
     for _ in 0..count {
         match frame_alloc.allocate_frame() {
             Some(frame) => frames.push(frame),

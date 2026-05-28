@@ -196,6 +196,12 @@ static SMAP_GUARD_DEPTH: CpuLocal<AtomicUsize> = CpuLocal::new(|| AtomicUsize::n
 /// deadlock inside CpuLocal's lazy heap allocation.
 pub fn force_init_usercopy_locals() {
     SMAP_GUARD_DEPTH.force_init();
+    // R163-6 FIX: Also force-init USER_COPY_STATE, which is accessed from
+    // the page fault handler (try_handle_usercopy_fault). Without this,
+    // a page fault during the first usercopy triggers lazy heap allocation
+    // inside exception context — potential deadlock if the allocator lock
+    // is already held by the faulting path.
+    USER_COPY_STATE.force_init();
 }
 
 /// Helper to get current process PID (0 if none)
@@ -338,9 +344,12 @@ impl Drop for UserAccessGuard {
         if self.smap_active {
             // Only execute CLAC when this is the outermost guard (depth 1→0)
             // V-5 fix: Use per-CPU depth counter
+            // R163-I4 FIX: Check BEFORE atomic sub to avoid leaving the counter
+            // at usize::MAX on underflow. The assert after fetch_sub would panic
+            // anyway, but the counter state would be corrupted.
+            let cur_depth = SMAP_GUARD_DEPTH.with(|d| d.load(Ordering::Relaxed));
+            assert!(cur_depth > 0, "SMAP guard depth underflow");
             let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
-            // Check for underflow (should never happen with correct nesting)
-            assert!(prev_depth > 0, "SMAP guard depth underflow");
             if prev_depth == 1 {
                 // Clear AC flag to restore SMAP protection
                 unsafe {

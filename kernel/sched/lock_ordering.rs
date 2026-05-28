@@ -54,8 +54,7 @@
 //! │
 //! Level 9 (Audit/Security)
 //! ├── AUDIT_RING
-//! ├── RNG_STATE
-//! └── KPTR_KEY
+//! └── RNG_STATE
 //! ```
 //!
 //! # Lock Ordering Rules

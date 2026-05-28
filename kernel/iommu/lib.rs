@@ -150,6 +150,8 @@ static IOMMU_UNITS: Lazy<RwLock<Vec<Arc<VtdUnit>>>> = Lazy::new(|| RwLock::new(V
 
 /// Registry of domains.
 static DOMAINS: Lazy<RwLock<Vec<Arc<Domain>>>> = Lazy::new(|| RwLock::new(Vec::new()));
+// R163-I8 FIX: Monotonic domain ID counter independent of Vec length.
+static NEXT_DOMAIN_ID: AtomicU32 = AtomicU32::new(0);
 
 /// VM domain registry: maps domain ID to VM identifier.
 /// Used to distinguish VM passthrough domains from kernel domains.
@@ -277,8 +279,8 @@ pub fn init() -> IommuResult<u32> {
         Err(DmarError::NotFound) => {
             klog_always!("[IOMMU] No DMAR table found - IOMMU not available");
             // R90-1 NOTE: No IOMMU hardware present - allow legacy bypass.
-            // Only mark INIT_FAILED when hardware exists but init fails,
-            // not when hardware is absent (backward compatibility).
+            // R163-I6 FIX: Mark INIT_DONE to prevent redundant re-entries.
+            IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
             return Err(IommuError::NoDmarTable);
         }
         Err(e) => {
@@ -810,7 +812,7 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
         return Err(IommuError::TooManyDomains);
     }
 
-    let id = domains.len() as DomainId;
+    let id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst) as DomainId;
     let domain = match domain_type {
         DomainType::Identity => {
             // R94-13 FIX: Identity domains are only allowed when the
@@ -944,7 +946,7 @@ pub fn create_vm_domain(vm_id: u64) -> IommuResult<DomainId> {
         return Err(IommuError::TooManyDomains);
     }
 
-    let id = domains.len() as DomainId;
+    let id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst) as DomainId;
     let domain = Domain::new_paged(id)?;
     domains.push(Arc::new(domain));
 

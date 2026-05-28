@@ -258,11 +258,12 @@ impl Pipe {
             let should_wait = {
                 let mut inner = self.inner.lock();
 
-                // 检查读端是否全部关闭
+                // R163-33 FIX: Always return BrokenPipe when readers == 0,
+                // even if partial data was written. POSIX allows either
+                // partial count or EPIPE, but Linux delivers SIGPIPE/EPIPE
+                // unconditionally. Returning Ok(partial) silently hides the
+                // broken pipe from the caller.
                 if inner.readers == 0 {
-                    if total_written > 0 {
-                        return Ok(total_written);
-                    }
                     return Err(PipeError::BrokenPipe);
                 }
 

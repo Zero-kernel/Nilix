@@ -620,23 +620,56 @@ pub struct TcpOptions {
 ///
 /// Returns the raw bytes for the option, including kind and length fields
 /// where applicable. Single-byte options (End, NOP) return just the kind byte.
+///
+/// R163-10 FIX: All heap allocations in option serialization now use
+/// try_reserve / try_reserve_exact so OOM returns an empty Vec instead of
+/// panicking. serialize_tcp_options detects empty returns and propagates
+/// the failure by returning its own empty Vec.
 pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
     match *option {
-        TcpOptionKind::EndOfList => vec![0],
-        TcpOptionKind::Nop => vec![1],
+        // R163-10 FIX: Single-element vec![] macros use infallible global
+        // alloc; replace with try_reserve + push for OOM safety on all paths.
+        TcpOptionKind::EndOfList => {
+            let mut b = Vec::new();
+            if b.try_reserve(1).is_err() { return Vec::new(); }
+            b.push(0);
+            b
+        }
+        TcpOptionKind::Nop => {
+            let mut b = Vec::new();
+            if b.try_reserve(1).is_err() { return Vec::new(); }
+            b.push(1);
+            b
+        }
         TcpOptionKind::Mss(mss) => {
-            let mut bytes = Vec::with_capacity(4);
+            // R163-10 FIX: 4-byte option, reserved fallibly.
+            let mut bytes = Vec::new();
+            if bytes.try_reserve(4).is_err() { return Vec::new(); }
             bytes.extend_from_slice(&[2, 4]); // kind=2, len=4
             bytes.extend_from_slice(&mss.to_be_bytes());
             bytes
         }
-        TcpOptionKind::WindowScale(scale) => vec![3, 3, scale], // kind=3, len=3, shift
-        TcpOptionKind::SackPermitted => vec![4, 2],             // kind=4, len=2
+        TcpOptionKind::WindowScale(scale) => {
+            // R163-10 FIX: 3-byte option, reserved fallibly.
+            let mut b = Vec::new();
+            if b.try_reserve(3).is_err() { return Vec::new(); }
+            b.extend_from_slice(&[3, 3, scale]);
+            b
+        }
+        TcpOptionKind::SackPermitted => {
+            // R163-10 FIX: 2-byte option, reserved fallibly.
+            let mut b = Vec::new();
+            if b.try_reserve(2).is_err() { return Vec::new(); }
+            b.extend_from_slice(&[4, 2]);
+            b
+        }
         TcpOptionKind::Sack(ref blocks) => {
             // kind=5, len = 2 + 8*n (each block is 4+4 bytes)
             let count = blocks.len().min(TCP_SACK_MAX_BLOCKS);
             let len = 2u8.saturating_add((count as u8).saturating_mul(8));
-            let mut bytes = Vec::with_capacity(len as usize);
+            // R163-10 FIX: SACK option is largest (up to 34 bytes), reserved fallibly.
+            let mut bytes = Vec::new();
+            if bytes.try_reserve(len as usize).is_err() { return Vec::new(); }
             bytes.push(5);   // kind
             bytes.push(len);
             for block in blocks.iter().take(count) {
@@ -646,7 +679,9 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
             bytes
         }
         TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
-            let mut bytes = Vec::with_capacity(10);
+            // R163-10 FIX: 10-byte option, reserved fallibly.
+            let mut bytes = Vec::new();
+            if bytes.try_reserve(10).is_err() { return Vec::new(); }
             bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
             bytes.extend_from_slice(&ts_val.to_be_bytes());
             bytes.extend_from_slice(&ts_ecr.to_be_bytes());
@@ -655,7 +690,9 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
         TcpOptionKind::Unknown { kind, len } => {
             // Ensure minimum length of 2 (kind + length bytes)
             let effective_len = len.max(2);
-            let mut bytes = Vec::with_capacity(effective_len as usize);
+            // R163-10 FIX: Variable-length unknown option, reserved fallibly.
+            let mut bytes = Vec::new();
+            if bytes.try_reserve(effective_len as usize).is_err() { return Vec::new(); }
             bytes.push(kind);
             bytes.push(effective_len);
             bytes.resize(effective_len as usize, 0);
@@ -672,17 +709,51 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
 /// 3. Pads with NOP (0x00) bytes to ensure 32-bit alignment
 ///
 /// Returns empty Vec if no options provided (no padding needed for minimal header).
+///
+/// R163-10 FIX: TCP options are bounded by TCP_HEADER_MAX_LEN (60) minus the
+/// minimum header (20), leaving at most 40 bytes of option space.
+///
+/// Safety guarantees:
+/// - Upfront fallible reservation of 40 bytes prevents realloc panics.
+/// - Each option's serialized bytes are length-checked against remaining space
+///   before extend_from_slice, ensuring the Vec never needs to grow.
+/// - EOL marker and padding bytes are also space-checked before push.
+/// - On any failure (OOM or serialize_tcp_option returning empty for a
+///   non-empty option), returns an empty Vec. The caller
+///   (build_tcp_segment_with_options) interprets this as "no options", which
+///   causes it to build only the 20-byte minimum header — a safe degradation.
 pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> Vec<u8> {
     if options.is_empty() {
         return Vec::new();
     }
 
+    // R163-10 FIX: Fallible pre-reservation of the full option space.
+    // Max option space = TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN = 40 bytes.
+    let max_opts = TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN;
     let mut bytes = Vec::new();
+    if bytes.try_reserve(max_opts).is_err() {
+        return Vec::new();
+    }
     let mut has_end = false;
 
     for opt in options {
         let opt_bytes = serialize_tcp_option(opt);
-        bytes.extend_from_slice(&opt_bytes);
+        // R163-10 FIX: OOM in serialize_tcp_option produces an empty Vec for
+        // non-empty options. Detect this and abort (return empty = no options).
+        let is_nop_or_eol = matches!(opt, TcpOptionKind::Nop | TcpOptionKind::EndOfList);
+        if opt_bytes.is_empty() && !is_nop_or_eol {
+            // A non-trivial option failed to allocate — abort serialization.
+            return Vec::new();
+        }
+        // R163-10 FIX: Hard cap: skip options that would overflow the 40-byte
+        // option space rather than growing the Vec infallibly.
+        if bytes.len() + opt_bytes.len() <= max_opts {
+            bytes.extend_from_slice(&opt_bytes);
+        } else {
+            // Oversized option combination: truncate here; the EOL + padding
+            // added below will fill remaining space correctly.
+            break;
+        }
 
         if matches!(opt, TcpOptionKind::EndOfList) {
             has_end = true;
@@ -690,12 +761,13 @@ pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> Vec<u8> {
         }
     }
 
-    // Append End-of-List if not present
-    if !has_end {
+    // Append End-of-List if not present and space permits.
+    if !has_end && bytes.len() < max_opts {
         bytes.push(0);
     }
 
-    // Pad to 32-bit boundary with zeroes (same as NOP bytes after End)
+    // Pad to 32-bit boundary with zeroes (same as NOP bytes after End).
+    // Space is guaranteed since we pre-reserved 40 bytes and bytes.len() <= 40.
     while bytes.len() % 4 != 0 {
         bytes.push(0);
     }
@@ -1282,6 +1354,11 @@ impl TcpControlBlock {
                     if useful.len() > room {
                         break;
                     }
+                    // R163-2 FIX: Fallible allocation before extend, matching
+                    // the R162-9 pattern applied to socket.rs in-order paths.
+                    if self.recv_buffer.try_reserve(useful.len()).is_err() {
+                        break;
+                    }
                     self.recv_buffer.extend(useful);
                     let useful_len = useful.len() as u32;
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(useful_len);
@@ -1332,8 +1409,19 @@ impl TcpControlBlock {
     /// Returns up to `TCP_SACK_MAX_BLOCKS` blocks describing the contiguous
     /// ranges in the OOO queue. The most recently inserted range is placed
     /// first (RFC 2018 Section 3 recommendation), followed by earlier ranges.
+    ///
+    /// R163-10 FIX: Reserve SACK block storage fallibly before the loop so
+    /// the OOO receive path returns an empty block list instead of panicking
+    /// on OOM. TCP_SACK_MAX_BLOCKS is always 4, so this is a bounded heap
+    /// reservation. Callers already handle the empty-blocks case as a plain
+    /// ACK, making silent degradation correct protocol behaviour.
     pub fn generate_sack_blocks(&self) -> Vec<SackBlock> {
-        let mut blocks = Vec::with_capacity(TCP_SACK_MAX_BLOCKS);
+        let mut blocks = Vec::new();
+        // R163-10 FIX: Fallible upfront reservation (max 4 elements).
+        // On OOM return empty vec; caller falls back to plain ACK.
+        if blocks.try_reserve(TCP_SACK_MAX_BLOCKS).is_err() {
+            return Vec::new();
+        }
         for seg in self.ooo_queue.iter().rev().take(TCP_SACK_MAX_BLOCKS) {
             // R145-5 FIX: FIN occupies one sequence number after the data
             // payload.  Include it in right_edge so the peer doesn't
@@ -2369,7 +2457,18 @@ pub fn build_tcp_segment(
     payload: &[u8],
 ) -> Vec<u8> {
     let header = TcpHeader::new(src_port, dst_port, seq_num, ack_num, flags, window);
-    let mut segment = Vec::with_capacity(TCP_HEADER_MIN_LEN + payload.len());
+    // R163-10 FIX: Use checked_add to guard against theoretical usize overflow
+    // (e.g. payload near usize::MAX), then reserve fallibly so OOM returns an
+    // empty Vec rather than panicking. The IP layer's build_frame_and_transmit
+    // already rejects empty payloads with TxError::InvalidBuffer, so callers
+    // that ignore the Err result silently drop the packet — correct behaviour.
+    let Some(segment_len) = TCP_HEADER_MIN_LEN.checked_add(payload.len()) else {
+        return Vec::new();
+    };
+    let mut segment = Vec::new();
+    if segment.try_reserve_exact(segment_len).is_err() {
+        return Vec::new();
+    }
     segment.extend_from_slice(&header.to_bytes());
     segment.extend_from_slice(payload);
 
@@ -2434,7 +2533,16 @@ pub fn build_tcp_segment_with_options(
     header.data_offset = (header_len / 4) as u8;
 
     // Build segment: header + options + payload
-    let mut segment = Vec::with_capacity(header_len + payload.len());
+    // R163-10 FIX: Reserve complete option-bearing segment storage fallibly so
+    // OOM or capacity overflow returns an empty Vec rather than panicking.
+    // The IP layer rejects empty payloads, so callers silently drop the packet.
+    let Some(segment_len) = header_len.checked_add(payload.len()) else {
+        return Vec::new();
+    };
+    let mut segment = Vec::new();
+    if segment.try_reserve_exact(segment_len).is_err() {
+        return Vec::new();
+    }
     segment.extend_from_slice(&header.to_bytes());
     segment.extend_from_slice(&options_bytes);
     segment.extend_from_slice(payload);

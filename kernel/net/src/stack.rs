@@ -284,7 +284,7 @@ pub fn process_frame(
     }
 
     // Route to protocol handler
-    match eth_hdr.ethertype {
+    let result = match eth_hdr.ethertype {
         ETHERTYPE_IPV4 => {
             // R90-2 FIX: Pass network namespace to IPv4 handler
             process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, net_ns_id, now_ms)
@@ -308,7 +308,116 @@ pub fn process_frame(
             stats.inc_unsupported_proto();
             ProcessResult::Dropped(DropReason::UnsupportedEtherType)
         }
+    };
+
+    // R163-7 FIX: All ingress reply frames (ICMP echo replies, TCP RSTs, firewall REJECT
+    // responses, ARP replies) were previously returned directly to the caller, bypassing the
+    // egress firewall added in R161-7. Intercept every Reply here and apply the egress
+    // firewall before allowing the frame to leave. Frames that fail the egress check are
+    // silently dropped so the caller sees Dropped(Firewall) instead of Reply.
+    if let ProcessResult::Reply(ref reply_frame) = result {
+        if !egress_firewall_allows_reply(reply_frame, net_ns_id.0, now_ms) {
+            return ProcessResult::Dropped(DropReason::Firewall {
+                rule_id: None,
+                rejected: false,
+            });
+        }
     }
+    result
+}
+
+/// R163-7 FIX: Evaluate an outbound reply frame against the egress firewall.
+///
+/// Parses the complete Ethernet+IPv4 frame, extracts protocol/port information,
+/// and evaluates the egress firewall rules for the given namespace. Returns
+/// `true` if the frame is allowed (ACCEPT verdict), `false` if it should be
+/// dropped (DROP or REJECT verdict).
+///
+/// ARP frames (non-IPv4) are always allowed because ARP has no IP-level firewall
+/// semantics. Frames that cannot be parsed default to allow (fail-open) so that
+/// a malformed reply frame still reaches the caller rather than being silently
+/// dropped — the caller can then handle the parse error itself.
+#[cfg(feature = "conntrack")]
+fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bool {
+    use crate::conntrack::{conntrack_table, FlowKey};
+
+    // Parse Ethernet header; non-IPv4 frames (ARP, etc.) are passed through.
+    let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    if eth_hdr.ethertype != ETHERTYPE_IPV4 {
+        return true;
+    }
+
+    // Parse IPv4 header.
+    let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+
+    let proto = match ip_hdr.proto() {
+        Some(p) => p,
+        None => return true,
+    };
+
+    // Extract transport-layer ports for TCP/UDP.
+    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
+        && l4_bytes.len() >= 4
+    {
+        (
+            Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
+            Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
+        )
+    } else {
+        (None, None)
+    };
+
+    // Derive conntrack state from the tracking table.
+    let ct_decision = {
+        let sp = src_port.unwrap_or(0);
+        let dp = dst_port.unwrap_or(0);
+        let proto_u8 = match proto {
+            Ipv4Proto::Tcp  => 6u8,
+            Ipv4Proto::Udp  => 17u8,
+            Ipv4Proto::Icmp => 1u8,
+            _               => 0u8,
+        };
+        let (key, _) = FlowKey::from_packet(
+            net_ns_id, proto_u8, ip_hdr.src, ip_hdr.dst, sp, dp,
+        );
+        conntrack_table()
+            .lookup(&key)
+            .map(|e| if e.seen_reply {
+                crate::conntrack::CtDecision::Established
+            } else {
+                crate::conntrack::CtDecision::New
+            })
+    };
+
+    let fw_pkt = FirewallPacket {
+        net_ns_id,
+        src_ip: ip_hdr.src,
+        dst_ip: ip_hdr.dst,
+        proto,
+        src_port,
+        dst_port,
+        ct_state: ct_decision,
+    };
+
+    let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
+    crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
+
+    matches!(fw_verdict.action, FirewallAction::Accept)
+}
+
+/// R163-7 FIX (non-conntrack build): Without conntrack the egress firewall
+/// cannot evaluate stateful rules; pass all reply frames through so we do not
+/// break the non-conntrack configuration.
+#[cfg(not(feature = "conntrack"))]
+#[inline(always)]
+fn egress_firewall_allows_reply(_frame: &[u8], _net_ns_id: u64, _now_ms: u64) -> bool {
+    true
 }
 
 /// Process an IPv4 packet.
@@ -999,6 +1108,64 @@ fn build_frame_and_transmit(
         let fw_verdict = fw_table.evaluate(&fw_pkt);
         if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
             return Err(TxError::InvalidBuffer);
+        }
+
+        // R163-8 FIX: Egress conntrack was read-only — it performed a lookup to
+        // derive ct_state for the firewall but never called ct_process_tcp /
+        // ct_process_udp to create or advance the connection tracking entry.
+        // As a result, an outbound SYN was never inserted into the table, so the
+        // returning SYN-ACK was classified as Invalid and dropped by the stateful
+        // firewall. Fix: after an ACCEPT verdict, create/update the conntrack
+        // entry for TCP and UDP so the reply direction is tracked correctly.
+        {
+            // build_frame_and_transmit has no now_ms parameter; use the same
+            // source as resolve_dst_mac (the socket tick hook).
+            let ct_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+            let sp = src_port.unwrap_or(0);
+            let dp = dst_port.unwrap_or(0);
+            match proto {
+                Ipv4Proto::Tcp if sp != 0 || dp != 0 => {
+                    use crate::conntrack::ct_process_tcp;
+                    // Derive TCP flags from the segment: flags are at byte offset 13
+                    // of a standard TCP header (src_port[2] dst_port[2] seq[4] ack[4]
+                    // data_off[1] flags[1] ...).
+                    let tcp_flags = if payload.len() >= 14 { payload[13] } else { 0 };
+                    let tcp_data_len = {
+                        // data offset is upper nibble of byte 12, in 4-byte units
+                        let data_off = if payload.len() >= 13 {
+                            ((payload[12] >> 4) as usize) * 4
+                        } else {
+                            20
+                        };
+                        payload.len().saturating_sub(data_off)
+                    };
+                    let _ = ct_process_tcp(
+                        net_ns_id,
+                        cfg_pre.our_ip,
+                        dst_ip,
+                        sp,
+                        dp,
+                        tcp_flags,
+                        tcp_data_len,
+                        ct_now_ms,
+                    );
+                }
+                Ipv4Proto::Udp if sp != 0 || dp != 0 => {
+                    use crate::conntrack::ct_process_udp;
+                    // UDP header is 8 bytes; payload follows immediately.
+                    let udp_data_len = payload.len().saturating_sub(8);
+                    let _ = ct_process_udp(
+                        net_ns_id,
+                        cfg_pre.our_ip,
+                        dst_ip,
+                        sp,
+                        dp,
+                        udp_data_len,
+                        ct_now_ms,
+                    );
+                }
+                _ => {}
+            }
         }
     }
 

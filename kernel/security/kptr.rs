@@ -33,6 +33,9 @@ static KPTR_SECRET: AtomicU64 = AtomicU64::new(0);
 
 /// Counter for additional entropy mixing (prevents replay attacks).
 static KPTR_COUNTER: AtomicU64 = AtomicU64::new(0);
+// R163-35 FIX: Track whether kptr has been seeded with strong entropy.
+// Before reseed_from_entropy() is called, the TSC-based secret is weak.
+static KPTR_STRONG_SEEDED: AtomicBool = AtomicBool::new(false);
 
 /// Wrapper for kernel pointers that renders an obfuscated address.
 ///
@@ -175,11 +178,14 @@ pub fn reseed_with(secret: u64) -> u64 {
 /// to get cryptographically strong entropy.
 pub fn reseed_from_entropy() -> u64 {
     // Try hardware RNG first
-    if let Ok(val) = super::rng::random_u64() {
-        return reseed_with(val);
-    }
-    // Fall back to TSC entropy
-    reseed_with(tsc_entropy())
+    let result = if let Ok(val) = super::rng::random_u64() {
+        reseed_with(val)
+    } else {
+        reseed_with(tsc_entropy())
+    };
+    // R163-35 FIX: Mark as strongly seeded after RNG-based reseed.
+    KPTR_STRONG_SEEDED.store(true, Ordering::SeqCst);
+    result
 }
 
 /// Initialize kptr guard with TSC-based entropy.

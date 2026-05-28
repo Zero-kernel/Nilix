@@ -615,6 +615,8 @@ impl FragmentCache {
         let offset = header.fragment_offset() * 8;
         let more_fragments = header.more_fragments();
 
+        // R163-27 FIX: Document lock ordering — `queues` before `per_src_counts`.
+        // Both are always acquired in this order; never reverse.
         let mut queues = self.queues.lock();
         let mut per_src = self.per_src_counts.lock();
 

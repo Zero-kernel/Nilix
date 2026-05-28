@@ -845,12 +845,14 @@ fn wait_for_acks_with_retry(
 /// Warn about timeout waiting for ACKs (non-fatal, for debugging)
 fn warn_timeout(targets: &[usize], generation: u64) {
     // Find which CPUs didn't ACK
+    // R163-I7 FIX: Use unwrap_or(true) for consistency with get_unacked_cpus —
+    // a missing mailbox means we cannot confirm ACK, so assume NOT acked.
     let missing: Vec<usize> = targets
         .iter()
         .filter(|&&cpu| {
             mailbox_for_cpu(cpu)
                 .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
-                .unwrap_or(false)
+                .unwrap_or(true)
         })
         .copied()
         .collect();

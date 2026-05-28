@@ -3308,8 +3308,13 @@ fn sys_clone(
         child.tid = child_pid; // tid == pid (Linux 语义)
         if flags & CLONE_THREAD != 0 {
             // R26-3 FIX: Reject thread creation if parent is installing seccomp filter
-            // This prevents TOCTOU race where new thread escapes sandbox
-            if parent_seccomp_installing {
+            // R163-13 FIX: Re-check the live flag (not just snapshot) after
+            // create_process, closing the TOCTOU window where sys_seccomp
+            // sets the flag between snapshot and this check.
+            let live_seccomp_installing = get_process(parent_pid)
+                .map(|p| p.lock().seccomp_installing)
+                .unwrap_or(false);
+            if parent_seccomp_installing || live_seccomp_installing {
                 // Clean up: terminate the child process we just created
                 child.state = ProcessState::Terminated;
                 drop(child);
@@ -4346,6 +4351,8 @@ fn sys_exec(
 
         // Seccomp 过滤器在 exec 后保持不变（Linux 语义）
         // no_new_privs 仍然有效，防止特权提升
+        // R163-12 FIX: Clear stale seccomp_installing flag on exec.
+        proc.seccomp_installing = false;
 
         // 应用 CLOEXEC 能力：撤销带有 CLOEXEC 标志的能力条目
         //
@@ -4818,10 +4825,12 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         // - Only processes whose UIDs match at the host level can signal each other
         //
         // For root namespace processes, map_uid_from_ns returns identity.
+        // R163-14 FIX: Single lookup — prevents TOCTOU on user_ns if setns
+        // runs between two separate lookups.
         let sender_ns = {
             let self_proc = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
-            let ns = self_proc.lock().user_ns.clone();
-            ns
+            let guard = self_proc.lock();
+            guard.user_ns.clone()
         };
         let target_ns = {
             let ns = target.lock().user_ns.clone();
@@ -5212,9 +5221,8 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    // 预先验证用户缓冲区可写
-    // 这避免了创建管道后因 copy_to_user 失败导致的 fd 泄漏
-    validate_user_ptr(fds as *const u8, core::mem::size_of::<[i32; 2]>())?;
+    // R163-I1 FIX: Removed redundant validate_user_ptr — verify_user_memory
+    // already calls validate_user_ptr internally as its first step.
     verify_user_memory(fds as *const u8, core::mem::size_of::<[i32; 2]>(), true)?;
 
     // 获取回调函数指针并立即释放锁
@@ -6060,7 +6068,13 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // compute_cgroup_charged_bytes() includes it even though brk
         // hasn't been updated yet. This closes the TOCTOU window where
         // cgroup migration could read stale brk during the lock drop.
-        mm_arc.lock().brk_pending_growth = grow_size as u64;
+        // R163-9 FIX: Use saturating_add instead of overwrite to prevent
+        // concurrent CLONE_VM sys_brk calls from clobbering each other's
+        // pending growth (same pattern as R162-3 for mprotect_pending_bytes).
+        {
+            let mut mm = mm_arc.lock();
+            mm.brk_pending_growth = mm.brk_pending_growth.saturating_add(grow_size as u64);
+        }
 
         // 释放 Process 锁后进行映射操作
         drop(proc);
@@ -6199,7 +6213,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
             // a charge that is about to be rolled back.
             let rollback_cgroup_id = {
                 let proc = process.lock();
-                mm_arc.lock().brk_pending_growth = 0;
+                // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
+                let mut mm = mm_arc.lock();
+                mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
                 proc.cgroup_id
             };
             cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
@@ -6215,14 +6231,16 @@ fn sys_brk(addr: usize) -> SyscallResult {
         {
             let mut mm = mm_arc.lock();
             if mm.brk != old_brk {
-                mm.brk_pending_growth = 0;
+                // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
+                mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
                 drop(mm);
                 let rollback_cgroup_id = process.lock().cgroup_id;
                 cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
                 return Ok(mm_arc.lock().brk);
             }
             mm.brk = addr;
-            mm.brk_pending_growth = 0;
+            // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
+            mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_add(grow_size as u64);
@@ -8444,8 +8462,8 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
         c => c,
     };
 
-    // 验证用户缓冲区
-    validate_user_ptr_mut(buf, count)?;
+    // R163-I1 FIX: Removed redundant validate_user_ptr_mut — verify_user_memory
+    // already calls validate_user_ptr internally.
     verify_user_memory(buf as *const u8, count, true)?;
 
     // R40-1 FIX: 使用 CSPRNG (ChaCha20) 生成随机数据

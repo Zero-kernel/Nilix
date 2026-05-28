@@ -285,7 +285,9 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // 验证 canonical（虽然上面的范围检查已经隐含了这一点，但显式检查更安全）
     let sign_extended = ((entry as i64) >> 47) as u64;
     if sign_extended != 0 && sign_extended != 0x1FFFF {
-        klog!(Error, "ELF loader: non-canonical entry point 0x{:x}", entry);
+        // R163-22 FIX: Use Debug level — Error would expose attacker-controlled
+        // values in production logs (PO-8 / INV-11 compliance).
+        klog!(Debug, "ELF loader: non-canonical entry point");
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
@@ -716,16 +718,17 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
 }
 
 /// 打印 ELF 文件信息（调试用）
+// R163-21 FIX: Use Debug level — Info-level VA disclosure aids ASLR bypass.
 pub fn print_elf_info(image: &[u8]) {
     if let Ok(elf) = ElfFile::new(image) {
         let hdr = &elf.header;
-        klog!(Info, "=== ELF Info ===");
-        klog!(Info, "Entry point: 0x{:x}", hdr.pt2.entry_point());
-        klog!(Info, "Program headers: {}", hdr.pt2.ph_count());
+        klog!(Debug, "=== ELF Info ===");
+        klog!(Debug, "Entry point: 0x{:x}", hdr.pt2.entry_point());
+        klog!(Debug, "Program headers: {}", hdr.pt2.ph_count());
 
         for (i, ph) in elf.program_iter().enumerate() {
             if ph.get_type() == Ok(PhType::Load) {
-                klog!(Info, 
+                klog!(Debug,
                     "  Segment {}: vaddr=0x{:x}, memsz=0x{:x}, filesz=0x{:x}",
                     i,
                     ph.virtual_addr(),

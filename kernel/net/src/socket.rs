@@ -1608,14 +1608,18 @@ impl SocketTable {
         // Build ACK with SACK option (kind=5).
         // NOP padding before SACK aligns to 32-bit boundary:
         //   NOP, NOP, SACK(blocks...)
-        let mut opts: Vec<TcpOptionKind> = Vec::with_capacity(3);
-        opts.push(TcpOptionKind::Nop);
-        opts.push(TcpOptionKind::Nop);
-        opts.push(TcpOptionKind::Sack(sack_blocks));
+        // R163-10 FIX: There are always exactly 3 options (NOP, NOP, SACK).
+        // Use a stack array to eliminate the heap allocation for the opts Vec,
+        // making ACK generation OOM-free for the options list itself.
+        let opts = [
+            TcpOptionKind::Nop,
+            TcpOptionKind::Nop,
+            TcpOptionKind::Sack(sack_blocks),
+        ];
 
         build_tcp_segment_with_options(
             src_ip, dst_ip, src_port, dst_port,
-            tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &opts, &[],
+            tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &opts[..], &[],
         )
     }
 
@@ -2629,7 +2633,10 @@ impl SocketTable {
 
         // TCP segmentation: split payload into MSS-sized chunks
         let mss = TCP_ETHERNET_MSS as usize;
-        let mut segments = Vec::with_capacity((payload.len() + mss - 1) / mss.max(1));
+        // R163-10 FIX: Start with Vec::new() instead of Vec::with_capacity so
+        // the segments list itself has no infallible reservation. Each slot is
+        // reserved fallibly inside the loop via try_reserve(1) before push.
+        let mut segments: Vec<Vec<u8>> = Vec::new();
         let mut offset = 0usize;
 
         while offset < payload.len() {
@@ -2646,6 +2653,13 @@ impl SocketTable {
                     0
                 };
 
+            // R163-10 FIX: Reserve space in the output segments Vec before
+            // building the segment. If we cannot even reserve the slot, break
+            // now — no data was buffered for retransmission for this chunk.
+            if segments.try_reserve(1).is_err() {
+                break;
+            }
+
             let segment = build_tcp_segment(
                 local_ip,
                 remote_ip,
@@ -2658,6 +2672,12 @@ impl SocketTable {
                 seg_payload,
             );
 
+            // R163-10 FIX: build_tcp_segment returns empty Vec on OOM; do not
+            // queue an empty (malformed) packet or advance accounting.
+            if segment.is_empty() {
+                break;
+            }
+
             // Buffer segment for potential retransmission
             // This enables reliable delivery: segments are kept until ACKed
             // R162-9 FIX: Fallible allocation for retransmission buffer copy.
@@ -2666,6 +2686,13 @@ impl SocketTable {
                 break; // Stop sending more segments; already-buffered ones will be retransmitted
             }
             retrans_data.extend_from_slice(seg_payload);
+
+            // R163-10 FIX: Reserve a slot in the send_buffer VecDeque fallibly
+            // before push_back. If send_buffer is full or OOM, break and leave
+            // already-queued segments for transmission.
+            if tcp_state.control.send_buffer.try_reserve(1).is_err() {
+                break;
+            }
             tcp_state.control.send_buffer.push_back(TcpSegment {
                 seq,
                 data: retrans_data,
@@ -2679,11 +2706,21 @@ impl SocketTable {
             offset = end;
         }
 
-        // R115-3 FIX: Commit the total buffered bytes after all segments are pushed.
-        tcp_state.control.send_buffer_bytes = new_total;
+        // R163-1 FIX: Use `offset` (actual bytes buffered) not `payload.len()`.
+        // When try_reserve_exact fails mid-loop, only `offset` bytes have
+        // retransmission buffers. Advancing snd_nxt past unbuffered data
+        // causes irrecoverable sequence number corruption on packet loss.
+        if offset == 0 {
+            drop(guard);
+            return Err(SocketError::NoMemory);
+        }
 
-        // Update send next sequence number
-        tcp_state.control.snd_nxt = base_seq.wrapping_add(payload.len() as u32);
+        tcp_state.control.send_buffer_bytes = tcp_state
+            .control
+            .send_buffer_bytes
+            .saturating_add(offset);
+
+        tcp_state.control.snd_nxt = base_seq.wrapping_add(offset as u32);
 
         // R57-1: Record activity timestamp for idle detection (RFC 2861)
         tcp_state.control.last_activity = now_ms;
@@ -2692,9 +2729,9 @@ impl SocketTable {
 
         // Update statistics
         sock.tx_bytes
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            .fetch_add(offset as u64, Ordering::Relaxed);
 
-        Ok((payload.len(), segments))
+        Ok((offset, segments))
     }
 
     /// Shutdown TCP connection (half-close).
@@ -4352,29 +4389,46 @@ impl SocketTable {
                         tcp_state.control.state = TcpState::SynReceived;
 
                         // Build SYN+ACK: retransmit our SYN (snd_una = ISS) + ACK their SYN
-                        let mut syn_ack_opts =
-                            alloc::vec![TcpOptionKind::Mss(TCP_ETHERNET_MSS)];
-                        if tcp_state.control.wscale_requested {
-                            syn_ack_opts.push(TcpOptionKind::WindowScale(
-                                tcp_state.control.rcv_wscale,
-                            ));
-                        }
-                        if tcp_state.control.sack_requested {
-                            syn_ack_opts.push(TcpOptionKind::SackPermitted);
-                        }
-
-                        let syn_ack = build_tcp_segment_with_options(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_una, // Our original ISS
-                            tcp_state.control.rcv_nxt, // ACK their SYN
-                            TCP_FLAG_SYN | TCP_FLAG_ACK,
-                            TCP_DEFAULT_WINDOW, // Unscaled
-                            &syn_ack_opts,
-                            &[],
+                        // R163-10 FIX: Replace infallible alloc::vec![...] + push() opts
+                        // construction with a bounded stack array. There are at most 3
+                        // options (MSS, WindowScale, SackPermitted); we populate a
+                        // fixed-size array and slice it to the actual count used.
+                        let wscale_opt = tcp_state.control.wscale_requested.then(||
+                            TcpOptionKind::WindowScale(tcp_state.control.rcv_wscale)
                         );
+                        let sack_opt = tcp_state.control.sack_requested.then(||
+                            TcpOptionKind::SackPermitted
+                        );
+                        let syn_ack = match (wscale_opt, sack_opt) {
+                            (Some(ws), Some(_sack)) => build_tcp_segment_with_options(
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), ws, TcpOptionKind::SackPermitted],
+                                &[],
+                            ),
+                            (Some(ws), None) => build_tcp_segment_with_options(
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), ws],
+                                &[],
+                            ),
+                            (None, Some(_sack)) => build_tcp_segment_with_options(
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), TcpOptionKind::SackPermitted],
+                                &[],
+                            ),
+                            (None, None) => build_tcp_segment_with_options(
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS)],
+                                &[],
+                            ),
+                        };
 
                         drop(guard);
                         return Some(syn_ack);
