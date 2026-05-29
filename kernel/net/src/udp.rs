@@ -388,8 +388,11 @@ pub fn build_udp_datagram(
 
     let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
 
-    // Build datagram with zero checksum initially
-    let mut datagram = Vec::with_capacity(udp_len as usize);
+    // R164-6 FIX: Fallible allocation for UDP datagram.
+    let mut datagram = Vec::new();
+    if datagram.try_reserve_exact(udp_len as usize).is_err() {
+        return Err(UdpError::PayloadTooLarge);
+    }
     datagram.extend_from_slice(&src_port.to_be_bytes());
     datagram.extend_from_slice(&dst_port.to_be_bytes());
     datagram.extend_from_slice(&udp_len.to_be_bytes());

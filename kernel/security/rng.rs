@@ -665,6 +665,23 @@ impl ChaCha20Rng {
     }
 }
 
+// R164-11 FIX: Volatile-zero all key material when ChaCha20Rng is dropped.
+// Without this, chacha20_xor_keystream() leaves the expanded key schedule
+// (state[4..12]) and partial output buffer on the kernel stack after return.
+impl Drop for ChaCha20Rng {
+    fn drop(&mut self) {
+        for w in self.state.iter_mut() {
+            unsafe { core::ptr::write_volatile(w, 0) };
+        }
+        for b in self.buffer.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        unsafe { core::ptr::write_volatile(&mut self.available, 0) };
+        unsafe { core::ptr::write_volatile(&mut self.bytes_generated, 0) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Securely zero memory (prevent compiler optimization)
 #[inline(never)]
 fn explicit_bzero(buf: &mut [u8]) {

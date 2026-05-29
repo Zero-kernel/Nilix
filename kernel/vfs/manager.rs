@@ -945,6 +945,13 @@ impl Vfs {
             if !check_access_permission(&fresh_stat, flags.is_readable(), true, false) {
                 return Err(FsError::PermDenied);
             }
+            // R164-9 FIX: Evaluate LSM hook_file_truncate before truncating.
+            // Without this, open(O_TRUNC) bypasses MAC truncation policy —
+            // the ftruncate() path calls this hook but the open path did not.
+            if let Some(task) = LsmProcessCtx::from_current() {
+                lsm::hook_file_truncate(&task, fresh_stat.ino, 0)
+                    .map_err(|_| FsError::PermDenied)?;
+            }
             inode.truncate(0)?;
         }
 

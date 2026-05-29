@@ -1627,6 +1627,17 @@ fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
 /// 如果用户在验证后取消映射内存，copy_from_user_safe 会安全返回错误
 /// 而不是导致内核 panic。
 ///
+// R164-3 FIX: Fallible String construction from &str. The infallible
+// .to_string() panics under OOM via alloc_error_handler. All path
+// syscalls (open, stat, openat, fstatat) use this instead.
+#[inline]
+fn try_str_to_string(s: &str) -> Result<String, SyscallError> {
+    let mut owned = String::new();
+    owned.try_reserve_exact(s.len()).map_err(|_| SyscallError::ENOMEM)?;
+    owned.push_str(s);
+    Ok(owned)
+}
+
 /// 逐字节读取直到遇到 NUL 终止符，限制最大长度防止恶意无限字符串。
 fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
     if ptr.is_null() {
@@ -5556,9 +5567,10 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        core::str::from_utf8(&path_bytes)
-            .map_err(|_| SyscallError::EINVAL)?
-            .to_string()
+        try_str_to_string(
+            core::str::from_utf8(&path_bytes)
+                .map_err(|_| SyscallError::EINVAL)?
+        )?
     };
 
     // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in openat
@@ -5643,9 +5655,10 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        core::str::from_utf8(&path_bytes)
-            .map_err(|_| SyscallError::EINVAL)?
-            .to_string()
+        try_str_to_string(
+            core::str::from_utf8(&path_bytes)
+                .map_err(|_| SyscallError::EINVAL)?
+        )?
     };
 
     // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in fstatat
@@ -5948,6 +5961,31 @@ pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
 #[inline]
 pub(crate) fn mmap_region_len(len_with_flags: usize) -> usize {
     len_with_flags & !MMAP_REGION_FLAG_MASK
+}
+
+// D2-MMAP-LIFECYCLE: Validation helper for mmap_regions entries.
+// Verifies invariants at insert time in debug builds:
+// 1. Length is page-aligned
+// 2. At most one transient flag is set
+#[inline]
+pub(crate) fn debug_validate_mmap_entry(len_with_flags: usize) {
+    if cfg!(debug_assertions) {
+        let length = len_with_flags & !MMAP_REGION_FLAG_MASK;
+        debug_assert!(
+            length & (PAGE_SIZE - 1) == 0,
+            "mmap_regions: length {:#x} is not page-aligned",
+            length,
+        );
+        let transient = len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK;
+        debug_assert!(
+            transient == 0
+                || transient == MMAP_REGION_FLAG_PENDING_MAP
+                || transient == MMAP_REGION_FLAG_PENDING_UNMAP
+                || transient == MMAP_REGION_FLAG_PENDING_MPROTECT,
+            "mmap_regions: multiple transient flags set: {:#x}",
+            transient,
+        );
+    }
 }
 
 /// R144-2 FIX: Encode POSIX prot bits (PROT_READ/WRITE/EXEC) into mmap region
@@ -6308,22 +6346,34 @@ fn sys_brk(addr: usize) -> SyscallResult {
             });
         }
 
-        // D3-ARC-MM-SHARED: Update brk and charge counters in shared MmState.
+        // R164-1 FIX: Re-verify mm.brk == old_brk at shrink commit, matching
+        // the grow path (R162-2). Without this, a concurrent CLONE_VM thread
+        // that grew brk while we held no lock gets its brk value clobbered,
+        // and its cgroup charge becomes orphaned.
         {
             let mut mm = mm_arc.lock();
+            if mm.brk != old_brk {
+                // Concurrent brk changed mm.brk while we were unmapping.
+                // Our unmapped pages were in [new_top, old_top) which is
+                // below old_brk, so they don't overlap with concurrent growth.
+                // The cgroup charge for these freed pages must still be
+                // released since the frames were already deallocated.
+                mm.vm_charged_bytes = mm
+                    .vm_charged_bytes
+                    .saturating_sub(shrink_size as u64);
+                let current_brk = mm.brk;
+                drop(mm);
+                let shrink_cgroup_id = process.lock().cgroup_id;
+                cgroup::uncharge_memory(shrink_cgroup_id, shrink_size as u64);
+                return Ok(current_brk);
+            }
             mm.brk = addr;
-            // R131-6 FIX: Track brk shrink in per-address-space charge counter.
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_sub(shrink_size as u64);
         }
 
-        // D3-ARC-MM-SHARED: sync_vm_siblings_brk is no longer needed — all
-        // CLONE_VM siblings share the same MmState via Arc<Mutex<MmState>>.
-
         // R145-1 FIX: Re-read cgroup_id under lock immediately before uncharge.
-        // Migration may have changed it while we held no lock during PT
-        // operations.
         let shrink_cgroup_id = process.lock().cgroup_id;
         cgroup::uncharge_memory(shrink_cgroup_id, shrink_size as u64);
 
@@ -6513,6 +6563,7 @@ fn sys_mmap(
         let len_with_flags = length_aligned | MMAP_REGION_FLAG_PROT_NONE;
         {
             let mut mm = mm_arc.lock();
+            debug_validate_mmap_entry(len_with_flags);
             mm.mmap_regions.insert(base, len_with_flags);
             if mm.next_mmap_addr < end {
                 mm.next_mmap_addr = end;
@@ -7088,7 +7139,21 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     .saturating_add(region_len as u64);
                 // R149-6 FIX: Set transient flag so concurrent munmap sees
                 // the in-flight mprotect and returns EBUSY.
+                // R164-2 FIX: Check if PENDING_MPROTECT is already set by a
+                // concurrent mprotect on the same region. Without this, two
+                // CLONE_VM threads can both charge cgroup and proceed to PT
+                // ops, then one's rollback clears the flag, causing the
+                // other's commit check to fail — leaking frames.
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
+                    if (*entry & MMAP_REGION_FLAG_PENDING_MPROTECT) != 0 {
+                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                            .saturating_sub(region_len as u64);
+                        drop(mm);
+                        let cgroup_id = proc.cgroup_id;
+                        drop(proc);
+                        cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                        return Err(SyscallError::EBUSY);
+                    }
                     *entry |= MMAP_REGION_FLAG_PENDING_MPROTECT;
                 } else {
                     // Region vanished between Phase 0 classification and here;
@@ -8788,9 +8853,10 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        core::str::from_utf8(&path_bytes)
-            .map_err(|_| SyscallError::EINVAL)?
-            .to_string()
+        try_str_to_string(
+            core::str::from_utf8(&path_bytes)
+                .map_err(|_| SyscallError::EINVAL)?
+        )?
     };
 
     // Check from kernel copy - no TOCTOU possible
@@ -8828,9 +8894,10 @@ fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResu
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        core::str::from_utf8(&path_bytes)
-            .map_err(|_| SyscallError::EINVAL)?
-            .to_string()
+        try_str_to_string(
+            core::str::from_utf8(&path_bytes)
+                .map_err(|_| SyscallError::EINVAL)?
+        )?
     };
 
     // Check from kernel copy - no TOCTOU possible
@@ -8883,9 +8950,10 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     if path_bytes.is_empty() {
         return Err(SyscallError::EINVAL);
     }
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?
-        .to_string();
+    let path_str = try_str_to_string(
+        core::str::from_utf8(&path_bytes)
+            .map_err(|_| SyscallError::EINVAL)?
+    )?;
 
     // Get current process
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -8893,16 +8961,18 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
 
     // R65-22 FIX: Handle dirfd for relative paths
     // Resolve relative paths against the directory referenced by dirfd
+    // R164-3 FIX: Use fallible allocation for resolved path construction.
     let resolved_path = if path_str.starts_with('/') {
-        // Absolute path: dirfd is ignored
         path_str.clone()
     } else if dirfd == AT_FDCWD {
-        // AT_FDCWD: resolve relative to current working directory
-        // For now, treat as relative to root (cwd support is limited)
         if path_str.is_empty() {
-            "/".to_string()
+            try_str_to_string("/")?
         } else {
-            format!("/{}", path_str)
+            let mut s = String::new();
+            s.try_reserve_exact(1 + path_str.len()).map_err(|_| SyscallError::ENOMEM)?;
+            s.push('/');
+            s.push_str(&path_str);
+            s
         }
     } else {
         // R65-22 FIX: Resolve relative path against dirfd

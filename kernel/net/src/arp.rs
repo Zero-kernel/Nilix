@@ -559,10 +559,12 @@ pub fn parse_arp(buf: &[u8]) -> Result<ArpPacket, ArpError> {
 /// # Returns
 ///
 /// 28-byte ARP packet suitable for Ethernet payload.
+// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
 pub fn serialize_arp(pkt: &ArpPacket) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(ARP_PACKET_LEN);
-
-    // Hardware type (Ethernet)
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(ARP_PACKET_LEN).is_err() {
+        return buf;
+    }
     buf.extend_from_slice(&HTYPE_ETHERNET.to_be_bytes());
     // Protocol type (IPv4)
     buf.extend_from_slice(&PTYPE_IPV4.to_be_bytes());

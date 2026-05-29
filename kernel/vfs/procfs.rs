@@ -1504,54 +1504,79 @@ fn generate_stat(pid: u32) -> String {
         return String::new();
     }
 
-    let table = PROCESS_TABLE.lock();
+    // R164-8 FIX: Snapshot all data under PROCESS_TABLE lock, then drop
+    // the lock BEFORE calling pid_in_namespace/owning_namespace. The old
+    // code held the table lock while acquiring PID namespace internal
+    // locks, creating a lock ordering inversion with concurrent sys_clone
+    // + CLONE_NEWPID (which holds ns lock then acquires PROCESS_TABLE).
+    // This matches the R162-I1 snapshot-then-translate pattern used by
+    // generate_status().
+    let snapshot = {
+        let table = PROCESS_TABLE.lock();
 
-    // R140-7 FIX: Resolve the caller's owning PID namespace for PID translation.
-    let caller_ns = process::current_pid()
-        .and_then(|cur_pid| table.get(cur_pid))
-        .and_then(|slot| slot.as_ref())
-        .and_then(|proc_arc| {
-            let p = proc_arc.lock();
-            kernel_core::owning_namespace(&p.pid_ns_chain)
-        });
+        let caller_ns_chain = process::current_pid()
+            .and_then(|cur_pid| table.get(cur_pid))
+            .and_then(|slot| slot.as_ref())
+            .map(|proc_arc| {
+                let p = proc_arc.lock();
+                p.pid_ns_chain.clone()
+            });
 
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            // R98-1 FIX: Check orthogonal stopped flag before scheduler state.
-            let state_char = match p.state {
-                ProcessState::Zombie => 'Z',
-                ProcessState::Terminated => 'X',
-                ProcessState::Stopped => 'T',
-                _ if p.stopped => 'T',
-                ProcessState::Ready | ProcessState::Running => 'R',
-                ProcessState::Blocked | ProcessState::Sleeping => 'S',
-            };
-
-            // R140-7 FIX: Emit namespace-local PIDs.
-            let (ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
-                (
-                    kernel_core::pid_in_namespace(ns, p.pid).unwrap_or(0),
-                    kernel_core::pid_in_namespace(ns, p.ppid).unwrap_or(0),
-                )
-            } else {
-                (p.pid, p.ppid)
-            };
-
-            // Minimal stat format: pid (comm) state ppid pgrp session tty_nr ...
-            format!(
-                "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                ns_pid,
-                p.name,
-                state_char,
-                ns_ppid,
-                ns_pid, // pgrp = pid for now
-                ns_pid, // session = pid for now
-                p.priority,
-            )
+        match table.get(pid as usize) {
+            Some(Some(proc)) => {
+                let p = proc.lock();
+                let state_char = match p.state {
+                    ProcessState::Zombie => 'Z',
+                    ProcessState::Terminated => 'X',
+                    ProcessState::Stopped => 'T',
+                    _ if p.stopped => 'T',
+                    ProcessState::Ready | ProcessState::Running => 'R',
+                    ProcessState::Blocked | ProcessState::Sleeping => 'S',
+                };
+                Some((
+                    p.pid,
+                    p.ppid,
+                    p.name.clone(),
+                    state_char,
+                    p.priority,
+                    p.pid_ns_chain.clone(),
+                    caller_ns_chain,
+                ))
+            }
+            _ => None,
         }
-        _ => String::new(),
-    }
+    };
+    // PROCESS_TABLE lock dropped here.
+
+    let (raw_pid, raw_ppid, name, state_char, priority, _target_ns_chain, caller_ns_chain) =
+        match snapshot {
+            Some(s) => s,
+            None => return String::new(),
+        };
+
+    let caller_ns = caller_ns_chain
+        .as_ref()
+        .and_then(|chain| kernel_core::owning_namespace(chain));
+
+    let (ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
+        (
+            kernel_core::pid_in_namespace(ns, raw_pid).unwrap_or(0),
+            kernel_core::pid_in_namespace(ns, raw_ppid).unwrap_or(0),
+        )
+    } else {
+        (raw_pid, raw_ppid)
+    };
+
+    format!(
+        "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        ns_pid,
+        name,
+        state_char,
+        ns_ppid,
+        ns_pid,
+        ns_pid,
+        priority,
+    )
 }
 
 /// R117-2 FIX: Maximum number of mmap entries to emit in /proc/[pid]/maps.

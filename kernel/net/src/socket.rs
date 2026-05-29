@@ -1361,10 +1361,18 @@ impl SocketState {
         }
 
         // R133-2 FIX: Only allocate/copy the payload after all cap checks pass.
+        // R164-6 FIX: Fallible copy of UDP payload. On OOM, roll back the
+        // global byte counter and reject the datagram.
+        let mut data_copy = Vec::new();
+        if data_copy.try_reserve_exact(data.len()).is_err() {
+            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt_len, Ordering::Relaxed);
+            return false;
+        }
+        data_copy.extend_from_slice(data);
         let pkt = PendingDatagram {
             src_ip,
             src_port,
-            data: data.to_vec(),
+            data: data_copy,
             received_at,
         };
 
@@ -3739,7 +3747,24 @@ impl SocketTable {
                         tcp_state.control.state = TcpState::Closed;
                         drop(guard);
 
-                        // Clean up connection resources
+                        // R164-5 FIX: When RST aborts a SynReceived connection,
+                        // remove the PendingSyn entry from the listener's SYN
+                        // queue and decrement GLOBAL_HALF_OPEN_COUNT. Without
+                        // this, the slot leaks until SYN timeout (30s), allowing
+                        // an attacker to exhaust the half-open limit.
+                        if old_state == TcpState::SynReceived {
+                            if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
+                                let mut listen_guard = listener.listen.lock();
+                                if let Some(listen_state) = listen_guard.as_mut() {
+                                    let syn_key = tcp_map_key_from_parts(
+                                        net_ns_id, dst_ip, header.dst_port,
+                                        src_ip, header.src_port,
+                                    );
+                                    listen_state.take_syn(&syn_key);
+                                }
+                            }
+                        }
+
                         self.cleanup_tcp_connection(&sock);
                         sock.wake_tcp_waiters();
                     }
@@ -5784,24 +5809,26 @@ impl SocketTable {
                 // R58: Use scaled window advertisement
                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+
+                // R164-4 FIX: Check for retransmitted FIN BEFORE the window check.
+                // A retransmitted FIN has seq == rcv_nxt - 1 (FIN consumed one
+                // sequence number). This falls outside [rcv_nxt, rcv_nxt + wnd),
+                // so the old window check silently dropped it. Per RFC 793, the
+                // TIME_WAIT state must re-ACK retransmitted FINs and restart 2MSL.
+                let is_retransmitted_fin = header.flags & TCP_FLAG_FIN != 0
+                    && header.seq_num == tcp_state.control.rcv_nxt.wrapping_sub(1);
+
                 let seq_in_recv_window =
                     seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
-                // Do not collapse TIME_WAIT on out-of-window traffic; prevents spoofed
-                // segments from forcing premature cleanup and RSTs on legitimate retransmits.
-                if !seq_in_recv_window {
+                if !seq_in_recv_window && !is_retransmitted_fin {
                     drop(guard);
                     return None;
                 }
 
                 // Handle retransmitted FIN from peer
                 // R159-9 FIX: Only accept FIN at the exact expected sequence position.
-                // rcv_nxt was advanced past the original FIN, so a retransmitted FIN
-                // has seq == rcv_nxt - 1. Without this, any in-window FIN resets the
-                // 2MSL timer, enabling targeted port-exhaustion DoS.
                 let mut fin_ack = None;
-                let is_retransmitted_fin = header.flags & TCP_FLAG_FIN != 0
-                    && header.seq_num == tcp_state.control.rcv_nxt.wrapping_sub(1);
                 if is_retransmitted_fin {
                     let window_after = tcp_state
                         .control

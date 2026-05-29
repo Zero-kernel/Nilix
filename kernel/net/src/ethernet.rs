@@ -198,17 +198,16 @@ pub fn parse_ethernet(frame: &[u8]) -> Result<(EthHeader, &[u8]), EthError> {
 ///
 /// # Returns
 /// Complete Ethernet frame including header and payload
+// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
 pub fn build_ethernet_frame(dst: EthAddr, src: EthAddr, ethertype: u16, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(ETH_HEADER_LEN + payload.len());
-
-    // Destination MAC
+    let total = ETH_HEADER_LEN + payload.len();
+    let mut frame = Vec::new();
+    if frame.try_reserve_exact(total).is_err() {
+        return frame;
+    }
     frame.extend_from_slice(&dst.0);
-    // Source MAC
     frame.extend_from_slice(&src.0);
-    // EtherType
     frame.extend_from_slice(&ethertype.to_be_bytes());
-    // Payload
     frame.extend_from_slice(payload);
-
     frame
 }

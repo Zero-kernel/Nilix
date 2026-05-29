@@ -424,7 +424,30 @@ impl Default for Context {
 /// Lock ordering: Process → MmState (never reverse).
 #[derive(Debug, Clone)]
 pub struct MmState {
-    /// mmap region tracking (base address -> length | flags)
+    /// D2-MMAP-LIFECYCLE: mmap region tracking (base_addr -> length_with_flags).
+    ///
+    /// ## Encoding Contract
+    ///
+    /// Each value packs a page-aligned length in bits [63:12] with flags in bits [11:0]:
+    ///
+    /// | Bits | Name | Lifecycle | Description |
+    /// |------|------|-----------|-------------|
+    /// | 0 | PENDING_MAP | Transient | Phase 1 reservation; cleared on Phase 3 commit or rollback |
+    /// | 1 | PENDING_UNMAP | Transient | Region marked for removal; cleared after unmap+dealloc |
+    /// | 2 | PROT_NONE | Persistent | Pure address reservation, no physical frames allocated |
+    /// | 3 | PROT_READ | Persistent | POSIX PROT_READ permission |
+    /// | 4 | PROT_WRITE | Persistent | POSIX PROT_WRITE permission |
+    /// | 5 | PROT_EXEC | Persistent | POSIX PROT_EXEC permission |
+    /// | 6 | PENDING_MPROTECT | Transient | mprotect Path A in progress; cleared on commit/rollback |
+    ///
+    /// ## Invariants
+    ///
+    /// 1. Length is always a multiple of PAGE_SIZE (4096)
+    /// 2. At most ONE transient flag (PENDING_MAP | PENDING_UNMAP | PENDING_MPROTECT) per entry
+    /// 3. Consumers MUST use `mmap_region_len()` to extract length, never raw value
+    /// 4. Fork MUST strip transient flags via `& !MMAP_REGION_FLAG_TRANSIENT_MASK`
+    /// 5. `compute_cgroup_charged_bytes()` MUST skip PROT_NONE entries
+    /// 6. Concurrent mprotect MUST check PENDING_MPROTECT before setting (R164-2)
     pub mmap_regions: BTreeMap<usize, usize>,
 
     /// Heap start address (page-aligned end of ELF BSS)

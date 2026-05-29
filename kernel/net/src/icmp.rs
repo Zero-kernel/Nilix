@@ -332,8 +332,12 @@ pub fn build_echo_reply(request: &[u8]) -> Result<Vec<u8>, IcmpError> {
         return Err(IcmpError::PayloadTooLarge);
     }
 
-    // Copy the entire request to create the reply
-    let mut reply = request.to_vec();
+    // R164-6 FIX: Fallible allocation for echo reply copy.
+    let mut reply = Vec::new();
+    if reply.try_reserve_exact(request.len()).is_err() {
+        return Err(IcmpError::PayloadTooLarge);
+    }
+    reply.extend_from_slice(request);
 
     // Change type to echo reply
     reply[0] = ICMP_TYPE_ECHO_REPLY;
@@ -379,11 +383,13 @@ pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
 /// Error messages contain:
 /// - 8 byte ICMP header (type, code, checksum, unused)
 /// - Original IP header + first 8 bytes of original payload
+// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
 fn build_error_message(icmp_type: u8, code: u8, original_data: &[u8]) -> Vec<u8> {
-    // Limit original data to IP header + 8 bytes (as per RFC 792)
-    let data_len = cmp::min(original_data.len(), 28); // 20 IP + 8 payload
-
-    let mut packet = Vec::with_capacity(ICMP_HEADER_LEN + data_len);
+    let data_len = cmp::min(original_data.len(), 28);
+    let mut packet = Vec::new();
+    if packet.try_reserve_exact(ICMP_HEADER_LEN + data_len).is_err() {
+        return packet;
+    }
 
     // Type
     packet.push(icmp_type);

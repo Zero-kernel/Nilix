@@ -7,9 +7,9 @@
 //!
 //! 这些原语是管道、消息队列阻塞操作的基础
 
-use alloc::collections::{BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_core::process::{self, ProcessId, ProcessState};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -66,8 +66,12 @@ pub struct WaitQueue {
     waiters: Mutex<VecDeque<ProcessId>>,
     /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
     closed: AtomicBool,
-    /// R39-6 FIX: 标记因超时被唤醒的进程
-    timed_out: Mutex<BTreeSet<ProcessId>>,
+    /// R164-10 FIX: Timeout entries tagged with (PID, generation) to prevent
+    /// PID reuse misclassification. A stale entry from a dead process whose
+    /// PID was recycled cannot match the new process's generation.
+    timed_out: Mutex<BTreeMap<ProcessId, u64>>,
+    /// Monotonic generation counter, incremented on each wait_with_timeout call.
+    wait_generation: AtomicU64,
 }
 
 impl WaitQueue {
@@ -76,7 +80,8 @@ impl WaitQueue {
         WaitQueue {
             waiters: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
-            timed_out: Mutex::new(BTreeSet::new()),
+            timed_out: Mutex::new(BTreeMap::new()),
+            wait_generation: AtomicU64::new(0),
         }
     }
 
@@ -106,6 +111,9 @@ impl WaitQueue {
             Some(p) => p,
             None => return WaitOutcome::NoProcess,
         };
+
+        // R164-10 FIX: Snapshot a unique generation for this wait call.
+        let my_gen = self.wait_generation.fetch_add(1, Ordering::Relaxed);
 
         // X-6: 快速检查 - 如果已关闭则不阻塞
         if self.closed.load(Ordering::Acquire) {
@@ -181,8 +189,9 @@ impl WaitQueue {
             });
         }
 
-        // 检查是否因超时唤醒
-        if self.consume_timeout_flag(pid) {
+        // R164-10 FIX: Pass generation to consume — only accept if the
+        // timed_out entry's generation matches our wait call's generation.
+        if self.consume_timeout_flag(pid, my_gen) {
             WaitOutcome::TimedOut
         } else {
             WaitOutcome::Woken
@@ -223,18 +232,32 @@ impl WaitQueue {
             }
             drop(waiters);
 
-            self.timed_out.lock().insert(pid);
+            // R164-10 FIX: Store generation from the wait_generation counter.
+            // The timeout_wake doesn't know which specific generation this PID
+            // was waiting under, so we store the current counter value as a
+            // snapshot. consume_timeout_flag will accept any generation >= the
+            // wait call's my_gen (monotonic, so a higher gen means a later wait).
+            let gen = self.wait_generation.load(Ordering::Relaxed);
+            self.timed_out.lock().insert(pid, gen);
             true
         })
     }
 
-    /// R39-6 FIX: 消费超时标记
-    fn consume_timeout_flag(&self, pid: ProcessId) -> bool {
-        self.timed_out.lock().remove(&pid)
+    // R164-10 FIX: Only consume timeout flag if the stored generation matches
+    // or exceeds the wait call's generation. A stale entry from a prior wait
+    // (by a different process that reused this PID) will have a lower generation.
+    fn consume_timeout_flag(&self, pid: ProcessId, expected_gen: u64) -> bool {
+        let mut set = self.timed_out.lock();
+        if let Some(&stored_gen) = set.get(&pid) {
+            if stored_gen >= expected_gen {
+                set.remove(&pid);
+                return true;
+            }
+        }
+        false
     }
 
     /// R156-6 FIX: Remove stale entries for an exiting process.
-    /// Called during process cleanup to prevent PID reuse misclassification.
     pub fn cleanup_for_pid(&self, pid: ProcessId) {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();

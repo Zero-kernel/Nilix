@@ -254,6 +254,20 @@ pub enum DropReason {
 /// * `net_ns_id` - Network namespace of the receiving device
 /// * `now_ms` - Current time in milliseconds (for rate limiting)
 ///
+// R164-6 FIX: Fallible concatenation of two byte slices into a Vec.
+// Returns empty Vec on OOM so callers can drop the frame gracefully.
+#[inline]
+fn try_concat_slices(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let total = a.len() + b.len();
+    let mut v = Vec::new();
+    if v.try_reserve_exact(total).is_err() {
+        return v;
+    }
+    v.extend_from_slice(a);
+    v.extend_from_slice(b);
+    v
+}
+
 /// # Returns
 /// `ProcessResult` indicating what action to take
 pub fn process_frame(
@@ -476,8 +490,14 @@ fn process_ipv4(
             }
         }
     } else {
-        // Non-fragment: use payload directly
-        payload.to_vec()
+        // R164-6 FIX: Fallible copy of non-fragment payload.
+        let mut v = Vec::new();
+        if v.try_reserve_exact(payload.len()).is_err() {
+            stats.inc_rx_errors();
+            return ProcessResult::Dropped(DropReason::EthParseError);
+        }
+        v.extend_from_slice(payload);
+        v
     };
 
     // Route to protocol handler
@@ -735,18 +755,21 @@ fn process_icmp(
             64, // Default TTL
         );
 
-        // Combine IP header and ICMP reply
-        let mut ip_packet = Vec::with_capacity(ip_reply.len() + icmp_reply.len());
-        ip_packet.extend_from_slice(&ip_reply);
-        ip_packet.extend_from_slice(&icmp_reply);
+        // R164-6 FIX: Fallible IP packet assembly.
+        let ip_packet = try_concat_slices(&ip_reply, &icmp_reply);
+        if ip_packet.is_empty() {
+            return ProcessResult::Dropped(DropReason::EthParseError);
+        }
 
-        // Build Ethernet frame (swap src/dst MACs)
         let frame = build_ethernet_frame(
-            eth_hdr.src, // Original source as destination
-            our_mac,     // Our MAC as source
+            eth_hdr.src,
+            our_mac,
             ETHERTYPE_IPV4,
             &ip_packet,
         );
+        if frame.is_empty() {
+            return ProcessResult::Dropped(DropReason::EthParseError);
+        }
 
         // R159-14 FIX: Seed conntrack for the outbound echo reply so egress
         // firewall rules requiring ESTABLISHED state can match it.
@@ -908,10 +931,11 @@ fn process_tcp(
             64, // Default TTL
         );
 
-        // Combine IP header and TCP segment
-        let mut ip_packet = Vec::with_capacity(ip_reply.len() + resp_seg.len());
-        ip_packet.extend_from_slice(&ip_reply);
-        ip_packet.extend_from_slice(&resp_seg);
+        // R164-6 FIX: Fallible IP+TCP assembly.
+        let ip_packet = try_concat_slices(&ip_reply, &resp_seg);
+        if ip_packet.is_empty() && !ip_reply.is_empty() {
+            return ProcessResult::Handled;
+        }
 
         // Build Ethernet frame (swap MACs)
         let frame = build_ethernet_frame(
@@ -1054,118 +1078,106 @@ fn build_frame_and_transmit(
         return Err(TxError::InvalidBuffer);
     }
 
-    // R161-7 FIX: Evaluate egress firewall before building and transmitting
-    // the frame. Previously only the RX (ingress) path evaluated firewall
-    // rules; egress DROP rules were completely unenforced. Uses root
-    // namespace (0) as default since the TX path lacks namespace context.
-    // TCP and UDP payloads have src_port/dst_port at offset 0-3.
+    // R164-7 FIX: Evaluate egress firewall for ALL builds, not only conntrack.
+    // The stateless firewall (src/dst IP, ports, protocol) is evaluated
+    // unconditionally. Conntrack-aware ct_state is only available when the
+    // conntrack feature is enabled; without it, ct_state is None and
+    // stateful rules won't match, but stateless DROP/REJECT rules still fire.
+    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
+        && payload.len() >= 4
+    {
+        (
+            Some(u16::from_be_bytes([payload[0], payload[1]])),
+            Some(u16::from_be_bytes([payload[2], payload[3]])),
+        )
+    } else {
+        (None, None)
+    };
+    let cfg_pre = network_config();
+
+    // Conntrack-aware ct_state lookup (only with conntrack feature).
+    #[cfg(feature = "conntrack")]
+    let ct_decision = {
+        let sp = src_port.unwrap_or(0);
+        let dp = dst_port.unwrap_or(0);
+        let proto_u8 = match proto {
+            Ipv4Proto::Tcp => 6u8,
+            Ipv4Proto::Udp => 17u8,
+            Ipv4Proto::Icmp => 1u8,
+            _ => 0u8,
+        };
+        let (key, _) = crate::conntrack::FlowKey::from_packet(
+            net_ns_id, proto_u8, cfg_pre.our_ip, dst_ip, sp, dp,
+        );
+        crate::conntrack::conntrack_table()
+            .lookup(&key)
+            .map(|e| if e.seen_reply {
+                crate::conntrack::CtDecision::Established
+            } else {
+                crate::conntrack::CtDecision::New
+            })
+    };
+    #[cfg(not(feature = "conntrack"))]
+    let ct_decision: Option<crate::conntrack::CtDecision> = None;
+
+    let fw_pkt = FirewallPacket {
+        net_ns_id,
+        src_ip: cfg_pre.our_ip,
+        dst_ip,
+        proto,
+        src_port,
+        dst_port,
+        ct_state: ct_decision,
+    };
+    let fw_table = firewall_table_for_ns(net_ns_id);
+    let fw_verdict = fw_table.evaluate(&fw_pkt);
+    if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
+        return Err(TxError::InvalidBuffer);
+    }
+
+    // R163-8 FIX: After egress ACCEPT, create/update conntrack entry.
     #[cfg(feature = "conntrack")]
     {
-        let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
-            && payload.len() >= 4
-        {
-            (
-                Some(u16::from_be_bytes([payload[0], payload[1]])),
-                Some(u16::from_be_bytes([payload[2], payload[3]])),
-            )
-        } else {
-            (None, None)
-        };
-        let cfg_pre = network_config();
-        // R162-18 FIX: Derive ct_state from actual conntrack lookup instead of
-        // hardcoding Established. The old hardcoded value caused egress rules
-        // that match on NEW state to never fire for outbound packets.
-        let ct_decision = {
-            let sp = src_port.unwrap_or(0);
-            let dp = dst_port.unwrap_or(0);
-            let proto_u8 = match proto {
-                Ipv4Proto::Tcp => 6u8,
-                Ipv4Proto::Udp => 17u8,
-                Ipv4Proto::Icmp => 1u8,
-                _ => 0u8,
-            };
-            let (key, _) = crate::conntrack::FlowKey::from_packet(
-                net_ns_id, proto_u8, cfg_pre.our_ip, dst_ip, sp, dp,
-            );
-            crate::conntrack::conntrack_table()
-                .lookup(&key)
-                .map(|e| if e.seen_reply {
-                    crate::conntrack::CtDecision::Established
-                } else {
-                    crate::conntrack::CtDecision::New
-                })
-        };
-        let fw_pkt = FirewallPacket {
-            net_ns_id,
-            src_ip: cfg_pre.our_ip,
-            dst_ip,
-            proto,
-            src_port,
-            dst_port,
-            ct_state: ct_decision,
-        };
-        let fw_table = firewall_table_for_ns(net_ns_id);
-        let fw_verdict = fw_table.evaluate(&fw_pkt);
-        if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
-            return Err(TxError::InvalidBuffer);
-        }
-
-        // R163-8 FIX: Egress conntrack was read-only — it performed a lookup to
-        // derive ct_state for the firewall but never called ct_process_tcp /
-        // ct_process_udp to create or advance the connection tracking entry.
-        // As a result, an outbound SYN was never inserted into the table, so the
-        // returning SYN-ACK was classified as Invalid and dropped by the stateful
-        // firewall. Fix: after an ACCEPT verdict, create/update the conntrack
-        // entry for TCP and UDP so the reply direction is tracked correctly.
-        {
-            // build_frame_and_transmit has no now_ms parameter; use the same
-            // source as resolve_dst_mac (the socket tick hook).
-            let ct_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
-            let sp = src_port.unwrap_or(0);
-            let dp = dst_port.unwrap_or(0);
-            match proto {
-                Ipv4Proto::Tcp if sp != 0 || dp != 0 => {
-                    use crate::conntrack::ct_process_tcp;
-                    // Derive TCP flags from the segment: flags are at byte offset 13
-                    // of a standard TCP header (src_port[2] dst_port[2] seq[4] ack[4]
-                    // data_off[1] flags[1] ...).
-                    let tcp_flags = if payload.len() >= 14 { payload[13] } else { 0 };
-                    let tcp_data_len = {
-                        // data offset is upper nibble of byte 12, in 4-byte units
-                        let data_off = if payload.len() >= 13 {
-                            ((payload[12] >> 4) as usize) * 4
-                        } else {
-                            20
-                        };
-                        payload.len().saturating_sub(data_off)
+        let ct_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+        let sp = src_port.unwrap_or(0);
+        let dp = dst_port.unwrap_or(0);
+        match proto {
+            Ipv4Proto::Tcp if sp != 0 || dp != 0 => {
+                use crate::conntrack::ct_process_tcp;
+                let tcp_flags = if payload.len() >= 14 { payload[13] } else { 0 };
+                let tcp_data_len = {
+                    let data_off = if payload.len() >= 13 {
+                        ((payload[12] >> 4) as usize) * 4
+                    } else {
+                        20
                     };
-                    let _ = ct_process_tcp(
-                        net_ns_id,
-                        cfg_pre.our_ip,
-                        dst_ip,
-                        sp,
-                        dp,
-                        tcp_flags,
-                        tcp_data_len,
-                        ct_now_ms,
-                    );
-                }
-                Ipv4Proto::Udp if sp != 0 || dp != 0 => {
-                    use crate::conntrack::ct_process_udp;
-                    // UDP header is 8 bytes; payload follows immediately.
-                    let udp_data_len = payload.len().saturating_sub(8);
-                    let _ = ct_process_udp(
-                        net_ns_id,
-                        cfg_pre.our_ip,
-                        dst_ip,
-                        sp,
-                        dp,
-                        udp_data_len,
-                        ct_now_ms,
-                    );
-                }
-                _ => {}
+                    payload.len().saturating_sub(data_off)
+                };
+                let _ = ct_process_tcp(
+                    net_ns_id,
+                    cfg_pre.our_ip,
+                    dst_ip,
+                    sp,
+                    dp,
+                    tcp_flags,
+                    tcp_data_len,
+                    ct_now_ms,
+                );
             }
+            Ipv4Proto::Udp if sp != 0 || dp != 0 => {
+                use crate::conntrack::ct_process_udp;
+                let udp_data_len = payload.len().saturating_sub(8);
+                let _ = ct_process_udp(
+                    net_ns_id,
+                    cfg_pre.our_ip,
+                    dst_ip,
+                    sp,
+                    dp,
+                    udp_data_len,
+                    ct_now_ms,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -1180,10 +1192,11 @@ fn build_frame_and_transmit(
     // Build IPv4 header
     let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
 
-    // Construct complete IP packet
-    let mut ip_packet = Vec::with_capacity(ip_hdr.len() + payload.len());
-    ip_packet.extend_from_slice(&ip_hdr);
-    ip_packet.extend_from_slice(payload);
+    // R164-6 FIX: Fallible IP packet assembly in TX path.
+    let ip_packet = try_concat_slices(&ip_hdr, payload);
+    if ip_packet.is_empty() && !ip_hdr.is_empty() {
+        return Err(TxError::InvalidBuffer);
+    }
 
     // Build Ethernet frame
     let frame = build_ethernet_frame(dst_mac, cfg.our_mac, ETHERTYPE_IPV4, &ip_packet);
@@ -1282,7 +1295,11 @@ fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> Vec<u8>
     let checksum = compute_checksum(&hdr, IPV4_HEADER_MIN_LEN);
     hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-    let mut snapshot = Vec::with_capacity(IPV4_HEADER_MIN_LEN + quoted_len);
+    // R164-6 FIX: Fallible allocation for reject quoted packet.
+    let mut snapshot = Vec::new();
+    if snapshot.try_reserve_exact(IPV4_HEADER_MIN_LEN + quoted_len).is_err() {
+        return snapshot;
+    }
     snapshot.extend_from_slice(&hdr);
     if quoted_len > 0 {
         snapshot.extend_from_slice(&l4_bytes[..quoted_len]);
@@ -1377,9 +1394,11 @@ fn apply_firewall_verdict(
                             64,
                         );
 
-                        let mut ip_packet = Vec::with_capacity(ip_reply.len() + rst_segment.len());
-                        ip_packet.extend_from_slice(&ip_reply);
-                        ip_packet.extend_from_slice(&rst_segment);
+                        // R164-6 FIX: Fallible IP+RST assembly.
+                        let ip_packet = try_concat_slices(&ip_reply, &rst_segment);
+                        if ip_packet.is_empty() && !ip_reply.is_empty() {
+                            return None;
+                        }
 
                         let frame = build_ethernet_frame(
                             eth_hdr.src,
@@ -1405,9 +1424,11 @@ fn apply_firewall_verdict(
                 64,
             );
 
-            let mut ip_packet = Vec::with_capacity(ip_reply.len() + icmp.len());
-            ip_packet.extend_from_slice(&ip_reply);
-            ip_packet.extend_from_slice(&icmp);
+            // R164-6 FIX: Fallible IP+ICMP assembly.
+            let ip_packet = try_concat_slices(&ip_reply, &icmp);
+            if ip_packet.is_empty() && !ip_reply.is_empty() {
+                return None;
+            }
 
             let frame = build_ethernet_frame(eth_hdr.src, eth_hdr.dst, ETHERTYPE_IPV4, &ip_packet);
 
