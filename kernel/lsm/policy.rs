@@ -139,6 +139,22 @@ pub trait LsmPolicy: Send + Sync {
         Ok(())
     }
 
+    /// R165-17: Called when a task creates new namespaces via `unshare(2)`,
+    /// after basic flag validation and capability checks but BEFORE any
+    /// namespace state change. `flags` is the `CLONE_NEW*` set being unshared.
+    /// Lets a policy mediate (deny/audit) privilege-relevant namespace creation.
+    fn task_unshare(&self, task: &ProcessCtx, flags: u64) -> LsmResult {
+        Ok(())
+    }
+
+    /// R165-17: Called when a task joins an existing namespace via `setns(2)`,
+    /// after capability checks but BEFORE the namespace switch. `nstype` is the
+    /// namespace type (`CLONE_NEW*`); `target_ns_id` identifies the namespace
+    /// being joined so a policy can confine cross-namespace moves.
+    fn task_setns(&self, task: &ProcessCtx, nstype: u64, target_ns_id: u64) -> LsmResult {
+        Ok(())
+    }
+
     /// Called when a process modifies capabilities.
     fn task_cap_modify(&self, task: &ProcessCtx, cap_id: CapId, op: u32) -> LsmResult {
         Ok(())
@@ -557,6 +573,15 @@ impl LsmPolicy for DenyAllPolicy {
     }
 
     fn task_prctl(&self, _task: &ProcessCtx, _option: i32, _arg2: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    // R165-17: DenyAllPolicy must explicitly deny namespace operations too.
+    fn task_unshare(&self, _task: &ProcessCtx, _flags: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn task_setns(&self, _task: &ProcessCtx, _nstype: u64, _target_ns_id: u64) -> LsmResult {
         Err(LsmError::Denied)
     }
 

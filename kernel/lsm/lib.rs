@@ -743,6 +743,44 @@ pub fn hook_task_prctl(task: &ProcessCtx, option: i32, arg2: u64) -> LsmResult {
     }
 }
 
+/// Hook: unshare (create new namespaces). R165-17.
+#[inline]
+pub fn hook_task_unshare(task: &ProcessCtx, flags: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().task_unshare(task, flags);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_unshare", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, flags);
+        Ok(())
+    }
+}
+
+/// Hook: setns (join an existing namespace). R165-17.
+#[inline]
+pub fn hook_task_setns(task: &ProcessCtx, nstype: u64, target_ns_id: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().task_setns(task, nstype, target_ns_id);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_setns", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, nstype, target_ns_id);
+        Ok(())
+    }
+}
+
 /// Hook: capability modification.
 #[inline]
 pub fn hook_task_cap_modify(task: &ProcessCtx, cap_id: CapId, op: u32) -> LsmResult {
