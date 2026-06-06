@@ -80,6 +80,19 @@ pub fn test_ext2_write() {
     klog_always!("    ✓ Ext2 write infrastructure compiled");
 }
 
+/// Test the fallible ordered map (next-phase #11 / R165-14).
+///
+/// Runs real assertions over `FallibleOrderedMap` (sorted-Vec backing, fallible
+/// `try_insert`, range/range_mut, `from_sorted_vec`). Any failure panics, which
+/// `make test` / `make boot-check` detect via the serial log.
+pub fn test_fallible_map() {
+    klog_always!("  [TEST] Fallible Ordered Map...");
+    kernel_core::fallible_map::run_fallible_ordered_map_self_test();
+    klog_always!("    ✓ try_insert / replace / remove ordered + fallible");
+    klog_always!("    ✓ range / range_mut half-open bounds + DoubleEnded");
+    klog_always!("    ✓ from_sorted_vec O(1) adopt + try_clone independence");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -93,6 +106,7 @@ pub fn run_all_tests() {
     test_syscalls();
     test_context_switch();
     test_memory_mapping();
+    test_fallible_map();
     test_ext2_write();
 
     klog_always!();

@@ -419,10 +419,16 @@ impl Default for Context {
 /// (D2-RES-CGROUP-CLONE: R123-R127, R139-R142, R146-R147, R161).
 ///
 /// For non-CLONE_VM processes (regular fork), each child gets an independent
-/// `MmState` clone via `clone_for_fork()`.
+/// `MmState` built field-by-field in `fork_inner`, with `mmap_regions` cloned
+/// fallibly via `FallibleOrderedMap::from_sorted_vec` (no infallible deep copy).
 ///
 /// Lock ordering: Process → MmState (never reverse).
-#[derive(Debug, Clone)]
+///
+/// `MmState` deliberately does NOT derive `Clone`: `mmap_regions` is a
+/// `FallibleOrderedMap` (next-phase #11 / R165-14) whose only growth path is the
+/// allocation-fallible `try_clone`, so an infallible `derive(Clone)` would
+/// reintroduce the OOM-abort class. Use `try_*` paths instead.
+#[derive(Debug)]
 pub struct MmState {
     /// D2-MMAP-LIFECYCLE: mmap region tracking (base_addr -> length_with_flags).
     ///
@@ -452,7 +458,7 @@ pub struct MmState {
     /// D2-MMAP-LIFECYCLE Phase 2: values are the typed `MmapEntry` newtype
     /// (a `#[repr(transparent)]` wrapper over the same packed word) so the magic
     /// bit-arithmetic above is accessed through named, contract-enforcing methods.
-    pub mmap_regions: BTreeMap<usize, crate::syscall::MmapEntry>,
+    pub mmap_regions: crate::fallible_map::FallibleOrderedMap<usize, crate::syscall::MmapEntry>,
 
     /// Heap start address (page-aligned end of ELF BSS)
     pub brk_start: usize,
@@ -502,7 +508,7 @@ pub struct MmState {
 impl MmState {
     pub fn new(next_mmap_addr: usize) -> Self {
         Self {
-            mmap_regions: BTreeMap::new(),
+            mmap_regions: crate::fallible_map::FallibleOrderedMap::new(),
             brk_start: 0,
             brk: 0,
             next_mmap_addr,
@@ -515,20 +521,12 @@ impl MmState {
         }
     }
 
-    /// Clone for fork: creates an independent copy with pending counters reset.
-    /// Committed charge counters (vm_charged_bytes, elf_charged_bytes) are
-    /// preserved because fork COW semantics mean the child inherits the
-    /// parent's charge state until pages are actually freed.
-    pub fn clone_for_fork(&self) -> Self {
-        let mut child = self.clone();
-        child.brk_pending_growth = 0;
-        child.mprotect_pending_bytes = 0;
-        child.exec_pending_bytes = 0;
-        // R165-1 FIX: A child never inherits an in-flight brk reservation; fork
-        // is already rejected while a brk is in progress, but reset defensively.
-        child.brk_in_progress = false;
-        child
-    }
+    // NOTE: the former `clone_for_fork()` helper was removed (next-phase #11).
+    // It was dead (zero callers — `fork_inner` builds the child `MmState` by an
+    // explicit field-by-field struct literal) and relied on `MmState: Clone`,
+    // which no longer exists now that `mmap_regions` is a `FallibleOrderedMap`.
+    // The child's regions are cloned fallibly via `FallibleOrderedMap::
+    // from_sorted_vec` over a try_reserve'd snapshot, eliminating the OOM-abort.
 }
 
 /// 进程控制块（PCB）

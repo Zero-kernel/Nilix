@@ -17,6 +17,7 @@ pub use drivers::vga_buffer;
 pub mod cgroup;
 pub mod elf_loader;
 pub mod exception_table;
+pub mod fallible_map;
 pub mod fork;
 pub mod ipc_namespace;
 pub mod mount_namespace;

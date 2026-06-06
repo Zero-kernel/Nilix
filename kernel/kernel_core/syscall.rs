@@ -6051,11 +6051,15 @@ pub(crate) const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
 pub const MMAP_REGION_FLAG_PROT_READ: usize = 1 << 3;
 pub const MMAP_REGION_FLAG_PROT_WRITE: usize = 1 << 4;
 pub const MMAP_REGION_FLAG_PROT_EXEC: usize = 1 << 5;
-/// R149-6 FIX: Transient flag marking a mprotect Path A (PROT_NONE → real)
-/// operation in progress. Set under process lock before dropping for PT ops;
-/// cleared on commit or rollback. Concurrent munmap sees this flag via the
-/// transient mask and returns EBUSY, preventing the mprotect-vs-munmap race
-/// that leads to permanent cgroup charge leaks.
+/// R149-6 / R168-1 FIX: Transient ownership token for an mprotect operation
+/// that drops the MmState lock for page-table work. Path A (PROT_NONE → real)
+/// holds it while allocating + mapping frames; Path B (real → PROT_NONE) holds
+/// it while unmapping + freeing frames. Set under the lock before the PT ops
+/// and cleared on commit/rollback. Concurrent munmap / mprotect / fork observe
+/// it via the transient mask and fail closed (EBUSY / skip / EAGAIN) instead of
+/// racing cgroup bookkeeping against the in-flight page-table side effects —
+/// preventing both the permanent charge leak (Path A) and the double-uncharge
+/// isolation bypass (Path B).
 const MMAP_REGION_FLAG_PENDING_MPROTECT: usize = 1 << 6;
 
 /// Mask of transient in-flight flags. Only these are stripped on fork/clone;
@@ -6067,9 +6071,9 @@ pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
 ///
 /// A `#[repr(transparent)]` newtype over the packed `usize` (bits [63:12] =
 /// page-aligned length, bits [11:0] = flags — see the encoding contract on
-/// `MmState::mmap_regions`). `Copy` + `repr(transparent)` guarantees that
-/// `BTreeMap<usize, MmapEntry>` and `MmState`'s `derive(Clone)` copy values
-/// VERBATIM — bit-identical to the previous `BTreeMap<usize, usize>`. Every
+/// `MmState::mmap_regions`). `Copy` + `repr(transparent)` guarantees that the
+/// `FallibleOrderedMap<usize, MmapEntry>` backing store (next-phase #11) holds
+/// values VERBATIM — bit-identical to the previous packed `usize`. Every
 /// method body is written in terms of the existing `MMAP_REGION_FLAG_*`
 /// constants, so it is provably bit-equivalent to the prior inline bit-ops.
 ///
@@ -6878,8 +6882,20 @@ fn sys_mmap(
         // Reserve the region with PENDING_MAP flag before dropping locks.
         let phase1_flags = MMAP_REGION_FLAG_PENDING_MAP
             | if is_prot_none { MMAP_REGION_FLAG_PROT_NONE } else { 0 };
-        mm.mmap_regions
-            .insert(base, MmapEntry::from_len_flags(length_aligned, phase1_flags));
+        // next-phase #11: fallible insert. `base` is a new key (overlap-checked
+        // above), so this allocates a slot. On OOM, roll back the cgroup charge
+        // made for the non-PROT_NONE case before returning ENOMEM — otherwise the
+        // charge would leak with no region to account for it.
+        if mm
+            .mmap_regions
+            .try_insert(base, MmapEntry::from_len_flags(length_aligned, phase1_flags))
+            .is_err()
+        {
+            if !is_prot_none {
+                cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
+            }
+            return Err(SyscallError::ENOMEM);
+        }
 
         // Advance next_mmap_addr early so concurrent auto-mmaps don't collide.
         let old_next_mmap_addr = mm.next_mmap_addr;
@@ -6902,7 +6918,13 @@ fn sys_mmap(
         {
             let mut mm = mm_arc.lock();
             debug_validate_mmap_entry(len_with_flags);
-            mm.mmap_regions.insert(base, len_with_flags);
+            // next-phase #11: `base` is still present from Phase 1 (its
+            // PENDING_MAP marker makes concurrent munmap/mprotect/fork bail), so
+            // this is an in-place replace that never allocates; map_err keeps the
+            // path total even in the impossible-realloc case.
+            mm.mmap_regions
+                .try_insert(base, len_with_flags)
+                .map_err(|_| SyscallError::ENOMEM)?;
             if mm.next_mmap_addr < end {
                 mm.next_mmap_addr = end;
             }
@@ -7058,7 +7080,11 @@ fn sys_mmap(
     let committed_len_with_flags = MmapEntry::from_len_flags(length_aligned, prot_flags);
     {
         let mut mm = mm_arc.lock();
-        mm.mmap_regions.insert(base, committed_len_with_flags);
+        // next-phase #11: `base` is still present from Phase 1 (PENDING_MAP), so
+        // this is an in-place replace clearing the flag — no allocation.
+        mm.mmap_regions
+            .try_insert(base, committed_len_with_flags)
+            .map_err(|_| SyscallError::ENOMEM)?;
         // R131-6 FIX: Track per-address-space cgroup charge.
         mm.vm_charged_bytes = mm
             .vm_charged_bytes
@@ -7148,8 +7174,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
         // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
         // Preserve committed per-region flags (e.g. PROT_NONE) through the operation.
+        // next-phase #11: `addr` is the region being unmapped (already present),
+        // so setting its PENDING_UNMAP flag is an in-place replace — no alloc.
         mm.mmap_regions
-            .insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags).with_pending_unmap());
+            .try_insert(
+                addr,
+                MmapEntry::from_len_flags(recorded_length, committed_flags).with_pending_unmap(),
+            )
+            .map_err(|_| SyscallError::ENOMEM)?;
 
         // R145-1 FIX: Do NOT capture cgroup_id here — it may change during
         // the lock-drop window (migration).  Re-read under lock in Phase 3.
@@ -7220,7 +7252,13 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     if let Err(e) = unmap_result {
         // Roll back the PENDING_UNMAP marker so the region remains usable.
         // Preserve committed per-region flags (e.g. PROT_NONE).
-        mm_arc.lock().mmap_regions.insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
+        // next-phase #11: `addr` still carries its PENDING_UNMAP marker here, so
+        // this is an in-place replace that cannot allocate; ignore the result so
+        // the original unmap error `e` is the one returned.
+        let _ = mm_arc
+            .lock()
+            .mmap_regions
+            .try_insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
         return Err(e);
     }
 
@@ -7335,8 +7373,28 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             return Err(SyscallError::ENOMEM);
         }
 
+        // next-phase #11: the two split blocks below add at most two new boundary
+        // keys (`addr`, `end`) — every other insert is an in-place replace of an
+        // existing region base. Pre-reserve that capacity so the subsequent
+        // try_insert calls cannot fail mid-sequence and leave a half-split map.
+        // (Matches the `+ 2` headroom asserted by the MAX_MAP_COUNT check above.)
+        mm.mmap_regions
+            .try_reserve(2)
+            .map_err(|_| SyscallError::ENOMEM)?;
+
         // Split preceding region whose tail extends into [addr, end).
-        if let Some((&prev_base, &prev_lf)) = mm.mmap_regions.range(..addr).next_back() {
+        // next-phase #11: copy the boundary entry out of the range iterator into
+        // an owned Option FIRST so the immutable `range(..)` borrow of
+        // `mmap_regions` is released before the `try_insert` mutations below.
+        // (`BTreeMap::range` had no drop glue and the borrow ended early; the
+        // `FallibleOrderedMap` range iterator must be dropped explicitly via this
+        // `let` boundary, else it conflicts with the mutable borrow in the body.)
+        let preceding = mm
+            .mmap_regions
+            .range(..addr)
+            .next_back()
+            .map(|(&base, &lf)| (base, lf));
+        if let Some((prev_base, prev_lf)) = preceding {
             let prev_len = mmap_region_len(prev_lf);
             let prev_end = prev_base.saturating_add(prev_len);
             if prev_end > addr && prev_len > 0 {
@@ -7345,19 +7403,32 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 }
                 let prev_flags = prev_lf.flags();
                 let left_len = addr - prev_base;
-                mm.mmap_regions.insert(prev_base, MmapEntry::from_len_flags(left_len, prev_flags));
+                mm.mmap_regions
+                    .try_insert(prev_base, MmapEntry::from_len_flags(left_len, prev_flags))
+                    .map_err(|_| SyscallError::ENOMEM)?;
                 let tail_end = prev_end.min(end);
                 let tail_len = tail_end - addr;
-                mm.mmap_regions.insert(addr, MmapEntry::from_len_flags(tail_len, prev_flags));
+                mm.mmap_regions
+                    .try_insert(addr, MmapEntry::from_len_flags(tail_len, prev_flags))
+                    .map_err(|_| SyscallError::ENOMEM)?;
                 if prev_end > end {
                     let right_len = prev_end - end;
-                    mm.mmap_regions.insert(end, MmapEntry::from_len_flags(right_len, prev_flags));
+                    mm.mmap_regions
+                        .try_insert(end, MmapEntry::from_len_flags(right_len, prev_flags))
+                        .map_err(|_| SyscallError::ENOMEM)?;
                 }
             }
         }
 
         // Split trailing region that starts in [addr, end) but extends past end.
-        if let Some((&last_base, &last_lf)) = mm.mmap_regions.range(addr..end).next_back() {
+        // next-phase #11: same as above — hoist the range lookup into an owned
+        // Option so the immutable borrow ends before the try_insert mutations.
+        let trailing = mm
+            .mmap_regions
+            .range(addr..end)
+            .next_back()
+            .map(|(&base, &lf)| (base, lf));
+        if let Some((last_base, last_lf)) = trailing {
             let last_len = mmap_region_len(last_lf);
             let last_end = last_base.saturating_add(last_len);
             if last_end > end && last_len > 0 {
@@ -7367,8 +7438,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let last_flags = last_lf.flags();
                 let in_range_len = end - last_base;
                 let right_len = last_end - end;
-                mm.mmap_regions.insert(last_base, MmapEntry::from_len_flags(in_range_len, last_flags));
-                mm.mmap_regions.insert(end, MmapEntry::from_len_flags(right_len, last_flags));
+                mm.mmap_regions
+                    .try_insert(last_base, MmapEntry::from_len_flags(in_range_len, last_flags))
+                    .map_err(|_| SyscallError::ENOMEM)?;
+                mm.mmap_regions
+                    .try_insert(end, MmapEntry::from_len_flags(right_len, last_flags))
+                    .map_err(|_| SyscallError::ENOMEM)?;
             }
         }
 
@@ -7488,6 +7563,33 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         drop(proc);
                         cgroup::uncharge_memory(cgroup_id, region_len as u64);
                         return Err(SyscallError::EBUSY);
+                    }
+                    // next-phase #11 (symmetric with R168 Path B / IM-12): the
+                    // MmState lock was FREE between Phase-0 classification and this
+                    // claim, so a concurrent op on a CLONE_VM sibling may have
+                    // (a) demoted this region away from PROT_NONE, (b) marked it
+                    // transient — a racing munmap's PENDING_UNMAP or mmap's
+                    // PENDING_MAP — or (c) split/resized it so the live length no
+                    // longer matches the stale Phase-0 `region_len`. Committing
+                    // Path A with that stale length would rewrite a wrong-length
+                    // entry (overlapping a neighbour) AND over-charge the cgroup.
+                    // Re-validate the live entry against the snapshot exactly as
+                    // Path B does; on any mismatch roll back THIS region's charge
+                    // and skip it (POSIX mprotect permits partial application).
+                    // After we set PENDING_MPROTECT, concurrent split/munmap both
+                    // bail on has_transient() for the entire Step 2 window, so
+                    // `region_len` is guaranteed to remain the live length through
+                    // the Step 3 commit below.
+                    if !entry.is_prot_none()
+                        || entry.has_transient()
+                        || entry.len() != region_len
+                    {
+                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                            .saturating_sub(region_len as u64);
+                        drop(mm);
+                        drop(proc);
+                        cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                        continue;
                     }
                     entry.set_pending_mprotect();
                 } else {
@@ -7654,7 +7756,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         // Clear PROT_NONE + old prot bits + transient mprotect flag.
                         let preserved = old.committed_flags_excluding_prot();
                         let new_entry = MmapEntry::from_len_flags(region_len, preserved | new_prot_flags);
-                        mm.mmap_regions.insert(region_base, new_entry);
+                        // next-phase #11: `region_base` is present (matched just
+                        // above under this same lock hold), so replace in place —
+                        // get_mut cannot allocate, keeping this commit infallible.
+                        if let Some(slot) = mm.mmap_regions.get_mut(&region_base) {
+                            *slot = new_entry;
+                        }
                         mm.vm_charged_bytes = mm
                             .vm_charged_bytes
                             .saturating_add(region_len as u64);
@@ -7696,7 +7803,59 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // ---------------------------------------------------------------
     if is_target_prot_none && !real_regions.is_empty() {
         for &(region_base, region_len) in &real_regions {
-            // Step 1: Unmap pages and free frames (COW-aware).
+            // R168-1 FIX (found during the D2-MMAP-LIFECYCLE Phase 2 re-land
+            // audit): Path B demotes a real region to PROT_NONE by unmapping its
+            // frames with the shared MmState lock DROPPED for the page-table
+            // work. The previous code set NO transient marker over that window,
+            // so a concurrent munmap (or mprotect) on the same MmState (a
+            // CLONE_VM sibling) could interleave: capture the region as still
+            // real+charged, mark PENDING_UNMAP, drop its lock — and this path's
+            // commit would then transition to PROT_NONE and uncharge the cgroup,
+            // after which the racing munmap's Phase 3 would uncharge the SAME
+            // bytes a SECOND time (cgroup memory_current driven below true usage
+            // → memory.max isolation bypass / container DoS). Mirror Path A's
+            // proven protocol: claim the entry with PENDING_MPROTECT under the
+            // lock BEFORE the unmap, so concurrent munmap / mprotect / fork fail
+            // closed on has_transient() for the whole window. The claim is
+            // released by the prot_none() commit in Step 3.
+            //
+            // Path B does NOT touch mprotect_pending_bytes: unlike Path A it does
+            // not pre-charge — the region stays charged across the claim window
+            // (still non-PROT_NONE, so compute_cgroup_charged_bytes() keeps
+            // counting it) and the charge is removed exactly once, at commit.
+            //
+            // Step 1: Claim the live entry under the lock, re-validating against
+            // the Phase-0 snapshot (the lock was free since classification, so a
+            // racing op may have demoted / removed / split it in between).
+            let claimed = {
+                let mut mm = mm_arc.lock();
+                match mm.mmap_regions.get_mut(&region_base) {
+                    Some(entry) => {
+                        if entry.is_prot_none() {
+                            // A concurrent mprotect already demoted + uncharged it.
+                            false
+                        } else if entry.has_transient() {
+                            // Another in-flight op (munmap / mprotect) owns it and
+                            // will account for it. POSIX permits partial success.
+                            false
+                        } else if entry.len() != region_len {
+                            // R168-2 FIX: region was split/resized in the window;
+                            // the stale Phase-0 length no longer matches the live
+                            // entry. Skip rather than rewrite a mismatched length.
+                            false
+                        } else {
+                            entry.set_pending_mprotect();
+                            true
+                        }
+                    }
+                    None => false, // a concurrent munmap removed + uncharged it.
+                }
+            };
+            if !claimed {
+                continue;
+            }
+
+            // Step 2: Unmap pages and free frames (COW-aware).
             // R158-7 FIX: fallible frames_to_free with immediate free on OOM.
             unsafe {
                 use mm::memory::FrameAllocator;
@@ -7753,33 +7912,50 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 })
             };
 
-            // D3-ARC-MM-SHARED: Commit bookkeeping directly in shared MmState.
-            // atomic_mprotect_prot_none_transition is no longer needed — all
-            // CLONE_VM siblings share the same MmState via Arc<Mutex<MmState>>.
-            // R162-1 FIX: Condition was inverted — when PROT_NONE flag is ABSENT
-            // (region is real), we SHOULD transition it; when flag is PRESENT
-            // (already PROT_NONE), a concurrent mprotect already transitioned it.
-            let did_transition = {
+            // Step 3: Commit real→PROT_NONE in the shared MmState, releasing the
+            // PENDING_MPROTECT claim (prot_none() clears every flag but
+            // PROT_NONE). Because we held the claim across the unmap window, the
+            // entry is guaranteed present, still our claim, and unchanged in
+            // length. Read cgroup_id under the SAME Process→MmState critical
+            // section as the vm_charged_bytes decrement (R146-2 pattern) so a
+            // concurrent cgroup migration can never split the decrement from its
+            // uncharge target. Write the LIVE entry length (R168-2), not the
+            // stale Phase-0 region_len.
+            let transition = {
+                let proc = process.lock();
                 let mut mm = mm_arc.lock();
-                if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
-                    let old = *entry;
-                    if old.is_prot_none() {
-                        false // Already PROT_NONE; concurrent mprotect transitioned it.
-                    } else {
-                        *entry = MmapEntry::prot_none(region_len);
-                        mm.vm_charged_bytes = mm
-                            .vm_charged_bytes
-                            .saturating_sub(region_len as u64);
-                        true
+                match mm.mmap_regions.get(&region_base).copied() {
+                    Some(old) if old.is_pending_mprotect() => {
+                        let live_len = old.len();
+                        // next-phase #11: `region_base` is present (matched just
+                        // above under this same lock hold), so replace in place —
+                        // get_mut cannot allocate, keeping this commit infallible.
+                        if let Some(slot) = mm.mmap_regions.get_mut(&region_base) {
+                            *slot = MmapEntry::prot_none(live_len);
+                        }
+                        mm.vm_charged_bytes =
+                            mm.vm_charged_bytes.saturating_sub(live_len as u64);
+                        Some((proc.cgroup_id, live_len))
                     }
-                } else {
-                    false
+                    _ => {
+                        // Unreachable while we hold the claim (munmap / mprotect /
+                        // fork all fail closed on has_transient). If the claim
+                        // were somehow lost, fail toward OVER-counting (skip the
+                        // uncharge) rather than risk the double-uncharge isolation
+                        // bypass this fix exists to prevent — the frames were
+                        // already freed in Step 2.
+                        debug_assert!(
+                            false,
+                            "mprotect Path B: lost PENDING_MPROTECT claim at {:#x}",
+                            region_base
+                        );
+                        None
+                    }
                 }
             };
 
-            if did_transition {
-                let uncharge_cgroup_id = process.lock().cgroup_id;
-                cgroup::uncharge_memory(uncharge_cgroup_id, region_len as u64);
+            if let Some((uncharge_cgroup_id, uncharge_len)) = transition {
+                cgroup::uncharge_memory(uncharge_cgroup_id, uncharge_len as u64);
             }
         }
     }

@@ -448,16 +448,17 @@ fn fork_inner(
             }));
 
             let child_mm = crate::process::MmState {
-                // R165-14 (tracked tech-debt, AD-02): stable no_std
-                // `alloc::collections::BTreeMap` exposes NO fallible
-                // construction/insertion API (`try_insert` only reports key
-                // collisions, not allocation failure), so this `.collect()` can
-                // still abort under OOM. Mitigations: (1) the `snap` Vec above is
-                // a fallible OOM probe sized to the same entry count, and (2) the
-                // count is bounded by MAX_MAP_COUNT (asserted above). A complete
-                // fix requires replacing `mmap_regions` with a genuinely fallible
-                // ordered map — tracked as design debt, not closed here.
-                mmap_regions: snap.into_iter().collect(),
+                // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
+                // child's region map is now a `FallibleOrderedMap`, adopted in
+                // O(1) with NO allocation from the already-sorted, already
+                // try_reserve'd `snap` Vec. The prior infallible
+                // `BTreeMap::collect()` (which could abort under OOM with up to
+                // MAX_MAP_COUNT entries) is eliminated: every allocation on this
+                // path is now the fallible `try_reserve_exact` on `snap` above,
+                // and `from_sorted_vec` consumes that Vec verbatim. `snap` is
+                // strictly key-sorted because it is built from the parent's
+                // ordered `mmap_regions.iter()` (debug-asserted by from_sorted_vec).
+                mmap_regions: crate::fallible_map::FallibleOrderedMap::from_sorted_vec(snap),
                 brk_start: parent_mm.brk_start,
                 brk: parent_mm.brk,
                 next_mmap_addr: parent_mm.next_mmap_addr,
