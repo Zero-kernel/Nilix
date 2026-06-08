@@ -156,6 +156,25 @@ pub fn test_cgroup_pt_kmem() {
     klog_always!("    ✓ hard DATA gate re-enforces + root NOT exempt + migration transfer + fork==exit + saturating");
 }
 
+/// Test the Phase J.2 item 8 per-cgroup ephemeral-port budget (`ports.max`).
+///
+/// Two layers: the NET-controller ARITHMETIC (hierarchical charge with ancestor
+/// rollback on deep rejection, the root id==0 exemption, and saturating uncharge)
+/// and the net-side MECHANISM (the `PortBinding` value as the single source of
+/// truth, the ptr-eq remove choke-point that uncharges exactly once and blocks
+/// recycled-key / passive-child cross-cgroup clobber, refund-the-displaced-charge,
+/// the dead-Weak reaper incl. the port-availability prune, the netns-teardown
+/// backstop, and fold-by-cgid deferred-uncharge drain idempotency). Any failure
+/// panics, detected by `make test` / `make boot-check`.
+pub fn test_cgroup_port_budget() {
+    klog_always!("  [TEST] Per-Cgroup Port Budget (J.2-8)...");
+    kernel_core::cgroup::run_cgroup_ports_budget_self_test();
+    net::socket::SocketTable::run_per_cgroup_port_budget_self_test();
+    klog_always!("    ✓ hierarchical ports.max cap (fail-closed) + ancestor rollback + root exempt + saturating");
+    klog_always!("    ✓ PortBinding single-source + ptr-eq uncharge-once + displaced-charge refund");
+    klog_always!("    ✓ dead-Weak reaper (+ port-availability prune) + netns backstop + deferred-drain idempotency");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -174,6 +193,7 @@ pub fn run_all_tests() {
     test_cgroup_fd_budget();
     test_cgroup_vfs_dir_budget();
     test_cgroup_pt_kmem();
+    test_cgroup_port_budget();
     test_ext2_write();
 
     klog_always!();

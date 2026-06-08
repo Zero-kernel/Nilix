@@ -447,6 +447,14 @@ impl Drop for NetNamespace {
             // R121-1 FIX: Clean up per-namespace firewall table to prevent
             // unbounded growth of the global FIREWALL_TABLES map.
             net::firewall::firewall_remove_ns(self.id.0);
+            // J2-8: backstop the per-cgroup ephemeral-port budget — once this
+            // namespace is destroyed, nothing ever allocates an ephemeral port in
+            // it again, so the alloc-time reaper would never run and any still
+            // -charged binding for this ns would leak forever. Remove all (ns,*)
+            // bindings and enqueue their charges (Drop runs in arbitrary context,
+            // so this is enqueue-only; the Level-5 uncharge happens at the next
+            // process-context drain).
+            net::socket_table().drain_ns_port_bindings(self.id);
             NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }

@@ -958,6 +958,40 @@ pub fn register_socket_hooks() {
     net::register_socket_wait_hooks(&KERNEL_SOCKET_WAIT_HOOKS);
 }
 
+/// J2-8: Kernel implementation of the per-cgroup ephemeral-port budget hooks.
+///
+/// Bridges the `net` crate (which cannot depend on `kernel_core::cgroup` — that
+/// would be a dependency cycle) to `process::current_cgroup_id` +
+/// `cgroup::try_charge_ports` / `cgroup::uncharge_ports`.
+struct KernelCgroupPortHooks;
+
+impl net::CgroupPortHooks for KernelCgroupPortHooks {
+    fn current_cgroup_id(&self) -> Option<u64> {
+        // Returns None for non-process (kernel-thread / RX) callers; the net
+        // side then treats the charge as cgid 0 (root / exempt).
+        crate::process::current_cgroup_id()
+    }
+
+    fn try_charge_ports(&self, cgid: u64, n: u64) -> Result<(), ()> {
+        crate::cgroup::try_charge_ports(cgid, n).map_err(|_| ())
+    }
+
+    fn uncharge_ports(&self, cgid: u64, n: u64) {
+        crate::cgroup::uncharge_ports(cgid, n);
+    }
+}
+
+/// Static instance of KernelCgroupPortHooks for registration.
+static KERNEL_CGROUP_PORT_HOOKS: KernelCgroupPortHooks = KernelCgroupPortHooks;
+
+/// J2-8: Register the per-cgroup ephemeral-port budget hooks with the net crate.
+///
+/// Called during kernel initialization alongside `register_socket_hooks`, after
+/// the process module and cgroup registry are ready.
+pub fn register_cgroup_port_hooks() {
+    net::register_cgroup_port_hooks(&KERNEL_CGROUP_PORT_HOOKS);
+}
+
 /// Timer callback to check socket wait timeouts.
 ///
 /// Called from scheduler tick to wake processes whose timeouts have expired.
@@ -10460,14 +10494,18 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
 
     // Bind via socket_table (includes LSM hook_net_bind check)
     // R51-1: Support both UDP and TCP binding
+    // J2-8: explicit bind() (incl. bind(0) -> ephemeral) is NOT charged to the
+    // per-cgroup ports.max budget (charge_ephemeral = false); only active-open
+    // auto-binds (connect / UDP send) are. bind(0) is a documented out-of-scope
+    // residual for this slice.
     let port_opt = if port == 0 { None } else { Some(port) };
     if socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp {
         net::socket_table()
-            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged)
+            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, false)
             .map_err(socket_error_to_syscall)?;
     } else if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
         net::socket_table()
-            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged)
+            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, false)
             .map_err(socket_error_to_syscall)?;
     } else {
         return Err(SyscallError::EOPNOTSUPP);

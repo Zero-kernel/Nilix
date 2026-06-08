@@ -136,6 +136,17 @@ pub fn reschedule_if_needed() {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
 
+    // J2-8: Drain deferred per-cgroup port uncharges in process context. Placed
+    // AFTER the TCP-timer drain because that sweep can tear down ESTABLISHED
+    // connections (cleanup_tcp_connection), which ENQUEUE port uncharges in this
+    // same pass. The cgroup uncharge takes CGROUP_REGISTRY (Level 5) and so must
+    // run here (process context, no net-binding lock held), never under the
+    // binding lock or in IRQ. NOT wired into force_reschedule(): that hook is
+    // reachable from IRQ-adjacent paths where a Level-5 acquire is illegal; the
+    // fold-by-cgid queue bounds any transient overshoot until this drain runs on
+    // the syscall-return path.
+    net::socket_table().drain_deferred_port_uncharges();
+
     // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.
     crate::syscall::drain_deferred_stdin_wakes();
 

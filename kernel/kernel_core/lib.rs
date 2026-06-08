@@ -248,6 +248,11 @@ pub fn init() {
     // Must be after process::init since it needs process management
     syscall::register_socket_hooks();
 
+    // J2-8: Register the per-cgroup ephemeral-port budget hooks (net -> cgroup
+    // upcall). Must be after process::init + cgroup registry init; precedes
+    // userspace, so any non-zero cgroup charge always sees a registered hook.
+    syscall::register_cgroup_port_hooks();
+
     // Register socket timeout checker as timer callback
     scheduler_hook::register_timer_callback(syscall::check_socket_timeouts);
 

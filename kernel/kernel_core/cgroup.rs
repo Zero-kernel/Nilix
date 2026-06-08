@@ -352,6 +352,25 @@ impl CgroupStats {
     fn record_fds_max_event(&self) {
         self.fds_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
+
+    /// J2-8: Decrements the ephemeral-port count (saturating at zero), mirroring
+    /// `decrement_fds` so a double-uncharge / teardown race (the deferred-uncharge
+    /// queue can fold the same charge twice if a remove and a reaper both observe
+    /// the entry) can never wrap `ports_current` to `u64::MAX`.
+    #[inline]
+    fn decrement_ports(&self, n: u64) {
+        let _ = self.ports_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(n)),
+        );
+    }
+
+    /// J2-8: Records a ports.max exceeded event.
+    #[inline]
+    fn record_ports_max_event(&self) {
+        self.ports_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+    }
 }
 
 /// Point-in-time copy of `CgroupStats`.
@@ -2182,6 +2201,121 @@ pub fn migrate_fd_charges(
 }
 
 // ============================================================================
+// J2-8: NET controller — per-cgroup ephemeral-port budget (ports.max)
+// ============================================================================
+
+/// Atomically charges `count` ephemeral ports against a cgroup and its NET
+/// ancestors, hierarchically enforcing `ports.max`. Root (id 0) is exempt.
+///
+/// This is the verbatim structural twin of `try_charge_fds` (FILES -> NET=0x20,
+/// fds_* -> ports_*): it walks the target + ancestors carrying the NET
+/// controller, snapshots each node's `ports_max`, then does a saturating
+/// `fetch_update` per level and ROLLS BACK every already-charged level on the
+/// first rejection (so a deep-ancestor cap never strands a charge at a shallower
+/// level). Hierarchical by design: an ancestor's `ports_current` aggregates all
+/// descendants' charges, so the leaf invariant "ports_current(leaf) == count of
+/// live PortBinding entries charged to leaf" holds per-leaf and the uncharge
+/// walks the SAME chain (symmetry).
+///
+/// # Lock context (J2-SHARED-CORE invariant, lock_ordering.rs)
+/// Acquires CGROUP_REGISTRY (L5, via `lookup_cgroup`) + per-node `limits` (L5).
+/// MUST NOT be called while any net-binding lock (L8) is held or from IRQ
+/// context — the net layer resolves the cgroup and charges BEFORE taking a
+/// binding lock, and routes every teardown uncharge through the process-context
+/// deferred-uncharge drain.
+///
+/// # Errors
+/// * `PortsLimitExceeded` - the target or an ancestor would exceed `ports.max`.
+pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError> {
+    if count == 0 || cgroup_id == 0 {
+        return Ok(());
+    }
+
+    // Collect the chain: target cgroup + ancestors with the NET controller.
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+    while let Some(cgroup) = cursor {
+        if cgroup.controllers.contains(CgroupControllers::NET) {
+            chain.push(cgroup.clone());
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+
+    if chain.is_empty() {
+        return Ok(()); // No NET controller anywhere in the chain.
+    }
+
+    // Snapshot per-node limits (lock each briefly; never hold two at once).
+    let limits_snapshot: Vec<Option<u64>> =
+        chain.iter().map(|c| c.limits.lock().ports_max).collect();
+
+    // Track charged indices for rollback on rejection at a deeper level.
+    let mut charged: Vec<usize> = Vec::new();
+    for (idx, cgroup) in chain.iter().enumerate() {
+        let max = limits_snapshot[idx];
+        match cgroup.stats.ports_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| {
+                let new = current.saturating_add(count);
+                if let Some(max) = max {
+                    if new > max {
+                        return None; // would exceed ports.max
+                    }
+                }
+                Some(new)
+            },
+        ) {
+            Ok(_) => charged.push(idx),
+            Err(_) => {
+                cgroup.stats.record_ports_max_event();
+                // Rollback previously charged levels (saturating, cannot fail).
+                for &j in &charged {
+                    chain[j].stats.decrement_ports(count);
+                }
+                return Err(CgroupError::PortsLimitExceeded);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Atomically uncharges `count` ephemeral ports from a cgroup (saturating at
+/// zero), walking the same NET ancestor chain as `try_charge_ports`. Root (id 0)
+/// is exempt. Called from the process-context deferred-uncharge drain and the
+/// direct (close / connect-rollback) teardown sites — NEVER under a net-binding
+/// lock or from IRQ.
+///
+/// "Uncharge what you charged": the net layer passes the STORED `charged_cgroup`
+/// recorded in the `PortBinding` value at allocation time, never the current
+/// task's cgroup (which may have migrated, or whose lookup would re-enter
+/// PROCESS_TABLE on the exec/cloexec teardown path).
+pub fn uncharge_ports(cgroup_id: CgroupId, count: u64) {
+    if count == 0 || cgroup_id == 0 {
+        return;
+    }
+
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
+        if cgroup.controllers.contains(CgroupControllers::NET) {
+            cgroup.stats.decrement_ports(count);
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+}
+
+// ============================================================================
 // F.2: IO Controller Integration (io.max enforcement)
 // ============================================================================
 
@@ -2675,6 +2809,71 @@ pub fn run_cgroup_fd_budget_self_test() {
     let _ = delete_cgroup(b_id);
     let _ = delete_cgroup(a_id);
     let _ = delete_cgroup(c_id);
+}
+
+/// J2-8: in-kernel self-test for the per-cgroup ephemeral-port budget ARITHMETIC
+/// (NET controller, ports.max): hierarchical charge, deep-rejection rollback of
+/// the already-charged ancestor, root id==0 exemption, and saturating uncharge.
+/// Mirrors the FILES test minus migration — port charges deliberately do NOT
+/// migrate on cgroup_attach (they stick to the alloc-time cgroup via
+/// "uncharge what you charged"; the net-side MECHANISM is tested in
+/// `net::SocketTable::run_per_cgroup_port_budget_self_test`).
+pub fn run_cgroup_ports_budget_self_test() {
+    let ports = |n: &Arc<CgroupNode>| n.stats.ports_current.load(Ordering::SeqCst);
+
+    // Fresh, task-less NET cgroups under root: A(ports_max=10) ⊃ B(ports_max=4).
+    let a = create_cgroup(0, CgroupControllers::NET).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits { ports_max: Some(10), ..Default::default() })
+        .expect("set A.ports.max");
+    let b = create_cgroup(a_id, CgroupControllers::NET).expect("create B");
+    let b_id = b.id();
+    b.set_limit(CgroupLimits { ports_max: Some(4), ..Default::default() })
+        .expect("set B.ports.max");
+
+    // 1) Charge 3 under B (within cap): B and ancestor A both increment.
+    try_charge_ports(b_id, 3).expect("charge 3 under B");
+    assert_eq!(ports(&b), 3, "B after charge 3");
+    assert_eq!(ports(&a), 3, "A (ancestor) after charge 3 under B");
+
+    // 2) Over B's cap (3+2 > 4) -> PortsLimitExceeded; A is NOT left over-charged
+    //    (deep-level rejection rolls back the already-charged ancestor).
+    assert_eq!(
+        try_charge_ports(b_id, 2),
+        Err(CgroupError::PortsLimitExceeded),
+        "B over-cap must fail-closed"
+    );
+    assert_eq!(ports(&b), 3, "B unchanged after rejected charge");
+    assert_eq!(ports(&a), 3, "A rolled back after B rejection");
+
+    // 3) Charge exactly to B's cap.
+    try_charge_ports(b_id, 1).expect("charge 1 to B's cap");
+    assert_eq!(ports(&b), 4, "B at cap");
+    assert_eq!(ports(&a), 4, "A after B at cap");
+
+    // 4) Root id==0 short-circuit: a root-TARGETED charge/uncharge is a no-op.
+    let root = lookup_cgroup(0).expect("root");
+    let root_before = root.stats.ports_current.load(Ordering::SeqCst);
+    try_charge_ports(0, 100).expect("root-targeted charge is Ok");
+    uncharge_ports(0, 100);
+    assert_eq!(
+        root.stats.ports_current.load(Ordering::SeqCst),
+        root_before,
+        "root id=0 port charge/uncharge are no-ops"
+    );
+
+    // 5) Uncharge what you charged: drop B's 4 — B and ancestor A both decrement.
+    uncharge_ports(b_id, 4);
+    assert_eq!(ports(&b), 0, "B drained");
+    assert_eq!(ports(&a), 0, "A (B's ancestor) drained");
+
+    // 6) Saturating uncharge: over-uncharge floors at 0 (never wraps).
+    uncharge_ports(b_id, 999);
+    assert_eq!(ports(&b), 0, "B saturates at 0");
+
+    // Cleanup: delete children before parents (no tasks attached).
+    let _ = delete_cgroup(b_id);
+    let _ = delete_cgroup(a_id);
 }
 
 /// J2-9: in-kernel self-test for the page-table-frame kmem accounting. The pt
