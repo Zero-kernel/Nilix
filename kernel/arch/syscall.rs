@@ -402,9 +402,9 @@ static SYSCALL_INITIALIZED: core::sync::atomic::AtomicBool =
 ///
 /// # Safety
 ///
-/// - 必须在 GDT 初始化后调用
+/// - 必须在每个 CPU 上调用，且在该 CPU 的 GDT 加载之后
+///   （STAR/LSTAR/SFMASK 与 EFER.SCE 均为 per-CPU MSR，BSP 与每个 AP 都必须各自配置）
 /// - syscall_entry 必须是有效的系统调用处理程序地址
-/// - 只能调用一次
 ///
 /// # STAR MSR 布局 (64-bit 模式)
 ///
@@ -414,11 +414,16 @@ static SYSCALL_INITIALIZED: core::sync::atomic::AtomicBool =
 /// bits 31:0  = 保留（32-bit 模式使用）
 /// ```
 pub unsafe fn init_syscall_msr(syscall_entry: u64) {
-    if SYSCALL_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-        klog!(Warn, "Warning: SYSCALL MSR already initialized");
-        return;
-    }
-
+    // R171-G1-01 FIX: STAR/LSTAR/SFMASK and EFER.SCE are PER-CPU MSRs — every
+    // logical CPU (the BSP and each AP) MUST program its own copy. The previous
+    // global `SYSCALL_INITIALIZED` early-return ran the MSR programming only on
+    // the first (BSP) call and skipped it on every AP, leaving APs with a
+    // reset-value LSTAR (=0): a `syscall` executed on an AP then transferred to
+    // RIP 0 in ring 0 (and SYSRET loaded reset-value selectors). The writes
+    // below are per-CPU (wrmsr affects only the executing CPU) and idempotent,
+    // so they now run UNCONDITIONALLY on every CPU. `SYSCALL_INITIALIZED` is kept
+    // only to (a) back `is_initialized()` and (b) gate the one-time, KASLR-
+    // sensitive MSR dump so the LSTAR address is not logged once per CPU.
     let sel = gdt::selectors();
 
     // 获取选择子的原始值（不含 RPL）
@@ -455,13 +460,24 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
     let efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
 
-    SYSCALL_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
+    // R171-G1-01 FIX: publish "first CPU done" exactly once. The CAS both backs
+    // `is_initialized()` and selects the single CPU allowed to emit the one-time
+    // dump/log below — so the per-CPU re-programming never re-logs the KASLR-
+    // sensitive LSTAR address (debug) or spams the line once per AP (release).
+    let first_cpu = SYSCALL_INITIALIZED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok();
 
     // R102-7 FIX: Gate LSTAR/STAR/SFMASK values behind debug_assertions.
     // These contain kernel code addresses that defeat KASLR if leaked
     // to serial console or log output in production builds.
     #[cfg(debug_assertions)]
-    {
+    if first_cpu {
         kprintln!("SYSCALL MSR initialized:");
         kprintln!("  STAR:   0x{:016x}", star_value);
         kprintln!("  LSTAR:  0x{:016x}", syscall_entry);
@@ -472,7 +488,9 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
         );
     }
     #[cfg(not(debug_assertions))]
-    klog_always!("SYSCALL MSR initialized");
+    if first_cpu {
+        klog_always!("SYSCALL MSR initialized");
+    }
 }
 
 /// 检查 SYSCALL/SYSRET 是否已初始化

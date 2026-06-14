@@ -416,12 +416,20 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     code[i + 1] = 0x20;
     code[i + 2] = 0xC0;
     i += 3;
-    // or eax, 0x80000001 (PG | PE)
+    // R171-G1-1 FIX: or eax, 0x80010001 (PG | WP | PE).
+    // The BSP runs ring 0 with CR0.WP=1, so supervisor writes honor the
+    // read-only PTE bit (W^X for kernel .text/.rodata, COW pages reached via
+    // kernel writes). The prior trampoline enabled only PG|PE (0x80000001),
+    // leaving every AP in ring 0 with WP=0 — supervisor write-protection
+    // DISABLED for the life of the AP. Setting WP (bit 16) in the SAME CR0 write
+    // that sets PG closes the class with zero WP=0 window in long mode: the AP's
+    // pre-Rust path only writes RW memory (claim flag, stack; GDT/IDT loads are
+    // reads), so an honest write-protect cannot fault the trampoline itself.
     code[i] = 0x0D;
     i += 1;
     code[i] = 0x01;
     code[i + 1] = 0x00;
-    code[i + 2] = 0x00;
+    code[i + 2] = 0x01;
     code[i + 3] = 0x80;
     i += 4;
     // mov cr0, eax
@@ -1006,8 +1014,17 @@ pub extern "C" fn ap_rust_entry(
     // deadlock hazard as the IRQ/resched locals (R163-6 was never wired in).
     kernel_core::force_init_usercopy_locals();
 
+    // R171-G1-01 FIX: program this AP's per-CPU SYSCALL/SYSRET MSRs
+    // (STAR/LSTAR/SFMASK + EFER.SCE). These are per-CPU MSRs at reset values on a
+    // freshly-started AP; the BSP-only call in main.rs never reached this CPU, so
+    // a `syscall` on a user task migrated here would otherwise transfer to RIP 0
+    // in ring 0. The GDT is already loaded for this AP (init_for_ap above), which
+    // is the documented precondition. Must precede init_syscall_percpu (matching
+    // the BSP order in main.rs: init_syscall_msr then init_syscall_percpu).
+    //
     // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for this AP
     unsafe {
+        syscall::init_syscall_msr(syscall::syscall_entry_stub as *const () as u64);
         syscall::init_syscall_percpu(cpu_idx);
     }
 
