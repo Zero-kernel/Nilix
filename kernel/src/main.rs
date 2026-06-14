@@ -749,9 +749,64 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     mm::init_page_cache();
     klog_always!("      ✓ Global page cache initialized");
 
+    // R171-G5-01 FIX (foundation/observability slice): initialize the IOMMU/VT-d
+    // subsystem BEFORE probing DMA-capable PCI devices (net/block, below).
+    // Previously `iommu::init()` had ZERO callers tree-wide, so the subsystem was
+    // inert: ensure_iommu_ready()/attach_device() always returned NotAvailable
+    // and every device fell into legacy *unprotected* DMA. Wiring it here runs
+    // the subsystem and makes the DMA-isolation posture boot-visible, and — on a
+    // hard init failure — leaves the PCI probes failing CLOSED (init() sets
+    // IOMMU_INIT_FAILED → attach_device() returns NotInitialized → the probes'
+    // error arm skips the device instead of enabling bus-master DMA).
+    //
+    // KNOWN RESIDUAL (tracked, R171-G5-01 follow-ups, NOT closed by this slice):
+    //   (B) ACPI DMAR discovery is stubbed (iommu::dmar::find_dmar_table always
+    //       returns NotFound), so init() currently returns NoDmarTable on every
+    //       machine → real VT-d never engages until discovery is implemented.
+    //   (C) In the Secure hardening profile, the PCI probes must REFUSE bus
+    //       mastering for a device that cannot be IOMMU-isolated (NotAvailable),
+    //       instead of the current legacy-proceed — the actual "fail-closed"
+    //       enforcement. Deferred (gate boots Balanced; needs per-profile probe
+    //       policy + Secure-profile boot verification).
+    // init() fails SAFE on no-DMAR, so this wiring is boot-neutral where no DMAR
+    // table exists (incl. default QEMU, which presents no intel-iommu).
+    klog_always!("[7.53/8] Initializing IOMMU (DMA isolation)...");
+    // R171-G5-01-B: pass the bootloader-provided RSDP so iommu can actually
+    // discover the ACPI DMAR table (same source the arch RSDP publish uses).
+    let rsdp_phys = boot_info.map(|i| i.rsdp_address).unwrap_or(0);
+    match iommu::init(rsdp_phys) {
+        Ok(units) => {
+            klog_always!("      ✓ IOMMU active: {} unit(s), DMA translation enabled", units);
+        }
+        Err(iommu::IommuError::NoDmarTable) => {
+            klog_always!("      ! No ACPI DMAR table discovered — legacy (unisolated) DMA mode");
+        }
+        Err(err) => {
+            // DMAR present but unit init failed; iommu::init() has set
+            // IOMMU_INIT_FAILED, so the device probes below fail closed.
+            // Use klog_force! (not klog!/klog_always!, which the Secure profile
+            // suppresses) so this security-relevant failure is visible even under
+            // the Secure-profile diagnostic blackout.
+            klog_force!(
+                "      ! IOMMU initialization FAILED ({:?}) — DMA-capable PCI devices fail closed this boot",
+                err
+            );
+        }
+    }
+    klog_always!("      - IOMMU enabled: {}", iommu::is_enabled());
+
+    // R171-G5-01-C: in the Secure profile, a DMA-capable device that cannot be
+    // IOMMU-isolated must be REFUSED bus-mastering (fail closed) rather than run
+    // legacy-unprotected. Compute the policy here (where `compliance` is a dep) and
+    // thread it into the device probes (net/block stay compliance-agnostic).
+    let iommu_required = matches!(
+        compliance::policy().profile,
+        compliance::HardeningProfile::Secure
+    );
+
     // Phase D: Network Layer
     klog_always!("[7.54/8] Initializing Network Layer...");
-    let net_devices = net::init();
+    let net_devices = net::init(iommu_required);
     if net_devices == 0 {
         klog_always!("      ! No network devices detected");
     }
@@ -760,7 +815,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     klog_always!("[7.55/8] Initializing Block Layer...");
     block::init();
     // Probe for virtio-blk devices and register with VFS
-    if let Some((device, name)) = block::probe_devices() {
+    if let Some((device, name)) = block::probe_devices(iommu_required) {
         let device_for_registration = device.clone();
         match vfs::register_block_device(name, device_for_registration) {
             Ok(()) => {

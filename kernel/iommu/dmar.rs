@@ -20,6 +20,7 @@
 
 use alloc::vec::Vec;
 use core::ptr;
+use mm::PHYSICAL_MEMORY_OFFSET;
 
 // ============================================================================
 // Constants
@@ -27,6 +28,18 @@ use core::ptr;
 
 /// DMAR table signature ("DMAR").
 const DMAR_SIGNATURE: [u8; 4] = *b"DMAR";
+
+/// R171-G5-01-B FIX: the kernel high-half direct map covers only physical
+/// `[0, 1 GiB)` (mm `HIGH_HALF_MAP_LIMIT`). Any ACPI table physical address whose
+/// `[phys, phys+len)` is not fully inside this window cannot be read through the
+/// direct map and MUST fail CLOSED (`InvalidStructure`), never be silently treated
+/// as "no DMAR" (`NotFound`). Mirrors `vtd.rs` MAX_DIRECT_MAP_PHYS; do NOT use the
+/// (latently-wrong) 4 GiB `smp::MAX_PHYS_MAPPED`.
+const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30;
+
+/// Legacy BIOS RSDP scan window (used only when the bootloader provides no RSDP).
+const RSDP_SEARCH_START: u64 = 0xE_0000;
+const RSDP_SEARCH_END: u64 = 0x10_0000;
 
 /// DRHD structure type.
 const DMAR_TYPE_DRHD: u16 = 0;
@@ -94,6 +107,28 @@ struct AcpiHeader {
     oem_revision: u32,
     creator_id: u32,
     creator_revision: u32,
+}
+
+/// ACPI RSDP v1 structure (20 bytes; ACPI 1.0).
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct RsdpV1 {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+}
+
+/// ACPI RSDP v2 structure (36 bytes; ACPI 2.0+, supersedes v1 with XSDT).
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct RsdpV2 {
+    v1: RsdpV1,
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
 }
 
 /// DMAR table header (after ACPI header).
@@ -372,27 +407,206 @@ impl DeviceScope {
 ///
 /// * `Ok(DmarTable)` - Successfully parsed DMAR table
 /// * `Err(DmarError)` - Parsing failed
-pub fn parse_dmar_table() -> Result<DmarTable, DmarError> {
+pub fn parse_dmar_table(rsdp_phys: u64) -> Result<DmarTable, DmarError> {
     // Find DMAR table in ACPI
-    let table_ptr = find_dmar_table()?;
+    let table_ptr = find_dmar_table(rsdp_phys)?;
 
     unsafe { parse_dmar_at(table_ptr) }
 }
 
-/// Find the DMAR table in ACPI tables.
-fn find_dmar_table() -> Result<*const u8, DmarError> {
-    // TODO: Implement proper ACPI table discovery
-    // For now, search known locations or use bootloader-provided ACPI info
-    //
-    // In a real implementation:
-    // 1. Find RSDP (Root System Description Pointer)
-    // 2. Parse RSDT or XSDT to find DMAR table
-    //
-    // For QEMU with intel-iommu=on, DMAR is present in ACPI tables
+/// R171-G5-01-B FIX: bound a firmware-advertised physical region to the kernel
+/// direct map and return a CPU-readable high-half pointer, or `None` if it is not
+/// fully inside `[0, 1 GiB)`. EVERY read of a firmware-controlled ACPI address goes
+/// through this so a malformed/out-of-range table can never fault the kernel or be
+/// blindly dereferenced. `None` for an address the firmware CLAIMS exists is the
+/// caller's signal to fail CLOSED (`InvalidStructure`).
+fn phys_window(phys: u64, len: usize) -> Option<*const u8> {
+    if phys == 0 {
+        return None;
+    }
+    let end = phys.checked_add(len as u64)?; // no u64 wrap
+    if end > MAX_DIRECT_MAP_PHYS {
+        return None; // above the 1 GiB direct map
+    }
+    Some((PHYSICAL_MEMORY_OFFSET + phys) as *const u8)
+}
 
-    // Placeholder: Search for DMAR in ACPI table area
-    // This needs proper ACPI infrastructure
-    Err(DmarError::NotFound)
+/// Outcome of validating a candidate RSDP. The `Unreadable` vs `Invalid`
+/// distinction is the fail-closed hinge (R171-G5-01-B): a firmware-advertised RSDP
+/// that lies (even partially) above the 1 GiB direct map is present-but-
+/// uninspectable → the caller must fail CLOSED; a merely garbage/corrupt readable
+/// hint may fall back to a legacy BIOS scan without weakening isolation.
+enum RsdpResult {
+    /// Valid RSDP → (rsdt_phys, xsdt_phys); xsdt 0 if ACPI 1.0.
+    Valid(u64, u64),
+    /// Readable but not a valid RSDP (bad signature / checksum / length).
+    Invalid,
+    /// A required window lies above the 1 GiB direct map — cannot be inspected.
+    Unreadable,
+}
+
+/// Validate an RSDP at `phys`.
+///
+/// # Safety
+/// All reads are bounded by `phys_window`; `phys` need not be pre-validated.
+unsafe fn validate_rsdp(phys: u64) -> RsdpResult {
+    let rsdp_ptr = match phys_window(phys, core::mem::size_of::<RsdpV1>()) {
+        Some(p) => p,
+        None => return RsdpResult::Unreadable,
+    };
+    if core::slice::from_raw_parts(rsdp_ptr, 8) != b"RSD PTR " {
+        return RsdpResult::Invalid;
+    }
+    if !verify_checksum(rsdp_ptr, core::mem::size_of::<RsdpV1>()) {
+        return RsdpResult::Invalid;
+    }
+    let v1 = ptr::read_unaligned(rsdp_ptr as *const RsdpV1);
+    if v1.revision < 2 {
+        return RsdpResult::Valid(v1.rsdt_address as u64, 0);
+    }
+    // ACPI 2.0+: validate the extended structure + checksum, prefer XSDT. A v2 body
+    // or checksum window above 1 GiB is Unreadable (fail closed), NOT a bad hint.
+    let v2_ptr = match phys_window(phys, core::mem::size_of::<RsdpV2>()) {
+        Some(p) => p,
+        None => return RsdpResult::Unreadable,
+    };
+    let v2 = ptr::read_unaligned(v2_ptr as *const RsdpV2);
+    let v2_len = v2.length as usize;
+    if v2_len < core::mem::size_of::<RsdpV1>() || v2_len > core::mem::size_of::<RsdpV2>() {
+        return RsdpResult::Invalid;
+    }
+    let v2_full = match phys_window(phys, v2_len) {
+        Some(p) => p,
+        None => return RsdpResult::Unreadable,
+    };
+    if !verify_checksum(v2_full, v2_len) {
+        return RsdpResult::Invalid;
+    }
+    RsdpResult::Valid(v1.rsdt_address as u64, v2.xsdt_address)
+}
+
+/// Walk an RSDT (`entry_width==4`) or XSDT (`entry_width==8`) looking for the DMAR
+/// entry. Returns `Ok(Some(dmar_phys))`, `Ok(None)` if not present, or
+/// `Err(InvalidStructure)` for any malformed / out-of-direct-map table.
+///
+/// # Safety
+/// `sdt_phys` is a firmware pointer; all reads are bounded via `phys_window`.
+unsafe fn find_dmar_in_sdt(
+    sdt_phys: u64,
+    entry_width: usize,
+    expect_sig: &[u8; 4],
+) -> Result<Option<u64>, DmarError> {
+    if entry_width != 4 && entry_width != 8 {
+        return Err(DmarError::InvalidStructure);
+    }
+    let hdr_size = core::mem::size_of::<AcpiHeader>();
+    let header_ptr = phys_window(sdt_phys, hdr_size).ok_or(DmarError::InvalidStructure)?;
+    let header = ptr::read_unaligned(header_ptr as *const AcpiHeader);
+    if &header.signature != expect_sig {
+        return Err(DmarError::InvalidStructure);
+    }
+    let total_len = header.length as usize;
+    if total_len < hdr_size {
+        return Err(DmarError::InvalidStructure);
+    }
+    let body_len = total_len - hdr_size;
+    if body_len % entry_width != 0 {
+        return Err(DmarError::InvalidStructure);
+    }
+    // Re-window the whole table and checksum it before trusting any entry.
+    let table_ptr = phys_window(sdt_phys, total_len).ok_or(DmarError::InvalidStructure)?;
+    if !verify_checksum(table_ptr, total_len) {
+        return Err(DmarError::InvalidStructure);
+    }
+    for i in 0..(body_len / entry_width) {
+        let off = hdr_size + i * entry_width;
+        let entry_phys = match entry_width {
+            4 => u32::from_le(ptr::read_unaligned(table_ptr.add(off) as *const u32)) as u64,
+            _ => u64::from_le(ptr::read_unaligned(table_ptr.add(off) as *const u64)),
+        };
+        // A real-but-unreadable (>1 GiB) entry is "present yet uninspectable" → fail closed.
+        let entry_hdr_ptr =
+            phys_window(entry_phys, hdr_size).ok_or(DmarError::InvalidStructure)?;
+        let entry_hdr = ptr::read_unaligned(entry_hdr_ptr as *const AcpiHeader);
+        if entry_hdr.signature == DMAR_SIGNATURE {
+            return Ok(Some(entry_phys));
+        }
+    }
+    Ok(None)
+}
+
+/// Scan the legacy BIOS area for an RSDP (used when the bootloader supplies none,
+/// or supplied a readable-but-invalid hint). The scan window is wholly below 1 MiB,
+/// so `Unreadable` never arises here; only a `Valid` RSDP terminates the scan.
+unsafe fn scan_bios_rsdp() -> Option<(u64, u64)> {
+    let mut phys = RSDP_SEARCH_START;
+    while phys < RSDP_SEARCH_END {
+        if let RsdpResult::Valid(rsdt, xsdt) = validate_rsdp(phys) {
+            return Some((rsdt, xsdt));
+        }
+        phys += 16;
+    }
+    None
+}
+
+/// Find the DMAR table in ACPI. `rsdp_phys` is the bootloader-supplied RSDP
+/// physical address (0 if none → BIOS scan).
+///
+/// FAILURE TAXONOMY (the fail-open → fail-closed hinge, R171-G5-01-B):
+/// - `NotFound`: the firmware genuinely advertises no usable ACPI/DMAR → legacy
+///   bypass is permitted by the caller.
+/// - `InvalidStructure`: ACPI exists but is uninspectable/malformed — a non-zero
+///   RSDP or any RSDT/XSDT/entry/DMAR at phys ≥ 1 GiB, a length/overflow, or a bad
+///   checksum → the caller fails CLOSED (no legacy DMA). A real DMAR above the
+///   direct map is therefore refused, NEVER silently treated as "no IOMMU".
+fn find_dmar_table(rsdp_phys: u64) -> Result<*const u8, DmarError> {
+    unsafe {
+        let (rsdt_phys, xsdt_phys) = if rsdp_phys != 0 {
+            match validate_rsdp(rsdp_phys) {
+                RsdpResult::Valid(rsdt, xsdt) => (rsdt, xsdt),
+                // Present but uninspectable (a window >= 1 GiB, incl. a v2 body that
+                // straddles the direct map) → fail CLOSED; never silently downgrade
+                // firmware-advertised ACPI to legacy DMA.
+                RsdpResult::Unreadable => return Err(DmarError::InvalidStructure),
+                // Readable but garbage/corrupt hint → try the legacy BIOS area.
+                RsdpResult::Invalid => match scan_bios_rsdp() {
+                    Some(addrs) => addrs,
+                    None => return Err(DmarError::NotFound),
+                },
+            }
+        } else {
+            match scan_bios_rsdp() {
+                Some(addrs) => addrs,
+                None => return Err(DmarError::NotFound),
+            }
+        };
+
+        if rsdt_phys == 0 && xsdt_phys == 0 {
+            return Err(DmarError::InvalidStructure);
+        }
+
+        // Prefer the 64-bit XSDT; fall back to the 32-bit RSDT.
+        let dmar_phys = if xsdt_phys != 0 {
+            match find_dmar_in_sdt(xsdt_phys, 8, b"XSDT")? {
+                Some(p) => Some(p),
+                None if rsdt_phys != 0 => find_dmar_in_sdt(rsdt_phys, 4, b"RSDT")?,
+                None => None,
+            }
+        } else {
+            find_dmar_in_sdt(rsdt_phys, 4, b"RSDT")?
+        }
+        .ok_or(DmarError::NotFound)?;
+
+        // Bound the DMAR body itself before handing the pointer to parse_dmar_at.
+        let dmar_hdr_ptr = phys_window(dmar_phys, core::mem::size_of::<AcpiHeader>())
+            .ok_or(DmarError::InvalidStructure)?;
+        let dmar_hdr = ptr::read_unaligned(dmar_hdr_ptr as *const AcpiHeader);
+        let dmar_len = dmar_hdr.length as usize;
+        if dmar_len < core::mem::size_of::<AcpiHeader>() + core::mem::size_of::<DmarHeader>() {
+            return Err(DmarError::InvalidStructure);
+        }
+        phys_window(dmar_phys, dmar_len).ok_or(DmarError::InvalidStructure)
+    }
 }
 
 /// Parse DMAR table at a given physical address.

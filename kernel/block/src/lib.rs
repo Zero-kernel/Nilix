@@ -922,7 +922,7 @@ unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> 
 ///
 /// # Returns
 /// Option containing (device Arc, device name) if found
-pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
+pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'static str)> {
     // Known virtio-mmio addresses to try (used by some VMs)
     // These use identity mapping (virt == phys for first 4GB)
     const VIRTIO_MMIO_BASES: [u64; 2] = [
@@ -931,35 +931,43 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
     ];
     let mmio_virt_offset = 0u64; // Identity mapped for low addresses
 
-    // First, try MMIO transport at known addresses
-    for (idx, &base) in VIRTIO_MMIO_BASES.iter().enumerate() {
-        let name = match idx {
-            0 => "vda",
-            1 => "vdb",
-            _ => "vdx",
-        };
-        match unsafe { virtio::VirtioBlkDevice::probe_mmio(base, mmio_virt_offset, name) } {
-            Ok(device) => {
-                let capacity = device.capacity_sectors();
-                let sector_size = device.sector_size();
-                let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
-                klog!(Info, 
-                    "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
-                    name, size_mb, capacity, sector_size
-                );
-                return Some((device, name));
-            }
-            Err(BlockError::NotFound) => {
-                // No device at this address, continue silently
-            }
-            Err(e) => {
-                klog!(Warn, "    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
+    // R171-G5-01-C FIX: the virtio-MMIO block transport allocates DMA buffers
+    // (probe_mmio) with NO IOMMU attach/isolation path, so in the Secure profile
+    // it must be refused (fail closed) — there is no per-device bus-master gate to
+    // fall back on for MMIO. Balanced/Performance keep the legacy MMIO probe.
+    if iommu_required {
+        klog_force!("    ! [SECURE] Refusing virtio-mmio block transport — no IOMMU isolation");
+    } else {
+        // First, try MMIO transport at known addresses
+        for (idx, &base) in VIRTIO_MMIO_BASES.iter().enumerate() {
+            let name = match idx {
+                0 => "vda",
+                1 => "vdb",
+                _ => "vdx",
+            };
+            match unsafe { virtio::VirtioBlkDevice::probe_mmio(base, mmio_virt_offset, name) } {
+                Ok(device) => {
+                    let capacity = device.capacity_sectors();
+                    let sector_size = device.sector_size();
+                    let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
+                    klog!(Info,
+                        "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
+                        name, size_mb, capacity, sector_size
+                    );
+                    return Some((device, name));
+                }
+                Err(BlockError::NotFound) => {
+                    // No device at this address, continue silently
+                }
+                Err(e) => {
+                    klog!(Warn, "    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
+                }
             }
         }
     }
 
     // Then, try PCI transport (virtio-pci modern)
-    if let Some((pci_id, pci_addrs, name)) = pci::probe_virtio_blk() {
+    if let Some((pci_id, pci_addrs, name)) = pci::probe_virtio_blk(iommu_required) {
         // Calculate the range of physical addresses that need to be mapped
         let phys_addrs = [
             pci_addrs.common_cfg,

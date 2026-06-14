@@ -381,14 +381,15 @@ unsafe fn map_virtio_pci_regions(
 /// registers them in the global device registry.
 ///
 /// Returns the number of devices successfully initialized.
-pub fn init() -> usize {
+pub fn init(iommu_required: bool) -> usize {
     klog_always!("  Network subsystem initialized");
     klog_always!("      Probing for network devices...");
 
     let mut registered = 0;
 
-    // Probe PCI for virtio-net devices
-    let pci_devices = pci::probe_virtio_net();
+    // Probe PCI for virtio-net devices (R171-G5-01-C: iommu_required => Secure
+    // refuses bus-master for a device that cannot be IOMMU-isolated).
+    let pci_devices = pci::probe_virtio_net(iommu_required);
 
     if pci_devices.is_empty() {
         klog_always!("      No virtio-net devices found");

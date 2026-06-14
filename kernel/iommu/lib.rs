@@ -270,7 +270,7 @@ pub type IommuResult<T> = Result<T, IommuError>;
 ///
 /// This should be called early in boot, before PCI devices are initialized.
 /// If IOMMU is not available, the kernel can still operate in bypass mode.
-pub fn init() -> IommuResult<u32> {
+pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
     // R90-1 FIX: Prevent double init and fail closed after a previous failure.
     // Check both flags with Acquire ordering to ensure visibility.
     if IOMMU_INIT_DONE.load(Ordering::Acquire) || IOMMU_INIT_FAILED.load(Ordering::Acquire) {
@@ -280,7 +280,7 @@ pub fn init() -> IommuResult<u32> {
     klog_always!("[IOMMU] Initializing IOMMU subsystem...");
 
     // Parse ACPI DMAR table
-    let dmar = match dmar::parse_dmar_table() {
+    let dmar = match dmar::parse_dmar_table(rsdp_phys) {
         Ok(d) => d,
         Err(DmarError::NotFound) => {
             klog_always!("[IOMMU] No DMAR table found - IOMMU not available");

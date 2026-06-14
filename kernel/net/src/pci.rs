@@ -59,7 +59,7 @@ pub struct VirtioNetPciDevice {
 // ============================================================================
 
 /// Probe PCI buses for virtio-net devices.
-pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
+pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
     let mut devices = Vec::new();
     let mut total_pci_devices = 0;
 
@@ -138,9 +138,22 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                 match attach_device(pci_id) {
                     Ok(()) => {}
                     Err(iommu::IommuError::NotAvailable) => {
+                        // R171-G5-01-C FIX: in the Secure profile, REFUSE bus-master
+                        // for a device that cannot be IOMMU-isolated (fail closed)
+                        // rather than enabling unprotected DMA. klog_force! so the
+                        // refusal is visible under the Secure diagnostic blackout.
+                        if iommu_required {
+                            klog_force!(
+                                "    ! [SECURE] Refusing bus-master for {:02x}:{:02x}.{} — no IOMMU isolation",
+                                bus,
+                                dev,
+                                func
+                            );
+                            continue;
+                        }
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
-                        klog!(Info, 
+                        klog!(Info,
                             "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
                             bus,
                             dev,

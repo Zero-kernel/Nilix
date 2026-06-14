@@ -257,7 +257,7 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 /// # Returns
 /// * `Some((pci_id, pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
 /// * `None` - No compatible virtio-blk device found
-pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
+pub fn probe_virtio_blk(iommu_required: bool) -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
     // R161-15 FIX: Acquire shared PCI config lock to prevent concurrent
     // access with IOMMU's PCI operations on SMP.
     let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
@@ -297,6 +297,16 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                 match attach_device(pci_id) {
                     Ok(()) => {}
                     Err(iommu::IommuError::NotAvailable) => {
+                        // R171-G5-01-C FIX: Secure profile refuses bus-master for a
+                        // device that cannot be IOMMU-isolated (fail closed).
+                        // klog_force! pierces the Secure diagnostic blackout.
+                        if iommu_required {
+                            klog_force!(
+                                "    ! [SECURE] Refusing bus-master for {:02x}:{:02x}.{} — no IOMMU isolation",
+                                bus, dev, func
+                            );
+                            continue;
+                        }
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
                         klog!(Warn,
