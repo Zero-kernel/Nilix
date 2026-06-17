@@ -708,6 +708,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // allocate in IRQ/fault context and deadlock against the heap lock. Must run
         // here in process context, mirroring force_init_irq_cpu_locals (R151-5).
         kernel_core::force_init_usercopy_locals();
+        // M4-1 (force-init): three MORE lazy per-CPU CpuLocals are reachable from the
+        // FIRST AP timer IRQ — PER_CPU_COUNTERS (increment_counter in the raw timer ISR),
+        // CURRENT_PID (current_pid() in the ISR), and RCU_READERS (rcu_timer_tick via
+        // on_scheduler_tick, every tick). Force-init them here (BSP, before start_aps), or
+        // an AP's first tick lazily Box-allocates the slab in IRQ and deadlocks on the heap
+        // lock (the same R151-5 class as the three calls above). One BSP call each; the
+        // single global Once covers every CPU.
+        trace::counters::force_init_per_cpu_counters();
+        kernel_core::process::force_init_current_pid();
+        kernel_core::rcu::force_init_rcu_locals();
         klog_always!("      ✓ BSP per-CPU data initialized");
 
         // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP

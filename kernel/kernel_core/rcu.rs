@@ -82,6 +82,16 @@ static CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Nested calls are supported via reference counting.
 static RCU_READERS: CpuLocal<AtomicUsize> = CpuLocal::new(|| AtomicUsize::new(0));
 
+/// M4-1 (force-init): pre-allocate the `RCU_READERS` per-CPU slab before IRQs are
+/// enabled. `on_scheduler_tick` (the timer-IRQ scheduler hook) UNCONDITIONALLY calls
+/// `rcu_timer_tick() -> rcu_quiescent_state() -> RCU_READERS.with(...)` every tick;
+/// without this the first AP timer IRQ would lazily heap-allocate the CpuLocal slab in
+/// IRQ and deadlock on the heap lock (the R151-5 class). Call on the BSP before
+/// `start_aps()`; the single global `Once` covers every CPU.
+pub fn force_init_rcu_locals() {
+    RCU_READERS.force_init();
+}
+
 /// Deferred callback entry with target epoch.
 struct Callback {
     /// The grace period epoch after which this callback can run.

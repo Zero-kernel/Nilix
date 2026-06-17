@@ -159,6 +159,15 @@ unsafe impl Sync for PerCpuCounters {}
 /// Global per-CPU counter storage.
 static PER_CPU_COUNTERS: CpuLocal<PerCpuCounters> = CpuLocal::new(PerCpuCounters::new);
 
+/// M4-1 (force-init): pre-allocate the `PER_CPU_COUNTERS` per-CPU slab before IRQs are
+/// enabled. `increment_counter()` runs in the raw timer ISR (arch/interrupts.rs) BEFORE
+/// `on_scheduler_tick`; without this the first AP timer IRQ would lazily heap-allocate
+/// the CpuLocal slab in IRQ and deadlock on the heap lock (the R151-5 class). Call on the
+/// BSP before `start_aps()`; the single global `Once` covers every CPU.
+pub fn force_init_per_cpu_counters() {
+    PER_CPU_COUNTERS.force_init();
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
