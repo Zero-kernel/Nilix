@@ -594,6 +594,15 @@ fn fork_inner(
         child.robust_list_head = 0;
         child.robust_list_len = 0;
 
+        // M4-1b: the per-PCB wait-timeout markers are INTENTIONALLY OMITTED from the
+        // parent-copy allowlist above — a child must be born-clean (no inherited
+        // timeout). `Process::new` already zeroes them; this explicit store is the
+        // grep-visible tripwire so a future field-copy refactor cannot silently
+        // inherit a parent marker (which would surface as a spurious TimedOut in the
+        // child's first wait of the matching subsystem).
+        child.socket_timeout_marker.store(0, Ordering::Relaxed);
+        child.wq_timeout_marker.store(0, Ordering::Relaxed);
+
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;
 
