@@ -574,17 +574,10 @@ struct SocketWaiters {
     /// R165-9 FIX: each waiter carries the monotonic `generation` of the
     /// `wait()` call that enqueued it (mirrors the IPC WaitQueue R165-4 fix).
     waiters: BTreeMap<usize, VecDeque<(ProcessId, u64, Option<u64>)>>,
-    /// Track timed-out waiters to report correct WaitOutcome.
-    ///
-    /// When a waiter times out (via check_timeouts or inline check), we record
-    /// `(pid -> generation)` here. When wait() returns, it consumes this marker
-    /// to distinguish TimedOut from Woken.
-    ///
-    /// R165-9 FIX: keyed by `(pid, generation)` rather than PID alone. A PID
-    /// recycled to a different process within the ~tick window cannot consume a
-    /// stale timeout marker, because its `wait()` runs with a fresh generation
-    /// that will not match the old marker.
-    timed_out: BTreeMap<ProcessId, u64>,
+    // M4-1b: the former `timed_out: BTreeMap<ProcessId, u64>` was removed — the
+    // timeout marker now lives per-PCB in `Process.socket_timeout_marker`, set
+    // under the proc lock at the Blocked->Ready transition (no IRQ heap alloc) and
+    // consumed by the waiter's epilogue via `process::consume_socket_timeout`.
     /// Monotonic generation counter, advanced on each `wait()` registration.
     /// All access is under the `SOCKET_WAITERS` lock, so a plain counter
     /// suffices (no atomics needed).
@@ -595,7 +588,6 @@ impl SocketWaiters {
     const fn new() -> Self {
         SocketWaiters {
             waiters: BTreeMap::new(),
-            timed_out: BTreeMap::new(),
             next_generation: 1,
         }
     }
@@ -652,26 +644,12 @@ impl SocketWaiters {
         false
     }
 
-    /// Mark a process as timed out (for correct WaitOutcome reporting).
-    fn mark_timed_out(&mut self, pid: ProcessId, generation: u64) {
-        self.timed_out.insert(pid, generation);
-    }
-
-    /// Consume the timeout marker for a process on an EXACT generation match.
-    ///
-    /// R165-9 FIX: a stored generation strictly less than `expected` is a stale
-    /// leftover from an earlier wait by this PID — drop it without reporting a
-    /// timeout. A greater stored generation is impossible (one PID cannot have
-    /// two concurrent waits). Returns true only on an exact `(pid, gen)` match.
-    fn consume_timeout(&mut self, pid: ProcessId, expected: u64) -> bool {
-        if let Some(&stored) = self.timed_out.get(&pid) {
-            if stored <= expected {
-                self.timed_out.remove(&pid);
-                return stored == expected;
-            }
-        }
-        false
-    }
+    // M4-1b: `mark_timed_out` / `consume_timeout` (which mutated the deleted
+    // `timed_out` BTreeMap) are removed. The timeout marker now lives per-PCB in
+    // `Process.socket_timeout_marker`: SET inline (under the proc lock, gated on a
+    // successful exact-(pid,gen) `remove_waiter`) or from the timer IRQ in
+    // `check_timeouts`, and CONSUMED by the wait epilogue via
+    // `process::consume_socket_timeout` (exact-generation, swap-to-clear).
 
     /// Wake one waiter from a queue (FIFO order).
     fn wake_one(&mut self, queue_addr: usize) -> Option<ProcessId> {
@@ -768,21 +746,35 @@ impl SocketWaiters {
                     // Blocked->Ready transition. If the process exited, its lock is
                     // contended, or a normal wake already readied it, we must not
                     // leave a stale timeout marker (mirrors sync.rs timeout_wake).
-                    let mut record_timeout = false;
                     // R171-G5-1 FIX: tri-state try_get_process — never block
                     // PROCESS_TABLE in IRQ context.
                     match try_get_process(pid) {
                         // Contended table: defer this waiter (leave it queued with
                         // its original deadline; retried next tick). Do NOT remove.
                         None => continue,
-                        // Process gone — fall through to remove membership with
-                        // record_timeout == false (R155-12: no stale timeout flag).
+                        // Process gone — fall through to remove membership; set NO
+                        // marker (R155-12: no stale timeout flag for a dead process).
                         Some(None) => {}
                         Some(Some(proc_arc)) => {
                             if let Some(mut proc) = proc_arc.try_lock() {
                                 if proc.state == ProcessState::Blocked {
+                                    // M4-1b: SET the per-PCB socket timeout marker
+                                    // (Release) STRICTLY BEFORE state=Ready, both
+                                    // inside THIS held proc-lock critical section —
+                                    // the proc-lock release/acquire hand-off (NOT the
+                                    // Release on the atomic) is the marker-before-wake
+                                    // edge every `state` reader honors. Replaces the
+                                    // IRQ-allocating SocketWaiters.timed_out.insert
+                                    // (R151-5 heap-alloc-in-IRQ class). The store and
+                                    // the Ready store MUST stay in the same proc-lock
+                                    // section; moving either out silently breaks it.
+                                    if is_timeout {
+                                        proc.socket_timeout_marker.store(
+                                            crate::process::pack_timeout_marker(generation),
+                                            core::sync::atomic::Ordering::Release,
+                                        );
+                                    }
                                     proc.state = ProcessState::Ready;
-                                    record_timeout = is_timeout;
                                 }
                             } else {
                                 continue;
@@ -798,10 +790,6 @@ impl SocketWaiters {
                         queue.remove(pos);
                     }
 
-                    if record_timeout {
-                        self.timed_out.insert(pid, generation);
-                    }
-
                     // Track queues that may need cleanup
                     if queue.is_empty() && clean_count < MAX_TIMEOUTS_PER_TICK {
                         queues_to_clean[clean_count] = Some(queue_addr);
@@ -812,6 +800,12 @@ impl SocketWaiters {
         }
 
         // Clean up empty queues (separate pass to avoid borrow issues)
+        // M4-1b RESIDUAL (out of scope, tracked as M4-1c): `self.waiters.remove`
+        // is a BTreeMap node free via the global LockedHeap in this timer-IRQ path
+        // — the same R151-5 dealloc class. M4-1b removed only the per-timeout marker
+        // INSERT alloc + this function's former periodic `timed_out.retain` prune
+        // (node deallocs every 100 ticks). The membership-map free below is NOT yet
+        // moved off the IRQ path; M4-1c will defer it to a process-context drain.
         for addr in queues_to_clean.iter().take(clean_count).flatten() {
             if let Some(queue) = self.waiters.get(addr) {
                 if queue.is_empty() {
@@ -820,15 +814,10 @@ impl SocketWaiters {
             }
         }
 
-        // Clean up stale timeout markers for exited processes (prevents PID reuse issues)
-        // Only do this periodically to avoid overhead on every tick
-        if current_ticks % 100 == 0 {
-            // R171-G5-1 FIX: prune only entries we can DEFINITIVELY confirm gone
-            // (Some(None)); a contended table (None) is kept and reconsidered at
-            // the next prune — never block PROCESS_TABLE in this IRQ scan.
-            self.timed_out
-                .retain(|pid, _| !matches!(try_get_process(*pid), Some(None)));
-        }
+        // M4-1b: the per-PCB socket_timeout_marker dies with the PCB, so the former
+        // periodic stale-marker prune (PID-reuse cleanup of the deleted `timed_out`
+        // BTreeMap) is no longer needed — its removal also drops a per-100-tick
+        // BTreeMap node-dealloc from this IRQ path.
     }
 }
 
@@ -888,6 +877,20 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
             // Mark process as blocked
             if let Some(proc_arc) = get_process(pid) {
                 let mut proc = proc_arc.lock();
+                // M4-1b: entry-clear (born-clean). The prior wait's epilogue swap
+                // should already have zeroed this; the debug_assert is the tripwire
+                // for that invariant and the store is the belt so a future exit path
+                // that forgets to consume can never leak a stale incomparable
+                // generation into THIS wait. Must precede Blocked (the IRQ/inline
+                // timeout-set only fires on a Blocked, still-queued entry); the whole
+                // enqueue+block runs under SOCKET_WAITERS + IRQs-off, so no marker can
+                // be set between enqueue above and this clear.
+                debug_assert!(
+                    proc.socket_timeout_marker.load(core::sync::atomic::Ordering::Relaxed) == 0,
+                    "M4-1b: socket_timeout_marker not born-clean at wait entry"
+                );
+                proc.socket_timeout_marker
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 proc.state = ProcessState::Blocked;
             }
             (my_gen, None)
@@ -946,12 +949,27 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                         // R165-9 FIX: only record the timeout if we actually
                         // removed OUR (pid, generation) entry, so we never stamp a
                         // timeout over a concurrent wake/refresh of a newer wait.
-                        let mut waiters = SOCKET_WAITERS.lock();
-                        if waiters.remove_waiter(queue_addr, pid, Some(my_gen)) {
-                            waiters.mark_timed_out(pid, my_gen);
-                        }
+                        // M4-1b: set the per-PCB marker IFF WE removed our exact
+                        // (pid, my_gen) membership — preserves the R165-9 gate (never
+                        // stamp a timeout over a concurrent wake/refresh of a newer
+                        // wait). Drop SOCKET_WAITERS before taking the proc lock
+                        // (strictly fewer locks than the old held-across form).
+                        let we_timed_out = {
+                            let mut waiters = SOCKET_WAITERS.lock();
+                            waiters.remove_waiter(queue_addr, pid, Some(my_gen))
+                        };
                         if let Some(proc_arc) = get_process(pid) {
-                            proc_arc.lock().state = ProcessState::Ready;
+                            let mut proc = proc_arc.lock();
+                            // Store the marker (Release) STRICTLY BEFORE state=Ready,
+                            // both under the proc lock — same marker-before-wake edge
+                            // as the IRQ path (replaces SocketWaiters::mark_timed_out).
+                            if we_timed_out {
+                                proc.socket_timeout_marker.store(
+                                    crate::process::pack_timeout_marker(my_gen),
+                                    core::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            proc.state = ProcessState::Ready;
                         }
                         return false;
                     }
@@ -972,19 +990,19 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
         // close/timeout/wake — consume any stale timeout marker for THIS wait and
         // report Interrupted so the caller returns EINTR instead of re-parking.
         if aborted {
-            SOCKET_WAITERS.lock().consume_timeout(pid, my_gen);
+            crate::process::consume_socket_timeout(pid, my_gen);
             return net::WaitOutcome::Interrupted;
         }
 
         // Determine outcome using timeout marker (fixes race between timer and wake)
         if queue.is_closed() {
             // Consume any stale timeout marker for THIS wait (R165-9: exact gen)
-            SOCKET_WAITERS.lock().consume_timeout(pid, my_gen);
+            crate::process::consume_socket_timeout(pid, my_gen);
             return net::WaitOutcome::Closed;
         }
 
         // Check if we were marked as timed out (by timer callback or inline check)
-        if SOCKET_WAITERS.lock().consume_timeout(pid, my_gen) {
+        if crate::process::consume_socket_timeout(pid, my_gen) {
             return net::WaitOutcome::TimedOut;
         }
 
