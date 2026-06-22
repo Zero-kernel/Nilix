@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -324,6 +324,14 @@ test: build
 # and the D1-BOOT-NX-KASLR-LAYOUT process lesson in docs/next-phase-plan.md.
 boot-check: build
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/boot_check.sh esp
+
+# M0 conformance gate (item 3): prove a REAL static-musl binary runs end-to-end
+# (crt+auxv -> musl stdio printf/writev -> clean exit). Exit code reflects real
+# libc-conformance health, unlike `make test` (which is `... || true` and always
+# exits 0). Builds with --features musl_test so the embedded
+# userspace/hello_musl.elf is the Ring-3 init program. See scripts/musl_check.sh.
+musl-check: build-musl-test
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh esp
 
 # SMP测试模式 - 启用多核支持
 # 使用 -smp 指定CPU数量（默认2个）
