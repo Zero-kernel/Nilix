@@ -39,6 +39,13 @@ pub fn test_syscalls() {
     klog_always!("    ✓ System call framework defined");
     klog_always!("    ✓ 50+ system calls enumerated");
     klog_always!("    ✓ Handler infrastructure ready");
+    // M0 #2: the pure helpers behind clock_gettime(228)/readv(19)/rt_sigprocmask(14).
+    // Verifies the clock-id accept/reject set, ms→timespec/timeval boundary
+    // arithmetic, the rt_sigprocmask Linux-semantics validator (incl. the
+    // NULL-`set` how-skip), and readv's single-segment selection (the
+    // first-non-empty-iovec one-read rule that avoids the exact-boundary block).
+    kernel_core::syscall::run_startup_abi_self_test();
+    klog_always!("    ✓ M0 #2 startup ABI: clock_gettime id-set + ms→timespec/timeval + rt_sigprocmask validator + readv seg-select");
     // M0 #4: the pure helpers behind exec disambiguation — the `#!` shebang
     // parser, argv reconstruction (re-enforced MAX_ARG_* caps + embedded-NUL
     // rejection), the UTF-8 path validator, and comm-name basename truncation.

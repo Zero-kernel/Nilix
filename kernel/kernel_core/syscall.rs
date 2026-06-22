@@ -2678,6 +2678,7 @@ pub fn syscall_dispatcher(
         ),
         8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => sys_ioctl(arg0 as i32, arg1, arg2),
+        19 => sys_readv(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
         20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
         22 => sys_pipe(arg0 as *mut i32),
         32 => sys_dup(arg0 as i32),
@@ -2735,6 +2736,7 @@ pub fn syscall_dispatcher(
         // 时间相关
         35 => sys_nanosleep(arg0 as *const TimeSpec, arg1 as *mut TimeSpec),
         96 => sys_gettimeofday(arg0 as *mut TimeVal, arg1 as usize),
+        228 => sys_clock_gettime(arg0 as i32, arg1 as *mut TimeSpec),
 
         // 系统信息
         63 => sys_uname(arg0 as *mut UtsName),
@@ -7147,6 +7149,69 @@ const _: [(); 16] = [(); core::mem::size_of::<Iovec>()];
 /// writev 最大 iovec 数量
 const IOV_MAX: usize = 1024;
 
+/// Copy and validate a user-supplied `iovec[]` array into kernel memory.
+///
+/// Shared by `sys_writev` and `sys_readv` so the scatter/gather I/O ABI has a
+/// SINGLE hardened validation path (a divergent copy in each would be a latent
+/// audit gap). Returns an empty `Vec` for `iovcnt == 0`.
+///
+/// Preserves the writev security history:
+/// - R97-1: `checked_mul`/`checked_add` guard the array-size and per-entry
+///   offset arithmetic against integer overflow.
+/// - R24-11 / P1-6: each entry is copied with the fault-tolerant
+///   `copy_from_user_safe` (its own per-chunk SMAP window — NO outer
+///   `UserAccessGuard`, which would widen the inter-chunk interrupt-restore
+///   window). A concurrent user unmap degrades to `EFAULT`, never a kernel fault.
+/// - R158-9: fallible `try_reserve_exact` (bounded by `IOV_MAX`, but policy
+///   forbids the infallible `Vec` allocation).
+fn copy_iovec_array_from_user(
+    iov: *const Iovec,
+    iovcnt: usize,
+) -> Result<Vec<Iovec>, SyscallError> {
+    use crate::usercopy::copy_from_user_safe;
+
+    if iovcnt == 0 {
+        return Ok(Vec::new());
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let iov_size = iovcnt
+        .checked_mul(mem::size_of::<Iovec>())
+        .ok_or(SyscallError::EFAULT)?;
+    validate_user_ptr(iov as *const u8, iov_size)?;
+
+    let mut iov_array: Vec<Iovec> = Vec::new();
+    iov_array
+        .try_reserve_exact(iovcnt)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    for i in 0..iovcnt {
+        let entry_offset = i
+            .checked_mul(mem::size_of::<Iovec>())
+            .ok_or(SyscallError::EFAULT)?;
+        let entry_ptr = (iov as usize)
+            .checked_add(entry_offset)
+            .ok_or(SyscallError::EFAULT)? as *const u8;
+
+        // Fault-tolerant per-entry copy, then unaligned read (entry_bytes has
+        // only 1-byte alignment).
+        // SAFETY: Iovec is repr(C) and every byte pattern is a valid Iovec.
+        let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
+        if copy_from_user_safe(&mut entry_bytes, entry_ptr).is_err() {
+            return Err(SyscallError::EFAULT);
+        }
+        let iov_entry: Iovec =
+            unsafe { core::ptr::read_unaligned(entry_bytes.as_ptr() as *const Iovec) };
+        iov_array.push(iov_entry);
+    }
+
+    Ok(iov_array)
+}
+
 /// sys_writev - 分散写入多个缓冲区
 ///
 /// # Arguments
@@ -7157,56 +7222,10 @@ const IOV_MAX: usize = 1024;
 /// # Returns
 /// 成功返回写入的总字节数，失败返回错误码
 fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
-    use crate::usercopy::copy_from_user_safe;
-
-    // 验证 iovcnt
-    if iovcnt == 0 {
+    // Shared hardened validation/copy (R97-1 / R24-11 / P1-6 / R158-9).
+    let iov_array = copy_iovec_array_from_user(iov, iovcnt)?;
+    if iov_array.is_empty() {
         return Ok(0);
-    }
-    if iovcnt > IOV_MAX {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // 验证 iov 指针
-    if iov.is_null() {
-        return Err(SyscallError::EFAULT);
-    }
-    // R97-1 FIX: Use checked_mul to prevent integer overflow
-    let iov_size = iovcnt
-        .checked_mul(mem::size_of::<Iovec>())
-        .ok_or(SyscallError::EFAULT)?;
-    validate_user_ptr(iov as *const u8, iov_size)?;
-
-    // R24-11 fix: Copy iovec array using fault-tolerant usercopy
-    // This prevents kernel panic if user unmaps iovec during copy
-    //
-    // P1-6 FIX: Removed outer UserAccessGuard — copy_from_user_safe creates
-    // its own per-chunk guard internally.  An outer guard prevents the
-    // inter-chunk interrupt-restore window, widening the SMAP-bypass.
-    // R158-9 FIX: Fallible allocation (bounded by IOV_MAX but policy requires try_reserve).
-    let mut iov_array: Vec<Iovec> = Vec::new();
-    iov_array.try_reserve_exact(iovcnt).map_err(|_| SyscallError::ENOMEM)?;
-    for i in 0..iovcnt {
-        // R97-1 FIX: Use checked_mul/checked_add to prevent integer overflow
-        let entry_offset = i
-            .checked_mul(mem::size_of::<Iovec>())
-            .ok_or(SyscallError::EFAULT)?;
-        let entry_ptr = (iov as usize)
-            .checked_add(entry_offset)
-            .ok_or(SyscallError::EFAULT)? as *const u8;
-
-        // Use fault-tolerant copy for each iovec entry
-        let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
-        if copy_from_user_safe(&mut entry_bytes, entry_ptr).is_err() {
-            return Err(SyscallError::EFAULT);
-        }
-
-        // Safely transmute bytes to Iovec
-        // SAFETY: Iovec is repr(C) and all byte patterns are valid.
-        // R97-1 FIX: Use read_unaligned since entry_bytes has only 1-byte alignment.
-        let iov_entry: Iovec =
-            unsafe { core::ptr::read_unaligned(entry_bytes.as_ptr() as *const Iovec) };
-        iov_array.push(iov_entry);
     }
 
     // 逐个写入每个缓冲区
@@ -7236,6 +7255,48 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     }
 
     Ok(total_written)
+}
+
+/// Index of the first non-empty iovec — the single segment `sys_readv` services
+/// this call — or `None` if every segment is zero-length. Pure (reads only
+/// `iov_len`), so it is unit-testable without touching user memory.
+fn first_nonempty_iovec(iovs: &[Iovec]) -> Option<usize> {
+    iovs.iter().position(|e| e.iov_len != 0)
+}
+
+/// sys_readv - 分散读取到多个缓冲区 (Linux x86_64 syscall 19)
+///
+/// Shares `sys_writev`'s hardened iovec validation (`copy_iovec_array_from_user`),
+/// then performs EXACTLY ONE underlying `sys_read` into the first non-empty
+/// segment.
+///
+/// Why one read, not a per-segment gather: `readv(2)` is a SINGLE read operation
+/// over the concatenated buffers — it blocks at most until the first byte and
+/// then returns whatever is currently available, *without blocking again*. Our
+/// I/O primitive is per-buffer and `sys_read` blocks on empty blocking sources
+/// (stdin, pipes — `ipc/lib.rs:121` "potentially blocking pipe I/O"). A naive
+/// gather that advanced to the next segment after a full read would issue a
+/// second blocking read and could hang at an exact buffer boundary where Linux
+/// returns (the case Codex flagged). Servicing only the first non-empty segment
+/// is a legal `readv` (a short result is always permitted; callers loop) and is
+/// musl-stdio compatible (its `[user_buf, FILE_buf]` readv tolerates a short
+/// return — it just forgoes read-ahead buffering). A true scatter awaits a
+/// lower-level vectored read (Phase U / later M0).
+fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
+    // Shared hardened validation/copy (R97-1 / R24-11 / P1-6 / R158-9).
+    let iov_array = copy_iovec_array_from_user(iov, iovcnt)?;
+
+    match first_nonempty_iovec(&iov_array) {
+        Some(i) => {
+            let entry = &iov_array[i];
+            // `iov_base` is the destination here. `sys_read` validates it
+            // writable (validate_user_ptr_mut) and performs the fault-tolerant
+            // usercopy — we never form a Rust `&mut [u8]` from the raw pointer.
+            sys_read(fd, entry.iov_base as *mut u8, entry.iov_len)
+        }
+        // Empty vector (iovcnt == 0) or all segments zero-length: read nothing.
+        None => Ok(0),
+    }
 }
 
 /// sys_open - 打开文件
@@ -12124,17 +12185,218 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
     Ok(0)
 }
 
+// ============================================================================
+// 时间辅助 (shared timespec/timeval construction + startup clock support)
+// ============================================================================
+
+/// CLOCK_* ids that the single millisecond tick can satisfy today (Linux ABI).
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_MONOTONIC_RAW: i32 = 4;
+const CLOCK_REALTIME_COARSE: i32 = 5;
+const CLOCK_MONOTONIC_COARSE: i32 = 6;
+const CLOCK_BOOTTIME: i32 = 7;
+
+/// Build a `struct timespec` from a millisecond count (sec + nanosecond remainder).
+fn timespec_from_ms(ms: u64) -> TimeSpec {
+    TimeSpec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    }
+}
+
+/// Build a `struct timeval` from a millisecond count (sec + microsecond remainder).
+fn timeval_from_ms(ms: u64) -> TimeVal {
+    TimeVal {
+        tv_sec: (ms / 1000) as i64,
+        tv_usec: ((ms % 1000) * 1000) as i64,
+    }
+}
+
+/// Whether `clock_gettime` can satisfy `clockid` from the current time source.
+///
+/// Zero-OS exposes a SINGLE monotonic millisecond tick (`current_timestamp_ms`),
+/// so REALTIME currently aliases uptime exactly as `sys_gettimeofday` already
+/// does, and the whole MONOTONIC family resolves to that same source. CPU-time
+/// clocks (PROCESS/THREAD_CPUTIME_ID = 2/3) and unknown/negative/dynamic ids
+/// return EINVAL until a real epoch wall-clock + per-task CPU accounting land
+/// (Phase U). The realtime-vs-monotonic split is intentionally NOT branched on
+/// today (both arms would be identical); that divergence seam is documented here
+/// so the future epoch source only has to add an offset, not re-classify.
+fn startup_clockid_supported(clockid: i32) -> bool {
+    matches!(
+        clockid,
+        CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+    )
+}
+
+/// sys_clock_gettime - high-resolution clock query (syscall 228).
+///
+/// musl's crt faults without this. Fills a `struct timespec` from the kernel
+/// millisecond tick for every supported clock id (see `startup_clockid_supported`).
+fn sys_clock_gettime(clockid: i32, tp: *mut TimeSpec) -> SyscallResult {
+    if tp.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if !startup_clockid_supported(clockid) {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let timespec = timespec_from_ms(crate::time::current_timestamp_ms());
+
+    // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes)
+    let tp_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &timespec as *const TimeSpec as *const u8,
+            core::mem::size_of::<TimeSpec>(),
+        )
+    };
+    crate::usercopy::copy_to_user_safe(tp as *mut u8, tp_bytes)
+        .map_err(|_| SyscallError::EFAULT)?;
+
+    Ok(0)
+}
+
+/// M0 #2 self-test for the pure startup-ABI helpers — the wires a green
+/// build/boot can't catch (clock-id accept/reject set, ms→timespec/timeval
+/// boundary arithmetic, and the rt_sigprocmask Linux-semantics validator
+/// including the NULL-`set` how-skip). Panics on failure (caught by `make test`
+/// / `make boot-check`).
+pub fn run_startup_abi_self_test() {
+    // --- clock-id acceptance set ---
+    for id in [
+        CLOCK_REALTIME,
+        CLOCK_MONOTONIC,
+        CLOCK_MONOTONIC_RAW,
+        CLOCK_REALTIME_COARSE,
+        CLOCK_MONOTONIC_COARSE,
+        CLOCK_BOOTTIME,
+    ] {
+        assert!(
+            startup_clockid_supported(id),
+            "clockid {} must be supported",
+            id
+        );
+    }
+    // CPU-time clocks (2/3) + unknown/negative/extreme ids are rejected.
+    for id in [2_i32, 3, 8, 9, 11, -1, i32::MAX, i32::MIN] {
+        assert!(
+            !startup_clockid_supported(id),
+            "clockid {} must be rejected",
+            id
+        );
+    }
+
+    // --- ms -> timespec / timeval boundary arithmetic ---
+    // (ms, expected_sec, expected_nsec)
+    let cases = [
+        (0u64, 0i64, 0i64),
+        (1, 0, 1_000_000),
+        (999, 0, 999_000_000),
+        (1000, 1, 0),
+        (1500, 1, 500_000_000),
+        (3_600_000, 3600, 0),
+    ];
+    for (ms, sec, nsec) in cases {
+        let ts = timespec_from_ms(ms);
+        assert_eq!(ts.tv_sec, sec, "timespec sec for ms={}", ms);
+        assert_eq!(ts.tv_nsec, nsec, "timespec nsec for ms={}", ms);
+        assert!(
+            ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000,
+            "timespec nsec out of range for ms={}",
+            ms
+        );
+        let tv = timeval_from_ms(ms);
+        assert_eq!(tv.tv_sec, sec, "timeval sec for ms={}", ms);
+        assert_eq!(tv.tv_usec, nsec / 1000, "timeval usec for ms={}", ms);
+        assert!(
+            tv.tv_usec >= 0 && tv.tv_usec < 1_000_000,
+            "timeval usec out of range for ms={}",
+            ms
+        );
+    }
+
+    // --- rt_sigprocmask argument validator (Linux semantics) ---
+    // Valid how + correct size, with a real `set`.
+    assert!(validate_rt_sigprocmask_args(SIG_BLOCK, false, LINUX_KERNEL_SIGSET_SIZE).is_ok());
+    assert!(validate_rt_sigprocmask_args(SIG_UNBLOCK, false, LINUX_KERNEL_SIGSET_SIZE).is_ok());
+    assert!(validate_rt_sigprocmask_args(SIG_SETMASK, false, LINUX_KERNEL_SIGSET_SIZE).is_ok());
+    // Wrong sigsetsize always fails, regardless of set/how.
+    assert_eq!(
+        validate_rt_sigprocmask_args(SIG_BLOCK, false, 0),
+        Err(SyscallError::EINVAL)
+    );
+    assert_eq!(
+        validate_rt_sigprocmask_args(SIG_BLOCK, false, 16),
+        Err(SyscallError::EINVAL)
+    );
+    assert_eq!(
+        validate_rt_sigprocmask_args(SIG_BLOCK, true, 4),
+        Err(SyscallError::EINVAL)
+    );
+    // Non-NULL set + invalid how => EINVAL.
+    assert_eq!(
+        validate_rt_sigprocmask_args(-1, false, LINUX_KERNEL_SIGSET_SIZE),
+        Err(SyscallError::EINVAL)
+    );
+    assert_eq!(
+        validate_rt_sigprocmask_args(3, false, LINUX_KERNEL_SIGSET_SIZE),
+        Err(SyscallError::EINVAL)
+    );
+    // NULL set is a pure query: `how` is ignored, so even a bogus how is OK.
+    assert!(validate_rt_sigprocmask_args(-1, true, LINUX_KERNEL_SIGSET_SIZE).is_ok());
+    assert!(validate_rt_sigprocmask_args(999, true, LINUX_KERNEL_SIGSET_SIZE).is_ok());
+
+    // --- readv segment selection (the single segment readv services) ---
+    let z = core::ptr::null::<u8>();
+    // All-empty (incl. the iovcnt==0 case) selects nothing => readv returns 0.
+    assert_eq!(first_nonempty_iovec(&[]), None);
+    assert_eq!(
+        first_nonempty_iovec(&[Iovec { iov_base: z, iov_len: 0 }]),
+        None
+    );
+    assert_eq!(
+        first_nonempty_iovec(&[
+            Iovec { iov_base: z, iov_len: 0 },
+            Iovec { iov_base: z, iov_len: 0 },
+        ]),
+        None
+    );
+    // First non-empty wins; leading zero-length segments are skipped.
+    assert_eq!(
+        first_nonempty_iovec(&[Iovec { iov_base: z, iov_len: 5 }]),
+        Some(0)
+    );
+    assert_eq!(
+        first_nonempty_iovec(&[
+            Iovec { iov_base: z, iov_len: 0 },
+            Iovec { iov_base: z, iov_len: 3 },
+        ]),
+        Some(1)
+    );
+    assert_eq!(
+        first_nonempty_iovec(&[
+            Iovec { iov_base: z, iov_len: 0 },
+            Iovec { iov_base: z, iov_len: 0 },
+            Iovec { iov_base: z, iov_len: 7 },
+            Iovec { iov_base: z, iov_len: 1 },
+        ]),
+        Some(2)
+    );
+}
+
 /// sys_gettimeofday - 获取当前时间
 fn sys_gettimeofday(tv: *mut TimeVal, _tz: usize) -> SyscallResult {
     if tv.is_null() {
         return Err(SyscallError::EFAULT);
     }
 
-    let ms = crate::time::current_timestamp_ms();
-    let timeval = TimeVal {
-        tv_sec: (ms / 1000) as i64,
-        tv_usec: ((ms % 1000) * 1000) as i64,
-    };
+    let timeval = timeval_from_ms(crate::time::current_timestamp_ms());
 
     // lint-repr-c-copy: allow (no-padding: TimeVal {i64,i64} = 16 bytes)
     let tv_bytes = unsafe {
