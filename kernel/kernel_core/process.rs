@@ -686,6 +686,54 @@ impl MmState {
 /// - tid: 等于 pid（Linux 语义）
 /// - tgid: 线程组ID（主线程的 pid，所有线程共享）
 /// - is_thread: true 表示由 CLONE_THREAD 创建
+// ============================================================================
+// M0-6: POSIX resource limits (rlimit)
+// ============================================================================
+
+/// A single resource limit (soft `rlim_cur` <= hard `rlim_max`).
+/// ABI: matches Linux `struct rlimit64` (two u64, no padding).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RLimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+const _: () = assert!(core::mem::size_of::<RLimit>() == 16);
+
+/// "No limit" sentinel (RLIM64_INFINITY).
+pub const RLIM_INFINITY: u64 = u64::MAX;
+/// Number of resource-limit slots (Linux RLIMIT_NLIMITS = 16).
+pub const RLIMIT_NLIMITS: usize = 16;
+
+// Linux x86-64 resource indices (the ones referenced by name; the array spans 0..16).
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_NOFILE: usize = 7;
+
+/// Default resource limits for a freshly-created process.
+///
+/// NOFILE/STACK track the kernel's ACTUAL caps so the reported soft limit does
+/// not lie (NOFILE soft==hard==MAX_FD; STACK soft==the loader's fixed stack).
+/// All other limits are RLIM_INFINITY. **ALL limits are ADVISORY**: stored +
+/// reported faithfully but NOT enforced — `allocate_fd` uses the compile-time
+/// `MAX_FD` cap and the loader maps a fixed `USER_STACK_SIZE` stack regardless of
+/// these values (M0 scope; enforcement is future work).
+pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
+    let inf = RLimit {
+        rlim_cur: RLIM_INFINITY,
+        rlim_max: RLIM_INFINITY,
+    };
+    let mut r = [inf; RLIMIT_NLIMITS];
+    r[RLIMIT_NOFILE] = RLimit {
+        rlim_cur: MAX_FD as u64,
+        rlim_max: MAX_FD as u64,
+    };
+    r[RLIMIT_STACK] = RLimit {
+        rlim_cur: crate::elf_loader::USER_STACK_SIZE as u64,
+        rlim_max: RLIM_INFINITY,
+    };
+    r
+}
+
 #[derive(Debug)]
 pub struct Process {
     /// 进程ID（唯一标识，也是 Linux 语义中的 tid）
@@ -835,6 +883,15 @@ pub struct Process {
     ///
     /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
     pub cloexec_fds: BTreeSet<i32>,
+
+    /// M0-6: POSIX resource limits (getrlimit/setrlimit/prlimit64).
+    ///
+    /// PER-TASK storage (a documented M0 DIVERGENCE from Linux, which shares one
+    /// rlimit set per thread group). Inherited by COPY on both fork and clone.
+    /// Mostly ADVISORY (see `default_rlimits`). A future thread-group-sharing
+    /// slice must NOT silently swap in a mutable Arc without a Process→MmState
+    /// lock-ordering review.
+    pub rlimits: [RLimit; RLIMIT_NLIMITS],
 
     /// J2-7: Running count of open file descriptors this process has charged to
     /// its cgroup's `files.max` budget. Maintained in LOCKSTEP with every
@@ -1195,6 +1252,7 @@ impl Process {
             mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(DEFAULT_MMAP_BASE)))),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
+            rlimits: default_rlimits(), // M0-6: POSIX resource limits
             fds_charged_count: 0, // J2-7: no fds charged at construction
 
             cap_table: Arc::new(CapTable::new()),

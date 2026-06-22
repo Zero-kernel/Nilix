@@ -76,14 +76,21 @@ pub(crate) const SYS_SYMLINK: u64 = 88;
 pub(crate) const SYS_READLINK: u64 = 89;
 
 // File attributes
+// M0-6 FIX (fail-unsafe): the Linux x86-64 numbers are chmod=90, fchmod=91,
+// chown=92, fchown=93, lchown=94. SYS_FCHMOD/SYS_FCHOWN were 93/94 (wrong), so a
+// FATTR-pledged process calling the REAL fchmod(91) — dispatched at syscall.rs
+// `91 => sys_fchmod` — was DENIED (91 in neither pledge gate), and 93/94 were
+// allowed-but-ENOSYS phantoms. Corrected to 91/93.
 pub(crate) const SYS_CHMOD: u64 = 90;
+pub(crate) const SYS_FCHMOD: u64 = 91;
 pub(crate) const SYS_CHOWN: u64 = 92;
-pub(crate) const SYS_FCHMOD: u64 = 93;
-pub(crate) const SYS_FCHOWN: u64 = 94;
+pub(crate) const SYS_FCHOWN: u64 = 93;
 
 // Resource limits
 pub(crate) const SYS_GETRLIMIT: u64 = 97;
 pub(crate) const SYS_SETRLIMIT: u64 = 160;
+// M0-6: prlimit64 — the modern interface musl/glibc route get/setrlimit through.
+pub(crate) const SYS_PRLIMIT64: u64 = 302;
 
 // Threading
 pub(crate) const SYS_FUTEX: u64 = 202;
@@ -1250,11 +1257,20 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     }
 
     // R150-3 FIX: RLIMIT was missing entirely from promise_allows_syscall().
+    // M0-6: prlimit64 added in lockstep with pledge_to_filter (R150-3).
     if promises.contains(PledgePromises::RLIMIT) {
-        if matches!(syscall_nr, SYS_GETRLIMIT | SYS_SETRLIMIT) {
+        if matches!(syscall_nr, SYS_GETRLIMIT | SYS_SETRLIMIT | SYS_PRLIMIT64) {
             return true;
         }
     }
 
     false
+}
+
+/// M0-6: public probe of the semantic pledge gate for the divergence-prevention
+/// parity self-test. Uses all-zero args (a permissive probe for the unconditional
+/// allow paths). Arg-sensitive gating (open flags, mmap PROT_EXEC) is approximated
+/// at args=0; the headline parity check is over the arg-insensitive BPF union.
+pub fn promise_allows_syscall_probe(promises: PledgePromises, syscall_nr: u64) -> bool {
+    promise_allows_syscall(promises, syscall_nr, &[0u64; 6])
 }

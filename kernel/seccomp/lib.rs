@@ -196,9 +196,14 @@ pub fn strict_filter() -> SeccompFilter {
 ///
 /// This compiles the promise set into a BPF-like filter that can be
 /// evaluated by the same code path as user-provided filters.
-pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
+/// M0-6: the deduped, sorted set of syscall numbers a pledge promise set allows.
+///
+/// SINGLE SOURCE OF TRUTH for the BPF whitelist: `pledge_to_filter` compiles
+/// exactly this list, so the divergence-prevention parity self-test
+/// (`pledge_full_syscall_union`) is provably equal to what the filter whitelists
+/// — there is no third hand-maintained list to drift (R150-3).
+pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
     use types::*;
-    let mut prog = Vec::new();
     let mut allowed_syscalls: Vec<u64> = Vec::new();
 
     // R149-I3 FIX: Use centralized syscall number constants from types.rs.
@@ -319,12 +324,33 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
         allowed_syscalls.extend_from_slice(&[
             SYS_GETRLIMIT,
             SYS_SETRLIMIT,
+            SYS_PRLIMIT64, // M0-6: modern get/setrlimit route through prlimit64
         ]);
     }
 
-    // Deduplicate
+    // Deduplicate -> the canonical sorted+deduped allow set.
     allowed_syscalls.sort();
     allowed_syscalls.dedup();
+    allowed_syscalls
+}
+
+/// M0-6: the full pledge syscall union across ALL promises — the set the
+/// divergence-prevention parity self-test asserts is dispatched-or-exempt.
+pub fn pledge_full_syscall_union() -> Vec<u64> {
+    pledge_syscall_list(PledgePromises::all())
+}
+
+/// Generate a seccomp filter from pledge promises.
+///
+/// This compiles the promise set into a BPF-like filter that can be
+/// evaluated by the same code path as user-provided filters. The whitelisted
+/// numbers are exactly `pledge_syscall_list(promises)` (single source of truth).
+pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
+    use types::*;
+    // M0-6: same sorted+deduped list the union/parity test sees -> the compiled
+    // BPF program is byte-identical to the pre-refactor generator.
+    let allowed_syscalls = pledge_syscall_list(promises);
+    let mut prog = Vec::new();
 
     // Build filter program
     prog.push(SeccompInsn::LdSyscallNr);
@@ -339,12 +365,8 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
 
     // R169-12 FIX: trusted generator — validate the (compile-time-bounded)
     // program against MAX_TRUSTED_INSNS and FAIL CLOSED (deny-all [Ret(Kill)])
-    // rather than panic. The prior `SeccompFilter::new(...).expect(...)` used the
-    // untrusted MAX_INSNS=64 bound, so a broad-but-legitimate pledge set (the
-    // deduped union runs to 98 insns) panicked the kernel on VALID input. The
-    // worst case is const-asserted (WORST_CASE_PLEDGE_INSNS) to fit
-    // MAX_TRUSTED_INSNS, so the fallback is a future-regression backstop, not a
-    // path any current promise set takes.
+    // rather than panic. The worst case is const-asserted (WORST_CASE_PLEDGE_INSNS)
+    // to fit MAX_TRUSTED_INSNS, so the fallback is a future-regression backstop.
     SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
         .unwrap_or_else(|_| deny_all_filter())
 }

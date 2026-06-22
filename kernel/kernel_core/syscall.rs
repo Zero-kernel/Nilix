@@ -2697,6 +2697,17 @@ pub fn syscall_dispatcher(
         91 => sys_fchmod(arg0 as i32, arg1 as u32),
         95 => sys_umask(arg0 as u32),
 
+        // M0-6: POSIX resource limits (closes the RLIMIT allowed-but-ENOSYS seam).
+        // prlimit64 arg order: (pid, resource, NEW=arg2, OLD=arg3) — keep new=arg2/old=arg3.
+        97 => sys_getrlimit(arg0 as u32, arg1 as *mut u8),
+        160 => sys_setrlimit(arg0 as u32, arg1 as *const u8),
+        302 => sys_prlimit64(
+            arg0 as ProcessId,
+            arg1 as u32,
+            arg2 as *const u8,
+            arg3 as *mut u8,
+        ),
+
         // 内存管理
         12 => sys_brk(arg0 as usize),
         9 => sys_mmap(
@@ -3359,6 +3370,9 @@ fn sys_clone(
         parent_gs_base,
         parent_credentials_arc, // R39-3 FIX: 共享凭证 Arc
         parent_umask,
+        parent_rlimits, // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
+        parent_sigactions, // M0 item 5: inherit signal dispositions (per-task copy)
+        parent_blocked,    // M0 item 5: inherit blocked mask
         parent_seccomp_state,
         parent_pledge_state,
         parent_seccomp_installing,
@@ -3453,6 +3467,9 @@ fn sys_clone(
             parent.gs_base,
             parent.credentials.clone(), // R39-3 FIX: 获取凭证 Arc
             parent.umask,
+            parent.rlimits, // M0-6: [RLimit; N] is Copy — snapshot under parent lock
+            parent.sigactions, // M0 item 5: [SigAction; NSIG] is Copy
+            parent.blocked,    // M0 item 5: u64 mask
             parent.seccomp_state.try_clone().map_err(|_| SyscallError::ENOMEM)?,
             parent.pledge_state.clone(),
             parent.seccomp_installing,
@@ -4035,6 +4052,19 @@ fn sys_clone(
             child.credentials = Arc::new(spin::RwLock::new(creds_copy));
         }
         child.umask = parent_umask;
+        // M0-6: inherit rlimits on the CLONE_VM/THREAD manual-construction path
+        // (the non-CLONE_VM path goes through fork_inner, which copies them too).
+        // Per-task copy = the documented M0 divergence from thread-group sharing.
+        child.rlimits = parent_rlimits;
+
+        // M0 item 5: inherit signal dispositions + blocked mask on the manual
+        // CLONE_VM/THREAD path too (the non-CLONE_VM path goes through fork_inner).
+        // Per-task COPY even under CLONE_SIGHAND/CLONE_THREAD = the documented M0
+        // divergence from Linux's thread-group-shared disposition table (a future
+        // CLONE_SIGHAND slice will swap in a shared table). `saved_blocked` /
+        // `in_signal_handler` stay born-clean (handler scratch is never inherited).
+        child.sigactions = parent_sigactions;
+        child.blocked = parent_blocked;
 
         // 继承 Seccomp/Pledge 沙箱状态
         // - 过滤器栈通过 Arc 共享，父子进程共享同一过滤器对象
@@ -6653,6 +6683,242 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
 /// # Returns
 ///
 /// 成功返回 0，失败返回错误码
+// ============================================================================
+// M0-6: POSIX resource limits (getrlimit/setrlimit/prlimit64)
+// ============================================================================
+
+/// M0-6: validate a proposed rlimit change (pure, unit-testable).
+/// `cur > max` => EINVAL; RAISING the hard limit requires host-root (Linux
+/// CAP_SYS_RESOURCE). All limits are ADVISORY (stored+reported, not enforced).
+fn validate_rlimit_change(
+    old: crate::process::RLimit,
+    nv: crate::process::RLimit,
+    is_host_root: bool,
+) -> Result<crate::process::RLimit, SyscallError> {
+    if nv.rlim_cur > nv.rlim_max {
+        return Err(SyscallError::EINVAL);
+    }
+    if nv.rlim_max > old.rlim_max && !is_host_root {
+        return Err(SyscallError::EPERM);
+    }
+    Ok(nv)
+}
+
+/// getrlimit(resource, *rlimit) — read the current task's limit.
+fn sys_getrlimit(resource: u32, rlim_ptr: *mut u8) -> SyscallResult {
+    if resource as usize >= crate::process::RLIMIT_NLIMITS {
+        return Err(SyscallError::EINVAL);
+    }
+    if rlim_ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let p = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let rl = { p.lock().rlimits[resource as usize] };
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&rl.rlim_cur.to_le_bytes());
+    buf[8..16].copy_from_slice(&rl.rlim_max.to_le_bytes());
+    copy_to_user(rlim_ptr, &buf)?;
+    Ok(0)
+}
+
+/// setrlimit(resource, *rlimit) — self-only; routes through prlimit64.
+fn sys_setrlimit(resource: u32, rlim_ptr: *const u8) -> SyscallResult {
+    sys_prlimit64(0, resource, rlim_ptr, core::ptr::null_mut())
+}
+
+/// prlimit64(pid, resource, *new, *old) — the modern interface musl/glibc route
+/// get/setrlimit through. SELF-ONLY (never locks a foreign PCB).
+fn sys_prlimit64(
+    pid: ProcessId,
+    resource: u32,
+    new_ptr: *const u8,
+    old_ptr: *mut u8,
+) -> SyscallResult {
+    if resource as usize >= crate::process::RLIMIT_NLIMITS {
+        return Err(SyscallError::EINVAL);
+    }
+    let self_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let self_proc = get_process(self_pid).ok_or(SyscallError::ESRCH)?;
+
+    // SELF-ONLY: accept pid==0 (self) or pid == the caller's NAMESPACE-visible pid
+    // (what getpid() returns — Codex Fix: raw current_pid() would wrongly EPERM a
+    // legitimate prlimit64(getpid(), ...)). A foreign pid => EPERM; never lock another PCB.
+    if pid != 0 {
+        let ns_pid = {
+            let proc = self_proc.lock();
+            crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+                .ok_or(SyscallError::EFAULT)?
+        };
+        if pid != ns_pid {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    // Pre-validate the OLD-out destination up front: a genuine mapped+writable
+    // preflight (validate_user_ptr_mut is bounds-only; verify_user_memory(.., true)
+    // is the real check, mirroring sys_pipe/sys_clone) so the install runs only
+    // after the destination is known-writable. This minimizes the Linux-like
+    // post-install copy-out EFAULT window (it cannot fully eliminate it — Linux has
+    // the same install-then-copyout window — but it is now a real preflight).
+    if !old_ptr.is_null() {
+        validate_user_ptr_mut(old_ptr, 16)?;
+        verify_user_memory(old_ptr as *const u8, 16, true)?;
+    }
+
+    // Read NEW before the lock (copy_from_user can fault — BEFORE any mutation).
+    let nv = if !new_ptr.is_null() {
+        let mut b = [0u8; 16];
+        copy_from_user(&mut b, new_ptr)?;
+        let mut cur = [0u8; 8];
+        cur.copy_from_slice(&b[0..8]);
+        let mut max = [0u8; 8];
+        max.copy_from_slice(&b[8..16]);
+        Some(crate::process::RLimit {
+            rlim_cur: u64::from_le_bytes(cur),
+            rlim_max: u64::from_le_bytes(max),
+        })
+    } else {
+        None
+    };
+
+    // Codex Fix: snapshot privilege BEFORE the PCB lock — current_is_host_root()
+    // re-locks PROCESS_TABLE + the Process, so calling it under the lock deadlocks.
+    let is_root = crate::process::current_is_host_root();
+
+    let idx = resource as usize;
+    let old = {
+        let mut proc = self_proc.lock();
+        let old = proc.rlimits[idx];
+        if let Some(n) = nv {
+            let stored = validate_rlimit_change(old, n, is_root)?;
+            proc.rlimits[idx] = stored;
+        }
+        old
+    };
+
+    if !old_ptr.is_null() {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&old.rlim_cur.to_le_bytes());
+        buf[8..16].copy_from_slice(&old.rlim_max.to_le_bytes());
+        copy_to_user(old_ptr, &buf)?;
+    }
+    Ok(0)
+}
+
+// ============================================================================
+// M0-6: seccomp pledge <-> dispatch DIVERGENCE-PREVENTION (the class fix)
+// ============================================================================
+
+/// Pledge-promised syscalls that HAVE a dispatcher arm (hand-verified against the
+/// syscall_dispatcher match). With INTENTIONAL_UNDISPATCHED this must PARTITION the
+/// pledge union, so a newly-promised-but-undispatched syscall (allowed-but-ENOSYS)
+/// fails the parity self-test at `make test`.
+const DISPATCHED_PROMISED: &[u64] = &[
+    0, 1, 2, 3, 4, 5, 6, 8, // read write open close stat fstat lstat lseek
+    9, 10, 11, 12, // mmap mprotect munmap brk (VM promise)
+    24, 39, // sched_yield getpid
+    56, 57, 59, 60, 61, 62, // clone fork execve exit wait4 kill
+    83, 84, 87, // mkdir rmdir unlink
+    90, 91, // chmod fchmod
+    97, 160, 302, // getrlimit setrlimit prlimit64  (M0-6 NEW)
+    102, 104, 107, 108, 110, // getuid getgid geteuid getegid getppid
+    202, 217, 218, // futex getdents64 set_tid_address
+    228, 231, 257, 318, // clock_gettime exit_group openat getrandom
+];
+
+/// Pledge-promised syscalls deliberately NOT dispatched (ENOSYS), each with a
+/// reason. Bounded by MAX_EXEMPT, which every future M0-6 slice MUST lower — so
+/// this list can never permanently hide divergence.
+const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
+    (25, "mremap: VM promise, dispatch deferred (M0-6 later slice)"),
+    (58, "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)"),
+    (82, "rename: WPATH, deferred to the VFS-META slice"),
+    (86, "link: CPATH, deferred (needs FileSystem::link)"),
+    (88, "symlink: WPATH, deferred (needs FileSystem::symlink)"),
+    (89, "readlink: RPATH, deferred to VFS-META (lookup-resolver fix needed)"),
+    (92, "chown: FATTR, dispatch deferred (M0-6 later slice)"),
+    (93, "fchown: FATTR (post-const-fix), dispatch deferred (M0-6 later slice)"),
+    (247, "waitid: PROC promise, dispatch deferred (M0-6 later slice)"),
+];
+const MAX_EXEMPT: usize = 9;
+
+fn rlimit_is_exempt(nr: u64) -> bool {
+    INTENTIONAL_UNDISPATCHED.iter().any(|&(n, _)| n == nr)
+}
+
+/// M0-6: the divergence-prevention parity self-test. Asserts the pledge allowlist
+/// is PARTITIONED into dispatched XOR intentionally-exempt, fences the FastAllowSet
+/// boundary, and confirms 517 is private. A future promise that grants an
+/// un-dispatched syscall (allowed-but-ENOSYS) then fails `make test`.
+pub fn run_pledge_dispatch_parity_self_test() {
+    assert!(
+        INTENTIONAL_UNDISPATCHED.len() <= MAX_EXEMPT,
+        "M0-6: exemption set exceeded MAX_EXEMPT (a slice must LOWER it)"
+    );
+    let union = seccomp::pledge_full_syscall_union();
+    for &nr in &union {
+        assert!(nr < 512, "M0-6: pledge union member {} >= 512 (FastAllowSet boundary)", nr);
+        let disp = DISPATCHED_PROMISED.contains(&nr);
+        let ex = rlimit_is_exempt(nr);
+        assert!(
+            disp ^ ex,
+            "M0-6 allowed-but-ENOSYS: pledge syscall {} must be dispatched XOR exempt (disp={}, exempt={})",
+            nr, disp, ex
+        );
+    }
+    for &nr in DISPATCHED_PROMISED {
+        assert!(union.contains(&nr), "M0-6: DISPATCHED_PROMISED {} is not pledge-promised (stale)", nr);
+    }
+    for &(nr, _) in INTENTIONAL_UNDISPATCHED {
+        assert!(union.contains(&nr), "M0-6: exemption {} is not pledge-promised (stale)", nr);
+    }
+    assert!(!union.contains(&517), "M0-6: spawn_image(517) must not be pledge-able");
+}
+
+/// M0-6: machine-check BPF<->semantic agreement (R150-3) + promise non-vacuity.
+/// Every BPF-whitelisted syscall must also pass the authoritative semantic gate,
+/// and every list-bearing promise must contribute >=1 syscall (catches a vacuous
+/// promise like the empty UNIX/INET/DNS/PTRACE bits — tracked for a later slice).
+pub fn run_pledge_semantic_parity_self_test() {
+    use seccomp::types::PledgePromises;
+    let all = PledgePromises::all();
+    for nr in seccomp::pledge_syscall_list(all) {
+        assert!(
+            seccomp::types::promise_allows_syscall_probe(all, nr),
+            "M0-6 R150-3 drift: BPF whitelists syscall {} but the semantic gate denies it",
+            nr
+        );
+    }
+    const LIST_BEARING: &[PledgePromises] = &[
+        PledgePromises::STDIO, PledgePromises::RPATH, PledgePromises::WPATH,
+        PledgePromises::CPATH, PledgePromises::TMPPATH, PledgePromises::PROC,
+        PledgePromises::EXEC, PledgePromises::THREAD, PledgePromises::TIME,
+        PledgePromises::SENDSIG, PledgePromises::FATTR, PledgePromises::RLIMIT,
+        PledgePromises::VM,
+    ];
+    let base = seccomp::pledge_syscall_list(PledgePromises::empty()).len();
+    for &bit in LIST_BEARING {
+        assert!(
+            seccomp::pledge_syscall_list(bit).len() > base,
+            "M0-6: list-bearing promise contributes no syscalls (vacuous)"
+        );
+    }
+}
+
+/// M0-6: rlimit data-model + validator self-test (pure).
+pub fn run_rlimit_self_test() {
+    use crate::process::{default_rlimits, RLimit, RLIMIT_NOFILE, RLIM_INFINITY};
+    let d = default_rlimits();
+    assert_eq!(d[RLIMIT_NOFILE].rlim_cur, crate::process::MAX_FD as u64);
+    assert_eq!(d[0].rlim_cur, RLIM_INFINITY); // CPU index = infinity
+    let old = RLimit { rlim_cur: 100, rlim_max: 200 };
+    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 10, rlim_max: 5 }, false).is_err()); // cur>max
+    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 100, rlim_max: 300 }, false).is_err()); // raise w/o root
+    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 100, rlim_max: 300 }, true).is_ok()); // raise w/ root
+    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 50, rlim_max: 150 }, false).is_ok()); // lower
+}
+
 fn sys_pipe(fds: *mut i32) -> SyscallResult {
     // 验证用户指针
     if fds.is_null() {

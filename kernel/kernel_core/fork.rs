@@ -437,6 +437,10 @@ fn fork_inner(
         // (~12KB worst case). Accepted risk documented.
         child.cloexec_fds = parent.cloexec_fds.clone();
 
+        // M0-6: inherit POSIX resource limits across fork (POSIX: child inherits
+        // the parent's rlimits). `[RLimit; N]` is Copy — a trivial value copy.
+        child.rlimits = parent.rlimits;
+
         // M0 item 5: inherit signal dispositions + blocked mask across fork (POSIX).
         // `[SigAction; NSIG]` and `u64` are Copy. `saved_blocked`/`in_signal_handler`
         // are handler scratch state and intentionally stay born-clean in the child

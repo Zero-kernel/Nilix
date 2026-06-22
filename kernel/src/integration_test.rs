@@ -49,6 +49,13 @@ pub fn test_syscalls() {
     // the incremental read loop and size cap. VFS is initialized well before the
     // integration tests run.
     vfs::manager::run_exec_read_file_self_test();
+    // M0 #6: RLIMIT (getrlimit/setrlimit/prlimit64) data-model + validator, and the
+    // seccomp<->dispatch divergence-prevention parity tests (the pledge allowlist is
+    // PARTITIONED into dispatched XOR exempt; BPF agrees with the semantic gate).
+    kernel_core::syscall::run_rlimit_self_test();
+    kernel_core::syscall::run_pledge_dispatch_parity_self_test();
+    kernel_core::syscall::run_pledge_semantic_parity_self_test();
+    klog_always!("    ✓ M0 #6 rlimit + seccomp parity: getrlimit/setrlimit/prlimit64 + allowlist⊆dispatch∪exempt + BPF==semantic + FATTR-const fix");
     // M0 #5 (sub-slice 1a): signal-handler delivery. The pure rt_sigframe builder +
     // SROP validators (layout %16==8, FXSAVE info-leak tail, MXCSR mask, RIP/RSP
     // canonical+low-half, deliver→sigreturn mcontext round-trip) AND the signal data
