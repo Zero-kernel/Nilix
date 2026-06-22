@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check fmt fmt-check clippy
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -414,21 +414,14 @@ lint-smap:
 # Scoped to high-risk paths; bulk statistics dirs (net/, arch/, sched/, etc.) excluded.
 lint-fetch-add:
 	@echo "=== Lint: checking for bare fetch_add(1) in core/VFS/namespace paths ==="
-	@HITS=$$(grep -rn 'fetch_add(1' \
-		kernel/kernel_core/ \
-		kernel/vfs/ \
-		kernel/mm/page_cache.rs \
-		--include='*.rs' \
-		| grep -v '// lint-fetch-add: allow' \
-		| grep -v '^\s*//' \
-		| grep -v '//.*fetch_add' \
-	) ; \
-	if [ -n "$$HITS" ]; then \
-		echo "ERROR: Bare fetch_add(1 found in core/VFS/namespace code:"; \
-		echo "$$HITS"; \
+	@OUT=$$(for F in $$(grep -rl 'fetch_add(1' kernel/kernel_core kernel/vfs kernel/mm/page_cache.rs --include='*.rs'); do awk '{a[NR]=$$0} END{for(i=1;i<=NR;i++){l=a[i]; if(l~/fetch_add\(1/ && l!~/^[[:space:]]*\/\// && l!~/\/\/.*fetch_add/){ if(l~/lint-fetch-add: allow/||a[i-1]~/lint-fetch-add: allow/) continue; printf "%s:%d:%s\n",FILENAME,i,l}}}' "$$F"; done) ; \
+	if [ -n "$$OUT" ]; then \
+		echo "ERROR: Bare fetch_add(1) found in core/VFS/namespace code:"; \
+		echo "$$OUT"; \
 		echo ""; \
-		echo "ID counters and refcounts MUST use fetch_update + checked_add."; \
-		echo "If this is a legitimate counter, add '// lint-fetch-add: allow' on the same line."; \
+		echo "ID counters and refcounts MUST use fetch_update + checked_add (R105-5)."; \
+		echo "If a legitimate counter, add '// lint-fetch-add: allow' on the fetch_add line OR the line directly above"; \
+		echo "(the marker survives rustfmt either way)."; \
 		exit 1; \
 	else \
 		echo "OK: No unguarded fetch_add(1 in core/VFS/namespace paths."; \
@@ -473,6 +466,43 @@ lint-repr-c-copy:
 
 # Unified lint target: runs all CI lint checks.
 lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy
+
+# ──────────────────────────────────────────────────────────────────────────
+# Code-style + clippy gates. Run on the build host (the local Windows mirror
+# has no toolchain). CI runs these on every push/PR, and .githooks/pre-push
+# runs `fmt-check` + `clippy` on the remote before each push. Enable the hook:
+#     git config core.hooksPath .githooks
+# rustfmt.toml pins newline_style=Windows (the repo is CRLF) so fmt is stable.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Auto-format every crate: the workspace (bootloader + kernel and its path-dep
+# sub-crates) plus the workspace-excluded userspace crate.
+fmt:
+	cargo fmt --all
+	cd userspace && cargo fmt --all
+
+# Verify formatting without writing. Fails (exit 1) if anything is unformatted.
+fmt-check:
+	@echo "=== cargo fmt --check (workspace) ==="
+	cargo fmt --all -- --check
+	@echo "=== cargo fmt --check (userspace) ==="
+	cd userspace && cargo fmt --all -- --check
+	@echo "OK: all crates are rustfmt-clean."
+
+# Clippy across all three build units (separate target dirs so they don't clash
+# with `make build`). Fails on clippy ERRORS (deny-by-default correctness lints);
+# warnings are reported but non-blocking.
+clippy:
+	@echo "=== clippy: bootloader (UEFI) ==="
+	cd bootloader && CARGO_TARGET_DIR=../clippy-bootloader-target \
+		cargo clippy --release --target x86_64-unknown-uefi --features kaslr
+	@echo "=== clippy: kernel (bare-metal, build-std) ==="
+	cd kernel && CARGO_TARGET_DIR=../clippy-kernel-target \
+		cargo clippy --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
+	@echo "=== clippy: userspace (build-std) ==="
+	cd userspace && CARGO_TARGET_DIR=clippy-userspace-target \
+		cargo clippy --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
+	@echo "OK: clippy reports no errors."
 
 clean:
 	cargo clean

@@ -12,6 +12,12 @@ Cargo.lock
 /esp
 /bootloader-target
 /kernel-target
+/clippy-target
+/clippy-kernel-target
+/clippy-bootloader-target
+/clippy-boot-target
+/clippy-userspace-target
+userspace/clippy-userspace-target
 
 #no_need
 *.md

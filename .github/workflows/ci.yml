@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: make fmt-check
+      - name: cargo clippy
+        run: make clippy
+
+  build:
+    name: build (bootloader + kernel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: make build
+        run: make build
+
+  lint:
+    name: custom lints (grep gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make lint
+        run: make lint
+
+  boot:
+    name: boot-check + musl-check (QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU + OVMF + musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools
+      - name: make boot-check (boots the kernel, asserts 0 NX-violation #PF)
+        run: make boot-check
+      - name: make musl-check (static-musl conformance gate)
+        run: make musl-check

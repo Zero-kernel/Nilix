@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# Zero-OS pre-push hook — run `cargo fmt --check` + `cargo clippy` before every push.
+#
+# The local Windows mirror has no Rust toolchain, so the checks run on the remote
+# build host (the project's authoritative build environment) over SSH.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Bypass a single push:    SKIP_PREPUSH=1 git push
+#
+# Override the target via env if your setup differs:
+#   ZEROOS_REMOTE       SSH host alias        (default: 40c-devbox-ts)
+#   ZEROOS_REMOTE_DIR   repo path on remote   (default: /home/dev/workspace/project/rsproject/Zero-os)
+#
+# Note: the checks run against the remote's working tree, which mirrors local via
+# the project's dual-write rule. If they can drift, sync the remote before pushing.
+
+set -e
+
+if [ -n "$SKIP_PREPUSH" ]; then
+	echo "[pre-push] skipped (SKIP_PREPUSH set)"
+	exit 0
+fi
+
+if ! command -v ssh >/dev/null 2>&1; then
+	echo "[pre-push] WARN: 'ssh' not found locally; skipping remote fmt/clippy (CI will enforce them)." >&2
+	exit 0
+fi
+
+REMOTE_ALIAS="${ZEROOS_REMOTE:-40c-devbox-ts}"
+REMOTE_DIR="${ZEROOS_REMOTE_DIR:-/home/dev/workspace/project/rsproject/Zero-os}"
+
+echo "[pre-push] running fmt-check + clippy on '$REMOTE_ALIAS' (this can take a few minutes; SKIP_PREPUSH=1 to bypass)..."
+
+if ssh "$REMOTE_ALIAS" "export PATH=\$HOME/.cargo/bin:\$PATH; cd '$REMOTE_DIR' && make fmt-check && make clippy"; then
+	echo "[pre-push] OK — cargo fmt + clippy clean."
+	exit 0
+else
+	echo "[pre-push] FAILED — fix fmt/clippy issues, or override with: SKIP_PREPUSH=1 git push" >&2
+	exit 1
+fi
