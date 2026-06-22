@@ -19,8 +19,15 @@
 # ============================================================================
 set -u
 
+# Resolve the repo root from this script's own location so it runs from any
+# working directory (CI, the remote build host, a fresh clone) without a `cd`.
+ROOT="$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")"
+
 QEMU=qemu-system-x86_64
-ESP="${1:-esp}"
+# ESP defaults to <repo>/esp; a relative override is resolved against the repo root
+# (so `bash scripts/boot_check.sh esp` works the same from anywhere), absolute kept.
+ESP="${1:-$ROOT/esp}"
+case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 TO="${BOOT_CHECK_TIMEOUT:-25}"
 
 # OVMF firmware autodetect (mirrors the Makefile OVMF_PATH logic).
