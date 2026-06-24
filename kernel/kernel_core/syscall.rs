@@ -1467,6 +1467,24 @@ pub fn register_syscall_frame_mut_callback(cb: GetSyscallFrameMutCallback) {
 pub fn register_set_frame_owner_callback(cb: SetFrameOwnerCallback) {
     SET_FRAME_OWNER_CALLBACK.call_once(|| cb);
 }
+/// R172-04: callback (registered by arch) staging this CPU's pending FS/GS bases that
+/// the SYSRET epilogue commits to the MSRs. Used by arch_prctl (W3) and exec TLS reset
+/// (W4); kernel_core cannot depend on `arch` directly.
+pub type StagePendingTlsBasesCallback = fn(fs_base: u64, gs_base: u64);
+static STAGE_PENDING_TLS_BASES_CALLBACK: spin::Once<StagePendingTlsBasesCallback> =
+    spin::Once::new();
+/// Register the FS/GS staging writer (arch → kernel_core). Called once at boot.
+pub fn register_stage_pending_tls_bases_callback(cb: StagePendingTlsBasesCallback) {
+    STAGE_PENDING_TLS_BASES_CALLBACK.call_once(|| cb);
+}
+/// R172-04: stage the running task's FS/GS bases for the SYSRET-epilogue commit (no-op
+/// until arch registers the callback at boot).
+#[inline]
+pub(crate) fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
+    if let Some(&cb) = STAGE_PENDING_TLS_BASES_CALLBACK.get() {
+        cb(fs_base, gs_base);
+    }
+}
 
 /// Record `pid` as the owner of the current syscall frame. Called once at the top of
 /// the dispatcher so the mutable accessor can reject a stale cross-task frame.
@@ -11007,16 +11025,22 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
             kprintln!("[arch_prctl] PID={} ARCH_SET_FS addr=0x{:x}", pid, addr);
 
             // 更新进程 PCB 中的 fs_base
-            {
+            let gs_base = {
                 let mut proc = process.lock();
                 proc.fs_base = addr;
-            }
+                proc.gs_base
+            };
 
             // 立即更新 MSR（当前进程正在运行）
             unsafe {
                 let mut msr = Msr::new(MSR_FS_BASE);
                 msr.write(addr);
             }
+
+            // R172-04 W3: keep the SYSRET-epilogue staged pair coherent with the live
+            // MSR + PCB. Without this, a no-block return commits the STALE pending FS
+            // staged at switch-in (W1), clobbering the FS just set here.
+            stage_pending_tls_bases(addr, gs_base);
 
             Ok(0)
         }
@@ -11049,16 +11073,20 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
             }
 
             // 更新进程 PCB 中的 gs_base
-            {
+            let fs_base = {
                 let mut proc = process.lock();
                 proc.gs_base = addr;
-            }
+                proc.fs_base
+            };
 
             // 立即更新 MSR
             unsafe {
                 let mut msr = Msr::new(MSR_KERNEL_GS_BASE);
                 msr.write(addr);
             }
+
+            // R172-04 W3: keep the SYSRET-epilogue staged pair coherent (see SET_FS).
+            stage_pending_tls_bases(fs_base, addr);
 
             Ok(0)
         }

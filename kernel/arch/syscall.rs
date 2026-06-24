@@ -256,6 +256,23 @@ pub struct SyscallPerCpu {
     /// invariant the future preemptive-IRQ-delivery slice will rely on (where the
     /// hook is NOT preceded by a syscall entry). Not touched by the ASM.
     pub frame_owner_pid: u64,
+
+    /// R172-04 FIX: the FS_BASE / KERNEL_GS_BASE that the CURRENTLY-running task must
+    /// have on the MSRs when it returns to ring 3. STAGED (in Rust) by the closed
+    /// writer set — W1: the scheduler before `switch_context`/`switch_to_user`
+    /// switch-in; W3: `arch_prctl(SET_FS/SET_GS)`; W4: exec TLS reset — and COMMITTED
+    /// (in ASM) by the SYSRET fast-path epilogue with two `wrmsr`, BEFORE user
+    /// RCX/RDX become live and while kernel GS is still active. This closes the
+    /// cross-task TLS leak where a task resumed mid-syscall via the `switch_context`
+    /// branch returned to ring 3 with the PREVIOUS task's FS/GS (the enter_usermode
+    /// IRETQ branch wrote the MSRs directly, but the switch_context branch did not).
+    /// CR4.FSGSBASE is never enabled, so the PCB (and hence this staged pair) is the
+    /// authoritative source for the task's FS/GS. Appended at the struct TAIL so the
+    /// existing GS-relative offsets (frame_ptr/syscall_active/kpti_*) are unchanged.
+    pub pending_fs_base: u64,
+    /// R172-04 FIX: companion to `pending_fs_base` (the user GS base, programmed into
+    /// IA32_KERNEL_GS_BASE so the epilogue SWAPGS makes it the active user GS).
+    pub pending_gs_base: u64,
 }
 
 impl SyscallPerCpu {
@@ -269,6 +286,8 @@ impl SyscallPerCpu {
             kpti_user_cr3: 0,
             kpti_tmp: 0,
             frame_owner_pid: 0,
+            pending_fs_base: 0,
+            pending_gs_base: 0,
         }
     }
 }
@@ -328,6 +347,10 @@ pub const PERCPU_KPTI_USER_CR3_OFFSET: usize = 40;
 pub const PERCPU_KPTI_TMP_OFFSET: usize = 48;
 /// M0 item 5: Offset of frame_owner_pid in SyscallPerCpu (Rust-only, no ASM use).
 pub const PERCPU_FRAME_OWNER_OFFSET: usize = 56;
+/// R172-04: Offset of pending_fs_base (GS-relative; read by the SYSRET epilogue wrmsr).
+pub const PERCPU_PENDING_FS_BASE_OFFSET: usize = 64;
+/// R172-04: Offset of pending_gs_base (GS-relative; read by the SYSRET epilogue wrmsr).
+pub const PERCPU_PENDING_GS_BASE_OFFSET: usize = 72;
 
 // R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
 // If SyscallPerCpu is reordered, these will produce a build error.
@@ -363,6 +386,14 @@ const _: () = {
     assert!(
         core::mem::offset_of!(SyscallPerCpu, frame_owner_pid) == PERCPU_FRAME_OWNER_OFFSET,
         "PERCPU_FRAME_OWNER_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, pending_fs_base) == PERCPU_PENDING_FS_BASE_OFFSET,
+        "PERCPU_PENDING_FS_BASE_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, pending_gs_base) == PERCPU_PENDING_GS_BASE_OFFSET,
+        "PERCPU_PENDING_GS_BASE_OFFSET does not match struct layout"
     );
 };
 
@@ -632,6 +663,25 @@ fn set_frame_owner_inner(pid: u64) {
     }
 }
 
+/// R172-04 FIX: stage the FS/GS bases the currently-running task must have on the MSRs
+/// at its next ring-3 return. The SYSRET fast-path epilogue commits these via two
+/// `wrmsr` (and the enter_usermode/switch_to_user IRETQ paths write the MSRs directly).
+/// Single-writer per CPU (scheduler switch-in W1 runs with IRQs off; arch_prctl W3 /
+/// exec W4 run in the task's own syscall context on this CPU). Exposed BOTH as a pub fn
+/// (the `sched` crate calls it directly for W1) AND registered as a `kernel_core`
+/// callback (W3/W4, since `kernel_core` cannot depend on `arch`).
+pub fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return;
+    }
+    // SAFETY: per-CPU slot, single-writer on this CPU; the epilogue reads it with IRQs
+    // off / kernel GS active.
+    unsafe {
+        SYSCALL_PERCPU[cpu_id].pending_fs_base = fs_base;
+        SYSCALL_PERCPU[cpu_id].pending_gs_base = gs_base;
+    }
+}
 /// M0 item 5: MUTABLE access to the current syscall frame, for signal-handler
 /// delivery (it redirects RIP/RSP/args to the handler).
 ///
@@ -676,6 +726,9 @@ pub fn register_frame_callback() {
     // syscall-return signal-delivery path.
     kernel_core::syscall::register_syscall_frame_mut_callback(get_current_syscall_frame_mut_inner);
     kernel_core::syscall::register_set_frame_owner_callback(set_frame_owner_inner);
+    // R172-04: the FS/GS staging writer used by arch_prctl (W3) and exec TLS reset (W4)
+    // in kernel_core (which cannot depend on arch directly).
+    kernel_core::syscall::register_stage_pending_tls_bases_callback(stage_pending_tls_bases);
 }
 
 /// R67-8 FIX: Initialize per-CPU syscall metadata and kernel GS base.
@@ -706,6 +759,9 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
     SYSCALL_PERCPU[cpu_id].frame_ptr = 0;
     // R67-11 FIX: Initialize syscall active flag to 0 (idle)
     SYSCALL_PERCPU[cpu_id].syscall_active = 0;
+    // R172-04: no staged TLS at init (kernel has FS/GS base 0 until a user task runs).
+    SYSCALL_PERCPU[cpu_id].pending_fs_base = 0;
+    SYSCALL_PERCPU[cpu_id].pending_gs_base = 0;
 
     // Program kernel GS base to point to this CPU's SyscallPerCpu
     // After SWAPGS, GS:0 will point to SYSCALL_PERCPU[cpu_id]
@@ -998,6 +1054,33 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov qword ptr gs:[{percpu_syscall_active}], 0",  // 释放标志
         "5:",
 
+        // R172-04 FIX: commit the staged per-task FS/GS bases to the MSRs HERE. This is
+        // the sole TLS-restore site for a task RESUMED mid-syscall via the scheduler's
+        // switch_context branch (which, unlike enter_usermode/switch_to_user, does NOT
+        // write the FS/GS MSRs) — without it the resumed task returned to ring 3 with the
+        // PREVIOUS task's FS/GS (cross-task TLS breach). Placed AT label 5: because here:
+        //   * kernel GS is still active (SWAPGS is far below), so gs:[pending_*] resolves
+        //     to this CPU's SyscallPerCpu (the correct staged pair);
+        //   * RCX/RDX are dead (both reloaded from the frame r12 below), so wrmsr may
+        //     freely clobber them;
+        //   * only RAX (the syscall return value, NOT reloaded) must survive, so it is
+        //     parked in the kpti_tmp scratch across the two wrmsr (kpti_tmp is reused by
+        //     the CR3 switch strictly later — no overlap).
+        // For a non-blocking syscall the staged pair already equals the running task's
+        // FS/GS (set at switch-in W1 / arch_prctl W3), so the commit is idempotent.
+        "mov qword ptr gs:[{percpu_kpti_tmp}], rax",
+        "mov rax, qword ptr gs:[{percpu_pending_fs_base}]",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, {msr_fs_base}",
+        "wrmsr",
+        "mov rax, qword ptr gs:[{percpu_pending_gs_base}]",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, {msr_kernel_gs_base}",
+        "wrmsr",
+        "mov rax, qword ptr gs:[{percpu_kpti_tmp}]",
+
         // SYSRET 安全检查：用户 RIP/RSP 必须是规范地址且在低半区
         // 这是防御 CVE-2014-4699/CVE-2014-9322 类漏洞的关键
         "mov rdx, [r12 + {off_rcx}]",               // 用户 RIP
@@ -1103,6 +1186,11 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         percpu_kpti_kernel_cr3 = const PERCPU_KPTI_KERNEL_CR3_OFFSET,
         percpu_kpti_user_cr3 = const PERCPU_KPTI_USER_CR3_OFFSET,
         percpu_kpti_tmp = const PERCPU_KPTI_TMP_OFFSET,
+        // R172-04: staged FS/GS commit in the SYSRET epilogue
+        percpu_pending_fs_base = const PERCPU_PENDING_FS_BASE_OFFSET,
+        percpu_pending_gs_base = const PERCPU_PENDING_GS_BASE_OFFSET,
+        msr_fs_base = const 0xC000_0100u32,
+        msr_kernel_gs_base = const 0xC000_0102u32,
         // R67-11 FIX: Error code for nested syscall rejection (-EBUSY = -16)
         nested_err = const SYSCALL_NESTED_ERROR,
         frame_size = const SYSCALL_FRAME_SIZE,

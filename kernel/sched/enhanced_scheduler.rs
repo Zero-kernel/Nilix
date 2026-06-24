@@ -37,7 +37,7 @@ use crate::cpuset::{self, CpusetId};
 // 导入arch模块的上下文切换功能
 use arch::ipi::{send_ipi, IpiType};
 use arch::Context as ArchContext;
-use arch::{assert_kernel_context, enter_usermode, save_context, switch_context};
+use arch::{assert_kernel_context, stage_pending_tls_bases, switch_context, switch_to_user};
 use arch::{default_kernel_stack_top, set_kernel_stack};
 
 // G.1 Observability: Per-CPU counter integration
@@ -144,6 +144,79 @@ static BOOTSTRAP_CONTEXT: Mutex<ArchContext> = Mutex::new(ArchContext::new());
 /// Each CPU tracks its own current process. This prevents races where
 /// multiple CPUs could believe they own the same process.
 static CURRENT_PROCESS: CpuLocal<Mutex<Option<Pid>>> = CpuLocal::new(|| Mutex::new(None));
+
+/// R172-03 FIX: per-CPU "previous task whose outgoing context save just completed but
+/// whose `on_cpu` gate has not yet been cleared" — the Linux `finish_task_switch` model.
+/// Identified by (pid, generation), NOT a raw pointer: a self-exiting/killed outgoing
+/// task can become `Zombie` and be REAPED (its PCB freed) before the next
+/// `reschedule_now`, so a raw `*const Process::on_cpu` would dangle (UAF). Resolving via
+/// `get_process(pid)` returns `None` for a reaped task (no UAF), and the generation guard
+/// rejects a recycled pid (so a NEW task that reused the pid and is genuinely running is
+/// never wrongly un-gated → no double-run). STAGED right before the actual
+/// `switch_to_user`/`switch_context`; CLEARED at the TOP of the next `reschedule_now` on
+/// this CPU (by which point the previous switch has fully completed). pid 0 = empty.
+struct PrevOnCpu {
+    pid: AtomicU64,
+    generation: AtomicU64,
+}
+static PENDING_PREV_ON_CPU: CpuLocal<PrevOnCpu> = CpuLocal::new(|| PrevOnCpu {
+    pid: AtomicU64::new(0),
+    generation: AtomicU64::new(0),
+});
+
+/// R172-03: record the outgoing (pid, generation) to be cleared at the next
+/// `reschedule_now` on this CPU. Called (IRQs off) right before the actual switch.
+/// `pid == 0` (the bootstrap path) stages nothing.
+#[inline]
+fn stage_prev_on_cpu(pid: u64, generation: u64) {
+    PENDING_PREV_ON_CPU.with(|s| {
+        // generation first, pid last (pid != 0 publishes a valid pair on this CPU; same-CPU
+        // IRQs-off single-writer so ordering vs concurrent readers is moot, but keep it tidy).
+        s.generation.store(generation, Ordering::Relaxed);
+        s.pid.store(pid, Ordering::Release);
+    });
+}
+
+/// R172-03: clear the previously-switched-out task's `on_cpu` gate (Linux
+/// `finish_task_switch`). Runs at the TOP of `reschedule_now` on the switching CPU, after
+/// the previous switch has fully completed — so the outgoing task is now truly off-CPU
+/// (its context durable, its kernel stack no longer aliased) and becomes claimable.
+/// Runs in PROCESS context (IRQs off, no other lock held), so `get_process` (PROCESS_TABLE
+/// lock) + the PCB lock are safe. Idempotent: a no-switch `reschedule_now` finds pid 0.
+///
+/// TRACKED RESIDUAL (R172-03, liveness-only — NOT a safety gap; Codex-converged
+/// not-UNSAFE): this clear runs ONLY at a `reschedule_now` entry. It cannot run from the
+/// timer IRQ because the pid+generation resolution needs PROCESS_TABLE/PCB locks (unsafe
+/// in IRQ) and adding a lock to `on_clock_tick` would regress the M4-1 no-lock-in-IRQ
+/// invariant. So a task switched out on a CPU that then runs a NEW task in an infinite
+/// syscall-free ring-3 loop (which already monopolizes that CPU — there is no preemptive
+/// reschedule for syscall-free loops in this kernel) stays `on_cpu`-gated and thus
+/// un-stealable by OTHER CPUs until the switching CPU next re-enters process-context
+/// scheduling. The double-run / torn-context / privesc classes are fully closed; this is
+/// purely a cross-CPU load-balancing delay under a degenerate runaway workload. A prompt
+/// IRQ-safe clear (a lifetime-pinned PCB handle + lock-free `on_cpu` store from the timer
+/// IRQ, with the Arc drop deferred to process context) is the future full convergence.
+#[inline]
+fn finish_pending_prev() {
+    let (pid, generation) = PENDING_PREV_ON_CPU.with(|s| {
+        let pid = s.pid.swap(0, Ordering::AcqRel);
+        (pid, s.generation.load(Ordering::Relaxed))
+    });
+    if pid == 0 {
+        return;
+    }
+    if let Some(pcb) = process::get_process(pid as usize) {
+        let proc = pcb.lock();
+        // Generation guard: a reaped+recycled pid now names a DIFFERENT task; clearing its
+        // on_cpu while it runs would re-open the double-run hole. Only clear if it is still
+        // the same task instance whose save we just completed.
+        if proc.generation == generation {
+            proc.on_cpu.store(false, Ordering::Release);
+        }
+    }
+    // get_process == None => the outgoing task was already reaped; its on_cpu is gone with
+    // its PCB, nothing to clear (and definitely no UAF).
+}
 
 /// R69-1 FIX: Per-CPU ready queues - each CPU has its own priority-bucketed queue.
 ///
@@ -300,6 +373,7 @@ impl Scheduler {
                 let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
 
                 if proc.state == ProcessState::Ready
+                    && !proc.on_cpu.load(Ordering::Acquire) // R172-03: skip a task whose outgoing save is not yet durable
                     && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
                     && !process::is_pending_irq_kill(pid) // R169-9 FIX: skip IRQ-killed tasks
                     && Self::cpu_allowed(cpu_id, effective_mask)
@@ -608,7 +682,10 @@ impl Scheduler {
             for (&pid, pcb) in bucket.iter() {
                 // R98-1 FIX: Check both state and stopped flag
                 let p = pcb.lock();
-                if p.state == ProcessState::Ready && !p.stopped {
+                if p.state == ProcessState::Ready
+                    && !p.on_cpu.load(Ordering::Acquire) // R172-03: don't migrate a task mid-switch
+                    && !p.stopped
+                {
                     target = Some((priority, pid));
                     break;
                 }
@@ -670,6 +747,7 @@ impl Scheduler {
             if let Some(proc_arc) = Self::find_pcb(&guard, pid) {
                 let mut pcb = proc_arc.lock();
                 if pcb.state != ProcessState::Ready
+                    || pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
                     || pcb.stopped // R98-1 FIX: Also skip job-control stopped processes
                     || process::is_pending_irq_kill(pid)
                 // R169-9 FIX: don't steal IRQ-killed tasks
@@ -680,6 +758,7 @@ impl Scheduler {
                 }
                 let priority = pcb.dynamic_priority;
                 pcb.state = ProcessState::Running;
+                pcb.on_cpu.store(true, Ordering::Release); // R172-03: now executing -> gate steal/select until its next switch-out save completes
                 pcb.reset_time_slice();
                 pcb.reset_wait_ticks();
                 pcb.pending_starve_boost = false; // M4-1: claimed to Run -> boost goal met
@@ -813,12 +892,14 @@ impl Scheduler {
                 if let Some(proc_arc) = Self::find_pcb(&queue, pid) {
                     let mut pcb = proc_arc.lock();
                     if pcb.state == ProcessState::Ready
+                        && !pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
                         && !pcb.stopped
                         && !process::is_pending_irq_kill(pid)
                     {
                         // R98-1 FIX: Only transition to Running if truly runnable
                         // R169-9 FIX: re-validate the IRQ-kill set after re-locking
                         pcb.state = ProcessState::Running;
+                        pcb.on_cpu.store(true, Ordering::Release); // R172-03: now executing
                         pcb.reset_time_slice();
                         pcb.reset_wait_ticks();
                         pcb.pending_starve_boost = false; // M4-1: claimed to Run -> boost goal met
@@ -1326,6 +1407,18 @@ impl Scheduler {
                     return Some((next_pid, next_memory_space));
                 }
             }
+            // R172-03 FIX: no switch (no other runnable task, or re-selected self). If a
+            // timer tick flipped this still-running task Running->Ready (deferred preempt)
+            // but we are NOT switching away from it, restore Running — its live registers
+            // ARE its durable state; leaving it Ready would mis-feed the starvation scan.
+            // `on_cpu` stays true (it genuinely occupies this CPU) and is cleared only when
+            // the task is actually switched out (via finish_pending_prev).
+            if let Some(proc) = current_proc {
+                let mut pcb = proc.lock();
+                if pcb.state == ProcessState::Ready && pcb.on_cpu.load(Ordering::Acquire) {
+                    pcb.state = ProcessState::Running;
+                }
+            }
             None
         })
     }
@@ -1468,6 +1561,14 @@ impl Scheduler {
             // lock. (A future KERNEL-MODE force_reschedule-in-IRQ caller would reintroduce a
             // Vec-alloc-in-IRQ deadlock here — that RPL==3 precondition is load-bearing.)
             Self::drain_starve_rebucket();
+            // R172-03 FIX: clear the previously-switched-out task's on_cpu gate (Linux
+            // finish_task_switch). Runs on EVERY reschedule_now entry — including the idle
+            // loop and the no-switch early-returns below — so a task switched out on this
+            // CPU becomes claimable within at most one reschedule cycle, and a CPU that
+            // IRETQ'd to a fresh user task clears the previous task's gate at its next
+            // kernel re-entry (timer preempt -> force_reschedule -> here). Placed BEFORE the
+            // need_resched early-return so the clear is never skipped.
+            finish_pending_prev();
             if current_cpu_id() == 0 && BALANCE_DUE.swap(false, Ordering::Relaxed) {
                 Self::balance_queues();
             }
@@ -1507,39 +1608,46 @@ impl Scheduler {
 
             // 获取旧进程的上下文指针
             // 首次调度时 old_pid 为 None，使用哑上下文保存内核启动状态
-            let old_ctx_ptr: *mut ArchContext = match old_pid.and_then(process::get_process) {
-                Some(old_pcb) => {
-                    let mut guard = old_pcb.lock();
+            // R172-03: also capture the outgoing task's generation, staged below (with its
+            // pid) as the PENDING_PREV to be cleared at the next reschedule_now (after the
+            // switch-out save completes). (pid, generation) — NOT a raw on_cpu pointer —
+            // so a self-exiting/reaped outgoing task can never leave a dangling clear (UAF);
+            // the bootstrap path (no PCB) yields generation 0 and is staged with pid 0 below.
+            let (old_ctx_ptr, old_generation): (*mut ArchContext, u64) =
+                match old_pid.and_then(process::get_process) {
+                    Some(old_pcb) => {
+                        let mut guard = old_pcb.lock();
 
-                    // R24-6 fix: 保存当前硬件 FS/GS base 到 PCB
-                    // 用户态可能通过 wrfsbase/wrgsbase 指令修改了 TLS 基址，
-                    // 必须在切换前读取 MSR 并保存，否则下次恢复时会使用旧值
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        use x86_64::registers::model_specific::Msr;
-                        const MSR_FS_BASE: u32 = 0xC000_0100;
-                        // R100-2 FIX: 调度器在 SWAPGS 后运行，此时：
-                        //   IA32_GS_BASE (0xC0000101) = 内核 per-CPU 指针
-                        //   IA32_KERNEL_GS_BASE (0xC0000102) = 用户态 GS 基址
-                        // 必须读写 0xC0000102 以保存/恢复用户态 GS
-                        const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+                        // R24-6 fix: 保存当前硬件 FS/GS base 到 PCB
+                        // 用户态可能通过 wrfsbase/wrgsbase 指令修改了 TLS 基址，
+                        // 必须在切换前读取 MSR 并保存，否则下次恢复时会使用旧值
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            use x86_64::registers::model_specific::Msr;
+                            const MSR_FS_BASE: u32 = 0xC000_0100;
+                            // R100-2 FIX: 调度器在 SWAPGS 后运行，此时：
+                            //   IA32_GS_BASE (0xC0000101) = 内核 per-CPU 指针
+                            //   IA32_KERNEL_GS_BASE (0xC0000102) = 用户态 GS 基址
+                            // 必须读写 0xC0000102 以保存/恢复用户态 GS
+                            const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-                        unsafe {
-                            let fs_msr = Msr::new(MSR_FS_BASE);
-                            let gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
-                            guard.fs_base = fs_msr.read();
-                            guard.gs_base = gs_msr.read();
+                            unsafe {
+                                let fs_msr = Msr::new(MSR_FS_BASE);
+                                let gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
+                                guard.fs_base = fs_msr.read();
+                                guard.gs_base = gs_msr.read();
+                            }
                         }
-                    }
 
-                    &mut guard.context as *mut _ as *mut ArchContext
-                }
-                None => {
-                    // 首次调度：保存到哑上下文（不会被恢复）
-                    let mut bootstrap = BOOTSTRAP_CONTEXT.lock();
-                    &mut *bootstrap as *mut ArchContext
-                }
-            };
+                        let generation = guard.generation;
+                        (&mut guard.context as *mut _ as *mut ArchContext, generation)
+                    }
+                    None => {
+                        // 首次调度：保存到哑上下文（不会被恢复）
+                        let mut bootstrap = BOOTSTRAP_CONTEXT.lock();
+                        (&mut *bootstrap as *mut ArchContext, 0u64)
+                    }
+                };
 
             // R69-2 FIX: Save lazy FPU state before context switch.
             //
@@ -1672,38 +1780,44 @@ impl Scheduler {
 
             process::activate_memory_space(next_space, Some(next_user_space));
 
+            // R172-04 W1: stage the incoming task's FS/GS for the SYSRET-epilogue commit
+            // (the switch_context resume path's only TLS-restore site). Covers BOTH
+            // branches: a user task resumed mid-syscall via switch_context commits these in
+            // its epilogue; a fresh user task entered via switch_to_user gets the direct MSR
+            // write below for its IRETQ AND staged here for its first syscall's epilogue.
+            stage_pending_tls_bases(next_fs_base, next_gs_base);
+            // R172-03: stage the outgoing task as PENDING_PREV — its on_cpu gate is cleared
+            // at the NEXT reschedule_now on this CPU (after this switch's save completes),
+            // keeping it unclaimable by any CPU until then. Closes the steal-before-save
+            // TOCTOU that made switch_to_user's per-CPU save unsafe on SMP.
+            stage_prev_on_cpu(old_pid.map(|p| p as u64).unwrap_or(0), old_generation);
+
             // 执行上下文切换
             // 根据目标进程的特权级选择不同的切换方式：
             //
             // - Ring 0（内核进程）：使用 switch_context 直接切换寄存器和栈
-            // - Ring 3（用户进程）：需要使用 IRETQ 进行特权级切换
+            // - Ring 3（用户进程）：使用 switch_to_user（保存内核上下文 + IRETQ 进入用户态）
             //
-            // 对于 Ring 3 进程，enter_usermode 永不返回（执行 IRETQ 跳转到用户态），
-            // 因此必须先用 save_context 保存当前内核上下文，以便下次被调度时恢复。
+            // R172-01 FIX: switch_to_user replaces the unsound save_context(old)+enter_usermode(new)
+            // pairing — its save-half captures the outgoing kernel rip/rflags/truthful-cs so a
+            // later resume via switch_context can never `ret` into stale user .text at CPL0.
             unsafe {
                 if next_is_user {
-                    // 用户态进程：先保存当前上下文，再通过 IRETQ 进入用户态
-                    // enter_usermode 会验证 RIP/RSP 的规范性和用户空间边界，
-                    // 清理 RFLAGS 中的特权位（IOPL/NT/RF），强制使用用户段选择子
-                    save_context(old_ctx_ptr);
-
                     // Debug: 打印进入用户态前的上下文（必须在 MSR 写入之前）
                     {
                         let ctx = &*new_ctx_ptr;
                         sched_debug!(
-                            "[SCHED] enter_usermode PID={}: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, fs_base=0x{:x}",
+                            "[SCHED] switch_to_user PID={}: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, fs_base=0x{:x}",
                             next_pid, ctx.rax, ctx.rip, ctx.rsp, next_fs_base
                         );
                     }
 
-                    // 恢复用户进程的 FS/GS base (TLS 支持)
-                    // 必须在 enter_usermode 之前的最后一步写入 MSR
-                    // 因为 kprintln! 等内核代码可能会覆盖 FS_BASE MSR
+                    // 恢复用户进程的 FS/GS base (TLS 支持) — switch_to_user 的 enter-half 通过
+                    // SWAPGS 将 KERNEL_GS_BASE 交换为用户 GS。必须在切换前的最后一步写入 MSR
+                    // （kprintln! 等内核代码可能覆盖 FS_BASE MSR）。
                     {
                         use x86_64::registers::model_specific::Msr;
                         const MSR_FS_BASE: u32 = 0xC000_0100;
-                        // R100-2 FIX: 写入 IA32_KERNEL_GS_BASE (0xC0000102)
-                        // 以便 enter_usermode 中的 SWAPGS 将其交换为用户 GS
                         const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
                         let mut fs_msr = Msr::new(MSR_FS_BASE);
@@ -1713,8 +1827,9 @@ impl Scheduler {
                         gs_msr.write(next_gs_base);
                     }
 
-                    enter_usermode(new_ctx_ptr);
-                    // 不会到达这里
+                    switch_to_user(old_ctx_ptr, new_ctx_ptr);
+                    // 不会到达这里（IRETQ 跳转到用户态；旧任务在下次被 switch_context 调度时
+                    // 从 switch_to_user 调用点之后恢复）。
                 } else {
                     // 内核态进程：使用标准的 switch_context
                     // 对于旧进程，函数会在下次被调度时从这里"返回"
@@ -1736,6 +1851,7 @@ fn force_init_sched_locals() {
     READY_QUEUE.force_init();
     CURRENT_PROCESS.force_init();
     NEXT_CONTEXT_SHADOW.force_init();
+    PENDING_PREV_ON_CPU.force_init(); // R172-03: per-CPU finish_task_switch slot
 }
 
 /// 初始化调度器

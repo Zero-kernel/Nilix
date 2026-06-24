@@ -2,7 +2,6 @@
 //!
 //! 提供进程上下文的保存、恢复和切换功能
 
-use core::arch::asm;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 /// FXSAVE 区域大小（512 字节）
@@ -355,94 +354,184 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
     )
 }
 
-/// 保存当前上下文
+/// R172-01 FIX: unified outgoing-save + user-entry primitive (replaces the unsound
+/// `save_context(old) + enter_usermode(new)` pairing the scheduler used on its
+/// `next_is_user` branch).
 ///
-/// 保存当前 CPU 状态到指定的 Context 结构，包括：
-/// - 所有通用寄存器 (rax-r15)
-/// - 栈指针 (rsp) 和帧指针 (rbp)
-/// - 段寄存器 (cs, ss) - 用于判断当前执行模式
-/// - FPU/SIMD 状态
+/// ## Why the old pairing was a CRITICAL privilege escalation
 ///
-/// 注意：RIP 和 RFLAGS 不在此保存，它们由调用者或上下文切换机制处理。
+/// The deleted `save_context` saved GPRs/rbp/rsp/cs/ss/FXSAVE but OMITTED rip(0x80)
+/// and rflags(0x88), and stamped cs=0x08 (it ran in kernel mode). When the scheduler
+/// switched OUT a task `O` via `save_context(O); enter_usermode(new)` (taken whenever
+/// the INCOMING task was fresh, cs=0x23), `O.context.rip` was left at its CREATION
+/// user-entry while `O.context.cs` became 0x08. On `O`'s NEXT resume the scheduler saw
+/// cs=0x08 → routed through `switch_context`, which does `push O.rip; ret` with NO
+/// privilege transition → `O`'s user `.text` executed at CPL0 (sandbox escape). The
+/// reproducer was `clone(); sched_yield()`.
+///
+/// ## The fix
+///
+/// `switch_to_user` captures the outgoing context with the SAME mechanism that drives
+/// its resume: a save-half that is BYTE-IDENTICAL to `switch_context`'s save-half
+/// (records the REAL kernel return rip via `[rsp]`, rflags via `pushfq`, truthful
+/// cs=0x08/ss=0x10, clears per-CPU syscall_active+frame_ptr = R102-3/R172-05 parity,
+/// sets CR0.TS, zeroes the debug registers). Because the save-half is byte-identical
+/// to `switch_context`'s, the saved context is a matched pair with `switch_context`'s
+/// restore — when `O` is later reselected it resumes at the post-`switch_to_user`
+/// kernel continuation and unwinds out of `reschedule_now` exactly like any
+/// kernel-saved task, so `assert_kernel_context` stays a SOUND witness on the
+/// `switch_context` branch.
+///
+/// It does NOT fxsave the outgoing FPU: the scheduler already fxsave'd the outgoing
+/// owner's FPU into its PCB and cleared per-CPU ownership before calling here (same
+/// lazy-FPU contract `switch_context` relies on). The enter-half is byte-identical to
+/// `enter_usermode` (validate rip/rsp, sanitize rflags, fxrstor the NEW ctx, build the
+/// IRETQ frame with FORCED user cs/ss, KPTI user-CR3 swap, SWAPGS, IRETQ).
+///
+/// SMP NOTE: this primitive is sound on its own CPU only in conjunction with the
+/// R172-03 `on_cpu` claim-guard, which keeps the outgoing task unselectable by any
+/// CPU until the save-half above has completed (see `Process::on_cpu` and the
+/// scheduler `finish_pending_prev` deferred clear). Without that guard a remote CPU
+/// could steal the outgoing task mid-save and resume a torn context.
 ///
 /// # Safety
 ///
-/// 调用者必须确保ctx指向有效的Context结构，且 FPU 已初始化
-#[inline]
-pub unsafe fn save_context(ctx: *mut Context) {
-    asm!(
-        // R67-10 FIX: Protect FXSAVE from interrupt corruption
-        // Save RFLAGS to stack, disable interrupts, do FXSAVE, restore RFLAGS
+/// - `old_ctx`/`new_ctx` must point to valid `Context`s.
+/// - `new_ctx.rip`/`.rsp` must be valid user addresses (canonical, bit 47 == 0); the
+///   enter-half validates this and `ud2`s otherwise.
+/// - Must be called with the incoming address space already active and TSS RSP0 set
+///   (the scheduler does both before calling), interrupts disabled by the caller.
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const Context) {
+    core::arch::naked_asm!(
+        // ================= SAVE-HALF (byte-identical to switch_context) =================
+        // rdi = old_ctx, rsi = new_ctx on entry.
         "pushfq",
+        "pop qword ptr [rdi + 0x88]",  // save RFLAGS to old_ctx before cli
         "cli",
-        "fxsave64 [{ctx} + {fxoff}]",
-        "popfq",                        // Restore original IF state
-        "mov [{ctx} + 0x00], rax",
-        "mov [{ctx} + 0x08], rbx",
-        "mov [{ctx} + 0x10], rcx",
-        "mov [{ctx} + 0x18], rdx",
-        "mov [{ctx} + 0x20], rsi",
-        "mov [{ctx} + 0x28], rdi",
-        "mov [{ctx} + 0x30], rbp",
-        "mov [{ctx} + 0x38], rsp",
-        "mov [{ctx} + 0x40], r8",
-        "mov [{ctx} + 0x48], r9",
-        "mov [{ctx} + 0x50], r10",
-        "mov [{ctx} + 0x58], r11",
-        "mov [{ctx} + 0x60], r12",
-        "mov [{ctx} + 0x68], r13",
-        "mov [{ctx} + 0x70], r14",
-        "mov [{ctx} + 0x78], r15",
-        // 保存 CS/SS 以便调度器判断当前执行模式
-        // 当用户进程在系统调用中被抢占时，CS=0x08（内核）
-        // 这使得调度器能正确使用 switch_context 而非 enter_usermode
-        //
-        // FIX: Use {tmp} register instead of rax to avoid clobbering {ctx}
-        // if the compiler allocated {ctx} to rax. This caused CR2=0x98 faults
-        // when ctx pointer was overwritten by "mov rax, cs".
-        "mov {tmp}, cs",
-        "mov [{ctx} + 0x90], {tmp}",
-        "mov {tmp}, ss",
-        "mov [{ctx} + 0x98], {tmp}",
-        ctx = in(reg) ctx,
-        tmp = out(reg) _,
-        fxoff = const FXSAVE_OFFSET,
-    );
-}
+        "mov [rdi + 0x10], rcx",       // save rcx (before clobbering as base)
+        "mov [rdi + 0x18], rdx",       // save rdx
+        "mov rdx, rdi",                // rdx = old_ctx base
+        "mov rcx, rsi",                // rcx = new_ctx base
+        "mov [rdx + 0x00], rax",
+        "mov [rdx + 0x08], rbx",
+        "xor rax, rax",
+        "mov [rdx + 0x20], rax",       // rsi = 0 (caller-saved)
+        "mov [rdx + 0x28], rax",       // rdi = 0 (caller-saved)
+        "mov [rdx + 0x30], rbp",
+        "mov [rdx + 0x38], rsp",
+        "mov [rdx + 0x40], r8",
+        "mov [rdx + 0x48], r9",
+        "mov [rdx + 0x50], r10",
+        "mov [rdx + 0x58], r11",
+        "mov [rdx + 0x60], r12",
+        "mov [rdx + 0x68], r13",
+        "mov [rdx + 0x70], r14",
+        "mov [rdx + 0x78], r15",
+        // REAL kernel return rip = the instruction after `call switch_to_user`.
+        "mov rax, [rsp]",
+        "mov [rdx + 0x80], rax",
+        // Truthful kernel segments (this runs in Ring 0).
+        "mov ax, cs",
+        "mov [rdx + 0x90], rax",
+        "mov ax, ss",
+        "mov [rdx + 0x98], rax",
+        // R172-05 / R102-3: clear per-CPU syscall_active + frame_ptr on switch-out.
+        "mov qword ptr gs:[{percpu_syscall_active}], 0",
+        "mov qword ptr gs:[{percpu_frame_ptr}], 0",
+        // Lazy-FPU: arm #NM for the incoming task.
+        "mov rax, cr0",
+        "or rax, {cr0_ts}",
+        "mov cr0, rax",
+        // Zero all debug registers (R158-12/R159-11 parity).
+        "xor eax, eax",
+        "mov dr0, rax",
+        "mov dr1, rax",
+        "mov dr2, rax",
+        "mov dr3, rax",
+        "mov dr6, rax",
+        "mov dr7, rax",
 
-/// 恢复上下文
-///
-/// # Safety
-///
-/// 调用者必须确保ctx指向有效的Context结构，且 FPU 已初始化
-#[inline]
-pub unsafe fn restore_context(ctx: *const Context) {
-    asm!(
-        // R67-10 FIX: Protect FXRSTOR from interrupt corruption
-        // Save RFLAGS to stack, disable interrupts, do FXRSTOR, restore RFLAGS
-        "pushfq",
+        // ================= ENTER-HALF (byte-identical to enter_usermode) =================
+        // Point rdi at new_ctx for the enter-half (which dereferences [rdi + ...]).
+        "mov rdi, rcx",
+        // Validate user RIP canonical + low-half.
+        "mov rax, [rdi + 0x80]",
+        "mov rcx, rax",
+        "shl rcx, 16",
+        "sar rcx, 16",
+        "cmp rcx, rax",
+        "jne 3f",
+        "bt rax, 47",
+        "jc 3f",
+        // Validate user RSP canonical + low-half.
+        "mov rcx, [rdi + 0x38]",
+        "mov rbx, rcx",
+        "shl rbx, 16",
+        "sar rbx, 16",
+        "cmp rbx, rcx",
+        "jne 3f",
+        "bt rcx, 47",
+        "jc 3f",
+        // Sanitize RFLAGS (clear IOPL/NT/RF, force IF) -> stash in r15.
+        "mov rax, [rdi + 0x88]",
+        "and rax, {rflags_user_mask}",
+        "or  rax, {rflags_if}",
+        "mov r15, rax",
         "cli",
-        "fxrstor64 [{ctx} + {fxoff}]",
-        "popfq",                        // Restore original IF state
-        "mov rax, [{ctx} + 0x00]",
-        "mov rbx, [{ctx} + 0x08]",
-        "mov rcx, [{ctx} + 0x10]",
-        "mov rdx, [{ctx} + 0x18]",
-        "mov rsi, [{ctx} + 0x20]",
-        "mov rdi, [{ctx} + 0x28]",
-        "mov rbp, [{ctx} + 0x30]",
-        "mov rsp, [{ctx} + 0x38]",
-        "mov r8,  [{ctx} + 0x40]",
-        "mov r9,  [{ctx} + 0x48]",
-        "mov r10, [{ctx} + 0x50]",
-        "mov r11, [{ctx} + 0x58]",
-        "mov r12, [{ctx} + 0x60]",
-        "mov r13, [{ctx} + 0x68]",
-        "mov r14, [{ctx} + 0x70]",
-        "mov r15, [{ctx} + 0x78]",
-        ctx = in(reg) ctx,
+        "fxrstor64 [rdi + {fxoff}]",
+        // Restore general registers (RSP via IRETQ frame).
+        "mov rax, [rdi + 0x00]",
+        "mov rbx, [rdi + 0x08]",
+        "mov rcx, [rdi + 0x10]",
+        "mov rdx, [rdi + 0x18]",
+        "mov rsi, [rdi + 0x20]",
+        "mov rbp, [rdi + 0x30]",
+        "mov r8,  [rdi + 0x40]",
+        "mov r9,  [rdi + 0x48]",
+        "mov r10, [rdi + 0x50]",
+        "mov r11, [rdi + 0x58]",
+        "mov r12, [rdi + 0x60]",
+        "mov r13, [rdi + 0x68]",
+        "mov r14, [rdi + 0x70]",
+        // Build IRETQ frame (low->high: RIP, CS, RFLAGS, RSP, SS). Forced user selectors.
+        "push {user_ss}",
+        "push qword ptr [rdi + 0x38]",
+        "push r15",
+        "push {user_cs}",
+        "push qword ptr [rdi + 0x80]",
+        // Restore r15 (real ctx value) then rdi last.
+        "mov r15, [rdi + 0x78]",
+        "mov rdi, [rdi + 0x28]",
+        "cli",
+        // KPTI: switch to user CR3 before IRETQ (GS still kernel; use kpti_tmp scratch).
+        "mov qword ptr gs:[{percpu_kpti_tmp}], rdx",
+        "mov rdx, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "test rdx, rdx",
+        "jz 4f",
+        "cmp rdx, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "je 4f",
+        "mov cr3, rdx",
+        "4:",
+        "mov rdx, qword ptr gs:[{percpu_kpti_tmp}]",
+        "swapgs",
+        "iretq",
+        // Illegal user RIP/RSP -> #UD (never reached on a valid context).
+        "3:",
+        "ud2",
+
+        cr0_ts = const 0x8u64,
         fxoff = const FXSAVE_OFFSET,
-    );
+        rflags_if = const RFLAGS_IF,
+        rflags_user_mask = const RFLAGS_USER_MASK,
+        percpu_frame_ptr = const crate::syscall::PERCPU_FRAME_PTR_OFFSET,
+        percpu_syscall_active = const crate::syscall::PERCPU_SYSCALL_ACTIVE_OFFSET,
+        percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
+        percpu_kpti_tmp = const crate::syscall::PERCPU_KPTI_TMP_OFFSET,
+        user_cs = const USER_CODE_SELECTOR,
+        user_ss = const USER_DATA_SELECTOR,
+    )
 }
 
 /// 初始化 FPU/SIMD 支持
@@ -520,6 +609,18 @@ const RFLAGS_USER_MASK: u64 = !(RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF);
 #[unsafe(naked)]
 pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
     core::arch::naked_asm!(
+        // R172-05 FIX: clear the per-CPU syscall_active + frame_ptr on EVERY user
+        // entry through this primitive (R102-3 parity with switch_context:291-292).
+        // enter_usermode is the sole no-old-context user-entry primitive (jump_to_usermode
+        // first-entry); switch_to_user covers the scheduler switch-out path with the same
+        // two clears in its save-half. Without this, a task that blocks mid-syscall (or a
+        // fork/clone child first-run) could leak syscall_active=1 to the next user task on
+        // this CPU -> spurious -EBUSY nested-syscall rejection -> self-perpetuating CPU
+        // wedge. Immediate stores; clobber no register, so RDI (the live ctx ptr the
+        // prologue dereferences) is preserved. Runs PRE-SWAPGS (SWAPGS is far below at the
+        // IRETQ tail), so gs:[..] resolves to KERNEL per-CPU data (the correct slot).
+        "mov qword ptr gs:[{percpu_syscall_active}], 0",
+        "mov qword ptr gs:[{percpu_frame_ptr}], 0",
         // ========================================
         // Y-6 安全修复：规范地址验证
         // ========================================
@@ -656,6 +757,9 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         fxoff = const FXSAVE_OFFSET,
         rflags_if = const RFLAGS_IF,
         rflags_user_mask = const RFLAGS_USER_MASK,
+        // R172-05: bindings for the prologue syscall_active/frame_ptr clears.
+        percpu_frame_ptr = const crate::syscall::PERCPU_FRAME_PTR_OFFSET,
+        percpu_syscall_active = const crate::syscall::PERCPU_SYSCALL_ACTIVE_OFFSET,
         percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
         percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
         percpu_kpti_tmp = const crate::syscall::PERCPU_KPTI_TMP_OFFSET,

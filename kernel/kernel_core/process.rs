@@ -1213,6 +1213,20 @@ pub struct Process {
     /// read/written under the proc lock, so `Relaxed` access is sufficient (the lock
     /// is the synchronizing edge).
     pub active_wait_seq: AtomicU64,
+
+    /// R172-03 FIX (CONTEXT-SAVE-COMPLETE): a lock-free "this task's `context` is not
+    /// yet durable / its kernel stack may still be aliased by an in-flight switch"
+    /// gate, composed AND with `state == Ready` by EVERY scheduler claimant
+    /// (`select_next_locked` / `steal_one` / `select_next_process` / `pop_ready_process`).
+    /// SET (`store(true, Release)`) under the proc lock at every Running->Ready flip of
+    /// the running task (`schedule()`, the `on_clock_tick` deferred-preempt flips, and
+    /// `sys_yield`), and at the cross-CPU claim itself; CLEARED (`store(false, Release)`)
+    /// ONLY after the outgoing register+FPU save has fully completed — deferred to the
+    /// NEXT `reschedule_now` entry on the switching CPU (the Linux `finish_task_switch`
+    /// model) so the clear can never race the still-in-progress save or alias the old
+    /// kernel stack. Accessed lock-free via the PCB's stable address (same discipline as
+    /// the timeout markers above), so concurrent readers never need the proc lock.
+    pub on_cpu: AtomicBool,
 }
 
 impl Process {
@@ -1244,6 +1258,7 @@ impl Process {
             socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
             wq_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
             active_wait_seq: AtomicU64::new(0), // M1-02: born-clean, no active timed wait
+            on_cpu: AtomicBool::new(false),  // R172-03: born off-CPU (context durable)
             pi_boosts: BTreeMap::new(),      // E.4 PI: no boosts initially
             waiting_on_futex: None,          // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),

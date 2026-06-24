@@ -20,8 +20,8 @@ pub mod smp;
 pub mod syscall;
 
 pub use context_switch::{
-    assert_kernel_context, enter_usermode, init_fpu, jump_to_usermode, restore_context,
-    save_context, switch_context, validate_kernel_context, Context, FxSaveArea, USER_CODE_SELECTOR,
+    assert_kernel_context, enter_usermode, init_fpu, jump_to_usermode, switch_context,
+    switch_to_user, validate_kernel_context, Context, FxSaveArea, USER_CODE_SELECTOR,
     USER_DATA_SELECTOR,
 };
 pub use cpu_protection::{
@@ -37,7 +37,7 @@ pub use gdt::{
 };
 pub use syscall::{
     arch_set_kpti_cr3s, init_syscall_msr, is_initialized as syscall_initialized,
-    register_frame_callback, with_current_syscall_frame, SyscallFrame,
+    register_frame_callback, stage_pending_tls_bases, with_current_syscall_frame, SyscallFrame,
 };
 
 // Re-export cpu_local from the cpu_local crate for backwards compatibility
