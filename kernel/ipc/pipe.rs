@@ -212,6 +212,13 @@ impl Pipe {
                 if wait_should_abort(pid) {
                     return Err(PipeError::Interrupted);
                 }
+                // M0-5 sub-slice 1b: top-of-loop EINTR for a deliverable handler signal
+                // (same every-iteration posture as the kill gate; kill-FIRST; never consumes
+                // pending_kill). A steadily-fed reader that never reaches prepare_to_wait
+                // still observes the signal here.
+                if kernel_core::signal::has_deliverable_signal(pid) {
+                    return Err(PipeError::Interrupted);
+                }
             }
             let should_wait = {
                 let mut inner = self.inner.lock();
@@ -272,6 +279,14 @@ impl Pipe {
             // (POSIX short-count), otherwise EINTR.
             if let Some(pid) = current_pid() {
                 if wait_should_abort(pid) {
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(PipeError::Interrupted);
+                }
+                // M0-5 sub-slice 1b: same EINTR posture for a deliverable handler signal —
+                // POSIX short-count if any bytes were already written, else EINTR.
+                if kernel_core::signal::has_deliverable_signal(pid) {
                     if total_written > 0 {
                         return Ok(total_written);
                     }

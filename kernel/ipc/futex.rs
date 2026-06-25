@@ -45,7 +45,17 @@ pub enum FutexError {
     OwnerDied,
     /// R171 (F3): 等待期间检测到挂起的 kill —— 以 EINTR 中断 futex 等待。
     Interrupted,
+    /// R172-23: per-thread-group resident futex-bucket budget exhausted -> ENOMEM. Bounds the
+    /// soft-DoS from one tgid iterating distinct page-aligned uaddrs (each FUTEX_LOCK_PI it
+    /// owns / live waiter pins a bucket until thread-group exit).
+    TooManyBuckets,
 }
+
+/// R172-23: per-thread-group cap on resident futex buckets. Sized for real pthread working
+/// sets (one futex addr per mutex/condvar/once x threads -> low thousands), NOT the 32-endpoint
+/// scale — too small would turn DoS-hardening into a correctness regression. Fully reclaimed at
+/// thread-group exit; this caps the transient resident set, not a permanent leak.
+const MAX_FUTEX_BUCKETS_PER_TGID: usize = 4096;
 
 /// 单个 futex 地址的等待状态
 struct FutexBucket {

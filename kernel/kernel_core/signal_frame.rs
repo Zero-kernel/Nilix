@@ -151,8 +151,10 @@ pub const SIGRETURN_MCONTEXT_FROM_UC: u64 = OFF_MCONTEXT - OFF_UC; // 40
 /// Compute the frame placement (addresses only — pure, no user-memory access).
 ///
 /// `interrupted_rsp` is the user RSP at the syscall return; `stack_floor` is the
-/// lowest mapped user-stack VA (`USER_STACK_TOP - USER_STACK_SIZE`). Returns `E2BIG`
-/// (treated by the caller as a fatal SIGSEGV) if the frame would underflow the stack.
+/// lowest MAPPED user-stack VA (M0-7: `USER_STACK_TOP - USER_STACK_SIZE +
+/// USER_STACK_GUARD_SIZE` — the reserved window minus the permanently-unmapped low
+/// guard page). Returns `E2BIG` (treated by the caller as a fatal SIGSEGV) if the frame
+/// would underflow the lowest mapped page (incl. landing in the guard).
 pub fn compute_sigframe_layout(
     interrupted_rsp: u64,
     stack_floor: u64,
@@ -187,6 +189,47 @@ pub fn compute_sigframe_layout(
         fpstate_va: frame_base + OFF_FPSTATE,
         len: FRAME_SIZE as usize,
     })
+}
+
+/// R172-25: resolve the early-reject stack floor for the sigframe of the DELIVERING task.
+///
+/// `compute_sigframe_layout`'s `stack_floor` is the lowest VA the frame base may occupy.
+/// The previous code passed the MAIN-thread geometry constant unconditionally, but a
+/// CLONE_VM thread's stack is a separate mmap'd region (or a BSS/static `child_stack`), so
+/// that constant is the wrong floor for it: too high spuriously E2BIGs a valid thread (→
+/// fatal SIGSEGV), too low merely loses the early guard (`copy_to_user` still backstops).
+/// The two LOCATABLE tiers give the exact lowest mapped VA of the delivering task's stack;
+/// the fallback FAILS CLOSED. It is NEVER too-low-into-foreign-memory:
+///   1. `rsp` in the main-thread window `[main_win_start, main_win_end)` → `main_guard_top`
+///      (the main stack's lowest mapped VA; covers the main thread AND a fork child).
+///   2. else a precise mmap'd thread-stack VMA base, when the caller resolved one.
+///   3. else `rsp` (FAIL CLOSED): an unlocatable stack (a BSS/static `child_stack` not in
+///      `mmap_regions`) yields a floor == `rsp`, which forces `compute_sigframe_layout` to
+///      return `E2BIG` → fatal SIGSEGV (Linux `force_sigsegv`). This is deliberately NOT a
+///      permissive `0` floor: `copy_to_user` only checks that the target range is mapped &
+///      user-writable, so a frame written below an unlocatable stack into ADJACENT mapped
+///      writable memory would NOT fault — it would silently corrupt it (R172-25 / Codex
+///      impl-diff `019ef337`). Fail-closed matches the pre-fix behavior for this degenerate
+///      case (no real pthread/fork path reaches it — those are tier 1/2) while the tier-2
+///      VMA lookup removes the genuine spurious-E2BIG of a CLONE_VM mmap'd thread stack.
+///
+/// Pure / unit-testable: ALL lock-touching VMA lookup stays in the caller and arrives here
+/// as `tracked_vma_base`, so this function takes no `&Process` and acquires no lock.
+pub fn resolve_sigframe_stack_floor(
+    rsp: u64,
+    main_win_start: u64,
+    main_win_end: u64,
+    main_guard_top: u64,
+    tracked_vma_base: Option<u64>,
+) -> u64 {
+    if main_win_start <= rsp && rsp < main_win_end {
+        main_guard_top
+    } else if let Some(base) = tracked_vma_base {
+        base
+    } else {
+        // FAIL CLOSED — floor == rsp forces E2BIG (frame_base is always below rsp).
+        rsp
+    }
 }
 
 #[inline]
@@ -575,10 +618,102 @@ fn selftest_mcontext_roundtrip() {
 
 /// Run all rt_sigframe builder/validator self-tests. Any failure panics (surfaced by
 /// the serial Test Summary).
+/// R172-25: pin the per-thread sigframe floor resolution + its downstream layout, so a
+/// future floor regression (the old main-thread-constant bug, or a wrong per-thread floor)
+/// fails `make test`. The existing fixed-floor layout tests cannot catch this.
+fn selftest_sigframe_floor() {
+    let (win_start, win_end) = crate::elf_loader::user_stack_window();
+    let main_win_start = win_start as u64;
+    let main_win_end = win_end as u64;
+    let main_floor = crate::elf_loader::user_stack_mapped_floor();
+
+    // (i) main-thread RSP in the window → floor == main_floor, and a frame fits.
+    let main_rsp = main_win_end - 0x100; // a normal main-thread RSP near the top
+    let f1 = resolve_sigframe_stack_floor(main_rsp, main_win_start, main_win_end, main_floor, None);
+    assert_eq!(
+        f1, main_floor,
+        "main-thread RSP must resolve to the main mapped floor"
+    );
+    assert!(
+        compute_sigframe_layout(main_rsp, f1).is_ok(),
+        "a main-thread frame must fit above the main floor"
+    );
+
+    // (ii) low BSS-style child_stack RSP, no tracked VMA → FAIL CLOSED (floor == rsp →
+    // E2BIG → fatal SIGSEGV). A permissive 0 floor would let the frame spill below an
+    // unlocatable stack into adjacent mapped writable memory (copy_to_user does NOT fault
+    // on a valid adjacent mapping) — silent corruption (R172-25 / Codex `019ef337`).
+    let bss_rsp = 0x0060_0000u64;
+    let f2 = resolve_sigframe_stack_floor(bss_rsp, main_win_start, main_win_end, main_floor, None);
+    assert_eq!(
+        f2, bss_rsp,
+        "an untracked stack must FAIL CLOSED (floor == rsp)"
+    );
+    assert!(
+        compute_sigframe_layout(bss_rsp, f2).is_err(),
+        "tier-3 (unlocatable stack) MUST E2BIG, never permit a frame below it"
+    );
+
+    // (iii) mmap'd thread-stack RSP inside a tracked VMA → floor == that base.
+    let vma_base = 0x1_0000_0000u64;
+    let vma_rsp = vma_base + 0x8000;
+    let f3 = resolve_sigframe_stack_floor(
+        vma_rsp,
+        main_win_start,
+        main_win_end,
+        main_floor,
+        Some(vma_base),
+    );
+    assert_eq!(
+        f3, vma_base,
+        "a tracked mmap thread-stack must resolve to its VMA base"
+    );
+    assert!(
+        compute_sigframe_layout(vma_rsp, f3).is_ok(),
+        "a frame must fit above the thread VMA base"
+    );
+
+    // (iv) FA regression: a thread RSP far BELOW the main floor must NOT be rejected
+    // (the old global-constant floor would have spuriously E2BIG'd it).
+    let low_thread_rsp = main_floor - 0x10_0000; // 1 MiB below the main mapped floor
+    let f4 = resolve_sigframe_stack_floor(
+        low_thread_rsp,
+        main_win_start,
+        main_win_end,
+        main_floor,
+        Some(low_thread_rsp - 0x4000),
+    );
+    assert!(
+        f4 < low_thread_rsp,
+        "tier-2 floor must be below the thread RSP"
+    );
+    assert!(
+        compute_sigframe_layout(low_thread_rsp, f4).is_ok(),
+        "a below-main-floor thread stack must NOT be rejected (the R172-25 regression)"
+    );
+
+    // (v) genuine underflow still E2BIGs: RSP only a few bytes above its own floor.
+    let tight_base = 0x2_0000_0000u64;
+    let tight_rsp = tight_base + 0x80; // < RED_ZONE + FRAME_SIZE above the floor
+    let f5 = resolve_sigframe_stack_floor(
+        tight_rsp,
+        main_win_start,
+        main_win_end,
+        main_floor,
+        Some(tight_base),
+    );
+    assert_eq!(f5, tight_base);
+    assert!(
+        compute_sigframe_layout(tight_rsp, f5).is_err(),
+        "a frame with no room above its own floor MUST still E2BIG"
+    );
+}
+
 pub fn run_signal_frame_self_test() {
     selftest_layout_alignment();
     selftest_assemble_roundtrip();
     selftest_mxcsr_and_rflags();
     selftest_srop_canonical();
     selftest_mcontext_roundtrip();
+    selftest_sigframe_floor();
 }

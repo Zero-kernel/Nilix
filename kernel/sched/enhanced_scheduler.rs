@@ -564,6 +564,30 @@ impl Scheduler {
         send_ipi(cpu_id, IpiType::Reschedule);
     }
 
+    /// M0-5 sub-slice 1b: broadcast a reschedule IPI to ALL other online CPUs.
+    ///
+    /// Registered as `kernel_core::signal`'s kick callback and invoked after a signal-wake
+    /// flips a blocked target `Blocked -> Ready`. Unlike `kick_idle_cpus`, this does NOT gate
+    /// on an empty ready queue: a blocked task's PCB stays resident in its owning CPU's
+    /// (non-empty) ready queue with state-filtered selection, so the empty-queue heuristic
+    /// would skip exactly the CPU that must re-select the now-Ready task. Bounded — only ever
+    /// called on an actual wake (a deliverable handler signal to a Blocked task).
+    pub fn kick_all_for_reschedule() {
+        let self_cpu = current_cpu_id();
+        // R172-27 FIX: also flag the LOCAL CPU's need_resched. A signal that wakes a Blocked
+        // sibling on THIS CPU (the dominant path on UP) was previously re-selected only at the
+        // next unrelated reschedule (<=1 timeslice latency) because this broadcast only IPI'd
+        // OTHER CPUs. Setting the local flag makes the woken task picked up at the next safe
+        // point on this CPU too.
+        current_cpu().set_need_resched();
+        let total = Self::cpu_pool_size();
+        for cpu_id in 0..total {
+            if cpu_id != self_cpu {
+                Self::kick_cpu(cpu_id);
+            }
+        }
+    }
+
     /// Number of CPUs to consider for load balancing (at least 1)
     #[inline]
     fn cpu_pool_size() -> usize {
@@ -1068,6 +1092,35 @@ impl Scheduler {
                             // both enqueues at the correct boosted bucket key AND upholds the
                             // invariant that a set marker on a queued task is recorded in that
                             // CPU's buffer (which makes the drain fast-path sound).
+                            let _ = proc.apply_pending_starve_boost();
+                            (
+                                true,
+                                proc.dynamic_priority,
+                                Self::effective_allowed_cpus(&proc),
+                            )
+                        } else if proc.state == ProcessState::Blocked
+                            && kernel_core::signal::should_abort_pending_block(&proc)
+                        {
+                            // R172-19 FIX: a CAUGHT SIGCONT to a stopped+Blocked task. The
+                            // `state == Blocked` guard is LOAD-BEARING (Codex 019ef2c6): a
+                            // `Running && stopped` task is reachable cross-CPU (a remote stop
+                            // sets stopped=true without rescheduling a non-current task), and
+                            // requeuing a STILL-RUNNING task here (remove_from_all_queues +
+                            // enqueue) would corrupt scheduler state (the running task is
+                            // tracked by its presence in the ready queue). Only a genuinely
+                            // Blocked task is safe to wake. The
+                            // EINTR-wake in send_signal_inner was SKIPPED because the task was
+                            // `stopped`; now that we've cleared `stopped`, a deliverable handler
+                            // signal (or kill) is pending and the task must be WOKEN so it
+                            // reaches a safe point and the handler runs — otherwise it stays
+                            // Blocked forever (its original wait condition won't fire; the
+                            // SIGCONT IS the event). Wake exactly as the should_add path: temp
+                            // Blocked (claim guard during migrate) + enqueue (-> Ready). The
+                            // wait epilogue's should_abort recheck then bails it to EINTR. A
+                            // PLAIN SIGCONT (no handler) cleared its pending bit, so
+                            // should_abort_pending_block is false and the task correctly stays
+                            // Blocked (woken by its real wait condition).
+                            proc.state = ProcessState::Blocked;
                             let _ = proc.apply_pending_starve_boost();
                             (
                                 true,
@@ -1874,6 +1927,10 @@ pub fn init() {
 
     // 注册信号恢复回调，让 SIGCONT 能正确恢复暂停的进程
     kernel_core::register_resume_callback(Scheduler::resume_stopped);
+
+    // M0-5 1b: register the cross-CPU reschedule-kick so a signal-wake's Blocked->Ready flip
+    // promptly re-selects the target on the (idle, non-empty-queue) CPU that owns it.
+    kernel_core::register_kick_callback(Scheduler::kick_all_for_reschedule);
 
     klog_always!("Enhanced scheduler initialized");
     klog_always!("  Ready queue: per-CPU with work stealing (R69-1)");

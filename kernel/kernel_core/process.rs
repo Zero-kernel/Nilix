@@ -798,6 +798,25 @@ pub struct Process {
     /// `rt_sigreturn` from THIS field (never from the user-controlled `uc_sigmask`,
     /// closing a mask-widening SROP). Cleared on exec.
     pub saved_blocked: u64,
+    /// M0 #5 (sub-slice 1b-2): SAME-return handler delivery for a syscall that
+    /// BLOCKED and resumed. The per-CPU `frame_ptr` (the live kernel-stack
+    /// `SyscallFrame`) is ZEROED by `switch_context` on switch-out
+    /// (arch/context_switch.rs), so when a blocked syscall resumes, its return-tail
+    /// mutable-frame accessor fails-closed and delivery would defer to the NEXT
+    /// syscall (the 1b-1 gap → a syscall-free post-EINTR compute-spinner never runs
+    /// its handler). These capture the live `(frame_ptr, owner_pid)` binding at THIS
+    /// syscall's entry (gated by the any-handler hint) so `maybe_deliver_signal` can
+    /// REPUBLISH the per-CPU binding and deliver at the SAME return as the EINTR
+    /// wake. The frame VA is per-task-invariant (kernel_stack_top − frame − fpu) and
+    /// the kernel stack persists across a block, so a binding captured at this (or a
+    /// prior) entry still points at the live frame. Handler SCRATCH: born-clean, NOT
+    /// inherited on fork / CLONE_VM, cleared on exec (exactly like `saved_blocked` /
+    /// `in_signal_handler`).
+    pub saved_frame_ptr: u64,
+    /// Owner PID of `saved_frame_ptr` (always this task). Re-validated against
+    /// `current_pid()` by the owner-checked mutable accessor after republish, so a
+    /// stale/corrupt binding can never redirect another task's frame.
+    pub saved_frame_owner: u64,
     /// Nesting guard: true while a handler frame is live (between delivery and
     /// `rt_sigreturn`). Caps slice-1a nested delivery at one (a second deliverable
     /// signal stays pending until `rt_sigreturn` clears this). Cleared on exec.
@@ -1250,6 +1269,9 @@ impl Process {
             blocked: 0,
             sigactions: crate::signal::default_sigactions(),
             saved_blocked: 0,
+            // M0 #5 (1b-2): no live syscall-frame binding at birth.
+            saved_frame_ptr: 0,
+            saved_frame_owner: 0,
             in_signal_handler: false,
             priority,
             dynamic_priority: priority,
@@ -3861,6 +3883,13 @@ pub fn run_timeout_marker_self_test() {
         child.wq_timeout_marker.load(Ordering::Relaxed),
         0,
         "child wq marker born-clean"
+    );
+    // M0 #5 (1b-2): a fresh PCB carries NO inherited syscall-frame binding — a stale
+    // parent frame_ptr republished into a child would redirect the wrong kernel stack.
+    assert_eq!(child.saved_frame_ptr, 0, "child saved_frame_ptr born-clean");
+    assert_eq!(
+        child.saved_frame_owner, 0,
+        "child saved_frame_owner born-clean"
     );
 
     // (8) M1-02: queue-free IRQ-wake DECISION CORE. `decide_wq_timeout` is the exact

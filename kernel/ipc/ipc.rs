@@ -70,6 +70,10 @@ pub enum IpcError {
     TooManyEndpoints,
     /// R105-5 FIX: 全局端点 ID 空间耗尽
     EndpointIdExhausted,
+    /// M0-5 1b-1b: a pending kill or a deliverable HANDLER signal interrupted a blocking
+    /// `receive_message_blocking` (the M0-5 1b wake) → maps to EINTR, replacing the
+    /// imprecise `NoCurrentProcess`/ESRCH. See `ipc_error_to_syscall`.
+    Interrupted,
 }
 
 /// IPC端点
@@ -669,6 +673,34 @@ pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessa
         if !wq.prepare_to_wait() {
             if wq.is_closed() {
                 return Err(IpcError::EndpointNotFound);
+            }
+            // M0-5 1b-1b: prepare_to_wait ALSO bails when a pending kill or a deliverable
+            // HANDLER signal raced in (the M0-5 1b should_abort_pending_block re-check).
+            // BOTH the first-iteration entry AND a post-block re-loop (after finish_wait
+            // returns from a signal-wake) funnel through here. Ordering (Codex impl-diff):
+            //   1. kill-FIRST — a pending kill ABORTS the recv (the task is terminating);
+            //      do NOT deliver a queued message to a dying task.
+            //   2. message-first (POSIX) — for a non-kill wake (deliverable signal OR a
+            //      spurious wake), deliver any QUEUED message rather than interrupting; a
+            //      signal interrupts a blocking recv only if it would otherwise block.
+            //      (The pre-1b-1b bail dropped such a message; this re-check closes that.)
+            //   3. signal with no message => precise EINTR (replaces the imprecise ESRCH).
+            //   4. otherwise the genuine no-current-process bail.
+            let cur = process::current_pid();
+            if let Some(pid) = cur {
+                if process::wait_should_abort(pid) {
+                    return Err(IpcError::Interrupted);
+                }
+            }
+            match receive_message(endpoint_id) {
+                Ok(Some(msg)) => return Ok(msg),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(pid) = cur {
+                if kernel_core::signal::has_deliverable_signal(pid) {
+                    return Err(IpcError::Interrupted);
+                }
             }
             return Err(IpcError::NoCurrentProcess);
         }

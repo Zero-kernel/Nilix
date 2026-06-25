@@ -663,6 +663,54 @@ fn set_frame_owner_inner(pid: u64) {
     }
 }
 
+/// M0 item 5 (1b-2): read this CPU's raw `(frame_ptr, frame_owner_pid)` binding.
+///
+/// Used at the syscall dispatcher entry to SNAPSHOT the live frame binding into the
+/// PCB so a blocked-and-resumed return tail can republish it (the per-CPU `frame_ptr`
+/// is zeroed by `switch_context` on a block). Returns `(0, 0)` for an out-of-range
+/// CPU index. Reads only — never mutates per-CPU state.
+fn get_frame_binding_inner() -> (u64, u64) {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return (0, 0);
+    }
+    // SAFETY: per-CPU slot, this CPU's own syscall context (single reader/writer).
+    unsafe {
+        (
+            SYSCALL_PERCPU[cpu_id].frame_ptr,
+            SYSCALL_PERCPU[cpu_id].frame_owner_pid,
+        )
+    }
+}
+
+/// M0 item 5 (1b-2): REPUBLISH this CPU's `(frame_ptr, frame_owner_pid)` binding.
+///
+/// Called by `maybe_deliver_signal` from a PCB-saved binding when a blocked syscall
+/// has resumed (its per-CPU `frame_ptr` was zeroed on the block). Writes BOTH fields
+/// together so the owner-checked mutable accessor sees a consistent pair. The signal
+/// delivery path runs in the task's own syscall context on this CPU with no concurrent
+/// same-CPU reader.
+///
+/// LEAK BOUND (NOT "zeroed before any return"): the republished pointer is re-zeroed by
+/// the ordinary syscall epilogue and by every `switch_context` switch-out. The dispatcher
+/// tail's post-delivery `reschedule_if_needed` MAY switch away first via the
+/// `save_context`+`enter_usermode` path, which does NOT zero `frame_ptr` — so a republished
+/// value can briefly outlive this CPU's switch. That is harmless: the owner-checked MUTABLE
+/// accessor rejects it for any other PID, and the only un-owner-checked reader
+/// (`get_current_syscall_frame_inner`, used by clone/fork) runs ONLY mid-syscall, where the
+/// entry ASM has already overwritten `frame_ptr` with that task's own live frame.
+fn set_frame_binding_inner(frame_ptr: u64, owner_pid: u64) {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return;
+    }
+    // SAFETY: per-CPU slot, single-writer in this CPU's syscall context.
+    unsafe {
+        SYSCALL_PERCPU[cpu_id].frame_ptr = frame_ptr;
+        SYSCALL_PERCPU[cpu_id].frame_owner_pid = owner_pid;
+    }
+}
+
 /// R172-04 FIX: stage the FS/GS bases the currently-running task must have on the MSRs
 /// at its next ring-3 return. The SYSRET fast-path epilogue commits these via two
 /// `wrmsr` (and the enter_usermode/switch_to_user IRETQ paths write the MSRs directly).
@@ -726,6 +774,10 @@ pub fn register_frame_callback() {
     // syscall-return signal-delivery path.
     kernel_core::syscall::register_syscall_frame_mut_callback(get_current_syscall_frame_mut_inner);
     kernel_core::syscall::register_set_frame_owner_callback(set_frame_owner_inner);
+    // M0 item 5 (1b-2): the raw (frame_ptr, owner) get/set used to snapshot the live
+    // binding at syscall entry and republish it on the blocked-resume return tail.
+    kernel_core::syscall::register_get_frame_binding_callback(get_frame_binding_inner);
+    kernel_core::syscall::register_set_frame_binding_callback(set_frame_binding_inner);
     // R172-04: the FS/GS staging writer used by arch_prctl (W3) and exec TLS reset (W4)
     // in kernel_core (which cannot depend on arch directly).
     kernel_core::syscall::register_stage_pending_tls_bases_callback(stage_pending_tls_bases);

@@ -359,6 +359,17 @@ impl CapTable {
         interrupts::without_interrupts(|| {
             let mut inner = self.inner.lock();
 
+            // R172-06: INV-CAP-FREELIST-CAP. allocate() now keeps free.capacity() >=
+            // slots.len(), so every free.push below (at most one per slot, total <=
+            // slots.len()) is allocation-free — making this safe PAST exec's point-of-no-return
+            // where apply_cloexec runs. The assert is the tripwire if a future allocate()
+            // change breaks the invariant (it would otherwise re-introduce a fatal OOM panic
+            // in the exec commit window).
+            debug_assert!(
+                inner.free.capacity() >= inner.slots.len(),
+                "R172-06: INV-CAP-FREELIST-CAP violated; apply_cloexec free.push could realloc/panic"
+            );
+
             for idx in 0..inner.slots.len() {
                 if let Some(slot) = &inner.slots[idx] {
                     if !slot.entry.inherits_on_exec() {
@@ -409,8 +420,27 @@ impl CapTableInner {
             if self.slots.len() >= MAX_CAP_SLOTS {
                 return Err(CapError::TableFull);
             }
+            // R172-06 FIX: grow BOTH `slots` and `free` FALLIBLY before mutating, restoring
+            // the invariant INV-CAP-FREELIST-CAP: free.capacity() >= slots.len(). The old
+            // `slots.push(None)` was an infallible grow (panic on OOM) AND it never reserved
+            // `free`, so after draining the initial 64-slot free list a later
+            // `apply_cloexec`/`revoke` `free.push` could reallocate and PANIC — and
+            // apply_cloexec runs PAST exec's point-of-no-return (proc.memory_space already
+            // overwritten), so the alloc_error_handler abort is an unrecoverable kernel halt.
+            // With this, every `free.push` for an existing slot is allocation-free by
+            // construction (free already has room for all slots). Both reserves run BEFORE the
+            // push, so an OOM leaves the table in its exact prior state (no half-grow).
+            let new_len = self.slots.len() + 1;
+            if self.free.capacity() < new_len {
+                self.free
+                    .try_reserve(new_len - self.free.len())
+                    .map_err(|_| CapError::OutOfMemory)?;
+            }
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| CapError::OutOfMemory)?;
             let new_idx = self.slots.len() as u16;
-            self.slots.push(None);
+            self.slots.push(None); // within reserved capacity -> cannot realloc
             new_idx
         };
 

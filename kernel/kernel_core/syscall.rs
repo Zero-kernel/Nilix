@@ -493,6 +493,20 @@ fn stdin_finish_wait() -> bool {
                     aborted = true;
                     return false;
                 }
+                // M0-5 sub-slice 1b: same EINTR cleanup for a deliverable handler signal
+                // (the canonical Ctrl-C-during-read site). SEPARATE from the kill gate
+                // (kill-first); the caller already maps `aborted` -> EINTR.
+                if crate::signal::has_deliverable_signal(pid) {
+                    STDIN_WAITERS.lock().retain(|&p| p != pid);
+                    if let Some(proc_arc) = get_process(pid) {
+                        let mut proc = proc_arc.lock();
+                        if proc.state == ProcessState::Blocked {
+                            proc.state = ProcessState::Ready;
+                        }
+                    }
+                    aborted = true;
+                    return false;
+                }
             }
             if let Some(pid) = current_pid() {
                 if let Some(proc_arc) = get_process(pid) {
@@ -950,6 +964,19 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 // "Woken" and the caller (sys_accept / recv) would re-park forever.
                 // Dequeue our exact (pid, generation), mark Ready, flag aborted.
                 if wait_should_abort(pid) {
+                    SOCKET_WAITERS
+                        .lock()
+                        .remove_waiter(queue_addr, pid, Some(my_gen));
+                    if let Some(proc_arc) = get_process(pid) {
+                        proc_arc.lock().state = ProcessState::Ready;
+                    }
+                    aborted = true;
+                    return false;
+                }
+                // M0-5 sub-slice 1b: same EINTR cleanup for a deliverable handler signal,
+                // evaluated BEFORE the `state != Blocked` check below so the recv/accept
+                // caller does not re-park with its exact (pid, gen) waiter dequeued.
+                if crate::signal::has_deliverable_signal(pid) {
                     SOCKET_WAITERS
                         .lock()
                         .remove_waiter(queue_addr, pid, Some(my_gen));
@@ -1458,6 +1485,9 @@ pub type SetFrameOwnerCallback = fn(pid: u64);
 // (a lock-free atomic-state read after init, no fn-ptr-to-int cast / transmute) fits.
 static SYSCALL_FRAME_MUT_CALLBACK: spin::Once<GetSyscallFrameMutCallback> = spin::Once::new();
 static SET_FRAME_OWNER_CALLBACK: spin::Once<SetFrameOwnerCallback> = spin::Once::new();
+// M0 item 5 (1b-2): raw frame-binding get/set (snapshot at entry, republish on resume).
+static GET_FRAME_BINDING_CALLBACK: spin::Once<GetFrameBindingCallback> = spin::Once::new();
+static SET_FRAME_BINDING_CALLBACK: spin::Once<SetFrameBindingCallback> = spin::Once::new();
 
 /// Register the mutable-frame accessor (arch → kernel_core). Called once at boot.
 pub fn register_syscall_frame_mut_callback(cb: GetSyscallFrameMutCallback) {
@@ -1467,6 +1497,15 @@ pub fn register_syscall_frame_mut_callback(cb: GetSyscallFrameMutCallback) {
 pub fn register_set_frame_owner_callback(cb: SetFrameOwnerCallback) {
     SET_FRAME_OWNER_CALLBACK.call_once(|| cb);
 }
+/// Register the raw frame-binding reader (arch → kernel_core). Called once at boot.
+pub fn register_get_frame_binding_callback(cb: GetFrameBindingCallback) {
+    GET_FRAME_BINDING_CALLBACK.call_once(|| cb);
+}
+/// Register the raw frame-binding writer (arch → kernel_core). Called once at boot.
+pub fn register_set_frame_binding_callback(cb: SetFrameBindingCallback) {
+    SET_FRAME_BINDING_CALLBACK.call_once(|| cb);
+}
+
 /// R172-04: callback (registered by arch) staging this CPU's pending FS/GS bases that
 /// the SYSRET epilogue commits to the MSRs. Used by arch_prctl (W3) and exec TLS reset
 /// (W4); kernel_core cannot depend on `arch` directly.
@@ -1484,6 +1523,71 @@ pub(crate) fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
     if let Some(&cb) = STAGE_PENDING_TLS_BASES_CALLBACK.get() {
         cb(fs_base, gs_base);
     }
+}
+
+/// M0 item 5 (1b-2): read this CPU's live `(frame_ptr, owner_pid)` binding (or `(0, 0)`
+/// if the callback is unregistered). Used to snapshot the binding at syscall entry.
+#[inline]
+fn current_syscall_frame_binding() -> (u64, u64) {
+    GET_FRAME_BINDING_CALLBACK.get().map_or((0, 0), |&cb| cb())
+}
+
+/// M0 item 5 (1b-2): republish this CPU's `(frame_ptr, owner_pid)` binding from a
+/// PCB-saved pair, so the owner-checked mutable accessor yields the live frame after a
+/// blocked syscall has resumed (the block zeroed the per-CPU `frame_ptr`).
+#[inline]
+fn publish_syscall_frame_binding(frame_ptr: u64, owner_pid: u64) {
+    if let Some(&cb) = SET_FRAME_BINDING_CALLBACK.get() {
+        cb(frame_ptr, owner_pid);
+    }
+}
+
+/// M0 item 5 (1b-2): a frame binding is usable iff the pointer is non-null AND owned by
+/// the expected task. Shared by the entry-snapshot gate and the return-tail republish so
+/// the two can never diverge.
+#[inline]
+fn is_valid_frame_binding(frame_ptr: u64, owner_pid: u64, expected_pid: ProcessId) -> bool {
+    frame_ptr != 0 && owner_pid == expected_pid as u64
+}
+
+/// M0 #5 (1b-2) self-test: the frame-binding validity predicate AND the arch
+/// get/set-binding callback wiring. The republish path only matters on the
+/// blocked-resume return tail — which a green boot / musl gate never exercises — so a
+/// silent mis-registration of either callback would be invisible to build/test/boot.
+/// This exercises both directions of the predicate and a live per-CPU round-trip,
+/// restoring the original binding BEFORE asserting so a failure can never strand a
+/// bogus per-CPU `frame_ptr`.
+pub fn run_saved_frame_binding_self_test() {
+    // Predicate: a null pointer never binds (fail-closed defer); an owner mismatch
+    // never binds (no cross-task frame redirect); a non-null pointer owned by the
+    // expected task binds.
+    assert!(
+        !is_valid_frame_binding(0, 7, 7),
+        "1b-2: null frame_ptr must not bind"
+    );
+    assert!(
+        !is_valid_frame_binding(0x1000, 8, 7),
+        "1b-2: owner mismatch must not bind"
+    );
+    assert!(
+        is_valid_frame_binding(0x1000, 7, 7),
+        "1b-2: matching non-null binding must bind"
+    );
+
+    // Arch round-trip: the get/set-binding callbacks must be registered and write BOTH
+    // fields on this CPU. Snapshot the live binding (0 in the boot self-test context),
+    // round-trip a sentinel, then RESTORE — the whole snapshot→sentinel→restore window is
+    // held under `without_interrupts` so no IRQ on this CPU can ever observe the sentinel
+    // in the live per-CPU slot (defense even though no IRQ path reads `frame_ptr`).
+    let (rt_ptr, rt_owner) = x86_64::instructions::interrupts::without_interrupts(|| {
+        let (orig_ptr, orig_owner) = current_syscall_frame_binding();
+        publish_syscall_frame_binding(0xFACE_F00D, 4242);
+        let rt = current_syscall_frame_binding();
+        publish_syscall_frame_binding(orig_ptr, orig_owner);
+        rt
+    });
+    assert_eq!(rt_ptr, 0xFACE_F00D, "1b-2: frame_ptr binding round-trip");
+    assert_eq!(rt_owner, 4242, "1b-2: frame_owner binding round-trip");
 }
 
 /// Record `pid` as the owner of the current syscall frame. Called once at the top of
@@ -2475,6 +2579,25 @@ pub fn syscall_dispatcher(
         // is ever built and the unset owner is never consulted).
         if crate::signal::any_handler_installed() {
             set_syscall_frame_owner(pid);
+            // M0 item 5 (1b-2): SNAPSHOT the live syscall-frame binding into the PCB so
+            // a blocked-and-resumed return tail can republish it (`switch_context` zeroes
+            // the per-CPU `frame_ptr` on a block, which would otherwise fail-close the
+            // delivery accessor and defer the handler to the NEXT syscall). Same handler-
+            // hint gate as the owner-set above, so the no-handler hot path pays nothing.
+            // The binding is owner==pid here (set_syscall_frame_owner just ran); the else
+            // arm clears any stale pair if the frame slot is somehow empty (defensive —
+            // the syscall ASM always sets `frame_ptr` before this dispatcher runs).
+            let (frame_ptr, owner) = current_syscall_frame_binding();
+            if let Some(proc_arc) = get_process(pid) {
+                let mut proc = proc_arc.lock();
+                if is_valid_frame_binding(frame_ptr, owner, pid) {
+                    proc.saved_frame_ptr = frame_ptr;
+                    proc.saved_frame_owner = owner;
+                } else {
+                    proc.saved_frame_ptr = 0;
+                    proc.saved_frame_owner = 0;
+                }
+            }
         }
     }
 
@@ -5013,12 +5136,16 @@ fn exec_from_bytes(
         // never survive the address-space replacement. (The monotonic global
         // any-handler hint is intentionally not reset; a stale-true hint only costs a
         // redundant pending scan, never incorrect delivery.)
-        for sa in proc.sigactions.iter_mut() {
-            if sa.is_handler() {
-                *sa = crate::signal::SigAction::default_action();
-            }
-        }
+        // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION leg (b) — the SOLE handler-reset path,
+        // extracted to `reset_sigactions_for_exec` so its self-test is a TRUE witness of the
+        // production reset, and the maybe_deliver_signal `exec_in_progress` tripwire (legs a/c
+        // enforcement) can rely on it. See `reset_sigactions_for_exec`.
+        reset_sigactions_for_exec(&mut proc.sigactions);
         proc.saved_blocked = 0;
+        // M0 #5 (1b-2): drop any stale syscall-frame binding — exec replaces the
+        // address space; the next handler-bearing syscall re-snapshots a fresh one.
+        proc.saved_frame_ptr = 0;
+        proc.saved_frame_owner = 0;
         proc.in_signal_handler = false;
 
         // M0-4 (gap g1): refresh the process name to the exec'd program's
@@ -5492,6 +5619,15 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         // re-blocking on children. Restore Ready + clear the waiting_child marker
         // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
         if wait_should_abort(pid) {
+            let mut proc = parent.lock();
+            proc.state = ProcessState::Ready;
+            proc.waiting_child = None;
+            return Err(SyscallError::EINTR);
+        }
+        // M0-5 sub-slice 1b: same EINTR cleanup for a deliverable handler signal — restore
+        // Ready AND clear the waiting_child marker (the load-bearing cleanup; dropping it
+        // strands a confused parent). SEPARATE from the kill gate (kill-first).
+        if crate::signal::has_deliverable_signal(pid) {
             let mut proc = parent.lock();
             proc.state = ProcessState::Ready;
             proc.waiting_child = None;
@@ -6325,7 +6461,24 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
                 flags,
                 mask,
             } => {
-                let restorer = proc.sigactions[bit as usize].restorer;
+                // M0 item 5 (1b-2): if THIS syscall blocked-and-resumed, `switch_context`
+                // zeroed the per-CPU `frame_ptr`, so the mutable accessor used by Phase 2/3
+                // below would fail-closed and DEFER this handler to the next syscall (the
+                // 1b-1 gap). Republish the binding snapshotted at entry — owner-re-validated
+                // by the accessor — so delivery lands at the SAME return as the EINTR wake.
+                // ONE republish (still under this Phase-1 lock) covers BOTH the Phase-2
+                // snapshot and the Phase-3 commit because nothing between here and the commit
+                // reschedules or re-zeroes the slot: `copy_to_user` does not block/switch
+                // (its SMAP windows only briefly re-enable IRQs, and a fault is ex-table
+                // fixed-up to EFAULT), and kernel-mode is not timer-preempted. INVARIANT FOR
+                // FUTURE EDITS: if kernel-mode preemption OR a blocking usercopy path is ever
+                // added, republish again immediately before the Phase-3 commit below.
+                if is_valid_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner, pid) {
+                    publish_syscall_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner);
+                }
+                // R172-P6-F1: recompute the sigaction index from the selected signal (the
+                // former `bit` local was folded into select_lowest_deliverable).
+                let restorer = proc.sigactions[(sig.as_u8() - 1) as usize].restorer;
                 (sig, handler, restorer, mask, flags, proc.blocked)
             }
             crate::signal::Disposition::Ignored => {

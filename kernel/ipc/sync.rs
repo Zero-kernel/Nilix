@@ -228,7 +228,18 @@ impl WaitQueue {
                 if let Some(seq) = wait_seq {
                     proc.active_wait_seq.store(seq, Ordering::Relaxed);
                 }
-                proc.state = ProcessState::Blocked;
+                // M0-5 sub-slice 1b: close the lost-wakeup window (see prepare_to_wait). A
+                // kill or deliverable handler signal that raced in before we publish Blocked
+                // would be MISSED by the bare state-flip wake. Re-check under the SAME proc
+                // lock the wakers use: if one is pending, do NOT block — leave the state as-is
+                // so the wait below returns immediately and the epilogue's wait_should_abort /
+                // has_deliverable_signal gates self-dequeue us and return Interrupted. The
+                // timer IRQ never wakes a non-Blocked entry, so the stamped seq is harmless
+                // (the epilogue clears it). (For a TIMED wait the window is also timeout-
+                // backstopped; this closes the untimed/infinite case too.)
+                if !kernel_core::signal::should_abort_pending_block(&proc) {
+                    proc.state = ProcessState::Blocked;
+                }
             }
 
             enqueued = true;
@@ -283,6 +294,18 @@ impl WaitQueue {
             // timer that fired just before/at the cancel above) so an exact
             // (pid, generation) match can never surface it as a later spurious
             // TimedOut. consume_timeout_flag is exact-gen, so it only clears OURS.
+            self.consume_timeout_flag(pid, my_gen);
+            return WaitOutcome::Interrupted;
+        }
+
+        // M0-5 sub-slice 1b: EINTR-wake for a deliverable HANDLER signal. SEPARATE from (and
+        // strictly AFTER) the kill gate above — kill-first ordering preserved; this never
+        // consumes pending_kill. Same self-dequeue + timeout-marker drain as the abort branch
+        // (the send-side wake flipped Blocked->Ready without removing us from self.waiters).
+        if kernel_core::signal::has_deliverable_signal(pid) {
+            interrupts::without_interrupts(|| {
+                self.waiters.lock().retain(|&(p, _)| p != pid);
+            });
             self.consume_timeout_flag(pid, my_gen);
             return WaitOutcome::Interrupted;
         }
@@ -513,6 +536,15 @@ impl WaitQueue {
                 return false;
             }
 
+            // M0-5 sub-slice 1b: the symmetric bail for a deliverable HANDLER signal — do
+            // NOT (re-)enqueue, so the caller's loop observes it via its top-of-loop
+            // has_deliverable_signal gate and returns EINTR. SEPARATE from the kill bail
+            // (kill-first); never consumes pending_kill. This is the CENTRAL condvar-family
+            // gate that makes a signal-Ready'd task bail the re-enqueue.
+            if kernel_core::signal::has_deliverable_signal(pid) {
+                return false;
+            }
+
             // R152-8 FIX: Check for duplicate enqueue before pushing.
             // Without this, spurious reschedule returns cause the same PID
             // to accumulate in the deque, consuming wake signals meant for
@@ -526,6 +558,19 @@ impl WaitQueue {
                 // reschedule immediately re-ran the still-Ready task at 100% CPU.
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
+                    // R172-13 FIX: re-check under the proc lock BEFORE re-stamping Blocked.
+                    // The fresh-enqueue path (:585) and the timed twin (:240) already do this;
+                    // this duplicate branch did NOT, so a deliverable handler signal/kill that
+                    // raced in after the top-of-prepare bail (:535/:544) was clobbered back to
+                    // Blocked with no further wake -> strand (the callers KMutex/Semaphore/
+                    // CondVar/recv/futex_lock_pi have no top-of-loop signal recheck). Mirror
+                    // the fresh path: undo the (lingering) enqueue and bail so the caller's
+                    // loop observes the abort and returns EINTR.
+                    if kernel_core::signal::should_abort_pending_block(&proc) {
+                        drop(proc);
+                        waiters.retain(|&(p, _)| p != pid);
+                        return false;
+                    }
                     if proc.state != ProcessState::Blocked {
                         proc.state = ProcessState::Blocked;
                     }
@@ -543,6 +588,17 @@ impl WaitQueue {
             // 将进程状态设为阻塞
             if let Some(proc_arc) = process::get_process(pid) {
                 let mut proc = proc_arc.lock();
+                // M0-5 sub-slice 1b: close the lost-wakeup window. The top-of-prepare
+                // signal/kill bails ran BEFORE we took this proc lock; a kill or deliverable
+                // handler signal that landed in between would be MISSED by the bare
+                // state-flip wake (it fires only on state==Blocked, which we have not set
+                // yet). Re-check here under the SAME proc lock the wakers use: if one raced
+                // in, UNDO the enqueue and do not block, so the caller's loop observes it and
+                // returns EINTR (signals have no kill-cascade backstop to recover a strand).
+                if kernel_core::signal::should_abort_pending_block(&proc) {
+                    waiters.retain(|&(p, _)| p != pid);
+                    return false;
+                }
                 proc.state = ProcessState::Blocked;
             }
 

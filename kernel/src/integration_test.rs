@@ -56,6 +56,9 @@ pub fn test_syscalls() {
     // the incremental read loop and size cap. VFS is initialized well before the
     // integration tests run.
     vfs::manager::run_exec_read_file_self_test();
+    // M0-6 slice 2: rename(82) atomicity + dual errno-mapper fidelity (ENOTEMPTY/EROFS/
+    // ENAMETOOLONG) + RENAME_NOREPLACE + the half-mutation guard.
+    vfs::manager::run_rename_self_test();
     // M0 #6: RLIMIT (getrlimit/setrlimit/prlimit64) data-model + validator, and the
     // seccomp<->dispatch divergence-prevention parity tests (the pledge allowlist is
     // PARTITIONED into dispatched XOR exempt; BPF agrees with the semantic gate).
@@ -71,6 +74,22 @@ pub fn test_syscalls() {
     kernel_core::signal_frame::run_signal_frame_self_test();
     kernel_core::signal::run_signal_self_test();
     klog_always!("    ✓ M0 #5 signals (1a): rt_sigframe layout/SROP/MXCSR/round-trip + mask RMW + disposition resolver");
+    // M0 #5 (1b-2): SAME-return handler delivery for a blocked-and-resumed syscall —
+    // the frame-binding validity predicate + the arch get/set-binding callback wiring
+    // (a mis-registration is invisible to a green boot, which never blocks-then-signals).
+    kernel_core::syscall::run_saved_frame_binding_self_test();
+    klog_always!(
+        "    ✓ M0 #5 signals (1b-2): frame-binding predicate + arch get/set-binding round-trip"
+    );
+    // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION leg (b) — exec resets real handlers to
+    // SIG_DFL, preserves SIG_IGN (exercises the production reset_sigactions_for_exec).
+    kernel_core::syscall::run_exec_signal_safepoint_self_test();
+    klog_always!("    ✓ R172-X-F1 exec-signal safepoint: handler reset / SIG_IGN preserved");
+    // M0-5 1b-1b: IPC-recv + PI-futex precise EINTR — the errno-mapping guard
+    // (IpcError::Interrupted => EINTR) a future receive_message_blocking caller must honor.
+    // PURE (a real-blocking receive/futex test would hang single-CPU at boot).
+    ipc::run_ipc_eintr_self_test();
+    klog_always!("    ✓ M0 #5 signals (1b-1b): IPC/PI-futex precise-EINTR errno mapping (Interrupted => EINTR)");
 }
 
 /// 测试上下文切换
@@ -243,6 +262,17 @@ pub fn test_cgroup_pt_kmem() {
     // + ledger corruption (the single most error-prone seam of SLICE-4).
     kernel_core::syscall::run_recording_frame_allocator_split_self_test();
     klog_always!("    ✓ M2-1 SLICE-4b: RecordingFrameAllocator DATA/PT split (allocate_data_frame unrecorded, trait allocate_frame records by identity) — brk-grow PT kmem now on-budget");
+    // M0-7 item7 SLICE 4: the charge-correct user-stack demand-grow PRIMITIVE
+    // (try_grow_user_stack). Two self-tests: (1) the PURE accounting state machine —
+    // the stack_grow_floor RLIMIT clamp + the FA-04 commit_stack_grow move (grow DATA
+    // folds into elf_charged_bytes, the bucket teardown+compute+fork read, NOT the
+    // vm_charged_bytes home that would strand mem_pinned at exit); (2) the cgroup
+    // matched-sequence telescoping (grow→migrate→exit→rollback) proving the grow lane
+    // leaves NO stranded pin (MEM_UNPIN_UNDERFLOW==0).
+    kernel_core::process::run_stack_grow_accounting_self_test();
+    klog_always!("    ✓ M0-7 SLICE 4: stack-grow accounting (grow_floor RLIMIT clamp + FA-04 commit folds DATA into elf_charged_bytes)");
+    kernel_core::cgroup::run_stack_grow_cgroup_self_test();
+    klog_always!("    ✓ M0-7 SLICE 4: stack-grow charge lane telescopes (grow/migrate/exit/rollback, MEM_UNPIN_UNDERFLOW==0 — no FA-04 strand)");
     // M4-1b: the per-PCB wait-timeout markers that replaced the two TIMER-IRQ-
     // allocating `timed_out` BTreeMaps (check_socket_timeouts + the WaitQueue timeout
     // wake, M1-02-renamed `wq_timeout_wake_by_seq`).
@@ -361,6 +391,16 @@ pub fn test_user_stack_builder() {
     klog_always!("    ✓ entry RSP%16==0 sweep (argc/envc/phdr parities) — the alignment-parity flip class eliminated");
     klog_always!("    ✓ auxv value whitelist (no kernel/phys address leaks via AT_*) + AT_PHDR-triple-iff-phdr!=0");
     klog_always!("    ✓ layout contiguity: argc@[RSP] + argv/envp NULLs + AT_NULL-terminated auxv + AT_RANDOM/EXECFN ptrs + zero gap");
+    klog_always!("    ✓ M0-7 builder floor == guard_top: no string/ptr can land in the unmapped low guard page");
+    // M0-7: pin the loader's eager-map geometry (guard carved, +1 anti-guard removed).
+    kernel_core::elf_loader::run_user_stack_guard_range_self_test();
+    klog_always!("    ✓ M0-7 stack guard geometry: 511 eager pages, top ends AT USER_STACK_TOP, one unmapped low guard page");
+    // M0-7 slice 2 (SLICE 1): the third-door mmap/brk stack-window exclusion — half-open
+    // [base,end) intersection + the page-aligned brk ceiling, guard-INCLUSIVE, single-
+    // sourced through user_stack_window(). Closes a hinted/MAP_FIXED mmap (or brk grow)
+    // aliasing the reserved stack window.
+    kernel_core::syscall::run_stack_window_exclusion_self_test();
+    klog_always!("    ✓ M0-7 slice 2 (SLICE 1): mmap/brk stack-window exclusion (guard-inclusive, half-open boundary exact)");
 }
 
 /// 运行所有集成测试

@@ -213,6 +213,51 @@ fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
     }
 }
 
+/// M0-5 1b-1b: IpcError → SyscallError. `receive_message_blocking` has NO caller in the
+/// tree today (only the re-export), so IpcError has no other errno-mapping site — this is
+/// the FUTURE home for its errno AND the guard (pinned by `run_ipc_eintr_self_test`) that a
+/// future wiring maps `Interrupted` to EINTR rather than silently inheriting the legacy
+/// `NoCurrentProcess` → ESRCH. Colocated with the `IpcError::Interrupted` variant.
+pub fn ipc_error_to_syscall(err: IpcError) -> SyscallError {
+    match err {
+        IpcError::NoCurrentProcess | IpcError::ProcessNotFound => SyscallError::ESRCH,
+        IpcError::EndpointNotFound => SyscallError::ENOENT,
+        IpcError::AccessDenied => SyscallError::EACCES,
+        IpcError::QueueFull => SyscallError::EAGAIN,
+        IpcError::MessageTooLarge => SyscallError::ENOMEM,
+        IpcError::TooManyEndpoints | IpcError::EndpointIdExhausted => SyscallError::EMFILE,
+        // M0-5 1b-1b: a pending kill or a deliverable HANDLER signal interrupted the
+        // blocking receive (the M0-5 1b wake) → EINTR, not the imprecise ESRCH.
+        IpcError::Interrupted => SyscallError::EINTR,
+    }
+}
+
+/// M0-5 1b-1b PURE self-test. A REAL-blocking receive/futex test would HANG at boot
+/// (single-CPU, no second schedulable task to send the wake), so instead of exercising the
+/// blocking path this pins the only mis-wire a green boot cannot catch: the precise-EINTR
+/// ERRNO mapping. The kill-first OR decision at the two bail sites (ipc.rs
+/// `receive_message_blocking` + futex.rs `futex_lock_pi`) is by-construction congruent with
+/// the already-converged sync.rs wait epilogue (same `wait_should_abort` /
+/// `has_deliverable_signal` predicates, kill checked first), so its correctness rides that
+/// pattern; the NEW surface is the errno home, which this guards.
+pub fn run_ipc_eintr_self_test() {
+    assert_eq!(
+        ipc_error_to_syscall(IpcError::Interrupted),
+        SyscallError::EINTR,
+        "1b-1b: IpcError::Interrupted MUST map to EINTR (a future receive_message_blocking caller must not inherit ESRCH)"
+    );
+    assert_eq!(
+        ipc_error_to_syscall(IpcError::NoCurrentProcess),
+        SyscallError::ESRCH,
+        "1b-1b: a genuine no-current-process bail stays ESRCH (the non-interrupted case)"
+    );
+    assert_eq!(
+        ipc_error_to_syscall(IpcError::EndpointNotFound),
+        SyscallError::ENOENT,
+        "1b-1b: EndpointNotFound errno unchanged"
+    );
+}
+
 /// FsError 到 SyscallError 的转换（用于 VFS FileHandle）
 fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
     use vfs::types::FsError;

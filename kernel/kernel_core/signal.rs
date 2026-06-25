@@ -35,6 +35,26 @@ fn get_resume_callback() -> Option<ResumeCallback> {
     *RESUME_CALLBACK.lock()
 }
 
+/// M0-5 sub-slice 1b: cross-CPU reschedule-kick callback type. A bare `Blocked -> Ready`
+/// flip makes the target SELECTABLE on the CPU that owns its ready queue, but that CPU may
+/// be idle (in HLT) with no pending reschedule — and unlike the kill-wake (which TERMINATES
+/// a stranded task via the deferred-kill cascade), the signal-wake needs the task to actually
+/// RUN to deliver. So after a wake we ask the scheduler to broadcast a reschedule IPI so the
+/// queue-owning CPU re-selects the now-Ready task promptly instead of at the next timer tick.
+type KickCallback = fn();
+
+/// 全局重调度 kick 回调（由调度器注册）。
+static KICK_CALLBACK: Mutex<Option<KickCallback>> = Mutex::new(None);
+
+/// 注册重调度 kick 回调（调度器初始化时调用，注册广播 reschedule-IPI 的函数）。
+pub fn register_kick_callback(callback: KickCallback) {
+    *KICK_CALLBACK.lock() = Some(callback);
+}
+
+fn get_kick_callback() -> Option<KickCallback> {
+    *KICK_CALLBACK.lock()
+}
+
 /// R171-S-R170-5-01 FIX (SLICE 3): Kernel-internal un-stop hook used by the
 /// namespace init-death cascade's `force_remote_kill`. A SIGKILL must un-stop a
 /// job-control-stopped victim so the scheduler will dispatch it and it can reach a
@@ -167,12 +187,12 @@ impl PendingSignals {
 
     /// Take the next pending signal (lowest numbered first)
     pub fn take_next(&mut self) -> Option<Signal> {
-        if self.bits == 0 {
-            return None;
-        }
-        let idx = self.bits.trailing_zeros() as u8;
-        self.bits &= !(1u64 << idx);
-        Signal::from_index(idx + 1)
+        // R172-P6-F1: delegate the lowest-bit pick to the shared `select_lowest_deliverable`
+        // so this third copy of trailing_zeros/from_index cannot re-fork (currently has no
+        // callers — class-hardening insurance), then pop exactly the selected bit.
+        let sig = select_lowest_deliverable(self.bits)?;
+        self.bits &= !sig.bit();
+        Some(sig)
     }
 
     /// Get raw bits (for debugging)
@@ -288,6 +308,25 @@ pub fn uncatchable_mask() -> u64 {
     Signal::SIGKILL.bit() | Signal::SIGSTOP.bit()
 }
 
+/// R172-P6-F1: the SINGLE lowest-deliverable-bit selector — pure / total / lock-free. Takes
+/// the ALREADY-MASKED deliverable set, so the uncatchable-mask choice lives at the call site
+/// as an explicit, deliberate decision (NOT an accidental omission): `signal_is_deliverable`
+/// / `should_abort_pending_block` pass `pending & !blocked & !uncatchable_mask()` (a lone
+/// pending SIGKILL/SIGSTOP must take the kill / stop leg, never the handler-EINTR leg), while
+/// `maybe_deliver_signal` Phase-1 passes the UNMASKED `pending & !blocked` (it must still
+/// select a lone uncatchable so its `Default` arm terminates / stops). Both, plus
+/// `PendingSignals::take_next`, share THIS `trailing_zeros` / `from_index` / None-guard, so
+/// the wake-gate selector and the delivery selector can NEVER drift apart (the lost-wakeup /
+/// wrong-signal divergence the finding pinned). `from_index` already None-guards
+/// `bit + 1 > MAX_SIGNAL`, so a spurious high bit is dropped, never panicked.
+pub fn select_lowest_deliverable(deliverable: u64) -> Option<Signal> {
+    if deliverable == 0 {
+        return None;
+    }
+    let bit = deliverable.trailing_zeros() as u8; // signal = bit + 1, lowest first
+    Signal::from_index(bit + 1)
+}
+
 /// The effective disposition of a signal under a sigaction table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
@@ -359,6 +398,79 @@ pub fn note_handler_installed() {
 #[inline]
 pub fn any_handler_installed() -> bool {
     ANY_HANDLER_INSTALLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// M0-5 sub-slice 1b: pure predicate — is a HANDLER signal deliverable to a task with this
+/// (pending, blocked, in_handler, sigactions) snapshot? HANDLER-ONLY by design:
+/// * A no-handler catchable signal (e.g. Default(Terminate)) to a blocked task is ALREADY
+///   wake+terminated by the KILL leg (send_signal sets terminate_code -> request_process_exit
+///   flips Blocked->Ready + sets pending_kill -> wait_should_abort fires), so Handler-only is
+///   both correct AND complete — NOT a gap.
+/// * `in_handler` => false: never EINTR-wake (or deliver) while a handler frame is live
+///   (mirrors maybe_deliver_signal's serialize-defer; anti-spurious-EINTR, LOAD-BEARING).
+/// * `& !uncatchable_mask()`: send_signal sets the pending bit for SIGKILL too and SIGKILL is
+///   force-stripped from `blocked`, so a SIGKILL bit IS in `pending & !blocked` — it MUST be
+///   masked out here so it takes the kill leg, never the signal-EINTR leg.
+/// Resolves the LOWEST deliverable bit's disposition (bit-for-bit congruent with
+/// maybe_deliver_signal Phase-1) so the send-side wake and the wait-site epilogue agree.
+fn signal_is_deliverable(
+    pending: u64,
+    blocked: u64,
+    in_handler: bool,
+    sigactions: &[SigAction; NSIG],
+) -> bool {
+    if in_handler {
+        return false;
+    }
+    // Site A (R172-P6-F1): mask uncatchables BEFORE the shared pick — a lone pending
+    // SIGKILL/SIGSTOP must NOT be reported deliverable here (it takes the kill / stop leg,
+    // never the handler-EINTR leg). The bit-pick is the SAME primitive Site B uses.
+    let sig = match select_lowest_deliverable(pending & !blocked & !uncatchable_mask()) {
+        Some(s) => s,
+        None => return false,
+    };
+    matches!(
+        resolve_disposition(sigactions, sig),
+        Disposition::Handler { .. }
+    )
+}
+
+/// M0-5 sub-slice 1b: does `pid` have a deliverable HANDLER signal pending? Called by the
+/// blocking wait sites to decide an EINTR-wake. Lock-free fast-path FIRST (no proc lock on
+/// the no-handler musl/native boot — a single relaxed load), then ONE proc-lock snapshot.
+pub fn has_deliverable_signal(pid: ProcessId) -> bool {
+    if !any_handler_installed() {
+        return false;
+    }
+    let arc = match process::get_process(pid) {
+        Some(a) => a,
+        None => return false,
+    };
+    let proc = arc.lock();
+    signal_is_deliverable(
+        proc.pending_signals.bits(),
+        proc.blocked,
+        proc.in_signal_handler,
+        &proc.sigactions,
+    )
+}
+
+/// M0-5 sub-slice 1b: should a task ABOUT to publish Blocked bail instead? True if a kill is
+/// pending OR a deliverable handler signal exists. Called UNDER the proc lock at the
+/// Blocked-commit point (where the wakers also take the lock) to close the lost-wakeup window
+/// between a top-of-wait bail and publishing Blocked — a window in which the bare
+/// state-flip wake (which fires only on state==Blocked) would otherwise be missed, stranding
+/// the task indefinitely (signals, unlike kills, have no deferred-kill-cascade backstop).
+/// Takes `&Process` so the caller can re-use its already-held guard (no re-lock / deadlock).
+pub fn should_abort_pending_block(proc: &crate::process::Process) -> bool {
+    proc.pending_kill
+        .load(core::sync::atomic::Ordering::Acquire)
+        || signal_is_deliverable(
+            proc.pending_signals.bits(),
+            proc.blocked,
+            proc.in_signal_handler,
+            &proc.sigactions,
+        )
 }
 
 /// Signal-related errors
@@ -506,6 +618,9 @@ fn send_signal_inner(
     let mut needs_reschedule = false;
     let mut terminate_code: Option<i32> = None;
     let mut needs_resume = false;
+    // M0-5 sub-slice 1b: set when the EINTR-wake flips a blocked target Ready, so we
+    // broadcast a reschedule kick AFTER releasing the proc lock.
+    let mut needs_kick = false;
 
     {
         let mut proc = process_arc.lock();
@@ -552,6 +667,25 @@ fn send_signal_inner(
                 // needs it.
                 if signal.is_continue() && (proc.stopped || proc.state == ProcessState::Stopped) {
                     needs_resume = true;
+                }
+                // M0-5 sub-slice 1b: EINTR-wake a target BLOCKED in a syscall so it unwinds
+                // to its syscall-return tail and returns EINTR (the handler then delivers at
+                // its NEXT syscall entry — 1a re-establishes the per-CPU frame there). Routed
+                // through the SAME pure predicate the wait-site epilogues use (so the wake and
+                // the epilogue agree on the lowest deliverable bit — no socket lost-wakeup).
+                // Guarded `== Blocked && !stopped`: a job-control-stopped+blocked task must
+                // keep its Blocked wait-state (un-stop is SIGCONT's resume_stopped path, not
+                // this). Bare state flip — the PCB stays in the scheduler; select_next re-picks
+                // it on `== Ready`. Idempotent vs a racing data-wake (the `== Blocked` guard).
+                let should_wake = signal_is_deliverable(
+                    proc.pending_signals.bits(),
+                    proc.blocked,
+                    proc.in_signal_handler,
+                    &proc.sigactions,
+                );
+                if should_wake && proc.state == ProcessState::Blocked && !proc.stopped {
+                    proc.state = ProcessState::Ready;
+                    needs_kick = true;
                 }
             }
             Disposition::Ignored => {
@@ -625,6 +759,15 @@ fn send_signal_inner(
         crate::scheduler_hook::force_reschedule();
     }
 
+    // M0-5 sub-slice 1b: the EINTR-wake flipped a blocked target Ready on (typically) another
+    // CPU. Broadcast a reschedule IPI so the queue-owning CPU re-selects it promptly rather
+    // than only at its next timer tick. No-op until the scheduler registers the callback.
+    if needs_kick {
+        if let Some(kick) = get_kick_callback() {
+            kick();
+        }
+    }
+
     Ok(action)
 }
 
@@ -649,6 +792,19 @@ pub fn run_signal_self_test() {
         kill_stop,
         (1u64 << 8) | (1u64 << 18),
         "uncatchable == SIGKILL|SIGSTOP"
+    );
+
+    // R172-21 (NO_FIX regression guard): SA_RESTART MUST remain ACCEPTED at install (it is a
+    // documented M0 no-op, NOT EINVAL-rejected). glibc signal() installs handlers with
+    // SA_RESTART by default and musl's pthread_cancel sets SA_RESTART|SA_SIGINFO and ignores
+    // the rt_sigaction return value; removing SA_RESTART from SA_SUPPORTED_FLAGS would make
+    // the unknown-flag reject fail EVERY libc handler install — strictly worse than the
+    // honest no-op. This pins the invariant so a future refactor cannot "fix" R172-21 the
+    // harmful way. (A real restart needs ERESTARTSYS + orig_rax + a restartability table +
+    // zero-progress detection — out of M0 scope; see the doc at the SA_RESTART definition.)
+    assert!(
+        SA_SUPPORTED_FLAGS & SA_RESTART != 0,
+        "R172-21: SA_RESTART must stay ACCEPTED (not EINVAL-rejected) — glibc/musl set it by default"
     );
 
     // apply_sigprocmask: BLOCK adds, always strips SIGKILL/SIGSTOP.
@@ -722,6 +878,96 @@ pub fn run_signal_self_test() {
     assert!(
         default_sigactions().iter().all(|s| !s.is_handler()),
         "default table is all SIG_DFL"
+    );
+
+    // M0-5 sub-slice 1b: signal_is_deliverable decision table. `table` has SIGUSR1=Handler,
+    // SIGUSR2=SIG_IGN; `clean` is all-SIG_DFL. These rows are the build-time guard that the
+    // EINTR-wake predicate stays Handler-only, uncatchable-masked, mask/in-handler-aware, and
+    // lowest-bit-resolving (congruent with maybe_deliver_signal Phase-1).
+    let clean = default_sigactions();
+    let usr1 = Signal::SIGUSR1.bit();
+    // (a) in_handler => defer (anti-spurious-EINTR).
+    assert!(
+        !signal_is_deliverable(usr1, 0, true, &table),
+        "in_handler => defer"
+    );
+    // (b) nothing pending => false.
+    assert!(
+        !signal_is_deliverable(0, 0, false, &table),
+        "no pending => false"
+    );
+    // (c) lowest deliverable Handler bit => true.
+    assert!(
+        signal_is_deliverable(usr1, 0, false, &table),
+        "handler pending => true"
+    );
+    // (d) SIG_IGN => false.
+    assert!(
+        !signal_is_deliverable(Signal::SIGUSR2.bit(), 0, false, &table),
+        "SIG_IGN => false"
+    );
+    // (e) Default(Terminate) SIGTERM => false (Handler-only scope; the KILL leg handles it).
+    assert!(
+        !signal_is_deliverable(Signal::SIGTERM.bit(), 0, false, &clean),
+        "Default(Terminate) => false"
+    );
+    // (f) Default(Stop) SIGTSTP => false.
+    assert!(
+        !signal_is_deliverable(Signal::SIGTSTP.bit(), 0, false, &clean),
+        "Default(Stop) => false"
+    );
+    // (g) Default(Continue) SIGCONT => false.
+    assert!(
+        !signal_is_deliverable(Signal::SIGCONT.bit(), 0, false, &clean),
+        "Default(Continue) => false"
+    );
+    // (h) handler signal pending but BLOCKED => false.
+    assert!(
+        !signal_is_deliverable(usr1, usr1, false, &table),
+        "blocked handler => false"
+    );
+    // (i) lowest-bit precedence: a LOWER default-terminate bit (SIGHUP=1) + a HIGHER handler
+    //     bit (SIGUSR1) resolves the LOW bit (not Handler) => false. Proves the send-side wake
+    //     and the wait-site epilogue agree on the lowest deliverable bit (no socket lost-wakeup).
+    assert!(
+        !signal_is_deliverable((1u64 << 0) | usr1, 0, false, &table),
+        "lowest-bit precedence: low default bit wins => false"
+    );
+    // (j) a SIGKILL bit IS in pending&!blocked (send_signal sets it; SIGKILL is unblockable),
+    //     but the uncatchable mask-out keeps it off the signal-EINTR leg.
+    assert!(
+        !signal_is_deliverable(Signal::SIGKILL.bit(), 0, false, &table),
+        "SIGKILL masked out of the deliverable set"
+    );
+
+    // R172-P6-F1: pin the SHARED selector AND the intentional Site-A vs Site-B mask
+    // divergence so a future re-fork fails the suite (the green musl boot can't catch it —
+    // no-handler boot never runs either selector).
+    // (k) empty set => None.
+    assert!(
+        select_lowest_deliverable(0).is_none(),
+        "empty deliverable => None"
+    );
+    // (l) DIVERGENCE WITNESS — Site B's UNMASKED input: the production selector picks
+    //     SIGKILL (the lowest bit), so maybe_deliver_signal routes it into the Default /
+    //     terminate arm. This is the EXACT bit Site A masks out.
+    assert_eq!(
+        select_lowest_deliverable(Signal::SIGKILL.bit() | usr1),
+        Some(Signal::SIGKILL),
+        "Site-B (unmasked) selector picks the lone-lowest SIGKILL for the Default arm"
+    );
+    // (m) Site A's MASKED input: the predicate selector picks SIGUSR1, never SIGKILL —
+    //     (l)+(m) together pin the intentional divergence (same primitive, deliberate masks).
+    assert_eq!(
+        select_lowest_deliverable((Signal::SIGKILL.bit() | usr1) & !uncatchable_mask()),
+        Some(Signal::SIGUSR1),
+        "Site-A (masked) selector skips SIGKILL and picks the catchable handler bit"
+    );
+    // (n) lowest-of-multiple catchable bits.
+    assert_eq!(
+        select_lowest_deliverable(Signal::SIGUSR2.bit() | usr1),
+        Some(Signal::SIGUSR1),
+        "lowest catchable bit wins"
     );
 }
 
