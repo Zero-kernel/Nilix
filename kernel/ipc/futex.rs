@@ -59,6 +59,16 @@ struct FutexBucket {
     owner_dead: bool,
     /// E.4 PI: PI 等待者列表 (pid -> priority)，用于找出最高优先级的等待者
     pi_waiters: BTreeMap<ProcessId, Priority>,
+    /// R172-07/08 FIX: tombstone published UNDER the bucket lock atomically with the
+    /// bucket's removal from FUTEX_TABLE (see `cleanup_empty_bucket`). `get_or_create_bucket`
+    /// drops FUTEX_TABLE before the caller publishes its first state under the bucket lock;
+    /// in that gap the reaper (or a thread-group-exit drain) can remove the bucket from the
+    /// table while a concurrent thread still holds a stale `Arc` to it. Without the tombstone
+    /// that stale `Arc` could be revived (a second LOCK_PI mints a fresh bucket for the same
+    /// key -> TWO owners of one PI mutex; or a waiter enqueues on an orphan that no waker can
+    /// find). Set-once, never cleared (a tombstoned `Arc` is discarded). A first-publish site
+    /// that observes `unlinked` retries `get_or_create_bucket` to obtain the live entry.
+    unlinked: bool,
 }
 
 impl FutexBucket {
@@ -69,8 +79,28 @@ impl FutexBucket {
             owner: None,
             owner_dead: false,
             pi_waiters: BTreeMap::new(),
+            unlinked: false,
         }
     }
+}
+
+/// R172-07/08: bounded retry count for obtaining a live (non-tombstoned) bucket. A
+/// pathological reaper could repeatedly unlink between create and lock; the bound makes the
+/// loop terminate (the per-site `unlinked` guard is the authoritative correctness check).
+const FUTEX_REVALIDATE_RETRIES: usize = 16;
+
+/// R172-07/08: get-or-create a bucket and ensure the returned `Arc` is not already
+/// tombstoned. The per-first-publish-site `unlinked` re-check under the bucket lock is the
+/// authoritative guard; this just avoids handing out an obviously-dead `Arc`.
+fn get_or_create_live_bucket(key: FutexKey) -> Result<Arc<Mutex<FutexBucket>>, FutexError> {
+    let mut last = get_or_create_bucket(key)?;
+    for _ in 0..FUTEX_REVALIDATE_RETRIES {
+        if !last.lock().unlinked {
+            return Ok(last);
+        }
+        last = get_or_create_bucket(key)?;
+    }
+    Ok(last)
 }
 
 lazy_static::lazy_static! {
@@ -159,15 +189,31 @@ pub fn futex_wait(
     let key = (tgid, uaddr);
 
     // 获取或创建此地址的等待桶
-    let bucket = get_or_create_bucket(key);
-
-    // 【关键修复】增加等待者计数并获取队列 Arc，然后立即释放桶锁
-    // 避免持有桶锁时调用 WaitQueue::wait() 导致死锁
-    let queue = {
-        let mut b = bucket.lock();
-        b.waiter_count += 1;
-        b.queue.clone()
-    }; // 桶锁在此释放
+    // R172-07/08 FIX: obtain a LIVE bucket and bump waiter_count under the bucket lock with a
+    // re-check of `unlinked` — the first-publish guard. waiter_count>=1 then pins the bucket
+    // table-resident (cleanup_empty_bucket's emptiness gate fails), so all later re-locks of
+    // `bucket` operate on the live table entry. If a reaper unlinked it in the get->lock gap
+    // we retry; on exhaustion fail closed (WouldBlock -> userspace retries) rather than
+    // enqueue on an orphan no waker can find.
+    let (bucket, queue) = {
+        let mut attempt = 0;
+        loop {
+            let bucket = get_or_create_live_bucket(key)?;
+            let mut b = bucket.lock();
+            if b.unlinked {
+                drop(b);
+                attempt += 1;
+                if attempt >= FUTEX_REVALIDATE_RETRIES {
+                    return Err(FutexError::WouldBlock);
+                }
+                continue;
+            }
+            b.waiter_count += 1;
+            let queue = b.queue.clone();
+            drop(b);
+            break (bucket, queue);
+        }
+    };
 
     // 【关键修复】在入队前二次读取 futex 值，防止 lost-wake 竞态
     // 如果值已变化，说明唤醒者已经完成操作，我们不应该阻塞
@@ -298,52 +344,69 @@ pub fn futex_lock_pi(
         proc.dynamic_priority
     };
 
-    let bucket = get_or_create_bucket(key);
-
-    // 快路径：尝试直接获取所有权
-    {
-        let mut b = bucket.lock();
-
-        // 清理已死亡的 owner（robust futex）
-        // R161-13 FIX: Also detect zombie/terminated owners, not just reaped ones.
-        if let Some(owner) = b.owner {
-            let owner_dead = match process::get_process(owner) {
-                None => true,
-                Some(proc_arc) => {
-                    let state = proc_arc.lock().state;
-                    matches!(
-                        state,
-                        process::ProcessState::Zombie | process::ProcessState::Terminated
-                    )
+    // R172-07/08 FIX: acquire a LIVE bucket and run the claim/wait fast-path under the bucket
+    // lock with an `unlinked` first-publish guard (retry on the rare get->lock reap race,
+    // bounded). The owner-claim / waiter_count++ below makes the bucket non-empty, pinning it
+    // table-resident so cleanup_empty_bucket cannot orphan it — which previously let a stale
+    // Arc be claimed while a second LOCK_PI minted a fresh bucket for the same key, giving
+    // TWO simultaneous owners of one PI mutex (the R172-08 double-owner bug).
+    let bucket = {
+        let mut attempt = 0;
+        loop {
+            let bucket = get_or_create_live_bucket(key)?;
+            let mut b = bucket.lock();
+            if b.unlinked {
+                drop(b);
+                attempt += 1;
+                if attempt >= FUTEX_REVALIDATE_RETRIES {
+                    return Err(FutexError::WouldBlock);
                 }
-            };
-            if owner_dead {
-                b.owner = None;
-                b.owner_dead = true;
+                continue;
             }
-        }
 
-        if b.owner.is_none() {
-            // 锁空闲，直接获取
-            let owner_died = b.owner_dead;
-            b.owner = Some(pid);
-            b.owner_dead = false;
-            b.pi_waiters.remove(&pid);
-            return if owner_died {
-                Err(FutexError::OwnerDied)
-            } else {
-                Ok(0)
-            };
-        }
+            // 清理已死亡的 owner（robust futex）
+            // R161-13 FIX: Also detect zombie/terminated owners, not just reaped ones.
+            if let Some(owner) = b.owner {
+                let owner_dead = match process::get_process(owner) {
+                    None => true,
+                    Some(proc_arc) => {
+                        let state = proc_arc.lock().state;
+                        matches!(
+                            state,
+                            process::ProcessState::Zombie | process::ProcessState::Terminated
+                        )
+                    }
+                };
+                if owner_dead {
+                    b.owner = None;
+                    b.owner_dead = true;
+                }
+            }
 
-        if b.owner == Some(pid) {
-            // 自己已经持有，防止死锁
-            return Err(FutexError::InvalidOperation);
-        }
+            if b.owner.is_none() {
+                // 锁空闲，直接获取
+                let owner_died = b.owner_dead;
+                b.owner = Some(pid);
+                b.owner_dead = false;
+                b.pi_waiters.remove(&pid);
+                return if owner_died {
+                    Err(FutexError::OwnerDied)
+                } else {
+                    Ok(0)
+                };
+            }
 
-        // 需要等待：增加计数但暂不记录 pi_waiters（避免 race）
-        b.waiter_count += 1;
-    }
+            if b.owner == Some(pid) {
+                // 自己已经持有，防止死锁
+                return Err(FutexError::InvalidOperation);
+            }
+
+            // 需要等待：增加计数但暂不记录 pi_waiters（避免 race）
+            b.waiter_count += 1;
+            drop(b);
+            break bucket;
+        }
+    };
 
     // 记录阻塞的 futex key（用于链式 PI）
     if let Some(proc) = process::get_process(pid) {
@@ -759,38 +822,56 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
 }
 
 /// 获取或创建指定键的等待桶
-fn get_or_create_bucket(key: FutexKey) -> Arc<Mutex<FutexBucket>> {
+fn get_or_create_bucket(key: FutexKey) -> Result<Arc<Mutex<FutexBucket>>, FutexError> {
     let mut table = FUTEX_TABLE.lock();
-    table
-        .entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(FutexBucket::new())))
-        .clone()
+    // Fast path: an existing bucket never counts against the cap (no growth).
+    if let Some(b) = table.get(&key) {
+        return Ok(b.clone());
+    }
+    // R172-23: enforce the per-tgid cap on the CREATE path, counted from the table itself via
+    // the contiguous (tgid, *) key range (ProcessId is the high-order field). Deriving the
+    // count (not storing it) keeps it definitionally in sync with EVERY reclaim path
+    // (cleanup_empty_bucket / cleanup_process_futexes) — no counter to desync/leak (avoids the
+    // FA-04 trap). count<->insert is atomic under this one FUTEX_TABLE lock (no TOCTOU). The
+    // reject path allocates nothing (split entry() into get-then-insert).
+    let tgid = key.0;
+    let live = table.range((tgid, 0)..=(tgid, usize::MAX)).count();
+    if live >= MAX_FUTEX_BUCKETS_PER_TGID {
+        return Err(FutexError::TooManyBuckets);
+    }
+    let bucket = Arc::new(Mutex::new(FutexBucket::new()));
+    table.insert(key, bucket.clone());
+    Ok(bucket)
 }
 
 /// 清理空的等待桶（无等待者时移除）
 ///
 /// E.4 PI: 额外检查 owner 和 pi_waiters 是否为空
 fn cleanup_empty_bucket(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
-    let b = bucket.lock();
-    // E.4 PI: 只有当 owner、等待者、队列都为空时才清理
-    if b.waiter_count == 0 && b.queue.is_empty() && b.owner.is_none() && b.pi_waiters.is_empty() {
-        drop(b);
-
-        // 重新获取 table 锁进行移除
-        let mut table = FUTEX_TABLE.lock();
-        if let Some(existing) = table.get(&key) {
-            // 确保是同一个桶（防止竞态条件下移除新创建的桶）
-            if Arc::ptr_eq(existing, bucket) {
-                // 再次检查是否为空
-                let b = existing.lock();
-                if b.waiter_count == 0
-                    && b.queue.is_empty()
-                    && b.owner.is_none()
-                    && b.pi_waiters.is_empty()
-                {
-                    drop(b);
-                    table.remove(&key);
-                }
+    // R172-07/08 FIX: TABLE-first then bucket (the established table->bucket lock order, e.g.
+    // apply_pi_and_propagate / cleanup_process_futexes), so publishing the `unlinked`
+    // tombstone and removing the table entry are ATOMIC w.r.t. any bucket-lock holder. This
+    // closes the get_or_create_bucket(drop table) -> claim-under-bucket-lock window: a
+    // first-publish site holding a stale Arc either observes unlinked==false on a still-
+    // resident bucket (and its waiter_count++/owner-set then makes the bucket non-empty, so
+    // this emptiness gate fails and it is never reaped out from under it), or observes
+    // unlinked==true and retries get_or_create_bucket for the live entry. (Previously this
+    // took bucket-then-table with the table re-checked separately, leaving the stale-Arc
+    // revival gap the audit found.)
+    let mut table = FUTEX_TABLE.lock();
+    if let Some(existing) = table.get(&key) {
+        // 确保是同一个桶（防止竞态条件下移除新创建的桶）
+        if Arc::ptr_eq(existing, bucket) {
+            let mut b = bucket.lock();
+            // E.4 PI: 只有当 owner、等待者、队列都为空时才清理
+            if b.waiter_count == 0
+                && b.queue.is_empty()
+                && b.owner.is_none()
+                && b.pi_waiters.is_empty()
+            {
+                b.unlinked = true; // tombstone published atomically with the removal below
+                drop(b);
+                table.remove(&key);
             }
         }
     }
