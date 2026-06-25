@@ -5063,6 +5063,15 @@ fn exec_from_bytes(
                                        // exec already rejects multithreaded/shared-VM callers, so no sibling
                                        // brk can be in flight here; reset defensively for a clean slate.
             mm.brk_in_progress = false;
+            // R172-16: clear the brk-grow VA reservation on exec too (clean slate).
+            mm.brk_grow_resv_lo = 0;
+            mm.brk_grow_resv_hi = 0;
+            // M0-7 item7 SLICE 4: clear any stack-grow reservation / in-flight lane on
+            // exec image replacement (exec already rejects multithreaded/shared-VM, so no
+            // sibling grow can be in flight; reset defensively). The watermark is set to
+            // the fresh image's mapped floor below, after elf_charged_bytes.
+            mm.stack_grow_pending_bytes = 0;
+            mm.stack_grow_in_progress = false;
             mm.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
             mm.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
                                        // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
@@ -8337,7 +8346,41 @@ struct BrkReservation {
 impl Drop for BrkReservation {
     fn drop(&mut self) {
         if self.armed {
-            self.mm.lock().brk_in_progress = false;
+            // R172-16: clear the brk-grow VA reservation together with brk_in_progress on
+            // EVERY early-return / error path. (The clean commit disarms this guard and
+            // clears both fields explicitly under its own MmState lock, so Drop is the
+            // catch-all for the abort paths only.)
+            let mut mm = self.mm.lock();
+            mm.brk_in_progress = false;
+            mm.brk_grow_resv_lo = 0;
+            mm.brk_grow_resv_hi = 0;
+        }
+    }
+}
+
+/// M0-7 item7 SLICE 4: RAII reservation serializing `try_grow_user_stack` against
+/// sibling grows, fork, and cgroup migration — the stack-lane twin of
+/// `BrkReservation`. While `armed`, `MmState.stack_grow_in_progress` is set; the
+/// grow drops the Process lock across the irreversible page-table work, so this
+/// guard guarantees the flag is cleared on EVERY abort / early-return path (a bad
+/// floor, a cgroup-charge reject, a map-failure rollback). The clean commit clears
+/// the flag under its own held `MmState` lock and disarms the guard, so `Drop` is
+/// the catch-all for the abort paths only. `Drop` runs only at `try_grow_user_stack`
+/// scope exit — after every inner `mm_arc.lock()` scope has ended — so re-locking
+/// `MmState` here cannot self-deadlock (mirrors `BrkReservation`).
+///
+/// `stack_grow_pending_bytes` is intentionally NOT cleared here: it is armed and then
+/// explicitly subtracted in the SAME arm (commit or rollback) with no early-return in
+/// between, exactly like `brk_pending_growth` — so the guard never needs to undo it.
+struct StackGrowReservation {
+    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    armed: bool,
+}
+
+impl Drop for StackGrowReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.mm.lock().stack_grow_in_progress = false;
         }
     }
 }
@@ -8436,6 +8479,20 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     return Ok(old_brk);
                 }
             }
+            // R172-16: no existing region overlaps [old_top, new_top); reserve that VA range
+            // ATOMICALLY with the check (same MmState lock) so a concurrent sys_mmap on a
+            // shared MmState (CLONE_VM / CLONE_THREAD sibling) cannot place a mapping inside
+            // the grow window while we drop the lock for the irreversible page-table work
+            // below. sys_mmap's Phase-1 overlap check rejects any [base,end) intersecting
+            // this reservation (EINVAL), so the brk grow can NEVER silently adopt a racing
+            // mmap's page into the heap (double VMA ownership + double cgroup uncharge at
+            // teardown — the R172-16 bug). brk_in_progress already serializes sibling brk()s,
+            // so this window has exactly one writer. The reservation carries NO charge (charge
+            // lives in brk_pending_growth) — a pure VA placement-exclusion, so no cgroup /
+            // fork / teardown / munmap / proc-maps consumer changes. Cleared on every exit
+            // path by BrkReservation::Drop and explicitly disarmed at the clean commit.
+            mm.brk_grow_resv_lo = old_top;
+            mm.brk_grow_resv_hi = new_top;
         }
 
         // F.2 Cgroup: Charge memory before heap expansion.
@@ -8725,7 +8782,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
                 mm.record_pt_charge(&pt_frames);
             }
             // R165-1/R165-2 FIX: release the brk reservation under the commit lock.
+            // R172-16: also clear the brk-grow VA reservation here — the commit disarms
+            // brk_resv, so its Drop will NOT run; clear both fields explicitly.
             mm.brk_in_progress = false;
+            mm.brk_grow_resv_lo = 0;
+            mm.brk_grow_resv_hi = 0;
             brk_resv.armed = false;
         }
 
@@ -8915,6 +8976,307 @@ fn sys_brk(addr: usize) -> SyscallResult {
         brk_resv.armed = false;
         Ok(addr)
     }
+}
+
+/// M0-7 item7 SLICE 4: 3-phase rollback for a partially-mapped user-stack grow — a
+/// faithful mirror of the `sys_brk` grow rollback. Unmaps the pages mapped so far
+/// (reverse order), reclaims the now-empty intermediate PT/PD tables this grow built,
+/// issues the cross-CPU flush, then frees the frames. `frame_alloc` is the SAME
+/// `RecordingFrameAllocator` the grow used, so `deallocate_frame` returns DATA +
+/// reclaimed-table frames to the buddy WITHOUT perturbing the recorded `pt_frames`
+/// (which are consumed only on the Ok path). `[grow_lo, grow_lo+grow_size)` spans the
+/// whole request; `mapped_pages` is SPARSE (already-mapped pages skipped), and
+/// `prune_empty_tables_in_range`'s `table_empty()` guard leaves a table still pinned by
+/// a skipped sibling leaf untouched.
+///
+/// # Safety
+/// Must run inside `with_current_manager` (PT_LOCK held, interrupts off, current CR3).
+unsafe fn rollback_stack_grow_pages(
+    manager: &mut mm::page_table::PageTableManager,
+    frame_alloc: &mut RecordingFrameAllocator,
+    mapped_pages: &[x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>],
+    grow_lo: usize,
+    grow_size: usize,
+) {
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::VirtAddr;
+
+    let mut frames_to_free: Vec<PhysFrame> = Vec::new();
+    let _ = frames_to_free.try_reserve(mapped_pages.len());
+    for &rollback_page in mapped_pages.iter().rev() {
+        if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+            if frames_to_free.try_reserve(1).is_ok() {
+                frames_to_free.push(freed_frame);
+            } else {
+                // R158-6 FIX pattern: immediate free on tracking-Vec OOM.
+                mm::flush_current_as_page(rollback_page.start_address());
+                frame_alloc.deallocate_frame(freed_frame);
+            }
+        }
+    }
+    manager.prune_empty_tables_in_range(
+        VirtAddr::new(grow_lo as u64),
+        grow_size,
+        &mut frames_to_free,
+    );
+    if !frames_to_free.is_empty() {
+        mm::flush_current_as_range(VirtAddr::new(grow_lo as u64), grow_size);
+        for frame in frames_to_free {
+            frame_alloc.deallocate_frame(frame);
+        }
+    }
+}
+
+/// M0-7 item7 SLICE 4: the charge-correct user main-stack demand-grow PRIMITIVE.
+///
+/// Lowers the committed stack floor to `new_floor` (page-aligned), mapping
+/// `[new_floor, stack_floor_committed)` with zeroed `USER|WRITABLE|NX` pages, HARD-
+/// charging the DATA bytes to the process cgroup and SOFT-charging the page-table-frame
+/// kmem — a faithful mirror of `sys_brk` grow (RAII reservation, `RecordingFrameAllocator`
+/// DATA/PT split, 3-phase prune-on-rollback, migration-atomic `Process -> MmState`
+/// commit) BUT with the **FA-04 fix**: the grow DATA commits to `elf_charged_bytes`
+/// (the bucket teardown + `compute_cgroup_charged_bytes` + fork all read), NOT
+/// `vm_charged_bytes` (read by neither → would strand `mem_pinned>0` at exit →
+/// `delete_cgroup` fail-closed forever). See `MmState::commit_stack_grow`.
+///
+/// Process-context ONLY — it acquires blocking Process/MmState/PT/frame-allocator locks
+/// and is NOT callable from a `#PF` / IRQ context (SLICE 5 adds a deferred-charge `#PF`
+/// arm that calls this from a process-context safepoint). There is NO production caller
+/// yet: today a user `#PF` is fatal (`interrupts.rs`), so on a default process
+/// `stack_grow_floor() == stack_floor_committed` (the whole window-minus-guard is already
+/// eager-mapped) and this returns ENOMEM — it is reachable only via the imperative
+/// self-test until SLICE 5 splits the geometry.
+///
+/// Returns `Ok(())` on a committed grow; `EAGAIN` if a sibling grow holds the reservation;
+/// `ENOMEM` on a cgroup-limit reject or an allocation failure (FULLY rolled back, no
+/// charge / mapping leaked); `EINVAL` on a malformed floor (not page-aligned, not below
+/// the current floor, or no user image installed).
+pub fn try_grow_user_stack(
+    process: &Arc<spin::Mutex<crate::process::Process>>,
+    new_floor: usize,
+) -> Result<(), SyscallError> {
+    use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+    use x86_64::VirtAddr;
+
+    // ── Phase 0: validate + acquire the reservation under the entry Process lock ──
+    let proc = process.lock();
+    // Codex SLICE-4 review (current-task-only contract): the page-table work below runs
+    // through with_current_manager, which mutates the RUNNING CPU's CR3 — so a caller
+    // passing a NON-current process would map pages into the WRONG address space while
+    // charging THIS process's cgroup (a confused deputy). SLICE 5's #PF arm always passes
+    // the faulting (current) task; this HARD guard kills the class for any future caller
+    // (mirrors the exec_from_bytes current-task assertion, but fail-closed in release too).
+    if current_pid() != Some(proc.pid) {
+        return Err(SyscallError::EINVAL);
+    }
+    let cgroup_id = proc.cgroup_id;
+    let mm_arc = Arc::clone(&proc.mm);
+    let rlim_cur = proc.rlimits[crate::process::RLIMIT_STACK].rlim_cur;
+
+    let (old_floor, grow_size, mut grow_resv) = {
+        let mut mm = mm_arc.lock();
+        let old_floor = mm.stack_floor_committed;
+        // Sentinel: no user image installed yet (MmState::new) — nothing to grow.
+        if old_floor == 0 {
+            return Err(SyscallError::EINVAL);
+        }
+        // Must descend (grow is downward) to a page boundary strictly below the floor.
+        if new_floor >= old_floor || (new_floor & (PAGE_SIZE - 1)) != 0 {
+            return Err(SyscallError::EINVAL);
+        }
+        // Bound by RLIMIT_STACK clamped to the architectural window (the load-bearing
+        // min() lives in stack_grow_floor). A request past the limit is ENOMEM (Linux
+        // delivers SIGSEGV for an over-limit auto-grow; the primitive's caller — SLICE 5
+        // — maps ENOMEM to the fatal fault).
+        let grow_floor = crate::elf_loader::stack_grow_floor(rlim_cur);
+        if new_floor < grow_floor {
+            return Err(SyscallError::ENOMEM);
+        }
+        // A sibling grow on this shared MmState is mid-flight — fail-closed EAGAIN
+        // (mirror brk_in_progress; the caller retries). brk_in_progress / a mid-flight
+        // brk does not block a stack grow and vice-versa: they touch disjoint VA ranges
+        // and DISJOINT charge lanes (brk_pending_growth vs stack_grow_pending_bytes), so
+        // a single shared MmState can have at most one of each in flight without aliasing.
+        if mm.stack_grow_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+        mm.stack_grow_in_progress = true;
+        (
+            old_floor,
+            old_floor - new_floor,
+            StackGrowReservation {
+                mm: Arc::clone(&mm_arc),
+                armed: true,
+            },
+        )
+    };
+
+    // ── Phase 1: HARD-charge the grow DATA to the snapshot cgroup ──
+    // try_charge_memory enforces memory.max (rejects → ENOMEM). cgroup_id is the value
+    // snapshotted while holding `proc`; the commit re-reads proc.cgroup_id for the PT
+    // charge, and the DATA (tracked below in stack_grow_pending_bytes) telescopes via a
+    // migration's compute-transfer if one races (the sys_cgroup_attach EAGAIN gate makes
+    // the syscall path mutually exclusive; the cgroupfs path relies on the pending lane).
+    if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
+        return Err(SyscallError::ENOMEM); // grow_resv Drop clears stack_grow_in_progress
+    }
+    // Record the in-flight DATA so compute_cgroup_charged_bytes counts it while the
+    // Process lock is dropped for PT work (mirror brk_pending_growth, R144-1; saturating
+    // for a defensively-concurrent CLONE_VM sibling, though the reservation serializes).
+    {
+        let mut mm = mm_arc.lock();
+        mm.stack_grow_pending_bytes = mm.stack_grow_pending_bytes.saturating_add(grow_size as u64);
+    }
+
+    // Release the Process lock for the irreversible page-table work (lock order:
+    // MmState/PT/frame-allocator locks sit BELOW Process; holding Process across them
+    // would invert the established order — the brk-grow contract).
+    drop(proc);
+
+    // ── Phase 2: map [new_floor, old_floor) — zeroed USER|WRITABLE|NX pages ──
+    // RecordingFrameAllocator: DATA frames via allocate_data_frame (UNrecorded — stack
+    // data is not page-table kmem); intermediate PT/PD frames via the trait allocate_frame
+    // (recorded by identity for record_pt_charge). Single 3-phase rollback on any error.
+    let map_result: Result<Vec<PhysFrame<Size4KiB>>, SyscallError> = unsafe {
+        with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<Vec<PhysFrame<Size4KiB>>, SyscallError> {
+                let mut frame_alloc = RecordingFrameAllocator::new();
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+                let mut mapped_pages: Vec<Page<Size4KiB>> = Vec::new();
+
+                for offset in (0..grow_size).step_by(PAGE_SIZE) {
+                    let vaddr = VirtAddr::new((new_floor + offset) as u64);
+                    let page = Page::containing_address(vaddr);
+
+                    // Defensive skip (the lazy window should be unmapped); mirrors brk.
+                    if manager.translate_addr(vaddr).is_some() {
+                        continue;
+                    }
+
+                    // DATA frame via the inherent (UNrecorded) method.
+                    let frame = match frame_alloc.allocate_data_frame() {
+                        Some(f) => f,
+                        None => {
+                            rollback_stack_grow_pages(
+                                manager,
+                                &mut frame_alloc,
+                                &mapped_pages,
+                                new_floor,
+                                grow_size,
+                            );
+                            return Err(SyscallError::ENOMEM);
+                        }
+                    };
+
+                    // Zero the fresh frame before it becomes user-visible.
+                    let virt = mm::phys_to_virt(frame.start_address());
+                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+
+                    if manager
+                        .map_page(page, frame, flags, &mut frame_alloc)
+                        .is_err()
+                    {
+                        frame_alloc.deallocate_frame(frame);
+                        rollback_stack_grow_pages(
+                            manager,
+                            &mut frame_alloc,
+                            &mapped_pages,
+                            new_floor,
+                            grow_size,
+                        );
+                        return Err(SyscallError::ENOMEM);
+                    }
+
+                    // R158-6 FIX pattern: fallible push — unmap+free this page then roll back.
+                    if mapped_pages.try_reserve(1).is_err() {
+                        if let Ok(freed) = manager.unmap_page(page) {
+                            mm::flush_current_as_page(page.start_address());
+                            frame_alloc.deallocate_frame(freed);
+                        }
+                        rollback_stack_grow_pages(
+                            manager,
+                            &mut frame_alloc,
+                            &mapped_pages,
+                            new_floor,
+                            grow_size,
+                        );
+                        return Err(SyscallError::ENOMEM);
+                    }
+                    mapped_pages.push(page);
+                }
+                // Yield the recorded PT-frame identities for the Step-3 charge fold (every
+                // Err arm above freed its own DATA leaves + pruned+freed its own tables).
+                Ok(frame_alloc.take_pt_frames())
+            },
+        )
+    };
+
+    // ── Phase 3: commit or roll back the cgroup accounting ──
+    let pt_frames = match map_result {
+        Err(e) => {
+            // Roll back the DATA charge + the pending lane. Clear pending FIRST (so a
+            // concurrent migration cannot transfer a charge about to be rolled back),
+            // then uncharge the CURRENT cgroup_id (migration may have re-homed it during
+            // the lock-drop) — mirror brk's rollback. The PT work already freed its own
+            // DATA leaves + pruned+freed its own tables, so no PT uncharge is owed.
+            let rollback_cgroup_id = {
+                let proc = process.lock();
+                let mut mm = mm_arc.lock();
+                mm.stack_grow_pending_bytes =
+                    mm.stack_grow_pending_bytes.saturating_sub(grow_size as u64);
+                proc.cgroup_id
+            };
+            cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
+            return Err(e); // grow_resv Drop clears stack_grow_in_progress
+        }
+        Ok(frames) => frames,
+    };
+    let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
+
+    // Migration-atomic commit fold under Process -> MmState (canonical order). cgroup
+    // migration snapshots compute_cgroup_charged_bytes — which sums stack_grow_pending_bytes
+    // AND pt_charged_bytes — under the Process lock (R155-5), so charging under mm-only
+    // would race sys_cgroup_attach and strand the charge on a stale cgroup. `proc` (the
+    // entry guard) was dropped before the lock-free PT work; re-acquire a fresh Process
+    // lock — no self-deadlock (the PT work held no Process lock).
+    {
+        let proc = process.lock();
+        let mut mm = mm_arc.lock();
+        // Defense-in-depth tripwire (DEAD under the reservation): stack_grow_in_progress
+        // pins stack_floor_committed for the whole lock-dropped window — a sibling grow
+        // EAGAINs, fork EAGAINs, sys_cgroup_attach EAGAINs, exec rejects shared-VM and
+        // cannot run concurrently single-threaded. If it somehow moved we STILL COMMIT
+        // (NOT uncharge): the pages ARE mapped and the DATA IS charged, so committing keeps
+        // memory_current consistent with the live frames — the conservative, never-
+        // under-count direction (Codex SLICE-4 review: an uncharge-but-leave-mapped arm was
+        // an UNDER-count / memory.max bypass, the WRONG direction). Only the watermark could
+        // be stale, and it is consumed solely by this primitive. Mirrors brk's mm.brk==old_brk
+        // tripwire but resolves to a balanced commit rather than a stale-DATA uncharge.
+        debug_assert!(
+            mm.stack_floor_committed == old_floor,
+            "stack floor moved under reservation — impossible (stack_grow_in_progress pins it)"
+        );
+        // FA-04 commit: move the DATA from the pending lane into elf_charged_bytes +
+        // advance the watermark + clear the reservation (pure, unit-tested helper).
+        mm.commit_stack_grow(grow_size as u64, new_floor);
+        // SOFT/forced PT-frame kmem charge (the count is knowable only after map_page ran
+        // — IM-15), migration-atomic under this hold. record_pt_charge does the per-AS
+        // frame-identity ledger insert + INVARIANT-I' bookkeeping (OOM-fallback to
+        // pt_inherited_bytes). charge_memory_forced takes only CGROUP_REGISTRY + atomics
+        // (never Process/MmState), so this is deadlock-free under the held locks.
+        if pt_bytes > 0 {
+            cgroup::charge_memory_forced(proc.cgroup_id, pt_bytes);
+            mm.record_pt_charge(&pt_frames);
+        }
+        grow_resv.armed = false;
+    }
+
+    Ok(())
 }
 
 /// R171-CG1x0 FIX (M2-1 SLICE-0; hoisted to module scope by M2-1 SLICE-4a): a

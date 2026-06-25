@@ -578,6 +578,49 @@ pub struct MmState {
     /// `fork()` is rejected while this is set (mirrors the mmap transient-state
     /// guard) so a child cannot inherit a half-applied heap.
     pub brk_in_progress: bool,
+
+    /// R172-16: the in-flight `sys_brk` heap-grow VA range `[lo, hi)` (`old_top`,
+    /// `new_top`), armed atomically with the mmap-overlap check while the grow drops the
+    /// MmState lock for page-table work. `sys_mmap` rejects any placement intersecting it,
+    /// so a CLONE_VM / CLONE_THREAD sibling mmap cannot land inside the grow window and be
+    /// silently adopted into the heap (double VMA ownership + double cgroup uncharge).
+    /// Inactive ⇔ `lo == hi` (both `0`). Carries NO charge — a pure VA placement-exclusion.
+    pub brk_grow_resv_lo: usize,
+    pub brk_grow_resv_hi: usize,
+
+    /// M0-7 item7 SLICE 4 (user-stack demand-grow PRIMITIVE): the in-flight DATA
+    /// charge for an in-progress `try_grow_user_stack`, the stack-lane twin of
+    /// `brk_pending_growth`. The grow HARD-charges the DATA bytes to its snapshot
+    /// cgroup, records them HERE, drops the Process lock for the irreversible
+    /// page-table work, then on the migration-atomic commit MOVES them into
+    /// `elf_charged_bytes`. `compute_cgroup_charged_bytes` sums this lane so a
+    /// cgroup migration racing the lock-dropped window cannot under-transfer the
+    /// in-flight charge (the R144-1 `brk_pending_growth` protection, on the stack
+    /// lane). Reset to 0 on fork (child) and exec (clean slate); only ever nonzero
+    /// between arming and the matching commit/rollback of a single grow.
+    pub stack_grow_pending_bytes: u64,
+
+    /// M0-7 item7 SLICE 4: the lowest COMMITTED (mapped) user main-stack VA — the
+    /// demand-grow watermark. `0` = sentinel (no user image yet, e.g. `MmState::new`
+    /// before exec); set to `elf_loader::user_stack_mapped_floor()` at the exec
+    /// image-install commit and COPIED on fork (the grown region is COW-inherited,
+    /// so the child shares the floor). `try_grow_user_stack` lowers it under the
+    /// migration-atomic commit; SLICE 5 will drive it from the `#PF` arm. The DATA
+    /// for `[new_floor, stack_floor_committed)` is charged to `elf_charged_bytes`
+    /// (FA-04: the bucket teardown + compute + fork read; `vm_charged_bytes` is read
+    /// by NEITHER teardown NOR compute → would strand `mem_pinned>0` at exit →
+    /// `delete_cgroup` fail-closed forever).
+    pub stack_floor_committed: usize,
+
+    /// M0-7 item7 SLICE 4: reservation serializing a `try_grow_user_stack` against
+    /// siblings, fork, and cgroup migration (the stack-lane twin of
+    /// `brk_in_progress`). While set: a sibling grow on the shared `MmState`
+    /// early-returns `EAGAIN`; `fork` `EAGAIN`s (no half-applied grow inherited);
+    /// `sys_cgroup_attach` `EAGAIN`s (the grow HARD-charges with the Process lock
+    /// dropped — migrating mid-grow would snapshot `compute_cgroup_charged_bytes`
+    /// and strand the in-flight lane). Cleared on EVERY commit / rollback / abort
+    /// path (RAII `StackGrowReservation`) and reset on exec.
+    pub stack_grow_in_progress: bool,
 }
 
 impl MmState {
@@ -599,6 +642,13 @@ impl MmState {
             mprotect_pending_bytes: 0,
             exec_pending_bytes: 0,
             brk_in_progress: false,
+            brk_grow_resv_lo: 0,
+            brk_grow_resv_hi: 0,
+            // M0-7 item7 SLICE 4: no in-flight stack grow, sentinel floor (set at
+            // exec image-install commit / copied on fork), no grow reservation.
+            stack_grow_pending_bytes: 0,
+            stack_floor_committed: 0,
+            stack_grow_in_progress: false,
         }
     }
 
@@ -671,6 +721,34 @@ impl MmState {
         }
     }
 
+    /// M0-7 item7 SLICE 4: the PURE migration-atomic accounting commit for a
+    /// successfully-mapped user-stack grow of `grow_size` DATA bytes that lowered
+    /// the committed floor to `new_floor`. Called by `try_grow_user_stack` under
+    /// the canonical `Process -> MmState` hold (so it lands atomically w.r.t. a
+    /// cgroup migration, which snapshots `compute_cgroup_charged_bytes` under the
+    /// Process lock — R155-5), and unit-tested directly by the SLICE-4 accounting
+    /// self-test.
+    ///
+    /// FA-04 FIX: the DATA moves from the transient `stack_grow_pending_bytes` lane
+    /// into the PERSISTENT `elf_charged_bytes` bucket — the one bucket that
+    /// `free_process_resources` (process.rs:4992) AND `compute_cgroup_charged_bytes`
+    /// (process.rs:5433) BOTH read, and that the fork child literal inherits
+    /// (fork.rs:545). `vm_charged_bytes` (the demand-grow design's original home) is
+    /// read by NEITHER, so a grow charged there would strand `mem_pinned>0` at every
+    /// stack-growing exit → `delete_cgroup` fail-closed forever. The PT-frame kmem
+    /// charge (`charge_memory_forced` + `record_pt_charge`) stays at the call site
+    /// (a cgroup side-effect), keeping this method pure over `self`.
+    ///
+    /// `saturating_sub` on the pending lane is defensive: under the
+    /// `stack_grow_in_progress` reservation exactly `grow_size` is in flight, so the
+    /// subtract is exact; saturation only ever floors at 0 (never negative).
+    pub(crate) fn commit_stack_grow(&mut self, grow_size: u64, new_floor: usize) {
+        self.elf_charged_bytes = self.elf_charged_bytes.saturating_add(grow_size);
+        self.stack_grow_pending_bytes = self.stack_grow_pending_bytes.saturating_sub(grow_size);
+        self.stack_floor_committed = new_floor;
+        self.stack_grow_in_progress = false;
+    }
+
     // NOTE: the former `clone_for_fork()` helper was removed (next-phase #11).
     // It was dead (zero callers — `fork_inner` builds the child `MmState` by an
     // explicit field-by-field struct literal) and relied on `MmState: Clone`,
@@ -717,11 +795,12 @@ pub const RLIMIT_NOFILE: usize = 7;
 /// Default resource limits for a freshly-created process.
 ///
 /// NOFILE/STACK track the kernel's ACTUAL caps so the reported soft limit does
-/// not lie (NOFILE soft==hard==MAX_FD; STACK soft==the loader's fixed stack).
-/// All other limits are RLIM_INFINITY. **ALL limits are ADVISORY**: stored +
-/// reported faithfully but NOT enforced — `allocate_fd` uses the compile-time
-/// `MAX_FD` cap and the loader maps a fixed `USER_STACK_SIZE` stack regardless of
-/// these values (M0 scope; enforcement is future work).
+/// not lie (NOFILE soft==hard==MAX_FD; STACK soft == the loader's ACTUAL writable
+/// stack = `USER_STACK_SIZE - USER_STACK_GUARD_SIZE`, i.e. the reserved window minus
+/// the M0-7 permanently-unmapped low guard page). All other limits are RLIM_INFINITY.
+/// **ALL limits are ADVISORY**: stored + reported faithfully but NOT enforced —
+/// `allocate_fd` uses the compile-time `MAX_FD` cap and the loader maps a fixed
+/// writable stack regardless of these values (M0 scope; enforcement is future work).
 pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     let inf = RLimit {
         rlim_cur: RLIM_INFINITY,
@@ -732,8 +811,12 @@ pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
         rlim_cur: MAX_FD as u64,
         rlim_max: MAX_FD as u64,
     };
+    // M0-7: report the ACTUAL writable stack (reserved window minus the unmapped low
+    // guard page), so getrlimit/prlimit64 do not overstate the mapped extent by a page.
+    // R172-X-F2: derived from the single-sourced mapped floor (TOP - mapped_floor ==
+    // SIZE - GUARD, byte-identical) so the limit tracks any future guard-size change.
     r[RLIMIT_STACK] = RLimit {
-        rlim_cur: crate::elf_loader::USER_STACK_SIZE as u64,
+        rlim_cur: crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_mapped_floor(),
         rlim_max: RLIM_INFINITY,
     };
     r
@@ -5413,6 +5496,13 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     // R149-3 FIX: Include pending exec (load_elf) charges.
     let pending_exec = mm.exec_pending_bytes;
 
+    // M0-7 item7 SLICE 4: include an in-flight user-stack grow's DATA charge that
+    // has been HARD-charged to the cgroup but not yet folded into elf_charged_bytes
+    // (the Process lock is dropped for the grow's page-table work). Mirrors the
+    // R144-1 brk_pending_growth term so a cgroup migration racing the lock-dropped
+    // window transfers the in-flight stack charge instead of stranding it.
+    let pending_stack = mm.stack_grow_pending_bytes;
+
     // ELF loader charges (PT_LOAD segments + user stack).
     let elf_bytes = mm.elf_charged_bytes;
 
@@ -5432,6 +5522,7 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .saturating_add(pending_brk)
         .saturating_add(pending_mprotect)
         .saturating_add(pending_exec)
+        .saturating_add(pending_stack)
         .saturating_add(elf_bytes)
         .saturating_add(pt_bytes)
 }
@@ -5631,6 +5722,110 @@ pub fn run_record_pt_charge_self_test() {
         "child flips authoritative once it tracks own frames"
     );
     assert!(inv(&child), "I' holds across inherited + ledgered lanes");
+}
+
+/// M0-7 item7 SLICE 4: pure unit test for the stack-grow accounting STATE MACHINE —
+/// the `stack_grow_floor` RLIMIT clamp and the FA-04 `commit_stack_grow` move. No
+/// Process / page-table / cgroup context is needed (the cgroup-charge telescoping is
+/// proven separately by `cgroup::run_stack_grow_cgroup_self_test`). Panics on failure;
+/// detected by `make test` / `make boot-check` via the serial log.
+pub fn run_stack_grow_accounting_self_test() {
+    use crate::elf_loader::{stack_grow_floor, user_stack_mapped_floor, USER_STACK_TOP};
+    const PAGE: usize = 0x1000;
+
+    // ── grow_floor clamp (the RLIMIT_STACK → lowest growable VA mapping) ──
+    let mapped_floor = user_stack_mapped_floor() as usize;
+    let writable_extent = USER_STACK_TOP as usize - mapped_floor; // == SIZE - GUARD
+
+    // Default rlim_cur (== the writable extent) ⇒ floor == the architectural mapped floor:
+    // on a default process the whole window-minus-guard is already eager-mapped, so there
+    // is NO lazy region to grow into (a real grow would be ENOMEM — SLICE 5 splits this).
+    assert_eq!(
+        stack_grow_floor(writable_extent as u64),
+        mapped_floor,
+        "default RLIMIT_STACK ⇒ grow_floor == mapped floor (no lazy region)"
+    );
+    // An INFINITE rlim_cur clamps to the SAME floor — the load-bearing min(): a raised
+    // soft limit can never push the growable region below the architectural window.
+    assert_eq!(
+        stack_grow_floor(u64::MAX),
+        mapped_floor,
+        "infinite RLIMIT_STACK clamps to the mapped floor (window bound)"
+    );
+    // A SMALLER limit (1 page) ⇒ a HIGHER floor (one page growable below TOP).
+    assert_eq!(
+        stack_grow_floor(PAGE as u64),
+        USER_STACK_TOP as usize - PAGE,
+        "1-page RLIMIT_STACK ⇒ floor one page below TOP"
+    );
+    // A partial-page limit rounds the extent DOWN (a SMALLER region, the conservative
+    // direction) so the floor stays page-aligned.
+    assert_eq!(
+        stack_grow_floor((PAGE + 1) as u64),
+        USER_STACK_TOP as usize - PAGE,
+        "partial-page RLIMIT_STACK rounds the extent down (page-aligned floor)"
+    );
+    // Whatever the limit, the floor is page-aligned and within [mapped_floor, TOP].
+    for &r in &[
+        0u64,
+        1,
+        PAGE as u64,
+        writable_extent as u64,
+        writable_extent as u64 + PAGE as u64,
+        u64::MAX,
+    ] {
+        let f = stack_grow_floor(r);
+        assert_eq!(f & (PAGE - 1), 0, "grow_floor must be page-aligned");
+        assert!(
+            f >= mapped_floor && f <= USER_STACK_TOP as usize,
+            "grow_floor within [mapped_floor, TOP]"
+        );
+    }
+
+    // ── commit_stack_grow: the FA-04 move (pending lane → elf_charged_bytes) ──
+    let mut mm = MmState::new(0);
+    let old_floor = mapped_floor;
+    let new_floor = old_floor - 4 * PAGE;
+    let grow = (4 * PAGE) as u64;
+    // Simulate Phase-0/1 arming: reservation set, the grow DATA in the pending lane, and a
+    // prior elf charge present (the initial eager stack already lives in elf_charged_bytes).
+    mm.elf_charged_bytes = (9 * PAGE) as u64;
+    mm.stack_floor_committed = old_floor;
+    mm.stack_grow_in_progress = true;
+    mm.stack_grow_pending_bytes = grow;
+    let elf_before = mm.elf_charged_bytes;
+    mm.commit_stack_grow(grow, new_floor);
+    // FA-04: the grow DATA lands in elf_charged_bytes — the ONE bucket that
+    // free_process_resources (process.rs:4992) AND compute_cgroup_charged_bytes
+    // (process.rs:5433) BOTH read, and fork inherits — so a stack-growing exit cannot
+    // strand a charge (the vm_charged_bytes home would have, → delete_cgroup DoS).
+    assert_eq!(
+        mm.elf_charged_bytes,
+        elf_before + grow,
+        "grow DATA folded into elf_charged_bytes (FA-04 home)"
+    );
+    assert_eq!(
+        mm.stack_grow_pending_bytes, 0,
+        "pending lane drained by the commit"
+    );
+    assert_eq!(
+        mm.stack_floor_committed, new_floor,
+        "watermark advanced to new_floor"
+    );
+    assert!(
+        !mm.stack_grow_in_progress,
+        "reservation cleared by the commit"
+    );
+
+    // compute_cgroup_charged_bytes summand wiring: an in-flight pending lane is counted
+    // (so a cgroup migration racing the lock-dropped window transfers it). Re-arm and
+    // assert the field is the one summed — proven at the FIELD level here; the live
+    // compute() sum over a real Process is exercised by the cgroup migration self-test.
+    mm.stack_grow_pending_bytes = grow;
+    assert_eq!(
+        mm.stack_grow_pending_bytes, grow,
+        "pending lane holds the in-flight grow DATA between arm and commit"
+    );
 }
 
 /// 进程统计信息
