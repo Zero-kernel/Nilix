@@ -57,15 +57,32 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
-    /// Rename an entry
+    /// Rename an entry. `noreplace` (M0-6 slice 2, from renameat2 RENAME_NOREPLACE) makes
+    /// an existing destination an error (EEXIST) instead of being overwritten.
+    /// `expected_src_ino` / `expected_dest_ino` bind the caller's DAC/sticky/LSM decision to
+    /// the inode actually moved: the fs MUST verify (under its rename lock) that the source
+    /// name still maps to `expected_src_ino` and the destination still matches
+    /// `expected_dest_ino` (same inode if Some, absent if None), else fail closed.
+    #[allow(clippy::too_many_arguments)]
     fn rename(
         &self,
         old_parent: &Arc<dyn Inode>,
         old_name: &str,
         new_parent: &Arc<dyn Inode>,
         new_name: &str,
+        noreplace: bool,
+        expected_src_ino: u64,
+        expected_dest_ino: Option<u64>,
     ) -> Result<(), FsError> {
-        let _ = (old_parent, old_name, new_parent, new_name);
+        let _ = (
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            noreplace,
+            expected_src_ino,
+            expected_dest_ino,
+        );
         Err(FsError::NotSupported)
     }
 

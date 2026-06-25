@@ -3929,6 +3929,118 @@ pub fn run_cgroup_pt_kmem_self_test() {
     let _ = delete_cgroup(a_id);
 }
 
+/// M0-7 item7 SLICE 4: matched-sequence telescoping self-test for the user-stack
+/// demand-grow charge lane — the cgroup-level proof that `try_grow_user_stack`'s
+/// accounting leaves NO stranded `mem_pinned` (the FA-04 failure mode: a grow charged
+/// to a bucket teardown/compute never read would strand `mem_pinned>0` at exit and wedge
+/// `delete_cgroup` forever).
+///
+/// The grow primitive HARD-charges the grow DATA (`try_charge_memory`, committed into
+/// `elf_charged_bytes`) and SOFT-charges the page-table-frame kmem (`charge_memory_forced`
+/// + `record_pt_charge`); a process exit uncharges BOTH lanes via `uncharge_memory` (the
+/// DATA via the `elf_charged_bytes` teardown leg at `free_process_resources:4992`). This
+/// drives those EXACT primitives over the grow → migrate → exit → rollback lifecycle and
+/// asserts the origin-keyed pin telescopes to 0 with `MEM_UNPIN_UNDERFLOW == 0` (a SOUND
+/// witness — Σunpin == Σpin — not a saturating-floored one). Panics on failure.
+pub fn run_stack_grow_cgroup_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // Clear the process-wide over-uncharge tripwire so the matched sequences below PROVE
+    // Σunpin == Σpin (tripwire stays 0), not merely Σunpin >= Σpin.
+    let _ = mem_unpin_underflow_take();
+
+    // A(memory.max=256 pages) ⊃ B(leaf), sibling C — all fresh, task-less.
+    let a = create_cgroup(0, CgroupControllers::MEMORY).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits {
+        memory_max: Some(256 * PAGE),
+        ..Default::default()
+    })
+    .expect("set A.memory.max");
+    let b = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create B");
+    let b_id = b.id();
+    let c = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create C");
+    let c_id = c.id();
+
+    // A grow of 4 DATA pages whose page-table materialization pulled 1 PT-frame page.
+    const DATA: u64 = 4 * PAGE;
+    const PT: u64 = PAGE;
+
+    // 1) GROW: HARD DATA charge (try_charge_memory — committed into elf_charged_bytes by
+    //    commit_stack_grow) + SOFT PT charge (charge_memory_forced). Both lanes pin B's
+    //    origin and propagate the display counter to the ancestor A.
+    try_charge_memory(b_id, DATA).expect("grow: HARD DATA charge within memory.max");
+    charge_memory_forced(b_id, PT);
+    assert_eq!(mem(&b), DATA + PT, "B after grow DATA+PT charge");
+    assert_eq!(mem(&a), DATA + PT, "A (ancestor) after grow under B");
+    assert_eq!(pin(&b), DATA + PT, "B mem_pinned after grow (origin-keyed)");
+    assert_eq!(
+        pin(&a),
+        0,
+        "A mem_pinned stays 0 (origin-keyed, not hierarchical)"
+    );
+
+    // 2) MIGRATE B→C (compute_cgroup_charged_bytes path): the grown footprint moves with
+    //    the task. B drains to 0; C gains DATA+PT; shared ancestor A nets unchanged.
+    migrate_memory_charges(DATA + PT, b_id, c_id).expect("migrate grown footprint B→C");
+    assert_eq!(mem(&b), 0, "B drained after migrate");
+    assert_eq!(mem(&c), DATA + PT, "C charged after migrate");
+    assert_eq!(mem(&a), DATA + PT, "A net unchanged by sibling migrate");
+    assert_eq!(
+        pin(&b),
+        0,
+        "B mem_pinned drained to 0 by migrate source-unpin"
+    );
+    assert_eq!(
+        pin(&c),
+        DATA + PT,
+        "C mem_pinned gained by migrate dest-pin"
+    );
+
+    // 3) EXIT/TEARDOWN: last-exit uncharges BOTH lanes — the DATA via the elf_charged_bytes
+    //    teardown leg, the PT via free_process_resources' pt leg. Both route through
+    //    uncharge_memory; the pin telescopes to EXACTLY 0 (FA-04 closed: no stranded pin).
+    uncharge_memory(c_id, DATA); // elf_charged_bytes teardown uncharge
+    uncharge_memory(c_id, PT); // pt teardown uncharge
+    assert_eq!(mem(&c), 0, "C drained after exit uncharge");
+    assert_eq!(mem(&a), 0, "A drained after C exit uncharge");
+    assert_eq!(
+        pin(&c),
+        0,
+        "C mem_pinned telescopes to 0 after exit — the FA-04 property: a stack-growing \
+         exit strands NO pin, so delete_cgroup stays openable"
+    );
+
+    // 4) ROLLBACK (map-failure / ENOMEM after the DATA charge): the grow charged DATA then
+    //    its error arm uncharged it to the CURRENT cgroup — a matched +DATA/-DATA pair that
+    //    must telescope with no residual pin.
+    try_charge_memory(b_id, DATA).expect("rollback: provisional DATA charge");
+    assert_eq!(
+        pin(&b),
+        DATA,
+        "B pinned by the provisional grow DATA charge"
+    );
+    uncharge_memory(b_id, DATA); // map-fail rollback uncharge
+    assert_eq!(mem(&b), 0, "B drained after rollback uncharge");
+    assert_eq!(pin(&b), 0, "B mem_pinned telescopes to 0 after rollback");
+
+    // PROOF CHECKPOINT: every step above was a MATCHED charge/uncharge sequence, so if the
+    // grow lane truly telescopes NO unpin ever clamped at the floor ⇒ the tripwire reads 0.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "M0-7 SLICE 4: the stack-grow charge lane telescopes WITHOUT any saturating \
+         over-uncharge — mem_pinned==0 is a SOUND witness (no FA-04 strand)",
+    );
+
+    // Cleanup: delete children before parents (no tasks attached).
+    let _ = delete_cgroup(b_id);
+    let _ = delete_cgroup(c_id);
+    let _ = delete_cgroup(a_id);
+}
+
 /// M2-1 SLICE-2 (co-residency GAP closure): in-kernel self-test that the
 /// origin-keyed `mem_pinned` aggregate is PER-PROCESS-EXACT under MULTI-PROCESS
 /// CO-RESIDENCY, and that the saturating-unpin floor NEVER fires when ONE of N

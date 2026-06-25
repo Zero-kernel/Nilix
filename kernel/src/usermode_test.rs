@@ -414,6 +414,13 @@ pub fn run_usermode_test() -> bool {
         // M0 #1: the entry RSP is the auxv-stack pointer from the builder, not the
         // loader's raw stack top (which carries no argc/argv/envp/auxv).
         proc.user_stack = Some(x86_64::VirtAddr::new(stack_layout.rsp));
+        // M0-7 item7 SLICE 4 (Codex review): seed the demand-grow watermark exactly like
+        // the exec image-install commit (syscall.rs). The eager stack is mapped down to the
+        // architectural mapped floor; without this the boot Ring-3 diagnostic / musl-gate
+        // process keeps the MmState::new sentinel (0) and a future SLICE-5 grow would EINVAL.
+        // Process -> MmState lock order (proc held).
+        proc.mm.lock().stack_floor_committed =
+            kernel_core::elf_loader::user_stack_mapped_floor() as usize;
 
         // Set up context for Ring 3 execution
         proc.context.rip = load_result.entry;

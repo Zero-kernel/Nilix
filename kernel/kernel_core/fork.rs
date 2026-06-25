@@ -316,6 +316,15 @@ fn fork_inner(
         if parent_mm.brk_in_progress {
             return Err(ForkError::MmapTransientState);
         }
+        // M0-7 item7 SLICE 4: a sibling thread mid `try_grow_user_stack` has dropped the
+        // MmState lock for page-table work, so the parent's stack page tables and
+        // stack_floor_committed watermark may be momentarily inconsistent (and an
+        // in-flight DATA charge sits in stack_grow_pending_bytes, which fork's custom
+        // inherited-charge sum at :222 reads elf_charged_bytes — NOT the pending lane —
+        // and would miss). Same hazard as the brk/mmap guards above. Fail-closed EAGAIN.
+        if parent_mm.stack_grow_in_progress {
+            return Err(ForkError::MmapTransientState);
+        }
     }
 
     if let Some(child_process) = get_process(child_pid) {
@@ -569,6 +578,21 @@ fn fork_inner(
                 // R165-1 FIX: child starts with no brk reservation (fork is
                 // rejected above while a brk is in flight).
                 brk_in_progress: false,
+                // R172-16: child inherits no brk-grow VA reservation — fork EAGAINs while
+                // brk_in_progress, so this path is never reached mid-grow; zero defensively.
+                brk_grow_resv_lo: 0,
+                brk_grow_resv_hi: 0,
+                // M0-7 item7 SLICE 4: the child inherits no in-flight stack grow nor its
+                // reservation — fork EAGAINs while stack_grow_in_progress, so this path is
+                // never reached mid-grow; zero defensively. The COMMITTED watermark IS
+                // copied: the grown stack region is COW-inherited (this is an independent
+                // address space built by copying the parent's page tables), so the child's
+                // committed floor matches the parent's, and the inherited grow DATA already
+                // rides in elf_charged_bytes (copied above + charged to the parent cgroup
+                // via fork_charge_bytes), so the child's last-exit uncharges it symmetrically.
+                stack_grow_pending_bytes: 0,
+                stack_floor_committed: parent_mm.stack_floor_committed,
+                stack_grow_in_progress: false,
             };
             child.mm = Arc::new(Mutex::new(child_mm));
         }

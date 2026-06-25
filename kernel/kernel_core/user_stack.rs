@@ -32,7 +32,7 @@
 //! new page allocation — the auxv/strings live inside the 2 MiB user stack that
 //! `elf_loader::load_elf` already mapped and charged.
 
-use crate::elf_loader::{ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
+use crate::elf_loader::{ElfLoadResult, USER_STACK_GUARD_SIZE, USER_STACK_SIZE, USER_STACK_TOP};
 use crate::syscall::SyscallError;
 use alloc::vec::Vec;
 
@@ -141,13 +141,16 @@ fn compute_layout(
     creds: &StackCreds,
     execfn: &[u8],
 ) -> Result<LayoutPlan, SyscallError> {
-    // True mapped stack floor: load_elf maps [USER_STACK_TOP - USER_STACK_SIZE,
-    // USER_STACK_TOP + PAGE). Derive the floor from the architectural constant, NOT
-    // from `user_stack_top` (which is pre-biased by -16) — the latter would be 16
-    // bytes too low and let a string underflow into unmapped memory.
-    let stack_base = USER_STACK_TOP
-        .checked_sub(USER_STACK_SIZE as u64)
-        .ok_or(SyscallError::EFAULT)?;
+    // True mapped stack floor (M0-7): the loader eagerly maps
+    // [USER_STACK_TOP - USER_STACK_SIZE + USER_STACK_GUARD_SIZE, USER_STACK_TOP) — the
+    // reserved window MINUS the one permanently-unmapped low guard page. R172-X-F2:
+    // single-sourced via `user_stack_mapped_floor()` (NOT from `user_stack_top`, which is
+    // pre-biased by -16) so no string/pointer can underflow into the guard or unmapped
+    // memory, and a guard-size change updates this and every other consumer at once. The
+    // helper is an infallible const fn (window_start + GUARD, no underflow), so the prior
+    // `checked_sub().ok_or(EFAULT)?` is dead and dropped. Despite the name, `stack_base`
+    // here is the lowest MAPPED VA (== guard_top).
+    let stack_base = crate::elf_loader::user_stack_mapped_floor();
 
     // The writable ceiling for the string area is `user_stack_top` (= USER_STACK_TOP
     // - 16). All writes land in [buf_base, user_stack_top); the highest written byte
@@ -467,7 +470,8 @@ fn selftest_alignment_sweep() {
 fn selftest_auxv_value_whitelist() {
     let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
     let ust = USER_STACK_TOP - 16;
-    let stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
+    // M0-7: lowest MAPPED stack VA = guard_top (window minus the unmapped low guard page).
+    let stack_base = USER_STACK_TOP - (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) as u64;
     let creds = StackCreds {
         uid: 7,
         euid: 7,
@@ -610,9 +614,68 @@ fn selftest_layout_contiguity() {
     }
 }
 
+/// Test 4 (M0-7) — the builder floor is the guard_top (lowest MAPPED VA), so no
+/// string/pointer can land in the permanently-unmapped low guard page. This is the
+/// mechanical tripwire that catches a forgotten floor-raise (which would otherwise let
+/// the bulk `copy_to_user` fault into the guard at exec).
+fn selftest_guard_floor() {
+    let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
+    let creds = StackCreds {
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        at_secure: false,
+    };
+    let stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64; // architectural window base
+    let guard_top = stack_base + USER_STACK_GUARD_SIZE as u64; // lowest MAPPED VA
+    let argv = synth_args(1);
+    let envp = synth_args(0); // empty
+                              // (a) With user_stack_top == guard_top, ANY non-empty layout drives buf_base into
+                              // [stack_base, guard_top) — the guard page — so a floor of guard_top MUST reject it
+                              // with E2BIG (the exact floor-underflow errno, NOT just any error). If the floor were
+                              // wrongly left at the architectural stack_base this would succeed — the regression
+                              // this pins.
+    assert!(
+        matches!(
+            compute_layout(
+                entry,
+                guard_top,
+                entry + 0x2000,
+                56,
+                10,
+                &argv,
+                &envp,
+                &creds,
+                b"/x"
+            ),
+            Err(SyscallError::E2BIG)
+        ),
+        "a layout bottoming into the guard page must be rejected with E2BIG (floor must be guard_top)"
+    );
+    // (b) One page higher, the same small layout fits with buf_base at/above guard_top.
+    let plan = compute_layout(
+        entry,
+        guard_top + USER_STACK_GUARD_SIZE as u64,
+        entry + 0x2000,
+        56,
+        10,
+        &argv,
+        &envp,
+        &creds,
+        b"/x",
+    )
+    .expect("a layout one page above the guard must fit");
+    assert!(
+        plan.buf_base >= guard_top,
+        "buf_base must never be below the lowest mapped page (guard_top)"
+    );
+}
+
 /// Run all initial-user-stack-builder self-tests. Any failure panics.
 pub fn run_user_stack_builder_self_test() {
     selftest_alignment_sweep();
     selftest_auxv_value_whitelist();
     selftest_layout_contiguity();
+    selftest_guard_floor();
 }

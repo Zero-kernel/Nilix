@@ -636,7 +636,14 @@ pub fn hook_task_fork(parent: &ProcessCtx, child: &ProcessCtx) -> LsmResult {
     }
 }
 
-/// Hook: process exec.
+/// Hook: process exec (content-keyed). `path_hash` is the exec'd image's CONTENT hash.
+///
+/// R172-X-F5: this fires for BOTH file-backed exec (execve, AFTER the `read_file_for_exec`
+/// file-object DAC/MAC gate) AND anonymous self-exec (spawn_image(517), which has no file
+/// object). It is therefore the ONLY content-keyed exec-deny seam shared by both paths, and
+/// the correct anchor for any future anon-vs-file exec policy (e.g. a W^X-anonymous-exec /
+/// no-anon-exec rule) — which must key off this content hash rather than fabricate a
+/// file-object check on the objectless spawn_image path.
 #[inline]
 pub fn hook_task_exec(task: &ProcessCtx, path_hash: u64) -> LsmResult {
     #[cfg(feature = "lsm")]

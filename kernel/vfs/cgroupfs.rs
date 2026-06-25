@@ -346,7 +346,10 @@ impl FileSystem for CgroupFs {
         // Delete the cgroup
         match cgroup::delete_cgroup(child_id) {
             Ok(()) => Ok(()),
-            Err(CgroupError::NotEmpty) => Err(FsError::NotEmpty),
+            // M0-6 slice 2: cgroup rmdir of a non-empty cgroup is EBUSY in Linux (NOT
+            // ENOTEMPTY). Map via FsError::Busy so the global FsError::NotEmpty=>ENOTEMPTY
+            // errno-fidelity fix (for real-fs rmdir/rename) does not mis-report cgroup rmdir.
+            Err(CgroupError::NotEmpty) => Err(FsError::Busy),
             Err(CgroupError::NotFound) => Err(FsError::NotFound),
             Err(CgroupError::PermissionDenied) => Err(FsError::PermDenied),
             Err(_) => Err(FsError::Invalid),

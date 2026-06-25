@@ -730,6 +730,7 @@ pub fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
         SYSCALL_PERCPU[cpu_id].pending_gs_base = gs_base;
     }
 }
+
 /// M0 item 5: MUTABLE access to the current syscall frame, for signal-handler
 /// delivery (it redirects RIP/RSP/args to the handler).
 ///

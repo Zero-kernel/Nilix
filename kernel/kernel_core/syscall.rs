@@ -429,7 +429,16 @@ fn stdin_prepare_to_wait() -> bool {
         // 将进程状态设为阻塞
         if let Some(proc_arc) = get_process(pid) {
             let mut proc = proc_arc.lock();
-            proc.state = ProcessState::Blocked;
+            // R172-12 FIX: close the gate->commit lost-wakeup window — do NOT publish Blocked
+            // if a kill/handler-signal raced in under the proc lock the wakers take (the bare
+            // state-flip wake fires only on state==Blocked, so it would be lost). Leaving the
+            // task Running makes stdin_finish_wait's HLT loop recheck wait_should_abort /
+            // has_deliverable_signal on its first iteration and return EINTR. Keeping the
+            // `true` return preserves the EOF/EINTR distinction at the caller (a `false`
+            // return is EOF, not EINTR — RISK-1).
+            if !crate::signal::should_abort_pending_block(&proc) {
+                proc.state = ProcessState::Blocked;
+            }
         }
     });
 
@@ -940,6 +949,18 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 );
                 proc.socket_timeout_marker
                     .store(0, core::sync::atomic::Ordering::Relaxed);
+                // R172-12 FIX: recheck kill/signal UNDER the proc lock before publishing
+                // Blocked (the data double-check at :928 ran, but not a kill/signal recheck).
+                // On a raced-in kill/handler-signal the bare state-flip wake would be lost; an
+                // UNTIMED socket recv/accept then has no backstop -> permanent strand. Bail
+                // with Interrupted (mapped to EINTR at the recv/accept callers); remove our
+                // waiter (exact gen) below, after dropping the proc lock (waiters is the outer
+                // lock). Born-clean marker means no socket_timeout_marker cleanup is owed.
+                if crate::signal::should_abort_pending_block(&proc) {
+                    drop(proc);
+                    waiters.remove_waiter(queue_addr, pid, Some(my_gen));
+                    return (my_gen, Some(net::WaitOutcome::Interrupted));
+                }
                 proc.state = ProcessState::Blocked;
             }
             (my_gen, None)
@@ -1326,36 +1347,38 @@ pub enum SyscallNumber {
 #[repr(i64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallError {
-    Success = 0,     // 成功
-    EPERM = -1,      // 操作不允许
-    ENOENT = -2,     // 文件或目录不存在
-    ESRCH = -3,      // 进程不存在
-    EINTR = -4,      // 系统调用被中断
-    EIO = -5,        // I/O错误
-    ENXIO = -6,      // 设备不存在
-    E2BIG = -7,      // 参数列表过长
-    ENOEXEC = -8,    // 执行格式错误
-    EBADF = -9,      // 文件描述符错误
-    ECHILD = -10,    // 没有子进程
-    EAGAIN = -11,    // 资源暂时不可用
-    ENOMEM = -12,    // 内存不足
-    EACCES = -13,    // 权限不足
-    EFAULT = -14,    // 地址错误
-    EBUSY = -16,     // 设备或资源忙
-    EEXIST = -17,    // 文件已存在
-    EXDEV = -18,     // 跨设备链接 (cross-device link)
-    ENOTDIR = -20,   // 不是目录
-    EISDIR = -21,    // 是目录
-    EINVAL = -22,    // 无效参数
-    ENFILE = -23,    // 系统打开文件过多
-    EMFILE = -24,    // 进程打开文件过多
-    ENOTTY = -25,    // 不是终端设备
-    EPIPE = -32,     // 管道破裂
-    ERANGE = -34,    // 结果超出范围
-    ENOSYS = -38,    // 功能未实现
-    ENOTEMPTY = -39, // 目录非空
-    ELOOP = -40,     // 符号链接过多或禁止符号链接
-    ENOSPC = -28,    // 设备无空间 (no space left on device)
+    Success = 0,        // 成功
+    EPERM = -1,         // 操作不允许
+    ENOENT = -2,        // 文件或目录不存在
+    ESRCH = -3,         // 进程不存在
+    EINTR = -4,         // 系统调用被中断
+    EIO = -5,           // I/O错误
+    ENXIO = -6,         // 设备不存在
+    E2BIG = -7,         // 参数列表过长
+    ENOEXEC = -8,       // 执行格式错误
+    EBADF = -9,         // 文件描述符错误
+    ECHILD = -10,       // 没有子进程
+    EAGAIN = -11,       // 资源暂时不可用
+    ENOMEM = -12,       // 内存不足
+    EACCES = -13,       // 权限不足
+    EFAULT = -14,       // 地址错误
+    EBUSY = -16,        // 设备或资源忙
+    EEXIST = -17,       // 文件已存在
+    EXDEV = -18,        // 跨设备链接 (cross-device link)
+    ENOTDIR = -20,      // 不是目录
+    EISDIR = -21,       // 是目录
+    EINVAL = -22,       // 无效参数
+    ENFILE = -23,       // 系统打开文件过多
+    EMFILE = -24,       // 进程打开文件过多
+    ENOTTY = -25,       // 不是终端设备
+    EPIPE = -32,        // 管道破裂
+    ERANGE = -34,       // 结果超出范围
+    ENOSYS = -38,       // 功能未实现
+    ENOTEMPTY = -39,    // 目录非空
+    ELOOP = -40,        // 符号链接过多或禁止符号链接
+    ENOSPC = -28,       // 设备无空间 (no space left on device)
+    EROFS = -30,        // 只读文件系统 (read-only filesystem)
+    ENAMETOOLONG = -36, // 文件名过长 (filename too long)
     // Socket-related errors (Linux ABI)
     ENOTSOCK = -88,        // 套接字操作目标不是套接字
     EDESTADDRREQ = -89,    // 需要目标地址
@@ -1478,6 +1501,10 @@ const SYSCALL_FRAME_BYTES: usize = core::mem::size_of::<SyscallFrame>();
 pub type GetSyscallFrameMutCallback = fn(expected_pid: u64) -> Option<*mut SyscallFrame>;
 /// Callback (registered by arch): record the PID owning the current frame.
 pub type SetFrameOwnerCallback = fn(pid: u64);
+/// Callback (registered by arch): read this CPU's raw `(frame_ptr, owner_pid)` binding.
+pub type GetFrameBindingCallback = fn() -> (u64, u64);
+/// Callback (registered by arch): write this CPU's raw `(frame_ptr, owner_pid)` binding.
+pub type SetFrameBindingCallback = fn(frame_ptr: u64, owner_pid: u64);
 
 // LOCK-FREE callback storage. `set_syscall_frame_owner` runs on EVERY syscall entry,
 // so a `Mutex` here would be per-syscall global contention under SMP. The callbacks
@@ -2323,6 +2350,9 @@ fn cap_error_to_syscall(err: cap::CapError) -> SyscallError {
         cap::CapError::InsufficientRights => SyscallError::EPERM,
         cap::CapError::InvalidOperation => SyscallError::EINVAL,
         cap::CapError::NoCurrentProcess => SyscallError::ESRCH,
+        // R172-06: table-grow OOM is memory pressure (ENOMEM), distinct from the EMFILE
+        // MAX_CAP_SLOTS ceiling.
+        cap::CapError::OutOfMemory => SyscallError::ENOMEM,
     }
 }
 
@@ -4619,6 +4649,16 @@ fn sys_clone(
 /// it switches the running CPU's CR3 (`activate_memory_space`) and reads the
 /// current LSM context (`lsm_current_process_ctx`). `process` MUST be the `Arc`
 /// of the running task; a non-current process would corrupt the live CR3.
+///
+/// R172-X-F5: the two front-ends differ in OBJECT-NESS — execve(59) has a FILE (so the
+/// file-object DAC/MAC live in `read_file_for_exec`, manager.rs), spawn_image(517) has NONE
+/// (anonymous caller-owned bytes). The `hook_task_exec(bin_hash)` call below is the SINGLE
+/// shared content-keyed exec-deny seam covering BOTH paths. A future W^X-anonymous-exec /
+/// no-anon-exec LSM policy MUST key off that existing content hook (it already receives the
+/// anon bytes' hash) — never fabricate a file-object check on the spawn_image path, and
+/// never add a divergent second exec-deny seam. If a dedicated discriminator is ever
+/// required, the correct shape is an EXPLICIT default-ALLOW anon-exec policy seam, NOT a
+/// fail-open VFS file-gate.
 fn exec_from_bytes(
     process: Arc<spin::Mutex<crate::process::Process>>,
     elf_data: Vec<u8>,
@@ -5131,6 +5171,20 @@ fn exec_from_bytes(
         proc.fs_base = 0;
         proc.gs_base = 0;
 
+        // R172-04 W4: exec must reset the SYSRET-epilogue staged pair AND the LIVE MSRs to
+        // 0 as well — not just the PCB. The dispatcher tail runs reschedule_if_needed, so:
+        // (a) on the no-switch return, the epilogue would otherwise commit the STALE
+        // switch-in pending pair (the pre-exec FS/GS); and (b) on a pre-SYSRET switch, the
+        // unconditional switch-out save would read the STALE live MSRs back into the PCB,
+        // resurrecting the pre-exec TLS. Writing all three (PCB above + pending + live MSR)
+        // closes both. Runs in the exec'ing task's own syscall context (its own CPU).
+        stage_pending_tls_bases(0, 0);
+        unsafe {
+            use x86_64::registers::model_specific::Msr;
+            Msr::new(0xC000_0100u32).write(0); // IA32_FS_BASE
+            Msr::new(0xC000_0102u32).write(0); // IA32_KERNEL_GS_BASE (user GS via SWAPGS)
+        }
+
         // OpenBSD Pledge 语义：exec 后应用 exec_promises
         // 如果进程设置了 exec_promises，则在 exec 成功后将其替换为当前 promises
         // 这允许进程在 exec 前声明一组更宽松的权限（用于加载程序），
@@ -5440,6 +5494,19 @@ fn reconstruct_argv(
 /// passes an in-memory ELF image; a real path-based program uses `execve`(59).
 /// `arg0` is ALWAYS an image pointer here (never a path) — the confused-deputy
 /// is gone because the type is fixed per syscall number.
+///
+/// R172-X-F5 SECURITY INVARIANT — ANONYMOUS self-exec: 517 copies the CALLER's OWN bytes
+/// into the CALLER's OWN address space under the CALLER's OWN creds. There is NO file, no
+/// inode, no DAC object, no pathname, and NO privilege boundary crossed. The VFS exec gate
+/// `read_file_for_exec` (manager.rs — hook_file_open inode/mode/path-hash MAC + DAC
+/// need_exec) does NOT and MUST NOT apply: there is no object to check, and a path lookup on
+/// fabricated bytes is meaningless. DO NOT "fix" this asymmetry by routing spawn_image
+/// through a VFS file-gate — that would either fail-closed (bricking the musl-check /
+/// usermode_test boot path) or require a fabricated fake inode (a worse, fail-open design).
+/// The exec coverage that DOES apply here: the content-keyed exec MAC `hook_task_exec`
+/// (bin_hash, inside `exec_from_bytes`) + the unbypassable EBUSY multithread / CLONE_VM
+/// share-count gates. A future W^X-anonymous-exec / no-anon-exec LSM policy MUST key off
+/// that existing content hook, NOT a fabricated file check.
 fn sys_spawn_image(
     image: *const u8,
     image_len: usize,
@@ -5524,17 +5591,37 @@ fn sys_execve(
     // address space, so a mid-chain error (ENOENT/EACCES/ELOOP/parse) returns to
     // the caller with its image INTACT (Linux semantics). exec_from_bytes — the
     // point of no return — is reached EXACTLY ONCE, at the leaf.
+    // R172-P6-F5: resolve the shebang chain via the extracted, boot-testable helper. The
+    // point of no return (exec_from_bytes) stays the caller's job here, reached EXACTLY ONCE
+    // at the leaf — so the PONR-once-at-leaf discipline is unchanged.
+    let (elf_bytes, cur_argv) = resolve_exec_chain(orig_path, argv_vec, exec_read_file)?;
+
+    exec_from_bytes(process, elf_bytes, cur_argv, envp_vec, execfn)
+}
+
+/// R172-P6-F5: resolve the `#!` shebang interpreter chain to the FINAL image bytes + the
+/// rebuilt argv, BEFORE any address-space mutation, so a mid-chain error
+/// (ENOENT/EACCES/ELOOP/parse) returns with the caller's image INTACT. Parameterized by a
+/// `read` callback so the depth-cap (`MAX_SHEBANG_DEPTH` -> ELOOP) and argv-threading logic —
+/// which a green boot cannot exercise — is unit-testable with a mock path->bytes map. The
+/// PONR (`exec_from_bytes`) is the SOLE caller's job AFTER this returns, kept out of the loop
+/// so the point of no return stays exactly-once-at-the-leaf.
+fn resolve_exec_chain<F: FnMut(&str) -> Result<Vec<u8>, SyscallError>>(
+    orig_path: alloc::string::String,
+    orig_argv: Vec<Vec<u8>>,
+    mut read: F,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), SyscallError> {
     let mut cur_path = orig_path;
-    let mut cur_argv = argv_vec;
+    let mut cur_argv = orig_argv;
     let mut depth: usize = 0;
     let elf_bytes: Vec<u8> = loop {
-        let bytes = exec_read_file(&cur_path)?;
+        let bytes = read(&cur_path)?;
         if bytes.starts_with(b"\x7FELF") {
             break bytes; // ELF leaf
         }
         if !bytes.starts_with(b"#!") {
-            // Not a shebang and not ELF — let load_elf reject it (ENOEXEC) inside
-            // the core, after a single clean entry.
+            // Not a shebang and not ELF — let load_elf reject it (ENOEXEC) inside the core,
+            // after a single clean entry.
             break bytes;
         }
         depth += 1;
@@ -5551,8 +5638,7 @@ fn sys_execve(
         cur_path = interp_path; // next hop reads the interpreter file
                                 // `bytes` drops here => at most one MAX_EXEC_IMAGE_SIZE buffer is live.
     };
-
-    exec_from_bytes(process, elf_bytes, cur_argv, envp_vec, execfn)
+    Ok((elf_bytes, cur_argv))
 }
 
 /// M0-4: pure self-test for the exec-disambiguation helpers. Covers the logic a
@@ -5639,6 +5725,91 @@ pub fn run_exec_disambiguation_self_test() {
     );
     // non-printable / non-ASCII byte => '?' (never a lossy alloc or a panic).
     assert_eq!(exec_comm_name(&[b'/', 0xff, b'a']).expect("comm"), "?a");
+
+    // --- R172-P6-F5: resolve_exec_chain (the shebang LOOP + ELOOP depth cap, mock-read) ---
+    // The loop a green boot cannot exercise; driven by a fixed path->bytes mock (no VFS).
+    let elf = || alloc::vec![0x7Fu8, b'E', b'L', b'F', 0, 0, 0, 0];
+    // (i) ELF leaf at hop 0 => bytes returned, argv untouched.
+    {
+        let argv = alloc::vec![b"prog".to_vec()];
+        let (bytes, out) =
+            resolve_exec_chain(String::from("/bin/elf"), argv.clone(), |_p| Ok(elf()))
+                .expect("ELF leaf at hop 0");
+        assert!(bytes.starts_with(b"\x7FELF"));
+        assert_eq!(out, argv, "ELF leaf must leave argv untouched");
+    }
+    // (ii) 4-deep #! chain terminating in ELF => Ok (depth == MAX_SHEBANG_DEPTH succeeds).
+    {
+        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+            match p {
+                "/s" => Ok(b"#!/i1\n".to_vec()),
+                "/i1" => Ok(b"#!/i2\n".to_vec()),
+                "/i2" => Ok(b"#!/i3\n".to_vec()),
+                "/i3" => Ok(b"#!/elf\n".to_vec()),
+                "/elf" => Ok(elf()),
+                _ => Err(SyscallError::ENOENT),
+            }
+        };
+        assert!(
+            resolve_exec_chain(String::from("/s"), alloc::vec![b"s".to_vec()], read).is_ok(),
+            "4-deep shebang chain (== MAX_SHEBANG_DEPTH) must succeed"
+        );
+    }
+    // (iii) 5-deep #! chain exceeds the cap => ELOOP.
+    {
+        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+            match p {
+                "/s" => Ok(b"#!/i1\n".to_vec()),
+                "/i1" => Ok(b"#!/i2\n".to_vec()),
+                "/i2" => Ok(b"#!/i3\n".to_vec()),
+                "/i3" => Ok(b"#!/i4\n".to_vec()),
+                "/i4" => Ok(b"#!/elf\n".to_vec()),
+                "/elf" => Ok(elf()),
+                _ => Err(SyscallError::ENOENT),
+            }
+        };
+        assert!(
+            matches!(
+                resolve_exec_chain(String::from("/s"), alloc::vec![b"s".to_vec()], read),
+                Err(SyscallError::ELOOP)
+            ),
+            "5-deep shebang chain must ELOOP (depth > MAX_SHEBANG_DEPTH)"
+        );
+    }
+    // (iv) a non-ELF, non-#! leaf returns its bytes (load_elf rejects later — must NOT loop).
+    {
+        let (bytes, _argv) =
+            resolve_exec_chain(String::from("/data"), alloc::vec![b"d".to_vec()], |_p| {
+                Ok(b"plain data".to_vec())
+            })
+            .expect("non-ELF non-#! leaf returns bytes");
+        assert_eq!(bytes, b"plain data".to_vec());
+    }
+    // (v) argv reconstruction across one hop: /s (#!/i -a) with argv [s,x] => [/i,-a,/s,x].
+    {
+        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+            match p {
+                "/s" => Ok(b"#!/i -a\n".to_vec()),
+                "/i" => Ok(elf()),
+                _ => Err(SyscallError::ENOENT),
+            }
+        };
+        let (_b, argv) = resolve_exec_chain(
+            String::from("/s"),
+            alloc::vec![b"s".to_vec(), b"x".to_vec()],
+            read,
+        )
+        .expect("one-hop argv reconstruction");
+        assert_eq!(
+            argv,
+            alloc::vec![
+                b"/i".to_vec(),
+                b"-a".to_vec(),
+                b"/s".to_vec(),
+                b"x".to_vec()
+            ]
+        );
+    }
 }
 
 /// sys_wait - 等待子进程
@@ -5710,19 +5881,36 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 }
                 // Re-acquire and set wait state.
                 let mut proc = parent.lock();
+                // R172-11 FIX: re-check kill/signal UNDER the held parent lock (the lock the
+                // wakers take) immediately before publishing Blocked. The loop-top gates
+                // (5670/5679) read-and-dropped the lock; a kill/handler-signal racing into
+                // the gate->commit window would set its pending bit while state != Blocked,
+                // so the bare state-flip wake no-ops and wait4 (no IRQ/data backstop) strands
+                // permanently (+ deferred SIGKILL). Mirror sync.rs:585 — bail to EINTR.
+                if crate::signal::should_abort_pending_block(&proc) {
+                    proc.state = ProcessState::Ready;
+                    proc.waiting_child = None;
+                    return Err(SyscallError::EINTR);
+                }
                 proc.state = ProcessState::Blocked;
                 proc.waiting_child = Some(0);
                 found
             } else {
                 // Normal fast path: use children list.
-                proc.state = ProcessState::Blocked;
-                proc.waiting_child = Some(0);
+                // R172-11 FIX: same under-lock recheck before publishing Blocked. Reserve the
+                // snapshot FIRST (ENOMEM rollback needs no Blocked-undo since nothing is
+                // committed yet), then recheck, then commit Blocked + waiting_child.
                 let mut snapshot = Vec::new();
                 if snapshot.try_reserve_exact(proc.children.len()).is_err() {
-                    proc.state = ProcessState::Ready;
-                    proc.waiting_child = None;
                     return Err(SyscallError::ENOMEM);
                 }
+                if crate::signal::should_abort_pending_block(&proc) {
+                    proc.state = ProcessState::Ready;
+                    proc.waiting_child = None;
+                    return Err(SyscallError::EINTR);
+                }
+                proc.state = ProcessState::Blocked;
+                proc.waiting_child = Some(0);
                 snapshot.extend_from_slice(&proc.children);
                 snapshot
             }
@@ -6195,13 +6383,17 @@ fn validate_rt_sigprocmask_args(
     Ok(())
 }
 
-/// sys_rt_sigprocmask - examine/change the blocked-signal mask (syscall 14).
+/// sys_rt_sigprocmask - examine/change the per-task blocked-signal mask (syscall 14).
 ///
-/// STUB for M0: real per-thread signal-mask state and signal-handler delivery
-/// land in M0 item 5. Until then no signal is ever delivered, so the effective
-/// blocked mask is permanently empty. We fault-validate the inbound `set`
-/// (without applying it) and report an all-zero `oldset`. musl's crt calls this
-/// during startup and only needs a success return plus a zeroed `oldset`.
+/// REAL since M0 item 5 (no longer an M0 stub): the per-task `blocked` mask is load-bearing.
+/// Signal delivery masks against it — `maybe_deliver_signal` selects from `pending & !blocked`,
+/// and `signal_is_deliverable` (the shared EINTR-wake / wait-epilogue predicate) gates on
+/// `pending & !blocked & !uncatchable_mask()`. Semantics: validates `how`/`sigsetsize`,
+/// fault-reads `set` and preflights `oldset` BEFORE mutating, then under the proc lock applies
+/// SIG_BLOCK (old|set) / SIG_UNBLOCK (old & !set) / SIG_SETMASK (set) and copies the PREVIOUS
+/// mask to `oldset`. SIGKILL/SIGSTOP are force-stripped, so they can never be blocked (POSIX).
+/// A born-clean process starts `blocked == 0`, so musl's startup query still observes an
+/// all-zero `oldset`.
 fn sys_rt_sigprocmask(
     how: i32,
     set: *const u8,
@@ -6470,6 +6662,41 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
 /// (a non-blocking syscall return); a syscall that blocked-and-resumed has a zeroed
 /// `frame_ptr`, so delivery is SAFELY DEFERRED to the task's next non-blocking return
 /// (waking a blocked-in-syscall target is 1b). No blocked-waiter wake here.
+/// R172-X-F1 / EXEC-SIGNAL-SAFEPOINT-CONJUNCTION leg (b): on exec, every installed user
+/// handler resets to SIG_DFL (SIG_IGN is PRESERVED, per POSIX); the blocked mask and pending
+/// set are untouched. The SOLE handler-reset path, so a self-test exercising THIS fn is a
+/// true witness of the production reset (dev-v29: not a constant mirror).
+pub(crate) fn reset_sigactions_for_exec(
+    sigactions: &mut [crate::signal::SigAction; crate::signal::NSIG],
+) {
+    for sa in sigactions.iter_mut() {
+        if sa.is_handler() {
+            *sa = crate::signal::SigAction::default_action();
+        }
+    }
+}
+
+/// R172-X-F1: pin EXEC-SIGNAL-SAFEPOINT-CONJUNCTION leg (b) by exercising the PRODUCTION
+/// `reset_sigactions_for_exec`. The runtime `exec_in_progress` tripwire in
+/// `maybe_deliver_signal` (legs a/c enforcement) needs a live process to lock, so it is
+/// covered by the boot / SMP exec paths, not this pure test.
+pub fn run_exec_signal_safepoint_self_test() {
+    use crate::signal::{SigAction, NSIG, SIG_IGN};
+    let mut t: [SigAction; NSIG] = [SigAction::default_action(); NSIG];
+    t[0].handler = 0x4000_1000; // a real user handler at index 0
+    t[1].handler = SIG_IGN; // SIG_IGN at index 1
+    reset_sigactions_for_exec(&mut t);
+    assert!(
+        !t[0].is_handler(),
+        "leg-b: exec must reset a real handler to SIG_DFL"
+    );
+    assert_eq!(t[1].handler, SIG_IGN, "leg-b: exec must PRESERVE SIG_IGN");
+    assert!(
+        t.iter().all(|s| !s.is_handler()),
+        "leg-b: no real handler survives exec"
+    );
+}
+
 fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // Lock-free fast path FIRST: no handler installed anywhere yet => nothing to
     // deliver. The musl / native-hello gate path takes EXACTLY one relaxed atomic
@@ -6487,15 +6714,43 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // snapshot its disposition + the pre-delivery blocked mask.
     let (sig, handler, restorer, sa_mask, sa_flags, old_blocked) = {
         let proc = proc_arc.lock();
+        // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION (leg enforcement, the single delivery
+        // choke point). Delivery here writes a sigframe against the INTERRUPTED user RSP
+        // (ctx.rsp). After an exec that just swapped CR3 to the new image, that RSP is valid
+        // ONLY because exec (a) refused a shared / multithreaded AS [EBUSY tgid/share_count,
+        // EAGAIN migration] and (b) reset every handler + cleared the frame binding under the
+        // commit lock [reset_sigactions_for_exec] BEFORE control could reach this safe point
+        // [exec clears exec_in_progress via ExecInProgressGuard at scope exit, AFTER the
+        // commit and BEFORE the unified syscall-return safe point], and (c) never blocks
+        // mid-exec. On the legitimate post-exec path this guard is a TAUTOLOGY (never fires);
+        // it fires ONLY if a future edit re-exposes this safe point while an exec is genuinely
+        // mid-flight — exactly the sigframe-against-stale-RSP-on-the-new-AS corruption class it
+        // pins. Fail CLOSED in release (DROP the delivery, leave the pending bit set for a
+        // later post-exec attempt) rather than execute the corrupting copy_to_user. Cost: one
+        // bool read on a lock we already hold, only on the rare any_handler_installed() path.
+        if proc.exec_in_progress {
+            klog_force!(
+                "FATAL-INVARIANT: maybe_deliver_signal reached with exec_in_progress set \
+                 (pid={}) — EXEC-SIGNAL-SAFEPOINT-CONJUNCTION violated; a sigframe write would \
+                 target a stale pre-exec RSP on the new AS",
+                pid
+            );
+            debug_assert!(
+                !proc.exec_in_progress,
+                "EXEC-SIGNAL-SAFEPOINT-CONJUNCTION: signal delivery in the live exec window"
+            );
+            return;
+        }
         if proc.in_signal_handler {
             return; // serialize: one live handler frame at a time (slice 1a).
         }
-        let deliverable = proc.pending_signals.bits() & !proc.blocked;
-        if deliverable == 0 {
-            return;
-        }
-        let bit = deliverable.trailing_zeros() as u8; // signal = bit + 1, lowest first
-        let sig = match crate::signal::Signal::from_index(bit + 1) {
+        // Site B (R172-P6-F1): UNMASKED input (no uncatchable mask) — DELIBERATELY, so a lone
+        // pending SIGKILL/SIGSTOP is still selected and routed into the `Default` arm below
+        // (apply_default_at_safepoint -> terminate / stop). Shares the lowest-bit pick with
+        // signal_is_deliverable (the wake-gate) via the single select_lowest_deliverable.
+        let sig = match crate::signal::select_lowest_deliverable(
+            proc.pending_signals.bits() & !proc.blocked,
+        ) {
             Some(s) => s,
             None => return,
         };
@@ -7222,7 +7477,6 @@ const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
         58,
         "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)",
     ),
-    (82, "rename: WPATH, deferred to the VFS-META slice"),
     (86, "link: CPATH, deferred (needs FileSystem::link)"),
     (88, "symlink: WPATH, deferred (needs FileSystem::symlink)"),
     (
@@ -8625,9 +8879,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
     if new_top > old_top {
         let grow_size = new_top - old_top;
 
-        // 检查与 mmap 区域冲突
+        // 检查与 mmap 区域冲突 + R172-16: ARM the brk-grow VA reservation atomically
         {
-            let mm = mm_arc.lock();
+            let mut mm = mm_arc.lock();
             for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
                 let region_end = region_base.saturating_add(mmap_region_len(region_len_with_flags));
                 if old_top < region_end && new_top > region_base {
@@ -12601,22 +12855,12 @@ fn sys_mkdir(path: *const u8, mode: u32) -> SyscallResult {
     let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
     let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
-    // LSM hook: check mkdir permission
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let (parent_hash, name_hash) = match path_str.rfind('/') {
-            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
-            Some(idx) => (
-                audit::hash_path(&path_str[..idx]),
-                audit::hash_path(&path_str[idx + 1..]),
-            ),
-            None => (audit::hash_path("."), audit::hash_path(path_str)),
-        };
-        if let Err(err) = lsm::hook_file_mkdir(&proc_ctx, parent_hash, name_hash, mode & 0o7777) {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
-
-    // 通过回调创建目录
+    // R172-X-F4: the syscall-layer path-hash LSM prehook is REMOVED. VFS Manager::create
+    // fires hook_file_mkdir ONCE with the REVALIDATED parent inode (manager.rs:1136, under
+    // the create lock) — a coherent inode-keyed MAC object the syscall layer (no lookup /
+    // lock / inode context) could only approximate with a path-hash, yielding an incoherent
+    // double-keyed decision + a double audit-emit on denial. A denial now surfaces as the
+    // VFS error (FsError::PermDenied -> EACCES), matching create/open post-R105-1.
     let create_fn = VFS_CREATE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     create_fn(path_str, mode & 0o7777, true)?;
     Ok(0)
@@ -12638,22 +12882,9 @@ fn sys_rmdir(path: *const u8) -> SyscallResult {
         return Err(SyscallError::ENOTDIR);
     }
 
-    // LSM hook: check rmdir permission
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let (parent_hash, name_hash) = match path_str.rfind('/') {
-            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
-            Some(idx) => (
-                audit::hash_path(&path_str[..idx]),
-                audit::hash_path(&path_str[idx + 1..]),
-            ),
-            None => (audit::hash_path("."), audit::hash_path(path_str)),
-        };
-        if let Err(err) = lsm::hook_file_rmdir(&proc_ctx, parent_hash, name_hash) {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
-
-    // 通过回调删除目录
+    // R172-X-F4: the syscall-layer path-hash LSM prehook is REMOVED. VFS Manager::unlink
+    // fires hook_file_rmdir ONCE with the revalidated parent inode (manager.rs:1216). The
+    // is_directory ENOTDIR gate above is a POSIX type check (not MAC) and stays.
     let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     unlink_fn(path_str)?;
     Ok(0)
@@ -13389,16 +13620,39 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
     }
 
     // 计算睡眠时间(毫秒)
-    let total_ms = (ts.tv_sec as u64)
-        .saturating_mul(1000)
-        .saturating_add((ts.tv_nsec / 1_000_000) as u64);
+    // R172-20 FIX: round UP to >= 1ms for any nonzero request. The old truncating
+    // sec*1000 + nsec/1_000_000 made a sub-ms sleep a no-op (usleep -> userspace busy-spin)
+    // and under-slept non-whole-ms requests, violating POSIX "sleep at LEAST the requested
+    // time". Compute total ns (checked), then ceil-divide to ms.
+    const NS_PER_MS: u64 = 1_000_000;
+    let total_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    let total_ms = if total_ns == 0 {
+        0
+    } else {
+        // ceil(total_ns / NS_PER_MS), always >= 1 for any nonzero request.
+        (total_ns / NS_PER_MS)
+            .saturating_add(if total_ns % NS_PER_MS != 0 { 1 } else { 0 })
+            .max(1)
+    };
 
-    // R42-3 FIX: Yield CPU during sleep to prevent busy-wait DoS.
-    // Instead of spinning in kernel context monopolizing the CPU,
-    // we allow the scheduler to run other processes and use HLT
-    // to reduce power consumption while waiting for the timer.
+    // R42-3 FIX: Yield CPU during sleep to prevent busy-wait DoS (HLT to next timer tick).
     let start = crate::time::get_ticks();
+    let mut interrupted = false;
     while crate::time::get_ticks().saturating_sub(start) < total_ms {
+        // R172-10 FIX: honor a pending kill + deliverable handler signal EACH iteration. The
+        // old loop never checked, so a Running task in nanosleep ignored SIGKILL / OOM-kill /
+        // ns-init-death cascade AND any handler signal for the entire sleep window
+        // (uninterruptible, defeating the deferred-kill model that only fires at the RPL==3
+        // safe point this loop never reached). Break to EINTR so the task unwinds to that safe
+        // point (kill honored there; handler delivered on syscall return).
+        if let Some(pid) = current_pid() {
+            if wait_should_abort(pid) || crate::signal::has_deliverable_signal(pid) {
+                interrupted = true;
+                break;
+            }
+        }
         // Allow other processes to run
         crate::reschedule_if_needed();
         // Halt until next timer interrupt (reduces CPU usage)
@@ -13407,23 +13661,31 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
         }
     }
 
-    // 如果提供了rem，设置为0
+    // R172-10/20 FIX: report the REMAINING time on EINTR (POSIX), 0 on normal completion.
     if !rem.is_null() {
-        let zero = TimeSpec {
-            tv_sec: 0,
-            tv_nsec: 0,
+        let remaining_ms = if interrupted {
+            total_ms.saturating_sub(crate::time::get_ticks().saturating_sub(start))
+        } else {
+            0
         };
-        // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes; all-zero)
-        let zero_bytes = unsafe {
+        let rem_ts = TimeSpec {
+            tv_sec: (remaining_ms / 1000) as i64,
+            tv_nsec: ((remaining_ms % 1000).saturating_mul(NS_PER_MS)) as i64,
+        };
+        // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes; kernel→user)
+        let rem_bytes = unsafe {
             core::slice::from_raw_parts(
-                &zero as *const TimeSpec as *const u8,
+                &rem_ts as *const TimeSpec as *const u8,
                 core::mem::size_of::<TimeSpec>(),
             )
         };
-        crate::usercopy::copy_to_user_safe(rem as *mut u8, zero_bytes)
+        crate::usercopy::copy_to_user_safe(rem as *mut u8, rem_bytes)
             .map_err(|_| SyscallError::EFAULT)?;
     }
 
+    if interrupted {
+        return Err(SyscallError::EINTR);
+    }
     Ok(0)
 }
 
@@ -14549,6 +14811,18 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
             // This prevents resource exhaustion from abandoned connection attempts
             net::socket_table().abort_tcp_connect(&socket);
             return Err(SyscallError::ETIMEDOUT);
+        }
+
+        // R172-09 FIX: honor a pending kill + deliverable handler signal EACH iteration. This
+        // is a Running-state spin (never Blocked), so the deferred-kill model — which only
+        // acts at the RPL==3 safe point — could not reach the task for up to
+        // TCP_CONNECT_TIMEOUT (5s): SIGKILL/EINTR were delayed the whole window. Abort the
+        // connect attempt and return EINTR so the task unwinds to its safe point.
+        if let Some(pid) = current_pid() {
+            if wait_should_abort(pid) || crate::signal::has_deliverable_signal(pid) {
+                net::socket_table().abort_tcp_connect(&socket);
+                return Err(SyscallError::EINTR);
+            }
         }
 
         // Yield to allow RX processing

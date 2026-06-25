@@ -32,11 +32,22 @@ use crate::cgroup;
 /// 需要将冲突的大页拆分为 4KB 页（通过 ensure_pte_level）。
 pub const USER_BASE: usize = 0x0040_0000;
 
-/// 用户栈顶地址（用户空间顶部 - 8KB 守护页）
+/// 用户栈顶地址：用户栈区间的固定（非随机化）独占上界。M0 无栈 ASLR，该 VA 是
+/// 确定的——正因可被预测，才需要低端守护页。真正的 4 KiB 守护页由
+/// `allocate_user_stack_tracked` 在窗口低端 [stack_base, stack_base+USER_STACK_GUARD_SIZE)
+/// 划出，永不映射。
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
 
-/// 用户栈大小（默认 2MB）
+/// 用户栈保留窗口大小（默认 2MB，含低端 1 页守护）
 pub const USER_STACK_SIZE: usize = 0x20_0000;
+
+/// M0-7: 用户栈低端永久未映射的守护页大小（1×4 KiB）。
+///
+/// 栈向下溢出落入该页 → not-present 的用户态写缺页 → 经 `interrupts.rs` 既有的
+/// 用户 SIGSEGV 路径终止进程，而非静默破坏其下的 brk/堆。守护页必须是「完全
+/// 未使用」的 PTE（加载循环从不访问它，addr=0），绝不能是显式的 non-present
+/// PTE——否则 `free_address_space` 的 R123-1 叶子回收会对幻象帧二次释放。
+pub const USER_STACK_GUARD_SIZE: usize = 0x1000;
 
 /// 页大小
 const PAGE_SIZE: usize = 0x1000;
@@ -307,10 +318,18 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
 
     // 验证 brk_start 不与栈区域重叠
     // 栈区域：[USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP)
+    // NOTE: this is the ARCHITECTURAL window base (incl. the M0-7 low guard page); brk
+    // must stay below the WHOLE window, so the guard is brk-safe by this very check.
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
-    if brk_start >= stack_base {
-        // R165-12 FIX: Debug, not Error — `stack_base` is a KASLR-randomized VA;
-        // leaking it at production log level weakens user-space ASLR.
+    // R172-26 FIX: strict `>` (half-open window), single-sourced via user_stack_window(). The
+    // old `>=` was one page over-conservative: brk_start == stack_base is an EMPTY heap abutting
+    // the window (zero overlap), and the first non-empty grow is independently rejected at
+    // runtime by the strict `>` brk gate (syscall.rs). Aligning here removes the load-time vs
+    // runtime boundary disagreement. `stack_base` (== user_stack_window().0) is kept for the log.
+    if brk_start > user_stack_window().0 {
+        // R165-12 FIX: Debug, not Error — keep this user VA out of production logs.
+        // (USER_STACK_TOP is a FIXED constant; there is NO user-stack ASLR in M0, so
+        // `stack_base` is deterministic — Debug here is log hygiene, not ASLR.)
         klog!(
             Debug,
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
@@ -478,7 +497,9 @@ fn compute_phdr_va(elf: &ElfFile) -> u64 {
         None => return 0,
     };
     let user_floor = USER_BASE as u64;
-    let user_ceiling = USER_STACK_TOP - USER_STACK_SIZE as u64; // strictly below the stack.
+    // R172-X-F2: route the last guard-INCLUSIVE re-derivation through the single source
+    // (algebraically identical to USER_STACK_TOP - USER_STACK_SIZE).
+    let user_ceiling = user_stack_window().0 as u64; // strictly below the stack.
     if candidate < user_floor || cand_end > user_ceiling {
         return 0;
     }
@@ -532,6 +553,46 @@ fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
         return Err(ElfLoadError::UnsupportedType);
     }
 
+    // R172-02 FIX (untrusted-input panic=abort DoS): bound + align the program-header table
+    // BEFORE any `program_iter()` is reached on attacker bytes. xmas-elf's
+    // `parse_program_header` slices `&input[off..off+entsize]` with NO bounds check, and
+    // `zero::read::<ProgramHeader64>` then asserts BOTH (a) the slice is large enough AND
+    // (b) the slice base is `align_of::<ProgramHeader64>()`-aligned (8). Either assert
+    // failing is `panic=abort` -> permanent CPU halt: a ~100-byte crafted ELF with a bad
+    // `e_phoff`/`e_phnum`/`e_phentsize` (or an unaligned `e_phoff`) is an unauthenticated
+    // full-system DoS via execve(59)/spawn_image(517). `validate_elf_header` dominates every
+    // `program_iter()` call (load loop, AT_PHDR derivation), so one fail-closed check here
+    // closes the class. `header::sanity_check` does NOT exist in xmas-elf-0.9.1 (do not call).
+    const PH64_ENTSIZE: u64 = 56; // size_of::<xmas_elf::program::ProgramHeader64>() (fixed ELF64 ABI)
+    const PH64_ALIGN: usize = 8; // align_of::<ProgramHeader64>() — zero::read asserts this
+    let e_phnum = hdr.pt2.ph_count();
+    if e_phnum != 0 {
+        let e_phoff = hdr.pt2.ph_offset();
+        let e_phentsize = hdr.pt2.ph_entry_size() as u64;
+        // Exact ELF64 entry size: a smaller entsize makes the crate slice/read overlap or
+        // run short; a larger one over-reads. Reject both (readable-but-bad => reject, FX-18).
+        if e_phentsize != PH64_ENTSIZE {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+        // [e_phoff, e_phoff + e_phnum*e_phentsize) must lie within the image (checked math).
+        let table_bytes = (e_phnum as u64)
+            .checked_mul(e_phentsize)
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        let table_end = e_phoff
+            .checked_add(table_bytes)
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        if table_end > elf.input.len() as u64 {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+        // Alignment: each entry is at `input.as_ptr() + e_phoff + i*56`; since 56 % 8 == 0,
+        // every entry shares the alignment of `(input base + e_phoff)`. If that is not
+        // 8-aligned, the first `program_iter()` read panics — reject fail-closed instead.
+        let table_base = (elf.input.as_ptr() as usize).wrapping_add(e_phoff as usize);
+        if table_base & (PH64_ALIGN - 1) != 0 {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+    }
+
     Ok(())
 }
 
@@ -580,7 +641,12 @@ fn load_segment_tracked(
         return Err(ElfLoadError::SegmentOutOfRange);
     }
 
-    if end as u64 >= USER_STACK_TOP - USER_STACK_SIZE as u64 {
+    // R172-26 FIX: `end` is the EXCLUSIVE segment end; it intrudes the half-open stack window
+    // [stack_base, USER_STACK_TOP) iff `end > stack_base`, NOT `>=` (end == stack_base means
+    // the segment is [.., stack_base), disjoint). The old `>=` was one page over-conservative.
+    // Single-sourced through user_stack_window().0 (usize; drops the as-u64 casts) so all the
+    // load-time guards share the runtime SoT and cannot drift apart.
+    if end > user_stack_window().0 {
         return Err(ElfLoadError::OverlapWithStack);
     }
 
@@ -685,6 +751,20 @@ fn load_segment_tracked(
                     .allocate_data_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
+                // R172-24 FIX: reserve BOTH tracking vectors BEFORE map_page (mirror the
+                // stack path allocate_user_stack_tracked / R158-9). The old order mapped
+                // FIRST then `tracked.try_reserve(1)?`, so a reserve-OOM left a mapped-but-
+                // UNTRACKED frame: reclaimed only by the whole-AS free_address_space backstop
+                // and mis-uncharged by the post-loop `tracked.len()` delta (transient cgroup
+                // skew + a latent leak if a future refactor made this failure recoverable).
+                // Reserve-before-map makes "no frame is mapped unless its rollback slot
+                // exists" hold by construction; the reserve-fail branch never maps, so no
+                // prune/unmap is needed (strictly simpler than the map-then-reserve sites).
+                if tracked.try_reserve(1).is_err() || segment_mapped.try_reserve(1).is_err() {
+                    frame_alloc.deallocate_frame(frame);
+                    return Err(ElfLoadError::OutOfMemory);
+                }
+
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
                     // R165-12 FIX: Debug, not Error — leaks the loaded segment VA.
                     klog!(
@@ -699,11 +779,7 @@ fn load_segment_tracked(
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                // Z-10 fix: 追加到本段和全局追踪向量
-                // R155-4 FIX: Fallible push to avoid kernel panic on OOM
-                tracked
-                    .try_reserve(1)
-                    .map_err(|_| ElfLoadError::OutOfMemory)?;
+                // Z-10 fix: 追加到本段和全局追踪向量 (capacity reserved above -> infallible).
                 segment_mapped.push((page, frame));
                 tracked.push((page, frame));
             }
@@ -755,6 +831,123 @@ fn load_segment_tracked(
     Ok((charge_bytes, frame_alloc.take_pt_frames()))
 }
 
+/// M0-7: the eager user-stack map geometry — the SINGLE source of truth for BOTH the
+/// loader (`allocate_user_stack_tracked`) and `run_user_stack_guard_range_self_test`,
+/// so the test cannot drift from the real map-loop bounds.
+///
+/// Returns `(stack_base, usable_base, page_count)`:
+/// * `stack_base`  — architectural low boundary of the reserved window
+///   (`USER_STACK_TOP - USER_STACK_SIZE`); brk/segments are barred below it.
+/// * `usable_base` — `stack_base + USER_STACK_GUARD_SIZE`, the lowest *mapped* VA;
+///   `[stack_base, usable_base)` is the permanently-UNMAPPED guard page.
+/// * `page_count`  — `(USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE` eager pages
+///   mapped upward from `usable_base`; the topmost ends EXACTLY at `USER_STACK_TOP`
+///   (nothing is mapped above the window — the old `+1` anti-guard is gone).
+pub(crate) const fn user_stack_layout() -> (usize, usize, usize) {
+    let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
+    let usable_base = stack_base + USER_STACK_GUARD_SIZE;
+    let page_count = (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE;
+    (stack_base, usable_base, page_count)
+}
+
+/// M0-7 slice 2 (SLICE 1+2): the SINGLE SOURCE of the architectural user-stack window
+/// `[stack_base, USER_STACK_TOP)` — **guard-INCLUSIVE** (`stack_base = USER_STACK_TOP -
+/// USER_STACK_SIZE`, the SAME ceiling the `OverlapWithStack` segment guards at
+/// `:323`/`:495`/`:597` already enforce, NOT the `guard_top`/`usable_base` floor).
+///
+/// Returned as the half-open `(window_start, window_end)`. Consumed by the runtime
+/// stack-window exclusion in `sys_mmap` and `sys_brk` (the "third door": today both bound
+/// only on `USER_SPACE_TOP`, which is `0x1FFFE000` ABOVE the window, so a hinted/MAP_FIXED
+/// mmap or a brk grow can land INSIDE the reserved stack region and alias it). Routing both
+/// through this one const fn keeps the exclusion bound from drifting to `guard_top` (which
+/// would re-open `[stack_base, guard_top)` and the guard page itself to aliasing).
+pub(crate) const fn user_stack_window() -> (usize, usize) {
+    let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
+    (stack_base, USER_STACK_TOP as usize)
+}
+
+/// M0-7 / R172-X-F2: the lowest MAPPED user-stack VA (guard-EXCLUSIVE) — the reserved
+/// window's low edge plus the one permanently-UNMAPPED low guard page. Equals BOTH
+/// `user_stack_layout().1` (usable_base) and `user_stack_window().0 + USER_STACK_GUARD_SIZE`.
+/// This is the SINGLE source for the sigframe floor (`maybe_deliver_signal`), the
+/// auxv/argv builder floor (`user_stack::compute_layout`), and the RLIMIT_STACK
+/// magnitude — so a future guard-size change moves ALL of them together.
+///
+/// Derived from `user_stack_window().0` (NOT a fresh `USER_STACK_TOP - (SIZE - GUARD)`)
+/// so the guard-INCLUSIVE window base (quantity A) and this guard-EXCLUSIVE floor
+/// (quantity B) share ONE origin expression; the cross-geometry self-test then pins
+/// `floor == window_start + GUARD == usable_base` as a near-tautology. Returned as `u64`
+/// (the type every consumer needs); the architectural extent fits `u64` and the addition
+/// of two compile-time constants cannot overflow.
+///
+/// `pub` (not `pub(crate)`) so the boot `usermode_test` AS-install path (in the binary
+/// crate) can seed `MmState.stack_floor_committed` to the same mapped floor the exec
+/// image-install commit uses — M0-7 item7 SLICE 4.
+pub const fn user_stack_mapped_floor() -> u64 {
+    user_stack_window().0 as u64 + USER_STACK_GUARD_SIZE as u64
+}
+
+/// M0-7 item7 SLICE 4: the lowest VA a user main-stack demand-grow may descend to,
+/// derived from the soft `RLIMIT_STACK` `rlim_cur` (bytes). Used by
+/// `try_grow_user_stack` to bound a grow request.
+///
+/// The growable extent is `min(rlim_cur, USER_STACK_SIZE - USER_STACK_GUARD_SIZE)`:
+/// the `min()` clamp is LOAD-BEARING because `RLIMIT_STACK.rlim_max` is infinite, so a
+/// process can `setrlimit` `rlim_cur` arbitrarily high — but the architectural window
+/// only backs `SIZE - GUARD` bytes above the unmapped guard page, and a grow must NEVER
+/// descend below `user_stack_mapped_floor()` (that would alias the guard or the brk
+/// heap below the window). The extent is page-aligned DOWN, which makes the returned
+/// floor `== page_align_up(USER_STACK_TOP - min(...))` (the conservative direction: a
+/// partial-page limit yields a SMALLER growable region) and page-aligned because
+/// `USER_STACK_TOP` and the aligned extent are both page multiples.
+///
+/// Returned floor is in `[user_stack_mapped_floor(), USER_STACK_TOP]`. With the default
+/// `rlim_cur == SIZE - GUARD` it equals `user_stack_mapped_floor()` exactly — i.e. on a
+/// default process the whole window-minus-guard is already eager-mapped, so there is no
+/// lazy region to grow into (SLICE 5 splits the geometry to create one).
+pub(crate) fn stack_grow_floor(rlim_cur: u64) -> usize {
+    let max_extent = (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) as u64;
+    let extent = if rlim_cur < max_extent {
+        rlim_cur
+    } else {
+        max_extent
+    };
+    let extent_pages = extent & !((PAGE_SIZE as u64) - 1);
+    (USER_STACK_TOP - extent_pages) as usize
+}
+
+/// M0-7 self-test: pin the eager user-stack map geometry so a regression to the `+1`
+/// "anti-guard" (a page above `USER_STACK_TOP`) or a forgotten guard carve fails
+/// `make test`. Pure — exercises the loader's own `user_stack_layout` helper.
+pub fn run_user_stack_guard_range_self_test() {
+    let (stack_base, usable_base, page_count) = user_stack_layout();
+    // The guard is exactly ONE page at the window's low end.
+    assert_eq!(
+        usable_base - stack_base,
+        USER_STACK_GUARD_SIZE,
+        "guard page must be exactly USER_STACK_GUARD_SIZE at the window low end"
+    );
+    // Exactly (window - guard) pages are eagerly mapped (511 for the default geometry).
+    assert_eq!(
+        page_count,
+        (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE,
+        "eager page_count must be (USER_STACK_SIZE - guard)/PAGE_SIZE"
+    );
+    // The topmost eager page ends EXACTLY at USER_STACK_TOP — nothing maps above the
+    // window (proves the dead +1 anti-guard is gone).
+    assert_eq!(
+        usable_base + page_count * PAGE_SIZE,
+        USER_STACK_TOP as usize,
+        "top eager page must end exactly at USER_STACK_TOP (no page above the window)"
+    );
+    // The whole eager map stays strictly inside the reserved window, above the guard.
+    assert!(
+        usable_base == stack_base + USER_STACK_GUARD_SIZE
+            && usable_base + page_count * PAGE_SIZE <= USER_STACK_TOP as usize,
+        "eager stack map must lie within (stack_base+guard .. USER_STACK_TOP]"
+    );
+}
+
 /// Z-10 fix: 分配用户栈并追踪映射，便于失败时全局回滚
 ///
 /// # Arguments
@@ -771,10 +964,14 @@ fn allocate_user_stack_tracked(
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
 ) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
-    let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
-    // 【修复】多分配一页，确保 USER_STACK_TOP 所在的页也被映射
-    // musl libc 启动时会向上扫描栈查找 auxv 等数据结构
-    let page_count = USER_STACK_SIZE / PAGE_SIZE + 1;
+    // M0-7: single source of truth for the eager map geometry (also pinned by
+    // `run_user_stack_guard_range_self_test`). The window's low page
+    // `[stack_base, usable_base)` is the permanently-UNMAPPED guard; we map `page_count`
+    // (=511) pages upward from `usable_base`, the topmost ending EXACTLY at
+    // USER_STACK_TOP. The old `+1` "anti-guard" page above the top is GONE —
+    // `build_initial_user_stack` writes strictly below `USER_STACK_TOP-16`, so nothing
+    // above the window is ever needed, and there is now a real guard BELOW the stack.
+    let (_, usable_base, page_count) = user_stack_layout();
 
     // R93-6 FIX: Pre-charge memory for user stack.
     // This enforces cgroup memory limits for stack allocation.
@@ -807,7 +1004,7 @@ fn allocate_user_stack_tracked(
     let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
             for i in 0..page_count {
-                let va = VirtAddr::new((stack_base + i * PAGE_SIZE) as u64);
+                let va = VirtAddr::new((usable_base + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
                 // M2-1 SLICE-4d: DATA frame via allocate_data_frame (NOT recorded).
@@ -823,7 +1020,9 @@ fn allocate_user_stack_tracked(
                 }
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    // R165-12 FIX: Debug, not Error — leaks the KASLR stack VA.
+                    // R165-12 FIX: Debug, not Error — keep this user VA out of
+                    // production logs (the stack VA is a FIXED constant, NOT KASLR-
+                    // randomized; Debug here is log hygiene).
                     klog!(
                         Debug,
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
@@ -837,6 +1036,16 @@ fn allocate_user_stack_tracked(
                 stack_mapped.push((page, frame));
                 tracked.push((page, frame));
             }
+            // M0-7: the low guard page MUST stay unmapped (a fully-unused PTE). The loop
+            // started at `usable_base` and never visited the page below it, so this holds
+            // by construction; assert it so a future edit that maps the guard — or installs
+            // an explicit non-present guard PTE that free_address_space's R123-1 leaf
+            // reclaim would double-free — is caught at boot (debug builds).
+            debug_assert!(
+                mgr.translate_addr(VirtAddr::new((usable_base - USER_STACK_GUARD_SIZE) as u64))
+                    .is_none(),
+                "user-stack guard page must be unmapped"
+            );
             Ok(())
         })
     };
@@ -853,8 +1062,10 @@ fn allocate_user_stack_tracked(
     }
 
     // 【修复】使用直映物理地址清零栈区域
-    // R100-5 FIX: 清零所有已映射的栈页（page_count 页），而非仅 USER_STACK_SIZE 字节。
-    // 额外的 guard page 也必须清零以防信息泄漏。
+    // R100-5 FIX: 清零所有已映射的栈页（page_count 页）以防信息泄漏。
+    // M0-7: page_count、charge_bytes 与下面的 remaining 都源自同一 user_stack_layout()
+    // 的 page_count，三者恒一致；故 remaining 恰在覆盖最后一页后归零。下方两个断言把
+    // 这一 lockstep 钉死：半改 page_count 会导致少清零（信息泄漏）或多扣费（cgroup 泄漏）。
     let mut remaining = page_count * PAGE_SIZE;
     for (_, frame) in stack_mapped.iter() {
         let base = unsafe { phys_to_virt(frame.start_address()).as_mut_ptr::<u8>() };
@@ -867,6 +1078,15 @@ fn allocate_user_stack_tracked(
             break;
         }
     }
+    debug_assert_eq!(
+        stack_mapped.len(),
+        page_count,
+        "stack mapped-page count must equal page_count (charge/zero lockstep)"
+    );
+    debug_assert_eq!(
+        remaining, 0,
+        "stack zeroing must cover exactly page_count pages"
+    );
 
     // M2-1 SLICE-4d: yield the recorded PT-frame identities alongside the charged bytes.
     Ok((charge_bytes, frame_alloc.take_pt_frames()))
@@ -931,6 +1151,18 @@ pub fn print_elf_info(image: &[u8]) {
         klog!(Debug, "=== ELF Info ===");
         klog!(Debug, "Entry point: 0x{:x}", hdr.pt2.entry_point());
         klog!(Debug, "Program headers: {}", hdr.pt2.ph_count());
+
+        // R172-02 FIX: this debug helper is the OTHER program_iter() site (besides load_elf);
+        // gate it on validate_elf_header too so a crafted ELF can never panic=abort here
+        // either (closes the panic CLASS module-wide, not just the exec path). No-op return
+        // on a malformed table — it is only diagnostics.
+        if validate_elf_header(&elf).is_err() {
+            klog!(
+                Debug,
+                "  (program-header table failed validation; not iterating)"
+            );
+            return;
+        }
 
         for (i, ph) in elf.program_iter().enumerate() {
             if ph.get_type() == Ok(PhType::Load) {

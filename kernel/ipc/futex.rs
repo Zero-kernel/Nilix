@@ -435,6 +435,13 @@ pub fn futex_lock_pi(
         if let Some(proc) = process::get_process(pid) {
             proc.lock().set_waiting_on_futex(None);
         }
+        // M0-5 1b-1b: prepare_to_wait ALSO bails (returns false) when a pending kill or a
+        // deliverable HANDLER signal raced in before the task published Blocked (the M0-5
+        // 1b should_abort_pending_block re-check). Distinguish that from a genuine
+        // closed-queue / no-current-process failure and return a PRECISE EINTR. kill-first.
+        if process::wait_should_abort(pid) || kernel_core::signal::has_deliverable_signal(pid) {
+            return Err(FutexError::Interrupted);
+        }
         return Err(FutexError::NoProcess);
     }
 
@@ -577,7 +584,18 @@ pub fn futex_lock_pi(
             Ok(0)
         }
     } else {
-        Err(FutexError::WouldBlock)
+        // M0-5 1b-1b: a NON-grant wake that is a pending kill OR a deliverable HANDLER
+        // signal returns a PRECISE EINTR (Interrupted) instead of the imprecise EAGAIN
+        // (WouldBlock). kill-FIRST (wait_should_abort short-circuits before the signal
+        // check); the signal branch never consumes pending_kill. Mirrors the already-
+        // converged sync.rs wait epilogue (R171-F3 kill gate + M0-5 1b
+        // has_deliverable_signal). A non-kill, non-signal spurious wake still returns
+        // WouldBlock so the caller retries the LOCK_PI loop (no control-flow change).
+        if process::wait_should_abort(pid) || kernel_core::signal::has_deliverable_signal(pid) {
+            Err(FutexError::Interrupted)
+        } else {
+            Err(FutexError::WouldBlock)
+        }
     }
 }
 

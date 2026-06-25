@@ -305,12 +305,16 @@ impl FileSystem for Initramfs {
         Err(FsError::ReadOnly)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rename(
         &self,
         _old_parent: &Arc<dyn Inode>,
         _old_name: &str,
         _new_parent: &Arc<dyn Inode>,
         _new_name: &str,
+        _noreplace: bool,
+        _expected_src_ino: u64,
+        _expected_dest_ino: Option<u64>,
     ) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }

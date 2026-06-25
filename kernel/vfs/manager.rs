@@ -80,28 +80,48 @@ fn check_access_permission(
     };
     let egid = current_host_egid().unwrap_or(65534);
     let supplementary = current_host_supplementary_groups().unwrap_or_default();
+    permission_bits_allow(
+        euid,
+        egid,
+        &supplementary,
+        stat,
+        need_read,
+        need_write,
+        need_exec,
+    )
+}
 
-    // Host root (host-mapped euid == 0) bypasses all permission checks
+/// R172-P6-F5: the PURE DAC permission-bit decision — host-root bypass + owner/group/other
+/// bit selection + the need_read/write/exec checks — with NO credential lookup. Split out of
+/// `check_access_permission` so the +x / DAC-deny logic is DETERMINISTICALLY unit-testable at
+/// boot, where `current_host_euid() == None` would otherwise make the wrapper early-return
+/// `true` and a naive "expect EACCES" test tautologically pass while testing nothing. The
+/// wrapper supplies the live creds; this is behavior-identical to the prior inline logic.
+fn permission_bits_allow(
+    euid: u32,
+    egid: u32,
+    supplementary: &[u32],
+    stat: &Stat,
+    need_read: bool,
+    need_write: bool,
+    need_exec: bool,
+) -> bool {
+    // Host root (host-mapped euid == 0) bypasses all permission checks.
     if euid == 0 {
         return true;
     }
 
     let perm = stat.mode.perm;
 
-    // Determine which permission bits to check based on uid/gid
-    // Check supplementary groups in addition to primary group
+    // Determine which permission bits to check based on uid/gid (supplementary groups too).
     let check_bits = if euid == stat.uid {
-        // Owner: use high bits (0o700)
-        (perm >> 6) & 0o7
+        (perm >> 6) & 0o7 // Owner: high bits (0o700)
     } else if egid == stat.gid || supplementary.iter().any(|&g| g == stat.gid) {
-        // Group (primary or supplementary): use middle bits (0o070)
-        (perm >> 3) & 0o7
+        (perm >> 3) & 0o7 // Group (primary or supplementary): middle bits (0o070)
     } else {
-        // Others: use low bits (0o007)
-        perm & 0o7
+        perm & 0o7 // Others: low bits (0o007)
     };
 
-    // Check each requested permission
     if need_read && (check_bits & 0o4) == 0 {
         return false;
     }
@@ -1767,8 +1787,44 @@ pub fn run_exec_read_file_self_test() {
             VFS.read_file_for_exec(path, content.len() - 1),
             Err(SyscallError::E2BIG)
         ));
+
+        // R172-P6-F5: pin the DAC +x deny logic via the PRODUCTION permission_bits_allow.
+        // At boot current_host_euid()==None makes check_access_permission early-return true,
+        // so a naive "stage 0o644, expect EACCES" test tautologically passes while testing
+        // NOTHING; the extracted pure fn is the deterministic seam. Perm-relative (robust to
+        // any umask): the decision must EXACTLY match the relevant class's permission bit.
+        if let Ok(xstat) = VFS.lookup_path(path).and_then(|i| i.stat()) {
+            let perm = xstat.mode.perm;
+            let empty: &[u32] = &[];
+            // Fabricated NON-root, NON-owner, NON-group creds => the "others" bits decide.
+            let nobody_uid = xstat.uid.wrapping_add(0x4000) | 1;
+            let nobody_gid = xstat.gid.wrapping_add(0x4000) | 1;
+            // need_exec is allowed IFF the others class has +x (the motivating gate).
+            assert_eq!(
+                permission_bits_allow(nobody_uid, nobody_gid, empty, &xstat, false, false, true),
+                (perm & 0o1) != 0,
+                "P6-F5: others-exec decision must match the others +x bit"
+            );
+            // need_write IFF the others class has +w (a guaranteed deny on a 0o755 file).
+            assert_eq!(
+                permission_bits_allow(nobody_uid, nobody_gid, empty, &xstat, false, true, false),
+                (perm & 0o2) != 0,
+                "P6-F5: others-write decision must match the others +w bit"
+            );
+            // OWNER class uses the high bits.
+            assert_eq!(
+                permission_bits_allow(xstat.uid, nobody_gid, empty, &xstat, false, false, true),
+                (perm >> 6 & 0o1) != 0,
+                "P6-F5: owner-exec decision must match the owner +x bit"
+            );
+            // Host root (euid 0) ALWAYS bypasses DAC, even requesting all of r/w/x.
+            assert!(
+                permission_bits_allow(0, 0, empty, &xstat, true, true, true),
+                "P6-F5: host root bypasses DAC"
+            );
+        }
         klog_always!(
-            "    \u{2713} M0 #4 read_file_for_exec: ENOENT/EISDIR + staged read + E2BIG cap"
+            "    \u{2713} M0 #4 read_file_for_exec: ENOENT/EISDIR + staged read + E2BIG cap + DAC(R172-P6-F5)"
         );
     } else {
         klog_always!(
