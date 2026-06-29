@@ -51,9 +51,24 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
-    /// Remove a file or empty directory
-    fn unlink(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<(), FsError> {
-        let _ = (parent, name);
+    /// Remove a file or empty directory.
+    ///
+    /// `expected_ino` / `must_be_dir` mirror `rename`'s identity-binding discipline
+    /// (R172-X-F4-FOLLOWON). The fs MUST, under its directory lock, verify that `name` still
+    /// resolves to `expected_ino` (else fail closed) AND that the revalidated entry satisfies
+    /// `must_be_dir` (`None` = any type; `Some(true)` = must be a directory, else
+    /// `FsError::NotDir`; `Some(false)` = must NOT be a directory, else `FsError::IsDir`) —
+    /// atomically with the removal. This makes the rmdir-vs-unlink POSIX type gate immune to a
+    /// concurrent file<->dir swap between the caller's resolution and the actual removal (the
+    /// gate previously lived in a SEPARATE syscall-layer `stat()`).
+    fn unlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        expected_ino: u64,
+        must_be_dir: Option<bool>,
+    ) -> Result<(), FsError> {
+        let _ = (parent, name, expected_ino, must_be_dir);
         Err(FsError::NotSupported)
     }
 

@@ -9,7 +9,6 @@
 use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -17,6 +16,7 @@ use block::BlockDevice;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
+use mm::fallible_map::FallibleOrderedMap;
 use spin::{Mutex, RwLock};
 
 /// Global device filesystem ID counter
@@ -36,21 +36,32 @@ impl DevFs {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .expect("devfs: NEXT_FS_ID overflow");
 
-        let mut devices: BTreeMap<String, Arc<dyn Inode>> = BTreeMap::new();
+        // R172-22-FOLLOWON: directory entries use the allocation-fallible FallibleOrderedMap
+        // (like ramfs) so a runtime insert (register_block_device) returns NoSpace instead of
+        // aborting the kernel via handle_alloc_error. DevFs::new() registers a FIXED 3-device
+        // boot set in an infallible constructor, so an OOM here is boot-fatal by policy (the
+        // `.expect` mirrors the NEXT_FS_ID `.expect` above) — NOT closure of the OOM-abort class.
+        let mut devices: FallibleOrderedMap<String, Arc<dyn Inode>> = FallibleOrderedMap::new();
 
         // Create device inodes with self-references initialized
         // This enables open() to return FileHandle wrapping the inode
         let null_inode = Arc::new(NullDevInode::new(fs_id));
         *null_inode.self_ref.write() = Arc::downgrade(&null_inode);
-        devices.insert("null".into(), null_inode);
+        devices
+            .try_insert("null".into(), null_inode)
+            .expect("devfs: boot device registration OOM");
 
         let zero_inode = Arc::new(ZeroDevInode::new(fs_id));
         *zero_inode.self_ref.write() = Arc::downgrade(&zero_inode);
-        devices.insert("zero".into(), zero_inode);
+        devices
+            .try_insert("zero".into(), zero_inode)
+            .expect("devfs: boot device registration OOM");
 
         let console_inode = Arc::new(ConsoleDevInode::new(fs_id));
         *console_inode.self_ref.write() = Arc::downgrade(&console_inode);
-        devices.insert("console".into(), console_inode);
+        devices
+            .try_insert("console".into(), console_inode)
+            .expect("devfs: boot device registration OOM");
 
         let root = Arc::new(DevDirInode {
             fs_id,
@@ -89,7 +100,13 @@ impl DevFs {
         // This enables open() to return FileHandle wrapping the inode
         let inode = Arc::new(BlockDevInode::new(self.fs_id, ino, device));
         *inode.self_ref.write() = Arc::downgrade(&inode);
-        entries.insert(String::from(name), inode);
+        // R172-22-FOLLOWON: fallible key build + try_insert -> NoSpace (was an infallible
+        // BTreeMap::insert that aborts the kernel via handle_alloc_error on OOM). Mirrors the
+        // ramfs add_child pattern; this path is user-reachable via block-device registration.
+        let mut key = String::new();
+        key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
+        key.push_str(name);
+        entries.try_insert(key, inode).map_err(|_| FsError::NoSpace)?;
 
         Ok(())
     }
@@ -130,7 +147,7 @@ impl FileSystem for DevFs {
 struct DevDirInode {
     fs_id: u64,
     ino: u64,
-    entries: RwLock<BTreeMap<String, Arc<dyn Inode>>>,
+    entries: RwLock<FallibleOrderedMap<String, Arc<dyn Inode>>>,
     /// Self-reference for creating Arc in open()
     self_ref: RwLock<Weak<Self>>,
 }

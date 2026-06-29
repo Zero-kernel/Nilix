@@ -1734,9 +1734,10 @@ pub type VfsCreateCallback = fn(&str, u32, bool) -> Result<(), SyscallError>;
 
 /// VFS 删除文件/目录回调类型
 ///
-/// 由 vfs 模块注册，处理文件和目录删除
-/// 参数: (path) -> () 或错误
-pub type VfsUnlinkCallback = fn(&str) -> Result<(), SyscallError>;
+/// 由 vfs 模块注册，处理文件和目录删除。
+/// 参数: (path, must_be_dir) -> () 或错误。
+/// must_be_dir: None = 任意类型, Some(true) = 必须是目录 (rmdir), Some(false) = 必须不是目录 (unlink)。
+pub type VfsUnlinkCallback = fn(&str, Option<bool>) -> Result<(), SyscallError>;
 
 /// VFS 重命名回调类型 (M0-6 slice 2)
 ///
@@ -1767,7 +1768,8 @@ pub type VfsTruncateCallback = fn(i32, u64) -> Result<(), SyscallError>;
 /// parent namespace mounts to leak into child namespaces.
 ///
 /// Parameter: Arc<MountNamespace> to materialize
-pub type MountNsMaterializeCallback = fn(&alloc::sync::Arc<crate::mount_namespace::MountNamespace>);
+pub type MountNsMaterializeCallback =
+    fn(&alloc::sync::Arc<crate::mount_namespace::MountNamespace>) -> Result<(), ()>;
 
 /// 文件类型枚举(本地定义避免循环依赖)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1959,11 +1961,17 @@ pub fn test_is_mount_ns_callback_registered() -> bool {
 /// could proceed without proper mount table snapshots, potentially leaking
 /// parent namespace mounts to child namespaces.
 ///
+/// # Returns
+///
+/// `Err(())` if the VFS callback could not materialize the table (OOM); the caller maps it to
+/// ENOMEM (R172-22-FOLLOWON). A silently-dropped failure would reintroduce the R74-2
+/// lazy-materialization namespace mount-leak, so the error MUST propagate.
+///
 /// # Panics
 ///
 /// Panics with a critical error if `register_mount_ns_materialize_callback()`
 /// was not called before this function is invoked.
-fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) {
+fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) -> Result<(), ()> {
     // R74-2 Enhancement: Mandatory callback - panic if not registered.
     // Copy the fn pointer out immediately to avoid holding lock during callback.
     // MountNsMaterializeCallback is `fn(...)` which is Copy, so we dereference
@@ -1974,7 +1982,7 @@ fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) {
          namespace operations (clone/unshare with CLONE_NEWNS). This is a \
          kernel initialization bug.",
     );
-    cb(ns);
+    cb(ns)
 }
 
 // ============================================================================
@@ -3841,8 +3849,9 @@ fn sys_clone(
                 //
                 // Fix: Materialize both parent and child mount tables NOW to
                 // snapshot the parent's mount state at clone time.
-                materialize_namespace(&parent_mount_ns);
-                materialize_namespace(&ns);
+                materialize_namespace(&parent_mount_ns)
+                    .map_err(|_| SyscallError::ENOMEM)?;
+                materialize_namespace(&ns).map_err(|_| SyscallError::ENOMEM)?;
 
                 klog!(Info,
                     "[sys_clone] Created new mount namespace: id={}, level={} (eagerly materialized)",
@@ -7135,8 +7144,8 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         //
         // Same security fix as sys_clone: snapshot the parent's mount table NOW
         // to prevent post-unshare parent mounts from leaking into the child.
-        materialize_namespace(&current_ns);
-        materialize_namespace(&new_ns);
+        materialize_namespace(&current_ns).map_err(|_| SyscallError::ENOMEM)?;
+        materialize_namespace(&new_ns).map_err(|_| SyscallError::ENOMEM)?;
 
         // Update process's mount namespace (immediately takes effect)
         {
@@ -12875,18 +12884,15 @@ fn sys_rmdir(path: *const u8) -> SyscallResult {
     let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
     let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
-    // 通过回调检查是否为目录
-    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    let stat = stat_fn(path_str)?;
-    if !is_directory_mode(stat.mode) {
-        return Err(SyscallError::ENOTDIR);
-    }
-
-    // R172-X-F4: the syscall-layer path-hash LSM prehook is REMOVED. VFS Manager::unlink
-    // fires hook_file_rmdir ONCE with the revalidated parent inode (manager.rs:1216). The
-    // is_directory ENOTDIR gate above is a POSIX type check (not MAC) and stays.
+    // R172-X-F4-FOLLOWON: the POSIX dir-vs-file gate is NO LONGER a separate syscall-layer
+    // stat(path) (which raced the actual removal — a file<->dir swap between the stat and the
+    // unlink could make rmdir remove a file). It is folded into the VFS unlink contract via
+    // `must_be_dir = Some(true)`, enforced against the FINAL revalidated inode ATOMICALLY with
+    // the removal (manager.rs -> fs.unlink). ENOTDIR is preserved via FsError::NotDir. The MAC
+    // gate (hook_file_rmdir) still fires ONCE in Manager::unlink with the revalidated parent
+    // inode (R172-X-F4).
     let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    unlink_fn(path_str)?;
+    unlink_fn(path_str, Some(true))?;
     Ok(0)
 }
 
@@ -12899,19 +12905,14 @@ fn sys_unlink(path: *const u8) -> SyscallResult {
     let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
     let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
-    // 不允许删除目录 (应使用rmdir)
-    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    if let Ok(stat) = stat_fn(path_str) {
-        if is_directory_mode(stat.mode) {
-            return Err(SyscallError::EISDIR);
-        }
-    }
-
-    // R172-X-F4: the syscall-layer path-hash LSM prehook is REMOVED. VFS Manager::unlink
-    // fires hook_file_unlink ONCE with the revalidated parent inode (manager.rs:1219). The
-    // is_directory EISDIR guard above is a POSIX type check (not MAC) and stays.
+    // R172-X-F4-FOLLOWON: the "不允许删除目录 (应使用rmdir)" gate is NO LONGER a separate
+    // syscall-layer stat(path) (which raced the actual removal — a file<->dir swap between the
+    // stat and the unlink could make unlink remove a directory). It is folded into the VFS
+    // unlink contract via `must_be_dir = Some(false)`, enforced against the FINAL revalidated
+    // inode ATOMICALLY with the removal. EISDIR is preserved via FsError::IsDir. The MAC gate
+    // (hook_file_unlink) still fires ONCE in Manager::unlink (R172-X-F4).
     let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    unlink_fn(path_str)?;
+    unlink_fn(path_str, Some(false))?;
     Ok(0)
 }
 

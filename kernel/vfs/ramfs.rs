@@ -837,24 +837,64 @@ impl FileSystem for RamFs {
         Ok(new_inode as Arc<dyn Inode>)
     }
 
-    fn unlink(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<(), FsError> {
+    fn unlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        expected_ino: u64,
+        must_be_dir: Option<bool>,
+    ) -> Result<(), FsError> {
         let parent = self.downcast_inode(parent)?;
 
         // Check if parent is a directory
         if !parent.is_dir() {
             return Err(FsError::NotDir);
         }
-
-        // Look up the child first to check if it's a non-empty directory
-        let child = parent.lookup_child(name)?;
-
-        // If it's a directory, it must be empty
-        if child.is_dir() && child.child_count() > 0 {
-            return Err(FsError::NotEmpty);
+        // remove_child rejected "."/".."; the inlined remove below must keep doing so.
+        if name == "." || name == ".." {
+            return Err(FsError::Invalid);
         }
 
-        // Remove from parent
-        let removed = parent.remove_child(name)?;
+        // R172-X-F4-FOLLOWON: the non-empty-directory pre-check uses the child's OWN (released)
+        // `entries` lock and is NEVER taken while holding the parent guard. RAMFS_RENAME_LOCK's
+        // invariant (see ramfs.rs ~:314) is that non-rename ops hold a SINGLE parent `entries`
+        // lock, so nesting child_count()'s lock under the parent write guard below would reopen
+        // the rename-vs-unlink ABBA that lock exists to prevent. This check stays advisory (the
+        // pre-existing add-after-check race is unchanged and out of scope); the AUTHORITATIVE
+        // identity+type gate runs atomically with the removal.
+        if let Ok(child) = parent.lookup_child(name) {
+            if child.is_dir() && child.child_count() > 0 {
+                return Err(FsError::NotEmpty);
+            }
+        }
+
+        // R172-X-F4-FOLLOWON: under ONE parent `entries` write guard, re-verify the entry STILL
+        // maps to `expected_ino` (closes the file<->dir swap TOCTOU the manager's separate
+        // stat()/lookup could not) AND satisfies the POSIX type gate (`must_be_dir`), then
+        // remove — all observing one unchanged parent directory state. `ino()` is a plain field
+        // read and ramfs `is_dir()` is a lock-free `matches!`, so the gate takes NO second lock
+        // (no entries->entries nesting), preserving the single-parent-lock invariant above.
+        let entries = parent.dir_entries().ok_or(FsError::NotDir)?;
+        let removed = {
+            let mut guard = entries.write();
+            let current = guard.get(name).cloned().ok_or(FsError::NotFound)?;
+            if current.ino() != expected_ino {
+                // Entry was swapped since the manager's revalidated lookup -> fail closed,
+                // mirroring the manager's C.4 inode-swap reject (so a removal can never land on
+                // an inode other than the one the DAC/sticky/LSM decision was bound to).
+                return Err(FsError::PermDenied);
+            }
+            match must_be_dir {
+                Some(true) if !current.is_dir() => return Err(FsError::NotDir), // rmdir on non-dir
+                Some(false) if current.is_dir() => return Err(FsError::IsDir),  // unlink on dir
+                _ => {}
+            }
+            guard.remove(name).ok_or(FsError::NotFound)?
+        };
+
+        // The raw-map remove bypassed remove_child (which updates the parent dir timestamps);
+        // mirror it, exactly as the atomic rename path does (ramfs.rs ~:292).
+        parent.touch_mtime_ctime();
 
         // If removing a directory, decrement parent's nlink
         if removed.is_dir() {

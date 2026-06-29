@@ -5,12 +5,12 @@
 //! - Implements FileSystem/Inode; all mutating ops return ReadOnly
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
+use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
 use crate::traits::{FileHandle, FileSystem, Inode};
@@ -155,8 +155,16 @@ impl Initramfs {
         );
 
         // Track inodes by their original inode number for hardlink support
-        let mut inode_by_ino: BTreeMap<u64, Arc<InitramfsInode>> = BTreeMap::new();
-        inode_by_ino.insert(root.ino, root.clone());
+        // R172-22-FOLLOWON: the hardlink-tracking map uses the allocation-fallible
+        // FallibleOrderedMap (like ramfs) so a crafted/oversized CPIO archive returns NoSpace at
+        // boot instead of aborting the kernel via handle_alloc_error. (File-data and inode
+        // allocations on this path stay infallible — this closes the map-slot abort, not every
+        // from_cpio OOM abort.)
+        let mut inode_by_ino: FallibleOrderedMap<u64, Arc<InitramfsInode>> =
+            FallibleOrderedMap::new();
+        inode_by_ino
+            .try_insert(root.ino, root.clone())
+            .map_err(|_| FsError::NoSpace)?;
 
         let mut offset = 0usize;
 
@@ -253,7 +261,9 @@ impl Initramfs {
                     ),
                     _ => unreachable!(),
                 };
-                inode_by_ino.insert(header.ino, inode.clone());
+                inode_by_ino
+                    .try_insert(header.ino, inode.clone())
+                    .map_err(|_| FsError::NoSpace)?;
                 inode
             };
 
@@ -301,7 +311,13 @@ impl FileSystem for Initramfs {
         Err(FsError::ReadOnly)
     }
 
-    fn unlink(&self, _parent: &Arc<dyn Inode>, _name: &str) -> Result<(), FsError> {
+    fn unlink(
+        &self,
+        _parent: &Arc<dyn Inode>,
+        _name: &str,
+        _expected_ino: u64,
+        _must_be_dir: Option<bool>,
+    ) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 
@@ -339,7 +355,7 @@ struct NodeMeta {
 /// Inode content type
 enum NodeKind {
     Directory {
-        children: RwLock<BTreeMap<String, Arc<InitramfsInode>>>,
+        children: RwLock<FallibleOrderedMap<String, Arc<InitramfsInode>>>,
     },
     File {
         data: Arc<[u8]>,
@@ -383,7 +399,7 @@ impl InitramfsInode {
                 ctime: mtime,
             }),
             kind: NodeKind::Directory {
-                children: RwLock::new(BTreeMap::new()),
+                children: RwLock::new(FallibleOrderedMap::new()),
             },
             self_ref: RwLock::new(None),
         });
@@ -480,7 +496,12 @@ impl InitramfsInode {
                     // Allow replacing existing entry for hardlink support
                     return Ok(());
                 }
-                guard.insert(name.to_string(), child);
+                // R172-22-FOLLOWON: fallible key build + try_insert -> NoSpace (was an infallible
+                // BTreeMap::insert that aborts the kernel on OOM).
+                let mut key = String::new();
+                key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
+                key.push_str(name);
+                guard.try_insert(key, child).map_err(|_| FsError::NoSpace)?;
                 Ok(())
             }
             _ => Err(FsError::NotDir),

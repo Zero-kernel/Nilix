@@ -320,11 +320,30 @@ impl FileSystem for CgroupFs {
         }
     }
 
-    fn unlink(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<(), FsError> {
+    fn unlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        expected_ino: u64,
+        must_be_dir: Option<bool>,
+    ) -> Result<(), FsError> {
         let dir = parent
             .as_any()
             .downcast_ref::<CgroupDirInode>()
             .ok_or(FsError::NotDir)?;
+
+        // R172-X-F4-FOLLOWON: a cgroupfs control file (cgroup.procs, etc.) is never a directory
+        // and is not a removable entry. The cgroup-dir-only scan below would report it as
+        // ENOENT, but the POSIX type gate must see it as a NON-directory: rmdir(2) on it is
+        // ENOTDIR — the fidelity the deleted syscall-layer stat() used to provide. Control-file
+        // names and the numeric child-cgroup pseudo-names are disjoint, so this branch is exact;
+        // unlink(2) and other cases stay ENOENT (control files are not removable).
+        if CtrlKind::from_filename(name).is_some() {
+            if must_be_dir == Some(true) {
+                return Err(FsError::NotDir);
+            }
+            return Err(FsError::NotFound);
+        }
 
         // P1-3: Require root or delegated subtree owner on parent cgroup
         if !is_privileged_or_delegate(dir.cgroup_id) {
@@ -342,6 +361,17 @@ impl FileSystem for CgroupFs {
                 format!("{}", child_id) == name && cgroup::lookup_cgroup(*child_id).is_some()
             })
             .ok_or(FsError::NotFound)?;
+
+        // R172-X-F4-FOLLOWON: bind the delete to the exact inode the manager revalidated (the
+        // cgroup dir's deterministic ino) and honor the POSIX type gate. A cgroup is ALWAYS a
+        // directory, so unlink(2) (must_be_dir == Some(false)) must refuse it with EISDIR
+        // instead of silently deleting it; rmdir(2) (Some(true)) and None proceed.
+        if cgroup_dir_ino(child_id) != expected_ino {
+            return Err(FsError::PermDenied);
+        }
+        if must_be_dir == Some(false) {
+            return Err(FsError::IsDir);
+        }
 
         // Delete the cgroup
         match cgroup::delete_cgroup(child_id) {

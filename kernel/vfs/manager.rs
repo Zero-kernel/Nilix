@@ -15,7 +15,6 @@ use crate::ramfs::RamFs;
 use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, ResolveFlags, Stat};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -26,6 +25,7 @@ use kernel_core::{
     current_mount_ns, current_umask, FileDescriptor, FileOps, MountNamespace, SyscallError,
     VfsStat, ROOT_MNT_NAMESPACE,
 };
+use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
 // R25-9 FIX: Import LSM hooks for MAC enforcement
@@ -193,8 +193,6 @@ fn strip_suid_sgid_if_needed(perm: u16, is_dir: bool) -> u16 {
 /// Mount point information
 #[derive(Clone)]
 struct Mount {
-    /// Absolute path where this filesystem is mounted
-    path: String,
     /// The mounted filesystem
     fs: Arc<dyn FileSystem>,
 }
@@ -209,7 +207,7 @@ struct Mount {
 /// to be isolated between namespaces.
 struct NamespaceMountTable {
     /// Mount points within this namespace: path -> Mount
-    mounts: RwLock<BTreeMap<String, Mount>>,
+    mounts: RwLock<FallibleOrderedMap<String, Mount>>,
     /// Root filesystem for this namespace
     root_fs: RwLock<Option<Arc<dyn FileSystem>>>,
 }
@@ -218,7 +216,7 @@ impl NamespaceMountTable {
     /// Create a new empty mount table.
     fn new() -> Self {
         Self {
-            mounts: RwLock::new(BTreeMap::new()),
+            mounts: RwLock::new(FallibleOrderedMap::new()),
             root_fs: RwLock::new(None),
         }
     }
@@ -227,16 +225,26 @@ impl NamespaceMountTable {
     ///
     /// This creates a copy of all mount points, allowing the child namespace
     /// to diverge from the parent without affecting it.
-    fn clone_from(parent: &NamespaceMountTable) -> Self {
+    ///
+    /// R172-22-FOLLOWON: the copy is allocation-FALLIBLE. `FallibleOrderedMap::try_clone` is
+    /// insufficient because its internal `String` key clone is itself infallible, so this does a
+    /// MANUAL deep clone (fallible key copy + Arc value clone). On OOM it returns NoMem and the
+    /// caller (`ensure_namespace_table`) fails the CLONE_NEWNS/unshare with ENOMEM instead of
+    /// aborting the kernel via handle_alloc_error.
+    fn try_clone_from(parent: &NamespaceMountTable) -> Result<Self, FsError> {
         let src = parent.mounts.read();
-        let mut mounts = BTreeMap::new();
+        let mut mounts: FallibleOrderedMap<String, Mount> = FallibleOrderedMap::new();
+        mounts.try_reserve(src.len()).map_err(|_| FsError::NoMem)?;
         for (k, v) in src.iter() {
-            mounts.insert(k.clone(), v.clone());
+            let mut key = String::new();
+            key.try_reserve(k.len()).map_err(|_| FsError::NoMem)?;
+            key.push_str(k);
+            mounts.try_insert(key, v.clone()).map_err(|_| FsError::NoMem)?;
         }
-        Self {
+        Ok(Self {
             mounts: RwLock::new(mounts),
             root_fs: RwLock::new(parent.root_fs.read().clone()),
-        }
+        })
     }
 }
 
@@ -245,7 +253,7 @@ pub struct Vfs {
     /// Namespace ID -> mount table mapping
     ///
     /// Each mount namespace has its own mount table for filesystem isolation.
-    mount_tables: RwLock<BTreeMap<NamespaceId, Arc<NamespaceMountTable>>>,
+    mount_tables: RwLock<FallibleOrderedMap<NamespaceId, Arc<NamespaceMountTable>>>,
     /// Device filesystem handle for block device registration
     devfs: RwLock<Option<Arc<DevFs>>>,
 }
@@ -254,7 +262,7 @@ impl Vfs {
     /// Create a new VFS instance
     pub const fn new() -> Self {
         Self {
-            mount_tables: RwLock::new(BTreeMap::new()),
+            mount_tables: RwLock::new(FallibleOrderedMap::new()),
             devfs: RwLock::new(None),
         }
     }
@@ -271,12 +279,15 @@ impl Vfs {
     /// This ensures that:
     /// 1. The child sees all mounts that existed in the parent at creation time
     /// 2. Subsequent mounts in either namespace are independent
-    fn ensure_namespace_table(&self, ns: &Arc<MountNamespace>) -> Arc<NamespaceMountTable> {
+    fn ensure_namespace_table(
+        &self,
+        ns: &Arc<MountNamespace>,
+    ) -> Result<Arc<NamespaceMountTable>, FsError> {
         // Fast path: table already exists
         {
             let guard = self.mount_tables.read();
             if let Some(existing) = guard.get(&ns.id()).cloned() {
-                return existing;
+                return Ok(existing);
             }
         }
 
@@ -285,7 +296,7 @@ impl Vfs {
         if let Some(parent) = ns.parent() {
             // Recursive call to ensure parent table is materialized
             // This avoids the case where child gets empty table because parent wasn't created yet
-            let _ = self.ensure_namespace_table(&parent);
+            self.ensure_namespace_table(&parent)?;
         }
 
         // Slow path: create table
@@ -293,24 +304,30 @@ impl Vfs {
 
         // Double-check after acquiring write lock
         if let Some(existing) = guard.get(&ns.id()).cloned() {
-            return existing;
+            return Ok(existing);
         }
 
-        // Create new table
+        // Create new table.
+        // R172-22-FOLLOWON: the parent copy (try_clone_from) and the table-map insert are
+        // allocation-FALLIBLE (FallibleOrderedMap) so an OOM here returns NoMem (-> ENOMEM at the
+        // clone/unshare callers) instead of aborting the kernel via handle_alloc_error.
         let table = if let Some(parent) = ns.parent() {
             // Clone from parent - parent table is guaranteed to exist now
             guard
                 .get(&parent.id())
                 .cloned()
-                .map(|p| Arc::new(NamespaceMountTable::clone_from(p.as_ref())))
+                .map(|p| NamespaceMountTable::try_clone_from(p.as_ref()).map(Arc::new))
+                .transpose()?
                 .unwrap_or_else(|| Arc::new(NamespaceMountTable::new()))
         } else {
             // Root namespace: create empty table
             Arc::new(NamespaceMountTable::new())
         };
 
-        guard.insert(ns.id(), table.clone());
-        table
+        guard
+            .try_insert(ns.id(), table.clone())
+            .map_err(|_| FsError::NoMem)?;
+        Ok(table)
     }
 
     /// R74-2 FIX: Force eager materialization of mount namespace table.
@@ -343,11 +360,15 @@ impl Vfs {
     /// VFS.materialize_namespace(&parent_ns);  // Ensure parent is stable
     /// VFS.materialize_namespace(&new_ns);     // Snapshot parent NOW
     /// ```
-    pub fn materialize_namespace(&self, ns: &Arc<MountNamespace>) {
+    pub fn materialize_namespace(&self, ns: &Arc<MountNamespace>) -> Result<(), FsError> {
         // ensure_namespace_table already performs the snapshot when the
         // table doesn't exist. Calling it explicitly forces immediate
         // materialization instead of deferring to first VFS access.
-        let _ = self.ensure_namespace_table(ns);
+        // R172-22-FOLLOWON: propagate OOM (NoMem) instead of swallowing it with `let _`. The
+        // clone/unshare callers map it to ENOMEM; a silently-dropped materialization would
+        // reintroduce the R74-2 lazy-materialization namespace-leak, so the failure MUST surface.
+        self.ensure_namespace_table(ns)?;
+        Ok(())
     }
 
     /// Initialize the VFS with default mounts
@@ -357,7 +378,9 @@ impl Vfs {
 
         // Get the root mount namespace and its table
         let root_ns = ROOT_MNT_NAMESPACE.clone();
-        let root_table = self.ensure_namespace_table(&root_ns);
+        let root_table = self
+            .ensure_namespace_table(&root_ns)
+            .expect("boot: root mount table OOM");
 
         // Set ramfs as root in the root namespace's table
         *root_table.root_fs.write() = Some(ramfs.clone());
@@ -478,7 +501,7 @@ impl Vfs {
         fs: Arc<dyn FileSystem>,
     ) -> Result<(), FsError> {
         let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns);
+        let table = self.ensure_namespace_table(ns)?;
         let mut mounts = table.mounts.write();
 
         if mounts.contains_key(&path) {
@@ -491,18 +514,19 @@ impl Vfs {
             return Err(FsError::NoMem);
         }
 
-        mounts.insert(
-            path.clone(),
-            Mount {
-                path: path.clone(),
-                fs: fs.clone(),
-            },
-        );
+        // R172-22-FOLLOWON: try_insert (allocation-fallible) -> NoMem instead of an infallible
+        // BTreeMap::insert that aborts the kernel via handle_alloc_error on OOM. The path String
+        // is MOVED into the map key (the dead Mount.path field was dropped), so capture is_root
+        // first.
+        let is_root = path == "/";
+        mounts
+            .try_insert(path, Mount { fs: fs.clone() })
+            .map_err(|_| FsError::NoMem)?;
 
         // R152-9 FIX: Update root_fs while still holding mounts lock
         // to prevent a concurrent find_mount from observing an inconsistent
         // state between mounts and root_fs.
-        if path == "/" {
+        if is_root {
             *table.root_fs.write() = Some(fs);
         }
 
@@ -548,7 +572,7 @@ impl Vfs {
     /// * `path` - Normalized path to unmount
     pub fn umount_in_namespace(&self, ns: &Arc<MountNamespace>, path: &str) -> Result<(), FsError> {
         let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns);
+        let table = self.ensure_namespace_table(ns)?;
         let mut mounts = table.mounts.write();
 
         if mounts.remove(&path).is_some() {
@@ -1179,7 +1203,7 @@ impl Vfs {
     ///
     /// Enforces sticky-bit semantics: in a directory with sticky bit set (mode & 0o1000),
     /// only root, the directory owner, or the file owner may delete files.
-    pub fn unlink(&self, path: &str) -> Result<(), FsError> {
+    pub fn unlink(&self, path: &str, must_be_dir: Option<bool>) -> Result<(), FsError> {
         let path = normalize_path(path)?;
 
         let (parent_path, filename) = split_path(&path)?;
@@ -1248,7 +1272,9 @@ impl Vfs {
             return Err(FsError::PermDenied);
         }
 
-        fs.unlink(&parent, filename)
+        // R172-X-F4-FOLLOWON: pass the C.4-revalidated `child_ino` + the POSIX type gate down so
+        // the fs enforces both ATOMICALLY with the removal (no separate syscall-layer stat()).
+        fs.unlink(&parent, filename, child_ino, must_be_dir)
     }
 
     /// M0-6 slice 2: rename / renameat2(RENAME_NOREPLACE). A two-parent atomic move with
@@ -1417,7 +1443,7 @@ impl Vfs {
     ) -> Result<(String, Arc<dyn FileSystem>, String), FsError> {
         // Normalize path to prevent traversal attacks and ensure consistent matching
         let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns);
+        let table = self.ensure_namespace_table(ns)?;
         let mounts = table.mounts.read();
 
         // Helper to check if path matches mount point with proper boundaries
@@ -1977,8 +2003,10 @@ pub fn register_syscall_callbacks() {
 /// Called by syscall layer when a new mount namespace is created to ensure
 /// the mount table is eagerly materialized, preventing race conditions where
 /// parent namespace mounts could leak into the child.
-fn mount_ns_materialize_callback(ns: &alloc::sync::Arc<kernel_core::MountNamespace>) {
-    VFS.materialize_namespace(ns);
+fn mount_ns_materialize_callback(
+    ns: &alloc::sync::Arc<kernel_core::MountNamespace>,
+) -> Result<(), ()> {
+    VFS.materialize_namespace(ns).map_err(|_| ())
 }
 
 /// VFS create callback for syscall registration
@@ -1999,8 +2027,8 @@ fn vfs_create_callback(path: &str, mode: u32, is_dir: bool) -> Result<(), Syscal
 /// VFS unlink callback for syscall registration
 ///
 /// Called by sys_unlink/sys_rmdir to delete files/directories
-fn vfs_unlink_callback(path: &str) -> Result<(), SyscallError> {
-    VFS.unlink(path).map_err(fs_error_to_syscall)
+fn vfs_unlink_callback(path: &str, must_be_dir: Option<bool>) -> Result<(), SyscallError> {
+    VFS.unlink(path, must_be_dir).map_err(fs_error_to_syscall)
 }
 
 /// VFS rename callback for syscall registration (M0-6 slice 2).

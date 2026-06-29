@@ -258,6 +258,16 @@ pub struct MountNamespace {
     /// Mount table: path -> Mount
     ///
     /// Key is the absolute mount path (e.g., "/", "/dev", "/proc")
+    ///
+    /// R172-22-FOLLOWON (DE-SCOPED): intentionally left as `BTreeMap`, NOT migrated to the
+    /// allocation-fallible `FallibleOrderedMap` (unlike ramfs/devfs/initramfs and the live
+    /// `manager.rs` tables). This `MountNamespace` table API (`add_mount`/`copy_mounts`/
+    /// `find_mount`/`has_submounts`) has NO in-tree LIVE caller: the live VFS mount path uses
+    /// `kernel_core::MountNamespace` for identity and keys mounts by `NamespaceId` in
+    /// `manager.rs`'s own `NamespaceMountTable` (which WAS migrated). NOTE: this module is still
+    /// re-exported from `vfs/lib.rs`, so it remains a callable PUBLIC API surface — "dead" here
+    /// means dead-on-the-live-path, not unreachable. Migrating an unused secondary table is wasted
+    /// risk; tracked for separate deletion (it still hosts `MAX_MOUNTS_PER_NS`, used by `manager.rs`).
     mounts: RwLock<BTreeMap<String, Mount>>,
 
     /// Root mount path for this namespace (usually "/")
