@@ -7195,9 +7195,12 @@ pub fn try_deliver_signal_on_irq_return(
         // Try to grow the stack to cover the frame
         let target_floor = (frame_base as usize) & !(PAGE_SIZE - 1);
 
-        // Check if we need to grow
+        // Check if we need to grow (R173-01 FIX: try_lock for IRQ safety)
         let need_grow = {
-            let mm = proc_guard.mm.lock();
+            let mm = match proc_guard.mm.try_lock() {
+                Some(mm) => mm,
+                None => return None, // mm lock contended - defer signal delivery
+            };
             target_floor < mm.stack_floor_committed
         };
 
@@ -8034,15 +8037,14 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
+    // R173-05 FIX: Reject O_CLOEXEC until per-fd CLOEXEC tracking is implemented
+    // Fail-closed: return EINVAL rather than silently ignoring the flag
+    if flags & O_CLOEXEC != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
     // Create pipe
     let (read_fd, write_fd) = create_fn()?;
-
-    // Apply O_CLOEXEC if requested
-    if flags & O_CLOEXEC != 0 {
-        // Set close-on-exec for both fds
-        // Note: O_NONBLOCK is not supported yet (pipes are always blocking)
-        // TODO: Add FD_CLOEXEC flag support when fcntl(F_SETFD) is implemented
-    }
 
     // Write fds to user space
     let fd_array = [read_fd, write_fd];
@@ -8096,7 +8098,7 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     const FD_CLOEXEC: i32 = 1;
 
     match cmd {
-        F_DUPFD | F_DUPFD_CLOEXEC => {
+        F_DUPFD => {
             // Duplicate fd to lowest-numbered fd >= arg
             let min_fd = arg as i32;
             if min_fd < 0 {
@@ -8136,9 +8138,13 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             proc.fd_table.insert(new_fd, cloned_desc);
             proc.fds_charged_count = proc.fds_charged_count.saturating_add(1);
 
-            // TODO: Set FD_CLOEXEC if cmd == F_DUPFD_CLOEXEC
-
             Ok(new_fd as usize)
+        }
+
+        F_DUPFD_CLOEXEC => {
+            // R173-06 FIX: Reject F_DUPFD_CLOEXEC until per-fd CLOEXEC tracking is implemented
+            // Fail-closed: return EINVAL rather than silently ignoring the cloexec flag
+            return Err(SyscallError::EINVAL);
         }
 
         F_GETFD => {
@@ -8232,48 +8238,11 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 ///
 /// Number of bytes read or errno
 fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
-    // Negative offset is invalid
-    if offset < 0 {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // Size limit
-    let count = match count {
-        0 => return Ok(0),
-        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
-        c => c,
-    };
-
-    // Validate user buffer
-    validate_user_ptr_mut(buf, count)?;
-
-    // stdin/stdout/stderr don't support pread
-    if fd < 3 {
-        return Err(SyscallError::ESPIPE);
-    }
-
-    // Get read callback
-    let read_fn = {
-        let callback = FD_READ_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
-    };
-
-    // Allocate temporary buffer
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
-
-    // Read at offset (callback should not modify fd's current offset)
-    // Note: Current implementation doesn't support positioned I/O yet
-    // For now, treat as regular read (this is a limitation)
-    let bytes_read = read_fn(fd, &mut tmp)?;
-    let bytes_read = bytes_read.min(count);
-
-    // Copy to user space
-    copy_to_user(buf, &tmp[..bytes_read])?;
-
-    Ok(bytes_read)
+    // R173-07 FIX: Return ENOSYS until positioned I/O is implemented
+    // Fail-closed: return ENOSYS rather than silently ignoring the offset parameter
+    // (treating as regular read causes data corruption when user expects positioned I/O)
+    let _ = (fd, buf, count, offset); // Suppress unused warnings
+    return Err(SyscallError::ENOSYS);
 }
 
 /// sys_pwrite64 - 向文件描述符在指定偏移量写入数据
@@ -8291,45 +8260,11 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResul
 ///
 /// Number of bytes written or errno
 fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallResult {
-    // Negative offset is invalid
-    if offset < 0 {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // Size limit
-    let count = match count {
-        0 => return Ok(0),
-        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
-        c => c,
-    };
-
-    // Validate user buffer
-    validate_user_ptr(buf, count)?;
-
-    // stdin/stdout/stderr don't support pwrite
-    if fd < 3 {
-        return Err(SyscallError::ESPIPE);
-    }
-
-    // Get write callback
-    let write_fn = {
-        let callback = FD_WRITE_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
-    };
-
-    // Copy from user space
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
-    copy_from_user(&mut tmp, buf)?;
-
-    // Write at offset (callback should not modify fd's current offset)
-    // Note: Current implementation doesn't support positioned I/O yet
-    // For now, treat as regular write (this is a limitation)
-    let bytes_written = write_fn(fd, &tmp)?;
-
-    Ok(bytes_written.min(count))
+    // R173-07 FIX: Return ENOSYS until positioned I/O is implemented
+    // Fail-closed: return ENOSYS rather than silently ignoring the offset parameter
+    // (treating as regular write causes data corruption when user expects positioned I/O)
+    let _ = (fd, buf, count, offset); // Suppress unused warnings
+    return Err(SyscallError::ENOSYS);
 }
 
 /// sys_read - 从文件描述符读取数据
@@ -10126,8 +10061,11 @@ pub fn try_demand_grow_user_stack(
     // Bounded batch: grow up to 8 pages downward from fault_page_base
     const MAX_GROW_PAGES: usize = 8;
 
-    // Acquire process lock (try_lock for IRQ safety)
-    let proc = process_arc.lock();
+    // Acquire process lock (R173-02 FIX: try_lock for IRQ safety in #PF handler)
+    let proc = match process_arc.try_lock() {
+        Some(p) => p,
+        None => return Err(SyscallError::EAGAIN), // Lock contended - let #PF retry
+    };
 
     // Verify this is the current process
     if current_pid() != Some(proc.pid) {
@@ -10138,9 +10076,10 @@ pub fn try_demand_grow_user_stack(
     let mm_arc = Arc::clone(&proc.mm);
     let rlim_cur = proc.rlimits[crate::process::RLIMIT_STACK].rlim_cur;
 
-    // Check stack_floor_committed and compute grow range
-    let (old_floor, grow_pages) = {
-        let mm = mm_arc.lock();
+    // R173-03 FIX: Atomic check-and-set for stack_grow_in_progress (single critical section)
+    // Check stack_floor_committed, verify grow is valid, and claim reservation atomically
+    let (old_floor, grow_pages, new_floor, grow_size) = {
+        let mut mm = mm_arc.lock();
         let old_floor = mm.stack_floor_committed;
 
         // Sentinel: no user image installed yet
@@ -10159,31 +10098,23 @@ pub fn try_demand_grow_user_stack(
             return Err(SyscallError::ENOMEM);
         }
 
-        // Check for concurrent grow
+        // Check for concurrent grow and atomically claim reservation
         if mm.stack_grow_in_progress {
             return Err(SyscallError::EAGAIN);
         }
+        mm.stack_grow_in_progress = true; // Atomically claim reservation
 
         // Compute how many pages to map (bounded by MAX_GROW_PAGES)
         let span = old_floor - fault_page_base;
         let pages_needed = (span + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_to_map = pages_needed.min(MAX_GROW_PAGES);
 
-        (old_floor, pages_to_map)
+        // Compute new floor and grow size under lock
+        let new_floor = old_floor - (pages_to_map * PAGE_SIZE);
+        let grow_size = pages_to_map * PAGE_SIZE;
+
+        (old_floor, pages_to_map, new_floor, grow_size)
     };
-
-    // Compute new floor after this grow
-    let new_floor = old_floor - (grow_pages * PAGE_SIZE);
-    let grow_size = grow_pages * PAGE_SIZE;
-
-    // Set reservation flag
-    {
-        let mut mm = mm_arc.lock();
-        if mm.stack_grow_in_progress {
-            return Err(SyscallError::EAGAIN);
-        }
-        mm.stack_grow_in_progress = true;
-    }
 
     // Release Process lock before PT work
     drop(proc);
@@ -10241,12 +10172,14 @@ pub fn try_demand_grow_user_stack(
                 mm.stack_grow_in_progress = false;
             }
 
-            // Defer the actual cgroup charge (will be processed at next syscall boundary)
-            // For now, immediately charge to avoid complexity
-            // TODO: Implement true deferred charge mechanism
+            // R173-08 DOCUMENTED: Deferred cgroup charge design not yet implemented
+            // TODO: Implement true deferred-charge mechanism (IRQs-off, no blocking locks)
+            // Current immediate charge contains blocking lock (cgroup.limits.lock()) which
+            // could deadlock in #PF handler. However, this code path is SMP-gated (R173-04)
+            // so the deadlock scenario (cross-CPU lock hold) cannot occur until SLICE 6.
+            // TRACKED: Implement deferred charge queue before enabling SMP demand-grow.
             if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
                 // Charge failed - kill the process
-                // TODO: Add proper deferred-charge handling
                 return Err(SyscallError::ENOMEM);
             }
 
@@ -13740,13 +13673,11 @@ fn sys_rmdir(path: *const u8) -> SyscallResult {
 ///
 /// EPERM (hard links not supported yet)
 fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
+    // R173-09 FIX: Return EPERM immediately after null check
+    // Skip usercopy validation for unimplemented stub (low-priority efficiency fix)
     if oldpath.is_null() || newpath.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
-    // Validate paths
-    let _old_bytes = crate::usercopy::copy_user_cstring(oldpath).map_err(|_| SyscallError::EFAULT)?;
-    let _new_bytes = crate::usercopy::copy_user_cstring(newpath).map_err(|_| SyscallError::EFAULT)?;
 
     // Hard links require:
     // 1. VFS inode link count tracking
