@@ -62,8 +62,10 @@ mod integration_test;
 mod interrupt_demo;
 mod process_demo;
 mod runtime_tests;
+mod shell;
 mod stack_guard;
 mod syscall_demo;
+mod test_framework;
 mod usermode_test;
 
 // 串口端口
@@ -1170,22 +1172,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 
-    // 先尝试强制调度一次，让 Ring 3 测试进程运行
-    // 这是 Phase 6 Ring 3 测试的关键：调度器会检测到用户进程并使用 IRETQ 进入用户态
-    sched::enhanced_scheduler::Scheduler::reschedule_now(true);
+    // Enter interactive shell after all tests complete
+    // The shell runs on the BSP and provides a Linux-compatible command-line interface
+    klog_always!();
+    klog_always!("All runtime tests complete. Entering interactive shell...");
+    klog_always!();
 
-    // 主内核循环
-    // R98-3 FIX: Use reschedule_if_needed() instead of direct scheduler calls.
-    // This ensures deferred timer work (TIME_WAIT cleanup, TCP retransmissions)
-    // and RCU callbacks are drained even when the system is idle (no syscalls).
-    loop {
-        // Drain deferred work and check for reschedule requests
-        kernel_core::reschedule_if_needed();
-
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
-    }
+    // Transfer control to the shell (never returns unless exited explicitly)
+    // Note: The shell will run concurrently with any Ring 3 processes
+    // The scheduler will time-slice between them
+    shell::init_and_run();
 }
 
 #[alloc_error_handler]

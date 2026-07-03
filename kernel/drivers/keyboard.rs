@@ -424,3 +424,17 @@ pub fn clear() {
 pub fn dropped_count() -> u64 {
     DROPPED_BYTES.load(Ordering::Relaxed)
 }
+
+/// Try to pop a single character from the keyboard buffer (alias for read_char)
+///
+/// Non-blocking: returns None if no input available.
+/// This is an alias for `read_char()` to match the naming convention
+/// expected by the shell module.
+///
+/// # Returns
+///
+/// The next character, or None if buffer empty
+#[inline]
+pub fn try_pop_char() -> Option<u8> {
+    read_char()
+}

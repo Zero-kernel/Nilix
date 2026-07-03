@@ -357,7 +357,9 @@ run-smp-debug: build disk-ext2.img
 		-D qemu-smp.log
 
 # H.2.2 CI gate: Reject ungated println! in kernel code.
-# Allowed locations: kernel/drivers/ (macro definition), kernel/klog/ (implementation).
+# Allowed locations: kernel/drivers/ (macro definition), kernel/klog/ (implementation),
+# build.rs (cargo build-script protocol REQUIRES println!("cargo:...")), and
+# kernel/tests/ (host-side tests, not kernel runtime code).
 # All other crates must use kprintln!, klog!, or klog_always!.
 # Comments and doc strings containing println! are excluded.
 lint-release:
@@ -366,6 +368,8 @@ lint-release:
 		--include='*.rs' \
 		--exclude-dir=drivers \
 		--exclude-dir=klog \
+		--exclude-dir=tests \
+		--exclude=build.rs \
 		| grep -v '^\s*//' \
 		| grep -v '//.*println!' \
 		| grep -v '///.*println!' \

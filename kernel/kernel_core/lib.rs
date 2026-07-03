@@ -14,6 +14,10 @@ extern crate klog;
 // 导出 vga_buffer 模块中的其他公共函数
 pub use drivers::vga_buffer;
 
+// Defense-in-depth: Fail-closed syscall stub generator (R173 Layer 3)
+#[macro_use]
+pub mod syscall_macros;
+
 pub mod cgroup;
 pub mod elf_loader;
 pub mod exception_table;
@@ -141,6 +145,8 @@ pub use syscall::{
     register_vfs_lseek_callback,
     register_vfs_open_callback,
     register_vfs_open_with_resolve_callback,
+    register_vfs_pread_callback,
+    register_vfs_pwrite_callback,
     register_vfs_read_file_callback,
     register_vfs_readdir_callback,
     register_vfs_rename_callback,
