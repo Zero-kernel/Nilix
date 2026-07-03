@@ -63,3 +63,91 @@ pub fn init() {
     syscall::register_frame_callback(); // 注册 syscall 帧回调
     klog_always!("Arch module initialized (FPU/SIMD enabled)");
 }
+
+/// Try to read a character from serial input (non-blocking)
+///
+/// This function checks the keyboard buffer which is populated by serial interrupts.
+/// Returns `Some(ch)` if a character is available, `None` otherwise.
+///
+/// # Multi-core Safety
+///
+/// This function is lock-free and safe to call from any CPU.
+pub fn try_read_serial_char() -> Option<u8> {
+    drivers::keyboard::try_pop_char()
+}
+
+/// Write a single byte to serial output (no newline added)
+///
+/// This is for interactive I/O where character-by-character output is needed.
+pub fn serial_write_byte(byte: u8) {
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut port = Port::new(0x3F8);
+        port.write(byte);
+    }
+}
+
+/// Write a string to serial output (no newline added)
+///
+/// This is for interactive I/O where precise control over output is needed.
+pub fn serial_write_str(s: &str) {
+    for byte in s.bytes() {
+        serial_write_byte(byte);
+    }
+}
+
+/// System reboot via keyboard controller
+pub fn reboot() -> ! {
+    unsafe {
+        // Method 1: Keyboard controller reset
+        core::arch::asm!("mov al, 0xFE", "out 0x64, al", options(nostack, nomem));
+
+        // Method 2: Triple fault (if keyboard controller fails)
+        core::arch::asm!("cli");
+
+        // Load invalid IDT to trigger triple fault
+        #[repr(C, packed)]
+        struct IdtPtr {
+            limit: u16,
+            base: u64,
+        }
+        let invalid_idt = IdtPtr { limit: 0, base: 0 };
+        core::arch::asm!(
+            "lidt [{}]",
+            "int3",
+            in(reg) &invalid_idt,
+            options(nostack)
+        );
+    }
+
+    loop {
+        unsafe { core::arch::asm!("hlt") }
+    }
+}
+
+/// System shutdown via ACPI
+pub fn shutdown() -> ! {
+    unsafe {
+        // Try QEMU/Bochs magic port shutdown
+        core::arch::asm!(
+            "mov dx, 0x604",
+            "mov ax, 0x2000",
+            "out dx, ax",
+            options(nostack, nomem)
+        );
+
+        // Try ACPI shutdown (simplified)
+        core::arch::asm!(
+            "mov dx, 0xB004",
+            "mov ax, 0x3400",
+            "out dx, ax",
+            options(nostack, nomem)
+        );
+    }
+
+    // Fallback: halt forever
+    klog_always!("Shutdown failed, halting...");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") }
+    }
+}

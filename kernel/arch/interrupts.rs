@@ -27,7 +27,7 @@ use crate::ipi;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cpu_local::{current_cpu, CpuLocal, NO_FPU_OWNER};
 use kernel_core::on_scheduler_tick;
-use kernel_core::process::{current_pid, get_process};
+use kernel_core::process::{current_pid, get_process, try_get_process};
 use lazy_static::lazy_static;
 use mm::tlb_shootdown;
 use x86_64::instructions::interrupts as x86_interrupts;
@@ -694,8 +694,42 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 }
 
 /// #DB - Debug Exception (调试异常)
+///
+/// R174-A3 FIX: Clear debug registers before returning to user mode to prevent
+/// KASLR bypass. User processes can set DR0-DR3 to kernel addresses; when #DB
+/// fires, those addresses would leak if not cleared.
 extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
+
+    // R174-A3 FIX: Clear debug registers if returning to user mode (CS.RPL == 3)
+    // This prevents KASLR bypass via hardware breakpoint address leakage.
+    //
+    // SAFETY: Only clears when returning to Ring 3. Kernel-mode debug exceptions
+    // (e.g., from kgdb, kernel breakpoints) keep their DR state intact.
+    let returning_to_user = (stack_frame.code_segment.0 & 0x3) == 3;
+    if returning_to_user {
+        unsafe {
+            // Clear DR0-DR3 (breakpoint addresses - potential kernel pointers)
+            core::arch::asm!(
+                "mov dr0, {zero}",
+                "mov dr1, {zero}",
+                "mov dr2, {zero}",
+                "mov dr3, {zero}",
+                zero = in(reg) 0usize,
+                options(nostack, nomem)
+            );
+            // Clear DR6 (debug status register - indicates which breakpoint fired)
+            core::arch::asm!(
+                "mov dr6, {zero}",
+                zero = in(reg) 0usize,
+                options(nostack, nomem)
+            );
+            // NOTE: DR7 (debug control register) is NOT cleared - it controls whether
+            // breakpoints are enabled. Clearing it would disable debugging entirely.
+            // The vulnerability is ADDRESS leakage (DR0-DR3), not control state.
+        }
+    }
+
     // 调试异常：静默处理
     // R117-4 FIX: Check pending_kill before returning to user-mode.
     check_pending_kill_on_exception_return(&stack_frame);
@@ -810,77 +844,115 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
         }
     };
 
-    // Disable interrupts during FPU owner transition to prevent races
-    let transfer_complete = x86_interrupts::without_interrupts(|| {
+    // R174-A1 FIX: Disable interrupts for the ENTIRE handler body to prevent
+    // FPU state leakage via nested timer IRQ.
+    //
+    // VULNERABILITY: The previous code re-enabled IRQs after the transfer
+    // closure (line 891) but before the retry-restore check (line 895). A
+    // timer IRQ firing in that window could use FPU instructions, clobbering
+    // live architectural state (XMM registers holding encryption keys, KASLR
+    // cookies, etc.) mid-transfer. This is a CRITICAL privilege escalation
+    // vector (cross-process key leakage).
+    //
+    // FIX: Extend without_interrupts() to cover the retry-restore (lines
+    // 895-897) and the pending_kill check (line 900), ensuring NO preemption
+    // until FPU ownership is fully settled.
+    //
+    // SAFETY: The extended IRQ-masked region is acceptable because:
+    // 1. The handler is fast (try_lock, not blocking)
+    // 2. FPU state is architectural secret data requiring atomic handling
+    // 3. The pending_kill check is also fast (lock-free atomic read + optional syscall)
+    x86_interrupts::without_interrupts(|| {
         let per_cpu = current_cpu();
         let prev_owner = per_cpu.get_fpu_owner();
 
         // Fast path: same process re-accessing FPU
         if prev_owner == current {
             per_cpu.set_fpu_owner(current);
-            return true;
+            // R117-4 FIX: Check pending_kill after FPU state is settled.
+            check_pending_kill_on_exception_return(&stack_frame);
+            return;
         }
 
         // R154-4 FIX: Use try_lock() to avoid deadlock if #NM interrupts code
         // already holding a Process lock.
         // R155-1 FIX: If ANY try_lock fails, abort the transfer and restore
         // CR0.TS below so the faulting instruction retries #NM later.
+        // R173 IRQ-SAFETY FIX: Use try_get_process to avoid blocking on PROCESS_TABLE.
         //
         // IMPORTANT: We must not fxrstor current without first fxsave previous,
         // because that would destroy the previous owner's unsaved live FPU state.
 
         // Step 1: Save previous owner's FPU state if needed
         let prev_saved = if prev_owner != NO_FPU_OWNER {
-            if let Some(prev_proc) = get_process(prev_owner) {
-                if let Some(mut pcb) = prev_proc.try_lock() {
-                    let fx_ptr = pcb.context.fx.data.as_mut_ptr();
-                    unsafe {
-                        core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
+            match try_get_process(prev_owner) {
+                Some(Some(prev_proc)) => {
+                    if let Some(mut pcb) = prev_proc.try_lock() {
+                        let fx_ptr = pcb.context.fx.data.as_mut_ptr();
+                        unsafe {
+                            core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
+                        }
+                        pcb.fpu_used = true;
+                        true
+                    } else {
+                        false // PCB contended - retry
                     }
-                    pcb.fpu_used = true;
+                }
+                Some(None) => {
+                    // Process gone
+                    per_cpu.clear_fpu_owner_if(prev_owner);
                     true
-                } else {
+                }
+                None => {
+                    // PROCESS_TABLE contended - retry
                     false
                 }
-            } else {
-                per_cpu.clear_fpu_owner_if(prev_owner);
-                true
             }
         } else {
             true
         };
 
         // Step 2: Only restore current if we successfully saved previous
-        if prev_saved {
-            if let Some(cur_proc) = get_process(current) {
-                if let Some(mut pcb) = cur_proc.try_lock() {
-                    let fx_ptr = pcb.context.fx.data.as_ptr();
-                    unsafe {
-                        core::arch::asm!("fxrstor64 [{}]", in(reg) fx_ptr, options(nostack));
+        let transfer_complete = if prev_saved {
+            match try_get_process(current) {
+                Some(Some(cur_proc)) => {
+                    if let Some(mut pcb) = cur_proc.try_lock() {
+                        let fx_ptr = pcb.context.fx.data.as_ptr();
+                        unsafe {
+                            core::arch::asm!("fxrstor64 [{}]", in(reg) fx_ptr, options(nostack));
+                        }
+                        pcb.fpu_used = true;
+                        per_cpu.set_fpu_owner(current);
+                        true
+                    } else {
+                        false // PCB contended - retry
                     }
-                    pcb.fpu_used = true;
-                    per_cpu.set_fpu_owner(current);
+                }
+                Some(None) => {
+                    // Process gone
+                    per_cpu.set_fpu_owner(NO_FPU_OWNER);
                     true
-                } else {
+                }
+                None => {
+                    // PROCESS_TABLE contended - retry
                     false
                 }
-            } else {
-                per_cpu.set_fpu_owner(NO_FPU_OWNER);
-                true
             }
         } else {
             false
+        };
+
+        // R155-1 FIX: If ownership transfer failed (try_lock contention), restore
+        // CR0.TS so the faulting instruction re-triggers #NM for retry.
+        // R174-A1: This retry-restore is now IRQ-masked (was previously unmasked).
+        if !transfer_complete {
+            unsafe { Cr0::write(cr0) };
         }
+
+        // R117-4 FIX: Check pending_kill after FPU state is settled.
+        // R174-A1: This check is now IRQ-masked (was previously unmasked).
+        check_pending_kill_on_exception_return(&stack_frame);
     });
-
-    // R155-1 FIX: If ownership transfer failed (try_lock contention), restore
-    // CR0.TS so the faulting instruction re-triggers #NM for retry.
-    if !transfer_complete {
-        unsafe { Cr0::write(cr0) };
-    }
-
-    // R117-4 FIX: Check pending_kill after FPU state is settled.
-    check_pending_kill_on_exception_return(&stack_frame);
 }
 
 /// #DF - Double Fault (双重错误)
@@ -1130,15 +1202,30 @@ extern "x86-interrupt" fn page_fault_handler(
     if is_user_mode && is_not_present && fault_addr < USER_SPACE_TOP {
         // Check if this is a stack grow opportunity
         if let Some(pid) = kernel_core::process::current_pid() {
-            // SMP gate: Only attempt demand-grow on single-CPU
-            // (SLICE 6 will add deferred TLB flush for SMP)
-            let online_cpus = cpu_local::num_online_cpus();
-            if online_cpus == 1 {
-                // Try to grow the stack (bounded batch, IRQs-off, deferred charge)
-                if kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr).is_ok() {
-                    // Stack grown successfully, return to user mode
-                    return;
-                }
+            // M0-7 SLICE 6: Demand-grow now works on SMP with TLB shootdown.
+            // The grow primitive (try_demand_grow_user_stack) uses deferred charge
+            // (IRQ-safe), bounded batch mapping (≤8 pages), and returns the grown
+            // range [new_floor, old_floor). After a successful grow, we invalidate
+            // that range on all CPUs via mm::tlb_shootdown::flush_current_as_range.
+            //
+            // The TLB flush MUST happen before IRET returns to user mode — otherwise
+            // another CPU running a sibling thread in the same address space could
+            // access the newly-mapped stack pages with stale not-present TLB entries,
+            // causing spurious #PF faults (correctness issue, not a security hole —
+            // the page tables are correct, only TLB is stale).
+            if let Ok((new_floor, old_floor)) =
+                kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr)
+            {
+                // Invalidate [new_floor, old_floor) on all CPUs. The shootdown
+                // infrastructure (mm::tlb_shootdown) handles single-CPU vs SMP
+                // transparently: on single-CPU it's a local invlpg; on SMP it
+                // sends IPIs and waits for ACKs. IRQ-safe (uses spin locks only).
+                use x86_64::VirtAddr;
+                let len = old_floor - new_floor;
+                mm::tlb_shootdown::flush_current_as_range(VirtAddr::new(new_floor as u64), len);
+
+                // Stack grown + TLB flushed successfully, return to user mode
+                return;
             }
         }
     }
@@ -1394,7 +1481,26 @@ const IRQ_GPR_FRAME_BYTES: usize = 0x78;
 fn extract_irq_user_context(
     gpr: &IrqGprFrame,
     isf: &x86_64::structures::idt::InterruptStackFrameValue,
-) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)> {
+) -> Option<(
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+)> {
     // Only extract for Ring-3 interrupts (RPL == 3 in CS).
     let cs_value: u16 = isf.code_segment.0;
     if cs_value & 3 != 3 {
@@ -1436,11 +1542,7 @@ unsafe fn capture_irq_sigframe_fpu(pid: usize) -> [u8; 512] {
 
     // Copy from the IRQ FPU save area
     IRQ_FPU_AREAS.with(|area| {
-        core::ptr::copy_nonoverlapping(
-            area.data.as_ptr(),
-            local_irq_area.as_mut_ptr(),
-            512
-        );
+        core::ptr::copy_nonoverlapping(area.data.as_ptr(), local_irq_area.as_mut_ptr(), 512);
     });
 
     let ts_was_set = IRQ_FPU_TS_WAS_SET.with(|flag| flag.load(Ordering::Relaxed));
@@ -1630,12 +1732,21 @@ extern "C" fn timer_interrupt_body(
                 // R155-6 FIX: Defer heavy terminate_process() to process context.
                 // Only set Zombie AFTER defer succeeds to avoid unreaped zombie
                 // if the deferred queue is full.
+                // R173 IRQ-SAFETY FIX: Use try_get_process to avoid blocking on PROCESS_TABLE
                 if kernel_core::process::defer_irq_terminate(pid, exit_code) {
                     // Deferred successfully — now mark Zombie to prevent rescheduling
-                    if let Some(proc_arc) = kernel_core::process::get_process(pid) {
-                        if let Some(mut proc) = proc_arc.try_lock() {
-                            proc.state = kernel_core::process::ProcessState::Zombie;
-                            proc.exit_code = Some(exit_code);
+                    match kernel_core::process::try_get_process(pid) {
+                        Some(Some(proc_arc)) => {
+                            if let Some(mut proc) = proc_arc.try_lock() {
+                                proc.state = kernel_core::process::ProcessState::Zombie;
+                                proc.exit_code = Some(exit_code);
+                            }
+                            // PCB contended - state update deferred; process will be terminated
+                            // in process context anyway via defer_irq_terminate queue
+                        }
+                        _ => {
+                            // Process gone or PROCESS_TABLE contended - OK, termination
+                            // will complete via deferred queue
                         }
                     }
 
@@ -1673,9 +1784,26 @@ extern "C" fn timer_interrupt_body(
         if kernel_core::signal::any_handler_installed() {
             if let Some(pid) = kernel_core::process::current_pid() {
                 // Extract scalar user context from arch-local types.
-                if let Some((rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp,
-                            r8, r9, r10, r11, r12, r13, r14, r15)) =
-                    extract_irq_user_context(gpr, stack_frame)
+                if let Some((
+                    rip,
+                    rsp,
+                    rflags,
+                    rax,
+                    rbx,
+                    rcx,
+                    rdx,
+                    rsi,
+                    rdi,
+                    rbp,
+                    r8,
+                    r9,
+                    r10,
+                    r11,
+                    r12,
+                    r13,
+                    r14,
+                    r15,
+                )) = extract_irq_user_context(gpr, stack_frame)
                 {
                     // FIX C: Capture FPU atomically (lock-free snapshot first).
                     let fpu_state = unsafe { capture_irq_sigframe_fpu(pid) };
@@ -1683,8 +1811,8 @@ extern "C" fn timer_interrupt_body(
                     // Try to deliver (all-try_lock call graph, FIX A).
                     if let Some((handler_rip, handler_rsp, new_rflags)) =
                         kernel_core::syscall::try_deliver_signal_on_irq_return(
-                            pid as u64, rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp,
-                            r8, r9, r10, r11, r12, r13, r14, r15, &fpu_state,
+                            pid as u64, rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8,
+                            r9, r10, r11, r12, r13, r14, r15, &fpu_state,
                         )
                     {
                         // Delivery succeeded — redirect the interrupted context.
@@ -1708,7 +1836,8 @@ extern "C" fn timer_interrupt_body(
                         gpr.r15 = r15;
                         stack_frame.instruction_pointer = x86_64::VirtAddr::new(handler_rip);
                         stack_frame.stack_pointer = x86_64::VirtAddr::new(handler_rsp);
-                        stack_frame.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(new_rflags);
+                        stack_frame.cpu_flags =
+                            x86_64::registers::rflags::RFlags::from_bits_truncate(new_rflags);
                         // Do NOT call request_resched_from_irq — we just redirected the return.
                         // Fall through to irq_restore_fpu and IRETQ.
                     } else {
