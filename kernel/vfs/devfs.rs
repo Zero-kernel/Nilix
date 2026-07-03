@@ -106,7 +106,9 @@ impl DevFs {
         let mut key = String::new();
         key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
         key.push_str(name);
-        entries.try_insert(key, inode).map_err(|_| FsError::NoSpace)?;
+        entries
+            .try_insert(key, inode)
+            .map_err(|_| FsError::NoSpace)?;
 
         Ok(())
     }

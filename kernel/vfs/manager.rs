@@ -239,7 +239,9 @@ impl NamespaceMountTable {
             let mut key = String::new();
             key.try_reserve(k.len()).map_err(|_| FsError::NoMem)?;
             key.push_str(k);
-            mounts.try_insert(key, v.clone()).map_err(|_| FsError::NoMem)?;
+            mounts
+                .try_insert(key, v.clone())
+                .map_err(|_| FsError::NoMem)?;
         }
         Ok(Self {
             mounts: RwLock::new(mounts),
@@ -1988,6 +1990,8 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_rename_callback(vfs_rename_callback);
     kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
+    kernel_core::register_vfs_pread_callback(vfs_pread_callback); // R173-07 proper fix
+    kernel_core::register_vfs_pwrite_callback(vfs_pwrite_callback); // R173-07 proper fix
 
     // R74-2 FIX: Register mount namespace materialization callback.
     // This enables eager materialization when namespaces are created via
@@ -1995,7 +1999,7 @@ pub fn register_syscall_callbacks() {
     // post-clone parent mounts from leaking into child namespaces.
     kernel_core::register_mount_ns_materialize_callback(mount_ns_materialize_callback);
 
-    klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled)");
+    klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled, R173-07 pread64/pwrite64 enabled)");
 }
 
 /// R74-2 FIX: Mount namespace materialization callback.
@@ -2231,4 +2235,70 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
     lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
 
     inode.truncate(length).map_err(fs_error_to_syscall)
+}
+
+/// VFS positioned read callback for pread64 (R173-07 proper fix).
+///
+/// Reads from fd at offset without changing the fd's current offset.
+fn vfs_pread_callback(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, SyscallError> {
+    use kernel_core::{current_pid, get_process};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Clone inode Arc under the process lock, drop before I/O (same R132-2/R41-3
+    // pattern as vfs_truncate: procfs callbacks may touch PROCESS_TABLE, so
+    // holding Process lock across inode.read_at() risks lock inversion).
+    let inode = {
+        let proc = proc_arc.lock();
+        let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+        // Downcast to FileHandle
+        let file_handle = handle
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .ok_or(SyscallError::ENOSYS)?;
+
+        // POSIX: pread requires the fd to be readable
+        if !file_handle.flags.is_readable() {
+            return Err(SyscallError::EBADF);
+        }
+
+        file_handle.inode.clone()
+    };
+    // Process lock released before positioned read
+
+    inode.read_at(offset, buf).map_err(fs_error_to_syscall)
+}
+
+/// VFS positioned write callback for pwrite64 (R173-07 proper fix).
+///
+/// Writes to fd at offset without changing the fd's current offset.
+fn vfs_pwrite_callback(fd: i32, data: &[u8], offset: u64) -> Result<usize, SyscallError> {
+    use kernel_core::{current_pid, get_process};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Clone inode Arc under the process lock, drop before I/O (same pattern).
+    let inode = {
+        let proc = proc_arc.lock();
+        let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+        // Downcast to FileHandle
+        let file_handle = handle
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .ok_or(SyscallError::ENOSYS)?;
+
+        // POSIX: pwrite requires the fd to be writable
+        if !file_handle.flags.is_writable() {
+            return Err(SyscallError::EBADF);
+        }
+
+        file_handle.inode.clone()
+    };
+    // Process lock released before positioned write
+
+    inode.write_at(offset, data).map_err(fs_error_to_syscall)
 }
