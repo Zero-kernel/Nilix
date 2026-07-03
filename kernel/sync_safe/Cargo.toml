@@ -1,0 +1,14 @@
+[package]
+name = "sync_safe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sync_safe"
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+
+[features]
+default = []
