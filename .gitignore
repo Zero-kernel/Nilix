@@ -19,6 +19,11 @@ Cargo.lock
 /clippy-userspace-target
 userspace/clippy-userspace-target
 
+# Fuzz testing
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/*.log
+
 #no_need
 *.md
 *.txt

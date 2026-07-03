@@ -1,0 +1,141 @@
+name: Kernel Fuzz Testing
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Run daily at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Specific fuzz target to run (leave empty for all)'
+        required: false
+        default: ''
+      timeout:
+        description: 'Timeout per target in seconds'
+        required: false
+        default: '600'
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_syscall
+          - fuzz_vfs_path
+          - fuzz_signal_delivery
+          - fuzz_memory_ops
+          - fuzz_ipc_message
+          - fuzz_scheduler
+          - fuzz_network_packet
+          - fuzz_cgroup_ops
+          - fuzz_elf_loader
+          - fuzz_futex_ops
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzzer
+        run: |
+          cd fuzz
+          timeout=${{ github.event.inputs.timeout || '600' }}
+          echo "Running ${{ matrix.target }} for ${timeout}s"
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${timeout} \
+            -rss_limit_mb=4096 \
+            -print_final_stats=1 \
+            || exit_code=$?
+
+          # Exit code 0 = success, 77 = timeout (ok), others = crash
+          if [ ${exit_code:-0} -ne 0 ] && [ ${exit_code:-0} -ne 77 ]; then
+            echo "Fuzzer found issues!"
+            exit 1
+          fi
+        continue-on-error: true
+        id: fuzz
+
+      - name: Check for crashes
+        if: always()
+        run: |
+          cd fuzz
+          crashes=$(find artifacts/${{ matrix.target }} -name 'crash-*' 2>/dev/null | wc -l || echo 0)
+          if [ "$crashes" -gt 0 ]; then
+            echo "::error::Found $crashes crash(es) in ${{ matrix.target }}"
+            ls -lh artifacts/${{ matrix.target }}/crash-* || true
+            exit 1
+          fi
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/crash-*
+            fuzz/artifacts/${{ matrix.target }}/timeout-*
+            fuzz/artifacts/${{ matrix.target }}/oom-*
+          retention-days: 30
+
+      - name: Upload corpus
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 7
+
+  report:
+    name: Generate Fuzz Report
+    needs: fuzz
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Generate summary
+        run: |
+          echo "# Kernel Fuzz Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          crash_dirs=$(find artifacts -name 'fuzz-crashes-*' -type d 2>/dev/null || true)
+          if [ -n "$crash_dirs" ]; then
+            echo "## ⚠️ Crashes Found" >> $GITHUB_STEP_SUMMARY
+            for dir in $crash_dirs; do
+              target=$(basename "$dir" | sed 's/fuzz-crashes-//')
+              count=$(find "$dir" -name 'crash-*' 2>/dev/null | wc -l || echo 0)
+              echo "- **$target**: $count crash(es)" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "## ✅ No Crashes Found" >> $GITHUB_STEP_SUMMARY
+            echo "All fuzz targets completed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi

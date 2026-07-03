@@ -1,0 +1,97 @@
+[package]
+name = "nilix-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+[dependencies.kernel_core]
+path = "../kernel/kernel_core"
+
+[dependencies.vfs]
+path = "../kernel/vfs"
+
+[dependencies.mm]
+path = "../kernel/mm"
+
+[dependencies.ipc]
+path = "../kernel/ipc"
+
+[dependencies.sched]
+path = "../kernel/sched"
+
+[dependencies.security]
+path = "../kernel/security"
+
+[dependencies.net]
+path = "../kernel/net"
+
+# Prevent this from interfering with workspace lints
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_syscall"
+path = "fuzz_targets/fuzz_syscall.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vfs_path"
+path = "fuzz_targets/fuzz_vfs_path.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_signal_delivery"
+path = "fuzz_targets/fuzz_signal_delivery.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_memory_ops"
+path = "fuzz_targets/fuzz_memory_ops.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ipc_message"
+path = "fuzz_targets/fuzz_ipc_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_scheduler"
+path = "fuzz_targets/fuzz_scheduler.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_network_packet"
+path = "fuzz_targets/fuzz_network_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cgroup_ops"
+path = "fuzz_targets/fuzz_cgroup_ops.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_elf_loader"
+path = "fuzz_targets/fuzz_elf_loader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_futex_ops"
+path = "fuzz_targets/fuzz_futex_ops.rs"
+test = false
+doc = false
