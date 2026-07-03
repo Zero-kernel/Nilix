@@ -85,6 +85,7 @@ pub(crate) const SYS_CHMOD: u64 = 90;
 pub(crate) const SYS_FCHMOD: u64 = 91;
 pub(crate) const SYS_CHOWN: u64 = 92;
 pub(crate) const SYS_FCHOWN: u64 = 93;
+pub(crate) const SYS_LCHOWN: u64 = 94;
 
 // Resource limits
 pub(crate) const SYS_GETRLIMIT: u64 = 97;
@@ -101,10 +102,17 @@ pub(crate) const SYS_GETDENTS64: u64 = 217;
 
 // *at() syscalls
 pub(crate) const SYS_OPENAT: u64 = 257;
+pub(crate) const SYS_STATX: u64 = 332;
 
 // Time / entropy
 pub(crate) const SYS_CLOCK_GETTIME: u64 = 228;
 pub(crate) const SYS_GETRANDOM: u64 = 318;
+
+// I/O multiplexing (M0-6 SLICE 5+)
+pub(crate) const SYS_SELECT: u64 = 23;
+pub(crate) const SYS_PSELECT6: u64 = 270;
+pub(crate) const SYS_PPOLL: u64 = 271;
+pub(crate) const SYS_POLL: u64 = 7;
 
 // ============================================================================
 // Seccomp Actions

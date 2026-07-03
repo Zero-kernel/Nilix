@@ -2925,6 +2925,14 @@ pub fn syscall_dispatcher(
             arg2 as *mut VfsStat,
             arg3 as i32,
         ),
+        // M0-6: statx - modern extended stat interface
+        332 => sys_statx(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as i32,
+            arg3 as u32,
+            arg4 as *mut u8,
+        ),
         8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => sys_ioctl(arg0 as i32, arg1, arg2),
         19 => sys_readv(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
@@ -2946,6 +2954,10 @@ pub fn syscall_dispatcher(
         84 => sys_rmdir(arg0 as *const u8),
         86 => sys_link(arg0 as *const u8, arg1 as *const u8),
         87 => sys_unlink(arg0 as *const u8),
+        // M0-6 slice 3: symlink/readlink - DEFERRED per plan
+        // Blocked on ramfs lacking Symlink NodeKind + /proc/self contradictory inode
+        88 => sys_symlink(arg0 as *const u8, arg1 as *const u8),
+        89 => sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
         // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
         // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
         82 => sys_rename(arg0 as *const u8, arg1 as *const u8),
@@ -3077,6 +3089,48 @@ pub fn syscall_dispatcher(
         // P1-4: Batch enable/disable with topological dependency ordering
         514 => sys_kpatch_enable_all(),
         515 => sys_kpatch_disable_all(),
+
+        // M0-6 SLICE 5+: Additional syscalls for broader compatibility
+        // poll/select family - I/O multiplexing
+        23 => sys_select(
+            arg0 as i32,
+            arg1 as *mut u8,
+            arg2 as *mut u8,
+            arg3 as *mut u8,
+            arg4 as *mut u8,
+        ),
+        270 => sys_pselect6(
+            arg0 as i32,
+            arg1 as *mut u8,
+            arg2 as *mut u8,
+            arg3 as *mut u8,
+            arg4 as *const u8,
+            arg5 as *const u8,
+        ),
+        271 => sys_ppoll(
+            arg0 as *mut u8,
+            arg1 as usize,
+            arg2 as *const u8,
+            arg3 as *const u8,
+            arg4 as usize,
+        ),
+
+        // Memory management
+        25 => sys_mremap(
+            arg0 as u64,
+            arg1 as usize,
+            arg2 as usize,
+            arg3 as i32,
+            arg4 as u64,
+        ),
+
+        // File ownership (dispatch-or-stub per plan)
+        92 => sys_chown(arg0 as *const u8, arg1 as u32, arg2 as u32),
+        93 => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32),
+        94 => sys_lchown(arg0 as *const u8, arg1 as u32, arg2 as u32),
+
+        // Process wait
+        247 => sys_waitid(arg0 as i32, arg1 as i32, arg2 as *mut u8, arg3 as i32),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -9115,9 +9169,6 @@ fn sys_close(fd: i32) -> SyscallResult {
 /// # Returns
 /// 当前始终返回 ENOTTY（不是终端设备）
 fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
-    // 标记参数为已使用，避免编译器警告
-    let _ = (cmd, arg);
-
     // 验证 fd 有效性
     if fd < 0 {
         return Err(SyscallError::EBADF);
@@ -9133,12 +9184,89 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
         }
     }
 
-    // 当前不实现任何 ioctl 命令
-    // 常见命令：
-    // - TCGETS (0x5401): 获取终端属性
-    // - TIOCGWINSZ (0x5413): 获取终端窗口大小
-    // 返回 ENOTTY 告知 musl 这不是终端设备
-    Err(SyscallError::ENOTTY)
+    // M0-6 SLICE 5+: Basic termios support for stdin/stdout/stderr
+    // Common ioctl commands for terminal control
+    const TCGETS: u64 = 0x5401;      // Get terminal attributes
+    const TCSETS: u64 = 0x5402;      // Set terminal attributes
+    const TCSETSW: u64 = 0x5403;     // Set after drain
+    const TCSETSF: u64 = 0x5404;     // Set after flush
+    const TIOCGWINSZ: u64 = 0x5413;  // Get window size
+    const TIOCSWINSZ: u64 = 0x5414;  // Set window size
+    const FIONREAD: u64 = 0x541B;    // Bytes available to read
+
+    match cmd {
+        TCGETS if fd <= 2 => {
+            // Return minimal termios structure for stdin/stdout/stderr
+            // struct termios is 60 bytes on x86_64
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            // Zero out termios structure (canonical mode, no special flags)
+            let zero_termios = [0u8; 60];
+            crate::usercopy::copy_to_user_safe(arg as *mut u8, &zero_termios)
+                .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF if fd <= 2 => {
+            // Accept termios settings but don't actually apply them
+            // (no real terminal to configure)
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            // Just verify the buffer is readable
+            let mut termios_buf = [0u8; 60];
+            crate::usercopy::copy_from_user_safe(&mut termios_buf, arg as *const u8)
+                .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        TIOCGWINSZ if fd <= 2 => {
+            // Return default window size (80x24)
+            // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } = 8 bytes (4 u16s)
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let winsize: [u16; 4] = [24, 80, 0, 0]; // rows, cols, xpixel, ypixel
+            let winsize_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    winsize.as_ptr() as *const u8,
+                    8
+                )
+            };
+            crate::usercopy::copy_to_user_safe(arg as *mut u8, winsize_bytes)
+                .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        TIOCSWINSZ if fd <= 2 => {
+            // Accept window size but don't store it
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let mut winsize_buf = [0u8; 8];
+            crate::usercopy::copy_from_user_safe(&mut winsize_buf, arg as *const u8)
+                .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        FIONREAD if fd == 0 => {
+            // Return 0 bytes available for stdin (no buffering)
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let bytes_available: i32 = 0;
+            let bytes_slice = unsafe {
+                core::slice::from_raw_parts(
+                    &bytes_available as *const i32 as *const u8,
+                    4
+                )
+            };
+            crate::usercopy::copy_to_user_safe(arg as *mut u8, bytes_slice)
+                .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        _ => {
+            // For non-standard streams or unknown commands, return ENOTTY
+            Err(SyscallError::ENOTTY)
+        }
+    }
 }
 
 // ============================================================================
@@ -13924,6 +14052,39 @@ fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
     Err(SyscallError::EPERM)
 }
 
+/// sys_symlink - create symbolic link
+///
+/// # M0-6 SLICE 3 - DEFERRED per plan
+///
+/// Blocked on:
+/// 1. ramfs lacks Symlink NodeKind (only File/Directory)
+/// 2. /proc/self is contradictory (is_dir()==true but file_type==Symlink)
+/// 3. readlink resolver broken (lookup_path_with_flags(..,false) returns ELOOP for final symlink)
+///
+/// The readlink-resolver fix + ramfs Symlink node land together as one coherent change.
+fn sys_symlink(_target: *const u8, _linkpath: *const u8) -> SyscallResult {
+    // M0-6: Full implementation would:
+    // 1. Validate both paths
+    // 2. Create new inode with NodeKind::Symlink
+    // 3. Store target path in inode data
+    // 4. Add to parent directory
+    Err(SyscallError::ENOSYS)
+}
+
+/// sys_readlink - read value of symbolic link
+///
+/// # M0-6 SLICE 3 - DEFERRED per plan
+///
+/// Blocked on same issues as sys_symlink (see above).
+fn sys_readlink(_path: *const u8, _buf: *mut u8, _bufsiz: usize) -> SyscallResult {
+    // M0-6: Full implementation would:
+    // 1. Lookup path without following final component
+    // 2. Verify it's a symlink
+    // 3. Copy target path to user buffer
+    // 4. Return bytes copied (NOT null-terminated per POSIX)
+    Err(SyscallError::ENOSYS)
+}
+
 /// sys_unlink - 删除文件
 fn sys_unlink(path: *const u8) -> SyscallResult {
     if path.is_null() {
@@ -14151,6 +14312,37 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
 
     // Use internal helper with already-copied path
     sys_stat_internal(&path_str, statbuf)
+}
+
+/// sys_statx - extended file status (modern stat interface)
+///
+/// # M0-6 SLICE 5+ Implementation
+/// Minimal stub returning ENOSYS. Full statx provides:
+/// - Extended attributes (birth time, mount ID, inode flags)
+/// - Fine-grained control over what's returned (mask parameter)
+/// - Better timestamp precision (nanoseconds)
+///
+/// # Arguments
+/// - `dirfd`: directory fd for relative paths (AT_FDCWD for current)
+/// - `pathname`: path to stat
+/// - `flags`: AT_* flags (AT_SYMLINK_NOFOLLOW, AT_STATX_SYNC_*, etc.)
+/// - `mask`: STATX_* mask for what fields to return
+/// - `statxbuf`: pointer to struct statx (256 bytes)
+fn sys_statx(
+    _dirfd: i32,
+    _pathname: *const u8,
+    _flags: i32,
+    _mask: u32,
+    _statxbuf: *mut u8,
+) -> SyscallResult {
+    // M0-6: statx is the modern stat interface used by new code
+    // For M0 compatibility, programs fall back to fstatat/stat
+    // Full implementation would:
+    // 1. Parse AT_* flags and STATX_* mask
+    // 2. Lookup path (with/without symlink following per flags)
+    // 3. Fill struct statx (256 bytes) with requested fields
+    // 4. Include extended attributes (btime, mount_id, inode_flags)
+    Err(SyscallError::ENOSYS)
 }
 
 /// sys_openat - 相对路径打开文件
@@ -17473,6 +17665,128 @@ fn sys_kpatch_disable_all() -> Result<usize, SyscallError> {
         Ok(0)
     }
 }
+
+// ============================================================================
+// M0-6 SLICE 5+: Additional syscalls for broader compatibility
+// ============================================================================
+
+/// select(2) - synchronous I/O multiplexing
+///
+/// # M0-6 Implementation Strategy
+/// Minimal stub returning ENOSYS. Full implementation would monitor multiple
+/// file descriptors for readability/writability, similar to poll but with
+/// different ABI (fd_set bitmasks vs pollfd array).
+///
+/// # Arguments
+/// - `nfds`: highest fd number + 1
+/// - `readfds`, `writefds`, `exceptfds`: fd_set pointers (may be NULL)
+/// - `timeout`: struct timeval pointer (may be NULL)
+///
+/// # Returns
+/// - `ENOSYS` - not yet implemented
+fn sys_select(
+    _nfds: i32,
+    _readfds: *mut u8,
+    _writefds: *mut u8,
+    _exceptfds: *mut u8,
+    _timeout: *mut u8,
+) -> Result<usize, SyscallError> {
+    // M0-6: Full select would:
+    // 1. Validate and copy fd_set bitmasks from user
+    // 2. Check each fd for readability/writability
+    // 3. Block with timeout if none ready
+    // 4. Return count of ready fds
+    Err(SyscallError::ENOSYS)
+}
+
+/// pselect6(2) - synchronous I/O multiplexing with signal mask
+///
+/// Like select but with nanosecond precision and signal mask.
+fn sys_pselect6(
+    _nfds: i32,
+    _readfds: *mut u8,
+    _writefds: *mut u8,
+    _exceptfds: *mut u8,
+    _timeout: *const u8,
+    _sigmask: *const u8,
+) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// ppoll(2) - poll with signal mask
+///
+/// Like poll but with signal mask atomicity.
+fn sys_ppoll(
+    _fds: *mut u8,
+    _nfds: usize,
+    _timeout: *const u8,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// mremap(2) - remap a virtual memory address
+///
+/// # M0-6 Implementation Strategy
+/// Stub returning ENOSYS. Full implementation would:
+/// 1. Validate old address and size are page-aligned
+/// 2. Check flags (MREMAP_MAYMOVE, MREMAP_FIXED)
+/// 3. Either grow/shrink in place or relocate to new address
+/// 4. Update VMA structures and page tables
+/// 5. Handle cgroup memory accounting
+///
+/// # Arguments
+/// - `old_addr`: current mapping address
+/// - `old_size`: current mapping size
+/// - `new_size`: desired new size
+/// - `flags`: MREMAP_* flags
+/// - `new_addr`: new address (if MREMAP_FIXED)
+fn sys_mremap(
+    _old_addr: u64,
+    _old_size: usize,
+    _new_size: usize,
+    _flags: i32,
+    _new_addr: u64,
+) -> Result<usize, SyscallError> {
+    // M0-6: mremap is complex - deferred to post-M0
+    // Requires VMA manipulation + PT updates + accounting
+    Err(SyscallError::ENOSYS)
+}
+
+/// chown(2) - change file ownership
+///
+/// # M0-6 Implementation Strategy
+/// Dispatch-or-stub per plan. Stub for now as VFS lacks full ownership tracking.
+fn sys_chown(_path: *const u8, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
+    // M0-6: chown requires VFS inode ownership + DAC checks
+    // Current VFS has minimal ownership tracking
+    Err(SyscallError::ENOSYS)
+}
+
+/// fchown(2) - change file ownership by fd
+fn sys_fchown(_fd: i32, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// lchown(2) - change symlink ownership (don't follow link)
+fn sys_lchown(_path: *const u8, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// waitid(2) - wait for child process to change state
+///
+/// # M0-6 Implementation Strategy
+/// Dispatch-or-stub per plan. More complex than wait4, supports WNOWAIT.
+fn sys_waitid(_idtype: i32, _id: i32, _infop: *mut u8, _options: i32) -> Result<usize, SyscallError> {
+    // M0-6: waitid is like wait4 but with siginfo_t and WNOWAIT support
+    // Current wait4 implementation could be adapted
+    Err(SyscallError::ENOSYS)
+}
+
+// ============================================================================
+// Syscall Statistics
+// ============================================================================
 
 /// 系统调用统计
 pub struct SyscallStats {
