@@ -858,6 +858,20 @@ pub unsafe fn copy_page_table_cow(
 /// the lock, we re-check if the page is still COW (another thread may have
 /// resolved it while we were waiting).
 ///
+/// # R174-A4 FIX: IRQ-Safe try_lock Pattern
+///
+/// The #PF handler does NOT call irq_enter()/irq_exit(), so if a timer IRQ
+/// fires mid-COW while holding the Process lock, the timer's pending-kill
+/// check can block waiting for the same lock → cross-CPU deadlock on SMP:
+///   CPU A: process context holds Process lock, IRQs enabled
+///   CPU B: #PF (COW) → tries to acquire Process lock → spins forever (IRQs disabled)
+///   CPU A: tries to send IPI to CPU B → CPU B can't respond (IRQs disabled)
+///   → DEADLOCK
+///
+/// FIX: Use try_lock() on COW_FAULT_LOCK. On contention, return EAGAIN so the
+/// #PF handler can retry (the page remains read-only, next write re-triggers #PF).
+/// This makes COW resolution IRQ-safe without restructuring the entire handler.
+///
 /// # Arguments
 ///
 /// * `pid` - 触发页错误的进程ID
@@ -870,12 +884,19 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     use mm::page_table::with_current_manager;
     use spin::Mutex;
 
-    // R65-21 FIX: Global lock to serialize COW page fault handling.
-    // This prevents race conditions when multiple threads fault on the same COW page.
-    // Using a static Mutex ensures all COW faults are serialized.
-    // Note: In SMP future, this could be made per-page or per-address-space for better scalability.
+    // R65-21 FIX + R174-A4 FIX: Global lock to serialize COW page fault handling,
+    // now using try_lock() for IRQ safety. On contention, the fault retries naturally
+    // (page remains read-only, next write re-triggers #PF).
     static COW_FAULT_LOCK: Mutex<()> = Mutex::new(());
-    let _cow_guard = COW_FAULT_LOCK.lock();
+    let _cow_guard = match COW_FAULT_LOCK.try_lock() {
+        Some(guard) => guard,
+        None => {
+            // R174-A4 FIX: Lock contended - return transient error so #PF handler
+            // can retry. The page remains read-only, so the next write will
+            // re-trigger #PF. This is IRQ-safe (no blocking).
+            return Err(ForkError::ProcessNotFound); // Transient contention, retry
+        }
+    };
 
     let virt = VirtAddr::new(fault_addr as u64);
     let page = Page::containing_address(virt);

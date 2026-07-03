@@ -1413,6 +1413,17 @@ impl Scheduler {
     ///
     /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
     pub fn schedule() -> Option<(Pid, usize)> {
+        // R174-B1 FIX: Drain deferred cgroup charges before scheduling decision.
+        //
+        // The #PF handler (try_grow_user_stack) pushes memory charges to a per-CPU
+        // deferred queue to avoid blocking locks in IRQ context. We drain that queue
+        // here (process context, IRQs can be enabled, blocking locks OK) before
+        // picking the next task. On charge failure (OOM), the affected process is
+        // marked pending_kill and will be reaped.
+        //
+        // SAFETY: This is process context (not hard IRQ), so blocking locks are safe.
+        kernel_core::cgroup::drain_deferred_charges();
+
         interrupts::without_interrupts(|| {
             // R67-4 FIX: Clear this CPU's reschedule flag
             current_cpu().need_resched.store(false, Ordering::SeqCst);

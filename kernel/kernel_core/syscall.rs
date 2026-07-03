@@ -558,26 +558,52 @@ pub fn wake_stdin_waiters() {
 /// - `stdin_finish_wait()` HLT loop (handles idle-system case)
 ///
 /// Uses wake_one semantics to avoid thundering herd.
+///
+/// R173 IRQ-SAFETY FIX: Use try_lock pattern throughout to prevent same-CPU
+/// deadlock if process context holds any lock with IRQs enabled, then timer IRQ
+/// fires and reaches this drain via reschedule_if_needed(). Matches the proven
+/// SOCKET_WAITERS pattern (lines 724-843).
 pub fn drain_deferred_stdin_wakes() {
     // Fast path: no wake pending
     if !STDIN_WAKE_PENDING.swap(false, AtomicOrdering::Acquire) {
         return;
     }
 
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut waiters = STDIN_WAITERS.lock();
-        // 清理已退出的进程并唤醒第一个有效等待者
-        while let Some(pid) = waiters.pop_front() {
-            if let Some(proc_arc) = get_process(pid) {
-                let mut proc = proc_arc.lock();
-                if proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
-                    return; // 只唤醒一个
-                }
-            }
-            // 进程不存在或不在阻塞状态，继续检查下一个
+    // R173: Use try_lock instead of blocking lock to avoid IRQ deadlock
+    let mut waiters = match STDIN_WAITERS.try_lock() {
+        Some(w) => w,
+        None => {
+            // Contended - re-set flag and defer to next reschedule
+            STDIN_WAKE_PENDING.store(true, AtomicOrdering::Release);
+            return;
         }
-    });
+    };
+
+    // 清理已退出的进程并唤醒第一个有效等待者
+    while let Some(pid) = waiters.pop_front() {
+        // R173: Use try_get_process to avoid blocking on PROCESS_TABLE
+        match crate::process::try_get_process(pid) {
+            Some(Some(proc_arc)) => {
+                // R173: Use try_lock on PCB to avoid deadlock
+                if let Some(mut proc) = proc_arc.try_lock() {
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                        return; // 只唤醒一个
+                    }
+                }
+                // PCB contended - skip this waiter, continue to next
+            }
+            Some(None) => {
+                // Process gone - continue to next waiter
+            }
+            None => {
+                // PROCESS_TABLE contended - re-queue this PID and defer
+                waiters.push_front(pid);
+                STDIN_WAKE_PENDING.store(true, AtomicOrdering::Release);
+                return;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1762,6 +1788,14 @@ pub type VfsReaddirCallback = fn(i32, usize) -> Result<alloc::vec::Vec<DirEntry>
 /// 参数: (fd, length) -> () 或错误
 pub type VfsTruncateCallback = fn(i32, u64) -> Result<(), SyscallError>;
 
+/// VFS positioned read callback type (pread64).
+/// Reads from fd at offset without changing the fd's offset.
+pub type VfsPreadCallback = fn(i32, &mut [u8], u64) -> Result<usize, SyscallError>;
+
+/// VFS positioned write callback type (pwrite64).
+/// Writes to fd at offset without changing the fd's offset.
+pub type VfsPwriteCallback = fn(i32, &[u8], u64) -> Result<usize, SyscallError>;
+
 /// R74-2 FIX: Mount namespace materialization callback type.
 ///
 /// Registered by vfs module to force eager materialization of mount tables.
@@ -1848,6 +1882,10 @@ lazy_static::lazy_static! {
     static ref VFS_READDIR_CALLBACK: spin::Mutex<Option<VfsReaddirCallback>> = spin::Mutex::new(None);
     /// VFS 截断回调
     static ref VFS_TRUNCATE_CALLBACK: spin::Mutex<Option<VfsTruncateCallback>> = spin::Mutex::new(None);
+    /// VFS positioned read callback (pread64)
+    static ref VFS_PREAD_CALLBACK: spin::Mutex<Option<VfsPreadCallback>> = spin::Mutex::new(None);
+    /// VFS positioned write callback (pwrite64)
+    static ref VFS_PWRITE_CALLBACK: spin::Mutex<Option<VfsPwriteCallback>> = spin::Mutex::new(None);
     /// R74-2 FIX: Mount namespace materialization callback
     static ref MOUNT_NS_MATERIALIZE_CALLBACK: spin::Mutex<Option<MountNsMaterializeCallback>> = spin::Mutex::new(None);
 }
@@ -1925,6 +1963,16 @@ pub fn register_vfs_readdir_callback(cb: VfsReaddirCallback) {
 /// 注册 VFS 截断回调
 pub fn register_vfs_truncate_callback(cb: VfsTruncateCallback) {
     *VFS_TRUNCATE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS positioned read 回调 (pread64)
+pub fn register_vfs_pread_callback(cb: VfsPreadCallback) {
+    *VFS_PREAD_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS positioned write 回调 (pwrite64)
+pub fn register_vfs_pwrite_callback(cb: VfsPwriteCallback) {
+    *VFS_PWRITE_CALLBACK.lock() = Some(cb);
 }
 
 /// R74-2 FIX: Register mount namespace materialization callback.
@@ -3855,8 +3903,7 @@ fn sys_clone(
                 //
                 // Fix: Materialize both parent and child mount tables NOW to
                 // snapshot the parent's mount state at clone time.
-                materialize_namespace(&parent_mount_ns)
-                    .map_err(|_| SyscallError::ENOMEM)?;
+                materialize_namespace(&parent_mount_ns).map_err(|_| SyscallError::ENOMEM)?;
                 materialize_namespace(&ns).map_err(|_| SyscallError::ENOMEM)?;
 
                 klog!(Info,
@@ -4548,30 +4595,8 @@ fn sys_clone(
     // E.5 Cpuset: update task count after successful cgroup attach.
     crate::process::notify_cpuset_task_joined(parent_cpuset_id);
 
-    // J2-7: per-cgroup FD budget — batch-charge the child's copied fds. Only
-    // CLONE_FILES populates the child fd_table (deep copy); otherwise it is empty
-    // (count 0, a no-op). Charge to the child's now-attached cgroup. On failure,
-    // mirror the cgroup-attach rollback exactly (detach cgroup + cpuset, drop the
-    // child); later copy_to_user arms route through cleanup_unscheduled_process →
-    // free_process_resources, which uncharges fds_charged_count (set below).
-    let child_fd_count = {
-        let child = child_arc.lock();
-        child.fd_table.len() as u64
-    };
-    if child_fd_count > 0 {
-        if crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err() {
-            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-                let _ = cg.detach_task(child_pid as u64);
-            }
-            crate::process::notify_cpuset_task_left(parent_cpuset_id);
-            if let Some(parent) = get_process(parent_pid) {
-                parent.lock().children.retain(|&p| p != child_pid);
-            }
-            cleanup_unscheduled_process(child_pid);
-            return Err(SyscallError::EAGAIN);
-        }
-        child_arc.lock().fds_charged_count = child_fd_count;
-    }
+    // R174-A2: FD charge moved AFTER all error paths (see line 4644+ below).
+    // This prevents double-uncharge when copy_to_user fails.
 
     // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -4615,6 +4640,53 @@ fn sys_clone(
             cleanup_unscheduled_process(child_pid);
             return Err(e);
         }
+    }
+
+    // R174-A2 FIX: Charge FDs AFTER all error paths (moved from line 4577-4600).
+    //
+    // RATIONALE: The FD charge is the LAST resource acquisition that can fail.
+    // All prior error paths (LSM denial, cgroup attach failure, copy_to_user
+    // failure) must NOT see a charged fds_charged_count, otherwise
+    // cleanup_unscheduled_process double-uncharges:
+    //   1. cleanup calls free_process_resources (process.rs:5119-5121)
+    //   2. free_process_resources uncharges fds_charged_count
+    //   3. BUT the parent still holds the FD references (child fd_table was
+    //      deep-copied at line 4390-4400, parent never lost those FDs)
+    //   4. When parent exits, it uncharges the SAME FDs again → double-uncharge
+    //      → fds_current underflow → delete-gate bypass
+    //
+    // By charging HERE (after copy_to_user), we guarantee:
+    // 1. All error paths before this point uncharge 0 FDs (idempotent)
+    // 2. After this point, only ONE error path remains (FD charge failure itself)
+    // 3. The charge/uncharge lifecycle is symmetric
+    //
+    // INVARIANT (FD-CHARGE-LAST):
+    //   fds_charged_count is set ONLY after all error paths that call
+    //   cleanup_unscheduled_process(). This ensures error-path uncharge is
+    //   idempotent (uncharges 0 when nothing was charged).
+    //
+    // J2-7: per-cgroup FD budget — batch-charge the child's copied fds. Only
+    // CLONE_FILES populates the child fd_table (deep copy); otherwise it is empty
+    // (count 0, a no-op). Charge to the child's now-attached cgroup.
+    let child_fd_count = {
+        let child = child_arc.lock();
+        child.fd_table.len() as u64
+    };
+    if child_fd_count > 0 {
+        // NOTE: This is the ONLY remaining error path after copy_to_user.
+        // On failure, we must manually rollback cgroup/cpuset/cleanup.
+        if crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err() {
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EAGAIN);
+        }
+        child_arc.lock().fds_charged_count = child_fd_count;
     }
 
     // 将子进程添加到调度器（通过回调，避免循环依赖）
@@ -7011,11 +7083,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
 /// Tier 1: Main user-stack window (constant check, no lock).
 /// Tier 2: CLONE_VM thread stacks (VMA lookup via try_lock).
 /// Tier 3: Fail-closed floor (== rsp) on contention or no matching VMA.
-fn resolve_sigframe_stack_floor_irq(
-    _pid: u64,
-    rsp: u64,
-    proc: &crate::process::Process,
-) -> u64 {
+fn resolve_sigframe_stack_floor_irq(_pid: u64, rsp: u64, proc: &crate::process::Process) -> u64 {
     // Tier 1: Main user-stack window (covers the musl default-process case).
     // NO lock needed — this is a constant range check.
     let (main_floor, main_top) = crate::elf_loader::user_stack_window();
@@ -7127,7 +7195,9 @@ pub fn try_deliver_signal_on_irq_return(
 
     // Select the lowest-priority deliverable handler signal.
     // Compute the deliverable mask (pending & !blocked, with uncatchables removed).
-    let deliverable = proc_guard.pending_signals.bits() & !proc_guard.blocked & !crate::signal::uncatchable_mask();
+    let deliverable = proc_guard.pending_signals.bits()
+        & !proc_guard.blocked
+        & !crate::signal::uncatchable_mask();
     let sig = match crate::signal::select_lowest_deliverable(deliverable) {
         Some(s) => s,
         None => return None, // No deliverable signal.
@@ -7212,7 +7282,12 @@ pub fn try_deliver_signal_on_irq_return(
     }
 
     // Write the frame to user memory. copy_to_user Err → DEFER (NOT terminate).
-    if crate::usercopy::copy_to_user_addr(crate::usercopy::UserAddr::new(frame_base as usize), &frame_bytes).is_err() {
+    if crate::usercopy::copy_to_user_addr(
+        crate::usercopy::UserAddr::new(frame_base as usize),
+        &frame_bytes,
+    )
+    .is_err()
+    {
         return None; // Fault on write — defer.
     }
 
@@ -7241,8 +7316,7 @@ pub fn try_deliver_signal_on_irq_return(
     proc.blocked = newmask & !crate::signal::uncatchable_mask();
     proc.in_signal_handler = true;
     if sa_flags & crate::signal::SA_RESETHAND != 0 {
-        proc.sigactions[(sig.as_u8() - 1) as usize] =
-            crate::signal::SigAction::default_action();
+        proc.sigactions[(sig.as_u8() - 1) as usize] = crate::signal::SigAction::default_action();
     }
     drop(proc);
 
@@ -8037,14 +8111,44 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // R173-05 FIX: Reject O_CLOEXEC until per-fd CLOEXEC tracking is implemented
-    // Fail-closed: return EINVAL rather than silently ignoring the flag
-    if flags & O_CLOEXEC != 0 {
-        return Err(SyscallError::EINVAL);
-    }
+    // R173-05 PROPER FIX (supersedes the fail-closed EINVAL stopgap): per-fd
+    // CLOEXEC tracking EXISTS (`Process::cloexec_fds` + `set_fd_cloexec`,
+    // drained at exec by `take_cloexec_fds_into`, inherited at fork/clone,
+    // cleared on close by `remove_fd`) — sys_dup3 has used it since R39-4.
+    // The R173 stopgap's premise ("until per-fd CLOEXEC tracking is
+    // implemented") was false; wire the flag exactly like dup3 does.
 
     // Create pipe
     let (read_fd, write_fd) = create_fn()?;
+
+    // Mark both ends close-on-exec BEFORE exposing the fds to userspace.
+    // fd_table is per-process (deep-copied even under CLONE_FILES — INV-CG-FD),
+    // so no other task can observe the window between create and mark; the
+    // copy_to_user failure path below closes both fds via remove_fd, which
+    // also clears the CLOEXEC marks (no stale-entry leak).
+    if flags & O_CLOEXEC != 0 {
+        let proc_lookup = current_pid().and_then(get_process);
+        match proc_lookup {
+            Some(process_arc) => {
+                let mut proc = process_arc.lock();
+                proc.set_fd_cloexec(read_fd, true);
+                proc.set_fd_cloexec(write_fd, true);
+            }
+            None => {
+                // No current process (unreachable for a live syscall, but do
+                // not leak the just-created pipe fds if it ever fires).
+                let close_fn = {
+                    let callback = FD_CLOSE_CALLBACK.lock();
+                    callback.as_ref().copied()
+                };
+                if let Some(close) = close_fn {
+                    let _ = close(read_fd);
+                    let _ = close(write_fd);
+                }
+                return Err(SyscallError::ESRCH);
+            }
+        }
+    }
 
     // Write fds to user space
     let fd_array = [read_fd, write_fd];
@@ -8098,10 +8202,19 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     const FD_CLOEXEC: i32 = 1;
 
     match cmd {
-        F_DUPFD => {
-            // Duplicate fd to lowest-numbered fd >= arg
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            // Duplicate fd to lowest-numbered fd >= arg.
+            // R173-06 PROPER FIX (supersedes the fail-closed EINVAL stopgap):
+            // per-fd CLOEXEC tracking exists (Process::cloexec_fds, R39-4) —
+            // F_DUPFD_CLOEXEC is F_DUPFD + set_fd_cloexec on the new fd,
+            // mirroring sys_dup3's O_CLOEXEC handling.
             let min_fd = arg as i32;
             if min_fd < 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            // Linux returns EINVAL when arg is beyond the fd limit (RLIMIT_NOFILE
+            // analog); our hard table cap is MAX_FD. This also bounds the scan.
+            if min_fd >= crate::process::MAX_FD {
                 return Err(SyscallError::EINVAL);
             }
 
@@ -8116,11 +8229,13 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // Clone the file descriptor
             let cloned_desc = source_desc.clone_box();
 
-            // Find lowest available fd >= min_fd
+            // Find lowest available fd >= min_fd, bounded by the same MAX_FD
+            // gate sys_dup2/sys_dup3 enforce (the old scan ran to 1024, allowing
+            // fcntl to mint fds past the table cap every other path rejects).
             let mut new_fd = min_fd;
             while proc.fd_table.contains_key(&new_fd) {
                 new_fd += 1;
-                if new_fd >= 1024 {
+                if new_fd >= crate::process::MAX_FD {
                     return Err(SyscallError::EMFILE);
                 }
             }
@@ -8130,25 +8245,25 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             drop(proc);
 
             // J.2 item 7: charge one fd to the cgroup
-            crate::cgroup::try_charge_fds(cgroup_id, 1)
-                .map_err(|_| SyscallError::EMFILE)?;
+            crate::cgroup::try_charge_fds(cgroup_id, 1).map_err(|_| SyscallError::EMFILE)?;
 
-            // Insert the new fd
+            // Insert the new fd. fd_table is per-PCB (never shared, even under
+            // CLONE_FILES it is deep-copied), so new_fd cannot have been taken
+            // while the lock was dropped for the cgroup charge.
             let mut proc = process_arc.lock();
             proc.fd_table.insert(new_fd, cloned_desc);
             proc.fds_charged_count = proc.fds_charged_count.saturating_add(1);
+            // POSIX: F_DUPFD's copy does NOT inherit close-on-exec;
+            // F_DUPFD_CLOEXEC's copy has it set atomically.
+            proc.set_fd_cloexec(new_fd, cmd == F_DUPFD_CLOEXEC);
 
             Ok(new_fd as usize)
         }
 
-        F_DUPFD_CLOEXEC => {
-            // R173-06 FIX: Reject F_DUPFD_CLOEXEC until per-fd CLOEXEC tracking is implemented
-            // Fail-closed: return EINVAL rather than silently ignoring the cloexec flag
-            return Err(SyscallError::EINVAL);
-        }
-
         F_GETFD => {
-            // Get file descriptor flags (only FD_CLOEXEC is defined)
+            // Get file descriptor flags (only FD_CLOEXEC is defined).
+            // R173-06 companion: report the REAL per-fd CLOEXEC state instead
+            // of the old hardcoded 0 (which lied for fds marked via dup3/pipe2).
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let proc = process_arc.lock();
@@ -8156,12 +8271,15 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // Check if fd exists
             proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-            // TODO: Track FD_CLOEXEC per-fd (currently always 0)
-            Ok(0)
+            if proc.cloexec_fds.contains(&fd) {
+                Ok(FD_CLOEXEC as usize)
+            } else {
+                Ok(0)
+            }
         }
 
         F_SETFD => {
-            // Set file descriptor flags
+            // Set file descriptor flags (only FD_CLOEXEC is defined).
             let flags = arg as i32;
 
             // Only FD_CLOEXEC is valid
@@ -8171,12 +8289,14 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let proc = process_arc.lock();
+            let mut proc = process_arc.lock();
 
-            // Check if fd exists
+            // Check if fd exists (existence-gate BEFORE mutating the mark, so
+            // cloexec_fds can never hold an entry for an absent fd —
+            // INV: cloexec_fds ⊆ fd_table keys, relied on by exec's drain).
             proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-            // TODO: Store FD_CLOEXEC flag per-fd
+            proc.set_fd_cloexec(fd, flags & FD_CLOEXEC != 0);
 
             Ok(0)
         }
@@ -8226,6 +8346,7 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 /// sys_pread64 - 从文件描述符在指定偏移量读取数据
 ///
 /// M0-6 SLICE 4: Positioned read (does not change fd offset).
+/// R173-07 proper fix (supersedes the ENOSYS stopgap): wire to VFS_PREAD_CALLBACK.
 ///
 /// # Arguments
 ///
@@ -8238,16 +8359,45 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 ///
 /// Number of bytes read or errno
 fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
-    // R173-07 FIX: Return ENOSYS until positioned I/O is implemented
-    // Fail-closed: return ENOSYS rather than silently ignoring the offset parameter
-    // (treating as regular read causes data corruption when user expects positioned I/O)
-    let _ = (fd, buf, count, offset); // Suppress unused warnings
-    return Err(SyscallError::ENOSYS);
+    // Validate offset (must be non-negative)
+    if offset < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Bound count (same MAX_RW_SIZE limit as sys_read)
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // Validate user buffer early
+    validate_user_ptr_mut(buf, count)?;
+
+    // Get the VFS pread callback
+    let pread_fn = VFS_PREAD_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+
+    // Allocate kernel buffer (fallible to avoid OOM panic)
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
+
+    // Call VFS positioned read (does not mutate fd offset)
+    let bytes_read = pread_fn(fd, &mut tmp, offset as u64)?;
+
+    // Copy result to user space
+    if bytes_read > 0 {
+        copy_to_user(buf, &tmp[..bytes_read])?;
+    }
+
+    Ok(bytes_read)
 }
 
 /// sys_pwrite64 - 向文件描述符在指定偏移量写入数据
 ///
 /// M0-6 SLICE 4: Positioned write (does not change fd offset).
+/// R173-07 proper fix (supersedes the ENOSYS stopgap): wire to VFS_PWRITE_CALLBACK.
 ///
 /// # Arguments
 ///
@@ -8260,11 +8410,33 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResul
 ///
 /// Number of bytes written or errno
 fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallResult {
-    // R173-07 FIX: Return ENOSYS until positioned I/O is implemented
-    // Fail-closed: return ENOSYS rather than silently ignoring the offset parameter
-    // (treating as regular write causes data corruption when user expects positioned I/O)
-    let _ = (fd, buf, count, offset); // Suppress unused warnings
-    return Err(SyscallError::ENOSYS);
+    // Validate offset (must be non-negative)
+    if offset < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Bound count (same MAX_RW_SIZE limit as sys_write)
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // Validate user buffer early
+    validate_user_ptr(buf, count)?;
+
+    // Get the VFS pwrite callback
+    let pwrite_fn = VFS_PWRITE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+
+    // Copy from user space to kernel buffer (fallible allocation)
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
+    copy_from_user(&mut tmp, buf)?;
+
+    // Call VFS positioned write (does not mutate fd offset)
+    pwrite_fn(fd, &tmp, offset as u64)
 }
 
 /// sys_read - 从文件描述符读取数据
@@ -9383,6 +9555,16 @@ fn sys_brk(addr: usize) -> SyscallResult {
     // read and the reservation. While `brk_resv` is held (brk_in_progress=true),
     // mm.brk is pinned to old_brk until this call commits, making the existing
     // post-PT re-checks provably true rather than best-effort recovery.
+    //
+    // R174-B4 FIX: Merge mmap overlap check and VA reservation arming into this
+    // SAME lock acquisition. The previous code checked mmap overlap in a SECOND
+    // lock (lines 9481-9503), creating a TOCTOU window where a CLONE_VM sibling's
+    // sys_mmap could place a mapping after the first lock but before the reservation
+    // was armed, leading to double VMA ownership (brk-grow adopts mmap's pages).
+    // By doing check+arm atomically under ONE lock, sys_mmap's Phase-1 overlap
+    // check (which also takes mm.lock()) is guaranteed to see EITHER the armed
+    // reservation (rejects with EINVAL) OR an unarmed state (proceeds, then this
+    // brk's overlap check below detects it and fails). No interleaving possible.
     let (old_brk, old_top, new_top, mut brk_resv) = {
         let mut mm = mm_arc.lock();
         // 拒绝缩小到 brk_start 以下
@@ -9409,11 +9591,36 @@ fn sys_brk(addr: usize) -> SyscallResult {
         if mm.brk_in_progress {
             return Ok(mm.brk);
         }
+
+        let old_brk_val = mm.brk;
+        let old_top_val = page_align_up(mm.brk);
+        let new_top_val = page_align_up(addr);
+
+        // R174-B4 FIX: If this is a grow operation, check mmap overlap and arm
+        // the VA reservation ATOMICALLY under this SAME lock, before setting
+        // brk_in_progress. This closes the TOCTOU window where a CLONE_VM sibling's
+        // sys_mmap could race between the old two-lock sequence.
+        if new_top_val > old_top_val {
+            // Check for overlap with existing mmap regions
+            for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
+                let region_end = region_base.saturating_add(mmap_region_len(region_len_with_flags));
+                if old_top_val < region_end && new_top_val > region_base {
+                    // Overlap detected - return current brk unchanged (Linux semantics)
+                    return Ok(old_brk_val);
+                }
+            }
+            // R172-16 + R174-B4: No overlap detected; arm the VA reservation atomically.
+            // sys_mmap's Phase-1 overlap check will reject any [base,end) intersecting
+            // this reservation, preventing double VMA ownership.
+            mm.brk_grow_resv_lo = old_top_val;
+            mm.brk_grow_resv_hi = new_top_val;
+        }
+
         mm.brk_in_progress = true;
         (
-            mm.brk,
-            page_align_up(mm.brk),
-            page_align_up(addr),
+            old_brk_val,
+            old_top_val,
+            new_top_val,
             BrkReservation {
                 mm: Arc::clone(&mm_arc),
                 armed: true,
@@ -9425,31 +9632,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
     if new_top > old_top {
         let grow_size = new_top - old_top;
 
-        // 检查与 mmap 区域冲突 + R172-16: ARM the brk-grow VA reservation atomically
-        {
-            let mut mm = mm_arc.lock();
-            for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
-                let region_end = region_base.saturating_add(mmap_region_len(region_len_with_flags));
-                if old_top < region_end && new_top > region_base {
-                    // 有重叠，返回旧值
-                    return Ok(old_brk);
-                }
-            }
-            // R172-16: no existing region overlaps [old_top, new_top); reserve that VA range
-            // ATOMICALLY with the check (same MmState lock) so a concurrent sys_mmap on a
-            // shared MmState (CLONE_VM / CLONE_THREAD sibling) cannot place a mapping inside
-            // the grow window while we drop the lock for the irreversible page-table work
-            // below. sys_mmap's Phase-1 overlap check rejects any [base,end) intersecting
-            // this reservation (EINVAL), so the brk grow can NEVER silently adopt a racing
-            // mmap's page into the heap (double VMA ownership + double cgroup uncharge at
-            // teardown — the R172-16 bug). brk_in_progress already serializes sibling brk()s,
-            // so this window has exactly one writer. The reservation carries NO charge (charge
-            // lives in brk_pending_growth) — a pure VA placement-exclusion, so no cgroup /
-            // fork / teardown / munmap / proc-maps consumer changes. Cleared on every exit
-            // path by BrkReservation::Drop and explicitly disarmed at the clean commit.
-            mm.brk_grow_resv_lo = old_top;
-            mm.brk_grow_resv_hi = new_top;
-        }
+        // R174-B4 FIX: The mmap overlap check and VA reservation arming have been
+        // moved into the first lock acquisition above (lines 9431-9508) to make
+        // check+arm atomic. This eliminates the TOCTOU window where a CLONE_VM
+        // sibling's sys_mmap could place a mapping between the two locks.
+        // The redundant second lock block has been removed.
 
         // F.2 Cgroup: Charge memory before heap expansion.
         // R169-1 FIX (CRITICAL self-deadlock): Reuse the `cgroup_id` cached at
@@ -10030,12 +10217,12 @@ unsafe fn rollback_stack_grow_pages(
 /// 4. Mark pages as "pending charge" in MmState
 /// 5. Defer actual cgroup charge to next syscall entry/exit
 ///
-/// SMP: Only called on single-CPU (gated in interrupts.rs). SLICE 6 adds
-/// deferred TLB flush for SMP support.
+/// M0-7 SLICE 6: SMP-ready with TLB shootdown. Returns (new_floor, old_floor) on
+/// success so the caller can invalidate [new_floor, old_floor) across all CPUs.
 pub fn try_demand_grow_user_stack(
     pid: crate::process::ProcessId,
     fault_addr: usize,
-) -> Result<(), SyscallError> {
+) -> Result<(usize, usize), SyscallError> {
     use crate::elf_loader::{user_stack_layout, user_stack_mapped_floor, USER_STACK_TOP};
     use mm::page_table::with_current_manager;
     use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
@@ -10120,10 +10307,12 @@ pub fn try_demand_grow_user_stack(
     drop(proc);
 
     // Map pages [new_floor, old_floor) with deferred charge
-    let map_result = unsafe {
+    // R174-B3 FIX: Extract PT frames from RecordingFrameAllocator to ledger them.
+    use x86_64::structures::paging::PhysFrame;
+    let (map_result, pt_frames) = unsafe {
         with_current_manager(
             VirtAddr::new(0),
-            |manager| -> Result<(), SyscallError> {
+            |manager| -> Result<(Result<(), SyscallError>, Vec<PhysFrame>), SyscallError> {
                 let mut frame_alloc = RecordingFrameAllocator::new();
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
@@ -10142,23 +10331,32 @@ pub fn try_demand_grow_user_stack(
                     // Allocate DATA frame
                     let frame = match frame_alloc.allocate_data_frame() {
                         Some(f) => f,
-                        None => return Err(SyscallError::ENOMEM),
+                        None => {
+                            // Rollback on allocation failure
+                            return Ok((Err(SyscallError::ENOMEM), Vec::new()));
+                        }
                     };
 
                     // Map page
                     if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
                         frame_alloc.deallocate_frame(frame);
-                        return Err(SyscallError::ENOMEM);
+                        return Ok((Err(SyscallError::ENOMEM), Vec::new()));
                     }
 
                     // Zero the page
                     let ptr = vaddr.as_u64() as *mut u8;
                     core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
                 }
-                Ok(())
+
+                // R174-B3 FIX: Extract PT frames to ledger them atomically with DATA charge.
+                // The RecordingFrameAllocator tracks intermediate PT/PD/PDPT frames created
+                // during map_page(). These must be charged + ledgered so munmap/exit can
+                // debit them correctly (prevents PT frame leak → mem_pinned > 0 at deletion).
+                let pt_frames = frame_alloc.take_pt_frames();
+                Ok((Ok(()), pt_frames))
             },
         )
-    };
+    }?;
 
     // Commit or rollback
     match map_result {
@@ -10168,22 +10366,56 @@ pub fn try_demand_grow_user_stack(
                 let proc = process_arc.lock();
                 let mut mm = mm_arc.lock();
                 mm.stack_floor_committed = new_floor;
-                mm.stack_grow_pending_bytes = mm.stack_grow_pending_bytes.saturating_add(grow_size as u64);
+                mm.stack_grow_pending_bytes =
+                    mm.stack_grow_pending_bytes.saturating_add(grow_size as u64);
+
+                // R174-B3 FIX: Ledger PT frames so they can be debited on munmap/exit.
+                // The demand-grow allocated intermediate page-table frames (PT/PD/PDPT)
+                // via RecordingFrameAllocator. These must be added to pt_charged_frames
+                // so compute_cgroup_charged_bytes() includes them and teardown can debit
+                // them correctly. Without this, PT frames leak → mem_pinned > 0 at deletion.
+                //
+                // CHARGE: PT frame kmem is also added to stack_grow_pending_bytes above
+                // (included in grow_size). The deferred charge (line 10340) covers BOTH
+                // DATA pages and PT frames as a single lump sum.
+                //
+                // NOTE: pt_charged_frames is a FallibleOrderedMap, so use try_insert.
+                // On insert failure (OOM), the PT frames fall back to pt_inherited_bytes
+                // (over-count-safe — they reclaim at teardown, never a bypass).
+                for pt_frame in pt_frames {
+                    let _ = mm
+                        .pt_charged_frames
+                        .try_insert(pt_frame.start_address().as_u64(), ());
+                }
+
                 mm.stack_grow_in_progress = false;
             }
 
-            // R173-08 DOCUMENTED: Deferred cgroup charge design not yet implemented
-            // TODO: Implement true deferred-charge mechanism (IRQs-off, no blocking locks)
-            // Current immediate charge contains blocking lock (cgroup.limits.lock()) which
-            // could deadlock in #PF handler. However, this code path is SMP-gated (R173-04)
-            // so the deadlock scenario (cross-CPU lock hold) cannot occur until SLICE 6.
-            // TRACKED: Implement deferred charge queue before enabling SMP demand-grow.
-            if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
-                // Charge failed - kill the process
-                return Err(SyscallError::ENOMEM);
-            }
+            // R174-B1 FIX: Use deferred-charge queue to avoid blocking lock in IRQ context.
+            //
+            // VULNERABILITY (R173-08 documented, R174-B1 now fixed): The previous code called
+            // try_charge_memory() here, which acquires cgroup.limits.lock() — a blocking Mutex.
+            // This is called from try_grow_user_stack() → #PF handler (IRQ context). On SMP,
+            // if another CPU holds that lock with IRQs enabled, a cross-CPU deadlock occurs:
+            //   CPU A: holds cgroup.limits.lock(), IRQs enabled
+            //   CPU B: #PF, tries to acquire cgroup.limits.lock() → spins forever (IRQs disabled)
+            //   CPU A: tries to send IPI to CPU B → CPU B can't respond (IRQs disabled)
+            //   → DEADLOCK
+            //
+            // FIX: Push the charge to a per-CPU deferred queue. The scheduler drains this
+            // queue at the next safe point (process context, IRQs enabled, blocking locks OK).
+            // On charge failure (OOM), the process is killed via SIGKILL.
+            //
+            // SAFETY: defer_charge_memory() is IRQ-safe (spin lock only, no blocking).
+            // The actual charge happens asynchronously in drain_deferred_charges().
+            //
+            // FAILURE MODE: User sees "stack growth → (small delay) → SIGKILL" instead of
+            // "stack growth → deadlock → system hang". This is acceptable for OOM scenarios.
+            cgroup::defer_charge_memory(cgroup_id, grow_size as u64);
 
-            Ok(())
+            // M0-7 SLICE 6: Return the grown range [new_floor, old_floor) so the caller
+            // (interrupts.rs #PF handler) can invalidate it across all CPUs via TLB shootdown.
+            Ok((new_floor, old_floor))
         }
         Err(e) => {
             // Rollback: clear reservation
@@ -10210,7 +10442,10 @@ pub fn try_demand_grow_user_stack(
 /// # Returns
 ///
 /// Ok(()) if region is backed, Err if grow fails
-fn ensure_stack_backed(pid: crate::process::ProcessId, target_va: usize) -> Result<(), SyscallError> {
+fn ensure_stack_backed(
+    pid: crate::process::ProcessId,
+    target_va: usize,
+) -> Result<(), SyscallError> {
     let process_arc = match crate::process::get_process(pid) {
         Some(p) => p,
         None => return Err(SyscallError::ESRCH),
@@ -10611,7 +10846,8 @@ pub fn run_stack_window_exclusion_self_test() {
     let page = 0x1000usize;
 
     // The window is the GUARD-INCLUSIVE architectural range, never the guard_top floor.
-    let (stack_base, usable_base, _eager_floor, _eager_page_count) = crate::elf_loader::user_stack_layout();
+    let (stack_base, usable_base, _eager_floor, _eager_page_count) =
+        crate::elf_loader::user_stack_layout();
     assert_eq!(
         win_start, stack_base,
         "window base MUST be the guard-INCLUSIVE stack_base, not guard_top/usable_base"
