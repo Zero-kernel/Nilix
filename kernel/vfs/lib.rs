@@ -62,7 +62,10 @@ pub use cgroupfs::CgroupFs;
 pub use devfs::DevFs;
 pub use ext2::{Ext2Fs, Ext2Inode};
 pub use initramfs::Initramfs;
-pub use manager::{init, mount, open, readdir, register_block_device, stat, umount, VFS};
+pub use manager::{
+    init, mount, normalize_path, open, readdir, register_block_device, split_path, stat, umount,
+    VFS,
+};
 pub use procfs::ProcFs;
 pub use ramfs::{RamFs, RamFsInode};
 pub use traits::{FileHandle, FileSystem, Inode};

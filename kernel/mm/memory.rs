@@ -113,7 +113,14 @@ const MAX_RESERVED_RANGES: usize = 64;
 // 内存配置
 // ============================================================================
 
-#[global_allocator]
+// The `#[global_allocator]` registration is compiled out under the
+// `host_harness` feature so `mm` (and every crate that transitively depends on
+// it) can link into a hosted `std` binary — e.g. the cargo-fuzz harness, which
+// already carries std's global allocator; two registrations is a hard link
+// error. The static itself is kept in BOTH configs (init_heap_allocator_at and
+// the heap-stats path reference it), so only the global registration is gated.
+// The kernel build never enables `host_harness`, so its allocator is unchanged.
+#[cfg_attr(not(feature = "host_harness"), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // ============================================================================

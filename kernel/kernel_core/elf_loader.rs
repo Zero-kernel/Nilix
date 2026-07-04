@@ -609,6 +609,44 @@ fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
     Ok(())
 }
 
+/// Pure, host-safe ELF pre-flight validation — the exact parse [`load_elf`] runs
+/// on untrusted bytes BEFORE it maps anything, with NO page-table, frame-allocator,
+/// or cgroup work.
+///
+/// `load_elf` performs this same validation (header checks + the R172-02
+/// program-header-table bounds/alignment guard) and then walks `program_iter()`
+/// to map PT_LOAD segments. Exposing the validation as a standalone pure function
+/// lets a host fuzz harness exercise the attacker-controlled parse path (crafted
+/// ELF headers / program-header tables) reached via execve(59)/spawn_image(517)
+/// directly, without a live address space.
+///
+/// Returns `Ok(())` if the image passes the loader's pre-flight checks, or the
+/// same [`ElfLoadError`] the loader would return. Never maps memory; must never
+/// panic on malformed input — that is precisely the DoS class R172-02 closed.
+pub fn validate_elf_image(image: &[u8]) -> Result<(), ElfLoadError> {
+    let elf = ElfFile::new(image).map_err(|_| ElfLoadError::InvalidMagic)?;
+
+    // Header + R172-02 program-header-table bounds/alignment guard. This
+    // dominates every `program_iter()` walk below, exactly as in `load_elf`.
+    validate_elf_header(&elf)?;
+
+    // Walk the program headers the loader relies on. This is the operation that
+    // used to `panic=abort` on crafted input; it is safe now only because the
+    // R172-02 guard above has bounded and aligned the table.
+    for ph in elf.program_iter() {
+        let _ = ph.get_type();
+        let _ = ph.virtual_addr();
+        let _ = ph.mem_size();
+        let _ = ph.file_size();
+        let _ = ph.offset();
+    }
+
+    // Pure AT_PHDR user-VA derivation (checked math over the same headers).
+    let _ = compute_phdr_va(&elf);
+
+    Ok(())
+}
+
 /// Z-10 fix: 加载单个程序段并追踪映射，便于失败时全局回滚
 ///
 /// # Arguments

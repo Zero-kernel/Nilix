@@ -1696,7 +1696,7 @@ pub fn init() {
 /// Rejects paths that attempt to traverse above the root directory.
 /// Paths like "/../../etc/passwd" will return PermDenied to prevent
 /// sandbox/mount jail escapes.
-fn normalize_path(path: &str) -> Result<String, FsError> {
+pub fn normalize_path(path: &str) -> Result<String, FsError> {
     let mut components: Vec<&str> = Vec::new();
 
     for component in path.split('/') {
@@ -1725,7 +1725,7 @@ fn normalize_path(path: &str) -> Result<String, FsError> {
 }
 
 /// Split path into parent directory and filename
-fn split_path(path: &str) -> Result<(String, &str), FsError> {
+pub fn split_path(path: &str) -> Result<(String, &str), FsError> {
     let path = path.trim_end_matches('/');
 
     if path.is_empty() || path == "/" {

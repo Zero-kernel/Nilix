@@ -43,7 +43,9 @@ pub mod user_namespace;
 pub mod user_stack;
 pub mod usercopy;
 
-pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
+pub use elf_loader::{
+    load_elf, validate_elf_image, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP,
+};
 // M0 #1 (auxv): shared SysV AMD64 initial-user-stack builder, used by both sys_exec
 // and the usermode_test boot diagnostic (the real M0 musl gate path).
 pub use fork::{

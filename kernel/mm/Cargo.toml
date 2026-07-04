@@ -6,6 +6,13 @@ edition = "2021"
 [lib]
 path = "lib.rs"
 
+[features]
+# host_harness: compile `mm` WITHOUT its #[global_allocator] registration so the
+# crate (and everything that transitively depends on it) can link into a hosted
+# std binary — the cargo-fuzz harness. OFF for the kernel build; see the
+# ALLOCATOR static in memory.rs.
+host_harness = []
+
 [dependencies]
 drivers = { path = "../drivers" }
 cpu_local = { path = "../cpu_local" }
