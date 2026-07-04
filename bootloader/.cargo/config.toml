@@ -1,0 +1,11 @@
+# Bootloader (UEFI) build configuration.
+# NOTE: build-std must stay scoped to this directory (NOT the repo root) — a
+# root-level [unstable] build-std leaks into host-target builds (fuzz/) and
+# produces E0152 duplicate-`core` against the prebuilt sysroot std.
+
+[build]
+target = "x86_64-unknown-uefi"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
