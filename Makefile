@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check fmt fmt-check clippy hooks
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -332,6 +332,17 @@ boot-check: build
 # userspace/hello_musl.elf is the Ring-3 init program. See scripts/musl_check.sh.
 musl-check: build-musl-test
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh esp
+
+# SMP stress test gates - validate R175 D0 fixes under multi-core operation
+# Exit code reflects real SMP stability (0 = pass, non-zero = fail).
+# 2-core test validates basic SMP operation, 4-core validates scaling.
+test-smp: build
+	@echo "=== Running 2-Core SMP Stress Test ==="
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/smp_test.sh esp
+
+test-smp-4core: build
+	@echo "=== Running 4-Core SMP Stress Test ==="
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/smp_test_4core.sh esp
 
 # SMP测试模式 - 启用多核支持
 # 使用 -smp 指定CPU数量（默认2个）
