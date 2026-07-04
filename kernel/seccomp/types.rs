@@ -1142,6 +1142,10 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
                 | SYS_GETEGID     // R150-3 FIX
                 | SYS_GETPPID     // R150-3 FIX
                 | SYS_SCHED_YIELD // R150-3 FIX
+                | SYS_POLL        // M0-6 poll/select: lockstep with pledge_syscall_list (R150-3)
+                | SYS_SELECT      // M0-6 poll/select
+                | SYS_PSELECT6    // M0-6 poll/select (sigmask leg only masks the CALLER's own signals)
+                | SYS_PPOLL       // M0-6 poll/select
         ) {
             return true;
         }

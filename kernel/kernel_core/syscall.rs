@@ -7942,6 +7942,7 @@ fn sys_prlimit64(
 /// fails the parity self-test at `make test`.
 const DISPATCHED_PROMISED: &[u64] = &[
     0, 1, 2, 3, 4, 5, 6, 8, // read write open close stat fstat lstat lseek
+    7, 23, 270, 271, // poll select pselect6 ppoll (M0-6 poll/select STDIO wiring)
     9, 10, 11, 12, // mmap mprotect munmap brk (VM promise)
     24, 39, // sched_yield getpid
     56, 57, 59, 60, 61, 62, // clone fork execve exit wait4 kill

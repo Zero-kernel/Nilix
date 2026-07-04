@@ -134,7 +134,8 @@ const STRICT_ALLOWED: &[u64] = &[
 
 /// R169-12: Conservative worst-case instruction count for a generated pledge
 /// filter — `1` (LdSyscallNr) + `2` per allowed syscall + `1` (Ret Kill). The
-/// deduped union of every promise's syscall list is <= 48 today; we bound it at
+/// deduped union of every promise's syscall list is 53 today (49 + the 4 M0-6
+/// poll/select STDIO additions); we bound it at
 /// 64 distinct syscalls for headroom. The const-assert below makes any future
 /// promise/syscall expansion that would overrun `MAX_TRUSTED_INSNS` a BUILD
 /// error rather than a silent runtime fail-closed (deny-all). If you add
@@ -229,6 +230,14 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
             SYS_GETEGID,
             SYS_GETPPID,
             SYS_SCHED_YIELD,
+            // M0-6 poll/select: I/O multiplexing over already-held fds is a
+            // core stdio capability (OpenBSD pledge("stdio") grants
+            // poll/select/ppoll/pselect identically). Added in lockstep with
+            // promise_allows_syscall (types.rs) per R150-3.
+            SYS_POLL,
+            SYS_SELECT,
+            SYS_PSELECT6,
+            SYS_PPOLL,
         ]);
     }
 
