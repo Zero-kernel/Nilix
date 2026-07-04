@@ -17,12 +17,15 @@ M0-6 syscall fill is now **100% COMPLETE**. All remaining syscalls for broader u
 ### Added Syscalls
 
 #### 1. I/O Multiplexing (Poll/Select Family)
-- **select(23)** - stub returning ENOSYS (full fd_set implementation deferred)
-- **pselect6(270)** - stub returning ENOSYS (signal mask variant)
-- **ppoll(271)** - stub returning ENOSYS (poll with signal mask)
-- **poll(7)** - already present
 
-**Rationale:** I/O multiplexing is complex and requires event queue infrastructure. Stubs allow programs to detect unsupported calls cleanly rather than hanging.
+**⚠️ SUPERSEDED (2026-07-03, kernel-next-phase Post-M0 P1): the poll/select family is now REALLY IMPLEMENTED, not stubbed.** The entries below were the SLICE 5+ stubs; they have been replaced by a full level-triggered implementation. The prior "poll(7) - already present" line was FALSE — there was never a `7 =>` dispatch arm; poll(7) is now added.
+
+- **poll(7)** - ✅ IMPLEMENTED (dispatch arm added; `sys_poll`)
+- **select(23)** - ✅ IMPLEMENTED (real fd_set codec + timeval, replaces the ENOSYS stub)
+- **pselect6(270)** - ✅ IMPLEMENTED (timespec + sigmask argpack; timeout arg retyped `*mut`)
+- **ppoll(271)** - ✅ IMPLEMENTED (timespec + temporary sigmask; timeout arg retyped `*mut`)
+
+**As-built:** a level-triggered readiness SCAN + a bounded tick-granularity wait loop (the proven `sys_nanosleep` shape), with per-kind non-consuming probes (stdin keyboard, pipe via a new `PollProbeOps`, socket via `SocketState::poll_readiness`, files always-ready). Pure ABI/codec/timeout math in `kernel/kernel_core/poll.rs`; classify-under-lock / probe-without-lock two-phase machinery + the four handlers in `syscall.rs`. ppoll/pselect6 carry a TIF_RESTORE_SIGMASK-analog (`Process.poll_restore_blocked`). Ring-3 end-to-end proven by a `MUSL-POLL-OK` smoke in the musl gate. See the **M0-6 poll/select** section in `docs/next-phase-plan.md`.
 
 #### 2. Memory Management
 - **mremap(25)** - stub returning ENOSYS
@@ -149,7 +152,7 @@ This satisfies programs that query terminal attributes but don't strictly requir
 Items marked DEFERRED have documented blocking prerequisites:
 - **symlink/readlink**: needs ramfs Symlink NodeKind
 - **mremap**: needs VMA manipulation infrastructure  
-- **poll/select**: needs event queue infrastructure
+- ~~**poll/select**: needs event queue infrastructure~~ — **SUPERSEDED: poll/select/ppoll/pselect6 REALLY IMPLEMENTED (Post-M0 P1, 2026-07-03)** via a level-triggered scan + tick-wait loop (no event-queue infrastructure required; an event-driven redesign is a tracked follow-on efficiency slice).
 
 Stubs are in place with clear documentation for future implementation.
 
