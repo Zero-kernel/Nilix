@@ -10413,47 +10413,56 @@ pub fn try_demand_grow_user_stack(
     let mm_arc = Arc::clone(&proc.mm);
     let rlim_cur = proc.rlimits[crate::process::RLIMIT_STACK].rlim_cur;
 
-    // R173-03 FIX: Atomic check-and-set for stack_grow_in_progress (single critical section)
-    // Check stack_floor_committed, verify grow is valid, and claim reservation atomically
-    let (old_floor, grow_pages, new_floor, grow_size) = {
-        let mut mm = mm_arc.lock();
-        let old_floor = mm.stack_floor_committed;
-
-        // Sentinel: no user image installed yet
-        if old_floor == 0 {
-            return Err(SyscallError::EINVAL);
+    // R173-02 FIX (COMPLETE): try_lock for BOTH Process AND mm locks (IRQ safety)
+    // The previous fix only converted Process lock to try_lock, leaving mm.lock()
+    // as a blocking lock. This created the SAME deadlock on mm lock that R173-02
+    // was supposed to fix. Now BOTH locks use try_lock for full IRQ safety.
+    let mut mm = match mm_arc.try_lock() {
+        Some(mm) => mm,
+        None => {
+            drop(proc); // Release Process lock first
+            return Err(SyscallError::EAGAIN); // mm lock contended - let #PF retry
         }
-
-        // If fault_page is already at or above committed floor, something's wrong
-        if fault_page_base >= old_floor {
-            return Err(SyscallError::EINVAL);
-        }
-
-        // Bound by RLIMIT_STACK
-        let grow_floor = crate::elf_loader::stack_grow_floor(rlim_cur);
-        if fault_page_base < grow_floor {
-            return Err(SyscallError::ENOMEM);
-        }
-
-        // Check for concurrent grow and atomically claim reservation
-        if mm.stack_grow_in_progress {
-            return Err(SyscallError::EAGAIN);
-        }
-        mm.stack_grow_in_progress = true; // Atomically claim reservation
-
-        // Compute how many pages to map (bounded by MAX_GROW_PAGES)
-        let span = old_floor - fault_page_base;
-        let pages_needed = (span + PAGE_SIZE - 1) / PAGE_SIZE;
-        let pages_to_map = pages_needed.min(MAX_GROW_PAGES);
-
-        // Compute new floor and grow size under lock
-        let new_floor = old_floor - (pages_to_map * PAGE_SIZE);
-        let grow_size = pages_to_map * PAGE_SIZE;
-
-        (old_floor, pages_to_map, new_floor, grow_size)
     };
 
-    // Release Process lock before PT work
+    // R173-03 FIX: Atomic check-and-set for stack_grow_in_progress (single critical section)
+    // Check stack_floor_committed, verify grow is valid, and claim reservation atomically
+    let old_floor = mm.stack_floor_committed;
+
+    // Sentinel: no user image installed yet
+    if old_floor == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // If fault_page is already at or above committed floor, something's wrong
+    if fault_page_base >= old_floor {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Bound by RLIMIT_STACK
+    let grow_floor = crate::elf_loader::stack_grow_floor(rlim_cur);
+    if fault_page_base < grow_floor {
+        return Err(SyscallError::ENOMEM);
+    }
+
+    // Check for concurrent grow and atomically claim reservation
+    if mm.stack_grow_in_progress {
+        return Err(SyscallError::EAGAIN);
+    }
+    mm.stack_grow_in_progress = true; // Atomically claim reservation
+
+    // Compute how many pages to map (bounded by MAX_GROW_PAGES)
+    let span = old_floor - fault_page_base;
+    let pages_needed = (span + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages_to_map = pages_needed.min(MAX_GROW_PAGES);
+
+    // Compute new floor and grow size
+    let new_floor = old_floor - (pages_to_map * PAGE_SIZE);
+    let grow_size = pages_to_map * PAGE_SIZE;
+    let grow_pages = pages_to_map;
+
+    // Release locks before PT work
+    drop(mm);
     drop(proc);
 
     // Map pages [new_floor, old_floor) with deferred charge
