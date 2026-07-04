@@ -318,7 +318,13 @@ impl Inode for ProcSelfSymlink {
     }
 
     fn is_dir(&self) -> bool {
-        // Allow traversal through /proc/self/<...> before global symlink support exists
+        // M0-6 SLICE 3 FIX: /proc/self is a symlink, not a directory.
+        // Now that symlink resolution is implemented, return false and rely
+        // on the VFS manager to follow the symlink automatically.
+        false
+    }
+
+    fn is_symlink(&self) -> bool {
         true
     }
 

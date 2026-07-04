@@ -1831,6 +1831,19 @@ pub type VfsPreadCallback = fn(i32, &mut [u8], u64) -> Result<usize, SyscallErro
 /// Writes to fd at offset without changing the fd's offset.
 pub type VfsPwriteCallback = fn(i32, &[u8], u64) -> Result<usize, SyscallError>;
 
+/// VFS symlink creation callback type (M0-6 SLICE 3).
+/// Creates a symbolic link at linkpath pointing to target.
+pub type VfsSymlinkCallback = fn(&str, &str) -> Result<(), SyscallError>;
+
+/// VFS readlink callback type (M0-6 SLICE 3).
+/// Reads the target path of a symbolic link.
+/// Returns the target string (not null-terminated).
+pub type VfsReadlinkCallback = fn(&str) -> Result<alloc::string::String, SyscallError>;
+
+/// VFS lstat callback type (M0-6 SLICE 3).
+/// Stat the LINK itself (no-follow) — backs lstat / fstatat(AT_SYMLINK_NOFOLLOW).
+pub type VfsStatNofollowCallback = fn(&str) -> Result<VfsStat, SyscallError>;
+
 /// R74-2 FIX: Mount namespace materialization callback type.
 ///
 /// Registered by vfs module to force eager materialization of mount tables.
@@ -1921,6 +1934,12 @@ lazy_static::lazy_static! {
     static ref VFS_PREAD_CALLBACK: spin::Mutex<Option<VfsPreadCallback>> = spin::Mutex::new(None);
     /// VFS positioned write callback (pwrite64)
     static ref VFS_PWRITE_CALLBACK: spin::Mutex<Option<VfsPwriteCallback>> = spin::Mutex::new(None);
+    /// VFS symlink creation callback (M0-6 SLICE 3)
+    static ref VFS_SYMLINK_CALLBACK: spin::Mutex<Option<VfsSymlinkCallback>> = spin::Mutex::new(None);
+    /// VFS readlink callback (M0-6 SLICE 3)
+    static ref VFS_READLINK_CALLBACK: spin::Mutex<Option<VfsReadlinkCallback>> = spin::Mutex::new(None);
+    /// VFS lstat (no-follow) callback (M0-6 SLICE 3)
+    static ref VFS_STAT_NOFOLLOW_CALLBACK: spin::Mutex<Option<VfsStatNofollowCallback>> = spin::Mutex::new(None);
     /// R74-2 FIX: Mount namespace materialization callback
     static ref MOUNT_NS_MATERIALIZE_CALLBACK: spin::Mutex<Option<MountNsMaterializeCallback>> = spin::Mutex::new(None);
 }
@@ -2008,6 +2027,21 @@ pub fn register_vfs_pread_callback(cb: VfsPreadCallback) {
 /// 注册 VFS positioned write 回调 (pwrite64)
 pub fn register_vfs_pwrite_callback(cb: VfsPwriteCallback) {
     *VFS_PWRITE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS symlink 创建回调 (M0-6 SLICE 3)
+pub fn register_vfs_symlink_callback(cb: VfsSymlinkCallback) {
+    *VFS_SYMLINK_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS readlink 回调 (M0-6 SLICE 3)
+pub fn register_vfs_readlink_callback(cb: VfsReadlinkCallback) {
+    *VFS_READLINK_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS lstat (no-follow) 回调 (M0-6 SLICE 3)
+pub fn register_vfs_stat_nofollow_callback(cb: VfsStatNofollowCallback) {
+    *VFS_STAT_NOFOLLOW_CALLBACK.lock() = Some(cb);
 }
 
 /// R74-2 FIX: Register mount namespace materialization callback.
@@ -14111,13 +14145,26 @@ fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
 /// 3. readlink resolver broken (lookup_path_with_flags(..,false) returns ELOOP for final symlink)
 ///
 /// The readlink-resolver fix + ramfs Symlink node land together as one coherent change.
-fn sys_symlink(_target: *const u8, _linkpath: *const u8) -> SyscallResult {
-    // M0-6: Full implementation would:
-    // 1. Validate both paths
-    // 2. Create new inode with NodeKind::Symlink
-    // 3. Store target path in inode data
-    // 4. Add to parent directory
-    Err(SyscallError::ENOSYS)
+fn sys_symlink(target: *const u8, linkpath: *const u8) -> SyscallResult {
+    // M0-6 SLICE 3: Create symbolic link
+    if target.is_null() || linkpath.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 1. Copy both paths from userspace (SMAP-safe)
+    let target_bytes =
+        crate::usercopy::copy_user_cstring(target).map_err(|_| SyscallError::EFAULT)?;
+    let target_str = core::str::from_utf8(&target_bytes).map_err(|_| SyscallError::EINVAL)?;
+
+    let linkpath_bytes =
+        crate::usercopy::copy_user_cstring(linkpath).map_err(|_| SyscallError::EFAULT)?;
+    let linkpath_str = core::str::from_utf8(&linkpath_bytes).map_err(|_| SyscallError::EINVAL)?;
+
+    // 2. Call VFS symlink callback
+    let symlink_fn = VFS_SYMLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    symlink_fn(linkpath_str, target_str)?;
+
+    Ok(0)
 }
 
 /// sys_readlink - read value of symbolic link
@@ -14125,13 +14172,35 @@ fn sys_symlink(_target: *const u8, _linkpath: *const u8) -> SyscallResult {
 /// # M0-6 SLICE 3 - DEFERRED per plan
 ///
 /// Blocked on same issues as sys_symlink (see above).
-fn sys_readlink(_path: *const u8, _buf: *mut u8, _bufsiz: usize) -> SyscallResult {
-    // M0-6: Full implementation would:
-    // 1. Lookup path without following final component
-    // 2. Verify it's a symlink
-    // 3. Copy target path to user buffer
-    // 4. Return bytes copied (NOT null-terminated per POSIX)
-    Err(SyscallError::ENOSYS)
+fn sys_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> SyscallResult {
+    // M0-6 SLICE 3: Read symbolic link target
+    if path.is_null() || buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // SYM-READLINK-BUFSIZ-ZERO fix: Linux readlink(2) requires bufsiz > 0.
+    // A zero-sized buffer is EINVAL, not a no-op that returns 0.
+    if bufsiz == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 1. Copy path from userspace (SMAP-safe)
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+
+    // 2. Call VFS readlink callback to get target
+    let readlink_fn = VFS_READLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    let target = readlink_fn(path_str)?;
+
+    // 3. Copy to userspace (truncate if needed, NO null terminator per POSIX)
+    let copy_len = target.len().min(bufsiz);
+    if copy_len > 0 {
+        let target_bytes = target.as_bytes();
+        crate::usercopy::copy_to_user_safe(buf, &target_bytes[..copy_len])
+            .map_err(|_| SyscallError::EFAULT)?;
+    }
+
+    Ok(copy_len)
 }
 
 /// sys_unlink - 删除文件
@@ -14311,9 +14380,41 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
 
 /// sys_lstat - 获取符号链接状态
 ///
-/// 当前VFS不支持符号链接，等同于stat。
+/// M0-6 SLICE 3: lstat now stats the LINK itself (no-follow), not its target.
+/// Falls back to sys_stat only if the no-follow callback is unregistered (e.g.
+/// pre-VFS-init), preserving prior behavior.
 fn sys_lstat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
-    sys_stat(path, statbuf)
+    use crate::usercopy::copy_user_cstring;
+
+    if path.is_null() || statbuf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let path_str = {
+        let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        if path_bytes.is_empty() {
+            return Err(SyscallError::EINVAL);
+        }
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
+    };
+
+    sys_lstat_internal(&path_str, statbuf)
+}
+
+/// Shared lstat core: no-follow stat with fall-back to follow-stat if the
+/// no-follow callback is not registered.
+fn sys_lstat_internal(path_str: &str, statbuf: *mut VfsStat) -> SyscallResult {
+    let nofollow = *VFS_STAT_NOFOLLOW_CALLBACK.lock();
+    match nofollow {
+        Some(cb) => {
+            let stat = cb(path_str)?;
+            // R113-1 padding-safe copy (same as sys_stat_internal).
+            copy_vfs_stat_to_user(statbuf, &stat)?;
+            Ok(0)
+        }
+        // No-follow unavailable (pre-init): fall back to follow-stat.
+        None => sys_stat_internal(path_str, statbuf),
+    }
 }
 
 /// sys_fstatat - 相对路径stat
@@ -14330,7 +14431,7 @@ fn sys_lstat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 /// Copies the entire path once and uses the kernel copy for both the
 /// check and the actual operation, eliminating the window where an
 /// attacker could modify the path between check and use.
-fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) -> SyscallResult {
+fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, flags: i32) -> SyscallResult {
     use crate::usercopy::copy_user_cstring;
 
     if path.is_null() {
@@ -14338,6 +14439,12 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
     }
     if statbuf.is_null() {
         return Err(SyscallError::EFAULT);
+    }
+
+    // M0-6 SLICE 3: Validate flags (only AT_SYMLINK_NOFOLLOW is defined).
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(SyscallError::EINVAL);
     }
 
     // R96-5 FIX: Copy the entire path once to eliminate TOCTOU window.
@@ -14359,8 +14466,13 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    // Use internal helper with already-copied path
-    sys_stat_internal(&path_str, statbuf)
+    // M0-6 SLICE 3: Honor AT_SYMLINK_NOFOLLOW — route to lstat when set,
+    // otherwise route to stat (follow symlinks).
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        sys_lstat_internal(&path_str, statbuf)
+    } else {
+        sys_stat_internal(&path_str, statbuf)
+    }
 }
 
 /// sys_statx - extended file status (modern stat interface)

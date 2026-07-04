@@ -858,6 +858,69 @@ impl Vfs {
         }
     }
 
+    /// Resolve a path to its FINAL component's inode WITHOUT following that
+    /// component if it is a symbolic link (M0-6 SLICE 3).
+    ///
+    /// This is the primitive `readlink(2)` / `lstat(2)` need: the parent path is
+    /// resolved with full symlink following + per-component `+x` enforcement (via
+    /// `lookup_path`), but the final component is returned verbatim — even when it
+    /// is a symlink (returning the link inode) or dangles (the link exists though
+    /// its target does not). `lookup_path_with_flags(.., follow_final_symlink=false)`
+    /// CANNOT serve this role: it returns `Err(SymlinkLoop)` for a final symlink
+    /// instead of the inode.
+    ///
+    /// # Security
+    /// - Enforces search (`+x`) permission on the parent directory before the
+    ///   final lookup (same gate the traversal loop applies per component).
+    /// - Intermediate symlinks in the parent path ARE followed (POSIX: only the
+    ///   final component is treated no-follow), bounded by MAX_SYMLINK_DEPTH inside
+    ///   `lookup_path`.
+    pub fn lookup_symlink(&self, path: &str) -> Result<Arc<dyn Inode>, FsError> {
+        let normalized = normalize_path(path)?;
+
+        // Root ("/") has no "final component" to treat no-follow; it is always a
+        // directory, never a symlink.
+        if normalized == "/" {
+            return self.lookup_path("/");
+        }
+
+        let (parent_path, name) = split_path(&normalized)?;
+
+        // Resolve the parent with full symlink following + per-component +x.
+        let parent = self.lookup_path(&parent_path)?;
+        if !parent.is_dir() {
+            return Err(FsError::NotDir);
+        }
+
+        // Enforce search permission on the parent directory before the final
+        // lookup (mirrors the per-component gate in lookup_path_with_flags).
+        let parent_stat = parent.stat()?;
+        if !check_access_permission(&parent_stat, false, false, true) {
+            return Err(FsError::PermDenied);
+        }
+
+        // Resolve the final component in the parent's own filesystem WITHOUT
+        // following it. `find_mount` binds us to the correct namespace/mount for
+        // the fully-resolved parent path.
+        let (_, fs, _) = self.find_mount(&parent_path)?;
+        fs.lookup(&parent, name)
+    }
+
+    /// `stat(2)` on the LINK itself, not its target (M0-6 SLICE 3) — the `lstat(2)`
+    /// / `fstatat(AT_SYMLINK_NOFOLLOW)` primitive. Resolves via `lookup_symlink`
+    /// (no-follow final component) then runs the same MAC gate `stat` applies.
+    pub fn stat_nofollow(&self, path: &str) -> Result<Stat, FsError> {
+        let inode = self.lookup_symlink(path)?;
+        let stat = inode.stat()?;
+
+        // R153-2 parity: MAC gate for stat — access_mask 0 = existence/metadata.
+        if let Some(task) = LsmProcessCtx::from_current() {
+            lsm::hook_file_permission(&task, stat.ino, 0).map_err(|_| FsError::PermDenied)?;
+        }
+
+        Ok(stat)
+    }
+
     /// Open a file by path
     ///
     /// Supports O_CREAT for file creation and O_EXCL for exclusive creation.
@@ -1199,6 +1262,87 @@ impl Vfs {
 
         // Create the entry with sanitized permissions
         fs.create(&parent, filename, masked_mode)
+    }
+
+    /// Create a symbolic link at `linkpath` pointing to `target` (M0-6 SLICE 3).
+    ///
+    /// Mirrors `create`'s discipline: namespace-correct filesystem selection via
+    /// `find_mount` (NOT a cross-namespace fs_id scan), parent `+wx` DAC gate,
+    /// C.4 revalidation + existence re-check, and the LSM `hook_file_create` MAC
+    /// gate — all before the fs-level `symlink`. The symlink's own mode is the
+    /// conventional `lrwxrwxrwx` (0o120777); `target` is stored verbatim (POSIX
+    /// does not resolve or validate it at creation).
+    pub fn symlink(&self, linkpath: &str, target: &str) -> Result<(), FsError> {
+        if target.is_empty() {
+            return Err(FsError::Invalid);
+        }
+
+        let path = normalize_path(linkpath)?;
+        let (parent_path, name) = split_path(&path)?;
+
+        // Resolve parent (follows intermediate symlinks + per-component +x).
+        let parent = self.lookup_path(&parent_path)?;
+        if !parent.is_dir() {
+            return Err(FsError::NotDir);
+        }
+
+        // DAC: need write+execute on the parent directory to create entries.
+        let parent_stat = parent.stat()?;
+        if !check_access_permission(&parent_stat, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+
+        // Namespace-correct filesystem selection (same as create()).
+        let (_, fs, _) = self.find_mount(&path)?;
+
+        // C.4 revalidation: re-check parent identity + perms + absence right
+        // before the mutation.
+        let latest_parent_stat = parent.stat()?;
+        if latest_parent_stat.ino != parent_stat.ino
+            || !check_access_permission(&latest_parent_stat, false, true, true)
+        {
+            return Err(FsError::PermDenied);
+        }
+        if fs.lookup(&parent, name).is_ok() {
+            return Err(FsError::Exists);
+        }
+
+        // LSM MAC gate (S_IFLNK | 0o777 == 0o120777), freshest metadata.
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let name_hash = hash_path(name);
+            lsm::hook_file_create(&task, latest_parent_stat.ino, name_hash, 0o120777)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
+        fs.symlink(&parent, name, target)?;
+        Ok(())
+    }
+
+    /// Read the literal target of the symbolic link at `path` (M0-6 SLICE 3).
+    ///
+    /// Uses `lookup_symlink` (no-follow final component) so a link-to-file or a
+    /// DANGLING link both resolve to the link inode itself; returns `Invalid`
+    /// (EINVAL) when the final component is not a symlink, matching `readlink(2)`.
+    pub fn readlink(&self, path: &str) -> Result<String, FsError> {
+        let inode = self.lookup_symlink(path)?;
+        if !inode.is_symlink() {
+            return Err(FsError::Invalid);
+        }
+
+        // MAC gate parity with stat (metadata access).
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let ino = inode.stat()?.ino;
+            lsm::hook_file_permission(&task, ino, 0).map_err(|_| FsError::PermDenied)?;
+        }
+
+        // Read the target. Bound by PATH_MAX; never trust stat.size for the buffer
+        // beyond that cap. Symlinks are immutable in ramfs so size is stable.
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = inode.read_at(0, &mut buf)?;
+        let target = core::str::from_utf8(&buf[..n])
+            .map_err(|_| FsError::Invalid)?
+            .to_string();
+        Ok(target)
     }
 
     /// Remove a file or directory
@@ -1717,8 +1861,21 @@ fn vfs_open_with_resolve_callback(
 /// Called by sys_stat to get file status through VFS
 fn vfs_stat_callback(path: &str) -> Result<VfsStat, SyscallError> {
     let stat = VFS.stat(path).map_err(fs_error_to_syscall)?;
+    Ok(vfs_stat_from(stat))
+}
 
-    Ok(VfsStat {
+/// VFS lstat callback (M0-6 SLICE 3) — stat the LINK itself, not its target.
+///
+/// Backs `sys_lstat` and `sys_fstatat(AT_SYMLINK_NOFOLLOW)`. Routes through
+/// `Vfs::stat_nofollow` (no-follow final component).
+fn vfs_stat_nofollow_callback(path: &str) -> Result<VfsStat, SyscallError> {
+    let stat = VFS.stat_nofollow(path).map_err(fs_error_to_syscall)?;
+    Ok(vfs_stat_from(stat))
+}
+
+/// Shared conversion from the VFS `Stat` to the ABI `VfsStat`.
+fn vfs_stat_from(stat: Stat) -> VfsStat {
+    VfsStat {
         dev: stat.dev,
         ino: stat.ino,
         mode: stat.mode.to_raw(),
@@ -1735,7 +1892,7 @@ fn vfs_stat_callback(path: &str) -> Result<VfsStat, SyscallError> {
         mtime_nsec: stat.mtime.nsec,
         ctime_sec: stat.ctime.sec,
         ctime_nsec: stat.ctime.nsec,
-    })
+    }
 }
 
 /// VFS lseek callback for syscall registration
@@ -1992,6 +2149,9 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
     kernel_core::register_vfs_pread_callback(vfs_pread_callback); // R173-07 proper fix
     kernel_core::register_vfs_pwrite_callback(vfs_pwrite_callback); // R173-07 proper fix
+    kernel_core::syscall::register_vfs_symlink_callback(vfs_symlink_callback); // M0-6 SLICE 3
+    kernel_core::syscall::register_vfs_readlink_callback(vfs_readlink_callback); // M0-6 SLICE 3
+    kernel_core::syscall::register_vfs_stat_nofollow_callback(vfs_stat_nofollow_callback); // M0-6 SLICE 3 (lstat)
 
     // R74-2 FIX: Register mount namespace materialization callback.
     // This enables eager materialization when namespaces are created via
@@ -1999,7 +2159,7 @@ pub fn register_syscall_callbacks() {
     // post-clone parent mounts from leaking into child namespaces.
     kernel_core::register_mount_ns_materialize_callback(mount_ns_materialize_callback);
 
-    klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled, R173-07 pread64/pwrite64 enabled)");
+    klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled, R173-07 pread64/pwrite64 enabled, M0-6 symlink enabled)");
 }
 
 /// R74-2 FIX: Mount namespace materialization callback.
@@ -2301,4 +2461,22 @@ fn vfs_pwrite_callback(fd: i32, data: &[u8], offset: u64) -> Result<usize, Sysca
     // Process lock released before positioned write
 
     inode.write_at(offset, data).map_err(fs_error_to_syscall)
+}
+
+/// VFS symlink creation callback (M0-6 SLICE 3).
+///
+/// Creates a symbolic link at linkpath pointing to target. Delegates to
+/// `Vfs::symlink`, which performs namespace-correct filesystem selection, DAC/LSM
+/// gating, and C.4 revalidation.
+fn vfs_symlink_callback(linkpath: &str, target: &str) -> Result<(), SyscallError> {
+    VFS.symlink(linkpath, target).map_err(fs_error_to_syscall)
+}
+
+/// VFS readlink callback (M0-6 SLICE 3).
+///
+/// Reads the LITERAL target of a symbolic link WITHOUT following it. Delegates to
+/// `Vfs::readlink`, which uses the no-follow `lookup_symlink` primitive so a link
+/// to a file — or a dangling link — reads correctly.
+fn vfs_readlink_callback(path: &str) -> Result<alloc::string::String, SyscallError> {
+    VFS.readlink(path).map_err(fs_error_to_syscall)
 }

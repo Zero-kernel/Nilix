@@ -101,6 +101,25 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// Create a symbolic link
+    ///
+    /// # Arguments
+    /// * `parent` - Parent directory inode
+    /// * `name` - New symlink name
+    /// * `target` - Symlink target path (not validated, stored as-is)
+    ///
+    /// # Returns
+    /// The new symlink inode or error
+    fn symlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        let _ = (parent, name, target);
+        Err(FsError::NotSupported)
+    }
+
     /// Sync filesystem to storage (flush caches)
     fn sync(&self) -> Result<(), FsError> {
         Ok(())
@@ -138,6 +157,11 @@ pub trait Inode: Send + Sync {
     /// Check if this inode is a regular file
     fn is_file(&self) -> bool {
         self.stat().map(|s| s.mode.is_file()).unwrap_or(false)
+    }
+
+    /// Check if this inode is a symbolic link
+    fn is_symlink(&self) -> bool {
+        self.stat().map(|s| s.mode.is_symlink()).unwrap_or(false)
     }
 
     /// Read directory entries

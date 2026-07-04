@@ -83,6 +83,11 @@ impl FileMode {
         Self::new(FileType::BlockDevice, perm)
     }
 
+    /// Create mode for symbolic link with given permissions
+    pub const fn symlink(perm: u16) -> Self {
+        Self::new(FileType::Symlink, perm)
+    }
+
     /// Convert to raw st_mode value
     pub fn to_raw(&self) -> u32 {
         self.file_type.to_mode_bits() | (self.perm as u32)
@@ -101,6 +106,11 @@ impl FileMode {
     /// Check if this is a character device
     pub fn is_char_device(&self) -> bool {
         self.file_type == FileType::CharDevice
+    }
+
+    /// Check if this is a symbolic link
+    pub fn is_symlink(&self) -> bool {
+        self.file_type == FileType::Symlink
     }
 }
 

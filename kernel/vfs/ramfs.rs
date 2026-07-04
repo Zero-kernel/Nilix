@@ -125,7 +125,7 @@ impl Meta {
     }
 }
 
-/// Node kind: file or directory
+/// Node kind: file, directory, or symlink
 enum NodeKind {
     /// Regular file with data buffer
     File { data: RwLock<Vec<u8>> },
@@ -133,6 +133,8 @@ enum NodeKind {
     Dir {
         entries: RwLock<FallibleOrderedMap<String, Arc<RamFsInode>>>,
     },
+    /// Symbolic link with target path
+    Symlink { target: RwLock<String> },
 }
 
 /// RAM filesystem inode
@@ -180,6 +182,33 @@ impl RamFsInode {
         inode
     }
 
+    /// Create a new symlink inode
+    pub fn new_symlink(
+        fs_id: u64,
+        ino: u64,
+        perm: u16,
+        uid: u32,
+        gid: u32,
+        target: String,
+    ) -> Arc<Self> {
+        let mode = FileMode::symlink(perm);
+        let target_len = target.len() as u64;
+        let inode = Arc::new(Self {
+            fs_id,
+            ino,
+            meta: RwLock::new(Meta::new(mode, uid, gid)),
+            kind: NodeKind::Symlink {
+                target: RwLock::new(target),
+            },
+            self_ref: RwLock::new(None),
+        });
+        // Set symlink size to target path length
+        inode.meta.write().size = target_len;
+        // Store weak self-reference
+        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
+        inode
+    }
+
     /// Get Arc<Self> from weak reference
     fn as_arc(&self) -> Result<Arc<Self>, FsError> {
         self.self_ref
@@ -193,7 +222,7 @@ impl RamFsInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<RamFsInode>, FsError> {
         match &self.kind {
             NodeKind::Dir { entries } => entries.read().get(name).cloned().ok_or(FsError::NotFound),
-            NodeKind::File { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
     }
 
@@ -233,7 +262,7 @@ impl RamFsInode {
 
                 Ok(())
             }
-            NodeKind::File { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
     }
 
@@ -256,7 +285,7 @@ impl RamFsInode {
 
                 Ok(child)
             }
-            NodeKind::File { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
     }
 
@@ -264,7 +293,7 @@ impl RamFsInode {
     fn child_count(&self) -> usize {
         match &self.kind {
             NodeKind::Dir { entries } => entries.read().len(),
-            NodeKind::File { .. } => 0,
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => 0,
         }
     }
 
@@ -306,7 +335,7 @@ impl RamFsInode {
     fn dir_entries(&self) -> Option<&RwLock<FallibleOrderedMap<String, Arc<RamFsInode>>>> {
         match &self.kind {
             NodeKind::Dir { entries } => Some(entries),
-            NodeKind::File { .. } => None,
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => None,
         }
     }
 }
@@ -490,11 +519,24 @@ fn rename_apply_accounting(
 impl Drop for RamFsInode {
     fn drop(&mut self) {
         // Release quota for file data when inode is freed
-        if let NodeKind::File { data } = &self.kind {
-            let data = data.read();
-            if !data.is_empty() {
-                quota_release(data.len());
+        match &self.kind {
+            NodeKind::File { data } => {
+                let data = data.read();
+                if !data.is_empty() {
+                    quota_release(data.len());
+                }
             }
+            NodeKind::Symlink { target } => {
+                // SYM-QUOTA-BYPASS fix: symlink targets are charged at creation
+                // (RamFs::symlink), so release symmetrically here. This also
+                // reclaims the charge on the add_child-failure path, where the
+                // freshly-built (never-linked) symlink Arc drops.
+                let target = target.read();
+                if !target.is_empty() {
+                    quota_release(target.len());
+                }
+            }
+            NodeKind::Dir { .. } => {}
         }
     }
 }
@@ -550,6 +592,10 @@ impl Inode for RamFsInode {
         matches!(self.kind, NodeKind::File { .. })
     }
 
+    fn is_symlink(&self) -> bool {
+        matches!(self.kind, NodeKind::Symlink { .. })
+    }
+
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         match &self.kind {
             NodeKind::Dir { entries } => {
@@ -601,7 +647,7 @@ impl Inode for RamFsInode {
                     None => Ok(None),
                 }
             }
-            NodeKind::File { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
     }
 
@@ -621,6 +667,22 @@ impl Inode for RamFsInode {
 
                 // Update atime (optional, can be skipped for performance)
                 // self.meta.write().atime = TimeSpec::now();
+
+                Ok(to_read)
+            }
+            NodeKind::Symlink { target } => {
+                // Read symlink target (for readlink syscall)
+                let target = target.read();
+                let target_bytes = target.as_bytes();
+                let offset = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
+
+                if offset >= target_bytes.len() {
+                    return Ok(0); // EOF
+                }
+
+                let available = target_bytes.len() - offset;
+                let to_read = buf.len().min(available);
+                buf[..to_read].copy_from_slice(&target_bytes[offset..offset + to_read]);
 
                 Ok(to_read)
             }
@@ -665,6 +727,7 @@ impl Inode for RamFsInode {
                 Ok(data_in.len())
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
+            NodeKind::Symlink { .. } => Err(FsError::Invalid), // Symlinks are immutable
         }
     }
 
@@ -706,6 +769,7 @@ impl Inode for RamFsInode {
                 Ok(())
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
+            NodeKind::Symlink { .. } => Err(FsError::Invalid), // Symlinks are immutable
         }
     }
 
@@ -1073,6 +1137,69 @@ impl FileSystem for RamFs {
             same_parent,
         );
         Ok(())
+    }
+
+    fn symlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        let parent = self.downcast_inode(parent)?;
+
+        // Check if parent is a directory
+        if !parent.is_dir() {
+            return Err(FsError::NotDir);
+        }
+
+        // Validate target is not empty
+        if target.is_empty() {
+            return Err(FsError::Invalid);
+        }
+
+        // Validate target length. Linux PATH_MAX (4096) INCLUDES the NUL
+        // terminator, so a symlink target caps at 4095 bytes; >= 4096 is
+        // ENAMETOOLONG (SYM-PATH-MAX-DIVERGENCE fix).
+        if target.len() >= 4096 {
+            return Err(FsError::NameTooLong);
+        }
+
+        // Charge the target bytes against the ramfs global quota BEFORE
+        // allocating the inode, mirroring file writes (SYM-QUOTA-BYPASS fix).
+        // Symlink target storage was previously an uncharged heap allocation
+        // path — an unbounded-DoS bypass of MAX_TOTAL_BYTES.
+        if !quota_try_alloc(target.len()) {
+            return Err(FsError::NoSpace);
+        }
+
+        // Allocate inode number
+        let ino = self.alloc_ino();
+
+        // Get current process credentials for symlink ownership
+        let creds = current_credentials();
+        let uid = creds.as_ref().map(|c| c.euid).unwrap_or(0);
+
+        // For gid: respect setgid bit on parent directory
+        let parent_meta = parent.meta.read();
+        let gid = if parent_meta.mode.perm & 0o2000 != 0 {
+            parent_meta.gid
+        } else {
+            creds.as_ref().map(|c| c.egid).unwrap_or(0)
+        };
+        drop(parent_meta);
+
+        // Create new symlink inode (symlinks always have 0o777 permissions)
+        let new_inode =
+            RamFsInode::new_symlink(self.fs_id, ino, 0o777, uid, gid, target.to_string());
+
+        // Add to parent directory. On failure (EEXIST / NoSpace), `new_inode`
+        // (and the passed clone) drop here WITHOUT being linked, so the Symlink
+        // Drop arm releases the quota charged above exactly once — no manual
+        // rollback needed, no double-release (SYM-INO-LEAK quota leg). The inode
+        // NUMBER is not reclaimed (next_ino is monotonic + overflow-guarded).
+        parent.add_child(name, new_inode.clone())?;
+
+        Ok(new_inode as Arc<dyn Inode>)
     }
 }
 
