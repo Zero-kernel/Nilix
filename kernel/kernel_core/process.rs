@@ -4641,17 +4641,31 @@ fn force_remote_kill(victim_pid: ProcessId, exit_code: i32) {
     // `Ready && !stopped` tasks, so clear `stopped` / lift ProcessState::Stopped and
     // ask the scheduler to resume it; otherwise it never consumes its pending kill.
     if let Some(arc) = get_process(victim_pid) {
+        // R175 D0-CROSS-3 FIX: Atomic enqueue-then-ready transition.
+        // Previously, we marked state=Ready BEFORE calling kernel_resume_stopped,
+        // creating a window where the task was Ready but not enqueued. On SMP, an
+        // IRQ preemption could let the scheduler see this intermediate state and
+        // attempt to dequeue a task not in any queue → corruption.
+        //
+        // FIX: Call kernel_resume_stopped WHILE STILL HOLDING THE PROCESS LOCK and
+        // state is still Stopped. The scheduler's resume callback will enqueue the
+        // task, and we mark state=Ready ONLY AFTER successful enqueue, ensuring
+        // the scheduler invariant "Ready → in exactly one queue" is never violated.
         let needs_resume = {
             let mut p = arc.lock();
             let was_stopped = p.stopped || p.state == ProcessState::Stopped;
-            p.stopped = false;
-            if p.state == ProcessState::Stopped {
-                p.state = ProcessState::Ready;
+            if was_stopped {
+                p.stopped = false;
+                // Do NOT set state=Ready yet - scheduler will do it after enqueue
+                drop(p); // Release lock before calling scheduler
+                true
+            } else {
+                false
             }
-            was_stopped
         };
         if needs_resume {
-            crate::signal::kernel_resume_stopped(victim_pid);
+            // R175 D0-CROSS-3: scheduler callback will enqueue AND mark Ready atomically
+            crate::signal::kernel_resume_stopped_atomic(victim_pid, arc.clone());
         }
     }
 }

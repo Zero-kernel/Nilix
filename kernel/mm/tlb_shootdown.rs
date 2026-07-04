@@ -753,6 +753,12 @@ fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
                 .unwrap_or(false)
         });
         if all_acked {
+            // R175 D0-CROSS-2 FIX: Explicit Release fence ensures all prior writes
+            // (including the Acquire-synchronized TLB flush side effects) are visible
+            // globally before caller proceeds to deallocate frames. Required for
+            // non-TSO architectures (ARM, RISC-V) and formal verification soundness.
+            // On x86-64 TSO this is a no-op but documents the happens-before contract.
+            core::sync::atomic::fence(Ordering::Release);
             return true;
         }
         spin_loop();

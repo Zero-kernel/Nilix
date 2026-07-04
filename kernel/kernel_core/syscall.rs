@@ -1654,27 +1654,49 @@ pub fn set_syscall_frame_owner(pid: ProcessId) {
 }
 
 /// Execute a closure with MUTABLE access to the current syscall frame AND its FPU
-/// save area, but ONLY when the frame is live and owned by `expected_pid` (the
-/// caller's `current_pid()`). Returns `None` (and runs nothing) when no valid frame
-/// is present — e.g. a syscall that blocked-and-resumed (its `frame_ptr` was zeroed),
-/// in which case signal delivery is safely deferred to the next non-blocking return.
+/// save area, but ONLY when the frame is live and owned by `expected_pid`.
+///
+/// **R175 D0-CROSS-1 FIX:** This accessor now reads the frame pointer from the PCB's
+/// `saved_frame_ptr`/`saved_frame_owner` fields (task-bound storage) rather than
+/// from the per-CPU `SYSCALL_PERCPU[current_cpu_id()]` slot. This eliminates the
+/// cross-CPU corruption risk: if the target task migrates to a different CPU, the
+/// PCB-stored pointer remains correct, whereas the old per-CPU accessor would index
+/// the wrong CPU's slot and potentially corrupt an unrelated task's frame.
+///
+/// Returns `None` when no valid frame is present (task not in syscall, or frame_owner
+/// validation fails), safely deferring signal delivery to the next syscall return.
 ///
 /// The closure receives `(&mut SyscallFrame, &mut [u8; 512] fxsave_area)`.
 ///
 /// # Safety
-/// The raw pointer is the live kernel-stack frame; it is valid only during the active
-/// syscall on this CPU. The closure must not let either reference escape.
+/// The frame pointer must remain valid for the closure's duration. All call sites
+/// are from syscall-return paths where the task is actively executing the syscall.
 pub fn with_current_syscall_frame_mut<F, R>(expected_pid: ProcessId, f: F) -> Option<R>
 where
     F: FnOnce(&mut SyscallFrame, &mut [u8; 512]) -> R,
 {
-    let cb = *SYSCALL_FRAME_MUT_CALLBACK.get()?;
-    let ptr = cb(expected_pid as u64)?;
-    // SAFETY: arch validated `ptr` is the live frame for `expected_pid` on this CPU;
-    // the FPU area is the 512 bytes immediately above the 128-byte frame.
+    // R175 D0-CROSS-1 FIX: Read frame pointer from PCB (task-bound), not per-CPU slot.
+    // This requires locking the Process, which all call sites can do safely.
+    let proc_arc = crate::process::get_process(expected_pid)?;
+    let proc = proc_arc.lock();
+
+    let frame_ptr = proc.saved_frame_ptr;
+    let owner = proc.saved_frame_owner;
+
+    // Validate: frame must be live (ptr != 0) and owned by the expected task.
+    if frame_ptr == 0 || owner != expected_pid as u64 {
+        return None;
+    }
+
+    // Drop lock before accessing frame (frame is on kernel stack, stable during syscall).
+    drop(proc);
+
+    // SAFETY: We validated `frame_ptr` is non-zero and owned by `expected_pid`.
+    // The frame is on the task's kernel stack and remains valid during syscall execution.
+    // The FPU area is the 512 bytes immediately above the 128-byte frame.
     unsafe {
-        let frame = &mut *ptr;
-        let fx = &mut *((ptr as usize + SYSCALL_FRAME_BYTES) as *mut [u8; 512]);
+        let frame = &mut *(frame_ptr as *mut SyscallFrame);
+        let fx = &mut *((frame_ptr as usize + SYSCALL_FRAME_BYTES) as *mut [u8; 512]);
         Some(f(frame, fx))
     }
 }
