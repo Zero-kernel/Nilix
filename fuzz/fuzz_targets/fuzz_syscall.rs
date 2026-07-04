@@ -136,8 +136,9 @@ fn test_fcntl_fuzzing(fd: i32, cmd: i32, arg: u64) {
         0 | 1 | 2 | 3 | 4 | 1030 => {
             // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
             // Test boundary: arg for F_DUPFD should be < MAX_FD
-            if cmd == 0 || cmd == 1030 {
-                assert!(arg <= 256, "F_DUPFD arg exceeds MAX_FD");
+            if (cmd == 0 || cmd == 1030) && arg > 256 {
+                // F_DUPFD arg above MAX_FD is rejected with EINVAL.
+                return;
             }
         }
         _ => return, // Invalid cmd
@@ -154,9 +155,11 @@ fn test_pipe2_fuzzing(pipefd_addr: u64, flags: i32) {
         return;
     }
 
-    // Address should be user-space (< KERNEL_BASE)
+    // Address should be user-space (< KERNEL_BASE); a kernel pointer is rejected.
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    assert!(pipefd_addr < KERNEL_BASE, "pipe2 pipefd in kernel space");
+    if pipefd_addr >= KERNEL_BASE {
+        return;
+    }
 }
 
 fn test_pread64_fuzzing(fd: i32, buf_addr: u64, count: usize, offset: i64) {
@@ -175,7 +178,9 @@ fn test_pread64_fuzzing(fd: i32, buf_addr: u64, count: usize, offset: i64) {
 
     // Buffer address validation
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    assert!(buf_addr < KERNEL_BASE, "pread64 buffer in kernel space");
+    if buf_addr >= KERNEL_BASE {
+        return;
+    }
 
     // Count should be bounded by MAX_RW_SIZE
     const MAX_RW_SIZE: usize = 0x7ffff000;
@@ -197,7 +202,9 @@ fn test_pwrite64_fuzzing(fd: i32, buf_addr: u64, count: usize, offset: i64) {
     }
 
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    assert!(buf_addr < KERNEL_BASE, "pwrite64 buffer in kernel space");
+    if buf_addr >= KERNEL_BASE {
+        return;
+    }
 
     const MAX_RW_SIZE: usize = 0x7ffff000;
     if count > MAX_RW_SIZE {
@@ -220,13 +227,12 @@ fn test_sigaction_fuzzing(signum: i32, act_addr: u64, oldact_addr: u64) {
         return;
     }
 
-    // Addresses should be user-space or NULL
+    // Addresses should be user-space or NULL; a kernel pointer is rejected.
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    if act_addr != 0 {
-        assert!(act_addr < KERNEL_BASE, "sigaction act in kernel space");
-    }
-    if oldact_addr != 0 {
-        assert!(oldact_addr < KERNEL_BASE, "sigaction oldact in kernel space");
+    if (act_addr != 0 && act_addr >= KERNEL_BASE)
+        || (oldact_addr != 0 && oldact_addr >= KERNEL_BASE)
+    {
+        return;
     }
 }
 
@@ -240,13 +246,12 @@ fn test_sigprocmask_fuzzing(how: i32, set_addr: u64, oldset_addr: u64) {
         return;
     }
 
-    // Addresses validation
+    // Addresses validation; a kernel pointer is rejected with EFAULT.
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    if set_addr != 0 {
-        assert!(set_addr < KERNEL_BASE, "sigprocmask set in kernel space");
-    }
-    if oldset_addr != 0 {
-        assert!(oldset_addr < KERNEL_BASE, "sigprocmask oldset in kernel space");
+    if (set_addr != 0 && set_addr >= KERNEL_BASE)
+        || (oldset_addr != 0 && oldset_addr >= KERNEL_BASE)
+    {
+        return;
     }
 }
 
@@ -259,21 +264,23 @@ fn test_clone_fuzzing(flags: u64, stack: u64, ptid: u64) {
     const CLONE_SIGHAND: u64 = 0x00000800;
     const CLONE_THREAD: u64 = 0x00010000;
 
-    // CLONE_THREAD requires CLONE_SIGHAND and CLONE_VM
-    if flags & CLONE_THREAD != 0 {
-        assert!(flags & CLONE_SIGHAND != 0, "CLONE_THREAD without CLONE_SIGHAND");
-        assert!(flags & CLONE_VM != 0, "CLONE_THREAD without CLONE_VM");
+    // CLONE_THREAD requires CLONE_SIGHAND and CLONE_VM; a real clone() rejects
+    // the invalid flag combinations with EINVAL, so filter them here.
+    if flags & CLONE_THREAD != 0 && (flags & CLONE_SIGHAND == 0 || flags & CLONE_VM == 0) {
+        return;
     }
 
     // CLONE_SIGHAND requires CLONE_VM
-    if flags & CLONE_SIGHAND != 0 {
-        assert!(flags & CLONE_VM != 0, "CLONE_SIGHAND without CLONE_VM");
+    if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
+        return;
     }
 
-    // Stack address for CLONE_VM must be user-provided
+    // Stack address for CLONE_VM must be user-provided (never a kernel pointer)
     if flags & CLONE_VM != 0 && stack != 0 {
         const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-        assert!(stack < KERNEL_BASE, "clone stack in kernel space");
+        if stack >= KERNEL_BASE {
+            return;
+        }
     }
 }
 
@@ -292,16 +299,16 @@ fn test_futex_fuzzing(uaddr: u64, op: i32, val: i32, timeout_addr: u64) {
         return;
     }
 
-    // Address must be 4-byte aligned
-    assert!(uaddr % 4 == 0, "futex uaddr not aligned");
-
-    // Address must be user-space
+    // Address must be 4-byte aligned and user-space; a real futex() rejects the
+    // rest with EINVAL/EFAULT, so filter rather than panic on fuzz input.
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    assert!(uaddr < KERNEL_BASE, "futex uaddr in kernel space");
+    if uaddr % 4 != 0 || uaddr >= KERNEL_BASE {
+        return;
+    }
 
     // Timeout address validation for WAIT operations
-    if base_op == FUTEX_WAIT && timeout_addr != 0 {
-        assert!(timeout_addr < KERNEL_BASE, "futex timeout in kernel space");
+    if base_op == FUTEX_WAIT && timeout_addr != 0 && timeout_addr >= KERNEL_BASE {
+        return;
     }
 }
 

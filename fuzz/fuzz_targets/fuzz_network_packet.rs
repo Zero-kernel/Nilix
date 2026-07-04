@@ -1,93 +1,52 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
 
+/// Fuzz input for the network packet parsers.
 #[derive(Arbitrary, Debug)]
 struct NetworkFuzzInput {
+    /// Selects which transport parser to exercise on the raw bytes directly.
     protocol: u8,
-    packet_size: usize,
-    flags: u32,
+    /// Raw packet bytes handed to the real kernel parsers.
     data: Vec<u8>,
 }
 
+// Drives the REAL kernel packet parsers in `kernel/net` — the pure, host-safe
+// header decoders run on every received frame. The goal is to prove no crafted
+// packet can panic the parse path (all bounds/length/checksum handling must
+// return Err, never abort). A crash here is a real finding.
 fuzz_target!(|input: NetworkFuzzInput| {
-    // Target network packet handling
-    // - Malformed packets
-    // - Protocol violations
-    // - Buffer overflows
+    let data = &input.data[..];
 
-    if input.data.len() > 65535 {
-        return;
+    // Link + network layer entry points (each parses the buffer independently).
+    let _ = net::parse_ethernet(data);
+    let _ = net::parse_arp(data);
+
+    // If the bytes parse as IPv4, feed the returned L4 payload to the transport
+    // parsers exactly as the stack would.
+    if let Ok((_hdr, _opts, payload)) = net::parse_ipv4(data) {
+        let _ = net::parse_tcp_header(payload);
+        let _ = net::parse_udp_header(payload);
+        let _ = net::parse_icmp(payload);
     }
 
+    // Also exercise the transport parsers directly on the raw bytes, selected by
+    // a fuzzer-controlled protocol byte, so they get coverage independent of a
+    // well-formed IPv4 wrapper.
     match input.protocol {
-        6 => test_tcp_packet(&input.data),
-        17 => test_udp_packet(&input.data),
-        1 => test_icmp_packet(&input.data),
-        _ => return,
-    }
-});
-
-fn test_tcp_packet(data: &[u8]) {
-    if data.len() < 20 {
-        return; // Too small for TCP header
-    }
-
-    // TCP header validation
-    let src_port = u16::from_be_bytes([data[0], data[1]]);
-    let dst_port = u16::from_be_bytes([data[2], data[3]]);
-
-    if src_port == 0 || dst_port == 0 {
-        // Invalid port
-        return;
-    }
-
-    // Flags validation
-    let flags = data[13];
-    const TCP_FIN: u8 = 0x01;
-    const TCP_SYN: u8 = 0x02;
-    const TCP_RST: u8 = 0x04;
-    const TCP_ACK: u8 = 0x10;
-
-    // SYN+RST is invalid
-    if flags & TCP_SYN != 0 && flags & TCP_RST != 0 {
-        return;
-    }
-}
-
-fn test_udp_packet(data: &[u8]) {
-    if data.len() < 8 {
-        return; // Too small for UDP header
-    }
-
-    let src_port = u16::from_be_bytes([data[0], data[1]]);
-    let dst_port = u16::from_be_bytes([data[2], data[3]]);
-    let length = u16::from_be_bytes([data[4], data[5]]);
-
-    if length < 8 || length as usize > data.len() {
-        return; // Invalid length
-    }
-}
-
-fn test_icmp_packet(data: &[u8]) {
-    if data.len() < 8 {
-        return;
-    }
-
-    let icmp_type = data[0];
-    let icmp_code = data[1];
-
-    // Validate type/code combinations
-    match icmp_type {
-        0 => {
-            // Echo Reply
-            assert!(icmp_code == 0, "Echo Reply with non-zero code");
+        6 => {
+            if let Ok(hdr) = net::parse_tcp_header(data) {
+                let _ = net::parse_tcp_options(data, &hdr);
+            }
         }
-        8 => {
-            // Echo Request
-            assert!(icmp_code == 0, "Echo Request with non-zero code");
+        17 => {
+            let _ = net::parse_udp_header(data);
+        }
+        1 => {
+            let _ = net::parse_icmp(data);
+            let _ = net::icmp::parse_icmp_unchecked(data);
         }
         _ => {}
     }
-}
+});

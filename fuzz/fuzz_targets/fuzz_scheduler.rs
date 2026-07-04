@@ -69,9 +69,15 @@ fn test_set_affinity(mask: u64) {
         return;
     }
 
-    // Only valid CPU bits should be set
+    // Only valid CPU bits should be set. With a 64-bit mask covering 64 CPUs,
+    // every bit is a valid CPU, so the mask is all-ones. Guard the shift so
+    // MAX_CPUS >= 64 does not hit `1u64 << 64` (shift overflow panic in debug).
     const MAX_CPUS: u32 = 64;
-    let valid_mask = (1u64 << MAX_CPUS) - 1;
+    let valid_mask = if MAX_CPUS >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << MAX_CPUS) - 1
+    };
 
     if mask & !valid_mask != 0 {
         // Invalid CPU bits set

@@ -183,30 +183,41 @@ jobs:
           - fuzz_futex_ops
     
     steps:
-      - uses: actions/checkout@v3
-      
+      - uses: actions/checkout@v4
+
       - name: Install Rust nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          override: true
-      
+        uses: dtolnay/rust-toolchain@nightly
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      
+
       - name: Run fuzzer
         run: |
           cd fuzz
           cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=4096
         continue-on-error: true
-      
+
       - name: Upload artifacts
         if: failure()
-        uses: actions/upload-artifact@v3
+        # v4 required: the v3 artifact actions are shut down and hard-fail the job.
+        uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
 ```
+
+> The committed workflow at `.github/workflows/fuzz.yml` is the source of truth;
+> the snippet above is illustrative.
+>
+> **What actually runs kernel code:** `fuzz_elf_loader`, `fuzz_network_packet`,
+> and `fuzz_vfs_path` link and drive the real kernel parsers
+> (`kernel_core::validate_elf_image`, `net::parse_*`, `vfs::normalize_path` /
+> `split_path`) — the pure, host-safe validation layers. This is possible because
+> `mm`'s `#[global_allocator]` is compiled out under its `host_harness` feature
+> (see `fuzz/Cargo.toml` and the `ALLOCATOR` static in `kernel/mm/memory.rs`), so
+> the crate graph links against std's allocator. The remaining seven targets model
+> hardware/stateful subsystems that are not host-callable without a mock harness,
+> so they still exercise self-contained input-validation logic.
 
 ## Best Practices
 

@@ -116,8 +116,11 @@ fn test_mmap_fuzzing(addr: u64, length: u64, prot: i32, flags: i32, fd: i32, off
 
     // File-backed vs anonymous
     if flags & MAP_ANONYMOUS != 0 {
-        // fd should be -1, offset should be 0
-        assert!(fd == -1 || fd >= 0, "MAP_ANONYMOUS with fd");
+        // MAP_ANONYMOUS ignores fd; only an out-of-range fd (< -1) is clearly
+        // invalid, which the kernel rejects with EBADF.
+        if fd < -1 {
+            return;
+        }
     } else {
         // File-backed mapping
         if fd < 0 {

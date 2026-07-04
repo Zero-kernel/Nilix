@@ -113,19 +113,34 @@ fuzz_target!(|input: (i32, i32, u64)| {
 });
 ```
 
-## Status
+## Status (updated)
 
-- ❌ Direct kernel fuzzing via cargo-fuzz (incompatible with no_std)
-- ⏸️ syzkaller integration (requires syscall descriptions + significant setup)
-- ✅ Unit test expansion (already working via runtime_tests.rs)
-- 🎯 **Recommended**: Expand runtime_tests.rs with more edge cases
+The "cannot compile" premise above held only for the whole kernel. It turns out
+the kernel's **pure validation/parsing layers do compile and link into a hosted
+`std` cargo-fuzz harness** — the one true blocker was `mm`'s `#[global_allocator]`,
+now compiled out under an `mm/host_harness` cargo feature (see
+`kernel/mm/memory.rs`). With that gate, three targets drive real kernel code:
+
+- ✅ `fuzz_elf_loader` → `kernel_core::validate_elf_image` (the execve/spawn_image
+  ELF header + program-header-table pre-flight parse; guards the R172-02
+  crafted-ELF `panic=abort` DoS fix).
+- ✅ `fuzz_network_packet` → `net::parse_ethernet/ipv4/tcp/udp/icmp/arp` (the pure
+  received-frame header decoders).
+- ✅ `fuzz_vfs_path` → `vfs::normalize_path` / `split_path` (the R32-VFS-1
+  `..`-escape guard + parent/basename split run before any mount/inode state).
+
+- ⚠️ The other seven targets still exercise self-contained input-validation logic:
+  the subsystems they model (syscall dispatch, signals, mm, ipc, scheduler,
+  cgroup, futex) are hardware- and global-state-coupled and are not host-callable
+  without a mock harness.
+- ⏸️ syzkaller integration (whole-kernel syscall fuzzing) remains future work.
 
 ## Decision
 
-For now, **keep the fuzz framework as documentation** of what should be tested, but:
-1. Use the fuzz target logic as **test case templates** for runtime_tests.rs
-2. Add more edge case tests based on the fuzz target scenarios
-3. Revisit full fuzzing with syzkaller after 1.0-Preview release
+Wire every kernel subsystem that exposes a **pure, host-safe** entry point to its
+real code (done for ELF/net/path). For the stateful subsystems, either build a
+host mock/shim or pursue syzkaller (QEMU-based) after 1.0-Preview; until then keep
+their targets as input-validation guards so the CI job stays meaningful and green.
 
 ## References
 

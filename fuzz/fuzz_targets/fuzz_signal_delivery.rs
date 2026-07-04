@@ -129,9 +129,9 @@ fn test_signal_action(signum: i32, handler_addr: u64, flags: u32) {
     const SA_SIGINFO: u32 = 0x00000004;
     const SA_ONSTACK: u32 = 0x08000000;
 
-    if handler_addr > 1 {
-        // Custom handler requires SA_RESTORER
-        assert!(flags & SA_RESTORER != 0, "handler without SA_RESTORER");
+    // Custom handler requires SA_RESTORER; kernel returns EINVAL otherwise.
+    if handler_addr > 1 && flags & SA_RESTORER == 0 {
+        return;
     }
 
     // SA_NODEFER: signal is not automatically blocked during handler
@@ -170,12 +170,12 @@ fn test_signal_return(frame_addr: u64) {
         return;
     }
 
-    // Frame must be in user space
+    // Frame must be in user space and 16-byte aligned (x86_64 ABI); the SROP
+    // defense rejects the rest, so filter rather than panic on fuzz input.
     const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
-    assert!(frame_addr < KERNEL_BASE, "sigreturn frame in kernel space");
-
-    // Frame must be aligned (typically 16-byte for x86_64 ABI)
-    assert!(frame_addr % 16 == 0, "sigreturn frame misaligned");
+    if frame_addr >= KERNEL_BASE || frame_addr % 16 != 0 {
+        return;
+    }
 
     // SROP defense checks (in kernel):
     // 1. RIP must be canonical user-space
