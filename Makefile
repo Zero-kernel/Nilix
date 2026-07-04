@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -533,6 +533,46 @@ clean:
 	rm -rf esp
 	rm -f qemu-debug.log qemu-verbose.log qemu-smp.log disk-ext2.img
 
+# AFL++ Fuzzing Targets
+# NOTE: AFL++ QEMU mode cannot fuzz bare-metal x86_64-unknown-none kernel.
+#       See docs/fuzz/AFL_STATUS.md for alternatives (userspace wrappers or libFuzzer).
+afl-seeds:
+	@echo "=== 生成AFL++种子语料库 ==="
+	python3 scripts/generate_afl_seeds.py
+
+afl-fuzz: build afl-seeds
+	@echo "=== 运行AFL++单实例模糊测试 ==="
+	@echo "⚠️  WARNING: AFL++ QEMU mode cannot fuzz bare-metal x86_64-unknown-none kernel."
+	@echo "    This will fail with 'Unable to request new process from fork server'."
+	@echo "    See docs/fuzz/AFL_STATUS.md for alternatives (userspace wrappers or libFuzzer)."
+	@echo ""
+	chmod +x scripts/afl_fuzz.sh
+	./scripts/afl_fuzz.sh --kernel kernel-target/x86_64-unknown-none/release/kernel
+
+afl-fuzz-parallel: build afl-seeds
+	@echo "=== 运行AFL++并行模糊测试 ==="
+	@echo "⚠️  WARNING: AFL++ QEMU mode cannot fuzz bare-metal x86_64-unknown-none kernel."
+	@echo "    See docs/fuzz/AFL_STATUS.md for alternatives."
+	@echo ""
+	chmod +x scripts/afl_parallel.sh
+	./scripts/afl_parallel.sh \
+		--kernel kernel-target/x86_64-unknown-none/release/kernel \
+		--instances $(INSTANCES)
+
+afl-triage:
+	@echo "=== 分类AFL++崩溃发现 ==="
+	chmod +x scripts/afl_triage.sh
+	@if [ -d fuzz/afl_findings ]; then \
+		for fuzzer in fuzz/afl_findings/fuzzer*/crashes; do \
+			if [ -d "$$fuzzer" ]; then \
+				./scripts/afl_triage.sh "$$fuzzer"; \
+			fi; \
+		done; \
+	else \
+		echo "错误: 未找到AFL++结果目录 fuzz/afl_findings"; \
+		echo "请先运行 'make afl-fuzz' 或 'make afl-fuzz-parallel'"; \
+	fi
+
 # 用于连接到QEMU监视器
 monitor:
 	telnet localhost 45454
@@ -563,6 +603,13 @@ help:
 	@echo "  make run-smp SMP_CPUS=4 - 指定4核"
 	@echo "  make run-smp-debug - SMP调试模式（记录中断到qemu-smp.log）"
 	@echo ""
+	@echo "Fuzzing (AFL++) [⚠️  Disabled - incompatible with bare-metal kernel]:"
+	@echo "  make afl-seeds    - 生成AFL++种子语料库"
+	@echo "  make afl-fuzz     - 运行单实例AFL++模糊测试（会失败，见AFL_STATUS.md）"
+	@echo "  make afl-fuzz-parallel INSTANCES=4 - 并行运行多个AFL++实例（会失败）"
+	@echo "  make afl-triage   - 分类AFL++崩溃发现"
+	@echo "  NOTE: AFL++ cannot fuzz bare-metal kernel. Use libFuzzer instead (see docs/fuzz/)."
+	@echo ""
 	@echo "清理命令:"
 	@echo "  make clean        - 清理所有构建文件"
 	@echo ""
@@ -573,4 +620,5 @@ help:
 	@echo "  - Shell图形模式：使用PS/2键盘和VGA显示，Ctrl+Alt+G释放鼠标"
 	@echo "  - 调试模式会在qemu-debug.log中记录详细信息"
 	@echo "  - SMP模式会启动多个CPU核心，可用SMP_CPUS环境变量指定数量"
-	@echo "  - 按Ctrl+C可以随时停止QEMU"
+	@echo "  - AFL++模糊测试需要先安装AFL++工具链"
+	@echo "  - 按Ctrl+C可以随时停止QEMU或AFL++"

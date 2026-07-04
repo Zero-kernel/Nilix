@@ -7,6 +7,10 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+name = "nilix_fuzz"
+path = "src/lib.rs"
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.3", features = ["derive"] }
