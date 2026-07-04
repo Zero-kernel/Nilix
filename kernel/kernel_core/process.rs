@@ -144,6 +144,25 @@ pub trait FileOps: Send + Sync {
     fn stat(&self) -> Result<VfsStat, SyscallError> {
         Err(SyscallError::EBADF)
     }
+
+    /// M0-6 poll/select: classify this fd for a non-consuming readiness probe.
+    ///
+    /// Called under the Process lock by the poll/select classify pass; the returned
+    /// `PollArm` is then probed OUTSIDE the lock. Because `kernel_core` cannot
+    /// downcast the concrete types living in the `ipc`/`vfs` crates (they depend on
+    /// `kernel_core`, not the reverse), each implementor overrides this instead of a
+    /// central downcast — the same cycle-avoiding pattern as `FD_READ_CALLBACK`.
+    ///
+    /// The default is `AlwaysReady` (Linux DEFAULT_POLLMASK: a fd kind with no
+    /// blocking read/write always reports readable+writable). Regular files
+    /// (`FileHandle`/`Ext2File`) and namespace fds keep the default. NOTE: a
+    /// `/dev/console` `FileHandle` is a KNOWN-WRONG case under this default (its
+    /// `read_at` is a non-blocking `keyboard_read` that returns 0 when empty, so
+    /// poll would spuriously report POLLIN) — no in-tree consumer opens it today;
+    /// a char-device override rides this same mechanism as a tracked residual.
+    fn poll_arm(&self) -> crate::poll::PollArm {
+        crate::poll::PollArm::AlwaysReady
+    }
 }
 
 impl core::fmt::Debug for dyn FileOps {
@@ -908,6 +927,19 @@ pub struct Process {
     /// this Mutex-guarded struct could not be read lock-free anyway.)
     pub in_signal_handler: bool,
 
+    /// M0-6 poll/select (ppoll/pselect6 TIF_RESTORE_SIGMASK analog): when a
+    /// ppoll/pselect6 with a temporary signal mask is interrupted by a signal that
+    /// is deliverable ONLY under the caller's ORIGINAL mask, the temporary mask is
+    /// LEFT installed (so the just-woken signal is delivered under it at the
+    /// dispatcher tail) and the original mask is stashed here. It is restored to
+    /// `blocked` either by `maybe_deliver_signal` (as the `saved_blocked` source, so
+    /// `rt_sigreturn` lands on the original mask) OR by the dispatcher-tail
+    /// `poll_restore_sigmask_tail` on every no-delivery path. `None` = no pending
+    /// restore (the common case). Handler-scratch class: born-clean, NOT inherited on
+    /// fork/CLONE_VM (stays `None` via `Process::new`), cleared on exec — exactly like
+    /// `saved_blocked`.
+    pub poll_restore_blocked: Option<u64>,
+
     /// 进程优先级（静态优先级）
     pub priority: Priority,
 
@@ -1356,6 +1388,8 @@ impl Process {
             saved_frame_ptr: 0,
             saved_frame_owner: 0,
             in_signal_handler: false,
+            // M0-6 poll/select: no pending ppoll/pselect6 sigmask restore at birth.
+            poll_restore_blocked: None,
             priority,
             dynamic_priority: priority,
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority

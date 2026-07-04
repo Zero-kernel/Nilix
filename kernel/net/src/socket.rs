@@ -1125,6 +1125,18 @@ impl SocketMeta {
 // Socket State
 // ============================================================================
 
+/// M0-6 poll/select: non-consuming readiness snapshot of a socket, produced by
+/// `SocketState::poll_readiness`. Booleans (not raw POLL* bits) so the poll layer
+/// owns the bit mapping + masking.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SockPollReadiness {
+    pub readable: bool,
+    pub writable: bool,
+    pub hup: bool,
+    pub err: bool,
+    pub rdhup: bool,
+}
+
 /// Per-socket state backing a capability handle.
 ///
 /// This structure is wrapped in `Arc` and stored in the capability table.
@@ -1344,6 +1356,103 @@ impl SocketState {
     /// Get the current TCP state (if any).
     pub fn tcp_state(&self) -> Option<TcpState> {
         self.tcp.lock().as_ref().map(|tcp| tcp.control.state)
+    }
+
+    /// M0-6 poll/select: non-consuming readiness snapshot for this socket.
+    ///
+    /// # Lock discipline (NORMATIVE — do not violate)
+    /// At most ONE `SocketState` sub-lock (`listen`, `tcp`, or `rx_queue`) is held
+    /// at any instant: the listener arm takes+drops `listen` BEFORE the connection
+    /// arm touches `tcp` (never nest them — `push_accept_ready` wakes under `listen`
+    /// into Process-reaching hooks, so a `tcp`→`listen` nesting here would form a
+    /// cross-lock cycle with the accept path). Callable from process context with
+    /// IRQs enabled ONLY while no socket sub-lock is ever acquired in IRQ context
+    /// (today NIC RX is not IRQ-driven and TCP timers are flag-deferred); an
+    /// IRQ-context RX pump must first convert these to irqsave/try_lock discipline.
+    ///
+    /// Readiness is a "won't block" predicate: an unconnected / reset / closed
+    /// stream reports ready so the follow-up op fails FAST (ENOTCONN/EOF) instead of
+    /// hanging — never a false "would block". The send-window POLLOUT rule ignores
+    /// the per-namespace J2-6 budget (over-reporting POLLOUT is safe: the level-
+    /// triggered poll re-checks each tick and the real `tcp_send` enforces the cap).
+    pub fn poll_readiness(&self) -> SockPollReadiness {
+        // (1) Fully-closed socket: readable (EOF), writable (op fails fast), hup.
+        if self.is_closed() {
+            return SockPollReadiness {
+                readable: true,
+                writable: true,
+                hup: true,
+                err: false,
+                rdhup: false,
+            };
+        }
+
+        match self.ty {
+            SocketType::Stream => {
+                // (2) Listener: readable iff the accept queue has a pending conn.
+                // Take + DROP the `listen` lock before touching `tcp`.
+                {
+                    let lg = self.listen.lock();
+                    if let Some(l) = lg.as_ref() {
+                        return SockPollReadiness {
+                            readable: l.has_pending(),
+                            writable: false,
+                            hup: false,
+                            err: false,
+                            rdhup: false,
+                        };
+                    }
+                }
+
+                // (3) Connection TCB (single `tcp` lock).
+                let tg = self.tcp.lock();
+                match tg.as_ref() {
+                    // Not-yet-connected or post-RST stream: report all-ready so a
+                    // read/write/recv/send fails fast (never blocks). Documented
+                    // approximation of Linux tcp_poll on TCP_CLOSE.
+                    None => SockPollReadiness {
+                        readable: true,
+                        writable: true,
+                        hup: true,
+                        err: true,
+                        rdhup: false,
+                    },
+                    Some(tcp) => {
+                        let state = tcp.control.state;
+                        // Handshake in progress: neither readable nor writable yet.
+                        if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
+                            return SockPollReadiness::default();
+                        }
+                        let cb = &tcp.control;
+                        let readable = !cb.recv_buffer.is_empty()
+                            || cb.fin_received
+                            || state.is_closed()
+                            || !state.can_receive();
+                        let writable = if !state.can_send() {
+                            true
+                        } else {
+                            cb.send_window_available() > 0
+                                && cb.send_buffer_bytes < TCP_MAX_SEND_BUFFER_BYTES
+                        };
+                        SockPollReadiness {
+                            readable,
+                            writable,
+                            hup: false,
+                            err: false,
+                            rdhup: cb.fin_received,
+                        }
+                    }
+                }
+            }
+            // (5) Datagram / raw: readable iff a datagram is queued; always writable.
+            _ => SockPollReadiness {
+                readable: !self.rx_queue.lock().is_empty(),
+                writable: true,
+                hup: false,
+                err: false,
+                rdhup: false,
+            },
+        }
     }
 
     /// Get a clone of the TCP state waiters (for blocking connect/wakeups).

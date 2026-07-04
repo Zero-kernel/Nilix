@@ -31,6 +31,7 @@ pub mod ipc_namespace;
 pub mod mount_namespace;
 pub mod net_namespace;
 pub mod pid_namespace;
+pub mod poll;
 pub mod process;
 pub mod rcu;
 pub mod scheduler_hook;

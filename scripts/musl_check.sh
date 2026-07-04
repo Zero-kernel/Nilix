@@ -46,7 +46,11 @@ QEMU=qemu-system-x86_64
 # (so `bash scripts/musl_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
-TO="${MUSL_CHECK_TIMEOUT:-25}"
+# Default 35s: the boot self-test suite + the Ring-3 poll/select smoke (M0-6) push
+# the clean-exit marker past the old 25s window on a loaded remote. The gate still
+# observes to completion and re-greps the full log, so a wider window never weakens
+# it (it only fails-fast earlier on KERNEL PANIC).
+TO="${MUSL_CHECK_TIMEOUT:-35}"
 
 # Serial markers — KEEP IN SYNC with userspace/hello_musl.c.
 # Both musl markers are required (printf path AND the final puts path); checked
@@ -54,6 +58,9 @@ TO="${MUSL_CHECK_TIMEOUT:-25}"
 # treated as a regex quantifier.
 MUSL_PRINTF_MARKER='42 * 2 = 84'
 MUSL_SUCCESS_MARKER='musl libc test passed!'
+# M0-6 poll/select Ring-3 smoke marker: printed only if poll/select/ppoll all
+# ran to the expected results end-to-end (dispatch + copy-in/out + timeout casts).
+MUSL_POLL_MARKER='MUSL-POLL-OK'
 # Accept both the sys_exit ("exited with code") and reaper ("terminated with
 # exit code") phrasings; the musl Ring-3 path emits the latter.
 EXIT_RE='Process [0-9]+ (exited with code|terminated with exit code) 0'
@@ -138,6 +145,7 @@ qpid=""
 # Evaluate the final logs (do not trust only the poll flag).
 has_printf=0;  grep -Fq "$MUSL_PRINTF_MARKER"  "$ser" 2>/dev/null && has_printf=1
 has_success=0; grep -Fq "$MUSL_SUCCESS_MARKER" "$ser" 2>/dev/null && has_success=1
+has_poll=0;    grep -Fq "$MUSL_POLL_MARKER"    "$ser" 2>/dev/null && has_poll=1
 has_exit=0;    grep -qE "$EXIT_RE"             "$ser" 2>/dev/null && has_exit=1
 has_panic=0;   grep -Fq "$PANIC_MARKER"        "$ser" 2>/dev/null && has_panic=1
 
@@ -152,6 +160,11 @@ if [ "$has_printf" -ne 1 ]; then
 fi
 if [ "$has_success" -ne 1 ]; then
     echo "MUSL-CHECK FAIL: libc success marker missing (expected '$MUSL_SUCCESS_MARKER')"
+    rc=1
+fi
+if [ "$has_poll" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: poll/select smoke marker missing (expected '$MUSL_POLL_MARKER')"
+    echo "    => poll(7)/select(23)/pselect6(270)/ppoll(271) Ring-3 smoke failed (see MUSL-POLL-FAIL on serial)"
     rc=1
 fi
 if [ "$has_exit" -ne 1 ]; then

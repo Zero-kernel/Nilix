@@ -394,6 +394,37 @@ impl Pipe {
     }
 }
 
+/// M0-6 poll/select: non-consuming readiness probe for a pipe.
+///
+/// Takes exactly ONE `inner` lock via `status()`; mutates nothing and fires no
+/// wakeups (unlike `read`/`write`/`close_*`). Read-end readiness: POLLIN when
+/// data is buffered, POLLHUP when all write ends are gone (a read then returns
+/// EOF). Write-end readiness: POLLOUT when buffer space exists, POLLERR when all
+/// read ends are gone (a write then returns EPIPE).
+impl kernel_core::poll::PollProbeOps for Pipe {
+    fn poll_status_read(&self) -> kernel_core::poll::PollStatus {
+        let st = self.status();
+        kernel_core::poll::PollStatus {
+            readable: st.available > 0,
+            hup: st.writers == 0,
+            writable: false,
+            err: false,
+            rdhup: false,
+        }
+    }
+
+    fn poll_status_write(&self) -> kernel_core::poll::PollStatus {
+        let st = self.status();
+        kernel_core::poll::PollStatus {
+            writable: st.space > 0,
+            err: st.readers == 0,
+            readable: false,
+            hup: false,
+            rdhup: false,
+        }
+    }
+}
+
 /// 管道状态信息
 #[derive(Debug, Clone, Copy)]
 pub struct PipeStatus {
@@ -533,6 +564,20 @@ impl FileOps for PipeHandle {
         match self.end_type {
             PipeEndType::Read => "PipeRead",
             PipeEndType::Write => "PipeWrite",
+        }
+    }
+
+    /// M0-6 poll/select: hand the poll layer a probe over the SHARED `Arc<Pipe>`.
+    ///
+    /// `self.pipe.clone()` is an `Arc` refcount bump only — it does NOT touch
+    /// `PipeInner.readers`/`writers` (that is `duplicate()`/`clone_box`, which also
+    /// fire close-time wakes on drop). Coercing `Arc<Pipe>` → `Arc<dyn PollProbeOps>`
+    /// is a zero-allocation unsized coercion. `write_end` selects which end's
+    /// readiness the probe reads.
+    fn poll_arm(&self) -> kernel_core::poll::PollArm {
+        kernel_core::poll::PollArm::Dyn {
+            probe: self.pipe.clone(),
+            write_end: self.end_type == PipeEndType::Write,
         }
     }
 

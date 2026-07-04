@@ -90,6 +90,99 @@ pub fn test_syscalls() {
     // PURE (a real-blocking receive/futex test would hang single-CPU at boot).
     ipc::run_ipc_eintr_self_test();
     klog_always!("    ✓ M0 #5 signals (1b-1b): IPC/PI-futex precise-EINTR errno mapping (Interrupted => EINTR)");
+    // M0-6 poll/select: the PURE ABI/codec/timeout core (fd_set words/mark/test/
+    // trim boundaries, strict timespec vs lenient timeval conversion, revents
+    // masking with ERR/HUP/NVAL-always + RDHUP-requires-request, select-bit map).
+    kernel_core::poll::run_poll_pure_self_test();
+    // M0-6 poll/select: the pipe readiness PROBE composition over a REAL pipe
+    // (probe-layer only — no PROCESS_TABLE registration + timeout-0/non-blocking
+    // reads, so it cannot block or flake the 2-core SMP gate).
+    run_poll_pipe_probe_self_test();
+    // M0-6 poll/select: socket fds must classify as PollArm::Socket (not the
+    // AlwaysReady default) — guards the SocketFile::poll_arm override that routes
+    // to SocketState::poll_readiness (impl-diff review CONFIRMED finding).
+    kernel_core::syscall::run_poll_socket_arm_self_test();
+    klog_always!(
+        "    ✓ M0 #6 poll/select: pure codec/trim/timeout/mask + pipe probe + socket-arm classify"
+    );
+}
+
+/// M0-6 poll/select: exercise the pipe readiness probe end-to-end over a real
+/// pipe via its `poll_arm` FileOps hook — the exact `Dyn`-arm composition the
+/// syscall probe pass runs. Probe-layer only: no process registration, and the
+/// pipe is non-blocking so a mistaken read can never hang the boot / SMP gate.
+fn run_poll_pipe_probe_self_test() {
+    use ipc::pipe::{create_pipe, PipeFlags, PipeHandle};
+    use kernel_core::poll::{
+        mask_revents, status_to_bits, PollArm, POLLERR, POLLHUP, POLLIN, POLLOUT,
+    };
+    use kernel_core::process::FileOps;
+
+    // Non-blocking pipe: a stray read returns WouldBlock instead of blocking.
+    let flags = PipeFlags {
+        nonblock: true,
+        cloexec: false,
+    };
+
+    // Compute pre-mask readiness bits for a pipe end via its poll_arm probe.
+    let probe_bits = |h: &PipeHandle| -> i16 {
+        match h.poll_arm() {
+            PollArm::Dyn { probe, write_end } => {
+                let st = if write_end {
+                    probe.poll_status_write()
+                } else {
+                    probe.poll_status_read()
+                };
+                status_to_bits(&st)
+            }
+            _ => panic!("poll pipe self-test: a pipe end must classify as Dyn"),
+        }
+    };
+
+    let (rd, wr) = create_pipe(flags).expect("poll self-test: create_pipe");
+    // Empty pipe, both ends open: read end not readable + no HUP; write end writable.
+    let rb = probe_bits(&rd);
+    assert!(rb & POLLIN == 0, "empty pipe read end must not be readable");
+    assert!(rb & POLLHUP == 0, "pipe with a live writer must not HUP");
+    assert!(
+        probe_bits(&wr) & POLLOUT != 0,
+        "fresh pipe write end must be writable"
+    );
+    // Write 1 byte → read end becomes readable.
+    wr.write(b"x").expect("poll self-test: write");
+    assert!(
+        probe_bits(&rd) & POLLIN != 0,
+        "read end must be readable after a write"
+    );
+    // Drain the byte → read end not readable again.
+    let mut buf = [0u8; 1];
+    let n = rd.read(&mut buf).expect("poll self-test: drain read");
+    assert_eq!(n, 1, "drain read must return the one buffered byte");
+    assert!(
+        probe_bits(&rd) & POLLIN == 0,
+        "read end must not be readable after drain"
+    );
+    // Close the write end → read end reports POLLHUP.
+    drop(wr);
+    assert!(
+        probe_bits(&rd) & POLLHUP != 0,
+        "read end must HUP after the writer is closed"
+    );
+
+    // A fresh pipe whose READ end is closed → write end reports POLLERR.
+    let (rd2, wr2) = create_pipe(flags).expect("poll self-test: create_pipe 2");
+    drop(rd2);
+    assert!(
+        probe_bits(&wr2) & POLLERR != 0,
+        "write end must ERR after the reader is closed"
+    );
+
+    // Masking composition: an unrequested POLLOUT is stripped; POLLHUP always passes.
+    assert_eq!(
+        mask_revents(POLLIN, POLLOUT | POLLHUP),
+        POLLHUP,
+        "mask_revents must strip unrequested OUT but keep HUP"
+    );
 }
 
 /// 测试上下文切换

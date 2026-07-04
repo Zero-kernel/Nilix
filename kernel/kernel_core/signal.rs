@@ -474,6 +474,20 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
         None => return false,
     };
     let proc = arc.lock();
+    has_deliverable_signal_locked(&proc)
+}
+
+/// M0-6 poll/select: the handler-deliverable check over an ALREADY-HELD `&Process`
+/// guard (no re-lock). Mirrors `should_abort_pending_block`'s `&Process` shape so a
+/// caller holding the proc lock — ppoll/pselect6's sigmask restore-or-stash — can
+/// decide WITHOUT the self-deadlocking `get_process().lock()` re-entry of
+/// `has_deliverable_signal`. Handler-only (uncatchables/kills excluded via
+/// `signal_is_deliverable`, in-handler-gated); the monotonic fast-path is kept so
+/// the no-handler caller pays a single relaxed load.
+pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
+    if !any_handler_installed() {
+        return false;
+    }
     signal_is_deliverable(
         proc.pending_signals.bits(),
         proc.blocked,

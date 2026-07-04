@@ -90,8 +90,8 @@ pub use ipv4::{
 };
 pub use socket::{
     register_cgroup_port_hooks, register_socket_wait_hooks, socket_table, BindCharge,
-    CgroupPortHooks, PendingDatagram, SocketDomain, SocketError, SocketLabel, SocketProtocol,
-    SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
+    CgroupPortHooks, PendingDatagram, SockPollReadiness, SocketDomain, SocketError, SocketLabel,
+    SocketProtocol, SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
     TcpConnectResult, WaitOutcome, WaitQueue,
 };
 pub use stack::{
