@@ -279,7 +279,7 @@ const AF_INET: u32 = 2;
 ///
 /// Stores the CapId and socket_id together for efficient lookup.
 #[derive(Clone)]
-struct SocketFile {
+pub(crate) struct SocketFile {
     /// Capability ID referencing this socket in cap_table
     cap_id: cap::CapId,
     /// Socket ID in socket_table()
@@ -295,6 +295,11 @@ impl SocketFile {
             socket_id,
             nonblocking,
         }
+    }
+
+    /// U.S2-α: Expose cap_id for revocation in process::remove_fd.
+    pub(crate) fn cap_id(&self) -> cap::CapId {
+        self.cap_id
     }
 }
 
@@ -318,6 +323,19 @@ impl crate::process::FileOps for SocketFile {
         if let Some(sock) = net::socket_table().get(self.socket_id) {
             sock.increment_refcount();
         }
+
+        // U.S2-SLICE-2: Increment CapEntry refcount on dup/fork.
+        // SAFETY: cap_table is Arc<CapTable> shared under CLONE_SIGHAND, so
+        // this dup'd fd shares the same cap_table. increment_refcount() is
+        // called BEFORE returning the cloned SocketFile, so the refcount is
+        // correct even if the original fd closes immediately after this call.
+        if let Some(pid) = crate::process::current_pid() {
+            if let Some(Some(proc)) = crate::process::try_get_process(pid) {
+                let proc_guard = proc.lock();
+                let _ = proc_guard.cap_table.increment_refcount(self.cap_id);
+            }
+        }
+
         alloc::boxed::Box::new(self.clone())
     }
 

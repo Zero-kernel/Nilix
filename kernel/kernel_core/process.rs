@@ -1557,6 +1557,27 @@ impl Process {
             crate::cgroup::uncharge_fds(self.cgroup_id, 1);
             self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
         }
+
+        // U.S2-α FIX: Revoke CapId for SocketFile on close.
+        // U.S2-SLICE-2: Decrement refcount; revoke only at refcount→0.
+        //
+        // KNOWN GAP (SLICE-1, now FIXED): dup'd sockets share a CapId; the
+        // first close() would invalidate the CapId for ALL dup'd fds (the
+        // surviving fd's cap_id would become stale). SLICE-2 adds CapEntry
+        // refcounting (like SocketFile::socket refcount) so revocation happens
+        // only at the LAST close.
+        if let Some(ref desc) = removed {
+            if let Some(sock_file) = desc.as_any().downcast_ref::<crate::syscall::SocketFile>() {
+                let should_revoke = self
+                    .cap_table
+                    .decrement_refcount(sock_file.cap_id())
+                    .unwrap_or(false);
+                if should_revoke {
+                    let _ = self.cap_table.revoke(sock_file.cap_id());
+                }
+            }
+        }
+
         removed
     }
 
