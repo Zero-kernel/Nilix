@@ -22,6 +22,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // ============================================================================
 // Local Type Definitions (to avoid cyclic dependency with kernel_core)
@@ -398,7 +399,14 @@ impl fmt::Debug for CapObject {
 /// Capability table entry pairing object, rights, and flags.
 ///
 /// This is the internal representation stored in per-process CapTables.
-#[derive(Debug, Clone)]
+///
+/// # U.S2-SLICE-2: Refcounting
+///
+/// CapEntry now includes a refcount to support multiple FDs sharing the same
+/// CapId (via dup/dup2/fork). The refcount starts at 1 on allocate, increments
+/// on dup/fork, and decrements on close. Revocation happens only when refcount
+/// reaches 0, fixing the SLICE-1 dup'd socket gap.
+#[derive(Debug)]
 pub struct CapEntry {
     /// The kernel object this capability references.
     pub object: CapObject,
@@ -408,6 +416,12 @@ pub struct CapEntry {
 
     /// Behavioral flags (CLOEXEC, CLOFORK, etc.).
     pub flags: CapFlags,
+
+    /// U.S2-SLICE-2: Reference count for shared ownership (dup/fork).
+    /// Starts at 1 on allocate, incremented on dup/fork, decremented on close.
+    /// Revocation happens only at refcount→0.
+    /// pub(crate) to allow lib.rs to construct CapEntry in Clone/lookup.
+    pub(crate) refcount: AtomicUsize,
 }
 
 impl CapEntry {
@@ -418,6 +432,7 @@ impl CapEntry {
             object,
             rights,
             flags: CapFlags::empty(),
+            refcount: AtomicUsize::new(1),
         }
     }
 
@@ -428,7 +443,28 @@ impl CapEntry {
             object,
             rights,
             flags,
+            refcount: AtomicUsize::new(1),
         }
+    }
+
+    /// U.S2-SLICE-2: Increment reference count (dup/fork).
+    #[inline]
+    pub fn increment_refcount(&self) {
+        self.refcount.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// U.S2-SLICE-2: Decrement reference count (close).
+    /// Returns true if refcount reached 0 (should revoke).
+    #[inline]
+    pub fn decrement_refcount(&self) -> bool {
+        let prev = self.refcount.fetch_sub(1, Ordering::SeqCst);
+        prev == 1
+    }
+
+    /// U.S2-SLICE-2: Get current refcount (for debugging/auditing).
+    #[inline]
+    pub fn refcount(&self) -> usize {
+        self.refcount.load(Ordering::SeqCst)
     }
 
     /// Check if this capability should be inherited across exec().

@@ -136,7 +136,7 @@ struct CapTableInner {
 }
 
 /// Slot ties a capability entry to its generation counter.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CapSlot {
     /// R29-4 FIX: Generation counter for this slot (matches CapId.generation).
     /// Extended to u64 to support 48-bit generation space.
@@ -144,6 +144,26 @@ struct CapSlot {
 
     /// The actual capability entry.
     entry: CapEntry,
+}
+
+impl Clone for CapSlot {
+    /// U.S2-SLICE-2: Clone increments the CapEntry refcount.
+    /// Used by try_clone_for_fork to share CapIds across fork.
+    fn clone(&self) -> Self {
+        self.entry.increment_refcount();
+        Self {
+            generation: self.generation,
+            // SAFETY: We manually reconstruct CapEntry with the same object/rights/flags
+            // but a fresh AtomicUsize initialized to the current refcount+1 (already done
+            // via increment_refcount above). This is a shallow copy of the object handle.
+            entry: CapEntry {
+                object: self.entry.object.clone(),
+                rights: self.entry.rights,
+                flags: self.entry.flags,
+                refcount: core::sync::atomic::AtomicUsize::new(self.entry.refcount()),
+            },
+        }
+    }
 }
 
 impl CapTable {
@@ -190,7 +210,15 @@ impl CapTable {
     pub fn lookup(&self, cap_id: CapId) -> Result<CapEntry, CapError> {
         interrupts::without_interrupts(|| {
             let inner = self.inner.lock();
-            inner.lookup(cap_id).cloned()
+            let entry = inner.lookup(cap_id)?;
+            // U.S2-SLICE-2: Manually copy CapEntry fields since AtomicUsize isn't Clone.
+            // This creates a snapshot with the current refcount value (no increment).
+            Ok(CapEntry {
+                object: entry.object.clone(),
+                rights: entry.rights,
+                flags: entry.flags,
+                refcount: core::sync::atomic::AtomicUsize::new(entry.refcount()),
+            })
         })
     }
 
@@ -260,6 +288,45 @@ impl CapTable {
             let inner = self.inner.lock();
             let entry = inner.lookup(cap_id)?;
             Ok(entry.allows(required))
+        })
+    }
+
+    /// U.S2-SLICE-2: Increment refcount for a capability (dup/fork).
+    ///
+    /// # Arguments
+    ///
+    /// * `cap_id` - The capability to increment
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Refcount incremented successfully
+    /// * `Err(CapError::InvalidCapId)` - CapId is invalid or revoked
+    pub fn increment_refcount(&self, cap_id: CapId) -> Result<(), CapError> {
+        interrupts::without_interrupts(|| {
+            let inner = self.inner.lock();
+            let entry = inner.lookup(cap_id)?;
+            entry.increment_refcount();
+            Ok(())
+        })
+    }
+
+    /// U.S2-SLICE-2: Decrement refcount for a capability (close).
+    /// Returns true if refcount reached 0 (caller should revoke).
+    ///
+    /// # Arguments
+    ///
+    /// * `cap_id` - The capability to decrement
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Refcount reached 0, should revoke
+    /// * `Ok(false)` - Refcount > 0, do not revoke yet
+    /// * `Err(CapError::InvalidCapId)` - CapId is invalid or revoked
+    pub fn decrement_refcount(&self, cap_id: CapId) -> Result<bool, CapError> {
+        interrupts::without_interrupts(|| {
+            let inner = self.inner.lock();
+            let entry = inner.lookup(cap_id)?;
+            Ok(entry.decrement_refcount())
         })
     }
 
@@ -515,29 +582,33 @@ impl CapTableInner {
         rights_mask: CapRights,
         flags: CapFlags,
     ) -> Result<CapId, CapError> {
-        // Look up the source capability
-        let source_entry = self.lookup(cap_id)?.clone();
+        // Look up the source capability and extract its fields
+        let source_entry = self.lookup(cap_id)?;
+        let source_object = source_entry.object.clone();
+        let source_rights = source_entry.rights;
+        let source_flags = source_entry.flags;
 
         // Check if delegation is allowed
-        if source_entry.flags.contains(CapFlags::NOXFER) {
+        if source_flags.contains(CapFlags::NOXFER) {
             return Err(CapError::DelegationDenied);
         }
 
         // R162-9-2 FIX: Namespace capabilities are non-transferable by default
         // to prevent cross-namespace capability leaks.
-        if matches!(source_entry.object, CapObject::Namespace(_)) {
+        if matches!(source_object, CapObject::Namespace(_)) {
             return Err(CapError::DelegationDenied);
         }
 
         // R25-1 FIX: Enforce source restrictions on delegated capability
         // Source flags (CLOEXEC, CLOFORK, O_PATH, NOXFER) must be inherited to prevent
         // privilege escalation via flag stripping attacks
-        let enforced_flags = flags | source_entry.flags;
+        let enforced_flags = flags | source_flags;
 
         // Create new entry with restricted rights and enforced flags
+        // U.S2-SLICE-2: New CapEntry starts with refcount=1 (not shared with source)
         let new_entry = CapEntry::with_flags(
-            source_entry.object,
-            source_entry.rights.restrict(rights_mask),
+            source_object,
+            source_rights.restrict(rights_mask),
             enforced_flags,
         );
 
