@@ -1,8 +1,8 @@
 # Zero-OS Next-Phase Kernel Development Plan
 
 **Date:** 2026-07-04
-**Version:** 15.7
-**Based on:** 176 Security Audit Rounds + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.6
+**Version:** 15.8
+**Based on:** 176 Security Audit Rounds + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.7
 
 ---
 
@@ -5377,6 +5377,84 @@ review) provided the following calibrations for R129:
 
 ---
 
-*Generated: 2026-03-06 (v9.7 -- R129: 1 HIGH FIXED (ftruncate DAC bypass) + 1 MEDIUM (SynReceived socket count); R128-1/R128-2 ALL VERIFIED; 1.0-Preview 0-HIGH streak 0/3; R130 first potential clean round)*
+## 🔶 U.S2 (Enterprise Capability System Phase 2) — fd→CapId Bridge + Native Syscalls (IN PROGRESS, 2026-07-04)
+
+**Objective:** Wire the capability system to file descriptors and implement the first 5 native capability syscalls for M0 Ring-3 compatibility. This phase bridges POSIX fd semantics with object-capability security.
+
+**Status (2026-07-04):** **SLICE-1 ✅ + SLICE-2 ✅ COMPLETE** (~120 lines, 4 files). SLICE-3 **BLOCKED** on architectural refactoring (cap_table→IPC/VFS visibility).
+
+### ✅ SLICE-1: Socket CapId Close Revocation (2026-07-04)
+
+**Delivered:** Socket file descriptors now allocate a CapId on creation and revoke it on close, establishing the fd→CapId lifecycle bridge.
+
+**Changes:**
+- `kernel/kernel_core/syscall.rs` (~10 lines): Added `cap_id()` getter to `SocketFile`
+- `kernel/kernel_core/process.rs` (~15 lines): `remove_fd()` revokes CapId for `SocketFile` on close
+
+**Design:** SocketFile already had the cap_id field (added in R75-1 for network namespace isolation). SLICE-1 wires the revocation path: when a socket fd closes, `Process::remove_fd()` downcasts to SocketFile and calls `cap_table.revoke(cap_id)`.
+
+**Known Gap (Fixed in SLICE-2):** Multiple FDs can share one CapId via dup/dup2/fork. SLICE-1's immediate revocation invalidates the CapId for ALL surviving dup'd fds. SLICE-2 adds refcounting to fix this.
+
+**Verification:** Build ✅ / Lint 4/4 ✅ / Tests ✅ (exit 0) / Dual-write ✅ (MD5-verified local + remote sync)
+
+### ✅ SLICE-2: CapEntry Refcounting (2026-07-04)
+
+**Delivered:** CapEntry now has a reference count to support multiple FDs sharing the same CapId (via dup/dup2/fork). Revocation happens only when refcount→0 (last fd closes).
+
+**Changes (~100 lines, 4 files):**
+- `kernel/cap/types.rs` (~40 lines):
+  - Added `use core::sync::atomic::{AtomicUsize, Ordering}`
+  - Added `refcount: AtomicUsize` field to `CapEntry` (pub(crate) for lib.rs access)
+  - Implemented `increment_refcount()`, `decrement_refcount()`, `refcount()` methods
+  - Updated constructors to initialize refcount=1
+
+- `kernel/cap/lib.rs` (~50 lines):
+  - Removed `Clone` derive from `CapSlot`, implemented manual `Clone` that increments refcount
+  - Added `increment_refcount()` and `decrement_refcount()` methods to `CapTable`
+  - Fixed `lookup()` to manually copy CapEntry fields (AtomicUsize isn't Clone)
+  - Fixed `delegate()` to extract fields before creating new entry
+
+- `kernel/kernel_core/syscall.rs` (~10 lines):
+  - `SocketFile::clone_box()` increments CapEntry refcount on dup/fork
+  - Fixed double-Option handling for `try_get_process` return value
+
+- `kernel/kernel_core/process.rs` (~15 lines):
+  - `remove_fd()` decrements refcount and only revokes at refcount→0
+  - Removed "KNOWN GAP" comment (now fixed)
+
+**Design:** Mirrors SocketFile's socket refcount mechanism. Refcount starts at 1 on allocate, increments on dup/fork (`FileOps::clone_box`), decrements on close (`remove_fd`). Only when refcount→0 does `remove_fd` call `cap_table.revoke()`.
+
+**Safety:** The manual `Clone` for `CapSlot` ensures fork increments the refcount atomically. The `decrement_refcount()` uses SeqCst ordering and returns true only when the previous value was 1 (last reference).
+
+**Verification:** Build ✅ / Lint 4/4 ✅ / Tests ✅ (exit 0) / Dual-write ✅ (MD5-verified local + remote sync)
+
+### ⏸️ SLICE-3: Pipe/File CapId Allocation (BLOCKED)
+
+**Objective:** Extend CapId allocation to pipes and regular files (sys_pipe/sys_pipe2/sys_open/sys_openat).
+
+**Blocker:** The IPC/VFS subsystems create PipeHandle/FileHandle objects but don't have access to the process's `cap_table` (it's in kernel_core::Process). Current architecture:
+- IPC/VFS callbacks return `(fd, fd)` or `fd` to kernel_core
+- kernel_core allocates FDs and installs the FileOps objects
+- CapId allocation needs to happen DURING object creation (before fd allocation) to avoid TOCTOU
+
+**Architectural Options (deferred to U.S3 design):**
+1. Move `cap_table` to a global or per-namespace structure
+2. Pass `&CapTable` through IPC/VFS callbacks (ABI break)
+3. Allocate CapIds post-creation via a two-phase protocol (complex)
+
+**Status:** SLICE-3+ blocked pending U.S3 architectural design. The fd→CapId bridge is functional for sockets (SLICE-1+2); pipes/files will follow after the visibility issue is resolved.
+
+### Remaining SLICES (Blocked on SLICE-3)
+
+**SLICE-4:** `native_cap_op(604)` syscall + seccomp 600-631 enforcement  
+**SLICE-5:** Generation exhaustion error mapping  
+**SLICE-6:** `native_invoke(605)` + `native_spawn(606)` (blocked on U.S3 IPC)  
+**SLICE-7:** `native_endpoint_call(607)` + `native_event_wait(608)` (U.S3 gate)  
+
+**Next Steps:** U.S3 architectural design phase will resolve the cap_table visibility issue, unblocking SLICE-3+.
+
+---
+
+*Generated: 2026-07-04 (v15.8 -- U.S2 SLICE-1+2 complete: fd→CapId bridge functional for sockets with refcounting; SLICE-3+ blocked on cap_table→IPC/VFS visibility)*
 *Collaborative review: Claude Opus 4 + Codex MCP*
 *Inputs: 129 QA rounds + 19 defect analysis docs + 2 roadmaps + 19 prior plans*
