@@ -105,6 +105,27 @@ pub fn test_syscalls() {
     klog_always!(
         "    ✓ M0 #6 poll/select: pure codec/trim/timeout/mask + pipe probe + socket-arm classify"
     );
+    // U.S3-B: the generic FileOps::cap_id() accessor that the fd→cap lifecycle
+    // (dup bump, close/exec/exit decrement) dispatches through — SocketFile
+    // must override (Some), clone must carry the SAME CapId (bump lives at the
+    // install site, not clone_box), defaults stay None. A missing override is
+    // invisible to a green boot (dev-v35 class): decrements silently no-op and
+    // cap slots leak to TableFull.
+    kernel_core::syscall::run_fileops_cap_id_self_test();
+    klog_always!(
+        "    ✓ U.S3-B fd→cap accessor: SocketFile override + same-CapId clone + None default"
+    );
+    // U.S3-SLICE-2: fork reconciliation of thread-shared cap_table refcounts.
+    // When a CLONE_THREAD thread (sharing its cap_table Arc) calls fork(), the
+    // verbatim refcount copy includes sibling-held references but the child only
+    // gets the forking thread's fds → over-count. reconcile_refcounts_after_fork
+    // fixes this by counting the child's actual fd references and overwriting
+    // each CapEntry.refcount. Self-test simulates the scenario and asserts the
+    // corrected counts (pure: no real process/socket state).
+    kernel_core::syscall::run_fork_reconcile_refcount_self_test();
+    klog_always!(
+        "    ✓ U.S3-SLICE-2 fork reconciliation: thread-shared cap_table refcount correction"
+    );
 }
 
 /// M0-6 poll/select: exercise the pipe readiness probe end-to-end over a real
