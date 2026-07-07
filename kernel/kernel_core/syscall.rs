@@ -296,11 +296,6 @@ impl SocketFile {
             nonblocking,
         }
     }
-
-    /// U.S2-α: Expose cap_id for revocation in process::remove_fd.
-    pub(crate) fn cap_id(&self) -> cap::CapId {
-        self.cap_id
-    }
 }
 
 /// S_IFSOCK constant - socket file type marker
@@ -308,7 +303,7 @@ const S_IFSOCK: u32 = 0o140000;
 
 impl crate::process::FileOps for SocketFile {
     fn clone_box(&self) -> alloc::boxed::Box<dyn crate::process::FileOps> {
-        // Increment refcount on clone (for dup/fork POSIX semantics).
+        // Increment the SOCKET refcount on clone (for dup/fork POSIX semantics).
         //
         // NOTE: If the socket was already closed/removed from the table,
         // get() returns None and we create a SocketFile pointing to a dead
@@ -324,19 +319,28 @@ impl crate::process::FileOps for SocketFile {
             sock.increment_refcount();
         }
 
-        // U.S2-SLICE-2: Increment CapEntry refcount on dup/fork.
-        // SAFETY: cap_table is Arc<CapTable> shared under CLONE_SIGHAND, so
-        // this dup'd fd shares the same cap_table. increment_refcount() is
-        // called BEFORE returning the cloned SocketFile, so the refcount is
-        // correct even if the original fd closes immediately after this call.
-        if let Some(pid) = crate::process::current_pid() {
-            if let Some(Some(proc)) = crate::process::try_get_process(pid) {
-                let proc_guard = proc.lock();
-                let _ = proc_guard.cap_table.increment_refcount(self.cap_id);
-            }
-        }
-
+        // U.S3-A2 FIX (CRITICAL self-deadlock): clone_box is PURE with respect to
+        // the cap_table — it does NOT take the Process lock or bump the CapEntry
+        // refcount. The prior U.S2-SLICE-2 code did `try_get_process(pid).lock()`
+        // + `cap_table.increment_refcount()` HERE, but EVERY clone_box caller
+        // (sys_dup/dup2/dup3, fcntl F_DUPFD, fork.rs:443, the CLONE_FILES snapshot
+        // at :3833) already holds THAT SAME Process spin::Mutex — a non-reentrant
+        // lock — so any dup/fork of a socket fd was a same-CPU self-deadlock,
+        // masked only because no boot/musl path dups a live socket. The cap
+        // refcount is now bumped EXPLICITLY at each call site under the
+        // already-held guard AFTER the fd install succeeds (U.S3-A3), and copied
+        // verbatim (not incremented) into the fork child table (U.S3-A1
+        // CapSlot::clone). See `remove_fd` (process.rs) for the matching decrement
+        // via the generic `FileOps::cap_id()` accessor.
         alloc::boxed::Box::new(self.clone())
+    }
+
+    /// U.S3-B FIX: expose this fd's CapId so the generic `remove_fd` /
+    /// dup / exec-cloexec / exit paths can decrement its refcount without
+    /// downcasting to the concrete `SocketFile` type. `Some` because a socket fd
+    /// always carries a live cap allocated at `sys_socket` / `sys_accept`.
+    fn cap_id(&self) -> Option<cap::CapId> {
+        Some(self.cap_id)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1320,6 +1324,182 @@ pub fn run_socket_waiter_deferred_free_self_test() {
             && !sw.waiters.contains_key(&q1)
             && !sw.waiters.contains_key(&q3),
         "M4-1c: live queues must be preserved, empties freed"
+    );
+}
+
+/// U.S3-B: structural self-test for the generic `FileOps::cap_id()` accessor.
+///
+/// The fd→cap lifecycle (dup increment, close/exec/exit decrement) dispatches
+/// through this trait method instead of per-type downcasts. A cap-BEARING
+/// implementor that forgets the override silently falls back to the `None`
+/// default — every decrement for its fds becomes a no-op and the cap leaks to
+/// TableFull (the dev-v35 missing-override class). A green boot cannot catch
+/// that, so each bearing type is pinned here. PURE: the fabricated socket_id
+/// resolves to nothing in socket_table(), so clone/Drop side effects are
+/// no-ops and no process/cap table is touched.
+pub fn run_fileops_cap_id_self_test() {
+    use crate::process::FileOps;
+
+    // (1) SocketFile MUST override cap_id() with its live CapId (a socket fd
+    // always carries the cap allocated at sys_socket/sys_accept).
+    let cid = cap::CapId::from_parts(7, 42);
+    let sock = SocketFile::new(cid, u64::MAX, false);
+    let desc: &dyn FileOps = &sock;
+    assert!(
+        desc.cap_id() == Some(cid),
+        "U.S3-B: SocketFile must override FileOps::cap_id() with its CapId — \
+         a default-None fallback makes every close/exec/exit decrement a no-op \
+         (cap slot leak → TableFull DoS)"
+    );
+
+    // (2) clone_box is PURE w.r.t. cap accounting (U.S3-A2) and the copy
+    // carries the SAME CapId (shared entry, not a fresh allocation) — the
+    // explicit call-site bump (U.S3-A3) relies on both.
+    let cloned = desc.clone_box();
+    assert!(
+        cloned.cap_id() == Some(cid),
+        "U.S3-A2/A3: a dup/fork copy must reference the SAME CapId; the \
+         refcount bump happens at the install site, never inside clone_box"
+    );
+
+    // (3) A non-bearing fd kind keeps the default None (namespace fds today;
+    // pipe/file fds keep None until U.S2 SLICE-3 wires their caps).
+    struct NoCapFile;
+    impl FileOps for NoCapFile {
+        fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
+            alloc::boxed::Box::new(NoCapFile)
+        }
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn type_name(&self) -> &'static str {
+            "NoCapFile"
+        }
+    }
+    let plain: &dyn FileOps = &NoCapFile;
+    assert!(
+        plain.cap_id().is_none(),
+        "U.S3-B: the FileOps::cap_id() default must stay None for \
+         non-cap-bearing fd kinds"
+    );
+}
+
+/// U.S3-SLICE-2: self-test for fork reconciliation of thread-shared cap_table.
+///
+/// When a CLONE_THREAD thread (sharing its cap_table Arc with siblings) calls
+/// fork(), CapSlot::clone copies refcounts VERBATIM including sibling-held
+/// references, but the child only gets the forking thread's fds → over-count.
+/// The reconcile_refcounts_after_fork method fixes this by counting the child's
+/// actual fd references and overwriting each CapEntry.refcount. This test
+/// simulates the scenario: create a cap_table with over-counted refcounts,
+/// build a child-fd histogram, call reconcile, and assert the corrected counts.
+/// PURE: no process/socket state touched (fabricated CapIds + empty CapObjects).
+pub fn run_fork_reconcile_refcount_self_test() {
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+
+    // (1) Create a cap_table simulating a CLONE_THREAD parent whose refcounts
+    // include sibling-held references. Allocate 3 caps with initial refcount=1
+    // each, then manually bump them to simulate: cap A held by 2 threads (parent
+    // + sibling), cap B held by 3 threads, cap C held by 1 thread (parent only).
+    let parent_table = cap::CapTable::new();
+    let cap_a = parent_table
+        .allocate(cap::CapEntry::new(
+            cap::CapObject::Socket(Arc::new(cap::Socket::new(999, 0))),
+            cap::CapRights::READ | cap::CapRights::WRITE,
+        ))
+        .expect("allocate cap A");
+    let cap_b = parent_table
+        .allocate(cap::CapEntry::new(
+            cap::CapObject::Socket(Arc::new(cap::Socket::new(998, 0))),
+            cap::CapRights::READ,
+        ))
+        .expect("allocate cap B");
+    let cap_c = parent_table
+        .allocate(cap::CapEntry::new(
+            cap::CapObject::Socket(Arc::new(cap::Socket::new(997, 0))),
+            cap::CapRights::WRITE,
+        ))
+        .expect("allocate cap C");
+
+    // Simulate sibling-held references: A=2 (parent+1 sibling), B=3 (parent+2
+    // siblings), C=1 (parent only). The initial allocate() set refcount=1; bump
+    // the shared ones.
+    parent_table.increment_refcount(cap_a).expect("bump A");
+    parent_table.increment_refcount(cap_b).expect("bump B to 2");
+    parent_table.increment_refcount(cap_b).expect("bump B to 3");
+    // C stays at 1 (parent-only).
+
+    assert!(
+        parent_table.get_refcount(cap_a) == Some(2),
+        "pre-fork: cap A should have refcount=2 (parent+sibling)"
+    );
+    assert!(
+        parent_table.get_refcount(cap_b) == Some(3),
+        "pre-fork: cap B should have refcount=3 (parent+2 siblings)"
+    );
+    assert!(
+        parent_table.get_refcount(cap_c) == Some(1),
+        "pre-fork: cap C should have refcount=1 (parent-only)"
+    );
+
+    // (2) Simulate fork: try_clone_for_fork copies the table VERBATIM (refcounts
+    // 2/3/1 for A/B/C), but the child only gets the forking thread's fds.
+    // Build the child-fd histogram: child holds A once, B once, and does NOT
+    // hold C (C was a sibling-only cap in this simulation).
+    let mut child_table = parent_table
+        .try_clone_for_fork()
+        .expect("fork clone table");
+
+    // Before reconciliation, the child's verbatim-copied refcounts are wrong:
+    assert!(
+        child_table.get_refcount(cap_a) == Some(2),
+        "pre-reconcile: child's cap A refcount is verbatim-copied = 2 (WRONG, child holds 1 fd)"
+    );
+    assert!(
+        child_table.get_refcount(cap_b) == Some(3),
+        "pre-reconcile: child's cap B refcount is verbatim-copied = 3 (WRONG, child holds 1 fd)"
+    );
+    assert!(
+        child_table.get_refcount(cap_c) == Some(1),
+        "pre-reconcile: child's cap C refcount is verbatim-copied = 1 (WRONG, child holds 0 fds)"
+    );
+
+    // Build the child-fd histogram: A→1 fd, B→1 fd, C→0 fds (not in map).
+    let mut child_counts = BTreeMap::new();
+    child_counts.insert(cap_a, 1);
+    child_counts.insert(cap_b, 1);
+    // C is omitted (child has no fds carrying C).
+
+    // (3) Call reconcile_refcounts_after_fork to fix the over-counts.
+    child_table.reconcile_refcounts_after_fork(&child_counts);
+
+    // After reconciliation, the child's refcounts must match its fd histogram:
+    assert!(
+        child_table.get_refcount(cap_a) == Some(1),
+        "U.S3-SLICE-2: reconciled cap A refcount must equal child's fd count (1, not 2)"
+    );
+    assert!(
+        child_table.get_refcount(cap_b) == Some(1),
+        "U.S3-SLICE-2: reconciled cap B refcount must equal child's fd count (1, not 3)"
+    );
+    assert!(
+        child_table.get_refcount(cap_c) == Some(0),
+        "U.S3-SLICE-2: reconciled cap C refcount must equal child's fd count (0, not 1)"
+    );
+
+    // (4) Verify the parent table is UNCHANGED (fork does NOT touch the parent).
+    assert!(
+        parent_table.get_refcount(cap_a) == Some(2),
+        "post-reconcile: parent cap A refcount must stay 2 (fork reconciles child only)"
+    );
+    assert!(
+        parent_table.get_refcount(cap_b) == Some(3),
+        "post-reconcile: parent cap B refcount must stay 3 (fork reconciles child only)"
+    );
+    assert!(
+        parent_table.get_refcount(cap_c) == Some(1),
+        "post-reconcile: parent cap C refcount must stay 1 (fork reconciles child only)"
     );
 }
 
@@ -4565,6 +4745,27 @@ fn sys_clone(
         // R133-5 FIX: Use pre-captured cap_table clone instead of re-acquiring
         // parent lock. See snapshot above (under parent lock block).
         child.cap_table = parent_cap_table_clone;
+
+        // U.S3-A3 FIX: pay the per-fd cap refcounts for the CLONE_THREAD case.
+        // A thread SHARES the parent's cap_table (Arc), while its fd_table is a
+        // DEEP COPY (snapshot loop above) — so every cap-bearing fd installed
+        // in the child adds one real reference to a SHARED CapEntry and must
+        // bump it (+1 each), exactly like dup. The non-thread CLONE_FILES case
+        // must NOT bump: try_clone_for_fork gave the child its OWN table with
+        // refcounts VERBATIM-copied (U.S3-A1), already equal to the child's
+        // 1:1 fd copy count. Failure (InvalidCapId) = a sibling revoked the
+        // cap between snapshot and install; the child fd is then a documented
+        // dead handle (its close decrement is a no-op) — accepted race class.
+        // Balanced at thread exit by free_process_resources' per-fd decrement
+        // (U.S3-B), and on clone-abort by cleanup_unscheduled_process → the
+        // same teardown path.
+        if flags & CLONE_THREAD != 0 {
+            for desc in child.fd_table.values() {
+                if let Some(cid) = desc.cap_id() {
+                    let _ = child.cap_table.increment_refcount(cid);
+                }
+            }
+        }
 
         // F.1 Mount Namespace: Assign mount namespace to child
         //
@@ -8404,6 +8605,13 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             let mut proc = process_arc.lock();
             proc.fd_table.insert(new_fd, cloned_desc);
             proc.fds_charged_count = proc.fds_charged_count.saturating_add(1);
+            // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
+            // copy. Re-acquired lock is fine: a CLONE_THREAD sibling revoking
+            // the cap in the charge window makes this a no-op and the dup a
+            // documented dead handle (see sys_dup).
+            if let Some(cid) = proc.get_fd(new_fd).and_then(|d| d.cap_id()) {
+                let _ = proc.cap_table.increment_refcount(cid);
+            }
             // POSIX: F_DUPFD's copy does NOT inherit close-on-exec;
             // F_DUPFD_CLOEXEC's copy has it set atomically.
             proc.set_fd_cloexec(new_fd, cmd == F_DUPFD_CLOEXEC);
@@ -14749,6 +14957,16 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
         drop(rejected);
         SyscallError::EMFILE
     })?;
+    // U.S3-A3 FIX: the new fd shares oldfd's CapId, so bump the CapEntry
+    // refcount HERE, under the already-held Process lock, AFTER the install
+    // succeeded — never inside clone_box (U.S3-A2 self-deadlock). Failure
+    // (InvalidCapId) means a CLONE_THREAD sibling sharing this cap_table
+    // revoked the cap between clone and install; the dup then carries a
+    // documented dead handle (ops fail, close is a no-op decrement) — same
+    // accepted race class as clone_box's dead-socket note above.
+    if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
+        let _ = proc.cap_table.increment_refcount(cid);
+    }
     Ok(newfd as usize)
 }
 
@@ -14787,8 +15005,18 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert):
         // empty newfd → charge +1 (EMFILE on over-budget, table untouched);
         // occupied newfd → net 0, reuses the replaced entry's charge.
-        proc.replace_fd_charged(newfd, cloned)
-            .map_err(|_| SyscallError::EMFILE)?
+        // (replace_fd_charged also pays back the DISPLACED entry's cap
+        // refcount — U.S3-B.)
+        let displaced = proc
+            .replace_fd_charged(newfd, cloned)
+            .map_err(|_| SyscallError::EMFILE)?;
+        // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
+        // copy, under the held Process lock (see sys_dup for the failure-race
+        // note).
+        if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
+            let _ = proc.cap_table.increment_refcount(cid);
+        }
+        displaced
     };
     drop(old_fd_entry);
 
@@ -14829,9 +15057,17 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
         let cloned = src.clone_box();
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert).
         // replace_fd_charged clears CLOEXEC on newfd; re-set it below if requested.
+        // (It also pays back the DISPLACED entry's cap refcount — U.S3-B.)
         let removed = proc
             .replace_fd_charged(newfd, cloned)
             .map_err(|_| SyscallError::EMFILE)?;
+
+        // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
+        // copy, under the held Process lock (see sys_dup for the failure-race
+        // note).
+        if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
+            let _ = proc.cap_table.increment_refcount(cid);
+        }
 
         if flags & O_CLOEXEC != 0 {
             proc.set_fd_cloexec(newfd, true);
@@ -15587,11 +15823,17 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     };
 
     // Create capability entry
-    let cap_flags = if cloexec {
-        cap::CapFlags::CLOEXEC
-    } else {
-        cap::CapFlags::empty()
-    };
+    //
+    // U.S3-B FIX: SOCK_CLOEXEC is recorded ONLY fd-side (cloexec_fds, below) —
+    // the CapEntry no longer carries CapFlags::CLOEXEC. With refcounted
+    // fd-backed caps, table-side apply_cloexec() at exec revoked the CapEntry
+    // OUTRIGHT (ignoring refcount), so a non-cloexec dup of a SOCK_CLOEXEC
+    // socket SURVIVED exec holding a dangling CapId — every later op failed on
+    // a POSIX-valid fd. Exec teardown of cloexec'd socket fds now flows through
+    // take_cloexec_fds_into's per-fd decrement (revoke at 0), which keeps
+    // surviving dups live and still revokes when the last fd goes.
+    // apply_cloexec() remains for NON-fd-backed caps (sys_cap_allocate).
+    let cap_flags = cap::CapFlags::empty();
     // R152-1 FIX: TCP sockets get CONNECT/LISTEN/ACCEPT rights at creation.
     // These rights enable least-privilege delegation (e.g., connect-only cap).
     let mut rights = cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND;
