@@ -136,6 +136,22 @@ pub trait FileOps: Send + Sync {
     /// 获取类型名称（用于调试）
     fn type_name(&self) -> &'static str;
 
+    /// U.S3-B: report the CapId this fd carries, if any, so the generic fd
+    /// lifecycle paths (`remove_fd`, dup increment, exec-cloexec drain, process
+    /// exit) can decrement its refcount and revoke-at-0 WITHOUT downcasting to
+    /// each concrete type.
+    ///
+    /// Default `None` = this fd kind carries no capability (namespace fds:
+    /// mount/ipc/net/user — they refcount the namespace object itself, not a
+    /// CapEntry). A cap-BEARING implementor (`SocketFile` today; pipe/file fds in
+    /// U.S2 SLICE-3+) MUST override this AND have a structural self-test asserting
+    /// the override — a new default-bearing trait method silently makes the
+    /// specialized path dead for any implementor that forgot to override it
+    /// (the dev-v35 missing-override class; see `run_fileops_cap_id_self_test`).
+    fn cap_id(&self) -> Option<cap::CapId> {
+        None
+    }
+
     /// R41-1 FIX: 获取文件状态信息（用于 fstat）
     ///
     /// 默认返回 EBADF，子类型应覆盖此方法返回正确的元数据。
@@ -1558,27 +1574,47 @@ impl Process {
             self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
         }
 
-        // U.S2-α FIX: Revoke CapId for SocketFile on close.
-        // U.S2-SLICE-2: Decrement refcount; revoke only at refcount→0.
-        //
-        // KNOWN GAP (SLICE-1, now FIXED): dup'd sockets share a CapId; the
-        // first close() would invalidate the CapId for ALL dup'd fds (the
-        // surviving fd's cap_id would become stale). SLICE-2 adds CapEntry
-        // refcounting (like SocketFile::socket refcount) so revocation happens
-        // only at the LAST close.
+        // U.S2-α FIX: Revoke CapId on close (refcounted; revoke only at 0).
+        // U.S3-B FIX: use the generic `FileOps::cap_id()` accessor instead of a
+        // `SocketFile` downcast, so EVERY cap-bearing fd kind (pipes/files in
+        // U.S2 SLICE-3+) rides this same last-close revocation without touching
+        // this function again. Non-bearing kinds return None (no-op).
         if let Some(ref desc) = removed {
-            if let Some(sock_file) = desc.as_any().downcast_ref::<crate::syscall::SocketFile>() {
-                let should_revoke = self
-                    .cap_table
-                    .decrement_refcount(sock_file.cap_id())
-                    .unwrap_or(false);
-                if should_revoke {
-                    let _ = self.cap_table.revoke(sock_file.cap_id());
-                }
-            }
+            self.decrement_fd_cap(desc.as_ref());
         }
 
         removed
+    }
+
+    /// U.S3-B: decrement the CapEntry refcount carried by `desc` (if any) and
+    /// revoke the capability at refcount→0 (last fd reference gone).
+    ///
+    /// This is THE single fd→cap teardown edge; every path that removes an fd
+    /// from `fd_table` funnels here (`remove_fd`, `replace_fd_charged`
+    /// displacement, `take_cloexec_fds_into` exec drain, and process-exit
+    /// extraction in `free_process_resources`). Pairs with the explicit
+    /// per-fd increments at the dup/F_DUPFD/CLONE_THREAD-install sites
+    /// (U.S3-A3) and the allocate()-time refcount=1 (sys_socket/sys_accept).
+    ///
+    /// A failed decrement (InvalidCapId) is a NO-OP by design: a CLONE_THREAD
+    /// sibling sharing this cap_table may have already driven the refcount to
+    /// 0 and revoked (its last-close raced ours), or the cap was CLOFORK/
+    /// CLOEXEC-revoked table-side while the fd lingered. The fd is then a
+    /// documented dead-handle (ops fail EBADF-class) — never a double-revoke,
+    /// because generation counters make revoke idempotent-safe.
+    ///
+    /// Lock context: called under the owning Process lock. CapTable's inner
+    /// spinlock is a LEAF (without_interrupts + no callbacks), and revoke()
+    /// only drops plain-data cap objects today (cap::Socket = ids). SLICE-3
+    /// CAUTION: if CapObject ever carries a Drop that re-locks (FileOps-like),
+    /// the revoke must move outside the Process lock (R154-3/R169-4 class).
+    pub(crate) fn decrement_fd_cap(&self, desc: &dyn FileOps) {
+        if let Some(cap_id) = desc.cap_id() {
+            let should_revoke = self.cap_table.decrement_refcount(cap_id).unwrap_or(false);
+            if should_revoke {
+                let _ = self.cap_table.revoke(cap_id);
+            }
+        }
     }
 
     /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
@@ -1641,6 +1677,14 @@ impl Process {
                 // Stale cloexec entries for already-closed fds contribute 0
                 // (remove() == None), so the uncharge count stays exact.
                 closed += 1;
+                // U.S3-B FIX: decrement the removed fd's cap (revoke at 0).
+                // Without this, an fd marked close-on-exec via F_SETFD *after*
+                // creation (so its CapEntry never carried CapFlags::CLOEXEC)
+                // leaked its refcount at exec — the cap outlived every fd and
+                // the slot was permanently lost (TableFull DoS class, since the
+                // cap_table SURVIVES exec). Safe under the Process lock: leaf
+                // spinlock, plain-data drop (see decrement_fd_cap).
+                self.decrement_fd_cap(desc.as_ref());
                 // Infallible: the caller pre-reserved enough capacity, so this
                 // never reallocates and never drops `desc` inline under the lock.
                 removed.push(desc);
@@ -1678,7 +1722,17 @@ impl Process {
         self.cloexec_fds.remove(&fd);
         // Occupied → insert returns the old entry (its charge is reused, count
         // unchanged); empty → returns None.
-        Ok(self.fd_table.insert(fd, desc))
+        let displaced = self.fd_table.insert(fd, desc);
+        // U.S3-B FIX: the DISPLACED entry leaves fd_table here without passing
+        // through remove_fd, so its cap refcount must be decremented (revoke at
+        // 0) or every dup2/dup3 onto an occupied cap-bearing fd leaks a slot
+        // (TableFull DoS class). The displaced Box itself is still returned to
+        // the caller to DROP outside the Process lock (R155-3) — only the leaf
+        // cap accounting happens here.
+        if let Some(ref old) = displaced {
+            self.decrement_fd_cap(old.as_ref());
+        }
+        Ok(displaced)
     }
 
     /// 查找下一个可用的 fd（从 3 开始）
@@ -5177,6 +5231,19 @@ fn free_process_resources(
     let fd_count = proc.fd_table.len();
     let extracted_fds = core::mem::take(&mut proc.fd_table);
     proc.cloexec_fds.clear();
+
+    // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
+    // PCB is torn down. Load-bearing for CLONE_THREAD: the cap_table Arc is
+    // SHARED with surviving siblings, so a thread that exits without paying
+    // back its per-fd refcounts (bumped at the CLONE_FILES install, U.S3-A3)
+    // would strand every shared cap above 0 forever — the siblings' last
+    // close could then never revoke (permanent slot leak → TableFull DoS).
+    // For a non-shared table this is a harmless pre-drop of entries the table
+    // teardown would free anyway. Leaf-safe under the Process lock; the
+    // descriptor Boxes themselves still drop OUTSIDE the lock (R154-3).
+    for desc in extracted_fds.values() {
+        proc.decrement_fd_cap(desc.as_ref());
+    }
 
     // J2-7: uncharge the per-cgroup FD budget. fd_table is PER-PROCESS (deep-
     // copied, never Arc-shared even under CLONE_FILES), so this is UNGATED by
