@@ -1,8 +1,8 @@
 # Zero-OS Next-Phase Kernel Development Plan
 
-**Date:** 2026-07-04
-**Version:** 15.8
-**Based on:** 176 Security Audit Rounds + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.7
+**Date:** 2026-07-06
+**Version:** 15.9
+**Based on:** 176 Security Audit Rounds + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.8
 
 ---
 
@@ -5377,84 +5377,138 @@ review) provided the following calibrations for R129:
 
 ---
 
-## 🔶 U.S2 (Enterprise Capability System Phase 2) — fd→CapId Bridge + Native Syscalls (IN PROGRESS, 2026-07-04)
+## 🟩 U.S3 (Enterprise Capability System Phase 3) — fd→CapId Refcount Lifecycle (COMPLETE, 2026-07-06)
 
-**Objective:** Wire the capability system to file descriptors and implement the first 5 native capability syscalls for M0 Ring-3 compatibility. This phase bridges POSIX fd semantics with object-capability security.
+**Objective:** Implement correct fd→CapId refcounting across all fd lifecycle edges (dup, fork, close, exec, exit) to close the U.S2-α single-close revocation gap and establish the generic fd→cap infrastructure.
 
-**Status (2026-07-04):** **SLICE-1 ✅ + SLICE-2 ✅ COMPLETE** (~120 lines, 4 files). SLICE-3 **BLOCKED** on architectural refactoring (cap_table→IPC/VFS visibility).
+**Status (2026-07-06):** **SLICE-1 ✅ + SLICE-2 ✅ COMPLETE** (5 files, +485/-55 lines). Adversarially converged (7-agent multi-lens review), 0 CONFIRMED defects, 1 LOW FIXED (fork+thread over-count).
 
-### ✅ SLICE-1: Socket CapId Close Revocation (2026-07-04)
+### ✅ SLICE-1: fd→CapId Refcount Infrastructure (2026-07-06)
 
-**Delivered:** Socket file descriptors now allocate a CapId on creation and revoke it on close, establishing the fd→CapId lifecycle bridge.
+**Delivered:** Complete fd→cap refcount lifecycle with 12 edges connecting fd operations (allocate, dup, fork, close, exec, exit) to cap table refcounting. Single teardown funnel ensures revoke-at-0 correctness.
 
-**Changes:**
-- `kernel/kernel_core/syscall.rs` (~10 lines): Added `cap_id()` getter to `SocketFile`
-- `kernel/kernel_core/process.rs` (~15 lines): `remove_fd()` revokes CapId for `SocketFile` on close
+**Invariant:** `CapEntry.refcount == number of fds (across ALL processes sharing that CapTable Arc) carrying that CapId`
 
-**Design:** SocketFile already had the cap_id field (added in R75-1 for network namespace isolation). SLICE-1 wires the revocation path: when a socket fd closes, `Process::remove_fd()` downcasts to SocketFile and calls `cap_table.revoke(cap_id)`.
+**Edges Implemented (E1-E12):**
+- **+1 allocate**: sys_socket/sys_accept (refcount=1, one fd installed)
+- **+1 dup sites** (E5-E8): sys_dup/dup2/dup3/fcntl F_DUPFD[_CLOEXEC] explicit bump after install
+- **+1 CLONE_THREAD** (E9): child shares cap_table Arc, deep-copies fd_table, bumps each fd's cap
+- **verbatim fork** (U.S3-A1): CapSlot::clone copies refcount VERBATIM (child table is separate Arc)
+- **-1 decrement** (E1-E4, revoke at 0): Process::decrement_fd_cap single teardown funnel
+  - remove_fd (close)
+  - replace_fd_charged displaced entry (dup2/dup3 overwrite)
+  - take_cloexec_fds_into (exec cloexec drain)
+  - free_process_resources fd extraction (exit/thread-exit/clone-abort)
+- **PURE clone** (U.S3-A2): SocketFile::clone_box no table touch, bump lives at install site
+- **E10 fix**: sys_socket no longer sets CapFlags::CLOEXEC (fd-side cloexec_fds only)
 
-**Known Gap (Fixed in SLICE-2):** Multiple FDs can share one CapId via dup/dup2/fork. SLICE-1's immediate revocation invalidates the CapId for ALL surviving dup'd fds. SLICE-2 adds refcounting to fix this.
+**Generic Accessor:** `FileOps::cap_id()` trait method (default None) enables polymorphic dispatch. SocketFile overrides with Some(cap_id); future pipe/file types will override when caps land (U.S2 SLICE-3+).
 
-**Verification:** Build ✅ / Lint 4/4 ✅ / Tests ✅ (exit 0) / Dual-write ✅ (MD5-verified local + remote sync)
+**Structural Self-Test:** `run_fileops_cap_id_self_test()` guards the missing-override class (invisible to green boot — decrements silently no-op → cap slot leak to TableFull).
 
-### ✅ SLICE-2: CapEntry Refcounting (2026-07-04)
+**Files Changed:**
+- `kernel/cap/lib.rs` (+27): CapSlot::clone VERBATIM copy, increment/decrement_refcount
+- `kernel/kernel_core/process.rs` (+103): remove_fd, decrement_fd_cap funnel, take_cloexec_fds_into, replace_fd_charged, free_process_resources extraction
+- `kernel/kernel_core/syscall.rs` (+173): SocketFile cap_id override, CLONE_THREAD bump loop, fcntl F_DUPFD, sys_dup/dup2/dup3, sys_socket E10, self-test
+- `kernel/src/integration_test.rs` (+10): U.S3-B self-test registration
 
-**Delivered:** CapEntry now has a reference count to support multiple FDs sharing the same CapId (via dup/dup2/fork). Revocation happens only when refcount→0 (last fd closes).
+**Convergence (Adversarial Multi-Lens Review):** Workflow `wwgxzgfrd` (7 agents, 6 lenses + completeness critic, ~1.1M subagent tokens). 0 CONFIRMED defects, 1 LOW (fork+thread over-count, fixed SLICE-2), 3 NOTE (design clarifications documented).
 
-**Changes (~100 lines, 4 files):**
-- `kernel/cap/types.rs` (~40 lines):
-  - Added `use core::sync::atomic::{AtomicUsize, Ordering}`
-  - Added `refcount: AtomicUsize` field to `CapEntry` (pub(crate) for lib.rs access)
-  - Implemented `increment_refcount()`, `decrement_refcount()`, `refcount()` methods
-  - Updated constructors to initialize refcount=1
+**Verification:** Build 0 / Lint 4/4 / Boot-check 0-NX / Self-test marker confirmed
 
-- `kernel/cap/lib.rs` (~50 lines):
-  - Removed `Clone` derive from `CapSlot`, implemented manual `Clone` that increments refcount
-  - Added `increment_refcount()` and `decrement_refcount()` methods to `CapTable`
-  - Fixed `lookup()` to manually copy CapEntry fields (AtomicUsize isn't Clone)
-  - Fixed `delegate()` to extract fields before creating new entry
+### ✅ SLICE-2: Fork Reconciliation (Thread-Shared Cap Table Fix, 2026-07-06)
 
-- `kernel/kernel_core/syscall.rs` (~10 lines):
-  - `SocketFile::clone_box()` increments CapEntry refcount on dup/fork
-  - Fixed double-Option handling for `try_get_process` return value
+**Delivered:** Fixes LOW severity finding from SLICE-1 adversarial review — fork+thread cap refcount over-count.
 
-- `kernel/kernel_core/process.rs` (~15 lines):
-  - `remove_fd()` decrements refcount and only revokes at refcount→0
-  - Removed "KNOWN GAP" comment (now fixed)
+**Problem:** When a CLONE_THREAD thread (sharing its cap_table Arc with siblings) calls fork():
+- CapSlot::clone copies refcounts VERBATIM including sibling-held references
+- But fork's fd_table copy gives child ONLY the forking thread's fds
+- Result: child's cap refcounts include sibling references → over-count
+- Impact: child-local slot leak (TableFull DoS class, fail-safe: revoke-too-late, never premature)
 
-**Design:** Mirrors SocketFile's socket refcount mechanism. Refcount starts at 1 on allocate, increments on dup/fork (`FileOps::clone_box`), decrements on close (`remove_fd`). Only when refcount→0 does `remove_fd` call `cap_table.revoke()`.
+**Solution:** Reconcile child cap_table refcounts AFTER verbatim copy, BEFORE Arc wrap:
+1. Check if parent's `Arc::strong_count(&cap_table) > 1` (shared with siblings)
+2. If shared: build histogram of child's actual fd→CapId references from child.fd_table
+3. Call `reconcile_refcounts_after_fork` to OVERWRITE each CapEntry.refcount to match histogram
+4. Non-shared parents skip (refcounts already correct, O(1) check avoids O(fds×caps) scan)
 
-**Safety:** The manual `Clone` for `CapSlot` ensures fork increments the refcount atomically. The `decrement_refcount()` uses SeqCst ordering and returns true only when the previous value was 1 (last reference).
+**Implementation:**
+- `kernel/cap/lib.rs` (+55): `reconcile_refcounts_after_fork(child_counts)`, `get_refcount(cap_id)` query
+- `kernel/kernel_core/fork.rs` (+42): Arc::strong_count check, build child_cap_counts histogram, call reconcile
+- `kernel/kernel_core/syscall.rs` (+119): `run_fork_reconcile_refcount_self_test()` pure simulation (2/3/1 → 1/1/0)
+- `kernel/src/integration_test.rs` (+11): U.S3-SLICE-2 self-test registration
 
-**Verification:** Build ✅ / Lint 4/4 ✅ / Tests ✅ (exit 0) / Dual-write ✅ (MD5-verified local + remote sync)
+**Edge Cases:**
+- Caps child doesn't hold get refcount=0 (benign: child can't synthesize CapId it never received)
+- Generation continuity preserved (revoked parent CapId stays invalid in child)
+- Parent table UNCHANGED (fork reconciles child only)
 
-### ⏸️ SLICE-3: Pipe/File CapId Allocation (BLOCKED)
+**Verification:** Build 0 / Lint 4/4 / Boot-check 0-NX / Self-test structural verification (pure, no real process/socket state)
+
+### Cumulative Changes (SLICE-1 + SLICE-2)
+
+**5 files, +485/-55 lines:**
+- kernel/cap/lib.rs: +82
+- kernel/kernel_core/fork.rs: +42
+- kernel/kernel_core/process.rs: +103
+- kernel/kernel_core/syscall.rs: +292
+- kernel/src/integration_test.rs: +21
+
+**Verification Gates:**
+- ✅ Build: 0 errors
+- ✅ Lint: 4/4 passes (println/UserAccessGuard/fetch_add/repr(C))
+- ✅ Boot-check: 0 NX violations, kernel reaches userspace
+- ✅ Self-tests: 2 structural tests (cap_id accessor + fork reconciliation)
+- ✅ Adversarial review: 0 CONFIRMED defects, 1 LOW FIXED, 3 NOTE documented
+- ✅ Dual-write: MD5-verified sync
+
+**Uncommitted (manual-commit rule):** Ready for commit when requested
+
+### Deferred Work (U.S3 SLICE-3+)
+
+**SLICE-3+: Pipe/File CapId Wiring** — Blocked pending U.S2 pipe/file capability infrastructure. When U.S2 SLICE-3+ lands (pipe/file CapObject allocation), the U.S3 generic infrastructure (FileOps::cap_id accessor + refcount lifecycle) will extend immediately via cap_id() override in PipeHandle/FileHandle.
+
+**Extended Tests:**
+- Runtime verification via loopback harness (socket cap lifecycle under real workload)
+- Fuzz integration (stateful cap table property checks)
+- SMP stress (concurrent dup/close/fork races)
+
+**Documentation (from adversarial review NOTEs):**
+- CLOFORK mitigation: don't set CLOFORK on fd-backed caps (or filter fds in fork to match cap_table CLOFORK filtering)
+- Delegate scope: document that sys_cap_delegate creates non-fd-backed caps (refcount invariant scoped to fd-backed caps only)
+- CLOEXEC pattern: pipe/file caps (U.S2 SLICE-3+) must follow socket's E10 fix (fd-side cloexec_fds only, never CapFlags::CLOEXEC)
+
+**Next Phase:** U.S4 will add native capability syscalls (native_cap_op/native_invoke/native_spawn) building on the U.S3 fd→cap infrastructure.
+
+---
+
+## 🔶 U.S2 (Enterprise Capability System Phase 2) — Pipe/File Capabilities (BLOCKED, 2026-07-06)
 
 **Objective:** Extend CapId allocation to pipes and regular files (sys_pipe/sys_pipe2/sys_open/sys_openat).
 
-**Blocker:** The IPC/VFS subsystems create PipeHandle/FileHandle objects but don't have access to the process's `cap_table` (it's in kernel_core::Process). Current architecture:
+**Status:** BLOCKED on architectural refactoring — IPC/VFS subsystems don't have access to Process::cap_table.
+
+**Blocker:** The IPC/VFS subsystems create PipeHandle/FileHandle objects but can't allocate CapIds (cap_table is in kernel_core::Process). Current architecture:
 - IPC/VFS callbacks return `(fd, fd)` or `fd` to kernel_core
 - kernel_core allocates FDs and installs the FileOps objects
 - CapId allocation needs to happen DURING object creation (before fd allocation) to avoid TOCTOU
 
-**Architectural Options (deferred to U.S3 design):**
+**Architectural Options (needs design phase):**
 1. Move `cap_table` to a global or per-namespace structure
 2. Pass `&CapTable` through IPC/VFS callbacks (ABI break)
 3. Allocate CapIds post-creation via a two-phase protocol (complex)
 
-**Status:** SLICE-3+ blocked pending U.S3 architectural design. The fd→CapId bridge is functional for sockets (SLICE-1+2); pipes/files will follow after the visibility issue is resolved.
+**Note:** Socket caps work because sys_socket/sys_accept are in kernel_core (direct cap_table access). The U.S3 generic infrastructure (FileOps::cap_id + refcount lifecycle) is ready — pipes/files just need the CapId allocation architecture resolved.
 
-### Remaining SLICES (Blocked on SLICE-3)
-
-**SLICE-4:** `native_cap_op(604)` syscall + seccomp 600-631 enforcement  
-**SLICE-5:** Generation exhaustion error mapping  
-**SLICE-6:** `native_invoke(605)` + `native_spawn(606)` (blocked on U.S3 IPC)  
-**SLICE-7:** `native_endpoint_call(607)` + `native_event_wait(608)` (U.S3 gate)  
-
-**Next Steps:** U.S3 architectural design phase will resolve the cap_table visibility issue, unblocking SLICE-3+.
+**Remaining U.S2 SLICES (Blocked on SLICE-3):**
+- **SLICE-3:** Pipe/File CapId allocation (architectural blocker)
+- **SLICE-4:** `native_cap_op(604)` syscall + seccomp 600-631 enforcement
+- **SLICE-5:** Generation exhaustion error mapping
+- **SLICE-6:** `native_invoke(605)` + `native_spawn(606)` (blocked on U.S3 IPC design)
+- **SLICE-7:** `native_endpoint_call(607)` + `native_event_wait(608)` (U.S3 gate)
 
 ---
 
-*Generated: 2026-07-04 (v15.8 -- U.S2 SLICE-1+2 complete: fd→CapId bridge functional for sockets with refcounting; SLICE-3+ blocked on cap_table→IPC/VFS visibility)*
+*Generated: 2026-07-06 (v15.9 -- U.S3 SLICE-1+2 complete: fd→CapId refcount lifecycle with fork reconciliation; U.S2 SLICE-3+ blocked on cap_table→IPC/VFS visibility)*
 *Collaborative review: Claude Opus 4 + Codex MCP*
 *Inputs: 129 QA rounds + 19 defect analysis docs + 2 roadmaps + 19 prior plans*
