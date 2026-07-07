@@ -147,15 +147,30 @@ struct CapSlot {
 }
 
 impl Clone for CapSlot {
-    /// U.S2-SLICE-2: Clone increments the CapEntry refcount.
-    /// Used by try_clone_for_fork to share CapIds across fork.
+    /// U.S3-A1 FIX: VERBATIM-copy the refcount; do NOT touch the source entry.
+    ///
+    /// `try_clone_for_fork` deep-copies the parent's cap_table into a SEPARATE
+    /// table with its OWN `Arc` (fork / non-thread CLONE_FILES). The child slot's
+    /// refcount must equal the number of CHILD fds that reference it — which,
+    /// immediately post-fork, equals the parent's CURRENT count, because the child
+    /// `fd_table` is a 1:1 copy of the parent's (fork.rs deep-copy loop) and
+    /// `clone_box` no longer bumps the cap (U.S3-A2). So we copy the parent's
+    /// current refcount into the child's fresh `AtomicUsize` and leave the parent
+    /// entry UNCHANGED.
+    ///
+    /// The prior U.S2-SLICE-2 code called `self.entry.increment_refcount()` here,
+    /// which (a) bumped the PARENT entry (→ parent slot never reaches 0 on last
+    /// close → permanent leak) AND (b) seeded the child from the post-increment
+    /// value (→ child over-count). Combined with the (now-removed) `clone_box`
+    /// bump, a single forked socket fd reached parent=3/child=3 for 1 fd each,
+    /// so last-close revocation could never fire → `TableFull` DoS. This is the
+    /// SOLE fork-side refcount edge; per-fd dup/thread increments are explicit at
+    /// the call sites (U.S3-A3).
     fn clone(&self) -> Self {
-        self.entry.increment_refcount();
         Self {
             generation: self.generation,
-            // SAFETY: We manually reconstruct CapEntry with the same object/rights/flags
-            // but a fresh AtomicUsize initialized to the current refcount+1 (already done
-            // via increment_refcount above). This is a shallow copy of the object handle.
+            // Shallow copy of the object handle (Arc clone) + a fresh refcount
+            // atomic seeded with the source's CURRENT (un-incremented) value.
             entry: CapEntry {
                 object: self.entry.object.clone(),
                 rights: self.entry.rights,
@@ -330,6 +345,24 @@ impl CapTable {
         })
     }
 
+    /// U.S3-SLICE-2: Get the current refcount for a capability (self-test only).
+    ///
+    /// # Arguments
+    ///
+    /// * `cap_id` - The capability to query
+    ///
+    /// # Returns
+    ///
+    /// * `Some(count)` - The current refcount
+    /// * `None` - CapId is invalid or revoked
+    pub fn get_refcount(&self, cap_id: CapId) -> Option<usize> {
+        interrupts::without_interrupts(|| {
+            let inner = self.inner.lock();
+            let entry = inner.lookup(cap_id).ok()?;
+            Some(entry.refcount())
+        })
+    }
+
     /// Check if any capability in the table grants the required rights.
     ///
     /// Used by ambient gates such as audit snapshot export to check if
@@ -410,6 +443,43 @@ impl CapTable {
                 inner: Mutex::new(new_inner),
             })
         })
+    }
+
+    /// U.S3-SLICE-2: reconcile child cap_table refcounts after fork to match the
+    /// child's ACTUAL fd count (fixes the thread-shared parent over-count).
+    ///
+    /// When the parent is a CLONE_THREAD thread sharing its cap_table Arc with
+    /// siblings, CapSlot::clone copies refcounts VERBATIM (U.S3-A1) including
+    /// sibling-held references, but fork's fd_table copy gives the child ONLY
+    /// the forking thread's fds → over-count → child-local slot leak. This
+    /// method OVERWRITES each CapEntry.refcount to equal `child_counts[cid]`
+    /// (the histogram fork.rs built from the child's fd_table).
+    ///
+    /// Called BEFORE the child cap_table is wrapped in Arc and made visible —
+    /// no lock needed (child private, parent still locked). For caps the child
+    /// does NOT hold (parent/sibling-only), we leave the slot present but set
+    /// refcount=0 so the child's first hypothetical dup/delegate bumps it to 1.
+    /// That's benign: the child can't synthesize a CapId it never received, so
+    /// refcount=0 entries are unreachable until/unless a future SCM_RIGHTS-like
+    /// transfer lands (which would bump on install). Keeping the slot preserves
+    /// generation continuity (a revoked parent CapId stays invalid in the child).
+    pub fn reconcile_refcounts_after_fork(
+        &mut self,
+        child_counts: &alloc::collections::BTreeMap<CapId, usize>,
+    ) {
+        interrupts::without_interrupts(|| {
+            let mut inner = self.inner.lock();
+            for (idx, slot_opt) in inner.slots.iter_mut().enumerate() {
+                if let Some(slot) = slot_opt {
+                    let cid = CapId::from_parts(idx as u16, slot.generation);
+                    let child_fd_count = child_counts.get(&cid).copied().unwrap_or(0);
+                    // Overwrite the verbatim-copied refcount with the child's actual count.
+                    slot.entry
+                        .refcount
+                        .store(child_fd_count, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
     }
 
     /// Revoke all capabilities with CLOEXEC flag (for exec).
