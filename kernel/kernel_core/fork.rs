@@ -466,12 +466,42 @@ fn fork_inner(
         // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
         // 并保持生成计数器的单调性以防止 wrap 攻击。
         // R161-4 FIX: Use fallible try_clone_for_fork to avoid OOM panic
-        child.cap_table = Arc::new(
-            parent
-                .cap_table
-                .try_clone_for_fork()
-                .map_err(|_| ForkError::MemoryAllocationFailed)?,
-        );
+        //
+        // U.S3-SLICE-2 FIX: reconcile the child cap_table refcounts to match the
+        // child's ACTUAL fd count when the parent is a CLONE_THREAD thread sharing
+        // its cap_table Arc with siblings. CapSlot::clone copies refcounts VERBATIM
+        // (U.S3-A1), but fork's fd_table copy (loop above) copies ONLY the forking
+        // thread's fds, not sibling fds. So the child's cap refcounts include
+        // sibling-held references → over-count → child-local slot leak (TableFull
+        // DoS class, fail-safe: revoke-too-late, never premature). Reconciliation:
+        // COUNT the child's actual per-cap fd references and OVERWRITE each
+        // CapEntry.refcount to match. Safe under parent lock; child not visible yet.
+        let mut raw_cap_table = parent
+            .cap_table
+            .try_clone_for_fork()
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+
+        // Reconcile only if parent's cap_table Arc::strong_count > 1 (shared).
+        // A non-shared parent (standalone process or the last survivor of a thread
+        // group) has cap refcounts that already equal its own fd count, so the
+        // verbatim copy is correct. Checking `> 1` avoids the O(fds × caps) scan
+        // on the common non-threaded fork path.
+        if Arc::strong_count(&parent.cap_table) > 1 {
+            // Build a histogram: CapId → count of child fds carrying it.
+            let mut child_cap_counts: alloc::collections::BTreeMap<cap::CapId, usize> =
+                alloc::collections::BTreeMap::new();
+            for desc in child.fd_table.values() {
+                if let Some(cid) = desc.cap_id() {
+                    *child_cap_counts.entry(cid).or_insert(0) += 1;
+                }
+            }
+            // Overwrite each CapEntry.refcount to match the child's fd count.
+            // try_clone_for_fork gave us a fresh CapTable with its own inner Mutex;
+            // no lock needed here (child not visible, parent still locked).
+            raw_cap_table.reconcile_refcounts_after_fork(&child_cap_counts);
+        }
+
+        child.cap_table = Arc::new(raw_cap_table);
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
