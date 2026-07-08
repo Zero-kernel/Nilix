@@ -153,38 +153,20 @@ jobs:
       - name: Generate markdown report
         run: |
           run_id="R$(date -u '+%Y%m%d-%H%M%S')"
-          mkdir -p docs/fuzz
+          mkdir -p report_output
           python3 scripts/generate_fuzz_report.py \
             report_stats \
-            docs/fuzz/${run_id}.md \
+            report_output/${run_id}.md \
             ${run_id}
 
-      - name: Generate summary
+      - name: Generate comprehensive summary
         run: |
-          echo "# Kernel Fuzz Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 scripts/generate_fuzz_summary.py report_stats >> $GITHUB_STEP_SUMMARY
 
-          crash_dirs=$(find artifacts -name 'fuzz-crashes-*' -type d 2>/dev/null || true)
-          if [ -n "$crash_dirs" ]; then
-            echo "## ⚠️ Crashes Found" >> $GITHUB_STEP_SUMMARY
-            for dir in $crash_dirs; do
-              target=$(basename "$dir" | sed 's/fuzz-crashes-//')
-              count=$(find "$dir" -name 'crash-*' 2>/dev/null | wc -l || echo 0)
-              echo "- **$target**: $count crash(es)" >> $GITHUB_STEP_SUMMARY
-            done
-          else
-            echo "## ✅ No Crashes Found" >> $GITHUB_STEP_SUMMARY
-            echo "All fuzz targets completed successfully!" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Full report available in artifacts." >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload report
+      - name: Upload report (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-report
-          path: docs/fuzz/*.md
+          path: report_output/*.md
           retention-days: 90
