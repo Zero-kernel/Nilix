@@ -274,6 +274,37 @@ pub fn run_usermode_test() -> bool {
     };
     klog!(Info, "      ✓ Process created with PID {}", pid);
 
+    // U.S2-SLICE-3 (CRITICAL-13): boot cap-budget instrumentation for the musl
+    // gate. sys_pipe now allocates 2 cap slots; if the boot path ever consumed
+    // most of the DEFAULT_CAP_SLOTS(64) preallocation, the first pipe would
+    // silently take the table-grow path (heap alloc under the Process lock) —
+    // surface the headroom in the serial log so a musl-check regression is
+    // attributable instead of mysterious. Expected today: 0 used (fd 0/1/2 are
+    // virtual and boot allocates no caps into the init process).
+    #[cfg(feature = "musl_test")]
+    {
+        if let Some(proc_arc) = kernel_core::process::get_process(pid) {
+            let used = {
+                let proc = proc_arc.lock();
+                proc.cap_table.len()
+            };
+            let slots = kernel_core::DEFAULT_CAP_SLOTS;
+            klog_always!(
+                "Boot cap budget: {}/{} slots used before musl test (headroom {})",
+                used,
+                slots,
+                slots.saturating_sub(used)
+            );
+            if slots.saturating_sub(used) < 10 {
+                klog_always!(
+                    "WARNING: boot consumed {} cap slots (<10 headroom); musl pipe(2 caps) \
+                     may trigger cap-table grow — consider raising DEFAULT_CAP_SLOTS",
+                    used
+                );
+            }
+        }
+    }
+
     // Step 2: Create fresh address space
     klog!(Info, "[2/4] Creating address space...");
     let (_pml4_frame, memory_space) = match create_fresh_address_space() {
