@@ -16,3 +16,9 @@ x86_64 = "0.15"
 vfs = { path = "../vfs" }
 trace = { path = "../trace" }
 klog = { path = "../klog" }
+# U.S2-SLICE-3: pipe CapId allocation at the fd-install site (pipe_create_callback).
+# cap is a LEAF crate; lsm/audit sit BELOW kernel_core (which already depends on
+# both) — all three are cycle-free from ipc (ipc sits above kernel_core).
+cap = { path = "../cap" }
+lsm = { path = "../lsm" }
+audit = { path = "../audit" }

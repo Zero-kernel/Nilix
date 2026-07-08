@@ -446,6 +446,16 @@ pub struct PipeHandle {
     end_type: PipeEndType,
     /// 标志
     flags: PipeFlags,
+    /// U.S2-SLICE-3: the CapId allocated for this pipe end at the sys_pipe
+    /// install site (`pipe_create_callback`), or `None` for a handle that was
+    /// never fd-installed (unit-test pipes, pre-install rollback handles).
+    ///
+    /// Lifecycle: set ONCE under the owning Process lock (between cap
+    /// allocation and fd install), then carried VERBATIM by every
+    /// `duplicate()`/`clone_box()` copy — dup/fork/CLONE_THREAD copies share
+    /// the SAME CapId, and the per-fd refcount bump happens at each INSTALL
+    /// site (U.S3-A3), never inside the clone itself (U.S3-A2 purity).
+    cap_id: Option<cap::CapId>,
 }
 
 impl PipeHandle {
@@ -455,6 +465,7 @@ impl PipeHandle {
             pipe,
             end_type: PipeEndType::Read,
             flags,
+            cap_id: None,
         }
     }
 
@@ -464,7 +475,19 @@ impl PipeHandle {
             pipe,
             end_type: PipeEndType::Write,
             flags,
+            cap_id: None,
         }
+    }
+
+    /// U.S2-SLICE-3: attach the CapId allocated for this pipe end.
+    ///
+    /// Called by `pipe_create_callback` under the owning Process lock, AFTER
+    /// both pipe caps were allocated and BEFORE either fd is installed
+    /// (CRITICAL-6 ordering). Idempotence is not needed — each handle is set
+    /// exactly once on the create path; test fixtures may also set it to pin
+    /// the accessor contract.
+    pub fn set_cap_id(&mut self, cap_id: cap::CapId) {
+        self.cap_id = Some(cap_id);
     }
 
     /// 获取端类型
@@ -509,6 +532,13 @@ impl PipeHandle {
     }
 
     /// 复制句柄（用于fork）
+    ///
+    /// U.S2-SLICE-3: the copy carries the SAME `cap_id` (shared CapEntry, not
+    /// a fresh allocation). Pipe-internal `readers`/`writers` counts and the
+    /// cap refcount are DECOUPLED lifecycles: duplicate() bumps the pipe end
+    /// count here (transient I/O clones included), while the cap refcount is
+    /// bumped only at fd INSTALL sites (dup/F_DUPFD/CLONE_THREAD — U.S3-A3)
+    /// and never inside the clone itself (U.S3-A2 purity).
     pub fn duplicate(&self) -> Self {
         // 增加相应端的引用计数
         match self.end_type {
@@ -520,6 +550,7 @@ impl PipeHandle {
             pipe: self.pipe.clone(),
             end_type: self.end_type,
             flags: self.flags,
+            cap_id: self.cap_id,
         }
     }
 }
@@ -541,6 +572,18 @@ impl core::fmt::Debug for PipeHandle {
     }
 }
 
+/// U.S2-SLICE-3 Drop / refcount contract (CRITICAL-7 fix, design-v3 Fix 4):
+///
+/// Drop closes the underlying RESOURCE (pipe end count → EOF/EPIPE wakeups)
+/// and MUST NOT touch any cap_table. Cap refcount decrement is the exclusive
+/// responsibility of the fd REMOVAL PATH (`remove_fd` → `decrement_fd_cap`
+/// funnel); a Drop-side decrement would double-decrement every removed fd
+/// (funnel once, Drop again → underflow/premature revoke). This is also what
+/// makes transient I/O clones (fd_read/write_callback) and pre-install
+/// rollback handles safe to drop: they leave the pipe end count balanced and
+/// leave cap accounting alone. Drop MUST run OUTSIDE the Process lock
+/// (R155-3/R170-6 discipline at every call site) because `close_*` re-locks
+/// the pipe and fires wakeups.
 impl Drop for PipeHandle {
     fn drop(&mut self) {
         match self.end_type {
@@ -565,6 +608,16 @@ impl FileOps for PipeHandle {
             PipeEndType::Read => "PipeRead",
             PipeEndType::Write => "PipeWrite",
         }
+    }
+
+    /// U.S2-SLICE-3: pipe fds are cap-BEARING — expose the CapId allocated at
+    /// the sys_pipe install site so the generic fd→cap lifecycle (dup bump,
+    /// close/exec/exit decrement via `decrement_fd_cap`) covers pipes without
+    /// downcasting. `None` for never-installed handles (test pipes). A revoked
+    /// cap (CLONE_THREAD sibling raced last-close) makes the decrement a
+    /// documented no-op — see `decrement_fd_cap`.
+    fn cap_id(&self) -> Option<cap::CapId> {
+        self.cap_id
     }
 
     /// M0-6 poll/select: hand the poll layer a probe over the SHARED `Arc<Pipe>`.

@@ -41,9 +41,70 @@ pub use futex::{
 // 系统调用回调实现
 // ============================================================================
 
+/// U.S2-SLICE-3: cap-only rollback stage for a pipe cap that never got its fd
+/// installed (design-v3 Fix 1 single-decrement pattern + audit parity).
+///
+/// The generic teardown funnel (`remove_fd` → `decrement_fd_cap`) can only
+/// reach caps that an fd carries; a cap allocated but not (yet) fd-installed
+/// is unreachable from every funnel path, so the CREATE path itself must pay
+/// it back on error. Decrement ONCE; revoke only when that decrement reports
+/// refcount→0 (on this path the count is 1 by construction, but the pattern
+/// stays uniform and double-decrement-proof); emit the audit Revoke event
+/// (mirroring the sys_socket EMFILE rollback). NEVER call this for a cap
+/// whose fd was installed — that cap rolls back through `remove_fd` instead
+/// (CRITICAL-4/7: one owner per teardown edge, no double-decrement).
+///
+/// Lock context: called under the owning Process lock. CapTable is a leaf
+/// spinlock and `CapObject::Pipe` is plain data (revoke drops no `Arc`, fires
+/// no wakeups), so the in-lock revoke is side-effect-free (see
+/// `decrement_fd_cap`'s SLICE-3 caution note).
+fn revoke_uninstalled_pipe_cap(proc: &process::Process, cap_id: cap::CapId, ctx: &lsm::ProcessCtx) {
+    if let Ok(true) = proc.cap_table.decrement_refcount(cap_id) {
+        let _ = proc.cap_table.revoke(cap_id);
+        let subject =
+            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
+        let timestamp = kernel_core::get_ticks();
+        let _ = audit::emit_capability_event(
+            audit::AuditOutcome::Success,
+            subject,
+            cap_id.raw(),
+            audit::AuditCapOperation::Revoke,
+            None,
+            0,
+            timestamp,
+        );
+    }
+}
+
 /// 创建管道的系统调用回调
 ///
 /// 创建一个管道，分配两个文件描述符给当前进程
+///
+/// # U.S2-SLICE-3: pipe CapId allocation (design-v3, adversarially converged)
+///
+/// Both pipe-end capabilities are allocated at THIS install site — the only
+/// place that owns the concrete `PipeHandle`s pre-boxing — mirroring the
+/// sys_socket model:
+///
+/// - **CRITICAL-1/2**: every cap operation happens under the ONE `proc.lock()`
+///   acquisition below (allocate, set_cap_id, rollback decrement/revoke) —
+///   no pre-lock orphan window, no double-lock.
+/// - **CRITICAL-3**: the LSM subject is built from the LOCKED proc's CURRENT
+///   credentials (`lsm_process_ctx_from`), never from cached values.
+/// - **CRITICAL-5**: `CapObject::Pipe` carries plain `{pipe_id, end_type}`
+///   data — the `Arc<Pipe>` stays exclusively in the `PipeHandle`s, so a
+///   revoke can never double-close the pipe.
+/// - **CRITICAL-6**: BOTH caps are allocated before EITHER fd is installed;
+///   the rollback ladder below is exact at every rung.
+/// - **CRITICAL-7 + LEAK FIX (deviation from design-v2/v3)**: an INSTALLED
+///   fd's cap rolls back only through the `remove_fd` funnel; an UNINSTALLED
+///   cap is funnel-unreachable and takes the cap-only stage
+///   (`revoke_uninstalled_pipe_cap`). design-v2/v3's arms dropped the
+///   rejected boxes without paying the uninstalled caps back — 1-2 slots
+///   leaked per failed sys_pipe (TableFull DoS class); the ladder here closes
+///   that.
+/// - **R170-6**: every rollback `PipeHandle` Drop (close → wake) runs OUTSIDE
+///   the Process lock via `rollback_outside`.
 fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     use process::{current_pid, get_process};
 
@@ -51,12 +112,10 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 创建管道
-    let (read_handle, write_handle) =
+    // 创建管道（锁外 — 对象创建没有 cap/fd 副作用）
+    let (mut read_handle, mut write_handle) =
         create_pipe(PipeFlags::default()).map_err(pipe_error_to_syscall)?;
 
-    // 分配文件描述符
-    //
     // R170-6 FIX (D2-FD-DROP-UNDER-LOCK): every rollback object is bound
     // OUTSIDE the lock scope so its Drop (PipeHandle close → wake paths)
     // never runs while the Process lock is held — mirroring the sys_close
@@ -64,26 +123,92 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     // `remove_fd` uncharge itself stays under the lock (it reverses THIS
     // call's charge); only the object teardown is deferred.
     let mut rollback_outside: [Option<Box<dyn FileOps>>; 2] = [None, None];
-    let alloc_result = {
-        let mut proc = process.lock();
+    let alloc_result: Result<(i32, i32), SyscallError> = 'install: {
+        let mut proc = process.lock(); // SINGLE lock acquisition (CRITICAL-1)
 
-        match proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>) {
-            Ok(rfd) => {
-                // 分配写端 fd，失败时回滚（读端移除 + 两个对象都在锁外析构）
-                match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
-                    Ok(wfd) => Ok((rfd, wfd)),
-                    Err(write_box) => {
-                        rollback_outside[0] = proc.remove_fd(rfd);
-                        rollback_outside[1] = Some(write_box);
-                        Err(SyscallError::EMFILE)
-                    }
-                }
+        // LSM subject from the LOCKED proc's current creds (CRITICAL-3).
+        let proc_ctx = kernel_core::lsm_process_ctx_from(&proc);
+        let pipe_id = read_handle.pipe_id();
+
+        // Allocate BOTH caps before EITHER fd install (CRITICAL-6), each
+        // LSM-gated + audit-emitting (cap_allocate_with_lsm — the exact
+        // sys_socket composition: hook, allocate, audit Allocate).
+        let read_cap = match kernel_core::cap_allocate_with_lsm(
+            &proc.cap_table,
+            cap::CapEntry::new(
+                cap::CapObject::Pipe(cap::Pipe {
+                    pipe_id,
+                    end_type: cap::PipeEndType::Read,
+                }),
+                cap::CapRights::READ,
+            ),
+            Some(&proc_ctx),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // Nothing cap-allocated yet — both handles tear down outside.
+                rollback_outside[0] = Some(Box::new(read_handle));
+                rollback_outside[1] = Some(Box::new(write_handle));
+                break 'install Err(e);
             }
+        };
+        let write_cap = match kernel_core::cap_allocate_with_lsm(
+            &proc.cap_table,
+            cap::CapEntry::new(
+                cap::CapObject::Pipe(cap::Pipe {
+                    pipe_id,
+                    end_type: cap::PipeEndType::Write,
+                }),
+                cap::CapRights::WRITE,
+            ),
+            Some(&proc_ctx),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // design-v3 Fix 1 (CRITICAL-4): the read cap is now an orphan
+                // (no fd will ever carry it) — cap-only rollback stage.
+                revoke_uninstalled_pipe_cap(&proc, read_cap, &proc_ctx);
+                rollback_outside[0] = Some(Box::new(read_handle));
+                rollback_outside[1] = Some(Box::new(write_handle));
+                break 'install Err(e);
+            }
+        };
+
+        // Attach the CapIds BEFORE install (CRITICAL-7: from the moment an fd
+        // carries the cap, the remove_fd funnel is its ONLY teardown edge).
+        read_handle.set_cap_id(read_cap);
+        write_handle.set_cap_id(write_cap);
+
+        // Install the fds.
+        let read_fd = match proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>) {
+            Ok(rfd) => rfd,
             Err(read_box) => {
+                // LEAK FIX: NEITHER fd installed → both caps are
+                // funnel-unreachable orphans; pay both back here (the
+                // design-v2/v3 arms missed this — 2 slots leaked per
+                // EMFILE'd sys_pipe).
+                revoke_uninstalled_pipe_cap(&proc, read_cap, &proc_ctx);
+                revoke_uninstalled_pipe_cap(&proc, write_cap, &proc_ctx);
                 rollback_outside[0] = Some(read_box);
-                Err(SyscallError::EMFILE)
+                rollback_outside[1] = Some(Box::new(write_handle));
+                break 'install Err(SyscallError::EMFILE);
             }
-        }
+        };
+        let write_fd = match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
+            Ok(wfd) => wfd,
+            Err(write_box) => {
+                // read_fd IS installed → its cap pays back through the
+                // remove_fd funnel (decrement_fd_cap → revoke at 0). The
+                // write cap never got an fd → cap-only stage (LEAK FIX for
+                // the second design-v2/v3 miss).
+                rollback_outside[0] = proc.remove_fd(read_fd);
+                revoke_uninstalled_pipe_cap(&proc, write_cap, &proc_ctx);
+                rollback_outside[1] = Some(write_box);
+                break 'install Err(SyscallError::EMFILE);
+            }
+        };
+
+        Ok((read_fd, write_fd))
     };
     // Process lock released — rollback PipeHandles (if any) drop HERE.
     drop(rollback_outside);
