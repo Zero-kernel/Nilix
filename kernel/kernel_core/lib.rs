@@ -123,7 +123,7 @@ pub use user_stack::{build_initial_user_stack, StackCreds, UserStackLayout};
 // Re-export capability types for convenience
 pub use cap::{
     CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, CapTable, EndpointId, NamespaceId,
-    Shm, Socket, Timer,
+    Shm, Socket, Timer, DEFAULT_CAP_SLOTS,
 };
 pub use scheduler_hook::{
     force_init_resched_locals, force_reschedule, on_scheduler_tick, register_resched_callback,
@@ -134,7 +134,14 @@ pub use signal::{
     PendingSignals, Signal, SignalAction, SignalError,
 };
 pub use syscall::{
+    // U.S2-SLICE-3: canonical LSM-gated cap allocator, error mappers, and LSM
+    // subject constructor, shared with the out-of-crate pipe cap-install site
+    // (ipc::pipe_create_callback).
+    cap_allocate_with_lsm,
+    cap_error_to_syscall,
     drain_deferred_stdin_wakes,
+    lsm_error_to_syscall,
+    lsm_process_ctx_from,
     // R144-2 FIX: Decode mmap region flags to permission string for procfs
     mmap_flags_to_perms,
     register_fd_close_callback,
