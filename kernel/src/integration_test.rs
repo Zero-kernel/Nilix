@@ -122,9 +122,81 @@ pub fn test_syscalls() {
     // fixes this by counting the child's actual fd references and overwriting
     // each CapEntry.refcount. Self-test simulates the scenario and asserts the
     // corrected counts (pure: no real process/socket state).
+    // U.S2-SLICE-3 extends it: fd-backed orphans (0 child fds) are REVOKED
+    // (CRITICAL-9 slot-leak class), Pipe rides the Socket class, and
+    // non-fd-backed caps (Endpoint) stay VERBATIM (BV-3 scoping).
     kernel_core::syscall::run_fork_reconcile_refcount_self_test();
     klog_always!(
-        "    ✓ U.S3-SLICE-2 fork reconciliation: thread-shared cap_table refcount correction"
+        "    ✓ U.S3-SLICE-2/U.S2-SLICE-3 fork reconciliation: refcount correction + orphan revoke + BV-3 scoping"
+    );
+    // U.S2-SLICE-3: the PipeHandle cap_id accessor contract — the exact
+    // missing-override class run_fileops_cap_id_self_test pins for SocketFile
+    // (kernel_core cannot construct a PipeHandle — dep direction — so the pipe
+    // leg lives here where real pipes are built). A missing override or a
+    // clone that drops the CapId silently no-ops every pipe-fd close decrement
+    // (cap slot leak → TableFull DoS), invisible to a green boot.
+    run_pipe_cap_id_self_test();
+    klog_always!(
+        "    ✓ U.S2-SLICE-3 pipe fd→cap accessor: None default + set_cap_id override + same-CapId clone"
+    );
+}
+
+/// U.S2-SLICE-3: structural self-test for the PipeHandle cap_id contract.
+///
+/// Pins three load-bearing properties of the pipe cap wiring (PURE: the
+/// fabricated CapId resolves to no table — no process/cap state is touched,
+/// and the non-blocking test pipe cannot hang the boot gate):
+/// 1. a fresh (never fd-installed) PipeHandle carries NO CapId — unit-test
+///    pipes and rollback handles must stay funnel-invisible;
+/// 2. after `set_cap_id` (what pipe_create_callback does under the Process
+///    lock), `FileOps::cap_id()` reports it — the generic dup/close/exec/exit
+///    lifecycle dispatches through this override;
+/// 3. `clone_box` carries the SAME CapId (U.S3-A2 purity: the install-site
+///    bump owns refcount changes, the clone itself never touches cap state) —
+///    and dropping the clone (transient-I/O shape) is side-effect-free for
+///    cap accounting by construction (Drop contract, CRITICAL-7).
+fn run_pipe_cap_id_self_test() {
+    use ipc::pipe::{create_pipe, PipeFlags};
+    use kernel_core::process::FileOps;
+
+    let flags = PipeFlags {
+        nonblock: true,
+        cloexec: false,
+    };
+    let (mut read_end, write_end) = create_pipe(flags).expect("pipe cap self-test: create_pipe");
+
+    // (1) Never-installed handles are cap-less (funnel no-op class).
+    assert!(
+        FileOps::cap_id(&read_end).is_none() && FileOps::cap_id(&write_end).is_none(),
+        "U.S2-SLICE-3: a PipeHandle that never passed the sys_pipe install \
+         site must carry NO CapId (rollback/test handles stay funnel-invisible)"
+    );
+
+    // (2) set_cap_id → the FileOps override reports it.
+    let cid = kernel_core::CapId::from_parts(9, 77);
+    read_end.set_cap_id(cid);
+    let desc: &dyn FileOps = &read_end;
+    assert!(
+        desc.cap_id() == Some(cid),
+        "U.S2-SLICE-3: PipeHandle must override FileOps::cap_id() with the \
+         CapId set at the install site — a default-None fallback makes every \
+         pipe-fd close decrement a no-op (cap slot leak → TableFull DoS)"
+    );
+
+    // (3) clone_box carries the SAME CapId; dropping the clone only balances
+    // the pipe end count (readers 2→1), never cap state.
+    let cloned = desc.clone_box();
+    assert!(
+        cloned.cap_id() == Some(cid),
+        "U.S2-SLICE-3: a dup/fork/transient copy must reference the SAME \
+         CapId (shared entry) — the refcount bump lives at the install site, \
+         never inside clone_box (U.S3-A2/A3)"
+    );
+    drop(cloned);
+    assert!(
+        desc.cap_id() == Some(cid),
+        "U.S2-SLICE-3: dropping a transient clone must not disturb the \
+         original handle's CapId"
     );
 }
 
