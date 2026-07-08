@@ -143,11 +143,36 @@ pub trait FileOps: Send + Sync {
     ///
     /// Default `None` = this fd kind carries no capability (namespace fds:
     /// mount/ipc/net/user — they refcount the namespace object itself, not a
-    /// CapEntry). A cap-BEARING implementor (`SocketFile` today; pipe/file fds in
-    /// U.S2 SLICE-3+) MUST override this AND have a structural self-test asserting
-    /// the override — a new default-bearing trait method silently makes the
-    /// specialized path dead for any implementor that forgot to override it
-    /// (the dev-v35 missing-override class; see `run_fileops_cap_id_self_test`).
+    /// CapEntry). A cap-BEARING implementor (`SocketFile`, `PipeHandle` since
+    /// U.S2 SLICE-3; file fds in SLICE-3B) MUST override this AND have a
+    /// structural self-test asserting the override — a new default-bearing
+    /// trait method silently makes the specialized path dead for any
+    /// implementor that forgot to override it (the dev-v35 missing-override
+    /// class; see `run_fileops_cap_id_self_test` +
+    /// `run_pipe_cap_id_self_test`).
+    ///
+    /// # Drop / refcount contract (U.S2-SLICE-3, CRITICAL-7)
+    ///
+    /// A cap-bearing implementor's `Drop` MUST NOT touch any cap_table: cap
+    /// refcount decrement is the exclusive responsibility of the fd REMOVAL
+    /// path (`remove_fd` → `decrement_fd_cap` funnel and its exec/exit
+    /// siblings). Drop MAY close the underlying resource (pipe end, socket).
+    /// A Drop-side decrement would double-decrement every removed fd (funnel
+    /// once, Drop again → underflow/premature revoke of a still-referenced
+    /// cap). The R155-3/R170-6 drop-outside-lock discipline additionally keeps
+    /// those resource-close side effects (wake_all) off the Process lock.
+    ///
+    /// # Transient clones and cap lifetime (U.S2-SLICE-3, CRITICAL-10)
+    ///
+    /// `clone_box()` copies are refcount-PURE (U.S3-A2) and carry the SAME
+    /// CapId. The I/O paths (fd_read/fd_write callbacks) clone the handle and
+    /// drop the Process lock before blocking I/O (R41-3); such transient
+    /// clones do NOT extend cap lifetime. If another task drives the cap's
+    /// refcount to 0 mid-I/O (last close → revoke), the in-flight clone's
+    /// cap_id points to a REVOKED CapId. That is benign today (I/O paths do
+    /// not consult cap rights); any future rights-checking I/O path must
+    /// tolerate `InvalidCapId` (generation mismatch) and map it to EBADF
+    /// ("fd closed during I/O"), never panic.
     fn cap_id(&self) -> Option<cap::CapId> {
         None
     }
@@ -1605,9 +1630,11 @@ impl Process {
     ///
     /// Lock context: called under the owning Process lock. CapTable's inner
     /// spinlock is a LEAF (without_interrupts + no callbacks), and revoke()
-    /// only drops plain-data cap objects today (cap::Socket = ids). SLICE-3
-    /// CAUTION: if CapObject ever carries a Drop that re-locks (FileOps-like),
-    /// the revoke must move outside the Process lock (R154-3/R169-4 class).
+    /// only drops plain-data cap objects today (cap::Socket = ids;
+    /// cap::Pipe/RegularFile = ids since U.S2-SLICE-3 — enforced by the
+    /// CRITICAL-5 plain-data rule). CAUTION: if CapObject ever carries a Drop
+    /// that re-locks (FileOps-like), the revoke must move outside the Process
+    /// lock (R154-3/R169-4 class).
     pub(crate) fn decrement_fd_cap(&self, desc: &dyn FileOps) {
         if let Some(cap_id) = desc.cap_id() {
             let should_revoke = self.cap_table.decrement_refcount(cap_id).unwrap_or(false);
