@@ -5482,26 +5482,64 @@ review) provided the following calibrations for R129:
 
 ---
 
-## 🔶 U.S2 (Enterprise Capability System Phase 2) — Pipe/File Capabilities (BLOCKED, 2026-07-06)
+## 🟢 U.S2 (Enterprise Capability System Phase 2) — Pipe/File Capabilities (SLICE-3A PIPES IMPLEMENTED ✅ 2026-07-07)
 
 **Objective:** Extend CapId allocation to pipes and regular files (sys_pipe/sys_pipe2/sys_open/sys_openat).
 
-**Status:** BLOCKED on architectural refactoring — IPC/VFS subsystems don't have access to Process::cap_table.
+**Status:** ✅ **SLICE-3A (pipes) IMPLEMENTED & CONVERGED** (2026-07-07, kernel-next-phase) — design-v3 FIRST-SLICE landed with 3 documented deviations (all safety-tightening, see impl report). All 14 design findings now resolved IN CODE (or verified already-present). Gates: fmt-check OK, build PASS (49 warnings = baseline), lint 4/4, **boot-check OK** (new self-tests pass), **musl-check OK** (BV-1 discharged: pipe cap-alloc does not disturb the musl gate). Convergence via multi-lens adversarial self-review (Codex MCP unavailable — standing directive 2026-07-02). Files in SLICE-3B.
 
-**Blocker:** The IPC/VFS subsystems create PipeHandle/FileHandle objects but can't allocate CapIds (cap_table is in kernel_core::Process). Current architecture:
-- IPC/VFS callbacks return `(fd, fd)` or `fd` to kernel_core
-- kernel_core allocates FDs and installs the FileOps objects
-- CapId allocation needs to happen DURING object creation (before fd allocation) to avoid TOCTOU
+### SLICE-3A implementation (2026-07-07) — what landed
 
-**Architectural Options (needs design phase):**
-1. Move `cap_table` to a global or per-namespace structure
-2. Pass `&CapTable` through IPC/VFS callbacks (ABI break)
-3. Allocate CapIds post-creation via a two-phase protocol (complex)
+- **`cap/types.rs`**: plain-data `CapObject::Pipe(Pipe{pipe_id,end_type})` + `PipeEndType` + reserved `RegularFile{inode_id,fs_id}` (CRITICAL-5: never Arc — revoke is side-effect-free) + `CapObject::is_fd_backed()` (Socket/Pipe/RegularFile; `File(Arc<dyn FileOps>)` deliberately excluded — construction-less, and its Drop under a lock would be the R154-3 class).
+- **`ipc/lib.rs pipe_create_callback`**: both pipe-end caps allocated under the ONE `proc.lock()` (CRITICAL-1/2), LSM-gated + audited via the revived canonical `cap_allocate_with_lsm` (CRITICAL-3: locked-proc creds; socket parity), both caps before either fd (CRITICAL-6), `set_cap_id` pre-install (CRITICAL-7: funnel is the only teardown edge for installed fds), R170-6 drop-outside preserved. Rights: READ / WRITE per end; `CapFlags::empty()` (fd-side cloexec only, U.S3 E10).
+- **`ipc/pipe.rs`**: `PipeHandle.cap_id` field + `set_cap_id` + verbatim carry through `duplicate()`/`clone_box` (U.S3-A2 purity) + `FileOps::cap_id()` override → the ENTIRE generic U.S3 lifecycle (dup/F_DUPFD/dup2/dup3 bump, close/exec/exit decrement, CLONE_THREAD bump, fork reconcile) covers pipes with ZERO changes to those paths. Drop contract documented (Fix 4): Drop closes the resource, never touches cap_table.
+- **`cap/lib.rs reconcile_refcounts_after_fork`**: CRITICAL-9 fixed — fd-backed orphans (0 child fds) are REVOKED (was: parked at refcount=0 forever = child-local slot leak → TableFull DoS); zero-allocation index-loop (apply_cloexec style; a collect-Vec would re-introduce the R161-4 fork fatal-OOM class); non-fd-backed caps stay VERBATIM (BV-3 scoping — their refcount is not an fd count). CRITICAL-8 invariant relaxation + CRITICAL-14 panic-safety documented on `CapTable`.
+- **Self-tests (boot-run, all builds)**: `run_pipe_cap_id_self_test` (None default / override / same-CapId clone / clone-drop purity) + extended `run_fork_reconcile_refcount_self_test` (Socket+Pipe orphans revoked, lookup fails, Endpoint verbatim, parent untouched).
+- **CRITICAL-13**: boot cap-budget instrumentation in `usermode_test.rs` (musl_test cfg): logs `used/DEFAULT_CAP_SLOTS` + headroom, warns <10.
 
-**Note:** Socket caps work because sys_socket/sys_accept are in kernel_core (direct cap_table access). The U.S3 generic infrastructure (FileOps::cap_id + refcount lifecycle) is ready — pipes/files just need the CapId allocation architecture resolved.
+### Deviations from design-v3 (all tightening; full analysis in impl report)
 
-**Remaining U.S2 SLICES (Blocked on SLICE-3):**
-- **SLICE-3:** Pipe/File CapId allocation (architectural blocker)
+1. **LEAK FIX**: design-v2/v3's fd-install failure arms left 1-2 caps at refcount=1 with NO fd — funnel-unreachable → 1-2 slots leaked per failed sys_pipe (the exact TableFull DoS class the design targets). Fixed: `revoke_uninstalled_pipe_cap` cap-only rollback stage (single-decrement pattern + audit Revoke) at every rung where a cap has no fd; installed fds still roll back exclusively via `remove_fd`.
+2. **Fix 2 `is_thread_shared` param REJECTED**: reconcile has exactly ONE call site (fork.rs:489-502) operating on the child's PRIVATE table under the parent lock — no thread-shared caller exists (CLONE_THREAD pays explicit bumps instead, U.S3-A3). The CRITICAL-9 race is structurally absent; the fix reduces to orphan-revoke + BV-3 scoping. Fix 2b (revoke outside lock) moot on a private table — documented in code.
+3. **CRITICAL-11/12 verified ALREADY-PRESENT** (committed U.S3/R133-5/R155-3 work): snapshot-then-bump CLONE_THREAD and replace_fd_charged extract-then-drop-outside needed no new code.
+
+**Architecture (verified 2026-07-07):** The "architectural blocker" claim from v15.9 was **STALE**. CapId allocation at fd-install time is architecturally viable:
+- **Pipes:** `ipc/lib.rs:47 pipe_create_callback` already holds `proc.lock()` where `proc.cap_table` is directly accessible. ipc crate deps kernel_core (has Process/cap re-exports) — adding direct cap dep is cycle-free (cap is leaf).
+- **Files:** Both `sys_open_internal` (kernel_core/syscall.rs:9202-9220) and `sys_openat2` (14916-14931) install fds under `proc.lock()` where `proc.cap_table` is directly reachable. VFS callbacks return `Box<dyn FileOps>` to kernel_core; cap allocation happens at install, mirroring `sys_socket` (15870-15940).
+
+**Design Evolution (2026-07-07):**
+- **design-v1 (FAILED):** Workflow `wf_83761552-b89` (22 agents, ~2.2M tokens, 70min) exposed **12 CRITICAL defects** across lock-ordering, refcount-accounting, error-rollback, TOCTOU, and slot-limits (4 KILL verdicts). Prevented catastrophic implementation.
+- **design-v2 (FAILED):** Fixed 4 CRITICALs but introduced 3 NEW bugs (double-decrement, CRITICAL-9 thread-shared reconcile race, CRITICAL-12 parent-child deadlock).
+- **design-v3 (CONVERGED):** Fixed all 12 + 3 = 15 issues. Final convergence agent identified **CRITICAL-14** (panic=abort missing for dev profile) → fixed via `Cargo.toml` addition → **FINAL VERDICT: CONVERGED**.
+
+**Design-v3 Core Principles:**
+1. Single-lock scope: all cap ops under ONE proc.lock()
+2. Plain-data CapObject: `Pipe{pipe_id, end_type}` / `RegularFile{inode_id, fs_id}` (never Arc)
+3. Extract-then-drop-outside: R170-6 for ALL displaced descriptors (incl. replace_fd_charged)
+4. No double-lock: snapshot parent fd_table, release, THEN bump child caps
+5. Generic funnel discipline: rollback via remove_fd only, never direct cap ops
+6. Thread-shared reconcile skip: refcounts already correct from bump loop
+7. Explicit Drop contract: Drop closes resource, doesn't touch cap_table
+8. panic=abort ALL profiles: Cargo.toml enforces abort for dev+release
+
+**All 13 CRITICAL Findings Resolved:**
+- CRITICAL-1 to CRITICAL-6: Single-lock scope, plain-data CapObject, cap-before-fd window
+- CRITICAL-7 to CRITICAL-12: Drop contract, fork reconcile, extract-then-drop, snapshot-then-bump
+- CRITICAL-13: Boot cap budget instrumentation
+- **CRITICAL-14: panic=abort for [profile.dev] added** (Cargo.toml dual-written 2026-07-07)
+
+**Design Documents:**
+- Failure report: `docs/review/us2-slice3-design-failed-2026-07-07.md`
+- Fix catalog (v2): `docs/review/us2-slice3-design-v2-fixes.md`
+- Final design (v3): `docs/review/us2-slice3-design-v3-final.md` ✅ CONVERGED
+- **Implementation report (SLICE-3A):** `docs/review/us2-slice3a-impl-2026-07-07.md` ✅ IMPLEMENTED + self-review converged (7 lenses SAFE)
+- Workflow output: `.claude/temp/wv7r7hme5.output` (22 agents, 464 tool uses)
+
+**Next Step:** SLICE-3B (files): wire `CapObject::RegularFile` at `sys_open_internal` + `sys_openat2` fd-install sites, riding the identical single-lock + funnel discipline (the variant, classifier, and lifecycle plumbing all landed in 3A).
+
+**Remaining U.S2 SLICES:**
+- ~~**SLICE-3A:** Pipe CapId allocation~~ ✅ **DONE 2026-07-07** (see impl report; the "architectural blocker" was stale — no refactor was needed)
+- **SLICE-3B:** File CapId allocation (sys_open/sys_openat → `RegularFile`; variant reserved in 3A)
 - **SLICE-4:** `native_cap_op(604)` syscall + seccomp 600-631 enforcement
 - **SLICE-5:** Generation exhaustion error mapping
 - **SLICE-6:** `native_invoke(605)` + `native_spawn(606)` (blocked on U.S3 IPC design)
@@ -5509,6 +5547,6 @@ review) provided the following calibrations for R129:
 
 ---
 
-*Generated: 2026-07-06 (v15.9 -- U.S3 SLICE-1+2 complete: fd→CapId refcount lifecycle with fork reconciliation; U.S2 SLICE-3+ blocked on cap_table→IPC/VFS visibility)*
-*Collaborative review: Claude Opus 4 + Codex MCP*
+*Generated: 2026-07-07 (v16.0 -- U.S2 SLICE-3A complete: pipe CapId allocation implemented per design-v3 with 3 tightening deviations (rollback leak fix, is_thread_shared rejection, BV-3 scoping); all 14 design findings resolved in code; gates fmt/build/lint/clippy/boot-check/musl-check/test-smp all green)*
+*Collaborative review: Claude Opus 4 (multi-lens adversarial self-review; Codex MCP unavailable per 2026-07-02 standing directive)*
 *Inputs: 129 QA rounds + 19 defect analysis docs + 2 roadmaps + 19 prior plans*
