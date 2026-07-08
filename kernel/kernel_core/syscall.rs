@@ -1394,6 +1394,13 @@ pub fn run_fileops_cap_id_self_test() {
 /// simulates the scenario: create a cap_table with over-counted refcounts,
 /// build a child-fd histogram, call reconcile, and assert the corrected counts.
 /// PURE: no process/socket state touched (fabricated CapIds + empty CapObjects).
+///
+/// U.S2-SLICE-3 extensions (CRITICAL-9 + BV-3):
+/// - an fd-backed cap with child_fd_count==0 must be REVOKED (slot reclaimed),
+///   not parked at refcount=0 forever (the child-local slot-leak class);
+/// - the Pipe variant rides the same reconcile as Socket (fd-backed class);
+/// - a NON-fd-backed cap (Endpoint) must stay VERBATIM — its refcount is not
+///   an fd count, so the fd histogram must neither rewrite nor revoke it.
 pub fn run_fork_reconcile_refcount_self_test() {
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
@@ -1421,6 +1428,25 @@ pub fn run_fork_reconcile_refcount_self_test() {
             cap::CapRights::WRITE,
         ))
         .expect("allocate cap C");
+    // U.S2-SLICE-3: cap D = NON-fd-backed (Endpoint) — reconcile must leave it
+    // VERBATIM (BV-3 scoping): no refcount rewrite, no revoke.
+    let cap_d = parent_table
+        .allocate(cap::CapEntry::new(
+            cap::CapObject::Endpoint(4242),
+            cap::CapRights::READ,
+        ))
+        .expect("allocate cap D (Endpoint)");
+    // U.S2-SLICE-3: cap E = fd-backed Pipe variant, parent/sibling-only (child
+    // holds 0 fds) — must be REVOKED by reconcile exactly like a Socket orphan.
+    let cap_e = parent_table
+        .allocate(cap::CapEntry::new(
+            cap::CapObject::Pipe(cap::Pipe {
+                pipe_id: 996,
+                end_type: cap::PipeEndType::Read,
+            }),
+            cap::CapRights::READ,
+        ))
+        .expect("allocate cap E (Pipe)");
 
     // Simulate sibling-held references: A=2 (parent+1 sibling), B=3 (parent+2
     // siblings), C=1 (parent only). The initial allocate() set refcount=1; bump
@@ -1428,7 +1454,7 @@ pub fn run_fork_reconcile_refcount_self_test() {
     parent_table.increment_refcount(cap_a).expect("bump A");
     parent_table.increment_refcount(cap_b).expect("bump B to 2");
     parent_table.increment_refcount(cap_b).expect("bump B to 3");
-    // C stays at 1 (parent-only).
+    // C stays at 1 (parent-only). D (Endpoint) stays at 1. E (Pipe) stays at 1.
 
     assert!(
         parent_table.get_refcount(cap_a) == Some(2),
@@ -1447,9 +1473,7 @@ pub fn run_fork_reconcile_refcount_self_test() {
     // 2/3/1 for A/B/C), but the child only gets the forking thread's fds.
     // Build the child-fd histogram: child holds A once, B once, and does NOT
     // hold C (C was a sibling-only cap in this simulation).
-    let mut child_table = parent_table
-        .try_clone_for_fork()
-        .expect("fork clone table");
+    let mut child_table = parent_table.try_clone_for_fork().expect("fork clone table");
 
     // Before reconciliation, the child's verbatim-copied refcounts are wrong:
     assert!(
@@ -1469,7 +1493,8 @@ pub fn run_fork_reconcile_refcount_self_test() {
     let mut child_counts = BTreeMap::new();
     child_counts.insert(cap_a, 1);
     child_counts.insert(cap_b, 1);
-    // C is omitted (child has no fds carrying C).
+    // C and E are omitted (child has no fds carrying them); D is non-fd-backed
+    // and never appears in an fd histogram.
 
     // (3) Call reconcile_refcounts_after_fork to fix the over-counts.
     child_table.reconcile_refcounts_after_fork(&child_counts);
@@ -1483,9 +1508,30 @@ pub fn run_fork_reconcile_refcount_self_test() {
         child_table.get_refcount(cap_b) == Some(1),
         "U.S3-SLICE-2: reconciled cap B refcount must equal child's fd count (1, not 3)"
     );
+    // U.S2-SLICE-3 (CRITICAL-9): fd-backed orphans (child_fd_count==0) are
+    // REVOKED, not parked at refcount=0 — the CapId must now be invalid.
     assert!(
-        child_table.get_refcount(cap_c) == Some(0),
-        "U.S3-SLICE-2: reconciled cap C refcount must equal child's fd count (0, not 1)"
+        child_table.get_refcount(cap_c).is_none(),
+        "U.S2-SLICE-3: orphan Socket cap C (0 child fds) must be REVOKED by \
+         reconcile — a refcount=0 slot parked forever is the child-local slot \
+         leak class (TableFull DoS)"
+    );
+    assert!(
+        child_table.get_refcount(cap_e).is_none(),
+        "U.S2-SLICE-3: orphan Pipe cap E (0 child fds) must be REVOKED by \
+         reconcile — the Pipe variant rides the same fd-backed class as Socket"
+    );
+    assert!(
+        child_table.lookup(cap_c).is_err() && child_table.lookup(cap_e).is_err(),
+        "U.S2-SLICE-3: revoked orphan CapIds must fail lookup in the child \
+         (generation guard keeps stale ids invalid)"
+    );
+    // U.S2-SLICE-3 (BV-3): the NON-fd-backed Endpoint cap must be untouched —
+    // neither rewritten to the (absent) histogram count nor revoked.
+    assert!(
+        child_table.get_refcount(cap_d) == Some(1),
+        "U.S2-SLICE-3: non-fd-backed Endpoint cap D must stay VERBATIM \
+         (refcount=1) — its refcount is not an fd count (BV-3 scoping)"
     );
 
     // (4) Verify the parent table is UNCHANGED (fork does NOT touch the parent).
@@ -1500,6 +1546,16 @@ pub fn run_fork_reconcile_refcount_self_test() {
     assert!(
         parent_table.get_refcount(cap_c) == Some(1),
         "post-reconcile: parent cap C refcount must stay 1 (fork reconciles child only)"
+    );
+    // U.S2-SLICE-3: the child-side orphan revoke must NOT leak into the parent
+    // (separate table object), and the parent's non-fd-backed cap is untouched.
+    assert!(
+        parent_table.get_refcount(cap_e) == Some(1),
+        "post-reconcile: parent Pipe cap E must stay allocated (child revoke is child-local)"
+    );
+    assert!(
+        parent_table.get_refcount(cap_d) == Some(1),
+        "post-reconcile: parent Endpoint cap D must stay allocated at refcount=1"
     );
 }
 
@@ -2652,7 +2708,9 @@ fn get_audit_subject() -> AuditSubject {
 
 /// Map LSM errors to syscall errno values.
 #[inline]
-fn lsm_error_to_syscall(err: lsm::LsmError) -> SyscallError {
+/// U.S2-SLICE-3: `pub` for the same reason as `lsm_process_ctx_from` — one
+/// canonical LsmError→errno mapping shared with out-of-crate cap-install sites.
+pub fn lsm_error_to_syscall(err: lsm::LsmError) -> SyscallError {
     match err {
         lsm::LsmError::Denied => SyscallError::EPERM,
         lsm::LsmError::Internal => SyscallError::EPERM,
@@ -2663,9 +2721,11 @@ fn lsm_error_to_syscall(err: lsm::LsmError) -> SyscallError {
 ///
 /// This ensures proper error reporting when capability operations fail,
 /// rather than silently swallowing errors.
+///
+/// U.S2-SLICE-3: `pub` — the pipe cap-install site (ipc crate) maps CapError
+/// through this same canonical table (TableFull→EMFILE, OutOfMemory→ENOMEM).
 #[inline]
-#[allow(dead_code)] // Will be used when capability syscalls are added
-fn cap_error_to_syscall(err: cap::CapError) -> SyscallError {
+pub fn cap_error_to_syscall(err: cap::CapError) -> SyscallError {
     match err {
         cap::CapError::TableFull => SyscallError::EMFILE,
         cap::CapError::GenerationExhausted => SyscallError::ERANGE, // No EOVERFLOW, use ERANGE
@@ -2739,7 +2799,11 @@ fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {
 
 /// Build an LSM ProcessCtx from a locked Process struct.
 #[inline]
-fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
+/// U.S2-SLICE-3: `pub` so cap-allocating fd-install sites OUTSIDE kernel_core
+/// (ipc::pipe_create_callback) build the LSM subject from the SAME canonical
+/// constructor as the in-crate sites (sys_socket/sys_accept) — a locked-proc
+/// snapshot of the CURRENT credentials (CRITICAL-3: never VFS-cached values).
+pub fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
     // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
     let creds = proc.credentials.read();
     lsm::ProcessCtx::new(
@@ -2806,7 +2870,10 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
 ///
 /// * `Ok(CapId)` - The allocated capability ID
 /// * `Err(SyscallError)` - LSM denied or allocation failed
-fn cap_allocate_with_lsm(
+/// U.S2-SLICE-3: `pub` — the pipe cap-install site (ipc::pipe_create_callback)
+/// allocates both pipe-end caps through this same LSM-gated, audit-emitting
+/// composition instead of hand-rolling the hook/allocate/audit sequence.
+pub fn cap_allocate_with_lsm(
     cap_table: &cap::CapTable,
     entry: cap::CapEntry,
     proc_ctx: Option<&lsm::ProcessCtx>,
