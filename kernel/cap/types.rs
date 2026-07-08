@@ -348,6 +348,48 @@ impl fmt::Debug for CapFlags {
 /// IPC endpoint identifier (from ipc crate).
 pub type EndpointId = u64;
 
+/// Pipe end identifier for capability tracking (U.S2-SLICE-3).
+///
+/// PLAIN DATA by design (CRITICAL-5): the capability entry must never hold the
+/// `Arc<ipc::Pipe>` itself — a CapObject-held Arc would make `revoke()` a
+/// potential last-drop of the pipe (close/wake side effects) under whatever
+/// lock the revoker holds, and would double-close against `PipeHandle::Drop`.
+/// The REAL object handle lives in the fd's `PipeHandle`; this struct carries
+/// only identification data, so dropping a revoked slot is side-effect-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pipe {
+    /// Pipe identifier (matches `ipc::pipe::PipeId`).
+    pub pipe_id: u64,
+    /// Which end of the pipe this capability covers.
+    pub end_type: PipeEndType,
+}
+
+/// Which end of a pipe a `CapObject::Pipe` capability covers (U.S2-SLICE-3).
+///
+/// Local to the cap crate (cap cannot depend on ipc — dependency direction);
+/// `ipc::pipe::PipeEndType` maps 1:1 onto this at the allocation site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeEndType {
+    /// Read end (capability carries CapRights::READ).
+    Read,
+    /// Write end (capability carries CapRights::WRITE).
+    Write,
+}
+
+/// Regular-file identifier for capability tracking (U.S2-SLICE-3B, RESERVED).
+///
+/// Same plain-data rationale as [`Pipe`] (CRITICAL-5): identification data
+/// only, never an `Arc<Inode>`. No allocation site exists yet — sys_open/
+/// sys_openat wire this in SLICE-3B; the variant lands now so the enum shape
+/// (and every exhaustive match) is settled in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegularFile {
+    /// Inode number within the owning filesystem.
+    pub inode_id: u64,
+    /// Filesystem identifier for cross-mount disambiguation.
+    pub fs_id: u64,
+}
+
 /// Objects referenced by capabilities.
 ///
 /// Each variant represents a different kernel object type that can be
@@ -357,6 +399,9 @@ pub enum CapObject {
     /// VFS/fd-backed objects (wraps FileOps for fd_table interop).
     ///
     /// Includes regular files, pipes, sockets, device files, etc.
+    /// NOTE: no in-tree construction site today; fd-backed caps use the
+    /// plain-data variants (`Socket`, `Pipe`, `RegularFile`) instead, so
+    /// slot teardown never runs a `dyn FileOps` Drop under a cap lock.
     File(Arc<dyn FileOps>),
 
     /// IPC endpoint (message queue endpoint from ipc subsystem).
@@ -364,6 +409,12 @@ pub enum CapObject {
 
     /// Network socket handle (placeholder until net stack lands).
     Socket(Arc<Socket>),
+
+    /// Anonymous pipe end (U.S2-SLICE-3: plain data, NO Arc — see [`Pipe`]).
+    Pipe(Pipe),
+
+    /// Regular file (U.S2-SLICE-3B RESERVED: plain data, NO Arc).
+    RegularFile(RegularFile),
 
     /// Shared memory region handle.
     Shm(Arc<Shm>),
@@ -378,12 +429,41 @@ pub enum CapObject {
     Namespace(NamespaceId),
 }
 
+impl CapObject {
+    /// U.S2-SLICE-3: does this capability's lifecycle ride the fd lifecycle?
+    ///
+    /// fd-BACKED caps are allocated at an fd-install site (sys_socket/
+    /// sys_accept → `Socket`, sys_pipe/sys_pipe2 → `Pipe`, SLICE-3B open →
+    /// `RegularFile`) with `refcount == number of fds carrying the CapId`;
+    /// the generic funnel (`decrement_fd_cap`) revokes at refcount→0. Fork
+    /// reconciliation may therefore rewrite/revoke them from the child's fd
+    /// histogram (see `reconcile_refcounts_after_fork`).
+    ///
+    /// NON-fd-backed caps (Endpoint/Process/Namespace/Shm/Timer) have no fd
+    /// tied to them; their refcount is NOT an fd count and fork reconcile
+    /// must leave them VERBATIM (BV-3 scoping). `File(Arc<dyn FileOps>)` is
+    /// deliberately NOT fd-backed here: it has no construction site, and
+    /// revoking one from reconcile would drop a `dyn FileOps` under the
+    /// parent Process lock (R154-3 inversion class) — excluded fail-safe.
+    #[inline]
+    pub fn is_fd_backed(&self) -> bool {
+        matches!(
+            self,
+            CapObject::Socket(_) | CapObject::Pipe(_) | CapObject::RegularFile(_)
+        )
+    }
+}
+
 impl fmt::Debug for CapObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CapObject::File(fo) => write!(f, "File({})", fo.type_name()),
             CapObject::Endpoint(id) => write!(f, "Endpoint({})", id),
             CapObject::Socket(_) => write!(f, "Socket"),
+            CapObject::Pipe(p) => write!(f, "Pipe(id={}, {:?})", p.pipe_id, p.end_type),
+            CapObject::RegularFile(rf) => {
+                write!(f, "RegularFile(ino={}, fs={})", rf.inode_id, rf.fs_id)
+            }
             CapObject::Shm(_) => write!(f, "Shm"),
             CapObject::Timer(_) => write!(f, "Timer"),
             CapObject::Process(pid) => write!(f, "Process({})", pid),

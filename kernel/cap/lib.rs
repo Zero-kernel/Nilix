@@ -92,7 +92,7 @@ pub mod types;
 
 pub use types::{
     CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, EndpointId, FileOps, NamespaceId,
-    ProcessId, Shm, Socket, Timer,
+    Pipe, PipeEndType, ProcessId, RegularFile, Shm, Socket, Timer,
 };
 
 // ============================================================================
@@ -114,6 +114,32 @@ pub const MAX_CAP_SLOTS: usize = 65535;
 ///
 /// Each process has its own CapTable. The table maps CapId slot indices
 /// to CapEntry objects. Generation counters prevent use-after-free.
+///
+/// # U.S3 Refcount Invariant (relaxed for U.S2-SLICE-3, CRITICAL-8)
+///
+/// For fd-BACKED caps (`CapObject::is_fd_backed()`: Socket/Pipe/RegularFile):
+/// - **During allocation:** `refcount >= fd-count` — the cap is allocated
+///   under the owning `Process` lock BEFORE its fd is installed (sys_socket,
+///   sys_pipe), so a concurrent CLONE_THREAD sibling inspecting the SHARED
+///   table can observe a cap with refcount=1 and no fd yet. This in-flight
+///   window (microseconds, bounded by the Process lock hold) is INTENTIONAL
+///   and SAFE: any future cap-introspection surface must tolerate
+///   `refcount > fd-count` as a normal allocation window, not an error.
+/// - **Post-install:** `refcount == fd-count` — one reference per fd carrying
+///   the CapId (dup/F_DUPFD/CLONE_THREAD bump; close/exec/exit decrement via
+///   the `decrement_fd_cap` funnel, revoke at 0).
+/// - **During I/O:** transient FileOps clones do NOT bump refcount (U.S3-A2
+///   clone purity); a cap may be revoked while a transient clone is in flight
+///   (see the FileOps trait contract in kernel_core::process).
+///
+/// # Panic Safety (U.S2-SLICE-3, CRITICAL-14)
+///
+/// If a panic occurred between cap allocation and fd installation, the slot
+/// would remain allocated with refcount=1 and no fd — an orphan that no
+/// funnel would ever revoke. The workspace root Cargo.toml enforces
+/// `panic = "abort"` for BOTH dev and release profiles, so unwinding past
+/// the allocation window cannot happen in any build configuration: a panic
+/// is an unrecoverable kernel halt and the leak class cannot materialize.
 #[derive(Debug)]
 pub struct CapTable {
     inner: Mutex<CapTableInner>,
@@ -452,31 +478,87 @@ impl CapTable {
     /// siblings, CapSlot::clone copies refcounts VERBATIM (U.S3-A1) including
     /// sibling-held references, but fork's fd_table copy gives the child ONLY
     /// the forking thread's fds → over-count → child-local slot leak. This
-    /// method OVERWRITES each CapEntry.refcount to equal `child_counts[cid]`
-    /// (the histogram fork.rs built from the child's fd_table).
+    /// method OVERWRITES each fd-backed CapEntry.refcount to equal
+    /// `child_counts[cid]` (the histogram fork.rs built from the child's
+    /// fd_table).
     ///
-    /// Called BEFORE the child cap_table is wrapped in Arc and made visible —
-    /// no lock needed (child private, parent still locked). For caps the child
-    /// does NOT hold (parent/sibling-only), we leave the slot present but set
-    /// refcount=0 so the child's first hypothetical dup/delegate bumps it to 1.
-    /// That's benign: the child can't synthesize a CapId it never received, so
-    /// refcount=0 entries are unreachable until/unless a future SCM_RIGHTS-like
-    /// transfer lands (which would bump on install). Keeping the slot preserves
-    /// generation continuity (a revoked parent CapId stays invalid in the child).
+    /// # Contract (single call site: fork.rs)
+    ///
+    /// Called on the child's PRIVATE table (fresh from `try_clone_for_fork`,
+    /// not yet wrapped in Arc, not visible to any other task) while the parent
+    /// Process lock is held. There is NO thread-shared caller: a CLONE_THREAD
+    /// child shares the parent's table Arc and pays explicit per-fd increments
+    /// at its install site instead (U.S3-A3) — it never reconciles. Because
+    /// the table is private, no concurrent decrement can race the overwrite
+    /// (the design-v3 CRITICAL-9 race is structurally absent here).
+    ///
+    /// # U.S2-SLICE-3 (CRITICAL-9 fix): revoke fd-backed orphans
+    ///
+    /// A cap the child does NOT hold any fd for (`child_fd_count == 0`,
+    /// parent/sibling-only) previously kept its slot with refcount=0 forever:
+    /// no child fd will ever funnel a decrement through it, so the slot was
+    /// permanently lost (child-local slot leak → TableFull DoS class). Now it
+    /// is REVOKED immediately — safe in-lock because the revoke scope is
+    /// limited to PLAIN-DATA fd-backed variants (`CapObject::is_fd_backed()`:
+    /// Socket/Pipe/RegularFile — dropping them has zero side effects), and
+    /// safe semantically because generation monotonicity keeps any stale
+    /// parent CapId invalid in the child even after slot reuse
+    /// (`next_generation` was inherited from the parent).
+    ///
+    /// # BV-3 scoping: NON-fd-backed caps stay VERBATIM
+    ///
+    /// Endpoint/Process/Namespace/Shm/Timer (and the construction-less
+    /// `File(Arc<dyn FileOps>)`) refcounts are NOT fd counts — overwriting
+    /// them from an fd histogram (the pre-SLICE-3 behavior zeroed them) or
+    /// revoking them would corrupt their independent lifecycle the moment a
+    /// non-fd allocation site lands. They are left untouched: the child
+    /// inherits them exactly as `try_clone_for_fork` copied them.
     pub fn reconcile_refcounts_after_fork(
         &mut self,
         child_counts: &alloc::collections::BTreeMap<CapId, usize>,
     ) {
         interrupts::without_interrupts(|| {
             let mut inner = self.inner.lock();
-            for (idx, slot_opt) in inner.slots.iter_mut().enumerate() {
-                if let Some(slot) = slot_opt {
-                    let cid = CapId::from_parts(idx as u16, slot.generation);
-                    let child_fd_count = child_counts.get(&cid).copied().unwrap_or(0);
-                    // Overwrite the verbatim-copied refcount with the child's actual count.
-                    slot.entry
-                        .refcount
-                        .store(child_fd_count, core::sync::atomic::Ordering::Relaxed);
+            // Index loop (the apply_cloexec style) — ZERO allocation under the
+            // lock: a collect-then-revoke Vec would infallibly push under the
+            // table spinlock on the FORK path, re-introducing the fatal-OOM
+            // class R161-4/R157-3 eliminated from fork. `revoke`'s `free.push`
+            // is allocation-free by INV-CAP-FREELIST-CAP (R172-06).
+            for idx in 0..inner.slots.len() {
+                let action = match &inner.slots[idx] {
+                    // BV-3: only fd-lifecycle-managed caps are reconciled.
+                    Some(slot) if slot.entry.object.is_fd_backed() => {
+                        let cid = CapId::from_parts(idx as u16, slot.generation);
+                        let child_fd_count = child_counts.get(&cid).copied().unwrap_or(0);
+                        if child_fd_count == 0 {
+                            // CRITICAL-9: no child fd references this cap →
+                            // orphan → revoke (below, outside this borrow).
+                            Some((cid, 0))
+                        } else {
+                            Some((cid, child_fd_count))
+                        }
+                    }
+                    _ => None,
+                };
+                match action {
+                    Some((cid, 0)) => {
+                        // Revoke in-lock: the table is private (no observer
+                        // can race) and the fd-backed scope guarantees a
+                        // plain-data drop — no wakeup/re-lock side effect
+                        // (the design-v3 Fix 2b "revoke outside lock" concern
+                        // does not apply to a private table).
+                        let _ = inner.revoke(cid);
+                    }
+                    Some((_, child_fd_count)) => {
+                        // Overwrite the verbatim-copied refcount with the
+                        // child's actual count.
+                        if let Some(slot) = &mut inner.slots[idx] {
+                            slot.entry
+                                .refcount
+                                .store(child_fd_count, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    None => {}
                 }
             }
         });
