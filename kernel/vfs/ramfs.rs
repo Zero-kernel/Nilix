@@ -809,7 +809,8 @@ impl Inode for RamFsInode {
                     } else {
                         // Shrink with detached replacement to release capacity, not just length
                         let mut new_data = Vec::new();
-                        new_data.try_reserve_exact(new_len)
+                        new_data
+                            .try_reserve_exact(new_len)
                             .map_err(|_| FsError::NoMem)?;
                         new_data.resize(new_len, 0);
                         new_data.copy_from_slice(&data[..new_len]);

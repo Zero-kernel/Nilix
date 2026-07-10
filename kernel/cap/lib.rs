@@ -908,12 +908,22 @@ mod tests {
         // Only reaches here in release builds
         #[cfg(not(debug_assertions))]
         {
-            assert!(!should_revoke_again, "Second decrement from 0 should return false (saturated)");
-            assert_eq!(table.get_refcount(cap_id), Some(0), "Refcount should saturate at 0, not wrap");
+            assert!(
+                !should_revoke_again,
+                "Second decrement from 0 should return false (saturated)"
+            );
+            assert_eq!(
+                table.get_refcount(cap_id),
+                Some(0),
+                "Refcount should saturate at 0, not wrap"
+            );
 
             // Verify the slot is NOT permanently leaked (revoke still works)
             let revoked = table.revoke(cap_id);
-            assert!(revoked.is_ok(), "Slot should still be revocable after saturation");
+            assert!(
+                revoked.is_ok(),
+                "Slot should still be revocable after saturation"
+            );
         }
     }
 }
