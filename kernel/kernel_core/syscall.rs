@@ -9146,6 +9146,17 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
                 total_written = total_written
                     .checked_add(written)
                     .ok_or(SyscallError::EOVERFLOW)?;
+
+                // R177-2 FIX: Stop on short write (written < iov_len).
+                // When sys_write accepts only part of a buffer (e.g., non-blocking socket/pipe
+                // with limited send buffer space), continuing to the next iovec creates a data
+                // gap. POSIX writev semantics: return partial count on short write, letting
+                // the caller retry with adjusted iovecs. This is correct for regular files
+                // (writes are always complete), and fixes the correctness edge for partial-
+                // accepting fds.
+                if written < entry.iov_len {
+                    break;
+                }
             }
             Err(e) => {
                 // 如果已写入部分数据，返回已写入的字节数
@@ -16535,11 +16546,17 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
             }
         }
 
-        // Yield to allow RX processing
+        // R177-L1 FIX: Yield CPU and halt until next timer tick to prevent tight-spin CPU livelock.
+        // The old pause+force_reschedule busy-waited if SYN-ACK was lost and never retransmitted
+        // (no RTO timer when SYN sent but TCB destroyed by spurious RST / net device error), spinning
+        // at 100% CPU for up to TCP_CONNECT_TIMEOUT. Match the proven poll/nanosleep pattern:
+        // reschedule_if_needed (drains deferred work + switches if NEED_RESCHED set by tick) + hlt
+        // (yields CPU until next IRQ, typically the 1kHz timer). Defense-in-depth against lost-SYN
+        // scenarios not yet covered by TCP RTO logic.
+        crate::reschedule_if_needed();
         unsafe {
-            core::arch::asm!("pause", options(nomem, nostack));
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
-        crate::force_reschedule();
     }
 }
 
