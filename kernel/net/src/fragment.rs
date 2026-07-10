@@ -823,12 +823,58 @@ impl FragmentCache {
             // FRAG and BYTE ceilings are ALSO enforced at the reserve sites (C2/C3)
             // for existing queues; this create-branch check covers the queue count
             // (mutated only on create/teardown) and gives an early frag/byte reject.
+            //
+            // R177-3 FIX: Per-ns LRU eviction added to align with global behavior.
+            // Previously, the per-ns path rejected immediately on hitting the queue cap,
+            // while the global path performed LRU eviction. This asymmetry meant a
+            // namespace at its local cap would hard-fail (fragments dropped) rather than
+            // evicting its own oldest incomplete queue. Now both paths evict the oldest
+            // queue from the SAME namespace when the respective limit is reached.
             if key.net_ns_id != 0 {
                 let nb = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
                 if nb.queues >= MAX_QUEUES_PER_NS {
-                    self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
-                    return Err(FragmentDropReason::PerNsQueueLimit);
+                    // R177-3 FIX: Evict oldest queue from this namespace before rejecting.
+                    let oldest_key = queues
+                        .iter()
+                        .filter(|(k, _)| k.net_ns_id == key.net_ns_id)
+                        .min_by_key(|(_, q)| q.created_ms)
+                        .map(|(&k, _)| k);
+
+                    if let Some(evict_key) = oldest_key {
+                        let evict_per_src_key = (evict_key.net_ns_id, evict_key.src_ip());
+                        if let Some(evicted) = queues.remove(&evict_key) {
+                            let frag_count = evicted.received_frags as u32;
+                            let byte_count = evicted.received_bytes as u64;
+                            if let Some(c) = per_src.get_mut(&evict_per_src_key) {
+                                *c = c.saturating_sub(1);
+                                if *c == 0 {
+                                    per_src.remove(&evict_per_src_key);
+                                }
+                            }
+                            self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                            if frag_count > 0 {
+                                self.stats
+                                    .buffered_fragments
+                                    .fetch_sub(frag_count, Ordering::Relaxed);
+                                self.stats
+                                    .buffered_bytes
+                                    .fetch_sub(byte_count, Ordering::Relaxed);
+                            }
+                            per_ns_release_queue(&mut per_ns, evict_key.net_ns_id);
+                            if frag_count > 0 {
+                                per_ns_release_frags(&mut per_ns, evict_key.net_ns_id, frag_count);
+                                per_ns_release_bytes(&mut per_ns, evict_key.net_ns_id, byte_count);
+                            }
+                            self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        // No queue to evict (shouldn't happen if nb.queues >= cap), reject.
+                        self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
+                        return Err(FragmentDropReason::PerNsQueueLimit);
+                    }
                 }
+                // R177-3-CODEX: Recompute budget after eviction (was using stale pre-eviction snapshot)
+                let nb = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
                 if (nb.frags as usize) >= MAX_FRAGS_PER_NS {
                     self.stats
                         .global_limit_drops
@@ -850,6 +896,8 @@ impl FragmentCache {
             // reassembly queue to make room. This ensures legitimate fragmented
             // packets have a chance even when an attacker is flooding with crafted
             // fragments that are never completed.
+            // R177-3-CODEX: Recompute queue count after per-ns eviction (was using stale snapshot)
+            let current_queues = queues.len();
             if current_queues >= GLOBAL_MAX_QUEUES {
                 // Find and evict the oldest queue (by creation time).
                 // R169-10: SAME-NS filter — only the arriving fragment's OWN
@@ -903,6 +951,10 @@ impl FragmentCache {
                     return Err(FragmentDropReason::GlobalQueueLimit);
                 }
             }
+            // R177-3-CODEX: Recompute frag/byte budgets after all queue evictions (queue count already refreshed above)
+            let current_frags = self.stats.buffered_fragments.load(Ordering::Relaxed) as usize;
+            let current_bytes = self.stats.buffered_bytes.load(Ordering::Relaxed) as usize;
+
             if current_frags >= GLOBAL_MAX_FRAGS {
                 self.stats
                     .global_limit_drops
