@@ -1,12 +1,8 @@
 [toolchain]
-# M5-1 (reproducibility pin) ATTEMPTED + REVERTED 2026-06-16: pinning a dated nightly
-# (nightly-2025-12-08 = rustc 1.94.0-nightly ba2142a19) is correct in principle, but the
-# authoritative remote build host (40c-devbox-ts) CANNOT install that dated channel — its
-# rustup repeatedly leaves the `rustc` component "not applicable" (mismatched-date
-# components on a slow/flaky dist link), so the default `make build` fails under the pin.
-# A reproducibility pin the build env cannot install is net-negative, so this stays on the
-# working rolling channel until the remote toolchain fetch is fixed (a remote-env task).
-# The workspace IS verified green on this 1.94.0-nightly series (rolling 37aa2135b).
-channel = "nightly"
+# Pin to nightly-2025-12-08 to avoid x86_64 crate Step trait breakage in newer nightlies.
+# The x86_64-0.15.4 crate's Step impl is missing forward_overflowing/backward_overflowing
+# methods added in recent nightly (2026-07-10 CI failure). Remote build host (40c-devbox-ts)
+# already runs rustc 1.94.0-nightly (37aa2135b 2025-12-08), which builds clean.
+channel = "nightly-2025-12-08"
 components = ["rust-src", "llvm-tools-preview"]
 targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]
