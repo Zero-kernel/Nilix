@@ -465,6 +465,22 @@ fn signal_is_deliverable(
 /// M0-5 sub-slice 1b: does `pid` have a deliverable HANDLER signal pending? Called by the
 /// blocking wait sites to decide an EINTR-wake. Lock-free fast-path FIRST (no proc lock on
 /// the no-handler musl/native boot — a single relaxed load), then ONE proc-lock snapshot.
+///
+/// # Lock Contract (R177-D4)
+///
+/// **Use this variant when the Process lock is NOT held by the caller.**
+///
+/// This function internally acquires the Process lock via `get_process(pid).lock()`.
+/// If called while already holding the Process lock for `pid`, it will **deadlock** (same-thread
+/// re-entry of a non-reentrant lock).
+///
+/// **When you already hold `&Process` or `&mut Process`:** Use [`has_deliverable_signal_locked`]
+/// instead to avoid the re-lock. Common scenarios:
+/// - ppoll/pselect6 sigmask restore (syscall.rs:18623) — already holds proc guard for sigmask stash
+/// - should_abort_pending_block callsites — already inside the Blocked-commit critical section
+/// - Signal delivery epilogues — guard held to update in_signal_handler / blocked / pending
+///
+/// See [`has_deliverable_signal_locked`] for the lock-free variant when the guard is already held.
 pub fn has_deliverable_signal(pid: ProcessId) -> bool {
     if !any_handler_installed() {
         return false;
@@ -484,6 +500,30 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
 /// `has_deliverable_signal`. Handler-only (uncatchables/kills excluded via
 /// `signal_is_deliverable`, in-handler-gated); the monotonic fast-path is kept so
 /// the no-handler caller pays a single relaxed load.
+///
+/// # Lock Contract (R177-D4)
+///
+/// **Use this variant when the Process lock IS already held by the caller.**
+///
+/// This function does NOT acquire any locks — it reads signal state directly from the provided
+/// `&Process` guard. The caller MUST hold the Process lock for the task being checked, and that
+/// lock MUST cover the entire read of `pending_signals`, `blocked`, `in_signal_handler`, and
+/// `sigactions` to ensure a consistent snapshot (no TOCTOU between fields).
+///
+/// **When you do NOT hold `&Process`:** Use [`has_deliverable_signal`] instead, which acquires
+/// the lock internally. Calling this function without holding the lock is a **data race** (reads
+/// mutable Process fields without synchronization).
+///
+/// # Example (from ppoll sigmask restore, syscall.rs:18623)
+///
+/// ```ignore
+/// let mut proc = process_arc.lock();  // Acquire Process lock
+/// if has_deliverable_signal_locked(&proc) {  // No re-lock — reads from held guard
+///     // ... EINTR path
+/// }
+/// ```
+///
+/// See [`has_deliverable_signal`] for the self-locking variant when no guard is held.
 pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
     if !any_handler_installed() {
         return false;
