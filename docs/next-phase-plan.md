@@ -1,8 +1,88 @@
 # Zero-OS Next-Phase Kernel Development Plan
 
-**Date:** 2026-07-06
-**Version:** 15.9
-**Based on:** 176 Security Audit Rounds + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.8
+**Date:** 2026-07-10
+**Version:** 15.11
+**Based on:** 177 Security Audit Rounds (R177 re-run) + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.10
+
+---
+
+## 🚨 R177 (2026-07-09, RE-RUN complete 2026-07-10) — U.S2/U.S3 Cap Lifecycle Audit: ✅ 0 CRITICAL, 0 HIGH, 0 MEDIUM (6/6 FIXED + 2 Codex corrections)
+
+**Round 177 was RE-RUN** (the first pass was incomplete: Design Workflow abandoned mid-run,
+Implementation Workflow deferred, and R177-1 rated CRITICAL on a premise the re-run falsifies).
+The full 7-phase pipeline ran: 7-pillar Design Workflow + 10-subsystem Implementation Workflow
+(660+ read-only Opus-4.8 agents) + the orchestrator's independent file:line re-read (the
+R169-validated backstop). **Implementation:** 0 CRITICAL, 1 HIGH (R177-1, recalibrated), 2 MEDIUM,
+1 LOW actionable, 1 INFO. **Design:** 2 D3, 1 D4 (0 D0/D1). **The U.S2-SLICE-3A / U.S3 fd→CapId cap lifecycle is SOUND.**
+
+**Status (2026-07-10):** ✅ **ALL 6 ACTIONABLE FINDINGS FIXED** (R177-1 HIGH, R177-2/3 MEDIUM, R177-L1 LOW, D4 doc, D3 hardening). **Codex MCP bidirectional review found 2 implementation bugs in the fixes** — both CORRECTED 2026-07-10 (R177-3 stale budget snapshots, R177-1 test panic). Build PASS, Lint 4/4 PASS. 1.0-Preview gate UNBLOCKED. Full report: `docs/review/qa-2026-07-09-v2.md`, Codex audit: `docs/review/codex-audit-remaining-issues.md`.
+
+### R177-1 (HIGH, recalibrated CRITICAL→HIGH): CapEntry::decrement_refcount underflow hardening ✅ FIXED
+
+**Severity:** HIGH (defense-in-depth) — **File:** `kernel/cap/types.rs:539-541`  
+**Status:** ✅ FIXED (2026-07-10, targeted: saturating + tripwire + self-test)
+
+**Original code:**
+```rust
+pub fn decrement_refcount(&self) -> bool {
+    let prev = self.refcount.fetch_sub(1, Ordering::SeqCst);  // wraps 0→usize::MAX
+    prev == 1
+}
+```
+
+**Why HIGH not CRITICAL (the incomplete pass's premise, falsified by re-read):** the prior CRITICAL
+rested on a "TOCTOU between generation-check and decrement" enabling a stale-CapId slot-reuse UAF.
+FALSIFIED: `CapTable::decrement_refcount` (`cap/lib.rs:366-372`) holds `inner.lock()` across BOTH
+`lookup` (generation check) AND `entry.decrement_refcount()` — one critical section, no window;
+`lookup` returns `Err(InvalidCapId)` on generation mismatch, so a stale/reused-slot CapId cannot
+reach the decrement. Generation monotonicity + the single-owner teardown funnel + `PipeHandle::Drop`
+not touching the cap_table close the whole reachable class. **No reachable double-decrement in the
+current tree.** Residual real risk = latent slot-leak DoS IF a future path ever double-decrements.
+
+**Fix applied (2026-07-10):**
+```rust
+pub fn decrement_refcount(&self) -> bool {
+    let prev = self.refcount.fetch_update(SeqCst, SeqCst, |c| Some(c.saturating_sub(1)))
+        .unwrap(); // closure returns Some → never Err
+    debug_assert!(prev != 0, "CapEntry refcount underflow: double-decrement");
+    prev == 1
+}
+```
+Added `test_refcount_saturating_decrement` self-test validating: (1) refcount 1→0 returns true, (2) second decrement saturates at 0 (no wrap), (3) slot remains revocable. Eliminates the underflow-wrap vulnerability **class** for all future edits. **Codex correction (2026-07-10):** Original test panicked in debug builds due to debug_assert; split into two tests with proper #[cfg_attr(debug_assertions, should_panic)] handling. Build/lint PASS. Files: `kernel/cap/types.rs:539-545`, `kernel/cap/lib.rs:867-918`.
+
+### R177 lower-severity (tracked)
+- **R177-2 (MED):** ✅ FIXED (2026-07-10) — `sys_writev` short-write continuation (syscall.rs:9149-9157). Added `if written < entry.iov_len { break; }` after successful write, aligning with POSIX writev semantics (return partial count on short write). Harmless for regular files; fixes correctness edge for non-blocking sockets/pipes.
+- **R177-3 (MED):** ✅ FIXED (2026-07-10) — `fragment.rs` per-ns quota LRU eviction (fragment.rs:817-876). Added same-namespace LRU eviction to per-ns queue cap check, mirroring global path behavior. Namespace at local cap now evicts its own oldest queue before rejecting. Cross-namespace isolation preserved. **Codex correction (2026-07-10):** Budget snapshots (nb, current_queues, current_frags, current_bytes) were captured BEFORE eviction but used AFTER, causing spurious rejections or double-evictions. Fixed: recompute nb after per-ns eviction (line 877), current_queues before global check (line 900), current_frags/bytes after all evictions (line 952).
+- **R177-L1 (LOW):** ✅ FIXED (2026-07-10) — `sys_connect` blocking loop tight-spins without `hlt` on lost SYN (syscall.rs:16556-16560). Replaced `pause` + `force_reschedule()` with `reschedule_if_needed()` + `hlt`, matching poll/nanosleep pattern. Defense-in-depth against lost-SYN scenarios not covered by TCP RTO logic.
+- **R177-L2 (INFO, forward):** wire `FileHandle`/`Ext2File` `cap_id()` when U.S2-SLICE-3B lands
+  (RegularFile caps unallocated today → no bug now, required then).
+- **D3-FORK-MULTICTRL-ROLLBACK:** fork multi-controller cgroup rollback holds Process lock into
+  cleanup (1-bug-away; needs socket fd + blocking CLONE_THREAD peer). Add lock-order test.
+- **D4-SIGNAL-LOCK-CONTRACT:** ✅ DOC ADDED (2026-07-10) — documented the Process-lock contract on `has_deliverable_signal` vs `has_deliverable_signal_locked` (signal.rs:465-497). Fix already present at syscall.rs:18623; API documentation now explains when to use each variant and the deadlock risk of calling the wrong one.
+
+### R177 method note (audit skill lesson)
+The Implementation Workflow find stage over-generated (8 "CRITICAL" + 29 "HIGH" candidates); the
+2-lens verify propagated the over-ratings because it judged finding TEXT, not fresh code. The
+orchestrator's independent file:line re-read falsified every headline CRITICAL (single-lock decrement,
+CLONE_THREAD increment pre-visibility, elf alignment-only wrapping_add, mm mature ledger). **The
+re-read — not verify vote counts — is the real backstop (R169 reaffirmed).** Also: the loop-until-dry
+MAX_ROUNDS was too loose for a 10-subsystem run (789 agents / 43.5M tokens, completeness tail did not
+self-terminate); harvested at 660 completed agents. Skill fix: tighten MAX_ROUNDS / completeness-round
+cap for large partitions.
+
+**VD Skill:** VD-18 (NEW): Atomic refcount underflow (fetch_sub without saturation/checked arithmetic)
+— now scoped as a defense-in-depth/hardening detector, NOT an auto-CRITICAL (severity depends on a
+REACHABLE double-decrement, which the orchestrator re-read must confirm before ranking above HIGH).
+
+**Codex MCP Comprehensive Audit (2026-07-10):** After verifying R177 fixes, Codex performed a full-codebase audit for remaining MEDIUM/LOW issues to reach 99%+ test coverage. Found **19 actionable issues** (9 MEDIUM, 10 LOW) focused on resource management, error handling, API safety, and test coverage gaps. Key findings: RAMFS write/truncate can leak quota or panic on OOM (needs transactional allocation), IOMMU mapping staging is infallible (needs try_reserve_exact), IPC sender allowlists unbounded, pipe capacity accepts zero/unbounded values, EXT2/audit/livepatch use infallible allocations despite errno APIs, IPI handler table has unsynchronized static mut, 15+ placeholder tests remain unimplemented (context-switch, futex, pipe-EINTR, VFS, poll/select edge cases). Detailed findings + priority order in `docs/review/codex-audit-remaining-issues.md`. Estimated total effort: ~700-1000 LOC production + ~1500-2000 LOC tests. Recommended immediate action: fix MEDIUM-1 through MEDIUM-6 (all "Small" effort, high safety impact), then P1 robustness fixes, then convert placeholders to executable tests.
+
+---
+
+## 🗄️ R177 (2026-07-09) — SUPERSEDED incomplete first pass (kept for history)
+
+**The original R177 (`docs/review/qa-2026-07-09.md`) was INCOMPLETE** — Design Workflow abandoned
+mid-run, Implementation Workflow deferred, R177-1 over-rated CRITICAL. Superseded by the re-run
+above (`qa-2026-07-09-v2.md`). Do NOT act on the "1 CRITICAL / streak BROKEN / RE-BLOCKED" framing.
 
 ---
 
