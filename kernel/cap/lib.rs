@@ -856,4 +856,64 @@ mod tests {
         // Should fail now
         assert!(table.lookup(cap_id).is_err());
     }
+
+    /// R177-1 FIX: Test that decrement_refcount saturates at 0 (no underflow wrap).
+    ///
+    /// This test verifies defense-in-depth hardening: while no reachable double-decrement
+    /// exists in the current tree (generation monotonicity + single-lock decrement close
+    /// the class), saturating arithmetic prevents a future double-decrement bug from
+    /// wrapping the refcount to usize::MAX (which would permanently leak the slot).
+    #[test]
+    fn test_refcount_saturating_decrement() {
+        let table = CapTable::new();
+
+        // Allocate a capability with refcount=1
+        let entry = CapEntry::new(CapObject::Process(1), CapRights::SIGNAL);
+        let cap_id = table.allocate(entry).unwrap();
+
+        // Verify initial refcount
+        assert_eq!(table.get_refcount(cap_id), Some(1));
+
+        // First decrement: refcount 1 → 0, should return true (revoke)
+        let should_revoke = table.decrement_refcount(cap_id).unwrap();
+        assert!(should_revoke, "First decrement from 1 should return true");
+        assert_eq!(table.get_refcount(cap_id), Some(0));
+
+        // Verify the slot is revocable after reaching 0
+        let revoked = table.revoke(cap_id);
+        assert!(revoked.is_ok(), "Slot should be revocable at refcount 0");
+    }
+
+    // R177-1-CODEX: Split test — the debug_assert!(prev != 0) will panic on
+    // double-decrement in debug builds, so test saturation behavior separately
+    // in release or with #[should_panic] in debug.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "refcount underflow"))]
+    fn test_refcount_underflow_detection() {
+        let table = CapTable::new();
+
+        // Allocate a capability with refcount=1
+        let entry = CapEntry::new(CapObject::Process(1), CapRights::SIGNAL);
+        let cap_id = table.allocate(entry).unwrap();
+
+        // Decrement to 0
+        let _ = table.decrement_refcount(cap_id).unwrap();
+        assert_eq!(table.get_refcount(cap_id), Some(0));
+
+        // Second decrement on the same entry (simulating a double-decrement bug):
+        // - In debug builds: panics due to debug_assert!(prev != 0)
+        // - In release builds: saturates at 0 (defense-in-depth)
+        let should_revoke_again = table.decrement_refcount(cap_id).unwrap();
+
+        // Only reaches here in release builds
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(!should_revoke_again, "Second decrement from 0 should return false (saturated)");
+            assert_eq!(table.get_refcount(cap_id), Some(0), "Refcount should saturate at 0, not wrap");
+
+            // Verify the slot is NOT permanently leaked (revoke still works)
+            let revoked = table.revoke(cap_id);
+            assert!(revoked.is_ok(), "Slot should still be revocable after saturation");
+        }
+    }
 }

@@ -535,9 +535,25 @@ impl CapEntry {
 
     /// U.S2-SLICE-2: Decrement reference count (close).
     /// Returns true if refcount reached 0 (should revoke).
+    ///
+    /// R177-1 FIX: Uses saturating decrement to prevent underflow wrap (0 - 1 → usize::MAX).
+    /// While no reachable double-decrement exists in the current tree (generation monotonicity
+    /// + single-lock decrement + teardown funnel close the class), saturating arithmetic
+    /// provides defense-in-depth hardening against future edits. A debug_assert tripwire
+    /// catches any double-decrement during development.
     #[inline]
     pub fn decrement_refcount(&self) -> bool {
-        let prev = self.refcount.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.refcount.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |c| Some(c.saturating_sub(1))
+        ).unwrap(); // closure returns Some → never Err
+
+        // R177-1 FIX: Debug tripwire — double-decrement should never occur.
+        // The single-lock wrapper (lib.rs:366-372) + generation-check guard prevent
+        // stale CapIds from reaching here, but this catches any future bugs early.
+        debug_assert!(prev != 0, "CapEntry refcount underflow: double-decrement detected");
+
         prev == 1
     }
 
