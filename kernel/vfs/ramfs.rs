@@ -84,6 +84,43 @@ fn quota_release(bytes: usize) {
     });
 }
 
+/// Transactional global quota charge.
+///
+/// R-MEDIUM-1 / R-MEDIUM-2 fix: RAMFS growth paths charge quota FIRST via this
+/// guard, then perform fallible in-place capacity reservation. The guard automatically
+/// releases its charge unless the reservation and resize succeed and `commit()` is called.
+/// This ordering prevents quota leaks, OOM panics, and uncharged-capacity bypasses.
+#[must_use = "the quota charge rolls back unless committed"]
+struct QuotaGuard {
+    bytes: usize,
+    committed: bool,
+}
+
+impl QuotaGuard {
+    fn try_new(bytes: usize) -> Result<Self, FsError> {
+        if !quota_try_alloc(bytes) {
+            return Err(FsError::NoSpace);
+        }
+
+        Ok(Self {
+            bytes,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for QuotaGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            quota_release(self.bytes);
+        }
+    }
+}
+
 /// Get current total bytes used by ramfs
 #[allow(dead_code)]
 pub fn ramfs_bytes_used() -> usize {
@@ -705,16 +742,23 @@ impl Inode for RamFsInode {
                     return Err(FsError::NoSpace);
                 }
 
-                // Check global quota for new bytes needed
+                // R-MEDIUM-1 fix: Transactional in-place expansion - charge quota FIRST,
+                // reserve additional capacity fallibly IN-PLACE, resize, commit immediately.
+                // This prevents all quota bypass paths: if quota fails, no allocation is
+                // attempted; if allocation fails, guard auto-rolls back quota; no transient
+                // capacity amplification from detached buffers.
                 if required_len > current_len {
                     let additional_bytes = required_len - current_len;
-                    if !quota_try_alloc(additional_bytes) {
-                        return Err(FsError::NoSpace);
-                    }
+                    let guard = QuotaGuard::try_new(additional_bytes)?;
+
+                    // Reserve additional capacity in-place (fallible)
+                    data.try_reserve_exact(additional_bytes)
+                        .map_err(|_| FsError::NoMem)?;
                     data.resize(required_len, 0);
+                    guard.commit();
                 }
 
-                // Write data
+                // Write data (in-place, no allocation)
                 data[offset..offset + data_in.len()].copy_from_slice(data_in);
 
                 // Update metadata
@@ -744,20 +788,36 @@ impl Inode for RamFsInode {
                 let mut data = data.write();
                 let current_len = data.len();
 
-                // Handle quota for expansion or shrinking
+                // R-MEDIUM-2 fix: Transactional in-place expansion - charge quota FIRST,
+                // reserve additional capacity fallibly IN-PLACE, resize, commit immediately.
+                // Shrinking uses detached replacement to release capacity, not just length.
                 if new_len > current_len {
-                    // Expanding: try to allocate additional bytes
                     let additional_bytes = new_len - current_len;
-                    if !quota_try_alloc(additional_bytes) {
-                        return Err(FsError::NoSpace);
-                    }
+                    let guard = QuotaGuard::try_new(additional_bytes)?;
+
+                    // Reserve additional capacity in-place (fallible)
+                    data.try_reserve_exact(additional_bytes)
+                        .map_err(|_| FsError::NoMem)?;
+                    data.resize(new_len, 0);
+                    guard.commit();
                 } else if new_len < current_len {
-                    // Shrinking: release bytes back to quota
                     let freed_bytes = current_len - new_len;
+
+                    if new_len == 0 {
+                        // Truncate to zero: replace with empty Vec to release all capacity
+                        *data = Vec::new();
+                    } else {
+                        // Shrink with detached replacement to release capacity, not just length
+                        let mut new_data = Vec::new();
+                        new_data.try_reserve_exact(new_len)
+                            .map_err(|_| FsError::NoMem)?;
+                        new_data.resize(new_len, 0);
+                        new_data.copy_from_slice(&data[..new_len]);
+                        *data = new_data;
+                    }
+
                     quota_release(freed_bytes);
                 }
-
-                data.resize(new_len, 0);
 
                 // Update metadata
                 let mut meta = self.meta.write();
