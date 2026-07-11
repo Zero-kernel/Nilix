@@ -30,6 +30,9 @@ const MAX_MESSAGES_PER_ENDPOINT: usize = 64;
 /// 每个进程可注册的最大端点数
 const MAX_ENDPOINTS_PER_PROCESS: usize = 32;
 
+/// 每个端点可显式授权的最大发送者数量（所有者自动包含）
+const MAX_ALLOWED_SENDERS: usize = 32;
+
 /// 单条消息最大数据长度（字节）
 const MAX_MESSAGE_SIZE: usize = 4096;
 
@@ -68,6 +71,10 @@ pub enum IpcError {
     MessageTooLarge,
     /// 端点数量超限
     TooManyEndpoints,
+    /// 端点发送者白名单数量超限
+    TooManySenders,
+    /// IPC 操作所需内存分配失败
+    NoMemory,
     /// R105-5 FIX: 全局端点 ID 空间耗尽
     EndpointIdExhausted,
     /// M0-5 1b-1b: a pending kill or a deliverable HANDLER signal interrupted a blocking
@@ -130,8 +137,26 @@ impl Endpoint {
     ///
     /// R106-1 FIX: 接受预查询的 generation 值，避免在持有 ENDPOINTS 锁时
     /// 访问 PROCESS_TABLE（防止锁序反转死锁）。
-    fn grant_access(&mut self, pid: ProcessId, generation: u64) {
+    ///
+    /// MEDIUM-5 FIX: 强制执行 MAX_ALLOWED_SENDERS 限制，防止授权后无界增长。
+    /// 更新现有发送者的 generation 总是允许的（不增加计数）。
+    /// 所有者自动包含，限制适用于显式授权的非所有者发送者。
+    fn grant_access(&mut self, pid: ProcessId, generation: u64) -> Result<(), IpcError> {
+        // 所有者总是允许（已在构造时添加），不计入显式授权配额
+        if pid == self.owner {
+            self.allowed_senders.insert(pid, generation);
+            return Ok(());
+        }
+
+        // 如果是新增授权（而非更新现有），检查是否超过限制
+        // allowed_senders.len() 包含所有者，所以上限是 MAX_ALLOWED_SENDERS + 1
+        if !self.allowed_senders.contains_key(&pid)
+            && self.allowed_senders.len() >= MAX_ALLOWED_SENDERS + 1
+        {
+            return Err(IpcError::TooManySenders);
+        }
         self.allowed_senders.insert(pid, generation);
+        Ok(())
     }
 
     /// 撤销另一个进程的发送权限
@@ -305,19 +330,41 @@ pub fn init() {
 /// # Errors
 ///
 /// * `NoCurrentProcess` - 无当前进程上下文
+/// * `ProcessNotFound` - 白名单中的进程不存在
 /// * `TooManyEndpoints` - 端点数量超过限制
+/// * `TooManySenders` - 发送者白名单数量超过限制
+/// * `NoMemory` - 无法为发送者白名单分配内存
 pub fn register_endpoint(allowed_senders: &[ProcessId]) -> Result<EndpointId, IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
     let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
+    // MEDIUM-5 FIX: 限制发送者白名单大小，防止无界分配
+    if allowed_senders.len() > MAX_ALLOWED_SENDERS {
+        return Err(IpcError::TooManySenders);
+    }
+
     // R106-1 FIX: 在获取 ENDPOINTS 锁之前解析所有 sender 的 generation，
     // 避免在持有 ENDPOINTS 锁时访问 PROCESS_TABLE（防止锁序反转死锁）。
-    let mut resolved_senders = Vec::with_capacity(allowed_senders.len());
+    let mut resolved_senders = Vec::new();
+    resolved_senders
+        .try_reserve_exact(allowed_senders.len())
+        .map_err(|_| IpcError::NoMemory)?;
+
     for &pid in allowed_senders {
         if pid == owner {
             continue; // 所有者已在 Endpoint::new() 中自动添加
         }
+
+        // MAX_ALLOWED_SENDERS bounds this linear scan. Reusing resolved_senders
+        // avoids a second allocation and deduplicates before generation lookup.
+        if resolved_senders
+            .iter()
+            .any(|&(resolved_pid, _)| resolved_pid == pid)
+        {
+            continue;
+        }
+
         let proc_arc = process::get_process(pid).ok_or(IpcError::ProcessNotFound)?;
         let gen = proc_arc.lock().generation;
         resolved_senders.push((pid, gen));
@@ -434,6 +481,10 @@ pub fn receive_message(endpoint_id: EndpointId) -> Result<Option<ReceivedMessage
 ///
 /// * `endpoint_id` - 端点ID
 /// * `pid` - 要授权的进程ID
+///
+/// # Errors
+///
+/// * `TooManySenders` - 端点授权列表已满（更新现有授权不受限制）
 pub fn grant_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
     let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
@@ -455,8 +506,7 @@ pub fn grant_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcEr
         return Err(IpcError::AccessDenied);
     }
 
-    endpoint.grant_access(pid, target_generation);
-    Ok(())
+    endpoint.grant_access(pid, target_generation)
 }
 
 /// 撤销进程发送权限

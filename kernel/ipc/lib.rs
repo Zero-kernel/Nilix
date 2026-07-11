@@ -332,6 +332,8 @@ fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
         PipeError::Closed => SyscallError::EPIPE,
         PipeError::InvalidPipe | PipeError::InvalidOperation => SyscallError::EBADF,
         PipeError::PipeIdExhausted => SyscallError::ENOMEM,
+        PipeError::InvalidCapacity => SyscallError::EINVAL,
+        PipeError::NoMemory => SyscallError::ENOMEM,
         PipeError::NoCurrentProcess => SyscallError::ESRCH,
         // R171-F2: pending kill interrupted the blocking pipe op -> EINTR.
         PipeError::Interrupted => SyscallError::EINTR,
@@ -350,7 +352,9 @@ pub fn ipc_error_to_syscall(err: IpcError) -> SyscallError {
         IpcError::AccessDenied => SyscallError::EACCES,
         IpcError::QueueFull => SyscallError::EAGAIN,
         IpcError::MessageTooLarge => SyscallError::ENOMEM,
+        IpcError::TooManySenders => SyscallError::E2BIG,
         IpcError::TooManyEndpoints | IpcError::EndpointIdExhausted => SyscallError::EMFILE,
+        IpcError::NoMemory => SyscallError::ENOMEM,
         // M0-5 1b-1b: a pending kill or a deliverable HANDLER signal interrupted the
         // blocking receive (the M0-5 1b wake) → EINTR, not the imprecise ESRCH.
         IpcError::Interrupted => SyscallError::EINTR,
@@ -380,6 +384,16 @@ pub fn run_ipc_eintr_self_test() {
         ipc_error_to_syscall(IpcError::EndpointNotFound),
         SyscallError::ENOENT,
         "1b-1b: EndpointNotFound errno unchanged"
+    );
+    assert_eq!(
+        ipc_error_to_syscall(IpcError::TooManySenders),
+        SyscallError::E2BIG,
+        "oversized IPC sender allowlists must map to E2BIG"
+    );
+    assert_eq!(
+        ipc_error_to_syscall(IpcError::NoMemory),
+        SyscallError::ENOMEM,
+        "IPC sender allowlist allocation failure must map to ENOMEM"
     );
 }
 
