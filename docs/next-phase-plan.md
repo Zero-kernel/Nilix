@@ -1,8 +1,92 @@
 # Zero-OS Next-Phase Kernel Development Plan
 
 **Date:** 2026-07-10
-**Version:** 15.11
-**Based on:** 177 Security Audit Rounds (R177 re-run) + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.10
+**Version:** 15.12
+**Based on:** 178 Security Audit Rounds (R178 full audit) + roadmap.md + roadmap-enterprise.md + next-phase-plan.md v15.11
+
+---
+
+## R178 (2026-07-10) — FULL KERNEL AUDIT: 4 CRITICAL + 7 HIGH, 1 D0 + 2 D1 — 1.0-Preview BLOCKED
+
+Full report: `docs/review/qa-2026-07-10.md`. The migrated `kernel-security-audit` workflow was
+used with the user-authorized omission of Codex-MCP self-cross-audit. All conflict-free phases ran;
+two native fresh-code skeptic passes plus the orchestrator's direct file:line re-read replaced that
+single step. All seven design pillars and all ten production-kernel implementation partitions were
+source-accounted.
+
+**Implementation:** 35 new findings (4 CRITICAL / 7 HIGH / 18 MEDIUM / 6 LOW).
+**Design:** 10 findings (1 D0 / 2 D1 / 7 D2).
+**Gate:** **BLOCKED** — 4 CRITICAL, 7 HIGH, 1 D0, and 2 D1 open; zero-HIGH streak reset to 0.
+**Prior fixes:** all R177 fixes and the RAMFS/IOMMU/IPC/pipe/ext2-BGDT remediation changes verified
+present and sound.
+
+### P0 — R178 release blockers
+
+1. **R178-1 / D1-ARC-ENTRY-STATE — Ring-3 fatal IRQ/exception scheduling with user GS.**
+   Timer and ordinary exception entry do not SWAPGS, but fatal paths call the scheduler; context
+   switch assembly then uses attacker-controlled `gs:[percpu_*]` state. Build one CPL3 entry
+   contract (kernel GS + kernel CR3 + balanced return) and executable
+   `ARCH_SET_GS + ud2/div0/pending-kill` tests.
+2. **R178-2 / D0-ARC-PREEMPT — no IRQ-return preemptive scheduling.**
+   `IRQ_RESCHED_PENDING` is consumed only in process context; the timer restores registers and
+   `iretq`s. Add a full-register safe IRQ-return switch before any preview claim.
+3. **R178-3 — timer IRQ self-deadlocks on current PCB.**
+   The IRQ blocking-locks the resident current PCB while IRQ-enabled `fork` can hold it through a
+   large COW walk. Move all PCB/queue locking and starvation scans out of hard IRQ.
+4. **R178-4 — OOM recovery re-enters caller-held PCB locks.**
+   Physical allocation failure synchronously snapshots processes; `fork` may already hold the
+   parent/child PCB. Replace the Vec callback with streaming, allocation-free, lock-safe victim
+   selection.
+
+### P1 — R178 HIGH findings
+
+| ID | Finding | Required outcome |
+|---|---|---|
+| R178-5 | stale scheduler priority buckets + PID-order starvation | rebucket all mutations or use per-priority round-robin; three-task progress test |
+| R178-6 | COW refcount B-tree insert after parent PTE mutation | reserve/stage refcount metadata before point of no return |
+| R178-7 | remote conntrack infallible allocation | fallible packet admission + heap-derived byte budgets |
+| R178-8 | PI-futex 4096-bucket cap exceeds 1 MiB heap | fallible bucket creation + byte cap + allocation-free cleanup |
+| R178-9 | ext2 indirect-block failed writes leak persistent blocks | reject before allocation or transactional rollback |
+| R178-10 | delegated `cpu.max` write amplifies into `Vec<&str>` | parse at most three tokens without allocation |
+| R178-11 | page-cache metadata/cap exceeds heap | fallible insertion, reclaim-first, byte cap, cgroup ownership |
+
+### R178 design actions
+
+1. **D0-ARC-PREEMPT:** resolve with R178-2; roadmap readiness text is false until an executable
+   syscall-free two-task preemption test passes.
+2. **D1-ARC-ENTRY-STATE:** specify and enforce GS/CR3 state for syscall, IRQ, exception, NMI, and
+   scheduler entry/exit branches.
+3. **D1-ISO-IOMMU-DOMAIN:** replace shared ordinary-device domain 0 with per-device/IOMMU-group
+   domains and domain-aware DMA allocation.
+4. **D2:** mandatory-audit fail-open policy, meaningful CI gates, ext2 recovery, lifetime-safe BIO,
+   namespace-aware LSM subjects, post-publication allocation discipline, and page-cache ownership.
+
+### R178 risk assessment
+
+| Risk | Severity | Trigger | Mitigation/gate |
+|---|---|---|---|
+| attacker-controlled GS reaches context-switch state | CRITICAL / D1 | fatal Ring-3 exception or pending kill | P0 entry trampoline + negative tests |
+| scheduler cooperation dependency | CRITICAL / D0 | syscall-free loop | P0 IRQ-return preemption |
+| hard-IRQ PCB lock re-entry | CRITICAL | timer during lock-held syscall | atomic tick + deferred process work |
+| OOM self-deadlock | CRITICAL | physical failure inside lock-held allocation | streaming lock-safe OOM |
+| heap caps exceed 1 MiB reality | HIGH / D2 | local/remote retained metadata | byte budgets + fallible admission |
+| cross-device DMA visibility | D1 | compromised PCI device | per-IOMMU-group domains |
+| false-green test gate | D2 | `make test` masks failure / CI omits suites | failure propagation + executable gates |
+
+### R178 dependency and verification order
+
+`ENTRY-STATE (R178-1) -> IRQ-RETURN PREEMPTION (R178-2) -> TIMER IRQ DE-LOCKING (R178-3/12)
+-> OOM REDESIGN (R178-4) -> scheduler fairness (R178-5) -> allocation-budget HIGH cluster
+(R178-6..11) -> MEDIUM/LOW cleanup -> R179 focused verification -> clean R180+ streak.`
+
+**Remote evidence:** `make build` PASS; `make lint` 4/4 PASS; `make boot-check` PASS with 0 NX
+violations; `make test-smp` PASS (25 passed / 31 deferred / 0 failed). `make test` is **not** a
+trustworthy pass: its target masks failures and this run timed out before a test summary. Host
+coverage/capability tests are invalid (duplicate `_start` / privileged `cli` SIGSEGV).
+
+**Skill evolution:** audit-v7 -> audit-v8; probe-v5 -> probe-v6. Extended VD-01/VD-05/VD-16 and
+added VD-19 (failure-sentinel polarity with mandatory reachability calibration). Hard probe now
+covers scheduling from raw CPL3 entry without SWAPGS; easy probe covers post-PTE COW allocation.
 
 ---
 
@@ -74,11 +158,83 @@ cap for large partitions.
 — now scoped as a defense-in-depth/hardening detector, NOT an auto-CRITICAL (severity depends on a
 REACHABLE double-decrement, which the orchestrator re-read must confirm before ranking above HIGH).
 
-**Codex MCP Comprehensive Audit (2026-07-10):** After verifying R177 fixes, Codex performed a full-codebase audit for remaining MEDIUM/LOW issues to reach 99%+ test coverage. Found **19 actionable issues** (9 MEDIUM, 10 LOW) focused on resource management, error handling, API safety, and test coverage gaps. Key findings: RAMFS write/truncate can leak quota or panic on OOM (needs transactional allocation), IOMMU mapping staging is infallible (needs try_reserve_exact), IPC sender allowlists unbounded, pipe capacity accepts zero/unbounded values, EXT2/audit/livepatch use infallible allocations despite errno APIs, IPI handler table has unsynchronized static mut, 15+ placeholder tests remain unimplemented (context-switch, futex, pipe-EINTR, VFS, poll/select edge cases). Detailed findings + priority order in `docs/review/codex-audit-remaining-issues.md`. Estimated total effort: ~700-1000 LOC production + ~1500-2000 LOC tests. Recommended immediate action: fix MEDIUM-1 through MEDIUM-6 (all "Small" effort, high safety impact), then P1 robustness fixes, then convert placeholders to executable tests.
+**Codex MCP Comprehensive Audit (2026-07-10):** After verifying R177 fixes, Codex performed a full-codebase audit for remaining MEDIUM/LOW issues to reach 99%+ test coverage. Found **19 actionable issues** (9 MEDIUM, 10 LOW) focused on resource management, error handling, API safety, and test coverage gaps. Key findings: RAMFS write/truncate can leak quota or panic on OOM (MEDIUM-1/2 FIXED 2026-07-10), IOMMU mapping staging is infallible + intermediate table leak (MEDIUM-3/4 FIXED 2026-07-10), IPC sender allowlists unbounded (MEDIUM-5 FIXED 2026-07-10), pipe capacity accepts zero/unbounded values, EXT2/audit/livepatch use infallible allocations despite errno APIs, IPI handler table has unsynchronized static mut, 15+ placeholder tests remain unimplemented (context-switch, futex, pipe-EINTR, VFS, poll/select edge cases). Detailed findings + priority order in `docs/review/codex-audit-remaining-issues.md`. **Progress: 5/9 MEDIUM fixed (1/2 RAMFS quota, 3/4 IOMMU transactional, 5 IPC sender allowlist)**, 4 MEDIUM + 10 LOW remaining. Estimated remaining effort: ~250-350 LOC production + ~1200-1500 LOC tests. Recommended immediate action: fix MEDIUM-6 through MEDIUM-9 (all "Small" effort, high safety impact), then P1 robustness fixes, then convert placeholders to executable tests.
 
 ---
 
 ## 🗄️ R177 (2026-07-09) — SUPERSEDED incomplete first pass (kept for history)
+
+---
+
+## ✅ MEDIUM-5 (2026-07-10) — IPC Sender Allowlist Unbounded Allocation ✅ FIXED
+
+**Severity:** MEDIUM (Resource management / API safety)  
+**Status:** ✅ FIXED (2026-07-10, kernel-next-phase)
+
+### Finding
+
+**Location:** `kernel/ipc/ipc.rs:309, 316, 143`
+
+1. **Registration path:** `register_endpoint()` accepts arbitrarily large `allowed_senders` slice, calls infallible `Vec::with_capacity()` before limit checks
+2. **Mutation path:** `grant_access()` bypassed limit, allowing unbounded post-registration growth
+
+**Root cause:** Unbounded per-endpoint authorization set across entire lifecycle (registration + mutation)
+
+### Fix Applied (2026-07-10)
+
+**Targeted fix with full lifecycle coverage:**
+
+1. **Added constant:** `MAX_ALLOWED_SENDERS = 32` (owner + 32 explicit senders)
+2. **Input validation:** Reject if `allowed_senders.len() > MAX_ALLOWED_SENDERS` before allocation
+3. **Fallible allocation:** Replaced `Vec::with_capacity()` with `Vec::new() + try_reserve_exact()`
+4. **Deduplication:** In-place linear scan (O(n²) bounded n≤32) before generation lookups
+5. **Error variants:** `IpcError::TooManySenders`, `IpcError::NoMemory`
+6. **Mutation guard:** `Endpoint::grant_access()` now returns `Result`, enforces `allowed_senders.len() < MAX_ALLOWED_SENDERS + 1` for new entries
+7. **Update semantics:** Re-granting existing sender (generation refresh) always allowed, doesn't count against limit
+8. **Owner handling:** Owner explicitly checked and allowed without limit check
+9. **ABI mapping:** `TooManySenders → E2BIG`, `NoMemory → ENOMEM`
+10. **Self-tests:** Added errno mapping assertions for new error variants
+
+**Files modified:**
+- `kernel/ipc/ipc.rs` - Constants, error variants, input validation, fallible allocation, deduplication, mutation guard
+- `kernel/ipc/lib.rs` - ABI error mapping, self-tests
+
+### Convergence (Codex MCP Bidirectional Review)
+
+**Session:** `019f4ae6-9a34-7040-9842-4bc94714e833`  
+**Iterations:** 2
+
+**Iteration 1 finding (CONFIRMED):** `grant_access()` bypassed MAX_ALLOWED_SENDERS limit post-registration  
+**Fix:** Made `grant_access()` fallible, propagated error through public API
+
+**Iteration 2 finding (CONFIRMED):** Semantic inconsistency - registration allowed owner+32, mutation enforced total≤32  
+**Fix:** Adjusted mutation check to `>= MAX_ALLOWED_SENDERS + 1` with explicit owner fast-path
+
+**Final Codex verdict:** SAFE / COMPLETE - "I would accept this as resolving MEDIUM-5"
+
+**Classification by aspect:**
+- Input validation: SAFE / COMPLETE
+- Temporary allocation: SAFE / COMPLETE
+- Deduplication: SAFE / EFFICIENT
+- Lock ordering: SAFE (all checks before ENDPOINTS.lock())
+- Registration path: SAFE / COMPLETE
+- Mutation path: SAFE / COMPLETE (no bypass paths)
+- ABI mapping: SAFE / COMPLETE
+- Scope: APPROPRIATE
+
+### Verification
+
+**Remote build/lint/test (via ssh-skill):**
+- ✅ `make build` - PASS
+- ✅ `make lint` - 4/4 PASS
+- ✅ `make test` - Boots successfully
+
+**Vulnerability class eliminated:** Unbounded IPC sender allowlist allocation across entire endpoint lifecycle (registration + all post-registration mutations)
+
+**Files:** `kernel/ipc/ipc.rs`, `kernel/ipc/lib.rs`  
+**Dual-write:** Local + remote via ssh-skill, md5-verified  
+**Git status:** Uncommitted (manual-commit rule)
+
 
 **The original R177 (`docs/review/qa-2026-07-09.md`) was INCOMPLETE** — Design Workflow abandoned
 mid-run, Implementation Workflow deferred, R177-1 over-rated CRITICAL. Superseded by the re-run
