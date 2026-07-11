@@ -156,6 +156,23 @@ impl fmt::Display for BioOp {
 ///
 /// Each vector points to a contiguous memory region. For DMA-capable
 /// devices, the physical address should also be provided.
+///
+/// # Safety Invariants
+///
+/// A `BioVec` is valid only if ALL of the following hold:
+/// - `ptr` is non-null and points to a valid, allocated memory region of at least `len` bytes
+/// - `ptr` is properly aligned for `u8` access (trivially true, but stricter alignment may be required by device)
+/// - The memory region `[ptr, ptr + len)` does not wrap around the address space
+/// - The referenced memory remains valid for the lifetime of the `BioVec` and any slices derived from it
+/// - For read operations: the memory is readable
+/// - For write operations: the memory is writable
+/// - For DMA operations: the memory is not concurrently accessed by CPU during device transfer
+/// - If `phys` is `Some`, it must be the correct physical address mapping for `ptr`
+///
+/// **Aliasing hazard:** Creating a mutable slice via `as_mut_slice()` while a DMA device
+/// concurrently accesses the same buffer is undefined behavior. Callers must ensure:
+/// - Device transfer is complete before CPU accesses the buffer, OR
+/// - Appropriate memory barriers/cache invalidation are used
 #[derive(Clone, Copy)]
 pub struct BioVec {
     /// Virtual address of the buffer.
@@ -173,7 +190,16 @@ unsafe impl Sync for BioVec {}
 
 impl BioVec {
     /// Create a new BioVec with virtual address only.
-    pub const fn new(ptr: *mut u8, len: usize) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure:
+    /// - `ptr` is non-null and points to a valid, allocated memory region of at least `len` bytes
+    /// - The memory region remains valid for the lifetime of the `BioVec` and any derived slices
+    /// - `ptr + len` does not overflow the address space
+    /// - The memory is readable/writable as required by subsequent operations
+    /// - For DMA operations: no concurrent CPU access during device transfer
+    pub const unsafe fn new(ptr: *mut u8, len: usize) -> Self {
         Self {
             ptr,
             len,
@@ -182,11 +208,39 @@ impl BioVec {
     }
 
     /// Create a new BioVec with both virtual and physical addresses.
-    pub const fn with_phys(ptr: *mut u8, len: usize, phys: u64) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure all invariants from [`BioVec::new`], plus:
+    /// - `phys` is the correct physical address mapping for `ptr`
+    /// - The physical mapping remains stable for the lifetime of the `BioVec`
+    pub const unsafe fn with_phys(ptr: *mut u8, len: usize, phys: u64) -> Self {
         Self {
             ptr,
             len,
             phys: Some(phys),
+        }
+    }
+
+    /// Create a BioVec from a byte slice (safe constructor).
+    ///
+    /// This is the preferred constructor when the buffer is already a valid slice.
+    pub fn from_slice(slice: &[u8]) -> Self {
+        Self {
+            ptr: slice.as_ptr() as *mut u8,
+            len: slice.len(),
+            phys: None,
+        }
+    }
+
+    /// Create a BioVec from a mutable byte slice (safe constructor).
+    ///
+    /// This is the preferred constructor when the buffer is already a valid mutable slice.
+    pub fn from_mut_slice(slice: &mut [u8]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+            phys: None,
         }
     }
 
@@ -200,7 +254,14 @@ impl BioVec {
     /// Get the buffer as a byte slice (for read operations).
     ///
     /// # Safety
-    /// Caller must ensure the pointer is valid and the buffer is readable.
+    ///
+    /// Caller must ensure ALL of the following hold:
+    /// - The `BioVec` was constructed with valid pointer and length (see type-level invariants)
+    /// - The referenced memory region is currently valid and readable
+    /// - The memory will remain valid for the lifetime `'a` of the returned slice
+    /// - The memory is properly initialized (contains valid `u8` values)
+    /// - No mutable references to overlapping memory exist during the slice's lifetime
+    /// - If used for DMA: device transfer has completed and appropriate barriers/invalidation performed
     #[inline]
     pub unsafe fn as_slice(&self) -> &[u8] {
         core::slice::from_raw_parts(self.ptr, self.len)
@@ -209,7 +270,14 @@ impl BioVec {
     /// Get the buffer as a mutable byte slice (for write operations).
     ///
     /// # Safety
-    /// Caller must ensure the pointer is valid and the buffer is writable.
+    ///
+    /// Caller must ensure ALL of the following hold:
+    /// - The `BioVec` was constructed with valid pointer and length (see type-level invariants)
+    /// - The referenced memory region is currently valid and writable
+    /// - The memory will remain valid for the lifetime `'a` of the returned slice
+    /// - No other references (mutable or immutable) to overlapping memory exist during the slice's lifetime
+    /// - For DMA write (device → memory): CPU must not access the buffer until transfer completes
+    /// - For DMA read (memory → device): the slice content must be initialized before device access
     #[inline]
     pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         core::slice::from_raw_parts_mut(self.ptr, self.len)
@@ -1093,7 +1161,8 @@ mod tests {
     #[test]
     fn test_bio_vec_alignment() {
         let buf = [0u8; 512];
-        let bv = BioVec::new(buf.as_ptr() as *mut u8, 512);
+        // SAFETY: buf is a valid stack array, pointer and length are correct
+        let bv = unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) };
         assert!(bv.is_aligned(512));
         assert!(!bv.is_aligned(1024));
     }
@@ -1110,7 +1179,8 @@ mod tests {
     fn test_bio_validation() {
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
         let buf = [0u8; 512];
-        bio.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
+        // SAFETY: buf is a valid stack array, pointer and length are correct
+        bio.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
             .unwrap();
 
         // Should pass with matching sector size and sufficient capacity
@@ -1121,12 +1191,12 @@ mod tests {
 
         // Should fail if exceeds device capacity
         let mut bio2 = Bio::new(BioOp::Read, 999).unwrap();
-        bio2.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
+        bio2.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
             .unwrap();
         assert!(bio2.validate(512, 1024, 1000).is_ok()); // sector 999 + 1 = 1000, OK
 
         let mut bio3 = Bio::new(BioOp::Read, 1000).unwrap();
-        bio3.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
+        bio3.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
             .unwrap();
         assert!(bio3.validate(512, 1024, 1000).is_err()); // sector 1000 + 1 = 1001, exceeds
     }
@@ -1152,7 +1222,8 @@ mod tests {
 
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
         let buf = [0u8; 512];
-        bio.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
+        // SAFETY: buf is a valid stack array, pointer and length are correct
+        bio.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
             .unwrap();
 
         queue.enqueue(bio).unwrap();
