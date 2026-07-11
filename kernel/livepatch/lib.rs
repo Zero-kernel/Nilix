@@ -1893,7 +1893,15 @@ fn do_sys_kpatch_load(user_ptr: usize, len: usize) -> Result<u64, Errno> {
         return Err(Errno::EFAULT);
     }
 
-    let mut buf = vec![0u8; len];
+    // LOW-17 FIX: Reserve fallibly before resizing to return ENOMEM instead of panic.
+    //
+    // SAFETY (Safety > Efficiency): Privileged livepatch operation under memory pressure
+    // should fail gracefully with errno, not kernel panic. len is bounded by MAX_PATCH_BYTES
+    // (64 KiB), so this allocation is bounded and safe.
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| Errno::ENOMEM)?;
+    buf.resize(len, 0);
     unsafe { ops.copy_from_user(buf.as_mut_ptr(), user_ptr, len)? };
 
     let loaded = load_patch_from_bytes(&buf)?;
