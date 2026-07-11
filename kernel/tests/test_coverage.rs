@@ -116,7 +116,10 @@ mod test_coverage_tests {
 
         // Warn about stale lower-priority placeholders
         if !stale_other.is_empty() {
-            println!("Warning: {} stale P2/P3 placeholder tests:", stale_other.len());
+            println!(
+                "Warning: {} stale P2/P3 placeholder tests:",
+                stale_other.len()
+            );
             for s in &stale_other {
                 println!("  - {}", s);
             }
