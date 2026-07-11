@@ -76,26 +76,25 @@ mod test_coverage_tests {
                             if now > timestamp + eight_weeks {
                                 // LOW-11 FIX: Check for valid waiver (Safety > Efficiency).
                                 // Waivers must have both owner and non-expired expiration date.
-                                let has_valid_waiver = match (&meta.waiver_owner, &meta.waiver_expiration) {
-                                    (Some(owner), Some(exp_str)) if !owner.is_empty() => {
-                                        if let Some(exp_ts) = parse_date(exp_str) {
-                                            now <= exp_ts
-                                        } else {
-                                            false
+                                let has_valid_waiver =
+                                    match (&meta.waiver_owner, &meta.waiver_expiration) {
+                                        (Some(owner), Some(exp_str)) if !owner.is_empty() => {
+                                            if let Some(exp_ts) = parse_date(exp_str) {
+                                                now <= exp_ts
+                                            } else {
+                                                false
+                                            }
                                         }
-                                    }
-                                    _ => false,
-                                };
+                                        _ => false,
+                                    };
 
                                 if has_valid_waiver {
                                     // Waiver is valid - skip this test
                                     continue;
                                 }
 
-                                let msg = format!(
-                                    "{} (created {}, >8 weeks old)",
-                                    meta.name, date_str
-                                );
+                                let msg =
+                                    format!("{} (created {}, >8 weeks old)", meta.name, date_str);
 
                                 // P0/P1 placeholders fail CI, others warn only
                                 if let Some(priority) = &meta.priority {

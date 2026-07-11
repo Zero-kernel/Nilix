@@ -1899,8 +1899,7 @@ fn do_sys_kpatch_load(user_ptr: usize, len: usize) -> Result<u64, Errno> {
     // should fail gracefully with errno, not kernel panic. len is bounded by MAX_PATCH_BYTES
     // (64 KiB), so this allocation is bounded and safe.
     let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|_| Errno::ENOMEM)?;
+    buf.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
     buf.resize(len, 0);
     unsafe { ops.copy_from_user(buf.as_mut_ptr(), user_ptr, len)? };
 

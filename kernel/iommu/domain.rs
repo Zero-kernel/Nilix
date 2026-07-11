@@ -506,15 +506,17 @@ impl Domain {
         // The parent entry remains absent until Phase 2, so consult the
         // transaction-local entries before allocating another child table.
         let parent_ptr = parent as *mut SlPageTable;
-        if let Some(phys) = staged_table_entries.iter().find_map(
-            |(staged_parent, staged_index, staged_phys)| {
-                if *staged_parent == parent_ptr && *staged_index == index {
-                    Some(*staged_phys)
-                } else {
-                    None
-                }
-            },
-        ) {
+        if let Some(phys) =
+            staged_table_entries
+                .iter()
+                .find_map(|(staged_parent, staged_index, staged_phys)| {
+                    if *staged_parent == parent_ptr && *staged_index == index {
+                        Some(*staged_phys)
+                    } else {
+                        None
+                    }
+                })
+        {
             return unsafe { Ok(Self::table_from_phys(phys)) };
         }
 
