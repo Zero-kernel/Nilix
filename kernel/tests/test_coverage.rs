@@ -28,12 +28,15 @@ mod test_coverage_tests {
             let p0_count = metadata
                 .iter()
                 .filter(|m| {
+                    // LOW-10 FIX: Require explicit Status: Implemented (Safety > Efficiency).
+                    // Previously: unwrap_or(true) counted missing status as implemented.
+                    // Now: fail-closed - only count tests with explicit "Implemented" status.
                     m.category.as_ref().map(|c| c == category).unwrap_or(false)
                         && m.priority.as_ref().map(|p| p == "P0").unwrap_or(false)
                         && m.status
                             .as_ref()
                             .map(|s| s == "Implemented")
-                            .unwrap_or(true)
+                            .unwrap_or(false)
                 })
                 .count();
 
@@ -62,7 +65,8 @@ mod test_coverage_tests {
             .as_secs();
 
         let eight_weeks = 8 * 7 * 24 * 60 * 60;
-        let mut stale = Vec::new();
+        let mut stale_p0_p1 = Vec::new();
+        let mut stale_other = Vec::new();
 
         for meta in metadata {
             if let Some(status) = &meta.status {
@@ -70,10 +74,39 @@ mod test_coverage_tests {
                     if let Some(date_str) = &meta.placeholder_date {
                         if let Some(timestamp) = parse_date(date_str) {
                             if now > timestamp + eight_weeks {
-                                stale.push(format!(
+                                // LOW-11 FIX: Check for valid waiver (Safety > Efficiency).
+                                // Waivers must have both owner and non-expired expiration date.
+                                let has_valid_waiver = match (&meta.waiver_owner, &meta.waiver_expiration) {
+                                    (Some(owner), Some(exp_str)) if !owner.is_empty() => {
+                                        if let Some(exp_ts) = parse_date(exp_str) {
+                                            now <= exp_ts
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    _ => false,
+                                };
+
+                                if has_valid_waiver {
+                                    // Waiver is valid - skip this test
+                                    continue;
+                                }
+
+                                let msg = format!(
                                     "{} (created {}, >8 weeks old)",
                                     meta.name, date_str
-                                ));
+                                );
+
+                                // P0/P1 placeholders fail CI, others warn only
+                                if let Some(priority) = &meta.priority {
+                                    if priority == "P0" || priority == "P1" {
+                                        stale_p0_p1.push(msg);
+                                    } else {
+                                        stale_other.push(msg);
+                                    }
+                                } else {
+                                    stale_other.push(msg);
+                                }
                             }
                         }
                     }
@@ -81,13 +114,24 @@ mod test_coverage_tests {
             }
         }
 
-        if !stale.is_empty() {
-            println!("Warning: {} stale placeholder tests:", stale.len());
-            for s in &stale {
+        // Warn about stale lower-priority placeholders
+        if !stale_other.is_empty() {
+            println!("Warning: {} stale P2/P3 placeholder tests:", stale_other.len());
+            for s in &stale_other {
                 println!("  - {}", s);
             }
-            // Don't fail the build, just warn
-            // panic!("Stale placeholder tests detected:\n{}", stale.join("\n"));
+        }
+
+        // FAIL CI for stale P0/P1 placeholders without valid waivers
+        if !stale_p0_p1.is_empty() {
+            panic!(
+                "Stale P0/P1 placeholder tests detected (>8 weeks):\n{}\n\n\
+                 To waive a placeholder, add:\n\
+                 /// Waiver-Owner: <name>\n\
+                 /// Waiver-Expires: YYYY-MM-DD\n\
+                 to the test documentation.",
+                stale_p0_p1.join("\n")
+            );
         }
     }
 
@@ -158,6 +202,8 @@ mod test_coverage_tests {
         priority: Option<String>,
         status: Option<String>,
         placeholder_date: Option<String>,
+        waiver_owner: Option<String>,
+        waiver_expiration: Option<String>,
     }
 
     fn parse_test_metadata(files: &[std::path::PathBuf]) -> Vec<TestMetadata> {
@@ -189,6 +235,8 @@ mod test_coverage_tests {
                             priority: extract_field(&doc_lines, "Priority:"),
                             status: extract_field(&doc_lines, "Status:"),
                             placeholder_date: extract_field(&doc_lines, "TODO:"),
+                            waiver_owner: extract_field(&doc_lines, "Waiver-Owner:"),
+                            waiver_expiration: extract_field(&doc_lines, "Waiver-Expires:"),
                         };
 
                         metadata.push(meta);
