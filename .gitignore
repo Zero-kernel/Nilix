@@ -8,6 +8,7 @@ Cargo.lock
 # Binaries
 /.vscode
 /.claude
+/.codex
 /scripts
 /esp
 /bootloader-target
@@ -25,6 +26,7 @@ userspace/clippy-userspace-target
 /fuzz/artifacts/*.log
 
 #no_need
+*.backup
 *.md
 *.txt
 *.log
