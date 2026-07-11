@@ -480,7 +480,11 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
-        let mut buf = alloc::vec![0u8; read_len];
+        // MEDIUM-7 FIX: Use fallible allocation to prevent OOM panic during mount
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(read_len)
+            .map_err(|_| FsError::NoMem)?;
+        buf.resize(read_len, 0);
 
         let start_sector = bgdt_offset / sector_size as u64;
         dev.read_sync(start_sector, &mut buf)
@@ -488,7 +492,11 @@ impl Ext2Fs {
 
         // Parse group descriptors
         // R95-3 FIX: Use read_unaligned to avoid UB on unaligned access.
-        let mut descs = Vec::with_capacity(groups_count as usize);
+        // MEDIUM-7 FIX: Use fallible allocation to prevent OOM panic during mount
+        let mut descs = Vec::new();
+        descs
+            .try_reserve_exact(groups_count as usize)
+            .map_err(|_| FsError::NoMem)?;
         for i in 0..groups_count as usize {
             let offset = i * size_of::<Ext2GroupDesc>();
             let gd: Ext2GroupDesc =
