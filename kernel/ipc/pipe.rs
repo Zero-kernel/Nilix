@@ -8,7 +8,6 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +19,9 @@ use kernel_core::{FileOps, SyscallError, VfsStat};
 
 /// 默认管道缓冲区大小（4KB）
 pub const DEFAULT_PIPE_CAPACITY: usize = 4096;
+
+/// 最大管道缓冲区大小（1MB），防止无界内核内存分配
+pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 
 /// 管道错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,10 @@ pub enum PipeError {
     InvalidOperation,
     /// 管道 ID 分配耗尽
     PipeIdExhausted,
+    /// 管道容量为零或超过允许的最大值
+    InvalidCapacity,
+    /// 无法为管道缓冲区分配内存
+    NoMemory,
     /// R171 (F2): 阻塞读/写期间检测到挂起的 kill —— 以 EINTR 中断（写已写出则返回短计数）。
     Interrupted,
 }
@@ -80,15 +86,23 @@ struct PipeInner {
 }
 
 impl PipeInner {
-    fn new(capacity: usize) -> Self {
-        PipeInner {
-            buffer: vec![0u8; capacity],
+    fn new(capacity: usize) -> Result<Self, PipeError> {
+        // MEDIUM-6 FIX: Reserve fallibly before resizing so allocation failure is
+        // returned to the caller instead of triggering an OOM panic.
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| PipeError::NoMemory)?;
+        buffer.resize(capacity, 0);
+
+        Ok(PipeInner {
+            buffer,
             capacity,
             read_pos: 0,
             len: 0,
             readers: 1,
             writers: 1,
-        }
+        })
     }
 
     /// 检查缓冲区是否为空
@@ -168,13 +182,13 @@ pub struct Pipe {
 
 impl Pipe {
     /// 创建新管道
-    fn new(id: PipeId, capacity: usize) -> Self {
-        Pipe {
+    fn new(id: PipeId, capacity: usize) -> Result<Self, PipeError> {
+        Ok(Pipe {
             id,
-            inner: Mutex::new(PipeInner::new(capacity)),
+            inner: Mutex::new(PipeInner::new(capacity)?),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
-        }
+        })
     }
 
     /// 获取管道ID
@@ -674,13 +688,19 @@ pub fn create_pipe_with_capacity(
     capacity: usize,
     flags: PipeFlags,
 ) -> Result<(PipeHandle, PipeHandle), PipeError> {
+    // MEDIUM-6 FIX: Reject zero-capacity pipes, which can never accept writes, and
+    // bound valid capacities to prevent unbounded kernel memory allocations.
+    if capacity == 0 || capacity > MAX_PIPE_CAPACITY {
+        return Err(PipeError::InvalidCapacity);
+    }
+
     // R111-3 FIX: Use fetch_update + checked_add to prevent wrapping to 0
     // on usize overflow.  Follows the R105-5 pattern established for IPC
     // endpoint IDs and socket IDs.
     let id = NEXT_PIPE_ID
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
         .map_err(|_| PipeError::PipeIdExhausted)? as PipeId;
-    let pipe = Arc::new(Pipe::new(id, capacity));
+    let pipe = Arc::new(Pipe::new(id, capacity)?);
 
     let read_handle = PipeHandle::new_read(pipe.clone(), flags);
     let write_handle = PipeHandle::new_write(pipe, flags);
