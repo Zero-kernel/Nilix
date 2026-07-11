@@ -307,53 +307,28 @@ pub fn broadcast_panic() {
 }
 
 // ============================================================================
-// IPI Handler Registration (Stubs)
+// IPI Handler Registration
 // ============================================================================
-
-/// Handler function type for IPI interrupts
-pub type IpiHandler = fn();
-
-/// Registered IPI handlers (one per IPI type)
-/// These will be called from the IDT interrupt handlers
-static mut IPI_HANDLERS: [Option<IpiHandler>; 5] = [None; 5];
-
-/// Register a handler for an IPI type
-///
-/// # Safety
-///
-/// This function modifies global mutable state. It should only be called
-/// during single-threaded initialization (before SMP bring-up).
-///
-/// # Arguments
-///
-/// * `ipi_type` - IPI type to register handler for
-/// * `handler` - Handler function to call when IPI is received
-pub unsafe fn register_ipi_handler(ipi_type: IpiType, handler: IpiHandler) {
-    let index = match ipi_type {
-        IpiType::Reschedule => 0,
-        IpiType::Halt => 1,
-        IpiType::Profile => 2,
-        IpiType::TlbShootdown => 3,
-        IpiType::Panic => 4,
-    };
-    IPI_HANDLERS[index] = Some(handler);
-}
-
-/// Get the registered handler for an IPI type
-///
-/// # Safety
-///
-/// Handler must only be called in appropriate interrupt context.
-pub unsafe fn get_ipi_handler(ipi_type: IpiType) -> Option<IpiHandler> {
-    let index = match ipi_type {
-        IpiType::Reschedule => 0,
-        IpiType::Halt => 1,
-        IpiType::Profile => 2,
-        IpiType::TlbShootdown => 3,
-        IpiType::Panic => 4,
-    };
-    IPI_HANDLERS[index]
-}
+//
+// MEDIUM-9 FIX: Removed unused unsafe IPI handler registration API.
+//
+// The previous implementation exposed `static mut IPI_HANDLERS` with
+// unsynchronized write (register_ipi_handler) and read (get_ipi_handler),
+// creating a data race if called after SMP initialization despite documentation
+// stating "should only be called during single-threaded initialization".
+//
+// Codebase search confirmed zero usage of:
+// - register_ipi_handler()
+// - get_ipi_handler()
+// - IPI_HANDLERS
+//
+// Safety-first approach: Delete dead unsafe code rather than maintain liability.
+//
+// When IPI handler dispatch is needed in the future, implement using:
+// - AtomicPtr<()> array for lock-free handler storage
+// - Ordering::Release (write) / Acquire (read) for synchronization
+// - Explicit SMP initialization seal to reject late registration
+// - Compare-exchange for duplicate registration detection
 
 // ============================================================================
 // LAPIC Interface (Stubs for SMP)
