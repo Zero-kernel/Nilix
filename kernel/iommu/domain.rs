@@ -480,11 +480,18 @@ impl Domain {
     /// Get or allocate a child page table at the given index.
     ///
     /// If the entry is already present, returns a reference to the existing table.
-    /// If absent, allocates a new zeroed table and installs it.
+    /// If absent, allocates a new zeroed table and stages the parent entry for
+    /// installation during transaction commit.
     /// Rejects superpage (PS) entries since we only support 4KB mappings.
+    ///
+    /// R-MEDIUM-3/4 FIX: Newly allocated tables remain detached from the hardware-
+    /// visible hierarchy until Phase 2 commit. On validation failure, rollback can
+    /// free them without unlinking PTEs or invalidating IOTLB.
     fn get_or_create_table(
         parent: &mut SlPageTable,
         index: usize,
+        newly_allocated_tables: &mut Vec<PhysFrame<Size4KiB>>,
+        staged_table_entries: &mut Vec<(*mut SlPageTable, usize, u64)>,
     ) -> Result<&'static mut SlPageTable, IommuError> {
         let entry = parent.entry(index);
 
@@ -496,14 +503,53 @@ impl Domain {
             return unsafe { Ok(Self::table_from_phys(entry.addr())) };
         }
 
+        // The parent entry remains absent until Phase 2, so consult the
+        // transaction-local entries before allocating another child table.
+        let parent_ptr = parent as *mut SlPageTable;
+        if let Some(phys) = staged_table_entries.iter().find_map(
+            |(staged_parent, staged_index, staged_phys)| {
+                if *staged_parent == parent_ptr && *staged_index == index {
+                    Some(*staged_phys)
+                } else {
+                    None
+                }
+            },
+        ) {
+            return unsafe { Ok(Self::table_from_phys(phys)) };
+        }
+
+        // Reserve rollback metadata before allocating the physical frame.
+        // This ensures recording ownership cannot panic or fail after allocation.
+        newly_allocated_tables
+            .try_reserve(1)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        staged_table_entries
+            .try_reserve(1)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+
         // Allocate a new zeroed child table
         let frame = Self::alloc_zeroed_page_table()?;
         let phys = frame.start_address().as_u64();
 
-        // Install the new table entry (PRESENT + WRITE for intermediate entries)
-        parent.set_entry(index, SlPte::new_table(phys));
+        // Keep the frame detached from the hardware-visible hierarchy until
+        // every page in the requested mapping has passed validation.
+        newly_allocated_tables.push(frame);
+        staged_table_entries.push((parent_ptr, index, phys));
 
         unsafe { Ok(Self::table_from_phys(phys)) }
+    }
+
+    /// Free intermediate page tables allocated by an aborted mapping transaction.
+    ///
+    /// These frames were never linked into the hardware-visible hierarchy, so
+    /// they can be returned directly without page-table or IOTLB invalidation.
+    ///
+    /// R-MEDIUM-4 FIX: Rollback mechanism to prevent page table leaks on validation
+    /// failure. Frames are freed in reverse order (deepest first) for clarity.
+    fn rollback_new_tables(newly_allocated_tables: &mut Vec<PhysFrame<Size4KiB>>) {
+        for frame in newly_allocated_tables.drain(..).rev() {
+            buddy_allocator::free_physical_pages(frame, 1);
+        }
     }
 
     /// Install page table mapping entries.
@@ -573,59 +619,121 @@ impl Domain {
         // Phase 1: Validate all pages and collect staging entries
         // Phase 2: Commit all entries only if validation passes
         //
-        // Note: Intermediate tables may still be created during Phase 1 via
-        // get_or_create_table, but without leaf entries they don't enable DMA.
-        let num_pages = (size + IOMMU_PAGE_SIZE - 1) / IOMMU_PAGE_SIZE;
-        let mut staged: alloc::vec::Vec<(*mut SlPageTable, usize, SlPte)> =
-            alloc::vec::Vec::with_capacity(num_pages);
+        // R-MEDIUM-3/4 FIX: Intermediate tables allocated during Phase 1 remain
+        // detached from the hardware-visible hierarchy. They are linked only during
+        // Phase 2, or freed if validation fails.
+
+        // R-MEDIUM-3 FIX: Fallible staging allocation - pre-reserve capacity for all
+        // leaf entries to avoid panic on attacker-controlled map size
+        let num_pages = size / IOMMU_PAGE_SIZE; // size is page-aligned by map_range validation
+        let mut staged: Vec<(*mut SlPageTable, usize, SlPte)> = Vec::new();
+        staged
+            .try_reserve_exact(num_pages)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+
+        // R-MEDIUM-4 FIX: Track newly allocated intermediate tables for rollback
+        let mut newly_allocated_tables: Vec<PhysFrame<Size4KiB>> = Vec::new();
+        let mut staged_table_entries: Vec<(*mut SlPageTable, usize, u64)> = Vec::new();
 
         // Phase 1: Walk and validate mappings for each 4KB page
-        for offset in (0..size).step_by(IOMMU_PAGE_SIZE) {
-            let cur_iova = iova + offset as u64;
-            let cur_phys = phys + offset as u64;
+        let validation_result = (|| -> Result<(), IommuError> {
+            for offset in (0..size).step_by(IOMMU_PAGE_SIZE) {
+                let cur_iova = iova + offset as u64;
+                let cur_phys = phys + offset as u64;
 
-            // Extract page table indices from IOVA based on address width
-            let l3_idx = ((cur_iova >> 30) & 0x1FF) as usize;
-            let l2_idx = ((cur_iova >> 21) & 0x1FF) as usize;
-            let l1_idx = ((cur_iova >> IOMMU_PAGE_SHIFT) & 0x1FF) as usize;
+                // Extract page table indices from IOVA based on address width
+                let l3_idx = ((cur_iova >> 30) & 0x1FF) as usize;
+                let l2_idx = ((cur_iova >> 21) & 0x1FF) as usize;
+                let l1_idx = ((cur_iova >> IOMMU_PAGE_SHIFT) & 0x1FF) as usize;
 
-            // Get the leaf page table (may create intermediate tables)
-            let pt = if use_4_level {
-                // 4-level: PML4[47:39] -> PDPT[38:30] -> PD[29:21] -> PT[20:12]
-                let l4_idx = ((cur_iova >> 39) & 0x1FF) as usize;
-                let pml4 = unsafe { Self::table_from_phys(root_phys) };
-                let pdpt = Self::get_or_create_table(pml4, l4_idx)?;
-                let pd = Self::get_or_create_table(pdpt, l3_idx)?;
-                Self::get_or_create_table(pd, l2_idx)?
-            } else {
-                // 3-level: PDPT[38:30] -> PD[29:21] -> PT[20:12]
-                // Root is the PDPT for 39-bit AGAW
-                let pdpt = unsafe { Self::table_from_phys(root_phys) };
-                let pd = Self::get_or_create_table(pdpt, l3_idx)?;
-                Self::get_or_create_table(pd, l2_idx)?
-            };
+                // Get the leaf page table, staging any newly allocated
+                // intermediate tables without publishing them yet.
+                let pt = if use_4_level {
+                    // 4-level: PML4[47:39] -> PDPT[38:30] -> PD[29:21] -> PT[20:12]
+                    let l4_idx = ((cur_iova >> 39) & 0x1FF) as usize;
+                    let pml4 = unsafe { Self::table_from_phys(root_phys) };
+                    let pdpt = Self::get_or_create_table(
+                        pml4,
+                        l4_idx,
+                        &mut newly_allocated_tables,
+                        &mut staged_table_entries,
+                    )?;
+                    let pd = Self::get_or_create_table(
+                        pdpt,
+                        l3_idx,
+                        &mut newly_allocated_tables,
+                        &mut staged_table_entries,
+                    )?;
+                    Self::get_or_create_table(
+                        pd,
+                        l2_idx,
+                        &mut newly_allocated_tables,
+                        &mut staged_table_entries,
+                    )?
+                } else {
+                    // 3-level: PDPT[38:30] -> PD[29:21] -> PT[20:12]
+                    // Root is the PDPT for 39-bit AGAW
+                    let pdpt = unsafe { Self::table_from_phys(root_phys) };
+                    let pd = Self::get_or_create_table(
+                        pdpt,
+                        l3_idx,
+                        &mut newly_allocated_tables,
+                        &mut staged_table_entries,
+                    )?;
+                    Self::get_or_create_table(
+                        pd,
+                        l2_idx,
+                        &mut newly_allocated_tables,
+                        &mut staged_table_entries,
+                    )?
+                };
 
-            // Check if leaf entry already exists (reject to prevent aliasing)
-            // R83-1 FIX: Do NOT install the entry yet, just validate
-            if pt.entry(l1_idx).is_present() {
-                return Err(IommuError::InvalidRange);
+                // Check if leaf entry already exists (reject to prevent aliasing)
+                // R83-1 FIX: Do NOT install the entry yet, just validate
+                if pt.entry(l1_idx).is_present() {
+                    return Err(IommuError::InvalidRange);
+                }
+
+                // Capacity for every requested page was reserved before Phase 1,
+                // so this push cannot trigger an infallible allocation.
+                staged.push((
+                    pt as *mut SlPageTable,
+                    l1_idx,
+                    SlPte::new_leaf(cur_phys, pte_flags),
+                ));
             }
 
-            // Stage the leaf entry for commit after all pages are validated
-            staged.push((
-                pt as *mut SlPageTable,
-                l1_idx,
-                SlPte::new_leaf(cur_phys, pte_flags),
-            ));
+            Ok(())
+        })();
+
+        // R-MEDIUM-4 FIX: On validation failure, rollback all intermediate tables
+        if let Err(error) = validation_result {
+            Self::rollback_new_tables(&mut newly_allocated_tables);
+            return Err(error);
         }
 
-        // Phase 2: Commit all staged entries (only reached if all validations passed)
+        // Phase 2: Publish intermediate entries deepest-first. Newly allocated
+        // tables are zeroed and contain no leaf mappings at this point.
+        for &(parent_ptr, idx, child_phys) in staged_table_entries.iter().rev() {
+            // SAFETY: parent_ptr refers either to an existing table protected by
+            // page_table_lock or to a newly allocated frame retained in
+            // newly_allocated_tables for the duration of this transaction.
+            unsafe { (*parent_ptr).set_entry(idx, SlPte::new_table(child_phys)) };
+        }
+
+        // Commit leaf entries only after the complete intermediate hierarchy is
+        // reachable. No fallible operation remains after publication begins.
         for (pt_ptr, idx, entry) in staged {
             // SAFETY: pt_ptr is a valid pointer to a SlPageTable obtained from
             // get_or_create_table() in the validation loop above. The page_table_lock
             // is held throughout this function, preventing concurrent modification.
             unsafe { (*pt_ptr).set_entry(idx, entry) };
         }
+
+        // Ownership of these frames has transferred to the page-table hierarchy.
+        // Clearing the rollback list drops only frame descriptors; it does not
+        // return the physical frames to the allocator.
+        newly_allocated_tables.clear();
 
         // R95-5 FIX: Memory fence to ensure all PTE writes are visible before
         // returning. The caller (map_range in lib.rs) will issue IOTLB invalidation
