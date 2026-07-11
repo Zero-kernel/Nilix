@@ -101,6 +101,8 @@ pub enum AuditError {
     AlreadyInitialized,
     /// Invalid capacity (zero or too large)
     InvalidCapacity,
+    /// Memory allocation failed
+    NoMemory,
     /// Audit subsystem is disabled
     Disabled,
     /// Missing capability to read/export the audit log (CAP_AUDIT_READ)
@@ -876,16 +878,22 @@ struct AuditRing {
 
 impl AuditRing {
     /// Create a new ring buffer with given capacity
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buf: alloc::vec![None; capacity],
+    fn with_capacity(capacity: usize) -> Result<Self, AuditError> {
+        // MEDIUM-8 FIX: Use fallible allocation to prevent OOM panic during init
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(capacity)
+            .map_err(|_| AuditError::NoMemory)?;
+        buf.resize(capacity, None);
+
+        Ok(Self {
+            buf,
             head: 0,
             len: 0,
             next_id: 0,
             prev_hash: ZERO_HASH,
             dropped: 0,
             hmac_key: HmacKey::empty(), // R65-15 FIX: Initialize empty key
-        }
+        })
     }
 
     /// R65-15 FIX: Set the HMAC key for audit log integrity
@@ -1871,7 +1879,7 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
         if ring.is_some() {
             return Err(AuditError::AlreadyInitialized);
         }
-        *ring = Some(AuditRing::with_capacity(capacity));
+        *ring = Some(AuditRing::with_capacity(capacity)?);
         AUDIT_INITIALIZED.store(true, Ordering::SeqCst);
         Ok(())
     })?;
