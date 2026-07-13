@@ -203,7 +203,10 @@ impl Shell {
         // deferred work + reschedule on every idle iteration, exactly like the
         // idle loop this shell replaced. IRQs are enabled here (sti precedes
         // shell entry), satisfying reschedule_if_needed()'s R169-5 contract.
-        sched::enhanced_scheduler::Scheduler::reschedule_now(true);
+        sched::enhanced_scheduler::Scheduler::reschedule_now(
+            true,
+            kernel_core::ReschedOrigin::Process,
+        );
 
         while self.running.load(Ordering::Acquire) {
             // Check for serial input (non-blocking)

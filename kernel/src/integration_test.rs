@@ -19,6 +19,11 @@ pub fn test_process_control_block() {
 
 /// 测试增强型调度器
 pub fn test_scheduler() {
+    kernel_core::process::run_ready_aging_self_test();
+    kernel_core::process::run_fatal_exit_publication_self_test();
+    sched::enhanced_scheduler::run_bounded_selector_self_test();
+    sched::enhanced_scheduler::run_identity_resume_self_test();
+    klog_always!("    [PASS] RF178-33 selector/aging + RF178-35 fatal wake + RF178-36 identity resume");
     klog_always!("  [TEST] Enhanced Scheduler...");
     klog_always!("    ✓ Scheduler module compiled");
     klog_always!("    ✓ Multi-level feedback queue ready");
@@ -28,6 +33,8 @@ pub fn test_scheduler() {
 /// 测试Fork系统调用框架
 pub fn test_fork_framework() {
     klog_always!("  [TEST] Fork System Call Framework...");
+    kernel_core::fork::run_cow_refcount_self_test();
+    kernel_core::syscall::run_cow_mprotect_self_test();
     klog_always!("    ✓ Fork implementation compiled");
     klog_always!("    ✓ COW (Copy-on-Write) framework ready");
     klog_always!("    ✓ Physical page ref counting available");
@@ -72,6 +79,8 @@ pub fn test_syscalls() {
     // model (mask RMW with SIGKILL/SIGSTOP strip, disposition resolver). These cover
     // the mis-wires a green boot cannot catch.
     kernel_core::signal_frame::run_signal_frame_self_test();
+    // RF178-34: shared syscall/IRQ VMA locator boundary and fail-closed cases.
+    kernel_core::syscall::run_sigframe_stack_locator_self_test();
     kernel_core::signal::run_signal_self_test();
     klog_always!("    ✓ M0 #5 signals (1a): rt_sigframe layout/SROP/MXCSR/round-trip + mask RMW + disposition resolver");
     // M0 #5 (1b-2): SAME-return handler delivery for a blocked-and-resumed syscall —
@@ -301,9 +310,45 @@ pub fn test_memory_mapping() {
 pub fn test_ext2_write() {
     klog_always!("  [TEST] Ext2 Write Support...");
 
-    // Verify /mnt is mounted by checking stat
+    vfs::ext2::run_ext2_direct_write_preflight_self_test();
+    klog_always!("    Ext2 direct-write preflight boundaries passed");
+    vfs::ext2::run_ext2_mutation_scratch_self_test();
+    klog_always!("    RF178-39 scratch reuse + fallible UTF-8 decoding passed");
+    iommu::domain::run_mapping_tracker_self_test();
+    klog_always!("    RF178-39 fallible IOMMU mapping tracker passed");
+    vfs::ext2::run_ext2_inode_cache_self_test();
+    klog_always!("    RF178-37 canonical inode-cache lifecycle passed");
+
+    // Optional mounted-image probe. The deterministic fail-closed production
+    // open/cache test above is the RF178-37 acceptance criterion.
     match vfs::stat("/mnt") {
         Ok(stat) => {
+            let flags = vfs::OpenFlags::new(
+                vfs::OpenFlags::O_RDONLY | vfs::OpenFlags::O_DIRECTORY,
+            );
+            let first = vfs::open("/mnt", flags, 0);
+            let second = vfs::open("/mnt", flags, 0);
+            if let (Ok(first), Ok(second)) = (first, second) {
+                let first = first.as_any().downcast_ref::<vfs::FileHandle>();
+                let second = second.as_any().downcast_ref::<vfs::FileHandle>();
+                if let (Some(first), Some(second)) = (first, second) {
+                    if first.inode.as_any().is::<vfs::Ext2Inode>()
+                        && second.inode.as_any().is::<vfs::Ext2Inode>()
+                    {
+                        assert!(
+                            alloc::sync::Arc::ptr_eq(&first.inode, &second.inode),
+                            "independent ext2 opens must share the canonical inode Arc"
+                        );
+                        klog_always!("    RF178-37 mounted-ext2 dual-open identity passed");
+                    } else {
+                        klog_always!("    - /mnt is not ext2; mounted-image probe skipped");
+                    }
+                } else {
+                    klog_always!("    - /mnt handles are not FileHandle; probe skipped");
+                }
+            } else {
+                klog_always!("    - /mnt dual-open unavailable; probe skipped");
+            }
             klog_always!("    ✓ /mnt mounted (ino={})", stat.ino);
             klog_always!("    ✓ Ext2 write_at() implemented");
             klog_always!("    ✓ Block allocation with bitmap management");
@@ -328,6 +373,15 @@ pub fn test_fallible_map() {
     klog_always!("    ✓ try_insert / replace / remove ordered + fallible");
     klog_always!("    ✓ range / range_mut half-open bounds + DoubleEnded");
     klog_always!("    ✓ from_sorted_vec O(1) adopt + try_clone independence");
+}
+
+/// RF178-11: page-cache heap/cgroup admission invariants.
+pub fn test_page_cache_policy() {
+    klog_always!("  [TEST] Page Cache Admission Policy...");
+    mm::run_page_cache_policy_self_test();
+    klog_always!("    ✓ heap-derived cap + single-index retained-capacity bound");
+    klog_always!("    ✓ cgroup-before-global + owner-only refusal reclaim");
+    klog_always!("    ✓ RAII charge transfer + exact final-Arc uncharge");
 }
 
 /// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.
@@ -608,6 +662,7 @@ pub fn run_all_tests() {
     test_context_switch();
     test_memory_mapping();
     test_fallible_map();
+    test_page_cache_policy();
     test_per_ns_tcp_budgets();
     test_cgroup_fd_budget();
     test_cgroup_vfs_dir_budget();

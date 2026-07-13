@@ -940,6 +940,12 @@ impl RuntimeTest for SchedulerStarvationTest {
             100, // priority: u8 (lower = higher priority, 100 is low)
         );
 
+        // RF178-33: give the base priority real boost headroom. A task already
+        // at its static-priority floor must retain wait evidence, not fake a
+        // boost by clearing the counter.
+        process.base_dynamic_priority = 105;
+        process.dynamic_priority = 105;
+
         let initial_priority = process.dynamic_priority;
         let initial_wait_ticks = process.wait_ticks;
 
@@ -1613,8 +1619,7 @@ impl RuntimeTest for R175SignalFramePointerTest {
 
 /// R175 D0-CROSS-3: Scheduler Atomicity Stress Test
 ///
-/// Validates atomic enqueue-then-ready transition during namespace teardown.
-/// This is a structural validation that kernel_resume_stopped_atomic exists.
+/// Validates exact-identity, in-place resume during namespace teardown.
 struct R175SchedulerAtomicityTest;
 
 impl RuntimeTest for R175SchedulerAtomicityTest {
@@ -1635,8 +1640,9 @@ impl RuntimeTest for R175SchedulerAtomicityTest {
             ));
         }
 
-        // Validated in R176: kernel_resume_stopped_atomic at signal.rs:78
-        // Caller at process.rs:4668 uses new atomic primitive
+        // RF178-36's executable state-machine probe runs in integration_test;
+        // the production callback carries Arc + PID + generation and performs
+        // no raw-PID lookup or queue removal.
         TestResult::Pass
     }
 }

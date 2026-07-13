@@ -757,6 +757,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
         // Attempt to bring up Application Processors (APs)
         // This will enumerate CPUs via ACPI MADT and send INIT-SIPI-SIPI
+        // RF178-23 FIX: arch cannot depend on security. Register the AP-local
+        // Spectre/MSR initializer before any AP is allowed to start.
+        arch::register_ap_security_init(security::spectre::init_cpu);
         let num_cpus = arch::start_aps();
         if num_cpus > 1 {
             klog_always!("      ✓ SMP enabled: {} CPU(s) online", num_cpus);
@@ -766,6 +769,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     klog_always!("[6/8] Initializing scheduler...");
+    sched::enhanced_scheduler::register_security_switch_hook(
+        security::spectre::context_switch_barrier,
+    );
     sched::enhanced_scheduler::init(); // 注册定时器和重调度回调
     klog_always!("      ✓ Enhanced scheduler initialized");
 
@@ -902,27 +908,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     let audit_capacity = compliance::policy().audit_ring_capacity;
     match audit::init(audit_capacity) {
         Ok(()) => {
-            // Emit boot event
-            let _ = audit::emit(
-                audit::AuditKind::Internal,
-                audit::AuditOutcome::Info,
-                audit::AuditSubject::kernel(),
-                audit::AuditObject::None,
-                &[0], // boot event
-                0,
-                0, // timestamp 0 = boot
-            );
             klog_always!(
                 "      ✓ Audit subsystem ready (capacity: {} events)",
                 audit_capacity
             );
             klog_always!("      ✓ Hash-chained tamper evidence enabled");
-
-            // P1-1: Re-emit the profile validation audit event now that audit is
-            // initialised. The initial emission during init_policy_surface() was
-            // silently dropped because audit::init() hadn't run yet.
-            compliance::emit_deferred_policy_audit();
-            klog_always!("      ✓ Deferred profile audit event recorded");
 
             // R148-I8 FIX: Register kernel timestamp provider so audit events
             // get real timestamps instead of 0.
@@ -990,7 +980,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             });
             klog_always!("      ✓ Audit HMAC key gate registered (CAP_AUDIT_WRITE)");
 
-            // R72-HMAC: Generate and install audit HMAC key for integrity protection
+            // R178-24 FIX: Install HMAC key BEFORE any audit events are emitted.
+            // This ensures a uniform HMAC-SHA256 chain from the very first event,
+            // preventing mixed SHA-256/HMAC-SHA256 chains that are unverifiable.
+            //
+            // Previously, boot events were emitted with plain SHA-256, then the key
+            // was installed, creating a mixed chain that neither verify_chain() nor
+            // verify_chain_hmac() could validate.
+            //
+            // R72-HMAC: Generate and install audit HMAC key for integrity protection.
             // Uses CSPRNG to generate a 32-byte cryptographically secure key.
             // The key is zeroed from stack memory after use to minimize exposure.
             {
@@ -1020,6 +1018,25 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 }
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
+
+            // R178-24 FIX: Now that HMAC key is installed, emit boot event.
+            // This event will be HMAC-protected, ensuring chain uniformity.
+            let _ = audit::emit(
+                audit::AuditKind::Internal,
+                audit::AuditOutcome::Info,
+                audit::AuditSubject::kernel(),
+                audit::AuditObject::None,
+                &[0], // boot event
+                0,
+                0, // timestamp 0 = boot
+            );
+
+            // P1-1: Re-emit the profile validation audit event now that audit is
+            // initialised. The initial emission during init_policy_surface() was
+            // silently dropped because audit::init() hadn't run yet.
+            // R178-24: This event is also HMAC-protected since key is already installed.
+            compliance::emit_deferred_policy_audit();
+            klog_always!("      ✓ Deferred profile audit event recorded");
 
             // R106-8: Register OOM killer audit callback for tamper-evident event recording.
             // OOM kill events are now fed into the hash-chained audit ring buffer.

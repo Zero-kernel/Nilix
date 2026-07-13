@@ -19,7 +19,7 @@
 use alloc::string::ToString;
 use kernel_core::elf_loader::load_elf;
 use kernel_core::fork::{create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4};
-use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessState};
+use kernel_core::process::{create_process, get_process, FxSaveArea};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -488,7 +488,7 @@ pub fn run_usermode_test() -> bool {
         proc.context.fx = FxSaveArea::default();
 
         // Mark as ready to run
-        proc.state = ProcessState::Ready;
+        proc.enter_ready_at(kernel_core::get_ticks());
 
         klog!(Info, "      ✓ Process context configured");
         klog!(Info, "        Entry: 0x{:x}", load_result.entry);
