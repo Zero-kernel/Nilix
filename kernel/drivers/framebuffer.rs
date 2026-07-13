@@ -70,6 +70,12 @@ pub struct FramebufferWriter {
     fb_size: usize,
 }
 
+impl Default for FramebufferWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FramebufferWriter {
     /// Create an uninitialized writer
     pub const fn new() -> Self {
@@ -213,8 +219,7 @@ impl FramebufferWriter {
         // Get font bitmap for this character
         let bitmap = get_font_bitmap(c);
 
-        for row in 0..CHAR_HEIGHT {
-            let bits = bitmap[row];
+        for (row, &bits) in bitmap.iter().enumerate() {
             for col in 0..CHAR_WIDTH {
                 let color = if (bits >> (7 - col)) & 1 == 1 {
                     self.fg_color
@@ -283,7 +288,6 @@ impl FramebufferWriter {
         let line_bytes = self.stride as usize * CHAR_HEIGHT;
         let src_start = self.fb_base + line_bytes as u64;
         let dst_start = self.fb_base;
-        let copy_bytes = (self.max_row - 1) * line_bytes;
 
         // R24-8 fix: Validate that operations stay within framebuffer bounds
         let total_needed = (self.max_row * line_bytes).saturating_add(line_bytes);
@@ -293,7 +297,7 @@ impl FramebufferWriter {
         }
 
         // Copy line by line to handle overlapping regions
-        for row in 0..(self.max_row - 1) {
+        for (row, _) in (0..(self.max_row - 1)).enumerate() {
             let src = src_start + (row * line_bytes) as u64;
             let dst = dst_start + (row * line_bytes) as u64;
 
@@ -386,7 +390,7 @@ impl FramebufferWriter {
                         self.row = self.max_row - 1;
                     }
                 }
-                let c = if byte >= 0x20 && byte < 0x7f {
+                let c = if (0x20..0x7f).contains(&byte) {
                     byte as char
                 } else {
                     '?' // Replace unprintable with '?'
@@ -459,7 +463,7 @@ pub fn _print(args: fmt::Arguments) {
 /// Get font bitmap for a character (8x16 pixels)
 fn get_font_bitmap(c: char) -> [u8; CHAR_HEIGHT] {
     let idx = c as usize;
-    if idx >= 0x20 && idx < 0x7f {
+    if (0x20..0x7f).contains(&idx) {
         FONT_8X16[idx - 0x20]
     } else {
         FONT_8X16[0] // Space for unknown characters

@@ -103,13 +103,13 @@ impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &*self.inner
+        &self.inner
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.inner
+        &mut self.inner
     }
 }
 

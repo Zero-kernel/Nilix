@@ -884,7 +884,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // This is defense-in-depth: even if an attacker can write to page tables via
         // the recursive mapping, they cannot execute code from them.
         (&mut *pml4_ptr)[510].set_addr(
-            PhysAddr::new(pml4_frame as u64),
+            PhysAddr::new(pml4_frame),
             Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
         );
 
@@ -898,7 +898,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 加载新的页表
         Cr3::write(
-            PhysFrame::containing_address(PhysAddr::new(pml4_frame as u64)),
+            PhysFrame::containing_address(PhysAddr::new(pml4_frame)),
             Cr3::read().1,
         );
 

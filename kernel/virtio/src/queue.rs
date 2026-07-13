@@ -90,8 +90,8 @@ impl VirtQueue {
         let avail_size = 4 + 2 * queue_size as usize + 2;
 
         // Calculate aligned offsets
-        let desc_pages = (desc_size + 4095) / 4096;
-        let avail_pages = (avail_size + 4095) / 4096;
+        let desc_pages = desc_size.div_ceil(4096);
+        let avail_pages = avail_size.div_ceil(4096);
 
         let desc_phys = base_phys;
         let avail_phys = desc_phys + (desc_pages * 4096) as u64;
@@ -206,7 +206,7 @@ impl VirtQueue {
         }
 
         // R43-3 FIX: Detect double-free (redundant with above, but extra safety)
-        if free.iter().any(|&v| v == idx) {
+        if free.contains(&idx) {
             return;
         }
 

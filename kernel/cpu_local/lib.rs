@@ -126,8 +126,8 @@ pub const NO_FPU_OWNER: usize = usize::MAX;
 ///
 /// Index = CPU logical index, Value = hardware LAPIC ID.
 /// Used by `current_cpu_id()` to map LAPIC ID to CPU index.
+#[allow(clippy::declare_interior_mutable_const)]
 static LAPIC_ID_MAP: [AtomicU32; MAX_CPUS] = {
-    // Initialize all entries to INVALID_LAPIC_ID
     const INIT: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
     [INIT; MAX_CPUS]
 };
@@ -136,6 +136,7 @@ static LAPIC_ID_MAP: [AtomicU32; MAX_CPUS] = {
 ///
 /// Index = hardware LAPIC ID (0..255), Value = CPU logical index.
 /// This enables fast CPU ID lookup in syscall entry without linear search.
+#[allow(clippy::declare_interior_mutable_const)]
 static LAPIC_ID_REVERSE_MAP: [AtomicUsize; LAPIC_ID_REVERSE_MAP_SIZE] = {
     const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
     [INIT; LAPIC_ID_REVERSE_MAP_SIZE]
@@ -179,6 +180,12 @@ impl TlbShootdownEntry {
             start: AtomicU64::new(0),
             len: AtomicU64::new(0),
         }
+    }
+}
+
+impl Default for TlbShootdownEntry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -240,6 +247,12 @@ impl TlbShootdownMailbox {
     }
 }
 
+impl Default for TlbShootdownMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-CPU data required for SMP operation.
 ///
 /// This structure contains all per-CPU metadata needed by the scheduler,
@@ -297,6 +310,12 @@ pub struct PerCpuData {
 // Safety: PerCpuData uses only atomics, so it's Send+Sync
 unsafe impl Send for PerCpuData {}
 unsafe impl Sync for PerCpuData {}
+
+impl Default for PerCpuData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PerCpuData {
     /// Construct a zeroed per-CPU record.

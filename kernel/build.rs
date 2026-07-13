@@ -66,6 +66,7 @@ fn scan_test_files(manifest_dir: &str) -> Vec<PathBuf> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TestMetadata {
     name: String,
     category: Option<String>,
@@ -141,8 +142,8 @@ fn extract_test_name(line: &str) -> String {
 
 fn extract_field(doc_lines: &[&str], field: &str) -> Option<String> {
     for line in doc_lines {
-        if line.starts_with(field) {
-            return Some(line[field.len()..].trim().to_string());
+        if let Some(content) = line.strip_prefix(field) {
+            return Some(content.trim().to_string());
         }
     }
     None
@@ -204,13 +205,13 @@ fn validate_coverage(metadata: &[TestMetadata]) {
         );
 
         // Enforce minimums for P0 coverage
-        if category == &"Architecture" || category == &"Memory" || category == &"Scheduler" {
-            if p0_tests < 3 {
-                println!(
-                    "cargo:warning=WARNING: {} has only {} P0 tests (minimum 3 required)",
-                    category, p0_tests
-                );
-            }
+        if (category == &"Architecture" || category == &"Memory" || category == &"Scheduler")
+            && p0_tests < 3
+        {
+            println!(
+                "cargo:warning=WARNING: {} has only {} P0 tests (minimum 3 required)",
+                category, p0_tests
+            );
         }
     }
 
