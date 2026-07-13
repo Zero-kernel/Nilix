@@ -2,7 +2,7 @@
 #![no_main]
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::vec;
 use log::info;
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
