@@ -154,17 +154,15 @@ impl Initramfs {
             now,
         );
 
-        // Track inodes by their original inode number for hardlink support
+        // Track regular files by the full CPIO identity tuple. Inode numbers
+        // are only unique within a device.
         // R172-22-FOLLOWON: the hardlink-tracking map uses the allocation-fallible
         // FallibleOrderedMap (like ramfs) so a crafted/oversized CPIO archive returns NoSpace at
         // boot instead of aborting the kernel via handle_alloc_error. (File-data and inode
         // allocations on this path stay infallible — this closes the map-slot abort, not every
         // from_cpio OOM abort.)
-        let mut inode_by_ino: FallibleOrderedMap<u64, Arc<InitramfsInode>> =
+        let mut regular_by_key: FallibleOrderedMap<(u32, u32, u64), Arc<InitramfsInode>> =
             FallibleOrderedMap::new();
-        inode_by_ino
-            .try_insert(root.ino, root.clone())
-            .map_err(|_| FsError::NoSpace)?;
 
         let mut offset = 0usize;
 
@@ -235,15 +233,31 @@ impl Initramfs {
                 continue;
             }
 
-            // Check for hardlink (same inode number seen before)
-            let inode = if let Some(existing) = inode_by_ino.get(&header.ino) {
-                existing.clone()
-            } else {
-                let mode = FileMode::new(file_type, (header.mode & 0o7777) as u16);
-                let mtime = TimeSpec::new(header.mtime as i64, 0);
-                let nlink = core::cmp::max(header.nlink, 1);
+            let mode = FileMode::new(file_type, (header.mode & 0o7777) as u16);
+            let mtime = TimeSpec::new(header.mtime as i64, 0);
+            let nlink = core::cmp::max(header.nlink, 1);
 
-                let inode = match file_type {
+            // RF178-27 FIX: Every regular-file hardlink shares the exact inode Arc.
+            // CPIO may place the sole data-bearing payload in any record, so install
+            // later payloads into that object instead of replacing only the map entry.
+            let inode = if file_type == FileType::Regular {
+                let key = (header.devmajor, header.devminor, header.ino);
+                if let Some(existing) = regular_by_key.get(&key).cloned() {
+                    if !data.is_empty() {
+                        existing.install_file_data(data, mtime)?;
+                    }
+                    existing
+                } else {
+                    let inode = InitramfsInode::new_file(
+                        fs_id, header.ino, mode, nlink, header.uid, header.gid, mtime, data,
+                    );
+                    regular_by_key
+                        .try_insert(key, inode.clone())
+                        .map_err(|_| FsError::NoSpace)?;
+                    inode
+                }
+            } else {
+                match file_type {
                     FileType::Directory => InitramfsInode::new_dir(
                         fs_id,
                         header.ino,
@@ -253,18 +267,11 @@ impl Initramfs {
                         header.gid,
                         mtime,
                     ),
-                    FileType::Regular => InitramfsInode::new_file(
-                        fs_id, header.ino, mode, nlink, header.uid, header.gid, mtime, data,
-                    ),
                     FileType::Symlink => InitramfsInode::new_symlink(
                         fs_id, header.ino, mode, nlink, header.uid, header.gid, mtime, data,
                     ),
                     _ => unreachable!(),
-                };
-                inode_by_ino
-                    .try_insert(header.ino, inode.clone())
-                    .map_err(|_| FsError::NoSpace)?;
-                inode
+                }
             };
 
             // Attach to directory tree
@@ -358,7 +365,9 @@ enum NodeKind {
         children: RwLock<FallibleOrderedMap<String, Arc<InitramfsInode>>>,
     },
     File {
-        data: Arc<[u8]>,
+        /// Mutable only while the archive is being assembled. All hardlink
+        /// directory entries share this inode and therefore this content slot.
+        data: RwLock<Arc<[u8]>>,
     },
     Symlink {
         target: Arc<[u8]>,
@@ -433,11 +442,37 @@ impl InitramfsInode {
                 mtime,
                 ctime: mtime,
             }),
-            kind: NodeKind::File { data: buf },
+            kind: NodeKind::File {
+                data: RwLock::new(buf),
+            },
             self_ref: RwLock::new(None),
         });
         *inode.self_ref.write() = Some(Arc::downgrade(&inode));
         inode
+    }
+
+    /// RF178-27 FIX: Install a later CPIO hardlink payload into the already
+    /// attached inode. Conflicting non-empty payloads are a malformed archive.
+    fn install_file_data(&self, bytes: &[u8], mtime: TimeSpec) -> Result<(), FsError> {
+        let replacement: Arc<[u8]> = bytes.to_vec().into();
+        match &self.kind {
+            NodeKind::File { data } => {
+                let mut current = data.write();
+                if !current.is_empty() && current.as_ref() != bytes {
+                    return Err(FsError::Invalid);
+                }
+                if current.is_empty() {
+                    *current = replacement;
+                    drop(current);
+                    let mut meta = self.meta.write();
+                    meta.size = bytes.len() as u64;
+                    meta.mtime = mtime;
+                    meta.ctime = mtime;
+                }
+                Ok(())
+            }
+            _ => Err(FsError::Invalid),
+        }
     }
 
     /// Create a new symlink inode
@@ -659,6 +694,7 @@ impl Inode for InitramfsInode {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         match &self.kind {
             NodeKind::File { data } => {
+                let data = data.read();
                 let start = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
                 if start >= data.len() {
                     return Ok(0);

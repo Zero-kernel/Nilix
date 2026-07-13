@@ -852,17 +852,21 @@ impl CgroupCtrlInode {
                 Ok(())
             }
             CtrlKind::CpuMax => {
-                // Parse "quota period" or "max period"
-                let parts: Vec<&str> = data.split_whitespace().collect();
-                if parts.len() != 2 {
+                // RF178-10 FIX: Parse exactly two tokens without materializing a
+                // user-sized Vec<&str>. Collecting tiny tokens amplified a bounded
+                // write into an infallible kernel allocation.
+                let mut tokens = data.split_whitespace();
+                let quota_token = tokens.next().ok_or(FsError::Invalid)?;
+                let period_token = tokens.next().ok_or(FsError::Invalid)?;
+                if tokens.next().is_some() {
                     return Err(FsError::Invalid);
                 }
-                let quota = if parts[0] == "max" {
+                let quota = if quota_token == "max" {
                     u64::MAX
                 } else {
-                    parts[0].parse().map_err(|_| FsError::Invalid)?
+                    quota_token.parse().map_err(|_| FsError::Invalid)?
                 };
-                let period: u64 = parts[1].parse().map_err(|_| FsError::Invalid)?;
+                let period: u64 = period_token.parse().map_err(|_| FsError::Invalid)?;
                 let limits = CgroupLimits {
                     cpu_max: Some((quota, period)),
                     ..Default::default()

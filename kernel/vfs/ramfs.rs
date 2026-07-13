@@ -24,7 +24,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
@@ -180,6 +180,9 @@ pub struct RamFsInode {
     ino: u64,
     meta: RwLock<Meta>,
     kind: NodeKind,
+    /// RF178-16 FIX: A removed directory may remain alive through an open file
+    /// description, but it is no longer a valid topology parent.
+    detached: AtomicBool,
     /// Weak self-reference for FileHandle creation
     self_ref: RwLock<Option<Weak<RamFsInode>>>,
 }
@@ -195,6 +198,7 @@ impl RamFsInode {
             kind: NodeKind::Dir {
                 entries: RwLock::new(FallibleOrderedMap::new()),
             },
+            detached: AtomicBool::new(false),
             self_ref: RwLock::new(None),
         });
         // Store weak self-reference
@@ -212,6 +216,7 @@ impl RamFsInode {
             kind: NodeKind::File {
                 data: RwLock::new(Vec::new()),
             },
+            detached: AtomicBool::new(false),
             self_ref: RwLock::new(None),
         });
         // Store weak self-reference
@@ -237,6 +242,7 @@ impl RamFsInode {
             kind: NodeKind::Symlink {
                 target: RwLock::new(target),
             },
+            detached: AtomicBool::new(false),
             self_ref: RwLock::new(None),
         });
         // Set symlink size to target path length
@@ -287,6 +293,40 @@ impl RamFsInode {
                 let mut key = String::new();
                 key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
                 key.push_str(name);
+                entries
+                    .try_insert(key, child)
+                    .map_err(|_| FsError::NoSpace)?;
+
+                // Update parent directory timestamps
+                let mut meta = self.meta.write();
+                let now = TimeSpec::now();
+                meta.mtime = now;
+                meta.ctime = now;
+
+                Ok(())
+            }
+            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
+        }
+    }
+
+    /// R178-29 FIX: Add a child entry using a pre-allocated key.
+    /// Bypasses the internal try_reserve in add_child(), allowing the caller to
+    /// complete all fallible allocations before charging quota.
+    fn add_child_with_key(&self, key: String, child: Arc<RamFsInode>) -> Result<(), FsError> {
+        // Validate name (key is already allocated, just check constraints)
+        if key.is_empty() || key.len() > 255 || key.contains('/') {
+            return Err(FsError::NameTooLong);
+        }
+        if key == "." || key == ".." {
+            return Err(FsError::Invalid);
+        }
+
+        match &self.kind {
+            NodeKind::Dir { entries } => {
+                let mut entries = entries.write();
+                if entries.contains_key(&key) {
+                    return Err(FsError::Exists);
+                }
                 entries
                     .try_insert(key, child)
                     .map_err(|_| FsError::NoSpace)?;
@@ -375,16 +415,29 @@ impl RamFsInode {
             NodeKind::File { .. } | NodeKind::Symlink { .. } => None,
         }
     }
+
+    /// Reject mutations through an open handle to an unlinked directory.
+    fn ensure_attached_dir(&self) -> Result<(), FsError> {
+        if !self.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        if self.detached.load(Ordering::Acquire) {
+            return Err(FsError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn mark_detached_dir(&self) {
+        debug_assert!(self.is_dir());
+        self.detached.store(true, Ordering::Release);
+    }
 }
 
-/// M0-6 slice 2: serialize ALL ramfs renames (Linux `s_vfs_rename_mutex` pattern). A
-/// cross-parent rename of a directory victim calls `victim.child_count()` (a THIRD
-/// `entries` lock outside the two-parent low-ino order) while holding both parent guards;
-/// two concurrent renames could then deadlock. A single rename-serialization mutex makes
-/// that impossible (only one rename ever holds parent guards), and non-rename ops take a
-/// single parent lock so they cannot close a cycle against a serialized rename. Renames are
-/// rare, so the coarse grain is acceptable.
-static RAMFS_RENAME_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// RF178-16 FIX: Serialize every RAMFS topology mutation. This is the authority
+/// for directory emptiness, detach, and ancestry, so callers never need to nest
+/// a child `entries` lock under a parent lock. It also linearizes the detached
+/// tombstone with mutations through retained directory handles.
+static RAMFS_TOPOLOGY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// M0-6 slice 2: under the spanning lock, bind the manager's DAC/sticky/LSM decision (made
 /// on `expected_src_ino` / `expected_dest_ino`) to the inode actually moved. A concurrent
@@ -420,12 +473,13 @@ enum RenameDecision {
     Replace,
 }
 
-/// Decide the rename outcome from the source inode and the destination slot (both read
-/// under the held lock). Returns an error BEFORE any mutation if the move is illegal.
+/// Decide the rename outcome from the source inode and destination slot read under
+/// the parent guard. Directory emptiness is the topology-locked preflight result.
 fn rename_decide(
     inode: &Arc<RamFsInode>,
     inode_is_dir: bool,
     dest: Option<Arc<RamFsInode>>,
+    dest_dir_empty: Option<bool>,
     noreplace: bool,
     old_parent: &RamFsInode,
     new_parent: &RamFsInode,
@@ -444,17 +498,8 @@ fn rename_decide(
             if Arc::ptr_eq(inode, &existing) {
                 return Ok(RenameDecision::NoOp);
             }
-            // R172-14 FIX: the victim must never be one of the parent `entries` maps whose
-            // write guard the caller already holds — `existing.child_count()` below does
-            // `entries.read()`, and `spin::RwLock` is NON-reentrant, so child_count() on a
-            // held-write parent SELF-DEADLOCKS while holding RAMFS_RENAME_LOCK -> system-wide
-            // rename DoS. Reachable as rename("/a/sub","/a") (dest == old_parent) and the
-            // symmetric forms. Overwriting one's own parent/ancestor dir is structurally
-            // illegal (it would orphan/cycle the subtree) => EINVAL, fail-closed UNDER the
-            // held lock with NO path-string dependence (ramfs must not trust the manager's
-            // lexical guard). Pure pointer ops: no new lock, no lock-order inversion. The
-            // held write guards are exactly {old_parent.entries, new_parent.entries}, so this
-            // covers every inode on which child_count() could re-enter a held lock.
+            // R172-14 FIX: overwriting either parent would orphan or cycle the
+            // subtree. Reject it by identity, independent of lexical path checks.
             let ep: *const RamFsInode = Arc::as_ptr(&existing);
             if core::ptr::eq(ep, old_parent as *const RamFsInode)
                 || core::ptr::eq(ep, new_parent as *const RamFsInode)
@@ -466,7 +511,9 @@ fn rename_decide(
                 if !inode_is_dir {
                     return Err(FsError::IsDir);
                 }
-                if existing.child_count() > 0 {
+                // RF178-16 FIX: Emptiness was sampled before parent write locks
+                // under RAMFS_TOPOLOGY_LOCK. Do not nest a child read here.
+                if dest_dir_empty != Some(true) {
                     return Err(FsError::NotEmpty);
                 }
             } else if inode_is_dir {
@@ -483,8 +530,8 @@ fn rename_decide(
 /// (snapshot-clone the child Arcs, DROP the lock, then descend) so it never lock-couples /
 /// ABBAs with create/unlink (each takes a single parent write). ino-based: inos are unique
 /// within the fs and never reused (`next_ino` is checked_add), so there is no ABA. Called
-/// UNDER RAMFS_RENAME_LOCK (topology quiescent — only rename re-parents a directory, and
-/// renames serialize on that lock) to reject moving a directory under its own subtree, which
+/// UNDER RAMFS_TOPOLOGY_LOCK (all topology mutators quiescent) to reject moving a
+/// directory under its own subtree, which
 /// would commit a mutual `Arc<RamFsInode>` cycle detached from root. Fails CLOSED to NoSpace
 /// on heap exhaustion (a rename failing on genuine OOM is acceptable — never a panic, never a
 /// false negative that would let the cycle through).
@@ -775,6 +822,47 @@ impl Inode for RamFsInode {
         }
     }
 
+    // R178-21 FIX: Atomic append write with inode-level serialization
+    fn append_write(&self, data_in: &[u8]) -> Result<(usize, u64), FsError> {
+        match &self.kind {
+            NodeKind::File { data } => {
+                // Lock file data (inode-level) for atomic EOF + write
+                let mut data = data.write();
+                let offset = data.len();
+                let required_len = offset.checked_add(data_in.len()).ok_or(FsError::Invalid)?;
+
+                // V-3 fix: Enforce maximum file size
+                if required_len > MAX_FILE_SIZE {
+                    return Err(FsError::NoSpace);
+                }
+
+                // Transactional quota + allocation
+                if required_len > offset {
+                    let additional_bytes = required_len - offset;
+                    let guard = QuotaGuard::try_new(additional_bytes)?;
+                    data.try_reserve_exact(additional_bytes)
+                        .map_err(|_| FsError::NoMem)?;
+                    data.resize(required_len, 0);
+                    guard.commit();
+                }
+
+                // Write data at EOF
+                data[offset..required_len].copy_from_slice(data_in);
+
+                // Update metadata
+                let mut meta = self.meta.write();
+                meta.size = data.len() as u64;
+                let now = TimeSpec::now();
+                meta.mtime = now;
+                meta.ctime = now;
+
+                Ok((data_in.len(), required_len as u64))
+            }
+            NodeKind::Dir { .. } => Err(FsError::IsDir),
+            NodeKind::Symlink { .. } => Err(FsError::Invalid),
+        }
+    }
+
     fn truncate(&self, len: u64) -> Result<(), FsError> {
         match &self.kind {
             NodeKind::File { data } => {
@@ -951,7 +1039,10 @@ impl FileSystem for RamFs {
             RamFsInode::new_file(self.fs_id, ino, final_perm, uid, gid)
         };
 
-        // Add to parent directory
+        // RF178-16 FIX: Publication is serialized with detach, and retained
+        // handles to an unlinked directory cannot acquire new children.
+        let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
+        parent.ensure_attached_dir()?;
         parent.add_child(name, new_inode.clone())?;
 
         // If creating a directory, increment parent's nlink
@@ -980,42 +1071,39 @@ impl FileSystem for RamFs {
             return Err(FsError::Invalid);
         }
 
-        // R172-X-F4-FOLLOWON: the non-empty-directory pre-check uses the child's OWN (released)
-        // `entries` lock and is NEVER taken while holding the parent guard. RAMFS_RENAME_LOCK's
-        // invariant (see ramfs.rs ~:314) is that non-rename ops hold a SINGLE parent `entries`
-        // lock, so nesting child_count()'s lock under the parent write guard below would reopen
-        // the rename-vs-unlink ABBA that lock exists to prevent. This check stays advisory (the
-        // pre-existing add-after-check race is unchanged and out of scope); the AUTHORITATIVE
-        // identity+type gate runs atomically with the removal.
-        if let Ok(child) = parent.lookup_child(name) {
-            if child.is_dir() && child.child_count() > 0 {
+        // RF178-16 FIX: Serialize emptiness validation and detach without
+        // parent/child lock coupling; read locks can participate in ABBA too.
+        let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
+        parent.ensure_attached_dir()?;
+        let entries = parent.dir_entries().ok_or(FsError::NotDir)?;
+        let current = entries.read().get(name).cloned().ok_or(FsError::NotFound)?;
+
+        // Bind the manager's authorization and POSIX type decision to this inode.
+        if current.ino() != expected_ino {
+            return Err(FsError::PermDenied);
+        }
+        match must_be_dir {
+            Some(true) if !current.is_dir() => return Err(FsError::NotDir),
+            Some(false) if current.is_dir() => return Err(FsError::IsDir),
+            _ => {}
+        }
+
+        // RF178-16 FIX: No topology mutator can add a child while the mutex is
+        // held. Observe the child with a transient lock, release it, then detach
+        // from the parent. No parent/child lock nesting is required.
+        if let NodeKind::Dir {
+            entries: child_entries,
+        } = &current.kind
+        {
+            if !child_entries.read().is_empty() {
                 return Err(FsError::NotEmpty);
             }
         }
 
-        // R172-X-F4-FOLLOWON: under ONE parent `entries` write guard, re-verify the entry STILL
-        // maps to `expected_ino` (closes the file<->dir swap TOCTOU the manager's separate
-        // stat()/lookup could not) AND satisfies the POSIX type gate (`must_be_dir`), then
-        // remove — all observing one unchanged parent directory state. `ino()` is a plain field
-        // read and ramfs `is_dir()` is a lock-free `matches!`, so the gate takes NO second lock
-        // (no entries->entries nesting), preserving the single-parent-lock invariant above.
-        let entries = parent.dir_entries().ok_or(FsError::NotDir)?;
-        let removed = {
-            let mut guard = entries.write();
-            let current = guard.get(name).cloned().ok_or(FsError::NotFound)?;
-            if current.ino() != expected_ino {
-                // Entry was swapped since the manager's revalidated lookup -> fail closed,
-                // mirroring the manager's C.4 inode-swap reject (so a removal can never land on
-                // an inode other than the one the DAC/sticky/LSM decision was bound to).
-                return Err(FsError::PermDenied);
-            }
-            match must_be_dir {
-                Some(true) if !current.is_dir() => return Err(FsError::NotDir), // rmdir on non-dir
-                Some(false) if current.is_dir() => return Err(FsError::IsDir),  // unlink on dir
-                _ => {}
-            }
-            guard.remove(name).ok_or(FsError::NotFound)?
-        };
+        let removed = entries.write().remove(name).ok_or(FsError::NotFound)?;
+        if removed.is_dir() {
+            removed.mark_detached_dir();
+        }
 
         // The raw-map remove bypassed remove_child (which updates the parent dir timestamps);
         // mirror it, exactly as the atomic rename path does (ramfs.rs ~:292).
@@ -1074,15 +1162,13 @@ impl FileSystem for RamFs {
             "distinct ramfs parents must have distinct inode numbers"
         );
 
-        // Serialize all renames so the victim-dir `child_count()` lock (a third `entries`
-        // lock taken inside the spanning section) can never deadlock against a concurrent
-        // rename. Held for the whole transaction; released on return.
-        let _rename_guard = RAMFS_RENAME_LOCK.lock();
+        // RF178-16 FIX: Rename participates in the same transaction as every
+        // other topology mutator, making ancestry and victim emptiness stable.
+        let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
+        old_parent.ensure_attached_dir()?;
+        new_parent.ensure_attached_dir()?;
 
-        // R172-15 FIX: under RAMFS_RENAME_LOCK (topology now quiescent — only rename
-        // re-parents a directory and renames serialize on this lock; create/mkdir mint fresh
-        // inodes, unlink only removes, and there is no directory-hardlink op, so no non-rename
-        // mutation can change directory ancestry), reject moving a DIRECTORY under its own
+        // R172-15 FIX: under RAMFS_TOPOLOGY_LOCK, reject moving a DIRECTORY under its own
         // subtree (new_parent == source or a descendant of source). Committing that grafts a
         // mutual Arc<RamFsInode> cycle detached from root -> permanent subtree/data loss +
         // kernel-heap exhaustion via repeated cyclic renames. The manager's lexical guard
@@ -1099,6 +1185,13 @@ impl FileSystem for RamFs {
                 }
             }
         }
+
+        // RF178-16 FIX: Sample victim-directory emptiness without any parent
+        // write lock. The topology mutex keeps it stable through the commit.
+        let dest_dir_empty = match new_parent.lookup_child(new_name) {
+            Ok(dest) if dest.is_dir() => Some(dest.child_count() == 0),
+            _ => None,
+        };
 
         // === Spanning critical section: decide + commit atomically ===
         // Order is INSERT-NEW (overwrites any victim, returns it) then REMOVE-OLD: no
@@ -1117,6 +1210,7 @@ impl FileSystem for RamFs {
                 &inode,
                 inode_is_dir,
                 dest,
+                dest_dir_empty,
                 noreplace,
                 old_parent,
                 new_parent,
@@ -1162,6 +1256,7 @@ impl FileSystem for RamFs {
                 &inode,
                 inode_is_dir,
                 dest,
+                dest_dir_empty,
                 noreplace,
                 old_parent,
                 new_parent,
@@ -1187,6 +1282,11 @@ impl FileSystem for RamFs {
                 }
             }
         };
+        if let Some(ref evicted) = victim {
+            if evicted.is_dir() {
+                evicted.mark_detached_dir();
+            }
+        }
         // Guards released here -> nlink/timestamp fixups take only `meta` locks (entries
         // -> meta is the established lock order, so no inversion).
         rename_apply_accounting(
@@ -1225,13 +1325,33 @@ impl FileSystem for RamFs {
             return Err(FsError::NameTooLong);
         }
 
-        // Charge the target bytes against the ramfs global quota BEFORE
-        // allocating the inode, mirroring file writes (SYM-QUOTA-BYPASS fix).
-        // Symlink target storage was previously an uncharged heap allocation
-        // path — an unbounded-DoS bypass of MAX_TOTAL_BYTES.
-        if !quota_try_alloc(target.len()) {
-            return Err(FsError::NoSpace);
-        }
+        // R178-29 FIX: Perform ALL fallible allocations BEFORE quota charge to prevent
+        // quota-guard-spanning leak. The target String and parent directory entry key
+        // allocate fallibly. If either fails, we return FsError::NoSpace BEFORE charging
+        // quota, eliminating the leak-on-OOM window.
+        //
+        // Previous bug: quota_try_alloc(target.len()) happened before new_symlink(), but
+        // new_symlink() contains target.to_string() (infallible clone) and add_child()
+        // contains fallible String key allocation. If either failed post-quota-charge,
+        // the quota leaked because the inode Drop handler only runs on successfully
+        // constructed nodes.
+
+        // Pre-allocate the target string fallibly
+        let mut target_owned = String::new();
+        target_owned
+            .try_reserve(target.len())
+            .map_err(|_| FsError::NoSpace)?;
+        target_owned.push_str(target);
+
+        // Pre-allocate the directory entry key fallibly
+        let mut entry_key = String::new();
+        entry_key
+            .try_reserve(name.len())
+            .map_err(|_| FsError::NoSpace)?;
+        entry_key.push_str(name);
+
+        // NOW charge quota — all fallible allocations are complete
+        let quota_guard = QuotaGuard::try_new(target.len())?;
 
         // Allocate inode number
         let ino = self.alloc_ino();
@@ -1249,18 +1369,34 @@ impl FileSystem for RamFs {
         };
         drop(parent_meta);
 
-        // Create new symlink inode (symlinks always have 0o777 permissions)
-        let new_inode =
-            RamFsInode::new_symlink(self.fs_id, ino, 0o777, uid, gid, target.to_string());
+        // Create new symlink inode using the pre-allocated target (move ownership)
+        let mode = FileMode::symlink(0o777);
+        // RF178-25 FIX: Transfer charge ownership before Arc allocation. On
+        // Arc::try_new failure the constructed inode value is dropped and
+        // releases the charge exactly once; an armed guard would release it a
+        // second time and undercount RAMFS quota.
+        quota_guard.commit();
+        let inode = Arc::try_new(RamFsInode {
+            fs_id: self.fs_id,
+            ino,
+            meta: RwLock::new(Meta::new(mode, uid, gid)),
+            kind: NodeKind::Symlink {
+                target: RwLock::new(target_owned),
+            },
+            detached: AtomicBool::new(false),
+            self_ref: RwLock::new(None),
+        })
+        .map_err(|_| FsError::NoSpace)?;
+        // RamFsInode::drop now owns the charge. If insertion fails, dropping
+        // the last Arc releases it exactly once.
+        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
 
-        // Add to parent directory. On failure (EEXIST / NoSpace), `new_inode`
-        // (and the passed clone) drop here WITHOUT being linked, so the Symlink
-        // Drop arm releases the quota charged above exactly once — no manual
-        // rollback needed, no double-release (SYM-INO-LEAK quota leg). The inode
-        // NUMBER is not reclaimed (next_ino is monotonic + overflow-guarded).
-        parent.add_child(name, new_inode.clone())?;
+        // RF178-16 FIX: Publication is serialized with directory detach.
+        let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
+        parent.ensure_attached_dir()?;
+        parent.add_child_with_key(entry_key, inode.clone())?;
 
-        Ok(new_inode as Arc<dyn Inode>)
+        Ok(inode as Arc<dyn Inode>)
     }
 }
 

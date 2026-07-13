@@ -20,7 +20,7 @@ use core::any::Any;
 use core::cmp;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_core::{FileOps, SyscallError, VfsStat};
+use kernel_core::FileOps;
 use mm::{
     buddy_allocator, page_cache, PageCacheEntry, PageState, PAGE_CACHE, PAGE_SIZE,
     PHYSICAL_MEMORY_OFFSET,
@@ -51,6 +51,342 @@ pub const EXT2_DIND_BLOCK: usize = 13;
 
 /// Triple indirect block index
 pub const EXT2_TIND_BLOCK: usize = 14;
+
+/// RF178-32 FIX: validate the entire half-open write range before Ext2 can
+/// allocate or modify any block. Direct holes are allocatable; indirect holes
+/// are not yet supported and must fail before earlier blocks are changed.
+fn preflight_direct_write<F>(
+    offset: u64,
+    len: usize,
+    block_size: u64,
+    mut indirect_is_mapped: F,
+) -> Result<u64, FsError>
+where
+    F: FnMut(u32) -> Result<bool, FsError>,
+{
+    if block_size == 0 {
+        return Err(FsError::Invalid);
+    }
+    let direct_limit = block_size
+        .checked_mul(EXT2_NDIR_BLOCKS as u64)
+        .ok_or(FsError::Invalid)?;
+    let len = u64::try_from(len).map_err(|_| FsError::Invalid)?;
+    let end_offset = offset.checked_add(len).ok_or(FsError::Invalid)?;
+    if len == 0 || end_offset <= direct_limit {
+        return Ok(end_offset);
+    }
+
+    let last_block = u32::try_from((end_offset - 1) / block_size)
+        .map_err(|_| FsError::Invalid)?;
+    let first_indirect = u32::try_from((offset / block_size).max(EXT2_NDIR_BLOCKS as u64))
+        .map_err(|_| FsError::Invalid)?;
+    for file_block in first_indirect..=last_block {
+        if !indirect_is_mapped(file_block)? {
+            return Err(FsError::NotSupported);
+        }
+    }
+    Ok(end_offset)
+}
+
+/// RF178-39 FIX: one reusable block-sized allocation for an entire ext2
+/// write/append mutation. Every metadata/data RMW after the first persistent
+/// write borrows this buffer instead of allocating another Vec.
+struct Ext2MutationScratch {
+    block: Vec<u8>,
+}
+
+impl Ext2MutationScratch {
+    fn try_new(block_size: u32) -> Result<Self, FsError> {
+        if !(1024..=65536).contains(&block_size)
+            || size_of::<Ext2Superblock>() > 1024
+        {
+            return Err(FsError::Invalid);
+        }
+        let block_size = block_size as usize;
+        let mut block = Vec::new();
+        block
+            .try_reserve_exact(block_size)
+            .map_err(|_| FsError::NoSpace)?;
+        block.resize(block_size, 0);
+        Ok(Self { block })
+    }
+
+    #[inline]
+    fn block(&self) -> &[u8] {
+        &self.block
+    }
+
+    #[inline]
+    fn block_mut(&mut self) -> &mut [u8] {
+        &mut self.block
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Ext2WriteMode {
+    Positioned(u64),
+    Append,
+}
+
+#[derive(Clone, Copy)]
+struct InodeWriteTarget {
+    block: u32,
+    start: usize,
+    end: usize,
+    copy_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GroupDescWriteTarget {
+    block: u32,
+    offset: usize,
+}
+
+/// Boot-time boundary probes for the direct-only write preflight.
+#[doc(hidden)]
+pub fn run_ext2_direct_write_preflight_self_test() {
+    const BLOCK_SIZE: u64 = 4096;
+    const DIRECT_LIMIT: u64 = BLOCK_SIZE * EXT2_NDIR_BLOCKS as u64;
+
+    assert_eq!(
+        preflight_direct_write(0, DIRECT_LIMIT as usize, BLOCK_SIZE, |_| {
+            panic!("direct range must not inspect indirect mappings")
+        }),
+        Ok(DIRECT_LIMIT)
+    );
+    assert_eq!(
+        preflight_direct_write(DIRECT_LIMIT - 1, 1, BLOCK_SIZE, |_| {
+            panic!("direct range must not inspect indirect mappings")
+        }),
+        Ok(DIRECT_LIMIT)
+    );
+    assert_eq!(
+        preflight_direct_write(DIRECT_LIMIT - 1, 2, BLOCK_SIZE, |_| Ok(false)),
+        Err(FsError::NotSupported)
+    );
+    assert_eq!(
+        preflight_direct_write(11 * BLOCK_SIZE, 1, BLOCK_SIZE, |_| {
+            panic!("sparse direct block 11 must remain allocatable")
+        }),
+        Ok(11 * BLOCK_SIZE + 1)
+    );
+    assert_eq!(
+        preflight_direct_write(
+            DIRECT_LIMIT - BLOCK_SIZE / 2,
+            BLOCK_SIZE as usize,
+            BLOCK_SIZE,
+            |_| Ok(false),
+        ),
+        Err(FsError::NotSupported)
+    );
+    assert_eq!(
+        preflight_direct_write(u64::MAX - 1, 2, BLOCK_SIZE, |_| Ok(true)),
+        Err(FsError::Invalid)
+    );
+    assert_eq!(
+        preflight_direct_write(0, 1, u64::MAX, |_| Ok(true)),
+        Err(FsError::Invalid)
+    );
+    assert_eq!(
+        preflight_direct_write(DIRECT_LIMIT, 1, BLOCK_SIZE, |block| Ok(block == 12)),
+        Ok(DIRECT_LIMIT + 1)
+    );
+    assert_eq!(
+        preflight_direct_write(DIRECT_LIMIT, BLOCK_SIZE as usize + 1, BLOCK_SIZE, |block| {
+            Ok(block != 13)
+        }),
+        Err(FsError::NotSupported)
+    );
+}
+
+/// Boot-time probes for RF178-39's allocation discipline and fallible lossy
+/// directory-name decoder. Pointer/capacity stability proves buffer reuse does
+/// not grow the Vec after the pre-mutation allocation succeeds.
+#[doc(hidden)]
+pub fn run_ext2_mutation_scratch_self_test() {
+    assert!(matches!(
+        Ext2MutationScratch::try_new(1023),
+        Err(FsError::Invalid)
+    ));
+    assert!(matches!(
+        Ext2MutationScratch::try_new(65537),
+        Err(FsError::Invalid)
+    ));
+
+    for block_size in [1024u32, 4096, 65536] {
+        let mut scratch =
+            Ext2MutationScratch::try_new(block_size).expect("ext2 mutation scratch");
+        let ptr = scratch.block.as_ptr();
+        let capacity = scratch.block.capacity();
+        scratch.block_mut().fill(0xA5);
+        assert_eq!(scratch.block().len(), block_size as usize);
+        assert_eq!(scratch.block.as_ptr(), ptr);
+        assert_eq!(scratch.block.capacity(), capacity);
+        scratch.block_mut().fill(0);
+        assert_eq!(scratch.block.as_ptr(), ptr);
+        assert_eq!(scratch.block.capacity(), capacity);
+    }
+
+    assert_eq!(
+        fallible_lossy_name("zero-OS".as_bytes()).expect("valid UTF-8 name"),
+        "zero-OS"
+    );
+    assert_eq!(
+        fallible_lossy_name("零-OS".as_bytes()).expect("valid multibyte UTF-8 name"),
+        "零-OS"
+    );
+    assert_eq!(
+        fallible_lossy_name(&[b'a', 0xF0, b'(', 0x8C, b'(', b'z'])
+            .expect("invalid UTF-8 name"),
+        "a\u{FFFD}(\u{FFFD}(z"
+    );
+    assert_eq!(
+        fallible_lossy_name(&[0xE2, 0x82]).expect("truncated UTF-8 name"),
+        "\u{FFFD}"
+    );
+    assert_eq!(
+        fallible_lossy_name(&[0x80, 0x80]).expect("consecutive invalid UTF-8 bytes"),
+        "\u{FFFD}\u{FFFD}"
+    );
+
+    struct TraceBlockDevice {
+        bytes: Mutex<Vec<u8>>,
+        writes: AtomicU64,
+    }
+
+    impl BlockDevice for TraceBlockDevice {
+        fn name(&self) -> &str {
+            "ext2-rf178-39-trace"
+        }
+
+        fn sector_size(&self) -> u32 {
+            512
+        }
+
+        fn capacity_sectors(&self) -> u64 {
+            (self.bytes.lock().len() / 512) as u64
+        }
+
+        fn submit_bio(&self, _bio: block::Bio) -> Result<(), block::BlockError> {
+            Err(block::BlockError::NotSupported)
+        }
+
+        fn read_sync(
+            &self,
+            sector: u64,
+            buf: &mut [u8],
+        ) -> Result<usize, block::BlockError> {
+            let start = usize::try_from(sector)
+                .ok()
+                .and_then(|sector| sector.checked_mul(512))
+                .ok_or(block::BlockError::Invalid)?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or(block::BlockError::Invalid)?;
+            let bytes = self.bytes.lock();
+            let source = bytes
+                .get(start..end)
+                .ok_or(block::BlockError::Invalid)?;
+            buf.copy_from_slice(source);
+            Ok(buf.len())
+        }
+
+        fn write_sync(&self, sector: u64, buf: &[u8]) -> Result<usize, block::BlockError> {
+            let start = usize::try_from(sector)
+                .ok()
+                .and_then(|sector| sector.checked_mul(512))
+                .ok_or(block::BlockError::Invalid)?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or(block::BlockError::Invalid)?;
+            let mut bytes = self.bytes.lock();
+            let target = bytes
+                .get_mut(start..end)
+                .ok_or(block::BlockError::Invalid)?;
+            target.copy_from_slice(buf);
+            self.writes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |writes| {
+                    writes.checked_add(1)
+                })
+                .expect("ext2 trace write counter overflow");
+            Ok(buf.len())
+        }
+    }
+
+    let mut device_bytes = Vec::new();
+    device_bytes
+        .try_reserve_exact(8 * 1024)
+        .expect("trace block-device bytes");
+    device_bytes.resize(8 * 1024, 0);
+    let device = Arc::try_new(TraceBlockDevice {
+        bytes: Mutex::new(device_bytes),
+        writes: AtomicU64::new(0),
+    })
+    .expect("trace block device");
+    let dev: Arc<dyn BlockDevice> = device.clone();
+
+    // SAFETY: Ext2Superblock contains only integer fields and byte arrays.
+    let mut superblock: Ext2Superblock = unsafe { core::mem::zeroed() };
+    superblock.inodes_count = 8;
+    superblock.blocks_count = 8;
+    superblock.free_blocks_count = 2;
+    superblock.first_data_block = 1;
+    superblock.blocks_per_group = 8;
+    superblock.inodes_per_group = 8;
+    let mut group_descs = Vec::new();
+    group_descs
+        .try_reserve_exact(1)
+        .expect("trace group descriptor");
+    group_descs.push(Ext2GroupDesc {
+        inode_table: 3,
+        free_blocks_count: 2,
+        ..Ext2GroupDesc::default()
+    });
+    let fs = Arc::try_new(Ext2Fs {
+        fs_id: u64::MAX - 179,
+        dev,
+        superblock: RwLock::new(superblock),
+        group_descs: RwLock::new(group_descs),
+        block_size: 1024,
+        sector_size: 512,
+        blocks_count: 8,
+        blocks_per_group: 8,
+        inodes_per_group: 8,
+        inode_size: size_of::<Ext2InodeRaw>() as u16,
+        root: RwLock::new(None),
+        inode_cache: WeakArcCache::new(),
+        meta_lock: Mutex::new(()),
+        self_ref: Mutex::new(None),
+    })
+    .expect("trace ext2 filesystem");
+    let mut raw = Ext2InodeRaw::default();
+    raw.mode = EXT2_S_IFREG | 0o644;
+    raw.size_lo = 1;
+    raw.links_count = 1;
+    raw.blocks_lo = 2;
+    raw.block[0] = 5;
+    let inode = fs
+        .inode_cache
+        .get_or_try_insert_with(2, || fs.new_inode_from_raw(2, raw))
+        .expect("trace canonical inode");
+
+    assert_eq!(inode.write_at(0, b"A"), Ok(1));
+    assert_eq!(device.writes.load(Ordering::Relaxed), 2);
+    assert_eq!(inode.append_write(b"B"), Ok((1, 2)));
+    assert_eq!(device.writes.load(Ordering::Relaxed), 4);
+
+    let writes_before_reject = device.writes.load(Ordering::Relaxed);
+    let direct_limit = 1024u64 * EXT2_NDIR_BLOCKS as u64;
+    assert_eq!(
+        inode.write_at(direct_limit - 1, b"XY"),
+        Err(FsError::NotSupported)
+    );
+    assert_eq!(
+        device.writes.load(Ordering::Relaxed),
+        writes_before_reject,
+        "preflight rejection must occur before any device write"
+    );
+}
 
 /// File type in mode field
 pub const EXT2_S_IFMT: u16 = 0xF000;
@@ -109,6 +445,47 @@ fn read_u32_le(buf: &[u8], index: usize) -> Result<u32, FsError> {
         .ok_or(FsError::Invalid)?;
     let bytes = buf.get(offset..end).ok_or(FsError::Invalid)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// RF178-39 FIX: fallible lossy UTF-8 conversion for ext2 directory names.
+/// Capacity is reserved before any push, so malformed ext2 names return
+/// `NoSpace` on OOM instead of reaching an infallible String growth path.
+fn fallible_lossy_name(bytes: &[u8]) -> Result<String, FsError> {
+    if let Ok(valid) = core::str::from_utf8(bytes) {
+        let mut out = String::new();
+        out.try_reserve_exact(valid.len())
+            .map_err(|_| FsError::NoSpace)?;
+        out.push_str(valid);
+        return Ok(out);
+    }
+
+    let worst_case = bytes.len().checked_mul(3).ok_or(FsError::Invalid)?;
+    let mut out = String::new();
+    out.try_reserve_exact(worst_case)
+        .map_err(|_| FsError::NoSpace)?;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match core::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len != 0 {
+                    // SAFETY: Utf8Error guarantees the prefix through valid_up_to
+                    // is valid UTF-8.
+                    out.push_str(unsafe { core::str::from_utf8_unchecked(&rest[..valid_len]) });
+                }
+                out.push('\u{FFFD}');
+                let invalid_len = err
+                    .error_len()
+                    .unwrap_or_else(|| rest.len().saturating_sub(valid_len));
+                rest = &rest[valid_len + invalid_len..];
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -229,6 +606,225 @@ fn validated_sector_size(dev: &dyn BlockDevice) -> Result<u64, FsError> {
     Ok(sector_size)
 }
 
+/// RF178-37 FIX: per-filesystem canonical object cache.
+///
+/// The cache holds only `Weak` references, so inode lifetimes remain driven by
+/// VFS users. A separate miss mutex serializes load/construct/publish without
+/// holding the cache lock across disk I/O. Growth is allocation-fallible and
+/// stale entries are compacted in place before publication.
+struct WeakArcCache<T> {
+    entries: RwLock<mm::fallible_map::FallibleOrderedMap<u32, Weak<T>>>,
+    miss: Mutex<()>,
+}
+
+impl<T> WeakArcCache<T> {
+    fn new() -> Self {
+        Self {
+            entries: RwLock::new(mm::fallible_map::FallibleOrderedMap::new()),
+            miss: Mutex::new(()),
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: u32) -> Option<Arc<T>> {
+        self.entries
+            .read()
+            .get(&key)
+            .and_then(|weak| weak.upgrade())
+    }
+
+    fn get_or_try_insert_with<F>(&self, key: u32, loader: F) -> Result<Arc<T>, FsError>
+    where
+        F: FnOnce() -> Result<Arc<T>, FsError>,
+    {
+        if let Some(existing) = self.get(key) {
+            return Ok(existing);
+        }
+
+        let _miss = self.miss.lock();
+        if let Some(existing) = self.get(key) {
+            return Ok(existing);
+        }
+
+        {
+            let mut entries = self.entries.write();
+            entries.retain(|_, weak| weak.strong_count() != 0);
+        }
+
+        // No cache guard spans the loader: ext2 inode reads acquire filesystem
+        // metadata/device locks below the serialized miss lane.
+        let candidate = loader()?;
+
+        let mut entries = self.entries.write();
+        if let Some(existing) = entries.get(&key).and_then(|weak| weak.upgrade()) {
+            return Ok(existing);
+        }
+        entries.retain(|_, weak| weak.strong_count() != 0);
+        entries
+            .try_reserve_exact(1)
+            .map_err(|_| FsError::NoMem)?;
+        entries
+            .try_insert(key, Arc::downgrade(&candidate))
+            .map_err(|_| FsError::NoMem)?;
+        Ok(candidate)
+    }
+}
+
+/// Cache lifecycle probes plus a deterministic production `Ext2Inode::open`
+/// identity check. The latter uses the exact constructor helper and cache owned
+/// by `Ext2Fs`; it does not depend on an ext2 image being mounted at boot.
+#[doc(hidden)]
+pub fn run_ext2_inode_cache_self_test() {
+    struct CacheNode {
+        value: AtomicU64,
+    }
+
+    let cache: WeakArcCache<CacheNode> = WeakArcCache::new();
+    let mut loads = 0usize;
+    let first = cache
+        .get_or_try_insert_with(7, || {
+            loads += 1;
+            assert!(
+                cache.miss.try_lock().is_none(),
+                "inode cache misses must be serialized"
+            );
+            assert!(
+                cache.entries.try_read().is_some(),
+                "cache guard must not span inode loader I/O"
+            );
+            Arc::try_new(CacheNode {
+                value: AtomicU64::new(11),
+            })
+            .map_err(|_| FsError::NoMem)
+        })
+        .expect("first canonical cache load");
+    let second = cache
+        .get_or_try_insert_with(7, || panic!("cache hit must not invoke loader"))
+        .expect("second canonical cache lookup");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(loads, 1, "canonical inode loader must run once per live key");
+    first.value.store(29, Ordering::Release);
+    assert_eq!(second.value.load(Ordering::Acquire), 29);
+
+    let other = cache
+        .get_or_try_insert_with(8, || {
+            Arc::try_new(CacheNode {
+                value: AtomicU64::new(8),
+            })
+            .map_err(|_| FsError::NoMem)
+        })
+        .expect("distinct inode cache load");
+    assert!(!Arc::ptr_eq(&first, &other));
+
+    let stale = Arc::downgrade(&other);
+    drop(other);
+    assert!(stale.upgrade().is_none());
+    let replacement = cache
+        .get_or_try_insert_with(8, || {
+            Arc::try_new(CacheNode {
+                value: AtomicU64::new(80),
+            })
+            .map_err(|_| FsError::NoMem)
+        })
+        .expect("stale cache replacement");
+    assert_eq!(replacement.value.load(Ordering::Acquire), 80);
+
+    let retry_cache: WeakArcCache<CacheNode> = WeakArcCache::new();
+    assert!(matches!(
+        retry_cache.get_or_try_insert_with(9, || Err(FsError::Io)),
+        Err(FsError::Io)
+    ));
+    assert!(retry_cache.get(9).is_none(), "loader error must publish nothing");
+    assert!(retry_cache
+        .get_or_try_insert_with(9, || {
+            Arc::try_new(CacheNode {
+                value: AtomicU64::new(9),
+            })
+            .map_err(|_| FsError::NoMem)
+        })
+        .is_ok());
+
+    struct CacheTestDevice;
+
+    impl BlockDevice for CacheTestDevice {
+        fn name(&self) -> &str {
+            "ext2-cache-self-test"
+        }
+
+        fn capacity_sectors(&self) -> u64 {
+            1
+        }
+
+        fn submit_bio(&self, _bio: block::Bio) -> Result<(), block::BlockError> {
+            Err(block::BlockError::NotSupported)
+        }
+    }
+
+    let concrete_dev = Arc::try_new(CacheTestDevice).expect("cache test block device");
+    let dev: Arc<dyn BlockDevice> = concrete_dev;
+    // SAFETY: Ext2Superblock contains only integer fields and byte arrays, for
+    // which the all-zero bit pattern is valid. The synthetic filesystem never
+    // performs disk I/O or consults this placeholder superblock.
+    let superblock: Ext2Superblock = unsafe { core::mem::zeroed() };
+    let fs = Arc::try_new(Ext2Fs {
+        fs_id: u64::MAX - 178,
+        dev,
+        superblock: RwLock::new(superblock),
+        group_descs: RwLock::new(Vec::new()),
+        block_size: 4096,
+        sector_size: 512,
+        blocks_count: 1,
+        blocks_per_group: 1,
+        inodes_per_group: 1,
+        inode_size: size_of::<Ext2InodeRaw>() as u16,
+        root: RwLock::new(None),
+        inode_cache: WeakArcCache::new(),
+        meta_lock: Mutex::new(()),
+        self_ref: Mutex::new(None),
+    })
+    .expect("synthetic ext2 filesystem");
+
+    let mut raw = Ext2InodeRaw::default();
+    raw.mode = EXT2_S_IFREG | 0o644;
+    raw.links_count = 1;
+    let canonical = fs
+        .inode_cache
+        .get_or_try_insert_with(42, || fs.new_inode_from_raw(42, raw))
+        .expect("publish canonical production inode");
+    let same = fs
+        .inode_cache
+        .get_or_try_insert_with(42, || panic!("live production cache hit must not reload"))
+        .expect("retrieve canonical production inode");
+    assert!(Arc::ptr_eq(&canonical, &same));
+
+    let first_open = canonical
+        .open(OpenFlags::new(OpenFlags::O_RDONLY))
+        .expect("first canonical production open");
+    let second_open = same
+        .open(OpenFlags::new(OpenFlags::O_RDONLY))
+        .expect("second canonical production open");
+    let first_handle = first_open
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .expect("first ext2 open must return FileHandle");
+    let second_handle = second_open
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .expect("second ext2 open must return FileHandle");
+    let canonical_inode: Arc<dyn Inode> = canonical.clone();
+    assert!(Arc::ptr_eq(&first_handle.inode, &canonical_inode));
+    assert!(Arc::ptr_eq(&second_handle.inode, &canonical_inode));
+    assert!(Arc::ptr_eq(&first_handle.inode, &second_handle.inode));
+
+    let rogue = fs
+        .new_inode_from_raw(42, raw)
+        .expect("construct duplicate wrapper for rejection probe");
+    assert!(matches!(
+        rogue.open(OpenFlags::new(OpenFlags::O_RDONLY)),
+        Err(FsError::Invalid)
+    ));
+}
+
 /// Ext2 filesystem instance
 pub struct Ext2Fs {
     fs_id: u64,
@@ -250,6 +846,8 @@ pub struct Ext2Fs {
     inodes_per_group: u32,
     inode_size: u16,
     root: RwLock<Option<Arc<Ext2Inode>>>,
+    /// Canonical `(filesystem, inode-number) -> Arc<Ext2Inode>` identity.
+    inode_cache: WeakArcCache<Ext2Inode>,
     /// Serialize metadata updates requiring read-modify-write
     meta_lock: Mutex<()>,
     self_ref: Mutex<Option<Weak<Ext2Fs>>>,
@@ -309,6 +907,7 @@ impl Ext2Fs {
             inodes_per_group: superblock.inodes_per_group,
             inode_size,
             root: RwLock::new(None),
+            inode_cache: WeakArcCache::new(),
             meta_lock: Mutex::new(()),
             self_ref: Mutex::new(None),
         });
@@ -317,8 +916,7 @@ impl Ext2Fs {
         *fs.self_ref.lock() = Some(Arc::downgrade(&fs));
 
         // Load root inode
-        let root_raw = fs.read_inode_raw(EXT2_ROOT_INO)?;
-        let root = fs.wrap_inode(EXT2_ROOT_INO, root_raw);
+        let root = fs.load_inode(EXT2_ROOT_INO)?;
         *fs.root.write() = Some(root);
 
         Ok(fs)
@@ -330,8 +928,11 @@ impl Ext2Fs {
         let sector_size = validated_sector_size(&**dev)?;
         let start_sector = SUPERBLOCK_OFFSET / sector_size;
 
-        // Read superblock (1024 bytes, may span 2 sectors)
-        let mut buf = alloc::vec![0u8; 1024];
+        // R178-29 FIX: Fallible superblock buffer allocation (1024 bytes).
+        // Mount is a recoverable path — OOM here returns FsError::NoSpace instead of aborting.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(1024).map_err(|_| FsError::NoSpace)?;
+        buf.resize(1024, 0u8);
         dev.read_sync(start_sector, &mut buf)
             .map_err(|_| FsError::Io)?;
 
@@ -607,8 +1208,13 @@ impl Ext2Fs {
             .filter(|b| *b < blocks_count)
             .ok_or(FsError::Invalid)?;
 
-        // Read the block containing the inode
-        let mut block_buf = alloc::vec![0u8; self.block_size as usize];
+        // R178-29 FIX: Fallible inode block buffer allocation (up to 64 KiB).
+        // Inode lookup is a recoverable path — OOM here returns FsError::NoSpace.
+        let mut block_buf = Vec::new();
+        block_buf
+            .try_reserve_exact(self.block_size as usize)
+            .map_err(|_| FsError::NoSpace)?;
+        block_buf.resize(self.block_size as usize, 0u8);
         self.read_block(inode_block, &mut block_buf)?;
 
         // R95-3 FIX: Bounds check inode read to prevent OOB access.
@@ -629,17 +1235,14 @@ impl Ext2Fs {
         Ok(inode)
     }
 
-    /// Write raw inode back to disk
-    fn write_inode_raw(&self, ino: u32, raw: &Ext2InodeRaw) -> Result<(), FsError> {
+    /// Resolve and validate the immutable inode-table target before mutation.
+    fn inode_write_target(&self, ino: u32) -> Result<InodeWriteTarget, FsError> {
         let sb = self.superblock.read();
         if ino == 0 || ino > sb.inodes_count {
             return Err(FsError::NotFound);
         }
         let blocks_count = sb.blocks_count;
         drop(sb);
-
-        // Serialize inode table updates
-        let _guard = self.meta_lock.lock();
 
         let (group, index) = self.inode_group_index(ino);
         // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
@@ -668,39 +1271,63 @@ impl Ext2Fs {
             .filter(|b| *b < blocks_count)
             .ok_or(FsError::Invalid)?;
 
-        // Read-modify-write the block containing the inode
-        let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(inode_block, &mut block_buf)?;
-
-        // Copy inode data into buffer
+        // R178-29 FIX: Fallible inode write buffer allocation (up to 64 KiB).
+        // Inode write is a recoverable path — OOM here returns FsError::NoSpace.
         let copy_len = cmp::min(self.inode_size as usize, size_of::<Ext2InodeRaw>());
         let start = offset_in_block as usize;
-        let end = start + self.inode_size as usize;
-        if end > block_buf.len() {
+        let end = start
+            .checked_add(self.inode_size as usize)
+            .ok_or(FsError::Invalid)?;
+        if end > self.block_size as usize {
             return Err(FsError::Invalid);
         }
 
-        let raw_bytes: &[u8] =
-            unsafe { core::slice::from_raw_parts(raw as *const _ as *const u8, copy_len) };
-        block_buf[start..start + copy_len].copy_from_slice(raw_bytes);
-        // Zero padding if inode_size > Ext2InodeRaw
-        if self.inode_size as usize > copy_len {
-            block_buf[start + copy_len..end].fill(0);
-        }
-
-        self.write_block(inode_block, &block_buf)
+        Ok(InodeWriteTarget {
+            block: inode_block,
+            start,
+            end,
+            copy_len,
+        })
     }
 
-    /// Write updated superblock to disk
-    fn write_superblock(&self) -> Result<(), FsError> {
+    /// RF178-39 FIX: final inode RMW using the preallocated mutation scratch.
+    fn write_inode_raw_with_scratch(
+        &self,
+        target: InodeWriteTarget,
+        raw: &Ext2InodeRaw,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), FsError> {
+        let _guard = self.meta_lock.lock();
+        let block_buf = scratch.block_mut();
+        self.read_block(target.block, block_buf)?;
+
+        let raw_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(raw as *const _ as *const u8, target.copy_len) };
+        block_buf[target.start..target.start + target.copy_len].copy_from_slice(raw_bytes);
+        // Zero padding if inode_size > Ext2InodeRaw
+        if target.end > target.start + target.copy_len {
+            block_buf[target.start + target.copy_len..target.end].fill(0);
+        }
+
+        self.write_block(target.block, block_buf)
+    }
+
+    /// RF178-39 FIX: persist a caller-snapshotted superblock with no heap work.
+    /// The caller holds `meta_lock`, so the snapshot belongs to the same block
+    /// allocation transaction as the bitmap and BGDT updates.
+    fn write_superblock_with_scratch(
+        &self,
+        sb: &Ext2Superblock,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), FsError> {
         if self.dev.is_read_only() {
             return Err(FsError::ReadOnly);
         }
 
-        let sb = *self.superblock.read();
-        let mut buf = alloc::vec![0u8; 1024];
+        let buf = scratch.block_mut();
+        buf[..1024].fill(0);
         let sb_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(&sb as *const _ as *const u8, size_of::<Ext2Superblock>())
+            core::slice::from_raw_parts(sb as *const _ as *const u8, size_of::<Ext2Superblock>())
         };
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
@@ -709,18 +1336,13 @@ impl Ext2Fs {
         let start_sector = SUPERBLOCK_OFFSET / sector_size;
 
         self.dev
-            .write_sync(start_sector, &buf)
+            .write_sync(start_sector, &buf[..1024])
             .map(|_| ())
             .map_err(|_| FsError::Io)
     }
 
-    /// Write a block group descriptor to disk
-    fn write_group_desc(&self, group: usize, desc: &Ext2GroupDesc) -> Result<(), FsError> {
-        if self.dev.is_read_only() {
-            return Err(FsError::ReadOnly);
-        }
-
-        // R105-4 FIX: Use checked arithmetic to prevent overflow/divide-by-zero.
+    /// Resolve the BGDT RMW location before the allocation bitmap is changed.
+    fn group_desc_write_target(&self, group: usize) -> Result<GroupDescWriteTarget, FsError> {
         let descs_per_block = (self.block_size as usize) / size_of::<Ext2GroupDesc>();
         if descs_per_block == 0 {
             return Err(FsError::Invalid);
@@ -730,18 +1352,42 @@ impl Ext2Fs {
         let block = bgdt_block
             .checked_add(group_block)
             .ok_or(FsError::Invalid)?;
-        let offset = (group % descs_per_block) * size_of::<Ext2GroupDesc>();
+        let offset = (group % descs_per_block)
+            .checked_mul(size_of::<Ext2GroupDesc>())
+            .ok_or(FsError::Invalid)?;
+        let end = offset
+            .checked_add(size_of::<Ext2GroupDesc>())
+            .ok_or(FsError::Invalid)?;
+        if end > self.block_size as usize {
+            return Err(FsError::Invalid);
+        }
+        self.validate_block(block)?.ok_or(FsError::Invalid)?;
 
-        // Read-modify-write the block containing the descriptor
-        let mut buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(block, &mut buf)?;
+        // R178-29 FIX: Fallible group descriptor buffer allocation (up to 64 KiB).
+        // Group descriptor write is a recoverable path — OOM here returns FsError::NoSpace.
+        Ok(GroupDescWriteTarget { block, offset })
+    }
 
+    /// RF178-39 FIX: persist one prevalidated BGDT slot with mutation scratch.
+    /// The caller retains `meta_lock` across bitmap, BGDT, and superblock writes.
+    fn write_group_desc_with_scratch(
+        &self,
+        target: GroupDescWriteTarget,
+        desc: &Ext2GroupDesc,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), FsError> {
+        if self.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+
+        let buf = scratch.block_mut();
+        self.read_block(target.block, buf)?;
         let desc_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(desc as *const _ as *const u8, size_of::<Ext2GroupDesc>())
         };
-        buf[offset..offset + size_of::<Ext2GroupDesc>()].copy_from_slice(desc_bytes);
-
-        self.write_block(block, &buf)
+        buf[target.offset..target.offset + size_of::<Ext2GroupDesc>()]
+            .copy_from_slice(desc_bytes);
+        self.write_block(target.block, buf)
     }
 
     /// Allocate a block by scanning the group bitmaps
@@ -751,7 +1397,10 @@ impl Ext2Fs {
     /// FIXME(R38): If I/O fails after bitmap write but before descriptor/superblock
     /// persist, the block is leaked (marked used but counters not updated). A full
     /// fsck or journal would be needed to handle this properly.
-    fn allocate_block(&self) -> Result<u32, FsError> {
+    fn allocate_block_with_scratch(
+        &self,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<u32, FsError> {
         if self.dev.is_read_only() {
             return Err(FsError::ReadOnly);
         }
@@ -765,7 +1414,11 @@ impl Ext2Fs {
             return Err(FsError::NoSpace);
         }
 
-        let groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
+        let groups_count = sb
+            .blocks_count
+            .checked_add(sb.blocks_per_group.checked_sub(1).ok_or(FsError::Invalid)?)
+            .ok_or(FsError::Invalid)?
+            / sb.blocks_per_group;
 
         for group in 0..groups_count as usize {
             // R65-EXT2-3 FIX: Bounds check group descriptor access
@@ -782,45 +1435,69 @@ impl Ext2Fs {
                 continue; // Skip corrupted group descriptor
             }
 
-            // Read the block bitmap for this group
-            let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-            self.read_block(block_bitmap, &mut bitmap)?;
+            // R178-29 FIX: Fallible block bitmap allocation (up to 64 KiB).
+            // Block allocation is a recoverable path — OOM here returns FsError::NoSpace.
+            self.read_block(block_bitmap, scratch.block_mut())?;
 
             // Calculate blocks in this group
+            let group_u32 = u32::try_from(group).map_err(|_| FsError::Invalid)?;
+            let group_offset = group_u32
+                .checked_mul(sb.blocks_per_group)
+                .ok_or(FsError::Invalid)?;
             let group_blocks = cmp::min(
                 sb.blocks_per_group,
-                sb.blocks_count
-                    .saturating_sub(group as u32 * sb.blocks_per_group),
+                sb.blocks_count.saturating_sub(group_offset),
             );
-            let group_start = sb.first_data_block + group as u32 * sb.blocks_per_group;
+            let group_start = sb
+                .first_data_block
+                .checked_add(group_offset)
+                .ok_or(FsError::Invalid)?;
 
             // Scan bitmap for free block
             for bit in 0..group_blocks {
                 let byte_idx = (bit / 8) as usize;
                 let bit_mask = 1u8 << (bit % 8);
 
-                if (bitmap[byte_idx] & bit_mask) != 0 {
+                let byte = *scratch.block().get(byte_idx).ok_or(FsError::Invalid)?;
+                if (byte & bit_mask) != 0 {
                     continue; // Block is in use
                 }
 
-                // Found free block - mark it as used
-                bitmap[byte_idx] |= bit_mask;
-                let phys_block = group_start + bit;
+                // Compute every metadata target/counter before the bitmap write,
+                // which is the first persistent point of no return.
+                let phys_block = group_start
+                    .checked_add(bit)
+                    .filter(|block| *block < sb.blocks_count)
+                    .ok_or(FsError::Invalid)?;
+                let desc_target = self.group_desc_write_target(group)?;
+                let new_group_free = group_descs[group]
+                    .free_blocks_count
+                    .checked_sub(1)
+                    .ok_or(FsError::Invalid)?;
+                let new_sb_free = sb
+                    .free_blocks_count
+                    .checked_sub(1)
+                    .ok_or(FsError::Invalid)?;
 
                 // Write updated bitmap (using validated block_bitmap)
-                self.write_block(block_bitmap, &bitmap)?;
+                {
+                    let bitmap = scratch.block_mut();
+                    bitmap[byte_idx] |= bit_mask;
+                    self.write_block(block_bitmap, bitmap)?;
+                }
 
                 // Update counters
-                group_descs[group].free_blocks_count -= 1;
-                sb.free_blocks_count -= 1;
+                group_descs[group].free_blocks_count = new_group_free;
+                sb.free_blocks_count = new_sb_free;
 
-                // Persist metadata
+                // Snapshot the same transaction while retaining meta_lock.
                 let desc = group_descs[group];
+                let sb_snapshot = *sb;
                 drop(group_descs);
                 drop(sb);
 
-                self.write_group_desc(group, &desc)?;
-                self.write_superblock()?;
+                self.write_group_desc_with_scratch(desc_target, &desc, scratch)?;
+                self.write_superblock_with_scratch(&sb_snapshot, scratch)?;
 
                 return Ok(phys_block);
             }
@@ -829,56 +1506,68 @@ impl Ext2Fs {
         Err(FsError::NoSpace)
     }
 
-    /// Set a direct block pointer in an inode
-    ///
-    /// Only supports direct blocks (0-11) for now.
-    fn set_file_block(
+    /// Allocate and publish a direct data block without an ext2 heap operation
+    /// after the persistent bitmap allocation succeeds.
+    fn allocate_direct_file_block_with_scratch(
         &self,
         raw: &mut Ext2InodeRaw,
         file_block: u32,
-        phys_block: u32,
-    ) -> Result<(), FsError> {
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<u32, FsError> {
+        // RF178-9 FIX: Reject unsupported indirect writes before allocate_block
+        // makes a persistent bitmap change.
         if file_block >= EXT2_NDIR_BLOCKS as u32 {
-            return Err(FsError::NotSupported); // Only direct blocks for now
+            return Err(FsError::NotSupported);
         }
-
-        // Validate the physical block
-        if self.validate_block(phys_block)?.is_none() {
+        let index = file_block as usize;
+        if raw.block[index] != 0 {
             return Err(FsError::Invalid);
         }
-
-        let old = raw.block[file_block as usize];
-        raw.block[file_block as usize] = phys_block;
-
-        // Update block count if allocating a new block
-        if old == 0 {
-            let sectors_per_block = self.block_size / 512;
-            raw.blocks_lo = raw
-                .blocks_lo
-                .checked_add(sectors_per_block)
-                .ok_or(FsError::Invalid)?;
-        }
-
-        Ok(())
+        // Precompute every fallible metadata update before allocation. Once the
+        // allocator returns, publishing into the in-memory inode is infallible.
+        let new_blocks_lo = raw
+            .blocks_lo
+            .checked_add(self.block_size / 512)
+            .ok_or(FsError::Invalid)?;
+        let phys_block = self.allocate_block_with_scratch(scratch)?;
+        debug_assert!(phys_block > 0 && phys_block < self.blocks_count);
+        raw.block[index] = phys_block;
+        raw.blocks_lo = new_blocks_lo;
+        Ok(phys_block)
     }
 
-    /// Wrap a raw inode into an Ext2Inode
-    fn wrap_inode(self: &Arc<Self>, ino: u32, raw: Ext2InodeRaw) -> Arc<Ext2Inode> {
+    /// Construct one in-memory wrapper from validated on-disk inode state.
+    /// All production construction and deterministic identity tests use this
+    /// single allocation site; publication remains the cache's responsibility.
+    fn new_inode_from_raw(
+        self: &Arc<Self>,
+        ino: u32,
+        raw: Ext2InodeRaw,
+    ) -> Result<Arc<Ext2Inode>, FsError> {
         let size = if raw.mode & EXT2_S_IFREG != 0 {
-            // Regular file: use size_high for large files
-            ((raw.size_high_or_dir_acl as u64) << 32) | (raw.size_lo as u64)
+            // Regular file: use size_high for large files.
+            ((raw.size_high_or_dir_acl as u64) << 32) | raw.size_lo as u64
         } else {
-            // Directories: only use size_lo
+            // Directories and symlinks use size_lo in the current ext2 slice.
             raw.size_lo as u64
         };
 
-        Arc::new(Ext2Inode {
+        Arc::try_new(Ext2Inode {
             fs: Arc::downgrade(self),
             fs_id: self.fs_id,
             ino,
             raw: RwLock::new(raw),
             size: AtomicU64::new(size),
             write_lock: Mutex::new(()),
+        })
+        .map_err(|_| FsError::NoMem)
+    }
+
+    /// RF178-37 FIX: load or return the canonical in-memory inode wrapper.
+    fn load_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<Ext2Inode>, FsError> {
+        self.inode_cache.get_or_try_insert_with(ino, || {
+            let raw = self.read_inode_raw(ino)?;
+            self.new_inode_from_raw(ino, raw)
         })
     }
 
@@ -911,6 +1600,22 @@ impl Ext2Fs {
 
     /// Map a file block number to physical block number
     fn map_file_block(&self, raw: &Ext2InodeRaw, file_block: u32) -> Result<Option<u32>, FsError> {
+        // Preserve the allocation-free direct-block fast path for reads.
+        if file_block < EXT2_NDIR_BLOCKS as u32 {
+            return self.validate_block(raw.block[file_block as usize]);
+        }
+        let mut scratch = Ext2MutationScratch::try_new(self.block_size)?;
+        self.map_file_block_with_scratch(raw, file_block, &mut scratch)
+    }
+
+    /// RF178-39 FIX: map direct/indirect blocks using a caller-owned scratch.
+    /// Mutation callers allocate it once before their first persistent write.
+    fn map_file_block_with_scratch(
+        &self,
+        raw: &Ext2InodeRaw,
+        file_block: u32,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<Option<u32>, FsError> {
         let ptrs_per_block = self.block_size / 4; // 4 bytes per u32 pointer
 
         // Direct blocks (0-11)
@@ -929,12 +1634,11 @@ impl Ext2Fs {
                 None => return Ok(None),
             };
 
-            let mut buf = alloc::vec![0u8; self.block_size as usize];
-            self.read_block(ind_block, &mut buf)?;
+            self.read_block(ind_block, scratch.block_mut())?;
 
             // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
             // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ptr = read_u32_le(&buf, file_block as usize)?;
+            let ptr = read_u32_le(scratch.block(), file_block as usize)?;
             // R28-5 Fix: Validate data block pointer
             return self.validate_block(ptr);
         }
@@ -953,25 +1657,24 @@ impl Ext2Fs {
                 None => return Ok(None),
             };
 
-            let mut buf = alloc::vec![0u8; self.block_size as usize];
-            self.read_block(dind_block, &mut buf)?;
+            self.read_block(dind_block, scratch.block_mut())?;
 
             let ind_index = file_block / ptrs_per_block;
             // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
             // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ind_ptr = read_u32_le(&buf, ind_index as usize)?;
+            let ind_ptr = read_u32_le(scratch.block(), ind_index as usize)?;
             // R28-5 Fix: Validate indirect block pointer from double indirect table
             let ind_block = match self.validate_block(ind_ptr)? {
                 Some(b) => b,
                 None => return Ok(None),
             };
 
-            self.read_block(ind_block, &mut buf)?;
+            self.read_block(ind_block, scratch.block_mut())?;
 
             let block_index = file_block % ptrs_per_block;
             // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
             // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ptr = read_u32_le(&buf, block_index as usize)?;
+            let ptr = read_u32_le(scratch.block(), block_index as usize)?;
             // R28-5 Fix: Validate data block pointer
             return self.validate_block(ptr);
         }
@@ -1045,7 +1748,12 @@ impl Ext2Inode {
         let mut offset = 0u64;
         let file_size = self.size.load(Ordering::Acquire);
         let raw = *self.raw.read();
-        let mut block_buf = alloc::vec![0u8; fs.block_size as usize];
+        // R178-29 FIX: Fallible directory listing buffer allocation (up to 64 KiB).
+        let mut block_buf = Vec::new();
+        block_buf
+            .try_reserve_exact(fs.block_size as usize)
+            .map_err(|_| FsError::NoSpace)?;
+        block_buf.resize(fs.block_size as usize, 0u8);
 
         while offset < file_size {
             // Calculate which block to read
@@ -1093,9 +1801,9 @@ impl Ext2Inode {
                 let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
                 if let Ok(entry_name) = core::str::from_utf8(name_bytes) {
                     if entry_name == name {
-                        // Found it!
-                        let raw = fs.read_inode_raw(head.inode)?;
-                        return Ok(fs.wrap_inode(head.inode, raw));
+                        // RF178-37: every lookup of this `(fs, ino)` returns the
+                        // same wrapper, including its raw/size/write state.
+                        return Ok(fs.load_inode(head.inode)?);
                     }
                 }
             }
@@ -1134,6 +1842,11 @@ impl Ext2Inode {
             let remaining_in_page = PAGE_SIZE - offset_in_page;
             let copy_len = cmp::min(remaining_in_page, to_read - bytes_read);
 
+            // RF178-11 FIX: bind each cache miss to the cgroup current for this
+            // page's admission. A multi-page read may straddle a concurrent
+            // migration; operation-start identity would mischarge later pages.
+            let page_cache_owner = kernel_core::process::current_cgroup_id().unwrap_or(0);
+
             // Clone fs for the I/O closure
             let fs_for_io = fs.clone();
 
@@ -1147,6 +1860,9 @@ impl Ext2Inode {
             let page = page_cache::read_page(
                 cache_inode_id,
                 page_index,
+                page_cache_owner,
+                |cgroup_id, bytes| kernel_core::cgroup::try_charge_memory(cgroup_id, bytes).is_ok(),
+                kernel_core::cgroup::uncharge_memory,
                 alloc_pfn,
                 |page_entry: &PageCacheEntry| {
                     // This closure populates the page from disk
@@ -1177,8 +1893,12 @@ impl Ext2Inode {
                             u32::try_from(global_offset / block_size as u64).map_err(|_| ())?;
                         let offset_in_block = (global_offset % block_size as u64) as usize;
 
-                        // Read the block from disk
-                        let mut block_buf = alloc::vec![0u8; block_size];
+                        // R178-29 FIX: Fallible block buffer allocation inside page cache loader (up to 64 KiB).
+                        let mut block_buf = Vec::new();
+                        if block_buf.try_reserve_exact(block_size).is_err() {
+                            return Err(());
+                        }
+                        block_buf.resize(block_size, 0u8);
                         let phys_block = match fs_for_io.map_file_block(&raw_inode, file_block) {
                             Ok(Some(b)) => Some(b),
                             Ok(None) => None, // Hole in file
@@ -1238,6 +1958,146 @@ impl Ext2Inode {
         Ok(bytes_read)
     }
 
+    /// RF178-39 FIX: centralized positioned/append mutation engine.
+    ///
+    /// The sole ext2-owned heap allocation is the block-sized scratch, completed
+    /// before inode locks and preflight. Inode state is staged locally and is
+    /// published only after the final inode-table write succeeds.
+    fn write_mutation(
+        &self,
+        mode: Ext2WriteMode,
+        data: &[u8],
+    ) -> Result<(usize, u64), FsError> {
+        if !self.is_file_inner() {
+            return Err(FsError::IsDir);
+        }
+        if data.is_empty() {
+            let offset = match mode {
+                Ext2WriteMode::Positioned(offset) => offset,
+                Ext2WriteMode::Append => self.size.load(Ordering::Acquire),
+            };
+            return Ok((0, offset));
+        }
+
+        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+        if fs.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let mut scratch = Ext2MutationScratch::try_new(fs.block_size)?;
+
+        let _inode_guard = self.write_lock.lock();
+        let mut raw_guard = self.raw.write();
+        let current_size = self.size.load(Ordering::Acquire);
+        let offset = match mode {
+            Ext2WriteMode::Positioned(offset) => offset,
+            Ext2WriteMode::Append => current_size,
+        };
+
+        if (raw_guard.flags & EXT2_IMMUTABLE_FL) != 0 {
+            return Err(FsError::PermDenied);
+        }
+        if (raw_guard.flags & EXT2_APPEND_FL) != 0
+            && matches!(mode, Ext2WriteMode::Positioned(_))
+            && offset != current_size
+        {
+            return Err(FsError::PermDenied);
+        }
+
+        let mut staged = *raw_guard;
+        let inode_target = fs.inode_write_target(self.ino)?;
+        let end_offset =
+            preflight_direct_write(offset, data.len(), fs.block_size as u64, |file_block| {
+                Ok(fs
+                    .map_file_block_with_scratch(&staged, file_block, &mut scratch)?
+                    .is_some())
+            })?;
+
+        let published_size = current_size.max(end_offset);
+        if published_size != current_size {
+            staged.size_lo = published_size as u32;
+            staged.size_high_or_dir_acl = (published_size >> 32) as u32;
+        }
+        let now = TimeSpec::now();
+        staged.mtime = now.sec as u32;
+        staged.ctime = now.sec as u32;
+
+        let block_size = fs.block_size as usize;
+        let mut written = 0usize;
+        let mut cursor = offset;
+        while written < data.len() {
+            let file_block =
+                u32::try_from(cursor / fs.block_size as u64).map_err(|_| FsError::Invalid)?;
+            let offset_in_block = (cursor % fs.block_size as u64) as usize;
+            let space = block_size - offset_in_block;
+            let to_copy = cmp::min(space, data.len() - written);
+
+            let existing =
+                fs.map_file_block_with_scratch(&staged, file_block, &mut scratch)?;
+            let (phys_block, is_new) = match existing {
+                Some(block) => (block, false),
+                None => (
+                    fs.allocate_direct_file_block_with_scratch(
+                        &mut staged,
+                        file_block,
+                        &mut scratch,
+                    )?,
+                    true,
+                ),
+            };
+
+            {
+                let block_buf = scratch.block_mut();
+                if !is_new && to_copy != block_size {
+                    fs.read_block(phys_block, block_buf)?;
+                } else if is_new {
+                    block_buf.fill(0);
+                }
+                block_buf[offset_in_block..offset_in_block + to_copy]
+                    .copy_from_slice(&data[written..written + to_copy]);
+                fs.write_block(phys_block, block_buf)?;
+            }
+
+            // Keep already-cached pages coherent without allocating cache state.
+            let inode_id = (self.fs_id << 32) | self.ino as u64;
+            let mut cache_remaining = to_copy;
+            let mut cache_cursor = cursor;
+            let mut data_pos = written;
+            while cache_remaining > 0 {
+                let page_index = cache_cursor / PAGE_SIZE as u64;
+                let offset_in_page = (cache_cursor % PAGE_SIZE as u64) as usize;
+                let page_room = PAGE_SIZE - offset_in_page;
+                let chunk = cmp::min(cache_remaining, page_room);
+
+                if let Some(page) = PAGE_CACHE.find_get_page(inode_id, page_index) {
+                    let page_phys = page.physical_address();
+                    let page_virt = (page_phys + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data[data_pos..].as_ptr(),
+                            page_virt.add(offset_in_page),
+                            chunk,
+                        );
+                    }
+                    PAGE_CACHE.clear_dirty(&page);
+                    page.set_state(PageState::Uptodate);
+                    page.put();
+                }
+
+                cache_remaining -= chunk;
+                cache_cursor += chunk as u64;
+                data_pos += chunk;
+            }
+
+            written += to_copy;
+            cursor += to_copy as u64;
+        }
+
+        fs.write_inode_raw_with_scratch(inode_target, &staged, &mut scratch)?;
+        *raw_guard = staged;
+        self.size.store(published_size, Ordering::Release);
+        Ok((written, end_offset))
+    }
+
     /// Convert raw mode to FileType
     fn file_type(&self) -> FileType {
         match self.raw.read().mode & EXT2_S_IFMT {
@@ -1280,8 +2140,13 @@ impl Inode for Ext2Inode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        let raw = *self.raw.read();
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+        let inode = fs.inode_cache.get(self.ino).ok_or(FsError::Invalid)?;
+        if !core::ptr::eq(self, Arc::as_ref(&inode)) {
+            // Every Ext2Inode entering VFS must be the cache's canonical object.
+            // Fail closed instead of manufacturing another stale wrapper.
+            return Err(FsError::Invalid);
+        }
 
         // Directories can only be opened for read-only operations (getdents64)
         if self.is_dir_inner() {
@@ -1289,14 +2154,12 @@ impl Inode for Ext2Inode {
                 return Err(FsError::IsDir);
             }
             // Return directory handle with seekable=false
-            let inode = fs.wrap_inode(self.ino, raw);
             return Ok(Box::new(FileHandle::new(inode, flags, false)));
         }
 
-        Ok(Box::new(Ext2File {
-            inode: fs.wrap_inode(self.ino, raw),
-            offset: Mutex::new(0),
-        }))
+        // RF178-17 FIX: regular files must use the shared-offset FileHandle so
+        // O_APPEND reaches Ext2Inode::append_write.
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn is_dir(&self) -> bool {
@@ -1312,7 +2175,12 @@ impl Inode for Ext2Inode {
         let file_size = self.size.load(Ordering::Acquire);
         let raw = *self.raw.read();
         let block_size = fs.block_size as u64;
-        let mut block_buf = alloc::vec![0u8; fs.block_size as usize];
+        // R178-29 FIX: Fallible directory lookup buffer allocation (up to 64 KiB).
+        let mut block_buf = Vec::new();
+        block_buf
+            .try_reserve_exact(fs.block_size as usize)
+            .map_err(|_| FsError::NoSpace)?;
+        block_buf.resize(fs.block_size as usize, 0u8);
         let min_rec = size_of::<Ext2DirEntryHead>();
 
         // R165-21 FIX: read the inode count ONCE here instead of re-acquiring the
@@ -1408,7 +2276,7 @@ impl Inode for Ext2Inode {
                     return Err(FsError::Invalid);
                 }
                 let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
-                let name = String::from_utf8_lossy(name_bytes).into_owned();
+                let name = fallible_lossy_name(name_bytes)?;
 
                 let file_type = match head.file_type {
                     // R134-6 FIX: EXT2_FT_UNKNOWN — fall back to inode mode
@@ -1467,169 +2335,15 @@ impl Inode for Ext2Inode {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
-        if !self.is_file_inner() {
-            return Err(FsError::IsDir);
-        }
-        if data.is_empty() {
-            return Ok(0);
-        }
+        self.write_mutation(Ext2WriteMode::Positioned(offset), data)
+            .map(|(written, _)| written)
+    }
 
-        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
-        if fs.dev.is_read_only() {
-            return Err(FsError::ReadOnly);
-        }
-
-        // Serialize writes to this inode
-        let _inode_guard = self.write_lock.lock();
-        let mut raw = self.raw.write();
-
-        // Check immutable/append-only flags
-        if (raw.flags & EXT2_IMMUTABLE_FL) != 0 {
-            return Err(FsError::PermDenied);
-        }
-        if (raw.flags & EXT2_APPEND_FL) != 0 && offset != self.size.load(Ordering::Acquire) {
-            // Append-only: writes must be at end of file
-            return Err(FsError::PermDenied);
-        }
-        let block_size = fs.block_size as usize;
-
-        let mut written = 0usize;
-        let mut cursor = offset;
-
-        while written < data.len() {
-            // R97-3 FIX: Use try_from instead of truncating cast
-            let file_block =
-                u32::try_from(cursor / fs.block_size as u64).map_err(|_| FsError::Invalid)?;
-            let offset_in_block = (cursor % fs.block_size as u64) as usize;
-            let space = block_size - offset_in_block;
-            let to_copy = cmp::min(space, data.len() - written);
-
-            // Check if we have an existing block or need to allocate
-            let existing = fs.map_file_block(&raw, file_block)?;
-            let mut block_buf = alloc::vec![0u8; block_size];
-
-            let (phys_block, is_new) = match existing {
-                Some(b) => (b, false),
-                None => {
-                    // Allocate new block
-                    let new_block = fs.allocate_block()?;
-                    fs.set_file_block(&mut raw, file_block, new_block)?;
-                    (new_block, true)
-                }
-            };
-
-            // Read existing block if partial write, or zero new block
-            if !is_new && to_copy != block_size {
-                fs.read_block(phys_block, &mut block_buf)?;
-            } else if is_new {
-                block_buf.fill(0);
-            }
-
-            // Copy user data into block buffer
-            block_buf[offset_in_block..offset_in_block + to_copy]
-                .copy_from_slice(&data[written..written + to_copy]);
-
-            // Write block to disk
-            fs.write_block(phys_block, &block_buf)?;
-
-            // Keep page cache coherent if pages are cached
-            let inode_id = (self.fs_id << 32) | (self.ino as u64);
-            let mut cache_remaining = to_copy;
-            let mut cache_cursor = cursor;
-            let mut data_pos = written;
-            while cache_remaining > 0 {
-                let page_index = cache_cursor / PAGE_SIZE as u64;
-                let offset_in_page = (cache_cursor % PAGE_SIZE as u64) as usize;
-                let page_room = PAGE_SIZE - offset_in_page;
-                let chunk = cmp::min(cache_remaining, page_room);
-
-                if let Some(page) = PAGE_CACHE.find_get_page(inode_id, page_index) {
-                    let page_phys = page.physical_address();
-                    let page_virt = (page_phys + PHYSICAL_MEMORY_OFFSET) as *mut u8;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            data[data_pos..].as_ptr(),
-                            page_virt.add(offset_in_page),
-                            chunk,
-                        );
-                    }
-                    // Use global PAGE_CACHE method for correct dirty accounting
-                    PAGE_CACHE.clear_dirty(&page);
-                    page.set_state(PageState::Uptodate);
-                    page.put();
-                }
-
-                cache_remaining -= chunk;
-                cache_cursor += chunk as u64;
-                data_pos += chunk;
-            }
-
-            written += to_copy;
-            cursor += to_copy as u64;
-        }
-
-        // Update file size if we extended the file
-        let end_offset = offset
-            .checked_add(data.len() as u64)
-            .ok_or(FsError::Invalid)?;
-        let current_size = self.size.load(Ordering::Acquire);
-        if end_offset > current_size {
-            self.size.store(end_offset, Ordering::Release);
-            raw.size_lo = end_offset as u32;
-            raw.size_high_or_dir_acl = (end_offset >> 32) as u32;
-        }
-
-        // Update timestamps
-        let now = TimeSpec::now();
-        raw.mtime = now.sec as u32;
-        raw.ctime = now.sec as u32;
-
-        // Persist inode to disk
-        fs.write_inode_raw(self.ino, &raw)?;
-
-        Ok(written)
+    fn append_write(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
+        self.write_mutation(Ext2WriteMode::Append, data)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-// ============================================================================
-// Ext2 File Handle
-// ============================================================================
-
-/// File handle for ext2 files
-struct Ext2File {
-    inode: Arc<Ext2Inode>,
-    offset: Mutex<u64>,
-}
-
-impl FileOps for Ext2File {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(Ext2File {
-            inode: self.inode.clone(),
-            offset: Mutex::new(*self.offset.lock()),
-        })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "Ext2File"
-    }
-
-    /// R41-1 FIX: Return actual inode metadata for fstat.
-    /// R154-1 FIX: MAC gate for fd-backed stat — prevents metadata probe
-    /// via inherited/pre-policy fds that bypass path-based R153-2 check.
-    fn stat(&self) -> Result<VfsStat, SyscallError> {
-        let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
-        let vfs_stat = VfsStat::from(inode_stat);
-        if let Some(task) = lsm::ProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
-        }
-        Ok(vfs_stat)
     }
 }

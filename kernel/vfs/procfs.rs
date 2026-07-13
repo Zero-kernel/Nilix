@@ -14,21 +14,37 @@ use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeS
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
 // R29-1 FIX: Import process module for real process information
-use kernel_core::process::{self, ProcessState, PROCESS_TABLE};
+use kernel_core::process::{self, Process, ProcessState, PROCESS_TABLE};
 // R36 FIX: Import time module for uptime and mm for memory stats
 use kernel_core::time;
 use mm::memory::FrameAllocator;
 use mm::page_cache::PAGE_CACHE;
-use spin::RwLock;
+use spin::Mutex;
 
 /// Global procfs ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(200);
+
+/// RF178-19 FIX: Stable identity and namespace view for every per-process
+/// procfs inode. Holding the exact Process Arc prevents any later raw-PID
+/// lookup from crossing a recycled table slot.
+#[derive(Clone)]
+struct ProcIdentity {
+    /// A procfs descriptor must not retain an exited task's complete PCB/MM/FD
+    /// graph indefinitely. Upgrade only while validating or snapshotting.
+    process: Weak<Mutex<Process>>,
+    pid: u32,
+    generation: u64,
+    display_pid: u32,
+    viewer_ns: Option<Arc<kernel_core::PidNamespace>>,
+}
+
+type BoundProcess = Arc<Mutex<Process>>;
 
 // ============================================================================
 // ProcFs
@@ -82,7 +98,7 @@ impl FileSystem for ProcFs {
         if let Some(self_link) = parent.as_any().downcast_ref::<ProcSelfSymlink>() {
             let alias_dir = ProcPidDirInode {
                 fs_id: self.fs_id,
-                pid: self_link.target_pid,
+                identity: self_link.identity.clone(),
             };
             return alias_dir.lookup_child(name);
         }
@@ -109,11 +125,10 @@ impl ProcRootInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         match name {
             "self" => {
-                // Symlink to current process
-                let pid = get_current_pid();
+                let identity = bind_current_proc_identity(get_current_pid())?;
                 Ok(Arc::new(ProcSelfSymlink {
                     fs_id: self.fs_id,
-                    target_pid: pid,
+                    identity,
                 }))
             }
             "meminfo" => Ok(Arc::new(ProcMeminfoInode { fs_id: self.fs_id })),
@@ -123,29 +138,11 @@ impl ProcRootInode {
             _ => {
                 // Try to parse as PID
                 if let Ok(ns_pid) = name.parse::<u32>() {
-                    // R141-5 FIX: Interpret the parsed PID as namespace-local.
-                    // Translate to global PID so internal lookups work correctly.
-                    // Without namespace context, treat as global (kernel context).
-                    let global_pid = resolve_ns_pid_to_global(ns_pid).unwrap_or(ns_pid);
-
-                    if process_exists(global_pid) {
-                        // R134-1 FIX: Enforce PID namespace visibility for direct
-                        // /proc/<pid> lookups.  R133-4 only fixed list_pids()
-                        // (directory listing); the lookup path was unprotected,
-                        // allowing container root to read host process info via
-                        // /proc/<global_pid>/maps etc.
-                        if !is_pid_visible_in_caller_ns(global_pid) {
-                            return Err(FsError::NotFound);
-                        }
-                        // R31-1 FIX: Check access permission before returning PID directory
-                        if !can_access_pid(global_pid) {
-                            return Err(FsError::PermDenied);
-                        }
-                        return Ok(Arc::new(ProcPidDirInode {
-                            fs_id: self.fs_id,
-                            pid: global_pid,
-                        }));
-                    }
+                    let identity = bind_named_proc_identity(ns_pid)?;
+                    return Ok(Arc::new(ProcPidDirInode {
+                        fs_id: self.fs_id,
+                        identity,
+                    }));
                 }
                 Err(FsError::NotFound)
             }
@@ -257,21 +254,20 @@ impl Inode for ProcRootInode {
 
 struct ProcSelfSymlink {
     fs_id: u64,
-    target_pid: u32,
+    identity: ProcIdentity,
 }
 
 impl ProcSelfSymlink {
     fn pid_dir(&self) -> ProcPidDirInode {
         ProcPidDirInode {
             fs_id: self.fs_id,
-            pid: self.target_pid,
+            identity: self.identity.clone(),
         }
     }
 
-    /// R141-5 FIX: Return namespace-local PID for symlink display.
-    /// Internal operations still use `self.target_pid` (global).
+    /// Return the namespace-local PID captured with the stable identity.
     fn display_pid(&self) -> u32 {
-        caller_ns_local_pid(self.target_pid).unwrap_or(self.target_pid)
+        self.identity.display_pid
     }
 }
 
@@ -332,13 +328,7 @@ impl Inode for ProcSelfSymlink {
         // R163-30 FIX: Check PID namespace visibility and access permission,
         // not just existence. A recycled PID might be visible but belong to a
         // different namespace than the caller expected.
-        if !process_exists(self.target_pid) {
-            return Err(FsError::NotFound);
-        }
-        if !is_pid_visible_in_caller_ns(self.target_pid as u32) {
-            return Err(FsError::NotFound);
-        }
-        if !can_access_pid(self.target_pid as u32) {
+        if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
         self.pid_dir().readdir(offset)
@@ -355,35 +345,35 @@ impl Inode for ProcSelfSymlink {
 
 struct ProcPidDirInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl ProcPidDirInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         // R31-1 FIX: Check access permission before returning child entries
-        if !can_access_pid(self.pid) {
+        if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
         match name {
             "status" => Ok(Arc::new(ProcPidStatusInode {
                 fs_id: self.fs_id,
-                pid: self.pid,
+                identity: self.identity.clone(),
             })),
             "cmdline" => Ok(Arc::new(ProcPidCmdlineInode {
                 fs_id: self.fs_id,
-                pid: self.pid,
+                identity: self.identity.clone(),
             })),
             "stat" => Ok(Arc::new(ProcPidStatInode {
                 fs_id: self.fs_id,
-                pid: self.pid,
+                identity: self.identity.clone(),
             })),
             "maps" => Ok(Arc::new(ProcPidMapsInode {
                 fs_id: self.fs_id,
-                pid: self.pid,
+                identity: self.identity.clone(),
             })),
             "fd" => Ok(Arc::new(ProcPidFdDirInode {
                 fs_id: self.fs_id,
-                pid: self.pid,
+                identity: self.identity.clone(),
             })),
             _ => Err(FsError::NotFound),
         }
@@ -394,8 +384,7 @@ impl Inode for ProcPidDirInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Use namespace-local PID to prevent leaking global PIDs
         // via fstat()/getdents64() inode numbers on procfs PID directories.
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        1000 + display_pid as u64
+        1000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -403,7 +392,8 @@ impl Inode for ProcPidDirInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -429,7 +419,7 @@ impl Inode for ProcPidDirInode {
         // Return directory handle with seekable=false
         let inode: Arc<dyn Inode> = Arc::new(ProcPidDirInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
@@ -440,7 +430,7 @@ impl Inode for ProcPidDirInode {
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         // R31-1 FIX: Check access permission before listing entries
-        if !can_access_pid(self.pid) {
+        if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
         let entries = ["status", "cmdline", "stat", "maps", "fd"];
@@ -474,16 +464,18 @@ impl Inode for ProcPidDirInode {
 // /proc/[pid]/status
 // ============================================================================
 
+// R178-23 FIX: Bind procfs authorization to process identity (generation).
+// Prevents PID-reuse attacks where authorization check at open-time succeeds,
+// but reads occur after the original process exits and a new process reuses the PID.
 struct ProcPidStatusInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl Inode for ProcPidStatusInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        10000 + display_pid as u64
+        10000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -491,7 +483,8 @@ impl Inode for ProcPidStatusInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -510,22 +503,22 @@ impl Inode for ProcPidStatusInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
+        if validate_proc_identity(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
         let inode: Arc<dyn Inode> = Arc::new(ProcPidStatusInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Security: Re-check access on each read to prevent PID reuse attacks
-        // If the original process exits and a new process takes its PID,
-        // we must not expose the new process's data to the original opener.
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let content = generate_status(self.pid);
+        // R178-23 FIX: Validate BOTH ownership and generation on every read.
+        // Prevents PID-reuse attacks: if the original process exits and a new process
+        // reuses the PID, generation mismatch blocks access even if UIDs match.
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let content = generate_status(&self.identity, &process);
         read_from_content(&content, offset, buf)
     }
 
@@ -538,16 +531,16 @@ impl Inode for ProcPidStatusInode {
 // /proc/[pid]/cmdline
 // ============================================================================
 
+// R178-23 FIX: Bind procfs authorization to process identity (generation)
 struct ProcPidCmdlineInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl Inode for ProcPidCmdlineInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        20000 + display_pid as u64
+        20000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -555,7 +548,8 @@ impl Inode for ProcPidCmdlineInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -574,20 +568,20 @@ impl Inode for ProcPidCmdlineInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
+        if validate_proc_identity(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
         let inode: Arc<dyn Inode> = Arc::new(ProcPidCmdlineInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Security: Re-check access on each read to prevent PID reuse attacks
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let content = get_process_cmdline(self.pid);
+        // R178-23 FIX: Validate both ownership and generation
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let content = get_process_cmdline(&process);
         read_from_content(&content, offset, buf)
     }
 
@@ -600,16 +594,16 @@ impl Inode for ProcPidCmdlineInode {
 // /proc/[pid]/stat
 // ============================================================================
 
+// R178-23 FIX: Bind procfs authorization to process identity (generation)
 struct ProcPidStatInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl Inode for ProcPidStatInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        30000 + display_pid as u64
+        30000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -617,7 +611,8 @@ impl Inode for ProcPidStatInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -636,20 +631,20 @@ impl Inode for ProcPidStatInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
+        if validate_proc_identity(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
         let inode: Arc<dyn Inode> = Arc::new(ProcPidStatInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Security: Re-check access on each read to prevent PID reuse attacks
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let content = generate_stat(self.pid);
+        // R178-23 FIX: Validate both ownership and generation
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let content = generate_stat(&self.identity, &process);
         read_from_content(&content, offset, buf)
     }
 
@@ -662,16 +657,16 @@ impl Inode for ProcPidStatInode {
 // /proc/[pid]/maps
 // ============================================================================
 
+// R178-23 FIX: Bind procfs authorization to process identity (generation)
 struct ProcPidMapsInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl Inode for ProcPidMapsInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        40000 + display_pid as u64
+        40000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -679,7 +674,8 @@ impl Inode for ProcPidMapsInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -698,20 +694,20 @@ impl Inode for ProcPidMapsInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
+        if validate_proc_identity(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
         let inode: Arc<dyn Inode> = Arc::new(ProcPidMapsInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Security: Re-check access on each read to prevent PID reuse attacks
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let content = generate_maps(self.pid);
+        // R178-23 FIX: Validate both ownership and generation
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let content = generate_maps(&process);
         read_from_content(&content, offset, buf)
     }
 
@@ -726,23 +722,21 @@ impl Inode for ProcPidMapsInode {
 
 struct ProcPidFdDirInode {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
 }
 
 impl ProcPidFdDirInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         // R31-1 FIX: Check access permission before returning fd entries
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
         let fd: u32 = name.parse().map_err(|_| FsError::NotFound)?;
-        let fds = list_process_fds(self.pid);
+        let fds = list_process_fds(&process);
         if !fds.iter().any(|&n| n == fd) {
             return Err(FsError::NotFound);
         }
         Ok(Arc::new(ProcPidFdSymlink {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
             fd,
         }))
     }
@@ -751,8 +745,7 @@ impl ProcPidFdDirInode {
 impl Inode for ProcPidFdDirInode {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        50000 + display_pid as u64
+        50000 + self.identity.display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -760,7 +753,8 @@ impl Inode for ProcPidFdDirInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let (uid, gid) = get_process_owner(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -786,7 +780,7 @@ impl Inode for ProcPidFdDirInode {
         // Return directory handle with seekable=false
         let inode: Arc<dyn Inode> = Arc::new(ProcPidFdDirInode {
             fs_id: self.fs_id,
-            pid: self.pid,
+            identity: self.identity.clone(),
         });
         Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
@@ -797,10 +791,8 @@ impl Inode for ProcPidFdDirInode {
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         // R31-1 FIX: Defense-in-depth access check for fd listing
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let fds = list_process_fds(self.pid);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let fds = list_process_fds(&process);
         if offset < fds.len() {
             let fd = fds[offset];
             return Ok(Some((
@@ -826,15 +818,14 @@ impl Inode for ProcPidFdDirInode {
 
 struct ProcPidFdSymlink {
     fs_id: u64,
-    pid: u32,
+    identity: ProcIdentity,
     fd: u32,
 }
 
 impl Inode for ProcPidFdSymlink {
     fn ino(&self) -> u64 {
         // R142-3 FIX: Namespace-local PID for inode number
-        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
-        (50000 + display_pid as u64) * 1000 + self.fd as u64
+        (50000 + self.identity.display_pid as u64) * 1000 + self.fd as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -845,11 +836,9 @@ impl Inode for ProcPidFdSymlink {
         // R42-1 FIX: Re-check access permission on each stat call to prevent
         // PID-reuse information leaks. If the original process exits and a new
         // process reuses the PID, we must not expose the new process's FD info.
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let (uid, gid) = get_process_owner(self.pid);
-        let target = get_fd_target(self.pid, self.fd);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process);
+        let target = get_fd_target(&process, self.fd);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -874,10 +863,8 @@ impl Inode for ProcPidFdSymlink {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         // R42-1 FIX: Defense-in-depth access check for each read operation.
         // Handles race conditions where PID is reused between open and read.
-        if !can_access_pid(self.pid) {
-            return Err(FsError::PermDenied);
-        }
-        let target = get_fd_target(self.pid, self.fd);
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let target = get_fd_target(&process, self.fd);
         read_from_content(&target, offset, buf)
     }
 
@@ -1112,43 +1099,6 @@ fn get_current_pid() -> u32 {
     process::current_pid().unwrap_or(0) as u32
 }
 
-/// R134-1 FIX: Check whether `pid` is visible from the caller's PID namespace.
-///
-/// A process is visible if it belongs to the caller's owning namespace or any
-/// descendant namespace.  When the caller has no PID namespace (kernel context),
-/// all processes are visible (global view).
-///
-/// Returns `false` (invisible) when `pid` is outside the caller's namespace
-/// subtree, preventing cross-namespace information disclosure via direct
-/// `/proc/<global_pid>` lookups.
-fn is_pid_visible_in_caller_ns(pid: u32) -> bool {
-    let table = PROCESS_TABLE.lock();
-
-    // Determine the caller's owning PID namespace.
-    let caller_ns = process::current_pid()
-        .and_then(|cur_pid| table.get(cur_pid))
-        .and_then(|slot| slot.as_ref())
-        .and_then(|proc_arc| {
-            let p = proc_arc.lock();
-            kernel_core::owning_namespace(&p.pid_ns_chain)
-        });
-
-    // Kernel context (no namespace): global visibility.
-    let ns = match caller_ns {
-        Some(ns) => ns,
-        None => return true,
-    };
-
-    // Check target process visibility in the caller's namespace.
-    match table.get(pid as usize) {
-        Some(Some(proc_arc)) => {
-            let p = proc_arc.lock();
-            kernel_core::is_visible_in_namespace(&ns, &p.pid_ns_chain)
-        }
-        _ => false,
-    }
-}
-
 /// R141-5 FIX: Translate a global PID to the namespace-local PID as seen by
 /// the current caller. Returns `None` if the caller has no PID namespace
 /// (kernel context) or the target is not visible.
@@ -1170,26 +1120,6 @@ fn caller_ns_local_pid(global_pid: u32) -> Option<u32> {
     kernel_core::pid_in_namespace(&caller_ns, global_pid as usize).map(|p| p as u32)
 }
 
-/// R141-5 FIX: Resolve a namespace-local PID (as entered by the user) to a
-/// global kernel PID. Returns `None` if the caller has no PID namespace
-/// (kernel context — use the value as-is).
-///
-/// Codex review: Drop PROCESS_TABLE lock before namespace translation.
-fn resolve_ns_pid_to_global(ns_pid: u32) -> Option<u32> {
-    let caller_ns = {
-        let table = PROCESS_TABLE.lock();
-        process::current_pid()
-            .and_then(|pid| table.get(pid))
-            .and_then(|slot| slot.as_ref())
-            .and_then(|proc_arc| {
-                let p = proc_arc.lock();
-                kernel_core::owning_namespace(&p.pid_ns_chain)
-            })
-    }?; // PROCESS_TABLE lock dropped here
-
-    kernel_core::resolve_pid_in_namespace(&caller_ns, ns_pid as usize).map(|p| p as u32)
-}
-
 /// R31-1 FIX: Access control for /proc/[pid] entries.
 ///
 /// Allow access if any of the following conditions are met:
@@ -1204,6 +1134,23 @@ fn can_access_pid(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    let target = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .cloned()
+    };
+    target
+        .as_ref()
+        .map(|target| can_access_process(pid, target))
+        .unwrap_or(false)
+}
+
+/// RF178-19 FIX: Authorize the exact process object captured by procfs, not
+/// whichever process happens to occupy the numeric PID slot during a later
+/// credentials lookup.
+fn can_access_process(pid: u32, target: &BoundProcess) -> bool {
     let cur_pid = process::current_pid();
     // Self access is always allowed
     if let Some(cp) = cur_pid {
@@ -1227,29 +1174,143 @@ fn can_access_pid(pid: u32) -> bool {
     // Codex review: use Option-based comparison — if either UID is unmapped,
     // deny access rather than risking a false match on OVERFLOW_UID.
     let cur_host_uid = cur_pid.and_then(|cp| get_process_host_uid_opt(cp as u32));
-    let target_host_uid = get_process_host_uid_opt(pid);
+    let target_host_uid = get_bound_process_host_uid_opt(target);
     match (cur_host_uid, target_host_uid) {
         (Some(cur), Some(target)) => cur == target,
         _ => false, // Unmapped UID on either side → deny
     }
 }
 
-/// Check if a process exists
-///
-/// R29-1 FIX: Now checks the actual process table
-fn process_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
+fn current_viewer_namespace() -> Option<Arc<kernel_core::PidNamespace>> {
     let table = PROCESS_TABLE.lock();
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let state = proc.lock().state;
-            !matches!(state, ProcessState::Zombie | ProcessState::Terminated)
-        }
+    process::current_pid()
+        .and_then(|pid| table.get(pid))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| kernel_core::owning_namespace(&proc.lock().pid_ns_chain))
+}
+
+fn same_viewer_namespace(identity: &ProcIdentity) -> bool {
+    match (current_viewer_namespace(), identity.viewer_ns.as_ref()) {
+        (None, None) => true,
+        (Some(current), Some(bound)) => Arc::ptr_eq(&current, bound),
         _ => false,
     }
+}
+
+/// RF178-19 FIX: Resolve a namespace-local name without the old global-PID
+/// fallback, then bind it to the exact process object and viewer namespace.
+fn bind_named_proc_identity(ns_pid: u32) -> Result<ProcIdentity, FsError> {
+    let viewer_ns = current_viewer_namespace();
+    let global_pid = match viewer_ns.as_ref() {
+        Some(ns) => kernel_core::resolve_pid_in_namespace(ns, ns_pid as usize)
+            .map(|pid| pid as u32)
+            .ok_or(FsError::NotFound)?,
+        None => ns_pid,
+    };
+    bind_proc_identity(global_pid, viewer_ns, Some(ns_pid))
+}
+
+fn bind_current_proc_identity(global_pid: u32) -> Result<ProcIdentity, FsError> {
+    bind_proc_identity(global_pid, current_viewer_namespace(), None)
+}
+
+fn bind_proc_identity(
+    pid: u32,
+    viewer_ns: Option<Arc<kernel_core::PidNamespace>>,
+    expected_display_pid: Option<u32>,
+) -> Result<ProcIdentity, FsError> {
+    if pid == 0 {
+        return Err(FsError::PermDenied);
+    }
+
+    let process = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .cloned()
+            .ok_or(FsError::NotFound)?
+    };
+    if !can_access_process(pid, &process) {
+        return Err(FsError::PermDenied);
+    }
+    let (generation, chain, state) = {
+        let target = process.lock();
+        (target.generation, target.pid_ns_chain.clone(), target.state)
+    };
+    if matches!(state, ProcessState::Zombie | ProcessState::Terminated) {
+        return Err(FsError::NotFound);
+    }
+    let display_pid = match viewer_ns.as_ref() {
+        Some(ns) => chain
+            .iter()
+            .find(|membership| Arc::ptr_eq(&membership.ns, ns))
+            .and_then(|membership| u32::try_from(membership.pid).ok())
+            .ok_or(FsError::NotFound)?,
+        None => pid,
+    };
+    if expected_display_pid
+        .map(|expected| expected != display_pid)
+        .unwrap_or(false)
+    {
+        return Err(FsError::NotFound);
+    }
+    let identity = ProcIdentity {
+        process: Arc::downgrade(&process),
+        pid,
+        generation,
+        display_pid,
+        viewer_ns,
+    };
+    if validate_proc_identity(&identity).is_none() {
+        return Err(FsError::NotFound);
+    }
+    Ok(identity)
+}
+
+/// Verify permission, namespace membership, generation, and table-slot
+/// identity, returning the same exact process object the caller must snapshot.
+fn validate_proc_identity(identity: &ProcIdentity) -> Option<BoundProcess> {
+    if !same_viewer_namespace(identity) {
+        return None;
+    }
+    let process = match identity.process.upgrade() {
+        Some(process) => process,
+        None => return None,
+    };
+    let attached = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(identity.pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|candidate| Arc::ptr_eq(candidate, &process))
+            .unwrap_or(false)
+    };
+    if !attached {
+        return None;
+    }
+    let namespace_matches = {
+        let target = process.lock();
+        if target.generation != identity.generation
+            || matches!(
+                target.state,
+                ProcessState::Zombie | ProcessState::Terminated
+            )
+        {
+            return None;
+        }
+        match identity.viewer_ns.as_ref() {
+            Some(ns) => target.pid_ns_chain.iter().any(|membership| {
+                Arc::ptr_eq(&membership.ns, ns)
+                    && u32::try_from(membership.pid).ok() == Some(identity.display_pid)
+            }),
+            None => identity.display_pid == identity.pid,
+        }
+    };
+    if !namespace_matches || !can_access_process(identity.pid, &process) {
+        return None;
+    }
+    Some(process)
 }
 
 /// List all PIDs
@@ -1296,21 +1357,10 @@ fn list_pids() -> Vec<u32> {
 /// Get process owner (uid, gid)
 ///
 /// R29-1 FIX: Now returns actual process credentials
-fn get_process_owner(pid: u32) -> (u32, u32) {
-    if pid == 0 {
-        return (0, 0);
-    }
-
-    let table = PROCESS_TABLE.lock();
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            // R39-3 FIX: 使用共享凭证读取 uid/gid
-            let creds = p.credentials.read();
-            (creds.uid, creds.gid)
-        }
-        _ => (0, 0),
-    }
+fn get_process_owner(process: &BoundProcess) -> (u32, u32) {
+    let process = process.lock();
+    let creds = process.credentials.read();
+    (creds.uid, creds.gid)
 }
 
 /// R140-5 FIX: Map a process's UID through its user namespace to obtain the host UID.
@@ -1344,78 +1394,47 @@ fn get_process_host_uid_opt(pid: u32) -> Option<u32> {
     user_ns.map_uid_from_ns(ns_uid)
 }
 
+fn get_bound_process_host_uid_opt(process: &BoundProcess) -> Option<u32> {
+    let (ns_uid, user_ns) = {
+        let process = process.lock();
+        let ns_uid = process.credentials.read().uid;
+        (ns_uid, process.user_ns.clone())
+    };
+    user_ns.map_uid_from_ns(ns_uid)
+}
+
 /// Get process command line
 ///
 /// R29-1 FIX: Now returns actual process name from PCB
-fn get_process_cmdline(pid: u32) -> String {
-    if pid == 0 {
-        return String::new();
-    }
-
-    let table = PROCESS_TABLE.lock();
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            // Return process name with null terminator (Linux format)
-            format!("{}\0", p.name)
-        }
-        _ => String::new(),
-    }
+fn get_process_cmdline(process: &BoundProcess) -> String {
+    let process = process.lock();
+    format!("{}\0", process.name)
 }
 
 /// List file descriptors for a process
 ///
 /// R29-1 FIX: Now returns actual FD list from process
-fn list_process_fds(pid: u32) -> Vec<u32> {
-    if pid == 0 {
-        return Vec::new();
-    }
-
-    let table = PROCESS_TABLE.lock();
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            p.fd_table.keys().map(|&fd| fd as u32).collect()
-        }
-        _ => Vec::new(),
-    }
+fn list_process_fds(process: &BoundProcess) -> Vec<u32> {
+    let process = process.lock();
+    process.fd_table.keys().map(|&fd| fd as u32).collect()
 }
 
 /// Resolve a file descriptor target for /proc/[pid]/fd/<n>
 ///
 /// R29-1 FIX: Now returns actual FD type from process
-fn get_fd_target(pid: u32, fd: u32) -> String {
-    if pid == 0 {
-        return String::new();
-    }
-
-    let table = PROCESS_TABLE.lock();
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            match p.fd_table.get(&(fd as i32)) {
-                Some(fd_obj) => {
-                    // Return type name as the "target"
-                    format!("{}", fd_obj.type_name())
-                }
-                None => String::new(),
-            }
-        }
-        _ => String::new(),
+fn get_fd_target(process: &BoundProcess, fd: u32) -> String {
+    let process = process.lock();
+    match process.fd_table.get(&(fd as i32)) {
+        Some(fd_obj) => format!("{}", fd_obj.type_name()),
+        None => String::new(),
     }
 }
 
 /// Generate /proc/[pid]/status content
 ///
 /// R29-1 FIX: Now uses real process data
-fn generate_status(pid: u32) -> String {
-    if pid == 0 {
-        return String::new();
-    }
-
-    // R162-I1 FIX: Snapshot all data under PROCESS_TABLE lock, then drop
-    // the lock before namespace PID translation and string formatting.
-    // Previously held PROCESS_TABLE across pid_in_namespace + format!.
+fn generate_status(identity: &ProcIdentity, bound: &BoundProcess) -> String {
+    // RF178-19 FIX: Snapshot the bound process Arc, never a raw PID relookup.
     struct StatusSnap {
         name: alloc::string::String,
         umask: u16,
@@ -1428,68 +1447,51 @@ fn generate_status(pid: u32) -> String {
         euid: u32,
         gid: u32,
         egid: u32,
-        pid_ns_chain: alloc::vec::Vec<kernel_core::PidNamespaceMembership>,
     }
 
-    let (snap, caller_chain): (
-        Option<StatusSnap>,
-        alloc::vec::Vec<kernel_core::PidNamespaceMembership>,
-    ) = {
-        let table = PROCESS_TABLE.lock();
-        let caller_chain = process::current_pid()
-            .and_then(|cur_pid| table.get(cur_pid))
-            .and_then(|slot| slot.as_ref())
-            .map(|proc_arc| proc_arc.lock().pid_ns_chain.clone())
-            .unwrap_or_default();
-
-        let s = table
-            .get(pid as usize)
-            .and_then(|slot| slot.as_ref())
-            .map(|proc_arc| {
-                let p = proc_arc.lock();
-                let (sc, sn) = match p.state {
-                    ProcessState::Zombie => ('Z', "zombie"),
-                    ProcessState::Terminated => ('X', "dead"),
-                    ProcessState::Stopped => ('T', "stopped"),
-                    _ if p.stopped => ('T', "stopped"),
-                    ProcessState::Ready | ProcessState::Running => ('R', "running"),
-                    ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
-                };
-                let creds = p.credentials.read();
-                StatusSnap {
-                    name: p.name.clone(),
-                    umask: p.umask,
-                    state_char: sc,
-                    state_name: sn,
-                    tgid: p.tgid,
-                    pid_val: p.pid,
-                    ppid: p.ppid,
-                    uid: creds.uid,
-                    euid: creds.euid,
-                    gid: creds.gid,
-                    egid: creds.egid,
-                    pid_ns_chain: p.pid_ns_chain.clone(),
-                }
-            });
-        (s, caller_chain)
+    let snap = {
+        let process = bound.lock();
+        let (state_char, state_name) = match process.state {
+            ProcessState::Zombie => ('Z', "zombie"),
+            ProcessState::Terminated => ('X', "dead"),
+            ProcessState::Stopped => ('T', "stopped"),
+            _ if process.stopped => ('T', "stopped"),
+            ProcessState::Ready | ProcessState::Running => ('R', "running"),
+            ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
+        };
+        let creds = process.credentials.read();
+        StatusSnap {
+            name: process.name.clone(),
+            umask: process.umask,
+            state_char,
+            state_name,
+            tgid: process.tgid,
+            pid_val: process.pid,
+            ppid: process.ppid,
+            uid: creds.uid,
+            euid: creds.euid,
+            gid: creds.gid,
+            egid: creds.egid,
+        }
     };
-    // PROCESS_TABLE lock dropped here
 
-    match snap {
-        Some(s) => {
-            let caller_ns = kernel_core::owning_namespace(&caller_chain);
-            let (ns_tgid, ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
-                (
-                    kernel_core::pid_in_namespace(ns, s.tgid).unwrap_or(0),
-                    kernel_core::pid_in_namespace(ns, s.pid_val).unwrap_or(0),
-                    kernel_core::pid_in_namespace(ns, s.ppid).unwrap_or(0),
-                )
-            } else {
-                (s.tgid, s.pid_val, s.ppid)
-            };
+    {
+        let s = snap;
+        let (ns_tgid, ns_ppid) = if let Some(ref ns) = identity.viewer_ns {
+            (
+                if s.tgid == s.pid_val {
+                    identity.display_pid as usize
+                } else {
+                    kernel_core::pid_in_namespace(ns, s.tgid).unwrap_or(0)
+                },
+                kernel_core::pid_in_namespace(ns, s.ppid).unwrap_or(0),
+            )
+        } else {
+            (s.tgid, s.ppid)
+        };
 
-            format!(
-                "Name:\t{}\n\
+        format!(
+            "Name:\t{}\n\
                  Umask:\t{:04o}\n\
                  State:\t{} ({})\n\
                  Tgid:\t{}\n\
@@ -1498,106 +1500,64 @@ fn generate_status(pid: u32) -> String {
                  Uid:\t{}\t{}\t{}\t{}\n\
                  Gid:\t{}\t{}\t{}\t{}\n\
                  Threads:\t1\n",
-                s.name,
-                s.umask,
-                s.state_char,
-                s.state_name,
-                ns_tgid,
-                ns_pid,
-                ns_ppid,
-                s.uid,
-                s.euid,
-                s.uid,
-                s.uid,
-                s.gid,
-                s.egid,
-                s.gid,
-                s.gid,
-            )
-        }
-        _ => String::new(),
+            s.name,
+            s.umask,
+            s.state_char,
+            s.state_name,
+            ns_tgid,
+            identity.display_pid,
+            ns_ppid,
+            s.uid,
+            s.euid,
+            s.uid,
+            s.uid,
+            s.gid,
+            s.egid,
+            s.gid,
+            s.gid,
+        )
     }
 }
 
 /// Generate /proc/[pid]/stat content
 ///
 /// R29-1 FIX: Now uses real process data
-fn generate_stat(pid: u32) -> String {
-    if pid == 0 {
-        return String::new();
-    }
-
-    // R164-8 FIX: Snapshot all data under PROCESS_TABLE lock, then drop
-    // the lock BEFORE calling pid_in_namespace/owning_namespace. The old
-    // code held the table lock while acquiring PID namespace internal
-    // locks, creating a lock ordering inversion with concurrent sys_clone
-    // + CLONE_NEWPID (which holds ns lock then acquires PROCESS_TABLE).
-    // This matches the R162-I1 snapshot-then-translate pattern used by
-    // generate_status().
+fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> String {
+    // RF178-19 FIX: Snapshot the exact bound process object.
     let snapshot = {
-        let table = PROCESS_TABLE.lock();
-
-        let caller_ns_chain = process::current_pid()
-            .and_then(|cur_pid| table.get(cur_pid))
-            .and_then(|slot| slot.as_ref())
-            .map(|proc_arc| {
-                let p = proc_arc.lock();
-                p.pid_ns_chain.clone()
-            });
-
-        match table.get(pid as usize) {
-            Some(Some(proc)) => {
-                let p = proc.lock();
-                let state_char = match p.state {
-                    ProcessState::Zombie => 'Z',
-                    ProcessState::Terminated => 'X',
-                    ProcessState::Stopped => 'T',
-                    _ if p.stopped => 'T',
-                    ProcessState::Ready | ProcessState::Running => 'R',
-                    ProcessState::Blocked | ProcessState::Sleeping => 'S',
-                };
-                Some((
-                    p.pid,
-                    p.ppid,
-                    p.name.clone(),
-                    state_char,
-                    p.priority,
-                    p.pid_ns_chain.clone(),
-                    caller_ns_chain,
-                ))
-            }
-            _ => None,
-        }
-    };
-    // PROCESS_TABLE lock dropped here.
-
-    let (raw_pid, raw_ppid, name, state_char, priority, _target_ns_chain, caller_ns_chain) =
-        match snapshot {
-            Some(s) => s,
-            None => return String::new(),
+        let process = bound.lock();
+        let state_char = match process.state {
+            ProcessState::Zombie => 'Z',
+            ProcessState::Terminated => 'X',
+            ProcessState::Stopped => 'T',
+            _ if process.stopped => 'T',
+            ProcessState::Ready | ProcessState::Running => 'R',
+            ProcessState::Blocked | ProcessState::Sleeping => 'S',
         };
-
-    let caller_ns = caller_ns_chain
-        .as_ref()
-        .and_then(|chain| kernel_core::owning_namespace(chain));
-
-    let (ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
         (
-            kernel_core::pid_in_namespace(ns, raw_pid).unwrap_or(0),
-            kernel_core::pid_in_namespace(ns, raw_ppid).unwrap_or(0),
+            process.ppid,
+            process.name.clone(),
+            state_char,
+            process.priority,
         )
+    };
+
+    let (raw_ppid, name, state_char, priority) = snapshot;
+
+    let ns_ppid = if let Some(ref ns) = identity.viewer_ns {
+        kernel_core::pid_in_namespace(ns, raw_ppid).unwrap_or(0)
     } else {
-        (raw_pid, raw_ppid)
+        raw_ppid
     };
 
     format!(
         "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        ns_pid,
+        identity.display_pid,
         name,
         state_char,
         ns_ppid,
-        ns_pid,
-        ns_pid,
+        identity.display_pid,
+        identity.display_pid,
         priority,
     )
 }
@@ -1618,29 +1578,24 @@ const MAX_MAPS_OUTPUT: usize = 64 * 1024;
 /// R117-2 FIX: Output is bounded by MAX_MAPS_ENTRIES and MAX_MAPS_OUTPUT
 /// to prevent kernel OOM from processes with many mmap regions. When the
 /// budget is exceeded, a `... (truncated)\n` marker is appended.
-fn generate_maps(pid: u32) -> String {
+fn generate_maps(bound: &BoundProcess) -> String {
     // R162-I2 FIX: Snapshot mmap_regions and user_stack under locks, then drop
     // all locks before string formatting. This eliminates triple-nested lock
-    // hold (PROCESS_TABLE → Process → MmState) during format! calls.
+    // hold (Process → MmState) during format! calls.
     let snapshot: Option<(Vec<(usize, usize)>, Option<u64>)> = {
-        let table = PROCESS_TABLE.lock();
-        if let Some(Some(proc_arc)) = table.get(pid as usize) {
-            let proc = proc_arc.lock();
-            let mm = proc.mm.lock();
-            // D2 Phase 2: mmap_regions values are MmapEntry; snapshot the raw
-            // packed word so the downstream formatting (len/flags decode) is
-            // unchanged.
-            let regions: Vec<(usize, usize)> = mm
-                .mmap_regions
-                .iter()
-                .take(MAX_MAPS_ENTRIES)
-                .map(|(&start, &entry)| (start, entry.raw()))
-                .collect();
-            let stack = proc.user_stack.map(|s| s.as_u64());
-            Some((regions, stack))
-        } else {
-            None
-        }
+        let proc = bound.lock();
+        let mm = proc.mm.lock();
+        // D2 Phase 2: mmap_regions values are MmapEntry; snapshot the raw
+        // packed word so the downstream formatting (len/flags decode) is
+        // unchanged.
+        let regions: Vec<(usize, usize)> = mm
+            .mmap_regions
+            .iter()
+            .take(MAX_MAPS_ENTRIES)
+            .map(|(&start, &entry)| (start, entry.raw()))
+            .collect();
+        let stack = proc.user_stack.map(|s| s.as_u64());
+        Some((regions, stack))
     };
 
     if let Some((regions, user_stack)) = snapshot {

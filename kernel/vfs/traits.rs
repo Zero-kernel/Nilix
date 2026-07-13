@@ -198,6 +198,21 @@ pub trait Inode: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// R178-21 FIX: Atomic append write primitive
+    ///
+    /// Atomically selects EOF and writes data under inode-level serialization.
+    /// This makes O_APPEND writes atomic across independent file handles.
+    ///
+    /// RF178-17 FIX: The default fails closed. A stat()+write_at() fallback is
+    /// inherently racy across independent handles, so filesystems must provide
+    /// explicit inode-level append serialization.
+    ///
+    /// Returns (bytes_written, final_offset_after_write)
+    fn append_write(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
+        let _ = data;
+        Err(FsError::NotSupported)
+    }
+
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn Any;
 }
@@ -263,14 +278,18 @@ impl FileHandle {
             return Err(FsError::BadFd);
         }
 
-        let mut offset = self.offset.lock();
-
-        // Handle append mode
+        // R178-21 FIX: O_APPEND uses inode-level atomic append primitive
         if self.flags.is_append() {
-            let stat = self.inode.stat()?;
-            *offset = stat.size;
+            // RF178-17 FIX: Keep this open file description's offset lock across
+            // EOF selection, I/O, and final offset publication. Independent
+            // handles serialize at the inode; clones serialize here.
+            let mut offset = self.offset.lock();
+            let (n, final_offset) = self.inode.append_write(data)?;
+            *offset = final_offset;
+            return Ok(n);
         }
 
+        let mut offset = self.offset.lock();
         let n = self.inode.write_at(*offset, data)?;
         *offset += n as u64;
         Ok(n)
