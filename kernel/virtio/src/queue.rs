@@ -60,9 +60,9 @@ impl VirtQueue {
         let used_size = 4 + 8 * queue_size as usize + 2; // flags + idx + ring + avail_event
 
         // Align each section to 4KB for DMA
-        let desc_pages = (desc_size + 4095) / 4096;
-        let avail_pages = (avail_size + 4095) / 4096;
-        let used_pages = (used_size + 4095) / 4096;
+        let desc_pages = desc_size.div_ceil(4096);
+        let avail_pages = avail_size.div_ceil(4096);
+        let used_pages = used_size.div_ceil(4096);
 
         (desc_pages + avail_pages + used_pages) * 4096
     }

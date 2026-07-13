@@ -417,8 +417,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         let file_size = info.file_size() as usize;
 
-        let mut kernel_data = Vec::with_capacity(file_size);
-        kernel_data.resize(file_size, 0);
+        let mut kernel_data = vec![0; file_size];
 
         // 循环读取直到完整读取整个文件
         let mut total_read = 0usize;
@@ -821,13 +820,13 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
         // Maps virtual 0xffffffff80000000-0xffffffffbfffffff (1GB) to physical 0x0-0x3fffffff
         (&mut *pdpt_high_ptr)[510].set_addr(
-            PhysAddr::new(pd_frame as u64),
+            PhysAddr::new(pd_frame),
             Flags::PRESENT | Flags::WRITABLE,
         );
 
         // PML4的第511项指向高半区PDPT
         (&mut *pml4_ptr)[511].set_addr(
-            PhysAddr::new(pdpt_high_frame as u64),
+            PhysAddr::new(pdpt_high_frame),
             Flags::PRESENT | Flags::WRITABLE,
         );
 
@@ -862,7 +861,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
 
             (&mut *pdpt_low_ptr)[pdpt_idx].set_addr(
-                PhysAddr::new(pd_low_frame as u64),
+                PhysAddr::new(pd_low_frame),
                 Flags::PRESENT | Flags::WRITABLE,
             );
         }

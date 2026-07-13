@@ -297,12 +297,12 @@ impl FramebufferWriter {
         }
 
         // Copy line by line to handle overlapping regions
-        for (row, _) in (0..(self.max_row - 1)).enumerate() {
+        for row in 0..(self.max_row - 1) {
             let src = src_start + (row * line_bytes) as u64;
             let dst = dst_start + (row * line_bytes) as u64;
 
             // R24-8 fix: Check bounds for each line copy
-            let dst_offset = (row * line_bytes) as usize;
+            let dst_offset = row * line_bytes;
             let src_offset = dst_offset.saturating_add(line_bytes);
             if src_offset.saturating_add(line_bytes) > self.fb_size {
                 break;
