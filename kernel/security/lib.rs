@@ -205,13 +205,37 @@ impl SecurityReport {
     }
 
     /// Check if the system is in a secure state
+    /// R178-L5 FIX: Consider skipped protections and test warnings
     pub fn is_secure(&self) -> bool {
+        // Tests must pass (no failures) and have no warnings
         let tests_ok = self
             .test_report
             .as_ref()
-            .map(|t| t.failed == 0)
-            .unwrap_or(true);
-        self.total_violations == 0 && self.rng_ready && tests_ok
+            .map(|t| t.failed == 0 && t.warnings == 0)
+            .unwrap_or(false);
+
+        // Identity cleanup must not be skipped
+        let identity_ok = !matches!(self.identity_cleanup, CleanupOutcome::Skipped);
+
+        // NX/W^X must be enabled (not None)
+        let nx_enabled = self.nx_summary.is_some();
+        let wxorx_enabled = self.wxorx_summary.is_some();
+
+        // RF178-29 FIX: Presence alone is not a mitigation guarantee.
+        let spectre_enabled = self
+            .spectre_status
+            .as_ref()
+            .map(MitigationStatus::hardened)
+            .unwrap_or(false);
+
+        self.total_violations == 0
+            && self.rng_ready
+            && self.kptr_guard_active
+            && tests_ok
+            && identity_ok
+            && nx_enabled
+            && wxorx_enabled
+            && spectre_enabled
     }
 
     /// Print the security report to console
@@ -326,6 +350,10 @@ pub fn init(
     frame_allocator: &mut FrameAllocator,
 ) -> Result<SecurityReport, SecurityError> {
     let mut report = SecurityReport::empty();
+
+    // RF178-23 FIX: Publish the selected boot policy before BSP/AP or
+    // scheduler mitigation hooks can run.
+    spectre::set_policy_enabled(config.enable_spectre_mitigations);
 
     // R102-11 FIX: Propagate the fail-closed policy to KASLR slide generation.
     // In strict/Secure profiles, a deterministic kernel layout is unacceptable.

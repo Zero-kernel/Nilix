@@ -45,7 +45,22 @@
 //! }
 //! ```
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::registers::model_specific::Msr;
+
+/// RF178-23 FIX: Boot policy is authoritative on every CPU and switch path.
+/// Default false prevents AP startup from silently enabling mitigations before
+/// the selected profile has explicitly opted in.
+static MITIGATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_policy_enabled(enabled: bool) {
+    MITIGATIONS_ENABLED.store(enabled, Ordering::Release);
+}
+
+#[inline]
+fn policy_enabled() -> bool {
+    MITIGATIONS_ENABLED.load(Ordering::Acquire)
+}
 
 /// Status of speculative execution mitigations.
 #[derive(Debug, Clone, Copy)]
@@ -343,17 +358,20 @@ pub fn init() -> Result<MitigationStatus, SpectreError> {
 ///     // ... continue AP initialization ...
 /// }
 /// ```
-pub fn init_cpu() {
-    let status = detect();
+pub fn init_cpu() -> bool {
+    if !policy_enabled() {
+        return true;
+    }
+    let mut status = detect();
 
     // Enable IBRS if supported on this CPU
     if status.ibrs_supported {
-        let _ = enable_ibrs();
+        status.ibrs_enabled = enable_ibrs().is_ok();
     }
 
     // Enable STIBP if supported on this CPU
     if status.stibp_supported {
-        let _ = enable_stibp();
+        status.stibp_enabled = enable_stibp().is_ok();
     }
 
     // Issue IBPB to clear predictor state for this CPU
@@ -363,8 +381,13 @@ pub fn init_cpu() {
 
     // Enable SSBD if supported on this CPU
     if status.ssbd_supported {
-        let _ = enable_ssbd();
+        status.ssbd_enabled = enable_ssbd().is_ok();
     }
+
+    // Match the BSP's load-bearing RetpolineRequired gate. A heterogeneous AP
+    // that cannot establish either hardware IBRS or compiler retpoline stays
+    // offline instead of weakening the system invisibly.
+    !(status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled)
 }
 
 /// Enable IBRS by setting IA32_SPEC_CTRL.IBRS.
@@ -563,6 +586,39 @@ pub unsafe fn rsb_fill_on_context_switch() {
 #[inline]
 pub(crate) unsafe fn fill_rsb_if_needed() {
     rsb_fill();
+}
+
+/// R178-27 FIX: Issue IBPB on context switch between address spaces.
+///
+/// Called by the scheduler before switching to a different trust domain (process).
+/// Flushes indirect branch predictor state to prevent Spectre-v2 cross-process
+/// attacks. Only issues IBPB if the CPU supports it; silently no-ops otherwise.
+///
+/// # Safety
+///
+/// Safe to call from any context. Uses non-blocking MSR write. Scheduler ensures
+/// this is only called when switching between different address spaces (same-process
+/// threads skip the barrier).
+#[inline]
+pub fn issue_ibpb_on_switch() {
+    let status = detect();
+    if status.ibpb_supported {
+        let _ = issue_ibpb();
+    }
+}
+
+/// RF178-23 FIX: Complete the switch mitigation contract at one hook used by
+/// both fresh-user and resumed-context scheduler branches.
+pub fn context_switch_barrier(address_space_changed: bool) {
+    if !policy_enabled() {
+        return;
+    }
+    if address_space_changed {
+        issue_ibpb_on_switch();
+    }
+    // SAFETY: scheduler callers invoke this before changing RSP, and exec calls
+    // it on the current task's valid kernel stack after address-space commit.
+    unsafe { rsb_fill_on_context_switch() };
 }
 
 // ============================================================================

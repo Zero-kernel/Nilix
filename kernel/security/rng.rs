@@ -30,7 +30,7 @@ use core::hint::spin_loop;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fips::{fips_state, FipsState};
+use crate::fips::FipsState;
 
 /// RNG errors
 #[derive(Debug, Clone, Copy)]
@@ -86,7 +86,11 @@ pub fn init_global() -> Result<(), RngError> {
 
     // Seed material: 32 bytes key + 12 bytes nonce
     let mut seed = [0u8; 44];
-    fill_entropy(&mut seed)?;
+    if let Err(err) = fill_entropy(&mut seed) {
+        // RF178-28 FIX: entropy failure can leave a partially filled buffer.
+        explicit_bzero(&mut seed);
+        return Err(err);
+    }
 
     // Create and initialize the CSPRNG
     let mut key = [0u8; 32];
@@ -96,15 +100,21 @@ pub fn init_global() -> Result<(), RngError> {
 
     let mut rng = ChaCha20Rng::new(key, nonce);
 
-    // Mix in additional entropy for defense in depth
-    let mut extra = [0u8; 16];
-    fill_entropy(&mut extra)?;
-    rng.mix_in(&extra);
-
-    // Clear sensitive data from stack
+    // R178-L4 FIX: Clear seed/key/nonce BEFORE second entropy call
+    // so they don't remain on stack if fill_entropy fails below
     explicit_bzero(&mut seed);
     explicit_bzero(&mut key);
     explicit_bzero(&mut nonce);
+
+    // Mix in additional entropy for defense in depth
+    let mut extra = [0u8; 16];
+    if let Err(err) = fill_entropy(&mut extra) {
+        explicit_bzero(&mut extra);
+        return Err(err);
+    }
+    rng.mix_in(&extra);
+
+    // Clear extra entropy from stack
     explicit_bzero(&mut extra);
 
     *GLOBAL_RNG.lock() = Some(rng);
@@ -149,11 +159,12 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
     //  - Enabled: fall back to direct hardware entropy (RDRAND/RDSEED)
     //  - Failed:  fail closed — no crypto operations in indeterminate state
     //  - Disabled: proceed normally with ChaCha20 CSPRNG
-    match fips_state() {
-        FipsState::Enabled => return fill_entropy(out),
-        FipsState::Failed => return Err(RngError::FipsBlocked),
-        FipsState::Disabled => {}
-    }
+    let _non_fips = match crate::fips::begin_non_fips_operation() {
+        Ok(guard) => guard,
+        Err(FipsState::Enabled) => return fill_entropy(out),
+        Err(FipsState::Failed | FipsState::Disabled) => return Err(RngError::FipsBlocked),
+    };
+
     for chunk in out.chunks_mut(RNG_FILL_CHUNK_SIZE) {
         let mut guard = GLOBAL_RNG.lock();
         let rng = guard.as_mut().ok_or(RngError::NotInitialized)?;
@@ -175,6 +186,7 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
         // Lock is released here (guard dropped) before next chunk iteration,
         // allowing other CPUs to acquire the RNG for their operations.
     }
+
     Ok(())
 }
 
@@ -197,11 +209,11 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
 /// always get entropy for encryption, avoiding plaintext dumps.
 pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
     // R140-6 FIX: Same FIPS gate as fill_random().
-    match fips_state() {
-        FipsState::Enabled => return fill_entropy(out),
-        FipsState::Failed => return Err(RngError::FipsBlocked),
-        FipsState::Disabled => {}
-    }
+    let _non_fips = match crate::fips::begin_non_fips_operation() {
+        Ok(guard) => guard,
+        Err(FipsState::Enabled) => return fill_entropy(out),
+        Err(FipsState::Failed | FipsState::Disabled) => return Err(RngError::FipsBlocked),
+    };
 
     // First, try the CSPRNG if it's available without blocking.
     if let Some(mut guard) = GLOBAL_RNG.try_lock() {
@@ -218,6 +230,7 @@ pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
             }
 
             rng.fill_bytes(out);
+
             return Ok(());
         }
     }
@@ -294,13 +307,13 @@ pub fn chacha20_xor_keystream(
     // R165-10 FIX: Fail-closed FIPS gate. Unlike fill_random() (which can fall
     // back to the FIPS-validated hardware entropy path when Enabled), ChaCha20
     // has no approved path at all — block it under both Enabled and Failed.
-    match fips_state() {
-        FipsState::Enabled | FipsState::Failed => {
+    let _non_fips = match crate::fips::begin_non_fips_operation() {
+        Ok(guard) => guard,
+        Err(FipsState::Enabled | FipsState::Failed | FipsState::Disabled) => {
             explicit_bzero(&mut key);
             return Err(RngError::FipsBlocked);
         }
-        FipsState::Disabled => {}
-    }
+    };
 
     let mut cipher = ChaCha20Rng::new(key, nonce);
     // Wipe the stack copy of the key now that it's been expanded into cipher state.
@@ -320,6 +333,7 @@ pub fn chacha20_xor_keystream(
     // Defense-in-depth: wipe keystream buffer using write_volatile to
     // prevent the compiler from optimizing away the zeroing.
     explicit_bzero(&mut keystream);
+
     Ok(())
 }
 
