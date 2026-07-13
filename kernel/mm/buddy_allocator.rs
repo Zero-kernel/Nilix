@@ -157,7 +157,7 @@ impl BuddyAllocator {
             // ceil is written as div + remainder-bump (not `rel_end + page - 1`)
             // so it cannot wrap even if rel_end were near u64::MAX (R167 review).
             let start_idx = (rel_start / page) as usize;
-            let end_idx = ((rel_end / page) as usize + usize::from(rel_end % page != 0))
+            let end_idx = ((rel_end / page) as usize + usize::from(!rel_end.is_multiple_of(page)))
                 .min(self.total_pages);
 
             for page_idx in start_idx..end_idx {
@@ -248,7 +248,7 @@ impl BuddyAllocator {
     }
 
     /// 分割块直到达到目标大小
-    fn split_block(&mut self, mut block_idx: usize, mut current_order: usize, target_order: usize) {
+    fn split_block(&mut self, block_idx: usize, mut current_order: usize, target_order: usize) {
         while current_order > target_order {
             current_order -= 1;
             let buddy_idx = block_idx + (1 << current_order);
@@ -394,7 +394,7 @@ impl BuddyAllocator {
         // Use checked_add to guard against usize overflow on pathological input.
         if buddy_idx
             .checked_add(pages)
-            .map_or(true, |end| end > self.total_pages)
+            .is_none_or(|end| end > self.total_pages)
         {
             return false;
         }
@@ -578,10 +578,7 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
 
     // R152-17 FIX: Use checked_next_power_of_two to prevent overflow to 0
     // on huge count values, matching the pattern in free_physical_pages().
-    let pages_needed = match count.checked_next_power_of_two() {
-        Some(p) => p,
-        None => return None,
-    };
+    let pages_needed = count.checked_next_power_of_two()?;
     let order = pages_needed.trailing_zeros() as usize;
 
     // 第一次尝试分配

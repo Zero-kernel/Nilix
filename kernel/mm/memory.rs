@@ -184,7 +184,7 @@ const MIN_USABLE_REGION: u64 = 2 * 1024 * 1024;
 const MIN_SAFE_ADDRESS: u64 = 0x100000;
 /// 高半区直映上限（Bootloader 映射了物理 0-1GB 到 0xffffffff80000000-...）
 /// 只能使用此范围内的物理内存（超出范围将不可访问）
-const HIGH_HALF_MAP_LIMIT: u64 = 1 * 1024 * 1024 * 1024; // 1GB
+const HIGH_HALF_MAP_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 
 // ============================================================================
 // 初始化函数
@@ -616,7 +616,7 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         total_conventional += clamped_length;
 
         // 记录最大区域
-        if best.map_or(true, |(_, size)| clamped_length > size) {
+        if best.is_none_or(|(_, size)| clamped_length > size) {
             best = Some((start, clamped_length));
         }
     }
@@ -836,6 +836,12 @@ const fn align_down(val: u64, align: u64) -> u64 {
 /// 改进的物理帧分配器（使用Buddy分配器）
 pub struct FrameAllocator;
 
+impl Default for FrameAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameAllocator {
     pub fn new() -> Self {
         FrameAllocator
@@ -877,7 +883,7 @@ impl FrameAllocator {
             free_physical_pages: buddy_stats.free_pages,
             used_physical_pages: buddy_stats.used_pages,
             fragmentation_percent: (buddy_stats.fragmentation * 100.0) as u32,
-            heap_used_bytes: HEAP_SIZE - unsafe { ALLOCATOR.lock().free() },
+            heap_used_bytes: HEAP_SIZE - ALLOCATOR.lock().free(),
             heap_total_bytes: HEAP_SIZE,
         }
     }
@@ -893,7 +899,7 @@ impl FrameAllocator {
 /// largest contiguous run — a necessary-not-sufficient headroom check.
 #[inline]
 pub fn heap_free_bytes() -> usize {
-    unsafe { ALLOCATOR.lock().free() }
+    ALLOCATOR.lock().free()
 }
 
 /// 实现 x86_64 FrameAllocator trait 以便与页表管理器配合使用

@@ -66,6 +66,7 @@ static STATS_PAGES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 /// R106-5: Counter for mailbox saturation fallbacks
 static STATS_COALESCED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 /// SMP support flag - now true since IPI-based shootdown is implemented
 static SMP_SHOOTDOWN_IMPLEMENTED: bool = true;
 
@@ -247,8 +248,9 @@ unsafe fn flush_all_pcid_without_invpcid() {
 /// 1. **INVPCID available**: Use INVPCID type 2 (most efficient, flushes all PCIDs)
 /// 2. **PCID enabled, no INVPCID**: Toggle CR4.PCIDE to flush all PCIDs
 /// 3. **No PCID**: Standard CR3 reload (fastest, no PCID tracking overhead)
-/// R115-4 FIX: Made `pub` to allow other kernel crates (security, arch) to use
-/// the PCID-aware flush path instead of raw `tlb::flush_all()`.
+///
+///    R115-4 FIX: Made `pub` to allow other kernel crates (security, arch) to use
+///    the PCID-aware flush path instead of raw `tlb::flush_all()`.
 ///
 /// This is the **single flush API** that all kernel code should use for local
 /// TLB invalidation. Direct calls to `x86_64::instructions::tlb::flush_all()`
@@ -381,7 +383,7 @@ fn tlb_ipi_sender() -> Option<TlbIpiSender> {
         None
     } else {
         // Safety: pointer was written from a real function in register_ipi_sender()
-        Some(unsafe { mem::transmute(ptr) })
+        Some(unsafe { mem::transmute::<usize, fn(usize)>(ptr) })
     }
 }
 
@@ -456,7 +458,7 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
     if target_cr3 != 0 {
         let online = ONLINE_CPU_MASK.load(Ordering::Acquire);
         let max_tracked = core::cmp::min(max_cpus(), 64);
-        for cpu in 0..max_tracked {
+        for (cpu, _) in CPU_ACTIVE_CR3.iter().enumerate().take(max_tracked) {
             if cpu == self_id || (online & (1u64 << cpu)) == 0 {
                 continue;
             }
@@ -548,7 +550,7 @@ fn enqueue_mailbox(
         } else {
             // Queue is full, need to wait
             spins += 1;
-            if spins % 100_000 == 0 {
+            if spins.is_multiple_of(100_000) {
                 kprintln!(
                     "[TLB] CPU shootdown queue full, waiting (head={}, tail={}, spins={})",
                     head,
@@ -738,12 +740,14 @@ fn wait_for_acks_with_retry(targets: &[usize], generation: u64, sender: TlbIpiSe
 
             // In release builds, continue with warning (safer than hard panic)
             // The TLB may be stale on some CPUs, but panicking could cause worse issues
+            #[cfg(not(debug_assertions))]
             return false;
         }
     }
     false
 }
 
+#[allow(dead_code)]
 /// Warn about timeout waiting for ACKs (non-fatal, for debugging)
 fn warn_timeout(targets: &[usize], generation: u64) {
     // Find which CPUs didn't ACK
@@ -853,7 +857,7 @@ fn normalize_range(start: VirtAddr, len: usize) -> RangeOp {
 
 /// Flush a range of pages locally
 fn flush_range_local(start: u64, len: u64) {
-    debug_assert!(len % PAGE_SIZE == 0);
+    debug_assert!(len.is_multiple_of(PAGE_SIZE));
     let mut offset = 0;
     while offset < len {
         let addr = VirtAddr::new(start + offset);

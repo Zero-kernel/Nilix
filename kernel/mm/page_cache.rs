@@ -1631,7 +1631,7 @@ pub struct PageCachePressureHandler;
 impl MemoryPressureHandler for PageCachePressureHandler {
     fn on_memory_pressure(&self, nr_pages_needed: usize) -> usize {
         // First, try to reclaim clean pages
-        let mut freed = reclaim_pages(nr_pages_needed);
+        let freed = reclaim_pages(nr_pages_needed);
 
         if freed < nr_pages_needed {
             // Not enough clean pages, need to writeback dirty pages first

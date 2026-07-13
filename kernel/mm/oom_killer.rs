@@ -301,6 +301,7 @@ fn emit_audit(
     }
 }
 
+#[allow(dead_code)]
 /// Encode nice value to unsigned for audit args
 fn encode_nice(nice: i32) -> u64 {
     nice.clamp(-20, 19).saturating_add(20) as u64

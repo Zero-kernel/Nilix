@@ -4,7 +4,6 @@
 extern crate alloc;
 
 // 导入 drivers crate 的宏
-#[macro_use]
 extern crate drivers;
 #[macro_use]
 extern crate klog;

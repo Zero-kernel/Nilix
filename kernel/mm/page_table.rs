@@ -120,6 +120,10 @@ where
 }
 
 /// RF178-12: nonblocking `with_current_manager` variant for synchronous #PF.
+///
+/// # Safety
+///
+/// Caller must ensure `physical_memory_offset` is valid and the PT_LOCK is not held by the current CPU.
 /// A contended global PT lock returns `None`; an exception path must never spin
 /// on a lock whose holder may need the faulting CPU to make forward progress.
 pub unsafe fn try_with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> Option<T>
@@ -627,7 +631,6 @@ pub enum UpdateFlagsError {
     ParentEntryHugePage,
 }
 
-/// 全局页表管理器实例
 lazy_static::lazy_static! {
     pub static ref PAGE_TABLE_MANAGER: Mutex<Option<PageTableManager>> = Mutex::new(None);
 }

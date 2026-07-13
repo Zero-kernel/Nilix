@@ -299,7 +299,7 @@ impl Drop for DmaBuffer {
 
         // Step 1: Unmap from IOMMU domain first (prevents DMA into freed memory).
         if let Some(ops) = IOMMU_OPS.get() {
-            if let Err(_) = (ops.unmap_range)(self.domain_id, self.iova, self.size) {
+            if (ops.unmap_range)(self.domain_id, self.iova, self.size).is_err() {
                 // IOMMU unmap failed - scrub and leak pages to prevent reuse
                 // under an unknown DMA state. This is fail-safe behavior.
                 scrub_range(self.phys, alloc_bytes);
@@ -437,7 +437,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
                     );
                     buddy_allocator::free_physical_pages(frame, pages);
                 }
-                DmaError::IommuMapFailed | _ => {
+                DmaError::IommuMapFailed => {
                     // Unsafe error: mapping state uncertain, must leak pages
                     // to prevent device from accessing reused memory
                     kprintln!(
