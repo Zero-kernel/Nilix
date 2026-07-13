@@ -798,10 +798,10 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
     use types::FileOps;
 
     // Mock FileOps for testing
+    #[allow(dead_code)]
     struct MockFile;
 
     impl FileOps for MockFile {
@@ -903,7 +903,7 @@ mod tests {
         // Second decrement on the same entry (simulating a double-decrement bug):
         // - In debug builds: panics due to debug_assert!(prev != 0)
         // - In release builds: saturates at 0 (defense-in-depth)
-        let should_revoke_again = table.decrement_refcount(cap_id).unwrap();
+        let _should_revoke_again = table.decrement_refcount(cap_id).unwrap();
 
         // Only reaches here in release builds
         #[cfg(not(debug_assertions))]

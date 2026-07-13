@@ -1519,8 +1519,8 @@ impl AuditExportRecord {
         let mut args = [0u64; 6];
         let count = core::cmp::min(event.arg_count as usize, args.len());
         let should_redact = redact_syscall_args && matches!(event.kind, AuditKind::Syscall);
-        for i in 0..count {
-            args[i] = if should_redact && i != 0 {
+        for (i, arg) in args.iter_mut().enumerate().take(count) {
+            *arg = if should_redact && i != 0 {
                 0
             } else {
                 event.args[i]

@@ -539,8 +539,8 @@ impl CapEntry {
     /// R177-1 FIX: Uses saturating decrement to prevent underflow wrap (0 - 1 → usize::MAX).
     /// While no reachable double-decrement exists in the current tree (generation monotonicity
     /// + single-lock decrement + teardown funnel close the class), saturating arithmetic
-    /// provides defense-in-depth hardening against future edits. A debug_assert tripwire
-    /// catches any double-decrement during development.
+    ///   provides defense-in-depth hardening against future edits. A debug_assert tripwire
+    ///   catches any double-decrement during development.
     #[inline]
     pub fn decrement_refcount(&self) -> bool {
         let prev = self
