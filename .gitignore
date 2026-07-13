@@ -31,6 +31,7 @@ userspace/clippy-userspace-target
 *.txt
 *.log
 *.skill
+.tmp-*/
 core
 
 !README.md

@@ -2,6 +2,10 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R178 Fixes (July 2026)
+
+- **[R178-fix-summary.md](R178-fix-summary.md)** - Complete R178 CRITICAL+HIGH fix summary (11 findings)
+
 ## R174 Fixes (July 2026)
 
 - **[R174-fix-plan.md](R174-fix-plan.md)** - Comprehensive fix plan for R174 findings
@@ -25,7 +29,7 @@ This directory contains fix plans, implementation details, and summaries for sec
 
 1. **Audit** → Findings categorized by severity (see [../audits/](../audits/))
 2. **Fix Plan** → Comprehensive fix strategy (R17X-fix-plan.md)
-3. **Implementation** → Detailed implementation with verification (R17X-HIGH-fixes-implementation.md)
+3. **Implementation** → Detailed implementation with verification (R17X-fix-summary.md)
 4. **Completion** → Fix validation and gate status (R17X-HIGH-fixes-complete.md)
 5. **Summary** → Executive summary and next steps (R17X-summary.md)
 
