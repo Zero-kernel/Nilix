@@ -867,7 +867,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
 
         (&mut *pml4_ptr)[0].set_addr(
-            PhysAddr::new(pdpt_low_frame as u64),
+            PhysAddr::new(pdpt_low_frame),
             Flags::PRESENT | Flags::WRITABLE,
         );
 
