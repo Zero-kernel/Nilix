@@ -606,6 +606,29 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 // CPU异常处理器 (0-31)
 // ============================================================================
 
+/// RF178-1 FIX: Fatal Ring-3 exception paths do not return through a normal
+/// epilogue, so establish kernel GS and the kernel KPTI root before they enter
+/// process teardown or the scheduler.
+#[inline]
+unsafe fn enter_kernel_state_from_user_exception() {
+    core::arch::asm!(
+        "swapgs",
+        "lfence",
+        "mov rax, qword ptr gs:[{kernel_cr3}]",
+        "test rax, rax",
+        "jz 2f",
+        "mov rcx, cr3",
+        "cmp rcx, rax",
+        "je 2f",
+        "mov cr3, rax",
+        "2:",
+        kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        out("rax") _,
+        out("rcx") _,
+        options(nostack)
+    );
+}
+
 /// R107-1 FIX: Shared helper for user-mode exception discrimination.
 ///
 /// Checks whether the CPU exception originated from Ring 3 (user-mode) by
@@ -639,6 +662,8 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
         return false;
     }
 
+    // SAFETY: CS.RPL above proves this exception crossed from Ring 3.
+    unsafe { enter_kernel_state_from_user_exception() };
     if let Some(pid) = current_pid() {
         // R116-1 FIX: After terminate_process(), we MUST NOT return to the caller.
         // The x86-interrupt ABI will IRET back to the faulting user instruction,
@@ -674,6 +699,8 @@ fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrame) {
 
     if let Some(pid) = current_pid() {
         if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
+            // SAFETY: returning_to_user proves the handler entered from Ring 3.
+            unsafe { enter_kernel_state_from_user_exception() };
             kernel_core::process::terminate_self_and_halt(pid, exit_code);
         }
     }
@@ -1190,41 +1217,21 @@ extern "x86-interrupt" fn page_fault_handler(
     // If a user-mode not-present page fault lands in the lazy stack region
     // [usable_base, eager_floor), try to grow the stack to cover it.
     //
-    // DEFERRED-CHARGE design (IRQs-off, no Process lock):
-    // 1. Map up to 8 pages in the leaf PT (IRQs-off, bounded time)
-    // 2. Defer the cgroup charge to a process-context safepoint
-    // 3. If charge fails later, the process is killed
-    //
-    // SMP gating: Only enabled on single-CPU until SLICE 6 implements deferred-flush.
+    // RF178-12: synchronous hard-charge design. The try-only fault path keeps
+    // Process -> MmState held, hard-charges DATA/PT before PTE publication, and
+    // commits every published prefix before returning. It never queues work or
+    // waits for an IPI acknowledgement from exception context.
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
     let is_not_present = !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
 
     if is_user_mode && is_not_present && fault_addr < USER_SPACE_TOP {
         // Check if this is a stack grow opportunity
         if let Some(pid) = kernel_core::process::current_pid() {
-            // M0-7 SLICE 6: Demand-grow now works on SMP with TLB shootdown.
-            // The grow primitive (try_demand_grow_user_stack) uses deferred charge
-            // (IRQ-safe), bounded batch mapping (≤8 pages), and returns the grown
-            // range [new_floor, old_floor). After a successful grow, we invalidate
-            // that range on all CPUs via mm::tlb_shootdown::flush_current_as_range.
-            //
-            // The TLB flush MUST happen before IRET returns to user mode — otherwise
-            // another CPU running a sibling thread in the same address space could
-            // access the newly-mapped stack pages with stale not-present TLB entries,
-            // causing spurious #PF faults (correctness issue, not a security hole —
-            // the page tables are correct, only TLB is stale).
-            if let Ok((new_floor, old_floor)) =
-                kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr)
-            {
-                // Invalidate [new_floor, old_floor) on all CPUs. The shootdown
-                // infrastructure (mm::tlb_shootdown) handles single-CPU vs SMP
-                // transparently: on single-CPU it's a local invlpg; on SMP it
-                // sends IPIs and waits for ACKs. IRQ-safe (uses spin locks only).
-                use x86_64::VirtAddr;
-                let len = old_floor - new_floor;
-                mm::tlb_shootdown::flush_current_as_range(VirtAddr::new(new_floor as u64), len);
-
-                // Stack grown + TLB flushed successfully, return to user mode
+            // P=0 -> P=1 creates no pre-existing valid translation to shoot down;
+            // map_page performs the bounded local invalidation. Any error falls
+            // through to the fatal USER_MODE path, after partial accounting has
+            // already been committed by the helper.
+            if kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr).is_ok() {
                 return;
             }
         }
@@ -1236,13 +1243,18 @@ extern "x86-interrupt" fn page_fault_handler(
     // 内核态访问用户内存的缺页仍然 panic（这是内核bug，如TOCTOU）
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
 
-    if is_user_mode && fault_addr < USER_SPACE_TOP {
+    // RF178-1 FIX: USER_MODE is authoritative. Ring 3 can fault on a
+    // canonical upper-half address; treating that as a kernel fault lets an
+    // unprivileged access panic the kernel.
+    if is_user_mode {
         if let Some(pid) = kernel_core::process::current_pid() {
             // SIGSEGV 的退出码为 128 + 11 = 139
             // R116-1 FIX: Do NOT return after terminate — IRET would resume the
             // zombie on freed page tables. On SMP, parent can concurrently reap
             // via waitpid, freeing CR3 while this CPU is on the IRET path.
             // R117-1 FIX: Use centralized terminate_self_and_halt().
+            // SAFETY: USER_MODE proves this page fault crossed from Ring 3.
+            unsafe { enter_kernel_state_from_user_exception() };
             kernel_core::process::terminate_self_and_halt(pid, 139);
         }
     }
@@ -1371,19 +1383,23 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 /// preemptive IRQ-return signal delivery; SLICE 3a adds NO new behavior — the body
 /// below is the former handler verbatim, reading the hardware frame via `isf`.
 ///
-/// ## GS / CR3 invariant (LOAD-BEARING — do NOT add swapgs here)
+/// ## R178-1 FIX: CS-RPL-gated swapgs for Ring-3 timer interrupts
 ///
-/// This stub does **NO** `swapgs` and **NO** CR3 switch, exactly matching the prior
-/// `extern "x86-interrupt"` handler. The timer body is **GS-INDEPENDENT**: per-CPU
-/// access goes through `current_cpu_id()` (kernel/cpu_local/lib.rs — reads the LAPIC
-/// MMIO ID register, bits 31:24 of `lapic_mmio_base()+0x20`) and `CpuLocal`/atomic
-/// indexing, NOT `gs:[...]` (contrast the SYSCALL stub at arch/syscall.rs:942/1212,
-/// which DOES swapgs precisely because it uses `gs:[percpu_*]`). Adding swapgs here
-/// would be a behavior change AND a regression risk (returning to Ring-3 on the wrong
-/// GS if any path skipped the swap-out). INVARIANT FOR FUTURE EDITS: if the timer body
-/// is ever changed to access per-CPU data via `gs:[...]`, this stub MUST then adopt the
-/// full CS-RPL-gated swapgs (+lfence) + KPTI CR3 discipline of the syscall entry/exit
-/// stubs — until then it is intentionally absent. (Codex-confirmed, session 019efcb9.)
+/// The timer body's pending-kill path (line 1761: force_reschedule) calls the scheduler,
+/// which accesses `gs:[percpu_*]` (enhanced_scheduler.rs). When a Ring-3 timer fires,
+/// the attacker-controlled GS_BASE remains active without swapgs, allowing:
+/// 1. Attacker places malicious CR3 at GS_BASE+percpu_kpti_user_cr3_offset
+/// 2. Scheduler reads it into RDX (context_switch.rs:509)
+/// 3. MOV CR3, RDX switches to attacker-controlled page tables
+/// 4. Arbitrary physical memory access
+///
+/// FIX: Add CS-RPL-gated swapgs+lfence after GPR save, mirroring syscall_entry_stub
+/// discipline (syscall.rs:942). This ensures kernel GS_BASE is active BEFORE any
+/// scheduler call. Kernel-mode timers skip the swap (test CS.RPL==0).
+///
+/// SAFETY: Eliminates the vulnerability class by enforcing kernel GS_BASE at entry
+/// before ANY code path that might call the scheduler. Performance: ~13 cycles on
+/// Ring-3 timer (every 1ms) = 0.001% overhead. Negligible.
 #[unsafe(naked)]
 unsafe extern "C" fn timer_interrupt_stub() -> ! {
     // Push the 15 general-purpose registers so the interrupted user (or kernel) GPR
@@ -1412,6 +1428,23 @@ unsafe extern "C" fn timer_interrupt_stub() -> ! {
         "push r13",
         "push r14",
         "push r15",
+        // R178-1 FIX: CS-RPL-gated swapgs for Ring-3 entries.
+        // Load CS from hardware frame at [rsp + GPR_BYTES + 8].
+        "mov rax, [rsp + {gpr_bytes} + 8]",
+        // Test RPL bits (CS & 0x3). If zero (kernel mode), skip swapgs.
+        "test al, 3",
+        "jz 1f",
+        // Ring-3: swap to kernel GS_BASE and fence speculation.
+        "swapgs",
+        "lfence",
+        // KPTI: enter the kernel root before invoking Rust or the scheduler.
+        "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "test rax, rax",
+        "jz 1f",
+        "cmp rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "je 1f",
+        "mov cr3, rax",
+        "1:",
         // rdi = &mut IrqGprFrame (current rsp, r15 at the lowest address).
         "mov rdi, rsp",
         // rsi = &mut InterruptStackFrameValue (just above the pushed GPRs).
@@ -1421,6 +1454,21 @@ unsafe extern "C" fn timer_interrupt_stub() -> ! {
         "and rsp, -16",
         "call {body}",
         "mov rsp, rbp",
+        // R178-1 FIX: Restore user GS if we swapped.
+        // Reload CS after the call because RAX is caller-clobbered.
+        "mov rax, [rsp + {gpr_bytes} + 8]",
+        "test al, 3",
+        "jz 2f",
+        // KPTI: restore the current task's user root while kernel GS is active.
+        "mov rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "test rax, rax",
+        "jz 3f",
+        "cmp rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "je 3f",
+        "mov cr3, rax",
+        "3:",
+        "swapgs",
+        "2:",
         // Restore in reverse push order.
         "pop r15",
         "pop r14",
@@ -1439,6 +1487,8 @@ unsafe extern "C" fn timer_interrupt_stub() -> ! {
         "pop rax",
         "iretq",
         gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+        percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
         body = sym timer_interrupt_body,
     );
 }
@@ -1726,30 +1776,13 @@ extern "C" fn timer_interrupt_body(
     // 2. 没有正确的 iret 降权路径
     // 实际调度延迟到安全路径（syscall 返回）执行
     if returning_to_user {
+        let mut retry_pending_exit = false;
         // R116-2 FIX: Check pending_kill before returning to user-mode.
         if let Some(pid) = current_pid() {
-            if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
-                // R155-6 FIX: Defer heavy terminate_process() to process context.
-                // Only set Zombie AFTER defer succeeds to avoid unreaped zombie
-                // if the deferred queue is full.
-                // R173 IRQ-SAFETY FIX: Use try_get_process to avoid blocking on PROCESS_TABLE
-                if kernel_core::process::defer_irq_terminate(pid, exit_code) {
-                    // Deferred successfully — now mark Zombie to prevent rescheduling
-                    match kernel_core::process::try_get_process(pid) {
-                        Some(Some(proc_arc)) => {
-                            if let Some(mut proc) = proc_arc.try_lock() {
-                                proc.state = kernel_core::process::ProcessState::Zombie;
-                                proc.exit_code = Some(exit_code);
-                            }
-                            // PCB contended - state update deferred; process will be terminated
-                            // in process context anyway via defer_irq_terminate queue
-                        }
-                        _ => {
-                            // Process gone or PROCESS_TABLE contended - OK, termination
-                            // will complete via deferred queue
-                        }
-                    }
-
+            match kernel_core::process::try_defer_pending_process_exit(pid) {
+                kernel_core::process::IrqExitDefer::Queued => {
+                    // RF178-35 FIX: queue claim, pending consumption, and provisional
+                    // Zombie publication are one exact-PCB try-lock transaction.
                     unsafe {
                         irq_restore_fpu();
                     }
@@ -1758,19 +1791,22 @@ extern "C" fn timer_interrupt_body(
                     x86_interrupts::disable();
                     kernel_core::process::activate_memory_space(0, Some(0));
 
-                    kernel_core::force_reschedule();
-
-                    x86_interrupts::disable();
+                    // A bounded local selection may legitimately miss because
+                    // a queue/PCB is contended or the runnable task lies in a
+                    // later cursor window. Stay on boot CR3, allow interrupts,
+                    // and retry after each wake. Deferred teardown is gated by
+                    // `on_cpu`, so this kernel stack remains pinned until a
+                    // replacement context has actually been saved.
                     loop {
-                        x86_64::instructions::hlt();
+                        kernel_core::force_reschedule_from_irq();
+                        x86_64::instructions::interrupts::enable_and_hlt();
+                        x86_interrupts::disable();
                     }
-                } else {
-                    // Deferred queue full — re-flag for next tick
-                    kernel_core::process::request_process_exit(pid, exit_code);
                 }
+                kernel_core::process::IrqExitDefer::Retry => retry_pending_exit = true,
+                kernel_core::process::IrqExitDefer::NoRequest => {}
             }
         }
-
         // M0-7 SLICE 3b: IRQ-context signal delivery hook.
         // INVARIANT FOR FUTURE EDITS (FIX B): This hook site requires: (1) the
         // syscall-path signal-frame build (maybe_deliver_signal Phase 2/3) completes
@@ -1781,7 +1817,7 @@ extern "C" fn timer_interrupt_body(
         // (e.g. an atomic flag checked here + set by maybe_deliver_signal Phase 2)
         // becomes MANDATORY to prevent double-delivery (IRQ hook + syscall-path both
         // mid-build). Today the RPL==3 + in_signal_handler exclusion is airtight.
-        if kernel_core::signal::any_handler_installed() {
+        if !retry_pending_exit && kernel_core::signal::any_handler_installed() {
             if let Some(pid) = kernel_core::process::current_pid() {
                 // Extract scalar user context from arch-local types.
                 if let Some((
@@ -1863,6 +1899,28 @@ extern "C" fn timer_interrupt_body(
 
     // R69-3 FIX: Mark leaving IRQ context
     current_cpu().irq_exit();
+
+    // R178-2 FIX: Check need_resched with IRQs off immediately before iretq.
+    //
+    // VULNERABILITY: The previous code only called request_resched_from_irq() which sets
+    // a flag, but never actually checked it before returning. A user-mode infinite loop
+    // that never makes syscalls could monopolize the CPU indefinitely, starving other tasks.
+    //
+    // FIX: Check need_resched with interrupts DISABLED (they are disabled throughout this
+    // x86-interrupt handler), and if set, invoke the scheduler. The x86-interrupt calling
+    // convention keeps IRQs disabled from entry through return, and iretq atomically restores
+    // RFLAGS (re-enabling IF), so there's no window between the check and the actual return
+    // where an IRQ could set need_resched and be missed.
+    //
+    // SAFETY: Only preempt when returning to user mode (RPL==3). Kernel code is non-preemptible.
+    // The scheduler must not re-enable interrupts, or we reintroduce the race. We use
+    // x86_interrupts::without_interrupts() which is a no-op when IRQs are already disabled,
+    // ensuring the scheduler runs with IRQs off.
+    if returning_to_user && current_cpu().need_resched.load(Ordering::Acquire) {
+        x86_interrupts::without_interrupts(|| {
+            kernel_core::scheduler_hook::force_reschedule_from_irq();
+        });
+    }
 }
 
 /// M0-7 SLICE 3a self-test: pin the `IrqGprFrame` layout against the

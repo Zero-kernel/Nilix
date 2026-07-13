@@ -33,13 +33,22 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::apic;
 use crate::interrupts;
 use crate::syscall;
 use mm::page_table::recursive_pd;
+use spin::Once;
 use x86_64::structures::paging::PageTableFlags;
+
+/// RF178-23 FIX: Root-registered AP security initialization avoids an
+/// arch-to-security crate dependency and fails closed if boot wiring is lost.
+static AP_SECURITY_INIT: Once<fn() -> bool> = Once::new();
+
+pub fn register_ap_security_init(callback: fn() -> bool) {
+    AP_SECURITY_INIT.call_once(|| callback);
+}
 
 // ============================================================================
 // Constants
@@ -551,6 +560,18 @@ static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Without this, a slow AP could read the wrong data if BSP times out and moves on.
 static AP_DATA_CLAIMED: AtomicU64 = AtomicU64::new(0);
 
+/// RF178-24 FIX: BSP-owned admission handshake for the one AP currently using
+/// the shared trampoline. Bring-up is serialized, so one state machine is
+/// sufficient and prevents a timed-out AP from publishing itself after the
+/// scheduler/cpuset topology snapshot has been frozen.
+const AP_BOOT_IDLE: u8 = 0;
+const AP_BOOT_STARTING: u8 = 1;
+const AP_BOOT_READY: u8 = 2;
+const AP_BOOT_ACCEPTED: u8 = 3;
+const AP_BOOT_REJECTED: u8 = 4;
+const AP_BOOT_ONLINE: u8 = 5;
+static AP_BOOT_STATE: AtomicU8 = AtomicU8::new(AP_BOOT_IDLE);
+
 /// Flag set when SMP bring-up is complete
 static SMP_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -813,6 +834,7 @@ pub fn start_aps() -> usize {
         // R67-2 FIX: Reset claim flag before setting up this AP's data.
         // The AP will set this to 1 after reading all trampoline data.
         AP_DATA_CLAIMED.store(0, Ordering::Release);
+        AP_BOOT_STATE.store(AP_BOOT_STARTING, Ordering::Release);
 
         // Allocate per-AP stack
         let stack_top = alloc_ap_stack();
@@ -866,8 +888,11 @@ pub fn start_aps() -> usize {
                     "[SMP] CRITICAL: CPU {} did not claim trampoline data - halting SMP init",
                     cpu_index
                 );
+                // RF178-24: even if this AP reaches Rust later, it must lose
+                // admission and halt before any online-topology publication.
+                AP_BOOT_STATE.store(AP_BOOT_REJECTED, Ordering::Release);
                 // Return early with partial CPU count rather than risk data corruption
-                let partial_total = AP_ONLINE_COUNT.load(Ordering::Acquire) + 1;
+                let partial_total = cpu_local::num_online_cpus();
                 TOTAL_CPUS.store(partial_total, Ordering::Release);
                 SMP_INIT_DONE.store(true, Ordering::Release);
                 cpu_local::set_smp_init_done(); // R151-6 FIX
@@ -876,27 +901,93 @@ pub fn start_aps() -> usize {
             }
         }
 
-        // Wait for AP to signal ready (fully initialized)
+        // RF178-24: wait for the AP to finish all pre-publication initialization,
+        // then make an explicit BSP admission decision. A timeout rejects this AP
+        // and stops bring-up, preserving a dense online-ID prefix for legacy
+        // count-indexed consumers while bitmap consumers remain authoritative.
         let mut timeout = AP_READY_TIMEOUT;
-        while AP_ONLINE_COUNT.load(Ordering::Acquire) < cpu_index {
+        loop {
+            let state = AP_BOOT_STATE.load(Ordering::Acquire);
+            if state == AP_BOOT_READY {
+                break;
+            }
             core::hint::spin_loop();
             timeout -= 1;
             if timeout == 0 {
-                klog!(
-                    Warn,
-                    "[SMP] WARNING: CPU {} failed to complete init!",
-                    cpu_index
-                );
-                break;
+                match AP_BOOT_STATE.compare_exchange(
+                    AP_BOOT_STARTING,
+                    AP_BOOT_REJECTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        klog!(
+                            Warn,
+                            "[SMP] WARNING: CPU {} failed admission; freezing partial topology",
+                            cpu_index
+                        );
+                        let partial_total = cpu_local::num_online_cpus();
+                        TOTAL_CPUS.store(partial_total, Ordering::Release);
+                        SMP_INIT_DONE.store(true, Ordering::Release);
+                        cpu_local::set_smp_init_done();
+                        make_trampoline_nonexecutable();
+                        return partial_total;
+                    }
+                    // The AP won the STARTING->READY race at the deadline; it is
+                    // fully initialized and may be admitted normally.
+                    Err(AP_BOOT_READY) => break,
+                    Err(other) => {
+                        klog!(
+                            Error,
+                            "[SMP] CPU {} invalid admission state {}; freezing partial topology",
+                            cpu_index,
+                            other
+                        );
+                        AP_BOOT_STATE.store(AP_BOOT_REJECTED, Ordering::Release);
+                        let partial_total = cpu_local::num_online_cpus();
+                        TOTAL_CPUS.store(partial_total, Ordering::Release);
+                        SMP_INIT_DONE.store(true, Ordering::Release);
+                        cpu_local::set_smp_init_done();
+                        make_trampoline_nonexecutable();
+                        return partial_total;
+                    }
+                }
             }
         }
 
-        if timeout > 0 {
-            klog_always!("[SMP] CPU {} online", cpu_index);
+        if AP_BOOT_STATE
+            .compare_exchange(
+                AP_BOOT_READY,
+                AP_BOOT_ACCEPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            klog!(
+                Error,
+                "[SMP] CPU {} admission changed before acceptance; freezing partial topology",
+                cpu_index
+            );
+            AP_BOOT_STATE.store(AP_BOOT_REJECTED, Ordering::Release);
+            let partial_total = cpu_local::num_online_cpus();
+            TOTAL_CPUS.store(partial_total, Ordering::Release);
+            SMP_INIT_DONE.store(true, Ordering::Release);
+            cpu_local::set_smp_init_done();
+            make_trampoline_nonexecutable();
+            return partial_total;
         }
+
+        // Once accepted, topology publication is a committed transaction. Wait
+        // for its Release publication rather than timing out into a late-AP race.
+        while AP_BOOT_STATE.load(Ordering::Acquire) != AP_BOOT_ONLINE {
+            core::hint::spin_loop();
+        }
+        debug_assert!(cpu_local::is_cpu_online(cpu_index));
+        klog_always!("[SMP] CPU {} online", cpu_index);
     }
 
-    let total = AP_ONLINE_COUNT.load(Ordering::Acquire) + 1; // +1 for BSP
+    let total = cpu_local::num_online_cpus();
     TOTAL_CPUS.store(total, Ordering::Release);
     SMP_INIT_DONE.store(true, Ordering::Release);
     cpu_local::set_smp_init_done(); // R151-6 FIX
@@ -924,6 +1015,15 @@ pub fn online_cpus() -> usize {
 // ============================================================================
 // AP Entry Point
 // ============================================================================
+
+#[inline(never)]
+fn halt_rejected_ap() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
+    }
+}
 
 /// Rust entry point for Application Processors.
 ///
@@ -1042,6 +1142,53 @@ pub extern "C" fn ap_rust_entry(
         syscall::init_syscall_percpu(cpu_idx);
     }
 
+    // R178-27 FIX: Initialize Spectre mitigations for this AP
+    // (IBRS, STIBP, SSBD, IBPB predictor flush). Each AP must program its own
+    // per-CPU MSRs (IA32_SPEC_CTRL, IA32_PRED_CMD) — the BSP's init_cpu() call
+    // in main.rs only affected the BSP. Must be called after GDT/IDT/LAPIC init
+    // but before enabling interrupts.
+    let security_init = AP_SECURITY_INIT
+        .get()
+        .copied()
+        .expect("per-AP security initialization callback not registered");
+    // RF178-23 FIX: Do not advertise an AP whose local mitigation MSRs could
+    // not establish the policy's minimum Spectre-v2 path.
+    assert!(
+        security_init(),
+        "per-AP speculative-execution mitigation initialization failed"
+    );
+
+    // RF178-24 FIX: finishing initialization is not permission to publish.
+    // The BSP either accepts this exact serialized bring-up attempt or rejects
+    // it on timeout. A rejected/late AP halts before enabling interrupts,
+    // registering for shootdowns, or changing the authoritative online mask.
+    match AP_BOOT_STATE.compare_exchange(
+        AP_BOOT_STARTING,
+        AP_BOOT_READY,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(AP_BOOT_REJECTED) => halt_rejected_ap(),
+        Err(other) => {
+            klog!(
+                Error,
+                "[SMP] CPU {} observed invalid admission state {}; halting",
+                cpu_idx,
+                other
+            );
+            halt_rejected_ap();
+        }
+    }
+
+    loop {
+        match AP_BOOT_STATE.load(Ordering::Acquire) {
+            AP_BOOT_ACCEPTED => break,
+            AP_BOOT_REJECTED => halt_rejected_ap(),
+            _ => core::hint::spin_loop(),
+        }
+    }
+
     // R68-1 FIX: Enable interrupts BEFORE advertising this CPU as online.
     //
     // Critical for TLB shootdown correctness: If we mark ourselves online while
@@ -1069,6 +1216,7 @@ pub extern "C" fn ap_rust_entry(
 
     // Signal that we're online
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);
+    AP_BOOT_STATE.store(AP_BOOT_ONLINE, Ordering::Release);
 
     // R70-1: Enter scheduler-aware idle loop instead of dead HLT loop
     // This allows APs to participate in scheduling and receive work via IPIs

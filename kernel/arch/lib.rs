@@ -49,7 +49,10 @@ pub use cpu_local::{
 };
 
 // Re-export SMP bring-up functions
-pub use smp::{ap_rust_entry, online_cpus, set_rsdp_address, smp_initialized, start_aps};
+pub use smp::{
+    ap_rust_entry, online_cpus, register_ap_security_init, set_rsdp_address, smp_initialized,
+    start_aps,
+};
 
 // Re-export INVPCID instruction wrappers
 pub use invpcid::{
