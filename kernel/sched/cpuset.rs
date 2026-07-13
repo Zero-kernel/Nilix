@@ -42,9 +42,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use cpu_local::max_cpus;
 use spin::{Mutex, RwLock};
 
 /// Unique identifier for a cpuset.
@@ -70,17 +68,20 @@ pub struct CpusetNode {
     cpus_allowed: AtomicU64,
     /// Parent cpuset (None for root)
     parent: Option<Weak<CpusetNode>>,
+    /// Cached hierarchy depth. Bounds every scheduler-side ancestry fold.
+    depth: u8,
     /// Number of tasks attached to this cpuset
     task_count: AtomicU32,
 }
 
 impl CpusetNode {
     /// Create a new cpuset node.
-    fn new(id: CpusetId, cpus: u64, parent: Option<Weak<CpusetNode>>) -> Self {
+    fn new(id: CpusetId, cpus: u64, parent: Option<Weak<CpusetNode>>, depth: u8) -> Self {
         Self {
             id,
             cpus_allowed: AtomicU64::new(cpus),
             parent,
+            depth,
             task_count: AtomicU32::new(0),
         }
     }
@@ -129,10 +130,11 @@ impl CpusetNode {
     /// Returns the intersection of this cpuset's mask with all ancestors.
     pub fn effective_cpus(&self) -> u64 {
         let mut mask = self.cpus_allowed.load(Ordering::Acquire);
-        if let Some(ref parent_weak) = self.parent {
-            if let Some(parent) = parent_weak.upgrade() {
-                mask &= parent.effective_cpus();
-            }
+        let mut cursor = self.parent.as_ref().and_then(Weak::upgrade);
+        for _ in 0..self.depth {
+            let Some(parent) = cursor else { return 0 };
+            mask &= parent.cpus_allowed.load(Ordering::Acquire);
+            cursor = parent.parent.as_ref().and_then(Weak::upgrade);
         }
         mask
     }
@@ -169,7 +171,7 @@ pub fn init() {
     let online_mask = online_cpu_mask();
 
     // Create root cpuset
-    let root = Arc::new(CpusetNode::new(CpusetId::ROOT, online_mask, None));
+    let root = Arc::new(CpusetNode::new(CpusetId::ROOT, online_mask, None, 0));
 
     // Store root cpuset
     *ROOT_CPUSET.lock() = Some(Arc::clone(&root));
@@ -194,15 +196,13 @@ pub fn init() {
 
 /// Get the current online CPU mask.
 ///
-/// This returns a mask where bit N is set if CPU N is online.
+/// R178-28 FIX: Returns the authoritative online-CPU bitmap from cpu_local,
+/// not the capacity. Only bits for CPUs that have completed AP initialization
+/// and called `mark_cpu_online()` are set. This prevents affinity and cpuset
+/// masks from including registered-but-offline CPU IDs.
 #[inline]
 pub fn online_cpu_mask() -> u64 {
-    let cpu_count = max_cpus();
-    if cpu_count >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << cpu_count) - 1
-    }
+    cpu_local::online_cpu_mask()
 }
 
 /// Get the root cpuset.
@@ -233,6 +233,11 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
         .sets
         .get(&parent_id)
         .ok_or(CpusetError::InvalidParent)?;
+    const MAX_CPUSET_DEPTH: u8 = 16;
+    let depth = parent.depth.checked_add(1).ok_or(CpusetError::TooDeep)?;
+    if depth > MAX_CPUSET_DEPTH {
+        return Err(CpusetError::TooDeep);
+    }
 
     // Validate mask is subset of parent
     let parent_mask = parent.cpus();
@@ -253,7 +258,12 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
         .ok_or(CpusetError::TooManySets)?;
 
     // Create cpuset node
-    let node = Arc::new(CpusetNode::new(id, cpus, Some(Arc::downgrade(parent))));
+    let node = Arc::new(CpusetNode::new(
+        id,
+        cpus,
+        Some(Arc::downgrade(parent)),
+        depth,
+    ));
     registry.sets.insert(id, node);
 
     Ok(id)
@@ -370,6 +380,30 @@ pub fn effective_cpus(cpuset_id: CpusetId, task_affinity: u64) -> u64 {
     online & cpuset_mask & affinity
 }
 
+/// RF178-33: nonblocking twin for the timer IRQ-return scheduler path.
+///
+/// Registry contention is distinct from a missing cpuset: callers must skip
+/// the candidate and retry on a later bounded scan rather than escaping the
+/// cpuset constraint or blocking with IF=0.
+#[inline]
+pub fn try_effective_cpus(cpuset_id: CpusetId, task_affinity: u64) -> Option<u64> {
+    let online = online_cpu_mask();
+    let registry = CPUSET_REGISTRY.try_read()?;
+    let cpuset_mask = registry
+        .as_ref()
+        .and_then(|registry| registry.sets.get(&cpuset_id).cloned())
+        .map(|cpuset| cpuset.effective_cpus())
+        .unwrap_or(online);
+    drop(registry);
+
+    let affinity = if task_affinity == 0 {
+        online
+    } else {
+        task_affinity
+    };
+    Some(online & cpuset_mask & affinity)
+}
+
 /// Check if a CPU is allowed for a task given its cpuset and affinity.
 ///
 /// # Arguments
@@ -434,6 +468,8 @@ pub enum CpusetError {
     NotEmpty,
     /// Too many cpusets created
     TooManySets,
+    /// Cpuset hierarchy exceeds the scheduler's bounded ancestry walk.
+    TooDeep,
     /// Permission denied
     PermissionDenied,
 }
@@ -450,6 +486,7 @@ impl CpusetError {
             CpusetError::CannotDestroyRoot => -1, // EPERM
             CpusetError::NotEmpty => -16,         // EBUSY
             CpusetError::TooManySets => -12,      // ENOMEM
+            CpusetError::TooDeep => -22,          // EINVAL
             CpusetError::PermissionDenied => -1,  // EPERM
         }
     }

@@ -31,7 +31,7 @@ impl PriorityScheduler {
         if let Some(process) = get_process(pid) {
             let mut proc = process.lock();
             let priority = proc.dynamic_priority;
-            proc.state = ProcessState::Ready;
+            proc.enter_ready_at(kernel_core::get_ticks());
             drop(proc);
 
             self.ready_queues
@@ -69,7 +69,7 @@ impl PriorityScheduler {
                         if proc.stopped {
                             // Put the task back into the ready queues as Ready-but-stopped
                             proc.reset_time_slice();
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(kernel_core::get_ticks());
                             let priority = proc.dynamic_priority;
                             drop(proc);
 
@@ -84,7 +84,7 @@ impl PriorityScheduler {
                             // 时间片用完，重新加入就绪队列
                             proc.reset_time_slice();
                             proc.decrease_dynamic_priority(); // 惩罚CPU密集型进程
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(kernel_core::get_ticks());
                             let priority = proc.dynamic_priority;
                             drop(proc);
 
@@ -127,7 +127,7 @@ impl PriorityScheduler {
                 // 确保进程仍然是就绪状态
                 // R98-1 FIX: Also check orthogonal stopped flag
                 if proc.state == ProcessState::Ready && !proc.stopped {
-                    proc.state = ProcessState::Running;
+                    proc.enter_running_at(kernel_core::get_ticks());
                     proc.reset_time_slice();
                     drop(proc);
 
@@ -176,7 +176,7 @@ impl PriorityScheduler {
         if let Some(current_pid) = self.current_process {
             if let Some(process) = get_process(current_pid) {
                 let mut proc = process.lock();
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(kernel_core::get_ticks());
                 drop(proc);
             }
             self.current_process = None;
@@ -188,7 +188,7 @@ impl PriorityScheduler {
         if let Some(process) = get_process(pid) {
             let mut proc = process.lock();
             if proc.state == ProcessState::Blocked || proc.state == ProcessState::Sleeping {
-                proc.state = ProcessState::Ready;
+                proc.enter_ready_at(kernel_core::get_ticks());
                 let priority = proc.dynamic_priority;
                 drop(proc);
 

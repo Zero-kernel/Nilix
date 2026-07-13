@@ -104,6 +104,15 @@
 //! is a non-reentrant `spin::RwLock`, so a charge primitive must never be invoked
 //! while the registry read lock is already held on the same CPU (migration helpers
 //! keep the target `Arc`s alive instead of holding the registry across calls).
+//!
+//! RF178-12 exception-path rule: synchronous user-stack #PF growth holds
+//! `Process -> MmState` while probing cgroup, PT, and buddy state, but every
+//! lower-level acquisition is try-only. The fixed cgroup ancestry and limit
+//! snapshots are captured and all Level-5 guards are dropped before PT_LOCK;
+//! PT-frame extensions then use atomics only. PT_LOCK and BUDDY_ALLOCATOR are
+//! also acquired with `try_lock`, so this out-of-order exception path can fail
+//! closed but can never wait and complete a lock cycle. USER_MODE proves it did
+//! not interrupt a kernel thread already holding one of these locks.
 //! | ENDPOINT_REGISTRY | ipc/ipc.rs | 7 | Mutex<HashMap> | Global |
 //! | VGA_BUFFER | drivers/vga_buffer.rs | 8 | Mutex | Global |
 //! | SERIAL_PORT | drivers/serial.rs | 8 | Mutex | Global |
