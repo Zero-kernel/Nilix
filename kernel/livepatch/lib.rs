@@ -164,11 +164,15 @@ pub trait KernelOps: Sync {
 
     /// Allocate an executable region and return its kernel VA.
     ///
+    /// # Safety
+    ///
     /// SECURITY: The returned mapping must be kernel-only (not user-accessible).
     /// Prefer W^X: allocate RW, copy bytes, then transition to RX via `seal_exec`.
     unsafe fn alloc_exec(&self, len: usize) -> Result<usize, Errno>;
 
     /// Tighten permissions on an exec region after initialization (e.g., RW->RX).
+    ///
+    /// # Safety
     ///
     /// R93-11 FIX: This method is now REQUIRED. A no-op implementation would silently
     /// violate W^X, leaving handler memory both writable and executable.
@@ -176,12 +180,26 @@ pub trait KernelOps: Sync {
     unsafe fn seal_exec(&self, addr: usize, len: usize) -> Result<(), Errno>;
 
     /// Free an executable region previously allocated with `alloc_exec`.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the region is no longer in use and addr/len match a prior alloc_exec.
     unsafe fn free_exec(&self, addr: usize, len: usize);
 
     /// Temporarily make kernel text writable for patching.
     ///
+    /// # Safety
+    ///
     /// SECURITY: Must only permit kernel text pages, and must be safe against
     /// concurrent calls (or callers must serialize externally).
+    unsafe fn make_text_writable(&self, addr: usize, len: usize) -> Result<(), Errno>;
+
+    /// Restore .text to read-only+executable after patching.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the range matches a prior make_text_writable call.
+    unsafe fn make_text_readonly(&self, addr: usize, len: usize);
     unsafe fn make_text_writable(&self, addr: usize, len: usize) -> Result<(), Errno>;
 
     /// Restore kernel text protections after patching.
@@ -283,6 +301,7 @@ const MAX_PATCH_DEPS: usize = 4;
 pub const MAX_PATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct PatchHeader {
     #[allow(dead_code)]
     flags: u32,
@@ -2049,8 +2068,8 @@ extern "C" {
 
 #[inline]
 fn kernel_text_bounds() -> (usize, usize) {
-    let start = unsafe { core::ptr::addr_of!(text_start) as usize };
-    let end = unsafe { core::ptr::addr_of!(text_end) as usize };
+    let start = core::ptr::addr_of!(text_start) as usize;
+    let end = core::ptr::addr_of!(text_end) as usize;
     (start, end)
 }
 
