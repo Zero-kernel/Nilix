@@ -3587,8 +3587,7 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
         // new thread that escapes the exit_group scan. The old snapshot-then-mark
         // pattern had a TOCTOU window where new threads could be created between
         // the snapshot and the marking loop.
-        let marked =
-            crate::process::request_exit_group_atomic(pid, &group_exit_token, exit_code);
+        let marked = crate::process::request_exit_group_atomic(pid, &group_exit_token, exit_code);
 
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook.
@@ -7349,10 +7348,7 @@ pub fn run_sigframe_stack_locator_self_test() {
     let overflow_base = usize::MAX & !(PAGE_SIZE - 1);
     let mut overflow = FallibleOrderedMap::new();
     overflow
-        .try_insert(
-            overflow_base,
-            MmapEntry::from_len_flags(PAGE_SIZE, write),
-        )
+        .try_insert(overflow_base, MmapEntry::from_len_flags(PAGE_SIZE, write))
         .expect("insert overflowing locator fixture");
     assert_eq!(
         locate_sigframe_vma(overflow_base as u64, &overflow),
@@ -7508,14 +7504,12 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             locate_sigframe_vma(ctx.rsp, &mm.mmap_regions)
         }
     };
-    let layout = match crate::signal_frame::compute_sigframe_layout(
-        ctx.rsp,
-        stack.layout_floor(ctx.rsp),
-    ) {
-        Ok(l) => l,
-        // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
-        Err(_) => terminate_self_and_halt(pid, 139),
-    };
+    let layout =
+        match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack.layout_floor(ctx.rsp)) {
+            Ok(l) => l,
+            // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
+            Err(_) => terminate_self_and_halt(pid, 139),
+        };
     let buf = match crate::signal_frame::assemble_sigframe(
         &layout,
         &ctx,
@@ -7698,7 +7692,10 @@ pub fn try_deliver_signal_on_irq_return(
     // Check delivery preconditions under the lock.
     // RF178-35 FIX: fatal exit dominates handler delivery. This closes the
     // race after the timer's initial pending-exit transaction.
-    if proc_guard.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+    if proc_guard
+        .pending_kill
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
         return None;
     }
     if proc_guard.in_signal_handler {
@@ -7778,10 +7775,7 @@ pub fn try_deliver_signal_on_irq_return(
     // M0-7 SLICE 5: PRE-GROW the user stack to back the IRQ sigframe write
     // (Ring-0 writer #3 of 3). If frame_base is in the lazy region, grow it first.
     // Use try_lock variant since we're in IRQ context.
-    if stack.needs_main_stack_backing(
-        frame_base,
-        crate::elf_loader::user_stack_mapped_floor(),
-    ) {
+    if stack.needs_main_stack_backing(frame_base, crate::elf_loader::user_stack_mapped_floor()) {
         // Try to grow the stack to cover the frame
         let target_floor = (frame_base as usize) & !(PAGE_SIZE - 1);
 
@@ -7827,7 +7821,10 @@ pub fn try_deliver_signal_on_irq_return(
             return None;
         }
     };
-    if proc.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+    if proc
+        .pending_kill
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
         return None;
     }
     proc.pending_signals.clear(sig);
@@ -10904,11 +10901,8 @@ pub fn try_demand_grow_user_stack(
     let mapped = unsafe {
         try_with_current_manager(VirtAddr::new(0), |manager| {
             mm::buddy_allocator::try_with_allocator(|buddy| {
-                let mut frame_alloc = FaultStackFrameAllocator::new(
-                    buddy,
-                    &mut charge,
-                    MAX_GROW_PT_PAGES,
-                );
+                let mut frame_alloc =
+                    FaultStackFrameAllocator::new(buddy, &mut charge, MAX_GROW_PT_PAGES);
                 let mut outcome = FaultStackMapOutcome::new();
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
@@ -10919,9 +10913,7 @@ pub fn try_demand_grow_user_stack(
                 // therefore lower the committed floor by exactly k pages; it
                 // never leaves a mapped island below an unmapped hole.
                 for page_index in 0..pages_to_map {
-                    let vaddr = VirtAddr::new(
-                        (old_floor - (page_index + 1) * PAGE_SIZE) as u64,
-                    );
+                    let vaddr = VirtAddr::new((old_floor - (page_index + 1) * PAGE_SIZE) as u64);
                     let page = Page::containing_address(vaddr);
                     if manager.translate_addr(vaddr).is_some() {
                         outcome.error = Some(SyscallError::EINVAL);
@@ -10943,9 +10935,7 @@ pub fn try_demand_grow_user_stack(
                         .is_err()
                     {
                         frame_alloc.deallocate_frame(frame);
-                        outcome.error = frame_alloc
-                            .take_error()
-                            .or(Some(SyscallError::ENOMEM));
+                        outcome.error = frame_alloc.take_error().or(Some(SyscallError::ENOMEM));
                         break;
                     }
                     outcome.mapped_data_pages += 1;
@@ -12542,9 +12532,8 @@ fn reconcile_cow_mprotect_flags(
 /// Focused permission-state checks for forked read-only and write-entitled COW
 /// mappings. Arithmetic/table rollback is covered by fork's companion test.
 pub fn run_cow_mprotect_self_test() {
-    let read = PageTableFlags::PRESENT
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
+    let read =
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
     let write = read | PageTableFlags::WRITABLE;
 
     let promoted = reconcile_cow_mprotect_flags(read | cow_readonly_flag(), write);

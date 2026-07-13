@@ -76,8 +76,7 @@ where
         return Ok(end_offset);
     }
 
-    let last_block = u32::try_from((end_offset - 1) / block_size)
-        .map_err(|_| FsError::Invalid)?;
+    let last_block = u32::try_from((end_offset - 1) / block_size).map_err(|_| FsError::Invalid)?;
     let first_indirect = u32::try_from((offset / block_size).max(EXT2_NDIR_BLOCKS as u64))
         .map_err(|_| FsError::Invalid)?;
     for file_block in first_indirect..=last_block {
@@ -97,9 +96,7 @@ struct Ext2MutationScratch {
 
 impl Ext2MutationScratch {
     fn try_new(block_size: u32) -> Result<Self, FsError> {
-        if !(1024..=65536).contains(&block_size)
-            || size_of::<Ext2Superblock>() > 1024
-        {
+        if !(1024..=65536).contains(&block_size) || size_of::<Ext2Superblock>() > 1024 {
             return Err(FsError::Invalid);
         }
         let block_size = block_size as usize;
@@ -214,8 +211,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
     ));
 
     for block_size in [1024u32, 4096, 65536] {
-        let mut scratch =
-            Ext2MutationScratch::try_new(block_size).expect("ext2 mutation scratch");
+        let mut scratch = Ext2MutationScratch::try_new(block_size).expect("ext2 mutation scratch");
         let ptr = scratch.block.as_ptr();
         let capacity = scratch.block.capacity();
         scratch.block_mut().fill(0xA5);
@@ -236,8 +232,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
         "零-OS"
     );
     assert_eq!(
-        fallible_lossy_name(&[b'a', 0xF0, b'(', 0x8C, b'(', b'z'])
-            .expect("invalid UTF-8 name"),
+        fallible_lossy_name(&[b'a', 0xF0, b'(', 0x8C, b'(', b'z']).expect("invalid UTF-8 name"),
         "a\u{FFFD}(\u{FFFD}(z"
     );
     assert_eq!(
@@ -271,11 +266,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             Err(block::BlockError::NotSupported)
         }
 
-        fn read_sync(
-            &self,
-            sector: u64,
-            buf: &mut [u8],
-        ) -> Result<usize, block::BlockError> {
+        fn read_sync(&self, sector: u64, buf: &mut [u8]) -> Result<usize, block::BlockError> {
             let start = usize::try_from(sector)
                 .ok()
                 .and_then(|sector| sector.checked_mul(512))
@@ -284,9 +275,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
                 .checked_add(buf.len())
                 .ok_or(block::BlockError::Invalid)?;
             let bytes = self.bytes.lock();
-            let source = bytes
-                .get(start..end)
-                .ok_or(block::BlockError::Invalid)?;
+            let source = bytes.get(start..end).ok_or(block::BlockError::Invalid)?;
             buf.copy_from_slice(source);
             Ok(buf.len())
         }
@@ -660,9 +649,7 @@ impl<T> WeakArcCache<T> {
             return Ok(existing);
         }
         entries.retain(|_, weak| weak.strong_count() != 0);
-        entries
-            .try_reserve_exact(1)
-            .map_err(|_| FsError::NoMem)?;
+        entries.try_reserve_exact(1).map_err(|_| FsError::NoMem)?;
         entries
             .try_insert(key, Arc::downgrade(&candidate))
             .map_err(|_| FsError::NoMem)?;
@@ -702,7 +689,10 @@ pub fn run_ext2_inode_cache_self_test() {
         .get_or_try_insert_with(7, || panic!("cache hit must not invoke loader"))
         .expect("second canonical cache lookup");
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(loads, 1, "canonical inode loader must run once per live key");
+    assert_eq!(
+        loads, 1,
+        "canonical inode loader must run once per live key"
+    );
     first.value.store(29, Ordering::Release);
     assert_eq!(second.value.load(Ordering::Acquire), 29);
 
@@ -734,7 +724,10 @@ pub fn run_ext2_inode_cache_self_test() {
         retry_cache.get_or_try_insert_with(9, || Err(FsError::Io)),
         Err(FsError::Io)
     ));
-    assert!(retry_cache.get(9).is_none(), "loader error must publish nothing");
+    assert!(
+        retry_cache.get(9).is_none(),
+        "loader error must publish nothing"
+    );
     assert!(retry_cache
         .get_or_try_insert_with(9, || {
             Arc::try_new(CacheNode {
@@ -1385,8 +1378,7 @@ impl Ext2Fs {
         let desc_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(desc as *const _ as *const u8, size_of::<Ext2GroupDesc>())
         };
-        buf[target.offset..target.offset + size_of::<Ext2GroupDesc>()]
-            .copy_from_slice(desc_bytes);
+        buf[target.offset..target.offset + size_of::<Ext2GroupDesc>()].copy_from_slice(desc_bytes);
         self.write_block(target.block, buf)
     }
 
@@ -1963,11 +1955,7 @@ impl Ext2Inode {
     /// The sole ext2-owned heap allocation is the block-sized scratch, completed
     /// before inode locks and preflight. Inode state is staged locally and is
     /// published only after the final inode-table write succeeds.
-    fn write_mutation(
-        &self,
-        mode: Ext2WriteMode,
-        data: &[u8],
-    ) -> Result<(usize, u64), FsError> {
+    fn write_mutation(&self, mode: Ext2WriteMode, data: &[u8]) -> Result<(usize, u64), FsError> {
         if !self.is_file_inner() {
             return Err(FsError::IsDir);
         }
@@ -2031,8 +2019,7 @@ impl Ext2Inode {
             let space = block_size - offset_in_block;
             let to_copy = cmp::min(space, data.len() - written);
 
-            let existing =
-                fs.map_file_block_with_scratch(&staged, file_block, &mut scratch)?;
+            let existing = fs.map_file_block_with_scratch(&staged, file_block, &mut scratch)?;
             let (phys_block, is_new) = match existing {
                 Some(block) => (block, false),
                 None => (

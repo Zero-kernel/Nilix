@@ -166,10 +166,7 @@ impl FaultMemoryCharge {
                 if chain_len == FAULT_CHARGE_CHAIN_CAPACITY {
                     return Err(FaultChargeError::Invalid);
                 }
-                let snapshot = node
-                    .limits
-                    .try_lock()
-                    .ok_or(FaultChargeError::Contended)?;
+                let snapshot = node.limits.try_lock().ok_or(FaultChargeError::Contended)?;
                 limits[chain_len] = (snapshot.memory_max, snapshot.memory_high);
                 drop(snapshot);
                 chain[chain_len] = Some(node.clone());
@@ -4394,8 +4391,7 @@ fn run_fault_memory_charge_self_test() {
 
     // An armed receipt owns the complete charge and Drop rolls it back exactly.
     {
-        let receipt = FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE)
-            .expect("initial DATA charge");
+        let receipt = FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE).expect("initial DATA charge");
         assert_eq!(receipt.charged_bytes(), 4 * PAGE);
         assert_eq!(mem(&leaf), 4 * PAGE);
         assert_eq!(mem(&parent), 4 * PAGE);
@@ -4424,8 +4420,8 @@ fn run_fault_memory_charge_self_test() {
     })
     .expect("tight fault charge limit");
     {
-        let mut receipt = FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE)
-            .expect("DATA below tight limit");
+        let mut receipt =
+            FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE).expect("DATA below tight limit");
         assert_eq!(
             receipt.try_add(3 * PAGE),
             Err(FaultChargeError::LimitExceeded)
@@ -4446,8 +4442,7 @@ fn run_fault_memory_charge_self_test() {
         ..Default::default()
     })
     .expect("raise fault charge limit");
-    let mut receipt =
-        FaultMemoryCharge::try_new(leaf.id(), 8 * PAGE).expect("eight DATA pages");
+    let mut receipt = FaultMemoryCharge::try_new(leaf.id(), 8 * PAGE).expect("eight DATA pages");
     receipt.try_add(2 * PAGE).expect("two PT pages");
     receipt.refund(5 * PAGE).expect("unused DATA suffix");
     assert_eq!(receipt.charged_bytes(), 5 * PAGE);

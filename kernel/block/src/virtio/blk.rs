@@ -913,8 +913,7 @@ impl VirtioBlkDevice {
                 }
 
                 match kind {
-                    RequestKind::Read { data_dma, .. }
-                    | RequestKind::Write { data_dma, .. } => unsafe {
+                    RequestKind::Read { data_dma, .. } | RequestKind::Write { data_dma, .. } => unsafe {
                         core::ptr::write_bytes(data_dma.virt_ptr(), 0, data_dma.size());
                         // data_dma dropped here → IOMMU unmap
                     },
@@ -1026,11 +1025,7 @@ impl VirtioBlkDevice {
     }
 
     /// Process a single synchronous request.
-    fn do_request(
-        &self,
-        sector: u64,
-        mut data: SyncRequestData<'_>,
-    ) -> Result<usize, BlockError> {
+    fn do_request(&self, sector: u64, mut data: SyncRequestData<'_>) -> Result<usize, BlockError> {
         // R106-3: Reject I/O immediately if device is failed/resetting.
         if self.device_failed.load(Ordering::Acquire) {
             return Err(BlockError::Offline);

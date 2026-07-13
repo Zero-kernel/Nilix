@@ -35,8 +35,8 @@ use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cpu_local::{
-    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox,
-    PER_CPU_DATA, TLB_SHOOTDOWN_QUEUE_LEN,
+    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox, PER_CPU_DATA,
+    TLB_SHOOTDOWN_QUEUE_LEN,
 };
 use x86_64::instructions::tlb;
 use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};

@@ -213,7 +213,9 @@ fn wake_reaper_after_switch(
         }
     };
     let Some(parent) = parent else {
-        let Some(child) = child.try_lock() else { return false };
+        let Some(child) = child.try_lock() else {
+            return false;
+        };
         if child.generation == generation {
             child.switch_reap_pending.store(false, Ordering::Release);
         }
@@ -221,8 +223,12 @@ fn wake_reaper_after_switch(
     };
     // Use try locks for both origins: this is a cross-PCB handoff and must not
     // introduce a parent<->child lock-order cycle. The pending-prev slot retries.
-    let Some(mut parent) = parent.try_lock() else { return false };
-    let Some(child) = child.try_lock() else { return false };
+    let Some(mut parent) = parent.try_lock() else {
+        return false;
+    };
+    let Some(child) = child.try_lock() else {
+        return false;
+    };
     if child.generation != generation {
         return true;
     }
@@ -231,8 +237,8 @@ fn wake_reaper_after_switch(
     // on_cpu/reap-pending state and re-block without a matching wake.
     child.switch_reap_pending.store(false, Ordering::Release);
     let waiting = parent.waiting_child;
-    let woke = parent.state == ProcessState::Blocked
-        && (waiting == Some(0) || waiting == Some(child_pid));
+    let woke =
+        parent.state == ProcessState::Blocked && (waiting == Some(0) || waiting == Some(child_pid));
     if woke {
         parent.enter_ready_at(kernel_core::get_ticks());
         parent.waiting_child = None;
@@ -296,9 +302,7 @@ fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
         // on_cpu while it runs would re-open the double-run hole. Only clear if it is still
         // the same task instance whose save we just completed.
         if proc.generation == generation {
-            if proc.state == ProcessState::Zombie
-                && proc.teardown_done.load(Ordering::Acquire)
-            {
+            if proc.state == ProcessState::Zombie && proc.teardown_done.load(Ordering::Acquire) {
                 proc.switch_reap_pending.store(true, Ordering::Release);
                 reaper = Some(proc.ppid);
                 reap_pcb = Some(pcb.clone());
@@ -307,7 +311,9 @@ fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
         }
     }
     if let Some(parent_pid) = reaper {
-        let Some(pcb) = reap_pcb.as_ref() else { return false };
+        let Some(pcb) = reap_pcb.as_ref() else {
+            return false;
+        };
         if !wake_reaper_after_switch(parent_pid, pid as Pid, generation, pcb, origin) {
             return false;
         }
@@ -767,57 +773,52 @@ impl Scheduler {
         let now_tick = kernel_core::get_ticks();
         let now_ns = now_tick.saturating_mul(TICK_NS);
         let mut best: Option<(Priority, u64, Pid, ProcessControlBlock)> = None;
-        let (visited, complete_cycle) = Self::scan_queue_window(
-            queue,
-            cursor,
-            queue_epoch,
-            visit_budget,
-            |key, pcb| {
-            let pid = key.1;
-            if Some(pid) == skip_pid || process::is_pending_irq_kill(pid) {
-                return;
-            }
-
-            // Timer-return scheduling has IF=0. Contention consumes one bounded
-            // visit and advances the cursor; it can never spin on a PCB lock.
-            let Some(mut proc) = pcb.try_lock() else {
-                return;
-            };
-            if proc.state != ProcessState::Ready
-                || proc.stopped
-                || proc.on_cpu.load(Ordering::Acquire)
-            {
-                return;
-            }
-
-            proc.age_wait_ticks_to(now_tick);
-            proc.check_and_boost_starved();
-            let Some(effective_mask) = Self::try_effective_allowed_cpus(&proc) else {
-                return;
-            };
-            if !Self::cpu_allowed(target_cpu, effective_mask)
-                || cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some()
-            {
-                return;
-            }
-
-            let candidate = (proc.dynamic_priority, proc.wait_ticks, pid);
-            let better = match best.as_ref() {
-                None => true,
-                Some((priority, waited, best_pid, _)) => {
-                    candidate.0 < *priority
-                        || (candidate.0 == *priority && candidate.1 > *waited)
-                        || (candidate.0 == *priority
-                            && candidate.1 == *waited
-                            && candidate.2 < *best_pid)
+        let (visited, complete_cycle) =
+            Self::scan_queue_window(queue, cursor, queue_epoch, visit_budget, |key, pcb| {
+                let pid = key.1;
+                if Some(pid) == skip_pid || process::is_pending_irq_kill(pid) {
+                    return;
                 }
-            };
-            drop(proc);
-            if better {
-                best = Some((candidate.0, candidate.1, candidate.2, Arc::clone(pcb)));
-            }
-            },
-        );
+
+                // Timer-return scheduling has IF=0. Contention consumes one bounded
+                // visit and advances the cursor; it can never spin on a PCB lock.
+                let Some(mut proc) = pcb.try_lock() else {
+                    return;
+                };
+                if proc.state != ProcessState::Ready
+                    || proc.stopped
+                    || proc.on_cpu.load(Ordering::Acquire)
+                {
+                    return;
+                }
+
+                proc.age_wait_ticks_to(now_tick);
+                proc.check_and_boost_starved();
+                let Some(effective_mask) = Self::try_effective_allowed_cpus(&proc) else {
+                    return;
+                };
+                if !Self::cpu_allowed(target_cpu, effective_mask)
+                    || cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some()
+                {
+                    return;
+                }
+
+                let candidate = (proc.dynamic_priority, proc.wait_ticks, pid);
+                let better = match best.as_ref() {
+                    None => true,
+                    Some((priority, waited, best_pid, _)) => {
+                        candidate.0 < *priority
+                            || (candidate.0 == *priority && candidate.1 > *waited)
+                            || (candidate.0 == *priority
+                                && candidate.1 == *waited
+                                && candidate.2 < *best_pid)
+                    }
+                };
+                drop(proc);
+                if better {
+                    best = Some((candidate.0, candidate.1, candidate.2, Arc::clone(pcb)));
+                }
+            });
 
         let candidate = best.map(|(priority, _, pid, pcb)| (pid, pcb, priority));
         if candidate.is_some() {
@@ -854,9 +855,16 @@ impl Scheduler {
             SELECT_VISIT_BUDGET,
         );
         if let Some((_pid, _, _)) = result.candidate.as_ref() {
-            sched_debug!("[SCHED] selected pid={} after {} visits", _pid, result.visited);
+            sched_debug!(
+                "[SCHED] selected pid={} after {} visits",
+                _pid,
+                result.visited
+            );
         } else {
-            sched_debug!("[SCHED] no ready process in {} bounded visits", result.visited);
+            sched_debug!(
+                "[SCHED] no ready process in {} bounded visits",
+                result.visited
+            );
         }
         result
     }
@@ -1257,12 +1265,8 @@ impl Scheduler {
         let queue = Self::ready_queue_for_cpu(source_cpu)?;
         let mut guard = queue.lock();
         let mut retries = 0usize;
-        let mut candidate = Self::select_next_for_migration_locked(
-            &guard,
-            source_cpu,
-            local_cpu,
-            current_pid,
-        );
+        let mut candidate =
+            Self::select_next_for_migration_locked(&guard, source_cpu, local_cpu, current_pid);
         while let Some((pid, proc_arc, _selected_priority)) = candidate {
             if retries == 2 {
                 return None;
@@ -1309,8 +1313,7 @@ impl Scheduler {
                 // `pcb.dynamic_priority` could miss the real bucket and leave the PCB in the
                 // source queue while the caller (`select_next_process`) inserts it locally —
                 // double-queuing one PCB across two CPUs. Only steal if the remove succeeded.
-                if let Some(stolen) =
-                    Self::remove_pid_from_queue(&mut guard, Some(source_cpu), pid)
+                if let Some(stolen) = Self::remove_pid_from_queue(&mut guard, Some(source_cpu), pid)
                 {
                     drop(guard);
                     // The stolen task lands on the destination at its CURRENT effective
@@ -1444,8 +1447,7 @@ impl Scheduler {
         let local_cpu = current_cpu_id();
         let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
 
-        let selection =
-            Self::select_next_result_locked(&queue, local_cpu, local_cpu, current_pid);
+        let selection = Self::select_next_result_locked(&queue, local_cpu, local_cpu, current_pid);
         let complete_cycle = selection.complete_cycle;
         let selected_was_present = selection.candidate.is_some();
         let selected = selection.candidate;
@@ -2598,12 +2600,8 @@ pub fn run_bounded_selector_self_test() {
         budget: usize,
     ) -> (Option<Pid>, usize, bool) {
         let mut best: Option<(Priority, Pid)> = None;
-        let (visited, complete) = Scheduler::scan_queue_window(
-            queue,
-            cursor,
-            epoch,
-            budget,
-            |key, entry| {
+        let (visited, complete) =
+            Scheduler::scan_queue_window(queue, cursor, epoch, budget, |key, entry| {
                 if Some(key.1) == skip_pid
                     || entry.contended
                     || !entry.runnable
@@ -2614,8 +2612,7 @@ pub fn run_bounded_selector_self_test() {
                 if best.map(|current| key < current).unwrap_or(true) {
                     best = Some(key);
                 }
-            },
-        );
+            });
         if best.is_some() {
             cursor.cycle_start = None;
         }
@@ -2710,27 +2707,14 @@ pub fn run_bounded_selector_self_test() {
             insert(&mut queue, owner_pid + offset, BLOCKED);
         }
         let mut thief_cursor = SelectionCursorState::new();
-        assert!(scan(
-            &queue,
-            1,
-            None,
-            &mut thief_cursor,
-            0,
-            SELECT_VISIT_BUDGET,
-        )
-        .0
-        .is_none());
+        assert!(
+            scan(&queue, 1, None, &mut thief_cursor, 0, SELECT_VISIT_BUDGET,)
+                .0
+                .is_none()
+        );
         let mut owner_cursor = SelectionCursorState::new();
         assert_eq!(
-            scan(
-                &queue,
-                0,
-                None,
-                &mut owner_cursor,
-                0,
-                SELECT_VISIT_BUDGET,
-            )
-            .0,
+            scan(&queue, 0, None, &mut owner_cursor, 0, SELECT_VISIT_BUDGET,).0,
             Some(owner_pid)
         );
     }
@@ -2824,7 +2808,9 @@ pub fn run_identity_resume_self_test() {
     // Plain SIGCONT releases job control but preserves an unrelated block.
     proc.enter_blocked_at(20);
     proc.stopped = true;
-    assert!(!Scheduler::resume_stopped_locked(&mut proc, pid, generation));
+    assert!(!Scheduler::resume_stopped_locked(
+        &mut proc, pid, generation
+    ));
     assert_eq!(proc.state, ProcessState::Blocked);
     assert!(!proc.stopped);
 
@@ -2832,20 +2818,26 @@ pub fn run_identity_resume_self_test() {
     // SIGCONT callback observed before that publication is now a no-op.
     proc.enter_ready_at(30);
     proc.pending_kill.store(true, Ordering::Release);
-    assert!(!Scheduler::resume_stopped_locked(&mut proc, pid, generation));
+    assert!(!Scheduler::resume_stopped_locked(
+        &mut proc, pid, generation
+    ));
     assert_eq!(proc.state, ProcessState::Ready);
     proc.pending_kill.store(false, Ordering::Release);
 
     proc.enter_running_at(40);
     proc.stopped = true;
-    assert!(!Scheduler::resume_stopped_locked(&mut proc, pid, generation));
+    assert!(!Scheduler::resume_stopped_locked(
+        &mut proc, pid, generation
+    ));
     assert_eq!(proc.state, ProcessState::Running);
     assert!(!proc.stopped);
 
     for terminal in [ProcessState::Zombie, ProcessState::Terminated] {
         proc.state = terminal;
         proc.stopped = true;
-        assert!(!Scheduler::resume_stopped_locked(&mut proc, pid, generation));
+        assert!(!Scheduler::resume_stopped_locked(
+            &mut proc, pid, generation
+        ));
         assert_eq!(proc.state, terminal);
     }
 }

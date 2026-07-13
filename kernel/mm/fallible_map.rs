@@ -431,7 +431,11 @@ pub fn run_fallible_ordered_map_self_test() {
         retained_capacity,
         "retain must compact without reallocating"
     );
-    assert_eq!(map.get(&20), Some(&122), "retain fixture must not alias source");
+    assert_eq!(
+        map.get(&20),
+        Some(&122),
+        "retain fixture must not alias source"
+    );
 
     // remove returns the value and shifts the rest.
     assert_eq!(map.remove(&20), Some(122));

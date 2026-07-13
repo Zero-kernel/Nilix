@@ -23,7 +23,9 @@ pub fn test_scheduler() {
     kernel_core::process::run_fatal_exit_publication_self_test();
     sched::enhanced_scheduler::run_bounded_selector_self_test();
     sched::enhanced_scheduler::run_identity_resume_self_test();
-    klog_always!("    [PASS] RF178-33 selector/aging + RF178-35 fatal wake + RF178-36 identity resume");
+    klog_always!(
+        "    [PASS] RF178-33 selector/aging + RF178-35 fatal wake + RF178-36 identity resume"
+    );
     klog_always!("  [TEST] Enhanced Scheduler...");
     klog_always!("    ✓ Scheduler module compiled");
     klog_always!("    ✓ Multi-level feedback queue ready");
@@ -323,9 +325,7 @@ pub fn test_ext2_write() {
     // open/cache test above is the RF178-37 acceptance criterion.
     match vfs::stat("/mnt") {
         Ok(stat) => {
-            let flags = vfs::OpenFlags::new(
-                vfs::OpenFlags::O_RDONLY | vfs::OpenFlags::O_DIRECTORY,
-            );
+            let flags = vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY | vfs::OpenFlags::O_DIRECTORY);
             let first = vfs::open("/mnt", flags, 0);
             let second = vfs::open("/mnt", flags, 0);
             if let (Ok(first), Ok(second)) = (first, second) {

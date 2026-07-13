@@ -6,9 +6,9 @@
 //! - Default signal actions
 //! - Signal delivery mechanism
 
-use alloc::sync::Arc;
 use crate::process::{self, Process, ProcessId, ProcessState};
 use crate::syscall::SyscallError;
+use alloc::sync::Arc;
 use spin::{Mutex, Once};
 
 /// Maximum signal number supported (1-64)
@@ -781,11 +781,8 @@ fn send_signal_inner(
                     // RF178-35 FIX: publication, runnable normalization, and
                     // unstop are one PCB-locked transaction. The IPI is emitted
                     // only after this guard is released.
-                    fatal_post = process::request_process_exit_locked(
-                        &mut proc,
-                        code,
-                        crate::get_ticks(),
-                    );
+                    fatal_post =
+                        process::request_process_exit_locked(&mut proc, code, crate::get_ticks());
                 }
                 SignalAction::Stop => {
                     // R98-1 FIX: Job-control stop is orthogonal to scheduler state.

@@ -2063,9 +2063,7 @@ impl Process {
         // RF178-33 FIX: Only genuine off-CPU Ready residence earns aging
         // credit. Lifecycle edges re-anchor wait_age_tick, so returning here
         // cannot cause Running, Blocked, or Stopped time to be folded later.
-        if self.state != ProcessState::Ready
-            || self.stopped
-            || self.on_cpu.load(Ordering::Acquire)
+        if self.state != ProcessState::Ready || self.stopped || self.on_cpu.load(Ordering::Acquire)
         {
             return;
         }
@@ -2114,14 +2112,20 @@ pub fn run_ready_aging_self_test() {
     assert_eq!((proc.wait_ticks, proc.wait_age_tick), (0, 300));
     proc.enter_ready_at(450);
     proc.age_wait_ticks_to(475);
-    assert_eq!(proc.wait_ticks, 25, "blocked time must not become Ready wait");
+    assert_eq!(
+        proc.wait_ticks, 25,
+        "blocked time must not become Ready wait"
+    );
 
     proc.enter_ready_at(500);
     proc.stopped = true;
     proc.wait_ticks = 19;
     proc.wait_age_tick = 500;
     proc.age_wait_ticks_to(600);
-    assert_eq!(proc.wait_ticks, 19, "stopped time must not earn aging credit");
+    assert_eq!(
+        proc.wait_ticks, 19,
+        "stopped time must not earn aging credit"
+    );
     proc.enter_ready_at(600);
     proc.stopped = false;
     proc.age_wait_ticks_to(625);
@@ -2132,7 +2136,10 @@ pub fn run_ready_aging_self_test() {
     proc.wait_age_tick = 700;
     proc.on_cpu.store(true, Ordering::Release);
     proc.age_wait_ticks_to(800);
-    assert_eq!(proc.wait_ticks, 11, "Ready+on_cpu must not earn wait credit");
+    assert_eq!(
+        proc.wait_ticks, 11,
+        "Ready+on_cpu must not earn wait credit"
+    );
     proc.enter_ready_at(800);
     proc.on_cpu.store(false, Ordering::Release);
     proc.age_wait_ticks_to(825);
@@ -2164,7 +2171,6 @@ pub fn run_ready_aging_self_test() {
     proc.check_and_boost_starved();
     assert_eq!(proc.base_dynamic_priority, proc.priority);
     assert_eq!(proc.wait_ticks, 50);
-
 }
 
 /// 根据优先级计算时间片（毫秒）
@@ -3152,12 +3158,7 @@ pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
 
 /// RF178-35 executable state-matrix probe for fatal publication.
 pub fn run_fatal_exit_publication_self_test() {
-    let mut proc = Process::new(
-        0x178_3501,
-        1,
-        String::from("rf178-35-fatal"),
-        120,
-    );
+    let mut proc = Process::new(0x178_3501, 1, String::from("rf178-35-fatal"), 120);
     let group_token = Arc::clone(&proc.thread_group_exiting);
     let unrelated_group_token = Arc::new(AtomicBool::new(false));
     assert!(Arc::ptr_eq(&proc.thread_group_exiting, &group_token));
@@ -3192,8 +3193,8 @@ pub fn run_fatal_exit_publication_self_test() {
                 request_process_exit_locked(&mut proc, code, case as u64),
                 FatalExitPost::Kick,
             );
-            let actively_running = on_cpu
-                && matches!(state, ProcessState::Running | ProcessState::Ready);
+            let actively_running =
+                on_cpu && matches!(state, ProcessState::Running | ProcessState::Ready);
             let expected = if !actively_running && state != ProcessState::Ready
                 || (state == ProcessState::Ready && stopped)
             {
@@ -5250,10 +5251,7 @@ fn force_remote_kill(
         // The namespace member list contains reusable numeric PIDs. Revalidate
         // membership against the resolved PCB under the same guard that posts
         // the fatal request, so PID recycling cannot kill an unrelated task.
-        if !crate::pid_namespace::is_visible_in_namespace(
-            shutting_namespace,
-            &proc.pid_ns_chain,
-        ) {
+        if !crate::pid_namespace::is_visible_in_namespace(shutting_namespace, &proc.pid_ns_chain) {
             return;
         }
         request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
