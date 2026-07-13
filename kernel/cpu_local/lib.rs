@@ -853,34 +853,59 @@ pub fn init_ap(
     });
 }
 
-/// Counter for online CPUs.
+/// R178-28 FIX: Bitmap of online CPU IDs (bit N = CPU N is online).
 ///
-/// This is incremented by `mark_cpu_online()` as APs come online.
-/// BSP (CPU 0) is counted at init time.
-static ONLINE_CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
+/// Authoritative mask for scheduler affinity and cpuset validation. Only bits
+/// corresponding to registered CPUs (via `register_cpu_id`) that have called
+/// `mark_cpu_online` are set. BSP (CPU 0) is marked online at init.
+static ONLINE_CPU_MASK: AtomicU64 = AtomicU64::new(1); // Bit 0 set for BSP
 
 /// Get the number of online CPUs.
 ///
 /// # R69-1 FIX: Accurate Online CPU Count
 ///
-/// Returns the actual count of online CPUs tracked locally.
-/// This count is incremented by `mark_cpu_online()` as APs come online.
+/// Derives the count from the authoritative ID bitmap so count and mask cannot
+/// diverge when logical IDs are sparse.
 #[inline]
 pub fn num_online_cpus() -> usize {
-    ONLINE_CPU_COUNT.load(Ordering::Acquire)
+    ONLINE_CPU_MASK.load(Ordering::Acquire).count_ones() as usize
+}
+
+/// R178-28 FIX: Get the online CPU mask (bit N = CPU N is online).
+///
+/// Returns a bitmap of online CPU IDs. Used by scheduler affinity and cpuset
+/// code to validate that requested CPUs are actually online. Only CPUs that
+/// have both registered their LAPIC ID and completed AP initialization are set.
+#[inline]
+pub fn online_cpu_mask() -> u64 {
+    ONLINE_CPU_MASK.load(Ordering::Acquire)
+}
+
+/// Test one logical CPU ID against the same authoritative bitmap.
+#[inline]
+pub fn is_cpu_online(cpu_id: usize) -> bool {
+    cpu_id < 64 && (online_cpu_mask() & (1u64 << cpu_id)) != 0
 }
 
 /// Mark a CPU as online (call this from AP initialization).
 ///
-/// This increments the online CPU counter. Should be called once per AP
+/// Sets the corresponding bit in the online mask. Should be called once per AP
 /// after it has completed initialization.
 ///
 /// # Safety
 ///
 /// Should only be called once per CPU during SMP initialization.
+///
+/// # R178-28 FIX
+///
+/// Now also updates the authoritative online-CPU mask so affinity/cpuset
+/// validation can distinguish registered-but-offline from truly online CPUs.
 #[inline]
 pub fn mark_cpu_online() {
-    ONLINE_CPU_COUNT.fetch_add(1, Ordering::Release);
+    let cpu_id = current_cpu_id();
+    if cpu_id < 64 {
+        ONLINE_CPU_MASK.fetch_or(1u64 << cpu_id, Ordering::Release);
+    }
 }
 
 /// Clear FPU ownership for a process across all CPUs.

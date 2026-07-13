@@ -74,6 +74,12 @@ pub mod sha256 {
         total_len: u64,
     }
 
+    impl Default for Sha256 {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Sha256 {
         /// Create a new SHA-256 hasher.
         pub const fn new() -> Self {

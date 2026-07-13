@@ -79,7 +79,7 @@ impl<T> Mutex<T> {
     }
 }
 
-impl<T: ?Sized + Default> Default for Mutex<T> {
+impl<T: Default> Default for Mutex<T> {
     fn default() -> Self {
         Self::new(Default::default())
     }

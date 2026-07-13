@@ -74,6 +74,12 @@ pub const DEFAULT_CAPACITY: usize = 256;
 /// Maximum capacity to prevent excessive memory usage
 pub const MAX_CAPACITY: usize = 8192;
 
+/// Maximum number of records returned by one cursor export.
+const MAX_EXPORT_BATCH: usize = 1000;
+
+/// Number of optimistic plan/capture attempts before reserving the fixed bound.
+const CAPTURE_VERSION_RETRIES: usize = 2;
+
 /// Maximum number of syscall arguments to store
 /// Note: We store syscall_num + 6 args, so need 7 slots
 pub const MAX_ARGS: usize = 7;
@@ -103,6 +109,10 @@ pub enum AuditError {
     InvalidCapacity,
     /// Memory allocation failed
     NoMemory,
+    /// RF178-21 FIX: Out of memory while reserving audit capture storage
+    OutOfMemory,
+    /// RF178-21 FIX: Private audit-ring invariants were violated
+    CorruptState,
     /// Audit subsystem is disabled
     Disabled,
     /// Missing capability to read/export the audit log (CAP_AUDIT_READ)
@@ -295,7 +305,7 @@ impl AuditSubject {
 }
 
 /// Object (target) of an audit event
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuditObject {
     /// No specific object
     None,
@@ -363,7 +373,7 @@ pub enum AuditObject {
 // ============================================================================
 
 /// A single audit record with hash chain metadata
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditEvent {
     /// Monotonically increasing event ID
     pub id: u64,
@@ -852,6 +862,55 @@ impl Drop for HmacKey {
     }
 }
 
+/// Allocation-free description of one stable cursor export window.
+#[derive(Clone, Copy)]
+struct AuditExportPlan {
+    content_version: u64,
+    start_offset: usize,
+    event_count: usize,
+    next_cursor: u64,
+    has_more: bool,
+    tail_hash: [u8; 32],
+    batch_first_prev_hash: [u8; 32],
+    ring_usage: u16,
+    dropped_since_cursor: u64,
+}
+
+impl AuditExportPlan {
+    /// Assemble the owning public result after the ring lock has been released.
+    fn finish(self, events: Vec<AuditEvent>) -> AuditExportBatch {
+        AuditExportBatch {
+            events,
+            next_cursor: self.next_cursor,
+            has_more: self.has_more,
+            tail_hash: self.tail_hash,
+            batch_first_prev_hash: self.batch_first_prev_hash,
+            ring_usage: self.ring_usage,
+            dropped_since_cursor: self.dropped_since_cursor,
+        }
+    }
+}
+
+/// Allocation-free description of a drain attempt.
+#[derive(Clone, Copy)]
+struct AuditSnapshotPlan {
+    content_version: u64,
+    event_count: usize,
+    ring_capacity: usize,
+}
+
+/// Scalar snapshot metadata captured with the drained records.
+#[derive(Clone, Copy)]
+struct AuditSnapshotMetadata {
+    dropped: u64,
+    tail_hash: [u8; 32],
+}
+
+enum AuditSnapshotAttempt {
+    Captured(AuditSnapshotMetadata),
+    Retry(AuditSnapshotPlan),
+}
+
 /// Internal ring buffer for audit events
 struct AuditRing {
     /// Fixed-size buffer
@@ -866,6 +925,11 @@ struct AuditRing {
     prev_hash: [u8; 32],
     /// Accumulated dropped count since last emit
     dropped: u64,
+    /// RF178-21 FIX: Changes whenever the buffered export view changes.
+    ///
+    /// Export and snapshot use this sequence to reject a stale pre-allocation
+    /// plan before copying records from a concurrently changed ring.
+    content_version: u64,
     /// R65-15 FIX: HMAC key for audit log integrity
     ///
     /// When set, all events are hashed with HMAC-SHA256 instead of plain SHA-256.
@@ -892,6 +956,7 @@ impl AuditRing {
             next_id: 0,
             prev_hash: ZERO_HASH,
             dropped: 0,
+            content_version: 0,
             hmac_key: HmacKey::empty(), // R65-15 FIX: Initialize empty key
         })
     }
@@ -923,8 +988,15 @@ impl AuditRing {
         if self.hmac_key.is_set() {
             return Err(AuditError::KeyAlreadySet);
         }
+        // RF178-20 FIX: Never change authentication mode after record zero.
+        // If an early emitter won the race, this boot remains uniformly SHA
+        // rather than producing a chain no single verifier can validate.
+        if self.next_id != 0 || self.len != 0 || self.dropped != 0 || self.prev_hash != ZERO_HASH {
+            return Err(AuditError::KeyAlreadySet);
+        }
         self.hmac_key.data[..key.len()].copy_from_slice(key);
         self.hmac_key.len = key.len();
+        self.content_version = self.content_version.wrapping_add(1);
         Ok(())
     }
 
@@ -935,7 +1007,7 @@ impl AuditRing {
 
     /// Return `(used, capacity)` for ring buffer occupancy reporting.
     ///
-    /// Used by `read_from_cursor()` to populate `AuditExportBatch::ring_usage`.
+    /// Used by `export_plan()` to populate `AuditExportBatch::ring_usage`.
     #[inline]
     fn usage_fraction(&self) -> (usize, usize) {
         (self.len, self.buf.len())
@@ -979,27 +1051,61 @@ impl AuditRing {
         let tail = (self.head + self.len) % self.buf.len();
         self.buf[tail] = Some(event);
         self.len += 1;
+        self.content_version = self.content_version.wrapping_add(1);
     }
 
-    /// Drain all events from the buffer
-    fn drain(&mut self) -> Vec<AuditEvent> {
-        let mut events = Vec::with_capacity(self.len);
-        for _ in 0..self.len {
-            if let Some(event) = self.buf[self.head].take() {
-                events.push(event);
-            }
-            self.head = (self.head + 1) % self.buf.len();
+    /// Return a scalar plan for a fallible, outside-lock snapshot reservation.
+    fn snapshot_plan(&self) -> AuditSnapshotPlan {
+        AuditSnapshotPlan {
+            content_version: self.content_version,
+            event_count: self.len,
+            ring_capacity: self.buf.len(),
         }
-        self.len = 0;
-        events
     }
 
-    /// Read up to `max_events` events with `id >= cursor` without draining.
+    /// Drain into caller-owned storage that was reserved before taking the lock.
     ///
-    /// `cursor` is an event ID. If `cursor` refers to an event that has already
-    /// been evicted from the ring buffer, reading starts from the oldest
-    /// available event. Returns `next_cursor = last_returned_id + 1`.
-    fn read_from_cursor(&self, cursor: u64, max_events: usize) -> AuditExportBatch {
+    /// The preflight validates every occupied slot before changing the ring, so
+    /// a failed invariant/capacity check leaves both the ring and output intact.
+    fn drain_into(&mut self, events: &mut Vec<AuditEvent>) -> Option<AuditSnapshotMetadata> {
+        if !events.is_empty() || events.capacity().saturating_sub(events.len()) < self.len {
+            return None;
+        }
+
+        let drain_len = self.len;
+        for i in 0..drain_len {
+            let idx = (self.head + i) % self.buf.len();
+            if self.buf[idx].is_none() {
+                return None;
+            }
+        }
+
+        let metadata = AuditSnapshotMetadata {
+            dropped: self.dropped,
+            tail_hash: self.tail_hash(),
+        };
+
+        for i in 0..drain_len {
+            let idx = (self.head + i) % self.buf.len();
+            // AuditEvent is Copy and every slot was validated above: this copy
+            // cannot allocate or run an ownership destructor under the lock.
+            if let Some(event) = self.buf[idx] {
+                events.push(event);
+                self.buf[idx] = None;
+            }
+        }
+
+        if drain_len != 0 {
+            self.head = (self.head + drain_len) % self.buf.len();
+            self.len = 0;
+            self.content_version = self.content_version.wrapping_add(1);
+        }
+
+        Some(metadata)
+    }
+
+    /// Plan a bounded cursor export without allocating or moving output storage.
+    fn export_plan(&self, cursor: u64, max_events: usize) -> AuditExportPlan {
         let tail_hash = self.tail_hash();
 
         // P1-2: Compute ring buffer occupancy in basis points (0–10000).
@@ -1013,9 +1119,12 @@ impl AuditRing {
         // P1-2: Determine oldest_id upfront so we can compute dropped_since_cursor
         // for all return paths (including empty ring / future cursor).
         let oldest_id = if used == 0 || capacity == 0 {
-            cursor
+            self.next_id
         } else {
-            self.buf[self.head].as_ref().map(|e| e.id).unwrap_or(cursor)
+            self.buf[self.head]
+                .as_ref()
+                .map(|e| e.id)
+                .unwrap_or(self.next_id)
         };
 
         // P1-2: Events lost between the caller's cursor and the oldest available.
@@ -1025,16 +1134,28 @@ impl AuditRing {
             0
         };
 
-        if used == 0 || capacity == 0 || max_events == 0 {
-            return AuditExportBatch {
-                events: Vec::new(),
-                next_cursor: cursor,
-                has_more: false,
-                tail_hash,
-                batch_first_prev_hash: ZERO_HASH,
-                ring_usage,
-                dropped_since_cursor,
-            };
+        let mut plan = AuditExportPlan {
+            content_version: self.content_version,
+            start_offset: 0,
+            event_count: 0,
+            next_cursor: cursor,
+            has_more: false,
+            tail_hash,
+            batch_first_prev_hash: ZERO_HASH,
+            ring_usage,
+            dropped_since_cursor,
+        };
+
+        if used == 0 || capacity == 0 {
+            // A concurrent destructive snapshot may have consumed the caller's
+            // window. Advance to next_id and report the exact cursor gap now,
+            // rather than waiting for a later emit to expose it.
+            plan.next_cursor = self.next_id;
+            return plan;
+        }
+
+        if max_events == 0 {
+            return plan;
         }
 
         // Clamp cursor to the valid range [oldest_id, next_id].
@@ -1048,15 +1169,8 @@ impl AuditRing {
         } else if cursor >= self.next_id {
             // Future cursor: nothing available yet; return next_id so the
             // caller can poll again when new events arrive.
-            return AuditExportBatch {
-                events: Vec::new(),
-                next_cursor: self.next_id,
-                has_more: false,
-                tail_hash,
-                batch_first_prev_hash: ZERO_HASH,
-                ring_usage,
-                dropped_since_cursor,
-            };
+            plan.next_cursor = self.next_id;
+            return plan;
         } else {
             cursor
         };
@@ -1075,60 +1189,68 @@ impl AuditRing {
 
         let Some(start_offset) = start_offset else {
             // Cursor is beyond the newest available event.
-            return AuditExportBatch {
-                events: Vec::new(),
-                next_cursor: start_cursor,
-                has_more: false,
-                tail_hash,
-                batch_first_prev_hash: ZERO_HASH,
-                ring_usage,
-                dropped_since_cursor,
-            };
+            plan.next_cursor = start_cursor;
+            return plan;
         };
 
         let available = self.len - start_offset;
         let to_take = core::cmp::min(max_events, available);
-        let mut events = Vec::with_capacity(to_take);
-        let mut last_id = start_cursor;
-
-        for i in 0..available {
-            if events.len() >= to_take {
-                break;
-            }
-            let idx = (self.head + start_offset + i) % self.buf.len();
-            if let Some(ref event) = self.buf[idx] {
-                if event.id < start_cursor {
-                    continue;
-                }
-                last_id = event.id;
-                events.push(event.clone());
-            }
+        if to_take == 0 {
+            plan.next_cursor = start_cursor;
+            return plan;
         }
 
-        let next_cursor = if events.is_empty() {
-            start_cursor
-        } else {
-            last_id.wrapping_add(1)
+        let first_idx = (self.head + start_offset) % self.buf.len();
+        let last_idx = (self.head + start_offset + to_take - 1) % self.buf.len();
+        let (Some(first), Some(last)) = (self.buf[first_idx].as_ref(), self.buf[last_idx].as_ref())
+        else {
+            // A hole violates the private dense-ring invariant. Fail closed with
+            // an empty plan rather than constructing a discontinuous batch.
+            plan.next_cursor = start_cursor;
+            return plan;
         };
 
-        // P1-2: Extract first event's prev_hash for chain continuity verification.
-        // When dropped_since_cursor > 0, the chain is broken so we zero the field
-        // to signal the daemon that continuity cannot be verified for this window.
-        let batch_first_prev_hash = if dropped_since_cursor > 0 {
+        plan.start_offset = start_offset;
+        plan.event_count = to_take;
+        plan.next_cursor = last.id.wrapping_add(1);
+        plan.has_more = available > to_take;
+        // When events were evicted, the first retained prev_hash names a record
+        // the caller cannot possess. Zero is the explicit chain-gap sentinel.
+        plan.batch_first_prev_hash = if dropped_since_cursor > 0 {
             ZERO_HASH
         } else {
-            events.first().map(|e| e.prev_hash).unwrap_or(ZERO_HASH)
+            first.prev_hash
         };
+        plan
+    }
 
-        AuditExportBatch {
-            events,
-            next_cursor,
-            has_more: available > to_take,
-            tail_hash,
-            batch_first_prev_hash,
-            ring_usage,
-            dropped_since_cursor,
+    /// Copy a previously planned export into caller-owned reserved storage.
+    ///
+    /// Returns false without modifying `events` when the plan is stale, storage
+    /// is insufficient, or the private dense-ring invariant is violated.
+    fn copy_export_plan_into(&self, plan: AuditExportPlan, events: &mut Vec<AuditEvent>) -> bool {
+        if self.content_version != plan.content_version
+            || !events.is_empty()
+            || events.capacity().saturating_sub(events.len()) < plan.event_count
+        {
+            return false;
         }
+
+        for i in 0..plan.event_count {
+            let idx = (self.head + plan.start_offset + i) % self.buf.len();
+            if self.buf[idx].is_none() {
+                return false;
+            }
+        }
+
+        for i in 0..plan.event_count {
+            let idx = (self.head + plan.start_offset + i) % self.buf.len();
+            if let Some(event) = self.buf[idx] {
+                // AuditEvent is Copy; capacity was checked before the first push.
+                events.push(event);
+            }
+        }
+        true
     }
 
     /// Get the current tail hash (for integrity verification)
@@ -2283,6 +2405,23 @@ pub fn emit_security_allow(
     )
 }
 
+/// Fallibly ensure that `events` can hold `required` records.
+///
+/// RF178-21 invariant: every caller invokes this helper before taking
+/// `AUDIT_RING`; subsequent pushes into that reserved storage cannot allocate.
+fn reserve_capture_storage(
+    events: &mut Vec<AuditEvent>,
+    required: usize,
+) -> Result<(), AuditError> {
+    if events.capacity() < required {
+        let additional = required.saturating_sub(events.len());
+        events
+            .try_reserve_exact(additional)
+            .map_err(|_| AuditError::OutOfMemory)?;
+    }
+    Ok(())
+}
+
 /// Export a batch of audit events from a cursor without draining the ring buffer.
 ///
 /// This is the preferred API for remote delivery / userspace audit daemon
@@ -2297,6 +2436,13 @@ pub fn emit_security_allow(
 /// # Capability Gate
 ///
 /// Identical to `snapshot()`: requires `SNAPSHOT_AUTHORIZER` / `CAP_AUDIT_READ`.
+///
+/// # RF178-21 FIX
+///
+/// Planning records a private ring content version, allocation happens outside
+/// the IRQ-disabled lock, and capture accepts the plan only while that version
+/// remains current. After bounded optimistic retries, the fixed 1000-record cap
+/// is reserved outside the lock and a one-lock capture guarantees progress.
 pub fn export(cursor: u64, max_events: usize) -> Result<AuditExportBatch, AuditError> {
     if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
         return Err(AuditError::Uninitialized);
@@ -2308,14 +2454,64 @@ pub fn export(cursor: u64, max_events: usize) -> Result<AuditExportBatch, AuditE
     // Invoke flush hook so pending events from other subsystems are visible.
     run_flush_hook();
 
-    interrupts::without_interrupts(|| {
+    let capped_max = core::cmp::min(max_events, MAX_EXPORT_BATCH);
+
+    // Plan under the lock without allocating. The plan includes cursor loss,
+    // hash-chain boundary metadata, and the content sequence it describes.
+    let mut plan = interrupts::without_interrupts(|| {
         let ring = AUDIT_RING.lock();
         if let Some(ref r) = *ring {
-            Ok(r.read_from_cursor(cursor, max_events))
+            Ok(r.export_plan(cursor, capped_max))
         } else {
             Err(AuditError::Uninitialized)
         }
-    })
+    })?;
+
+    let mut events = Vec::new();
+    for _ in 0..CAPTURE_VERSION_RETRIES {
+        reserve_capture_storage(&mut events, plan.event_count)?;
+
+        // The closure returns only scalar plan state; vector ownership and the
+        // public batch are assembled after IRQs and the ring lock are restored.
+        let retry_plan = interrupts::without_interrupts(|| {
+            let ring = AUDIT_RING.lock();
+            if let Some(ref r) = *ring {
+                if r.copy_export_plan_into(plan, &mut events) {
+                    Ok(None)
+                } else {
+                    Ok(Some(r.export_plan(cursor, capped_max)))
+                }
+            } else {
+                Err(AuditError::Uninitialized)
+            }
+        })?;
+
+        match retry_plan {
+            None => return Ok(plan.finish(events)),
+            Some(current) => plan = current,
+        }
+    }
+
+    // Sustained emit/drain traffic can invalidate every exact-size plan. Reserve
+    // the bounded ceiling outside the lock, then plan+copy atomically once.
+    reserve_capture_storage(&mut events, capped_max)?;
+    let captured_plan = interrupts::without_interrupts(|| {
+        let ring = AUDIT_RING.lock();
+        if let Some(ref r) = *ring {
+            let current = r.export_plan(cursor, capped_max);
+            if r.copy_export_plan_into(current, &mut events) {
+                Ok(current)
+            } else {
+                // With the fixed bound reserved and the lock held, failure can
+                // only mean the private dense-ring invariant was violated.
+                Err(AuditError::CorruptState)
+            }
+        } else {
+            Err(AuditError::Uninitialized)
+        }
+    })?;
+
+    Ok(captured_plan.finish(events))
 }
 
 /// Take a snapshot of the audit log (drains all buffered events)
@@ -2338,22 +2534,69 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
     // any pending audit events before we drain the ring buffer
     run_flush_hook();
 
-    // Drain events from the ring buffer
-    let snapshot = interrupts::without_interrupts(|| {
-        let mut ring = AUDIT_RING.lock();
-        if let Some(ref mut r) = *ring {
-            let dropped = r.dropped;
-            let tail_hash = r.tail_hash();
-            let events = r.drain();
-            Ok(AuditSnapshot {
-                events,
-                dropped,
-                tail_hash,
-            })
-        } else {
-            Err(AuditError::Uninitialized)
-        }
+    // Snapshot uses the same versioned two-phase protocol as cursor export.
+    // Only scalar metadata crosses the IRQ-disabled closure; the Vec remains
+    // caller-owned for its entire lifetime.
+    let mut plan = interrupts::without_interrupts(|| {
+        let ring = AUDIT_RING.lock();
+        ring.as_ref()
+            .map(AuditRing::snapshot_plan)
+            .ok_or(AuditError::Uninitialized)
     })?;
+
+    let mut events = Vec::new();
+    let metadata = {
+        let mut captured = None;
+        for _ in 0..CAPTURE_VERSION_RETRIES {
+            reserve_capture_storage(&mut events, plan.event_count)?;
+
+            let attempt = interrupts::without_interrupts(|| {
+                let mut ring = AUDIT_RING.lock();
+                if let Some(ref mut r) = *ring {
+                    if r.content_version != plan.content_version {
+                        Ok(AuditSnapshotAttempt::Retry(r.snapshot_plan()))
+                    } else if let Some(metadata) = r.drain_into(&mut events) {
+                        Ok(AuditSnapshotAttempt::Captured(metadata))
+                    } else {
+                        Ok(AuditSnapshotAttempt::Retry(r.snapshot_plan()))
+                    }
+                } else {
+                    Err(AuditError::Uninitialized)
+                }
+            })?;
+
+            match attempt {
+                AuditSnapshotAttempt::Captured(metadata) => {
+                    captured = Some(metadata);
+                    break;
+                }
+                AuditSnapshotAttempt::Retry(current) => plan = current,
+            }
+        }
+
+        match captured {
+            Some(metadata) => metadata,
+            None => {
+                // Reserve the ring's immutable maximum outside the lock. This
+                // bounded fallback cannot be invalidated by concurrent emitters.
+                reserve_capture_storage(&mut events, plan.ring_capacity)?;
+                interrupts::without_interrupts(|| {
+                    let mut ring = AUDIT_RING.lock();
+                    if let Some(ref mut r) = *ring {
+                        r.drain_into(&mut events).ok_or(AuditError::CorruptState)
+                    } else {
+                        Err(AuditError::Uninitialized)
+                    }
+                })?
+            }
+        }
+    };
+
+    let snapshot = AuditSnapshot {
+        events,
+        dropped: metadata.dropped,
+        tail_hash: metadata.tail_hash,
+    };
 
     // R72-PERSIST: Invoke persistence hook (best-effort, don't lose events on failure)
     if let Err(err) = run_persistence_hook(&snapshot.events) {
@@ -2631,6 +2874,92 @@ pub fn verify_chain_hmac(events: &[AuditEvent], key: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_test_event(timestamp: u64) -> AuditEvent {
+        AuditEvent::new(
+            timestamp,
+            AuditKind::Security,
+            AuditOutcome::Success,
+            AuditSubject::kernel(),
+            AuditObject::None,
+            &[timestamp],
+            0,
+        )
+    }
+
+    #[test]
+    fn test_versioned_export_rejects_stale_plan_and_reports_gap() {
+        let mut ring = AuditRing::with_capacity(2).expect("private ring allocation");
+        ring.push(private_test_event(1));
+        ring.push(private_test_event(2));
+
+        let stale = ring.export_plan(0, 2);
+        ring.push(private_test_event(3)); // Evicts id 0 and changes content_version.
+
+        let mut events = Vec::new();
+        reserve_capture_storage(&mut events, 2).expect("export reservation");
+        let storage = events.as_ptr();
+        assert!(!ring.copy_export_plan_into(stale, &mut events));
+        assert!(events.is_empty(), "stale capture must not partially copy");
+
+        let current = ring.export_plan(0, 2);
+        assert_eq!(current.dropped_since_cursor, 1);
+        assert_eq!(current.batch_first_prev_hash, ZERO_HASH);
+        assert!(ring.copy_export_plan_into(current, &mut events));
+        assert_eq!(events.as_ptr(), storage, "capture must not reallocate");
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(events[1].prev_hash, events[0].hash);
+        assert_eq!(current.tail_hash, events[1].hash);
+    }
+
+    #[test]
+    fn test_versioned_export_preserves_hmac_chain_boundary() {
+        let key = [0x5au8; 32];
+        let mut ring = AuditRing::with_capacity(4).expect("private ring allocation");
+        ring.set_key(&key).expect("private ring HMAC key");
+        ring.push(private_test_event(1));
+        ring.push(private_test_event(2));
+
+        let plan = ring.export_plan(0, 4);
+        let mut events = Vec::new();
+        reserve_capture_storage(&mut events, plan.event_count).expect("export reservation");
+        assert!(ring.copy_export_plan_into(plan, &mut events));
+
+        let batch = plan.finish(events);
+        assert_eq!(batch.batch_first_prev_hash, ZERO_HASH);
+        assert_eq!(batch.tail_hash, batch.events.last().unwrap().hash);
+        assert!(verify_chain_hmac(&batch.events, &key));
+    }
+
+    #[test]
+    fn test_snapshot_drain_uses_reserved_storage_and_exposes_cursor_loss() {
+        let mut ring = AuditRing::with_capacity(3).expect("private ring allocation");
+        ring.push(private_test_event(1));
+        ring.push(private_test_event(2));
+        let stale = ring.snapshot_plan();
+        ring.push(private_test_event(3));
+        assert_ne!(stale.content_version, ring.content_version);
+
+        let current = ring.snapshot_plan();
+        let mut events = Vec::new();
+        reserve_capture_storage(&mut events, current.event_count).expect("snapshot reservation");
+        let storage = events.as_ptr();
+        let metadata = ring.drain_into(&mut events).expect("reserved drain");
+
+        assert_eq!(events.as_ptr(), storage, "drain must not reallocate");
+        assert_eq!(events.len(), 3);
+        assert_eq!(metadata.tail_hash, events.last().unwrap().hash);
+        assert_eq!(ring.len, 0);
+
+        let after_drain = ring.export_plan(0, 3);
+        assert_eq!(after_drain.event_count, 0);
+        assert_eq!(after_drain.next_cursor, 3);
+        assert_eq!(after_drain.dropped_since_cursor, 3);
+        assert_eq!(after_drain.batch_first_prev_hash, ZERO_HASH);
+    }
 
     #[test]
     fn test_sha256_known_vector() {

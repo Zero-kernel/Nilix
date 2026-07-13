@@ -21,7 +21,6 @@
 //!
 //! - Intel VT-d Specification, Chapter 3.4 (Second-Level Translation)
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +29,7 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
 
 use crate::IommuError;
-use mm::{buddy_allocator, phys_to_virt};
+use mm::{buddy_allocator, fallible_map::FallibleOrderedMap, phys_to_virt};
 
 // ============================================================================
 // Constants
@@ -100,7 +99,7 @@ pub struct Domain {
     address_width: u8,
 
     /// Mapping entries (for tracking, even in identity mode).
-    mappings: Mutex<BTreeMap<u64, MappingEntry>>,
+    mappings: Mutex<FallibleOrderedMap<u64, MappingEntry>>,
 
     /// Second-level page table root (physical address).
     /// Only used for PageTable type domains.
@@ -132,7 +131,7 @@ impl Domain {
             id,
             domain_type: DomainType::Identity,
             address_width: MAX_ADDR_WIDTH,
-            mappings: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(FallibleOrderedMap::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
             mapped_bytes: AtomicU64::new(0),
@@ -157,7 +156,7 @@ impl Domain {
             id,
             domain_type: DomainType::PageTable,
             address_width: MAX_ADDR_WIDTH,
-            mappings: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(FallibleOrderedMap::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
             mapped_bytes: AtomicU64::new(0),
@@ -184,7 +183,7 @@ impl Domain {
             id,
             domain_type: DomainType::PageTable,
             address_width,
-            mappings: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(FallibleOrderedMap::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
             mapped_bytes: AtomicU64::new(0),
@@ -321,13 +320,21 @@ impl Domain {
             }
         }
 
+        // RF178-39 FIX: reserve tracking capacity before SLPT publication.
+        // Once this succeeds, the post-publication insert cannot grow the heap.
+        mappings
+            .try_reserve(1)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+
         // For page-table domains, install mapping after overlap validation
         if self.domain_type == DomainType::PageTable {
             self.install_mapping(iova, phys, size, write)?;
         }
 
-        // Track any replaced mapping for accurate accounting
-        if let Some(replaced) = mappings.insert(iova, entry) {
+        if let Some(replaced) = mappings
+            .try_insert(iova, entry)
+            .map_err(|_| IommuError::PageTableAllocFailed)?
+        {
             self.mapped_bytes
                 .fetch_sub(replaced.size as u64, Ordering::Relaxed);
         }
@@ -369,32 +376,33 @@ impl Domain {
 
         let mut mappings = self.mappings.lock();
 
-        // Find and remove matching mapping
-        if let Some(entry) = mappings.remove(&iova) {
-            if entry.size != size {
-                // Partial unmap not supported in this simple implementation
-                // Re-insert and return error
-                mappings.insert(iova, entry);
-                return Err(IommuError::InvalidRange);
-            }
-
-            self.mapped_bytes
-                .fetch_sub(entry.size as u64, Ordering::Relaxed);
-
-            // For page-table domains, clear the page table entries
-            if self.domain_type == DomainType::PageTable {
-                self.clear_mapping(iova, size)?;
-            }
-
-            Ok(())
-        } else {
-            Err(IommuError::InvalidRange)
+        // Validate before removal so an unsupported partial unmap never needs
+        // an allocating remove-then-reinsert rollback.
+        let entry = *mappings.get(&iova).ok_or(IommuError::InvalidRange)?;
+        if entry.size != size {
+            return Err(IommuError::InvalidRange);
         }
+
+        // For page-table domains, clear hardware mappings before forgetting the
+        // tracking entry. On failure, accounting/tracking remains intact.
+        if self.domain_type == DomainType::PageTable {
+            self.clear_mapping(iova, size)?;
+        }
+        let removed = mappings.remove(&iova).ok_or(IommuError::InvalidRange)?;
+        self.mapped_bytes
+            .fetch_sub(removed.size as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Get all current mappings.
-    pub fn get_mappings(&self) -> Vec<MappingEntry> {
-        self.mappings.lock().values().cloned().collect()
+    pub fn get_mappings(&self) -> Result<Vec<MappingEntry>, IommuError> {
+        let mappings = self.mappings.lock();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(mappings.len())
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        snapshot.extend(mappings.values().copied());
+        Ok(snapshot)
     }
 
     /// Ensure page table root is allocated.
@@ -834,6 +842,34 @@ impl Domain {
 
         Ok(())
     }
+}
+
+/// Boot-time RF178-39 probe for fallible mapping publication and allocation-free
+/// unmap validation. Identity mode exercises tracking without hardware page tables.
+#[doc(hidden)]
+pub fn run_mapping_tracker_self_test() {
+    let domain = Domain::new_identity(u16::MAX).expect("mapping tracker domain");
+    assert_eq!(domain.mapping_count(), 0);
+    domain
+        .map_range(0x2000, 0x2000, IOMMU_PAGE_SIZE, true)
+        .expect("fallible mapping publication");
+    assert_eq!(domain.mapping_count(), 1);
+    assert!(matches!(
+        domain.map_range(0x2000, 0x2000, IOMMU_PAGE_SIZE, true),
+        Err(IommuError::InvalidRange)
+    ));
+    assert!(matches!(
+        domain.unmap_range(0x2000, IOMMU_PAGE_SIZE * 2),
+        Err(IommuError::InvalidRange)
+    ));
+    assert_eq!(domain.mapping_count(), 1);
+    let snapshot = domain.get_mappings().expect("fallible mapping snapshot");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].iova, 0x2000);
+    domain
+        .unmap_range(0x2000, IOMMU_PAGE_SIZE)
+        .expect("mapping removal");
+    assert_eq!(domain.mapping_count(), 0);
 }
 
 /// R130-3 FIX: Release page table tree memory when a Domain is dropped.
