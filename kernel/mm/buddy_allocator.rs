@@ -518,6 +518,20 @@ pub struct AllocatorStats {
 /// 全局Buddy分配器实例
 static BUDDY_ALLOCATOR: Mutex<Option<BuddyAllocator>> = Mutex::new(None);
 
+/// RF178-12: borrow the physical allocator without waiting or invoking OOM
+/// recovery. Intended for bounded synchronous exception work that must either
+/// complete with one allocator ownership interval or fail closed. Keeping the
+/// guard across the callback also makes rollback frees infallible with respect
+/// to allocator-lock contention.
+pub fn try_with_allocator<T, F>(f: F) -> Option<T>
+where
+    F: FnOnce(&mut BuddyAllocator) -> T,
+{
+    let mut guard = BUDDY_ALLOCATOR.try_lock()?;
+    let allocator = guard.as_mut()?;
+    Some(f(allocator))
+}
+
 /// 初始化全局Buddy分配器
 ///
 /// # 参数
@@ -583,6 +597,11 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
     // 分配失败，触发 OOM killer 尝试回收内存
     // 使用实际需要的页数（向上取整后），而非原始请求
     oom_killer::on_allocation_failure(pages_needed);
+
+    // RF178-4: The first allocation attempt released BUDDY_ALLOCATOR before
+    // publishing the request. Run reclaim/victim selection only in this
+    // lock-free phase so OOM recovery cannot re-enter the allocator guard.
+    oom_killer::poll_and_handle_oom();
 
     // OOM 处理后重试一次
     BUDDY_ALLOCATOR

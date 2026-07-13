@@ -119,6 +119,24 @@ where
     })
 }
 
+/// RF178-12: nonblocking `with_current_manager` variant for synchronous #PF.
+/// A contended global PT lock returns `None`; an exception path must never spin
+/// on a lock whose holder may need the faulting CPU to make forward progress.
+pub unsafe fn try_with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> Option<T>
+where
+    F: FnOnce(&mut PageTableManager) -> T,
+{
+    let _pt_guard = PT_LOCK.try_lock()?;
+    Some(interrupts::without_interrupts(|| {
+        let _ = physical_memory_offset;
+        let phys_offset = get_phys_offset();
+        let level_4_table = active_level_4_table(phys_offset);
+        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+        let mut manager = PageTableManager { mapper };
+        f(&mut manager)
+    }))
+}
+
 impl PageTableManager {
     /// 创建新的页表管理器
     ///

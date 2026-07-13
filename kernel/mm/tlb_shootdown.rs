@@ -30,16 +30,14 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cpu_local::{
-    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, CpuLocal, TlbShootdownMailbox,
+    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox,
     PER_CPU_DATA, TLB_SHOOTDOWN_QUEUE_LEN,
 };
-use spin::RwLock;
 use x86_64::instructions::tlb;
 use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::VirtAddr;
@@ -93,44 +91,18 @@ static NEXT_SHOOTDOWN_GEN: AtomicU64 = AtomicU64::new(1);
 // Per-Address-Space TLB Tracking (R68 Architecture Improvement)
 // ============================================================================
 
-/// Per-CPU record of last loaded CR3 (0 = unknown/kernel shared).
+/// RF178-33: allocation-free record of the CR3 currently loaded on each CPU.
 ///
-/// Each CPU tracks its current CR3 so we can update ASID_CPU_MASKS on context switch.
-static CPU_ACTIVE_CR3: CpuLocal<AtomicU64> = CpuLocal::new(|| AtomicU64::new(0));
-
-/// CR3 -> CPU bitmask mapping for address spaces currently running.
-///
-/// Key: CR3 physical address (address space identifier)
-/// Value: Bitmask of CPUs currently running this address space
-///
-/// When a CPU switches CR3, it updates this map:
-/// - Removes itself from the old CR3's bitmask
-/// - Adds itself to the new CR3's bitmask
-///
-/// TLB shootdown uses this to target only CPUs with potentially cached TLB entries.
-/// If a CR3 is not in the map, we fall back to broadcast (safe but less efficient).
-static ASID_CPU_MASKS: RwLock<BTreeMap<u64, u64>> = RwLock::new(BTreeMap::new());
-
-/// R69-4 FIX: Writer-priority flag to prevent starvation.
-///
-/// When a writer (track_cr3_switch) needs the lock, it sets this flag.
-/// Readers (collect_target_cpus) check this flag and briefly yield to writers.
-/// This prevents heavy TLB shootdown traffic from starving context switches.
-static ASID_WRITER_PENDING: AtomicBool = AtomicBool::new(false);
+/// A fixed array avoids `CpuLocal` first-touch initialization in IRQ-return
+/// context. Context switch publishes with Release after CR3 is loaded;
+/// shootdown scans with Acquire. This replaces the global CR3->mask BTreeMap,
+/// whose write lock and insertion were illegal on the timer-return path.
+static CPU_ACTIVE_CR3: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
 
 /// Statistics for optimized TLB shootdowns
 static STATS_TARGETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
 static STATS_BROADCAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
-
-/// Convert CPU ID to bitmask bit, if within range.
-#[inline]
-fn cpu_bit(cpu_id: usize) -> Option<u64> {
-    if cpu_id < 64 {
-        Some(1u64 << cpu_id)
-    } else {
-        None
-    }
-}
 
 /// Registered function used to send the TLB shootdown IPI
 /// Stored as usize to avoid function pointer in static
@@ -374,59 +346,12 @@ pub fn online_cpu_count() -> u64 {
 ///
 /// * `new_cr3` - The new CR3 value (physical address of PML4)
 ///
-/// # Implementation
-///
-/// 1. Swap the current CPU's tracked CR3 with the new value
-/// 2. Remove this CPU's bit from the old CR3's mask (if tracked)
-/// 3. Add this CPU's bit to the new CR3's mask
-///
-/// # Thread Safety
-///
-/// Uses a RwLock for the global map. The per-CPU CR3 tracking uses atomics.
-/// CPUs with ID >= 64 fall back to broadcast shootdown (cannot be tracked in u64 mask).
-///
-/// # R69-4 FIX: Write Priority
-///
-/// To prevent writer starvation under heavy TLB shootdown traffic, this function
-/// sets ASID_WRITER_PENDING before acquiring the write lock. Readers check this
-/// flag and briefly spin-wait, giving priority to context switches.
+/// RF178-33: this context-switch hook is one Release store: no lock, allocation,
+/// lazy per-CPU initialization, or unbounded work is reachable from IRQ return.
 pub fn track_cr3_switch(new_cr3: u64) {
     let cpu_id = current_cpu_id();
-    let bit = match cpu_bit(cpu_id) {
-        Some(b) => b,
-        None => {
-            // CPU ID >= 64: can't track in bitmask, just update local state
-            CPU_ACTIVE_CR3.with(|c| c.store(new_cr3, Ordering::SeqCst));
-            return;
-        }
-    };
-
-    // Atomically swap the CPU's tracked CR3
-    let prev = CPU_ACTIVE_CR3.with(|c| c.swap(new_cr3, Ordering::SeqCst));
-
-    // R69-4 FIX: Signal that a writer is waiting
-    ASID_WRITER_PENDING.store(true, Ordering::Release);
-
-    // Update the global CR3 -> CPU mask mapping
-    let mut map = ASID_CPU_MASKS.write();
-
-    // R69-4 FIX: Clear writer-pending flag once we have the lock
-    ASID_WRITER_PENDING.store(false, Ordering::Release);
-
-    // Remove this CPU from the previous CR3's mask
-    if prev != 0 && prev != new_cr3 {
-        if let Some(mask) = map.get_mut(&prev) {
-            *mask &= !bit;
-            if *mask == 0 {
-                map.remove(&prev);
-            }
-        }
-    }
-
-    // Add this CPU to the new CR3's mask
-    if new_cr3 != 0 {
-        let entry = map.entry(new_cr3).or_insert(0);
-        *entry |= bit;
+    if let Some(slot) = CPU_ACTIVE_CR3.get(cpu_id) {
+        slot.store(new_cr3, Ordering::Release);
     }
 }
 
@@ -435,7 +360,10 @@ pub fn track_cr3_switch(new_cr3: u64) {
 /// Returns 0 if no CR3 has been tracked for this CPU yet.
 #[inline]
 pub fn current_cpu_cr3() -> u64 {
-    CPU_ACTIVE_CR3.with(|c| c.load(Ordering::SeqCst))
+    CPU_ACTIVE_CR3
+        .get(current_cpu_id())
+        .map(|slot| slot.load(Ordering::Acquire))
+        .unwrap_or(0)
 }
 
 /// Register the function used to send the TLB shootdown IPI.
@@ -501,8 +429,8 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
 
 /// Collect target CPUs for TLB shootdown based on address space tracking.
 ///
-/// R68 Architecture Improvement: Uses per-address-space tracking to target only
-/// CPUs that might have TLB entries for the affected address space.
+/// RF178-33: Uses a bounded scan of fixed per-CPU atomic CR3 snapshots. This
+/// preserves targeted shootdowns without a context-switch-side global map.
 ///
 /// # Arguments
 ///
@@ -514,57 +442,33 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
 ///
 /// # Fallback Behavior
 ///
-/// If the CR3 is not in the tracking map, or if tracking indicates no CPUs,
+/// If tracking indicates no CPUs,
 /// we fall back to broadcasting to all online CPUs (except self). This ensures
 /// correctness even if tracking becomes out of sync.
-///
-/// # R69-4 FIX: Writer Priority
-///
-/// Before acquiring the read lock, this function checks if a writer (context switch)
-/// is pending. If so, it briefly spin-waits to give priority to the writer.
-/// This prevents heavy TLB shootdown traffic from starving context switches.
 fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
     let mut targets = Vec::new();
     let self_id = current_cpu_id();
 
-    // R69-4 FIX: Yield to pending writers before acquiring read lock.
-    // Writers (context switches) are time-critical and should not be starved
-    // by heavy TLB shootdown traffic. We spin-wait briefly if a writer is pending.
-    const WRITER_YIELD_SPINS: usize = 100;
-    for _ in 0..WRITER_YIELD_SPINS {
-        if !ASID_WRITER_PENDING.load(Ordering::Acquire) {
-            break;
-        }
-        spin_loop();
-    }
-
-    // Try to use per-address-space tracking if CR3 is valid
+    // Try to use the per-CPU snapshots when CR3 is valid. A CPU switching
+    // into this address space after our Acquire scan observes page-table
+    // mutations before it can execute in the newly loaded CR3; a CPU switching
+    // out flushes that CR3 before publishing its replacement snapshot.
     if target_cr3 != 0 {
-        if let Some(mask) = ASID_CPU_MASKS.read().get(&target_cr3).copied() {
-            if mask != 0 {
-                // We found tracked CPUs for this address space
-                let online = ONLINE_CPU_MASK.load(Ordering::Acquire);
-                let tracked = mask & online; // Only consider online CPUs
-
-                // Convert bitmask to CPU list
-                let max_tracked = core::cmp::min(max_cpus(), 64);
-                for cpu in 0..max_tracked {
-                    if cpu == self_id {
-                        continue;
-                    }
-                    if let Some(bit) = cpu_bit(cpu) {
-                        if (tracked & bit) != 0 && lapic_id_for_cpu(cpu).is_some() {
-                            targets.push(cpu);
-                        }
-                    }
-                }
-
-                if !targets.is_empty() {
-                    // Successful targeted shootdown
-                    STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-                    return targets;
-                }
+        let online = ONLINE_CPU_MASK.load(Ordering::Acquire);
+        let max_tracked = core::cmp::min(max_cpus(), 64);
+        for cpu in 0..max_tracked {
+            if cpu == self_id || (online & (1u64 << cpu)) == 0 {
+                continue;
             }
+            if CPU_ACTIVE_CR3[cpu].load(Ordering::Acquire) == target_cr3
+                && lapic_id_for_cpu(cpu).is_some()
+            {
+                targets.push(cpu);
+            }
+        }
+        if !targets.is_empty() {
+            STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+            return targets;
         }
     }
 

@@ -3,9 +3,8 @@
 //! Uses buddy allocator watermarks and page cache pressure to trigger, reclaims cache pages,
 //! then selects and terminates the worst offender, emitting an audit event.
 
-use alloc::vec::Vec;
 use core::cmp;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::buddy_allocator;
@@ -15,10 +14,12 @@ use crate::page_cache::{MemoryPressureHandler, PRESSURE_HANDLER};
 pub type ProcessId = usize;
 
 /// Snapshot of a process for OOM scoring
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct OomProcessInfo {
     /// Process ID
     pub pid: ProcessId,
+    /// Monotonic process generation, binding the snapshot to one PID lifetime
+    pub generation: u64,
     /// Thread group ID (leader PID)
     pub tgid: ProcessId,
     /// User ID
@@ -37,9 +38,8 @@ pub struct OomProcessInfo {
     pub is_kernel_thread: bool,
 }
 
-type SnapshotFn = fn() -> Vec<OomProcessInfo>;
-type KillFn = fn(ProcessId, i32);
-type CleanupFn = fn(ProcessId);
+type SnapshotFn = fn() -> Option<OomProcessInfo>;
+type KillFn = fn(ProcessId, u64, i32) -> bool;
 type TimestampFn = fn() -> u64;
 /// R106-8: Callback for emitting tamper-evident audit events.
 /// Args: (pid: u32, uid: u32, nr_pages_needed: u64, rss_pages: u64, oom_score_adj: i64, timestamp: u64)
@@ -48,7 +48,6 @@ type AuditEmitFn = fn(u32, u32, u64, u64, i64, u64);
 struct Callbacks {
     snapshot: Option<SnapshotFn>,
     kill: Option<KillFn>,
-    cleanup: Option<CleanupFn>,
     timestamp: Option<TimestampFn>,
     /// R106-8: Audit callback for tamper-evident OOM event recording.
     audit_emit: Option<AuditEmitFn>,
@@ -57,13 +56,17 @@ struct Callbacks {
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
     snapshot: None,
     kill: None,
-    cleanup: None,
     timestamp: None,
     audit_emit: None,
 });
 
 /// Prevent re-entrant OOM handling
 static OOM_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Pending allocation request. The allocator publishes this while its lock may
+/// still be held; process-context OOM work consumes it only after that lock is
+/// released.
+static OOM_PENDING: AtomicUsize = AtomicUsize::new(0);
 
 /// Free pages below this percentage of total trigger the OOM path
 const LOW_WATERMARK_PCT: usize = 5;
@@ -73,16 +76,10 @@ const MIN_RECLAIM_PAGES: usize = 64;
 const OOM_EXIT_CODE: i32 = -9;
 
 /// Register callbacks from kernel_core for process enumeration and termination
-pub fn register_callbacks(
-    snapshot: SnapshotFn,
-    kill: KillFn,
-    cleanup: CleanupFn,
-    timestamp: TimestampFn,
-) {
+pub fn register_callbacks(snapshot: SnapshotFn, kill: KillFn, timestamp: TimestampFn) {
     let mut cb = CALLBACKS.lock();
     cb.snapshot = Some(snapshot);
     cb.kill = Some(kill);
-    cb.cleanup = Some(cleanup);
     cb.timestamp = Some(timestamp);
 }
 
@@ -93,9 +90,36 @@ pub fn register_audit_callback(audit_emit: AuditEmitFn) {
     cb.audit_emit = Some(audit_emit);
 }
 
-/// Entry point when the allocator cannot satisfy a request.
-/// Attempts cache reclaim, then selects and kills a victim if pressure remains.
+/// Allocation-free phase-1 entry point used by the physical allocator.
 pub fn on_allocation_failure(nr_pages_needed: usize) {
+    if nr_pages_needed == 0 {
+        return;
+    }
+
+    rearm_pending(nr_pages_needed);
+}
+
+/// Retain the largest outstanding request when failures race or a handler must
+/// defer. This is lock-free and allocation-free, so it is safe under the buddy
+/// allocator lock.
+fn rearm_pending(nr_pages_needed: usize) {
+    let mut pending = OOM_PENDING.load(Ordering::Relaxed);
+    while pending < nr_pages_needed {
+        match OOM_PENDING.compare_exchange_weak(
+            pending,
+            nr_pages_needed,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => pending = observed,
+        }
+    }
+}
+
+/// Execute pending OOM work after the allocator lock has been released.
+pub fn poll_and_handle_oom() {
+    let nr_pages_needed = OOM_PENDING.swap(0, Ordering::AcqRel);
     if nr_pages_needed == 0 {
         return;
     }
@@ -105,6 +129,7 @@ pub fn on_allocation_failure(nr_pages_needed: usize) {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
     {
+        rearm_pending(nr_pages_needed);
         return;
     }
 
@@ -124,7 +149,12 @@ pub fn on_allocation_failure(nr_pages_needed: usize) {
         nr_pages_needed
     );
 
-    kill_best_candidate(nr_pages_needed);
+    if !kill_best_candidate(nr_pages_needed) {
+        // A nonblocking process-table/PCB/mm/credential acquisition may have
+        // contended, or the generation-bound kill may have lost a race. Retry
+        // at the next allocator-failure poll instead of dropping the request.
+        rearm_pending(nr_pages_needed);
+    }
     OOM_RUNNING.store(false, Ordering::Release);
 }
 
@@ -140,77 +170,66 @@ fn still_under_pressure(nr_pages_needed: usize) -> bool {
 }
 
 /// Select and kill the best victim process
-fn kill_best_candidate(nr_pages_needed: usize) {
-    let (snapshot_cb, kill_cb, cleanup_cb, ts_cb, audit_cb) = {
+fn kill_best_candidate(nr_pages_needed: usize) -> bool {
+    let (snapshot_cb, kill_cb, ts_cb, audit_cb) = {
         let cb = CALLBACKS.lock();
-        (
-            cb.snapshot,
-            cb.kill,
-            cb.cleanup,
-            cb.timestamp,
-            cb.audit_emit,
-        )
+        (cb.snapshot, cb.kill, cb.timestamp, cb.audit_emit)
     };
 
-    let snapshot = match snapshot_cb {
+    let victim = match snapshot_cb {
         Some(f) => f(),
         None => {
             klog!(Error, "OOM: no snapshot provider registered");
-            return;
+            return false;
         }
     };
 
-    if snapshot.is_empty() {
-        klog!(Error, "OOM: no eligible processes to kill");
-        return;
-    }
+    let victim = match victim {
+        Some(victim) => victim,
+        None => {
+            klog!(
+                Warn,
+                "OOM: victim selection deferred or found no eligible process"
+            );
+            return false;
+        }
+    };
 
-    if let Some(victim) = select_victim(&snapshot) {
+    klog!(
+        Error,
+        "OOM: killing pid={} generation={} tgid={} rss={} pages nice={} adj={}",
+        victim.pid,
+        victim.generation,
+        victim.tgid,
+        victim.rss_pages,
+        victim.nice,
+        victim.oom_score_adj
+    );
+
+    let killed = match kill_cb {
+        Some(kill) => kill(victim.pid, victim.generation, OOM_EXIT_CODE),
+        None => {
+            klog!(Error, "OOM: no kill provider registered");
+            false
+        }
+    };
+    if !killed {
         klog!(
-            Error,
-            "OOM: killing pid={} tgid={} rss={} pages nice={} adj={}",
+            Warn,
+            "OOM: victim pid={} generation={} changed or was contended; deferring",
             victim.pid,
-            victim.tgid,
-            victim.rss_pages,
-            victim.nice,
-            victim.oom_score_adj
+            victim.generation
         );
-
-        if let Some(kill) = kill_cb {
-            kill(victim.pid, OOM_EXIT_CODE);
-        }
-        if let Some(cleanup) = cleanup_cb {
-            cleanup(victim.pid);
-        }
-
-        emit_audit(&victim, nr_pages_needed, ts_cb, audit_cb);
-    } else {
-        klog!(
-            Error,
-            "OOM: no eligible processes to kill (protected or kernel threads)"
-        );
-    }
-}
-
-/// Select the victim process with highest OOM score
-fn select_victim(candidates: &[OomProcessInfo]) -> Option<OomProcessInfo> {
-    let mut best: Option<OomProcessInfo> = None;
-    let mut best_score = i64::MIN;
-
-    for info in candidates.iter() {
-        let score = score_process(info);
-        if score > best_score {
-            best_score = score;
-            best = Some(info.clone());
-        }
+        return false;
     }
 
-    best
+    emit_audit(&victim, nr_pages_needed, ts_cb, audit_cb);
+    true
 }
 
 /// Calculate OOM score for a process
 /// Higher score = more likely to be killed
-fn score_process(info: &OomProcessInfo) -> i64 {
+pub fn score_process(info: &OomProcessInfo) -> i64 {
     // Immune tasks (oom_score_adj <= -1000)
     if info.oom_score_adj <= -1000 {
         return i64::MIN;
@@ -304,5 +323,57 @@ pub fn get_stats() -> OomStats {
         is_running: OOM_RUNNING.load(Ordering::Relaxed),
         low_watermark_pct: LOW_WATERMARK_PCT,
         min_reclaim_pages: MIN_RECLAIM_PAGES,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{score_process, OomProcessInfo};
+
+    fn candidate() -> OomProcessInfo {
+        OomProcessInfo {
+            pid: 2,
+            generation: 7,
+            tgid: 2,
+            uid: 1000,
+            gid: 1000,
+            rss_pages: 10,
+            nice: 0,
+            oom_score_adj: 0,
+            has_mm: true,
+            is_kernel_thread: false,
+        }
+    }
+
+    #[test]
+    fn score_rejects_protected_targets() {
+        let mut info = candidate();
+        info.pid = 1;
+        assert_eq!(score_process(&info), i64::MIN);
+
+        let mut info = candidate();
+        info.oom_score_adj = -1000;
+        assert_eq!(score_process(&info), i64::MIN);
+
+        let mut info = candidate();
+        info.is_kernel_thread = true;
+        assert_eq!(score_process(&info), i64::MIN);
+    }
+
+    #[test]
+    fn score_prefers_rss_adjustment_and_nice() {
+        let base = candidate();
+
+        let mut more_rss = base;
+        more_rss.rss_pages += 1;
+        assert!(score_process(&more_rss) > score_process(&base));
+
+        let mut adjusted = base;
+        adjusted.oom_score_adj = 100;
+        assert!(score_process(&adjusted) > score_process(&base));
+
+        let mut nicer = base;
+        nicer.nice = 1;
+        assert!(score_process(&nicer) > score_process(&base));
     }
 }

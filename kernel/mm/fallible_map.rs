@@ -77,6 +77,15 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
         self.entries.len()
     }
 
+    /// Allocated entry capacity retained by the backing vector.
+    ///
+    /// Exposing this lets bounded users verify that churn cannot accumulate
+    /// hidden high-water storage after entries are removed.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
     /// Whether the map holds no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -147,6 +156,13 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
         self.entries.try_reserve(additional)
     }
 
+    /// Reserve capacity for at least `additional` more entries using the
+    /// allocator's exact-growth request, fallibly.
+    #[inline]
+    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.entries.try_reserve_exact(additional)
+    }
+
     /// Insert `value` for `key`, fallibly.
     ///
     /// Returns `Ok(Some(old))` if `key` was already present (replaced in place —
@@ -182,6 +198,17 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
     #[inline]
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Retain only entries for which `keep` returns true.
+    ///
+    /// `Vec::retain` compacts in place and never grows the allocation, so this
+    /// is suitable for pruning stale `Weak` cache entries under memory pressure.
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.entries.retain(|(key, value)| keep(key, value));
     }
 
     /// Iterate `(&K, &V)` in ascending key order.
@@ -366,12 +393,45 @@ pub fn run_fallible_ordered_map_self_test() {
     map.try_reserve(4).expect("reserve");
     assert_eq!(map.try_insert(40, 4).expect("insert 40"), None);
 
+    // Exact reservation is observable by bounded metadata users and makes the
+    // requested insert sequence allocation-free.
+    let mut exact: FallibleOrderedMap<usize, usize> = FallibleOrderedMap::new();
+    assert_eq!(exact.capacity(), 0);
+    exact.try_reserve_exact(3).expect("reserve exact");
+    let exact_capacity = exact.capacity();
+    assert!(exact_capacity >= 3);
+    for key in 0..3 {
+        assert_eq!(exact.try_insert(key, key).expect("exact insert"), None);
+    }
+    assert_eq!(exact.capacity(), exact_capacity);
+    for key in 0..3 {
+        assert_eq!(exact.remove(&key), Some(key));
+    }
+    assert_eq!(
+        exact.capacity(),
+        exact_capacity,
+        "removal retains one bounded high-water allocation"
+    );
+
     // try_clone is independent of the source.
     let mut cloned = map.try_clone().expect("clone");
     assert_eq!(cloned.len(), map.len());
     assert_eq!(cloned.get(&20), Some(&122));
     cloned.try_insert(20, 999).expect("mutate clone");
     assert_eq!(map.get(&20), Some(&122), "clone must not alias source");
+
+    // Allocation-free retain preserves ordering and backing capacity.
+    let mut retained = map.try_clone().expect("retain fixture clone");
+    let retained_capacity = retained.capacity();
+    retained.retain(|key, _| *key != 20 && *key != 30);
+    let retained_keys: Vec<usize> = retained.keys().copied().collect();
+    assert_eq!(retained_keys, alloc::vec![10usize, 40]);
+    assert_eq!(
+        retained.capacity(),
+        retained_capacity,
+        "retain must compact without reallocating"
+    );
+    assert_eq!(map.get(&20), Some(&122), "retain fixture must not alias source");
 
     // remove returns the value and shifts the rest.
     assert_eq!(map.remove(&20), Some(122));

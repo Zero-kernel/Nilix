@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
+#![feature(allocator_api)]
 extern crate alloc;
 
 // 导入 drivers crate 的宏
@@ -25,13 +26,15 @@ pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,
     register_audit_callback as register_oom_audit_callback,
-    register_callbacks as register_oom_callbacks, OomProcessInfo, OomStats,
+    register_callbacks as register_oom_callbacks, score_process as score_oom_process,
+    OomProcessInfo, OomStats,
 };
 pub use page_cache::{
-    find_or_create_page, init as init_page_cache, read_page, reclaim_pages, sync_inode,
-    writeback_dirty_pages, writeback_page, AddressSpace, GlobalPageCache, InodeId,
-    MemoryPressureHandler, PageCacheEntry, PageCacheStats, PageIndex, PageState, WritebackStats,
-    PAGE_CACHE, PAGE_SIZE, PRESSURE_HANDLER,
+    find_or_create_page, init as init_page_cache, read_page, reclaim_pages,
+    run_page_cache_policy_self_test, writeback_dirty_pages, writeback_page, GlobalPageCache,
+    InodeId, MemoryPressureHandler, PageCacheEntry, PageCacheStats, PageCacheUnchargeFn, PageIndex,
+    PageState, WritebackStats, PAGE_CACHE, PAGE_CACHE_CGROUP_CHARGE_BYTES, PAGE_CACHE_MAX_PAGES,
+    PAGE_SIZE, PRESSURE_HANDLER,
 };
 pub use page_table::{
     map_mmio, phys_to_virt, with_current_manager, MapError, PageTableManager, UnmapError,

@@ -1,7 +1,7 @@
 use crate::buddy_allocator;
 use crate::page_table::PHYSICAL_MEMORY_OFFSET;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::{
     structures::paging::{FrameAllocator as X64FrameAllocator, PhysFrame, Size4KiB},
@@ -165,6 +165,17 @@ const FALLBACK_PHYS_MEM_START: u64 = 0x10000000;
 /// 物理内存管理大小（硬编码后备值，64MB）
 const FALLBACK_PHYS_MEM_SIZE: usize = 64 * 1024 * 1024;
 
+/// RF178-31 FIX: maximum contiguous physical window managed by the buddy
+/// allocator. COW refcounts use one fixed, page-indexed table sized from this
+/// bound, so fork never allocates metadata or retains a heap high-water mark.
+pub const MAX_MANAGED_PHYS_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_MANAGED_PHYS_PAGES: usize = MAX_MANAGED_PHYS_BYTES / 4096;
+
+/// Published after the buddy allocator has accepted its one contiguous window.
+/// Readers load the page count with Acquire before using the base.
+static MANAGED_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+static MANAGED_PHYS_PAGES: AtomicUsize = AtomicUsize::new(0);
+
 /// 页大小
 const PAGE_SIZE: u64 = 0x1000;
 /// 最小可用区域（跳过小于 2MB 的碎片区域）
@@ -276,6 +287,7 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
 
     // 初始化 Buddy 物理页分配器
     buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges);
+    publish_managed_phys_window(pmm_base, pmm_size);
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
@@ -330,6 +342,7 @@ pub fn init() {
         FALLBACK_PHYS_MEM_SIZE,
         &reserved_ranges,
     );
+    publish_managed_phys_window(FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE);
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
@@ -616,9 +629,42 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
 
     best.map(|(base, size)| {
         // 限制最大使用量，避免占用太多内存
-        let capped_size = size.min(256 * 1024 * 1024) as usize; // 最大 256MB
+        let capped_size = size.min(MAX_MANAGED_PHYS_BYTES as u64) as usize;
         (base, capped_size)
     })
+}
+
+/// Publish the exact physical-page index domain used by the buddy allocator.
+fn publish_managed_phys_window(base: u64, size: usize) {
+    assert_eq!(
+        base % PAGE_SIZE,
+        0,
+        "managed physical base must be page aligned"
+    );
+    assert_eq!(
+        size % PAGE_SIZE as usize,
+        0,
+        "managed physical size must be page aligned"
+    );
+    assert!(size > 0 && size <= MAX_MANAGED_PHYS_BYTES);
+    assert_eq!(
+        MANAGED_PHYS_PAGES.load(Ordering::Acquire),
+        0,
+        "managed physical window must be published exactly once"
+    );
+
+    MANAGED_PHYS_BASE.store(base, Ordering::Relaxed);
+    MANAGED_PHYS_PAGES.store(size / PAGE_SIZE as usize, Ordering::Release);
+}
+
+/// Return the buddy-owned physical page window after initialization.
+#[inline]
+pub fn managed_physical_page_window() -> Option<(u64, usize)> {
+    let page_count = MANAGED_PHYS_PAGES.load(Ordering::Acquire);
+    if page_count == 0 {
+        return None;
+    }
+    Some((MANAGED_PHYS_BASE.load(Ordering::Relaxed), page_count))
 }
 
 /// R167-C: Bounded accumulator for the buddy allocator's physical reservation
@@ -835,6 +881,19 @@ impl FrameAllocator {
             heap_total_bytes: HEAP_SIZE,
         }
     }
+}
+
+/// R178-11: current free bytes in the kernel heap (`linked_list_allocator`).
+///
+/// Leaf call: locks `ALLOCATOR` only to read `free()` and releases immediately —
+/// the same lock every allocation already takes (and that `get_memory_stats`
+/// above reads at line ~834), so it adds no new lock-ordering hazard. Used by
+/// the page cache to refuse a metadata allocation before it can drive the
+/// 1 MiB heap to `handle_alloc_error`. Returns TOTAL free bytes, not the
+/// largest contiguous run — a necessary-not-sufficient headroom check.
+#[inline]
+pub fn heap_free_bytes() -> usize {
+    unsafe { ALLOCATOR.lock().free() }
 }
 
 /// 实现 x86_64 FrameAllocator trait 以便与页表管理器配合使用
