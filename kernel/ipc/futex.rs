@@ -10,13 +10,15 @@
 //! 使用全局 FutexTable，以 (pid, vaddr) 为键索引等待队列。
 //! 进程退出时自动清理其所有 futex 等待队列。
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use core::mem::size_of;
+use core::ops::Bound;
 use kernel_core::process::{self, FutexKey, Priority, ProcessId};
 use kernel_core::request_resched_from_irq;
+use mm::fallible_map::FallibleOrderedMap;
 use spin::Mutex;
 
-use crate::sync::{WaitOutcome, WaitQueue};
+use crate::sync::{PrepareWait, WaitOutcome, WaitQueue};
 
 /// Futex 操作码
 pub const FUTEX_WAIT: i32 = 0;
@@ -45,17 +47,35 @@ pub enum FutexError {
     OwnerDied,
     /// R171 (F3): 等待期间检测到挂起的 kill —— 以 EINTR 中断 futex 等待。
     Interrupted,
-    /// R172-23: per-thread-group resident futex-bucket budget exhausted -> ENOMEM. Bounds the
-    /// soft-DoS from one tgid iterating distinct page-aligned uaddrs (each FUTEX_LOCK_PI it
-    /// owns / live waiter pins a bucket until thread-group exit).
+    /// Futex metadata admission/allocation failed -> ENOMEM. This includes the
+    /// heap-derived global/per-TGID bucket budget and fallible queue/PI metadata growth.
     TooManyBuckets,
 }
 
-/// R172-23: per-thread-group cap on resident futex buckets. Sized for real pthread working
-/// sets (one futex addr per mutex/condvar/once x threads -> low thousands), NOT the 32-endpoint
-/// scale — too small would turn DoS-hardening into a correctness regression. Fully reclaimed at
-/// thread-group exit; this caps the transient resident set, not a permanent leak.
-const MAX_FUTEX_BUCKETS_PER_TGID: usize = 4096;
+/// RF178-8: futex metadata may retain at most one quarter of the actual 1 MiB
+/// kernel heap. The charge covers both Arc allocations plus worst-case 2x Vec
+/// backing slack for the global FallibleOrderedMap, then doubles the whole raw
+/// layout for allocator alignment/fragmentation headroom. Birth is independently
+/// fallible, so fragmentation rejects admission rather than aborting the kernel.
+const FUTEX_HEAP_BUDGET_BYTES: usize = mm::memory::HEAP_SIZE_BYTES / 4;
+const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
+type FutexBucketRef = Arc<Mutex<FutexBucket>>;
+const FUTEX_TABLE_SLOT_BYTES: usize = size_of::<(FutexKey, FutexBucketRef)>();
+const FUTEX_BUCKET_RAW_BYTES: usize = size_of::<Mutex<FutexBucket>>()
+    + ARC_HEADER_BYTES
+    + size_of::<WaitQueue>()
+    + ARC_HEADER_BYTES
+    + 2 * FUTEX_TABLE_SLOT_BYTES;
+const FUTEX_BUCKET_CHARGE_BYTES: usize = 2 * FUTEX_BUCKET_RAW_BYTES;
+const MAX_FUTEX_BUCKETS_GLOBAL: usize = FUTEX_HEAP_BUDGET_BYTES / FUTEX_BUCKET_CHARGE_BYTES;
+/// A single TGID receives at most one quarter of the global futex budget.
+const MAX_FUTEX_BUCKETS_PER_TGID: usize = MAX_FUTEX_BUCKETS_GLOBAL / 4;
+
+const _: () = assert!(FUTEX_HEAP_BUDGET_BYTES < mm::memory::HEAP_SIZE_BYTES);
+const _: () = assert!(FUTEX_BUCKET_CHARGE_BYTES >= FUTEX_BUCKET_RAW_BYTES);
+const _: () = assert!(MAX_FUTEX_BUCKETS_PER_TGID > 0);
+const _: () =
+    assert!(MAX_FUTEX_BUCKETS_GLOBAL * FUTEX_BUCKET_CHARGE_BYTES <= FUTEX_HEAP_BUDGET_BYTES);
 
 /// 单个 futex 地址的等待状态
 struct FutexBucket {
@@ -68,7 +88,7 @@ struct FutexBucket {
     /// E.4 PI: 持有者已经死亡（robust futex 语义）
     owner_dead: bool,
     /// E.4 PI: PI 等待者列表 (pid -> priority)，用于找出最高优先级的等待者
-    pi_waiters: BTreeMap<ProcessId, Priority>,
+    pi_waiters: FallibleOrderedMap<ProcessId, Priority>,
     /// R172-07/08 FIX: tombstone published UNDER the bucket lock atomically with the
     /// bucket's removal from FUTEX_TABLE (see `cleanup_empty_bucket`). `get_or_create_bucket`
     /// drops FUTEX_TABLE before the caller publishes its first state under the bucket lock;
@@ -82,13 +102,13 @@ struct FutexBucket {
 }
 
 impl FutexBucket {
-    fn new() -> Self {
+    fn new(queue: Arc<WaitQueue>) -> Self {
         FutexBucket {
-            queue: Arc::new(WaitQueue::new()),
+            queue,
             waiter_count: 0,
             owner: None,
             owner_dead: false,
-            pi_waiters: BTreeMap::new(),
+            pi_waiters: FallibleOrderedMap::new(),
             unlinked: false,
         }
     }
@@ -118,8 +138,8 @@ lazy_static::lazy_static! {
     ///
     /// 以 (pid, vaddr) 为键，管理该地址上的等待队列。
     /// 空队列会在唤醒后被清理，避免内存泄漏。
-    static ref FUTEX_TABLE: Mutex<BTreeMap<FutexKey, Arc<Mutex<FutexBucket>>>> =
-        Mutex::new(BTreeMap::new());
+    static ref FUTEX_TABLE: Mutex<FallibleOrderedMap<FutexKey, FutexBucketRef>> =
+        Mutex::new(FallibleOrderedMap::new());
 }
 
 /// 从用户空间读取 u32 值
@@ -127,45 +147,13 @@ lazy_static::lazy_static! {
 /// 用于 futex_wait 在入队前二次检查值，防止 lost-wake 竞态
 /// R24-5 fix: 验证跨页、使用 SMAP 保护和容错 usercopy
 fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
-    use kernel_core::usercopy::copy_from_user_safe;
-    use mm::page_table::PageTableManager;
-    use x86_64::structures::paging::PageTableFlags;
-    use x86_64::VirtAddr;
+    use kernel_core::usercopy::read_user_u32_atomic;
 
-    // 验证并读取跨页安全
-    unsafe {
-        mm::page_table::with_current_manager(
-            VirtAddr::new(0),
-            |manager: &mut PageTableManager| -> Result<u32, FutexError> {
-                let end = uaddr
-                    .checked_add(core::mem::size_of::<u32>())
-                    .ok_or(FutexError::Fault)?;
-
-                // 验证起止两页（处理跨页读取）
-                for addr in [uaddr, end - 1] {
-                    let page_addr = addr & !0xfff;
-                    if let Some((_, flags)) =
-                        manager.translate_with_flags(VirtAddr::new(page_addr as u64))
-                    {
-                        if !flags.contains(PageTableFlags::PRESENT)
-                            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
-                        {
-                            return Err(FutexError::Fault);
-                        }
-                    } else {
-                        return Err(FutexError::Fault);
-                    }
-                }
-
-                // 使用 SMAP 安全的容错复制
-                // P1-6 FIX: Removed redundant outer UserAccessGuard —
-                // copy_from_user_safe creates its own guard internally.
-                let mut buf = [0u8; 4];
-                copy_from_user_safe(&mut buf, uaddr as *const u8).map_err(|_| FutexError::Fault)?;
-                Ok(u32::from_ne_bytes(buf))
-            },
-        )
-    }
+    // RF178-8: the syscall already validated the aligned u32 range. This
+    // second, exception-table-backed copy is deliberately PT_LOCK-free because
+    // the caller serializes FUTEX_WAKE with the wait-queue lock. A concurrent
+    // unmap is reported as EFAULT by the nofault helper.
+    read_user_u32_atomic(uaddr as *const u32).map_err(|_| FutexError::Fault)
 }
 
 /// FUTEX_WAIT / FUTEX_WAIT_TIMEOUT 操作
@@ -227,36 +215,35 @@ pub fn futex_wait(
 
     // 【关键修复】在入队前二次读取 futex 值，防止 lost-wake 竞态
     // 如果值已变化，说明唤醒者已经完成操作，我们不应该阻塞
-    match read_user_u32(uaddr) {
-        Ok(cur) if cur == expected => {
-            // 值仍然匹配，继续阻塞
-        }
-        Ok(_) => {
-            // 值已变化，回滚等待者计数并返回
-            let mut b = bucket.lock();
-            if b.waiter_count > 0 {
-                b.waiter_count -= 1;
+    // RF178-8 FIX: publish the complete fallible queue/timer transaction before
+    // the second futex-word read. A concurrent wake now either observes this
+    // waiter, or its preceding store is observed by the re-read below.
+    let prepared =
+        match queue.try_prepare_with_timeout_after(timeout_ns, || match read_user_u32(uaddr) {
+            Ok(cur) if cur == expected => Ok(()),
+            Ok(_) => Err(FutexError::WouldBlock),
+            Err(error) => Err(error),
+        }) {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                let mut b = bucket.lock();
+                b.waiter_count = b.waiter_count.saturating_sub(1);
+                drop(b);
+                cleanup_empty_bucket(key, &bucket);
+                return Err(error);
             }
-            drop(b);
-            cleanup_empty_bucket(key, &bucket);
-            return Err(FutexError::WouldBlock);
-        }
-        Err(e) => {
-            // 内存访问错误，回滚并返回
-            let mut b = bucket.lock();
-            if b.waiter_count > 0 {
-                b.waiter_count -= 1;
+            Err(_) => {
+                let mut b = bucket.lock();
+                b.waiter_count = b.waiter_count.saturating_sub(1);
+                drop(b);
+                cleanup_empty_bucket(key, &bucket);
+                return Err(FutexError::TooManyBuckets);
             }
-            drop(b);
-            cleanup_empty_bucket(key, &bucket);
-            return Err(e);
-        }
-    }
-
-    // R39-6 FIX: 阻塞等待（支持可选超时）
-    // WaitQueue::wait_with_timeout 会设置进程状态并触发调度
-    // 此时不持有桶锁，唤醒者可以安全地获取锁并调用 wake_n
-    let outcome = queue.wait_with_timeout(timeout_ns);
+        };
+    let outcome = match prepared {
+        PrepareWait::Armed(ticket) => queue.finish_prepared(ticket),
+        PrepareWait::Immediate(outcome) => outcome,
+    };
 
     // 被唤醒后减少等待者计数
     {
@@ -276,6 +263,7 @@ pub fn futex_wait(
         WaitOutcome::Closed | WaitOutcome::NoProcess => Err(FutexError::NoProcess),
         // R171-F3: a pending kill interrupted the futex wait (-> EINTR).
         WaitOutcome::Interrupted => Err(FutexError::Interrupted),
+        WaitOutcome::ResourceExhausted => Err(FutexError::TooManyBuckets),
     }
 }
 
@@ -418,23 +406,59 @@ pub fn futex_lock_pi(
         }
     };
 
-    // 记录阻塞的 futex key（用于链式 PI）
-    if let Some(proc) = process::get_process(pid) {
-        proc.lock().set_waiting_on_futex(Some(key));
+    // RF178-8: reserve the future owner's keyed boost slot under the target
+    // PCB lock before publishing either waiting_on_futex or PI queue state.
+    // A robust-exit/unlock handoff can therefore propagate without allocation.
+    let proc_arc = match process::get_process(pid) {
+        Some(proc) => proc,
+        None => {
+            let mut b = bucket.lock();
+            b.waiter_count = b.waiter_count.saturating_sub(1);
+            drop(b);
+            cleanup_empty_bucket(key, &bucket);
+            return Err(FutexError::NoProcess);
+        }
+    };
+    {
+        let mut proc = proc_arc.lock();
+        if proc.try_reserve_pi_boost(key).is_err() {
+            drop(proc);
+            let mut b = bucket.lock();
+            b.waiter_count = b.waiter_count.saturating_sub(1);
+            drop(b);
+            cleanup_empty_bucket(key, &bucket);
+            return Err(FutexError::TooManyBuckets);
+        }
+        proc.set_waiting_on_futex(Some(key));
     }
 
     // CRITICAL FIX: 先加入 WaitQueue，再记录 pi_waiters
     // 这避免了 unlock_pi 在 waiter 入队前就尝试 wake_specific 的 race
     let queue = { bucket.lock().queue.clone() };
-    if !queue.prepare_to_wait() {
+    let prepared = match queue.try_prepare_to_wait() {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            let mut b = bucket.lock();
+            b.waiter_count = b.waiter_count.saturating_sub(1);
+            drop(b);
+            let mut proc = proc_arc.lock();
+            proc.set_waiting_on_futex(None);
+            proc.cancel_pi_boost_reservation(&key);
+            drop(proc);
+            cleanup_empty_bucket(key, &bucket);
+            return Err(FutexError::TooManyBuckets);
+        }
+    };
+    if !prepared {
         // 入队失败（队列已关闭或无当前进程），回滚
         let mut b = bucket.lock();
-        if b.waiter_count > 0 {
-            b.waiter_count -= 1;
-        }
-        if let Some(proc) = process::get_process(pid) {
-            proc.lock().set_waiting_on_futex(None);
-        }
+        b.waiter_count = b.waiter_count.saturating_sub(1);
+        drop(b);
+        let mut proc = proc_arc.lock();
+        proc.set_waiting_on_futex(None);
+        proc.cancel_pi_boost_reservation(&key);
+        drop(proc);
+        cleanup_empty_bucket(key, &bucket);
         // M0-5 1b-1b: prepare_to_wait ALSO bails (returns false) when a pending kill or a
         // deliverable HANDLER signal raced in before the task published Blocked (the M0-5
         // 1b should_abort_pending_block re-check). Distinguish that from a genuine
@@ -448,7 +472,17 @@ pub fn futex_lock_pi(
     // 现在 waiter 已在队列中，安全地记录 pi_waiters
     {
         let mut b = bucket.lock();
-        b.pi_waiters.insert(pid, waiter_priority);
+        if b.pi_waiters.try_insert(pid, waiter_priority).is_err() {
+            b.waiter_count = b.waiter_count.saturating_sub(1);
+            drop(b);
+            queue.cancel_wait();
+            let mut proc = proc_arc.lock();
+            proc.set_waiting_on_futex(None);
+            proc.cancel_pi_boost_reservation(&key);
+            drop(proc);
+            cleanup_empty_bucket(key, &bucket);
+            return Err(FutexError::TooManyBuckets);
+        }
     }
 
     // R73-1 FIX: 窗口修复——在 pi_waiters.insert 后再次检查 owner 状态
@@ -467,10 +501,9 @@ pub fn futex_lock_pi(
             drop(b);
             // 取消排队的等待，防止永久阻塞
             queue.cancel_wait();
-            if let Some(proc) = process::get_process(pid) {
-                proc.lock().set_waiting_on_futex(None);
-            }
-            recompute_pi_state(key, &bucket);
+            proc_arc.lock().set_waiting_on_futex(None);
+            recompute_pi_state_noalloc(key, &bucket);
+            proc_arc.lock().cancel_pi_boost_reservation(&key);
             cleanup_empty_bucket(key, &bucket);
             return if owner_died {
                 Err(FutexError::OwnerDied)
@@ -481,7 +514,23 @@ pub fn futex_lock_pi(
     }
 
     // 触发 PI 传播到当前 owner
-    recompute_pi_state(key, &bucket);
+    if recompute_pi_state(key, &bucket).is_err() {
+        // The only expected allocation in propagation is the current owner's
+        // first keyed boost. Roll back every published waiter facet before
+        // returning ENOMEM, then restore the owner's remaining donation.
+        let mut b = bucket.lock();
+        b.pi_waiters.remove(&pid);
+        b.waiter_count = b.waiter_count.saturating_sub(1);
+        drop(b);
+        queue.cancel_wait();
+        let mut proc = proc_arc.lock();
+        proc.set_waiting_on_futex(None);
+        proc.cancel_pi_boost_reservation(&key);
+        drop(proc);
+        recompute_pi_state_noalloc(key, &bucket);
+        cleanup_empty_bucket(key, &bucket);
+        return Err(FutexError::TooManyBuckets);
+    }
 
     // 完成等待（实际阻塞）
     queue.finish_wait();
@@ -518,10 +567,11 @@ pub fn futex_lock_pi(
             // hazard on a Running task is closed by cancel_wait's new
             // Blocked-only state guard (sync.rs, R170-4).
             queue.cancel_wait();
-            if let Some(proc) = process::get_process(pid) {
-                proc.lock().set_waiting_on_futex(None);
-            }
-            recompute_pi_state(key, &bucket);
+            let mut proc = proc_arc.lock();
+            proc.set_waiting_on_futex(None);
+            proc.cancel_pi_boost_reservation(&key);
+            drop(proc);
+            recompute_pi_state_noalloc(key, &bucket);
             cleanup_empty_bucket(key, &bucket);
             return if owner_died {
                 Err(FutexError::OwnerDied)
@@ -543,8 +593,12 @@ pub fn futex_lock_pi(
     }
 
     // 清除等待标记
-    if let Some(proc) = process::get_process(pid) {
-        proc.lock().set_waiting_on_futex(None);
+    {
+        let mut proc = proc_arc.lock();
+        proc.set_waiting_on_futex(None);
+        if !acquired {
+            proc.cancel_pi_boost_reservation(&key);
+        }
     }
 
     // R170-4 FIX (R169-8 asymmetry): clear any stale WaitQueue entry on EVERY
@@ -560,7 +614,10 @@ pub fn futex_lock_pi(
     queue.cancel_wait();
 
     // 等待者离开后重新计算 PI
-    recompute_pi_state(key, &bucket);
+    recompute_pi_state_noalloc(key, &bucket);
+    if acquired {
+        proc_arc.lock().cancel_pi_boost_reservation(&key);
+    }
     cleanup_empty_bucket(key, &bucket);
 
     // R169-8 FIX (fail-closed-on-non-grant, INV-FUTEX-PI): report success ONLY
@@ -631,15 +688,26 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
             return Err(FutexError::InvalidOperation);
         }
 
-        // R162-8-2 FIX: Filter out zombie/terminated waiters (not just reaped).
-        b.pi_waiters
-            .retain(|waiter, _| match process::get_process(*waiter) {
-                None => false,
-                Some(proc_arc) => !matches!(
-                    proc_arc.lock().state,
-                    process::ProcessState::Zombie | process::ProcessState::Terminated
-                ),
+        // R162-8-2 / RF178-8: prune in place without BTreeMap::retain or a
+        // scratch collection. Removal from FallibleOrderedMap never allocates.
+        loop {
+            let dead = b.pi_waiters.iter().find_map(|(waiter, _)| {
+                let is_dead = match process::get_process(*waiter) {
+                    None => true,
+                    Some(proc_arc) => matches!(
+                        proc_arc.lock().state,
+                        process::ProcessState::Zombie | process::ProcessState::Terminated
+                    ),
+                };
+                is_dead.then_some(*waiter)
             });
+            match dead {
+                Some(waiter) => {
+                    b.pi_waiters.remove(&waiter);
+                }
+                None => break,
+            }
+        }
 
         let queue = b.queue.clone();
         let next = select_highest_waiter(&b.pi_waiters);
@@ -660,7 +728,7 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
 
     // 当前持有者清除自己的 PI 提升
     if let Some(proc) = process::get_process(pid) {
-        let changed = proc.lock().clear_pi_boost(&key);
+        let changed = proc.lock().try_update_pi_boost(key, None).unwrap_or(false);
         if changed {
             request_resched_from_irq();
         }
@@ -668,15 +736,19 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
 
     if let Some(new_owner) = next_owner {
         // 传递剩余等待者的捐赠到新的 owner，并链式传播
-        {
-            let mut visited = BTreeSet::new();
-            visited.insert(key);
-            apply_pi_and_propagate(key, new_owner, remaining_boost, &mut visited);
+        if apply_pi_and_propagate(key, new_owner, remaining_boost).is_err() {
+            kprintln!(
+                "[FUTEX] RF178-8: successor {} lacked reserved PI slot for {:?}",
+                new_owner,
+                key
+            );
         }
 
         // 清理等待标记并唤醒新的 owner
         if let Some(proc) = process::get_process(new_owner) {
-            proc.lock().set_waiting_on_futex(None);
+            let mut proc = proc.lock();
+            proc.set_waiting_on_futex(None);
+            proc.cancel_pi_boost_reservation(&key);
         }
         queue.wake_specific(new_owner);
     } else {
@@ -713,6 +785,39 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
 /// 4. The real waiters would never be woken, causing deadlock
 ///
 /// Now we clean up waiter entries first, before handling owner cleanup.
+fn next_tgid_bucket(
+    tgid: ProcessId,
+    after: Option<FutexKey>,
+) -> Option<(FutexKey, FutexBucketRef)> {
+    let table = FUTEX_TABLE.lock();
+    let lower = match after {
+        Some(key) => Bound::Excluded(key),
+        None => Bound::Included((tgid, 0)),
+    };
+    let next = table
+        .range((lower, Bound::Included((tgid, usize::MAX))))
+        .next()
+        .map(|(key, bucket)| (*key, bucket.clone()));
+    next
+}
+
+/// RF178-8: unlink one TGID bucket without a key snapshot Vec. The tombstone
+/// and removal remain atomic under the established table->bucket lock order.
+fn unlink_first_tgid_bucket(tgid: ProcessId) -> Option<Arc<WaitQueue>> {
+    let mut table = FUTEX_TABLE.lock();
+    let (key, bucket) = table
+        .range((tgid, 0)..=(tgid, usize::MAX))
+        .next()
+        .map(|(key, bucket)| (*key, bucket.clone()))?;
+    let queue = {
+        let mut b = bucket.lock();
+        b.unlinked = true;
+        b.queue.clone()
+    };
+    table.remove(&key);
+    Some(queue)
+}
+
 pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
     // R37-2 FIX (Codex review): Use TGID provided by caller, not from process lock.
     // Check thread group size without locking the current process.
@@ -721,15 +826,9 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
     // R72-1 FIX: Clean up this PID from ALL waiter lists (even if not owner).
     // This prevents stale PID references from poisoning futex state after PID reuse.
     {
-        let table = FUTEX_TABLE.lock();
-        let buckets: alloc::vec::Vec<(FutexKey, Arc<Mutex<FutexBucket>>)> = table
-            .iter()
-            .filter(|(k, _)| k.0 == tgid)
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-        drop(table);
-
-        for (key, bucket) in buckets {
+        let mut after = None;
+        while let Some((key, bucket)) = next_tgid_bucket(tgid, after) {
+            after = Some(key);
             let mut needs_pi_recompute = false;
             let (queue, removed_from_pi) = {
                 let mut b = bucket.lock();
@@ -767,7 +866,7 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
             // Recompute PI state if we removed a PI waiter
             // This ensures the owner's priority boost is correctly updated
             if needs_pi_recompute {
-                recompute_pi_state(key, &bucket);
+                recompute_pi_state_noalloc(key, &bucket);
             }
 
             // Try to clean up empty bucket
@@ -777,15 +876,9 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
 
     // E.4 PI: 先标记由退出线程持有的 futex（robust 语义）
     {
-        let table = FUTEX_TABLE.lock();
-        let owned: alloc::vec::Vec<(FutexKey, Arc<Mutex<FutexBucket>>)> = table
-            .iter()
-            .filter(|(k, _)| k.0 == tgid)
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-        drop(table);
-
-        for (key, bucket) in owned {
+        let mut after = None;
+        while let Some((key, bucket)) = next_tgid_bucket(tgid, after) {
+            after = Some(key);
             let (queue, next_owner) = {
                 let mut b = bucket.lock();
                 if b.owner != Some(pid) {
@@ -822,30 +915,27 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
             }
 
             // 重新计算 PI（owner 已变更）
-            recompute_pi_state(key, &bucket);
+            recompute_pi_state_noalloc(key, &bucket);
+            if let Some(new_owner) = next_owner {
+                if let Some(proc) = process::get_process(new_owner) {
+                    proc.lock().cancel_pi_boost_reservation(&key);
+                }
+            }
         }
     }
 
-    // 如果线程组还有其他活跃线程，只做 owner_dead 标记，不移除桶
-    if group_size > 1 {
+    // R178-19 FIX: Preserve buckets when group_size > 0 (not > 1).
+    // group_size is the count EXCLUDING the exiting thread (process::thread_group_size
+    // already decremented by terminate_process). So group_size == 1 means exactly one
+    // OTHER thread remains alive; group_size == 0 means this is the LAST thread.
+    // Only remove buckets when group_size == 0 (last thread exiting).
+    if group_size > 0 {
         return;
     }
 
-    let mut table = FUTEX_TABLE.lock();
-
-    // 收集要移除的键 (使用 TGID 而非 PID)
-    let keys_to_remove: alloc::vec::Vec<FutexKey> =
-        table.keys().filter(|(p, _)| *p == tgid).cloned().collect();
-
-    // 唤醒所有等待者并移除条目
-    for key in keys_to_remove {
-        if let Some(bucket) = table.remove(&key) {
-            let queue = {
-                let b = bucket.lock();
-                b.queue.clone()
-            };
-            queue.wake_all();
-        }
+    // RF178-8: stream removals; exit never allocates a key/bucket snapshot.
+    while let Some(queue) = unlink_first_tgid_bucket(tgid) {
+        queue.wake_all();
     }
 }
 
@@ -856,19 +946,26 @@ fn get_or_create_bucket(key: FutexKey) -> Result<Arc<Mutex<FutexBucket>>, FutexE
     if let Some(b) = table.get(&key) {
         return Ok(b.clone());
     }
-    // R172-23: enforce the per-tgid cap on the CREATE path, counted from the table itself via
-    // the contiguous (tgid, *) key range (ProcessId is the high-order field). Deriving the
-    // count (not storing it) keeps it definitionally in sync with EVERY reclaim path
-    // (cleanup_empty_bucket / cleanup_process_futexes) — no counter to desync/leak (avoids the
-    // FA-04 trap). count<->insert is atomic under this one FUTEX_TABLE lock (no TOCTOU). The
-    // reject path allocates nothing (split entry() into get-then-insert).
+    // RF178-8: derive both counts from the authoritative table while holding its
+    // lock, so admission and publication are atomic and no counter can desync.
+    // The global cap is the heap-derived byte budget; the per-TGID cap prevents
+    // one group from monopolizing it.
     let tgid = key.0;
     let live = table.range((tgid, 0)..=(tgid, usize::MAX)).count();
-    if live >= MAX_FUTEX_BUCKETS_PER_TGID {
+    if table.len() >= MAX_FUTEX_BUCKETS_GLOBAL || live >= MAX_FUTEX_BUCKETS_PER_TGID {
         return Err(FutexError::TooManyBuckets);
     }
-    let bucket = Arc::new(Mutex::new(FutexBucket::new()));
-    table.insert(key, bucket.clone());
+
+    // Every nested birth is truly fallible. Unlike the rejected scratch probe,
+    // these are the allocations that become the live objects. The table insert
+    // uses its own fallible Vec reservation while this lock prevents any peer
+    // from consuming the capacity between reserve and publication.
+    let queue = Arc::try_new(WaitQueue::new()).map_err(|_| FutexError::TooManyBuckets)?;
+    let bucket = Arc::try_new(Mutex::new(FutexBucket::new(queue)))
+        .map_err(|_| FutexError::TooManyBuckets)?;
+    table
+        .try_insert(key, bucket.clone())
+        .map_err(|_| FutexError::TooManyBuckets)?;
     Ok(bucket)
 }
 
@@ -918,7 +1015,9 @@ pub type FutexTable = ();
 // ============================================================================
 
 /// E.4 PI: 选择最高优先级（数值最小）的等待者
-fn select_highest_waiter(waiters: &BTreeMap<ProcessId, Priority>) -> Option<(ProcessId, Priority)> {
+fn select_highest_waiter(
+    waiters: &FallibleOrderedMap<ProcessId, Priority>,
+) -> Option<(ProcessId, Priority)> {
     waiters
         .iter()
         .min_by_key(|(_, prio)| *prio)
@@ -941,36 +1040,23 @@ const MAX_PI_CHAIN_DEPTH: usize = 64;
 ///
 /// 支持链式优先级继承：如果 owner 也在等待其他 futex，则继续向上传播
 ///
-/// # R72-2 FIX: Iterative Implementation
-///
-/// This function now uses an iterative approach with a work stack instead of
-/// recursive calls to prevent stack overflow when traversing long PI chains.
-/// A malicious user could construct a chain of N processes where each waits
-/// on the next's futex (A → B → C → ... → N). With recursive propagation,
-/// unlock_pi() would cause O(N) stack frames, overflowing the 16KB kernel
-/// stack for N > ~100. The iterative version uses O(1) stack space.
-///
-/// Additionally, a depth limit of MAX_PI_CHAIN_DEPTH prevents unbounded
-/// traversal even with a Vec work stack, limiting worst-case to O(MAX_PI_CHAIN_DEPTH).
+/// RF178-8: the PI graph has out-degree at most one (`waiting_on_futex`), so a
+/// cursor plus a fixed visited array is sufficient. This path is used during
+/// process exit; it must not allocate a Vec/BTreeSet or grow a boost map.
 fn apply_pi_and_propagate(
     key: FutexKey,
     owner: ProcessId,
     donated: Option<Priority>,
-    visited: &mut BTreeSet<FutexKey>,
-) {
-    // R72-2 FIX: Use work stack instead of recursion
-    // Stack entry: (futex_key, owner_pid, donated_priority)
-    let mut work_stack: alloc::vec::Vec<(FutexKey, ProcessId, Option<Priority>)> =
-        alloc::vec::Vec::with_capacity(8);
-    work_stack.push((key, owner, donated));
+) -> Result<(), FutexError> {
+    let mut visited = [(0, 0); MAX_PI_CHAIN_DEPTH];
+    let mut visited_len = 0usize;
+    let mut current = Some((key, owner, donated));
 
-    let mut depth = 0;
-
-    while let Some((cur_key, cur_owner, donation)) = work_stack.pop() {
-        // R72-2 FIX: Depth limit to prevent unbounded traversal
-        depth += 1;
-        if depth > MAX_PI_CHAIN_DEPTH {
-            // Log warning but don't panic - gracefully stop propagation
+    while let Some((cur_key, cur_owner, donation)) = current.take() {
+        if visited[..visited_len].contains(&cur_key) {
+            break;
+        }
+        if visited_len == MAX_PI_CHAIN_DEPTH {
             kprintln!(
                 "[FUTEX] PI chain depth exceeded {} at key {:?}, truncating",
                 MAX_PI_CHAIN_DEPTH,
@@ -978,44 +1064,41 @@ fn apply_pi_and_propagate(
             );
             break;
         }
+        visited[visited_len] = cur_key;
+        visited_len += 1;
 
-        if let Some(proc) = process::get_process(cur_owner) {
-            let (changed, next_wait, effective_prio) = {
-                let mut p = proc.lock();
-                let changed = match donation {
-                    Some(prio) => p.apply_pi_boost(cur_key, prio),
-                    None => p.clear_pi_boost(&cur_key),
-                };
-                let next = p.get_waiting_on_futex();
-                let eff = p.dynamic_priority;
-                (changed, next, eff)
-            };
+        let proc = match process::get_process(cur_owner) {
+            Some(proc) => proc,
+            None => break,
+        };
+        let (changed, next_wait, effective_prio) = {
+            let mut p = proc.lock();
+            let changed = p
+                .try_update_pi_boost(cur_key, donation)
+                .map_err(|_| FutexError::TooManyBuckets)?;
+            let next = p.get_waiting_on_futex();
+            let eff = p.dynamic_priority;
+            (changed, next, eff)
+        };
 
-            if changed {
-                // 通知调度器重新评估优先级
-                request_resched_from_irq();
-            }
-
-            // 链式传播（如果 owner 也在等待其他 futex）
-            if let Some(next_key) = next_wait {
-                if visited.insert(next_key) {
-                    // Look up next owner and push to work stack
-                    let next_owner = {
-                        let table = FUTEX_TABLE.lock();
-                        table.get(&next_key).and_then(|b| b.lock().owner)
-                    };
-
-                    if let Some(next_owner_pid) = next_owner {
-                        work_stack.push((next_key, next_owner_pid, Some(effective_prio)));
-                    }
-                }
-            }
+        if changed {
+            request_resched_from_irq();
         }
+
+        current = next_wait.and_then(|next_key| {
+            let table = FUTEX_TABLE.lock();
+            table
+                .get(&next_key)
+                .and_then(|bucket| bucket.lock().owner)
+                .map(|next_owner| (next_key, next_owner, Some(effective_prio)))
+        });
     }
+
+    Ok(())
 }
 
 /// E.4 PI: 根据当前等待者重新计算 owner 的 PI，并处理链式传播/清除
-fn recompute_pi_state(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
+fn recompute_pi_state(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) -> Result<(), FutexError> {
     let (owner, donation) = {
         let mut b = bucket.lock();
         // R162-8-1 FIX: Detect zombie/terminated owners (same pattern as R161-13).
@@ -1039,8 +1122,20 @@ fn recompute_pi_state(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
     };
 
     if let Some(owner_pid) = owner {
-        let mut visited = BTreeSet::new();
-        visited.insert(key);
-        apply_pi_and_propagate(key, owner_pid, donation, &mut visited);
+        apply_pi_and_propagate(key, owner_pid, donation)?;
+    }
+    Ok(())
+}
+
+/// Propagation sites after waiter admission are allocation-free by invariant:
+/// an existing owner already has the keyed boost entry, while a successor owns
+/// a PCB reservation made before it entered the PI queue. Never convert an
+/// invariant violation into a false lock failure after ownership moved.
+fn recompute_pi_state_noalloc(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
+    if recompute_pi_state(key, bucket).is_err() {
+        kprintln!(
+            "[FUTEX] RF178-8: missing reserved PI boost slot for key {:?}",
+            key
+        );
     }
 }

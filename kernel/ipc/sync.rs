@@ -30,6 +30,22 @@ pub enum WaitOutcome {
     NoProcess,
     /// R171 (F3): 等待期间检测到挂起的 kill —— 以 EINTR 中断阻塞，而非重新挂起。
     Interrupted,
+    /// RF178-8: waiter or timer metadata admission failed without publishing
+    /// a partial wait transaction.
+    ResourceExhausted,
+}
+
+/// RF178-8: linear token for one fully published queue/timer wait. The exact
+/// generation and sequence make finish/cancel unable to consume a newer wait.
+pub(crate) struct WaitTicket {
+    pid: ProcessId,
+    generation: u64,
+    wait_seq: Option<u64>,
+}
+
+pub(crate) enum PrepareWait {
+    Immediate(WaitOutcome),
+    Armed(WaitTicket),
 }
 
 /// R39-6 FIX: 定时等待者记录
@@ -164,8 +180,12 @@ impl WaitQueue {
         // untimed wait registers no timer and needs no token — this gating is what
         // keeps a `wait(None)` from ever stranding a nonzero `active_wait_seq`).
         let wait_seq = deadline_tick.map(|_| process::alloc_wait_seq());
+        if wait_seq.is_some() && !WAITQUEUE_TIMER_INIT.load(Ordering::Acquire) {
+            return WaitOutcome::ResourceExhausted;
+        }
 
         let mut enqueued = false;
+        let mut admission_failed = false;
 
         // 在关中断状态下操作，防止竞态条件
         interrupts::without_interrupts(|| {
@@ -197,6 +217,10 @@ impl WaitQueue {
                     }
                 }
                 if !refreshed {
+                    if waiters.try_reserve(1).is_err() {
+                        admission_failed = true;
+                        return;
+                    }
                     waiters.push_back((pid, my_gen));
                 }
             }
@@ -238,7 +262,7 @@ impl WaitQueue {
                 // (the epilogue clears it). (For a TIMED wait the window is also timeout-
                 // backstopped; this closes the untimed/infinite case too.)
                 if !kernel_core::signal::should_abort_pending_block(&proc) {
-                    proc.state = ProcessState::Blocked;
+                    proc.enter_blocked_at(kernel_core::get_ticks());
                 }
             }
 
@@ -246,6 +270,9 @@ impl WaitQueue {
         });
 
         // X-6: 如果未能入队（队列已关闭），直接返回
+        if admission_failed {
+            return WaitOutcome::ResourceExhausted;
+        }
         if !enqueued {
             return WaitOutcome::Closed;
         }
@@ -253,22 +280,31 @@ impl WaitQueue {
         // R158-1 FIX: register under IRQ-disable to prevent deadlock with
         // process_waitqueue_timeouts() acquiring TIMED_WAITERS from timer IRQ.
         if let (Some(deadline), Some(seq)) = (deadline_tick, wait_seq) {
-            ensure_waitqueue_timer_registered();
-            interrupts::without_interrupts(|| {
+            let registered = interrupts::without_interrupts(|| {
                 // M1-02: the timer is keyed by the globally-unique `seq` (no queue
                 // pointer); `my_gen` is carried for the epilogue's exact-gen marker
                 // consume.
-                register_timed_wait(seq, pid, deadline, my_gen);
+                try_register_timed_wait(seq, pid, deadline, my_gen)
             });
+            if registered.is_err() {
+                self.cancel_wait();
+                if let Some(proc_arc) = process::get_process(pid) {
+                    let proc = proc_arc.lock();
+                    if proc.active_wait_seq.load(Ordering::Relaxed) == seq {
+                        proc.active_wait_seq.store(0, Ordering::Relaxed);
+                    }
+                }
+                return WaitOutcome::ResourceExhausted;
+            }
         }
 
         // 触发调度，让出CPU
         kernel_core::force_reschedule();
 
         // R158-1 FIX: cancel under IRQ-disable (same lock ordering as register).
-        if wait_seq.is_some() {
+        if let Some(seq) = wait_seq {
             interrupts::without_interrupts(|| {
-                cancel_timed_wait(pid);
+                cancel_timed_wait_exact(pid, seq);
             });
             // M1-02: clear the per-PCB wait token in this ONE common epilogue — it
             // runs BEFORE the abort/timeout/woken branches below, so NO resume path
@@ -320,6 +356,169 @@ impl WaitQueue {
             // idempotent no-op if a concurrent wake already popped us.
             interrupts::without_interrupts(|| {
                 self.waiters.lock().retain(|&(p, _)| p != pid);
+            });
+            WaitOutcome::TimedOut
+        } else {
+            WaitOutcome::Woken
+        }
+    }
+
+    /// RF178-8: fallibly publish a complete queue/timer transaction without
+    /// yielding. Callers may re-check their condition after publication, then
+    /// either finish the wait or cancel this exact ticket.
+    pub(crate) fn try_prepare_with_timeout_after<F, E>(
+        &self,
+        timeout_ns: Option<u64>,
+        check: F,
+    ) -> Result<Result<PrepareWait, E>, alloc::collections::TryReserveError>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let pid = match process::current_pid() {
+            Some(pid) => pid,
+            None => return Ok(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess))),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::Closed)));
+        }
+        if matches!(timeout_ns, Some(0)) {
+            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::TimedOut)));
+        }
+
+        let deadline_tick = timeout_ns.map(|ns| {
+            let ticks = ns.checked_add(NS_PER_MS - 1).unwrap_or(u64::MAX) / NS_PER_MS;
+            kernel_core::get_ticks().saturating_add(ticks.max(1))
+        });
+        let wait_seq = deadline_tick.map(|_| process::alloc_wait_seq());
+        if wait_seq.is_some() && !WAITQUEUE_TIMER_INIT.load(Ordering::Acquire) {
+            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::ResourceExhausted)));
+        }
+        let process = match process::get_process(pid) {
+            Some(process) => process,
+            None => return Ok(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess))),
+        };
+        let generation = self.wait_generation.fetch_add(1, Ordering::Relaxed);
+
+        interrupts::without_interrupts(|| {
+            if self.closed.load(Ordering::Relaxed) {
+                return Ok(Ok(PrepareWait::Immediate(WaitOutcome::Closed)));
+            }
+
+            let mut queue = self.waiters.lock();
+            let queue_pos = queue.iter().position(|&(queued_pid, _)| queued_pid == pid);
+            if queue_pos.is_none() {
+                queue.try_reserve(1)?;
+            }
+
+            if let (Some(deadline_tick), Some(seq)) = (deadline_tick, wait_seq) {
+                // RF178-8: normal wakers are serialized by `queue`. Revalidate
+                // before taking TIMED_WAITERS: `check` may acquire the page-table
+                // lock, while a CPU holding that lock can take a timer IRQ that
+                // needs TIMED_WAITERS. Holding the timer registry here would form
+                // TIMED_WAITERS -> PT_LOCK -> timer IRQ -> TIMED_WAITERS.
+                if let Err(error) = check() {
+                    return Ok(Err(error));
+                }
+
+                // LOAD-BEARING order: WaitQueue -> timer registry -> PCB. Timer
+                // capacity is still reserved before any queue/PCB/timer logical
+                // publication, and `queue` continues to exclude normal wakers
+                // between the successful recheck and the complete publication.
+                let mut timers = TIMED_WAITERS.lock();
+                let timer_pos = timers.iter().position(|timer| timer.pid == pid);
+                if timer_pos.is_none() {
+                    timers.try_reserve(1)?;
+                }
+
+                let mut proc = process.lock();
+                if kernel_core::signal::should_abort_pending_block(&proc) {
+                    return Ok(Ok(PrepareWait::Immediate(WaitOutcome::Interrupted)));
+                }
+                if let Some(pos) = queue_pos {
+                    queue[pos].1 = generation;
+                } else {
+                    queue.push_back((pid, generation));
+                }
+                proc.wq_timeout_marker.store(0, Ordering::Relaxed);
+                proc.active_wait_seq.store(seq, Ordering::Relaxed);
+                proc.enter_blocked_at(kernel_core::get_ticks());
+
+                let timer = TimedWaiter {
+                    pid,
+                    deadline_tick,
+                    seq,
+                    generation,
+                };
+                if let Some(pos) = timer_pos {
+                    timers[pos] = timer;
+                } else {
+                    timers.push(timer);
+                }
+                Ok(Ok(PrepareWait::Armed(WaitTicket {
+                    pid,
+                    generation,
+                    wait_seq: Some(seq),
+                })))
+            } else {
+                if let Err(error) = check() {
+                    return Ok(Err(error));
+                }
+                let mut proc = process.lock();
+                if kernel_core::signal::should_abort_pending_block(&proc) {
+                    return Ok(Ok(PrepareWait::Immediate(WaitOutcome::Interrupted)));
+                }
+                if let Some(pos) = queue_pos {
+                    queue[pos].1 = generation;
+                } else {
+                    queue.push_back((pid, generation));
+                }
+                proc.wq_timeout_marker.store(0, Ordering::Relaxed);
+                proc.enter_blocked_at(kernel_core::get_ticks());
+                Ok(Ok(PrepareWait::Armed(WaitTicket {
+                    pid,
+                    generation,
+                    wait_seq: None,
+                })))
+            }
+        })
+    }
+
+    fn remove_waiter_exact(&self, pid: ProcessId, generation: u64) {
+        self.waiters
+            .lock()
+            .retain(|&(queued_pid, queued_gen)| queued_pid != pid || queued_gen != generation);
+    }
+
+    fn disarm_ticket_timer(&self, ticket: &WaitTicket) {
+        if let Some(seq) = ticket.wait_seq {
+            interrupts::without_interrupts(|| {
+                cancel_timed_wait_exact(ticket.pid, seq);
+            });
+            if let Some(process) = process::get_process(ticket.pid) {
+                let proc = process.lock();
+                if proc.active_wait_seq.load(Ordering::Relaxed) == seq {
+                    proc.active_wait_seq.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish_prepared(&self, ticket: WaitTicket) -> WaitOutcome {
+        kernel_core::force_reschedule();
+        self.disarm_ticket_timer(&ticket);
+
+        if process::wait_should_abort(ticket.pid)
+            || kernel_core::signal::has_deliverable_signal(ticket.pid)
+        {
+            interrupts::without_interrupts(|| {
+                self.remove_waiter_exact(ticket.pid, ticket.generation);
+            });
+            self.consume_timeout_flag(ticket.pid, ticket.generation);
+            return WaitOutcome::Interrupted;
+        }
+        if self.consume_timeout_flag(ticket.pid, ticket.generation) {
+            interrupts::without_interrupts(|| {
+                self.remove_waiter_exact(ticket.pid, ticket.generation);
             });
             WaitOutcome::TimedOut
         } else {
@@ -383,7 +582,7 @@ impl WaitQueue {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(kernel_core::get_ticks());
                         return Some(pid);
                     }
                 }
@@ -410,7 +609,7 @@ impl WaitQueue {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(kernel_core::get_ticks());
                     }
                 }
             }
@@ -447,7 +646,7 @@ impl WaitQueue {
                     if let Some(proc_arc) = process::get_process(pid) {
                         let mut proc = proc_arc.lock();
                         if proc.state == ProcessState::Blocked {
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(kernel_core::get_ticks());
                             woken += 1;
                         }
                     }
@@ -482,7 +681,7 @@ impl WaitQueue {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(kernel_core::get_ticks());
                     }
                 }
                 true
@@ -512,20 +711,30 @@ impl WaitQueue {
     ///
     /// 如果成功加入队列返回 true，如果无当前进程或队列已关闭返回 false
     pub fn prepare_to_wait(&self) -> bool {
+        // Legacy callers have no ENOMEM channel. Fail closed rather than let
+        // VecDeque::push_back invoke the global OOM handler.
+        self.try_prepare_to_wait().unwrap_or(false)
+    }
+
+    /// RF178-8: fallible form of `prepare_to_wait`.
+    ///
+    /// Reservation and enqueue share the waiters lock, so capacity cannot be
+    /// consumed by another producer between `try_reserve` and `push_back`.
+    pub fn try_prepare_to_wait(&self) -> Result<bool, alloc::collections::TryReserveError> {
         let pid = match process::current_pid() {
             Some(p) => p,
-            None => return false,
+            None => return Ok(false),
         };
 
         // 如果已关闭则不阻塞
         if self.closed.load(Ordering::Acquire) {
-            return false;
+            return Ok(false);
         }
 
         interrupts::without_interrupts(|| {
             // 再次检查未关闭
             if self.closed.load(Ordering::Relaxed) {
-                return false;
+                return Ok(false);
             }
 
             // R171-F2 FIX: a pending kill must NOT enqueue / re-block — bail like
@@ -533,7 +742,7 @@ impl WaitQueue {
             // EINTR (e.g. a pipe read/write loop re-checks wait_should_abort at
             // its top; without this gate the task would re-block under the kill).
             if process::wait_should_abort(pid) {
-                return false;
+                return Ok(false);
             }
 
             // M0-5 sub-slice 1b: the symmetric bail for a deliverable HANDLER signal — do
@@ -542,7 +751,7 @@ impl WaitQueue {
             // (kill-first); never consumes pending_kill. This is the CENTRAL condvar-family
             // gate that makes a signal-Ready'd task bail the re-enqueue.
             if kernel_core::signal::has_deliverable_signal(pid) {
-                return false;
+                return Ok(false);
             }
 
             // R152-8 FIX: Check for duplicate enqueue before pushing.
@@ -569,13 +778,13 @@ impl WaitQueue {
                     if kernel_core::signal::should_abort_pending_block(&proc) {
                         drop(proc);
                         waiters.retain(|&(p, _)| p != pid);
-                        return false;
+                        return Ok(false);
                     }
                     if proc.state != ProcessState::Blocked {
-                        proc.state = ProcessState::Blocked;
+                        proc.enter_blocked_at(kernel_core::get_ticks());
                     }
                 }
-                return true; // Already enqueued — no duplicate
+                return Ok(true); // Already enqueued — no duplicate
             }
 
             // 将当前进程加入等待队列
@@ -583,6 +792,9 @@ impl WaitQueue {
             // timer, so its generation only needs to be unique; snapshot one so
             // the entry shape matches the timed path and wake/cancel stay uniform.
             let gen = self.wait_generation.fetch_add(1, Ordering::Relaxed);
+            // RF178-8: a real reservation held through publication. On success
+            // push_back cannot allocate; on failure the queue is unchanged.
+            waiters.try_reserve(1)?;
             waiters.push_back((pid, gen));
 
             // 将进程状态设为阻塞
@@ -597,12 +809,12 @@ impl WaitQueue {
                 // returns EINTR (signals have no kill-cascade backstop to recover a strand).
                 if kernel_core::signal::should_abort_pending_block(&proc) {
                     waiters.retain(|&(p, _)| p != pid);
-                    return false;
+                    return Ok(false);
                 }
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(kernel_core::get_ticks());
             }
 
-            true
+            Ok(true)
         })
     }
 
@@ -636,8 +848,6 @@ impl WaitQueue {
             if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 waiters.remove(pos);
                 // R39-6 FIX: 取消定时等待
-                cancel_timed_wait(pid);
-
                 // 恢复进程状态为就绪
                 //
                 // R170-4 FIX: restore Ready ONLY when the state is still the
@@ -656,7 +866,7 @@ impl WaitQueue {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(kernel_core::get_ticks());
                     }
                 }
 
@@ -1018,24 +1228,34 @@ fn ensure_waitqueue_timer_registered() {
 /// therefore exact. A future SECOND timed-wait producer for an already-timed-waiting
 /// PID would need a richer key here (it would otherwise silently drop one timer — a
 /// missed timeout, NOT a UAF).
-fn register_timed_wait(seq: u64, pid: ProcessId, deadline_tick: u64, generation: u64) {
-    // R154-10 / R165-4: REPLACE any pre-existing entry for this PID so this wait's
-    // seq + generation are authoritative (a spurious reschedule or re-entrant wait
-    // can re-register before the prior entry is cleared).
+fn try_register_timed_wait(
+    seq: u64,
+    pid: ProcessId,
+    deadline_tick: u64,
+    generation: u64,
+) -> Result<(), alloc::collections::TryReserveError> {
+    // RF178-8: overwrite in place, or reserve while holding the registry lock
+    // before publishing a new timer. No push below can invoke the OOM handler.
     let mut waiters = TIMED_WAITERS.lock();
-    waiters.retain(|w| w.pid != pid);
-    waiters.push(TimedWaiter {
+    let timer = TimedWaiter {
         pid,
         deadline_tick,
         seq,
         generation,
-    });
+    };
+    if let Some(pos) = waiters.iter().position(|waiter| waiter.pid == pid) {
+        waiters[pos] = timer;
+    } else {
+        waiters.try_reserve(1)?;
+        waiters.push(timer);
+    }
+    Ok(())
 }
 
 /// 取消定时等待 (M1-02: keyed by `pid`, one in-flight timed wait per PCB)
-fn cancel_timed_wait(pid: ProcessId) {
+fn cancel_timed_wait_exact(pid: ProcessId, seq: u64) {
     let mut waits = TIMED_WAITERS.lock();
-    waits.retain(|w| w.pid != pid);
+    waits.retain(|w| w.pid != pid || w.seq != seq);
 }
 
 /// Maximum number of timeouts to process per tick (prevents allocation in IRQ context)

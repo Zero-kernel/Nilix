@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
+#![feature(allocator_api)]
 extern crate alloc;
 
 use alloc::boxed::Box;

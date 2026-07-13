@@ -23,6 +23,12 @@ pub const DEFAULT_PIPE_CAPACITY: usize = 4096;
 /// 最大管道缓冲区大小（1MB），防止无界内核内存分配
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 
+/// R178-22 FIX: POSIX PIPE_BUF atomicity threshold
+///
+/// POSIX requires writes ≤PIPE_BUF to be atomic across concurrent writers.
+/// This must not exceed the minimum guaranteed pipe capacity.
+pub const PIPE_BUF: usize = 4096;
+
 /// 管道错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipeError {
@@ -285,6 +291,20 @@ impl Pipe {
     ///
     /// 使用 prepare_to_wait/finish_wait 模式防止丢失唤醒。
     pub fn write(&self, src: &[u8], flags: PipeFlags) -> Result<usize, PipeError> {
+        if src.is_empty() {
+            return Ok(0);
+        }
+
+        // R178-22 FIX: POSIX atomicity for writes ≤PIPE_BUF
+        //
+        // POSIX requires writes ≤PIPE_BUF to be atomic: either the entire write
+        // succeeds, or none of it does. For writes >PIPE_BUF, partial writes are
+        // allowed (the original loop behavior).
+        if src.len() <= PIPE_BUF {
+            return self.write_atomic(src, flags);
+        }
+
+        // Large writes (>PIPE_BUF): allow partial writes
         let mut total_written = 0;
 
         while total_written < src.len() {
@@ -364,6 +384,57 @@ impl Pipe {
         }
 
         Ok(total_written)
+    }
+
+    /// R178-22 FIX: Atomic write for buffers ≤PIPE_BUF
+    ///
+    /// POSIX atomicity: either the entire write succeeds, or none of it does.
+    /// Blocks until sufficient space is available (blocking mode) or returns
+    /// EAGAIN immediately (nonblock mode).
+    fn write_atomic(&self, src: &[u8], flags: PipeFlags) -> Result<usize, PipeError> {
+        debug_assert!(src.len() <= PIPE_BUF);
+
+        loop {
+            // Kill/signal gate before each attempt
+            if let Some(pid) = current_pid() {
+                if wait_should_abort(pid) {
+                    return Err(PipeError::Interrupted);
+                }
+                if kernel_core::signal::has_deliverable_signal(pid) {
+                    return Err(PipeError::Interrupted);
+                }
+            }
+
+            let should_wait = {
+                let mut inner = self.inner.lock();
+
+                // Check read end
+                if inner.readers == 0 {
+                    return Err(PipeError::BrokenPipe);
+                }
+
+                // Atomicity gate: check if entire write can proceed
+                if inner.space() >= src.len() {
+                    // Sufficient space: write atomically
+                    let n = inner.write(src);
+                    debug_assert_eq!(n, src.len());
+                    self.read_wait.wake_one();
+                    return Ok(n);
+                }
+
+                // Insufficient space
+                if flags.nonblock {
+                    return Err(PipeError::WouldBlock);
+                }
+
+                // Blocking mode: wait for space
+                self.write_wait.prepare_to_wait()
+            };
+
+            if should_wait {
+                self.write_wait.finish_wait();
+            }
+        }
     }
 
     /// 关闭读端
@@ -688,9 +759,9 @@ pub fn create_pipe_with_capacity(
     capacity: usize,
     flags: PipeFlags,
 ) -> Result<(PipeHandle, PipeHandle), PipeError> {
-    // MEDIUM-6 FIX: Reject zero-capacity pipes, which can never accept writes, and
-    // bound valid capacities to prevent unbounded kernel memory allocations.
-    if capacity == 0 || capacity > MAX_PIPE_CAPACITY {
+    // RF178-18 FIX: A pipe smaller than PIPE_BUF can never satisfy the promised
+    // all-or-nothing short-write contract and would block forever.
+    if capacity < PIPE_BUF || capacity > MAX_PIPE_CAPACITY {
         return Err(PipeError::InvalidCapacity);
     }
 
