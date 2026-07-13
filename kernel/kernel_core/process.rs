@@ -18,7 +18,7 @@ use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hoo
 use mm::memory::FrameAllocator;
 use mm::page_table;
 use seccomp::{PledgeState, SeccompState};
-use spin::{Mutex, RwLock};
+use spin::{Mutex, Once, RwLock};
 // G.1 Observability: Watchdog integration for hung-task detection
 use trace::watchdog::{register_watchdog, unregister_watchdog, WatchdogConfig, WatchdogHandle};
 use x86_64::{
@@ -809,6 +809,31 @@ impl MmState {
         self.stack_grow_in_progress = false;
     }
 
+    /// RF178-12 FIX: allocation-free commit for a synchronous stack #PF.
+    ///
+    /// The fault keeps `Process -> MmState` locked from cgroup selection through
+    /// PTE publication, so no transient pending lane or deferred identity lookup
+    /// is needed. Fault-built page-table frames are intentionally inherited-basis
+    /// bytes: the main stack has no munmap lifecycle, so they reclaim wholesale
+    /// with the address space. The frame ledger and its capacity stay untouched,
+    /// preserving invariant I'.
+    pub(crate) fn commit_fault_stack_grow(
+        &mut self,
+        data_bytes: u64,
+        pt_bytes: u64,
+        new_floor: usize,
+    ) {
+        debug_assert_eq!(
+            self.stack_grow_pending_bytes, 0,
+            "synchronous #PF must not use the migration pending lane"
+        );
+        self.elf_charged_bytes = self.elf_charged_bytes.saturating_add(data_bytes);
+        self.pt_charged_bytes = self.pt_charged_bytes.saturating_add(pt_bytes);
+        self.pt_inherited_bytes = self.pt_inherited_bytes.saturating_add(pt_bytes);
+        self.stack_floor_committed = new_floor;
+        self.stack_grow_in_progress = false;
+    }
+
     // NOTE: the former `clone_for_fork()` helper was removed (next-phase #11).
     // It was dead (zero callers — `fork_inner` builds the child `MmState` by an
     // explicit field-by-field struct literal) and relied on `MmState: Clone`,
@@ -876,7 +901,7 @@ pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     // R172-X-F2: derived from the single-sourced mapped floor (TOP - mapped_floor ==
     // SIZE - GUARD, byte-identical) so the limit tracks any future guard-size change.
     r[RLIMIT_STACK] = RLimit {
-        rlim_cur: crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_mapped_floor(),
+        rlim_cur: crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_usable_floor(),
         rlim_max: RLIM_INFINITY,
     };
     r
@@ -999,7 +1024,13 @@ pub struct Process {
     /// When this task holds a futex and high-priority waiters are blocked on it,
     /// those waiters' priorities are recorded here. The effective priority is
     /// computed as min(base_dynamic_priority, min(all pi_boosts values)).
-    pub pi_boosts: BTreeMap<FutexKey, Priority>,
+    pub pi_boosts: crate::fallible_map::FallibleOrderedMap<FutexKey, Priority>,
+
+    /// RF178-8: one capacity slot reserved for the PI futex this task is
+    /// currently waiting to inherit. A task can wait on at most one futex, so a
+    /// single keyed reservation is sufficient. Other boost insertions preserve
+    /// this spare slot, making robust-owner handoff/exit propagation allocation-free.
+    pub pi_boost_reservation: Option<FutexKey>,
 
     /// E.4 Priority Inheritance: 如果阻塞在 futex 上，记录等待的 futex key
     ///
@@ -1138,6 +1169,11 @@ pub struct Process {
     /// 调度器会提升进程的动态优先级，防止低优先级进程饥饿。
     /// 每次进程被调度运行时重置为0。
     pub wait_ticks: u64,
+
+    /// RF178-3 FIX: Timer epoch already folded into `wait_ticks`. Selection can
+    /// scan a queue multiple times per tick; this prevents scan count from
+    /// masquerading as elapsed wait time.
+    pub wait_age_tick: u64,
 
     /// CPU亲和性位掩码（bit N = 允许在CPU N上运行）
     ///
@@ -1341,16 +1377,6 @@ pub struct Process {
     /// / futex / FPU-owner / watchdog), which would strand those charges (BREAK #1).
     pub teardown_done: core::sync::atomic::AtomicBool,
 
-    /// M4-1: latched starvation-boost request. Set TRUE on the timer tick (IRQ) when this
-    /// Ready task crosses `STARVATION_THRESHOLD` — NO priority mutation in IRQ (that would
-    /// drift the ready-queue bucket key away from `dynamic_priority` and corrupt
-    /// steal/select/pop). The actual boost (`base_dynamic_priority -= 1` + recompute +
-    /// bucket move) is APPLIED later under the queue lock in process context
-    /// (`reschedule_now` drain), or consumed when the task is claimed-to-Run / migrated.
-    /// The PCB marker — not the per-CPU hint buffer — is the source of truth, so an
-    /// overflowed buffer never loses a boost.
-    pub pending_starve_boost: bool,
-
     /// M4-1b: per-PCB socket-wait timeout marker (replaces the global heap
     /// `SocketWaiters.timed_out: BTreeMap` whose `insert` allocated a node in
     /// TIMER-IRQ context — the R151-5 deadlock class). Packed encoding:
@@ -1402,6 +1428,9 @@ pub struct Process {
     /// kernel stack. Accessed lock-free via the PCB's stable address (same discipline as
     /// the timeout markers above), so concurrent readers never need the proc lock.
     pub on_cpu: AtomicBool,
+    /// RF178-33: finish-task-switch is clearing `on_cpu` and completing the
+    /// corresponding parent wake. Reapers must wait until this handoff clears.
+    pub switch_reap_pending: AtomicBool,
 }
 
 impl Process {
@@ -1434,13 +1463,14 @@ impl Process {
             priority,
             dynamic_priority: priority,
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
-            pending_starve_boost: false,     // M4-1: no latched starvation boost at birth
             socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
             wq_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
             active_wait_seq: AtomicU64::new(0), // M1-02: born-clean, no active timed wait
             on_cpu: AtomicBool::new(false),  // R172-03: born off-CPU (context durable)
-            pi_boosts: BTreeMap::new(),      // E.4 PI: no boosts initially
-            waiting_on_futex: None,          // E.4 PI: not waiting on any futex
+            switch_reap_pending: AtomicBool::new(false),
+            pi_boosts: crate::fallible_map::FallibleOrderedMap::new(),
+            pi_boost_reservation: None,
+            waiting_on_futex: None, // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
             context: Context::default(),
             fpu_used: false, // Lazy FPU: process hasn't used FPU yet
@@ -1473,8 +1503,9 @@ impl Process {
             cpu_quota_debt_ns: 0,
             cpu_quota_debt_cgid: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
+            wait_age_tick: crate::get_ticks(),
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
-            cpuset_id: 0,  // Root cpuset (all CPUs)
+            cpuset_id: 0,                     // Root cpuset (all CPUs)
             created_at: time::current_timestamp_ms(),
             // R101-1 FIX: Default to unprivileged nobody (uid=65534) credentials.
             //
@@ -1806,31 +1837,85 @@ impl Process {
         }
     }
 
-    /// E.4 PI: 应用一次 PI 提升（如果提升更高则更新）
+    /// E.4 PI: Get the current effective priority (read-only accessor).
     ///
-    /// Called when a high-priority waiter blocks on a futex held by this task.
-    /// Returns true if the effective priority changed.
-    pub fn apply_pi_boost(&mut self, key: FutexKey, donated: Priority) -> bool {
-        let should_update = match self.pi_boosts.get(&key) {
-            Some(&existing) => donated < existing, // Lower priority number = higher priority
-            None => true,
-        };
-        if should_update {
-            self.pi_boosts.insert(key, donated);
-            return self.recompute_effective_priority();
-        }
-        false
+    /// Returns the current `dynamic_priority`, which is the effective priority
+    /// after considering both base priority and any active PI boosts.
+    /// This is the priority used by the scheduler for task selection.
+    pub fn effective_priority(&self) -> Priority {
+        self.dynamic_priority
     }
 
-    /// E.4 PI: 清除指定 futex 的 PI 提升
+    /// RF178-8: reserve the allocation needed if this waiter later inherits
+    /// `key` during robust-owner exit or normal PI unlock.
     ///
-    /// Called when the futex is released or all waiters leave.
-    /// Returns true if the effective priority changed.
-    pub fn clear_pi_boost(&mut self, key: &FutexKey) -> bool {
-        if self.pi_boosts.remove(key).is_some() {
-            return self.recompute_effective_priority();
+    /// The caller holds this PCB lock across the reservation publication. Every
+    /// unrelated boost insertion preserves one additional spare while this key
+    /// is reserved, so the capacity cannot be stolen before handoff.
+    pub fn try_reserve_pi_boost(&mut self, key: FutexKey) -> Result<(), ()> {
+        match self.pi_boost_reservation {
+            Some(existing) if existing == key => return Ok(()),
+            Some(_) => return Err(()),
+            None => {}
         }
-        false
+        if self.pi_boosts.contains_key(&key) {
+            return Ok(());
+        }
+        self.pi_boosts.try_reserve(1).map_err(|_| ())?;
+        self.pi_boost_reservation = Some(key);
+        Ok(())
+    }
+
+    /// RF178-8: release an unused handoff reservation. Capacity is retained;
+    /// this operation never allocates or deallocates.
+    pub fn cancel_pi_boost_reservation(&mut self, key: &FutexKey) {
+        if self.pi_boost_reservation.as_ref() == Some(key) {
+            self.pi_boost_reservation = None;
+        }
+    }
+
+    /// RF178-8: set or clear one keyed PI donation with fallible growth.
+    ///
+    /// Replacements/removals are allocation-free. A new key either consumes
+    /// its pre-reserved handoff slot or reserves enough room for the insertion
+    /// *and* any other outstanding handoff reservation before mutation.
+    pub fn try_update_pi_boost(
+        &mut self,
+        key: FutexKey,
+        donated: Option<Priority>,
+    ) -> Result<bool, ()> {
+        match donated {
+            Some(priority) => {
+                if let Some(existing) = self.pi_boosts.get_mut(&key) {
+                    if *existing == priority {
+                        return Ok(false);
+                    }
+                    *existing = priority;
+                    return Ok(self.recompute_effective_priority());
+                }
+
+                let consumes_reservation = self.pi_boost_reservation == Some(key);
+                if !consumes_reservation {
+                    // Preserve a different waiter's reserved slot. All boost
+                    // insertions pass through this method, so it cannot be stolen.
+                    let additional = 1 + usize::from(self.pi_boost_reservation.is_some());
+                    self.pi_boosts.try_reserve(additional).map_err(|_| ())?;
+                }
+                self.pi_boosts.try_insert(key, priority).map_err(|_| ())?;
+                if consumes_reservation {
+                    self.pi_boost_reservation = None;
+                }
+                Ok(self.recompute_effective_priority())
+            }
+            None => {
+                self.cancel_pi_boost_reservation(&key);
+                if self.pi_boosts.remove(&key).is_some() {
+                    Ok(self.recompute_effective_priority())
+                } else {
+                    Ok(false)
+                }
+            }
+        }
     }
 
     /// E.4 PI: 记录 / 清除当前等待的 futex（用于链式 PI）
@@ -1894,51 +1979,99 @@ impl Process {
     ///
     /// Now operates on base_dynamic_priority and recomputes effective priority.
     pub fn check_and_boost_starved(&mut self) {
-        // 饥饿阈值：STARVATION_THRESHOLD ticks（约100ms，假设1ms/tick）
-        if self.wait_ticks >= STARVATION_THRESHOLD {
-            // R66-4 FIX: Only boost if base > static (never boost beyond static)
-            // This prevents low-priority processes from gaining realtime priority
-            // E.4 PI: Now operates on base_dynamic_priority
-            if self.base_dynamic_priority > self.priority {
-                self.base_dynamic_priority -= 1;
-                self.recompute_effective_priority();
-            }
-            // 重置等待计数器
+        // RF178-33 FIX: A sparse bounded scheduler scan can observe several
+        // starvation periods at once. Fold the quotient into every available
+        // boost and retain the exact sub-threshold remainder. Complete periods
+        // are consumed even at the static-priority floor, matching the original
+        // one-period reset policy without scan-frequency dependence.
+        let periods = self.wait_ticks / STARVATION_THRESHOLD;
+        if periods == 0 {
+            return;
+        }
+        let available = self.base_dynamic_priority.saturating_sub(self.priority) as u64;
+        let boosts = periods.min(available);
+        if boosts != 0 {
+            self.base_dynamic_priority = self
+                .base_dynamic_priority
+                .saturating_sub(boosts.min(u8::MAX as u64) as u8);
+            self.recompute_effective_priority();
+        }
+        self.wait_ticks %= STARVATION_THRESHOLD;
+    }
+
+    /// RF178-33 FIX: Start a fresh Ready residence epoch.
+    ///
+    /// A Ready-to-Ready queue move preserves credit. `stopped` and `on_cpu`
+    /// are part of runnable readiness, so resuming a Ready-but-stopped task or
+    /// preempting a Ready-marked on-CPU task starts a new epoch as well.
+    #[inline]
+    pub fn enter_ready_at(&mut self, now_tick: u64) {
+        let starts_new_epoch = self.state != ProcessState::Ready
+            || self.stopped
+            || self.on_cpu.load(Ordering::Acquire);
+        self.state = ProcessState::Ready;
+        if starts_new_epoch {
             self.wait_ticks = 0;
+            self.wait_age_tick = now_tick;
         }
     }
 
-    /// M4-1: apply a latched starvation boost (see `pending_starve_boost`). Idempotent —
-    /// clears the marker, and if the task still has headroom below its static priority
-    /// (the R66-4 cap) decrements `base_dynamic_priority` by one level and recomputes the
-    /// effective `dynamic_priority` (which folds in any CURRENT PI boosts via
-    /// `recompute_effective_priority` = min(base, pi_boosts)). Returns whether the
-    /// effective priority changed, so the caller re-buckets the task IFF `true`. Touches
-    /// ONLY `base` + the marker — never `pi_boosts` — so PI semantics are untouched and a
-    /// concurrent PI boost in the gap is correctly composed at apply time.
-    pub fn apply_pending_starve_boost(&mut self) -> bool {
-        if !self.pending_starve_boost {
-            return false;
-        }
-        self.pending_starve_boost = false;
-        if self.base_dynamic_priority > self.priority {
-            self.base_dynamic_priority -= 1;
-            self.recompute_effective_priority()
-        } else {
-            false
-        }
+    /// RF178-33 FIX: Publish newly-created or explicitly re-enqueued work.
+    /// Constructor/fork preparation time is not scheduler queue residence.
+    #[inline]
+    pub fn publish_ready_at(&mut self, now_tick: u64) {
+        self.state = ProcessState::Ready;
+        self.wait_ticks = 0;
+        self.wait_age_tick = now_tick;
+    }
+
+    /// RF178-33 FIX: Mark a task Running and stop Ready-wait accounting.
+    #[inline]
+    pub fn enter_running_at(&mut self, now_tick: u64) {
+        self.state = ProcessState::Running;
+        self.wait_ticks = 0;
+        self.wait_age_tick = now_tick;
+    }
+
+    /// RF178-33 FIX: Mark a task blocked and exclude the blocked interval.
+    #[inline]
+    pub fn enter_blocked_at(&mut self, now_tick: u64) {
+        self.state = ProcessState::Blocked;
+        self.wait_ticks = 0;
+        self.wait_age_tick = now_tick;
+    }
+
+    /// RF178-33 FIX: Mark a task stopped and exclude the stopped interval.
+    #[inline]
+    pub fn enter_stopped_at(&mut self, now_tick: u64) {
+        self.state = ProcessState::Stopped;
+        self.stopped = true;
+        self.wait_ticks = 0;
+        self.wait_age_tick = now_tick;
     }
 
     /// R65-19 FIX: 重置等待时间（进程被调度运行时调用）
     #[inline]
     pub fn reset_wait_ticks(&mut self) {
         self.wait_ticks = 0;
+        self.wait_age_tick = crate::get_ticks();
     }
 
     /// R65-19 FIX: 增加等待时间（调度器tick时调用）
     #[inline]
-    pub fn increment_wait_ticks(&mut self) {
-        self.wait_ticks = self.wait_ticks.saturating_add(1);
+    pub fn age_wait_ticks_to(&mut self, now_tick: u64) {
+        // RF178-33 FIX: Only genuine off-CPU Ready residence earns aging
+        // credit. Lifecycle edges re-anchor wait_age_tick, so returning here
+        // cannot cause Running, Blocked, or Stopped time to be folded later.
+        if self.state != ProcessState::Ready
+            || self.stopped
+            || self.on_cpu.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let elapsed = now_tick.saturating_sub(self.wait_age_tick);
+        self.wait_ticks = self.wait_ticks.saturating_add(elapsed);
+        self.wait_age_tick = now_tick;
     }
 
     /// 恢复静态优先级
@@ -1948,6 +2081,90 @@ impl Process {
         self.base_dynamic_priority = self.priority;
         self.recompute_effective_priority();
     }
+}
+
+/// RF178-33 executable probe for scheduler wait-lifecycle accounting.
+///
+/// Uses injected ticks so a green boot cannot hide epoch drift behind timing.
+pub fn run_ready_aging_self_test() {
+    let mut proc = Process::new(0x17_833, 1, String::from("rf178-33-aging"), 100);
+
+    proc.enter_running_at(10);
+    proc.wait_ticks = 77;
+    proc.wait_age_tick = 10;
+    proc.enter_ready_at(100);
+    assert_eq!(proc.state, ProcessState::Ready);
+    assert_eq!((proc.wait_ticks, proc.wait_age_tick), (0, 100));
+
+    proc.age_wait_ticks_to(150);
+    assert_eq!(proc.wait_ticks, 50);
+    proc.age_wait_ticks_to(150);
+    assert_eq!(proc.wait_ticks, 50, "same-tick aging must be idempotent");
+
+    // A Ready-to-Ready move is migration/rebucketing, not a new wait epoch.
+    proc.enter_ready_at(175);
+    assert_eq!((proc.wait_ticks, proc.wait_age_tick), (50, 150));
+
+    proc.enter_running_at(200);
+    proc.age_wait_ticks_to(250);
+    assert_eq!((proc.wait_ticks, proc.wait_age_tick), (0, 200));
+
+    proc.enter_blocked_at(300);
+    proc.age_wait_ticks_to(450);
+    assert_eq!((proc.wait_ticks, proc.wait_age_tick), (0, 300));
+    proc.enter_ready_at(450);
+    proc.age_wait_ticks_to(475);
+    assert_eq!(proc.wait_ticks, 25, "blocked time must not become Ready wait");
+
+    proc.enter_ready_at(500);
+    proc.stopped = true;
+    proc.wait_ticks = 19;
+    proc.wait_age_tick = 500;
+    proc.age_wait_ticks_to(600);
+    assert_eq!(proc.wait_ticks, 19, "stopped time must not earn aging credit");
+    proc.enter_ready_at(600);
+    proc.stopped = false;
+    proc.age_wait_ticks_to(625);
+    assert_eq!(proc.wait_ticks, 25);
+
+    proc.enter_ready_at(700);
+    proc.wait_ticks = 11;
+    proc.wait_age_tick = 700;
+    proc.on_cpu.store(true, Ordering::Release);
+    proc.age_wait_ticks_to(800);
+    assert_eq!(proc.wait_ticks, 11, "Ready+on_cpu must not earn wait credit");
+    proc.enter_ready_at(800);
+    proc.on_cpu.store(false, Ordering::Release);
+    proc.age_wait_ticks_to(825);
+    assert_eq!(proc.wait_ticks, 25);
+
+    // Sparse scans fold every complete period and keep the exact remainder.
+    proc.priority = 100;
+    proc.base_dynamic_priority = 110;
+    proc.dynamic_priority = 110;
+    proc.wait_ticks = 250;
+    proc.check_and_boost_starved();
+    assert_eq!(proc.base_dynamic_priority, 108);
+    assert_eq!(proc.dynamic_priority, 108);
+    assert_eq!(proc.wait_ticks, 50);
+
+    // Complete periods are consumed at the policy floor; only the remainder
+    // survives, exactly as repeated one-period checks would produce.
+    proc.base_dynamic_priority = proc.priority;
+    proc.dynamic_priority = proc.priority;
+    proc.wait_ticks = 250;
+    proc.check_and_boost_starved();
+    assert_eq!(proc.wait_ticks, 50);
+
+    // Limited headroom still consumes the full quotient, not merely the one
+    // period that could alter priority.
+    proc.base_dynamic_priority = proc.priority + 1;
+    proc.dynamic_priority = proc.priority + 1;
+    proc.wait_ticks = 250;
+    proc.check_and_boost_starved();
+    assert_eq!(proc.base_dynamic_priority, proc.priority);
+    assert_eq!(proc.wait_ticks, 50);
+
 }
 
 /// 根据优先级计算时间片（毫秒）
@@ -1969,7 +2186,7 @@ fn calculate_time_slice(priority: Priority) -> u32 {
 /// - weight=200: 2x time slice (more CPU time)
 /// - weight=50: 0.5x time slice (less CPU time)
 ///
-/// Clamps result to [1, 300]ms to prevent starvation of peer cgroups.
+/// Clamps result to [1, 300]ms.
 fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup::CgroupId) -> u32 {
     let base = calculate_time_slice(priority);
     let weight = crate::cgroup::get_effective_cpu_weight(cgroup_id);
@@ -1978,7 +2195,7 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
     // Use u64 to avoid overflow during multiplication
     let scaled = (base as u64 * weight as u64) / 100;
 
-    // Clamp to reasonable range [1, 300]
+    // RF178-33: keep the final, weight-scaled slice above the IRQ-scan cadence floor.
     // Upper bound reduced from 1000ms to 300ms to prevent excessive starvation
     // of peer cgroups when high weights (e.g., 10000) are configured.
     scaled.clamp(1, 300) as u32
@@ -2001,10 +2218,13 @@ lazy_static::lazy_static! {
     /// E.5 Cpuset: Task left callback (for process exit)
     static ref CPUSET_TASK_LEFT: Mutex<Option<CpusetTaskLeftCallback>> = Mutex::new(None);
     /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
-    static ref KPTI_CR3_UPDATE: Mutex<Option<KptiCr3UpdateCallback>> = Mutex::new(None);
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
+
+/// RF178-33: installed once during boot, then read lock-free from the
+/// timer-return context-switch path.
+static KPTI_CR3_UPDATE: Once<KptiCr3UpdateCallback> = Once::new();
 
 /// R67-4 FIX: Per-CPU storage for current process ID.
 ///
@@ -2789,13 +3009,17 @@ pub fn process_table_snapshot() -> Option<alloc::vec::Vec<ProcessId>> {
 /// Holds PROCESS_TABLE lock while iterating and marking, preventing a concurrent
 /// sys_clone(CLONE_THREAD) from creating a new thread that escapes the exit_group.
 /// Returns the number of siblings marked for exit.
-/// R153-4 NOTE: PID reuse TOCTOU is structurally prevented here because we
-/// iterate the PROCESS_TABLE slots directly under the table lock (not raw PIDs).
-/// Each slot holds an Arc<Mutex<Process>>, so identity is verified by the slot
-/// position under lock, not by a stale PID lookup.
-pub fn request_exit_group_atomic(caller_pid: ProcessId, tgid: ProcessId, exit_code: i32) -> usize {
+/// RF178-35: group membership is authorized by the shared exit-token identity,
+/// not a reusable numeric TGID. The table lock still closes clone insertion.
+pub fn request_exit_group_atomic(
+    caller_pid: ProcessId,
+    group_exit_token: &Arc<AtomicBool>,
+    exit_code: i32,
+) -> usize {
     let table = PROCESS_TABLE.lock();
     let mut marked = 0usize;
+    let mut post = FatalExitPost::None;
+    let now_tick = crate::get_ticks();
     for (i, slot) in table.iter().enumerate() {
         let pid = i;
         if pid == caller_pid {
@@ -2803,28 +3027,24 @@ pub fn request_exit_group_atomic(caller_pid: ProcessId, tgid: ProcessId, exit_co
         }
         if let Some(proc_arc) = slot {
             let mut proc = proc_arc.lock();
-            if proc.tgid == tgid
+            if Arc::ptr_eq(&proc.thread_group_exiting, group_exit_token)
                 && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
             {
-                proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
-                proc.pending_kill.store(true, Ordering::Release);
-                // R153-5 FIX: Unblock threads so they observe pending_kill
-                // promptly. Without this, threads in kernel waits (futex,
-                // pipe read, socket recv) remain blocked indefinitely,
-                // delaying exit_group completion and pinning resources.
-                //
-                // NOTE: The thread may still be registered in a WaitQueue's
-                // waiters list. This stale entry is benign: when wake_one()
-                // encounters a non-Blocked PID it skips it, and the thread
-                // will self-terminate at syscall return before re-entering
-                // any wait. The R153-1 dedup check also prevents re-enqueue.
-                if proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
+                let request = request_process_exit_locked(&mut proc, exit_code, now_tick);
+                if request != FatalExitPost::None {
+                    marked += 1;
+                    if request == FatalExitPost::Kick {
+                        post = FatalExitPost::Kick;
+                    } else if post == FatalExitPost::None {
+                        post = FatalExitPost::Posted;
+                    }
                 }
-                marked += 1;
             }
         }
     }
+    // RF178-35: never send an IPI while PROCESS_TABLE or a sibling PCB is held.
+    drop(table);
+    let _ = finish_process_exit_request(post);
     marked
 }
 
@@ -2842,21 +3062,208 @@ pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
         None => return false,
     };
 
-    let mut proc = proc_arc.lock();
+    request_process_exit_arc(&proc_arc, exit_code)
+}
+
+/// RF178-14 FIX: Post a fatal-exit request against an already-authorized
+/// process identity. Holding the Arc binds the request to that generation and
+/// prevents a PID-reuse relookup from killing an unrelated process.
+pub fn request_process_exit_arc(proc_arc: &Arc<Mutex<Process>>, exit_code: i32) -> bool {
+    let post = {
+        let mut proc = proc_arc.lock();
+        request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
+    };
+    finish_process_exit_request(post)
+}
+
+/// RF178-35 post-lock action token. First publication or runnable-state repair
+/// requests one broadcast; an already-runnable repost is recorded without IPI
+/// amplification. Callers finish the token only after dropping all guards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum FatalExitPost {
+    None,
+    Posted,
+    Kick,
+}
+
+/// Atomically publish a fatal exit and make every non-running live task
+/// selectable. The caller must hold this exact PCB's guard.
+pub(crate) fn request_process_exit_locked(
+    proc: &mut Process,
+    exit_code: i32,
+    now_tick: u64,
+) -> FatalExitPost {
     if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
-        return false;
+        return FatalExitPost::None;
     }
 
-    // Store exit code first, then publish the kill flag with Release ordering
-    // so the consumer (AcqRel swap) sees a consistent exit_code.
+    let was_pending = proc.pending_kill.load(Ordering::Acquire);
+    let was_stopped = proc.stopped;
+
+    // Running and the Ready+on_cpu switch transient already own a CPU. Every
+    // other live state must become Ready in place; scheduler queues retain
+    // blocked/sleeping/stopped PCBs, so no queue move is required.
+    let actively_running = proc.on_cpu.load(Ordering::Acquire)
+        && matches!(proc.state, ProcessState::Running | ProcessState::Ready);
+    let needs_ready = !actively_running && proc.state != ProcessState::Ready;
+
+    // RF178-35 FIX: publish the fatal request before making a parked task
+    // selectable. Every consumer that can act on the request takes this PCB
+    // guard, so it cannot observe the post-publication normalization half-done.
     proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
     proc.pending_kill.store(true, Ordering::Release);
 
-    // R153-5 FIX: Unblock the target so it observes pending_kill promptly.
-    if proc.state == ProcessState::Blocked {
-        proc.state = ProcessState::Ready;
+    if needs_ready || (proc.state == ProcessState::Ready && was_stopped) {
+        // Keep `stopped` set through this call so a newly runnable residence
+        // begins a fresh starvation-aging epoch.
+        proc.enter_ready_at(now_tick);
     }
+    proc.stopped = false;
+
+    if !was_pending || needs_ready || was_stopped {
+        FatalExitPost::Kick
+    } else {
+        FatalExitPost::Posted
+    }
+}
+
+/// Apply a job-control stop while preserving fatal-exit precedence.
+/// The caller must hold this exact PCB's guard.
+pub(crate) fn try_mark_job_control_stopped_locked(proc: &mut Process) -> bool {
+    if proc.pending_kill.load(Ordering::Acquire) {
+        return false;
+    }
+    proc.stopped = true;
     true
+}
+
+/// Complete a fatal request after all locks have been released.
+pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
+    match post {
+        FatalExitPost::None => false,
+        FatalExitPost::Posted => true,
+        FatalExitPost::Kick => {
+            let _ = crate::signal::kernel_kick_reschedule();
+            true
+        }
+    }
+}
+
+/// RF178-35 executable state-matrix probe for fatal publication.
+pub fn run_fatal_exit_publication_self_test() {
+    let mut proc = Process::new(
+        0x178_3501,
+        1,
+        String::from("rf178-35-fatal"),
+        120,
+    );
+    let group_token = Arc::clone(&proc.thread_group_exiting);
+    let unrelated_group_token = Arc::new(AtomicBool::new(false));
+    assert!(Arc::ptr_eq(&proc.thread_group_exiting, &group_token));
+    assert!(!Arc::ptr_eq(
+        &proc.thread_group_exiting,
+        &unrelated_group_token,
+    ));
+    let live_states = [
+        (ProcessState::Ready, false),
+        (ProcessState::Ready, true),
+        (ProcessState::Running, false),
+        (ProcessState::Running, true),
+        (ProcessState::Blocked, false),
+        (ProcessState::Blocked, true),
+        (ProcessState::Sleeping, false),
+        (ProcessState::Sleeping, true),
+        (ProcessState::Stopped, false),
+        (ProcessState::Stopped, true),
+    ];
+
+    let mut case = 0usize;
+    for (state, on_cpu) in live_states.iter().copied() {
+        for stopped in [false, true] {
+            proc.state = state;
+            proc.stopped = stopped;
+            proc.on_cpu.store(on_cpu, Ordering::Release);
+            proc.pending_kill.store(false, Ordering::Release);
+            proc.socket_timeout_marker.store(0x3501, Ordering::Release);
+            proc.wq_timeout_marker.store(0x3503, Ordering::Release);
+            let code = 0x3500 + case as i32;
+            assert_eq!(
+                request_process_exit_locked(&mut proc, code, case as u64),
+                FatalExitPost::Kick,
+            );
+            let actively_running = on_cpu
+                && matches!(state, ProcessState::Running | ProcessState::Ready);
+            let expected = if !actively_running && state != ProcessState::Ready
+                || (state == ProcessState::Ready && stopped)
+            {
+                ProcessState::Ready
+            } else {
+                state
+            };
+            assert_eq!(proc.state, expected);
+            assert!(!proc.stopped);
+            assert_eq!(proc.on_cpu.load(Ordering::Acquire), on_cpu);
+            assert_eq!(proc.socket_timeout_marker.load(Ordering::Acquire), 0x3501);
+            assert_eq!(proc.wq_timeout_marker.load(Ordering::Acquire), 0x3503);
+            assert!(proc.pending_kill.load(Ordering::Acquire));
+            assert_eq!(proc.pending_exit_code.load(Ordering::Acquire), code);
+            case += 1;
+        }
+    }
+
+    // A first publication kicks; a redundant, already-runnable repost only
+    // updates the code and cannot amplify cross-CPU IPIs.
+    proc.state = ProcessState::Ready;
+    proc.stopped = false;
+    proc.on_cpu.store(false, Ordering::Release);
+    proc.pending_kill.store(false, Ordering::Release);
+    assert_eq!(
+        request_process_exit_locked(&mut proc, 0x35ff, 100),
+        FatalExitPost::Kick,
+    );
+    assert_eq!(
+        request_process_exit_locked(&mut proc, 0x35fe, 101),
+        FatalExitPost::Posted,
+    );
+    assert_eq!(proc.pending_exit_code.load(Ordering::Acquire), 0x35fe);
+
+    // A repost repairs a task that was re-parked by stale state and must kick.
+    proc.state = ProcessState::Blocked;
+    assert_eq!(
+        request_process_exit_locked(&mut proc, 0x35fd, 102),
+        FatalExitPost::Kick,
+    );
+    assert_eq!(proc.state, ProcessState::Ready);
+
+    // Both lock-serialized race orders give fatal exit precedence over stop.
+    proc.state = ProcessState::Blocked;
+    proc.stopped = false;
+    proc.pending_kill.store(false, Ordering::Release);
+    assert!(try_mark_job_control_stopped_locked(&mut proc));
+    assert_eq!(
+        request_process_exit_locked(&mut proc, 0x35fc, 103),
+        FatalExitPost::Kick,
+    );
+    assert!(!proc.stopped);
+    assert!(!try_mark_job_control_stopped_locked(&mut proc));
+    assert!(!proc.stopped);
+    assert_eq!(proc.pending_exit_code.load(Ordering::Acquire), 0x35fc);
+
+    for terminal in [ProcessState::Zombie, ProcessState::Terminated] {
+        proc.state = terminal;
+        proc.stopped = true;
+        proc.pending_kill.store(false, Ordering::Release);
+        proc.pending_exit_code.store(7, Ordering::Release);
+        assert_eq!(
+            request_process_exit_locked(&mut proc, 99, 200),
+            FatalExitPost::None,
+        );
+        assert_eq!(proc.state, terminal);
+        assert!(proc.stopped);
+        assert!(!proc.pending_kill.load(Ordering::Acquire));
+        assert_eq!(proc.pending_exit_code.load(Ordering::Acquire), 7);
+    }
 }
 
 /// R115-1 FIX: Consume a pending cross-CPU exit request for the given PID.
@@ -2881,6 +3288,48 @@ pub fn take_pending_process_exit(pid: ProcessId) -> Option<i32> {
     }
 
     Some(proc.pending_exit_code.load(Ordering::Acquire))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqExitDefer {
+    NoRequest,
+    Retry,
+    Queued,
+}
+
+/// RF178-35: transactionally move a pending fatal request into the fixed IRQ
+/// termination queue. Contention or a full queue returns `Retry` without
+/// consuming `pending_kill`; only `Queued` provisionally marks the PCB Zombie.
+pub fn try_defer_pending_process_exit(pid: ProcessId) -> IrqExitDefer {
+    let proc_arc = match try_get_process(pid) {
+        None => return IrqExitDefer::Retry,
+        Some(None) => return IrqExitDefer::NoRequest,
+        Some(Some(proc_arc)) => proc_arc,
+    };
+    let mut proc = match proc_arc.try_lock() {
+        Some(proc) => proc,
+        None => return IrqExitDefer::Retry,
+    };
+
+    if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+        proc.pending_kill.store(false, Ordering::Relaxed);
+        return IrqExitDefer::NoRequest;
+    }
+    if !proc.pending_kill.load(Ordering::Acquire) {
+        return IrqExitDefer::NoRequest;
+    }
+    let exit_code = proc.pending_exit_code.load(Ordering::Acquire);
+    if !defer_irq_terminate(pid, exit_code) {
+        return IrqExitDefer::Retry;
+    }
+
+    // The queue's NONRUNNABLE claim already excludes scheduler admission.
+    // Only after that claim succeeds may the IRQ path consume the request and
+    // publish the provisional lifecycle state used by deferred teardown.
+    proc.state = ProcessState::Zombie;
+    proc.exit_code = Some(exit_code);
+    proc.pending_kill.store(false, Ordering::Release);
+    IrqExitDefer::Queued
 }
 
 /// 设置当前进程ID
@@ -3695,15 +4144,14 @@ pub fn notify_cpuset_task_left(cpuset_id: u32) {
 /// Called by main kernel during initialization to bridge kernel_core → arch.
 /// The callback is `arch::arch_set_kpti_cr3s`.
 pub fn register_kpti_cr3_callback(callback: KptiCr3UpdateCallback) {
-    *KPTI_CR3_UPDATE.lock() = Some(callback);
+    KPTI_CR3_UPDATE.call_once(|| callback);
 }
 
 /// H.3 KPTI: Update per-CPU GS-addressable CR3 pair via registered callback.
 ///
 /// No-op if the callback has not been registered (early boot or KPTI disabled).
 fn notify_kpti_cr3_update(user_cr3: u64, kernel_cr3: u64) {
-    let callback = *KPTI_CR3_UPDATE.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = KPTI_CR3_UPDATE.get().copied() {
         cb(user_cr3, kernel_cr3);
     }
 }
@@ -3711,9 +4159,9 @@ fn notify_kpti_cr3_update(user_cr3: u64, kernel_cr3: u64) {
 // R155-6 FIX: Deferred IRQ termination queue.
 // Timer IRQ handlers cannot safely run terminate_process() (blocking locks,
 // heap allocation, deep call stack) on the interrupt stack. Instead, they
-// enqueue the (pid, exit_code) here and set the process to Blocked. The
-// next process-context drain_deferred_irq_terminates() call performs the
-// full cleanup.
+// enqueue the (pid, exit_code) here. The caller provisionally marks the exact
+// PCB Zombie only after the slot claim succeeds; the next process-context
+// drain_deferred_irq_terminates() call performs the full cleanup.
 const MAX_DEFERRED_IRQ_KILLS: usize = 8;
 static DEFERRED_IRQ_KILL_PIDS: [AtomicU64; MAX_DEFERRED_IRQ_KILLS] =
     [const { AtomicU64::new(0) }; MAX_DEFERRED_IRQ_KILLS];
@@ -3745,7 +4193,7 @@ static DEFERRED_IRQ_KILL_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_KILL_NONRUNNABLE_PIDS: [AtomicU64; MAX_DEFERRED_IRQ_KILLS] =
     [const { AtomicU64::new(0) }; MAX_DEFERRED_IRQ_KILLS];
 
-pub fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
+fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
     for i in 0..MAX_DEFERRED_IRQ_KILLS {
         // R170-5 FIX: the NONRUNNABLE entry IS the slot claim (CAS) and is
         // published BEFORE the drain-visible DEFERRED store, so the scheduler
@@ -3963,7 +4411,7 @@ pub fn wq_timeout_wake_by_seq(pid: ProcessId, seq: u64, marker_gen: u64) -> bool
                 ) {
                     proc.wq_timeout_marker
                         .store(pack_timeout_marker(marker_gen), Ordering::Release);
-                    proc.state = ProcessState::Ready;
+                    proc.enter_ready_at(crate::get_ticks());
                     proc.active_wait_seq.store(0, Ordering::Relaxed);
                 }
                 // Lock acquired: an exact hit woke the wait; a mismatch means the
@@ -4153,22 +4601,43 @@ pub fn run_timeout_marker_self_test() {
 }
 
 pub fn drain_deferred_irq_terminates() {
-    if !DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire) {
+    if !DEFERRED_IRQ_KILL_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
-    DEFERRED_IRQ_KILL_PENDING.store(false, Ordering::Relaxed);
+    let mut still_running = false;
     for i in 0..MAX_DEFERRED_IRQ_KILLS {
-        // The swap(0) stays the exactly-once TERMINATION claim (two drains can
-        // never both terminate one entry). R170-5: it no longer doubles as the
+        // Inspect before the exactly-once CAS claim so an active handoff can
+        // remain queued without transiently losing scheduler visibility.
         // scheduler-visibility membership — that lives in
         // IRQ_KILL_NONRUNNABLE_PIDS and is cleared by terminate_process itself
         // right after the Zombie publish, so the [swap → Zombie] window is no
         // longer scheduler-visible. This drain does NOT touch NONRUNNABLE.
-        let pid_raw = DEFERRED_IRQ_KILL_PIDS[i].swap(0, Ordering::Acquire);
-        if pid_raw != 0 {
+        let pid_raw = DEFERRED_IRQ_KILL_PIDS[i].load(Ordering::Acquire);
+        if pid_raw == 0 {
+            continue;
+        }
+
+        // A timer-kill handoff may still be executing on this task's kernel
+        // stack. Leave both queue and NONRUNNABLE membership intact until the
+        // scheduler publishes on_cpu=false after saving its context.
+        let on_cpu = get_process(pid_raw as ProcessId)
+            .map(|proc| proc.lock().on_cpu.load(Ordering::Acquire))
+            .unwrap_or(false);
+        if on_cpu {
+            still_running = true;
+            continue;
+        }
+
+        if DEFERRED_IRQ_KILL_PIDS[i]
+            .compare_exchange(pid_raw, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             let code = DEFERRED_IRQ_KILL_CODES[i].load(Ordering::Relaxed);
             terminate_process(pid_raw as ProcessId, code);
         }
+    }
+    if still_running {
+        DEFERRED_IRQ_KILL_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -4201,16 +4670,14 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     // another CPU. Switching to BOOT_CR3 ensures no stale TLB entries reference
     // freed page table frames.
     activate_memory_space(0, Some(0));
-    // Give the scheduler a chance to context-switch to another task.
-    // force_reschedule() may temporarily re-enable interrupts internally
-    // (spinlock acquisition), but we are now on safe boot CR3.
-    crate::force_reschedule();
-
-    // Re-disable interrupts after force_reschedule returns (it may have
-    // re-enabled them). We must halt with IF=0 to prevent timer IRQs.
-    x86_64::instructions::interrupts::disable();
+    // Bounded selection can legitimately miss a later queue window or a
+    // contended PCB. Retry from boot CR3 after every interrupt wake. Reaping
+    // is gated by on_cpu below, so this stack remains live until the scheduler
+    // has durably saved it and finish-task-switch clears the publication.
     loop {
-        x86_64::instructions::hlt();
+        crate::force_reschedule_from_irq();
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
     }
 }
 
@@ -4486,7 +4953,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 if parent_proc.state == ProcessState::Blocked
                     && (waiting == Some(0) || waiting == Some(pid))
                 {
-                    parent_proc.state = ProcessState::Ready;
+                    parent_proc.enter_ready_at(crate::get_ticks());
                     parent_proc.waiting_child = None;
                     wake_parent = true;
                 }
@@ -4749,7 +5216,7 @@ fn handle_namespace_init_death(
                         // R171-S FIX: deferred, no-return-free kill for EVERY victim
                         // (including the current task, which is merely deferred — never
                         // self-halted from inside this teardown).
-                        force_remote_kill(victim_pid, sigkill_code);
+                        force_remote_kill(victim_pid, sigkill_code, &membership.ns);
                     }
                 }
             }
@@ -4767,43 +5234,31 @@ fn handle_namespace_init_death(
 /// `Stopped` member of a shutting-down namespace would survive the cascade (a live
 /// leak). NEVER calls the no-return self-termination path, so it cannot abandon the
 /// caller's in-flight teardown even if `victim_pid` is the currently-running task.
-fn force_remote_kill(victim_pid: ProcessId, exit_code: i32) {
-    // request_process_exit returns false for a missing / already-Zombie/Terminated
-    // target, and promotes a Blocked target to Ready.
-    if !request_process_exit(victim_pid, exit_code) {
+fn force_remote_kill(
+    victim_pid: ProcessId,
+    exit_code: i32,
+    shutting_namespace: &Arc<crate::pid_namespace::PidNamespace>,
+) {
+    // RF178-36 FIX: resolve exactly once. A namespace victim may be reaped and
+    // its PID reused after this lock is released, so every later action carries
+    // this Arc plus its generation instead of looking the raw PID up again.
+    let Some(arc) = get_process(victim_pid) else {
         return;
-    }
-    // SIGKILL un-stops a job-control-stopped victim. The scheduler only dispatches
-    // `Ready && !stopped` tasks, so clear `stopped` / lift ProcessState::Stopped and
-    // ask the scheduler to resume it; otherwise it never consumes its pending kill.
-    if let Some(arc) = get_process(victim_pid) {
-        // R175 D0-CROSS-3 FIX: Atomic enqueue-then-ready transition.
-        // Previously, we marked state=Ready BEFORE calling kernel_resume_stopped,
-        // creating a window where the task was Ready but not enqueued. On SMP, an
-        // IRQ preemption could let the scheduler see this intermediate state and
-        // attempt to dequeue a task not in any queue → corruption.
-        //
-        // FIX: Call kernel_resume_stopped WHILE STILL HOLDING THE PROCESS LOCK and
-        // state is still Stopped. The scheduler's resume callback will enqueue the
-        // task, and we mark state=Ready ONLY AFTER successful enqueue, ensuring
-        // the scheduler invariant "Ready → in exactly one queue" is never violated.
-        let needs_resume = {
-            let mut p = arc.lock();
-            let was_stopped = p.stopped || p.state == ProcessState::Stopped;
-            if was_stopped {
-                p.stopped = false;
-                // Do NOT set state=Ready yet - scheduler will do it after enqueue
-                drop(p); // Release lock before calling scheduler
-                true
-            } else {
-                false
-            }
-        };
-        if needs_resume {
-            // R175 D0-CROSS-3: scheduler callback will enqueue AND mark Ready atomically
-            crate::signal::kernel_resume_stopped_atomic(victim_pid, arc.clone());
+    };
+    let post = {
+        let mut proc = arc.lock();
+        // The namespace member list contains reusable numeric PIDs. Revalidate
+        // membership against the resolved PCB under the same guard that posts
+        // the fatal request, so PID recycling cannot kill an unrelated task.
+        if !crate::pid_namespace::is_visible_in_namespace(
+            shutting_namespace,
+            &proc.pid_ns_chain,
+        ) {
+            return;
         }
-    }
+        request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
+    };
+    let _ = finish_process_exit_request(post);
 }
 
 /// 等待子进程
@@ -4812,7 +5267,11 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
         let proc = process.lock();
         // R169-9: a Zombie is reapable/observable as exited ONLY after teardown
         // has been published — never report exit before teardown ran.
-        if proc.state == ProcessState::Zombie && proc.teardown_done.load(Ordering::Acquire) {
+        if proc.state == ProcessState::Zombie
+            && proc.teardown_done.load(Ordering::Acquire)
+            && !proc.on_cpu.load(Ordering::Acquire)
+            && !proc.switch_reap_pending.load(Ordering::Acquire)
+        {
             return proc.exit_code;
         }
     }
@@ -4824,7 +5283,7 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 /// # Reaper Contract (H.0.9)
 ///
 /// **SAFETY:** This function MUST ONLY be called by a **reaper** — the parent process
-/// via `waitpid()`, the init reaper, or the OOM cleanup path (remote only).
+/// via `waitpid()`, the init reaper, or a never-scheduled child rollback path.
 /// NEVER call on the currently-executing process (`current_pid() == Some(pid)`).
 ///
 /// Self-reaping frees the active CR3 page tables and kernel stack while the calling
@@ -4833,7 +5292,6 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 ///
 /// # Callers (audited H.0.9):
 /// - `sys_wait4()` — parent reaps child (waitpid semantics)
-/// - `oom_cleanup()` — remote only (self-reap guarded by H.0.9 early return)
 /// - `sys_fork()`/`sys_clone()` LSM denial on fork-based child — immediately after
 ///   `terminate_process()`, never-scheduled (remote-only invariant holds)
 /// - `sys_clone()` no-CLONE_VM PID translation failure — same as above
@@ -4890,6 +5348,8 @@ pub fn cleanup_zombie(pid: ProcessId) {
                     // reapable — block the IRQ-deferred early-reap before teardown.
                     if proc.state == ProcessState::Zombie
                         && proc.teardown_done.load(Ordering::Acquire)
+                        && !proc.on_cpu.load(Ordering::Acquire)
+                        && !proc.switch_reap_pending.load(Ordering::Acquire)
                     {
                         (proc.memory_space, true)
                     } else {
@@ -5489,6 +5949,15 @@ unsafe fn free_page_table_level(
         let flags = entry.flags();
         let entry_phys = entry.addr();
 
+        // RF178-31: the low identity map is supervisor-only and shared. COW
+        // clones copy those leaves but never own their physical frames; only
+        // the private intermediate page-table frames are reclaimed below.
+        let is_leaf = level == 1 || flags.contains(PageTableFlags::HUGE_PAGE);
+        if is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            entry.set_unused();
+            continue;
+        }
+
         // R123-1 defense-in-depth: Reclaim leaf frames referenced by non-present
         // PTEs. A buggy PROT_NONE mmap path could install non-present leaf entries
         // that still encode a physical frame address. Older code skipped all
@@ -5551,19 +6020,9 @@ unsafe fn free_page_table_level(
 fn free_leaf_frame(phys: PhysAddr, frame_alloc: &mut FrameAllocator) {
     let phys_usize = phys.as_u64() as usize;
 
-    // 检查是否在 COW 跟踪中
-    let current_count = PAGE_REF_COUNT.get(phys_usize);
-
-    if current_count > 0 {
-        // COW 页面：减少引用计数
-        let remaining = PAGE_REF_COUNT.decrement(phys_usize);
-        if remaining == 0 {
-            // 最后一个引用，释放物理帧
-            let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
-            frame_alloc.deallocate_frame(frame);
-        }
-    } else {
-        // 未被 COW 跟踪的独占页面，直接释放
+    // RF178-31: one atomic operation decides ownership. An invalid physical
+    // address is retained leak-safe instead of being returned to the buddy.
+    if PAGE_REF_COUNT.release(phys_usize).should_free_unmapped() {
         let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
         frame_alloc.deallocate_frame(frame);
     }
@@ -5802,6 +6261,40 @@ pub fn run_record_pt_charge_self_test() {
     assert_eq!(mm.pt_charged_bytes, 0);
     assert!(mm.pt_ledger_authoritative);
 
+    // RF178-12: synchronous #PF commits are allocation-free and put PT bytes in
+    // the wholesale-teardown basis. Neither the ledger length nor its retained
+    // capacity may change on the full-DATA or PT-only partial-publication path.
+    let mut fault_mm = MmState::new(0);
+    fault_mm.elf_charged_bytes = 9 * PT;
+    fault_mm.stack_floor_committed = 0x7000_0000;
+    fault_mm.stack_grow_in_progress = true;
+    let ledger_len = fault_mm.pt_charged_frames.len();
+    let ledger_capacity = fault_mm.pt_charged_frames.capacity();
+    fault_mm.commit_fault_stack_grow(3 * PT, 2 * PT, 0x6fff_d000);
+    assert_eq!(fault_mm.elf_charged_bytes, 12 * PT);
+    assert_eq!(fault_mm.pt_charged_bytes, 2 * PT);
+    assert_eq!(fault_mm.pt_inherited_bytes, 2 * PT);
+    assert_eq!(fault_mm.stack_floor_committed, 0x6fff_d000);
+    assert!(!fault_mm.stack_grow_in_progress);
+    assert_eq!(fault_mm.pt_charged_frames.len(), ledger_len);
+    assert_eq!(fault_mm.pt_charged_frames.capacity(), ledger_capacity);
+    assert!(inv(&fault_mm), "synchronous full commit preserves I'");
+
+    // A mapper can publish an intermediate PT and then fail before its first
+    // leaf. Account the PT, keep the DATA floor unchanged, and clear the grow
+    // reservation before the architectural caller terminates the task.
+    fault_mm.stack_grow_in_progress = true;
+    let unchanged_floor = fault_mm.stack_floor_committed;
+    fault_mm.commit_fault_stack_grow(0, PT, unchanged_floor);
+    assert_eq!(fault_mm.elf_charged_bytes, 12 * PT);
+    assert_eq!(fault_mm.pt_charged_bytes, 3 * PT);
+    assert_eq!(fault_mm.pt_inherited_bytes, 3 * PT);
+    assert_eq!(fault_mm.stack_floor_committed, unchanged_floor);
+    assert!(!fault_mm.stack_grow_in_progress);
+    assert_eq!(fault_mm.pt_charged_frames.len(), ledger_len);
+    assert_eq!(fault_mm.pt_charged_frames.capacity(), ledger_capacity);
+    assert!(inv(&fault_mm), "PT-only fatal partial commit preserves I'");
+
     // 1) LEDGERED-SUCCESS branch: record 3 distinct PT frames (as mprotect Path-A
     //    does for a freshly-materialized region). pt_charged_bytes rises by
     //    EXACTLY 3 * PT — NOT the region's DATA bytes: this is the guard against
@@ -5893,27 +6386,30 @@ pub fn run_record_pt_charge_self_test() {
 /// proven separately by `cgroup::run_stack_grow_cgroup_self_test`). Panics on failure;
 /// detected by `make test` / `make boot-check` via the serial log.
 pub fn run_stack_grow_accounting_self_test() {
-    use crate::elf_loader::{stack_grow_floor, user_stack_mapped_floor, USER_STACK_TOP};
+    use crate::elf_loader::{
+        stack_grow_floor, user_stack_mapped_floor, user_stack_usable_floor, USER_STACK_TOP,
+    };
     const PAGE: usize = 0x1000;
 
     // ── grow_floor clamp (the RLIMIT_STACK → lowest growable VA mapping) ──
     let mapped_floor = user_stack_mapped_floor() as usize;
-    let writable_extent = USER_STACK_TOP as usize - mapped_floor; // == SIZE - GUARD
+    let usable_floor = user_stack_usable_floor() as usize;
+    let writable_extent = USER_STACK_TOP as usize - usable_floor; // == SIZE - GUARD
 
     // Default rlim_cur (== the writable extent) ⇒ floor == the architectural mapped floor:
     // on a default process the whole window-minus-guard is already eager-mapped, so there
     // is NO lazy region to grow into (a real grow would be ENOMEM — SLICE 5 splits this).
     assert_eq!(
         stack_grow_floor(writable_extent as u64),
-        mapped_floor,
-        "default RLIMIT_STACK ⇒ grow_floor == mapped floor (no lazy region)"
+        usable_floor,
+        "default RLIMIT_STACK => grow_floor == architectural usable floor"
     );
     // An INFINITE rlim_cur clamps to the SAME floor — the load-bearing min(): a raised
     // soft limit can never push the growable region below the architectural window.
     assert_eq!(
         stack_grow_floor(u64::MAX),
-        mapped_floor,
-        "infinite RLIMIT_STACK clamps to the mapped floor (window bound)"
+        usable_floor,
+        "infinite RLIMIT_STACK clamps to the usable floor (window bound)"
     );
     // A SMALLER limit (1 page) ⇒ a HIGHER floor (one page growable below TOP).
     assert_eq!(
@@ -5928,7 +6424,7 @@ pub fn run_stack_grow_accounting_self_test() {
         USER_STACK_TOP as usize - PAGE,
         "partial-page RLIMIT_STACK rounds the extent down (page-aligned floor)"
     );
-    // Whatever the limit, the floor is page-aligned and within [mapped_floor, TOP].
+    // Whatever the limit, the floor is page-aligned and within [usable_floor, TOP].
     for &r in &[
         0u64,
         1,
@@ -5940,8 +6436,8 @@ pub fn run_stack_grow_accounting_self_test() {
         let f = stack_grow_floor(r);
         assert_eq!(f & (PAGE - 1), 0, "grow_floor must be page-aligned");
         assert!(
-            f >= mapped_floor && f <= USER_STACK_TOP as usize,
-            "grow_floor within [mapped_floor, TOP]"
+            f >= usable_floor && f <= USER_STACK_TOP as usize,
+            "grow_floor within [usable_floor, TOP]"
         );
     }
 
@@ -6020,91 +6516,86 @@ impl ProcessStats {
 
 // ========== OOM Killer 回调实现 ==========
 
-/// 为 OOM killer 生成进程快照
-///
-/// 返回所有可杀进程的信息，用于 OOM 评分和选择
-pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
-    let table = PROCESS_TABLE.lock();
-    let mut result = Vec::new();
+/// Return the highest-scoring currently observable OOM victim without allocating.
+/// Every lock in this recovery scan is nonblocking: a contended table, PCB, mm,
+/// or credential object is deferred to a later allocator-failure poll.
+pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
+    let table = PROCESS_TABLE.try_lock()?;
+    let mut best = None;
+    let mut best_score = i64::MIN;
 
-    for slot in table.iter() {
-        if let Some(process) = slot {
-            let proc = process.lock();
+    for process in table.iter().flatten() {
+        let proc = match process.try_lock() {
+            Some(proc) => proc,
+            None => continue,
+        };
+        if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+            continue;
+        }
 
-            // 跳过僵尸和已终止的进程
-            if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
-                continue;
-            }
-
-            // 跳过 init 进程 (PID 1) - 永不杀死
-            if proc.pid == 1 {
-                continue;
-            }
-
-            // 计算 RSS（简化实现：使用 mmap 区域大小估算）
-            // R123-5 FIX: Mask low-bit flags before summing for accurate RSS.
-            // D3-ARC-MM-SHARED: Lock shared MmState to read mmap_regions.
-            let rss_pages = {
-                let mm = proc.mm.lock();
-                (mm.mmap_regions
-                    .values()
-                    .map(|&v| crate::syscall::mmap_region_len(v))
-                    .sum::<usize>()
-                    / 4096) as u64
+        let rss_pages = {
+            let mm_state = match proc.mm.try_lock() {
+                Some(mm_state) => mm_state,
+                None => continue,
             };
+            let rss_bytes = mm_state
+                .mmap_regions
+                .values()
+                .fold(0usize, |total, &entry| {
+                    total.saturating_add(crate::syscall::mmap_region_len(entry))
+                });
+            (rss_bytes / 4096) as u64
+        };
 
-            // R39-3 FIX: 使用共享凭证获取 uid/gid
-            let creds = proc.credentials.read();
-            result.push(mm::OomProcessInfo {
-                pid: proc.pid,
-                tgid: proc.tgid,
-                uid: creds.uid,
-                gid: creds.gid,
-                rss_pages,
-                nice: proc.nice,
-                oom_score_adj: proc.oom_score_adj,
-                has_mm: proc.memory_space != 0,
-                is_kernel_thread: proc.memory_space == 0,
-            });
+        let (uid, gid) = {
+            let creds = match proc.credentials.try_read() {
+                Some(creds) => creds,
+                None => continue,
+            };
+            (creds.uid, creds.gid)
+        };
+
+        let candidate = mm::OomProcessInfo {
+            pid: proc.pid,
+            generation: proc.generation,
+            tgid: proc.tgid,
+            uid,
+            gid,
+            rss_pages,
+            nice: proc.nice,
+            oom_score_adj: proc.oom_score_adj,
+            has_mm: proc.memory_space != 0,
+            is_kernel_thread: proc.memory_space == 0,
+        };
+        let score = mm::score_oom_process(&candidate);
+        if score > best_score {
+            best_score = score;
+            best = Some(candidate);
         }
     }
 
-    result
+    best
 }
 
-/// OOM killer 调用的进程终止函数
-///
-/// H.0.7 FIX: OOM victim selection is arbitrary — the victim may be running
-/// on any CPU. Use `request_process_exit()` for all targets (self and remote)
-/// so the victim self-terminates at its next syscall return or timer IRQ safe point.
-///
-/// H.0.9 FIX: Always use deferred termination (even for self) so the OOM handler
-/// can unwind normally: `kill_best_candidate()` must clear `OOM_RUNNING` and call
-/// `emit_audit()` after kill() returns. A halt loop in the self branch would wedge
-/// the OOM subsystem permanently and leak stack-local allocations (e.g., `snapshot`).
-pub fn oom_kill(pid: ProcessId, exit_code: i32) {
-    let _ = request_process_exit(pid, exit_code);
-}
-
-/// OOM killer 调用的进程清理函数
-///
-/// H.0.9 NOTE: `oom_kill()` always uses `request_process_exit()` (deferred),
-/// so the victim may NOT yet be Zombie when this function is called.
-/// `cleanup_zombie()` is a no-op for non-Zombie processes, so the actual
-/// cleanup happens later when:
-///   1. The victim reaches its next safe point and self-terminates
-///   2. The victim's parent reaps it via waitpid/cleanup_zombie
-///
-/// This is the correct safety trade-off: deferred memory reclaim is preferable
-/// to cross-CPU use-after-free or OOM subsystem wedge.
-pub fn oom_cleanup(pid: ProcessId) {
-    // H.0.9 DEFENSE: Never self-reap. oom_kill() posted a pending-kill request
-    // and the current process may not yet be Zombie. The parent (or init reaper)
-    // will call cleanup_zombie() via waitpid after the victim self-terminates.
-    if current_pid() == Some(pid) {
-        return;
+/// Post a generation-bound deferred exit request for the selected OOM victim.
+/// Validation and publication share one PCB try-lock, so PID reuse cannot redirect
+/// the kill and contention cannot deadlock an allocation recovery path.
+pub fn oom_kill(pid: ProcessId, generation: u64, exit_code: i32) -> bool {
+    let proc_arc = match try_get_process(pid) {
+        Some(Some(proc_arc)) => proc_arc,
+        Some(None) | None => return false,
+    };
+    let mut proc = match proc_arc.try_lock() {
+        Some(proc) => proc,
+        None => return false,
+    };
+    if proc.pid != pid || proc.generation != generation {
+        return false;
     }
-    cleanup_zombie(pid);
+
+    let post = request_process_exit_locked(&mut proc, exit_code, crate::get_ticks());
+    drop(proc);
+    finish_process_exit_request(post)
 }
 
 /// OOM killer 调用的时间戳函数
@@ -6118,6 +6609,6 @@ pub fn oom_timestamp() -> u64 {
 ///
 /// 在内核初始化时调用，将进程管理函数注册到 OOM killer
 pub fn register_oom_callbacks() {
-    mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_cleanup, oom_timestamp);
+    mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_timestamp);
     klog!(Info, "  OOM killer callbacks registered");
 }

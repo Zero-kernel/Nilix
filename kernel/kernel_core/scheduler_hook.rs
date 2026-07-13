@@ -7,19 +7,29 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use cpu_local::CpuLocal;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 /// 定时器回调类型：在定时器中断时调用
 pub type TimerCallback = fn();
 
+/// RF178-33: Distinguish a normal process-context scheduling point from the
+/// timer IRQ-return fast path. The latter must remain strictly bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReschedOrigin {
+    Process,
+    IrqReturn,
+}
+
 /// 重调度回调类型：force=true 强制调度，false 仅在需要时调度
-pub type ReschedCallback = fn(force: bool);
+pub type ReschedCallback = fn(force: bool, origin: ReschedOrigin);
 
 /// R39-6 FIX: 全局定时器回调列表（支持多个回调，按注册顺序依次调用）
 static TIMER_CBS: Mutex<Vec<TimerCallback>> = Mutex::new(Vec::new());
 
 /// 全局重调度回调
-static RESCHED_CB: Mutex<Option<ReschedCallback>> = Mutex::new(None);
+/// RF178-33: immutable after early scheduler initialization. IRQ-return
+/// scheduling reads this without acquiring a spin lock while IF=0.
+static RESCHED_CB: Once<ReschedCallback> = Once::new();
 
 /// 【关键修复】从中断上下文延迟的抢占请求标志
 ///
@@ -71,12 +81,7 @@ pub fn register_timer_callback(cb: TimerCallback) {
 ///
 /// 调度器在初始化时调用此函数注册 reschedule_now 处理器
 pub fn register_resched_callback(cb: ReschedCallback) {
-    // R152-11 FIX: Disable IRQs while holding RESCHED_CB lock.
-    // force_reschedule() also acquires this lock and is reachable from signal paths
-    // that may run in interrupt-adjacent context. Matches register_timer_callback().
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        *RESCHED_CB.lock() = Some(cb);
-    });
+    RESCHED_CB.call_once(|| cb);
 }
 
 /// Maximum number of timer callbacks (prevents allocation in IRQ context)
@@ -217,9 +222,8 @@ pub fn reschedule_if_needed() {
     // The callback triggers context switches — holding a global spinlock
     // across switch_context corrupts the lock when the resumed task drops
     // its own stale MutexGuard. Same copy-then-call pattern as on_scheduler_tick().
-    let cb = x86_64::instructions::interrupts::without_interrupts(|| *RESCHED_CB.lock());
-    if let Some(cb) = cb {
-        cb(irq_pending);
+    if let Some(cb) = RESCHED_CB.get().copied() {
+        cb(irq_pending, ReschedOrigin::Process);
     }
 }
 
@@ -229,9 +233,18 @@ pub fn reschedule_if_needed() {
 #[inline]
 pub fn force_reschedule() {
     // R160-3 FIX: Copy callback out of lock before invoking (same fix as reschedule_if_needed).
-    let cb = x86_64::instructions::interrupts::without_interrupts(|| *RESCHED_CB.lock());
-    if let Some(cb) = cb {
-        cb(true);
+    if let Some(cb) = RESCHED_CB.get().copied() {
+        cb(true, ReschedOrigin::Process);
+    }
+}
+
+/// RF178-33: IRQ-return scheduling entry. This deliberately skips every
+/// process-context deferred-work drain and tells the scheduler to use only its
+/// bounded, nonblocking local selector.
+#[inline]
+pub fn force_reschedule_from_irq() {
+    if let Some(cb) = RESCHED_CB.get().copied() {
+        cb(true, ReschedOrigin::IrqReturn);
     }
 }
 

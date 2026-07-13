@@ -9,14 +9,13 @@ use crate::process::{
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
 use spin::{Mutex, RwLock};
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
 use x86_64::{
-    instructions::interrupts,
     registers::control::Cr3,
     structures::paging::{
         page_table::PageTableEntry, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -685,7 +684,7 @@ fn fork_inner(
         child.active_wait_seq.store(0, Ordering::Relaxed);
 
         child.context.rax = 0; // 子进程返回值 0
-        child.state = ProcessState::Ready;
+        child.enter_ready_at(crate::get_ticks());
 
         kprintln!(
             "Fork: parent={}, child={}, COW enabled",
@@ -839,9 +838,23 @@ pub unsafe fn copy_page_table_cow(
 
         // 阶段 2: 预分配所有中间页表帧
         // 若分配失败，此时父进程未被修改，直接返回错误即可
-        let table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
+        let mut table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
+
+        // RF178-6 / RF178-31: Refcount metadata is part of the COW transaction.
+        // Stage checked fixed-table deltas before any parent PTE mutation. Failure
+        // rolls back the exact prefix; explicitly return all preallocated table
+        // frames because dropping a PhysFrame value does not free the frame.
+        if let Err(error) = PAGE_REF_COUNT.stage_clone_refs(&mut plan) {
+            for frame in table_frames.drain(..) {
+                frame_alloc.deallocate_frame(frame);
+            }
+            return Err(error);
+        }
 
         // 阶段 3: 应用所有 COW 修改（使用预分配帧，保证不会失败）
+        // RF178-31: All allocation and refcount staging completed above. The
+        // remaining traversal is structurally infallible and only consumes the
+        // exact plan plus its exact number of preallocated page-table frames.
         let mut leaf_cursor = 0usize;
         let mut frame_iter = table_frames.into_iter();
         apply_clone_level(
@@ -851,8 +864,9 @@ pub unsafe fn copy_page_table_cow(
             &plan,
             &mut leaf_cursor,
             4,
-        )?;
+        );
         debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
+        debug_assert!(frame_iter.next().is_none());
 
         // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
         // 使用 TLB shootdown 机制，为 SMP 支持做准备
@@ -990,6 +1004,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         // R114-3 FIX: `flags` is guaranteed fresh — read under PT_LOCK above.
         let mut new_flags = flags;
         new_flags.remove(cow_flag());
+        new_flags.remove(cow_readonly_flag());
         new_flags.insert(PageTableFlags::WRITABLE);
 
         // H-35 fix: If map fails, try to restore the old mapping to avoid page loss
@@ -1015,7 +1030,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         // R114-3 FIX (Codex review): Use page-aligned frame address for refcount key,
         // not the offset-adjusted `old_phys`. `translate_with_flags()` returns
         // `frame.start_address() + offset`, but refcount keys are page-aligned
-        // (set by `PAGE_REF_COUNT.increment(entry.addr().as_u64() as usize)` in fork).
+        // (staged transactionally by `PhysicalPageRefCount::stage_clone_refs` in fork).
         // Using unaligned `old_phys` would miss the entry and return 0, causing
         // premature frame deallocation.
         // R153-I2 FIX: Assert alignment to catch future misuse of the refcount API.
@@ -1023,8 +1038,10 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
             old_frame.start_address().as_u64() % 4096 == 0,
             "COW refcount key must be page-aligned"
         );
-        let remaining = PAGE_REF_COUNT.decrement(old_frame.start_address().as_u64() as usize);
-        if remaining == 0 {
+        // RF178-31: a COW PTE must already be tracked. Missing/invalid metadata
+        // fails leak-safe; only a confirmed tracked last reference may be freed.
+        let release = PAGE_REF_COUNT.release(old_frame.start_address().as_u64() as usize);
+        if release == CowPageRelease::Last {
             frame_alloc.deallocate_frame(old_frame);
         }
 
@@ -1037,122 +1054,196 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     })
 }
 
-/// 物理页引用计数管理
-///
-/// 使用 RwLock + AtomicU64 实现中断安全的引用计数：
-/// - 读取操作只需 RwLock 读锁，高并发友好
-/// - 原子操作确保增减引用不需要等待写锁
-/// - 新增条目时禁用中断获取写锁，避免死锁
+/// RF178-31 FIX: fixed COW refcount storage for the largest buddy-managed
+/// physical window. This 256 KiB table lives in kernel static storage, not the
+/// 1 MiB heap, and every lookup/update is O(1).
+static COW_PAGE_REFCOUNTS: [AtomicU32; mm::memory::MAX_MANAGED_PHYS_PAGES] =
+    [const { AtomicU32::new(0) }; mm::memory::MAX_MANAGED_PHYS_PAGES];
+
+/// Result of atomically releasing one leaf mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CowPageRelease {
+    /// This frame never entered COW tracking; the removed leaf owned it directly.
+    Untracked,
+    /// Other tracked mappings still own the frame.
+    Remaining(u32),
+    /// This was the last tracked mapping.
+    Last,
+    /// The address is malformed or outside the buddy-owned window. Never free it.
+    Invalid,
+}
+
+impl CowPageRelease {
+    /// Ordinary unmap/teardown frees both exclusive untracked pages and the last
+    /// tracked page. Invalid metadata fails leak-safe rather than risking a UAF.
+    #[inline]
+    pub const fn should_free_unmapped(self) -> bool {
+        matches!(self, Self::Untracked | Self::Last)
+    }
+}
+
 pub struct PhysicalPageRefCount {
-    /// 物理页地址 -> 原子引用计数
-    /// 使用 AtomicU64 避免在中断上下文中获取锁
-    ref_counts: Arc<RwLock<alloc::collections::BTreeMap<usize, AtomicU64>>>,
+    _fixed_table: (),
 }
 
 impl PhysicalPageRefCount {
-    pub fn new() -> Self {
-        PhysicalPageRefCount {
-            ref_counts: Arc::new(RwLock::new(alloc::collections::BTreeMap::new())),
+    pub const fn new() -> Self {
+        PhysicalPageRefCount { _fixed_table: () }
+    }
+
+    #[inline]
+    fn slot(phys_addr: usize) -> Option<&'static AtomicU32> {
+        let (base, page_count) = mm::memory::managed_physical_page_window()?;
+        if phys_addr & 0xfff != 0 {
+            return None;
+        }
+        let offset = (phys_addr as u64).checked_sub(base)?;
+        let index = usize::try_from(offset / 4096).ok()?;
+        if index >= page_count {
+            return None;
+        }
+        COW_PAGE_REFCOUNTS.get(index)
+    }
+
+    /// Atomically add this fork's exact mapping delta to one frame.
+    fn stage_slot(slot: &AtomicU32, flags: PageTableFlags) -> Result<u32, ForkError> {
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Ok(0);
+        }
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(ForkError::PageTableCopyFailed);
+        }
+        let write_cow = flags.contains(cow_flag());
+        let readonly_cow = flags.contains(cow_readonly_flag());
+        if (write_cow && readonly_cow)
+            || ((write_cow || readonly_cow) && flags.contains(PageTableFlags::WRITABLE))
+        {
+            return Err(ForkError::PageTableCopyFailed);
+        }
+
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            let delta = if old == 0 {
+                // A COW marker proves the parent was already tracked. Losing
+                // that metadata cannot be repaired from one PTE; fail leak-safe.
+                if write_cow || readonly_cow {
+                    return Err(ForkError::PageTableCopyFailed);
+                }
+                2 // materialize the existing parent plus the new child
+            } else {
+                // Every successfully cloned user leaf is COW-marked below.
+                // A tracked non-COW state is contradictory (or an alias the
+                // current metadata cannot count safely), so do not guess.
+                if !write_cow && !readonly_cow {
+                    return Err(ForkError::PageTableCopyFailed);
+                }
+                1 // the tracked parent exists; add only the new child
+            };
+            let new = old
+                .checked_add(delta)
+                .ok_or(ForkError::PageTableCopyFailed)?;
+            match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(delta),
+                Err(actual) => old = actual,
+            }
         }
     }
 
-    /// 增加页的引用计数
+    fn rollback_slot(slot: &AtomicU32, delta: u32) {
+        let mut current = slot.load(Ordering::Acquire);
+        loop {
+            let Some(new) = current.checked_sub(delta) else {
+                debug_assert!(false, "staged COW refcount rollback underflow");
+                return;
+            };
+            match slot.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_slot(slot: &AtomicU32) -> CowPageRelease {
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 {
+                return CowPageRelease::Untracked;
+            }
+            let new = old - 1;
+            match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) if new == 0 => return CowPageRelease::Last,
+                Ok(_) => return CowPageRelease::Remaining(new),
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    /// Fallibly stage every refcount delta required by a COW clone.
     ///
-    /// 快速路径：如果条目已存在，只需原子增加
-    /// 慢速路径：禁用中断并获取写锁创建新条目
-    pub fn increment(&self, phys_addr: usize) -> u64 {
-        // 快速路径：尝试读锁查找已存在的条目
-        if let Some(count) = self.ref_counts.read().get(&phys_addr) {
-            return count.fetch_add(1, Ordering::SeqCst) + 1; // lint-fetch-add: allow (statistics counter)
+    /// The caller holds PT_LOCK, so the leaf plan is stable. Each checked atomic
+    /// delta is recorded in its leaf; any failure rolls back the staged prefix
+    /// before a parent PTE has been changed.
+    fn stage_clone_refs(&self, plan: &mut CowClonePlan) -> Result<(), ForkError> {
+        debug_assert!(plan.leaf_updates.iter().all(|leaf| leaf.ref_delta == 0));
+
+        for index in 0..plan.leaf_updates.len() {
+            let (phys_addr, flags) = {
+                let leaf = &plan.leaf_updates[index];
+                (leaf.phys_addr.as_u64() as usize, leaf.original_flags)
+            };
+
+            // Supervisor identity-map leaves are copied unchanged. Only actual
+            // user mappings consume COW references or become write-protected.
+            if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                continue;
+            }
+
+            let Some(slot) = Self::slot(phys_addr) else {
+                self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
+                return Err(ForkError::PageTableCopyFailed);
+            };
+            let delta = match Self::stage_slot(slot, flags) {
+                Ok(delta) => delta,
+                Err(error) => {
+                    self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
+                    return Err(error);
+                }
+            };
+            plan.leaf_updates[index].ref_delta = delta;
         }
 
-        // 慢速路径：禁用中断以安全获取写锁
-        interrupts::without_interrupts(|| {
-            let mut counts = self.ref_counts.write();
-            // Double-check：可能在等待写锁期间被其他 CPU 创建
-            let entry = counts.entry(phys_addr).or_insert_with(|| AtomicU64::new(0));
-            entry.fetch_add(1, Ordering::SeqCst) + 1 // lint-fetch-add: allow (statistics counter)
-        })
+        Ok(())
     }
 
-    /// 减少页的引用计数
-    ///
-    /// 返回更新后的引用计数。如果为 0 则调用者可以释放该页。
-    /// 使用 CAS 循环确保原子性。
-    /// 【M-15 修复】当引用计数归零时，自动从映射中移除条目以防止内存泄漏
-    ///
-    /// # R69-1 FIX: Atomic Decrement + Removal
-    ///
-    /// Previous two-phase approach (read-lock CAS, then write-lock removal) had a TOCTOU
-    /// vulnerability: between releasing read lock and calling remove_entry(), a concurrent
-    /// increment() could resurrect the entry, causing use-after-free when caller frees
-    /// the frame based on the returned 0.
-    ///
-    /// Now uses a single write-lock section with interrupts disabled to ensure atomicity
-    /// of decrement + removal. This eliminates the ABA window at the cost of slightly
-    /// higher contention (all decrements now need write lock instead of read lock).
-    pub fn decrement(&self, phys_addr: usize) -> u64 {
-        // R69-1 FIX: Single atomic section eliminates ABA race condition.
-        // By holding the write lock throughout decrement + removal, no concurrent
-        // increment can resurrect the entry after we observe count == 0.
-        interrupts::without_interrupts(|| {
-            let mut counts = self.ref_counts.write();
-            if let Some(count) = counts.get(&phys_addr) {
-                let mut prev = count.load(Ordering::SeqCst);
-                while prev > 0 {
-                    match count.compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
-                    {
-                        Ok(_) => {
-                            let new_val = prev - 1;
-                            if new_val == 0 {
-                                // Remove entry immediately while still holding the lock
-                                counts.remove(&phys_addr);
-                            }
-                            return new_val;
-                        }
-                        Err(actual) => prev = actual,
-                    }
-                }
+    /// Undo a staged prefix without allocation or lookup-container mutation.
+    fn rollback_clone_refs(&self, leaves: &mut [LeafUpdate]) {
+        for leaf in leaves.iter_mut().rev() {
+            let delta = core::mem::replace(&mut leaf.ref_delta, 0);
+            if delta == 0 {
+                continue;
             }
-            0
-        })
+
+            let phys_addr = leaf.phys_addr.as_u64() as usize;
+            let Some(slot) = Self::slot(phys_addr) else {
+                debug_assert!(false, "staged COW refcount address left managed window");
+                continue;
+            };
+            Self::rollback_slot(slot, delta);
+        }
     }
 
-    /// 移除指定地址的引用计数条目（引用计数归零时调用）
-    fn remove_entry(&self, phys_addr: usize) {
-        interrupts::without_interrupts(|| {
-            let mut counts = self.ref_counts.write();
-            // 二次检查确保确实归零（防止并发increment竞态）
-            if let Some(entry) = counts.get(&phys_addr) {
-                if entry.load(Ordering::SeqCst) == 0 {
-                    counts.remove(&phys_addr);
-                }
-            }
-        });
-    }
-
-    /// 获取页的引用计数
-    pub fn get(&self, phys_addr: usize) -> u64 {
-        self.ref_counts
-            .read()
-            .get(&phys_addr)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    /// 移除引用计数为 0 的条目（可选清理）
-    pub fn cleanup_zero_entries(&self) {
-        interrupts::without_interrupts(|| {
-            let mut counts = self.ref_counts.write();
-            counts.retain(|_, v| v.load(Ordering::Relaxed) > 0);
-        });
+    /// Atomically remove one mapping reference. Zero is a stable table value,
+    /// so no allocation, removal, cleanup scan, or split get/decrement race exists.
+    pub fn release(&self, phys_addr: usize) -> CowPageRelease {
+        match Self::slot(phys_addr) {
+            Some(slot) => Self::release_slot(slot),
+            None => CowPageRelease::Invalid,
+        }
     }
 }
 
 /// 全局物理页引用计数器
-lazy_static::lazy_static! {
-    pub static ref PAGE_REF_COUNT: PhysicalPageRefCount = PhysicalPageRefCount::new();
-}
+pub static PAGE_REF_COUNT: PhysicalPageRefCount = PhysicalPageRefCount::new();
 
 // ============================================================================
 // COW 辅助函数
@@ -1160,8 +1251,15 @@ lazy_static::lazy_static! {
 
 /// COW 标志位（使用 BIT_9，这是 x86_64 页表中可供软件使用的位）
 #[inline]
-const fn cow_flag() -> PageTableFlags {
+pub(crate) const fn cow_flag() -> PageTableFlags {
     PageTableFlags::BIT_9
+}
+
+/// Shared read-only COW tracking without write entitlement. Unlike BIT_9,
+/// write faults and copy-to-user validation must never treat this bit as writable.
+#[inline]
+pub(crate) const fn cow_readonly_flag() -> PageTableFlags {
+    PageTableFlags::BIT_10
 }
 
 // ============================================================================
@@ -1178,6 +1276,9 @@ struct LeafUpdate {
     original_flags: PageTableFlags,
     /// 物理地址
     phys_addr: PhysAddr,
+    /// RF178-6: exact delta already staged in PAGE_REF_COUNT. Zero until
+    /// staging succeeds; used to transactionally unwind a failed prefix.
+    ref_delta: u32,
 }
 
 /// 记录 COW 复制计划
@@ -1207,6 +1308,7 @@ impl CowClonePlan {
             entry_ptr: entry as *mut PageTableEntry,
             original_flags: entry.flags(),
             phys_addr: entry.addr(),
+            ref_delta: 0,
         });
         Ok(())
     }
@@ -1284,7 +1386,7 @@ fn apply_clone_level(
     plan: &CowClonePlan,
     leaf_cursor: &mut usize,
     level: u8,
-) -> Result<(), ForkError> {
+) {
     // 只处理用户空间（PML4 的索引 0-255）
     let idx_range = if level == 4 { 0..256 } else { 0..512 };
 
@@ -1299,12 +1401,14 @@ fn apply_clone_level(
             let planned = plan
                 .leaf_updates
                 .get(*leaf_cursor)
-                .ok_or(ForkError::PageTableCopyFailed)?;
+                .expect("COW apply traversal must match its locked plan");
             *leaf_cursor += 1;
-            apply_leaf(entry, &mut child[idx], planned)?;
+            apply_leaf(entry, &mut child[idx], planned);
         } else {
             // 中间节点：使用预分配帧
-            let frame = frames.next().ok_or(ForkError::MemoryAllocationFailed)?;
+            let frame = frames
+                .next()
+                .expect("COW apply must have one preallocated frame per planned table");
             unsafe {
                 zero_table(frame);
             }
@@ -1320,10 +1424,9 @@ fn apply_clone_level(
                 plan,
                 leaf_cursor,
                 level - 1,
-            )?;
+            );
         }
     }
-    Ok(())
 }
 
 /// 应用单个叶子的 COW 修改
@@ -1333,7 +1436,7 @@ fn apply_leaf(
     parent_entry: &mut PageTableEntry,
     child_entry: &mut PageTableEntry,
     planned: &LeafUpdate,
-) -> Result<(), ForkError> {
+) {
     // 验证计划匹配（调试断言）
     debug_assert_eq!(
         planned.entry_ptr, parent_entry as *mut PageTableEntry,
@@ -1342,42 +1445,194 @@ fn apply_leaf(
 
     let addr = planned.phys_addr;
     let mut flags = planned.original_flags;
-    let addr_usize = addr.as_u64() as usize;
 
-    // 处理已经是 COW 的页面（来自之前的 fork）
-    if flags.contains(cow_flag()) {
-        // 已经是 COW，给新子进程增加一份引用
-        PAGE_REF_COUNT.increment(addr_usize);
-    } else if flags.contains(PageTableFlags::WRITABLE) {
-        // 如果页面可写，则标记为 COW
-        flags.remove(PageTableFlags::WRITABLE);
-        flags.insert(cow_flag());
-
-        // 更新父进程页表项
-        parent_entry.set_addr(addr, flags);
-
-        // 增加引用计数（父进程和子进程各一次）
-        PAGE_REF_COUNT.increment(addr_usize);
-        PAGE_REF_COUNT.increment(addr_usize);
-    } else if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-        // 【关键修复】只读用户页面（如代码段）也在进程间共享
-        // 缺少引用计数会导致父进程退出时页面被释放，而子进程仍在使用
-        //
-        // 【TOCTOU 修复】使用一次原子加返回旧值的方式避免 get()+increment 竞态：
-        // - increment() 返回更新后的值，减 1 得到旧值
-        // - 如果旧值为 0，说明是首次跟踪此页面，需要补记父进程的引用
-        // - 如果旧值 > 0，说明已有其他进程在跟踪，只需为子进程增加引用
-        let new_count = PAGE_REF_COUNT.increment(addr_usize); // 子进程持有引用
-        let prev = new_count.saturating_sub(1); // 计算旧值
-        if prev == 0 {
-            // 首次跟踪此页面时，补记父进程的持有
-            PAGE_REF_COUNT.increment(addr_usize);
+    // RF178-6: Refcount deltas were staged before entering this function.
+    // Application performs no allocation or fallible metadata operation.
+    if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        if flags.contains(PageTableFlags::WRITABLE) || flags.contains(cow_flag()) {
+            flags.remove(PageTableFlags::WRITABLE);
+            flags.remove(cow_readonly_flag());
+            flags.insert(cow_flag());
+        } else {
+            flags.remove(cow_flag());
+            flags.insert(cow_readonly_flag());
         }
+        parent_entry.set_addr(addr, flags);
     }
 
     // 子进程使用相同的映射
     child_entry.set_addr(addr, flags);
-    Ok(())
+}
+
+/// Boot-time RF178-31 regression probes. These use one local atomic slot and
+/// never perturb the production COW table.
+pub fn run_cow_refcount_self_test() {
+    let user_writable =
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+    let user_readonly = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    let slot = AtomicU32::new(0);
+
+    assert_eq!(
+        PhysicalPageRefCount::stage_slot(
+            &slot,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        )
+        .expect("supervisor stage"),
+        0
+    );
+    assert_eq!(slot.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        PhysicalPageRefCount::stage_slot(&slot, user_writable | PageTableFlags::HUGE_PAGE),
+        Err(ForkError::PageTableCopyFailed)
+    ));
+    assert!(matches!(
+        PhysicalPageRefCount::stage_slot(&slot, user_readonly | cow_flag()),
+        Err(ForkError::PageTableCopyFailed)
+    ));
+    assert!(matches!(
+        PhysicalPageRefCount::stage_slot(&slot, user_readonly | cow_readonly_flag()),
+        Err(ForkError::PageTableCopyFailed)
+    ));
+    assert_eq!(slot.load(Ordering::Acquire), 0);
+
+    let first =
+        PhysicalPageRefCount::stage_slot(&slot, user_writable).expect("first writable COW stage");
+    assert_eq!(first, 2);
+    assert!(matches!(
+        PhysicalPageRefCount::stage_slot(&slot, user_readonly),
+        Err(ForkError::PageTableCopyFailed)
+    ));
+    assert_eq!(slot.load(Ordering::Acquire), 2);
+    let child = PhysicalPageRefCount::stage_slot(&slot, user_readonly | cow_readonly_flag())
+        .expect("existing COW stage");
+    assert_eq!(child, 1);
+    assert_eq!(slot.load(Ordering::Acquire), 3);
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&slot),
+        CowPageRelease::Remaining(2)
+    );
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&slot),
+        CowPageRelease::Remaining(1)
+    );
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&slot),
+        CowPageRelease::Last
+    );
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&slot),
+        CowPageRelease::Untracked
+    );
+
+    let readonly_first =
+        PhysicalPageRefCount::stage_slot(&slot, user_readonly).expect("first read-only COW stage");
+    assert_eq!(readonly_first, 2);
+    slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_add(1)
+    })
+    .expect("unrelated checked increment");
+    PhysicalPageRefCount::rollback_slot(&slot, readonly_first);
+    assert_eq!(slot.load(Ordering::Acquire), 1);
+
+    slot.store(u32::MAX, Ordering::Release);
+    assert!(matches!(
+        PhysicalPageRefCount::stage_slot(&slot, user_readonly | cow_readonly_flag()),
+        Err(ForkError::PageTableCopyFailed)
+    ));
+    assert_eq!(slot.load(Ordering::Acquire), u32::MAX);
+
+    let (base, pages) = mm::memory::managed_physical_page_window()
+        .expect("buddy physical window must precede integration tests");
+    let base = usize::try_from(base).expect("physical base fits usize");
+    assert!(PhysicalPageRefCount::slot(base).is_some());
+    assert!(PhysicalPageRefCount::slot(base + (pages - 1) * 4096).is_some());
+    assert!(PhysicalPageRefCount::slot(base + pages * 4096).is_none());
+    assert!(PhysicalPageRefCount::slot(base + 1).is_none());
+    if base >= 4096 {
+        assert!(PhysicalPageRefCount::slot(base - 4096).is_none());
+    }
+
+    // Exercise the production transaction through two deltas for the same
+    // frame followed by an invalid address. Rollback must restore both the
+    // fixed slot and every receipt before any PTE apply.
+    let production_slot = PhysicalPageRefCount::slot(base).expect("first managed slot");
+    assert_eq!(production_slot.load(Ordering::Acquire), 0);
+    let mut plan = CowClonePlan::new();
+    plan.leaf_updates
+        .try_reserve_exact(3)
+        .expect("three-leaf rollback plan");
+    let invalid_phys = base
+        .checked_add(pages * 4096)
+        .expect("managed-window end fits usize");
+    for (phys, flags) in [
+        (base, user_writable),
+        (base, user_readonly | cow_readonly_flag()),
+        (invalid_phys, user_writable),
+    ] {
+        plan.leaf_updates.push(LeafUpdate {
+            entry_ptr: core::ptr::null_mut(),
+            original_flags: flags,
+            phys_addr: PhysAddr::new(phys as u64),
+            ref_delta: 0,
+        });
+    }
+    let staged = x86_64::instructions::interrupts::without_interrupts(|| {
+        PAGE_REF_COUNT.stage_clone_refs(&mut plan)
+    });
+    assert!(matches!(staged, Err(ForkError::PageTableCopyFailed)));
+    assert_eq!(production_slot.load(Ordering::Acquire), 0);
+    assert!(plan.leaf_updates.iter().all(|leaf| leaf.ref_delta == 0));
+
+    let supervisor_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let mut supervisor_parent = PageTableEntry::new();
+    let mut supervisor_child = PageTableEntry::new();
+    supervisor_parent.set_addr(PhysAddr::new(base as u64), supervisor_flags);
+    let supervisor_plan = LeafUpdate {
+        entry_ptr: &mut supervisor_parent,
+        original_flags: supervisor_flags,
+        phys_addr: PhysAddr::new(base as u64),
+        ref_delta: 0,
+    };
+    apply_leaf(
+        &mut supervisor_parent,
+        &mut supervisor_child,
+        &supervisor_plan,
+    );
+    assert!(supervisor_parent.flags().contains(PageTableFlags::WRITABLE));
+    assert!(!supervisor_parent.flags().contains(cow_flag()));
+    assert!(supervisor_child.flags().contains(PageTableFlags::WRITABLE));
+
+    let mut readonly_parent = PageTableEntry::new();
+    let mut readonly_child = PageTableEntry::new();
+    readonly_parent.set_addr(PhysAddr::new(base as u64), user_readonly);
+    let readonly_plan = LeafUpdate {
+        entry_ptr: &mut readonly_parent,
+        original_flags: user_readonly,
+        phys_addr: PhysAddr::new(base as u64),
+        ref_delta: 2,
+    };
+    apply_leaf(&mut readonly_parent, &mut readonly_child, &readonly_plan);
+    assert!(readonly_parent.flags().contains(cow_readonly_flag()));
+    assert!(readonly_child.flags().contains(cow_readonly_flag()));
+    assert!(!readonly_parent.flags().contains(cow_flag()));
+    assert!(!readonly_child.flags().contains(cow_flag()));
+    assert!(!readonly_parent.flags().contains(PageTableFlags::WRITABLE));
+
+    let write_cow_flags = user_readonly | cow_flag();
+    let mut refork_parent = PageTableEntry::new();
+    let mut refork_child = PageTableEntry::new();
+    refork_parent.set_addr(PhysAddr::new(base as u64), write_cow_flags);
+    let refork_plan = LeafUpdate {
+        entry_ptr: &mut refork_parent,
+        original_flags: write_cow_flags,
+        phys_addr: PhysAddr::new(base as u64),
+        ref_delta: 1,
+    };
+    apply_leaf(&mut refork_parent, &mut refork_child, &refork_plan);
+    assert!(refork_parent.flags().contains(cow_flag()));
+    assert!(refork_child.flags().contains(cow_flag()));
+    assert!(!refork_parent.flags().contains(cow_readonly_flag()));
+    assert!(!refork_child.flags().contains(cow_readonly_flag()));
 }
 
 /// 查找虚拟地址对应的页表项
@@ -1432,6 +1687,56 @@ unsafe fn zero_table(frame: PhysFrame) {
     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
 }
 
+/// RF178-15 FIX: private-frame rollback ledger for fresh address spaces.
+/// Copied identity-map leaves are shared and must never be recursively freed.
+/// The constructor allocates at most root + PDPT + PD + PT.
+struct FreshSpaceGuard {
+    frames: [Option<PhysFrame<Size4KiB>>; 4],
+    len: usize,
+    committed: bool,
+}
+
+impl FreshSpaceGuard {
+    fn new(root: PhysFrame<Size4KiB>) -> Self {
+        let mut frames = [None; 4];
+        frames[0] = Some(root);
+        Self {
+            frames,
+            len: 1,
+            committed: false,
+        }
+    }
+
+    fn track(&mut self, frame: PhysFrame<Size4KiB>) -> Result<(), ForkError> {
+        if self.len >= self.frames.len() {
+            let mut allocator = FrameAllocator::new();
+            allocator.deallocate_frame(frame);
+            return Err(ForkError::PageTableCopyFailed);
+        }
+        self.frames[self.len] = Some(frame);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for FreshSpaceGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut allocator = FrameAllocator::new();
+        for index in (0..self.len).rev() {
+            if let Some(frame) = self.frames[index].take() {
+                allocator.deallocate_frame(frame);
+            }
+        }
+    }
+}
+
 /// 创建新的用户地址空间
 ///
 /// 分配新的 PML4 页表并复制内核高半区映射（索引 256-511）。
@@ -1451,6 +1756,10 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
     let new_pml4_frame = frame_alloc
         .allocate_frame()
         .ok_or(ForkError::MemoryAllocationFailed)?;
+
+    // R178-17 / RF178-15: arm private-frame rollback immediately after root
+    // allocation, before any subsequent fallible table construction.
+    let mut construction_guard = FreshSpaceGuard::new(new_pml4_frame);
 
     // 清零新页表
     unsafe {
@@ -1474,7 +1783,12 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
         // 1. 深拷贝 PML4[0] 路径上的页表（避免影响内核的恒等映射）
         // 2. 将用户空间区域（0x400000 附近）的 2MB 大页拆分为 4KB 页
         if !current_pml4[0].is_unused() {
-            deep_copy_identity_for_user(current_pml4, new_pml4, &mut frame_alloc)?;
+            deep_copy_identity_for_user(
+                current_pml4,
+                new_pml4,
+                &mut frame_alloc,
+                &mut construction_guard,
+            )?;
         }
 
         // 复制内核高半区映射（索引 256-511）
@@ -1499,6 +1813,9 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         new_pml4[RECURSIVE_INDEX].set_frame(new_pml4_frame, recursive_flags);
     }
+
+    // R178-17 FIX: Commit the guard — construction succeeded, no rollback needed.
+    construction_guard.commit();
 
     let phys_addr = new_pml4_frame.start_address().as_u64() as usize;
     Ok((new_pml4_frame, phys_addr))
@@ -1713,6 +2030,7 @@ unsafe fn deep_copy_identity_for_user(
     current_pml4: &mut PageTable,
     new_pml4: &mut PageTable,
     frame_alloc: &mut FrameAllocator,
+    construction_guard: &mut FreshSpaceGuard,
 ) -> Result<(), ForkError> {
     // 用户空间起始地址对应的页表索引
     const USER_BASE: usize = 0x400000; // 4MB
@@ -1728,6 +2046,7 @@ unsafe fn deep_copy_identity_for_user(
     let new_pdpt_frame = frame_alloc
         .allocate_frame()
         .ok_or(ForkError::MemoryAllocationFailed)?;
+    construction_guard.track(new_pdpt_frame)?;
     zero_table(new_pdpt_frame);
 
     // 复制 PDPT 条目
@@ -1772,6 +2091,7 @@ unsafe fn deep_copy_identity_for_user(
     let new_pd_frame = frame_alloc
         .allocate_frame()
         .ok_or(ForkError::MemoryAllocationFailed)?;
+    construction_guard.track(new_pd_frame)?;
     zero_table(new_pd_frame);
 
     // 复制 PD 条目
@@ -1817,6 +2137,7 @@ unsafe fn deep_copy_identity_for_user(
         let new_pt_frame = frame_alloc
             .allocate_frame()
             .ok_or(ForkError::MemoryAllocationFailed)?;
+        construction_guard.track(new_pt_frame)?;
         zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
 
         // 更新 PD[2] 指向新的空 PT（不再是大页）
@@ -1842,6 +2163,7 @@ unsafe fn deep_copy_identity_for_user(
         let new_pt_frame = frame_alloc
             .allocate_frame()
             .ok_or(ForkError::MemoryAllocationFailed)?;
+        construction_guard.track(new_pt_frame)?;
         zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
 
         // 【关键修复】添加 USER_ACCESSIBLE，移除 NO_EXECUTE 以允许用户代码执行

@@ -8,7 +8,7 @@
 //! Events include: syscall number, arguments, result, and process context.
 
 use crate::cgroup;
-use crate::fork::PAGE_REF_COUNT;
+use crate::fork::{cow_flag, cow_readonly_flag, PAGE_REF_COUNT};
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
     current_net_ns_id, current_pid, get_process, terminate_process, terminate_self_and_halt,
@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
-use cpu_local::{current_cpu, current_cpu_id, max_cpus};
+use cpu_local::{current_cpu, current_cpu_id};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -472,7 +472,7 @@ fn stdin_prepare_to_wait() -> bool {
             // `true` return preserves the EOF/EINTR distinction at the caller (a `false`
             // return is EOF, not EINTR — RISK-1).
             if !crate::signal::should_abort_pending_block(&proc) {
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(crate::get_ticks());
             }
         }
     });
@@ -491,7 +491,7 @@ fn stdin_cancel_wait() {
             if let Some(proc_arc) = get_process(pid) {
                 let mut proc = proc_arc.lock();
                 if proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
+                    proc.enter_ready_at(crate::get_ticks());
                 }
             }
         });
@@ -531,7 +531,7 @@ fn stdin_finish_wait() -> bool {
                     if let Some(proc_arc) = get_process(pid) {
                         let mut proc = proc_arc.lock();
                         if proc.state == ProcessState::Blocked {
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(crate::get_ticks());
                         }
                     }
                     aborted = true;
@@ -545,7 +545,7 @@ fn stdin_finish_wait() -> bool {
                     if let Some(proc_arc) = get_process(pid) {
                         let mut proc = proc_arc.lock();
                         if proc.state == ProcessState::Blocked {
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(crate::get_ticks());
                         }
                     }
                     aborted = true;
@@ -622,7 +622,7 @@ pub fn drain_deferred_stdin_wakes() {
                 // R173: Use try_lock on PCB to avoid deadlock
                 if let Some(mut proc) = proc_arc.try_lock() {
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(crate::get_ticks());
                         return; // 只唤醒一个
                     }
                 }
@@ -743,7 +743,7 @@ impl SocketWaiters {
                 if let Some(proc_arc) = get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(crate::get_ticks());
                         // Clean up empty queue
                         if queue.is_empty() {
                             self.waiters.remove(&queue_addr);
@@ -767,7 +767,7 @@ impl SocketWaiters {
                 if let Some(proc_arc) = get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
+                        proc.enter_ready_at(crate::get_ticks());
                         woken += 1;
                     }
                 }
@@ -859,7 +859,7 @@ impl SocketWaiters {
                                             core::sync::atomic::Ordering::Release,
                                         );
                                     }
-                                    proc.state = ProcessState::Ready;
+                                    proc.enter_ready_at(crate::get_ticks());
                                 }
                             } else {
                                 continue;
@@ -1022,7 +1022,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                     waiters.remove_waiter(queue_addr, pid, Some(my_gen));
                     return (my_gen, Some(net::WaitOutcome::Interrupted));
                 }
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(crate::get_ticks());
             }
             (my_gen, None)
         });
@@ -1050,7 +1050,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                         .lock()
                         .remove_waiter(queue_addr, pid, Some(my_gen));
                     if let Some(proc_arc) = get_process(pid) {
-                        proc_arc.lock().state = ProcessState::Ready;
+                        proc_arc.lock().enter_ready_at(crate::get_ticks());
                     }
                     aborted = true;
                     return false;
@@ -1063,7 +1063,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                         .lock()
                         .remove_waiter(queue_addr, pid, Some(my_gen));
                     if let Some(proc_arc) = get_process(pid) {
-                        proc_arc.lock().state = ProcessState::Ready;
+                        proc_arc.lock().enter_ready_at(crate::get_ticks());
                     }
                     aborted = true;
                     return false;
@@ -1085,7 +1085,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                         .remove_waiter(queue_addr, pid, Some(my_gen));
                     // Mark ready so we can return
                     if let Some(proc_arc) = get_process(pid) {
-                        proc_arc.lock().state = ProcessState::Ready;
+                        proc_arc.lock().enter_ready_at(crate::get_ticks());
                     }
                     return false;
                 }
@@ -1117,7 +1117,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                                     core::sync::atomic::Ordering::Release,
                                 );
                             }
-                            proc.state = ProcessState::Ready;
+                            proc.enter_ready_at(crate::get_ticks());
                         }
                         return false;
                     }
@@ -3571,7 +3571,7 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 fn sys_exit_group(exit_code: i32) -> SyscallResult {
     if let Some(pid) = current_pid() {
         // Determine our thread group ID and publish the group-exiting flag.
-        let tgid = {
+        let (tgid, group_exit_token) = {
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let proc = proc_arc.lock();
             // R153-3 FIX: Publish thread-group "exiting" flag before marking
@@ -3579,7 +3579,7 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             // slipping in between this point and the atomic marking scan below.
             proc.thread_group_exiting
                 .store(true, core::sync::atomic::Ordering::Release);
-            proc.tgid
+            (proc.tgid, Arc::clone(&proc.thread_group_exiting))
         };
 
         // R152-10 FIX: Atomically mark all siblings under PROCESS_TABLE lock.
@@ -3587,7 +3587,8 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
         // new thread that escapes the exit_group scan. The old snapshot-then-mark
         // pattern had a TOCTOU window where new threads could be created between
         // the snapshot and the marking loop.
-        let marked = crate::process::request_exit_group_atomic(pid, tgid, exit_code);
+        let marked =
+            crate::process::request_exit_group_atomic(pid, &group_exit_token, exit_code);
 
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook.
@@ -3599,6 +3600,9 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             exit_code,
             marked
         );
+
+        // The no-return tail does not run stack-local destructors.
+        drop(group_exit_token);
 
         // R117-1 FIX: Use centralized terminate_self_and_halt().
         terminate_self_and_halt(pid, exit_code);
@@ -4879,7 +4883,7 @@ fn sys_clone(
         child.user_ns_for_children = child_user_ns;
 
         // 设置进程状态为就绪
-        child.state = ProcessState::Ready;
+        child.enter_ready_at(crate::get_ticks());
     }
 
     // D3-ARC-MM-SHARED: reconcile_clone_vm_mmap_regions is no longer needed.
@@ -5721,7 +5725,7 @@ fn exec_from_bytes(
         let cloexec_cgroup_id = proc.cgroup_id;
         let cloexec_closed = proc.take_cloexec_fds_into(&mut cloexec_removed);
 
-        proc.state = ProcessState::Ready;
+        proc.enter_ready_at(crate::get_ticks());
 
         // M0 item 5: POSIX exec signal semantics. Caught signals (a real handler)
         // reset to SIG_DFL; SIG_IGN dispositions are PRESERVED; the blocked mask and
@@ -5807,6 +5811,11 @@ fn exec_from_bytes(
         final_rsp,
         stack_layout.argc
     );
+
+    // RF178-38 FIX: exec replaces the current task's trust domain without a
+    // scheduler context switch, so explicitly flush predictor and RSB state
+    // after the new image is committed and the old address space is gone.
+    security::spectre::context_switch_barrier(true);
 
     Ok(0)
 }
@@ -6334,7 +6343,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
         if wait_should_abort(pid) {
             let mut proc = parent.lock();
-            proc.state = ProcessState::Ready;
+            proc.enter_ready_at(crate::get_ticks());
             proc.waiting_child = None;
             return Err(SyscallError::EINTR);
         }
@@ -6343,7 +6352,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         // strands a confused parent). SEPARATE from the kill gate (kill-first).
         if crate::signal::has_deliverable_signal(pid) {
             let mut proc = parent.lock();
-            proc.state = ProcessState::Ready;
+            proc.enter_ready_at(crate::get_ticks());
             proc.waiting_child = None;
             return Err(SyscallError::EINTR);
         }
@@ -6387,11 +6396,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 // so the bare state-flip wake no-ops and wait4 (no IRQ/data backstop) strands
                 // permanently (+ deferred SIGKILL). Mirror sync.rs:585 — bail to EINTR.
                 if crate::signal::should_abort_pending_block(&proc) {
-                    proc.state = ProcessState::Ready;
+                    proc.enter_ready_at(crate::get_ticks());
                     proc.waiting_child = None;
                     return Err(SyscallError::EINTR);
                 }
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(crate::get_ticks());
                 proc.waiting_child = Some(0);
                 found
             } else {
@@ -6404,11 +6413,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                     return Err(SyscallError::ENOMEM);
                 }
                 if crate::signal::should_abort_pending_block(&proc) {
-                    proc.state = ProcessState::Ready;
+                    proc.enter_ready_at(crate::get_ticks());
                     proc.waiting_child = None;
                     return Err(SyscallError::EINTR);
                 }
-                proc.state = ProcessState::Blocked;
+                proc.enter_blocked_at(crate::get_ticks());
                 proc.waiting_child = Some(0);
                 snapshot.extend_from_slice(&proc.children);
                 snapshot
@@ -6433,6 +6442,10 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                     if child.state == ProcessState::Zombie
                         && child
                             .teardown_done
+                            .load(core::sync::atomic::Ordering::Acquire)
+                        && !child.on_cpu.load(core::sync::atomic::Ordering::Acquire)
+                        && !child
+                            .switch_reap_pending
                             .load(core::sync::atomic::Ordering::Acquire)
                     {
                         zombie_child = Some((
@@ -6493,7 +6506,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 let mut proc = parent.lock();
                 proc.children.retain(|&c| c != child_pid);
                 proc.waiting_child = None;
-                proc.state = ProcessState::Ready;
+                proc.enter_ready_at(crate::get_ticks());
             }
 
             // 清理僵尸进程资源
@@ -6515,7 +6528,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             proc.children.retain(|pid| !stale_pids.contains(pid));
             // 如果清理后没有子进程了，恢复状态并返回 ECHILD
             if proc.children.is_empty() {
-                proc.state = ProcessState::Ready;
+                proc.enter_ready_at(crate::get_ticks());
                 proc.waiting_child = None;
                 return Err(SyscallError::ECHILD);
             }
@@ -7137,12 +7150,19 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
             terminate_self_and_halt(pid, signal_exit_code(sig)); // no return
         }
         SignalAction::Stop => {
-            if let Some(arc) = get_process(pid) {
+            let stopped = if let Some(arc) = get_process(pid) {
                 let mut p = arc.lock();
-                p.stopped = true;
+                // RF178-35 FIX: a fatal request published after the earlier
+                // dispatcher check still dominates this safe-point stop.
+                let stopped = crate::process::try_mark_job_control_stopped_locked(&mut p);
                 p.pending_signals.clear(sig);
+                stopped
+            } else {
+                false
+            };
+            if stopped {
+                crate::scheduler_hook::force_reschedule();
             }
-            crate::scheduler_hook::force_reschedule();
         }
         SignalAction::Continue | SignalAction::Ignore => {
             if let Some(arc) = get_process(pid) {
@@ -7193,6 +7213,151 @@ pub fn run_exec_signal_safepoint_self_test() {
     assert!(
         t.iter().all(|s| !s.is_handler()),
         "leg-b: no real handler survives exec"
+    );
+}
+
+/// RF178-34 FIX: classify the architectural main stack without taking a lock.
+/// The window is deliberately half-open; an RSP exactly at `USER_STACK_TOP`
+/// does not acquire main-stack growth authority.
+#[inline]
+fn main_sigframe_stack(rsp: u64) -> Option<crate::signal_frame::SigframeStack> {
+    let (start, end) = crate::elf_loader::user_stack_window();
+    if (start as u64) <= rsp && rsp < end as u64 {
+        Some(crate::signal_frame::SigframeStack::Main {
+            floor: crate::elf_loader::user_stack_usable_floor(),
+        })
+    } else {
+        None
+    }
+}
+
+/// RF178-34 FIX: allocation-free, fail-closed VMA provenance lookup shared by
+/// syscall-return and IRQ-return signal delivery.
+///
+/// The greatest base `<= rsp` is the only candidate. This is load-bearing at
+/// adjacent mappings: a mapping beginning exactly at RSP wins over a lower VMA
+/// whose exclusive top is RSP. If that upper candidate is invalid, we do not
+/// fall back and grant the lower mapping authority over the frame write.
+fn locate_sigframe_vma(
+    rsp: u64,
+    regions: &crate::fallible_map::FallibleOrderedMap<usize, MmapEntry>,
+) -> crate::signal_frame::SigframeStack {
+    use crate::signal_frame::SigframeStack;
+
+    let Ok(rsp_key) = usize::try_from(rsp) else {
+        return SigframeStack::Unlocatable;
+    };
+    let Some((&base, &entry)) = regions.range(..=rsp_key).next_back() else {
+        return SigframeStack::Unlocatable;
+    };
+    let len = entry.len();
+    let Some(end) = base.checked_add(len) else {
+        return SigframeStack::Unlocatable;
+    };
+    if len == 0
+        || entry.is_prot_none()
+        || entry.has_transient()
+        || !entry.prot_write()
+        || rsp_key < base
+        || rsp_key > end
+    {
+        return SigframeStack::Unlocatable;
+    }
+
+    // `rsp == end` is the exact-top case: [frame_base, rsp) remains inside the
+    // candidate. `rsp == base` is accepted as provenance too, but the layout
+    // floor then rejects the downward frame rather than borrowing a lower VMA.
+    SigframeStack::Mmap { floor: base as u64 }
+}
+
+/// Pure RF178-34 regression coverage for the shared VMA locator and the
+/// half-open main-stack classifier. Map construction may allocate; the
+/// production locator itself only performs a binary range lookup.
+pub fn run_sigframe_stack_locator_self_test() {
+    use crate::fallible_map::FallibleOrderedMap;
+    use crate::signal_frame::SigframeStack;
+
+    let (main_start, main_end) = crate::elf_loader::user_stack_window();
+    let main_floor = crate::elf_loader::user_stack_usable_floor();
+    assert_eq!(
+        main_sigframe_stack(main_start as u64),
+        Some(SigframeStack::Main { floor: main_floor })
+    );
+    assert_eq!(
+        main_sigframe_stack(main_end as u64 - 1),
+        Some(SigframeStack::Main { floor: main_floor })
+    );
+    assert_eq!(
+        main_sigframe_stack(main_end as u64),
+        None,
+        "the main-stack window must remain half-open"
+    );
+
+    let write = MMAP_REGION_FLAG_PROT_READ | MMAP_REGION_FLAG_PROT_WRITE;
+    let mut regions: FallibleOrderedMap<usize, MmapEntry> = FallibleOrderedMap::new();
+    regions
+        .try_insert(0x1000, MmapEntry::from_len_flags(0x1000, write))
+        .expect("insert lower VMA");
+    assert_eq!(
+        locate_sigframe_vma(0x1800, &regions),
+        SigframeStack::Mmap { floor: 0x1000 },
+        "an RSP inside a writable VMA must use its base"
+    );
+    assert_eq!(
+        locate_sigframe_vma(0x2000, &regions),
+        SigframeStack::Mmap { floor: 0x1000 },
+        "an exact-top RSP must use the VMA below it"
+    );
+
+    regions
+        .try_insert(0x2000, MmapEntry::from_len_flags(0x1000, write))
+        .expect("insert adjacent upper VMA");
+    assert_eq!(
+        locate_sigframe_vma(0x2000, &regions),
+        SigframeStack::Mmap { floor: 0x2000 },
+        "at adjacency, the upper base==RSP mapping must win"
+    );
+    regions
+        .try_insert(
+            0x2000,
+            MmapEntry::from_len_flags(0x1000, MMAP_REGION_FLAG_PROT_READ),
+        )
+        .expect("replace upper VMA as read-only");
+    assert_eq!(
+        locate_sigframe_vma(0x2000, &regions),
+        SigframeStack::Unlocatable,
+        "an invalid upper adjacency candidate must not fall back to the lower VMA"
+    );
+
+    let invalid = [
+        MmapEntry::from_len_flags(0, write),
+        MmapEntry::prot_none(0x1000),
+        MmapEntry::from_len_flags(0x1000, write | MMAP_REGION_FLAG_PENDING_MAP),
+        MmapEntry::from_len_flags(0x1000, MMAP_REGION_FLAG_PROT_READ),
+    ];
+    for entry in invalid {
+        let mut one = FallibleOrderedMap::new();
+        one.try_insert(0x4000usize, entry)
+            .expect("insert invalid locator fixture");
+        assert_eq!(
+            locate_sigframe_vma(0x4000, &one),
+            SigframeStack::Unlocatable,
+            "zero-length, PROT_NONE, transient, and non-writable VMAs must fail closed"
+        );
+    }
+
+    let overflow_base = usize::MAX & !(PAGE_SIZE - 1);
+    let mut overflow = FallibleOrderedMap::new();
+    overflow
+        .try_insert(
+            overflow_base,
+            MmapEntry::from_len_flags(PAGE_SIZE, write),
+        )
+        .expect("insert overflowing locator fixture");
+    assert_eq!(
+        locate_sigframe_vma(overflow_base as u64, &overflow),
+        SigframeStack::Unlocatable,
+        "base+len overflow must fail closed"
     );
 }
 
@@ -7333,75 +7498,20 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     };
     crate::signal_frame::sanitize_fxsave_for_export(&mut fxcopy);
 
-    // R172-25 / R172-X-F2: the sigframe early-reject floor must track the DELIVERING
-    // task's OWN stack, not the main-thread geometry constant — a CLONE_VM thread's stack
-    // is a separate mmap'd region, so the constant floor spuriously E2BIG'd a below-floor
-    // thread (fatal SIGSEGV) and under-guarded an above-floor one. Tier-1 (RSP in the main
-    // window) needs NO lock; only a non-main RSP triggers the brief Process->MmState VMA
-    // lookup below. The locks are dropped BEFORE compute_sigframe_layout / the faultable
-    // copy_to_user, so the floor is a plain u64 fully decoupled from the lock. The floor is
-    // EITHER the exact base of the VMA rsp sits in/atop (tier 1/2) OR fail-closed == rsp
-    // (tier-3 unlocatable stack), so the frame is confined to rsp's own region and a
-    // genuine overflow becomes E2BIG/EFAULT -> fatal SIGSEGV — never a write into a foreign
-    // mapped region (a permissive 0 floor would NOT be caught by copy_to_user; Codex
-    // impl-diff `019ef337`).
-    let (win_start, win_end) = crate::elf_loader::user_stack_window();
-    let main_guard_top = crate::elf_loader::user_stack_mapped_floor();
-    let tracked_vma_base: Option<u64> =
-        if (win_start as u64) <= ctx.rsp && ctx.rsp < (win_end as u64) {
-            None // tier-1 main window: no VMA lookup needed
-        } else if let Some(arc) = get_process(pid) {
-            let proc = arc.lock();
+    // RF178-34 FIX: carry stack provenance through layout and backing. This
+    // prevents a low mmap-backed thread stack from entering main-stack growth.
+    let stack = match main_sigframe_stack(ctx.rsp) {
+        Some(main) => main,
+        None => {
+            let proc = proc_arc.lock();
             let mm = proc.mm.lock();
-            // Find the delivering task's stack VMA to bound the sigframe floor. Only a real
-            // (non-PROT_NONE, non-transient) mapping qualifies. TWO-STEP (Codex impl-diff
-            // `019ef337` — a bare `rsp-1` predecessor probe is UNSAFE for the rsp==base
-            // bottom edge, where it would pick the adjacent region BELOW and permit a write
-            // into foreign mapped memory):
-            //   PRIMARY — the VMA that CONTAINS rsp (`base <= rsp < end`). Covers mid-stack
-            //   AND the fully-consumed rsp==base bottom (floor=base; the frame is BELOW rsp,
-            //   so it then E2BIGs and is rejected — it is NEVER attributed to the region
-            //   below, so there is no cross-region spill).
-            //   FALLBACK (only when NO VMA contains rsp — the exclusive-TOP case rsp==base+len,
-            //   common right after clone): the VMA whose `end == rsp`. The sigframe writes
-            //   into [frame_base, rsp), which lies inside THAT region.
-            // PROT_NONE reservations and in-flight PENDING_MAP/UNMAP/MPROTECT regions fall
-            // through to the tier-3 fail-closed floor.
-            let region_floor = |va: u64, require_end_eq: Option<u64>| -> Option<u64> {
-                mm.mmap_regions
-                    .range(..=(va as usize))
-                    .next_back()
-                    .and_then(|(&base, &entry)| {
-                        let base = base as u64;
-                        let end = base.saturating_add(entry.len() as u64);
-                        let ok = !entry.is_prot_none()
-                            && !entry.has_transient()
-                            && base <= va
-                            && va < end
-                            && require_end_eq.map_or(true, |r| end == r);
-                        if ok {
-                            Some(base)
-                        } else {
-                            None
-                        }
-                    })
-            };
-            let found = region_floor(ctx.rsp, None)
-                .or_else(|| region_floor(ctx.rsp.saturating_sub(1), Some(ctx.rsp)));
-            drop(mm);
-            drop(proc);
-            found
-        } else {
-            None // task gone mid-flight: tier-3 permissive, copy_to_user backstops
-        };
-    let stack_floor = crate::signal_frame::resolve_sigframe_stack_floor(
+            locate_sigframe_vma(ctx.rsp, &mm.mmap_regions)
+        }
+    };
+    let layout = match crate::signal_frame::compute_sigframe_layout(
         ctx.rsp,
-        win_start as u64,
-        win_end as u64,
-        main_guard_top,
-        tracked_vma_base,
-    );
-    let layout = match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack_floor) {
+        stack.layout_floor(ctx.rsp),
+    ) {
         Ok(l) => l,
         // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
         Err(_) => terminate_self_and_halt(pid, 139),
@@ -7421,9 +7531,11 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // (Ring-0 writer #1 of 3). The sigframe writes to [frame_base, rsp), which may
     // land in the lazy region. Pre-grow ensures the pages are mapped BEFORE the
     // copy_to_user. If pre-grow fails (OOM / over-limit), kill with SIGSEGV.
-    if (layout.frame_base as usize) < crate::elf_loader::user_stack_layout().2 {
-        // frame_base is below eager_floor — may need demand-grow
-        if let Err(_) = ensure_stack_backed(pid, layout.frame_base as usize) {
+    if stack.needs_main_stack_backing(
+        layout.frame_base,
+        crate::elf_loader::user_stack_mapped_floor(),
+    ) {
+        if ensure_stack_backed(pid, layout.frame_base as usize).is_err() {
             terminate_self_and_halt(pid, 139);
         }
     }
@@ -7495,39 +7607,19 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
 // M0-7 SLICE 3b: IRQ-context preemptive signal delivery
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// M0-7 SLICE 3b FIX A: Resolve the sigframe stack floor using a 3-tier try-lock
-/// strategy. ANY lock contention → fail-closed to tier-3 (floor == rsp).
-///
-/// Tier 1: Main user-stack window (constant check, no lock).
-/// Tier 2: CLONE_VM thread stacks (VMA lookup via try_lock).
-/// Tier 3: Fail-closed floor (== rsp) on contention or no matching VMA.
-fn resolve_sigframe_stack_floor_irq(_pid: u64, rsp: u64, proc: &crate::process::Process) -> u64 {
-    // Tier 1: Main user-stack window (covers the musl default-process case).
-    // NO lock needed — this is a constant range check.
-    let (main_floor, main_top) = crate::elf_loader::user_stack_window();
-    let main_floor = main_floor as u64;
-    let main_top = main_top as u64;
-
-    if rsp >= main_floor && rsp < main_top {
-        return main_floor; // Hit tier-1 — no lock needed.
+/// Resolve stack provenance on IRQ return without blocking. Lock contention is
+/// unlocatable/fail-closed; the shared locator performs no allocation.
+fn resolve_sigframe_stack_irq(
+    rsp: u64,
+    proc: &crate::process::Process,
+) -> crate::signal_frame::SigframeStack {
+    if let Some(main) = main_sigframe_stack(rsp) {
+        return main;
     }
-
-    // Tier 2: CLONE_VM thread stacks (VMA lookup). Uses try_lock-or-tier-3.
-    // FIX A: We already hold proc via try_lock in the caller, so only proc.mm.try_lock() remains.
-    if let Some(mm_guard) = proc.mm.try_lock() {
-        // Scan mmap_regions for a stack mapping containing rsp.
-        // SAFETY: BTreeMap::iter() does not allocate, so this is safe in IRQ context.
-        for (base, entry) in mm_guard.mmap_regions.iter() {
-            let start = *base as u64;
-            let end = start + entry.len() as u64;
-            if rsp >= start && rsp < end {
-                return start; // Hit tier-2.
-            }
-        }
+    match proc.mm.try_lock() {
+        Some(mm) => locate_sigframe_vma(rsp, &mm.mmap_regions),
+        None => crate::signal_frame::SigframeStack::Unlocatable,
     }
-
-    // Tier 3: Fail-closed floor (==rsp). Contended lock or no matching VMA.
-    rsp
 }
 
 /// M0-7 SLICE 3b: FPU state helpers for IRQ signal delivery.
@@ -7604,6 +7696,11 @@ pub fn try_deliver_signal_on_irq_return(
     };
 
     // Check delivery preconditions under the lock.
+    // RF178-35 FIX: fatal exit dominates handler delivery. This closes the
+    // race after the timer's initial pending-exit transaction.
+    if proc_guard.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     if proc_guard.in_signal_handler {
         return None; // Already in a handler — no nested delivery.
     }
@@ -7651,11 +7748,14 @@ pub fn try_deliver_signal_on_irq_return(
         rflags: interrupted_rflags,
     };
 
-    // Resolve the sigframe stack floor using the 3-tier try-lock resolver (FIX A).
-    let floor = resolve_sigframe_stack_floor_irq(pid, interrupted_rsp, &proc_guard);
+    // Resolve provenance with the same fail-closed VMA locator as syscall return.
+    let stack = resolve_sigframe_stack_irq(interrupted_rsp, &proc_guard);
 
     // Compute the layout.
-    let layout = match crate::signal_frame::compute_sigframe_layout(interrupted_rsp, floor) {
+    let layout = match crate::signal_frame::compute_sigframe_layout(
+        interrupted_rsp,
+        stack.layout_floor(interrupted_rsp),
+    ) {
         Ok(l) => l,
         Err(_) => return None, // Layout computation failed — defer.
     };
@@ -7678,8 +7778,10 @@ pub fn try_deliver_signal_on_irq_return(
     // M0-7 SLICE 5: PRE-GROW the user stack to back the IRQ sigframe write
     // (Ring-0 writer #3 of 3). If frame_base is in the lazy region, grow it first.
     // Use try_lock variant since we're in IRQ context.
-    if (frame_base as usize) < crate::elf_loader::user_stack_layout().2 {
-        // frame_base is below eager_floor — may need demand-grow
+    if stack.needs_main_stack_backing(
+        frame_base,
+        crate::elf_loader::user_stack_mapped_floor(),
+    ) {
         // Try to grow the stack to cover the frame
         let target_floor = (frame_base as usize) & !(PAGE_SIZE - 1);
 
@@ -7725,6 +7827,9 @@ pub fn try_deliver_signal_on_irq_return(
             return None;
         }
     };
+    if proc.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     proc.pending_signals.clear(sig);
     proc.saved_blocked = old_blocked;
     let mut newmask = old_blocked | sa_mask;
@@ -8404,7 +8509,7 @@ pub fn run_rlimit_self_test() {
     // stack-window geometry test agree (a guard-size change moves both together).
     assert_eq!(
         d[RLIMIT_STACK].rlim_cur,
-        crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_mapped_floor()
+        crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_usable_floor()
     );
     assert_eq!(d[RLIMIT_STACK].rlim_max, RLIM_INFINITY);
     let old = RLimit {
@@ -10482,11 +10587,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     if let Some(frame) = frame_opt {
                         let phys_addr = frame.start_address().as_u64() as usize;
 
-                        let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
-                            PAGE_REF_COUNT.decrement(phys_addr) == 0
-                        } else {
-                            true
-                        };
+                        let should_free = PAGE_REF_COUNT.release(phys_addr).should_free_unmapped();
 
                         if should_free {
                             if frames_to_free.try_reserve(1).is_ok() {
@@ -10701,11 +10802,7 @@ unsafe fn rollback_stack_grow_pages(
 /// `ENOMEM` on a cgroup-limit reject or an allocation failure (FULLY rolled back, no
 /// charge / mapping leaked); `EINVAL` on a malformed floor (not page-aligned, not below
 /// the current floor, or no user image installed).
-/// M0-7 SLICE 5: IRQ-safe demand-grow handler for #PF
-///
-/// Called from the page fault handler when a user-mode not-present fault lands
-/// in the lazy stack region. Uses deferred-charge design: maps pages in IRQs-off
-/// PT work (bounded batch), defers cgroup charge to process context.
+/// M0-7 SLICE 5 / RF178-12: synchronous fail-closed demand-grow handler for #PF.
 ///
 /// # Arguments
 ///
@@ -10714,233 +10811,286 @@ unsafe fn rollback_stack_grow_pages(
 ///
 /// # Returns
 ///
-/// Ok(()) if stack grown successfully, Err otherwise
+/// `Ok(())` if a complete top-down prefix was committed, `Err` otherwise.
 ///
-/// # Design (DEFERRED-CHARGE, IRQs-off safe)
+/// # Design (synchronous hard charge, IRQs-off safe)
 ///
 /// 1. Check if fault_addr is in lazy stack region [usable_base, eager_floor)
 /// 2. Compute grow target: page-align-down fault_addr
-/// 3. Map up to 8 pages in bounded batch (IRQs-off, no blocking locks)
-/// 4. Mark pages as "pending charge" in MmState
-/// 5. Defer actual cgroup charge to next syscall entry/exit
+/// 3. Hard-charge the complete DATA batch before mapping
+/// 4. Precharge and pre-zero every intermediate PT frame before publication
+/// 5. Commit the mapped top-down prefix and all published PT bytes before return
 ///
-/// M0-7 SLICE 6: SMP-ready with TLB shootdown. Returns (new_floor, old_floor) on
-/// success so the caller can invalidate [new_floor, old_floor) across all CPUs.
+/// Any partial publication is charged and folded into `MmState` before `Err` is
+/// returned; the sole architectural caller then terminates the current task.
+/// The handler never allocates rollback metadata, unmaps a published frame, or
+/// performs a cross-CPU shootdown. x86 needs no invalidation for P=0 -> P=1;
+/// `map_page` retains its bounded local `invlpg`.
 pub fn try_demand_grow_user_stack(
     pid: crate::process::ProcessId,
     fault_addr: usize,
-) -> Result<(usize, usize), SyscallError> {
-    use crate::elf_loader::{user_stack_layout, user_stack_mapped_floor, USER_STACK_TOP};
-    use mm::page_table::with_current_manager;
-    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+) -> Result<(), SyscallError> {
+    use crate::elf_loader::user_stack_layout;
+    use cgroup::{FaultChargeError, FaultMemoryCharge};
+    use mm::page_table::try_with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags};
     use x86_64::VirtAddr;
 
-    // Get process (try_get_process to avoid blocking in IRQ context)
-    let process_arc = match crate::process::get_process(pid) {
-        Some(p) => p,
-        None => return Err(SyscallError::ESRCH),
+    const MAX_GROW_PAGES: usize = 8;
+    const MAX_GROW_PT_PAGES: usize = MAX_GROW_PAGES * 3;
+
+    // RF178-12: PROCESS_TABLE, PCB, and MmState are all nonblocking on #PF.
+    let process_arc = match crate::process::try_get_process(pid) {
+        Some(Some(p)) => p,
+        Some(None) => return Err(SyscallError::ESRCH),
+        None => return Err(SyscallError::EAGAIN),
     };
-
-    // Get stack geometry
-    let (_, usable_base, eager_floor, _) = user_stack_layout();
-
-    // Check if fault_addr is in lazy region [usable_base, eager_floor)
-    if fault_addr < usable_base || fault_addr >= eager_floor {
+    let proc = process_arc.try_lock().ok_or(SyscallError::EAGAIN)?;
+    if current_pid() != Some(proc.pid) || proc.pid != pid {
         return Err(SyscallError::EINVAL);
     }
 
-    // Page-align-down the fault address
+    let (_, usable_base, eager_floor, _) = user_stack_layout();
+    if fault_addr < usable_base || fault_addr >= eager_floor {
+        return Err(SyscallError::EINVAL);
+    }
     let fault_page_base = fault_addr & !(PAGE_SIZE - 1);
-
-    // Bounded batch: grow up to 8 pages downward from fault_page_base
-    const MAX_GROW_PAGES: usize = 8;
-
-    // Acquire process lock (R173-02 FIX: try_lock for IRQ safety in #PF handler)
-    let proc = match process_arc.try_lock() {
-        Some(p) => p,
-        None => return Err(SyscallError::EAGAIN), // Lock contended - let #PF retry
-    };
-
-    // Verify this is the current process
-    if current_pid() != Some(proc.pid) {
+    let (stack_window_base, stack_window_top) = crate::elf_loader::user_stack_window();
+    if fault_page_base < stack_window_base || fault_page_base >= stack_window_top {
         return Err(SyscallError::EINVAL);
     }
 
     let cgroup_id = proc.cgroup_id;
-    let mm_arc = Arc::clone(&proc.mm);
     let rlim_cur = proc.rlimits[crate::process::RLIMIT_STACK].rlim_cur;
-
-    // R173-02 FIX (COMPLETE): try_lock for BOTH Process AND mm locks (IRQ safety)
-    // The previous fix only converted Process lock to try_lock, leaving mm.lock()
-    // as a blocking lock. This created the SAME deadlock on mm lock that R173-02
-    // was supposed to fix. Now BOTH locks use try_lock for full IRQ safety.
-    let mut mm = match mm_arc.try_lock() {
-        Some(mm) => mm,
-        None => {
-            drop(proc); // Release Process lock first
-            return Err(SyscallError::EAGAIN); // mm lock contended - let #PF retry
-        }
-    };
-
-    // R173-03 FIX: Atomic check-and-set for stack_grow_in_progress (single critical section)
-    // Check stack_floor_committed, verify grow is valid, and claim reservation atomically
+    let mm_arc = Arc::clone(&proc.mm);
+    let mut mm = mm_arc.try_lock().ok_or(SyscallError::EAGAIN)?;
     let old_floor = mm.stack_floor_committed;
-
-    // Sentinel: no user image installed yet
-    if old_floor == 0 {
+    if old_floor == 0 || fault_page_base >= old_floor {
         return Err(SyscallError::EINVAL);
     }
-
-    // If fault_page is already at or above committed floor, something's wrong
-    if fault_page_base >= old_floor {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // Bound by RLIMIT_STACK
-    let grow_floor = crate::elf_loader::stack_grow_floor(rlim_cur);
-    if fault_page_base < grow_floor {
+    if fault_page_base < crate::elf_loader::stack_grow_floor(rlim_cur) {
         return Err(SyscallError::ENOMEM);
     }
-
-    // Check for concurrent grow and atomically claim reservation
     if mm.stack_grow_in_progress {
         return Err(SyscallError::EAGAIN);
     }
-    mm.stack_grow_in_progress = true; // Atomically claim reservation
+    mm.stack_grow_in_progress = true;
 
-    // Compute how many pages to map (bounded by MAX_GROW_PAGES)
-    let span = old_floor - fault_page_base;
-    let pages_needed = (span + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages_needed = (old_floor - fault_page_base + PAGE_SIZE - 1) / PAGE_SIZE;
     let pages_to_map = pages_needed.min(MAX_GROW_PAGES);
-
-    // Compute new floor and grow size
-    let new_floor = old_floor - (pages_to_map * PAGE_SIZE);
     let grow_size = pages_to_map * PAGE_SIZE;
-    let grow_pages = pages_to_map;
 
-    // Release locks before PT work
-    drop(mm);
-    drop(proc);
+    // Hard-charge the complete DATA reservation before any leaf or parent PTE
+    // can become present. All guards are try-only; the fixed receipt allocates
+    // nothing and carries the captured ancestry into the PT section.
+    let mut charge = match FaultMemoryCharge::try_new(cgroup_id, grow_size as u64) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            mm.stack_grow_in_progress = false;
+            return Err(match error {
+                FaultChargeError::Contended => SyscallError::EAGAIN,
+                FaultChargeError::NotFound => SyscallError::ESRCH,
+                FaultChargeError::Invalid => SyscallError::EINVAL,
+                FaultChargeError::LimitExceeded
+                | FaultChargeError::Overflow
+                | FaultChargeError::Invariant => SyscallError::ENOMEM,
+            });
+        }
+    };
 
-    // Map pages [new_floor, old_floor) with deferred charge
-    // R174-B3 FIX: Extract PT frames from RecordingFrameAllocator to ledger them.
-    use x86_64::structures::paging::PhysFrame;
-    let (map_result, pt_frames) = unsafe {
-        with_current_manager(
-            VirtAddr::new(0),
-            |manager| -> Result<(Result<(), SyscallError>, Vec<PhysFrame>), SyscallError> {
-                let mut frame_alloc = RecordingFrameAllocator::new();
+    // The PCB and MmState guards remain held through the bounded PT operation.
+    // This is canonical Process -> MmState -> PT ordering and makes cgroup identity,
+    // reservation, and floor a single transaction without any blocking re-lock.
+    let mapped = unsafe {
+        try_with_current_manager(VirtAddr::new(0), |manager| {
+            mm::buddy_allocator::try_with_allocator(|buddy| {
+                let mut frame_alloc = FaultStackFrameAllocator::new(
+                    buddy,
+                    &mut charge,
+                    MAX_GROW_PT_PAGES,
+                );
+                let mut outcome = FaultStackMapOutcome::new();
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
                     | PageTableFlags::NO_EXECUTE;
 
-                for offset in (0..grow_size).step_by(PAGE_SIZE) {
-                    let vaddr = VirtAddr::new((new_floor + offset) as u64);
+                // Publish only a top-down prefix. A fatal partial mapping can
+                // therefore lower the committed floor by exactly k pages; it
+                // never leaves a mapped island below an unmapped hole.
+                for page_index in 0..pages_to_map {
+                    let vaddr = VirtAddr::new(
+                        (old_floor - (page_index + 1) * PAGE_SIZE) as u64,
+                    );
                     let page = Page::containing_address(vaddr);
-
-                    // Skip if already mapped
                     if manager.translate_addr(vaddr).is_some() {
-                        continue;
+                        outcome.error = Some(SyscallError::EINVAL);
+                        break;
                     }
-
-                    // Allocate DATA frame
-                    let frame = match frame_alloc.allocate_data_frame() {
-                        Some(f) => f,
-                        None => {
-                            // Rollback on allocation failure
-                            return Ok((Err(SyscallError::ENOMEM), Vec::new()));
-                        }
+                    let Some(frame) = frame_alloc.allocate_data_frame() else {
+                        outcome.error = Some(SyscallError::ENOMEM);
+                        break;
                     };
 
-                    // Map page
-                    if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
+                    // The direct map is required under SMAP and makes zero-before-
+                    // publication explicit to both the compiler and x86 hardware.
+                    let direct = mm::phys_to_virt(frame.start_address());
+                    core::ptr::write_bytes(direct.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+
+                    if manager
+                        .map_page(page, frame, flags, &mut frame_alloc)
+                        .is_err()
+                    {
                         frame_alloc.deallocate_frame(frame);
-                        return Ok((Err(SyscallError::ENOMEM), Vec::new()));
+                        outcome.error = frame_alloc
+                            .take_error()
+                            .or(Some(SyscallError::ENOMEM));
+                        break;
                     }
-
-                    // Zero the page
-                    let ptr = vaddr.as_u64() as *mut u8;
-                    core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+                    outcome.mapped_data_pages += 1;
                 }
-
-                // R174-B3 FIX: Extract PT frames to ledger them atomically with DATA charge.
-                // The RecordingFrameAllocator tracks intermediate PT/PD/PDPT frames created
-                // during map_page(). These must be charged + ledgered so munmap/exit can
-                // debit them correctly (prevents PT frame leak → mem_pinned > 0 at deletion).
-                let pt_frames = frame_alloc.take_pt_frames();
-                Ok((Ok(()), pt_frames))
-            },
-        )
-    }?;
-
-    // Commit or rollback
-    match map_result {
-        Ok(()) => {
-            // Commit: update stack_floor_committed and add to pending charge
-            {
-                let proc = process_arc.lock();
-                let mut mm = mm_arc.lock();
-                mm.stack_floor_committed = new_floor;
-                mm.stack_grow_pending_bytes =
-                    mm.stack_grow_pending_bytes.saturating_add(grow_size as u64);
-
-                // R174-B3 FIX: Ledger PT frames so they can be debited on munmap/exit.
-                // The demand-grow allocated intermediate page-table frames (PT/PD/PDPT)
-                // via RecordingFrameAllocator. These must be added to pt_charged_frames
-                // so compute_cgroup_charged_bytes() includes them and teardown can debit
-                // them correctly. Without this, PT frames leak → mem_pinned > 0 at deletion.
-                //
-                // CHARGE: PT frame kmem is also added to stack_grow_pending_bytes above
-                // (included in grow_size). The deferred charge (line 10340) covers BOTH
-                // DATA pages and PT frames as a single lump sum.
-                //
-                // NOTE: pt_charged_frames is a FallibleOrderedMap, so use try_insert.
-                // On insert failure (OOM), the PT frames fall back to pt_inherited_bytes
-                // (over-count-safe — they reclaim at teardown, never a bypass).
-                for pt_frame in pt_frames {
-                    let _ = mm
-                        .pt_charged_frames
-                        .try_insert(pt_frame.start_address().as_u64(), ());
+                outcome.charged_pt_pages = frame_alloc.charged_pt_pages();
+                if outcome.error.is_none() {
+                    outcome.error = frame_alloc.take_error();
                 }
+                outcome
+            })
+        })
+    };
 
-                mm.stack_grow_in_progress = false;
-            }
-
-            // R174-B1 FIX: Use deferred-charge queue to avoid blocking lock in IRQ context.
-            //
-            // VULNERABILITY (R173-08 documented, R174-B1 now fixed): The previous code called
-            // try_charge_memory() here, which acquires cgroup.limits.lock() — a blocking Mutex.
-            // This is called from try_grow_user_stack() → #PF handler (IRQ context). On SMP,
-            // if another CPU holds that lock with IRQs enabled, a cross-CPU deadlock occurs:
-            //   CPU A: holds cgroup.limits.lock(), IRQs enabled
-            //   CPU B: #PF, tries to acquire cgroup.limits.lock() → spins forever (IRQs disabled)
-            //   CPU A: tries to send IPI to CPU B → CPU B can't respond (IRQs disabled)
-            //   → DEADLOCK
-            //
-            // FIX: Push the charge to a per-CPU deferred queue. The scheduler drains this
-            // queue at the next safe point (process context, IRQs enabled, blocking locks OK).
-            // On charge failure (OOM), the process is killed via SIGKILL.
-            //
-            // SAFETY: defer_charge_memory() is IRQ-safe (spin lock only, no blocking).
-            // The actual charge happens asynchronously in drain_deferred_charges().
-            //
-            // FAILURE MODE: User sees "stack growth → (small delay) → SIGKILL" instead of
-            // "stack growth → deadlock → system hang". This is acceptable for OOM scenarios.
-            cgroup::defer_charge_memory(cgroup_id, grow_size as u64);
-
-            // M0-7 SLICE 6: Return the grown range [new_floor, old_floor) so the caller
-            // (interrupts.rs #PF handler) can invalidate it across all CPUs via TLB shootdown.
-            Ok((new_floor, old_floor))
+    let mut outcome = match mapped {
+        Some(Some(outcome)) => outcome,
+        Some(None) | None => {
+            mm.stack_grow_in_progress = false;
+            return Err(SyscallError::EAGAIN);
         }
-        Err(e) => {
-            // Rollback: clear reservation
-            {
-                let mut mm = mm_arc.lock();
-                mm.stack_grow_in_progress = false;
-            }
-            Err(e)
+    };
+
+    let data_bytes = (outcome.mapped_data_pages as u64) * PAGE_SIZE as u64;
+    let pt_bytes = (outcome.charged_pt_pages as u64) * PAGE_SIZE as u64;
+    if data_bytes == 0 && pt_bytes == 0 {
+        mm.stack_grow_in_progress = false;
+        return Err(outcome.error.unwrap_or(SyscallError::EIO));
+    }
+
+    // Return the unused DATA suffix. If the exact release invariant itself is
+    // broken, retain and ledger the full DATA reservation (safe over-accounting)
+    // and force the fatal path instead of creating an unowned cgroup charge.
+    let unused_data = (grow_size as u64).saturating_sub(data_bytes);
+    let committed_data = if charge.refund(unused_data).is_ok() {
+        data_bytes
+    } else {
+        outcome.error = Some(SyscallError::EIO);
+        grow_size as u64
+    };
+    let committed_floor = old_floor - outcome.mapped_data_pages * PAGE_SIZE;
+    mm.commit_fault_stack_grow(committed_data, pt_bytes, committed_floor);
+    debug_assert_eq!(
+        charge.charged_bytes(),
+        committed_data.saturating_add(pt_bytes),
+        "fault receipt and MmState commit must transfer the same byte total"
+    );
+    charge.commit();
+
+    match outcome.error {
+        Some(error) => Err(error),
+        None if outcome.mapped_data_pages == pages_to_map => Ok(()),
+        None => Err(SyscallError::EIO),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FaultStackMapOutcome {
+    mapped_data_pages: usize,
+    charged_pt_pages: usize,
+    error: Option<SyscallError>,
+}
+
+impl FaultStackMapOutcome {
+    const fn new() -> Self {
+        Self {
+            mapped_data_pages: 0,
+            charged_pt_pages: 0,
+            error: None,
         }
+    }
+}
+
+/// RF178-12: stack-only allocator used exclusively by synchronous #PF growth.
+/// Every PT frame is hard-charged and zeroed before `map_to` may publish it.
+struct FaultStackFrameAllocator<'a, 'charge> {
+    inner: &'a mut mm::buddy_allocator::BuddyAllocator,
+    charge: &'charge mut cgroup::FaultMemoryCharge,
+    charged_pt_pages: usize,
+    max_pt_pages: usize,
+    error: Option<SyscallError>,
+}
+
+impl<'a, 'charge> FaultStackFrameAllocator<'a, 'charge> {
+    fn new(
+        inner: &'a mut mm::buddy_allocator::BuddyAllocator,
+        charge: &'charge mut cgroup::FaultMemoryCharge,
+        max_pt_pages: usize,
+    ) -> Self {
+        Self {
+            inner,
+            charge,
+            charged_pt_pages: 0,
+            max_pt_pages,
+            error: None,
+        }
+    }
+
+    fn allocate_data_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
+        self.inner.alloc_pages(0)
+    }
+
+    fn deallocate_frame(&mut self, frame: x86_64::structures::paging::PhysFrame) {
+        self.inner.free_pages(frame, 0);
+    }
+
+    fn charged_pt_pages(&self) -> usize {
+        self.charged_pt_pages
+    }
+
+    fn take_error(&mut self) -> Option<SyscallError> {
+        self.error.take()
+    }
+}
+
+unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
+    for FaultStackFrameAllocator<'_, '_>
+{
+    fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
+        if self.charged_pt_pages == self.max_pt_pages {
+            self.error = Some(SyscallError::ENOMEM);
+            return None;
+        }
+
+        if self.charge.try_add(PAGE_SIZE as u64).is_err() {
+            self.error = Some(SyscallError::ENOMEM);
+            return None;
+        }
+        self.charged_pt_pages += 1;
+
+        let Some(frame) = self.inner.alloc_pages(0) else {
+            if self.charge.refund(PAGE_SIZE as u64).is_ok() {
+                self.charged_pt_pages -= 1;
+            } else {
+                self.error = Some(SyscallError::EIO);
+                return None;
+            }
+            self.error = Some(SyscallError::ENOMEM);
+            return None;
+        };
+
+        // x86_64's mapper links the returned parent before its own zero pass.
+        // Pre-zeroing closes that transient page-table exposure.
+        let direct = mm::phys_to_virt(frame.start_address());
+        unsafe { core::ptr::write_bytes(direct.as_mut_ptr::<u8>(), 0, PAGE_SIZE) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        Some(frame)
     }
 }
 
@@ -11362,7 +11512,7 @@ pub fn run_stack_window_exclusion_self_test() {
     let page = 0x1000usize;
 
     // The window is the GUARD-INCLUSIVE architectural range, never the guard_top floor.
-    let (stack_base, usable_base, _eager_floor, _eager_page_count) =
+    let (stack_base, usable_base, eager_floor, _eager_page_count) =
         crate::elf_loader::user_stack_layout();
     assert_eq!(
         win_start, stack_base,
@@ -11498,25 +11648,23 @@ pub fn run_stack_window_exclusion_self_test() {
         "an inactive reservation (lo == hi) never intersects"
     );
 
-    // R172-X-F2: the guard-EXCLUSIVE mapped floor MUST agree across all three geometry
-    // derivations — the new single-source helper, the layout usable_base, and
-    // window_start + GUARD — so no future site can re-derive a drifted floor (the green
-    // build alone cannot catch a geometry drift).
+    // RF178-12 FIX: mapped and usable floors are distinct. The committed floor
+    // starts at the eager mapping; RLIMIT_STACK spans down to guard_top.
     let floor = crate::elf_loader::user_stack_mapped_floor();
     assert_eq!(
-        floor as usize, usable_base,
-        "mapped_floor() MUST equal user_stack_layout().1 (usable_base)"
+        floor as usize, eager_floor,
+        "mapped_floor() MUST equal user_stack_layout().2 (eager_floor)"
     );
     assert_eq!(
-        floor as usize,
+        crate::elf_loader::user_stack_usable_floor() as usize,
         win_start + crate::elf_loader::USER_STACK_GUARD_SIZE,
-        "mapped_floor() MUST equal window_start + USER_STACK_GUARD_SIZE"
+        "usable_floor() MUST equal window_start + USER_STACK_GUARD_SIZE"
     );
-    // The RLIMIT_STACK magnitude is exactly TOP - mapped_floor (the writable extent).
+    // The RLIMIT_STACK magnitude is exactly TOP - usable_floor.
     assert_eq!(
-        crate::elf_loader::USER_STACK_TOP - floor,
+        crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_usable_floor(),
         (crate::elf_loader::USER_STACK_SIZE - crate::elf_loader::USER_STACK_GUARD_SIZE) as u64,
-        "RLIMIT_STACK magnitude (TOP - mapped_floor) MUST equal SIZE - GUARD"
+        "RLIMIT_STACK magnitude (TOP - usable_floor) MUST equal SIZE - GUARD"
     );
 }
 
@@ -12209,11 +12357,9 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 if let Some(frame) = frame_opt {
                     let phys_addr = frame.start_address().as_u64() as usize;
 
-                    let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
-                        PAGE_REF_COUNT.decrement(phys_addr) == 0
-                    } else {
-                        true
-                    };
+                    let should_free = PAGE_REF_COUNT
+                        .release(phys_addr)
+                        .should_free_unmapped();
 
                     if should_free {
                         if frames_to_free.try_reserve(1).is_ok() {
@@ -12369,6 +12515,53 @@ const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const PROT_EXEC: i32 = 0x4;
 const PROT_NONE: i32 = 0x0;
+
+/// RF178-31: reconcile requested permissions with the two COW states.
+/// BIT_9 means a shared page whose current protection permits writes after a
+/// private copy; BIT_10 tracks a shared read-only page with no write entitlement.
+fn reconcile_cow_mprotect_flags(
+    current: PageTableFlags,
+    mut requested: PageTableFlags,
+) -> PageTableFlags {
+    let tracked = current.contains(cow_flag()) || current.contains(cow_readonly_flag());
+    if !tracked {
+        return requested;
+    }
+
+    if requested.contains(PageTableFlags::WRITABLE) {
+        requested.remove(PageTableFlags::WRITABLE);
+        requested.remove(cow_readonly_flag());
+        requested.insert(cow_flag());
+    } else {
+        requested.remove(cow_flag());
+        requested.insert(cow_readonly_flag());
+    }
+    requested
+}
+
+/// Focused permission-state checks for forked read-only and write-entitled COW
+/// mappings. Arithmetic/table rollback is covered by fork's companion test.
+pub fn run_cow_mprotect_self_test() {
+    let read = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let write = read | PageTableFlags::WRITABLE;
+
+    let promoted = reconcile_cow_mprotect_flags(read | cow_readonly_flag(), write);
+    assert!(promoted.contains(cow_flag()));
+    assert!(!promoted.contains(cow_readonly_flag()));
+    assert!(!promoted.contains(PageTableFlags::WRITABLE));
+
+    let demoted = reconcile_cow_mprotect_flags(read | cow_flag(), read);
+    assert!(demoted.contains(cow_readonly_flag()));
+    assert!(!demoted.contains(cow_flag()));
+    assert!(!demoted.contains(PageTableFlags::WRITABLE));
+
+    let exclusive = reconcile_cow_mprotect_flags(read, write);
+    assert!(exclusive.contains(PageTableFlags::WRITABLE));
+    assert!(!exclusive.contains(cow_flag()));
+    assert!(!exclusive.contains(cow_readonly_flag()));
+}
 
 /// sys_mprotect - 设置内存区域保护属性
 ///
@@ -13059,11 +13252,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
                         if let Some(frame) = frame_opt {
                             let phys_addr = frame.start_address().as_u64() as usize;
-                            let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
-                                PAGE_REF_COUNT.decrement(phys_addr) == 0
-                            } else {
-                                true
-                            };
+                            let should_free =
+                                PAGE_REF_COUNT.release(phys_addr).should_free_unmapped();
                             if should_free {
                                 if frames_to_free.try_reserve(1).is_ok() {
                                     frames_to_free.push(frame);
@@ -13140,20 +13330,11 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let vaddr = VirtAddr::new(page_addr as u64);
                 let page = Page::containing_address(vaddr);
 
-                // R127-1 FIX: Preserve COW semantics. If the page is COW-shared
-                // (BIT_9 set by fork), we must NOT make it WRITABLE via mprotect.
-                // Instead, preserve the COW marker and keep the page read-only so
-                // that the first write triggers the COW fault handler for proper
-                // resolution (new frame allocation + copy).
-                // Without this check, mprotect(PROT_WRITE) on a COW page would
-                // strip BIT_9 and set WRITABLE, allowing direct writes to the
-                // shared physical frame — a COW isolation break.
+                // R127-1 / RF178-31: preserve sharing while separately tracking
+                // whether the requested protection grants write entitlement.
                 let mut new_flags = flags;
                 if let Some((_phys, current_flags)) = manager.translate_with_flags(vaddr) {
-                    if current_flags.contains(PageTableFlags::BIT_9) {
-                        new_flags.insert(PageTableFlags::BIT_9);
-                        new_flags.remove(PageTableFlags::WRITABLE);
-                    }
+                    new_flags = reconcile_cow_mprotect_flags(current_flags, new_flags);
                 }
 
                 // 尝试更新页的保护属性
@@ -13936,7 +14117,7 @@ fn sys_yield() -> SyscallResult {
     if let Some(pid) = current_pid() {
         if let Some(process) = get_process(pid) {
             let mut proc = process.lock();
-            proc.state = crate::process::ProcessState::Ready;
+            proc.enter_ready_at(crate::get_ticks());
         }
     }
 
@@ -14028,22 +14209,19 @@ fn can_get_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
     Ok(true)
 }
 
-/// Get the mask of usable CPUs (online CPUs capped at max_cpus).
+/// Get the authoritative mask of usable online CPUs.
 ///
 /// This returns a bitmask where bit N is set if CPU N is available.
 /// Used for normalizing affinity masks and for returning "all CPUs"
 /// when allowed_cpus == 0.
 #[inline]
 fn usable_cpu_mask() -> u64 {
-    let cpu_count = max_cpus();
-    if cpu_count >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << cpu_count).saturating_sub(1)
-    }
+    // RF178-24: capacity is not topology. Returning capacity bits allowed
+    // affinity to target registered-but-offline CPUs and misrepresented holes.
+    cpu_local::online_cpu_mask()
 }
 
-/// Normalize affinity mask: mask off CPUs beyond max_cpus and reject empty masks.
+/// Normalize affinity mask: mask off offline CPU IDs and reject empty masks.
 ///
 /// # Returns
 /// - Ok(mask) - Normalized mask with only valid CPU bits set
@@ -14216,7 +14394,7 @@ fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> SyscallR
     if affinity == 0 {
         affinity = usable;
     } else {
-        // Normalize: mask off any bits beyond max_cpus
+        // Normalize: mask off every currently offline CPU ID.
         affinity &= usable;
     }
 

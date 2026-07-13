@@ -614,10 +614,7 @@ fn selftest_layout_contiguity() {
     }
 }
 
-/// Test 4 (M0-7) — the builder floor is the guard_top (lowest MAPPED VA), so no
-/// string/pointer can land in the permanently-unmapped low guard page. This is the
-/// mechanical tripwire that catches a forgotten floor-raise (which would otherwise let
-/// the bulk `copy_to_user` fault into the guard at exec).
+/// Test 4 (M0-7) - the initial builder is confined to the eager mapping.
 fn selftest_guard_floor() {
     let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
     let creds = StackCreds {
@@ -627,8 +624,7 @@ fn selftest_guard_floor() {
         egid: 0,
         at_secure: false,
     };
-    let stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64; // architectural window base
-    let guard_top = stack_base + USER_STACK_GUARD_SIZE as u64; // lowest MAPPED VA
+    let eager_floor = crate::elf_loader::user_stack_mapped_floor();
     let argv = synth_args(1);
     let envp = synth_args(0); // empty
                               // (a) With user_stack_top == guard_top, ANY non-empty layout drives buf_base into
@@ -640,7 +636,7 @@ fn selftest_guard_floor() {
         matches!(
             compute_layout(
                 entry,
-                guard_top,
+                eager_floor,
                 entry + 0x2000,
                 56,
                 10,
@@ -651,12 +647,12 @@ fn selftest_guard_floor() {
             ),
             Err(SyscallError::E2BIG)
         ),
-        "a layout bottoming into the guard page must be rejected with E2BIG (floor must be guard_top)"
+        "a layout below the eager mapping must be rejected with E2BIG"
     );
     // (b) One page higher, the same small layout fits with buf_base at/above guard_top.
     let plan = compute_layout(
         entry,
-        guard_top + USER_STACK_GUARD_SIZE as u64,
+        eager_floor + USER_STACK_GUARD_SIZE as u64,
         entry + 0x2000,
         56,
         10,
@@ -667,8 +663,8 @@ fn selftest_guard_floor() {
     )
     .expect("a layout one page above the guard must fit");
     assert!(
-        plan.buf_base >= guard_top,
-        "buf_base must never be below the lowest mapped page (guard_top)"
+        plan.buf_base >= eager_floor,
+        "buf_base must never be below the eager mapped floor"
     );
 }
 

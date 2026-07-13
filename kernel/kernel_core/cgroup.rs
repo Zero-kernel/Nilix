@@ -103,171 +103,272 @@ pub fn mem_unpin_underflow_peek() -> u64 {
 }
 
 // ============================================================================
-// R174-B1 FIX: Deferred Charge Queue (IRQ-safe memory charging)
+// RF178-12 FIX: synchronous, allocation-free #PF memory charging
 // ============================================================================
 
-/// Maximum number of CPUs supported for deferred charge queues.
-const MAX_CPUS_DEFERRED: usize = 256;
+const FAULT_CHARGE_CHAIN_CAPACITY: usize = MAX_CGROUP_DEPTH as usize + 1;
 
-/// Per-CPU deferred charge queue entry.
-///
-/// R174-B1: When #PF handler needs to charge cgroup memory but cannot
-/// acquire the blocking cgroup.limits.lock() (IRQ context), it pushes
-/// an entry here. The scheduler drains these at the next safe point
-/// (process context) and applies the charge. On failure (OOM), the
-/// process is killed via SIGKILL.
-#[derive(Debug, Clone, Copy)]
-struct DeferredCharge {
-    pid: crate::process::ProcessId,
-    cgroup_id: CgroupId,
-    bytes: u64,
-    timestamp_ms: u64, // For leak detection / timeout
+/// Failure modes for the try-only stack-fault charge transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultChargeError {
+    Contended,
+    NotFound,
+    Invalid,
+    LimitExceeded,
+    Overflow,
+    Invariant,
 }
 
-/// Per-CPU deferred charge queue.
+/// A hard cgroup charge owned by one synchronous user-stack fault.
 ///
-/// Each CPU has its own queue to avoid cross-CPU contention.
-/// The queue is protected by a spin lock (not a blocking Mutex).
-struct DeferredChargeQueue {
-    entries: Mutex<Vec<DeferredCharge>>,
-    pending: AtomicBool, // Fast-path hint: are there pending charges?
+/// Construction snapshots a fixed ancestry and its memory limits under try-only
+/// guards, then charges the complete DATA batch before any PTE can be published.
+/// Later PT-frame additions use only the captured Arcs, snapshots, and atomics,
+/// so the page-table critical section never reaches a Level-5 lock. Dropping an
+/// armed receipt rolls back every unpublished byte without allocating.
+pub struct FaultMemoryCharge {
+    origin: Arc<CgroupNode>,
+    chain: [Option<Arc<CgroupNode>>; FAULT_CHARGE_CHAIN_CAPACITY],
+    limits: [(Option<u64>, Option<u64>); FAULT_CHARGE_CHAIN_CAPACITY],
+    chain_len: usize,
+    charged_bytes: u64,
+    armed: bool,
 }
 
-impl DeferredChargeQueue {
-    const fn new() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-            pending: AtomicBool::new(false),
+impl FaultMemoryCharge {
+    pub fn try_new(cgroup_id: CgroupId, initial_bytes: u64) -> Result<Self, FaultChargeError> {
+        if initial_bytes == 0 || initial_bytes & 0xfff != 0 {
+            return Err(FaultChargeError::Invalid);
         }
-    }
-}
 
-/// Per-CPU deferred charge queues (one per CPU).
-static DEFERRED_CHARGE_QUEUES: [DeferredChargeQueue; MAX_CPUS_DEFERRED] = {
-    const INIT: DeferredChargeQueue = DeferredChargeQueue::new();
-    [INIT; MAX_CPUS_DEFERRED]
-};
-
-/// R174-B1 FIX: Defer a memory charge to be processed at the next safe point.
-///
-/// IRQ-safe: uses per-CPU lock, no blocking. Called from #PF handler when
-/// demand-growing the user stack.
-///
-/// # Arguments
-///
-/// * `cgroup_id` - The cgroup to charge
-/// * `bytes` - Number of bytes to charge
-///
-/// # Safety
-///
-/// This function is IRQ-safe. It only acquires a spin lock on the per-CPU
-/// queue, never a blocking lock. The actual charge happens asynchronously
-/// in `drain_deferred_charges()` (process context only).
-///
-/// # Failure Mode
-///
-/// If the deferred charge fails (OOM), the process is killed via SIGKILL.
-/// User sees: stack growth → (small delay) → SIGKILL, which is better than
-/// stack growth → deadlock → system hang.
-pub fn defer_charge_memory(cgroup_id: CgroupId, bytes: u64) {
-    use crate::process::current_pid;
-    use cpu_local::current_cpu_id;
-
-    if bytes == 0 {
-        return;
-    }
-
-    let cpu_id = current_cpu_id() as usize;
-    if cpu_id >= MAX_CPUS_DEFERRED {
-        // CPU ID out of range - should never happen, but fail safe
-        return;
-    }
-
-    let pid = current_pid().unwrap_or(0);
-
-    // Use a simple timestamp (could be enhanced with a real clock if needed)
-    let timestamp_ms = 0; // TODO: wire to current_timestamp_ms() if leak detection needed
-
-    let entry = DeferredCharge {
-        pid,
-        cgroup_id,
-        bytes,
-        timestamp_ms,
-    };
-
-    // Acquire per-CPU queue lock (spin, not blocking)
-    let queue = &DEFERRED_CHARGE_QUEUES[cpu_id];
-    let mut entries = queue.entries.lock();
-    entries.push(entry);
-    drop(entries);
-
-    // Set pending flag (Release ensures the push is visible before the flag)
-    queue.pending.store(true, Ordering::Release);
-}
-
-/// R174-B1 FIX: Drain deferred charges and apply them (process context only).
-///
-/// Called from:
-/// - Scheduler on task switch
-/// - Timer tick handler (after IRQ return to Ring 0)
-///
-/// # Safety
-///
-/// This function MUST only be called from process context, NEVER from hard IRQ.
-/// It acquires blocking locks (cgroup.limits.lock()) via try_charge_memory().
-///
-/// # Killing on OOM
-///
-/// If a charge fails, the process is marked pending_kill=true and woken if blocked.
-/// The process will be reaped at the next exception/syscall return.
-pub fn drain_deferred_charges() {
-    use crate::process::{get_process, ProcessState};
-    use cpu_local::current_cpu_id;
-
-    let cpu_id = current_cpu_id() as usize;
-    if cpu_id >= MAX_CPUS_DEFERRED {
-        return;
-    }
-
-    let queue = &DEFERRED_CHARGE_QUEUES[cpu_id];
-
-    // Fast-path check: no pending charges
-    if !queue.pending.load(Ordering::Acquire) {
-        return;
-    }
-
-    // Extract pending charges (swap with empty vec to avoid holding lock during processing)
-    let charges = {
-        let mut entries = queue.entries.lock();
-        if entries.is_empty() {
-            queue.pending.store(false, Ordering::Release);
-            return;
+        // The registry guard pins deletion safety until the origin pin and the
+        // initial display charges are visible. No blocking acquire is permitted
+        // from #PF, including for the root cgroup.
+        let registry = CGROUP_REGISTRY
+            .try_read()
+            .ok_or(FaultChargeError::Contended)?;
+        let origin = registry
+            .get(&cgroup_id)
+            .cloned()
+            .ok_or(FaultChargeError::NotFound)?;
+        if origin.deleted.load(Ordering::Acquire) {
+            return Err(FaultChargeError::NotFound);
         }
-        core::mem::take(&mut *entries)
-    };
 
-    // Clear pending flag (we've extracted all charges)
-    queue.pending.store(false, Ordering::Release);
+        let mut chain: [Option<Arc<CgroupNode>>; FAULT_CHARGE_CHAIN_CAPACITY] =
+            core::array::from_fn(|_| None);
+        let mut limits = [(None, None); FAULT_CHARGE_CHAIN_CAPACITY];
+        let mut chain_len = 0usize;
+        let mut depth = 0u32;
+        let mut cursor = Some(origin.clone());
+        while let Some(node) = cursor {
+            if node.controllers.contains(CgroupControllers::MEMORY) {
+                if chain_len == FAULT_CHARGE_CHAIN_CAPACITY {
+                    return Err(FaultChargeError::Invalid);
+                }
+                let snapshot = node
+                    .limits
+                    .try_lock()
+                    .ok_or(FaultChargeError::Contended)?;
+                limits[chain_len] = (snapshot.memory_max, snapshot.memory_high);
+                drop(snapshot);
+                chain[chain_len] = Some(node.clone());
+                chain_len += 1;
+            }
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
+            cursor = node.parent();
+        }
 
-    // Process each charge (blocking lock OK here, we're in process context)
-    for entry in charges {
-        if let Err(_) = try_charge_memory(entry.cgroup_id, entry.bytes) {
-            // Charge failed (OOM) - kill the process
-            if entry.pid != 0 {
-                if let Some(proc_arc) = crate::process::get_process(entry.pid) {
-                    let mut proc = proc_arc.lock();
-                    proc.pending_kill
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    proc.exit_code = Some(137); // SIGKILL (128 + 9)
+        let mut receipt = Self {
+            origin,
+            chain,
+            limits,
+            chain_len,
+            charged_bytes: 0,
+            armed: true,
+        };
+        receipt.try_add(initial_bytes)?;
+        drop(registry);
+        Ok(receipt)
+    }
 
-                    // Wake if blocked so it can be reaped
-                    if proc.state == ProcessState::Blocked {
-                        proc.state = ProcessState::Ready;
-                        drop(proc);
-                        crate::process::notify_scheduler_add_process(proc_arc.clone());
+    /// Hard-charge an additional PT-frame delta using the transaction snapshot.
+    pub fn try_add(&mut self, bytes: u64) -> Result<(), FaultChargeError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes & 0xfff != 0 {
+            return Err(FaultChargeError::Invalid);
+        }
+        let new_total = self
+            .charged_bytes
+            .checked_add(bytes)
+            .ok_or(FaultChargeError::Overflow)?;
+
+        self.origin
+            .stats
+            .mem_pinned
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                current.checked_add(bytes)
+            })
+            .map_err(|_| FaultChargeError::Overflow)?;
+
+        let mut charged_len = 0usize;
+        for index in 0..self.chain_len {
+            let Some(node) = self.chain[index].as_ref() else {
+                self.rollback_delta(bytes, charged_len);
+                return Err(FaultChargeError::Invariant);
+            };
+            let (max, high) = self.limits[index];
+            match node.stats.memory_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |current| {
+                    let next = current.checked_add(bytes)?;
+                    if max.is_some_and(|limit| next > limit) {
+                        return None;
+                    }
+                    Some(next)
+                },
+            ) {
+                Ok(old) => {
+                    charged_len += 1;
+                    if high.is_some_and(|limit| old.saturating_add(bytes) > limit) {
+                        node.stats.record_memory_high();
                     }
                 }
+                Err(_) => {
+                    node.stats.record_memory_max();
+                    self.rollback_delta(bytes, charged_len);
+                    return Err(FaultChargeError::LimitExceeded);
+                }
             }
+        }
+
+        self.charged_bytes = new_total;
+        Ok(())
+    }
+
+    /// Return a known-unpublished suffix of the DATA reservation.
+    pub fn refund(&mut self, bytes: u64) -> Result<(), FaultChargeError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes & 0xfff != 0 || bytes > self.charged_bytes {
+            return Err(FaultChargeError::Invalid);
+        }
+        self.release_bytes(bytes)
+    }
+
+    #[inline]
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged_bytes
+    }
+
+    /// Transfer ownership of every remaining byte to the address-space ledger.
+    pub fn commit(mut self) {
+        self.armed = false;
+        self.charged_bytes = 0;
+    }
+
+    fn rollback_delta(&self, bytes: u64, charged_len: usize) {
+        let mut released_len = 0usize;
+        for index in 0..charged_len {
+            let Some(node) = self.chain[index].as_ref() else {
+                self.restore_display(bytes, released_len);
+                return;
+            };
+            if node
+                .stats
+                .memory_current
+                .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                    current.checked_sub(bytes)
+                })
+                .is_err()
+            {
+                self.restore_display(bytes, released_len);
+                return;
+            }
+            released_len += 1;
+        }
+        if self
+            .origin
+            .stats
+            .mem_pinned
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                current.checked_sub(bytes)
+            })
+            .is_err()
+        {
+            // Preserve the origin pin and restore display counters. This leaves
+            // fail-closed over-accounting if a pre-existing invariant is broken.
+            self.restore_display(bytes, released_len);
+        }
+    }
+
+    fn release_bytes(&mut self, bytes: u64) -> Result<(), FaultChargeError> {
+        let mut released_len = 0usize;
+        for index in 0..self.chain_len {
+            let Some(node) = self.chain[index].as_ref() else {
+                self.restore_display(bytes, released_len);
+                return Err(FaultChargeError::Invariant);
+            };
+            if node
+                .stats
+                .memory_current
+                .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                    current.checked_sub(bytes)
+                })
+                .is_err()
+            {
+                self.restore_display(bytes, released_len);
+                return Err(FaultChargeError::Invariant);
+            }
+            released_len += 1;
+        }
+
+        if self
+            .origin
+            .stats
+            .mem_pinned
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                current.checked_sub(bytes)
+            })
+            .is_err()
+        {
+            self.restore_display(bytes, released_len);
+            return Err(FaultChargeError::Invariant);
+        }
+        self.charged_bytes = self
+            .charged_bytes
+            .checked_sub(bytes)
+            .ok_or(FaultChargeError::Invariant)?;
+        Ok(())
+    }
+
+    fn restore_display(&self, bytes: u64, released_len: usize) {
+        for index in 0..released_len {
+            if let Some(node) = self.chain[index].as_ref() {
+                let result = node.stats.memory_current.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    |current| current.checked_add(bytes),
+                );
+                debug_assert!(result.is_ok(), "fault charge rollback restore overflow");
+            }
+        }
+    }
+}
+
+impl Drop for FaultMemoryCharge {
+    fn drop(&mut self) {
+        if self.armed && self.charged_bytes != 0 {
+            // A failed exact rollback deliberately leaves the origin pin armed:
+            // fail-closed over-accounting is safer than a silent limit bypass.
+            let _ = self.release_bytes(self.charged_bytes);
         }
     }
 }
@@ -2408,6 +2509,7 @@ pub fn check_memory_allowed(cgroup_id: CgroupId, allocation_bytes: u64) -> bool 
 ///
 /// * `MemoryLimitExceeded` - Adding `allocation_bytes` would exceed memory.max
 ///   at this cgroup or any ancestor.
+/// * `NotFound` - The origin cgroup no longer exists.
 pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(), CgroupError> {
     if allocation_bytes == 0 {
         return Ok(());
@@ -2415,21 +2517,52 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
 
     // Collect the chain: target cgroup + ancestors with MEMORY controller.
     let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
     // M2-1 SLICE-2: pin at the ORIGIN node FIRST, controller-independent — twin
     // of try_charge_fds' pin (see CgroupStats::mem_pinned). Captured BEFORE the
     // chain walk consumes `cursor`, and BEFORE any display CAS, so the gate can
     // never observe display motion without the matching pin. The MEMORY family
     // is NOT root-exempt (unlike fds/ports): root.mem_pinned moves too — matching
     // the display counter, which also charges root.
-    let origin: Option<Arc<CgroupNode>> = cursor.clone();
-    if let Some(o) = &origin {
-        o.stats.pin_origin(&o.stats.mem_pinned, allocation_bytes);
-    }
-    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+    // Fail closed for a stale/deleting origin. For non-root nodes, keep the
+    // registry read guard through the origin pin: otherwise delete_cgroup can
+    // take the writer lock after lookup returns but before the pin, sample zero,
+    // remove the node, and strand an unaccounted charge on a detached Arc.
+    let origin: Arc<CgroupNode> = if cgroup_id == 0 {
+        let root = ROOT_CGROUP.clone();
+        root.stats
+            .pin_origin(&root.stats.mem_pinned, allocation_bytes);
+        root
+    } else {
+        let registry = CGROUP_REGISTRY.read();
+        let node = registry
+            .get(&cgroup_id)
+            .cloned()
+            .ok_or(CgroupError::NotFound)?;
+        if node.deleted.load(Ordering::Acquire) {
+            return Err(CgroupError::NotFound);
+        }
+        node.stats
+            .pin_origin(&node.stats.mem_pinned, allocation_bytes);
+        drop(registry);
+        node
+    };
+    let mut cursor = Some(origin.clone());
+    // RF178-11 FIX: page-cache admission reaches this function before its own
+    // Arc/map births, so the accounting gate itself must not allocate
+    // infallibly. The hierarchy depth is hard-bounded; keep the chain and
+    // rollback ledger in fixed storage instead of three heap Vecs.
+    const CHAIN_CAPACITY: usize = MAX_CGROUP_DEPTH as usize + 1;
+    let mut chain: [Option<Arc<CgroupNode>>; CHAIN_CAPACITY] = core::array::from_fn(|_| None);
+    let mut chain_len = 0usize;
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
-            chain.push(cgroup.clone());
+            debug_assert!(chain_len < CHAIN_CAPACITY);
+            if chain_len >= CHAIN_CAPACITY {
+                origin.stats.unpin_origin_mem(allocation_bytes);
+                return Err(CgroupError::InvalidLimit);
+            }
+            chain[chain_len] = Some(cgroup.clone());
+            chain_len += 1;
         }
         if depth >= MAX_CGROUP_DEPTH {
             break;
@@ -2438,7 +2571,7 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
         cursor = cgroup.parent();
     }
 
-    if chain.is_empty() {
+    if chain_len == 0 {
         // No MEMORY controller anywhere in the chain: the PIN STAYS (the
         // per-process tally's exit/migrate uncharge keys to this id and unpins
         // it symmetrically — uncharge_memory unpins the origin BEFORE its own
@@ -2447,18 +2580,36 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
     }
 
     // Snapshot limits to avoid holding multiple locks during CAS charging.
-    let limits_snapshot: Vec<(Option<u64>, Option<u64>)> = chain
-        .iter()
-        .map(|c| {
-            let l = c.limits.lock();
-            (l.memory_max, l.memory_high)
-        })
-        .collect();
+    let mut limits_snapshot = [(None, None); CHAIN_CAPACITY];
+    for idx in 0..chain_len {
+        let Some(cgroup) = chain[idx].as_ref() else {
+            debug_assert!(false, "cgroup charge chain must be contiguous");
+            origin.stats.unpin_origin_mem(allocation_bytes);
+            return Err(CgroupError::NotFound);
+        };
+        let limits = cgroup.limits.lock();
+        limits_snapshot[idx] = (limits.memory_max, limits.memory_high);
+    }
 
-    // Track indices of charged cgroups for rollback on failure.
-    let mut charged: Vec<usize> = Vec::new();
+    // Successful charges are always a prefix, so one count is a complete,
+    // allocation-free rollback ledger.
+    let mut charged_len = 0usize;
 
-    for (idx, cgroup) in chain.iter().enumerate() {
+    for idx in 0..chain_len {
+        let Some(cgroup) = chain[idx].as_ref() else {
+            debug_assert!(false, "cgroup charge chain must be contiguous");
+            for charged_idx in 0..charged_len {
+                if let Some(charged) = chain[charged_idx].as_ref() {
+                    let _ = charged.stats.memory_current.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(allocation_bytes)),
+                    );
+                }
+            }
+            origin.stats.unpin_origin_mem(allocation_bytes);
+            return Err(CgroupError::NotFound);
+        };
         let (max, high) = limits_snapshot[idx];
 
         match cgroup.stats.memory_current.fetch_update(
@@ -2482,7 +2633,7 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
                         cgroup.stats.record_memory_high();
                     }
                 }
-                charged.push(idx);
+                charged_len += 1;
             }
             Err(_) => {
                 // Limit exceeded at this level — record event and rollback.
@@ -2490,12 +2641,14 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
 
                 // R110-1 pattern: Rollback with saturating decrement to
                 // prevent underflow if a concurrent uncharge raced.
-                for &j in &charged {
-                    let _ = chain[j].stats.memory_current.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(allocation_bytes)),
-                    );
+                for j in 0..charged_len {
+                    if let Some(charged) = chain[j].as_ref() {
+                        let _ = charged.stats.memory_current.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                            |current| Some(current.saturating_sub(allocation_bytes)),
+                        );
+                    }
                 }
 
                 // M2-1 SLICE-2: roll back the ORIGIN pin too (the whole charge is
@@ -2504,9 +2657,7 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
                 // Mirrors try_charge_fds:2402-2405. The matched-rollback unpin
                 // routes through the tripwire so a concurrent over-uncharge that
                 // raced our pin below allocation_bytes is still caught.
-                if let Some(o) = &origin {
-                    o.stats.unpin_origin_mem(allocation_bytes);
-                }
+                origin.stats.unpin_origin_mem(allocation_bytes);
 
                 return Err(CgroupError::MemoryLimitExceeded);
             }
@@ -4124,6 +4275,8 @@ pub fn run_cgroup_pt_kmem_self_test() {
 /// asserts the origin-keyed pin telescopes to 0 with `MEM_UNPIN_UNDERFLOW == 0` (a SOUND
 /// witness — Σunpin == Σpin — not a saturating-floored one). Panics on failure.
 pub fn run_stack_grow_cgroup_self_test() {
+    run_fault_memory_charge_self_test();
+
     const PAGE: u64 = 0x1000;
     let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
     let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
@@ -4220,6 +4373,100 @@ pub fn run_stack_grow_cgroup_self_test() {
     let _ = delete_cgroup(b_id);
     let _ = delete_cgroup(c_id);
     let _ = delete_cgroup(a_id);
+}
+
+/// RF178-12: focused receipt tests for rollback, limit rejection, partial DATA
+/// refund, PT ownership transfer, and try-lock contention.
+fn run_fault_memory_charge_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |node: &Arc<CgroupNode>| node.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |node: &Arc<CgroupNode>| node.stats.mem_pinned.load(Ordering::SeqCst);
+    let _ = mem_unpin_underflow_take();
+
+    let parent = create_cgroup(0, CgroupControllers::MEMORY).expect("fault charge parent");
+    parent
+        .set_limit(CgroupLimits {
+            memory_max: Some(64 * PAGE),
+            ..Default::default()
+        })
+        .expect("fault charge parent limit");
+    let leaf = create_cgroup(parent.id(), CgroupControllers::MEMORY).expect("fault charge leaf");
+
+    // An armed receipt owns the complete charge and Drop rolls it back exactly.
+    {
+        let receipt = FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE)
+            .expect("initial DATA charge");
+        assert_eq!(receipt.charged_bytes(), 4 * PAGE);
+        assert_eq!(mem(&leaf), 4 * PAGE);
+        assert_eq!(mem(&parent), 4 * PAGE);
+        assert_eq!(pin(&leaf), 4 * PAGE);
+    }
+    assert_eq!(mem(&leaf), 0, "Drop rolls back leaf DATA");
+    assert_eq!(mem(&parent), 0, "Drop rolls back ancestor DATA");
+    assert_eq!(pin(&leaf), 0, "Drop rolls back the origin pin");
+
+    // A contended limit lock fails before any counter or origin pin changes.
+    let held_limit = leaf.limits.lock();
+    assert!(matches!(
+        FaultMemoryCharge::try_new(leaf.id(), PAGE),
+        Err(FaultChargeError::Contended)
+    ));
+    assert_eq!(mem(&leaf), 0);
+    assert_eq!(mem(&parent), 0);
+    assert_eq!(pin(&leaf), 0);
+    drop(held_limit);
+
+    // PT addition rejection rolls back only that delta and preserves the DATA
+    // reservation already owned by the transaction.
+    leaf.set_limit(CgroupLimits {
+        memory_max: Some(6 * PAGE),
+        ..Default::default()
+    })
+    .expect("tight fault charge limit");
+    {
+        let mut receipt = FaultMemoryCharge::try_new(leaf.id(), 4 * PAGE)
+            .expect("DATA below tight limit");
+        assert_eq!(
+            receipt.try_add(3 * PAGE),
+            Err(FaultChargeError::LimitExceeded)
+        );
+        assert_eq!(receipt.charged_bytes(), 4 * PAGE);
+        assert_eq!(mem(&leaf), 4 * PAGE);
+        assert_eq!(mem(&parent), 4 * PAGE);
+        assert_eq!(pin(&leaf), 4 * PAGE);
+    }
+    assert_eq!(mem(&leaf), 0);
+    assert_eq!(mem(&parent), 0);
+    assert_eq!(pin(&leaf), 0);
+
+    // Model 8 DATA + 2 PT pages, then a five-page unused DATA suffix. The
+    // committed owner is exactly 3 DATA + 2 PT pages and teardown telescopes it.
+    leaf.set_limit(CgroupLimits {
+        memory_max: Some(32 * PAGE),
+        ..Default::default()
+    })
+    .expect("raise fault charge limit");
+    let mut receipt =
+        FaultMemoryCharge::try_new(leaf.id(), 8 * PAGE).expect("eight DATA pages");
+    receipt.try_add(2 * PAGE).expect("two PT pages");
+    receipt.refund(5 * PAGE).expect("unused DATA suffix");
+    assert_eq!(receipt.charged_bytes(), 5 * PAGE);
+    assert_eq!(mem(&leaf), 5 * PAGE);
+    assert_eq!(mem(&parent), 5 * PAGE);
+    assert_eq!(pin(&leaf), 5 * PAGE);
+    receipt.commit();
+    uncharge_memory(leaf.id(), 5 * PAGE);
+    assert_eq!(mem(&leaf), 0);
+    assert_eq!(mem(&parent), 0);
+    assert_eq!(pin(&leaf), 0);
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "fault receipt matched sequences never trigger the underflow tripwire"
+    );
+
+    let _ = delete_cgroup(leaf.id());
+    let _ = delete_cgroup(parent.id());
 }
 
 /// M2-1 SLICE-2 (co-residency GAP closure): in-kernel self-test that the

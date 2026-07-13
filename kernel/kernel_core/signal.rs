@@ -6,9 +6,10 @@
 //! - Default signal actions
 //! - Signal delivery mechanism
 
-use crate::process::{self, ProcessId, ProcessState};
+use alloc::sync::Arc;
+use crate::process::{self, Process, ProcessId, ProcessState};
 use crate::syscall::SyscallError;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 /// Maximum signal number supported (1-64)
 const MAX_SIGNAL: u8 = 64;
@@ -17,8 +18,10 @@ const MAX_SIGNAL: u8 = 64;
 // 调度器集成回调
 // ============================================================================
 
-/// 恢复被暂停进程的回调类型
-type ResumeCallback = fn(ProcessId) -> bool;
+/// RF178-36: Resume is identity-bound from authorization through scheduler
+/// mutation. A reusable PID is never sufficient authority after the target PCB
+/// lock has been released.
+type ResumeCallback = fn(Arc<Mutex<Process>>, ProcessId, u64) -> bool;
 
 /// 全局恢复回调（由调度器注册）
 static RESUME_CALLBACK: Mutex<Option<ResumeCallback>> = Mutex::new(None);
@@ -44,54 +47,42 @@ fn get_resume_callback() -> Option<ResumeCallback> {
 type KickCallback = fn();
 
 /// 全局重调度 kick 回调（由调度器注册）。
-static KICK_CALLBACK: Mutex<Option<KickCallback>> = Mutex::new(None);
+static KICK_CALLBACK: Once<KickCallback> = Once::new();
 
 /// 注册重调度 kick 回调（调度器初始化时调用，注册广播 reschedule-IPI 的函数）。
 pub fn register_kick_callback(callback: KickCallback) {
-    *KICK_CALLBACK.lock() = Some(callback);
+    KICK_CALLBACK.call_once(|| callback);
 }
 
 fn get_kick_callback() -> Option<KickCallback> {
-    *KICK_CALLBACK.lock()
+    KICK_CALLBACK.get().copied()
 }
 
-/// R171-S-R170-5-01 FIX (SLICE 3): Kernel-internal un-stop hook used by the
-/// namespace init-death cascade's `force_remote_kill`. A SIGKILL must un-stop a
-/// job-control-stopped victim so the scheduler will dispatch it and it can reach a
-/// safe point to consume its pending kill — otherwise a `Stopped` member of a
-/// shutting-down namespace would survive the cascade (a live leak). No-op if the
-/// scheduler has not registered a resume callback.
-pub fn kernel_resume_stopped(pid: ProcessId) {
-    if let Some(resume) = get_resume_callback() {
-        resume(pid);
-    }
+/// RF178-35: lock-free post-publication wake used after every PCB/table guard
+/// has been released. Returns false only before scheduler initialization.
+pub(crate) fn kernel_kick_reschedule() -> bool {
+    let Some(kick) = get_kick_callback() else {
+        return false;
+    };
+    kick();
+    true
 }
 
-/// R175 D0-CROSS-3 FIX: Atomic enqueue-then-ready resume.
-///
-/// This is the SMP-safe variant of `kernel_resume_stopped`. It passes the Process Arc
-/// to the scheduler so the scheduler can mark state=Ready AFTER enqueuing, ensuring the
-/// invariant "state==Ready → task in exactly one queue" is never violated.
-///
-/// The caller must have already cleared the `stopped` flag but NOT set state=Ready.
-/// The scheduler callback will enqueue the task and atomically mark it Ready.
-pub fn kernel_resume_stopped_atomic(
-    pid: ProcessId,
-    proc_arc: alloc::sync::Arc<spin::Mutex<crate::process::Process>>,
-) {
-    // For now, use the simple implementation: the scheduler doesn't have an atomic
-    // variant yet. The fix is to NOT mark Ready in the caller, and let the scheduler
-    // do it. Since we don't have the scheduler callback updated yet, do it here.
-    //
-    // TODO: Update scheduler to provide atomic enqueue+mark-ready callback.
-    if let Some(resume) = get_resume_callback() {
-        resume(pid);
+/// Resume one exact task identity after its caller has released the PCB lock.
+/// The callback mutates the supplied resident PCB in place; it never re-resolves
+/// `expected_pid`. A successful Ready transition is followed by a cross-CPU kick.
+pub fn kernel_resume_stopped(
+    proc_arc: Arc<Mutex<Process>>,
+    expected_pid: ProcessId,
+    expected_generation: u64,
+) -> bool {
+    let resumed = get_resume_callback()
+        .map(|resume| resume(proc_arc, expected_pid, expected_generation))
+        .unwrap_or(false);
+    if resumed {
+        kernel_kick_reschedule();
     }
-    // Mark Ready after enqueue completes
-    let mut p = proc_arc.lock();
-    if p.state == ProcessState::Stopped {
-        p.state = ProcessState::Ready;
-    }
+    resumed
 }
 
 /// Signal identifier (1-64, 0 is invalid)
@@ -698,13 +689,23 @@ fn send_signal_inner(
     let action = default_action(signal);
     let mut needs_reschedule = false;
     let mut terminate_code: Option<i32> = None;
+    let mut fatal_post = process::FatalExitPost::None;
     let mut needs_resume = false;
+    let target_generation;
     // M0-5 sub-slice 1b: set when the EINTR-wake flips a blocked target Ready, so we
     // broadcast a reschedule kick AFTER releasing the proc lock.
     let mut needs_kick = false;
 
     {
         let mut proc = process_arc.lock();
+
+        // RF178-36: bind every post-lock action to the same task identity that
+        // passed authorization. The Arc pins the object; the generation rejects
+        // stale or malformed callers without consulting PROCESS_TABLE again.
+        if proc.pid != pid {
+            return Err(SignalError::NoSuchProcess);
+        }
+        target_generation = proc.generation;
 
         // Cannot send signals to zombie or terminated processes
         if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
@@ -765,7 +766,7 @@ fn send_signal_inner(
                     &proc.sigactions,
                 );
                 if should_wake && proc.state == ProcessState::Blocked && !proc.stopped {
-                    proc.state = ProcessState::Ready;
+                    proc.enter_ready_at(crate::get_ticks());
                     needs_kick = true;
                 }
             }
@@ -775,16 +776,30 @@ fn send_signal_inner(
             }
             Disposition::Default(default) => match default {
                 SignalAction::Terminate => {
-                    terminate_code = Some(signal_exit_code(signal));
+                    let code = signal_exit_code(signal);
+                    terminate_code = Some(code);
+                    // RF178-35 FIX: publication, runnable normalization, and
+                    // unstop are one PCB-locked transaction. The IPI is emitted
+                    // only after this guard is released.
+                    fatal_post = process::request_process_exit_locked(
+                        &mut proc,
+                        code,
+                        crate::get_ticks(),
+                    );
                 }
                 SignalAction::Stop => {
                     // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
                     // Do NOT overwrite Blocked/Sleeping, or we lose the wait condition
                     // and break wait queue invariants (H-34 lost wakeup fix).
                     let was_running = proc.state == ProcessState::Running;
-                    proc.stopped = true;
-                    if was_running && process::current_pid() == Some(pid) {
-                        needs_reschedule = true;
+                    // RF178-35 FIX: a lock-serialized fatal publication wins over
+                    // a later stop and cannot be stranded again.
+                    if process::try_mark_job_control_stopped_locked(&mut proc) {
+                        if was_running && process::current_pid() == Some(pid) {
+                            needs_reschedule = true;
+                        }
+                    } else {
+                        proc.pending_signals.clear(signal);
                     }
                 }
                 SignalAction::Continue => {
@@ -822,17 +837,14 @@ fn send_signal_inner(
             // disables interrupts and switches to boot CR3 before halting.
             process::terminate_self_and_halt(pid, code);
         } else {
-            // Remote: post a pending-kill flag; target checks at syscall return.
-            let _ = process::request_process_exit(pid, code);
+            // The exact authorized PCB was already posted under its guard.
+            let _ = process::finish_process_exit_request(fatal_post);
         }
     }
 
-    // Resume stopped process - calls into scheduler to add to ready queue
+    // Resume the exact resident PCB in place; no PID lookup or queue move.
     if needs_resume {
-        // 通过回调调用调度器的 resume_stopped 函数
-        if let Some(resume_fn) = get_resume_callback() {
-            resume_fn(pid);
-        }
+        kernel_resume_stopped(process_arc.clone(), pid, target_generation);
     }
 
     // Trigger reschedule if needed
@@ -844,9 +856,7 @@ fn send_signal_inner(
     // CPU. Broadcast a reschedule IPI so the queue-owning CPU re-selects it promptly rather
     // than only at its next timer tick. No-op until the scheduler registers the callback.
     if needs_kick {
-        if let Some(kick) = get_kick_callback() {
-            kick();
-        }
+        kernel_kick_reschedule();
     }
 
     Ok(action)

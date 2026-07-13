@@ -91,6 +91,29 @@ __zero_os_usercopy_get_u8:
 .Lex_get_u8_fixup:  .long .Lget_u8_fixup - .Lex_get_u8_fixup
     .popsection
 
+    // RF178-8: Atomically copy one aligned u32 from user space [rsi] to
+    // kernel space [rdi]. One dword load is required for futex comparison;
+    // four byte loads can synthesize a value that never existed concurrently.
+    // Returns 0 on success, 1 on fault.
+    .global __zero_os_usercopy_get_u32
+    .type __zero_os_usercopy_get_u32, @function
+__zero_os_usercopy_get_u32:
+.Lget_u32_access:
+    mov eax, dword ptr [rsi] // Aligned atomic user load - may fault here
+    mov dword ptr [rdi], eax
+    xor eax, eax
+    ret
+.Lget_u32_fixup:
+    mov eax, 1
+    ret
+    .size __zero_os_usercopy_get_u32, .-__zero_os_usercopy_get_u32
+
+    .pushsection .ex_table,"a"
+    .balign 8
+.Lex_get_u32_fault: .long .Lget_u32_access - .Lex_get_u32_fault
+.Lex_get_u32_fixup: .long .Lget_u32_fixup - .Lex_get_u32_fixup
+    .popsection
+
     // Write one byte (sil) to user space [rdi]
     // Returns 0 on success, 1 on fault
     .global __zero_os_usercopy_put_u8
@@ -111,6 +134,7 @@ __zero_os_usercopy_put_u8:
 .Lex_put_u8_fault:  .long .Lput_u8_access - .Lex_put_u8_fault
 .Lex_put_u8_fixup:  .long .Lput_u8_fixup - .Lex_put_u8_fixup
     .popsection
+
 "#
 );
 
@@ -119,9 +143,14 @@ extern "C" {
     /// Returns 0 on success, 1 on fault.
     fn __zero_os_usercopy_get_u8(dst: *mut u8, src: *const u8) -> u32;
 
+    /// Copy one aligned u32 from user space with one atomic load.
+    /// Returns 0 on success, 1 on fault.
+    fn __zero_os_usercopy_get_u32(dst: *mut u32, src: *const u32) -> u32;
+
     /// Write one byte to user space.
     /// Returns 0 on success, 1 on fault.
     fn __zero_os_usercopy_put_u8(dst: *mut u8, val: u8) -> u32;
+
 }
 
 /// H-26 FIX: Exception-safe byte read from user space
@@ -710,6 +739,36 @@ pub fn copy_from_user_addr(dst: &mut [u8], src: UserAddr) -> Result<(), ()> {
 #[inline]
 pub fn copy_to_user_addr(dst: UserAddr, src: &[u8]) -> Result<(), ()> {
     copy_to_user_safe(dst.as_mut_ptr(), src)
+}
+
+/// RF178-8: fault-tolerant, atomic-width futex-word read.
+///
+/// The aligned x86 dword load is a single-copy atomic observation. This helper
+/// performs no page-table lookup and takes no blocking lock, so callers may use
+/// it while holding a futex wait-queue lock with interrupts already disabled.
+pub fn read_user_u32_atomic(src: *const u32) -> Result<u32, ()> {
+    let addr = src as usize;
+    if addr & (core::mem::align_of::<u32>() - 1) != 0
+        || !validate_user_range(addr, core::mem::size_of::<u32>())
+    {
+        return Err(());
+    }
+
+    let _smap_guard = UserAccessGuard::new();
+    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
+    USER_COPY_STATE.with(|s| {
+        s.remaining
+            .store(core::mem::size_of::<u32>(), Ordering::SeqCst)
+    });
+
+    let mut value = 0u32;
+    let status = unsafe { __zero_os_usercopy_get_u32(&mut value, src) };
+    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
+    if status == 0 {
+        Ok(value)
+    } else {
+        Err(())
+    }
 }
 
 /// Fault-tolerant copy from user space to kernel buffer

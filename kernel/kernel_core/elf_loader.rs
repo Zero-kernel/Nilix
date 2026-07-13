@@ -925,45 +925,62 @@ pub(crate) const fn user_stack_window() -> (usize, usize) {
     (stack_base, USER_STACK_TOP as usize)
 }
 
-/// M0-7 / R172-X-F2: the lowest MAPPED user-stack VA (guard-EXCLUSIVE) — the reserved
-/// window's low edge plus the one permanently-UNMAPPED low guard page. Equals BOTH
-/// `user_stack_layout().1` (usable_base) and `user_stack_window().0 + USER_STACK_GUARD_SIZE`.
-/// This is the SINGLE source for the sigframe floor (`maybe_deliver_signal`), the
-/// auxv/argv builder floor (`user_stack::compute_layout`), and the RLIMIT_STACK
-/// magnitude — so a future guard-size change moves ALL of them together.
+/// M0-7 / R172-X-F2 / R178-13 FIX: the lowest ACTUALLY-MAPPED user-stack VA after exec.
 ///
-/// Derived from `user_stack_window().0` (NOT a fresh `USER_STACK_TOP - (SIZE - GUARD)`)
-/// so the guard-INCLUSIVE window base (quantity A) and this guard-EXCLUSIVE floor
-/// (quantity B) share ONE origin expression; the cross-geometry self-test then pins
-/// `floor == window_start + GUARD == usable_base` as a near-tautology. Returned as `u64`
-/// (the type every consumer needs); the architectural extent fits `u64` and the addition
-/// of two compile-time constants cannot overflow.
+/// Returns the eager region floor (`USER_STACK_TOP - USER_STACK_EAGER_SIZE`), which is
+/// the lowest VA that `allocate_user_stack_tracked` actually maps. This is the correct
+/// initial value for `MmState.stack_floor_committed` — setting it to the usable_base
+/// (guard-exclusive but below the eager floor) would make the first lazy #PF fault
+/// rejected at `try_grow_user_stack:10795` because `fault_page_base >= old_floor`.
+///
+/// The eager region is 16KB (4 pages) at the top of the stack window, mapped to back
+/// initial stack usage (argc/argv/envp/auxv, signal frames). The rest of the usable
+/// region `[usable_base, eager_floor)` grows on-demand via #PF, which lowers
+/// `stack_floor_committed` incrementally.
+///
+/// Derived from `user_stack_layout().2` (eager_floor) — the SINGLE source for both
+/// the loader's map loop and this committed-floor seed.
 ///
 /// `pub` (not `pub(crate)`) so the boot `usermode_test` AS-install path (in the binary
 /// crate) can seed `MmState.stack_floor_committed` to the same mapped floor the exec
 /// image-install commit uses — M0-7 item7 SLICE 4.
 pub const fn user_stack_mapped_floor() -> u64 {
+    let (_stack_base, _usable_base, eager_floor, _eager_page_count) = user_stack_layout();
+    eager_floor as u64
+}
+
+/// R178-13 FIX: the lowest VA that COULD be mapped (guard-exclusive, the usable base).
+///
+/// This is the absolute lower bound for `try_grow_user_stack` — a fault below this
+/// would alias the guard page or the brk heap. The grow logic at `syscall.rs:10800`
+/// uses `stack_grow_floor(rlim_cur)` which is typically higher (respecting RLIMIT_STACK),
+/// but this const provides the architectural hard floor for validation.
+///
+/// Equals `user_stack_window().0 + USER_STACK_GUARD_SIZE` (the usable_base from
+/// `user_stack_layout().1`). This is NOT the same as `user_stack_mapped_floor()` —
+/// the latter is the eager floor (actually mapped at exec), while this is the
+/// architectural floor (the lowest VA that could EVER be mapped, including lazy region).
+pub const fn user_stack_usable_floor() -> u64 {
     user_stack_window().0 as u64 + USER_STACK_GUARD_SIZE as u64
 }
 
-/// M0-7 item7 SLICE 4: the lowest VA a user main-stack demand-grow may descend to,
-/// derived from the soft `RLIMIT_STACK` `rlim_cur` (bytes). Used by
+/// M0-7 item7 SLICE 4 / R178-13 FIX: the lowest VA a user main-stack demand-grow may
+/// descend to, derived from the soft `RLIMIT_STACK` `rlim_cur` (bytes). Used by
 /// `try_grow_user_stack` to bound a grow request.
 ///
 /// The growable extent is `min(rlim_cur, USER_STACK_SIZE - USER_STACK_GUARD_SIZE)`:
 /// the `min()` clamp is LOAD-BEARING because `RLIMIT_STACK.rlim_max` is infinite, so a
 /// process can `setrlimit` `rlim_cur` arbitrarily high — but the architectural window
 /// only backs `SIZE - GUARD` bytes above the unmapped guard page, and a grow must NEVER
-/// descend below `user_stack_mapped_floor()` (that would alias the guard or the brk
+/// descend below `user_stack_usable_floor()` (that would alias the guard or the brk
 /// heap below the window). The extent is page-aligned DOWN, which makes the returned
 /// floor `== page_align_up(USER_STACK_TOP - min(...))` (the conservative direction: a
 /// partial-page limit yields a SMALLER growable region) and page-aligned because
 /// `USER_STACK_TOP` and the aligned extent are both page multiples.
 ///
-/// Returned floor is in `[user_stack_mapped_floor(), USER_STACK_TOP]`. With the default
-/// `rlim_cur == SIZE - GUARD` it equals `user_stack_mapped_floor()` exactly — i.e. on a
-/// default process the whole window-minus-guard is already eager-mapped, so there is no
-/// lazy region to grow into (SLICE 5 splits the geometry to create one).
+/// R178-13: Returned floor is in `[user_stack_usable_floor(), USER_STACK_TOP]` and is
+/// clamped to never go below the architectural usable floor (guard-exclusive). With the
+/// default `rlim_cur == SIZE - GUARD`, it equals `user_stack_usable_floor()` exactly.
 pub(crate) fn stack_grow_floor(rlim_cur: u64) -> usize {
     let max_extent = (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) as u64;
     let extent = if rlim_cur < max_extent {
@@ -972,7 +989,16 @@ pub(crate) fn stack_grow_floor(rlim_cur: u64) -> usize {
         max_extent
     };
     let extent_pages = extent & !((PAGE_SIZE as u64) - 1);
-    (USER_STACK_TOP - extent_pages) as usize
+    let computed_floor = (USER_STACK_TOP - extent_pages) as usize;
+
+    // R178-13 FIX: Clamp to architectural hard floor (guard-exclusive usable base).
+    // Prevents RLIMIT_STACK from pushing below the guard page or into brk heap.
+    let hard_floor = user_stack_usable_floor() as usize;
+    if computed_floor < hard_floor {
+        hard_floor
+    } else {
+        computed_floor
+    }
 }
 
 /// M0-7 self-test: pin the eager user-stack map geometry so a regression to the `+1`

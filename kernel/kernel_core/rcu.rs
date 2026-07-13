@@ -51,7 +51,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use cpu_local::{current_cpu, current_cpu_id, num_online_cpus, CpuLocal, PER_CPU_DATA};
+use cpu_local::{current_cpu, current_cpu_id, online_cpu_mask, CpuLocal, PER_CPU_DATA};
 use spin::Mutex;
 
 /// Global epoch counter (monotonically increasing).
@@ -635,16 +635,21 @@ fn try_advance_completed_epoch() {
 ///
 /// # Important
 ///
-/// Only checks online CPUs (via `num_online_cpus()`), not all `max_cpus()` slots.
+/// Only checks online CPUs (via `online_cpu_mask()`), not all `max_cpus()` slots.
 /// Uninitialized CPU slots have `rcu_epoch == 0` which would cause deadlock
 /// if we waited for them. We must use `.max(1)` to handle the BSP-only case
 /// before any APs have come online.
 fn all_cpus_quiescent(target: u64) -> bool {
-    // Only online CPUs can hold readers or update rcu_epoch.
-    // Use .max(1) to ensure we check at least the BSP even if counter is 0.
-    let num_cpus = num_online_cpus().max(1);
+    // RF178-24: iterate authoritative set bits. `count_ones()` is a population,
+    // not an ID ceiling; using 0..count skips a high online ID across a hole.
+    let mut online = online_cpu_mask();
+    if online == 0 {
+        online = 1; // Early BSP-only fallback.
+    }
 
-    for cpu_id in 0..num_cpus {
+    while online != 0 {
+        let cpu_id = online.trailing_zeros() as usize;
+        online &= online - 1;
         // Check if this CPU has any active readers
         let readers = RCU_READERS
             .with_cpu(cpu_id, |counter| counter.load(Ordering::Acquire))
