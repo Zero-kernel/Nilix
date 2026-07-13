@@ -219,6 +219,8 @@ pub enum DropReason {
     UnsupportedProtocol,
     /// Rate limited
     RateLimited,
+    /// RF178-7 FIX: Conntrack metadata admission failed.
+    ConntrackExhausted,
     /// Dropped by firewall
     Firewall {
         rule_id: Option<u32>,
@@ -680,6 +682,16 @@ fn process_udp(
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
 
+    // RF178-7 FIX: Resource failure is an ingress hard drop, not merely an
+    // INVALID state that a broader firewall ACCEPT rule could override.
+    if ct_result
+        .as_ref()
+        .map(|result| result.resource_exhausted)
+        .unwrap_or(false)
+    {
+        return ProcessResult::Dropped(DropReason::ConntrackExhausted);
+    }
+
     // R121-1 FIX: Evaluate packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
         net_ns_id: net_ns_id.0,
@@ -768,6 +780,15 @@ fn process_icmp(
     };
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+
+    // RF178-7 FIX: Conntrack admission failure is fail-closed before firewall.
+    if ct_result
+        .as_ref()
+        .map(|result| result.resource_exhausted)
+        .unwrap_or(false)
+    {
+        return ProcessResult::Dropped(DropReason::ConntrackExhausted);
+    }
 
     // R121-1 FIX: Evaluate ICMP packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
@@ -925,6 +946,15 @@ fn process_tcp(
     };
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+
+    // RF178-7 FIX: Conntrack admission failure is fail-closed before firewall.
+    if ct_result
+        .as_ref()
+        .map(|result| result.resource_exhausted)
+        .unwrap_or(false)
+    {
+        return ProcessResult::Dropped(DropReason::ConntrackExhausted);
+    }
 
     // R121-1 FIX: Evaluate TCP packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
@@ -1476,8 +1506,12 @@ fn apply_firewall_verdict(
 
                         // R164-6 FIX: Fallible IP+RST assembly.
                         let ip_packet = try_concat_slices(&ip_reply, &rst_segment);
+                        // R178-L1 FIX: OOM during REJECT response assembly → drop, not accept
                         if ip_packet.is_empty() && !ip_reply.is_empty() {
-                            return None;
+                            return Some(ProcessResult::Dropped(DropReason::Firewall {
+                                rule_id: verdict.rule_id,
+                                rejected: true,
+                            }));
                         }
 
                         let frame = build_ethernet_frame(
@@ -1486,10 +1520,13 @@ fn apply_firewall_verdict(
                             ETHERTYPE_IPV4,
                             &ip_packet,
                         );
-                        // R165-18 FIX: drop on empty-OOM frame instead of emitting
-                        // a runt RST frame.
+                        // R165-18 / R178-L1 FIX: drop on empty-OOM frame instead of emitting
+                        // a runt RST frame or accepting.
                         if frame.is_empty() {
-                            return None;
+                            return Some(ProcessResult::Dropped(DropReason::Firewall {
+                                rule_id: verdict.rule_id,
+                                rejected: true,
+                            }));
                         }
 
                         return Some(ProcessResult::Reply(frame));
@@ -1509,17 +1546,24 @@ fn apply_firewall_verdict(
                 64,
             );
 
-            // R164-6 FIX: Fallible IP+ICMP assembly.
+            // R164-6 / R178-L1 FIX: Fallible IP+ICMP assembly.
+            // OOM during REJECT response → drop, not accept
             let ip_packet = try_concat_slices(&ip_reply, &icmp);
             if ip_packet.is_empty() && !ip_reply.is_empty() {
-                return None;
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
             }
 
             let frame = build_ethernet_frame(eth_hdr.src, eth_hdr.dst, ETHERTYPE_IPV4, &ip_packet);
-            // R165-18 FIX: drop on empty-OOM frame instead of emitting a runt
-            // ICMP-reject frame.
+            // R165-18 / R178-L1 FIX: drop on empty-OOM frame instead of emitting a runt
+            // ICMP-reject frame or accepting.
             if frame.is_empty() {
-                return None;
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
             }
 
             Some(ProcessResult::Reply(frame))

@@ -451,6 +451,21 @@ static GLOBAL_UDP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Privileged port boundary (ports below this require special permissions).
 const PRIVILEGED_PORT_LIMIT: u16 = 1024;
 
+/// RF178-30 FIX: Accept a data segment when either its first or last payload
+/// byte is inside the receive window. Using the inclusive last byte avoids
+/// admitting a segment whose exclusive end is exactly `rcv_nxt`.
+#[inline]
+fn segment_in_recv_window(seq: u32, payload_len: usize, rcv_nxt: u32, rcv_wnd: u32) -> bool {
+    let wnd = rcv_wnd.max(1);
+    seq_in_window(seq, rcv_nxt, wnd)
+        || (payload_len != 0
+            && seq_in_window(
+                seq.wrapping_add(payload_len as u32).wrapping_sub(1),
+                rcv_nxt,
+                wnd,
+            ))
+}
+
 // ============================================================================
 // Challenge ACK Rate Limiting (R54-2 FIX)
 // ============================================================================
@@ -7576,11 +7591,17 @@ impl SocketTable {
 
                 // R50-2 FIX: Validate segment sequence number is within receive window
                 // This prevents blind data injection attacks
-                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
-                let seq_in_recv_window =
-                    seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+                //
+                // R178-L6 / RF178-30 FIX: Partial-left-overlap data must reach
+                // the trimming logic below.
+                let seq_in_recv_window = segment_in_recv_window(
+                    header.seq_num,
+                    payload.len(),
+                    tcp_state.control.rcv_nxt,
+                    tcp_state.control.rcv_wnd,
+                );
 
-                // If sequence is outside receive window, send challenge ACK
+                // If sequence is completely outside receive window, send challenge ACK
                 if !seq_in_recv_window {
                     let win_ack = build_tcp_segment(
                         dst_ip,
@@ -8044,9 +8065,12 @@ impl SocketTable {
 
                 // R58: Use scaled window advertisement
                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
-                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
-                let seq_in_recv_window =
-                    seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+                let seq_in_recv_window = segment_in_recv_window(
+                    header.seq_num,
+                    payload.len(),
+                    tcp_state.control.rcv_nxt,
+                    tcp_state.control.rcv_wnd,
+                );
 
                 if !seq_in_recv_window {
                     let win_ack = build_tcp_segment(
@@ -8451,9 +8475,12 @@ impl SocketTable {
 
                 // R58: Use scaled window advertisement
                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
-                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
-                let seq_in_recv_window =
-                    seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+                let seq_in_recv_window = segment_in_recv_window(
+                    header.seq_num,
+                    payload.len(),
+                    tcp_state.control.rcv_nxt,
+                    tcp_state.control.rcv_wnd,
+                );
 
                 if !seq_in_recv_window {
                     let win_ack = build_tcp_segment(
@@ -10903,5 +10930,14 @@ mod tests {
         assert_eq!(ipv4_to_u64([192, 168, 1, 1]), 0xC0A80101);
         assert_eq!(ipv4_to_u64([0, 0, 0, 0]), 0);
         assert_eq!(ipv4_to_u64([255, 255, 255, 255]), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn test_segment_partial_left_overlap_window() {
+        assert!(segment_in_recv_window(990, 11, 1000, 128));
+        assert!(!segment_in_recv_window(990, 10, 1000, 128));
+        assert!(segment_in_recv_window(1127, 1, 1000, 128));
+        assert!(!segment_in_recv_window(1128, 1, 1000, 128));
+        assert!(segment_in_recv_window(u32::MAX, 4, 2, 128));
     }
 }

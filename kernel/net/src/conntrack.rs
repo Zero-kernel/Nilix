@@ -20,10 +20,9 @@
 //! - Rate limits new connection creation
 //! - Bounded memory usage with configurable limits
 
-use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
-use core::cmp::Reverse;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use mm::fallible_map::FallibleOrderedMap;
 use spin::{Mutex, Once, RwLock};
 
 use crate::ipv4::Ipv4Addr;
@@ -32,13 +31,19 @@ use crate::ipv4::Ipv4Addr;
 // Constants
 // ============================================================================
 
-/// Maximum entries in the conntrack table
-pub const CT_MAX_ENTRIES: usize = 65536;
+/// RF178-7 FIX: Charge enough heap budget for both flow and namespace metadata.
+const CT_FLOW_CHARGE_BYTES: usize = 1024;
+const CT_HEAP_BUDGET_BYTES: usize = mm::memory::HEAP_SIZE_BYTES / 2;
+
+/// Maximum entries in the conntrack table, derived from the kernel heap budget.
+pub const CT_MAX_ENTRIES: usize = CT_HEAP_BUDGET_BYTES / CT_FLOW_CHARGE_BYTES;
 
 /// R140-9 FIX: Maximum entries per network namespace.
 /// Prevents a single namespace from monopolizing the global conntrack table.
 /// Set to 1/4 of global limit as a fair-share heuristic.
-const CT_MAX_ENTRIES_PER_NS: usize = 16384;
+const CT_MAX_ENTRIES_PER_NS: usize = CT_MAX_ENTRIES / 4;
+
+const _: () = assert!(CT_MAX_ENTRIES == 512);
 
 /// TCP timeout values (milliseconds)
 pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;
@@ -307,8 +312,6 @@ pub struct ConntrackEntry {
     /// the first packet (the true initiator) so the state machine can correctly
     /// distinguish Original (initiator→responder) from Reply (responder→initiator).
     pub initiator_dir: ConntrackDir,
-    /// R65-3 FIX: Monotonic generation for validating heap entries in the LRU index.
-    pub lru_gen: u64,
 }
 
 impl ConntrackEntry {
@@ -337,7 +340,6 @@ impl ConntrackEntry {
             created_ms: now_ms,
             seen_reply: false,
             initiator_dir,
-            lru_gen: 0,
         }
     }
 
@@ -390,6 +392,8 @@ pub struct CtUpdateResult {
     pub state: CtProtoState,
     /// Packet direction
     pub dir: ConntrackDir,
+    /// RF178-7 FIX: Metadata admission failed and ingress must hard-drop.
+    pub resource_exhausted: bool,
 }
 
 // ============================================================================
@@ -472,47 +476,15 @@ impl ConntrackStats {
 }
 
 // ============================================================================
-// R65-3 FIX: LRU Index Entry for O(log n) eviction
-// ============================================================================
-
-/// Heap entry keyed by last_seen_ms and a generation to skip stale nodes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LruIndexEntry {
-    last_seen_ms: u64,
-    generation: u64,
-    key: FlowKey,
-}
-
-impl PartialOrd for LruIndexEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for LruIndexEntry {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // Order by last_seen_ms first, then generation, then key for stability
-        self.last_seen_ms
-            .cmp(&other.last_seen_ms)
-            .then_with(|| self.generation.cmp(&other.generation))
-            .then_with(|| self.key.cmp(&other.key))
-    }
-}
-
-// ============================================================================
 // Conntrack Table
 // ============================================================================
 
 /// The connection tracking table.
 pub struct ConntrackTable {
-    /// Entry storage (BTreeMap for stable iteration during sweep)
-    entries: RwLock<BTreeMap<FlowKey, Mutex<ConntrackEntry>>>,
+    /// RF178-7 FIX: Fallible, bounded entry storage with stable ordered iteration.
+    entries: RwLock<FallibleOrderedMap<FlowKey, Mutex<ConntrackEntry>>>,
     /// R140-9 FIX: Per-namespace entry counts for fair quota enforcement.
-    ns_entry_counts: Mutex<BTreeMap<u64, usize>>,
-    /// R65-3 FIX: Min-heap (via Reverse) for O(log n) LRU eviction
-    lru_index: Mutex<BinaryHeap<Reverse<LruIndexEntry>>>,
-    /// R65-3 FIX: Monotonic generation counter for LRU heap validation
-    lru_clock: AtomicU64,
+    ns_entry_counts: Mutex<FallibleOrderedMap<u64, usize>>,
     /// Statistics
     stats: ConntrackStats,
 }
@@ -521,82 +493,10 @@ impl ConntrackTable {
     /// Create a new conntrack table.
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(BTreeMap::new()),
-            ns_entry_counts: Mutex::new(BTreeMap::new()),
-            lru_index: Mutex::new(BinaryHeap::new()),
-            lru_clock: AtomicU64::new(0),
+            entries: RwLock::new(FallibleOrderedMap::new()),
+            ns_entry_counts: Mutex::new(FallibleOrderedMap::new()),
             stats: ConntrackStats::new(),
         }
-    }
-
-    /// R65-3 FIX: Allocate a fresh LRU generation value.
-    fn next_lru_generation(&self) -> u64 {
-        self.lru_clock
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
-    }
-
-    /// R65-3 FIX: Record the latest access for a flow in the LRU heap.
-    ///
-    /// # R96-3 FIX: Bounded Heap Growth
-    ///
-    /// The LRU heap receives a push on every packet, not just on flow creation.
-    /// Without compaction, the heap grows O(packets) instead of O(flows), causing
-    /// memory exhaustion under high PPS traffic. This fix periodically rebuilds
-    /// the heap from current entries when it exceeds a threshold.
-    ///
-    /// The threshold is `entries.len() * COMPACT_FACTOR + COMPACT_SLACK` to allow
-    /// some slack for normal operation while bounding worst-case growth.
-    fn record_lru(
-        &self,
-        entries: &BTreeMap<FlowKey, Mutex<ConntrackEntry>>,
-        key: FlowKey,
-        last_seen_ms: u64,
-        generation: u64,
-    ) {
-        // Tuning constants for heap compaction
-        const HEAP_COMPACT_FACTOR: usize = 4;
-        const HEAP_COMPACT_SLACK: usize = 1024;
-
-        let rebuild_threshold = entries
-            .len()
-            .saturating_mul(HEAP_COMPACT_FACTOR)
-            .saturating_add(HEAP_COMPACT_SLACK);
-
-        // Push the new entry and check if rebuild is needed
-        let should_rebuild = {
-            let mut heap = self.lru_index.lock();
-            heap.push(Reverse(LruIndexEntry {
-                last_seen_ms,
-                generation,
-                key,
-            }));
-            heap.len() > rebuild_threshold
-        };
-
-        if !should_rebuild {
-            return;
-        }
-
-        // Rebuild heap from current entries only.
-        // This drops stale entries (flows that were removed or have newer timestamps)
-        // and bounds heap memory to O(flows).
-        //
-        // Lock ordering: We must not hold lru_index while acquiring entry locks
-        // to avoid deadlock. Build the new heap first, then swap.
-        let mut rebuilt: BinaryHeap<Reverse<LruIndexEntry>> =
-            BinaryHeap::with_capacity(entries.len());
-        for (flow_key, entry_lock) in entries.iter() {
-            let entry = entry_lock.lock();
-            rebuilt.push(Reverse(LruIndexEntry {
-                last_seen_ms: entry.last_seen_ms,
-                generation: entry.lru_gen,
-                key: *flow_key,
-            }));
-        }
-
-        // Atomic swap of the heap
-        *self.lru_index.lock() = rebuilt;
     }
 
     /// Look up an entry by flow key.
@@ -656,20 +556,12 @@ impl ConntrackTable {
                         decision,
                         state: entry.state,
                         dir,
+                        resource_exhausted: false,
                     };
                 }
 
                 entry.state = new_state;
                 entry.update_stats(state_dir, l4.payload_len, now_ms);
-
-                // R65-3 FIX: Record LRU access
-                let lru_gen = self.next_lru_generation();
-                entry.lru_gen = lru_gen;
-                let last_seen_ms = entry.last_seen_ms;
-                drop(entry);
-
-                // R96-3 FIX: Pass entries reference for heap compaction
-                self.record_lru(&entries, key, last_seen_ms, lru_gen);
 
                 // R95-2 FIX: Propagate actual decision from state machine
                 // instead of hardcoded Established. This prevents firewall
@@ -678,6 +570,7 @@ impl ConntrackTable {
                     decision,
                     state: new_state,
                     dir,
+                    resource_exhausted: false,
                 };
             }
         }
@@ -709,6 +602,7 @@ impl ConntrackTable {
                         decision: CtDecision::Invalid,
                         state: CtProtoState::Tcp(TcpCtState::None),
                         dir,
+                        resource_exhausted: false,
                     };
                 }
             }
@@ -756,20 +650,12 @@ impl ConntrackTable {
                         decision,
                         state: entry.state,
                         dir,
+                        resource_exhausted: false,
                     };
                 }
 
                 entry.state = new_state;
                 entry.update_stats(state_dir, l4.payload_len, now_ms);
-
-                // R65-3 FIX: Record LRU access
-                let lru_gen = self.next_lru_generation();
-                entry.lru_gen = lru_gen;
-                let last_seen_ms = entry.last_seen_ms;
-                drop(entry);
-
-                // R96-3 FIX: Pass entries reference for heap compaction
-                self.record_lru(&*entries, key, last_seen_ms, lru_gen);
 
                 // R95-2 FIX: Propagate actual decision from state machine
                 // (double-check path after write-lock acquisition).
@@ -777,41 +663,59 @@ impl ConntrackTable {
                     decision,
                     state: new_state,
                     dir,
+                    resource_exhausted: false,
                 };
             } // else (non-expired)
         }
 
-        // R63-2 FIX: Check table capacity UNDER the write lock to prevent
-        // concurrent bypass. Previously, the check was done before acquiring
-        // the lock, allowing multiple threads to pass the check simultaneously.
-        // R63-3 FIX: Use LRU eviction instead of rejecting when table is full.
-        // This prevents attackers from filling the table to block legitimate traffic.
-        if entries.len() >= CT_MAX_ENTRIES {
-            if !self.evict_lru_locked(&mut entries) {
-                // Table is empty but still at capacity? Shouldn't happen.
-                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
-                return CtUpdateResult {
-                    decision: CtDecision::Invalid,
-                    state: CtProtoState::Other,
-                    dir,
-                };
-            }
+        // RF178-7 / R178-18 FIX: Reserve every potentially-growing metadata
+        // store before eviction or publication. Requester quota is deliberately
+        // checked first so a saturated namespace cannot evict another tenant.
+        let mut ns_counts = self.ns_entry_counts.lock();
+        let ns_row_exists = ns_counts.get(&key.net_ns_id).is_some();
+        let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
+        if ns_count >= CT_MAX_ENTRIES_PER_NS {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
         }
 
-        // R140-9 FIX: Enforce per-namespace conntrack entry limit.
-        // Prevents a single network namespace from monopolizing the global table.
-        {
-            let ns_counts = self.ns_entry_counts.lock();
-            let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
-            if ns_count >= CT_MAX_ENTRIES_PER_NS {
-                drop(ns_counts);
-                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
-                return CtUpdateResult {
-                    decision: CtDecision::Invalid,
-                    state: CtProtoState::Other,
-                    dir,
-                };
-            }
+        if !ns_row_exists && ns_counts.try_reserve(1).is_err() {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
+        }
+
+        let table_full = entries.len() >= CT_MAX_ENTRIES;
+        if !table_full && entries.try_reserve(1).is_err() {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
+        }
+
+        // At the hard cap, removal retains the ordered map's backing capacity,
+        // so the replacement insert is allocation-free. The O(n) scan is bounded
+        // by CT_MAX_ENTRIES and avoids a second attacker-amplified LRU structure.
+        if table_full && !self.evict_lru_locked(&mut entries, &mut ns_counts) {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
         }
 
         // R63-1 FIX: Pass initiator_dir to track the true connection initiator.
@@ -820,27 +724,41 @@ impl ConntrackTable {
         // Use Original for stats since this is the first packet from initiator
         entry.update_stats(ConntrackDir::Original, l4.payload_len, now_ms);
 
-        // R65-3 FIX: Set LRU generation and record in heap
-        let lru_gen = self.next_lru_generation();
-        entry.lru_gen = lru_gen;
-        let last_seen_ms = entry.last_seen_ms;
-
-        entries.insert(key, Mutex::new(entry));
-        // R140-9 FIX: Increment per-namespace entry count.
-        {
-            let mut ns_counts = self.ns_entry_counts.lock();
-            *ns_counts.entry(key.net_ns_id).or_insert(0) += 1;
+        // Both backing stores have capacity now. Keep defensive error handling
+        // so a future map implementation change cannot make admission fail open.
+        if entries.try_insert(key, Mutex::new(entry)).is_err() {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
         }
+
+        if let Some(count) = ns_counts.get_mut(&key.net_ns_id) {
+            *count += 1;
+        } else if ns_counts.try_insert(key.net_ns_id, 1).is_err() {
+            // Transactional rollback: no flow may remain published without its
+            // namespace charge.
+            entries.remove(&key);
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+                resource_exhausted: true,
+            };
+        }
+
         self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
         self.stats.current_entries.fetch_add(1, Ordering::Relaxed);
-
-        // R96-3 FIX: Pass entries reference for heap compaction
-        self.record_lru(&*entries, key, last_seen_ms, lru_gen);
 
         CtUpdateResult {
             decision: CtDecision::New,
             state: initial_state,
             dir,
+            resource_exhausted: false,
         }
     }
 
@@ -1024,6 +942,11 @@ impl ConntrackTable {
     /// R140-9 FIX: Decrement the per-namespace entry count for a removed entry.
     fn dec_ns_entry_count(&self, ns_id: u64) {
         let mut counts = self.ns_entry_counts.lock();
+        Self::dec_ns_entry_count_locked(&mut counts, ns_id);
+    }
+
+    /// Decrement a namespace charge when the caller already holds the count lock.
+    fn dec_ns_entry_count_locked(counts: &mut FallibleOrderedMap<u64, usize>, ns_id: u64) {
         if let Some(c) = counts.get_mut(&ns_id) {
             *c = c.saturating_sub(1);
             if *c == 0 {
@@ -1033,42 +956,46 @@ impl ConntrackTable {
     }
 
     /// `true` if an entry was evicted, `false` if the table is empty.
-    /// R65-3 FIX: Evict the least-recently-seen entry (LRU) in O(log n) using heap index.
+    /// RF178-7 FIX: The direct LRU scan is allocation-free and bounded by the
+    /// heap-derived `CT_MAX_ENTRIES` cap.
     ///
     /// This prevents table exhaustion attacks where an attacker fills the table
     /// with long-lived UDP or half-open TCP connections to block legitimate traffic.
     ///
     /// # Returns
     /// `true` if an entry was evicted, `false` if table is empty.
-    fn evict_lru_locked(&self, entries: &mut BTreeMap<FlowKey, Mutex<ConntrackEntry>>) -> bool {
-        // R65-3 FIX: Use heap for O(log n) eviction instead of O(n) linear scan
-        loop {
-            let candidate = {
-                let mut heap = self.lru_index.lock();
-                heap.pop().map(|Reverse(entry)| entry)
-            };
-
-            let Some(victim) = candidate else {
-                return false;
-            };
-
-            // Validate the heap entry is still current (not stale)
-            if let Some(entry_lock) = entries.get(&victim.key) {
-                let entry = entry_lock.lock();
-                if entry.lru_gen == victim.generation && entry.last_seen_ms == victim.last_seen_ms {
-                    drop(entry);
-                    entries.remove(&victim.key);
-                    // R140-9 FIX: Decrement per-namespace entry count.
-                    self.dec_ns_entry_count(victim.key.net_ns_id);
-                    self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                    self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
-                    return true;
+    fn evict_lru_locked(
+        &self,
+        entries: &mut FallibleOrderedMap<FlowKey, Mutex<ConntrackEntry>>,
+        counts: &mut FallibleOrderedMap<u64, usize>,
+    ) -> bool {
+        let mut victim: Option<(FlowKey, u64)> = None;
+        for (flow_key, entry_lock) in entries.iter() {
+            let last_seen_ms = entry_lock.lock().last_seen_ms;
+            let replace = match victim {
+                None => true,
+                Some((victim_key, victim_last_seen)) => {
+                    last_seen_ms < victim_last_seen
+                        || (last_seen_ms == victim_last_seen && *flow_key < victim_key)
                 }
-                // Entry was updated since heap entry was created - skip stale entry
+            };
+            if replace {
+                victim = Some((*flow_key, last_seen_ms));
             }
-            // Entry was removed or stale - continue to next candidate
         }
+
+        let Some((victim_key, _)) = victim else {
+            return false;
+        };
+        if entries.remove(&victim_key).is_none() {
+            return false;
+        }
+
+        Self::dec_ns_entry_count_locked(counts, victim_key.net_ns_id);
+        self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
+        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+        true
     }
 
     /// Sweep expired entries.
@@ -1138,30 +1065,30 @@ impl ConntrackTable {
     /// `drain_ns_counters` teardown backstop (R170-7) — the 6th per-ns map that
     /// backstop missed. Returns the number of flows removed.
     pub fn drain_ns(&self, ns_id: u64) -> usize {
-        // Single write-locked `retain` pass removes EVERY flow for this namespace
-        // in one go — no intermediate allocation (hence no OOM/try_reserve
-        // best-effort path) and no read-then-write snapshot window where a flow
-        // could survive while the counter row is dropped. Namespace teardown is
-        // rare, so the O(table) write-lock hold is acceptable. (NOTE: a packet on
+        // Repeated ordered-map removal deletes EVERY flow for this namespace
+        // without intermediate allocation or a read-then-write snapshot window.
+        // The O(table^2) shifts are bounded by CT_MAX_ENTRIES and namespace
+        // teardown is rare. (NOTE: a packet on
         // a socket that outlives the namespace and still carries this raw ns id
         // could re-create a flow AFTER this drain; that straggler is bounded and
         // reclaimed by the now-wired periodic `ct_sweep`, matching the accepted
         // self-healing residual of the socket-table teardown backstop, R170-7.)
         let mut removed: u64 = 0;
-        {
-            let mut entries = self.entries.write();
-            entries.retain(|key, _entry| {
-                if key.net_ns_id == ns_id {
-                    removed += 1;
-                    false
-                } else {
-                    true
-                }
-            });
+        let mut entries = self.entries.write();
+        loop {
+            let victim = entries.keys().find(|key| key.net_ns_id == ns_id).copied();
+            let Some(key) = victim else {
+                break;
+            };
+            if entries.remove(&key).is_some() {
+                removed += 1;
+            }
         }
 
-        // Drop the per-ns counter row entirely (the namespace is gone).
+        // Drop the row before releasing entries.write(), preserving the global
+        // entries -> counts lock order and preventing an uncharged re-creation.
         self.ns_entry_counts.lock().remove(&ns_id);
+        drop(entries);
 
         if removed > 0 {
             self.stats
@@ -1302,6 +1229,7 @@ pub fn ct_process_icmp(
             decision: CtDecision::Related,
             state: CtProtoState::Icmp(IcmpCtState::EchoRequest),
             dir: ConntrackDir::Original,
+            resource_exhausted: false,
         };
     }
 
@@ -1332,9 +1260,10 @@ pub fn ct_drain_ns(ns_id: u64) -> usize {
 /// R171-G4-1/G4-2 in-kernel self-test (boot suite). Verifies (1) the periodic
 /// timer sweep reclaims an expired flow (`ct_sweep`, now wired into
 /// `net::handle_timer_tick`), and (2) namespace-teardown drain (`ct_drain_ns`)
-/// removes ALL of a namespace's flows and drops its per-ns counter row. Panics on
-/// failure → caught by `make test`. Uses high, otherwise-unused test namespace ids
-/// so it never perturbs real traffic.
+/// removes ALL of a namespace's flows and drops its per-ns counter row, and (3)
+/// requester quota failure is explicitly marked for hard-drop. Panics on failure
+/// → caught by `make test`. Uses high, otherwise-unused test namespace ids so it
+/// never perturbs real traffic.
 pub fn run_conntrack_reclaim_self_test() {
     let table = conntrack_table();
     let ns_sweep: u64 = 0x7E57_0001;
@@ -1372,5 +1301,41 @@ pub fn run_conntrack_reclaim_self_test() {
         ct_drain_ns(ns_drain),
         0,
         "conntrack: ns drain must be idempotent"
+    );
+
+    // (3) A saturated requester fails before publishing another flow, and the
+    // caller receives the explicit fail-closed resource signal.
+    let ns_quota: u64 = 0x7E57_0003;
+    for p in 0..CT_MAX_ENTRIES_PER_NS as u16 {
+        let result = ct_process_tcp(ns_quota, ip_a, ip_b, 30000 + p, 443, SYN, 0, far_future);
+        assert!(
+            !result.resource_exhausted,
+            "conntrack: entries within the namespace quota must be admitted"
+        );
+    }
+    let before_reject = table.len();
+    let rejected = ct_process_tcp(
+        ns_quota,
+        ip_a,
+        ip_b,
+        30000 + CT_MAX_ENTRIES_PER_NS as u16,
+        443,
+        SYN,
+        0,
+        far_future,
+    );
+    assert!(
+        rejected.resource_exhausted,
+        "conntrack: quota exhaustion must request an ingress hard drop"
+    );
+    assert_eq!(
+        table.len(),
+        before_reject,
+        "conntrack: rejected admission must not publish a partial flow"
+    );
+    assert_eq!(
+        ct_drain_ns(ns_quota),
+        CT_MAX_ENTRIES_PER_NS,
+        "conntrack: quota self-test cleanup must reclaim every flow"
     );
 }
