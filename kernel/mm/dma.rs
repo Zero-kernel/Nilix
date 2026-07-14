@@ -437,9 +437,10 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
                     );
                     buddy_allocator::free_physical_pages(frame, pages);
                 }
-                DmaError::IommuMapFailed => {
-                    // Unsafe error: mapping state uncertain, must leak pages
-                    // to prevent device from accessing reused memory
+                _ => {
+                    // Only IommuMapRejected proves that no mapping was installed.
+                    // Every other (including future) error has uncertain mapping
+                    // state, so leak the pages to prevent DMA into reused memory.
                     kprintln!(
                         "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
                         phys,

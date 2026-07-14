@@ -819,10 +819,8 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
         // Maps virtual 0xffffffff80000000-0xffffffffbfffffff (1GB) to physical 0x0-0x3fffffff
-        (&mut *pdpt_high_ptr)[510].set_addr(
-            PhysAddr::new(pd_frame),
-            Flags::PRESENT | Flags::WRITABLE,
-        );
+        (&mut *pdpt_high_ptr)[510]
+            .set_addr(PhysAddr::new(pd_frame), Flags::PRESENT | Flags::WRITABLE);
 
         // PML4的第511项指向高半区PDPT
         (&mut *pml4_ptr)[511].set_addr(

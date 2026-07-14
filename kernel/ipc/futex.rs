@@ -147,13 +147,13 @@ lazy_static::lazy_static! {
 /// 用于 futex_wait 在入队前二次检查值，防止 lost-wake 竞态
 /// R24-5 fix: 验证跨页、使用 SMAP 保护和容错 usercopy
 fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
-    use kernel_core::usercopy::read_user_u32_atomic;
+    use kernel_core::usercopy::{read_user_u32_atomic, UserAddr};
 
     // RF178-8: the syscall already validated the aligned u32 range. This
     // second, exception-table-backed copy is deliberately PT_LOCK-free because
     // the caller serializes FUTEX_WAKE with the wait-queue lock. A concurrent
     // unmap is reported as EFAULT by the nofault helper.
-    read_user_u32_atomic(uaddr as *const u32).map_err(|_| FutexError::Fault)
+    read_user_u32_atomic(UserAddr::new(uaddr)).map_err(|_| FutexError::Fault)
 }
 
 /// FUTEX_WAIT / FUTEX_WAIT_TIMEOUT 操作

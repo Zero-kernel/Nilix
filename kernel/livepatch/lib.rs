@@ -200,10 +200,6 @@ pub trait KernelOps: Sync {
     ///
     /// Caller must ensure the range matches a prior make_text_writable call.
     unsafe fn make_text_readonly(&self, addr: usize, len: usize);
-    unsafe fn make_text_writable(&self, addr: usize, len: usize) -> Result<(), Errno>;
-
-    /// Restore kernel text protections after patching.
-    unsafe fn make_text_readonly(&self, addr: usize, len: usize);
 
     /// Ensure instruction stream synchronization across all CPUs after text modification.
     ///

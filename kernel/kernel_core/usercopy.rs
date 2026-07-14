@@ -746,8 +746,8 @@ pub fn copy_to_user_addr(dst: UserAddr, src: &[u8]) -> Result<(), ()> {
 /// The aligned x86 dword load is a single-copy atomic observation. This helper
 /// performs no page-table lookup and takes no blocking lock, so callers may use
 /// it while holding a futex wait-queue lock with interrupts already disabled.
-pub fn read_user_u32_atomic(src: *const u32) -> Result<u32, ()> {
-    let addr = src as usize;
+pub fn read_user_u32_atomic(src: UserAddr) -> Result<u32, ()> {
+    let addr = src.as_usize();
     if addr & (core::mem::align_of::<u32>() - 1) != 0
         || !validate_user_range(addr, core::mem::size_of::<u32>())
     {
@@ -762,7 +762,8 @@ pub fn read_user_u32_atomic(src: *const u32) -> Result<u32, ()> {
     });
 
     let mut value = 0u32;
-    let status = unsafe { __zero_os_usercopy_get_u32(&mut value, src) };
+    let status =
+        unsafe { __zero_os_usercopy_get_u32(&mut value, src.as_const_ptr().cast::<u32>()) };
     USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
     if status == 0 {
         Ok(value)
