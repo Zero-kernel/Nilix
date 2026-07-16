@@ -1647,6 +1647,57 @@ impl RuntimeTest for R175SchedulerAtomicityTest {
     }
 }
 
+/// RF178-33 / P1-B: multi-CPU executable gate for the hardened scheduler.
+///
+/// Requires ≥2 CPUs online (harness hard-fails silent single-CPU). Re-runs the
+/// pure selector + identity-cleanup probes and verifies per-CPU online mask
+/// membership for distinct CPU IDs (preemption/fairness infrastructure is live).
+struct Rf17833SchedulerSmpGateTest;
+
+impl RuntimeTest for Rf17833SchedulerSmpGateTest {
+    fn name(&self) -> &'static str {
+        "rf178_33_sched_smp_gate"
+    }
+
+    fn description(&self) -> &'static str {
+        "RF178-33: 2+ CPU scheduler gate (selector/aging/identity cleanup)"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::{max_cpus, num_online_cpus};
+        use mm::tlb_shootdown::is_cpu_online;
+
+        let online = num_online_cpus();
+        if online <= 1 {
+            // P0-B harness fails the suite if this soft-skips under -smp 2.
+            // Still return Warning so single-CPU `make test` stays diagnostic.
+            return TestResult::Warning(String::from(
+                "Single-core; RF178-33 SMP gate requires 2+ CPUs",
+            ));
+        }
+
+        // Distinct online CPU IDs (real multi-CPU, not a lying online count).
+        let mut distinct = 0usize;
+        for cpu in 0..max_cpus() {
+            if is_cpu_online(cpu) {
+                distinct = distinct.saturating_add(1);
+            }
+        }
+        if distinct < 2 {
+            return TestResult::Fail(String::from(
+                "num_online_cpus>1 but fewer than 2 is_cpu_online bits — SMP truth regression",
+            ));
+        }
+
+        // Executable probes (pure; no real task mutation of production queues).
+        sched::enhanced_scheduler::run_bounded_selector_self_test();
+        sched::enhanced_scheduler::run_identity_cleanup_self_test();
+        kernel_core::process::run_ready_aging_self_test();
+
+        TestResult::Pass
+    }
+}
+
 // ============================================================================
 // Test Runner
 // ============================================================================
@@ -1681,6 +1732,8 @@ pub fn run_all_runtime_tests() -> TestReport {
         &R175TlbShootdownStressTest,
         &R175SignalFramePointerTest,
         &R175SchedulerAtomicityTest,
+        // RF178-33 / P1-B multi-CPU scheduler gate
+        &Rf17833SchedulerSmpGateTest,
         // F.1 Mount Namespace Tests
         &MountNamespaceIsolationTest,
         // F.1 IPC Namespace Tests

@@ -22,9 +22,10 @@ pub fn test_scheduler() {
     kernel_core::process::run_ready_aging_self_test();
     kernel_core::process::run_fatal_exit_publication_self_test();
     sched::enhanced_scheduler::run_bounded_selector_self_test();
+    sched::enhanced_scheduler::run_identity_cleanup_self_test();
     sched::enhanced_scheduler::run_identity_resume_self_test();
     klog_always!(
-        "    [PASS] RF178-33 selector/aging + RF178-35 fatal wake + RF178-36 identity resume"
+        "    [PASS] RF178-33 selector/aging/identity-cleanup + RF178-35 fatal wake + RF178-36 identity resume"
     );
     klog_always!("  [TEST] Enhanced Scheduler...");
     klog_always!("    ✓ Scheduler module compiled");
@@ -68,6 +69,9 @@ pub fn test_syscalls() {
     // M0-6 slice 2: rename(82) atomicity + dual errno-mapper fidelity (ENOTEMPTY/EROFS/
     // ENAMETOOLONG) + RENAME_NOREPLACE + the half-mutation guard.
     vfs::manager::run_rename_self_test();
+    // P2-C: fallible symlink-resolution helpers (last named D2-ERR-RECOVERY instance).
+    vfs::manager::run_symlink_fallible_helpers_self_test();
+    klog_always!("    ✓ P2-C symlink fallible helpers: try_reserve path/buf/utf8 joins");
     // M0 #6: RLIMIT (getrlimit/setrlimit/prlimit64) data-model + validator, and the
     // seccomp<->dispatch divergence-prevention parity tests (the pledge allowlist is
     // PARTITIONED into dispatched XOR exempt; BPF agrees with the semantic gate).
@@ -101,6 +105,13 @@ pub fn test_syscalls() {
     // PURE (a real-blocking receive/futex test would hang single-CPU at boot).
     ipc::run_ipc_eintr_self_test();
     klog_always!("    ✓ M0 #5 signals (1b-1b): IPC/PI-futex precise-EINTR errno mapping (Interrupted => EINTR)");
+    // P2-B: under-lock recheck-before-publish closes the R172 futex compare/
+    // enqueue lost-wake class (RF178-8 try_prepare_with_timeout_after).
+    ipc::run_futex_lost_wake_prepare_self_test();
+    klog_always!("    ✓ P2-B futex lost-wake: prepare recheck-before-publish (fail→empty, pass→Arm+cancel)");
+    // P3-A: process-generation stamp for pipe WaitQueue wake identity.
+    ipc::run_process_gen_stamp_self_test();
+    klog_always!("    ✓ P3-A pipe raw-PID residual: PROCESS_GEN_TAG stamp/unstamp + mismatch refuse");
     // M0-6 poll/select: the PURE ABI/codec/timeout core (fd_set words/mark/test/
     // trim boundaries, strict timespec vs lenient timeval conversion, revents
     // masking with ERR/HUP/NVAL-always + RDHUP-requires-request, select-bit map).
@@ -384,6 +395,46 @@ pub fn test_page_cache_policy() {
     klog_always!("    ✓ RAII charge transfer + exact final-Arc uncharge");
 }
 
+/// P2-A: kernel-heap byte-budget arbiter coexistence + query API.
+pub fn test_heap_budget_arbiter() {
+    klog_always!("  [TEST] Heap Budget Arbiter (P2-A)...");
+    mm::run_heap_budget_self_test();
+    assert!(
+        mm::heap_budgets_published(),
+        "arbiter must be published at boot before integration tests"
+    );
+    let snap = mm::heap_budget_snapshot();
+    // Consumer coupling: derived caps must stay within registered floors.
+    assert!(
+        (net::conntrack::CT_MAX_ENTRIES * 1024) <= mm::CONNTRACK_HARD_BYTES,
+        "conntrack entry charge must fit arbiter hard floor"
+    );
+    assert!(
+        (mm::PAGE_CACHE_MAX_PAGES as usize) * 256 <= mm::PAGE_CACHE_META_HARD_BYTES,
+        "page-cache metadata charge must fit arbiter hard floor"
+    );
+    assert_eq!(
+        mm::budget_bytes(mm::HeapBudgetId::ExecImagePeak),
+        mm::EXEC_IMAGE_PEAK_BYTES
+    );
+    assert_eq!(
+        mm::hard_floor_bytes(mm::HeapBudgetId::ExecImagePeak),
+        0,
+        "exec peak must not register as a hard floor"
+    );
+    assert_eq!(mm::transient_peak_holders(), 0);
+    klog_always!(
+        "    ✓ coexistence: hard={} KiB + headroom={} KiB + peak={} KiB <= heap={} KiB (residual={} KiB)",
+        snap.hard_floors_sum_bytes / 1024,
+        snap.reserved_headroom_bytes / 1024,
+        snap.transient_peak_bytes / 1024,
+        snap.heap_total_bytes / 1024,
+        snap.general_residual_bytes / 1024
+    );
+    klog_always!("    ✓ named hard floors derived from arbiter (no independent HEAP/N fractions)");
+    klog_always!("    ✓ single-holder transient peak admission + consumer floor coupling");
+}
+
 /// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.
 ///
 /// Runs real assertions over the per-namespace connection (J2-1), half-open /
@@ -662,6 +713,7 @@ pub fn run_all_tests() {
     test_context_switch();
     test_memory_mapping();
     test_fallible_map();
+    test_heap_budget_arbiter();
     test_page_cache_policy();
     test_per_ns_tcp_budgets();
     test_cgroup_fd_budget();

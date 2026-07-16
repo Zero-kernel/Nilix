@@ -356,6 +356,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         klog_always!("      ✓ Heap and Buddy allocator ready (fallback mode)");
     }
 
+    // P2-A: publish the kernel-heap byte-budget arbiter immediately after the
+    // heap is live and BEFORE any subsystem that sizes retained metadata from
+    // these budgets allocates (page cache, conntrack, futex, audit, exec).
+    // Fail-closed: over-committed hard floors panic here rather than OOM later.
+    mm::publish_heap_budgets();
+    klog_always!("      ✓ Heap budget arbiter published (hard floors coexistence proven)");
+
     // 初始化页表管理器
     // Bootloader 创建了恒等映射（物理地址 == 虚拟地址），所以物理偏移量为 0
     unsafe {
@@ -473,6 +480,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 );
                 klog_always!("        - kaslr_fail_closed:    {}", ps.kaslr_fail_closed);
                 klog_always!("        - kpti_fail_closed:     {}", ps.kpti_fail_closed);
+                klog_always!("        - audit_fail_closed:    {}", ps.audit_fail_closed);
                 klog_always!(
                     "        - debug_interfaces:     {}",
                     ps.debug_interfaces_enabled
@@ -753,7 +761,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         unsafe {
             arch::syscall::init_syscall_percpu(0);
         }
-        klog_always!("      ✓ BSP syscall per-CPU state initialized");
+        // P1-A: confirm kernel GS is live after boot SWAPGS (Gate #5 self-test).
+        arch::run_entry_state_gs_self_test();
+        klog_always!("      ✓ BSP syscall per-CPU state initialized (P1-A GS self-test OK)");
 
         // Attempt to bring up Application Processors (APs)
         // This will enumerate CPUs via ACPI MADT and send INIT-SIPI-SIPI
@@ -905,7 +915,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     klog_always!("[7.6/8] Initializing audit subsystem...");
     // G.fin.1: Audit ring capacity is derived from the boot-time PolicySurface.
+    // D-1 / D2-OPS-AUDIT-MANDATORY: Secure profile requires a working audit ring
+    // AND a boot-time HMAC-SHA256 key (fail-closed). Balanced/Performance may
+    // continue in an explicit degraded mode (logged warnings only).
     let audit_capacity = compliance::policy().audit_ring_capacity;
+    let audit_fail_closed = compliance::policy().audit_fail_closed;
     match audit::init(audit_capacity) {
         Ok(()) => {
             klog_always!(
@@ -991,23 +1005,27 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // R72-HMAC: Generate and install audit HMAC key for integrity protection.
             // Uses CSPRNG to generate a 32-byte cryptographically secure key.
             // The key is zeroed from stack memory after use to minimize exposure.
+            //
+            // D-1: Track whether the key actually landed so Secure can fail-closed
+            // if CSPRNG or set_hmac_key fails (otherwise "mandatory" was a lie).
+            let mut hmac_installed = false;
             {
                 let mut audit_hmac_key = [0u8; audit::MAX_HMAC_KEY_SIZE];
                 match security::rng::fill_random(&mut audit_hmac_key) {
                     Ok(()) => match audit::set_hmac_key(&audit_hmac_key) {
                         Ok(()) => {
+                            hmac_installed = true;
                             klog_always!("      ✓ Audit HMAC key installed (32 bytes, CSPRNG)");
                             klog_always!("        - All audit events now HMAC-SHA256 protected");
                         }
                         Err(e) => {
-                            klog!(Error, "      ! Failed to set audit HMAC key: {:?}", e);
+                            klog_force!("      ! Failed to set audit HMAC key: {:?}", e);
                         }
                     },
                     Err(e) => {
-                        klog!(Error, "      ! Failed to generate audit HMAC key: {:?}", e);
-                        klog!(
-                            Warn,
-                            "        - Audit events using plain SHA-256 chain only"
+                        klog_force!("      ! Failed to generate audit HMAC key: {:?}", e);
+                        klog_force!(
+                            "        - Audit events using plain SHA-256 chain only (degraded)"
                         );
                     }
                 }
@@ -1019,8 +1037,23 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
 
-            // R178-24 FIX: Now that HMAC key is installed, emit boot event.
-            // This event will be HMAC-protected, ensuring chain uniformity.
+            // D-1: Secure profile requires HMAC-protected audit chain.
+            if audit_fail_closed && !hmac_installed {
+                klog_force!(
+                    "[POLICY] Secure profile: audit HMAC key required but not installed — halting"
+                );
+                panic!(
+                    "Audit HMAC key installation failed in Secure profile \
+                     (use Balanced profile to allow degraded boot with plain SHA-256)"
+                );
+            }
+            debug_assert!(
+                !hmac_installed || audit::has_hmac_key(),
+                "HMAC install flag out of sync with audit::has_hmac_key()"
+            );
+
+            // R178-24 FIX: Now that HMAC key is installed (or Secure halted), emit boot event.
+            // This event will be HMAC-protected when the key is present.
             let _ = audit::emit(
                 audit::AuditKind::Internal,
                 audit::AuditOutcome::Info,
@@ -1034,7 +1067,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // P1-1: Re-emit the profile validation audit event now that audit is
             // initialised. The initial emission during init_policy_surface() was
             // silently dropped because audit::init() hadn't run yet.
-            // R178-24: This event is also HMAC-protected since key is already installed.
+            // R178-24: This event is also HMAC-protected when key is installed.
             compliance::emit_deferred_policy_audit();
             klog_always!("      ✓ Deferred profile audit event recorded");
 
@@ -1075,7 +1108,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             klog_always!("      ✓ Livepatch audit callback registered (P1-4)");
         }
         Err(e) => {
-            klog!(Error, "      ! Audit initialization failed: {:?}", e);
+            // D-1: Secure requires audit; Balanced/Performance degrade explicitly.
+            klog_force!("      ! Audit initialization failed: {:?}", e);
+            if audit_fail_closed {
+                klog_force!(
+                    "[POLICY] Secure profile: audit subsystem required but init failed — halting"
+                );
+                panic!(
+                    "Audit initialization failed in Secure profile: {:?} \
+                     (use Balanced profile to allow degraded boot without audit)",
+                    e
+                );
+            }
+            klog_force!("      ! Continuing without audit (degraded mode)");
         }
     }
 
@@ -1169,7 +1214,17 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     klog_always!("   • Capability-based IPC");
     klog_always!("   • Virtual File System (VFS)");
     klog_always!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
-    klog_always!("   • Security Audit (hash-chained events)");
+    // Component summary: audit line reflects actual init state (D-1 residual —
+    // do not advertise hash-chained audit after a degraded no-audit boot).
+    if audit::is_initialized() {
+        if audit::has_hmac_key() {
+            klog_always!("   • Security Audit (HMAC-SHA256 hash-chained events)");
+        } else {
+            klog_always!("   • Security Audit (hash-chained events, plain SHA-256 — degraded)");
+        }
+    } else {
+        klog_always!("   • Security Audit (NOT INITIALIZED — degraded mode)");
+    }
     klog_always!("   • Ring 3 User Mode (Phase 6 complete)");
     klog_always!();
     klog_always!("进入空闲循环...");
