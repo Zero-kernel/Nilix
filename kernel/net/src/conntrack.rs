@@ -31,11 +31,13 @@ use crate::ipv4::Ipv4Addr;
 // Constants
 // ============================================================================
 
-/// RF178-7 FIX: Charge enough heap budget for both flow and namespace metadata.
+/// RF178-7 + P2-A: conntrack hard floor is the arbiter slot
+/// [`mm::HeapBudgetId::Conntrack`] (HEAP/4 = 256 KiB), not an independent
+/// HEAP/2 fraction. Charge covers flow + namespace metadata + map slack.
 const CT_FLOW_CHARGE_BYTES: usize = 1024;
-const CT_HEAP_BUDGET_BYTES: usize = mm::memory::HEAP_SIZE_BYTES / 2;
+const CT_HEAP_BUDGET_BYTES: usize = mm::hard_floor_bytes(mm::HeapBudgetId::Conntrack);
 
-/// Maximum entries in the conntrack table, derived from the kernel heap budget.
+/// Maximum entries in the conntrack table, derived from the heap-budget arbiter.
 pub const CT_MAX_ENTRIES: usize = CT_HEAP_BUDGET_BYTES / CT_FLOW_CHARGE_BYTES;
 
 /// R140-9 FIX: Maximum entries per network namespace.
@@ -43,7 +45,9 @@ pub const CT_MAX_ENTRIES: usize = CT_HEAP_BUDGET_BYTES / CT_FLOW_CHARGE_BYTES;
 /// Set to 1/4 of global limit as a fair-share heuristic.
 const CT_MAX_ENTRIES_PER_NS: usize = CT_MAX_ENTRIES / 4;
 
-const _: () = assert!(CT_MAX_ENTRIES == 512);
+// P2-A: 256 KiB / 1024 B = 256 entries (was 512 under the old HEAP/2 claim).
+const _: () = assert!(CT_MAX_ENTRIES == 256);
+const _: () = assert!(CT_HEAP_BUDGET_BYTES == mm::CONNTRACK_HARD_BYTES);
 
 /// TCP timeout values (milliseconds)
 pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;

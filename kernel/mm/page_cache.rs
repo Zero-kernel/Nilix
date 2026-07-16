@@ -22,20 +22,22 @@ use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
 use crate::buddy_allocator;
 use crate::fallible_map::FallibleOrderedMap;
-use crate::memory::HEAP_SIZE_BYTES;
+use crate::heap_budget::{hard_floor_bytes, HeapBudgetId};
 
 /// Page size constant (4KB)
 pub const PAGE_SIZE: usize = 4096;
 
-/// RF178-11 FIX: Reserve only one eighth of the 1 MiB kernel heap for page-cache
-/// metadata. `256` bytes per resident deliberately covers the Arc allocation,
-/// one index record, one LRU record, and allocator/vector slack. The physical
-/// 4 KiB data frame is not heap-backed.
-const PAGE_CACHE_METADATA_BUDGET_BYTES: usize = HEAP_SIZE_BYTES / 8;
+/// RF178-11 + P2-A: page-cache metadata hard floor is the arbiter slot
+/// [`HeapBudgetId::PageCacheMeta`] (HEAP/16 = 64 KiB), not an independent
+/// HEAP/8 fraction. `256` bytes per resident covers Arc + index + LRU + slack.
+/// The physical 4 KiB data frame is not heap-backed.
+const PAGE_CACHE_METADATA_BUDGET_BYTES: usize =
+    hard_floor_bytes(HeapBudgetId::PageCacheMeta);
 const PAGE_CACHE_METADATA_BYTES_PER_PAGE: usize = 256;
 
-/// Heap-derived hard ceiling. With the current heap this is 512 pages, not the
-/// old 16,384-page policy whose eager LRU alone could consume the heap.
+/// Heap-arbiter-derived hard ceiling (256 pages at the current 64 KiB floor).
+/// The historical 16,384-page policy (and the intermediate 512-page HEAP/8 cap)
+/// could over-commit the 1 MiB heap when stacked with other hard floors.
 pub const PAGE_CACHE_MAX_PAGES: u64 =
     (PAGE_CACHE_METADATA_BUDGET_BYTES / PAGE_CACHE_METADATA_BYTES_PER_PAGE) as u64;
 
@@ -950,7 +952,8 @@ pub struct PageCacheStats {
 use lazy_static::lazy_static;
 
 lazy_static! {
-    /// RF178-11: heap-derived metadata bound (512 pages with the 1 MiB heap).
+    /// RF178-11 + P2-A: heap-arbiter metadata bound (256 pages under the 64 KiB
+    /// PageCacheMeta hard floor with the 1 MiB heap).
     pub static ref PAGE_CACHE: GlobalPageCache = GlobalPageCache::new(PAGE_CACHE_MAX_PAGES);
 }
 
