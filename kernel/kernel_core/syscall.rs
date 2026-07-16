@@ -2378,13 +2378,16 @@ fn is_directory_mode(mode: u32) -> bool {
 /// 内核空间使用高半区（0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF）
 const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
-/// sys_exec 允许的最大 ELF 映像大小（512 KiB）
+/// sys_exec 允许的最大 ELF 映像大小（P2-A transient peak = HEAP/4 = 256 KiB）
 ///
-/// R151-1 FIX: Reduced from 16 MiB to 512 KiB. The kernel heap is only 1 MiB
-/// (HEAP_SIZE); the previous 16 MiB limit allowed infallible vec! allocation to
-/// exhaust the heap and trigger the alloc_error_handler panic — a deterministic
-/// kernel crash from unprivileged userspace.
-const MAX_EXEC_IMAGE_SIZE: usize = 512 * 1024;
+/// R151-1 FIX: Reduced from 16 MiB because the kernel heap is only 1 MiB
+/// (HEAP_SIZE); a large limit allowed infallible vec! allocation to exhaust the
+/// heap and trigger the alloc_error_handler panic — a deterministic kernel crash
+/// from unprivileged userspace. P2-A further binds this to the heap-budget
+/// arbiter's `ExecImagePeak` slot (HEAP/4) so the peak coexists with retained
+/// hard floors + reserved headroom without over-commit. Concurrent exec paths
+/// must hold `mm::TransientPeakGuard` while the staging buffer is live.
+const MAX_EXEC_IMAGE_SIZE: usize = mm::budget_bytes(mm::HeapBudgetId::ExecImagePeak);
 
 // M0-4 (exec disambiguation) limits.
 /// First-line scan window for a `#!` shebang (Linux BINPRM_BUF_SIZE-class).
@@ -4029,7 +4032,7 @@ fn sys_clone(
         parent_user_memory_space, // H.3 KPTI: user CR3 root for CLONE_VM sharing
         parent_tgid,
         parent_thread_group_exiting, // R153-3 FIX: shared exiting flag
-        parent_mm_arc,               // D3-ARC-MM-SHARED: shared mm Arc for CLONE_VM
+        parent_exec_in_progress, // P1-D: mid-exec gate for CLONE_VM (authoritative recheck below)
         parent_name,
         parent_priority,
         parent_cgroup_id, // R123-2 FIX: for cgroup attachment after create_process
@@ -4118,19 +4121,26 @@ fn sys_clone(
             )
         };
 
-        // D3-ARC-MM-SHARED: Clone mm Arc for CLONE_VM sharing.
-        // R162-5 FIX: Removed dead mmap_snapshot code. Under D3-ARC-MM-SHARED,
-        // CLONE_VM shares the Arc directly and fork returns early from sys_clone.
-        // The mmap_snapshot BTreeMap was never used but performed up to 65536
-        // infallible BTreeMap node allocations under the parent lock.
-        let parent_mm_arc_clone = Arc::clone(&parent.mm);
+        // D3-ARC-MM-SHARED / P1-D: do NOT Arc::clone(parent.mm) here for later
+        // publication. The early snapshot is only used for the CLONE_VM decision
+        // surface; the authoritative mm Arc is re-cloned under a re-validated
+        // parent lock immediately before installing child.memory_space (below).
+        // An early clone alone was insufficient: exec_from_bytes mutates the
+        // same MmState Arc in place after its share_count gate, so a sibling
+        // that attached to a mid-exec AS would observe rewritten bookkeeping
+        // and/or a freed CR3.
+        //
+        // P1-D FIX: snapshot exec_in_progress so CLONE_VM can fail-closed
+        // before create_process when the parent is mid-exec (mutual exclusion
+        // with the exec share_count→load_elf→commit window).
+        let parent_exec_in_progress = parent.exec_in_progress;
 
         (
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
-            parent_mm_arc_clone,                 // D3-ARC-MM-SHARED
+            parent_exec_in_progress,            // P1-D: mid-exec gate for CLONE_VM
             parent.name.clone(),
             parent.priority,
             parent.cgroup_id,    // R123-2 FIX
@@ -4169,6 +4179,16 @@ fn sys_clone(
     // 决定使用的地址空间
     let (child_space, is_shared_space) = if flags & CLONE_VM != 0 {
         // CLONE_VM: 共享父进程的地址空间
+        //
+        // P1-D FIX: fail-closed if the parent is mid-exec. exec_from_bytes
+        // rewrites the live MmState Arc in place after its share_count gate
+        // (with Process lock dropped for load_elf). Attaching a sibling to
+        // that mid-exec AS yields stale-mm bookkeeping and can free the old
+        // CR3 while the child still maps it. Early reject avoids create_process
+        // work; the install site re-checks under the parent lock.
+        if parent_exec_in_progress {
+            return Err(SyscallError::EBUSY);
+        }
         (parent_space, true)
     } else {
         // 不共享地址空间：使用 COW fork
@@ -4623,19 +4643,66 @@ fn sys_clone(
         }
 
         // 设置地址空间
-        child.memory_space = child_space;
-        if is_shared_space {
-            // H.3 KPTI: CLONE_VM shares both kernel and user CR3 roots.
-            // Threads in the same address space use the same KPTI shadow PML4.
-            child.user_memory_space = parent_user_memory_space;
+        //
+        // P1-D FIX: for CLONE_VM, re-validate the parent under its Process lock
+        // BEFORE publishing child.memory_space / child.mm. The early snapshot of
+        // parent_space alone is not enough: exec_from_bytes can pass its
+        // share_count gate, arm exec_in_progress, drop the Process lock for
+        // load_elf, then commit a NEW CR3 while rewriting the same MmState Arc
+        // in place. Without this recheck a concurrent clone would install the
+        // OLD CR3 + OLD (now rewritten) mm Arc into the child → stale-mm and
+        // potential UAF when exec frees the old AS.
+        //
+        // Lock order: Process-parent → Process-child is inverted if we lock
+        // parent while holding child. Drop child first, re-lock parent, then
+        // re-lock child (parent→child is the canonical order used by
+        // enforce_lsm_task_fork). create_process has not scheduled the child,
+        // so no concurrent child-side lock contention exists.
+        //
+        // Rebind `child` on both arms so the rest of this block always holds a
+        // live MutexGuard (the is_shared_space arm moves the original guard).
+        let mut child = if is_shared_space {
+            // Drop child lock before taking parent (avoid child→parent inversion).
+            drop(child);
 
-            // D3-ARC-MM-SHARED: CLONE_VM shares the same MmState via Arc.
-            // All CLONE_VM siblings point to the same Arc<Mutex<MmState>>,
-            // eliminating the need for sync_vm_siblings_* functions and
-            // reconcile_clone_vm_mmap_regions(). The child's default MmState
-            // (created by create_process) is dropped and replaced.
-            child.mm = Arc::clone(&parent_mm_arc);
-        }
+            // P1-D: hold parent for the entire validate→publish window so
+            // exec cannot arm/commit between Arc::clone and child.memory_space
+            // publication. Order: parent → child (canonical).
+            let parent = parent_arc.lock();
+            if parent.exec_in_progress
+                || parent.memory_space != parent_space
+                || parent.user_memory_space != parent_user_memory_space
+                || parent.memory_space == 0
+            {
+                drop(parent);
+                // Parent mid-exec or AS changed since snapshot — abort the
+                // never-scheduled child. memory_space is still 0 (default), so
+                // cleanup will not free any shared CR3.
+                drop(child_arc);
+                if let Some(p) = get_process(parent_pid) {
+                    p.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
+                kprintln!(
+                    "sys_clone: rejecting CLONE_VM — parent mid-exec or address space changed (parent={})",
+                    parent_pid
+                );
+                return Err(SyscallError::EBUSY);
+            }
+            // Fresh Arc::clone under the held parent lock.
+            let live_mm = Arc::clone(&parent.mm);
+            let mut child = child_arc.lock();
+            child.memory_space = parent_space;
+            child.user_memory_space = parent_user_memory_space;
+            child.mm = live_mm;
+            // Parent still held until here → share_count now sees the child;
+            // concurrent exec's recheck/arm will EBUSY.
+            drop(parent);
+            child
+        } else {
+            child.memory_space = child_space;
+            child
+        };
 
         // 从当前 syscall 帧构建子进程上下文
         // 使用 syscall 帧而非 parent.context，因为后者是上次调度时的状态
@@ -5210,6 +5277,15 @@ fn exec_from_bytes(
     // processes (including Zombies) that share the same memory_space. A Zombie
     // retains its memory_space reference until reaped by cleanup_zombie(), so
     // it must be counted to prevent double-free of CR3 page tables.
+    //
+    // P1-D FIX: arm `exec_in_progress` in the SAME Process-lock critical section
+    // as the share_count recheck (count under PROCESS_TABLE, then re-lock Process
+    // and re-validate). A concurrent sys_clone(CLONE_VM) either:
+    //   - publishes child.memory_space first → share_count > 1 → EBUSY here, or
+    //   - sees exec_in_progress after this arm → EBUSY on the clone recheck.
+    // The previous ordering (share_count, then long unlocked work, then arm)
+    // left a window where clone could attach mid-exec and observe a rewritten
+    // MmState / freed CR3.
     let share_count = address_space_share_count(current_memory_space);
     if share_count > 1 {
         kprintln!(
@@ -5247,10 +5323,6 @@ fn exec_from_bytes(
     // It is moved (no allocation) into proc.name during the commit.
     let comm_name = exec_comm_name(&execfn)?;
 
-    // 创建新的地址空间
-    let (_new_pml4_frame, new_memory_space) =
-        create_fresh_address_space().map_err(|_| SyscallError::ENOMEM)?;
-
     // H.3 KPTI: User PML4 creation is deferred until AFTER load_elf() and stack
     // setup populate user-space page table entries. create_kpti_user_pml4() snapshots
     // PML4[0..255], so it must run after all user mappings (code, data, BSS, stack
@@ -5275,22 +5347,63 @@ fn exec_from_bytes(
         }
     }
 
+    // P1-D: arm exec_in_progress FIRST under the Process lock, then re-validate
+    // sole ownership. Order matters:
+    //   1. Arm under Process lock → concurrent CLONE_VM recheck sees the flag
+    //      and EBUSYs (cannot publish child.memory_space against this AS).
+    //   2. Drop Process, call address_space_share_count (needs PROCESS_TABLE;
+    //      Level-5 ordering forbids holding Process across that scan).
+    //   3. If a sibling already published before the arm, share_count > 1 →
+    //      EBUSY (guard Drop clears the flag).
+    //   4. Re-lock and confirm memory_space is still the counted one.
+    //   5. ONLY THEN allocate the new address space (no free-on-EBUSY path).
+    // The previous ordering (unlocked share_count → long work → arm) left a
+    // window where clone could attach mid-exec and observe a rewritten MmState
+    // or a freed CR3.
     let (old_memory_space, old_user_memory_space, exec_cgroup_id) = {
         let mut proc = process.lock();
+        let ms = proc.memory_space;
+        let ums = proc.user_memory_space;
+        let cg = proc.cgroup_id;
+        if ms == 0 {
+            return Err(SyscallError::ENOMEM);
+        }
         // R171 M2-1 SLICE-1 FIX: arm the migration block under the Process lock,
-        // BEFORE the lock is dropped for load_elf's lock-dropped charge window. A
-        // concurrent cgroup migration now sees this set and retries (EAGAIN/EBUSY)
-        // instead of snapshotting compute_cgroup_charged_bytes mid-charge and
-        // stranding the in-flight exec charge on `exec_cgroup_id`.
+        // BEFORE the lock is dropped for load_elf's lock-dropped charge window.
+        // P1-D: this arm is also the mutual-exclusion edge against concurrent
+        // sys_clone(CLONE_VM) attach (clone rechecks exec_in_progress).
         proc.exec_in_progress = true;
         proc.mm.lock().exec_pending_bytes = 0; // Clear any stale value
-        (proc.memory_space, proc.user_memory_space, proc.cgroup_id)
+        (ms, ums, cg)
     };
-    // Armed: from here every sys_exec exit clears the flag (no gap — the next
-    // statements cannot early-return before this guard exists).
+    // Armed: from here every sys_exec exit clears the flag.
     let _exec_progress_guard = ExecInProgressGuard {
         process: process.clone(),
     };
+
+    // Re-check sole ownership after arming. Any CLONE_VM that published before
+    // the arm is visible to the count; any that races after the arm fails its
+    // recheck on exec_in_progress.
+    if address_space_share_count(old_memory_space) > 1 {
+        kprintln!(
+            "exec_from_bytes: refusing exec — CLONE_VM sibling appeared before arm (cr3=0x{:x})",
+            old_memory_space
+        );
+        return Err(SyscallError::EBUSY);
+    }
+    // Defensive: memory_space must not have changed under us (exec is single-
+    // threaded per task, but keep the R156-1 style re-verify).
+    {
+        let proc = process.lock();
+        if proc.memory_space != old_memory_space {
+            return Err(SyscallError::EAGAIN);
+        }
+    }
+
+    // 创建新的地址空间 — only after the P1-D arm+recheck so a mid-window
+    // EBUSY cannot leak a freshly allocated PML4.
+    let (_new_pml4_frame, new_memory_space) =
+        create_fresh_address_space().map_err(|_| SyscallError::ENOMEM)?;
 
     // S-7 fix: RAII guard to rollback address space on error
     //
@@ -6036,6 +6149,9 @@ fn sys_spawn_image(
         );
         return Err(SyscallError::E2BIG);
     }
+    // P2-A: single-holder transient-peak admission — concurrent exec staging
+    // must not stack N * EXEC_IMAGE_PEAK_BYTES on top of full hard floors.
+    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
     // R151-1 FIX: fallible allocation (the global alloc_error_handler panics).
     let mut elf_data: Vec<u8> = Vec::new();
     elf_data
@@ -6055,7 +6171,9 @@ fn sys_spawn_image(
     };
 
     // The EBUSY multithread/CLONE_VM gate runs INSIDE exec_from_bytes (first work),
-    // so it is unbypassable on every entry path.
+    // so it is unbypassable on every entry path. Peak guard lives until this
+    // function returns (staging buffer moved into exec_from_bytes and dropped
+    // after load, or on error).
     exec_from_bytes(process, elf_data, argv_vec, envp_vec, execfn)
 }
 
@@ -6093,6 +6211,11 @@ fn sys_execve(
     let envp_vec = copy_user_str_array(envp)?;
     // AT_EXECFN = the ORIGINAL pathname, threaded UNCHANGED through any shebang.
     let execfn: Vec<u8> = path_bytes;
+
+    // P2-A: admit the transient peak BEFORE resolve_exec_chain allocates the
+    // MAX_EXEC_IMAGE_SIZE staging buffer(s). Guard lives until this function
+    // returns so concurrent execve/spawn_image cannot stack peaks.
+    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
 
     // Resolve the entire shebang chain to the FINAL ELF bytes BEFORE touching the
     // address space, so a mid-chain error (ENOENT/EACCES/ELOOP/parse) returns to

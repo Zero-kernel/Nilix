@@ -1054,11 +1054,10 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     })
 }
 
-/// RF178-31 FIX: fixed COW refcount storage for the largest buddy-managed
-/// physical window. This 256 KiB table lives in kernel static storage, not the
-/// 1 MiB heap, and every lookup/update is O(1).
-static COW_PAGE_REFCOUNTS: [AtomicU32; mm::memory::MAX_MANAGED_PHYS_PAGES] =
-    [const { AtomicU32::new(0) }; mm::memory::MAX_MANAGED_PHYS_PAGES];
+// RF178-31 FIX: COW refcount storage is a boot-reserved physical-frame table
+// sized from the discovered managed window (see mm::memory::publish_cow_refcount_table).
+// It is NOT a static array sized by an artificial 256 MiB RAM cap, and it is NOT
+// allocated from the 1 MiB heap. Lookups remain O(1) and allocation-free.
 
 /// Result of atomically releasing one leaf mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1102,7 +1101,8 @@ impl PhysicalPageRefCount {
         if index >= page_count {
             return None;
         }
-        COW_PAGE_REFCOUNTS.get(index)
+        // RF178-31: index into the boot-reserved frame-backed table.
+        mm::memory::cow_refcount_slot(index)
     }
 
     /// Atomically add this fork's exact mapping delta to one frame.
@@ -1544,6 +1544,20 @@ pub fn run_cow_refcount_self_test() {
     let (base, pages) = mm::memory::managed_physical_page_window()
         .expect("buddy physical window must precede integration tests");
     let base = usize::try_from(base).expect("physical base fits usize");
+    // RF178-31: the boot-reserved table must cover the full managed window
+    // (including the last page index) and reject addresses outside it.
+    assert!(
+        mm::memory::cow_refcount_slot(0).is_some(),
+        "COW refcount table must be published before self-test"
+    );
+    assert!(
+        mm::memory::cow_refcount_slot(pages - 1).is_some(),
+        "COW refcount table must cover last managed page"
+    );
+    assert!(
+        mm::memory::cow_refcount_slot(pages).is_none(),
+        "COW refcount table must not over-claim past managed pages"
+    );
     assert!(PhysicalPageRefCount::slot(base).is_some());
     assert!(PhysicalPageRefCount::slot(base + (pages - 1) * 4096).is_some());
     assert!(PhysicalPageRefCount::slot(base + pages * 4096).is_none());

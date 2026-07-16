@@ -127,7 +127,8 @@ pub use cap::{
 };
 pub use scheduler_hook::{
     force_init_resched_locals, force_reschedule, force_reschedule_from_irq, on_scheduler_tick,
-    register_resched_callback, register_timer_callback, request_resched_from_irq,
+    register_kernel_gs_assert, register_resched_callback, register_timer_callback,
+    request_resched_from_irq,
     reschedule_if_needed, ReschedOrigin,
 };
 pub use signal::{
