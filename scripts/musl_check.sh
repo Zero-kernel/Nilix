@@ -2,11 +2,11 @@
 # ============================================================================
 # Zero-OS musl libc conformance gate  (M0 item 3 — the FIRST real gate)
 # ============================================================================
-# Unlike `make test` (which runs `timeout 10 qemu ... || true` and therefore
-# ALWAYS exits 0, even on a crash), this script's exit code reflects the REAL
-# health of the user-mode ABI: it proves that a genuine static-musl binary runs
-# end-to-end (crt startup consuming the auxv, musl stdio via printf -> writev,
-# and a clean process exit).
+# Sibling of `make test` / scripts/kernel_test.sh (runtime suite gate) and
+# boot_check.sh. This script's exit code reflects the REAL health of the
+# user-mode ABI: it proves that a genuine static-musl binary runs end-to-end
+# (crt startup consuming the auxv, musl stdio via printf -> writev, and a
+# clean process exit).
 #
 # It boots the kernel — which MUST be built with `--features musl_test` so the
 # embedded `userspace/hello_musl.elf` is the Ring-3 init program (see

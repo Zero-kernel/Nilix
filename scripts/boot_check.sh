@@ -2,9 +2,9 @@
 # ============================================================================
 # Zero-OS CI boot-health gate
 # ============================================================================
-# Unlike `make test` (which runs `timeout 10 qemu ... || true` and therefore
-# ALWAYS exits 0, even on a boot crash), this script's exit code reflects real
-# boot health. It boots the kernel under QEMU and asserts that:
+# Sibling of `make test` / scripts/kernel_test.sh (runtime suite gate) and
+# musl_check.sh. This script's exit code reflects real boot health — it boots
+# the kernel under QEMU and asserts that:
 #
 #   1. the kernel reaches userspace / its idle loop (success marker on serial), and
 #   2. NO NX-violation instruction-fetch #PF occurred (the D1-BOOT-NX-KASLR-LAYOUT
