@@ -606,11 +606,21 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 // CPU异常处理器 (0-31)
 // ============================================================================
 
-/// RF178-1 FIX: Fatal Ring-3 exception paths do not return through a normal
-/// epilogue, so establish kernel GS and the kernel KPTI root before they enter
-/// process teardown or the scheduler.
+/// RF178-1 / P1-A FIX: Fatal Ring-3 exception paths do not return through a
+/// normal epilogue, so establish kernel GS and the kernel KPTI root before they
+/// enter process teardown or the scheduler.
+///
+/// # Contract (D1-ARC-ENTRY-STATE)
+///
+/// - Call **only** when the exception/IRQ originated from CPL3 (CS.RPL==3) **or**
+///   when the path is known no-return and kernel GS is required for
+///   `force_reschedule_from_irq` / KPTI loads.
+/// - **Do not** call on recoverable paths that return via IRET to user: the
+///   `x86-interrupt` ABI does **not** auto-swapgs, so an unpaired swap leaves
+///   user IRET with kernel GS (or double-swaps on next entry).
+/// - Idempotent w.r.t. CR3 when already on the kernel root.
 #[inline]
-unsafe fn enter_kernel_state_from_user_exception() {
+pub unsafe fn enter_kernel_state_from_user_exception() {
     core::arch::asm!(
         "swapgs",
         "lfence",
@@ -990,6 +1000,13 @@ extern "x86-interrupt" fn double_fault_handler(
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
+    // P1-A D1-ARC-ENTRY-STATE: #DF uses IST and can originate from Ring-3 (e.g.
+    // bad user RSP + nested fault). Establish kernel GS/CR3 before diagnostics
+    // or any gs:[percpu_*] access. No-return path — unpaired swapgs is fine.
+    if (stack_frame.code_segment.0 & 0x3) == 3 {
+        unsafe { enter_kernel_state_from_user_exception() };
+    }
+
     // L-7 fix: Only output detailed state in debug builds to avoid
     // leaking kernel addresses (KASLR bypass prevention)
     #[cfg(debug_assertions)]
@@ -1002,8 +1019,6 @@ extern "x86-interrupt" fn double_fault_handler(
     }
     #[cfg(not(debug_assertions))]
     unsafe {
-        // Suppress unused warning in release builds
-        let _ = &stack_frame;
         serial_write_str("\n[DOUBLE FAULT]\n");
     }
 
@@ -1192,6 +1207,14 @@ extern "x86-interrupt" fn page_fault_handler(
         // Fallback: no exception-table entry for this RIP.
         // Keep old kill behavior to avoid a user-triggerable kernel panic
         // if a non-annotated access slips in.
+        //
+        // P1-A D1-ARC-ENTRY-STATE: Usercopy faults are almost always CPL0
+        // (kernel accessing user memory) so GS is already kernel. If CS.RPL==3
+        // somehow reaches this fallback (mis-annotated path), establish kernel
+        // GS/CR3 before no-return terminate → force_reschedule_from_irq.
+        if (stack_frame.code_segment.0 & 0x3) == 3 {
+            unsafe { enter_kernel_state_from_user_exception() };
+        }
         if let Some(pid) = kernel_core::process::current_pid() {
             // SIGSEGV 的退出码为 128 + 11 = 139
             // R116-1 FIX: Do NOT return after terminate — IRET would resume the

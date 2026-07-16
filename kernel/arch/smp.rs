@@ -1151,12 +1151,26 @@ pub extern "C" fn ap_rust_entry(
         .get()
         .copied()
         .expect("per-AP security initialization callback not registered");
-    // RF178-23 FIX: Do not advertise an AP whose local mitigation MSRs could
-    // not establish the policy's minimum Spectre-v2 path.
-    assert!(
-        security_init(),
-        "per-AP speculative-execution mitigation initialization failed"
-    );
+    // RF178-23 / P0-B VT-1 FIX: Do not advertise an AP whose local mitigation
+    // MSRs cannot meet the BSP-published Spectre floor. Prefer clean rejection
+    // (halt before IRQ/online/shootdown publication) over panic-on-AP — panic
+    // can race BSP admission and is harder to observe on serial.
+    if !security_init() {
+        klog!(
+            Warn,
+            "[SMP] CPU {} cannot meet BSP Spectre mitigation floor; halting AP",
+            cpu_idx
+        );
+        // Ensure BSP does not wait forever if we lost the STARTING→READY race
+        // window; mark rejected if still STARTING, then halt without publishing.
+        let _ = AP_BOOT_STATE.compare_exchange(
+            AP_BOOT_STARTING,
+            AP_BOOT_REJECTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        halt_rejected_ap();
+    }
 
     // RF178-24 FIX: finishing initialization is not permission to publish.
     // The BSP either accepts this exact serialized bring-up attempt or rejects
