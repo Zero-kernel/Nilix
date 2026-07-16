@@ -36,8 +36,9 @@ pub use gdt::{
     DOUBLE_FAULT_STACK_SIZE, KERNEL_STACK_SIZE,
 };
 pub use syscall::{
-    arch_set_kpti_cr3s, init_syscall_msr, is_initialized as syscall_initialized,
-    register_frame_callback, stage_pending_tls_bases, with_current_syscall_frame, SyscallFrame,
+    arch_set_kpti_cr3s, assert_kernel_gs_base, init_syscall_msr,
+    is_initialized as syscall_initialized, register_frame_callback, run_entry_state_gs_self_test,
+    stage_pending_tls_bases, with_current_syscall_frame, SyscallFrame,
 };
 
 // Re-export cpu_local from the cpu_local crate for backwards compatibility

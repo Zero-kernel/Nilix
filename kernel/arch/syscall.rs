@@ -434,6 +434,64 @@ unsafe fn wrmsr(msr: u32, value: u64) {
     );
 }
 
+// ============================================================================
+// P1-A D1-ARC-ENTRY-STATE: kernel GS enforcement
+// ============================================================================
+
+/// P1-A: bit N set after CPU N has programmed `SYSCALL_PERCPU[N]` and performed
+/// the boot SWAPGS so *this* CPU runs with kernel `IA32_GS_BASE`.
+///
+/// Per-CPU (not a single global) so an early AP cannot false-positive against
+/// BSP's ready bit before the AP's own `init_syscall_percpu` + swapgs.
+static SYSCALL_GS_READY_MASK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// P1-A: Assert that `IA32_GS_BASE` points into the kernel `SYSCALL_PERCPU` array.
+///
+/// After a correct CPL3→kernel entry (`swapgs` on syscall/timer Ring-3 path, or
+/// already-kernel GS on CPL0 IRQ), GS must address per-CPU syscall metadata.
+/// Scheduling or KPTI CR3 loads with user GS active is the R178-1 class.
+///
+/// No-op until **this** CPU has completed `init_syscall_percpu` (bit in
+/// `SYSCALL_GS_READY_MASK`).
+#[inline]
+pub fn assert_kernel_gs_base() {
+    use core::sync::atomic::Ordering;
+    let cpu = cpu_local::current_cpu_id();
+    if cpu >= 64 {
+        return;
+    }
+    let mask = SYSCALL_GS_READY_MASK.load(Ordering::Acquire);
+    if (mask & (1u64 << cpu)) == 0 {
+        return;
+    }
+
+    let gs_base = unsafe { rdmsr(IA32_GS_BASE) };
+    // SAFETY: SYSCALL_PERCPU is a static mut array with fixed layout for the life of
+    // the kernel; we only read its address range for a bounds check.
+    let (start, end) = unsafe {
+        let start = SYSCALL_PERCPU.as_ptr() as u64;
+        let end = start
+            + (core::mem::size_of::<SyscallPerCpu>() as u64) * (SYSCALL_MAX_CPUS as u64);
+        (start, end)
+    };
+
+    assert!(
+        gs_base >= start && gs_base < end,
+        "P1-A ENTRY-STATE: CPU {} IA32_GS_BASE=0x{:x} outside SYSCALL_PERCPU [0x{:x}, 0x{:x}) — \
+         missing swapgs / enter_kernel_state before schedule?",
+        cpu,
+        gs_base,
+        start,
+        end
+    );
+}
+
+/// Boot self-check: kernel GS must already be active after `init_syscall_percpu(0)`.
+pub fn run_entry_state_gs_self_test() {
+    assert_kernel_gs_base();
+}
+
 /// 系统调用入口是否已初始化
 /// R102-L3 FIX: Use AtomicBool instead of static mut to prevent data races
 /// if multiple CPUs attempt concurrent init_syscall_msr calls.
@@ -833,6 +891,14 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
     // MSR 从 (GS_BASE=0, KERNEL_GS_BASE=0) 交换为 (0, 0)，导致后续
     // SYSCALL 入口的 SWAPGS 无法恢复 per-CPU 指针，引发 DOUBLE FAULT。
     asm!("swapgs", options(nostack, preserves_flags));
+
+    // P1-A: mark THIS CPU ready for GS entry-state checks (per-CPU bit).
+    if cpu_id < 64 {
+        SYSCALL_GS_READY_MASK.fetch_or(1u64 << cpu_id, core::sync::atomic::Ordering::Release);
+    }
+    // Wire the checker into kernel_core schedule entry (kernel_core holds a fn
+    // pointer; arch registers it here — Once is idempotent across BSP/APs).
+    kernel_core::scheduler_hook::register_kernel_gs_assert(assert_kernel_gs_base);
 }
 
 // ============================================================================

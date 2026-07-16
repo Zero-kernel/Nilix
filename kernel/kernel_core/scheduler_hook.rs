@@ -31,6 +31,22 @@ static TIMER_CBS: Mutex<Vec<TimerCallback>> = Mutex::new(Vec::new());
 /// scheduling reads this without acquiring a spin lock while IF=0.
 static RESCHED_CB: Once<ReschedCallback> = Once::new();
 
+/// P1-A D1-ARC-ENTRY-STATE: optional kernel-GS assertion registered by `arch`
+/// after `init_syscall_percpu` (avoids arch ↔ kernel_core crate cycle).
+static KERNEL_GS_ASSERT: Once<fn()> = Once::new();
+
+/// Register the P1-A kernel-GS entry-state checker (call once from arch init).
+pub fn register_kernel_gs_assert(f: fn()) {
+    let _ = KERNEL_GS_ASSERT.call_once(|| f);
+}
+
+#[inline]
+fn assert_kernel_entry_state() {
+    if let Some(f) = KERNEL_GS_ASSERT.get().copied() {
+        f();
+    }
+}
+
 /// 【关键修复】从中断上下文延迟的抢占请求标志
 ///
 /// 在中断上下文中不能直接调用 switch_context（会导致栈和特权级问题），
@@ -162,6 +178,8 @@ pub fn reschedule_if_needed() {
         "reschedule_if_needed() (full L8 + L5 deferred-work drain) must run with \
          interrupts ENABLED — never from an IRQ-off context (R169-5)"
     );
+    // P1-A D1-ARC-ENTRY-STATE: process-context schedule must run with kernel GS.
+    assert_kernel_entry_state();
 
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
@@ -232,6 +250,8 @@ pub fn reschedule_if_needed() {
 /// 由 sys_yield 调用，无论 NEED_RESCHED 标志如何都执行调度
 #[inline]
 pub fn force_reschedule() {
+    // P1-A D1-ARC-ENTRY-STATE: must not schedule with user GS (R178-1 class).
+    assert_kernel_entry_state();
     // R160-3 FIX: Copy callback out of lock before invoking (same fix as reschedule_if_needed).
     if let Some(cb) = RESCHED_CB.get().copied() {
         cb(true, ReschedOrigin::Process);
@@ -243,6 +263,9 @@ pub fn force_reschedule() {
 /// bounded, nonblocking local selector.
 #[inline]
 pub fn force_reschedule_from_irq() {
+    // P1-A: IRQ-return schedule is only legal after CS-RPL-gated swapgs (timer)
+    // or enter_kernel_state_from_user_exception / syscall kernel GS.
+    assert_kernel_entry_state();
     if let Some(cb) = RESCHED_CB.get().copied() {
         cb(true, ReschedOrigin::IrqReturn);
     }
