@@ -71,7 +71,13 @@ const KSTACK_GUARD_PAGES: usize = 1;
 const WATCHDOG_TIMEOUT_MS: u64 = 10_000;
 
 /// 调度器清理回调类型
-type SchedulerCleanupCallback = fn(ProcessId);
+///
+/// RF178-33 / P1-B: identity is `(pid, generation)`, not PID alone.
+/// `cleanup_zombie` detaches the table slot before this fires; a recycled PID
+/// may already own a live PCB under the same numeric id. The callback must
+/// only purge queue membership for the reaped generation (see
+/// `Scheduler::remove_process`).
+type SchedulerCleanupCallback = fn(ProcessId, u64);
 
 /// IPC清理回调类型
 /// R37-2 FIX (Codex review): Pass both PID and TGID to avoid deadlock.
@@ -4067,10 +4073,13 @@ pub fn register_futex_wake(callback: FutexWakeCallback) {
 }
 
 /// 通知调度器进程已被移除
-fn notify_scheduler_process_removed(pid: ProcessId) {
+///
+/// RF178-33 / P1-B: generation is load-bearing. Call only with the reaped
+/// task's identity captured under the PCB lock before the slot was cleared.
+fn notify_scheduler_process_removed(pid: ProcessId, generation: u64) {
     let callback = *SCHEDULER_CLEANUP.lock();
     if let Some(cb) = callback {
-        cb(pid);
+        cb(pid, generation);
     }
 }
 
@@ -5402,8 +5411,11 @@ pub fn cleanup_zombie(pid: ProcessId) {
                         && proc.teardown_done.load(Ordering::Acquire)
                     {
                         proc.state = ProcessState::Terminated;
-                        // Capture IDs needed for Phase 2 callbacks before dropping the lock
+                        // Capture IDs needed for Phase 2 callbacks before dropping the lock.
+                        // RF178-33 / P1-B: generation must ride with the reaped PID so the
+                        // scheduler cleanup callback cannot purge a recycled-PID successor.
                         let reaped_pid = proc.pid;
+                        let reaped_generation = proc.generation;
                         let tgid = proc.tgid;
                         let ipc_ns_id = proc.ipc_ns.id();
                         let cpuset_id = proc.cpuset_id;
@@ -5412,6 +5424,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
                             process,
                             keep_address_space,
                             reaped_pid,
+                            reaped_generation,
                             tgid,
                             ipc_ns_id,
                             cpuset_id,
@@ -5433,7 +5446,16 @@ pub fn cleanup_zombie(pid: ProcessId) {
     // PROCESS_TABLE lock is released here.
 
     // Phase 2: Free resources and run cross-subsystem cleanup WITHOUT holding PROCESS_TABLE.
-    if let Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id)) = reap_info {
+    if let Some((
+        process,
+        keep_address_space,
+        reaped_pid,
+        reaped_generation,
+        tgid,
+        ipc_ns_id,
+        cpuset_id,
+    )) = reap_info
+    {
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
         // the table slot was cleared in Phase 1c.
@@ -5453,7 +5475,9 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // E.5 Cpuset: decrement task count when process exits
         notify_cpuset_task_left(cpuset_id);
 
-        notify_scheduler_process_removed(reaped_pid);
+        // RF178-33 / P1-B: pass generation so a recycled PID's live queue entry
+        // is never removed by the reaper of the previous occupant.
+        notify_scheduler_process_removed(reaped_pid, reaped_generation);
         klog!(Info, "Cleaned up zombie process {}", reaped_pid);
     }
 }

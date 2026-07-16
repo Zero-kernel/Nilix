@@ -1157,7 +1157,11 @@ impl Scheduler {
         }
     }
 
-    /// Remove a PID from all CPU queues
+    /// Remove a PID from all CPU queues (membership by PID only).
+    ///
+    /// Used by `add_process` to de-dupe before re-enqueue under the same PID.
+    /// Reap-time cleanup must use [`remove_identity_from_all_queues`] so a
+    /// recycled PID's new occupant is never purged (RF178-33 / P1-B).
     fn remove_from_all_queues(pid: Pid) {
         // Cleanup scans every bounded slot, including a queue left behind by a
         // failed/offline CPU, rather than deriving an ID ceiling from a count.
@@ -1172,6 +1176,70 @@ impl Scheduler {
                 if changed {
                     Self::mark_queue_mutated(cpu_id);
                 }
+            }
+        }
+    }
+
+    /// RF178-33 / P1-B: identity-bound membership remove on one ready queue.
+    ///
+    /// Drops the PID slot only when the queued PCB's generation matches.
+    /// Generation mismatch (recycled PID) or missing entry → no-op.
+    /// Zero heap allocation; process-context only (holds PCB lock briefly).
+    fn remove_identity_from_ready_queues(
+        queue: &mut ReadyQueues,
+        queue_cpu: Option<usize>,
+        pid: Pid,
+        generation: u64,
+    ) -> bool {
+        // Membership scan: PI boost can drift dynamic_priority from the bucket key.
+        let match_priority = queue.iter().find_map(|(&priority, bucket)| {
+            let pcb = bucket.get(&pid)?;
+            let proc = pcb.lock();
+            if proc.pid == pid && proc.generation == generation {
+                Some(priority)
+            } else {
+                None
+            }
+        });
+        let Some(priority) = match_priority else {
+            return false;
+        };
+        let Some(bucket) = queue.get_mut(&priority) else {
+            return false;
+        };
+        let removed = bucket.remove(&pid).is_some();
+        if bucket.is_empty() {
+            queue.remove(&priority);
+        }
+        if removed {
+            if let Some(cpu_id) = queue_cpu {
+                Self::mark_queue_mutated(cpu_id);
+            }
+        }
+        removed
+    }
+
+    /// RF178-33 / P1-B: identity-bound queue purge for reaped tasks.
+    ///
+    /// `cleanup_zombie` clears the PROCESS_TABLE slot before the scheduler
+    /// notifier runs. A recycled PID may already be live and enqueued under the
+    /// same numeric id with a *new* generation. Removing by PID alone would
+    /// orphan that successor (task-resurrection / ABA class).
+    ///
+    /// Contract:
+    /// - Drop the slot only when the queued PCB's `(pid, generation)` matches.
+    /// - Missing entry / generation mismatch: no-op (idempotent double-remove).
+    /// - Process-context only (cleanup_zombie / reaper); may take PCB locks.
+    fn remove_identity_from_all_queues(pid: Pid, generation: u64) {
+        for cpu_id in 0..max_cpus() {
+            if let Some(queue) = Self::ready_queue_for_cpu(cpu_id) {
+                let mut guard = queue.lock();
+                let _ = Self::remove_identity_from_ready_queues(
+                    &mut guard,
+                    Some(cpu_id),
+                    pid,
+                    generation,
+                );
             }
         }
     }
@@ -1582,14 +1650,16 @@ impl Scheduler {
         });
     }
 
-    /// 移除进程
+    /// 移除进程（reap-time; identity-bound）
     ///
     /// R69-1 FIX: Removes process from all per-CPU queues.
+    /// RF178-33 / P1-B: generation is load-bearing — see
+    /// [`remove_identity_from_all_queues`].
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
-    pub fn remove_process(pid: Pid) {
+    pub fn remove_process(pid: Pid, generation: u64) {
         interrupts::without_interrupts(|| {
-            Self::remove_from_all_queues(pid);
+            Self::remove_identity_from_all_queues(pid, generation);
 
             let mut stats = SCHEDULER_STATS.lock();
             stats.processes_terminated += 1;
@@ -2771,6 +2841,78 @@ pub fn run_bounded_selector_self_test() {
     }
     assert_eq!(exiting.state, ProcessState::Zombie);
     assert_eq!(exiting.time_slice, exit_slice);
+}
+
+/// RF178-33 / P1-B: executable probe for identity-bound reap cleanup.
+///
+/// Builds a local ready queue with two PCBs sharing the same PID (recycled)
+/// and proves only the matching generation is removed.
+pub fn run_identity_cleanup_self_test() {
+    let old = Process::new(
+        0x178_33c1,
+        1,
+        alloc::string::String::from("rf178-33-old"),
+        120,
+    );
+    let old_pid = old.pid;
+    let old_gen = old.generation;
+    let old_pcb = Arc::new(Mutex::new(old));
+
+    let mut successor = Process::new(
+        0x178_33c1, // same numeric PID (recycle)
+        1,
+        alloc::string::String::from("rf178-33-new"),
+        120,
+    );
+    assert_eq!(successor.pid, old_pid);
+    assert_ne!(
+        successor.generation, old_gen,
+        "NEXT_GENERATION must mint distinct generations"
+    );
+    let new_gen = successor.generation;
+    successor.enter_ready_at(10);
+    let new_pcb = Arc::new(Mutex::new(successor));
+
+    let mut queue: ReadyQueues = BTreeMap::new();
+    // Only the successor is queued (the reaped task may still appear if exit
+    // raced with a stale Ready mark — cover both present and absent cases).
+    queue
+        .entry(120)
+        .or_default()
+        .insert(old_pid, Arc::clone(&new_pcb));
+
+    // Reaper of the OLD identity must NOT remove the successor.
+    assert!(!Scheduler::remove_identity_from_ready_queues(
+        &mut queue, None, old_pid, old_gen
+    ));
+    assert!(
+        queue.get(&120).and_then(|b| b.get(&old_pid)).is_some(),
+        "recycled-PID successor must survive old-generation cleanup"
+    );
+
+    // Matching identity removes exactly once; second call is idempotent.
+    assert!(Scheduler::remove_identity_from_ready_queues(
+        &mut queue, None, old_pid, new_gen
+    ));
+    assert!(
+        queue.get(&120).map(|b| b.is_empty()).unwrap_or(true)
+            || queue.get(&120).and_then(|b| b.get(&old_pid)).is_none()
+    );
+    assert!(!Scheduler::remove_identity_from_ready_queues(
+        &mut queue, None, old_pid, new_gen
+    ));
+
+    // Stale reaped PCB still in queue (zombie residual) is removed by old gen.
+    queue
+        .entry(120)
+        .or_default()
+        .insert(old_pid, Arc::clone(&old_pcb));
+    assert!(Scheduler::remove_identity_from_ready_queues(
+        &mut queue, None, old_pid, old_gen
+    ));
+    assert!(queue.get(&120).and_then(|b| b.get(&old_pid)).is_none());
+
+    let _ = (old_pcb, new_pcb);
 }
 
 /// RF178-36 executable probe for identity-bound stopped/fatal resume.
