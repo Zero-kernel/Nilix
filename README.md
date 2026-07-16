@@ -260,17 +260,23 @@ Four parallel jobs:
 | **rustfmt + clippy** | `make fmt-check` · `make clippy` | All crates rustfmt-clean; clippy reports no errors |
 | **build** | `make build` | Bootloader + kernel compile (PIE / build-std / hardened flags) |
 | **custom lints** | `make lint` | Four grep-based source gates pass (below) |
-| **boot + musl** | `make boot-check` · `make musl-check` | Kernel boots clean to user space, and a static-musl binary runs end-to-end |
+| **boot + test + musl** | `make boot-check` · `make test` · `make musl-check` | Kernel boots clean to user space, runtime suite scores clean, and a static-musl binary runs end-to-end |
 
 ### 5.2 Boot & conformance gates
 
-Unlike `make test` (which is `timeout 10 qemu … || true` and always exits 0), these gates have
-**real exit codes** read from the serial log and the QEMU `-d int` interrupt log — never from
-QEMU's own exit code.
+These QEMU gates have **real exit codes** read from the serial log and the QEMU `-d int`
+interrupt log — never from QEMU's own exit code (`-no-reboot -no-shutdown` makes a timeout the
+normal end of a healthy run).
 
 - **`make boot-check`** (`scripts/boot_check.sh`) — boots under QEMU and fails unless the kernel
   reaches user space / its idle loop **and** zero NX-violation instruction-fetch page faults
   occurred (the `v=0e e=0011` signature from the D1-BOOT-NX-KASLR-LAYOUT class of bugs).
+- **`make test`** (`scripts/kernel_test.sh`, P1-C VT-2 / Gate #4) — boots the default
+  `make build` image and asserts a parseable in-kernel
+  `=== Test Summary: N passed, M deferred (...), K failed ===` with `K == 0`, plus zero
+  `KERNEL PANIC` and zero NX-violation #PF. Exit polarity: **0 PASS / 1 FAILED / 2 NOT-RUN**
+  (missing summary or missing OVMF/ESP is NOT-RUN, not a silent green). Deferred/warning
+  counts are informational only.
 - **`make musl-check`** (`scripts/musl_check.sh`) — builds with `--features musl_test` so the
   embedded `hello_musl.elf` is the Ring-3 init program, then asserts **all** of: the
   libc-attributable `printf` marker (`42 * 2 = 84`), the `musl libc test passed!` success line,

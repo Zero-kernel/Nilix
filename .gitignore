@@ -9,7 +9,21 @@ Cargo.lock
 /.vscode
 /.claude
 /.codex
-/scripts
+# scripts/: ignore local-only tooling, but keep CI/gate harnesses trackable.
+# (A bare `/scripts` directory ignore cannot be re-opened by later `!` rules.)
+/scripts/*
+!/scripts/boot_check.sh
+!/scripts/musl_check.sh
+!/scripts/kernel_test.sh
+!/scripts/smp_test.sh
+!/scripts/smp_test_4core.sh
+!/scripts/afl_fuzz.sh
+!/scripts/afl_parallel.sh
+!/scripts/afl_triage.sh
+!/scripts/generate_afl_seeds.py
+!/scripts/generate_fuzz_report.py
+!/scripts/generate_fuzz_summary.py
+!/scripts/parse_fuzz_output.py
 /esp
 /bootloader-target
 /kernel-target

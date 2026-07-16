@@ -241,16 +241,21 @@ Nilix 自动强制执行正确性、风格与启动健康度——相同的门�
 | **rustfmt + clippy** | `make fmt-check` · `make clippy`      | 所有 crate rustfmt 干净；clippy 无错误                |
 | **build**            | `make build`                             | 引导程序 + 内核编译通过（PIE / build-std / 加固标志） |
 | **custom lints**     | `make lint`                              | 四个基于 grep 的源码门禁通过（见下）                  |
-| **boot + musl**      | `make boot-check` · `make musl-check` | 内核干净启动至用户态，且静态 musl 程序端到端运行      |
+| **boot + test + musl** | `make boot-check` · `make test` · `make musl-check` | 内核干净启动至用户态、运行时套件计分为干净，且静态 musl 程序端到端运行 |
 
 ### 5.2 启动与一致性门禁
 
-与 `make test`（即 `timeout 10 qemu … || true`，总是退出 0）不同，这些门禁的**退出码是真实的**——
-从串口日志与 QEMU `-d int` 中断日志读取，而绝不从 QEMU 自身的退出码读取。
+这些 QEMU 门禁的**退出码是真实的**——从串口日志与 QEMU `-d int` 中断日志读取，而绝不从
+QEMU 自身的退出码读取（`-no-reboot -no-shutdown` 下 timeout 是健康运行的正常结束方式）。
 
 - **`make boot-check`**（`scripts/boot_check.sh`）—— 在 QEMU 下启动，除非内核到达用户态 /
   其空闲循环 **且** 发生了零次 NX 违例取指缺页（D1-BOOT-NX-KASLR-LAYOUT 类缺陷的
   `v=0e e=0011` 签名），否则失败。
+- **`make test`**（`scripts/kernel_test.sh`，P1-C VT-2 / Gate #4）—— 启动默认 `make build`
+  镜像，并断言可解析的内核
+  `=== Test Summary: N passed, M deferred (...), K failed ===` 且 `K == 0`，外加零次
+  `KERNEL PANIC` 与零次 NX 违例 #PF。退出极性：**0 PASS / 1 FAILED / 2 NOT-RUN**
+  （缺少 summary 或缺少 OVMF/ESP 为 NOT-RUN，而非静默变绿）。deferred/warning 计数仅供参考。
 - **`make musl-check`**（`scripts/musl_check.sh`）—— 以 `--features musl_test` 构建，使内嵌的
   `hello_musl.elf` 成为 Ring-3 init 程序，然后断言**以下全部**：libc 可归因的 `printf` 标记
   （`42 * 2 = 84`）、`musl libc test passed!` 成功行、干净的 `exit code 0`、零次 NX 违例 #PF，
