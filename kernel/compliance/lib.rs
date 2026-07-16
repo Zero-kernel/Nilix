@@ -181,6 +181,7 @@ pub enum ProfileSource {
 /// | `panic_redact_details` | true | false | false |
 /// | `kaslr_fail_closed` | true | false | false |
 /// | `kpti_fail_closed` | true | false | false |
+/// | `audit_fail_closed` | true | false | false |
 /// | `audit_ring_capacity` | 256 | 128 | 64 |
 /// | `debug_interfaces_enabled` | false | true | true |
 /// | `spectre_mitigations` | true | true | false |
@@ -198,6 +199,11 @@ pub struct PolicySurface {
     pub kaslr_fail_closed: bool,
     /// If `true`, KPTI initialisation failures are fatal.
     pub kpti_fail_closed: bool,
+    /// D-1 / D2-OPS-AUDIT-MANDATORY: if `true`, audit ring init and boot-time
+    /// HMAC-SHA256 key installation are mandatory — failure halts boot.
+    /// Secure: fail-closed. Balanced/Performance: explicit degraded mode
+    /// (log and continue with plain SHA-256 chain or no audit).
+    pub audit_fail_closed: bool,
     /// Audit ring buffer capacity to use during `audit::init()`.
     pub audit_ring_capacity: usize,
     /// If `true`, debug interfaces (serial debug, test hooks) may be exposed.
@@ -220,6 +226,7 @@ impl PolicySurface {
             panic_redact_details: is_secure,
             kaslr_fail_closed: is_secure,
             kpti_fail_closed: is_secure,
+            audit_fail_closed: is_secure,
             audit_ring_capacity: profile.audit_capacity(),
             debug_interfaces_enabled: !is_secure,
             spectre_mitigations: profile.spectre_mitigations_enabled(),
@@ -762,6 +769,8 @@ fn emit_profile_validation_audit_event(surface: &PolicySurface, validated: bool)
     const FLAG_SPECTRE: u64 = 1 << 4;
     const FLAG_KPTR_GUARD: u64 = 1 << 5;
     const FLAG_STRICT_WXORX: u64 = 1 << 6;
+    // D-1: audit fail-closed bit (must not collide with existing flags).
+    const FLAG_AUDIT_FAIL_CLOSED: u64 = 1 << 7;
 
     let mut flags = 0u64;
     if surface.panic_redact_details {
@@ -784,6 +793,9 @@ fn emit_profile_validation_audit_event(surface: &PolicySurface, validated: bool)
     }
     if surface.strict_wxorx {
         flags |= FLAG_STRICT_WXORX;
+    }
+    if surface.audit_fail_closed {
+        flags |= FLAG_AUDIT_FAIL_CLOSED;
     }
 
     let outcome = if validated {

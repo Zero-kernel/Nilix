@@ -71,8 +71,14 @@ use x86_64::instructions::interrupts;
 /// Default ring buffer capacity (number of events)
 pub const DEFAULT_CAPACITY: usize = 256;
 
-/// Maximum capacity to prevent excessive memory usage
-pub const MAX_CAPACITY: usize = 8192;
+/// Maximum capacity accepted by [`init`].
+///
+/// P2-A: capped at DEFAULT_CAPACITY so retained audit ring memory stays within
+/// the arbiter hard floor (`mm::AUDIT_RING_HARD_BYTES` = 64 KiB). Larger
+/// historical MAX_CAPACITY (8192) could retain multi-MiB and re-open the
+/// independent over-commit class. Opportunistic export staging remains separate
+/// and fallible (`try_reserve_exact`).
+pub const MAX_CAPACITY: usize = DEFAULT_CAPACITY;
 
 /// Maximum number of records returned by one cursor export.
 const MAX_EXPORT_BATCH: usize = 1000;
@@ -2112,12 +2118,14 @@ pub fn enable() {
 ///
 /// # Security (Phase A Hardening)
 ///
-/// This function is intentionally a no-op. The audit subsystem is mandatory
-/// and cannot be disabled at runtime. Attempts to disable are logged but
-/// ignored to prevent attackers from covering their tracks.
+/// Once the audit ring is initialised, emission cannot be disabled at runtime
+/// (R35-AUDIT-1). Attempts are ignored so attackers cannot cover their tracks.
+/// Boot-time absence of audit is a separate PolicySurface concern
+/// (`audit_fail_closed` for Secure; explicit degraded mode for
+/// Balanced/Performance — D-1 / D2-OPS-AUDIT-MANDATORY).
 pub fn disable() {
-    // R35-AUDIT-1: Audit is mandatory - log the attempt but don't disable
-    kprintln!("  audit: disable() called but ignored (audit is mandatory)");
+    // R35-AUDIT-1: Once initialised, audit cannot be disabled — ignore attempts.
+    kprintln!("  audit: disable() called but ignored (audit cannot be disabled once initialised)");
 }
 
 /// Check if audit is enabled
