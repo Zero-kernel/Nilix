@@ -45,6 +45,100 @@ fn hash_path(path: &str) -> u64 {
     h
 }
 
+// ============================================================================
+// P2-C: fallible string / buffer helpers (D2-ERR-RECOVERY residual)
+// ============================================================================
+//
+// Symlink resolution and readlink must not allocate infallibly after the
+// lookup has begun (recoverable API → ENOMEM, not kernel OOM panic). These
+// helpers mirror the try_clone_from key-copy pattern (manager.rs:239-241).
+
+/// Fallibly allocate and zero a byte buffer of length `len` (at least 1).
+fn try_zeroed_buf(len: usize) -> Result<Vec<u8>, FsError> {
+    let n = len.max(1);
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(n).map_err(|_| FsError::NoMem)?;
+    buf.resize(n, 0u8);
+    Ok(buf)
+}
+
+/// Fallibly copy UTF-8 bytes into an owned `String`.
+fn try_string_from_utf8_slice(bytes: &[u8]) -> Result<String, FsError> {
+    let s = core::str::from_utf8(bytes).map_err(|_| FsError::Invalid)?;
+    try_string_from_str(s)
+}
+
+/// Fallibly clone a `&str` into an owned `String`.
+fn try_string_from_str(s: &str) -> Result<String, FsError> {
+    let mut out = String::new();
+    out.try_reserve(s.len()).map_err(|_| FsError::NoMem)?;
+    out.push_str(s);
+    Ok(out)
+}
+
+/// Fallibly join path segments with a single leading `/` and `/` separators.
+/// Empty `parts` yields `"/"`.
+fn try_join_path_components(parts: &[&str]) -> Result<String, FsError> {
+    if parts.is_empty() {
+        return try_string_from_str("/");
+    }
+    let mut need = 1usize; // leading '/'
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            need = need.checked_add(1).ok_or(FsError::NoMem)?;
+        }
+        need = need.checked_add(p.len()).ok_or(FsError::NoMem)?;
+    }
+    let mut out = String::new();
+    out.try_reserve(need).map_err(|_| FsError::NoMem)?;
+    out.push('/');
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(p);
+    }
+    Ok(out)
+}
+
+/// Fallibly concatenate `a` + `b` with capacity pre-reserve.
+fn try_concat_strs(a: &str, b: &str) -> Result<String, FsError> {
+    let need = a.len().checked_add(b.len()).ok_or(FsError::NoMem)?;
+    let mut out = String::new();
+    out.try_reserve(need).map_err(|_| FsError::NoMem)?;
+    out.push_str(a);
+    out.push_str(b);
+    Ok(out)
+}
+
+/// Fallibly build `prefix + '/' + rest` when prefix does not already end with `/`.
+fn try_join_two(prefix: &str, rest: &str) -> Result<String, FsError> {
+    if rest.is_empty() {
+        return try_string_from_str(prefix);
+    }
+    if prefix.is_empty() || prefix == "/" {
+        if rest.starts_with('/') {
+            return try_string_from_str(rest);
+        }
+        return try_concat_strs("/", rest);
+    }
+    if prefix.ends_with('/') {
+        return try_concat_strs(prefix, rest.trim_start_matches('/'));
+    }
+    let rest = rest.trim_start_matches('/');
+    let need = prefix
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_add(rest.len()))
+        .ok_or(FsError::NoMem)?;
+    let mut out = String::new();
+    out.try_reserve(need).map_err(|_| FsError::NoMem)?;
+    out.push_str(prefix);
+    out.push('/');
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Check if current process has required access permissions on a file
 ///
 /// Implements POSIX-style DAC (Discretionary Access Control):
@@ -685,9 +779,9 @@ impl Vfs {
                 // Split to get parent path and mount point name
                 if let Some(last_slash) = mount_path.rfind('/') {
                     let parent_path = if last_slash == 0 {
-                        "/".to_string()
+                        try_string_from_str("/")?
                     } else {
-                        mount_path[..last_slash].to_string()
+                        try_string_from_str(&mount_path[..last_slash])?
                     };
                     let mp_name = &mount_path[last_slash + 1..];
 
@@ -742,12 +836,18 @@ impl Vfs {
                 return Ok(current);
             }
 
-            // Track resolved prefix for relative symlink resolution
-            let mut resolved_prefix: Vec<String> = mount_path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
+            // Track resolved prefix for relative symlink resolution.
+            // P2-C: fallible component collect (was infallible map/to_string).
+            let mut resolved_prefix: Vec<String> = Vec::new();
+            {
+                let parts: Vec<&str> = mount_path.split('/').filter(|s| !s.is_empty()).collect();
+                resolved_prefix
+                    .try_reserve_exact(parts.len())
+                    .map_err(|_| FsError::NoMem)?;
+                for p in parts {
+                    resolved_prefix.push(try_string_from_str(p)?);
+                }
+            }
 
             let components: Vec<&str> =
                 relative_path.split('/').filter(|s| !s.is_empty()).collect();
@@ -801,38 +901,31 @@ impl Vfs {
                         return Err(FsError::SymlinkLoop);
                     }
 
-                    // Read symlink target
+                    // P2-C / D2-ERR-RECOVERY: fallible symlink-target read + path rebuild.
+                    // Bound by PATH_MAX-class 4096; never trust stat.size beyond that.
                     let target_len = next_stat.size.min(4096) as usize;
-                    let mut buf = Vec::with_capacity(target_len.max(1));
-                    buf.resize(target_len.max(1), 0u8);
+                    let mut buf = try_zeroed_buf(target_len)?;
                     let read_len = next.read_at(0, &mut buf)?;
-                    let target = core::str::from_utf8(&buf[..read_len])
-                        .map_err(|_| FsError::Invalid)?
-                        .to_string();
+                    let target = try_string_from_utf8_slice(&buf[..read_len])?;
 
                     // Build new path based on symlink target
                     let new_path = if target.starts_with('/') {
                         // Absolute symlink
                         if resolve_flags.in_root() && anchor_mount != "/" {
                             // Reroot absolute symlinks within the anchor
-                            let mut path = String::from(anchor_mount.trim_end_matches('/'));
-                            path.push('/');
-                            path.push_str(target.trim_start_matches('/'));
-                            path
+                            try_join_two(
+                                anchor_mount.trim_end_matches('/'),
+                                target.trim_start_matches('/'),
+                            )?
                         } else {
                             target
                         }
                     } else {
                         // Relative symlink: resolve from current directory
-                        let mut prefix = String::from("/");
-                        if !resolved_prefix.is_empty() {
-                            prefix.push_str(&resolved_prefix.join("/"));
-                        }
-                        if !prefix.ends_with('/') {
-                            prefix.push('/');
-                        }
-                        prefix.push_str(&target);
-                        prefix
+                        let prefix_parts: Vec<&str> =
+                            resolved_prefix.iter().map(|s| s.as_str()).collect();
+                        let prefix = try_join_path_components(&prefix_parts)?;
+                        try_join_two(&prefix, &target)?
                     };
 
                     // Append remaining path components
@@ -840,10 +933,9 @@ impl Vfs {
                     let full_path = if remaining.is_empty() {
                         new_path
                     } else {
-                        let mut path = String::from(new_path.trim_end_matches('/'));
-                        path.push('/');
-                        path.push_str(&remaining.join("/"));
-                        path
+                        let rem = try_join_path_components(&remaining)?;
+                        // rem is "/a/b"; join onto new_path without double slash
+                        try_join_two(new_path.trim_end_matches('/'), rem.trim_start_matches('/'))?
                     };
 
                     path_to_resolve = normalize_path(&full_path)?;
@@ -851,7 +943,10 @@ impl Vfs {
                 }
 
                 current = next;
-                resolved_prefix.push((*component).to_string());
+                resolved_prefix
+                    .try_reserve(1)
+                    .map_err(|_| FsError::NoMem)?;
+                resolved_prefix.push(try_string_from_str(component)?);
             }
 
             return Ok(current);
@@ -1335,13 +1430,10 @@ impl Vfs {
             lsm::hook_file_permission(&task, ino, 0).map_err(|_| FsError::PermDenied)?;
         }
 
-        // Read the target. Bound by PATH_MAX; never trust stat.size for the buffer
-        // beyond that cap. Symlinks are immutable in ramfs so size is stable.
-        let mut buf = alloc::vec![0u8; 4096];
+        // P2-C: fallible PATH_MAX buffer + owned target string (no infallible vec!/to_string).
+        let mut buf = try_zeroed_buf(4096)?;
         let n = inode.read_at(0, &mut buf)?;
-        let target = core::str::from_utf8(&buf[..n])
-            .map_err(|_| FsError::Invalid)?
-            .to_string();
+        let target = try_string_from_utf8_slice(&buf[..n])?;
         Ok(target)
     }
 
@@ -1627,10 +1719,11 @@ impl Vfs {
             } else {
                 "/"
             };
+            // P2-C: fallible owned path strings for recoverable lookup.
             return Ok((
-                mount_path.clone(),
+                try_string_from_str(mount_path)?,
                 Arc::clone(&mount.fs),
-                relative.to_string(),
+                try_string_from_str(relative)?,
             ));
         }
 
@@ -1640,7 +1733,11 @@ impl Vfs {
         // No mount found, check if this namespace has a root fs
         let root_fs = table.root_fs.read();
         if let Some(fs) = root_fs.as_ref() {
-            Ok(("/".to_string(), Arc::clone(fs), path.to_string()))
+            Ok((
+                try_string_from_str("/")?,
+                Arc::clone(fs),
+                try_string_from_str(path.as_str())?,
+            ))
         } else {
             Err(FsError::NotFound)
         }
@@ -1696,6 +1793,9 @@ pub fn init() {
 /// Rejects paths that attempt to traverse above the root directory.
 /// Paths like "/../../etc/passwd" will return PermDenied to prevent
 /// sandbox/mount jail escapes.
+///
+/// P2-C: allocation-fallible (try_reserve on the component list and result
+/// string). Recoverable callers map `NoMem` → ENOMEM instead of kernel OOM.
 pub fn normalize_path(path: &str) -> Result<String, FsError> {
     let mut components: Vec<&str> = Vec::new();
 
@@ -1708,23 +1808,23 @@ pub fn normalize_path(path: &str) -> Result<String, FsError> {
                     return Err(FsError::PermDenied);
                 }
             }
-            _ => components.push(component),
+            _ => {
+                components.try_reserve(1).map_err(|_| FsError::NoMem)?;
+                components.push(component);
+            }
         }
     }
 
     if components.is_empty() {
-        Ok("/".to_string())
+        try_string_from_str("/")
     } else {
-        let mut result = String::new();
-        for c in components {
-            result.push('/');
-            result.push_str(c);
-        }
-        Ok(result)
+        try_join_path_components(&components)
     }
 }
 
 /// Split path into parent directory and filename
+///
+/// P2-C: parent ownership is fallible (`try_string_from_str`).
 pub fn split_path(path: &str) -> Result<(String, &str), FsError> {
     let path = path.trim_end_matches('/');
 
@@ -1739,10 +1839,10 @@ pub fn split_path(path: &str) -> Result<(String, &str), FsError> {
             if filename.is_empty() {
                 Err(FsError::Invalid)
             } else {
-                Ok((parent.to_string(), filename))
+                Ok((try_string_from_str(parent)?, filename))
             }
         }
-        None => Ok(("/".to_string(), path)),
+        None => Ok((try_string_from_str("/")?, path)),
     }
 }
 
@@ -2133,6 +2233,39 @@ pub fn run_rename_self_test() {
     klog_always!(
         "    \u{2713} M0-6 rename: mapper(ENOTEMPTY/EROFS/ENAMETOOLONG) + happy move + atomicity guard + NOREPLACE + NotEmpty + same-parent(R172-22)"
     );
+}
+
+/// P2-C: pure structural self-test for fallible symlink-resolution helpers.
+///
+/// Does not touch VFS mounts or real symlinks — pins the helper arithmetic a
+/// green boot cannot exercise (try_reserve capacity, join shapes, UTF-8 gate).
+pub fn run_symlink_fallible_helpers_self_test() {
+    // (1) try_zeroed_buf length + zero fill.
+    let b = try_zeroed_buf(4).expect("zeroed buf");
+    assert_eq!(b.len(), 4);
+    assert!(b.iter().all(|&x| x == 0));
+    let b1 = try_zeroed_buf(0).expect("len 0 => 1");
+    assert_eq!(b1.len(), 1);
+
+    // (2) try_string_from_str / utf8.
+    let s = try_string_from_str("abc").expect("str clone");
+    assert_eq!(s, "abc");
+    assert!(matches!(
+        try_string_from_utf8_slice(&[0xff, 0xfe]),
+        Err(FsError::Invalid)
+    ));
+    let s2 = try_string_from_utf8_slice(b"hi").expect("utf8");
+    assert_eq!(s2, "hi");
+
+    // (3) path join shapes.
+    assert_eq!(try_join_path_components(&[]).unwrap(), "/");
+    assert_eq!(try_join_path_components(&["a"]).unwrap(), "/a");
+    assert_eq!(try_join_path_components(&["a", "b"]).unwrap(), "/a/b");
+    assert_eq!(try_join_two("/foo", "bar").unwrap(), "/foo/bar");
+    assert_eq!(try_join_two("/foo/", "bar").unwrap(), "/foo/bar");
+    assert_eq!(try_join_two("/", "bar").unwrap(), "/bar");
+    assert_eq!(try_join_two("/foo", "").unwrap(), "/foo");
+    assert_eq!(try_concat_strs("a", "b").unwrap(), "ab");
 }
 
 /// Register VFS callbacks with kernel_core
