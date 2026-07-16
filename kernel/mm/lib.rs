@@ -15,12 +15,23 @@ pub mod dma;
 /// allocation-fallible per-fragment map without a `net -> kernel_core` dependency
 /// cycle. Re-exported from `kernel_core::fallible_map` for source compatibility.
 pub mod fallible_map;
+/// P2-A: single registry of kernel-heap hard floors / transient peaks / headroom.
+pub mod heap_budget;
 pub mod memory;
 pub mod oom_killer;
 pub mod page_cache;
 pub mod page_table;
 pub mod tlb_shootdown;
 
+pub use heap_budget::{
+    budget_bytes, general_residual_bytes, hard_floor_bytes, hard_floors_sum_bytes,
+    is_published as heap_budgets_published, publish_and_assert as publish_heap_budgets,
+    reserved_headroom_bytes, run_heap_budget_self_test, snapshot as heap_budget_snapshot,
+    transient_peak_bytes, transient_peak_holders, HeapBudgetId, HeapBudgetSnapshot,
+    TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES, EXEC_IMAGE_PEAK_BYTES,
+    FUTEX_HARD_BYTES, HARD_FLOOR_BYTES, HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, HARD_FLOORS_SUM_BYTES,
+    PAGE_CACHE_META_HARD_BYTES, RESERVED_HEADROOM_BYTES, TRANSIENT_PEAK_BYTES,
+};
 pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,

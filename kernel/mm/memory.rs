@@ -165,16 +165,24 @@ const FALLBACK_PHYS_MEM_START: u64 = 0x10000000;
 /// 物理内存管理大小（硬编码后备值，64MB）
 const FALLBACK_PHYS_MEM_SIZE: usize = 64 * 1024 * 1024;
 
-/// RF178-31 FIX: maximum contiguous physical window managed by the buddy
-/// allocator. COW refcounts use one fixed, page-indexed table sized from this
-/// bound, so fork never allocates metadata or retains a heap high-water mark.
-pub const MAX_MANAGED_PHYS_BYTES: usize = 256 * 1024 * 1024;
-pub const MAX_MANAGED_PHYS_PAGES: usize = MAX_MANAGED_PHYS_BYTES / 4096;
+// RF178-31 / R178-6 FIX: The previous 256 MiB `MAX_MANAGED_PHYS_BYTES` cap existed
+// solely to size a static COW refcount table. That is rejected: usable RAM is
+// limited only by the architectural high-half direct map (`HIGH_HALF_MAP_LIMIT`).
+// COW metadata is boot-reserved physical frames sized from the discovered window
+// (NOT the 1 MiB heap), published once, and never grown after the first PTE
+// mutation.
 
 /// Published after the buddy allocator has accepted its one contiguous window.
 /// Readers load the page count with Acquire before using the base.
 static MANAGED_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 static MANAGED_PHYS_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// RF178-31: virtual address of the boot-reserved `[AtomicU32; managed_pages]`
+/// table (direct-map of permanently reserved physical frames). Zero until
+/// `publish_cow_refcount_table` runs exactly once during MM init.
+static COW_REFCOUNT_TABLE_VIRT: AtomicUsize = AtomicUsize::new(0);
+/// Length of the published table in entries (== managed page count).
+static COW_REFCOUNT_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// 页大小
 const PAGE_SIZE: u64 = 0x1000;
@@ -267,6 +275,13 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         heap_phys,
         &mut reserved_ranges,
     );
+
+    // RF178-31: reserve exact-sized COW refcount metadata from the discovered
+    // physical window (not the 1 MiB heap). Placed to avoid the heap hole.
+    let (meta_phys, meta_bytes) =
+        place_cow_refcount_metadata(pmm_base, pmm_size, heap_phys, HEAP_SIZE as u64);
+    let reserved_count =
+        push_cow_metadata_reservation(&mut reserved_ranges, reserved_count, meta_phys, meta_bytes);
     let reserved_ranges = &reserved_ranges[..reserved_count];
 
     // R148-8 FIX: Physical memory region bounds also leak information.
@@ -284,9 +299,15 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         "  Physical memory region: {} MB",
         pmm_size / (1024 * 1024)
     );
+    klog!(
+        Info,
+        "  COW refcount metadata: {} KB (boot-reserved frames)",
+        meta_bytes / 1024
+    );
 
     // 初始化 Buddy 物理页分配器
     buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges);
+    publish_cow_refcount_table(meta_phys, pmm_size / PAGE_SIZE as usize);
     publish_managed_phys_window(pmm_base, pmm_size);
 
     // 运行自测（可选）
@@ -334,14 +355,24 @@ pub fn init() {
     // R167-B: reserve the heap out of the buddy region (same physical-overlap
     // exclusion as the BootInfo path, but via reservation so the full fallback
     // region minus the heap hole is managed). No UEFI map here, so the heap is
-    // the only reservation.
+    // the only non-metadata reservation.
     let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
-    let reserved_ranges = [(heap_phys, HEAP_SIZE as u64)];
+    let (meta_phys, meta_bytes) = place_cow_refcount_metadata(
+        FALLBACK_PHYS_MEM_START,
+        FALLBACK_PHYS_MEM_SIZE,
+        heap_phys,
+        HEAP_SIZE as u64,
+    );
+    let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
+    reserved_ranges[0] = (heap_phys, HEAP_SIZE as u64);
+    let reserved_count =
+        push_cow_metadata_reservation(&mut reserved_ranges, 1, meta_phys, meta_bytes);
     buddy_allocator::init_buddy_allocator(
         PhysAddr::new(FALLBACK_PHYS_MEM_START),
         FALLBACK_PHYS_MEM_SIZE,
-        &reserved_ranges,
+        &reserved_ranges[..reserved_count],
     );
+    publish_cow_refcount_table(meta_phys, FALLBACK_PHYS_MEM_SIZE / PAGE_SIZE as usize);
     publish_managed_phys_window(FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE);
 
     // 运行自测（可选）
@@ -627,11 +658,148 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         total_conventional / (1024 * 1024)
     );
 
-    best.map(|(base, size)| {
-        // 限制最大使用量，避免占用太多内存
-        let capped_size = size.min(MAX_MANAGED_PHYS_BYTES as u64) as usize;
-        (base, capped_size)
-    })
+    // RF178-31: manage the full discovered conventional window up to the
+    // architectural high-half direct-map limit only. No artificial RAM cap.
+    best.map(|(base, size)| (base, size as usize))
+}
+
+/// Bytes required for an O(1) AtomicU32 COW table covering `managed_pages`.
+#[inline]
+fn cow_refcount_table_bytes(managed_pages: usize) -> usize {
+    managed_pages
+        .checked_mul(core::mem::size_of::<core::sync::atomic::AtomicU32>())
+        .expect("COW refcount table byte count overflow")
+}
+
+/// Choose a page-aligned physical placement for the COW refcount table that
+/// lies entirely inside the managed window and does not overlap the heap.
+///
+/// Prefer the high end of the window (buddy still sees a large low free span).
+/// If that collides with the heap, try the low end. Fail closed if neither fits.
+fn place_cow_refcount_metadata(
+    pmm_base: u64,
+    pmm_size: usize,
+    heap_phys: u64,
+    heap_len: u64,
+) -> (u64, usize) {
+    assert!(pmm_size > 0, "managed window must be non-empty");
+    assert_eq!(pmm_base % PAGE_SIZE, 0, "managed base must be page aligned");
+    assert_eq!(
+        pmm_size % PAGE_SIZE as usize,
+        0,
+        "managed size must be page aligned"
+    );
+
+    let managed_pages = pmm_size / PAGE_SIZE as usize;
+    let meta_bytes_raw = cow_refcount_table_bytes(managed_pages);
+    let meta_bytes = align_up(meta_bytes_raw as u64, PAGE_SIZE) as usize;
+    assert!(
+        meta_bytes > 0 && meta_bytes < pmm_size,
+        "COW metadata ({} B) must fit strictly inside managed window ({} B)",
+        meta_bytes,
+        pmm_size
+    );
+
+    let pmm_end = pmm_base
+        .checked_add(pmm_size as u64)
+        .expect("managed window end overflow");
+    let heap_end = heap_phys.saturating_add(heap_len);
+
+    let ranges_overlap = |a: u64, a_len: u64, b: u64, b_len: u64| -> bool {
+        let a_end = a.saturating_add(a_len);
+        let b_end = b.saturating_add(b_len);
+        a < b_end && b < a_end
+    };
+
+    // Prefer high placement: [pmm_end - meta, pmm_end).
+    let high = pmm_end
+        .checked_sub(meta_bytes as u64)
+        .expect("metadata high placement underflow");
+    if high >= pmm_base
+        && high + meta_bytes as u64 <= pmm_end
+        && !ranges_overlap(high, meta_bytes as u64, heap_phys, heap_len)
+    {
+        return (high, meta_bytes);
+    }
+
+    // Fall back to low placement: [pmm_base, pmm_base + meta).
+    let low = pmm_base;
+    if low + meta_bytes as u64 <= pmm_end
+        && !ranges_overlap(low, meta_bytes as u64, heap_phys, heap_len)
+    {
+        // heap_end is only used to make the placement decision readable in
+        // boot-failure panics; the overlap predicate is authoritative.
+        let _ = heap_end;
+        return (low, meta_bytes);
+    }
+
+    panic!(
+        "RF178-31: cannot place COW refcount metadata ({} KB) inside managed window without colliding with heap",
+        meta_bytes / 1024
+    );
+}
+
+/// Append the COW metadata reservation; fail closed if the bounded set is full
+/// (same R167 overflow discipline — never silently drop a live reservation).
+fn push_cow_metadata_reservation(
+    out: &mut [(u64, u64); MAX_RESERVED_RANGES],
+    count: usize,
+    meta_phys: u64,
+    meta_bytes: usize,
+) -> usize {
+    if count >= MAX_RESERVED_RANGES {
+        panic!(
+            "RF178-31: reservation list full; cannot permanently reserve COW metadata"
+        );
+    }
+    out[count] = (meta_phys, meta_bytes as u64);
+    count + 1
+}
+
+/// Zero and publish the boot-reserved COW refcount table via the direct map.
+///
+/// # Safety contract
+///
+/// `meta_phys` must be page-aligned, permanently reserved out of the buddy free
+/// pool, and fully covered by the high-half direct map. Called exactly once,
+/// single-threaded, before any AP is launched and before any fork/COW path runs.
+fn publish_cow_refcount_table(meta_phys: u64, managed_pages: usize) {
+    assert_eq!(
+        meta_phys % PAGE_SIZE,
+        0,
+        "COW metadata physical base must be page aligned"
+    );
+    assert!(managed_pages > 0, "managed page count must be non-zero");
+    assert_eq!(
+        COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire),
+        0,
+        "COW refcount table must be published exactly once"
+    );
+
+    let meta_bytes = cow_refcount_table_bytes(managed_pages);
+    let virt = meta_phys
+        .checked_add(PHYSICAL_MEMORY_OFFSET)
+        .expect("COW metadata direct-map address overflow");
+    let ptr = virt as *mut u8;
+
+    // SAFETY: meta_phys is inside the managed window which is clamped to the
+    // high-half direct map; the frames are permanently reserved and not yet
+    // used by any other subsystem.
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, meta_bytes);
+    }
+
+    // Publish base first, then length with Release. Readers Acquire-load length
+    // and only then read the base; if length != 0 they observe this base.
+    COW_REFCOUNT_TABLE_VIRT.store(virt as usize, Ordering::Release);
+    COW_REFCOUNT_TABLE_LEN.store(managed_pages, Ordering::Release);
+
+    klog!(
+        Info,
+        "  COW refcount table published: {} entries ({} KB)",
+        managed_pages,
+        meta_bytes / 1024
+    );
 }
 
 /// Publish the exact physical-page index domain used by the buddy allocator.
@@ -646,11 +814,18 @@ fn publish_managed_phys_window(base: u64, size: usize) {
         0,
         "managed physical size must be page aligned"
     );
-    assert!(size > 0 && size <= MAX_MANAGED_PHYS_BYTES);
+    // RF178-31: only the architectural direct-map limit bounds the window.
+    assert!(size > 0 && (size as u64) <= HIGH_HALF_MAP_LIMIT);
     assert_eq!(
         MANAGED_PHYS_PAGES.load(Ordering::Acquire),
         0,
         "managed physical window must be published exactly once"
+    );
+    // Metadata table must already cover the full window (same page count).
+    assert_eq!(
+        COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire),
+        size / PAGE_SIZE as usize,
+        "COW refcount table length must match managed page count"
     );
 
     MANAGED_PHYS_BASE.store(base, Ordering::Relaxed);
@@ -665,6 +840,28 @@ pub fn managed_physical_page_window() -> Option<(u64, usize)> {
         return None;
     }
     Some((MANAGED_PHYS_BASE.load(Ordering::Relaxed), page_count))
+}
+
+/// RF178-31: return the boot-reserved COW refcount slot for a managed page index.
+///
+/// Returns `None` when the table is unpublished or `index` is out of range.
+/// The table lives in permanently reserved physical frames (not the heap); every
+/// access is O(1) and allocation-free.
+#[inline]
+pub fn cow_refcount_slot(index: usize) -> Option<&'static core::sync::atomic::AtomicU32> {
+    let len = COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire);
+    if len == 0 || index >= len {
+        return None;
+    }
+    let base = COW_REFCOUNT_TABLE_VIRT.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: base/len published once after zeroing reserved frames; index < len.
+    let slot = unsafe {
+        &*(base as *const core::sync::atomic::AtomicU32).add(index)
+    };
+    Some(slot)
 }
 
 /// R167-C: Bounded accumulator for the buddy allocator's physical reservation
