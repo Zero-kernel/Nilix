@@ -52,12 +52,13 @@ pub enum FutexError {
     TooManyBuckets,
 }
 
-/// RF178-8: futex metadata may retain at most one quarter of the actual 1 MiB
-/// kernel heap. The charge covers both Arc allocations plus worst-case 2x Vec
+/// RF178-8 + P2-A: futex metadata hard floor is the arbiter slot
+/// [`mm::HeapBudgetId::Futex`] (HEAP/8 = 128 KiB), not an independent HEAP/4
+/// fraction. The charge covers both Arc allocations plus worst-case 2x Vec
 /// backing slack for the global FallibleOrderedMap, then doubles the whole raw
 /// layout for allocator alignment/fragmentation headroom. Birth is independently
 /// fallible, so fragmentation rejects admission rather than aborting the kernel.
-const FUTEX_HEAP_BUDGET_BYTES: usize = mm::memory::HEAP_SIZE_BYTES / 4;
+const FUTEX_HEAP_BUDGET_BYTES: usize = mm::hard_floor_bytes(mm::HeapBudgetId::Futex);
 const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 type FutexBucketRef = Arc<Mutex<FutexBucket>>;
 const FUTEX_TABLE_SLOT_BYTES: usize = size_of::<(FutexKey, FutexBucketRef)>();
@@ -213,11 +214,11 @@ pub fn futex_wait(
         }
     };
 
-    // 【关键修复】在入队前二次读取 futex 值，防止 lost-wake 竞态
-    // 如果值已变化，说明唤醒者已经完成操作，我们不应该阻塞
-    // RF178-8 FIX: publish the complete fallible queue/timer transaction before
-    // the second futex-word read. A concurrent wake now either observes this
-    // waiter, or its preceding store is observed by the re-read below.
+    // P2-B / RF178-8: under-lock recheck-before-publish. `try_prepare_with_timeout_after`
+    // holds the WaitQueue `waiters` lock across (1) this futex-word re-read and
+    // (2) enqueue+Blocked. All FUTEX_WAKE paths take the same lock first, so a
+    // concurrent wake either observes this waiter or its store is visible to the
+    // re-read — the R172 compare/enqueue lost-wake class is closed by construction.
     let prepared =
         match queue.try_prepare_with_timeout_after(timeout_ns, || match read_user_u32(uaddr) {
             Ok(cur) if cur == expected => Ok(()),

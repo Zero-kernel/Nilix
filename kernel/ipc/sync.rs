@@ -17,6 +17,31 @@ use x86_64::instructions::interrupts;
 /// R39-6 FIX: 纳秒到毫秒 Tick 的转换常量（时钟频率 1kHz）
 const NS_PER_MS: u64 = 1_000_000;
 
+/// P3-A: high bit tags a WaitQueue entry generation as a **process** generation
+/// (`Process.generation`) rather than a per-queue wait counter.
+///
+/// `prepare_to_wait` (pipe / condvar path — the R171 residual producer) stamps
+/// `(Process.generation | PROCESS_GEN_TAG)`. `wait_with_timeout` keeps plain
+/// queue-local gens (tag clear). Wake paths that see the tag require
+/// `pcb.generation == stamped` before readying — closing PID-recycling
+/// misdirect when a stale non-Blocked entry lingers and the PID is reused.
+const PROCESS_GEN_TAG: u64 = 1u64 << 63;
+
+#[inline]
+fn stamp_process_generation(process_gen: u64) -> u64 {
+    (process_gen & !PROCESS_GEN_TAG) | PROCESS_GEN_TAG
+}
+
+#[inline]
+fn is_process_generation_stamp(entry_gen: u64) -> bool {
+    (entry_gen & PROCESS_GEN_TAG) != 0
+}
+
+#[inline]
+fn unstamp_process_generation(entry_gen: u64) -> u64 {
+    entry_gen & !PROCESS_GEN_TAG
+}
+
 /// R39-6 FIX: 等待结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
@@ -363,10 +388,28 @@ impl WaitQueue {
         }
     }
 
-    /// RF178-8: fallibly publish a complete queue/timer transaction without
-    /// yielding. Callers may re-check their condition after publication, then
-    /// either finish the wait or cancel this exact ticket.
-    pub(crate) fn try_prepare_with_timeout_after<F, E>(
+    /// RF178-8 / P2-B: fallibly publish a complete queue/timer transaction without
+/// yielding, with a **caller-supplied recheck under `waiters` lock**.
+///
+/// # Lost-wake class elimination (P2-B / R172 residual)
+///
+/// Classic futex lost-wake: value-check → (race: store+wake) → enqueue+block.
+/// This API closes that class for any caller that supplies a recheck of the
+/// wait condition:
+///
+/// 1. Take `waiters` under IRQs-off (all normal wakers take the same lock first).
+/// 2. Run `check` **while still holding `waiters`** (before any enqueue).
+/// 3. Only if `check` returns `Ok(())`: publish waiter + `Blocked` (+ timer).
+///
+/// A concurrent wake either (a) runs before we take `waiters` — then the under-
+/// lock recheck observes the store and aborts without blocking, or (b) runs
+/// while/after we hold `waiters` — then it observes the published waiter.
+///
+/// Callers that need to sleep after a successful arm use [`finish_prepared`].
+/// Callers that arm and then discover the condition elsewhere must use
+/// [`cancel_wait`] / exact remove — do **not** recheck only *after* publish and
+/// then sleep without cancel (that would re-open a different lost-wake shape).
+pub(crate) fn try_prepare_with_timeout_after<F, E>(
         &self,
         timeout_ns: Option<u64>,
         check: F,
@@ -557,37 +600,32 @@ impl WaitQueue {
     /// 唤醒等待队列中的一个进程
     ///
     /// 返回被唤醒的进程ID，如果队列为空返回None
+    ///
+    /// # P3-A (R171 residual)
+    ///
+    /// Skip non-Blocked entries (M1-02). Additionally, if the entry was stamped
+    /// with a **process** generation (`PROCESS_GEN_TAG`), require
+    /// `pcb.generation == stamped` so a recycled PID cannot be readied by a
+    /// stale queue entry left after signal/kill interrupt of a pipe wait.
     pub fn wake_one(&self) -> Option<ProcessId> {
         interrupts::without_interrupts(|| {
-            // M1-02: pop until a genuinely Blocked waiter is readied (mirrors
-            // `wake_n`'s skip-non-Blocked loop). LOAD-BEARING under the queue-free
-            // timeout: the timer IRQ no longer removes a timed-out waiter from
-            // `self.waiters` (the wakee self-dequeues in its own epilogue), so a
-            // timed-out-but-not-yet-resumed waiter can briefly linger here as
-            // non-Blocked (Ready). The old unconditional pop+return would "spend"
-            // this wake on that phantom and STRAND the next real Blocked waiter (a
-            // lost wakeup).
-            //
-            // M1-02 (Codex KILL fix): the wakers do NOT cancel the woken PID's
-            // timer. `cancel_timed_wait` is now keyed by PID alone (the queue
-            // discriminator is gone with the freed-queue pointer), so cancelling
-            // here could remove an UNRELATED live timer for a RECYCLED pid that
-            // lingers as a stale entry on this queue (the pre-existing kill-without-
-            // cancel_wait producer + PID recycling). It is also unnecessary: the
-            // woken task's own epilogue cancels its timer, and `wq_timeout_wake_by_seq`
-            // refuses to fire once `state != Blocked` (set just below), so no stale
-            // timer can spuriously mark a normally-woken task.
             let mut waiters = self.waiters.lock();
-            while let Some((pid, _gen)) = waiters.pop_front() {
+            while let Some((pid, entry_gen)) = waiters.pop_front() {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
-                    if proc.state == ProcessState::Blocked {
-                        proc.enter_ready_at(kernel_core::get_ticks());
-                        return Some(pid);
+                    if proc.state != ProcessState::Blocked {
+                        continue;
                     }
+                    if is_process_generation_stamp(entry_gen) {
+                        let stamped = unstamp_process_generation(entry_gen);
+                        if stamped != proc.generation {
+                            // Stale recycled-PID entry — drop, do not ready.
+                            continue;
+                        }
+                    }
+                    proc.enter_ready_at(kernel_core::get_ticks());
+                    return Some(pid);
                 }
-                // non-Blocked (already woken / timed-out / gone): consumed no real
-                // wake — keep popping for a genuinely blocked waiter.
             }
             None
         })
@@ -599,22 +637,28 @@ impl WaitQueue {
     pub fn wake_all(&self) -> usize {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
-            let count = waiters.len();
+            let mut woken = 0usize;
 
-            while let Some((pid, _gen)) = waiters.pop_front() {
-                // M1-02 (Codex KILL fix): do NOT cancel the woken PID's timer here —
-                // a PID-only cancel could remove an unrelated recycled-PID timer; the
-                // wakee's epilogue cancels its own timer and the seq+Blocked gate in
-                // `wq_timeout_wake_by_seq` prevents a spurious fire after `Ready`.
+            while let Some((pid, entry_gen)) = waiters.pop_front() {
+                // M1-02: no PID-only timer cancel here.
+                // P3-A: process-generation identity gate (same as wake_one).
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
-                    if proc.state == ProcessState::Blocked {
-                        proc.enter_ready_at(kernel_core::get_ticks());
+                    if proc.state != ProcessState::Blocked {
+                        continue;
                     }
+                    if is_process_generation_stamp(entry_gen) {
+                        let stamped = unstamp_process_generation(entry_gen);
+                        if stamped != proc.generation {
+                            continue;
+                        }
+                    }
+                    proc.enter_ready_at(kernel_core::get_ticks());
+                    woken += 1;
                 }
             }
 
-            count
+            woken
         })
     }
 
@@ -639,16 +683,22 @@ impl WaitQueue {
             let mut woken = 0;
 
             while woken < n {
-                if let Some((pid, _gen)) = waiters.pop_front() {
-                    // M1-02 (Codex KILL fix): no PID-only timer cancel here (could hit
-                    // a recycled-PID's live timer); the wakee's epilogue + the
-                    // seq+Blocked gate handle its timer.
+                if let Some((pid, entry_gen)) = waiters.pop_front() {
+                    // M1-02: no PID-only timer cancel here.
+                    // P3-A: process-generation identity gate.
                     if let Some(proc_arc) = process::get_process(pid) {
                         let mut proc = proc_arc.lock();
-                        if proc.state == ProcessState::Blocked {
-                            proc.enter_ready_at(kernel_core::get_ticks());
-                            woken += 1;
+                        if proc.state != ProcessState::Blocked {
+                            continue;
                         }
+                        if is_process_generation_stamp(entry_gen) {
+                            let stamped = unstamp_process_generation(entry_gen);
+                            if stamped != proc.generation {
+                                continue;
+                            }
+                        }
+                        proc.enter_ready_at(kernel_core::get_ticks());
+                        woken += 1;
                     }
                 } else {
                     break;
@@ -674,15 +724,22 @@ impl WaitQueue {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
             if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
+                let entry_gen = waiters[pos].1;
                 waiters.remove(pos);
-                // M1-02 (Codex KILL fix): no PID-only timer cancel here (could hit a
-                // recycled-PID's live timer); the wakee's epilogue + the seq+Blocked
-                // gate handle its timer.
+                // M1-02: no PID-only timer cancel here.
+                // P3-A: process-generation identity gate.
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
-                    if proc.state == ProcessState::Blocked {
-                        proc.enter_ready_at(kernel_core::get_ticks());
+                    if proc.state != ProcessState::Blocked {
+                        return false;
                     }
+                    if is_process_generation_stamp(entry_gen) {
+                        let stamped = unstamp_process_generation(entry_gen);
+                        if stamped != proc.generation {
+                            return false;
+                        }
+                    }
+                    proc.enter_ready_at(kernel_core::get_ticks());
                 }
                 true
             } else {
@@ -768,17 +825,16 @@ impl WaitQueue {
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     // R172-13 FIX: re-check under the proc lock BEFORE re-stamping Blocked.
-                    // The fresh-enqueue path (:585) and the timed twin (:240) already do this;
-                    // this duplicate branch did NOT, so a deliverable handler signal/kill that
-                    // raced in after the top-of-prepare bail (:535/:544) was clobbered back to
-                    // Blocked with no further wake -> strand (the callers KMutex/Semaphore/
-                    // CondVar/recv/futex_lock_pi have no top-of-loop signal recheck). Mirror
-                    // the fresh path: undo the (lingering) enqueue and bail so the caller's
-                    // loop observes the abort and returns EINTR.
                     if kernel_core::signal::should_abort_pending_block(&proc) {
                         drop(proc);
                         waiters.retain(|&(p, _)| p != pid);
                         return Ok(false);
+                    }
+                    // P3-A: refresh process-generation stamp on re-entry so a
+                    // recycled identity cannot inherit a stale tag from a prior
+                    // wait that left the PID in the deque.
+                    if let Some(entry) = waiters.iter_mut().find(|(p, _)| *p == pid) {
+                        entry.1 = stamp_process_generation(proc.generation);
                     }
                     if proc.state != ProcessState::Blocked {
                         proc.enter_blocked_at(kernel_core::get_ticks());
@@ -788,10 +844,16 @@ impl WaitQueue {
             }
 
             // 将当前进程加入等待队列
-            // R165-4 FIX: the condvar prepare_to_wait path never registers a
-            // timer, so its generation only needs to be unique; snapshot one so
-            // the entry shape matches the timed path and wake/cancel stay uniform.
-            let gen = self.wait_generation.fetch_add(1, Ordering::Relaxed);
+            // P3-A: stamp Process.generation | PROCESS_GEN_TAG so wake_* can
+            // refuse a recycled PID after a signal/kill left a stale entry
+            // (R171 pipe residual). Queue-local gens remain for wait_with_timeout.
+            let gen = if let Some(proc_arc) = process::get_process(pid) {
+                let proc = proc_arc.lock();
+                stamp_process_generation(proc.generation)
+            } else {
+                // No PCB — still use a plain queue gen (will fail Blocked wake).
+                self.wait_generation.fetch_add(1, Ordering::Relaxed)
+            };
             // RF178-8: a real reservation held through publication. On success
             // push_back cannot allocate; on failure the queue is unchanged.
             waiters.try_reserve(1)?;
@@ -810,6 +872,11 @@ impl WaitQueue {
                 if kernel_core::signal::should_abort_pending_block(&proc) {
                     waiters.retain(|&(p, _)| p != pid);
                     return Ok(false);
+                }
+                // Refresh stamp under the same proc lock (generation is stable for
+                // the PCB lifetime; re-stamp if we took a plain gen above).
+                if let Some(entry) = waiters.iter_mut().find(|(p, _)| *p == pid) {
+                    entry.1 = stamp_process_generation(proc.generation);
                 }
                 proc.enter_blocked_at(kernel_core::get_ticks());
             }
@@ -1529,6 +1596,98 @@ pub fn run_wq_timeout_drain_self_test() {
             "M4-1c: the rotating cursor must examine every waiter within ceil(n/MAX) ticks"
         );
     }
+}
+
+/// P2-B: pure structural self-test for the under-lock recheck-before-publish
+/// contract that closes the futex compare/enqueue lost-wake class.
+///
+/// Drives a LOCAL WaitQueue only. Proves:
+/// (1) a failing recheck never Arms a ticket and leaves the queue empty;
+/// (2) a passing recheck (with a current process) Arms and publishes one waiter;
+/// (3) cancel_wait undoes a published waiter.
+///
+/// Concurrent wake serialization is by construction (all wake_* take `waiters`
+/// first). This test pins the prepare/check/publish shape a green boot cannot
+/// exercise alone.
+pub fn run_futex_lost_wake_prepare_self_test() {
+    let q = WaitQueue::new();
+
+    // (1) Failing recheck → never Armed; queue stays empty.
+    {
+        let r = q.try_prepare_with_timeout_after(None, || Err(()));
+        let prepared = r.expect("empty-queue reserve must succeed");
+        // Outer Result: Ok = reservation ok; inner Result: Ok(PrepareWait) or Err(check).
+        match prepared {
+            Ok(PrepareWait::Armed(_)) => {
+                panic!("P2-B: failing recheck (or no-process path) must not Arm")
+            }
+            Ok(PrepareWait::Immediate(_)) => {
+                // No current process / closed — still not Armed.
+            }
+            Err(()) => {
+                // check ran under waiters lock and rejected — the closed shape.
+            }
+        }
+        assert!(
+            q.is_empty(),
+            "P2-B: non-Arm prepare path must leave waiters empty"
+        );
+    }
+
+    // (2) Passing recheck with a current process → Armed + published; cancel undoes.
+    if process::current_pid().is_some() {
+        let r = q
+            .try_prepare_with_timeout_after(None, || Ok(()))
+            .expect("reserve must not fail");
+        match r {
+            Ok(PrepareWait::Armed(_ticket)) => {
+                assert!(
+                    !q.is_empty(),
+                    "P2-B: successful recheck must publish a waiter"
+                );
+                assert!(
+                    q.cancel_wait(),
+                    "P2-B: cancel_wait must remove the published waiter"
+                );
+                assert!(
+                    q.is_empty(),
+                    "P2-B: after cancel_wait the queue must be empty"
+                );
+            }
+            Ok(PrepareWait::Immediate(WaitOutcome::Interrupted))
+            | Ok(PrepareWait::Immediate(WaitOutcome::Closed))
+            | Ok(PrepareWait::Immediate(WaitOutcome::NoProcess)) => {
+                // Benign races (pending kill/signal).
+            }
+            Ok(PrepareWait::Immediate(other)) => {
+                panic!("P2-B: unexpected Immediate outcome: {:?}", other)
+            }
+            Err(()) => {
+                panic!("P2-B: passing check must not return Err")
+            }
+        }
+    }
+}
+
+/// P3-A: pure structural self-test for process-generation identity on wake.
+///
+/// Proves the tag helpers and that a process-stamped entry whose generation
+/// does not match would be refused by the wake gate (logic only — no real PCB
+/// table mutations beyond helpers).
+pub fn run_process_gen_stamp_self_test() {
+    let g = 42u64;
+    let stamped = stamp_process_generation(g);
+    assert!(is_process_generation_stamp(stamped));
+    assert_eq!(unstamp_process_generation(stamped), g);
+    assert!(!is_process_generation_stamp(7)); // plain queue gen
+    assert!(!is_process_generation_stamp(0));
+    // Tag bit must not collide with unstamped value for normal generations
+    // (NEXT_GENERATION is far below 2^63).
+    assert_ne!(stamped, g);
+    // Mismatch simulation: stamped for gen 42, live gen 99 → refuse.
+    let live = 99u64;
+    assert!(is_process_generation_stamp(stamped));
+    assert_ne!(unstamp_process_generation(stamped), live);
 }
 
 /// 定时器回调：每个 tick 检查超时

@@ -25,7 +25,10 @@ pub use ipc::{
     send_message, send_message_notify, EndpointId, IpcError, Message, ReceivedMessage,
 };
 
-pub use sync::{init_waitqueue_timers, CondVar, KMutex, Semaphore, WaitOutcome, WaitQueue};
+pub use sync::{
+    init_waitqueue_timers, run_futex_lost_wake_prepare_self_test, run_process_gen_stamp_self_test,
+    run_wq_timeout_drain_self_test, CondVar, KMutex, Semaphore, WaitOutcome, WaitQueue,
+};
 
 pub use pipe::{
     create_pipe, create_pipe_with_capacity, PipeEndType, PipeError, PipeFlags, PipeHandle, PipeId,
