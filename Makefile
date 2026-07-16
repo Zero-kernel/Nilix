@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -312,24 +312,25 @@ run-both: build
 	$(QEMU) $(QEMU_COMMON) \
 		-serial stdio
 
-# 测试模式 - 自动退出（用于CI/CD）
+# Runtime suite gate (P1-C VT-2 / Gate #4) — exit code reflects REAL suite health.
+# Historical form was `timeout 10 qemu ... || true` (always green + too short
+# for the full runtime suite). Verdict is now serial Test Summary + panic/NX
+# via scripts/kernel_test.sh (exit 0 PASS / 1 FAILED / 2 NOT-RUN).
 test: build
-	@echo "=== 启动内核（测试模式）==="
-	timeout 10 $(QEMU) $(QEMU_COMMON) \
-		-nographic || true
+	@echo "=== 启动内核（运行时测试套件门禁）==="
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/kernel_test.sh esp
 
-# CI boot-health gate — exit code reflects REAL boot health (unlike `test`,
-# which runs `... || true` and always exits 0). Boots under QEMU and asserts the
-# kernel reaches userspace with zero NX-violation #PF. See scripts/boot_check.sh
-# and the D1-BOOT-NX-KASLR-LAYOUT process lesson in docs/next-phase-plan.md.
+# CI boot-health gate — exit code reflects REAL boot health. Boots under QEMU
+# and asserts the kernel reaches userspace with zero NX-violation #PF. See
+# scripts/boot_check.sh and the D1-BOOT-NX-KASLR-LAYOUT process lesson.
 boot-check: build
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/boot_check.sh esp
 
 # M0 conformance gate (item 3): prove a REAL static-musl binary runs end-to-end
 # (crt+auxv -> musl stdio printf/writev -> clean exit). Exit code reflects real
-# libc-conformance health, unlike `make test` (which is `... || true` and always
-# exits 0). Builds with --features musl_test so the embedded
-# userspace/hello_musl.elf is the Ring-3 init program. See scripts/musl_check.sh.
+# libc-conformance health (sibling of make test / boot-check). Builds with
+# --features musl_test so the embedded userspace/hello_musl.elf is the Ring-3
+# init program. See scripts/musl_check.sh.
 musl-check: build-musl-test
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh esp
 
@@ -596,7 +597,7 @@ help:
 	@echo "  make run-verbose  - 详细调试（记录到文件）"
 	@echo "  make run-both     - 图形+串口组合模式"
 	@echo "  make debug        - GDB调试模式（等待GDB连接）"
-	@echo "  make test         - 测试模式（10秒后自动退出）"
+	@echo "  make test         - 运行时套件门禁（Test Summary + panic/NX；exit 0/1/2）"
 	@echo ""
 	@echo "SMP多核模式:"
 	@echo "  make run-smp      - 启用SMP多核模式（默认2核）"
