@@ -443,8 +443,7 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 ///
 /// Per-CPU (not a single global) so an early AP cannot false-positive against
 /// BSP's ready bit before the AP's own `init_syscall_percpu` + swapgs.
-static SYSCALL_GS_READY_MASK: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static SYSCALL_GS_READY_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// P1-A: Assert that `IA32_GS_BASE` points into the kernel `SYSCALL_PERCPU` array.
 ///
@@ -471,8 +470,8 @@ pub fn assert_kernel_gs_base() {
     // the kernel; we only read its address range for a bounds check.
     let (start, end) = unsafe {
         let start = SYSCALL_PERCPU.as_ptr() as u64;
-        let end = start
-            + (core::mem::size_of::<SyscallPerCpu>() as u64) * (SYSCALL_MAX_CPUS as u64);
+        let end =
+            start + (core::mem::size_of::<SyscallPerCpu>() as u64) * (SYSCALL_MAX_CPUS as u64);
         (start, end)
     };
 

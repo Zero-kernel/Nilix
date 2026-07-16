@@ -943,9 +943,7 @@ impl Vfs {
                 }
 
                 current = next;
-                resolved_prefix
-                    .try_reserve(1)
-                    .map_err(|_| FsError::NoMem)?;
+                resolved_prefix.try_reserve(1).map_err(|_| FsError::NoMem)?;
                 resolved_prefix.push(try_string_from_str(component)?);
             }
 

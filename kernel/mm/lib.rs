@@ -29,7 +29,7 @@ pub use heap_budget::{
     reserved_headroom_bytes, run_heap_budget_self_test, snapshot as heap_budget_snapshot,
     transient_peak_bytes, transient_peak_holders, HeapBudgetId, HeapBudgetSnapshot,
     TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES, EXEC_IMAGE_PEAK_BYTES,
-    FUTEX_HARD_BYTES, HARD_FLOOR_BYTES, HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, HARD_FLOORS_SUM_BYTES,
+    FUTEX_HARD_BYTES, HARD_FLOORS_SUM_BYTES, HARD_FLOOR_BYTES, HARD_FLOOR_COUNT, HARD_FLOOR_NAMES,
     PAGE_CACHE_META_HARD_BYTES, RESERVED_HEADROOM_BYTES, TRANSIENT_PEAK_BYTES,
 };
 pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};

@@ -108,10 +108,14 @@ pub fn test_syscalls() {
     // P2-B: under-lock recheck-before-publish closes the R172 futex compare/
     // enqueue lost-wake class (RF178-8 try_prepare_with_timeout_after).
     ipc::run_futex_lost_wake_prepare_self_test();
-    klog_always!("    ✓ P2-B futex lost-wake: prepare recheck-before-publish (fail→empty, pass→Arm+cancel)");
+    klog_always!(
+        "    ✓ P2-B futex lost-wake: prepare recheck-before-publish (fail→empty, pass→Arm+cancel)"
+    );
     // P3-A: process-generation stamp for pipe WaitQueue wake identity.
     ipc::run_process_gen_stamp_self_test();
-    klog_always!("    ✓ P3-A pipe raw-PID residual: PROCESS_GEN_TAG stamp/unstamp + mismatch refuse");
+    klog_always!(
+        "    ✓ P3-A pipe raw-PID residual: PROCESS_GEN_TAG stamp/unstamp + mismatch refuse"
+    );
     // M0-6 poll/select: the PURE ABI/codec/timeout core (fd_set words/mark/test/
     // trim boundaries, strict timespec vs lenient timeval conversion, revents
     // masking with ERR/HUP/NVAL-always + RDHUP-requires-request, select-bit map).

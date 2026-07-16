@@ -405,8 +405,7 @@ pub fn publish_and_assert() {
 pub fn run_heap_budget_self_test() {
     // 1) Coexistence: hard + headroom + peak fit the real heap.
     assert!(
-        HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES + TRANSIENT_PEAK_BYTES
-            <= HEAP_SIZE_BYTES,
+        HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES + TRANSIENT_PEAK_BYTES <= HEAP_SIZE_BYTES,
         "coexistence broken"
     );
     // 2) Hard floors alone leave headroom free.

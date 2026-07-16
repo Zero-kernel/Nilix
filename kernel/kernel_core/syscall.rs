@@ -4140,7 +4140,7 @@ fn sys_clone(
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
-            parent_exec_in_progress,            // P1-D: mid-exec gate for CLONE_VM
+            parent_exec_in_progress,             // P1-D: mid-exec gate for CLONE_VM
             parent.name.clone(),
             parent.priority,
             parent.cgroup_id,    // R123-2 FIX

@@ -31,8 +31,7 @@ pub const PAGE_SIZE: usize = 4096;
 /// [`HeapBudgetId::PageCacheMeta`] (HEAP/16 = 64 KiB), not an independent
 /// HEAP/8 fraction. `256` bytes per resident covers Arc + index + LRU + slack.
 /// The physical 4 KiB data frame is not heap-backed.
-const PAGE_CACHE_METADATA_BUDGET_BYTES: usize =
-    hard_floor_bytes(HeapBudgetId::PageCacheMeta);
+const PAGE_CACHE_METADATA_BUDGET_BYTES: usize = hard_floor_bytes(HeapBudgetId::PageCacheMeta);
 const PAGE_CACHE_METADATA_BYTES_PER_PAGE: usize = 256;
 
 /// Heap-arbiter-derived hard ceiling (256 pages at the current 64 KiB floor).

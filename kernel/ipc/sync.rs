@@ -389,27 +389,27 @@ impl WaitQueue {
     }
 
     /// RF178-8 / P2-B: fallibly publish a complete queue/timer transaction without
-/// yielding, with a **caller-supplied recheck under `waiters` lock**.
-///
-/// # Lost-wake class elimination (P2-B / R172 residual)
-///
-/// Classic futex lost-wake: value-check → (race: store+wake) → enqueue+block.
-/// This API closes that class for any caller that supplies a recheck of the
-/// wait condition:
-///
-/// 1. Take `waiters` under IRQs-off (all normal wakers take the same lock first).
-/// 2. Run `check` **while still holding `waiters`** (before any enqueue).
-/// 3. Only if `check` returns `Ok(())`: publish waiter + `Blocked` (+ timer).
-///
-/// A concurrent wake either (a) runs before we take `waiters` — then the under-
-/// lock recheck observes the store and aborts without blocking, or (b) runs
-/// while/after we hold `waiters` — then it observes the published waiter.
-///
-/// Callers that need to sleep after a successful arm use [`finish_prepared`].
-/// Callers that arm and then discover the condition elsewhere must use
-/// [`cancel_wait`] / exact remove — do **not** recheck only *after* publish and
-/// then sleep without cancel (that would re-open a different lost-wake shape).
-pub(crate) fn try_prepare_with_timeout_after<F, E>(
+    /// yielding, with a **caller-supplied recheck under `waiters` lock**.
+    ///
+    /// # Lost-wake class elimination (P2-B / R172 residual)
+    ///
+    /// Classic futex lost-wake: value-check → (race: store+wake) → enqueue+block.
+    /// This API closes that class for any caller that supplies a recheck of the
+    /// wait condition:
+    ///
+    /// 1. Take `waiters` under IRQs-off (all normal wakers take the same lock first).
+    /// 2. Run `check` **while still holding `waiters`** (before any enqueue).
+    /// 3. Only if `check` returns `Ok(())`: publish waiter + `Blocked` (+ timer).
+    ///
+    /// A concurrent wake either (a) runs before we take `waiters` — then the under-
+    /// lock recheck observes the store and aborts without blocking, or (b) runs
+    /// while/after we hold `waiters` — then it observes the published waiter.
+    ///
+    /// Callers that need to sleep after a successful arm use [`finish_prepared`].
+    /// Callers that arm and then discover the condition elsewhere must use
+    /// [`cancel_wait`] / exact remove — do **not** recheck only *after* publish and
+    /// then sleep without cancel (that would re-open a different lost-wake shape).
+    pub(crate) fn try_prepare_with_timeout_after<F, E>(
         &self,
         timeout_ns: Option<u64>,
         check: F,

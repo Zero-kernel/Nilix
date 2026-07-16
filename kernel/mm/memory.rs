@@ -748,9 +748,7 @@ fn push_cow_metadata_reservation(
     meta_bytes: usize,
 ) -> usize {
     if count >= MAX_RESERVED_RANGES {
-        panic!(
-            "RF178-31: reservation list full; cannot permanently reserve COW metadata"
-        );
+        panic!("RF178-31: reservation list full; cannot permanently reserve COW metadata");
     }
     out[count] = (meta_phys, meta_bytes as u64);
     count + 1
@@ -858,9 +856,7 @@ pub fn cow_refcount_slot(index: usize) -> Option<&'static core::sync::atomic::At
         return None;
     }
     // SAFETY: base/len published once after zeroing reserved frames; index < len.
-    let slot = unsafe {
-        &*(base as *const core::sync::atomic::AtomicU32).add(index)
-    };
+    let slot = unsafe { &*(base as *const core::sync::atomic::AtomicU32).add(index) };
     Some(slot)
 }
 
