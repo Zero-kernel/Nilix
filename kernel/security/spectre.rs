@@ -46,12 +46,79 @@
 //! ```
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use spin::Once;
 use x86_64::registers::model_specific::Msr;
 
 /// RF178-23 FIX: Boot policy is authoritative on every CPU and switch path.
 /// Default false prevents AP startup from silently enabling mitigations before
 /// the selected profile has explicitly opted in.
 static MITIGATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// P0-B / RF178-23 FIX: BSP-published Spectre floor used for AP admission.
+///
+/// `init_cpu` must not apply a *stricter absolute* gate than the BSP actually
+/// established. On qemu64 (no IBRS), BSP `init()` soft-fails with
+/// `RetpolineRequired` and boot continues; APs with identical hardware must be
+/// admitted. True heterogeneous APs that are *weaker* than this floor are still
+/// rejected fail-closed.
+#[derive(Debug, Clone, Copy)]
+struct BspSpectreFloor {
+    ibrs_supported: bool,
+    ibrs_enabled: bool,
+    stibp_supported: bool,
+    stibp_enabled: bool,
+    ssbd_supported: bool,
+    ssbd_enabled: bool,
+}
+
+static BSP_SPECTRE_FLOOR: Once<BspSpectreFloor> = Once::new();
+
+fn publish_bsp_spectre_floor(status: &MitigationStatus) {
+    let _ = BSP_SPECTRE_FLOOR.call_once(|| BspSpectreFloor {
+        ibrs_supported: status.ibrs_supported,
+        ibrs_enabled: status.ibrs_enabled,
+        stibp_supported: status.stibp_supported,
+        stibp_enabled: status.stibp_enabled,
+        ssbd_supported: status.ssbd_supported,
+        ssbd_enabled: status.ssbd_enabled,
+    });
+}
+
+fn bsp_spectre_floor() -> Option<BspSpectreFloor> {
+    BSP_SPECTRE_FLOOR.get().copied()
+}
+
+/// True iff `ap` is at least as strong as the BSP floor (support + enablement).
+fn meets_bsp_spectre_floor(ap: &MitigationStatus) -> bool {
+    let Some(floor) = bsp_spectre_floor() else {
+        // Policy is on but BSP never published a floor — fail closed (wiring bug).
+        return false;
+    };
+
+    // Capability: AP must not lack a feature the BSP reported as present.
+    if floor.ibrs_supported && !ap.ibrs_supported {
+        return false;
+    }
+    if floor.stibp_supported && !ap.stibp_supported {
+        return false;
+    }
+    if floor.ssbd_supported && !ap.ssbd_supported {
+        return false;
+    }
+
+    // Enablement: AP must enable every mitigation the BSP successfully enabled.
+    if floor.ibrs_enabled && !ap.ibrs_enabled {
+        return false;
+    }
+    if floor.stibp_enabled && !ap.stibp_enabled {
+        return false;
+    }
+    if floor.ssbd_enabled && !ap.ssbd_enabled {
+        return false;
+    }
+
+    true
+}
 
 pub(crate) fn set_policy_enabled(enabled: bool) {
     MITIGATIONS_ENABLED.store(enabled, Ordering::Release);
@@ -324,6 +391,11 @@ pub fn init() -> Result<MitigationStatus, SpectreError> {
         }
     }
 
+    // P0-B VT-1 FIX: publish the *actual* BSP floor before any Ok/Err return so
+    // AP admission can compare against what this boot established — including
+    // soft-fail (RetpolineRequired) boots that still continue on the BSP.
+    publish_bsp_spectre_floor(&status);
+
     // Check if we have adequate protection
     if status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled {
         return Err(SpectreError::RetpolineRequired);
@@ -384,10 +456,11 @@ pub fn init_cpu() -> bool {
         status.ssbd_enabled = enable_ssbd().is_ok();
     }
 
-    // Match the BSP's load-bearing RetpolineRequired gate. A heterogeneous AP
-    // that cannot establish either hardware IBRS or compiler retpoline stays
-    // offline instead of weakening the system invisibly.
-    !(status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled)
+    // P0-B / RF178-23 FIX: AP admission is relative to the BSP-published floor,
+    // not a second absolute RetpolineRequired gate that the BSP itself soft-
+    // failed past. Homogeneous soft-fail (qemu64, no IBRS, no retpoline codegen)
+    // admits; a weaker heterogeneous AP is still rejected fail-closed.
+    meets_bsp_spectre_floor(&status)
 }
 
 /// Enable IBRS by setting IA32_SPEC_CTRL.IBRS.
