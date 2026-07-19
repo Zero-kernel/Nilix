@@ -10,7 +10,6 @@
 //!
 //! These limits prevent memory exhaustion DoS attacks.
 
-use alloc::boxed::Box;
 // R172-22: ramfs directory entries use the allocation-fallible `FallibleOrderedMap`
 // (mm/fallible_map.rs) instead of `BTreeMap` — stable no_std `BTreeMap::insert` allocates a
 // B-tree node infallibly on leaf-split, so OOM aborts the kernel via `handle_alloc_error`.
@@ -19,18 +18,20 @@ use alloc::boxed::Box;
 // inserts change. (Sibling devfs/initramfs/manager/mount_namespace children maps are the
 // SAME class — tracked as R172-22-FOLLOWON, out of this ramfs-scoped fix.)
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
-use alloc::vec;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use mm::fallible_map::FallibleOrderedMap;
+use mm::fallible_map::{FallibleOrderedMap, PreparedOrderedMapBacking};
+use mm::{
+    arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass, HeapReservation,
+};
 use spin::RwLock;
 
-use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
-use kernel_core::{current_credentials, FileOps};
+use kernel_core::{current_credentials, FileDescriptor};
 
 /// Global filesystem ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(100);
@@ -162,16 +163,288 @@ impl Meta {
     }
 }
 
-/// Node kind: file, directory, or symlink
+type DirectoryMap = FallibleOrderedMap<String, Arc<RamFsInode>>;
+type DirectoryBacking = PreparedOrderedMapBacking<String, Arc<RamFsInode>>;
+
+/// Regular-file storage and the lifetime charge covering both the inode Arc
+/// allocation and the allocator's actual data-vector capacity.
+struct FileState {
+    data: Vec<u8>,
+    heap_charge: HeapCharge,
+}
+
+impl FileState {
+    /// Resize file storage transactionally under the inode's state write lock.
+    /// Detached replacement keeps the old bytes reachable and charged until
+    /// the new allocation has been admitted, allocated, reconciled, and
+    /// committed. This also compacts capacity on truncate, preventing churn
+    /// from retaining an unbounded high-water allocation.
+    fn resize_data(&mut self, new_len: usize) -> Result<(), FsError> {
+        let old_len = self.data.len();
+        if new_len == old_len {
+            return Ok(());
+        }
+
+        let growth_quota = if new_len > old_len {
+            Some(QuotaGuard::try_new(new_len - old_len)?)
+        } else {
+            None
+        };
+
+        // Growing inside already charged capacity requires no allocation.
+        if new_len > old_len && new_len <= self.data.capacity() {
+            self.data.resize(new_len, 0);
+            growth_quota
+                .expect("RAMFS growth quota guard missing")
+                .commit();
+            return Ok(());
+        }
+
+        let old_capacity = self.data.capacity();
+        let old_charge = string_buffer_charge(old_capacity)?;
+
+        let estimated_new = string_buffer_charge(new_len)?;
+        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated_new))?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(new_len)
+            .map_err(|_| FsError::NoMem)?;
+        let actual_new = string_buffer_charge(replacement.capacity())?;
+        heap_no_space(reservation.resize(actual_new))?;
+        replacement.resize(new_len, 0);
+        let preserved = core::cmp::min(old_len, new_len);
+        replacement[..preserved].copy_from_slice(&self.data[..preserved]);
+
+        absorb_prepared(&mut self.heap_charge, reservation);
+        let retired = core::mem::replace(&mut self.data, replacement);
+        drop(retired);
+        release_deallocated(&mut self.heap_charge, old_charge);
+
+        if let Some(guard) = growth_quota {
+            guard.commit();
+        } else {
+            quota_release(old_len - new_len);
+        }
+        Ok(())
+    }
+}
+
+/// Directory storage and its aggregate lifetime charge. The charge covers the
+/// inode Arc, the map backing Vec, and every retained String-key buffer.
+struct DirectoryState {
+    entries: DirectoryMap,
+    heap_charge: HeapCharge,
+}
+
+/// Symlink target storage and the lifetime charge covering the inode Arc plus
+/// the target String's actual allocator capacity.
+struct SymlinkState {
+    target: String,
+    _heap_charge: HeapCharge,
+}
+
+/// Node kind: file, directory, or symlink.
 enum NodeKind {
-    /// Regular file with data buffer
-    File { data: RwLock<Vec<u8>> },
-    /// Directory with child entries
-    Dir {
-        entries: RwLock<FallibleOrderedMap<String, Arc<RamFsInode>>>,
-    },
-    /// Symbolic link with target path
-    Symlink { target: RwLock<String> },
+    File { state: RwLock<FileState> },
+    Dir { state: RwLock<DirectoryState> },
+    Symlink { state: RwLock<SymlinkState> },
+}
+
+#[inline]
+fn heap_no_space<T>(result: Result<T, mm::HeapAdmissionError>) -> Result<T, FsError> {
+    result.map_err(|_| FsError::NoSpace)
+}
+
+#[inline]
+fn checked_charge_add(left: usize, right: usize) -> Result<usize, FsError> {
+    left.checked_add(right).ok_or(FsError::NoSpace)
+}
+
+#[inline]
+fn string_buffer_charge(capacity: usize) -> Result<usize, FsError> {
+    heap_no_space(vec_charge_bytes::<u8>(capacity))
+}
+
+#[inline]
+fn directory_backing_charge(capacity: usize) -> Result<usize, FsError> {
+    heap_no_space(vec_charge_bytes::<(String, Arc<RamFsInode>)>(capacity))
+}
+
+/// A detached, admitted directory key. The reservation remains rollback-armed
+/// until the caller has completed every fallible preparation step.
+struct PreparedDirectoryKey {
+    key: String,
+    reservation: HeapReservation,
+    charge_bytes: usize,
+}
+
+impl PreparedDirectoryKey {
+    fn try_new(name: &str) -> Result<Self, FsError> {
+        let estimated = string_buffer_charge(name.len())?;
+        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated))?;
+        let mut key = String::new();
+        key.try_reserve_exact(name.len())
+            .map_err(|_| FsError::NoSpace)?;
+        let actual = string_buffer_charge(key.capacity())?;
+        heap_no_space(reservation.resize(actual))?;
+        key.push_str(name);
+        Ok(Self {
+            key,
+            reservation,
+            charge_bytes: actual,
+        })
+    }
+}
+
+/// Detached replacement backing for a directory. The full new allocation is
+/// reserved (rather than only the delta) because old and new backing vectors
+/// coexist during preparation.
+struct PreparedDirectoryCapacity {
+    backing: DirectoryBacking,
+    reservation: HeapReservation,
+}
+
+struct AdmittedDirectoryCapacity {
+    backing: DirectoryBacking,
+}
+
+impl PreparedDirectoryCapacity {
+    fn try_new(required_capacity: usize) -> Result<Self, FsError> {
+        let estimated = directory_backing_charge(required_capacity)?;
+        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated))?;
+        let backing = DirectoryMap::try_prepare_backing_exact(required_capacity)
+            .map_err(|_| FsError::NoSpace)?;
+        let actual = directory_backing_charge(backing.capacity())?;
+        heap_no_space(reservation.resize(actual))?;
+        Ok(Self {
+            backing,
+            reservation,
+        })
+    }
+}
+
+#[inline]
+fn absorb_prepared(charge: &mut HeapCharge, reservation: HeapReservation) {
+    // A same-class, successfully acquired reservation cannot fail to commit
+    // unless the global ledger is corrupt. Continuing after that would make
+    // every subsequent admission unsound, so fail closed as an invariant fault.
+    charge
+        .absorb(reservation)
+        .expect("R180 RAMFS heap ledger corrupt during commit");
+}
+
+#[inline]
+fn release_deallocated(charge: &mut HeapCharge, bytes: usize) {
+    charge
+        .release_after_deallocation(bytes)
+        .expect("R180 RAMFS heap ledger corrupt during release");
+}
+
+/// Install already-admitted backing and release the old backing charge only
+/// after its allocation has been deallocated by `replace_backing`.
+fn admit_directory_backing(
+    state: &mut DirectoryState,
+    prepared: PreparedDirectoryCapacity,
+) -> AdmittedDirectoryCapacity {
+    absorb_prepared(&mut state.heap_charge, prepared.reservation);
+    AdmittedDirectoryCapacity {
+        backing: prepared.backing,
+    }
+}
+
+fn install_admitted_backing(state: &mut DirectoryState, admitted: AdmittedDirectoryCapacity) {
+    let expected_old_capacity = state.entries.capacity();
+    let old_capacity = state
+        .entries
+        .replace_backing(admitted.backing)
+        .unwrap_or_else(|_| panic!("R180 RAMFS prepared backing too small"));
+    debug_assert_eq!(old_capacity, expected_old_capacity);
+    let old_charge =
+        directory_backing_charge(old_capacity).expect("R180 RAMFS old backing charge overflow");
+    release_deallocated(&mut state.heap_charge, old_charge);
+}
+
+fn prepare_directory_insert(
+    entry_len: usize,
+    capacity: usize,
+    name: &str,
+) -> Result<(PreparedDirectoryKey, Option<PreparedDirectoryCapacity>), FsError> {
+    let key = PreparedDirectoryKey::try_new(name)?;
+    let target_len = entry_len.checked_add(1).ok_or(FsError::NoSpace)?;
+    let backing = if capacity < target_len {
+        Some(PreparedDirectoryCapacity::try_new(target_len)?)
+    } else {
+        None
+    };
+    Ok((key, backing))
+}
+
+/// Publish a fully prepared directory insertion. No allocation occurs here.
+fn commit_directory_insert(
+    state: &mut DirectoryState,
+    prepared_key: PreparedDirectoryKey,
+    prepared_backing: Option<PreparedDirectoryCapacity>,
+    child: Arc<RamFsInode>,
+) -> Result<(), FsError> {
+    if let Some(prepared) = prepared_backing {
+        let admitted = admit_directory_backing(state, prepared);
+        install_admitted_backing(state, admitted);
+    }
+
+    let PreparedDirectoryKey {
+        key,
+        reservation,
+        charge_bytes,
+    } = prepared_key;
+    absorb_prepared(&mut state.heap_charge, reservation);
+    if let Err((key, child)) = state.entries.insert_unique_reserved(key, child) {
+        drop(key);
+        drop(child);
+        release_deallocated(&mut state.heap_charge, charge_bytes);
+        return Err(FsError::NoSpace);
+    }
+    Ok(())
+}
+
+/// Remove an entry without making deletion depend on fresh heap capacity.
+///
+/// A compact replacement is best-effort for non-empty directories: if its
+/// detached allocation could not be admitted, the old high-water backing stays
+/// live *and charged* until a later mutation can compact it. Empty-directory
+/// compaction needs zero bytes and therefore always succeeds. This prevents a
+/// full RAMFS class from refusing the unlink/rmdir operations needed to release
+/// memory while retaining exact deallocation-before-uncharge ordering.
+fn commit_directory_remove(
+    state: &mut DirectoryState,
+    name: &str,
+    prepared: Option<PreparedDirectoryCapacity>,
+) -> Arc<RamFsInode> {
+    let admitted = prepared.map(|prepared| admit_directory_backing(state, prepared));
+    let (key, child) = state
+        .entries
+        .remove_entry(name)
+        .expect("R180 RAMFS remove precondition changed under write lock");
+    let key_charge =
+        string_buffer_charge(key.capacity()).expect("R180 RAMFS key charge overflow during remove");
+    drop(key);
+    if let Some(admitted) = admitted {
+        install_admitted_backing(state, admitted);
+    }
+    release_deallocated(&mut state.heap_charge, key_charge);
+    child
+}
+
+/// Prepare compaction without turning a resource-releasing mutation into an
+/// allocation-dependent operation. A zero-entry backing performs no allocation
+/// and must always be available once heap admission is published.
+fn prepare_directory_compaction(target_len: usize) -> Option<PreparedDirectoryCapacity> {
+    match PreparedDirectoryCapacity::try_new(target_len) {
+        Ok(prepared) => Some(prepared),
+        Err(_) if target_len == 0 => {
+            panic!("R180 RAMFS zero-capacity compaction unexpectedly failed")
+        }
+        Err(_) => None,
+    }
 }
 
 /// RAM filesystem inode
@@ -183,45 +456,63 @@ pub struct RamFsInode {
     /// RF178-16 FIX: A removed directory may remain alive through an open file
     /// description, but it is no longer a valid topology parent.
     detached: AtomicBool,
-    /// Weak self-reference for FileHandle creation
-    self_ref: RwLock<Option<Weak<RamFsInode>>>,
 }
 
 impl RamFsInode {
     /// Create a new directory inode
-    pub fn new_dir(fs_id: u64, ino: u64, perm: u16, uid: u32, gid: u32) -> Arc<Self> {
+    pub fn new_dir(
+        fs_id: u64,
+        ino: u64,
+        perm: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<Self>, FsError> {
         let mode = FileMode::directory(perm);
-        let inode = Arc::new(Self {
+        let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, arc_bytes))?;
+        let charge = heap_no_space(reservation.commit())?;
+        let inode = Arc::try_new(Self {
             fs_id,
             ino,
             meta: RwLock::new(Meta::new(mode, uid, gid)),
             kind: NodeKind::Dir {
-                entries: RwLock::new(FallibleOrderedMap::new()),
+                state: RwLock::new(DirectoryState {
+                    entries: FallibleOrderedMap::new(),
+                    heap_charge: charge,
+                }),
             },
             detached: AtomicBool::new(false),
-            self_ref: RwLock::new(None),
-        });
-        // Store weak self-reference
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
+        })
+        .map_err(|_| FsError::NoSpace)?;
+        Ok(inode)
     }
 
     /// Create a new file inode
-    pub fn new_file(fs_id: u64, ino: u64, perm: u16, uid: u32, gid: u32) -> Arc<Self> {
+    pub fn new_file(
+        fs_id: u64,
+        ino: u64,
+        perm: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<Self>, FsError> {
         let mode = FileMode::regular(perm);
-        let inode = Arc::new(Self {
+        let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, arc_bytes))?;
+        let charge = heap_no_space(reservation.commit())?;
+        let inode = Arc::try_new(Self {
             fs_id,
             ino,
             meta: RwLock::new(Meta::new(mode, uid, gid)),
             kind: NodeKind::File {
-                data: RwLock::new(Vec::new()),
+                state: RwLock::new(FileState {
+                    data: Vec::new(),
+                    heap_charge: charge,
+                }),
             },
             detached: AtomicBool::new(false),
-            self_ref: RwLock::new(None),
-        });
-        // Store weak self-reference
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
+        })
+        .map_err(|_| FsError::NoSpace)?;
+        Ok(inode)
     }
 
     /// Create a new symlink inode
@@ -231,40 +522,56 @@ impl RamFsInode {
         perm: u16,
         uid: u32,
         gid: u32,
-        target: String,
-    ) -> Arc<Self> {
+        target: &str,
+    ) -> Result<Arc<Self>, FsError> {
         let mode = FileMode::symlink(perm);
         let target_len = target.len() as u64;
-        let inode = Arc::new(Self {
+        let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let estimated_target = string_buffer_charge(target.len())?;
+        let estimated_total = checked_charge_add(arc_bytes, estimated_target)?;
+        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated_total))?;
+        let quota_guard = QuotaGuard::try_new(target.len())?;
+
+        let mut target_owned = String::new();
+        target_owned
+            .try_reserve_exact(target.len())
+            .map_err(|_| FsError::NoSpace)?;
+        let actual_target = string_buffer_charge(target_owned.capacity())?;
+        let actual_total = checked_charge_add(arc_bytes, actual_target)?;
+        heap_no_space(reservation.resize(actual_total))?;
+        target_owned.push_str(target);
+
+        let charge = heap_no_space(reservation.commit())?;
+        // From this point the inode value owns the quota charge. Arc failure
+        // drops the value and releases both quota and heap charge exactly once.
+        quota_guard.commit();
+        let inode = Arc::try_new(Self {
             fs_id,
             ino,
             meta: RwLock::new(Meta::new(mode, uid, gid)),
             kind: NodeKind::Symlink {
-                target: RwLock::new(target),
+                state: RwLock::new(SymlinkState {
+                    target: target_owned,
+                    _heap_charge: charge,
+                }),
             },
             detached: AtomicBool::new(false),
-            self_ref: RwLock::new(None),
-        });
+        })
+        .map_err(|_| FsError::NoSpace)?;
         // Set symlink size to target path length
         inode.meta.write().size = target_len;
-        // Store weak self-reference
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
-    }
-
-    /// Get Arc<Self> from weak reference
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref
-            .read()
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .ok_or(FsError::Invalid)
+        Ok(inode)
     }
 
     /// Look up a child entry in directory
     fn lookup_child(&self, name: &str) -> Result<Arc<RamFsInode>, FsError> {
         match &self.kind {
-            NodeKind::Dir { entries } => entries.read().get(name).cloned().ok_or(FsError::NotFound),
+            NodeKind::Dir { state } => state
+                .read()
+                .entries
+                .get(name)
+                .cloned()
+                .ok_or(FsError::NotFound),
             NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
     }
@@ -280,22 +587,43 @@ impl RamFsInode {
         }
 
         match &self.kind {
-            NodeKind::Dir { entries } => {
-                let mut entries = entries.write();
-                if entries.contains_key(name) {
-                    return Err(FsError::Exists);
+            NodeKind::Dir { state } => {
+                // R180-13 FIX: key bytes and any new map backing are reserved
+                // and allocated while detached and without a directory spin
+                // lock held. Revalidate under the write lock before the
+                // allocation-free publication step; retry if a nonstandard
+                // direct caller changed capacity outside the topology mutex.
+                loop {
+                    let (entry_len, capacity) = {
+                        let state = state.read();
+                        if state.entries.contains_key(name) {
+                            return Err(FsError::Exists);
+                        }
+                        (state.entries.len(), state.entries.capacity())
+                    };
+                    let (prepared_key, prepared_backing) =
+                        prepare_directory_insert(entry_len, capacity, name)?;
+
+                    let mut state = state.write();
+                    if state.entries.contains_key(name) {
+                        return Err(FsError::Exists);
+                    }
+                    let current_target =
+                        state.entries.len().checked_add(1).ok_or(FsError::NoSpace)?;
+                    let prepared_is_sufficient = match prepared_backing.as_ref() {
+                        Some(backing) => backing.backing.capacity() >= current_target,
+                        None => state.entries.capacity() >= current_target,
+                    };
+                    if !prepared_is_sufficient {
+                        drop(state);
+                        drop(prepared_key);
+                        drop(prepared_backing);
+                        continue;
+                    }
+
+                    commit_directory_insert(&mut state, prepared_key, prepared_backing, child)?;
+                    break;
                 }
-                // R172-22: build the key String FALLIBLY then fallibly insert. try_insert
-                // makes only the map SLOT fallible; `name.to_string()` would allocate the
-                // String key infallibly -> handle_alloc_error abort under OOM (the SAME
-                // class). Mirror the rename path (key.try_reserve + push_str). A genuine grow
-                // (contains_key above ruled out a replace), so the map is unchanged on Err.
-                let mut key = String::new();
-                key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
-                key.push_str(name);
-                entries
-                    .try_insert(key, child)
-                    .map_err(|_| FsError::NoSpace)?;
 
                 // Update parent directory timestamps
                 let mut meta = self.meta.write();
@@ -304,63 +632,6 @@ impl RamFsInode {
                 meta.ctime = now;
 
                 Ok(())
-            }
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
-        }
-    }
-
-    /// R178-29 FIX: Add a child entry using a pre-allocated key.
-    /// Bypasses the internal try_reserve in add_child(), allowing the caller to
-    /// complete all fallible allocations before charging quota.
-    fn add_child_with_key(&self, key: String, child: Arc<RamFsInode>) -> Result<(), FsError> {
-        // Validate name (key is already allocated, just check constraints)
-        if key.is_empty() || key.len() > 255 || key.contains('/') {
-            return Err(FsError::NameTooLong);
-        }
-        if key == "." || key == ".." {
-            return Err(FsError::Invalid);
-        }
-
-        match &self.kind {
-            NodeKind::Dir { entries } => {
-                let mut entries = entries.write();
-                if entries.contains_key(&key) {
-                    return Err(FsError::Exists);
-                }
-                entries
-                    .try_insert(key, child)
-                    .map_err(|_| FsError::NoSpace)?;
-
-                // Update parent directory timestamps
-                let mut meta = self.meta.write();
-                let now = TimeSpec::now();
-                meta.mtime = now;
-                meta.ctime = now;
-
-                Ok(())
-            }
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
-        }
-    }
-
-    /// Remove a child entry from directory
-    fn remove_child(&self, name: &str) -> Result<Arc<RamFsInode>, FsError> {
-        if name == "." || name == ".." {
-            return Err(FsError::Invalid);
-        }
-
-        match &self.kind {
-            NodeKind::Dir { entries } => {
-                let mut entries = entries.write();
-                let child = entries.remove(name).ok_or(FsError::NotFound)?;
-
-                // Update parent directory timestamps
-                let mut meta = self.meta.write();
-                let now = TimeSpec::now();
-                meta.mtime = now;
-                meta.ctime = now;
-
-                Ok(child)
             }
             NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
         }
@@ -369,7 +640,7 @@ impl RamFsInode {
     /// Get directory entry count
     fn child_count(&self) -> usize {
         match &self.kind {
-            NodeKind::Dir { entries } => entries.read().len(),
+            NodeKind::Dir { state } => state.read().entries.len(),
             NodeKind::File { .. } | NodeKind::Symlink { .. } => 0,
         }
     }
@@ -409,9 +680,9 @@ impl RamFsInode {
     /// a SINGLE spanning write guard across the whole transaction (the self-locking
     /// add_child/remove_child each take their own lock — a two-lock atomicity gap that
     /// allowed a half-mutation when an insert failed after a remove). Returns None for files.
-    fn dir_entries(&self) -> Option<&RwLock<FallibleOrderedMap<String, Arc<RamFsInode>>>> {
+    fn dir_entries(&self) -> Option<&RwLock<DirectoryState>> {
         match &self.kind {
-            NodeKind::Dir { entries } => Some(entries),
+            NodeKind::Dir { state } => Some(state),
             NodeKind::File { .. } | NodeKind::Symlink { .. } => None,
         }
     }
@@ -549,8 +820,9 @@ fn dir_subtree_contains_ino(root: &Arc<RamFsInode>, target_ino: u64) -> Result<b
             Some(entries) => {
                 let guard = entries.read();
                 let mut v: alloc::vec::Vec<Arc<RamFsInode>> = alloc::vec::Vec::new();
-                v.try_reserve(guard.len()).map_err(|_| FsError::NoSpace)?;
-                for child in guard.values() {
+                v.try_reserve(guard.entries.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                for child in guard.entries.values() {
                     v.push(child.clone());
                 }
                 v // guard dropped here
@@ -604,20 +876,20 @@ impl Drop for RamFsInode {
     fn drop(&mut self) {
         // Release quota for file data when inode is freed
         match &self.kind {
-            NodeKind::File { data } => {
-                let data = data.read();
-                if !data.is_empty() {
-                    quota_release(data.len());
+            NodeKind::File { state } => {
+                let state = state.read();
+                if !state.data.is_empty() {
+                    quota_release(state.data.len());
                 }
             }
-            NodeKind::Symlink { target } => {
+            NodeKind::Symlink { state } => {
                 // SYM-QUOTA-BYPASS fix: symlink targets are charged at creation
                 // (RamFs::symlink), so release symmetrically here. This also
                 // reclaims the charge on the add_child-failure path, where the
                 // freshly-built (never-linked) symlink Arc drops.
-                let target = target.read();
-                if !target.is_empty() {
-                    quota_release(target.len());
+                let state = state.read();
+                if !state.target.is_empty() {
+                    quota_release(state.target.len());
                 }
             }
             NodeKind::Dir { .. } => {}
@@ -653,19 +925,22 @@ impl Inode for RamFsInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Directories can only be opened for read-only operations (getdents64)
         if matches!(self.kind, NodeKind::Dir { .. }) {
             if flags.is_writable() {
                 return Err(FsError::IsDir);
             }
-            // Return directory handle with seekable=false
-            let inode_arc = self.as_arc()?;
-            return Ok(Box::new(FileHandle::new(inode_arc, flags, false)));
+            let inode: Arc<dyn Inode> = self;
+            return Ok(prepared.finalize(inode, flags, false));
         }
 
-        let inode_arc = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode_arc, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn is_dir(&self) -> bool {
@@ -682,8 +957,9 @@ impl Inode for RamFsInode {
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         match &self.kind {
-            NodeKind::Dir { entries } => {
-                let entries = entries.read();
+            NodeKind::Dir { state } => {
+                let state = state.read();
+                let entries = &state.entries;
 
                 // Handle "." and ".." at offsets 0 and 1
                 if offset == 0 {
@@ -737,8 +1013,9 @@ impl Inode for RamFsInode {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         match &self.kind {
-            NodeKind::File { data } => {
-                let data = data.read();
+            NodeKind::File { state } => {
+                let state = state.read();
+                let data = &state.data;
                 let offset = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
 
                 if offset >= data.len() {
@@ -754,10 +1031,10 @@ impl Inode for RamFsInode {
 
                 Ok(to_read)
             }
-            NodeKind::Symlink { target } => {
+            NodeKind::Symlink { state } => {
                 // Read symlink target (for readlink syscall)
-                let target = target.read();
-                let target_bytes = target.as_bytes();
+                let state = state.read();
+                let target_bytes = state.target.as_bytes();
                 let offset = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
 
                 if offset >= target_bytes.len() {
@@ -776,10 +1053,10 @@ impl Inode for RamFsInode {
 
     fn write_at(&self, offset: u64, data_in: &[u8]) -> Result<usize, FsError> {
         match &self.kind {
-            NodeKind::File { data } => {
-                let mut data = data.write();
+            NodeKind::File { state } => {
+                let mut state = state.write();
                 let offset = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
-                let current_len = data.len();
+                let current_len = state.data.len();
 
                 // Expand file if needed (with checked addition)
                 let required_len = offset.checked_add(data_in.len()).ok_or(FsError::Invalid)?;
@@ -789,28 +1066,16 @@ impl Inode for RamFsInode {
                     return Err(FsError::NoSpace);
                 }
 
-                // R-MEDIUM-1 fix: Transactional in-place expansion - charge quota FIRST,
-                // reserve additional capacity fallibly IN-PLACE, resize, commit immediately.
-                // This prevents all quota bypass paths: if quota fails, no allocation is
-                // attempted; if allocation fails, guard auto-rolls back quota; no transient
-                // capacity amplification from detached buffers.
                 if required_len > current_len {
-                    let additional_bytes = required_len - current_len;
-                    let guard = QuotaGuard::try_new(additional_bytes)?;
-
-                    // Reserve additional capacity in-place (fallible)
-                    data.try_reserve_exact(additional_bytes)
-                        .map_err(|_| FsError::NoMem)?;
-                    data.resize(required_len, 0);
-                    guard.commit();
+                    state.resize_data(required_len)?;
                 }
 
                 // Write data (in-place, no allocation)
-                data[offset..offset + data_in.len()].copy_from_slice(data_in);
+                state.data[offset..offset + data_in.len()].copy_from_slice(data_in);
 
                 // Update metadata
                 let mut meta = self.meta.write();
-                meta.size = data.len() as u64;
+                meta.size = state.data.len() as u64;
                 let now = TimeSpec::now();
                 meta.mtime = now;
                 meta.ctime = now;
@@ -825,10 +1090,10 @@ impl Inode for RamFsInode {
     // R178-21 FIX: Atomic append write with inode-level serialization
     fn append_write(&self, data_in: &[u8]) -> Result<(usize, u64), FsError> {
         match &self.kind {
-            NodeKind::File { data } => {
+            NodeKind::File { state } => {
                 // Lock file data (inode-level) for atomic EOF + write
-                let mut data = data.write();
-                let offset = data.len();
+                let mut state = state.write();
+                let offset = state.data.len();
                 let required_len = offset.checked_add(data_in.len()).ok_or(FsError::Invalid)?;
 
                 // V-3 fix: Enforce maximum file size
@@ -836,22 +1101,16 @@ impl Inode for RamFsInode {
                     return Err(FsError::NoSpace);
                 }
 
-                // Transactional quota + allocation
                 if required_len > offset {
-                    let additional_bytes = required_len - offset;
-                    let guard = QuotaGuard::try_new(additional_bytes)?;
-                    data.try_reserve_exact(additional_bytes)
-                        .map_err(|_| FsError::NoMem)?;
-                    data.resize(required_len, 0);
-                    guard.commit();
+                    state.resize_data(required_len)?;
                 }
 
                 // Write data at EOF
-                data[offset..required_len].copy_from_slice(data_in);
+                state.data[offset..required_len].copy_from_slice(data_in);
 
                 // Update metadata
                 let mut meta = self.meta.write();
-                meta.size = data.len() as u64;
+                meta.size = state.data.len() as u64;
                 let now = TimeSpec::now();
                 meta.mtime = now;
                 meta.ctime = now;
@@ -865,7 +1124,7 @@ impl Inode for RamFsInode {
 
     fn truncate(&self, len: u64) -> Result<(), FsError> {
         match &self.kind {
-            NodeKind::File { data } => {
+            NodeKind::File { state } => {
                 let new_len = usize::try_from(len).map_err(|_| FsError::Invalid)?;
 
                 // V-3 fix: Enforce maximum file size to prevent memory exhaustion DoS
@@ -873,40 +1132,8 @@ impl Inode for RamFsInode {
                     return Err(FsError::NoSpace);
                 }
 
-                let mut data = data.write();
-                let current_len = data.len();
-
-                // R-MEDIUM-2 fix: Transactional in-place expansion - charge quota FIRST,
-                // reserve additional capacity fallibly IN-PLACE, resize, commit immediately.
-                // Shrinking uses detached replacement to release capacity, not just length.
-                if new_len > current_len {
-                    let additional_bytes = new_len - current_len;
-                    let guard = QuotaGuard::try_new(additional_bytes)?;
-
-                    // Reserve additional capacity in-place (fallible)
-                    data.try_reserve_exact(additional_bytes)
-                        .map_err(|_| FsError::NoMem)?;
-                    data.resize(new_len, 0);
-                    guard.commit();
-                } else if new_len < current_len {
-                    let freed_bytes = current_len - new_len;
-
-                    if new_len == 0 {
-                        // Truncate to zero: replace with empty Vec to release all capacity
-                        *data = Vec::new();
-                    } else {
-                        // Shrink with detached replacement to release capacity, not just length
-                        let mut new_data = Vec::new();
-                        new_data
-                            .try_reserve_exact(new_len)
-                            .map_err(|_| FsError::NoMem)?;
-                        new_data.resize(new_len, 0);
-                        new_data.copy_from_slice(&data[..new_len]);
-                        *data = new_data;
-                    }
-
-                    quota_release(freed_bytes);
-                }
+                let mut state = state.write();
+                state.resize_data(new_len)?;
 
                 // Update metadata
                 let mut meta = self.meta.write();
@@ -932,30 +1159,39 @@ pub struct RamFs {
     fs_id: u64,
     root: Arc<RamFsInode>,
     next_ino: AtomicU64,
+    /// Charge for the RamFs Arc allocation itself. The charged root inode has
+    /// its own independent lifetime charge.
+    _heap_charge: HeapCharge,
 }
 
 impl RamFs {
-    /// Create a new RAM filesystem
-    pub fn new() -> Arc<Self> {
+    /// Create a new RAM filesystem with fully fallible, aggregate-admitted Arc
+    /// publication. Boot callers may explicitly fail closed with `expect`.
+    pub fn try_new() -> Result<Arc<Self>, FsError> {
+        let fs_arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, fs_arc_bytes))?;
         // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
         let fs_id = NEXT_FS_ID
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .expect("ramfs: NEXT_FS_ID overflow");
+            .map_err(|_| FsError::NoSpace)?;
         // Root directory is owned by root (uid=0, gid=0)
-        let root = RamFsInode::new_dir(fs_id, 1, 0o755, 0, 0);
+        let root = RamFsInode::new_dir(fs_id, 1, 0o755, 0, 0)?;
+        let charge = heap_no_space(reservation.commit())?;
 
-        Arc::new(Self {
+        Arc::try_new(Self {
             fs_id,
             root,
             next_ino: AtomicU64::new(2),
+            _heap_charge: charge,
         })
+        .map_err(|_| FsError::NoSpace)
     }
 
     /// Allocate a new inode number (R112-2: overflow-safe)
-    fn alloc_ino(&self) -> u64 {
+    fn alloc_ino(&self) -> Result<u64, FsError> {
         self.next_ino
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .expect("ramfs: next_ino overflow")
+            .map_err(|_| FsError::NoSpace)
     }
 
     /// Downcast an Inode to RamFsInode
@@ -1000,7 +1236,7 @@ impl FileSystem for RamFs {
         }
 
         // Allocate inode number
-        let ino = self.alloc_ino();
+        let ino = self.alloc_ino()?;
 
         // Get current process credentials for file ownership
         // New files are owned by the effective uid of the creating process
@@ -1034,9 +1270,9 @@ impl FileSystem for RamFs {
 
         // Create new inode based on type
         let new_inode = if mode.is_dir() {
-            RamFsInode::new_dir(self.fs_id, ino, final_perm, uid, gid)
+            RamFsInode::new_dir(self.fs_id, ino, final_perm, uid, gid)?
         } else {
-            RamFsInode::new_file(self.fs_id, ino, final_perm, uid, gid)
+            RamFsInode::new_file(self.fs_id, ino, final_perm, uid, gid)?
         };
 
         // RF178-16 FIX: Publication is serialized with detach, and retained
@@ -1076,7 +1312,12 @@ impl FileSystem for RamFs {
         let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
         parent.ensure_attached_dir()?;
         let entries = parent.dir_entries().ok_or(FsError::NotDir)?;
-        let current = entries.read().get(name).cloned().ok_or(FsError::NotFound)?;
+        let current = entries
+            .read()
+            .entries
+            .get(name)
+            .cloned()
+            .ok_or(FsError::NotFound)?;
 
         // Bind the manager's authorization and POSIX type decision to this inode.
         if current.ino() != expected_ino {
@@ -1091,16 +1332,24 @@ impl FileSystem for RamFs {
         // RF178-16 FIX: No topology mutator can add a child while the mutex is
         // held. Observe the child with a transient lock, release it, then detach
         // from the parent. No parent/child lock nesting is required.
-        if let NodeKind::Dir {
-            entries: child_entries,
-        } = &current.kind
-        {
-            if !child_entries.read().is_empty() {
+        if let NodeKind::Dir { state } = &current.kind {
+            if !state.read().entries.is_empty() {
                 return Err(FsError::NotEmpty);
             }
         }
 
-        let removed = entries.write().remove(name).ok_or(FsError::NotFound)?;
+        // Try to compact before the destructive unlink, but never make a
+        // resource-releasing operation depend on additional heap capacity.
+        let target_len = entries
+            .read()
+            .entries
+            .len()
+            .checked_sub(1)
+            .ok_or(FsError::NotFound)?;
+        let prepared = prepare_directory_compaction(target_len);
+        let mut parent_state = entries.write();
+        let removed = commit_directory_remove(&mut parent_state, name, prepared);
+        drop(parent_state);
         if removed.is_dir() {
             removed.mark_detached_dir();
         }
@@ -1147,13 +1396,6 @@ impl FileSystem for RamFs {
         if new_name.is_empty() || new_name.len() > 255 || new_name.contains('/') {
             return Err(FsError::NameTooLong);
         }
-        // Reserve the key allocation up front, FALLIBLY — an OOM here returns NoSpace and
-        // is a no-op (nothing has been mutated yet), never a panic, never a half-mutation.
-        let mut key = String::new();
-        key.try_reserve(new_name.len())
-            .map_err(|_| FsError::NoSpace)?;
-        key.push_str(new_name);
-
         let old_entries = old_parent.dir_entries().ok_or(FsError::NotDir)?;
         let new_entries = new_parent.dir_entries().ok_or(FsError::NotDir)?;
         let same_parent = core::ptr::eq(old_parent, new_parent);
@@ -1193,92 +1435,170 @@ impl FileSystem for RamFs {
             _ => None,
         };
 
-        // === Spanning critical section: decide + commit atomically ===
-        // Order is INSERT-NEW (overwrites any victim, returns it) then REMOVE-OLD: no
-        // destructive step precedes the successful insert and no fallible step follows it,
-        // so the move is all-or-nothing by construction. This closes the half-mutation bug
-        // where the old code removed the source (and the victim) BEFORE the add, losing the
-        // entry from both parents if the add raced an Exists. All mutation-deciding reads
-        // happen UNDER the held guard(s) (closes the check-vs-move TOCTOU).
+        // === Spanning critical section: prepare, then allocation-free commit ===
+        // RAMFS_TOPOLOGY_LOCK keeps the preflight stable while all heap
+        // reservations and detached backing/key allocations occur without a
+        // directory spin lock held. Once preparation succeeds, commit performs
+        // no allocation and cannot expose a half-rename.
         let (inode, inode_is_dir, victim) = if same_parent {
-            let mut g = old_entries.write();
-            let inode = g.get(old_name).cloned().ok_or(FsError::NotFound)?;
-            let inode_is_dir = inode.is_dir();
-            let dest = g.get(new_name).cloned();
-            verify_rename_identity(&inode, &dest, expected_src_ino, expected_dest_ino)?;
-            match rename_decide(
-                &inode,
-                inode_is_dir,
-                dest,
-                dest_dir_empty,
-                noreplace,
-                old_parent,
-                new_parent,
-            )? {
+            let (inode, inode_is_dir, decision, parent_len) = {
+                let g = old_entries.read();
+                let inode = g.entries.get(old_name).cloned().ok_or(FsError::NotFound)?;
+                let inode_is_dir = inode.is_dir();
+                let dest = g.entries.get(new_name).cloned();
+                verify_rename_identity(&inode, &dest, expected_src_ino, expected_dest_ino)?;
+                let decision = rename_decide(
+                    &inode,
+                    inode_is_dir,
+                    dest,
+                    dest_dir_empty,
+                    noreplace,
+                    old_parent,
+                    new_parent,
+                )?;
+                (inode, inode_is_dir, decision, g.entries.len())
+            };
+
+            match decision {
                 RenameDecision::NoOp => return Ok(()),
                 RenameDecision::Move => {
-                    // R172-22: fallible insert FIRST (the only allocating/fallible step) —
-                    // on OOM the map is UNCHANGED (try_insert reserves-before-mutate) and we
-                    // return NoSpace before the remove, so the source survives in this parent
-                    // (all-or-nothing). new_name is pre-validated absent -> Ok(None).
-                    g.try_insert(key, inode.clone())
-                        .map_err(|_| FsError::NoSpace)?;
-                    g.remove(old_name);
+                    let prepared_key = PreparedDirectoryKey::try_new(new_name)?;
+                    let mut g = old_entries.write();
+                    let PreparedDirectoryKey {
+                        key,
+                        reservation,
+                        charge_bytes,
+                    } = prepared_key;
+                    absorb_prepared(&mut g.heap_charge, reservation);
+                    let (old_key, source) = g
+                        .entries
+                        .remove_entry(old_name)
+                        .expect("R180 RAMFS same-parent source changed under topology lock");
+                    let old_key_charge = string_buffer_charge(old_key.capacity())
+                        .expect("R180 RAMFS old rename key charge overflow");
+                    if let Err((key, source_for_insert)) =
+                        g.entries.insert_unique_reserved(key, source.clone())
+                    {
+                        // Capacity is guaranteed after removing one entry. If
+                        // the invariant is ever violated, restore the source
+                        // allocation-free and release the unpublished key.
+                        drop(key);
+                        drop(source_for_insert);
+                        release_deallocated(&mut g.heap_charge, charge_bytes);
+                        g.entries
+                            .insert_unique_reserved(old_key, source)
+                            .unwrap_or_else(|_| panic!("R180 RAMFS rename rollback failed"));
+                        return Err(FsError::NoSpace);
+                    }
+                    drop(old_key);
+                    release_deallocated(&mut g.heap_charge, old_key_charge);
+                    debug_assert_eq!(g.entries.len(), parent_len);
                     (inode, inode_is_dir, None)
                 }
                 RenameDecision::Replace => {
-                    // R172-22: dest exists -> try_insert is an in-place mem::replace with NO
-                    // allocation, returning Ok(Some(victim)); the .map_err arm is dead but
-                    // required for type-correctness. After `?`, victim is Option<V> directly.
-                    let victim = g
-                        .try_insert(key, inode.clone())
-                        .map_err(|_| FsError::NoSpace)?;
-                    g.remove(old_name);
-                    (inode, inode_is_dir, victim)
+                    let target_len = parent_len.checked_sub(1).ok_or(FsError::NotFound)?;
+                    let prepared = prepare_directory_compaction(target_len);
+                    let mut g = old_entries.write();
+                    let victim = core::mem::replace(
+                        g.entries
+                            .get_mut(new_name)
+                            .expect("R180 RAMFS rename victim changed under topology lock"),
+                        inode.clone(),
+                    );
+                    let removed_source = commit_directory_remove(&mut g, old_name, prepared);
+                    debug_assert!(Arc::ptr_eq(&removed_source, &inode));
+                    drop(removed_source);
+                    (inode, inode_is_dir, Some(victim))
                 }
             }
         } else {
-            // Acquire BOTH guards low-ino-first (ABBA-safe; ino is unique within the fs).
-            let (mut og, mut ng) = if old_parent.ino() < new_parent.ino() {
-                let og = old_entries.write();
-                let ng = new_entries.write();
-                (og, ng)
-            } else {
-                let ng = new_entries.write();
-                let og = old_entries.write();
-                (og, ng)
+            // Read-preflight both parents low-ino-first. The topology lock makes
+            // the result stable while detached allocations are prepared.
+            let (inode, inode_is_dir, decision, old_len, new_len, new_capacity) = {
+                let (og, ng) = if old_parent.ino() < new_parent.ino() {
+                    let og = old_entries.read();
+                    let ng = new_entries.read();
+                    (og, ng)
+                } else {
+                    let ng = new_entries.read();
+                    let og = old_entries.read();
+                    (og, ng)
+                };
+                let inode = og.entries.get(old_name).cloned().ok_or(FsError::NotFound)?;
+                let inode_is_dir = inode.is_dir();
+                let dest = ng.entries.get(new_name).cloned();
+                verify_rename_identity(&inode, &dest, expected_src_ino, expected_dest_ino)?;
+                let decision = rename_decide(
+                    &inode,
+                    inode_is_dir,
+                    dest,
+                    dest_dir_empty,
+                    noreplace,
+                    old_parent,
+                    new_parent,
+                )?;
+                (
+                    inode,
+                    inode_is_dir,
+                    decision,
+                    og.entries.len(),
+                    ng.entries.len(),
+                    ng.entries.capacity(),
+                )
             };
-            let inode = og.get(old_name).cloned().ok_or(FsError::NotFound)?;
-            let inode_is_dir = inode.is_dir();
-            let dest = ng.get(new_name).cloned();
-            verify_rename_identity(&inode, &dest, expected_src_ino, expected_dest_ino)?;
-            match rename_decide(
-                &inode,
-                inode_is_dir,
-                dest,
-                dest_dir_empty,
-                noreplace,
-                old_parent,
-                new_parent,
-            )? {
+
+            match decision {
                 RenameDecision::NoOp => return Ok(()),
                 RenameDecision::Move => {
-                    // R172-22: fallible insert into the NEW parent FIRST; on OOM the map is
-                    // unchanged and we return NoSpace before removing from the old parent
-                    // (all-or-nothing; the source survives in og).
-                    ng.try_insert(key, inode.clone())
-                        .map_err(|_| FsError::NoSpace)?;
-                    og.remove(old_name);
+                    let old_compact = prepare_directory_compaction(
+                        old_len.checked_sub(1).ok_or(FsError::NotFound)?,
+                    );
+                    let prepared_key = PreparedDirectoryKey::try_new(new_name)?;
+                    let new_target = new_len.checked_add(1).ok_or(FsError::NoSpace)?;
+                    let new_backing = if new_capacity < new_target {
+                        Some(PreparedDirectoryCapacity::try_new(new_target)?)
+                    } else {
+                        None
+                    };
+
+                    let (mut og, mut ng) = if old_parent.ino() < new_parent.ino() {
+                        let og = old_entries.write();
+                        let ng = new_entries.write();
+                        (og, ng)
+                    } else {
+                        let ng = new_entries.write();
+                        let og = old_entries.write();
+                        (og, ng)
+                    };
+                    commit_directory_insert(&mut ng, prepared_key, new_backing, inode.clone())?;
+                    let removed_source = commit_directory_remove(&mut og, old_name, old_compact);
+                    debug_assert!(Arc::ptr_eq(&removed_source, &inode));
+                    drop(removed_source);
                     (inode, inode_is_dir, None)
                 }
                 RenameDecision::Replace => {
-                    // R172-22: dest exists -> in-place replace, no allocation; after `?`,
-                    // victim is Option<V>.
-                    let victim = ng
-                        .try_insert(key, inode.clone())
-                        .map_err(|_| FsError::NoSpace)?;
-                    og.remove(old_name);
-                    (inode, inode_is_dir, victim)
+                    let old_compact = prepare_directory_compaction(
+                        old_len.checked_sub(1).ok_or(FsError::NotFound)?,
+                    );
+                    let (mut og, mut ng) = if old_parent.ino() < new_parent.ino() {
+                        let og = old_entries.write();
+                        let ng = new_entries.write();
+                        (og, ng)
+                    } else {
+                        let ng = new_entries.write();
+                        let og = old_entries.write();
+                        (og, ng)
+                    };
+                    let victim = core::mem::replace(
+                        ng.entries
+                            .get_mut(new_name)
+                            .expect("R180 RAMFS cross-parent victim changed"),
+                        inode.clone(),
+                    );
+                    let removed_source = commit_directory_remove(&mut og, old_name, old_compact);
+                    debug_assert!(Arc::ptr_eq(&removed_source, &inode));
+                    drop(removed_source);
+                    (inode, inode_is_dir, Some(victim))
                 }
             }
         };
@@ -1325,36 +1645,8 @@ impl FileSystem for RamFs {
             return Err(FsError::NameTooLong);
         }
 
-        // R178-29 FIX: Perform ALL fallible allocations BEFORE quota charge to prevent
-        // quota-guard-spanning leak. The target String and parent directory entry key
-        // allocate fallibly. If either fails, we return FsError::NoSpace BEFORE charging
-        // quota, eliminating the leak-on-OOM window.
-        //
-        // Previous bug: quota_try_alloc(target.len()) happened before new_symlink(), but
-        // new_symlink() contains target.to_string() (infallible clone) and add_child()
-        // contains fallible String key allocation. If either failed post-quota-charge,
-        // the quota leaked because the inode Drop handler only runs on successfully
-        // constructed nodes.
-
-        // Pre-allocate the target string fallibly
-        let mut target_owned = String::new();
-        target_owned
-            .try_reserve(target.len())
-            .map_err(|_| FsError::NoSpace)?;
-        target_owned.push_str(target);
-
-        // Pre-allocate the directory entry key fallibly
-        let mut entry_key = String::new();
-        entry_key
-            .try_reserve(name.len())
-            .map_err(|_| FsError::NoSpace)?;
-        entry_key.push_str(name);
-
-        // NOW charge quota — all fallible allocations are complete
-        let quota_guard = QuotaGuard::try_new(target.len())?;
-
         // Allocate inode number
-        let ino = self.alloc_ino();
+        let ino = self.alloc_ino()?;
 
         // Get current process credentials for symlink ownership
         let creds = current_credentials();
@@ -1369,51 +1661,200 @@ impl FileSystem for RamFs {
         };
         drop(parent_meta);
 
-        // Create new symlink inode using the pre-allocated target (move ownership)
-        let mode = FileMode::symlink(0o777);
-        // RF178-25 FIX: Transfer charge ownership before Arc allocation. On
-        // Arc::try_new failure the constructed inode value is dropped and
-        // releases the charge exactly once; an armed guard would release it a
-        // second time and undercount RAMFS quota.
-        quota_guard.commit();
-        let inode = Arc::try_new(RamFsInode {
-            fs_id: self.fs_id,
-            ino,
-            meta: RwLock::new(Meta::new(mode, uid, gid)),
-            kind: NodeKind::Symlink {
-                target: RwLock::new(target_owned),
-            },
-            detached: AtomicBool::new(false),
-            self_ref: RwLock::new(None),
-        })
-        .map_err(|_| FsError::NoSpace)?;
-        // RamFsInode::drop now owns the charge. If insertion fails, dropping
-        // the last Arc releases it exactly once.
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
+        // R180-13: target bytes, inode Arc, and quota are one private,
+        // fallible construction transaction. Parent key/backing admission is
+        // handled independently by `add_child`; failure drops this inode and
+        // rolls both lifetime charges back exactly once.
+        let inode = RamFsInode::new_symlink(self.fs_id, ino, 0o777, uid, gid, target)?;
 
         // RF178-16 FIX: Publication is serialized with directory detach.
         let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
         parent.ensure_attached_dir()?;
-        parent.add_child_with_key(entry_key, inode.clone())?;
+        parent.add_child(name, inode.clone())?;
 
         Ok(inode as Arc<dyn Inode>)
     }
 }
 
-impl Default for RamFs {
-    fn default() -> Self {
-        // This creates a non-Arc version for internal use
-        // R112-2: overflow-safe ID allocation
-        let fs_id = NEXT_FS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .expect("ramfs: NEXT_FS_ID overflow");
-        // Root directory is owned by root (uid=0, gid=0)
-        let root = RamFsInode::new_dir(fs_id, 1, 0o755, 0, 0);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        Self {
-            fs_id,
-            root,
-            next_ino: AtomicU64::new(2),
+    static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    fn publish_heap_admission() {
+        mm::publish_heap_budgets();
+    }
+
+    #[test]
+    fn create_rename_unlink_and_truncate_release_exact_charges() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let class_before = mm::heap_class_snapshot(HeapClass::RamFs);
+        let quota_before = ramfs_bytes_used();
+
+        let fs = RamFs::try_new().expect("ramfs construction");
+        let root = fs.root_inode();
+        let fs_only = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(fs_only.committed_bytes > class_before.committed_bytes);
+
+        let long_name = "r180-retained-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let file = fs
+            .create(&root, long_name, FileMode::new(FileType::Regular, 0o600))
+            .expect("create admitted file");
+        let ino = file.ino();
+        let after_create = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(after_create.committed_bytes > fs_only.committed_bytes);
+
+        let payload = [0xabu8; 16 * 1024];
+        file.write_at(0, &payload).expect("grow admitted file");
+        let after_write = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(after_write.committed_bytes > after_create.committed_bytes);
+        assert_eq!(ramfs_bytes_used(), quota_before + payload.len());
+
+        fs.rename(&root, long_name, &root, "x", false, ino, None)
+            .expect("same-parent charged rename");
+        let after_rename = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(
+            after_rename.committed_bytes < after_write.committed_bytes,
+            "old retained key capacity must be released after rename"
+        );
+
+        file.truncate(0).expect("truncate releases capacity");
+        let after_truncate = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(after_truncate.committed_bytes < after_rename.committed_bytes);
+        assert_eq!(ramfs_bytes_used(), quota_before);
+
+        fs.unlink(&root, "x", ino, Some(false))
+            .expect("unlink admitted file");
+        let root_inode = fs.downcast_inode(&root).expect("ramfs root downcast");
+        let root_state = root_inode.dir_entries().expect("root directory").read();
+        assert_eq!(root_state.entries.len(), 0);
+        assert_eq!(
+            root_state.entries.capacity(),
+            0,
+            "unlink must compact retained map high-water capacity"
+        );
+        drop(root_state);
+
+        // The open inode Arc deliberately keeps only its own Arc charge alive.
+        let after_unlink = mm::heap_class_snapshot(HeapClass::RamFs);
+        assert!(after_unlink.committed_bytes > fs_only.committed_bytes);
+        drop(file);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), fs_only);
+
+        drop(root);
+        drop(fs);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), class_before);
+        assert_eq!(ramfs_bytes_used(), quota_before);
+    }
+
+    #[test]
+    fn admission_failure_rolls_back_inode_and_file_growth_transactions() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let class_before = mm::heap_class_snapshot(HeapClass::RamFs);
+        let quota_before = ramfs_bytes_used();
+
+        let fs = RamFs::try_new().expect("ramfs construction");
+        let root = fs.root_inode();
+        let file = fs
+            .create(&root, "held", FileMode::new(FileType::Regular, 0o600))
+            .expect("fixture file");
+        let ino = file.ino();
+        let before_exhaustion = mm::heap_class_snapshot(HeapClass::RamFs);
+        let remaining = before_exhaustion
+            .capacity_bytes
+            .checked_sub(before_exhaustion.committed_bytes + before_exhaustion.reserved_bytes)
+            .expect("valid class snapshot");
+        let exhaustion = mm::try_reserve_heap(HeapClass::RamFs, remaining)
+            .expect("reserve remaining RAMFS class capacity");
+        let exhausted_snapshot = mm::heap_class_snapshot(HeapClass::RamFs);
+
+        match fs.create(
+            &root,
+            "must-not-publish",
+            FileMode::new(FileType::Regular, 0o600),
+        ) {
+            Err(FsError::NoSpace) => {}
+            Err(error) => panic!("unexpected inode admission error: {:?}", error),
+            Ok(_) => panic!("inode Arc admission unexpectedly published"),
         }
+        assert!(fs.lookup(&root, "must-not-publish").is_err());
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::RamFs),
+            exhausted_snapshot
+        );
+
+        assert_eq!(
+            file.write_at(0, &[0x11u8; 4096])
+                .expect_err("file growth admission must fail"),
+            FsError::NoSpace
+        );
+        assert_eq!(file.stat().expect("file stat").size, 0);
+        assert_eq!(ramfs_bytes_used(), quota_before);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::RamFs),
+            exhausted_snapshot
+        );
+
+        drop(exhaustion);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), before_exhaustion);
+        fs.unlink(&root, "held", ino, Some(false))
+            .expect("fixture unlink");
+        drop(file);
+        drop(root);
+        drop(fs);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), class_before);
+        assert_eq!(ramfs_bytes_used(), quota_before);
+    }
+
+    #[test]
+    fn unlink_remains_progress_making_when_compaction_cannot_be_admitted() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let class_before = mm::heap_class_snapshot(HeapClass::RamFs);
+        let quota_before = ramfs_bytes_used();
+
+        let fs = RamFs::try_new().expect("ramfs construction");
+        let root = fs.root_inode();
+        let first = fs
+            .create(&root, "first", FileMode::new(FileType::Regular, 0o600))
+            .expect("first fixture");
+        let second = fs
+            .create(&root, "second", FileMode::new(FileType::Regular, 0o600))
+            .expect("second fixture");
+
+        let live = mm::heap_class_snapshot(HeapClass::RamFs);
+        let remaining = live
+            .capacity_bytes
+            .checked_sub(live.committed_bytes + live.reserved_bytes)
+            .expect("valid RAMFS class snapshot");
+        let exhaustion = mm::try_reserve_heap(HeapClass::RamFs, remaining)
+            .expect("reserve remaining RAMFS class capacity");
+
+        // target_len=1 needs a detached replacement and cannot reserve it. The
+        // unlink must still commit and retain the old backing under its charge.
+        fs.unlink(&root, "first", first.ino(), Some(false))
+            .expect("unlink must not depend on compaction allocation");
+        assert!(matches!(fs.lookup(&root, "first"), Err(FsError::NotFound)));
+        assert!(fs.lookup(&root, "second").is_ok());
+
+        // target_len=0 uses an allocation-free empty backing and releases the
+        // retained high-water capacity even while the exhaustion guard is live.
+        fs.unlink(&root, "second", second.ino(), Some(false))
+            .expect("last unlink must release retained backing");
+        let root_inode = fs.downcast_inode(&root).expect("ramfs root");
+        let root_state = root_inode.dir_entries().expect("root directory").read();
+        assert_eq!(root_state.entries.capacity(), 0);
+        drop(root_state);
+
+        drop(exhaustion);
+        drop(first);
+        drop(second);
+        drop(root);
+        drop(fs);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), class_before);
+        assert_eq!(ramfs_bytes_used(), quota_before);
     }
 }
