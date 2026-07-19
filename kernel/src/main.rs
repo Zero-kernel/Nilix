@@ -259,6 +259,27 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     }
 }
 
+/// IRQ-safe polling fallback until a dedicated VT-d fault vector is wired.
+fn iommu_fault_capture_tick() {
+    if iommu::capture_dma_faults_irq() {
+        kernel_core::request_soft_progress_from_irq();
+        kernel_core::request_resched_from_irq();
+    }
+}
+
+/// Blocking/logging containment half, invoked only by the process-context
+/// deferred-work hook in `reschedule_if_needed`.
+fn iommu_fault_drain_deferred() {
+    // Claim contention leaves hardware FRCD state untouched and sets the
+    // recapture level. Re-scan first at every soft progress point, then perform
+    // one bounded containment transaction.
+    let _ = iommu::capture_dma_faults_irq();
+    let _ = iommu::drain_dma_fault_work();
+    if iommu::capture_dma_faults_irq() {
+        kernel_core::request_soft_progress_from_irq();
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 禁用中断 - 必须首先做！
@@ -370,6 +391,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
     klog_always!("      ✓ Page table manager initialized");
 
+    // RF180-24: prove all guarded-stack data and page-table frames roll back
+    // under zero, upper-level, and partial-mapping allocation failures before
+    // KPTI creates peer roots that would make upper-table detachment unsafe.
+    unsafe {
+        stack_guard::run_rollback_self_test();
+    }
+
     // 安装内核栈守护页（必须在 mm 初始化后、启用中断前）
     klog_always!("[2.5/3] Installing kernel stack guard pages...");
     unsafe {
@@ -383,13 +411,6 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
     }
-
-    // R149-I5 FIX: Install BSP IST double-fault stack guard page.
-    // Must run after mm::page_table::init(). AP guard pages are installed in
-    // gdt::init_for_ap(); BSP was deferred because gdt::init() runs before PT init.
-    arch::gdt::install_bsp_ist_guard_page();
-    arch::gdt::install_bsp_nmi_guard_page();
-    klog_always!("      ✓ BSP IST guard pages installed (double-fault + NMI)");
 
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
     // G.3 Compliance: Use HardeningProfile to configure security settings
@@ -506,6 +527,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 klog_force!("      ! Continuing with reduced security");
             }
         }
+
+        // RF180-53 FIX: install BSP and every possible AP IST guard only after
+        // the kernel page tables are available and the normal hardening pass has
+        // had the opportunity to demote section mappings. The guard installer
+        // independently demotes any remaining huge parents (including the
+        // Performance profile), checks every unmap, and publishes completion
+        // before SMP startup.
+        arch::gdt::install_ist_guard_pages_before_smp(&mut frame_allocator);
+        klog_always!("      ✓ BSP/AP IST guard pages installed (double-fault + NMI)");
     }
 
     // R101-4 FIX: Boot-time livepatch ECDSA key validation
@@ -517,9 +547,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     // KASLR/KPTI/PCID initialization
-    // R39-7 FIX: Pass KASLR slide from bootloader to kernel
+    // R39-7/RF180-32: pass relocation separately from version-validated
+    // randomization provenance. A deterministic non-zero slide is not KASLR.
     klog_always!("[2.65/3] Initializing KASLR/KPTI/PCID...");
-    security::init_kaslr(boot_info.map(|info| info.kaslr_slide));
+    security::init_kaslr(boot_info.map(|info| security::BootKaslrState {
+        slide: info.kaslr_slide,
+        randomized: info.kaslr_randomized(),
+    }));
 
     // P1-1 FIX: PolicySurface-driven KASLR/KPTI fail-closed enforcement.
     // When kaslr_fail_closed is true (Secure profile), the kernel must not
@@ -831,6 +865,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     let rsdp_phys = boot_info.map(|i| i.rsdp_address).unwrap_or(0);
     match iommu::init(rsdp_phys) {
         Ok(units) => {
+            // Register the process drain before exposing the IRQ producer.
+            // Callback exhaustion is boot-fatal: an active IOMMU must always
+            // have a reachable, durable fault-containment path.
+            kernel_core::register_soft_progress_callback(iommu_fault_drain_deferred)
+                .expect("IOMMU deferred fault callback slots exhausted");
+            kernel_core::register_timer_callback(iommu_fault_capture_tick)
+                .expect("IOMMU fault capture timer callback slots exhausted");
             klog_always!(
                 "      ✓ IOMMU active: {} unit(s), DMA translation enabled",
                 units
@@ -872,11 +913,38 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // Phase C: Block Layer and Storage Foundation
     klog_always!("[7.55/8] Initializing Block Layer...");
     block::init();
-    // Probe for virtio-blk devices and register with VFS
-    if let Some((device, name)) = block::probe_devices(iommu_required) {
-        let device_for_registration = device.clone();
-        match vfs::register_block_device(name, device_for_registration) {
+    // Probe for virtio-blk devices and publish them transactionally.
+    if let Some(probed) = block::probe_devices(iommu_required) {
+        let name = probed.name();
+        let device_for_registration = probed.device();
+
+        // R180-27 FIX: DRIVER_OK-to-publication is one rollbackable
+        // transaction. Both registries allocate fallibly; the probe guard
+        // resets (or quarantines) DMA ownership unless both commits succeed.
+        let registry_result = block::register_device(device_for_registration.clone());
+        let mut block_registered = false;
+        let devfs_result = match registry_result {
+            Ok(_) => {
+                block_registered = true;
+                vfs::register_block_device(name, device_for_registration)
+            }
+            Err(error) => {
+                klog!(
+                    Error,
+                    "      ! Failed to publish block::{}: {:?}",
+                    name,
+                    error
+                );
+                Err(vfs::FsError::NoSpace)
+            }
+        };
+
+        match devfs_result {
             Ok(()) => {
+                // Disarm rollback immediately after the second registry
+                // commit. This only transfers Arc ownership and cannot allocate.
+                let (device, committed_name) = probed.commit();
+                debug_assert_eq!(committed_name, name);
                 klog_always!("      ✓ Registered /dev/{} in devfs", name);
 
                 // Phase C: Test block write path (uses last sectors, outside filesystem)
@@ -909,7 +977,22 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     ),
                 }
             }
-            Err(e) => klog!(Error, "      ! Failed to register /dev/{}: {:?}", name, e),
+            Err(e) => {
+                // If the block registry committed but devfs failed, undo that
+                // first publication before `probed` resets the hardware.
+                if block_registered {
+                    if let Err(unregister_error) = block::unregister_device(name) {
+                        klog_force!(
+                            "R180-27: failed to roll back block registry entry {}: {:?}",
+                            name,
+                            unregister_error
+                        );
+                    }
+                }
+                klog!(Error, "      ! Failed to register /dev/{}: {:?}", name, e);
+                // `probed` drops here. Reset acknowledgement is required before
+                // DMA buffers are freed; otherwise its final Arc is quarantined.
+            }
         }
     }
 
@@ -1163,7 +1246,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // In Secure profile, debug_interfaces_enabled is false — skip integration,
     // runtime, and Ring 3 usermode tests to reduce the attack surface and
     // eliminate test-only code paths in production deployments.
-    if compliance::policy().debug_interfaces_enabled {
+    let pending_usermode_process = if compliance::policy().debug_interfaces_enabled {
         // 运行集成测试
         integration_test::run_all_tests();
 
@@ -1179,17 +1262,20 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
         // 运行 Ring 3 用户态测试
         klog_always!("[9/9] Running Ring 3 user mode test...");
-        if usermode_test::run_usermode_test() {
-            klog_always!("      ✓ Ring 3 test process created successfully");
+        let pending = usermode_test::prepare_usermode_test();
+        if pending.is_some() {
+            klog_always!("      ✓ Ring 3 test process prepared successfully");
         } else {
             klog!(Error, "      ! Ring 3 test setup failed");
         }
+        pending
     } else {
         klog_force!(
             "[POLICY] {} profile: debug/test interfaces disabled",
             compliance::policy().profile.name()
         );
-    }
+        None
+    };
 
     klog_always!("=== System Ready ===");
     klog_always!();
@@ -1241,7 +1327,42 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     BOOT_PHASE_COMPLETE.store(true, core::sync::atomic::Ordering::Release);
 
     unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
+        // RF180-52: this is also the compiler barrier before the readiness
+        // Release store below. Do not add `nomem`: LLVM must not move the
+        // publication above the point where the BSP becomes IRQ-responsive.
+        core::arch::asm!("sti", options(nostack));
+    }
+
+    // RF180-52 FIX: all scheduler, IPC, IOMMU soft-progress, network/socket,
+    // cgroup, RCU, and boot-quiescent self-test dependencies used by the full
+    // process-context deferred drain are now initialized, and the boot-only
+    // credential bypass is closed. Publish only after the BSP can service
+    // cross-CPU interrupts: a newly enabled drain may itself require an IPI.
+    kernel_core::mark_process_deferred_work_ready();
+    // Release-before-edge: the Acquire gate read observes all initialization,
+    // while the reschedule IPI promptly wakes every online AP from HLT. The
+    // periodic LAPIC timer remains a backstop, not the publication mechanism.
+    arch::ipi::broadcast_ipi(arch::ipi::IpiType::Reschedule);
+    // RF180-54 FIX: do not expose runnable Ring-3 work until every online AP has
+    // completed one full post-publication deferred drain. The bounded BSP wait
+    // runs with interrupts enabled and fails closed on a missing/invalid ACK.
+    arch::smp::wait_for_process_deferred_acknowledgements();
+
+    if let Some(process) = pending_usermode_process {
+        let pid = process.lock().pid;
+        match sched::enhanced_scheduler::Scheduler::add_process(process) {
+            Ok(()) => {
+                klog_always!("      ✓ Ring 3 test process added to scheduler ready queue");
+            }
+            Err(error) => {
+                kernel_core::process::cleanup_unscheduled_process(pid);
+                klog!(
+                    Error,
+                    "      ! Ring 3 scheduler admission failed: {:?}",
+                    error
+                );
+            }
+        }
     }
 
     // Enter interactive shell after all tests complete
