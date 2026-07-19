@@ -34,17 +34,23 @@
 extern crate alloc;
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    alloc::{AllocError, Allocator, Global},
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
+    alloc::Layout,
     fmt,
+    ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use spin::{Lazy, Mutex, RwLock};
 
 use bitflags::bitflags;
+use mm::{
+    arc_charge_bytes, try_reserve_heap, AdmittedMap, AdmittedSet, AdmittedVec, HeapCharge,
+    HeapClass, PreparedAdmittedMapCapacity, PreparedAdmittedSetCapacity,
+    PreparedAdmittedVecCapacity, RetiredAdmittedMapCapacity, RetiredAdmittedSetCapacity,
+};
 
 // ============================================================================
 // Type Definitions
@@ -73,6 +79,303 @@ pub const MAX_CGROUP_DEPTH: u32 = 8;
 /// This prevents DoS attacks where an adversary creates
 /// unlimited cgroups to exhaust kernel memory.
 pub const MAX_CGROUPS: usize = 4096;
+
+// ============================================================================
+// Exact-lifetime cgroup Arc admission (RF180-45)
+// ============================================================================
+
+/// The slot table is the physical cgroup-Arc bound, not merely the registry
+/// bound. Deleted payloads whose Arc control blocks remain pinned by stale Weak
+/// handles therefore continue consuming one slot and one admitted charge.
+const CGROUP_ARC_SLOTS: usize = MAX_CGROUPS;
+const _: () = assert!(CGROUP_ARC_SLOTS <= u16::MAX as usize + 1);
+
+struct CgroupArcChargeSlot {
+    generation: u64,
+    allocated: bool,
+    _charge: HeapCharge,
+}
+
+static CGROUP_ARC_CHARGES: Mutex<[Option<CgroupArcChargeSlot>; CGROUP_ARC_SLOTS]> =
+    Mutex::new([const { None }; CGROUP_ARC_SLOTS]);
+static NEXT_CGROUP_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Default)]
+struct CgroupCreateFault {
+    fail_arc_allocation: bool,
+    fail_registry_prepare: bool,
+    fail_children_prepare: bool,
+    fail_after_children_insert: bool,
+    interleave_sibling_once: bool,
+    check_prepare_unlocked: bool,
+    check_deallocate_unlocked: bool,
+}
+
+struct CgroupArcInstallError {
+    _charge: HeapCharge,
+}
+
+/// Allocator carried by every cgroup strong and weak handle.
+///
+/// The generation-tagged static slot owns the whole-heap charge until `Arc`
+/// invokes `deallocate` after the final strong and weak handles disappear.
+/// Deallocation releases physical memory first and admission second.
+#[derive(Clone, Copy, Debug)]
+pub struct CgroupArcAllocator {
+    slot: u16,
+    generation: u64,
+    fail_allocation: bool,
+    check_deallocate_unlocked: bool,
+}
+
+impl CgroupArcAllocator {
+    fn try_install(
+        charge: HeapCharge,
+        fail_allocation: bool,
+        check_deallocate_unlocked: bool,
+    ) -> Result<Self, CgroupArcInstallError> {
+        let generation = match NEXT_CGROUP_ARC_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => return Err(CgroupArcInstallError { _charge: charge }),
+        };
+
+        let mut charge = Some(charge);
+        let mut slots = CGROUP_ARC_CHARGES.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(CgroupArcChargeSlot {
+                    generation,
+                    allocated: false,
+                    _charge: charge.take().expect("cgroup Arc charge moved once"),
+                });
+                return Ok(Self {
+                    slot: index as u16,
+                    generation,
+                    fail_allocation,
+                    check_deallocate_unlocked,
+                });
+            }
+        }
+        Err(CgroupArcInstallError {
+            _charge: charge.expect("cgroup Arc slot scan retained charge"),
+        })
+    }
+
+    fn take_slot(self, expected_allocated: bool) -> CgroupArcChargeSlot {
+        let mut slots = CGROUP_ARC_CHARGES.lock();
+        let slot = slots
+            .get_mut(self.slot as usize)
+            .expect("RF180-45 cgroup Arc slot out of range");
+        match slot.as_ref() {
+            Some(entry)
+                if entry.generation == self.generation && entry.allocated == expected_allocated => {
+            }
+            Some(entry) if entry.generation == self.generation => {
+                panic!("RF180-45 cgroup Arc allocator state mismatch")
+            }
+            Some(_) => panic!("RF180-45 stale cgroup Arc allocator generation"),
+            None => panic!("RF180-45 cgroup Arc slot released twice"),
+        }
+        slot.take()
+            .expect("validated cgroup Arc charge disappeared")
+    }
+
+    fn cancel_failed_allocation(self) {
+        drop(self.take_slot(false));
+    }
+}
+
+unsafe impl Allocator for CgroupArcAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        {
+            let mut slots = CGROUP_ARC_CHARGES.lock();
+            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+                return Err(AllocError);
+            };
+            if entry.generation != self.generation || entry.allocated {
+                return Err(AllocError);
+            }
+            entry.allocated = true;
+        }
+
+        if self.fail_allocation {
+            let mut slots = CGROUP_ARC_CHARGES.lock();
+            if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                if entry.generation == self.generation {
+                    entry.allocated = false;
+                }
+            }
+            return Err(AllocError);
+        }
+
+        match Global.allocate(layout) {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                let mut slots = CGROUP_ARC_CHARGES.lock();
+                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                    if entry.generation == self.generation {
+                        entry.allocated = false;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if self.check_deallocate_unlocked {
+            assert!(
+                CGROUP_REGISTRY.try_write().is_some(),
+                "RF180-45 cgroup Arc deallocated under registry lock"
+            );
+        }
+        unsafe { Global.deallocate(ptr, layout) };
+        drop(self.take_slot(true));
+    }
+}
+
+fn active_cgroup_arc_slots() -> usize {
+    CGROUP_ARC_CHARGES
+        .lock()
+        .iter()
+        .filter(|slot| slot.is_some())
+        .count()
+}
+
+pub type CgroupArc = Arc<CgroupNode, CgroupArcAllocator>;
+pub type CgroupWeak = Weak<CgroupNode, CgroupArcAllocator>;
+
+const CGROUP_CHAIN_CAPACITY: usize = MAX_CGROUP_DEPTH as usize + 1;
+const CGROUP_TASK_CAPACITY: usize = crate::process::PID_MAX as usize;
+
+fn bounded_growth_target(
+    current_capacity: usize,
+    required: usize,
+    domain_capacity: usize,
+) -> Option<usize> {
+    if required > domain_capacity {
+        return None;
+    }
+    let amortized = current_capacity
+        .max(4)
+        .checked_mul(2)
+        .unwrap_or(domain_capacity)
+        .min(domain_capacity);
+    Some(required.max(amortized))
+}
+
+fn cgroup_metadata_growth_target(
+    current_capacity: usize,
+    required: usize,
+) -> Result<usize, CgroupError> {
+    bounded_growth_target(current_capacity, required, MAX_CGROUPS).ok_or(CgroupError::CgroupLimit)
+}
+
+fn cgroup_task_growth_target(
+    current_capacity: usize,
+    required: usize,
+) -> Result<usize, CgroupError> {
+    bounded_growth_target(current_capacity, required, CGROUP_TASK_CAPACITY)
+        .ok_or(CgroupError::PidsLimitExceeded)
+}
+
+fn prepare_set_capacity_with_fallback<K: Ord>(
+    preferred: usize,
+    required: usize,
+) -> Result<PreparedAdmittedSetCapacity<K>, CgroupError> {
+    match PreparedAdmittedSetCapacity::try_new(HeapClass::Cgroup, preferred) {
+        Ok(prepared) => Ok(prepared),
+        Err(_) if preferred != required => {
+            PreparedAdmittedSetCapacity::try_new(HeapClass::Cgroup, required)
+                .map_err(|_| CgroupError::OutOfMemory)
+        }
+        Err(_) => Err(CgroupError::OutOfMemory),
+    }
+}
+
+fn prepare_map_capacity_with_fallback<K: Ord, V>(
+    preferred: usize,
+    required: usize,
+) -> Result<PreparedAdmittedMapCapacity<K, V>, CgroupError> {
+    match PreparedAdmittedMapCapacity::try_new(HeapClass::Cgroup, preferred) {
+        Ok(prepared) => Ok(prepared),
+        Err(_) if preferred != required => {
+            PreparedAdmittedMapCapacity::try_new(HeapClass::Cgroup, required)
+                .map_err(|_| CgroupError::OutOfMemory)
+        }
+        Err(_) => Err(CgroupError::OutOfMemory),
+    }
+}
+
+struct CgroupArcChain {
+    nodes: [Option<CgroupArc>; CGROUP_CHAIN_CAPACITY],
+    len: usize,
+}
+
+impl CgroupArcChain {
+    fn empty() -> Self {
+        Self {
+            nodes: core::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, node: CgroupArc) -> Result<(), CgroupError> {
+        if self.len == self.nodes.len() {
+            return Err(CgroupError::DepthLimit);
+        }
+        self.nodes[self.len] = Some(node);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn get(&self, index: usize) -> Option<&CgroupArc> {
+        self.nodes.get(index).and_then(Option::as_ref)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &CgroupArc> {
+        self.nodes[..self.len].iter().filter_map(Option::as_ref)
+    }
+
+    fn index_of(&self, candidate: &CgroupArc) -> Option<usize> {
+        self.iter().position(|node| Arc::ptr_eq(node, candidate))
+    }
+}
+
+fn collect_cgroup_ancestry(origin: &CgroupArc) -> Result<CgroupArcChain, CgroupError> {
+    let mut chain = CgroupArcChain::empty();
+    let mut cursor = Some(origin.clone());
+    for _ in 0..CGROUP_CHAIN_CAPACITY {
+        let Some(node) = cursor else {
+            return Ok(chain);
+        };
+        cursor = node.parent();
+        chain.push(node)?;
+    }
+    if cursor.is_some() {
+        Err(CgroupError::DepthLimit)
+    } else {
+        Ok(chain)
+    }
+}
+
+fn collect_controller_chain(
+    origin: &CgroupArc,
+    controller: CgroupControllers,
+) -> Result<CgroupArcChain, CgroupError> {
+    let ancestry = collect_cgroup_ancestry(origin)?;
+    let mut selected = CgroupArcChain::empty();
+    for node in ancestry.iter() {
+        if node.controllers.contains(controller) {
+            selected.push(node.clone())?;
+        }
+    }
+    Ok(selected)
+}
 
 /// M2-1 SLICE-2: process-wide MEMORY over-uncharge tripwire (in bytes).
 ///
@@ -127,8 +430,8 @@ pub enum FaultChargeError {
 /// so the page-table critical section never reaches a Level-5 lock. Dropping an
 /// armed receipt rolls back every unpublished byte without allocating.
 pub struct FaultMemoryCharge {
-    origin: Arc<CgroupNode>,
-    chain: [Option<Arc<CgroupNode>>; FAULT_CHARGE_CHAIN_CAPACITY],
+    origin: CgroupArc,
+    chain: [Option<CgroupArc>; FAULT_CHARGE_CHAIN_CAPACITY],
     limits: [(Option<u64>, Option<u64>); FAULT_CHARGE_CHAIN_CAPACITY],
     chain_len: usize,
     charged_bytes: u64,
@@ -155,7 +458,7 @@ impl FaultMemoryCharge {
             return Err(FaultChargeError::NotFound);
         }
 
-        let mut chain: [Option<Arc<CgroupNode>>; FAULT_CHARGE_CHAIN_CAPACITY] =
+        let mut chain: [Option<CgroupArc>; FAULT_CHARGE_CHAIN_CAPACITY] =
             core::array::from_fn(|_| None);
         let mut limits = [(None, None); FAULT_CHARGE_CHAIN_CAPACITY];
         let mut chain_len = 0usize;
@@ -787,6 +1090,21 @@ impl CgroupStats {
     }
 }
 
+fn try_increment_pids(stats: &CgroupStats, limit: Option<u64>) -> Result<(), ()> {
+    stats
+        .pids_current
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            let next = current.checked_add(1)?;
+            if limit.is_some_and(|maximum| next > maximum) {
+                None
+            } else {
+                Some(next)
+            }
+        })
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
 /// Point-in-time copy of `CgroupStats`.
 ///
 /// This is returned by `CgroupNode::get_stats()` for safe reading
@@ -1177,6 +1495,10 @@ pub enum CgroupError {
     DepthLimit,
     /// Creating cgroup would exceed MAX_CGROUPS.
     CgroupLimit,
+    /// Whole-heap admission or a fallible allocator request rejected metadata.
+    OutOfMemory,
+    /// An endpoint is pinned by another non-blocking migration transaction.
+    Busy,
     /// Requested cgroup ID does not exist.
     NotFound,
     /// Task is already attached to this cgroup.
@@ -1212,6 +1534,8 @@ impl fmt::Display for CgroupError {
             CgroupError::CgroupLimit => {
                 write!(f, "cgroup count exceeds MAX_CGROUPS ({})", MAX_CGROUPS)
             }
+            CgroupError::OutOfMemory => write!(f, "out of memory for cgroup metadata"),
+            CgroupError::Busy => write!(f, "cgroup transaction is busy; retry"),
             CgroupError::NotFound => write!(f, "cgroup not found"),
             CgroupError::TaskAlreadyAttached => write!(f, "task already attached to this cgroup"),
             CgroupError::TaskNotAttached => write!(f, "task not attached to this cgroup"),
@@ -1245,10 +1569,10 @@ pub struct CgroupNode {
     id: CgroupId,
 
     /// Weak reference to parent (None for root).
-    parent: Option<Weak<CgroupNode>>,
+    parent: Option<CgroupWeak>,
 
     /// IDs of direct children.
-    children: Mutex<BTreeSet<CgroupId>>,
+    children: Mutex<AdmittedSet<CgroupId>>,
 
     /// Depth in hierarchy (root = 0).
     depth: u32,
@@ -1263,7 +1587,12 @@ pub struct CgroupNode {
     stats: CgroupStats,
 
     /// Set of attached task IDs.
-    processes: Mutex<BTreeSet<TaskId>>,
+    processes: Mutex<AdmittedSet<TaskId>>,
+
+    /// Allocation-free pin for a two-cgroup migration transaction.
+    /// It excludes overlapping migrations and deletion; ordinary attach/detach
+    /// operations continue to serialize on the endpoint task-set mutexes.
+    membership_frozen: AtomicBool,
 
     /// Manual reference count for external tracking.
     ref_count: AtomicU32,
@@ -1298,21 +1627,37 @@ pub struct CgroupNode {
 
 impl CgroupNode {
     /// Creates the root cgroup node with all controllers enabled.
-    fn new_root() -> Self {
-        Self {
-            id: 0,
-            parent: None,
-            children: Mutex::new(BTreeSet::new()),
-            depth: 0,
-            controllers: CgroupControllers::all(),
-            limits: Mutex::new(CgroupLimits::default()),
-            stats: CgroupStats::new(),
-            processes: Mutex::new(BTreeSet::new()),
-            ref_count: AtomicU32::new(1),
-            deleted: AtomicBool::new(false),     // R77-1 FIX
-            delegate_uid: Mutex::new(None),      // P1-3
-            cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
-            io_throttle: IoThrottleState::new(), // F.2: IO throttle state
+    fn try_new_root() -> Result<CgroupArc, CgroupError> {
+        let bytes = arc_charge_bytes::<CgroupNode>().map_err(|_| CgroupError::OutOfMemory)?;
+        let reservation =
+            try_reserve_heap(HeapClass::Cgroup, bytes).map_err(|_| CgroupError::OutOfMemory)?;
+        let charge = reservation.commit().map_err(|_| CgroupError::OutOfMemory)?;
+        let allocator = CgroupArcAllocator::try_install(charge, false, false)
+            .map_err(|_| CgroupError::OutOfMemory)?;
+        match Arc::try_new_in(
+            Self {
+                id: 0,
+                parent: None,
+                children: Mutex::new(AdmittedSet::new(HeapClass::Cgroup)),
+                depth: 0,
+                controllers: CgroupControllers::all(),
+                limits: Mutex::new(CgroupLimits::default()),
+                stats: CgroupStats::new(),
+                processes: Mutex::new(AdmittedSet::new(HeapClass::Cgroup)),
+                membership_frozen: AtomicBool::new(false),
+                ref_count: AtomicU32::new(1),
+                deleted: AtomicBool::new(false),     // R77-1 FIX
+                delegate_uid: Mutex::new(None),      // P1-3
+                cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
+                io_throttle: IoThrottleState::new(), // F.2: IO throttle state
+            },
+            allocator,
+        ) {
+            Ok(root) => Ok(root),
+            Err(_) => {
+                allocator.cancel_failed_allocation();
+                Err(CgroupError::OutOfMemory)
+            }
         }
     }
 
@@ -1340,13 +1685,38 @@ impl CgroupNode {
     }
 
     /// Returns the parent cgroup, if any.
-    pub fn parent(&self) -> Option<Arc<CgroupNode>> {
+    pub fn parent(&self) -> Option<CgroupArc> {
         self.parent.as_ref().and_then(|w| w.upgrade())
     }
 
     /// Returns the IDs of direct children.
-    pub fn children(&self) -> Vec<CgroupId> {
-        self.children.lock().iter().copied().collect()
+    pub fn children(&self) -> Result<AdmittedVec<CgroupId>, CgroupError> {
+        let mut target = self.children.lock().len();
+        loop {
+            let mut snapshot = AdmittedVec::new(HeapClass::Cgroup);
+            if target != 0 {
+                let prepared = PreparedAdmittedVecCapacity::try_new(HeapClass::Cgroup, target)
+                    .map_err(|_| CgroupError::OutOfMemory)?;
+                snapshot
+                    .install_prepared(prepared)
+                    .map_err(|_| CgroupError::OutOfMemory)?;
+            }
+
+            let children = self.children.lock();
+            if snapshot.capacity() < children.len() {
+                target = children.len();
+                drop(children);
+                drop(snapshot);
+                continue;
+            }
+            for child in children.iter().copied() {
+                snapshot
+                    .push_reserved(child)
+                    .unwrap_or_else(|_| panic!("prepared cgroup child snapshot capacity vanished"));
+            }
+            drop(children);
+            return Ok(snapshot);
+        }
     }
 
     // ==================================================================
@@ -1595,9 +1965,17 @@ impl CgroupNode {
     /// * `DepthLimit` - Would exceed MAX_CGROUP_DEPTH
     /// * `CgroupLimit` - Would exceed MAX_CGROUPS
     pub fn new_child(
-        parent: &Arc<Self>,
+        parent: &CgroupArc,
         controllers: CgroupControllers,
-    ) -> Result<Arc<Self>, CgroupError> {
+    ) -> Result<CgroupArc, CgroupError> {
+        Self::new_child_with_fault(parent, controllers, CgroupCreateFault::default())
+    }
+
+    fn new_child_with_fault(
+        parent: &CgroupArc,
+        controllers: CgroupControllers,
+        fault: CgroupCreateFault,
+    ) -> Result<CgroupArc, CgroupError> {
         // Validate controllers are subset of parent's
         if controllers.is_empty() || !parent.controllers.contains(controllers) {
             return Err(CgroupError::ControllerDisabled);
@@ -1617,44 +1995,293 @@ impl CgroupNode {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| CgroupError::CgroupLimit)?;
 
-        // Check global count limit (with lock held to prevent TOCTOU)
-        {
-            let registry = CGROUP_REGISTRY.read();
-            if registry.len() >= MAX_CGROUPS {
-                return Err(CgroupError::CgroupLimit);
+        // Create the detached node under an Arc reservation. It is not visible
+        // until both registry and parent-membership backing are prepared.
+        let node_bytes = arc_charge_bytes::<CgroupNode>().map_err(|_| CgroupError::OutOfMemory)?;
+        let node_reservation = try_reserve_heap(HeapClass::Cgroup, node_bytes)
+            .map_err(|_| CgroupError::OutOfMemory)?;
+        let node_charge = node_reservation
+            .commit()
+            .map_err(|_| CgroupError::OutOfMemory)?;
+        let allocator = CgroupArcAllocator::try_install(
+            node_charge,
+            fault.fail_arc_allocation,
+            fault.check_deallocate_unlocked,
+        )
+        .map_err(|_| CgroupError::OutOfMemory)?;
+        let node = match Arc::try_new_in(
+            CgroupNode {
+                id,
+                parent: Some(Arc::downgrade(parent)),
+                children: Mutex::new(AdmittedSet::new(HeapClass::Cgroup)),
+                depth: next_depth,
+                controllers,
+                limits: Mutex::new(CgroupLimits::default()),
+                stats: CgroupStats::new(),
+                processes: Mutex::new(AdmittedSet::new(HeapClass::Cgroup)),
+                membership_frozen: AtomicBool::new(false),
+                ref_count: AtomicU32::new(1),
+                deleted: AtomicBool::new(false),     // R77-1 FIX
+                delegate_uid: Mutex::new(None),      // P1-3
+                cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
+                io_throttle: IoThrottleState::new(), // F.2: IO throttle state
+            },
+            allocator,
+        ) {
+            Ok(node) => node,
+            Err(_) => {
+                allocator.cancel_failed_allocation();
+                return Err(CgroupError::OutOfMemory);
             }
+        };
+
+        enum PublishOutcome {
+            Retry {
+                registry_target: Option<(usize, usize)>,
+                children_target: Option<(usize, usize)>,
+            },
+            Published {
+                retired_registry: Option<RetiredAdmittedMapCapacity<CgroupId, CgroupArc>>,
+                retired_children: Option<RetiredAdmittedSetCapacity<CgroupId>>,
+            },
+            Failed {
+                retired_registry: Option<RetiredAdmittedMapCapacity<CgroupId, CgroupArc>>,
+                retired_children: Option<RetiredAdmittedSetCapacity<CgroupId>>,
+                rejected_node: Option<CgroupArc>,
+            },
         }
 
-        // Create the new node
-        let node = Arc::new(CgroupNode {
-            id,
-            parent: Some(Arc::downgrade(parent)),
-            children: Mutex::new(BTreeSet::new()),
-            depth: next_depth,
-            controllers,
-            limits: Mutex::new(CgroupLimits::default()),
-            stats: CgroupStats::new(),
-            processes: Mutex::new(BTreeSet::new()),
-            ref_count: AtomicU32::new(1),
-            deleted: AtomicBool::new(false),     // R77-1 FIX
-            delegate_uid: Mutex::new(None),      // P1-3
-            cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
-            io_throttle: IoThrottleState::new(), // F.2: IO throttle state
-        });
+        // RF180-45: prepare both detached backings with no cgroup lock held,
+        // then revalidate and publish under canonical registry -> children
+        // order. Concurrent creators may stale either prepared capacity; the
+        // loop retries without mutating membership or dropping an owner under a
+        // lock. Publication itself is allocation-free.
+        let mut prepared_registry: Option<PreparedAdmittedMapCapacity<CgroupId, CgroupArc>> = None;
+        let mut prepared_children: Option<PreparedAdmittedSetCapacity<CgroupId>> = None;
+        let mut interleave_sibling = fault.interleave_sibling_once;
 
-        // Register in global registry (re-check count under write lock)
-        {
-            let mut registry = CGROUP_REGISTRY.write();
-            if registry.len() >= MAX_CGROUPS {
-                return Err(CgroupError::CgroupLimit);
+        loop {
+            let outcome = {
+                let mut registry = CGROUP_REGISTRY.write();
+                if registry.len() >= MAX_CGROUPS {
+                    return Err(CgroupError::CgroupLimit);
+                }
+                let registered_parent = registry
+                    .get(&parent.id)
+                    .filter(|candidate| Arc::ptr_eq(candidate, parent))
+                    .ok_or(CgroupError::NotFound)?;
+                if registered_parent.deleted.load(Ordering::Acquire) {
+                    return Err(CgroupError::NotFound);
+                }
+                let mut children = parent.children.lock();
+                if children.contains(&id) || registry.contains_key(&id) {
+                    return Err(CgroupError::CgroupLimit);
+                }
+
+                let registry_required = registry
+                    .len()
+                    .checked_add(1)
+                    .ok_or(CgroupError::CgroupLimit)?;
+                let children_required = children
+                    .len()
+                    .checked_add(1)
+                    .ok_or(CgroupError::CgroupLimit)?;
+                let registry_needs_backing = registry.capacity() < registry_required;
+                let children_need_backing = children.capacity() < children_required;
+                let registry_ready = !registry_needs_backing
+                    || prepared_registry
+                        .as_ref()
+                        .map(|prepared| prepared.capacity() >= registry_required)
+                        .unwrap_or(false);
+                let children_ready = !children_need_backing
+                    || prepared_children
+                        .as_ref()
+                        .map(|prepared| prepared.capacity() >= children_required)
+                        .unwrap_or(false);
+
+                if !registry_ready || !children_ready {
+                    PublishOutcome::Retry {
+                        registry_target: if !registry_ready {
+                            Some((
+                                cgroup_metadata_growth_target(
+                                    registry.capacity(),
+                                    registry_required,
+                                )?,
+                                registry_required,
+                            ))
+                        } else {
+                            None
+                        },
+                        children_target: if !children_ready {
+                            Some((
+                                cgroup_metadata_growth_target(
+                                    children.capacity(),
+                                    children_required,
+                                )?,
+                                children_required,
+                            ))
+                        } else {
+                            None
+                        },
+                    }
+                } else {
+                    let mut retired_registry = None;
+                    let mut retired_children = None;
+                    if registry_needs_backing {
+                        let prepared = prepared_registry
+                            .take()
+                            .expect("validated cgroup registry backing disappeared");
+                        retired_registry = Some(
+                            registry
+                                .install_prepared_deferred(prepared)
+                                .expect("validated cgroup registry backing rejected"),
+                        );
+                    }
+                    if children_need_backing {
+                        let prepared = prepared_children
+                            .take()
+                            .expect("validated cgroup children backing disappeared");
+                        retired_children = Some(
+                            children
+                                .install_prepared_deferred(prepared)
+                                .expect("validated cgroup children backing rejected"),
+                        );
+                    }
+
+                    children
+                        .insert_reserved(id)
+                        .unwrap_or_else(|_| panic!("prepared cgroup child slot vanished"));
+
+                    let mut rejected_node = None;
+                    let publication_failed = if fault.fail_after_children_insert {
+                        true
+                    } else {
+                        match registry.insert_unique_reserved(id, node.clone()) {
+                            Ok(()) => false,
+                            Err((_id, rejected)) => {
+                                rejected_node = Some(rejected);
+                                true
+                            }
+                        }
+                    };
+
+                    if publication_failed {
+                        assert!(
+                            children.remove_retaining_capacity(&id),
+                            "cgroup child rollback lost published id"
+                        );
+                        let retired_children = retired_children.map(|retired| {
+                            children
+                                .restore_retired_deferred(retired)
+                                .unwrap_or_else(|_| panic!("cgroup child backing rollback failed"))
+                        });
+                        let retired_registry = retired_registry.map(|retired| {
+                            registry
+                                .restore_retired_deferred(retired)
+                                .unwrap_or_else(|_| {
+                                    panic!("cgroup registry backing rollback failed")
+                                })
+                        });
+                        PublishOutcome::Failed {
+                            retired_registry,
+                            retired_children,
+                            rejected_node,
+                        }
+                    } else {
+                        PublishOutcome::Published {
+                            retired_registry,
+                            retired_children,
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                PublishOutcome::Retry {
+                    registry_target,
+                    children_target,
+                } => {
+                    if let Some((target, required)) = registry_target {
+                        drop(prepared_registry.take());
+                        if fault.check_prepare_unlocked {
+                            assert!(
+                                CGROUP_REGISTRY.try_write().is_some(),
+                                "RF180-45 registry backing prepared under registry lock"
+                            );
+                            assert!(
+                                parent.children.try_lock().is_some(),
+                                "RF180-45 registry backing prepared under children lock"
+                            );
+                        }
+                        if fault.fail_registry_prepare {
+                            return Err(CgroupError::OutOfMemory);
+                        }
+                        prepared_registry =
+                            Some(prepare_map_capacity_with_fallback(target, required)?);
+                    }
+                    if let Some((target, required)) = children_target {
+                        drop(prepared_children.take());
+                        if fault.check_prepare_unlocked {
+                            assert!(
+                                CGROUP_REGISTRY.try_write().is_some(),
+                                "RF180-45 child backing prepared under registry lock"
+                            );
+                            assert!(
+                                parent.children.try_lock().is_some(),
+                                "RF180-45 child backing prepared under children lock"
+                            );
+                        }
+                        if fault.fail_children_prepare {
+                            return Err(CgroupError::OutOfMemory);
+                        }
+                        prepared_children =
+                            Some(prepare_set_capacity_with_fallback(target, required)?);
+                    }
+
+                    if interleave_sibling {
+                        interleave_sibling = false;
+                        // Fill the just-observed child capacity completely.
+                        // The outer candidate is then provably stale and must
+                        // take the retry leg on its next revalidation.
+                        let sibling_count = prepared_children
+                            .as_ref()
+                            .map(|prepared| prepared.capacity())
+                            .unwrap_or(1)
+                            .max(1);
+                        for _ in 0..sibling_count {
+                            let sibling = Self::new_child_with_fault(
+                                parent,
+                                controllers,
+                                CgroupCreateFault::default(),
+                            )?;
+                            drop(sibling);
+                        }
+                    }
+                }
+                PublishOutcome::Published {
+                    retired_registry,
+                    retired_children,
+                } => {
+                    drop(prepared_registry.take());
+                    drop(prepared_children.take());
+                    drop(retired_registry);
+                    drop(retired_children);
+                    return Ok(node);
+                }
+                PublishOutcome::Failed {
+                    retired_registry,
+                    retired_children,
+                    rejected_node,
+                } => {
+                    drop(prepared_registry.take());
+                    drop(prepared_children.take());
+                    drop(retired_registry);
+                    drop(retired_children);
+                    drop(rejected_node);
+                    return Err(CgroupError::OutOfMemory);
+                }
             }
-            registry.insert(id, node.clone());
         }
-
-        // Add to parent's children list
-        parent.children.lock().insert(id);
-
-        Ok(node)
     }
 
     /// Attaches a task to this cgroup.
@@ -1672,131 +2299,152 @@ impl CgroupNode {
     /// Uses fetch_update CAS to atomically check-and-increment pids counters,
     /// preventing concurrent attach bypassing pids.max limits.
     pub fn attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
-        self.attach_task_impl(task, true)
+        self.attach_task_impl(task)
     }
 
-    /// Attaches a task to this cgroup, bypassing pids.max enforcement.
-    ///
-    /// R123-4 FIX: Used exclusively for rollback paths (e.g. `migrate_task`)
-    /// where a failed migration must re-attach the task to its source cgroup.
-    /// Without this, a concurrent attach filling pids.max between detach and
-    /// rollback would leave the task permanently unattached (INV-CG-03 violation).
-    fn force_attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
-        self.attach_task_impl(task, false)
-    }
-
-    fn attach_task_impl(&self, task: TaskId, enforce_pids_max: bool) -> Result<(), CgroupError> {
-        // R77-1 FIX: Block attaches once deletion has started.
-        // This prevents the race where a thread holds an old Arc<CgroupNode>
-        // and attempts to attach after delete_cgroup() has checked emptiness
-        // but before removing from registry.
-        if self.deleted.load(Ordering::Acquire) {
-            return Err(CgroupError::NotFound);
-        }
-
-        let mut procs = self.processes.lock();
-
-        // Check if already attached
-        if procs.contains(&task) {
-            return Err(CgroupError::TaskAlreadyAttached);
-        }
-
-        // R83-3 + R90-3 FIX: Hierarchical PIDs enforcement with atomic charging
-        //
-        // In cgroups v2, a cgroup's pids.max limit applies to the total number
-        // of processes in that cgroup *and all its descendants*. R90-3 fixes
-        // the race where concurrent attachers could all pass relaxed checks
-        // and then all increment, exceeding pids.max.
-        //
-        // Solution: Use fetch_update CAS to atomically check-and-increment.
-        // On any failure, rollback previously charged ancestors.
-        let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
-        // R169-L4 FIX: bound the ancestor collection by MAX_CGROUP_DEPTH (mirrors
-        // the other cgroup ancestor walks) so a corrupted/cyclic parent chain
-        // cannot spin forever. Depth-capped at create time, so legitimate chains fit.
-        let mut depth: u32 = 0;
-        let mut cursor = self.parent();
-        while let Some(p) = cursor {
-            ancestors.push(p.clone());
-            if depth >= MAX_CGROUP_DEPTH {
-                break;
+    fn attach_task_impl(&self, task: TaskId) -> Result<(), CgroupError> {
+        let mut prepared_membership: Option<PreparedAdmittedSetCapacity<TaskId>> = None;
+        loop {
+            // R77-1 FIX: Block attaches once deletion has started. Rechecked
+            // under the membership lock after every detached prepare.
+            if self.deleted.load(Ordering::Acquire) {
+                return Err(CgroupError::NotFound);
             }
-            depth = depth.saturating_add(1);
-            cursor = p.parent();
-        }
 
-        // Snapshot limits (only if PIDs controller enabled AND enforcement requested)
-        let self_limit = if enforce_pids_max && self.controllers.contains(CgroupControllers::PIDS) {
-            self.limits.lock().pids_max
-        } else {
-            None
-        };
-        let ancestor_limits: alloc::vec::Vec<Option<u64>> = ancestors
-            .iter()
-            .map(|a| {
-                if enforce_pids_max && a.controllers.contains(CgroupControllers::PIDS) {
-                    a.limits.lock().pids_max
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // R90-3 FIX: Atomic charge helper using CAS
-        // Returns Ok(()) if charge succeeded, Err(()) if limit would be exceeded
-        let charge = |stats: &CgroupStats, limit: Option<u64>| -> Result<(), ()> {
-            if let Some(limit) = limit {
-                stats
-                    .pids_current
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                        if cur >= limit {
-                            None // Reject: would exceed limit
-                        } else {
-                            Some(cur + 1)
-                        }
-                    })
-                    .map(|_| ())
-                    .map_err(|_| ())
-            } else {
-                // No limit set, always allow
-                stats.pids_current.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
-                Ok(())
+            let mut procs = self.processes.lock();
+            if self.deleted.load(Ordering::Acquire) {
+                return Err(CgroupError::NotFound);
             }
-        };
-
-        // Track which stats have been charged for rollback on failure
-        let mut charged: alloc::vec::Vec<&CgroupStats> = alloc::vec::Vec::new();
-
-        // Charge self first
-        if charge(&self.stats, self_limit).is_err() {
-            self.stats.record_pids_max_event();
-            return Err(CgroupError::PidsLimitExceeded);
-        }
-        charged.push(&self.stats);
-
-        // Charge all ancestors, rolling back on failure
-        for (ancestor, limit) in ancestors.iter().zip(ancestor_limits.iter()) {
-            if charge(&ancestor.stats, *limit).is_err() {
-                ancestor.stats.record_pids_max_event();
-                // R110-1 FIX: Rollback with saturating decrement to prevent
-                // underflow if a concurrent exit already decremented.
-                for stats in charged.into_iter() {
-                    let _ = stats.pids_current.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(1)),
-                    );
-                }
+            if procs.contains(&task) {
+                return Err(CgroupError::TaskAlreadyAttached);
+            }
+            let required = procs
+                .len()
+                .checked_add(1)
+                .ok_or(CgroupError::PidsLimitExceeded)?;
+            if required > CGROUP_TASK_CAPACITY {
+                self.stats.record_pids_max_event();
                 return Err(CgroupError::PidsLimitExceeded);
             }
-            charged.push(&ancestor.stats);
+            if procs.capacity() < required
+                && !prepared_membership
+                    .as_ref()
+                    .map(|prepared| prepared.capacity() >= required)
+                    .unwrap_or(false)
+            {
+                let target = cgroup_task_growth_target(procs.capacity(), required)?;
+                drop(procs);
+                drop(prepared_membership.take());
+                prepared_membership = Some(prepare_set_capacity_with_fallback(target, required)?);
+                continue;
+            }
+
+            // R83-3 + R90-3 FIX: hierarchical PIDs enforcement with atomic
+            // charging. The fixed ancestor storage and all limit snapshots are
+            // allocation-free while membership is serialized.
+            let mut ancestors: [Option<CgroupArc>; MAX_CGROUP_DEPTH as usize + 1] =
+                core::array::from_fn(|_| None);
+            let mut ancestor_count = 0usize;
+            let mut depth: u32 = 0;
+            let mut cursor = self.parent();
+            while let Some(parent) = cursor {
+                if ancestor_count == ancestors.len() {
+                    drop(procs);
+                    return Err(CgroupError::DepthLimit);
+                }
+                ancestors[ancestor_count] = Some(parent.clone());
+                ancestor_count += 1;
+                if depth >= MAX_CGROUP_DEPTH {
+                    break;
+                }
+                depth = depth.saturating_add(1);
+                cursor = parent.parent();
+            }
+
+            let self_limit = if self.controllers.contains(CgroupControllers::PIDS) {
+                self.limits.lock().pids_max
+            } else {
+                None
+            };
+            let mut ancestor_limits = [None; MAX_CGROUP_DEPTH as usize + 1];
+            for (index, ancestor) in ancestors[..ancestor_count].iter().enumerate() {
+                let Some(ancestor) = ancestor.as_ref() else {
+                    drop(procs);
+                    return Err(CgroupError::OutOfMemory);
+                };
+                ancestor_limits[index] = if ancestor.controllers.contains(CgroupControllers::PIDS) {
+                    ancestor.limits.lock().pids_max
+                } else {
+                    None
+                };
+            }
+
+            if try_increment_pids(&self.stats, self_limit).is_err() {
+                self.stats.record_pids_max_event();
+                drop(procs);
+                return Err(CgroupError::PidsLimitExceeded);
+            }
+
+            let mut charged_ancestors = 0usize;
+            for index in 0..ancestor_count {
+                let Some(ancestor) = ancestors[index].as_ref() else {
+                    self.stats.decrement_pids();
+                    for rollback in 0..charged_ancestors {
+                        if let Some(node) = ancestors[rollback].as_ref() {
+                            node.stats.decrement_pids();
+                        }
+                    }
+                    drop(procs);
+                    return Err(CgroupError::OutOfMemory);
+                };
+                if try_increment_pids(&ancestor.stats, ancestor_limits[index]).is_err() {
+                    ancestor.stats.record_pids_max_event();
+                    self.stats.decrement_pids();
+                    for rollback in 0..charged_ancestors {
+                        if let Some(node) = ancestors[rollback].as_ref() {
+                            node.stats.decrement_pids();
+                        }
+                    }
+                    drop(procs);
+                    return Err(CgroupError::PidsLimitExceeded);
+                }
+                charged_ancestors += 1;
+            }
+
+            let mut retired = None;
+            if procs.capacity() < required {
+                retired = Some(
+                    procs
+                        .install_prepared_deferred(
+                            prepared_membership
+                                .take()
+                                .expect("validated cgroup task backing disappeared"),
+                        )
+                        .expect("validated cgroup task backing rejected"),
+                );
+            }
+            if procs.insert_reserved(task).is_err() {
+                self.stats.decrement_pids();
+                for index in 0..charged_ancestors {
+                    if let Some(node) = ancestors[index].as_ref() {
+                        node.stats.decrement_pids();
+                    }
+                }
+                let retired = retired.map(|old| {
+                    procs
+                        .restore_retired_deferred(old)
+                        .unwrap_or_else(|_| panic!("cgroup task backing rollback failed"))
+                });
+                drop(procs);
+                drop(retired);
+                return Err(CgroupError::OutOfMemory);
+            }
+
+            drop(procs);
+            drop(retired);
+            drop(prepared_membership.take());
+            return Ok(());
         }
-
-        // All charges succeeded, commit membership
-        procs.insert(task);
-        // Counters already incremented during charging, no additional increment needed
-
-        Ok(())
     }
 
     /// Detaches a task from this cgroup.
@@ -1805,15 +2453,25 @@ impl CgroupNode {
     ///
     /// * `TaskNotAttached` - Task is not in this cgroup
     pub fn detach_task(&self, task: TaskId) -> Result<(), CgroupError> {
+        self.detach_task_impl(task)
+    }
+
+    fn detach_task_impl(&self, task: TaskId) -> Result<(), CgroupError> {
         // R83-3 FIX: Collect ancestors before detaching for hierarchical count update
-        let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
+        let mut ancestors: [Option<CgroupArc>; MAX_CGROUP_DEPTH as usize + 1] =
+            core::array::from_fn(|_| None);
+        let mut ancestor_count = 0usize;
         // R169-L4 FIX: bound the ancestor collection by MAX_CGROUP_DEPTH (mirrors
         // the other cgroup ancestor walks) so a corrupted/cyclic parent chain
         // cannot spin forever. Depth-capped at create time, so legitimate chains fit.
         let mut depth: u32 = 0;
         let mut cursor = self.parent();
         while let Some(p) = cursor {
-            ancestors.push(p.clone());
+            if ancestor_count == ancestors.len() {
+                return Err(CgroupError::DepthLimit);
+            }
+            ancestors[ancestor_count] = Some(p.clone());
+            ancestor_count += 1;
             if depth >= MAX_CGROUP_DEPTH {
                 break;
             }
@@ -1823,17 +2481,20 @@ impl CgroupNode {
 
         let mut procs = self.processes.lock();
 
-        if !procs.remove(&task) {
+        if !procs.remove_retaining_capacity(&task) {
             return Err(CgroupError::TaskNotAttached);
         }
+        let retired = procs.take_empty_capacity();
 
         self.stats.decrement_pids();
 
         // R83-3 FIX: Decrement ancestor counts for hierarchical tracking
-        for ancestor in ancestors {
+        for ancestor in ancestors[..ancestor_count].iter().flatten() {
             ancestor.stats.decrement_pids();
         }
 
+        drop(procs);
+        drop(retired);
         Ok(())
     }
 
@@ -1984,13 +2645,30 @@ impl CgroupNode {
 // ============================================================================
 
 /// Global registry of all cgroups, keyed by CgroupId.
-pub static CGROUP_REGISTRY: Lazy<RwLock<BTreeMap<CgroupId, Arc<CgroupNode>>>> =
-    Lazy::new(|| RwLock::new(BTreeMap::new()));
+pub static CGROUP_REGISTRY: Lazy<RwLock<AdmittedMap<CgroupId, CgroupArc>>> =
+    Lazy::new(|| RwLock::new(AdmittedMap::new(HeapClass::Cgroup)));
 
 /// The root cgroup (id=0, all controllers enabled).
-pub static ROOT_CGROUP: Lazy<Arc<CgroupNode>> = Lazy::new(|| {
-    let root = Arc::new(CgroupNode::new_root());
-    CGROUP_REGISTRY.write().insert(root.id, root.clone());
+pub static ROOT_CGROUP: Lazy<CgroupArc> = Lazy::new(|| {
+    let root = CgroupNode::try_new_root().expect("root cgroup heap admission failed");
+    let prepared = PreparedAdmittedMapCapacity::try_new(HeapClass::Cgroup, 1)
+        .expect("root cgroup registry admission failed");
+    let (retired, rejected) = {
+        let mut registry = CGROUP_REGISTRY.write();
+        let retired = registry
+            .install_prepared_deferred(prepared)
+            .expect("prepared root cgroup registry backing rejected");
+        let rejected = registry
+            .insert_unique_reserved(root.id, root.clone())
+            .err()
+            .map(|(_id, root)| root);
+        (retired, rejected)
+    };
+    drop(retired);
+    if let Some(rejected) = rejected {
+        drop(rejected);
+        panic!("duplicate root cgroup publication");
+    }
     root
 });
 
@@ -1999,6 +2677,57 @@ static NEXT_CGROUP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Global cgroup count for quota enforcement.
 static CGROUP_COUNT: AtomicU32 = AtomicU32::new(1); // Root counts as 1
+
+/// Exclusive, allocation-free pin for one membership migration.
+///
+/// Construction runs under `CGROUP_REGISTRY.read()`, so deletion cannot pass
+/// between identity validation and publication of the freeze. Once armed, the
+/// registry guard is released; delete and overlapping migrations fail closed,
+/// while endpoint attach/detach serialize normally on their task-set locks.
+struct CgroupMembershipFreeze {
+    first: CgroupArc,
+    second: Option<CgroupArc>,
+}
+
+impl CgroupMembershipFreeze {
+    fn try_new(from: &CgroupArc, to: &CgroupArc) -> Option<Self> {
+        let same = Arc::ptr_eq(from, to);
+        let (first, second) = if same || from.id() <= to.id() {
+            (from, (!same).then_some(to))
+        } else {
+            (to, Some(from))
+        };
+
+        first
+            .membership_frozen
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if let Some(second) = second {
+            if second
+                .membership_frozen
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                first.membership_frozen.store(false, Ordering::Release);
+                return None;
+            }
+        }
+
+        Some(Self {
+            first: first.clone(),
+            second: second.cloned(),
+        })
+    }
+}
+
+impl Drop for CgroupMembershipFreeze {
+    fn drop(&mut self) {
+        if let Some(second) = self.second.as_ref() {
+            second.membership_frozen.store(false, Ordering::Release);
+        }
+        self.first.membership_frozen.store(false, Ordering::Release);
+    }
+}
 
 // ============================================================================
 // Public API
@@ -2017,11 +2746,88 @@ pub fn init() {
 /// Looks up a cgroup by its ID.
 ///
 /// Returns `None` if the cgroup doesn't exist.
-pub fn lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
+pub fn lookup_cgroup(id: CgroupId) -> Option<CgroupArc> {
     if id == 0 {
         return Some(ROOT_CGROUP.clone());
     }
     CGROUP_REGISTRY.read().get(&id).cloned()
+}
+
+/// R180-3: true if `target_id` is `ancestor_id` or a descendant of it.
+///
+/// Shared by both migration front doors (syscall 502 and cgroupfs `cgroup.procs`).
+pub fn cgroup_is_descendant_of(target_id: CgroupId, ancestor_id: CgroupId) -> bool {
+    if target_id == ancestor_id {
+        return true;
+    }
+    let target = match lookup_cgroup(target_id) {
+        Some(cg) => cg,
+        None => return false,
+    };
+    let mut depth: u32 = 0;
+    let mut cursor = target.parent();
+    while let Some(parent) = cursor {
+        if parent.id() == ancestor_id {
+            return true;
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = parent.parent();
+    }
+    false
+}
+
+/// R180-3 CLASS FIX: authorize a task migration from `from_id` → `to_id`.
+///
+/// Single policy for both front doors (`sys_cgroup_attach` and cgroupfs
+/// `cgroup.procs`). Identity is host-mapped (R134-2).
+///
+/// Rules (Safety > Efficiency):
+/// 1. host root → Allow
+/// 2. CAP_SYS_ADMIN (non-root): dest must be descendant-or-self of source (R93-5)
+/// 3. delegated manager: **both** endpoints must be `is_delegated_to(euid)`
+/// 4. else → PermissionDenied
+///
+/// Callers must re-invoke under the Process lock with the locked `from_id`
+/// immediately before `migrate_task` (TOCTOU class).
+pub fn authorize_cgroup_migrate(
+    from_id: CgroupId,
+    to_id: CgroupId,
+    host_euid: Option<u32>,
+    is_host_root: bool,
+    has_cap_sys_admin: bool,
+) -> Result<(), CgroupError> {
+    if is_host_root {
+        // Host root may re-home anywhere; still require nodes to exist so we
+        // do not paper over NotFound with a later migrate_task error.
+        let _ = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
+        let _ = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
+        return Ok(());
+    }
+
+    let from = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
+    let to = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
+
+    if has_cap_sys_admin {
+        if cgroup_is_descendant_of(to_id, from_id) {
+            return Ok(());
+        }
+        // RF180-2 FIX: capabilities and delegation are independent grants.
+        // A caller that happens to hold CAP_SYS_ADMIN must not lose a valid
+        // delegated source+destination authorization merely because the CAP
+        // descendant rule does not apply.
+    }
+
+    let euid = host_euid.ok_or(CgroupError::PermissionDenied)?;
+    // R180-3: BOTH endpoints must lie in the caller's delegated forest.
+    // Destination-only checks allowed pulling a task from outside the forest
+    // into a looser delegated sibling (isolation escape).
+    if to.is_delegated_to(euid) && from.is_delegated_to(euid) {
+        return Ok(());
+    }
+    Err(CgroupError::PermissionDenied)
 }
 
 /// R169-2 FIX (D1-CGROUP-IRQ-L5): Non-blocking sibling of `lookup_cgroup` for
@@ -2040,7 +2846,7 @@ pub fn lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
 /// registry read flows through. Mirrors the existing `cgroup.limits.try_lock()`
 /// IRQ-safety pattern (2589). Root (id 0) short-circuits to `ROOT_CGROUP` and
 /// never touches the registry, so it always resolves even in IRQ context.
-pub fn try_lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
+pub fn try_lookup_cgroup(id: CgroupId) -> Option<CgroupArc> {
     if id == 0 {
         return Some(ROOT_CGROUP.clone());
     }
@@ -2053,7 +2859,7 @@ pub fn try_lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
 pub fn create_cgroup(
     parent_id: CgroupId,
     controllers: CgroupControllers,
-) -> Result<Arc<CgroupNode>, CgroupError> {
+) -> Result<CgroupArc, CgroupError> {
     let parent = lookup_cgroup(parent_id).ok_or(CgroupError::NotFound)?;
     CgroupNode::new_child(&parent, controllers)
 }
@@ -2143,6 +2949,16 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
 
     let node = registry.get(&id).cloned().ok_or(CgroupError::NotFound)?;
 
+    // RF180-45: migration publishes this allocation-free freeze while holding
+    // a registry reader, then releases the registry before any detached heap
+    // preparation. A writer that arrives afterward must fail closed until the
+    // membership transaction commits or rolls back.
+    if node.membership_frozen.load(Ordering::Acquire) {
+        drop(registry);
+        drop(node);
+        return Err(CgroupError::NotEmpty);
+    }
+
     // R77-1 FIX: Mark as deleting BEFORE checking emptiness to block any racing
     // attach_task() callers who hold old Arc<CgroupNode> references.
     // The deleted flag uses Acquire/Release ordering to ensure proper visibility.
@@ -2155,11 +2971,15 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     if !node.children.lock().is_empty() {
         // Rollback deleted flag since deletion failed
         node.deleted.store(false, Ordering::Release);
+        drop(registry);
+        drop(node);
         return Err(CgroupError::NotEmpty);
     }
     if !node.processes.lock().is_empty() {
         // Rollback deleted flag since deletion failed
         node.deleted.store(false, Ordering::Release);
+        drop(registry);
+        drop(node);
         return Err(CgroupError::NotEmpty);
     }
 
@@ -2249,28 +3069,257 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     let live_mem = node.stats.mem_pinned.load(Ordering::Acquire);
     if live_ports != 0 || live_fds != 0 || live_mem != 0 {
         node.deleted.store(false, Ordering::Release);
+        drop(registry);
+        drop(node);
         return Err(CgroupError::NotEmpty);
     }
 
-    // Remove from parent's children (safe - parent lookup also blocked)
-    if let Some(parent) = node.parent() {
-        parent.children.lock().remove(&id);
+    // RF180-45: validate and remove under canonical registry -> children order,
+    // but retain both backings until the transaction commits. Every obsolete
+    // backing and every removed CgroupArc owner is destroyed after both locks.
+    let Some(parent) = node.parent() else {
+        node.deleted.store(false, Ordering::Release);
+        drop(registry);
+        drop(node);
+        return Err(CgroupError::NotFound);
+    };
+    let mut children = parent.children.lock();
+    if !children.contains(&id) {
+        node.deleted.store(false, Ordering::Release);
+        drop(children);
+        drop(registry);
+        drop(parent);
+        drop(node);
+        return Err(CgroupError::NotFound);
     }
-
-    // Remove from registry atomically
-    registry.remove(&id);
-
+    assert!(
+        children.remove_retaining_capacity(&id),
+        "validated cgroup child disappeared during deletion"
+    );
+    let removed = match registry.remove_retaining_capacity(&id) {
+        Some(removed) => removed,
+        None => {
+            children
+                .insert_reserved(id)
+                .unwrap_or_else(|_| panic!("cgroup deletion rollback slot vanished"));
+            node.deleted.store(false, Ordering::Release);
+            drop(children);
+            drop(registry);
+            drop(parent);
+            drop(node);
+            return Err(CgroupError::NotFound);
+        }
+    };
+    let retired_children = children.take_empty_capacity();
+    let retired_registry = registry.take_empty_capacity();
+    drop(children);
+    drop(registry);
+    drop(retired_children);
+    drop(retired_registry);
+    drop(removed);
+    drop(parent);
+    drop(node);
     Ok(())
 }
 
 /// Returns the root cgroup.
-pub fn root_cgroup() -> Arc<CgroupNode> {
+pub fn root_cgroup() -> CgroupArc {
     ROOT_CGROUP.clone()
 }
 
 /// Returns the total number of cgroups.
 pub fn cgroup_count() -> usize {
     CGROUP_REGISTRY.read().len()
+}
+
+struct CgroupMigrationProbe<'a> {
+    sibling: &'a CgroupArc,
+    task: TaskId,
+}
+
+enum LockedMigrationOutcome {
+    Retry {
+        preferred: usize,
+        required: usize,
+    },
+    Complete {
+        retired_target: Option<RetiredAdmittedSetCapacity<TaskId>>,
+        retired_source: Option<RetiredAdmittedSetCapacity<TaskId>>,
+    },
+    Failed {
+        error: CgroupError,
+        retired_target: Option<RetiredAdmittedSetCapacity<TaskId>>,
+    },
+}
+
+fn migration_exclusive_lengths(
+    source: &CgroupArcChain,
+    target: &CgroupArcChain,
+) -> Result<(usize, usize), CgroupError> {
+    for target_index in 0..target.len {
+        let Some(target_node) = target.get(target_index) else {
+            return Err(CgroupError::DepthLimit);
+        };
+        if let Some(source_index) = source.index_of(target_node) {
+            return Ok((source_index, target_index));
+        }
+    }
+    Err(CgroupError::DepthLimit)
+}
+
+fn rollback_migration_target_reservations(chain: &CgroupArcChain, charged_len: usize) {
+    for index in 0..charged_len {
+        if let Some(node) = chain.get(index) {
+            node.stats.decrement_pids();
+        }
+    }
+}
+
+fn migrate_task_locked(
+    task: TaskId,
+    from_procs: &mut AdmittedSet<TaskId>,
+    to_procs: &mut AdmittedSet<TaskId>,
+    source_chain: &CgroupArcChain,
+    target_chain: &CgroupArcChain,
+    source_exclusive_len: usize,
+    target_exclusive_len: usize,
+    prepared_target: &mut Option<PreparedAdmittedSetCapacity<TaskId>>,
+    probe: Option<&CgroupMigrationProbe<'_>>,
+) -> LockedMigrationOutcome {
+    if !from_procs.contains(&task) {
+        return LockedMigrationOutcome::Failed {
+            error: CgroupError::TaskNotAttached,
+            retired_target: None,
+        };
+    }
+    if to_procs.contains(&task) {
+        return LockedMigrationOutcome::Failed {
+            error: CgroupError::TaskAlreadyAttached,
+            retired_target: None,
+        };
+    }
+
+    let required = match to_procs.len().checked_add(1) {
+        Some(required) if required <= CGROUP_TASK_CAPACITY => required,
+        _ => {
+            return LockedMigrationOutcome::Failed {
+                error: CgroupError::PidsLimitExceeded,
+                retired_target: None,
+            }
+        }
+    };
+    if to_procs.capacity() < required
+        && !prepared_target
+            .as_ref()
+            .map(|prepared| prepared.capacity() >= required)
+            .unwrap_or(false)
+    {
+        let preferred = match cgroup_task_growth_target(to_procs.capacity(), required) {
+            Ok(preferred) => preferred,
+            Err(error) => {
+                return LockedMigrationOutcome::Failed {
+                    error,
+                    retired_target: None,
+                }
+            }
+        };
+        return LockedMigrationOutcome::Retry {
+            preferred,
+            required,
+        };
+    }
+
+    let mut reserved_target = 0usize;
+    for index in 0..target_exclusive_len {
+        let Some(node) = target_chain.get(index) else {
+            rollback_migration_target_reservations(target_chain, reserved_target);
+            return LockedMigrationOutcome::Failed {
+                error: CgroupError::DepthLimit,
+                retired_target: None,
+            };
+        };
+        let limit = if node.controllers.contains(CgroupControllers::PIDS) {
+            node.limits.lock().pids_max
+        } else {
+            None
+        };
+        if try_increment_pids(&node.stats, limit).is_err() {
+            node.stats.record_pids_max_event();
+            rollback_migration_target_reservations(target_chain, reserved_target);
+            return LockedMigrationOutcome::Failed {
+                error: CgroupError::PidsLimitExceeded,
+                retired_target: None,
+            };
+        }
+        reserved_target += 1;
+    }
+
+    if let Some(probe) = probe {
+        let has_spare_capacity = {
+            let sibling = probe.sibling.processes.lock();
+            sibling.capacity() > sibling.len()
+        };
+        assert!(
+            has_spare_capacity,
+            "RF180-45 sibling migration probe must be allocation-free"
+        );
+        assert_eq!(
+            probe.sibling.attach_task(probe.task),
+            Err(CgroupError::PidsLimitExceeded),
+            "RF180-45 common ancestor must expose no transient migration credit"
+        );
+    }
+
+    let mut retired_target = None;
+    if to_procs.capacity() < required {
+        retired_target = Some(
+            to_procs
+                .install_prepared_deferred(
+                    prepared_target
+                        .take()
+                        .expect("validated migration target backing disappeared"),
+                )
+                .expect("validated migration target backing rejected"),
+        );
+    }
+
+    assert!(
+        from_procs.remove_retaining_capacity(&task),
+        "validated migration source task disappeared"
+    );
+    match to_procs.insert_reserved(task) {
+        Ok(true) => {}
+        Ok(false) => panic!("validated migration target task appeared during commit"),
+        Err(rejected_task) => {
+            assert!(
+                from_procs
+                    .insert_reserved(rejected_task)
+                    .unwrap_or_else(|_| panic!("migration source rollback slot vanished")),
+                "migration source rollback found an unexpected duplicate"
+            );
+            rollback_migration_target_reservations(target_chain, reserved_target);
+            let retired_target = retired_target.map(|retired| {
+                to_procs
+                    .restore_retired_deferred(retired)
+                    .unwrap_or_else(|_| panic!("migration target backing rollback failed"))
+            });
+            return LockedMigrationOutcome::Failed {
+                error: CgroupError::OutOfMemory,
+                retired_target,
+            };
+        }
+    }
+
+    for index in 0..source_exclusive_len {
+        if let Some(node) = source_chain.get(index) {
+            node.stats.decrement_pids();
+        }
+    }
+    let retired_source = from_procs.take_empty_capacity();
+    LockedMigrationOutcome::Complete {
+        retired_target,
+        retired_source,
+    }
 }
 
 /// Migrates a task from one cgroup to another.
@@ -2280,15 +3329,17 @@ pub fn cgroup_count() -> usize {
 ///
 /// # R90-4 FIX: Migration/Deletion Race
 ///
-/// Holds `CGROUP_REGISTRY` read lock throughout the migration to prevent
-/// concurrent `delete_cgroup()` from removing source or target cgroups
-/// between detach and attach, which could leave the task orphaned.
+/// Validates both identities and publishes an allocation-free membership
+/// freeze under `CGROUP_REGISTRY.read()`. Deletion then fails closed while the
+/// registry is released for detached capacity preparation and publication.
 ///
 /// # Errors
 ///
 /// * `NotFound` - Source or target cgroup doesn't exist
 /// * `TaskNotAttached` - Task is not in source cgroup
+/// * `TaskAlreadyAttached` - Task is already present in the target cgroup
 /// * `PidsLimitExceeded` - Target cgroup's pids.max exceeded
+/// * `Busy` - Another migration involving either endpoint is active
 ///
 /// # Caller obligations (R169-L12)
 ///
@@ -2305,41 +3356,147 @@ pub fn cgroup_count() -> usize {
 /// whether that SHOULD change is the open D2-J2-CHARGE-LIFETIME / R169-7 question,
 /// not a caller obligation of this function.
 ///
-/// Lock discipline: `migrate_task` holds the **non-reentrant** `CGROUP_REGISTRY`
-/// read lock for the whole window (R90-4). Callers MUST therefore run any
+/// Historical R90-4 lock discipline held the **non-reentrant** registry reader
+/// for the whole window. Callers therefore had to run any
 /// charge/uncharge primitive (each does `lookup_cgroup` → a registry read) AFTER
-/// `migrate_task` returns, never inside a callback under this guard. Callers MUST
+/// `migrate_task` returns. RF180-45 removes that hidden lock from preparation.
+/// Callers MUST
 /// NOT fold `address_space_share_count()` (which takes PROCESS_TABLE then foreign
 /// Process locks) into a "hold the target Process lock across `migrate_task`"
 /// obligation — that is the R156-1 child→parent ABBA / self-deadlock footgun.
+///
+/// RF180-45: any required target backing is prepared with endpoint freezes
+/// released, then publication revalidates and pins both endpoints. It locks both task sets in
+/// cgroup-id order, reserves only target-exclusive hierarchical PID deltas,
+/// leaves every common ancestor unchanged, commits membership allocation-free,
+/// and only then releases source-exclusive accounting. Freeze contention returns
+/// [`CgroupError::Busy`] immediately; no caller spins.
 pub fn migrate_task(task: TaskId, from_id: CgroupId, to_id: CgroupId) -> Result<(), CgroupError> {
-    // R90-4 FIX: Hold registry read lock to block concurrent delete_cgroup.
-    // delete_cgroup requires a write lock, so this prevents both source
-    // and target from being deleted during the migration window.
-    let _reg_guard = CGROUP_REGISTRY.read();
+    migrate_task_impl(task, from_id, to_id, None)
+}
 
-    let from = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
-    let to = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
-
-    // Detach from source
-    from.detach_task(task)?;
-
-    // Attach to target (rollback on failure)
-    if let Err(e) = to.attach_task(task) {
-        // R123-4 FIX: Rollback must not fail due to pids.max. force_attach_task()
-        // bypasses pids.max enforcement so a failed migration never orphans the
-        // task (INV-CG-03). The pids counter may temporarily exceed pids.max, but
-        // this is bounded and self-correcting (next task exit decrements it).
-        if let Err(rollback_err) = from.force_attach_task(task) {
-            klog_always!(
-                "SECURITY: cgroup migrate rollback failed for task {}: source={} target={} err={:?}",
-                task, from_id, to_id, rollback_err
-            );
+fn migrate_task_impl(
+    task: TaskId,
+    from_id: CgroupId,
+    to_id: CgroupId,
+    probe: Option<&CgroupMigrationProbe<'_>>,
+) -> Result<(), CgroupError> {
+    let _ = ROOT_CGROUP.id();
+    let registry = CGROUP_REGISTRY.read();
+    let from = match registry.get(&from_id).cloned() {
+        Some(from) => from,
+        None => return Err(CgroupError::NotFound),
+    };
+    let to = match registry.get(&to_id).cloned() {
+        Some(to) => to,
+        None => {
+            drop(registry);
+            drop(from);
+            return Err(CgroupError::NotFound);
         }
-        return Err(e);
+    };
+    if from.deleted.load(Ordering::Acquire) || to.deleted.load(Ordering::Acquire) {
+        drop(registry);
+        drop(to);
+        drop(from);
+        return Err(CgroupError::NotFound);
     }
+    if Arc::ptr_eq(&from, &to) {
+        let attached = from.processes.lock().contains(&task);
+        drop(registry);
+        return if attached {
+            Ok(())
+        } else {
+            Err(CgroupError::TaskNotAttached)
+        };
+    }
+    drop(registry);
 
-    Ok(())
+    let mut prepared_target: Option<PreparedAdmittedSetCapacity<TaskId>> = None;
+    loop {
+        let registry = CGROUP_REGISTRY.read();
+        let registered_from = registry
+            .get(&from_id)
+            .filter(|candidate| Arc::ptr_eq(candidate, &from))
+            .ok_or(CgroupError::NotFound)?;
+        let registered_to = registry
+            .get(&to_id)
+            .filter(|candidate| Arc::ptr_eq(candidate, &to))
+            .ok_or(CgroupError::NotFound)?;
+        if registered_from.deleted.load(Ordering::Acquire)
+            || registered_to.deleted.load(Ordering::Acquire)
+        {
+            return Err(CgroupError::NotFound);
+        }
+        let freeze = CgroupMembershipFreeze::try_new(&from, &to).ok_or(CgroupError::Busy)?;
+        drop(registry);
+
+        let source_chain = collect_cgroup_ancestry(&from)?;
+        let target_chain = collect_cgroup_ancestry(&to)?;
+        let (source_exclusive_len, target_exclusive_len) =
+            migration_exclusive_lengths(&source_chain, &target_chain)?;
+
+        let outcome = if from.id() < to.id() {
+            let mut from_procs = from.processes.lock();
+            let mut to_procs = to.processes.lock();
+            migrate_task_locked(
+                task,
+                &mut from_procs,
+                &mut to_procs,
+                &source_chain,
+                &target_chain,
+                source_exclusive_len,
+                target_exclusive_len,
+                &mut prepared_target,
+                probe,
+            )
+        } else {
+            let mut to_procs = to.processes.lock();
+            let mut from_procs = from.processes.lock();
+            migrate_task_locked(
+                task,
+                &mut from_procs,
+                &mut to_procs,
+                &source_chain,
+                &target_chain,
+                source_exclusive_len,
+                target_exclusive_len,
+                &mut prepared_target,
+                probe,
+            )
+        };
+
+        drop(source_chain);
+        drop(target_chain);
+        drop(freeze);
+
+        match outcome {
+            LockedMigrationOutcome::Retry {
+                preferred,
+                required,
+            } => {
+                drop(prepared_target.take());
+                prepared_target = Some(prepare_set_capacity_with_fallback(preferred, required)?);
+            }
+            LockedMigrationOutcome::Complete {
+                retired_target,
+                retired_source,
+            } => {
+                drop(prepared_target.take());
+                drop(retired_target);
+                drop(retired_source);
+                return Ok(());
+            }
+            LockedMigrationOutcome::Failed {
+                error,
+                retired_target,
+            } => {
+                drop(prepared_target.take());
+                drop(retired_target);
+                return Err(error);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -2524,7 +3681,7 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
     // registry read guard through the origin pin: otherwise delete_cgroup can
     // take the writer lock after lookup returns but before the pin, sample zero,
     // remove the node, and strand an unaccounted charge on a detached Arc.
-    let origin: Arc<CgroupNode> = if cgroup_id == 0 {
+    let origin: CgroupArc = if cgroup_id == 0 {
         let root = ROOT_CGROUP.clone();
         root.stats
             .pin_origin(&root.stats.mem_pinned, allocation_bytes);
@@ -2549,7 +3706,7 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
     // infallibly. The hierarchy depth is hard-bounded; keep the chain and
     // rollback ledger in fixed storage instead of three heap Vecs.
     const CHAIN_CAPACITY: usize = MAX_CGROUP_DEPTH as usize + 1;
-    let mut chain: [Option<Arc<CgroupNode>>; CHAIN_CAPACITY] = core::array::from_fn(|_| None);
+    let mut chain: [Option<CgroupArc>; CHAIN_CAPACITY] = core::array::from_fn(|_| None);
     let mut chain_len = 0usize;
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
@@ -2824,33 +3981,40 @@ pub fn migrate_memory_charges(
 /// * `FdsLimitExceeded` - charging `count` would exceed `files.max` at this
 ///   cgroup or any ancestor. Nothing is charged: every partial charge is rolled
 ///   back before returning (fail-closed).
+/// * `NotFound` / `DepthLimit` - the origin or its bounded ancestry is invalid.
 pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError> {
     if count == 0 || cgroup_id == 0 {
         return Ok(());
     }
 
-    // Collect the chain: target cgroup + ancestors with the FILES controller.
-    let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
-    // R170-2 FIX: pin at the ORIGIN node first, controller-independent —
-    // twin of try_charge_ports' pin (see CgroupStats::fds_pinned).
-    let origin: Option<Arc<CgroupNode>> = cursor.clone();
-    if let Some(o) = &origin {
-        o.stats.pin_origin(&o.stats.fds_pinned, count);
-    }
-    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
-    while let Some(cgroup) = cursor {
-        if cgroup.controllers.contains(CgroupControllers::FILES) {
-            chain.push(cgroup.clone());
+    // RF180-45 REVIEW FIX: publish the origin pin while the registry read lock
+    // still prevents deletion. A lookup followed by a later pin lets delete_cgroup observe
+    // zero, remove the node, and strand ancestor charges keyed to its ID.
+    let origin = {
+        let registry = CGROUP_REGISTRY.read();
+        let node = registry
+            .get(&cgroup_id)
+            .cloned()
+            .ok_or(CgroupError::NotFound)?;
+        if node.deleted.load(Ordering::Acquire) {
+            return Err(CgroupError::NotFound);
         }
-        if depth >= MAX_CGROUP_DEPTH {
-            break;
+        // R170-2 FIX: pin at the ORIGIN node first, controller-independent —
+        // twin of try_charge_ports' pin (see CgroupStats::fds_pinned).
+        node.stats.pin_origin(&node.stats.fds_pinned, count);
+        node
+    };
+    // Collect the chain after publication; the pin now keeps the origin
+    // registry-resident. Roll it back if the bounded ancestry is invalid.
+    let chain = match collect_controller_chain(&origin, CgroupControllers::FILES) {
+        Ok(chain) => chain,
+        Err(error) => {
+            origin.stats.unpin_origin(&origin.stats.fds_pinned, count);
+            return Err(error);
         }
-        depth = depth.saturating_add(1);
-        cursor = cgroup.parent();
-    }
+    };
 
-    if chain.is_empty() {
+    if chain.len == 0 {
         // No FILES controller anywhere: the PIN stays (the per-process FD
         // tallies key their exit/migrate uncharge to this id, which unpins
         // symmetrically) — keeps the delete-gate sound for a controller-less
@@ -2859,12 +4023,28 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
     }
 
     // Snapshot per-node limits (lock each briefly; never hold two at once).
-    let limits_snapshot: Vec<Option<u64>> = chain.iter().map(|c| c.limits.lock().fds_max).collect();
+    let mut limits_snapshot = [None; CGROUP_CHAIN_CAPACITY];
+    for index in 0..chain.len {
+        let Some(node) = chain.get(index) else {
+            origin.stats.unpin_origin(&origin.stats.fds_pinned, count);
+            return Err(CgroupError::DepthLimit);
+        };
+        limits_snapshot[index] = node.limits.lock().fds_max;
+    }
 
-    // Track charged indices for rollback on rejection at a deeper level.
-    let mut charged: Vec<usize> = Vec::new();
-    for (idx, cgroup) in chain.iter().enumerate() {
-        let max = limits_snapshot[idx];
+    // Successful charges are a prefix, so one count is the rollback ledger.
+    let mut charged_len = 0usize;
+    for index in 0..chain.len {
+        let Some(cgroup) = chain.get(index) else {
+            for rollback in 0..charged_len {
+                if let Some(node) = chain.get(rollback) {
+                    node.stats.decrement_fds(count);
+                }
+            }
+            origin.stats.unpin_origin(&origin.stats.fds_pinned, count);
+            return Err(CgroupError::DepthLimit);
+        };
+        let max = limits_snapshot[index];
         match cgroup.stats.fds_current.fetch_update(
             Ordering::SeqCst,
             Ordering::Relaxed,
@@ -2878,17 +4058,17 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
                 Some(new)
             },
         ) {
-            Ok(_) => charged.push(idx),
+            Ok(_) => charged_len += 1,
             Err(_) => {
                 cgroup.stats.record_fds_max_event();
                 // R110-1 pattern: rollback previously charged levels (saturating).
-                for &j in &charged {
-                    chain[j].stats.decrement_fds(count);
+                for rollback in 0..charged_len {
+                    if let Some(node) = chain.get(rollback) {
+                        node.stats.decrement_fds(count);
+                    }
                 }
                 // R170-2: roll back the origin pin too (nothing was keyed).
-                if let Some(o) = &origin {
-                    o.stats.unpin_origin(&o.stats.fds_pinned, count);
-                }
+                origin.stats.unpin_origin(&origin.stats.fds_pinned, count);
                 return Err(CgroupError::FdsLimitExceeded);
             }
         }
@@ -2980,36 +4160,23 @@ pub fn migrate_fd_charges(
 ///
 /// # Errors
 /// * `PortsLimitExceeded` - the target or an ancestor would exceed `ports.max`.
+/// * `NotFound` / `DepthLimit` - the origin or its bounded ancestry is invalid.
 pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError> {
     if count == 0 || cgroup_id == 0 {
         return Ok(());
     }
 
     // Collect the chain: target cgroup + ancestors with the NET controller.
-    let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
+    let origin = lookup_cgroup(cgroup_id).ok_or(CgroupError::NotFound)?;
+    let chain = collect_controller_chain(&origin, CgroupControllers::NET)?;
     // R170-2 FIX: pin the charge at the ORIGIN node (the node whose id the
     // caller stores as the uncharge key) FIRST, controller-INDEPENDENT — see
     // `CgroupStats::ports_pinned`. Pinned before the display charges so the
     // delete-gate can never observe display motion without the pin; unpinned
     // on rejection below.
-    let origin: Option<Arc<CgroupNode>> = cursor.clone();
-    if let Some(o) = &origin {
-        o.stats.pin_origin(&o.stats.ports_pinned, count);
-    }
-    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
-    while let Some(cgroup) = cursor {
-        if cgroup.controllers.contains(CgroupControllers::NET) {
-            chain.push(cgroup.clone());
-        }
-        if depth >= MAX_CGROUP_DEPTH {
-            break;
-        }
-        depth = depth.saturating_add(1);
-        cursor = cgroup.parent();
-    }
+    origin.stats.pin_origin(&origin.stats.ports_pinned, count);
 
-    if chain.is_empty() {
+    if chain.len == 0 {
         // No NET controller anywhere: nothing to enforce or display-count,
         // but the PIN stays — the caller still stores this id and the later
         // uncharge_ports(id) unpins symmetrically, keeping the delete-gate
@@ -3019,13 +4186,27 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
     }
 
     // Snapshot per-node limits (lock each briefly; never hold two at once).
-    let limits_snapshot: Vec<Option<u64>> =
-        chain.iter().map(|c| c.limits.lock().ports_max).collect();
+    let mut limits_snapshot = [None; CGROUP_CHAIN_CAPACITY];
+    for index in 0..chain.len {
+        let Some(node) = chain.get(index) else {
+            origin.stats.unpin_origin(&origin.stats.ports_pinned, count);
+            return Err(CgroupError::DepthLimit);
+        };
+        limits_snapshot[index] = node.limits.lock().ports_max;
+    }
 
-    // Track charged indices for rollback on rejection at a deeper level.
-    let mut charged: Vec<usize> = Vec::new();
-    for (idx, cgroup) in chain.iter().enumerate() {
-        let max = limits_snapshot[idx];
+    let mut charged_len = 0usize;
+    for index in 0..chain.len {
+        let Some(cgroup) = chain.get(index) else {
+            for rollback in 0..charged_len {
+                if let Some(node) = chain.get(rollback) {
+                    node.stats.decrement_ports(count);
+                }
+            }
+            origin.stats.unpin_origin(&origin.stats.ports_pinned, count);
+            return Err(CgroupError::DepthLimit);
+        };
+        let max = limits_snapshot[index];
         match cgroup.stats.ports_current.fetch_update(
             Ordering::SeqCst,
             Ordering::Relaxed,
@@ -3039,17 +4220,17 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
                 Some(new)
             },
         ) {
-            Ok(_) => charged.push(idx),
+            Ok(_) => charged_len += 1,
             Err(_) => {
                 cgroup.stats.record_ports_max_event();
                 // Rollback previously charged levels (saturating, cannot fail).
-                for &j in &charged {
-                    chain[j].stats.decrement_ports(count);
+                for rollback in 0..charged_len {
+                    if let Some(node) = chain.get(rollback) {
+                        node.stats.decrement_ports(count);
+                    }
                 }
                 // R170-2: roll back the origin pin too (nothing was keyed).
-                if let Some(o) = &origin {
-                    o.stats.unpin_origin(&o.stats.ports_pinned, count);
-                }
+                origin.stats.unpin_origin(&origin.stats.ports_pinned, count);
                 return Err(CgroupError::PortsLimitExceeded);
             }
         }
@@ -3149,26 +4330,28 @@ pub fn charge_io(
     //
     // This prevents "token leakage" where a child's tokens are consumed
     // but the IO is not issued because an ancestor is throttled.
-    let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
-    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
-
-    // Collect ancestors with IO controller and configured io.max limits.
-    while let Some(cgroup) = cursor {
-        if cgroup.controllers.contains(CgroupControllers::IO) {
-            let limits = cgroup.limits.lock();
-            if limits.io_max_bytes_per_sec.is_some() || limits.io_max_iops_per_sec.is_some() {
-                chain.push(cgroup.clone());
-            }
+    let Some(origin) = lookup_cgroup(cgroup_id) else {
+        return IoThrottleStatus::Unlimited;
+    };
+    let chain = match collect_controller_chain(&origin, CgroupControllers::IO) {
+        Ok(chain) => chain,
+        Err(_) => return IoThrottleStatus::Throttled(u64::MAX),
+    };
+    let mut limits_snapshot: [Option<CgroupLimits>; CGROUP_CHAIN_CAPACITY] =
+        core::array::from_fn(|_| None);
+    let mut active = 0usize;
+    for index in 0..chain.len {
+        let Some(cgroup) = chain.get(index) else {
+            return IoThrottleStatus::Throttled(u64::MAX);
+        };
+        let limits = cgroup.limits.lock().clone();
+        if limits.io_max_bytes_per_sec.is_some() || limits.io_max_iops_per_sec.is_some() {
+            limits_snapshot[index] = Some(limits);
+            active += 1;
         }
-        if depth >= MAX_CGROUP_DEPTH {
-            break;
-        }
-        depth = depth.saturating_add(1);
-        cursor = cgroup.parent();
     }
 
-    if chain.is_empty() {
+    if active == 0 {
         return IoThrottleStatus::Unlimited;
     }
 
@@ -3177,8 +4360,13 @@ pub fn charge_io(
     // active throttling, and check token availability without decrementing.
     let mut overall_throttle_until: u64 = 0;
 
-    for cgroup in &chain {
-        let limits = cgroup.limits.lock();
+    for index in 0..chain.len {
+        let Some(limits) = limits_snapshot[index].as_ref() else {
+            continue;
+        };
+        let Some(cgroup) = chain.get(index) else {
+            return IoThrottleStatus::Throttled(u64::MAX);
+        };
         let bucket = cgroup.io_throttle.state.lock();
 
         // Check if currently in a throttle window.
@@ -3227,11 +4415,16 @@ pub fn charge_io(
     // the throttle state and wait. The performance cost of full rollback +
     // retry outweighs the impact of a single leaked IO in this microsecond
     // race window.
-    for cgroup in &chain {
-        let limits = cgroup.limits.lock();
+    for index in 0..chain.len {
+        let Some(limits) = limits_snapshot[index].as_ref() else {
+            continue;
+        };
+        let Some(cgroup) = chain.get(index) else {
+            return IoThrottleStatus::Throttled(u64::MAX);
+        };
         let _ = cgroup
             .io_throttle
-            .charge(&limits, bytes, now_ns, &cgroup.stats);
+            .charge(limits, bytes, now_ns, &cgroup.stats);
     }
 
     IoThrottleStatus::Allowed
@@ -3405,7 +4598,7 @@ pub fn charge_cpu_quota(cgroup_id: CgroupId, delta_ns: u64, now_ns: u64) -> CpuQ
     // Phase B (R170-3 FIX): collect the quota-bearing chain and snapshot every
     // cpu.max BEFORE any accumulation. Fixed-size stack storage — IRQ context,
     // no heap. Slots [0..chain_len) are Some.
-    let mut chain: [Option<(Arc<CgroupNode>, u64, u64)>; (MAX_CGROUP_DEPTH as usize) + 1] =
+    let mut chain: [Option<(CgroupArc, u64, u64)>; (MAX_CGROUP_DEPTH as usize) + 1] =
         core::array::from_fn(|_| None);
     let mut chain_len: usize = 0;
     {
@@ -3653,7 +4846,7 @@ pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
 /// and saturating uncharge. Exercises `try_charge_fds`/`uncharge_fds` directly
 /// (no real fd_table) so the engine is validated independently of syscall wiring.
 pub fn run_cgroup_fd_budget_self_test() {
-    let fds = |n: &Arc<CgroupNode>| n.stats.fds_current.load(Ordering::SeqCst);
+    let fds = |n: &CgroupArc| n.stats.fds_current.load(Ordering::SeqCst);
 
     // Fresh, empty, task-less cgroups under root: A(fds_max=10) ⊃ B(fds_max=4),
     // plus sibling C(fds_max=20). Their counters start at 0 (isolated from any
@@ -3736,7 +4929,7 @@ pub fn run_cgroup_fd_budget_self_test() {
 /// "uncharge what you charged"; the net-side MECHANISM is tested in
 /// `net::SocketTable::run_per_cgroup_port_budget_self_test`).
 pub fn run_cgroup_ports_budget_self_test() {
-    let ports = |n: &Arc<CgroupNode>| n.stats.ports_current.load(Ordering::SeqCst);
+    let ports = |n: &CgroupArc| n.stats.ports_current.load(Ordering::SeqCst);
 
     // Fresh, task-less NET cgroups under root: A(ports_max=10) ⊃ B(ports_max=4).
     let a = create_cgroup(0, CgroupControllers::NET).expect("create A");
@@ -3812,10 +5005,10 @@ pub fn run_cgroup_ports_budget_self_test() {
 /// counters; (4) the drained leaf then deletes cleanly; (5) a rejected charge
 /// rolls its pin back; (6) saturating unpin never wraps.
 pub fn run_cgroup_disabled_leaf_gate_self_test() {
-    let ports_disp = |n: &Arc<CgroupNode>| n.stats.ports_current.load(Ordering::SeqCst);
-    let fds_disp = |n: &Arc<CgroupNode>| n.stats.fds_current.load(Ordering::SeqCst);
-    let ports_pin = |n: &Arc<CgroupNode>| n.stats.ports_pinned.load(Ordering::SeqCst);
-    let fds_pin = |n: &Arc<CgroupNode>| n.stats.fds_pinned.load(Ordering::SeqCst);
+    let ports_disp = |n: &CgroupArc| n.stats.ports_current.load(Ordering::SeqCst);
+    let fds_disp = |n: &CgroupArc| n.stats.fds_current.load(Ordering::SeqCst);
+    let ports_pin = |n: &CgroupArc| n.stats.ports_pinned.load(Ordering::SeqCst);
+    let fds_pin = |n: &CgroupArc| n.stats.fds_pinned.load(Ordering::SeqCst);
 
     // P carries NET+FILES+PIDS (with limits); C is a NET/FILES-DISABLED leaf
     // under P — it enables only the PIDS subset (new_child rejects an empty
@@ -3906,8 +5099,8 @@ pub fn run_cgroup_disabled_leaf_gate_self_test() {
 /// (a SOUND `mem_pinned == 0` witness, not a saturating-floored one).
 pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // Clear the shared tripwire so any over-uncharge surplus is attributable to
     // THIS test's matched sequence.
@@ -4009,10 +5202,10 @@ pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
 /// masking it guards against.
 pub fn run_cgroup_pt_kmem_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
     // M2-1 SLICE-2: origin-pin reader (controller-independent delete-gate
     // counter, twin of fds_pinned/ports_pinned).
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // M2-1 SLICE-2 (lens SATURATING-UNPIN-MASKING): clear the process-wide
     // over-uncharge tripwire so this test's MATCHED charge/uncharge sequences can
@@ -4275,8 +5468,8 @@ pub fn run_stack_grow_cgroup_self_test() {
     run_fault_memory_charge_self_test();
 
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // Clear the process-wide over-uncharge tripwire so the matched sequences below PROVE
     // Σunpin == Σpin (tripwire stays 0), not merely Σunpin >= Σpin.
@@ -4376,8 +5569,8 @@ pub fn run_stack_grow_cgroup_self_test() {
 /// refund, PT ownership transfer, and try-lock contention.
 fn run_fault_memory_charge_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |node: &Arc<CgroupNode>| node.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |node: &Arc<CgroupNode>| node.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |node: &CgroupArc| node.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |node: &CgroupArc| node.stats.mem_pinned.load(Ordering::SeqCst);
     let _ = mem_unpin_underflow_take();
 
     let parent = create_cgroup(0, CgroupControllers::MEMORY).expect("fault charge parent");
@@ -4495,8 +5688,8 @@ fn run_fault_memory_charge_self_test() {
 /// `mem_pinned == 0` witness.
 pub fn run_cgroup_mem_pinned_coresidency_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // Clear the shared tripwire so any over-uncharge surplus is attributable to
     // THIS test (read-and-cleared at each matched-sequence checkpoint below).
@@ -4728,8 +5921,8 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
 /// boundary and the tripwire == 0 at each checkpoint.
 pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // Clear the shared tripwire so any over-uncharge surplus is attributable to
     // THIS test (read-and-cleared at each matched-sequence checkpoint below).
@@ -4963,7 +6156,7 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
 /// The four uncharge legs (process.rs:4318/4330/4336/4358) key to
 /// `proc.cgroup_id`, and `child.cgroup_id == parent.cgroup_id == parent_cgroup_id`
 /// (fork.rs:561). Because the child is NEVER scheduled before the abort
-/// (`notify_scheduler_add_process` runs only on the success arm, syscall.rs:3229),
+/// (the reserved scheduler admission is committed only on the success arm),
 /// it can never migrate, so its uncharge origin is still EXACTLY the fork-charge
 /// origin. The fork lump therefore telescopes to 0 — NO FA-09 strand, telescoping
 /// NOT broken.
@@ -4995,8 +6188,8 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
 /// `mem_pinned == 0` alone cannot tell apart under saturating unpin.
 pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     const PAGE: u64 = 0x1000;
-    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
-    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+    let mem = |n: &CgroupArc| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &CgroupArc| n.stats.mem_pinned.load(Ordering::SeqCst);
 
     // Clear the shared tripwire so any over-uncharge surplus is attributable to
     // THIS test (read-and-cleared at each matched-sequence checkpoint below).
@@ -5179,7 +6372,7 @@ pub const MIN_VFS_DIR_BUDGET: usize = 4096;
 /// concern not addressed here.
 #[must_use = "the guard must outlive the directory enumeration it bounds"]
 pub struct VfsDirBudgetGuard {
-    chain: Vec<Arc<CgroupNode>>,
+    chain: CgroupArcChain,
     bytes: u64,
     granted: usize,
 }
@@ -5193,26 +6386,29 @@ impl VfsDirBudgetGuard {
     pub fn charge(cgroup_id: CgroupId, want: usize) -> Self {
         if cgroup_id == 0 || want == 0 {
             return Self {
-                chain: Vec::new(),
+                chain: CgroupArcChain::empty(),
                 bytes: 0,
                 granted: want,
             };
         }
-        // Collect target + ancestors with the MEMORY controller.
-        let mut depth: u32 = 0;
-        let mut cursor = lookup_cgroup(cgroup_id);
-        let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
-        while let Some(cgroup) = cursor {
-            if cgroup.controllers.contains(CgroupControllers::MEMORY) {
-                chain.push(cgroup.clone());
+        let Some(origin) = lookup_cgroup(cgroup_id) else {
+            return Self {
+                chain: CgroupArcChain::empty(),
+                bytes: 0,
+                granted: want,
+            };
+        };
+        let chain = match collect_controller_chain(&origin, CgroupControllers::MEMORY) {
+            Ok(chain) => chain,
+            Err(_) => {
+                return Self {
+                    chain: CgroupArcChain::empty(),
+                    bytes: 0,
+                    granted: 0,
+                }
             }
-            if depth >= MAX_CGROUP_DEPTH {
-                break;
-            }
-            depth = depth.saturating_add(1);
-            cursor = cgroup.parent();
-        }
-        if chain.is_empty() {
+        };
+        if chain.len == 0 {
             return Self {
                 chain,
                 bytes: 0,
@@ -5222,7 +6418,17 @@ impl VfsDirBudgetGuard {
         let want_u = want as u64;
         let floor = (MIN_VFS_DIR_BUDGET as u64).min(want_u);
         // Snapshot each node's vfs_dir.max once (None = unlimited).
-        let caps: Vec<Option<u64>> = chain.iter().map(|n| n.limits.lock().vfs_dir_max).collect();
+        let mut caps = [None; CGROUP_CHAIN_CAPACITY];
+        for index in 0..chain.len {
+            let Some(node) = chain.get(index) else {
+                return Self {
+                    chain,
+                    bytes: 0,
+                    granted: 0,
+                };
+            };
+            caps[index] = node.limits.lock().vfs_dir_max;
+        }
 
         // HARD reservation (NOT a soft read-then-add): grant the largest amount in
         // [floor, want] that fits EVERY node's vfs_dir.max right now, charged
@@ -5235,14 +6441,14 @@ impl VfsDirBudgetGuard {
         // per concurrent call) that restricts further, never bypasses.
         for _attempt in 0..4 {
             let mut headroom: u64 = u64::MAX;
-            for (i, node) in chain.iter().enumerate() {
-                if let Some(max) = caps[i] {
+            for (index, node) in chain.iter().enumerate() {
+                if let Some(max) = caps[index] {
                     let cur = node.stats.vfs_dir_current.load(Ordering::Acquire);
                     headroom = headroom.min(max.saturating_sub(cur));
                 }
             }
             if headroom < floor {
-                for node in &chain {
+                for node in chain.iter() {
                     node.stats
                         .vfs_dir_current
                         .fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
@@ -5254,10 +6460,10 @@ impl VfsDirBudgetGuard {
                 };
             }
             let grant = want_u.min(headroom); // in [floor, want]
-            let mut charged: Vec<usize> = Vec::new();
+            let mut charged_len = 0usize;
             let mut committed = true;
-            for (i, node) in chain.iter().enumerate() {
-                let max = caps[i];
+            for (index, node) in chain.iter().enumerate() {
+                let max = caps[index];
                 let res = node.stats.vfs_dir_current.fetch_update(
                     Ordering::SeqCst,
                     Ordering::Relaxed,
@@ -5272,7 +6478,7 @@ impl VfsDirBudgetGuard {
                     },
                 );
                 if res.is_ok() {
-                    charged.push(i);
+                    charged_len += 1;
                 } else {
                     committed = false;
                     break;
@@ -5286,21 +6492,23 @@ impl VfsDirBudgetGuard {
                 };
             }
             // Roll back the partial reservation (saturating) and retry.
-            for &i in &charged {
-                let _ = chain[i].stats.vfs_dir_current.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                    |c| Some(c.saturating_sub(grant)),
-                );
+            for rollback in 0..charged_len {
+                if let Some(node) = chain.get(rollback) {
+                    let _ = node.stats.vfs_dir_current.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        |c| Some(c.saturating_sub(grant)),
+                    );
+                }
             }
         }
         // Retries exhausted under pathological contention. One FINAL attempt to
         // reserve exactly `floor` honoring the cap (CAS) — so the forced path
         // below is taken ONLY when not even `floor` fits, matching the design.
-        let mut charged: Vec<usize> = Vec::new();
+        let mut charged_len = 0usize;
         let mut committed = true;
-        for (i, node) in chain.iter().enumerate() {
-            let max = caps[i];
+        for (index, node) in chain.iter().enumerate() {
+            let max = caps[index];
             let res = node.stats.vfs_dir_current.fetch_update(
                 Ordering::SeqCst,
                 Ordering::Relaxed,
@@ -5315,7 +6523,7 @@ impl VfsDirBudgetGuard {
                 },
             );
             if res.is_ok() {
-                charged.push(i);
+                charged_len += 1;
             } else {
                 committed = false;
                 break;
@@ -5328,16 +6536,18 @@ impl VfsDirBudgetGuard {
                 granted: floor as usize,
             };
         }
-        for &i in &charged {
-            let _ = chain[i].stats.vfs_dir_current.fetch_update(
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-                |c| Some(c.saturating_sub(floor)),
-            );
+        for rollback in 0..charged_len {
+            if let Some(node) = chain.get(rollback) {
+                let _ = node.stats.vfs_dir_current.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(floor)),
+                );
+            }
         }
         // Even `floor` does not fit under the cap → force it (bounded over-count
         // ≤ floor per concurrent call) so enumeration still makes forward progress.
-        for node in &chain {
+        for node in chain.iter() {
             node.stats
                 .vfs_dir_current
                 .fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
@@ -5363,7 +6573,7 @@ impl VfsDirBudgetGuard {
         }
         let bytes = self.bytes;
         self.bytes = 0;
-        for node in &self.chain {
+        for node in self.chain.iter() {
             let _ = node.stats.vfs_dir_current.fetch_update(
                 Ordering::SeqCst,
                 Ordering::Relaxed,
@@ -5388,7 +6598,7 @@ impl Drop for VfsDirBudgetGuard {
 /// 0 because the guard uncharges the held Arcs, not a re-resolved id), root
 /// id==0 exemption, and release idempotency.
 pub fn run_cgroup_vfs_dir_budget_self_test() {
-    let vdir = |n: &Arc<CgroupNode>| n.stats.vfs_dir_current.load(Ordering::SeqCst);
+    let vdir = |n: &CgroupArc| n.stats.vfs_dir_current.load(Ordering::SeqCst);
 
     // P(vfs_dir_max=10000) ⊃ A(vfs_dir_max unlimited): fresh, task-less.
     let p = create_cgroup(0, CgroupControllers::MEMORY).expect("create P");
@@ -5465,6 +6675,418 @@ pub fn run_cgroup_vfs_dir_budget_self_test() {
 // ============================================================================
 // Test Helpers
 // ============================================================================
+
+/// RF180-45 executable probe for exact physical Arc lifetime and detached
+/// cgroup metadata publication.
+pub fn run_cgroup_exact_lifetime_self_test() {
+    init();
+    let root = root_cgroup();
+    let parent = CgroupNode::new_child(&root, CgroupControllers::PIDS)
+        .expect("RF180-45 lifetime-test parent");
+
+    // Prime registry growth before taking exact heap snapshots. Parent-child
+    // backing is reclaimed when the primer is deleted, while the nonempty
+    // global registry intentionally retains its bounded high-water backing.
+    let primer = CgroupNode::new_child(&parent, CgroupControllers::PIDS)
+        .expect("RF180-45 lifetime-test primer");
+    let primer_id = primer.id();
+    delete_cgroup(primer_id).expect("RF180-45 delete lifetime-test primer");
+    drop(primer);
+
+    let outer_bytes =
+        arc_charge_bytes::<CgroupNode>().expect("RF180-45 cgroup Arc charge must be representable");
+    let lifetime_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let slots_before = active_cgroup_arc_slots();
+    let lifetime_child = CgroupNode::new_child_with_fault(
+        &parent,
+        CgroupControllers::PIDS,
+        CgroupCreateFault {
+            check_prepare_unlocked: true,
+            check_deallocate_unlocked: true,
+            ..CgroupCreateFault::default()
+        },
+    )
+    .expect("RF180-45 lifetime-test child");
+    let lifetime_id = lifetime_child.id();
+    let lifetime_weak: CgroupWeak = Arc::downgrade(&lifetime_child);
+    delete_cgroup(lifetime_id).expect("RF180-45 unregister lifetime-test child");
+    drop(lifetime_child);
+    assert!(lifetime_weak.upgrade().is_none());
+    assert_eq!(active_cgroup_arc_slots(), slots_before + 1);
+    let after_strong = mm::heap_class_snapshot(HeapClass::Cgroup);
+    assert_eq!(after_strong.reserved_bytes, lifetime_before.reserved_bytes);
+    assert_eq!(
+        after_strong.committed_bytes,
+        lifetime_before
+            .committed_bytes
+            .checked_add(outer_bytes)
+            .expect("RF180-45 lifetime snapshot arithmetic"),
+        "RF180-45 final Weak must retain exactly the outer Arc charge"
+    );
+    drop(lifetime_weak);
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        lifetime_before,
+        "RF180-45 ArcInner must deallocate before admission release"
+    );
+    assert_eq!(active_cgroup_arc_slots(), slots_before);
+
+    // Forced Arc allocation failure must drop the payload Weak, release its
+    // generation slot exactly once, and leave both hierarchy publications and
+    // heap accounting untouched.
+    let arc_failure_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let arc_failure_slots = active_cgroup_arc_slots();
+    let arc_failure_count = cgroup_count();
+    assert!(matches!(
+        CgroupNode::new_child_with_fault(
+            &parent,
+            CgroupControllers::PIDS,
+            CgroupCreateFault {
+                fail_arc_allocation: true,
+                ..CgroupCreateFault::default()
+            },
+        ),
+        Err(CgroupError::OutOfMemory)
+    ));
+    assert_eq!(parent.children().expect("RF180-45 child snapshot").len(), 0);
+    assert_eq!(cgroup_count(), arc_failure_count);
+    assert_eq!(active_cgroup_arc_slots(), arc_failure_slots);
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        arc_failure_before
+    );
+
+    // Force the nonempty registry to exact live capacity so the next creation
+    // must execute its detached registry-prepare path. The old backing is
+    // retired only after the registry writer is released.
+    let exact_registry_len = cgroup_count();
+    let exact_registry =
+        PreparedAdmittedMapCapacity::try_new(HeapClass::Cgroup, exact_registry_len)
+            .expect("RF180-45 exact registry backing");
+    let retired_registry = {
+        let mut registry = CGROUP_REGISTRY.write();
+        registry
+            .install_prepared_deferred(exact_registry)
+            .expect("RF180-45 install exact registry backing")
+    };
+    drop(retired_registry);
+    assert_eq!(CGROUP_REGISTRY.read().capacity(), exact_registry_len);
+
+    let registry_failure_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let registry_failure_slots = active_cgroup_arc_slots();
+    assert!(matches!(
+        CgroupNode::new_child_with_fault(
+            &parent,
+            CgroupControllers::PIDS,
+            CgroupCreateFault {
+                fail_registry_prepare: true,
+                check_prepare_unlocked: true,
+                check_deallocate_unlocked: true,
+                ..CgroupCreateFault::default()
+            },
+        ),
+        Err(CgroupError::OutOfMemory)
+    ));
+    assert_eq!(active_cgroup_arc_slots(), registry_failure_slots);
+    assert_eq!(cgroup_count(), exact_registry_len);
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        registry_failure_before
+    );
+
+    // The registry candidate succeeds, then child backing preparation fails.
+    // Both the unused detached registry allocation and the node Arc telescope.
+    let children_failure_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let children_failure_slots = active_cgroup_arc_slots();
+    assert!(matches!(
+        CgroupNode::new_child_with_fault(
+            &parent,
+            CgroupControllers::PIDS,
+            CgroupCreateFault {
+                fail_children_prepare: true,
+                check_prepare_unlocked: true,
+                check_deallocate_unlocked: true,
+                ..CgroupCreateFault::default()
+            },
+        ),
+        Err(CgroupError::OutOfMemory)
+    ));
+    assert_eq!(active_cgroup_arc_slots(), children_failure_slots);
+    assert_eq!(cgroup_count(), exact_registry_len);
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        children_failure_before
+    );
+
+    // Fail after parent membership publication. Both prepared backings are
+    // restored exactly and the detached node is destroyed only after locks.
+    let rollback_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let rollback_slots = active_cgroup_arc_slots();
+    let rollback_count = cgroup_count();
+    assert!(matches!(
+        CgroupNode::new_child_with_fault(
+            &parent,
+            CgroupControllers::PIDS,
+            CgroupCreateFault {
+                fail_after_children_insert: true,
+                check_prepare_unlocked: true,
+                check_deallocate_unlocked: true,
+                ..CgroupCreateFault::default()
+            },
+        ),
+        Err(CgroupError::OutOfMemory)
+    ));
+    assert_eq!(
+        parent.children().expect("RF180-45 rollback snapshot").len(),
+        0
+    );
+    assert_eq!(cgroup_count(), rollback_count);
+    assert_eq!(active_cgroup_arc_slots(), rollback_slots);
+    assert_eq!(mm::heap_class_snapshot(HeapClass::Cgroup), rollback_before);
+
+    // Cross the former MAX_CGROUPS task-set clamp with real production attach /
+    // detach entry points and valid process-domain IDs. Growth must reach 4097,
+    // every hierarchical counter must move exactly, and the final empty backing
+    // must retire outside the task-set lock.
+    const TASK_BOUNDARY_COUNT: usize = MAX_CGROUPS + 1;
+    const TASK_BOUNDARY_FIRST: TaskId =
+        crate::process::PID_MAX as TaskId - TASK_BOUNDARY_COUNT as TaskId + 1;
+    let membership_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let parent_pids_before = parent.stats.pids_current.load(Ordering::SeqCst);
+    let root_pids_before = root.stats.pids_current.load(Ordering::SeqCst);
+    for offset in 0..TASK_BOUNDARY_COUNT {
+        parent
+            .attach_task(TASK_BOUNDARY_FIRST + offset as TaskId)
+            .expect("RF180-45 boundary attach task membership");
+    }
+    assert_eq!(parent.task_count(), TASK_BOUNDARY_COUNT);
+    assert_eq!(
+        parent.stats.pids_current.load(Ordering::SeqCst),
+        parent_pids_before + TASK_BOUNDARY_COUNT as u64
+    );
+    assert_eq!(
+        root.stats.pids_current.load(Ordering::SeqCst),
+        root_pids_before + TASK_BOUNDARY_COUNT as u64
+    );
+    for offset in 0..TASK_BOUNDARY_COUNT {
+        parent
+            .detach_task(TASK_BOUNDARY_FIRST + offset as TaskId)
+            .expect("RF180-45 boundary detach task membership");
+    }
+    assert_eq!(parent.task_count(), 0);
+    assert_eq!(
+        parent.stats.pids_current.load(Ordering::SeqCst),
+        parent_pids_before
+    );
+    assert_eq!(
+        root.stats.pids_current.load(Ordering::SeqCst),
+        root_pids_before
+    );
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        membership_before,
+        "RF180-45 task-set backing must retire outside its lock"
+    );
+
+    // A deeper target-exclusive ancestor rejects after the target leaf has
+    // already reserved +1. The reservation must roll back before any source
+    // membership/counter mutation, and freeze contention is retryable Busy.
+    let migration_source =
+        CgroupNode::new_child(&parent, CgroupControllers::PIDS).expect("RF180-45 migration source");
+    let migration_branch =
+        CgroupNode::new_child(&parent, CgroupControllers::PIDS).expect("RF180-45 migration branch");
+    let migration_target = CgroupNode::new_child(&migration_branch, CgroupControllers::PIDS)
+        .expect("RF180-45 migration target");
+    let migration_task: TaskId = 0x4501;
+    migration_source
+        .attach_task(migration_task)
+        .expect("RF180-45 migration source attach");
+    assert_eq!(
+        migrate_task(migration_task, migration_source.id(), migration_source.id()),
+        Ok(()),
+        "RF180-45 same-endpoint migration is a membership-preserving no-op"
+    );
+    migration_source
+        .membership_frozen
+        .store(true, Ordering::Release);
+    let lifecycle_task: TaskId = 0x4505;
+    migration_source
+        .attach_task(lifecycle_task)
+        .expect("RF180-45 endpoint attach must serialize during migration pin");
+    migration_source
+        .detach_task(lifecycle_task)
+        .expect("RF180-45 endpoint detach must not strand exit membership");
+    assert_eq!(
+        migrate_task(migration_task, migration_source.id(), migration_target.id()),
+        Err(CgroupError::Busy)
+    );
+    migration_source
+        .membership_frozen
+        .store(false, Ordering::Release);
+    migration_branch
+        .set_limit(CgroupLimits {
+            pids_max: Some(0),
+            ..CgroupLimits::default()
+        })
+        .expect("RF180-45 rejecting branch limit");
+    let migration_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let parent_migration_pids = parent.stats.pids_current.load(Ordering::SeqCst);
+    let root_migration_pids = root.stats.pids_current.load(Ordering::SeqCst);
+    assert_eq!(
+        migrate_task(migration_task, migration_source.id(), migration_target.id()),
+        Err(CgroupError::PidsLimitExceeded)
+    );
+    assert!(migration_source.has_task(migration_task));
+    assert!(!migration_target.has_task(migration_task));
+    assert_eq!(
+        migration_source.stats.pids_current.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        migration_target.stats.pids_current.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        migration_branch.stats.pids_current.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        parent.stats.pids_current.load(Ordering::SeqCst),
+        parent_migration_pids
+    );
+    assert_eq!(
+        root.stats.pids_current.load(Ordering::SeqCst),
+        root_migration_pids
+    );
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        migration_before,
+        "RF180-45 precommit migration rejection must telescope exactly"
+    );
+    migration_source
+        .detach_task(migration_task)
+        .expect("RF180-45 failed-migration cleanup detach");
+    let migration_source_id = migration_source.id();
+    let migration_branch_id = migration_branch.id();
+    let migration_target_id = migration_target.id();
+    delete_cgroup(migration_target_id).expect("RF180-45 delete migration target");
+    delete_cgroup(migration_branch_id).expect("RF180-45 delete migration branch");
+    delete_cgroup(migration_source_id).expect("RF180-45 delete migration source");
+    drop(migration_target);
+    drop(migration_branch);
+    drop(migration_source);
+
+    // At a full common ancestor, the migration must never publish temporary
+    // headroom. A deterministic sibling attach uses existing spare backing, so
+    // the probe itself is allocation-free while endpoint task locks are held.
+    let delta_source = CgroupNode::new_child(&parent, CgroupControllers::PIDS)
+        .expect("RF180-45 delta migration source");
+    let delta_target = CgroupNode::new_child(&parent, CgroupControllers::PIDS)
+        .expect("RF180-45 delta migration target");
+    let delta_sibling = CgroupNode::new_child(&parent, CgroupControllers::PIDS)
+        .expect("RF180-45 delta migration sibling");
+    let delta_task: TaskId = 0x4502;
+    let sibling_primer: TaskId = 0x4503;
+    let sibling_probe_task: TaskId = 0x4504;
+    delta_source
+        .attach_task(delta_task)
+        .expect("RF180-45 delta source attach");
+    delta_sibling
+        .attach_task(sibling_primer)
+        .expect("RF180-45 sibling primer attach");
+    parent
+        .set_limit(CgroupLimits {
+            pids_max: Some(2),
+            ..CgroupLimits::default()
+        })
+        .expect("RF180-45 common ancestor pids limit");
+    let delta_heap_before = mm::heap_class_snapshot(HeapClass::Cgroup);
+    let delta_parent_before = parent.stats.pids_current.load(Ordering::SeqCst);
+    let delta_root_before = root.stats.pids_current.load(Ordering::SeqCst);
+    let sibling_probe = CgroupMigrationProbe {
+        sibling: &delta_sibling,
+        task: sibling_probe_task,
+    };
+    migrate_task_impl(
+        delta_task,
+        delta_source.id(),
+        delta_target.id(),
+        Some(&sibling_probe),
+    )
+    .expect("RF180-45 common-ancestor delta migration");
+    assert!(!delta_source.has_task(delta_task));
+    assert!(delta_target.has_task(delta_task));
+    assert!(!delta_sibling.has_task(sibling_probe_task));
+    assert_eq!(delta_source.stats.pids_current.load(Ordering::SeqCst), 0);
+    assert_eq!(delta_target.stats.pids_current.load(Ordering::SeqCst), 1);
+    assert_eq!(delta_sibling.stats.pids_current.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        parent.stats.pids_current.load(Ordering::SeqCst),
+        delta_parent_before,
+        "RF180-45 common ancestor must remain unchanged across migration"
+    );
+    assert_eq!(
+        root.stats.pids_current.load(Ordering::SeqCst),
+        delta_root_before
+    );
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Cgroup),
+        delta_heap_before,
+        "RF180-45 source/target task backing transfer must telescope"
+    );
+    delta_target
+        .detach_task(delta_task)
+        .expect("RF180-45 delta target cleanup detach");
+    delta_sibling
+        .detach_task(sibling_primer)
+        .expect("RF180-45 sibling primer cleanup detach");
+    let delta_source_id = delta_source.id();
+    let delta_target_id = delta_target.id();
+    let delta_sibling_id = delta_sibling.id();
+    delete_cgroup(delta_source_id).expect("RF180-45 delete delta source");
+    delete_cgroup(delta_target_id).expect("RF180-45 delete delta target");
+    delete_cgroup(delta_sibling_id).expect("RF180-45 delete delta sibling");
+    drop(delta_source);
+    drop(delta_target);
+    drop(delta_sibling);
+
+    // Deterministically interleave a complete sibling creation between
+    // detached preparation and publication. The outer creator must revalidate
+    // both live capacities and publish without losing either child.
+    let interleave_count = cgroup_count();
+    let interleaved = CgroupNode::new_child_with_fault(
+        &parent,
+        CgroupControllers::PIDS,
+        CgroupCreateFault {
+            interleave_sibling_once: true,
+            check_prepare_unlocked: true,
+            check_deallocate_unlocked: true,
+            ..CgroupCreateFault::default()
+        },
+    )
+    .expect("RF180-45 interleaved child creation");
+    let interleaved_id = interleaved.id();
+    let children = parent
+        .children()
+        .expect("RF180-45 interleaved child snapshot");
+    assert!(
+        children.len() > 1,
+        "RF180-45 interleave must stale the first prepared capacity"
+    );
+    assert_eq!(cgroup_count(), interleave_count + children.len());
+    for child_id in children.iter().copied() {
+        delete_cgroup(child_id).expect("RF180-45 delete interleaved child");
+    }
+    drop(children);
+    drop(interleaved);
+    assert!(lookup_cgroup(interleaved_id).is_none());
+    assert_eq!(parent.children().expect("RF180-45 final snapshot").len(), 0);
+
+    let parent_id = parent.id();
+    delete_cgroup(parent_id).expect("RF180-45 delete lifetime-test parent");
+    drop(parent);
+    drop(root);
+}
 
 /// Returns true if the cgroup subsystem is initialized.
 #[cfg(test)]
