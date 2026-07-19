@@ -3,27 +3,34 @@ use crate::signal::PendingSignals;
 use crate::signal::{SigAction, NSIG};
 use crate::syscall::{SyscallError, VfsStat};
 use crate::time;
+use alloc::alloc::{AllocError, Allocator, Global, Layout};
 use alloc::{
     boxed::Box,
-    collections::{BTreeMap, BTreeSet},
     string::String,
-    sync::Arc,
-    vec,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use cap::CapTable;
 use core::any::Any;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
+use mm::{
+    allocation_charge_bytes, arc_charge_bytes, try_reserve_heap, vec_charge_bytes, AdmittedMap,
+    AdmittedSet, AdmittedVec, HeapCharge, HeapClass, HeapReservation, PreparedAdmittedVecCapacity,
+    RetiredAdmittedVecCapacity,
+};
 use seccomp::{PledgeState, SeccompState};
 use spin::{Mutex, Once, RwLock};
 // G.1 Observability: Watchdog integration for hung-task detection
 use trace::watchdog::{register_watchdog, unregister_watchdog, WatchdogConfig, WatchdogHandle};
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
-    structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
+    structures::paging::{
+        FrameAllocator as X64FrameAllocator, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    },
     PhysAddr, VirtAddr,
 };
 
@@ -45,6 +52,131 @@ pub type Priority = u8;
 /// and as keys in the PI boost map.
 pub type FutexKey = (ProcessId, usize);
 
+// ============================================================================
+// Exact-lifetime process Arc admission (RF180-40)
+// ============================================================================
+
+/// Maximum number of simultaneously live process Arc control blocks.
+///
+/// `HeapClass::CoreProcess` is capped at 512 KiB, and the compile-time assertion
+/// below proves every `Mutex<Process>` payload consumes at least 512 bytes. The
+/// byte ledger therefore rejects a 1025th process Arc before this fixed, heap-
+/// independent registry can be exhausted.
+const PROCESS_ARC_CHARGE_SLOTS: usize = 1024;
+
+struct ProcessArcChargeSlot {
+    generation: u64,
+    allocated: bool,
+    charge: HeapCharge,
+}
+
+static PROCESS_ARC_CHARGES: Mutex<[Option<ProcessArcChargeSlot>; PROCESS_ARC_CHARGE_SLOTS]> =
+    Mutex::new([const { None }; PROCESS_ARC_CHARGE_SLOTS]);
+static NEXT_PROCESS_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Allocator carried by every process `Arc` and `Weak` handle.
+///
+/// RF180-40 FIX: storing the outer-Arc charge inside `Process` released it when
+/// the last strong owner destroyed the payload, even though procfs can retain a
+/// `Weak` and keep the control block allocated indefinitely. The allocator owns
+/// the charge in static, generation-tagged storage instead. `Arc` calls
+/// `deallocate` only after the final strong and weak reference disappears; this
+/// implementation deallocates the control block first and releases admission
+/// second. A copied allocator is a single-use capability and cannot allocate a
+/// second uncharged block.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessArcAllocator {
+    slot: u16,
+    generation: u64,
+}
+
+impl ProcessArcAllocator {
+    fn try_install(charge: HeapCharge) -> Result<Self, HeapCharge> {
+        let generation = match NEXT_PROCESS_ARC_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => return Err(charge),
+        };
+
+        let mut charge = Some(charge);
+        let mut slots = PROCESS_ARC_CHARGES.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(ProcessArcChargeSlot {
+                    generation,
+                    allocated: false,
+                    charge: charge.take().expect("process Arc charge moved once"),
+                });
+                return Ok(Self {
+                    slot: index as u16,
+                    generation,
+                });
+            }
+        }
+        Err(charge.expect("process Arc slot scan retained charge"))
+    }
+
+    fn take_charge(self) -> HeapCharge {
+        let mut slots = PROCESS_ARC_CHARGES.lock();
+        let slot = slots
+            .get_mut(self.slot as usize)
+            .expect("RF180-40 process Arc allocator slot out of range");
+        match slot.as_ref() {
+            Some(entry) if entry.generation == self.generation => {}
+            Some(_) => panic!("RF180-40 stale process Arc allocator generation"),
+            None => panic!("RF180-40 process Arc charge released twice"),
+        }
+        slot.take()
+            .expect("validated process Arc charge disappeared")
+            .charge
+    }
+
+    fn cancel_failed_allocation(self) {
+        drop(self.take_charge());
+    }
+}
+
+unsafe impl Allocator for ProcessArcAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        {
+            let mut slots = PROCESS_ARC_CHARGES.lock();
+            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+                return Err(AllocError);
+            };
+            if entry.generation != self.generation || entry.allocated {
+                return Err(AllocError);
+            }
+            entry.allocated = true;
+        }
+
+        match Global.allocate(layout) {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                let mut slots = PROCESS_ARC_CHARGES.lock();
+                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                    if entry.generation == self.generation {
+                        entry.allocated = false;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // Memory first, admission second: a concurrent creator cannot consume
+        // these bytes while the old control block is still physically live.
+        unsafe { Global.deallocate(ptr, layout) };
+        drop(self.take_charge());
+    }
+}
+
+pub type ProcessArc = Arc<Mutex<Process>, ProcessArcAllocator>;
+pub type ProcessWeak = Weak<Mutex<Process>, ProcessArcAllocator>;
+
 /// mmap 默认起始地址
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
@@ -62,6 +194,51 @@ const KSTACK_PAGES: usize = 4;
 
 /// 守护页数
 const KSTACK_GUARD_PAGES: usize = 1;
+
+/// `map_to` can request at most three intermediate frames per 4 KiB leaf.
+/// The deliberately conservative per-stack ledger remains tiny and makes all
+/// post-admission mapping/rollback bookkeeping allocation-free.
+const KSTACK_PT_LEDGER_CAPACITY: usize = KSTACK_PAGES * 3;
+
+struct KernelStackPtRecorder<'a> {
+    inner: &'a mut FrameAllocator,
+    frames: [Option<PhysFrame<Size4KiB>>; KSTACK_PT_LEDGER_CAPACITY],
+    len: usize,
+}
+
+impl<'a> KernelStackPtRecorder<'a> {
+    fn new(inner: &'a mut FrameAllocator) -> Self {
+        Self {
+            inner,
+            frames: [None; KSTACK_PT_LEDGER_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn into_record(
+        self,
+    ) -> (
+        [Option<PhysFrame<Size4KiB>>; KSTACK_PT_LEDGER_CAPACITY],
+        usize,
+    ) {
+        (self.frames, self.len)
+    }
+}
+
+unsafe impl X64FrameAllocator<Size4KiB> for KernelStackPtRecorder<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        // Refuse before allocation if the fixed provenance ledger is full.
+        // A live but unrecorded table frame would make failure rollback unable
+        // to prove ownership.
+        if self.len == KSTACK_PT_LEDGER_CAPACITY {
+            return None;
+        }
+        let frame = self.inner.allocate_frame()?;
+        self.frames[self.len] = Some(frame);
+        self.len += 1;
+        Some(frame)
+    }
+}
 
 /// G.1: Default watchdog timeout for hung-task detection (10 seconds).
 ///
@@ -85,12 +262,84 @@ type SchedulerCleanupCallback = fn(ProcessId, u64);
 /// `PROCESS_TABLE` and releasing the table lock. This avoids deadlocks from IPC/futex cleanup
 /// paths that call `thread_group_size()` or `get_process()` (both re-lock `PROCESS_TABLE`).
 /// R75-2 FIX: Also pass IPC namespace ID for per-namespace endpoint cleanup.
-type IpcCleanupCallback = fn(ProcessId, ProcessId, cap::NamespaceId); // (pid, tgid, ipc_ns_id)
+/// R180-5 FIX: Also pass the reaped process **generation**. The PID slot may already
+/// be reused by a successor before Phase 2 runs; callbacks must key identity by
+/// `(pid, generation)` (mirrors RF178-33 / P1-B scheduler cleanup).
+type IpcCleanupCallback = fn(ProcessId, ProcessId, cap::NamespaceId, u64); // (pid, tgid, ipc_ns_id, generation)
 
-/// 调度器添加进程回调类型
+/// R180-19: identity-bound token for a pre-staged scheduler admission.
 ///
-/// clone/fork 创建新进程后调用，将进程添加到调度队列
-pub type SchedulerAddCallback = fn(Arc<Mutex<Process>>);
+/// The scheduler inserts the child into a fallible ready-queue slot while the
+/// child is still `Provisioning`.  Fork/clone then complete every remaining
+/// fallible operation and consume the token to publish `Ready` without any heap
+/// growth.  `(pid, generation)` prevents cancellation or commit from touching a
+/// recycled PID, while `cpu_id + priority` identify the exact reserved bucket.
+/// The pinned Arc lets COMMIT publish the exact PCB without rediscovering it
+/// under a ready-queue lock after the transaction's point of no return.
+pub struct SchedulerAddToken {
+    pub cpu_id: usize,
+    pub priority: Priority,
+    pub pid: ProcessId,
+    pub generation: u64,
+    pub process: ProcessArc,
+}
+
+/// Recoverable scheduler-admission failures.  They are deliberately coarse:
+/// callers fail the process-creation transaction before publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerAddError {
+    Unavailable,
+    NoMemory,
+    NoEligibleCpu,
+    InvalidState,
+}
+
+pub type SchedulerReserveCallback = fn(ProcessArc) -> Result<SchedulerAddToken, SchedulerAddError>;
+pub type SchedulerCommitCallback = fn(SchedulerAddToken);
+pub type SchedulerCancelCallback = fn(SchedulerAddToken);
+
+#[derive(Clone, Copy)]
+struct SchedulerAdmissionCallbacks {
+    reserve: SchedulerReserveCallback,
+    commit: SchedulerCommitCallback,
+    cancel: SchedulerCancelCallback,
+}
+
+/// RAII ownership of one exact scheduler queue slot.
+///
+/// Dropping an uncommitted permit removes the non-runnable placeholder without
+/// allocation.  `commit` is intentionally infallible: the queue entry and all
+/// of its backing capacity already exist.
+pub struct SchedulerAddPermit {
+    token: Option<SchedulerAddToken>,
+    commit: SchedulerCommitCallback,
+    cancel: SchedulerCancelCallback,
+    armed: bool,
+}
+
+impl SchedulerAddPermit {
+    #[inline]
+    pub fn commit(mut self) {
+        let token = self
+            .token
+            .take()
+            .expect("scheduler admission permit consumed twice");
+        (self.commit)(token);
+        self.armed = false;
+    }
+}
+
+impl Drop for SchedulerAddPermit {
+    fn drop(&mut self) {
+        if self.armed {
+            let token = self
+                .token
+                .take()
+                .expect("armed scheduler admission permit lost its token");
+            (self.cancel)(token);
+        }
+    }
+}
 
 /// Futex 唤醒回调类型
 ///
@@ -122,6 +371,7 @@ pub type KptiCr3UpdateCallback = fn(u64, u64);
 
 /// 最大文件描述符数量（每进程）
 pub const MAX_FD: i32 = 256;
+const FD_RESERVATION_WORDS: usize = (MAX_FD as usize + 63) / 64;
 
 /// 文件操作 trait
 ///
@@ -134,7 +384,15 @@ pub const MAX_FD: i32 = 256;
 /// 在各自的 crate（如 ipc）中实现。
 pub trait FileOps: Send + Sync {
     /// 克隆此文件描述符（用于 fork）
-    fn clone_box(&self) -> Box<dyn FileOps>;
+    fn clone_box(&self) -> FileDescriptor;
+
+    /// Fallibly clone this file description for fork/dup transactions.
+    ///
+    /// Persistent publication paths must use this method: `clone_box` is kept
+    /// only for legacy non-transactional callers while they are migrated.  An
+    /// implementation must prepare a [`FileDescriptor`] allocation before any
+    /// manual resource-refcount increment, then finalize it without allocation.
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()>;
 
     /// 获取 Any 引用用于向下转型
     fn as_any(&self) -> &dyn Any;
@@ -219,7 +477,108 @@ impl core::fmt::Debug for dyn FileOps {
 }
 
 /// 文件描述符类型
-pub type FileDescriptor = Box<dyn FileOps>;
+/// Detached, admitted backing for one concrete file-operations value.
+///
+/// RF180-37: the allocation and its lifetime charge are acquired before the
+/// caller performs externally visible work. Finalization only initializes the
+/// already-allocated slot and unsizes its Box; it cannot allocate or fail.
+#[must_use = "dropping a prepared descriptor releases its private allocation and admission"]
+pub struct PreparedFileDescriptor<T: FileOps + 'static> {
+    storage: Box<core::mem::MaybeUninit<T>>,
+    charge: Option<HeapCharge>,
+}
+
+impl<T: FileOps + 'static> PreparedFileDescriptor<T> {
+    pub fn try_new(class: HeapClass) -> Result<Self, ()> {
+        let bytes = allocation_charge_bytes(core::mem::size_of::<T>(), core::mem::align_of::<T>())
+            .map_err(|_| ())?;
+        let reservation = try_reserve_heap(class, bytes).map_err(|_| ())?;
+        let storage = Box::<T>::try_new_uninit().map_err(|_| ())?;
+        let charge = reservation.commit().map_err(|_| ())?;
+        Ok(Self {
+            storage,
+            charge: Some(charge),
+        })
+    }
+
+    /// Initialize and publish the already-admitted descriptor allocation.
+    ///
+    /// This function is intentionally infallible. `storage` is declared before
+    /// `charge` both here and in [`FileDescriptor`], so every rollback and live
+    /// drop destroys/deallocates the concrete value before releasing admission.
+    pub fn finalize(mut self, value: T) -> FileDescriptor {
+        unsafe {
+            self.storage.as_mut_ptr().write(value);
+        }
+        let storage = self.storage;
+        let concrete = unsafe { storage.assume_init() };
+        let ops: Box<dyn FileOps> = concrete;
+        let charge = self
+            .charge
+            .take()
+            .expect("prepared file descriptor lost its heap charge");
+        FileDescriptor {
+            ops,
+            _charge: charge,
+        }
+    }
+}
+
+/// Exact-lifetime owner for a heap-allocated file-operations value.
+///
+/// RF180-37: this replaces the raw `Box<dyn FileOps>` alias. The trait object is
+/// the first field, so its concrete value is dropped and its Box is deallocated
+/// before the second field releases the whole-heap charge. Embedding the charge
+/// inside the concrete FileOps value is not exact: that field is destroyed while
+/// the outer Box allocation is still live.
+pub struct FileDescriptor {
+    ops: Box<dyn FileOps>,
+    _charge: HeapCharge,
+}
+
+impl FileDescriptor {
+    /// Admit and allocate a descriptor before constructing/publishing it.
+    #[inline]
+    pub fn try_prepare<T: FileOps + 'static>(
+        class: HeapClass,
+    ) -> Result<PreparedFileDescriptor<T>, ()> {
+        PreparedFileDescriptor::try_new(class)
+    }
+
+    /// Convenience for side-effect-free values. Transactions with external
+    /// ownership changes should call `try_prepare` first and `finalize` last.
+    #[inline]
+    pub fn try_new<T: FileOps + 'static>(value: T, class: HeapClass) -> Result<Self, ()> {
+        Self::try_prepare(class).map(|prepared| prepared.finalize(value))
+    }
+
+    #[inline]
+    pub fn try_clone(&self) -> Result<Self, ()> {
+        self.ops.try_clone_box()
+    }
+}
+
+impl core::ops::Deref for FileDescriptor {
+    type Target = dyn FileOps;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.ops.as_ref()
+    }
+}
+
+impl AsRef<dyn FileOps> for FileDescriptor {
+    #[inline]
+    fn as_ref(&self) -> &(dyn FileOps + 'static) {
+        self.ops.as_ref()
+    }
+}
+
+impl core::fmt::Debug for FileDescriptor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.ops.fmt(f)
+    }
+}
 
 /// 内核栈分配错误
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +591,10 @@ pub enum KernelStackError {
     MapFailed,
     /// R103-I2 FIX: 地址计算溢出（PID 超出内核栈地址空间范围）
     AddressOverflow,
+    /// R180-12: fixed RCU callback pool is full. No stack was allocated.
+    CallbackPoolExhausted,
+    /// The recycled PID's previous stack is still awaiting RCU reclamation.
+    ReclaimPending,
 }
 
 /// 进程创建错误
@@ -243,6 +606,8 @@ pub enum ProcessCreateError {
     KernelStackAllocFailed(KernelStackError),
     /// R29-5 FIX: PID 空间耗尽（内核栈地址空间溢出）
     PidExhausted,
+    /// Whole-heap admission or a fallible PCB allocation failed.
+    OutOfMemory,
     /// F.1: PID namespace chain assignment failed
     NamespaceError,
 }
@@ -260,6 +625,116 @@ pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as Pro
 /// recycling keeps the process table bounded and prevents PID exhaustion under
 /// fork/exit churn. Valid PIDs are in [1, PID_MAX].
 pub const PID_MAX: ProcessId = 32_768;
+
+/// R180-12: every valid PID has one dedicated RCU stack-lifecycle slot.
+/// This is an admission invariant, not a reduction of the PID/task capability.
+pub const KERNEL_STACK_ADMISSION_LIMIT: usize = crate::rcu::RCU_STACK_CALLBACK_CAPACITY;
+const _: () = assert!(KERNEL_STACK_ADMISSION_LIMIT == PID_MAX);
+
+/// RF180-3 FIX: PIDs detached for Phase-2 reap cleanup remain unavailable
+/// until every raw-PID subsystem callback has completed.  A thread-group ID
+/// remains pinned as well until every member has left `PROCESS_TABLE` and all
+/// concurrent Phase-2 cleanups for that group have finished.
+///
+/// The table slot must be removed before callbacks because they re-enter
+/// PROCESS_TABLE, but making the numeric PID immediately reusable lets futex
+/// owner/waiter metadata either mutate a successor or survive into it.  This
+/// fixed bitmap is allocation-free and is consulted by the PID allocator.
+const REAPING_PID_WORDS: usize = (PID_MAX + 64) / 64;
+
+struct ReapingPidState {
+    bits: [u64; REAPING_PID_WORDS],
+    /// Number of detached members whose Phase-2 cleanup still references this
+    /// raw TGID.  `u16` covers the complete bounded PID space.
+    tgid_inflight: [u16; PID_MAX + 1],
+}
+
+static REAPING_PID_STATE: Mutex<ReapingPidState> = Mutex::new(ReapingPidState {
+    bits: [0; REAPING_PID_WORDS],
+    tgid_inflight: [0; PID_MAX + 1],
+});
+
+#[inline]
+fn reaping_pid_is_set(state: &ReapingPidState, pid: ProcessId) -> bool {
+    let word = pid / 64;
+    let bit = pid % 64;
+    state
+        .bits
+        .get(word)
+        .map(|value| (*value & (1u64 << bit)) != 0)
+        .unwrap_or(true)
+}
+
+#[inline]
+fn set_reaping_bit(state: &mut ReapingPidState, pid: ProcessId) {
+    if let Some(value) = state.bits.get_mut(pid / 64) {
+        *value |= 1u64 << (pid % 64);
+    }
+}
+
+#[inline]
+fn clear_reaping_bit(state: &mut ReapingPidState, pid: ProcessId) {
+    if let Some(value) = state.bits.get_mut(pid / 64) {
+        *value &= !(1u64 << (pid % 64));
+    }
+}
+
+/// Begin one detached task's raw-PID/TGID cleanup transaction.
+///
+/// Caller holds `PROCESS_TABLE`, so allocator observation is atomic with the
+/// slot detach.  Pinning `tgid` prevents a new process from becoming a leader
+/// with the same numeric TGID while surviving old-group members still own
+/// futex buckets keyed by `(tgid, uaddr)`.
+fn begin_reaping_identity(pid: ProcessId, tgid: ProcessId) {
+    let mut state = REAPING_PID_STATE.lock();
+    set_reaping_bit(&mut state, pid);
+    set_reaping_bit(&mut state, tgid);
+    if let Some(inflight) = state.tgid_inflight.get_mut(tgid) {
+        *inflight = inflight
+            .checked_add(1)
+            .expect("reaping TGID inflight count exceeds PID_MAX");
+    }
+}
+
+/// Complete one detached task's cleanup and release recyclable identities only
+/// after the old thread group has no table members and no other Phase-2 reaper.
+fn finish_reaping_identity(pid: ProcessId, tgid: ProcessId) {
+    // Lock order matches the allocator and all table scanners:
+    // PROCESS_TABLE -> PCB -> REAPING_PID_STATE.
+    let table = PROCESS_TABLE.lock();
+    let group_has_table_member = table.iter().any(|slot| {
+        slot.as_ref()
+            .map(|process| process.lock().tgid == tgid)
+            .unwrap_or(false)
+    });
+
+    let mut state = REAPING_PID_STATE.lock();
+    let remaining = match state.tgid_inflight.get_mut(tgid) {
+        Some(inflight) if *inflight > 0 => {
+            *inflight -= 1;
+            *inflight
+        }
+        _ => {
+            // Bookkeeping corruption must fail closed: retain both bits.
+            klog!(
+                Error,
+                "RF180-3: missing reaping TGID reference for pid={} tgid={}",
+                pid,
+                tgid
+            );
+            return;
+        }
+    };
+
+    // A non-leader PID is no longer present in any raw-PID callback after this
+    // point.  The group leader/TGID has the stronger group-wide lifetime below.
+    if pid != tgid {
+        clear_reaping_bit(&mut state, pid);
+    }
+    if !group_has_table_member && remaining == 0 {
+        clear_reaping_bit(&mut state, tgid);
+    }
+}
 
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
@@ -314,8 +789,27 @@ pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelS
 /// # Returns
 ///
 /// 成功返回 (栈底, 栈顶)，失败返回错误
-pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
+pub fn allocate_kernel_stack(
+    pid: ProcessId,
+) -> Result<
+    (
+        VirtAddr,
+        VirtAddr,
+        PhysFrame<Size4KiB>,
+        crate::rcu::RcuCallbackPermit,
+    ),
+    KernelStackError,
+> {
     let (stack_base, stack_top) = kernel_stack_slot(pid)?;
+    // R180-12: reserve deferred-reclamation capacity before allocating frames
+    // or publishing mappings. Pool exhaustion is ordinary creation backpressure.
+    let reclaim_permit =
+        crate::rcu::try_reserve_stack_callback(pid).map_err(|error| match error {
+            crate::rcu::RcuBackpressure::StackCallbackLimit => KernelStackError::ReclaimPending,
+            crate::rcu::RcuBackpressure::CallbackPoolExhausted => {
+                KernelStackError::CallbackPoolExhausted
+            }
+        })?;
     // R103-I2 FIX: Derive guard_base from stack_base using checked arithmetic
     // instead of the previous unchecked `KSTACK_BASE + pid as u64 * KSTACK_STRIDE`.
     let guard_bytes = KSTACK_GUARD_PAGES as u64 * PAGE_SIZE;
@@ -326,23 +820,28 @@ pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), Ker
     let guard_base = VirtAddr::new(guard_base_addr);
 
     let mut frame_alloc = FrameAllocator::new();
+    let mut rollback_data_frame: Option<PhysFrame<Size4KiB>> = None;
+    let mut rollback_table_frames: [Option<PhysFrame<Size4KiB>>; KSTACK_PT_LEDGER_CAPACITY] =
+        [None; KSTACK_PT_LEDGER_CAPACITY];
+    let mut rollback_table_count = 0usize;
+    let mut rollback_quarantine = false;
 
-    unsafe {
+    let mapped_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| {
             // 检查整个 slot（守护页 + 栈页）是否已被映射
             let total_pages = KSTACK_PAGES + KSTACK_GUARD_PAGES;
             for i in 0..total_pages {
                 let addr = guard_base + (i as u64 * PAGE_SIZE);
-                if mgr.translate_addr(addr).is_some() {
+                if !mgr.page_slot_is_unused(Page::containing_address(addr)) {
                     return Err(KernelStackError::AlreadyMapped);
                 }
             }
 
             // 分配连续物理帧
-            let phys_start = frame_alloc
+            let phys_start_frame = frame_alloc
                 .allocate_contiguous_frames(KSTACK_PAGES)
-                .ok_or(KernelStackError::AllocationFailed)?
-                .start_address();
+                .ok_or(KernelStackError::AllocationFailed)?;
+            let phys_start = phys_start_frame.start_address();
 
             // R128-1 FIX: 内核栈页标志：可写、不可执行。
             // 不使用 GLOBAL 标志：per-process 内核栈在 PID 回收时会被解映射并重新分配。
@@ -355,20 +854,150 @@ pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), Ker
 
             // 映射栈页（守护页不映射，自动触发页错误）
             let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
-            mgr.map_range(stack_base, phys_start, stack_size, flags, &mut frame_alloc)
-                .map_err(|_| KernelStackError::MapFailed)?;
+            // Map with a fixed rollback ledger. `map_range()` uses a heap Vec
+            // after physical allocation; a kernel stack has exactly four pages,
+            // so keep this post-admission path allocation-free.
+            let mut mapped_pages = 0usize;
+            let mut pt_recorder = KernelStackPtRecorder::new(&mut frame_alloc);
+            for index in 0..KSTACK_PAGES {
+                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
+                let frame = PhysFrame::containing_address(phys_start + (index as u64 * PAGE_SIZE));
+                if mgr.map_page(page, frame, flags, &mut pt_recorder).is_err() {
+                    // Freeze the table-frame provenance record before any
+                    // rollback mutation. No allocation occurs below this point.
+                    let (tracked_tables, tracked_len) = pt_recorder.into_record();
+
+                    // First prove every installed leaf still maps the exact
+                    // order-2 block allocated by this transaction. If proof
+                    // fails, mutate nothing and quarantine both the mapping and
+                    // PID-indexed RCU permit.
+                    let mut leaves_valid = true;
+                    for rollback in 0..mapped_pages {
+                        let rollback_page =
+                            Page::containing_address(stack_base + (rollback as u64 * PAGE_SIZE));
+                        let expected = PhysFrame::containing_address(
+                            phys_start + (rollback as u64 * PAGE_SIZE),
+                        );
+                        if mgr.translate_page_4k(rollback_page) != Some(expected) {
+                            leaves_valid = false;
+                            break;
+                        }
+                    }
+
+                    let mut cleared = 0usize;
+                    let mut matched = 0usize;
+                    if leaves_valid {
+                        for rollback in (0..mapped_pages).rev() {
+                            let rollback_page = Page::containing_address(
+                                stack_base + (rollback as u64 * PAGE_SIZE),
+                            );
+                            let expected = PhysFrame::containing_address(
+                                phys_start + (rollback as u64 * PAGE_SIZE),
+                            );
+                            match mgr.unmap_page(rollback_page) {
+                                Ok(actual) => {
+                                    cleared += 1;
+                                    if actual == expected {
+                                        matched += 1;
+                                    } else {
+                                        leaves_valid = false;
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    leaves_valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // These high-half tables are shared by many distinct CR3
+                    // roots. A current-CR3 range shootdown is insufficient.
+                    if cleared != 0 {
+                        mm::flush_all_address_spaces();
+                    }
+
+                    if leaves_valid && matched == mapped_pages {
+                        let report = mgr.rollback_tracked_leaf_tables(
+                            stack_base,
+                            stack_size,
+                            &tracked_tables,
+                            tracked_len,
+                            &mut rollback_table_frames,
+                            false,
+                        );
+                        if report.all_accounted {
+                            rollback_table_count = report.reclaimed_count;
+                            rollback_data_frame = Some(phys_start_frame);
+                        } else {
+                            // R180-12 FIX: an incomplete hierarchy report can
+                            // mean that a recorder-owned table still contains an
+                            // unexpected leaf.  Even though the requested stack
+                            // leaves were removed, that leaf may alias the same
+                            // buddy block.  Quarantine the detached table frames
+                            // and data block together; freeing either would turn
+                            // an accounting anomaly into mapped-frame reuse.
+                            rollback_table_count = 0;
+                            rollback_quarantine = true;
+                        }
+                    } else {
+                        rollback_quarantine = true;
+                    }
+                    return Err(KernelStackError::MapFailed);
+                }
+                mapped_pages += 1;
+            }
 
             // 清零栈区域
             core::ptr::write_bytes(stack_base.as_mut_ptr::<u8>(), 0, stack_size);
 
-            Ok((stack_base, stack_top))
+            Ok((stack_base, stack_top, phys_start_frame))
         })
+    };
+
+    match mapped_result {
+        Ok(mapped) => Ok((mapped.0, mapped.1, mapped.2, reclaim_permit)),
+        Err(error) => {
+            let mut release_failed = false;
+            for frame in rollback_table_frames
+                .iter()
+                .take(rollback_table_count)
+                .flatten()
+                .copied()
+            {
+                if frame_alloc.try_deallocate_frame(frame).is_err() {
+                    release_failed = true;
+                }
+            }
+            if let Some(frame) = rollback_data_frame {
+                if frame_alloc
+                    .try_deallocate_contiguous_frames(frame, KSTACK_PAGES)
+                    .is_err()
+                {
+                    release_failed = true;
+                }
+            }
+
+            if rollback_quarantine || release_failed {
+                // Dropping the permit would make the PID/VA slot reusable after
+                // a rollback whose physical/table ownership was not completely
+                // proven. Permanently pin it fail-closed.
+                core::mem::forget(reclaim_permit);
+            }
+            Err(error)
+        }
     }
 }
 
 /// 进程状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
+    /// R180-19: fully constructed enough to own a reserved scheduler slot, but
+    /// not yet committed/runnable.  Wake paths do not treat this as Blocked,
+    /// and scheduler selection admits only `Ready`, so no signal can publish a
+    /// pre-COW child early.
+    Provisioning,
     /// 就绪状态，等待被调度
     Ready,
     /// 运行状态
@@ -687,6 +1316,17 @@ pub struct MmState {
     /// and strand the in-flight lane). Cleared on EVERY commit / rollback / abort
     /// path (RAII `StackGrowReservation`) and reset on exec.
     pub stack_grow_in_progress: bool,
+
+    /// R180-19 FIX: address-space fork transaction reservation.
+    ///
+    /// Set under the shared `MmState` lock only after proving that mmap,
+    /// munmap, mprotect, brk, and stack growth have no in-flight transient.
+    /// Every PT+metadata mutator checks this flag before arming its own
+    /// transient reservation.  Fork may then snapshot `MmState`, drop the lock,
+    /// and COW-clone under PT_LOCK without a CLONE_VM sibling changing PTEs or
+    /// metadata between those two steps.  Cleared by an RAII guard on every
+    /// fork exit.
+    pub fork_in_progress: bool,
 }
 
 impl MmState {
@@ -715,6 +1355,7 @@ impl MmState {
             stack_grow_pending_bytes: 0,
             stack_floor_committed: 0,
             stack_grow_in_progress: false,
+            fork_in_progress: false,
         }
     }
 
@@ -850,7 +1491,7 @@ impl MmState {
 
 /// 进程控制块（PCB）
 ///
-/// 注意：Process 不实现 Clone，因为 fd_table 包含不可克隆的 Box<dyn FileOps>。
+/// 注意：Process 不实现 Clone，因为 fd_table 包含需可失败复制的 FileDescriptor。
 /// 进程复制（fork）通过手动字段复制和 clone_box() 实现。
 ///
 /// # 线程模型
@@ -1064,6 +1705,16 @@ pub struct Process {
     /// 内核栈顶（用于 TSS.rsp0）
     pub kernel_stack_top: VirtAddr,
 
+    /// Original buddy block identity for the four-page kernel stack. Deferred
+    /// reclaim validates every leaf against this exact base before returning
+    /// the order-2 block; deriving identity from mutable PTEs at teardown would
+    /// let corruption substitute an unrelated allocation.
+    pub(crate) kernel_stack_phys: Option<PhysFrame<Size4KiB>>,
+
+    /// R180-12: callback capacity reserved before this stack was allocated.
+    /// Teardown consumes it to enqueue allocation-free deferred reclamation.
+    pub(crate) kernel_stack_rcu: Option<crate::rcu::RcuCallbackPermit>,
+
     /// 用户栈指针（如果是用户进程）
     pub user_stack: Option<VirtAddr>,
 
@@ -1094,12 +1745,26 @@ pub struct Process {
     /// 文件描述符表（fd -> 描述符）
     ///
     /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
-    pub fd_table: BTreeMap<i32, FileDescriptor>,
+    pub fd_table: AdmittedMap<i32, FileDescriptor>,
 
     /// R39-4 FIX: 带 FD_CLOEXEC 标记的文件描述符集合
     ///
     /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
-    pub cloexec_fds: BTreeSet<i32>,
+    pub cloexec_fds: AdmittedSet<i32>,
+
+    /// R180-23: FD numbers admitted for an in-progress open transaction but not
+    /// yet published in `fd_table`. Fixed bitmap: reservation cannot allocate,
+    /// competing allocators skip the slot, and guessed use still observes EBADF.
+    fd_reservations: [u64; FD_RESERVATION_WORDS],
+
+    /// Subset of `fd_reservations` whose eventual publication must atomically
+    /// install FD_CLOEXEC. Keeping this in fixed storage lets reservation also
+    /// pre-grow the admitted set before a mutating VFS operation begins.
+    fd_cloexec_reservations: [u64; FD_RESERVATION_WORDS],
+
+    /// `files.max` charges currently held by `fd_reservations`. Kept separate
+    /// from the installed-FD count so both invariants remain auditable at exit.
+    fd_reservations_charged_count: u64,
 
     /// M0-6: POSIX resource limits (getrlimit/setrlimit/prlimit64).
     ///
@@ -1157,7 +1822,7 @@ pub struct Process {
     pub waiting_child: Option<ProcessId>,
 
     /// 子进程列表
-    pub children: Vec<ProcessId>,
+    pub children: AdmittedVec<ProcessId>,
 
     /// R158-4 FIX: Reserved child slots not yet committed (prevents concurrent capacity theft).
     pub children_reserved: usize,
@@ -1253,13 +1918,13 @@ pub struct Process {
     /// Each entry contains the namespace and the PID as seen from that namespace.
     /// The last entry is the owning (leaf) namespace where the process was created.
     /// Root namespace (level 0) uses global PID directly.
-    pub pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>,
+    pub pid_ns_chain: AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
 
     /// PID namespace for children
     ///
     /// When CLONE_NEWPID is used, children are created in a new child namespace.
     /// Otherwise, children inherit this namespace (same as parent's owning namespace).
-    pub pid_ns_for_children: Arc<crate::pid_namespace::PidNamespace>,
+    pub pid_ns_for_children: crate::pid_namespace::PidNamespaceArc,
 
     // ========== F.1: Mount Namespace Support ==========
     /// Mount namespace of this process
@@ -1359,6 +2024,14 @@ pub struct Process {
     /// 在安装期间拒绝创建新线程，防止 TSYNC 竞态绕过
     pub seccomp_installing: bool,
 
+    /// RF180-1 FIX: monotonic revision of the committed seccomp filter stack.
+    ///
+    /// Clone snapshots this value with the filter state, then re-validates it
+    /// while holding the parent lock through child policy publication.  A
+    /// boolean `seccomp_installing` sample cannot detect an installation that
+    /// both starts and completes between two clone snapshots; the revision can.
+    pub seccomp_generation: u64,
+
     // ========== G.1: Observability ==========
     /// Watchdog handle for hung-task detection.
     ///
@@ -1437,13 +2110,221 @@ pub struct Process {
     /// RF178-33: finish-task-switch is clearing `on_cpu` and completing the
     /// corresponding parent wake. Reapers must wait until this handoff clears.
     pub switch_reap_pending: AtomicBool,
+
+    /// Aggregate lifetime charge for construction-time shared control blocks
+    /// and the retained process-name buffer. The outer PCB Arc has an
+    /// independent allocator-owned charge that survives the last strong owner
+    /// until the final `ProcessWeak` deallocates the control block (RF180-40).
+    /// Declared last so all payload-owned allocations are destroyed before this
+    /// payload charge is released.
+    _heap_charge: Option<HeapCharge>,
 }
+
+// The fixed charge registry must never be the limiting resource. At this
+// conservative lower bound, the CoreProcess byte gate permits at most 1024
+// simultaneously live process Arc allocations.
+const _: () = assert!(
+    core::mem::size_of::<Mutex<Process>>()
+        >= HeapClass::CoreProcess.limit_bytes() / PROCESS_ARC_CHARGE_SLOTS
+);
 
 impl Process {
     /// 创建新进程
     ///
     /// 默认以root权限运行（uid=0, gid=0），umask为标准0o022
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
+        let mm = Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(
+            DEFAULT_MMAP_BASE,
+        ))));
+        let cap_table = Arc::new(CapTable::new());
+        let thread_group_exiting = Arc::new(AtomicBool::new(false));
+        let credentials = Arc::new(RwLock::new(Credentials {
+            uid: 65534,
+            gid: 65534,
+            euid: 65534,
+            egid: 65534,
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+        }));
+        Self::new_with_allocations(
+            pid,
+            ppid,
+            name,
+            priority,
+            mm,
+            cap_table,
+            thread_group_exiting,
+            credentials,
+            None,
+        )
+    }
+
+    /// R180-7: construct a production PCB as one fallible admission
+    /// transaction. Every allocator request is preceded by a conservative byte
+    /// reservation; failure drops all private allocations and rolls the ledger
+    /// back before the PCB can enter `PROCESS_TABLE`.
+    pub fn try_new_pcb(
+        pid: ProcessId,
+        ppid: ProcessId,
+        name: ProcessNameSnapshot,
+        priority: Priority,
+    ) -> Result<ProcessArc, ProcessCreateError> {
+        let process_arc_bytes =
+            arc_charge_bytes::<Mutex<Process>>().map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let mut fixed_total = 0usize;
+        for bytes in [
+            arc_charge_bytes::<Mutex<MmState>>(),
+            arc_charge_bytes::<AtomicBool>(),
+            arc_charge_bytes::<RwLock<Credentials>>(),
+        ] {
+            let bytes = bytes.map_err(|_| ProcessCreateError::OutOfMemory)?;
+            fixed_total = fixed_total
+                .checked_add(bytes)
+                .ok_or(ProcessCreateError::OutOfMemory)?;
+        }
+        let estimated_name = vec_charge_bytes::<u8>(name.as_str().len())
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let estimated_total = fixed_total
+            .checked_add(estimated_name)
+            .ok_or(ProcessCreateError::OutOfMemory)?;
+        let mut reservation = try_reserve_heap(HeapClass::CoreProcess, estimated_total)
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        // Reserve the outer Arc independently before any allocation. Its charge
+        // is transferred to ProcessArcAllocator and therefore follows the
+        // control block through the final Weak drop instead of the PCB payload.
+        let process_arc_reservation = try_reserve_heap(HeapClass::CoreProcess, process_arc_bytes)
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+
+        // RF180-17 FIX: no process-name allocation precedes admission.
+        let mut owned_name = String::new();
+        owned_name
+            .try_reserve_exact(name.as_str().len())
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let actual_total = fixed_total
+            .checked_add(
+                vec_charge_bytes::<u8>(owned_name.capacity())
+                    .map_err(|_| ProcessCreateError::OutOfMemory)?,
+            )
+            .ok_or(ProcessCreateError::OutOfMemory)?;
+        reservation
+            .resize(actual_total)
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        owned_name.push_str(name.as_str());
+
+        let mm = Arc::try_new(Mutex::new(MmState::new(security::randomized_mmap_base(
+            DEFAULT_MMAP_BASE,
+        ))))
+        .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let thread_group_exiting =
+            Arc::try_new(AtomicBool::new(false)).map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let credentials = Arc::try_new(RwLock::new(Credentials {
+            uid: 65534,
+            gid: 65534,
+            euid: 65534,
+            egid: 65534,
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+        }))
+        .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let payload_charge = reservation
+            .commit()
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let process = Self::new_with_allocations(
+            pid,
+            ppid,
+            owned_name,
+            priority,
+            mm,
+            cap_table,
+            thread_group_exiting,
+            credentials,
+            Some(payload_charge),
+        );
+        let process_arc_charge = process_arc_reservation
+            .commit()
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let allocator = ProcessArcAllocator::try_install(process_arc_charge).map_err(|charge| {
+            drop(charge);
+            ProcessCreateError::OutOfMemory
+        })?;
+        match Arc::try_new_in(Mutex::new(process), allocator) {
+            Ok(process) => Ok(process),
+            Err(_) => {
+                allocator.cancel_failed_allocation();
+                Err(ProcessCreateError::OutOfMemory)
+            }
+        }
+    }
+
+    /// RF180-40 executable proof for the outer process Arc's exact accounting
+    /// lifetime. The PCB payload and every payload-owned allocation disappear
+    /// with the last strong reference, but a procfs-style Weak must keep the Arc
+    /// control block and its independent charge live until that Weak is dropped.
+    pub fn run_arc_lifetime_self_test() {
+        let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
+        let outer_bytes = arc_charge_bytes::<Mutex<Process>>()
+            .expect("RF180-40 process Arc charge must be representable");
+        let process = Self::try_new_pcb(
+            0x180_4001,
+            1,
+            ProcessNameSnapshot::from_parts("rf180-40-process-arc", ""),
+            120,
+        )
+        .expect("RF180-40 process Arc fixture");
+        let weak: ProcessWeak = Arc::downgrade(&process);
+
+        drop(process);
+        let after_strong = mm::heap_class_snapshot(HeapClass::CoreProcess);
+        assert_eq!(after_strong.reserved_bytes, before.reserved_bytes);
+        assert_eq!(
+            after_strong.committed_bytes,
+            before
+                .committed_bytes
+                .checked_add(outer_bytes)
+                .expect("RF180-40 snapshot arithmetic"),
+            "RF180-40 final Weak must retain exactly the outer Arc charge"
+        );
+        assert!(weak.upgrade().is_none());
+
+        drop(weak);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::CoreProcess),
+            before,
+            "RF180-40 final Weak drop must deallocate then release admission"
+        );
+    }
+
+    /// RF180-17 FIX: publish an already-admitted name with no allocation or
+    /// recoverable failure in exec's post-PONR commit window.
+    pub fn commit_prepared_name(&mut self, prepared: PreparedProcessName) {
+        let old_bytes = vec_charge_bytes::<u8>(self.name.capacity())
+            .expect("live process-name capacity charge must be representable");
+        let PreparedProcessName { name, reservation } = prepared;
+        let charge = self
+            ._heap_charge
+            .as_mut()
+            .expect("production process must own aggregate heap charge");
+        charge
+            .absorb(reservation)
+            .expect("prepared process-name charge must match PCB class");
+        let old = core::mem::replace(&mut self.name, name);
+        drop(old);
+        charge
+            .release_after_deallocation(old_bytes)
+            .expect("process-name charge release must match old allocation");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_allocations(
+        pid: ProcessId,
+        ppid: ProcessId,
+        name: String,
+        priority: Priority,
+        mm: Arc<Mutex<MmState>>,
+        cap_table: Arc<CapTable>,
+        thread_group_exiting: Arc<AtomicBool>,
+        credentials: Arc<RwLock<Credentials>>,
+        heap_charge: Option<HeapCharge>,
+    ) -> Self {
         Process {
             pid,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst), // lint-fetch-add: allow (generation counter)
@@ -1482,24 +2363,27 @@ impl Process {
             fpu_used: false, // Lazy FPU: process hasn't used FPU yet
             kernel_stack: VirtAddr::new(0),
             kernel_stack_top: VirtAddr::new(0),
+            kernel_stack_phys: None,
+            kernel_stack_rcu: None,
             user_stack: None,
             memory_space: 0,
             user_memory_space: 0,
-            mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(
-                DEFAULT_MMAP_BASE,
-            )))),
-            fd_table: BTreeMap::new(),
-            cloexec_fds: BTreeSet::new(),
+            mm,
+            fd_table: AdmittedMap::new(HeapClass::CoreProcess),
+            cloexec_fds: AdmittedSet::new(HeapClass::CoreProcess),
+            fd_reservations: [0; FD_RESERVATION_WORDS],
+            fd_cloexec_reservations: [0; FD_RESERVATION_WORDS],
+            fd_reservations_charged_count: 0,
             rlimits: default_rlimits(), // M0-6: POSIX resource limits
             fds_charged_count: 0,       // J2-7: no fds charged at construction
 
-            cap_table: Arc::new(CapTable::new()),
+            cap_table,
             exit_code: None,
-            thread_group_exiting: Arc::new(AtomicBool::new(false)),
+            thread_group_exiting,
             pending_kill: AtomicBool::new(false),
             pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
-            children: Vec::new(),
+            children: AdmittedVec::new(HeapClass::CoreProcess),
             children_reserved: 0,
             children_incomplete: false,
             cpu_time: 0,
@@ -1520,13 +2404,7 @@ impl Process {
             // restricted defaults. Kernel-internal processes (ppid=0) are promoted
             // to root explicitly by create_process(), and fork()/clone() inherit
             // credentials from the parent process via independent clone.
-            credentials: Arc::new(RwLock::new(Credentials {
-                uid: 65534,
-                gid: 65534,
-                euid: 65534,
-                egid: 65534,
-                supplementary_groups: Vec::new(),
-            })),
+            credentials,
             umask: 0o022,
             // OOM killer 支持 - 默认中立设置
             nice: 0,
@@ -1542,7 +2420,7 @@ impl Process {
             robust_list_len: 0,
             // F.1: PID namespace - default to root namespace
             // The actual chain will be assigned by create_process after PID allocation
-            pid_ns_chain: Vec::new(),
+            pid_ns_chain: AdmittedVec::new(HeapClass::CoreProcess),
             pid_ns_for_children: crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
             // F.1: Mount namespace - default to root mount namespace
             // The actual namespace will be assigned by create_process from parent
@@ -1567,11 +2445,14 @@ impl Process {
             pledge_state: None,
             // R26-3: seccomp 安装状态标志
             seccomp_installing: false,
+            // RF180-1: no committed filter installations at process birth.
+            seccomp_generation: 0,
             // G.1: Watchdog not registered until process starts running
             watchdog_handle: None,
             // R169-9: teardown bookkeeping starts unclaimed / not-done.
             teardown_claimed: core::sync::atomic::AtomicBool::new(false),
             teardown_done: core::sync::atomic::AtomicBool::new(false),
+            _heap_charge: heap_charge,
         }
     }
 
@@ -1594,26 +2475,270 @@ impl Process {
     /// inline-drop timing are tagged `D2-FD-DROP-UNDER-LOCK` at the call site.
     /// Both failure arms are charge-neutral: the no-slot arm never charged,
     /// and the charge arm's `try_charge_fds` already failed.
-    pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Result<i32, FileDescriptor> {
-        let fd = match self.next_available_fd() {
-            Some(fd) => fd,
-            None => return Err(desc),
-        };
-        // J2-7: charge the per-cgroup FD budget BEFORE installing (fail-closed:
-        // returns Err, which every caller surfaces as EMFILE). The Process lock
-        // is held (&mut self); "Process lock → cgroup charge" is the established
-        // order (fork.rs charges memory under the parent lock at ~line 200).
-        if crate::cgroup::try_charge_fds(self.cgroup_id, 1).is_err() {
-            return Err(desc);
+    #[inline]
+    fn fd_is_reserved(&self, fd: i32) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
         }
-        self.fds_charged_count = self.fds_charged_count.saturating_add(1);
-        self.fd_table.insert(fd, desc);
-        Ok(fd)
+        let fd = fd as usize;
+        self.fd_reservations
+            .get(fd / 64)
+            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
+    }
+
+    #[inline]
+    fn set_fd_reserved(&mut self, fd: i32, reserved: bool) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        let Some(word) = self.fd_reservations.get_mut(fd / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (fd % 64);
+        let was_reserved = *word & mask != 0;
+        if reserved {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+        was_reserved
+    }
+
+    #[inline]
+    fn fd_cloexec_is_reserved(&self, fd: i32) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        self.fd_cloexec_reservations
+            .get(fd / 64)
+            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
+    }
+
+    #[inline]
+    fn set_fd_cloexec_reserved(&mut self, fd: i32, reserved: bool) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        let Some(word) = self.fd_cloexec_reservations.get_mut(fd / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (fd % 64);
+        let was_reserved = *word & mask != 0;
+        if reserved {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+        was_reserved
+    }
+
+    #[inline]
+    fn pending_fd_reservations(&self) -> Option<usize> {
+        usize::try_from(self.fd_reservations_charged_count).ok()
+    }
+
+    #[inline]
+    fn pending_cloexec_reservations(&self) -> usize {
+        self.fd_cloexec_reservations
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Ensure live admitted backing has room for all existing reservations and
+    /// one additional publication. No externally visible state is changed.
+    fn prepare_fd_reservation_storage(&mut self, cloexec: bool) -> Result<(), ()> {
+        let fd_additional = self
+            .pending_fd_reservations()
+            .ok_or(())?
+            .checked_add(1)
+            .ok_or(())?;
+        self.fd_table
+            .ensure_capacity_for(fd_additional)
+            .map_err(|_| ())?;
+
+        if cloexec {
+            let cloexec_additional = self
+                .pending_cloexec_reservations()
+                .checked_add(1)
+                .ok_or(())?;
+            self.cloexec_fds
+                .ensure_capacity_for(cloexec_additional)
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn remove_fd_entry_preserving_reservations(&mut self, fd: i32) -> Option<FileDescriptor> {
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.remove(&fd)
+        } else {
+            self.fd_table.remove_retaining_capacity(&fd)
+        }
+    }
+
+    #[inline]
+    fn remove_cloexec_preserving_reservations(&mut self, fd: i32) -> bool {
+        if self.pending_cloexec_reservations() == 0 {
+            self.cloexec_fds.remove(&fd)
+        } else {
+            self.cloexec_fds.remove_retaining_capacity(&fd)
+        }
+    }
+
+    /// R180-23: reserve an FD number and its hierarchical `files.max` charge
+    /// before a VFS call is allowed to create or truncate anything. The fixed
+    /// bitmap mutation is allocation-free and competing FD operations skip the
+    /// number until commit or cancellation.
+    pub fn reserve_fd(&mut self) -> Option<i32> {
+        self.reserve_fd_with_cloexec(false)
+    }
+
+    /// Reserve an FD and, when requested, an admitted CLOEXEC publication slot
+    /// before any VFS/socket/pipe side effect. Both insertions are allocation-
+    /// free at commit, and cancellation releases the files.max credit exactly.
+    pub fn reserve_fd_with_cloexec(&mut self, cloexec: bool) -> Option<i32> {
+        self.reserve_fd_from_with_cloexec(3, cloexec)
+    }
+
+    /// F_DUPFD/F_DUPFD_CLOEXEC reservation: choose the lowest free descriptor
+    /// at or above `min_fd`, including 0..2 when explicitly requested, while
+    /// skipping every in-flight reservation bit.
+    pub fn reserve_fd_from_with_cloexec(&mut self, min_fd: i32, cloexec: bool) -> Option<i32> {
+        let fd = self.next_available_fd_from(min_fd)?;
+        self.prepare_fd_reservation_storage(cloexec).ok()?;
+        crate::cgroup::try_charge_fds(self.cgroup_id, 1).ok()?;
+        let Some(next_reserved_count) = self.fd_reservations_charged_count.checked_add(1) else {
+            crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+            return None;
+        };
+        if self.set_fd_reserved(fd, true) {
+            panic!("R180-23: free-FD scan selected an already reserved slot");
+        }
+        if cloexec && self.set_fd_cloexec_reserved(fd, true) {
+            panic!("R180-23: CLOEXEC reservation bit duplicated");
+        }
+        self.fd_reservations_charged_count = next_reserved_count;
+        Some(fd)
+    }
+
+    /// Publish a descriptor into a previously reserved slot. This consumes the
+    /// existing cgroup charge; no second files.max admission occurs.
+    pub fn install_reserved_fd(
+        &mut self,
+        fd: i32,
+        desc: FileDescriptor,
+    ) -> Result<(), FileDescriptor> {
+        assert!(
+            self.fd_is_reserved(fd) && !self.fd_table.contains_key(&fd),
+            "R180-23: invalid or occupied FD reservation at commit"
+        );
+        let next_reserved_count = self
+            .fd_reservations_charged_count
+            .checked_sub(1)
+            .expect("R180-23: reservation charge underflow at commit");
+        let next_installed_count = self
+            .fds_charged_count
+            .checked_add(1)
+            .expect("R180-23: installed FD charge overflow at commit");
+
+        let cloexec = self.fd_cloexec_is_reserved(fd);
+        if let Err((_fd, _desc)) = self.fd_table.insert_unique_reserved(fd, desc) {
+            // The reservation owns an exact map slot. A failure here is ledger
+            // or local-state corruption after an irreversible VFS operation;
+            // returning an ordinary error would violate R180-23 atomicity.
+            panic!("R180-23: reserved FD backing/identity invariant failed at commit");
+        }
+        if cloexec {
+            match self.cloexec_fds.insert_reserved(fd) {
+                Ok(true) => {}
+                Ok(false) => panic!("R180-23: stale CLOEXEC marker preceded FD publication"),
+                Err(_) => panic!("R180-23: reserved CLOEXEC backing invariant failed at commit"),
+            }
+        }
+
+        let was_reserved = self.set_fd_reserved(fd, false);
+        assert!(
+            was_reserved,
+            "R180-23: committed FD lost its reservation bit"
+        );
+        let was_cloexec_reserved = self.set_fd_cloexec_reserved(fd, false);
+        assert_eq!(was_cloexec_reserved, cloexec);
+        self.fd_reservations_charged_count = next_reserved_count;
+        self.fds_charged_count = next_installed_count;
+        Ok(())
+    }
+
+    /// Cancel one reservation and return its files.max credit. Idempotent false
+    /// on stale/mismatched tokens so a double-cancel cannot undercharge.
+    pub fn cancel_fd_reservation(&mut self, fd: i32) -> bool {
+        if !self.fd_is_reserved(fd) || self.fd_reservations_charged_count == 0 {
+            return false;
+        }
+        if !self.set_fd_reserved(fd, false) {
+            return false;
+        }
+        let _ = self.set_fd_cloexec_reserved(fd, false);
+        self.fd_reservations_charged_count -= 1;
+        crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.reclaim_empty_capacity();
+        }
+        if self.pending_cloexec_reservations() == 0 {
+            self.cloexec_fds.reclaim_empty_capacity();
+        }
+        true
+    }
+
+    /// Installed plus in-flight open charges. Cgroup migration must move both
+    /// before changing `cgroup_id`, otherwise reservation Drop would uncharge a
+    /// different hierarchy from the one originally charged.
+    pub fn total_fd_charge_count(&self) -> u64 {
+        self.fds_charged_count
+            .checked_add(self.fd_reservations_charged_count)
+            .expect("FD charge accounting overflow")
+    }
+
+    pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Result<i32, FileDescriptor> {
+        self.allocate_fd_with_cloexec(desc, false)
+    }
+
+    /// Allocate and atomically publish an FD plus its optional CLOEXEC marker.
+    pub fn allocate_fd_with_cloexec(
+        &mut self,
+        desc: FileDescriptor,
+        cloexec: bool,
+    ) -> Result<i32, FileDescriptor> {
+        self.allocate_fd_from_with_cloexec(desc, 3, cloexec)
+    }
+
+    /// Allocate from a Linux F_DUPFD lower bound with the same admitted table,
+    /// files.max, rollback, and optional CLOEXEC transaction as ordinary open.
+    pub fn allocate_fd_from_with_cloexec(
+        &mut self,
+        desc: FileDescriptor,
+        min_fd: i32,
+        cloexec: bool,
+    ) -> Result<i32, FileDescriptor> {
+        let Some(fd) = self.reserve_fd_from_with_cloexec(min_fd, cloexec) else {
+            return Err(desc);
+        };
+        match self.install_reserved_fd(fd, desc) {
+            Ok(()) => Ok(fd),
+            Err(desc) => {
+                let _ = self.cancel_fd_reservation(fd);
+                Err(desc)
+            }
+        }
     }
 
     /// 获取指定 fd 对应的描述符引用
     pub fn get_fd(&self, fd: i32) -> Option<&FileDescriptor> {
-        if fd < 0 {
+        if fd < 0 || self.fd_is_reserved(fd) {
             return None;
         }
         self.fd_table.get(&fd)
@@ -1624,11 +2749,11 @@ impl Process {
     /// 关闭文件描述符时使用，描述符的 Drop 会自动处理资源清理
     /// R39-4 FIX: 同时清除 CLOEXEC 标记
     pub fn remove_fd(&mut self, fd: i32) -> Option<FileDescriptor> {
-        if fd < 0 {
+        if fd < 0 || self.fd_is_reserved(fd) {
             return None;
         }
-        self.cloexec_fds.remove(&fd);
-        let removed = self.fd_table.remove(&fd);
+        self.remove_cloexec_preserving_reservations(fd);
+        let removed = self.remove_fd_entry_preserving_reservations(fd);
         if removed.is_some() {
             // J2-7: every fd_table entry corresponds to exactly one charge (fds
             // 0/1/2 are virtual — allocate_fd starts at 3), so uncharge exactly 1.
@@ -1686,12 +2811,31 @@ impl Process {
     /// # Arguments
     /// * `fd` - 文件描述符
     /// * `cloexec` - true 设置 CLOEXEC，false 清除
-    pub fn set_fd_cloexec(&mut self, fd: i32, cloexec: bool) {
-        if cloexec {
-            self.cloexec_fds.insert(fd);
-        } else {
-            self.cloexec_fds.remove(&fd);
+    pub fn set_fd_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), ()> {
+        if self.fd_is_reserved(fd) || !self.fd_table.contains_key(&fd) {
+            return Err(());
         }
+        if cloexec {
+            if self.cloexec_fds.contains(&fd) {
+                return Ok(());
+            }
+            // Do not consume capacity promised to an in-flight O_CLOEXEC open.
+            let additional = self
+                .pending_cloexec_reservations()
+                .checked_add(1)
+                .ok_or(())?;
+            self.cloexec_fds
+                .ensure_capacity_for(additional)
+                .map_err(|_| ())?;
+            match self.cloexec_fds.insert_reserved(fd) {
+                Ok(true) => {}
+                Ok(false) => panic!("CLOEXEC marker appeared during locked publication"),
+                Err(_) => panic!("prepared CLOEXEC capacity disappeared during publication"),
+            }
+        } else {
+            self.remove_cloexec_preserving_reservations(fd);
+        }
+        Ok(())
     }
 
     /// R39-4 FIX: 在 exec 期间关闭所有带 FD_CLOEXEC 的文件描述符
@@ -1730,14 +2874,17 @@ impl Process {
     #[must_use = "the returned closed count must be uncharged from the per-cgroup \
                   FD budget (L5) OUTSIDE the Process lock (R169-4)"]
     pub fn take_cloexec_fds_into(&mut self, removed: &mut Vec<FileDescriptor>) -> u64 {
-        let cloexec = core::mem::take(&mut self.cloexec_fds);
+        let cloexec = core::mem::replace(
+            &mut self.cloexec_fds,
+            AdmittedSet::new(HeapClass::CoreProcess),
+        );
         debug_assert!(
             removed.capacity().saturating_sub(removed.len()) >= cloexec.len(),
             "take_cloexec_fds_into: caller under-reserved the cloexec drop buffer"
         );
         let mut closed: u64 = 0;
         for fd in cloexec.iter().copied() {
-            if let Some(desc) = self.fd_table.remove(&fd) {
+            if let Some(desc) = self.remove_fd_entry_preserving_reservations(fd) {
                 // Stale cloexec entries for already-closed fds contribute 0
                 // (remove() == None), so the uncharge count stays exact.
                 closed += 1;
@@ -1756,6 +2903,9 @@ impl Process {
         }
         if closed > 0 {
             self.fds_charged_count = self.fds_charged_count.saturating_sub(closed);
+        }
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.reclaim_empty_capacity();
         }
         closed
     }
@@ -1776,17 +2926,84 @@ impl Process {
         &mut self,
         fd: i32,
         desc: FileDescriptor,
-    ) -> Result<Option<FileDescriptor>, ()> {
+    ) -> Result<Option<FileDescriptor>, FileDescriptor> {
+        self.replace_fd_charged_with_cloexec(fd, desc, false)
+    }
+
+    /// Net-aware dup2/dup3 publication with optional atomic CLOEXEC marking.
+    /// Every allocation is prepared before the old descriptor is displaced.
+    pub fn replace_fd_charged_with_cloexec(
+        &mut self,
+        fd: i32,
+        desc: FileDescriptor,
+        cloexec: bool,
+    ) -> Result<Option<FileDescriptor>, FileDescriptor> {
+        if !(0..MAX_FD).contains(&fd) || self.fd_is_reserved(fd) {
+            return Err(desc);
+        }
         let occupied = self.fd_table.contains_key(&fd);
+        let had_cloexec = self.cloexec_fds.contains(&fd);
         if !occupied {
             // Net +1 — charge fail-closed BEFORE any mutation.
-            crate::cgroup::try_charge_fds(self.cgroup_id, 1).map_err(|_| ())?;
-            self.fds_charged_count = self.fds_charged_count.saturating_add(1);
+            let Some(additional) = self
+                .pending_fd_reservations()
+                .and_then(|pending| pending.checked_add(1))
+            else {
+                return Err(desc);
+            };
+            if self.fd_table.ensure_capacity_for(additional).is_err() {
+                return Err(desc);
+            }
+            if crate::cgroup::try_charge_fds(self.cgroup_id, 1).is_err() {
+                return Err(desc);
+            }
         }
-        self.cloexec_fds.remove(&fd);
+        if cloexec && !had_cloexec {
+            let Some(additional) = self.pending_cloexec_reservations().checked_add(1) else {
+                if !occupied {
+                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+                }
+                return Err(desc);
+            };
+            if self.cloexec_fds.ensure_capacity_for(additional).is_err() {
+                if !occupied {
+                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+                }
+                return Err(desc);
+            }
+        }
         // Occupied → insert returns the old entry (its charge is reused, count
         // unchanged); empty → returns None.
-        let displaced = self.fd_table.insert(fd, desc);
+        let displaced = if occupied {
+            self.fd_table
+                .try_insert(fd, desc)
+                .unwrap_or_else(|_| panic!("occupied FD replacement attempted allocation"))
+        } else {
+            match self.fd_table.insert_unique_reserved(fd, desc) {
+                Ok(()) => {
+                    self.fds_charged_count = self
+                        .fds_charged_count
+                        .checked_add(1)
+                        .expect("installed FD charge count overflow");
+                    None
+                }
+                Err((_fd, desc)) => {
+                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+                    return Err(desc);
+                }
+            }
+        };
+        if cloexec {
+            if !had_cloexec {
+                match self.cloexec_fds.insert_reserved(fd) {
+                    Ok(true) => {}
+                    Ok(false) => panic!("dup CLOEXEC marker appeared without publication"),
+                    Err(_) => panic!("prepared dup CLOEXEC slot disappeared during publication"),
+                }
+            }
+        } else {
+            self.remove_cloexec_preserving_reservations(fd);
+        }
         // U.S3-B FIX: the DISPLACED entry leaves fd_table here without passing
         // through remove_fd, so its cap refcount must be decremented (revoke at
         // 0) or every dup2/dup3 onto an occupied cap-bearing fd leaks a slot
@@ -1800,11 +3017,14 @@ impl Process {
     }
 
     /// 查找下一个可用的 fd（从 3 开始）
-    fn next_available_fd(&self) -> Option<i32> {
+    fn next_available_fd_from(&self, min_fd: i32) -> Option<i32> {
         // 从 3 开始，因为 0/1/2 保留给标准流
-        let mut fd: i32 = 3;
+        if !(0..MAX_FD).contains(&min_fd) {
+            return None;
+        }
+        let mut fd = min_fd;
         while fd < MAX_FD {
-            if !self.fd_table.contains_key(&fd) {
+            if !self.fd_table.contains_key(&fd) && !self.fd_is_reserved(fd) {
                 return Some(fd);
             }
             fd = fd.checked_add(1)?;
@@ -2179,6 +3399,130 @@ pub fn run_ready_aging_self_test() {
     assert_eq!(proc.wait_ticks, 50);
 }
 
+/// R180-23 executable probe: a migration snapshot must include FD charges
+/// owned by in-flight open reservations as well as installed descriptors.
+pub fn run_fd_charge_migration_self_test() {
+    let mut proc = Process::new(0x180_2301, 1, String::from("r180-23-fd-migration"), 120);
+    proc.fds_charged_count = 3;
+    proc.fd_reservations_charged_count = 2;
+    assert_eq!(
+        proc.total_fd_charge_count(),
+        5,
+        "migration must transfer installed and reserved FD charges"
+    );
+    proc.fd_reservations_charged_count = 0;
+    assert_eq!(proc.total_fd_charge_count(), 3);
+
+    // F_DUPFD lower-bound scans include 0..2 when explicitly requested and
+    // never collide with an in-flight open reservation.
+    assert_eq!(proc.next_available_fd_from(0), Some(0));
+    assert!(!proc.set_fd_reserved(4, true));
+    assert_eq!(proc.next_available_fd_from(4), Some(5));
+    assert!(proc.set_fd_reserved(4, false));
+    assert_eq!(proc.next_available_fd_from(4), Some(4));
+    assert_eq!(proc.next_available_fd_from(MAX_FD), None);
+}
+
+/// Public task-name bound used by fork/clone snapshots.
+pub const PROCESS_NAME_MAX: usize = 256;
+
+/// Heap-free name snapshot. User-triggered fork/clone builds this while the
+/// parent PCB is locked, then the PCB constructor admits and allocates String
+/// storage after all process-creation reservations are in place.
+#[derive(Clone, Copy)]
+pub struct ProcessNameSnapshot {
+    bytes: [u8; PROCESS_NAME_MAX],
+    len: usize,
+}
+
+impl ProcessNameSnapshot {
+    pub fn from_parts(base: &str, suffix: &str) -> Self {
+        let mut bytes = [0u8; PROCESS_NAME_MAX];
+        let mut suffix_len = suffix.len().min(PROCESS_NAME_MAX);
+        while !suffix.is_char_boundary(suffix_len) {
+            suffix_len -= 1;
+        }
+        let mut base_len = base.len().min(PROCESS_NAME_MAX - suffix_len);
+        while !base.is_char_boundary(base_len) {
+            base_len -= 1;
+        }
+        bytes[..base_len].copy_from_slice(&base.as_bytes()[..base_len]);
+        bytes[base_len..base_len + suffix_len].copy_from_slice(&suffix.as_bytes()[..suffix_len]);
+        Self {
+            bytes,
+            len: base_len + suffix_len,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len])
+            .expect("ProcessNameSnapshot is copied only at UTF-8 boundaries")
+    }
+
+    pub fn from_sanitized_ascii(bytes: &[u8]) -> Self {
+        let mut snapshot = Self {
+            bytes: [0u8; PROCESS_NAME_MAX],
+            len: bytes.len().min(PROCESS_NAME_MAX),
+        };
+        for (dst, &src) in snapshot.bytes[..snapshot.len].iter_mut().zip(bytes.iter()) {
+            *dst = if (0x20..0x7f).contains(&src) {
+                src
+            } else {
+                b'?'
+            };
+        }
+        snapshot
+    }
+}
+
+pub struct PreparedProcessName {
+    name: String,
+    reservation: HeapReservation,
+}
+
+impl PreparedProcessName {
+    pub fn try_new(snapshot: ProcessNameSnapshot) -> Result<Self, ProcessCreateError> {
+        let estimated = vec_charge_bytes::<u8>(snapshot.as_str().len())
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let mut reservation = try_reserve_heap(HeapClass::CoreProcess, estimated)
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let mut name = String::new();
+        name.try_reserve_exact(snapshot.as_str().len())
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        reservation
+            .resize(
+                vec_charge_bytes::<u8>(name.capacity())
+                    .map_err(|_| ProcessCreateError::OutOfMemory)?,
+            )
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        name.push_str(snapshot.as_str());
+        Ok(Self { name, reservation })
+    }
+}
+
+pub trait IntoProcessNameSnapshot {
+    fn into_process_name_snapshot(self) -> ProcessNameSnapshot;
+}
+
+impl IntoProcessNameSnapshot for ProcessNameSnapshot {
+    fn into_process_name_snapshot(self) -> ProcessNameSnapshot {
+        self
+    }
+}
+
+impl IntoProcessNameSnapshot for String {
+    fn into_process_name_snapshot(self) -> ProcessNameSnapshot {
+        ProcessNameSnapshot::from_parts(&self, "")
+    }
+}
+
+impl IntoProcessNameSnapshot for &str {
+    fn into_process_name_snapshot(self) -> ProcessNameSnapshot {
+        ProcessNameSnapshot::from_parts(self, "")
+    }
+}
+
 /// 根据优先级计算时间片（毫秒）
 fn calculate_time_slice(priority: Priority) -> u32 {
     // 优先级越高，时间片越长
@@ -2218,11 +3562,13 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
 /// 使用 Option<Arc<Mutex<Process>>> 以支持 PID 作为直接索引。
 /// 索引 0 保留为空（PID 从 1 开始），实际进程存储在其 PID 对应的索引位置。
 lazy_static::lazy_static! {
-    pub static ref PROCESS_TABLE: Mutex<Vec<Option<Arc<Mutex<Process>>>>> = Mutex::new(vec![None]); // 索引0预留
+pub static ref PROCESS_TABLE: Mutex<AdmittedVec<Option<ProcessArc>>> =
+        Mutex::new(AdmittedVec::new(HeapClass::CoreProcess));
     static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
     static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
-    /// 调度器添加进程回调
-    static ref SCHEDULER_ADD: Mutex<Option<SchedulerAddCallback>> = Mutex::new(None);
+    /// R180-19: scheduler admission is registered as one atomic callback set so
+    /// a permit can never be born without matching commit/cancel operations.
+    static ref SCHEDULER_ADMISSION: Mutex<Option<SchedulerAdmissionCallbacks>> = Mutex::new(None);
     /// Futex 唤醒回调（用于 clear_child_tid）
     static ref FUTEX_WAKE: Mutex<Option<FutexWakeCallback>> = Mutex::new(None);
     /// E.5 Cpuset: Task joined callback (for fork/clone)
@@ -2232,6 +3578,66 @@ lazy_static::lazy_static! {
     /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
+}
+
+/// Detach the process-table backing when no published PCB remains.
+///
+/// RF180-44: this function runs while `PROCESS_TABLE` is held, so it may only
+/// mutate and detach storage. The returned owner must be dropped after the
+/// caller releases the table lock; its destructor physically deallocates the
+/// backing before releasing the corresponding whole-heap charge.
+#[must_use = "retired process-table backing must be dropped after PROCESS_TABLE unlock"]
+pub(crate) fn reclaim_empty_process_table(
+    table: &mut AdmittedVec<Option<ProcessArc>>,
+) -> Option<RetiredAdmittedVecCapacity<Option<ProcessArc>>> {
+    if table.iter().all(Option::is_none) {
+        // Every element is `None`, so clearing cannot run an Arc destructor.
+        table.clear_retaining_capacity();
+        table.take_empty_capacity()
+    } else {
+        None
+    }
+}
+
+/// RF180-44 executable proof that process-table backing retirement is split
+/// into an allocation-free locked phase and an out-of-lock destruction phase.
+pub fn run_process_table_retirement_self_test() {
+    let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
+    let table = Mutex::new(AdmittedVec::<Option<ProcessArc>>::new(
+        HeapClass::CoreProcess,
+    ));
+
+    let retired = {
+        let mut table = table.lock();
+        table
+            .try_reserve_exact(4)
+            .expect("RF180-44 process-table fixture backing");
+        table
+            .push_reserved(None)
+            .unwrap_or_else(|_| panic!("RF180-44 process-table fixture capacity vanished"));
+        let live = mm::heap_class_snapshot(HeapClass::CoreProcess);
+        assert!(live.committed_bytes > before.committed_bytes);
+
+        let retired = reclaim_empty_process_table(&mut table)
+            .expect("RF180-44 empty process table must detach its backing");
+        assert!(table.is_empty());
+        assert_eq!(table.capacity(), 0);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::CoreProcess),
+            live,
+            "RF180-44 locked detach must not deallocate or uncharge"
+        );
+        retired
+    };
+
+    let detached = mm::heap_class_snapshot(HeapClass::CoreProcess);
+    assert!(detached.committed_bytes > before.committed_bytes);
+    drop(retired);
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::CoreProcess),
+        before,
+        "RF180-44 retired backing must deallocate before returning admission"
+    );
 }
 
 /// RF178-33: installed once during boot, then read lock-free from the
@@ -2322,9 +3728,13 @@ pub fn init() {
 /// `PROCESS_TABLE` to avoid double-locking.
 fn allocate_global_pid(
     hint: &mut ProcessId,
-    table: &Vec<Option<Arc<Mutex<Process>>>>,
+    table: &[Option<ProcessArc>],
 ) -> Result<ProcessId, ProcessCreateError> {
     let pid_max = PID_MAX.min(MAX_PID);
+    // Lock order: NEXT_PID_HINT -> PROCESS_TABLE -> REAPING_PID_BITS.
+    // cleanup_zombie marks under PROCESS_TABLE before releasing the empty slot,
+    // so the allocator can never observe a reusable gap between those states.
+    let reaping = REAPING_PID_STATE.lock();
 
     let start = match *hint {
         0 => 1,
@@ -2334,7 +3744,8 @@ fn allocate_global_pid(
 
     // Forward scan: [start, pid_max]
     for pid in start..=pid_max {
-        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true);
+        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
+            && !reaping_pid_is_set(&reaping, pid);
         if is_free {
             *hint = if pid == pid_max { 1 } else { pid + 1 };
             return Ok(pid);
@@ -2343,7 +3754,8 @@ fn allocate_global_pid(
 
     // Wrap-around scan: [1, start)
     for pid in 1..start {
-        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true);
+        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
+            && !reaping_pid_is_set(&reaping, pid);
         if is_free {
             *hint = if pid == pid_max { 1 } else { pid + 1 };
             return Ok(pid);
@@ -2370,7 +3782,7 @@ pub fn reserve_child_slot(ppid: ProcessId) -> Result<(), ProcessCreateError> {
             parent
                 .children
                 .try_reserve(additional)
-                .map_err(|_| ProcessCreateError::PidExhausted)?;
+                .map_err(|_| ProcessCreateError::OutOfMemory)?;
         }
         parent.children_reserved += 1;
         Ok(())
@@ -2391,7 +3803,10 @@ pub fn commit_child_slot(ppid: ProcessId, child_pid: ProcessId) {
         if parent.children_reserved > 0 {
             parent.children_reserved -= 1;
         }
-        parent.children.push(child_pid);
+        parent
+            .children
+            .push_reserved(child_pid)
+            .expect("reserved parent child slot disappeared");
     }
 }
 
@@ -2435,6 +3850,118 @@ impl Drop for ChildSlotGuard {
     }
 }
 
+enum ProcessTablePublicationAttempt {
+    NeedCapacity,
+    Complete(Result<(), ProcessCreateError>),
+}
+
+/// RF180-43: publish a fully prepared PCB while every source PID namespace is
+/// live without allocating or deallocating under namespace/PROCESS_TABLE locks.
+/// A capacity miss exits the lifecycle lock set, prepares detached admitted
+/// backing, and retries; shutdown is revalidated on every commit attempt.
+fn publish_process_with_pid_sources(
+    sources: &crate::pid_namespace::PidPublicationSources,
+    process: &ProcessArc,
+    pid: ProcessId,
+    ppid: ProcessId,
+    slot_guard: &mut ChildSlotGuard,
+) -> Result<(), ProcessCreateError> {
+    let target_capacity = pid.checked_add(1).ok_or(ProcessCreateError::PidExhausted)?;
+    let mut prepared: Option<PreparedAdmittedVecCapacity<Option<ProcessArc>>> = None;
+
+    loop {
+        let mut retired: Option<RetiredAdmittedVecCapacity<Option<ProcessArc>>> = None;
+        let attempt = sources
+            .with_live_publication(|| {
+                let mut table = PROCESS_TABLE.lock();
+                if table.len() <= pid && table.capacity() < target_capacity {
+                    let Some(candidate) = prepared.take() else {
+                        return ProcessTablePublicationAttempt::NeedCapacity;
+                    };
+                    assert!(candidate.capacity() >= target_capacity);
+                    retired = Some(
+                        table
+                            .install_prepared_deferred(candidate)
+                            .expect("validated process-table backing rejected"),
+                    );
+                }
+
+                while table.len() <= pid {
+                    if table.push_reserved(None).is_err() {
+                        return ProcessTablePublicationAttempt::Complete(Err(
+                            ProcessCreateError::OutOfMemory,
+                        ));
+                    }
+                }
+                if table[pid].is_some() {
+                    return ProcessTablePublicationAttempt::Complete(Err(
+                        ProcessCreateError::PidExhausted,
+                    ));
+                }
+
+                table[pid] = Some(process.clone());
+                if ppid > 0 {
+                    if let Some(Some(parent_arc)) = table.get(ppid) {
+                        let mut parent = parent_arc.lock();
+                        if parent.children_reserved > 0 {
+                            parent.children_reserved -= 1;
+                        }
+                        parent
+                            .children
+                            .push_reserved(pid)
+                            .expect("reserved parent child slot disappeared");
+                    }
+                }
+                slot_guard.commit();
+                ProcessTablePublicationAttempt::Complete(Ok(()))
+            })
+            .map_err(|_| ProcessCreateError::NamespaceError)?;
+
+        drop(retired);
+        match attempt {
+            ProcessTablePublicationAttempt::Complete(result) => {
+                drop(prepared);
+                return result;
+            }
+            ProcessTablePublicationAttempt::NeedCapacity => {
+                drop(prepared.take());
+                prepared = Some(
+                    PreparedAdmittedVecCapacity::try_new(HeapClass::CoreProcess, target_capacity)
+                        .map_err(|_| ProcessCreateError::OutOfMemory)?,
+                );
+            }
+        }
+    }
+}
+
+/// RF180-16: allocation-free rollback for a process whose namespace mappings
+/// exist but whose PCB was never published in PROCESS_TABLE. The PID chain is
+/// moved out so OOM/shutdown rejection cannot recurse into allocation while
+/// returning namespace slots and the kernel stack.
+fn cleanup_unpublished_process_resources(
+    process: &ProcessArc,
+    pid: ProcessId,
+    stack_base: VirtAddr,
+    stack_phys: PhysFrame<Size4KiB>,
+) {
+    let (chain, permit) = {
+        let mut proc = process.lock();
+        (
+            core::mem::replace(
+                &mut proc.pid_ns_chain,
+                AdmittedVec::new(HeapClass::CoreProcess),
+            ),
+            proc.kernel_stack_rcu
+                .take()
+                .expect("kernel stack missing RCU reclaim permit"),
+        )
+    };
+    if !chain.is_empty() {
+        crate::pid_namespace::detach_pid_chain(&chain, pid);
+    }
+    free_kernel_stack(pid, stack_base, stack_phys, permit);
+}
+
 /// 创建新进程
 ///
 /// # Arguments
@@ -2447,11 +3974,12 @@ impl Drop for ChildSlotGuard {
 ///
 /// # Security Fix Z-7
 /// 内核栈分配失败时必须返回错误终止进程创建，绝不能共享内核栈
-pub fn create_process(
-    name: String,
+pub fn create_process<N: IntoProcessNameSnapshot>(
+    name: N,
     ppid: ProcessId,
     priority: Priority,
 ) -> Result<ProcessId, ProcessCreateError> {
+    let name = name.into_process_name_snapshot();
     // R158-4 FIX: Reserve parent child slot BEFORE allocating any resources.
     // If reservation fails, return ENOMEM with no cleanup needed.
     reserve_child_slot(ppid)?;
@@ -2465,24 +3993,25 @@ pub fn create_process(
     // advance the hint past that PID and retry with the next candidate.
     let mut hint_guard = NEXT_PID_HINT.lock();
 
-    // Maximum retries bounded by practical RCU backlog; in a healthy system only
-    // a handful of PIDs can be in the grace-period window simultaneously.
-    const MAX_STACK_RETRIES: usize = 32;
+    // A PID may be free in PROCESS_TABLE while its old stack callback is still
+    // queued. Scan the complete bounded PID space so one busy recycled PID (or
+    // even a large teardown wave) never becomes a false global admission failure.
+    const MAX_STACK_RETRIES: usize = PID_MAX;
     let mut stack_retries = 0;
-    let (pid, stack_base, stack_top) = loop {
+    let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
             allocate_global_pid(&mut hint_guard, &table)?
         };
 
         match allocate_kernel_stack(pid) {
-            Ok((base, top)) => break (pid, base, top),
-            Err(KernelStackError::AlreadyMapped) => {
+            Ok((base, top, phys, permit)) => break (pid, base, top, phys, permit),
+            Err(KernelStackError::AlreadyMapped | KernelStackError::ReclaimPending) => {
                 // Stack slot still mapped from RCU-deferred free; skip this PID.
                 stack_retries += 1;
                 if stack_retries >= MAX_STACK_RETRIES {
                     kprintln!(
-                        "Error: {} consecutive PIDs have stale kernel stacks (RCU backlog)",
+                        "Error: all {} PID stack slots are still mapped or reclaim-pending",
                         stack_retries
                     );
                     return Err(ProcessCreateError::KernelStackAllocFailed(
@@ -2509,13 +4038,21 @@ pub fn create_process(
         }
     };
 
-    let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
+    let process = match Process::try_new_pcb(pid, ppid, name, priority) {
+        Ok(process) => process,
+        Err(error) => {
+            free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
+            return Err(error);
+        }
+    };
 
     // 设置已分配的内核栈
     {
         let mut proc = process.lock();
         proc.kernel_stack = stack_base;
         proc.kernel_stack_top = stack_top;
+        proc.kernel_stack_phys = Some(stack_phys);
+        proc.kernel_stack_rcu = Some(stack_rcu);
     }
 
     // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
@@ -2530,7 +4067,7 @@ pub fn create_process(
             gid: 0,
             euid: 0,
             egid: 0,
-            supplementary_groups: Vec::new(),
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
         };
     }
 
@@ -2539,7 +4076,7 @@ pub fn create_process(
     // For kernel-created processes (ppid == 0), use root namespace.
     // For forked/cloned processes, the caller (fork.rs/sys_clone) will handle
     // namespace inheritance from the parent.
-    {
+    let pid_publication_sources = {
         let target_ns = if ppid == 0 {
             // Kernel thread: use root namespace
             crate::pid_namespace::ROOT_PID_NAMESPACE.clone()
@@ -2557,22 +4094,32 @@ pub fn create_process(
         // Assign PID chain from root namespace down to target
         match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
             Ok(chain) => {
+                let Some(publication_sources) =
+                    crate::pid_namespace::PidPublicationSources::from_chain(&chain)
+                else {
+                    let mut proc = process.lock();
+                    proc.pid_ns_chain = chain;
+                    drop(proc);
+                    cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
+                    return Err(ProcessCreateError::NamespaceError);
+                };
                 let mut proc = process.lock();
                 proc.pid_ns_chain = chain;
                 proc.pid_ns_for_children = target_ns;
+                publication_sources
             }
             Err(e) => {
                 // Namespace chain assignment failed, clean up
                 // R104-2 FIX: Gate diagnostic println behind debug_assertions.
                 kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
                 let _ = e; // suppress unused warning in release
-                free_kernel_stack(pid, stack_base);
+                cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
                 // R106-11: PID reclaim is automatic — the slot is still None,
                 // so the next allocate_global_pid() scan will find it.
                 return Err(ProcessCreateError::NamespaceError);
             }
         }
-    }
+    };
 
     // Mount namespace: inherit from parent's mount_ns_for_children (or root for kernel threads)
     {
@@ -2592,43 +4139,20 @@ pub fn create_process(
         proc.mount_ns_for_children = target_mnt_ns;
     }
 
-    // R106-11 (P0-4): Insert into PROCESS_TABLE, then release hint_guard.
-    // The hint_guard was held throughout to prevent concurrent allocators from
-    // reusing this PID slot before insertion.
-    {
-        let mut table = PROCESS_TABLE.lock();
-
-        // R158-5 FIX: fallible table growth — clean up all resources on failure.
-        if table.len() <= pid {
-            let needed = pid + 1 - table.len();
-            if table.try_reserve(needed).is_err() {
-                drop(table);
-                let chain = process.lock().pid_ns_chain.clone();
-                if !chain.is_empty() {
-                    crate::pid_namespace::detach_pid_chain(&chain, pid);
-                }
-                free_kernel_stack(pid, stack_base);
-                return Err(ProcessCreateError::PidExhausted);
-            }
-            while table.len() <= pid {
-                table.push(None);
-            }
-        }
-
-        // 将新进程存储在其 PID 对应的索引位置
-        table[pid] = Some(process.clone());
-
-        // R158-4 FIX: Commit pre-reserved child slot — push is infallible.
-        if ppid > 0 {
-            if let Some(Some(parent_arc)) = table.get(ppid) {
-                let mut p = parent_arc.lock();
-                if p.children_reserved > 0 {
-                    p.children_reserved -= 1;
-                }
-                p.children.push(pid);
-            }
-        }
-        slot_guard.commit();
+    // RF180-16: namespace mapping and PCB publication are one lifecycle
+    // transaction. Lock order is namespace sources (root->leaf) ->
+    // PROCESS_TABLE -> parent PCB. Init teardown takes only one source lock,
+    // releases it before PROCESS_TABLE lookup, and therefore cannot deadlock:
+    // publication-first is enumerated; shutdown-first rejects publication.
+    if let Err(error) = publish_process_with_pid_sources(
+        &pid_publication_sources,
+        &process,
+        pid,
+        ppid,
+        &mut slot_guard,
+    ) {
+        cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
+        return Err(error);
     }
 
     // Safe to release now — the PID slot is occupied in PROCESS_TABLE
@@ -2664,13 +4188,16 @@ pub fn create_process(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog!(
-        Info,
-        "Created process: PID={}, Name={}, Priority={}",
-        pid,
-        name,
-        priority
-    );
+    {
+        let proc = process.lock();
+        klog!(
+            Info,
+            "Created process: PID={}, Name={}, Priority={}",
+            pid,
+            proc.name,
+            priority
+        );
+    }
 
     Ok(pid)
 }
@@ -2690,12 +4217,13 @@ pub fn create_process(
 /// # Returns
 ///
 /// The new process's global PID on success
-pub fn create_process_in_namespace(
-    name: String,
+pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
+    name: N,
     ppid: ProcessId,
     priority: Priority,
-    target_ns: Arc<crate::pid_namespace::PidNamespace>,
+    target_ns: crate::pid_namespace::PidNamespaceArc,
 ) -> Result<ProcessId, ProcessCreateError> {
+    let name = name.into_process_name_snapshot();
     // R158-4 FIX: Reserve parent child slot BEFORE allocating any resources.
     reserve_child_slot(ppid)?;
     let mut slot_guard = ChildSlotGuard::new(ppid);
@@ -2704,21 +4232,21 @@ pub fn create_process_in_namespace(
     // R106-11 (P0-4): Allocate PID via recycling scan with AlreadyMapped retry.
     let mut hint_guard = NEXT_PID_HINT.lock();
 
-    const MAX_STACK_RETRIES: usize = 32;
+    const MAX_STACK_RETRIES: usize = PID_MAX;
     let mut stack_retries = 0;
-    let (pid, stack_base, stack_top) = loop {
+    let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
             allocate_global_pid(&mut hint_guard, &table)?
         };
 
         match allocate_kernel_stack(pid) {
-            Ok((base, top)) => break (pid, base, top),
-            Err(KernelStackError::AlreadyMapped) => {
+            Ok((base, top, phys, permit)) => break (pid, base, top, phys, permit),
+            Err(KernelStackError::AlreadyMapped | KernelStackError::ReclaimPending) => {
                 stack_retries += 1;
                 if stack_retries >= MAX_STACK_RETRIES {
                     kprintln!(
-                        "Error: {} consecutive PIDs have stale kernel stacks (RCU backlog)",
+                        "Error: all {} PID stack slots are still mapped or reclaim-pending",
                         stack_retries
                     );
                     return Err(ProcessCreateError::KernelStackAllocFailed(
@@ -2740,13 +4268,21 @@ pub fn create_process_in_namespace(
         }
     };
 
-    let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
+    let process = match Process::try_new_pcb(pid, ppid, name, priority) {
+        Ok(process) => process,
+        Err(error) => {
+            free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
+            return Err(error);
+        }
+    };
 
     // Set up kernel stack
     {
         let mut proc = process.lock();
         proc.kernel_stack = stack_base;
         proc.kernel_stack_top = stack_top;
+        proc.kernel_stack_phys = Some(stack_phys);
+        proc.kernel_stack_rcu = Some(stack_rcu);
     }
 
     // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
@@ -2757,27 +4293,38 @@ pub fn create_process_in_namespace(
             gid: 0,
             euid: 0,
             egid: 0,
-            supplementary_groups: Vec::new(),
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
         };
     }
 
-    // Assign PID namespace chain using the specified target namespace
-    match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
-        Ok(chain) => {
-            let mut proc = process.lock();
-            proc.pid_ns_chain = chain;
-            proc.pid_ns_for_children = target_ns;
-        }
-        Err(e) => {
-            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-            kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
-            let _ = e; // suppress unused warning in release
-            free_kernel_stack(pid, stack_base);
-            // R106-11: PID reclaim is automatic — the slot is still None,
-            // so the next allocate_global_pid() scan will find it.
-            return Err(ProcessCreateError::NamespaceError);
-        }
-    }
+    // Assign PID namespace chain using the specified target namespace.
+    let pid_publication_sources =
+        match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
+            Ok(chain) => {
+                let Some(publication_sources) =
+                    crate::pid_namespace::PidPublicationSources::from_chain(&chain)
+                else {
+                    let mut proc = process.lock();
+                    proc.pid_ns_chain = chain;
+                    drop(proc);
+                    cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
+                    return Err(ProcessCreateError::NamespaceError);
+                };
+                let mut proc = process.lock();
+                proc.pid_ns_chain = chain;
+                proc.pid_ns_for_children = target_ns;
+                publication_sources
+            }
+            Err(e) => {
+                // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+                kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
+                let _ = e; // suppress unused warning in release
+                cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
+                // R106-11: PID reclaim is automatic — the slot is still None,
+                // so the next allocate_global_pid() scan will find it.
+                return Err(ProcessCreateError::NamespaceError);
+            }
+        };
 
     // Mount namespace: inherit from parent's mount_ns_for_children (or root for kernel threads)
     {
@@ -2797,40 +4344,17 @@ pub fn create_process_in_namespace(
         proc.mount_ns_for_children = target_mnt_ns;
     }
 
-    // R106-11 (P0-4): Insert into PROCESS_TABLE, then release hint_guard.
-    {
-        let mut table = PROCESS_TABLE.lock();
-
-        // R158-5 FIX: fallible table growth — clean up all resources on failure.
-        if table.len() <= pid {
-            let needed = pid + 1 - table.len();
-            if table.try_reserve(needed).is_err() {
-                drop(table);
-                let chain = process.lock().pid_ns_chain.clone();
-                if !chain.is_empty() {
-                    crate::pid_namespace::detach_pid_chain(&chain, pid);
-                }
-                free_kernel_stack(pid, stack_base);
-                return Err(ProcessCreateError::PidExhausted);
-            }
-            while table.len() <= pid {
-                table.push(None);
-            }
-        }
-
-        table[pid] = Some(process.clone());
-
-        // R158-4 FIX: Commit pre-reserved child slot — push is infallible.
-        if ppid > 0 {
-            if let Some(Some(parent_arc)) = table.get(ppid) {
-                let mut p = parent_arc.lock();
-                if p.children_reserved > 0 {
-                    p.children_reserved -= 1;
-                }
-                p.children.push(pid);
-            }
-        }
-        slot_guard.commit();
+    // RF180-16: hold the exact root-to-leaf namespace lifecycle sources across
+    // PROCESS_TABLE publication. See create_process() for the lock-order proof.
+    if let Err(error) = publish_process_with_pid_sources(
+        &pid_publication_sources,
+        &process,
+        pid,
+        ppid,
+        &mut slot_guard,
+    ) {
+        cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
+        return Err(error);
     }
 
     // Safe to release now — the PID slot is occupied in PROCESS_TABLE
@@ -2862,14 +4386,17 @@ pub fn create_process_in_namespace(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog!(
-        Info,
-        "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
-        pid,
-        name,
-        priority,
-        process.lock().pid_ns_for_children.id().raw()
-    );
+    {
+        let proc = process.lock();
+        klog!(
+            Info,
+            "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
+            pid,
+            proc.name,
+            priority,
+            proc.pid_ns_for_children.id().raw()
+        );
+    }
 
     Ok(pid)
 }
@@ -3080,7 +4607,7 @@ pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
 /// RF178-14 FIX: Post a fatal-exit request against an already-authorized
 /// process identity. Holding the Arc binds the request to that generation and
 /// prevents a PID-reuse relookup from killing an unrelated process.
-pub fn request_process_exit_arc(proc_arc: &Arc<Mutex<Process>>, exit_code: i32) -> bool {
+pub fn request_process_exit_arc(proc_arc: &ProcessArc, exit_code: i32) -> bool {
     let post = {
         let mut proc = proc_arc.lock();
         request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
@@ -3114,11 +4641,20 @@ pub(crate) fn request_process_exit_locked(
     let was_stopped = proc.stopped;
 
     // Running and the Ready+on_cpu switch transient already own a CPU. Every
-    // other live state must become Ready in place; scheduler queues retain
-    // blocked/sleeping/stopped PCBs, so no queue move is required.
+    // other *published* live state must become Ready in place; scheduler queues
+    // retain blocked/sleeping/stopped PCBs, so no queue move is required.
+    //
+    // R180-19 review-fix: Provisioning is the scheduler-admission transaction's
+    // unpublished state. A remote SIGKILL/OOM/namespace-cascade request may post
+    // `pending_kill`, but it must not turn that reserved child Ready before fork
+    // or clone commits the rest of its PCB/MM state. The eventual admission
+    // commit publishes Ready and the already-posted fatal request is then
+    // consumed at the ordinary safe point.
     let actively_running = proc.on_cpu.load(Ordering::Acquire)
         && matches!(proc.state, ProcessState::Running | ProcessState::Ready);
-    let needs_ready = !actively_running && proc.state != ProcessState::Ready;
+    let needs_ready = proc.state != ProcessState::Provisioning
+        && !actively_running
+        && proc.state != ProcessState::Ready;
 
     // RF178-35 FIX: publish the fatal request before making a parked task
     // selectable. Every consumer that can act on the request takes this PCB
@@ -3173,6 +4709,8 @@ pub fn run_fatal_exit_publication_self_test() {
         &unrelated_group_token,
     ));
     let live_states = [
+        (ProcessState::Provisioning, false),
+        (ProcessState::Provisioning, true),
         (ProcessState::Ready, false),
         (ProcessState::Ready, true),
         (ProcessState::Running, false),
@@ -3201,7 +4739,9 @@ pub fn run_fatal_exit_publication_self_test() {
             );
             let actively_running =
                 on_cpu && matches!(state, ProcessState::Running | ProcessState::Ready);
-            let expected = if !actively_running && state != ProcessState::Ready
+            let expected = if state == ProcessState::Provisioning {
+                ProcessState::Provisioning
+            } else if !actively_running && state != ProcessState::Ready
                 || (state == ProcessState::Ready && stopped)
             {
                 ProcessState::Ready
@@ -3354,26 +4894,48 @@ pub fn set_current_pid(pid: Option<ProcessId>) {
 // ========== 进程凭证访问 (DAC支持) ==========
 
 /// 进程凭证结构
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Credentials {
     pub uid: u32,
     pub gid: u32,
     pub euid: u32,
     pub egid: u32,
-    pub supplementary_groups: Vec<u32>,
+    pub supplementary_groups: AdmittedVec<u32>,
+}
+
+/// Allocation-free scalar credential snapshot used by authorization callers.
+#[derive(Debug, Clone, Copy)]
+pub struct CredentialIds {
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialsError {
+    NoCurrentProcess,
+    PermissionDenied,
+    TooManyGroups,
+    OutOfMemory,
 }
 
 /// 获取当前进程的凭证
 ///
 /// R39-3 FIX: 从共享凭证结构读取，线程间共享
 /// 返回 None 如果没有当前进程
-pub fn current_credentials() -> Option<Credentials> {
+pub fn current_credentials() -> Option<CredentialIds> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
-    let creds = proc.credentials.read().clone();
-    Some(creds)
+    let creds = proc.credentials.read();
+    Some(CredentialIds {
+        uid: creds.uid,
+        gid: creds.gid,
+        euid: creds.euid,
+        egid: creds.egid,
+    })
 }
 
 /// 获取当前进程的有效用户ID
@@ -3517,13 +5079,18 @@ pub fn current_cgroup_id() -> Option<crate::cgroup::CgroupId> {
 ///
 /// R39-3 FIX: 从共享凭证结构读取
 /// 返回附属组ID的克隆列表，如果没有当前进程则返回 None
-pub fn current_supplementary_groups() -> Option<Vec<u32>> {
-    let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
-    let groups = proc.credentials.read().supplementary_groups.clone();
-    Some(groups)
+pub fn current_supplementary_groups() -> Result<Option<AdmittedVec<u32>>, CredentialsError> {
+    let Some(pid) = current_pid() else {
+        return Ok(None);
+    };
+    let Some(proc) = get_process(pid) else {
+        return Ok(None);
+    };
+    let credentials = Arc::clone(&proc.lock().credentials);
+    let creds = credentials.read();
+    AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, &creds.supplementary_groups)
+        .map(Some)
+        .map_err(|_| CredentialsError::OutOfMemory)
 }
 
 /// R135-1 FIX: 获取当前进程的 host 级附属组列表（映射后的 supplementary groups）。
@@ -3533,31 +5100,62 @@ pub fn current_supplementary_groups() -> Option<Vec<u32>> {
 /// 对于 root namespace 进程，该映射为 identity（input == output）。
 ///
 /// 未映射的 GID 将被替换为 OVERFLOW_GID (65534) 以确保 fail-closed。
-pub fn current_host_supplementary_groups() -> Option<Vec<u32>> {
+pub fn current_host_supplementary_groups() -> Result<Option<AdmittedVec<u32>>, CredentialsError> {
     const OVERFLOW_GID: u32 = 65534;
 
+    let Some((ns_groups, len, user_ns)) = snapshot_current_groups() else {
+        return Ok(None);
+    };
+    let mut host_groups = AdmittedVec::new(HeapClass::CoreProcess);
+    host_groups
+        .try_reserve_exact(len)
+        .map_err(|_| CredentialsError::OutOfMemory)?;
+    for &group in &ns_groups[..len] {
+        host_groups
+            .push_reserved(user_ns.map_gid_from_ns(group).unwrap_or(OVERFLOW_GID))
+            .map_err(|_| CredentialsError::OutOfMemory)?;
+    }
+    normalize_groups(&mut host_groups);
+    Ok(Some(host_groups))
+}
+
+/// RF180-17/RF180-19: allocation-free host-group authorization predicate.
+pub fn current_in_host_supplementary_group(host_gid: u32) -> Option<bool> {
+    const OVERFLOW_GID: u32 = 65534;
+    let (groups, len, user_ns) = snapshot_current_groups()?;
+    Some(
+        groups[..len]
+            .iter()
+            .any(|&group| user_ns.map_gid_from_ns(group).unwrap_or(OVERFLOW_GID) == host_gid),
+    )
+}
+
+fn snapshot_current_groups() -> Option<(
+    [u32; NGROUPS_MAX],
+    usize,
+    Arc<crate::user_namespace::UserNamespace>,
+)> {
     let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
+    let process = get_process(pid)?;
+    let proc = process.lock();
+    let credentials = proc.credentials.read();
+    let len = credentials.supplementary_groups.len().min(NGROUPS_MAX);
+    let mut groups = [0u32; NGROUPS_MAX];
+    groups[..len].copy_from_slice(&credentials.supplementary_groups[..len]);
+    Some((groups, len, Arc::clone(&proc.user_ns)))
+}
 
-    let ns_groups = proc.credentials.read().supplementary_groups.clone();
-    let user_ns = proc.user_ns.clone();
-    // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
-    // across the gid_map read lock.
-    drop(proc);
-    drop(table);
-
-    let mut host_groups: Vec<u32> = ns_groups
-        .into_iter()
-        .map(|g| user_ns.map_gid_from_ns(g).unwrap_or(OVERFLOW_GID))
-        .collect();
-
-    // Keep the list normalized for fast membership checks.
-    host_groups.sort_unstable();
-    host_groups.dedup();
-
-    Some(host_groups)
+fn normalize_groups(groups: &mut AdmittedVec<u32>) {
+    groups.sort_unstable();
+    let mut previous = None;
+    groups.retain(|group| {
+        if previous == Some(*group) {
+            false
+        } else {
+            previous = Some(*group);
+            true
+        }
+    });
 }
 
 /// Maximum number of supplementary groups per process
@@ -3581,29 +5179,26 @@ pub const NGROUPS_MAX: usize = 256;
 ///
 /// # Returns
 /// 成功返回 Some(())，没有当前进程或权限不足返回 None
-pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
-    let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
-
-    // R39-3 FIX: 使用共享凭证结构
-    let mut creds = proc.credentials.write();
-
-    // Security: Only root can modify supplementary groups
+pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), CredentialsError> {
+    if groups.len() > NGROUPS_MAX {
+        return Err(CredentialsError::TooManyGroups);
+    }
+    let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
+    let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
+    let credentials = Arc::clone(&process.lock().credentials);
+    let mut creds = credentials.write();
     if creds.euid != 0 {
-        return None;
+        return Err(CredentialsError::PermissionDenied);
     }
 
-    creds.supplementary_groups.clear();
-    // Take only up to NGROUPS_MAX groups to prevent DoS
-    let limit = groups.len().min(NGROUPS_MAX);
-    creds
-        .supplementary_groups
-        .extend(groups[..limit].iter().copied());
-    creds.supplementary_groups.sort_unstable();
-    creds.supplementary_groups.dedup();
-    Some(())
+    // RF180-17 FIX: complete the admitted replacement before publication.
+    let mut replacement = AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, groups)
+        .map_err(|_| CredentialsError::OutOfMemory)?;
+    normalize_groups(&mut replacement);
+    let old = core::mem::replace(&mut creds.supplementary_groups, replacement);
+    drop(creds);
+    drop(old);
+    Ok(())
 }
 
 /// 向当前进程添加一个附属组
@@ -3621,27 +5216,30 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
 ///
 /// # Returns
 /// 成功返回 Some(())，没有当前进程或权限不足返回 None
-pub fn add_supplementary_group(gid: u32) -> Option<()> {
-    let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
-
-    // R39-3 FIX: 使用共享凭证结构
-    let mut creds = proc.credentials.write();
-
-    // Security: Only root can modify supplementary groups
+pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
+    let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
+    let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
+    let credentials = Arc::clone(&process.lock().credentials);
+    let mut creds = credentials.write();
     if creds.euid != 0 {
-        return None;
+        return Err(CredentialsError::PermissionDenied);
     }
 
     if !creds.supplementary_groups.contains(&gid) {
-        // Enforce NGROUPS_MAX limit
-        if creds.supplementary_groups.len() < NGROUPS_MAX {
-            creds.supplementary_groups.push(gid);
+        if creds.supplementary_groups.len() >= NGROUPS_MAX {
+            return Err(CredentialsError::TooManyGroups);
         }
+        creds
+            .supplementary_groups
+            .try_reserve(1)
+            .map_err(|_| CredentialsError::OutOfMemory)?;
+        creds
+            .supplementary_groups
+            .push_reserved(gid)
+            .map_err(|_| CredentialsError::OutOfMemory)?;
+        normalize_groups(&mut creds.supplementary_groups);
     }
-    Some(())
+    Ok(())
 }
 
 /// 从当前进程移除一个附属组
@@ -3658,22 +5256,17 @@ pub fn add_supplementary_group(gid: u32) -> Option<()> {
 ///
 /// # Returns
 /// 成功返回 Some(())，没有当前进程或权限不足返回 None
-pub fn remove_supplementary_group(gid: u32) -> Option<()> {
-    let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
-
-    // R39-3 FIX: 使用共享凭证结构
-    let mut creds = proc.credentials.write();
-
-    // Security: Only root can modify supplementary groups
+pub fn remove_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
+    let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
+    let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
+    let credentials = Arc::clone(&process.lock().credentials);
+    let mut creds = credentials.write();
     if creds.euid != 0 {
-        return None;
+        return Err(CredentialsError::PermissionDenied);
     }
 
     creds.supplementary_groups.retain(|&g| g != gid);
-    Some(())
+    Ok(())
 }
 
 /// 获取当前进程的umask
@@ -4025,7 +5618,7 @@ pub fn sync_kpti_cr3() {
 ///
 /// # Returns
 /// 如果进程存在，返回进程的 Arc 引用；否则返回 None
-pub fn get_process(pid: ProcessId) -> Option<Arc<Mutex<Process>>> {
+pub fn get_process(pid: ProcessId) -> Option<ProcessArc> {
     let table = PROCESS_TABLE.lock();
     table.get(pid).and_then(|slot| slot.clone())
 }
@@ -4047,7 +5640,7 @@ pub fn get_process(pid: ProcessId) -> Option<Arc<Mutex<Process>>> {
 ///
 /// Only clones an `Arc` under the (briefly held) lock — no allocation — so it is
 /// safe on the IRQ tick path.
-pub fn try_get_process(pid: ProcessId) -> Option<Option<Arc<Mutex<Process>>>> {
+pub fn try_get_process(pid: ProcessId) -> Option<Option<ProcessArc>> {
     let table = PROCESS_TABLE.try_lock()?;
     Some(table.get(pid).and_then(|slot| slot.clone()))
 }
@@ -4062,9 +5655,17 @@ pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
     *IPC_CLEANUP.lock() = Some(callback);
 }
 
-/// 注册调度器添加进程回调，用于 clone/fork 时将新进程添加到调度队列
-pub fn register_scheduler_add(callback: SchedulerAddCallback) {
-    *SCHEDULER_ADD.lock() = Some(callback);
+/// Register the scheduler's prepare/commit/cancel admission transaction.
+pub fn register_scheduler_admission(
+    reserve: SchedulerReserveCallback,
+    commit: SchedulerCommitCallback,
+    cancel: SchedulerCancelCallback,
+) {
+    *SCHEDULER_ADMISSION.lock() = Some(SchedulerAdmissionCallbacks {
+        reserve,
+        commit,
+        cancel,
+    });
 }
 
 /// 注册 futex 唤醒回调，用于线程退出时唤醒等待者
@@ -4086,21 +5687,32 @@ fn notify_scheduler_process_removed(pid: ProcessId, generation: u64) {
 /// 通知IPC子系统清理进程端点
 /// R37-2 FIX (Codex review): Pass TGID to avoid re-locking the process in callback.
 /// R75-2 FIX: Pass IPC namespace ID for per-namespace endpoint cleanup.
-fn notify_ipc_process_cleanup(pid: ProcessId, tgid: ProcessId, ipc_ns_id: cap::NamespaceId) {
+/// R180-5 FIX: Pass reaped generation so delayed cleanup cannot target a recycled PID.
+fn notify_ipc_process_cleanup(
+    pid: ProcessId,
+    tgid: ProcessId,
+    ipc_ns_id: cap::NamespaceId,
+    generation: u64,
+) {
     let callback = *IPC_CLEANUP.lock();
     if let Some(cb) = callback {
-        cb(pid, tgid, ipc_ns_id);
+        cb(pid, tgid, ipc_ns_id, generation);
     }
 }
 
-/// 通知调度器添加新进程到调度队列
-///
-/// 由 clone/fork 在创建新进程后调用
-pub fn notify_scheduler_add_process(process: Arc<Mutex<Process>>) {
-    let callback = *SCHEDULER_ADD.lock();
-    if let Some(cb) = callback {
-        cb(process);
-    }
+/// Fallibly reserve an exact scheduler queue entry before a process-creation
+/// transaction reaches an irreversible commit point.
+pub fn prepare_scheduler_add_process(
+    process: ProcessArc,
+) -> Result<SchedulerAddPermit, SchedulerAddError> {
+    let callbacks = (*SCHEDULER_ADMISSION.lock()).ok_or(SchedulerAddError::Unavailable)?;
+    let token = (callbacks.reserve)(process)?;
+    Ok(SchedulerAddPermit {
+        token: Some(token),
+        commit: callbacks.commit,
+        cancel: callbacks.cancel,
+        armed: true,
+    })
 }
 
 /// 通知 futex 唤醒等待者
@@ -4736,7 +6348,7 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
 /// cross-subsystem detach on never-joined cgroup/cpuset/IPC subsystems.
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
-        let children_to_reparent: Vec<ProcessId>;
+        let children_to_reparent: AdmittedVec<ProcessId>;
         let parent_pid: ProcessId;
         let clear_child_tid: u64;
         let tgid: ProcessId;
@@ -4747,7 +6359,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let lsm_euid: u32;
         let lsm_egid: u32;
         // F.1: Save namespace info for cleanup
-        let pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>;
+        let pid_ns_chain: AdmittedVec<crate::pid_namespace::PidNamespaceMembership>;
         // F.2: Save cgroup_id for task detachment
         let cgroup_id: crate::cgroup::CgroupId;
         // R170-3: (tag, ns) of any contention-deferred CPU-quota debt, taken
@@ -4788,7 +6400,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             proc.exit_code = Some(exit_code);
             parent_pid = proc.ppid;
             // R158-10 FIX: take() instead of clone()+clear() — avoids infallible alloc on exit.
-            children_to_reparent = core::mem::take(&mut proc.children);
+            children_to_reparent =
+                core::mem::replace(&mut proc.children, AdmittedVec::new(HeapClass::CoreProcess));
             // 获取 clear_child_tid 信息用于线程退出通知
             clear_child_tid = proc.clear_child_tid;
             tgid = proc.tgid;
@@ -4803,8 +6416,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 lsm_euid = creds.euid;
                 lsm_egid = creds.egid;
             } // Drop creds read guard before mutable access below
-              // F.1: Copy namespace chain for cleanup
-            pid_ns_chain = proc.pid_ns_chain.clone();
+              // RF180-16: transfer the admitted chain; a dying task no longer
+              // needs namespace visibility and teardown must not allocate.
+            pid_ns_chain = core::mem::replace(
+                &mut proc.pid_ns_chain,
+                AdmittedVec::new(HeapClass::CoreProcess),
+            );
             // F.2: Copy cgroup_id for detachment
             cgroup_id = proc.cgroup_id;
             // R170-3 FIX: take (read + zero) the deferred quota debt in this
@@ -4846,7 +6463,9 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // G.1 Observability: Unregister watchdog before any other cleanup.
         // This must happen early to prevent false hung-task alerts during teardown.
         if let Some(handle) = watchdog_handle {
-            unregister_watchdog(&handle);
+            if unregister_watchdog(&handle).is_err() {
+                debug_assert!(false, "live process carried a stale watchdog handle");
+            }
         }
 
         // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)
@@ -5088,8 +6707,8 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
 /// list under the same PCB lock): we either push before it drains (our child rides
 /// along and is re-reparented by the adopter) or observe Zombie and skip.
 fn try_commit_reaper(
-    table: &Vec<Option<Arc<Mutex<Process>>>>,
-    child_arc: &Arc<Mutex<Process>>,
+    table: &[Option<ProcessArc>],
+    child_arc: &ProcessArc,
     child_pid: ProcessId,
     cand: ProcessId,
 ) -> bool {
@@ -5107,7 +6726,10 @@ fn try_commit_reaper(
         }
         if !adopter_proc.children.contains(&child_pid) {
             if adopter_proc.children.try_reserve(1).is_ok() {
-                adopter_proc.children.push(child_pid);
+                adopter_proc
+                    .children
+                    .push_reserved(child_pid)
+                    .expect("reparent child reservation disappeared");
             } else {
                 adopter_proc.children_incomplete = true;
             }
@@ -5123,11 +6745,7 @@ fn try_commit_reaper(
 /// R171-S-R170-5-01 FIX (SLICE 3): no live reaper exists. Set a deterministic ppid
 /// (so getppid is well-defined) WITHOUT pushing into any dead/absent adopter's
 /// children list, and log the orphan as leaked. Child PCB lock alone.
-fn reparent_logged_leak(
-    child_arc: &Arc<Mutex<Process>>,
-    child_pid: ProcessId,
-    fallback_pid: ProcessId,
-) {
+fn reparent_logged_leak(child_arc: &ProcessArc, child_pid: ProcessId, fallback_pid: ProcessId) {
     {
         let mut child = child_arc.lock();
         child.ppid = fallback_pid;
@@ -5247,7 +6865,7 @@ fn handle_namespace_init_death(
 fn force_remote_kill(
     victim_pid: ProcessId,
     exit_code: i32,
-    shutting_namespace: &Arc<crate::pid_namespace::PidNamespace>,
+    shutting_namespace: &crate::pid_namespace::PidNamespaceArc,
 ) {
     // RF178-36 FIX: resolve exactly once. A namespace victim may be reaped and
     // its PID reused after this lock is released, so every later action carries
@@ -5343,7 +6961,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
     // Phase 1: Detach process from PROCESS_TABLE under lock.
     // After `slot.take()`, no other code path can look up this PID in the table,
     // so the extracted Arc is the sole remaining reference to the PCB.
-    let reap_info = {
+    let (reap_info, retired_process_table) = {
         let mut table = PROCESS_TABLE.lock();
 
         // Phase 1a: Check process state
@@ -5370,7 +6988,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
             }
         };
 
-        if !is_zombie {
+        let result = if !is_zombie {
             None
         } else {
             // Phase 1b: Check if other processes still reference this address space.
@@ -5419,6 +7037,10 @@ pub fn cleanup_zombie(pid: ProcessId) {
                         let tgid = proc.tgid;
                         let ipc_ns_id = proc.ipc_ns.id();
                         let cpuset_id = proc.cpuset_id;
+                        // RF180-3: reserve the numeric PID before PROCESS_TABLE
+                        // becomes observable as empty.  Phase 2 clears it only
+                        // after all raw-PID cleanup and scheduler removal finish.
+                        begin_reaping_identity(reaped_pid, tgid);
                         drop(proc);
                         Some((
                             process,
@@ -5441,9 +7063,14 @@ pub fn cleanup_zombie(pid: ProcessId) {
             } else {
                 None
             }
-        }
+        };
+        let retired = result
+            .as_ref()
+            .and_then(|_| reclaim_empty_process_table(&mut table));
+        (result, retired)
     };
     // PROCESS_TABLE lock is released here.
+    drop(retired_process_table);
 
     // Phase 2: Free resources and run cross-subsystem cleanup WITHOUT holding PROCESS_TABLE.
     if let Some((
@@ -5461,16 +7088,20 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // the table slot was cleared in Phase 1c.
         // R154-3 FIX: Extract fd_table under lock, drop destructors outside to
         // prevent lock inversion (socket close → wake_all → other Process lock).
-        let _fds_to_drop = {
+        let fds_to_drop = {
             let mut proc = process.lock();
             free_process_resources(&mut proc, keep_address_space)
         };
-        // _fds_to_drop dropped here — Process lock is released, safe for socket destructors.
+        // Process lock is released; run FileOps destructors while the PID/TGID
+        // pins are still held because they can wake PID-keyed waiters.
+        drop(fds_to_drop);
 
         // Cross-subsystem cleanup: IPC endpoint teardown + futex waiter cleanup.
         // These callbacks may re-lock PROCESS_TABLE (e.g., thread_group_size(),
         // get_process()) which is safe now since we no longer hold it.
-        notify_ipc_process_cleanup(reaped_pid, tgid, ipc_ns_id);
+        // R180-5: generation rides with the reaped PID (same identity contract as
+        // RF178-33 scheduler cleanup) so a recycled successor is never targeted.
+        notify_ipc_process_cleanup(reaped_pid, tgid, ipc_ns_id, reaped_generation);
 
         // E.5 Cpuset: decrement task count when process exits
         notify_cpuset_task_left(cpuset_id);
@@ -5478,6 +7109,11 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // RF178-33 / P1-B: pass generation so a recycled PID's live queue entry
         // is never removed by the reaper of the previous occupant.
         notify_scheduler_process_removed(reaped_pid, reaped_generation);
+        // RF180-3: all PID-only subsystem state for this task has been drained.
+        // Release the PID, and release the TGID only after no old-group table
+        // member or concurrent Phase-2 reaper remains. Kernel-stack RCU lag is
+        // independently guarded by create_process's AlreadyMapped retry path.
+        finish_reaping_identity(reaped_pid, tgid);
         klog!(Info, "Cleaned up zombie process {}", reaped_pid);
     }
 }
@@ -5488,7 +7124,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
 ///
 /// This function is for **error-path cleanup only** — when `sys_clone()` or
 /// `enforce_lsm_task_fork()` creates a child via `create_process()` but encounters
-/// an error before the child reaches `notify_scheduler_add_process()`.
+/// an error before its reserved scheduler admission is committed.
 ///
 /// Unlike the `terminate_process()` + `cleanup_zombie()` pair, this function
 /// performs **only kernel-internal resource teardown** and PID namespace detachment.
@@ -5527,16 +7163,23 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
     );
 
     // Phase 1: Detach from PROCESS_TABLE under lock, capturing info for Phase 2.
-    let cleanup_info = {
+    let (cleanup_info, retired_process_table) = {
         let mut table = PROCESS_TABLE.lock();
 
-        if let Some(slot) = table.get_mut(pid) {
+        let result = if let Some(slot) = table.get_mut(pid) {
             if let Some(process) = slot.take() {
                 let mut proc = process.lock();
                 proc.state = ProcessState::Terminated;
 
                 let memory_space = proc.memory_space;
-                let pid_ns_chain = proc.pid_ns_chain.clone();
+                // RF180-19 defense-in-depth: this is an error/OOM rollback path.
+                // The detached, never-scheduled PCB will never need namespace
+                // visibility again, so transfer its already-owned chain instead
+                // of allocating a clone while the system may be out of memory.
+                let pid_ns_chain = core::mem::replace(
+                    &mut proc.pid_ns_chain,
+                    AdmittedVec::new(HeapClass::CoreProcess),
+                );
                 let watchdog_handle = proc.watchdog_handle.take();
 
                 // Determine whether another live process shares this address space.
@@ -5567,15 +7210,22 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
             }
         } else {
             None
-        }
+        };
+        let retired = result
+            .as_ref()
+            .and_then(|_| reclaim_empty_process_table(&mut table));
+        (result, retired)
     };
     // PROCESS_TABLE lock released here.
+    drop(retired_process_table);
 
     // Phase 2: Free resources without cross-subsystem callbacks.
     if let Some((process, keep_address_space, pid_ns_chain, watchdog_handle)) = cleanup_info {
         // G.1 Observability: Unregister watchdog before releasing other resources.
         if let Some(handle) = watchdog_handle {
-            unregister_watchdog(&handle);
+            if unregister_watchdog(&handle).is_err() {
+                debug_assert!(false, "reaped process carried a stale watchdog handle");
+            }
         }
 
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
@@ -5619,7 +7269,7 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 fn free_process_resources(
     proc: &mut Process,
     keep_address_space: bool,
-) -> BTreeMap<i32, FileDescriptor> {
+) -> AdmittedMap<i32, FileDescriptor> {
     // D3-ARC-MM-SHARED: Lock the shared MmState to access mmap/brk metadata.
     // For shared MmState (CLONE_VM), Arc::strong_count > 1 means other tasks
     // still reference this mm — non-last exit must NOT uncharge cgroup memory.
@@ -5637,7 +7287,15 @@ fn free_process_resources(
 
     // 释放 per-process 内核栈
     if proc.kernel_stack.as_u64() != 0 {
-        free_kernel_stack(proc.pid, proc.kernel_stack);
+        let permit = proc
+            .kernel_stack_rcu
+            .take()
+            .expect("live kernel stack missing RCU reclaim permit");
+        let phys = proc
+            .kernel_stack_phys
+            .take()
+            .expect("live kernel stack missing physical block identity");
+        free_kernel_stack(proc.pid, proc.kernel_stack, phys, permit);
         proc.kernel_stack = VirtAddr::new(0);
         proc.kernel_stack_top = VirtAddr::new(0);
     }
@@ -5738,7 +7396,8 @@ fn free_process_resources(
     // causing lock inversion if we drop while holding the caller's Process lock.
     // The extracted fds are returned; the caller drops them AFTER releasing the lock.
     let fd_count = proc.fd_table.len();
-    let extracted_fds = core::mem::take(&mut proc.fd_table);
+    let extracted_fds =
+        core::mem::replace(&mut proc.fd_table, AdmittedMap::new(HeapClass::CoreProcess));
     proc.cloexec_fds.clear();
 
     // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
@@ -5761,10 +7420,17 @@ fn free_process_resources(
     // fd_count for a clone-error child that copied fds but failed before the
     // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
     // zero after, so a second teardown call uncharges nothing.
-    if proc.fds_charged_count > 0 {
-        crate::cgroup::uncharge_fds(proc.cgroup_id, proc.fds_charged_count);
-        proc.fds_charged_count = 0;
+    let total_fd_charges = proc
+        .fds_charged_count
+        .checked_add(proc.fd_reservations_charged_count)
+        .expect("FD charge accounting overflow");
+    if total_fd_charges > 0 {
+        crate::cgroup::uncharge_fds(proc.cgroup_id, total_fd_charges);
     }
+    proc.fds_charged_count = 0;
+    proc.fd_reservations_charged_count = 0;
+    proc.fd_reservations.fill(0);
+    proc.fd_cloexec_reservations.fill(0);
     // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
     // to prevent leaking fd count, page table root addresses, and PID in release.
     if fd_count > 0 {
@@ -5847,13 +7513,110 @@ fn free_process_resources(
 /// 之后执行，以确保所有 CPU 都已进入过 quiescent state。
 ///
 /// 如果当前 CPU 正在使用该栈，则仍跳过释放以避免自踩栈导致崩溃。
-pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
-    use core::arch::asm;
-    use x86_64::structures::paging::Page;
+fn reclaim_kernel_stack(args: [usize; 2]) {
+    let pid = args[0];
+    let expected_phys = PhysFrame::from_start_address(PhysAddr::new(args[1] as u64))
+        .unwrap_or_else(|_| panic!("RCU: unaligned kernel-stack physical identity"));
+    let (stack_base, _) = kernel_stack_slot(pid)
+        .unwrap_or_else(|_| panic!("RCU: invalid PID in kernel-stack callback"));
 
-    // H-25 FIX: call_rcu requires a 'static closure; capture the raw address
-    // and reconstruct VirtAddr inside the deferred callback.
+    // Prevalidate every leaf against the immutable original buddy-block
+    // identity before mutating any PTE. A mismatch is quarantined in place.
+    let reclaim_ready = unsafe {
+        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+            for index in 0..KSTACK_PAGES {
+                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
+                let expected = PhysFrame::containing_address(
+                    expected_phys.start_address() + (index as u64 * PAGE_SIZE),
+                );
+                if mgr.translate_page_4k(page) != Some(expected) {
+                    return false;
+                }
+            }
+
+            let mut cleared = 0usize;
+            let mut matched = 0usize;
+            let mut exact = true;
+            for index in (0..KSTACK_PAGES).rev() {
+                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
+                let expected = PhysFrame::containing_address(
+                    expected_phys.start_address() + (index as u64 * PAGE_SIZE),
+                );
+                match mgr.unmap_page(page) {
+                    Ok(actual) => {
+                        // `unmap_page` has already cleared the PTE on every Ok,
+                        // even if the returned physical identity is wrong.  TLB
+                        // invalidation therefore follows mutation accounting,
+                        // while physical reuse additionally requires identity.
+                        cleared += 1;
+                        if actual == expected {
+                            matched += 1;
+                        } else {
+                            exact = false;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+
+            // Kernel-stack mappings are shared through many distinct CR3 roots.
+            // Broadcast before any physical reuse, even on a partial failure.
+            if cleared != 0 {
+                mm::flush_all_address_spaces();
+            }
+            exact && matched == KSTACK_PAGES
+        })
+    };
+
+    if !reclaim_ready {
+        kprintln!(
+            "  CRITICAL: quarantining unverifiable kernel-stack reclaim for PID {}",
+            pid
+        );
+        crate::rcu::quarantine_running_stack_callback(pid);
+        return;
+    }
+
+    let mut frame_alloc = FrameAllocator::new();
+    if frame_alloc
+        .try_deallocate_contiguous_frames(expected_phys, KSTACK_PAGES)
+        .is_err()
+    {
+        kprintln!(
+            "  CRITICAL: buddy rejected kernel-stack block for PID {}; quarantining slot",
+            pid
+        );
+        crate::rcu::quarantine_running_stack_callback(pid);
+        return;
+    }
+
+    kprintln!("  Released kernel stack for PID {}", pid);
+}
+
+pub fn free_kernel_stack(
+    pid: ProcessId,
+    stack_base: VirtAddr,
+    stack_phys: PhysFrame<Size4KiB>,
+    reclaim_permit: crate::rcu::RcuCallbackPermit,
+) {
+    use core::arch::asm;
+
     let stack_base_u64 = stack_base.as_u64();
+    if kernel_stack_slot(pid)
+        .map(|(expected, _)| expected != stack_base)
+        .unwrap_or(true)
+    {
+        kprintln!(
+            "  CRITICAL: quarantining invalid kernel-stack teardown identity for PID {}",
+            pid
+        );
+        core::mem::forget(reclaim_permit);
+        return;
+    }
 
     // 【关键修复】检查当前 CPU 是否正在使用该栈
     let current_rsp: u64;
@@ -5869,54 +7632,24 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         // 这种情况不应该发生（进程应在不同栈上清理自己的栈），但防御性编程
         // R104-2 FIX: Gate to prevent leaking kernel RSP in release builds.
         kprintln!(
-            "  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
+            "  CRITICAL: quarantining kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
             pid,
             current_rsp
         );
+        // Releasing this dedicated permit would allow PID reuse while its old
+        // stack remains mapped. Keep both resources quarantined fail-closed.
+        core::mem::forget(reclaim_permit);
         return;
     }
 
-    // H-25 FIX: Defer unmap + frame reclamation until after a grace period so
-    // all CPUs (including ones that might still be switching away) have passed
-    // a quiescent state.
-    crate::rcu::call_rcu(move || {
-        let stack_base = VirtAddr::new(stack_base_u64);
-        let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
-        let mut frame_alloc = FrameAllocator::new();
-
-        unsafe {
-            page_table::with_current_manager(VirtAddr::new(0), |mgr| {
-                // R128-1 FIX: 3-phase unmap pattern (matches sys_munmap/sys_brk shrink).
-                // Phase 1: Unmap pages and collect frames — do not deallocate yet.
-                let mut frames_to_free = Vec::new();
-                for i in 0..KSTACK_PAGES {
-                    let addr = stack_base + (i as u64 * PAGE_SIZE);
-                    let page = Page::containing_address(addr);
-
-                    if let Ok(frame) = mgr.unmap_page(page) {
-                        frames_to_free.push(frame);
-                    }
-                }
-
-                // Phase 2: Cross-CPU TLB shootdown.
-                // Even without GLOBAL flag, defense-in-depth ensures no stale
-                // entries remain on any CPU before frames are freed.
-                mm::flush_current_as_range(stack_base, stack_size);
-
-                // Phase 3: Deallocate physical frames (TLB now clear on all CPUs).
-                for frame in frames_to_free {
-                    frame_alloc.deallocate_frame(frame);
-                }
-            });
-        }
-
-        // R104-2 FIX: Gate to prevent leaking kernel stack address in release builds.
-        kprintln!(
-            "  Released kernel stack for PID {} at 0x{:x}",
-            pid,
-            stack_base_u64
-        );
-    });
+    // R180-12: permit consumption makes enqueue infallible after teardown's
+    // point of no return. Function pointer + two words fit in the static slot.
+    crate::rcu::call_rcu_stack(
+        reclaim_permit,
+        pid,
+        reclaim_kernel_stack,
+        [pid, stack_phys.start_address().as_u64() as usize],
+    );
 }
 
 /// 释放独立用户地址空间（PML4 物理地址）
@@ -6080,6 +7813,7 @@ pub fn get_process_stats() -> ProcessStats {
                 ProcessState::Terminated => stats.terminated += 1,
                 ProcessState::Stopped => stats.stopped += 1,
                 _ if proc.stopped => stats.stopped += 1,
+                ProcessState::Provisioning => stats.blocked += 1,
                 ProcessState::Ready => stats.ready += 1,
                 ProcessState::Running => stats.running += 1,
                 ProcessState::Blocked => stats.blocked += 1,
