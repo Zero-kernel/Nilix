@@ -419,6 +419,36 @@ impl OpenFlags {
         (self.0 & Self::O_PATH) != 0
     }
 
+    /// Raw access-mode bits (`O_ACCMODE`).
+    #[inline]
+    pub const fn accmode(self) -> u32 {
+        self.0 & Self::O_ACCMODE
+    }
+
+    /// R180-4 FIX: reject reserved access mode 3 for non-`O_PATH` opens.
+    ///
+    /// Linux: without `O_PATH`, access mode must be `O_RDONLY`/`O_WRONLY`/`O_RDWR`.
+    /// Mode 3 made both `is_readable` and `is_writable` false, so open DAC was
+    /// skipped and getdents could enumerate without read permission.
+    pub fn validate_access_mode(self) -> Result<(), FsError> {
+        if self.is_path() {
+            return Ok(());
+        }
+        match self.accmode() {
+            Self::O_RDONLY | Self::O_WRONLY | Self::O_RDWR => Ok(()),
+            _ => Err(FsError::Invalid),
+        }
+    }
+
+    /// Whether this description may perform directory enumeration (`getdents`).
+    ///
+    /// R180-4: requires a readable (non-`O_PATH`) description — generalizes the
+    /// earlier O_PATH-only getdents reject (R131-5).
+    #[inline]
+    pub fn allows_readdir(self) -> bool {
+        !self.is_path() && self.is_readable()
+    }
+
     /// Check if directory is required (O_DIRECTORY)
     pub fn is_directory(&self) -> bool {
         (self.0 & Self::O_DIRECTORY) != 0

@@ -24,3 +24,4 @@ block = { path = "../block" }
 mm = { path = "../mm" }
 cap = { path = "../cap" }
 klog = { path = "../klog" }
+kernel_crypto = { package = "crypto", path = "../crypto" }

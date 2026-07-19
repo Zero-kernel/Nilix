@@ -3,10 +3,16 @@
 //! Core traits for filesystem and inode operations.
 
 use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
+use alloc::alloc::{dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
-use kernel_core::{FileOps, SyscallError, VfsStat};
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::ops::Deref;
+use core::ptr::NonNull;
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
+use kernel_core::{FileDescriptor, FileOps, PreparedFileDescriptor, SyscallError, VfsStat};
+use mm::{allocation_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
 
 /// Filesystem trait
 ///
@@ -147,7 +153,11 @@ pub trait Inode: Send + Sync {
     ///
     /// # Returns
     /// A FileOps implementation for read/write operations
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError>;
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError>;
 
     /// Check if this inode is a directory
     fn is_dir(&self) -> bool {
@@ -182,6 +192,22 @@ pub trait Inode: Send + Sync {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let _ = (offset, buf);
         Err(FsError::NotSupported)
+    }
+
+    /// R180-L1: transactional read hook for sources whose `read_at` consumes
+    /// data (character devices, queues). The default is correct for ordinary
+    /// files: fill the caller's staging buffer, run copyout, then let the open
+    /// file description publish its offset. Consuming devices override this to
+    /// peek, copy, and consume only after `commit` succeeds.
+    fn read_at_with_commit(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    ) -> Result<usize, FsError> {
+        let count = self.read_at(offset, buf)?.min(buf.len());
+        commit(&buf[..count])?;
+        Ok(count)
     }
 
     /// Write data at given offset
@@ -221,11 +247,257 @@ pub trait Inode: Send + Sync {
 ///
 /// This wraps an inode with open state (offset, flags) and provides
 /// the standard file operations.
+const MAX_SHARED_OFFSET_REFS: usize = isize::MAX as usize;
+
+struct SharedFileOffsetInner {
+    strong: AtomicUsize,
+    /// Explicit weak references plus one implicit weak reference while strong
+    /// ownership is nonzero, matching Arc's reclamation discipline.
+    weak: AtomicUsize,
+    value: ManuallyDrop<spin::Mutex<u64>>,
+    /// Initialized before publication and moved out only by the last weak
+    /// owner, immediately before the backing allocation is deallocated.
+    charge: MaybeUninit<HeapCharge>,
+}
+
+/// Exact-lifetime shared offset for one open file description.
+///
+/// RF180-37: an ordinary `Arc<Mutex<u64>>` cannot embed its admission charge in
+/// the payload: the payload is destroyed when the last strong reference drops,
+/// while the Arc allocation remains live until the last Weak drops. This small,
+/// purpose-built Arc keeps the charge in the allocation and moves it to the
+/// final weak drop, which deallocates first and releases admission second.
+pub struct SharedFileOffset {
+    ptr: NonNull<SharedFileOffsetInner>,
+}
+
+/// Non-owning offset reference. Its presence deliberately keeps the backing
+/// allocation and admission charge alive after the last strong owner.
+pub struct WeakSharedFileOffset {
+    ptr: NonNull<SharedFileOffsetInner>,
+}
+
+unsafe impl Send for SharedFileOffset {}
+unsafe impl Sync for SharedFileOffset {}
+unsafe impl Send for WeakSharedFileOffset {}
+unsafe impl Sync for WeakSharedFileOffset {}
+
+impl SharedFileOffset {
+    fn try_new() -> Result<Self, FsError> {
+        let bytes = allocation_charge_bytes(
+            core::mem::size_of::<SharedFileOffsetInner>(),
+            core::mem::align_of::<SharedFileOffsetInner>(),
+        )
+        .map_err(|_| FsError::NoMem)?;
+        let reservation = try_reserve_heap(HeapClass::Vfs, bytes).map_err(|_| FsError::NoMem)?;
+        let mut inner = Box::try_new(SharedFileOffsetInner {
+            strong: AtomicUsize::new(1),
+            weak: AtomicUsize::new(1),
+            value: ManuallyDrop::new(spin::Mutex::new(0)),
+            charge: MaybeUninit::uninit(),
+        })
+        .map_err(|_| FsError::NoMem)?;
+        let charge = match reservation.commit() {
+            Ok(charge) => charge,
+            Err(_) => {
+                unsafe {
+                    ManuallyDrop::drop(&mut inner.value);
+                }
+                return Err(FsError::NoMem);
+            }
+        };
+        inner.charge.write(charge);
+        let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(inner)) };
+        Ok(Self { ptr })
+    }
+
+    #[inline]
+    pub fn downgrade(&self) -> WeakSharedFileOffset {
+        increment_refcount(unsafe { &self.ptr.as_ref().weak }, "shared offset weak");
+        WeakSharedFileOffset { ptr: self.ptr }
+    }
+
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    #[inline]
+    pub fn strong_count(&self) -> usize {
+        unsafe { self.ptr.as_ref().strong.load(Ordering::Acquire) }
+    }
+
+    #[inline]
+    pub fn weak_count(&self) -> usize {
+        let inner = unsafe { self.ptr.as_ref() };
+        let implicit = usize::from(inner.strong.load(Ordering::Acquire) != 0);
+        inner.weak.load(Ordering::Acquire).saturating_sub(implicit)
+    }
+}
+
+impl Clone for SharedFileOffset {
+    fn clone(&self) -> Self {
+        increment_refcount(unsafe { &self.ptr.as_ref().strong }, "shared offset strong");
+        Self { ptr: self.ptr }
+    }
+}
+
+impl Deref for SharedFileOffset {
+    type Target = spin::Mutex<u64>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(&self.ptr.as_ref().value as *const ManuallyDrop<_> as *const spin::Mutex<u64>) }
+    }
+}
+
+impl core::fmt::Debug for SharedFileOffset {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedFileOffset")
+            .field("strong", &self.strong_count())
+            .field("weak", &self.weak_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SharedFileOffset {
+    fn drop(&mut self) {
+        let inner = unsafe { self.ptr.as_ref() };
+        if inner.strong.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        unsafe {
+            ManuallyDrop::drop(&mut self.ptr.as_mut().value);
+        }
+        release_shared_offset_weak(self.ptr);
+    }
+}
+
+impl WeakSharedFileOffset {
+    pub fn upgrade(&self) -> Option<SharedFileOffset> {
+        let strong = unsafe { &self.ptr.as_ref().strong };
+        let mut current = strong.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return None;
+            }
+            if current >= MAX_SHARED_OFFSET_REFS {
+                panic!("shared offset strong reference count overflow");
+            }
+            match strong.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(SharedFileOffset { ptr: self.ptr }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+}
+
+impl Clone for WeakSharedFileOffset {
+    fn clone(&self) -> Self {
+        increment_refcount(unsafe { &self.ptr.as_ref().weak }, "shared offset weak");
+        Self { ptr: self.ptr }
+    }
+}
+
+impl core::fmt::Debug for WeakSharedFileOffset {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let inner = unsafe { self.ptr.as_ref() };
+        f.debug_struct("WeakSharedFileOffset")
+            .field("strong", &inner.strong.load(Ordering::Acquire))
+            .field("weak_total", &inner.weak.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WeakSharedFileOffset {
+    fn drop(&mut self) {
+        release_shared_offset_weak(self.ptr);
+    }
+}
+
+#[inline]
+fn increment_refcount(counter: &AtomicUsize, kind: &'static str) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 || current >= MAX_SHARED_OFFSET_REFS {
+            panic!("{kind} reference count overflow or resurrection");
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_shared_offset_weak(ptr: NonNull<SharedFileOffsetInner>) {
+    let inner = unsafe { ptr.as_ref() };
+    if inner.weak.fetch_sub(1, Ordering::Release) != 1 {
+        return;
+    }
+    fence(Ordering::Acquire);
+    unsafe {
+        let charge = ptr.as_ref().charge.as_ptr().read();
+        dealloc(
+            ptr.as_ptr().cast::<u8>(),
+            Layout::new::<SharedFileOffsetInner>(),
+        );
+        drop(charge);
+    }
+}
+
+/// Fully allocated open-file-description storage.
+///
+/// Construct this before path lookup/create. `finalize` performs no allocation,
+/// so O_CREAT/O_TRUNC cannot become visible and then fail solely because the fd
+/// object or shared offset could not be allocated.
+pub struct PreparedFileHandle {
+    descriptor: PreparedFileDescriptor<FileHandle>,
+    offset: SharedFileOffset,
+}
+
+impl PreparedFileHandle {
+    pub fn try_new() -> Result<Self, FsError> {
+        let descriptor = FileDescriptor::try_prepare(HeapClass::Vfs).map_err(|_| FsError::NoMem)?;
+        let offset = SharedFileOffset::try_new()?;
+        Ok(Self { descriptor, offset })
+    }
+
+    pub fn finalize(
+        self,
+        inode: Arc<dyn Inode>,
+        flags: OpenFlags,
+        seekable: bool,
+    ) -> FileDescriptor {
+        self.descriptor.finalize(FileHandle {
+            inode,
+            offset: self.offset,
+            flags,
+            seekable,
+        })
+    }
+}
+
+#[non_exhaustive]
 pub struct FileHandle {
     /// The underlying inode
     pub inode: Arc<dyn Inode>,
     /// Current file offset (shared via Arc for clone to share offset)
-    pub offset: Arc<spin::Mutex<u64>>,
+    pub offset: SharedFileOffset,
     /// Open flags
     pub flags: OpenFlags,
     /// Whether this handle supports seeking
@@ -242,7 +514,7 @@ impl Clone for FileHandle {
     fn clone(&self) -> Self {
         Self {
             inode: Arc::clone(&self.inode),
-            offset: Arc::clone(&self.offset),
+            offset: self.offset.clone(),
             flags: self.flags,
             seekable: self.seekable,
         }
@@ -250,14 +522,9 @@ impl Clone for FileHandle {
 }
 
 impl FileHandle {
-    /// Create a new file handle
-    pub fn new(inode: Arc<dyn Inode>, flags: OpenFlags, seekable: bool) -> Self {
-        Self {
-            inode,
-            offset: Arc::new(spin::Mutex::new(0)),
-            flags,
-            seekable,
-        }
+    fn try_clone_descriptor(&self) -> Result<FileDescriptor, ()> {
+        let prepared = FileDescriptor::try_prepare(HeapClass::Vfs)?;
+        Ok(prepared.finalize(self.clone()))
     }
 
     /// Read from current offset
@@ -344,13 +611,13 @@ impl FileHandle {
 }
 
 impl FileOps for FileHandle {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(FileHandle {
-            inode: Arc::clone(&self.inode),
-            offset: Arc::clone(&self.offset),
-            flags: self.flags,
-            seekable: self.seekable,
-        })
+    fn clone_box(&self) -> FileDescriptor {
+        self.try_clone_descriptor()
+            .expect("FileHandle clone allocation/admission failed")
+    }
+
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
+        self.try_clone_descriptor()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -371,5 +638,128 @@ impl FileOps for FileHandle {
             lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
         }
         Ok(vfs_stat)
+    }
+}
+
+#[cfg(test)]
+mod rf180_37_tests {
+    use super::*;
+    use crate::types::{FileType, TimeSpec};
+
+    static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    struct TestInode;
+
+    impl Inode for TestInode {
+        fn ino(&self) -> u64 {
+            1
+        }
+
+        fn fs_id(&self) -> u64 {
+            1
+        }
+
+        fn stat(&self) -> Result<Stat, FsError> {
+            Ok(Stat {
+                dev: 1,
+                ino: 1,
+                mode: FileMode::new(FileType::Regular, 0o600),
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: TimeSpec::new(0, 0),
+                mtime: TimeSpec::new(0, 0),
+                ctime: TimeSpec::new(0, 0),
+            })
+        }
+
+        fn open(
+            self: Arc<Self>,
+            flags: OpenFlags,
+            prepared: PreparedFileHandle,
+        ) -> Result<FileDescriptor, FsError> {
+            let inode: Arc<dyn Inode> = self;
+            Ok(prepared.finalize(inode, flags, true))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn rf180_37_descriptor_and_shared_offset_charges_have_exact_lifetimes() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Vfs);
+
+        let prepared = PreparedFileHandle::try_new().expect("prepare file handle");
+        let prepared_snapshot = mm::heap_class_snapshot(HeapClass::Vfs);
+        assert!(prepared_snapshot.committed_bytes > before.committed_bytes);
+        assert_eq!(prepared_snapshot.reserved_bytes, before.reserved_bytes);
+        drop(prepared);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Vfs), before);
+
+        let inode = Arc::new(TestInode);
+        let original = inode
+            .clone()
+            .open(
+                OpenFlags::new(OpenFlags::O_RDWR),
+                PreparedFileHandle::try_new().expect("prepare original descriptor"),
+            )
+            .expect("finalize original descriptor");
+        let one_descriptor = mm::heap_class_snapshot(HeapClass::Vfs);
+        let original_handle = original
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .expect("original FileHandle");
+        let weak = original_handle.offset.downgrade();
+
+        let cloned = original.try_clone().expect("fallible descriptor clone");
+        let two_descriptors = mm::heap_class_snapshot(HeapClass::Vfs);
+        assert!(two_descriptors.committed_bytes > one_descriptor.committed_bytes);
+        let cloned_handle = cloned
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .expect("cloned FileHandle");
+        assert!(SharedFileOffset::ptr_eq(
+            &original_handle.offset,
+            &cloned_handle.offset
+        ));
+        assert_eq!(cloned_handle.offset.strong_count(), 2);
+
+        drop(original);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Vfs),
+            one_descriptor,
+            "dropping one descriptor must release exactly one outer allocation"
+        );
+        let cloned_handle = cloned
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .expect("retained clone FileHandle");
+        assert_eq!(cloned_handle.offset.strong_count(), 1);
+        *cloned_handle.offset.lock() = 0x5a5a;
+        assert_eq!(
+            *weak.upgrade().expect("clone keeps offset live").lock(),
+            0x5a5a
+        );
+
+        drop(cloned);
+        let weak_only = mm::heap_class_snapshot(HeapClass::Vfs);
+        assert!(weak_only.committed_bytes > before.committed_bytes);
+        assert!(weak_only.committed_bytes < one_descriptor.committed_bytes);
+        assert!(weak.upgrade().is_none());
+
+        drop(weak);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Vfs),
+            before,
+            "the last Weak must deallocate backing before releasing its charge"
+        );
     }
 }
