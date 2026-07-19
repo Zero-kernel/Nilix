@@ -28,9 +28,6 @@
 //! The `assert_single_core_mode()` function panics if multiple CPUs are online
 //! but the IPI sender is not registered, ensuring we never silently skip shootdown.
 
-extern crate alloc;
-
-use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -85,8 +82,21 @@ static ONLINE_CPU_COUNT: AtomicU64 = AtomicU64::new(1);
 /// `register_cpu_online_with_id()` after completing initialization.
 static ONLINE_CPU_MASK: AtomicU64 = AtomicU64::new(1); // BSP (bit 0) is always online
 
-/// Next generation number for TLB shootdown requests (monotonic, starts at 1)
+/// Next generation number for TLB shootdown requests (monotonic, starts at 1).
+/// Zero is the unpublished queue-slot sentinel and may never be issued.
 static NEXT_SHOOTDOWN_GEN: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_shootdown_generation() -> u64 {
+    // R180-12 FIX: never wrap the generation into the queue's zero sentinel.
+    // A wrapped value would remain indistinguishable from an unpublished entry
+    // and could wedge the IPI handler or make completion accounting ambiguous.
+    NEXT_SHOOTDOWN_GEN
+        .fetch_update(Ordering::SeqCst, Ordering::Acquire, |current| {
+            current.checked_add(1).filter(|next| *next != 0)
+        })
+        .unwrap_or_else(|_| panic!("TLB shootdown generation space exhausted"))
+}
 
 // ============================================================================
 // Per-Address-Space TLB Tracking (R68 Architecture Improvement)
@@ -121,6 +131,67 @@ const FULL_FLUSH_THRESHOLD: u64 = 16;
 
 /// Type alias for IPI sender function
 type TlbIpiSender = fn(usize);
+
+/// Allocation-free set of logical CPU IDs.
+///
+/// `cpu_local` supports at most 64 CPUs, so a single word can carry target,
+/// fallback, and unacknowledged CPU sets through the entire shootdown path.
+/// Keeping this type private also preserves the existing public API while
+/// making page-table teardown safe when the heap is unavailable.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct CpuMask(u64);
+
+impl CpuMask {
+    #[inline]
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    fn insert(&mut self, cpu_id: usize) {
+        assert!(
+            cpu_id < u64::BITS as usize,
+            "TLB shootdown CPU ID {} exceeds fixed mask width",
+            cpu_id
+        );
+        self.0 |= 1u64 << cpu_id;
+    }
+
+    #[inline]
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    const fn iter(self) -> CpuMaskIter {
+        CpuMaskIter { remaining: self.0 }
+    }
+}
+
+impl core::fmt::Debug for CpuMask {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+struct CpuMaskIter {
+    remaining: u64,
+}
+
+impl Iterator for CpuMaskIter {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let cpu_id = self.remaining.trailing_zeros() as usize;
+        self.remaining &= self.remaining - 1;
+        Some(cpu_id)
+    }
+}
 
 /// Cached INVPCID support flag (initialized once, never changes)
 ///
@@ -429,6 +500,15 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
     PER_CPU_DATA.get_cpu(cpu_id).map(|data| data.tlb_mailbox())
 }
 
+/// Force-initialize the per-CPU mailbox storage used by every shootdown path.
+///
+/// `CpuLocal` allocates its fixed slot array on first access. Callers that must
+/// guarantee an allocation-free TLB flush after committing page-table state
+/// invoke this in process/boot context before beginning that transaction.
+pub fn force_init_tlb_shootdown_locals() {
+    PER_CPU_DATA.force_init();
+}
+
 /// Collect target CPUs for TLB shootdown based on address space tracking.
 ///
 /// RF178-33: Uses a bounded scan of fixed per-CPU atomic CR3 snapshots. This
@@ -440,15 +520,15 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
 ///
 /// # Returns
 ///
-/// Vector of CPU IDs that need to receive the TLB shootdown IPI.
+/// Bitmask of CPU IDs that need to receive the TLB shootdown IPI.
 ///
 /// # Fallback Behavior
 ///
 /// If tracking indicates no CPUs,
 /// we fall back to broadcasting to all online CPUs (except self). This ensures
 /// correctness even if tracking becomes out of sync.
-fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
-    let mut targets = Vec::new();
+fn collect_target_cpus(target_cr3: u64) -> CpuMask {
+    let mut targets = CpuMask::empty();
     let self_id = current_cpu_id();
 
     // Try to use the per-CPU snapshots when CR3 is valid. A CPU switching
@@ -465,7 +545,7 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
             if CPU_ACTIVE_CR3[cpu].load(Ordering::Acquire) == target_cr3
                 && lapic_id_for_cpu(cpu).is_some()
             {
-                targets.push(cpu);
+                targets.insert(cpu);
             }
         }
         if !targets.is_empty() {
@@ -484,7 +564,7 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
         }
         // Check both: LAPIC ID is registered AND CPU is marked online
         if lapic_id_for_cpu(cpu).is_some() && is_cpu_online(cpu) {
-            targets.push(cpu);
+            targets.insert(cpu);
         }
     }
     targets
@@ -596,14 +676,14 @@ fn enqueue_mailbox(
 /// 2. Every active CPU must have been initialized with a mailbox
 /// 3. A missing mailbox for an active CPU indicates a critical initialization bug
 ///
-/// # R106-5 FIX: Returns list of CPUs whose mailboxes were saturated
+/// # R106-5 FIX: Returns a mask of CPUs whose mailboxes were saturated
 ///
-/// CPUs returned in this list need a full-flush fallback via the IPI handler.
+/// CPUs set in this mask need a full-flush fallback via the IPI handler.
 /// For these CPUs, request_gen is advanced without a queue entry so the IPI
 /// handler performs an implicit full flush when it sees request_gen > ack_gen.
-fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) -> Vec<usize> {
-    let mut fallback_cpus = Vec::new();
-    for &cpu in targets {
+fn post_requests(targets: CpuMask, cr3: u64, start: u64, len: u64, generation: u64) -> CpuMask {
+    let mut fallback_cpus = CpuMask::empty();
+    for cpu in targets.iter() {
         // R94-8 FIX: A target CPU MUST have an initialized mailbox. If it doesn't,
         // this is a critical per-CPU initialization failure that would silently skip
         // TLB flushes, risking use-after-free from stale TLB entries.
@@ -619,15 +699,15 @@ fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: 
             // the IPI handler performs a full flush when it sees the generation gap.
             mailbox.request_gen.fetch_max(generation, Ordering::Release);
             STATS_COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            fallback_cpus.push(cpu);
+            fallback_cpus.insert(cpu);
         }
     }
     fallback_cpus
 }
 
 /// Send TLB shootdown IPIs to all target CPUs
-fn send_ipis(targets: &[usize], sender: TlbIpiSender) {
-    for &cpu in targets {
+fn send_ipis(targets: CpuMask, sender: TlbIpiSender) {
+    for cpu in targets.iter() {
         sender(cpu);
     }
 }
@@ -650,9 +730,9 @@ const ACK_TIMEOUT_RETRIES: usize = 3;
 /// Now uses `.unwrap_or(false)` (fail-closed): if we cannot verify a CPU's ACK,
 /// we assume it has NOT acked. Combined with the retry/panic logic in callers,
 /// this ensures we never silently skip a CPU's TLB flush.
-fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
+fn wait_for_acks(targets: CpuMask, generation: u64) -> bool {
     for _ in 0..IPI_ACK_TIMEOUT_SPINS {
-        let all_acked = targets.iter().all(|&cpu| {
+        let all_acked = targets.iter().all(|cpu| {
             mailbox_for_cpu(cpu)
                 .map(|m| m.ack_gen.load(Ordering::Acquire) >= generation)
                 // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
@@ -672,7 +752,7 @@ fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
     false
 }
 
-/// Get list of CPUs that haven't ACKed yet
+/// Get a mask of CPUs that haven't ACKed yet
 ///
 /// # R93-9 FIX: Fail-Closed Missing Mailbox
 ///
@@ -687,24 +767,25 @@ fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
 /// Now uses `.unwrap_or(true)` (fail-closed): if we cannot verify a CPU's ACK
 /// status, we assume it has NOT acked and include it in the unacked list.
 /// This ensures the retry logic and panic path catch the problem.
-fn get_unacked_cpus(targets: &[usize], generation: u64) -> Vec<usize> {
-    targets
-        .iter()
-        .filter(|&&cpu| {
-            mailbox_for_cpu(cpu)
-                .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
-                // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
-                .unwrap_or(true)
-        })
-        .copied()
-        .collect()
+fn get_unacked_cpus(targets: CpuMask, generation: u64) -> CpuMask {
+    let mut unacked = CpuMask::empty();
+    for cpu in targets.iter() {
+        if mailbox_for_cpu(cpu)
+            .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
+            // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
+            .unwrap_or(true)
+        {
+            unacked.insert(cpu);
+        }
+    }
+    unacked
 }
 
 /// Wait for ACKs with retry support
 ///
 /// Codex review fix: On timeout, resends IPIs and retries before failing.
 /// After ACK_TIMEOUT_RETRIES attempts, panics in debug builds or warns in release.
-fn wait_for_acks_with_retry(targets: &[usize], generation: u64, sender: TlbIpiSender) -> bool {
+fn wait_for_acks_with_retry(targets: CpuMask, generation: u64, sender: TlbIpiSender) -> bool {
     for attempt in 0..=ACK_TIMEOUT_RETRIES {
         if wait_for_acks(targets, generation) {
             return true;
@@ -718,7 +799,7 @@ fn wait_for_acks_with_retry(targets: &[usize], generation: u64, sender: TlbIpiSe
 
         if attempt < ACK_TIMEOUT_RETRIES {
             // Resend IPIs to unacked CPUs
-            for &cpu in &unacked {
+            for cpu in unacked.iter() {
                 sender(cpu);
             }
         } else {
@@ -749,19 +830,11 @@ fn wait_for_acks_with_retry(targets: &[usize], generation: u64, sender: TlbIpiSe
 
 #[allow(dead_code)]
 /// Warn about timeout waiting for ACKs (non-fatal, for debugging)
-fn warn_timeout(targets: &[usize], generation: u64) {
+fn warn_timeout(targets: CpuMask, generation: u64) {
     // Find which CPUs didn't ACK
     // R163-I7 FIX: Use unwrap_or(true) for consistency with get_unacked_cpus —
     // a missing mailbox means we cannot confirm ACK, so assume NOT acked.
-    let missing: Vec<usize> = targets
-        .iter()
-        .filter(|&&cpu| {
-            mailbox_for_cpu(cpu)
-                .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
-                .unwrap_or(true)
-        })
-        .copied()
-        .collect();
+    let missing = get_unacked_cpus(targets, generation);
 
     kprintln!(
         "[WARN] TLB shootdown gen {} timed out waiting for ACK from CPUs {:?}",
@@ -782,21 +855,21 @@ fn warn_timeout(targets: &[usize], generation: u64) {
 ///
 /// # R106-5 FIX: Propagates mailbox saturation info
 ///
-/// The returned `ShootdownDispatch` includes a list of CPUs whose mailboxes
-/// were saturated. Callers should perform a full local flush when this list
+/// The returned `ShootdownDispatch` includes a mask of CPUs whose mailboxes
+/// were saturated. Callers should perform a full local flush when this mask
 /// is non-empty to ensure correctness.
 struct ShootdownDispatch {
-    targets: Vec<usize>,
+    targets: CpuMask,
     generation: u64,
     /// R106-5: CPUs that couldn't be enqueued (mailbox full); need full-flush fallback
-    fallback_cpus: Vec<usize>,
+    fallback_cpus: CpuMask,
 }
 
-fn dispatch_shootdown(start: u64, len: u64) -> Option<ShootdownDispatch> {
-    let cr3 = current_cr3_value();
-
-    // R68 optimization: Use per-address-space tracking to target only relevant CPUs
-    let targets = collect_target_cpus(cr3);
+fn dispatch_shootdown_for_cr3(target_cr3: u64, start: u64, len: u64) -> Option<ShootdownDispatch> {
+    // R68 optimization: Use per-address-space tracking to target only relevant CPUs.
+    // target_cr3 == 0 deliberately broadcasts to every online CPU for shared
+    // kernel mappings that are reachable through multiple distinct CR3 roots.
+    let targets = collect_target_cpus(target_cr3);
     if targets.is_empty() {
         return None;
     }
@@ -808,20 +881,25 @@ fn dispatch_shootdown(start: u64, len: u64) -> Option<ShootdownDispatch> {
         )
     });
 
-    let generation = NEXT_SHOOTDOWN_GEN.fetch_add(1, Ordering::SeqCst);
+    let generation = next_shootdown_generation();
 
     // Post requests to all target mailboxes. Under mailbox saturation this may
     // return a list of CPUs that need a full-flush fallback (R106-5).
-    let fallback_cpus = post_requests(&targets, cr3, start, len, generation);
+    let fallback_cpus = post_requests(targets, target_cr3, start, len, generation);
 
     // Send IPIs to wake up targets
-    send_ipis(&targets, sender);
+    send_ipis(targets, sender);
 
     Some(ShootdownDispatch {
         targets,
         generation,
         fallback_cpus,
     })
+}
+
+#[inline]
+fn dispatch_shootdown(start: u64, len: u64) -> Option<ShootdownDispatch> {
+    dispatch_shootdown_for_cr3(current_cr3_value(), start, len)
 }
 
 /// Range operation type for flush optimization
@@ -956,13 +1034,32 @@ impl Drop for ShootdownCpuPin {
 /// IPI acknowledgments.
 #[inline]
 pub fn flush_current_as_all() {
+    flush_all_impl(false);
+}
+
+/// Flush non-global translations on every online CPU, independent of the CR3
+/// currently active on that CPU.
+///
+/// R180-12 FIX: per-process kernel stacks live in shared high-half page-table
+/// subtrees copied into many kernel and KPTI roots. Targeting only CPUs whose
+/// active CR3 equals the caller's root can leave a stale translation under a
+/// different root. A `target_cr3 == 0` mailbox request makes every receiver do
+/// a full non-global flush and ACK before shared frames are reused.
+#[inline]
+pub fn flush_all_address_spaces() {
+    flush_all_impl(true);
+}
+
+fn flush_all_impl(broadcast: bool) {
     // P2-7 FIX: Pin to a stable CPU for the entire shootdown operation.
     let _pin = ShootdownCpuPin::new();
 
     assert_single_core_mode();
 
-    // Dispatch to remote CPUs (if any)
-    let shoot = dispatch_shootdown(0, 0);
+    // Dispatch to remote CPUs (if any). Shared kernel mappings use CR3=0 to
+    // force a true broadcast; ordinary callers retain targeted CR3 behavior.
+    let target_cr3 = if broadcast { 0 } else { current_cr3_value() };
+    let shoot = dispatch_shootdown_for_cr3(target_cr3, 0, 0);
 
     // Flush local TLB immediately using INVPCID if available
     flush_all_local();
@@ -997,8 +1094,8 @@ pub fn flush_current_as_all() {
             //
             // We cannot safely continue. Previous behavior (warn + continue) allowed
             // silent memory corruption in release builds.
-            if !wait_for_acks_with_retry(&targets, generation, sender) {
-                let unacked = get_unacked_cpus(&targets, generation);
+            if !wait_for_acks_with_retry(targets, generation, sender) {
+                let unacked = get_unacked_cpus(targets, generation);
                 panic!(
                     "CRITICAL: TLB shootdown gen {} failed! CPUs {:?} did not ACK. \
                      Cannot continue - stale TLB entries would cause memory corruption.",
@@ -1086,8 +1183,8 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
                 if let Some(sender) = tlb_ipi_sender() {
                     // R68-5 FIX: Range flush ACK failure is also fatal.
                     // Same reasoning as flush_current_as_all - cannot allow stale TLB.
-                    if !wait_for_acks_with_retry(&targets, generation, sender) {
-                        let unacked = get_unacked_cpus(&targets, generation);
+                    if !wait_for_acks_with_retry(targets, generation, sender) {
+                        let unacked = get_unacked_cpus(targets, generation);
                         panic!(
                             "CRITICAL: TLB shootdown gen {} (range 0x{:x}+0x{:x}) failed! \
                              CPUs {:?} did not ACK. Cannot continue.",

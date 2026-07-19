@@ -83,6 +83,22 @@ pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
 }
 
+/// Result of allocation-free rollback accounting for page-table frames that a
+/// failed `map_to` operation allocated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackedTableRollback {
+    /// Empty leaf page tables detached and safe to return after this method's
+    /// synchronous paging-structure flush.
+    pub reclaimed_count: usize,
+    /// Empty upper tables deliberately left reachable for reuse.  Kernel KPTI
+    /// roots copy upper entry-island entries by value, so detaching those tables
+    /// without a global root registry would leave stale aliases.
+    pub retained_count: usize,
+    /// Every tracked allocation was either reclaimed or proven reachable and
+    /// empty.  `false` requires fail-closed quarantine by the caller.
+    pub all_accounted: bool,
+}
+
 /// 基于当前活动的 CR3 构建临时页表管理器
 ///
 /// 此函数在每次调用时从当前 CR3 读取页表根地址，确保始终操作正确的地址空间。
@@ -157,6 +173,70 @@ impl PageTableManager {
     }
 
     /// 映射虚拟页到物理帧
+    /// Return whether the exact 4 KiB leaf slot is structurally unused.
+    ///
+    /// Unlike `translate_addr`, this treats a non-present PTE that still
+    /// contains flags or a physical address as occupied. Mapping over such an
+    /// entry would discard hidden ownership metadata or make rollback reason
+    /// about a leaf it did not create.
+    pub fn page_slot_is_unused(&mut self, page: Page<Size4KiB>) -> bool {
+        let addr = page.start_address();
+        let pml4 = self.mapper.level_4_table_mut();
+        let pml4e = &pml4[usize::from(addr.p4_index())];
+        if pml4e.is_unused() {
+            return true;
+        }
+        if !pml4e.flags().contains(PageTableFlags::PRESENT) {
+            return false;
+        }
+
+        let pdpt = unsafe { &*phys_to_virt(pml4e.addr()).as_ptr::<PageTable>() };
+        let pdpte = &pdpt[usize::from(addr.p3_index())];
+        if pdpte.is_unused() {
+            return true;
+        }
+        let pdpte_flags = pdpte.flags();
+        if !pdpte_flags.contains(PageTableFlags::PRESENT)
+            || pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
+        {
+            return false;
+        }
+
+        let pd = unsafe { &*phys_to_virt(pdpte.addr()).as_ptr::<PageTable>() };
+        let pde = &pd[usize::from(addr.p2_index())];
+        if pde.is_unused() {
+            return true;
+        }
+        let pde_flags = pde.flags();
+        if !pde_flags.contains(PageTableFlags::PRESENT)
+            || pde_flags.contains(PageTableFlags::HUGE_PAGE)
+        {
+            return false;
+        }
+
+        let pt = unsafe { &*phys_to_virt(pde.addr()).as_ptr::<PageTable>() };
+        pt[usize::from(addr.p1_index())].is_unused()
+    }
+
+    /// Return whether the complete 512 GiB PML4 slot containing `addr` is
+    /// structurally unused.
+    ///
+    /// This is stronger than [`Self::page_slot_is_unused`]: a vacant leaf in an
+    /// already-populated hierarchy is not sufficient for tests or transactions
+    /// that need a deterministic number of intermediate-table allocations.
+    /// `PageTableEntry::is_unused` also rejects non-present entries that retain
+    /// flags or an address, so callers never overwrite hidden ownership state.
+    pub fn pml4_slot_is_unused(&mut self, addr: VirtAddr) -> bool {
+        let pml4 = self.mapper.level_4_table_mut();
+        pml4[usize::from(addr.p4_index())].is_unused()
+    }
+
+    /// Translate one exact 4 KiB page. Huge-parent mappings are rejected.
+    #[inline]
+    pub fn translate_page_4k(&self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
+        self.mapper.translate_page(page).ok()
+    }
+
     pub fn map_page(
         &mut self,
         page: Page,
@@ -283,8 +363,10 @@ impl PageTableManager {
     /// user root (only PML4 entries are copied per-root — see `fork.rs`), so the
     /// change is visible through both roots with no mirroring. The PDPT level is
     /// intentionally **not** pruned: freeing a PDPT means clearing a PML4E, which
-    /// would have to be mirrored into the KPTI user root. The residual is at most
-    /// one PDPT frame per fresh-512 GiB-region rollback, which is exit-reclaimed.
+    /// would have to be mirrored into the KPTI user root. A tracked PDPT that is
+    /// still referenced by the exact PML4E is explicitly accounted as retained;
+    /// the residual is at most one frame per fresh 512-GiB region and remains
+    /// reachable for reuse/exit reclamation.
     ///
     /// # Safety invariant
     ///
@@ -418,6 +500,241 @@ impl PageTableManager {
     }
 
     /// 转换虚拟地址到物理地址
+    /// R180-12 FIX: allocation-free accounting for intermediate frames created
+    /// by a failed fixed-size mapping transaction.
+    ///
+    /// After the caller clears every leaf PTE it installed, this detaches tracked
+    /// empty PT frames. Runtime callers pass `detach_upper_tables = false`, so
+    /// empty PD/PDPT frames remain linked: KPTI roots may copy upper entries by
+    /// value. A pre-KPTI boot-exclusive caller may pass `true` only when it proves
+    /// that the active PML4 is the sole root containing the transaction's entries;
+    /// that mode detaches every tracked empty level bottom-up.
+    ///
+    /// Any detached PT is followed by a synchronous full cross-CPU flush before
+    /// return. The caller may free the returned frames after dropping PT_LOCK.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold PT_LOCK, must have removed all leaves installed by
+    /// this transaction, and must pass only frames allocated by the transaction's
+    /// recording frame allocator. `detach_upper_tables = true` additionally
+    /// requires exclusive ownership of the active root and absence of peer roots.
+    pub unsafe fn rollback_tracked_leaf_tables<const TRACKED: usize, const RECLAIMED: usize>(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+        tracked: &[Option<PhysFrame<Size4KiB>>; TRACKED],
+        tracked_len: usize,
+        reclaimed: &mut [Option<PhysFrame<Size4KiB>>; RECLAIMED],
+        detach_upper_tables: bool,
+    ) -> TrackedTableRollback {
+        const PT_SPAN: u64 = 0x20_0000;
+        const PD_SPAN: u64 = 0x4000_0000;
+        const PML4_SPAN: u64 = 0x80_0000_0000;
+
+        #[inline]
+        fn empty(table: &PageTable) -> bool {
+            table.iter().all(|entry| entry.is_unused())
+        }
+
+        #[inline]
+        fn tracked_index<const N: usize>(
+            tracked: &[Option<PhysFrame<Size4KiB>>; N],
+            tracked_len: usize,
+            frame: PhysFrame<Size4KiB>,
+        ) -> Option<usize> {
+            (0..tracked_len).find(|index| tracked[*index] == Some(frame))
+        }
+
+        if tracked_len > TRACKED || len == 0 || reclaimed.iter().any(Option::is_some) {
+            return TrackedTableRollback {
+                reclaimed_count: 0,
+                retained_count: 0,
+                all_accounted: tracked_len == 0 && len != 0,
+            };
+        }
+
+        let mut valid = true;
+        for index in 0..tracked_len {
+            let Some(frame) = tracked[index] else {
+                valid = false;
+                continue;
+            };
+            if tracked[..index]
+                .iter()
+                .any(|candidate| *candidate == Some(frame))
+            {
+                valid = false;
+            }
+        }
+
+        let start_u = start.as_u64();
+        let Some(end_u) = (len as u64)
+            .checked_sub(1)
+            .and_then(|tail| start_u.checked_add(tail))
+        else {
+            return TrackedTableRollback {
+                reclaimed_count: 0,
+                retained_count: 0,
+                all_accounted: false,
+            };
+        };
+
+        let mut accounted = [false; TRACKED];
+        let mut reclaimed_count = 0usize;
+        let mut retained_count = 0usize;
+        let mut detached_any = false;
+        let pml4 = self.mapper.level_4_table_mut();
+
+        // Bottom-up PT pass. The range iterator visits each possible PT parent
+        // once even when the four-page stack straddles a 2 MiB boundary.
+        let mut cursor = start_u & !(PT_SPAN - 1);
+        loop {
+            let addr = VirtAddr::new(cursor);
+            let pml4e = &pml4[usize::from(addr.p4_index())];
+            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+                let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
+                let pdpte = &pdpt[usize::from(addr.p3_index())];
+                let pdpte_flags = pdpte.flags();
+                if pdpte_flags.contains(PageTableFlags::PRESENT)
+                    && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
+                {
+                    let pd = &mut *phys_to_virt(pdpte.addr()).as_mut_ptr::<PageTable>();
+                    let pde = &mut pd[usize::from(addr.p2_index())];
+                    let pde_flags = pde.flags();
+                    if pde_flags.contains(PageTableFlags::PRESENT)
+                        && !pde_flags.contains(PageTableFlags::HUGE_PAGE)
+                    {
+                        let frame = PhysFrame::containing_address(pde.addr());
+                        if let Some(index) = tracked_index(tracked, tracked_len, frame) {
+                            let pt = &*phys_to_virt(pde.addr()).as_ptr::<PageTable>();
+                            if !empty(pt) {
+                                valid = false;
+                            } else if let Some(output) =
+                                reclaimed.iter_mut().find(|slot| slot.is_none())
+                            {
+                                *output = Some(frame);
+                                accounted[index] = true;
+                                reclaimed_count += 1;
+                                pde.set_unused();
+                                detached_any = true;
+                            } else {
+                                // Still fully accounted: it remains reachable
+                                // and empty, and later stack mappings reuse it.
+                                accounted[index] = true;
+                                retained_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            match cursor.checked_add(PT_SPAN) {
+                Some(next) if next <= end_u => cursor = next,
+                _ => break,
+            }
+        }
+
+        // Account newly created PDs after their tracked PT children have been
+        // detached. Runtime callers retain them for KPTI alias safety. A
+        // pre-KPTI boot-exclusive caller may prove that no peer root exists and
+        // request complete bottom-up detachment.
+        cursor = start_u & !(PD_SPAN - 1);
+        loop {
+            let addr = VirtAddr::new(cursor);
+            let pml4e = &pml4[usize::from(addr.p4_index())];
+            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+                let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
+                let pdpte = &mut pdpt[usize::from(addr.p3_index())];
+                let flags = pdpte.flags();
+                if flags.contains(PageTableFlags::PRESENT)
+                    && !flags.contains(PageTableFlags::HUGE_PAGE)
+                {
+                    let frame = PhysFrame::containing_address(pdpte.addr());
+                    if let Some(index) = tracked_index(tracked, tracked_len, frame) {
+                        let pd = &*phys_to_virt(pdpte.addr()).as_ptr::<PageTable>();
+                        if empty(pd) {
+                            if !accounted[index] {
+                                if detach_upper_tables {
+                                    if let Some(output) =
+                                        reclaimed.iter_mut().find(|slot| slot.is_none())
+                                    {
+                                        *output = Some(frame);
+                                        accounted[index] = true;
+                                        reclaimed_count += 1;
+                                        pdpte.set_unused();
+                                        detached_any = true;
+                                    } else {
+                                        valid = false;
+                                    }
+                                } else {
+                                    accounted[index] = true;
+                                    retained_count += 1;
+                                }
+                            }
+                        } else {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+
+            match cursor.checked_add(PD_SPAN) {
+                Some(next) if next <= end_u => cursor = next,
+                _ => break,
+            }
+        }
+
+        // Account newly allocated PDPTs last. Runtime callers retain them because
+        // a KPTI peer root may carry the same PML4 entry by value. The guarded
+        // boot-stack caller runs before peer roots exist and can detach the now-
+        // empty tracked PDPT from the sole live PML4.
+        cursor = start_u & !(PML4_SPAN - 1);
+        loop {
+            let addr = VirtAddr::new(cursor);
+            let pml4e = &mut pml4[usize::from(addr.p4_index())];
+            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+                let frame = PhysFrame::containing_address(pml4e.addr());
+                if let Some(index) = tracked_index(tracked, tracked_len, frame) {
+                    let pdpt = &*phys_to_virt(pml4e.addr()).as_ptr::<PageTable>();
+                    if !empty(pdpt) {
+                        valid = false;
+                    } else if !accounted[index] {
+                        if detach_upper_tables {
+                            if let Some(output) = reclaimed.iter_mut().find(|slot| slot.is_none()) {
+                                *output = Some(frame);
+                                accounted[index] = true;
+                                reclaimed_count += 1;
+                                pml4e.set_unused();
+                                detached_any = true;
+                            } else {
+                                valid = false;
+                            }
+                        } else {
+                            accounted[index] = true;
+                            retained_count += 1;
+                        }
+                    }
+                }
+            }
+
+            match cursor.checked_add(PML4_SPAN) {
+                Some(next) if next <= end_u => cursor = next,
+                _ => break,
+            }
+        }
+
+        if detached_any {
+            crate::tlb_shootdown::flush_all_address_spaces();
+        }
+
+        TrackedTableRollback {
+            reclaimed_count,
+            retained_count,
+            all_accounted: valid && accounted[..tracked_len].iter().all(|entry| *entry),
+        }
+    }
+
     pub fn translate_addr(&self, addr: VirtAddr) -> Option<PhysAddr> {
         use x86_64::structures::paging::mapper::TranslateResult;
 
