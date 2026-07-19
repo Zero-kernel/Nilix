@@ -7,11 +7,11 @@ edition = "2021"
 path = "lib.rs"
 
 [features]
-# host_harness: compile `mm` WITHOUT its #[global_allocator] registration so the
-# crate (and everything that transitively depends on it) can link into a hosted
-# std binary — the cargo-fuzz harness. OFF for the kernel build; see the
-# ALLOCATOR static in memory.rs.
-host_harness = []
+# host_harness: compile `mm` WITHOUT its #[global_allocator] registration and
+# make CPU-local lookup safe for an ordinary hosted process with no LAPIC MMIO
+# mapping. The feature is OFF for the kernel build; see the ALLOCATOR static in
+# memory.rs and cpu_local::current_cpu_id().
+host_harness = ["cpu_local/host_harness"]
 
 [dependencies]
 drivers = { path = "../drivers" }
@@ -21,5 +21,4 @@ x86_64 = "0.15"
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 linked_list_allocator = "0.10"
-bit-vec = { version = "0.6", default-features = false }
 klog = { path = "../klog" }
