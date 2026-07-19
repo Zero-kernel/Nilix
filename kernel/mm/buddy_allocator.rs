@@ -3,38 +3,321 @@
 //! Buddy分配器是一种高效的内存管理算法，通过将内存分割成2的幂次大小的块来管理。
 //! 当需要分配内存时，找到最小的能满足需求的块；释放时尝试与相邻的块合并。
 
-use alloc::vec;
 use alloc::vec::Vec;
-use bit_vec::BitVec;
 use spin::Mutex;
 use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
 use crate::oom_killer;
 
-/// 最大阶数（2^MAX_ORDER * PAGE_SIZE = 最大连续分配大小）
-const MAX_ORDER: usize = 11; // 2^11 * 4KB = 8MB
+/// Number of supported buddy orders. Valid allocation orders are 0..=10,
+/// making the largest block 2^10 * 4 KiB = 4 MiB.
+const ORDER_COUNT: usize = 11;
 /// 页面大小（4KB）
 const PAGE_SIZE: usize = 4096;
 
+const PAGE_FREE: u8 = 0;
+const PAGE_ALLOC_START_BASE: u8 = 1;
+const PAGE_ALLOC_TAIL_BASE: u8 = 0x40;
+const PAGE_RESERVED: u8 = u8::MAX;
+
+#[inline]
+fn allocation_start_state(order: usize) -> Option<u8> {
+    (order < ORDER_COUNT).then_some(PAGE_ALLOC_START_BASE + order as u8)
+}
+
+#[inline]
+fn allocation_tail_state(order: usize) -> Option<u8> {
+    (order < ORDER_COUNT).then_some(PAGE_ALLOC_TAIL_BASE + order as u8)
+}
+
+#[inline]
+fn decode_allocation_start(state: u8) -> Option<usize> {
+    let order = state.checked_sub(PAGE_ALLOC_START_BASE)? as usize;
+    (order < ORDER_COUNT).then_some(order)
+}
+
+#[inline]
+fn decode_allocation_tail(state: u8) -> Option<usize> {
+    let order = state.checked_sub(PAGE_ALLOC_TAIL_BASE)? as usize;
+    (order < ORDER_COUNT).then_some(order)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuddyInitError {
+    EmptyRegion,
+    RegionMisaligned,
+    AddressOverflow,
+    MetadataSizeOverflow,
+    MetadataAllocationFailed,
+    MetadataCorrupt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AllocError {
+    InvalidOrder,
+    Exhausted,
+    AllocatorUnavailable,
+    AddressOverflow,
+    MetadataCorrupt,
+    AllocatorPoisoned,
+}
+
 /// Buddy分配器的核心结构
+/// Fail-closed reason returned by checked physical-block deallocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FreeError {
+    InvalidCount,
+    OrderTooLarge,
+    AllocatorUnavailable,
+    AddressBelowBase,
+    AddressMisaligned,
+    RangeOutOfBounds,
+    NotAllocationStart,
+    OrderMismatch,
+    PageNotAllocated,
+    ReservedPage,
+    MetadataCorrupt,
+    AllocatorPoisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FreeBit {
+    word_index: usize,
+    mask: u64,
+    order: usize,
+    block_idx: usize,
+}
+
+/// Fixed-size, allocation-free-after-init representation of every free buddy
+/// block.  Order `o`, block `b` represents the exact page range
+/// `[b << o, (b + 1) << o)`.  All order bitmaps live in one fallibly allocated
+/// word vector whose length and capacity never change after construction.
+struct FixedFreeMap {
+    words: Vec<u64>,
+    word_base: [usize; ORDER_COUNT + 1],
+    valid_blocks: [usize; ORDER_COUNT],
+    block_count: [usize; ORDER_COUNT],
+    search_cursor: [usize; ORDER_COUNT],
+}
+
+impl FixedFreeMap {
+    fn try_new(total_pages: usize) -> Result<Self, BuddyInitError> {
+        let mut word_base = [0usize; ORDER_COUNT + 1];
+        let mut valid_blocks = [0usize; ORDER_COUNT];
+        let mut total_words = 0usize;
+
+        for order in 0..ORDER_COUNT {
+            let block_pages = 1usize << order;
+            let blocks = total_pages / block_pages;
+            let words = blocks / u64::BITS as usize
+                + usize::from(!blocks.is_multiple_of(u64::BITS as usize));
+            valid_blocks[order] = blocks;
+            word_base[order] = total_words;
+            total_words = total_words
+                .checked_add(words)
+                .ok_or(BuddyInitError::MetadataSizeOverflow)?;
+        }
+        word_base[ORDER_COUNT] = total_words;
+
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(total_words)
+            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
+        storage.resize(total_words, 0);
+
+        Ok(Self {
+            words: storage,
+            word_base,
+            valid_blocks,
+            block_count: [0; ORDER_COUNT],
+            search_cursor: [0; ORDER_COUNT],
+        })
+    }
+
+    #[inline]
+    fn location(&self, order: usize, block_idx: usize) -> Option<FreeBit> {
+        if order >= ORDER_COUNT {
+            return None;
+        }
+        let block_pages = 1usize << order;
+        if block_idx & (block_pages - 1) != 0 {
+            return None;
+        }
+        let block_no = block_idx >> order;
+        if block_no >= self.valid_blocks[order] {
+            return None;
+        }
+        let word_offset = block_no / u64::BITS as usize;
+        let word_index = self.word_base[order].checked_add(word_offset)?;
+        if word_index >= self.word_base[order + 1] || word_index >= self.words.len() {
+            return None;
+        }
+        Some(FreeBit {
+            word_index,
+            mask: 1u64 << (block_no % u64::BITS as usize),
+            order,
+            block_idx,
+        })
+    }
+
+    #[inline]
+    fn is_set(&self, bit: FreeBit) -> bool {
+        self.words
+            .get(bit.word_index)
+            .is_some_and(|word| word & bit.mask != 0)
+    }
+
+    #[inline]
+    fn first_set_in_word(
+        &self,
+        order: usize,
+        word_offset: usize,
+        search_mask: u64,
+    ) -> Option<FreeBit> {
+        let word_index = self.word_base.get(order)?.checked_add(word_offset)?;
+        if word_index >= *self.word_base.get(order + 1)? {
+            return None;
+        }
+
+        let block_word = *self.words.get(word_index)? & search_mask;
+        if block_word == 0 {
+            return None;
+        }
+
+        let bit_in_word = block_word.trailing_zeros() as usize;
+        let block_no = word_offset
+            .checked_mul(u64::BITS as usize)?
+            .checked_add(bit_in_word)?;
+        if block_no >= *self.valid_blocks.get(order)? {
+            return None;
+        }
+        let block_idx = block_no.checked_shl(order as u32)?;
+        Some(FreeBit {
+            word_index,
+            mask: 1u64 << bit_in_word,
+            order,
+            block_idx,
+        })
+    }
+
+    /// Find a free block by scanning bitmap words from the per-order cursor.
+    ///
+    /// This deliberately never walks individual zero bits: the allocator lock
+    /// is global, and a sparse order-0 map can contain hundreds of thousands of
+    /// blocks.  Each bitmap word is examined at most once (apart from splitting
+    /// the cursor word into suffix/prefix masks), and `trailing_zeros` locates
+    /// the first candidate in constant time.  Bits beyond `valid_blocks` are
+    /// masked out so malformed tail storage can never yield an out-of-range
+    /// block.
+    fn find_first(&self, order: usize) -> Option<FreeBit> {
+        let blocks = *self.valid_blocks.get(order)?;
+        if blocks == 0 || self.block_count.get(order).copied()? == 0 {
+            return None;
+        }
+
+        let word_start = *self.word_base.get(order)?;
+        let word_end = *self.word_base.get(order + 1)?;
+        let word_count = word_end.checked_sub(word_start)?;
+        if word_count == 0 {
+            return None;
+        }
+
+        let start_block = self.search_cursor[order].min(blocks - 1);
+        let start_word = start_block / u64::BITS as usize;
+        let start_bit = start_block % u64::BITS as usize;
+
+        let valid_mask = |word_offset: usize| {
+            let first_block = word_offset.saturating_mul(u64::BITS as usize);
+            let remaining = blocks.saturating_sub(first_block);
+            match remaining {
+                0 => 0,
+                n if n >= u64::BITS as usize => u64::MAX,
+                n => (1u64 << n) - 1,
+            }
+        };
+
+        // Cursor word, from the cursor bit to the end.
+        let suffix_mask = u64::MAX << start_bit;
+        if let Some(bit) =
+            self.first_set_in_word(order, start_word, suffix_mask & valid_mask(start_word))
+        {
+            return Some(bit);
+        }
+
+        // Remaining whole words through the end of this order's bitmap.
+        for word_offset in start_word + 1..word_count {
+            if let Some(bit) = self.first_set_in_word(order, word_offset, valid_mask(word_offset)) {
+                return Some(bit);
+            }
+        }
+
+        // Wrap to whole words before the cursor word.
+        for word_offset in 0..start_word {
+            if let Some(bit) = self.first_set_in_word(order, word_offset, valid_mask(word_offset)) {
+                return Some(bit);
+            }
+        }
+
+        // Finally inspect the prefix of the cursor word.  Avoid a shift by 64.
+        if start_bit != 0 {
+            let prefix_mask = (1u64 << start_bit) - 1;
+            if let Some(bit) =
+                self.first_set_in_word(order, start_word, prefix_mask & valid_mask(start_word))
+            {
+                return Some(bit);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn count_for_order(&self, order: usize) -> Option<usize> {
+        self.block_count.get(order).copied()
+    }
+
+    /// Commit-only primitive. Every location and bit transition is preflighted
+    /// before callers enter their mutation phase, so this performs no allocation
+    /// and cannot change vector length/capacity.
+    fn commit_set(&mut self, bit: FreeBit, value: bool) {
+        let word = &mut self.words[bit.word_index];
+        if value {
+            *word |= bit.mask;
+            self.block_count[bit.order] += 1;
+            let block_no = bit.block_idx >> bit.order;
+            if self.block_count[bit.order] == 1 || block_no < self.search_cursor[bit.order] {
+                self.search_cursor[bit.order] = block_no;
+            }
+        } else {
+            *word &= !bit.mask;
+            self.block_count[bit.order] -= 1;
+            let blocks = self.valid_blocks[bit.order];
+            if blocks != 0 {
+                self.search_cursor[bit.order] = ((bit.block_idx >> bit.order) + 1) % blocks;
+            }
+        }
+    }
+
+    fn count_actual(&self, order: usize) -> Option<usize> {
+        if order >= ORDER_COUNT {
+            return None;
+        }
+        Some(
+            self.words[self.word_base[order]..self.word_base[order + 1]]
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum(),
+        )
+    }
+}
+
 pub struct BuddyAllocator {
-    /// 每个阶数的空闲链表
-    /// free_lists[i] 包含大小为 2^i * PAGE_SIZE 的空闲块
-    free_lists: [Vec<usize>; MAX_ORDER],
+    /// Fixed post-init free-block index. Runtime alloc/free only toggles bits.
+    free_map: FixedFreeMap,
 
-    /// 位图，用于跟踪块的状态
-    /// 每个位表示对应的块是否已分配
-    bitmap: BitVec,
-
-    /// R74-4 Enhancement: Track allocation order for each block.
-    ///
-    /// Stores (order + 1) for allocated blocks, 0 for free.
-    /// This prevents freeing with a mismatched order (e.g., freeing 1 page
-    /// from an 8-page allocation), which would corrupt the allocator.
-    ///
-    /// MAX_ORDER=11 fits in 4 bits, so u8 is sufficient and keeps memory
-    /// overhead reasonable (~1 byte per page).
-    alloc_order: Vec<u8>,
+    /// Exact per-page ownership state: free, reserved, allocation start(order),
+    /// or allocation tail(order). This makes interior/wrong-order/double frees
+    /// distinguishable without trusting caller-supplied sizes.
+    page_state: Vec<u8>,
 
     /// 内存起始物理地址
     base_addr: PhysAddr,
@@ -55,9 +338,9 @@ pub struct BuddyAllocator {
     /// the buddy free pool. `free_pages == total_pages - reserved_pages` at init.
     reserved_pages: usize,
 
-    /// 用于跟踪块的分割状态
-    /// split_bitmap[i] 表示块是否被分割成更小的块
-    split_bitmap: BitVec,
+    /// Sticky fail-closed state set only for internal metadata contradictions.
+    /// Invalid caller frees do not poison an otherwise sound allocator.
+    poisoned: bool,
 }
 
 impl BuddyAllocator {
@@ -66,7 +349,7 @@ impl BuddyAllocator {
     /// # 参数
     /// * `base_addr` - 管理的内存区域起始地址
     /// * `size` - 管理的内存区域大小（字节）
-    pub fn new(base_addr: PhysAddr, size: usize) -> Self {
+    pub fn new(base_addr: PhysAddr, size: usize) -> Result<Self, BuddyInitError> {
         // An allocator with no reservations manages the whole region.
         Self::new_with_reservations(base_addr, size, &[])
     }
@@ -85,20 +368,39 @@ impl BuddyAllocator {
         base_addr: PhysAddr,
         size: usize,
         reserved: &[(u64, u64)],
-    ) -> Self {
+    ) -> Result<Self, BuddyInitError> {
+        if size == 0 {
+            return Err(BuddyInitError::EmptyRegion);
+        }
+        if !size.is_multiple_of(PAGE_SIZE) || !base_addr.as_u64().is_multiple_of(PAGE_SIZE as u64) {
+            return Err(BuddyInitError::RegionMisaligned);
+        }
+        let size_u64 = u64::try_from(size).map_err(|_| BuddyInitError::AddressOverflow)?;
+        let region_end = base_addr
+            .as_u64()
+            .checked_add(size_u64)
+            .ok_or(BuddyInitError::AddressOverflow)?;
+        if region_end == 0 || PhysAddr::try_new(region_end - 1).is_err() {
+            return Err(BuddyInitError::AddressOverflow);
+        }
+
         let total_pages = size / PAGE_SIZE;
-        let bitmap_size = total_pages * 2; // 需要额外空间存储分割信息
+
+        let mut page_state = Vec::new();
+        page_state
+            .try_reserve_exact(total_pages)
+            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
+        page_state.resize(total_pages, PAGE_FREE);
 
         let mut allocator = BuddyAllocator {
-            free_lists: Default::default(),
-            bitmap: BitVec::from_elem(bitmap_size, false),
-            alloc_order: vec![0u8; total_pages], // R74-4: Initialize all as free (0)
+            free_map: FixedFreeMap::try_new(total_pages)?,
+            page_state,
             base_addr,
             total_pages,
             // Set to the true free count after reservations are marked below.
             free_pages: 0,
             reserved_pages: 0,
-            split_bitmap: BitVec::from_elem(bitmap_size, false),
+            poisoned: false,
         };
 
         // Mark reserved pages BEFORE building the free lists so the free-list
@@ -111,8 +413,12 @@ impl BuddyAllocator {
         );
 
         // 初始化：仅用未保留的连续区段构建空闲链表
-        allocator.init_memory_region();
-        allocator
+        allocator.init_memory_region()?;
+        allocator.validate_metadata().map_err(|_| {
+            allocator.poisoned = true;
+            BuddyInitError::MetadataCorrupt
+        })?;
+        Ok(allocator)
     }
 
     /// R167-B: Permanently withhold reserved physical ranges from the allocator.
@@ -163,8 +469,8 @@ impl BuddyAllocator {
             for page_idx in start_idx..end_idx {
                 // De-duplicate overlapping reservations. Bounds are guaranteed by
                 // construction: start_idx < total_pages and end_idx <= total_pages.
-                if !self.bitmap[page_idx] {
-                    self.bitmap.set(page_idx, true);
+                if self.page_state[page_idx] == PAGE_FREE {
+                    self.page_state[page_idx] = PAGE_RESERVED;
                     self.reserved_pages += 1;
                 }
             }
@@ -177,14 +483,14 @@ impl BuddyAllocator {
     /// pages. Each run is decomposed into buddy-aligned power-of-two blocks, so
     /// no free block ever spans a reserved page. With no reservations this
     /// reproduces the original greedy decomposition exactly.
-    fn init_memory_region(&mut self) {
+    fn init_memory_region(&mut self) -> Result<(), BuddyInitError> {
         let mut run_start: Option<usize> = None;
 
         for page_idx in 0..self.total_pages {
-            if self.bitmap[page_idx] {
+            if self.page_state[page_idx] == PAGE_RESERVED {
                 // Reserved/allocated page: close any open free run before it.
                 if let Some(start) = run_start.take() {
-                    self.add_free_run(start, page_idx);
+                    self.add_free_run(start, page_idx)?;
                 }
             } else if run_start.is_none() {
                 run_start = Some(page_idx);
@@ -192,19 +498,28 @@ impl BuddyAllocator {
         }
 
         if let Some(start) = run_start {
-            self.add_free_run(start, self.total_pages);
+            self.add_free_run(start, self.total_pages)?;
         }
+        Ok(())
     }
 
     /// R167-B: decompose a non-reserved page run `[start_idx, end_idx)` into
     /// buddy-aligned power-of-two blocks and push them onto the free lists.
-    fn add_free_run(&mut self, mut start_idx: usize, end_idx: usize) {
+    fn add_free_run(&mut self, mut start_idx: usize, end_idx: usize) -> Result<(), BuddyInitError> {
         while start_idx < end_idx {
             let remaining = end_idx - start_idx;
             let order = largest_aligned_order(start_idx, remaining);
-            self.free_lists[order].push(start_idx);
+            let bit = self
+                .free_map
+                .location(order, start_idx)
+                .ok_or(BuddyInitError::MetadataCorrupt)?;
+            if self.free_map.is_set(bit) || self.free_map.block_count[order] == usize::MAX {
+                return Err(BuddyInitError::MetadataCorrupt);
+            }
+            self.free_map.commit_set(bit, true);
             start_idx += 1 << order;
         }
+        Ok(())
     }
 
     /// 分配指定阶数的内存块
@@ -215,50 +530,109 @@ impl BuddyAllocator {
     /// # 返回
     /// 成功返回分配的物理帧，失败返回None
     pub fn alloc_pages(&mut self, order: usize) -> Option<PhysFrame> {
-        if order >= MAX_ORDER {
-            return None;
-        }
-
-        // 从当前阶数开始向上查找可用块
-        for current_order in order..MAX_ORDER {
-            if !self.free_lists[current_order].is_empty() {
-                // 找到可用块，从空闲链表中移除
-                let block_idx = self.free_lists[current_order].pop().unwrap();
-
-                // 如果块太大，需要分割
-                self.split_block(block_idx, current_order, order);
-
-                // 标记块为已分配
-                let pages = 1 << order;
-                self.mark_allocated(block_idx, pages);
-
-                // R74-4 Enhancement: Record allocation order for verification at free time
-                self.record_alloc_order(block_idx, pages, order);
-
-                // 更新统计
-                self.free_pages -= pages;
-
-                // 计算物理地址
-                let phys_addr = self.base_addr + (block_idx * PAGE_SIZE) as u64;
-                return Some(PhysFrame::containing_address(phys_addr));
-            }
-        }
-
-        None // 没有足够的内存
+        self.try_alloc_pages(order).ok()
     }
 
-    /// 分割块直到达到目标大小
-    fn split_block(&mut self, block_idx: usize, mut current_order: usize, target_order: usize) {
-        while current_order > target_order {
-            current_order -= 1;
-            let buddy_idx = block_idx + (1 << current_order);
-
-            // 将分割出的buddy块加入空闲链表
-            self.free_lists[current_order].push(buddy_idx);
-
-            // 标记原块被分割
-            self.split_bitmap.set(block_idx, true);
+    /// Transactional physical allocation. Every bitmap/state/counter change is
+    /// preflighted before the first mutation; the commit phase only toggles
+    /// fixed-size metadata and therefore cannot allocate or partially fail.
+    pub fn try_alloc_pages(&mut self, order: usize) -> Result<PhysFrame, AllocError> {
+        if self.poisoned {
+            return Err(AllocError::AllocatorPoisoned);
         }
+        if order >= ORDER_COUNT {
+            return Err(AllocError::InvalidOrder);
+        }
+
+        let mut source = None;
+        for current_order in order..ORDER_COUNT {
+            let recorded = self.free_map.count_for_order(current_order).unwrap_or(0);
+            if recorded == 0 {
+                continue;
+            }
+            let found = self.free_map.find_first(current_order);
+            match found {
+                None => {
+                    self.poisoned = true;
+                    return Err(AllocError::MetadataCorrupt);
+                }
+                Some(bit) => {
+                    source = Some(bit);
+                    break;
+                }
+            }
+        }
+        let source = source.ok_or(AllocError::Exhausted)?;
+        let source_pages = 1usize << source.order;
+        if !self.range_is_free(source.block_idx, source_pages) {
+            self.poisoned = true;
+            return Err(AllocError::MetadataCorrupt);
+        }
+
+        let mut allowed = [None; ORDER_COUNT];
+        allowed[0] = Some(source);
+        if self.has_unexpected_free_overlap(source.block_idx, source_pages, &allowed) {
+            self.poisoned = true;
+            return Err(AllocError::MetadataCorrupt);
+        }
+
+        let target_pages = 1usize << order;
+        let new_free_pages = self.free_pages.checked_sub(target_pages).ok_or_else(|| {
+            self.poisoned = true;
+            AllocError::MetadataCorrupt
+        })?;
+        let byte_offset = source
+            .block_idx
+            .checked_mul(PAGE_SIZE)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(AllocError::AddressOverflow)?;
+        let phys_u64 = self
+            .base_addr
+            .as_u64()
+            .checked_add(byte_offset)
+            .ok_or(AllocError::AddressOverflow)?;
+        let phys = PhysAddr::try_new(phys_u64).map_err(|_| AllocError::AddressOverflow)?;
+        let frame = PhysFrame::from_start_address(phys).map_err(|_| AllocError::AddressOverflow)?;
+
+        let mut split_bits = [None; ORDER_COUNT];
+        let mut split_count = 0usize;
+        let mut current_order = source.order;
+        while current_order > order {
+            current_order -= 1;
+            let buddy_idx = source
+                .block_idx
+                .checked_add(1usize << current_order)
+                .ok_or(AllocError::MetadataCorrupt)?;
+            let bit = self
+                .free_map
+                .location(current_order, buddy_idx)
+                .ok_or(AllocError::MetadataCorrupt)?;
+            if self.free_map.is_set(bit) || self.free_map.block_count[current_order] == usize::MAX {
+                self.poisoned = true;
+                return Err(AllocError::MetadataCorrupt);
+            }
+            split_bits[split_count] = Some(bit);
+            split_count += 1;
+        }
+        if self.free_map.block_count[source.order] == 0 {
+            self.poisoned = true;
+            return Err(AllocError::MetadataCorrupt);
+        }
+
+        // Commit: all vector indices, bit transitions, state ranges, and
+        // counter arithmetic above are now proven.
+        self.free_map.commit_set(source, false);
+        for bit in split_bits.iter().take(split_count).flatten().copied() {
+            self.free_map.commit_set(bit, true);
+        }
+        let start_state = allocation_start_state(order).ok_or(AllocError::InvalidOrder)?;
+        let tail_state = allocation_tail_state(order).ok_or(AllocError::InvalidOrder)?;
+        self.page_state[source.block_idx] = start_state;
+        for index in source.block_idx + 1..source.block_idx + target_pages {
+            self.page_state[index] = tail_state;
+        }
+        self.free_pages = new_free_pages;
+        Ok(frame)
     }
 
     /// 释放内存块
@@ -270,186 +644,297 @@ impl BuddyAllocator {
     /// # Safety
     /// 调用者必须确保该帧确实是之前分配的，且未被双重释放
     pub fn free_pages(&mut self, frame: PhysFrame, order: usize) {
-        if order >= MAX_ORDER {
-            return;
-        }
-
-        let addr = frame.start_address();
-
-        // 验证地址在管理范围内
-        if addr < self.base_addr {
-            return;
-        }
-
-        let block_idx = ((addr - self.base_addr) / PAGE_SIZE as u64) as usize;
-        let pages = 1 << order;
-
-        // R74-4 FIX: Enforce block alignment to prevent partial block frees.
-        //
-        // The buddy allocator requires that blocks be freed with the same order
-        // they were allocated with. Freeing a sub-block of a larger allocation
-        // would corrupt the allocator state and enable overlapping allocations,
-        // leading to memory corruption and use-after-free vulnerabilities.
-        //
-        // Security check: Reject frees where block_idx is not aligned to the
-        // block size (2^order pages). For example, freeing order=3 (8 pages)
-        // requires block_idx to be divisible by 8.
-        if block_idx & (pages - 1) != 0 {
-            // Block is not aligned to its size - this is a partial free attempt
-            return;
-        }
-
-        // 范围验证：确保不超出管理的内存区域
-        if block_idx + pages > self.total_pages {
-            return;
-        }
-
-        // R74-4 Enhancement: Verify freeing order matches recorded allocation order.
-        //
-        // The alignment check alone is insufficient. For example:
-        // - Allocate 8 pages (order=3) at block_idx=0
-        // - Free with order=0 at block_idx=0 (passes alignment: 0 & 0 == 0)
-        // - This would free 1 page from an 8-page block → allocator corruption
-        //
-        // By storing the allocation order and checking it at free time, we catch
-        // all order mismatch scenarios, preventing the Codex-identified edge case.
-        let recorded = self.alloc_order.get(block_idx).copied().unwrap_or(0);
-        if recorded == 0 {
-            // No allocation starts here (already free or mid-block access)
-            return;
-        }
-        let recorded_order = (recorded - 1) as usize;
-        if recorded_order != order {
-            // Order mismatch: trying to free with different order than allocated
-            // This would corrupt the buddy allocator structure
-            return;
-        }
-
-        // R74-4 FIX: Enhanced double-free/size-mismatch detection.
-        // All pages in the range must be currently allocated. If any page is
-        // already free or out of bounds, reject the operation to prevent
-        // partial blocks from entering the free lists.
-        for i in 0..pages {
-            if block_idx + i >= self.bitmap.len() || !self.bitmap[block_idx + i] {
-                // Page is out of bounds or already free - reject to prevent
-                // allocator corruption and overlapping allocations
-                return;
-            }
-        }
-
-        // 标记块为空闲
-        self.mark_free(block_idx, pages);
-        self.free_pages += pages;
-
-        // 尝试与 buddy 合并
-        self.merge_blocks(block_idx, order);
+        let _ = self.try_free_pages(frame, order);
     }
 
     /// 合并相邻的buddy块
-    fn merge_blocks(&mut self, mut block_idx: usize, mut order: usize) {
-        while order < MAX_ORDER - 1 {
-            let buddy_idx = self.get_buddy_index(block_idx, order);
-
-            // 检查buddy是否存在且空闲
-            if !self.is_buddy_free(buddy_idx, order) {
-                break;
-            }
-
-            // 从空闲链表中移除buddy
-            if let Some(pos) = self.free_lists[order].iter().position(|&x| x == buddy_idx) {
-                self.free_lists[order].remove(pos);
-            } else {
-                // R152-15 FIX: Buddy bitmap says free but not in this order's free list.
-                // Abort merge to prevent overlapping free blocks.
-                break;
-            }
-
-            // 合并：使用较小的索引作为合并后的块
-            if buddy_idx < block_idx {
-                block_idx = buddy_idx;
-            }
-
-            order += 1;
+    /// Checked deallocation used when a caller must prove that a physical
+    /// block really returned to the buddy allocator before releasing related
+    /// admission or identity state.
+    pub fn try_free_pages(&mut self, frame: PhysFrame, order: usize) -> Result<(), FreeError> {
+        if self.poisoned {
+            return Err(FreeError::AllocatorPoisoned);
+        }
+        if order >= ORDER_COUNT {
+            return Err(FreeError::OrderTooLarge);
         }
 
-        // 将合并后的块加入空闲链表
-        self.free_lists[order].push(block_idx);
-    }
+        let addr = frame.start_address();
+        if addr < self.base_addr {
+            return Err(FreeError::AddressBelowBase);
+        }
+        let offset = addr.as_u64() - self.base_addr.as_u64();
+        if offset % PAGE_SIZE as u64 != 0 {
+            return Err(FreeError::AddressMisaligned);
+        }
 
-    /// 获取buddy块的索引
-    fn get_buddy_index(&self, block_idx: usize, order: usize) -> usize {
-        block_idx ^ (1 << order)
-    }
-
-    /// 检查buddy块是否空闲
-    ///
-    /// R104-1 FIX: Check full block extent (`buddy_idx + pages`), not just the
-    /// start index. The bitmap is sized to `total_pages * 2`, so an incomplete
-    /// range check silently reads the extra bitmap region and may treat out-of-
-    /// range pages as "free", causing `merge_blocks()` to create oversized free
-    /// blocks that hand out frames beyond managed memory.
-    fn is_buddy_free(&self, buddy_idx: usize, order: usize) -> bool {
-        let pages = 1 << order;
-        // Reject if any part of the buddy block extends beyond managed pages.
-        // Use checked_add to guard against usize overflow on pathological input.
-        if buddy_idx
+        let block_idx = (offset / PAGE_SIZE as u64) as usize;
+        let pages = 1usize << order;
+        // Buddy alignment is relative to the managed-region base, not physical
+        // address zero.
+        if block_idx & (pages - 1) != 0 {
+            return Err(FreeError::AddressMisaligned);
+        }
+        if block_idx
             .checked_add(pages)
             .is_none_or(|end| end > self.total_pages)
         {
-            return false;
+            return Err(FreeError::RangeOutOfBounds);
         }
 
-        for i in 0..pages {
-            if self.bitmap[buddy_idx + i] {
-                return false; // 有页面被分配
+        let start_state = *self
+            .page_state
+            .get(block_idx)
+            .ok_or(FreeError::RangeOutOfBounds)?;
+        if start_state == PAGE_RESERVED {
+            return Err(FreeError::ReservedPage);
+        }
+        if start_state == PAGE_FREE || decode_allocation_tail(start_state).is_some() {
+            return Err(FreeError::NotAllocationStart);
+        }
+        let recorded_order =
+            decode_allocation_start(start_state).ok_or(FreeError::NotAllocationStart)?;
+        if recorded_order != order {
+            return Err(FreeError::OrderMismatch);
+        }
+        let expected_tail = allocation_tail_state(order).ok_or(FreeError::OrderTooLarge)?;
+        if (block_idx + 1..block_idx + pages)
+            .any(|index| self.page_state.get(index).copied() != Some(expected_tail))
+        {
+            self.poisoned = true;
+            return Err(FreeError::MetadataCorrupt);
+        }
+
+        let no_allowed_bits = [None; ORDER_COUNT];
+        if self.has_unexpected_free_overlap(block_idx, pages, &no_allowed_bits) {
+            self.poisoned = true;
+            return Err(FreeError::MetadataCorrupt);
+        }
+
+        let mut merge_bits = [None; ORDER_COUNT];
+        let mut merge_count = 0usize;
+        let mut merged_start = block_idx;
+        let mut final_order = order;
+        while final_order < ORDER_COUNT - 1 {
+            let buddy_pages = 1usize << final_order;
+            let buddy_idx = merged_start ^ buddy_pages;
+            if buddy_idx
+                .checked_add(buddy_pages)
+                .is_none_or(|end| end > self.total_pages)
+            {
+                break;
+            }
+            let bit = self
+                .free_map
+                .location(final_order, buddy_idx)
+                .ok_or_else(|| {
+                    self.poisoned = true;
+                    FreeError::MetadataCorrupt
+                })?;
+            if self.free_map.is_set(bit) {
+                if !self.range_is_free(buddy_idx, buddy_pages)
+                    || self.free_map.block_count[final_order] == 0
+                {
+                    self.poisoned = true;
+                    return Err(FreeError::MetadataCorrupt);
+                }
+                merge_bits[merge_count] = Some(bit);
+                merge_count += 1;
+                merged_start = core::cmp::min(merged_start, buddy_idx);
+                final_order += 1;
+            } else {
+                // A wholly-free buddy must have one exact maximal bit. If all
+                // of its pages are free but that bit is absent, free space is
+                // multiply split, lost, or otherwise inconsistently indexed.
+                if self.range_is_free(buddy_idx, buddy_pages) {
+                    self.poisoned = true;
+                    return Err(FreeError::MetadataCorrupt);
+                }
+                break;
             }
         }
 
-        true
-    }
-
-    /// 标记页面为已分配
-    fn mark_allocated(&mut self, start_idx: usize, pages: usize) {
-        for i in 0..pages {
-            self.bitmap.set(start_idx + i, true);
+        if self.has_unexpected_free_overlap(merged_start, 1usize << final_order, &merge_bits) {
+            self.poisoned = true;
+            return Err(FreeError::MetadataCorrupt);
         }
+        let final_bit = self
+            .free_map
+            .location(final_order, merged_start)
+            .ok_or_else(|| {
+                self.poisoned = true;
+                FreeError::MetadataCorrupt
+            })?;
+        if self.free_map.is_set(final_bit) || self.free_map.block_count[final_order] == usize::MAX {
+            self.poisoned = true;
+            return Err(FreeError::MetadataCorrupt);
+        }
+        let new_free_pages = self.free_pages.checked_add(pages).ok_or_else(|| {
+            self.poisoned = true;
+            FreeError::MetadataCorrupt
+        })?;
+        if new_free_pages > self.total_pages.saturating_sub(self.reserved_pages) {
+            self.poisoned = true;
+            return Err(FreeError::MetadataCorrupt);
+        }
+
+        // Commit only after the entire merge chain and final destination are
+        // proven. No operation below allocates or can return an error.
+        for bit in merge_bits.iter().take(merge_count).flatten().copied() {
+            self.free_map.commit_set(bit, false);
+        }
+        for index in block_idx..block_idx + pages {
+            self.page_state[index] = PAGE_FREE;
+        }
+        self.free_map.commit_set(final_bit, true);
+        self.free_pages = new_free_pages;
+        Ok(())
     }
 
-    /// R74-4 Enhancement: Record allocation order for each page in the block.
-    ///
-    /// Stores (order + 1) so that 0 represents free. This allows us to detect:
-    /// - Order mismatch on free (e.g., free order=0 from order=3 allocation)
-    /// - Access from mid-block (non-starting page of an allocation)
-    ///
-    /// # Arguments
-    /// * `start_idx` - Starting block index
-    /// * `pages` - Number of pages in the block (2^order)
-    /// * `order` - Allocation order (0 to MAX_ORDER-1)
-    fn record_alloc_order(&mut self, start_idx: usize, pages: usize, order: usize) {
-        let encoded_order = (order as u8) + 1;
-        for i in 0..pages {
-            if start_idx + i < self.alloc_order.len() {
-                self.alloc_order[start_idx + i] = encoded_order;
+    #[inline]
+    fn range_is_free(&self, start_idx: usize, pages: usize) -> bool {
+        start_idx
+            .checked_add(pages)
+            .filter(|end| *end <= self.page_state.len())
+            .is_some_and(|end| {
+                self.page_state[start_idx..end]
+                    .iter()
+                    .all(|state| *state == PAGE_FREE)
+            })
+    }
+
+    fn bit_is_allowed(bit: FreeBit, allowed: &[Option<FreeBit>; ORDER_COUNT]) -> bool {
+        allowed
+            .iter()
+            .flatten()
+            .any(|candidate| candidate.order == bit.order && candidate.block_idx == bit.block_idx)
+    }
+
+    /// Check every free-map order for any block overlapping `[start, start+pages)`
+    /// except the exact fixed set explicitly allowed by the transaction.
+    fn has_unexpected_free_overlap(
+        &self,
+        start_idx: usize,
+        pages: usize,
+        allowed: &[Option<FreeBit>; ORDER_COUNT],
+    ) -> bool {
+        let Some(end_idx) = start_idx.checked_add(pages) else {
+            return true;
+        };
+        if pages == 0 || end_idx > self.total_pages {
+            return true;
+        }
+
+        for order in 0..ORDER_COUNT {
+            let block_pages = 1usize << order;
+            let first = start_idx / block_pages;
+            let last = (end_idx - 1) / block_pages;
+            for block_no in first..=last {
+                let Some(block_idx) = block_no.checked_mul(block_pages) else {
+                    return true;
+                };
+                let Some(bit) = self.free_map.location(order, block_idx) else {
+                    continue;
+                };
+                if self.free_map.is_set(bit) && !Self::bit_is_allowed(bit, allowed) {
+                    return true;
+                }
             }
         }
+        false
     }
 
-    /// 标记页面为空闲
-    fn mark_free(&mut self, start_idx: usize, pages: usize) {
-        for i in 0..pages {
-            self.bitmap.set(start_idx + i, false);
+    /// Full invariant audit used at construction and by regression tests. The
+    /// runtime fast path still preflights every region it mutates; this global
+    /// pass additionally proves count/coverage/maximal-coalescing consistency.
+    fn validate_metadata(&self) -> Result<(), ()> {
+        if self.page_state.len() != self.total_pages {
+            return Err(());
         }
-        // R74-4 Enhancement: Clear the allocation order tracking
-        self.clear_alloc_order(start_idx, pages);
-    }
 
-    /// R74-4 Enhancement: Clear allocation order tracking for freed block.
-    fn clear_alloc_order(&mut self, start_idx: usize, pages: usize) {
-        for i in 0..pages {
-            if start_idx + i < self.alloc_order.len() {
-                self.alloc_order[start_idx + i] = 0;
+        let mut weighted_free = 0usize;
+        for order in 0..ORDER_COUNT {
+            let actual = self.free_map.count_actual(order).ok_or(())?;
+            if actual != self.free_map.block_count[order] {
+                return Err(());
+            }
+            weighted_free = weighted_free
+                .checked_add(actual.checked_mul(1usize << order).ok_or(())?)
+                .ok_or(())?;
+
+            if order + 1 < ORDER_COUNT {
+                for block_no in 0..self.free_map.valid_blocks[order] {
+                    let block_idx = block_no << order;
+                    let bit = self.free_map.location(order, block_idx).ok_or(())?;
+                    if self.free_map.is_set(bit) {
+                        let buddy_idx = block_idx ^ (1usize << order);
+                        if let Some(buddy) = self.free_map.location(order, buddy_idx) {
+                            if self.free_map.is_set(buddy) {
+                                return Err(());
+                            }
+                        }
+                    }
+                }
             }
         }
+        if weighted_free != self.free_pages {
+            return Err(());
+        }
+
+        let mut reserved = 0usize;
+        let mut page = 0usize;
+        while page < self.total_pages {
+            let state = self.page_state[page];
+            if state == PAGE_RESERVED {
+                let none = [None; ORDER_COUNT];
+                if self.has_unexpected_free_overlap(page, 1, &none) {
+                    return Err(());
+                }
+                reserved = reserved.checked_add(1).ok_or(())?;
+                page += 1;
+                continue;
+            }
+            if state == PAGE_FREE {
+                let mut covering = 0usize;
+                for order in 0..ORDER_COUNT {
+                    let block_pages = 1usize << order;
+                    let block_idx = (page / block_pages) * block_pages;
+                    if let Some(bit) = self.free_map.location(order, block_idx) {
+                        covering += usize::from(self.free_map.is_set(bit));
+                    }
+                }
+                if covering != 1 {
+                    return Err(());
+                }
+                page += 1;
+                continue;
+            }
+
+            let Some(order) = decode_allocation_start(state) else {
+                return Err(());
+            };
+            let pages = 1usize << order;
+            if page & (pages - 1) != 0
+                || page
+                    .checked_add(pages)
+                    .is_none_or(|end| end > self.total_pages)
+            {
+                return Err(());
+            }
+            let tail = allocation_tail_state(order).ok_or(())?;
+            if (page + 1..page + pages).any(|index| self.page_state[index] != tail) {
+                return Err(());
+            }
+            let none = [None; ORDER_COUNT];
+            if self.has_unexpected_free_overlap(page, pages, &none) {
+                return Err(());
+            }
+            page += pages;
+        }
+        if reserved != self.reserved_pages {
+            return Err(());
+        }
+        Ok(())
     }
 
     /// 获取统计信息
@@ -469,30 +954,28 @@ impl BuddyAllocator {
 
     /// 计算内存碎片率
     fn calculate_fragmentation(&self) -> f32 {
-        let mut total_free_blocks = 0;
         let mut largest_free_block = 0;
 
-        for (order, list) in self.free_lists.iter().enumerate() {
+        for order in 0..ORDER_COUNT {
             let block_size = 1 << order;
-            total_free_blocks += list.len() * block_size;
-            if !list.is_empty() && block_size > largest_free_block {
+            if self.free_map.block_count[order] != 0 && block_size > largest_free_block {
                 largest_free_block = block_size;
             }
         }
 
-        if total_free_blocks == 0 {
+        if self.free_pages == 0 {
             return 0.0;
         }
 
-        1.0 - (largest_free_block as f32 / total_free_blocks as f32)
+        1.0 - (largest_free_block as f32 / self.free_pages as f32)
     }
 }
 
 /// R167-B: largest buddy order whose block both fits in `remaining` pages and
-/// is aligned at `start_idx`. Caps at `MAX_ORDER - 1`. Always returns a valid
+/// is aligned at `start_idx`. Caps at `ORDER_COUNT - 1`. Always returns a valid
 /// order (0 fits because `remaining >= 1` and every index is 1-aligned).
 fn largest_aligned_order(start_idx: usize, remaining: usize) -> usize {
-    let mut order = MAX_ORDER - 1;
+    let mut order = ORDER_COUNT - 1;
     while order > 0 {
         let block_pages = 1usize << order;
         if block_pages <= remaining && (start_idx & (block_pages - 1)) == 0 {
@@ -540,8 +1023,12 @@ where
 /// * `reserved` - R167-B: permanent physical reservations `(phys_start, len_bytes)`
 ///   to withhold from the free pool (kernel heap, kernel image, framebuffer,
 ///   firmware/boot-services ranges that fall inside the managed window).
-pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize, reserved: &[(u64, u64)]) {
-    let allocator = BuddyAllocator::new_with_reservations(base_addr, size, reserved);
+pub fn init_buddy_allocator(
+    base_addr: PhysAddr,
+    size: usize,
+    reserved: &[(u64, u64)],
+) -> Result<(), BuddyInitError> {
+    let allocator = BuddyAllocator::new_with_reservations(base_addr, size, reserved)?;
     // Snapshot stats before the allocator is moved under the lock.
     let total_pages = allocator.total_pages;
     let reserved_pages = allocator.reserved_pages;
@@ -558,6 +1045,7 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize, reserved: &[(u64, 
     // (e.g. the whole region withheld) is visible in the boot log.
     klog_always!("  Reserved pages: {}", reserved_pages);
     klog_always!("  Free pages: {}", free_pages);
+    Ok(())
 }
 
 /// 分配物理页面
@@ -571,40 +1059,49 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize, reserved: &[(u64, 
 /// # OOM Handling
 /// 如果分配失败，会触发 OOM killer 尝试回收内存，然后重试一次
 pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
-    // 处理无效输入：count=0 时直接返回 None
+    match try_alloc_physical_pages(count) {
+        Ok(frame) => Some(frame),
+        Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned) => {
+            panic!("physical allocator metadata is corrupt/poisoned")
+        }
+        Err(_) => None,
+    }
+}
+
+/// Fallible physical allocation with error classification. OOM recovery runs
+/// only for genuine free-space exhaustion; invalid orders and poisoned
+/// metadata never masquerade as memory pressure.
+pub fn try_alloc_physical_pages(count: usize) -> Result<PhysFrame, AllocError> {
     if count == 0 {
-        return None;
+        return Err(AllocError::InvalidOrder);
     }
-
-    // R152-17 FIX: Use checked_next_power_of_two to prevent overflow to 0
-    // on huge count values, matching the pattern in free_physical_pages().
-    let pages_needed = count.checked_next_power_of_two()?;
+    let pages_needed = count
+        .checked_next_power_of_two()
+        .ok_or(AllocError::InvalidOrder)?;
     let order = pages_needed.trailing_zeros() as usize;
-
-    // 第一次尝试分配
-    let result = BUDDY_ALLOCATOR
-        .lock()
-        .as_mut()
-        .and_then(|allocator| allocator.alloc_pages(order));
-
-    if result.is_some() {
-        return result;
+    if order >= ORDER_COUNT {
+        return Err(AllocError::InvalidOrder);
     }
 
-    // 分配失败，触发 OOM killer 尝试回收内存
-    // 使用实际需要的页数（向上取整后），而非原始请求
-    oom_killer::on_allocation_failure(pages_needed);
+    let first = {
+        let mut guard = BUDDY_ALLOCATOR.lock();
+        let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
+        allocator.try_alloc_pages(order)
+    };
+    match first {
+        Ok(frame) => return Ok(frame),
+        Err(AllocError::Exhausted) => {}
+        Err(error) => return Err(error),
+    }
 
-    // RF178-4: The first allocation attempt released BUDDY_ALLOCATOR before
-    // publishing the request. Run reclaim/victim selection only in this
-    // lock-free phase so OOM recovery cannot re-enter the allocator guard.
+    oom_killer::on_allocation_failure(pages_needed);
+    // RF178-4: run reclaim only after releasing BUDDY_ALLOCATOR so recovery
+    // cannot recursively acquire the allocator guard.
     oom_killer::poll_and_handle_oom();
 
-    // OOM 处理后重试一次
-    BUDDY_ALLOCATOR
-        .lock()
-        .as_mut()
-        .and_then(|allocator| allocator.alloc_pages(order))
+    let mut guard = BUDDY_ALLOCATOR.lock();
+    let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
+    allocator.try_alloc_pages(order)
 }
 
 /// 释放物理页面
@@ -612,6 +1109,27 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
 /// # 参数
 /// * `frame` - 要释放的物理帧
 /// * `count` - 页面数量
+/// Checked counterpart to `free_physical_pages`.
+///
+/// The operation validates the exact buddy-relative base, allocation order,
+/// and allocation state of every page. It returns only after the block has
+/// actually re-entered the free lists.
+pub fn try_free_physical_pages(frame: PhysFrame, count: usize) -> Result<(), FreeError> {
+    if count == 0 {
+        return Err(FreeError::InvalidCount);
+    }
+    let pages = count
+        .checked_next_power_of_two()
+        .ok_or(FreeError::InvalidCount)?;
+    if pages != count {
+        return Err(FreeError::InvalidCount);
+    }
+    let order = pages.trailing_zeros() as usize;
+    let mut guard = BUDDY_ALLOCATOR.lock();
+    let allocator = guard.as_mut().ok_or(FreeError::AllocatorUnavailable)?;
+    allocator.try_free_pages(frame, order)
+}
+
 pub fn free_physical_pages(frame: PhysFrame, count: usize) {
     // R100-4 FIX: count=0 must be a no-op; 0.next_power_of_two() == 1
     // which would silently free 1 page.
@@ -648,7 +1166,8 @@ pub fn run_self_test() {
 
     let base = PhysAddr::new(0x10000000); // 256MB处
     let size = 16 * 1024 * 1024; // 16MB测试区域
-    let mut allocator = BuddyAllocator::new(base, size);
+    let mut allocator =
+        BuddyAllocator::new(base, size).expect("Test setup failed: buddy metadata allocation");
 
     // 测试1: 基础分配
     let frame1 = allocator
@@ -711,7 +1230,8 @@ pub fn run_reservation_self_test() {
     let resv_phys = base_u64 + (64 * PAGE_SIZE) as u64;
     let resv_len = (resv_pages * PAGE_SIZE) as u64;
 
-    let mut allocator = BuddyAllocator::new_with_reservations(base, size, &[(resv_phys, resv_len)]);
+    let mut allocator = BuddyAllocator::new_with_reservations(base, size, &[(resv_phys, resv_len)])
+        .expect("Reservation test setup failed: buddy metadata allocation");
 
     assert!(
         allocator.reserved_pages == resv_pages,
@@ -755,11 +1275,140 @@ pub fn run_reservation_self_test() {
     );
 }
 
-/// 简单的断言宏（用于no_std环境）
-macro_rules! assert {
-    ($cond:expr, $msg:expr) => {
-        if !$cond {
-            panic!($msg);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn metadata_shape(
+        allocator: &BuddyAllocator,
+    ) -> (*const u8, usize, usize, *const u64, usize, usize) {
+        (
+            allocator.page_state.as_ptr(),
+            allocator.page_state.len(),
+            allocator.page_state.capacity(),
+            allocator.free_map.words.as_ptr(),
+            allocator.free_map.words.len(),
+            allocator.free_map.words.capacity(),
+        )
+    }
+
+    #[test]
+    fn fixed_metadata_does_not_grow_during_split_and_merge() {
+        let base = PhysAddr::new(0x3000_0000);
+        let mut allocator = BuddyAllocator::new(base, 16 * 1024 * 1024).expect("construct");
+        let shape = metadata_shape(&allocator);
+        let initial_free = allocator.free_pages;
+
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(1024).expect("test frame ledger");
+        for _ in 0..1024 {
+            frames.push(allocator.try_alloc_pages(0).expect("order-0 split"));
         }
-    };
+        for frame in frames.into_iter().rev() {
+            allocator.try_free_pages(frame, 0).expect("order-0 merge");
+        }
+
+        assert_eq!(allocator.free_pages, initial_free);
+        assert_eq!(metadata_shape(&allocator), shape);
+        assert_eq!(allocator.validate_metadata(), Ok(()));
+    }
+
+    #[test]
+    fn rejected_frees_leave_metadata_byte_exact() {
+        let base = PhysAddr::new(0x3400_0000);
+        let mut allocator = BuddyAllocator::new(base, 2 * 1024 * 1024).expect("construct");
+        let frame = allocator.try_alloc_pages(2).expect("allocate order 2");
+
+        let words = allocator.free_map.words.clone();
+        let states = allocator.page_state.clone();
+        let counts = allocator.free_map.block_count;
+        let cursors = allocator.free_map.search_cursor;
+        let free_pages = allocator.free_pages;
+        assert_eq!(
+            allocator.try_free_pages(frame, 1),
+            Err(FreeError::OrderMismatch)
+        );
+        assert_eq!(allocator.free_map.words, words);
+        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.free_map.block_count, counts);
+        assert_eq!(allocator.free_map.search_cursor, cursors);
+        assert_eq!(allocator.free_pages, free_pages);
+        assert!(!allocator.poisoned);
+
+        let interior = PhysFrame::from_start_address(frame.start_address() + PAGE_SIZE as u64)
+            .expect("aligned interior frame");
+        assert_eq!(
+            allocator.try_free_pages(interior, 2),
+            Err(FreeError::AddressMisaligned)
+        );
+        assert_eq!(allocator.free_map.words, words);
+        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.free_pages, free_pages);
+
+        allocator.try_free_pages(frame, 2).expect("valid free");
+        let words = allocator.free_map.words.clone();
+        let states = allocator.page_state.clone();
+        let counts = allocator.free_map.block_count;
+        let free_pages = allocator.free_pages;
+        assert_eq!(
+            allocator.try_free_pages(frame, 2),
+            Err(FreeError::NotAllocationStart)
+        );
+        assert_eq!(allocator.free_map.words, words);
+        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.free_map.block_count, counts);
+        assert_eq!(allocator.free_pages, free_pages);
+        assert!(!allocator.poisoned);
+    }
+
+    #[test]
+    fn overlapping_free_metadata_poison_is_fail_closed() {
+        let base = PhysAddr::new(0x3800_0000);
+        let mut allocator = BuddyAllocator::new(base, 2 * 1024 * 1024).expect("construct");
+        let frame = allocator.try_alloc_pages(0).expect("allocate");
+        let block_idx = ((frame.start_address() - base) / PAGE_SIZE as u64) as usize;
+        let injected = allocator
+            .free_map
+            .location(0, block_idx)
+            .expect("in-range free bit");
+        assert!(!allocator.free_map.is_set(injected));
+        allocator.free_map.commit_set(injected, true);
+
+        let words = allocator.free_map.words.clone();
+        let states = allocator.page_state.clone();
+        let free_pages = allocator.free_pages;
+        assert_eq!(
+            allocator.try_free_pages(frame, 0),
+            Err(FreeError::MetadataCorrupt)
+        );
+        assert!(allocator.poisoned);
+        assert_eq!(allocator.free_map.words, words);
+        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.free_pages, free_pages);
+        assert_eq!(
+            allocator.try_alloc_pages(0),
+            Err(AllocError::AllocatorPoisoned)
+        );
+    }
+
+    #[test]
+    fn constructor_handles_holes_and_rejects_truncated_regions() {
+        let base = PhysAddr::new(0x3c00_0000);
+        assert_eq!(
+            BuddyAllocator::new(base, PAGE_SIZE - 1).err(),
+            Some(BuddyInitError::RegionMisaligned)
+        );
+
+        let size = 13 * PAGE_SIZE;
+        let reservations = [
+            (base.as_u64() + PAGE_SIZE as u64 / 2, PAGE_SIZE as u64),
+            (base.as_u64() + 11 * PAGE_SIZE as u64, 4 * PAGE_SIZE as u64),
+        ];
+        let allocator =
+            BuddyAllocator::new_with_reservations(base, size, &reservations).expect("holes");
+        assert_eq!(allocator.reserved_pages, 4);
+        assert_eq!(allocator.free_pages, 9);
+        assert_eq!(allocator.validate_metadata(), Ok(()));
+    }
 }
