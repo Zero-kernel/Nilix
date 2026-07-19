@@ -4,14 +4,14 @@
 
 use crate::process::{
     create_process, current_pid, free_address_space, free_kernel_stack, get_process,
-    FileDescriptor, ProcessId, ProcessState,
+    FileDescriptor, ProcessArc, ProcessId,
 };
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
+use mm::{arc_charge_bytes, try_reserve_heap, AdmittedMap, HeapClass};
 use spin::{Mutex, RwLock};
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
@@ -55,6 +55,86 @@ pub enum ForkError {
     /// R122-1 FIX: mmap_regions contains in-flight PENDING_MAP/PENDING_UNMAP entries;
     /// fork must be retried after the concurrent mmap/munmap completes.
     MmapTransientState,
+    /// R180-19: LSM rejected the prospective child during PREPARE.
+    SecurityDenied,
+    /// R180-19: the child's PID namespace membership cannot be represented to
+    /// the parent; fail before parent PTE commit.
+    NamespaceTranslationFailed,
+    /// R180-19: the scheduler could not reserve an exact pre-COW queue slot.
+    SchedulerAdmissionFailed,
+}
+
+/// R180-19: shared-MM transaction reservation spanning metadata snapshot
+/// through the parent-PTE COW commit.  Mutators observe `fork_in_progress`
+/// before arming their own transient state; Drop closes every error path.
+struct ForkMmReservation {
+    mm: Arc<Mutex<crate::process::MmState>>,
+}
+
+impl ForkMmReservation {
+    fn acquire(mm: Arc<Mutex<crate::process::MmState>>) -> Result<Self, ForkError> {
+        {
+            let mut state = mm.lock();
+            if state.fork_in_progress
+                || state
+                    .mmap_regions
+                    .values()
+                    .any(|entry: &crate::syscall::MmapEntry| entry.has_transient())
+                || state.brk_in_progress
+                || state.stack_grow_in_progress
+            {
+                return Err(ForkError::MmapTransientState);
+            }
+            state.fork_in_progress = true;
+        }
+        Ok(Self { mm })
+    }
+}
+
+impl Drop for ForkMmReservation {
+    fn drop(&mut self) {
+        self.mm.lock().fork_in_progress = false;
+    }
+}
+
+/// PREPARE-phase cgroup reservations.  Until `commit`, dropping the guard
+/// returns every acquired charge, including errors from later page-table/KPTI
+/// preparation.  The type makes it impossible to add a new `?` before COW
+/// commit without also inheriting exact rollback.
+struct ForkChargeGuard {
+    cgroup_id: crate::cgroup::CgroupId,
+    fd_count: u64,
+    memory_bytes: u64,
+    committed: bool,
+}
+
+impl ForkChargeGuard {
+    fn new(cgroup_id: crate::cgroup::CgroupId) -> Self {
+        Self {
+            cgroup_id,
+            fd_count: 0,
+            memory_bytes: 0,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ForkChargeGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.memory_bytes != 0 {
+            crate::cgroup::uncharge_memory(self.cgroup_id, self.memory_bytes);
+        }
+        if self.fd_count != 0 {
+            crate::cgroup::uncharge_fds(self.cgroup_id, self.fd_count);
+        }
+    }
 }
 
 /// 执行fork系统调用
@@ -67,10 +147,10 @@ pub enum ForkError {
 ///
 /// # 返回值
 ///
-/// - 父进程：返回子进程的PID
+/// - 成功：返回 `(全局子 PID, 父命名空间可见 PID)`
 /// - 子进程：返回0
 /// - 错误：返回错误码
-pub fn sys_fork() -> Result<ProcessId, ForkError> {
+pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
     let current = current_pid().ok_or(ForkError::NoCurrentProcess)?;
     let parent_process = get_process(current).ok_or(ForkError::ProcessNotFound)?;
 
@@ -96,7 +176,7 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             root,
             parent.pid,
             parent.priority,
-            alloc::format!("{}-child", parent.name),
+            crate::process::ProcessNameSnapshot::from_parts(&parent.name, "-child"),
         )
     };
 
@@ -105,16 +185,122 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
     let child_pid = create_process(child_name, parent_pid, parent_prio)
         .map_err(|_| ForkError::ProcessCreationFailed)?;
 
+    // R180-19 PREPARE: policy and PID-namespace visibility used to be checked
+    // by syscall.rs only after fork_inner had COW-committed the parent.  Build
+    // immutable contexts from the prospective child now and reject/clean up
+    // before any cgroup charge or page-table mutation.
+    let child_process = match get_process(child_pid) {
+        Some(process) => process,
+        None => {
+            parent_process
+                .lock()
+                .children
+                .retain(|&pid| pid != child_pid);
+            cleanup_partial_child(child_pid);
+            return Err(ForkError::ProcessCreationFailed);
+        }
+    };
+    let prepared_identity = {
+        let parent = parent_process.lock();
+        let visible_pid = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain)
+            .map(|ns| crate::pid_namespace::pid_in_namespace(&ns, child_pid))
+            .unwrap_or(Some(child_pid));
+        let parent_creds = parent.credentials.read();
+        let parent_ctx = lsm::ProcessCtx::new(
+            parent.pid,
+            parent.tgid,
+            parent_creds.uid,
+            parent_creds.gid,
+            parent_creds.euid,
+            parent_creds.egid,
+        );
+        if let Ok(supplementary_groups) = mm::AdmittedVec::try_copy_from_slice(
+            HeapClass::CoreProcess,
+            &parent_creds.supplementary_groups,
+        ) {
+            let child_credentials = crate::process::Credentials {
+                uid: parent_creds.uid,
+                gid: parent_creds.gid,
+                euid: parent_creds.euid,
+                egid: parent_creds.egid,
+                supplementary_groups,
+            };
+            let child_ctx = lsm::ProcessCtx::new(
+                child_pid,
+                child_pid,
+                child_credentials.uid,
+                child_credentials.gid,
+                child_credentials.euid,
+                child_credentials.egid,
+            );
+            Some((parent_ctx, child_ctx, visible_pid, child_credentials))
+        } else {
+            None
+        }
+    };
+    let Some((parent_ctx, child_ctx, parent_view_pid, child_credentials)) = prepared_identity
+    else {
+        parent_process
+            .lock()
+            .children
+            .retain(|&pid| pid != child_pid);
+        cleanup_partial_child(child_pid);
+        return Err(ForkError::MemoryAllocationFailed);
+    };
+    let Some(parent_view_pid) = parent_view_pid else {
+        parent_process
+            .lock()
+            .children
+            .retain(|&pid| pid != child_pid);
+        cleanup_partial_child(child_pid);
+        return Err(ForkError::NamespaceTranslationFailed);
+    };
+    if lsm::hook_task_fork(&parent_ctx, &child_ctx).is_err() {
+        parent_process
+            .lock()
+            .children
+            .retain(|&pid| pid != child_pid);
+        cleanup_partial_child(child_pid);
+        return Err(ForkError::SecurityDenied);
+    }
+
+    // Scheduler placement consumes affinity + cpuset before taking any queue
+    // lock. Snapshot them under the parent PCB, release it, then initialize the
+    // unpublished child. This preserves fork inheritance while keeping the
+    // canonical READY_QUEUE -> PCB order (never parent PCB -> READY_QUEUE).
+    let (child_allowed_cpus, child_cpuset_id) = {
+        let parent = parent_process.lock();
+        (parent.allowed_cpus, parent.cpuset_id)
+    };
+    {
+        let mut child = child_process.lock();
+        child.allowed_cpus = child_allowed_cpus;
+        child.cpuset_id = child_cpuset_id;
+    }
+
+    // R180-19 / review-fix: reserve before taking the parent PCB lock.
+    // Scheduler operations use READY_QUEUE -> PCB; doing this from inside
+    // fork_inner while the parent PCB was held inverted that order against a
+    // scheduler scan of the queued parent.  The permit remains non-runnable
+    // and owns exact rollback across every later PREPARE failure.
+    let scheduler_permit =
+        match crate::process::prepare_scheduler_add_process(Arc::clone(&child_process)) {
+            Ok(permit) => permit,
+            Err(_) => {
+                parent_process
+                    .lock()
+                    .children
+                    .retain(|&pid| pid != child_pid);
+                cleanup_partial_child(child_pid);
+                return Err(ForkError::SchedulerAdmissionFailed);
+            }
+        };
+
     // 重新获取父进程锁执行真正的 fork
     let mut parent = parent_process.lock();
 
     // F.2: Get parent's cgroup_id for child attachment
     let parent_cgroup_id = parent.cgroup_id;
-    // R77-3 FIX: Also capture cpuset_id for rollback on cgroup attach failure.
-    // notify_cpuset_task_joined is called inside fork_inner after critical
-    // allocations succeed, so we need to roll back if cgroup attach fails.
-    let parent_cpuset_id = parent.cpuset_id;
-
     // R152-5 FIX: Attach child to cgroup BEFORE the expensive fork_inner() PT copy.
     // This eliminates the pids.max TOCTOU window where multiple concurrent forks
     // all pass check_fork_allowed but waste kernel resources (kernel stack, PID,
@@ -124,153 +310,37 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         if let Err(_) = cgroup.attach_task(child_pid as u64) {
             parent.children.retain(|&pid| pid != child_pid);
             drop(parent);
+            // READY_QUEUE -> child PCB cancellation must run with no parent
+            // PCB held (canonical scheduler lock order).
+            drop(scheduler_permit);
             cleanup_partial_child(child_pid);
             return Err(ForkError::CgroupPidsLimitExceeded);
         }
         cgroup_attached = true;
     }
 
-    let result = fork_inner(&mut parent, child_pid, parent_root);
-
-    if result.is_err() {
-        // 从父进程子列表移除失败的占位 PID，防止悬挂
-        parent.children.retain(|&pid| pid != child_pid);
-        // R152-5: Detach from cgroup if we attached before fork_inner
-        if cgroup_attached {
-            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-                let _ = cg.detach_task(child_pid as u64);
-            }
-        }
-        // H.0.9 FIX: Do NOT roll back cpuset task count on fork_inner failure.
-        // (see original comment — cpuset join happens inside fork_inner after
-        // frame allocation, so it was never incremented on this error path)
-        drop(parent);
-        cleanup_partial_child(child_pid);
-    } else {
-        // J2-7: per-cgroup FD budget — batch-charge the child's inherited fds.
-        // fork_inner deep-copied the parent's fd_table into the child, so the
-        // child's count == parent.fd_table.len() (read here under the held parent
-        // lock; the child PCB is referenced only by pid at this point). Charge to
-        // parent_cgroup_id, which equals the child's FINAL cgroup (assigned in
-        // fork_inner) — child.cgroup_id is not readable here. Charge fds BEFORE
-        // memory so rollback stays symmetric: an fd-charge failure has no memory
-        // to undo, and the memory-charge failure below explicitly uncharges fds.
-        let child_fd_count = parent.fd_table.len() as u64;
-        if child_fd_count > 0
-            && crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err()
-        {
+    match fork_inner(&mut parent, child_pid, parent_root, child_credentials) {
+        Ok(()) => {}
+        Err(error) => {
             parent.children.retain(|&pid| pid != child_pid);
-            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-                let _ = cg.detach_task(child_pid as u64);
-            }
-            crate::process::notify_cpuset_task_left(parent_cpuset_id);
-            drop(parent);
-            cleanup_partial_child(child_pid);
-            return Err(ForkError::CgroupFilesLimitExceeded);
-        }
-
-        // R138-1 FIX: Worst-case COW cgroup memory charging.
-        //
-        // COW fork shares physical frames but gives the child a full copy of
-        // mmap_regions, brk, and elf_charged_bytes.  On child exit (or exec),
-        // free_process_resources() / sys_exec() uncharges ALL of those bytes.
-        // If the child was never charged for them, the parent's charges get
-        // uncharged twice — driving memory_current below true physical usage
-        // and allowing subsequent allocations to bypass memory.max.
-        //
-        // Fix: charge the child's cgroup for the full inherited virtual
-        // footprint at fork time.  This is conservative (counts COW-shared
-        // pages for both parent and child) but is fail-closed: the uncharge
-        // on exit exactly cancels the charge here, keeping memory_current
-        // accurate for every process independently.
-        //
-        // Locking note: fork_inner() creates an independent MmState for the
-        // child via parent.mm.lock().  We compute the inherited footprint
-        // from the parent's MmState here (lock ordering: Process → MmState)
-        // rather than re-locking the child's mm.
-        let fork_charge_bytes: u64 = {
-            let mut bytes: u64 = 0;
-
-            // D3-ARC-MM-SHARED: Access mm fields through the shared MmState lock.
-            // Lock ordering: Process (held) → MmState — never reverse.
-            let parent_mm = parent.mm.lock();
-
-            // Sum non-PROT_NONE mmap regions (inherited verbatim from parent)
-            for (_base, len_with_flags) in parent_mm.mmap_regions.iter() {
-                // R172-22: annotate the value type — FallibleOrderedMap::iter() returns an
-                // opaque `impl Iterator`, so the (now Borrow-generic) map's Item type is not
-                // inferable here without it.
-                let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
-                if len_with_flags.is_prot_none() {
-                    continue;
+            if cgroup_attached {
+                if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                    let _ = cg.detach_task(child_pid as u64);
                 }
-                let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
-                bytes = bytes.saturating_add(len);
             }
-
-            // Brk heap (inherited verbatim from parent)
-            let heap_bytes = {
-                const PAGE_SIZE: usize = 0x1000;
-                let brk_aligned = (parent_mm.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                let brk_start_aligned = (parent_mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                brk_aligned.saturating_sub(brk_start_aligned) as u64
-            };
-            bytes = bytes.saturating_add(heap_bytes);
-
-            // ELF loader charges (inherited verbatim from parent)
-            bytes = bytes.saturating_add(parent_mm.elf_charged_bytes);
-
-            // J2-9 FIX: Charge the inherited page-table-frame kmem. fork gives the
-            // child its OWN freshly-allocated page tables (plan_clone_level), so
-            // the child's last-exit uncharge of its copied pt_charged_bytes must be
-            // matched by a charge here (to the parent cgroup, like the rest of the
-            // inherited virtual footprint) or memory_current drifts below true
-            // usage and bypasses memory.max. Follows the elf LIFECYCLE (charge at
-            // fork, child last-exit cancels) — conservative for COW-shared pages,
-            // exactly like the mmap/heap/elf terms above. Note: this accounts only
-            // the INHERITED mmap page-table value; the child's whole-AS page tables
-            // (ELF/stack/brk/entry-island/KPTI) beyond that are a tracked deferred
-            // residual, not claimed to cancel.
-            bytes = bytes.saturating_add(parent_mm.pt_charged_bytes);
-
-            drop(parent_mm);
-            bytes
-        };
-
-        if fork_charge_bytes > 0
-            && crate::cgroup::try_charge_memory(parent_cgroup_id, fork_charge_bytes).is_err()
-        {
-            // Cgroup memory.max would be exceeded — roll back the entire fork.
-            // J2-7: also uncharge the fds charged above (multi-controller rollback).
-            // cleanup_partial_child does NOT call free_process_resources, and
-            // child.fds_charged_count has NOT been set yet, so this manual uncharge
-            // is the sole rollback for the FD charge.
-            if child_fd_count > 0 {
-                crate::cgroup::uncharge_fds(parent_cgroup_id, child_fd_count);
-            }
-            parent.children.retain(|&pid| pid != child_pid);
-            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-                let _ = cg.detach_task(child_pid as u64);
-            }
-            crate::process::notify_cpuset_task_left(parent_cpuset_id);
             drop(parent);
+            drop(scheduler_permit);
             cleanup_partial_child(child_pid);
-            return Err(ForkError::MemoryAllocationFailed);
-        }
-
-        // J2-7: both charges succeeded — record the child's running FD charge so
-        // its eventual exit (free_process_resources) uncharges exactly this amount.
-        // Set it LAST: any earlier failure path leaves it 0, and cleanup_partial_child
-        // (which does not uncharge) is then correct. Locking the child here is safe
-        // (parent→child order, established by fork_inner, which has since released it).
-        if child_fd_count > 0 {
-            if let Some(child_arc) = get_process(child_pid) {
-                child_arc.lock().fds_charged_count = child_fd_count;
-            }
+            return Err(error);
         }
     }
 
-    result
+    // Publication is infallible and centralized here so syscall wrappers have
+    // no post-COW lookup/failure window.  Drop the parent PCB lock first; the
+    // scheduler may inspect process state through independent locks.
+    drop(parent);
+    scheduler_permit.commit();
+    Ok((child_pid, parent_view_pid))
 }
 
 /// Fork 的内部实现，便于错误处理和回滚
@@ -278,7 +348,8 @@ fn fork_inner(
     parent: &mut crate::process::Process,
     child_pid: ProcessId,
     parent_root: usize,
-) -> Result<ProcessId, ForkError> {
+    child_credentials: crate::process::Credentials,
+) -> Result<(), ForkError> {
     // R122-1 FIX: Reject fork() while any mmap/munmap operation is in-flight.
     //
     // The three-phase mmap/munmap protocol (R121-4) encodes transient state in
@@ -297,83 +368,10 @@ fn fork_inner(
     //
     // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
     // Lock ordering: Process (held) → MmState — never reverse.
-    {
-        let parent_mm = parent.mm.lock();
-        if parent_mm
-            .mmap_regions
-            .values()
-            .any(|len_with_flags: &crate::syscall::MmapEntry| len_with_flags.has_transient())
-        {
-            return Err(ForkError::MmapTransientState);
-        }
-        // R165-1 FIX: brk also has a transient reservation now (brk_in_progress).
-        // A sibling thread mid-brk has dropped the MmState lock for page-table
-        // work, so the parent's page tables and `brk` may be momentarily
-        // inconsistent. Copying that into the child would produce a heap whose
-        // record disagrees with its mappings — same hazard the mmap guard above
-        // covers. Fail-closed with EAGAIN so userspace retries.
-        if parent_mm.brk_in_progress {
-            return Err(ForkError::MmapTransientState);
-        }
-        // M0-7 item7 SLICE 4: a sibling thread mid `try_grow_user_stack` has dropped the
-        // MmState lock for page-table work, so the parent's stack page tables and
-        // stack_floor_committed watermark may be momentarily inconsistent (and an
-        // in-flight DATA charge sits in stack_grow_pending_bytes, which fork's custom
-        // inherited-charge sum at :222 reads elf_charged_bytes — NOT the pending lane —
-        // and would miss). Same hazard as the brk/mmap guards above. Fail-closed EAGAIN.
-        if parent_mm.stack_grow_in_progress {
-            return Err(ForkError::MmapTransientState);
-        }
-    }
+    let _mm_fork_reservation = ForkMmReservation::acquire(Arc::clone(&parent.mm))?;
 
     if let Some(child_process) = get_process(child_pid) {
         let mut child = child_process.lock();
-
-        // 分配子进程页表根
-        let mut frame_alloc = FrameAllocator::new();
-        let child_root_frame = frame_alloc
-            .allocate_frame()
-            .ok_or(ForkError::MemoryAllocationFailed)?;
-        unsafe {
-            zero_table(child_root_frame);
-        }
-
-        // 复制页表并设置 COW
-        unsafe {
-            if let Err(e) = copy_page_table_cow(
-                parent_root,
-                child_root_frame.start_address().as_u64() as usize,
-            ) {
-                // 页表复制失败，释放已分配的页表树
-                // 注意：copy_page_table_cow 可能已经分配了部分子页表
-                free_address_space(child_root_frame.start_address().as_u64() as usize);
-                return Err(e);
-            }
-        }
-
-        child.memory_space = child_root_frame.start_address().as_u64() as usize;
-
-        // H.3 KPTI: Create a user-mode PML4 root for the child's COW-copied kernel PML4.
-        //
-        // The COW fork path allocates an independent kernel PML4 for the child, so the
-        // KPTI user CR3 shadow must be built against that new root — it cannot share
-        // the parent's user PML4 (which points into the parent's kernel PML4 sub-tables).
-        if security::is_kpti_enabled() {
-            match create_kpti_user_pml4(child.memory_space) {
-                Ok((_user_frame, user_phys)) => {
-                    child.user_memory_space = user_phys;
-                }
-                Err(e) => {
-                    // User PML4 creation failed — roll back the child's kernel PML4.
-                    free_address_space(child.memory_space);
-                    child.memory_space = 0;
-                    child.user_memory_space = 0;
-                    return Err(e);
-                }
-            }
-        } else {
-            child.user_memory_space = 0;
-        }
 
         // 复制 CPU 上下文（RAX 在下方置 0）
         child.context = parent.context;
@@ -381,14 +379,10 @@ fn fork_inner(
         // If parent used FPU, the state in context.fx is valid and child inherits it
         child.fpu_used = parent.fpu_used;
         child.user_stack = parent.user_stack;
-        // SMP: inherit CPU affinity from parent
-        child.allowed_cpus = parent.allowed_cpus;
-
-        // E.5 Cpuset: inherit cpuset from parent.
+        // SMP affinity and cpuset were snapshotted before scheduler admission.
         // R163-4 FIX: Defer notify_cpuset_task_joined until after all fallible
         // operations complete. If fork_inner fails after the notification,
         // the counter is incremented but never decremented (cpuset DoS).
-        child.cpuset_id = parent.cpuset_id;
 
         // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
         // 复制父进程内核栈内容以保持返回路径一致
@@ -435,17 +429,34 @@ fn fork_inner(
         // clone_box() is still infallible (Box::new), but we pre-validate
         // the fd count fits in memory. With MAX_FD=256, total alloc is ~128KB.
         // If fd_table is excessively large, fail early.
-        if parent.fd_table.len() > 256 {
+        if parent.fd_table.len() > crate::process::MAX_FD as usize {
             return Err(ForkError::MemoryAllocationFailed);
         }
+        child
+            .fd_table
+            .ensure_capacity_for(parent.fd_table.len())
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        child
+            .cloexec_fds
+            .ensure_capacity_for(parent.cloexec_fds.len())
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
         for (&fd, desc) in parent.fd_table.iter() {
-            child.fd_table.insert(fd, desc.clone_box());
+            let cloned = desc
+                .try_clone_box()
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            if child.fd_table.insert_unique_reserved(fd, cloned).is_err() {
+                panic!("fork FD snapshot violated unique reserved publication");
+            }
         }
 
         // R39-4 FIX: 克隆 close-on-exec 标记集合
         // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
         // (~12KB worst case). Accepted risk documented.
-        child.cloexec_fds = parent.cloexec_fds.clone();
+        for &fd in parent.cloexec_fds.iter() {
+            if child.cloexec_fds.insert_reserved(fd).is_err() {
+                panic!("fork CLOEXEC snapshot exceeded prepared capacity");
+            }
+        }
 
         // M0-6: inherit POSIX resource limits across fork (POSIX: child inherits
         // the parent's rlimits). `[RLimit; N]` is Copy — a trivial value copy.
@@ -487,20 +498,40 @@ fn fork_inner(
         // on the common non-threaded fork path.
         if Arc::strong_count(&parent.cap_table) > 1 {
             // Build a histogram: CapId → count of child fds carrying it.
-            let mut child_cap_counts: alloc::collections::BTreeMap<cap::CapId, usize> =
-                alloc::collections::BTreeMap::new();
+            let mut child_cap_counts =
+                [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
+            let mut child_cap_count_len = 0usize;
             for desc in child.fd_table.values() {
                 if let Some(cid) = desc.cap_id() {
-                    *child_cap_counts.entry(cid).or_insert(0) += 1;
+                    let Some(slot) = child_cap_counts.get_mut(child_cap_count_len) else {
+                        return Err(ForkError::MemoryAllocationFailed);
+                    };
+                    *slot = (cid, 1);
+                    child_cap_count_len += 1;
+                }
+            }
+            child_cap_counts[..child_cap_count_len].sort_unstable_by_key(|entry| entry.0);
+            let mut unique_len = 0usize;
+            for index in 0..child_cap_count_len {
+                let (cid, count) = child_cap_counts[index];
+                if unique_len != 0 && child_cap_counts[unique_len - 1].0 == cid {
+                    child_cap_counts[unique_len - 1].1 = child_cap_counts[unique_len - 1]
+                        .1
+                        .checked_add(count)
+                        .ok_or(ForkError::MemoryAllocationFailed)?;
+                } else {
+                    child_cap_counts[unique_len] = (cid, count);
+                    unique_len += 1;
                 }
             }
             // Overwrite each CapEntry.refcount to match the child's fd count.
             // try_clone_for_fork gave us a fresh CapTable with its own inner Mutex;
             // no lock needed here (child not visible, parent still locked).
-            raw_cap_table.reconcile_refcounts_after_fork(&child_cap_counts);
+            raw_cap_table.reconcile_refcounts_after_fork(&child_cap_counts[..unique_len]);
         }
 
-        child.cap_table = Arc::new(raw_cap_table);
+        child.cap_table =
+            Arc::try_new(raw_cap_table).map_err(|_| ForkError::MemoryAllocationFailed)?;
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
@@ -518,8 +549,17 @@ fn fork_inner(
         // fork() 创建的子进程获得父进程凭证的克隆副本（独立 Arc）。
         // 这意味着子进程后续的 setuid/setgid 不会影响父进程。
         // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
-        let parent_creds = parent.credentials.read().clone();
-        child.credentials = Arc::new(RwLock::new(parent_creds));
+        let credential_arc_reservation = try_reserve_heap(
+            HeapClass::CoreProcess,
+            arc_charge_bytes::<RwLock<crate::process::Credentials>>()
+                .map_err(|_| ForkError::MemoryAllocationFailed)?,
+        )
+        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        let credentials = Arc::try_new(RwLock::new(child_credentials))
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        let old_credentials = core::mem::replace(&mut child.credentials, credentials);
+        drop(old_credentials);
+        drop(credential_arc_reservation);
         child.umask = parent.umask;
 
         // D3-ARC-MM-SHARED: Build the child's independent MmState from the
@@ -527,9 +567,9 @@ fn fork_inner(
         // brk_start, brk, elf_charged_bytes, mmap_regions, and next_mmap_addr.
         //
         // R138-1 FIX: Inherit parent's ELF loader charges so the child's cgroup
-        // accounting is complete under worst-case COW semantics.  The actual
-        // cgroup charge for the child's full inherited footprint (mmap_regions +
-        // brk + elf_charged_bytes) happens in sys_fork() after fork_inner returns.
+        // accounting is complete under worst-case COW semantics.  The exact
+        // charge is derived from this same locked snapshot and reserved below,
+        // before the parent-PTE commit.
         //
         // R122-1 FIX: Strip transient PENDING_* flags when cloning committed
         // regions into the child, preserving persistent per-region flags (e.g.
@@ -540,8 +580,42 @@ fn fork_inner(
         // We pre-allocate into a Vec first to detect OOM early.
         //
         // Lock ordering: Process (held) → MmState — never reverse.
-        {
+        let fork_charge_bytes = {
             let parent_mm = parent.mm.lock();
+
+            // Re-check every transient at the actual snapshot point.  The early
+            // check rejects quickly; this one prevents a CLONE_VM sibling from
+            // opening a prepare window before the metadata/charge snapshot.
+            if parent_mm
+                .mmap_regions
+                .values()
+                .any(|entry: &crate::syscall::MmapEntry| entry.has_transient())
+                || parent_mm.brk_in_progress
+                || parent_mm.stack_grow_in_progress
+            {
+                return Err(ForkError::MmapTransientState);
+            }
+            debug_assert!(
+                parent_mm.fork_in_progress,
+                "fork snapshot must own the shared-MM reservation"
+            );
+
+            let mut charge_bytes = 0u64;
+            for (_base, entry) in parent_mm.mmap_regions.iter() {
+                let entry: &crate::syscall::MmapEntry = entry;
+                if !entry.is_prot_none() {
+                    charge_bytes =
+                        charge_bytes.saturating_add(crate::syscall::mmap_region_len(*entry) as u64);
+                }
+            }
+            const PAGE_SIZE: usize = 0x1000;
+            let brk_aligned = parent_mm.brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let brk_start_aligned =
+                parent_mm.brk_start.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            charge_bytes = charge_bytes
+                .saturating_add(brk_aligned.saturating_sub(brk_start_aligned) as u64)
+                .saturating_add(parent_mm.elf_charged_bytes)
+                .saturating_add(parent_mm.pt_charged_bytes);
 
             let region_count = parent_mm.mmap_regions.len();
             // R165-14: Re-assert the MAX_MAP_COUNT bound before cloning. mmap()
@@ -622,9 +696,12 @@ fn fork_inner(
                 stack_grow_pending_bytes: 0,
                 stack_floor_committed: parent_mm.stack_floor_committed,
                 stack_grow_in_progress: false,
+                fork_in_progress: false,
             };
-            child.mm = Arc::new(Mutex::new(child_mm));
-        }
+            child.mm = Arc::try_new(Mutex::new(child_mm))
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            charge_bytes
+        };
 
         // 复制 TLS 状态（FS/GS base）
         child.fs_base = parent.fs_base;
@@ -656,42 +733,85 @@ fn fork_inner(
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
         child.pledge_state = parent.pledge_state.clone();
 
-        // R163-4 FIX: All fallible operations above have succeeded. Safe to
-        // commit the cpuset counter increment now — no error path can leak it.
-        crate::process::notify_cpuset_task_joined(child.cpuset_id);
-
-        // 复制线程支持状态
-        // 【注意】fork 创建的是新进程，不是线程
-        // - tid/tgid 设为子进程 pid（Process::new 已处理）
-        // - is_thread = false（Process::new 已处理）
-        // - clear_child_tid/set_child_tid 清零（子进程需要自己设置）
+        // Finish every infallible PCB field before scheduler admission. The
+        // reserved queue entry is non-runnable until its permit is committed.
         child.clear_child_tid = 0;
         child.set_child_tid = 0;
         child.robust_list_head = 0;
         child.robust_list_len = 0;
-
-        // M4-1b: the per-PCB wait-timeout markers are INTENTIONALLY OMITTED from the
-        // parent-copy allowlist above — a child must be born-clean (no inherited
-        // timeout). `Process::new` already zeroes them; this explicit store is the
-        // grep-visible tripwire so a future field-copy refactor cannot silently
-        // inherit a parent marker (which would surface as a spurious TimedOut in the
-        // child's first wait of the matching subsystem).
         child.socket_timeout_marker.store(0, Ordering::Relaxed);
         child.wq_timeout_marker.store(0, Ordering::Relaxed);
-        // M1-02: same born-clean tripwire for the queue-free wait-timeout token — a
-        // child must NOT inherit the parent's active_wait_seq, or a parent stale timer
-        // could falsely match the child's first timed wait.
         child.active_wait_seq.store(0, Ordering::Relaxed);
+        child.context.rax = 0;
 
-        child.context.rax = 0; // 子进程返回值 0
-        child.enter_ready_at(crate::get_ticks());
+        // R180-19 PREPARE: reserve the exact resources represented by the
+        // already-built child state.  The RAII guard rolls both controllers back
+        // on root-frame, KPTI, or COW-plan failure; after this point there is no
+        // unguarded charge and no mismatch between the cloned MmState and its
+        // memory.max amount.
+        let child_fd_count = child.fd_table.len() as u64;
+        let mut charge_guard = ForkChargeGuard::new(parent.cgroup_id);
+        if child_fd_count != 0 {
+            crate::cgroup::try_charge_fds(parent.cgroup_id, child_fd_count)
+                .map_err(|_| ForkError::CgroupFilesLimitExceeded)?;
+            charge_guard.fd_count = child_fd_count;
+        }
+        if fork_charge_bytes != 0 {
+            crate::cgroup::try_charge_memory(parent.cgroup_id, fork_charge_bytes)
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            charge_guard.memory_bytes = fork_charge_bytes;
+        }
 
+        let child_cpuset_id = child.cpuset_id;
+        drop(child);
+
+        // R180-19 FIX: the parent-PTE COW transition is the COMMIT point.
+        // Every heap allocation, namespace/capability/credential clone, cgroup
+        // charge, and child metadata build above has already succeeded.  The
+        // page-table transaction also prepares KPTI before touching the parent,
+        // so nothing below this call can return an error after parent PTEs have
+        // become read-only.
+        let mut frame_alloc = FrameAllocator::new();
+        let child_root_frame = frame_alloc
+            .allocate_frame()
+            .ok_or(ForkError::MemoryAllocationFailed)?;
+        unsafe {
+            zero_table(child_root_frame);
+        }
+        let child_memory_space = child_root_frame.start_address().as_u64() as usize;
+        let child_user_memory_space = unsafe {
+            match copy_page_table_cow(parent_root, child_memory_space) {
+                Ok(user_memory_space) => user_memory_space,
+                Err(error) => {
+                    // copy_page_table_cow guarantees the root's user half is
+                    // empty on failure, so the generic teardown releases only
+                    // the private root and never touches parent-owned leaves.
+                    free_address_space(child_memory_space);
+                    return Err(error);
+                }
+            }
+        };
+        let mut child = child_process.lock();
+        child.memory_space = child_memory_space;
+        child.user_memory_space = child_user_memory_space;
+
+        // The admission charge becomes owned by the child at the same commit.
+        // No error path exists below this assignment; normal exit now performs
+        // the exact matching uncharge.
+        child.fds_charged_count = child_fd_count;
+        charge_guard.commit();
+
+        // R163-4 FIX: All fallible operations above have succeeded. Safe to
+        // commit the cpuset counter increment now — no error path can leak it.
+        let committed_child_pid = child.pid;
+        drop(child);
+        crate::process::notify_cpuset_task_joined(child_cpuset_id);
         kprintln!(
             "Fork: parent={}, child={}, COW enabled",
             parent.pid,
-            child.pid
+            committed_child_pid
         );
-        Ok(child_pid)
+        Ok(())
     } else {
         Err(ForkError::ProcessNotFound)
     }
@@ -704,13 +824,22 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
     // G.1: Also extract watchdog handle for unregistration
     // H.0.9: Also extract PID namespace chain for detachment outside lock
-    let (kstack, addr_space, user_addr_space, watchdog_handle, pid_ns_chain, fds_to_drop): (
-        Option<VirtAddr>,
+    let (
+        kstack,
+        addr_space,
+        user_addr_space,
+        watchdog_handle,
+        pid_ns_chain,
+        fds_to_drop,
+        process_to_drop,
+    ): (
+        Option<(VirtAddr, PhysFrame<Size4KiB>, crate::rcu::RcuCallbackPermit)>,
         usize,
         usize,
         Option<WatchdogHandle>,
-        Vec<crate::pid_namespace::PidNamespaceMembership>,
-        BTreeMap<i32, FileDescriptor>,
+        mm::AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
+        AdmittedMap<i32, FileDescriptor>,
+        Option<ProcessArc>,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         if let Some(slot) = table.get_mut(child_pid) {
@@ -718,7 +847,15 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                 let mut proc = process.lock();
                 (
                     if proc.kernel_stack.as_u64() != 0 {
-                        Some(proc.kernel_stack)
+                        Some((
+                            proc.kernel_stack,
+                            proc.kernel_stack_phys
+                                .take()
+                                .expect("live kernel stack missing physical block identity"),
+                            proc.kernel_stack_rcu
+                                .take()
+                                .expect("live kernel stack missing RCU reclaim permit"),
+                        ))
                     } else {
                         None
                     },
@@ -730,30 +867,63 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                     // create_process() calls assign_pid_chain(), so the chain is populated
                     // even for partially-constructed children. Without detachment, the
                     // namespace PID slots leak and are never reclaimed.
-                    proc.pid_ns_chain.clone(),
-                    // R171-F5 FIX: take the fd_table OUT so the FileDescriptor
-                    // (Box<dyn FileOps>) destructors do NOT run when the `process`
-                    // Arc drops at the end of this block — that drop happens while
-                    // PROCESS_TABLE (`table`) is still held, and an FD close can
-                    // take socket/pipe/vfs locks and wake_all -> get_process ->
-                    // PROCESS_TABLE (lock-order inversion / self-deadlock). The
-                    // emptied table makes the Arc drop FD-free; we drop the taken
-                    // map below, after PROCESS_TABLE is released. Mirrors
-                    // free_process_resources (process.rs:4105) + R154-3.
-                    core::mem::take(&mut proc.fd_table),
+                    // R180-19: cleanup is itself an OOM path. Transfer the
+                    // already-owned chain instead of cloning/allocating while
+                    // rolling back a failed fork.
+                    core::mem::replace(
+                        &mut proc.pid_ns_chain,
+                        mm::AdmittedVec::new(HeapClass::CoreProcess),
+                    ),
+                    // R171-F5 FIX: take the fd_table OUT so FileDescriptor
+                    // destructors run explicitly after PROCESS_TABLE is released.
+                    core::mem::replace(
+                        &mut proc.fd_table,
+                        AdmittedMap::new(HeapClass::CoreProcess),
+                    ),
+                    // RF180-16 defense-in-depth: retain the whole PCB across the
+                    // table unlock. Process field destructors include namespace
+                    // Arcs whose final Drop may take lifecycle/parent locks; PID
+                    // publication takes those locks before PROCESS_TABLE, so the
+                    // final PCB drop must never occur under PROCESS_TABLE.
+                    Some(Arc::clone(&process)),
                 )
             } else {
-                (None, 0, 0, None, Vec::new(), BTreeMap::new())
+                (
+                    None,
+                    0,
+                    0,
+                    None,
+                    mm::AdmittedVec::new(HeapClass::CoreProcess),
+                    AdmittedMap::new(HeapClass::CoreProcess),
+                    None,
+                )
             }
         } else {
-            (None, 0, 0, None, Vec::new(), BTreeMap::new())
+            (
+                None,
+                0,
+                0,
+                None,
+                mm::AdmittedVec::new(HeapClass::CoreProcess),
+                AdmittedMap::new(HeapClass::CoreProcess),
+                None,
+            )
         }
     };
+    let retired_process_table = {
+        let mut table = PROCESS_TABLE.lock();
+        crate::process::reclaim_empty_process_table(&mut table)
+    };
+    // RF180-44: the detached allocation and its admission charge must outlive
+    // the PROCESS_TABLE guard and be destroyed only after the global lock drops.
+    drop(retired_process_table);
 
     // G.1 Observability: Unregister watchdog before releasing other resources
     // This prevents false hung-task alerts for the partially-created process
     if let Some(handle) = watchdog_handle {
-        unregister_watchdog(&handle);
+        if unregister_watchdog(&handle).is_err() {
+            debug_assert!(false, "partial child carried a stale watchdog handle");
+        }
     }
 
     // H.0.9: Detach PID namespace chain to reclaim namespace PID slots.
@@ -763,8 +933,8 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     }
 
     // 在 PROCESS_TABLE 锁外释放资源
-    if let Some(stack_base) = kstack {
-        free_kernel_stack(child_pid, stack_base);
+    if let Some((stack_base, stack_phys, permit)) = kstack {
+        free_kernel_stack(child_pid, stack_base, stack_phys, permit);
     }
     // H.3 KPTI: Free user PML4 root BEFORE kernel PML4.
     // User-half entries are shared pointers into the kernel PML4's sub-tables,
@@ -780,6 +950,9 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // each FileDescriptor close (socket/pipe wake_all -> get_process ->
     // PROCESS_TABLE) runs lock-free. (No-op when the table was already empty.)
     drop(fds_to_drop);
+    // Drop all remaining PCB-owned resources only after every global/table lock
+    // and the explicitly ordered cleanup above have completed.
+    drop(process_to_drop);
 
     kprintln!("Fork failed: cleaned up partial child PID {}", child_pid);
 }
@@ -813,7 +986,7 @@ fn cleanup_partial_child(child_pid: ProcessId) {
 pub unsafe fn copy_page_table_cow(
     parent_page_table: usize,
     child_page_table: usize,
-) -> Result<(), ForkError> {
+) -> Result<usize, ForkError> {
     // R67-6 FIX: Hold PT_LOCK during entire COW setup to prevent concurrent
     // mmap/munmap/pagefault from racing with parent PTE modifications.
     with_pt_lock(|| {
@@ -840,24 +1013,12 @@ pub unsafe fn copy_page_table_cow(
         // 若分配失败，此时父进程未被修改，直接返回错误即可
         let mut table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
 
-        // RF178-6 / RF178-31: Refcount metadata is part of the COW transaction.
-        // Stage checked fixed-table deltas before any parent PTE mutation. Failure
-        // rolls back the exact prefix; explicitly return all preallocated table
-        // frames because dropping a PhysFrame value does not free the frame.
-        if let Err(error) = PAGE_REF_COUNT.stage_clone_refs(&mut plan) {
-            for frame in table_frames.drain(..) {
-                frame_alloc.deallocate_frame(frame);
-            }
-            return Err(error);
-        }
-
-        // 阶段 3: 应用所有 COW 修改（使用预分配帧，保证不会失败）
-        // RF178-31: All allocation and refcount staging completed above. The
-        // remaining traversal is structurally infallible and only consumes the
-        // exact plan plus its exact number of preallocated page-table frames.
+        // R180-19 PREPARE: build the complete child tree without modifying the
+        // parent.  Keep the exact frame vector alive as a rollback ledger; a
+        // PhysFrame value is non-owning, so dropping the Vec after COMMIT is safe.
         let mut leaf_cursor = 0usize;
-        let mut frame_iter = table_frames.into_iter();
-        apply_clone_level(
+        let mut frame_iter = table_frames.iter().copied();
+        build_child_clone_level(
             parent_pml4,
             child_pml4,
             &mut frame_iter,
@@ -867,6 +1028,40 @@ pub unsafe fn copy_page_table_cow(
         );
         debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
         debug_assert!(frame_iter.next().is_none());
+
+        // R180-19 PREPARE: KPTI construction used to happen after parent PTEs
+        // were committed.  Build it over the unpublished child tree now.  Any
+        // failure clears the child root and returns every private table frame;
+        // the parent and COW refcount table are still byte-for-byte unchanged.
+        let user_memory_space = if security::is_kpti_enabled() {
+            match create_kpti_user_pml4(child_page_table) {
+                Ok((_user_frame, user_phys)) => user_phys,
+                Err(error) => {
+                    rollback_prepared_child_clone(child_pml4, &mut table_frames, &mut frame_alloc);
+                    return Err(error);
+                }
+            }
+        } else {
+            0
+        };
+
+        // RF178-6 / RF178-31: refcount metadata is staged only after the child
+        // and KPTI roots are complete, but still before parent mutation.  The
+        // staging helper rolls back its exact prefix on failure; we then discard
+        // the unpublished child structures without releasing shared leaf frames.
+        if let Err(error) = PAGE_REF_COUNT.stage_clone_refs(&mut plan) {
+            if user_memory_space != 0 {
+                free_kpti_user_pml4(user_memory_space);
+            }
+            rollback_prepared_child_clone(child_pml4, &mut table_frames, &mut frame_alloc);
+            return Err(error);
+        }
+
+        // R180-19 COMMIT: no allocation or fallible operation remains.  Parent
+        // leaves are changed from their locked plan in one bounded pass.
+        unsafe {
+            commit_parent_cow(&plan);
+        }
 
         // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
         // 使用 TLB shootdown 机制，为 SMP 支持做准备
@@ -881,7 +1076,7 @@ pub unsafe fn copy_page_table_cow(
             plan.tables_needed
         );
 
-        Ok(())
+        Ok(user_memory_space)
     })
 }
 
@@ -984,6 +1179,51 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
 
         let old_frame = PhysFrame::containing_address(old_phys);
 
+        // R180-19 defense in depth: a failed/denied fork (and the ordinary
+        // "child exited first" case) can leave this process as the sole COW
+        // owner.  Requiring a fresh frame in that state turns recoverable memory
+        // pressure into SIGSEGV.  Atomically consume refcount==1 and restore
+        // writability in place; PT_LOCK excludes a concurrent fork publication.
+        match PAGE_REF_COUNT.claim_unique(old_frame.start_address().as_u64() as usize) {
+            CowUniqueClaim::Claimed => {
+                let mut unique_flags = flags;
+                unique_flags.remove(cow_flag());
+                unique_flags.remove(cow_readonly_flag());
+                unique_flags.insert(PageTableFlags::WRITABLE);
+                if manager.update_flags(page, unique_flags).is_err() {
+                    let restored = PAGE_REF_COUNT
+                        .restore_unique_claim(old_frame.start_address().as_u64() as usize);
+                    debug_assert!(restored, "failed to restore unique COW claim");
+                    return Err(ForkError::PageTableCopyFailed);
+                }
+                if !PAGE_REF_COUNT.finish_unique_claim(old_frame.start_address().as_u64() as usize)
+                {
+                    // Metadata corruption: restore the read-only PTE and the
+                    // tracking reference if possible.  Never leave a writable
+                    // mapping paired with an ambiguous ownership count.
+                    let _ = manager.update_flags(page, flags);
+                    let restored = PAGE_REF_COUNT
+                        .restore_unique_claim(old_frame.start_address().as_u64() as usize);
+                    debug_assert!(restored, "failed to unwind unique COW finalization");
+                    mm::flush_current_as_page(virt);
+                    return Err(ForkError::PageTableCopyFailed);
+                }
+                mm::flush_current_as_page(virt);
+                kprintln!(
+                    "COW page fault: pid={}, addr=0x{:x} upgraded unique owner",
+                    pid,
+                    fault_addr
+                );
+                return Ok(());
+            }
+            CowUniqueClaim::Shared => {}
+            CowUniqueClaim::Invalid => {
+                // A COW marker without tracking metadata cannot be repaired
+                // safely: do not allocate/copy and then guess at ownership.
+                return Err(ForkError::PageTableCopyFailed);
+            }
+        }
+
         // 分配新物理页
         let new_frame = frame_alloc
             .allocate_frame()
@@ -1072,6 +1312,19 @@ pub enum CowPageRelease {
     Invalid,
 }
 
+/// Result of trying to convert the only tracked COW mapping back to ordinary
+/// writable ownership without allocating a replacement frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CowUniqueClaim {
+    Claimed,
+    Shared,
+    Invalid,
+}
+
+/// Transient refcount value owned by the PT_LOCK-held unique-upgrade path.
+/// Teardown treats it as invalid/leak-safe rather than as an untracked frame.
+const COW_UNIQUE_CLAIMED: u32 = u32::MAX;
+
 impl CowPageRelease {
     /// Ordinary unmap/teardown frees both exclusive untracked pages and the last
     /// tracked page. Invalid metadata fails leak-safe rather than risking a UAF.
@@ -1123,6 +1376,9 @@ impl PhysicalPageRefCount {
 
         let mut old = slot.load(Ordering::Acquire);
         loop {
+            if old == COW_UNIQUE_CLAIMED {
+                return Err(ForkError::PageTableCopyFailed);
+            }
             let delta = if old == 0 {
                 // A COW marker proves the parent was already tracked. Losing
                 // that metadata cannot be repaired from one PTE; fail leak-safe.
@@ -1142,6 +1398,9 @@ impl PhysicalPageRefCount {
             let new = old
                 .checked_add(delta)
                 .ok_or(ForkError::PageTableCopyFailed)?;
+            if new == COW_UNIQUE_CLAIMED {
+                return Err(ForkError::PageTableCopyFailed);
+            }
             match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(delta),
                 Err(actual) => old = actual,
@@ -1166,6 +1425,9 @@ impl PhysicalPageRefCount {
     fn release_slot(slot: &AtomicU32) -> CowPageRelease {
         let mut old = slot.load(Ordering::Acquire);
         loop {
+            if old == COW_UNIQUE_CLAIMED {
+                return CowPageRelease::Invalid;
+            }
             if old == 0 {
                 return CowPageRelease::Untracked;
             }
@@ -1176,6 +1438,53 @@ impl PhysicalPageRefCount {
                 Err(actual) => old = actual,
             }
         }
+    }
+
+    /// Atomically consume the final tracking reference.  PT_LOCK prevents a
+    /// concurrent fork from adding a mapping while the caller updates its PTE;
+    /// teardown may only move a shared count downward, which is safely retried.
+    fn claim_unique_slot(slot: &AtomicU32) -> CowUniqueClaim {
+        let mut current = slot.load(Ordering::Acquire);
+        loop {
+            match current {
+                0 => return CowUniqueClaim::Invalid,
+                1 => match slot.compare_exchange_weak(
+                    1,
+                    COW_UNIQUE_CLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return CowUniqueClaim::Claimed,
+                    Err(actual) => current = actual,
+                },
+                _ => return CowUniqueClaim::Shared,
+            }
+        }
+    }
+
+    fn claim_unique(&self, phys_addr: usize) -> CowUniqueClaim {
+        match Self::slot(phys_addr) {
+            Some(slot) => Self::claim_unique_slot(slot),
+            None => CowUniqueClaim::Invalid,
+        }
+    }
+
+    /// Undo a unique claim if the in-place PTE flag update unexpectedly fails.
+    /// Failure indicates metadata corruption; the caller remains fail-closed.
+    fn restore_unique_claim(&self, phys_addr: usize) -> bool {
+        let Some(slot) = Self::slot(phys_addr) else {
+            return false;
+        };
+        slot.compare_exchange(COW_UNIQUE_CLAIMED, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish_unique_claim(&self, phys_addr: usize) -> bool {
+        let Some(slot) = Self::slot(phys_addr) else {
+            return false;
+        };
+        slot.compare_exchange(COW_UNIQUE_CLAIMED, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Fallibly stage every refcount delta required by a COW clone.
@@ -1376,10 +1685,12 @@ fn preallocate_table_frames(
     Ok(frames)
 }
 
-/// 第三阶段：应用 - 使用预分配帧克隆页表并按计划应用 COW 修改
+/// R180-19 PREPARE: build the unpublished child page-table tree.
 ///
-/// 此阶段使用预分配帧，保证不会因为内存分配失败而中途退出
-fn apply_clone_level(
+/// This consumes only preallocated frames and never changes a parent entry.
+/// Keeping parent mutation out of this traversal is what permits KPTI and all
+/// other fallible setup to complete before the transaction's commit point.
+fn build_child_clone_level(
     parent: &mut PageTable,
     child: &mut PageTable,
     frames: &mut impl Iterator<Item = PhysFrame<Size4KiB>>,
@@ -1397,13 +1708,18 @@ fn apply_clone_level(
         }
 
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            // 叶子节点：应用 COW 修改
+            // Leaf: prepare only the child's COW view.  The parent is committed
+            // later from the stable plan after KPTI and refcounts are ready.
             let planned = plan
                 .leaf_updates
                 .get(*leaf_cursor)
-                .expect("COW apply traversal must match its locked plan");
+                .expect("COW prepare traversal must match its locked plan");
             *leaf_cursor += 1;
-            apply_leaf(entry, &mut child[idx], planned);
+            debug_assert_eq!(
+                planned.entry_ptr, entry as *mut PageTableEntry,
+                "COW prepare plan pointer mismatch"
+            );
+            build_child_leaf(&mut child[idx], planned);
         } else {
             // 中间节点：使用预分配帧
             let frame = frames
@@ -1417,7 +1733,7 @@ fn apply_clone_level(
 
             let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
             let child_next = unsafe { phys_to_virt_table(frame.start_address()) };
-            apply_clone_level(
+            build_child_clone_level(
                 parent_next,
                 child_next,
                 frames,
@@ -1429,25 +1745,10 @@ fn apply_clone_level(
     }
 }
 
-/// 应用单个叶子的 COW 修改
-///
-/// 使用第一阶段记录的原始状态进行修改
-fn apply_leaf(
-    parent_entry: &mut PageTableEntry,
-    child_entry: &mut PageTableEntry,
-    planned: &LeafUpdate,
-) {
-    // 验证计划匹配（调试断言）
-    debug_assert_eq!(
-        planned.entry_ptr, parent_entry as *mut PageTableEntry,
-        "COW plan mismatch: entry pointer doesn't match"
-    );
-
-    let addr = planned.phys_addr;
+#[inline]
+fn cloned_leaf_flags(planned: &LeafUpdate) -> PageTableFlags {
     let mut flags = planned.original_flags;
 
-    // RF178-6: Refcount deltas were staged before entering this function.
-    // Application performs no allocation or fallible metadata operation.
     if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
         if flags.contains(PageTableFlags::WRITABLE) || flags.contains(cow_flag()) {
             flags.remove(PageTableFlags::WRITABLE);
@@ -1457,16 +1758,99 @@ fn apply_leaf(
             flags.remove(cow_flag());
             flags.insert(cow_readonly_flag());
         }
-        parent_entry.set_addr(addr, flags);
     }
+    flags
+}
 
-    // 子进程使用相同的映射
-    child_entry.set_addr(addr, flags);
+/// Populate one unpublished child leaf.  Parent state and refcounts are not
+/// touched, so this is safe to discard on any later PREPARE failure.
+fn build_child_leaf(child_entry: &mut PageTableEntry, planned: &LeafUpdate) {
+    child_entry.set_addr(planned.phys_addr, cloned_leaf_flags(planned));
+}
+
+/// R180-19 COMMIT: apply all parent COW protections from the PT_LOCK-stable
+/// plan.  The caller has already staged exact refcounts and owns every child
+/// resource; this pass performs no allocation and has no failure branch.
+unsafe fn commit_parent_cow(plan: &CowClonePlan) {
+    for planned in plan.leaf_updates.iter() {
+        if !planned
+            .original_flags
+            .contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            continue;
+        }
+        debug_assert!(!planned.entry_ptr.is_null());
+        let parent_entry = &mut *planned.entry_ptr;
+        debug_assert_eq!(parent_entry.addr(), planned.phys_addr);
+        parent_entry.set_addr(planned.phys_addr, cloned_leaf_flags(planned));
+    }
+}
+
+/// Discard an unpublished child clone without walking/releasing leaf mappings.
+/// The exact intermediate-frame ledger is authoritative; clearing the PML4
+/// first prevents generic cleanup from following frames after they are returned.
+fn rollback_prepared_child_clone(
+    child_pml4: &mut PageTable,
+    table_frames: &mut Vec<PhysFrame<Size4KiB>>,
+    frame_alloc: &mut FrameAllocator,
+) {
+    for index in 0..256 {
+        child_pml4[index].set_unused();
+    }
+    for frame in table_frames.drain(..).rev() {
+        frame_alloc.deallocate_frame(frame);
+    }
+}
+
+/// Combined leaf helper retained for the boot-time COW regression probes.
+/// Production uses the explicit prepare/commit helpers above.
+fn apply_leaf(
+    parent_entry: &mut PageTableEntry,
+    child_entry: &mut PageTableEntry,
+    planned: &LeafUpdate,
+) {
+    debug_assert_eq!(
+        planned.entry_ptr, parent_entry as *mut PageTableEntry,
+        "COW plan mismatch: entry pointer doesn't match"
+    );
+    build_child_leaf(child_entry, planned);
+    if planned
+        .original_flags
+        .contains(PageTableFlags::USER_ACCESSIBLE)
+    {
+        parent_entry.set_addr(planned.phys_addr, cloned_leaf_flags(planned));
+    }
 }
 
 /// Boot-time RF178-31 regression probes. These use one local atomic slot and
 /// never perturb the production COW table.
 pub fn run_cow_refcount_self_test() {
+    // R180-19: unique-owner recovery must be allocation-free and exact.
+    let unique = AtomicU32::new(1);
+    assert_eq!(
+        PhysicalPageRefCount::claim_unique_slot(&unique),
+        CowUniqueClaim::Claimed
+    );
+    assert_eq!(unique.load(Ordering::Acquire), COW_UNIQUE_CLAIMED);
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&unique),
+        CowPageRelease::Invalid
+    );
+    assert!(unique
+        .compare_exchange(COW_UNIQUE_CLAIMED, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok());
+    let shared = AtomicU32::new(2);
+    assert_eq!(
+        PhysicalPageRefCount::claim_unique_slot(&shared),
+        CowUniqueClaim::Shared
+    );
+    assert_eq!(shared.load(Ordering::Acquire), 2);
+    let missing = AtomicU32::new(0);
+    assert_eq!(
+        PhysicalPageRefCount::claim_unique_slot(&missing),
+        CowUniqueClaim::Invalid
+    );
+
     let user_writable =
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
     let user_readonly = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -1625,6 +2009,11 @@ pub fn run_cow_refcount_self_test() {
         phys_addr: PhysAddr::new(base as u64),
         ref_delta: 2,
     };
+    // R180-19 PREPARE must construct the child view without touching parent
+    // flags; only the explicit commit helper may add the parent's COW marker.
+    build_child_leaf(&mut readonly_child, &readonly_plan);
+    assert!(!readonly_parent.flags().contains(cow_readonly_flag()));
+    assert!(readonly_child.flags().contains(cow_readonly_flag()));
     apply_leaf(&mut readonly_parent, &mut readonly_child, &readonly_plan);
     assert!(readonly_parent.flags().contains(cow_readonly_flag()));
     assert!(readonly_child.flags().contains(cow_readonly_flag()));
