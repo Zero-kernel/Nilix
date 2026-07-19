@@ -20,9 +20,8 @@
 //! - `io.max` - I/O bandwidth/IOPS limits
 //! - `io.stat` - I/O statistics (read-only)
 
-use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -31,9 +30,10 @@ use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::cgroup::{
-    self, CgroupControllers, CgroupError, CgroupId, CgroupLimits, CgroupNode,
+    self, CgroupArc, CgroupControllers, CgroupError, CgroupId, CgroupLimits,
 };
-use kernel_core::{process, FileOps};
+use kernel_core::process::ProcessState;
+use kernel_core::{process, FileDescriptor};
 
 /// Global cgroupfs ID counter (starts at 300 to avoid collision with other FS types)
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
@@ -246,7 +246,6 @@ impl CgroupFs {
             fs_id,
             ino: cgroup_dir_ino(0),
             cgroup_id: 0,
-            name: String::new(),
         });
 
         Arc::new(Self { fs_id, root })
@@ -310,11 +309,11 @@ impl FileSystem for CgroupFs {
                     fs_id: self.fs_id,
                     ino,
                     cgroup_id: child.id(),
-                    name: String::from(name),
                 }))
             }
             Err(CgroupError::DepthLimit) => Err(FsError::NoSpace),
             Err(CgroupError::CgroupLimit) => Err(FsError::NoSpace),
+            Err(CgroupError::OutOfMemory) => Err(FsError::NoSpace),
             Err(CgroupError::ControllerDisabled) => Err(FsError::Invalid),
             Err(_) => Err(FsError::Invalid),
         }
@@ -356,7 +355,9 @@ impl FileSystem for CgroupFs {
         // CF-2 FIX: Find child cgroup by matching name against the pseudo-name (ID string)
         let child_id = parent_cgroup
             .children()
-            .into_iter()
+            .map_err(|_| FsError::NoSpace)?
+            .iter()
+            .copied()
             .find(|child_id| {
                 format!("{}", child_id) == name && cgroup::lookup_cgroup(*child_id).is_some()
             })
@@ -396,7 +397,6 @@ struct CgroupDirInode {
     fs_id: u64,
     ino: u64,
     cgroup_id: CgroupId,
-    name: String,
 }
 
 impl CgroupDirInode {
@@ -426,7 +426,8 @@ impl CgroupDirInode {
         // In a full implementation, we'd maintain a name->id mapping
         // For now, we check if the name matches any child cgroup ID
         let parent = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
-        for child_id in parent.children() {
+        let children = parent.children().map_err(|_| FsError::NoSpace)?;
+        for child_id in children.iter().copied() {
             // Simple matching: name could be the cgroup name or ID
             let id_str = format!("{}", child_id);
             if name == id_str {
@@ -436,7 +437,6 @@ impl CgroupDirInode {
                     fs_id,
                     ino,
                     cgroup_id: child_id,
-                    name: String::from(name),
                 }));
             }
         }
@@ -495,17 +495,16 @@ impl Inode for CgroupDirInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         if flags.is_writable() {
             return Err(FsError::IsDir);
         }
-        let inode: Arc<dyn Inode> = Arc::new(CgroupDirInode {
-            fs_id: self.fs_id,
-            ino: self.ino,
-            cgroup_id: self.cgroup_id,
-            name: self.name.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn is_dir(&self) -> bool {
@@ -532,7 +531,7 @@ impl Inode for CgroupDirInode {
 
         // Then, list child cgroup directories
         let parent = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
-        let children = parent.children();
+        let children = parent.children().map_err(|_| FsError::NoSpace)?;
         let child_offset = offset - ctrl_count;
 
         if child_offset < children.len() {
@@ -697,8 +696,16 @@ impl CgroupCtrlInode {
         let is_root = kernel_core::current_is_host_root();
         let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let is_delegate = !is_root && cgroup.is_delegated_to(euid);
+        let has_cap_admin = kernel_core::with_current_cap_table(|tbl| {
+            tbl.has_rights(kernel_core::CapRights::ADMIN)
+        })
+        .unwrap_or(false);
 
-        if !is_root && !is_delegate {
+        // RF180-2 FIX: root, CAP_SYS_ADMIN, and delegation are a union of
+        // independent grants.  The old outer gate rejected CAP-only callers
+        // before the shared migration authorizer could apply its descendant
+        // rule.
+        if !is_root && !has_cap_admin && !is_delegate {
             return Err(FsError::PermDenied);
         }
 
@@ -712,15 +719,42 @@ impl CgroupCtrlInode {
 
                 // Resolve current cgroup from the task struct
                 let proc = process::get_process(pid).ok_or(FsError::NotFound)?;
-                let old_cgroup_id = { proc.lock().cgroup_id };
-
-                // P1-3: Delegated managers can only move tasks within their subtree.
-                if is_delegate {
-                    let old_cg = cgroup::lookup_cgroup(old_cgroup_id).ok_or(FsError::NotFound)?;
-                    if !old_cg.is_delegated_to(euid) {
-                        return Err(FsError::PermDenied);
+                let (old_cgroup_id, target_generation) = {
+                    let proc_guard = proc.lock();
+                    // RF180-45 REVIEW FIX: inherited FD charges are not owned
+                    // by the child until fork commits, so raw-PID migration
+                    // must not observe or move this unpublished state.
+                    if proc_guard.state == ProcessState::Provisioning {
+                        return Err(FsError::Busy);
                     }
-                }
+                    if matches!(
+                        proc_guard.state,
+                        ProcessState::Zombie | ProcessState::Terminated
+                    ) {
+                        return Err(FsError::NotFound);
+                    }
+                    (proc_guard.cgroup_id, proc_guard.generation)
+                };
+
+                // R180-3 CLASS FIX: shared dual-front-door migration auth.
+                // Previously only the SOURCE was checked for delegates (dest was
+                // implied by the open/write gate on this control file). That still
+                // diverged from a complete policy matrix and could not cover
+                // CAP_SYS_ADMIN descendant rules. Use the same helper as
+                // sys_cgroup_attach: host root free; CAP_SYS_ADMIN + descendant;
+                // delegated ⇒ BOTH endpoints is_delegated_to(euid).
+                cgroup::authorize_cgroup_migrate(
+                    old_cgroup_id,
+                    self.cgroup_id,
+                    Some(euid),
+                    is_root,
+                    has_cap_admin,
+                )
+                .map_err(|e| match e {
+                    CgroupError::NotFound => FsError::NotFound,
+                    CgroupError::PermissionDenied => FsError::PermDenied,
+                    _ => FsError::PermDenied,
+                })?;
 
                 // R148-5 FIX: Block migration for tasks with CLONE_VM shared
                 // address spaces. Migrating one sibling transfers ALL memory
@@ -744,6 +778,24 @@ impl CgroupCtrlInode {
                 // bug). Hold the snapshot+update under one lock as before; just acquire
                 // it one step earlier so the membership move is covered too.
                 let mut proc_guard = proc.lock();
+                // RF180-2 FIX: the Arc captured above can outlive table removal.
+                // Reject a reaped identity before calling raw-PID migrate_task;
+                // while this live PCB lock remains held, the reaper cannot take
+                // the slot and publish a successor until the migration finishes.
+                if proc_guard.generation != target_generation {
+                    return Err(FsError::NotFound);
+                }
+                // RF180-45 REVIEW FIX: repeat the state gate under the guard
+                // held across the complete membership/accounting transaction.
+                if proc_guard.state == ProcessState::Provisioning {
+                    return Err(FsError::Busy);
+                }
+                if matches!(
+                    proc_guard.state,
+                    ProcessState::Zombie | ProcessState::Terminated
+                ) {
+                    return Err(FsError::NotFound);
+                }
                 // Re-verify memory_space under the held lock — exec/clone could have
                 // changed it between the share-count check (lock-free) and here.
                 if proc_guard.memory_space != memory_space {
@@ -761,57 +813,72 @@ impl CgroupCtrlInode {
                     return Err(FsError::Busy);
                 }
 
-                // Migrate task from old cgroup to this cgroup (atomic detach+attach),
-                // now UNDER the held Process lock.
-                cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id).map_err(
-                    |e| match e {
-                        CgroupError::PidsLimitExceeded => FsError::NoSpace,
-                        CgroupError::TaskNotAttached => FsError::Invalid,
-                        CgroupError::NotFound => FsError::NotFound,
-                        _ => FsError::Invalid,
-                    },
-                )?;
-
-                // R143-1 FIX: Transfer cgroup memory charges from source to
-                // destination cgroup. Without this, exit-time uncharge targets
-                // the wrong cgroup (destination instead of source), causing
-                // permanent memory_current leak in the source and undercount
-                // in the destination. The snapshot + transfer + cgroup_id update
-                // stay under the SAME `proc_guard` acquired above.
-                let total_charged_bytes = process::compute_cgroup_charged_bytes(&proc_guard);
-
-                // J2-7: combined cgroup migration with a HOLE-FREE rollback (same
-                // protocol as the sys_cgroup_attach path). Charge the FD count to
-                // the DESTINATION first, then migrate memory (charge-dest-first),
-                // then complete the FD move by uncharging the SOURCE. Every reverse
-                // is a saturating uncharge (never fails) or the best-effort
-                // migrate_task reverse — no fallible reverse-charge can strand a
-                // charge in the destination.
-                let fd_count = proc_guard.fds_charged_count;
-                if let Err(_e) = cgroup::try_charge_fds(self.cgroup_id, fd_count) {
-                    let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
-                    drop(proc_guard);
-                    return Err(FsError::NoSpace);
-                }
-                if let Err(e) = cgroup::migrate_memory_charges(
-                    total_charged_bytes,
-                    old_cgroup_id,
+                // R180-3: authoritative source under the held lock; re-auth so a
+                // concurrent re-home cannot swap `from` after the preflight.
+                let from_id = proc_guard.cgroup_id;
+                cgroup::authorize_cgroup_migrate(
+                    from_id,
                     self.cgroup_id,
-                ) {
-                    // R157-2 FIX: Keep Process lock held during rollback.
-                    // Memory dest-charge failed → source memory untouched (R148-1);
-                    // undo the FD dest-charge (never fails) and revert the task.
-                    cgroup::uncharge_fds(self.cgroup_id, fd_count);
-                    let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
+                    Some(euid),
+                    is_root,
+                    has_cap_admin,
+                )
+                .map_err(|e| match e {
+                    CgroupError::NotFound => FsError::NotFound,
+                    CgroupError::PermissionDenied => FsError::PermDenied,
+                    _ => FsError::PermDenied,
+                })?;
+
+                if from_id == self.cgroup_id {
+                    return Ok(());
+                }
+
+                let total_charged_bytes = process::compute_cgroup_charged_bytes(&proc_guard);
+                let fd_count = proc_guard.total_fd_charge_count();
+
+                // RF180-45: precharge destination FD + memory accounting before
+                // membership publication. Failure rolls back only saturating
+                // destination uncharges; no retryable reverse migration remains.
+                // R180-23 installed FD charges and in-flight reservations move as
+                // one transaction under the held Process lock.
+                if let Err(error) = cgroup::try_charge_fds(self.cgroup_id, fd_count) {
                     drop(proc_guard);
-                    return Err(match e {
+                    return Err(match error {
+                        CgroupError::NotFound => FsError::NotFound,
+                        CgroupError::FdsLimitExceeded | CgroupError::OutOfMemory => {
+                            FsError::NoSpace
+                        }
+                        _ => FsError::Invalid,
+                    });
+                }
+                if let Err(error) = cgroup::try_charge_memory(self.cgroup_id, total_charged_bytes) {
+                    cgroup::uncharge_fds(self.cgroup_id, fd_count);
+                    drop(proc_guard);
+                    return Err(match error {
                         CgroupError::MemoryLimitExceeded => FsError::NoSpace,
+                        CgroupError::OutOfMemory => FsError::NoSpace,
                         CgroupError::NotFound => FsError::NotFound,
                         _ => FsError::Invalid,
                     });
                 }
-                // Complete the FD migration: uncharge the source (never fails).
-                cgroup::uncharge_fds(old_cgroup_id, fd_count);
+
+                if let Err(error) = cgroup::migrate_task(pid_num, from_id, self.cgroup_id) {
+                    cgroup::uncharge_memory(self.cgroup_id, total_charged_bytes);
+                    cgroup::uncharge_fds(self.cgroup_id, fd_count);
+                    drop(proc_guard);
+                    return Err(match error {
+                        CgroupError::Busy => FsError::Busy,
+                        CgroupError::PidsLimitExceeded => FsError::NoSpace,
+                        CgroupError::OutOfMemory => FsError::NoSpace,
+                        CgroupError::TaskNotAttached => FsError::Invalid,
+                        CgroupError::NotFound => FsError::NotFound,
+                        _ => FsError::Invalid,
+                    });
+                }
+
+                // Membership is committed; only now release the source copies.
+                cgroup::uncharge_memory(from_id, total_charged_bytes);
+                cgroup::uncharge_fds(from_id, fd_count);
 
                 // R170-3 FIX: this `cgroup.procs` write is the THIRD live
                 // `cgroup_id` re-point (alongside sys_cgroup_attach and exit);
@@ -1055,19 +1122,18 @@ impl Inode for CgroupCtrlInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Check write permission for read-only files
         if flags.is_writable() && self.kind.is_readonly() {
             return Err(FsError::PermDenied);
         }
 
-        let inode: Arc<dyn Inode> = Arc::new(CgroupCtrlInode {
-            fs_id: self.fs_id,
-            ino: self.ino,
-            cgroup_id: self.cgroup_id,
-            kind: self.kind,
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn is_dir(&self) -> bool {
@@ -1162,7 +1228,7 @@ fn is_privileged_or_delegate(cgroup_id: CgroupId) -> bool {
 /// the full ancestor chain), preventing privilege escalation through the
 /// delegation mechanism.
 fn apply_limit(
-    cgroup: &Arc<CgroupNode>,
+    cgroup: &CgroupArc,
     limits: &CgroupLimits,
     is_delegate: bool,
 ) -> Result<(), FsError> {
@@ -1170,6 +1236,7 @@ fn apply_limit(
         cgroup.check_limit_boundary(limits).map_err(|e| match e {
             CgroupError::PermissionDenied => FsError::PermDenied,
             CgroupError::InvalidLimit => FsError::Invalid,
+            CgroupError::OutOfMemory => FsError::NoSpace,
             _ => FsError::Invalid,
         })?;
     }
@@ -1177,6 +1244,7 @@ fn apply_limit(
         CgroupError::ControllerDisabled => FsError::Invalid,
         CgroupError::InvalidLimit => FsError::Invalid,
         CgroupError::PermissionDenied => FsError::PermDenied,
+        CgroupError::OutOfMemory => FsError::NoSpace,
         _ => FsError::Invalid,
     })
 }
@@ -1306,7 +1374,6 @@ pub fn run_cgroupfs_j2_abi_self_test() {
         fs_id: 0,
         ino: cgroup_dir_ino(cg2_id),
         cgroup_id: cg2_id,
-        name: String::new(),
     };
     let avail = dir.available_ctrl_files();
     assert!(
