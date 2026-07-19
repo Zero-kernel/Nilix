@@ -132,6 +132,10 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                     subsystem_id
                 );
 
+                // R180-17 (iteration-2): clear firmware BME before attach; enable
+                // only after successful domain attachment (below).
+                disable_bus_master_bdf(bus, dev, func);
+
                 // Attach device to IOMMU before enabling bus mastering (fail-closed)
                 // R94-14 FIX: Handle NotAvailable explicitly - proceed with warning
                 // for legacy systems without IOMMU, but fail on other errors.
@@ -150,6 +154,7 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                                 dev,
                                 func
                             );
+                            // BME already cleared above.
                             continue;
                         }
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
@@ -172,6 +177,7 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                             func,
                             err
                         );
+                        // BME already cleared above.
                         continue;
                     }
                 }
@@ -206,7 +212,7 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                     // R82-1 FIX: Disable bus mastering if device lacks modern caps
                     // to prevent orphaned DMA-capable device
                     // R165-20 FIX: atomic RMW (see pci_update16).
-                    pci_update16(bus, dev, func, PCI_COMMAND, |cmd| cmd & !0x04);
+                    disable_bus_master_bdf(bus, dev, func);
                     klog!(Info,
                         "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         bus,
@@ -393,8 +399,10 @@ fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
 /// stale-value `pci_write16`, which invited that footgun).
 ///
 /// `f` receives the current 16-bit value and returns the new value to store.
+/// The returned value is a readback captured before the PCI-config lock is
+/// released, allowing callers to verify security-sensitive command changes.
 #[inline]
-fn pci_update16(bus: u8, dev: u8, func: u8, offset: u8, f: impl FnOnce(u16) -> u16) {
+fn pci_update16(bus: u8, dev: u8, func: u8, offset: u8, f: impl FnOnce(u16) -> u16) -> u16 {
     let _guard = PCI_CONFIG_LOCK.lock();
     let aligned = offset & 0xFC;
     let shift = ((offset & 2) * 8) as u32;
@@ -413,6 +421,12 @@ fn pci_update16(bus: u8, dev: u8, func: u8, offset: u8, f: impl FnOnce(u16) -> u
         outl(PCI_CONFIG_ADDRESS, address);
         outl(PCI_CONFIG_DATA, dword);
     }
+
+    // Keep verification within the same lock acquisition as the RMW. This is
+    // especially important for fail-closed BME clears: another CF8/CFC user
+    // cannot interleave between the write and its readback.
+    let verify = raw_pci_read32(bus, dev, func, aligned);
+    ((verify >> shift) & 0xFFFF) as u16
 }
 
 #[inline]
@@ -432,8 +446,22 @@ unsafe fn inl(port: u16) -> u32 {
 /// This should be called when a device fails to initialize properly after
 /// bus mastering was enabled, to prevent orphaned DMA-capable devices.
 pub fn disable_bus_master(slot: &PciSlot) {
-    // R165-20 FIX: atomic RMW (see pci_update16).
-    pci_update16(slot.bus, slot.device, slot.function, PCI_COMMAND, |cmd| {
-        cmd & !0x04
-    });
+    disable_bus_master_bdf(slot.bus, slot.device, slot.function);
+}
+
+/// R180-17: clear BME by BDF (probe/refusal path before a PciSlot exists).
+fn disable_bus_master_bdf(bus: u8, device: u8, function: u8) {
+    let verify = pci_update16(bus, device, function, PCI_COMMAND, |cmd| cmd & !0x04);
+    if verify & 0x04 != 0 {
+        klog_force!(
+            "    ! R180-17: BME still set after clear for {:02x}:{:02x}.{}",
+            bus,
+            device,
+            function
+        );
+        panic!(
+            "R180-17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{}",
+            bus, device, function
+        );
+    }
 }
