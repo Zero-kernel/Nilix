@@ -36,7 +36,7 @@
 //!
 //! - **Audit logging**: All faults are logged with device ID, domain, address
 //! - **Device isolation**: Option to disable bus mastering on faulting device
-//! - **Bounded processing**: Maximum 16 fault records per handler invocation
+//! - **Bounded processing**: Complete CAP.NFR scan, bounded to 256 records
 //! - **Fail-closed**: Faults default to audit + warn, optionally isolate
 //!
 //! # References
@@ -44,19 +44,24 @@
 //! - Intel VT-d Specification, Chapter 7 (Fault Logging)
 //! - Intel VT-d Specification, Section 10.4.7 (Fault Recording Registers)
 
-use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{fence, Ordering};
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Maximum number of fault records to read per handler invocation.
-/// This bounds processing time and prevents DoS from fault floods.
-pub const MAX_FAULT_RECORDS: usize = 16;
+/// Architectural maximum number of primary fault-recording registers.
+/// CAP.NFR is an eight-bit zero-based count, so a complete bounded scan is at
+/// most 256 entries. Scanning the complete hardware-owned set avoids clearing
+/// PPF while an unvisited record still contains the sole durable source ID.
+pub const MAX_FAULT_RECORDS: usize = 256;
 
 /// Fault Recording entry size (128 bits = 16 bytes).
 const FRCD_ENTRY_SIZE: usize = 16;
+
+/// Fault-record valid / W1C bit in the high 64-bit word.
+const FRCD_FAULT_VALID: u64 = 1 << 63;
 
 /// Fault Status Register - Primary Fault Overflow (PFO) bit.
 const FSTS_PFO: u32 = 1 << 0;
@@ -191,6 +196,32 @@ pub struct FaultRecord {
 }
 
 impl FaultRecord {
+    /// Decode one architecturally valid FRCD entry. The caller must retain the
+    /// raw words until any required durable publication is complete; clearing
+    /// the hardware F bit before publication loses the only source identity.
+    pub fn from_raw(lo: u64, hi: u64) -> Option<Self> {
+        if hi & FRCD_FAULT_VALID == 0 {
+            return None;
+        }
+        let source_id = (hi & 0xFFFF) as u16;
+        let is_execute = (hi >> 23) & 1 != 0;
+        let pasid_present = (hi >> 24) & 1 != 0;
+        let fault_type_bits = ((hi >> 28) & 0x3) | (((hi >> 21) & 1) << 2);
+        let pasid = ((hi >> 32) & 0xFFFFF) as u32;
+        let fault_reason = FaultReason::from_code(((hi >> 52) & 0xFF) as u8);
+        Some(Self {
+            source_id,
+            domain_id: 0,
+            fault_reason,
+            fault_address: lo & !0xFFF,
+            fault_type: FaultType::from_code(fault_type_bits as u8),
+            is_write: matches!(fault_reason, FaultReason::WriteToReadOnly),
+            is_execute,
+            pasid_present,
+            pasid,
+        })
+    }
+
     /// Get the PCI bus number from source ID.
     #[inline]
     pub fn bus(&self) -> u8 {
@@ -241,6 +272,198 @@ fn hex_char(n: u8) -> u8 {
 // Fault Handler Implementation
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FaultCaptureSummary {
+    pub captured: usize,
+    pub overflow: bool,
+    pub incomplete: bool,
+}
+
+/// Backend seam used by the IRQ capture path and deterministic hosted tests.
+/// Implementations must preserve program order for MMIO reads/W1C writes.
+pub(crate) trait FaultRegisterBackend {
+    fn read_status(&mut self) -> u32;
+    /// Return one stable record snapshot. MMIO implementations must inspect the
+    /// high word first: hardware publishes the F bit last and retains the entry
+    /// until software clears it, so reading the low word first can pair stale
+    /// address bits with a newly-arrived high word.
+    fn read_record(&mut self, index: usize) -> Option<(u64, u64)>;
+    fn clear_record(&mut self, index: usize);
+    fn clear_status(&mut self, mask: u32);
+    fn mask_interrupts(&mut self);
+}
+
+struct MmioFaultBackend {
+    reg_base: u64,
+    fault_offset: usize,
+}
+
+impl MmioFaultBackend {
+    fn record_base(&self, index: usize) -> Option<u64> {
+        self.reg_base
+            .checked_add(self.fault_offset as u64)
+            .and_then(|base| {
+                index
+                    .checked_mul(FRCD_ENTRY_SIZE)
+                    .and_then(|offset| base.checked_add(offset as u64))
+            })
+    }
+}
+
+impl FaultRegisterBackend for MmioFaultBackend {
+    fn read_status(&mut self) -> u32 {
+        unsafe { read_volatile((self.reg_base + 0x34) as *const u32) }
+    }
+
+    fn read_record(&mut self, index: usize) -> Option<(u64, u64)> {
+        let base = self.record_base(index)?;
+        let hi = unsafe { read_volatile((base + 8) as *const u64) };
+        if hi & FRCD_FAULT_VALID == 0 {
+            return Some((0, hi));
+        }
+
+        // Once F is observed, hardware owns an immutable record until the W1C.
+        // Re-reading the high word rejects a malformed/torn aperture rather
+        // than acknowledging a source ID paired with the wrong address.
+        let lo = unsafe { read_volatile(base as *const u64) };
+        let verify_hi = unsafe { read_volatile((base + 8) as *const u64) };
+        if verify_hi != hi {
+            return None;
+        }
+        Some((lo, hi))
+    }
+
+    fn clear_record(&mut self, index: usize) {
+        if let Some(base) = self.record_base(index) {
+            unsafe { write_volatile((base + 8) as *mut u64, FRCD_FAULT_VALID) };
+        }
+    }
+
+    fn clear_status(&mut self, mask: u32) {
+        if mask != 0 {
+            unsafe { write_volatile((self.reg_base + 0x34) as *mut u32, mask) };
+        }
+    }
+
+    fn mask_interrupts(&mut self) {
+        unsafe { set_fault_interrupt_enabled(self.reg_base, false) };
+    }
+}
+
+/// Capture bounded FRCD state without allocation or locks. Every accepted
+/// source/detail publication happens before the corresponding FRCD F-bit W1C,
+/// and FSTS is acknowledged only after all records selected by this pass have
+/// either been durably published or the unit has been interrupt-masked.
+pub(crate) fn capture_fault_records_with_backend<B, P, O>(
+    backend: &mut B,
+    num_fault_regs: usize,
+    mut publish: P,
+    mut publish_overflow: O,
+) -> FaultCaptureSummary
+where
+    B: FaultRegisterBackend,
+    P: FnMut(FaultRecord, u64, u64) -> bool,
+    O: FnMut(),
+{
+    let status = backend.read_status();
+    let status_overflow = status & FSTS_PFO != 0;
+    let pending = status & FSTS_PPF != 0;
+    if !status_overflow && !pending {
+        return FaultCaptureSummary::default();
+    }
+    if num_fault_regs == 0 {
+        publish_overflow();
+        backend.mask_interrupts();
+        return FaultCaptureSummary {
+            captured: 0,
+            overflow: true,
+            incomplete: true,
+        };
+    }
+
+    let mut summary = FaultCaptureSummary {
+        captured: 0,
+        overflow: status_overflow || num_fault_regs > MAX_FAULT_RECORDS,
+        incomplete: num_fault_regs > MAX_FAULT_RECORDS,
+    };
+    let mut interrupts_masked = false;
+    // Publish the sticky software quarantine before any record/status W1C.
+    // A PFO means source identities have already been lost in hardware.
+    if summary.overflow {
+        publish_overflow();
+        // Make the software quarantine globally visible before suppressing the
+        // hardware interrupt/status evidence.
+        fence(Ordering::SeqCst);
+        backend.mask_interrupts();
+        interrupts_masked = true;
+    }
+    let mut index = ((status & FSTS_FRI_MASK) >> FSTS_FRI_SHIFT) as usize % num_fault_regs;
+    let scan_count = num_fault_regs.min(MAX_FAULT_RECORDS);
+    for _ in 0..scan_count {
+        let Some((lo, hi)) = backend.read_record(index) else {
+            summary.overflow = true;
+            summary.incomplete = true;
+            publish_overflow();
+            break;
+        };
+        if let Some(record) = FaultRecord::from_raw(lo, hi) {
+            if !publish(record, lo, hi) {
+                summary.overflow = true;
+                summary.incomplete = true;
+                publish_overflow();
+                break;
+            }
+            // Publication is Release-ordered by the pending queue. Only now is
+            // it safe to destroy the sole hardware copy of SID/details.
+            fence(Ordering::SeqCst);
+            backend.clear_record(index);
+            summary.captured += 1;
+        }
+        index = (index + 1) % num_fault_regs;
+    }
+
+    if (summary.overflow || summary.incomplete) && !interrupts_masked {
+        publish_overflow();
+        fence(Ordering::SeqCst);
+        backend.mask_interrupts();
+    }
+
+    // PPF and FRI are read-only, derived from the FRCD array; clearing each F
+    // bit above retires them. PFO is the only writable primary-fault status bit
+    // and may be acknowledged only after sticky software overflow publication.
+    let clear_mask = status & FSTS_PFO;
+    if clear_mask != 0 {
+        // Pair the queue's Release publications with a full store/MMIO barrier
+        // before any FSTS W1C can erase the hardware-side evidence.
+        fence(Ordering::SeqCst);
+        backend.clear_status(clear_mask);
+    }
+    summary
+}
+
+/// MMIO entry for [`capture_fault_records_with_backend`].
+///
+/// # Safety
+/// `reg_base`, `fault_offset`, and the CAP-derived register count must describe
+/// one mapped VT-d register aperture that remains valid for the call.
+pub(crate) unsafe fn capture_fault_records_mmio<P, O>(
+    reg_base: u64,
+    fault_offset: usize,
+    num_fault_regs: usize,
+    publish: P,
+    publish_overflow: O,
+) -> FaultCaptureSummary
+where
+    P: FnMut(FaultRecord, u64, u64) -> bool,
+    O: FnMut(),
+{
+    let mut backend = MmioFaultBackend {
+        reg_base,
+        fault_offset,
+    };
+    capture_fault_records_with_backend(&mut backend, num_fault_regs, publish, publish_overflow)
+}
+
 /// Fault handler configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct FaultConfig {
@@ -262,165 +485,6 @@ impl Default for FaultConfig {
     }
 }
 
-/// Read fault records from VT-d hardware.
-///
-/// # Arguments
-///
-/// * `reg_base` - VT-d register base address
-/// * `fault_offset` - Offset to fault recording registers (from CAP.FRO)
-/// * `num_fault_regs` - Number of fault recording registers (from CAP.NFR)
-/// * `start_index` - Starting index from FRI (Fault Record Index)
-///
-/// # Returns
-///
-/// Vector of parsed fault records (bounded to MAX_FAULT_RECORDS).
-///
-/// # Safety
-///
-/// Caller must ensure `reg_base` and `fault_offset` are valid MMIO addresses.
-///
-/// # Security
-///
-/// R85-1 FIX: Use FRI-based rotation to avoid silently losing faults beyond index 15.
-/// R85-2 FIX: Use checked arithmetic to avoid MMIO pointer wrapping on malformed DMAR.
-pub unsafe fn read_fault_records(
-    reg_base: u64,
-    fault_offset: usize,
-    num_fault_regs: usize,
-    start_index: usize,
-) -> Vec<FaultRecord> {
-    // R85-2: Validate inputs to prevent wraparound attacks from malformed DMAR
-    if num_fault_regs == 0 {
-        return Vec::new();
-    }
-
-    let mut records = Vec::new();
-    let max_records = num_fault_regs.min(MAX_FAULT_RECORDS);
-
-    // R85-1: Start from FRI and wrap around the fault record ring buffer
-    let mut idx = start_index % num_fault_regs;
-
-    for _ in 0..max_records {
-        // R85-2: Use checked arithmetic to avoid MMIO pointer wrapping
-        let entry_base = match reg_base
-            .checked_add(fault_offset as u64)
-            .and_then(|base| base.checked_add((idx * FRCD_ENTRY_SIZE) as u64))
-        {
-            Some(addr) => addr,
-            None => {
-                // Overflow detected - likely malformed DMAR table
-                break;
-            }
-        };
-
-        // Read 128-bit fault record (two 64-bit reads)
-        let lo = read_volatile(entry_base as *const u64);
-        let hi = read_volatile((entry_base + 8) as *const u64);
-
-        // Check F (Fault) bit - bit 127 of the record (bit 63 of hi)
-        if hi & (1 << 63) == 0 {
-            // Advance to next entry even if this one has no fault
-            idx = (idx + 1) % num_fault_regs;
-            continue;
-        }
-
-        // Parse fault record fields per VT-d spec section 10.4.7
-        //
-        // Low 64 bits:
-        //   [11:0]  - Reserved
-        //   [63:12] - Fault Info (FI) - page-aligned fault address
-        //
-        // High 64 bits:
-        //   [15:0]  - Source ID (SID)
-        //   [20:16] - Reserved
-        //   [21]    - T2 (Type bit 2)
-        //   [22]    - PRIV
-        //   [23]    - EXE
-        //   [24]    - PP (PASID Present)
-        //   [27:25] - Reserved
-        //   [29:28] - T1:T0 (Type bits 1:0)
-        //   [31:30] - AT (Address Type)
-        //   [51:32] - PASID
-        //   [59:52] - FR (Fault Reason)
-        //   [62:60] - Reserved
-        //   [63]    - F (Fault) - already checked above
-
-        let fault_address = lo & !0xFFF; // Page-aligned
-        let source_id = (hi & 0xFFFF) as u16;
-        let is_execute = (hi >> 23) & 1 != 0;
-        let pasid_present = (hi >> 24) & 1 != 0;
-        let fault_type_bits = ((hi >> 28) & 0x3) | (((hi >> 21) & 1) << 2);
-        let pasid = ((hi >> 32) & 0xFFFFF) as u32;
-        let fault_reason_code = ((hi >> 52) & 0xFF) as u8;
-
-        // Domain ID is derived from context entry, not directly in fault record
-        // For now, set to 0 and let caller look up from attached_devices
-        let domain_id = 0u16;
-
-        // Determine if write based on fault reason
-        let is_write = matches!(
-            FaultReason::from_code(fault_reason_code),
-            FaultReason::WriteToReadOnly
-        );
-
-        records.push(FaultRecord {
-            source_id,
-            domain_id,
-            fault_reason: FaultReason::from_code(fault_reason_code),
-            fault_address,
-            fault_type: FaultType::from_code(fault_type_bits as u8),
-            is_write,
-            is_execute,
-            pasid_present,
-            pasid,
-        });
-
-        // Clear the fault by writing 1 to F bit (W1C)
-        write_volatile((entry_base + 8) as *mut u64, 1 << 63);
-
-        // Advance to next entry (circular buffer)
-        idx = (idx + 1) % num_fault_regs;
-    }
-
-    records
-}
-
-/// Read and clear fault status register.
-///
-/// # Arguments
-///
-/// * `reg_base` - VT-d register base address
-///
-/// # Returns
-///
-/// Tuple of (overflow_occurred, pending_fault, fault_record_index)
-///
-/// # Safety
-///
-/// Caller must ensure `reg_base` is a valid MMIO address.
-///
-/// # Security
-///
-/// R85-3 FIX: Clear FRI bits along with PFO/PPF to prevent stale index retriggering.
-pub unsafe fn read_and_clear_fault_status(reg_base: u64) -> (bool, bool, u8) {
-    const VTD_REG_FSTS: usize = 0x34;
-
-    let status = read_volatile((reg_base + VTD_REG_FSTS as u64) as *const u32);
-
-    let overflow = status & FSTS_PFO != 0;
-    let pending = status & FSTS_PPF != 0;
-    let fri = ((status & FSTS_FRI_MASK) >> FSTS_FRI_SHIFT) as u8;
-
-    // R85-3: Clear all W1C status bits including FRI to prevent stale indices
-    // from retriggering interrupts or masking new faults
-    let clear_mask = status & (FSTS_PFO | FSTS_PPF | FSTS_FRI_MASK);
-    if clear_mask != 0 {
-        write_volatile((reg_base + VTD_REG_FSTS as u64) as *mut u32, clear_mask);
-    }
-
-    (overflow, pending, fri)
-}
-
 /// Enable or disable fault event interrupts.
 ///
 /// # Arguments
@@ -431,7 +495,7 @@ pub unsafe fn read_and_clear_fault_status(reg_base: u64) -> (bool, bool, u8) {
 /// # Safety
 ///
 /// Caller must ensure `reg_base` is a valid MMIO address.
-pub unsafe fn set_fault_interrupt_enabled(reg_base: u64, enable: bool) {
+pub(crate) unsafe fn set_fault_interrupt_enabled(reg_base: u64, enable: bool) {
     const VTD_REG_FECTL: usize = 0x38;
 
     let mut ctl = read_volatile((reg_base + VTD_REG_FECTL as u64) as *const u32);
@@ -492,6 +556,53 @@ pub fn log_fault_to_audit(_record: &FaultRecord, _unit_index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
+    use alloc::vec;
+    use core::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Event {
+        Published(u16),
+        OverflowPublished,
+        RecordCleared(usize),
+        InterruptMasked,
+        StatusCleared(u32),
+    }
+
+    struct FakeBackend {
+        status: u32,
+        records: alloc::vec::Vec<(u64, u64)>,
+        events: Rc<RefCell<alloc::vec::Vec<Event>>>,
+    }
+
+    impl FaultRegisterBackend for FakeBackend {
+        fn read_status(&mut self) -> u32 {
+            self.status
+        }
+
+        fn read_record(&mut self, index: usize) -> Option<(u64, u64)> {
+            self.records.get(index).copied()
+        }
+
+        fn clear_record(&mut self, index: usize) {
+            self.events.borrow_mut().push(Event::RecordCleared(index));
+        }
+
+        fn clear_status(&mut self, mask: u32) {
+            self.events.borrow_mut().push(Event::StatusCleared(mask));
+        }
+
+        fn mask_interrupts(&mut self) {
+            self.events.borrow_mut().push(Event::InterruptMasked);
+        }
+    }
+
+    fn raw_fault(source_id: u16) -> (u64, u64) {
+        (
+            0x1234_5000,
+            (1u64 << 63) | u64::from(source_id) | (5u64 << 52),
+        )
+    }
 
     #[test]
     fn test_fault_reason_decode() {
@@ -530,5 +641,114 @@ mod tests {
         assert!(FaultReason::WriteToReadOnly.is_security_relevant());
         assert!(FaultReason::AddressBeyondMgaw.is_security_relevant());
         assert!(!FaultReason::RootEntryNotPresent.is_security_relevant());
+    }
+
+    #[test]
+    fn rf180_fault_publication_precedes_record_w1c() {
+        let events = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+        let mut backend = FakeBackend {
+            status: FSTS_PPF,
+            records: vec![raw_fault(0x1234)],
+            events: Rc::clone(&events),
+        };
+        let publish_events = Rc::clone(&events);
+        let overflow_events = Rc::clone(&events);
+        let summary = capture_fault_records_with_backend(
+            &mut backend,
+            1,
+            move |record, _, _| {
+                publish_events
+                    .borrow_mut()
+                    .push(Event::Published(record.source_id));
+                true
+            },
+            move || {
+                overflow_events.borrow_mut().push(Event::OverflowPublished);
+            },
+        );
+        assert_eq!(summary.captured, 1);
+        let events = events.borrow();
+        let published = events
+            .iter()
+            .position(|event| *event == Event::Published(0x1234))
+            .expect("publication event");
+        let cleared = events
+            .iter()
+            .position(|event| *event == Event::RecordCleared(0))
+            .expect("record W1C event");
+        assert!(published < cleared);
+    }
+
+    #[test]
+    fn rf180_overflow_is_published_and_masked_before_status_w1c() {
+        let events = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+        let mut backend = FakeBackend {
+            status: FSTS_PFO | FSTS_PPF,
+            records: vec![raw_fault(7)],
+            events: Rc::clone(&events),
+        };
+        let overflow_events = Rc::clone(&events);
+        let summary = capture_fault_records_with_backend(
+            &mut backend,
+            1,
+            |_, _, _| true,
+            move || {
+                overflow_events.borrow_mut().push(Event::OverflowPublished);
+            },
+        );
+        assert!(summary.overflow);
+        let events = events.borrow();
+        let published = events
+            .iter()
+            .position(|event| *event == Event::OverflowPublished)
+            .expect("overflow publication");
+        let masked = events
+            .iter()
+            .position(|event| *event == Event::InterruptMasked)
+            .expect("interrupt mask");
+        let status_cleared = events
+            .iter()
+            .position(|event| matches!(event, Event::StatusCleared(_)))
+            .expect("status W1C");
+        assert!(published < masked);
+        assert!(masked < status_cleared);
+    }
+
+    #[test]
+    fn rf180_rejected_publication_retains_frcd_and_masks_capture() {
+        let events = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+        let mut backend = FakeBackend {
+            status: FSTS_PPF,
+            records: vec![raw_fault(0x55aa)],
+            events: Rc::clone(&events),
+        };
+        let overflow_events = Rc::clone(&events);
+        let summary = capture_fault_records_with_backend(
+            &mut backend,
+            1,
+            |_, _, _| false,
+            move || {
+                overflow_events.borrow_mut().push(Event::OverflowPublished);
+            },
+        );
+        assert!(summary.overflow);
+        assert!(summary.incomplete);
+        assert_eq!(summary.captured, 0);
+
+        let events = events.borrow();
+        assert!(events.contains(&Event::OverflowPublished));
+        assert!(events.contains(&Event::InterruptMasked));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::RecordCleared(_))),
+            "failed publication must retain the sole hardware record"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::StatusCleared(_))),
+            "PPF/FRI evidence must survive an incomplete scan"
+        );
     }
 }
