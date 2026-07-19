@@ -162,8 +162,14 @@ pub enum TxError {
     QueueFull,
     /// Device link is down or TX queue is stopped.
     LinkDown,
+    /// The egress firewall rejected the packet before device publication.
+    FirewallDenied,
     /// Buffer is invalid (too large, misaligned, etc.).
     InvalidBuffer,
+    /// Ordinary heap/admission failed while preparing the packet owner.
+    NoMemory,
+    /// DMA/network buffer ownership could not be obtained.
+    NoBuffers,
     /// Device encountered an I/O or bus error.
     IoError,
 }

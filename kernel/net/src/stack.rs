@@ -36,7 +36,6 @@
 //! - Source routing is rejected
 //! - Broadcast/multicast sources are rejected
 
-use alloc::vec::Vec;
 use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
@@ -45,7 +44,8 @@ use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpSt
 use crate::buffer::NetBuf;
 use crate::device::TxError;
 use crate::ethernet::{
-    build_ethernet_frame, parse_ethernet, EthAddr, EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
+    build_ethernet_frame_from_parts, parse_ethernet, try_build_ethernet_frame_from_parts, EthAddr,
+    EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
 use crate::firewall::{firewall_table_for_ns, FirewallAction, FirewallPacket, FirewallVerdict};
 use crate::fragment::{
@@ -53,19 +53,20 @@ use crate::fragment::{
 };
 use crate::get_device;
 use crate::icmp::{
-    build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE,
-    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST,
+    build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER,
+    ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
     IPV4_HEADER_MIN_LEN,
 };
-use crate::socket::socket_table;
+use crate::socket::{socket_table, TcpConnectResult, TcpReplyBinding};
 use crate::tcp::{
     build_tcp_segment, parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError,
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
+    TcpHeader, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
 };
-use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
+use crate::udp::{parse_udp, parse_udp_header, UdpError, UdpHeader, UdpStats, UDP_HEADER_LEN};
+use crate::WirePacket;
 use crate::DEFAULT_MTU;
 use cap::NamespaceId;
 use mm::dma::{alloc_dma_buffer, DMA_PAGE_SIZE};
@@ -185,13 +186,129 @@ impl NetStats {
 // Packet Processing Result
 // ============================================================================
 
+/// A complete ingress-generated frame whose policy decision and conntrack
+/// publication remain bound to the eventual device-queue operation.
+///
+/// The type is intentionally non-cloneable and does not expose its owned
+/// `WirePacket`. Callers may inspect the bytes, but must consume the owner with
+/// [`transmit_prepared_reply`] to obtain the queue/conntrack transaction.
+pub struct PreparedReply {
+    frame: WirePacket,
+    tx_context: Option<u64>,
+    tcp_binding: Option<TcpReplyBinding>,
+    stat: PreparedReplyStat,
+    reject_count: u8,
+    retry_not_before_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedReplyStat {
+    None,
+    ArpReply,
+    IcmpEcho,
+}
+
+impl PreparedReply {
+    fn new(frame: WirePacket) -> Self {
+        Self {
+            frame,
+            tx_context: None,
+            tcp_binding: None,
+            stat: PreparedReplyStat::None,
+            reject_count: 0,
+            retry_not_before_ms: 0,
+        }
+    }
+
+    fn bind_tcp(&mut self, binding: Option<TcpReplyBinding>) {
+        self.tcp_binding = binding;
+    }
+
+    fn with_stat(mut self, stat: PreparedReplyStat) -> Self {
+        self.stat = stat;
+        self
+    }
+
+    fn commit_stat(&self, stats: &NetStats) {
+        match self.stat {
+            PreparedReplyStat::None => {}
+            PreparedReplyStat::ArpReply => stats.arp_stats.inc_tx_replies(),
+            PreparedReplyStat::IcmpEcho => stats.inc_icmp_echo_tx(),
+        }
+    }
+
+    fn note_queue_rejection(&mut self, now_ms: u64) {
+        const BASE_MS: u64 = 10;
+        const MAX_MS: u64 = 1_000;
+        self.reject_count = self.reject_count.saturating_add(1);
+        let shift = self.reject_count.saturating_sub(1).min(7) as u32;
+        let delay = BASE_MS.checked_shl(shift).unwrap_or(MAX_MS).min(MAX_MS);
+        self.retry_not_before_ms = now_ms.saturating_add(delay);
+    }
+
+    fn authorize(&mut self, net_ns_id: u64, _now_ms: u64) {
+        self.tx_context = Some(net_ns_id);
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        self.frame.as_slice()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.frame.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.frame.is_empty()
+    }
+}
+
+impl core::ops::Deref for PreparedReply {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for PreparedReply {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl core::fmt::Debug for PreparedReply {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedReply")
+            .field("frame", &self.frame)
+            .field("authorized", &self.tx_context.is_some())
+            .field("tcp_binding", &self.tcp_binding)
+            .field("stat", &self.stat)
+            .field("reject_count", &self.reject_count)
+            .field("retry_not_before_ms", &self.retry_not_before_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum PreparedReplyTxError {
+    /// Nothing reached the device; the exact admitted owner remains retryable.
+    Retryable(TxError, PreparedReply),
+    /// The device accepted the packet (or the transaction invariant was lost),
+    /// so returning the owner would permit an unsafe duplicate transmission.
+    Consumed(TxError),
+}
+
 /// Result of processing an incoming packet
 #[derive(Debug)]
 pub enum ProcessResult {
     /// Packet was handled, no response needed
     Handled,
     /// Packet requires a response to be sent
-    Reply(Vec<u8>),
+    Reply(PreparedReply),
     /// Packet was dropped with reason
     Dropped(DropReason),
 }
@@ -221,6 +338,8 @@ pub enum DropReason {
     RateLimited,
     /// RF178-7 FIX: Conntrack metadata admission failed.
     ConntrackExhausted,
+    /// A socket-accepted handshake could not finalize its exact conntrack flow.
+    ConntrackInvalid,
     /// Dropped by firewall
     Firewall {
         rule_id: Option<u32>,
@@ -256,20 +375,6 @@ pub enum DropReason {
 /// * `net_ns_id` - Network namespace of the receiving device
 /// * `now_ms` - Current time in milliseconds (for rate limiting)
 ///
-// R164-6 FIX: Fallible concatenation of two byte slices into a Vec.
-// Returns empty Vec on OOM so callers can drop the frame gracefully.
-#[inline]
-fn try_concat_slices(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let total = a.len() + b.len();
-    let mut v = Vec::new();
-    if v.try_reserve_exact(total).is_err() {
-        return v;
-    }
-    v.extend_from_slice(a);
-    v.extend_from_slice(b);
-    v
-}
-
 /// # Returns
 /// `ProcessResult` indicating what action to take
 pub fn process_frame(
@@ -300,7 +405,7 @@ pub fn process_frame(
     }
 
     // Route to protocol handler
-    let result = match eth_hdr.ethertype {
+    let mut result = match eth_hdr.ethertype {
         ETHERTYPE_IPV4 => {
             // R90-2 FIX: Pass network namespace to IPv4 handler
             process_ipv4(
@@ -324,7 +429,9 @@ pub fn process_frame(
                 now_ms,
             ) {
                 ArpResult::Handled => ProcessResult::Handled,
-                ArpResult::Reply(frame) => ProcessResult::Reply(frame),
+                ArpResult::Reply(frame) => ProcessResult::Reply(
+                    PreparedReply::new(frame).with_stat(PreparedReplyStat::ArpReply),
+                ),
                 ArpResult::Dropped(e) => ProcessResult::Dropped(DropReason::ArpError(e)),
             }
         }
@@ -339,62 +446,122 @@ pub fn process_frame(
     // egress firewall added in R161-7. Intercept every Reply here and apply the egress
     // firewall before allowing the frame to leave. Frames that fail the egress check are
     // silently dropped so the caller sees Dropped(Firewall) instead of Reply.
-    if let ProcessResult::Reply(ref reply_frame) = result {
-        if !egress_firewall_allows_reply(reply_frame, net_ns_id.0, now_ms) {
+    if let ProcessResult::Reply(ref mut reply_frame) = result {
+        if !matches!(
+            egress_firewall_allows_reply(reply_frame, net_ns_id.0, now_ms),
+            EgressFirewallDecision::Allow
+        ) {
             return ProcessResult::Dropped(DropReason::Firewall {
                 rule_id: None,
                 rejected: false,
             });
         }
+        // RF180-41 REVIEW FIX: policy acceptance authorizes preparation only.
+        // Conntrack and socket-visible completion remain deferred until the
+        // caller successfully queues this non-cloneable reply owner.
+        reply_frame.authorize(net_ns_id.0, now_ms);
     }
     result
+}
+
+/// Structurally validated transport metadata used by both direct egress and
+/// prepared-reply policy evaluation.
+///
+/// RF180-51 FIX: firewall classification must never run on raw port bytes from
+/// a malformed TCP/UDP packet. Keeping the parsed header here also prevents the
+/// transmit path from validating one representation and committing another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidatedTransport {
+    Tcp(TcpHeader),
+    Udp(UdpHeader),
+    Other,
+}
+
+impl ValidatedTransport {
+    #[inline]
+    fn ports(self) -> (Option<u16>, Option<u16>) {
+        match self {
+            Self::Tcp(header) => (Some(header.src_port), Some(header.dst_port)),
+            Self::Udp(header) => (Some(header.src_port), Some(header.dst_port)),
+            Self::Other => (None, None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportValidationError {
+    Tcp(TcpError),
+    Udp(UdpError),
+}
+
+fn validate_transport_payload(
+    proto: Ipv4Proto,
+    payload: &[u8],
+) -> Result<ValidatedTransport, TransportValidationError> {
+    match proto {
+        Ipv4Proto::Tcp => parse_tcp_header(payload)
+            .map(ValidatedTransport::Tcp)
+            .map_err(TransportValidationError::Tcp),
+        Ipv4Proto::Udp => {
+            let header = parse_udp_header(payload).map_err(TransportValidationError::Udp)?;
+            if header.length as usize != payload.len() {
+                return Err(TransportValidationError::Udp(UdpError::LengthMismatch));
+            }
+            Ok(ValidatedTransport::Udp(header))
+        }
+        _ => Ok(ValidatedTransport::Other),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressFirewallDecision {
+    Allow,
+    Deny,
+    Malformed,
 }
 
 /// R163-7 FIX: Evaluate an outbound reply frame against the egress firewall.
 ///
 /// Parses the complete Ethernet+IPv4 frame, extracts protocol/port information,
 /// and evaluates the egress firewall rules for the given namespace. Returns
-/// `true` if the frame is allowed (ACCEPT verdict), `false` if it should be
-/// dropped (DROP or REJECT verdict).
+/// Returns a typed decision so prepared-reply callers can distinguish a
+/// malformed generated frame from a valid frame denied by policy.
 ///
 /// ARP frames (non-IPv4) are always allowed because ARP has no IP-level firewall
-/// semantics. Frames that cannot be parsed default to allow (fail-open) so that
-/// a malformed reply frame still reaches the caller rather than being silently
-/// dropped — the caller can then handle the parse error itself.
+/// semantics. Malformed kernel-generated frames fail closed.
 #[cfg(feature = "conntrack")]
-fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bool {
+fn egress_firewall_allows_reply(
+    frame: &[u8],
+    net_ns_id: u64,
+    now_ms: u64,
+) -> EgressFirewallDecision {
     use crate::conntrack::{conntrack_table, FlowKey};
 
     // Parse Ethernet header; non-IPv4 frames (ARP, etc.) are passed through.
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
         Ok(r) => r,
-        Err(_) => return true,
+        Err(_) => return EgressFirewallDecision::Malformed,
     };
     if eth_hdr.ethertype != ETHERTYPE_IPV4 {
-        return true;
+        return EgressFirewallDecision::Allow;
     }
 
     // Parse IPv4 header.
     let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
         Ok(r) => r,
-        Err(_) => return true,
+        Err(_) => return EgressFirewallDecision::Malformed,
     };
 
     let proto = match ip_hdr.proto() {
         Some(p) => p,
-        None => return true,
+        None => return EgressFirewallDecision::Malformed,
     };
 
-    // Extract transport-layer ports for TCP/UDP.
-    let (src_port, dst_port) =
-        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && l4_bytes.len() >= 4 {
-            (
-                Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
-                Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
-            )
-        } else {
-            (None, None)
-        };
+    let transport = match validate_transport_payload(proto, l4_bytes) {
+        Ok(transport) => transport,
+        Err(_) => return EgressFirewallDecision::Malformed,
+    };
+    let (src_port, dst_port) = transport.ports();
 
     // R165-7 FIX: This hook only evaluates kernel-generated reply frames
     // (ProcessResult::Reply — ICMP echo replies, TCP RSTs, REJECT responses),
@@ -436,7 +603,11 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
     let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
     crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
 
-    matches!(fw_verdict.action, FirewallAction::Accept)
+    if matches!(fw_verdict.action, FirewallAction::Accept) {
+        EgressFirewallDecision::Allow
+    } else {
+        EgressFirewallDecision::Deny
+    }
 }
 
 /// R165-6 FIX: Evaluate STATELESS egress rules on reply frames in non-conntrack
@@ -450,38 +621,37 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
 /// This mirrors the conntrack variant's parse+evaluate path with `ct_state: None`,
 /// closing the asymmetric-enforcement gap.
 ///
-/// Non-IPv4 (ARP, etc.) and unparseable frames pass through (fail-open), matching
+/// Non-IPv4 (ARP, etc.) passes through; malformed generated frames fail closed, matching
 /// the conntrack variant's behavior for kernel-generated replies.
 #[cfg(not(feature = "conntrack"))]
-fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bool {
+fn egress_firewall_allows_reply(
+    frame: &[u8],
+    net_ns_id: u64,
+    now_ms: u64,
+) -> EgressFirewallDecision {
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
         Ok(r) => r,
-        Err(_) => return true,
+        Err(_) => return EgressFirewallDecision::Malformed,
     };
     if eth_hdr.ethertype != ETHERTYPE_IPV4 {
-        return true;
+        return EgressFirewallDecision::Allow;
     }
 
     let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
         Ok(r) => r,
-        Err(_) => return true,
+        Err(_) => return EgressFirewallDecision::Malformed,
     };
 
     let proto = match ip_hdr.proto() {
         Some(p) => p,
-        None => return true,
+        None => return EgressFirewallDecision::Malformed,
     };
 
-    // Extract transport-layer ports for TCP/UDP (same as the conntrack variant).
-    let (src_port, dst_port) =
-        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && l4_bytes.len() >= 4 {
-            (
-                Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
-                Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
-            )
-        } else {
-            (None, None)
-        };
+    let transport = match validate_transport_payload(proto, l4_bytes) {
+        Ok(transport) => transport,
+        Err(_) => return EgressFirewallDecision::Malformed,
+    };
+    let (src_port, dst_port) = transport.ports();
 
     // No conntrack: only stateless rules can match (ct_state = None).
     let fw_pkt = FirewallPacket {
@@ -497,7 +667,11 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
     let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
     crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
 
-    matches!(fw_verdict.action, FirewallAction::Accept)
+    if matches!(fw_verdict.action, FirewallAction::Accept) {
+        EgressFirewallDecision::Allow
+    } else {
+        EgressFirewallDecision::Deny
+    }
 }
 
 /// Process an IPv4 packet.
@@ -556,14 +730,15 @@ fn process_ipv4(
             }
         }
     } else {
-        // R164-6 FIX: Fallible copy of non-fragment payload.
-        let mut v = Vec::new();
-        if v.try_reserve_exact(payload.len()).is_err() {
-            stats.inc_rx_errors();
-            return ProcessResult::Dropped(DropReason::EthParseError);
+        // RF180-41 FIX: any owned RX payload participates in the aggregate
+        // socket-payload ledger for its complete lifetime.
+        match WirePacket::try_copy_from_slice(payload) {
+            Ok(packet) => packet,
+            Err(_) => {
+                stats.inc_rx_errors();
+                return ProcessResult::Dropped(DropReason::EthParseError);
+            }
         }
-        v.extend_from_slice(payload);
-        v
     };
 
     // Route to protocol handler
@@ -847,13 +1022,14 @@ fn process_icmp(
             64, // Default TTL
         );
 
-        // R164-6 FIX: Fallible IP packet assembly.
-        let ip_packet = try_concat_slices(&ip_reply, &icmp_reply);
-        if ip_packet.is_empty() {
-            return ProcessResult::Dropped(DropReason::EthParseError);
-        }
-
-        let frame = build_ethernet_frame(eth_hdr.src, our_mac, ETHERTYPE_IPV4, &ip_packet);
+        // RF180-41 FIX: construct the final frame in one admitted allocation;
+        // do not retain a second heap-backed IPv4 concatenation concurrently.
+        let frame = build_ethernet_frame_from_parts(
+            eth_hdr.src,
+            our_mac,
+            ETHERTYPE_IPV4,
+            &[&ip_reply, &icmp_reply],
+        );
         if frame.is_empty() {
             return ProcessResult::Dropped(DropReason::EthParseError);
         }
@@ -867,12 +1043,39 @@ fn process_icmp(
         // ESTABLISHED/RELATED accept rule pass legitimate ping replies. Seeding a
         // bogus half-open flow served no purpose and only polluted the table.
 
-        stats.inc_icmp_echo_tx();
-        return ProcessResult::Reply(frame);
+        return ProcessResult::Reply(
+            PreparedReply::new(frame).with_stat(PreparedReplyStat::IcmpEcho),
+        );
     }
 
     // Other ICMP types are just handled (logged but no response)
     ProcessResult::Handled
+}
+
+/// Construct the complete TCP reply owner without another allocator request.
+///
+/// RF180-41 REVIEW FIX: every non-empty `WirePacket` carries admitted L2/L3
+/// headroom. Stateful TCP code therefore allocates the segment and its final
+/// encapsulation backing before committing handshake/retransmission state;
+/// this helper only fills that already-owned prefix.
+fn try_prepare_tcp_reply_frame(
+    peer_mac: EthAddr,
+    local_mac: EthAddr,
+    peer_ip: Ipv4Addr,
+    local_ip: Ipv4Addr,
+    mut resp_seg: WirePacket,
+) -> Option<WirePacket> {
+    let ip_reply = build_ipv4_header(local_ip, peer_ip, Ipv4Proto::Tcp, resp_seg.len() as u16, 64);
+    let eth_reply = EthHeader {
+        dst: peer_mac,
+        src: local_mac,
+        ethertype: ETHERTYPE_IPV4,
+    }
+    .to_bytes();
+    resp_seg
+        .try_prepend_from_slices(&[&eth_reply, &ip_reply])
+        .ok()?;
+    Some(resp_seg)
 }
 
 /// Process a TCP segment.
@@ -980,64 +1183,55 @@ fn process_tcp(
 
     // Delegate to socket layer for stateful TCP processing
     // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
-    if let Some(resp_seg) = socket_table().process_tcp_segment(
+    let mut reply_binding = None;
+    let mut ingress_handshake_committed = false;
+    let response = socket_table().process_tcp_segment(
         net_ns_id,
         ip_hdr.src,
         ip_hdr.dst,
         &tcp_hdr,
         tcp_payload,
         &tcp_options,
-    ) {
-        // R157-10 FIX: Track the outbound reply through conntrack so
-        // the completing ACK advances SynRecv→Established. Without this,
-        // conntrack stays at SynRecv until the first data exchange.
-        // R158-11 FIX: Use parse_tcp_header instead of fragile byte offset.
-        #[cfg(feature = "conntrack")]
-        {
-            use crate::conntrack::ct_process_tcp;
-            use crate::tcp::parse_tcp_header;
-            let resp_flags = parse_tcp_header(&resp_seg).map(|h| h.flags).unwrap_or(0);
-            let _ = ct_process_tcp(
-                net_ns_id.0,
-                ip_hdr.dst,
-                ip_hdr.src,
-                tcp_hdr.dst_port,
-                tcp_hdr.src_port,
-                resp_flags,
-                0,
-                now_ms,
-            );
+        &mut reply_binding,
+        &mut ingress_handshake_committed,
+    );
+
+    #[cfg(feature = "conntrack")]
+    if ingress_handshake_committed {
+        if !crate::conntrack::ct_commit_tcp_ingress_handshake(
+            net_ns_id.0,
+            ip_hdr.src,
+            ip_hdr.dst,
+            tcp_hdr.src_port,
+            tcp_hdr.dst_port,
+        ) {
+            return ProcessResult::Dropped(DropReason::ConntrackInvalid);
         }
+    }
 
-        // Build IPv4 header (swap src/dst)
-        let ip_reply = build_ipv4_header(
-            ip_hdr.dst, // Our IP as source
-            ip_hdr.src, // Original source as destination
-            Ipv4Proto::Tcp,
-            resp_seg.len() as u16,
-            64, // Default TTL
-        );
-
-        // R164-6 FIX: Fallible IP+TCP assembly.
-        let ip_packet = try_concat_slices(&ip_reply, &resp_seg);
-        if ip_packet.is_empty() && !ip_reply.is_empty() {
+    if let Some(resp_seg) = response {
+        // RF180-41 FIX: compatibility TCP builders use an empty packet as the
+        // admission-failure sentinel. Never encapsulate that sentinel as a
+        // header-only malformed TCP response.
+        if resp_seg.is_empty() {
             return ProcessResult::Handled;
         }
+        // R157-10 FIX: the completing ACK advances SynRecv→Established.
+        // R158-11 FIX: use parse_tcp_header instead of a fragile byte offset.
+        let frame = match try_prepare_tcp_reply_frame(
+            eth_hdr.src,
+            eth_hdr.dst,
+            ip_hdr.src,
+            ip_hdr.dst,
+            resp_seg,
+        ) {
+            Some(frame) => frame,
+            None => return ProcessResult::Handled,
+        };
 
-        // Build Ethernet frame (swap MACs)
-        let frame = build_ethernet_frame(
-            eth_hdr.src, // Original source as destination
-            eth_hdr.dst, // Our MAC as source
-            ETHERTYPE_IPV4,
-            &ip_packet,
-        );
-        // R165-18 FIX: build_ethernet_frame returns an empty Vec on OOM. Drop
-        // rather than emit a runt header-only frame (the peer retransmits).
-        if frame.is_empty() {
-            return ProcessResult::Handled;
-        }
-
-        return ProcessResult::Reply(frame);
+        let mut reply = PreparedReply::new(frame);
+        reply.bind_tcp(reply_binding);
+        return ProcessResult::Reply(reply);
     }
 
     ProcessResult::Handled
@@ -1165,25 +1359,25 @@ fn build_frame_and_transmit(
     dst_ip: Ipv4Addr,
     payload: &[u8],
     net_ns_id: u64,
+    tcp_binding: Option<TcpReplyBinding>,
 ) -> Result<(), TxError> {
     if payload.is_empty() || payload.len() > DEFAULT_MTU {
         return Err(TxError::InvalidBuffer);
     }
+
+    // RF180-51 FIX: validate the complete transport header before consulting
+    // policy. Otherwise a malformed non-empty packet can be misclassified as a
+    // firewall denial, hiding InvalidBuffer behind EPERM and polluting policy
+    // statistics with input that never formed a valid packet.
+    let transport =
+        validate_transport_payload(proto, payload).map_err(|_| TxError::InvalidBuffer)?;
 
     // R164-7 FIX: Evaluate egress firewall for ALL builds, not only conntrack.
     // The stateless firewall (src/dst IP, ports, protocol) is evaluated
     // unconditionally. Conntrack-aware ct_state is only available when the
     // conntrack feature is enabled; without it, ct_state is None and
     // stateful rules won't match, but stateless DROP/REJECT rules still fire.
-    let (src_port, dst_port) =
-        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && payload.len() >= 4 {
-            (
-                Some(u16::from_be_bytes([payload[0], payload[1]])),
-                Some(u16::from_be_bytes([payload[2], payload[3]])),
-            )
-        } else {
-            (None, None)
-        };
+    let (src_port, dst_port) = transport.ports();
     let cfg_pre = network_config();
 
     // Conntrack-aware ct_state lookup (only with conntrack feature).
@@ -1231,56 +1425,17 @@ fn build_frame_and_transmit(
         fw_verdict.action,
         FirewallAction::Drop | FirewallAction::Reject { .. }
     ) {
-        return Err(TxError::InvalidBuffer);
+        // RF180-51 FIX: policy denial is not malformed packet data. Preserve
+        // default-deny while giving syscall callers a distinct fail-closed
+        // result after their L4 header has parsed successfully.
+        return Err(TxError::FirewallDenied);
     }
 
-    // R163-8 FIX: After egress ACCEPT, create/update conntrack entry.
-    #[cfg(feature = "conntrack")]
-    {
-        let ct_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
-        let sp = src_port.unwrap_or(0);
-        let dp = dst_port.unwrap_or(0);
-        match proto {
-            Ipv4Proto::Tcp if sp != 0 || dp != 0 => {
-                use crate::conntrack::ct_process_tcp;
-                let tcp_flags = if payload.len() >= 14 { payload[13] } else { 0 };
-                let tcp_data_len = {
-                    let data_off = if payload.len() >= 13 {
-                        ((payload[12] >> 4) as usize) * 4
-                    } else {
-                        20
-                    };
-                    payload.len().saturating_sub(data_off)
-                };
-                let _ = ct_process_tcp(
-                    net_ns_id,
-                    cfg_pre.our_ip,
-                    dst_ip,
-                    sp,
-                    dp,
-                    tcp_flags,
-                    tcp_data_len,
-                    ct_now_ms,
-                );
-            }
-            Ipv4Proto::Udp if sp != 0 || dp != 0 => {
-                use crate::conntrack::ct_process_udp;
-                let udp_data_len = payload.len().saturating_sub(8);
-                let _ = ct_process_udp(
-                    net_ns_id,
-                    cfg_pre.our_ip,
-                    dst_ip,
-                    sp,
-                    dp,
-                    udp_data_len,
-                    ct_now_ms,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    let cfg = network_config();
+    // RF180-41 REVIEW FIX: one immutable snapshot binds firewall metadata,
+    // conntrack metadata, source addressing, and L2 encapsulation. A second
+    // snapshot here could otherwise queue a frame for a different local IP/MAC
+    // than the tuple whose policy and conntrack transition were authorized.
+    let cfg = cfg_pre;
     if cfg.our_mac == EthAddr::ZERO {
         // No network device available
         return Err(TxError::LinkDown);
@@ -1291,18 +1446,18 @@ fn build_frame_and_transmit(
     // Build IPv4 header
     let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
 
-    // R164-6 FIX: Fallible IP packet assembly in TX path.
-    let ip_packet = try_concat_slices(&ip_hdr, payload);
-    if ip_packet.is_empty() && !ip_hdr.is_empty() {
-        return Err(TxError::InvalidBuffer);
-    }
-
-    // Build Ethernet frame
-    let frame = build_ethernet_frame(dst_mac, cfg.our_mac, ETHERTYPE_IPV4, &ip_packet);
+    // RF180-41 FIX: build the complete wire frame with one admitted allocation.
+    let frame = try_build_ethernet_frame_from_parts(
+        dst_mac,
+        cfg.our_mac,
+        ETHERTYPE_IPV4,
+        &[&ip_hdr, payload],
+    )
+    .map_err(|_| TxError::NoMemory)?;
 
     // R98-2 FIX: Allocate NetBuf via DMA buffer (IOMMU-mapped)
-    let dma = alloc_dma_buffer(DMA_PAGE_SIZE).map_err(|_| TxError::InvalidBuffer)?;
-    let mut buf = NetBuf::with_defaults(dma).ok_or(TxError::InvalidBuffer)?;
+    let dma = alloc_dma_buffer(DMA_PAGE_SIZE).map_err(|_| TxError::NoBuffers)?;
+    let mut buf = NetBuf::with_defaults(dma).ok_or(TxError::NoBuffers)?;
 
     let data = match buf.push_tail(frame.len()) {
         Some(d) => d,
@@ -1320,11 +1475,439 @@ fn build_frame_and_transmit(
         }
     };
 
-    let result = match dev.lock().transmit(buf) {
-        Ok(()) => Ok(()),
-        Err((err, _returned)) => Err(err),
+    #[cfg(feature = "conntrack")]
+    {
+        use crate::conntrack::{
+            ct_egress_tcp, ct_egress_tcp_with_commit, ct_egress_udp, CtEgressResult,
+        };
+
+        let ct_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+        let outcome = match proto {
+            Ipv4Proto::Tcp => {
+                let ValidatedTransport::Tcp(tcp) = transport else {
+                    return Err(TxError::InvalidBuffer);
+                };
+                let header_len = tcp.header_len();
+                if header_len < TCP_HEADER_MIN_LEN || header_len > payload.len() {
+                    return Err(TxError::InvalidBuffer);
+                }
+                if let Some(binding) = tcp_binding.as_ref() {
+                    let mut operation = socket_table()
+                        .lock_tcp_reply_operation(binding, &tcp)
+                        .ok_or(TxError::InvalidBuffer)?;
+                    let outcome = ct_egress_tcp_with_commit(
+                        net_ns_id,
+                        cfg_pre.our_ip,
+                        dst_ip,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.flags,
+                        payload.len() - header_len,
+                        ct_now_ms,
+                        move || {
+                            let mut device = dev.lock();
+                            device.transmit(buf).map_err(|(error, _returned)| error)
+                        },
+                        || operation.commit(&tcp, ct_now_ms),
+                    );
+                    drop(operation);
+                    outcome
+                } else {
+                    ct_egress_tcp(
+                        net_ns_id,
+                        cfg_pre.our_ip,
+                        dst_ip,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.flags,
+                        payload.len() - header_len,
+                        ct_now_ms,
+                        move || {
+                            let mut device = dev.lock();
+                            device.transmit(buf).map_err(|(error, _returned)| error)
+                        },
+                    )
+                }
+            }
+            Ipv4Proto::Udp => {
+                let ValidatedTransport::Udp(udp) = transport else {
+                    return Err(TxError::InvalidBuffer);
+                };
+                if udp.length as usize != payload.len() || payload.len() < UDP_HEADER_LEN {
+                    return Err(TxError::InvalidBuffer);
+                }
+                ct_egress_udp(
+                    net_ns_id,
+                    cfg_pre.our_ip,
+                    dst_ip,
+                    udp.src_port,
+                    udp.dst_port,
+                    payload.len() - UDP_HEADER_LEN,
+                    ct_now_ms,
+                    move || {
+                        let mut device = dev.lock();
+                        device.transmit(buf).map_err(|(error, _returned)| error)
+                    },
+                )
+            }
+            _ => {
+                let result = {
+                    let mut device = dev.lock();
+                    device.transmit(buf)
+                };
+                return result.map_err(|(error, _returned)| error);
+            }
+        };
+
+        return match outcome {
+            CtEgressResult::Committed(_) => Ok(()),
+            CtEgressResult::Rejected(_) => Err(TxError::InvalidBuffer),
+            CtEgressResult::QueueFailed(error) => Err(error),
+            CtEgressResult::QueuedOwnerStale(_) => Err(TxError::InvalidBuffer),
+            CtEgressResult::StateLost { .. } => Err(TxError::IoError),
+        };
+    }
+
+    #[cfg(not(feature = "conntrack"))]
+    {
+        if let Some(binding) = tcp_binding.as_ref() {
+            if proto != Ipv4Proto::Tcp {
+                return Err(TxError::InvalidBuffer);
+            }
+            let ValidatedTransport::Tcp(tcp) = transport else {
+                return Err(TxError::InvalidBuffer);
+            };
+            let mut operation = socket_table()
+                .lock_tcp_reply_operation(binding, &tcp)
+                .ok_or(TxError::InvalidBuffer)?;
+            let result = {
+                let mut device = dev.lock();
+                device.transmit(buf)
+            };
+            return match result {
+                Ok(()) if operation.commit(&tcp, 0) => Ok(()),
+                Ok(()) => Err(TxError::InvalidBuffer),
+                Err((error, _returned)) => Err(error),
+            };
+        }
+        let result = {
+            let mut device = dev.lock();
+            device.transmit(buf)
+        };
+        result.map_err(|(error, _returned)| error)
+    }
+}
+
+/// Queue an ingress-generated reply and commit all state that depends on that
+/// queue acceptance.
+///
+/// RF180-41 REVIEW FIX: `process_frame` performs an initial egress-policy check
+/// but does not claim that the returned frame was sent. This consuming API
+/// rechecks policy to close caller-delay TOCTOU, prepares DMA, and couples the
+/// final device operation to allocation-free conntrack publication. On error it
+/// returns the original admitted owner for retry and commits no socket state.
+fn preflight_prepared_reply(reply: &PreparedReply, now_ms: u64) -> Result<u64, TxError> {
+    let Some(net_ns_id) = reply.tx_context else {
+        return Err(TxError::InvalidBuffer);
     };
-    result
+    if now_ms < reply.retry_not_before_ms {
+        return Err(TxError::QueueFull);
+    }
+    if reply.is_empty() || reply.len() > DMA_PAGE_SIZE {
+        return Err(TxError::InvalidBuffer);
+    }
+    match egress_firewall_allows_reply(reply, net_ns_id, now_ms) {
+        EgressFirewallDecision::Allow => {}
+        EgressFirewallDecision::Deny => return Err(TxError::FirewallDenied),
+        EgressFirewallDecision::Malformed => return Err(TxError::InvalidBuffer),
+    }
+    Ok(net_ns_id)
+}
+
+/// Queue an ingress-generated reply and commit conntrack/socket state only
+/// after the device accepts that exact admitted owner.
+///
+/// On any policy, preparation, or queue error, returns the original owner so
+/// the caller may retry without reconstructing or duplicating the frame.
+pub fn transmit_prepared_reply(
+    reply: PreparedReply,
+    now_ms: u64,
+    stats: &NetStats,
+) -> Result<(), PreparedReplyTxError> {
+    let net_ns_id = match preflight_prepared_reply(&reply, now_ms) {
+        Ok(net_ns_id) => net_ns_id,
+        Err(error) => return Err(PreparedReplyTxError::Retryable(error, reply)),
+    };
+    let dev = match get_device("eth0") {
+        Some(dev) => dev,
+        None => {
+            return Err(PreparedReplyTxError::Retryable(TxError::LinkDown, reply));
+        }
+    };
+    transmit_prepared_reply_with_queue(reply, now_ms, net_ns_id, stats, move |buf| {
+        let mut device = dev.lock();
+        device.transmit(buf)
+    })
+}
+
+fn transmit_prepared_reply_with_queue<F>(
+    reply: PreparedReply,
+    now_ms: u64,
+    net_ns_id: u64,
+    stats: &NetStats,
+    queue: F,
+) -> Result<(), PreparedReplyTxError>
+where
+    F: FnOnce(NetBuf) -> Result<(), (TxError, NetBuf)>,
+{
+    let dma = match alloc_dma_buffer(DMA_PAGE_SIZE) {
+        Ok(dma) => dma,
+        Err(_) => {
+            return Err(PreparedReplyTxError::Retryable(TxError::NoBuffers, reply));
+        }
+    };
+    let mut buf = match NetBuf::with_defaults(dma) {
+        Some(buf) => buf,
+        None => {
+            return Err(PreparedReplyTxError::Retryable(TxError::NoBuffers, reply));
+        }
+    };
+    let Some(data) = buf.push_tail(reply.len()) else {
+        return Err(PreparedReplyTxError::Retryable(
+            TxError::InvalidBuffer,
+            reply,
+        ));
+    };
+    data.copy_from_slice(&reply);
+
+    complete_prepared_reply_transaction(reply, now_ms, net_ns_id, stats, move || {
+        queue(buf).map_err(|(error, _returned)| error)
+    })
+}
+
+fn complete_prepared_reply_transaction<F>(
+    reply: PreparedReply,
+    now_ms: u64,
+    net_ns_id: u64,
+    stats: &NetStats,
+    queue: F,
+) -> Result<(), PreparedReplyTxError>
+where
+    F: FnOnce() -> Result<(), TxError>,
+{
+    let (eth, ip_bytes) = match parse_ethernet(&reply) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return Err(PreparedReplyTxError::Retryable(
+                TxError::InvalidBuffer,
+                reply,
+            ));
+        }
+    };
+
+    #[cfg(feature = "conntrack")]
+    if eth.ethertype == ETHERTYPE_IPV4 {
+        use crate::conntrack::{
+            conntrack_table, ct_egress_tcp_with_commit, CtEgressResult, FlowKey, IPPROTO_TCP,
+        };
+
+        let (ip, _options, l4_bytes) = match parse_ipv4(ip_bytes) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+        };
+        if ip.proto() == Some(Ipv4Proto::Tcp) {
+            let tcp = match parse_tcp_header(l4_bytes) {
+                Ok(tcp) => tcp,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
+            };
+            let header_len = tcp.header_len();
+            if header_len < TCP_HEADER_MIN_LEN || header_len > l4_bytes.len() {
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+
+            let (key, _) = FlowKey::from_packet(
+                net_ns_id,
+                IPPROTO_TCP,
+                ip.src,
+                ip.dst,
+                tcp.src_port,
+                tcp.dst_port,
+            );
+            // An explicit firewall RST for an untracked packet is intentionally
+            // stateless. Every state-advancing TCP reply has an ingress-created
+            // flow and must use the transaction below.
+            if conntrack_table().lookup(&key).is_none() && tcp.flags & TCP_FLAG_RST != 0 {
+                let queued = queue();
+                return match queued {
+                    Ok(()) => {
+                        reply.commit_stat(stats);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let mut reply = reply;
+                        if error == TxError::QueueFull {
+                            reply.note_queue_rejection(now_ms);
+                        }
+                        Err(PreparedReplyTxError::Retryable(error, reply))
+                    }
+                };
+            }
+
+            let operation_result = reply
+                .tcp_binding
+                .as_ref()
+                .map(|binding| socket_table().lock_tcp_reply_operation(binding, &tcp));
+            if matches!(operation_result, Some(None)) {
+                // End the binding borrow before returning the retry owner.
+                drop(operation_result);
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+            let mut operation = operation_result.flatten();
+
+            let outcome = ct_egress_tcp_with_commit(
+                net_ns_id,
+                ip.src,
+                ip.dst,
+                tcp.src_port,
+                tcp.dst_port,
+                tcp.flags,
+                l4_bytes.len() - header_len,
+                now_ms,
+                queue,
+                || {
+                    operation
+                        .as_mut()
+                        .map(|operation| operation.commit(&tcp, now_ms))
+                        .unwrap_or(true)
+                },
+            );
+            drop(operation);
+            return match outcome {
+                CtEgressResult::Committed(_) => {
+                    reply.commit_stat(stats);
+                    Ok(())
+                }
+                CtEgressResult::Rejected(_) => Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                )),
+                CtEgressResult::QueueFailed(error) => {
+                    let mut reply = reply;
+                    if error == TxError::QueueFull {
+                        reply.note_queue_rejection(now_ms);
+                    }
+                    Err(PreparedReplyTxError::Retryable(error, reply))
+                }
+                CtEgressResult::QueuedOwnerStale(_) => {
+                    reply.commit_stat(stats);
+                    Err(PreparedReplyTxError::Consumed(TxError::InvalidBuffer))
+                }
+                CtEgressResult::StateLost { queued } => {
+                    if queued {
+                        reply.commit_stat(stats);
+                    }
+                    Err(PreparedReplyTxError::Consumed(TxError::IoError))
+                }
+            };
+        }
+    }
+
+    #[cfg(not(feature = "conntrack"))]
+    if eth.ethertype == ETHERTYPE_IPV4 {
+        let (ip, _options, l4_bytes) = match parse_ipv4(ip_bytes) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+        };
+        if ip.proto() == Some(Ipv4Proto::Tcp) {
+            let tcp = match parse_tcp_header(l4_bytes) {
+                Ok(tcp) => tcp,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
+            };
+            if tcp.header_len() < TCP_HEADER_MIN_LEN || tcp.header_len() > l4_bytes.len() {
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+            let operation_result = reply
+                .tcp_binding
+                .as_ref()
+                .map(|binding| socket_table().lock_tcp_reply_operation(binding, &tcp));
+            if matches!(operation_result, Some(None)) {
+                drop(operation_result);
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+            let mut operation = operation_result.flatten();
+            let queued = queue();
+            return match queued {
+                Ok(()) => {
+                    reply.commit_stat(stats);
+                    let committed = operation
+                        .as_mut()
+                        .map(|operation| operation.commit(&tcp, now_ms))
+                        .unwrap_or(true);
+                    drop(operation);
+                    if committed {
+                        Ok(())
+                    } else {
+                        Err(PreparedReplyTxError::Consumed(TxError::InvalidBuffer))
+                    }
+                }
+                Err(error) => {
+                    drop(operation);
+                    let mut reply = reply;
+                    if error == TxError::QueueFull {
+                        reply.note_queue_rejection(now_ms);
+                    }
+                    Err(PreparedReplyTxError::Retryable(error, reply))
+                }
+            };
+        }
+    }
+
+    let queued = queue();
+    match queued {
+        Ok(()) => {
+            reply.commit_stat(stats);
+            Ok(())
+        }
+        Err(error) => {
+            let mut reply = reply;
+            if error == TxError::QueueFull {
+                reply.note_queue_rejection(now_ms);
+            }
+            Err(PreparedReplyTxError::Retryable(error, reply))
+        }
+    }
 }
 
 /// Transmit a serialized TCP segment (without IP/Ethernet headers).
@@ -1344,7 +1927,17 @@ pub fn transmit_tcp_segment(
     segment: &[u8],
     net_ns_id: u64,
 ) -> Result<(), TxError> {
-    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment, net_ns_id)
+    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment, net_ns_id, None)
+}
+
+/// Transmit the exact initial active-open SYN and publish SYN-SENT only after
+/// the device accepts it. The private binding keeps a close/stale socket from
+/// queueing a control packet whose TCB can no longer commit.
+pub fn transmit_tcp_connect(result: TcpConnectResult, net_ns_id: u64) -> Result<(), TxError> {
+    let dst_ip = result.dst_ip;
+    let segment = result.segment;
+    let binding = result.egress_binding;
+    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, &segment, net_ns_id, Some(binding))
 }
 
 /// Transmit a serialized UDP datagram (without IP/Ethernet headers).
@@ -1364,7 +1957,7 @@ pub fn transmit_udp_datagram(
     datagram: &[u8],
     net_ns_id: u64,
 ) -> Result<(), TxError> {
-    build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram, net_ns_id)
+    build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram, net_ns_id, None)
 }
 
 // ============================================================================
@@ -1384,7 +1977,7 @@ pub fn transmit_udp_datagram(
 /// A more RFC-compliant implementation would pass through the original packet slice.
 /// This is acceptable for most cases but may cause issues with packets containing
 /// IP options. Future improvement: pass original IP header bytes through the call chain.
-fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> Vec<u8> {
+fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> WirePacket {
     let quoted_len = cmp::min(l4_bytes.len(), 8);
     let mut hdr = [0u8; IPV4_HEADER_MIN_LEN];
 
@@ -1402,19 +1995,9 @@ fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> Vec<u8>
     let checksum = compute_checksum(&hdr, IPV4_HEADER_MIN_LEN);
     hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-    // R164-6 FIX: Fallible allocation for reject quoted packet.
-    let mut snapshot = Vec::new();
-    if snapshot
-        .try_reserve_exact(IPV4_HEADER_MIN_LEN + quoted_len)
-        .is_err()
-    {
-        return snapshot;
-    }
-    snapshot.extend_from_slice(&hdr);
-    if quoted_len > 0 {
-        snapshot.extend_from_slice(&l4_bytes[..quoted_len]);
-    }
-    snapshot
+    // RF180-41 FIX: the firewall quote is an admitted wire owner and cannot
+    // escape the global heap proof while a reject is being assembled.
+    WirePacket::try_from_slices(&[&hdr, &l4_bytes[..quoted_len]]).unwrap_or_default()
 }
 
 /// Apply firewall verdict, generating response if needed.
@@ -1495,6 +2078,12 @@ fn apply_firewall_verdict(
                             0,   // Window size
                             &[], // No payload
                         );
+                        if rst_segment.is_empty() {
+                            return Some(ProcessResult::Dropped(DropReason::Firewall {
+                                rule_id: verdict.rule_id,
+                                rejected: true,
+                            }));
+                        }
 
                         let ip_reply = build_ipv4_header(
                             ip_hdr.dst,
@@ -1504,21 +2093,11 @@ fn apply_firewall_verdict(
                             64,
                         );
 
-                        // R164-6 FIX: Fallible IP+RST assembly.
-                        let ip_packet = try_concat_slices(&ip_reply, &rst_segment);
-                        // R178-L1 FIX: OOM during REJECT response assembly → drop, not accept
-                        if ip_packet.is_empty() && !ip_reply.is_empty() {
-                            return Some(ProcessResult::Dropped(DropReason::Firewall {
-                                rule_id: verdict.rule_id,
-                                rejected: true,
-                            }));
-                        }
-
-                        let frame = build_ethernet_frame(
+                        let frame = build_ethernet_frame_from_parts(
                             eth_hdr.src,
                             eth_hdr.dst,
                             ETHERTYPE_IPV4,
-                            &ip_packet,
+                            &[&ip_reply, &rst_segment],
                         );
                         // R165-18 / R178-L1 FIX: drop on empty-OOM frame instead of emitting
                         // a runt RST frame or accepting.
@@ -1529,7 +2108,7 @@ fn apply_firewall_verdict(
                             }));
                         }
 
-                        return Some(ProcessResult::Reply(frame));
+                        return Some(ProcessResult::Reply(PreparedReply::new(frame)));
                     }
                 }
                 // If TCP header parsing fails, fall through to ICMP response
@@ -1537,7 +2116,19 @@ fn apply_firewall_verdict(
 
             // Build ICMP destination unreachable for non-TCP protocols
             let quoted = build_original_ip_for_reject(ip_hdr, l4_bytes);
+            if quoted.is_empty() {
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
+            }
             let icmp = build_dest_unreachable(icmp_code, &quoted);
+            if icmp.is_empty() {
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
+            }
             let ip_reply = build_ipv4_header(
                 ip_hdr.dst,
                 ip_hdr.src,
@@ -1546,17 +2137,12 @@ fn apply_firewall_verdict(
                 64,
             );
 
-            // R164-6 / R178-L1 FIX: Fallible IP+ICMP assembly.
-            // OOM during REJECT response → drop, not accept
-            let ip_packet = try_concat_slices(&ip_reply, &icmp);
-            if ip_packet.is_empty() && !ip_reply.is_empty() {
-                return Some(ProcessResult::Dropped(DropReason::Firewall {
-                    rule_id: verdict.rule_id,
-                    rejected: true,
-                }));
-            }
-
-            let frame = build_ethernet_frame(eth_hdr.src, eth_hdr.dst, ETHERTYPE_IPV4, &ip_packet);
+            let frame = build_ethernet_frame_from_parts(
+                eth_hdr.src,
+                eth_hdr.dst,
+                ETHERTYPE_IPV4,
+                &[&ip_reply, &icmp],
+            );
             // R165-18 / R178-L1 FIX: drop on empty-OOM frame instead of emitting a runt
             // ICMP-reject frame or accepting.
             if frame.is_empty() {
@@ -1566,7 +2152,7 @@ fn apply_firewall_verdict(
                 }));
             }
 
-            Some(ProcessResult::Reply(frame))
+            Some(ProcessResult::Reply(PreparedReply::new(frame)))
         }
     }
 }
@@ -1614,5 +2200,252 @@ mod tests {
         stats.inc_rx_packets();
         stats.inc_rx_packets();
         assert_eq!(stats.rx_packets.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn rf180_51_malformed_transport_never_collapses_into_firewall_denial() {
+        use crate::firewall::{firewall_remove_ns, FirewallRule};
+
+        const DIRECT_NS: u64 = 0x7e57_1805_1001;
+        const REPLY_NS: u64 = 0x7e57_1805_1002;
+        let local_ip = Ipv4Addr::new(192, 0, 2, 51);
+        let peer_ip = Ipv4Addr::new(192, 0, 2, 52);
+
+        let valid_zero_udp = [
+            0xc0, 0x01, // source port 49153
+            0x00, 0x09, // destination port 9
+            0x00, 0x08, // header-only UDP length
+            0x00, 0x00, // IPv4 permits a zero UDP checksum
+        ];
+        let mut malformed_udp = valid_zero_udp;
+        malformed_udp[5] = 0x09; // claims one byte beyond the immutable payload
+
+        firewall_remove_ns(DIRECT_NS);
+        assert_eq!(
+            build_frame_and_transmit(Ipv4Proto::Udp, peer_ip, &malformed_udp, DIRECT_NS, None,),
+            Err(TxError::InvalidBuffer),
+            "malformed UDP must fail before default-deny policy evaluation"
+        );
+        assert_eq!(
+            build_frame_and_transmit(Ipv4Proto::Udp, peer_ip, &valid_zero_udp, DIRECT_NS, None,),
+            Err(TxError::FirewallDenied),
+            "a structurally valid header-only datagram must reach default-deny"
+        );
+        firewall_remove_ns(DIRECT_NS);
+
+        firewall_remove_ns(REPLY_NS);
+        firewall_table_for_ns(REPLY_NS).replace_rules(alloc::vec![FirewallRule::builder(51)
+            .priority(i32::MAX)
+            .proto(Ipv4Proto::Udp)
+            .action(FirewallAction::Drop)
+            .build(),]);
+
+        let make_reply = |udp: &[u8]| {
+            let ip = build_ipv4_header(local_ip, peer_ip, Ipv4Proto::Udp, udp.len() as u16, 64);
+            let frame = try_build_ethernet_frame_from_parts(
+                EthAddr::new(0x02, 0, 0, 0, 0, 52),
+                EthAddr::new(0x02, 0, 0, 0, 0, 51),
+                ETHERTYPE_IPV4,
+                &[&ip, udp],
+            )
+            .expect("RF180-51 reply fixture admission");
+            let mut reply = PreparedReply::new(frame);
+            reply.authorize(REPLY_NS, 0);
+            reply
+        };
+
+        assert_eq!(
+            preflight_prepared_reply(&make_reply(&malformed_udp), 0),
+            Err(TxError::InvalidBuffer),
+            "prepared-reply parsing failure must not be reported as policy denial"
+        );
+        assert_eq!(
+            preflight_prepared_reply(&make_reply(&valid_zero_udp), 0),
+            Err(TxError::FirewallDenied),
+            "valid prepared reply must retain the explicit firewall verdict"
+        );
+        firewall_remove_ns(REPLY_NS);
+    }
+
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn rf180_41_reply_encapsulation_is_allocation_free_and_conntrack_is_deferred() {
+        use crate::conntrack::{
+            conntrack_table, ct_drain_ns, ct_process_tcp, CtProtoState, FlowKey, TcpCtState,
+            IPPROTO_TCP,
+        };
+
+        const NS: u64 = 0x7e57_1804_1001;
+        let peer_ip = Ipv4Addr::new(192, 0, 2, 10);
+        let local_ip = Ipv4Addr::new(192, 0, 2, 20);
+        let peer_port = 40_001;
+        let local_port = 8080;
+        let now_ms = 41_000;
+
+        ct_drain_ns(NS);
+        let seeded = ct_process_tcp(
+            NS,
+            peer_ip,
+            local_ip,
+            peer_port,
+            local_port,
+            TCP_FLAG_SYN,
+            0,
+            now_ms,
+        );
+        assert_eq!(seeded.state, CtProtoState::Tcp(TcpCtState::SynSent));
+
+        let syn_ack = build_tcp_segment(
+            local_ip,
+            peer_ip,
+            local_port,
+            peer_port,
+            1,
+            2,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            4096,
+            &[],
+        );
+        assert!(!syn_ack.is_empty(), "test SYN-ACK allocation must succeed");
+
+        WirePacket::fail_next_admission_for_test();
+        let frame = try_prepare_tcp_reply_frame(
+            EthAddr::new(0x02, 0, 0, 0, 0, 1),
+            EthAddr::new(0x02, 0, 0, 0, 0, 2),
+            peer_ip,
+            local_ip,
+            syn_ack,
+        )
+        .expect("encapsulation must consume reserved headroom without allocation");
+        assert_eq!(
+            parse_ethernet(&frame)
+                .expect("encapsulated Ethernet frame parses")
+                .0
+                .ethertype,
+            ETHERTYPE_IPV4
+        );
+
+        // The injected failure remains pending, proving encapsulation did not
+        // issue a second allocator/admission request.
+        assert!(WirePacket::try_copy_from_slice(&[0xaa]).is_err());
+
+        let (key, _) =
+            FlowKey::from_packet(NS, IPPROTO_TCP, peer_ip, local_ip, peer_port, local_port);
+        let before_commit = conntrack_table()
+            .lookup(&key)
+            .expect("seeded conntrack entry must remain present");
+        assert_eq!(
+            before_commit.state,
+            CtProtoState::Tcp(TcpCtState::SynSent),
+            "frame preparation alone must not publish outbound conntrack"
+        );
+        assert_eq!(
+            before_commit.packets_reply, 0,
+            "reply accounting is deferred until policy acceptance"
+        );
+
+        let mut reply = PreparedReply::new(frame);
+        reply.authorize(NS, now_ms);
+        let stats = NetStats::new();
+        let reply = match complete_prepared_reply_transaction(reply, now_ms + 1, NS, &stats, || {
+            Err(TxError::QueueFull)
+        }) {
+            Err(PreparedReplyTxError::Retryable(TxError::QueueFull, reply)) => reply,
+            _ => panic!("QueueFull must return the original prepared owner"),
+        };
+        let after_reject = conntrack_table()
+            .lookup(&key)
+            .expect("QueueFull retains the ingress-created flow");
+        assert_eq!(after_reject.state, before_commit.state);
+        assert_eq!(after_reject.packets_reply, before_commit.packets_reply);
+
+        assert!(
+            complete_prepared_reply_transaction(reply, now_ms + 2, NS, &stats, || Ok(())).is_ok()
+        );
+        let committed = conntrack_table()
+            .lookup(&key)
+            .expect("committed conntrack entry remains present");
+        assert_eq!(committed.state, CtProtoState::Tcp(TcpCtState::SynRecv));
+        assert_eq!(committed.packets_reply, 1);
+
+        assert_eq!(ct_drain_ns(NS), 1);
+    }
+
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn rf180_41_egress_firewall_drop_does_not_commit_reply_conntrack() {
+        use crate::conntrack::{
+            conntrack_table, ct_drain_ns, CtProtoState, FlowKey, TcpCtState, IPPROTO_TCP,
+        };
+        use crate::firewall::{firewall_remove_ns, FirewallRule, IpCidrMatch};
+
+        const NS: u64 = 0x7e57_1804_1002;
+        let peer_ip = Ipv4Addr::new(192, 0, 2, 30);
+        let local_ip = Ipv4Addr::new(192, 0, 2, 40);
+        let peer_mac = EthAddr::new(0x02, 0, 0, 0, 0, 3);
+        let local_mac = EthAddr::new(0x02, 0, 0, 0, 0, 4);
+        let peer_port = 40_002;
+        let local_port = 8081;
+
+        ct_drain_ns(NS);
+        firewall_remove_ns(NS);
+        let firewall = firewall_table_for_ns(NS);
+        firewall.replace_rules(alloc::vec![
+            FirewallRule::builder(41)
+                .priority(200)
+                .src_ip(IpCidrMatch::host(local_ip))
+                .dst_ip(IpCidrMatch::host(peer_ip))
+                .proto(Ipv4Proto::Tcp)
+                .action(FirewallAction::Drop)
+                .build(),
+            FirewallRule::builder(42)
+                .priority(100)
+                .src_ip(IpCidrMatch::host(peer_ip))
+                .dst_ip(IpCidrMatch::host(local_ip))
+                .proto(Ipv4Proto::Tcp)
+                .action(FirewallAction::Accept)
+                .build(),
+        ]);
+
+        let syn = build_tcp_segment(
+            peer_ip,
+            local_ip,
+            peer_port,
+            local_port,
+            1,
+            0,
+            TCP_FLAG_SYN,
+            4096,
+            &[],
+        );
+        let ip = build_ipv4_header(peer_ip, local_ip, Ipv4Proto::Tcp, syn.len() as u16, 64);
+        let frame =
+            try_build_ethernet_frame_from_parts(local_mac, peer_mac, ETHERTYPE_IPV4, &[&ip, &syn])
+                .expect("test ingress frame admission");
+        let mut arp = ArpCache::with_defaults();
+        let stats = NetStats::new();
+        assert!(matches!(
+            process_frame(
+                &frame,
+                local_mac,
+                local_ip,
+                &mut arp,
+                &stats,
+                NamespaceId(NS),
+                42_000,
+            ),
+            ProcessResult::Dropped(DropReason::Firewall { .. })
+        ));
+
+        let (key, _) =
+            FlowKey::from_packet(NS, IPPROTO_TCP, peer_ip, local_ip, peer_port, local_port);
+        let entry = conntrack_table()
+            .lookup(&key)
+            .expect("accepted ingress SYN must remain tracked");
+        assert_eq!(entry.state, CtProtoState::Tcp(TcpCtState::SynSent));
+        assert_eq!(entry.packets_reply, 0);
+
+        assert_eq!(ct_drain_ns(NS), 1);
+        firewall_remove_ns(NS);
     }
 }
