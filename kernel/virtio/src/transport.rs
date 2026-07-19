@@ -25,6 +25,7 @@ use crate::{mmio, VIRTIO_MAGIC, VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN};
 ///
 /// This enum wraps the different transport implementations and provides
 /// a unified interface for device drivers.
+#[derive(Clone, Copy)]
 pub enum VirtioTransport {
     /// virtio-mmio transport
     Mmio(MmioTransport),
@@ -80,6 +81,23 @@ impl VirtioTransport {
                 write_volatile(&mut (*t.common_cfg).device_status, 0);
             }
         }
+    }
+
+    /// R180-16 FIX: write status 0 and poll until the device acknowledges reset
+    /// (status reads back as 0), with a bounded spin. Returns false if the
+    /// device never quiesced — callers must not free DMA pages for reuse.
+    ///
+    /// # Safety
+    /// Caller must ensure the transport is properly initialized.
+    pub unsafe fn reset_and_await_ack(&self, max_spins: u32) -> bool {
+        self.reset();
+        for _ in 0..max_spins {
+            if self.status() == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        self.status() == 0
     }
 
     /// Read the device status.
@@ -324,6 +342,7 @@ impl VirtioTransport {
 /// virtio-mmio transport implementation.
 ///
 /// This transport uses fixed MMIO offsets as defined in the VirtIO spec.
+#[derive(Clone, Copy)]
 pub struct MmioTransport {
     /// Base virtual address of MMIO region
     pub(crate) base: *mut u8,
@@ -445,6 +464,7 @@ pub struct VirtioPciCommonCfg {
 }
 
 /// virtio-pci modern transport implementation.
+#[derive(Clone, Copy)]
 pub struct VirtioPciTransport {
     /// VirtIO device type (e.g., 2 for block device)
     pub(crate) virtio_device_type: u32,

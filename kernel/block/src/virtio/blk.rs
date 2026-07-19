@@ -12,13 +12,14 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 
+use iommu::PciDeviceId;
 use mm::dma::{alloc_dma_buffer, DmaBuffer};
+use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass};
 
 use super::{
     blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkConfig,
@@ -167,12 +168,26 @@ impl VirtQueue {
         (desc_pages + avail_pages + used_pages) * 4096
     }
 
+    /// Actual ordinary-heap capacity retained by queue-side indices.
+    fn heap_charge_bytes(&self) -> Result<usize, BlockError> {
+        let free_capacity = self.free_list.lock().capacity();
+        let bitmap_capacity = self.alloc_bitmap.lock().capacity();
+        let free = vec_charge_bytes::<u16>(free_capacity).map_err(|_| BlockError::NoMem)?;
+        let bitmap = vec_charge_bytes::<bool>(bitmap_capacity).map_err(|_| BlockError::NoMem)?;
+        free.checked_add(bitmap).ok_or(BlockError::NoMem)
+    }
+
     /// Create a new virtqueue at the given physical address.
     ///
     /// # Safety
     /// The caller must ensure the memory region is valid and DMA-able.
     /// DMA memory is accessed via the kernel's high-half mapping (PHYSICAL_MEMORY_OFFSET).
-    unsafe fn new(base_phys: u64, queue_size: u16, _virt_offset: u64, notify_off: u16) -> Self {
+    unsafe fn try_new(
+        base_phys: u64,
+        queue_size: u16,
+        _virt_offset: u64,
+        notify_off: u16,
+    ) -> Result<Self, BlockError> {
         let desc_size = core::mem::size_of::<VringDesc>() * queue_size as usize;
         // R152-18 FIX: Include +2 for used_event per VirtIO spec
         let avail_size = 4 + 2 * queue_size as usize + 2;
@@ -191,11 +206,21 @@ impl VirtQueue {
         let avail = (avail_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut VringAvail;
         let used = (used_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut VringUsed;
 
-        // Initialize free list
-        let mut free_list = Vec::with_capacity(queue_size as usize);
+        // R180-27 FIX: construct every heap-backed queue index before device
+        // publication. Length/capacity are then fixed for the queue lifetime.
+        let mut free_list = Vec::new();
+        free_list
+            .try_reserve_exact(queue_size as usize)
+            .map_err(|_| BlockError::NoMem)?;
         for i in (0..queue_size).rev() {
             free_list.push(i);
         }
+
+        let mut alloc_bitmap = Vec::new();
+        alloc_bitmap
+            .try_reserve_exact(queue_size as usize)
+            .map_err(|_| BlockError::NoMem)?;
+        alloc_bitmap.resize(queue_size as usize, false);
 
         // R66-3 FIX: Zero out entire ring structures, not just 1 byte.
         // Previously only 1 byte was zeroed, leaving uninitialized memory
@@ -208,10 +233,7 @@ impl VirtQueue {
         let used_bytes = 4 + 8 * queue_size as usize + 2;
         core::ptr::write_bytes(used as *mut u8, 0, used_bytes);
 
-        // R66-6 FIX: Initialize allocation bitmap (all false = all free initially)
-        let alloc_bitmap = vec![false; queue_size as usize];
-
-        Self {
+        Ok(Self {
             size: queue_size,
             notify_off,
             desc,
@@ -224,7 +246,7 @@ impl VirtQueue {
             desc_phys,
             avail_phys,
             used_phys,
-        }
+        })
     }
 
     /// Allocate a descriptor from the free list.
@@ -252,27 +274,31 @@ impl VirtQueue {
             return;
         }
 
-        // Check allocation bitmap - prevent double-free
-        {
-            let mut alloc = self.alloc_bitmap.lock();
-            if let Some(slot) = alloc.get_mut(idx as usize) {
-                if !*slot {
-                    // Already free - double-free attempt detected
-                    kprintln!(
-                        "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
-                        idx
-                    );
-                    return;
-                }
-                // Mark as free
-                *slot = false;
-            } else {
-                return; // Index out of bounds
-            }
+        // Keep the established alloc_bitmap -> free_list lock order used by
+        // alloc_desc. Preflight fixed capacity before changing allocation state
+        // so even metadata corruption cannot make the final push allocate or
+        // leave the descriptor lost.
+        let mut alloc = self.alloc_bitmap.lock();
+        let mut free = self.free_list.lock();
+        if free.len() >= self.size as usize || free.len() >= free.capacity() {
+            kprintln!(
+                "[virtio-blk] descriptor free-list invariant violated for {}",
+                idx
+            );
+            return;
         }
-
-        // Now safe to push back to free list
-        self.free_list.lock().push(idx);
+        let Some(slot) = alloc.get_mut(idx as usize) else {
+            return;
+        };
+        if !*slot {
+            kprintln!(
+                "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
+                idx
+            );
+            return;
+        }
+        *slot = false;
+        free.push(idx);
     }
 
     /// Get available descriptor count.
@@ -400,6 +426,9 @@ pub struct VirtioBlkDevice {
     name: String,
     /// Transport layer (MMIO or PCI).
     transport: VirtioTransport,
+    /// PCI identity retained for fail-closed bus-master shutdown on reset failure.
+    /// MMIO transports have no PCI command register and store `None`.
+    pci_id: Option<PciDeviceId>,
     /// R105-3 FIX: Owned DMA buffer for virtqueue memory.
     /// Keeps the IOMMU mapping alive for the device's lifetime without mem::forget.
     /// Field is intentionally never read — held purely for RAII lifetime management.
@@ -421,6 +450,9 @@ pub struct VirtioBlkDevice {
     device_failed: AtomicBool,
     /// Request buffers (header + status).
     req_buffers: Mutex<Vec<RequestBuffer>>,
+    /// R180-27/D1: aggregate charge for every ordinary-heap allocation owned
+    /// by this device. Kept last so owned buffers are destroyed first.
+    _heap_charge: HeapCharge,
 }
 
 /// Buffer for a single request.
@@ -533,12 +565,13 @@ impl VirtioBlkDevice {
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
         let transport = MmioTransport::probe(mmio_phys, virt_offset).ok_or(BlockError::NotFound)?;
-        Self::probe_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)
+        Self::probe_with_transport(VirtioTransport::Mmio(transport), None, virt_offset, name)
     }
 
     /// Probe for a virtio-blk device using virtio-pci modern transport.
     ///
     /// # Arguments
+    /// * `pci_id` - PCI bus/device/function identity used for fail-closed shutdown
     /// * `pci_addrs` - Parsed PCI capability addresses
     /// * `virt_offset` - Offset to add for virtual address conversion
     /// * `name` - Device name (e.g., "vda")
@@ -546,18 +579,25 @@ impl VirtioBlkDevice {
     /// # Safety
     /// Caller must ensure the MMIO windows are mapped (identity mapped low memory).
     pub unsafe fn probe_pci(
+        pci_id: PciDeviceId,
         pci_addrs: VirtioPciAddrs,
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
         let transport = VirtioPciTransport::from_addrs(pci_addrs, virt_offset)
             .ok_or(BlockError::NotSupported)?;
-        Self::probe_with_transport(VirtioTransport::Pci(transport), virt_offset, name)
+        Self::probe_with_transport(
+            VirtioTransport::Pci(transport),
+            Some(pci_id),
+            virt_offset,
+            name,
+        )
     }
 
     /// Common probe logic for any transport.
     unsafe fn probe_with_transport(
         transport: VirtioTransport,
+        pci_id: Option<PciDeviceId>,
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
@@ -573,18 +613,21 @@ impl VirtioBlkDevice {
             return Err(BlockError::NotSupported);
         }
 
-        Self::init_device(transport, virt_offset, name)
+        Self::init_device(transport, pci_id, virt_offset, name)
     }
 
     /// Initialize the device.
     unsafe fn init_device(
         transport: VirtioTransport,
+        pci_id: Option<PciDeviceId>,
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
-        // Reset device
-        transport.reset();
-        mb();
+        // RF180-21 FIX: BME is already enabled when PCI probing reaches this
+        // function.  Do not negotiate against a device that merely accepted a
+        // one-shot status=0 write: require the reset acknowledgement before any
+        // queue ownership is constructed or published.
+        Self::reset_probe_transport(transport, pci_id, "initialization")?;
 
         // Acknowledge device
         transport.set_status(VIRTIO_STATUS_ACKNOWLEDGE);
@@ -622,6 +665,7 @@ impl VirtioBlkDevice {
         // Verify FEATURES_OK
         let status = transport.status();
         if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+            Self::reset_probe_transport(transport, pci_id, "FEATURES_OK refusal")?;
             return Err(BlockError::NotSupported);
         }
 
@@ -640,50 +684,158 @@ impl VirtioBlkDevice {
         let queue_size = queue_size_max.min(DEFAULT_QUEUE_SIZE);
 
         if queue_size == 0 {
+            Self::reset_probe_transport(transport, pci_id, "invalid queue size")?;
             return Err(BlockError::NotSupported);
+        }
+
+        // R180-27/D1 FIX: reserve the complete ordinary-heap ownership set
+        // before the first allocation. The estimate is reconciled with actual
+        // allocator capacities while every object is still private.
+        let estimated_heap_bytes = arc_charge_bytes::<Self>()
+            .and_then(|total| {
+                vec_charge_bytes::<u8>(name.len()).and_then(|name_bytes| {
+                    total
+                        .checked_add(name_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .and_then(|total| {
+                vec_charge_bytes::<RequestBuffer>(MAX_PENDING).and_then(|request_bytes| {
+                    total
+                        .checked_add(request_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .and_then(|total| {
+                vec_charge_bytes::<u16>(queue_size as usize).and_then(|free_bytes| {
+                    total
+                        .checked_add(free_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .and_then(|total| {
+                vec_charge_bytes::<bool>(queue_size as usize).and_then(|bitmap_bytes| {
+                    total
+                        .checked_add(bitmap_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            });
+        let estimated_heap_bytes = match estimated_heap_bytes {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                Self::reset_probe_transport(transport, pci_id, "heap estimate failure")?;
+                return Err(BlockError::NoMem);
+            }
+        };
+        let mut heap_reservation = match try_reserve_heap(HeapClass::Device, estimated_heap_bytes) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                Self::reset_probe_transport(transport, pci_id, "heap admission failure")?;
+                return Err(BlockError::NoMem);
+            }
+        };
+
+        // R180-27: Finish every fallible ordinary-heap allocation before the
+        // queue is published to the device.  Both containers retain fixed
+        // capacity for the device lifetime, so request completion and
+        // descriptor return never need to grow them under pressure.
+        let mut owned_name = String::new();
+        if owned_name.try_reserve_exact(name.len()).is_err() {
+            Self::reset_probe_transport(transport, pci_id, "name allocation failure")?;
+            return Err(BlockError::NoMem);
+        }
+        owned_name.push_str(name);
+
+        let mut req_buffers = Vec::new();
+        if req_buffers.try_reserve_exact(MAX_PENDING).is_err() {
+            Self::reset_probe_transport(transport, pci_id, "request allocation failure")?;
+            return Err(BlockError::NoMem);
+        }
+        for _ in 0..MAX_PENDING {
+            req_buffers.push(RequestBuffer {
+                header: VirtioBlkReqHeader::default(),
+                status: 0,
+                in_use: false,
+                pending: None,
+            });
         }
 
         // Allocate queue memory (simplified: use high physical memory)
         // In a real implementation, this would use a proper DMA allocator
         let queue_mem_size = VirtQueue::calc_size(queue_size);
         // R105-3 FIX: Keep DmaBuffer ownership instead of extracting phys + forget.
-        let virtqueue_dma = Self::alloc_dma_memory(queue_mem_size)?;
+        let virtqueue_dma = match Self::alloc_dma_memory(queue_mem_size) {
+            Ok(dma) => dma,
+            Err(error) => {
+                Self::reset_probe_transport(transport, pci_id, "queue DMA allocation failure")?;
+                return Err(error);
+            }
+        };
         let queue_phys = virtqueue_dma.phys();
 
         // Get notify offset for PCI transport
         let notify_off = transport.queue_notify_off(0);
 
         // Create virtqueue
-        let queue = VirtQueue::new(queue_phys, queue_size, virt_offset, notify_off);
+        let queue = match VirtQueue::try_new(queue_phys, queue_size, virt_offset, notify_off) {
+            Ok(queue) => queue,
+            Err(error) => {
+                Self::reset_probe_transport(transport, pci_id, "virtqueue construction failure")?;
+                return Err(error);
+            }
+        };
 
-        // Configure queue
-        transport.setup_queue(
-            0,
-            queue_size,
-            queue.desc_phys,
-            queue.avail_phys,
-            queue.used_phys,
-        );
-        transport.queue_ready(0, true);
-
-        // Set DRIVER_OK
-        let status = transport.status();
-        transport.set_status(status | VIRTIO_STATUS_DRIVER_OK);
-
-        // Create request buffers
-        let mut req_buffers = Vec::with_capacity(MAX_PENDING);
-        for _ in 0..MAX_PENDING {
-            req_buffers.push(RequestBuffer {
-                header: VirtioBlkReqHeader::default(),
-                status: 0,
-                in_use: false,
-                pending: None, // R39-1 FIX: Initialize pending metadata
+        let actual_heap_bytes = arc_charge_bytes::<Self>()
+            .and_then(|total| {
+                vec_charge_bytes::<u8>(owned_name.capacity()).and_then(|name_bytes| {
+                    total
+                        .checked_add(name_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .and_then(|total| {
+                vec_charge_bytes::<RequestBuffer>(req_buffers.capacity()).and_then(
+                    |request_bytes| {
+                        total
+                            .checked_add(request_bytes)
+                            .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                    },
+                )
+            })
+            .map_err(|_| BlockError::NoMem)
+            .and_then(|total| {
+                queue
+                    .heap_charge_bytes()
+                    .and_then(|queue_bytes| total.checked_add(queue_bytes).ok_or(BlockError::NoMem))
             });
+        let actual_heap_bytes = match actual_heap_bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                Self::reset_probe_transport(transport, pci_id, "heap reconciliation failure")?;
+                return Err(error);
+            }
+        };
+        if heap_reservation.resize(actual_heap_bytes).is_err() {
+            Self::reset_probe_transport(transport, pci_id, "heap reservation resize failure")?;
+            return Err(BlockError::NoMem);
         }
+        let heap_charge = match heap_reservation.commit() {
+            Ok(charge) => charge,
+            Err(_) => {
+                Self::reset_probe_transport(transport, pci_id, "heap reservation commit failure")?;
+                return Err(BlockError::NoMem);
+            }
+        };
 
-        Ok(Arc::new(Self {
-            name: String::from(name),
+        // Allocate the published owner before exposing any DMA address or
+        // setting DRIVER_OK. VirtioTransport is a copyable MMIO capability, so
+        // retain a reset handle for the allocation-failure path after the value
+        // itself has moved into `Self`.
+        let reset_transport = transport;
+        let device = match Arc::try_new(Self {
+            name: owned_name,
             transport,
+            pci_id,
             virtqueue_dma,
             queue,
             capacity,
@@ -693,7 +845,94 @@ impl VirtioBlkDevice {
             lock: Mutex::new(()),
             device_failed: AtomicBool::new(false),
             req_buffers: Mutex::new(req_buffers),
-        }))
+            _heap_charge: heap_charge,
+        }) {
+            Ok(device) => device,
+            Err(_) => {
+                Self::reset_probe_transport(
+                    reset_transport,
+                    pci_id,
+                    "device owner allocation failure",
+                )?;
+                return Err(BlockError::NoMem);
+            }
+        };
+
+        // Only now publish queue addresses and readiness to the device.
+        device.transport.setup_queue(
+            0,
+            queue_size,
+            device.queue.desc_phys,
+            device.queue.avail_phys,
+            device.queue.used_phys,
+        );
+        device.transport.queue_ready(0, true);
+
+        // DRIVER_OK is the final publication step. Read it back so a transport
+        // or device that refuses the transition cannot escape as a usable block
+        // device. If reset is not acknowledged, quarantine the Arc (and thus
+        // its DMA/IOMMU mapping) rather than returning those pages to the buddy.
+        let status = device.transport.status();
+        device
+            .transport
+            .set_status(status | VIRTIO_STATUS_DRIVER_OK);
+        mb();
+        let final_status = device.transport.status();
+        if final_status & VIRTIO_STATUS_DRIVER_OK == 0 || final_status & VIRTIO_STATUS_FAILED != 0 {
+            device.device_failed.store(true, Ordering::Release);
+            const INIT_RESET_ACK_SPINS: u32 = 1_000_000;
+            let reset_acked = device.transport.reset_and_await_ack(INIT_RESET_ACK_SPINS);
+            mb();
+            if !reset_acked {
+                if let Some(pci_id) = device.pci_id {
+                    if !crate::pci::disable_bus_master(pci_id) {
+                        panic!(
+                            "R180-27: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{} after init reset timeout",
+                            pci_id.bus, pci_id.device, pci_id.function
+                        );
+                    }
+                }
+                core::mem::forget(device);
+            }
+            return Err(BlockError::Io);
+        }
+
+        Ok(device)
+    }
+
+    /// Quiesce a probe that has not returned a published device owner.
+    ///
+    /// A failed reset on PCI is contained by disabling and read-back verifying
+    /// bus mastering before any staged allocation is allowed to drop.  MMIO
+    /// transports have no equivalent DMA gate, so continuing after an
+    /// unacknowledged reset cannot be made memory-safe and is terminal.
+    unsafe fn reset_probe_transport(
+        transport: VirtioTransport,
+        pci_id: Option<PciDeviceId>,
+        phase: &'static str,
+    ) -> Result<(), BlockError> {
+        const PROBE_RESET_ACK_SPINS: u32 = 1_000_000;
+
+        if unsafe { transport.reset_and_await_ack(PROBE_RESET_ACK_SPINS) } {
+            mb();
+            return Ok(());
+        }
+
+        if let Some(pci_id) = pci_id {
+            if !crate::pci::disable_bus_master(pci_id) {
+                panic!(
+                    "RF180-21: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{} after {} reset timeout",
+                    pci_id.bus, pci_id.device, pci_id.function, phase
+                );
+            }
+            mb();
+            return Err(BlockError::Io);
+        }
+
+        panic!(
+            "RF180-21: MMIO virtio-blk {} reset was not acknowledged and no DMA gate exists",
+            phase
+        );
     }
 
     /// Allocate DMA-able memory using the unified DMA allocator with IOMMU mapping.
@@ -866,11 +1105,52 @@ impl VirtioBlkDevice {
             self.name
         );
 
-        // VirtIO spec §2.1.1: writing 0 to status register resets the device.
-        unsafe {
-            self.transport.reset();
-        }
+        // R180-16 FIX: VirtIO reset must be acknowledged before DMA pages are
+        // scrubbed/dropped. The DMA contract (mm/dma.rs) states unmap does not
+        // drain in-flight device writes — freeing after a one-shot status=0
+        // write races a slow device. Poll status==0 with a bounded spin; if
+        // quiescence cannot be proven, leave buffers abandoned (leaked) rather
+        // than reusable, and keep device_failed sticky.
+        const RESET_ACK_SPINS: u32 = 1_000_000;
+        let reset_acked = unsafe { self.transport.reset_and_await_ack(RESET_ACK_SPINS) };
         mb();
+        if !reset_acked {
+            // A PCI device that ignores the VirtIO reset may remain capable of
+            // DMA. Clear and read back BME before quarantining the buffers so
+            // the failed device cannot issue new transactions into them.
+            if let Some(pci_id) = self.pci_id {
+                if !crate::pci::disable_bus_master(pci_id) {
+                    panic!(
+                        "R180-16/17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{} after reset timeout",
+                        pci_id.bus, pci_id.device, pci_id.function
+                    );
+                }
+            }
+            kprintln!(
+                "[virtio-blk] R180-16: reset not acknowledged for {} — quarantining in-flight DMA",
+                self.name
+            );
+            // Quarantine: forget RequestMeta so DmaBuffers are never Drop'd into
+            // the buddy. Leave in_use=true so slots are not refilled while the
+            // device is sticky-failed (descriptor indices stay allocated too —
+            // correct because device_failed blocks new I/O permanently here).
+            let mut buffers = self.req_buffers.lock();
+            for buffer in buffers.iter_mut() {
+                if !buffer.in_use {
+                    continue;
+                }
+                if let Some(m) = buffer.pending.take() {
+                    // Intentionally leak DmaBuffers + descriptor accounting.
+                    core::mem::forget(m);
+                }
+                // Keep in_use=true: slot must not look free while descs/DMA are
+                // quarantined. device_failed stays sticky (no re-init below).
+            }
+            // Leave device_failed set and do not re-init. For PCI transports BME
+            // is now verified clear; leaked DMA remains the conservative floor
+            // because reset acknowledgement (and thus full quiescence) failed.
+            return Err(BlockError::Io);
+        }
 
         // Reclaim all in-use request buffers and their DMA resources.
         let mut recovered_leaked = 0usize;
@@ -1014,7 +1294,29 @@ impl VirtioBlkDevice {
             self.transport.set_status(status | VIRTIO_STATUS_DRIVER_OK);
         }
 
-        // Recovery complete — accept new I/O.
+        // RF180-21 FIX: the status write is a request, not evidence that the
+        // device accepted the recovered queue. Keep failure sticky unless a
+        // readback proves DRIVER_OK and proves FAILED clear.
+        mb();
+        let recovered_status = unsafe { self.transport.status() };
+        if recovered_status & VIRTIO_STATUS_DRIVER_OK == 0
+            || recovered_status & VIRTIO_STATUS_FAILED != 0
+        {
+            if recovered_status & VIRTIO_STATUS_FAILED == 0 {
+                unsafe {
+                    self.transport
+                        .set_status(recovered_status | VIRTIO_STATUS_FAILED);
+                }
+            }
+            kprintln!(
+                "[virtio-blk] RF180-21: device {} rejected DRIVER_OK after reset (status={:#x})",
+                self.name,
+                recovered_status
+            );
+            return Err(BlockError::Io);
+        }
+
+        // Recovery is hardware-acknowledged; only this point may reopen I/O.
         self.device_failed.store(false, Ordering::Release);
         kprintln!(
             "[virtio-blk] R106-3: device {} reset successful, recovered {} abandoned requests",
@@ -1079,6 +1381,12 @@ impl VirtioBlkDevice {
         let header_sector = start_byte / VIRTIO_CAPACITY_SECTOR_SIZE;
 
         let _lock = self.lock.lock();
+        // Pair the optimistic fast rejection above with a serialized check.
+        // A publication rollback/reset can set the sticky failure bit while a
+        // request waits for this lock; it must not submit after reset completes.
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
 
         // Get a request buffer
         let buf_idx = {
@@ -1462,6 +1770,9 @@ impl BlockDevice for VirtioBlkDevice {
         }
 
         let _lock = self.lock.lock();
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
 
         // Acquire a request buffer slot
         let buf_idx = {
@@ -1630,5 +1941,35 @@ impl BlockDevice for VirtioBlkDevice {
         // No need to free DMA buffers or release buffer slot here
 
         result
+    }
+
+    fn rollback_unpublished(&self) -> Result<(), BlockError> {
+        // R180-27 FIX: a probe result is not a completed kernel publication.
+        // If block-registry or devfs admission fails after DRIVER_OK, serialize
+        // against I/O, make failure sticky, and prove DMA quiescence before the
+        // RAII probe guard releases queue/IOMMU ownership.
+        let _lock = self.lock.lock();
+        self.device_failed.store(true, Ordering::Release);
+
+        const PUBLICATION_RESET_ACK_SPINS: u32 = 1_000_000;
+        let reset_acked = unsafe {
+            self.transport
+                .reset_and_await_ack(PUBLICATION_RESET_ACK_SPINS)
+        };
+        mb();
+        if reset_acked {
+            return Ok(());
+        }
+
+        // RF180-22 FIX: BME clear stops new transactions but cannot prove that
+        // posted DMA writes have drained. Reset acknowledgement is the only
+        // ownership-release proof, so every unacknowledged reset returns an
+        // error and makes the probe guard quarantine the final Arc. We still
+        // disable BME as defense in depth to stop further bus-master traffic.
+        if let Some(pci_id) = self.pci_id {
+            let _ = crate::pci::disable_bus_master(pci_id);
+        }
+
+        Err(BlockError::Offline)
     }
 }
