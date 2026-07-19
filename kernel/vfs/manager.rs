@@ -12,18 +12,18 @@ use crate::cgroupfs::CgroupFs;
 use crate::devfs::DevFs;
 use crate::procfs::ProcFs;
 use crate::ramfs::RamFs;
-use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::traits::{FileHandle, FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, ResolveFlags, Stat};
-use alloc::boxed::Box;
+use alloc::collections::TryReserveError;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block::BlockDevice;
 use cap::NamespaceId;
 use kernel_core::{
-    current_host_egid, current_host_euid, current_host_supplementary_groups, current_is_host_root,
-    current_mount_ns, current_umask, FileDescriptor, FileOps, MountNamespace, SyscallError,
-    VfsStat, ROOT_MNT_NAMESPACE,
+    current_host_egid, current_host_euid, current_in_host_supplementary_group,
+    current_is_host_root, current_mount_ns, current_umask, FileDescriptor, MountNamespace,
+    SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
 };
 use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
@@ -79,20 +79,29 @@ fn try_string_from_str(s: &str) -> Result<String, FsError> {
 /// Fallibly join path segments with a single leading `/` and `/` separators.
 /// Empty `parts` yields `"/"`.
 fn try_join_path_components(parts: &[&str]) -> Result<String, FsError> {
-    if parts.is_empty() {
-        return try_string_from_str("/");
-    }
+    try_join_path_iter(parts.iter().copied())
+}
+
+/// Allocation-fallible path joining directly from a cloneable component
+/// iterator. This avoids first materializing attacker-controlled components in
+/// an infallibly growing `Vec<&str>`.
+fn try_join_path_iter<'a, I>(parts: I) -> Result<String, FsError>
+where
+    I: Iterator<Item = &'a str> + Clone,
+{
     let mut need = 1usize; // leading '/'
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
+    let mut count = 0usize;
+    for p in parts.clone() {
+        if count > 0 {
             need = need.checked_add(1).ok_or(FsError::NoMem)?;
         }
         need = need.checked_add(p.len()).ok_or(FsError::NoMem)?;
+        count = count.checked_add(1).ok_or(FsError::NoMem)?;
     }
     let mut out = String::new();
     out.try_reserve(need).map_err(|_| FsError::NoMem)?;
     out.push('/');
-    for (i, p) in parts.iter().enumerate() {
+    for (i, p) in parts.enumerate() {
         if i > 0 {
             out.push('/');
         }
@@ -173,11 +182,19 @@ fn check_access_permission(
         None => return true,
     };
     let egid = current_host_egid().unwrap_or(65534);
-    let supplementary = current_host_supplementary_groups().unwrap_or_default();
+    // RF180-19 FIX: authorization is borrowed/allocation-free; OOM can no
+    // longer silently turn a valid supplementary-group check into "other".
+    let supplementary_match = current_in_host_supplementary_group(stat.gid).unwrap_or(false);
+    let matching_group = [stat.gid];
+    let supplementary = if supplementary_match {
+        &matching_group[..]
+    } else {
+        &[]
+    };
     permission_bits_allow(
         euid,
         egid,
-        &supplementary,
+        supplementary,
         stat,
         need_read,
         need_write,
@@ -467,10 +484,21 @@ impl Vfs {
         Ok(())
     }
 
+    /// R180-22 rollback for an eagerly materialized namespace that failed the
+    /// process-publication revalidation. `NamespaceId` is globally monotonic and
+    /// is the table's identity; removing by this exact new namespace cannot
+    /// erase a table belonging to another namespace generation. Drop the table
+    /// after releasing the registry lock because filesystem Arc destructors may
+    /// acquire unrelated VFS locks.
+    pub fn rollback_materialized_namespace(&self, ns: &Arc<MountNamespace>) {
+        let removed = self.mount_tables.write().remove(&ns.id());
+        drop(removed);
+    }
+
     /// Initialize the VFS with default mounts
     pub fn init(&self) {
         // Create ramfs as root filesystem
-        let ramfs = RamFs::new();
+        let ramfs = RamFs::try_new().expect("boot: root ramfs admission/allocation failed");
 
         // Get the root mount namespace and its table
         let root_ns = ROOT_MNT_NAMESPACE.clone();
@@ -507,7 +535,7 @@ impl Vfs {
         *self.devfs.write() = Some(devfs);
 
         // Create and mount procfs at /proc
-        let procfs = ProcFs::new();
+        let procfs = ProcFs::try_new().expect("boot: procfs admission/allocation failed");
         self.mount_in_namespace(&root_ns, "/proc", procfs)
             .expect("Failed to mount procfs");
 
@@ -518,7 +546,7 @@ impl Vfs {
         }
 
         // Create /sys/fs via sysfs (we mount a ramfs at /sys for now)
-        let sysfs = RamFs::new();
+        let sysfs = RamFs::try_new().expect("boot: sysfs ramfs admission/allocation failed");
         self.mount_in_namespace(&root_ns, "/sys", sysfs.clone())
             .expect("Failed to mount sysfs");
 
@@ -790,12 +818,7 @@ impl Vfs {
                         if let Ok((_, parent_fs, parent_relative)) = self.find_mount(&parent_path) {
                             // Walk to the parent directory in the parent filesystem
                             let mut parent_inode = parent_fs.root_inode();
-                            let parent_components: Vec<&str> = parent_relative
-                                .split('/')
-                                .filter(|s| !s.is_empty())
-                                .collect();
-
-                            for comp in parent_components {
+                            for comp in parent_relative.split('/').filter(|s| !s.is_empty()) {
                                 if !parent_inode.is_dir() {
                                     return Err(FsError::NotDir);
                                 }
@@ -840,19 +863,19 @@ impl Vfs {
             // P2-C: fallible component collect (was infallible map/to_string).
             let mut resolved_prefix: Vec<String> = Vec::new();
             {
-                let parts: Vec<&str> = mount_path.split('/').filter(|s| !s.is_empty()).collect();
+                let parts = mount_path.split('/').filter(|s| !s.is_empty());
                 resolved_prefix
-                    .try_reserve_exact(parts.len())
+                    .try_reserve_exact(parts.clone().count())
                     .map_err(|_| FsError::NoMem)?;
                 for p in parts {
                     resolved_prefix.push(try_string_from_str(p)?);
                 }
             }
 
-            let components: Vec<&str> =
-                relative_path.split('/').filter(|s| !s.is_empty()).collect();
+            let components = relative_path.split('/').filter(|s| !s.is_empty());
+            let component_count = components.clone().count();
 
-            for (idx, component) in components.iter().enumerate() {
+            for (idx, component) in components.clone().enumerate() {
                 if !current.is_dir() {
                     return Err(FsError::NotDir);
                 }
@@ -876,7 +899,7 @@ impl Vfs {
 
                 let next = fs.lookup(&current, component)?;
                 let next_stat = next.stat()?;
-                let is_final = idx == components.len() - 1;
+                let is_final = idx + 1 == component_count;
 
                 // Check if this is a symlink
                 if next_stat.mode.file_type == FileType::Symlink {
@@ -922,18 +945,17 @@ impl Vfs {
                         }
                     } else {
                         // Relative symlink: resolve from current directory
-                        let prefix_parts: Vec<&str> =
-                            resolved_prefix.iter().map(|s| s.as_str()).collect();
-                        let prefix = try_join_path_components(&prefix_parts)?;
+                        let prefix =
+                            try_join_path_iter(resolved_prefix.iter().map(String::as_str))?;
                         try_join_two(&prefix, &target)?
                     };
 
                     // Append remaining path components
-                    let remaining: Vec<&str> = components.iter().skip(idx + 1).copied().collect();
-                    let full_path = if remaining.is_empty() {
+                    let remaining = components.clone().skip(idx + 1);
+                    let full_path = if remaining.clone().next().is_none() {
                         new_path
                     } else {
-                        let rem = try_join_path_components(&remaining)?;
+                        let rem = try_join_path_iter(remaining)?;
                         // rem is "/a/b"; join onto new_path without double slash
                         try_join_two(new_path.trim_end_matches('/'), rem.trim_start_matches('/'))?
                     };
@@ -1022,7 +1044,7 @@ impl Vfs {
         path: &str,
         flags: OpenFlags,
         create_mode: u16,
-    ) -> Result<Box<dyn FileOps>, FsError> {
+    ) -> Result<FileDescriptor, FsError> {
         self.open_with_resolve(path, flags, create_mode, ResolveFlags::empty())
     }
 
@@ -1046,8 +1068,36 @@ impl Vfs {
         flags: OpenFlags,
         create_mode: u16,
         resolve_flags: ResolveFlags,
-    ) -> Result<Box<dyn FileOps>, FsError> {
+    ) -> Result<FileDescriptor, FsError> {
+        self.open_with_resolve_using(
+            path,
+            flags,
+            create_mode,
+            resolve_flags,
+            PreparedFileHandle::try_new,
+        )
+    }
+
+    fn open_with_resolve_using<P>(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        create_mode: u16,
+        resolve_flags: ResolveFlags,
+        prepare: P,
+    ) -> Result<FileDescriptor, FsError>
+    where
+        P: FnOnce() -> Result<PreparedFileHandle, FsError>,
+    {
+        // R180-4 CLASS FIX: illegal O_ACCMODE must not reach DAC, create, or truncate.
+        flags.validate_access_mode()?;
+
         let path = normalize_path(path)?;
+        // RF180-37: admit and physically allocate the complete open file
+        // description before lookup can lead to O_CREAT publication. The
+        // prepared object rolls back exactly on every later authorization or
+        // filesystem error; finalization is allocation-free.
+        let prepared = prepare()?;
 
         // O_NOFOLLOW: don't follow the final symlink
         let follow_final = !flags.is_nofollow();
@@ -1146,7 +1196,14 @@ impl Vfs {
             return Err(FsError::IsDir);
         }
 
-        // Handle truncate for writable regular files
+        // Ask the already-resolved inode to initialize the prepared descriptor.
+        // This reuses the exact Arc that passed resolution and authorization;
+        // no implementation may manufacture a duplicate inode wrapper.
+        let descriptor = Arc::clone(&inode).open(flags, prepared)?;
+
+        // Handle truncate for writable regular files. The complete descriptor
+        // is live before mutation, so O_TRUNC has no later allocation-failure
+        // edge. A truncate error drops the private descriptor and its charges.
         // C.4 FIX: Revalidate write permission immediately before truncate
         if flags.is_truncate() && flags.is_writable() && !inode.is_dir() {
             let fresh_stat = inode.stat()?;
@@ -1163,7 +1220,7 @@ impl Vfs {
             inode.truncate(0)?;
         }
 
-        inode.open(flags)
+        Ok(descriptor)
     }
 
     /// Get file status by path
@@ -1854,7 +1911,7 @@ pub fn split_path(path: &str) -> Result<(String, &str), FsError> {
 /// * `path` - Path to the file
 /// * `flags` - Open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
 /// * `mode` - Permission mode for file creation (only used with O_CREAT)
-pub fn open(path: &str, flags: OpenFlags, mode: u16) -> Result<Box<dyn FileOps>, FsError> {
+pub fn open(path: &str, flags: OpenFlags, mode: u16) -> Result<FileDescriptor, FsError> {
     VFS.open(path, flags, mode)
 }
 
@@ -2289,6 +2346,9 @@ pub fn register_syscall_callbacks() {
     // sys_clone(CLONE_NEWNS) or sys_unshare(CLONE_NEWNS), preventing
     // post-clone parent mounts from leaking into child namespaces.
     kernel_core::register_mount_ns_materialize_callback(mount_ns_materialize_callback);
+    kernel_core::register_mount_ns_materialize_rollback_callback(
+        mount_ns_materialize_rollback_callback,
+    );
 
     klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled, R173-07 pread64/pwrite64 enabled, M0-6 symlink enabled)");
 }
@@ -2302,6 +2362,10 @@ fn mount_ns_materialize_callback(
     ns: &alloc::sync::Arc<kernel_core::MountNamespace>,
 ) -> Result<(), ()> {
     VFS.materialize_namespace(ns).map_err(|_| ())
+}
+
+fn mount_ns_materialize_rollback_callback(ns: &alloc::sync::Arc<kernel_core::MountNamespace>) {
+    VFS.rollback_materialized_namespace(ns);
 }
 
 /// VFS create callback for syscall registration
@@ -2345,19 +2409,58 @@ fn vfs_rename_callback(old: &str, new: &str, noreplace: bool) -> Result<(), Sysc
 ///
 /// If the first entry alone exceeds the budget, returns `EINVAL` (Linux-compatible behavior
 /// for buffer-too-small).
+fn commit_readdir_copy_result(
+    offset: &mut u64,
+    entries: &[kernel_core::DirEntry],
+    expected_bytes: usize,
+    copy_result: Result<usize, SyscallError>,
+) -> Result<usize, SyscallError> {
+    let written = copy_result?;
+    if written != expected_bytes {
+        return Err(SyscallError::EIO);
+    }
+    if let Some(last) = entries.last() {
+        *offset = u64::try_from(last.next_cookie).map_err(|_| SyscallError::EOVERFLOW)?;
+    }
+    Ok(written)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaddirReserveAction {
+    Append,
+    FinishPartial,
+}
+
+/// RF180-38 FIX: distinguish true end-of-directory from staging allocation
+/// failure. Before any entry is complete, OOM must be observable as ENOMEM;
+/// after a complete prefix exists, Linux getdents semantics return that prefix
+/// and leave the uncommitted entry for the next call.
+fn classify_readdir_reserve(
+    completed_entries: usize,
+    reserve_result: Result<(), TryReserveError>,
+) -> Result<ReaddirReserveAction, SyscallError> {
+    match reserve_result {
+        Ok(()) => Ok(ReaddirReserveAction::Append),
+        Err(_) if completed_entries == 0 => Err(SyscallError::ENOMEM),
+        Err(_) => Ok(ReaddirReserveAction::FinishPartial),
+    }
+}
+
 fn vfs_readdir_callback(
     fd: i32,
     max_bytes: usize,
-) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
+    user_dst: *mut u8,
+    copyout: kernel_core::syscall::VfsDirCopyout,
+) -> Result<usize, SyscallError> {
     use kernel_core::current_pid;
     use kernel_core::get_process;
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // Get inode and current offset from the file handle
+    // Get inode and the shared offset object from the file handle.
     // FIX: Extract inode Arc and offset to release process lock before I/O
-    let (inode, start_offset) = {
+    let (inode, shared_offset) = {
         let proc = proc_arc.lock();
         let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
@@ -2367,13 +2470,10 @@ fn vfs_readdir_callback(
             .downcast_ref::<FileHandle>()
             .ok_or(SyscallError::ENOTDIR)?;
 
-        // R131-5 FIX: Reject O_PATH fds. POSIX specifies that O_PATH file descriptors
-        // are path-only references that only support fstat/close/dup — not read/write/
-        // getdents64. Without this check, open(dir, O_PATH) bypasses DAC because
-        // is_readable()/is_writable() both return false for O_PATH, making
-        // check_access_permission() pass with no checks. An unprivileged process
-        // could enumerate any directory's contents.
-        if file_handle.flags.is_path() {
+        // R131-5 + R180-4 FIX: require a readable (non-O_PATH) description for
+        // getdents64. O_PATH and residual non-readable access modes (O_WRONLY,
+        // illegal mode 3 if any path skipped open validation) must not enumerate.
+        if !file_handle.flags.allows_readdir() {
             return Err(SyscallError::EBADF);
         }
 
@@ -2381,9 +2481,7 @@ fn vfs_readdir_callback(
             return Err(SyscallError::ENOTDIR);
         }
 
-        // Read offset before creating tuple to avoid lifetime issues
-        let offset = *file_handle.offset.lock() as usize;
-        (Arc::clone(&file_handle.inode), offset)
+        (Arc::clone(&file_handle.inode), file_handle.offset.clone())
     };
     // Process lock released here - safe for procfs operations
 
@@ -2393,15 +2491,16 @@ fn vfs_readdir_callback(
         lsm::hook_file_permission(&task, dir_stat.ino, 0x05).map_err(|_| SyscallError::EACCES)?;
     }
 
-    // R114-2 FIX: Read directory entries with budget enforcement.
-    // Estimate the serialized dirent64 size per entry to bound kernel heap allocation.
-    // IMPORTANT: The header size MUST match `size_of::<LinuxDirent64>()` used in
-    // `sys_getdents64` (24 bytes with #[repr(C)] tail padding: d_ino:8 + d_off:8 +
-    // d_reclen:2 + d_type:1 + 5 bytes padding = 24), NOT the raw field sum (19).
-    // A mismatch would cause the budget to over-collect entries that `sys_getdents64`
-    // then skips (because the serialized reclen is larger), advancing the file offset
-    // past entries never emitted to userspace.
-    const DIRENT64_HEADER_SIZE: usize = 24; // must equal size_of::<LinuxDirent64>()
+    // R180-L1: serialize concurrent operations on this open file description.
+    // Hold the offset lock through enumeration and user copyout; publish the new
+    // position only after copyout succeeds.
+    let mut offset_guard = shared_offset.lock();
+    let start_offset = usize::try_from(*offset_guard).map_err(|_| SyscallError::EOVERFLOW)?;
+
+    // R114-2 + R180-25: budget against the exact Linux wire record. `d_name`
+    // starts immediately after d_type at byte 19; the 24-byte Rust struct size
+    // includes tail padding and must never be used as the flexible-tail offset.
+    const DIRENT64_HEADER_SIZE: usize = kernel_core::syscall::LINUX_DIRENT64_NAME_OFFSET;
     let mut entries = Vec::new();
     let mut offset = start_offset;
     let mut estimated_bytes: usize = 0;
@@ -2409,6 +2508,7 @@ fn vfs_readdir_callback(
     loop {
         match inode.readdir(offset) {
             Ok(Some((next, entry))) => {
+                let next_cookie = i64::try_from(next).map_err(|_| SyscallError::EOVERFLOW)?;
                 // Estimate the serialized record length for this entry
                 let reclen = (DIRENT64_HEADER_SIZE + entry.name.len() + 1 + 7) & !7;
 
@@ -2425,8 +2525,6 @@ fn vfs_readdir_callback(
                 if estimated_bytes.saturating_add(reclen) > max_bytes {
                     break;
                 }
-                estimated_bytes += reclen;
-
                 // Convert VFS DirEntry to kernel_core DirEntry
                 let file_type = match entry.file_type {
                     crate::types::FileType::Regular => kernel_core::FileType::Regular,
@@ -2437,17 +2535,21 @@ fn vfs_readdir_callback(
                     crate::types::FileType::Fifo => kernel_core::FileType::Fifo,
                     crate::types::FileType::Socket => kernel_core::FileType::Socket,
                 };
-                // R161-6 FIX: Fallible allocation before push. The byte
-                // budget bounds entry count (~30K at 1MB) but Vec::push
-                // growth is infallible, panicking under OOM.
-                if entries.try_reserve(1).is_err() {
-                    break;
+                // R161-6 + RF180-38 FIX: growth remains fallible, but allocation
+                // failure is not end-of-directory. With no completed record it
+                // is ENOMEM; otherwise copy and commit only the completed prefix.
+                let reserve_result = entries.try_reserve(1);
+                match classify_readdir_reserve(entries.len(), reserve_result)? {
+                    ReaddirReserveAction::Append => {}
+                    ReaddirReserveAction::FinishPartial => break,
                 }
                 entries.push(kernel_core::DirEntry {
                     name: entry.name,
                     ino: entry.ino,
                     file_type,
+                    next_cookie,
                 });
+                estimated_bytes += reclen;
                 offset = next;
             }
             Ok(None) => break,
@@ -2455,18 +2557,154 @@ fn vfs_readdir_callback(
         }
     }
 
-    // Re-acquire process lock to update the original file handle's offset
-    // FIX: Update the actual fd_table entry, not a clone
-    {
-        let proc = proc_arc.lock();
-        if let Some(handle) = proc.get_fd(fd) {
-            if let Some(file_handle) = handle.as_any().downcast_ref::<FileHandle>() {
-                *file_handle.offset.lock() = offset as u64;
-            }
-        }
+    // RF180-14 FIX: the helper publishes only after successful copyout and an
+    // exact byte-count proof. EFAULT/EIO retries retain the original cookie.
+    commit_readdir_copy_result(
+        &mut offset_guard,
+        &entries,
+        estimated_bytes,
+        copyout(user_dst, max_bytes, &entries),
+    )
+}
+
+#[cfg(test)]
+mod readdir_cookie_tests {
+    use super::*;
+
+    fn deterministic_reserve_failure() -> Result<(), TryReserveError> {
+        let mut probe = Vec::<u8>::new();
+        probe.try_reserve(usize::MAX)
     }
 
-    Ok(entries)
+    #[test]
+    fn rf180_14_copy_fault_preserves_cookie_then_retry_commits() {
+        let entries = [kernel_core::DirEntry {
+            name: "entry".into(),
+            ino: 1,
+            file_type: kernel_core::FileType::Regular,
+            next_cookie: 0x1234_5678,
+        }];
+        let mut offset = 0x55u64;
+        assert!(matches!(
+            commit_readdir_copy_result(&mut offset, &entries, 24, Err(SyscallError::EFAULT)),
+            Err(SyscallError::EFAULT)
+        ));
+        assert_eq!(offset, 0x55, "fault must not consume the resume cookie");
+        assert_eq!(
+            commit_readdir_copy_result(&mut offset, &entries, 24, Ok(24)).unwrap(),
+            24
+        );
+        assert_eq!(offset, 0x1234_5678);
+    }
+
+    #[test]
+    fn rf180_38_first_entry_reserve_failure_returns_enomem_not_false_eof() {
+        let reserve_result = deterministic_reserve_failure();
+        assert!(
+            reserve_result.is_err(),
+            "capacity overflow must be deterministic"
+        );
+        assert!(matches!(
+            classify_readdir_reserve(0, reserve_result),
+            Err(SyscallError::ENOMEM)
+        ));
+    }
+
+    #[test]
+    fn rf180_38_later_reserve_failure_commits_completed_prefix() {
+        let entries = [kernel_core::DirEntry {
+            name: "complete".into(),
+            ino: 7,
+            file_type: kernel_core::FileType::Regular,
+            next_cookie: 0x4321,
+        }];
+        let reserve_result = deterministic_reserve_failure();
+        assert!(
+            reserve_result.is_err(),
+            "capacity overflow must be deterministic"
+        );
+        assert_eq!(
+            classify_readdir_reserve(entries.len(), reserve_result).unwrap(),
+            ReaddirReserveAction::FinishPartial
+        );
+
+        let expected_bytes =
+            (kernel_core::syscall::LINUX_DIRENT64_NAME_OFFSET + entries[0].name.len() + 1 + 7) & !7;
+        let mut offset = 0x55u64;
+        assert_eq!(
+            commit_readdir_copy_result(&mut offset, &entries, expected_bytes, Ok(expected_bytes),)
+                .unwrap(),
+            expected_bytes
+        );
+        assert_eq!(offset, entries[0].next_cookie as u64);
+    }
+}
+
+#[cfg(test)]
+mod rf180_37_open_tests {
+    use super::*;
+
+    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    #[test]
+    fn preparation_failure_precedes_create_and_truncate_without_vfs_ledger_drift() {
+        let _serial = TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+
+        let vfs = Vfs::new();
+        let fs = RamFs::try_new().expect("RF180-37 ramfs fixture");
+        let root = fs.root_inode();
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/", fs.clone())
+            .expect("RF180-37 root mount");
+
+        let victim = fs
+            .create(&root, "victim", FileMode::new(FileType::Regular, 0o600))
+            .expect("RF180-37 victim creation");
+        let contents = b"must survive failed O_TRUNC";
+        assert_eq!(
+            victim.write_at(0, contents).expect("victim write"),
+            contents.len()
+        );
+
+        let ledger_before = mm::heap_class_snapshot(mm::HeapClass::Vfs);
+        assert!(matches!(
+            vfs.open_with_resolve_using(
+                "/must-not-exist",
+                OpenFlags::new(OpenFlags::O_CREAT | OpenFlags::O_WRONLY),
+                0o600,
+                ResolveFlags::empty(),
+                || Err(FsError::NoMem),
+            ),
+            Err(FsError::NoMem)
+        ));
+        assert!(matches!(
+            fs.lookup(&root, "must-not-exist"),
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(mm::heap_class_snapshot(mm::HeapClass::Vfs), ledger_before);
+
+        assert!(matches!(
+            vfs.open_with_resolve_using(
+                "/victim",
+                OpenFlags::new(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC),
+                0,
+                ResolveFlags::empty(),
+                || Err(FsError::NoMem),
+            ),
+            Err(FsError::NoMem)
+        ));
+        assert_eq!(
+            victim.stat().expect("victim stat").size,
+            contents.len() as u64
+        );
+        let mut observed = [0u8; 64];
+        assert_eq!(
+            victim.read_at(0, &mut observed).expect("victim readback"),
+            contents.len()
+        );
+        assert_eq!(&observed[..contents.len()], contents);
+        assert_eq!(mm::heap_class_snapshot(mm::HeapClass::Vfs), ledger_before);
+    }
 }
 
 /// VFS truncate callback for syscall registration
@@ -2528,8 +2766,28 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
     inode.truncate(length).map_err(fs_error_to_syscall)
 }
 
+/// Shared access/seekability gate for pread64 and pwrite64.
+#[inline]
+fn positioned_io_gate(access_allowed: bool, seekable: bool) -> Result<(), SyscallError> {
+    if !access_allowed {
+        return Err(SyscallError::EBADF);
+    }
+    if !seekable {
+        return Err(SyscallError::ESPIPE);
+    }
+    Ok(())
+}
+
+/// RF180-L1 executable state matrix for positioned I/O. In particular, a
+/// readable character device such as `/dev/console` must fail with ESPIPE
+/// before its consuming `read_at` implementation is reached.
+pub fn run_positioned_io_gate_self_test() {
+    assert_eq!(positioned_io_gate(false, false), Err(SyscallError::EBADF));
+    assert_eq!(positioned_io_gate(true, false), Err(SyscallError::ESPIPE));
+    assert_eq!(positioned_io_gate(true, true), Ok(()));
+}
+
 /// VFS positioned read callback for pread64 (R173-07 proper fix).
-///
 /// Reads from fd at offset without changing the fd's current offset.
 fn vfs_pread_callback(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, SyscallError> {
     use kernel_core::{current_pid, get_process};
@@ -2548,18 +2806,21 @@ fn vfs_pread_callback(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Sys
         let file_handle = handle
             .as_any()
             .downcast_ref::<FileHandle>()
-            .ok_or(SyscallError::ENOSYS)?;
+            .ok_or(SyscallError::ESPIPE)?;
 
-        // POSIX: pread requires the fd to be readable
-        if !file_handle.flags.is_readable() {
-            return Err(SyscallError::EBADF);
-        }
+        // RF180-L1: reject pipes/sockets/character devices before read_at can
+        // dequeue input. Console FileHandles are deliberately non-seekable.
+        positioned_io_gate(file_handle.flags.is_readable(), file_handle.seekable)?;
 
         file_handle.inode.clone()
     };
     // Process lock released before positioned read
 
-    inode.read_at(offset, buf).map_err(fs_error_to_syscall)
+    let count = inode.read_at(offset, buf).map_err(fs_error_to_syscall)?;
+    if count > buf.len() {
+        return Err(SyscallError::EIO);
+    }
+    Ok(count)
 }
 
 /// VFS positioned write callback for pwrite64 (R173-07 proper fix).
@@ -2580,18 +2841,21 @@ fn vfs_pwrite_callback(fd: i32, data: &[u8], offset: u64) -> Result<usize, Sysca
         let file_handle = handle
             .as_any()
             .downcast_ref::<FileHandle>()
-            .ok_or(SyscallError::ENOSYS)?;
+            .ok_or(SyscallError::ESPIPE)?;
 
-        // POSIX: pwrite requires the fd to be writable
-        if !file_handle.flags.is_writable() {
-            return Err(SyscallError::EBADF);
-        }
+        // Keep positioned-write semantics congruent: non-seekable endpoints
+        // reject before any externally visible device write.
+        positioned_io_gate(file_handle.flags.is_writable(), file_handle.seekable)?;
 
         file_handle.inode.clone()
     };
     // Process lock released before positioned write
 
-    inode.write_at(offset, data).map_err(fs_error_to_syscall)
+    let count = inode.write_at(offset, data).map_err(fs_error_to_syscall)?;
+    if count > data.len() {
+        return Err(SyscallError::EIO);
+    }
+    Ok(count)
 }
 
 /// VFS symlink creation callback (M0-6 SLICE 3).
