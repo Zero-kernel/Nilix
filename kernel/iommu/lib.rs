@@ -52,6 +52,7 @@
 //! - Phase F.3 in roadmap.md
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
@@ -75,11 +76,11 @@ pub mod fault;
 pub mod interrupt;
 pub mod vtd;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use mm::{AdmittedMap, AdmittedVec, HeapClass};
 use spin::{Lazy, Mutex, RwLock};
 
 // Re-export key types
@@ -136,6 +137,9 @@ static IOMMU_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether IOMMU initialization has been attempted.
 static IOMMU_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Single-writer guard for the fallible multi-stage initialization transaction.
+static IOMMU_INIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 /// R90-1 FIX: Whether a previous initialization attempt failed.
 ///
 /// Once set, all subsequent IOMMU operations will fail-closed.
@@ -146,10 +150,19 @@ static IOMMU_INIT_FAILED: AtomicBool = AtomicBool::new(false);
 static IOMMU_UNIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Registry of IOMMU units (VT-d hardware units).
-static IOMMU_UNITS: Lazy<RwLock<Vec<Arc<VtdUnit>>>> = Lazy::new(|| RwLock::new(Vec::new()));
+static IOMMU_UNITS: Lazy<RwLock<AdmittedVec<Arc<VtdUnit>>>> =
+    Lazy::new(|| RwLock::new(AdmittedVec::new(HeapClass::Device)));
+
+/// IRQ readers cannot acquire the unit registry's blocking RwLock. Unit Arcs
+/// are retained for the kernel lifetime, so publish their stable pointee
+/// addresses once initialization is complete and never mutate this snapshot.
+static FAULT_UNIT_PTRS: [AtomicPtr<VtdUnit>; MAX_IOMMU_UNITS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; MAX_IOMMU_UNITS];
+static FAULT_UNIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Registry of domains.
-static DOMAINS: Lazy<RwLock<Vec<Arc<Domain>>>> = Lazy::new(|| RwLock::new(Vec::new()));
+static DOMAINS: Lazy<RwLock<AdmittedVec<Arc<Domain>>>> =
+    Lazy::new(|| RwLock::new(AdmittedVec::new(HeapClass::Device)));
 // R163-I8 FIX: Monotonic domain ID counter independent of Vec length.
 // R165-8 FIX: Start at 1, not 0. KERNEL_DOMAIN_ID = 0 is registered at init()
 // WITHOUT advancing this counter, so a base of 0 made the first create_domain()/
@@ -161,13 +174,21 @@ static NEXT_DOMAIN_ID: AtomicU32 = AtomicU32::new(1);
 
 /// VM domain registry: maps domain ID to VM identifier.
 /// Used to distinguish VM passthrough domains from kernel domains.
-static VM_DOMAINS: Lazy<Mutex<BTreeMap<DomainId, u64>>> = Lazy::new(|| Mutex::new(BTreeMap::new()));
+static VM_DOMAINS: Lazy<Mutex<AdmittedMap<DomainId, u64>>> =
+    Lazy::new(|| Mutex::new(AdmittedMap::new(HeapClass::Device)));
 
 /// Device-to-IRTE tracking for VM passthrough.
-/// Key: (segment, bus, device, function), Value: (domain_id, IRTE index)
+/// Key: (segment, bus, device, function), value: domain/IRTE plus detach phase.
 type DeviceKey = (u16, u8, u8, u8);
-static VM_DEVICE_IRTES: Lazy<Mutex<BTreeMap<DeviceKey, (DomainId, usize)>>> =
-    Lazy::new(|| Mutex::new(BTreeMap::new()));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VmDeviceAssignment {
+    domain_id: DomainId,
+    irte_index: usize,
+    device_detached: bool,
+}
+
+static VM_DEVICE_IRTES: Lazy<Mutex<AdmittedMap<DeviceKey, VmDeviceAssignment>>> =
+    Lazy::new(|| Mutex::new(AdmittedMap::new(HeapClass::Device)));
 
 // ============================================================================
 // Types
@@ -242,10 +263,104 @@ pub enum IommuError {
     DmaFault,
     /// Permission denied.
     PermissionDenied,
+    /// Sticky cache poison observed before a new mapping mutated any state.
+    CachePoisonedPreMutation,
+    /// Non-blocking IRQ-side operation must be retried later.
+    WouldBlock,
+    /// VM domains require the assignment transaction API.
+    VmDomainRequiresTransaction,
 }
 
 /// Result type for IOMMU operations.
 pub type IommuResult<T> = Result<T, IommuError>;
+
+/// RF180-30 FIX: private prepare/commit state for publishing IOMMU readiness.
+/// DMA hooks and the IRQ fault snapshot must both exist before any public
+/// readiness flag can become visible to concurrent allocators or IRQ readers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitPublicationPhase {
+    PrivateReady,
+    DmaHooksReady,
+    TranslationReady,
+    FaultSnapshotReady,
+}
+
+impl InitPublicationPhase {
+    const fn after_dma_hooks(self) -> Option<Self> {
+        match self {
+            Self::PrivateReady => Some(Self::DmaHooksReady),
+            Self::DmaHooksReady | Self::TranslationReady | Self::FaultSnapshotReady => None,
+        }
+    }
+
+    const fn after_translation(self) -> Option<Self> {
+        match self {
+            Self::DmaHooksReady => Some(Self::TranslationReady),
+            Self::PrivateReady | Self::TranslationReady | Self::FaultSnapshotReady => None,
+        }
+    }
+
+    const fn after_fault_snapshot(self) -> Option<Self> {
+        match self {
+            Self::TranslationReady => Some(Self::FaultSnapshotReady),
+            Self::PrivateReady | Self::DmaHooksReady | Self::FaultSnapshotReady => None,
+        }
+    }
+
+    const fn may_commit_ready(self) -> bool {
+        matches!(self, Self::FaultSnapshotReady)
+    }
+}
+
+fn install_fail_closed_dma_hooks() -> IommuResult<()> {
+    mm::dma::register_iommu_ops(mm::dma::IommuOps {
+        kernel_domain_id: KERNEL_DOMAIN_ID,
+        map_range: dma_map_range_hook,
+        unmap_range: dma_unmap_range_hook,
+    })
+    .map_err(|_| IommuError::HardwareInitFailed)?;
+    if mm::dma::iommu_ops_registered() {
+        Ok(())
+    } else {
+        Err(IommuError::HardwareInitFailed)
+    }
+}
+
+fn publish_fault_unit_snapshot(units: &[Arc<VtdUnit>]) -> IommuResult<usize> {
+    if units.len() > MAX_IOMMU_UNITS || FAULT_UNIT_COUNT.load(Ordering::Acquire) != 0 {
+        return Err(IommuError::HardwareInitFailed);
+    }
+    let mut published = 0usize;
+    for unit in units.iter().filter(|unit| unit.translation_enabled()) {
+        let ptr = Arc::as_ptr(unit).cast_mut();
+        if ptr.is_null() {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        FAULT_UNIT_PTRS[published].store(ptr, Ordering::Relaxed);
+        published += 1;
+    }
+    if published == 0 {
+        return Err(IommuError::HardwareInitFailed);
+    }
+    // Release publishes every preceding pointer store. Readers acquire the
+    // count before dereferencing any slot.
+    FAULT_UNIT_COUNT.store(published, Ordering::Release);
+    Ok(published)
+}
+
+#[inline]
+fn fault_unit(index: usize) -> Option<&'static VtdUnit> {
+    if index >= FAULT_UNIT_COUNT.load(Ordering::Acquire) {
+        return None;
+    }
+    let ptr = FAULT_UNIT_PTRS[index].load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is published only from an Arc retained permanently
+    // in IOMMU_UNITS; that registry never removes units after initialization.
+    Some(unsafe { &*ptr })
+}
 
 // ============================================================================
 // Public API
@@ -254,11 +369,11 @@ pub type IommuResult<T> = Result<T, IommuError>;
 /// Initialize the IOMMU subsystem.
 ///
 /// This function:
-/// 1. Parses the ACPI DMAR table to discover IOMMU units
-/// 2. Initializes each VT-d unit
-/// 3. Creates the kernel domain (page-table with on-demand mappings)
-/// 4. Enables translation on all units
-/// 5. Registers DMA allocation hooks for mm::dma
+/// 1. Closes the DMA allocator's legacy gate
+/// 2. Parses the ACPI DMAR table and installs fail-closed hooks when present
+/// 3. Initializes each VT-d unit and the kernel translation domain
+/// 4. Enables translation and publishes the fault-capture snapshot
+/// 5. Atomically commits allocator/core readiness, then INIT_DONE
 ///
 /// # Returns
 ///
@@ -270,6 +385,67 @@ pub type IommuResult<T> = Result<T, IommuError>;
 /// This should be called early in boot, before PCI devices are initialized.
 /// If IOMMU is not available, the kernel can still operate in bypass mode.
 pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
+    if IOMMU_INIT_DONE.load(Ordering::Acquire) || IOMMU_INIT_FAILED.load(Ordering::Acquire) {
+        return Err(IommuError::NotInitialized);
+    }
+    if IOMMU_INIT_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(IommuError::NotInitialized);
+    }
+
+    // RF180-31: close the entire public init window before firmware parsing.
+    // DMA allocation rejects while Probing and rechecks under the same gate
+    // after physical allocation, so no in-flight legacy buffer can cross into
+    // a present or malformed-IOMMU initialization attempt.
+    if mm::dma::begin_iommu_probe().is_err() {
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        IOMMU_INIT_IN_PROGRESS.store(false, Ordering::Release);
+        return Err(IommuError::HardwareInitFailed);
+    }
+
+    let result = match init_attempt(rsdp_phys) {
+        Ok(count) => {
+            let committed = mm::dma::commit_iommu_probe(|| {
+                // The DMA gate remains Probing while core readiness publishes;
+                // allocator-visible Active is the final edge under that gate.
+                IOMMU_UNIT_COUNT.store(count, Ordering::SeqCst);
+                IOMMU_ENABLED.store(true, Ordering::SeqCst);
+            });
+            if committed.is_err() {
+                mm::dma::fail_iommu_probe();
+                IOMMU_ENABLED.store(false, Ordering::SeqCst);
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                Err(IommuError::HardwareInitFailed)
+            } else {
+                IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
+                kprintln!("[IOMMU] Initialized {} IOMMU units", count);
+                Ok(count)
+            }
+        }
+        Err(IommuError::NoDmarTable) => {
+            if mm::dma::finish_iommu_probe_without_hardware().is_err() {
+                mm::dma::fail_iommu_probe();
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                Err(IommuError::HardwareInitFailed)
+            } else {
+                IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
+                Err(IommuError::NoDmarTable)
+            }
+        }
+        Err(error) => {
+            mm::dma::fail_iommu_probe();
+            IOMMU_ENABLED.store(false, Ordering::SeqCst);
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            Err(error)
+        }
+    };
+    IOMMU_INIT_IN_PROGRESS.store(false, Ordering::Release);
+    result
+}
+
+fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
     // R90-1 FIX: Prevent double init and fail closed after a previous failure.
     // Check both flags with Acquire ordering to ensure visibility.
     if IOMMU_INIT_DONE.load(Ordering::Acquire) || IOMMU_INIT_FAILED.load(Ordering::Acquire) {
@@ -284,15 +460,38 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         Err(DmarError::NotFound) => {
             klog_always!("[IOMMU] No DMAR table found - IOMMU not available");
             // R90-1 NOTE: No IOMMU hardware present - allow legacy bypass.
-            // R163-I6 FIX: Mark INIT_DONE to prevent redundant re-entries.
-            IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
+            // The outer single-writer wrapper publishes INIT_DONE after this
+            // attempt has completely returned.
             return Err(IommuError::NoDmarTable);
         }
         Err(e) => {
             klog!(Error, "[IOMMU] DMAR table parse error: {:?}", e);
             // R90-1 FIX: DMAR exists but parse failed - fail-closed
+            let hooks_ready = install_fail_closed_dma_hooks().is_ok();
             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
-            return Err(IommuError::InvalidDmar);
+            return if hooks_ready {
+                Err(IommuError::InvalidDmar)
+            } else {
+                Err(IommuError::HardwareInitFailed)
+            };
+        }
+    };
+
+    let mut publication_phase = InitPublicationPhase::PrivateReady;
+
+    // RF180-30 FIX: a valid DMAR table commits the boot to fail-closed DMA.
+    // Install hooks before any fallible unit/domain construction so a racing
+    // allocator cannot take the legacy no-hook path after hardware presence is
+    // established. No-DMAR returns above and deliberately retains legacy mode.
+    if install_fail_closed_dma_hooks().is_err() {
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        return Err(IommuError::HardwareInitFailed);
+    }
+    publication_phase = match publication_phase.after_dma_hooks() {
+        Some(phase) => phase,
+        None => {
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            return Err(IommuError::HardwareInitFailed);
         }
     };
 
@@ -311,6 +510,10 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
 
     // Initialize each DRHD (DMA Remapping Hardware Unit)
     let mut units = IOMMU_UNITS.write();
+    units.try_reserve_exact(dmar.drhd_count()).map_err(|_| {
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        IommuError::PageTableAllocFailed
+    })?;
     let mut count = 0u32;
 
     for drhd in dmar.drhd_iter() {
@@ -322,10 +525,8 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
             break;
         }
 
-        match VtdUnit::new(drhd) {
+        match VtdUnit::try_new_arc(drhd) {
             Ok(unit) => {
-                let unit = Arc::new(unit);
-
                 // F.3: Setup interrupt remapping if supported/required
                 match unit.setup_interrupt_remapping(ir_required) {
                     Ok(enabled) => {
@@ -356,6 +557,15 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
                                 count,
                                 e
                             );
+                            if unit.owns_ambiguous_ir_table() {
+                                // IRTA/IRE acknowledgement is ambiguous. Keep
+                                // the unit and its table alive even though init
+                                // fails, or hardware could later dereference a
+                                // freed page. Capacity was admitted up front.
+                                if let Err(unit) = units.push_reserved(unit) {
+                                    core::mem::forget(unit);
+                                }
+                            }
                             // R90-1 FIX: Mark init as failed before returning
                             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
                             return Err(IommuError::HardwareInitFailed);
@@ -371,7 +581,15 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
                     }
                 }
 
-                units.push(unit);
+                if let Err(unit) = units.push_reserved(unit) {
+                    // Capacity was admitted before any unit-side MMIO. Reaching
+                    // this branch indicates a collection invariant failure; a
+                    // unit may already own live IR hardware, so quarantine its
+                    // allocation rather than dropping memory hardware can use.
+                    core::mem::forget(unit);
+                    IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                    return Err(IommuError::HardwareInitFailed);
+                }
                 count += 1;
             }
             Err(e) => {
@@ -391,8 +609,6 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
         return Err(IommuError::HardwareInitFailed);
     }
-
-    IOMMU_UNIT_COUNT.store(count, Ordering::SeqCst);
 
     // R94-13 FIX: Select a common AGAW (address width) supported by all units.
     // Prefer 48-bit (4-level) when available, fall back to 39-bit (3-level).
@@ -425,10 +641,12 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
     // individually when allocated via mm::dma::alloc_dma_buffer().
     // This provides stricter isolation - devices can only access memory
     // that has been explicitly allocated for DMA.
-    let kernel_domain = Arc::new(Domain::new_paged_with_agaw(
-        KERNEL_DOMAIN_ID,
-        kernel_domain_agaw,
-    )?);
+    let mut domains = DOMAINS.write();
+    domains
+        .try_reserve(1)
+        .map_err(|_| IommuError::PageTableAllocFailed)?;
+    let kernel_domain =
+        Domain::new_paged_with_agaw(KERNEL_DOMAIN_ID, kernel_domain_agaw)?.try_into_arc()?;
 
     // Ensure the SLPT root exists before attaching devices.
     // With on-demand mappings, the kernel domain has no initial mappings,
@@ -441,7 +659,10 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         kernel_domain_agaw
     );
 
-    DOMAINS.write().push(kernel_domain);
+    domains
+        .push_reserved(kernel_domain)
+        .map_err(|_| IommuError::HardwareInitFailed)?;
+    drop(domains);
 
     // Handle RMRR (Reserved Memory Region Reporting)
     // These are memory regions that devices may DMA to before OS takes control
@@ -456,9 +677,8 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         // TODO: Map RMRR regions in all domains that may contain affected devices
     }
 
-    // R94-13 FIX: Enable DMA translation on all units BEFORE registering hooks.
-    // This ensures is_enabled() returns true and map_range() succeeds.
-    // Without this, on-demand mapping would fail with NotInitialized.
+    // Enable translation only after fail-closed hooks are present. Allocations
+    // remain rejected until every remaining prepare step succeeds.
     let translation_success_count = {
         let units = IOMMU_UNITS.read();
         let mut success = 0u32;
@@ -479,8 +699,9 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         success
     };
 
-    // R94-13 FIX: Only register hooks if at least one unit has translation enabled.
-    // If all units failed, don't register hooks to avoid map failures and memory leaks.
+    // R94-13/RF180-30: if every TE command fails, keep the already-installed
+    // fail-closed hooks but never publish readiness. Mapping attempts are then
+    // rejected and freed rather than silently returning unisolated buffers.
     if translation_success_count == 0 && count > 0 {
         klog!(
             Error,
@@ -490,20 +711,50 @@ pub fn init(rsdp_phys: u64) -> IommuResult<u32> {
         return Err(IommuError::HardwareInitFailed);
     }
 
-    IOMMU_ENABLED.store(true, Ordering::SeqCst);
-    // R90-1 FIX: Only mark as done on successful initialization
-    IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
+    publication_phase = match publication_phase.after_translation() {
+        Some(phase) => phase,
+        None => {
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            return Err(IommuError::HardwareInitFailed);
+        }
+    };
 
-    // Register IOMMU mapping hooks for the unified DMA allocator.
-    // Drivers can now use mm::dma::alloc_dma_buffer() to get on-demand mappings.
-    mm::dma::register_iommu_ops(mm::dma::IommuOps {
-        kernel_domain_id: KERNEL_DOMAIN_ID,
-        map_range: dma_map_range_hook,
-        unmap_range: dma_unmap_range_hook,
-    });
+    // Prepare the immutable lock-free IRQ view only after unit construction and
+    // translation setup are complete. Public readiness remains false here.
+    {
+        let units = IOMMU_UNITS.read();
+        let active = units
+            .iter()
+            .filter(|unit| unit.translation_enabled())
+            .count();
+        if active != translation_success_count as usize {
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            return Err(IommuError::HardwareInitFailed);
+        }
+        match publish_fault_unit_snapshot(units.as_slice()) {
+            Ok(published) if published == active => {}
+            Ok(_) | Err(_) => {
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                return Err(IommuError::HardwareInitFailed);
+            }
+        }
+    }
 
-    kprintln!("[IOMMU] Initialized {} IOMMU units", count);
+    publication_phase = match publication_phase.after_fault_snapshot() {
+        Some(phase) => phase,
+        None => {
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            return Err(IommuError::HardwareInitFailed);
+        }
+    };
 
+    if !publication_phase.may_commit_ready() {
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        return Err(IommuError::HardwareInitFailed);
+    }
+
+    // The outer wrapper commits UNIT_COUNT/ENABLED and the DMA Active edge
+    // under one allocation gate, then publishes INIT_DONE last.
     Ok(count)
 }
 
@@ -616,6 +867,9 @@ pub fn attach_device(device: PciDeviceId) -> IommuResult<()> {
 /// * `Err(IommuError)` - Attachment failed
 pub fn attach_device_to_domain(device: PciDeviceId, domain_id: DomainId) -> IommuResult<()> {
     ensure_iommu_ready()?;
+    if VM_DOMAINS.lock().contains_key(&domain_id) {
+        return Err(IommuError::VmDomainRequiresTransaction);
+    }
 
     // Find the IOMMU unit responsible for this device
     let units = IOMMU_UNITS.read();
@@ -700,6 +954,9 @@ pub fn detach_device(device: PciDeviceId) -> IommuResult<()> {
 /// - Validates device is actually attached to the specified domain
 pub fn detach_device_from_domain(device: PciDeviceId, domain_id: DomainId) -> IommuResult<()> {
     ensure_iommu_ready()?;
+    if VM_DOMAINS.lock().contains_key(&domain_id) {
+        return Err(IommuError::VmDomainRequiresTransaction);
+    }
 
     // R96-6 FIX: Removed dead code - ensure_iommu_ready() already returns
     // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
@@ -775,14 +1032,22 @@ pub fn map_range(
         .find(|d| d.id() == domain_id)
         .ok_or(IommuError::DomainNotFound)?;
 
+    // A poisoned unit may contain an untracked-present context if admission
+    // failed during recovery. Reject before changing domain state even when a
+    // per-domain scan cannot identify that context.
+    {
+        let units = IOMMU_UNITS.read();
+        if units.iter().any(|unit| !unit.cache_healthy()) {
+            return Err(IommuError::CachePoisonedPreMutation);
+        }
+    }
+
     domain.map_range(iova, phys, size, write)?;
 
     // Invalidate IOTLB for the affected range
     let units = IOMMU_UNITS.read();
     for unit in units.iter() {
-        if unit.has_domain(domain_id) {
-            unit.invalidate_iotlb_range(domain_id, iova, size)?;
-        }
+        unit.invalidate_iotlb_range_if_attached(domain_id, iova, size)?;
     }
 
     Ok(())
@@ -813,15 +1078,15 @@ pub fn unmap_range(domain_id: DomainId, iova: u64, size: usize) -> IommuResult<(
         .find(|d| d.id() == domain_id)
         .ok_or(IommuError::DomainNotFound)?;
 
-    domain.unmap_range(iova, size)?;
+    domain.prepare_unmap(iova, size)?;
 
-    // Invalidate IOTLB for the unmapped range
+    // Tombstone and accounting remain owned until every relevant unit confirms
+    // stale translations are retired. Failure is retryable without allocation.
     let units = IOMMU_UNITS.read();
     for unit in units.iter() {
-        if unit.has_domain(domain_id) {
-            unit.invalidate_iotlb_range(domain_id, iova, size)?;
-        }
+        unit.retire_iotlb_range_if_attached(domain_id, iova, size)?;
     }
+    domain.commit_unmap(iova, size)?;
 
     Ok(())
 }
@@ -847,6 +1112,9 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
     if domains.len() >= MAX_DOMAINS {
         return Err(IommuError::TooManyDomains);
     }
+    domains
+        .try_reserve(1)
+        .map_err(|_| IommuError::PageTableAllocFailed)?;
 
     // R165-8 FIX: Reject an ID that aliases the kernel DMA domain (id 0) or any
     // live domain. With NEXT_DOMAIN_ID based at 1 this only triggers on a
@@ -872,7 +1140,10 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
         DomainType::PageTable => Domain::new_paged(id)?,
     };
 
-    domains.push(Arc::new(domain));
+    let domain = domain.try_into_arc()?;
+    domains
+        .push_reserved(domain)
+        .map_err(|_| IommuError::HardwareInitFailed)?;
 
     kprintln!("[IOMMU] Created domain {} ({:?})", id, domain_type);
     Ok(id)
@@ -988,17 +1259,34 @@ pub fn create_vm_domain(vm_id: u64) -> IommuResult<DomainId> {
     if domains.len() >= MAX_DOMAINS {
         return Err(IommuError::TooManyDomains);
     }
+    let mut vm_domains = VM_DOMAINS.lock();
+    domains
+        .try_reserve(1)
+        .map_err(|_| IommuError::PageTableAllocFailed)?;
+    vm_domains
+        .ensure_capacity_for(1)
+        .map_err(|_| IommuError::PageTableAllocFailed)?;
 
     // R165-8 FIX: Same kernel-domain / live-domain alias guard as create_domain().
     let id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst) as DomainId;
     if id == KERNEL_DOMAIN_ID || domains.iter().any(|d| d.id() == id) {
         return Err(IommuError::TooManyDomains);
     }
-    let domain = Domain::new_paged(id)?;
-    domains.push(Arc::new(domain));
+    if vm_domains.contains_key(&id) {
+        return Err(IommuError::TooManyDomains);
+    }
+    let domain = Domain::new_paged(id)?.try_into_arc()?;
 
-    // Record VM association (hold domain write lock first, then VM lock)
-    VM_DOMAINS.lock().insert(id, vm_id);
+    // Publish both registries allocation-free. The VM association is installed
+    // first; the impossible vector-capacity failure still has an exact rollback.
+    vm_domains
+        .insert_unique_reserved(id, vm_id)
+        .map_err(|_| IommuError::HardwareInitFailed)?;
+    if let Err(domain) = domains.push_reserved(domain) {
+        let _ = vm_domains.remove(&id);
+        drop(domain);
+        return Err(IommuError::HardwareInitFailed);
+    }
 
     kprintln!(
         "[IOMMU] Created VM domain {} for VM {} (page-table)",
@@ -1046,19 +1334,14 @@ pub fn assign_device_to_vm(device: PciDeviceId, vm_domain_id: DomainId) -> Iommu
     // Resolve IOMMU unit for this device
     let unit = resolve_unit(&device)?;
 
-    // Fail-closed: reject if device is already attached to any domain
-    if unit.get_device_domain(device.source_id()).is_some() {
+    let key = device_key(&device);
+    let mut tracker = VM_DEVICE_IRTES.lock();
+    if tracker.contains_key(&key) || unit.get_device_domain(device.source_id()).is_some() {
         return Err(IommuError::DeviceAlreadyAttached);
     }
-
-    // Check tracking table for duplicate
-    let key = device_key(&device);
-    {
-        let tracker = VM_DEVICE_IRTES.lock();
-        if tracker.contains_key(&key) {
-            return Err(IommuError::DeviceAlreadyAttached);
-        }
-    }
+    tracker
+        .ensure_capacity_for(1)
+        .map_err(|_| IommuError::PageTableAllocFailed)?;
 
     // Obtain interrupt remapping table (mandatory for passthrough)
     let ir_table = require_ir_table(&unit)?;
@@ -1071,17 +1354,75 @@ pub fn assign_device_to_vm(device: PciDeviceId, vm_domain_id: DomainId) -> Iommu
     // Clear the IRTE entry to ensure no stale interrupt mappings leak
     ir_table.set_entry(irte_index, Irte::empty());
 
-    // Attach device to VM domain via IOMMU context table
-    if let Err(e) = unit.attach_device(&device, &domain) {
-        // Roll back IRTE allocation on failure
-        ir_table.free_index(irte_index);
-        return Err(e);
+    // Publish assignment ownership before context hardware can become present.
+    // This insert is allocation-free after the admission above.
+    if tracker
+        .insert_unique_reserved(
+            key,
+            VmDeviceAssignment {
+                domain_id: vm_domain_id,
+                irte_index,
+                device_detached: false,
+            },
+        )
+        .is_err()
+    {
+        // RF180-23 FIX: an index allocated moments ago must still be owned by
+        // this transaction. Treat a missing bitmap bit as corruption instead
+        // of silently claiming rollback succeeded.
+        if !ir_table.free_index_with_iec(irte_index, || unit.invalidate_interrupt_entry_cache())? {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        return Err(IommuError::HardwareInitFailed);
     }
 
-    // Record device assignment in tracking table
-    {
-        let mut tracker = VM_DEVICE_IRTES.lock();
-        tracker.insert(key, (vm_domain_id, irte_index));
+    // Attach device to VM domain via IOMMU context table
+    if let Err(e) = unit.attach_device(&device, &domain) {
+        // A retained unit record means context publication was reached or is
+        // ambiguous. Keep both the tracker and IRTE quarantined so a later
+        // explicit unassign can finish teardown. Only pre-publication failures
+        // have an exact rollback.
+        if !matches!(
+            unit.get_device_domain(device.source_id()),
+            Some(attached_domain) if attached_domain == vm_domain_id
+        ) {
+            // Validate ownership before retiring the IRTE. Removing first and
+            // only then discovering a mismatch would destroy the sole retry
+            // record after hardware state had already changed.
+            match tracker.get(&key) {
+                Some(record)
+                    if record.domain_id == vm_domain_id
+                        && record.irte_index == irte_index
+                        && !record.device_detached => {}
+                _ => return Err(IommuError::HardwareInitFailed),
+            }
+
+            let ir_cleanup = ir_table
+                .free_index_with_iec(irte_index, || unit.invalidate_interrupt_entry_cache());
+            match ir_cleanup {
+                Ok(true) => {
+                    tracker.remove(&key).ok_or(IommuError::HardwareInitFailed)?;
+                }
+                Ok(false) | Err(_) => {
+                    let record = tracker
+                        .get_mut(&key)
+                        .ok_or(IommuError::HardwareInitFailed)?;
+                    if record.domain_id != vm_domain_id || record.irte_index != irte_index {
+                        return Err(IommuError::HardwareInitFailed);
+                    }
+                    // No target-domain context was published. Preserve that
+                    // fact even on IEC timeout so an explicit retry skips a
+                    // guaranteed-failing detach and retries only IR cleanup.
+                    record.device_detached = true;
+                    return match ir_cleanup {
+                        Err(error) => Err(error),
+                        Ok(false) => Err(IommuError::HardwareInitFailed),
+                        Ok(true) => unreachable!(),
+                    };
+                }
+            }
+        }
+        return Err(e);
     }
 
     let handle = IrteHandle::new(irte_index, device.source_id(), 0);
@@ -1133,13 +1474,12 @@ pub fn unassign_device_from_vm(device: PciDeviceId, vm_domain_id: DomainId) -> I
 
     // Validate device assignment
     let key = device_key(&device);
-    let irte_index = {
-        let tracker = VM_DEVICE_IRTES.lock();
-        match tracker.get(&key) {
-            Some(&(domain_id, index)) if domain_id == vm_domain_id => index,
-            _ => return Err(IommuError::DeviceNotAttached),
-        }
+    let mut tracker = VM_DEVICE_IRTES.lock();
+    let assignment = match tracker.get(&key).copied() {
+        Some(assignment) if assignment.domain_id == vm_domain_id => assignment,
+        _ => return Err(IommuError::DeviceNotAttached),
     };
+    let irte_index = assignment.irte_index;
 
     // Resolve IOMMU unit
     let unit = resolve_unit(&device)?;
@@ -1147,32 +1487,32 @@ pub fn unassign_device_from_vm(device: PciDeviceId, vm_domain_id: DomainId) -> I
     // R88-2 FIX: Detach device FIRST, then attempt IR cleanup
     // This ensures device DMA/bus mastering is stopped even if IR cleanup fails.
     // The fail-closed priority is: stop device DMA > clean up IRTE
-    unit.detach_device(&device, vm_domain_id)?;
-
-    // Remove from tracking table immediately after detach
-    // (even before IR cleanup, to prevent double-unassign races)
-    {
-        let mut tracker = VM_DEVICE_IRTES.lock();
-        tracker.remove(&key);
+    if !assignment.device_detached {
+        unit.detach_device(&device, vm_domain_id)?;
+        let record = tracker
+            .get_mut(&key)
+            .ok_or(IommuError::HardwareInitFailed)?;
+        if record.domain_id != vm_domain_id || record.irte_index != irte_index {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        record.device_detached = true;
     }
 
-    // Attempt IR table cleanup (best-effort after device detach)
-    let ir_cleanup_ok =
-        match require_ir_table(&unit) {
-            Ok(ir_table) => {
-                // Clear IRTE entry before freeing to prevent stale interrupt delivery
-                ir_table.set_entry(irte_index, Irte::empty());
-                ir_table.free_index(irte_index)
-            }
-            Err(_) => {
-                // IR table unavailable - log warning but device is already detached
-                kprintln!(
-                "[IOMMU] WARNING: IR cleanup failed for device {:02x}:{:02x}.{} (IRTE {} orphaned)",
-                device.bus, device.device, device.function, irte_index
-            );
-                false
-            }
-        };
+    // IR cleanup is part of the ownership transaction. If the table or bitmap
+    // cannot be verified, retain the admitted tracker entry for an explicit
+    // retry rather than losing the only reference to a possibly-live IRTE.
+    match tracker.get(&key) {
+        Some(record)
+            if record.domain_id == vm_domain_id
+                && record.irte_index == irte_index
+                && record.device_detached => {}
+        _ => return Err(IommuError::HardwareInitFailed),
+    }
+    let ir_table = require_ir_table(&unit)?;
+    if !ir_table.free_index_with_iec(irte_index, || unit.invalidate_interrupt_entry_cache())? {
+        return Err(IommuError::HardwareInitFailed);
+    }
+    tracker.remove(&key).ok_or(IommuError::HardwareInitFailed)?;
 
     kprintln!(
         "[IOMMU] Unassigned device {:02x}:{:02x}.{} from VM domain {} (IRTE {} {})",
@@ -1181,7 +1521,7 @@ pub fn unassign_device_from_vm(device: PciDeviceId, vm_domain_id: DomainId) -> I
         device.function,
         vm_domain_id,
         irte_index,
-        if ir_cleanup_ok { "freed" } else { "orphaned" }
+        "freed"
     );
 
     Ok(())
@@ -1320,117 +1660,6 @@ unsafe fn inl(port: u16) -> u32 {
     val
 }
 
-/// Isolate a faulting PCI device by disabling bus mastering.
-///
-/// This function disables the Bus Master Enable bit in the PCI Command register,
-/// preventing the device from initiating any further DMA transactions. This is
-/// critical for containing devices that are generating DMA faults.
-///
-/// # Arguments
-///
-/// * `record` - Fault record containing the faulting device's source ID
-/// * `segment` - PCI segment the device belongs to (from VT-d unit)
-/// * `unit` - Reference to the VT-d unit for IOTLB invalidation
-///
-/// # Security
-///
-/// - R86-1 FIX: Includes segment validation for multi-segment systems
-/// - R86-2 FIX: Serializes PCI config access via global lock
-/// - R86-3 FIX: Invalidates device context/IOTLB after isolation
-/// - Best-effort isolation: logs outcome regardless of success/failure
-/// - Validates device exists before attempting isolation
-/// - Verifies bus mastering was actually disabled
-/// - All outcomes logged for audit trail
-///
-/// # Implementation Notes
-///
-/// Uses legacy PCI configuration space access (I/O ports 0xCF8/0xCFC).
-/// Legacy PCI I/O port access only supports segment 0.
-fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
-    let bus = record.bus();
-    let device = record.device();
-    let function = record.function();
-
-    // R86-1 FIX: Validate segment - legacy PCI I/O only supports segment 0
-    // Multi-segment systems require ECAM (memory-mapped config space)
-    if segment != 0 {
-        kprintln!(
-            "[IOMMU] WARNING: Cannot isolate device {:02x}:{:02x}.{} on segment {} - legacy PCI I/O only supports segment 0",
-            bus, device, function, segment
-        );
-        kprintln!(
-            "[IOMMU] SECURITY: Faulting device on segment {} remains active (source ID {:04x})",
-            segment,
-            record.source_id
-        );
-        return;
-    }
-
-    // R86-2 FIX: Serialize PCI config space access to prevent RMW races
-    // R162-10-2 FIX: Use try_lock to avoid deadlock when called from IRQ
-    // context (handle_dma_faults via timer). If lock is contended, skip
-    // isolation this tick — the fault handler will retry on next invocation.
-    let Some(_pci_lock) = PCI_CONFIG_LOCK.try_lock() else {
-        kprintln!(
-            "[IOMMU] Isolation deferred: PCI_CONFIG_LOCK contended for {:02x}:{:02x}.{}",
-            bus,
-            device,
-            function
-        );
-        return;
-    };
-
-    // Validate device exists by checking vendor ID
-    let vendor_device = pci_cfg_read32(bus, device, function, 0x00);
-    let vendor = (vendor_device & 0xFFFF) as u16;
-    if vendor == PCI_VENDOR_INVALID {
-        kprintln!(
-            "[IOMMU] Isolation skipped: no PCI device at {:02x}:{:02x}.{} (source ID {:04x})",
-            bus,
-            device,
-            function,
-            record.source_id
-        );
-        return;
-    }
-
-    // Read current command register
-    let command = pci_cfg_read16(bus, device, function, PCI_COMMAND_OFFSET);
-
-    // Clear bus master enable bit
-    let new_command = command & !PCI_COMMAND_BUS_MASTER;
-    pci_cfg_write16(bus, device, function, PCI_COMMAND_OFFSET, new_command);
-
-    // Verify the write took effect (read-back check)
-    let verify = pci_cfg_read16(bus, device, function, PCI_COMMAND_OFFSET);
-
-    // Drop PCI lock before IOTLB invalidation (avoid lock ordering issues)
-    drop(_pci_lock);
-
-    if verify & PCI_COMMAND_BUS_MASTER == 0 {
-        kprintln!(
-            "[IOMMU] Isolated faulting device {:02x}:{:02x}.{} (source ID {:04x}): bus master disabled",
-            bus, device, function, record.source_id
-        );
-
-        // R86-3 FIX: Invalidate device's context/IOTLB to quiesce outstanding DMA
-        // This helps prevent in-flight DMA from completing after isolation
-        let pci_id = PciDeviceId::from_bdf(bus, device, function);
-        let _ = unit.invalidate_context_device(&pci_id);
-
-        // Get domain ID for this device if known
-        if let Some(domain_id) = unit.get_device_domain(record.source_id) {
-            let _ = unit.invalidate_iotlb_domain(domain_id);
-        }
-    } else {
-        // Isolation failed - log warning for audit
-        kprintln!(
-            "[IOMMU] WARNING: Failed to disable bus mastering for {:02x}:{:02x}.{} (source ID {:04x}); command {:#06x} -> {:#06x} (verified {:#06x})",
-            bus, device, function, record.source_id, command, new_command, verify
-        );
-    }
-}
-
 // ============================================================================
 // Fault Handling API
 // ============================================================================
@@ -1452,89 +1681,143 @@ pub fn get_fault_config() -> FaultConfig {
     *FAULT_CONFIG.lock()
 }
 
-/// Handle pending DMA faults on all IOMMU units.
-///
-/// This function should be called periodically (e.g., from a timer interrupt)
-/// or in response to a fault interrupt to process any pending DMA faults.
-///
-/// # Returns
-///
-/// Total number of faults processed across all units.
-///
-/// # Security
-///
-/// - Logs all faults to console and audit subsystem
-/// - Optionally isolates faulting devices (if configured)
-/// - Bounded processing: max 16 records per unit per invocation
-/// - R85-4: Masks fault interrupts on overflow to prevent interrupt storms
-pub fn handle_dma_faults() -> usize {
+fn source_only_fault(unit: &VtdUnit, source_id: u16) -> FaultRecord {
+    FaultRecord {
+        source_id,
+        domain_id: unit.get_device_domain(source_id).unwrap_or(0),
+        fault_reason: FaultReason::Unknown(0xff),
+        fault_address: 0,
+        fault_type: FaultType::Unknown(0xff),
+        is_write: false,
+        is_execute: false,
+        pasid_present: false,
+        pasid: 0,
+    }
+}
+
+fn log_captured_fault(record: &FaultRecord, unit_index: usize, config: FaultConfig) {
+    if config.console_logging || config.isolate_devices {
+        fault::log_fault_to_console(record, unit_index);
+    } else if record.fault_reason.is_security_relevant() {
+        kprintln!(
+            "[IOMMU] SECURITY: Unit {} fault from {:04x} addr~={:#x} reason={:?}",
+            unit_index,
+            record.source_id,
+            record.fault_address & !0xfff,
+            record.fault_reason
+        );
+    }
+    if config.audit_logging || config.isolate_devices {
+        fault::log_fault_to_audit(record, unit_index);
+    }
+}
+
+/// Timer/IRQ half: capture into fixed atomic ownership slots. No allocation,
+/// logging, PCI access, or blocking lock is permitted here.
+pub fn capture_dma_faults_irq() -> bool {
+    if !IOMMU_ENABLED.load(Ordering::Acquire) {
+        return false;
+    }
+    let count = FAULT_UNIT_COUNT
+        .load(Ordering::Acquire)
+        .min(MAX_IOMMU_UNITS);
+    let mut pending = false;
+    for index in 0..count {
+        if let Some(unit) = fault_unit(index) {
+            pending |= unit.capture_faults_irq();
+        }
+    }
+    pending
+}
+
+/// Process-context half: bounded logging, optional PCI BME revocation, and
+/// mandatory context quarantine. Any failed acknowledgement retains the SID.
+pub fn drain_dma_fault_work() -> usize {
     if !IOMMU_ENABLED.load(Ordering::Acquire) {
         return 0;
     }
-
     let config = *FAULT_CONFIG.lock();
-    let units = IOMMU_UNITS.read();
-    let mut total_faults = 0;
-
-    // Fail-closed: Force audit logging when device isolation is enabled
-    // This ensures all isolation actions have an audit trail
-    let audit_enabled = config.audit_logging || config.isolate_devices;
-
-    // R86-4 FIX: Force console logging in isolation mode when audit feature
-    // may not be available, ensuring at least one logging path exists
-    let console_forced = config.isolate_devices && !config.console_logging;
-
-    for (unit_index, unit) in units.iter().enumerate() {
-        let (records, overflow) = unit.read_fault_records();
-        total_faults += records.len();
-
-        // Get segment for this unit (for device isolation)
-        let segment = unit.segment();
-
-        // R85-4: Quiesce interrupt storms when overflow detected and isolation enabled
-        if overflow && config.isolate_devices {
-            unit.set_fault_interrupt_enabled(false);
-            kprintln!(
-                "[IOMMU] Unit {} fault interrupts disabled due to overflow (isolation mode)",
-                unit_index
-            );
+    let count = FAULT_UNIT_COUNT
+        .load(Ordering::Acquire)
+        .min(MAX_IOMMU_UNITS);
+    let mut total = 0usize;
+    for unit_index in 0..count {
+        let Some(unit) = fault_unit(unit_index) else {
+            continue;
+        };
+        if !unit.has_pending_fault_work() {
+            continue;
         }
+        let completed = unit.drain_fault_work(
+            vtd::MAX_FAULT_DRAIN_PER_PASS,
+            || {
+                match unit.quarantine_all_fault_contexts() {
+                    Ok(()) => {
+                        kprintln!(
+                            "[IOMMU] SECURITY: Unit {} fault overflow/detail loss; all contexts quarantined{}",
+                            unit_index,
+                            if unit.fault_interrupt_masked() {
+                                " (fault interrupt masked)"
+                            } else {
+                                ""
+                            }
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        kprintln!(
+                            "[IOMMU] Unit {} full quarantine retry required: {:?}",
+                            unit_index,
+                            error
+                        );
+                        false
+                    }
+                }
+            },
+            |source_id, detail| {
+                // Mandatory isolation first. Logging and optional PCI config
+                // access must never delay revocation of the hardware context.
+                if let Err(error) = unit.quarantine_fault_source(source_id) {
+                    kprintln!(
+                        "[IOMMU] SID {:04x} quarantine retry required on unit {}: {:?}",
+                        source_id,
+                        unit_index,
+                        error
+                    );
+                    return false;
+                }
 
-        for record in &records {
-            if config.console_logging {
-                fault::log_fault_to_console(record, unit_index);
-            }
+                let record = detail.unwrap_or_else(|| source_only_fault(unit, source_id));
+                log_captured_fault(&record, unit_index, config);
 
-            if audit_enabled {
-                fault::log_fault_to_audit(record, unit_index);
-            }
-
-            // Security-relevant faults always get logged even if config says otherwise
-            if record.fault_reason.is_security_relevant() && !config.console_logging {
-                // R85-5: Redact low bits to avoid leaking full physical addresses
-                let redacted = record.fault_address & !0xFFF;
-                kprintln!(
-                    "[IOMMU] SECURITY: Unit {} fault from {:04x} addr~={:#x} reason={:?}",
-                    unit_index,
-                    record.source_id,
-                    redacted,
-                    record.fault_reason
-                );
-            }
-
-            // R86-4 FIX: Ensure logging for isolation actions even without console_logging
-            if console_forced && !record.fault_reason.is_security_relevant() {
-                fault::log_fault_to_console(record, unit_index);
-            }
-
-            // R86: Device isolation - disable bus mastering on faulting device
-            if config.isolate_devices {
-                isolate_device(record, segment, unit);
-            }
-        }
+                if config.isolate_devices {
+                    let device = PciDeviceId::new(
+                        unit.segment(),
+                        record.bus(),
+                        record.device(),
+                        record.function(),
+                    );
+                    if let Err(error) = unit.disable_bus_mastering(&device) {
+                        kprintln!(
+                            "[IOMMU] BME isolation unavailable for segment {} SID {:04x}: {:?}; retiring context",
+                            unit.segment(),
+                            source_id,
+                            error
+                        );
+                    }
+                }
+                true
+            },
+        );
+        total = total.saturating_add(completed);
     }
+    total
+}
 
-    total_faults
+/// Compatibility process-context entry. IRQ callers must use the split API.
+pub fn handle_dma_faults() -> usize {
+    let _ = capture_dma_faults_irq();
+    drain_dma_fault_work()
 }
 
 // ============================================================================
@@ -1572,7 +1855,8 @@ fn dma_map_range_hook(
             | IommuError::DomainNotFound
             | IommuError::InvalidRange
             | IommuError::PageTableAllocFailed
-            | IommuError::PermissionDenied => mm::dma::DmaError::IommuMapRejected,
+            | IommuError::PermissionDenied
+            | IommuError::CachePoisonedPreMutation => mm::dma::DmaError::IommuMapRejected,
 
             // Unsafe errors: mapping may have been partially installed
             // or state is otherwise uncertain
@@ -1590,4 +1874,52 @@ fn dma_unmap_range_hook(
     size: usize,
 ) -> Result<(), mm::dma::DmaError> {
     unmap_range(domain_id, iova, size).map_err(|_| mm::dma::DmaError::IommuUnmapFailed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InitPublicationPhase;
+
+    #[test]
+    fn rf180_readiness_commit_requires_hooks_translation_then_fault_snapshot() {
+        let phase = InitPublicationPhase::PrivateReady;
+        assert!(!phase.may_commit_ready());
+
+        let phase = phase
+            .after_dma_hooks()
+            .expect("DMA hooks establish fail-closed allocation first");
+        assert!(!phase.may_commit_ready());
+
+        let phase = phase
+            .after_translation()
+            .expect("translation follows fail-closed hooks");
+        assert!(!phase.may_commit_ready());
+
+        let phase = phase
+            .after_fault_snapshot()
+            .expect("fault snapshot completes the prepare phase");
+        assert!(phase.may_commit_ready());
+    }
+
+    #[test]
+    fn rf180_readiness_state_machine_rejects_reordered_or_repeated_prepare_steps() {
+        let private = InitPublicationPhase::PrivateReady;
+        assert_eq!(private.after_translation(), None);
+        assert_eq!(private.after_fault_snapshot(), None);
+
+        let hooks = private.after_dma_hooks().expect("valid hook transition");
+        assert_eq!(hooks.after_dma_hooks(), None);
+        assert_eq!(hooks.after_fault_snapshot(), None);
+
+        let translation = hooks.after_translation().expect("valid TE transition");
+        assert_eq!(translation.after_dma_hooks(), None);
+        assert_eq!(translation.after_translation(), None);
+
+        let snapshot = translation
+            .after_fault_snapshot()
+            .expect("valid snapshot transition");
+        assert_eq!(snapshot.after_dma_hooks(), None);
+        assert_eq!(snapshot.after_translation(), None);
+        assert_eq!(snapshot.after_fault_snapshot(), None);
+    }
 }

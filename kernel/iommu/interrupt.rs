@@ -42,7 +42,7 @@
 //! - Intel VT-d Specification, Chapter 5 (Interrupt Remapping)
 //! - Intel VT-d Specification, Section 9.10 (Interrupt Remapping Table Address Register)
 
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 use core::mem::size_of;
 use core::ptr::{self, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -50,9 +50,9 @@ use spin::Mutex;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::PhysAddr;
 
-use mm::buddy_allocator;
+use mm::{arc_charge_bytes, buddy_allocator, try_reserve_heap, AdmittedVec, HeapCharge, HeapClass};
 
-use crate::IommuError;
+use crate::{IommuError, IommuResult};
 
 // ============================================================================
 // Constants
@@ -302,10 +302,12 @@ pub struct InterruptRemappingTable {
 
     /// Bitmap tracking allocated IRTE indices.
     /// Each bit represents one IRTE: 1 = allocated, 0 = free.
-    allocation_bitmap: Mutex<Vec<u64>>,
+    allocation_bitmap: Mutex<AdmittedVec<u64>>,
 
     /// Number of IRTEs currently allocated.
     allocated_count: AtomicU64,
+
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 // SAFETY: InterruptRemappingTable is Send + Sync because:
@@ -333,12 +335,32 @@ impl InterruptRemappingTable {
     /// - Physical address is validated to be within direct map range
     pub fn allocate(entries: usize) -> Result<Self, IommuError> {
         // Round up to power of 2
-        let aligned = entries.next_power_of_two().min(MAX_IR_ENTRIES);
+        let aligned = entries
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(IommuError::InvalidRange)?
+            .min(MAX_IR_ENTRIES);
         let order = aligned.trailing_zeros() as u8;
 
         // Calculate allocation size
-        let bytes = aligned * size_of::<Irte>();
-        let pages = (bytes + 4095) / 4096;
+        let bytes = aligned
+            .checked_mul(size_of::<Irte>())
+            .ok_or(IommuError::InvalidRange)?;
+        let pages = bytes.checked_add(4095).ok_or(IommuError::InvalidRange)? / 4096;
+
+        // RF180-23: admit and allocate every byte of retained heap metadata
+        // before acquiring physical pages or publishing an IRTA. The bounded
+        // bitmap is then populated allocation-free.
+        let bitmap_qwords = aligned.checked_add(63).ok_or(IommuError::InvalidRange)? / 64;
+        let mut bitmap = AdmittedVec::new(HeapClass::Device);
+        bitmap
+            .try_reserve_exact(bitmap_qwords)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        for _ in 0..bitmap_qwords {
+            bitmap
+                .push_reserved(0)
+                .map_err(|_| IommuError::PageTableAllocFailed)?;
+        }
 
         // Allocate physical pages
         let frame =
@@ -364,10 +386,6 @@ impl InterruptRemappingTable {
             ptr::write_bytes(virt_ptr as *mut u8, 0, zero_len);
         }
 
-        // Initialize allocation bitmap (all entries free)
-        let bitmap_qwords = (aligned + 63) / 64;
-        let bitmap = Vec::from_iter(core::iter::repeat(0u64).take(bitmap_qwords));
-
         Ok(Self {
             phys,
             virt: virt_ptr,
@@ -376,7 +394,20 @@ impl InterruptRemappingTable {
             pages,
             allocation_bitmap: Mutex::new(bitmap),
             allocated_count: AtomicU64::new(0),
+            _arc_heap_charge: None,
         })
+    }
+
+    pub fn try_allocate_arc(entries: usize) -> Result<Arc<Self>, IommuError> {
+        let bytes = arc_charge_bytes::<Self>().map_err(|_| IommuError::PageTableAllocFailed)?;
+        let reservation = try_reserve_heap(HeapClass::Device, bytes)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        let mut table = Self::allocate(entries)?;
+        let charge = reservation
+            .commit()
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        table._arc_heap_charge = Some(charge);
+        Arc::try_new(table).map_err(|_| IommuError::PageTableAllocFailed)
     }
 
     /// Compute the IRTA register value for this table.
@@ -461,9 +492,12 @@ impl InterruptRemappingTable {
     /// # Returns
     ///
     /// True if the index was allocated and is now free
-    pub fn free_index(&self, index: usize) -> bool {
+    pub fn free_index_with_iec<F>(&self, index: usize, invalidate: F) -> IommuResult<bool>
+    where
+        F: FnOnce() -> IommuResult<()>,
+    {
         if index >= self.entries {
-            return false;
+            return Ok(false);
         }
 
         let mut bitmap = self.allocation_bitmap.lock();
@@ -473,16 +507,16 @@ impl InterruptRemappingTable {
         if qword_idx < bitmap.len() {
             let mask = 1u64 << bit_idx;
             if bitmap[qword_idx] & mask != 0 {
+                // Retire hardware presence before making the index reusable.
+                self.set_entry_locked(index, Irte::empty());
+                invalidate()?;
                 bitmap[qword_idx] &= !mask;
                 self.allocated_count.fetch_sub(1, Ordering::Relaxed);
-
-                // Clear the IRTE
-                self.set_entry(index, Irte::empty());
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Set an IRTE entry.
@@ -494,17 +528,28 @@ impl InterruptRemappingTable {
     ///
     /// # Ordering
     ///
-    /// Writes high qword first, then low qword to ensure the present bit
-    /// is set last with full entry visible to hardware.
+    /// Clears the old present bit first, then writes high qword and publishes
+    /// the new low qword last. This is safe both for first publication and for
+    /// replacement/teardown of an already-present IRTE.
     pub fn set_entry(&self, index: usize, irte: Irte) {
         if index >= self.entries {
             return;
         }
+        let _bitmap = self.allocation_bitmap.lock();
+        self.set_entry_locked(index, irte);
+    }
+
+    fn set_entry_locked(&self, index: usize, irte: Irte) {
+        debug_assert!(index < self.entries);
 
         unsafe {
             let ptr = self.virt.add(index);
 
-            // Write high qword first (destination, etc.)
+            // Retire any previous entry before changing its metadata.
+            write_volatile(&mut (*ptr).lo, 0);
+            core::sync::atomic::fence(Ordering::Release);
+
+            // Write high qword (destination, etc.) while not present.
             write_volatile(&mut (*ptr).hi, irte.hi);
 
             // Memory barrier to ensure hi is visible before lo
