@@ -73,14 +73,14 @@
 //! - RFC 6528: Defending Against Sequence Number Attacks
 //! - RFC 5961: Improving TCP's Robustness to Blind In-Window Attacks
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
+#[cfg(test)]
 use alloc::vec;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, Once, RwLock};
+use spin::{Mutex, Once};
 
-use crate::ipv4::{compute_checksum, Ipv4Addr};
+use crate::admitted::{AdmittedVec, WirePacket};
+use crate::ipv4::{calculate_checksum_with_pseudo, Ipv4Addr};
+use mm::HeapClass;
 
 // ============================================================================
 // TCP Constants
@@ -573,6 +573,76 @@ pub struct SackBlock {
     pub right_edge: u32,
 }
 
+/// Allocation-free bounded SACK block collection.
+///
+/// RF180-41 REVIEW FIX: wire-controlled SACK parsing and scoreboard scratch
+/// never need heap storage: the TCP option space can encode at most four
+/// blocks. Keeping the exact protocol maximum inline eliminates both retained
+/// and transient attacker-driven allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SackBlocks {
+    blocks: [SackBlock; TCP_SACK_MAX_BLOCKS],
+    len: u8,
+}
+
+impl SackBlocks {
+    /// Create an empty bounded collection.
+    pub const fn new() -> Self {
+        Self {
+            blocks: [SackBlock {
+                left_edge: 0,
+                right_edge: 0,
+            }; TCP_SACK_MAX_BLOCKS],
+            len: 0,
+        }
+    }
+
+    /// Number of present blocks.
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether no blocks are present.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the initialized prefix.
+    pub fn as_slice(&self) -> &[SackBlock] {
+        &self.blocks[..self.len()]
+    }
+
+    /// Append one block if protocol capacity remains.
+    pub fn push(&mut self, block: SackBlock) -> bool {
+        let index = self.len();
+        if index >= TCP_SACK_MAX_BLOCKS {
+            return false;
+        }
+        self.blocks[index] = block;
+        self.len += 1;
+        true
+    }
+
+    /// Iterate initialized blocks.
+    pub fn iter(&self) -> core::slice::Iter<'_, SackBlock> {
+        self.as_slice().iter()
+    }
+}
+
+impl Default for SackBlocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::ops::Deref for SackBlocks {
+    type Target = [SackBlock];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// TCP option kinds
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TcpOptionKind {
@@ -587,7 +657,7 @@ pub enum TcpOptionKind {
     /// Selective Acknowledgment Permitted (RFC 2018)
     SackPermitted,
     /// Selective Acknowledgment blocks (RFC 2018, kind=5)
-    Sack(Vec<SackBlock>),
+    Sack(SackBlocks),
     /// Timestamps (RFC 7323)
     Timestamps { ts_val: u32, ts_ecr: u32 },
     /// Unknown option
@@ -604,7 +674,7 @@ pub struct TcpOptions {
     /// SACK permitted (kind=4, SYN/SYN-ACK only)
     pub sack_permitted: bool,
     /// SACK blocks (kind=5, data segments and ACKs)
-    pub sack_blocks: Vec<SackBlock>,
+    pub sack_blocks: SackBlocks,
     /// Timestamps
     pub timestamps: Option<(u32, u32)>,
 }
@@ -618,100 +688,65 @@ pub struct TcpOptions {
 /// Returns the raw bytes for the option, including kind and length fields
 /// where applicable. Single-byte options (End, NOP) return just the kind byte.
 ///
-/// R163-10 FIX: All heap allocations in option serialization now use
-/// try_reserve / try_reserve_exact so OOM returns an empty Vec instead of
-/// panicking. serialize_tcp_options detects empty returns and propagates
-/// the failure by returning its own empty Vec.
-pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
-    match *option {
-        // R163-10 FIX: Single-element vec![] macros use infallible global
-        // alloc; replace with try_reserve + push for OOM safety on all paths.
-        TcpOptionKind::EndOfList => {
-            let mut b = Vec::new();
-            if b.try_reserve(1).is_err() {
-                return Vec::new();
-            }
-            b.push(0);
-            b
-        }
-        TcpOptionKind::Nop => {
-            let mut b = Vec::new();
-            if b.try_reserve(1).is_err() {
-                return Vec::new();
-            }
-            b.push(1);
-            b
-        }
+#[inline]
+fn tcp_option_wire_len(option: &TcpOptionKind) -> usize {
+    match option {
+        TcpOptionKind::EndOfList | TcpOptionKind::Nop => 1,
+        TcpOptionKind::Mss(_) => 4,
+        TcpOptionKind::WindowScale(_) => 3,
+        TcpOptionKind::SackPermitted => 2,
+        TcpOptionKind::Sack(blocks) => 2 + 8 * blocks.len().min(TCP_SACK_MAX_BLOCKS),
+        TcpOptionKind::Timestamps { .. } => 10,
+        TcpOptionKind::Unknown { len, .. } => usize::from((*len).max(2)),
+    }
+}
+
+fn write_tcp_option(option: &TcpOptionKind, output: &mut [u8]) -> usize {
+    let len = tcp_option_wire_len(option);
+    debug_assert!(output.len() >= len);
+    match option {
+        TcpOptionKind::EndOfList => output[0] = 0,
+        TcpOptionKind::Nop => output[0] = 1,
         TcpOptionKind::Mss(mss) => {
-            // R163-10 FIX: 4-byte option, reserved fallibly.
-            let mut bytes = Vec::new();
-            if bytes.try_reserve(4).is_err() {
-                return Vec::new();
-            }
-            bytes.extend_from_slice(&[2, 4]); // kind=2, len=4
-            bytes.extend_from_slice(&mss.to_be_bytes());
-            bytes
+            output[0..2].copy_from_slice(&[2, 4]);
+            output[2..4].copy_from_slice(&mss.to_be_bytes());
         }
-        TcpOptionKind::WindowScale(scale) => {
-            // R163-10 FIX: 3-byte option, reserved fallibly.
-            let mut b = Vec::new();
-            if b.try_reserve(3).is_err() {
-                return Vec::new();
+        TcpOptionKind::WindowScale(scale) => output[0..3].copy_from_slice(&[3, 3, *scale]),
+        TcpOptionKind::SackPermitted => output[0..2].copy_from_slice(&[4, 2]),
+        TcpOptionKind::Sack(blocks) => {
+            output[0] = 5;
+            output[1] = len as u8;
+            let mut offset = 2;
+            for block in blocks.iter().take(TCP_SACK_MAX_BLOCKS) {
+                output[offset..offset + 4].copy_from_slice(&block.left_edge.to_be_bytes());
+                output[offset + 4..offset + 8].copy_from_slice(&block.right_edge.to_be_bytes());
+                offset += 8;
             }
-            b.extend_from_slice(&[3, 3, scale]);
-            b
-        }
-        TcpOptionKind::SackPermitted => {
-            // R163-10 FIX: 2-byte option, reserved fallibly.
-            let mut b = Vec::new();
-            if b.try_reserve(2).is_err() {
-                return Vec::new();
-            }
-            b.extend_from_slice(&[4, 2]);
-            b
-        }
-        TcpOptionKind::Sack(ref blocks) => {
-            // kind=5, len = 2 + 8*n (each block is 4+4 bytes)
-            let count = blocks.len().min(TCP_SACK_MAX_BLOCKS);
-            let len = 2u8.saturating_add((count as u8).saturating_mul(8));
-            // R163-10 FIX: SACK option is largest (up to 34 bytes), reserved fallibly.
-            let mut bytes = Vec::new();
-            if bytes.try_reserve(len as usize).is_err() {
-                return Vec::new();
-            }
-            bytes.push(5); // kind
-            bytes.push(len);
-            for block in blocks.iter().take(count) {
-                bytes.extend_from_slice(&block.left_edge.to_be_bytes());
-                bytes.extend_from_slice(&block.right_edge.to_be_bytes());
-            }
-            bytes
         }
         TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
-            // R163-10 FIX: 10-byte option, reserved fallibly.
-            let mut bytes = Vec::new();
-            if bytes.try_reserve(10).is_err() {
-                return Vec::new();
-            }
-            bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
-            bytes.extend_from_slice(&ts_val.to_be_bytes());
-            bytes.extend_from_slice(&ts_ecr.to_be_bytes());
-            bytes
+            output[0..2].copy_from_slice(&[8, 10]);
+            output[2..6].copy_from_slice(&ts_val.to_be_bytes());
+            output[6..10].copy_from_slice(&ts_ecr.to_be_bytes());
         }
-        TcpOptionKind::Unknown { kind, len } => {
-            // Ensure minimum length of 2 (kind + length bytes)
-            let effective_len = len.max(2);
-            // R163-10 FIX: Variable-length unknown option, reserved fallibly.
-            let mut bytes = Vec::new();
-            if bytes.try_reserve(effective_len as usize).is_err() {
-                return Vec::new();
-            }
-            bytes.push(kind);
-            bytes.push(effective_len);
-            bytes.resize(effective_len as usize, 0);
-            bytes
+        TcpOptionKind::Unknown { kind, .. } => {
+            output[..len].fill(0);
+            output[0] = *kind;
+            output[1] = len as u8;
         }
     }
+    len
+}
+
+/// RF180-41 FIX: one option serialization owns an admitted wire allocation for
+/// its complete lifetime. No intermediate uncharged `Vec` is constructed.
+pub fn serialize_tcp_option(option: &TcpOptionKind) -> WirePacket {
+    let len = tcp_option_wire_len(option);
+    let mut bytes = match WirePacket::try_zeroed(len) {
+        Ok(bytes) => bytes,
+        Err(_) => return WirePacket::new(),
+    };
+    write_tcp_option(option, bytes.as_mut_slice());
+    bytes
 }
 
 /// Serialize a slice of TCP options with padding to 32-bit boundary.
@@ -721,52 +756,38 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
 /// 2. Appends End-of-List marker if not already present
 /// 3. Pads with NOP (0x00) bytes to ensure 32-bit alignment
 ///
-/// Returns empty Vec if no options provided (no padding needed for minimal header).
+/// Returns an empty packet if no options are provided (no padding needed for
+/// the minimal header), or if aggregate admission rejects the allocation.
 ///
 /// R163-10 FIX: TCP options are bounded by TCP_HEADER_MAX_LEN (60) minus the
 /// minimum header (20), leaving at most 40 bytes of option space.
 ///
 /// Safety guarantees:
-/// - Upfront fallible reservation of 40 bytes prevents realloc panics.
-/// - Each option's serialized bytes are length-checked against remaining space
-///   before extend_from_slice, ensuring the Vec never needs to grow.
-/// - EOL marker and padding bytes are also space-checked before push.
-/// - On any failure (OOM or serialize_tcp_option returning empty for a
-///   non-empty option), returns an empty Vec. The caller
-///   (build_tcp_segment_with_options) interprets this as "no options", which
-///   causes it to build only the 20-byte minimum header — a safe degradation.
-pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> Vec<u8> {
+/// - The complete bounded option block is serialized into a 40-byte stack
+///   scratch buffer, so serialization performs no heap growth.
+/// - Every option is length-checked against the remaining option space before
+///   it is written; EOL and alignment padding remain within the same bound.
+/// - The public serializer performs one admitted final allocation and returns
+///   an empty packet if aggregate admission or allocation fails.
+fn serialize_tcp_options_into(options: &[TcpOptionKind], output: &mut [u8; 40]) -> usize {
     if options.is_empty() {
-        return Vec::new();
+        return 0;
     }
 
-    // R163-10 FIX: Fallible pre-reservation of the full option space.
-    // Max option space = TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN = 40 bytes.
     let max_opts = TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN;
-    let mut bytes = Vec::new();
-    if bytes.try_reserve(max_opts).is_err() {
-        return Vec::new();
-    }
+    let mut used = 0usize;
     let mut has_end = false;
 
     for opt in options {
-        let opt_bytes = serialize_tcp_option(opt);
-        // R163-10 FIX: OOM in serialize_tcp_option produces an empty Vec for
-        // non-empty options. Detect this and abort (return empty = no options).
-        let is_nop_or_eol = matches!(opt, TcpOptionKind::Nop | TcpOptionKind::EndOfList);
-        if opt_bytes.is_empty() && !is_nop_or_eol {
-            // A non-trivial option failed to allocate — abort serialization.
-            return Vec::new();
-        }
-        // R163-10 FIX: Hard cap: skip options that would overflow the 40-byte
-        // option space rather than growing the Vec infallibly.
-        if bytes.len() + opt_bytes.len() <= max_opts {
-            bytes.extend_from_slice(&opt_bytes);
-        } else {
-            // Oversized option combination: truncate here; the EOL + padding
-            // added below will fill remaining space correctly.
+        let option_len = tcp_option_wire_len(opt);
+        let Some(end) = used.checked_add(option_len) else {
+            break;
+        };
+        if end > max_opts {
             break;
         }
+        write_tcp_option(opt, &mut output[used..end]);
+        used = end;
 
         if matches!(opt, TcpOptionKind::EndOfList) {
             has_end = true;
@@ -775,17 +796,23 @@ pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> Vec<u8> {
     }
 
     // Append End-of-List if not present and space permits.
-    if !has_end && bytes.len() < max_opts {
-        bytes.push(0);
+    if !has_end && used < max_opts {
+        output[used] = 0;
+        used += 1;
     }
 
-    // Pad to 32-bit boundary with zeroes (same as NOP bytes after End).
-    // Space is guaranteed since we pre-reserved 40 bytes and bytes.len() <= 40.
-    while bytes.len() % 4 != 0 {
-        bytes.push(0);
-    }
+    let padded = (used + 3) & !3;
+    output[used..padded].fill(0);
+    padded
+}
 
-    bytes
+pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> WirePacket {
+    let mut scratch = [0u8; TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN];
+    let len = serialize_tcp_options_into(options, &mut scratch);
+    if len == 0 {
+        return WirePacket::new();
+    }
+    WirePacket::try_copy_from_slice(&scratch[..len]).unwrap_or_default()
 }
 
 // ============================================================================
@@ -825,6 +852,34 @@ impl TcpConnKey {
             remote_port: self.local_port,
         }
     }
+}
+
+/// Provisional SYN-SENT transition committed only after the generated TCP
+/// response has passed egress policy and entered the device queue.
+///
+/// RF180-41 REVIEW FIX: the receive path may prepare the final ACK or a
+/// simultaneous-open SYN-ACK, but it must not report `Established`/`SynReceived`
+/// to socket observers while that response can still be dropped. Retransmitted
+/// peer handshakes may safely replace this plain, allocation-free snapshot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingHandshakeCommit {
+    pub response_flags: u8,
+    pub response_seq: u32,
+    pub response_ack: u32,
+    pub target_state: TcpState,
+    pub irs: u32,
+    pub rcv_nxt: u32,
+    pub ack_to_apply: Option<(u32, u64)>,
+    pub snd_wscale: u8,
+    pub wscale_received: bool,
+    pub sack_received: bool,
+    pub snd_mss: u16,
+    pub cwnd: u32,
+    pub snd_wnd: u32,
+    pub snd_wl1: u32,
+    pub snd_wl2: Option<u32>,
+    pub rcv_wnd: u32,
+    pub wake_connect: bool,
 }
 
 /// TCP Control Block - per-connection state
@@ -919,10 +974,26 @@ pub struct TcpControlBlock {
     pub rttvar_us: u64,
     /// Number of consecutive retransmissions
     pub retries: u8,
+    /// Prepared active/simultaneous handshake state awaiting actual egress.
+    pub(crate) pending_handshake: Option<PendingHandshakeCommit>,
+    /// Single packet/socket operation token that owns the pending handshake
+    /// publication. A retransmitted peer handshake replaces this token and
+    /// makes every older prepared packet stale before it can reach the device.
+    pub(crate) pending_reply_token: Option<u64>,
+    /// Initial active SYN has been prepared and registered but has not yet
+    /// crossed the device acceptance boundary. The externally visible TCP
+    /// state remains Closed until the exact token commits.
+    pub(crate) active_open_pending: bool,
+    /// Distinguishes listener-owned children from simultaneous-open clients in
+    /// SYN-RECEIVED so only passive children move through the accept queues.
+    pub(crate) passive_open: bool,
+    /// A passive-open child is staged but cannot accept the third ACK until its
+    /// SYN-ACK has actually entered the egress queue.
+    pub(crate) passive_egress_confirmed: bool,
 
     // === Buffers ===
     /// Send buffer (unacknowledged segments)
-    pub send_buffer: VecDeque<TcpSegment>,
+    pub(crate) send_buffer: AdmittedVec<TcpSegment>,
     /// R115-3 FIX: Total bytes currently buffered in `send_buffer`.
     /// Maintained by tcp_send() (increment) and handle_ack() (decrement).
     /// Bounded by `TCP_MAX_SEND_BUFFER_BYTES` to prevent OOM.
@@ -942,9 +1013,9 @@ pub struct TcpControlBlock {
     /// amount. Init 0; never mutated by tcp.rs (only the socket layer).
     pub ns_charged_recv_bytes: usize,
     /// Receive buffer (in-order data)
-    pub recv_buffer: VecDeque<u8>,
+    pub(crate) recv_buffer: AdmittedVec<u8>,
     /// Out-of-order receive queue (sorted by sequence number)
-    pub ooo_queue: VecDeque<OooSegment>,
+    pub(crate) ooo_queue: AdmittedVec<OooSegment>,
 
     // === Flags ===
     /// FIN has been sent
@@ -953,6 +1024,8 @@ pub struct TcpControlBlock {
     pub fin_sent_time: u64,
     /// FIN retransmission counter
     pub fin_retries: u8,
+    /// A prepared FIN retry currently has sole ownership of the egress attempt.
+    pub(crate) fin_retransmit_in_flight: bool,
     /// FIN has been received
     pub fin_received: bool,
     /// ACK is pending (delayed ACK)
@@ -979,15 +1052,21 @@ pub struct TcpControlBlock {
     pub keepalive_probes_max: u8,
     /// Number of keepalive probes sent without receiving a response.
     pub keepalive_probes_sent: u8,
+    /// Monotonic (wrapping) generation advanced for every accepted peer ACK.
+    /// Timer completion uses it to avoid counting a probe whose ACK raced the
+    /// post-device metadata commit.
+    pub(crate) peer_ack_generation: u64,
+    /// A keepalive probe is prepared and awaiting its queue result.
+    pub(crate) keepalive_probe_in_flight: bool,
 }
 
 /// A TCP segment for buffering
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TcpSegment {
     /// Sequence number of first byte
     pub seq: u32,
     /// Segment data
-    pub data: Vec<u8>,
+    pub(crate) data: AdmittedVec<u8>,
     /// Timestamp when segment was sent (for RTT)
     pub sent_at: u64,
     /// Number of times retransmitted
@@ -996,6 +1075,40 @@ pub struct TcpSegment {
     pub sacked: bool,
     /// SACK scoreboard: this segment has been marked as lost (RFC 6675)
     pub lost: bool,
+    /// RF180-41 REVIEW FIX: a NewReno/SACK retransmission whose wire-owner
+    /// preparation failed remains explicitly scheduled. Timer/ACK paths retry
+    /// it without pretending a transmission occurred or waiting for its RTO.
+    pub retransmit_pending: bool,
+    /// Exactly one prepared egress attempt owns this segment's retry commit.
+    pub retransmit_in_flight: bool,
+    /// The pending attempt originated at RTO and must apply loss recovery only
+    /// after a successful device queue operation.
+    pub retransmit_requires_rto: bool,
+    /// Consecutive device/policy rejections for this segment's retransmission.
+    pub(crate) tx_reject_count: u8,
+    /// Monotonic time before which ACK/timer recovery must not select it.
+    pub(crate) retry_not_before_ms: u64,
+}
+
+impl TcpSegment {
+    #[inline]
+    pub(crate) fn retry_due(&self, now_ms: u64) -> bool {
+        now_ms >= self.retry_not_before_ms
+    }
+
+    pub(crate) fn record_tx_rejection(&mut self, now_ms: u64) {
+        const BASE_MS: u64 = 10;
+        const MAX_MS: u64 = 1_000;
+        self.tx_reject_count = self.tx_reject_count.saturating_add(1);
+        let shift = self.tx_reject_count.saturating_sub(1).min(7) as u32;
+        let delay = BASE_MS.checked_shl(shift).unwrap_or(MAX_MS).min(MAX_MS);
+        self.retry_not_before_ms = now_ms.saturating_add(delay);
+    }
+
+    pub(crate) fn clear_tx_rejection(&mut self) {
+        self.tx_reject_count = 0;
+        self.retry_not_before_ms = 0;
+    }
 }
 
 /// Maximum number of out-of-order segments buffered per connection.
@@ -1009,12 +1122,12 @@ pub const TCP_OOO_MAX_SEGMENTS: usize = 64;
 ///
 /// Unlike `TcpSegment` (TX-oriented), this is RX-only and carries no
 /// retransmission metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OooSegment {
     /// First sequence number of this contiguous range
     pub seq: u32,
     /// Contiguous received data
-    pub data: Vec<u8>,
+    pub(crate) data: AdmittedVec<u8>,
     /// R133-3 FIX: True if this segment carries a FIN at the end of the data.
     /// FIN occupies one sequence number after the data payload.
     pub fin: bool,
@@ -1060,15 +1173,21 @@ impl TcpControlBlock {
             srtt_us: 0,
             rttvar_us: 0,
             retries: 0,
-            send_buffer: VecDeque::new(),
+            pending_handshake: None,
+            pending_reply_token: None,
+            active_open_pending: false,
+            passive_open: false,
+            passive_egress_confirmed: true,
+            send_buffer: AdmittedVec::new(HeapClass::SocketPayload),
             send_buffer_bytes: 0,
             ns_charged_send_bytes: 0,
             ns_charged_recv_bytes: 0,
-            recv_buffer: VecDeque::new(),
-            ooo_queue: VecDeque::new(),
+            recv_buffer: AdmittedVec::new(HeapClass::SocketPayload),
+            ooo_queue: AdmittedVec::new(HeapClass::SocketPayload),
             fin_sent: false,
             fin_sent_time: 0,
             fin_retries: 0,
+            fin_retransmit_in_flight: false,
             fin_received: false,
             ack_pending: false,
             established_at: 0,
@@ -1082,6 +1201,8 @@ impl TcpControlBlock {
             keepalive_interval_ms: 75_000, // 75 seconds
             keepalive_probes_max: 9,
             keepalive_probes_sent: 0,
+            peer_ack_generation: 0,
+            keepalive_probe_in_flight: false,
         }
     }
 
@@ -1104,6 +1225,8 @@ impl TcpControlBlock {
         // ack_num = ISS+1, breaking all stateful TCP passive opens.
         tcb.snd_nxt = iss.wrapping_add(1);
         tcb.state = TcpState::SynReceived;
+        tcb.passive_open = true;
+        tcb.passive_egress_confirmed = false;
         tcb
     }
 
@@ -1215,120 +1338,142 @@ impl TcpControlBlock {
             (data, fin)
         };
 
-        // R160-I2 FIX: Fallible initial segment allocation (data is bounded
-        // by rcv_wnd but should still be fallible under OOM).
-        let mut seg_data = Vec::new();
-        if seg_data.try_reserve_exact(data.len()).is_err() {
-            return 0;
-        }
-        seg_data.extend_from_slice(data);
-
-        let mut new_seg = OooSegment {
-            seq,
-            data: seg_data,
-            fin,
+        // R180-11 FIX: copy the incoming payload privately first. Queue growth
+        // is prepared only after we know whether existing entries will be
+        // removed by the merge (a full queue can still absorb an overlap).
+        let seg_data = match AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, data) {
+            Ok(data) => data,
+            Err(_) => return 0,
         };
 
-        // Track bytes absorbed from existing segments during merges so we can
-        // correct `ooo_bytes` at the end.  Each removed segment's byte count is
-        // subtracted; the final merged segment's byte count is added once.
-        let mut removed_bytes = 0u32;
+        // Compute the complete transitive merge span without mutating the live
+        // queue. Repeated scans are intentional: an overlap discovered to the
+        // left can make an earlier, previously skipped range newly adjacent.
+        // TCP_OOO_MAX_SEGMENTS bounds this O(n²) preflight.
+        let mut merged_start = seq;
+        let mut merged_data_end = seq.wrapping_add(seg_data.len() as u32);
+        let mut merged_fin_pos = fin.then_some(merged_data_end);
+        loop {
+            let mut changed = false;
+            for existing in &self.ooo_queue {
+                let ex_data_end = existing.seq.wrapping_add(existing.data.len() as u32);
+                let ex_seq_end = ex_data_end.wrapping_add(if existing.fin { 1 } else { 0 });
+                let merged_seq_end =
+                    merged_data_end.wrapping_add(if merged_fin_pos.is_some() { 1 } else { 0 });
+                if !seq_le(merged_start, ex_seq_end) || !seq_le(existing.seq, merged_seq_end) {
+                    continue;
+                }
 
-        // Merge with any overlapping/adjacent existing segments
-        //
-        // R134-5 FIX: Model FIN as occupying one sequence number in sequence
-        // space.  Endpoints used for overlap detection and FIN preservation
-        // include the +1 for FIN; data buffer sizing uses data-only endpoints.
+                let old_start = merged_start;
+                let old_end = merged_data_end;
+                let old_fin = merged_fin_pos;
+                if seq_le(existing.seq, merged_start) {
+                    merged_start = existing.seq;
+                }
+                if seq_ge(ex_data_end, merged_data_end) {
+                    merged_data_end = ex_data_end;
+                }
+                if existing.fin {
+                    merged_fin_pos = match merged_fin_pos {
+                        Some(current) if seq_le(current, ex_data_end) => Some(current),
+                        _ => Some(ex_data_end),
+                    };
+                }
+                if let Some(fin_pos) = merged_fin_pos {
+                    if seq_lt(fin_pos, merged_data_end) {
+                        merged_data_end = fin_pos;
+                    }
+                }
+                changed |= old_start != merged_start
+                    || old_end != merged_data_end
+                    || old_fin != merged_fin_pos;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let merged_seq_end =
+            merged_data_end.wrapping_add(if merged_fin_pos.is_some() { 1 } else { 0 });
+        let overlaps = self
+            .ooo_queue
+            .iter()
+            .filter(|existing| {
+                let ex_data_end = existing.seq.wrapping_add(existing.data.len() as u32);
+                let ex_seq_end = ex_data_end.wrapping_add(if existing.fin { 1 } else { 0 });
+                seq_le(merged_start, ex_seq_end) && seq_le(existing.seq, merged_seq_end)
+            })
+            .count();
+
+        let final_entries = self
+            .ooo_queue
+            .len()
+            .saturating_sub(overlaps)
+            .saturating_add(1);
+        if final_entries > TCP_OOO_MAX_SEGMENTS {
+            return 0;
+        }
+        if final_entries > self.ooo_queue.len() && self.ooo_queue.ensure_capacity_for(1).is_err() {
+            return 0;
+        }
+
+        // Allocate and populate the complete replacement payload before the
+        // first removal. Existing bytes are copied first and the newly received
+        // bytes overwrite overlaps, preserving the prior merge semantics.
+        let new_seg = if overlaps == 0 {
+            OooSegment {
+                seq,
+                data: seg_data,
+                fin,
+            }
+        } else {
+            let merged_len = merged_data_end.wrapping_sub(merged_start) as usize;
+            let mut merged_data =
+                match AdmittedVec::try_zeroed(HeapClass::SocketPayload, merged_len) {
+                    Ok(data) => data,
+                    Err(_) => return 0,
+                };
+            for existing in &self.ooo_queue {
+                let ex_data_end = existing.seq.wrapping_add(existing.data.len() as u32);
+                let ex_seq_end = ex_data_end.wrapping_add(if existing.fin { 1 } else { 0 });
+                if !seq_le(merged_start, ex_seq_end) || !seq_le(existing.seq, merged_seq_end) {
+                    continue;
+                }
+                let offset = existing.seq.wrapping_sub(merged_start) as usize;
+                if offset < merged_len {
+                    let len = existing.data.len().min(merged_len.saturating_sub(offset));
+                    merged_data.as_mut_slice()[offset..offset + len]
+                        .copy_from_slice(&existing.data.as_slice()[..len]);
+                }
+            }
+            let new_offset = seq.wrapping_sub(merged_start) as usize;
+            if new_offset < merged_len {
+                let len = seg_data.len().min(merged_len.saturating_sub(new_offset));
+                merged_data.as_mut_slice()[new_offset..new_offset + len]
+                    .copy_from_slice(&seg_data.as_slice()[..len]);
+            }
+            // The complete replacement now owns the incoming bytes. Release
+            // the private preflight copy before live entries are removed so
+            // peak SocketPayload admission is bounded to the true transaction.
+            drop(seg_data);
+            OooSegment {
+                seq: merged_start,
+                data: merged_data,
+                fin: merged_fin_pos.is_some(),
+            }
+        };
+
+        // All fallible work is complete. Remove every member of the final merge
+        // set, then publish the single replacement allocation-free.
+        let mut removed_bytes = 0u32;
         let mut i = 0;
         while i < self.ooo_queue.len() {
             let existing = &self.ooo_queue[i];
             let ex_data_end = existing.seq.wrapping_add(existing.data.len() as u32);
             let ex_seq_end = ex_data_end.wrapping_add(if existing.fin { 1 } else { 0 });
-
-            // Recompute the running end of new_seg after each merge iteration
-            // to avoid using a stale value that misses cascading overlaps.
-            let ns_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
-            let ns_seq_end = ns_data_end.wrapping_add(if new_seg.fin { 1 } else { 0 });
-
-            // Check if new segment overlaps or is adjacent to existing
-            // Two ranges [a, b) and [c, d) overlap or touch if a <= d && c <= b
-            // Use sequence-space endpoints (including FIN) for adjacency detection.
-            if seq_le(new_seg.seq, ex_seq_end) && seq_le(existing.seq, ns_seq_end) {
-                // R160-I2 FIX: Compute merge parameters from reference BEFORE
-                // removing existing segment. The previous code removed first then
-                // allocated — on alloc failure the removed segment was lost.
-                let ex_seq = existing.seq;
-                let ex_fin = existing.fin;
-                let rm_data_end = ex_seq.wrapping_add(existing.data.len() as u32);
-
-                let merged_start = if seq_le(ex_seq, new_seg.seq) {
-                    ex_seq
-                } else {
-                    new_seg.seq
-                };
-                let cur_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
-
-                let mut merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
-                    rm_data_end
-                } else {
-                    cur_data_end
-                };
-
-                // R144-2 FIX: Truncate merged data at the earliest FIN position.
-                let merged_fin = ex_fin || new_seg.fin;
-                if merged_fin {
-                    let fin_pos = match (ex_fin, new_seg.fin) {
-                        (true, true) => {
-                            if seq_le(rm_data_end, cur_data_end) {
-                                rm_data_end
-                            } else {
-                                cur_data_end
-                            }
-                        }
-                        (true, false) => rm_data_end,
-                        (false, true) => cur_data_end,
-                        (false, false) => merged_data_end,
-                    };
-                    if seq_lt(fin_pos, merged_data_end) {
-                        merged_data_end = fin_pos;
-                    }
-                }
-
-                let merged_len = merged_data_end.wrapping_sub(merged_start) as usize;
-
-                // R159-3 + R160-I2 FIX: Attempt allocation BEFORE removing
-                // existing segment. On failure, skip merge and keep both segments.
-                let mut merged_data = Vec::new();
-                if merged_data.try_reserve_exact(merged_len).is_err() {
-                    i += 1;
-                    continue;
-                }
-                merged_data.resize(merged_len, 0);
-
-                // Safe to remove now — allocation succeeded
+            if seq_le(merged_start, ex_seq_end) && seq_le(existing.seq, merged_seq_end) {
                 let removed = self.ooo_queue.remove(i).unwrap();
                 removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
-
-                let rm_off = removed.seq.wrapping_sub(merged_start) as usize;
-                if rm_off < merged_len {
-                    let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
-                    merged_data[rm_off..rm_off + rm_len].copy_from_slice(&removed.data[..rm_len]);
-                }
-
-                let ns_off = new_seg.seq.wrapping_sub(merged_start) as usize;
-                if ns_off < merged_len {
-                    let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
-                    merged_data[ns_off..ns_off + ns_len].copy_from_slice(&new_seg.data[..ns_len]);
-                }
-
-                // R135-4 FIX + R144-2 FIX: Preserve FIN if EITHER segment carries it.
-
-                new_seg = OooSegment {
-                    seq: merged_start,
-                    data: merged_data,
-                    fin: merged_fin,
-                };
-                // Don't increment i; check same position again for cascading merges
             } else {
                 i += 1;
             }
@@ -1343,12 +1488,9 @@ impl TcpControlBlock {
 
         let new_bytes = new_seg.data.len() as u32;
 
-        // Enforce segment count limit — drop if full (tail drop policy)
-        if self.ooo_queue.len() >= TCP_OOO_MAX_SEGMENTS {
-            return 0;
-        }
-
-        self.ooo_queue.insert(pos, new_seg);
+        self.ooo_queue
+            .insert_reserved(pos, new_seg)
+            .expect("R180-11 OOO merge lost reserved queue capacity");
 
         // Correct ooo_bytes: subtract all removed segments, add the final merged one.
         // This prevents ooo_bytes from drifting upward on successive overlapping inserts,
@@ -1375,18 +1517,17 @@ impl TcpControlBlock {
                 if seq_gt(front_end, self.rcv_nxt) {
                     // Some new data past rcv_nxt
                     let skip = self.rcv_nxt.wrapping_sub(front.seq) as usize;
-                    let useful = &self.ooo_queue.front().unwrap().data[skip..];
+                    let useful = &self.ooo_queue.front().unwrap().data.as_slice()[skip..];
                     // R158-10 FIX: Cap recv_buffer to prevent unbounded growth.
                     let room = TCP_MAX_RECV_BUFFER_BYTES.saturating_sub(self.recv_buffer.len());
                     if useful.len() > room {
                         break;
                     }
-                    // R163-2 FIX: Fallible allocation before extend, matching
-                    // the R162-9 pattern applied to socket.rs in-order paths.
-                    if self.recv_buffer.try_reserve(useful.len()).is_err() {
+                    // R180-11 FIX: detached admitted growth means the in-order
+                    // buffer cannot allocate during publication.
+                    if self.recv_buffer.try_extend_from_slice(useful).is_err() {
                         break;
                     }
-                    self.recv_buffer.extend(useful);
                     let useful_len = useful.len() as u32;
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(useful_len);
                     delivered = delivered.saturating_add(useful_len);
@@ -1438,25 +1579,24 @@ impl TcpControlBlock {
     /// on OOM. TCP_SACK_MAX_BLOCKS is always 4, so this is a bounded heap
     /// reservation. Callers already handle the empty-blocks case as a plain
     /// ACK, making silent degradation correct protocol behaviour.
-    pub fn generate_sack_blocks(&self) -> Vec<SackBlock> {
-        let mut blocks = Vec::new();
-        // R163-10 FIX: Fallible upfront reservation (max 4 elements).
-        // On OOM return empty vec; caller falls back to plain ACK.
-        if blocks.try_reserve(TCP_SACK_MAX_BLOCKS).is_err() {
-            return Vec::new();
-        }
+    pub fn generate_sack_blocks(&self) -> SackBlocks {
+        let mut blocks = SackBlocks::new();
         for seg in self.ooo_queue.iter().rev().take(TCP_SACK_MAX_BLOCKS) {
             // R145-5 FIX: FIN occupies one sequence number after the data
             // payload.  Include it in right_edge so the peer doesn't
             // unnecessarily retransmit the FIN position.
             let fin_len: u32 = if seg.fin { 1 } else { 0 };
-            blocks.push(SackBlock {
+            let inserted = blocks.push(SackBlock {
                 left_edge: seg.seq,
                 right_edge: seg
                     .seq
                     .wrapping_add(seg.data.len() as u32)
                     .wrapping_add(fin_len),
             });
+            debug_assert!(
+                inserted,
+                "bounded SACK generation exceeded protocol maximum"
+            );
         }
         blocks
     }
@@ -1478,8 +1618,8 @@ impl TcpControlBlock {
 
         // Phase 1: Clamp blocks to [snd_una, snd_nxt) and normalize to offsets
         // from snd_una so we can sort/merge safely even when sequence numbers wrap.
-        let mut rel_blocks: Vec<(u32, u32)> = Vec::new();
-        rel_blocks.reserve(blocks.len().min(TCP_SACK_MAX_BLOCKS));
+        let mut rel_blocks = [(0u32, 0u32); TCP_SACK_MAX_BLOCKS];
+        let mut rel_len = 0usize;
 
         for block in blocks.iter().take(TCP_SACK_MAX_BLOCKS) {
             let left = if seq_lt(block.left_edge, self.snd_una) {
@@ -1498,22 +1638,25 @@ impl TcpControlBlock {
                 continue;
             }
 
-            rel_blocks.push((
+            rel_blocks[rel_len] = (
                 left.wrapping_sub(self.snd_una),
                 right.wrapping_sub(self.snd_una),
-            ));
+            );
+            rel_len += 1;
         }
 
-        if rel_blocks.is_empty() {
+        if rel_len == 0 {
             return;
         }
 
         // Phase 2: Sort by left edge, then merge overlapping/adjacent blocks.
-        rel_blocks.sort_by_key(|(l, _)| *l);
+        rel_blocks[..rel_len].sort_by_key(|(l, _)| *l);
 
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(rel_blocks.len());
-        for (l, r) in rel_blocks {
-            if let Some(last) = merged.last_mut() {
+        let mut merged = [(0u32, 0u32); TCP_SACK_MAX_BLOCKS];
+        let mut merged_len = 0usize;
+        for &(l, r) in &rel_blocks[..rel_len] {
+            if merged_len != 0 {
+                let last = &mut merged[merged_len - 1];
                 if l <= last.1 {
                     // Overlapping or adjacent — extend the previous block
                     if r > last.1 {
@@ -1522,11 +1665,12 @@ impl TcpControlBlock {
                     continue;
                 }
             }
-            merged.push((l, r));
+            merged[merged_len] = (l, r);
+            merged_len += 1;
         }
 
         // Phase 3: Update highest_sacked (guaranteed <= snd_nxt after clamping).
-        for &(_, r_rel) in &merged {
+        for &(_, r_rel) in &merged[..merged_len] {
             let right = self.snd_una.wrapping_add(r_rel);
             if seq_gt(right, self.highest_sacked) {
                 self.highest_sacked = right;
@@ -1543,11 +1687,11 @@ impl TcpControlBlock {
             let seg_right_rel = seg_end.wrapping_sub(self.snd_una);
 
             // Advance past merged blocks that end before this segment starts
-            while bi < merged.len() && merged[bi].1 <= seg_left_rel {
+            while bi < merged_len && merged[bi].1 <= seg_left_rel {
                 bi += 1;
             }
 
-            if bi < merged.len() {
+            if bi < merged_len {
                 let (bl, br) = merged[bi];
                 if bl <= seg_left_rel && seg_right_rel <= br {
                     seg.sacked = true;
@@ -1821,6 +1965,10 @@ pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUp
 
     if seq_gt(ack_num, tcb.snd_una) {
         // New ACK - advances the acknowledgment point
+        // RF180-41 REVIEW FIX: RTO completion suppression requires proof of
+        // forward progress. Duplicate ACKs still prove liveness for keepalive,
+        // but cannot cancel loss recovery for the unchanged oldest target.
+        tcb.peer_ack_generation = tcb.peer_ack_generation.wrapping_add(1);
         update.newly_acked = ack_num.wrapping_sub(tcb.snd_una);
 
         let mut rtt_sampled = false;
@@ -2129,6 +2277,12 @@ pub enum TcpError {
     WouldBlock,
     /// Invalid sequence number
     InvalidSeq,
+    /// TCP header plus payload exceeds the IPv4 pseudo-header u16 length.
+    SegmentTooLong,
+    /// TCP option serialization exceeded the 60-byte header limit.
+    OptionsTooLong,
+    /// Fallible segment storage reservation failed.
+    AllocationFailed,
 }
 
 /// Result type for TCP operations
@@ -2322,7 +2476,8 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
                     break;
                 }
                 let block_count = (opt_len - 2) / 8;
-                let count = block_count.min(TCP_SACK_MAX_BLOCKS);
+                let remaining = TCP_SACK_MAX_BLOCKS.saturating_sub(options.sack_blocks.len());
+                let count = block_count.min(remaining);
                 let mut j = i + 2;
                 for _ in 0..count {
                     if j + 8 > opts_data.len() {
@@ -2342,10 +2497,11 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
                     ]);
                     // Discard invalid blocks where left >= right (wrap-safe)
                     if seq_lt(left, right) {
-                        options.sack_blocks.push(SackBlock {
+                        let inserted = options.sack_blocks.push(SackBlock {
                             left_edge: left,
                             right_edge: right,
                         });
+                        debug_assert!(inserted, "bounded SACK parser exceeded protocol maximum");
                     }
                     j += 8;
                 }
@@ -2411,13 +2567,20 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
 ///
 /// TCP checksum value
 pub fn compute_tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8]) -> u16 {
+    try_compute_tcp_checksum(src_ip, dst_ip, tcp_data).unwrap_or(0)
+}
+
+/// Checked TCP checksum API. Unlike the compatibility wrapper above, an
+/// oversized segment cannot be confused with the valid checksum value zero.
+pub fn try_compute_tcp_checksum(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    tcp_data: &[u8],
+) -> TcpResult<u16> {
     // Build pseudo-header
     // R157-9 FIX: Checked conversion — reject oversized segments instead of
     // silent truncation (IPv4 prevents >65535 in practice, defense-in-depth).
-    let tcp_len: u16 = match u16::try_from(tcp_data.len()) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
+    let tcp_len = u16::try_from(tcp_data.len()).map_err(|_| TcpError::SegmentTooLong)?;
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&src_ip.0);
     pseudo[4..8].copy_from_slice(&dst_ip.0);
@@ -2425,19 +2588,12 @@ pub fn compute_tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8])
     pseudo[9] = TCP_PROTO;
     pseudo[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
-    // Compute checksum over pseudo-header + TCP segment
-    let mut sum: u32 = compute_checksum(&pseudo, pseudo.len()) as u32;
-
-    // Add TCP segment
-    let tcp_sum = compute_checksum(tcp_data, tcp_data.len()) as u32;
-    sum = sum.wrapping_add(tcp_sum);
-
-    // Fold and complement
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    !(sum as u16)
+    // R180-20 FIX: accumulate the pseudo-header and complete TCP segment as
+    // raw one's-complement words, then complement exactly once.  The previous
+    // implementation added two already-complemented partial checksums and
+    // complemented that result again, producing the complement of the wire
+    // checksum while its matching verifier repeated the same mistake.
+    Ok(calculate_checksum_with_pseudo(&pseudo, tcp_data))
 }
 
 /// Verify TCP checksum
@@ -2452,7 +2608,34 @@ pub fn compute_tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8])
 ///
 /// true if checksum is valid
 pub fn verify_tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8]) -> bool {
-    compute_tcp_checksum(src_ip, dst_ip, tcp_data) == 0
+    matches!(try_compute_tcp_checksum(src_ip, dst_ip, tcp_data), Ok(0))
+}
+
+/// R180-20 byte-level checksum oracle used by the kernel integration suite.
+///
+/// The expected values were generated from the RFC 1071 raw word sum outside
+/// this crate. Keeping them in non-test code makes the boot suite exercise the
+/// actual no_std path even when unrelated host-unit tests fail to compile.
+pub fn run_tcp_checksum_self_test() {
+    let src = Ipv4Addr::new(192, 0, 2, 1);
+    let dst = Ipv4Addr::new(198, 51, 100, 2);
+    let mut syn = [
+        0x30, 0x39, 0x00, 0x50, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xfa,
+        0xf0, 0x00, 0x00, 0x00, 0x00,
+    ];
+    assert_eq!(compute_tcp_checksum(src, dst, &syn), 0x53cb);
+    syn[16..18].copy_from_slice(&0x53cbu16.to_be_bytes());
+    assert!(verify_tcp_checksum(src, dst, &syn));
+    syn[4] ^= 0x01;
+    assert!(!verify_tcp_checksum(src, dst, &syn));
+
+    let mut odd = [
+        0x30, 0x39, 0x00, 0x50, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xfa,
+        0xf0, 0x00, 0x00, 0x00, 0x00, b'a', b'b', b'c',
+    ];
+    assert_eq!(compute_tcp_checksum(src, dst, &odd), 0x8f65);
+    odd[16..18].copy_from_slice(&0x8f65u16.to_be_bytes());
+    assert!(verify_tcp_checksum(src, dst, &odd));
 }
 
 /// Build a TCP segment with the given parameters
@@ -2482,28 +2665,72 @@ pub fn build_tcp_segment(
     flags: u8,
     window: u16,
     payload: &[u8],
-) -> Vec<u8> {
+) -> WirePacket {
+    try_build_tcp_segment(
+        src_ip, dst_ip, src_port, dst_port, seq_num, ack_num, flags, window, payload,
+    )
+    .unwrap_or_default()
+}
+
+/// Checked segment builder. The compatibility wrapper returns an empty packet
+/// on error, while this API preserves the precise rejection reason.
+pub fn try_build_tcp_segment(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> TcpResult<WirePacket> {
     let header = TcpHeader::new(src_port, dst_port, seq_num, ack_num, flags, window);
     // R163-10 FIX: Use checked_add to guard against theoretical usize overflow
-    // (e.g. payload near usize::MAX), then reserve fallibly so OOM returns an
-    // empty Vec rather than panicking. The IP layer's build_frame_and_transmit
-    // already rejects empty payloads with TxError::InvalidBuffer, so callers
-    // that ignore the Err result silently drop the packet — correct behaviour.
-    let Some(segment_len) = TCP_HEADER_MIN_LEN.checked_add(payload.len()) else {
-        return Vec::new();
-    };
-    let mut segment = Vec::new();
-    if segment.try_reserve_exact(segment_len).is_err() {
-        return Vec::new();
+    // (e.g. payload near usize::MAX). The checked API preserves allocation and
+    // admission failures; the compatibility wrapper converts them into the
+    // empty-packet sentinel that downstream transmit paths drop fail-closed.
+    let segment_len = TCP_HEADER_MIN_LEN
+        .checked_add(payload.len())
+        .ok_or(TcpError::SegmentTooLong)?;
+    if segment_len > u16::MAX as usize {
+        return Err(TcpError::SegmentTooLong);
     }
-    segment.extend_from_slice(&header.to_bytes());
-    segment.extend_from_slice(payload);
+    // RF180-41 FIX: the complete SYN/data/control segment is admitted before
+    // its allocator request and keeps the charge through transmit/drop.
+    let mut segment =
+        WirePacket::try_zeroed(segment_len).map_err(|_| TcpError::AllocationFailed)?;
+    segment[..TCP_HEADER_MIN_LEN].copy_from_slice(&header.to_bytes());
+    segment[TCP_HEADER_MIN_LEN..].copy_from_slice(payload);
 
     // Compute and set checksum
-    let checksum = compute_tcp_checksum(src_ip, dst_ip, &segment);
+    let checksum = try_compute_tcp_checksum(src_ip, dst_ip, &segment)?;
     segment[16..18].copy_from_slice(&checksum.to_be_bytes());
 
-    segment
+    Ok(segment)
+}
+
+/// Build a serialized segment whose backing allocation remains charged until
+/// the caller has transmitted and destroyed it.
+///
+/// RF180-25 FIX: timer and close work cannot use a merely fallible `Vec`:
+/// allocation must also participate in the whole-kernel socket-payload ledger.
+/// The complete admitted packet is constructed before callers advance TCP
+/// sequence, retry, or state fields.
+pub(crate) fn try_build_tcp_segment_admitted(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> TcpResult<WirePacket> {
+    try_build_tcp_segment(
+        src_ip, dst_ip, src_port, dst_port, seq_num, ack_num, flags, window, payload,
+    )
 }
 
 /// Build a TCP segment with options and correct data offset.
@@ -2543,9 +2770,31 @@ pub fn build_tcp_segment_with_options(
     window: u16,
     options: &[TcpOptionKind],
     payload: &[u8],
-) -> Vec<u8> {
-    let options_bytes = serialize_tcp_options(options);
-    let header_len = TCP_HEADER_MIN_LEN + options_bytes.len();
+) -> WirePacket {
+    try_build_tcp_segment_with_options(
+        src_ip, dst_ip, src_port, dst_port, seq_num, ack_num, flags, window, options, payload,
+    )
+    .unwrap_or_default()
+}
+
+/// Checked option-bearing segment builder.
+pub fn try_build_tcp_segment_with_options(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    options: &[TcpOptionKind],
+    payload: &[u8],
+) -> TcpResult<WirePacket> {
+    // Serialize bounded options into stack storage so final-packet admission
+    // does not temporarily coexist with a second heap-backed wire buffer.
+    let mut option_scratch = [0u8; TCP_HEADER_MAX_LEN - TCP_HEADER_MIN_LEN];
+    let options_len = serialize_tcp_options_into(options, &mut option_scratch);
+    let header_len = TCP_HEADER_MIN_LEN + options_len;
 
     // Validate header length doesn't exceed maximum (60 bytes = 15 * 4)
     debug_assert!(
@@ -2554,31 +2803,35 @@ pub fn build_tcp_segment_with_options(
         header_len,
         TCP_HEADER_MAX_LEN
     );
+    if header_len > TCP_HEADER_MAX_LEN {
+        return Err(TcpError::OptionsTooLong);
+    }
 
     // Create header with correct data offset
     let mut header = TcpHeader::new(src_port, dst_port, seq_num, ack_num, flags, window);
     header.data_offset = (header_len / 4) as u8;
 
     // Build segment: header + options + payload
-    // R163-10 FIX: Reserve complete option-bearing segment storage fallibly so
-    // OOM or capacity overflow returns an empty Vec rather than panicking.
-    // The IP layer rejects empty payloads, so callers silently drop the packet.
-    let Some(segment_len) = header_len.checked_add(payload.len()) else {
-        return Vec::new();
-    };
-    let mut segment = Vec::new();
-    if segment.try_reserve_exact(segment_len).is_err() {
-        return Vec::new();
+    // R163-10 FIX: Compute and validate the complete option-bearing segment
+    // length before its single admitted allocation. The checked API preserves
+    // allocation errors; its compatibility wrapper returns an empty packet.
+    let segment_len = header_len
+        .checked_add(payload.len())
+        .ok_or(TcpError::SegmentTooLong)?;
+    if segment_len > u16::MAX as usize {
+        return Err(TcpError::SegmentTooLong);
     }
-    segment.extend_from_slice(&header.to_bytes());
-    segment.extend_from_slice(&options_bytes);
-    segment.extend_from_slice(payload);
+    let mut segment =
+        WirePacket::try_zeroed(segment_len).map_err(|_| TcpError::AllocationFailed)?;
+    segment[..TCP_HEADER_MIN_LEN].copy_from_slice(&header.to_bytes());
+    segment[TCP_HEADER_MIN_LEN..header_len].copy_from_slice(&option_scratch[..options_len]);
+    segment[header_len..].copy_from_slice(payload);
 
     // Compute and set checksum
-    let checksum = compute_tcp_checksum(src_ip, dst_ip, &segment);
+    let checksum = try_compute_tcp_checksum(src_ip, dst_ip, &segment)?;
     segment[16..18].copy_from_slice(&checksum.to_be_bytes());
 
-    segment
+    Ok(segment)
 }
 
 // ============================================================================
@@ -3208,6 +3461,165 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_checksum_known_syn_wire_vector() {
+        // Independently generated Internet-checksum vector for:
+        // 192.0.2.1:12345 -> 198.51.100.2:80, seq=0x11223344,
+        // SYN, window=64240, no options/payload.  The expected checksum is a
+        // fixed wire oracle, not derived by another helper in this crate.
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+        let mut syn = [
+            0x30, 0x39, // source port 12345
+            0x00, 0x50, // destination port 80
+            0x11, 0x22, 0x33, 0x44, // sequence
+            0x00, 0x00, 0x00, 0x00, // acknowledgment
+            0x50, 0x02, // data offset 5, SYN
+            0xfa, 0xf0, // window 64240
+            0x00, 0x00, // checksum placeholder
+            0x00, 0x00, // urgent pointer
+        ];
+
+        assert_eq!(compute_tcp_checksum(src, dst, &syn), 0x53cb);
+        syn[16..18].copy_from_slice(&0x53cbu16.to_be_bytes());
+        assert!(verify_tcp_checksum(src, dst, &syn));
+
+        // A bit flip must not validate against the known checksum.
+        syn[4] ^= 0x01;
+        assert!(!verify_tcp_checksum(src, dst, &syn));
+    }
+
+    #[test]
+    fn test_tcp_checksum_odd_payload_wire_vector() {
+        // Same header as the SYN oracle with an odd-length "abc" payload.
+        // The independent expected checksum pins high-byte padding of the
+        // final odd octet (RFC 1071) as well as pseudo-header composition.
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+        let mut segment = [
+            0x30, 0x39, 0x00, 0x50, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02,
+            0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00, b'a', b'b', b'c',
+        ];
+
+        assert_eq!(compute_tcp_checksum(src, dst, &segment), 0x8f65);
+        segment[16..18].copy_from_slice(&0x8f65u16.to_be_bytes());
+        assert!(verify_tcp_checksum(src, dst, &segment));
+    }
+
+    #[test]
+    fn test_oversized_checksum_and_builders_fail_closed() {
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+        let oversized_payload = vec![0u8; u16::MAX as usize - TCP_HEADER_MIN_LEN + 1];
+        let oversized_segment = vec![0u8; u16::MAX as usize + 1];
+
+        assert_eq!(
+            try_compute_tcp_checksum(src, dst, &oversized_segment),
+            Err(TcpError::SegmentTooLong)
+        );
+        assert!(!verify_tcp_checksum(src, dst, &oversized_segment));
+        assert_eq!(
+            try_build_tcp_segment(
+                src,
+                dst,
+                12345,
+                80,
+                1,
+                0,
+                TCP_FLAG_SYN,
+                TCP_DEFAULT_WINDOW,
+                &oversized_payload,
+            ),
+            Err(TcpError::SegmentTooLong)
+        );
+        assert!(build_tcp_segment(
+            src,
+            dst,
+            12345,
+            80,
+            1,
+            0,
+            TCP_FLAG_SYN,
+            TCP_DEFAULT_WINDOW,
+            &oversized_payload,
+        )
+        .is_empty());
+
+        assert_eq!(
+            try_build_tcp_segment_with_options(
+                src,
+                dst,
+                12345,
+                80,
+                1,
+                0,
+                TCP_FLAG_SYN,
+                TCP_DEFAULT_WINDOW,
+                &[TcpOptionKind::Mss(1460)],
+                &oversized_payload,
+            ),
+            Err(TcpError::SegmentTooLong)
+        );
+    }
+
+    #[test]
+    fn rf180_41_tcp_wire_admission_failure_is_fail_closed() {
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+
+        WirePacket::fail_next_admission_for_test();
+        assert_eq!(
+            try_build_tcp_segment(
+                src,
+                dst,
+                12345,
+                80,
+                1,
+                0,
+                TCP_FLAG_SYN,
+                TCP_DEFAULT_WINDOW,
+                &[],
+            ),
+            Err(TcpError::AllocationFailed)
+        );
+
+        WirePacket::fail_next_admission_for_test();
+        assert!(build_tcp_segment(
+            src,
+            dst,
+            12345,
+            80,
+            1,
+            0,
+            TCP_FLAG_SYN,
+            TCP_DEFAULT_WINDOW,
+            &[],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rf180_41_tcp_option_wire_bytes_remain_exact() {
+        assert_eq!(
+            serialize_tcp_option(&TcpOptionKind::Mss(1460)).as_slice(),
+            &[2, 4, 0x05, 0xb4]
+        );
+        assert_eq!(
+            serialize_tcp_option(&TcpOptionKind::Unknown { kind: 30, len: 1 }).as_slice(),
+            &[30, 2]
+        );
+
+        let serialized = serialize_tcp_options(&[
+            TcpOptionKind::Mss(1460),
+            TcpOptionKind::WindowScale(7),
+            TcpOptionKind::SackPermitted,
+        ]);
+        assert_eq!(
+            serialized.as_slice(),
+            &[2, 4, 0x05, 0xb4, 3, 3, 7, 4, 2, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn test_seq_arithmetic() {
         // Normal case
         assert!(seq_lt(100, 200));
@@ -3225,5 +3637,100 @@ mod tests {
         assert!(TcpState::Established.can_send());
         assert!(TcpState::Established.can_receive());
         assert!(!TcpState::TimeWait.can_receive());
+    }
+
+    #[test]
+    fn r180_ooo_merge_preflights_complete_transitive_span() {
+        mm::publish_heap_budgets();
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1000,
+            Ipv4Addr::new(10, 0, 0, 2),
+            2000,
+            1,
+        );
+
+        // Seed two adjacent legacy ranges directly. A one-pass scan starting
+        // from the new range at 108 would skip [100,104), merge [104,108), and
+        // need a second pass to discover the newly adjacent earlier range.
+        for (seq, bytes) in [(100, &[1u8; 4][..]), (104, &[2u8; 4][..])] {
+            tcb.ooo_queue
+                .try_push(OooSegment {
+                    seq,
+                    data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, bytes)
+                        .expect("OOO test payload admission"),
+                    fin: false,
+                })
+                .map_err(|_| ())
+                .expect("OOO test queue admission");
+        }
+        tcb.ooo_bytes = 8;
+
+        assert_eq!(tcb.ooo_insert(108, &[3u8; 4], false), 12);
+        assert_eq!(tcb.ooo_queue.len(), 1);
+        let merged = tcb.ooo_queue.front().expect("merged OOO range");
+        assert_eq!(merged.seq, 100);
+        assert_eq!(
+            merged.data.as_slice(),
+            &[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+        );
+        assert_eq!(tcb.ooo_bytes, 12);
+    }
+
+    #[test]
+    fn r180_ooo_queue_growth_failure_is_non_mutating() {
+        mm::publish_heap_budgets();
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1000,
+            Ipv4Addr::new(10, 0, 0, 2),
+            2000,
+            1,
+        );
+        tcb.ooo_queue.fail_next_growth_for_test();
+
+        assert_eq!(tcb.ooo_insert(100, &[9u8; 4], false), 0);
+        assert!(tcb.ooo_queue.is_empty());
+        assert_eq!(tcb.ooo_bytes, 0);
+    }
+
+    #[test]
+    fn rf180_7_ooo_merge_preserves_earliest_fin_across_wrap() {
+        mm::publish_heap_budgets();
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1000,
+            Ipv4Addr::new(10, 0, 0, 2),
+            2000,
+            1,
+        );
+
+        // [MAX-3, 0) carries FIN at sequence 0. The second range begins at 1,
+        // immediately after that FIN. An injected byte at the FIN position must
+        // merge transitively, preserve the earliest FIN, and discard all data
+        // beyond it even though the sequence interval wraps through zero.
+        for (seq, bytes, fin) in [
+            (u32::MAX - 3, &[1u8; 4][..], true),
+            (1, &[2u8; 3][..], false),
+        ] {
+            tcb.ooo_queue
+                .try_push(OooSegment {
+                    seq,
+                    data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, bytes)
+                        .expect("OOO wrap payload admission"),
+                    fin,
+                })
+                .map_err(|_| ())
+                .expect("OOO wrap queue admission");
+        }
+        tcb.ooo_bytes = 7;
+
+        assert_eq!(tcb.ooo_insert(0, &[9], false), 4);
+        assert_eq!(tcb.ooo_queue.len(), 1);
+        let merged = tcb.ooo_queue.front().expect("wrapped merged range");
+        assert_eq!(merged.seq, u32::MAX - 3);
+        assert_eq!(merged.data.as_slice(), &[1, 1, 1, 1]);
+        assert!(merged.fin);
+        assert_eq!(tcb.ooo_bytes, 4);
     }
 }
