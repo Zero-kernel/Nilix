@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -11,8 +11,14 @@ OVMF_PATH = $(shell \
 		find /usr/share/OVMF/ -type f -name "OVMF_CODE*.fd" 2>/dev/null | head -n 1; \
 	fi)
 QEMU = qemu-system-x86_64
+QEMU_ESP ?= esp
 ESP_DIR = $(shell pwd)/esp/EFI/BOOT
 KERNEL_LD = $(shell pwd)/kernel/kernel.ld
+MUSL_TARGET_DIR := kernel-target/musl
+MUSL_KERNEL := $(MUSL_TARGET_DIR)/x86_64-unknown-none/release/kernel
+# RF180-59 FIX: the feature artifact's final package/boot input is isolated too.
+MUSL_ESP := $(MUSL_TARGET_DIR)/esp
+MUSL_ESP_DIR := $(CURDIR)/$(MUSL_ESP)/EFI/BOOT
 
 all: build
 
@@ -115,26 +121,42 @@ build-musl-test:
 	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with Musl Test ==="
+	# RF180-55 FIX: isolate the feature build from the default kernel's top-level
+	# output hardlink. Cargo may reuse a fresh feature artifact without replacing
+	# a top-level binary most recently written by a different feature set.
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../$(MUSL_TARGET_DIR) RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features musl_test
 
 	@echo "=== 准备 EFI ESP 目录 ==="
-	mkdir -p $(ESP_DIR)
+	mkdir -p "$(MUSL_ESP_DIR)"
 
 	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
-	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(MUSL_ESP_DIR)/BOOTX64.EFI"
 
 	@echo "复制 Kernel 到 ESP/kernel.elf"
-	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+	cp "$(MUSL_KERNEL)" "$(MUSL_ESP)/kernel.elf"
+	# RF180-59 FIX: prove the exact Cargo artifact reaches the isolated boot ESP.
+	@set -eu; \
+	src_hash=$$(sha256sum "$(MUSL_KERNEL)" | awk '{print $$1}'); \
+	dst_hash=$$(sha256sum "$(MUSL_ESP)/kernel.elf" | awk '{print $$1}'); \
+	cmp -s "$(MUSL_KERNEL)" "$(MUSL_ESP)/kernel.elf" || { \
+		echo "RF180-59 FAIL: packaged musl kernel differs from Cargo artifact" >&2; exit 1; \
+	}; \
+	test "$$src_hash" = "$$dst_hash" || { \
+		echo "RF180-59 FAIL: packaged musl kernel SHA-256 mismatch" >&2; exit 1; \
+	}; \
+	echo "RF180-59: musl packaged kernel SHA-256 $$dst_hash"
 
 	@echo "=== 内核信息 ==="
-	@readelf -h esp/kernel.elf | grep "Entry\|Type"
+	@readelf -h "$(MUSL_ESP)/kernel.elf" | grep "Entry\|Type"
 	@echo "=== musl ELF 信息 ==="
 	@readelf -h kernel/src/musl_test.elf | grep "Entry\|Type"
 	@echo "=== 构建完成（Musl Test模式）==="
 
 # Run musl test (serial output)
+# RF180-59: interactive and automated musl consumers boot the same isolated ESP.
+run-musl-test: QEMU_ESP := $(MUSL_ESP)
 run-musl-test: build-musl-test
 	@echo "=== 启动内核（Musl Test模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
@@ -184,7 +206,7 @@ run-clone-test: build-clone-test
 # (q35会将某些BAR放在高于4GB的地址，超出bootloader的identity mapping范围)
 # R39-8 FIX: Add CPU model with SMEP/SMAP/UMIP/RDRAND support
 QEMU_COMMON = -bios $(OVMF_PATH) \
-	-drive format=raw,file=fat:rw:esp \
+	-drive format=raw,file=fat:rw:$(QEMU_ESP) \
 	-m 256M \
 	-vga std \
 	-no-reboot -no-shutdown \
@@ -216,23 +238,74 @@ endif
 QEMU_NET = -netdev user,id=net0 \
 	-device virtio-net-pci,netdev=net0,romfile=
 
-# 创建64MB ext2虚拟磁盘镜像
-# 使用dd确保跨平台兼容性，debugfs可选创建测试文件
+# Create the production Ext3 image with a standard internal JBD2 journal.
+# The historical filename is retained so existing run scripts keep working.
 disk-ext2.img:
-	@echo "=== 创建 64MB ext2 虚拟磁盘镜像 ==="
+	@echo "=== Creating 64MB Ext3/JBD2 filesystem image ==="
 	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-	mkfs.ext2 -F -L zeroos $@
+	mkfs.ext3 -F -b 4096 -I 256 -J size=4 -L zeroos $@
 	@echo "=== 写入测试文件 ==="
 	@if command -v debugfs >/dev/null 2>&1; then \
 		tmpfile=$$(mktemp); \
+		emptyfile=$$(mktemp); \
 		echo "Zero-OS virtio-blk test file" > $$tmpfile; \
 		debugfs -w -R "mkdir /test" $@ 2>/dev/null || true; \
 		debugfs -w -R "write $$tmpfile /test/hello.txt" $@ 2>/dev/null || true; \
-		rm -f $$tmpfile; \
-		echo "测试文件已写入: /test/hello.txt"; \
+		debugfs -w -R "write $$emptyfile /test/alloc.bin" $@ 2>/dev/null || true; \
+		rm -f $$tmpfile $$emptyfile; \
+		echo "测试文件已写入: /test/hello.txt, /test/alloc.bin"; \
 	else \
 		echo "警告: debugfs不可用，跳过测试文件创建"; \
 	fi
+
+# Existing developer images are upgraded offline before QEMU attachment. The
+# kernel never performs an implicit on-disk format conversion during mount.
+ensure-ext3-image: disk-ext2.img
+	@for tool in tune2fs e2fsck debugfs; do \
+		command -v $$tool >/dev/null 2>&1 || { echo "$$tool is required"; exit 1; }; \
+	done
+	@if ! LC_ALL=C tune2fs -l disk-ext2.img 2>/dev/null | grep -q 'has_journal'; then \
+		echo "=== Upgrading existing disk-ext2.img with an internal journal ==="; \
+		tune2fs -j -J size=4 disk-ext2.img; \
+	fi
+	@e2fsck -pf disk-ext2.img >/dev/null || status=$$?; \
+		if [ "$${status:-0}" -gt 1 ]; then exit "$${status}"; fi
+	@# RF180-48 FIX: debugfs returns success after leaking an orphan inode when
+	@# mkdir targets an existing directory, and its command exit status does not
+	@# distinguish lookup failure. Accept only an existing directory or the exact
+	@# C-locale missing-path diagnostic; always fsck after any attempted mutation.
+	@emptyfile=; status=0; \
+		cleanup() { \
+			trap - 0 1 2 3 15; \
+			[ -z "$$emptyfile" ] || rm -f "$$emptyfile"; \
+			fsck_status=0; e2fsck -pf disk-ext2.img >/dev/null || fsck_status=$$?; \
+			if [ "$$fsck_status" -gt 1 ]; then exit "$$fsck_status"; fi; \
+			exit "$$status"; \
+		}; \
+		trap 'status=$$?; cleanup' 0; \
+		trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 131' 3; trap 'exit 143' 15; \
+		test_stat=$$(LC_ALL=C debugfs -R "stat /test" disk-ext2.img 2>&1); \
+		case "$$test_stat" in \
+			*'Type: directory'*) ;; \
+			*'/test: File not found by ext2_lookup'*) \
+				debugfs -w -R "mkdir /test" disk-ext2.img >/dev/null 2>&1 || exit 1; \
+				test_stat=$$(LC_ALL=C debugfs -R "stat /test" disk-ext2.img 2>&1); \
+				printf '%s\n' "$$test_stat" | grep -q 'Type: directory' || exit 1 ;; \
+			*) printf '%s\n' "$$test_stat" >&2; echo "failed to validate /test" >&2; exit 1 ;; \
+		esac; \
+		alloc_stat=$$(LC_ALL=C debugfs -R "stat /test/alloc.bin" disk-ext2.img 2>&1); \
+		case "$$alloc_stat" in \
+			*'Type: regular'*'Size: 0'*) ;; \
+			*'/test/alloc.bin: File not found by ext2_lookup'*) \
+				emptyfile=$$(mktemp) || exit 1; \
+				debugfs -w -R "write $$emptyfile /test/alloc.bin" disk-ext2.img >/dev/null 2>&1 \
+					|| exit 1; \
+				alloc_stat=$$(LC_ALL=C debugfs -R "stat /test/alloc.bin" disk-ext2.img 2>&1); \
+				printf '%s\n' "$$alloc_stat" | grep -q 'Type: regular' \
+					&& printf '%s\n' "$$alloc_stat" | grep -q 'Size: 0' || exit 1 ;; \
+			*) printf '%s\n' "$$alloc_stat" >&2; \
+				echo "/test/alloc.bin is not an empty regular file" >&2; exit 1 ;; \
+		esac
 
 # 默认运行 - 图形窗口模式（可看到VGA输出）
 run: build
@@ -248,16 +321,16 @@ run-serial: build
 		-nographic
 
 # virtio-blk 图形模式 - 附加ext2磁盘镜像
-run-blk: build disk-ext2.img
+run-blk: build ensure-ext3-image
 	@echo "=== 启动内核（virtio-blk 图形模式）==="
-	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "磁盘: disk-ext2.img (64MB Ext3/JBD2)"
 	@echo "提示：使用Ctrl+Alt+G释放鼠标，Ctrl+Alt+2切换到QEMU监视器"
 	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET)
 
 # virtio-blk 串口模式 - 便于查看挂载日志
-run-blk-serial: build disk-ext2.img
+run-blk-serial: build ensure-ext3-image
 	@echo "=== 启动内核（virtio-blk 串口模式）==="
-	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "磁盘: disk-ext2.img (64MB Ext3/JBD2)"
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
 		-nographic
@@ -320,6 +393,19 @@ test: build
 	@echo "=== 启动内核（运行时测试套件门禁）==="
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/kernel_test.sh esp
 
+# R180-6 production filesystem gate: attach the reproducibly journaled image
+# so the mounted-image probe exercises real JBD2 transactions.
+test-ext3: build ensure-ext3-image
+	@echo "=== Running Ext3/JBD2 production-image gate ==="
+	@# RF180-50 FIX: the kernel intentionally upgrades its mounted journal with
+	@# a private incompat bit that host e2fsprogs must reject. Boot a disposable
+	@# copy so the canonical fixture stays host-checkable and the gate is repeatable.
+	@test_image=$$(mktemp "$(CURDIR)/.r180-ext3-test.XXXXXX") || exit 1; \
+		trap 'rm -f "$$test_image"' 0; \
+		trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 131' 3; trap 'exit 143' 15; \
+		cp disk-ext2.img "$$test_image" || exit 1; \
+		OVMF_PATH="$(OVMF_PATH)" KERNEL_TEST_DISK="$$test_image" bash scripts/kernel_test.sh esp
+
 # CI boot-health gate — exit code reflects REAL boot health. Boots under QEMU
 # and asserts the kernel reaches userspace with zero NX-violation #PF. See
 # scripts/boot_check.sh and the D1-BOOT-NX-KASLR-LAYOUT process lesson.
@@ -332,7 +418,7 @@ boot-check: build
 # --features musl_test so the embedded userspace/hello_musl.elf is the Ring-3
 # init program. See scripts/musl_check.sh.
 musl-check: build-musl-test
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh esp
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh "$(MUSL_ESP)"
 
 # SMP stress test gates - validate R175 D0 fixes under multi-core operation
 # Exit code reflects real SMP stability (0 = pass, non-zero = fail).
@@ -349,18 +435,18 @@ test-smp-4core: build
 # 使用 -smp 指定CPU数量（默认2个）
 # ACPI MADT表会自动生成，使内核能够发现多核
 SMP_CPUS ?= 2
-run-smp: build disk-ext2.img
+run-smp: build ensure-ext3-image
 	@echo "=== 启动内核（SMP模式 - $(SMP_CPUS)核）==="
-	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "磁盘: disk-ext2.img (64MB Ext3/JBD2)"
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
 		-smp cpus=$(SMP_CPUS) \
 		-nographic
 
 # SMP调试模式 - 详细的APIC/IPI日志
-run-smp-debug: build disk-ext2.img
+run-smp-debug: build ensure-ext3-image
 	@echo "=== 启动内核（SMP调试模式 - $(SMP_CPUS)核）==="
-	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "磁盘: disk-ext2.img (64MB Ext3/JBD2)"
 	@echo "提示：中断日志记录到 qemu-smp.log"
 	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
 		-smp cpus=$(SMP_CPUS) \
