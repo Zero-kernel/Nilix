@@ -11,7 +11,8 @@ pub mod vga_buffer;
 // Re-export keyboard API for convenient access
 pub use keyboard::{
     available as keyboard_available, clear as keyboard_clear, has_input as keyboard_has_input,
-    push_scancode, read_buf as keyboard_read, read_char as keyboard_read_char,
+    push_scancode, read_buf as keyboard_read, read_buf_with_commit as keyboard_read_with_commit,
+    read_char as keyboard_read_char,
 };
 
 pub fn init() {

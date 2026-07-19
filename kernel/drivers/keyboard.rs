@@ -131,6 +131,38 @@ impl KeyboardBuffer {
         count
     }
 
+    /// Copy buffered bytes without advancing the consumer cursor.
+    fn peek(&self, buf: &mut [u8]) -> usize {
+        let to_read = core::cmp::min(buf.len(), self.count);
+        let mut pos = self.read_pos;
+        for byte in buf.iter_mut().take(to_read) {
+            *byte = self.buffer[pos];
+            pos = (pos + 1) % BUFFER_SIZE;
+        }
+        to_read
+    }
+
+    /// Commit a previously peeked prefix while the buffer lock is held.
+    fn consume(&mut self, count: usize) {
+        debug_assert!(count <= self.count);
+        let count = count.min(self.count);
+        self.read_pos = (self.read_pos + count) % BUFFER_SIZE;
+        self.count -= count;
+    }
+
+    fn read_with_commit<E, F>(&mut self, buf: &mut [u8], commit: F) -> Result<usize, E>
+    where
+        F: FnOnce(&[u8]) -> Result<(), E>,
+    {
+        let count = self.peek(buf);
+        if count == 0 {
+            return Ok(0);
+        }
+        commit(&buf[..count])?;
+        self.consume(count);
+        Ok(count)
+    }
+
     /// Process a PS/2 Set 1 scancode
     ///
     /// Handles key press/release, modifier state, and character conversion.
@@ -372,6 +404,19 @@ pub fn read_buf(buf: &mut [u8]) -> usize {
     })
 }
 
+/// R180-L1: perform copyout before consuming keyboard bytes. The lock and
+/// interrupt exclusion cover the bounded callback, so another reader cannot
+/// steal the peeked prefix between validation and commit.
+pub fn read_buf_with_commit<E, F>(buf: &mut [u8], commit: F) -> Result<usize, E>
+where
+    F: FnOnce(&[u8]) -> Result<(), E>,
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut buffer = KEYBOARD_BUFFER.lock();
+        buffer.read_with_commit(buf, commit)
+    })
+}
+
 /// Read a single character from the keyboard buffer
 ///
 /// Non-blocking: returns None if no input available.
@@ -423,6 +468,55 @@ pub fn clear() {
 /// Useful for debugging input issues.
 pub fn dropped_count() -> u64 {
     DROPPED_BYTES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_is_zero_mutation_until_consume() {
+        let mut buffer = KeyboardBuffer::new();
+        assert!(buffer.push(b'a'));
+        assert!(buffer.push(b'b'));
+        assert!(buffer.push(b'c'));
+
+        let initial_pos = buffer.read_pos;
+        let initial_count = buffer.count;
+        let mut first = [0u8; 2];
+        assert_eq!(buffer.peek(&mut first), 2);
+        assert_eq!(&first, b"ab");
+        assert_eq!(buffer.read_pos, initial_pos);
+        assert_eq!(buffer.count, initial_count);
+
+        let mut retry = [0u8; 2];
+        assert_eq!(buffer.peek(&mut retry), 2);
+        assert_eq!(retry, first);
+        buffer.consume(2);
+        assert_eq!(buffer.count, 1);
+        assert_eq!(buffer.pop(), Some(b'c'));
+    }
+
+    #[test]
+    fn failed_copyout_preserves_keyboard_prefix() {
+        let mut buffer = KeyboardBuffer::new();
+        assert!(buffer.push(b'x'));
+        assert!(buffer.push(b'y'));
+        let mut staging = [0u8; 2];
+
+        let failed = buffer.read_with_commit(&mut staging, |_bytes| Err::<(), _>(()));
+        assert!(failed.is_err());
+        assert_eq!(buffer.available(), 2);
+
+        let copied = buffer
+            .read_with_commit(&mut staging, |bytes| {
+                assert_eq!(bytes, b"xy");
+                Ok::<(), ()>(())
+            })
+            .expect("retry must see the same keyboard bytes");
+        assert_eq!(copied, 2);
+        assert!(buffer.is_empty());
+    }
 }
 
 /// Try to pop a single character from the keyboard buffer (alias for read_char)
