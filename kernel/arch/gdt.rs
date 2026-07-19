@@ -19,6 +19,7 @@ use x86_64::{
     registers::segmentation::{Segment, CS, DS, SS},
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
+        paging::{FrameAllocator as PagingFrameAllocator, Page, Size4KiB},
         tss::TaskStateSegment,
     },
     VirtAddr,
@@ -126,6 +127,10 @@ static PER_CPU_INIT: [AtomicBool; MAX_CPUS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
     [INIT; MAX_CPUS]
 };
+
+/// RF180-53 FIX: publication that every BSP/AP IST guard PTE was installed by
+/// the BSP before any AP could inherit the shared kernel page tables.
+static IST_GUARDS_PREPARED: AtomicBool = AtomicBool::new(false);
 
 /// Global selectors cache (all CPUs use same selector values)
 static SELECTORS_CACHE: Once<Selectors> = Once::new();
@@ -278,34 +283,144 @@ pub fn get_kernel_stack() -> VirtAddr {
     }
 }
 
-/// R149-I5 FIX: Unmap the bottom page of the BSP IST double-fault stack as
-/// a guard page.  R148-4 added this for AP stacks; BSP was left unguarded
-/// because gdt::init() runs before mm::page_table::init().
-///
-/// Must be called after mm::page_table::init() completes (e.g. from
-/// stack_guard::install or a post-init hook in main.rs).
-pub fn install_bsp_ist_guard_page() {
-    use x86_64::structures::paging::{Page, Size4KiB};
-    let guard_addr = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
-    let guard_page = Page::<Size4KiB>::containing_address(guard_addr);
+#[inline]
+fn bsp_double_fault_guard_page() -> Page<Size4KiB> {
+    let start = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
+    Page::containing_address(start)
+}
+
+#[inline]
+fn bsp_nmi_guard_page() -> Page<Size4KiB> {
+    let start = VirtAddr::from_ptr(unsafe { &raw const BSP_NMI_STACK.0 });
+    Page::containing_address(start)
+}
+
+#[inline]
+fn ap_double_fault_guard_page(cpu_id: usize) -> Page<Size4KiB> {
+    let start = VirtAddr::from_ptr(unsafe { &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0 });
+    Page::containing_address(start)
+}
+
+#[inline]
+fn ap_nmi_guard_page(cpu_id: usize) -> Page<Size4KiB> {
+    let start = VirtAddr::from_ptr(unsafe { &raw const AP_NMI_STACKS[cpu_id].0 });
+    Page::containing_address(start)
+}
+
+fn ensure_guard_pte(
+    page: Page<Size4KiB>,
+    frame_allocator: &mut impl PagingFrameAllocator<Size4KiB>,
+) {
     unsafe {
-        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
-            let _ = manager.unmap_page(guard_page);
-        });
+        mm::page_table::ensure_pte_range(page.start_address(), 4096, frame_allocator)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "RF180-53: failed to demote IST guard page {:#x}: {:?}",
+                    page.start_address().as_u64(),
+                    error
+                )
+            });
     }
 }
 
-/// R148-I5 FIX: Unmap the bottom page of the BSP NMI IST stack as a guard page.
-/// Must be called after mm::page_table::init() completes (same as install_bsp_ist_guard_page).
-pub fn install_bsp_nmi_guard_page() {
-    use x86_64::structures::paging::{Page, Size4KiB};
-    let guard_addr = VirtAddr::from_ptr(unsafe { &raw const BSP_NMI_STACK.0 });
-    let guard_page = Page::<Size4KiB>::containing_address(guard_addr);
+fn unmap_guard_page(
+    manager: &mut mm::page_table::PageTableManager,
+    page: Page<Size4KiB>,
+    cpu_id: usize,
+    kind: &'static str,
+) {
+    manager.unmap_page(page).unwrap_or_else(|error| {
+        panic!(
+            "RF180-53: CPU {} {} IST guard unmap failed at {:#x}: {:?}",
+            cpu_id,
+            kind,
+            page.start_address().as_u64(),
+            error
+        )
+    });
+    if manager.translate_addr(page.start_address()).is_some() {
+        panic!(
+            "RF180-53: CPU {} {} IST guard remained present at {:#x}",
+            cpu_id,
+            kind,
+            page.start_address().as_u64()
+        );
+    }
+    let first_usable = page.start_address() + 4096u64;
+    if manager.translate_addr(first_usable).is_none() {
+        panic!(
+            "RF180-53: CPU {} {} IST body is not mapped at {:#x}",
+            cpu_id,
+            kind,
+            first_usable.as_u64()
+        );
+    }
+}
+
+fn verify_guard_page(
+    manager: &mut mm::page_table::PageTableManager,
+    page: Page<Size4KiB>,
+    cpu_id: usize,
+    kind: &'static str,
+) {
+    if manager.translate_addr(page.start_address()).is_some() {
+        panic!(
+            "RF180-53: CPU {} {} IST guard unexpectedly present at AP entry",
+            cpu_id, kind
+        );
+    }
+    if manager
+        .translate_addr(page.start_address() + 4096u64)
+        .is_none()
+    {
+        panic!(
+            "RF180-53: CPU {} {} IST body unexpectedly absent at AP entry",
+            cpu_id, kind
+        );
+    }
+}
+
+/// RF180-53 FIX: install every BSP and AP IST guard before SMP publication.
+///
+/// The old BSP calls ran before W^X demotion and silently ignored
+/// `ParentEntryHugePage`; the old AP path then mutated shared page tables after
+/// AP startup without a global TLB shootdown. The BSP now first demotes every
+/// target to a 4 KiB PTE, checks every unmap, verifies the adjacent stack body,
+/// and publishes completion before INIT-SIPI-SIPI can run. No guard frame is
+/// returned to the buddy allocator because these pages remain kernel-image
+/// storage; only their virtual mappings are removed.
+pub fn install_ist_guard_pages_before_smp(
+    frame_allocator: &mut impl PagingFrameAllocator<Size4KiB>,
+) {
+    if IST_GUARDS_PREPARED.load(Ordering::Acquire) {
+        panic!("RF180-53: IST guards installed more than once");
+    }
+
+    // Preflight all required huge-page demotions before removing the first
+    // mapping. A demotion failure halts boot with every stack still mapped.
+    ensure_guard_pte(bsp_double_fault_guard_page(), frame_allocator);
+    ensure_guard_pte(bsp_nmi_guard_page(), frame_allocator);
+    for cpu_id in 1..MAX_CPUS {
+        ensure_guard_pte(ap_double_fault_guard_page(cpu_id), frame_allocator);
+        ensure_guard_pte(ap_nmi_guard_page(cpu_id), frame_allocator);
+    }
+
     unsafe {
         mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
-            let _ = manager.unmap_page(guard_page);
+            unmap_guard_page(manager, bsp_double_fault_guard_page(), 0, "double-fault");
+            unmap_guard_page(manager, bsp_nmi_guard_page(), 0, "NMI");
+            for cpu_id in 1..MAX_CPUS {
+                unmap_guard_page(
+                    manager,
+                    ap_double_fault_guard_page(cpu_id),
+                    cpu_id,
+                    "double-fault",
+                );
+                unmap_guard_page(manager, ap_nmi_guard_page(cpu_id), cpu_id, "NMI");
+            }
         });
     }
+    IST_GUARDS_PREPARED.store(true, Ordering::Release);
 }
 
 /// 更新当前 CPU 指定 IST 栈顶
@@ -359,6 +474,9 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
     if cpu_id >= MAX_CPUS {
         panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
     }
+    if !IST_GUARDS_PREPARED.load(Ordering::Acquire) {
+        panic!("RF180-53: AP entered before BSP IST guards were published");
+    }
 
     // R145-6 FIX: APs use a dedicated per-CPU IST stack for double-fault
     // handling so that a kernel stack overflow does not corrupt the #DF
@@ -367,31 +485,22 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
         x86_64::VirtAddr::from_ptr(unsafe { &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0 });
     let df_stack_top = (df_stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64();
 
-    // R148-4 FIX: Unmap the bottom page of the AP IST stack as a guard page.
-    // With the AlignedStack now page-aligned, the bottom page can be safely
-    // unmapped without affecting adjacent data. Overflow past the guard page
-    // triggers a page fault instead of silently corrupting .bss.
-    {
-        use x86_64::structures::paging::{Page, Size4KiB};
-        let guard_page = Page::<Size4KiB>::containing_address(df_stack_start);
-        unsafe {
-            mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
-                let _ = manager.unmap_page(guard_page);
-            });
-        }
-    }
-
-    // R148-I5 FIX: Per-AP dedicated NMI IST stack + guard page
+    // R148-I5 FIX: Per-AP dedicated NMI IST stack.
     let nmi_stack_start = x86_64::VirtAddr::from_ptr(unsafe { &raw const AP_NMI_STACKS[cpu_id].0 });
     let nmi_stack_top = (nmi_stack_start + NMI_STACK_SIZE as u64).as_u64();
-    {
-        use x86_64::structures::paging::{Page, Size4KiB};
-        let guard_page = Page::<Size4KiB>::containing_address(nmi_stack_start);
-        unsafe {
-            mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
-                let _ = manager.unmap_page(guard_page);
-            });
-        }
+
+    // RF180-53: APs never mutate the shared kernel page tables. Verify the
+    // BSP-prepared guards before loading a TSS that depends on those stacks.
+    unsafe {
+        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+            verify_guard_page(
+                manager,
+                ap_double_fault_guard_page(cpu_id),
+                cpu_id,
+                "double-fault",
+            );
+            verify_guard_page(manager, ap_nmi_guard_page(cpu_id), cpu_id, "NMI");
+        });
     }
 
     init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top, nmi_stack_top);

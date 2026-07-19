@@ -1923,6 +1923,23 @@ extern "C" fn timer_interrupt_body(
     // R69-3 FIX: Mark leaving IRQ context
     current_cpu().irq_exit();
 
+    // RF180 VT-d fault progress: a syscall-free Ring-3 workload must not starve
+    // blocking fault containment forever. EOI and FPU restoration are complete,
+    // the interrupted context held no kernel locks, kernel GS/CR3 remain active,
+    // and irq_count is now zero. Temporarily enable interrupts for the fixed
+    // level-triggered callback snapshot, then restore IF=0 before the existing
+    // IRQ-return scheduler/IRET path. A nested timer interrupts CPL0 and therefore
+    // cannot recurse into this CPL3-only soft progress point.
+    if returning_to_user {
+        debug_assert!(!current_cpu().in_irq());
+        debug_assert!(!x86_interrupts::are_enabled());
+        x86_interrupts::enable();
+        debug_assert!(x86_interrupts::are_enabled());
+        kernel_core::drain_requested_soft_progress();
+        x86_interrupts::disable();
+        debug_assert!(!x86_interrupts::are_enabled());
+    }
+
     // R178-2 FIX: Check need_resched with IRQs off immediately before iretq.
     //
     // VULNERABILITY: The previous code only called request_resched_from_irq() which sets
