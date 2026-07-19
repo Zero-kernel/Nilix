@@ -62,6 +62,34 @@ pub struct FallibleOrderedMap<K: Ord, V> {
     entries: Vec<(K, V)>,
 }
 
+/// Detached backing storage prepared for an allocation-free map-capacity
+/// replacement.
+///
+/// The allocation happens while the live map is untouched.  Callers that
+/// account heap capacity can therefore reconcile the allocator's actual
+/// capacity before publishing it, then install it with
+/// [`FallibleOrderedMap::replace_backing`] without another allocation.
+pub struct PreparedOrderedMapBacking<K: Ord, V> {
+    entries: Vec<(K, V)>,
+}
+
+impl<K: Ord, V> PreparedOrderedMapBacking<K, V> {
+    /// Empty detached backing. This is allocation-free and is used to retire a
+    /// live map's final backing without freeing it under the caller's lock.
+    #[inline]
+    pub const fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Actual allocator capacity of the detached backing vector.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+}
+
 impl<K: Ord, V> FallibleOrderedMap<K, V> {
     /// Create an empty map. Const so it can initialize statics if ever needed.
     #[inline]
@@ -163,6 +191,58 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
         self.entries.try_reserve_exact(additional)
     }
 
+    /// Allocate detached backing storage for `required_capacity` entries.
+    ///
+    /// The live map is not modified on either success or failure.  This is the
+    /// prepare half of a transactional capacity replacement used by retained
+    /// metadata owners that must reserve aggregate heap bytes before the new
+    /// capacity becomes reachable.
+    pub fn try_prepare_backing_exact(
+        required_capacity: usize,
+    ) -> Result<PreparedOrderedMapBacking<K, V>, TryReserveError> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(required_capacity)?;
+        Ok(PreparedOrderedMapBacking { entries })
+    }
+
+    /// Replace this map's backing allocation with a previously prepared one.
+    ///
+    /// Existing entries are moved (never cloned) in sorted order.  The old
+    /// backing allocation is deallocated before this function returns, and the
+    /// returned value is its former capacity.  Failure is allocation-free and
+    /// leaves both the map and prepared backing unchanged.
+    pub fn replace_backing(
+        &mut self,
+        prepared: PreparedOrderedMapBacking<K, V>,
+    ) -> Result<usize, PreparedOrderedMapBacking<K, V>> {
+        let retired = self.replace_backing_deferred(prepared)?;
+        let old_capacity = retired.capacity();
+        drop(retired);
+        Ok(old_capacity)
+    }
+
+    /// Replace backing without destroying the obsolete allocation.
+    ///
+    /// The returned detached owner contains no entries but retains the old
+    /// allocation. Callers can therefore swap backing while holding a metadata
+    /// lock, release that lock, and only then perform the physical deallocation.
+    pub fn replace_backing_deferred(
+        &mut self,
+        mut prepared: PreparedOrderedMapBacking<K, V>,
+    ) -> Result<PreparedOrderedMapBacking<K, V>, PreparedOrderedMapBacking<K, V>> {
+        if prepared.entries.capacity() < self.entries.len() {
+            return Err(prepared);
+        }
+
+        let mut old = core::mem::take(&mut self.entries);
+        for entry in old.drain(..) {
+            // Capacity was validated above, so push cannot allocate.
+            prepared.entries.push(entry);
+        }
+        self.entries = prepared.entries;
+        Ok(PreparedOrderedMapBacking { entries: old })
+    }
+
     /// Insert `value` for `key`, fallibly.
     ///
     /// Returns `Ok(Some(old))` if `key` was already present (replaced in place —
@@ -182,6 +262,24 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
         }
     }
 
+    /// Insert a key known to be absent using already-reserved backing capacity.
+    ///
+    /// This function never allocates.  On a duplicate key or insufficient
+    /// capacity it returns ownership of `(key, value)` and leaves the map
+    /// unchanged.  It is the publication half paired with detached key/backing
+    /// preparation in aggregate-admitted users such as RAMFS.
+    pub fn insert_unique_reserved(&mut self, key: K, value: V) -> Result<(), (K, V)> {
+        let idx = match self.find(&key) {
+            Ok(_) => return Err((key, value)),
+            Err(idx) => idx,
+        };
+        if self.entries.len() == self.entries.capacity() {
+            return Err((key, value));
+        }
+        self.entries.insert(idx, (key, value));
+        Ok(())
+    }
+
     /// Remove and return the value for `key`, if present. O(n) (Vec shift).
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
@@ -190,6 +288,22 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
     {
         match self.find(key) {
             Ok(idx) => Some(self.entries.remove(idx).1),
+            Err(_) => None,
+        }
+    }
+
+    /// Remove and return both the owned key and value. O(n) (Vec shift).
+    ///
+    /// Returning the key lets retained-metadata users deallocate and uncharge
+    /// key-owned buffers exactly on unlink/rename instead of losing their
+    /// allocation capacity behind a value-only removal API.
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        match self.find(key) {
+            Ok(idx) => Some(self.entries.remove(idx)),
             Err(_) => None,
         }
     }
@@ -413,6 +527,24 @@ pub fn run_fallible_ordered_map_self_test() {
         "removal retains one bounded high-water allocation"
     );
 
+    // R180-13 detached prepare/install: the live map is untouched until the
+    // prepared backing is installed, and reserved insertion/removal transfers
+    // owned keys without any allocation.
+    let mut transactional: FallibleOrderedMap<usize, usize> = FallibleOrderedMap::new();
+    let prepared =
+        FallibleOrderedMap::try_prepare_backing_exact(2).expect("prepare detached backing");
+    assert!(prepared.capacity() >= 2);
+    assert_eq!(transactional.len(), 0);
+    match transactional.replace_backing(prepared) {
+        Ok(old_capacity) => assert_eq!(old_capacity, 0),
+        Err(_) => panic!("prepared backing unexpectedly too small"),
+    }
+    assert_eq!(transactional.insert_unique_reserved(2, 20), Ok(()));
+    assert_eq!(transactional.insert_unique_reserved(1, 10), Ok(()));
+    assert_eq!(transactional.keys().copied().collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(transactional.remove_entry(&1), Some((1, 10)));
+    assert_eq!(transactional.get(&1), None);
+
     // try_clone is independent of the source.
     let mut cloned = map.try_clone().expect("clone");
     assert_eq!(cloned.len(), map.len());
@@ -492,5 +624,13 @@ pub fn run_fallible_ordered_map_self_test() {
         assert_eq!(sm.remove("banana"), Some(22));
         assert_eq!(sm.get("banana"), None);
         assert_eq!(sm.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ordered_map_transaction_primitives() {
+        super::run_fallible_ordered_map_self_test();
     }
 }
