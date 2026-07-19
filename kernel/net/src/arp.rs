@@ -34,13 +34,13 @@
 //! - RFC 826: Ethernet Address Resolution Protocol
 //! - RFC 5227: IPv4 Address Conflict Detection
 
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::admitted::{AdmittedVec, WirePacket};
 use crate::ethernet::{build_ethernet_frame, EthAddr, ETHERTYPE_ARP};
 use crate::icmp::TokenBucket;
 use crate::ipv4::Ipv4Addr;
+use mm::HeapClass;
 
 // ============================================================================
 // ARP Constants (RFC 826)
@@ -122,7 +122,7 @@ impl ArpOp {
 // ============================================================================
 
 /// Parsed ARP packet for Ethernet/IPv4
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArpPacket {
     /// Sender hardware (MAC) address
     pub sender_hw: EthAddr,
@@ -159,6 +159,8 @@ pub enum ArpError {
     RateLimited,
     /// Conflicting cache entry (anti-spoofing)
     CacheConflict,
+    /// Aggregate heap admission failed before cache publication.
+    NoMemory,
 }
 
 // ============================================================================
@@ -201,7 +203,7 @@ pub struct ArpEntry {
 /// - Static entry protection (never overwritten)
 pub struct ArpCache {
     /// Cache entries (LRU order: oldest first)
-    entries: VecDeque<ArpEntry>,
+    entries: AdmittedVec<ArpEntry>,
     /// TTL for dynamic entries in milliseconds
     ttl_ms: u64,
     /// Maximum number of entries
@@ -218,7 +220,10 @@ impl ArpCache {
     /// Create a new ARP cache with specified TTL and capacity.
     pub fn new(ttl_ms: u64, max_entries: usize) -> Self {
         ArpCache {
-            entries: VecDeque::with_capacity(max_entries.min(64)),
+            // RF180-41 REVIEW FIX: the declared maximum is the truthful
+            // logical limit. Backing grows only through fallible aggregate
+            // admission; there is no hidden 64-entry infallible prefix.
+            entries: AdmittedVec::new(HeapClass::SocketObject),
             ttl_ms,
             max_entries,
             // R102-12 FIX: Per-interface rate limiters with same defaults as global.
@@ -285,8 +290,22 @@ impl ArpCache {
                 return Err(ArpError::CacheConflict);
             }
 
-            // Remove and re-add at end (update LRU position)
-            self.entries.remove(pos);
+            // Remove and re-add at end (update LRU position). Existing backing
+            // already has the required slot, so publication cannot allocate.
+            let refreshed = self
+                .entries
+                .remove(pos)
+                .expect("RF180-41 ARP refresh position vanished");
+            debug_assert_eq!(refreshed.ip, ip);
+            return self
+                .entries
+                .push_reserved(ArpEntry {
+                    ip,
+                    mac,
+                    kind,
+                    updated_at: now_ms,
+                })
+                .map_err(|_| ArpError::NoMemory);
         }
 
         // R62-5 FIX: Evict oldest *dynamic* entry if at capacity; never evict static.
@@ -307,13 +326,21 @@ impl ArpCache {
             }
         }
 
+        if self.entries.len() < self.max_entries {
+            self.entries
+                .ensure_capacity_for(1)
+                .map_err(|_| ArpError::NoMemory)?;
+        }
+
         // Add new entry at end (most recently used)
-        self.entries.push_back(ArpEntry {
-            ip,
-            mac,
-            kind,
-            updated_at: now_ms,
-        });
+        self.entries
+            .push_reserved(ArpEntry {
+                ip,
+                mac,
+                kind,
+                updated_at: now_ms,
+            })
+            .map_err(|_| ArpError::NoMemory)?;
 
         Ok(())
     }
@@ -559,31 +586,24 @@ pub fn parse_arp(buf: &[u8]) -> Result<ArpPacket, ArpError> {
 /// # Returns
 ///
 /// 28-byte ARP packet suitable for Ethernet payload.
-// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
-pub fn serialize_arp(pkt: &ArpPacket) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if buf.try_reserve_exact(ARP_PACKET_LEN).is_err() {
-        return buf;
-    }
-    buf.extend_from_slice(&HTYPE_ETHERNET.to_be_bytes());
-    // Protocol type (IPv4)
-    buf.extend_from_slice(&PTYPE_IPV4.to_be_bytes());
-    // Hardware address length
-    buf.push(HLEN_ETHERNET);
-    // Protocol address length
-    buf.push(PLEN_IPV4);
-    // Operation
-    buf.extend_from_slice(&pkt.op.to_raw().to_be_bytes());
-    // Sender hardware address
-    buf.extend_from_slice(&pkt.sender_hw.0);
-    // Sender protocol address
-    buf.extend_from_slice(&pkt.sender_ip.octets());
-    // Target hardware address
-    buf.extend_from_slice(&pkt.target_hw.0);
-    // Target protocol address
-    buf.extend_from_slice(&pkt.target_ip.octets());
+fn serialize_arp_bytes(pkt: &ArpPacket) -> [u8; ARP_PACKET_LEN] {
+    let mut bytes = [0u8; ARP_PACKET_LEN];
+    bytes[0..2].copy_from_slice(&HTYPE_ETHERNET.to_be_bytes());
+    bytes[2..4].copy_from_slice(&PTYPE_IPV4.to_be_bytes());
+    bytes[4] = HLEN_ETHERNET;
+    bytes[5] = PLEN_IPV4;
+    bytes[6..8].copy_from_slice(&pkt.op.to_raw().to_be_bytes());
+    bytes[8..14].copy_from_slice(&pkt.sender_hw.0);
+    bytes[14..18].copy_from_slice(&pkt.sender_ip.octets());
+    bytes[18..24].copy_from_slice(&pkt.target_hw.0);
+    bytes[24..28].copy_from_slice(&pkt.target_ip.octets());
+    bytes
+}
 
-    buf
+// RF180-41 FIX: serialization is aggregate-admitted and owns that charge for
+// the exact lifetime of its backing allocation.
+pub fn serialize_arp(pkt: &ArpPacket) -> WirePacket {
+    WirePacket::try_copy_from_slice(&serialize_arp_bytes(pkt)).unwrap_or_default()
 }
 
 /// Build an ARP reply packet.
@@ -603,7 +623,7 @@ pub fn build_arp_reply(
     our_ip: Ipv4Addr,
     target_mac: EthAddr,
     target_ip: Ipv4Addr,
-) -> Vec<u8> {
+) -> WirePacket {
     let arp_pkt = ArpPacket {
         sender_hw: our_mac,
         sender_ip: our_ip,
@@ -612,14 +632,7 @@ pub fn build_arp_reply(
         op: ArpOp::Reply,
     };
 
-    let arp_payload = serialize_arp(&arp_pkt);
-    // R165-19 FIX: serialize_arp returns an empty Vec on OOM. Building an Ethernet
-    // frame over an empty payload would emit a runt 14-byte (header-only) frame.
-    // Propagate the empty-Vec sentinel so the caller drops the reply instead of
-    // transmitting a malformed frame.
-    if arp_payload.is_empty() {
-        return Vec::new();
-    }
+    let arp_payload = serialize_arp_bytes(&arp_pkt);
     build_ethernet_frame(target_mac, our_mac, ETHERTYPE_ARP, &arp_payload)
 }
 
@@ -634,7 +647,7 @@ pub fn build_arp_reply(
 /// # Returns
 ///
 /// Complete Ethernet frame containing ARP request (broadcast).
-pub fn build_arp_request(our_mac: EthAddr, our_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
+pub fn build_arp_request(our_mac: EthAddr, our_ip: Ipv4Addr, target_ip: Ipv4Addr) -> WirePacket {
     let arp_pkt = ArpPacket {
         sender_hw: our_mac,
         sender_ip: our_ip,
@@ -643,7 +656,7 @@ pub fn build_arp_request(our_mac: EthAddr, our_ip: Ipv4Addr, target_ip: Ipv4Addr
         op: ArpOp::Request,
     };
 
-    let arp_payload = serialize_arp(&arp_pkt);
+    let arp_payload = serialize_arp_bytes(&arp_pkt);
     // Broadcast the request
     build_ethernet_frame(EthAddr::BROADCAST, our_mac, ETHERTYPE_ARP, &arp_payload)
 }
@@ -663,7 +676,7 @@ pub fn build_arp_request(our_mac: EthAddr, our_ip: Ipv4Addr, target_ip: Ipv4Addr
 /// # Returns
 ///
 /// Complete Ethernet frame containing gratuitous ARP (broadcast).
-pub fn build_gratuitous_arp(our_mac: EthAddr, our_ip: Ipv4Addr) -> Vec<u8> {
+pub fn build_gratuitous_arp(our_mac: EthAddr, our_ip: Ipv4Addr) -> WirePacket {
     let arp_pkt = ArpPacket {
         sender_hw: our_mac,
         sender_ip: our_ip,
@@ -672,7 +685,7 @@ pub fn build_gratuitous_arp(our_mac: EthAddr, our_ip: Ipv4Addr) -> Vec<u8> {
         op: ArpOp::Request,
     };
 
-    let arp_payload = serialize_arp(&arp_pkt);
+    let arp_payload = serialize_arp_bytes(&arp_pkt);
     build_ethernet_frame(EthAddr::BROADCAST, our_mac, ETHERTYPE_ARP, &arp_payload)
 }
 
@@ -698,7 +711,7 @@ pub enum ArpResult {
     /// ARP was handled, no response needed
     Handled,
     /// ARP requires a reply to be sent
-    Reply(Vec<u8>),
+    Reply(WirePacket),
     /// ARP was dropped with reason
     Dropped(ArpError),
 }
@@ -872,12 +885,12 @@ pub fn process_arp(
 
             // Build and return reply
             let reply = build_arp_reply(our_mac, our_ip, pkt.sender_hw, pkt.sender_ip);
-            // R165-19 FIX: build_arp_reply returns an empty Vec on OOM (sentinel).
-            // Drop silently rather than emitting a runt frame; the peer will retry.
+            // R165-19 FIX: build_arp_reply returns an empty admitted packet when
+            // allocation/admission fails. Drop rather than emit a runt frame;
+            // the peer will retry.
             if reply.is_empty() {
                 return ArpResult::Handled;
             }
-            stats.inc_tx_replies();
             ArpResult::Reply(reply)
         }
         ArpOp::Reply => {
@@ -895,7 +908,7 @@ pub fn process_arp(
 mod tests {
     use super::*;
 
-    fn make_test_arp_request() -> Vec<u8> {
+    fn make_test_arp_request() -> WirePacket {
         let pkt = ArpPacket {
             sender_hw: EthAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),
             sender_ip: Ipv4Addr::new(192, 168, 1, 100),

@@ -16,15 +16,15 @@
 //! - RFC 5722: Handling of Overlapping IPv4 Fragments
 //! - RFC 8900: IP Fragmentation Considered Fragile
 
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once};
 
-// R169-11: per-fragment map is allocation-fallible (FallibleOrderedMap, relocated
-// to the `mm` crate) so a crafted fragment stream cannot OOM-abort the kernel.
-use mm::fallible_map::FallibleOrderedMap;
+use mm::HeapClass;
 
+use crate::admitted::{
+    AdmittedMap, AdmittedVec, CapacityPlan, PreparedAdmittedMapCapacity,
+    RetiredAdmittedMapCapacity, WirePacket,
+};
 use crate::ipv4::Ipv4Header;
 
 // ============================================================================
@@ -243,7 +243,7 @@ pub enum FragmentDropReason {
 /// network namespace.  Without this, overlapping private IP address spaces in
 /// different namespaces can cause cross-namespace fragment injection or DoS via
 /// global queue exhaustion.
-/// Ord is derived to allow direct use as BTreeMap key (avoiding lossy u64 packing).
+/// Ord is derived for the admitted ordered-map key (avoiding lossy u64 packing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FragmentKey {
     /// R140-4 FIX: Network namespace ID for cross-namespace isolation.
@@ -327,8 +327,6 @@ impl RateLimiter {
 
 /// A single reassembly queue for one IP datagram
 struct FragmentQueue {
-    /// Queue key
-    key: FragmentKey,
     /// Creation timestamp (ms)
     created_ms: u64,
     /// Expiration timestamp (ms)
@@ -340,11 +338,12 @@ struct FragmentQueue {
     /// Total bytes received
     received_bytes: usize,
     /// Hole list (gaps to fill)
-    holes: Vec<FragmentHole>,
-    /// Fragment data keyed by offset. R169-11: allocation-fallible map (the only
-    /// no_std fallible ordered map) so an attacker's fragment stream cannot
-    /// OOM-abort the kernel on a per-fragment insert.
-    frags: FallibleOrderedMap<u16, Vec<u8>>,
+    /// RF180-41 REVIEW FIX: retained hole metadata owns aggregate heap
+    /// admission for its complete lifetime.
+    holes: AdmittedVec<FragmentHole>,
+    /// RF180-41 REVIEW FIX: both ordered-map backing and each retained payload
+    /// are aggregate-admitted before publication.
+    frags: AdmittedMap<u16, WirePacket>,
     /// First fragment (offset 0) received
     have_first: bool,
     /// Last fragment (MF=0) received
@@ -353,6 +352,10 @@ struct FragmentQueue {
     l4_header_ok: bool,
     /// Rate limiter for this source
     rate_limiter: RateLimiter,
+    #[cfg(test)]
+    fail_next_hole_growth: bool,
+    #[cfg(test)]
+    fail_next_frag_map_growth: bool,
 }
 
 impl FragmentQueue {
@@ -360,29 +363,34 @@ impl FragmentQueue {
     /// via `try_reserve_exact` so an OOM here returns `Err(QueueByteLimit)` instead
     /// of aborting the kernel. The caller propagates the error WITHOUT charging any
     /// counter (the queue was never inserted), so accounting stays balanced.
-    fn new(key: FragmentKey, now_ms: u64) -> Result<Self, FragmentDropReason> {
-        let mut holes: Vec<FragmentHole> = Vec::new();
+    fn new(_key: FragmentKey, now_ms: u64) -> Result<Self, FragmentDropReason> {
+        let mut holes = AdmittedVec::new(HeapClass::SocketObject);
         holes
-            .try_reserve_exact(1)
+            .ensure_capacity_for(1)
             .map_err(|_| FragmentDropReason::QueueByteLimit)?;
         // Initial hole: entire possible packet range (capacity reserved above).
-        holes.push(FragmentHole {
-            start: 0,
-            end: u16::MAX,
-        });
+        holes
+            .push_reserved(FragmentHole {
+                start: 0,
+                end: u16::MAX,
+            })
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
         Ok(Self {
-            key,
             created_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(FRAG_TIMEOUT_MS),
             total_len: None,
             received_frags: 0,
             received_bytes: 0,
             holes,
-            frags: FallibleOrderedMap::new(),
+            frags: AdmittedMap::new(HeapClass::SocketObject),
             have_first: false,
             have_last: false,
             l4_header_ok: false,
             rate_limiter: RateLimiter::new(now_ms),
+            #[cfg(test)]
+            fail_next_hole_growth: false,
+            #[cfg(test)]
+            fail_next_frag_map_growth: false,
         })
     }
 
@@ -432,14 +440,12 @@ impl FragmentQueue {
             return Err(FragmentDropReason::TooLarge);
         }
 
-        // Handle first fragment (offset 0)
-        // Note: have_first is set immediately since we need it for L4 header check
+        // Validate the first-fragment visibility contract without publishing it
+        // yet. All reassembly fields remain unchanged until every allocation
+        // below succeeds.
         let is_first = offset == 0;
         if is_first {
-            self.have_first = true;
-            // Require minimum L4 header visibility
-            self.l4_header_ok = data.len() >= MIN_L4_HEADER_BYTES;
-            if !self.l4_header_ok {
+            if data.len() < MIN_L4_HEADER_BYTES {
                 return Err(FragmentDropReason::FirstTooSmall);
             }
         }
@@ -498,9 +504,16 @@ impl FragmentQueue {
         // that does NOT affect retry correctness: the offset-0 hole is still
         // present, so `is_complete()` cannot mis-fire and a retry of the same
         // fragment re-inserts normally.)
-        let mut new_holes: Vec<FragmentHole> = Vec::new();
+        // RF180-41 REVIEW FIX: the historical note above is now conservative:
+        // first-fragment visibility is also staged until commit. Only the
+        // independent rate-limit token changes on an allocation failure.
+        let mut new_holes = AdmittedVec::new(HeapClass::SocketObject);
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_hole_growth) {
+            new_holes.fail_next_growth_for_test();
+        }
         new_holes
-            .try_reserve(self.holes.len() + 1)
+            .ensure_capacity_for(self.holes.len() + 1)
             .map_err(|_| FragmentDropReason::QueueByteLimit)?;
         let mut covered = false;
 
@@ -515,10 +528,12 @@ impl FragmentQueue {
 
             // No intersection with this hole
             if frag_end <= hole.start || frag_start >= hole_end {
-                new_holes.push(FragmentHole {
-                    start: hole.start,
-                    end: hole_end,
-                });
+                new_holes
+                    .push_reserved(FragmentHole {
+                        start: hole.start,
+                        end: hole_end,
+                    })
+                    .map_err(|_| FragmentDropReason::QueueByteLimit)?;
                 continue;
             }
 
@@ -534,16 +549,20 @@ impl FragmentQueue {
             // yields <=1, so total pushes <= self.holes.len() + 1 — the reserved
             // capacity — and these pushes therefore never reallocate.
             if hole.start < frag_start {
-                new_holes.push(FragmentHole {
-                    start: hole.start,
-                    end: frag_start,
-                });
+                new_holes
+                    .push_reserved(FragmentHole {
+                        start: hole.start,
+                        end: frag_start,
+                    })
+                    .map_err(|_| FragmentDropReason::QueueByteLimit)?;
             }
             if frag_end < hole_end {
-                new_holes.push(FragmentHole {
-                    start: frag_end,
-                    end: hole_end,
-                });
+                new_holes
+                    .push_reserved(FragmentHole {
+                        start: frag_end,
+                        end: hole_end,
+                    })
+                    .map_err(|_| FragmentDropReason::QueueByteLimit)?;
             }
         }
 
@@ -559,17 +578,19 @@ impl FragmentQueue {
         // queue's hole list / stored fragments / byte+frag counts half-mutated
         // (the offset-0 hole + counters stay consistent, so a retry is correct). ===
 
-        // 1. Payload copy — fallible (attacker-sized up to the fragment MTU). The
-        //    capacity is reserved exactly, so `extend_from_slice` cannot reallocate.
-        let mut frag_data: Vec<u8> = Vec::new();
-        frag_data
-            .try_reserve_exact(data.len())
+        // 1. RF180-41 FIX: every retained fragment byte owns aggregate heap
+        //    admission until its backing is destroyed. Failure remains
+        //    transactional because no queue state has been committed yet.
+        let frag_data = WirePacket::try_copy_from_slice(data)
             .map_err(|_| FragmentDropReason::QueueByteLimit)?;
-        frag_data.extend_from_slice(data);
 
-        // 2. Fallible ordered-map insert (FallibleOrderedMap::try_insert reserves
-        //    its backing Vec before the shift; on Err the map is unchanged).
+        // 2. Aggregate-admitted ordered-map insert reserves replacement backing
+        //    before the shift; on Err the map is unchanged.
         //    Offset uniqueness was established by the overlap checks above.
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_frag_map_growth) {
+            self.frags.fail_next_growth_for_test();
+        }
         self.frags
             .try_insert(offset, frag_data)
             .map_err(|_| FragmentDropReason::QueueByteLimit)?;
@@ -583,7 +604,11 @@ impl FragmentQueue {
             self.have_last = true;
             self.total_len = Some(frag_end);
         }
-        new_holes.sort_by_key(|h| h.start);
+        if is_first {
+            self.have_first = true;
+            self.l4_header_ok = true;
+        }
+        new_holes.as_mut_slice().sort_by_key(|h| h.start);
         self.holes = new_holes;
         self.received_frags += 1;
         self.received_bytes += len as usize;
@@ -604,7 +629,7 @@ impl FragmentQueue {
     /// Reassemble the complete packet
     ///
     /// Returns None if not complete or on error.
-    fn reassemble(&self) -> Option<Vec<u8>> {
+    fn reassemble(&self) -> Option<WirePacket> {
         if !self.is_complete() {
             return None;
         }
@@ -614,15 +639,9 @@ impl FragmentQueue {
             return None;
         }
 
-        // R169-11: fallible output allocation — `total` is attacker-influenced (up
-        // to MAX_PACKET_SIZE). On OOM return `None` (folds into the existing
-        // `Option<Vec<u8>>` contract); the completion-boundary caller treats a
-        // `None` here as an OOM drop and still fully unwinds the queue's charges.
-        let mut buf: Vec<u8> = Vec::new();
-        if buf.try_reserve_exact(total).is_err() {
-            return None;
-        }
-        buf.resize(total, 0); // capacity reserved above → no reallocation
+        // RF180-41 FIX: the completion buffer is admitted before allocation and
+        // remains charged after the queue's fragment owners are released.
+        let mut buf = WirePacket::try_zeroed(total).ok()?;
 
         for (&off, frag) in self.frags.iter() {
             let start = off as usize;
@@ -648,22 +667,26 @@ impl FragmentQueue {
 
 /// Global fragment reassembly cache
 pub struct FragmentCache {
-    /// Active reassembly queues keyed by FragmentKey
-    queues: Mutex<BTreeMap<FragmentKey, FragmentQueue>>,
+    /// RF180-41 REVIEW FIX: active-queue backing is aggregate-admitted before
+    /// a new queue becomes reachable.
+    queues: Mutex<AdmittedMap<FragmentKey, FragmentQueueOwner>>,
     /// R141-2 FIX: Per-source queue counts, scoped by (net_ns_id, src_ip).
     /// Previously keyed by src_ip alone; one namespace's fragment traffic
     /// could exhaust the per-source budget for all namespaces sharing the
     /// same source IP (cross-namespace DoS).
-    per_src_counts: Mutex<BTreeMap<(u64, u32), usize>>,
+    per_src_counts: Mutex<AdmittedMap<(u64, u32), usize>>,
     /// R169-10: per-netns fragment budget counts (queues / frags / bytes). The
     /// INNERMOST reassembly lock — order: `queues` -> `per_src_counts` ->
     /// `per_ns_counts`. An entry exists only while a namespace holds >=1 live
     /// queue (or any buffered frag/byte) and is pruned when all three reach 0, so
-    /// the map stays bounded by the live-namespace count. Plain `BTreeMap` (NOT
-    /// `FallibleOrderedMap`): the value is a 24-byte `PerNsBudget` and its node
-    /// alloc is the same bounded AD-02 residual class as `per_src.entry`, gated by
-    /// the admission caps checked immediately above it.
-    per_ns_counts: Mutex<BTreeMap<u64, PerNsBudget>>,
+    /// the map stays bounded by the live-namespace count. RF180-41 removes the
+    /// old bounded-but-infallible BTreeMap-node residual: backing growth is now
+    /// admitted and fallible like the queue and per-source indexes.
+    per_ns_counts: Mutex<AdmittedMap<u64, PerNsBudget>>,
+    /// One fragmented-datagram transaction at a time. This atomic ownership
+    /// token permits detached allocation and queue mutation without holding a
+    /// cache spin lock; it is never held as an allocator-visible lock.
+    transaction_active: AtomicBool,
     /// Statistics
     stats: FragmentStats,
 }
@@ -686,35 +709,172 @@ struct PerNsBudget {
 // saturating-sub then prune. PRUNE ONLY when ALL THREE fields are 0 (a live queue
 // implies `queues >= 1`, so an entry is never dropped while a queue lives — which
 // keeps `entry()`/`get()` for an existing queue's frag/byte charge consistent).
-fn per_ns_charge_queue(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
-    m.entry(ns).or_default().queues += 1;
+fn per_ns_charge_queue(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64) {
+    if let Some(entry) = m.get_mut(&ns) {
+        entry.queues = entry
+            .queues
+            .checked_add(1)
+            .expect("RF180-41 fragment namespace queue counter overflow");
+        return;
+    }
+    assert!(
+        m.insert_unique_reserved(
+            ns,
+            PerNsBudget {
+                queues: 1,
+                ..PerNsBudget::default()
+            },
+        )
+        .is_ok(),
+        "RF180-41 fragment namespace row publication lacked reserved capacity"
+    );
 }
-fn per_ns_charge_frag(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
-    m.entry(ns).or_default().frags += 1;
+
+struct FragmentTransactionPermit<'a> {
+    active: &'a AtomicBool,
 }
-fn per_ns_charge_bytes(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, b: u64) {
-    m.entry(ns).or_default().bytes += b;
+
+impl Drop for FragmentTransactionPermit<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
-fn per_ns_prune_if_zero(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+
+struct FragmentIndexCapacity {
+    queues: Option<PreparedAdmittedMapCapacity<FragmentKey, FragmentQueueOwner>>,
+    per_src: Option<PreparedAdmittedMapCapacity<(u64, u32), usize>>,
+    per_ns: Option<PreparedAdmittedMapCapacity<u64, PerNsBudget>>,
+}
+
+impl FragmentIndexCapacity {
+    fn prepare(
+        queue_plan: Option<CapacityPlan>,
+        per_src_plan: Option<CapacityPlan>,
+        per_ns_plan: Option<CapacityPlan>,
+    ) -> Result<Self, FragmentDropReason> {
+        let queues = queue_plan
+            .map(PreparedAdmittedMapCapacity::try_from_plan)
+            .transpose()
+            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?;
+        let per_src = per_src_plan
+            .map(PreparedAdmittedMapCapacity::try_from_plan)
+            .transpose()
+            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?;
+        let per_ns = per_ns_plan
+            .map(PreparedAdmittedMapCapacity::try_from_plan)
+            .transpose()
+            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?;
+        Ok(Self {
+            queues,
+            per_src,
+            per_ns,
+        })
+    }
+}
+
+struct RetiredFragmentIndexCapacity {
+    queues: Option<RetiredAdmittedMapCapacity<FragmentKey, FragmentQueueOwner>>,
+    per_src: Option<RetiredAdmittedMapCapacity<(u64, u32), usize>>,
+    per_ns: Option<RetiredAdmittedMapCapacity<u64, PerNsBudget>>,
+}
+
+impl RetiredFragmentIndexCapacity {
+    const fn empty() -> Self {
+        Self {
+            queues: None,
+            per_src: None,
+            per_ns: None,
+        }
+    }
+}
+
+/// Compact pointer-stable cache value. Moving an ordered-map entry shifts only
+/// this small allocation owner; the large queue and all nested containers stay
+/// at a fixed address until the detached owner is retired outside cache locks.
+struct FragmentQueueOwner {
+    queue: AdmittedVec<FragmentQueue>,
+}
+
+impl FragmentQueueOwner {
+    fn try_new(queue: FragmentQueue) -> Result<Self, FragmentDropReason> {
+        let mut owner = AdmittedVec::new(HeapClass::SocketObject);
+        owner
+            .ensure_capacity_for(1)
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
+        owner
+            .push_reserved(queue)
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
+        Ok(Self { queue: owner })
+    }
+
+    #[inline]
+    fn queue(&self) -> &FragmentQueue {
+        self.queue
+            .as_slice()
+            .first()
+            .expect("RF180-41 fragment owner lost its queue")
+    }
+
+    #[inline]
+    fn queue_mut(&mut self) -> &mut FragmentQueue {
+        self.queue
+            .as_mut_slice()
+            .first_mut()
+            .expect("RF180-41 fragment owner lost its queue")
+    }
+}
+
+impl core::ops::Deref for FragmentQueueOwner {
+    type Target = FragmentQueue;
+
+    fn deref(&self) -> &Self::Target {
+        self.queue()
+    }
+}
+
+impl core::ops::DerefMut for FragmentQueueOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.queue_mut()
+    }
+}
+fn per_ns_charge_frag(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64) {
+    let entry = m
+        .get_mut(&ns)
+        .expect("RF180-41 live fragment queue lost namespace row");
+    entry.frags = entry
+        .frags
+        .checked_add(1)
+        .expect("RF180-41 fragment namespace fragment counter overflow");
+}
+fn per_ns_charge_bytes(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64, b: u64) {
+    let entry = m
+        .get_mut(&ns)
+        .expect("RF180-41 live fragment queue lost namespace row");
+    entry.bytes = entry
+        .bytes
+        .checked_add(b)
+        .expect("RF180-41 fragment namespace byte counter overflow");
+}
+fn per_ns_prune_if_zero(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64) {
     if let Some(e) = m.get(&ns) {
         if e.queues == 0 && e.frags == 0 && e.bytes == 0 {
             m.remove(&ns);
         }
     }
 }
-fn per_ns_release_queue(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+fn per_ns_release_queue(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64) {
     if let Some(e) = m.get_mut(&ns) {
         e.queues = e.queues.saturating_sub(1);
     }
     per_ns_prune_if_zero(m, ns);
 }
-fn per_ns_release_frags(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, n: u32) {
+fn per_ns_release_frags(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64, n: u32) {
     if let Some(e) = m.get_mut(&ns) {
         e.frags = e.frags.saturating_sub(n);
     }
     per_ns_prune_if_zero(m, ns);
 }
-fn per_ns_release_bytes(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, b: u64) {
+fn per_ns_release_bytes(m: &mut AdmittedMap<u64, PerNsBudget>, ns: u64, b: u64) {
     if let Some(e) = m.get_mut(&ns) {
         e.bytes = e.bytes.saturating_sub(b);
     }
@@ -725,655 +885,660 @@ impl FragmentCache {
     /// Create a new fragment cache
     pub const fn new() -> Self {
         Self {
-            queues: Mutex::new(BTreeMap::new()),
-            per_src_counts: Mutex::new(BTreeMap::new()),
-            per_ns_counts: Mutex::new(BTreeMap::new()),
+            queues: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            per_src_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            per_ns_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            transaction_active: AtomicBool::new(false),
             stats: FragmentStats::new(),
         }
     }
 
-    /// Process an incoming fragment
-    ///
-    /// Returns:
-    /// - Ok(Some(payload)) if reassembly is complete
-    /// - Ok(None) if more fragments needed
-    /// - Err(reason) if fragment was dropped
+    fn try_transaction(&self) -> Option<FragmentTransactionPermit<'_>> {
+        self.transaction_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| FragmentTransactionPermit {
+                active: &self.transaction_active,
+            })
+    }
+
+    /// Process one fragment as a detached cache transaction.
     pub fn process_fragment(
         &self,
         net_ns_id: u64,
         header: &Ipv4Header,
         payload: &[u8],
         now_ms: u64,
-    ) -> Result<Option<Vec<u8>>, FragmentDropReason> {
+    ) -> Result<Option<WirePacket>, FragmentDropReason> {
         self.stats
             .fragments_received
             .fetch_add(1, Ordering::Relaxed);
+        let _transaction = match self.try_transaction() {
+            Some(permit) => permit,
+            None => {
+                self.stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
+                return Err(FragmentDropReason::RateLimited);
+            }
+        };
 
-        // R140-4 FIX: Include net_ns_id in key to isolate reassembly per namespace.
         let key = FragmentKey::from_header(net_ns_id, header);
-        let src_ip = key.src_ip();
-        // R141-2 FIX: Namespace-scoped per-source key replaces bare src_ip.
-        let per_src_key = (key.net_ns_id, src_ip);
-
-        // Fragment offset is in 8-byte units
         let offset = header.fragment_offset() * 8;
         let more_fragments = header.more_fragments();
 
-        // R163-27 / R169-10 FIX: Document lock ordering — `queues` before
-        // `per_src_counts` before `per_ns_counts` (innermost leaf). Always acquired
-        // in this order; never reverse. All three held for the whole critical
-        // section, acquired once up front, never re-locked.
-        let mut queues = self.queues.lock();
-        let mut per_src = self.per_src_counts.lock();
-        let mut per_ns = self.per_ns_counts.lock();
-
-        // Check for expired queue on arrival and drop it
-        // (Fixed queue lifetime - no extension on fragment arrival)
-        if let Some(queue) = queues.get(&key) {
-            if queue.is_expired(now_ms) {
-                let frag_count = queue.received_frags as u32;
-                let byte_count = queue.received_bytes as u64;
-                queues.remove(&key);
-                if let Some(c) = per_src.get_mut(&per_src_key) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        per_src.remove(&per_src_key);
+        // Detach expired nested owners and destroy them only after all cache
+        // locks have gone.
+        let expired = {
+            let mut queues = self.queues.lock();
+            let mut per_src = self.per_src_counts.lock();
+            let mut per_ns = self.per_ns_counts.lock();
+            if !queues
+                .get(&key)
+                .is_some_and(|owner| owner.is_expired(now_ms))
+            {
+                None
+            } else {
+                let owner = queues
+                    .remove(&key)
+                    .expect("RF180-41 expired fragment owner vanished");
+                let frags = owner.received_frags as u32;
+                let bytes = owner.received_bytes as u64;
+                let source = (key.net_ns_id, key.src_ip());
+                if let Some(count) = per_src.get_mut(&source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&source);
                     }
                 }
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                per_ns_release_frags(&mut per_ns, key.net_ns_id, frags);
+                per_ns_release_bytes(&mut per_ns, key.net_ns_id, bytes);
                 self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                if frag_count > 0 {
-                    self.stats
-                        .buffered_fragments
-                        .fetch_sub(frag_count, Ordering::Relaxed);
-                    // R62-2 FIX: Decrement buffered bytes on arrival-time timeout
-                    self.stats
-                        .buffered_bytes
-                        .fetch_sub(byte_count, Ordering::Relaxed);
-                }
-                // R169-10 R0: release the expired queue's per-ns charges (this ns).
-                per_ns_release_queue(&mut per_ns, key.net_ns_id);
-                if frag_count > 0 {
-                    per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
-                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
-                }
-                return Err(FragmentDropReason::Timeout);
+                self.stats
+                    .buffered_fragments
+                    .fetch_sub(frags, Ordering::Relaxed);
+                self.stats
+                    .buffered_bytes
+                    .fetch_sub(bytes, Ordering::Relaxed);
+                Some(owner)
             }
+        };
+        if let Some(owner) = expired {
+            drop(owner);
+            return Err(FragmentDropReason::Timeout);
         }
 
-        // Check global limits
-        let current_queues = queues.len();
-        let current_frags = self.stats.buffered_fragments.load(Ordering::Relaxed) as usize;
-        // R62-2 FIX: Check global byte limit
-        let current_bytes = self.stats.buffered_bytes.load(Ordering::Relaxed) as usize;
-
-        // Track whether we just created a new queue (for cleanup on error)
-        let mut created_new_queue = false;
-
-        // Get or create queue
-        let queue = if let Some(q) = queues.get_mut(&key) {
-            q
+        if self.queues.lock().contains_key(&key) {
+            self.process_existing_fragment(key, offset, more_fragments, payload, now_ms)
         } else {
-            // R169-10: per-ns admission gate — the SECURITY CRUX. Checked FIRST in
-            // the create branch (BEFORE the global-LRU eviction below), so a
-            // flooding tenant hits its OWN per-ns ceiling and returns Err before LRU
-            // victim-selection can run — it can never evict another namespace's
-            // in-flight queue. ns 0 (root) is cap-EXEMPT here but is still
-            // charged/released below so `sum(per_ns) == global` holds. The per-ns
-            // FRAG and BYTE ceilings are ALSO enforced at the reserve sites (C2/C3)
-            // for existing queues; this create-branch check covers the queue count
-            // (mutated only on create/teardown) and gives an early frag/byte reject.
-            //
-            // R177-3 FIX: Per-ns LRU eviction added to align with global behavior.
-            // Previously, the per-ns path rejected immediately on hitting the queue cap,
-            // while the global path performed LRU eviction. This asymmetry meant a
-            // namespace at its local cap would hard-fail (fragments dropped) rather than
-            // evicting its own oldest incomplete queue. Now both paths evict the oldest
-            // queue from the SAME namespace when the respective limit is reached.
-            if key.net_ns_id != 0 {
-                let nb = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
-                if nb.queues >= MAX_QUEUES_PER_NS {
-                    // R177-3 FIX: Evict oldest queue from this namespace before rejecting.
-                    let oldest_key = queues
-                        .iter()
-                        .filter(|(k, _)| k.net_ns_id == key.net_ns_id)
-                        .min_by_key(|(_, q)| q.created_ms)
-                        .map(|(&k, _)| k);
+            self.process_new_fragment(key, offset, more_fragments, payload, now_ms)
+        }
+    }
 
-                    if let Some(evict_key) = oldest_key {
-                        let evict_per_src_key = (evict_key.net_ns_id, evict_key.src_ip());
-                        if let Some(evicted) = queues.remove(&evict_key) {
-                            let frag_count = evicted.received_frags as u32;
-                            let byte_count = evicted.received_bytes as u64;
-                            if let Some(c) = per_src.get_mut(&evict_per_src_key) {
-                                *c = c.saturating_sub(1);
-                                if *c == 0 {
-                                    per_src.remove(&evict_per_src_key);
-                                }
-                            }
-                            self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                            if frag_count > 0 {
-                                self.stats
-                                    .buffered_fragments
-                                    .fetch_sub(frag_count, Ordering::Relaxed);
-                                self.stats
-                                    .buffered_bytes
-                                    .fetch_sub(byte_count, Ordering::Relaxed);
-                            }
-                            per_ns_release_queue(&mut per_ns, evict_key.net_ns_id);
-                            if frag_count > 0 {
-                                per_ns_release_frags(&mut per_ns, evict_key.net_ns_id, frag_count);
-                                per_ns_release_bytes(&mut per_ns, evict_key.net_ns_id, byte_count);
-                            }
-                            self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        // No queue to evict (shouldn't happen if nb.queues >= cap), reject.
-                        self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
-                        return Err(FragmentDropReason::PerNsQueueLimit);
-                    }
-                }
-                // R177-3-CODEX: Recompute budget after eviction (was using stale pre-eviction snapshot)
-                let nb = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
-                if (nb.frags as usize) >= MAX_FRAGS_PER_NS {
-                    self.stats
-                        .global_limit_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(FragmentDropReason::PerNsFragLimit);
-                }
-                if nb.bytes.saturating_add(payload.len() as u64) > MAX_BYTES_PER_NS {
-                    self.stats
-                        .global_limit_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(FragmentDropReason::PerNsByteLimit);
-                }
+    fn record_drop_reason(&self, reason: FragmentDropReason) {
+        match reason {
+            FragmentDropReason::RateLimited => {
+                self.stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
             }
-
-            // R101-12 FIX: LRU eviction under memory pressure.
-            //
-            // When the global queue limit is reached, instead of simply rejecting
-            // the new fragment (which drops legitimate traffic), evict the oldest
-            // reassembly queue to make room. This ensures legitimate fragmented
-            // packets have a chance even when an attacker is flooding with crafted
-            // fragments that are never completed.
-            // R177-3-CODEX: Recompute queue count after per-ns eviction (was using stale snapshot)
-            let current_queues = queues.len();
-            if current_queues >= GLOBAL_MAX_QUEUES {
-                // Find and evict the oldest queue (by creation time).
-                // R169-10: SAME-NS filter — only the arriving fragment's OWN
-                // namespace is an eviction candidate, so a tenant can cannibalize
-                // only its own oldest queue, never another ns's. (With the per-ns
-                // queue cap above, a single flooder is already rejected at 1024
-                // before reaching here; this filter is cheap defense-in-depth.)
-                let oldest_key = queues
-                    .iter()
-                    .filter(|(k, _)| k.net_ns_id == key.net_ns_id)
-                    .min_by_key(|(_, q)| q.created_ms)
-                    .map(|(&k, _)| k);
-
-                if let Some(evict_key) = oldest_key {
-                    // R141-2 FIX: Use namespace-scoped key for eviction path.
-                    let evict_per_src_key = (evict_key.net_ns_id, evict_key.src_ip());
-                    if let Some(evicted) = queues.remove(&evict_key) {
-                        let frag_count = evicted.received_frags as u32;
-                        let byte_count = evicted.received_bytes as u64;
-                        if let Some(c) = per_src.get_mut(&evict_per_src_key) {
-                            *c = c.saturating_sub(1);
-                            if *c == 0 {
-                                per_src.remove(&evict_per_src_key);
-                            }
-                        }
-                        self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                        if frag_count > 0 {
-                            self.stats
-                                .buffered_fragments
-                                .fetch_sub(frag_count, Ordering::Relaxed);
-                            self.stats
-                                .buffered_bytes
-                                .fetch_sub(byte_count, Ordering::Relaxed);
-                        }
-                        // R169-10 R8: release the VICTIM's per-ns charges. MUST key
-                        // off evict_key.net_ns_id (the victim), NOT key.net_ns_id —
-                        // the same-ns filter makes them equal today, but keying off
-                        // the victim is correct/robust if any path ever evicts
-                        // cross-ns.
-                        per_ns_release_queue(&mut per_ns, evict_key.net_ns_id);
-                        if frag_count > 0 {
-                            per_ns_release_frags(&mut per_ns, evict_key.net_ns_id, frag_count);
-                            per_ns_release_bytes(&mut per_ns, evict_key.net_ns_id, byte_count);
-                        }
-                        self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                } else {
-                    self.stats
-                        .global_limit_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(FragmentDropReason::GlobalQueueLimit);
-                }
+            FragmentDropReason::FirstTooSmall => {
+                self.stats
+                    .first_too_small_drops
+                    .fetch_add(1, Ordering::Relaxed);
             }
-            // R177-3-CODEX: Recompute frag/byte budgets after all queue evictions (queue count already refreshed above)
-            let current_frags = self.stats.buffered_fragments.load(Ordering::Relaxed) as usize;
-            let current_bytes = self.stats.buffered_bytes.load(Ordering::Relaxed) as usize;
-
-            if current_frags >= GLOBAL_MAX_FRAGS {
+            FragmentDropReason::TooLarge => {
+                self.stats.too_large_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            FragmentDropReason::QueueFragLimit
+            | FragmentDropReason::QueueByteLimit
+            | FragmentDropReason::PerSourceLimit
+            | FragmentDropReason::PerNsQueueLimit => {
+                self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            FragmentDropReason::GlobalQueueLimit
+            | FragmentDropReason::GlobalFragLimit
+            | FragmentDropReason::GlobalByteLimit
+            | FragmentDropReason::PerNsFragLimit
+            | FragmentDropReason::PerNsByteLimit => {
                 self.stats
                     .global_limit_drops
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            FragmentDropReason::Overlap | FragmentDropReason::Duplicate => {
+                self.stats.overlap_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            FragmentDropReason::Timeout | FragmentDropReason::ZeroLength => {}
+        }
+    }
+
+    fn process_existing_fragment(
+        &self,
+        key: FragmentKey,
+        offset: u16,
+        more_fragments: bool,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<WirePacket>, FragmentDropReason> {
+        let source = (key.net_ns_id, key.src_ip());
+        let detached = {
+            let mut queues = self.queues.lock();
+            let mut per_ns = self.per_ns_counts.lock();
+            if !queues.contains_key(&key) {
+                drop(per_ns);
+                drop(queues);
+                return self.process_new_fragment(key, offset, more_fragments, payload, now_ms);
+            }
+            let owner = queues
+                .get(&key)
+                .expect("RF180-41 existing fragment owner vanished");
+            if owner.received_frags >= MAX_FRAGS_PER_QUEUE {
+                self.record_drop_reason(FragmentDropReason::QueueFragLimit);
+                return Err(FragmentDropReason::QueueFragLimit);
+            }
+            if owner.received_bytes.saturating_add(payload.len()) > MAX_BYTES_PER_QUEUE {
+                self.record_drop_reason(FragmentDropReason::QueueByteLimit);
+                return Err(FragmentDropReason::QueueByteLimit);
+            }
+            let ns = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
+            if key.net_ns_id != 0 && ns.frags as usize >= MAX_FRAGS_PER_NS {
+                self.record_drop_reason(FragmentDropReason::PerNsFragLimit);
+                return Err(FragmentDropReason::PerNsFragLimit);
+            }
+            if key.net_ns_id != 0
+                && ns.bytes.saturating_add(payload.len() as u64) > MAX_BYTES_PER_NS
+            {
+                self.record_drop_reason(FragmentDropReason::PerNsByteLimit);
+                return Err(FragmentDropReason::PerNsByteLimit);
+            }
+            if !self.stats.try_reserve_fragment(GLOBAL_MAX_FRAGS) {
+                self.record_drop_reason(FragmentDropReason::GlobalFragLimit);
                 return Err(FragmentDropReason::GlobalFragLimit);
             }
-            // R62-2 FIX: Reject if adding this fragment would exceed global byte limit
-            if current_bytes.saturating_add(payload.len()) > GLOBAL_MAX_FRAG_BYTES {
-                self.stats
-                    .global_limit_drops
-                    .fetch_add(1, Ordering::Relaxed);
+            per_ns_charge_frag(&mut per_ns, key.net_ns_id);
+            if !self
+                .stats
+                .try_reserve_bytes(payload.len(), GLOBAL_MAX_FRAG_BYTES)
+            {
+                self.stats.release_fragment();
+                per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
+                self.record_drop_reason(FragmentDropReason::GlobalByteLimit);
                 return Err(FragmentDropReason::GlobalByteLimit);
             }
-
-            // Check per-source limit
-            let src_count = per_src.get(&per_src_key).copied().unwrap_or(0);
-            if src_count >= MAX_QUEUES_PER_SRC {
-                self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
-                return Err(FragmentDropReason::PerSourceLimit);
-            }
-
-            // Create new queue. R169-11: the constructor is now fallible — on OOM
-            // building the initial hole list, propagate the error BEFORE charging
-            // any counter (the queue is never inserted, per_src/active_queues never
-            // bumped), so accounting stays balanced with nothing to roll back.
-            let new_queue = match FragmentQueue::new(key, now_ms) {
-                Ok(q) => q,
-                Err(reason) => {
-                    self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
-                    return Err(reason);
-                }
-            };
-            // Carried-forward residual (AD-02): `queues.insert` and `per_src.entry`
-            // / `per_ns.entry` are infallible `BTreeMap` node allocations (no no_std
-            // fallible BTreeMap). These are SMALL fixed-size nodes, bounded by the
-            // per-ns + per-src (MAX_QUEUES_PER_SRC) + global (GLOBAL_MAX_QUEUES)
-            // admission caps checked just above. R169-10/D-2 DELIBERATELY does NOT
-            // migrate `queues` to a `Vec`-backed FallibleOrderedMap: each `queues`
-            // value is a LARGE FragmentQueue (holes Vec + frags map + counters), so
-            // a Vec-backed map's O(n) element-shift on every insert/remove would
-            // convert this DoS-pressured per-packet fast path from O(log n) to O(n)
-            // — the cure is worse than the bounded-small-node disease. If fallible
-            // queue insertion is ever needed, use a NODE-allocating fallible map to
-            // keep O(log n) + pointer stability.
-            queues.insert(key, new_queue);
-            *per_src.entry(per_src_key).or_insert(0) += 1;
-            self.stats.active_queues.fetch_add(1, Ordering::Relaxed);
-            // R169-10 C1: charge this ns's per-ns queue count (paired with the
-            // active_queues++ above). Unconditional for all ns (admission already
-            // guaranteed headroom for ns!=0; ns 0 is charged though cap-exempt).
-            per_ns_charge_queue(&mut per_ns, key.net_ns_id);
-            created_new_queue = true;
-
-            queues.get_mut(&key).unwrap()
+            per_ns_charge_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
+            queues
+                .remove(&key)
+                .expect("RF180-41 selected fragment owner vanished")
         };
 
-        // R66-11 FIX: Use atomic check-and-increment for global limits
-        // This replaces the racy check-then-increment pattern with CAS operations.
-        // We reserve resources BEFORE insertion, then release on failure.
-
-        // For new queues, limits were already checked above (non-atomically is OK there
-        // because we hold the queue lock and haven't committed anything yet).
-        // For existing queues, we must atomically reserve.
-
-        // R169-10 C2: enforce the per-ns FRAG ceiling (ns!=0, for ALL queues
-        // new+existing — an existing-queue fragment pump must also be bounded)
-        // BEFORE the global atomic reserve, so a flooder hits its own ceiling first.
-        // On exceed, roll back a just-created queue incl. its C1 per-ns charge (R1).
-        if key.net_ns_id != 0
-            && per_ns
-                .get(&key.net_ns_id)
-                .map(|b| b.frags as usize)
-                .unwrap_or(0)
-                >= MAX_FRAGS_PER_NS
-        {
-            if created_new_queue {
-                queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&per_src_key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        per_src.remove(&per_src_key);
-                    }
-                }
-                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                per_ns_release_queue(&mut per_ns, key.net_ns_id);
-            }
-            self.stats
-                .global_limit_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(FragmentDropReason::PerNsFragLimit);
-        }
-        // R66-11 FIX: Atomically reserve fragment slot
-        if !self.stats.try_reserve_fragment(GLOBAL_MAX_FRAGS) {
-            // Codex review fix: Roll back queue creation on reservation failure (R1).
-            if created_new_queue {
-                queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&per_src_key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        per_src.remove(&per_src_key);
-                    }
-                }
-                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                per_ns_release_queue(&mut per_ns, key.net_ns_id);
-            }
-            self.stats
-                .global_limit_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(FragmentDropReason::GlobalFragLimit);
-        }
-        // R169-10 C2 commit: charge the per-ns frag ONLY after the global reserve
-        // succeeded — a global-reserve failure then has nothing per-ns to leak.
-        per_ns_charge_frag(&mut per_ns, key.net_ns_id);
-
-        // R169-10 C3: enforce the per-ns BYTE ceiling (ns!=0) BEFORE the global byte
-        // reserve. On exceed, UNDO C2 (release the global frag slot + the per-ns frag
-        // charge) and roll back a just-created queue incl. its C1 per-ns charge (R2).
-        if key.net_ns_id != 0
-            && per_ns
-                .get(&key.net_ns_id)
-                .map(|b| b.bytes)
-                .unwrap_or(0)
-                .saturating_add(payload.len() as u64)
-                > MAX_BYTES_PER_NS
-        {
-            self.stats.release_fragment();
-            per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
-            if created_new_queue {
-                queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&per_src_key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        per_src.remove(&per_src_key);
-                    }
-                }
-                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                per_ns_release_queue(&mut per_ns, key.net_ns_id);
-            }
-            self.stats
-                .global_limit_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(FragmentDropReason::PerNsByteLimit);
-        }
-        // R66-11 FIX: Atomically reserve bytes
-        if !self
-            .stats
-            .try_reserve_bytes(payload.len(), GLOBAL_MAX_FRAG_BYTES)
-        {
-            // Release the global fragment slot we reserved AND undo the C2 per-ns
-            // frag charge (R2). Both are UNCONDITIONAL (C2 charged for all ns).
-            self.stats.release_fragment();
-            per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
-
-            // Codex review fix: Roll back queue creation on reservation failure.
-            if created_new_queue {
-                queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&per_src_key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        per_src.remove(&per_src_key);
-                    }
-                }
-                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                per_ns_release_queue(&mut per_ns, key.net_ns_id);
-            }
-
-            self.stats
-                .global_limit_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(FragmentDropReason::GlobalByteLimit);
-        }
-        // R169-10 C3 commit: charge the per-ns bytes ONLY after the global reserve
-        // succeeded.
-        per_ns_charge_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
-
-        // Insert fragment (resources are now reserved)
-        match queue.insert(offset, more_fragments, payload, now_ms) {
-            Ok(complete) => {
-                // Resources already accounted for via try_reserve above
-
-                if complete {
-                    // Reassembly complete - extract data before removing queue
-                    let result = queue.reassemble();
-                    let frag_count = queue.received_frags as u32;
-                    let byte_count = queue.received_bytes as u64;
-
-                    // Remove queue (queue reference is now invalid)
-                    queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&per_src_key) {
+        let mut owner = detached;
+        match owner.insert(offset, more_fragments, payload, now_ms) {
+            Ok(true) => {
+                let result = owner.reassemble();
+                let frags = owner.received_frags as u32;
+                let bytes = owner.received_bytes as u64;
+                {
+                    let mut per_src = self.per_src_counts.lock();
+                    let mut per_ns = self.per_ns_counts.lock();
+                    if let Some(count) = per_src.get_mut(&source) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            per_src.remove(&per_src_key);
+                            per_src.remove(&source);
                         }
                     }
+                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                    per_ns_release_frags(&mut per_ns, key.net_ns_id, frags);
+                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, bytes);
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                     self.stats
                         .buffered_fragments
-                        .fetch_sub(frag_count, Ordering::Relaxed);
-                    // R62-2 FIX: Decrement buffered bytes on completion
+                        .fetch_sub(frags, Ordering::Relaxed);
                     self.stats
                         .buffered_bytes
-                        .fetch_sub(byte_count, Ordering::Relaxed);
-                    // R169-10 R3: whole-queue per-ns release, UNCONDITIONAL (mirrors
-                    // the unguarded global completion sub above — runs whether
-                    // reassemble() returned Some or None/OOM). The per-call C2/C3
-                    // charges were folded into received_frags/received_bytes by the
-                    // successful inserts, so this whole-queue release balances them.
-                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
-                    per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
-                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
-                    // R169-11: the whole-queue uncharge above (queues.remove +
-                    // per_src-- + active_queues/buffered_fragments/buffered_bytes
-                    // decrements) is UNCONDITIONAL once `complete` — it runs whether
-                    // or not `reassemble()` succeeded, so an OOM in the reassembly
-                    // output never strands the queue's bytes/frags/active_queues (the
-                    // permanent-counter-climb DoS the QA flagged). Only the success
-                    // bookkeeping is gated on the allocation: a `None` here is an
-                    // OOM drop (reassemble() reserved its output fallibly), so count
-                    // it as a global-limit drop, NOT a reassembly.
-                    match result {
-                        Some(buf) => {
-                            self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
-                            Ok(Some(buf))
-                        }
-                        None => {
-                            self.stats
-                                .global_limit_drops
-                                .fetch_add(1, Ordering::Relaxed);
-                            Ok(None)
-                        }
+                        .fetch_sub(bytes, Ordering::Relaxed);
+                }
+                drop(owner);
+                match result {
+                    Some(packet) => {
+                        self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
+                        Ok(Some(packet))
                     }
-                } else {
-                    Ok(None)
+                    None => {
+                        self.stats
+                            .global_limit_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(None)
+                    }
                 }
             }
+            Ok(false) => {
+                let mut queues = self.queues.lock();
+                assert!(
+                    queues.insert_unique_reserved(key, owner).is_ok(),
+                    "RF180-41 detached fragment queue lost its slot"
+                );
+                Ok(None)
+            }
             Err(reason) => {
-                // R66-11 FIX: Release reserved resources since insert failed
-                // We reserved 1 fragment slot and payload.len() bytes before insert
                 self.stats.release_fragment();
                 self.stats.release_bytes(payload.len());
-                // R169-10 R4: undo THIS failed fragment's C2/C3 per-ns charges,
-                // UNCONDITIONAL (to reach this arm both global reserves committed, so
-                // both C2 and C3 committed their per-ns charges). DISJOINT from R5/R6
-                // below: the failed fragment was rejected by queue.insert and never
-                // folded into the queue's received_frags/received_bytes, so R4 (this
-                // frag) and R5/R6 (the queue's prior committed contents) release
-                // different magnitudes — do NOT collapse them.
-                per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
-                per_ns_release_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
-
-                // RFC 5722 compliance: on overlap OR duplicate, discard the ENTIRE reassembly queue
-                // Both indicate either an attack or a retransmission with different data
-                if reason == FragmentDropReason::Overlap || reason == FragmentDropReason::Duplicate
+                let discard = matches!(
+                    reason,
+                    FragmentDropReason::Overlap
+                        | FragmentDropReason::Duplicate
+                        | FragmentDropReason::FirstTooSmall
+                );
+                let mut retired_owner = None;
                 {
-                    let frag_count = queue.received_frags as u32;
-                    let byte_count = queue.received_bytes as u64;
-                    queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&per_src_key) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            per_src.remove(&per_src_key);
+                    let mut queues = self.queues.lock();
+                    let mut per_src = self.per_src_counts.lock();
+                    let mut per_ns = self.per_ns_counts.lock();
+                    per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
+                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
+                    if discard {
+                        let frags = owner.received_frags as u32;
+                        let bytes = owner.received_bytes as u64;
+                        if let Some(count) = per_src.get_mut(&source) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                per_src.remove(&source);
+                            }
                         }
-                    }
-                    self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                    if frag_count > 0 {
+                        per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                        per_ns_release_frags(&mut per_ns, key.net_ns_id, frags);
+                        per_ns_release_bytes(&mut per_ns, key.net_ns_id, bytes);
+                        self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                         self.stats
                             .buffered_fragments
-                            .fetch_sub(frag_count, Ordering::Relaxed);
-                        // R62-2 FIX: Decrement buffered bytes on queue removal
+                            .fetch_sub(frags, Ordering::Relaxed);
                         self.stats
                             .buffered_bytes
-                            .fetch_sub(byte_count, Ordering::Relaxed);
+                            .fetch_sub(bytes, Ordering::Relaxed);
+                        retired_owner = Some(owner);
+                    } else {
+                        assert!(
+                            queues.insert_unique_reserved(key, owner).is_ok(),
+                            "RF180-41 failed fragment lost its queue"
+                        );
                     }
-                    // R169-10 R5: release the discarded queue's PRIOR committed
-                    // contents (disjoint from R4's failed frag). queue unconditional;
-                    // frags/bytes gated fc>0 (mirror the global sub above).
-                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
-                    if frag_count > 0 {
-                        per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
-                        per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
-                    }
-                    self.stats.overlap_drops.fetch_add(1, Ordering::Relaxed);
-                    return Err(reason);
                 }
-
-                // FirstTooSmall on an existing queue means a malformed first fragment
-                // arrived after other fragments. This is suspicious - drop the queue
-                // to avoid pinning memory for 45s on a malformed packet.
-                if reason == FragmentDropReason::FirstTooSmall && !created_new_queue {
-                    let frag_count = queue.received_frags as u32;
-                    let byte_count = queue.received_bytes as u64;
-                    queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&per_src_key) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            per_src.remove(&per_src_key);
-                        }
-                    }
-                    self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                    if frag_count > 0 {
-                        self.stats
-                            .buffered_fragments
-                            .fetch_sub(frag_count, Ordering::Relaxed);
-                        // R62-2 FIX: Decrement buffered bytes on queue removal
-                        self.stats
-                            .buffered_bytes
-                            .fetch_sub(byte_count, Ordering::Relaxed);
-                    }
-                    // R169-10 R6: release the discarded queue's prior committed
-                    // contents (reached only when !created_new_queue, existing guard).
-                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
-                    if frag_count > 0 {
-                        per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
-                        per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
-                    }
-                    self.stats
-                        .first_too_small_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(reason);
-                }
-
-                // Clean up empty queues created for invalid first fragments
-                // (e.g., FirstTooSmall, ZeroLength)
-                if created_new_queue && queue.received_frags == 0 {
-                    queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&per_src_key) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            per_src.remove(&per_src_key);
-                        }
-                    }
-                    self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                    // R169-10 R7: queue-only per-ns release (received_frags == 0, so
-                    // no committed frags/bytes — the failed frag was released by R4).
-                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
-                }
-
-                // Update appropriate counter
-                match reason {
-                    FragmentDropReason::RateLimited => {
-                        self.stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                    FragmentDropReason::FirstTooSmall => {
-                        self.stats
-                            .first_too_small_drops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    FragmentDropReason::TooLarge => {
-                        self.stats.too_large_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                    FragmentDropReason::QueueFragLimit => {
-                        self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {}
-                }
+                drop(retired_owner);
+                self.record_drop_reason(reason);
                 Err(reason)
             }
         }
     }
 
-    /// Run timeout cleanup
-    ///
-    /// Should be called periodically from timer interrupt.
-    /// Returns number of queues cleaned up.
-    pub fn cleanup_expired(&self, now_ms: u64) -> usize {
-        // R169-10: same lock order as process_fragment (queues -> per_src -> per_ns).
-        let mut queues = self.queues.lock();
-        let mut per_src = self.per_src_counts.lock();
-        let mut per_ns = self.per_ns_counts.lock();
-
-        let mut expired_keys = Vec::new();
-
-        for (&key, queue) in queues.iter() {
-            if queue.is_expired(now_ms) {
-                // R169-11: fallible scratch push — under memory pressure, defer the
-                // remaining expired queues to the NEXT sweep rather than aborting.
-                // No counter is touched until the removal loop below, so a deferral
-                // leaks nothing (the still-expired queues are reclaimed next tick).
-                if expired_keys.try_reserve(1).is_err() {
-                    break;
-                }
-                // R62-2 FIX: Include byte count for cleanup
-                // R141-2 FIX: Use namespace-scoped per-source key.
-                expired_keys.push((
-                    key,
-                    (key.net_ns_id, queue.key.src_ip()),
-                    queue.received_frags,
-                    queue.received_bytes,
-                ));
+    fn process_new_fragment(
+        &self,
+        key: FragmentKey,
+        offset: u16,
+        more_fragments: bool,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<WirePacket>, FragmentDropReason> {
+        // Build the complete retained candidate before planning/removing a victim.
+        let mut queue = FragmentQueue::new(key, now_ms).map_err(|reason| {
+            self.record_drop_reason(reason);
+            reason
+        })?;
+        match queue.insert(offset, more_fragments, payload, now_ms) {
+            Ok(true) => {
+                let result = queue.reassemble();
+                drop(queue);
+                return match result {
+                    Some(packet) => {
+                        self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
+                        Ok(Some(packet))
+                    }
+                    None => {
+                        self.stats
+                            .global_limit_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(None)
+                    }
+                };
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                self.record_drop_reason(reason);
+                return Err(reason);
             }
         }
+        let mut candidate = Some(FragmentQueueOwner::try_new(queue).map_err(|reason| {
+            self.record_drop_reason(reason);
+            reason
+        })?);
+        let source = (key.net_ns_id, key.src_ip());
 
-        let count = expired_keys.len();
+        #[derive(Clone, Copy)]
+        struct Victim {
+            key: FragmentKey,
+            source: (u64, u32),
+            frags: u32,
+            bytes: u64,
+        }
 
-        for (key, per_src_key, frag_count, byte_count) in expired_keys {
-            queues.remove(&key);
-            if let Some(c) = per_src.get_mut(&per_src_key) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    per_src.remove(&per_src_key);
+        let planned: Result<
+            (
+                Option<Victim>,
+                Option<CapacityPlan>,
+                Option<CapacityPlan>,
+                Option<CapacityPlan>,
+            ),
+            FragmentDropReason,
+        > = (|| {
+            let mut queues = self.queues.lock();
+            let mut per_src = self.per_src_counts.lock();
+            let mut per_ns = self.per_ns_counts.lock();
+            if queues.contains_key(&key) {
+                return Err(FragmentDropReason::Duplicate);
+            }
+            let ns = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
+            let need_ns_victim = key.net_ns_id != 0 && ns.queues >= MAX_QUEUES_PER_NS;
+            let need_global_victim = queues.len() >= GLOBAL_MAX_QUEUES;
+            let victim = if need_ns_victim || need_global_victim {
+                let victim_key = queues
+                    .iter()
+                    .filter(|(candidate_key, _)| candidate_key.net_ns_id == key.net_ns_id)
+                    .min_by_key(|(_, owner)| owner.created_ms)
+                    .map(|(candidate_key, _)| *candidate_key)
+                    .ok_or(if need_ns_victim {
+                        FragmentDropReason::PerNsQueueLimit
+                    } else {
+                        FragmentDropReason::GlobalQueueLimit
+                    })?;
+                let owner = queues
+                    .get(&victim_key)
+                    .expect("RF180-41 planned fragment victim vanished");
+                Some(Victim {
+                    key: victim_key,
+                    source: (victim_key.net_ns_id, victim_key.src_ip()),
+                    frags: owner.received_frags as u32,
+                    bytes: owner.received_bytes as u64,
+                })
+            } else {
+                None
+            };
+
+            let same_ns = victim.is_some_and(|v| v.key.net_ns_id == key.net_ns_id);
+            let victim_frags = victim.filter(|_| same_ns).map_or(0, |v| v.frags);
+            let victim_bytes = victim.filter(|_| same_ns).map_or(0, |v| v.bytes);
+            if key.net_ns_id != 0
+                && ns.queues.saturating_sub(usize::from(same_ns)) >= MAX_QUEUES_PER_NS
+            {
+                return Err(FragmentDropReason::PerNsQueueLimit);
+            }
+            if key.net_ns_id != 0
+                && ns.frags.saturating_sub(victim_frags) as usize >= MAX_FRAGS_PER_NS
+            {
+                return Err(FragmentDropReason::PerNsFragLimit);
+            }
+            if key.net_ns_id != 0
+                && ns
+                    .bytes
+                    .saturating_sub(victim_bytes)
+                    .saturating_add(payload.len() as u64)
+                    > MAX_BYTES_PER_NS
+            {
+                return Err(FragmentDropReason::PerNsByteLimit);
+            }
+            let global_frags = self
+                .stats
+                .buffered_fragments
+                .load(Ordering::Relaxed)
+                .saturating_sub(victim.map_or(0, |v| v.frags));
+            let global_bytes = self
+                .stats
+                .buffered_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(victim.map_or(0, |v| v.bytes));
+            if global_frags as usize >= GLOBAL_MAX_FRAGS {
+                return Err(FragmentDropReason::GlobalFragLimit);
+            }
+            if global_bytes.saturating_add(payload.len() as u64) > GLOBAL_MAX_FRAG_BYTES as u64 {
+                return Err(FragmentDropReason::GlobalByteLimit);
+            }
+            let source_count = per_src.get(&source).copied().unwrap_or(0);
+            if source_count.saturating_sub(usize::from(victim.is_some_and(|v| v.source == source)))
+                >= MAX_QUEUES_PER_SRC
+            {
+                return Err(FragmentDropReason::PerSourceLimit);
+            }
+
+            let queue_plan = if victim.is_none() {
+                queues
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+            } else {
+                None
+            };
+            let frees_source = victim
+                .and_then(|v| per_src.get(&v.source).map(|count| *count == 1))
+                .unwrap_or(false);
+            let source_plan = if !per_src.contains_key(&source) && !frees_source {
+                per_src
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+            } else {
+                None
+            };
+            let frees_ns = victim
+                .and_then(|v| per_ns.get(&v.key.net_ns_id).map(|b| b.queues == 1))
+                .unwrap_or(false);
+            let ns_plan = if !per_ns.contains_key(&key.net_ns_id) && !frees_ns {
+                per_ns
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+            } else {
+                None
+            };
+            Ok((victim, queue_plan, source_plan, ns_plan))
+        })();
+
+        let (victim, queue_plan, source_plan, ns_plan) = planned.map_err(|reason| {
+            self.record_drop_reason(reason);
+            reason
+        })?;
+        let mut capacity = FragmentIndexCapacity::prepare(queue_plan, source_plan, ns_plan)
+            .map_err(|reason| {
+                self.record_drop_reason(reason);
+                reason
+            })?;
+        let mut retired = RetiredFragmentIndexCapacity::empty();
+        let mut retired_victim = None;
+
+        let commit: Result<(), FragmentDropReason> = (|| {
+            let mut queues = self.queues.lock();
+            let mut per_src = self.per_src_counts.lock();
+            let mut per_ns = self.per_ns_counts.lock();
+            if queues.contains_key(&key) || victim.is_some_and(|v| !queues.contains_key(&v.key)) {
+                return Err(FragmentDropReason::Duplicate);
+            }
+
+            if victim.is_none() {
+                if let Some(plan) = queues
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+                {
+                    let prepared = capacity
+                        .queues
+                        .take()
+                        .filter(|p| p.capacity() >= plan.required())
+                        .ok_or(FragmentDropReason::GlobalQueueLimit)?;
+                    retired.queues = Some(
+                        queues
+                            .install_prepared_deferred(prepared)
+                            .unwrap_or_else(|_| panic!("RF180-41 fragment queue backing rejected")),
+                    );
                 }
             }
-            self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
-            self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+            let frees_source = victim
+                .and_then(|v| per_src.get(&v.source).map(|count| *count == 1))
+                .unwrap_or(false);
+            if !per_src.contains_key(&source) && !frees_source {
+                if let Some(plan) = per_src
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+                {
+                    let prepared = capacity
+                        .per_src
+                        .take()
+                        .filter(|p| p.capacity() >= plan.required())
+                        .ok_or(FragmentDropReason::GlobalQueueLimit)?;
+                    retired.per_src = Some(
+                        per_src
+                            .install_prepared_deferred(prepared)
+                            .unwrap_or_else(|_| {
+                                panic!("RF180-41 fragment source backing rejected")
+                            }),
+                    );
+                }
+            }
+            let frees_ns = victim
+                .and_then(|v| per_ns.get(&v.key.net_ns_id).map(|b| b.queues == 1))
+                .unwrap_or(false);
+            if !per_ns.contains_key(&key.net_ns_id) && !frees_ns {
+                if let Some(plan) = per_ns
+                    .capacity_plan_for(1)
+                    .map_err(|_| FragmentDropReason::GlobalQueueLimit)?
+                {
+                    let prepared = capacity
+                        .per_ns
+                        .take()
+                        .filter(|p| p.capacity() >= plan.required())
+                        .ok_or(FragmentDropReason::GlobalQueueLimit)?;
+                    retired.per_ns = Some(
+                        per_ns
+                            .install_prepared_deferred(prepared)
+                            .unwrap_or_else(|_| {
+                                panic!("RF180-41 fragment namespace backing rejected")
+                            }),
+                    );
+                }
+            }
+
+            if let Some(victim) = victim {
+                retired_victim = Some(
+                    queues
+                        .remove(&victim.key)
+                        .expect("RF180-41 fragment victim disappeared at commit"),
+                );
+                if let Some(count) = per_src.get_mut(&victim.source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&victim.source);
+                    }
+                }
+                per_ns_release_queue(&mut per_ns, victim.key.net_ns_id);
+                per_ns_release_frags(&mut per_ns, victim.key.net_ns_id, victim.frags);
+                per_ns_release_bytes(&mut per_ns, victim.key.net_ns_id, victim.bytes);
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                self.stats
+                    .buffered_fragments
+                    .fetch_sub(victim.frags, Ordering::Relaxed);
+                self.stats
+                    .buffered_bytes
+                    .fetch_sub(victim.bytes, Ordering::Relaxed);
+                self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let owner = candidate
+                .take()
+                .expect("RF180-41 fragment candidate consumed once");
+            assert!(
+                queues.insert_unique_reserved(key, owner).is_ok(),
+                "RF180-41 fragment candidate publication lacked capacity"
+            );
+            if let Some(count) = per_src.get_mut(&source) {
+                *count = count
+                    .checked_add(1)
+                    .expect("RF180-41 fragment per-source counter overflow");
+            } else {
+                assert!(
+                    per_src.insert_unique_reserved(source, 1).is_ok(),
+                    "RF180-41 fragment source publication lacked capacity"
+                );
+            }
+            per_ns_charge_queue(&mut per_ns, key.net_ns_id);
+            per_ns_charge_frag(&mut per_ns, key.net_ns_id);
+            per_ns_charge_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
+            self.stats.active_queues.fetch_add(1, Ordering::Relaxed);
             self.stats
                 .buffered_fragments
-                .fetch_sub(frag_count as u32, Ordering::Relaxed);
-            // R62-2 FIX: Decrement buffered bytes on timeout cleanup
+                .fetch_add(1, Ordering::Relaxed);
             self.stats
                 .buffered_bytes
-                .fetch_sub(byte_count as u64, Ordering::Relaxed);
-            // R169-10 R9: per-ns release for each expired queue (its ns is
-            // per_src_key.0). Unguarded — saturating_sub tolerates a 0-frag queue.
-            per_ns_release_queue(&mut per_ns, per_src_key.0);
-            per_ns_release_frags(&mut per_ns, per_src_key.0, frag_count as u32);
-            per_ns_release_bytes(&mut per_ns, per_src_key.0, byte_count as u64);
-        }
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            Ok(())
+        })();
 
-        count
+        drop(retired_victim);
+        drop(retired.per_ns.take());
+        drop(retired.per_src.take());
+        drop(retired.queues.take());
+        drop(capacity);
+        drop(candidate.take());
+
+        match commit {
+            Ok(()) => Ok(None),
+            Err(reason) => {
+                self.record_drop_reason(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Run timeout cleanup without heap scratch or lock-held destruction.
+    ///
+    /// The transaction token excludes concurrent fragment publication while
+    /// each owner is detached. Cleanup remains bounded by the live queue cap;
+    /// a busy dataplane simply defers this sweep to the next timer tick.
+    pub fn cleanup_expired(&self, now_ms: u64) -> usize {
+        let _transaction = match self.try_transaction() {
+            Some(permit) => permit,
+            None => return 0,
+        };
+        let mut removed = 0usize;
+        loop {
+            let retired = {
+                let mut queues = self.queues.lock();
+                let mut per_src = self.per_src_counts.lock();
+                let mut per_ns = self.per_ns_counts.lock();
+                let key = queues
+                    .iter()
+                    .find(|(_, owner)| owner.is_expired(now_ms))
+                    .map(|(key, _)| *key);
+                let Some(key) = key else {
+                    break;
+                };
+                let owner = queues
+                    .remove(&key)
+                    .expect("RF180-41 cleanup-selected fragment owner vanished");
+                let source = (key.net_ns_id, key.src_ip());
+                let frags = owner.received_frags as u32;
+                let bytes = owner.received_bytes as u64;
+                if let Some(count) = per_src.get_mut(&source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&source);
+                    }
+                }
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                per_ns_release_frags(&mut per_ns, key.net_ns_id, frags);
+                per_ns_release_bytes(&mut per_ns, key.net_ns_id, bytes);
+                self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                self.stats
+                    .buffered_fragments
+                    .fetch_sub(frags, Ordering::Relaxed);
+                self.stats
+                    .buffered_bytes
+                    .fetch_sub(bytes, Ordering::Relaxed);
+                owner
+            };
+            drop(retired);
+            removed = removed.saturating_add(1);
+        }
+        removed
     }
 
     /// Get current statistics
@@ -1402,7 +1567,7 @@ pub fn process_fragment(
     header: &Ipv4Header,
     payload: &[u8],
     now_ms: u64,
-) -> Result<Option<Vec<u8>>, FragmentDropReason> {
+) -> Result<Option<WirePacket>, FragmentDropReason> {
     fragment_cache().process_fragment(net_ns_id, header, payload, now_ms)
 }
 
@@ -1645,5 +1810,80 @@ mod tests {
         let result = cache.process_fragment(1, &hdr, &data, now);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), FragmentDropReason::FirstTooSmall);
+    }
+
+    fn test_key(id: u16) -> FragmentKey {
+        FragmentKey {
+            net_ns_id: 0x1804_1000 + id as u64,
+            src: [10, 0, 0, 1],
+            dst: [10, 0, 0, 2],
+            protocol: 17,
+            identification: id,
+        }
+    }
+
+    fn assert_empty_queue_state(queue: &FragmentQueue) {
+        assert_eq!(queue.received_frags, 0);
+        assert_eq!(queue.received_bytes, 0);
+        assert_eq!(queue.total_len, None);
+        assert!(!queue.have_first);
+        assert!(!queue.have_last);
+        assert!(!queue.l4_header_ok);
+        assert!(queue.frags.is_empty());
+        assert_eq!(queue.holes.len(), 1);
+        assert_eq!(queue.holes[0].start, 0);
+        assert_eq!(queue.holes[0].end, u16::MAX);
+    }
+
+    #[test]
+    fn rf180_41_fragment_hole_growth_failure_is_transactional() {
+        mm::publish_heap_budgets();
+        let mut queue = FragmentQueue::new(test_key(1), 1).expect("queue admission");
+        queue.fail_next_hole_growth = true;
+
+        assert_eq!(
+            queue.insert(0, true, &[0x11; 16], 2),
+            Err(FragmentDropReason::QueueByteLimit)
+        );
+        assert_empty_queue_state(&queue);
+
+        assert_eq!(queue.insert(0, true, &[0x11; 16], 3), Ok(false));
+        assert_eq!(queue.received_frags, 1);
+    }
+
+    #[test]
+    fn rf180_41_fragment_map_growth_failure_is_transactional() {
+        mm::publish_heap_budgets();
+        let mut queue = FragmentQueue::new(test_key(2), 1).expect("queue admission");
+        queue.fail_next_frag_map_growth = true;
+
+        assert_eq!(
+            queue.insert(0, true, &[0x22; 16], 2),
+            Err(FragmentDropReason::QueueByteLimit)
+        );
+        assert_empty_queue_state(&queue);
+
+        assert_eq!(queue.insert(0, true, &[0x22; 16], 3), Ok(false));
+        assert!(queue.holes.charged_bytes_for_test() > 0);
+        assert!(queue.frags.charged_bytes_for_test() > 0);
+    }
+
+    #[test]
+    fn rf180_41_fragment_cache_index_admission_failure_publishes_nothing() {
+        mm::publish_heap_budgets();
+        let cache = FragmentCache::new();
+        cache.queues.lock().fail_next_growth_for_test();
+        let header = make_header([10, 0, 0, 9], 0x1804, 0, true);
+
+        assert_eq!(
+            cache.process_fragment(0x1804, &header, &[0x33; 16], 1),
+            Err(FragmentDropReason::GlobalQueueLimit)
+        );
+        assert!(cache.queues.lock().is_empty());
+        assert!(cache.per_src_counts.lock().is_empty());
+        assert!(cache.per_ns_counts.lock().is_empty());
+        assert_eq!(cache.stats.active_queues.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.stats.buffered_fragments.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.stats.buffered_bytes.load(Ordering::Relaxed), 0);
     }
 }

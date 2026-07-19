@@ -14,7 +14,7 @@
 //! # References
 //! - IEEE 802.3 Ethernet
 
-use alloc::vec::Vec;
+use crate::admitted::WirePacket;
 
 /// Ethernet header size (6 + 6 + 2 = 14 bytes)
 pub const ETH_HEADER_LEN: usize = 14;
@@ -140,13 +140,17 @@ impl EthHeader {
 // Ethernet Errors
 // ============================================================================
 
-/// Errors that can occur during Ethernet parsing
+/// Errors that can occur while parsing or constructing an Ethernet frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EthError {
     /// Frame is too short
     Truncated,
     /// Unsupported EtherType
     UnsupportedProtocol,
+    /// Header plus payload length overflowed the address space.
+    FrameTooLarge,
+    /// Aggregate admission or allocator backing was unavailable.
+    AllocationFailed,
 }
 
 // ============================================================================
@@ -198,16 +202,96 @@ pub fn parse_ethernet(frame: &[u8]) -> Result<(EthHeader, &[u8]), EthError> {
 ///
 /// # Returns
 /// Complete Ethernet frame including header and payload
-// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
-pub fn build_ethernet_frame(dst: EthAddr, src: EthAddr, ethertype: u16, payload: &[u8]) -> Vec<u8> {
-    let total = ETH_HEADER_LEN + payload.len();
-    let mut frame = Vec::new();
-    if frame.try_reserve_exact(total).is_err() {
-        return frame;
+// RF180-41 FIX: the returned wire owner holds aggregate admission until its
+// Ethernet backing allocation has actually been destroyed.
+pub fn build_ethernet_frame(
+    dst: EthAddr,
+    src: EthAddr,
+    ethertype: u16,
+    payload: &[u8],
+) -> WirePacket {
+    build_ethernet_frame_from_parts(dst, src, ethertype, &[payload])
+}
+
+/// Checked multi-part frame builder.
+///
+/// The complete frame is admitted before its one allocator request. Callers
+/// that need to distinguish pressure from an intentionally empty value should
+/// use this API instead of the compatibility wrapper.
+pub fn try_build_ethernet_frame_from_parts(
+    dst: EthAddr,
+    src: EthAddr,
+    ethertype: u16,
+    payload_parts: &[&[u8]],
+) -> Result<WirePacket, EthError> {
+    let payload_len = payload_parts
+        .iter()
+        .try_fold(0usize, |len, part| len.checked_add(part.len()))
+        .ok_or(EthError::FrameTooLarge)?;
+    let total = ETH_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(EthError::FrameTooLarge)?;
+    let mut frame = WirePacket::try_zeroed(total).map_err(|_| EthError::AllocationFailed)?;
+    frame.as_mut_slice()[0..6].copy_from_slice(&dst.0);
+    frame.as_mut_slice()[6..12].copy_from_slice(&src.0);
+    frame.as_mut_slice()[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    let mut offset = ETH_HEADER_LEN;
+    for part in payload_parts {
+        let end = offset + part.len();
+        frame.as_mut_slice()[offset..end].copy_from_slice(part);
+        offset = end;
     }
-    frame.extend_from_slice(&dst.0);
-    frame.extend_from_slice(&src.0);
-    frame.extend_from_slice(&ethertype.to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
+    Ok(frame)
+}
+
+/// Build a frame from discontiguous payload parts with one admitted allocation.
+/// This prevents IPv4 response paths from retaining a temporary concatenation
+/// at the same time as the final Ethernet frame.
+pub(crate) fn build_ethernet_frame_from_parts(
+    dst: EthAddr,
+    src: EthAddr,
+    ethertype: u16,
+    payload_parts: &[&[u8]],
+) -> WirePacket {
+    try_build_ethernet_frame_from_parts(dst, src, ethertype, payload_parts).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rf180_41_ethernet_admission_failure_never_emits_a_runt_frame() {
+        WirePacket::fail_next_admission_for_test();
+        assert_eq!(
+            try_build_ethernet_frame_from_parts(
+                EthAddr::BROADCAST,
+                EthAddr::ZERO,
+                ETHERTYPE_IPV4,
+                &[&[1, 2], &[3, 4]],
+            ),
+            Err(EthError::AllocationFailed)
+        );
+
+        WirePacket::fail_next_admission_for_test();
+        let failed = build_ethernet_frame(
+            EthAddr::BROADCAST,
+            EthAddr::ZERO,
+            ETHERTYPE_IPV4,
+            &[1, 2, 3, 4],
+        );
+        assert!(failed.is_empty());
+
+        let frame = try_build_ethernet_frame_from_parts(
+            EthAddr::BROADCAST,
+            EthAddr::ZERO,
+            ETHERTYPE_IPV4,
+            &[&[1, 2], &[3, 4]],
+        )
+        .expect("multi-part Ethernet admission");
+        assert_eq!(frame.len(), ETH_HEADER_LEN + 4);
+        assert_eq!(&frame[..6], &EthAddr::BROADCAST.0);
+        assert_eq!(&frame[12..14], &ETHERTYPE_IPV4.to_be_bytes());
+        assert_eq!(&frame[ETH_HEADER_LEN..], &[1, 2, 3, 4]);
+    }
 }
