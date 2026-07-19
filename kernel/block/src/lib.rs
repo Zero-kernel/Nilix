@@ -36,6 +36,7 @@
 //! for LSM policy enforcement at the block layer.
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
@@ -600,6 +601,17 @@ pub trait BlockDevice: Send + Sync {
     fn flush(&self) -> Result<(), BlockError> {
         Err(BlockError::NotSupported)
     }
+
+    /// Quiesce a newly probed device whose publication transaction failed.
+    ///
+    /// The caller must invoke this only before the device becomes reachable by
+    /// I/O clients. DMA-capable implementations must prove that the device can
+    /// no longer access owned buffers before returning `Ok(())`. Returning an
+    /// error requests quarantine: the caller must retain the final `Arc` and
+    /// all DMA ownership rather than releasing potentially live memory.
+    fn rollback_unpublished(&self) -> Result<(), BlockError> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -746,8 +758,6 @@ pub struct RequestQueueStats {
 
 /// Registered block device entry.
 struct RegisteredDevice {
-    /// Device name.
-    name: String,
     /// Device instance.
     device: Arc<dyn BlockDevice>,
     /// Minor device number.
@@ -759,8 +769,9 @@ struct RegisteredDevice {
 /// Provides device registration, lookup by name/minor number,
 /// and integration with devfs.
 pub struct BlockDeviceRegistry {
-    /// Registered devices.
-    devices: RwLock<Vec<RegisteredDevice>>,
+    /// Registered devices. Fixed storage makes publication allocation-free;
+    /// device names remain owned by the device itself.
+    devices: RwLock<[Option<RegisteredDevice>; MAX_BLOCK_DEVICES]>,
     /// Next minor number to assign.
     next_minor: AtomicU64,
 }
@@ -769,7 +780,7 @@ impl BlockDeviceRegistry {
     /// Create a new registry.
     pub const fn new() -> Self {
         Self {
-            devices: RwLock::new(Vec::new()),
+            devices: RwLock::new([const { None }; MAX_BLOCK_DEVICES]),
             next_minor: AtomicU64::new(0),
         }
     }
@@ -778,30 +789,35 @@ impl BlockDeviceRegistry {
     ///
     /// Returns the assigned minor number on success.
     pub fn register(&self, device: Arc<dyn BlockDevice>) -> Result<u32, BlockError> {
+        // R180-27 FIX: fixed slots and device-owned names make the complete
+        // registry mutation allocation-free after DRIVER_OK.
         let mut devices = self.devices.write();
 
-        if devices.len() >= MAX_BLOCK_DEVICES {
-            return Err(BlockError::NoMem);
-        }
-
         // Check for duplicate name
-        let name = device.name().into();
-        if devices.iter().any(|d| d.name == name) {
+        if devices
+            .iter()
+            .flatten()
+            .any(|registered| registered.device.name() == device.name())
+        {
             return Err(BlockError::Invalid);
         }
+
+        let slot = devices
+            .iter()
+            .position(Option::is_none)
+            .ok_or(BlockError::NoMem)?;
 
         // P2-8 FIX: Use fetch_update + checked_add to prevent minor number
         // wrapping on overflow, following the R105-5 pattern.
         let minor = self
             .next_minor
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
-            .map_err(|_| BlockError::NoMem)? as u32;
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                (id <= u32::MAX as u64).then(|| id + 1)
+            })
+            .map_err(|_| BlockError::NoMem)?;
+        let minor = u32::try_from(minor).map_err(|_| BlockError::NoMem)?;
 
-        devices.push(RegisteredDevice {
-            name,
-            device,
-            minor,
-        });
+        devices[slot] = Some(RegisteredDevice { device, minor });
 
         Ok(minor)
     }
@@ -811,9 +827,13 @@ impl BlockDeviceRegistry {
         let mut devices = self.devices.write();
         let pos = devices
             .iter()
-            .position(|d| d.name == name)
+            .position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|registered| registered.device.name() == name)
+            })
             .ok_or(BlockError::NotFound)?;
-        devices.remove(pos);
+        devices[pos] = None;
         Ok(())
     }
 
@@ -822,8 +842,9 @@ impl BlockDeviceRegistry {
         let devices = self.devices.read();
         devices
             .iter()
-            .find(|d| d.name == name)
-            .map(|d| Arc::clone(&d.device))
+            .flatten()
+            .find(|registered| registered.device.name() == name)
+            .map(|registered| Arc::clone(&registered.device))
     }
 
     /// Look up a device by minor number.
@@ -831,19 +852,33 @@ impl BlockDeviceRegistry {
         let devices = self.devices.read();
         devices
             .iter()
-            .find(|d| d.minor == minor)
-            .map(|d| Arc::clone(&d.device))
+            .flatten()
+            .find(|registered| registered.minor == minor)
+            .map(|registered| Arc::clone(&registered.device))
     }
 
     /// Get list of all registered device names.
-    pub fn list_devices(&self) -> Vec<String> {
+    pub fn list_devices(&self) -> Result<Vec<String>, BlockError> {
         let devices = self.devices.read();
-        devices.iter().map(|d| d.name.clone()).collect()
+        let mut names = Vec::new();
+        let count = devices.iter().flatten().count();
+        names
+            .try_reserve_exact(count)
+            .map_err(|_| BlockError::NoMem)?;
+        for registered in devices.iter().flatten() {
+            let source_name = registered.device.name();
+            let mut name = String::new();
+            name.try_reserve_exact(source_name.len())
+                .map_err(|_| BlockError::NoMem)?;
+            name.push_str(source_name);
+            names.push(name);
+        }
+        Ok(names)
     }
 
     /// Get the number of registered devices.
     pub fn count(&self) -> usize {
-        self.devices.read().len()
+        self.devices.read().iter().flatten().count()
     }
 }
 
@@ -886,8 +921,69 @@ pub fn get_device_by_minor(minor: u32) -> Option<Arc<dyn BlockDevice>> {
 }
 
 /// List all registered block devices.
-pub fn list_devices() -> Vec<String> {
+pub fn list_devices() -> Result<Vec<String>, BlockError> {
     BLOCK_REGISTRY.list_devices()
+}
+
+/// A ready VirtIO block device that has not completed kernel publication.
+///
+/// Dropping this guard rolls back `DRIVER_OK`. If hardware quiescence cannot be
+/// proven, the final Arc is deliberately quarantined so DMA-owned memory is
+/// never returned to the allocator. `commit` is the only way to disarm it.
+pub struct ProbedBlockDevice {
+    pending: Option<(Arc<dyn BlockDevice>, &'static str)>,
+}
+
+impl ProbedBlockDevice {
+    fn new(device: Arc<dyn BlockDevice>, name: &'static str) -> Self {
+        Self {
+            pending: Some((device, name)),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.pending
+            .as_ref()
+            .map(|(_, name)| *name)
+            .expect("probed block device already committed")
+    }
+
+    pub fn device(&self) -> Arc<dyn BlockDevice> {
+        Arc::clone(
+            &self
+                .pending
+                .as_ref()
+                .expect("probed block device already committed")
+                .0,
+        )
+    }
+
+    /// Finish publication after every registry has committed successfully.
+    pub fn commit(mut self) -> (Arc<dyn BlockDevice>, &'static str) {
+        self.pending
+            .take()
+            .expect("probed block device committed twice")
+    }
+}
+
+impl Drop for ProbedBlockDevice {
+    fn drop(&mut self) {
+        let Some((device, name)) = self.pending.take() else {
+            return;
+        };
+
+        if let Err(error) = device.rollback_unpublished() {
+            #[cfg(not(test))]
+            klog_force!(
+                "R180-27: /dev/{} publication rollback could not prove DMA quiescence: {:?}; quarantining device ownership",
+                name,
+                error
+            );
+            #[cfg(test)]
+            let _ = (name, error);
+            core::mem::forget(device);
+        }
+    }
 }
 
 // ============================================================================
@@ -991,11 +1087,11 @@ unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> 
 /// 1. Tries known virtio-mmio addresses (for embedded/VM configurations)
 /// 2. Scans PCI bus 0 for virtio-blk devices (modern transport)
 /// 3. Initializes found devices
-/// 4. Returns the device for caller to register with VFS
+/// 4. Returns an RAII publication guard for the caller to register atomically
 ///
 /// # Returns
-/// Option containing (device Arc, device name) if found
-pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'static str)> {
+/// A pending device guard if found. Dropping it resets/quarantines the device.
+pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
     // Known virtio-mmio addresses to try (used by some VMs)
     // These use identity mapping (virt == phys for first 4GB)
     const VIRTIO_MMIO_BASES: [u64; 2] = [
@@ -1031,7 +1127,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                         capacity,
                         sector_size
                     );
-                    return Some((device, name));
+                    return Some(ProbedBlockDevice::new(device, name));
                 }
                 Err(BlockError::NotFound) => {
                     // No device at this address, continue silently
@@ -1081,18 +1177,11 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
             }
             Err(e) => {
                 // R82-3 FIX: Disable bus mastering on MMIO mapping failure
-                // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
-                let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
-                let cmd =
-                    pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
-                pci::pci_config_write16(
-                    pci_id.bus,
-                    pci_id.device,
-                    pci_id.function,
-                    0x04,
-                    cmd & !0x04,
-                );
-                drop(_pci_lock);
+                // R180-17: verify the command-register clear under the shared
+                // PCI-config lock; continuing with BME set is not fail-closed.
+                if !pci::disable_bus_master(pci_id) {
+                    panic!("R180-17: cannot fail closed after virtio-blk MMIO mapping failure");
+                }
                 klog!(Error,
                     "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
                     min_phys, max_phys, e
@@ -1101,7 +1190,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
             }
         };
 
-        match unsafe { virtio::VirtioBlkDevice::probe_pci(pci_addrs, virt_offset, name) } {
+        match unsafe { virtio::VirtioBlkDevice::probe_pci(pci_id, pci_addrs, virt_offset, name) } {
             Ok(device) => {
                 let capacity = device.capacity_sectors();
                 let sector_size = device.sector_size();
@@ -1116,22 +1205,15 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                     capacity,
                     sector_size
                 );
-                return Some((device, name));
+                return Some(ProbedBlockDevice::new(device, name));
             }
             Err(e) => {
                 // R82-3 FIX: Disable bus mastering on driver probe failure
-                // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
-                let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
-                let cmd =
-                    pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
-                pci::pci_config_write16(
-                    pci_id.bus,
-                    pci_id.device,
-                    pci_id.function,
-                    0x04,
-                    cmd & !0x04,
-                );
-                drop(_pci_lock);
+                // R180-17: verify the command-register clear under the shared
+                // PCI-config lock; continuing with BME set is not fail-closed.
+                if !pci::disable_bus_master(pci_id) {
+                    panic!("R180-17: cannot fail closed after virtio-blk probe failure");
+                }
                 klog!(Warn,
                     "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",
                     name,
@@ -1157,12 +1239,112 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Host stack alignment is otherwise ABI-dependent. The second 512-byte
+    /// half is always sector-aligned and never 1024-byte aligned, which makes
+    /// the BIO alignment assertions deterministic.
+    #[repr(align(1024))]
+    struct AlignedDmaBuf([u8; 1024]);
+
+    impl AlignedDmaBuf {
+        fn sector_ptr(&self) -> *mut u8 {
+            // SAFETY: the backing is 1024 bytes and the 512-byte offset remains
+            // within the allocation for every 512-byte test vector below.
+            unsafe { self.0.as_ptr().add(512) as *mut u8 }
+        }
+    }
+
+    struct RollbackTestDevice {
+        rollbacks: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        fail_rollback: bool,
+    }
+
+    impl Drop for RollbackTestDevice {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    impl BlockDevice for RollbackTestDevice {
+        fn name(&self) -> &str {
+            "rollback-test"
+        }
+
+        fn capacity_sectors(&self) -> u64 {
+            1
+        }
+
+        fn submit_bio(&self, _bio: Bio) -> Result<(), BlockError> {
+            Err(BlockError::NotSupported)
+        }
+
+        fn rollback_unpublished(&self) -> Result<(), BlockError> {
+            self.rollbacks.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_rollback {
+                Err(BlockError::Offline)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn probed_device_rolls_back_uncommitted_publication() {
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let device: Arc<dyn BlockDevice> = Arc::new(RollbackTestDevice {
+            rollbacks: Arc::clone(&rollbacks),
+            drops: Arc::clone(&drops),
+            fail_rollback: false,
+        });
+        drop(ProbedBlockDevice::new(device, "vdt"));
+        assert_eq!(rollbacks.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn probed_device_commit_disarms_rollback() {
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let device: Arc<dyn BlockDevice> = Arc::new(RollbackTestDevice {
+            rollbacks: Arc::clone(&rollbacks),
+            drops: Arc::clone(&drops),
+            fail_rollback: false,
+        });
+        let (published, name) = ProbedBlockDevice::new(device, "vdt").commit();
+        assert_eq!(name, "vdt");
+        drop(published);
+        assert_eq!(rollbacks.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rf180_22_failed_publication_rollback_quarantines_owner() {
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let device: Arc<dyn BlockDevice> = Arc::new(RollbackTestDevice {
+            rollbacks: Arc::clone(&rollbacks),
+            drops: Arc::clone(&drops),
+            fail_rollback: true,
+        });
+
+        drop(ProbedBlockDevice::new(device, "vdt"));
+
+        assert_eq!(rollbacks.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            drops.load(AtomicOrdering::SeqCst),
+            0,
+            "unproven DMA quiescence must retain the final Arc"
+        );
+    }
 
     #[test]
     fn test_bio_vec_alignment() {
-        let buf = [0u8; 512];
-        // SAFETY: buf is a valid stack array, pointer and length are correct
-        let bv = unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) };
+        let buf = AlignedDmaBuf([0; 1024]);
+        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
+        let bv = unsafe { BioVec::new(buf.sector_ptr(), 512) };
         assert!(bv.is_aligned(512));
         assert!(!bv.is_aligned(1024));
     }
@@ -1178,9 +1360,9 @@ mod tests {
     #[test]
     fn test_bio_validation() {
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
-        let buf = [0u8; 512];
-        // SAFETY: buf is a valid stack array, pointer and length are correct
-        bio.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
+        let buf = AlignedDmaBuf([0; 1024]);
+        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
+        bio.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
             .unwrap();
 
         // Should pass with matching sector size and sufficient capacity
@@ -1191,12 +1373,12 @@ mod tests {
 
         // Should fail if exceeds device capacity
         let mut bio2 = Bio::new(BioOp::Read, 999).unwrap();
-        bio2.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
+        bio2.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
             .unwrap();
         assert!(bio2.validate(512, 1024, 1000).is_ok()); // sector 999 + 1 = 1000, OK
 
         let mut bio3 = Bio::new(BioOp::Read, 1000).unwrap();
-        bio3.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
+        bio3.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
             .unwrap();
         assert!(bio3.validate(512, 1024, 1000).is_err()); // sector 1000 + 1 = 1001, exceeds
     }
@@ -1221,9 +1403,9 @@ mod tests {
         assert!(queue.is_empty());
 
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
-        let buf = [0u8; 512];
-        // SAFETY: buf is a valid stack array, pointer and length are correct
-        bio.push_vec(unsafe { BioVec::new(buf.as_ptr() as *mut u8, 512) })
+        let buf = AlignedDmaBuf([0; 1024]);
+        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
+        bio.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
             .unwrap();
 
         queue.enqueue(bio).unwrap();

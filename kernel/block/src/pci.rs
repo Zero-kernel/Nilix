@@ -105,6 +105,50 @@ fn pci_config_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     (pci_config_read32(bus, dev, func, offset & 0xFC) >> shift) as u16
 }
 
+/// R180-17 FIX: clear and verify PCI bus-master enable on refusal paths.
+///
+/// Firmware/warm-boot may leave BME set. Skipping a device without clearing
+/// BME leaves it capable of untranslated DMA when IOMMU attach failed. The
+/// caller must hold [`iommu::PCI_CONFIG_LOCK`] across this operation so the
+/// command-register RMW and readback are one atomic PCI-config transaction.
+#[must_use = "failure to clear PCI bus mastering must be handled fail-closed"]
+fn clear_bus_master(bus: u8, dev: u8, func: u8) -> bool {
+    let cmd = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd & !0x04);
+    let verify = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+    let cleared = verify & 0x04 == 0;
+    if !cleared {
+        klog!(
+            Warn,
+            "    ! BME still set after clear for {:02x}:{:02x}.{}",
+            bus,
+            dev,
+            func
+        );
+    }
+    cleared
+}
+
+/// Disable and verify PCI bus mastering for a discovered block device.
+///
+/// This wrapper owns the shared PCI-config lock and is safe to call from
+/// driver failure/recovery paths that are outside the initial PCI scan.
+#[must_use = "failure to clear PCI bus mastering must be handled fail-closed"]
+pub fn disable_bus_master(pci_id: PciDeviceId) -> bool {
+    // Legacy CF8/CFC configuration access can address only segment zero. Do
+    // not report success after accidentally touching the same BDF elsewhere.
+    if pci_id.segment != 0 {
+        klog!(
+            Warn,
+            "    ! Cannot clear BME for unsupported PCI segment {}",
+            pci_id.segment
+        );
+        return false;
+    }
+    let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
+    clear_bus_master(pci_id.bus, pci_id.device, pci_id.function)
+}
+
 /// Read a BAR (Base Address Register) and return the physical address.
 ///
 /// Handles both 32-bit and 64-bit BARs. Returns None for I/O BARs.
@@ -292,6 +336,17 @@ pub fn probe_virtio_blk(
                     continue;
                 }
 
+                // R180-17 (iteration-2): clear any firmware-enabled BME BEFORE
+                // attach so a partial-unit / failed attach window cannot leave
+                // the device bus-mastering untranslated. Re-enable only after
+                // successful domain attach (below).
+                if !clear_bus_master(bus, dev, func) {
+                    panic!(
+                        "R180-17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{}",
+                        bus, dev, func
+                    );
+                }
+
                 // Attach device to IOMMU before enabling bus mastering (fail-closed)
                 // R94-14 FIX: Handle NotAvailable explicitly - proceed with warning
                 // for legacy systems without IOMMU, but fail on other errors.
@@ -307,6 +362,7 @@ pub fn probe_virtio_blk(
                                 "    ! [SECURE] Refusing bus-master for {:02x}:{:02x}.{} — no IOMMU isolation",
                                 bus, dev, func
                             );
+                            // BME already cleared above.
                             continue;
                         }
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
@@ -329,6 +385,7 @@ pub fn probe_virtio_blk(
                             func,
                             err
                         );
+                        // BME already cleared above.
                         continue;
                     }
                 }
@@ -358,9 +415,12 @@ pub fn probe_virtio_blk(
                 } else {
                     // R82-2 FIX: Disable bus mastering if device lacks modern caps
                     // to prevent orphaned DMA-capable device
-                    let cmd =
-                        (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-                    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd & !0x04);
+                    if !clear_bus_master(bus, dev, func) {
+                        panic!(
+                            "R180-17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{}",
+                            bus, dev, func
+                        );
+                    }
                     let dev_type = if device == VIRTIO_BLK_MODERN {
                         "modern"
                     } else {
