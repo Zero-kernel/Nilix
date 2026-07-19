@@ -21,6 +21,7 @@
 //!
 //! - Intel VT-d Specification, Chapter 3.4 (Second-Level Translation)
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +30,10 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
 
 use crate::IommuError;
-use mm::{buddy_allocator, fallible_map::FallibleOrderedMap, phys_to_virt};
+use mm::{
+    arc_charge_bytes, buddy_allocator, phys_to_virt, try_reserve_heap, AdmittedMap, AdmittedVec,
+    HeapCharge, HeapClass,
+};
 
 // ============================================================================
 // Constants
@@ -83,6 +87,35 @@ pub struct MappingEntry {
     pub write: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingState {
+    Installing,
+    Live,
+    MapPoisoned,
+    Unmapping,
+    AccountingCorrupt,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackedMapping {
+    entry: MappingEntry,
+    state: MappingState,
+}
+
+struct MappingRegistry {
+    entries: AdmittedMap<u64, TrackedMapping>,
+    owned_bytes: u64,
+}
+
+impl MappingRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: AdmittedMap::new(HeapClass::Device),
+            owned_bytes: 0,
+        }
+    }
+}
+
 /// IOMMU Domain for DMA isolation.
 ///
 /// Each domain maintains its own address space for DMA operations.
@@ -98,8 +131,10 @@ pub struct Domain {
     /// Determines page table levels: 39=3-level, 48=4-level.
     address_width: u8,
 
-    /// Mapping entries (for tracking, even in identity mode).
-    mappings: Mutex<FallibleOrderedMap<u64, MappingEntry>>,
+    /// Mapping ownership and its exact byte accounting. Co-locating both under
+    /// one lock prevents a poisoned/partial install from publishing a record
+    /// without the bytes that its eventual retirement must subtract.
+    mappings: Mutex<MappingRegistry>,
 
     /// Second-level page table root (physical address).
     /// Only used for PageTable type domains.
@@ -109,8 +144,8 @@ pub struct Domain {
     /// Prevents data races when concurrent operations modify the same domain.
     page_table_lock: Mutex<()>,
 
-    /// Total bytes mapped (for statistics).
-    mapped_bytes: AtomicU64,
+    /// Whole-heap charge for the production `Arc<Domain>` allocation.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl Domain {
@@ -131,10 +166,10 @@ impl Domain {
             id,
             domain_type: DomainType::Identity,
             address_width: MAX_ADDR_WIDTH,
-            mappings: Mutex::new(FallibleOrderedMap::new()),
+            mappings: Mutex::new(MappingRegistry::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
-            mapped_bytes: AtomicU64::new(0),
+            _arc_heap_charge: None,
         })
     }
 
@@ -156,10 +191,10 @@ impl Domain {
             id,
             domain_type: DomainType::PageTable,
             address_width: MAX_ADDR_WIDTH,
-            mappings: Mutex::new(FallibleOrderedMap::new()),
+            mappings: Mutex::new(MappingRegistry::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
-            mapped_bytes: AtomicU64::new(0),
+            _arc_heap_charge: None,
         })
     }
 
@@ -183,11 +218,22 @@ impl Domain {
             id,
             domain_type: DomainType::PageTable,
             address_width,
-            mappings: Mutex::new(FallibleOrderedMap::new()),
+            mappings: Mutex::new(MappingRegistry::new()),
             page_table_root: AtomicU64::new(0),
             page_table_lock: Mutex::new(()),
-            mapped_bytes: AtomicU64::new(0),
+            _arc_heap_charge: None,
         })
+    }
+
+    pub(crate) fn try_into_arc(mut self) -> Result<Arc<Self>, IommuError> {
+        let bytes = arc_charge_bytes::<Self>().map_err(|_| IommuError::PageTableAllocFailed)?;
+        let reservation = try_reserve_heap(HeapClass::Device, bytes)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        let charge = reservation
+            .commit()
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        self._arc_heap_charge = Some(charge);
+        Arc::try_new(self).map_err(|_| IommuError::PageTableAllocFailed)
     }
 
     /// Get domain identifier.
@@ -210,12 +256,12 @@ impl Domain {
 
     /// Get number of active mappings.
     pub fn mapping_count(&self) -> usize {
-        self.mappings.lock().len()
+        self.mappings.lock().entries.len()
     }
 
     /// Get total mapped bytes.
     pub fn mapped_bytes(&self) -> u64 {
-        self.mapped_bytes.load(Ordering::Relaxed)
+        self.mappings.lock().owned_bytes
     }
 
     /// Get page table root physical address.
@@ -305,40 +351,74 @@ impl Domain {
             write,
         };
 
-        let mut mappings = self.mappings.lock();
+        let mut registry = self.mappings.lock();
 
         // Reject overlapping mappings to avoid aliasing the same IOVA range
-        if let Some((_, prev)) = mappings.range(..=iova).next_back() {
-            let prev_end = prev.iova.checked_add(prev.size as u64).unwrap_or(u64::MAX);
+        if let Some((_, prev)) = registry.entries.range(..=iova).next_back() {
+            let prev_end = prev
+                .entry
+                .iova
+                .checked_add(prev.entry.size as u64)
+                .unwrap_or(u64::MAX);
             if prev_end > iova {
                 return Err(IommuError::InvalidRange);
             }
         }
-        if let Some((_, next)) = mappings.range(iova..).next() {
-            if next.iova < end_iova {
+        if let Some((_, next)) = registry.entries.range(iova..).next() {
+            if next.entry.iova < end_iova {
                 return Err(IommuError::InvalidRange);
             }
         }
 
         // RF178-39 FIX: reserve tracking capacity before SLPT publication.
         // Once this succeeds, the post-publication insert cannot grow the heap.
-        mappings
-            .try_reserve(1)
+        registry
+            .entries
+            .ensure_capacity_for(1)
             .map_err(|_| IommuError::PageTableAllocFailed)?;
+
+        let next_owned_bytes = registry
+            .owned_bytes
+            .checked_add(size_u64)
+            .ok_or(IommuError::InvalidRange)?;
+
+        // Publish ownership before any SLPT leaf can become hardware-visible.
+        // Capacity is already admitted, so this cannot allocate. If the
+        // two-phase page-table transaction fails, removal below is exact and
+        // allocation-free because install_mapping publishes nothing on error.
+        registry
+            .entries
+            .insert_unique_reserved(
+                iova,
+                TrackedMapping {
+                    entry,
+                    state: MappingState::Installing,
+                },
+            )
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        registry.owned_bytes = next_owned_bytes;
 
         // For page-table domains, install mapping after overlap validation
         if self.domain_type == DomainType::PageTable {
-            self.install_mapping(iova, phys, size, write)?;
+            if self.install_mapping(iova, phys, size, write).is_err() {
+                if let Some(tracked) = registry.entries.get_mut(&iova) {
+                    tracked.state = MappingState::MapPoisoned;
+                }
+                // Ownership stays published: callers must quarantine the
+                // physical range until an explicit unmap retry retires it.
+                return Err(IommuError::HardwareInitFailed);
+            }
         }
-
-        if let Some(replaced) = mappings
-            .try_insert(iova, entry)
-            .map_err(|_| IommuError::PageTableAllocFailed)?
-        {
-            self.mapped_bytes
-                .fetch_sub(replaced.size as u64, Ordering::Relaxed);
+        match registry.entries.get_mut(&iova) {
+            Some(tracked) if tracked.state == MappingState::Installing => {
+                tracked.state = MappingState::Live;
+            }
+            Some(tracked) => {
+                tracked.state = MappingState::AccountingCorrupt;
+                return Err(IommuError::HardwareInitFailed);
+            }
+            None => return Err(IommuError::HardwareInitFailed),
         }
-        self.mapped_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -354,7 +434,7 @@ impl Domain {
     ///
     /// * `Ok(())` - Unmapping successful
     /// * `Err(IommuError)` - Unmapping failed
-    pub fn unmap_range(&self, iova: u64, size: usize) -> Result<(), IommuError> {
+    pub(crate) fn prepare_unmap(&self, iova: u64, size: usize) -> Result<(), IommuError> {
         // Validate inputs
         if size == 0 || (size & (IOMMU_PAGE_SIZE - 1)) != 0 {
             return Err(IommuError::InvalidRange);
@@ -374,23 +454,65 @@ impl Domain {
             return Err(IommuError::InvalidRange);
         }
 
-        let mut mappings = self.mappings.lock();
+        let mut registry = self.mappings.lock();
 
         // Validate before removal so an unsupported partial unmap never needs
         // an allocating remove-then-reinsert rollback.
-        let entry = *mappings.get(&iova).ok_or(IommuError::InvalidRange)?;
-        if entry.size != size {
+        let tracked = registry
+            .entries
+            .get_mut(&iova)
+            .ok_or(IommuError::InvalidRange)?;
+        if tracked.entry.size != size {
             return Err(IommuError::InvalidRange);
         }
 
-        // For page-table domains, clear hardware mappings before forgetting the
-        // tracking entry. On failure, accounting/tracking remains intact.
+        match tracked.state {
+            MappingState::Live | MappingState::MapPoisoned => {
+                tracked.state = MappingState::Unmapping;
+            }
+            MappingState::Unmapping => {}
+            MappingState::Installing | MappingState::AccountingCorrupt => {
+                return Err(IommuError::HardwareInitFailed);
+            }
+        }
+
+        // Retain the tombstone and mapped-byte ownership until every unit has
+        // acknowledged invalidation. Re-entry is allocation-free and retries
+        // any partially-cleared page-table range.
         if self.domain_type == DomainType::PageTable {
             self.clear_mapping(iova, size)?;
         }
-        let removed = mappings.remove(&iova).ok_or(IommuError::InvalidRange)?;
-        self.mapped_bytes
-            .fetch_sub(removed.size as u64, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub(crate) fn commit_unmap(&self, iova: u64, size: usize) -> Result<(), IommuError> {
+        let mut registry = self.mappings.lock();
+        let tracked = registry
+            .entries
+            .get(&iova)
+            .ok_or(IommuError::InvalidRange)?;
+        if tracked.entry.size != size || tracked.state != MappingState::Unmapping {
+            return Err(IommuError::InvalidRange);
+        }
+        let next_owned_bytes = match registry.owned_bytes.checked_sub(tracked.entry.size as u64) {
+            Some(bytes) => bytes,
+            None => {
+                if let Some(tracked) = registry.entries.get_mut(&iova) {
+                    tracked.state = MappingState::AccountingCorrupt;
+                }
+                return Err(IommuError::HardwareInitFailed);
+            }
+        };
+        let removed = registry
+            .entries
+            .remove_retaining_capacity(&iova)
+            .ok_or(IommuError::HardwareInitFailed)?;
+        if removed.entry.size != size || removed.state != MappingState::Unmapping {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        registry.owned_bytes = next_owned_bytes;
+        registry.entries.reclaim_empty_capacity();
         Ok(())
     }
 
@@ -399,9 +521,9 @@ impl Domain {
         let mappings = self.mappings.lock();
         let mut snapshot = Vec::new();
         snapshot
-            .try_reserve_exact(mappings.len())
+            .try_reserve_exact(mappings.entries.len())
             .map_err(|_| IommuError::PageTableAllocFailed)?;
-        snapshot.extend(mappings.values().copied());
+        snapshot.extend(mappings.entries.values().map(|tracked| tracked.entry));
         Ok(snapshot)
     }
 
@@ -498,8 +620,8 @@ impl Domain {
     fn get_or_create_table(
         parent: &mut SlPageTable,
         index: usize,
-        newly_allocated_tables: &mut Vec<PhysFrame<Size4KiB>>,
-        staged_table_entries: &mut Vec<(*mut SlPageTable, usize, u64)>,
+        newly_allocated_tables: &mut AdmittedVec<PhysFrame<Size4KiB>>,
+        staged_table_entries: &mut AdmittedVec<(*mut SlPageTable, usize, u64)>,
     ) -> Result<&'static mut SlPageTable, IommuError> {
         let entry = parent.entry(index);
 
@@ -543,8 +665,12 @@ impl Domain {
 
         // Keep the frame detached from the hardware-visible hierarchy until
         // every page in the requested mapping has passed validation.
-        newly_allocated_tables.push(frame);
-        staged_table_entries.push((parent_ptr, index, phys));
+        newly_allocated_tables
+            .push_reserved(frame)
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
+        staged_table_entries
+            .push_reserved((parent_ptr, index, phys))
+            .map_err(|_| IommuError::PageTableAllocFailed)?;
 
         unsafe { Ok(Self::table_from_phys(phys)) }
     }
@@ -556,8 +682,8 @@ impl Domain {
     ///
     /// R-MEDIUM-4 FIX: Rollback mechanism to prevent page table leaks on validation
     /// failure. Frames are freed in reverse order (deepest first) for clarity.
-    fn rollback_new_tables(newly_allocated_tables: &mut Vec<PhysFrame<Size4KiB>>) {
-        for frame in newly_allocated_tables.drain(..).rev() {
+    fn rollback_new_tables(newly_allocated_tables: &mut AdmittedVec<PhysFrame<Size4KiB>>) {
+        while let Some(frame) = newly_allocated_tables.pop() {
             buddy_allocator::free_physical_pages(frame, 1);
         }
     }
@@ -636,14 +762,17 @@ impl Domain {
         // R-MEDIUM-3 FIX: Fallible staging allocation - pre-reserve capacity for all
         // leaf entries to avoid panic on attacker-controlled map size
         let num_pages = size / IOMMU_PAGE_SIZE; // size is page-aligned by map_range validation
-        let mut staged: Vec<(*mut SlPageTable, usize, SlPte)> = Vec::new();
+        let mut staged: AdmittedVec<(*mut SlPageTable, usize, SlPte)> =
+            AdmittedVec::new(HeapClass::Device);
         staged
             .try_reserve_exact(num_pages)
             .map_err(|_| IommuError::PageTableAllocFailed)?;
 
         // R-MEDIUM-4 FIX: Track newly allocated intermediate tables for rollback
-        let mut newly_allocated_tables: Vec<PhysFrame<Size4KiB>> = Vec::new();
-        let mut staged_table_entries: Vec<(*mut SlPageTable, usize, u64)> = Vec::new();
+        let mut newly_allocated_tables: AdmittedVec<PhysFrame<Size4KiB>> =
+            AdmittedVec::new(HeapClass::Device);
+        let mut staged_table_entries: AdmittedVec<(*mut SlPageTable, usize, u64)> =
+            AdmittedVec::new(HeapClass::Device);
 
         // Phase 1: Walk and validate mappings for each 4KB page
         let validation_result = (|| -> Result<(), IommuError> {
@@ -706,11 +835,13 @@ impl Domain {
 
                 // Capacity for every requested page was reserved before Phase 1,
                 // so this push cannot trigger an infallible allocation.
-                staged.push((
-                    pt as *mut SlPageTable,
-                    l1_idx,
-                    SlPte::new_leaf(cur_phys, pte_flags),
-                ));
+                staged
+                    .push_reserved((
+                        pt as *mut SlPageTable,
+                        l1_idx,
+                        SlPte::new_leaf(cur_phys, pte_flags),
+                    ))
+                    .map_err(|_| IommuError::PageTableAllocFailed)?;
             }
 
             Ok(())
@@ -859,7 +990,7 @@ pub fn run_mapping_tracker_self_test() {
         Err(IommuError::InvalidRange)
     ));
     assert!(matches!(
-        domain.unmap_range(0x2000, IOMMU_PAGE_SIZE * 2),
+        domain.prepare_unmap(0x2000, IOMMU_PAGE_SIZE * 2),
         Err(IommuError::InvalidRange)
     ));
     assert_eq!(domain.mapping_count(), 1);
@@ -867,8 +998,12 @@ pub fn run_mapping_tracker_self_test() {
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].iova, 0x2000);
     domain
-        .unmap_range(0x2000, IOMMU_PAGE_SIZE)
-        .expect("mapping removal");
+        .prepare_unmap(0x2000, IOMMU_PAGE_SIZE)
+        .expect("mapping retirement preparation");
+    assert_eq!(domain.mapping_count(), 1);
+    domain
+        .commit_unmap(0x2000, IOMMU_PAGE_SIZE)
+        .expect("mapping retirement commit");
     assert_eq!(domain.mapping_count(), 0);
 }
 
