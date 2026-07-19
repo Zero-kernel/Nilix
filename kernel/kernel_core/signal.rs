@@ -6,9 +6,8 @@
 //! - Default signal actions
 //! - Signal delivery mechanism
 
-use crate::process::{self, Process, ProcessId, ProcessState};
+use crate::process::{self, ProcessArc, ProcessId, ProcessState};
 use crate::syscall::SyscallError;
-use alloc::sync::Arc;
 use spin::{Mutex, Once};
 
 /// Maximum signal number supported (1-64)
@@ -21,7 +20,7 @@ const MAX_SIGNAL: u8 = 64;
 /// RF178-36: Resume is identity-bound from authorization through scheduler
 /// mutation. A reusable PID is never sufficient authority after the target PCB
 /// lock has been released.
-type ResumeCallback = fn(Arc<Mutex<Process>>, ProcessId, u64) -> bool;
+type ResumeCallback = fn(ProcessArc, ProcessId, u64) -> bool;
 
 /// 全局恢复回调（由调度器注册）
 static RESUME_CALLBACK: Mutex<Option<ResumeCallback>> = Mutex::new(None);
@@ -72,7 +71,7 @@ pub(crate) fn kernel_kick_reschedule() -> bool {
 /// The callback mutates the supplied resident PCB in place; it never re-resolves
 /// `expected_pid`. A successful Ready transition is followed by a cross-CPU kick.
 pub fn kernel_resume_stopped(
-    proc_arc: Arc<Mutex<Process>>,
+    proc_arc: ProcessArc,
     expected_pid: ProcessId,
     expected_generation: u64,
 ) -> bool {
