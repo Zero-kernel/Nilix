@@ -50,9 +50,9 @@ use x86_64::VirtAddr;
 pub use kaslr::{
     enable_partial_kaslr, get_kernel_layout, init as init_kaslr, install_kpti_context,
     is_kaslr_enabled, is_kpti_enabled, is_partial_kaslr_enabled, kernel_stack_slide,
-    partial_kaslr_status, randomized_mmap_base, text_kaslr_status, KernelLayout, KptiContext,
-    PartialKaslrFeature, PartialKaslrStatus, TextKaslrStatus, TrampolineDesc, KERNEL_PHYS_BASE,
-    KERNEL_VIRT_BASE,
+    partial_kaslr_status, randomized_mmap_base, text_kaslr_status, BootKaslrState, KernelLayout,
+    KptiContext, PartialKaslrFeature, PartialKaslrStatus, TextKaslrStatus, TrampolineDesc,
+    KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
 };
 pub use kptr::KptrGuard;
 pub use memory_hardening::{
@@ -354,10 +354,6 @@ pub fn init(
     // RF178-23 FIX: Publish the selected boot policy before BSP/AP or
     // scheduler mitigation hooks can run.
     spectre::set_policy_enabled(config.enable_spectre_mitigations);
-
-    // R102-11 FIX: Propagate the fail-closed policy to KASLR slide generation.
-    // In strict/Secure profiles, a deterministic kernel layout is unacceptable.
-    kaslr::set_kaslr_fail_closed(config.strict_wxorx);
 
     klog_always!("  Initializing security hardening...");
 

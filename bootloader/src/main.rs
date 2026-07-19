@@ -9,7 +9,7 @@ use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::table::boot::{AllocateType, MemoryType};
+use uefi::table::boot::{AllocateType, BootServices, MemoryType};
 use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
 use uefi::CStr16;
 use uefi::Identify;
@@ -29,13 +29,28 @@ const KERNEL_VIRT_BASE: u64 = 0xffffffff80000000;
 
 /// R167-C: BootInfo ABI version. MUST match `BOOT_INFO_VERSION` in
 /// `kernel/mm/memory.rs`. Bump on any change to the `BootInfo` layout.
-const BOOT_INFO_VERSION: u64 = 1;
+const BOOT_INFO_VERSION: u64 = 2;
+
+/// BootInfo `kaslr_flags`: the exact placement order was produced by a
+/// complete, unbiased RDRAND-backed shuffle. A non-zero relocation slide
+/// without this bit is availability relocation, not KASLR.
+const BOOT_INFO_KASLR_RANDOMIZED: u64 = 1 << 0;
 
 /// Maximum KASLR slide (512 MiB, within the 1GB high-half mapping)
 const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
 
 /// KASLR slide granularity (2 MiB aligned for huge page compatibility)
 const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
+
+/// Physical window covered by the initial high-half 1 GiB mapping.
+const KERNEL_PHYS_WINDOW_END: u64 = 1024 * 1024 * 1024;
+
+/// Number of bounded placement slots, including slide zero.
+const KASLR_SLOT_COUNT: usize = (KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY + 1) as usize;
+
+const _: () = assert!(KASLR_MAX_SLIDE % KASLR_SLIDE_GRANULARITY == 0);
+const _: () = assert!(KERNEL_PHYS_BASE + KASLR_MAX_SLIDE < KERNEL_PHYS_WINDOW_END);
+const _: () = assert!(KASLR_SLOT_COUNT <= u16::MAX as usize + 1);
 
 /// ELF relocation type: R_X86_64_RELATIVE (base + addend)
 const R_X86_64_RELATIVE: u32 = 8;
@@ -163,23 +178,12 @@ fn apply_rela_dyn_relocations(
     info!("  {} relocations applied successfully", applied);
 }
 
-/// Generate a random KASLR slide using RDRAND
-///
-/// Returns 0 when the `kaslr` feature is disabled, if RDRAND is unavailable,
-/// or if RDRAND fails.
-///
-/// When non-zero, the bootloader will:
-/// - Load the kernel at `KERNEL_PHYS_BASE + slide` (2 MiB aligned)
-/// - Apply `.rela.dyn` `R_X86_64_RELATIVE` relocations with the slide as load bias
-/// - Jump to `e_entry + slide`
-fn generate_kaslr_slide() -> u64 {
+/// Probe RDRAND safely before the permutation consumes additional samples.
+/// A successful sample is deliberately discarded; provenance is published
+/// only after the complete unbiased shuffle succeeds.
+fn probe_rdrand_entropy() -> bool {
     #[cfg(feature = "kaslr")]
     {
-        let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
-        if max_slots == 0 {
-            return 0;
-        }
-
         // R119-2 FIX: Check CPUID.01H:ECX[30] for RDRAND support before executing
         // the instruction. Without this check, RDRAND triggers #UD (Invalid Opcode)
         // on pre-Ivy Bridge Intel or pre-Excavator AMD CPUs. CPUID clobbers EAX,
@@ -205,38 +209,179 @@ fn generate_kaslr_slide() -> u64 {
         };
 
         if !rdrand_available {
-            // RDRAND not supported — graceful degradation to slide=0 (no KASLR)
-            return 0;
+            return false;
         }
 
-        let mut val: u64 = 0;
-        let success: u8;
-
-        // Use RDRAND instruction to get random value (CPUID check passed above)
-        unsafe {
-            core::arch::asm!(
-                "rdrand {val}",
-                "setc {success}",
-                val = out(reg) val,
-                success = out(reg_byte) success,
-                options(nostack, nomem),
-            );
+        // Retry transient RDRAND backpressure before demoting the placement
+        // transaction to deterministic full-window relocation.
+        for _ in 0..10 {
+            let success: u8;
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {value}",
+                    "setc {success}",
+                    value = out(reg) _,
+                    success = out(reg_byte) success,
+                    options(nostack, nomem),
+                );
+            }
+            if success == 1 {
+                return true;
+            }
         }
-
-        if success == 1 {
-            // Generate slide as multiple of granularity
-            (val % (max_slots + 1)) * KASLR_SLIDE_GRANULARITY
-        } else {
-            // RDRAND failed, disable KASLR
-            0
-        }
+        false
     }
 
     #[cfg(not(feature = "kaslr"))]
     {
-        // KASLR disabled: return 0 slide
-        0
+        false
     }
+}
+
+#[cfg(feature = "kaslr")]
+fn next_rdrand_u64() -> Option<u64> {
+    for _ in 0..10 {
+        let value: u64;
+        let success: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdrand {value}",
+                "setc {success}",
+                value = out(reg) value,
+                success = out(reg_byte) success,
+                options(nostack, nomem),
+            );
+        }
+        if success == 1 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "kaslr")]
+fn uniform_rdrand_below(upper: u64) -> Option<u64> {
+    assert!(upper > 0, "RDRAND bound must be non-zero");
+    let threshold = upper.wrapping_neg() % upper;
+    for _ in 0..32 {
+        let value = next_rdrand_u64()?;
+        if value >= threshold {
+            return Some(value % upper);
+        }
+    }
+    None
+}
+
+/// RF180-32 FIX: build a complete exact-address candidate order.
+///
+/// With healthy entropy this is an unbiased Fisher-Yates permutation, so the
+/// first UEFI-allocatable member is uniform over the viable subset even when
+/// much of the configured window is absent. If CPUID, RDRAND, or any shuffle
+/// sample fails, discard the partial permutation and search every slot in a
+/// deterministic order for availability without claiming KASLR.
+fn kernel_placement_order() -> ([u16; KASLR_SLOT_COUNT], bool) {
+    let mut deterministic = [0u16; KASLR_SLOT_COUNT];
+    for (index, slot) in deterministic.iter_mut().enumerate() {
+        *slot = u16::try_from(index).expect("KASLR slot index exceeds u16");
+    }
+
+    #[cfg(feature = "kaslr")]
+    {
+        if !probe_rdrand_entropy() {
+            return (deterministic, false);
+        }
+        let mut shuffled = deterministic;
+        for upper in (2..=KASLR_SLOT_COUNT).rev() {
+            let Some(other) = uniform_rdrand_below(upper as u64) else {
+                return (deterministic, false);
+            };
+            shuffled.swap(upper - 1, other as usize);
+        }
+        (shuffled, true)
+    }
+
+    #[cfg(not(feature = "kaslr"))]
+    {
+        (deterministic, false)
+    }
+}
+
+/// RF180-32 FIX: allocate the kernel at an exact, relocatable address inside
+/// the initial high-half physical window.
+///
+/// UEFI `AllocateType::Address` is the allocation authority. A memory-map
+/// snapshot would introduce a stale-snapshot TOCTOU, so this consumes the
+/// complete candidate order above and lets exact allocation decide. The first
+/// exact allocation wins; no failed candidate publishes state.
+fn allocate_kernel_image_pages(
+    boot_services: &BootServices,
+    pages: usize,
+    alloc_bytes: u64,
+) -> (u64, u64, bool) {
+    assert!(
+        pages > 0,
+        "ELF kernel allocation must contain at least one page"
+    );
+    assert!(alloc_bytes > 0, "ELF kernel allocation must contain bytes");
+
+    let (order, randomized) = kernel_placement_order();
+
+    for (attempt, slot) in order.into_iter().enumerate() {
+        let slide = u64::from(slot)
+            .checked_mul(KASLR_SLIDE_GRANULARITY)
+            .expect("KASLR slot multiplication overflow");
+        let candidate = KERNEL_PHYS_BASE
+            .checked_add(slide)
+            .expect("KASLR physical base overflow");
+        let candidate_end = candidate
+            .checked_add(alloc_bytes)
+            .expect("KASLR physical extent overflow");
+        if candidate_end > KERNEL_PHYS_WINDOW_END {
+            continue;
+        }
+
+        match boot_services.allocate_pages(
+            AllocateType::Address(candidate),
+            MemoryType::LOADER_DATA,
+            pages,
+        ) {
+            Ok(allocated) => {
+                if allocated != candidate {
+                    let freed = unsafe { boot_services.free_pages(allocated, pages) };
+                    assert!(
+                        freed.is_ok(),
+                        "UEFI returned and retained an unexpected kernel allocation"
+                    );
+                    panic!("UEFI violated exact-address kernel allocation semantics");
+                }
+                #[cfg(debug_assertions)]
+                if attempt != 0 {
+                    info!(
+                        "Kernel placement used bounded fallback attempt {} of {}",
+                        attempt + 1,
+                        KASLR_SLOT_COUNT
+                    );
+                }
+                #[cfg(not(debug_assertions))]
+                if attempt != 0 {
+                    info!("Kernel placement used bounded exact-address fallback");
+                }
+                return (allocated, slide, randomized);
+            }
+            Err(error) => match error.status() {
+                uefi::Status::NOT_FOUND | uefi::Status::OUT_OF_RESOURCES => continue,
+                uefi::Status::INVALID_PARAMETER => {
+                    panic!("UEFI rejected a validated kernel allocation request")
+                }
+                _ => panic!("UEFI returned an unexpected kernel allocation failure"),
+            },
+        }
+    }
+
+    panic!(
+        "FATAL: no contiguous {}-page kernel range exists in the bounded {}-slot high-half window",
+        pages, KASLR_SLOT_COUNT
+    );
 }
 
 /// Locate the ACPI RSDP via the UEFI configuration table.
@@ -345,7 +490,8 @@ pub struct FramebufferInfo {
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
     pub framebuffer: FramebufferInfo,
-    /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
+    /// R39-7/RF180-32: relocation slide. Randomization is reported separately
+    /// in `kaslr_flags`; zero is a valid randomly selected slot.
     pub kaslr_slide: u64,
     /// ACPI RSDP physical address (from UEFI configuration table)
     pub rsdp_address: u64,
@@ -360,6 +506,10 @@ pub struct BootInfo {
     pub kernel_phys_size: u64,
     /// R167-C: BootInfo ABI version (see `BOOT_INFO_VERSION`).
     pub version: u64,
+    /// RF180-32: placement provenance flags. `BOOT_INFO_KASLR_RANDOMIZED`
+    /// means the complete candidate order was uniformly randomized; the slide
+    /// alone never proves KASLR because deterministic relocation is permitted.
+    pub kaslr_flags: u64,
 }
 
 #[entry]
@@ -369,9 +519,9 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     info!("Rust Microkernel Bootloader v0.1");
     info!("Initializing...");
 
-    // R39-7 FIX: Get entry point, KASLR slide, and kernel size from loading block
+    // R39-7/RF180-32: get entry, relocation slide, image size, and provenance.
     // Codex Review Fix: kernel_size needed for accurate page table setup
-    let (entry_point, kaslr_slide, kernel_size) = {
+    let (entry_point, kaslr_slide, kernel_size, kaslr_randomized) = {
         let boot_services = system_table.boot_services();
 
         let fs_handle = boot_services
@@ -484,9 +634,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         //
         // Text KASLR: The kernel is compiled as a static PIE with
         // `-C relocation-model=pie`. The bootloader:
-        //   1. Generates a 2 MiB-aligned random slide (0 when feature disabled)
-        //   2. Attempts to allocate at KERNEL_PHYS_BASE + slide
-        //   3. Falls back to KERNEL_PHYS_BASE (slide=0) on allocation failure
+        //   1. Builds an unbiased random permutation of every 2 MiB slot when
+        //      RDRAND is healthy; otherwise uses a deterministic full search
+        //   2. Lets exact UEFI allocation choose the first available slot
+        //   3. Carries randomization provenance separately from relocation
         //   4. Loads LOAD segments into the allocated region
         //   5. Applies .rela.dyn R_X86_64_RELATIVE relocations with slide as load_bias
         //   6. Jumps to entry_point + slide
@@ -506,14 +657,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             .checked_mul(0x1000)
             .expect("Kernel allocation pages * 0x1000 overflow");
 
-        let mut kaslr_slide = generate_kaslr_slide();
-        let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
-
         // R119-1 FIX: Gate physical addresses and KASLR slide behind debug_assertions
         #[cfg(debug_assertions)]
         info!(
-            "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
-            pages, kernel_size, kernel_phys_base, kaslr_slide
+            "Allocating {} pages ({} bytes) for kernel",
+            pages, kernel_size
         );
         #[cfg(not(debug_assertions))]
         info!(
@@ -521,55 +669,27 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             pages, kernel_size
         );
 
-        // Try to allocate at the slid address; fall back to fixed base on failure.
-        // UEFI firmware or reserved regions may overlap the slid range.
-        let actual_phys_base = loop {
-            match boot_services.allocate_pages(
-                AllocateType::Address(kernel_phys_base),
-                MemoryType::LOADER_DATA,
-                pages,
-            ) {
-                Ok(_) => break kernel_phys_base,
-                Err(status) => {
-                    if kaslr_slide == 0 {
-                        panic!(
-                                "FATAL: Cannot allocate kernel memory at 0x{:x}: {:?}. \
-                                 Page table mappings require kernel within the 1 GiB high-half \
-                                 identity region. Ensure no UEFI runtime or reserved regions overlap.",
-                                kernel_phys_base, status
-                            );
-                    }
-                    // Slid allocation failed — fall back to deterministic base
-                    // R119-1 FIX: Gate addresses behind debug_assertions
-                    #[cfg(debug_assertions)]
-                    info!(
-                            "KASLR allocation at 0x{:x} failed ({:?}) — falling back to fixed base 0x{:x}",
-                            kernel_phys_base, status, KERNEL_PHYS_BASE
-                        );
-                    #[cfg(not(debug_assertions))]
-                    info!(
-                        "KASLR allocation failed ({:?}) — falling back to fixed base",
-                        status
-                    );
-                    kaslr_slide = 0;
-                    kernel_phys_base = KERNEL_PHYS_BASE;
-                }
-            }
-        };
+        let (actual_phys_base, kaslr_slide, kaslr_randomized) = allocate_kernel_image_pages(
+            boot_services,
+            pages,
+            u64::try_from(alloc_bytes).expect("kernel allocation size exceeds u64"),
+        );
 
         // R119-1 FIX: Gate allocated address and slide behind debug_assertions
         #[cfg(debug_assertions)]
         info!(
-            "Kernel memory allocated at 0x{:x} (final slide=0x{:x})",
-            actual_phys_base, kaslr_slide
+            "Kernel memory allocated at 0x{:x} (final slide=0x{:x}, randomized={})",
+            actual_phys_base, kaslr_slide, kaslr_randomized
         );
         #[cfg(not(debug_assertions))]
         info!(
-            "Kernel memory allocated (KASLR {})",
-            if kaslr_slide != 0 {
-                "active"
+            "Kernel memory allocated ({})",
+            if kaslr_randomized {
+                "randomized placement"
+            } else if kaslr_slide != 0 {
+                "deterministic availability relocation"
             } else {
-                "inactive"
+                "fixed placement"
             }
         );
 
@@ -683,14 +803,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         );
         #[cfg(not(debug_assertions))]
         info!(
-            "ELF entry point resolved (KASLR {})",
-            if kaslr_slide != 0 {
-                "applied"
+            "ELF entry point resolved ({})",
+            if kaslr_randomized {
+                "randomized placement"
+            } else if kaslr_slide != 0 {
+                "deterministic availability relocation"
             } else {
-                "inactive"
+                "fixed placement"
             }
         );
-        (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
+        (adjusted_entry, kaslr_slide, kernel_size, kaslr_randomized)
     };
 
     // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
@@ -1002,11 +1124,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             rsdp_address, // ACPI RSDP for SMP CPU enumeration
             cmdline_len,  // P1-1: Boot command line
             cmdline,
-            // R167-C: kernel image physical range, for the kernel's reservation-
-            // aware buddy allocator. kaslr_slide==0 on the fallback (no-KASLR) path.
+            // R167-C/RF180-32: exact kernel image range for reservation-aware
+            // MM. The slide records relocation; flags record whether it was random.
             kernel_phys_base: KERNEL_PHYS_BASE + kaslr_slide,
             kernel_phys_size: kernel_size as u64,
             version: BOOT_INFO_VERSION,
+            kaslr_flags: if kaslr_randomized {
+                BOOT_INFO_KASLR_RANDOMIZED
+            } else {
+                0
+            },
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

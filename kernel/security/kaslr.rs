@@ -98,21 +98,6 @@ static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether PCID is enabled (set during init if CPU supports it)
 static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// R102-11: Whether KASLR must fail-closed on RNG failure (Secure profile).
-///
-/// When true, `generate_kaslr_slide()` will panic instead of falling back to
-/// a deterministic layout. Set via `set_kaslr_fail_closed()` during security
-/// initialization based on the selected hardening profile.
-static KASLR_FAIL_CLOSED: AtomicBool = AtomicBool::new(false);
-
-/// Configure whether KASLR slide generation should fail closed.
-///
-/// Called by `security::init()` based on the hardening profile:
-/// `true` for Secure, `false` for Balanced/Performance.
-pub fn set_kaslr_fail_closed(fail_closed: bool) {
-    KASLR_FAIL_CLOSED.store(fail_closed, Ordering::Release);
-}
-
 // ============================================================================
 // Partial KASLR Feature Flags
 // ============================================================================
@@ -224,12 +209,23 @@ pub enum PartialKaslrFeature {
 /// address by the bootloader's `.rela.dyn` relocation engine.
 #[derive(Debug, Clone, Copy)]
 pub struct TextKaslrStatus {
-    /// True when the kernel image is slid by a non-zero offset.
+    /// True when the bootloader completed an unbiased randomized placement.
+    /// The selected slide may legitimately be zero.
     pub enabled: bool,
-    /// Slide applied to the kernel image (bytes). 0 when disabled.
+    /// Relocation slide applied to the kernel image (bytes). A non-zero value
+    /// may be deterministic availability relocation when `enabled` is false.
     pub slide: u64,
     /// Whether `slide` respects the 2 MiB granularity contract.
     pub slide_aligned_2m: bool,
+}
+
+/// Version-validated bootloader placement state.
+#[derive(Debug, Clone, Copy)]
+pub struct BootKaslrState {
+    /// Actual relocation slide reported by the bootloader.
+    pub slide: u64,
+    /// True only when BootInfo provenance attests a complete unbiased shuffle.
+    pub randomized: bool,
 }
 
 // ============================================================================
@@ -337,16 +333,15 @@ pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xffffffff80000000;
 
 /// Kernel layout information
 ///
-/// This struct provides runtime information about the kernel's location
-/// in memory. Currently uses fixed values; will support randomized layout
-/// when KASLR is implemented.
+/// This struct provides runtime information about the kernel's actual location
+/// in memory. Randomization provenance is deliberately stored outside the
+/// numeric slide; use `is_kaslr_enabled()` for the security verdict.
 ///
 /// # Section Fields
 ///
 /// The section fields (text_start, rodata_start, etc.) are currently set to
-/// placeholder values. They will be populated from linker symbols when
-/// KASLR is implemented. Do not rely on these for bounds checking until
-/// they are properly initialized.
+/// placeholder values until early initialization populates them from linker
+/// symbols. Do not rely on them before `init()` completes.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelLayout {
     /// Virtual base address of the kernel (high-half mapping)
@@ -355,7 +350,8 @@ pub struct KernelLayout {
     /// Physical base address where kernel is loaded
     pub phys_base: u64,
 
-    /// KASLR slide value (0 = no randomization)
+    /// Relocation slide. Zero is a valid uniformly selected placement and a
+    /// non-zero slide may be deterministic availability relocation.
     pub kaslr_slide: u64,
 
     /// Virtual address of kernel text section start
@@ -473,9 +469,10 @@ impl KernelLayout {
         }
     }
 
-    /// Check if this layout has KASLR enabled
+    /// Check whether the image was relocated away from its link-time slot.
+    /// This is not a KASLR verdict; use `is_kaslr_enabled()` for provenance.
     #[inline]
-    pub fn has_kaslr(&self) -> bool {
+    pub fn is_relocated(&self) -> bool {
         self.kaslr_slide != 0
     }
 
@@ -583,10 +580,23 @@ fn build_kernel_layout_from_linker() -> KernelLayout {
 }
 
 /// Update the global kernel layout from linker symbols
-fn set_kernel_layout(layout: KernelLayout) {
-    KASLR_ENABLED.store(layout.kaslr_slide != 0, Ordering::SeqCst);
+fn set_kernel_layout(layout: KernelLayout, randomized: bool) {
+    // RF180-32: relocation and randomization are separate facts. In
+    // particular, deterministic availability relocation must not satisfy the
+    // Secure-profile KASLR gate, while a uniformly selected zero slide does.
+    KASLR_ENABLED.store(randomized, Ordering::SeqCst);
     let mut guard = KERNEL_LAYOUT.lock();
     *guard = layout;
+}
+
+#[inline]
+fn boot_randomization_verified(boot_state: Option<BootKaslrState>, runtime_slide: u64) -> bool {
+    boot_state.is_some_and(|state| {
+        state.randomized
+            && state.slide == runtime_slide
+            && state.slide <= KASLR_MAX_SLIDE
+            && state.slide.is_multiple_of(KASLR_SLIDE_GRANULARITY)
+    })
 }
 
 // ============================================================================
@@ -1022,14 +1032,13 @@ pub fn partial_kaslr_status() -> PartialKaslrStatus {
 
 /// Get text KASLR status (kernel image slide).
 ///
-/// Returns the slide value passed by the bootloader via `BootInfo::kaslr_slide`.
-/// When non-zero, the kernel image was loaded at a randomized physical address
-/// and all absolute addresses were patched by the bootloader's `.rela.dyn`
-/// relocation engine.
+/// The slide and randomization provenance are independent: deterministic
+/// relocation can be non-zero, and an unbiased random selection can choose
+/// the zero slot.
 pub fn text_kaslr_status() -> TextKaslrStatus {
     let slide = get_kernel_layout().kaslr_slide;
     TextKaslrStatus {
-        enabled: slide != 0,
+        enabled: is_kaslr_enabled(),
         slide,
         slide_aligned_2m: slide % KASLR_SLIDE_GRANULARITY == 0,
     }
@@ -1056,17 +1065,6 @@ pub fn enable_partial_kaslr(feature: PartialKaslrFeature) {
 /// if KASLR was enabled during initialization.
 pub fn get_kernel_layout() -> KernelLayout {
     *KERNEL_LAYOUT.lock()
-}
-
-/// Enable KASLR (called by bootloader/early init)
-///
-/// # Safety
-///
-/// This should only be called once during boot, before any code
-/// relies on the kernel layout. Once enabled, KASLR cannot be disabled.
-#[allow(dead_code)]
-pub fn enable_kaslr() {
-    KASLR_ENABLED.store(true, Ordering::SeqCst);
 }
 
 /// Enable KPTI (called during security init)
@@ -1288,82 +1286,6 @@ pub fn allocated_pcid_count() -> usize {
 }
 
 // ============================================================================
-// KASLR Slide Generation
-// ============================================================================
-
-/// Convert a slot number to a KASLR slide value
-///
-/// Ensures the slide is 2 MiB aligned and within the maximum range.
-fn slide_from_slot(slot: u64) -> u64 {
-    let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
-    let bounded_slot = slot % (max_slots + 1);
-    bounded_slot * KASLR_SLIDE_GRANULARITY
-}
-
-/// Generate a random KASLR slide using the CSPRNG
-///
-/// R101-8 FIX: Emits a prominent boot-time warning on RNG failure instead of
-/// silently falling back to slide=0. A deterministic kernel memory layout is
-/// a significant security regression that must be visible to operators.
-fn generate_kaslr_slide() -> u64 {
-    let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
-
-    match rng::random_range(max_slots + 1) {
-        Ok(slot) => slide_from_slot(slot),
-        Err(_) => {
-            // R102-11 FIX: Secure profile must not tolerate deterministic layout.
-            if KASLR_FAIL_CLOSED.load(Ordering::Acquire) {
-                panic!(
-                    "KASLR RNG failure under Secure profile — refusing deterministic kernel layout"
-                );
-            }
-            // R101-8 FIX: Warn loudly instead of silent fallback
-            // Must be visible to operators even in release builds.
-            klog!(
-                Warn,
-                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-            );
-            klog!(
-                Warn,
-                "!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!"
-            );
-            klog!(
-                Warn,
-                "!! The kernel is booting with a DETERMINISTIC memory !!"
-            );
-            klog!(
-                Warn,
-                "!! layout. This severely weakens exploit mitigation. !!"
-            );
-            klog!(
-                Warn,
-                "!! Ensure hardware RNG (RDRAND) is available.        !!"
-            );
-            klog!(
-                Warn,
-                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-            );
-            0
-        }
-    }
-}
-
-/// Apply a KASLR slide to the global kernel layout
-///
-/// If slide is 0, KASLR is disabled and the fixed layout is used.
-fn apply_kaslr_slide(slide: u64) {
-    let mut layout = KERNEL_LAYOUT.lock();
-
-    if slide != 0 {
-        *layout = KernelLayout::with_slide(slide);
-        KASLR_ENABLED.store(true, Ordering::SeqCst);
-    } else {
-        *layout = KernelLayout::fixed();
-        KASLR_ENABLED.store(false, Ordering::SeqCst);
-    }
-}
-
-// ============================================================================
 // Trampoline Support (Preparation for KPTI)
 // ============================================================================
 
@@ -1419,7 +1341,8 @@ impl TrampolineDesc {
 ///
 /// # Arguments
 ///
-/// * `boot_slide` - Optional KASLR slide value from bootloader (R39-7 FIX)
+/// * `boot_state` - Optional relocation slide plus validated randomization
+///   provenance from BootInfo (R39-7/RF180-32)
 ///
 /// # R25-11 Fix
 ///
@@ -1431,7 +1354,7 @@ impl TrampolineDesc {
 ///
 /// Now accepts the KASLR slide from the bootloader's BootInfo structure
 /// and verifies it matches the runtime-detected slide from linker symbols.
-pub fn init(boot_slide: Option<u64>) {
+pub fn init(boot_state: Option<BootKaslrState>) {
     // Step 1: Enable PCID if CPU supports it
     let pcid_enabled = enable_pcid_if_supported();
 
@@ -1439,15 +1362,18 @@ pub fn init(boot_slide: Option<u64>) {
     // This populates section bounds accurately even without bootloader-assisted KASLR
     let layout = build_kernel_layout_from_linker();
 
-    // R39-7 FIX: Verify bootloader slide matches runtime-detected slide
-    if let Some(expected) = boot_slide {
-        if expected != 0 && expected != layout.kaslr_slide {
+    // R39-7/RF180-32: verify the relocation claim before trusting its
+    // provenance. Any mismatch demotes text KASLR to disabled; Secure policy
+    // will then fail closed after this function returns.
+    let randomized = boot_randomization_verified(boot_state, layout.kaslr_slide);
+    if let Some(state) = boot_state {
+        if state.slide != layout.kaslr_slide {
             // R101-2 FIX: Gate address-containing messages behind debug_assertions.
             // KASLR slide values are security-sensitive and must not leak in production.
             #[cfg(debug_assertions)]
             kprintln!(
                 "  ! KASLR slide mismatch: bootloader=0x{:x}, runtime=0x{:x}",
-                expected,
+                state.slide,
                 layout.kaslr_slide
             );
             #[cfg(not(debug_assertions))]
@@ -1455,10 +1381,15 @@ pub fn init(boot_slide: Option<u64>) {
                 Info,
                 "  ! KASLR slide mismatch detected (details hidden in release mode)"
             );
+        } else if state.randomized && !randomized {
+            klog!(
+                Info,
+                "  ! KASLR provenance rejected: slide violates the bounded alignment contract"
+            );
         }
     }
 
-    set_kernel_layout(layout);
+    set_kernel_layout(layout, randomized);
 
     // Step 3: Generate kernel stack base slide using CSPRNG
     let kstack_slide = generate_kstack_slide();
@@ -1492,22 +1423,24 @@ pub fn init(boot_slide: Option<u64>) {
     #[cfg(debug_assertions)]
     {
         kprintln!(
-            "  Text KASLR: {} (slide: 0x{:x})",
+            "  Text KASLR: {} (slide: 0x{:x}, relocation: {})",
+            if randomized { "enabled" } else { "disabled" },
+            layout.kaslr_slide,
             if layout.kaslr_slide != 0 {
-                "enabled"
+                "non-zero"
             } else {
-                "disabled"
-            },
-            layout.kaslr_slide
+                "zero"
+            }
         );
     }
     #[cfg(not(debug_assertions))]
     klog_always!(
-        "  Text KASLR: {}",
-        if layout.kaslr_slide != 0 {
-            "enabled"
+        "  Text KASLR: {}{}",
+        if randomized { "enabled" } else { "disabled" },
+        if !randomized && layout.kaslr_slide != 0 {
+            " (deterministic availability relocation)"
         } else {
-            "disabled"
+            ""
         }
     );
     // Report Partial KASLR status
@@ -1563,7 +1496,7 @@ mod tests {
         assert_eq!(layout.virt_base, KERNEL_VIRT_BASE);
         assert_eq!(layout.phys_base, KERNEL_PHYS_BASE);
         assert_eq!(layout.kaslr_slide, 0);
-        assert!(!layout.has_kaslr());
+        assert!(!layout.is_relocated());
     }
 
     #[test]
@@ -1574,7 +1507,47 @@ mod tests {
         assert_eq!(layout.virt_base, KERNEL_VIRT_BASE);
         assert_eq!(layout.phys_base, KERNEL_PHYS_BASE + slide);
         assert_eq!(layout.kaslr_slide, slide);
-        assert!(layout.has_kaslr());
+        assert!(layout.is_relocated());
+    }
+
+    #[test]
+    fn test_boot_randomization_provenance_is_independent_of_slide() {
+        let relocated = 0x20_0000;
+        assert!(!boot_randomization_verified(
+            Some(BootKaslrState {
+                slide: relocated,
+                randomized: false,
+            }),
+            relocated,
+        ));
+        assert!(boot_randomization_verified(
+            Some(BootKaslrState {
+                slide: 0,
+                randomized: true,
+            }),
+            0,
+        ));
+        assert!(!boot_randomization_verified(
+            Some(BootKaslrState {
+                slide: relocated,
+                randomized: true,
+            }),
+            relocated + KASLR_SLIDE_GRANULARITY,
+        ));
+        assert!(!boot_randomization_verified(
+            Some(BootKaslrState {
+                slide: 1,
+                randomized: true,
+            }),
+            1,
+        ));
+        assert!(!boot_randomization_verified(
+            Some(BootKaslrState {
+                slide: KASLR_MAX_SLIDE + KASLR_SLIDE_GRANULARITY,
+                randomized: true,
+            }),
+            KASLR_MAX_SLIDE + KASLR_SLIDE_GRANULARITY,
+        ));
     }
 
     #[test]
@@ -1598,51 +1571,6 @@ mod tests {
         let ctx = KptiContext::dual(0x12345000, 0x67890000, 1);
         assert_ne!(ctx.user_cr3, ctx.kernel_cr3);
         assert!(ctx.has_kpti());
-    }
-
-    #[test]
-    fn test_slide_from_slot_alignment() {
-        // Test that slides are properly aligned to 2 MiB
-        for slot in 0..10 {
-            let slide = slide_from_slot(slot);
-            assert_eq!(
-                slide % KASLR_SLIDE_GRANULARITY,
-                0,
-                "Slide 0x{:x} should be 2 MiB aligned",
-                slide
-            );
-            assert!(
-                slide <= KASLR_MAX_SLIDE,
-                "Slide 0x{:x} should be <= max 0x{:x}",
-                slide,
-                KASLR_MAX_SLIDE
-            );
-        }
-    }
-
-    #[test]
-    fn test_slide_from_slot_wraps() {
-        // Test that slot values beyond max wrap correctly
-        let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
-        let slide = slide_from_slot(max_slots + 10);
-        assert!(
-            slide <= KASLR_MAX_SLIDE,
-            "Wrapped slide 0x{:x} should be <= max 0x{:x}",
-            slide,
-            KASLR_MAX_SLIDE
-        );
-        assert_eq!(
-            slide % KASLR_SLIDE_GRANULARITY,
-            0,
-            "Wrapped slide should still be aligned"
-        );
-    }
-
-    #[test]
-    fn test_slide_zero_is_valid() {
-        // Slot 0 should produce slide 0 (no KASLR)
-        let slide = slide_from_slot(0);
-        assert_eq!(slide, 0);
     }
 
     #[test]
