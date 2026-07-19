@@ -60,7 +60,7 @@
 
 use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
-use spin::Once;
+use spin::{Mutex, Once};
 use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
 use crate::{buddy_allocator, PHYSICAL_MEMORY_OFFSET};
@@ -114,7 +114,7 @@ pub enum DmaError {
 // IOMMU Hooks (Dependency Inversion)
 // ============================================================================
 
-/// IOMMU operations registered by the IOMMU subsystem after successful init.
+/// IOMMU operations registered by the IOMMU subsystem during fail-closed probe.
 ///
 /// This struct uses function pointers to avoid a circular dependency between
 /// the `mm` and `iommu` crates. The IOMMU crate registers these hooks during
@@ -130,23 +130,152 @@ pub struct IommuOps {
     pub unmap_range: fn(DomainId, u64, usize) -> Result<(), DmaError>,
 }
 
+impl IommuOps {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.kernel_domain_id == other.kernel_domain_id
+            && ptr::fn_addr_eq(self.map_range, other.map_range)
+            && ptr::fn_addr_eq(self.unmap_range, other.unmap_range)
+    }
+}
+
+impl Clone for IommuOps {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for IommuOps {}
+
+/// RF180-31: DMA allocation must not fall back to legacy identity DMA while
+/// VT-d discovery or publication is in flight. The state transition and the
+/// allocator's final disposition are serialized by `IOMMU_GATE`, closing the
+/// check-to-return race that an atomic-only post-allocation recheck leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IommuGateState {
+    Legacy,
+    Probing,
+    Active,
+    Failed,
+}
+
+impl IommuGateState {
+    const fn begin_probe(self) -> Option<Self> {
+        match self {
+            Self::Legacy => Some(Self::Probing),
+            Self::Probing | Self::Active | Self::Failed => None,
+        }
+    }
+
+    const fn finish_without_hardware(self, ops_registered: bool) -> Option<Self> {
+        match (self, ops_registered) {
+            (Self::Probing, false) => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+
+    const fn fail_probe(self) -> Self {
+        match self {
+            Self::Active => Self::Active,
+            Self::Legacy | Self::Probing | Self::Failed => Self::Failed,
+        }
+    }
+
+    const fn can_register_ops(self) -> bool {
+        matches!(self, Self::Probing)
+    }
+
+    const fn can_commit_active(self, ops_registered: bool) -> bool {
+        matches!(self, Self::Probing) && ops_registered
+    }
+}
+
+struct IommuGate {
+    state: IommuGateState,
+}
+
+static IOMMU_GATE: Mutex<IommuGate> = Mutex::new(IommuGate {
+    state: IommuGateState::Legacy,
+});
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IommuGateError {
+    InvalidTransition,
+    ConflictingOps,
+}
+
 /// Global IOMMU operations registered by the IOMMU subsystem.
 ///
-/// `None` indicates no IOMMU is available (legacy mode).
+/// `None` is valid only in the `Legacy` or early `Probing` states. Allocation
+/// consults `IOMMU_GATE`; absence never implies legacy mode by itself.
 static IOMMU_OPS: Once<IommuOps> = Once::new();
 
-/// Register IOMMU operations for DMA mapping.
-///
-/// Called by the IOMMU subsystem once during successful initialization.
-/// Subsequent calls are ignored (first registration wins).
-pub fn register_iommu_ops(ops: IommuOps) {
-    IOMMU_OPS.call_once(|| ops);
+/// Enter the fail-closed IOMMU probing state before reading firmware tables.
+pub fn begin_iommu_probe() -> Result<(), IommuGateError> {
+    let mut gate = IOMMU_GATE.lock();
+    gate.state = gate
+        .state
+        .begin_probe()
+        .ok_or(IommuGateError::InvalidTransition)?;
+    Ok(())
+}
+
+/// Roll back to legacy DMA only when firmware proves that no IOMMU exists and
+/// no hooks were installed. Malformed/present hardware must use `fail_iommu_probe`.
+pub fn finish_iommu_probe_without_hardware() -> Result<(), IommuGateError> {
+    let mut gate = IOMMU_GATE.lock();
+    gate.state = gate
+        .state
+        .finish_without_hardware(IOMMU_OPS.get().is_some())
+        .ok_or(IommuGateError::InvalidTransition)?;
+    Ok(())
+}
+
+/// Make every subsequent DMA allocation fail closed after an initialization
+/// error. Active IOMMU operation is never downgraded by this init-only API.
+pub fn fail_iommu_probe() {
+    let mut gate = IOMMU_GATE.lock();
+    gate.state = gate.state.fail_probe();
+}
+
+/// Register and identity-verify the dependency-inversion hooks while probing.
+/// A conflicting prior registration is terminal rather than first-wins silent.
+pub fn register_iommu_ops(ops: IommuOps) -> Result<(), IommuGateError> {
+    let gate = IOMMU_GATE.lock();
+    if !gate.state.can_register_ops() {
+        return Err(IommuGateError::InvalidTransition);
+    }
+    let expected = ops;
+    let installed = IOMMU_OPS.call_once(|| ops);
+    if !installed.same_identity(&expected) {
+        return Err(IommuGateError::ConflictingOps);
+    }
+    Ok(())
+}
+
+/// True once the expected hook identity has been installed, even while the
+/// allocation gate remains in `Probing`.
+#[inline]
+pub fn iommu_ops_registered() -> bool {
+    IOMMU_OPS.get().is_some()
+}
+
+/// Publish the caller's core-IOMMU readiness atomics and the DMA `Active` edge
+/// under the same gate that serializes final legacy allocation disposition.
+pub fn commit_iommu_probe(publish_core_readiness: impl FnOnce()) -> Result<(), IommuGateError> {
+    let mut gate = IOMMU_GATE.lock();
+    if !gate.state.can_commit_active(IOMMU_OPS.get().is_some()) {
+        return Err(IommuGateError::InvalidTransition);
+    }
+    publish_core_readiness();
+    gate.state = IommuGateState::Active;
+    Ok(())
 }
 
 /// Check if IOMMU operations are registered.
 #[inline]
 pub fn is_iommu_enabled() -> bool {
-    IOMMU_OPS.get().is_some()
+    let gate = IOMMU_GATE.lock();
+    matches!(gate.state, IommuGateState::Active) && IOMMU_OPS.get().is_some()
 }
 
 // ============================================================================
@@ -156,7 +285,7 @@ pub fn is_iommu_enabled() -> bool {
 /// A physically-contiguous DMA buffer with an (optional) IOMMU mapping.
 ///
 /// When dropped, the buffer is automatically:
-/// 1. Unmapped from the IOMMU domain (if IOMMU is enabled)
+/// 1. Unmapped from the IOMMU domain (only if this buffer owns a mapping)
 /// 2. Securely zeroed (defense-in-depth against info leaks)
 /// 3. Returned to the physical page allocator
 ///
@@ -205,6 +334,9 @@ pub struct DmaBuffer {
     size: usize,
     /// Domain ID this buffer is mapped in.
     domain_id: DomainId,
+    /// Exact ownership proof for the IOMMU mapping. A legacy buffer may outlive
+    /// later hook installation and must never unmap an entry it did not create.
+    iommu_mapped: bool,
 }
 
 impl DmaBuffer {
@@ -298,7 +430,18 @@ impl Drop for DmaBuffer {
         };
 
         // Step 1: Unmap from IOMMU domain first (prevents DMA into freed memory).
-        if let Some(ops) = IOMMU_OPS.get() {
+        // RF180-31: consult hooks only when this exact buffer successfully
+        // published a mapping. Legacy buffers can outlive later hook install.
+        if self.iommu_mapped {
+            let Some(ops) = IOMMU_OPS.get() else {
+                scrub_range(self.phys, alloc_bytes);
+                kprintln!(
+                    "[DMA] WARNING: mapped buffer lost IOMMU ops for iova={:#x} size={}, leaking pages",
+                    self.iova,
+                    self.size
+                );
+                return;
+            };
             if (ops.unmap_range)(self.domain_id, self.iova, self.size).is_err() {
                 // IOMMU unmap failed - scrub and leak pages to prevent reuse
                 // under an unknown DMA state. This is fail-safe behavior.
@@ -382,6 +525,20 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
         return Err(DmaError::InvalidSize);
     }
 
+    // Fast rejection before touching the buddy allocator. The final decision
+    // is repeated under the same gate after allocation to close Legacy->Probing
+    // races; this first check avoids needless allocation/scrubbing in steady
+    // Probing/Failed states.
+    {
+        let gate = IOMMU_GATE.lock();
+        if matches!(gate.state, IommuGateState::Probing | IommuGateState::Failed) {
+            return Err(DmaError::IommuMapRejected);
+        }
+        if matches!(gate.state, IommuGateState::Active) && IOMMU_OPS.get().is_none() {
+            return Err(DmaError::IommuMapRejected);
+        }
+    }
+
     // Allocate physical pages from the buddy allocator.
     let frame = buddy_allocator::alloc_physical_pages(pages).ok_or(DmaError::NoMem)?;
     let phys = frame.start_address().as_u64();
@@ -418,38 +575,78 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
     // Identity IOVA strategy: keep driver-facing DMA addresses unchanged.
     // This simplifies driver code since iova == phys.
     let iova = phys;
-    let domain_id = IOMMU_OPS.get().map(|ops| ops.kernel_domain_id).unwrap_or(0);
 
-    // On-demand IOMMU mapping (only if IOMMU ops registered).
-    if let Some(ops) = IOMMU_OPS.get() {
-        if let Err(e) = (ops.map_range)(domain_id, iova, phys, size, true) {
-            // Always scrub before handling error
-            scrub_range(phys, alloc_bytes);
-
-            // R95-4 FIX: Classify error and decide whether to free or leak pages
-            match e {
-                DmaError::IommuMapRejected => {
-                    // Safe error: no mapping was installed, we can free the pages
-                    kprintln!(
-                        "[DMA] INFO: IOMMU map rejected for phys={:#x} size={}, freeing pages",
-                        phys,
-                        size
-                    );
+    // Linearize the final legacy-vs-IOMMU disposition against begin/commit/fail
+    // transitions. A buffer constructed under Legacy is committed before the
+    // gate is released; a transition that wins first makes this allocation fail.
+    let active_ops = {
+        let gate = IOMMU_GATE.lock();
+        match gate.state {
+            IommuGateState::Legacy => {
+                if IOMMU_OPS.get().is_some() {
+                    drop(gate);
+                    scrub_range(phys, alloc_bytes);
                     buddy_allocator::free_physical_pages(frame, pages);
+                    return Err(DmaError::IommuMapRejected);
                 }
-                _ => {
-                    // Only IommuMapRejected proves that no mapping was installed.
-                    // Every other (including future) error has uncertain mapping
-                    // state, so leak the pages to prevent DMA into reused memory.
-                    kprintln!(
-                        "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
-                        phys,
-                        size
-                    );
-                }
+                let buffer = DmaBuffer {
+                    phys,
+                    iova,
+                    size,
+                    domain_id: 0,
+                    iommu_mapped: false,
+                };
+                drop(gate);
+                return Ok(buffer);
             }
-            return Err(e);
+            IommuGateState::Probing | IommuGateState::Failed => {
+                drop(gate);
+                scrub_range(phys, alloc_bytes);
+                buddy_allocator::free_physical_pages(frame, pages);
+                return Err(DmaError::IommuMapRejected);
+            }
+            IommuGateState::Active => match IOMMU_OPS.get() {
+                Some(ops) => ops,
+                None => {
+                    drop(gate);
+                    scrub_range(phys, alloc_bytes);
+                    buddy_allocator::free_physical_pages(frame, pages);
+                    return Err(DmaError::IommuMapRejected);
+                }
+            },
         }
+    };
+    let domain_id = active_ops.kernel_domain_id;
+
+    // Active mode requires an on-demand IOMMU mapping. Only a successful map
+    // sets the buffer's ownership bit used by Drop.
+    if let Err(e) = (active_ops.map_range)(domain_id, iova, phys, size, true) {
+        // Always scrub before handling error
+        scrub_range(phys, alloc_bytes);
+
+        // R95-4 FIX: Classify error and decide whether to free or leak pages
+        match e {
+            DmaError::IommuMapRejected => {
+                // Safe error: no mapping was installed, we can free the pages
+                kprintln!(
+                    "[DMA] INFO: IOMMU map rejected for phys={:#x} size={}, freeing pages",
+                    phys,
+                    size
+                );
+                buddy_allocator::free_physical_pages(frame, pages);
+            }
+            _ => {
+                // Only IommuMapRejected proves that no mapping was installed.
+                // Every other (including future) error has uncertain mapping
+                // state, so leak the pages to prevent DMA into reused memory.
+                kprintln!(
+                    "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
+                    phys,
+                    size
+                );
+            }
+        }
+        return Err(e);
     }
 
     Ok(DmaBuffer {
@@ -457,6 +654,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
         iova,
         size,
         domain_id,
+        iommu_mapped: true,
     })
 }
 
@@ -484,4 +682,74 @@ pub fn stats() -> DmaStats {
 pub struct DmaStats {
     /// Whether IOMMU-backed allocation is active.
     pub iommu_enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_a(_: DomainId, _: u64, _: u64, _: usize, _: bool) -> Result<(), DmaError> {
+        Ok(())
+    }
+
+    fn map_b(_: DomainId, _: u64, _: u64, _: usize, _: bool) -> Result<(), DmaError> {
+        Ok(())
+    }
+
+    fn unmap_a(_: DomainId, _: u64, _: usize) -> Result<(), DmaError> {
+        Ok(())
+    }
+
+    #[test]
+    fn rf180_dma_gate_allows_only_absent_hardware_to_restore_legacy() {
+        let probing = IommuGateState::Legacy
+            .begin_probe()
+            .expect("legacy begins probing");
+        assert_eq!(
+            probing.finish_without_hardware(false),
+            Some(IommuGateState::Legacy)
+        );
+        assert_eq!(probing.finish_without_hardware(true), None);
+        assert_eq!(IommuGateState::Failed.finish_without_hardware(false), None);
+    }
+
+    #[test]
+    fn rf180_dma_gate_requires_verified_hooks_before_active_commit() {
+        let probing = IommuGateState::Legacy
+            .begin_probe()
+            .expect("legacy begins probing");
+        assert!(probing.can_register_ops());
+        assert!(!probing.can_commit_active(false));
+        assert!(probing.can_commit_active(true));
+        assert_eq!(probing.fail_probe(), IommuGateState::Failed);
+        assert_eq!(IommuGateState::Failed.fail_probe(), IommuGateState::Failed);
+        assert_eq!(IommuGateState::Active.fail_probe(), IommuGateState::Active);
+    }
+
+    #[test]
+    fn rf180_dma_hook_registration_rejects_conflicting_identity() {
+        let expected = IommuOps {
+            kernel_domain_id: 0,
+            map_range: map_a,
+            unmap_range: unmap_a,
+        };
+        let same = IommuOps {
+            kernel_domain_id: 0,
+            map_range: map_a,
+            unmap_range: unmap_a,
+        };
+        let wrong_domain = IommuOps {
+            kernel_domain_id: 1,
+            map_range: map_a,
+            unmap_range: unmap_a,
+        };
+        let wrong_map = IommuOps {
+            kernel_domain_id: 0,
+            map_range: map_b,
+            unmap_range: unmap_a,
+        };
+        assert!(expected.same_identity(&same));
+        assert!(!expected.same_identity(&wrong_domain));
+        assert!(!expected.same_identity(&wrong_map));
+    }
 }
