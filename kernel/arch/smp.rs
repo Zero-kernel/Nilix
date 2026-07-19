@@ -36,6 +36,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::apic;
+use crate::hpet;
 use crate::interrupts;
 use crate::syscall;
 use mm::page_table::recursive_pd;
@@ -83,6 +84,63 @@ const MAX_CPUS: usize = 64;
 
 /// Timeout for AP to signal ready (in spin iterations)
 const AP_READY_TIMEOUT: usize = 1_000_000;
+
+/// RF180-58 FIX: nominal wall-clock bound for the post-publication AP
+/// deferred-drain handshake.
+///
+/// The BSP-global software tick is not a valid deadline source here: its update
+/// depends on a timer interrupt which can be masked or stalled while this wait
+/// is in progress. HPET is used when it is initialized; the independent spin
+/// ceiling below remains a finite fail-closed fallback when HPET is absent.
+const PROCESS_DEFERRED_ACK_TIMEOUT_SECONDS: u64 = 30;
+const PROCESS_DEFERRED_ACK_MAX_SPINS: u64 = 250_000_000;
+
+#[derive(Clone, Copy)]
+struct ProcessDeferredAckDeadline {
+    start: u64,
+    ticks: u64,
+    counter_64bit: bool,
+}
+
+impl ProcessDeferredAckDeadline {
+    #[inline]
+    fn new() -> Option<Self> {
+        let info = hpet::info()?;
+        if info.frequency_hz == 0 {
+            return None;
+        }
+        let ticks = (info.frequency_hz as u128)
+            .checked_mul(PROCESS_DEFERRED_ACK_TIMEOUT_SECONDS as u128)?
+            .min(u64::MAX as u128) as u64;
+        if ticks == 0 {
+            return None;
+        }
+        // A 32-bit counter must not be allowed to wrap twice during the
+        // nominal deadline, otherwise elapsed-time subtraction is ambiguous.
+        if !info.counter_64bit && ticks > u32::MAX as u64 {
+            return None;
+        }
+        let start = hpet::read_main_counter()?;
+        Some(Self {
+            start,
+            ticks,
+            counter_64bit: info.counter_64bit,
+        })
+    }
+
+    #[inline]
+    fn expired(self) -> bool {
+        let Some(now) = hpet::read_main_counter() else {
+            return false;
+        };
+        let elapsed = if self.counter_64bit {
+            now.wrapping_sub(self.start)
+        } else {
+            (now as u32).wrapping_sub(self.start as u32) as u64
+        };
+        elapsed >= self.ticks
+    }
+}
 
 // ============================================================================
 // Trampoline Data Structure
@@ -578,6 +636,13 @@ static SMP_INIT_DONE: AtomicBool = AtomicBool::new(false);
 /// Total number of CPUs (including BSP)
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 
+/// RF180-54 FIX: exact post-publication acknowledgement bitmap.
+///
+/// Bit N is set by logical CPU N only after that AP completes one full
+/// process-context deferred drain. The BSP requires exact equality with the
+/// authoritative online-CPU mask (minus BSP bit 0) before admitting Ring-3.
+static PROCESS_DEFERRED_ACK_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// Physical address of the ACPI RSDP provided by the bootloader
 static RSDP_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 
@@ -784,6 +849,13 @@ pub fn start_aps() -> usize {
 
     // Enumerate all CPU LAPIC IDs
     let all_lapic_ids = enumerate_cpus();
+
+    // RF180-58 FIX: the BSP must appear exactly once. If firmware omits it, treating every
+    // MADT entry as an AP could send INIT/SIPI to the running BSP and corrupt
+    // the one-shot acknowledgement topology.
+    if all_lapic_ids.iter().filter(|id| **id == bsp_lapic).count() != 1 {
+        panic!("RF180-58: MADT does not contain exactly one BSP LAPIC identity");
+    }
 
     // Filter out BSP to get AP list
     let ap_lapic_ids: Vec<u32> = all_lapic_ids
@@ -1010,6 +1082,65 @@ pub fn smp_initialized() -> bool {
 #[inline]
 pub fn online_cpus() -> usize {
     TOTAL_CPUS.load(Ordering::Acquire)
+}
+
+/// Wait until every online AP has completed one full post-publication
+/// process-context deferred-work drain.
+///
+/// RF180-54: the BSP calls this with interrupts enabled after the readiness
+/// Release store and reschedule IPI, but before publishing Ring-3 runnable
+/// work. A missing, duplicate-topology, or out-of-range acknowledgement fails
+/// closed instead of allowing userspace to race incomplete AP initialization.
+pub fn wait_for_process_deferred_acknowledgements() {
+    if cpu_local::current_cpu_id() != 0 {
+        panic!("RF180-54: only the BSP may wait for AP deferred acknowledgements");
+    }
+    if !x86_64::instructions::interrupts::are_enabled() {
+        panic!("RF180-54: BSP deferred-ack wait requires interrupts enabled");
+    }
+    if !kernel_core::process_deferred_work_ready() {
+        panic!("RF180-54: deferred-ack wait ran before readiness publication");
+    }
+
+    let total = online_cpus();
+    if total == 0 || total > MAX_CPUS {
+        panic!("RF180-54: invalid online CPU count for deferred-ack wait");
+    }
+    let expected_online_mask = cpu_local::online_cpu_mask();
+    if expected_online_mask & 1 == 0 || expected_online_mask.count_ones() as usize != total {
+        panic!("RF180-54: inconsistent online CPU topology for deferred-ack wait");
+    }
+    let expected_ap_mask = expected_online_mask & !1u64;
+
+    // RF180-58: use an independently advancing hardware deadline when
+    // available, with the finite spin ceiling below as the fail-closed floor.
+    let deadline = ProcessDeferredAckDeadline::new();
+    let mut spins = 0u64;
+    loop {
+        let acknowledged = PROCESS_DEFERRED_ACK_MASK.load(Ordering::Acquire);
+        if acknowledged & !expected_ap_mask != 0 {
+            panic!("RF180-54: invalid CPU acknowledged the deferred-work gate");
+        }
+        if acknowledged == expected_ap_mask {
+            break;
+        }
+        spins = spins.saturating_add(1);
+        if spins >= PROCESS_DEFERRED_ACK_MAX_SPINS
+            || deadline.map(|value| value.expired()).unwrap_or(false)
+        {
+            panic!("RF180-58: timed out waiting for AP deferred-work acknowledgements");
+        }
+        core::hint::spin_loop();
+    }
+
+    let ap_count = total - 1;
+    // One BSP-owned line replaces concurrent per-AP serial logging, whose byte
+    // streams can interleave and corrupt an otherwise successful 4-core gate.
+    klog_always!(
+        "[SMP] process-deferred gate complete: {}/{} APs acknowledged",
+        ap_count,
+        ap_count
+    );
 }
 
 // ============================================================================
@@ -1242,17 +1373,19 @@ pub extern "C" fn ap_rust_entry(
 /// R70-1 FIX: Race-free idle loop.
 ///
 /// The original implementation had a race condition:
-/// 1. Check reschedule_if_needed() -> returns (no work)
+/// 1. Complete the IRQ-enabled deferred drain, then check `need_resched`.
 /// 2. [IPI arrives, sets need_resched=true, handler runs and returns]
 /// 3. sti; hlt executes -> CPU halts with work pending!
 ///
-/// Fix: Disable interrupts during the scheduling check, then use atomic
-/// sti;hlt sequence. On x86, STI enables interrupts starting with the
-/// NEXT instruction, so any pending interrupt will wake from HLT immediately.
+/// Fix: keep the full drain IRQ-enabled, then disable interrupts only for the
+/// `need_resched`/readiness recheck and atomic sti;hlt arming window. On x86,
+/// STI enables interrupts starting with the NEXT instruction, so any pending
+/// interrupt wakes from HLT immediately.
 ///
 /// This enables true SMP scheduling where all CPUs participate in running
 /// user processes, not just the BSP.
 fn ap_idle_loop() -> ! {
+    let mut process_deferred_ready_acknowledged = false;
     loop {
         // R169-5 FIX (D1-CGROUP-IRQ-L5): Run the full deferred-work drain with
         // interrupts ENABLED. reschedule_if_needed() is NOT a lightweight check
@@ -1276,14 +1409,42 @@ fn ap_idle_loop() -> ! {
         // with IRQs left disabled.
         x86_64::instructions::interrupts::enable();
 
-        // Drain deferred work + consume reschedule requests in true process
-        // context (IRQs on), exactly as the BSP idle loop and syscall return do.
-        kernel_core::reschedule_if_needed();
+        // RF180-52 FIX: APs are published before the BSP initializes the
+        // scheduler and the complete process-deferred-work dependency graph.
+        // Until the BSP's Release publication, this loop may only service
+        // interrupts and use the race-free sti;hlt path below; callback,
+        // network, cgroup, and scheduler publication is not yet complete.
+        let process_deferred_ready = kernel_core::process_deferred_work_ready();
+        if process_deferred_ready {
+            // Drain deferred work + consume reschedule requests in true process
+            // context (IRQs on), exactly as the BSP idle loop and syscall return do.
+            if !process_deferred_ready_acknowledged {
+                // RF180-54: publish this CPU's exact bit after the full drain,
+                // but before the scheduler callback can context-switch and
+                // prevent this frame from returning. The BSP admits Ring-3 work
+                // only after every online AP bit is present.
+                kernel_core::reschedule_if_needed_with_post_drain(
+                    acknowledge_process_deferred_work,
+                );
+                process_deferred_ready_acknowledged = true;
+            } else {
+                kernel_core::reschedule_if_needed();
+            }
+        }
 
         // R70-1 FIX: narrow race-free window — disable IRQs only for the
         // need_resched check + sti;hlt arming so no IPI can slip in between.
         x86_64::instructions::interrupts::disable();
-        if cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
+
+        // RF180-52: close the publication-to-halt race. If readiness became
+        // visible after the IRQ-enabled check above, loop back before HLT so
+        // the full drain runs with interrupts enabled. If publication happens
+        // after this check, the BSP's post-publication reschedule IPI is held
+        // pending across sti;hlt and wakes this CPU atomically.
+        if !process_deferred_ready && kernel_core::process_deferred_work_ready() {
+            continue;
+        }
+        if process_deferred_ready && cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
             // Work is pending — loop; the top-of-loop enable() re-arms IRQs.
             continue;
         }
@@ -1299,6 +1460,15 @@ fn ap_idle_loop() -> ! {
             );
         }
     }
+}
+
+/// RF180-54: publish one AP's post-publication deferred-drain completion.
+fn acknowledge_process_deferred_work() {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id == 0 || cpu_id >= MAX_CPUS || !cpu_local::is_cpu_online(cpu_id) {
+        panic!("RF180-54: invalid AP deferred-work acknowledgement");
+    }
+    PROCESS_DEFERRED_ACK_MASK.fetch_or(1u64 << cpu_id, Ordering::Release);
 }
 
 // ============================================================================
@@ -1481,7 +1651,21 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
             let pla = &*(table[offset..].as_ptr() as *const ProcessorLocalApic);
             // Check if processor is enabled (bit 0)
             if pla.flags & 1 != 0 {
-                ids.push(pla.apic_id as u32);
+                let apic_id = pla.apic_id as u32;
+                if ids.len() >= MAX_CPUS || ids.iter().any(|id| *id == apic_id) {
+                    // RF180-58 FIX: a duplicate or over-capacity MADT cannot define an
+                    // identity-bearing online mask. Fall back to BSP-only
+                    // enumeration rather than starting a ghost AP or
+                    // allowing the deferred-ack wait to depend on a false
+                    // topology.
+                    klog_always!(
+                        "[SMP] rejecting invalid MADT LAPIC topology (id={}, count={})",
+                        apic_id,
+                        ids.len()
+                    );
+                    return None;
+                }
+                ids.push(apic_id);
             }
         }
 

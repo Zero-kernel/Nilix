@@ -892,6 +892,8 @@ pub fn bsp_lapic_id() -> u32 {
 // IPI Operations
 // ============================================================================
 
+const RF180_58_ICR_IDLE_MAX_SPINS: u64 = 1_000_000;
+
 /// Wait for ICR delivery to complete
 ///
 /// # Safety
@@ -899,7 +901,15 @@ pub fn bsp_lapic_id() -> u32 {
 /// LAPIC must be initialized.
 unsafe fn wait_icr_idle() {
     // Bit 12 of ICR_LOW is the delivery status
+    let mut spins = 0u64;
     while lapic_read(lapic::ICR_LOW) & icr_flags::DELIVERY_PENDING != 0 {
+        // RF180-58 FIX: the readiness wakeup path must not turn a stuck LAPIC
+        // delivery into an unbounded pre-acknowledgement hang. Fail closed so
+        // the BSP never admits Ring-3 work without a completed wakeup attempt.
+        spins = spins.saturating_add(1);
+        if spins >= RF180_58_ICR_IDLE_MAX_SPINS {
+            panic!("RF180-58: LAPIC ICR delivery did not become idle");
+        }
         core::hint::spin_loop();
     }
 }
