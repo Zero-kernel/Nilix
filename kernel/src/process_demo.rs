@@ -10,9 +10,9 @@ pub fn demo_process_management() {
     // 演示1: 创建多个进程
     klog!(Info, "1. Creating multiple processes...");
 
-    let proc1 = create_process("worker1".into(), 0, 10).expect("worker1"); // 高优先级
-    let proc2 = create_process("worker2".into(), 0, 50).expect("worker2"); // 中优先级
-    let proc3 = create_process("worker3".into(), 0, 100).expect("worker3"); // 低优先级
+    let proc1 = create_process("worker1", 0, 10).expect("worker1"); // 高优先级
+    let proc2 = create_process("worker2", 0, 50).expect("worker2"); // 中优先级
+    let proc3 = create_process("worker3", 0, 100).expect("worker3"); // 低优先级
 
     klog!(Info, "   ✓ Created 3 worker processes");
 
@@ -120,9 +120,9 @@ pub fn demo_priority_scheduling() {
     klog!(Info, "1. Creating processes with different priorities...");
 
     // 创建不同优先级的进程
-    let high_prio = create_process("high_priority".into(), 0, 0).expect("high_priority"); // 最高优先级
-    let mid_prio = create_process("mid_priority".into(), 0, 70).expect("mid_priority"); // 中等优先级
-    let low_prio = create_process("low_priority".into(), 0, 139).expect("low_priority"); // 最低优先级
+    let high_prio = create_process("high_priority", 0, 0).expect("high_priority"); // 最高优先级
+    let mid_prio = create_process("mid_priority", 0, 70).expect("mid_priority"); // 中等优先级
+    let low_prio = create_process("low_priority", 0, 139).expect("low_priority"); // 最低优先级
 
     add_process(low_prio); // 先添加低优先级
     add_process(mid_prio); // 再添加中优先级
@@ -165,9 +165,9 @@ pub fn demo_time_slice() {
 
     klog!(Info, "1. Creating processes with same priority...");
 
-    let proc1 = create_process("equal1".into(), 0, 50).expect("equal1");
-    let proc2 = create_process("equal2".into(), 0, 50).expect("equal2");
-    let proc3 = create_process("equal3".into(), 0, 50).expect("equal3");
+    let proc1 = create_process("equal1", 0, 50).expect("equal1");
+    let proc2 = create_process("equal2", 0, 50).expect("equal2");
+    let proc3 = create_process("equal3", 0, 50).expect("equal3");
 
     add_process(proc1);
     add_process(proc2);

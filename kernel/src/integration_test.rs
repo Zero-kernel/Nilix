@@ -3,6 +3,15 @@
 //! 测试所有子系统的集成和功能
 
 /// 测试页表管理器
+/// R180-12 compile-time cross-crate API guard. Keeping this function in the
+/// top-level `kernel` crate proves that a consumer can pair the public general
+/// reservation permit with the public allocation-free enqueue operation. It
+/// is intentionally never executed by the boot suite.
+#[allow(dead_code)]
+fn assert_public_rcu_enqueue_api(permit: kernel_core::RcuCallbackPermit, callback: fn([usize; 2])) {
+    kernel_core::call_rcu(permit, callback, [0; 2]);
+}
+
 pub fn test_page_table() {
     klog_always!("  [TEST] Page Table Manager...");
     klog_always!("    ✓ Page table manager module compiled");
@@ -11,7 +20,11 @@ pub fn test_page_table() {
 
 /// 测试进程控制块
 pub fn test_process_control_block() {
+    kernel_core::process::Process::run_arc_lifetime_self_test();
+    kernel_core::process::run_process_table_retirement_self_test();
     klog_always!("  [TEST] Process Control Block...");
+    klog_always!("    [PASS] RF180-40 process Arc/Weak exact-lifetime admission");
+    klog_always!("    [PASS] RF180-44 process-table deferred retirement");
     klog_always!("    ✓ Process structure defined");
     klog_always!("    ✓ Priority system implemented");
     klog_always!("    ✓ State management ready");
@@ -24,6 +37,8 @@ pub fn test_scheduler() {
     sched::enhanced_scheduler::run_bounded_selector_self_test();
     sched::enhanced_scheduler::run_identity_cleanup_self_test();
     sched::enhanced_scheduler::run_identity_resume_self_test();
+    sched::enhanced_scheduler::run_scheduler_admission_self_test();
+    kernel_core::process::run_fd_charge_migration_self_test();
     klog_always!(
         "    [PASS] RF178-33 selector/aging/identity-cleanup + RF178-35 fatal wake + RF178-36 identity resume"
     );
@@ -38,6 +53,7 @@ pub fn test_fork_framework() {
     klog_always!("  [TEST] Fork System Call Framework...");
     kernel_core::fork::run_cow_refcount_self_test();
     kernel_core::syscall::run_cow_mprotect_self_test();
+    kernel_core::pid_namespace::run_shutdown_creation_self_test();
     klog_always!("    ✓ Fork implementation compiled");
     klog_always!("    ✓ COW (Copy-on-Write) framework ready");
     klog_always!("    ✓ Physical page ref counting available");
@@ -55,6 +71,8 @@ pub fn test_syscalls() {
     // NULL-`set` how-skip), and readv's single-segment selection (the
     // first-non-empty-iovec one-read rule that avoids the exact-boundary block).
     kernel_core::syscall::run_startup_abi_self_test();
+    kernel_core::syscall::run_linux_wire_abi_self_test();
+    klog_always!("    [PASS] R180-24/25 Linux wire ABI: sockaddr_in bytes + getdents64 d_name@19");
     klog_always!("    ✓ M0 #2 startup ABI: clock_gettime id-set + ms→timespec/timeval + rt_sigprocmask validator + readv seg-select");
     // M0 #4: the pure helpers behind exec disambiguation — the `#!` shebang
     // parser, argv reconstruction (re-enforced MAX_ARG_* caps + embedded-NUL
@@ -66,6 +84,8 @@ pub fn test_syscalls() {
     // the incremental read loop and size cap. VFS is initialized well before the
     // integration tests run.
     vfs::manager::run_exec_read_file_self_test();
+    vfs::ProcFs::run_admission_self_test();
+    klog_always!("    [PASS] RF180-40 procfs Arc admission + ENOMEM rollback");
     // M0-6 slice 2: rename(82) atomicity + dual errno-mapper fidelity (ENOTEMPTY/EROFS/
     // ENAMETOOLONG) + RENAME_NOREPLACE + the half-mutation guard.
     vfs::manager::run_rename_self_test();
@@ -108,6 +128,8 @@ pub fn test_syscalls() {
     // P2-B: under-lock recheck-before-publish closes the R172 futex compare/
     // enqueue lost-wake class (RF178-8 try_prepare_with_timeout_after).
     ipc::run_futex_lost_wake_prepare_self_test();
+    ipc::run_blocking_sync_failure_self_test();
+    klog_always!("    [PASS] RF180-42 blocking sync ENOMEM propagation + mutex invariant");
     klog_always!(
         "    ✓ P2-B futex lost-wake: prepare recheck-before-publish (fail→empty, pass→Arm+cancel)"
     );
@@ -350,11 +372,50 @@ pub fn test_ext2_write() {
                     if first.inode.as_any().is::<vfs::Ext2Inode>()
                         && second.inode.as_any().is::<vfs::Ext2Inode>()
                     {
+                        let ext2 = first
+                            .inode
+                            .as_any()
+                            .downcast_ref::<vfs::Ext2Inode>()
+                            .expect("ext2 downcast after type check");
+                        assert!(
+                            ext2.uses_internal_journal()
+                                .expect("query mounted ext2 journal"),
+                            "production ext2 image must use its internal JBD2 journal"
+                        );
                         assert!(
                             alloc::sync::Arc::ptr_eq(&first.inode, &second.inode),
                             "independent ext2 opens must share the canonical inode Arc"
                         );
                         klog_always!("    RF178-37 mounted-ext2 dual-open identity passed");
+                        let alloc_flags = vfs::OpenFlags::new(vfs::OpenFlags::O_RDWR);
+                        let alloc_file_ops = vfs::open("/mnt/test/alloc.bin", alloc_flags, 0)
+                            .expect("open production ext3 allocation probe");
+                        let alloc_file = alloc_file_ops
+                            .as_any()
+                            .downcast_ref::<vfs::FileHandle>()
+                            .expect("ext3 allocation probe FileHandle");
+                        assert_eq!(
+                            alloc_file
+                                .inode
+                                .stat()
+                                .expect("stat production ext3 allocation probe")
+                                .size,
+                            0,
+                            "production allocation probe must be reset to an empty inode"
+                        );
+                        assert_eq!(
+                            alloc_file.write(b"J"),
+                            Ok(1),
+                            "production image write must traverse JBD2 allocation/mapped commit"
+                        );
+                        let mut committed = [0u8; 1];
+                        assert_eq!(
+                            alloc_file.inode.read_at(0, &mut committed),
+                            Ok(1),
+                            "production JBD2 write must be immediately readable"
+                        );
+                        assert_eq!(committed, *b"J");
+                        klog_always!("    R180-6 production JBD2 write path passed");
                     } else {
                         klog_always!("    - /mnt is not ext2; mounted-image probe skipped");
                     }
@@ -399,10 +460,26 @@ pub fn test_page_cache_policy() {
     klog_always!("    ✓ RAII charge transfer + exact final-Arc uncharge");
 }
 
+/// R180-12: allocation-free RCU callback pool state/partition/FIFO invariants.
+pub fn test_rcu_callback_pool() {
+    klog_always!("  [TEST] RCU Callback Pool (R180-12)...");
+    kernel_core::rcu::run_rcu_callback_pool_self_test();
+    klog_always!("    ✓ PID-indexed stack class + reserved general class");
+    klog_always!("    ✓ cancellation, epoch gate, FIFO wrap, and state balance");
+}
+
+/// R180-20: independent TCP pseudo-header/wire checksum vectors.
+pub fn test_tcp_checksum_wire_oracle() {
+    klog_always!("  [TEST] TCP checksum wire oracle (R180-20)...");
+    net::tcp::run_tcp_checksum_self_test();
+    klog_always!("    [PASS] even SYN + odd payload checksum vectors");
+}
+
 /// P2-A: kernel-heap byte-budget arbiter coexistence + query API.
 pub fn test_heap_budget_arbiter() {
     klog_always!("  [TEST] Heap Budget Arbiter (P2-A)...");
     mm::run_heap_budget_self_test();
+    mm::run_emergency_heap_self_test();
     assert!(
         mm::heap_budgets_published(),
         "arbiter must be published at boot before integration tests"
@@ -427,6 +504,7 @@ pub fn test_heap_budget_arbiter() {
         "exec peak must not register as a hard floor"
     );
     assert_eq!(mm::transient_peak_holders(), 0);
+    kernel_core::syscall::run_transient_io_admission_self_test();
     klog_always!(
         "    ✓ coexistence: hard={} KiB + headroom={} KiB + peak={} KiB <= heap={} KiB (residual={} KiB)",
         snap.hard_floors_sum_bytes / 1024,
@@ -436,7 +514,7 @@ pub fn test_heap_budget_arbiter() {
         snap.general_residual_bytes / 1024
     );
     klog_always!("    ✓ named hard floors derived from arbiter (no independent HEAP/N fractions)");
-    klog_always!("    ✓ single-holder transient peak admission + consumer floor coupling");
+    klog_always!("    ✓ aggregate exec/I/O admission + exact nested-buffer release");
 }
 
 /// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.
@@ -471,6 +549,15 @@ pub fn test_cgroup_fd_budget() {
     klog_always!("    ✓ root id==0 exemption + migrate_fd_charges balance + saturating uncharge");
 }
 
+/// RF180-45 exact cgroup Arc lifetime and detached metadata transactions.
+pub fn test_cgroup_exact_lifetime() {
+    klog_always!("  [TEST] Cgroup exact-lifetime admission (RF180-45)...");
+    kernel_core::cgroup::run_cgroup_exact_lifetime_self_test();
+    klog_always!(
+        "    [PASS] final-Weak/prepare rollback + 4097-task growth + Busy/delta migration + common-ancestor headroom + deferred reclaim"
+    );
+}
+
 /// Test the Phase J.2 item 10 per-cgroup VFS dir-enumeration budget (`vfs_dir.max`).
 ///
 /// Runs real assertions over the Arc-chain-pinning VfsDirBudgetGuard: cap clamping
@@ -485,6 +572,14 @@ pub fn test_cgroup_vfs_dir_budget() {
     klog_always!(
         "    ✓ Arc-pinned uncharge survives leaf deletion + root exempt + idempotent release"
     );
+}
+
+/// RF180-L1: positioned I/O must reject every non-seekable endpoint before
+/// invoking a consuming device operation (`/dev/console`, pipes, sockets).
+pub fn test_positioned_io_gate() {
+    klog_always!("  [TEST] Positioned I/O non-seekable gate (RF180-L1)...");
+    vfs::manager::run_positioned_io_gate_self_test();
+    klog_always!("    ✓ access mode first; readable non-seekable endpoints return ESPIPE");
 }
 
 /// Test the Phase J.2 item 9 per-cgroup page-table-frame kmem accounting.
@@ -718,10 +813,14 @@ pub fn run_all_tests() {
     test_memory_mapping();
     test_fallible_map();
     test_heap_budget_arbiter();
+    test_rcu_callback_pool();
+    test_tcp_checksum_wire_oracle();
     test_page_cache_policy();
     test_per_ns_tcp_budgets();
+    test_cgroup_exact_lifetime();
     test_cgroup_fd_budget();
     test_cgroup_vfs_dir_budget();
+    test_positioned_io_gate();
     test_cgroup_pt_kmem();
     test_cgroup_port_budget();
     test_cgroupfs_abi();

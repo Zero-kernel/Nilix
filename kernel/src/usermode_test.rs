@@ -19,7 +19,7 @@
 use alloc::string::ToString;
 use kernel_core::elf_loader::load_elf;
 use kernel_core::fork::{create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4};
-use kernel_core::process::{create_process, get_process, FxSaveArea};
+use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessArc};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -252,8 +252,9 @@ const PROCESS_NAME: &str = "hello";
 /// - User-space programs can make system calls
 /// - Privilege level transitions (Ring 0 <-> Ring 3)
 ///
-/// Returns true if the test setup succeeded (actual execution is asynchronous).
-pub fn run_usermode_test() -> bool {
+/// Returns the fully prepared, not-yet-scheduled PCB. Scheduler admission is
+/// intentionally delayed until the BSP enables interrupts.
+pub fn prepare_usermode_test() -> Option<ProcessArc> {
     klog!(Info, "\n=== Ring 3 Execution Test ===\n");
     klog!(Info, "Embedded ELF size: {} bytes", user_elf().len());
 
@@ -269,7 +270,7 @@ pub fn run_usermode_test() -> bool {
         Ok(pid) => pid,
         Err(e) => {
             klog!(Error, "      ✗ Failed to create process: {:?}", e);
-            return false;
+            return None;
         }
     };
     klog!(Info, "      ✓ Process created with PID {}", pid);
@@ -314,7 +315,7 @@ pub fn run_usermode_test() -> bool {
         }
         Err(e) => {
             klog!(Error, "      ✗ Failed to create address space: {:?}", e);
-            return false;
+            return None;
         }
     };
 
@@ -352,7 +353,7 @@ pub fn run_usermode_test() -> bool {
             klog!(Error, "      ✗ Failed to load ELF: {:?}", e);
             // Restore original CR3
             kernel_core::process::activate_memory_space(saved_cr3, None);
-            return false;
+            return None;
         }
     };
 
@@ -375,7 +376,7 @@ pub fn run_usermode_test() -> bool {
             Err(e) => {
                 klog!(Error, "      ✗ Failed to create KPTI user PML4: {:?}", e);
                 kernel_core::process::activate_memory_space(saved_cr3, None);
-                return false;
+                return None;
             }
         }
     } else {
@@ -429,7 +430,7 @@ pub fn run_usermode_test() -> bool {
                 free_kpti_user_pml4(user_memory_space);
             }
             kernel_core::process::free_address_space(memory_space);
-            return false;
+            return None;
         }
     };
 
@@ -502,19 +503,14 @@ pub fn run_usermode_test() -> bool {
             free_kpti_user_pml4(user_memory_space);
         }
         kernel_core::process::activate_memory_space(saved_cr3, None);
-        return false;
+        return None;
     }
 
-    // Step 5: Add process to scheduler's ready queue
-    if let Some(process) = get_process(pid) {
-        sched::enhanced_scheduler::Scheduler::add_process(process);
-        klog!(Info, "[5/5] Process added to scheduler ready queue");
-    }
-
-    // Restore kernel address space (scheduler will switch when running the process)
+    // Restore kernel address space before the BSP can enable interrupts and
+    // make this process runnable.
     kernel_core::process::activate_memory_space(saved_cr3, None);
 
-    klog!(Info, "\n✓ Ring 3 test process ready!");
+    klog!(Info, "\n✓ Ring 3 test process prepared!");
     klog!(
         Info,
         "  KPTI: {}",
@@ -524,13 +520,16 @@ pub fn run_usermode_test() -> bool {
             "single-root"
         }
     );
-    klog!(Info, "  The process will execute when scheduled.");
+    klog!(
+        Info,
+        "  The process will execute after scheduler admission."
+    );
     klog!(
         Info,
         "  Expected output: \"Hello from Ring 3!\" followed by PID\n"
     );
 
-    true
+    get_process(pid)
 }
 
 /// Quick Ring 3 transition test (direct jump, blocking)

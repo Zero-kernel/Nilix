@@ -616,7 +616,7 @@ impl NetworkLoopbackTest {
         src_port: u16,
         dst_port: u16,
         payload: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<net::WirePacket, String> {
         // Build UDP datagram with correct checksum
         let udp_data = net::build_udp_datagram(src_ip, dst_ip, src_port, dst_port, payload)
             .map_err(|e| alloc::format!("UDP build failed: {:?}", e))?;
@@ -630,15 +630,15 @@ impl NetworkLoopbackTest {
             64, // TTL
         );
 
-        // Combine IP header + UDP datagram
-        let mut ip_packet = Vec::with_capacity(ip_header.len() + udp_data.len());
-        ip_packet.extend_from_slice(&ip_header);
-        ip_packet.extend_from_slice(&udp_data);
-
-        // Build Ethernet frame
-        let frame = net::build_ethernet_frame(dst_mac, src_mac, net::ETHERTYPE_IPV4, &ip_packet);
-
-        Ok(frame)
+        // RF180-41 REVIEW FIX: construct the runtime-test wire frame with the
+        // same one-allocation admitted API used by production response paths.
+        net::try_build_ethernet_frame_from_parts(
+            dst_mac,
+            src_mac,
+            net::ETHERTYPE_IPV4,
+            &[&ip_header, &udp_data],
+        )
+        .map_err(|e| alloc::format!("Ethernet build failed: {:?}", e))
     }
 
     /// Test UDP packet processing through the network stack
@@ -738,13 +738,14 @@ impl NetworkLoopbackTest {
             64,
         );
 
-        // Combine IP + TCP
-        let mut ip_packet = Vec::with_capacity(ip_header.len() + tcp_header.len());
-        ip_packet.extend_from_slice(&ip_header);
-        ip_packet.extend_from_slice(&tcp_header);
-
-        // Build Ethernet frame
-        let frame = net::build_ethernet_frame(our_mac, remote_mac, net::ETHERTYPE_IPV4, &ip_packet);
+        // RF180-41 REVIEW FIX: no unadmitted intermediate wire Vec.
+        let frame = net::try_build_ethernet_frame_from_parts(
+            our_mac,
+            remote_mac,
+            net::ETHERTYPE_IPV4,
+            &[&ip_header, &tcp_header],
+        )
+        .map_err(|e| alloc::format!("Ethernet build failed: {:?}", e))?;
 
         // Create test context
         let mut arp_cache = ArpCache::new(60_000, 256); // 60s TTL, 256 max entries
@@ -841,13 +842,14 @@ impl NetworkLoopbackTest {
             64,
         );
 
-        // Combine IP + TCP
-        let mut ip_packet = Vec::with_capacity(ip_header.len() + tcp_header.len());
-        ip_packet.extend_from_slice(&ip_header);
-        ip_packet.extend_from_slice(&tcp_header);
-
-        // Build Ethernet frame
-        let frame = net::build_ethernet_frame(our_mac, remote_mac, net::ETHERTYPE_IPV4, &ip_packet);
+        // RF180-41 REVIEW FIX: no unadmitted intermediate wire Vec.
+        let frame = net::try_build_ethernet_frame_from_parts(
+            our_mac,
+            remote_mac,
+            net::ETHERTYPE_IPV4,
+            &[&ip_header, &tcp_header],
+        )
+        .map_err(|e| alloc::format!("Ethernet build failed: {:?}", e))?;
 
         // Create test context
         let mut arp_cache = ArpCache::new(60_000, 256);
