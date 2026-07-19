@@ -32,6 +32,8 @@
 # Usage:   bash scripts/kernel_test.sh [esp_dir]
 # Env:     OVMF_PATH (autodetect fallback if unset)
 #          KERNEL_TEST_TIMEOUT seconds (default 45)
+#          KERNEL_TEST_DISK optional Ext3/JBD2 image; when set, the mounted
+#          production-journal probe marker becomes a mandatory gate condition
 # ============================================================================
 set -u
 
@@ -61,6 +63,7 @@ PANIC_MARKER='KERNEL PANIC'
 NX_RE='v=0e e=0011'
 CPU_RESET_RE='cpu[_ ]reset|CPU Reset'
 SUITE_START_MARKER='=== Runtime Functional Tests ==='
+JOURNAL_PROBE_MARKER='R180-6 production JBD2 write path passed'
 
 # OVMF firmware autodetect (prefers explicit OVMF_PATH, else mirrors the
 # Makefile OVMF_PATH search order including the OVMF_CODE*.fd fallback).
@@ -108,12 +111,29 @@ echo "OVMF:    $OVMF"
 echo "Timeout: ${TO}s"
 echo ""
 
+disk_args=()
+journal_probe_required=0
+if [[ -n "${KERNEL_TEST_DISK:-}" ]]; then
+    case "$KERNEL_TEST_DISK" in /*) ;; *) KERNEL_TEST_DISK="$ROOT/$KERNEL_TEST_DISK" ;; esac
+    if [[ ! -f "$KERNEL_TEST_DISK" ]]; then
+        echo "KERNEL-TEST BLOCKED: journaled test disk not found: $KERNEL_TEST_DISK"
+        exit 2
+    fi
+    journal_probe_required=1
+    disk_args=(
+        -drive "if=none,file=$KERNEL_TEST_DISK,format=raw,id=vdisk0,cache=writeback,discard=unmap"
+        -device virtio-blk-pci,drive=vdisk0
+    )
+    echo "Disk:     $KERNEL_TEST_DISK (Ext3/JBD2 gate)"
+fi
+
 # Same proven health surface as boot_check / musl_check:
 # -display none + serial-to-file (never trust -nographic stdio alone)
 # -d int,cpu_reset for the NX signature without changing guest layout
 # single-core (SMP is test-smp's job)
 timeout "$TO" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:rw:"$ESP" \
+    "${disk_args[@]}" \
     -m 256M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
@@ -147,6 +167,9 @@ resets=${resets:-0}
 
 has_suite_start=0
 grep -Fq "$SUITE_START_MARKER" "$ser" 2>/dev/null && has_suite_start=1
+
+journal_probe_passed=0
+grep -Fq "$JOURNAL_PROBE_MARKER" "$ser" 2>/dev/null && journal_probe_passed=1
 
 # Prefer the LAST matching summary line if multiple appear.
 summary_line=""
@@ -190,6 +213,9 @@ fi
 echo "Panic:   $has_panic"
 echo "NX #PF:  $nx (signature '$NX_RE')"
 echo "Suite:   start_marker=${has_suite_start}"
+if [ "$journal_probe_required" -eq 1 ]; then
+    echo "Ext3:    journal_probe=${journal_probe_passed}"
+fi
 if [ "$resets" -gt 0 ]; then
     echo "INFO:    intlog contains $resets cpu_reset marker(s) (not hard-gated)"
 fi
@@ -212,6 +238,13 @@ if [ "$nx" -gt 0 ]; then
 fi
 if [ "$has_summary" -eq 1 ] && [ "$failed" -gt 0 ]; then
     echo "KERNEL-TEST FAIL: runtime suite reported ${failed} failed test(s)"
+    rc=1
+    class="FAILED"
+fi
+if [ "$journal_probe_required" -eq 1 ] \
+    && [ "$has_summary" -eq 1 ] \
+    && [ "$journal_probe_passed" -ne 1 ]; then
+    echo "KERNEL-TEST FAIL: attached Ext3 image did not complete the production JBD2 write probe"
     rc=1
     class="FAILED"
 fi
