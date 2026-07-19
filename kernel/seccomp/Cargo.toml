@@ -15,6 +15,7 @@ bitflags = "2.4"
 drivers = { path = "../drivers" }
 audit = { path = "../audit" }
 klog = { path = "../klog" }
+mm = { path = "../mm" }
 
 [features]
 default = []

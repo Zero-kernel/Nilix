@@ -9,10 +9,164 @@
 
 extern crate alloc;
 
+use alloc::alloc::Global;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::fmt;
+use core::mem::size_of;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
+use mm::{
+    arc_charge_bytes, try_reserve_heap, vec_charge_bytes, AdmittedVec, HeapCharge, HeapClass,
+};
+use spin::Mutex;
+
+// ============================================================================
+// Charged Seccomp Filter Arc Allocator (RF180-28)
+// ============================================================================
+
+/// Every Arc charge is at least the two Arc counters plus allocator-link slack,
+/// or four machine words. Consequently this table can represent every filter
+/// Arc that the CoreProcess byte gate could admit; it does not impose a smaller
+/// object-count limit than the authoritative byte ledger.
+const SECCOMP_ARC_CHARGE_SLOTS: usize =
+    HeapClass::CoreProcess.limit_bytes() / (4 * size_of::<usize>());
+
+struct SeccompArcChargeSlot {
+    generation: u64,
+    allocated: bool,
+    charge: HeapCharge,
+}
+
+static SECCOMP_ARC_CHARGES: Mutex<[Option<SeccompArcChargeSlot>; SECCOMP_ARC_CHARGE_SLOTS]> =
+    Mutex::new([const { None }; SECCOMP_ARC_CHARGE_SLOTS]);
+static NEXT_SECCOMP_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Allocator capability carried by every strong and weak filter handle.
+///
+/// RF180-28 FIX: `SeccompFilter` is destroyed at the last strong reference,
+/// but the Arc control block remains allocated while any Weak exists. Keeping
+/// the charge in this fixed slot until `Allocator::deallocate` accounts for the
+/// complete physical lifetime without allocating bookkeeping recursively.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SeccompArcAllocator {
+    slot: u16,
+    generation: u64,
+}
+
+impl SeccompArcAllocator {
+    fn try_install(charge: HeapCharge) -> Result<Self, HeapCharge> {
+        let generation = match NEXT_SECCOMP_ARC_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => return Err(charge),
+        };
+
+        let mut charge = Some(charge);
+        let mut slots = SECCOMP_ARC_CHARGES.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(SeccompArcChargeSlot {
+                    generation,
+                    allocated: false,
+                    charge: charge.take().expect("seccomp Arc charge moved once"),
+                });
+                return Ok(Self {
+                    slot: index as u16,
+                    generation,
+                });
+            }
+        }
+        Err(charge.expect("seccomp Arc slot scan retained charge"))
+    }
+
+    fn take_charge(self) -> HeapCharge {
+        let mut slots = SECCOMP_ARC_CHARGES.lock();
+        let slot = slots
+            .get_mut(self.slot as usize)
+            .expect("RF180-28 seccomp Arc allocator slot out of range");
+        match slot.as_ref() {
+            Some(entry) if entry.generation == self.generation => {}
+            Some(_) => panic!("RF180-28 stale seccomp Arc allocator generation"),
+            None => panic!("RF180-28 seccomp Arc charge released twice"),
+        }
+        slot.take()
+            .expect("validated seccomp Arc charge disappeared")
+            .charge
+    }
+
+    fn cancel_failed_allocation(self) {
+        drop(self.take_charge());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn charge_bytes_for_test(self) -> usize {
+        SECCOMP_ARC_CHARGES
+            .lock()
+            .get(self.slot as usize)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.generation == self.generation)
+            .map_or(0, |entry| entry.charge.bytes())
+    }
+}
+
+unsafe impl Allocator for SeccompArcAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        {
+            let mut slots = SECCOMP_ARC_CHARGES.lock();
+            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+                return Err(AllocError);
+            };
+            if entry.generation != self.generation || entry.allocated {
+                return Err(AllocError);
+            }
+            entry.allocated = true;
+        }
+
+        match Global.allocate(layout) {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                let mut slots = SECCOMP_ARC_CHARGES.lock();
+                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                    if entry.generation == self.generation {
+                        entry.allocated = false;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // Release physical memory before returning the corresponding capacity
+        // to the admission ledger.
+        unsafe { Global.deallocate(ptr, layout) };
+        drop(self.take_charge());
+    }
+}
+
+pub(crate) type SeccompFilterArc = Arc<SeccompFilter, SeccompArcAllocator>;
+
+fn try_new_filter_arc(value: SeccompFilter) -> Result<SeccompFilterArc, ()> {
+    let bytes = arc_charge_bytes::<SeccompFilter>().map_err(|_| ())?;
+    let reservation = try_reserve_heap(HeapClass::CoreProcess, bytes).map_err(|_| ())?;
+    let charge = reservation.commit().map_err(|_| ())?;
+    let allocator = SeccompArcAllocator::try_install(charge).map_err(|charge| {
+        drop(charge);
+    })?;
+    match Arc::try_new_in(value, allocator) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            allocator.cancel_failed_allocation();
+            Err(())
+        }
+    }
+}
 
 // ============================================================================
 // R149-I3 FIX: Centralized Linux x86_64 syscall number definitions.
@@ -304,12 +458,12 @@ bitflags! {
 // arbitrary `prog`, bypassing the MAX_INSNS validation entirely — voiding the
 // R170-I1 `new_trusted` seal at the construction boundary. The two fields read
 // out-of-crate (id, flags) are exposed through the `id()`/`flags()` accessors below.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SeccompFilter {
     /// Default action when no rule matches.
     default_action: SeccompAction,
     /// BPF-like program.
-    prog: Arc<[SeccompInsn]>,
+    prog: Arc<Vec<SeccompInsn>>,
     /// Fast allow bitmap for common syscalls (syscall_nr < 512).
     /// If bit N is set, syscall N is unconditionally allowed.
     fast_allow: FastAllowSet,
@@ -317,6 +471,8 @@ pub struct SeccompFilter {
     id: u64,
     /// Filter flags.
     flags: SeccompFlags,
+    /// Complete lifetime charge for the program Vec backing and its Arc.
+    _prog_heap_charge: Option<HeapCharge>,
 }
 
 impl SeccompFilter {
@@ -326,22 +482,18 @@ impl SeccompFilter {
         default_action: SeccompAction,
         flags: SeccompFlags,
     ) -> Result<Self, SeccompError> {
-        // Validate the program
-        validate_program(&prog)?;
+        Self::new_from_slice(&prog, default_action, flags)
+    }
 
-        // Compute fast_allow bitmap
-        let fast_allow = compute_fast_allow(&prog);
-
-        // Compute filter ID (simple hash of program)
-        let id = compute_filter_id(&prog);
-
-        Ok(Self {
-            default_action,
-            prog: prog.into(),
-            fast_allow,
-            id,
-            flags,
-        })
+    /// RF180-18 FIX: construct an admitted retained program from stack or
+    /// caller-owned bytes. Admission precedes both Vec and Arc allocation.
+    pub fn new_from_slice(
+        prog: &[SeccompInsn],
+        default_action: SeccompAction,
+        flags: SeccompFlags,
+    ) -> Result<Self, SeccompError> {
+        validate_program(prog)?;
+        Self::new_validated_from_slice(prog, default_action, flags)
     }
 
     /// R169-12 FIX: Create a filter from a TRUSTED, kernel-generated program,
@@ -361,16 +513,71 @@ impl SeccompFilter {
         default_action: SeccompAction,
         flags: SeccompFlags,
     ) -> Result<Self, SeccompError> {
-        validate_program_with_limit(&prog, MAX_TRUSTED_INSNS)?;
-        let fast_allow = compute_fast_allow(&prog);
-        let id = compute_filter_id(&prog);
+        Self::new_trusted_from_slice(&prog, default_action, flags)
+    }
+
+    pub(crate) fn new_trusted_from_slice(
+        prog: &[SeccompInsn],
+        default_action: SeccompAction,
+        flags: SeccompFlags,
+    ) -> Result<Self, SeccompError> {
+        validate_program_with_limit(prog, MAX_TRUSTED_INSNS)?;
+        Self::new_validated_from_slice(prog, default_action, flags)
+    }
+
+    fn new_validated_from_slice(
+        prog: &[SeccompInsn],
+        default_action: SeccompAction,
+        flags: SeccompFlags,
+    ) -> Result<Self, SeccompError> {
+        #[cfg(test)]
+        {
+            static TEST_ADMISSION: spin::Once<()> = spin::Once::new();
+            TEST_ADMISSION.call_once(mm::publish_heap_budgets);
+        }
+        let arc_bytes =
+            arc_charge_bytes::<Vec<SeccompInsn>>().map_err(|_| SeccompError::OutOfMemory)?;
+        let vec_bytes =
+            vec_charge_bytes::<SeccompInsn>(prog.len()).map_err(|_| SeccompError::OutOfMemory)?;
+        let total = arc_bytes
+            .checked_add(vec_bytes)
+            .ok_or(SeccompError::OutOfMemory)?;
+        let mut reservation = try_reserve_heap(HeapClass::CoreProcess, total)
+            .map_err(|_| SeccompError::OutOfMemory)?;
+
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(prog.len())
+            .map_err(|_| SeccompError::OutOfMemory)?;
+        let actual = arc_bytes
+            .checked_add(
+                vec_charge_bytes::<SeccompInsn>(owned.capacity())
+                    .map_err(|_| SeccompError::OutOfMemory)?,
+            )
+            .ok_or(SeccompError::OutOfMemory)?;
+        reservation
+            .resize(actual)
+            .map_err(|_| SeccompError::OutOfMemory)?;
+        owned.extend_from_slice(prog);
+        let owned = Arc::try_new(owned).map_err(|_| SeccompError::OutOfMemory)?;
+
+        let fast_allow = compute_fast_allow(prog, default_action);
+        let id = compute_filter_id(prog);
+        let charge = reservation
+            .commit()
+            .map_err(|_| SeccompError::OutOfMemory)?;
         Ok(Self {
             default_action,
-            prog: prog.into(),
+            prog: owned,
             fast_allow,
             id,
             flags,
+            _prog_heap_charge: Some(charge),
         })
+    }
+
+    pub(crate) fn program_id(prog: &[SeccompInsn]) -> u64 {
+        compute_filter_id(prog)
     }
 
     /// R171-CG1x2 FIX: public accessors for the now-private sealed fields that
@@ -395,99 +602,125 @@ impl SeccompFilter {
     }
 
     /// Evaluate this filter against a syscall.
+    ///
+    /// R180-2: the fast_allow bit is set only when the full interpreter proves
+    /// `Allow` for every arg vector (or for zeros when the program never reads
+    /// args). The bit is never a second, looser policy.
     pub fn evaluate(&self, syscall_nr: u64, args: &[u64; 6]) -> SeccompAction {
-        // Fast path: check fast_allow bitmap
+        // Fast path: sound only under INV-SEC-01 (see compute_fast_allow).
         if syscall_nr < 512 && self.fast_allow.get(syscall_nr as usize) {
             return SeccompAction::Allow;
         }
+        interpret_program(self.prog.as_slice(), self.default_action, syscall_nr, args)
+    }
 
-        // Interpret the BPF program
-        let mut acc: u64 = 0;
-        let mut pc: usize = 0;
+    /// R180-2 test/oracle: true iff the install-time fast_allow bit is set.
+    #[cfg(test)]
+    pub fn fast_allows(&self, syscall_nr: u64) -> bool {
+        syscall_nr < 512 && self.fast_allow.get(syscall_nr as usize)
+    }
+}
 
-        while pc < self.prog.len() {
-            match self.prog[pc] {
-                SeccompInsn::LdSyscallNr => {
-                    acc = syscall_nr;
-                    pc += 1;
-                }
-                SeccompInsn::LdArg(idx) => {
-                    acc = if (idx as usize) < 6 {
-                        args[idx as usize]
-                    } else {
-                        0
-                    };
-                    pc += 1;
-                }
-                SeccompInsn::LdConst(val) => {
-                    acc = val;
-                    pc += 1;
-                }
-                SeccompInsn::And(val) => {
-                    acc &= val;
-                    pc += 1;
-                }
-                SeccompInsn::Or(val) => {
-                    acc |= val;
-                    pc += 1;
-                }
-                SeccompInsn::Shr(shift) => {
-                    acc >>= shift;
-                    pc += 1;
-                }
-                // R32-SECCOMP-2 FIX: All jump instructions must validate pc bounds
-                // after increment. If pc escapes program bounds, fail-closed with Trap.
-                SeccompInsn::JmpEq(val, t, f) => {
-                    pc += 1 + if acc == val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::JmpNe(val, t, f) => {
-                    pc += 1 + if acc != val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::JmpLt(val, t, f) => {
-                    pc += 1 + if acc < val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::JmpLe(val, t, f) => {
-                    pc += 1 + if acc <= val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::JmpGt(val, t, f) => {
-                    pc += 1 + if acc > val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::JmpGe(val, t, f) => {
-                    pc += 1 + if acc >= val { t as usize } else { f as usize };
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::Jmp(offset) => {
-                    pc += 1 + offset as usize;
-                    if pc >= self.prog.len() {
-                        return SeccompAction::Trap;
-                    }
-                }
-                SeccompInsn::Ret(action) => {
-                    return action;
+/// Single source of truth for seccomp BPF evaluation (no fast_allow).
+///
+/// R180-2 FIX: extracted from `SeccompFilter::evaluate` so install-time
+/// `compute_fast_allow` and runtime evaluation cannot diverge.
+fn interpret_program(
+    prog: &[SeccompInsn],
+    default_action: SeccompAction,
+    syscall_nr: u64,
+    args: &[u64; 6],
+) -> SeccompAction {
+    let mut acc: u64 = 0;
+    let mut pc: usize = 0;
+
+    while pc < prog.len() {
+        match prog[pc] {
+            SeccompInsn::LdSyscallNr => {
+                acc = syscall_nr;
+                pc += 1;
+            }
+            SeccompInsn::LdArg(idx) => {
+                acc = if (idx as usize) < 6 {
+                    args[idx as usize]
+                } else {
+                    0
+                };
+                pc += 1;
+            }
+            SeccompInsn::LdConst(val) => {
+                acc = val;
+                pc += 1;
+            }
+            SeccompInsn::And(val) => {
+                acc &= val;
+                pc += 1;
+            }
+            SeccompInsn::Or(val) => {
+                acc |= val;
+                pc += 1;
+            }
+            SeccompInsn::Shr(shift) => {
+                acc >>= shift;
+                pc += 1;
+            }
+            // R32-SECCOMP-2 FIX: All jump instructions must validate pc bounds
+            // after increment. If pc escapes program bounds, fail-closed with Trap.
+            SeccompInsn::JmpEq(val, t, f) => {
+                pc += 1 + if acc == val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
                 }
             }
+            SeccompInsn::JmpNe(val, t, f) => {
+                pc += 1 + if acc != val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::JmpLt(val, t, f) => {
+                pc += 1 + if acc < val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::JmpLe(val, t, f) => {
+                pc += 1 + if acc <= val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::JmpGt(val, t, f) => {
+                pc += 1 + if acc > val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::JmpGe(val, t, f) => {
+                pc += 1 + if acc >= val { t as usize } else { f as usize };
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::Jmp(offset) => {
+                pc += 1 + offset as usize;
+                if pc >= prog.len() {
+                    return SeccompAction::Trap;
+                }
+            }
+            SeccompInsn::Ret(action) => {
+                return action;
+            }
         }
-
-        // If we fall through, use default action
-        self.default_action
     }
+
+    default_action
+}
+
+/// True if any instruction reads syscall args (breaks arg-independence).
+#[inline]
+fn program_reads_args(prog: &[SeccompInsn]) -> bool {
+    prog.iter().any(|i| matches!(i, SeccompInsn::LdArg(_)))
 }
 
 // ============================================================================
@@ -638,7 +871,7 @@ impl PledgeState {
 // ============================================================================
 
 /// Per-process seccomp state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SeccompState {
     /// Stack of filters (evaluated in order, most restrictive wins).
     ///
@@ -647,7 +880,7 @@ pub struct SeccompState {
     /// out-of-crate caller could `state.filters.push(..)` directly and bypass the
     /// per-process chain-instruction cap (the bound is now type-enforced, not just
     /// convention). Read access is via the `filters()` accessor below.
-    filters: Vec<Arc<SeccompFilter>>,
+    filters: AdmittedVec<SeccompFilterArc>,
     /// PR_SET_NO_NEW_PRIVS flag.
     pub no_new_privs: bool,
     /// Log all violations.
@@ -658,7 +891,7 @@ impl SeccompState {
     /// Create empty seccomp state.
     pub fn new() -> Self {
         Self {
-            filters: Vec::new(),
+            filters: AdmittedVec::new(HeapClass::CoreProcess),
             no_new_privs: false,
             log_violations: false,
         }
@@ -706,8 +939,17 @@ impl SeccompState {
         if current_total.saturating_add(filter.prog_len()) > MAX_FILTER_INSNS_TOTAL {
             return Err(());
         }
-        self.filters.try_reserve(1).map_err(|_| ())?;
-        self.filters.push(Arc::new(filter));
+        // RF180-18/RF180-28 FIX: reserve the chain backing and outer Arc before
+        // either becomes visible. The Arc allocator owns its charge until the
+        // final strong and weak handle release the control block.
+        let prepared = self.filters.prepare_capacity_for(1).map_err(|_| ())?;
+        let filter = try_new_filter_arc(filter)?;
+        if let Some(prepared) = prepared {
+            self.filters.install_prepared(prepared).map_err(|_| ())?;
+        }
+        self.filters
+            .push_reserved(filter)
+            .unwrap_or_else(|_| panic!("prepared seccomp chain capacity vanished"));
         Ok(())
     }
 
@@ -720,19 +962,32 @@ impl SeccompState {
     /// `Vec` is private (see the field doc) so the only mutation path is
     /// `add_filter`, which enforces `MAX_FILTER_INSNS_TOTAL`.
     #[inline]
-    pub fn filters(&self) -> &[Arc<SeccompFilter>] {
+    pub(crate) fn filters(&self) -> &[SeccompFilterArc] {
         &self.filters
+    }
+
+    /// Number of installed filters without exposing the ownership-bearing Arc.
+    #[inline]
+    pub fn filter_count(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// ID of the only filter, if the chain contains exactly one entry.
+    #[inline]
+    pub fn single_filter_id(&self) -> Option<u64> {
+        if self.filters.len() == 1 {
+            self.filters.first().map(|filter| filter.id())
+        } else {
+            None
+        }
     }
 
     // R161-3 FIX: Fallible clone for fork/clone path. The derived Clone
     // uses infallible Vec::clone which panics under OOM. Arc<SeccompFilter>
     // clone is just a refcount bump (cheap), but the Vec growth is the issue.
     pub fn try_clone(&self) -> Result<Self, ()> {
-        let mut filters = Vec::new();
-        filters
-            .try_reserve_exact(self.filters.len())
+        let filters = AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, &self.filters)
             .map_err(|_| ())?;
-        filters.extend_from_slice(&self.filters);
         Ok(Self {
             filters,
             no_new_privs: self.no_new_privs,
@@ -766,6 +1021,8 @@ pub enum SeccompError {
     InvalidArgIndex,
     /// Invalid pledge promise string.
     InvalidPromise,
+    /// Retained filter storage could not be admitted or allocated.
+    OutOfMemory,
     /// Operation not permitted (no_new_privs).
     NotPermitted,
     /// Memory fault copying from user.
@@ -781,6 +1038,7 @@ impl fmt::Display for SeccompError {
             SeccompError::NoTerminator => write!(f, "seccomp: program doesn't terminate"),
             SeccompError::InvalidArgIndex => write!(f, "seccomp: invalid argument index"),
             SeccompError::InvalidPromise => write!(f, "seccomp: invalid pledge promise"),
+            SeccompError::OutOfMemory => write!(f, "seccomp: out of memory"),
             SeccompError::NotPermitted => write!(f, "seccomp: operation not permitted"),
             SeccompError::Fault => write!(f, "seccomp: memory fault"),
         }
@@ -855,67 +1113,36 @@ fn validate_program_with_limit(prog: &[SeccompInsn], max_insns: usize) -> Result
 
 /// Compute fast_allow bitmap from program.
 ///
-/// Scans for patterns where a syscall number check leads directly to Allow.
-/// Only sets the fast-allow bit if we can verify the path leads to Ret(Allow).
+/// # R180-2 FIX (class-eliminating semantic equivalence)
 ///
-/// Pattern detected:
-///   LD syscall_nr
-///   JMP_EQ N, offset, ...
-///   ... (at offset) Ret(Allow)
-fn compute_fast_allow(prog: &[SeccompInsn]) -> FastAllowSet {
+/// INV-SEC-01: `fast_allow.get(n)` ⇒ `∀args. interpret(n, args) == Allow`.
+///
+/// Prior walker set a bit when *any* false-branch-chain `JmpEq(n)` true target
+/// was `Ret(Allow)`, even if an earlier same-`n` arm returned `Kill`. That made
+/// the fast path a second, looser policy (sandbox bypass).
+///
+/// Construction:
+/// 1. If the program contains any `LdArg`, return empty (cannot cheaply prove
+///    ∀args; Safety > Efficiency).
+/// 2. Else, by ISA arg-independence, `interpret(n, zeros)` is the action for
+///    all args; set bit `n` iff that action is exactly `Allow`.
+///
+/// Pledge/strict generators emit pure nr whitelists (no `LdArg`), so every
+/// Allowed `nr < 512` still receives a bit and keeps the hot-path optimization.
+fn compute_fast_allow(prog: &[SeccompInsn], default_action: SeccompAction) -> FastAllowSet {
     let mut set = FastAllowSet::empty();
-
-    // R152-I1 FIX: Walk the false-branch chain of JmpEq instructions.
-    //
-    // Pledge/strict filters are generated as a linear chain:
-    //   [0] LdSyscallNr
-    //   [1] JmpEq(nr0, t0, f0)   // true→Ret(Allow), false→next JmpEq
-    //   [2] JmpEq(nr1, t1, f1)
-    //   ...
-    //   [N] Ret(Kill)
-    //
-    // The old implementation only examined prog[1] and missed all subsequent
-    // syscalls. This version walks the false-branch chain to set bits for
-    // every syscall that unconditionally leads to Ret(Allow).
-    //
-    // R145-8 safety: Only trust an entry-point LdSyscallNr at pc=0 to avoid
-    // dead-code fast_allow bits.
-    if prog.len() < 2 {
+    if prog.is_empty() || program_reads_args(prog) {
         return set;
     }
-    if !matches!(prog[0], SeccompInsn::LdSyscallNr) {
-        return set;
-    }
-
-    let mut pc: usize = 1;
-    let mut steps: usize = 0;
-    // Hard cap to prevent infinite loops on malformed programs (should be
-    // caught by validate_seccomp_program, but stay defensive).
-    while pc < prog.len() && steps < prog.len() {
-        steps += 1;
-        match prog[pc] {
-            SeccompInsn::JmpEq(nr, true_off, false_off) => {
-                // Check if the true branch leads directly to Ret(Allow)
-                let true_target = pc + 1 + true_off as usize;
-                if true_target < prog.len()
-                    && matches!(prog[true_target], SeccompInsn::Ret(SeccompAction::Allow))
-                {
-                    if nr < 512 {
-                        set.set(nr as usize);
-                    }
-                }
-
-                // Follow the false branch to the next JmpEq in the chain
-                let next_pc = pc + 1 + false_off as usize;
-                if next_pc <= pc {
-                    break; // Backwards jump — stop to prevent loops
-                }
-                pc = next_pc;
-            }
-            _ => break, // Non-JmpEq instruction — end of chain
+    let zero = [0u64; 6];
+    for nr in 0u64..512 {
+        if matches!(
+            interpret_program(prog, default_action, nr, &zero),
+            SeccompAction::Allow
+        ) {
+            set.set(nr as usize);
         }
     }
-
     set
 }
 

@@ -43,6 +43,7 @@
 //! - **no_new_privs**: Once set, cannot be cleared; prevents privilege escalation
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
@@ -132,6 +133,21 @@ const STRICT_ALLOWED: &[u64] = &[
     231, // exit_group
 ];
 
+const STRICT_PROGRAM: [SeccompInsn; 12] = [
+    SeccompInsn::LdSyscallNr,
+    SeccompInsn::JmpEq(0, 0, 1),
+    SeccompInsn::Ret(SeccompAction::Allow),
+    SeccompInsn::JmpEq(1, 0, 1),
+    SeccompInsn::Ret(SeccompAction::Allow),
+    SeccompInsn::JmpEq(15, 0, 1),
+    SeccompInsn::Ret(SeccompAction::Allow),
+    SeccompInsn::JmpEq(60, 0, 1),
+    SeccompInsn::Ret(SeccompAction::Allow),
+    SeccompInsn::JmpEq(231, 0, 1),
+    SeccompInsn::Ret(SeccompAction::Allow),
+    SeccompInsn::Ret(SeccompAction::Kill),
+];
+
 /// R169-12: Conservative worst-case instruction count for a generated pledge
 /// filter — `1` (LdSyscallNr) + `2` per allowed syscall + `1` (Ret Kill). The
 /// deduped union of every promise's syscall list is 53 today (49 + the 4 M0-6
@@ -154,6 +170,7 @@ const _: () = assert!(WORST_CASE_PLEDGE_INSNS <= types::MAX_TRUSTED_INSNS);
 /// bounded together.
 const WORST_CASE_STRICT_INSNS: usize = 2 + 2 * STRICT_ALLOWED.len();
 const _: () = assert!(WORST_CASE_STRICT_INSNS <= types::MAX_TRUSTED_INSNS);
+const _: () = assert!(STRICT_PROGRAM.len() == WORST_CASE_STRICT_INSNS);
 
 /// R169-12: Minimal fail-closed filter — a single `Ret(Kill)` with a `Kill`
 /// default action (deny everything). Used as the panic-free fallback for the
@@ -163,33 +180,31 @@ const _: () = assert!(WORST_CASE_STRICT_INSNS <= types::MAX_TRUSTED_INSNS);
 /// valid (non-empty, has a terminator, no jumps), so this construction cannot
 /// itself fail. Deny-all is the safe direction.
 fn deny_all_filter() -> SeccompFilter {
-    let mut prog = Vec::new();
-    prog.push(SeccompInsn::Ret(SeccompAction::Kill));
-    SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
+    let prog = [SeccompInsn::Ret(SeccompAction::Kill)];
+    SeccompFilter::new_trusted_from_slice(&prog, SeccompAction::Kill, SeccompFlags::empty())
         .expect("minimal [Ret(Kill)] filter is always valid")
+}
+
+/// RF180-18 FIX: fallible strict-filter construction for user installation.
+pub fn try_strict_filter() -> Result<SeccompFilter, SeccompError> {
+    SeccompFilter::new_trusted_from_slice(
+        &STRICT_PROGRAM,
+        SeccompAction::Kill,
+        SeccompFlags::empty(),
+    )
+}
+
+/// Allocation-free strict-filter identity for PR_GET_SECCOMP.
+pub fn strict_filter_id() -> u64 {
+    SeccompFilter::program_id(&STRICT_PROGRAM)
 }
 
 /// Create a filter for strict mode.
 pub fn strict_filter() -> SeccompFilter {
-    let mut prog = Vec::new();
-
-    // Load syscall number
-    prog.push(SeccompInsn::LdSyscallNr);
-
-    // Check against whitelist
-    for &nr in STRICT_ALLOWED {
-        prog.push(SeccompInsn::JmpEq(nr, 0, 1)); // If equal, fall through to Allow
-        prog.push(SeccompInsn::Ret(SeccompAction::Allow));
-    }
-
-    // Default: kill
-    prog.push(SeccompInsn::Ret(SeccompAction::Kill));
-
     // R169-12 FIX: trusted generator — validate against MAX_TRUSTED_INSNS and
     // FAIL CLOSED (deny-all [Ret(Kill)]) rather than panic if a future
     // STRICT_ALLOWED expansion ever overruns the bound.
-    SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
-        .unwrap_or_else(|_| deny_all_filter())
+    try_strict_filter().unwrap_or_else(|_| deny_all_filter())
 }
 
 // ============================================================================
@@ -554,6 +569,9 @@ pub fn run_seccomp_cap_self_test() {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -609,13 +627,56 @@ mod tests {
         assert!(!state.has_filters());
 
         // Add a strict filter
-        state.add_filter(strict_filter());
+        state
+            .add_filter(strict_filter())
+            .expect("strict filter admission");
         assert!(state.has_filters());
 
         // Evaluate
         let args = [0u64; 6];
         assert_eq!(state.evaluate(0, &args).action, SeccompAction::Allow);
         assert_eq!(state.evaluate(57, &args).action, SeccompAction::Kill);
+    }
+
+    #[test]
+    fn rf180_28_filter_arc_charge_follows_the_complete_control_block_lifetime() {
+        let mut original = SeccompState::new();
+        original
+            .add_filter(strict_filter())
+            .expect("strict filter admission");
+        let retained = Arc::clone(&original.filters()[0]);
+        let allocator = *Arc::allocator(&retained);
+        let expected_charge = allocator.charge_bytes_for_test();
+        assert!(expected_charge >= core::mem::size_of::<SeccompFilter>());
+
+        let cloned = original.try_clone().expect("fallible seccomp clone");
+        assert!(Arc::ptr_eq(&original.filters()[0], &cloned.filters()[0]));
+        assert_eq!(Arc::strong_count(&cloned.filters()[0]), 3);
+
+        let weak = Arc::downgrade(&retained);
+
+        drop(original);
+        drop(cloned);
+        assert_eq!(Arc::strong_count(&retained), 1);
+        assert_eq!(
+            allocator.charge_bytes_for_test(),
+            expected_charge,
+            "the allocation charge must survive the state that installed it"
+        );
+
+        drop(retained);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            allocator.charge_bytes_for_test(),
+            expected_charge,
+            "a weak handle still retains the Arc control block"
+        );
+        drop(weak);
+        assert_eq!(
+            allocator.charge_bytes_for_test(),
+            0,
+            "the final weak drop must release the allocation charge"
+        );
     }
 
     #[test]
@@ -660,5 +721,91 @@ mod tests {
         let args = [0u64, 0, PROT_EXEC, 0, 0, 0];
         assert!(!vm_only.allows(10, &args)); // SYS_MPROTECT
         assert!(vm_with_exec.allows(10, &args));
+    }
+
+    /// R180-2: overlapping JmpEq on the same nr — first Kill must win; fast bit clear.
+    #[test]
+    fn r180_2_overlapping_jmpeq_must_not_fast_allow() {
+        let x = 42u64;
+        let prog = vec![
+            SeccompInsn::LdSyscallNr,
+            SeccompInsn::JmpEq(x, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Kill),
+            SeccompInsn::JmpEq(x, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Allow),
+            SeccompInsn::Ret(SeccompAction::Kill),
+        ];
+        let f = SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty()).unwrap();
+        let args = [0u64; 6];
+        assert_eq!(f.evaluate(x, &args), SeccompAction::Kill);
+        assert!(!f.fast_allows(x));
+    }
+
+    /// R180-2: first-match Allow still fast-paths.
+    #[test]
+    fn r180_2_first_allow_wins_fast_path() {
+        let x = 7u64;
+        let prog = vec![
+            SeccompInsn::LdSyscallNr,
+            SeccompInsn::JmpEq(x, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Allow),
+            SeccompInsn::JmpEq(x, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Kill),
+            SeccompInsn::Ret(SeccompAction::Kill),
+        ];
+        let f = SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty()).unwrap();
+        assert_eq!(f.evaluate(x, &[0; 6]), SeccompAction::Allow);
+        assert!(f.fast_allows(x));
+    }
+
+    /// R180-2: any LdArg disables the entire fast_allow set (fail-closed).
+    #[test]
+    fn r180_2_ldarg_disables_fast_allow() {
+        let prog = vec![
+            SeccompInsn::LdArg(0),
+            SeccompInsn::JmpEq(0, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Allow),
+            SeccompInsn::Ret(SeccompAction::Kill),
+        ];
+        let f = SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty()).unwrap();
+        assert_eq!(f.evaluate(0, &[0; 6]), SeccompAction::Allow);
+        assert_eq!(f.evaluate(0, &[1, 0, 0, 0, 0, 0]), SeccompAction::Kill);
+        for n in 0u64..512 {
+            assert!(!f.fast_allows(n), "LdArg must suppress all fast bits");
+        }
+    }
+
+    /// R180-2: Log is not Allow — must not set the bit (side effects / severity).
+    #[test]
+    fn r180_2_log_is_not_fast_allow() {
+        let prog = vec![
+            SeccompInsn::LdSyscallNr,
+            SeccompInsn::JmpEq(0, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Log),
+            SeccompInsn::Ret(SeccompAction::Kill),
+        ];
+        let f = SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty()).unwrap();
+        assert_eq!(f.evaluate(0, &[0; 6]), SeccompAction::Log);
+        assert!(!f.fast_allows(0));
+    }
+
+    /// R180-2: pledge/strict generators still receive fast bits (efficiency).
+    #[test]
+    fn r180_2_strict_and_pledge_keep_fast_path() {
+        let strict = strict_filter();
+        for nr in [0u64, 1, 15, 60, 231] {
+            assert_eq!(strict.evaluate(nr, &[0; 6]), SeccompAction::Allow);
+            assert!(strict.fast_allows(nr));
+        }
+        assert!(!strict.fast_allows(2));
+        assert_eq!(strict.evaluate(2, &[0; 6]), SeccompAction::Kill);
+
+        let stdio = pledge_to_filter(PledgePromises::STDIO);
+        for nr in [0u64, 1, 3, 60, 231] {
+            assert_eq!(stdio.evaluate(nr, &[0; 6]), SeccompAction::Allow);
+            assert!(stdio.fast_allows(nr));
+        }
+        assert!(!stdio.fast_allows(57));
+        assert_eq!(stdio.evaluate(57, &[0; 6]), SeccompAction::Kill);
     }
 }
