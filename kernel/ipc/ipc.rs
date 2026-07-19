@@ -9,11 +9,20 @@
 //! - R75-2 FIX: 按 IPC 命名空间分区端点表
 
 use alloc::{
+    alloc::{AllocError, Allocator, Global},
     collections::{BTreeMap, VecDeque},
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    alloc::Layout,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
+};
+use mm::{
+    arc_charge_bytes, try_reserve_heap, AdmittedAllocError, AdmittedDeque, HeapCharge, HeapClass,
+    PreparedAdmittedDequeCapacity, RetiredAdmittedDequeCapacity,
+};
 use spin::Mutex;
 
 use crate::process::{self, ProcessId};
@@ -287,16 +296,41 @@ impl EndpointRegistry {
     /// 清理进程的所有端点（进程退出时调用）
     ///
     /// R75-2 FIX: 只清理指定命名空间内该进程的端点
-    fn cleanup_process(&mut self, ns_id: NamespaceId, pid: ProcessId) {
-        if let Some(endpoints) = self
+    /// R180-5 FIX: only remove endpoints whose `owner_generation` matches the
+    /// reaped identity. A successor may already own `(ns, pid)` after slot
+    /// recycle; its endpoints carry a different generation and must survive.
+    fn remove_one_process_endpoint(
+        &mut self,
+        ns_id: NamespaceId,
+        pid: ProcessId,
+        generation: u64,
+    ) -> Option<EndpointId> {
+        // RF180-3 FIX: stream one bounded endpoint removal at a time.  The
+        // previous repair collected the same ID set twice with infallible Vec
+        // allocation in exit cleanup, reopening teardown-OOM panic exposure.
+        let endpoint_id = self
             .per_ns
-            .get_mut(&ns_id)
-            .and_then(|by_pid| by_pid.remove(&pid))
-        {
-            for endpoint_id in endpoints.keys() {
-                self.owner_index.remove(endpoint_id);
+            .get(&ns_id)
+            .and_then(|by_pid| by_pid.get(&pid))
+            .and_then(|table| {
+                table
+                    .iter()
+                    .find(|(_, endpoint)| endpoint.owner_generation == generation)
+                    .map(|(id, _)| *id)
+            })?;
+
+        let mut remove_pid_bucket = false;
+        if let Some(by_pid) = self.per_ns.get_mut(&ns_id) {
+            if let Some(table) = by_pid.get_mut(&pid) {
+                table.remove(&endpoint_id);
+                remove_pid_bucket = table.is_empty();
+            }
+            if remove_pid_bucket {
+                by_pid.remove(&pid);
             }
         }
+        self.owner_index.remove(&endpoint_id);
+        Some(endpoint_id)
     }
 }
 
@@ -584,6 +618,8 @@ pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
 /// 此函数应在进程终止时由进程管理子系统调用。
 ///
 /// R75-2 FIX: 接受 IPC 命名空间 ID 用于按命名空间清理端点
+/// R180-5 FIX: `generation` filters which endpoints are reaped so a recycled
+/// PID's successor cannot lose freshly-created endpoints.
 ///
 /// # X-6 安全修复
 ///
@@ -593,26 +629,17 @@ pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
 /// **重要**：必须先移除端点注册，再清理等待队列。这确保被唤醒的线程
 /// 在下一次 receive_message 时立即看到 EndpointNotFound，避免重新创建
 /// 新的等待队列导致再次阻塞。
-pub fn cleanup_process_endpoints(ns_id: NamespaceId, pid: ProcessId) {
-    // X-6 修复：先收集该进程的所有端点 ID
-    let endpoint_ids: Vec<EndpointId> = {
-        let registry = ENDPOINTS.lock();
-        registry
-            .per_ns
-            .get(&ns_id)
-            .and_then(|by_pid| by_pid.get(&pid))
-            .map(|table| table.keys().copied().collect())
-            .unwrap_or_default()
-    };
-
-    // X-6 修复：先移除端点注册
-    // 确保被唤醒的线程在下一次 receive 时立即看到 EndpointNotFound
-    // 避免在等待队列清理后重新创建新的等待队列导致再次阻塞
-    ENDPOINTS.lock().cleanup_process(ns_id, pid);
-
-    // 然后清理每个端点的等待队列，唤醒阻塞的进程
-    for endpoint_id in &endpoint_ids {
-        cleanup_wait_queue(*endpoint_id);
+pub fn cleanup_process_endpoints(ns_id: NamespaceId, pid: ProcessId, generation: u64) {
+    // X-6 + R180-5 + RF180-3: remove registry state before each wake/close,
+    // without any heap snapshot.  Successor-generation endpoints remain.
+    loop {
+        let endpoint_id = ENDPOINTS
+            .lock()
+            .remove_one_process_endpoint(ns_id, pid, generation);
+        match endpoint_id {
+            Some(id) => cleanup_wait_queue(id),
+            None => break,
+        }
     }
 }
 
@@ -642,7 +669,168 @@ pub fn get_queue_length(endpoint_id: EndpointId) -> Result<usize, IpcError> {
 // ============================================================================
 
 use crate::sync::WaitQueue;
-use alloc::collections::BTreeMap as WaitQueueMap;
+
+const ENDPOINT_WAIT_QUEUE_ARC_MIN_CHARGE: usize =
+    core::mem::size_of::<WaitQueue>() + 4 * core::mem::size_of::<usize>();
+const ENDPOINT_WAIT_QUEUE_ARC_SLOTS: usize =
+    HeapClass::BlockingIo.limit_bytes() / ENDPOINT_WAIT_QUEUE_ARC_MIN_CHARGE + 1;
+const _: () = assert!(ENDPOINT_WAIT_QUEUE_ARC_SLOTS <= u16::MAX as usize);
+
+struct EndpointWaitQueueArcChargeSlot {
+    generation: u64,
+    allocated: bool,
+    charge: HeapCharge,
+}
+
+static ENDPOINT_WAIT_QUEUE_ARC_CHARGES: Mutex<
+    [Option<EndpointWaitQueueArcChargeSlot>; ENDPOINT_WAIT_QUEUE_ARC_SLOTS],
+> = Mutex::new([const { None }; ENDPOINT_WAIT_QUEUE_ARC_SLOTS]);
+static NEXT_ENDPOINT_WAIT_QUEUE_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug)]
+struct EndpointWaitQueueArcAllocator {
+    slot: u16,
+    generation: u64,
+}
+
+impl EndpointWaitQueueArcAllocator {
+    fn try_install(charge: HeapCharge) -> Result<Self, HeapCharge> {
+        let generation = match NEXT_ENDPOINT_WAIT_QUEUE_ARC_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => return Err(charge),
+        };
+
+        let mut charge = Some(charge);
+        let mut slots = ENDPOINT_WAIT_QUEUE_ARC_CHARGES.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(EndpointWaitQueueArcChargeSlot {
+                    generation,
+                    allocated: false,
+                    charge: charge
+                        .take()
+                        .expect("endpoint wait-queue Arc charge moved once"),
+                });
+                return Ok(Self {
+                    slot: index as u16,
+                    generation,
+                });
+            }
+        }
+        Err(charge.expect("endpoint wait-queue Arc slot scan retained charge"))
+    }
+
+    fn take_charge(self) -> HeapCharge {
+        let mut slots = ENDPOINT_WAIT_QUEUE_ARC_CHARGES.lock();
+        let slot = slots
+            .get_mut(self.slot as usize)
+            .expect("RF180-42 endpoint wait-queue Arc slot out of range");
+        match slot.as_ref() {
+            Some(entry) if entry.generation == self.generation => {}
+            Some(_) => panic!("RF180-42 stale endpoint wait-queue Arc generation"),
+            None => panic!("RF180-42 endpoint wait-queue Arc charge released twice"),
+        }
+        slot.take()
+            .expect("validated endpoint wait-queue Arc charge disappeared")
+            .charge
+    }
+
+    fn cancel_failed_allocation(self) {
+        drop(self.take_charge());
+    }
+
+    #[cfg(test)]
+    fn charge_is_live_for_test(self) -> bool {
+        ENDPOINT_WAIT_QUEUE_ARC_CHARGES
+            .lock()
+            .get(self.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| entry.generation == self.generation)
+    }
+}
+
+unsafe impl Allocator for EndpointWaitQueueArcAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        {
+            let mut slots = ENDPOINT_WAIT_QUEUE_ARC_CHARGES.lock();
+            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+                return Err(AllocError);
+            };
+            if entry.generation != self.generation || entry.allocated {
+                return Err(AllocError);
+            }
+            entry.allocated = true;
+        }
+
+        match Global.allocate(layout) {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                let mut slots = ENDPOINT_WAIT_QUEUE_ARC_CHARGES.lock();
+                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                    if entry.generation == self.generation {
+                        entry.allocated = false;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { Global.deallocate(ptr, layout) };
+        drop(self.take_charge());
+    }
+}
+
+type EndpointWaitQueueArc = Arc<WaitQueue, EndpointWaitQueueArcAllocator>;
+type EndpointWaitQueueEntry = (EndpointId, EndpointWaitQueueArc);
+
+struct EndpointWaitQueueRegistry {
+    entries: AdmittedDeque<EndpointWaitQueueEntry>,
+}
+
+impl EndpointWaitQueueRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: AdmittedDeque::new(HeapClass::BlockingIo),
+        }
+    }
+
+    fn get(&self, endpoint_id: EndpointId) -> Option<&EndpointWaitQueueArc> {
+        self.entries
+            .iter()
+            .find(|(queued_id, _)| *queued_id == endpoint_id)
+            .map(|(_, queue)| queue)
+    }
+
+    fn max_id(&self) -> Option<EndpointId> {
+        self.entries.iter().map(|(id, _)| *id).max()
+    }
+
+    fn next_after(
+        &self,
+        after: Option<EndpointId>,
+        upper: EndpointId,
+    ) -> Option<(EndpointId, EndpointWaitQueueArc)> {
+        self.entries
+            .iter()
+            .filter(|(id, _)| after.is_none_or(|cursor| *id > cursor) && *id <= upper)
+            .min_by_key(|(id, _)| *id)
+            .map(|(id, queue)| (*id, queue.clone()))
+    }
+
+    fn remove_retaining(&mut self, endpoint_id: EndpointId) -> Option<EndpointWaitQueueEntry> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|(queued_id, _)| *queued_id == endpoint_id)?;
+        self.entries.remove_retaining_capacity(pos)
+    }
+}
 
 lazy_static::lazy_static! {
     /// 每端点等待队列：用于阻塞接收
@@ -651,8 +839,113 @@ lazy_static::lazy_static! {
     ///
     /// 使用 Arc<WaitQueue> 引用计数，避免在锁外访问时发生 use-after-free。
     /// 当端点销毁时，通过 close() 关闭队列，唤醒所有等待者。
-    static ref ENDPOINT_WAIT_QUEUES: spin::Mutex<WaitQueueMap<EndpointId, Arc<WaitQueue>>> =
-        spin::Mutex::new(WaitQueueMap::new());
+    static ref ENDPOINT_WAIT_QUEUES: spin::Mutex<EndpointWaitQueueRegistry> =
+        spin::Mutex::new(EndpointWaitQueueRegistry::new());
+}
+
+fn prepare_endpoint_wait_queue_registry_growth(
+    len: usize,
+    capacity: usize,
+) -> Result<Option<PreparedAdmittedDequeCapacity<EndpointWaitQueueEntry>>, AdmittedAllocError> {
+    let required = len.checked_add(1).ok_or(AdmittedAllocError::Admission(
+        mm::HeapAdmissionError::ArithmeticOverflow,
+    ))?;
+    if required <= capacity {
+        return Ok(None);
+    }
+    let preferred = capacity
+        .max(4)
+        .checked_mul(2)
+        .map(|doubled| doubled.max(required))
+        .ok_or(AdmittedAllocError::Admission(
+            mm::HeapAdmissionError::ArithmeticOverflow,
+        ))?;
+    match PreparedAdmittedDequeCapacity::try_new(HeapClass::BlockingIo, preferred) {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(_) if preferred != required => {
+            PreparedAdmittedDequeCapacity::try_new(HeapClass::BlockingIo, required).map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn try_new_endpoint_wait_queue_arc() -> Result<EndpointWaitQueueArc, IpcError> {
+    let bytes = arc_charge_bytes::<WaitQueue>().map_err(|_| IpcError::NoMemory)?;
+    let reservation =
+        try_reserve_heap(HeapClass::BlockingIo, bytes).map_err(|_| IpcError::NoMemory)?;
+    let charge = reservation.commit().map_err(|_| IpcError::NoMemory)?;
+    let allocator = EndpointWaitQueueArcAllocator::try_install(charge).map_err(|charge| {
+        drop(charge);
+        IpcError::NoMemory
+    })?;
+    match Arc::try_new_in(WaitQueue::new(HeapClass::BlockingIo), allocator) {
+        Ok(queue) => Ok(queue),
+        Err(_) => {
+            allocator.cancel_failed_allocation();
+            Err(IpcError::NoMemory)
+        }
+    }
+}
+
+enum EndpointWaitQueuePublish {
+    Ready(EndpointWaitQueueArc),
+    RetryCapacity,
+}
+
+fn publish_endpoint_wait_queue_candidate(
+    registry: &Mutex<EndpointWaitQueueRegistry>,
+    endpoint_id: EndpointId,
+    candidate: &mut Option<EndpointWaitQueueArc>,
+    prepared: &mut Option<PreparedAdmittedDequeCapacity<EndpointWaitQueueEntry>>,
+    retired: &mut Option<RetiredAdmittedDequeCapacity<EndpointWaitQueueEntry>>,
+) -> EndpointWaitQueuePublish {
+    let mut queues = registry.lock();
+    if let Some(existing) = queues.get(endpoint_id) {
+        return EndpointWaitQueuePublish::Ready(existing.clone());
+    }
+
+    if queues.entries.len() == queues.entries.capacity() {
+        let Some(backing) = prepared.take() else {
+            return EndpointWaitQueuePublish::RetryCapacity;
+        };
+        if backing.class() != queues.entries.class() || backing.capacity() <= queues.entries.len() {
+            *prepared = Some(backing);
+            return EndpointWaitQueuePublish::RetryCapacity;
+        }
+        debug_assert!(retired.is_none());
+        *retired = Some(
+            queues
+                .entries
+                .install_prepared_deferred(backing)
+                .expect("RF180-42 endpoint registry prepared-capacity invariant"),
+        );
+    }
+
+    let queue = candidate
+        .take()
+        .expect("endpoint wait-queue candidate consumed once");
+    let result = queue.clone();
+    queues
+        .entries
+        .push_back_reserved((endpoint_id, queue))
+        .unwrap_or_else(|_| panic!("RF180-42 endpoint registry capacity vanished under lock"));
+    EndpointWaitQueuePublish::Ready(result)
+}
+
+fn detach_endpoint_wait_queue_from(
+    registry: &Mutex<EndpointWaitQueueRegistry>,
+    endpoint_id: EndpointId,
+) -> Option<EndpointWaitQueueArc> {
+    let (removed, retired) = {
+        let mut queues = registry.lock();
+        let removed = queues.remove_retaining(endpoint_id);
+        let retired = queues.entries.take_empty_capacity();
+        (removed, retired)
+    };
+    // The obsolete registry backing and any removed Arc are destroyed only
+    // after the registry lock is released.
+    drop(retired);
+    removed.map(|(_, queue)| queue)
 }
 
 /// 获取或创建端点的等待队列
@@ -660,12 +953,34 @@ lazy_static::lazy_static! {
 /// # X-6 安全增强
 ///
 /// 返回 Arc<WaitQueue> 而非裸指针，确保引用计数正确管理内存。
-fn get_or_create_wait_queue(endpoint_id: EndpointId) -> Arc<WaitQueue> {
-    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-    queues
-        .entry(endpoint_id)
-        .or_insert_with(|| Arc::new(WaitQueue::new()))
-        .clone()
+fn get_or_create_wait_queue(endpoint_id: EndpointId) -> Result<EndpointWaitQueueArc, IpcError> {
+    if let Some(existing) = ENDPOINT_WAIT_QUEUES.lock().get(endpoint_id).cloned() {
+        return Ok(existing);
+    }
+
+    let mut candidate = Some(try_new_endpoint_wait_queue_arc()?);
+    loop {
+        let (len, capacity) = {
+            let queues = ENDPOINT_WAIT_QUEUES.lock();
+            (queues.entries.len(), queues.entries.capacity())
+        };
+        let mut prepared = prepare_endpoint_wait_queue_registry_growth(len, capacity)
+            .map_err(|_| IpcError::NoMemory)?;
+        let mut retired = None;
+        let outcome = publish_endpoint_wait_queue_candidate(
+            &ENDPOINT_WAIT_QUEUES,
+            endpoint_id,
+            &mut candidate,
+            &mut prepared,
+            &mut retired,
+        );
+        drop(retired);
+        drop(prepared);
+        match outcome {
+            EndpointWaitQueuePublish::Ready(queue) => return Ok(queue),
+            EndpointWaitQueuePublish::RetryCapacity => continue,
+        }
+    }
 }
 
 /// 发送消息并唤醒等待的接收者
@@ -678,7 +993,7 @@ pub fn send_message_notify(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(),
     // X-6: 克隆 Arc 后再释放锁，避免在持有锁时调用 wake
     let wq = {
         let queues = ENDPOINT_WAIT_QUEUES.lock();
-        queues.get(&endpoint_id).cloned()
+        queues.get(endpoint_id).cloned()
     };
 
     if let Some(wq) = wq {
@@ -714,13 +1029,13 @@ pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessa
         //
         // Now: register in WaitQueue FIRST, then check for messages.
         // If a message arrived between registration and check, cancel_wait.
-        let wq = get_or_create_wait_queue(endpoint_id);
+        let wq = get_or_create_wait_queue(endpoint_id)?;
 
         if wq.is_closed() {
             return Err(IpcError::EndpointNotFound);
         }
 
-        if !wq.prepare_to_wait() {
+        if let Err(prepare_failure) = wq.prepare_to_wait() {
             if wq.is_closed() {
                 return Err(IpcError::EndpointNotFound);
             }
@@ -752,7 +1067,15 @@ pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessa
                     return Err(IpcError::Interrupted);
                 }
             }
-            return Err(IpcError::NoCurrentProcess);
+            return Err(match prepare_failure {
+                crate::sync::WaitOutcome::ResourceExhausted => IpcError::NoMemory,
+                crate::sync::WaitOutcome::Closed => IpcError::EndpointNotFound,
+                crate::sync::WaitOutcome::Interrupted => IpcError::Interrupted,
+                crate::sync::WaitOutcome::NoProcess => IpcError::NoCurrentProcess,
+                crate::sync::WaitOutcome::Woken | crate::sync::WaitOutcome::TimedOut => {
+                    IpcError::NoCurrentProcess
+                }
+            });
         }
 
         // Re-check for messages AFTER registering in the WaitQueue.
@@ -773,8 +1096,10 @@ pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessa
                 // non-existent endpoints leak WaitQueue entries in the global
                 // BTreeMap, causing unbounded memory growth.
                 if matches!(e, IpcError::EndpointNotFound) {
-                    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-                    queues.remove(&endpoint_id);
+                    drop(detach_endpoint_wait_queue_from(
+                        &ENDPOINT_WAIT_QUEUES,
+                        endpoint_id,
+                    ));
                 }
                 return Err(e);
             }
@@ -818,29 +1143,151 @@ pub fn receive_message_with_retries(
 /// 1. 设置 closed 标志，阻止新的等待者加入
 /// 2. 唤醒所有现有等待者
 /// 3. 等待者被唤醒后会检查 is_closed() 并返回错误
-/// R156-6 FIX: Remove stale WaitQueue entries for an exiting process.
-/// Prevents PID reuse misclassification from leftover timed_out entries.
-pub fn cleanup_waitqueues_for_pid(pid: ProcessId) {
-    let queues: Vec<Arc<WaitQueue>> = {
+/// R156-6 + R180-5 FIX: Remove stale WaitQueue entries for a reaped identity.
+///
+/// `generation` is the reaped process's PCB generation captured under the PCB
+/// lock before the table slot was cleared. Entries stamped with a process
+/// generation (PROCESS_GEN_TAG) are removed only on exact match; untagged
+/// entries for `pid` are removed only when no live successor owns the PID
+/// (or the live PCB generation still matches).
+pub fn cleanup_waitqueues_for_pid(pid: ProcessId, generation: u64) {
+    // RF180-3 FIX: bound the allocation-free walk to queues that existed at
+    // entry. Endpoint IDs are monotonic and never reused, so a cursor through
+    // this upper bound cannot miss an old queue or loop on concurrent creation.
+    let upper = {
         let wqs = ENDPOINT_WAIT_QUEUES.lock();
-        wqs.values().cloned().collect()
+        wqs.max_id()
     };
-    for wq in queues {
-        wq.cleanup_for_pid(pid);
+    let Some(upper) = upper else {
+        return;
+    };
+
+    let mut after = None;
+    loop {
+        let next = {
+            let wqs = ENDPOINT_WAIT_QUEUES.lock();
+            wqs.next_after(after, upper)
+        };
+        let Some((id, queue)) = next else {
+            break;
+        };
+        queue.cleanup_for_identity(pid, generation);
+        after = Some(id);
     }
 }
 
 fn cleanup_wait_queue(endpoint_id: EndpointId) {
     // X-6: 先取出 Arc，再释放锁后调用 close()
     // 这避免了在持有锁时调用可能导致调度的操作
-    let wq = {
-        let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-        queues.remove(&endpoint_id)
-    };
+    let wq = detach_endpoint_wait_queue_from(&ENDPOINT_WAIT_QUEUES, endpoint_id);
 
     if let Some(wq) = wq {
         // 关闭队列并唤醒所有等待者
         // 被唤醒的进程会检查 is_closed() 并返回 EndpointNotFound
         wq.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_wait_queue_arc_charge_releases_after_final_weak() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::BlockingIo);
+
+        let queue = try_new_endpoint_wait_queue_arc().expect("endpoint wait-queue Arc");
+        let allocator = *Arc::allocator(&queue);
+        let weak = Arc::downgrade(&queue);
+        drop(queue);
+        assert!(
+            allocator.charge_is_live_for_test(),
+            "payload drop must retain the endpoint wait-queue Arc charge"
+        );
+
+        drop(weak);
+        assert!(!allocator.charge_is_live_for_test());
+        assert_eq!(mm::heap_class_snapshot(HeapClass::BlockingIo), before);
+    }
+
+    #[test]
+    fn endpoint_wait_queue_publish_race_rolls_back_candidate_and_backing() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::BlockingIo);
+        let registry = Mutex::new(EndpointWaitQueueRegistry::new());
+        let endpoint_id = 0x1804_0042;
+
+        let mut winner = Some(try_new_endpoint_wait_queue_arc().expect("winner Arc"));
+        let mut winner_backing =
+            prepare_endpoint_wait_queue_registry_growth(0, 0).expect("winner backing");
+        let mut winner_retired = None;
+        let published = match publish_endpoint_wait_queue_candidate(
+            &registry,
+            endpoint_id,
+            &mut winner,
+            &mut winner_backing,
+            &mut winner_retired,
+        ) {
+            EndpointWaitQueuePublish::Ready(queue) => queue,
+            EndpointWaitQueuePublish::RetryCapacity => {
+                panic!("winner publish unexpectedly retried")
+            }
+        };
+        drop(winner_retired);
+        drop(winner_backing);
+        drop(published);
+        let winner_only = mm::heap_class_snapshot(HeapClass::BlockingIo);
+
+        // Model a publisher that prepared from a stale full snapshot while the
+        // winner raced in. Neither its Arc nor its detached oversized backing
+        // may become reachable or remain charged after the locked recheck.
+        let mut loser = Some(try_new_endpoint_wait_queue_arc().expect("loser Arc"));
+        let replacement_target = registry
+            .lock()
+            .entries
+            .capacity()
+            .checked_add(8)
+            .expect("test registry capacity");
+        let mut loser_backing = Some(
+            PreparedAdmittedDequeCapacity::try_new(HeapClass::BlockingIo, replacement_target)
+                .expect("loser detached backing"),
+        );
+        let mut loser_retired = None;
+        let observed = match publish_endpoint_wait_queue_candidate(
+            &registry,
+            endpoint_id,
+            &mut loser,
+            &mut loser_backing,
+            &mut loser_retired,
+        ) {
+            EndpointWaitQueuePublish::Ready(queue) => queue,
+            EndpointWaitQueuePublish::RetryCapacity => panic!("existing winner must not retry"),
+        };
+        assert!(
+            loser.is_some(),
+            "losing Arc candidate was incorrectly published"
+        );
+        assert!(
+            loser_backing.is_some(),
+            "losing detached backing was incorrectly installed"
+        );
+        assert!(loser_retired.is_none());
+        drop(observed);
+        drop(loser);
+        drop(loser_backing);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::BlockingIo),
+            winner_only,
+            "losing publication leaked admission or registry state"
+        );
+
+        let removed =
+            detach_endpoint_wait_queue_from(&registry, endpoint_id).expect("winner registry entry");
+        assert_eq!(registry.lock().entries.capacity(), 0);
+        drop(removed);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::BlockingIo), before);
     }
 }

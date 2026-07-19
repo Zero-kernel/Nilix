@@ -3,8 +3,6 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
-use alloc::boxed::Box;
-
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
@@ -12,12 +10,18 @@ extern crate drivers;
 extern crate klog;
 
 pub use kernel_core::process;
-use kernel_core::{FileOps, NamespaceId, SyscallError};
+use kernel_core::{NamespaceId, SyscallError};
 
 pub mod futex;
 pub mod ipc;
 pub mod pipe;
 pub mod sync;
+
+/// Serializes hosted tests that assert exact snapshots of the shared heap
+/// admission ledger.  A module-local lock is insufficient because endpoint,
+/// pipe, and RAMFS-backed IPC tests execute in parallel within one test binary.
+#[cfg(test)]
+pub(crate) static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 pub use ipc::{
     cleanup_process_endpoints, destroy_endpoint, get_queue_length, grant_access, receive_message,
@@ -26,7 +30,8 @@ pub use ipc::{
 };
 
 pub use sync::{
-    init_waitqueue_timers, run_futex_lost_wake_prepare_self_test, run_process_gen_stamp_self_test,
+    init_waitqueue_timers, run_blocking_sync_failure_self_test,
+    run_futex_lost_wake_prepare_self_test, run_process_gen_stamp_self_test,
     run_wq_timeout_drain_self_test, CondVar, KMutex, Semaphore, WaitOutcome, WaitQueue,
 };
 
@@ -117,8 +122,32 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // 创建管道（锁外 — 对象创建没有 cap/fd 副作用）
-    let (mut read_handle, mut write_handle) =
+    let (read_handle, write_handle) =
         create_pipe(PipeFlags::default()).map_err(pipe_error_to_syscall)?;
+
+    // Admit and physically allocate both exact-lifetime descriptor owners
+    // before any cap/fd state is created. Finalization below is infallible.
+    let read_prepared = match PipeHandle::try_prepare_descriptor() {
+        Ok(prepared) => prepared,
+        Err(()) => {
+            drop(read_handle);
+            drop(write_handle);
+            return Err(SyscallError::ENOMEM);
+        }
+    };
+    let write_prepared = match PipeHandle::try_prepare_descriptor() {
+        Ok(prepared) => prepared,
+        Err(()) => {
+            drop(read_prepared);
+            drop(read_handle);
+            drop(write_handle);
+            return Err(SyscallError::ENOMEM);
+        }
+    };
+    let mut read_handle = Some(read_handle);
+    let mut write_handle = Some(write_handle);
+    let mut read_prepared = Some(read_prepared);
+    let mut write_prepared = Some(write_prepared);
 
     // R170-6 FIX (D2-FD-DROP-UNDER-LOCK): every rollback object is bound
     // OUTSIDE the lock scope so its Drop (PipeHandle close → wake paths)
@@ -126,13 +155,28 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     // extract-then-drop pattern in `fd_close_callback` below (R155-3). The
     // `remove_fd` uncharge itself stays under the lock (it reverses THIS
     // call's charge); only the object teardown is deferred.
-    let mut rollback_outside: [Option<Box<dyn FileOps>>; 2] = [None, None];
+    let mut rollback_outside: [Option<PipeHandle>; 2] = [None, None];
     let alloc_result: Result<(i32, i32), SyscallError> = 'install: {
         let mut proc = process.lock(); // SINGLE lock acquisition (CRITICAL-1)
 
         // LSM subject from the LOCKED proc's current creds (CRITICAL-3).
         let proc_ctx = kernel_core::lsm_process_ctx_from(&proc);
-        let pipe_id = read_handle.pipe_id();
+        let pipe_id = read_handle.as_ref().expect("private read handle").pipe_id();
+
+        // Reserve both admitted FD-table slots and files.max charges before
+        // allocating either capability. Both later publications are therefore
+        // allocation-free and cannot partially fail.
+        let Some(read_fd) = proc.reserve_fd() else {
+            rollback_outside[0] = read_handle.take();
+            rollback_outside[1] = write_handle.take();
+            break 'install Err(SyscallError::EMFILE);
+        };
+        let Some(write_fd) = proc.reserve_fd() else {
+            assert!(proc.cancel_fd_reservation(read_fd));
+            rollback_outside[0] = read_handle.take();
+            rollback_outside[1] = write_handle.take();
+            break 'install Err(SyscallError::EMFILE);
+        };
 
         // Allocate BOTH caps before EITHER fd install (CRITICAL-6), each
         // LSM-gated + audit-emitting (cap_allocate_with_lsm — the exact
@@ -151,8 +195,10 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
             Ok(id) => id,
             Err(e) => {
                 // Nothing cap-allocated yet — both handles tear down outside.
-                rollback_outside[0] = Some(Box::new(read_handle));
-                rollback_outside[1] = Some(Box::new(write_handle));
+                assert!(proc.cancel_fd_reservation(write_fd));
+                assert!(proc.cancel_fd_reservation(read_fd));
+                rollback_outside[0] = read_handle.take();
+                rollback_outside[1] = write_handle.take();
                 break 'install Err(e);
             }
         };
@@ -172,50 +218,45 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
                 // design-v3 Fix 1 (CRITICAL-4): the read cap is now an orphan
                 // (no fd will ever carry it) — cap-only rollback stage.
                 revoke_uninstalled_pipe_cap(&proc, read_cap, &proc_ctx);
-                rollback_outside[0] = Some(Box::new(read_handle));
-                rollback_outside[1] = Some(Box::new(write_handle));
+                assert!(proc.cancel_fd_reservation(write_fd));
+                assert!(proc.cancel_fd_reservation(read_fd));
+                rollback_outside[0] = read_handle.take();
+                rollback_outside[1] = write_handle.take();
                 break 'install Err(e);
             }
         };
 
         // Attach the CapIds BEFORE install (CRITICAL-7: from the moment an fd
         // carries the cap, the remove_fd funnel is its ONLY teardown edge).
-        read_handle.set_cap_id(read_cap);
-        write_handle.set_cap_id(write_cap);
+        read_handle
+            .as_mut()
+            .expect("private read handle")
+            .set_cap_id(read_cap);
+        write_handle
+            .as_mut()
+            .expect("private write handle")
+            .set_cap_id(write_cap);
 
-        // Install the fds.
-        let read_fd = match proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>) {
-            Ok(rfd) => rfd,
-            Err(read_box) => {
-                // LEAK FIX: NEITHER fd installed → both caps are
-                // funnel-unreachable orphans; pay both back here (the
-                // design-v2/v3 arms missed this — 2 slots leaked per
-                // EMFILE'd sys_pipe).
-                revoke_uninstalled_pipe_cap(&proc, read_cap, &proc_ctx);
-                revoke_uninstalled_pipe_cap(&proc, write_cap, &proc_ctx);
-                rollback_outside[0] = Some(read_box);
-                rollback_outside[1] = Some(Box::new(write_handle));
-                break 'install Err(SyscallError::EMFILE);
-            }
-        };
-        let write_fd = match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
-            Ok(wfd) => wfd,
-            Err(write_box) => {
-                // read_fd IS installed → its cap pays back through the
-                // remove_fd funnel (decrement_fd_cap → revoke at 0). The
-                // write cap never got an fd → cap-only stage (LEAK FIX for
-                // the second design-v2/v3 miss).
-                rollback_outside[0] = proc.remove_fd(read_fd);
-                revoke_uninstalled_pipe_cap(&proc, write_cap, &proc_ctx);
-                rollback_outside[1] = Some(write_box);
-                break 'install Err(SyscallError::EMFILE);
-            }
-        };
+        let read_descriptor = read_prepared
+            .take()
+            .expect("prepared read descriptor")
+            .finalize(read_handle.take().expect("private read handle"));
+        let write_descriptor = write_prepared
+            .take()
+            .expect("prepared write descriptor")
+            .finalize(write_handle.take().expect("private write handle"));
+
+        proc.install_reserved_fd(read_fd, read_descriptor)
+            .unwrap_or_else(|_| panic!("reserved pipe read FD commit failed"));
+        proc.install_reserved_fd(write_fd, write_descriptor)
+            .unwrap_or_else(|_| panic!("reserved pipe write FD commit failed"));
 
         Ok((read_fd, write_fd))
     };
     // Process lock released — rollback PipeHandles (if any) drop HERE.
     drop(rollback_outside);
+    drop(read_prepared);
+    drop(write_prepared);
     let (read_fd, write_fd) = alloc_result?;
 
     kprintln!(
@@ -236,7 +277,12 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
 /// R41-3 FIX: Clone file handle and drop process lock before I/O.
 /// This prevents holding the lock during potentially blocking device I/O,
 /// avoiding DoS vectors and deadlock risks.
-fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
+fn fd_read_callback(
+    fd: i32,
+    buf: &mut [u8],
+    user_dst: *mut u8,
+    copyout: kernel_core::syscall::FdReadCopyout,
+) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
 
@@ -251,7 +297,12 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
     if let Some(pipe_handle) = fd_obj.as_any().downcast_ref::<PipeHandle>() {
         let pipe_clone = pipe_handle.clone();
         drop(proc); // Release lock before potentially blocking pipe I/O
-        return pipe_clone.read(buf).map_err(pipe_error_to_syscall);
+        return pipe_clone
+            .read_with_commit(buf, |bytes| copyout(user_dst, bytes))
+            .map_err(|error| match error {
+                pipe::PipeReadTransactionError::Pipe(error) => pipe_error_to_syscall(error),
+                pipe::PipeReadTransactionError::Commit(error) => error,
+            });
     }
 
     // R41-3 FIX: Clone FileHandle and drop lock before I/O
@@ -261,7 +312,86 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
         }
         let file_clone = file.clone();
         drop(proc); // Release lock before VFS I/O
-        return file_clone.read(buf).map_err(fs_error_to_syscall);
+        if !file_clone.flags.is_readable() {
+            return Err(SyscallError::EBADF);
+        }
+
+        // R180-L1: serialize the shared open-file description, read at the
+        // current offset, copy out, and publish the new offset last. A usercopy
+        // fault therefore leaves the offset byte-exactly unchanged.
+        let mut offset = file_clone.offset.lock();
+        let mut commit_error = None;
+        let mut committed_len = None;
+        let mut committed_next_offset = None;
+        let staging_capacity = buf.len();
+        let mut commit = |bytes: &[u8]| {
+            // The transaction contract is exactly one output commit. Reject a
+            // buggy device's second callback before it can duplicate user-visible
+            // side effects; the first successful length remains authoritative.
+            if committed_len.is_some() {
+                return Err(vfs::types::FsError::Io);
+            }
+            // An inode may expose at most the caller-provided staging capacity.
+            // Check before copyout: clamping only the returned count afterwards
+            // would still let a broken device overwrite beyond the validated user
+            // destination and would turn an internal contract bug into memory
+            // corruption.
+            if bytes.len() > staging_capacity {
+                commit_error = Some(SyscallError::EIO);
+                return Err(vfs::types::FsError::Io);
+            }
+            // Resolve offset overflow before copyout and therefore before a
+            // consuming inode dequeues its source. The final offset assignment
+            // below is then a stored, infallible commit.
+            let advance = match u64::try_from(bytes.len()) {
+                Ok(advance) => advance,
+                Err(_) => {
+                    commit_error = Some(SyscallError::EOVERFLOW);
+                    return Err(vfs::types::FsError::Io);
+                }
+            };
+            let next_offset = match offset.checked_add(advance) {
+                Some(next) => next,
+                None => {
+                    commit_error = Some(SyscallError::EOVERFLOW);
+                    return Err(vfs::types::FsError::Io);
+                }
+            };
+            match copyout(user_dst, bytes) {
+                Ok(()) => {
+                    committed_len = Some(bytes.len());
+                    committed_next_offset = Some(next_offset);
+                    Ok(())
+                }
+                Err(error) => {
+                    commit_error = Some(error);
+                    Err(vfs::types::FsError::Io)
+                }
+            }
+        };
+        let count_result = file_clone
+            .inode
+            .read_at_with_commit(*offset, buf, &mut commit);
+        drop(commit);
+        if let Some(error) = commit_error {
+            return Err(error);
+        }
+
+        // Once copyout succeeded it is too late to report a later device error:
+        // the caller already owns those bytes and a consuming source may already
+        // have dequeued them. Treat the committed byte count as authoritative.
+        // Conversely, a positive count without a commit is an invalid inode
+        // implementation and must not advance the shared offset silently.
+        let count = match (count_result, committed_len) {
+            (Ok(0), None) => 0,
+            (Ok(_), Some(committed)) | (Err(_), Some(committed)) => committed.min(buf.len()),
+            (Ok(_), None) => return Err(fs_error_to_syscall(vfs::types::FsError::Io)),
+            (Err(error), None) => return Err(fs_error_to_syscall(error)),
+        };
+        if let Some(next_offset) = committed_next_offset {
+            *offset = next_offset;
+        }
+        return Ok(count);
     }
 
     Err(SyscallError::EBADF)
@@ -567,12 +697,22 @@ fn futex_callback(
 /// R37-2 FIX (Codex review): Accept TGID directly to avoid re-locking the process.
 /// The caller (free_process_resources) already holds the process lock.
 /// R75-2 FIX: Accept IPC namespace ID for per-namespace endpoint cleanup.
-fn ipc_cleanup(pid: process::ProcessId, tgid: process::ProcessId, ipc_ns_id: NamespaceId) {
-    cleanup_process_endpoints(ipc_ns_id, pid);
-    cleanup_process_futexes(pid, tgid);
-    // R156-6 FIX: Drain stale timed_out entries for the exiting PID
-    // from all IPC WaitQueues, preventing PID reuse misclassification.
-    ipc::cleanup_waitqueues_for_pid(pid);
+/// R180-5 FIX: Accept reaped generation so delayed cleanup cannot target a
+/// recycled PID's endpoints / waiters / PI state after the table slot is free.
+fn ipc_cleanup(
+    pid: process::ProcessId,
+    tgid: process::ProcessId,
+    ipc_ns_id: NamespaceId,
+    generation: u64,
+) {
+    // R180-5 (iteration-2): always run generation-filtered endpoint drain —
+    // never skip the entire purge based on a TOCTOU get_process sample. The
+    // registry removes only endpoints whose owner_generation matches `generation`.
+    cleanup_process_endpoints(ipc_ns_id, pid, generation);
+    cleanup_process_futexes(pid, tgid, generation);
+    // R156-6 + R180-5: drain wait-queue entries stamped with this process
+    // generation (or plain wait counters for this pid when no live successor).
+    ipc::cleanup_waitqueues_for_pid(pid, generation);
 }
 
 /// Futex 唤醒回调（用于线程退出时的 clear_child_tid 机制）
