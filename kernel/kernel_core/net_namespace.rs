@@ -40,6 +40,7 @@ use cap::NamespaceId;
 use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use mm::HeapClass;
 use spin::RwLock;
 
 // ============================================================================
@@ -508,17 +509,17 @@ impl Drop for NetNamespaceFd {
 }
 
 impl FileOps for NetNamespaceFd {
-    fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
-        // R75-4 FIX: Increment manual refcount when cloning FD.
-        //
-        // Without this, dup()/fork() creates a new FD that shares the same
-        // Arc but doesn't increment the manual refcount. When each copy is
-        // dropped, dec_ref() is called multiple times, causing underflow
-        // (wrapping from 1 to u32::MAX) and breaking reference tracking.
+    fn clone_box(&self) -> FileDescriptor {
+        self.try_clone_box()
+            .expect("network namespace fd clone allocation/admission failed")
+    }
+
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
+        let prepared = FileDescriptor::try_prepare(HeapClass::CoreProcess)?;
         self.ns.inc_ref();
-        alloc::boxed::Box::new(Self {
-            ns: self.ns.clone(),
-        })
+        Ok(prepared.finalize(Self {
+            ns: Arc::clone(&self.ns),
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {

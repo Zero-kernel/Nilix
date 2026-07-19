@@ -23,19 +23,14 @@
 //! - No init/cascade-kill semantics
 //! - Full copy of mount table on CLONE_NEWNS (not shared references)
 
-use alloc::boxed::Box;
-use alloc::{
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::sync::Arc;
 use cap::NamespaceId;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
+use mm::{arc_charge_bytes, try_reserve_heap, AdmittedString, HeapCharge, HeapClass};
 use spin::RwLock;
 
-use crate::process::FileOps;
+use crate::process::{FileDescriptor, FileOps};
 
 // ============================================================================
 // Constants
@@ -137,7 +132,12 @@ pub struct MountNamespace {
     level: u8,
 
     /// Root mount path for this namespace (usually "/")
-    root_path: RwLock<String>,
+    root_path: RwLock<AdmittedString>,
+
+    counted: bool,
+
+    /// Lifetime charge for this namespace's Arc allocation.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl MountNamespace {
@@ -147,7 +147,12 @@ impl MountNamespace {
             id: NamespaceId::new(0),
             parent: None,
             level: 0,
-            root_path: RwLock::new("/".to_string()),
+            root_path: RwLock::new(
+                AdmittedString::try_from_str(HeapClass::CoreProcess, "/")
+                    .expect("root mount namespace path admission"),
+            ),
+            counted: false,
+            _arc_heap_charge: None,
         }
     }
 
@@ -177,12 +182,42 @@ impl MountNamespace {
                 MountNsError::NoMemory
             })?;
 
-        let child = Arc::new(Self {
+        // RF180-16 FIX: clone the path through admitted storage and reserve
+        // the namespace Arc before either allocation becomes public.
+        let root_path = {
+            let path = parent.root_path.read();
+            AdmittedString::try_from_str(HeapClass::CoreProcess, path.as_str()).map_err(|_| {
+                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+                MountNsError::NoMemory
+            })?
+        };
+        let arc_bytes = arc_charge_bytes::<MountNamespace>().map_err(|_| {
+            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+            MountNsError::NoMemory
+        })?;
+        let arc_reservation =
+            try_reserve_heap(HeapClass::CoreProcess, arc_bytes).map_err(|_| {
+                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+                MountNsError::NoMemory
+            })?;
+        let mut child = Arc::try_new(Self {
             id: NamespaceId::new(id),
-            parent: Some(parent.clone()),
+            parent: Some(Arc::clone(&parent)),
             level: parent.level.saturating_add(1),
-            root_path: RwLock::new(parent.root_path.read().clone()),
-        });
+            root_path: RwLock::new(root_path),
+            counted: true,
+            _arc_heap_charge: None,
+        })
+        .map_err(|_| {
+            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+            MountNsError::NoMemory
+        })?;
+        let charge = arc_reservation
+            .commit()
+            .map_err(|_| MountNsError::NoMemory)?;
+        Arc::get_mut(&mut child)
+            .expect("fresh mount namespace Arc must be unique")
+            ._arc_heap_charge = Some(charge);
 
         Ok(child)
     }
@@ -213,13 +248,19 @@ impl MountNamespace {
 
     /// Get the namespace root path.
     #[inline]
-    pub fn root_path(&self) -> String {
-        self.root_path.read().clone()
+    pub fn root_path(&self) -> Result<AdmittedString, MountNsError> {
+        let path = self.root_path.read();
+        AdmittedString::try_from_str(HeapClass::CoreProcess, path.as_str())
+            .map_err(|_| MountNsError::NoMemory)
     }
 
     /// Set the namespace root path (for pivot_root/chroot).
-    pub fn set_root_path(&self, path: String) {
-        *self.root_path.write() = path;
+    pub fn set_root_path(&self, path: &str) -> Result<(), MountNsError> {
+        let replacement = AdmittedString::try_from_str(HeapClass::CoreProcess, path)
+            .map_err(|_| MountNsError::NoMemory)?;
+        let old = core::mem::replace(&mut *self.root_path.write(), replacement);
+        drop(old);
+        Ok(())
     }
 }
 
@@ -229,7 +270,7 @@ impl MountNamespace {
 impl Drop for MountNamespace {
     fn drop(&mut self) {
         // Don't decrement for root namespace (it's counted in the initial value)
-        if !self.is_root() {
+        if self.counted {
             MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -305,10 +346,18 @@ impl MountNamespaceFd {
 }
 
 impl FileOps for MountNamespaceFd {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(Self {
-            ns: self.ns.clone(),
-        })
+    fn clone_box(&self) -> FileDescriptor {
+        self.try_clone_box()
+            .expect("mount namespace fd clone allocation/admission failed")
+    }
+
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
+        FileDescriptor::try_new(
+            Self {
+                ns: Arc::clone(&self.ns),
+            },
+            HeapClass::CoreProcess,
+        )
     }
 
     fn as_any(&self) -> &dyn Any {

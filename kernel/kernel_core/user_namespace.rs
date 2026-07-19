@@ -43,7 +43,6 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use cap::NamespaceId;
@@ -853,10 +852,16 @@ impl Drop for UserNamespaceFd {
 
 impl FileOps for UserNamespaceFd {
     fn clone_box(&self) -> FileDescriptor {
+        self.try_clone_box()
+            .expect("user namespace fd clone allocation/admission failed")
+    }
+
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
+        let prepared = FileDescriptor::try_prepare(mm::HeapClass::CoreProcess)?;
         self.ns.inc_ref();
-        Box::new(Self {
-            ns: self.ns.clone(),
-        })
+        Ok(prepared.finalize(Self {
+            ns: Arc::clone(&self.ns),
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {
