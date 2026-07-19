@@ -6,17 +6,17 @@
 //! - /dev/console - Kernel console (serial output)
 //! - /dev/vdX - Block devices (virtio-blk, etc.)
 
-use crate::traits::{FileHandle, FileSystem, Inode};
-use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
-use alloc::boxed::Box;
+use crate::traits::{FileSystem, Inode, PreparedFileHandle};
+use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat, TimeSpec};
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block::BlockDevice;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_core::FileOps;
+use kernel_core::FileDescriptor;
 use mm::fallible_map::FallibleOrderedMap;
+use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass};
 use spin::{Mutex, RwLock};
 
 /// Global device filesystem ID counter
@@ -42,23 +42,24 @@ impl DevFs {
         // boot set in an infallible constructor, so an OOM here is boot-fatal by policy (the
         // `.expect` mirrors the NEXT_FS_ID `.expect` above) — NOT closure of the OOM-abort class.
         let mut devices: FallibleOrderedMap<String, Arc<dyn Inode>> = FallibleOrderedMap::new();
+        // R180-27 FIX: reserve all runtime block-node slots before any device can
+        // reach DRIVER_OK. Later publication uses insert_unique_reserved and is
+        // therefore allocator-independent.
+        devices
+            .try_reserve_exact(3 + block::MAX_BLOCK_DEVICES)
+            .expect("devfs: boot block-node slot reservation OOM");
 
-        // Create device inodes with self-references initialized
-        // This enables open() to return FileHandle wrapping the inode
         let null_inode = Arc::new(NullDevInode::new(fs_id));
-        *null_inode.self_ref.write() = Arc::downgrade(&null_inode);
         devices
             .try_insert("null".into(), null_inode)
             .expect("devfs: boot device registration OOM");
 
         let zero_inode = Arc::new(ZeroDevInode::new(fs_id));
-        *zero_inode.self_ref.write() = Arc::downgrade(&zero_inode);
         devices
             .try_insert("zero".into(), zero_inode)
             .expect("devfs: boot device registration OOM");
 
         let console_inode = Arc::new(ConsoleDevInode::new(fs_id));
-        *console_inode.self_ref.write() = Arc::downgrade(&console_inode);
         devices
             .try_insert("console".into(), console_inode)
             .expect("devfs: boot device registration OOM");
@@ -67,10 +68,7 @@ impl DevFs {
             fs_id,
             ino: 1,
             entries: RwLock::new(devices),
-            self_ref: RwLock::new(Weak::new()),
         });
-        // Set self-reference after Arc creation
-        *root.self_ref.write() = Arc::downgrade(&root);
 
         Arc::new(Self { fs_id, root })
     }
@@ -83,12 +81,6 @@ impl DevFs {
         name: &str,
         device: Arc<dyn BlockDevice>,
     ) -> Result<(), FsError> {
-        let mut entries = self.root.entries.write();
-
-        if entries.contains_key(name) {
-            return Err(FsError::Exists);
-        }
-
         // Assign a unique inode number
         // R112-2: overflow-safe inode allocation
         static NEXT_BLOCK_INO: AtomicU64 = AtomicU64::new(100);
@@ -96,18 +88,47 @@ impl DevFs {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .map_err(|_| FsError::NoSpace)?;
 
-        // Create block device inode with self-reference initialized
-        // This enables open() to return FileHandle wrapping the inode
-        let inode = Arc::new(BlockDevInode::new(self.fs_id, ino, device));
-        *inode.self_ref.write() = Arc::downgrade(&inode);
-        // R172-22-FOLLOWON: fallible key build + try_insert -> NoSpace (was an infallible
-        // BTreeMap::insert that aborts the kernel via handle_alloc_error on OOM). Mirrors the
-        // ramfs add_child pattern; this path is user-reachable via block-device registration.
+        let estimated_heap_bytes = arc_charge_bytes::<BlockDevInode>()
+            .and_then(|arc_bytes| {
+                vec_charge_bytes::<u8>(name.len()).and_then(|key_bytes| {
+                    arc_bytes
+                        .checked_add(key_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .map_err(|_| FsError::NoSpace)?;
+        let mut reservation = try_reserve_heap(HeapClass::Device, estimated_heap_bytes)
+            .map_err(|_| FsError::NoSpace)?;
+
+        // R180-27 FIX: prepare every heap-backed publication object before
+        // mutating devfs. BlockDevInode embeds its RMW lock directly, so this is
+        // the sole inode allocation and can fail recoverably.
         let mut key = String::new();
         key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
         key.push_str(name);
+        let actual_heap_bytes = arc_charge_bytes::<BlockDevInode>()
+            .and_then(|arc_bytes| {
+                vec_charge_bytes::<u8>(key.capacity()).and_then(|key_bytes| {
+                    arc_bytes
+                        .checked_add(key_bytes)
+                        .ok_or(mm::HeapAdmissionError::ArithmeticOverflow)
+                })
+            })
+            .map_err(|_| FsError::NoSpace)?;
+        reservation
+            .resize(actual_heap_bytes)
+            .map_err(|_| FsError::NoSpace)?;
+        let heap_charge = reservation.commit().map_err(|_| FsError::NoSpace)?;
+
+        let inode = Arc::try_new(BlockDevInode::new(self.fs_id, ino, device, heap_charge))
+            .map_err(|_| FsError::NoSpace)?;
+
+        let mut entries = self.root.entries.write();
+        if entries.contains_key(name) {
+            return Err(FsError::Exists);
+        }
         entries
-            .try_insert(key, inode)
+            .insert_unique_reserved(key, inode)
             .map_err(|_| FsError::NoSpace)?;
 
         Ok(())
@@ -150,15 +171,6 @@ struct DevDirInode {
     fs_id: u64,
     ino: u64,
     entries: RwLock<FallibleOrderedMap<String, Arc<dyn Inode>>>,
-    /// Self-reference for creating Arc in open()
-    self_ref: RwLock<Weak<Self>>,
-}
-
-impl DevDirInode {
-    /// Get Arc<Self> from self_ref
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
-    }
 }
 
 impl Inode for DevDirInode {
@@ -188,14 +200,17 @@ impl Inode for DevDirInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Directories can only be opened for read-only operations (getdents64)
         if flags.is_writable() {
             return Err(FsError::IsDir);
         }
-        // Return directory handle with seekable=false
-        let inode = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn is_dir(&self) -> bool {
@@ -242,22 +257,11 @@ impl Inode for DevDirInode {
 struct NullDevInode {
     fs_id: u64,
     ino: u64,
-    /// Self-reference for creating Arc in open()
-    self_ref: RwLock<Weak<Self>>,
 }
 
 impl NullDevInode {
     fn new(fs_id: u64) -> Self {
-        Self {
-            fs_id,
-            ino: 2,
-            self_ref: RwLock::new(Weak::new()),
-        }
-    }
-
-    /// Get Arc<Self> from self_ref for FileHandle creation
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
+        Self { fs_id, ino: 2 }
     }
 }
 
@@ -288,10 +292,13 @@ impl Inode for NullDevInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
-        let inode: Arc<dyn Inode> = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
@@ -317,22 +324,11 @@ impl Inode for NullDevInode {
 struct ZeroDevInode {
     fs_id: u64,
     ino: u64,
-    /// Self-reference for creating Arc in open()
-    self_ref: RwLock<Weak<Self>>,
 }
 
 impl ZeroDevInode {
     fn new(fs_id: u64) -> Self {
-        Self {
-            fs_id,
-            ino: 3,
-            self_ref: RwLock::new(Weak::new()),
-        }
-    }
-
-    /// Get Arc<Self> from self_ref for FileHandle creation
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
+        Self { fs_id, ino: 3 }
     }
 }
 
@@ -363,10 +359,13 @@ impl Inode for ZeroDevInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
-        let inode: Arc<dyn Inode> = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -393,22 +392,11 @@ impl Inode for ZeroDevInode {
 struct ConsoleDevInode {
     fs_id: u64,
     ino: u64,
-    /// Self-reference for creating Arc in open()
-    self_ref: RwLock<Weak<Self>>,
 }
 
 impl ConsoleDevInode {
     fn new(fs_id: u64) -> Self {
-        Self {
-            fs_id,
-            ino: 4,
-            self_ref: RwLock::new(Weak::new()),
-        }
-    }
-
-    /// Get Arc<Self> from self_ref for FileHandle creation
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
+        Self { fs_id, ino: 4 }
     }
 }
 
@@ -439,15 +427,27 @@ impl Inode for ConsoleDevInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
-        let inode: Arc<dyn Inode> = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         // Console read: read from keyboard input buffer (non-blocking)
         Ok(drivers::keyboard_read(buf))
+    }
+
+    fn read_at_with_commit(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    ) -> Result<usize, FsError> {
+        drivers::keyboard_read_with_commit(buf, commit)
     }
 
     fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize, FsError> {
@@ -488,25 +488,21 @@ struct BlockDevInode {
     ino: u64,
     device: Arc<dyn BlockDevice>,
     /// Lock for serializing read-modify-write operations
-    rw_lock: Arc<Mutex<()>>,
-    /// Self-reference for creating Arc in open()
-    self_ref: RwLock<Weak<Self>>,
+    rw_lock: Mutex<()>,
+    /// Aggregate charge for the inode Arc and its devfs-owned key. Kept last so
+    /// inode state is destroyed before admission is released.
+    _heap_charge: HeapCharge,
 }
 
 impl BlockDevInode {
-    fn new(fs_id: u64, ino: u64, device: Arc<dyn BlockDevice>) -> Self {
+    fn new(fs_id: u64, ino: u64, device: Arc<dyn BlockDevice>, heap_charge: HeapCharge) -> Self {
         Self {
             fs_id,
             ino,
             device,
-            rw_lock: Arc::new(Mutex::new(())),
-            self_ref: RwLock::new(Weak::new()),
+            rw_lock: Mutex::new(()),
+            _heap_charge: heap_charge,
         }
-    }
-
-    /// Get Arc<Self> from self_ref for FileHandle creation
-    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -538,11 +534,13 @@ impl Inode for BlockDevInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
-        // Block devices are seekable
-        let inode: Arc<dyn Inode> = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -556,7 +554,11 @@ impl Inode for BlockDevInode {
 
         let mut file_offset = offset;
         let mut buf_pos = 0usize;
-        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+        let mut sector_buf = Vec::new();
+        sector_buf
+            .try_reserve_exact(sector_size as usize)
+            .map_err(|_| FsError::NoMem)?;
+        sector_buf.resize(sector_size as usize, 0);
         let limit = (capacity_bytes - offset) as usize;
         let to_read = buf.len().min(limit);
 
@@ -619,7 +621,11 @@ impl Inode for BlockDevInode {
         let _guard = self.rw_lock.lock();
         let mut file_offset = offset;
         let mut data_pos = 0usize;
-        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+        let mut sector_buf = Vec::new();
+        sector_buf
+            .try_reserve_exact(sector_size as usize)
+            .map_err(|_| FsError::NoMem)?;
+        sector_buf.resize(sector_size as usize, 0);
 
         while data_pos < to_write && file_offset < capacity_bytes {
             let sector_idx = file_offset / sector_size;

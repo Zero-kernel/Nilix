@@ -4,18 +4,17 @@
 //! - Builds a tree of files, directories, and symlinks
 //! - Implements FileSystem/Inode; all mutating ops return ReadOnly
 
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
 use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
-use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
-use kernel_core::FileOps;
+use kernel_core::FileDescriptor;
 
 /// CPIO "newc" magic number
 const CPIO_MAGIC: &[u8; 6] = b"070701";
@@ -380,7 +379,6 @@ pub struct InitramfsInode {
     ino: u64,
     meta: RwLock<NodeMeta>,
     kind: NodeKind,
-    self_ref: RwLock<Option<Weak<InitramfsInode>>>,
 }
 
 impl InitramfsInode {
@@ -394,7 +392,7 @@ impl InitramfsInode {
         gid: u32,
         mtime: TimeSpec,
     ) -> Arc<Self> {
-        let inode = Arc::new(Self {
+        Arc::new(Self {
             fs_id,
             ino,
             meta: RwLock::new(NodeMeta {
@@ -410,10 +408,7 @@ impl InitramfsInode {
             kind: NodeKind::Directory {
                 children: RwLock::new(FallibleOrderedMap::new()),
             },
-            self_ref: RwLock::new(None),
-        });
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
+        })
     }
 
     /// Create a new regular file inode
@@ -429,7 +424,7 @@ impl InitramfsInode {
     ) -> Arc<Self> {
         let buf: Arc<[u8]> = data.to_vec().into();
         let size = buf.len() as u64;
-        let inode = Arc::new(Self {
+        Arc::new(Self {
             fs_id,
             ino,
             meta: RwLock::new(NodeMeta {
@@ -445,10 +440,7 @@ impl InitramfsInode {
             kind: NodeKind::File {
                 data: RwLock::new(buf),
             },
-            self_ref: RwLock::new(None),
-        });
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
+        })
     }
 
     /// RF178-27 FIX: Install a later CPIO hardlink payload into the already
@@ -488,7 +480,7 @@ impl InitramfsInode {
     ) -> Arc<Self> {
         let target: Arc<[u8]> = data.to_vec().into();
         let size = target.len() as u64;
-        let inode = Arc::new(Self {
+        Arc::new(Self {
             fs_id,
             ino,
             meta: RwLock::new(NodeMeta {
@@ -502,10 +494,7 @@ impl InitramfsInode {
                 ctime: mtime,
             }),
             kind: NodeKind::Symlink { target },
-            self_ref: RwLock::new(None),
-        });
-        *inode.self_ref.write() = Some(Arc::downgrade(&inode));
-        inode
+        })
     }
 
     /// Look up a child by name
@@ -541,15 +530,6 @@ impl InitramfsInode {
             }
             _ => Err(FsError::NotDir),
         }
-    }
-
-    /// Get Arc reference to self
-    fn as_arc(&self) -> Result<Arc<InitramfsInode>, FsError> {
-        self.self_ref
-            .read()
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .ok_or(FsError::Invalid)
     }
 }
 
@@ -621,7 +601,11 @@ impl Inode for InitramfsInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Reject write operations on read-only filesystem
         if flags.is_writable() || flags.is_truncate() || flags.is_append() {
             return Err(FsError::ReadOnly);
@@ -630,8 +614,8 @@ impl Inode for InitramfsInode {
             return Err(FsError::IsDir);
         }
 
-        let inode: Arc<dyn Inode> = self.as_arc()?;
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn is_dir(&self) -> bool {

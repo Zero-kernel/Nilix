@@ -69,7 +69,9 @@ pub use manager::{
 };
 pub use procfs::ProcFs;
 pub use ramfs::{RamFs, RamFsInode};
-pub use traits::{FileHandle, FileSystem, Inode};
+pub use traits::{
+    FileHandle, FileSystem, Inode, PreparedFileHandle, SharedFileOffset, WeakSharedFileOffset,
+};
 pub use types::{DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, Stat, TimeSpec};
 
 // Mount namespace re-exports
