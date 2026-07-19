@@ -22,3 +22,4 @@ cpu_local = { path = "../cpu_local" }
 x86_64 = "0.15"
 trace = { path = "../trace" }
 klog = { path = "../klog" }
+mm = { path = "../mm" }

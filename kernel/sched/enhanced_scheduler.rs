@@ -20,14 +20,18 @@
 //! periodic load balancing to avoid global lock contention. This improves SMP
 //! scalability by eliminating the global queue lock as a bottleneck.
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
-use core::ops::Bound::{Excluded, Unbounded};
+use core::ops::Bound;
+use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use cpu_local::{current_cpu, current_cpu_id, max_cpus, CpuLocal, NO_FPU_OWNER};
+use cpu_local::{current_cpu, current_cpu_id, max_cpus, CpuLocal, NO_FPU_OWNER, PER_CPU_DATA};
 use kernel_core::cgroup;
-use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
+use kernel_core::process::{
+    self, Priority, Process, ProcessArc, ProcessId, ProcessNameSnapshot, ProcessState,
+};
 use lazy_static::lazy_static;
+use mm::{AdmittedMap, HeapClass, PreparedAdmittedMapCapacity, RetiredAdmittedMapCapacity};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
@@ -89,14 +93,244 @@ macro_rules! sched_debug {
 
 // 类型别名以保持兼容性
 pub type Pid = ProcessId;
-pub type ProcessControlBlock = Arc<Mutex<Process>>;
+pub type ProcessControlBlock = ProcessArc;
 
 /// 优先级分桶的就绪队列类型
 ///
 /// 结构: Priority -> (Pid -> ProcessControlBlock)
 /// - 按优先级从低到高排序（优先级数值越小越优先）
 /// - 同优先级内按 PID 先入先出
-type ReadyQueues = BTreeMap<Priority, BTreeMap<Pid, ProcessControlBlock>>;
+/// One lexicographically ordered `(priority, pid)` map preserves priority/PID
+/// traversal without embedding 256 heap-owning map headers in every per-CPU
+/// slot. The old representation forced CpuLocal to infallibly allocate at
+/// least 512 KiB of uncharged empty headers across MAX_CPUS before one task was
+/// queued. Runtime backing remains fallibly admitted and detached-prepared.
+const PRIORITY_BUCKETS: usize = u8::MAX as usize + 1;
+type ReadyMapKey = (Priority, Pid);
+type PreparedReadyBacking<T> = PreparedAdmittedMapCapacity<ReadyMapKey, T>;
+type RetiredReadyBacking<T> = RetiredAdmittedMapCapacity<ReadyMapKey, T>;
+
+#[derive(Clone, Copy)]
+struct PriorityBucketRef<'a, T> {
+    entries: &'a AdmittedMap<ReadyMapKey, T>,
+    priority: Priority,
+}
+
+impl<'a, T> PriorityBucketRef<'a, T> {
+    fn get(self, pid: &Pid) -> Option<&'a T> {
+        self.entries.get(&(self.priority, *pid))
+    }
+
+    fn contains_key(self, pid: &Pid) -> bool {
+        self.entries.get(&(self.priority, *pid)).is_some()
+    }
+
+    fn iter(self) -> impl DoubleEndedIterator<Item = (&'a Pid, &'a T)> + 'a {
+        self.entries
+            .range((self.priority, 0)..=(self.priority, Pid::MAX))
+            .map(|(key, value)| (&key.1, value))
+    }
+
+    fn range(
+        self,
+        bounds: (Bound<Pid>, Bound<Pid>),
+    ) -> impl DoubleEndedIterator<Item = (&'a Pid, &'a T)> + 'a {
+        let lower = match bounds.0 {
+            Included(pid) => Included((self.priority, pid)),
+            Excluded(pid) => Excluded((self.priority, pid)),
+            Unbounded => Included((self.priority, 0)),
+        };
+        let upper = match bounds.1 {
+            Included(pid) => Included((self.priority, pid)),
+            Excluded(pid) => Excluded((self.priority, pid)),
+            Unbounded => Included((self.priority, Pid::MAX)),
+        };
+        self.entries
+            .range((lower, upper))
+            .map(|(key, value)| (&key.1, value))
+    }
+
+    fn len(self) -> usize {
+        self.iter().count()
+    }
+
+    fn is_empty(self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    /// Capacity belongs to the compact aggregate map, not one priority view.
+    fn capacity(self) -> usize {
+        self.entries.capacity()
+    }
+}
+
+struct PriorityBucketMut<'a, T> {
+    entries: &'a mut AdmittedMap<ReadyMapKey, T>,
+    priority: Priority,
+}
+
+impl<T> PriorityBucketMut<'_, T> {
+    fn try_insert(&mut self, pid: Pid, value: T) -> Result<Option<T>, mm::AdmittedAllocError> {
+        self.entries.try_insert((self.priority, pid), value)
+    }
+
+    fn insert_unique_reserved(&mut self, pid: Pid, value: T) -> Result<(), (Pid, T)> {
+        self.entries
+            .insert_unique_reserved((self.priority, pid), value)
+            .map_err(|((_priority, pid), value)| (pid, value))
+    }
+
+    fn remove_retaining_capacity(&mut self, pid: &Pid) -> Option<T> {
+        self.entries
+            .remove_retaining_capacity(&(self.priority, *pid))
+    }
+
+    fn install_prepared_deferred(
+        &mut self,
+        prepared: PreparedReadyBacking<T>,
+    ) -> Result<RetiredReadyBacking<T>, mm::AdmittedAllocError> {
+        self.entries.install_prepared_deferred(prepared)
+    }
+}
+
+struct PriorityQueues<T> {
+    entries: AdmittedMap<ReadyMapKey, T>,
+    /// Capacity slots held exclusively for remove-then-publish rollback.
+    /// The compact aggregate map allows any retained slot to restore any
+    /// priority/PID key, so one count is both sufficient and exact. Ordinary
+    /// enqueue/removal paths preserve this count until migration
+    /// either restores the source membership or commits its removal.
+    rollback_slots: usize,
+}
+
+impl<T> PriorityQueues<T> {
+    const fn new() -> Self {
+        Self {
+            entries: AdmittedMap::new(HeapClass::Scheduler),
+            rollback_slots: 0,
+        }
+    }
+
+    #[inline]
+    fn bucket(&self, priority: Priority) -> PriorityBucketRef<'_, T> {
+        PriorityBucketRef {
+            entries: &self.entries,
+            priority,
+        }
+    }
+
+    #[inline]
+    fn bucket_mut(&mut self, priority: Priority) -> PriorityBucketMut<'_, T> {
+        PriorityBucketMut {
+            entries: &mut self.entries,
+            priority,
+        }
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (Priority, PriorityBucketRef<'_, T>)> {
+        (0..PRIORITY_BUCKETS).map(move |priority| {
+            let priority = priority as Priority;
+            (priority, self.bucket(priority))
+        })
+    }
+
+    #[inline]
+    fn values(&self) -> impl Iterator<Item = PriorityBucketRef<'_, T>> {
+        (0..PRIORITY_BUCKETS).map(move |priority| self.bucket(priority as Priority))
+    }
+
+    #[inline]
+    fn protected_slots(&self, _priority: Priority) -> usize {
+        self.rollback_slots
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    /// Remove one membership without destroying either its value or an empty
+    /// allocator backing while the ready-queue lock is held. The caller owns
+    /// both returned values and must drop them after releasing the lock.
+    #[must_use = "removed values and retired backing must leave the ready-queue lock"]
+    fn remove_ordinary(
+        &mut self,
+        priority: Priority,
+        pid: &Pid,
+    ) -> (Option<T>, Option<RetiredReadyBacking<T>>) {
+        let protected = self.rollback_slots != 0;
+        let removed = self.bucket_mut(priority).remove_retaining_capacity(pid);
+        let retired = if removed.is_some() && !protected {
+            self.entries.take_empty_capacity()
+        } else {
+            None
+        };
+        (removed, retired)
+    }
+
+    fn remove_for_migration(&mut self, priority: Priority, pid: &Pid) -> Option<T> {
+        let removed = self.bucket_mut(priority).remove_retaining_capacity(pid)?;
+        self.rollback_slots = self
+            .rollback_slots
+            .checked_add(1)
+            .expect("scheduler rollback-slot count overflow");
+        Some(removed)
+    }
+
+    fn restore_migration(
+        &mut self,
+        priority: Priority,
+        pid: Pid,
+        value: T,
+    ) -> Result<(), (Pid, T)> {
+        assert!(
+            self.rollback_slots != 0,
+            "scheduler migration restore without protected source slot"
+        );
+        self.bucket_mut(priority)
+            .insert_unique_reserved(pid, value)?;
+        self.rollback_slots -= 1;
+        Ok(())
+    }
+
+    /// Commit a remove-then-publish transaction without physically retiring an
+    /// empty source backing under the source queue lock.
+    #[must_use = "retired scheduler backing must be dropped outside the source lock"]
+    fn commit_migration_removal(&mut self, priority: Priority) -> Option<RetiredReadyBacking<T>> {
+        let _ = priority;
+        assert!(
+            self.rollback_slots != 0,
+            "scheduler migration commit without protected source slot"
+        );
+        self.rollback_slots -= 1;
+        if self.rollback_slots == 0 {
+            self.entries.take_empty_capacity()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+type ReadyQueues = PriorityQueues<ProcessControlBlock>;
+
+const _: () = assert!(
+    core::mem::size_of::<Mutex<ReadyQueues>>() * cpu_local::MAX_CPUS
+        + 2 * core::mem::size_of::<usize>()
+        <= mm::NORMAL_UNADMITTED_RESERVE_BYTES / 8
+);
+
+const READY_INSERT_RETRY_LIMIT: usize = 4;
 
 /// R70-4 FIX: Shadow buffer for the next task's context.
 ///
@@ -151,8 +385,30 @@ const _: () = {
     assert!(align_of::<process::Context>() == align_of::<ArchContext>());
 };
 
-/// 用于首次调度的哑上下文（内核启动上下文的保存位置，无需恢复）
-static BOOTSTRAP_CONTEXT: Mutex<ArchContext> = Mutex::new(ArchContext::new());
+/// Per-CPU first-switch save slot. Concurrent first dispatches on the BSP and
+/// APs must never alias one writable bootstrap context.
+struct BootstrapContext {
+    buf: UnsafeCell<ArchContext>,
+}
+
+unsafe impl Send for BootstrapContext {}
+unsafe impl Sync for BootstrapContext {}
+
+impl BootstrapContext {
+    fn new() -> Self {
+        Self {
+            buf: UnsafeCell::new(ArchContext::new()),
+        }
+    }
+
+    /// The caller owns this CPU and has IF clear for the complete save window.
+    #[inline]
+    fn as_mut_ptr(&self) -> *mut ArchContext {
+        self.buf.get()
+    }
+}
+
+static BOOTSTRAP_CONTEXT: CpuLocal<BootstrapContext> = CpuLocal::new(BootstrapContext::new);
 
 /// R67-4 FIX: Per-CPU current process tracking.
 ///
@@ -199,17 +455,13 @@ fn wake_reaper_after_switch(
     child_pid: Pid,
     generation: u64,
     child: &ProcessControlBlock,
-    origin: kernel_core::ReschedOrigin,
 ) -> bool {
     let parent = if parent_pid == 0 {
         None
     } else {
-        match origin {
-            kernel_core::ReschedOrigin::Process => process::get_process(parent_pid),
-            kernel_core::ReschedOrigin::IrqReturn => match process::try_get_process(parent_pid) {
-                None => return false,
-                Some(parent) => parent,
-            },
+        match process::try_get_process(parent_pid) {
+            None => return false,
+            Some(parent) => parent,
         }
     };
     let Some(parent) = parent else {
@@ -271,7 +523,7 @@ fn wake_reaper_after_switch(
 /// IRQ-safe clear (a lifetime-pinned PCB handle + lock-free `on_cpu` store from the timer
 /// IRQ, with the Arc drop deferred to process context) is the future full convergence.
 #[inline]
-fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
+fn finish_pending_prev() -> bool {
     let (pid, generation) = PENDING_PREV_ON_CPU.with(|s| {
         (
             s.pid.load(Ordering::Acquire),
@@ -281,22 +533,16 @@ fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
     if pid == 0 {
         return true;
     }
-    let pcb = match origin {
-        kernel_core::ReschedOrigin::Process => process::get_process(pid as usize),
-        kernel_core::ReschedOrigin::IrqReturn => match process::try_get_process(pid as usize) {
-            None => return false,
-            Some(pcb) => pcb,
-        },
+    let pcb = match process::try_get_process(pid as usize) {
+        None => return false,
+        Some(pcb) => pcb,
     };
     let mut reaper = None;
     let mut reap_pcb = None;
     if let Some(pcb) = pcb {
-        let proc = match origin {
-            kernel_core::ReschedOrigin::Process => pcb.lock(),
-            kernel_core::ReschedOrigin::IrqReturn => match pcb.try_lock() {
-                Some(proc) => proc,
-                None => return false,
-            },
+        let proc = match pcb.try_lock() {
+            Some(proc) => proc,
+            None => return false,
         };
         // Generation guard: a reaped+recycled pid now names a DIFFERENT task; clearing its
         // on_cpu while it runs would re-open the double-run hole. Only clear if it is still
@@ -314,7 +560,7 @@ fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
         let Some(pcb) = reap_pcb.as_ref() else {
             return false;
         };
-        if !wake_reaper_after_switch(parent_pid, pid as Pid, generation, pcb, origin) {
+        if !wake_reaper_after_switch(parent_pid, pid as Pid, generation, pcb) {
             return false;
         }
     }
@@ -333,7 +579,7 @@ fn finish_pending_prev(origin: kernel_core::ReschedOrigin) -> bool {
 /// Using CpuLocal splits the lock across CPUs, reducing cross-CPU contention and
 /// enabling work stealing for load balancing.
 pub static READY_QUEUE: CpuLocal<Mutex<ReadyQueues>> =
-    CpuLocal::new(|| Mutex::new(BTreeMap::new()));
+    CpuLocal::new(|| Mutex::new(ReadyQueues::new()));
 
 lazy_static! {
     pub static ref SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats::new());
@@ -407,11 +653,11 @@ struct SelectionResult {
     complete_cycle: bool,
 }
 
-/// Fully prepared IRQ-return switch. PCB/table/cpuset locks have all been
+/// Fully prepared context switch. PCB/table/cpuset locks have all been
 /// released. The outgoing PCB remains pinned by PROCESS_TABLE while `on_cpu`
 /// is true; deferred teardown now refuses to proceed until finish-task-switch
 /// clears that publication. The incoming context is copied to a per-CPU shadow.
-struct PreparedIrqSwitch {
+struct PreparedSwitch {
     old_pid: Pid,
     old_generation: u64,
     old_space: usize,
@@ -554,142 +800,27 @@ impl Scheduler {
     // 内部辅助函数
     // ========================================================================
 
-    /// 在优先级分桶中查找指定 PID 的进程
-    fn find_pcb(queue: &ReadyQueues, pid: Pid) -> Option<ProcessControlBlock> {
-        for bucket in queue.values() {
-            if let Some(pcb) = bucket.get(&pid) {
-                return Some(pcb.clone());
-            }
-        }
-        None
-    }
-
-    /// 选择优先级最高的就绪进程（内部实现，需要队列锁）
-    ///
-    /// # Arguments
-    /// * `queue` - 就绪队列引用
-    /// * `skip_pid` - 要跳过的进程 PID（用于 yield 时避免选中自己）
-    ///
-    /// # R70-3 FIX: Use cpu_allowed() for consistent affinity semantics
-    ///
-    /// # F.2: Skip processes in throttled cgroups (cpu.max enforcement)
-    #[allow(dead_code)]
-    fn select_next_legacy_bounded(queue: &ReadyQueues, skip_pid: Option<Pid>) -> Option<Pid> {
-        // Get current CPU ID for affinity check
-        let cpu_id = current_cpu_id();
-
-        // F.2 Cgroup: Calculate current time for CPU quota checks
-        let now_tick = kernel_core::get_ticks();
-        let now_ns = now_tick.saturating_mul(TICK_NS);
-
-        // RF178-5 FIX: Bucket keys are membership hints, not priority truth.
-        // PI, yield, quantum expiry, and aging all mutate the live PCB priority.
-        // Select globally by live priority, then longest wait, then PID.
-        let mut best: Option<(Priority, u64, Pid)> = None;
-        let mut visits = 0usize;
-        'queue_scan: for (_priority, bucket) in queue.iter() {
-            for (&pid, pcb) in bucket.iter() {
-                if visits == SELECT_VISIT_BUDGET {
-                    break 'queue_scan;
-                }
-                visits += 1;
-                // 跳过指定的进程（用于 yield 场景）
-                if Some(pid) == skip_pid {
-                    continue;
-                }
-                let Some(mut proc) = pcb.try_lock() else {
-                    continue;
-                };
-                if proc.state == ProcessState::Ready && !proc.stopped {
-                    proc.age_wait_ticks_to(now_tick);
-                    proc.check_and_boost_starved();
-                }
-                // R70-3 FIX: Check both state AND CPU affinity using cpu_allowed()
-                // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
-                let effective_mask = Self::effective_allowed_cpus(&proc);
-
-                // F.2 Cgroup: Skip processes in throttled cgroups
-                let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
-
-                if proc.state == ProcessState::Ready
-                    && !proc.on_cpu.load(Ordering::Acquire) // R172-03: skip a task whose outgoing save is not yet durable
-                    && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
-                    && !process::is_pending_irq_kill(pid) // R169-9 FIX: skip IRQ-killed tasks
-                    && Self::cpu_allowed(cpu_id, effective_mask)
-                    && !throttled
-                {
-                    let candidate = (proc.dynamic_priority, proc.wait_ticks, pid);
-                    let better = match best {
-                        None => true,
-                        Some((priority, waited, best_pid)) => {
-                            candidate.0 < priority
-                                || (candidate.0 == priority && candidate.1 > waited)
-                                || (candidate.0 == priority
-                                    && candidate.1 == waited
-                                    && candidate.2 < best_pid)
-                        }
-                    };
-                    if better {
-                        best = Some(candidate);
-                    }
-                }
-            }
-        }
-        if let Some((_, _, pid)) = best {
-            sched_debug!("[SCHED] selected pid={}", pid);
-            return Some(pid);
-        }
-
-        // 如果没有其他就绪进程，回退到被跳过的进程（如果它是就绪的且允许在此CPU运行）
-        if let Some(skip) = skip_pid {
-            if let Some(pcb) = Self::find_pcb(queue, skip) {
-                let Some(proc) = pcb.try_lock() else {
-                    return None;
-                };
-                // R70-3 FIX: Use cpu_allowed() for consistent semantics
-                // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
-                let effective_mask = Self::effective_allowed_cpus(&proc);
-
-                // F.2 Cgroup: Skip processes in throttled cgroups
-                let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
-
-                if proc.state == ProcessState::Ready
-                    && !proc.on_cpu.load(Ordering::Acquire)
-                    && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
-                    && !process::is_pending_irq_kill(skip) // R169-9 FIX: skip IRQ-killed tasks
-                    && Self::cpu_allowed(cpu_id, effective_mask)
-                    && !throttled
-                {
-                    sched_debug!("[SCHED] fallback to skipped pid={}", skip);
-                    return Some(skip);
-                }
-            }
-        }
-
-        sched_debug!("[SCHED] no ready process found");
-        None
-    }
-
     /// Return the queue entry immediately after `after`, wrapping at the end.
     /// Tree lookups are O(log N); the caller imposes the hard PCB-visit bound.
     fn next_queue_entry<'a, T>(
-        queue: &'a BTreeMap<Priority, BTreeMap<Pid, T>>,
+        queue: &'a PriorityQueues<T>,
         after: Option<(Priority, Pid)>,
     ) -> Option<((Priority, Pid), &'a T)> {
         if let Some((priority, pid)) = after {
-            if let Some(bucket) = queue.get(&priority) {
-                if let Some((&next_pid, pcb)) = bucket.range((Excluded(pid), Unbounded)).next() {
-                    return Some(((priority, next_pid), pcb));
-                }
+            let bucket = queue.bucket(priority);
+            if let Some((&next_pid, pcb)) = bucket.range((Excluded(pid), Unbounded)).next() {
+                return Some(((priority, next_pid), pcb));
             }
-            for (&next_priority, bucket) in queue.range((Excluded(priority), Unbounded)) {
+            for next_priority_raw in (priority as usize + 1)..PRIORITY_BUCKETS {
+                let next_priority = next_priority_raw as Priority;
+                let bucket = queue.bucket(next_priority);
                 if let Some((&next_pid, pcb)) = bucket.iter().next() {
                     return Some(((next_priority, next_pid), pcb));
                 }
             }
         }
 
-        for (&priority, bucket) in queue.iter() {
+        for (priority, bucket) in queue.iter() {
             if let Some((&pid, pcb)) = bucket.iter().next() {
                 return Some(((priority, pid), pcb));
             }
@@ -704,7 +835,7 @@ impl Scheduler {
     /// observed value is runnable; every callback invocation consumes exactly
     /// one unit of the hard visit budget.
     fn scan_queue_window<T, F>(
-        queue: &BTreeMap<Priority, BTreeMap<Pid, T>>,
+        queue: &PriorityQueues<T>,
         cursor: &mut SelectionCursorState,
         queue_epoch: u64,
         visit_budget: usize,
@@ -722,11 +853,7 @@ impl Scheduler {
         }
 
         if let Some((priority, pid)) = cursor.cycle_start {
-            if !queue
-                .get(&priority)
-                .map(|bucket| bucket.contains_key(&pid))
-                .unwrap_or(false)
-            {
+            if !queue.bucket(priority).contains_key(&pid) {
                 cursor.cycle_start = None;
             }
         }
@@ -919,18 +1046,43 @@ impl Scheduler {
         READY_QUEUE.get_cpu(cpu_id)
     }
 
+    /// RF180-46: a ready-queue owner may be performing an attacker-scaled
+    /// sorted-map mutation with interrupts enabled. Never spin behind that
+    /// owner after IF has been cleared: defer the scheduling point instead so
+    /// the local CPU can restore IF and make forward progress.
+    #[inline]
+    fn lock_ready_queue_or_defer<'a>(
+        queue: &'a Mutex<ReadyQueues>,
+    ) -> Option<spin::MutexGuard<'a, ReadyQueues>> {
+        if interrupts::are_enabled() {
+            return Some(queue.lock());
+        }
+
+        match queue.try_lock() {
+            Some(queue) => Some(queue),
+            None => {
+                current_cpu().set_need_resched();
+                None
+            }
+        }
+    }
+
     /// Calculate the length of a ready queue
     #[inline]
     fn queue_len(queue: &ReadyQueues) -> usize {
-        queue.values().map(|bucket| bucket.len()).sum()
+        queue.len()
     }
 
     /// Get queue length for a specific CPU
     #[inline]
     fn queue_len_for_cpu(cpu_id: usize) -> usize {
-        Self::ready_queue_for_cpu(cpu_id)
-            .map(|q| Self::queue_len(&q.lock()))
-            .unwrap_or(0)
+        let Some(queue) = Self::ready_queue_for_cpu(cpu_id) else {
+            return 0;
+        };
+        let Some(queue) = Self::lock_ready_queue_or_defer(queue) else {
+            return 0;
+        };
+        Self::queue_len(&queue)
     }
 
     // ========================================================================
@@ -958,23 +1110,22 @@ impl Scheduler {
     /// (only CPU 0 allowed) as a fail-safe - the task will be constrained to
     /// CPU 0 rather than escaping to all CPUs.
     #[inline]
-    fn effective_allowed_cpus(proc: &process::Process) -> u64 {
+    fn effective_allowed_cpus(proc: &process::Process) -> Option<u64> {
         let cpuset_id = CpusetId(proc.cpuset_id);
         let effective = cpuset::effective_cpus(cpuset_id, proc.allowed_cpus);
 
-        // R95-6 FIX: Never return 0 from a non-empty cpuset constraint.
-        // If affinity is disjoint from cpuset, ignore affinity and use cpuset-only.
+        // If affinity is disjoint from cpuset, ignore affinity and use the
+        // cpuset itself. An empty cpuset has no safe CPU fallback: manufacturing
+        // CPU 0 would cross the isolation boundary it is supposed to enforce.
         if effective == 0 {
             let cpuset_only = cpuset::effective_cpus(cpuset_id, 0);
-            // Edge case: If cpuset itself is empty (misconfiguration), clamp to CPU 0
-            // rather than allowing all CPUs. This is fail-closed behavior.
             if cpuset_only == 0 {
-                return 1; // Only CPU 0 allowed as fail-safe
+                return None;
             }
-            return cpuset_only;
+            return Some(cpuset_only);
         }
 
-        effective
+        Some(effective)
     }
 
     /// RF178-33: fail-closed, nonblocking affinity lookup for IRQ return.
@@ -987,7 +1138,7 @@ impl Scheduler {
         }
 
         let cpuset_only = cpuset::try_effective_cpus(cpuset_id, 0)?;
-        Some(if cpuset_only == 0 { 1 } else { cpuset_only })
+        (cpuset_only != 0).then_some(cpuset_only)
     }
 
     /// Check whether a CPU is permitted by the affinity mask (bit N = CPU N).
@@ -1030,6 +1181,33 @@ impl Scheduler {
         send_ipi(cpu_id, IpiType::Reschedule);
     }
 
+    #[inline]
+    fn publish_ready_signal<F>(need_resched: &AtomicBool, remote: bool, kick: F)
+    where
+        F: FnOnce(),
+    {
+        // Queue publication is level-triggered. The target must observe the
+        // pending bit before an IPI can make it enter the scheduling path.
+        need_resched.store(true, Ordering::Release);
+        if remote {
+            kick();
+        }
+    }
+
+    /// Arm the CPU that owns newly published runnable work. Remote publication
+    /// sets the level bit first and sends the edge-triggered IPI last.
+    fn arm_ready_cpu(cpu_id: usize) {
+        assert!(
+            cpu_local::is_cpu_online(cpu_id),
+            "runnable work published to an offline CPU"
+        );
+        let target = PER_CPU_DATA
+            .get_cpu(cpu_id)
+            .expect("online CPU lacks initialized scheduler state");
+        let remote = cpu_id != current_cpu_id();
+        Self::publish_ready_signal(&target.need_resched, remote, || Self::kick_cpu(cpu_id));
+    }
+
     /// Wake idle CPUs that are allowed to run the given work.
     ///
     /// Iterates through online CPUs (excluding self) and sends a reschedule IPI
@@ -1053,7 +1231,8 @@ impl Scheduler {
             }
             // Only kick if queue is empty (CPU likely idle in HLT)
             let queue_empty = Self::ready_queue_for_cpu(cpu_id)
-                .map(|q| q.lock().is_empty())
+                .and_then(|queue| Self::lock_ready_queue_or_defer(queue))
+                .map(|queue| queue.is_empty())
                 .unwrap_or(false);
             if queue_empty {
                 Self::kick_cpu(cpu_id);
@@ -1103,8 +1282,8 @@ impl Scheduler {
     /// # Arguments
     /// * `exclude` - Optional CPU to exclude from search
     /// * `allowed_cpus` - Affinity mask (bit N = CPU N allowed). If 0, all CPUs are considered.
-    fn least_loaded_cpu(exclude: Option<usize>, allowed_cpus: u64) -> (usize, usize) {
-        let mut best_cpu = current_cpu_id();
+    fn least_loaded_cpu(exclude: Option<usize>, allowed_cpus: u64) -> Option<(usize, usize)> {
+        let mut best_cpu = None;
         let mut best_len = usize::MAX;
         for cpu_id in Self::online_cpu_ids() {
             if Some(cpu_id) == exclude {
@@ -1115,14 +1294,17 @@ impl Scheduler {
                 continue;
             }
             if let Some(q) = Self::ready_queue_for_cpu(cpu_id) {
-                let len = Self::queue_len(&q.lock());
+                let Some(queue) = Self::lock_ready_queue_or_defer(q) else {
+                    continue;
+                };
+                let len = Self::queue_len(&queue);
                 if len < best_len {
                     best_len = len;
-                    best_cpu = cpu_id;
+                    best_cpu = Some(cpu_id);
                 }
             }
         }
-        (best_cpu, best_len)
+        best_cpu.map(|cpu_id| (cpu_id, best_len))
     }
 
     /// Select target CPU for new/resumed work (load-aware placement)
@@ -1130,23 +1312,23 @@ impl Scheduler {
     /// # Arguments
     /// * `preferred_cpu` - Default CPU (usually current CPU)
     /// * `allowed_cpus` - Affinity mask (bit N = CPU N allowed). If 0, all CPUs are considered.
-    fn target_cpu_for_new_work(preferred_cpu: usize, allowed_cpus: u64) -> usize {
+    fn target_cpu_for_new_work(preferred_cpu: usize, allowed_cpus: u64) -> Option<usize> {
         // R70-2 FIX: Pass affinity mask to least_loaded_cpu
-        let (least_cpu, least_len) = Self::least_loaded_cpu(None, allowed_cpus);
+        let (least_cpu, least_len) = Self::least_loaded_cpu(None, allowed_cpus)?;
         let preferred_len = Self::queue_len_for_cpu(preferred_cpu);
 
         // If preferred CPU is not allowed, always use least_cpu
         if allowed_cpus != 0 && !Self::cpu_allowed(preferred_cpu, allowed_cpus) {
-            return least_cpu;
+            return Some(least_cpu);
         }
 
         if least_len != usize::MAX
             && least_cpu != preferred_cpu
             && least_len + LOAD_IMBALANCE_THRESHOLD < preferred_len
         {
-            least_cpu
+            Some(least_cpu)
         } else {
-            preferred_cpu
+            Some(preferred_cpu)
         }
     }
 
@@ -1157,27 +1339,115 @@ impl Scheduler {
         }
     }
 
-    /// Remove a PID from all CPU queues (membership by PID only).
-    ///
-    /// Used by `add_process` to de-dupe before re-enqueue under the same PID.
-    /// Reap-time cleanup must use [`remove_identity_from_all_queues`] so a
-    /// recycled PID's new occupant is never purged (RF178-33 / P1-B).
-    fn remove_from_all_queues(pid: Pid) {
-        // Cleanup scans every bounded slot, including a queue left behind by a
-        // failed/offline CPU, rather than deriving an ID ceiling from a count.
-        for cpu_id in 0..max_cpus() {
-            if let Some(queue) = Self::ready_queue_for_cpu(cpu_id) {
-                let mut guard = queue.lock();
-                let mut changed = false;
-                for bucket in guard.values_mut() {
-                    changed |= bucket.remove(&pid).is_some();
+    /// RF180-46 REVIEW FIX: publish one ready membership with detached backing
+    /// preparation. Snapshot/recheck makes concurrent queue growth harmless:
+    /// an undersized candidate is discarded outside the lock and retried. Both
+    /// obsolete and unused backings leave the ready-queue critical section
+    /// before their destructors run.
+    fn try_insert_ready(
+        queue_ref: &Mutex<ReadyQueues>,
+        queue_cpu: usize,
+        priority: Priority,
+        pid: Pid,
+        pcb: ProcessControlBlock,
+    ) -> Result<(), process::SchedulerAddError> {
+        if !interrupts::are_enabled() {
+            return Err(process::SchedulerAddError::Unavailable);
+        }
+        let mut value = Some(pcb);
+        let mut prepared: Option<PreparedReadyBacking<ProcessControlBlock>> = None;
+
+        for _ in 0..READY_INSERT_RETRY_LIMIT {
+            let candidate = prepared.take();
+            let mut unused = None;
+            let mut retired = None;
+            // Process-context queue mutation deliberately runs with IF enabled.
+            // AdmittedMap is Vec-backed, so backing replacement and sorted
+            // insertion can move attacker-scaled entries.
+            let step = (|| {
+                let Some(mut queue) = Self::lock_ready_queue_or_defer(queue_ref) else {
+                    unused = candidate;
+                    return Err(process::SchedulerAddError::Unavailable);
+                };
+                if queue.bucket(priority).contains_key(&pid) {
+                    unused = candidate;
+                    return Err(process::SchedulerAddError::InvalidState);
                 }
-                guard.retain(|_, bucket| !bucket.is_empty());
-                if changed {
-                    Self::mark_queue_mutated(cpu_id);
+
+                let Some(required) = queue
+                    .len()
+                    .checked_add(queue.protected_slots(priority))
+                    .and_then(|needed| needed.checked_add(1))
+                else {
+                    unused = candidate;
+                    return Err(process::SchedulerAddError::NoMemory);
+                };
+
+                if required > queue.capacity() {
+                    let Some(doubled) = queue.capacity().max(4).checked_mul(2) else {
+                        unused = candidate;
+                        return Err(process::SchedulerAddError::NoMemory);
+                    };
+                    let preferred = doubled.max(required);
+                    match candidate {
+                        Some(candidate) if candidate.capacity() >= required => {
+                            retired = Some(
+                                queue
+                                    .bucket_mut(priority)
+                                    .install_prepared_deferred(candidate)
+                                    .expect("RF180-46 prepared scheduler backing invariant"),
+                            );
+                        }
+                        stale => {
+                            unused = stale;
+                            return Ok(Some((preferred, required)));
+                        }
+                    }
+                } else {
+                    unused = candidate;
+                }
+
+                let entry = value
+                    .take()
+                    .expect("RF180-46 scheduler insert retried after publication");
+                if let Err((_pid, returned)) = queue
+                    .bucket_mut(priority)
+                    .insert_unique_reserved(pid, entry)
+                {
+                    value = Some(returned);
+                    return Err(process::SchedulerAddError::InvalidState);
+                }
+                Self::mark_queue_mutated(queue_cpu);
+                Ok(None)
+            })();
+
+            // Dropping a prepared candidate rolls back its reservation; dropping
+            // a retired backing frees storage before releasing its committed
+            // charge. Neither destructor may run under a ready-queue lock.
+            drop(unused);
+            drop(retired);
+
+            match step? {
+                None => return Ok(()),
+                Some((preferred, required)) => {
+                    prepared =
+                        match PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, preferred)
+                        {
+                            Ok(candidate) => Some(candidate),
+                            Err(_) if preferred != required => Some(
+                                PreparedAdmittedMapCapacity::try_new(
+                                    HeapClass::Scheduler,
+                                    required,
+                                )
+                                .map_err(|_| process::SchedulerAddError::NoMemory)?,
+                            ),
+                            Err(_) => return Err(process::SchedulerAddError::NoMemory),
+                        };
                 }
             }
         }
+
+        Err(process::SchedulerAddError::NoMemory)
     }
 
     /// RF178-33 / P1-B: identity-bound membership remove on one ready queue.
@@ -1190,9 +1460,12 @@ impl Scheduler {
         queue_cpu: Option<usize>,
         pid: Pid,
         generation: u64,
-    ) -> bool {
+    ) -> (
+        Option<ProcessControlBlock>,
+        Option<RetiredReadyBacking<ProcessControlBlock>>,
+    ) {
         // Membership scan: PI boost can drift dynamic_priority from the bucket key.
-        let match_priority = queue.iter().find_map(|(&priority, bucket)| {
+        let match_priority = queue.iter().find_map(|(priority, bucket)| {
             let pcb = bucket.get(&pid)?;
             let proc = pcb.lock();
             if proc.pid == pid && proc.generation == generation {
@@ -1202,16 +1475,10 @@ impl Scheduler {
             }
         });
         let Some(priority) = match_priority else {
-            return false;
+            return (None, None);
         };
-        let Some(bucket) = queue.get_mut(&priority) else {
-            return false;
-        };
-        let removed = bucket.remove(&pid).is_some();
-        if bucket.is_empty() {
-            queue.remove(&priority);
-        }
-        if removed {
+        let removed = queue.remove_ordinary(priority, &pid);
+        if removed.0.is_some() {
             if let Some(cpu_id) = queue_cpu {
                 Self::mark_queue_mutated(cpu_id);
             }
@@ -1233,13 +1500,17 @@ impl Scheduler {
     fn remove_identity_from_all_queues(pid: Pid, generation: u64) {
         for cpu_id in 0..max_cpus() {
             if let Some(queue) = Self::ready_queue_for_cpu(cpu_id) {
-                let mut guard = queue.lock();
-                let _ = Self::remove_identity_from_ready_queues(
-                    &mut guard,
-                    Some(cpu_id),
-                    pid,
-                    generation,
-                );
+                let (removed, retired) = {
+                    let mut guard = queue.lock();
+                    Self::remove_identity_from_ready_queues(
+                        &mut guard,
+                        Some(cpu_id),
+                        pid,
+                        generation,
+                    )
+                };
+                drop(removed);
+                drop(retired);
             }
         }
     }
@@ -1256,39 +1527,24 @@ impl Scheduler {
         queue: &mut ReadyQueues,
         queue_cpu: Option<usize>,
         pid: Pid,
-    ) -> Option<ProcessControlBlock> {
-        let key = queue.iter().find_map(|(&k, bucket)| {
+    ) -> Option<(ProcessControlBlock, Priority)> {
+        let key = queue.iter().find_map(|(k, bucket)| {
             if bucket.contains_key(&pid) {
                 Some(k)
             } else {
                 None
             }
         })?;
-        let bucket = queue.get_mut(&key)?;
-        let pcb = bucket.remove(&pid);
-        if bucket.is_empty() {
-            queue.remove(&key);
-        }
+        // Migration is a remove-then-publish transaction. Protect the exact
+        // admitted source slot from every competing enqueue until destination
+        // publication succeeds or rollback restores this membership.
+        let pcb = queue.remove_for_migration(key, &pid);
         if pcb.is_some() {
             if let Some(cpu_id) = queue_cpu {
                 Self::mark_queue_mutated(cpu_id);
             }
         }
-        pcb
-    }
-
-    /// Enqueue a process on a specific CPU's queue
-    fn enqueue_on_cpu(pcb: ProcessControlBlock, priority: Priority, cpu_id: usize) {
-        let queue =
-            Self::ready_queue_for_cpu(cpu_id).unwrap_or_else(|| Self::current_ready_queue());
-        let pid = {
-            let mut proc = pcb.lock();
-            proc.publish_ready_at(kernel_core::get_ticks());
-            proc.pid
-        };
-        let mut guard = queue.lock();
-        guard.entry(priority).or_default().insert(pid, pcb);
-        Self::mark_queue_mutated(cpu_id);
+        pcb.map(|pcb| (pcb, key))
     }
 
     /// Pop a ready process from a queue (for migration)
@@ -1299,12 +1555,17 @@ impl Scheduler {
     ) -> Option<(Pid, ProcessControlBlock, Priority)> {
         let (pid, _selected, priority) =
             Self::select_next_for_migration_locked(queue, queue_cpu, target_cpu, None)?;
-        let removed = Self::remove_pid_from_queue(queue, Some(queue_cpu), pid)?;
-        Some((pid, removed, priority))
+        let (removed, membership_priority) =
+            Self::remove_pid_from_queue(queue, Some(queue_cpu), pid)
+                .expect("selected migration candidate disappeared under its queue lock");
+        let _ = priority;
+        Some((pid, removed, membership_priority))
     }
 
     /// Try to steal a ready process from another CPU
-    fn steal_one(current_pid: Option<Pid>) -> Option<(Pid, ProcessControlBlock, usize, Priority)> {
+    fn steal_one(
+        current_pid: Option<Pid>,
+    ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
         let local_cpu = current_cpu_id();
         let online_mask = cpu_local::online_cpu_mask();
         if online_mask.count_ones() < 2 {
@@ -1331,7 +1592,7 @@ impl Scheduler {
         }
 
         let queue = Self::ready_queue_for_cpu(source_cpu)?;
-        let mut guard = queue.lock();
+        let mut guard = Self::lock_ready_queue_or_defer(queue)?;
         let mut retries = 0usize;
         let mut candidate =
             Self::select_next_for_migration_locked(&guard, source_cpu, local_cpu, current_pid);
@@ -1350,8 +1611,16 @@ impl Scheduler {
                 );
                 continue;
             }
-            if let Some(mut pcb) = proc_arc.try_lock() {
-                let effective_mask = Self::effective_allowed_cpus(&pcb);
+            if let Some(pcb) = proc_arc.try_lock() {
+                let Some(effective_mask) = Self::effective_allowed_cpus(&pcb) else {
+                    candidate = Self::select_next_for_migration_locked(
+                        &guard,
+                        source_cpu,
+                        local_cpu,
+                        Some(pid),
+                    );
+                    continue;
+                };
                 let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
                 if pcb.state != ProcessState::Ready
                     || pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
@@ -1371,31 +1640,20 @@ impl Scheduler {
                     continue;
                 }
                 let priority = pcb.dynamic_priority;
-                pcb.enter_running_at(kernel_core::get_ticks());
-                pcb.on_cpu.store(true, Ordering::Release); // R172-03: now executing -> gate steal/select until its next switch-out save completes
-                pcb.reset_time_slice();
-                let mem_space = pcb.memory_space;
                 drop(pcb);
                 // R171-M4-1 FIX: remove from the source queue by MEMBERSHIP, NOT by the
                 // (possibly PI-drifted) `priority` above. Keying the remove off
                 // `pcb.dynamic_priority` could miss the real bucket and leave the PCB in the
                 // source queue while the caller (`select_next_process`) inserts it locally —
                 // double-queuing one PCB across two CPUs. Only steal if the remove succeeded.
-                if let Some(stolen) = Self::remove_pid_from_queue(&mut guard, Some(source_cpu), pid)
-                {
-                    drop(guard);
-                    // The stolen task lands on the destination at its CURRENT effective
-                    // priority (`priority`), which is the correct fresh bucket key there.
-                    return Some((pid, stolen, mem_space, priority));
-                }
-                // Unreachable under the held queue lock (we just selected `pid` from it), but
-                // fail safe: never report a steal we could not actually remove.
-                candidate = Self::select_next_for_migration_locked(
-                    &guard,
-                    source_cpu,
-                    local_cpu,
-                    Some(pid),
-                );
+                let (stolen, membership_priority) =
+                    Self::remove_pid_from_queue(&mut guard, Some(source_cpu), pid)
+                        .expect("selected steal candidate disappeared under its queue lock");
+                drop(guard);
+                // RF180-46: stealing is a Ready-to-Ready migration. The normal
+                // local selection transaction claims Running/on_cpu only after
+                // destination publication has completed.
+                return Some((pid, stolen, priority, source_cpu, membership_priority));
             } else {
                 candidate = Self::select_next_for_migration_locked(
                     &guard,
@@ -1411,6 +1669,57 @@ impl Scheduler {
     // M4-1: `maybe_balance` was REMOVED — its cheap CPU0 cadence check is inlined into
     // on_clock_tick (which now only sets BALANCE_DUE), and the allocating `balance_queues`
     // it called runs from reschedule_now's prologue in process context (off the IRQ tick).
+
+    /// RF180-46 REVIEW FIX: pull one remote runnable task into the local queue
+    /// while process-context detached allocation is legal. The source retains
+    /// an exact rollback slot until destination publication commits.
+    fn try_steal_to_local_queue(current_pid: Option<Pid>) -> bool {
+        let local_cpu = current_cpu_id();
+        let local = Self::current_ready_queue();
+        let local_has_candidate = {
+            let Some(queue) = Self::lock_ready_queue_or_defer(local) else {
+                return false;
+            };
+            Self::select_next_result_locked(&queue, local_cpu, local_cpu, current_pid)
+                .candidate
+                .is_some()
+        };
+        if local_has_candidate {
+            return false;
+        }
+
+        let stolen = Self::steal_one(current_pid);
+        let Some((pid, pcb, priority, source_cpu, source_priority)) = stolen else {
+            return false;
+        };
+
+        if Self::try_insert_ready(local, local_cpu, priority, pid, Arc::clone(&pcb)).is_ok() {
+            let retired = {
+                Self::ready_queue_for_cpu(source_cpu)
+                    .expect("steal source queue disappeared after publication")
+                    .lock()
+                    .commit_migration_removal(source_priority)
+            };
+            drop(retired);
+            drop(pcb);
+            Self::arm_ready_cpu(local_cpu);
+            true
+        } else {
+            {
+                let source = Self::ready_queue_for_cpu(source_cpu)
+                    .expect("steal source queue disappeared before rollback");
+                let mut source = source.lock();
+                let restored = source.restore_migration(source_priority, pid, pcb);
+                assert!(
+                    restored.is_ok(),
+                    "failed steal must restore retained source slot"
+                );
+                Self::mark_queue_mutated(source_cpu);
+            }
+            Self::arm_ready_cpu(source_cpu);
+            false
+        }
+    }
 
     /// Migrate a ready task from the busiest CPU to the idlest CPU
     fn balance_queues() {
@@ -1462,12 +1771,30 @@ impl Scheduler {
             // R69-3 FIX: Check CPU affinity before migration
             // E.5: Use effective_allowed_cpus for cpuset-aware migration
             let Some(proc) = pcb.try_lock() else {
-                let mut src_guard = src_queue.lock();
-                src_guard.entry(_priority).or_default().insert(pid, pcb);
-                Self::mark_queue_mutated(src_cpu);
+                {
+                    let mut src_guard = src_queue.lock();
+                    // The source bucket retained its capacity when `pid` was
+                    // removed, so restoration is allocation-free and exact.
+                    let restored = src_guard.restore_migration(_priority, pid, pcb);
+                    assert!(
+                        restored.is_ok(),
+                        "source queue restoration must be reserved"
+                    );
+                    Self::mark_queue_mutated(src_cpu);
+                }
+                Self::arm_ready_cpu(src_cpu);
                 return;
             };
-            let allowed_cpus = Self::effective_allowed_cpus(&proc);
+            let Some(allowed_cpus) = Self::effective_allowed_cpus(&proc) else {
+                drop(proc);
+                let mut src_guard = src_queue.lock();
+                let restored = src_guard.restore_migration(_priority, pid, pcb);
+                assert!(restored.is_ok(), "empty cpuset restore must be reserved");
+                Self::mark_queue_mutated(src_cpu);
+                drop(src_guard);
+                Self::arm_ready_cpu(src_cpu);
+                return;
+            };
             let eff_prio = proc.dynamic_priority;
             let still_ready = proc.state == ProcessState::Ready
                 && !proc.stopped
@@ -1476,114 +1803,45 @@ impl Scheduler {
 
             // Check if destination CPU is allowed by effective mask
             if !still_ready || !Self::cpu_allowed(dst_cpu, allowed_cpus) {
-                // Destination CPU not in affinity mask, put task back (at its effective prio)
-                let mut src_guard = src_queue.lock();
-                src_guard.entry(eff_prio).or_default().insert(pid, pcb);
-                Self::mark_queue_mutated(src_cpu);
+                // Put the task back in its original retained-capacity bucket.
+                {
+                    let mut src_guard = src_queue.lock();
+                    let restored = src_guard.restore_migration(_priority, pid, pcb);
+                    assert!(
+                        restored.is_ok(),
+                        "source queue restoration must be reserved"
+                    );
+                    Self::mark_queue_mutated(src_cpu);
+                }
+                Self::arm_ready_cpu(src_cpu);
                 return;
             }
 
-            let target =
-                Self::ready_queue_for_cpu(dst_cpu).unwrap_or_else(|| Self::current_ready_queue());
-            let mut dst_guard = target.lock();
-            dst_guard.entry(eff_prio).or_default().insert(pid, pcb);
-            Self::mark_queue_mutated(dst_cpu);
-        }
-    }
-
-    /// Select next process from local queue or via work stealing
-    fn select_next_process(
-        current_pid: Option<Pid>,
-        origin: kernel_core::ReschedOrigin,
-    ) -> Option<(
-        Option<Pid>,
-        Option<ProcessControlBlock>,
-        Option<ProcessControlBlock>,
-        usize,
-    )> {
-        let queue_ref = Self::current_ready_queue();
-        let queue = match origin {
-            kernel_core::ReschedOrigin::Process => queue_ref.lock(),
-            kernel_core::ReschedOrigin::IrqReturn => match queue_ref.try_lock() {
-                Some(queue) => queue,
-                None => {
-                    current_cpu().set_need_resched();
-                    return None;
+            let (target, target_cpu) = match Self::ready_queue_for_cpu(dst_cpu) {
+                Some(target) => (target, dst_cpu),
+                None => (Self::current_ready_queue(), current_cpu_id()),
+            };
+            match Self::try_insert_ready(target, target_cpu, eff_prio, pid, Arc::clone(&pcb)) {
+                Ok(()) => {
+                    let retired = { src_queue.lock().commit_migration_removal(_priority) };
+                    drop(retired);
+                    drop(pcb);
+                    Self::arm_ready_cpu(target_cpu);
                 }
-            },
-        };
-        let local_cpu = current_cpu_id();
-        let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
-
-        let selection = Self::select_next_result_locked(&queue, local_cpu, local_cpu, current_pid);
-        let complete_cycle = selection.complete_cycle;
-        let selected_was_present = selection.candidate.is_some();
-        let selected = selection.candidate;
-        let mut candidate = selected.as_ref().map(|(pid, _, _)| *pid);
-        let mut claimed_proc = None;
-        let mut claimed_memory_space = 0usize;
-
-        if let Some((pid, proc_arc, _selected_priority)) = selected {
-            if Some(pid) != current_pid {
-                if let Some(mut pcb) = proc_arc.try_lock() {
-                    let effective_mask = Self::effective_allowed_cpus(&pcb);
-                    let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
-                    if pcb.state == ProcessState::Ready
-                        && !pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
-                        && !pcb.stopped
-                        && !process::is_pending_irq_kill(pid)
-                        && Self::cpu_allowed(local_cpu, effective_mask)
-                        && cgroup::cpu_quota_is_throttled(pcb.cgroup_id, now_ns).is_none()
+                Err(_) => {
                     {
-                        // R98-1 FIX: Only transition to Running if truly runnable
-                        // R169-9 FIX: re-validate the IRQ-kill set after re-locking
-                        pcb.enter_running_at(kernel_core::get_ticks());
-                        pcb.on_cpu.store(true, Ordering::Release); // R172-03: now executing
-                        pcb.reset_time_slice();
-                        claimed_memory_space = pcb.memory_space;
-                        drop(pcb);
-                        claimed_proc = Some(proc_arc.clone());
-                    } else {
-                        candidate = None;
+                        let mut src_guard = src_queue.lock();
+                        let restored = src_guard.restore_migration(_priority, pid, pcb);
+                        assert!(
+                            restored.is_ok(),
+                            "failed migration must restore retained source slot"
+                        );
+                        Self::mark_queue_mutated(src_cpu);
                     }
-                } else {
-                    candidate = None;
+                    Self::arm_ready_cpu(src_cpu);
                 }
             }
         }
-
-        drop(queue);
-
-        // RF178-33: IRQ return is local-only. Work stealing scans CPU queues
-        // and may block on remote locks, so it remains process-context work.
-        if candidate.is_none() && origin == kernel_core::ReschedOrigin::Process {
-            if let Some((pid, proc_arc, mem_space, priority)) = Self::steal_one(current_pid) {
-                // Add stolen process to local queue
-                let mut queue = queue_ref.lock();
-                queue
-                    .entry(priority)
-                    .or_default()
-                    .insert(pid, proc_arc.clone());
-                Self::mark_queue_mutated(local_cpu);
-                return Some((Some(pid), current_proc, Some(proc_arc), mem_space));
-            }
-            // A blocking/yielding caller may halt immediately after this
-            // scheduling point. Preserve a level-triggered request whenever
-            // the bounded local scan was incomplete or its chosen PCB raced.
-            if !complete_cycle || selected_was_present {
-                current_cpu().set_need_resched();
-            }
-        }
-
-        if candidate.is_none() && origin == kernel_core::ReschedOrigin::IrqReturn {
-            if !complete_cycle || selected_was_present {
-                // The cursor advanced across a bounded window, or the chosen
-                // PCB changed before claim. Continue instead of declaring idle.
-                current_cpu().set_need_resched();
-            }
-        }
-
-        Some((candidate, current_proc, claimed_proc, claimed_memory_space))
     }
 
     // ========================================================================
@@ -1601,53 +1859,128 @@ impl Scheduler {
     /// E.5: Uses effective_allowed_cpus for cpuset-aware CPU placement.
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
-    pub fn add_process(pcb: ProcessControlBlock) {
-        interrupts::without_interrupts(|| {
-            // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
-            let (pid, priority, allowed_cpus) = {
-                let mut proc = pcb.lock();
-                proc.enter_ready_at(kernel_core::get_ticks());
-                (
-                    proc.pid,
-                    proc.dynamic_priority,
-                    Self::effective_allowed_cpus(&proc),
-                )
-            };
-            // R70-2 FIX: Pass affinity mask to target selection
-            let target_cpu = Self::target_cpu_for_new_work(current_cpu_id(), allowed_cpus);
-            sched_debug!(
-                "[SCHED] add_process: pid={}, priority={}, target_cpu={}",
-                pid,
+    /// R180-19 PREPARE: reserve the exact queue slot while the child is
+    /// non-runnable. All allocation is confined to this method.
+    pub fn reserve_process(
+        pcb: ProcessControlBlock,
+    ) -> Result<process::SchedulerAddToken, process::SchedulerAddError> {
+        if !interrupts::are_enabled() {
+            return Err(process::SchedulerAddError::Unavailable);
+        }
+
+        let (pid, generation, priority, allowed_cpus) = {
+            let mut proc = pcb.lock();
+            if proc.state != ProcessState::Ready || proc.stopped {
+                return Err(process::SchedulerAddError::InvalidState);
+            }
+            let allowed_cpus = Self::effective_allowed_cpus(&proc)
+                .ok_or(process::SchedulerAddError::NoEligibleCpu)?;
+            proc.state = ProcessState::Provisioning;
+            (
+                proc.pid,
+                proc.generation,
+                proc.dynamic_priority,
+                allowed_cpus,
+            )
+        };
+        // Target selection takes only ready-queue locks and performs no heap
+        // work. Detached queue backing is prepared afterward, with no lock held.
+        let target_cpu = Self::target_cpu_for_new_work(current_cpu_id(), allowed_cpus)
+            .ok_or(process::SchedulerAddError::NoEligibleCpu)?;
+        sched_debug!(
+            "[SCHED] add_process: pid={}, priority={}, target_cpu={}",
+            pid,
+            priority,
+            target_cpu
+        );
+
+        let queue =
+            Self::ready_queue_for_cpu(target_cpu).ok_or(process::SchedulerAddError::Unavailable)?;
+        let queue_cpu = target_cpu;
+        match Self::try_insert_ready(queue, queue_cpu, priority, pid, Arc::clone(&pcb)) {
+            Ok(()) => Ok(process::SchedulerAddToken {
+                cpu_id: queue_cpu,
                 priority,
-                target_cpu
+                pid,
+                generation,
+                process: pcb,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// R180-19 COMMIT: publish a prepared child with zero allocation.
+    pub fn commit_reserved_process(token: process::SchedulerAddToken) {
+        // This is post-COW publication. reserve_process established every
+        // condition below and rollback is no longer possible, so an invariant
+        // violation must fail-stop instead of silently stranding the child.
+        assert!(
+            interrupts::are_enabled(),
+            "scheduler admission commit requires IF-on process context"
+        );
+        let allowed_cpus = {
+            let mut proc = token.process.lock();
+            assert!(
+                proc.pid == token.pid && proc.generation == token.generation,
+                "scheduler reservation identity mismatch at commit"
             );
+            assert!(
+                proc.state == ProcessState::Provisioning,
+                "scheduler reservation left Provisioning before commit"
+            );
+            let allowed_cpus = Self::effective_allowed_cpus(&proc)
+                .expect("reserved process lost every eligible CPU before commit");
+            assert!(
+                Self::cpu_allowed(token.cpu_id, allowed_cpus),
+                "reserved scheduler CPU left the process affinity before commit"
+            );
+            proc.publish_ready_at(kernel_core::get_ticks());
+            allowed_cpus
+        };
+        Self::mark_queue_mutated(token.cpu_id);
 
-            // Remove from all queues first (prevent duplicates across CPUs)
-            Self::remove_from_all_queues(pid);
+        {
+            let mut stats = SCHEDULER_STATS.lock();
+            stats.processes_created = stats.processes_created.saturating_add(1);
+        }
+        let _ = allowed_cpus;
+        Self::arm_ready_cpu(token.cpu_id);
+    }
 
-            // R70-2 FIX: Check if target CPU's queue was empty before enqueue
-            let target_was_idle = Self::ready_queue_for_cpu(target_cpu)
-                .map(|q| q.lock().is_empty())
+    /// R180-19 rollback: remove only the exact reserved generation.
+    pub fn cancel_reserved_process(token: process::SchedulerAddToken) {
+        assert!(
+            interrupts::are_enabled(),
+            "scheduler admission cancel requires IF-on process context"
+        );
+        let removal = (|| {
+            let Some(queue) = Self::ready_queue_for_cpu(token.cpu_id) else {
+                return (None, None);
+            };
+            let mut queue = queue.lock();
+            let exact = queue
+                .bucket(token.priority)
+                .get(&token.pid)
+                .map(|pcb| Arc::ptr_eq(pcb, &token.process))
                 .unwrap_or(false);
-
-            // Add to target CPU's queue
-            Self::enqueue_on_cpu(pcb, priority, target_cpu);
-
-            {
-                let mut stats = SCHEDULER_STATS.lock();
-                stats.processes_created += 1;
+            assert!(exact, "scheduler cancellation lost its exact reserved PCB");
+            let removed = queue.remove_ordinary(token.priority, &token.pid);
+            if removed.0.is_some() {
+                Self::mark_queue_mutated(token.cpu_id);
             }
+            removed
+        })();
+        drop(removal.0);
+        drop(removal.1);
+    }
 
-            // R70-7: Kick target CPU to pick up new work immediately.
-            // Fixed: R70-4 (context shadow buffer) + R70-5 (AP stack allocation)
-            // resolved the double fault issue.
-            if target_was_idle
-                && target_cpu != current_cpu_id()
-                && Self::cpu_allowed(target_cpu, allowed_cpus)
-            {
-                Self::kick_cpu(target_cpu);
-            }
-        });
+    /// Convenience path for kernel-created tasks that do not need to hold the
+    /// permit across additional preparation.
+    #[must_use]
+    pub fn add_process(pcb: ProcessControlBlock) -> Result<(), process::SchedulerAddError> {
+        let token = Self::reserve_process(pcb)?;
+        Self::commit_reserved_process(token);
+        Ok(())
     }
 
     /// 移除进程（reap-time; identity-bound）
@@ -1658,9 +1991,8 @@ impl Scheduler {
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn remove_process(pid: Pid, generation: u64) {
+        Self::remove_identity_from_all_queues(pid, generation);
         interrupts::without_interrupts(|| {
-            Self::remove_identity_from_all_queues(pid, generation);
-
             let mut stats = SCHEDULER_STATS.lock();
             stats.processes_terminated += 1;
         });
@@ -1713,12 +2045,9 @@ impl Scheduler {
     ///
     /// R69-1 FIX: Uses current CPU's queue.
     pub fn select_next() -> Option<Pid> {
-        interrupts::without_interrupts(|| {
-            let queue = Self::current_ready_queue();
-            let queue = queue.lock();
-            let cpu = current_cpu_id();
-            Self::select_next_locked(&queue, cpu, cpu, None).map(|(pid, _, _)| pid)
-        })
+        let queue = Self::lock_ready_queue_or_defer(Self::current_ready_queue())?;
+        let cpu = current_cpu_id();
+        Self::select_next_locked(&queue, cpu, cpu, None).map(|(pid, _, _)| pid)
     }
 
     /// 更新当前运行的进程
@@ -1936,47 +2265,49 @@ impl Scheduler {
         current_cpu().need_resched.store(false, Ordering::SeqCst);
     }
 
-    /// RF178-33: prepare one timer-IRQ-return switch without a blocking lock.
+    /// RF178-33 / RF180-46: prepare one switch without a blocking lock.
     ///
-    /// The local queue plus candidate/current PCB locks are all try-only. The
-    /// candidate window is strictly bounded, and every datum needed after the
-    /// locks drop is copied into this CPU's stable context shadow or the result.
-    fn prepare_irq_switch() -> Option<PreparedIrqSwitch> {
+    /// Both process-origin and IRQ-return scheduling enter here with IF clear.
+    /// Every potentially contended lock is therefore try-only. A failed
+    /// acquisition leaves all task/current publications unchanged and rearms
+    /// the level-triggered reschedule request.
+    fn prepare_switch() -> Option<PreparedSwitch> {
         let current_slot = Self::current_process_slot();
         let Some(mut current_guard) = current_slot.try_lock() else {
             current_cpu().set_need_resched();
             return None;
         };
-        let old_pid = (*current_guard)?;
+        let old_pid = *current_guard;
         let local_cpu = current_cpu_id();
         let queue_ref = Self::current_ready_queue();
-        let queue = match queue_ref.try_lock() {
-            Some(queue) => queue,
-            None => {
-                current_cpu().set_need_resched();
-                return None;
-            }
-        };
+        let queue = Self::lock_ready_queue_or_defer(queue_ref)?;
 
-        let old_pcb = match process::try_get_process(old_pid) {
-            None => {
-                current_cpu().set_need_resched();
-                return None;
-            }
-            Some(Some(pcb)) => pcb,
-            Some(None) => return None,
-        };
-
-        let selection =
-            Self::select_next_result_locked(&queue, local_cpu, local_cpu, Some(old_pid));
-        let Some((next_pid, next_pcb, _priority)) = selection.candidate else {
-            if let Some(mut old) = old_pcb.try_lock() {
-                if old.state == ProcessState::Ready && old.on_cpu.load(Ordering::Acquire) {
-                    old.enter_running_at(kernel_core::get_ticks());
+        let old_pcb = match old_pid {
+            Some(pid) => match process::try_get_process(pid) {
+                None => {
+                    current_cpu().set_need_resched();
+                    return None;
                 }
-            } else {
-                current_cpu().set_need_resched();
-                return None;
+                Some(Some(pcb)) => Some(pcb),
+                Some(None) => {
+                    current_cpu().set_need_resched();
+                    return None;
+                }
+            },
+            None => None,
+        };
+
+        let selection = Self::select_next_result_locked(&queue, local_cpu, local_cpu, old_pid);
+        let Some((next_pid, next_pcb, _priority)) = selection.candidate else {
+            if let Some(old_pcb) = old_pcb {
+                if let Some(mut old) = old_pcb.try_lock() {
+                    if old.state == ProcessState::Ready && old.on_cpu.load(Ordering::Acquire) {
+                        old.enter_running_at(kernel_core::get_ticks());
+                    }
+                } else {
+                    current_cpu().set_need_resched();
+                    return None;
+                }
             }
             if !selection.complete_cycle {
                 current_cpu().set_need_resched();
@@ -1988,9 +2319,15 @@ impl Scheduler {
             current_cpu().set_need_resched();
             return None;
         };
-        let Some(mut old) = old_pcb.try_lock() else {
-            current_cpu().set_need_resched();
-            return None;
+        let mut old = match old_pcb.as_ref() {
+            Some(old_pcb) => match old_pcb.try_lock() {
+                Some(old) => Some(old),
+                None => {
+                    current_cpu().set_need_resched();
+                    return None;
+                }
+            },
+            None => None,
         };
 
         let Some(effective_mask) = Self::try_effective_allowed_cpus(&next) else {
@@ -2011,7 +2348,7 @@ impl Scheduler {
         }
 
         #[cfg(target_arch = "x86_64")]
-        {
+        if let Some(old) = old.as_mut() {
             use x86_64::registers::model_specific::Msr;
             const MSR_FS_BASE: u32 = 0xC000_0100;
             const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -2022,7 +2359,13 @@ impl Scheduler {
         }
 
         let per_cpu = current_cpu();
-        if per_cpu.get_fpu_owner() == old_pid {
+        if old_pid
+            .map(|pid| per_cpu.get_fpu_owner() == pid)
+            .unwrap_or(false)
+        {
+            let old = old
+                .as_mut()
+                .expect("current PID with FPU ownership must retain its PCB");
             unsafe {
                 use x86_64::registers::control::{Cr0, Cr0Flags};
                 let cr0 = Cr0::read();
@@ -2041,9 +2384,15 @@ impl Scheduler {
             per_cpu.set_fpu_owner(NO_FPU_OWNER);
         }
 
-        let old_ctx_ptr = &mut old.context as *mut _ as *mut ArchContext;
-        let old_generation = old.generation;
-        let old_space = old.memory_space;
+        let (old_ctx_ptr, old_generation, old_space) = if let Some(old) = old.as_mut() {
+            (
+                &mut old.context as *mut _ as *mut ArchContext,
+                old.generation,
+                old.memory_space,
+            )
+        } else {
+            (BOOTSTRAP_CONTEXT.with(BootstrapContext::as_mut_ptr), 0, 0)
+        };
         let next_ctx_ptr = NEXT_CONTEXT_SHADOW.with(|shadow| shadow.store(&next.context));
         let next_space = next.memory_space;
         let next_user_space = next.user_memory_space;
@@ -2054,8 +2403,10 @@ impl Scheduler {
         let next_wd_handle = next.watchdog_handle;
         let next_generation = next.generation;
 
-        if matches!(old.state, ProcessState::Running | ProcessState::Ready) {
-            old.enter_ready_at(now_tick);
+        if let Some(old) = old.as_mut() {
+            if matches!(old.state, ProcessState::Running | ProcessState::Ready) {
+                old.enter_ready_at(now_tick);
+            }
         }
         next.enter_running_at(now_tick);
         next.on_cpu.store(true, Ordering::Release);
@@ -2073,8 +2424,8 @@ impl Scheduler {
             stats.total_switches = stats.total_switches.saturating_add(1);
         }
 
-        Some(PreparedIrqSwitch {
-            old_pid,
+        Some(PreparedSwitch {
+            old_pid: old_pid.unwrap_or(0),
             old_generation,
             old_space,
             old_ctx_ptr,
@@ -2089,9 +2440,9 @@ impl Scheduler {
         })
     }
 
-    /// Complete a switch prepared by `prepare_irq_switch`; no PCB/cpuset/table
+    /// Complete a switch prepared by `prepare_switch`; no PCB/cpuset/table
     /// lock is acquired on this path.
-    fn execute_irq_switch(prepared: PreparedIrqSwitch) {
+    fn execute_switch(prepared: PreparedSwitch) {
         let effective_kstack_top = if prepared.next_kstack_top != 0 {
             prepared.next_kstack_top
         } else {
@@ -2133,144 +2484,46 @@ impl Scheduler {
         }
     }
 
-    /// 执行调度 - 选择下一个进程并更新状态
-    ///
-    /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
-    ///
-    /// **重要**: 此函数只更新进程状态和当前进程标识，不切换CR3。
-    /// CR3切换必须与完整的寄存器上下文切换（switch_context）配合执行。
-    /// 当前内核尚未实现真正的进程切换，所有"进程"共享内核地址空间。
-    ///
-    /// # R67-4 FIX: Per-CPU State
-    ///
-    /// Uses per-CPU CURRENT_PROCESS and need_resched to avoid cross-CPU races.
-    ///
-    /// # R68-3 FIX: Atomic State Transition
-    ///
-    /// State transition from Ready to Running is now done atomically within the
-    /// queue lock to prevent two CPUs from selecting the same process. If another
-    /// CPU has already claimed the selected process (state != Ready), we re-select.
-    ///
-    /// # R69-1 FIX: Per-CPU Run Queues with Work Stealing
-    ///
-    /// Uses per-CPU ready queues to reduce lock contention. If the local queue is
-    /// empty, attempts to steal a ready process from another CPU's queue.
-    ///
-    /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
-    pub fn schedule(origin: kernel_core::ReschedOrigin) -> Option<(Pid, usize)> {
-        interrupts::without_interrupts(|| {
-            // R67-4 FIX: Clear this CPU's reschedule flag
-            current_cpu().need_resched.store(false, Ordering::SeqCst);
-
-            // R67-4 FIX: Use per-CPU current process
-            let current_pid = Self::get_current();
-            sched_debug!("[SCHED] schedule: current_pid={:?}", current_pid);
-
-            // R69-1 FIX: Use select_next_process which handles per-CPU queues and work stealing
-            let Some((next_pid, current_proc, next_proc, next_memory_space)) =
-                Self::select_next_process(current_pid, origin)
-            else {
-                return None;
-            };
-
-            sched_debug!("[SCHED] schedule: next_pid={:?}", next_pid);
-
-            // 选择下一个要运行的进程
-            if let Some(next_pid) = next_pid {
-                if Some(next_pid) != current_pid {
-                    sched_debug!("[SCHED] switching from {:?} to {}", current_pid, next_pid);
-                    // 保存当前进程状态
-                    if let Some(proc) = current_proc {
-                        let mut pcb = proc.lock();
-                        if pcb.state == ProcessState::Running {
-                            pcb.enter_ready_at(kernel_core::get_ticks());
-                        }
-                    }
-
-                    // R68-3: State transition already done inside the lock above
-                    // next_proc and next_memory_space are already set
-
-                    // 注意：不在此处切换 CR3
-                    // CR3 切换必须与 switch_context 配合执行，否则会导致：
-                    // 1. 中断返回后运行在错误的地址空间
-                    // 2. 被中断的代码访问错误的内存映射
-                    //
-                    // TODO: 实现完整的上下文切换路径后，在此处或调用方处理 CR3
-                    // process::activate_memory_space(next_memory_space);
-
-                    // 更新当前进程 (both scheduler and kernel_core trackers)
-                    let next_generation = next_proc
-                        .as_ref()
-                        .map(|pcb| pcb.lock().generation)
-                        .expect("claimed scheduler task must carry a PCB");
-                    Self::set_current(Some(next_pid), next_generation);
-                    process::set_current_pid(Some(next_pid));
-
-                    let mut stats = SCHEDULER_STATS.lock();
-                    stats.total_switches += 1;
-
-                    return Some((next_pid, next_memory_space));
-                }
-            }
-            // R172-03 FIX: no switch (no other runnable task, or re-selected self). If a
-            // timer tick flipped this still-running task Running->Ready (deferred preempt)
-            // but we are NOT switching away from it, restore Running — its live registers
-            // ARE its durable state; leaving it Ready would mis-feed the starvation scan.
-            // `on_cpu` stays true (it genuinely occupies this CPU) and is cleared only when
-            // the task is actually switched out (via finish_pending_prev).
-            if let Some(proc) = current_proc {
-                let mut pcb = proc.lock();
-                if pcb.state == ProcessState::Ready && pcb.on_cpu.load(Ordering::Acquire) {
-                    pcb.enter_running_at(kernel_core::get_ticks());
-                }
-            }
-            None
-        })
-    }
-
     /// 主动让出CPU
     ///
     /// R69-1 FIX: Uses current CPU's ready queue.
     ///
     /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
     pub fn yield_cpu() -> Option<(Pid, usize)> {
-        interrupts::without_interrupts(|| {
-            if let Some(pid) = Self::get_current() {
-                if let Some(pcb) = {
-                    let queue = Self::current_ready_queue();
-                    let queue = queue.lock();
-                    Self::find_pcb(&queue, pid)
-                } {
-                    let mut proc = pcb.lock();
-                    proc.enter_ready_at(kernel_core::get_ticks());
-                    proc.update_dynamic_priority(); // 奖励主动让出的进程
-                }
-            }
-        });
-
-        Self::schedule(kernel_core::ReschedOrigin::Process)
+        Self::reschedule_now(true, kernel_core::ReschedOrigin::Process);
+        None
     }
 
     /// 获取进程数量
     ///
     /// R69-1 FIX: Sums across all per-CPU queues.
-    pub fn process_count() -> usize {
-        interrupts::without_interrupts(|| {
-            let mut total = 0;
-            for cpu_id in Self::online_cpu_ids() {
-                if let Some(queue) = Self::ready_queue_for_cpu(cpu_id) {
-                    total += Self::queue_len(&queue.lock());
-                }
-            }
-            total
-        })
+    pub fn process_count() -> Result<usize, SchedulerSnapshotError> {
+        if !interrupts::are_enabled() {
+            return Err(SchedulerSnapshotError::InterruptsDisabled);
+        }
+
+        let mut guards = core::array::from_fn::<_, { cpu_local::max_cpus() }, _>(|_| None);
+        for cpu_id in Self::online_cpu_ids() {
+            let queue = Self::ready_queue_for_cpu(cpu_id)
+                .ok_or(SchedulerSnapshotError::QueueUnavailable)?;
+            let Some(guard) = queue.try_lock() else {
+                return Err(SchedulerSnapshotError::Contended);
+            };
+            guards[cpu_id] = Some(guard);
+        }
+
+        let mut total = 0usize;
+        for guard in guards.iter().flatten() {
+            total = total
+                .checked_add(Self::queue_len(guard))
+                .ok_or(SchedulerSnapshotError::Overflow)?;
+        }
+        Ok(total)
     }
 
     /// 打印调度统计信息
     pub fn print_stats() {
-        interrupts::without_interrupts(|| {
-            SCHEDULER_STATS.lock().print();
-        });
+        SCHEDULER_STATS.lock().print();
     }
 
     /// 在安全上下文中执行完整上下文切换（含 CR3）
@@ -2299,341 +2552,43 @@ impl Scheduler {
     ///
     /// **警告**: 此函数可能不会返回（如果发生上下文切换）
     pub fn reschedule_now(force: bool, origin: kernel_core::ReschedOrigin) {
-        if origin == kernel_core::ReschedOrigin::IrqReturn {
-            interrupts::without_interrupts(|| {
-                if !drain_tick_debt_before_switch() || !finish_pending_prev(origin) {
-                    current_cpu().set_need_resched();
-                    return;
-                }
-                if !force && !current_cpu().clear_need_resched() {
-                    return;
-                }
-                if !current_cpu().preemptible() {
-                    current_cpu().set_need_resched();
-                    return;
-                }
-                current_cpu().need_resched.store(false, Ordering::SeqCst);
-                if let Some(prepared) = Self::prepare_irq_switch() {
-                    Self::execute_irq_switch(prepared);
-                }
-            });
-            return;
-        }
-
-        // RF178-33: load balancing is deferred until a genuine process-context
-        // entry with IF enabled. Timer IRQ return leaves BALANCE_DUE armed.
-        if origin == kernel_core::ReschedOrigin::Process
-            && interrupts::are_enabled()
-            && BALANCE_DUE.swap(false, Ordering::Relaxed)
-        {
-            interrupts::without_interrupts(Self::balance_queues);
+        // RF180-46: allocating load distribution stays in IF-on process
+        // context. The actual claim/save transaction below is shared with IRQ
+        // return and is entirely try-only once IF is cleared.
+        if origin == kernel_core::ReschedOrigin::Process && interrupts::are_enabled() {
+            if BALANCE_DUE.swap(false, Ordering::Relaxed) {
+                Self::balance_queues();
+            }
+            let current_pid = Self::get_current();
+            let _ = Self::try_steal_to_local_queue(current_pid);
         }
 
         interrupts::without_interrupts(|| {
-            // RF178-3: fold contention-deferred ticks before any switch. The
-            // drain uses tri-state table lookup, PCB try_lock, and generation
-            // validation, so the IRQ-return path never blocks on process locks
-            // and cannot mutate a reaped/reused PID.
-            if !drain_tick_debt_before_switch() {
+            if !drain_tick_debt_before_switch() || !finish_pending_prev() {
                 current_cpu().set_need_resched();
                 return;
             }
-
-            // R172-03 FIX: clear the previously-switched-out task's on_cpu gate (Linux
-            // finish_task_switch). Runs on EVERY reschedule_now entry — including the idle
-            // loop and the no-switch early-returns below — so a task switched out on this
-            // CPU becomes claimable within at most one reschedule cycle, and a CPU that
-            // IRETQ'd to a fresh user task clears the previous task's gate at its next
-            // kernel re-entry (timer preempt -> force_reschedule -> here). Placed BEFORE the
-            // need_resched early-return so the clear is never skipped.
-            if !finish_pending_prev(origin) {
-                current_cpu().set_need_resched();
-                return;
-            }
-            // R67-4 FIX: Check and clear this CPU's need_resched flag
             if !force && !current_cpu().clear_need_resched() {
                 return;
             }
-
-            // R69-3 FIX: Check if we can preempt (not in IRQ context, preemption enabled)
-            // If not preemptible, set need_resched and defer until a safe point
             if !current_cpu().preemptible() {
                 current_cpu().set_need_resched();
                 return;
             }
-
-            // R67-4 FIX: Use per-CPU current process
-            let old_pid = Self::get_current();
-
-            // 执行调度决策
-            let sched_decision = Self::schedule(origin);
-            let (next_pid, next_space) = match sched_decision {
-                Some(v) => v,
-                None => return, // 没有可调度的进程
-            };
-
-            // 如果新旧进程相同，无需切换
-            if old_pid == Some(next_pid) {
-                return;
-            }
-
-            // 获取新进程的 PCB（必须存在）
-            let next_pcb = match process::get_process(next_pid) {
-                Some(p) => p,
-                None => return,
-            };
-
-            // 获取旧进程的上下文指针
-            // 首次调度时 old_pid 为 None，使用哑上下文保存内核启动状态
-            // R172-03: also capture the outgoing task's generation, staged below (with its
-            // pid) as the PENDING_PREV to be cleared at the next reschedule_now (after the
-            // switch-out save completes). (pid, generation) — NOT a raw on_cpu pointer —
-            // so a self-exiting/reaped outgoing task can never leave a dangling clear (UAF);
-            // the bootstrap path (no PCB) yields generation 0 and is staged with pid 0 below.
-            let (old_ctx_ptr, old_generation, old_space): (*mut ArchContext, u64, usize) =
-                match old_pid.and_then(process::get_process) {
-                    Some(old_pcb) => {
-                        let mut guard = old_pcb.lock();
-
-                        // R24-6 fix: 保存当前硬件 FS/GS base 到 PCB
-                        // 用户态可能通过 wrfsbase/wrgsbase 指令修改了 TLS 基址，
-                        // 必须在切换前读取 MSR 并保存，否则下次恢复时会使用旧值
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            use x86_64::registers::model_specific::Msr;
-                            const MSR_FS_BASE: u32 = 0xC000_0100;
-                            // R100-2 FIX: 调度器在 SWAPGS 后运行，此时：
-                            //   IA32_GS_BASE (0xC0000101) = 内核 per-CPU 指针
-                            //   IA32_KERNEL_GS_BASE (0xC0000102) = 用户态 GS 基址
-                            // 必须读写 0xC0000102 以保存/恢复用户态 GS
-                            const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-
-                            unsafe {
-                                let fs_msr = Msr::new(MSR_FS_BASE);
-                                let gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
-                                guard.fs_base = fs_msr.read();
-                                guard.gs_base = gs_msr.read();
-                            }
-                        }
-
-                        let generation = guard.generation;
-                        let memory_space = guard.memory_space;
-                        (
-                            &mut guard.context as *mut _ as *mut ArchContext,
-                            generation,
-                            memory_space,
-                        )
-                    }
-                    None => {
-                        // 首次调度：保存到哑上下文（不会被恢复）
-                        let mut bootstrap = BOOTSTRAP_CONTEXT.lock();
-                        (&mut *bootstrap as *mut ArchContext, 0u64, 0usize)
-                    }
-                };
-
-            // R69-2 FIX: Save lazy FPU state before context switch.
-            //
-            // The lazy FPU implementation tracks FPU owner per-CPU. When a task is
-            // switched out, we must save its FPU state and clear ownership to prevent:
-            // 1. Cross-CPU stale state: If task migrates to CPU1, CPU0 still thinks
-            //    it owns the task's FPU. New task on CPU0 would overwrite migrated
-            //    task's FPU state in its PCB.
-            // 2. State corruption: Migrated task's current FPU work on CPU1 would
-            //    be clobbered when next #NM occurs on CPU0.
-            //
-            // By saving and clearing before switch, each CPU starts fresh and
-            // migrations always restore from saved PCB state via #NM handler.
-            if let Some(opid) = old_pid {
-                let per_cpu = current_cpu();
-                let owner = per_cpu.get_fpu_owner();
-                if owner != NO_FPU_OWNER && owner == opid {
-                    if let Some(proc_arc) = process::get_process(opid) {
-                        let mut pcb = proc_arc.lock();
-                        // R69-2 FIX (codex review): Clear CR0.TS before fxsave64.
-                        //
-                        // Under lazy FPU, CR0.TS may be set if the task never touched
-                        // FPU since its last switch-in. Executing fxsave64 with TS=1
-                        // would trigger #NM fault inside reschedule_now (with IF=0),
-                        // causing re-entry into lazy-FPU handler and potential panic.
-                        //
-                        // By clearing TS first, we ensure fxsave64 can safely execute.
-                        // After the context switch, the next task will have TS set by
-                        // switch_context() to enable lazy FPU for the new task.
-                        unsafe {
-                            use x86_64::registers::control::{Cr0, Cr0Flags};
-                            let cr0 = Cr0::read();
-                            if cr0.contains(Cr0Flags::TASK_SWITCHED) {
-                                let mut new_cr0 = cr0;
-                                new_cr0.remove(Cr0Flags::TASK_SWITCHED);
-                                Cr0::write(new_cr0);
-                            }
-                        }
-                        // Save current FPU hardware state to PCB
-                        let fx_ptr = pcb.context.fx.data.as_mut_ptr();
-                        unsafe {
-                            core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
-                        }
-                        pcb.fpu_used = true;
-                    }
-                    // Clear ownership so this CPU doesn't claim stale state
-                    per_cpu.set_fpu_owner(NO_FPU_OWNER);
-                }
-            }
-
-            // 获取新进程的上下文指针、内核栈顶、CS（用于判断 Ring 3）和 FS/GS base（TLS）
-            // R70-4 FIX: Copy context to per-CPU shadow buffer to prevent use-after-unlock.
-            // The PCB lock is released at the end of the closure, but we use the shadow
-            // buffer's stable pointer for enter_usermode/switch_context.
-            // R118-6 FIX: Also extract user_memory_space to pass directly to
-            // activate_memory_space(), avoiding PROCESS_TABLE scan in the hot path.
-            let (
-                new_ctx_ptr,
-                next_kstack_top,
-                next_cs,
-                next_user_space,
-                next_fs_base,
-                next_gs_base,
-                next_wd_handle,
-            ): (
-                *const ArchContext,
-                u64,
-                u64,
-                usize,
-                u64,
-                u64,
-                Option<WatchdogHandle>,
-            ) = NEXT_CONTEXT_SHADOW.with(|shadow| {
-                let guard = next_pcb.lock();
-                // Copy full context (176 bytes + FPU) to per-CPU shadow while holding lock
-                let ctx_ptr = shadow.store(&guard.context);
-                let kstack_top = guard.kernel_stack_top.as_u64();
-                let cs = guard.context.cs;
-                let user_space = guard.user_memory_space;
-                let fs_base = guard.fs_base;
-                let gs_base = guard.gs_base;
-                let wd_handle = guard.watchdog_handle;
-                (
-                    ctx_ptr, kstack_top, cs, user_space, fs_base, gs_base, wd_handle,
-                )
-            });
-            // The shadow owns every incoming datum used below. Drop the lookup
-            // Arc before a non-returning switch so an exiting outgoing task
-            // cannot strand that reference on its abandoned kernel stack.
-            // PROCESS_TABLE plus next.on_cpu pin the actual PCB lifecycle.
-            drop(next_pcb);
-
-            // 判断下一个进程是否为用户态进程（Ring 3）
-            // CS 的低 2 位是 RPL（Request Privilege Level）
-            // RPL == 3 表示用户态（Ring 3）
-            let next_is_user = (next_cs & 0x3) == 0x3;
-
-            // 执行上下文切换
-            // switch_context 内部流程：
-            // 1. 保存当前寄存器到 old_ctx（在当前/旧地址空间中完成）
-            // 2. 恢复新进程寄存器（包括 rsp）
-            // 3. 跳转到新进程的 rip
-            //
-            // 注意：CR3 切换在 switch_context 之后执行会有问题，因为跳转后
-            // 已在新进程的执行路径中。因此我们在切换前激活新地址空间。
-            //
-            // 安全性说明：当前内核使用共享内核地址空间模型，所有进程的
-            // 内核映射（高地址半区）相同，因此 CR3 切换后仍能访问所有 PCB。
-
-            // 更新 TSS.rsp0 为新进程的内核栈顶
-            // 这确保从用户态中断/异常返回时使用正确的内核栈
-            // 如果进程没有专用内核栈，回退到默认内核栈以避免使用旧进程的栈
-            let effective_kstack_top = if next_kstack_top != 0 {
-                next_kstack_top
-            } else {
-                default_kernel_stack_top()
-            };
-            unsafe {
-                set_kernel_stack(effective_kstack_top);
-            }
-
-            // Debug output for Ring 3 transition (minimal)
-            // Uncomment for debugging: kprintln!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });
-
-            // G.1: Track context switches in per-CPU observability counters
-            increment_counter(TraceCounter::ContextSwitches, 1);
-
-            // G.1 Observability: Send heartbeat for hung-task detection.
-            // This indicates the process is actively being scheduled (not hung).
-            // Lock-free operation - safe even with interrupts disabled.
-            if let Some(ref handle) = next_wd_handle {
-                let now_ms = kernel_core::time::current_timestamp_ms();
-                heartbeat(handle, now_ms);
-            }
-
-            process::activate_memory_space(next_space, Some(next_user_space));
-
-            // R172-04 W1: stage the incoming task's FS/GS for the SYSRET-epilogue commit
-            // (the switch_context resume path's only TLS-restore site). Covers BOTH
-            // branches: a user task resumed mid-syscall via switch_context commits these in
-            // its epilogue; a fresh user task entered via switch_to_user gets the direct MSR
-            // write below for its IRETQ AND staged here for its first syscall's epilogue.
-            stage_pending_tls_bases(next_fs_base, next_gs_base);
-            // R172-03: stage the outgoing task as PENDING_PREV — its on_cpu gate is cleared
-            // at the NEXT reschedule_now on this CPU (after this switch's save completes),
-            // keeping it unclaimable by any CPU until then. Closes the steal-before-save
-            // TOCTOU that made switch_to_user's per-CPU save unsafe on SMP.
-            stage_prev_on_cpu(old_pid.map(|p| p as u64).unwrap_or(0), old_generation);
-
-            let switch_hook = SECURITY_SWITCH_HOOK
-                .get()
-                .copied()
-                .expect("scheduler security switch hook not registered");
-            switch_hook(old_space != next_space);
-
-            // 执行上下文切换
-            // 根据目标进程的特权级选择不同的切换方式：
-            //
-            // - Ring 0（内核进程）：使用 switch_context 直接切换寄存器和栈
-            // - Ring 3（用户进程）：使用 switch_to_user（保存内核上下文 + IRETQ 进入用户态）
-            //
-            // R172-01 FIX: switch_to_user replaces the unsound save_context(old)+enter_usermode(new)
-            // pairing — its save-half captures the outgoing kernel rip/rflags/truthful-cs so a
-            // later resume via switch_context can never `ret` into stale user .text at CPL0.
-            unsafe {
-                if next_is_user {
-                    // Debug: 打印进入用户态前的上下文（必须在 MSR 写入之前）
-                    {
-                        let ctx = &*new_ctx_ptr;
-                        sched_debug!(
-                            "[SCHED] switch_to_user PID={}: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, fs_base=0x{:x}",
-                            next_pid, ctx.rax, ctx.rip, ctx.rsp, next_fs_base
-                        );
-                    }
-
-                    // 恢复用户进程的 FS/GS base (TLS 支持) — switch_to_user 的 enter-half 通过
-                    // SWAPGS 将 KERNEL_GS_BASE 交换为用户 GS。必须在切换前的最后一步写入 MSR
-                    // （kprintln! 等内核代码可能覆盖 FS_BASE MSR）。
-                    {
-                        use x86_64::registers::model_specific::Msr;
-                        const MSR_FS_BASE: u32 = 0xC000_0100;
-                        const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-
-                        let mut fs_msr = Msr::new(MSR_FS_BASE);
-                        fs_msr.write(next_fs_base);
-
-                        let mut gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
-                        gs_msr.write(next_gs_base);
-                    }
-
-                    switch_to_user(old_ctx_ptr, new_ctx_ptr);
-                    // 不会到达这里（IRETQ 跳转到用户态；旧任务在下次被 switch_context 调度时
-                    // 从 switch_to_user 调用点之后恢复）。
-                } else {
-                    // 内核态进程：使用标准的 switch_context
-                    // 对于旧进程，函数会在下次被调度时从这里"返回"
-                    // R65-16 FIX: Validate target context has kernel-mode segments before switching.
-                    // This prevents a critical privilege escalation vulnerability.
-                    assert_kernel_context(new_ctx_ptr);
-                    switch_context(old_ctx_ptr, new_ctx_ptr);
-                }
+            current_cpu().need_resched.store(false, Ordering::SeqCst);
+            if let Some(prepared) = Self::prepare_switch() {
+                Self::execute_switch(prepared);
             }
         });
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerSnapshotError {
+    InterruptsDisabled,
+    QueueUnavailable,
+    Contended,
+    Overflow,
 }
 
 /// RF178-33 executable probes for the bounded rotating selector.
@@ -2644,7 +2599,7 @@ pub fn run_bounded_selector_self_test() {
         contended: bool,
         allowed_cpus: u64,
     }
-    type ProbeQueues = BTreeMap<Priority, BTreeMap<Pid, ProbeEntry>>;
+    type ProbeQueues = PriorityQueues<ProbeEntry>;
 
     const BLOCKED: ProbeEntry = ProbeEntry {
         runnable: false,
@@ -2658,7 +2613,14 @@ pub fn run_bounded_selector_self_test() {
     };
 
     fn insert(queue: &mut ProbeQueues, pid: Pid, entry: ProbeEntry) {
-        queue.entry(120).or_default().insert(pid, entry);
+        insert_at(queue, 120, pid, entry);
+    }
+
+    fn insert_at(queue: &mut ProbeQueues, priority: Priority, pid: Pid, entry: ProbeEntry) {
+        queue
+            .bucket_mut(priority)
+            .try_insert(pid, entry)
+            .expect("bounded-selector probe insert");
     }
 
     fn scan(
@@ -2822,6 +2784,16 @@ pub fn run_bounded_selector_self_test() {
         cursor.cycle_start = None;
         assert_eq!(scan(&queue, 0, None, &mut cursor, 0, 1).0, Some(pid));
     }
+    {
+        let mut queue = ProbeQueues::new();
+        insert_at(&mut queue, 0, 0x180_4600, READY);
+        insert_at(&mut queue, 120, 0x180_4601, BLOCKED);
+        insert_at(&mut queue, u8::MAX, 0x180_4602, READY);
+        let mut cursor = SelectionCursorState::new();
+        assert_eq!(scan(&queue, 0, None, &mut cursor, 0, 1).0, Some(0x180_4600));
+        assert_eq!(scan(&queue, 0, None, &mut cursor, 0, 2).0, Some(0x180_4602));
+        assert!(scan(&queue, 0, None, &mut cursor, 0, 3).2);
+    }
 
     // Synchronous exit can wait indefinitely for another runnable task while
     // timer IRQs wake its boot-CR3 retry loop. More than the maximum quantum of
@@ -2848,71 +2820,229 @@ pub fn run_bounded_selector_self_test() {
 /// Builds a local ready queue with two PCBs sharing the same PID (recycled)
 /// and proves only the matching generation is removed.
 pub fn run_identity_cleanup_self_test() {
-    let old = Process::new(
+    let old_pcb = Process::try_new_pcb(
         0x178_33c1,
         1,
-        alloc::string::String::from("rf178-33-old"),
+        ProcessNameSnapshot::from_parts("rf178-33-old", ""),
         120,
-    );
-    let old_pid = old.pid;
-    let old_gen = old.generation;
-    let old_pcb = Arc::new(Mutex::new(old));
+    )
+    .expect("RF178-33 old PCB fixture");
+    let (old_pid, old_gen) = {
+        let old = old_pcb.lock();
+        (old.pid, old.generation)
+    };
 
-    let mut successor = Process::new(
+    let new_pcb = Process::try_new_pcb(
         0x178_33c1, // same numeric PID (recycle)
         1,
-        alloc::string::String::from("rf178-33-new"),
+        ProcessNameSnapshot::from_parts("rf178-33-new", ""),
         120,
-    );
-    assert_eq!(successor.pid, old_pid);
-    assert_ne!(
-        successor.generation, old_gen,
-        "NEXT_GENERATION must mint distinct generations"
-    );
-    let new_gen = successor.generation;
-    successor.enter_ready_at(10);
-    let new_pcb = Arc::new(Mutex::new(successor));
+    )
+    .expect("RF178-33 successor PCB fixture");
+    let new_gen = {
+        let mut successor = new_pcb.lock();
+        assert_eq!(successor.pid, old_pid);
+        assert_ne!(
+            successor.generation, old_gen,
+            "NEXT_GENERATION must mint distinct generations"
+        );
+        successor.enter_ready_at(10);
+        successor.generation
+    };
 
-    let mut queue: ReadyQueues = BTreeMap::new();
+    let mut queue = ReadyQueues::new();
     // Only the successor is queued (the reaped task may still appear if exit
     // raced with a stale Ready mark — cover both present and absent cases).
     queue
-        .entry(120)
-        .or_default()
-        .insert(old_pid, Arc::clone(&new_pcb));
+        .bucket_mut(120)
+        .try_insert(old_pid, Arc::clone(&new_pcb))
+        .expect("successor queue insert");
 
     // Reaper of the OLD identity must NOT remove the successor.
-    assert!(!Scheduler::remove_identity_from_ready_queues(
-        &mut queue, None, old_pid, old_gen
-    ));
+    let (removed, retired) =
+        Scheduler::remove_identity_from_ready_queues(&mut queue, None, old_pid, old_gen);
+    assert!(removed.is_none());
+    assert!(retired.is_none());
     assert!(
-        queue.get(&120).and_then(|b| b.get(&old_pid)).is_some(),
+        queue.bucket(120).get(&old_pid).is_some(),
         "recycled-PID successor must survive old-generation cleanup"
     );
 
     // Matching identity removes exactly once; second call is idempotent.
-    assert!(Scheduler::remove_identity_from_ready_queues(
-        &mut queue, None, old_pid, new_gen
-    ));
-    assert!(
-        queue.get(&120).map(|b| b.is_empty()).unwrap_or(true)
-            || queue.get(&120).and_then(|b| b.get(&old_pid)).is_none()
-    );
-    assert!(!Scheduler::remove_identity_from_ready_queues(
-        &mut queue, None, old_pid, new_gen
-    ));
+    let (removed, retired) =
+        Scheduler::remove_identity_from_ready_queues(&mut queue, None, old_pid, new_gen);
+    assert!(removed.is_some());
+    drop(removed);
+    drop(retired);
+    assert!(queue.bucket(120).get(&old_pid).is_none());
+    let (removed, retired) =
+        Scheduler::remove_identity_from_ready_queues(&mut queue, None, old_pid, new_gen);
+    assert!(removed.is_none());
+    assert!(retired.is_none());
 
     // Stale reaped PCB still in queue (zombie residual) is removed by old gen.
     queue
-        .entry(120)
-        .or_default()
-        .insert(old_pid, Arc::clone(&old_pcb));
-    assert!(Scheduler::remove_identity_from_ready_queues(
-        &mut queue, None, old_pid, old_gen
-    ));
-    assert!(queue.get(&120).and_then(|b| b.get(&old_pid)).is_none());
+        .bucket_mut(120)
+        .try_insert(old_pid, Arc::clone(&old_pcb))
+        .expect("stale queue insert");
+    let (removed, retired) =
+        Scheduler::remove_identity_from_ready_queues(&mut queue, None, old_pid, old_gen);
+    assert!(removed.is_some());
+    drop(removed);
+    drop(retired);
+    assert!(queue.bucket(120).get(&old_pid).is_none());
 
     let _ = (old_pcb, new_pcb);
+}
+
+/// R180-19 executable probe for the scheduler admission invariant: queue
+/// storage is acquired during PREPARE; publishing Provisioning->Ready changes
+/// no container length or capacity and therefore cannot allocate.
+pub fn run_scheduler_admission_self_test() {
+    let pcb = Process::try_new_pcb(
+        0x180_1901,
+        1,
+        ProcessNameSnapshot::from_parts("r180-19-admission", ""),
+        120,
+    )
+    .expect("R180-19 scheduler-admission PCB fixture");
+    assert!(matches!(
+        Scheduler::reserve_process(Arc::clone(&pcb)),
+        Err(process::SchedulerAddError::Unavailable)
+    ));
+    assert_eq!(
+        Scheduler::process_count(),
+        Err(SchedulerSnapshotError::InterruptsDisabled)
+    );
+
+    let ordered = AtomicBool::new(false);
+    Scheduler::publish_ready_signal(&ordered, true, || {
+        assert!(ordered.load(Ordering::Acquire));
+    });
+    assert!(ordered.load(Ordering::Acquire));
+    let local = AtomicBool::new(false);
+    Scheduler::publish_ready_signal(&local, false, || {
+        panic!("local ready publication must not emit an IPI")
+    });
+    assert!(local.load(Ordering::Acquire));
+    let pid = {
+        let mut proc = pcb.lock();
+        proc.state = ProcessState::Provisioning;
+        proc.pid
+    };
+
+    let mut queue = ReadyQueues::new();
+    let prepared = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, 3)
+        .expect("detached scheduler admission reserve");
+    let retired = queue
+        .bucket_mut(120)
+        .install_prepared_deferred(prepared)
+        .expect("detached scheduler admission install");
+    drop(retired);
+    let prepared_insert = queue
+        .bucket_mut(120)
+        .insert_unique_reserved(pid, Arc::clone(&pcb));
+    assert!(prepared_insert.is_ok(), "prepared admission insert");
+    let capacity = queue.bucket(120).capacity();
+    let len = queue.bucket(120).len();
+
+    pcb.lock().publish_ready_at(1);
+    assert_eq!(queue.bucket(120).capacity(), capacity);
+    assert_eq!(queue.bucket(120).len(), len);
+    assert_eq!(pcb.lock().state, ProcessState::Ready);
+
+    // RF180-46 rollback probe: two detached memberships at different priority
+    // boundaries reserve two aggregate slots. Ordinary publication must size
+    // around both reservations, and both restores remain allocation-free.
+    let edge_low = pid + 1;
+    let edge_high = pid + 2;
+    queue
+        .bucket_mut(0)
+        .insert_unique_reserved(edge_low, Arc::clone(&pcb))
+        .expect("low-priority boundary insert");
+    queue
+        .bucket_mut(u8::MAX)
+        .insert_unique_reserved(edge_high, Arc::clone(&pcb))
+        .expect("high-priority boundary insert");
+    let low = queue
+        .remove_for_migration(0, &edge_low)
+        .expect("low-priority migration remove");
+    let high = queue
+        .remove_for_migration(u8::MAX, &edge_high)
+        .expect("high-priority migration remove");
+    assert_eq!(queue.protected_slots(120), 2);
+    let required = queue
+        .len()
+        .checked_add(queue.protected_slots(120))
+        .and_then(|needed| needed.checked_add(1))
+        .expect("scheduler test capacity arithmetic");
+    assert!(required > queue.capacity());
+    let growth = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, required)
+        .expect("multi-slot scheduler growth preparation");
+    let retired = queue
+        .bucket_mut(120)
+        .install_prepared_deferred(growth)
+        .expect("multi-slot scheduler growth install");
+    drop(retired);
+    assert!(required <= queue.capacity());
+    let grown_capacity = queue.bucket(120).capacity();
+    queue
+        .restore_migration(0, edge_low, low)
+        .expect("low-priority retained slot restore");
+    queue
+        .restore_migration(u8::MAX, edge_high, high)
+        .expect("high-priority retained slot restore");
+    assert_eq!(queue.protected_slots(120), 0);
+
+    let (removed, membership_priority) =
+        Scheduler::remove_pid_from_queue(&mut queue, None, pid).expect("migration remove");
+    assert_eq!(membership_priority, 120);
+    assert!(queue.bucket(120).is_empty());
+    assert_eq!(queue.bucket(120).capacity(), grown_capacity);
+    assert_eq!(queue.protected_slots(120), 1);
+
+    // A competing enqueue must grow around, never consume, the protected
+    // rollback slot.
+    let competing_pid = pid + 3;
+    let competing_insert = queue
+        .bucket_mut(120)
+        .insert_unique_reserved(competing_pid, Arc::clone(&pcb));
+    assert!(
+        competing_insert.is_ok(),
+        "competing enqueue preserves rollback capacity"
+    );
+
+    let mut unprepared_destination = ReadyQueues::new();
+    let (pid, removed) = unprepared_destination
+        .bucket_mut(120)
+        .insert_unique_reserved(pid, removed)
+        .expect_err("unprepared destination must reject without allocating");
+    queue
+        .restore_migration(membership_priority, pid, removed)
+        .expect("retained source slot must restore allocation-free");
+    assert_eq!(queue.protected_slots(120), 0);
+    assert!(queue.bucket(120).contains_key(&pid));
+    assert!(queue.bucket(120).contains_key(&competing_pid));
+    let (removed, retired) = queue.remove_ordinary(0, &edge_low);
+    drop(removed);
+    drop(retired);
+    let (removed, retired) = queue.remove_ordinary(u8::MAX, &edge_high);
+    drop(removed);
+    drop(retired);
+
+    // RF180-46: removals detach, rather than destroy, the final backing while
+    // the caller conceptually owns the queue lock. Its lifetime charge remains
+    // committed until the retirement owner is dropped in the safe context.
+    let (removed, retired) = queue.remove_ordinary(120, &competing_pid);
+    assert!(removed.is_some());
+    assert!(retired.is_none());
+    drop(removed);
+    let (removed, retired) = queue.remove_ordinary(120, &pid);
+    assert!(removed.is_some());
+    let retired = retired.expect("final scheduler backing must detach");
+    assert_eq!(queue.bucket(120).capacity(), 0);
+    drop(removed);
+    drop(retired);
 }
 
 /// RF178-36 executable probe for identity-bound stopped/fatal resume.
@@ -3004,11 +3134,17 @@ pub fn init() {
     // 注册进程清理回调，确保进程终止时调度器同步更新
     process::register_cleanup_notifier(Scheduler::remove_process);
 
-    // 注册调度器添加进程回调，用于 clone/fork 时添加新进程
-    process::register_scheduler_add(Scheduler::add_process);
+    // R180-19: register the transactional scheduler admission API. Reserve is
+    // the sole fallible phase; commit/cancel mutate an already-backed slot.
+    process::register_scheduler_admission(
+        Scheduler::reserve_process,
+        Scheduler::commit_reserved_process,
+        Scheduler::cancel_reserved_process,
+    );
 
     // 注册定时器回调，让 arch 模块的定时器中断能调用调度器
-    kernel_core::register_timer_callback(Scheduler::on_clock_tick);
+    kernel_core::register_timer_callback(Scheduler::on_clock_tick)
+        .expect("scheduler timer callback slots exhausted");
 
     // 注册重调度回调，让系统调用返回时能触发调度
     kernel_core::register_resched_callback(Scheduler::reschedule_now);

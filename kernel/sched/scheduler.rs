@@ -243,7 +243,7 @@ pub fn init() {
 
     // 创建init进程（PID 0，最高优先级）
     // Init 进程必须成功创建，失败则 panic
-    let init_pid = crate::process::create_process("init".into(), 0, 0)
+    let init_pid = crate::process::create_process("init", 0, 0)
         .expect("FATAL: Failed to create init process - kernel stack allocation failed");
     SCHEDULER.lock().add_process(init_pid);
 
