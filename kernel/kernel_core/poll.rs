@@ -18,8 +18,6 @@
 //!   table's *masking* and the timeout math; the per-kind readiness *values* are
 //!   produced by the probes in `syscall.rs` and fed through `mask_revents`.
 
-use alloc::sync::Arc;
-
 // ────────────────────────────────────────────────────────────────────────────
 // POLL* event bits (Linux x86-64 asm-generic values).
 // ────────────────────────────────────────────────────────────────────────────
@@ -85,6 +83,61 @@ pub trait PollProbeOps: Send + Sync {
     fn poll_status_write(&self) -> PollStatus;
 }
 
+/// Allocation-free, allocator-erased strong owner for a dynamic poll probe.
+///
+/// A normal `Arc<dyn PollProbeOps>` fixes the allocator parameter to `Global`,
+/// which prevents a pipe from retaining its exact-lifetime charged Arc
+/// allocator. This handle owns one raw strong reference plus type-specific
+/// probe/drop callbacks. Construction is only an Arc refcount bump; `Drop`
+/// reconstructs that exact Arc with its original allocator in the producer
+/// crate.
+pub struct OwnedPollProbe {
+    ptr: *const (),
+    read: unsafe fn(*const ()) -> PollStatus,
+    write: unsafe fn(*const ()) -> PollStatus,
+    drop_owner: unsafe fn(*const ()),
+}
+
+impl OwnedPollProbe {
+    /// Build a type-erased owner from exactly one raw strong reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must remain valid until `drop_owner(ptr)` consumes that one strong
+    /// reference. `read` and `write` must only read through the same live
+    /// allocation, and `drop_owner` must be callable exactly once.
+    pub unsafe fn from_raw_owned(
+        ptr: *const (),
+        read: unsafe fn(*const ()) -> PollStatus,
+        write: unsafe fn(*const ()) -> PollStatus,
+        drop_owner: unsafe fn(*const ()),
+    ) -> Self {
+        debug_assert!(!ptr.is_null());
+        Self {
+            ptr,
+            read,
+            write,
+            drop_owner,
+        }
+    }
+
+    #[inline]
+    pub fn poll_status_read(&self) -> PollStatus {
+        unsafe { (self.read)(self.ptr) }
+    }
+
+    #[inline]
+    pub fn poll_status_write(&self) -> PollStatus {
+        unsafe { (self.write)(self.ptr) }
+    }
+}
+
+impl Drop for OwnedPollProbe {
+    fn drop(&mut self) {
+        unsafe { (self.drop_owner)(self.ptr) };
+    }
+}
+
 /// Classification of an fd for polling, produced under the Process lock and
 /// consumed by the lock-free probe pass. The socket arm carries ONLY Copy ids
 /// (never an `Arc<SocketState>`): a Drop-bearing socket handle parked here would
@@ -96,7 +149,7 @@ pub enum PollArm {
     AlwaysReady,
     /// A cross-crate probe (pipe). `write_end` selects which end's status to read.
     Dyn {
-        probe: Arc<dyn PollProbeOps>,
+        probe: OwnedPollProbe,
         write_end: bool,
     },
     /// A socket fd; resolved to `Arc<SocketState>` fresh in the probe pass.
