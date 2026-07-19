@@ -17,10 +17,10 @@
 //! # References
 //! - RFC 792: Internet Control Message Protocol
 
-use alloc::vec::Vec;
 use core::cmp;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::admitted::WirePacket;
 use crate::ipv4::compute_checksum;
 
 // ============================================================================
@@ -312,7 +312,7 @@ pub fn parse_icmp_unchecked(packet: &[u8]) -> Result<(IcmpHeader, &[u8]), IcmpEr
 ///
 /// # Returns
 /// The complete ICMP echo reply packet, or error if validation fails
-pub fn build_echo_reply(request: &[u8]) -> Result<Vec<u8>, IcmpError> {
+pub fn build_echo_reply(request: &[u8]) -> Result<WirePacket, IcmpError> {
     // Parse and validate the request
     let (hdr, _payload) = parse_icmp(request)?;
 
@@ -332,12 +332,10 @@ pub fn build_echo_reply(request: &[u8]) -> Result<Vec<u8>, IcmpError> {
         return Err(IcmpError::PayloadTooLarge);
     }
 
-    // R164-6 FIX: Fallible allocation for echo reply copy.
-    let mut reply = Vec::new();
-    if reply.try_reserve_exact(request.len()).is_err() {
-        return Err(IcmpError::PayloadTooLarge);
-    }
-    reply.extend_from_slice(request);
+    // RF180-41 FIX: admission precedes the echo-copy allocation, and remains
+    // owned until the serialized reply backing is destroyed.
+    let mut reply =
+        WirePacket::try_copy_from_slice(request).map_err(|_| IcmpError::PayloadTooLarge)?;
 
     // Change type to echo reply
     reply[0] = ICMP_TYPE_ECHO_REPLY;
@@ -362,7 +360,7 @@ pub fn build_echo_reply(request: &[u8]) -> Result<Vec<u8>, IcmpError> {
 ///
 /// # Returns
 /// Complete ICMP destination unreachable packet
-pub fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
+pub fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> WirePacket {
     build_error_message(ICMP_TYPE_DEST_UNREACHABLE, code, original_ip_header)
 }
 
@@ -374,7 +372,7 @@ pub fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
 ///
 /// # Returns
 /// Complete ICMP time exceeded packet
-pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
+pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> WirePacket {
     build_error_message(ICMP_TYPE_TIME_EXCEEDED, code, original_ip_header)
 }
 
@@ -383,28 +381,20 @@ pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
 /// Error messages contain:
 /// - 8 byte ICMP header (type, code, checksum, unused)
 /// - Original IP header + first 8 bytes of original payload
-// R164-6 FIX: Fallible allocation — returns empty Vec on OOM.
-fn build_error_message(icmp_type: u8, code: u8, original_data: &[u8]) -> Vec<u8> {
+// RF180-41 FIX: a transient ICMP error is a charged wire owner, not an
+// unaccounted `Vec<u8>` that can coexist outside the socket-payload budget.
+fn build_error_message(icmp_type: u8, code: u8, original_data: &[u8]) -> WirePacket {
     let data_len = cmp::min(original_data.len(), 28);
-    let mut packet = Vec::new();
-    if packet
-        .try_reserve_exact(ICMP_HEADER_LEN + data_len)
-        .is_err()
-    {
-        return packet;
-    }
-
-    // Type
-    packet.push(icmp_type);
-    // Code
-    packet.push(code);
-    // Checksum placeholder
-    packet.push(0);
-    packet.push(0);
-    // Rest of header (unused, must be 0)
-    packet.extend_from_slice(&[0, 0, 0, 0]);
-    // Original IP header + data
-    packet.extend_from_slice(&original_data[..data_len]);
+    let Some(packet_len) = ICMP_HEADER_LEN.checked_add(data_len) else {
+        return WirePacket::new();
+    };
+    let mut packet = match WirePacket::try_zeroed(packet_len) {
+        Ok(packet) => packet,
+        Err(_) => return WirePacket::new(),
+    };
+    packet[0] = icmp_type;
+    packet[1] = code;
+    packet[ICMP_HEADER_LEN..].copy_from_slice(&original_data[..data_len]);
 
     // Calculate checksum
     let checksum = compute_checksum(&packet, packet.len());
@@ -427,11 +417,9 @@ fn build_error_message(icmp_type: u8, code: u8, original_data: &[u8]) -> Vec<u8>
 /// # Thread Safety
 ///
 /// This implementation uses atomics for thread-safe operation without locking.
-/// The token consumption uses compare-exchange to ensure correctness under
-/// concurrent access. The refill calculation has a benign race: if two threads
-/// refill simultaneously, slightly more or fewer tokens may be added than
-/// strictly necessary, but this does not compromise security (errs on the side
-/// of rate limiting rather than allowing extra packets).
+/// Refill and consumption form one serialized transaction. Contended callers
+/// fail closed instead of spinning: packet processing can run in interrupt
+/// context, where waiting for a preempted owner could deadlock the CPU.
 ///
 /// # Security Note
 ///
@@ -466,6 +454,18 @@ pub struct TokenBucket {
     rate_per_sec: u64,
     /// Last refill timestamp in milliseconds (atomic)
     last_refill_ms: AtomicU64,
+    /// Distinguishes a real timestamp of zero from the pre-first-call state.
+    initialized: AtomicBool,
+    /// Non-blocking transaction gate for refill plus token consumption.
+    update_in_progress: AtomicBool,
+}
+
+struct TokenBucketUpdateGuard<'a>(&'a AtomicBool);
+
+impl Drop for TokenBucketUpdateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Maximum refill window to prevent extreme time jumps (60 seconds)
@@ -489,6 +489,8 @@ impl TokenBucket {
             tokens: AtomicU64::new(burst),
             rate_per_sec,
             last_refill_ms: AtomicU64::new(0),
+            initialized: AtomicBool::new(false),
+            update_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -510,18 +512,34 @@ impl TokenBucket {
     ///
     /// # R44-6 FIX: Added monotonic time enforcement and refill window capping
     pub fn allow(&self, now_ms: u64) -> bool {
+        // RF180 defense in depth: this entire state transition must be atomic.
+        // A load/refill-store followed by a separate decrement can overwrite a
+        // concurrent consumption and permit more packets than the byte-rate
+        // policy. Do not spin here because callers may execute in IRQ context.
+        let Ok(false) = self.update_in_progress.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) else {
+            return false;
+        };
+        let _guard = TokenBucketUpdateGuard(&self.update_in_progress);
+
         // Refill tokens based on elapsed time
         let last = self.last_refill_ms.load(Ordering::Relaxed);
+        let initialized = self.initialized.load(Ordering::Relaxed);
 
         // R44-6 FIX: Enforce monotonic time - reject if time went backwards
         // This prevents manipulation via non-monotonic timestamps
-        if last != 0 && now_ms < last {
+        if initialized && now_ms < last {
             return false;
         }
 
-        let elapsed = if last == 0 {
+        let elapsed = if !initialized {
             // First call - initialize timestamp
             self.last_refill_ms.store(now_ms, Ordering::Relaxed);
+            self.initialized.store(true, Ordering::Relaxed);
             0
         } else {
             // R44-6 FIX: Cap the refill window to prevent extreme time jumps
@@ -569,8 +587,20 @@ impl TokenBucket {
 
     /// Reset the bucket to full capacity.
     pub fn reset(&self) {
+        // Reset is a control-plane operation. Serialize with an in-flight allow
+        // so it cannot publish capacity that is immediately overwritten by a
+        // stale refill transaction.
+        while self
+            .update_in_progress
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let _guard = TokenBucketUpdateGuard(&self.update_in_progress);
         self.tokens.store(self.capacity, Ordering::Relaxed);
         self.last_refill_ms.store(0, Ordering::Relaxed);
+        self.initialized.store(false, Ordering::Relaxed);
     }
 }
 
@@ -582,6 +612,8 @@ impl Clone for TokenBucket {
             tokens: AtomicU64::new(self.tokens.load(Ordering::Relaxed)),
             rate_per_sec: self.rate_per_sec,
             last_refill_ms: AtomicU64::new(self.last_refill_ms.load(Ordering::Relaxed)),
+            initialized: AtomicBool::new(self.initialized.load(Ordering::Acquire)),
+            update_in_progress: AtomicBool::new(false),
         }
     }
 }
@@ -602,7 +634,10 @@ pub static ICMP_RATE_LIMITER: TokenBucket = TokenBucket::new_default();
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn test_parse_echo_request() {
@@ -643,5 +678,30 @@ mod tests {
 
         // After 1 second, should have 10 more tokens (capped at 5)
         assert!(bucket.allow(1000));
+    }
+
+    #[test]
+    fn token_bucket_concurrent_refill_cannot_over_admit() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const WORKERS: usize = 16;
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        assert!(bucket.allow(1), "consume the initial token");
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut workers = Vec::new();
+        for _ in 0..WORKERS {
+            let bucket = Arc::clone(&bucket);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                bucket.allow(1001) as usize
+            }));
+        }
+        let admitted: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("token-bucket worker"))
+            .sum();
+        assert_eq!(admitted, 1, "one elapsed token must be consumed once");
     }
 }

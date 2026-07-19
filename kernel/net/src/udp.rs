@@ -28,10 +28,10 @@
 //! - RFC 768: User Datagram Protocol
 //! - RFC 1122: Requirements for Internet Hosts
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ipv4::{compute_checksum, Ipv4Addr};
+use crate::admitted::WirePacket;
+use crate::ipv4::Ipv4Addr;
 
 // ============================================================================
 // UDP Constants
@@ -380,7 +380,7 @@ pub fn build_udp_datagram(
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
-) -> Result<Vec<u8>, UdpError> {
+) -> Result<WirePacket, UdpError> {
     // Validate payload size
     if payload.len() > UDP_MAX_PAYLOAD {
         return Err(UdpError::PayloadTooLarge);
@@ -388,16 +388,14 @@ pub fn build_udp_datagram(
 
     let udp_len = (UDP_HEADER_LEN + payload.len()) as u16;
 
-    // R164-6 FIX: Fallible allocation for UDP datagram.
-    let mut datagram = Vec::new();
-    if datagram.try_reserve_exact(udp_len as usize).is_err() {
-        return Err(UdpError::PayloadTooLarge);
-    }
-    datagram.extend_from_slice(&src_port.to_be_bytes());
-    datagram.extend_from_slice(&dst_port.to_be_bytes());
-    datagram.extend_from_slice(&udp_len.to_be_bytes());
-    datagram.extend_from_slice(&0u16.to_be_bytes()); // Checksum placeholder
-    datagram.extend_from_slice(payload);
+    // RF180-41 FIX: charge the complete datagram allocation before requesting
+    // backing and retain that charge through transmit/drop.
+    let mut datagram =
+        WirePacket::try_zeroed(udp_len as usize).map_err(|_| UdpError::PayloadTooLarge)?;
+    datagram[0..2].copy_from_slice(&src_port.to_be_bytes());
+    datagram[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    datagram[4..6].copy_from_slice(&udp_len.to_be_bytes());
+    datagram[UDP_HEADER_LEN..].copy_from_slice(payload);
 
     // Compute checksum
     let checksum = compute_udp_checksum(src_ip, dst_ip, &datagram);
@@ -514,5 +512,20 @@ mod tests {
         assert_eq!(bytes[2..4], 80u16.to_be_bytes());
         assert_eq!(bytes[4..6], 16u16.to_be_bytes());
         assert_eq!(bytes[6..8], 0xABCDu16.to_be_bytes());
+    }
+
+    #[test]
+    fn rf180_41_udp_admission_failure_preserves_fail_closed_error() {
+        WirePacket::fail_next_admission_for_test();
+        assert_eq!(
+            build_udp_datagram(
+                Ipv4Addr::new(192, 0, 2, 1),
+                Ipv4Addr::new(198, 51, 100, 2),
+                12345,
+                53,
+                b"query",
+            ),
+            Err(UdpError::PayloadTooLarge)
+        );
     }
 }
