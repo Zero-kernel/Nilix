@@ -1,6 +1,9 @@
 use crate::buddy_allocator;
 use crate::page_table::PHYSICAL_MEMORY_OFFSET;
+use alloc::boxed::Box;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::hint::spin_loop;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::{
@@ -58,7 +61,8 @@ pub struct FramebufferInfo {
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
     pub framebuffer: FramebufferInfo,
-    /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
+    /// R39-7/RF180-32: relocation slide. Randomization is reported separately
+    /// in `kaslr_flags`; zero is a valid randomly selected slot.
     pub kaslr_slide: u64,
     /// ACPI RSDP physical address (from UEFI configuration table)
     pub rsdp_address: u64,
@@ -77,6 +81,18 @@ pub struct BootInfo {
     /// means a stale bootloader; the kernel then ignores the version-gated image
     /// fields above and still applies the always-valid heap + UEFI reservations.
     pub version: u64,
+    /// RF180-32: placement provenance flags, appended after the v1 layout so a
+    /// v2 kernel can inspect the stable `version` offset before trusting them.
+    pub kaslr_flags: u64,
+}
+
+impl BootInfo {
+    /// True only when a matching bootloader attests that the complete exact-
+    /// address candidate order was uniformly randomized. A non-zero slide by
+    /// itself may be deterministic availability relocation and is not KASLR.
+    pub fn kaslr_randomized(&self) -> bool {
+        self.version == BOOT_INFO_VERSION && self.kaslr_flags == BOOT_INFO_KASLR_RANDOMIZED
+    }
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）
@@ -102,7 +118,10 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 
 /// R167-C: BootInfo ABI version shared with the bootloader mirror. Bump on any
 /// layout change to `BootInfo`.
-const BOOT_INFO_VERSION: u64 = 1;
+const BOOT_INFO_VERSION: u64 = 2;
+
+/// Must match `BOOT_INFO_KASLR_RANDOMIZED` in the bootloader mirror.
+const BOOT_INFO_KASLR_RANDOMIZED: u64 = 1 << 0;
 
 /// R167-C: Upper bound on the number of physical reservations passed to the
 /// buddy allocator at init. Bounded to avoid heap allocation during early MM
@@ -122,6 +141,15 @@ const MAX_RESERVED_RANGES: usize = 64;
 // The kernel build never enables `host_harness`, so its allocator is unchanged.
 #[cfg_attr(not(feature = "host_harness"), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// R180-7..13 FIX: physically disjoint recovery allocator.
+///
+/// The normal global allocator is never initialized over this tail region, so
+/// ordinary `Vec`/`Box`/`Arc` growth cannot consume the bytes needed by an
+/// explicitly emergency-allocated recovery object.  Emergency allocations are
+/// opt-in through [`EmergencyAllocator`] and remain fallible.
+static EMERGENCY_ALLOCATOR: LockedHeap = LockedHeap::empty();
+static EMERGENCY_ALLOCATOR_READY: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Partial KASLR: Heap Randomization Configuration
@@ -145,11 +173,63 @@ const HEAP_WINDOW_END: usize = 0xffffffff90000000;
 /// Heap alignment (2MB for huge page compatibility)
 const HEAP_ALIGNMENT: usize = 2 * 1024 * 1024;
 
-/// Heap size in bytes
-const HEAP_SIZE: usize = 1024 * 1024; // 1MB
+/// Heap size in bytes.
+///
+/// R180-10 FIX: the previous 1 MiB arena could not hold one valid maximum
+/// exec transaction (image + argv/env + initial-stack staging) together with
+/// the registered hard floors. The heap is dynamically placed in verified
+/// conventional memory, so use a 2 MiB arena and let `heap_admission` enforce
+/// the runtime coexistence partition within it.
+const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 /// Public constant for external modules
 pub const HEAP_SIZE_BYTES: usize = HEAP_SIZE;
+
+/// Physically isolated tail of the kernel heap mapping.  General allocations
+/// cannot enter this arena.
+pub const EMERGENCY_HEAP_SIZE_BYTES: usize = 64 * 1024;
+
+/// Bytes owned by the normal global allocator after carving the emergency
+/// arena.  Both sizes are page multiples so the split cannot create an
+/// alignment-dependent overlap.
+pub const NORMAL_HEAP_SIZE_BYTES: usize = HEAP_SIZE_BYTES - EMERGENCY_HEAP_SIZE_BYTES;
+
+const _: () = assert!(EMERGENCY_HEAP_SIZE_BYTES >= 16 * 1024);
+const _: () = assert!(EMERGENCY_HEAP_SIZE_BYTES < HEAP_SIZE_BYTES);
+const _: () = assert!(EMERGENCY_HEAP_SIZE_BYTES % 4096 == 0);
+const _: () = assert!(NORMAL_HEAP_SIZE_BYTES % 4096 == 0);
+
+/// Allocator handle for explicitly admitted recovery objects.
+///
+/// The handle is a ZST; all instances use the same locked emergency arena.
+/// Callers should prefer fixed/static pools where a strict bound is known and
+/// use this allocator only for recovery paths that genuinely require dynamic
+/// shape.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmergencyAllocator;
+
+unsafe impl Allocator for EmergencyAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            return Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
+        }
+        if !EMERGENCY_ALLOCATOR_READY.load(Ordering::Acquire) {
+            return Err(AllocError);
+        }
+        EMERGENCY_ALLOCATOR
+            .lock()
+            .allocate_first_fit(layout)
+            .map(|ptr| NonNull::slice_from_raw_parts(ptr, layout.size()))
+            .map_err(|_| AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            debug_assert!(EMERGENCY_ALLOCATOR_READY.load(Ordering::Acquire));
+            EMERGENCY_ALLOCATOR.lock().deallocate(ptr, layout);
+        }
+    }
+}
 
 /// Actual heap base address (set during init via randomization or fallback)
 static HEAP_BASE: AtomicUsize = AtomicUsize::new(HEAP_DEFAULT_BASE);
@@ -276,10 +356,12 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         &mut reserved_ranges,
     );
 
-    // RF178-31: reserve exact-sized COW refcount metadata from the discovered
-    // physical window (not the 1 MiB heap). Placed to avoid the heap hole.
+    // RF178-31 / R180-29: reserve exact-sized COW refcount metadata from the
+    // discovered physical window (not the 1 MiB heap). Placement is computed
+    // against the COMPLETE boot reservation set before the metadata is zeroed,
+    // including framebuffer, kernel image, and non-conventional UEFI ranges.
     let (meta_phys, meta_bytes) =
-        place_cow_refcount_metadata(pmm_base, pmm_size, heap_phys, HEAP_SIZE as u64);
+        place_cow_refcount_metadata(pmm_base, pmm_size, &reserved_ranges[..reserved_count]);
     let reserved_count =
         push_cow_metadata_reservation(&mut reserved_ranges, reserved_count, meta_phys, meta_bytes);
     let reserved_ranges = &reserved_ranges[..reserved_count];
@@ -306,7 +388,13 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
     );
 
     // 初始化 Buddy 物理页分配器
-    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges);
+    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges)
+        .unwrap_or_else(|error| {
+            panic!(
+                "buddy allocator metadata initialization failed before publication: {:?}",
+                error
+            )
+        });
     publish_cow_refcount_table(meta_phys, pmm_size / PAGE_SIZE as usize);
     publish_managed_phys_window(pmm_base, pmm_size);
 
@@ -357,21 +445,26 @@ pub fn init() {
     // region minus the heap hole is managed). No UEFI map here, so the heap is
     // the only non-metadata reservation.
     let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+    let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
+    reserved_ranges[0] = (heap_phys, HEAP_SIZE as u64);
     let (meta_phys, meta_bytes) = place_cow_refcount_metadata(
         FALLBACK_PHYS_MEM_START,
         FALLBACK_PHYS_MEM_SIZE,
-        heap_phys,
-        HEAP_SIZE as u64,
+        &reserved_ranges[..1],
     );
-    let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
-    reserved_ranges[0] = (heap_phys, HEAP_SIZE as u64);
     let reserved_count =
         push_cow_metadata_reservation(&mut reserved_ranges, 1, meta_phys, meta_bytes);
     buddy_allocator::init_buddy_allocator(
         PhysAddr::new(FALLBACK_PHYS_MEM_START),
         FALLBACK_PHYS_MEM_SIZE,
         &reserved_ranges[..reserved_count],
-    );
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "fallback buddy allocator metadata initialization failed before publication: {:?}",
+            error
+        )
+    });
     publish_cow_refcount_table(meta_phys, FALLBACK_PHYS_MEM_SIZE / PAGE_SIZE as usize);
     publish_managed_phys_window(FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE);
 
@@ -399,8 +492,17 @@ fn init_heap_allocator_at(heap_base: usize, randomized: bool) -> usize {
     HEAP_RANDOMIZED.store(randomized, Ordering::SeqCst);
 
     unsafe {
-        ALLOCATOR.lock().init(heap_base as *mut u8, HEAP_SIZE);
+        ALLOCATOR
+            .lock()
+            .init(heap_base as *mut u8, NORMAL_HEAP_SIZE_BYTES);
+        let emergency_base = heap_base
+            .checked_add(NORMAL_HEAP_SIZE_BYTES)
+            .expect("emergency heap base overflow");
+        EMERGENCY_ALLOCATOR
+            .lock()
+            .init(emergency_base as *mut u8, EMERGENCY_HEAP_SIZE_BYTES);
     }
+    EMERGENCY_ALLOCATOR_READY.store(true, Ordering::Release);
 
     heap_base
 }
@@ -671,16 +773,54 @@ fn cow_refcount_table_bytes(managed_pages: usize) -> usize {
         .expect("COW refcount table byte count overflow")
 }
 
+/// Return the page-rounded intersection of a reservation with the managed
+/// physical window. This mirrors the buddy allocator's outward rounding: even a
+/// one-byte overlap with a frame withholds the whole frame.
+fn normalized_reservation(
+    start: u64,
+    len: u64,
+    window_start: u64,
+    window_end: u64,
+) -> Option<(u64, u64)> {
+    if len == 0 || window_end <= window_start {
+        return None;
+    }
+    let raw_end = start.saturating_add(len);
+    if raw_end <= window_start || start >= window_end {
+        return None;
+    }
+
+    let rounded_start = align_down(start.max(window_start), PAGE_SIZE);
+    let bounded_start = rounded_start.max(window_start);
+    let bounded_raw_end = raw_end.min(window_end);
+    let remainder = bounded_raw_end % PAGE_SIZE;
+    let rounded_end = if remainder == 0 {
+        bounded_raw_end
+    } else {
+        bounded_raw_end.saturating_add(PAGE_SIZE - remainder)
+    }
+    .min(window_end);
+
+    (bounded_start < rounded_end).then_some((bounded_start, rounded_end))
+}
+
+#[inline]
+fn half_open_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
 /// Choose a page-aligned physical placement for the COW refcount table that
-/// lies entirely inside the managed window and does not overlap the heap.
+/// lies entirely inside the managed window and is disjoint from every existing
+/// boot reservation.
 ///
-/// Prefer the high end of the window (buddy still sees a large low free span).
-/// If that collides with the heap, try the low end. Fail closed if neither fits.
+/// Search downward from the high end to preserve a large low free span. On a
+/// collision, jump below the lowest overlapping reservation rather than walking
+/// page-by-page. The bounded reservation array therefore limits this to at most
+/// `reservations.len() + 1` probes and the early-boot path allocates no heap.
 fn place_cow_refcount_metadata(
     pmm_base: u64,
     pmm_size: usize,
-    heap_phys: u64,
-    heap_len: u64,
+    reservations: &[(u64, u64)],
 ) -> (u64, usize) {
     assert!(pmm_size > 0, "managed window must be non-empty");
     assert_eq!(pmm_base % PAGE_SIZE, 0, "managed base must be page aligned");
@@ -703,38 +843,46 @@ fn place_cow_refcount_metadata(
     let pmm_end = pmm_base
         .checked_add(pmm_size as u64)
         .expect("managed window end overflow");
-    let heap_end = heap_phys.saturating_add(heap_len);
 
-    let ranges_overlap = |a: u64, a_len: u64, b: u64, b_len: u64| -> bool {
-        let a_end = a.saturating_add(a_len);
-        let b_end = b.saturating_add(b_len);
-        a < b_end && b < a_end
-    };
+    let meta_len = meta_bytes as u64;
+    let mut candidate_end = pmm_end;
+    for _ in 0..=reservations.len() {
+        let Some(candidate_start) = candidate_end.checked_sub(meta_len) else {
+            break;
+        };
+        if candidate_start < pmm_base {
+            break;
+        }
 
-    // Prefer high placement: [pmm_end - meta, pmm_end).
-    let high = pmm_end
-        .checked_sub(meta_bytes as u64)
-        .expect("metadata high placement underflow");
-    if high >= pmm_base
-        && high + meta_bytes as u64 <= pmm_end
-        && !ranges_overlap(high, meta_bytes as u64, heap_phys, heap_len)
-    {
-        return (high, meta_bytes);
-    }
+        let mut move_below: Option<u64> = None;
+        for &(reserved_start, reserved_len) in reservations {
+            let Some((reserved_start, reserved_end)) =
+                normalized_reservation(reserved_start, reserved_len, pmm_base, pmm_end)
+            else {
+                continue;
+            };
+            if half_open_ranges_overlap(
+                candidate_start,
+                candidate_end,
+                reserved_start,
+                reserved_end,
+            ) {
+                move_below = Some(match move_below {
+                    Some(previous) => previous.min(reserved_start),
+                    None => reserved_start,
+                });
+            }
+        }
 
-    // Fall back to low placement: [pmm_base, pmm_base + meta).
-    let low = pmm_base;
-    if low + meta_bytes as u64 <= pmm_end
-        && !ranges_overlap(low, meta_bytes as u64, heap_phys, heap_len)
-    {
-        // heap_end is only used to make the placement decision readable in
-        // boot-failure panics; the overlap predicate is authoritative.
-        let _ = heap_end;
-        return (low, meta_bytes);
+        match move_below {
+            None => return (candidate_start, meta_bytes),
+            Some(next_end) if next_end < candidate_end => candidate_end = next_end,
+            Some(_) => break,
+        }
     }
 
     panic!(
-        "RF178-31: cannot place COW refcount metadata ({} KB) inside managed window without colliding with heap",
+        "R180-29: cannot place COW refcount metadata ({} KB) inside managed window without colliding with boot reservations",
         meta_bytes / 1024
     );
 }
@@ -749,6 +897,25 @@ fn push_cow_metadata_reservation(
 ) -> usize {
     if count >= MAX_RESERVED_RANGES {
         panic!("RF178-31: reservation list full; cannot permanently reserve COW metadata");
+    }
+    assert_eq!(
+        meta_phys % PAGE_SIZE,
+        0,
+        "COW metadata must be page aligned"
+    );
+    assert!(meta_bytes > 0, "COW metadata reservation must be non-empty");
+    let meta_end = meta_phys
+        .checked_add(meta_bytes as u64)
+        .expect("COW metadata reservation end overflow");
+    for &(reserved_start, reserved_len) in &out[..count] {
+        if reserved_len == 0 {
+            continue;
+        }
+        let reserved_end = reserved_start.saturating_add(reserved_len);
+        assert!(
+            !half_open_ranges_overlap(meta_phys, meta_end, reserved_start, reserved_end),
+            "R180-29: COW metadata overlaps an existing boot reservation"
+        );
     }
     out[count] = (meta_phys, meta_bytes as u64);
     count + 1
@@ -1055,9 +1222,27 @@ impl FrameAllocator {
         buddy_allocator::free_physical_pages(frame, 1);
     }
 
+    pub fn try_deallocate_frame(
+        &mut self,
+        frame: PhysFrame,
+    ) -> Result<(), buddy_allocator::FreeError> {
+        buddy_allocator::try_free_physical_pages(frame, 1)
+    }
+
     /// 释放连续的多个物理帧
     pub fn deallocate_contiguous_frames(&mut self, frame: PhysFrame, count: usize) {
         buddy_allocator::free_physical_pages(frame, count);
+    }
+
+    /// Checked contiguous deallocation for security-sensitive rollback and
+    /// deferred-reclaim paths. Success proves the exact original buddy block
+    /// was accepted; callers can quarantine identity state on any error.
+    pub fn try_deallocate_contiguous_frames(
+        &mut self,
+        frame: PhysFrame,
+        count: usize,
+    ) -> Result<(), buddy_allocator::FreeError> {
+        buddy_allocator::try_free_physical_pages(frame, count)
     }
 
     /// 获取内存统计信息
@@ -1076,7 +1261,8 @@ impl FrameAllocator {
             free_physical_pages: buddy_stats.free_pages,
             used_physical_pages: buddy_stats.used_pages,
             fragmentation_percent: (buddy_stats.fragmentation * 100.0) as u32,
-            heap_used_bytes: HEAP_SIZE - ALLOCATOR.lock().free(),
+            heap_used_bytes: (NORMAL_HEAP_SIZE_BYTES - ALLOCATOR.lock().free())
+                + (EMERGENCY_HEAP_SIZE_BYTES - EMERGENCY_ALLOCATOR.lock().free()),
             heap_total_bytes: HEAP_SIZE,
         }
     }
@@ -1093,6 +1279,51 @@ impl FrameAllocator {
 #[inline]
 pub fn heap_free_bytes() -> usize {
     ALLOCATOR.lock().free()
+}
+
+/// Free bytes in the physically isolated emergency arena.
+#[inline]
+pub fn emergency_heap_free_bytes() -> usize {
+    if !EMERGENCY_ALLOCATOR_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    EMERGENCY_ALLOCATOR.lock().free()
+}
+
+/// First virtual byte owned by the isolated emergency allocator.
+#[inline]
+pub fn emergency_heap_base() -> usize {
+    heap_base() + NORMAL_HEAP_SIZE_BYTES
+}
+
+/// Boot-visible proof that the two allocators cannot return overlapping memory.
+/// Both allocations are fallible and are released before return.
+pub fn run_emergency_heap_self_test() {
+    assert!(EMERGENCY_ALLOCATOR_READY.load(Ordering::Acquire));
+    let emergency_before = emergency_heap_free_bytes();
+
+    let normal = Box::try_new(0x4e4f_524du64).expect("normal heap self-test allocation");
+    let emergency = Box::try_new_in(0x454d_4552u64, EmergencyAllocator)
+        .expect("emergency heap self-test allocation");
+
+    let normal_ptr = (&*normal as *const u64) as usize;
+    let emergency_ptr = (&*emergency as *const u64) as usize;
+    let emergency_base = emergency_heap_base();
+    let heap_end = heap_base()
+        .checked_add(HEAP_SIZE_BYTES)
+        .expect("heap end overflow");
+
+    assert!(normal_ptr >= heap_base() && normal_ptr < emergency_base);
+    assert!(emergency_ptr >= emergency_base && emergency_ptr < heap_end);
+    assert_ne!(normal_ptr, emergency_ptr);
+
+    drop(emergency);
+    drop(normal);
+    assert_eq!(
+        emergency_heap_free_bytes(),
+        emergency_before,
+        "emergency allocation must return to the isolated arena"
+    );
 }
 
 /// 实现 x86_64 FrameAllocator trait 以便与页表管理器配合使用
@@ -1182,4 +1413,101 @@ pub fn heap_randomized() -> bool {
 #[inline]
 pub fn heap_validated() -> bool {
     HEAP_VALIDATED.load(Ordering::SeqCst)
+}
+
+#[cfg(all(test, feature = "host_harness"))]
+mod tests {
+    use super::*;
+
+    fn descriptor(typ: u32, phys_start: u64, page_count: u64) -> EfiMemoryDescriptor {
+        EfiMemoryDescriptor {
+            typ,
+            pad: 0,
+            phys_start,
+            virt_start: 0,
+            page_count,
+            attribute: 0,
+        }
+    }
+
+    #[test]
+    fn cow_metadata_avoids_complete_boot_reservation_set() {
+        const BASE: u64 = 0x0100_0000;
+        const SIZE: usize = 16 * 1024 * 1024;
+        let descriptors = [
+            descriptor(EFI_CONVENTIONAL_MEMORY, BASE, SIZE as u64 / PAGE_SIZE),
+            // Deliberately overlap a nominal conventional window with a
+            // firmware-owned range to model the malformed map R180-29 covers.
+            descriptor(3, BASE + SIZE as u64 - 0x2_0000, 8),
+        ];
+        let boot_info = BootInfo {
+            memory_map: MemoryMapInfo {
+                buffer: descriptors.as_ptr() as u64,
+                size: core::mem::size_of_val(&descriptors),
+                descriptor_size: core::mem::size_of::<EfiMemoryDescriptor>(),
+                descriptor_version: 1,
+            },
+            framebuffer: FramebufferInfo {
+                base: BASE + SIZE as u64 - 0x1_0000,
+                size: 0x4000,
+                width: 1,
+                height: 1,
+                stride: 4,
+                pixel_format: PixelFormat::Rgb,
+            },
+            kaslr_slide: 0,
+            rsdp_address: 0,
+            cmdline_len: 0,
+            cmdline: [0; 256],
+            kernel_phys_base: BASE + SIZE as u64 - 0x4_0000,
+            kernel_phys_size: 0x1_0000,
+            version: BOOT_INFO_VERSION,
+            kaslr_flags: 0,
+        };
+
+        let heap_phys = BASE + 0x20_0000;
+        let mut reservations = [(0u64, 0u64); MAX_RESERVED_RANGES];
+        let count = build_buddy_reservations(&boot_info, BASE, SIZE, heap_phys, &mut reservations);
+        assert_eq!(count, 4, "heap, framebuffer, kernel, and firmware range");
+
+        let (meta_phys, meta_bytes) =
+            place_cow_refcount_metadata(BASE, SIZE, &reservations[..count]);
+        let meta_end = meta_phys + meta_bytes as u64;
+        for &(start, len) in &reservations[..count] {
+            let Some((reserved_start, reserved_end)) =
+                normalized_reservation(start, len, BASE, BASE + SIZE as u64)
+            else {
+                continue;
+            };
+            assert!(!half_open_ranges_overlap(
+                meta_phys,
+                meta_end,
+                reserved_start,
+                reserved_end
+            ));
+        }
+
+        let new_count =
+            push_cow_metadata_reservation(&mut reservations, count, meta_phys, meta_bytes);
+        assert_eq!(new_count, count + 1);
+    }
+
+    #[test]
+    fn cow_metadata_honors_outward_page_rounding() {
+        const BASE: u64 = 0x0200_0000;
+        const SIZE: usize = 4 * 1024 * 1024;
+        let end = BASE + SIZE as u64;
+        let reservations = [(end - PAGE_SIZE / 2, PAGE_SIZE / 2)];
+
+        let (meta_phys, meta_bytes) = place_cow_refcount_metadata(BASE, SIZE, &reservations);
+        assert!(meta_phys + meta_bytes as u64 <= end - PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "R180-29")]
+    fn cow_metadata_fails_closed_when_window_is_fully_reserved() {
+        const BASE: u64 = 0x0300_0000;
+        const SIZE: usize = 4 * 1024 * 1024;
+        let _ = place_cow_refcount_metadata(BASE, SIZE, &[(BASE, SIZE as u64)]);
+    }
 }
