@@ -11,8 +11,8 @@ use crate::cgroup;
 use crate::fork::{cow_flag, cow_readonly_flag, PAGE_REF_COUNT};
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
-    current_net_ns_id, current_pid, get_process, terminate_process, terminate_self_and_halt,
-    try_get_process, wait_should_abort, with_current_cap_table, ProcessId, ProcessState,
+    current_net_ns_id, current_pid, get_process, terminate_self_and_halt, try_get_process,
+    wait_should_abort, with_current_cap_table, ProcessId, ProcessState,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -213,8 +213,12 @@ struct LinuxDirent64 {
     // followed by name bytes + '\0'
 }
 
-// H.0.1-3: Compile-time ABI size assertion (includes 5 bytes tail padding).
+// The Rust object includes five bytes of tail padding, but Linux places the
+// flexible `d_name[]` tail immediately after `d_type` at byte offset 19.
+// R180-25: never use size_of::<LinuxDirent64>() as the wire tail offset.
 const _: [(); 24] = [(); core::mem::size_of::<LinuxDirent64>()];
+pub const LINUX_DIRENT64_NAME_OFFSET: usize = core::mem::offset_of!(LinuxDirent64, d_type) + 1;
+const _: [(); 19] = [(); LINUX_DIRENT64_NAME_OFFSET];
 
 // ============================================================================
 // Socket ABI (Linux x86_64)
@@ -234,21 +238,23 @@ const UDP_MAX_PAYLOAD: usize = 65507;
 ///
 /// Used by socket syscalls for IPv4 address specification.
 /// All multi-byte fields are in network byte order.
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default)]
 struct SockAddrIn {
     /// Address family (AF_INET = 2)
     sin_family: u16,
     /// Port number (network byte order)
     sin_port: u16,
-    /// IPv4 address (network byte order)
-    sin_addr: u32,
+    /// IPv4 address as the exact four network-order bytes from `struct in_addr`.
+    sin_addr: [u8; 4],
     /// Padding to 16 bytes (Linux ABI)
     sin_zero: [u8; 8],
 }
 
 // H.0.1-3: Compile-time ABI size assertion.
 const _: [(); 16] = [(); core::mem::size_of::<SockAddrIn>()];
+const _: [(); 4] = [(); core::mem::offset_of!(SockAddrIn, sin_addr)];
+const _: [(); 4] = [(); core::mem::align_of::<SockAddrIn>()];
 
 impl SockAddrIn {
     /// Create from Ipv4Addr and port (host byte order).
@@ -256,20 +262,45 @@ impl SockAddrIn {
         Self {
             sin_family: AF_INET as u16,
             sin_port: port.to_be(),
-            sin_addr: u32::from_be_bytes(ip),
+            sin_addr: ip,
             sin_zero: [0; 8],
         }
     }
 
     /// Extract IP address as [u8; 4] in network byte order.
     fn ip_bytes(&self) -> [u8; 4] {
-        self.sin_addr.to_be_bytes()
+        self.sin_addr
     }
 
     /// Extract port in host byte order.
     fn port(&self) -> u16 {
         u16::from_be(self.sin_port)
     }
+}
+
+/// R180-24/R180-25 byte-level Linux ABI oracle.
+///
+/// This is intentionally independent of the bundled userspace wrappers. It
+/// pins the native x86_64 `sa_family_t` bytes, network-order port/address bytes,
+/// and the flexible-tail offset used by a host C `linux_dirent64` consumer.
+pub fn run_linux_wire_abi_self_test() {
+    let addr = SockAddrIn::from_addr([127, 0, 0, 1], 8080);
+    let bytes = unsafe {
+        // lint-repr-c-copy: allow (SockAddrIn is compile-time 16-byte, padding-free, and fully initialized)
+        core::slice::from_raw_parts(
+            &addr as *const SockAddrIn as *const u8,
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    assert_eq!(
+        bytes,
+        &[2, 0, 0x1f, 0x90, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        "sockaddr_in wire bytes differ from Linux x86_64 ABI"
+    );
+    assert_eq!(addr.ip_bytes(), [127, 0, 0, 1]);
+    assert_eq!(addr.port(), 8080);
+    assert_eq!(core::mem::align_of::<SockAddrIn>(), 4);
+    assert_eq!(LINUX_DIRENT64_NAME_OFFSET, 19);
 }
 
 /// AF_INET constant (IPv4)
@@ -302,7 +333,7 @@ impl SocketFile {
 const S_IFSOCK: u32 = 0o140000;
 
 impl crate::process::FileOps for SocketFile {
-    fn clone_box(&self) -> alloc::boxed::Box<dyn crate::process::FileOps> {
+    fn clone_box(&self) -> crate::process::FileDescriptor {
         // Increment the SOCKET refcount on clone (for dup/fork POSIX semantics).
         //
         // NOTE: If the socket was already closed/removed from the table,
@@ -315,10 +346,6 @@ impl crate::process::FileOps for SocketFile {
         // This edge case can occur if the socket is closed between dup/fork
         // initiation and completion - a valid race condition in concurrent
         // environments.
-        if let Some(sock) = net::socket_table().get(self.socket_id) {
-            sock.increment_refcount();
-        }
-
         // U.S3-A2 FIX (CRITICAL self-deadlock): clone_box is PURE with respect to
         // the cap_table — it does NOT take the Process lock or bump the CapEntry
         // refcount. The prior U.S2-SLICE-2 code did `try_get_process(pid).lock()`
@@ -332,7 +359,20 @@ impl crate::process::FileOps for SocketFile {
         // verbatim (not incremented) into the fork child table (U.S3-A1
         // CapSlot::clone). See `remove_fd` (process.rs) for the matching decrement
         // via the generic `FileOps::cap_id()` accessor.
-        alloc::boxed::Box::new(self.clone())
+        self.try_clone_box()
+            .expect("socket fd clone allocation/admission failed")
+    }
+
+    fn try_clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
+        // RF180-37: allocate/admit the exact-lifetime outer owner before
+        // incrementing socket ownership. Finalization is infallible, so no
+        // compensating refcount rollback is needed under Process.
+        let prepared = crate::process::FileDescriptor::try_prepare(mm::HeapClass::SocketObject)?;
+        let socket = net::socket_table().get(self.socket_id);
+        if let Some(socket) = socket.as_ref() {
+            socket.increment_refcount();
+        }
+        Ok(prepared.finalize(self.clone()))
     }
 
     /// U.S3-B FIX: expose this fd's CapId so the generic `remove_fd` /
@@ -1355,7 +1395,9 @@ pub fn run_fileops_cap_id_self_test() {
     // (2) clone_box is PURE w.r.t. cap accounting (U.S3-A2) and the copy
     // carries the SAME CapId (shared entry, not a fresh allocation) — the
     // explicit call-site bump (U.S3-A3) relies on both.
-    let cloned = desc.clone_box();
+    let cloned = desc
+        .try_clone_box()
+        .expect("self-test descriptor clone allocation");
     assert!(
         cloned.cap_id() == Some(cid),
         "U.S3-A2/A3: a dup/fork copy must reference the SAME CapId; the \
@@ -1366,8 +1408,11 @@ pub fn run_fileops_cap_id_self_test() {
     // pipe/file fds keep None until U.S2 SLICE-3 wires their caps).
     struct NoCapFile;
     impl FileOps for NoCapFile {
-        fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
-            alloc::boxed::Box::new(NoCapFile)
+        fn clone_box(&self) -> crate::process::FileDescriptor {
+            self.try_clone_box().expect("NoCapFile clone allocation")
+        }
+        fn try_clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
+            crate::process::FileDescriptor::try_new(NoCapFile, mm::HeapClass::CoreProcess)
         }
         fn as_any(&self) -> &dyn core::any::Any {
             self
@@ -1402,9 +1447,6 @@ pub fn run_fileops_cap_id_self_test() {
 /// - a NON-fd-backed cap (Endpoint) must stay VERBATIM — its refcount is not
 ///   an fd count, so the fd histogram must neither rewrite nor revoke it.
 pub fn run_fork_reconcile_refcount_self_test() {
-    use alloc::collections::BTreeMap;
-    use alloc::sync::Arc;
-
     // (1) Create a cap_table simulating a CLONE_THREAD parent whose refcounts
     // include sibling-held references. Allocate 3 caps with initial refcount=1
     // each, then manually bump them to simulate: cap A held by 2 threads (parent
@@ -1412,19 +1454,19 @@ pub fn run_fork_reconcile_refcount_self_test() {
     let parent_table = cap::CapTable::new();
     let cap_a = parent_table
         .allocate(cap::CapEntry::new(
-            cap::CapObject::Socket(Arc::new(cap::Socket::new(999, 0))),
+            cap::CapObject::Socket(cap::Socket::new(999, 0)),
             cap::CapRights::READ | cap::CapRights::WRITE,
         ))
         .expect("allocate cap A");
     let cap_b = parent_table
         .allocate(cap::CapEntry::new(
-            cap::CapObject::Socket(Arc::new(cap::Socket::new(998, 0))),
+            cap::CapObject::Socket(cap::Socket::new(998, 0)),
             cap::CapRights::READ,
         ))
         .expect("allocate cap B");
     let cap_c = parent_table
         .allocate(cap::CapEntry::new(
-            cap::CapObject::Socket(Arc::new(cap::Socket::new(997, 0))),
+            cap::CapObject::Socket(cap::Socket::new(997, 0)),
             cap::CapRights::WRITE,
         ))
         .expect("allocate cap C");
@@ -1490,9 +1532,7 @@ pub fn run_fork_reconcile_refcount_self_test() {
     );
 
     // Build the child-fd histogram: A→1 fd, B→1 fd, C→0 fds (not in map).
-    let mut child_counts = BTreeMap::new();
-    child_counts.insert(cap_a, 1);
-    child_counts.insert(cap_b, 1);
+    let child_counts = [(cap_a, 1usize), (cap_b, 1usize)];
     // C and E are omitted (child has no fds carrying them); D is non-fd-backed
     // and never appears in an fd histogram.
 
@@ -1572,19 +1612,155 @@ const MAX_ARG_STRLEN: usize = 4096;
 /// - OOM panic 或堆耗尽
 /// - 任意用户进程可 DoS 整个系统
 ///
-/// Linux 通常允许单次最大 2GB，但考虑到 Zero-OS 是微内核，
-/// 1MB 上限足够大多数场景，同时保护内核免受资源耗尽攻击。
-const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
+/// R180-10 FIX: preserve the historical 1 MiB per-call contract, while every
+/// live buffer is now aggregate-admitted below. The global ledger, not a
+/// functionality-reducing count cap, prevents concurrent blocked callers from
+/// starving unrelated kernel work.
+const MAX_RW_SIZE: usize = {
+    let residual = mm::general_residual_bytes();
+    if residual < 4096 {
+        4096
+    } else if residual > 1024 * 1024 {
+        1024 * 1024
+    } else {
+        residual
+    }
+};
+
+/// A transient Vec whose allocator backing and heap-ledger reservation have one
+/// owner. Field declaration order is intentional and guaranteed by Rust: the
+/// Vec is deallocated before `_reservation` returns its bytes to admission, so
+/// a competing allocation can never be admitted against memory that is still
+/// physically live.
+struct AdmittedVec<T> {
+    values: Vec<T>,
+    _reservation: mm::HeapReservation,
+}
+
+impl<T> AdmittedVec<T> {
+    #[inline]
+    fn admitted_bytes(&self) -> usize {
+        self._reservation.bytes()
+    }
+}
+
+impl<T> core::ops::Deref for AdmittedVec<T> {
+    type Target = Vec<T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<T> core::ops::DerefMut for AdmittedVec<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+fn try_admitted_vec<T>(
+    class: mm::HeapClass,
+    capacity: usize,
+) -> Result<AdmittedVec<T>, SyscallError> {
+    let estimated = mm::vec_charge_bytes::<T>(capacity).map_err(|_| SyscallError::ENOMEM)?;
+    let mut reservation =
+        mm::try_reserve_heap(class, estimated).map_err(|_| SyscallError::ENOMEM)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    let actual = mm::vec_charge_bytes::<T>(values.capacity()).map_err(|_| SyscallError::ENOMEM)?;
+    reservation
+        .resize(actual)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    Ok(AdmittedVec {
+        values,
+        _reservation: reservation,
+    })
+}
+
+fn try_admitted_zeroed_buffer(
+    class: mm::HeapClass,
+    len: usize,
+) -> Result<AdmittedVec<u8>, SyscallError> {
+    let mut bytes = try_admitted_vec(class, len)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+#[inline]
+fn try_admitted_zeroed_io_buffer(len: usize) -> Result<AdmittedVec<u8>, SyscallError> {
+    try_admitted_zeroed_buffer(mm::HeapClass::BlockingIo, len)
+}
+
+/// R180-10 executable regression probe: independently live blocking buffers
+/// accumulate in the authoritative byte ledger and release exactly, including
+/// the deallocation-before-uncharge owner ordering above.
+pub fn run_transient_io_admission_self_test() {
+    let before = mm::heap_class_snapshot(mm::HeapClass::BlockingIo);
+
+    // Preserve the public 1 MiB read/write contract together with the largest
+    // legal iovec descriptor array. Allocator metadata is part of the proof;
+    // a nominal 1 MiB class limit would reject the historical maximum.
+    let worst_rw = mm::vec_charge_bytes::<u8>(MAX_RW_SIZE).expect("max rw charge");
+    let worst_iov = mm::vec_charge_bytes::<Iovec>(IOV_MAX).expect("max iovec charge");
+    let worst_transaction = worst_rw
+        .checked_add(worst_iov)
+        .expect("max I/O transaction charge overflow");
+    assert!(
+        mm::HeapClass::BlockingIo.limit_bytes() >= worst_transaction,
+        "BlockingIo ceiling must preserve the 1 MiB + IOV_MAX contract"
+    );
+
+    let first = try_admitted_zeroed_io_buffer(4096).expect("first admitted I/O buffer");
+    let first_bytes = first.admitted_bytes();
+    let after_first = mm::heap_class_snapshot(mm::HeapClass::BlockingIo);
+    assert_eq!(
+        after_first.reserved_bytes,
+        before.reserved_bytes + first_bytes
+    );
+
+    let second =
+        try_admitted_vec::<u64>(mm::HeapClass::BlockingIo, 64).expect("second admitted buffer");
+    let second_bytes = second.admitted_bytes();
+    let after_second = mm::heap_class_snapshot(mm::HeapClass::BlockingIo);
+    assert_eq!(
+        after_second.reserved_bytes,
+        after_first.reserved_bytes + second_bytes
+    );
+
+    drop(second);
+    assert_eq!(
+        mm::heap_class_snapshot(mm::HeapClass::BlockingIo),
+        after_first
+    );
+    drop(first);
+    assert_eq!(mm::heap_class_snapshot(mm::HeapClass::BlockingIo), before);
+}
 
 /// R130-1 FIX: Maximum number of mmap regions per process.
 ///
 /// Bounds the per-process `mmap_regions` BTreeMap to prevent unbounded kernel
 /// heap growth from unprivileged syscalls (e.g., millions of PROT_NONE mmaps).
-/// Matches Linux's default `/proc/sys/vm/max_map_count` (65536).
+///
+/// R180-9 FIX: derive from general residual (~32 B/region incl. tree slack),
+/// hard-capped at 4096. Linux default 65536 cannot fit in our 1 MiB heap residual.
 ///
 /// R165-14: `pub(crate)` so fork.rs can re-assert the bound before cloning the
 /// parent's region map into the child (see fork::fork_inner).
-pub(crate) const MAX_MAP_COUNT: usize = 65536;
+pub(crate) const MAX_MAP_COUNT: usize = {
+    let residual = mm::general_residual_bytes();
+    let by_bytes = residual / 32;
+    if by_bytes < 64 {
+        64
+    } else if by_bytes > 4096 {
+        4096
+    } else {
+        by_bytes
+    }
+};
 
 /// 系统调用号定义（参考Linux系统调用表）
 #[repr(u64)]
@@ -1691,6 +1867,7 @@ pub enum SyscallError {
     EINPROGRESS = -115,    // 操作正在进行
     EOPNOTSUPP = -95,      // 操作不支持
     ECONNABORTED = -103,   // R51-1: 连接被中止 (accept on closed listener)
+    ENOBUFS = -105,        // No network buffer space available
     // E.4 PI: Robust futex error
     EOWNERDEAD = -130, // E.4 PI: Robust futex - 锁持有者已退出
     // R104-4: Arithmetic overflow (POSIX value 75)
@@ -1976,8 +2153,11 @@ pub type PipeCreateCallback = fn() -> Result<(i32, i32), SyscallError>;
 /// 文件描述符读取回调类型
 ///
 /// 由 ipc 模块注册，处理管道等文件描述符的读取
-/// 参数: (fd, buf, count) -> bytes_read 或错误
-pub type FdReadCallback = fn(i32, &mut [u8]) -> Result<usize, SyscallError>;
+/// R180-L1: the callback owns source commit ordering. It must copy the produced
+/// bytes through `copyout` and advance/dequeue the source only after copyout
+/// succeeds. This closes sibling-unmap races that bounds preflight cannot pin.
+pub type FdReadCopyout = fn(*mut u8, &[u8]) -> Result<(), SyscallError>;
+pub type FdReadCallback = fn(i32, &mut [u8], *mut u8, FdReadCopyout) -> Result<usize, SyscallError>;
 
 /// 文件描述符写入回调类型
 ///
@@ -2068,8 +2248,10 @@ pub type VfsRenameCallback = fn(&str, &str, bool) -> Result<(), SyscallError>;
 /// The callback MUST stop collecting entries once the estimated serialized size
 /// (header + name + NUL + alignment) exceeds `max_bytes`. This prevents unbounded
 /// kernel heap allocation from large directories, which could trigger OOM panic.
-/// 参数: (fd, max_bytes) -> 返回实际读取的目录项列表
-pub type VfsReaddirCallback = fn(i32, usize) -> Result<alloc::vec::Vec<DirEntry>, SyscallError>;
+/// R180-L1: the VFS callback keeps the shared directory offset uncommitted
+/// until this serializer/copyout callback succeeds.
+pub type VfsDirCopyout = fn(*mut u8, usize, &[DirEntry]) -> Result<usize, SyscallError>;
+pub type VfsReaddirCallback = fn(i32, usize, *mut u8, VfsDirCopyout) -> Result<usize, SyscallError>;
 
 /// VFS 截断文件回调类型
 ///
@@ -2107,6 +2289,11 @@ pub type VfsStatNofollowCallback = fn(&str) -> Result<VfsStat, SyscallError>;
 /// Parameter: Arc<MountNamespace> to materialize
 pub type MountNsMaterializeCallback =
     fn(&alloc::sync::Arc<crate::mount_namespace::MountNamespace>) -> Result<(), ()>;
+/// R180-22: remove an eagerly materialized table for a namespace that never
+/// reached PCB publication. Namespace IDs are globally unique and are the VFS
+/// table identity, so rollback cannot target a successor.
+pub type MountNsMaterializeRollbackCallback =
+    fn(&alloc::sync::Arc<crate::mount_namespace::MountNamespace>);
 
 /// 文件类型枚举(本地定义避免循环依赖)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2126,6 +2313,9 @@ pub struct DirEntry {
     pub name: alloc::string::String,
     pub ino: u64,
     pub file_type: FileType,
+    /// RF180-14: filesystem-provided resume cookie for the next readdir call.
+    /// Stored in the exact signed Linux ABI domain before serialization.
+    pub next_cookie: i64,
 }
 
 /// VFS 文件状态信息
@@ -2196,6 +2386,7 @@ lazy_static::lazy_static! {
     static ref VFS_STAT_NOFOLLOW_CALLBACK: spin::Mutex<Option<VfsStatNofollowCallback>> = spin::Mutex::new(None);
     /// R74-2 FIX: Mount namespace materialization callback
     static ref MOUNT_NS_MATERIALIZE_CALLBACK: spin::Mutex<Option<MountNsMaterializeCallback>> = spin::Mutex::new(None);
+    static ref MOUNT_NS_MATERIALIZE_ROLLBACK_CALLBACK: spin::Mutex<Option<MountNsMaterializeRollbackCallback>> = spin::Mutex::new(None);
 }
 
 /// 注册管道创建回调
@@ -2313,6 +2504,10 @@ pub fn register_mount_ns_materialize_callback(cb: MountNsMaterializeCallback) {
     *MOUNT_NS_MATERIALIZE_CALLBACK.lock() = Some(cb);
 }
 
+pub fn register_mount_ns_materialize_rollback_callback(cb: MountNsMaterializeRollbackCallback) {
+    *MOUNT_NS_MATERIALIZE_ROLLBACK_CALLBACK.lock() = Some(cb);
+}
+
 /// R74-2 Test Helper: Check if mount namespace materialization callback is registered.
 ///
 /// Used by runtime tests to verify the R74-2 fix is properly initialized.
@@ -2355,6 +2550,36 @@ fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) -> Re
          kernel initialization bug.",
     );
     cb(ns)
+}
+
+fn rollback_materialized_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) {
+    let cb = *MOUNT_NS_MATERIALIZE_ROLLBACK_CALLBACK
+        .lock()
+        .as_ref()
+        .expect("CRITICAL: mount namespace materialization rollback callback not registered");
+    cb(ns);
+}
+
+/// Owns the VFS table of a newly-created mount namespace until the namespace
+/// is published into a live PCB. Every pre-publication error removes the exact
+/// globally-unique namespace ID from the VFS registry.
+struct PreparedMountTableGuard {
+    ns: Arc<crate::mount_namespace::MountNamespace>,
+    armed: bool,
+}
+
+impl PreparedMountTableGuard {
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedMountTableGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            rollback_materialized_namespace(&self.ns);
+        }
+    }
 }
 
 // ============================================================================
@@ -2788,7 +3013,10 @@ fn tx_error_to_syscall(err: net::TxError) -> SyscallError {
     match err {
         net::TxError::QueueFull => SyscallError::EAGAIN,
         net::TxError::LinkDown => SyscallError::ENETDOWN,
+        net::TxError::FirewallDenied => SyscallError::EPERM,
         net::TxError::InvalidBuffer => SyscallError::EINVAL,
+        net::TxError::NoMemory => SyscallError::ENOMEM,
+        net::TxError::NoBuffers => SyscallError::ENOBUFS,
         net::TxError::IoError => SyscallError::EIO,
     }
 }
@@ -3370,6 +3598,12 @@ pub fn syscall_dispatcher(
         41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
         42 => sys_connect(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
         43 => sys_accept(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
+        288 => sys_accept4(
+            arg0 as i32,
+            arg1 as *mut SockAddrIn,
+            arg2 as *mut u32,
+            arg3 as i32,
+        ),
         49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
         50 => sys_listen(arg0 as i32, arg1 as i32),
         44 => sys_sendto(
@@ -3669,87 +3903,11 @@ fn sys_fork() -> SyscallResult {
 
     // 调用真正的 fork 实现（包含 COW 支持）
     match crate::fork::sys_fork() {
-        Ok(child_pid) => {
-            // LSM hook: check if policy allows this fork
-            //
-            // H.0.9 FIX: Cannot use enforce_lsm_task_fork() here because it calls
-            // cleanup_unscheduled_process() which skips cpuset/cgroup teardown.
-            // fork::sys_fork() ran fork_inner which joined cpuset and attached cgroup.
-            // On LSM denial, use terminate_process() + cleanup_zombie() for full teardown.
-            // This is safe because the child was never scheduled (no SMP race).
-            {
-                let parent_arc_lsm = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
-                let child_arc_lsm = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
-                let (parent_ctx, child_ctx) = {
-                    let parent = parent_arc_lsm.lock();
-                    let child = child_arc_lsm.lock();
-                    (lsm_process_ctx_from(&parent), lsm_process_ctx_from(&child))
-                };
-                if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
-                    if let Some(parent) = get_process(parent_pid) {
-                        parent.lock().children.retain(|&pid| pid != child_pid);
-                    }
-                    // H.0.9: Child was fully forked (cpuset/cgroup joined) but never
-                    // scheduled. terminate_process + cleanup_zombie gives full teardown
-                    // including cpuset task_left and cgroup detach. Safe because no CPU
-                    // has ever run this process (no SMP race on PCB).
-                    terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
-                    cleanup_zombie(child_pid);
-                    return Err(lsm_error_to_syscall(err));
-                }
-            }
-
-            // F.1 PID Namespace: Translate child's global PID to parent's namespace view
-            //
-            // Linux semantics: fork() returns the child's PID as seen from the parent's
-            // namespace. This is the same PID used by wait(), kill(), etc.
-            //
-            // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
-            // Falling back to global PID would break PID namespace isolation, allowing
-            // processes to observe kernel-internal PIDs across namespace boundaries.
-            //
-            // H.0.9 FIX: PID translation is performed BEFORE scheduler enqueue. On
-            // translation failure, the child is still unscheduled, so we can safely
-            // use terminate_process() + cleanup_zombie() for synchronous full teardown
-            // (no zombie accumulation, no cpuset/cgroup leak).
-            let parent_view_pid = {
-                let parent = parent_arc.lock();
-                let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
-                if let Some(ns) = owning_ns {
-                    crate::pid_namespace::pid_in_namespace(&ns, child_pid)
-                } else {
-                    Some(child_pid)
-                }
-            };
-
-            let parent_view_pid = match parent_view_pid {
-                Some(pid) => pid,
-                None => {
-                    // H.0.9: Child is fully forked (cpuset/cgroup joined) but never
-                    // scheduled. terminate_process + cleanup_zombie gives full teardown.
-                    if let Some(parent) = get_process(parent_pid) {
-                        parent.lock().children.retain(|&p| p != child_pid);
-                    }
-                    terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
-                    cleanup_zombie(child_pid);
-                    return Err(SyscallError::EFAULT);
-                }
-            };
-
-            // R101-3 FIX: Notify scheduler about the new child process.
-            //
-            // Previously, sys_fork() did not call notify_scheduler_add_process(),
-            // causing forked children to exist in the process table but never be
-            // added to the scheduler's run queue. This made fork() a resource leak
-            // DoS vector — each call consumed a PID, kernel stack, and page tables
-            // that were never reclaimed because the child never ran to completion.
-            //
-            // H.0.9: Moved AFTER PID translation so translation failure can use
-            // synchronous terminate_process + cleanup_zombie (child not yet enqueued).
-            if let Some(child_arc) = get_process(child_pid) {
-                crate::process::notify_scheduler_add_process(child_arc);
-            }
-
+        Ok((_child_pid, parent_view_pid)) => {
+            // R180-19: LSM authorization and namespace-local PID translation
+            // were completed during fork PREPARE, before parent PTE commit.  The
+            // low-level transaction has already published the runnable child;
+            // this syscall tail has no lookup or failure branch.
             Ok(parent_view_pid)
         }
         Err(e) => {
@@ -3758,7 +3916,10 @@ fn sys_fork() -> SyscallResult {
             match e {
                 ForkError::CgroupPidsLimitExceeded
                 | ForkError::CgroupFilesLimitExceeded
-                | ForkError::MmapTransientState => Err(SyscallError::EAGAIN),
+                | ForkError::MmapTransientState
+                | ForkError::SchedulerAdmissionFailed => Err(SyscallError::EAGAIN),
+                ForkError::SecurityDenied => Err(SyscallError::EPERM),
+                ForkError::NamespaceTranslationFailed => Err(SyscallError::EFAULT),
                 _ => Err(SyscallError::ENOMEM),
             }
         }
@@ -4048,6 +4209,7 @@ fn sys_clone(
         parent_sigactions, // M0 item 5: inherit signal dispositions (per-task copy)
         parent_blocked,    // M0 item 5: inherit blocked mask
         parent_seccomp_state,
+        parent_seccomp_generation,
         parent_pledge_state,
         parent_seccomp_installing,
         parent_pid_ns_for_children,   // F.1: PID namespace for children
@@ -4080,10 +4242,26 @@ fn sys_clone(
         let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> = if flags & CLONE_FILES != 0 {
             let mut snap = Vec::new();
             if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
+                drop(parent);
                 return Err(SyscallError::ENOMEM);
             }
+            let mut clone_failed = false;
             for (&fd, desc) in parent.fd_table.iter() {
-                snap.push((fd, desc.clone_box()));
+                let cloned = match desc.try_clone_box() {
+                    Ok(cloned) => cloned,
+                    Err(()) => {
+                        clone_failed = true;
+                        break;
+                    }
+                };
+                snap.push((fd, cloned));
+            }
+            if clone_failed {
+                // Socket/FileOps destructors may acquire foreign locks; never
+                // drop already-cloned descriptors under the parent PCB lock.
+                drop(parent);
+                drop(snap);
+                return Err(SyscallError::ENOMEM);
             }
             snap
         } else {
@@ -4099,6 +4277,8 @@ fn sys_clone(
         let cloexec_snapshot: Vec<i32> = if flags & CLONE_FILES != 0 {
             let mut snap = Vec::new();
             if snap.try_reserve_exact(parent.cloexec_fds.len()).is_err() {
+                drop(parent);
+                drop(fd_snapshot);
                 return Err(SyscallError::ENOMEM);
             }
             snap.extend(parent.cloexec_fds.iter().copied());
@@ -4113,12 +4293,24 @@ fn sys_clone(
         } else {
             // R25-8 FIX: Non-thread cases must inherit and filter CLOFORK entries
             // R161-4 FIX: Fallible clone + Arc wrapping
-            Arc::new(
-                parent
-                    .cap_table
-                    .try_clone_for_fork()
-                    .map_err(|_| SyscallError::ENOMEM)?,
-            )
+            let cloned = match parent.cap_table.try_clone_for_fork() {
+                Ok(cloned) => cloned,
+                Err(_) => {
+                    drop(parent);
+                    drop(fd_snapshot);
+                    drop(cloexec_snapshot);
+                    return Err(SyscallError::ENOMEM);
+                }
+            };
+            match Arc::try_new(cloned) {
+                Ok(cloned) => cloned,
+                Err(_) => {
+                    drop(parent);
+                    drop(fd_snapshot);
+                    drop(cloexec_snapshot);
+                    return Err(SyscallError::ENOMEM);
+                }
+            }
         };
 
         // D3-ARC-MM-SHARED / P1-D: do NOT Arc::clone(parent.mm) here for later
@@ -4141,7 +4333,14 @@ fn sys_clone(
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
             parent_exec_in_progress,             // P1-D: mid-exec gate for CLONE_VM
-            parent.name.clone(),
+            crate::process::ProcessNameSnapshot::from_parts(
+                &parent.name,
+                if flags & CLONE_THREAD != 0 {
+                    "-thread"
+                } else {
+                    "-clone"
+                },
+            ),
             parent.priority,
             parent.cgroup_id,    // R123-2 FIX
             parent.cpuset_id,    // R123-2 FIX
@@ -4159,6 +4358,7 @@ fn sys_clone(
                 .seccomp_state
                 .try_clone()
                 .map_err(|_| SyscallError::ENOMEM)?,
+            parent.seccomp_generation,
             parent.pledge_state.clone(),
             parent.seccomp_installing,
             parent.pid_ns_for_children.clone(), // F.1: PID namespace
@@ -4193,71 +4393,10 @@ fn sys_clone(
     } else {
         // 不共享地址空间：使用 COW fork
         match crate::fork::sys_fork() {
-            Ok(child_pid) => {
-                // fork 成功，执行 LSM 检查
-                // 这种情况很少见（clone 不带 CLONE_VM 通常就是 fork）
-                //
-                // H.0.9 FIX: Cannot use enforce_lsm_task_fork() here because it calls
-                // cleanup_unscheduled_process() which skips cpuset/cgroup teardown.
-                // fork::sys_fork() ran fork_inner (cpuset joined, cgroup attached).
-                // On LSM denial, use terminate_process + cleanup_zombie for full
-                // teardown. Safe because the child was never scheduled (no SMP race).
-                {
-                    let parent_arc_lsm = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
-                    let child_arc_lsm = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
-                    let (parent_ctx, child_ctx) = {
-                        let p = parent_arc_lsm.lock();
-                        let c = child_arc_lsm.lock();
-                        (lsm_process_ctx_from(&p), lsm_process_ctx_from(&c))
-                    };
-                    if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
-                        if let Some(parent) = get_process(parent_pid) {
-                            parent.lock().children.retain(|&pid| pid != child_pid);
-                        }
-                        // H.0.9: Child was fully forked (cpuset/cgroup joined) but never
-                        // scheduled. terminate_process + cleanup_zombie gives full teardown.
-                        terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
-                        cleanup_zombie(child_pid);
-                        return Err(lsm_error_to_syscall(err));
-                    }
-                }
-
-                // F.1: Translate to parent's namespace view before returning
-                //
-                // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
-                //
-                // H.0.9 FIX: Translation failure must not leak the child. fork::sys_fork()
-                // ran fork_inner (cpuset joined, cgroup attached) but did NOT add to
-                // scheduler. Use terminate_process + cleanup_zombie for synchronous
-                // full teardown (no zombie, no cpuset/cgroup leak).
-                let parent_view_pid = {
-                    let parent = parent_arc.lock();
-                    let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
-                    if let Some(ns) = owning_ns {
-                        crate::pid_namespace::pid_in_namespace(&ns, child_pid)
-                    } else {
-                        Some(child_pid)
-                    }
-                };
-                match parent_view_pid {
-                    Some(pid) => {
-                        // H.0.9: fork::sys_fork() does not add to scheduler; enqueue now.
-                        if let Some(child_arc) = get_process(child_pid) {
-                            crate::process::notify_scheduler_add_process(child_arc);
-                        }
-                        return Ok(pid);
-                    }
-                    None => {
-                        // Child was fully forked (cpuset/cgroup joined) but never scheduled.
-                        // H.0.9: Use terminate_process + cleanup_zombie for full teardown.
-                        if let Some(parent) = get_process(parent_pid) {
-                            parent.lock().children.retain(|&pid| pid != child_pid);
-                        }
-                        terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
-                        cleanup_zombie(child_pid);
-                        return Err(SyscallError::EFAULT);
-                    }
-                }
+            Ok((_child_pid, parent_view_pid)) => {
+                // R180-19: policy and PID translation were prepared before COW
+                // commit, and fork::sys_fork already published the child.
+                return Ok(parent_view_pid);
             }
             Err(e) => {
                 // R122-1 FIX: Map MmapTransientState to EAGAIN (retriable)
@@ -4266,7 +4405,10 @@ fn sys_clone(
                 return Err(match e {
                     ForkError::CgroupPidsLimitExceeded
                     | ForkError::CgroupFilesLimitExceeded
-                    | ForkError::MmapTransientState => SyscallError::EAGAIN,
+                    | ForkError::MmapTransientState
+                    | ForkError::SchedulerAdmissionFailed => SyscallError::EAGAIN,
+                    ForkError::SecurityDenied => SyscallError::EPERM,
+                    ForkError::NamespaceTranslationFailed => SyscallError::EFAULT,
                     _ => SyscallError::ENOMEM,
                 });
             }
@@ -4276,32 +4418,12 @@ fn sys_clone(
     // R160-14 FIX: Truncate child name to prevent unbounded growth from
     // deeply nested clone chains. The old infallible format!() could
     // accumulate ~230KB names and panic under OOM.
-    let suffix = if flags & CLONE_THREAD != 0 {
-        "-thread"
-    } else {
-        "-clone"
-    };
-    let max_name = 256;
-    let child_name = if parent_name.len() + suffix.len() > max_name {
-        let mut name = String::new();
-        if name.try_reserve(max_name).is_ok() {
-            let truncated = &parent_name[..max_name.saturating_sub(suffix.len())];
-            name.push_str(truncated);
-            name.push_str(suffix);
-        }
-        name
-    } else {
-        let mut name = String::new();
-        if name.try_reserve(parent_name.len() + suffix.len()).is_err() {
-            return Err(SyscallError::ENOMEM);
-        }
-        name.push_str(&parent_name);
-        name.push_str(suffix);
-        name
-    };
+    // RF180-17 FIX: parent_name is already a bounded stack snapshot; String
+    // allocation happens only inside the admitted PCB constructor.
+    let child_name = parent_name;
 
     // F.1: Handle CLONE_NEWNS - create new mount namespace
-    let new_mount_ns = if flags & CLONE_NEWNS != 0 {
+    let (new_mount_ns, mut new_mount_table_guard) = if flags & CLONE_NEWNS != 0 {
         match crate::mount_namespace::clone_namespace(parent_mount_ns.clone()) {
             Ok(ns) => {
                 // R74-2 FIX: Eagerly materialize mount namespace tables.
@@ -4316,30 +4438,16 @@ fn sys_clone(
                 // snapshot the parent's mount state at clone time.
                 materialize_namespace(&parent_mount_ns).map_err(|_| SyscallError::ENOMEM)?;
                 materialize_namespace(&ns).map_err(|_| SyscallError::ENOMEM)?;
+                // R180-22 FIX: the VFS mount-table registry is a second
+                // publication surface.  Own the exact new namespace table
+                // until the child is scheduler-visible; every intervening
+                // clone error removes it by globally-unique namespace ID.
+                let guard = PreparedMountTableGuard {
+                    ns: Arc::clone(&ns),
+                    armed: true,
+                };
 
-                klog!(Info,
-                    "[sys_clone] Created new mount namespace: id={}, level={} (eagerly materialized)",
-                    ns.id().raw(),
-                    ns.level()
-                );
-
-                // F.1 Audit: Emit namespace creation event
-                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
-                let _ = audit::emit(
-                    AuditKind::Process,
-                    AuditOutcome::Success,
-                    get_audit_subject(),
-                    AuditObject::Namespace {
-                        ns_id: ns.id().raw(),
-                        ns_type: CLONE_NEWNS as u32,
-                        parent_id,
-                    },
-                    &[56, flags, CLONE_NEWNS], // syscall 56 = clone, flags, CLONE_NEWNS
-                    0,
-                    crate::time::current_timestamp_ms(),
-                );
-
-                Some(ns)
+                (Some(ns), Some(guard))
             }
             Err(crate::mount_namespace::MountNsError::MaxDepthExceeded) => {
                 klog!(
@@ -4358,7 +4466,7 @@ fn sys_clone(
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // F.1: Handle CLONE_NEWIPC - create new IPC namespace
@@ -4531,19 +4639,22 @@ fn sys_clone(
     // F.1: Handle CLONE_NEWPID - create child in new PID namespace
     let child_pid = if flags & CLONE_NEWPID != 0 {
         // Create a new child PID namespace
-        let new_ns = crate::pid_namespace::PidNamespace::new_child(parent_pid_ns_for_children)
-            .map_err(|e| {
-                // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-                kprintln!("[sys_clone] Failed to create PID namespace: {:?}", e);
-                match e {
-                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
-                        SyscallError::EAGAIN
+        let new_ns =
+            crate::pid_namespace::PidNamespace::new_child(Arc::clone(&parent_pid_ns_for_children))
+                .map_err(|e| {
+                    // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+                    kprintln!("[sys_clone] Failed to create PID namespace: {:?}", e);
+                    match e {
+                        crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
+                            SyscallError::EAGAIN
+                        }
+                        // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+                        crate::pid_namespace::PidNamespaceError::MaxNamespaces => {
+                            SyscallError::EAGAIN
+                        }
+                        _ => SyscallError::ENOMEM,
                     }
-                    // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
-                    crate::pid_namespace::PidNamespaceError::MaxNamespaces => SyscallError::EAGAIN,
-                    _ => SyscallError::ENOMEM,
-                }
-            })?;
+                })?;
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         kprintln!(
             "[sys_clone] Created new PID namespace: id={}, level={}",
@@ -4560,77 +4671,144 @@ fn sys_clone(
 
     let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
 
+    // R180-1 FIX (INV-ARC-01): NEVER re-enter PROCESS_TABLE via get_process while
+    // holding a published child's PCB lock — live scanners take PROCESS_TABLE then
+    // each PCB (process.rs thread-group / table walks). Child → table is ABBA.
+    //
+    // All parent rechecks that need the table (live seccomp_installing, abort
+    // retain on parent.children) run with the child lock DROPPED, then the child
+    // is re-locked. parent_arc is already held as Arc so parent.lock() alone is
+    // fine (does not touch PROCESS_TABLE).
+
+    // Pre-child-lock: revalidate parent seccomp / group-exit flags without any
+    // child PCB held. Snapshot can race create_process; live recheck closes that.
+    let live_seccomp_installing = {
+        let parent = parent_arc.lock();
+        parent.seccomp_installing
+    };
+    let live_group_exiting =
+        parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire);
+
+    if (is_shared_space && (parent_seccomp_installing || live_seccomp_installing))
+        || ((flags & CLONE_THREAD) != 0 && (parent_seccomp_installing || live_seccomp_installing))
+    {
+        // Never scheduled — drop Arc then cleanup (no child lock held).
+        drop(child_arc);
+        if let Some(parent) = get_process(parent_pid) {
+            parent.lock().children.retain(|&p| p != child_pid);
+        }
+        cleanup_unscheduled_process(child_pid);
+        kprintln!(
+            "sys_clone: rejecting CLONE_VM/CLONE_THREAD during seccomp installation (pid={})",
+            parent_pid
+        );
+        return Err(SyscallError::EBUSY);
+    }
+    if (flags & CLONE_THREAD) != 0 && live_group_exiting {
+        drop(child_arc);
+        if let Some(parent) = get_process(parent_pid) {
+            parent.lock().children.retain(|&p| p != child_pid);
+        }
+        cleanup_unscheduled_process(child_pid);
+        return Err(SyscallError::EINTR);
+    }
+
+    // RF180-15 FIX: CLONE_THREAD identity publication linearizes under
+    // PROCESS_TABLE with unshare(CLONE_NEWNS). Revalidate the exact namespace
+    // sources before tgid becomes visible: clone-first makes unshare observe a
+    // second member; unshare-first makes this stale clone abort.
+    if flags & CLONE_THREAD != 0 {
+        let stale_source = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            let parent_in_table = table
+                .get(parent_pid)
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &parent_arc));
+            let child_in_table = table
+                .get(child_pid)
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &child_arc));
+            if !parent_in_table || !child_in_table {
+                true
+            } else {
+                let parent = parent_arc.lock();
+                let stale = !Arc::ptr_eq(&parent.mount_ns, &parent_mount_ns)
+                    || !Arc::ptr_eq(&parent.pid_ns_for_children, &parent_pid_ns_for_children)
+                    || parent.tgid != parent_tgid
+                    || parent.seccomp_installing
+                    || parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire);
+                if !stale {
+                    let mut child = child_arc.lock();
+                    child.tgid = parent_tgid;
+                    child.is_thread = true;
+                    child.thread_group_exiting = Arc::clone(&parent_thread_group_exiting);
+                }
+                stale
+            }
+        };
+        if stale_source {
+            parent_arc.lock().children.retain(|&p| p != child_pid);
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EAGAIN);
+        }
+    }
+
+    let mut prepared_private_credentials = if flags & CLONE_THREAD == 0 {
+        let prepared = (|| {
+            let parent = parent_credentials_arc.read();
+            let supplementary_groups = mm::AdmittedVec::try_copy_from_slice(
+                mm::HeapClass::CoreProcess,
+                &parent.supplementary_groups,
+            )
+            .map_err(|_| SyscallError::ENOMEM)?;
+            let credentials = crate::process::Credentials {
+                uid: parent.uid,
+                gid: parent.gid,
+                euid: parent.euid,
+                egid: parent.egid,
+                supplementary_groups,
+            };
+            let reservation = mm::try_reserve_heap(
+                mm::HeapClass::CoreProcess,
+                mm::arc_charge_bytes::<spin::RwLock<crate::process::Credentials>>()
+                    .map_err(|_| SyscallError::ENOMEM)?,
+            )
+            .map_err(|_| SyscallError::ENOMEM)?;
+            let credentials =
+                Arc::try_new(spin::RwLock::new(credentials)).map_err(|_| SyscallError::ENOMEM)?;
+            Ok::<_, SyscallError>(Some((credentials, reservation)))
+        })();
+        match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                parent_arc.lock().children.retain(|&p| p != child_pid);
+                cleanup_unscheduled_process(child_pid);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     {
         let mut child = child_arc.lock();
-
-        // R33-2 FIX: When parent is installing seccomp, block any shared-VM clone
-        // (CLONE_VM with or without CLONE_THREAD) to prevent sandbox escape.
-        // An attacker could race seccomp installation by spawning a CLONE_VM child
-        // that shares the address space but escapes the pending filter.
-        if is_shared_space && parent_seccomp_installing {
-            child.state = ProcessState::Terminated;
-            drop(child);
-            // R152-12 FIX: Drop child_arc before cleanup so namespace Arc refcount
-            // reaches zero promptly, allowing PidNamespace::drop to decrement PID_NS_COUNT.
-            drop(child_arc);
-            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
-            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
-            if let Some(parent) = get_process(parent_pid) {
-                parent.lock().children.retain(|&p| p != child_pid);
-            }
-            cleanup_unscheduled_process(child_pid);
-            // R103-L2 FIX: Gate diagnostic println behind debug_assertions.
-            // In release builds this leaks internal PID and seccomp race state.
-            kprintln!(
-                "sys_clone: rejecting CLONE_VM during seccomp installation (pid={})",
-                parent_pid
-            );
-            return Err(SyscallError::EBUSY);
-        }
 
         // 设置线程标识
         child.tid = child_pid; // tid == pid (Linux 语义)
         if flags & CLONE_THREAD != 0 {
-            // R26-3 FIX: Reject thread creation if parent is installing seccomp filter
-            // R163-13 FIX: Re-check the live flag (not just snapshot) after
-            // create_process, closing the TOCTOU window where sys_seccomp
-            // sets the flag between snapshot and this check.
-            let live_seccomp_installing = get_process(parent_pid)
-                .map(|p| p.lock().seccomp_installing)
-                .unwrap_or(false);
-            if parent_seccomp_installing || live_seccomp_installing {
-                // Clean up: terminate the child process we just created
-                child.state = ProcessState::Terminated;
-                drop(child);
-                // R152-12 FIX: Drop child_arc before cleanup for prompt namespace counter release
-                drop(child_arc);
-                // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
-                // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
-                if let Some(parent) = get_process(parent_pid) {
-                    parent.lock().children.retain(|&p| p != child_pid);
-                }
-                cleanup_unscheduled_process(child_pid);
-                return Err(SyscallError::EBUSY);
-            }
-            child.tgid = parent_tgid; // 加入父进程的线程组
-            child.is_thread = true;
-            child.thread_group_exiting = parent_thread_group_exiting.clone(); // R153-3 FIX
+            // R26-3 / R163-13 / R180-1: live seccomp and group-exit were re-checked
+            // ABOVE without holding the child PCB (canonical PROCESS_TABLE → PCB
+            // order). Under the child lock we only publish thread-group identity.
+            // Identity and shared exit token were published under PROCESS_TABLE
+            // above; never republish them outside the linearization lock.
 
-            // R153-3 FIX: After setting child.tgid, re-check the shared
-            // thread_group_exiting flag. exit_group() may have started while
-            // sys_clone was in progress, and the atomic scan may have missed
-            // this child (it had default tgid at insert time). The shared flag
-            // is set BEFORE the scan, so checking it here is race-free.
-            //
-            // R154-13 FIX: Return EINTR instead of marking pending_exit_code=0.
-            // The previous code set exit code to 0 regardless of the actual
-            // exit_group code, which is incorrect. Since the group is already
-            // exiting, the cleanest approach is to abort the clone entirely —
-            // the child never needs to run.
+            // R153-3: re-check the shared atomic (no table re-entry) after tgid
+            // publish — still race-free vs exit_group's set-before-scan protocol.
             if parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire) {
                 child.state = ProcessState::Terminated;
                 drop(child);
                 drop(child_arc);
+                // Child lock released before get_process (R180-1).
                 if let Some(parent) = get_process(parent_pid) {
                     parent.lock().children.retain(|&p| p != child_pid);
                 }
@@ -4836,10 +5014,14 @@ fn sys_clone(
         // 这确保同一进程的线程共享 setuid/setgid 变更，
         // 而不同进程保持凭证独立。
         if flags & CLONE_THREAD != 0 {
-            child.credentials = parent_credentials_arc.clone();
+            child.credentials = Arc::clone(&parent_credentials_arc);
         } else {
-            let creds_copy = parent_credentials_arc.read().clone();
-            child.credentials = Arc::new(spin::RwLock::new(creds_copy));
+            let (credentials, reservation) = prepared_private_credentials
+                .take()
+                .expect("private clone credentials must be prepared");
+            let old = core::mem::replace(&mut child.credentials, credentials);
+            drop(old);
+            drop(reservation);
         }
         child.umask = parent_umask;
         // M0-6: inherit rlimits on the CLONE_VM/THREAD manual-construction path
@@ -4856,18 +5038,69 @@ fn sys_clone(
         child.sigactions = parent_sigactions;
         child.blocked = parent_blocked;
 
-        // 继承 Seccomp/Pledge 沙箱状态
-        // - 过滤器栈通过 Arc 共享，父子进程共享同一过滤器对象
-        // - no_new_privs 是粘滞标志，一旦设置无法清除
-        // - pledge 状态包括当前 promises 和 exec_promises（exec 后生效）
+        // RF180-1 FIX: publish the snapshotted sandbox state only while holding
+        // parent -> child in canonical order and only if the committed seccomp
+        // revision is unchanged.  The old post-create boolean sample missed an
+        // install that completed between the initial snapshot and that sample:
+        // `seccomp_installing` was false again while the child still received
+        // the stale pre-install filter stack.
+        drop(child);
+        let parent = parent_arc.lock();
+        if parent.seccomp_installing || parent.seccomp_generation != parent_seccomp_generation {
+            drop(parent);
+            let mut child = child_arc.lock();
+            child.state = ProcessState::Terminated;
+            // This manual clone path shares the parent's address space.  The
+            // unscheduled-child cleanup must not free either shared CR3.
+            child.memory_space = 0;
+            child.user_memory_space = 0;
+            drop(child);
+            drop(child_arc);
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EBUSY);
+        }
+        let mut child = child_arc.lock();
         child.seccomp_state = parent_seccomp_state;
         child.pledge_state = parent_pledge_state;
+        // Keep the parent locked until both assignments are visible.  A new
+        // installation therefore cannot commit in the snapshot->publish gap.
+        drop(parent);
 
         // R133-5 FIX: Use pre-captured fd_table snapshot instead of re-acquiring
         // parent lock (which would create child→parent lock order inversion).
         if flags & CLONE_FILES != 0 {
+            // R180-7/R180-19: admit both retained containers before consuming
+            // any descriptor clone. Publication below is allocation-free; on
+            // refusal the snapshots are dropped only after the PCB lock.
+            let storage_ready = child
+                .fd_table
+                .ensure_capacity_for(parent_fd_table_snapshot.len())
+                .and_then(|()| {
+                    child
+                        .cloexec_fds
+                        .ensure_capacity_for(parent_cloexec_snapshot.len())
+                })
+                .is_ok();
+            if !storage_ready {
+                child.state = ProcessState::Terminated;
+                child.memory_space = 0;
+                child.user_memory_space = 0;
+                drop(child);
+                drop(parent_fd_table_snapshot);
+                drop(parent_cloexec_snapshot);
+                if let Some(parent) = get_process(parent_pid) {
+                    parent.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
+                return Err(SyscallError::ENOMEM);
+            }
             for (fd, desc) in parent_fd_table_snapshot {
-                child.fd_table.insert(fd, desc);
+                if child.fd_table.insert_unique_reserved(fd, desc).is_err() {
+                    panic!("prepared CLONE_FILES descriptor slot disappeared");
+                }
             }
             // R169-L1 FIX: Inherit the close-on-exec marks captured under the
             // parent lock. The rebuild is bounded by MAX_FD and runs OUTSIDE the
@@ -4875,7 +5108,9 @@ fn sys_clone(
             // foreign lock is held. Matches fork.rs, closing the CLOEXEC-bypass
             // parity gap (VD-03) where a CLONE_FILES child silently lost CLOEXEC.
             for fd in parent_cloexec_snapshot {
-                child.cloexec_fds.insert(fd);
+                if child.cloexec_fds.insert_reserved(fd).is_err() {
+                    panic!("prepared CLONE_FILES CLOEXEC slot disappeared");
+                }
             }
         }
 
@@ -5071,6 +5306,24 @@ fn sys_clone(
         }
     }
 
+    // R180-19: reserve scheduler storage before user-visible TID writes and
+    // before the final FD charge. The child remains Provisioning in the queue;
+    // all later failures cancel the exact slot before tearing the PCB down.
+    let scheduler_permit =
+        match crate::process::prepare_scheduler_add_process(Arc::clone(&child_arc)) {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                    let _ = cg.detach_task(child_pid as u64);
+                }
+                if let Some(parent) = get_process(parent_pid) {
+                    parent.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
+                return Err(SyscallError::EAGAIN);
+            }
+        };
+
     // E.5 Cpuset: update task count after successful cgroup attach.
     crate::process::notify_cpuset_task_joined(parent_cpuset_id);
 
@@ -5081,6 +5334,7 @@ fn sys_clone(
     if flags & CLONE_PARENT_SETTID != 0 {
         let tid_bytes = (parent_view_pid as i32).to_ne_bytes();
         if let Err(e) = copy_to_user(parent_tid as *mut u8, &tid_bytes) {
+            drop(scheduler_permit);
             // R104-3 FIX: Clean up child process on copy_to_user failure to prevent
             // PID / kernel-stack / address-space leak.
             // R123-2 FIX: Child is now attached to cgroup + cpuset; roll back
@@ -5106,6 +5360,7 @@ fn sys_clone(
     if flags & CLONE_CHILD_SETTID != 0 {
         let tid_bytes = (child_view_pid as i32).to_ne_bytes();
         if let Err(e) = copy_to_user(child_tid as *mut u8, &tid_bytes) {
+            drop(scheduler_permit);
             // R104-3 FIX: Clean up child process on copy_to_user failure.
             // R123-2 FIX: Child is now attached to cgroup + cpuset; roll back
             // those subsystems before cleanup_unscheduled_process().
@@ -5155,6 +5410,7 @@ fn sys_clone(
         // NOTE: This is the ONLY remaining error path after copy_to_user.
         // On failure, we must manually rollback cgroup/cpuset/cleanup.
         if crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err() {
+            drop(scheduler_permit);
             if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
                 let _ = cg.detach_task(child_pid as u64);
             }
@@ -5168,9 +5424,35 @@ fn sys_clone(
         child_arc.lock().fds_charged_count = child_fd_count;
     }
 
-    // 将子进程添加到调度器（通过回调，避免循环依赖）
-    if let Some(child_arc) = get_process(child_pid) {
-        crate::process::notify_scheduler_add_process(child_arc);
+    // Allocation-free publication of the already-reserved queue entry.
+    scheduler_permit.commit();
+    if let Some(guard) = new_mount_table_guard.as_mut() {
+        guard.commit();
+    }
+    // RF180-16: audit SUCCESS belongs to COMMIT, never PREPARE. Every clone
+    // failure above leaves the guard armed, rolls the VFS table back, and emits
+    // no success record for a namespace that was never published.
+    if let Some(ns) = new_mount_ns.as_ref() {
+        klog!(
+            Info,
+            "[sys_clone] Created new mount namespace: id={}, level={} (eagerly materialized)",
+            ns.id().raw(),
+            ns.level()
+        );
+        let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: ns.id().raw(),
+                ns_type: CLONE_NEWNS as u32,
+                parent_id,
+            },
+            &[56, flags, CLONE_NEWNS],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
     }
 
     // R101-2 FIX: Gate clone completion debug print behind debug_assertions.
@@ -5226,7 +5508,7 @@ fn sys_clone(
 /// required, the correct shape is an EXPLICIT default-ALLOW anon-exec policy seam, NOT a
 /// fail-open VFS file-gate.
 fn exec_from_bytes(
-    process: Arc<spin::Mutex<crate::process::Process>>,
+    process: crate::process::ProcessArc,
     elf_data: Vec<u8>,
     argv_vec: Vec<Vec<u8>>,
     envp_vec: Vec<Vec<u8>>,
@@ -5321,7 +5603,8 @@ fn exec_from_bytes(
     // the point of no return — so its fallible allocation can fail cleanly
     // (ENOMEM) rather than panic in the post-CR3 "no fallible ops" commit window.
     // It is moved (no allocation) into proc.name during the commit.
-    let comm_name = exec_comm_name(&execfn)?;
+    let comm_name = crate::process::PreparedProcessName::try_new(exec_comm_name(&execfn))
+        .map_err(|_| SyscallError::ENOMEM)?;
 
     // H.3 KPTI: User PML4 creation is deferred until AFTER load_elf() and stack
     // setup populate user-space page table entries. create_kpti_user_pml4() snapshots
@@ -5339,7 +5622,7 @@ fn exec_from_bytes(
     // uncharge — i.e. migration stays blocked through the entire exec window
     // including the rollback path. Clears under the Process lock (the only mutator).
     struct ExecInProgressGuard {
-        process: Arc<spin::Mutex<crate::process::Process>>,
+        process: crate::process::ProcessArc,
     }
     impl Drop for ExecInProgressGuard {
         fn drop(&mut self) {
@@ -5415,7 +5698,7 @@ fn exec_from_bytes(
         /// R149-3 FIX: Process handle for clearing exec_pending_bytes and
         /// re-reading cgroup_id on rollback (migration may have moved the
         /// charge to a different cgroup).
-        process: Arc<spin::Mutex<crate::process::Process>>,
+        process: crate::process::ProcessArc,
         old_space: usize,
         old_user_space: usize,
         new_space: usize,
@@ -5430,7 +5713,7 @@ fn exec_from_bytes(
 
     impl ExecSpaceGuard {
         fn new(
-            process: Arc<spin::Mutex<crate::process::Process>>,
+            process: crate::process::ProcessArc,
             old_space: usize,
             old_user_space: usize,
             new_space: usize,
@@ -5470,8 +5753,8 @@ fn exec_from_bytes(
             if !self.committed {
                 // R149-3 FIX: Clear exec_pending_bytes and re-read cgroup_id
                 // under lock. If cgroup migration occurred after load_elf()
-                // charged exec_cgroup_id, the charge was transferred to the
-                // new cgroup by migrate_memory_charges(). We must uncharge
+                // charged exec_cgroup_id, the charge was transferred by the
+                // Process-locked cgroup migration transaction. We must uncharge
                 // the current (post-migration) cgroup_id, not the stale one.
                 if self.charged_bytes > 0 {
                     let rollback_cgroup_id = {
@@ -5517,6 +5800,10 @@ fn exec_from_bytes(
         klog!(Error, "exec_from_bytes: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
+    // R180-10: load_elf has consumed every byte it needs. Release the image
+    // allocation before building argv/envp/auxv staging so the admitted peak is
+    // a conservative bound rather than an unnecessarily simultaneous footprint.
+    drop(elf_data);
 
     // R125-1 FIX: Record cgroup charges from load_elf() in the guard.  If
     // any subsequent step (copy_to_user, KPTI PML4 creation, etc.) fails,
@@ -5744,6 +6031,7 @@ fn exec_from_bytes(
                                        // exec already rejects multithreaded/shared-VM callers, so no sibling
                                        // brk can be in flight here; reset defensively for a clean slate.
             mm.brk_in_progress = false;
+            mm.fork_in_progress = false;
             // R172-16: clear the brk-grow VA reservation on exec too (clean slate).
             mm.brk_grow_resv_lo = 0;
             mm.brk_grow_resv_hi = 0;
@@ -5866,7 +6154,7 @@ fn exec_from_bytes(
         // never updated this, so /proc would report the pre-exec name forever.
         // The name was built fallibly BEFORE the point of no return; this is a
         // pure move (no allocation) under this same already-held Process lock.
-        proc.name = comm_name;
+        proc.commit_prepared_name(comm_name);
 
         (
             old_space,
@@ -5949,25 +6237,14 @@ fn try_clone_bytes(src: &[u8]) -> Result<Vec<u8>, SyscallError> {
 /// the AT_EXECFN bytes. Fully FALLIBLE (try_reserve) and panic-free: any byte that
 /// is not printable ASCII is replaced with '?', so the result is always valid
 /// UTF-8 with no infallible lossy allocation and no char-boundary hazard.
-fn exec_comm_name(execfn: &[u8]) -> Result<alloc::string::String, SyscallError> {
-    use alloc::string::String;
+fn exec_comm_name(execfn: &[u8]) -> crate::process::ProcessNameSnapshot {
     let base = match execfn.iter().rposition(|&b| b == b'/') {
         Some(i) => &execfn[i + 1..],
         None => execfn,
     };
     // Linux comm is 16 bytes including the NUL terminator => 15 usable.
     let cap = core::cmp::min(base.len(), 15);
-    let mut s = String::new();
-    s.try_reserve(cap).map_err(|_| SyscallError::ENOMEM)?;
-    for &b in &base[..cap] {
-        // Reserved `cap` 1-byte chars => push never reallocs (no infallible alloc).
-        s.push(if (0x20..0x7f).contains(&b) {
-            b as char
-        } else {
-            '?'
-        });
-    }
-    Ok(s)
+    crate::process::ProcessNameSnapshot::from_sanitized_ascii(&base[..cap])
 }
 
 /// M0-4: validate NUL-free bytes (from `copy_user_cstring`) as a UTF-8 path and
@@ -6193,6 +6470,15 @@ fn sys_execve(
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
+    // Preserve EFAULT precedence without allocating, then reserve the complete
+    // transaction BEFORE pathname, argv, or envp can allocate. The guard spans
+    // shebang resolution and the post-load stack/commit work.
+    if pathname.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    validate_user_ptr(pathname, 1)?;
+    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
+
     // FRONT-HALF user copy — runs EXACTLY ONCE; after this, kernel buffers only.
     let path_bytes = copy_user_cstring(pathname)?; // NULL ptr => EFAULT
     let orig_path = utf8_path(&path_bytes)?; // non-UTF-8 => EINVAL
@@ -6211,11 +6497,6 @@ fn sys_execve(
     let envp_vec = copy_user_str_array(envp)?;
     // AT_EXECFN = the ORIGINAL pathname, threaded UNCHANGED through any shebang.
     let execfn: Vec<u8> = path_bytes;
-
-    // P2-A: admit the transient peak BEFORE resolve_exec_chain allocates the
-    // MAX_EXEC_IMAGE_SIZE staging buffer(s). Guard lives until this function
-    // returns so concurrent execve/spawn_image cannot stack peaks.
-    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
 
     // Resolve the entire shebang chain to the FINAL ELF bytes BEFORE touching the
     // address space, so a mid-chain error (ENOENT/EACCES/ELOOP/parse) returns to
@@ -6342,19 +6623,16 @@ pub fn run_exec_disambiguation_self_test() {
     assert!(utf8_path(&[0xff, 0xfe]).is_err());
 
     // --- exec_comm_name (basename, <=15 bytes, ASCII-sanitized) ---
-    assert_eq!(
-        exec_comm_name(b"/usr/bin/python3").expect("comm"),
-        "python3"
-    );
-    assert_eq!(exec_comm_name(b"noslash").expect("comm"), "noslash");
+    assert_eq!(exec_comm_name(b"/usr/bin/python3").as_str(), "python3");
+    assert_eq!(exec_comm_name(b"noslash").as_str(), "noslash");
     assert_eq!(
         exec_comm_name(b"/a/abcdefghijklmnopqrstuvwxyz")
-            .expect("comm")
+            .as_str()
             .len(),
         15
     );
     // non-printable / non-ASCII byte => '?' (never a lossy alloc or a panic).
-    assert_eq!(exec_comm_name(&[b'/', 0xff, b'a']).expect("comm"), "?a");
+    assert_eq!(exec_comm_name(&[b'/', 0xff, b'a']).as_str(), "?a");
 
     // --- R172-P6-F5: resolve_exec_chain (the shebang LOOP + ELOOP depth cap, mock-read) ---
     // The loop a green boot cannot exercise; driven by a fixed path->bytes mock (no VFS).
@@ -6490,25 +6768,53 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 // R158-4 Phase 2: children_incomplete is set — do PROCESS_TABLE fallback scan.
                 drop(proc);
                 let mut found = Vec::new();
-                {
-                    let table = crate::process::PROCESS_TABLE.lock();
-                    for (idx, slot) in table.iter().enumerate() {
-                        if let Some(proc_arc) = slot {
-                            let p = proc_arc.lock();
-                            if p.ppid == pid && idx != pid {
-                                if found.try_reserve(1).is_ok() {
-                                    found.push(idx);
-                                }
+                // R180-14 FIX: track whether a matching child was seen but skipped
+                // because try_reserve failed. Clearing children_incomplete on an
+                // empty `found` when that happens permanently loses the recovery
+                // path (ECHILD despite live orphans → unreapable zombies / PID pin).
+                let mut reserve_failed = false;
+                // RF180-9 FIX: keep the table locked from the orphan scan through
+                // any `children_incomplete` clear. Reparenting publishes children
+                // under this same lock, so dropping it after the empty proof let a
+                // child arrive before the flag clear and permanently lose the
+                // fallback-scan marker. No PCB is held on entry; the clear below
+                // follows the canonical PROCESS_TABLE -> parent PCB order.
+                let table = crate::process::PROCESS_TABLE.lock();
+                for (idx, slot) in table.iter().enumerate() {
+                    if let Some(proc_arc) = slot {
+                        let p = proc_arc.lock();
+                        if p.ppid == pid && idx != pid {
+                            if found.try_reserve(1).is_ok() {
+                                found.push(idx);
+                            } else {
+                                reserve_failed = true;
+                                // Keep scanning so we know whether any match
+                                // exists even if we cannot snapshot it.
                             }
                         }
                     }
                 }
                 if found.is_empty() {
-                    // No orphan children found — clear stale flag and return ECHILD.
+                    if reserve_failed {
+                        // Live children may exist; surface ENOMEM and leave the
+                        // incomplete flag set so a later wait rescans.
+                        return Err(SyscallError::ENOMEM);
+                    }
+                    // Complete allocation-free scan proved no orphans. The table
+                    // remains held until this clear commits, closing the lost-clear
+                    // race with concurrent reparenting.
                     let mut proc = parent.lock();
                     proc.children_incomplete = false;
                     return Err(SyscallError::ECHILD);
                 }
+                // R180-14 (iteration-2): any reserve failure means the snapshot is
+                // incomplete. Do NOT publish Blocked on a partial list — that can
+                // strand the waiter if the only zombies were among the skipped
+                // matches. Fail closed with ENOMEM; flag stays set for rescan.
+                if reserve_failed {
+                    return Err(SyscallError::ENOMEM);
+                }
+                drop(table);
                 // Re-acquire and set wait state.
                 let mut proc = parent.lock();
                 // R172-11 FIX: re-check kill/signal UNDER the held parent lock (the lock the
@@ -6551,7 +6857,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         let mut zombie_child: Option<(
             ProcessId,
             i32,
-            Vec<crate::pid_namespace::PidNamespaceMembership>,
+            mm::AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
         )> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
@@ -6570,11 +6876,12 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                             .switch_reap_pending
                             .load(core::sync::atomic::Ordering::Acquire)
                     {
-                        zombie_child = Some((
-                            *child_pid,
-                            child.exit_code.unwrap_or(0),
-                            child.pid_ns_chain.clone(), // Capture ns chain before cleanup
-                        ));
+                        let chain = mm::AdmittedVec::try_copy_from_slice(
+                            mm::HeapClass::CoreProcess,
+                            &child.pid_ns_chain,
+                        )
+                        .map_err(|_| SyscallError::ENOMEM)?;
+                        zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), chain));
                         break;
                     }
                 }
@@ -7989,7 +8296,7 @@ pub fn try_deliver_signal_on_irq_return(
 /// Unlike clone(), unshare() affects only the namespace for children, not the
 /// caller's own namespace membership (for PID namespace).
 fn sys_unshare(flags: u64) -> SyscallResult {
-    // F.1: Currently CLONE_NEWPID and CLONE_NEWNS are supported
+    // F.1: Currently CLONE_NEWPID and CLONE_NEWNS are supported.
     let supported = CLONE_NEWPID | CLONE_NEWNS;
     let unsupported = flags & !supported;
 
@@ -8024,86 +8331,36 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         }
     }
 
-    // R156-2 FIX: CLONE_NEWPID in unshare requires CAP_ADMIN or root,
-    // matching clone() and the gates on CLONE_NEWNS/NEWIPC/NEWNET.
-    if flags & CLONE_NEWPID != 0 {
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        let is_root = crate::current_is_host_root();
-        if !is_root && !has_cap_admin {
-            kprintln!("[sys_unshare] CLONE_NEWPID denied: requires CAP_SYS_ADMIN or root");
-            return Err(SyscallError::EPERM);
-        }
+    // R180-22 PREPARE: both supported namespace types have the same host-admin
+    // gate.  Authorize the full requested flag set before constructing either
+    // namespace so a mixed request cannot commit one leg and fail the other.
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let is_root = crate::current_is_host_root();
+    if !is_root && !has_cap_admin {
+        kprintln!("[sys_unshare] permission denied: requires CAP_SYS_ADMIN or host root");
+        return Err(SyscallError::EPERM);
     }
 
-    if flags & CLONE_NEWPID != 0 {
-        // Create a new child PID namespace
-        let current_ns_for_children = {
-            let proc = proc_arc.lock();
-            proc.pid_ns_for_children.clone()
-        };
+    // Snapshot every source under one PCB lock.  These Arcs pin the exact
+    // parents used by the prepare phase until the atomic publication below.
+    let (tgid, current_pid_children_ns, current_mount_ns) = {
+        let proc = proc_arc.lock();
+        (
+            proc.tgid,
+            proc.pid_ns_for_children.clone(),
+            proc.mount_ns.clone(),
+        )
+    };
+    let publication_sources = crate::pid_namespace::PidPublicationSources::from_leaf(Arc::clone(
+        &current_pid_children_ns,
+    ))
+    .ok_or(SyscallError::EAGAIN)?;
 
-        let new_ns = crate::pid_namespace::PidNamespace::new_child(current_ns_for_children)
-            .map_err(|e| {
-                klog!(
-                    Error,
-                    "[sys_unshare] Failed to create PID namespace: {:?}",
-                    e
-                );
-                match e {
-                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
-                        SyscallError::EAGAIN
-                    }
-                    // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
-                    crate::pid_namespace::PidNamespaceError::MaxNamespaces => SyscallError::EAGAIN,
-                    _ => SyscallError::ENOMEM,
-                }
-            })?;
-
-        // Update the process's pid_ns_for_children
-        {
-            let mut proc = proc_arc.lock();
-            proc.pid_ns_for_children = new_ns.clone();
-        }
-
-        klog!(
-            Info,
-            "[sys_unshare] Process {} unshared PID namespace, children will use ns_id={}, level={}",
-            pid,
-            new_ns.id().raw(),
-            new_ns.level()
-        );
-    }
-
-    // F.1: Handle CLONE_NEWNS - unshare mount namespace
-    //
-    // Unlike PID namespace, mount namespace unshare immediately affects the
-    // current process's view of the filesystem. The process moves to a new
-    // mount namespace with a copy of the parent's mount table.
+    // R74-3: validate the NEWNS thread-group contract before allocating either
+    // requested namespace.  A mixed NEWPID|NEWNS failure is therefore a pure
+    // prepare failure with no visible state change.
     if flags & CLONE_NEWNS != 0 {
-        // F.1 Security: require CAP_SYS_ADMIN or root
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
-        // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
-        let is_root = crate::current_is_host_root();
-        if !is_root && !has_cap_admin {
-            kprintln!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
-            return Err(SyscallError::EPERM);
-        }
-
-        // R74-3 FIX: Prevent mount namespace divergence in multi-threaded processes.
-        //
-        // CLONE_NEWNS can only be used by single-threaded processes. If multiple
-        // threads share the same tgid, allowing one thread to unshare its mount
-        // namespace would cause thread-local divergence, violating the assumption
-        // that all threads in a thread group share the same mount namespace.
-        //
-        // This matches Linux behavior (EINVAL if CLONE_NEWNS with CLONE_THREAD).
-        let tgid = {
-            let proc = proc_arc.lock();
-            proc.tgid
-        };
         let thread_count = crate::thread_group_size(tgid);
         if thread_count > 1 {
             kprintln!(
@@ -8112,46 +8369,154 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             );
             return Err(SyscallError::EINVAL);
         }
+    }
 
-        let current_ns = {
-            let proc = proc_arc.lock();
-            proc.mount_ns.clone()
-        };
+    let prepared_pid_ns = if flags & CLONE_NEWPID != 0 {
+        Some(
+            crate::pid_namespace::PidNamespace::new_child(current_pid_children_ns.clone())
+                .map_err(|e| {
+                    klog!(
+                        Error,
+                        "[sys_unshare] Failed to prepare PID namespace: {:?}",
+                        e
+                    );
+                    match e {
+                        crate::pid_namespace::PidNamespaceError::MaxDepthExceeded
+                        | crate::pid_namespace::PidNamespaceError::MaxNamespaces
+                        | crate::pid_namespace::PidNamespaceError::NamespaceShuttingDown
+                        | crate::pid_namespace::PidNamespaceError::NamespaceIdOverflow => {
+                            SyscallError::EAGAIN
+                        }
+                        _ => SyscallError::ENOMEM,
+                    }
+                })?,
+        )
+    } else {
+        None
+    };
 
-        let new_ns = crate::mount_namespace::clone_namespace(current_ns.clone()).map_err(|e| {
-            klog!(
-                Error,
-                "[sys_unshare] Failed to create mount namespace: {:?}",
-                e
-            );
-            match e {
-                crate::mount_namespace::MountNsError::MaxDepthExceeded => SyscallError::EAGAIN,
-                _ => SyscallError::ENOMEM,
-            }
-        })?;
+    let (prepared_mount_ns, mut prepared_mount_table_guard) = if flags & CLONE_NEWNS != 0 {
+        let new_ns =
+            crate::mount_namespace::clone_namespace(current_mount_ns.clone()).map_err(|e| {
+                klog!(
+                    Error,
+                    "[sys_unshare] Failed to prepare mount namespace: {:?}",
+                    e
+                );
+                match e {
+                    crate::mount_namespace::MountNsError::MaxDepthExceeded
+                    | crate::mount_namespace::MountNsError::MaxCountExceeded
+                    | crate::mount_namespace::MountNsError::NamespaceShuttingDown => {
+                        SyscallError::EAGAIN
+                    }
+                    _ => SyscallError::ENOMEM,
+                }
+            })?;
 
-        // R74-2 FIX: Eagerly materialize mount namespace tables at unshare time.
-        //
-        // Same security fix as sys_clone: snapshot the parent's mount table NOW
-        // to prevent post-unshare parent mounts from leaking into the child.
-        materialize_namespace(&current_ns).map_err(|_| SyscallError::ENOMEM)?;
+        // R74-2: materialization is part of PREPARE.  If either snapshot fails,
+        // both local namespace Arcs are dropped and the process remains unchanged.
+        materialize_namespace(&current_mount_ns).map_err(|_| SyscallError::ENOMEM)?;
         materialize_namespace(&new_ns).map_err(|_| SyscallError::ENOMEM)?;
+        let guard = PreparedMountTableGuard {
+            ns: Arc::clone(&new_ns),
+            armed: true,
+        };
+        (Some(new_ns), Some(guard))
+    } else {
+        (None, None)
+    };
 
-        // Update process's mount namespace (immediately takes effect)
-        {
-            let mut proc = proc_arc.lock();
+    // RF180-16 COMMIT: PID lifecycle source -> PCB is the canonical lock order.
+    // Process publication takes the same source lock(s) before PROCESS_TABLE and
+    // the parent PCB; taking the PCB first here would deadlock against a sibling
+    // creator publishing under this process. Revalidate both prepared sources
+    // only after acquiring the PCB so a concurrent unshare cannot commit stale
+    // snapshots. No allocation/materialization remains after the first assignment.
+    let publish = || -> Result<(), SyscallError> {
+        // RF180-15 FIX: namespace sources -> PROCESS_TABLE -> PCB. The held
+        // table makes same-tgid recount and namespace publication indivisible
+        // with CLONE_THREAD identity publication.
+        let table = crate::process::PROCESS_TABLE.lock();
+        let live_slot = table
+            .get(pid)
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &proc_arc));
+        if !live_slot {
+            return Err(SyscallError::ESRCH);
+        }
+        if flags & CLONE_NEWNS != 0 {
+            let mut thread_count = 0usize;
+            for entry in table.iter().flatten() {
+                if entry.lock().tgid == tgid {
+                    thread_count = thread_count.saturating_add(1);
+                    if thread_count > 1 {
+                        return Err(SyscallError::EINVAL);
+                    }
+                }
+            }
+            if thread_count != 1 {
+                return Err(SyscallError::ESRCH);
+            }
+        }
+        let mut proc = proc_arc.lock();
+        let pid_source_changed = prepared_pid_ns.is_some()
+            && !Arc::ptr_eq(&proc.pid_ns_for_children, &current_pid_children_ns);
+        let mount_source_changed =
+            prepared_mount_ns.is_some() && !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns);
+        if proc.tgid != tgid || pid_source_changed || mount_source_changed {
+            return Err(SyscallError::EAGAIN);
+        }
+        if let Some(ref new_ns) = prepared_pid_ns {
+            proc.pid_ns_for_children = new_ns.clone();
+        }
+        if let Some(ref new_ns) = prepared_mount_ns {
             proc.mount_ns = new_ns.clone();
             proc.mount_ns_for_children = new_ns.clone();
         }
+        Ok(())
+    };
 
+    publication_sources
+        .with_live_publication(publish)
+        .map_err(|_| SyscallError::EAGAIN)??;
+
+    if let Some(guard) = prepared_mount_table_guard.as_mut() {
+        guard.commit();
+    }
+
+    // Logging/audit are best-effort observations after an infallible commit;
+    // they never change the syscall result or roll back one namespace leg.
+    if let Some(new_ns) = prepared_pid_ns {
+        klog!(
+            Info,
+            "[sys_unshare] Process {} unshared PID namespace, children will use ns_id={}, level={}",
+            pid,
+            new_ns.id().raw(),
+            new_ns.level()
+        );
+        let parent_id = new_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_ns.id().raw(),
+                ns_type: CLONE_NEWPID as u32,
+                parent_id,
+            },
+            &[272, flags, CLONE_NEWPID],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
+    }
+
+    if let Some(new_ns) = prepared_mount_ns {
         klog!(Info,
             "[sys_unshare] Process {} unshared mount namespace, now using ns_id={}, level={} (eagerly materialized)",
             pid,
             new_ns.id().raw(),
             new_ns.level()
         );
-
-        // F.1 Audit: Emit namespace unshare event
         let parent_id = new_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
         let _ = audit::emit(
             AuditKind::Process,
@@ -8162,7 +8527,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
                 ns_type: CLONE_NEWNS as u32,
                 parent_id,
             },
-            &[272, flags, CLONE_NEWNS], // syscall 272 = unshare, flags, CLONE_NEWNS
+            &[272, flags, CLONE_NEWNS],
             0,
             crate::time::current_timestamp_ms(),
         );
@@ -8775,8 +9140,21 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
         match proc_lookup {
             Some(process_arc) => {
                 let mut proc = process_arc.lock();
-                proc.set_fd_cloexec(read_fd, true);
-                proc.set_fd_cloexec(write_fd, true);
+                let marked = proc
+                    .set_fd_cloexec(read_fd, true)
+                    .and_then(|()| proc.set_fd_cloexec(write_fd, true));
+                if marked.is_err() {
+                    drop(proc);
+                    let close_fn = {
+                        let callback = FD_CLOSE_CALLBACK.lock();
+                        callback.as_ref().copied()
+                    };
+                    if let Some(close) = close_fn {
+                        let _ = close(read_fd);
+                        let _ = close(write_fd);
+                    }
+                    return Err(SyscallError::ENOMEM);
+                }
             }
             None => {
                 // No current process (unreachable for a live syscall, but do
@@ -8870,43 +9248,29 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // Get the source fd
             let source_desc = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-            // Clone the file descriptor
-            let cloned_desc = source_desc.clone_box();
-
-            // Find lowest available fd >= min_fd, bounded by the same MAX_FD
-            // gate sys_dup2/sys_dup3 enforce (the old scan ran to 1024, allowing
-            // fcntl to mint fds past the table cap every other path rejects).
-            let mut new_fd = min_fd;
-            while proc.fd_table.contains_key(&new_fd) {
-                new_fd += 1;
-                if new_fd >= crate::process::MAX_FD {
+            let cloned_desc = source_desc
+                .try_clone_box()
+                .map_err(|_| SyscallError::ENOMEM)?;
+            // One Process transaction chooses the lowest non-published and
+            // non-reserved fd >= min_fd, admits both retained containers,
+            // charges files.max, and publishes CLOEXEC atomically.
+            let new_fd = match proc.allocate_fd_from_with_cloexec(
+                cloned_desc,
+                min_fd,
+                cmd == F_DUPFD_CLOEXEC,
+            ) {
+                Ok(fd) => fd,
+                Err(rejected) => {
+                    drop(proc);
+                    drop(rejected);
                     return Err(SyscallError::EMFILE);
                 }
-            }
-
-            // Try to charge for the new fd
-            let cgroup_id = proc.cgroup_id;
-            drop(proc);
-
-            // J.2 item 7: charge one fd to the cgroup
-            crate::cgroup::try_charge_fds(cgroup_id, 1).map_err(|_| SyscallError::EMFILE)?;
-
-            // Insert the new fd. fd_table is per-PCB (never shared, even under
-            // CLONE_FILES it is deep-copied), so new_fd cannot have been taken
-            // while the lock was dropped for the cgroup charge.
-            let mut proc = process_arc.lock();
-            proc.fd_table.insert(new_fd, cloned_desc);
-            proc.fds_charged_count = proc.fds_charged_count.saturating_add(1);
+            };
             // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
-            // copy. Re-acquired lock is fine: a CLONE_THREAD sibling revoking
-            // the cap in the charge window makes this a no-op and the dup a
-            // documented dead handle (see sys_dup).
+            // copy only after publication succeeds.
             if let Some(cid) = proc.get_fd(new_fd).and_then(|d| d.cap_id()) {
                 let _ = proc.cap_table.increment_refcount(cid);
             }
-            // POSIX: F_DUPFD's copy does NOT inherit close-on-exec;
-            // F_DUPFD_CLOEXEC's copy has it set atomically.
-            proc.set_fd_cloexec(new_fd, cmd == F_DUPFD_CLOEXEC);
 
             Ok(new_fd as usize)
         }
@@ -8947,7 +9311,8 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // INV: cloexec_fds ⊆ fd_table keys, relied on by exec's drain).
             proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-            proc.set_fd_cloexec(fd, flags & FD_CLOEXEC != 0);
+            proc.set_fd_cloexec(fd, flags & FD_CLOEXEC != 0)
+                .map_err(|_| SyscallError::ENOMEM)?;
 
             Ok(0)
         }
@@ -9028,11 +9393,8 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResul
     // Get the VFS pread callback
     let pread_fn = VFS_PREAD_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
 
-    // Allocate kernel buffer (fallible to avoid OOM panic)
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
+    // R180-10 FIX: admission lives through positioned I/O and copyout.
+    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
 
     // Call VFS positioned read (does not mutate fd offset)
     let bytes_read = pread_fn(fd, &mut tmp, offset as u64)?;
@@ -9079,11 +9441,8 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallRe
     // Get the VFS pwrite callback
     let pwrite_fn = VFS_PWRITE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
 
-    // Copy from user space to kernel buffer (fallible allocation)
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
+    // R180-10 FIX: admission lives through copyin and the positioned write.
+    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
     copy_from_user(&mut tmp, buf)?;
 
     // Call VFS positioned write (does not mutate fd offset)
@@ -9118,16 +9477,14 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     if fd == 0 {
         // R158-I8 FIX: removed unconditional debug kprintln (log spam + info disclosure).
 
-        // R156-3 FIX: Fallible allocation — infallible vec! panics on OOM.
-        let mut tmp = Vec::new();
-        tmp.try_reserve_exact(count)
-            .map_err(|_| SyscallError::ENOMEM)?;
-        tmp.resize(count, 0);
+        // R180-10 FIX: the reservation remains live across the indefinite
+        // keyboard wait and transactional copyout.
+        let mut tmp = try_admitted_zeroed_io_buffer(count)?;
         loop {
             // 先尝试读取
-            let bytes_read = drivers::keyboard_read(&mut tmp);
+            let bytes_read =
+                drivers::keyboard_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?;
             if bytes_read > 0 {
-                copy_to_user(buf, &tmp[..bytes_read])?;
                 return Ok(bytes_read);
             }
 
@@ -9137,12 +9494,22 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
                 return Ok(0);
             }
 
+            // R180-L1: every exit from the post-enqueue second check must
+            // dequeue and restore Blocked->Ready, including a copyout EFAULT.
+            // The successful sleep/wake path is also safe: cancellation is
+            // idempotent after the waker already popped this PID.
+            struct StdinPreparedWaitGuard;
+            impl Drop for StdinPreparedWaitGuard {
+                fn drop(&mut self) {
+                    stdin_cancel_wait();
+                }
+            }
+            let _wait_guard = StdinPreparedWaitGuard;
+
             // 二次检查：入队后可能有新数据到达
-            let bytes_read = drivers::keyboard_read(&mut tmp);
+            let bytes_read =
+                drivers::keyboard_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?;
             if bytes_read > 0 {
-                // R158-8 FIX: cancel wait (dequeue + Blocked→Ready) before return.
-                stdin_cancel_wait();
-                copy_to_user(buf, &tmp[..bytes_read])?;
                 return Ok(bytes_read);
             }
 
@@ -9167,19 +9534,16 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::EBADF)?
     };
 
-    // R156-3 FIX: Fallible allocation for read buffer.
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
-    let bytes_read = read_fn(fd, &mut tmp)?;
+    // R180-10 FIX: ordinary files, pipes, and sockets retain this buffer across
+    // their callback lifetime, which may block.
+    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
+    let bytes_read = read_fn(fd, &mut tmp, buf, copy_to_user)?;
 
     // Z-4 安全修复：将回调返回值 clamp 到请求的大小
     // 防止恶意/错误回调返回超大值导致切片越界 panic
     let bytes_read = bytes_read.min(count);
 
-    // 复制到用户空间
-    copy_to_user(buf, &tmp[..bytes_read])?;
+    // The callback copied out before committing its source transaction.
     Ok(bytes_read)
 }
 
@@ -9205,11 +9569,9 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // 预先验证用户缓冲区，避免在分配后发现指针无效
     validate_user_ptr(buf, count)?;
 
-    // R156-3 FIX: Fallible allocation for write buffer.
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
+    // R180-10 FIX: keep aggregate admission through copyin and any blocking
+    // pipe/socket write callback.
+    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
     copy_from_user(&mut tmp, buf)?;
 
     // stdout(1)/stderr(2): 直接打印
@@ -9295,11 +9657,11 @@ const IOV_MAX: usize = 1024;
 fn copy_iovec_array_from_user(
     iov: *const Iovec,
     iovcnt: usize,
-) -> Result<Vec<Iovec>, SyscallError> {
+) -> Result<AdmittedVec<Iovec>, SyscallError> {
     use crate::usercopy::copy_from_user_safe;
 
     if iovcnt == 0 {
-        return Ok(Vec::new());
+        return try_admitted_vec(mm::HeapClass::BlockingIo, 0);
     }
     if iovcnt > IOV_MAX {
         return Err(SyscallError::EINVAL);
@@ -9313,10 +9675,9 @@ fn copy_iovec_array_from_user(
         .ok_or(SyscallError::EFAULT)?;
     validate_user_ptr(iov as *const u8, iov_size)?;
 
-    let mut iov_array: Vec<Iovec> = Vec::new();
-    iov_array
-        .try_reserve_exact(iovcnt)
-        .map_err(|_| SyscallError::ENOMEM)?;
+    // R180-10 FIX: readv/writev keep this descriptor array alive across the
+    // underlying operation, which may block. Return its reservation with it.
+    let mut iov_array = try_admitted_vec::<Iovec>(mm::HeapClass::BlockingIo, iovcnt)?;
     for i in 0..iovcnt {
         let entry_offset = i
             .checked_mul(mem::size_of::<Iovec>())
@@ -9471,6 +9832,62 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
     sys_open_internal(&path_str, flags, mode)
 }
 
+/// R180-23/RF180-37: RAII ownership of one FD number plus its hierarchical
+/// files.max charge while open/socket/accept performs work before publication.
+/// Every failed preflight or side effect pays the reservation back exactly.
+#[must_use = "dropping an uncommitted FD reservation cancels its files.max admission"]
+struct FdPublicationReservation {
+    process: crate::process::ProcessArc,
+    fd: i32,
+    active: bool,
+}
+
+impl FdPublicationReservation {
+    fn try_new(process: crate::process::ProcessArc, cloexec: bool) -> Result<Self, SyscallError> {
+        let fd = process
+            .lock()
+            .reserve_fd_with_cloexec(cloexec)
+            .ok_or(SyscallError::EMFILE)?;
+        Ok(Self {
+            process,
+            fd,
+            active: true,
+        })
+    }
+
+    fn install(
+        mut self,
+        desc: crate::process::FileDescriptor,
+    ) -> Result<i32, crate::process::FileDescriptor> {
+        let result = {
+            let mut process = self.process.lock();
+            process.install_reserved_fd(self.fd, desc)
+        };
+
+        match result {
+            Ok(()) => {
+                self.active = false;
+                Ok(self.fd)
+            }
+            Err(desc) => Err(desc),
+        }
+    }
+}
+
+impl Drop for FdPublicationReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let cancelled = self.process.lock().cancel_fd_reservation(self.fd);
+            if !cancelled {
+                klog!(
+                    Error,
+                    "R180-23/RF180-37: stale or corrupt FD publication reservation rollback"
+                );
+            }
+        }
+    }
+}
+
 /// R96-5 FIX: Internal helper for sys_open that works on already-copied path.
 ///
 /// This eliminates TOCTOU window in sys_openat where the path could be modified
@@ -9495,32 +9912,18 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
+    // Reserve both the numeric slot and files.max credit BEFORE VFS may create
+    // or truncate an inode. The guard rolls back on every `?` below.
+    let fd_reservation = FdPublicationReservation::try_new(process, open_flags & 0x80000 != 0)?;
+
     // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
     let file_ops = open_fn(&path_str, flags as u32, mode)?;
 
     // R39-4 FIX: O_CLOEXEC 常量定义
-    const O_CLOEXEC: u32 = 0x80000;
-
-    // 分配文件描述符并存入 fd_table
-    let fd = {
-        let mut proc = process.lock();
-        // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
-        // object on the EMFILE arm (byte-equivalent to the old
-        // allocate_fd-internal drop); conversion to drop-outside tracked.
-        let fd = proc.allocate_fd(file_ops).map_err(|rejected| {
-            drop(rejected);
-            SyscallError::EMFILE
-        })?;
-
-        // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
-        //
-        // 这样 exec 时会自动关闭此 fd，防止敏感句柄泄漏到子进程
-        if open_flags & O_CLOEXEC != 0 {
-            proc.set_fd_cloexec(fd, true);
-        }
-
-        fd
-    };
+    let fd = fd_reservation.install(file_ops).map_err(|rejected| {
+        drop(rejected);
+        SyscallError::EMFILE
+    })?;
 
     Ok(fd as usize)
 }
@@ -9682,7 +10085,10 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         // Same clone_box() pattern as R130-2 sys_lseek fix.
         let fd_obj = {
             let proc = process.lock();
-            proc.get_fd(fd).ok_or(SyscallError::EBADF)?.clone_box()
+            proc.get_fd(fd)
+                .ok_or(SyscallError::EBADF)?
+                .try_clone_box()
+                .map_err(|_| SyscallError::ENOMEM)?
         };
         // Process lock released here — safe for VFS/procfs operations
         fd_obj.stat()?
@@ -9728,7 +10134,10 @@ fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     // Follows the same pattern as vfs_readdir_callback and vfs_truncate_callback.
     let file_ops = {
         let proc = process.lock();
-        proc.get_fd(fd).ok_or(SyscallError::EBADF)?.clone_box()
+        proc.get_fd(fd)
+            .ok_or(SyscallError::EBADF)?
+            .try_clone_box()
+            .map_err(|_| SyscallError::ENOMEM)?
     };
     // Process lock released here — safe for VFS operations
 
@@ -10315,6 +10724,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // must not exceed the window base. Refusal contract: return the break UNCHANGED
         // (Linux brk-on-failure semantics), matching the USER_SPACE_TOP arm above.
         if page_align_up(addr) > crate::elf_loader::user_stack_window().0 {
+            return Ok(mm.brk);
+        }
+        // A fork owns the shared metadata→PTE snapshot transaction. Linux
+        // brk() reports the unchanged break on this retryable exclusion.
+        if mm.fork_in_progress {
             return Ok(mm.brk);
         }
         // A sibling brk() on this shared MmState is mid-flight. Linux brk()
@@ -10991,7 +11405,7 @@ pub fn try_demand_grow_user_stack(
     if fault_page_base < crate::elf_loader::stack_grow_floor(rlim_cur) {
         return Err(SyscallError::ENOMEM);
     }
-    if mm.stack_grow_in_progress {
+    if mm.fork_in_progress || mm.stack_grow_in_progress {
         return Err(SyscallError::EAGAIN);
     }
     mm.stack_grow_in_progress = true;
@@ -11249,7 +11663,7 @@ fn ensure_stack_backed(
 }
 
 pub fn try_grow_user_stack(
-    process: &Arc<spin::Mutex<crate::process::Process>>,
+    process: &crate::process::ProcessArc,
     new_floor: usize,
 ) -> Result<(), SyscallError> {
     use mm::page_table::with_current_manager;
@@ -11295,7 +11709,7 @@ pub fn try_grow_user_stack(
         // brk does not block a stack grow and vice-versa: they touch disjoint VA ranges
         // and DISJOINT charge lanes (brk_pending_growth vs stack_grow_pending_bytes), so
         // a single shared MmState can have at most one of each in flight without aliasing.
-        if mm.stack_grow_in_progress {
+        if mm.fork_in_progress || mm.stack_grow_in_progress {
             return Err(SyscallError::EAGAIN);
         }
         mm.stack_grow_in_progress = true;
@@ -11870,6 +12284,10 @@ fn sys_mmap(
         let mm_arc = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
+        if mm.fork_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+
         // 选择起始虚拟地址（使用 checked_add 防止溢出）
         // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
         let base = if addr == 0 {
@@ -12392,6 +12810,10 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         let mm_arc = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
+        if mm.fork_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+
         // 检查该区域是否在 mmap 记录中
         let recorded_len_with_flags = *mm.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
 
@@ -12686,7 +13108,7 @@ pub fn run_cow_mprotect_self_test() {
 /// 成功返回 0，失败返回错误码
 fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     use mm::page_table::with_current_manager;
-    use x86_64::structures::paging::Page;
+    use x86_64::structures::paging::{Page, PageTableFlags};
     use x86_64::VirtAddr;
 
     // 验证地址页对齐
@@ -12757,6 +13179,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         let mm_arc = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
+        if mm.fork_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+
         // R161-10 FIX: Split regions that partially overlap [addr, end) at the
         // boundary points. This ensures the classification loop below only sees
         // entries fully contained within the mprotect range, so Path A/B process
@@ -12766,6 +13192,41 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         if mm.mmap_regions.len() + 2 >= MAX_MAP_COUNT {
             return Err(SyscallError::ENOMEM);
         }
+
+        // RF180-5 FIX: classification metadata is fallible, so reserve it before
+        // the first boundary insertion. Count every VMA keyed in [addr, end) plus
+        // a preceding VMA whose tail overlaps `addr`; two extra slots cover the
+        // maximum boundary-split headroom. Either vector may receive every entry,
+        // so each gets the full upper bound.
+        let preceding = mm
+            .mmap_regions
+            .range(..addr)
+            .next_back()
+            .map(|(&base, &lf)| (base, lf));
+        let preceding_overlaps = preceding
+            .as_ref()
+            .map(|(base, lf)| {
+                let region_len = mmap_region_len(*lf);
+                region_len > 0 && (*base).saturating_add(region_len) > addr
+            })
+            .unwrap_or(false);
+        let overlapping_region_count = mm
+            .mmap_regions
+            .range(addr..end)
+            .count()
+            .checked_add(usize::from(preceding_overlaps))
+            .ok_or(SyscallError::ENOMEM)?;
+        let classification_capacity = overlapping_region_count
+            .checked_add(2)
+            .ok_or(SyscallError::ENOMEM)?;
+        let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
+        let mut real_regions: Vec<(usize, usize)> = Vec::new();
+        prot_none_regions
+            .try_reserve(classification_capacity)
+            .map_err(|_| SyscallError::ENOMEM)?;
+        real_regions
+            .try_reserve(classification_capacity)
+            .map_err(|_| SyscallError::ENOMEM)?;
 
         // next-phase #11: the two split blocks below add at most two new boundary
         // keys (`addr`, `end`) — every other insert is an in-place replace of an
@@ -12777,17 +13238,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             .map_err(|_| SyscallError::ENOMEM)?;
 
         // Split preceding region whose tail extends into [addr, end).
-        // next-phase #11: copy the boundary entry out of the range iterator into
-        // an owned Option FIRST so the immutable `range(..)` borrow of
-        // `mmap_regions` is released before the `try_insert` mutations below.
-        // (`BTreeMap::range` had no drop glue and the borrow ended early; the
-        // `FallibleOrderedMap` range iterator must be dropped explicitly via this
-        // `let` boundary, else it conflicts with the mutable borrow in the body.)
-        let preceding = mm
-            .mmap_regions
-            .range(..addr)
-            .next_back()
-            .map(|(&base, &lf)| (base, lf));
+        // next-phase #11: `preceding` was copied into an owned Option above, so
+        // the immutable range borrow ended before the mutations below.
         if let Some((prev_base, prev_lf)) = preceding {
             let prev_len = mmap_region_len(prev_lf);
             let prev_end = prev_base.saturating_add(prev_len);
@@ -12842,15 +13294,6 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     .try_insert(end, MmapEntry::from_len_flags(right_len, last_flags))
                     .map_err(|_| SyscallError::ENOMEM)?;
             }
-        }
-
-        let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
-        let mut real_regions: Vec<(usize, usize)> = Vec::new();
-        let region_count = mm.mmap_regions.range(addr..end).count();
-        if prot_none_regions.try_reserve(region_count).is_err()
-            || real_regions.try_reserve(region_count).is_err()
-        {
-            return Err(SyscallError::ENOMEM);
         }
 
         // R158-17 FIX: Track coverage to detect unmapped gaps in [addr, end).
@@ -12940,6 +13383,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     return Err(SyscallError::ENOMEM);
                 }
                 let mut mm = mm_arc.lock();
+                if mm.fork_in_progress {
+                    drop(mm);
+                    drop(proc);
+                    cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                    return Err(SyscallError::EAGAIN);
+                }
                 // R162-3 FIX: Accumulate instead of overwrite to prevent concurrent
                 // mprotect operations from clobbering each other's pending charge.
                 mm.mprotect_pending_bytes =
@@ -13292,6 +13741,9 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             // racing op may have demoted / removed / split it in between).
             let claimed = {
                 let mut mm = mm_arc.lock();
+                if mm.fork_in_progress {
+                    return Err(SyscallError::EAGAIN);
+                }
                 match mm.mmap_regions.get_mut(&region_base) {
                     Some(entry) => {
                         if entry.is_prot_none() {
@@ -13434,29 +13886,84 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         }
     }
 
-    // 更新页表项 (Path C: normal PTE flag update for all pages in range)
+    // R180-19: Path C used to change PTEs first and only later rewrite VMA
+    // protection metadata. A CLONE_VM sibling could fork in that gap and clone
+    // new PTEs with old metadata. Claim every covered VMA before PT_LOCK and
+    // retain the claim through the metadata commit.
+    struct MprotectPteReservation {
+        mm: Arc<spin::Mutex<crate::process::MmState>>,
+        start: usize,
+        end: usize,
+        armed: bool,
+    }
+    impl Drop for MprotectPteReservation {
+        fn drop(&mut self) {
+            if self.armed {
+                let mut mm = self.mm.lock();
+                for (_, entry) in mm.mmap_regions.range_mut(self.start..self.end) {
+                    if entry.is_pending_mprotect() {
+                        entry.clear_pending_mprotect();
+                    }
+                }
+            }
+        }
+    }
+
+    // Reserve rollback storage before claiming metadata or touching a PTE.
+    let page_count = len_aligned / 0x1000;
+    let mut previous_pte_flags: Vec<(Page, PageTableFlags)> = Vec::new();
+    previous_pte_flags
+        .try_reserve_exact(page_count)
+        .map_err(|_| SyscallError::ENOMEM)?;
+
+    let mut pte_reservation = {
+        let mut mm = mm_arc.lock();
+        if mm.fork_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+        let mut coverage = addr;
+        for (&region_base, entry) in mm.mmap_regions.range(addr..end) {
+            if entry.has_transient() {
+                return Err(SyscallError::EBUSY);
+            }
+            if region_base > coverage {
+                return Err(SyscallError::ENOMEM);
+            }
+            coverage = coverage.max(region_base.saturating_add(entry.len()));
+        }
+        if coverage < end {
+            return Err(SyscallError::ENOMEM);
+        }
+        for (_, entry) in mm.mmap_regions.range_mut(addr..end) {
+            entry.set_pending_mprotect();
+        }
+        MprotectPteReservation {
+            mm: Arc::clone(&mm_arc),
+            start: addr,
+            end,
+            armed: true,
+        }
+    };
+
     let result: Result<(), SyscallError> = unsafe {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
             for offset in (0..len_aligned).step_by(0x1000) {
-                let page_addr = addr + offset;
-                let vaddr = VirtAddr::new(page_addr as u64);
+                let vaddr = VirtAddr::new((addr + offset) as u64);
                 let page = Page::containing_address(vaddr);
-
-                // R127-1 / RF178-31: preserve sharing while separately tracking
-                // whether the requested protection grants write entitlement.
-                let mut new_flags = flags;
-                if let Some((_phys, current_flags)) = manager.translate_with_flags(vaddr) {
-                    new_flags = reconcile_cow_mprotect_flags(current_flags, new_flags);
-                }
-
-                // 尝试更新页的保护属性
-                // 如果页不存在，跳过（mprotect 只修改已存在的映射）
-                if let Err(e) = manager.update_flags(page, new_flags) {
-                    // 忽略页不存在的错误，这是正常的
-                    // 其他错误则返回
-                    if !matches!(e, mm::page_table::UpdateFlagsError::PageNotMapped) {
-                        return Err(SyscallError::EFAULT);
+                let Some((_phys, current_flags)) = manager.translate_with_flags(vaddr) else {
+                    continue;
+                };
+                previous_pte_flags.push((page, current_flags));
+                let new_flags = reconcile_cow_mprotect_flags(current_flags, flags);
+                if manager.update_flags(page, new_flags).is_err() {
+                    // Restore every page already touched before releasing the
+                    // VMA claim. Capacity was reserved up front, so rollback
+                    // itself cannot allocate or fail for lack of bookkeeping.
+                    for &(rollback_page, rollback_flags) in previous_pte_flags.iter().rev() {
+                        let _ = manager.update_flags(rollback_page, rollback_flags);
                     }
+                    mm::flush_current_as_range(VirtAddr::new(addr as u64), len_aligned);
+                    return Err(SyscallError::EFAULT);
                 }
             }
             Ok(())
@@ -13483,8 +13990,11 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     {
         let mut mm = mm_arc.lock();
         for (&_region_base, len_with_flags) in mm.mmap_regions.range_mut(addr..end) {
+            debug_assert!(len_with_flags.is_pending_mprotect());
             len_with_flags.rewrite_prot_bits(new_prot_flags);
+            len_with_flags.clear_pending_mprotect();
         }
+        pte_reservation.armed = false;
     }
 
     Ok(0)
@@ -13506,6 +14016,7 @@ fn seccomp_error_to_syscall(err: seccomp::SeccompError) -> SyscallError {
         seccomp::SeccompError::Fault => SyscallError::EFAULT,
         seccomp::SeccompError::NotPermitted => SyscallError::EPERM,
         seccomp::SeccompError::ProgramTooLong => SyscallError::E2BIG,
+        seccomp::SeccompError::OutOfMemory => SyscallError::ENOMEM,
         _ => SyscallError::EINVAL,
     }
 }
@@ -13637,11 +14148,9 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     validate_user_ptr(insn_ptr as *const u8, total)?;
 
     // R158-3 FIX: Fallible allocation — user-controlled len can exhaust kernel heap.
-    let mut raw_insns = Vec::new();
-    raw_insns
-        .try_reserve_exact(len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    raw_insns.resize(len, UserSeccompInsn::default());
+    // RF180-18 FIX: bounded stack staging leaves retained allocation to the
+    // admitted SeccompFilter constructor.
+    let mut raw_insns = [UserSeccompInsn::default(); seccomp::MAX_INSNS];
     let raw_bytes =
         unsafe { core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total) };
     copy_from_user(raw_bytes, insn_ptr as *const u8)?;
@@ -13650,36 +14159,27 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     let default_action = decode_user_action(prog.default_action, 0)?;
 
     // R158-3 FIX: Fallible allocation for translated program.
-    let mut program = Vec::new();
-    program
-        .try_reserve_exact(len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    for insn in raw_insns.iter() {
-        program.push(translate_user_insn(insn)?);
+    let mut program = [seccomp::SeccompInsn::Ret(seccomp::SeccompAction::Kill); seccomp::MAX_INSNS];
+    for (slot, insn) in program[..len].iter_mut().zip(raw_insns[..len].iter()) {
+        *slot = translate_user_insn(insn)?;
     }
 
     // Create and validate filter
-    seccomp::SeccompFilter::new(program, default_action, filter_flags)
+    seccomp::SeccompFilter::new_from_slice(&program[..len], default_action, filter_flags)
         .map_err(seccomp_error_to_syscall)
 }
 
 /// Get current seccomp mode for PR_GET_SECCOMP
 // R159-I3 FIX: Cache strict_filter ID to avoid heap allocation on every
 // PR_GET_SECCOMP call. Computed once on first use.
-static STRICT_FILTER_ID: spin::Once<u64> = spin::Once::new();
-
 fn current_seccomp_mode(state: &seccomp::SeccompState) -> usize {
-    if state.filters().is_empty() {
+    if state.filter_count() == 0 {
         return SECCOMP_MODE_DISABLED;
     }
 
-    let strict_id = *STRICT_FILTER_ID.call_once(|| seccomp::strict_filter().id());
-    if state.filters().len() == 1 {
-        if let Some(filter) = state.filters().first() {
-            if filter.id() == strict_id {
-                return SECCOMP_MODE_STRICT;
-            }
-        }
+    let strict_id = seccomp::strict_filter_id();
+    if state.single_filter_id() == Some(strict_id) {
+        return SECCOMP_MODE_STRICT;
     }
 
     SECCOMP_MODE_FILTER
@@ -13747,13 +14247,17 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 return Err(SyscallError::EPERM);
             }
 
-            let filter = seccomp::strict_filter();
+            let filter = seccomp::try_strict_filter().map_err(seccomp_error_to_syscall)?;
             let mut proc = proc_arc.lock();
 
             // R26-3 FIX: Re-check after reacquiring lock (race window between
             // the initial check above and the re-acquire here).
             if proc.seccomp_installing {
                 return Err(SyscallError::EBUSY);
+            }
+
+            if proc.seccomp_generation == u64::MAX {
+                return Err(SyscallError::EOVERFLOW);
             }
 
             // R26-3 FIX: Mark installation in progress
@@ -13770,6 +14274,10 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             // Installing any filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;
+
+            // RF180-1: publish the new committed filter revision before the
+            // installing flag is cleared.
+            proc.seccomp_generation += 1;
 
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
@@ -13837,6 +14345,10 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 return Err(SyscallError::EBUSY);
             }
 
+            if proc.seccomp_generation == u64::MAX {
+                return Err(SyscallError::EOVERFLOW);
+            }
+
             // R26-3 FIX: Mark installation in progress
             proc.seccomp_installing = true;
 
@@ -13859,6 +14371,10 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 proc.seccomp_state.log_violations = true;
             }
 
+            // RF180-1: publish the new committed filter revision before the
+            // installing flag is cleared.
+            proc.seccomp_generation += 1;
+
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
 
@@ -13866,7 +14382,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 Info,
                 "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",
                 pid,
-                proc.seccomp_state.filters().len()
+                proc.seccomp_state.filter_count()
             );
             Ok(0)
         }
@@ -14561,11 +15077,9 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     // - 由 RDRAND/RDSEED 播种
     // - 定期重新播种
     // - 提供密码学安全的随机数
-    // R156-3 FIX: Fallible allocation for getrandom buffer.
-    let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    tmp.resize(count, 0);
+    // R180-10 defense in depth: getrandom shares the 1 MiB syscall staging
+    // contract, so concurrent requests must participate in aggregate admission.
+    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
     match rng::fill_random(&mut tmp) {
         Ok(()) => {}
         // R140-6 FIX: FIPS state failed/corrupted — deny all crypto.
@@ -14942,7 +15456,7 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
     // Namespace euid/egid must NOT be compared against host inode UIDs/GIDs.
     let euid = crate::current_host_euid().ok_or(SyscallError::ESRCH)?;
     let egid = crate::current_host_egid().ok_or(SyscallError::ESRCH)?;
-    let sup_groups = crate::current_host_supplementary_groups().unwrap_or_default();
+    let supplementary_match = crate::current_in_host_supplementary_group(stat.gid).unwrap_or(false);
 
     // root用户拥有所有权限
     if euid == 0 {
@@ -14952,7 +15466,7 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
     // 计算权限位
     let perm_bits = if euid == stat.uid {
         (stat.mode >> 6) & 0o7
-    } else if egid == stat.gid || sup_groups.iter().any(|&g| g == stat.gid) {
+    } else if egid == stat.gid || supplementary_match {
         (stat.mode >> 3) & 0o7
     } else {
         stat.mode & 0o7
@@ -15274,29 +15788,18 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
+    // R180-23: admit FD slot + files.max before resolve/open can create or
+    // truncate. The reservation remains invisible to guessed FD lookups.
+    let fd_reservation = FdPublicationReservation::try_new(process, open_flags & 0x80000 != 0)?;
+
     // Call VFS with resolve flags — VFS enforces LSM hooks
     let file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
 
     // O_CLOEXEC flag
-    const O_CLOEXEC: u32 = 0x80000;
-
-    // Allocate fd
-    let fd = {
-        let mut proc = process.lock();
-        // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
-        // object on the EMFILE arm (byte-equivalent to the old
-        // allocate_fd-internal drop); conversion to drop-outside tracked.
-        let fd = proc.allocate_fd(file_ops).map_err(|rejected| {
-            drop(rejected);
-            SyscallError::EMFILE
-        })?;
-
-        if open_flags & O_CLOEXEC != 0 {
-            proc.set_fd_cloexec(fd, true);
-        }
-
-        fd
-    };
+    let fd = fd_reservation.install(file_ops).map_err(|rejected| {
+        drop(rejected);
+        SyscallError::EMFILE
+    })?;
 
     Ok(fd as usize)
 }
@@ -15316,15 +15819,16 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
     let mut proc = proc_arc.lock();
 
     let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-    let cloned = src.clone_box();
-
-    // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected clone on
-    // the EMFILE arm (byte-equivalent to the old allocate_fd-internal drop);
-    // conversion to drop-outside tracked.
-    let newfd = proc.allocate_fd(cloned).map_err(|rejected| {
-        drop(rejected);
-        SyscallError::EMFILE
-    })?;
+    let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
+    let newfd = match proc.allocate_fd_with_cloexec(cloned, false) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            // A descriptor destructor may acquire socket/waiter locks.
+            drop(proc);
+            drop(rejected);
+            return Err(SyscallError::EMFILE);
+        }
+    };
     // U.S3-A3 FIX: the new fd shares oldfd's CapId, so bump the CapEntry
     // refcount HERE, under the already-held Process lock, AFTER the install
     // succeeded — never inside clone_box (U.S3-A2 self-deadlock). Failure
@@ -15369,15 +15873,20 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     let old_fd_entry = {
         let mut proc = proc_arc.lock();
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-        let cloned = src.clone_box();
+        let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert):
         // empty newfd → charge +1 (EMFILE on over-budget, table untouched);
         // occupied newfd → net 0, reuses the replaced entry's charge.
         // (replace_fd_charged also pays back the DISPLACED entry's cap
         // refcount — U.S3-B.)
-        let displaced = proc
-            .replace_fd_charged(newfd, cloned)
-            .map_err(|_| SyscallError::EMFILE)?;
+        let displaced = match proc.replace_fd_charged_with_cloexec(newfd, cloned, false) {
+            Ok(displaced) => displaced,
+            Err(rejected) => {
+                drop(proc);
+                drop(rejected);
+                return Err(SyscallError::EMFILE);
+            }
+        };
         // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
         // copy, under the held Process lock (see sys_dup for the failure-race
         // note).
@@ -15422,23 +15931,25 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
     let old_fd_entry = {
         let mut proc = proc_arc.lock();
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-        let cloned = src.clone_box();
+        let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert).
         // replace_fd_charged clears CLOEXEC on newfd; re-set it below if requested.
         // (It also pays back the DISPLACED entry's cap refcount — U.S3-B.)
-        let removed = proc
-            .replace_fd_charged(newfd, cloned)
-            .map_err(|_| SyscallError::EMFILE)?;
+        let removed =
+            match proc.replace_fd_charged_with_cloexec(newfd, cloned, flags & O_CLOEXEC != 0) {
+                Ok(removed) => removed,
+                Err(rejected) => {
+                    drop(proc);
+                    drop(rejected);
+                    return Err(SyscallError::EMFILE);
+                }
+            };
 
         // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
         // copy, under the held Process lock (see sys_dup for the failure-race
         // note).
         if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
             let _ = proc.cap_table.increment_refcount(cid);
-        }
-
-        if flags & O_CLOEXEC != 0 {
-            proc.set_fd_cloexec(newfd, true);
         }
 
         removed
@@ -15493,6 +16004,128 @@ fn sys_umask(mask: u32) -> SyscallResult {
 }
 
 /// sys_getdents64 - 读取目录项
+fn linux_dirent64_record_len(entry: &DirEntry) -> Result<usize, SyscallError> {
+    let reclen = LINUX_DIRENT64_NAME_OFFSET
+        .checked_add(entry.name.len())
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(7))
+        .map(|value| value & !7)
+        .ok_or(SyscallError::EINVAL)?;
+    if reclen > u16::MAX as usize {
+        return Err(SyscallError::EINVAL);
+    }
+    Ok(reclen)
+}
+
+fn serialize_dirent_prefix(entries: &[DirEntry], wire: &mut [u8]) -> Result<usize, SyscallError> {
+    let mut written = 0usize;
+    for entry in entries {
+        let name = entry.name.as_bytes();
+        let reclen = linux_dirent64_record_len(entry)?;
+        let next = written.checked_add(reclen).ok_or(SyscallError::EINVAL)?;
+        if next > wire.len() {
+            break;
+        }
+        let d_type = match entry.file_type {
+            FileType::Regular => 8,
+            FileType::Directory => 4,
+            FileType::CharDevice => 2,
+            FileType::BlockDevice => 6,
+            FileType::Symlink => 10,
+            FileType::Fifo => 1,
+            FileType::Socket => 12,
+        };
+        let record = &mut wire[written..next];
+        record[0..8].copy_from_slice(&entry.ino.to_ne_bytes());
+        // RF180-14 FIX: d_off is an opaque filesystem resume cookie.
+        record[8..16].copy_from_slice(&entry.next_cookie.to_ne_bytes());
+        record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        record[18] = d_type;
+        let name_start = LINUX_DIRENT64_NAME_OFFSET;
+        record[name_start..name_start + name.len()].copy_from_slice(name);
+        record[name_start + name.len()] = 0;
+        written = next;
+    }
+    Ok(written)
+}
+
+fn copy_dirents_to_user(
+    dirp: *mut u8,
+    count: usize,
+    entries: &[DirEntry],
+) -> Result<usize, SyscallError> {
+    let mut total = 0usize;
+    let mut included = 0usize;
+    for entry in entries {
+        let next = total
+            .checked_add(linux_dirent64_record_len(entry)?)
+            .ok_or(SyscallError::EINVAL)?;
+        if next > count {
+            break;
+        }
+        total = next;
+        included += 1;
+    }
+    if total == 0 {
+        return Ok(0);
+    }
+
+    // One zeroed wire buffer and one fault-tolerant copyout: directory offset
+    // publication remains entirely after this operation in the VFS callback.
+    let mut wire = try_admitted_zeroed_io_buffer(total)?;
+
+    let written = serialize_dirent_prefix(&entries[..included], &mut wire)?;
+
+    copy_to_user(dirp, &wire)?;
+    Ok(written)
+}
+
+#[cfg(test)]
+mod getdents_cookie_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn rf180_14_serializes_non_unit_resume_cookies_across_calls() {
+        let entries = [
+            DirEntry {
+                name: "first".into(),
+                ino: 11,
+                file_type: FileType::Regular,
+                next_cookie: 0x1_0000,
+            },
+            DirEntry {
+                name: "second".into(),
+                ino: 12,
+                file_type: FileType::Directory,
+                next_cookie: 0x7fff_1234,
+            },
+        ];
+        let first_len = linux_dirent64_record_len(&entries[0]).unwrap();
+        let mut first_call = vec![0u8; first_len];
+        assert_eq!(
+            serialize_dirent_prefix(&entries, &mut first_call).unwrap(),
+            first_len
+        );
+        assert_eq!(
+            i64::from_ne_bytes(first_call[8..16].try_into().unwrap()),
+            entries[0].next_cookie
+        );
+
+        let second_len = linux_dirent64_record_len(&entries[1]).unwrap();
+        let mut second_call = vec![0u8; second_len];
+        assert_eq!(
+            serialize_dirent_prefix(&entries[1..], &mut second_call).unwrap(),
+            second_len
+        );
+        assert_eq!(
+            i64::from_ne_bytes(second_call[8..16].try_into().unwrap()),
+            entries[1].next_cookie
+        );
+        assert!(i64::try_from(usize::MAX).is_err());
+    }
+}
+
 fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     if fd < 0 {
         return Err(SyscallError::EBADF);
@@ -15501,9 +16134,8 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         return Err(SyscallError::EINVAL);
     }
 
-    // R114-2 FIX: Cap `count` to MAX_RW_SIZE (1 MB) to prevent extreme kernel allocations
-    // even with large user buffers. This matches Linux's practical limit for readdir.
-    const MAX_RW_SIZE: usize = 1024 * 1024; // 1 MB
+    // R114-2 FIX: Cap `count` to MAX_RW_SIZE to prevent extreme kernel allocations
+    // even with large user buffers. Uses the residual-derived MAX_RW_SIZE (R180-10).
     let budget = count.min(MAX_RW_SIZE);
 
     // J2-10: per-cgroup VFS dir-enumeration budget (vfs_dir.max). Resolve the
@@ -15521,80 +16153,10 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let vfs_guard = crate::cgroup::VfsDirBudgetGuard::charge(vfs_cg, budget);
     let budget = vfs_guard.granted();
 
-    // 通过回调读取目录项，passing byte budget to limit kernel-side allocation
+    // The VFS callback keeps the shared directory offset locked and uncommitted
+    // until `copy_dirents_to_user` succeeds.
     let readdir_fn = VFS_READDIR_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    let entries = readdir_fn(fd, budget)?;
-
-    // 构建dirent64结构
-    let mut written = 0usize;
-    let header_size = core::mem::size_of::<LinuxDirent64>();
-    // R114-2 FIX: Validate ABI assumption — vfs_readdir_callback uses DIRENT64_HEADER_SIZE=24
-    // for budget estimation. If repr(C) padding changes, this catches the mismatch.
-    debug_assert_eq!(
-        header_size, 24,
-        "LinuxDirent64 size mismatch: budget estimation assumes 24"
-    );
-
-    for entry in entries {
-        let name_bytes = entry.name.as_bytes();
-
-        // R42-2 FIX: Use checked arithmetic to prevent integer overflow.
-        // An extremely long filename could cause the addition to wrap around,
-        // resulting in an undersized buffer and subsequent memory corruption.
-        let reclen = header_size
-            .checked_add(name_bytes.len())
-            .and_then(|v| v.checked_add(1)) // +1 for NUL terminator
-            .and_then(|v| v.checked_add(7)) // +7 for alignment
-            .map(|v| v & !7) // 8-byte alignment (round down)
-            .ok_or(SyscallError::EINVAL)?;
-
-        // R42-2 FIX: Validate reclen fits in u16 (d_reclen field type)
-        if reclen > u16::MAX as usize {
-            return Err(SyscallError::EINVAL);
-        }
-
-        // R42-2 FIX: Use checked arithmetic for buffer position
-        let next_written = written.checked_add(reclen).ok_or(SyscallError::EINVAL)?;
-        if next_written > count {
-            break;
-        }
-
-        let d_type = match entry.file_type {
-            FileType::Regular => 8,     // DT_REG
-            FileType::Directory => 4,   // DT_DIR
-            FileType::CharDevice => 2,  // DT_CHR
-            FileType::BlockDevice => 6, // DT_BLK
-            FileType::Symlink => 10,    // DT_LNK
-            FileType::Fifo => 1,        // DT_FIFO
-            FileType::Socket => 12,     // DT_SOCK
-        };
-
-        // R156-3 FIX: Fallible allocation for dirent buffer.
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(reclen)
-            .map_err(|_| SyscallError::ENOMEM)?;
-        buf.resize(reclen, 0);
-
-        // R113-1 FIX: Write header fields individually into the zeroed buffer
-        // instead of copy_nonoverlapping from a stack LinuxDirent64, which would
-        // copy 5 bytes of uninitialized tail padding (offsets 19-23).
-        buf[0..8].copy_from_slice(&entry.ino.to_ne_bytes());
-        buf[8..16].copy_from_slice(&(next_written as i64).to_ne_bytes());
-        buf[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
-        buf[18] = d_type;
-
-        // 复制文件名
-        buf[header_size..header_size + name_bytes.len()].copy_from_slice(name_bytes);
-        buf[header_size + name_bytes.len()] = 0; // NUL terminator
-
-        // 复制到用户空间
-        // R102-I4 FIX: Use integer arithmetic for user pointer offset (provenance-safe).
-        let dst = (dirp as usize).wrapping_add(written) as *mut u8;
-        copy_to_user(dst, &buf)?;
-        written = next_written; // R42-2 FIX: Use pre-computed checked value
-    }
-
-    Ok(written)
+    readdir_fn(fd, budget, dirp, copy_dirents_to_user)
 }
 
 // ============================================================================
@@ -16004,7 +16566,7 @@ fn read_sockaddr_in(user: *const SockAddrIn, len: u32) -> Result<SockAddrIn, Sys
     validate_user_ptr(user as *const u8, need as usize)?;
 
     let mut addr = SockAddrIn::default();
-    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes; user→kernel)
+    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,[u8;4],[u8;8]} = 16 bytes; user→kernel)
     let addr_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut addr as *mut SockAddrIn as *mut u8,
@@ -16024,18 +16586,20 @@ fn write_sockaddr_in(
     if user_addr.is_null() {
         return Ok(()); // Nothing to write
     }
+    if user_len.is_null() {
+        // Linux requires a socklen_t pointer whenever the address output
+        // pointer is non-null. Silently assuming 16 bytes would discard the
+        // caller's object-boundary contract.
+        return Err(SyscallError::EFAULT);
+    }
 
     // Get user-provided buffer length
-    let provided_len = if user_len.is_null() {
-        core::mem::size_of::<SockAddrIn>() as u32
-    } else {
-        validate_user_ptr(user_len as *const u8, core::mem::size_of::<u32>())?;
-        let mut len_bytes = [0u8; 4];
-        copy_from_user(&mut len_bytes, user_len as *const u8)?;
-        u32::from_ne_bytes(len_bytes)
-    };
+    validate_user_ptr_mut(user_len as *mut u8, core::mem::size_of::<u32>())?;
+    let mut len_bytes = [0u8; 4];
+    copy_from_user(&mut len_bytes, user_len as *const u8)?;
+    let provided_len = u32::from_ne_bytes(len_bytes);
 
-    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
+    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,[u8;4],[u8;8]} = 16 bytes)
     let addr_bytes = unsafe {
         core::slice::from_raw_parts(
             addr as *const SockAddrIn as *const u8,
@@ -16081,7 +16645,7 @@ fn socket_handle_from_fd(fd: i32) -> Result<(cap::CapId, u64, bool), SyscallErro
 fn resolve_socket(
     cap_id: cap::CapId,
     socket_id: u64,
-) -> Result<(cap::CapEntry, alloc::sync::Arc<net::SocketState>), SyscallError> {
+) -> Result<(cap::CapEntry, net::SocketArc), SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
@@ -16128,6 +16692,104 @@ fn resolve_socket(
     }
 
     Ok((entry, sock))
+}
+
+/// RF180-37: all fallible per-process resources required to publish one
+/// socket-backed descriptor. None of these fields exposes a capability, fd, or
+/// SocketFile until `commit`; dropping the bundle is an exact rollback.
+struct PreparedSocketPublication<'a> {
+    descriptor: crate::process::PreparedFileDescriptor<SocketFile>,
+    fd_reservation: FdPublicationReservation,
+    capability: cap::PreparedCapAllocation<'a>,
+    proc_ctx: lsm::ProcessCtx,
+}
+
+impl PreparedSocketPublication<'_> {
+    #[inline]
+    fn process_context(&self) -> &lsm::ProcessCtx {
+        &self.proc_ctx
+    }
+
+    /// Publish the capability and descriptor through resources that were fully
+    /// reserved before any socket-table creation or accept-queue dequeue.
+    fn commit(
+        self,
+        cap_entry: cap::CapEntry,
+        socket_id: u64,
+        nonblocking: bool,
+    ) -> (i32, cap::CapId, lsm::ProcessCtx) {
+        let Self {
+            descriptor,
+            fd_reservation,
+            capability,
+            proc_ctx,
+        } = self;
+        let cap_id = capability.install(cap_entry);
+        let desc = descriptor.finalize(SocketFile::new(cap_id, socket_id, nonblocking));
+        let fd = match fd_reservation.install(desc) {
+            Ok(fd) => fd,
+            Err(_desc) => {
+                panic!("RF180-37: prepared socket FD publication invariant failed")
+            }
+        };
+        (fd, cap_id, proc_ctx)
+    }
+}
+
+/// RF180-37: structural ordering primitive for socket(). A failed preflight
+/// cannot invoke `publish`; a publication failure drops the unpublished
+/// resource bundle through ordinary RAII.
+fn socket_publish_after_preflight<P, S, E>(
+    preflight: impl FnOnce() -> Result<P, E>,
+    publish: impl FnOnce() -> Result<S, E>,
+) -> Result<(P, S), E> {
+    let prepared = preflight()?;
+    let published = publish()?;
+    Ok((prepared, published))
+}
+
+enum AcceptPublicationAttempt<P, C> {
+    NotReady,
+    LostRace,
+    Ready { prepared: P, child: C },
+}
+
+/// RF180-37: non-consuming readiness -> full publication preflight -> atomic
+/// recheck/pop. A resource failure returns before `pop`; a competing acceptor
+/// that wins after the readiness snapshot yields `LostRace` and drops every
+/// reservation before the caller retries.
+fn accept_after_preflight<P, C, E>(
+    ready: bool,
+    preflight: impl FnOnce() -> Result<P, E>,
+    pop: impl FnOnce() -> Result<Option<C>, E>,
+) -> Result<AcceptPublicationAttempt<P, C>, E> {
+    if !ready {
+        return Ok(AcceptPublicationAttempt::NotReady);
+    }
+    let prepared = preflight()?;
+    match pop()? {
+        Some(child) => Ok(AcceptPublicationAttempt::Ready { prepared, child }),
+        None => Ok(AcceptPublicationAttempt::LostRace),
+    }
+}
+
+fn emit_cap_allocate_audit(proc_ctx: &lsm::ProcessCtx, cap_id: cap::CapId) {
+    let subject = audit::AuditSubject::new(
+        proc_ctx.pid as u32,
+        proc_ctx.uid,
+        proc_ctx.gid,
+        proc_ctx.cap.map(|c| c.raw()),
+    );
+    let timestamp = crate::time::get_ticks();
+    let _ = audit::emit_capability_event(
+        audit::AuditOutcome::Success,
+        subject,
+        cap_id.raw(),
+        audit::AuditCapOperation::Allocate,
+        None,
+        0,
+        timestamp,
+    );
 }
 
 /// sys_socket - Create a UDP socket (syscall 41).
@@ -16179,136 +16841,100 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     // Fail-closed: if we can't determine the namespace, refuse to create socket.
     let net_ns_id = current_net_ns_id().ok_or(SyscallError::ESRCH)?;
 
-    // Create socket via socket_table (includes LSM hook_net_socket check)
-    let socket = match (ty, proto) {
-        (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
-            .create_udp_socket(label, net_ns_id)
-            .map_err(socket_error_to_syscall)?,
-        (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
-            .create_tcp_socket(label, net_ns_id)
-            .map_err(socket_error_to_syscall)?,
-        _ => return Err(SyscallError::EPROTONOSUPPORT),
-    };
-
-    // Create capability entry
-    //
-    // U.S3-B FIX: SOCK_CLOEXEC is recorded ONLY fd-side (cloexec_fds, below) —
-    // the CapEntry no longer carries CapFlags::CLOEXEC. With refcounted
-    // fd-backed caps, table-side apply_cloexec() at exec revoked the CapEntry
-    // OUTRIGHT (ignoring refcount), so a non-cloexec dup of a SOCK_CLOEXEC
-    // socket SURVIVED exec holding a dangling CapId — every later op failed on
-    // a POSIX-valid fd. Exec teardown of cloexec'd socket fds now flows through
-    // take_cloexec_fds_into's per-fd decrement (revoke at 0), which keeps
-    // surviving dups live and still revokes when the last fd goes.
-    // apply_cloexec() remains for NON-fd-backed caps (sys_cap_allocate).
-    let cap_flags = cap::CapFlags::empty();
-    // R152-1 FIX: TCP sockets get CONNECT/LISTEN/ACCEPT rights at creation.
-    // These rights enable least-privilege delegation (e.g., connect-only cap).
-    let mut rights = cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND;
-    if ty == net::SocketType::Stream && proto == net::SocketProtocol::Tcp {
-        rights |= cap::CapRights::CONNECT | cap::CapRights::LISTEN | cap::CapRights::ACCEPT;
-    }
-    let cap_entry = cap::CapEntry::with_flags(
-        // R75-1 FIX: Pass network namespace ID to Socket capability for isolation tracking
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(
-            socket.id,
-            socket.net_ns_id.raw(),
-        ))),
-        rights,
-        cap_flags,
-    );
-
-    // Allocate CapId + fd
-    // R65-13 FIX: Add LSM/audit integration for capability allocation
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let fd = {
-        let mut proc = process.lock();
-        let proc_ctx = lsm_process_ctx_from(&proc);
 
-        // R65-13 FIX: LSM hook before capability allocation
-        if let Err(err) =
-            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
-        {
-            drop(proc);
-            net::socket_table().close(socket.id);
-            return Err(lsm_error_to_syscall(err));
+    // RF180-37 FIX: prepare the exact SocketFile allocation, numeric fd,
+    // files.max charge, CLOEXEC slot, capability backing, and capability LSM
+    // permission before create_* publishes a socket in the global table.
+    let cap_table = { process.lock().cap_table.clone() };
+    let ((prepared, socket), rights) = {
+        let mut rights = cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND;
+        if ty == net::SocketType::Stream && proto == net::SocketProtocol::Tcp {
+            rights |= cap::CapRights::CONNECT | cap::CapRights::LISTEN | cap::CapRights::ACCEPT;
         }
 
-        // Allocate capability for the socket
-        let cap_id = match proc.cap_table.allocate(cap_entry) {
-            Ok(id) => id,
-            Err(e) => {
-                drop(proc);
-                net::socket_table().close(socket.id);
-                return Err(cap_error_to_syscall(e));
-            }
-        };
-
-        // R65-13 FIX: Audit event for capability allocation
-        {
-            let subject = audit::AuditSubject::new(
-                proc_ctx.pid as u32,
-                proc_ctx.uid,
-                proc_ctx.gid,
-                proc_ctx.cap.map(|c| c.raw()),
-            );
-            let timestamp = crate::time::get_ticks();
-            let _ = audit::emit_capability_event(
-                audit::AuditOutcome::Success,
-                subject,
-                cap_id.raw(),
-                audit::AuditCapOperation::Allocate,
-                None,
-                0,
-                timestamp,
-            );
-        }
-
-        let sock_file = SocketFile::new(cap_id, socket.id, nonblock);
-        // R51-4 FIX: Roll back allocations if fd table is full
-        let fd = match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
-            Ok(fd) => fd,
-            Err(rejected) => {
-                // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the
-                // rejected SocketFile (byte-equivalent to the old
-                // allocate_fd-internal drop — keeps the audited teardown
-                // ORDER: box-drop, then cap revoke, then explicit close);
-                // conversion to drop-outside tracked.
-                drop(rejected);
-                // Release capability and close socket to prevent resource leak
-                // R65-13 FIX: Audit event for capability revocation (rollback)
-                {
-                    let subject = audit::AuditSubject::new(
-                        proc_ctx.pid as u32,
-                        proc_ctx.uid,
-                        proc_ctx.gid,
-                        proc_ctx.cap.map(|c| c.raw()),
-                    );
-                    let timestamp = crate::time::get_ticks();
-                    let _ = audit::emit_capability_event(
-                        audit::AuditOutcome::Success,
-                        subject,
-                        cap_id.raw(),
-                        audit::AuditCapOperation::Revoke,
-                        None,
-                        0,
-                        timestamp,
-                    );
-                }
-                let _ = proc.cap_table.revoke(cap_id);
-                drop(proc);
-                net::socket_table().close(socket.id);
-                return Err(SyscallError::EMFILE);
-            }
-        };
-        if cloexec {
-            proc.cloexec_fds.insert(fd);
-        }
-        fd
+        let pair = socket_publish_after_preflight(
+            || {
+                let descriptor =
+                    crate::process::FileDescriptor::try_prepare(mm::HeapClass::SocketObject)
+                        .map_err(|_| SyscallError::ENOMEM)?;
+                let fd_reservation = FdPublicationReservation::try_new(process.clone(), cloexec)?;
+                let proc_ctx = {
+                    let proc = process.lock();
+                    let proc_ctx = lsm_process_ctx_from(&proc);
+                    lsm::hook_task_cap_modify(
+                        &proc_ctx,
+                        cap::CapId::INVALID,
+                        lsm::cap_op::ALLOCATE,
+                    )
+                    .map_err(lsm_error_to_syscall)?;
+                    proc_ctx
+                };
+                let capability = cap_table
+                    .prepare_allocation()
+                    .map_err(cap_error_to_syscall)?;
+                Ok(PreparedSocketPublication {
+                    descriptor,
+                    fd_reservation,
+                    capability,
+                    proc_ctx,
+                })
+            },
+            || match (ty, proto) {
+                (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
+                    .create_udp_socket(label, net_ns_id)
+                    .map_err(socket_error_to_syscall),
+                (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
+                    .create_tcp_socket(label, net_ns_id)
+                    .map_err(socket_error_to_syscall),
+                _ => Err(SyscallError::EPROTONOSUPPORT),
+            },
+        )?;
+        (pair, rights)
     };
 
+    // U.S3-B: SOCK_CLOEXEC remains exclusively fd-side. The capability install
+    // and reserved-fd commit below are both allocation-free and cannot return a
+    // recoverable error after socket publication.
+    let cap_entry = cap::CapEntry::with_flags(
+        cap::CapObject::Socket(cap::Socket::new(socket.id, socket.net_ns_id.raw())),
+        rights,
+        cap::CapFlags::empty(),
+    );
+    let (fd, cap_id, proc_ctx) = prepared.commit(cap_entry, socket.id, nonblock);
+    emit_cap_allocate_audit(&proc_ctx, cap_id);
+
     Ok(fd as usize)
+}
+
+/// Prepare a socket-backed descriptor publication for accept/accept4 while no
+/// accept-queue state is owned. All recoverable errors therefore leave the
+/// pending child available to another or later accept attempt.
+fn prepare_accept_publication<'a>(
+    process: crate::process::ProcessArc,
+    cap_table: &'a cap::CapTable,
+    cloexec: bool,
+) -> Result<PreparedSocketPublication<'a>, SyscallError> {
+    let descriptor = crate::process::FileDescriptor::try_prepare(mm::HeapClass::SocketObject)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    let fd_reservation = FdPublicationReservation::try_new(process.clone(), cloexec)?;
+    let proc_ctx = {
+        let proc = process.lock();
+        let proc_ctx = lsm_process_ctx_from(&proc);
+        lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+            .map_err(lsm_error_to_syscall)?;
+        proc_ctx
+    };
+    let capability = cap_table
+        .prepare_allocation()
+        .map_err(cap_error_to_syscall)?;
+    Ok(PreparedSocketPublication {
+        descriptor,
+        fd_reservation,
+        capability,
+        proc_ctx,
+    })
 }
 
 /// sys_bind - Bind socket to local address (syscall 49).
@@ -16479,7 +17105,25 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 /// - Invokes LSM hook_net_accept for policy check
 /// - Returns EAGAIN for non-blocking if no connections pending
 fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResult {
-    let (cap_id, socket_id, nonblock) = socket_handle_from_fd(fd)?;
+    sys_accept_common(fd, addr, addrlen, 0)
+}
+
+/// Linux accept4(2) (syscall 288): accept with atomic descriptor flags.
+fn sys_accept4(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32, flags: i32) -> SyscallResult {
+    let flags = flags as u32;
+    if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    sys_accept_common(fd, addr, addrlen, flags)
+}
+
+fn sys_accept_common(
+    fd: i32,
+    addr: *mut SockAddrIn,
+    addrlen: *mut u32,
+    accept_flags: u32,
+) -> SyscallResult {
+    let (cap_id, socket_id, listener_nonblock) = socket_handle_from_fd(fd)?;
     let (entry, socket) = resolve_socket(cap_id, socket_id)?;
 
     // Only TCP sockets can accept
@@ -16496,15 +17140,37 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     if !socket.is_listening() {
         return Err(SyscallError::EINVAL);
     }
+    if !addr.is_null() && addrlen.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
 
-    let current = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let cap_table = { process.lock().cap_table.clone() };
+    let cloexec = accept_flags & SOCK_CLOEXEC != 0;
+    // Linux accept() does not inherit O_NONBLOCK from the listener; only
+    // accept4(SOCK_NONBLOCK) marks the returned descriptor non-blocking.
+    let child_nonblock = accept_flags & SOCK_NONBLOCK != 0;
 
-    // Blocking loop until a connection is ready
-    let child = loop {
-        match net::socket_table().poll_accept_ready(&socket) {
-            Ok(Some(conn)) => break conn,
-            Ok(None) => {
-                if nonblock {
+    // RF180-37 FIX: readiness is observed without consuming the child. Only
+    // after every descriptor/capability resource is prepared do we atomically
+    // recheck and pop. ENOMEM/EMFILE/LSM rejection therefore leaves the child
+    // queued and retryable; a competing acceptor yields LostRace and retries.
+    let (prepared, child) = loop {
+        let attempt = accept_after_preflight(
+            socket.poll_readiness().readable,
+            || prepare_accept_publication(process.clone(), cap_table.as_ref(), cloexec),
+            || {
+                net::socket_table()
+                    .poll_accept_ready(&socket)
+                    .map_err(socket_error_to_syscall)
+            },
+        )?;
+        match attempt {
+            AcceptPublicationAttempt::Ready { prepared, child } => break (prepared, child),
+            AcceptPublicationAttempt::LostRace => continue,
+            AcceptPublicationAttempt::NotReady => {
+                if listener_nonblock {
                     return Err(SyscallError::EAGAIN);
                 }
                 // Block on accept wait queue
@@ -16521,12 +17187,12 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
                     return Err(SyscallError::EINVAL);
                 }
             }
-            Err(e) => return Err(socket_error_to_syscall(e)),
         }
     };
 
-    // Helper to clean up child socket on error after it's been popped from accept queue
-    let cleanup_child = |c: &alloc::sync::Arc<net::SocketState>| {
+    // Helper to clean up a child only for a post-dequeue policy rejection. All
+    // resource failures happened before the dequeue and require no rollback.
+    let cleanup_child = |c: &net::SocketArc| {
         c.mark_closed();
         net::socket_table().close(c.id);
     };
@@ -16534,156 +17200,136 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     // LSM accept hook (using child's context for peer info)
     let mut ctx = net::socket_table().ctx_from_socket(&child);
     ctx.cap = Some(cap_id);
-    if let Err(e) = lsm::hook_net_accept(&current, &ctx) {
+    // RF180-37: use the Process-lock snapshot taken immediately before the
+    // atomic pop, not a context captured before an arbitrarily long wait.
+    if let Err(e) = lsm::hook_net_accept(prepared.process_context(), &ctx) {
         cleanup_child(&child);
         return Err(lsm_error_to_syscall(e));
     }
 
-    // Fill optional peer address
-    // R162-11 FIX: addr copy failure is non-fatal — the connection is already
-    // established and the child fd is valid. Destroying the child socket on
-    // EFAULT during addr copy allows a malicious process to silently kill
-    // incoming connections by providing invalid addr pointers. Instead, skip
-    // the addr copy on validation failure (Linux behavior).
-    if !addr.is_null() && !addrlen.is_null() {
-        if let (Some(rip), Some(rport)) = (child.remote_ip(), child.remote_port()) {
-            let mut out = SockAddrIn::default();
-            out.sin_family = AF_INET as u16;
-            out.sin_port = rport.to_be();
-            out.sin_addr = u32::from_be_bytes(rip);
-
-            let addr_valid =
-                validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()).is_ok()
-                    && validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()).is_ok();
-            if !addr_valid {
-                // Skip addr copy but don't destroy the child — proceed to return fd.
-            } else {
-                // Convert struct to bytes for copy_to_user
-                // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
-                let out_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &out as *const SockAddrIn as *const u8,
-                        core::mem::size_of::<SockAddrIn>(),
-                    )
-                };
-                // R162-11 FIX: copy_to_user failure is also non-fatal for addr fill.
-                let _ = copy_to_user(addr as *mut u8, out_bytes);
-                let len_val = core::mem::size_of::<SockAddrIn>() as u32;
-                let _ = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes());
-            }
-        }
-    }
-
-    // Allocate capability + fd for child socket
     // R75-1 FIX: Pass network namespace ID to Socket capability (inherited from listener)
     // R152-1 FIX: Child socket rights are limited to (READ|WRITE) & listener_rights.
     // This enforces capability monotonicity: a restricted listener cannot mint
     // broader child capabilities via accept().
     let child_rights = (cap::CapRights::READ | cap::CapRights::WRITE) & entry.rights;
     let cap_entry = cap::CapEntry::with_flags(
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(
-            child.id,
-            child.net_ns_id.raw(),
-        ))),
+        cap::CapObject::Socket(cap::Socket::new(child.id, child.net_ns_id.raw())),
         child_rights,
         cap::CapFlags::empty(),
     );
+    let (new_fd, new_cap, proc_ctx) = prepared.commit(cap_entry, child.id, child_nonblock);
+    emit_cap_allocate_audit(&proc_ctx, new_cap);
 
-    let pid = match current_pid() {
-        Some(p) => p,
-        None => {
-            cleanup_child(&child);
-            return Err(SyscallError::ESRCH);
+    // R162-11/R180-24: peer-address copy failure is non-fatal after the child
+    // descriptor is valid. Copy at most the caller-provided length and report
+    // the actual sockaddr size; an invalid destination cannot kill the child.
+    if !addr.is_null() {
+        if let (Some(rip), Some(rport)) = (child.remote_ip(), child.remote_port()) {
+            let out = SockAddrIn::from_addr(rip, rport);
+            let _ = write_sockaddr_in(&out, addr, addrlen);
         }
-    };
-    let process = match get_process(pid) {
-        Some(p) => p,
-        None => {
-            cleanup_child(&child);
-            return Err(SyscallError::ESRCH);
-        }
-    };
-    let new_fd = {
-        let mut proc = process.lock();
-        let proc_ctx = lsm_process_ctx_from(&proc);
-
-        // R65-13 FIX: LSM hook before capability allocation
-        if let Err(err) =
-            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
-        {
-            drop(proc);
-            cleanup_child(&child);
-            return Err(lsm_error_to_syscall(err));
-        }
-
-        let new_cap = match proc.cap_table.allocate(cap_entry) {
-            Ok(c) => c,
-            Err(e) => {
-                drop(proc);
-                cleanup_child(&child);
-                return Err(cap_error_to_syscall(e));
-            }
-        };
-
-        // R65-13 FIX: Audit event for capability allocation
-        {
-            let subject = audit::AuditSubject::new(
-                proc_ctx.pid as u32,
-                proc_ctx.uid,
-                proc_ctx.gid,
-                proc_ctx.cap.map(|c| c.raw()),
-            );
-            let timestamp = crate::time::get_ticks();
-            let _ = audit::emit_capability_event(
-                audit::AuditOutcome::Success,
-                subject,
-                new_cap.raw(),
-                audit::AuditCapOperation::Allocate,
-                None,
-                0,
-                timestamp,
-            );
-        }
-
-        let sock_file = SocketFile::new(new_cap, child.id, nonblock);
-        match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
-            Ok(fd) => fd,
-            Err(rejected) => {
-                // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the
-                // rejected SocketFile (byte-equivalent to the old
-                // allocate_fd-internal drop — keeps the audited teardown
-                // ORDER: box-drop, then cap revoke, then cleanup_child);
-                // conversion to drop-outside tracked.
-                drop(rejected);
-                // Rollback capability allocation
-                // R65-13 FIX: Audit event for capability revocation (rollback)
-                {
-                    let subject = audit::AuditSubject::new(
-                        proc_ctx.pid as u32,
-                        proc_ctx.uid,
-                        proc_ctx.gid,
-                        proc_ctx.cap.map(|c| c.raw()),
-                    );
-                    let timestamp = crate::time::get_ticks();
-                    let _ = audit::emit_capability_event(
-                        audit::AuditOutcome::Success,
-                        subject,
-                        new_cap.raw(),
-                        audit::AuditCapOperation::Revoke,
-                        None,
-                        0,
-                        timestamp,
-                    );
-                }
-                let _ = proc.cap_table.revoke(new_cap);
-                drop(proc);
-                cleanup_child(&child);
-                return Err(SyscallError::EMFILE);
-            }
-        }
-    };
+    }
 
     Ok(new_fd as usize)
+}
+
+#[cfg(test)]
+mod rf180_37_socket_publication_tests {
+    use super::*;
+    use alloc::collections::VecDeque;
+    use core::cell::Cell;
+
+    struct DropMarker<'a>(&'a Cell<usize>);
+
+    impl Drop for DropMarker<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn rf180_37_socket_resource_failure_precedes_all_publication() {
+        // RF180-37 FIX: deterministic ENOMEM/EMFILE injection at the exact
+        // preflight boundary. The socket-publication closure is a tripwire;
+        // capability publication is independently covered by cap's prepared-
+        // allocation visibility/rollback tests.
+        for error in [SyscallError::ENOMEM, SyscallError::EMFILE] {
+            let socket_publications = Cell::new(0usize);
+            let result = socket_publish_after_preflight(
+                || Err::<(), _>(error),
+                || {
+                    socket_publications.set(socket_publications.get() + 1);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(error));
+            assert_eq!(
+                socket_publications.get(),
+                0,
+                "resource rejection must precede socket-table publication"
+            );
+        }
+    }
+
+    #[test]
+    fn rf180_37_socket_publish_failure_drops_every_prepared_resource() {
+        let drops = Cell::new(0usize);
+        let result = socket_publish_after_preflight(
+            || Ok::<_, SyscallError>(DropMarker(&drops)),
+            || Err::<(), _>(SyscallError::ENOMEM),
+        );
+        assert!(matches!(result, Err(SyscallError::ENOMEM)));
+        assert_eq!(drops.get(), 1, "failed create must roll preflight back");
+    }
+
+    #[test]
+    fn rf180_37_accept_failure_keeps_child_queued_and_retryable() {
+        for error in [SyscallError::ENOMEM, SyscallError::EMFILE] {
+            let child = 0x1803_7000_u64;
+            let mut queue = VecDeque::from([child]);
+            let pop_calls = Cell::new(0usize);
+            let ready = !queue.is_empty();
+            let failed = accept_after_preflight(
+                ready,
+                || Err::<(), _>(error),
+                || {
+                    pop_calls.set(pop_calls.get() + 1);
+                    Ok(queue.pop_front())
+                },
+            );
+            assert!(matches!(failed, Err(e) if e == error));
+            assert_eq!(pop_calls.get(), 0, "failed preflight must not dequeue");
+            assert_eq!(queue.front(), Some(&child));
+
+            let retry = accept_after_preflight(
+                !queue.is_empty(),
+                || Ok::<_, SyscallError>(()),
+                || Ok(queue.pop_front()),
+            )
+            .expect("retry preflight");
+            match retry {
+                AcceptPublicationAttempt::Ready {
+                    prepared: (),
+                    child: accepted,
+                } => assert_eq!(accepted, child),
+                _ => panic!("queued child was not retryable after resource failure"),
+            }
+            assert!(queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn rf180_37_accept_lost_race_releases_preflight_before_retry() {
+        let drops = Cell::new(0usize);
+        let attempt = accept_after_preflight(
+            true,
+            || Ok::<_, SyscallError>(DropMarker(&drops)),
+            || Ok::<Option<u64>, _>(None),
+        )
+        .expect("lost-race attempt");
+        assert!(matches!(attempt, AcceptPublicationAttempt::LostRace));
+        assert_eq!(drops.get(), 1);
+    }
 }
 
 /// sys_connect - Connect a TCP socket (syscall 42).
@@ -16760,30 +17406,13 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
         .connect(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, Some(0))
         .map_err(socket_error_to_syscall)?;
 
-    // R155-8 FIX: Seed conntrack entry for the outbound SYN before transmitting.
-    // Without this, the inbound SYN-ACK is classified Invalid (no existing entry,
-    // and SYN-ACK is not a pure SYN). Same pattern as the SYN cookie path.
-    // R156-9 FIX: Gate behind conntrack feature to match all other call sites.
-    #[cfg(feature = "conntrack")]
-    {
-        let now_ms = crate::time::get_ticks();
-        let _ = net::conntrack::ct_process_tcp(
-            socket.net_ns_id.0,
-            syn_result.src_ip,
-            syn_result.dst_ip,
-            syn_result.local_port,
-            syn_result.dst_port,
-            net::TCP_FLAG_SYN,
-            0,
-            now_ms,
-        );
-    }
+    // RF180-41 REVIEW FIX: the generic transmit path reserves and publishes
+    // conntrack together with device queue acceptance. Pre-seeding here would
+    // leave a ghost SYN on QueueFull and double-account successful sends.
 
     // Phase 2: Transmit the SYN segment via network device
     // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
-    if let Err(e) =
-        net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment, socket.net_ns_id.0)
-    {
+    if let Err(e) = net::transmit_tcp_connect(syn_result, socket.net_ns_id.0) {
         net::socket_table().abort_tcp_connect(&socket);
         return Err(tx_error_to_syscall(e));
     }
@@ -16872,10 +17501,6 @@ fn sys_sendto(
     dest_addr: *const SockAddrIn,
     addrlen: u32,
 ) -> SyscallResult {
-    if len == 0 {
-        return Ok(0);
-    }
-
     // Check flags
     let flag_bits = flags as u32;
     if flag_bits & !MSG_DONTWAIT != 0 {
@@ -16893,6 +17518,9 @@ fn sys_sendto(
     // Determine socket type
     let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
     let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+    if !is_tcp && !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
 
     // Get current process context early
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
@@ -16909,13 +17537,25 @@ fn sys_sendto(
             return Err(SyscallError::EMSGSIZE);
         }
 
+        // RF180-27 REVIEW FIX: zero-length TCP send is successful only after
+        // flags, fd kind, capability generation, namespace, rights, socket
+        // type, connection state, and LSM validation. The net-layer connected
+        // fast path remains allocation-free and does not mutate TCP state.
+        if len == 0 {
+            let (bytes_sent, segments) = net::socket_table()
+                .tcp_send(&socket, &ctx, cap_id, &[])
+                .map_err(socket_error_to_syscall)?;
+            debug_assert_eq!(bytes_sent, 0);
+            debug_assert!(segments.is_empty());
+            return Ok(0);
+        }
+
         // Copy payload from user space
         validate_user_ptr(buf, len)?;
-        // R156-3 FIX: Fallible allocation for TCP send buffer.
-        let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| SyscallError::ENOMEM)?;
-        data.resize(len, 0);
+        // R180-11: syscall copy staging competes with retained socket payloads
+        // in the same aggregate class. Its owner releases only after the net
+        // send path returns and the Vec backing has been deallocated.
+        let mut data = try_admitted_zeroed_buffer(mm::HeapClass::SocketPayload, len)?;
         copy_from_user(&mut data, buf)?;
 
         // Get remote IP for transmission
@@ -16970,15 +17610,6 @@ fn sys_sendto(
     }
     let dst_ip = net::Ipv4Addr(dest.ip_bytes());
 
-    // Copy payload from user space
-    validate_user_ptr(buf, len)?;
-    // R156-3 FIX: Fallible allocation for UDP send buffer.
-    let mut data = Vec::new();
-    data.try_reserve_exact(len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    data.resize(len, 0);
-    copy_from_user(&mut data, buf)?;
-
     // R48-REVIEW FIX: Source IP - use actual bound address if available.
     // If not bound, use INADDR_ANY (0.0.0.0) which send_to_udp will use
     // when auto-binding to an ephemeral port.
@@ -16987,15 +17618,30 @@ fn sys_sendto(
         .map(net::Ipv4Addr)
         .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
 
-    // Send via socket_table (includes LSM hook_net_send check)
-    let datagram = net::socket_table()
-        .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &data)
-        .map_err(socket_error_to_syscall)?;
+    // Send via socket_table (includes LSM hook_net_send check). A zero-length
+    // UDP send is a real datagram, not a no-op: pass an empty slice so the net
+    // layer emits the mandatory eight-byte UDP header without allocating a
+    // syscall staging buffer or touching the user pointer.
+    let datagram = if len == 0 {
+        net::socket_table()
+            .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &[])
+            .map_err(socket_error_to_syscall)?
+    } else {
+        validate_user_ptr(buf, len)?;
+        // R180-11: include the user-copy staging buffer in the socket-payload
+        // ledger; PendingDatagram takes its own retained charge on publication.
+        let mut data = try_admitted_zeroed_buffer(mm::HeapClass::SocketPayload, len)?;
+        copy_from_user(&mut data, buf)?;
+        net::socket_table()
+            .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &data)
+            .map_err(socket_error_to_syscall)?
+    };
 
     // Transmit the UDP datagram via network device
     // R162-7-2 FIX: Pass socket's namespace for per-NS egress firewall evaluation.
     net::transmit_udp_datagram(dst_ip, &datagram, socket.net_ns_id.0)
         .map_err(tx_error_to_syscall)?;
+    net::socket_table().commit_udp_send(&socket, len);
 
     Ok(len)
 }
@@ -17025,21 +17671,6 @@ fn sys_recvfrom(
     src_addr: *mut SockAddrIn,
     addrlen: *mut u32,
 ) -> SyscallResult {
-    if len == 0 {
-        return Ok(0);
-    }
-    // R159-12 FIX: Clamp to MAX_RW_SIZE, matching sys_read/sys_write.
-    if len > MAX_RW_SIZE {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // R160-1 FIX: Validate user buffer BEFORE any socket operation. The
-    // previous code called tcp_recv/recv_from_udp (which dequeues data)
-    // before checking the buffer pointer. On EFAULT, the dequeued data was
-    // irretrievably lost — violating TCP's reliable delivery at the syscall
-    // boundary. This matches the pattern in sys_read (line 5255).
-    validate_user_ptr_mut(buf, len)?;
-
     // Check flags
     let flag_bits = flags as u32;
     if flag_bits & !MSG_DONTWAIT != 0 {
@@ -17057,6 +17688,33 @@ fn sys_recvfrom(
     // Determine socket type
     let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
     let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+    if !is_tcp && !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // R159-12 FIX: Clamp to MAX_RW_SIZE, matching sys_read/sys_write. Keep
+    // this after fd/capability/namespace/rights/type validation so a zero-size
+    // request cannot turn an invalid handle into a false success.
+    if len > MAX_RW_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // TCP recv() semantics require a NULL source-address pointer. Validate the
+    // operation shape before touching any user range or receive queue.
+    if is_tcp && !src_addr.is_null() {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+    if is_udp && !src_addr.is_null() && addrlen.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // R160-1/RF180-27: validate a non-empty destination before a transactional
+    // receive can expose data. A zero-length buffer may be NULL and performs no
+    // payload copy, but UDP still consumes one whole datagram after optional
+    // source-address copyout succeeds.
+    if len != 0 {
+        validate_user_ptr_mut(buf, len)?;
+    }
 
     // Get current process context
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
@@ -17069,47 +17727,42 @@ fn sys_recvfrom(
     };
 
     // TCP: recv() semantics when src_addr is NULL (connected socket)
-    if is_tcp && src_addr.is_null() {
-        let data = net::socket_table()
-            .tcp_recv(&socket, &ctx, cap_id, len, timeout)
-            .map_err(socket_error_to_syscall)?;
-
-        // R161-1 FIX: Remove redundant validate_user_ptr_mut(buf, copy_len).
-        // The buffer was already validated at line 10273 with the full `len`.
-        // When tcp_recv returns empty Vec (TCP EOF / FIN), copy_len == 0,
-        // and validate_user_ptr rejects len==0 → EFAULT, breaking EOF detection.
-        // Guard copy with copy_len > 0; return 0 for EOF (POSIX recv semantics).
-        let copy_len = core::cmp::min(len, data.len());
-        if copy_len > 0 {
-            copy_to_user(buf, &data[..copy_len])?;
-        }
-        return Ok(copy_len);
+    if is_tcp {
+        let copied = net::socket_table()
+            .tcp_recv_with_commit(&socket, &ctx, cap_id, len, timeout, |data| {
+                if !data.is_empty() {
+                    copy_to_user(buf, data)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| match error {
+                net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
+                net::RecvTransactionError::Commit(error) => error,
+            })?;
+        return Ok(copied);
     }
 
-    // Must be UDP for recvfrom with address
-    if !is_udp {
-        return Err(SyscallError::EOPNOTSUPP);
-    }
-
-    // Receive via socket_table (includes LSM hook_net_recv check)
-    let pkt = net::socket_table()
-        .recv_from_udp(&socket, &ctx, cap_id, timeout)
-        .map_err(socket_error_to_syscall)?;
-
-    // R161-1 FIX: Same fix as TCP path — remove redundant validation.
-    // A 0-length UDP datagram is protocol-legal (RFC 768); returning EFAULT is wrong.
-    let copy_len = core::cmp::min(len, pkt.data.len());
-    if copy_len > 0 {
-        copy_to_user(buf, &pkt.data[..copy_len])?;
-    }
-
-    // Write source address if requested
-    if !src_addr.is_null() {
-        let sockaddr = SockAddrIn::from_addr(pkt.src_ip.0, pkt.src_port);
-        write_sockaddr_in(&sockaddr, src_addr, addrlen)?;
-    }
-
-    Ok(copy_len)
+    // Keep the exact datagram queued until payload and optional source address
+    // have both copied successfully. A fault may leave partial destination
+    // bytes, but retry observes the same source packet instead of data loss.
+    net::socket_table()
+        .recv_from_udp_with_commit(&socket, &ctx, cap_id, timeout, |pkt| {
+            if !src_addr.is_null() {
+                let sockaddr = SockAddrIn::from_addr(pkt.src_ip.0, pkt.src_port);
+                write_sockaddr_in(&sockaddr, src_addr, addrlen)?;
+            }
+            let payload = pkt.payload();
+            let copied = core::cmp::min(len, payload.len());
+            if copied != 0 {
+                let copy = payload.get(..copied).ok_or(SyscallError::EIO)?;
+                copy_to_user(buf, copy)?;
+            }
+            Ok(copied)
+        })
+        .map_err(|error| match error {
+            net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
+            net::RecvTransactionError::Commit(error) => error,
+        })
 }
 
 /// sys_shutdown - Shutdown TCP connection (syscall 48).
@@ -17355,6 +18008,7 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
 
     match cgroup::create_cgroup(parent_id, ctrl_flags) {
         Ok(node) => Ok(node.id() as usize),
+        Err(cgroup::CgroupError::OutOfMemory) => Err(SyscallError::ENOMEM),
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::DepthLimit) => Err(SyscallError::ENOSPC),
         Err(cgroup::CgroupError::CgroupLimit) => Err(SyscallError::ENOSPC),
@@ -17465,30 +18119,9 @@ fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> 
 
 /// R93-5 FIX: Check if target cgroup is a descendant of ancestor cgroup.
 ///
-/// Returns true if `target_id` is the same as `ancestor_id` or is a descendant
-/// (child, grandchild, etc.) of `ancestor_id`. This is used to enforce that
-/// non-root processes can only move to more restricted (deeper) cgroups.
+/// Thin wrapper over the shared helper in `cgroup` (R180-3 dual-front-door parity).
 fn cgroup_is_descendant_of(target_id: u64, ancestor_id: u64) -> bool {
-    // Same cgroup is allowed (no movement)
-    if target_id == ancestor_id {
-        return true;
-    }
-
-    // Walk up from target to see if we reach ancestor
-    let target = match cgroup::lookup_cgroup(target_id) {
-        Some(cg) => cg,
-        None => return false,
-    };
-
-    let mut cursor = target.parent();
-    while let Some(parent) = cursor {
-        if parent.id() == ancestor_id {
-            return true;
-        }
-        cursor = parent.parent();
-    }
-
-    false
+    cgroup::cgroup_is_descendant_of(target_id, ancestor_id)
 }
 
 /// sys_cgroup_attach - Attach current process to a cgroup
@@ -17510,6 +18143,9 @@ fn cgroup_is_descendant_of(target_id: u64, ancestor_id: u64) -> bool {
 ///
 /// Root users can still move anywhere; non-root with CAP_SYS_ADMIN is restricted
 /// to descendants to prevent accidental privilege escalation.
+///
+/// R180-3 FIX: delegated managers must own **both** source and destination
+/// (shared with cgroupfs via `cgroup::authorize_cgroup_migrate`).
 fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
     let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -17519,34 +18155,23 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         proc.cgroup_id
     };
 
-    // R93-5 FIX: Require CAP_SYS_ADMIN or root to attach to cgroups
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let is_root = crate::current_is_host_root();
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    // R134-2: host-mapped euid for delegation identity.
+    let host_euid = crate::process::current_host_euid();
 
-    if !is_root {
-        // P1-3: Delegated owners of the target cgroup may attach without
-        // CAP_SYS_ADMIN, but are still subject to the descendant-or-delegated
-        // check to prevent cgroup escape.
-        if is_cgroup_delegated_to_caller(cgroup_id) {
-            // Delegated user: verify target is within the delegated subtree.
-            // is_delegated_to() already walks ancestors, so if the target cgroup
-            // is delegated to us, attaching is safe.
-        } else {
-            // Non-delegated, non-root: need CAP_SYS_ADMIN + descendant check
-            let has_cap_admin = with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
-                .unwrap_or(false);
-            if !has_cap_admin {
-                return Err(SyscallError::EPERM);
-            }
-
-            // R93-5 FIX: Non-root can only move to descendant cgroups to prevent escape
-            // This prevents moving from a restricted child to a less-restricted parent
-            if !cgroup_is_descendant_of(cgroup_id, old_cgroup_id) {
-                return Err(SyscallError::EPERM);
-            }
-        }
-    }
+    // R180-3: preflight auth (cheap reject). Authoritative re-auth under Process
+    // lock uses the locked `proc.cgroup_id` so concurrent re-homes cannot swap
+    // the source after the check.
+    cgroup::authorize_cgroup_migrate(old_cgroup_id, cgroup_id, host_euid, is_root, has_cap_admin)
+        .map_err(|e| match e {
+        cgroup::CgroupError::OutOfMemory => SyscallError::ENOMEM,
+        cgroup::CgroupError::NotFound => SyscallError::ENOENT,
+        cgroup::CgroupError::PermissionDenied => SyscallError::EPERM,
+        _ => SyscallError::EPERM,
+    })?;
 
     // R156-1 FIX: Read memory_space under brief lock, then call
     // address_space_share_count() OUTSIDE Process lock to avoid ABBA
@@ -17595,101 +18220,80 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // grow's rollback re-reads the current cgroup_id, so a migration there transfers the
     // in-flight charge rather than stranding it (Codex SLICE-4: accounting-safe, only the
     // transient-state POLICY is asymmetric; SLICE 5 may unify both front doors).
-    if proc.mm.lock().stack_grow_in_progress {
+    let mm_txn = proc.mm.lock();
+    if mm_txn.fork_in_progress || mm_txn.stack_grow_in_progress {
         return Err(SyscallError::EAGAIN);
     }
+    drop(mm_txn);
 
-    match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
-        Ok(()) => {
-            let total_charged_bytes = crate::process::compute_cgroup_charged_bytes(&proc);
+    // R180-3: authoritative source under the held lock (may differ from preflight).
+    let from_id = proc.cgroup_id;
+    cgroup::authorize_cgroup_migrate(from_id, cgroup_id, host_euid, is_root, has_cap_admin)
+        .map_err(|e| match e {
+            cgroup::CgroupError::OutOfMemory => SyscallError::ENOMEM,
+            cgroup::CgroupError::NotFound => SyscallError::ENOENT,
+            cgroup::CgroupError::PermissionDenied => SyscallError::EPERM,
+            _ => SyscallError::EPERM,
+        })?;
 
-            // J2-7: combined cgroup migration with a HOLE-FREE rollback. The two
-            // MOVABLE controllers (memory + FDs) are migrated so that EVERY rollback
-            // is a saturating uncharge (can never fail) or the pre-existing
-            // best-effort migrate_task reverse — there is no fallible reverse-charge
-            // that could strand a charge in the destination.
-            //
-            // R169-7 (D2-J2-CHARGE-LIFETIME): per-cgroup ephemeral-PORT charges are
-            // intentionally NOT re-homed here. Unlike fds/memory (per-process
-            // tallies owned by this PID), a port charge is anchored in the
-            // `PortBinding.charged_cgroup` of an `Arc<SocketState>` that may be
-            // SHARED by N file descriptors across fork/CLONE_FILES/dup — there is no
-            // per-process port tally to move, and re-keying by PID would
-            // mis-attribute a sibling's still-live charge. The charge therefore
-            // stays anchored to the cgroup that allocated the port until the binding
-            // is torn down (uncharge uses the STORED cgid) or dead-`Weak` reaped by
-            // the global sweep (`sweep_stranded_port_charges`). The residual is made
-            // LOUD by the R169-3 `delete_cgroup` gate (the source cgroup cannot be
-            // deleted while a live port charge references it) and self-heals on
-            // socket teardown. Full Arc-shared port migration is a separate
-            // from-scratch design (needs a designated-owner socket set), DEFERRED.
-            //
-            // Protocol: (1) charge the FD count
-            // to the DESTINATION first; (2) migrate memory (charge-dest-first,
-            // R148-1); (3) complete the FD move by uncharging the SOURCE. The
-            // reverse of step 1 is uncharge_fds (never fails); a step-2 failure
-            // leaves memory at the source (R148-1), so we just undo step 1.
-            // fds_charged_count is read under the held Process lock.
-            let fd_count = proc.fds_charged_count;
-            if let Err(_e) = cgroup::try_charge_fds(cgroup_id, fd_count) {
-                let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
-                return Err(SyscallError::EAGAIN);
-            }
-            if let Err(_e) =
-                cgroup::migrate_memory_charges(total_charged_bytes, old_cgroup_id, cgroup_id)
-            {
-                // Memory dest-charge failed → source memory untouched (R148-1).
-                // Undo the FD dest-charge (saturating, never fails) and revert.
-                // R156-5 FIX: keep the Process lock held throughout the rollback.
-                cgroup::uncharge_fds(cgroup_id, fd_count);
-                let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
-                return Err(SyscallError::ENOMEM);
-            }
-            // Both destinations charged and memory source uncharged. Complete the
-            // FD migration: uncharge the source (never fails). FDs + memory now
-            // both reside at the destination, consistent with proc.cgroup_id.
-            cgroup::uncharge_fds(old_cgroup_id, fd_count);
-
-            // R170-3 FIX: land any contention-deferred CPU-quota debt on the
-            // OLD cgroup BEFORE re-pointing (take under the held Process
-            // lock, then flush — the blocking walk is process-context-legal
-            // under the established Process → cgroup order). Without this,
-            // the next tick's tag-mismatch branch would silently discard the
-            // source cgroup's deferred charge.
-            let quota_debt = (proc.cpu_quota_debt_cgid, proc.cpu_quota_debt_ns);
-            proc.cpu_quota_debt_ns = 0;
-            cgroup::flush_cpu_quota_debt(
-                quota_debt.0,
-                quota_debt.1,
-                crate::current_timestamp_ms().saturating_mul(1_000_000),
-            );
-
-            proc.cgroup_id = cgroup_id;
-            Ok(0)
-        }
-        Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
-        Err(cgroup::CgroupError::PidsLimitExceeded) => Err(SyscallError::EAGAIN),
-        Err(cgroup::CgroupError::TaskNotAttached) => {
-            // R94-11 FIX: TaskNotAttached indicates an inconsistent state between
-            // the PCB's recorded cgroup_id and the actual cgroup membership.
-            // This should not happen in normal operation and may indicate:
-            // - A race condition during cgroup migration
-            // - Memory corruption
-            // - A bug in cgroup bookkeeping
-            //
-            // Previous behavior: Try direct attach to new cgroup as fallback.
-            // This was a security risk because it could bypass cgroup hierarchy
-            // restrictions - a task might escape from a restricted child cgroup
-            // to a less-restricted parent by exploiting this fallback path.
-            //
-            // New behavior: Return EIO to indicate internal inconsistency.
-            // The caller should not retry without understanding the root cause.
-            // This is fail-closed security: we refuse to proceed when state is
-            // indeterminate rather than potentially violating isolation.
-            Err(SyscallError::EIO)
-        }
-        Err(_) => Err(SyscallError::EINVAL),
+    if from_id == cgroup_id {
+        return Ok(0);
     }
+
+    let total_charged_bytes = crate::process::compute_cgroup_charged_bytes(&proc);
+    let fd_count = proc.total_fd_charge_count();
+
+    // RF180-45: precharge every movable destination resource before publishing
+    // membership. A failed precharge leaves the source intact; a failed
+    // membership commit rolls back only saturating destination uncharges, so no
+    // fallible reverse migration can split membership from resource accounting.
+    // Installed FDs and R180-23 in-flight reservations move together under the
+    // Process lock. Port charges remain anchored to their stored binding cgroup.
+    if let Err(error) = cgroup::try_charge_fds(cgroup_id, fd_count) {
+        return Err(match error {
+            cgroup::CgroupError::NotFound => SyscallError::ENOENT,
+            cgroup::CgroupError::OutOfMemory => SyscallError::ENOMEM,
+            _ => SyscallError::EAGAIN,
+        });
+    }
+    if let Err(error) = cgroup::try_charge_memory(cgroup_id, total_charged_bytes) {
+        cgroup::uncharge_fds(cgroup_id, fd_count);
+        return Err(match error {
+            cgroup::CgroupError::NotFound => SyscallError::ENOENT,
+            _ => SyscallError::ENOMEM,
+        });
+    }
+
+    if let Err(error) = cgroup::migrate_task(pid as u64, from_id, cgroup_id) {
+        cgroup::uncharge_memory(cgroup_id, total_charged_bytes);
+        cgroup::uncharge_fds(cgroup_id, fd_count);
+        return match error {
+            cgroup::CgroupError::OutOfMemory => Err(SyscallError::ENOMEM),
+            cgroup::CgroupError::NotFound => Err(SyscallError::ENOENT),
+            cgroup::CgroupError::Busy => Err(SyscallError::EAGAIN),
+            cgroup::CgroupError::PidsLimitExceeded => Err(SyscallError::EAGAIN),
+            cgroup::CgroupError::TaskNotAttached => Err(SyscallError::EIO),
+            _ => Err(SyscallError::EINVAL),
+        };
+    }
+
+    // Membership is committed. Release the source copies only now, keeping all
+    // precommit windows conservative (over-counted) rather than permissive.
+    cgroup::uncharge_memory(from_id, total_charged_bytes);
+    cgroup::uncharge_fds(from_id, fd_count);
+
+    // R170-3 FIX: land any contention-deferred CPU-quota debt on the old cgroup
+    // before re-pointing the PCB.
+    let quota_debt = (proc.cpu_quota_debt_cgid, proc.cpu_quota_debt_ns);
+    proc.cpu_quota_debt_ns = 0;
+    cgroup::flush_cpu_quota_debt(
+        quota_debt.0,
+        quota_debt.1,
+        crate::current_timestamp_ms().saturating_mul(1_000_000),
+    );
+
+    proc.cgroup_id = cgroup_id;
+    Ok(0)
 }
 
 /// Limit types for sys_cgroup_set_limit
@@ -18489,7 +19093,7 @@ enum FdKind {
     ConsoleOut,
     /// A cross-crate probe (pipe). `write_end` selects which end's status.
     Dyn {
-        probe: alloc::sync::Arc<dyn crate::poll::PollProbeOps>,
+        probe: crate::poll::OwnedPollProbe,
         write_end: bool,
     },
     /// A live socket fd (cap validated, ns snapshotted under the Process lock).
@@ -18708,24 +19312,22 @@ fn poll_copyin_pollfds(
     fds: u64,
     nfds: usize,
     bytes: usize,
-) -> Result<Vec<PollEntry>, SyscallError> {
-    let mut entries: Vec<PollEntry> = Vec::new();
-    entries
-        .try_reserve_exact(nfds)
-        .map_err(|_| SyscallError::ENOMEM)?;
+) -> Result<AdmittedVec<PollEntry>, SyscallError> {
+    // Both the retained PollEntry vector and the temporary wire-image vector
+    // participate in the same aggregate class. The entry owner is returned and
+    // remains charged through wait cancellation and final copyout.
+    let mut entries = try_admitted_vec(mm::HeapClass::BlockingIo, nfds)?;
     if nfds == 0 {
         return Ok(entries);
     }
     validate_user_ptr(fds as *const u8, bytes)?;
     verify_user_memory(fds as *const u8, bytes, true)?;
-    let mut pfds: Vec<crate::poll::PollFd> = Vec::new();
-    pfds.try_reserve_exact(nfds)
-        .map_err(|_| SyscallError::ENOMEM)?;
+    let mut pfds = try_admitted_vec::<crate::poll::PollFd>(mm::HeapClass::BlockingIo, nfds)?;
     pfds.resize(nfds, crate::poll::PollFd::default());
     // lint-repr-c-copy: allow (PollFd[] {i32,i16,i16} = 8 bytes, no padding; user→kernel)
     let dst = unsafe { core::slice::from_raw_parts_mut(pfds.as_mut_ptr() as *mut u8, bytes) };
     copy_from_user(dst, fds as *const u8)?;
-    for pf in &pfds {
+    for pf in pfds.iter() {
         entries.push(PollEntry {
             fd: pf.fd,
             events: pf.events,
@@ -19005,11 +19607,11 @@ fn select_build_entries(
     wset: &[u64],
     eset: &[u64],
     nb: usize,
-) -> Result<Vec<PollEntry>, SyscallError> {
-    let mut entries: Vec<PollEntry> = Vec::new();
-    entries
-        .try_reserve_exact(nb)
-        .map_err(|_| SyscallError::ENOMEM)?;
+) -> Result<AdmittedVec<PollEntry>, SyscallError> {
+    // The maximum is small, but an unbounded number of blocked callers can
+    // retain these vectors. Charge the exact backing for the complete wait and
+    // copyout lifetime rather than treating the per-call cap as aggregate proof.
+    let mut entries = try_admitted_vec(mm::HeapClass::BlockingIo, nb)?;
     for fd in 0..nb {
         let r = crate::poll::fd_set_test(&rset[..words], fd);
         let w = crate::poll::fd_set_test(&wset[..words], fd);

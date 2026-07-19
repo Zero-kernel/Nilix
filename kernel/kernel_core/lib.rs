@@ -1,6 +1,7 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 #![feature(negative_impls)]
+#![feature(allocator_api)]
 extern crate alloc;
 
 // 导入 drivers crate，这会自动导入其导出的宏
@@ -67,12 +68,13 @@ pub use process::{
     current_host_egid,                 // R135-1: host-mapped egid for DAC
     current_host_euid,                 // R133-1: host-mapped euid for privilege gates
     current_host_supplementary_groups, // R135-1: host-mapped supplementary groups for DAC
-    current_ipc_ns,                    // F.1: IPC namespace
-    current_ipc_ns_id,                 // R75-2: IPC namespace ID for partitioning
-    current_is_host_root,              // R133-1: host root check for global gates
-    current_mount_ns,                  // F.1: Mount namespace
-    current_net_ns,                    // F.1: Network namespace
-    current_net_ns_id,                 // R75-1: Network namespace ID for partitioning
+    current_in_host_supplementary_group,
+    current_ipc_ns,       // F.1: IPC namespace
+    current_ipc_ns_id,    // R75-2: IPC namespace ID for partitioning
+    current_is_host_root, // R133-1: host root check for global gates
+    current_mount_ns,     // F.1: Mount namespace
+    current_net_ns,       // F.1: Network namespace
+    current_net_ns_id,    // R75-1: Network namespace ID for partitioning
     current_pid,
     current_supplementary_groups,
     current_umask,
@@ -111,9 +113,13 @@ pub use process::{
     FutexKey,
     KernelStackError,
     KptiCr3UpdateCallback,
+    PreparedFileDescriptor,
     Priority,
+    ProcessArc,
+    ProcessArcAllocator,
     // Process ID type
     ProcessId,
+    ProcessWeak,
     KSTACK_BASE,
     KSTACK_STRIDE,
     MAX_FD,
@@ -126,9 +132,12 @@ pub use cap::{
     Shm, Socket, Timer, DEFAULT_CAP_SLOTS,
 };
 pub use scheduler_hook::{
-    force_init_resched_locals, force_reschedule, force_reschedule_from_irq, on_scheduler_tick,
-    register_kernel_gs_assert, register_resched_callback, register_timer_callback,
-    request_resched_from_irq, reschedule_if_needed, ReschedOrigin,
+    drain_requested_soft_progress, force_init_resched_locals, force_reschedule,
+    force_reschedule_from_irq, mark_process_deferred_work_ready, on_scheduler_tick,
+    process_deferred_work_ready, register_kernel_gs_assert, register_resched_callback,
+    register_soft_progress_callback, register_timer_callback, request_resched_from_irq,
+    request_soft_progress_from_irq, reschedule_if_needed, reschedule_if_needed_with_post_drain,
+    CallbackRegistrationError, ReschedOrigin,
 };
 pub use signal::{
     default_action, register_kick_callback, register_resume_callback, send_signal, signal_name,
@@ -150,6 +159,7 @@ pub use syscall::{
     register_fd_write_callback,
     register_futex_callback,
     register_mount_ns_materialize_callback,
+    register_mount_ns_materialize_rollback_callback,
     register_pipe_callback,
     register_syscall_frame_callback,
     register_vfs_create_callback,
@@ -199,13 +209,15 @@ pub use usercopy::{
 // E.4: RCU (Read-Copy-Update) synchronization primitive
 pub use rcu::{
     call_rcu, rcu_quiescent_state, rcu_read_lock, rcu_read_lock_held, rcu_read_unlock,
-    synchronize_rcu, RcuReadGuard,
+    synchronize_rcu, try_reserve_callback, RcuBackpressure, RcuCallbackPermit, RcuReadGuard,
+    RCU_CALLBACK_CAPACITY, RCU_GENERAL_CALLBACK_CAPACITY, RCU_STACK_CALLBACK_CAPACITY,
 };
 // F.1: PID namespace support
 pub use pid_namespace::{
     assign_pid_chain, detach_pid_chain, get_cascade_kill_pids, is_visible_in_namespace,
     owning_namespace, pid_in_namespace, pid_in_owning_namespace, resolve_pid_in_namespace,
-    PidNamespace, PidNamespaceError, PidNamespaceMembership, MAX_PID_NS_LEVEL, ROOT_PID_NAMESPACE,
+    PidNamespace, PidNamespaceArc, PidNamespaceArcAllocator, PidNamespaceError,
+    PidNamespaceMembership, PidNamespaceWeak, MAX_PID_NS_LEVEL, ROOT_PID_NAMESPACE,
 };
 // F.1: Mount namespace support
 pub use mount_namespace::{
@@ -257,6 +269,8 @@ pub use cgroup::{
     try_charge_memory,
     uncharge_memory,
     wait_for_io_window,
+    CgroupArc,
+    CgroupArcAllocator,
     CgroupControllers,
     CgroupError,
     CgroupId,
@@ -264,6 +278,7 @@ pub use cgroup::{
     CgroupNode,
     CgroupStats,
     CgroupStatsSnapshot,
+    CgroupWeak,
     CpuQuotaStatus,
     IoDirection,
     IoThrottleStatus,
@@ -318,7 +333,8 @@ pub fn init() {
     syscall::register_cgroup_port_hooks();
 
     // Register socket timeout checker as timer callback
-    scheduler_hook::register_timer_callback(syscall::check_socket_timeouts);
+    scheduler_hook::register_timer_callback(syscall::check_socket_timeouts)
+        .expect("socket timeout timer callback slots exhausted");
 
     // R26-4 FIX: Register audit snapshot authorizer
     // R133-1 FIX: Use host-mapped root check for host-global gate
