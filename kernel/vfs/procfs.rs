@@ -9,26 +9,43 @@
 //! - /proc/meminfo - System memory information
 //! - /proc/cpuinfo - CPU information
 
-use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 use core::any::Any;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_core::FileOps;
+use kernel_core::FileDescriptor;
 // R29-1 FIX: Import process module for real process information
-use kernel_core::process::{self, Process, ProcessState, PROCESS_TABLE};
+use kernel_core::process::{self, ProcessArc, ProcessState, ProcessWeak, PROCESS_TABLE};
 // R36 FIX: Import time module for uptime and mm for memory stats
 use kernel_core::time;
 use mm::memory::FrameAllocator;
 use mm::page_cache::PAGE_CACHE;
-use spin::Mutex;
+use mm::{arc_charge_bytes, try_reserve_heap, AdmittedString, AdmittedVec, HeapCharge, HeapClass};
 
 /// Global procfs ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(200);
+static FAIL_NEXT_PROCFS_ARC: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Build one procfs-owned Arc only after admitting its complete allocation.
+/// The charge is embedded as the final payload field, matching the existing
+/// ramfs/devfs inode discipline. Procfs never stores Weak inode references, so
+/// the final strong drop immediately destroys the payload and then its control
+/// block; process Arcs use the stronger allocator-owned lifetime below because
+/// procfs deliberately retains `ProcessWeak` handles.
+fn try_new_procfs_arc<T>(build: impl FnOnce(HeapCharge) -> T) -> Result<Arc<T>, FsError> {
+    if FAIL_NEXT_PROCFS_ARC.swap(false, Ordering::AcqRel) {
+        return Err(FsError::NoMem);
+    }
+    let bytes = arc_charge_bytes::<T>().map_err(|_| FsError::NoMem)?;
+    let reservation = try_reserve_heap(HeapClass::Procfs, bytes).map_err(|_| FsError::NoMem)?;
+    let charge = reservation.commit().map_err(|_| FsError::NoMem)?;
+    Arc::try_new(build(charge)).map_err(|_| FsError::NoMem)
+}
 
 /// RF178-19 FIX: Stable identity and namespace view for every per-process
 /// procfs inode. Holding the exact Process Arc prevents any later raw-PID
@@ -37,14 +54,14 @@ static NEXT_FS_ID: AtomicU64 = AtomicU64::new(200);
 struct ProcIdentity {
     /// A procfs descriptor must not retain an exited task's complete PCB/MM/FD
     /// graph indefinitely. Upgrade only while validating or snapshotting.
-    process: Weak<Mutex<Process>>,
+    process: ProcessWeak,
     pid: u32,
     generation: u64,
     display_pid: u32,
-    viewer_ns: Option<Arc<kernel_core::PidNamespace>>,
+    viewer_ns: Option<kernel_core::PidNamespaceArc>,
 }
 
-type BoundProcess = Arc<Mutex<Process>>;
+type BoundProcess = ProcessArc;
 
 // ============================================================================
 // ProcFs
@@ -54,19 +71,67 @@ type BoundProcess = Arc<Mutex<Process>>;
 pub struct ProcFs {
     fs_id: u64,
     root: Arc<ProcRootInode>,
+    /// RF180-40: admission for the ProcFs Arc itself.
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl ProcFs {
-    /// Create a new procfs
-    pub fn new() -> Arc<Self> {
+    /// Create a new procfs through fully fallible, admitted Arc publication.
+    pub fn try_new() -> Result<Arc<Self>, FsError> {
         // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
         let fs_id = NEXT_FS_ID
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .expect("procfs: NEXT_FS_ID overflow");
+            .map_err(|_| FsError::NoMem)?;
 
-        let root = Arc::new(ProcRootInode { fs_id });
+        let root = try_new_procfs_arc(|charge| ProcRootInode {
+            fs_id,
+            _heap_charge: Some(charge),
+        })?;
 
-        Arc::new(Self { fs_id, root })
+        try_new_procfs_arc(|charge| Self {
+            fs_id,
+            root,
+            _heap_charge: Some(charge),
+        })
+    }
+
+    /// RF180-40 deterministic production-path test: every procfs Arc is
+    /// admitted, an injected allocation failure returns ENOMEM semantics with
+    /// no ledger drift, and dropping the complete private filesystem releases
+    /// all Procfs-class bytes.
+    pub fn run_admission_self_test() {
+        let before = mm::heap_class_snapshot(HeapClass::Procfs);
+        let fs = Self::try_new().expect("RF180-40 procfs fixture");
+        let root = fs.root_inode();
+        let stable = mm::heap_class_snapshot(HeapClass::Procfs);
+
+        FAIL_NEXT_PROCFS_ARC.store(true, Ordering::Release);
+        assert!(matches!(fs.lookup(&root, "meminfo"), Err(FsError::NoMem)));
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Procfs),
+            stable,
+            "RF180-40 failed procfs inode publication drifted admission"
+        );
+
+        for name in ["meminfo", "cpuinfo", "uptime", "version"] {
+            let inode = fs
+                .lookup(&root, name)
+                .expect("RF180-40 admitted procfs inode publication");
+            drop(inode);
+            assert_eq!(
+                mm::heap_class_snapshot(HeapClass::Procfs),
+                stable,
+                "RF180-40 dropped procfs inode retained admission"
+            );
+        }
+
+        drop(root);
+        drop(fs);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Procfs),
+            before,
+            "RF180-40 procfs fixture leaked admission"
+        );
     }
 }
 
@@ -99,6 +164,7 @@ impl FileSystem for ProcFs {
             let alias_dir = ProcPidDirInode {
                 fs_id: self.fs_id,
                 identity: self_link.identity.clone(),
+                _heap_charge: None,
             };
             return alias_dir.lookup_child(name);
         }
@@ -119,6 +185,7 @@ impl FileSystem for ProcFs {
 /// /proc root directory inode
 struct ProcRootInode {
     fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl ProcRootInode {
@@ -126,23 +193,37 @@ impl ProcRootInode {
         match name {
             "self" => {
                 let identity = bind_current_proc_identity(get_current_pid())?;
-                Ok(Arc::new(ProcSelfSymlink {
+                Ok(try_new_procfs_arc(|charge| ProcSelfSymlink {
                     fs_id: self.fs_id,
                     identity,
-                }))
+                    _heap_charge: Some(charge),
+                })?)
             }
-            "meminfo" => Ok(Arc::new(ProcMeminfoInode { fs_id: self.fs_id })),
-            "cpuinfo" => Ok(Arc::new(ProcCpuinfoInode { fs_id: self.fs_id })),
-            "uptime" => Ok(Arc::new(ProcUptimeInode { fs_id: self.fs_id })),
-            "version" => Ok(Arc::new(ProcVersionInode { fs_id: self.fs_id })),
+            "meminfo" => Ok(try_new_procfs_arc(|charge| ProcMeminfoInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
+            "cpuinfo" => Ok(try_new_procfs_arc(|charge| ProcCpuinfoInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
+            "uptime" => Ok(try_new_procfs_arc(|charge| ProcUptimeInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
+            "version" => Ok(try_new_procfs_arc(|charge| ProcVersionInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
             _ => {
                 // Try to parse as PID
                 if let Ok(ns_pid) = name.parse::<u32>() {
                     let identity = bind_named_proc_identity(ns_pid)?;
-                    return Ok(Arc::new(ProcPidDirInode {
+                    return Ok(try_new_procfs_arc(|charge| ProcPidDirInode {
                         fs_id: self.fs_id,
                         identity,
-                    }));
+                        _heap_charge: Some(charge),
+                    })?);
                 }
                 Err(FsError::NotFound)
             }
@@ -177,14 +258,17 @@ impl Inode for ProcRootInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Directories can only be opened for read-only operations (getdents64)
         if flags.is_writable() {
             return Err(FsError::IsDir);
         }
-        // Return directory handle with seekable=false
-        let inode: Arc<dyn Inode> = Arc::new(ProcRootInode { fs_id: self.fs_id });
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn is_dir(&self) -> bool {
@@ -213,15 +297,15 @@ impl Inode for ProcRootInode {
         }
 
         // R31-1 FIX: List PIDs filtered by access control (self/root/same owner/gid)
-        let pids: Vec<u32> = list_pids()
-            .into_iter()
-            .filter(|&pid| can_access_pid(pid))
-            .collect();
+        let pids = list_pids()?;
         let pid_offset = offset - static_entries.len();
 
-        if pid_offset < pids.len() {
-            let global_pid = pids[pid_offset];
-
+        if let Some(global_pid) = pids
+            .iter()
+            .copied()
+            .filter(|&pid| can_access_pid(pid))
+            .nth(pid_offset)
+        {
             // R141-5 FIX: Display namespace-local PID in directory names.
             // Without this, directory entries show global kernel PIDs that
             // don't match getpid() output in PID namespaces, breaking
@@ -255,6 +339,7 @@ impl Inode for ProcRootInode {
 struct ProcSelfSymlink {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl ProcSelfSymlink {
@@ -262,6 +347,7 @@ impl ProcSelfSymlink {
         ProcPidDirInode {
             fs_id: self.fs_id,
             identity: self.identity.clone(),
+            _heap_charge: None,
         }
     }
 
@@ -300,7 +386,11 @@ impl Inode for ProcSelfSymlink {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        _flags: OpenFlags,
+        _prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         Err(FsError::Invalid)
     }
 
@@ -346,6 +436,7 @@ impl Inode for ProcSelfSymlink {
 struct ProcPidDirInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl ProcPidDirInode {
@@ -355,26 +446,31 @@ impl ProcPidDirInode {
             return Err(FsError::PermDenied);
         }
         match name {
-            "status" => Ok(Arc::new(ProcPidStatusInode {
+            "status" => Ok(try_new_procfs_arc(|charge| ProcPidStatusInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
-            })),
-            "cmdline" => Ok(Arc::new(ProcPidCmdlineInode {
+                _heap_charge: Some(charge),
+            })?),
+            "cmdline" => Ok(try_new_procfs_arc(|charge| ProcPidCmdlineInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
-            })),
-            "stat" => Ok(Arc::new(ProcPidStatInode {
+                _heap_charge: Some(charge),
+            })?),
+            "stat" => Ok(try_new_procfs_arc(|charge| ProcPidStatInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
-            })),
-            "maps" => Ok(Arc::new(ProcPidMapsInode {
+                _heap_charge: Some(charge),
+            })?),
+            "maps" => Ok(try_new_procfs_arc(|charge| ProcPidMapsInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
-            })),
-            "fd" => Ok(Arc::new(ProcPidFdDirInode {
+                _heap_charge: Some(charge),
+            })?),
+            "fd" => Ok(try_new_procfs_arc(|charge| ProcPidFdDirInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
-            })),
+                _heap_charge: Some(charge),
+            })?),
             _ => Err(FsError::NotFound),
         }
     }
@@ -411,17 +507,17 @@ impl Inode for ProcPidDirInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Directories can only be opened for read-only operations (getdents64)
         if flags.is_writable() {
             return Err(FsError::IsDir);
         }
-        // Return directory handle with seekable=false
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidDirInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn is_dir(&self) -> bool {
@@ -470,6 +566,7 @@ impl Inode for ProcPidDirInode {
 struct ProcPidStatusInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcPidStatusInode {
@@ -502,15 +599,16 @@ impl Inode for ProcPidStatusInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatusInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -518,7 +616,7 @@ impl Inode for ProcPidStatusInode {
         // Prevents PID-reuse attacks: if the original process exits and a new process
         // reuses the PID, generation mismatch blocks access even if UIDs match.
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let content = generate_status(&self.identity, &process);
+        let content = generate_status(&self.identity, &process)?;
         read_from_content(&content, offset, buf)
     }
 
@@ -535,6 +633,7 @@ impl Inode for ProcPidStatusInode {
 struct ProcPidCmdlineInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcPidCmdlineInode {
@@ -567,21 +666,22 @@ impl Inode for ProcPidCmdlineInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidCmdlineInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         // R178-23 FIX: Validate both ownership and generation
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let content = get_process_cmdline(&process);
+        let content = get_process_cmdline(&process)?;
         read_from_content(&content, offset, buf)
     }
 
@@ -598,6 +698,7 @@ impl Inode for ProcPidCmdlineInode {
 struct ProcPidStatInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcPidStatInode {
@@ -630,21 +731,22 @@ impl Inode for ProcPidStatInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         // R178-23 FIX: Validate both ownership and generation
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let content = generate_stat(&self.identity, &process);
+        let content = generate_stat(&self.identity, &process)?;
         read_from_content(&content, offset, buf)
     }
 
@@ -661,6 +763,7 @@ impl Inode for ProcPidStatInode {
 struct ProcPidMapsInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcPidMapsInode {
@@ -693,21 +796,22 @@ impl Inode for ProcPidMapsInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         if validate_proc_identity(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidMapsInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         // R178-23 FIX: Validate both ownership and generation
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let content = generate_maps(&process);
+        let content = generate_maps(&process)?;
         read_from_content(&content, offset, buf)
     }
 
@@ -723,6 +827,7 @@ impl Inode for ProcPidMapsInode {
 struct ProcPidFdDirInode {
     fs_id: u64,
     identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl ProcPidFdDirInode {
@@ -730,15 +835,16 @@ impl ProcPidFdDirInode {
         // R31-1 FIX: Check access permission before returning fd entries
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
         let fd: u32 = name.parse().map_err(|_| FsError::NotFound)?;
-        let fds = list_process_fds(&process);
+        let fds = list_process_fds(&process)?;
         if !fds.iter().any(|&n| n == fd) {
             return Err(FsError::NotFound);
         }
-        Ok(Arc::new(ProcPidFdSymlink {
+        Ok(try_new_procfs_arc(|charge| ProcPidFdSymlink {
             fs_id: self.fs_id,
             identity: self.identity.clone(),
             fd,
-        }))
+            _heap_charge: Some(charge),
+        })?)
     }
 }
 
@@ -772,17 +878,17 @@ impl Inode for ProcPidFdDirInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         // Directories can only be opened for read-only operations (getdents64)
         if flags.is_writable() {
             return Err(FsError::IsDir);
         }
-        // Return directory handle with seekable=false
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidFdDirInode {
-            fs_id: self.fs_id,
-            identity: self.identity.clone(),
-        });
-        Ok(Box::new(FileHandle::new(inode, flags, false)))
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
     }
 
     fn is_dir(&self) -> bool {
@@ -792,7 +898,7 @@ impl Inode for ProcPidFdDirInode {
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         // R31-1 FIX: Defense-in-depth access check for fd listing
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let fds = list_process_fds(&process);
+        let fds = list_process_fds(&process)?;
         if offset < fds.len() {
             let fd = fds[offset];
             return Ok(Some((
@@ -820,6 +926,7 @@ struct ProcPidFdSymlink {
     fs_id: u64,
     identity: ProcIdentity,
     fd: u32,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcPidFdSymlink {
@@ -838,7 +945,7 @@ impl Inode for ProcPidFdSymlink {
         // process reuses the PID, we must not expose the new process's FD info.
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
         let (uid, gid) = get_process_owner(&process);
-        let target = get_fd_target(&process, self.fd);
+        let target = get_fd_target(&process, self.fd)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -856,7 +963,11 @@ impl Inode for ProcPidFdSymlink {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(
+        self: Arc<Self>,
+        _flags: OpenFlags,
+        _prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
         Err(FsError::Invalid)
     }
 
@@ -864,7 +975,7 @@ impl Inode for ProcPidFdSymlink {
         // R42-1 FIX: Defense-in-depth access check for each read operation.
         // Handles race conditions where PID is reused between open and read.
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let target = get_fd_target(&process, self.fd);
+        let target = get_fd_target(&process, self.fd)?;
         read_from_content(&target, offset, buf)
     }
 
@@ -879,6 +990,7 @@ impl Inode for ProcPidFdSymlink {
 
 struct ProcMeminfoInode {
     fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcMeminfoInode {
@@ -908,14 +1020,17 @@ impl Inode for ProcMeminfoInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcMeminfoInode { fs_id: self.fs_id });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let content = generate_meminfo();
+        let content = generate_meminfo()?;
         read_from_content(&content, offset, buf)
     }
 
@@ -930,6 +1045,7 @@ impl Inode for ProcMeminfoInode {
 
 struct ProcCpuinfoInode {
     fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcCpuinfoInode {
@@ -959,14 +1075,17 @@ impl Inode for ProcCpuinfoInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcCpuinfoInode { fs_id: self.fs_id });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let content = generate_cpuinfo();
+        let content = generate_cpuinfo()?;
         read_from_content(&content, offset, buf)
     }
 
@@ -981,6 +1100,7 @@ impl Inode for ProcCpuinfoInode {
 
 struct ProcUptimeInode {
     fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcUptimeInode {
@@ -1010,14 +1130,17 @@ impl Inode for ProcUptimeInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcUptimeInode { fs_id: self.fs_id });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let content = generate_uptime();
+        let content = generate_uptime()?;
         read_from_content(&content, offset, buf)
     }
 
@@ -1032,6 +1155,7 @@ impl Inode for ProcUptimeInode {
 
 struct ProcVersionInode {
     fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl Inode for ProcVersionInode {
@@ -1061,10 +1185,13 @@ impl Inode for ProcVersionInode {
         })
     }
 
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcVersionInode { fs_id: self.fs_id });
-        Ok(Box::new(FileHandle::new(inode, flags, true)))
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -1181,7 +1308,7 @@ fn can_access_process(pid: u32, target: &BoundProcess) -> bool {
     }
 }
 
-fn current_viewer_namespace() -> Option<Arc<kernel_core::PidNamespace>> {
+fn current_viewer_namespace() -> Option<kernel_core::PidNamespaceArc> {
     let table = PROCESS_TABLE.lock();
     process::current_pid()
         .and_then(|pid| table.get(pid))
@@ -1216,7 +1343,7 @@ fn bind_current_proc_identity(global_pid: u32) -> Result<ProcIdentity, FsError> 
 
 fn bind_proc_identity(
     pid: u32,
-    viewer_ns: Option<Arc<kernel_core::PidNamespace>>,
+    viewer_ns: Option<kernel_core::PidNamespaceArc>,
     expected_display_pid: Option<u32>,
 ) -> Result<ProcIdentity, FsError> {
     if pid == 0 {
@@ -1234,21 +1361,22 @@ fn bind_proc_identity(
     if !can_access_process(pid, &process) {
         return Err(FsError::PermDenied);
     }
-    let (generation, chain, state) = {
+    let (generation, display_pid, state) = {
         let target = process.lock();
-        (target.generation, target.pid_ns_chain.clone(), target.state)
+        let display_pid = match viewer_ns.as_ref() {
+            Some(ns) => target
+                .pid_ns_chain
+                .iter()
+                .find(|membership| Arc::ptr_eq(&membership.ns, ns))
+                .and_then(|membership| u32::try_from(membership.pid).ok())
+                .ok_or(FsError::NotFound)?,
+            None => pid,
+        };
+        (target.generation, display_pid, target.state)
     };
     if matches!(state, ProcessState::Zombie | ProcessState::Terminated) {
         return Err(FsError::NotFound);
     }
-    let display_pid = match viewer_ns.as_ref() {
-        Some(ns) => chain
-            .iter()
-            .find(|membership| Arc::ptr_eq(&membership.ns, ns))
-            .and_then(|membership| u32::try_from(membership.pid).ok())
-            .ok_or(FsError::NotFound)?,
-        None => pid,
-    };
     if expected_display_pid
         .map(|expected| expected != display_pid)
         .unwrap_or(false)
@@ -1318,7 +1446,7 @@ fn validate_proc_identity(identity: &ProcIdentity) -> Option<BoundProcess> {
 /// R29-1 FIX: Now returns actual PIDs from the process table
 /// R133-4 FIX: Filter by calling process's PID namespace for container isolation.
 /// A process only sees PIDs that are visible from its owning PID namespace.
-fn list_pids() -> Vec<u32> {
+fn list_pids() -> Result<AdmittedVec<u32>, FsError> {
     let table = PROCESS_TABLE.lock();
 
     // R133-4 FIX: Determine the caller's owning PID namespace.
@@ -1330,28 +1458,30 @@ fn list_pids() -> Vec<u32> {
             kernel_core::owning_namespace(&p.pid_ns_chain)
         });
 
-    table
-        .iter()
-        .enumerate()
-        .skip(1) // PID 0 is reserved
-        .filter_map(|(pid, slot)| {
-            slot.as_ref().and_then(|proc_arc| {
-                let p = proc_arc.lock();
-                if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
-                    return None;
-                }
-
-                // R133-4 FIX: Only include PIDs visible in caller's namespace.
-                if let Some(ref ns) = caller_ns {
-                    if !kernel_core::is_visible_in_namespace(ns, &p.pid_ns_chain) {
-                        return None;
-                    }
-                }
-
-                Some(pid as u32)
-            })
-        })
-        .collect()
+    let live = table.iter().filter(|slot| slot.is_some()).count();
+    let mut snapshot = AdmittedVec::new(HeapClass::Procfs);
+    snapshot
+        .try_reserve_exact(live)
+        .map_err(|_| FsError::NoSpace)?;
+    for (pid, slot) in table.iter().enumerate().skip(1) {
+        let Some(proc_arc) = slot.as_ref() else {
+            continue;
+        };
+        let p = proc_arc.lock();
+        if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+            continue;
+        }
+        if caller_ns
+            .as_ref()
+            .is_some_and(|ns| !kernel_core::is_visible_in_namespace(ns, &p.pid_ns_chain))
+        {
+            continue;
+        }
+        snapshot
+            .push_reserved(pid as u32)
+            .map_err(|_| FsError::NoSpace)?;
+    }
+    Ok(snapshot)
 }
 
 /// Get process owner (uid, gid)
@@ -1406,37 +1536,64 @@ fn get_bound_process_host_uid_opt(process: &BoundProcess) -> Option<u32> {
 /// Get process command line
 ///
 /// R29-1 FIX: Now returns actual process name from PCB
-fn get_process_cmdline(process: &BoundProcess) -> String {
+fn get_process_cmdline(process: &BoundProcess) -> Result<AdmittedString, FsError> {
     let process = process.lock();
-    format!("{}\0", process.name)
+    let mut output = AdmittedString::new(HeapClass::Procfs);
+    output
+        .try_reserve(process.name.len().saturating_add(1))
+        .map_err(|_| FsError::NoSpace)?;
+    output
+        .try_push_str(process.name.as_str())
+        .map_err(|_| FsError::NoSpace)?;
+    output.try_push('\0').map_err(|_| FsError::NoSpace)?;
+    Ok(output)
+}
+
+fn try_format_content(args: core::fmt::Arguments<'_>) -> Result<AdmittedString, FsError> {
+    let mut content = AdmittedString::new(HeapClass::Procfs);
+    content.write_fmt(args).map_err(|_| FsError::NoSpace)?;
+    Ok(content)
 }
 
 /// List file descriptors for a process
 ///
 /// R29-1 FIX: Now returns actual FD list from process
-fn list_process_fds(process: &BoundProcess) -> Vec<u32> {
+fn list_process_fds(process: &BoundProcess) -> Result<AdmittedVec<u32>, FsError> {
     let process = process.lock();
-    process.fd_table.keys().map(|&fd| fd as u32).collect()
+    let mut snapshot = AdmittedVec::new(HeapClass::Procfs);
+    snapshot
+        .try_reserve_exact(process.fd_table.len())
+        .map_err(|_| FsError::NoSpace)?;
+    for fd in process.fd_table.keys().copied() {
+        snapshot
+            .push_reserved(fd as u32)
+            .map_err(|_| FsError::NoSpace)?;
+    }
+    Ok(snapshot)
 }
 
 /// Resolve a file descriptor target for /proc/[pid]/fd/<n>
 ///
 /// R29-1 FIX: Now returns actual FD type from process
-fn get_fd_target(process: &BoundProcess, fd: u32) -> String {
+fn get_fd_target(process: &BoundProcess, fd: u32) -> Result<AdmittedString, FsError> {
     let process = process.lock();
     match process.fd_table.get(&(fd as i32)) {
-        Some(fd_obj) => format!("{}", fd_obj.type_name()),
-        None => String::new(),
+        Some(fd_obj) => AdmittedString::try_from_str(HeapClass::Procfs, fd_obj.type_name())
+            .map_err(|_| FsError::NoSpace),
+        None => Ok(AdmittedString::new(HeapClass::Procfs)),
     }
 }
 
 /// Generate /proc/[pid]/status content
 ///
 /// R29-1 FIX: Now uses real process data
-fn generate_status(identity: &ProcIdentity, bound: &BoundProcess) -> String {
+fn generate_status(
+    identity: &ProcIdentity,
+    bound: &BoundProcess,
+) -> Result<AdmittedString, FsError> {
     // RF178-19 FIX: Snapshot the bound process Arc, never a raw PID relookup.
     struct StatusSnap {
-        name: alloc::string::String,
+        name: AdmittedString,
         umask: u16,
         state_char: char,
         state_name: &'static str,
@@ -1457,11 +1614,14 @@ fn generate_status(identity: &ProcIdentity, bound: &BoundProcess) -> String {
             ProcessState::Stopped => ('T', "stopped"),
             _ if process.stopped => ('T', "stopped"),
             ProcessState::Ready | ProcessState::Running => ('R', "running"),
-            ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
+            ProcessState::Provisioning | ProcessState::Blocked | ProcessState::Sleeping => {
+                ('S', "sleeping")
+            }
         };
         let creds = process.credentials.read();
         StatusSnap {
-            name: process.name.clone(),
+            name: AdmittedString::try_from_str(HeapClass::Procfs, process.name.as_str())
+                .map_err(|_| FsError::NoSpace)?,
             umask: process.umask,
             state_char,
             state_name,
@@ -1490,7 +1650,9 @@ fn generate_status(identity: &ProcIdentity, bound: &BoundProcess) -> String {
             (s.tgid, s.ppid)
         };
 
-        format!(
+        let mut output = AdmittedString::new(HeapClass::Procfs);
+        write!(
+            &mut output,
             "Name:\t{}\n\
                  Umask:\t{:04o}\n\
                  State:\t{} ({})\n\
@@ -1516,13 +1678,15 @@ fn generate_status(identity: &ProcIdentity, bound: &BoundProcess) -> String {
             s.gid,
             s.gid,
         )
+        .map_err(|_| FsError::NoSpace)?;
+        Ok(output)
     }
 }
 
 /// Generate /proc/[pid]/stat content
 ///
 /// R29-1 FIX: Now uses real process data
-fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> String {
+fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> Result<AdmittedString, FsError> {
     // RF178-19 FIX: Snapshot the exact bound process object.
     let snapshot = {
         let process = bound.lock();
@@ -1532,11 +1696,12 @@ fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> String {
             ProcessState::Stopped => 'T',
             _ if process.stopped => 'T',
             ProcessState::Ready | ProcessState::Running => 'R',
-            ProcessState::Blocked | ProcessState::Sleeping => 'S',
+            ProcessState::Provisioning | ProcessState::Blocked | ProcessState::Sleeping => 'S',
         };
         (
             process.ppid,
-            process.name.clone(),
+            AdmittedString::try_from_str(HeapClass::Procfs, process.name.as_str())
+                .map_err(|_| FsError::NoSpace)?,
             state_char,
             process.priority,
         )
@@ -1550,7 +1715,9 @@ fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> String {
         raw_ppid
     };
 
-    format!(
+    let mut output = AdmittedString::new(HeapClass::Procfs);
+    write!(
+        &mut output,
         "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         identity.display_pid,
         name,
@@ -1560,6 +1727,8 @@ fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> String {
         identity.display_pid,
         priority,
     )
+    .map_err(|_| FsError::NoSpace)?;
+    Ok(output)
 }
 
 /// R117-2 FIX: Maximum number of mmap entries to emit in /proc/[pid]/maps.
@@ -1578,83 +1747,94 @@ const MAX_MAPS_OUTPUT: usize = 64 * 1024;
 /// R117-2 FIX: Output is bounded by MAX_MAPS_ENTRIES and MAX_MAPS_OUTPUT
 /// to prevent kernel OOM from processes with many mmap regions. When the
 /// budget is exceeded, a `... (truncated)\n` marker is appended.
-fn generate_maps(bound: &BoundProcess) -> String {
+fn generate_maps(bound: &BoundProcess) -> Result<AdmittedString, FsError> {
     // R162-I2 FIX: Snapshot mmap_regions and user_stack under locks, then drop
     // all locks before string formatting. This eliminates triple-nested lock
     // hold (Process → MmState) during format! calls.
-    let snapshot: Option<(Vec<(usize, usize)>, Option<u64>)> = {
+    let (regions, user_stack) = {
         let proc = bound.lock();
         let mm = proc.mm.lock();
         // D2 Phase 2: mmap_regions values are MmapEntry; snapshot the raw
         // packed word so the downstream formatting (len/flags decode) is
         // unchanged.
-        let regions: Vec<(usize, usize)> = mm
-            .mmap_regions
-            .iter()
-            .take(MAX_MAPS_ENTRIES)
-            .map(|(&start, &entry)| (start, entry.raw()))
-            .collect();
+        let count = mm.mmap_regions.len().min(MAX_MAPS_ENTRIES);
+        let mut regions = AdmittedVec::new(HeapClass::Procfs);
+        regions
+            .try_reserve_exact(count)
+            .map_err(|_| FsError::NoSpace)?;
+        for (&start, &entry) in mm.mmap_regions.iter().take(MAX_MAPS_ENTRIES) {
+            regions
+                .push_reserved((start, entry.raw()))
+                .map_err(|_| FsError::NoSpace)?;
+        }
         let stack = proc.user_stack.map(|s| s.as_u64());
-        Some((regions, stack))
+        (regions, stack)
     };
 
-    if let Some((regions, user_stack)) = snapshot {
-        let mut result = String::new();
-        let mut entries = 0usize;
-        let mut truncated = false;
+    let mut result = AdmittedString::new(HeapClass::Procfs);
+    result
+        .try_reserve(MAX_MAPS_OUTPUT + 128)
+        .map_err(|_| FsError::NoSpace)?;
+    let mut entries = 0usize;
+    let mut truncated = false;
 
-        for &(start, size) in &regions {
-            if entries >= MAX_MAPS_ENTRIES || result.len() > MAX_MAPS_OUTPUT {
-                truncated = true;
-                break;
-            }
-            let end = start.saturating_add(size & !0xfff);
-            let perms = kernel_core::mmap_flags_to_perms(size & 0xfff);
-            let perms_str = core::str::from_utf8(&perms).unwrap_or("rw-p");
-            let line = format!(
-                "{:016x}-{:016x} {} 00000000 00:00 0    [anon]\n",
-                start, end, perms_str
-            );
-            if result.len().saturating_add(line.len()) > MAX_MAPS_OUTPUT {
-                truncated = true;
-                break;
-            }
-            result.push_str(&line);
-            entries += 1;
+    for &(start, size) in &regions {
+        if entries >= MAX_MAPS_ENTRIES || result.len() > MAX_MAPS_OUTPUT {
+            truncated = true;
+            break;
         }
+        let end = start.saturating_add(size & !0xfff);
+        let perms = kernel_core::mmap_flags_to_perms(size & 0xfff);
+        let perms_str = core::str::from_utf8(&perms).unwrap_or("rw-p");
+        let before = result.len();
+        write!(
+            &mut result,
+            "{:016x}-{:016x} {} 00000000 00:00 0    [anon]\n",
+            start, end, perms_str
+        )
+        .map_err(|_| FsError::NoSpace)?;
+        if result.len() > MAX_MAPS_OUTPUT {
+            result.truncate(before);
+            truncated = true;
+            break;
+        }
+        entries += 1;
+    }
 
-        if !truncated {
-            if let Some(stack_top) = user_stack {
-                if entries < MAX_MAPS_ENTRIES {
-                    let stack_bottom = stack_top.saturating_sub(0x10000);
-                    let line = format!(
-                        "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
-                        stack_bottom, stack_top
-                    );
-                    if result.len().saturating_add(line.len()) <= MAX_MAPS_OUTPUT {
-                        result.push_str(&line);
-                    } else {
-                        truncated = true;
-                    }
-                } else {
+    if !truncated {
+        if let Some(stack_top) = user_stack {
+            if entries < MAX_MAPS_ENTRIES {
+                let stack_bottom = stack_top.saturating_sub(0x10000);
+                let before = result.len();
+                write!(
+                    &mut result,
+                    "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
+                    stack_bottom, stack_top
+                )
+                .map_err(|_| FsError::NoSpace)?;
+                if result.len() > MAX_MAPS_OUTPUT {
+                    result.truncate(before);
                     truncated = true;
                 }
+            } else {
+                truncated = true;
             }
         }
-
-        if result.is_empty() && !truncated {
-            result.push_str("0000000000400000-0000000000401000 r-xp 00000000 00:00 0    [code]\n");
-        }
-
-        if truncated {
-            result.push_str("... (truncated)\n");
-        }
-
-        result
-    } else {
-        // Process not found, return empty
-        String::new()
     }
+
+    if result.is_empty() && !truncated {
+        result
+            .try_push_str("0000000000400000-0000000000401000 r-xp 00000000 00:00 0    [code]\n")
+            .map_err(|_| FsError::NoSpace)?;
+    }
+
+    if truncated {
+        result
+            .try_push_str("... (truncated)\n")
+            .map_err(|_| FsError::NoSpace)?;
+    }
+
+    Ok(result)
 }
 
 /// Generate /proc/meminfo content
@@ -1664,7 +1844,7 @@ fn generate_maps(bound: &BoundProcess) -> String {
 /// configured memory.max, returns cgroup-relative totals instead of
 /// host-global physical memory stats.  This prevents namespaced containers
 /// from fingerprinting the host or detecting co-residency.
-fn generate_meminfo() -> String {
+fn generate_meminfo() -> Result<AdmittedString, FsError> {
     // R140-8 FIX: Virtualize for cgroup-limited containers.
     if let Some(cgroup_id) = process::current_cgroup_id() {
         if cgroup_id != 0 {
@@ -1680,7 +1860,7 @@ fn generate_meminfo() -> String {
                         let used_kb = (memory_current / 1024) as usize;
                         let free_kb = (memory_max.saturating_sub(memory_current) / 1024) as usize;
 
-                        return format!(
+                        return try_format_content(format_args!(
                             "MemTotal:       {:8} kB\n\
                              MemFree:        {:8} kB\n\
                              MemAvailable:   {:8} kB\n\
@@ -1703,7 +1883,7 @@ fn generate_meminfo() -> String {
                             0,       // Inactive
                             0,       // Dirty
                             0,       // KernelHeap: host-global, not exposed
-                        );
+                        ));
                     }
                 }
             }
@@ -1722,7 +1902,7 @@ fn generate_meminfo() -> String {
     let buffers_kb = cache_stats.nr_dirty as usize * 4;
     let available_kb = free_kb + cached_kb;
 
-    format!(
+    try_format_content(format_args!(
         "MemTotal:       {:8} kB\n\
          MemFree:        {:8} kB\n\
          MemAvailable:   {:8} kB\n\
@@ -1745,12 +1925,13 @@ fn generate_meminfo() -> String {
         cached_kb,  // Inactive = cached pages
         buffers_kb, // Dirty = dirty pages in cache
         mem_stats.heap_used_bytes / 1024,
-    )
+    ))
 }
 
 /// Generate /proc/cpuinfo content
-fn generate_cpuinfo() -> String {
-    String::from(
+fn generate_cpuinfo() -> Result<AdmittedString, FsError> {
+    AdmittedString::try_from_str(
+        HeapClass::Procfs,
         "processor\t: 0\n\
          vendor_id\t: Zero-OS\n\
          cpu family\t: 6\n\
@@ -1762,13 +1943,14 @@ fn generate_cpuinfo() -> String {
          flags\t\t: fpu vme de pse tsc msr pae mce cx8\n\
          bogomips\t: 2000.00\n\n",
     )
+    .map_err(|_| FsError::NoSpace)
 }
 
 /// Generate /proc/uptime content
 ///
 /// Shows system uptime in seconds (timer tick count / 1000 assuming 1kHz timer).
 /// Format: uptime_seconds idle_seconds
-fn generate_uptime() -> String {
+fn generate_uptime() -> Result<AdmittedString, FsError> {
     let ticks = time::get_ticks();
     // Assuming timer runs at 1000 Hz (1 tick = 1 ms)
     let uptime_secs = ticks / 1000;
@@ -1779,8 +1961,8 @@ fn generate_uptime() -> String {
     let idle_secs = uptime_secs / 2; // Rough approximation
     let idle_frac = uptime_frac;
 
-    format!(
+    try_format_content(format_args!(
         "{}.{:02} {}.{:02}\n",
         uptime_secs, uptime_frac, idle_secs, idle_frac
-    )
+    ))
 }
