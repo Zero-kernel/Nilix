@@ -1,5 +1,9 @@
 # Rust
 /target/
+/target-*
+
+# R180 synchronization/debug artifacts (generated, never source)
+/.r180-*
 userspace/target/
 userspace-target/
 Cargo.lock
