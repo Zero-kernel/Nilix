@@ -2,6 +2,10 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R180 Fixes (July 2026)
+
+- **[R180-fix-summary.md](R180-fix-summary.md)** - R180 historical review-fix plus convergence through RF180-59 (32/32 implementation findings closed; design blockers retained; MODE D)
+
 ## R178 Fixes (July 2026)
 
 - **[R178-fix-summary.md](R178-fix-summary.md)** - Complete R178 CRITICAL+HIGH fix summary (11 findings)
