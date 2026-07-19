@@ -44,12 +44,13 @@
 //! - POSIX.1-2017 Socket Interface
 //! - RFC 768: UDP Protocol
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::alloc::Global;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::arch::asm;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use spin::{Mutex, Once, RwLock};
+use spin::{Mutex, RwLock};
 
 use cap::{CapId, NamespaceId};
 use lsm::{
@@ -57,23 +58,196 @@ use lsm::{
     hook_net_shutdown, hook_net_socket, LsmError, NetCtx, ProcessCtx,
 };
 
+use crate::admitted::{AdmittedMap, AdmittedVec, WirePacket};
 use crate::ipv4::Ipv4Addr;
 use crate::stack::transmit_tcp_segment;
 use crate::tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, decode_window, encode_window,
     generate_isn, generate_syn_cookie_isn, handle_ack, handle_retransmission_timeout, initial_cwnd,
-    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, update_congestion_control,
-    validate_cwnd_after_idle, validate_syn_cookie, CongestionAction, SackBlock, TcpConnKey,
-    TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState,
-    TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS,
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_MAX_ACCEPT_BACKLOG,
-    TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS,
-    TCP_MAX_SEND_BUFFER_BYTES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE,
-    TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, try_build_tcp_segment_admitted,
+    try_build_tcp_segment_with_options, update_congestion_control, validate_syn_cookie,
+    CongestionAction, PendingHandshakeCommit, SackBlock, TcpConnKey, TcpControlBlock, TcpHeader,
+    TcpOptionKind, TcpOptions, TcpSegment, TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS,
+    TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TCP_FLAG_RST, TCP_FLAG_SYN, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS,
+    TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_BUFFER_BYTES,
+    TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO, TCP_SYN_TIMEOUT_MS,
+    TCP_TIME_WAIT_MS,
 };
 use crate::udp::{
     build_udp_datagram, UdpError, EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
 };
+use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
+
+// ============================================================================
+// Charged Arc Allocator (RF180-25)
+// ============================================================================
+
+/// Maximum number of simultaneously live socket-owned Arc allocations.
+///
+/// The SocketObject class is capped at 256 KiB. Even a zero-sized Arc payload
+/// is charged at least 32 bytes (two Arc counters plus allocator-link slack),
+/// so the byte admission gate can never authorize more than 8192 live Arc
+/// allocations. The slots live in static storage and therefore do not consume
+/// or recursively depend on the heap they account.
+const SOCKET_ARC_CHARGE_SLOTS: usize = 8192;
+
+struct SocketArcChargeSlot {
+    generation: u64,
+    allocated: bool,
+    charge: HeapCharge,
+}
+
+static SOCKET_ARC_CHARGES: Mutex<[Option<SocketArcChargeSlot>; SOCKET_ARC_CHARGE_SLOTS]> =
+    Mutex::new([const { None }; SOCKET_ARC_CHARGE_SLOTS]);
+static NEXT_SOCKET_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_SOCKET_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_TCP_EGRESS_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_nonzero_generation(counter: &AtomicU64) -> Result<u64, SocketError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .filter(|generation| *generation != 0)
+        .ok_or(SocketError::IdExhausted)
+}
+
+/// Allocator carried by every socket-owned Arc/Weak handle.
+///
+/// RF180-25 FIX: the charge is stored in a fixed static slot rather than in
+/// `T`. `Arc` invokes `deallocate` only when the final strong *and* weak owner
+/// are gone; this allocator frees the Arc control block first and releases the
+/// slot's `HeapCharge` second. Cloning the allocator copies only a
+/// `(slot, generation)` capability; slot-locked single-use state prevents a
+/// copied capability from allocating any additional uncharged backing.
+#[derive(Clone, Copy, Debug)]
+pub struct SocketArcAllocator {
+    slot: u16,
+    generation: u64,
+}
+
+impl SocketArcAllocator {
+    fn try_install(charge: HeapCharge) -> Result<Self, HeapCharge> {
+        let generation = match NEXT_SOCKET_ARC_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(generation) => generation,
+            Err(_) => return Err(charge),
+        };
+
+        let mut charge = Some(charge);
+        let mut slots = SOCKET_ARC_CHARGES.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(SocketArcChargeSlot {
+                    generation,
+                    allocated: false,
+                    charge: charge.take().expect("socket Arc charge moved once"),
+                });
+                return Ok(Self {
+                    slot: index as u16,
+                    generation,
+                });
+            }
+        }
+        Err(charge.expect("socket Arc slot scan retained charge"))
+    }
+
+    fn take_charge(self) -> HeapCharge {
+        let mut slots = SOCKET_ARC_CHARGES.lock();
+        let slot = slots
+            .get_mut(self.slot as usize)
+            .expect("RF180-25 socket Arc allocator slot out of range");
+        match slot.as_ref() {
+            Some(entry) if entry.generation == self.generation => {}
+            Some(_) => panic!("RF180-25 stale socket Arc allocator generation"),
+            None => panic!("RF180-25 socket Arc charge released twice"),
+        }
+        slot.take()
+            .expect("validated socket Arc charge disappeared")
+            .charge
+    }
+
+    /// Cancel a prepared allocator after `Arc::try_new_in` reports allocation
+    /// failure. No allocation exists in this path, so releasing the reservation
+    /// is correct and cannot race a future deallocation callback.
+    fn cancel_failed_allocation(self) {
+        drop(self.take_charge());
+    }
+
+    #[cfg(test)]
+    fn charge_is_live_for_test(self) -> bool {
+        SOCKET_ARC_CHARGES
+            .lock()
+            .get(self.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| entry.generation == self.generation)
+    }
+}
+
+unsafe impl Allocator for SocketArcAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        {
+            let mut slots = SOCKET_ARC_CHARGES.lock();
+            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+                return Err(AllocError);
+            };
+            if entry.generation != self.generation || entry.allocated {
+                return Err(AllocError);
+            }
+            entry.allocated = true;
+        }
+
+        match Global.allocate(layout) {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                // Arc::try_new_in may retry only after a failed allocation. Roll
+                // the single-use bit back while retaining the charge slot.
+                let mut slots = SOCKET_ARC_CHARGES.lock();
+                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                    if entry.generation == self.generation {
+                        entry.allocated = false;
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // RF180-25 FIX: allocator memory first, admission second. A new socket
+        // allocation cannot consume these bytes while the old Arc control block
+        // is still physically live.
+        unsafe { Global.deallocate(ptr, layout) };
+        drop(self.take_charge());
+    }
+}
+
+pub type SocketArc = Arc<SocketState, SocketArcAllocator>;
+type SocketWeak = Weak<SocketState, SocketArcAllocator>;
+pub type WaitQueueArc = Arc<WaitQueue, SocketArcAllocator>;
+
+fn try_new_socket_arc<T>(value: T) -> Result<Arc<T, SocketArcAllocator>, SocketError> {
+    let bytes = arc_charge_bytes::<T>().map_err(|_| SocketError::NoMemory)?;
+    let reservation =
+        try_reserve_heap(HeapClass::SocketObject, bytes).map_err(|_| SocketError::NoMemory)?;
+    let charge = reservation.commit().map_err(|_| SocketError::NoMemory)?;
+    let allocator = SocketArcAllocator::try_install(charge).map_err(|charge| {
+        drop(charge);
+        SocketError::NoMemory
+    })?;
+    match Arc::try_new_in(value, allocator) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            allocator.cancel_failed_allocation();
+            Err(SocketError::NoMemory)
+        }
+    }
+}
 
 // ============================================================================
 // Simple Wait Primitives (local to net crate to avoid ipc dependency)
@@ -326,11 +500,16 @@ pub struct WaitQueue {
 
 impl WaitQueue {
     /// Create a new wait queue.
-    pub fn new() -> Self {
+    pub fn new(_class: HeapClass) -> Self {
         WaitQueue {
             closed: AtomicBool::new(false),
             wakeup_count: AtomicU64::new(0),
         }
+    }
+
+    /// Allocate a standalone wait queue under the global socket-object gate.
+    fn try_new_arc() -> Result<WaitQueueArc, SocketError> {
+        try_new_socket_arc(Self::new(HeapClass::SocketObject))
     }
 
     /// Try to consume one pending wake token.
@@ -421,7 +600,7 @@ impl WaitQueue {
 
 impl Default for WaitQueue {
     fn default() -> Self {
-        Self::new()
+        Self::new(HeapClass::SocketObject)
     }
 }
 
@@ -451,19 +630,49 @@ static GLOBAL_UDP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Privileged port boundary (ports below this require special permissions).
 const PRIVILEGED_PORT_LIMIT: u16 = 1024;
 
-/// RF178-30 FIX: Accept a data segment when either its first or last payload
-/// byte is inside the receive window. Using the inclusive last byte avoids
-/// admitting a segment whose exclusive end is exactly `rcv_nxt`.
+/// RF178-30 / R180-L2 FIX: Accept a segment when either its first or last
+/// sequence-space position is inside the receive window.  FIN contributes one
+/// position even when every payload byte is duplicate.
 #[inline]
-fn segment_in_recv_window(seq: u32, payload_len: usize, rcv_nxt: u32, rcv_wnd: u32) -> bool {
+fn segment_in_recv_window(
+    seq: u32,
+    payload_len: usize,
+    has_fin: bool,
+    rcv_nxt: u32,
+    rcv_wnd: u32,
+) -> bool {
     let wnd = rcv_wnd.max(1);
+    let payload_len = match u32::try_from(payload_len) {
+        Ok(len) => len,
+        Err(_) => return false,
+    };
+    // R180-L2 FIX: SEG.LEN includes FIN's sequence-space byte.  A retransmission
+    // may have no new payload bytes while its FIN is exactly RCV.NXT; treating
+    // only payload bytes as the segment range rejects that new FIN before the
+    // overlap path can consume it.  Compute the last sequence-space position
+    // with wrapping arithmetic, as required by RFC 793 serial-number semantics.
+    let sequence_len = match payload_len.checked_add(u32::from(has_fin)) {
+        Some(len) => len,
+        None => return false,
+    };
     seq_in_window(seq, rcv_nxt, wnd)
-        || (payload_len != 0
-            && seq_in_window(
-                seq.wrapping_add(payload_len as u32).wrapping_sub(1),
-                rcv_nxt,
-                wnd,
-            ))
+        || (sequence_len != 0
+            && seq_in_window(seq.wrapping_add(sequence_len).wrapping_sub(1), rcv_nxt, wnd))
+}
+
+/// True when every payload byte is left of RCV.NXT but the segment's FIN is
+/// the next unconsumed sequence-space byte.
+#[inline]
+fn duplicate_payload_has_new_fin(
+    seq: u32,
+    payload_len: usize,
+    has_fin: bool,
+    rcv_nxt: u32,
+) -> bool {
+    has_fin
+        && u32::try_from(payload_len)
+            .ok()
+            .map_or(false, |len| seq.wrapping_add(len) == rcv_nxt)
 }
 
 // ============================================================================
@@ -693,7 +902,7 @@ const GLOBAL_MAX_HALF_OPEN: u32 = 1024;
 /// # R74-5 Enhancement: TOCTOU Fix
 ///
 /// The original implementation had a race condition:
-/// ```
+/// ```ignore
 /// if !can_queue_half_open() { return false; }  // Check
 /// // RACE: Other thread can increment here
 /// inc_half_open();  // Increment
@@ -907,16 +1116,24 @@ impl SocketLabel {
 // ============================================================================
 
 /// A received UDP datagram queued for userspace delivery.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PendingDatagram {
     /// Source IP address
     pub src_ip: Ipv4Addr,
     /// Source port
     pub src_port: u16,
     /// Datagram payload (UDP data only, no headers)
-    pub data: Vec<u8>,
+    data: AdmittedVec<u8>,
     /// Receive timestamp (ticks)
     pub received_at: u64,
+}
+
+impl PendingDatagram {
+    /// Read-only userspace-copy view. Retained capacity and its lifetime charge
+    /// remain encapsulated in the datagram until dequeue/teardown completes.
+    pub fn payload(&self) -> &[u8] {
+        self.data.as_slice()
+    }
 }
 
 // ============================================================================
@@ -931,17 +1148,37 @@ struct TcpSocketState {
     /// TCP control block for this stream socket
     control: TcpControlBlock,
     /// Waiters interested in TCP state transitions (connect/close)
-    state_waiters: Arc<WaitQueue>,
+    state_waiters: WaitQueueArc,
     /// Waiters for data availability (recv)
-    data_waiters: Arc<WaitQueue>,
+    data_waiters: WaitQueueArc,
+}
+
+struct PreparedTcpWaiters {
+    state_waiters: WaitQueueArc,
+    data_waiters: WaitQueueArc,
+}
+
+impl PreparedTcpWaiters {
+    fn try_new() -> Result<Self, SocketError> {
+        Ok(Self {
+            state_waiters: WaitQueue::try_new_arc()?,
+            data_waiters: WaitQueue::try_new_arc()?,
+        })
+    }
 }
 
 impl TcpSocketState {
-    fn new(control: TcpControlBlock) -> Self {
+    fn try_new(control: TcpControlBlock) -> Result<Self, SocketError> {
+        // R180-11 FIX: prepare both independently-owned waiter Arcs before
+        // publishing the TCP state into its socket.
+        Ok(Self::from_prepared(control, PreparedTcpWaiters::try_new()?))
+    }
+
+    fn from_prepared(control: TcpControlBlock, waiters: PreparedTcpWaiters) -> Self {
         TcpSocketState {
             control,
-            state_waiters: Arc::new(WaitQueue::new()),
-            data_waiters: Arc::new(WaitQueue::new()),
+            state_waiters: waiters.state_waiters,
+            data_waiters: waiters.data_waiters,
         }
     }
 }
@@ -962,9 +1199,9 @@ struct PendingSyn {
     /// Connection lookup key (4-tuple)
     key: TcpLookupKey,
     /// Child socket in SynReceived state
-    sock: Arc<SocketState>,
+    sock: SocketArc,
     /// Cached SYN-ACK segment for retransmission
-    syn_ack: Vec<u8>,
+    syn_ack: WirePacket,
     /// Timestamp when SYN-ACK was sent (for SYN timeout)
     syn_sent_at: u64,
 }
@@ -982,25 +1219,25 @@ struct TcpListenState {
     /// Maximum pending accept connections (accept queue size)
     accept_backlog: usize,
     /// Half-open connections indexed by 4-tuple
-    syn_queue: BTreeMap<TcpLookupKey, PendingSyn>,
+    syn_queue: AdmittedMap<TcpLookupKey, PendingSyn>,
     /// Fully established connections awaiting accept()
-    accept_queue: VecDeque<Arc<SocketState>>,
+    accept_queue: AdmittedVec<SocketArc>,
     /// Wait queue for blocking accept()
-    accept_waiters: Arc<WaitQueue>,
+    accept_waiters: WaitQueueArc,
 }
 
 impl TcpListenState {
     /// Create new listen state with bounded backlogs.
-    fn new(backlog: usize) -> Self {
+    fn try_new(backlog: usize) -> Result<Self, SocketError> {
         // Clamp backlog to valid range
         let effective = backlog.clamp(1, TCP_MAX_ACCEPT_BACKLOG);
-        TcpListenState {
+        Ok(TcpListenState {
             syn_backlog: TCP_MAX_SYN_BACKLOG.min(effective),
             accept_backlog: effective,
-            syn_queue: BTreeMap::new(),
-            accept_queue: VecDeque::new(),
-            accept_waiters: Arc::new(WaitQueue::new()),
-        }
+            syn_queue: AdmittedMap::new(HeapClass::SocketObject),
+            accept_queue: AdmittedVec::new(HeapClass::SocketObject),
+            accept_waiters: WaitQueue::try_new_arc()?,
+        })
     }
 
     /// Enqueue a half-open connection.
@@ -1010,9 +1247,15 @@ impl TcpListenState {
     /// J2-2: `table` is threaded in so the per-namespace half-open budget can be
     /// charged in the same funnel as the global reservation (lock order
     /// `listen.lock` > `per_ns_syn_counts`; the caller holds `listen.lock`).
-    fn queue_syn(&mut self, entry: PendingSyn, table: &SocketTable) -> bool {
+    fn try_reserve_syn_slot(&mut self, key: &TcpLookupKey, table: &SocketTable) -> bool {
         // Check local queue limit first (fast path)
-        if self.syn_queue.len() >= self.syn_backlog {
+        if self.syn_queue.len() >= self.syn_backlog || self.syn_queue.contains_key(key) {
+            return false;
+        }
+
+        // R180-11 FIX: backing allocation is prepared before global/per-ns
+        // counters change, so publication failure needs no allocation rollback.
+        if self.syn_queue.ensure_capacity_for(1).is_err() {
             return false;
         }
 
@@ -1029,13 +1272,44 @@ impl TcpListenState {
         // J2-2: per-namespace half-open budget (a subset of the global limit). On
         // over-quota, roll back the global reservation we just took and signal the
         // caller to fall back to stateless SYN cookies (same as the global path).
-        if !table.try_inc_ns_syn(entry.key.0) {
+        if !table.try_inc_ns_syn(key.0) {
             dec_half_open();
             return false;
         }
 
-        self.syn_queue.insert(entry.key, entry);
         true
+    }
+
+    /// Cancel a prepared-but-unpublished SYN slot.
+    ///
+    /// This is allocation-free and may be used after any later passive-open
+    /// preparation failure, including socket-ID exhaustion.
+    fn cancel_syn_slot(&mut self, ns_id: NamespaceId, table: &SocketTable) {
+        table.dec_ns_syn(ns_id);
+        dec_half_open();
+    }
+
+    /// Publish a half-open child after `try_reserve_syn_slot` succeeded.
+    fn publish_syn_reserved(&mut self, entry: PendingSyn, table: &SocketTable) -> bool {
+        let entry_ns = entry.key.0;
+        if self
+            .syn_queue
+            .insert_unique_reserved(entry.key, entry)
+            .is_err()
+        {
+            self.cancel_syn_slot(entry_ns, table);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn queue_syn(&mut self, entry: PendingSyn, table: &SocketTable) -> bool {
+        if !self.try_reserve_syn_slot(&entry.key, table) {
+            return false;
+        }
+
+        self.publish_syn_reserved(entry, table)
     }
 
     /// Remove and return a half-open connection by key.
@@ -1063,8 +1337,14 @@ impl TcpListenState {
     /// Enqueue a fully established connection for accept().
     ///
     /// Returns false if accept queue is full.
-    fn queue_accept(&mut self, sock: Arc<SocketState>) -> bool {
+    fn try_reserve_accept_slot(&mut self) -> bool {
         if self.accept_queue.len() >= self.accept_backlog {
+            return false;
+        }
+
+        // R180-11 FIX: no allocator call is permitted after the active-conn
+        // side effect. Prepare the retained Arc slot first.
+        if self.accept_queue.ensure_capacity_for(1).is_err() {
             return false;
         }
 
@@ -1074,16 +1354,35 @@ impl TcpListenState {
             return false;
         }
 
+        true
+    }
+
+    fn cancel_accept_slot(&mut self) {
+        dec_active_conn();
+    }
+
+    fn publish_accept_reserved(&mut self, sock: SocketArc) -> bool {
         // R121-3 FIX: Mark this socket as counted so cleanup_tcp_connection()
         // only decrements for sockets that actually incremented the counter.
         sock.counted_in_active.store(true, Ordering::Release);
 
-        self.accept_queue.push_back(sock);
+        if let Err(sock) = self.accept_queue.push_reserved(sock) {
+            sock.counted_in_active.store(false, Ordering::Release);
+            dec_active_conn();
+            return false;
+        }
         true
     }
 
+    fn queue_accept(&mut self, sock: SocketArc) -> bool {
+        if !self.try_reserve_accept_slot() {
+            return false;
+        }
+        self.publish_accept_reserved(sock)
+    }
+
     /// Dequeue an established connection for accept().
-    fn pop_accept(&mut self) -> Option<Arc<SocketState>> {
+    fn pop_accept(&mut self) -> Option<SocketArc> {
         self.accept_queue.pop_front()
     }
 
@@ -1093,16 +1392,16 @@ impl TcpListenState {
     }
 
     /// Get the accept wait queue for blocking.
-    fn waiters(&self) -> Arc<WaitQueue> {
+    fn waiters(&self) -> WaitQueueArc {
         self.accept_waiters.clone()
     }
 }
 
 /// Result of initiating a TCP connect (SYN sent).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TcpConnectResult {
     /// Serialized TCP segment (header + payload) ready for IPv4 encapsulation.
-    pub segment: Vec<u8>,
+    pub segment: WirePacket,
     /// Local port used for the connection.
     pub local_port: u16,
     /// Source IP address.
@@ -1111,6 +1410,69 @@ pub struct TcpConnectResult {
     pub dst_ip: Ipv4Addr,
     /// Destination port.
     pub dst_port: u16,
+    /// Exact socket operation that may publish SYN-SENT after device
+    /// acceptance. This token is intentionally private to the network stack.
+    pub(crate) egress_binding: TcpReplyBinding,
+}
+
+/// Exact socket identity and single pending egress operation bound to one
+/// generated TCP control packet. Retaining the `SocketArc` prevents allocator
+/// generation reuse while the packet is awaiting policy/device acceptance.
+pub(crate) struct TcpReplyBinding {
+    sock: SocketArc,
+    socket_id: u64,
+    socket_generation: u64,
+    operation_token: u64,
+}
+
+impl core::fmt::Debug for TcpReplyBinding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TcpReplyBinding")
+            .field("socket_id", &self.socket_id)
+            .field("socket_generation", &self.socket_generation)
+            .field("operation_token", &self.operation_token)
+            .finish()
+    }
+}
+
+/// A serialized TCP control packet whose heap admission remains owned until
+/// the caller finishes transmission and drops the packet.
+pub struct SerializedTcpPacket {
+    bytes: WirePacket,
+}
+
+impl core::ops::Deref for SerializedTcpPacket {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes.as_slice()
+    }
+}
+
+/// One admitted timer packet plus the socket identity whose metadata may be
+/// committed after the queue result.
+struct DataRetransmitWork {
+    sock: SocketArc,
+    dst_ip: Ipv4Addr,
+    packet: WirePacket,
+    net_ns_id: u64,
+    seq: u32,
+    ack_generation: u64,
+}
+
+struct FinRetransmitWork {
+    sock: SocketArc,
+    dst_ip: Ipv4Addr,
+    packet: WirePacket,
+    net_ns_id: u64,
+}
+
+struct KeepaliveWork {
+    sock: SocketArc,
+    dst_ip: Ipv4Addr,
+    packet: WirePacket,
+    net_ns_id: u64,
+    ack_generation: u64,
 }
 
 // ============================================================================
@@ -1118,7 +1480,7 @@ pub struct TcpConnectResult {
 // ============================================================================
 
 /// Socket binding and connection state.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct SocketMeta {
     /// Local IP address (if bound)
     local_ip: Option<[u8; 4]>,
@@ -1159,6 +1521,8 @@ pub struct SockPollReadiness {
 pub struct SocketState {
     /// Unique socket identifier (monotonically increasing)
     pub id: u64,
+    /// Non-reusable lifetime generation bound to prepared network operations.
+    owner_generation: u64,
     /// Socket domain
     pub domain: SocketDomain,
     /// Socket type
@@ -1178,10 +1542,28 @@ pub struct SocketState {
     /// Initialized to 1 at creation. Incremented on dup()/fork(), decremented
     /// on close(). Socket is only fully closed when refcount reaches 0.
     refcount: AtomicU64,
+    /// R180-21 FIX: Serializes state-changing userspace operations on a shared
+    /// socket handle.  This is the outermost socket-operation lock: bind,
+    /// connect, listen auto-bind, UDP send auto-bind, and connect abort hold it
+    /// across validation, quota charge, registry publication, metadata/TCB
+    /// commit, and synchronous rollback.  It is never held across a scheduler
+    /// wait; connect drops it before blocking and reacquires it for rollback.
+    ///
+    /// Close never blocks on this lock: it publishes `close_pending`, marks the
+    /// socket closed, and uses `try_lock`. If an operation owns the lock, its
+    /// `SocketOperationGuard` performs the exactly-once final teardown after
+    /// unlocking. This preserves the established operation-outermost order
+    /// without creating Process-lock -> operation -> cgroup-lock inversion.
+    operation: Mutex<()>,
+    /// RF180-26 FIX: a close request has linearized and no later userspace
+    /// state operation may publish a live socket state.
+    close_pending: AtomicBool,
+    /// Exactly-once ownership of the deferred close finalizer.
+    close_finalizer_claimed: AtomicBool,
     /// Binding/connection metadata
     meta: Mutex<SocketMeta>,
     /// Received datagram queue
-    rx_queue: Mutex<VecDeque<PendingDatagram>>,
+    rx_queue: Mutex<AdmittedVec<PendingDatagram>>,
     /// Wait queue for blocking recv
     waiters: WaitQueue,
     /// Socket closed flag
@@ -1221,28 +1603,31 @@ impl core::fmt::Debug for SocketState {
 }
 
 impl SocketState {
-    /// Create a new socket state.
-    ///
-    /// R75-1 FIX: Now requires net_ns_id parameter for namespace isolation.
-    pub fn new(
+    /// Prepare and allocate the sole supported socket representation.
+    fn try_new_arc(
         id: u64,
         domain: SocketDomain,
         ty: SocketType,
         proto: SocketProtocol,
         label: SocketLabel,
         net_ns_id: NamespaceId,
-    ) -> Self {
-        SocketState {
+    ) -> Result<SocketArc, SocketError> {
+        let owner_generation = next_nonzero_generation(&NEXT_SOCKET_OWNER_GENERATION)?;
+        try_new_socket_arc(SocketState {
             id,
+            owner_generation,
             domain,
             ty,
             proto,
             label,
             net_ns_id,
             refcount: AtomicU64::new(1),
+            operation: Mutex::new(()),
+            close_pending: AtomicBool::new(false),
+            close_finalizer_claimed: AtomicBool::new(false),
             meta: Mutex::new(SocketMeta::new()),
-            rx_queue: Mutex::new(VecDeque::new()),
-            waiters: WaitQueue::new(),
+            rx_queue: Mutex::new(AdmittedVec::new(HeapClass::SocketPayload)),
+            waiters: WaitQueue::new(HeapClass::SocketObject),
             closed: AtomicBool::new(false),
             counted_in_active: AtomicBool::new(false),
             rx_bytes: AtomicU64::new(0),
@@ -1252,7 +1637,7 @@ impl SocketState {
             rx_dropped: AtomicU64::new(0),
             tcp: Mutex::new(None),
             listen: Mutex::new(None),
-        }
+        })
     }
 
     /// Check if the socket is closed.
@@ -1328,7 +1713,7 @@ impl SocketState {
     }
 
     /// Bind the socket to a local address.
-    pub fn bind_local(&self, ip: Ipv4Addr, port: u16) {
+    fn bind_local(&self, ip: Ipv4Addr, port: u16) {
         let mut meta = self.meta.lock();
         meta.local_ip = Some(ip.0);
         meta.local_port = Some(port);
@@ -1347,7 +1732,7 @@ impl SocketState {
     }
 
     /// Set the remote endpoint (for connect).
-    pub fn set_remote(&self, ip: Ipv4Addr, port: u16) {
+    fn set_remote(&self, ip: Ipv4Addr, port: u16) {
         let mut meta = self.meta.lock();
         meta.remote_ip = Some(ip.0);
         meta.remote_port = Some(port);
@@ -1364,8 +1749,10 @@ impl SocketState {
     }
 
     /// Install a TCP control block for this socket.
-    fn attach_tcp(&self, control: TcpControlBlock) {
-        *self.tcp.lock() = Some(TcpSocketState::new(control));
+    fn attach_tcp(&self, control: TcpControlBlock) -> Result<(), SocketError> {
+        let state = TcpSocketState::try_new(control)?;
+        *self.tcp.lock() = Some(state);
+        Ok(())
     }
 
     /// Get the current TCP state (if any).
@@ -1471,7 +1858,7 @@ impl SocketState {
     }
 
     /// Get a clone of the TCP state waiters (for blocking connect/wakeups).
-    fn tcp_waiters(&self) -> Option<Arc<WaitQueue>> {
+    fn tcp_waiters(&self) -> Option<WaitQueueArc> {
         self.tcp
             .lock()
             .as_ref()
@@ -1486,7 +1873,7 @@ impl SocketState {
     }
 
     /// Get a clone of the TCP data waiters (for blocking recv).
-    fn tcp_data_waiters(&self) -> Option<Arc<WaitQueue>> {
+    fn tcp_data_waiters(&self) -> Option<WaitQueueArc> {
         self.tcp.lock().as_ref().map(|tcp| tcp.data_waiters.clone())
     }
 
@@ -1512,19 +1899,19 @@ impl SocketState {
     }
 
     /// Get the accept wait queue for blocking accept().
-    pub fn listen_waiters(&self) -> Option<Arc<WaitQueue>> {
+    pub fn listen_waiters(&self) -> Option<WaitQueueArc> {
         self.listen.lock().as_ref().map(|l| l.waiters())
     }
 
     /// Pop the next established connection from the accept queue.
-    pub fn pop_accept_ready(&self) -> Option<Arc<SocketState>> {
+    pub fn pop_accept_ready(&self) -> Option<SocketArc> {
         self.listen.lock().as_mut().and_then(|l| l.pop_accept())
     }
 
     /// Push an established connection to the accept queue.
     ///
     /// Returns false if the accept queue is full.
-    fn push_accept_ready(&self, child: Arc<SocketState>) -> bool {
+    fn push_accept_ready(&self, child: SocketArc) -> bool {
         let mut guard = self.listen.lock();
         if let Some(state) = guard.as_mut() {
             let queued = state.queue_accept(child);
@@ -1569,6 +1956,14 @@ impl SocketState {
             return false;
         }
 
+        // R180-11 FIX: reserve queue backing before payload allocation or
+        // logical publication. The retained capacity remains globally charged
+        // and reusable if this datagram is rejected later.
+        if queue.ensure_capacity_for(1).is_err() {
+            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
         // R132-4 FIX: Enforce global UDP queued bytes cap via atomic CAS loop.
         // Prevents aggregate memory exhaustion across all UDP sockets.
         if GLOBAL_UDP_QUEUED_BYTES
@@ -1589,12 +1984,13 @@ impl SocketState {
         // R133-2 FIX: Only allocate/copy the payload after all cap checks pass.
         // R164-6 FIX: Fallible copy of UDP payload. On OOM, roll back the
         // global byte counter and reject the datagram.
-        let mut data_copy = Vec::new();
-        if data_copy.try_reserve_exact(data.len()).is_err() {
-            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt_len, Ordering::Relaxed);
-            return false;
-        }
-        data_copy.extend_from_slice(data);
+        let data_copy = match AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, data) {
+            Ok(copy) => copy,
+            Err(_) => {
+                GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt_len, Ordering::Relaxed);
+                return false;
+            }
+        };
         let pkt = PendingDatagram {
             src_ip,
             src_port,
@@ -1602,9 +1998,13 @@ impl SocketState {
             received_at,
         };
 
+        if queue.push_reserved(pkt).is_err() {
+            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt_len, Ordering::Relaxed);
+            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         self.rx_bytes.fetch_add(pkt_len as u64, Ordering::Relaxed);
         self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
-        queue.push_back(pkt);
         drop(queue);
 
         self.waiters.wake_one();
@@ -1765,6 +2165,15 @@ pub enum SocketError {
     Interrupted,
 }
 
+/// R180-L1: receive failure split between socket/source handling and the
+/// caller-supplied copyout transaction. A Commit error guarantees the UDP/TCP
+/// source queue was not advanced.
+#[derive(Debug)]
+pub enum RecvTransactionError<E> {
+    Socket(SocketError),
+    Commit(E),
+}
+
 impl From<UdpError> for SocketError {
     fn from(e: UdpError) -> Self {
         SocketError::Udp(e)
@@ -1827,7 +2236,7 @@ enum BindKind {
 /// `insert_binding_charged` / `remove_binding_charged` /
 /// `resolve_while_alive_teardown`; every read projects `.sock`.
 struct PortBinding {
-    sock: Weak<SocketState>,
+    sock: SocketWeak,
     charged_cgroup: u64,
     kind: BindKind,
 }
@@ -1899,6 +2308,258 @@ enum TeardownAction {
     Removed(Option<u64>),
 }
 
+/// The kernel-wide cgroup registry admits at most 4096 simultaneously pinned
+/// cgroups. A charged port pins its cgroup until this deferred uncharge runs,
+/// so 4096 fixed slots are sufficient for every distinct pending producer,
+/// including churned/deleted-but-still-pinned nodes. This makes IRQ/timer
+/// cleanup allocation-free without reducing any socket or cgroup limit.
+const DEFERRED_PORT_UNCHARGE_SLOTS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct DeferredPortUnchargeSlot {
+    cgid: u64,
+    count: u64,
+}
+
+impl DeferredPortUnchargeSlot {
+    /// RF180-33 FIX: the zero cgroup id is an internal empty-slot sentinel,
+    /// never a queryable queue key. Keep both fields in one representation
+    /// state so a partially cleared or zero-count occupied slot cannot be
+    /// mistaken for valid accounting state.
+    #[inline]
+    fn assert_valid(&self) {
+        assert_eq!(
+            self.cgid == 0,
+            self.count == 0,
+            "RF180-33 deferred port-uncharge slot representation corrupted"
+        );
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.assert_valid();
+        self.cgid == 0
+    }
+}
+
+const EMPTY_DEFERRED_PORT_UNCHARGE: DeferredPortUnchargeSlot =
+    DeferredPortUnchargeSlot { cgid: 0, count: 0 };
+
+struct DeferredPortUncharges {
+    slots: [DeferredPortUnchargeSlot; DEFERRED_PORT_UNCHARGE_SLOTS],
+}
+
+impl DeferredPortUncharges {
+    const fn new() -> Self {
+        Self {
+            slots: [EMPTY_DEFERRED_PORT_UNCHARGE; DEFERRED_PORT_UNCHARGE_SLOTS],
+        }
+    }
+
+    fn enqueue(&mut self, cgid: u64, count: u64) {
+        if cgid == 0 || count == 0 {
+            return;
+        }
+        let mut empty = None;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            slot.assert_valid();
+            if slot.cgid == cgid {
+                slot.count = slot
+                    .count
+                    .checked_add(count)
+                    .expect("RF180-33 deferred port-uncharge count overflow");
+                return;
+            }
+            if slot.cgid == 0 && empty.is_none() {
+                empty = Some(index);
+            }
+        }
+        let index = empty.expect("R180-11 deferred cgroup uncharge slots exhausted");
+        self.slots[index] = DeferredPortUnchargeSlot { cgid, count };
+    }
+
+    fn take_one(&mut self) -> Option<(u64, u64)> {
+        for slot in &mut self.slots {
+            if !slot.is_empty() {
+                let out = (slot.cgid, slot.count);
+                *slot = EMPTY_DEFERRED_PORT_UNCHARGE;
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    fn get(&self, cgid: &u64) -> Option<&u64> {
+        if *cgid == 0 {
+            return None;
+        }
+        self.slots.iter().find_map(|slot| {
+            slot.assert_valid();
+            (slot.cgid == *cgid).then_some(&slot.count)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.slots.fill(EMPTY_DEFERRED_PORT_UNCHARGE);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(DeferredPortUnchargeSlot::is_empty)
+    }
+}
+
+/// Per-socket operation ownership with deferred-close handoff.
+///
+/// RF180-26 FIX: close-on-fd-drop may run while the Process table is locked, so
+/// it must never block on `SocketState::operation`. Every state-changing socket
+/// operation uses this guard. The guard releases the operation mutex first,
+/// then claims and runs any pending close finalizer; consequently teardown may
+/// take binding/cgroup locks without inserting the operation lock into their
+/// existing order.
+struct SocketOperationGuard<'a> {
+    table: &'a SocketTable,
+    sock: &'a SocketArc,
+    lock: Option<spin::MutexGuard<'a, ()>>,
+}
+
+pub(crate) struct TcpReplyOperation<'a> {
+    guard: SocketOperationGuard<'a>,
+    token: u64,
+}
+
+impl TcpReplyOperation<'_> {
+    fn exact_registry_owner(&self) -> bool {
+        let sock = self.guard.sock;
+        let meta = sock.meta_snapshot();
+        let (Some(local_ip), Some(local_port), Some(remote_ip), Some(remote_port)) = (
+            meta.local_ip.map(Ipv4Addr),
+            meta.local_port,
+            meta.remote_ip.map(Ipv4Addr),
+            meta.remote_port,
+        ) else {
+            return false;
+        };
+        let key =
+            tcp_map_key_from_parts(sock.net_ns_id, local_ip, local_port, remote_ip, remote_port);
+        self.guard
+            .table
+            .tcp_conns
+            .lock()
+            .get(&key)
+            .and_then(|owner| owner.upgrade())
+            .is_some_and(|owner| Arc::ptr_eq(&owner, sock))
+    }
+
+    pub(crate) fn commit(&mut self, response: &TcpHeader, queued_at_ms: u64) -> bool {
+        let sock = self.guard.sock;
+        if sock.close_pending.load(Ordering::Acquire)
+            || sock.is_closed()
+            || !self.exact_registry_owner()
+        {
+            return false;
+        }
+
+        let mut tcp_guard = sock.tcp.lock();
+        let Some(tcp_state) = tcp_guard.as_mut() else {
+            return false;
+        };
+        if tcp_state.control.pending_reply_token != Some(self.token) {
+            return false;
+        }
+
+        if tcp_state.control.active_open_pending {
+            if response.flags != TCP_FLAG_SYN
+                || response.seq_num != tcp_state.control.iss
+                || response.ack_num != 0
+                || tcp_state.control.state != TcpState::Closed
+            {
+                return false;
+            }
+            tcp_state.control.active_open_pending = false;
+            tcp_state.control.pending_reply_token = None;
+            tcp_state.control.state = TcpState::SynSent;
+            tcp_state.control.last_activity = queued_at_ms;
+            return true;
+        }
+
+        if let Some(pending) = tcp_state.control.pending_handshake {
+            if tcp_state.control.state != TcpState::SynSent
+                || response.flags != pending.response_flags
+                || response.seq_num != pending.response_seq
+                || response.ack_num != pending.response_ack
+            {
+                return false;
+            }
+
+            if let Some((ack_num, observed_at_ms)) = pending.ack_to_apply {
+                self.guard.table.handle_ack_reconciled(
+                    sock,
+                    &mut tcp_state.control,
+                    ack_num,
+                    observed_at_ms,
+                );
+            }
+            let control = &mut tcp_state.control;
+            control.irs = pending.irs;
+            control.rcv_nxt = pending.rcv_nxt;
+            control.snd_wscale = pending.snd_wscale;
+            control.wscale_received = pending.wscale_received;
+            control.sack_received = pending.sack_received;
+            control.snd_mss = pending.snd_mss;
+            control.cwnd = pending.cwnd;
+            control.snd_wnd = pending.snd_wnd;
+            control.snd_wl1 = pending.snd_wl1;
+            if let Some(snd_wl2) = pending.snd_wl2 {
+                control.snd_wl2 = snd_wl2;
+            }
+            control.rcv_wnd = pending.rcv_wnd;
+            control.passive_egress_confirmed = true;
+            control.state = pending.target_state;
+            control.pending_handshake = None;
+            control.pending_reply_token = None;
+            let wake_connect = pending.wake_connect;
+            drop(tcp_guard);
+            if wake_connect {
+                sock.wake_tcp_waiters();
+            }
+            return true;
+        }
+
+        if tcp_state.control.state == TcpState::SynReceived
+            && response.flags & (TCP_FLAG_SYN | TCP_FLAG_ACK) == (TCP_FLAG_SYN | TCP_FLAG_ACK)
+            && response.seq_num == tcp_state.control.iss
+            && response.ack_num == tcp_state.control.rcv_nxt
+        {
+            tcp_state.control.passive_egress_confirmed = true;
+            tcp_state.control.pending_reply_token = None;
+            return true;
+        }
+
+        false
+    }
+}
+
+impl Drop for SocketOperationGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        self.table.maybe_finalize_deferred_close(self.sock);
+    }
+}
+
+/// RF180-52: release aggregate-admission backing retained only by a completed
+/// boot self-test. Never disturb a map with live production entries; the high
+/// test IDs have already been removed before this helper is called.
+fn release_empty_boot_test_backing<K: Ord, V>(map: &Mutex<AdmittedMap<K, V>>) {
+    let retired = {
+        let mut guard = map.lock();
+        if !guard.is_empty() {
+            return;
+        }
+        core::mem::replace(&mut *guard, AdmittedMap::new(HeapClass::SocketObject))
+    };
+    drop(retired);
+}
+
 /// Global socket table: tracks all sockets and port bindings.
 ///
 /// Thread-safe via RwLock (read-heavy) and Mutex (write operations).
@@ -1919,28 +2580,28 @@ pub struct SocketTable {
     /// Next ephemeral port seed
     next_ephemeral: AtomicU16,
     /// All active sockets (socket_id -> SocketState)
-    sockets: RwLock<BTreeMap<u64, Arc<SocketState>>>,
+    sockets: RwLock<AdmittedMap<u64, SocketArc>>,
     /// R75-1 FIX: UDP port bindings partitioned by network namespace.
     /// J2-8: value carries the charged cgroup (see `PortBinding`).
-    udp_bindings: Mutex<BTreeMap<(NamespaceId, u16), PortBinding>>,
+    udp_bindings: Mutex<AdmittedMap<(NamespaceId, u16), PortBinding>>,
     /// R75-1 FIX: TCP local port bindings partitioned by network namespace.
     /// J2-8: value carries the charged cgroup (see `PortBinding`).
-    tcp_bindings: Mutex<BTreeMap<(NamespaceId, u16), PortBinding>>,
+    tcp_bindings: Mutex<AdmittedMap<(NamespaceId, u16), PortBinding>>,
     /// Active TCP connections keyed by 4-tuple
-    tcp_conns: Mutex<BTreeMap<TcpLookupKey, Weak<SocketState>>>,
+    tcp_conns: Mutex<AdmittedMap<TcpLookupKey, SocketWeak>>,
     /// R76-3 FIX: Per-namespace socket count for quota enforcement
-    per_ns_counts: Mutex<BTreeMap<NamespaceId, u64>>,
+    per_ns_counts: Mutex<AdmittedMap<NamespaceId, u64>>,
     /// J2-1 FIX (Phase J.2 per-tenant quotas): Per-namespace live TCP connection
     /// count. Bound to `tcp_conns` 4-tuple MEMBERSHIP (key.0 == net_ns_id), NOT a
     /// per-socket flag, so the six stale-Weak reapers cannot leak it. A strict
     /// subset of the global `TCP_MAX_ACTIVE_CONNECTIONS` cap; root (ns 0) is exempt.
     /// Lock order: `tcp_conns` > `per_ns_conn_counts` (pure leaf, takes no further lock).
-    per_ns_conn_counts: Mutex<BTreeMap<NamespaceId, u32>>,
+    per_ns_conn_counts: Mutex<AdmittedMap<NamespaceId, u32>>,
     /// J2-2 FIX (Phase J.2 per-tenant quotas): Per-namespace half-open (SYN-queue)
     /// count, summed across all listeners in the namespace. A strict subset of the
     /// global half-open cap; root (ns 0) is exempt. Charged/uncharged through
     /// `queue_syn`/`take_syn`. Lock order: `listen.lock` > `per_ns_syn_counts`.
-    per_ns_syn_counts: Mutex<BTreeMap<NamespaceId, u64>>,
+    per_ns_syn_counts: Mutex<AdmittedMap<NamespaceId, u64>>,
     /// J2-6 FIX (Phase J.2 per-tenant quotas): Per-namespace aggregate TCP send
     /// buffer bytes, summed across all live connections in the namespace. A strict
     /// additional layer over the per-connection `TCP_MAX_SEND_BUFFER_BYTES` (4 MiB)
@@ -1948,16 +2609,16 @@ pub struct SocketTable {
     /// `handle_ack` reconcile and at teardown (the per-TCB `ns_charged_send_bytes`
     /// mirror records each connection's contribution). Lock order:
     /// `sock.tcp` > `per_ns_send_bytes` (pure leaf, takes no further lock).
-    per_ns_send_bytes: Mutex<BTreeMap<NamespaceId, usize>>,
+    per_ns_send_bytes: Mutex<AdmittedMap<NamespaceId, usize>>,
     /// J2-4 FIX (Phase J.2 per-tenant quotas): Per-namespace aggregate TCP RECV
     /// footprint F = recv_buffer.len() + ooo_bytes, summed across all live
     /// connections in the namespace. A strict additional layer over the per-conn
     /// `TCP_MAX_RECV_BUFFER_BYTES` cap; root (ns 0) is exempt. Charged via a
-    /// decide-only gate + reconciled to live F under `sock.tcp`
+    /// decision/counter-slot preflight + reconciled to live F under `sock.tcp`
     /// (`try_charge_ns_recv_gate` / `reconcile_ns_recv`). SOFT cap (bounded,
     /// self-correcting overshoot — never under-counts, no isolation bypass). Lock
     /// order: `sock.tcp` > `per_ns_recv_bytes` (pure leaf, takes no further lock).
-    per_ns_recv_bytes: Mutex<BTreeMap<NamespaceId, usize>>,
+    per_ns_recv_bytes: Mutex<AdmittedMap<NamespaceId, usize>>,
     /// J2-8 FIX (Phase J.2 per-tenant quotas): Deferred per-cgroup port-uncharge
     /// queue, folded by cgroup id (so its size is bounded by the number of
     /// distinct charged cgroups, never by event count). The cgroup uncharge
@@ -1968,7 +2629,7 @@ pub struct SocketTable {
     /// `drain_deferred_port_uncharges` flushes it in process context (the
     /// scheduler reschedule hook). Pure Level-8 leaf: only appended while a
     /// binding lock is already held, or alone during the process-ctx drain.
-    port_uncharge_pending: Mutex<BTreeMap<u64, u64>>,
+    port_uncharge_pending: Mutex<DeferredPortUncharges>,
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
@@ -1980,9 +2641,72 @@ pub struct SocketTable {
     bind_count: AtomicU64,
     /// P0-2 FIX: Forced TIME_WAIT evictions to admit SYN cookie completions
     forced_tw_evictions: AtomicU64,
+    /// Deterministic cleanup-worklist OOM injection for RF180-7 tests.
+    #[cfg(test)]
+    fail_next_timer_cleanup_reserve: AtomicBool,
+    /// Deterministic passive SYN-ACK construction failure injection.
+    #[cfg(test)]
+    fail_next_passive_syn_ack_build: AtomicBool,
+    /// Deterministic simultaneous-open SYN-ACK construction failure injection.
+    #[cfg(test)]
+    fail_next_simultaneous_syn_ack_build: AtomicBool,
+    /// Deterministic close-vs-operation commit-window pause.
+    #[cfg(test)]
+    test_operation_pause_kind: core::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    test_operation_paused: AtomicBool,
+    #[cfg(test)]
+    test_operation_resume: AtomicBool,
 }
 
+#[cfg(test)]
+const TEST_PAUSE_BIND_COMMIT: u8 = 1;
+#[cfg(test)]
+const TEST_PAUSE_CONNECT_COMMIT: u8 = 2;
+#[cfg(test)]
+const TEST_PAUSE_LISTEN_COMMIT: u8 = 3;
+#[cfg(test)]
+const TEST_PAUSE_SHUTDOWN_COMMIT: u8 = 4;
+
 impl SocketTable {
+    fn lock_socket_operation<'a>(&'a self, sock: &'a SocketArc) -> SocketOperationGuard<'a> {
+        SocketOperationGuard {
+            table: self,
+            sock,
+            lock: Some(sock.operation.lock()),
+        }
+    }
+
+    fn maybe_finalize_deferred_close(&self, sock: &SocketArc) {
+        if !sock.close_pending.load(Ordering::Acquire) {
+            return;
+        }
+        if sock
+            .close_finalizer_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.finish_close(sock);
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_operation_commit_for_test(&self, kind: u8) {
+        if self
+            .test_operation_pause_kind
+            .compare_exchange(kind, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.test_operation_paused.store(true, Ordering::Release);
+        while !self.test_operation_resume.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        self.test_operation_resume.store(false, Ordering::Release);
+        self.test_operation_paused.store(false, Ordering::Release);
+    }
+
     /// Encode advertised receive window for TCP header using window scaling.
     ///
     /// RFC 7323: If window scaling is enabled, the advertised window in the
@@ -2018,11 +2742,11 @@ impl SocketTable {
         src_port: u16,
         dst_port: u16,
         window: u16,
-    ) -> Vec<u8> {
+    ) -> WirePacket {
         let sack_blocks = if tcb.sack_enabled() {
             tcb.generate_sack_blocks()
         } else {
-            Vec::new()
+            Default::default()
         };
 
         if sack_blocks.is_empty() {
@@ -2071,38 +2795,62 @@ impl SocketTable {
         SocketTable {
             next_socket_id: AtomicU64::new(1),
             next_ephemeral: AtomicU16::new(EPHEMERAL_PORT_START),
-            sockets: RwLock::new(BTreeMap::new()),
-            udp_bindings: Mutex::new(BTreeMap::new()),
-            tcp_bindings: Mutex::new(BTreeMap::new()),
-            tcp_conns: Mutex::new(BTreeMap::new()),
-            per_ns_counts: Mutex::new(BTreeMap::new()), // R76-3 FIX
-            per_ns_conn_counts: Mutex::new(BTreeMap::new()), // J2-1 FIX
-            per_ns_syn_counts: Mutex::new(BTreeMap::new()), // J2-2 FIX
-            per_ns_send_bytes: Mutex::new(BTreeMap::new()), // J2-6 FIX
-            per_ns_recv_bytes: Mutex::new(BTreeMap::new()), // J2-4 FIX
-            port_uncharge_pending: Mutex::new(BTreeMap::new()), // J2-8 FIX
+            sockets: RwLock::new(AdmittedMap::new(HeapClass::SocketObject)),
+            udp_bindings: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            tcp_bindings: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            tcp_conns: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
+            per_ns_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // R76-3 FIX
+            per_ns_conn_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-1 FIX
+            per_ns_syn_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-2 FIX
+            per_ns_send_bytes: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-6 FIX
+            per_ns_recv_bytes: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-4 FIX
+            port_uncharge_pending: Mutex::new(DeferredPortUncharges::new()),      // J2-8/R180-11
             time_wait_clock: AtomicU64::new(0),
             timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
             forced_tw_evictions: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_timer_cleanup_reserve: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_passive_syn_ack_build: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_simultaneous_syn_ack_build: AtomicBool::new(false),
+            #[cfg(test)]
+            test_operation_pause_kind: core::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            test_operation_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            test_operation_resume: AtomicBool::new(false),
         }
     }
 
     /// R76-3 FIX: Maximum sockets allowed per network namespace.
     /// Prevents DoS via socket exhaustion within a single namespace.
-    /// Value allows reasonable server workloads while preventing abuse.
+    ///
+    /// R180-11 FIX: this compatibility/isolation ceiling remains 8192, but is
+    /// no longer the heap-safety authority. Every namespace, including root,
+    /// competes under the global `SocketObject` byte admission class, which
+    /// charges the real Arc and registry backing before publication.
     pub const MAX_SOCKETS_PER_NS: u64 = 8192;
 
     /// R76-3 FIX: Try to increment namespace socket count, failing if quota exceeded.
     fn try_inc_ns_count(&self, ns_id: NamespaceId) -> Result<(), SocketError> {
         let mut counts = self.per_ns_counts.lock();
-        let count = counts.entry(ns_id).or_insert(0);
-        if *count >= Self::MAX_SOCKETS_PER_NS {
-            return Err(SocketError::QuotaExceeded); // Maps to EAGAIN in syscall layer
+        if let Some(count) = counts.get_mut(&ns_id) {
+            if *count >= Self::MAX_SOCKETS_PER_NS {
+                return Err(SocketError::QuotaExceeded);
+            }
+            *count += 1;
+            return Ok(());
         }
-        *count += 1;
+        counts
+            .ensure_capacity_for(1)
+            .map_err(|_| SocketError::NoMemory)?;
+        counts
+            .insert_unique_reserved(ns_id, 1)
+            .map_err(|_| SocketError::NoMemory)?;
         Ok(())
     }
 
@@ -2138,6 +2886,9 @@ impl SocketTable {
     // only by the global caps. This is deliberate — quotas isolate untrusted
     // tenants (CLONE_NEWNET, ns >= 1) without regressing host connection capacity
     // (a per-ns cap below the global 4096 would otherwise cap a host-only system).
+    // R180-11's `SocketObject`/`SocketPayload` byte gates are separate global
+    // safety limits and include root; this exemption applies only to tenant
+    // fairness policy, never to retained heap admission.
     //
     // `NamespaceId` is monotonic and never reused (net_namespace.rs: NEXT_NET_NS_ID
     // is allocated via `fetch_update` + `checked_add`; Drop does not recycle), so a
@@ -2162,7 +2913,7 @@ impl SocketTable {
     /// `TCP_MAX_RECV_BUFFER_BYTES` (256 KiB) = 16 MiB — and necessarily `>=` it so a
     /// single connection can still fill its own recv buffer. 1/4 of the 64 MiB send
     /// cap, matching the 4:1 per-conn send:recv buffer ratio. SOFT cap: the
-    /// decide-only `try_charge_ns_recv_gate` releases its leaf before the buffer
+    /// preflight-only `try_charge_ns_recv_gate` releases its leaf before the buffer
     /// mutation + `reconcile_ns_recv`, so concurrent same-ns siblings may transiently
     /// overshoot by at most (concurrent admissions) x one segment payload
     /// (<= num_cpus x snd_mss), bounded overall by MAX_CONNS_PER_NS x
@@ -2183,11 +2934,19 @@ impl SocketTable {
             return Ok(());
         }
         let mut counts = self.per_ns_conn_counts.lock();
-        let count = counts.entry(ns_id).or_insert(0);
-        if *count >= Self::MAX_CONNS_PER_NS {
-            return Err(SocketError::QuotaExceeded);
+        if let Some(count) = counts.get_mut(&ns_id) {
+            if *count >= Self::MAX_CONNS_PER_NS {
+                return Err(SocketError::QuotaExceeded);
+            }
+            *count += 1;
+            return Ok(());
         }
-        *count += 1;
+        counts
+            .ensure_capacity_for(1)
+            .map_err(|_| SocketError::NoMemory)?;
+        counts
+            .insert_unique_reserved(ns_id, 1)
+            .map_err(|_| SocketError::NoMemory)?;
         Ok(())
     }
 
@@ -2218,7 +2977,7 @@ impl SocketTable {
     /// `cleanup_tcp_connection`), so binding the count to map membership HERE is
     /// the only way to keep it leak-free. Replaces the bare
     /// `conns.retain(|_, w| w.strong_count() > 0)`.
-    fn conns_retain_accounted(&self, conns: &mut BTreeMap<TcpLookupKey, Weak<SocketState>>) {
+    fn conns_retain_accounted(&self, conns: &mut AdmittedMap<TcpLookupKey, SocketWeak>) {
         let mut counts = self.per_ns_conn_counts.lock();
         conns.retain(|key, weak| {
             let keep = weak.strong_count() > 0;
@@ -2231,6 +2990,36 @@ impl SocketTable {
         });
         // Drop any namespace entries that reached zero (keep the map bounded).
         counts.retain(|_, v| *v != 0);
+    }
+
+    /// Remove a live TCP registration only while `sock` is still its exact owner.
+    ///
+    /// RF180-36 FIX: a tuple can be removed and reused between an earlier metadata
+    /// snapshot and close/rollback cleanup. A key-only removal in that stale
+    /// cleanup would delete the replacement socket and uncharge its namespace.
+    /// Upgrade and compare the stored owner while holding `tcp_conns`; only the
+    /// exact owner may remove the entry and release its accounting. The nested
+    /// quota update preserves the established `tcp_conns` >
+    /// `per_ns_conn_counts` lock order. Dead Weak entries deliberately remain for
+    /// the existing accounted stale-Weak pruning paths.
+    fn remove_tcp_conn_exact_owner(&self, key: TcpLookupKey, sock: &SocketArc) -> bool {
+        let mut conns = self.tcp_conns.lock();
+        let owns_entry = conns
+            .get(&key)
+            .and_then(|weak| weak.upgrade())
+            .map_or(false, |owner| Arc::ptr_eq(&owner, sock));
+        if !owns_entry || conns.remove(&key).is_none() {
+            return false;
+        }
+
+        self.dec_ns_conn(key.0);
+        // RF180-36 FIX: transfer the passive-open count exactly once with the
+        // registration ownership. Repeated close/cleanup attempts and stale
+        // tuple owners cannot decrement the replacement's global admission.
+        if sock.counted_in_active.swap(false, Ordering::AcqRel) {
+            dec_active_conn();
+        }
+        true
     }
 
     // ========================================================================
@@ -2246,9 +3035,8 @@ impl SocketTable {
         if cgid == 0 || n == 0 {
             return;
         }
-        let mut pending = self.port_uncharge_pending.lock();
-        let slot = pending.entry(cgid).or_insert(0);
-        *slot = slot.saturating_add(n);
+        // R180-11 FIX: fixed slots make timer/RX cleanup allocation-free.
+        self.port_uncharge_pending.lock().enqueue(cgid, n);
     }
 
     /// J2-8: flush the deferred port-uncharge queue in PROCESS context. Snapshot
@@ -2257,17 +3045,14 @@ impl SocketTable {
     /// a second drain finds the queue empty. Called from the scheduler reschedule
     /// hook after the deferred TCP-timer drain (a producer in the same pass).
     pub fn drain_deferred_port_uncharges(&self) {
-        let drained: Vec<(u64, u64)> = {
-            let mut pending = self.port_uncharge_pending.lock();
-            if pending.is_empty() {
-                return;
+        // Take one fixed slot at a time and drop the leaf lock before entering
+        // cgroup Level 5. No snapshot allocation and no lock-order regression.
+        loop {
+            let next = { self.port_uncharge_pending.lock().take_one() };
+            match next {
+                Some((cgid, n)) => uncharge_port_cgroup(cgid, n),
+                None => break,
             }
-            let out = pending.iter().map(|(&c, &n)| (c, n)).collect();
-            pending.clear();
-            out
-        };
-        for (cgid, n) in drained {
-            uncharge_port_cgroup(cgid, n);
         }
     }
 
@@ -2280,7 +3065,7 @@ impl SocketTable {
     /// else's binding. Operates on the caller's held guard; the caller chooses
     /// direct uncharge (process ctx, after dropping the guard) vs `enqueue`.
     fn remove_binding_charged(
-        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
         key: (NamespaceId, u16),
         expect_ptr: Option<*const SocketState>,
     ) -> Option<u64> {
@@ -2288,7 +3073,9 @@ impl SocketTable {
             Some(pb) => {
                 if let Some(p) = expect_ptr {
                     if pb.sock_ptr() != p {
-                        bindings.insert(key, pb); // foreign — put it back
+                        if bindings.insert_unique_reserved(key, pb).is_err() {
+                            panic!("R180-11 removed binding lost reserved capacity");
+                        }
                         return None;
                     }
                 }
@@ -2312,7 +3099,7 @@ impl SocketTable {
     /// distinguish a live foreign owner from a dead stale entry, which needs
     /// `upgrade()`.)
     fn peek_binding_kind(
-        bindings: &BTreeMap<(NamespaceId, u16), PortBinding>,
+        bindings: &AdmittedMap<(NamespaceId, u16), PortBinding>,
         key: (NamespaceId, u16),
         expect_ptr: *const SocketState,
     ) -> Option<(BindKind, u64)> {
@@ -2335,7 +3122,7 @@ impl SocketTable {
     /// load-bearing: an uncharged (root / pre-hook) Explicit entry keeps
     /// today's remove-while-alive + connect-repair semantics.
     fn resolve_while_alive_teardown(
-        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
         key: (NamespaceId, u16),
         expect_ptr: *const SocketState,
     ) -> TeardownAction {
@@ -2354,28 +3141,44 @@ impl SocketTable {
     /// new charge is genuine growth (keep), a self-replace (undo the speculative
     /// charge), or evicted a stale charged entry (enqueue the old charge). Any
     /// displaced UNcharged entry is a plain `FreshGrowth` (nothing to uncharge).
-    fn insert_binding_charged(
-        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+    fn try_insert_binding_charged(
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
         key: (NamespaceId, u16),
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         new_cgid: u64,
         kind: BindKind,
-    ) -> InsertOutcome {
-        let prev = bindings.insert(
-            key,
-            PortBinding {
-                sock: Arc::downgrade(sock),
-                charged_cgroup: new_cgid,
-                kind,
-            },
-        );
+    ) -> Result<InsertOutcome, SocketError> {
+        let prev = bindings
+            .try_insert(
+                key,
+                PortBinding {
+                    sock: Arc::downgrade(sock),
+                    charged_cgroup: new_cgid,
+                    kind,
+                },
+            )
+            .map_err(|_| SocketError::NoMemory)?;
         // Always refund the displaced charge; ptr identity is irrelevant.
         match prev {
             Some(old) if old.charged_cgroup != 0 => {
-                InsertOutcome::DisplacedCharge(old.charged_cgroup)
+                Ok(InsertOutcome::DisplacedCharge(old.charged_cgroup))
             }
-            _ => InsertOutcome::FreshGrowth,
+            _ => Ok(InsertOutcome::FreshGrowth),
         }
+    }
+
+    /// Boot/self-test compatibility wrapper. Runtime publication paths use the
+    /// fallible variant above and roll back quota state; a self-test OOM is an
+    /// invariant/test-environment failure and must be visible.
+    fn insert_binding_charged(
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
+        key: (NamespaceId, u16),
+        sock: &SocketArc,
+        new_cgid: u64,
+        kind: BindKind,
+    ) -> InsertOutcome {
+        Self::try_insert_binding_charged(bindings, key, sock, new_cgid, kind)
+            .expect("R180-11 binding self-test admission")
     }
 
     /// J2-8: prune dead-`Weak` entries for namespace `ns` from a binding map,
@@ -2387,14 +3190,10 @@ impl SocketTable {
     /// Runs under the caller's held binding guard.
     fn reap_dead_bindings(
         &self,
-        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
         ns: NamespaceId,
     ) {
-        let mut to_enqueue: Vec<u64> = Vec::new();
-        Self::collect_dead_binding_charges(bindings, Some(ns), &mut to_enqueue);
-        for cgid in to_enqueue {
-            self.enqueue_port_uncharge(cgid, 1);
-        }
+        self.collect_dead_binding_charges(bindings, Some(ns));
     }
 
     /// R169-L9/L10/L11: the shared dead-`Weak` collector behind both the
@@ -2411,9 +3210,9 @@ impl SocketTable {
     /// `charged_cgroup`, never `kind` (a held Explicit charge is reclaimed
     /// identically once its socket is gone).
     fn collect_dead_binding_charges(
-        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+        &self,
+        bindings: &mut AdmittedMap<(NamespaceId, u16), PortBinding>,
         ns: Option<NamespaceId>,
-        to_enqueue: &mut Vec<u64>,
     ) {
         bindings.retain(|key, pb| {
             if let Some(target_ns) = ns {
@@ -2423,7 +3222,7 @@ impl SocketTable {
             }
             let alive = pb.sock.strong_count() > 0;
             if !alive && pb.charged_cgroup != 0 {
-                to_enqueue.push(pb.charged_cgroup);
+                self.enqueue_port_uncharge(pb.charged_cgroup, 1);
             }
             alive
         });
@@ -2449,17 +3248,13 @@ impl SocketTable {
     /// from the reschedule deferred-work drain and synchronously before the
     /// `delete_cgroup` emptiness gate.
     pub fn sweep_stranded_port_charges(&self) {
-        let mut to_enqueue: Vec<u64> = Vec::new();
         {
             let mut bindings = self.udp_bindings.lock();
-            Self::collect_dead_binding_charges(&mut bindings, None, &mut to_enqueue);
+            self.collect_dead_binding_charges(&mut bindings, None);
         }
         {
             let mut bindings = self.tcp_bindings.lock();
-            Self::collect_dead_binding_charges(&mut bindings, None, &mut to_enqueue);
-        }
-        for cgid in to_enqueue {
-            self.enqueue_port_uncharge(cgid, 1);
+            self.collect_dead_binding_charges(&mut bindings, None);
         }
     }
 
@@ -2470,7 +3265,6 @@ impl SocketTable {
     /// forever. Wired from `NetNamespace::Drop`. Enqueue-only (Drop runs in
     /// arbitrary context; the Level-5 uncharge is deferred to the drain).
     pub fn drain_ns_port_bindings(&self, ns: NamespaceId) {
-        let mut to_enqueue: Vec<u64> = Vec::new();
         {
             let mut bindings = self.udp_bindings.lock();
             bindings.retain(|key, pb| {
@@ -2478,7 +3272,7 @@ impl SocketTable {
                     return true;
                 }
                 if pb.charged_cgroup != 0 {
-                    to_enqueue.push(pb.charged_cgroup);
+                    self.enqueue_port_uncharge(pb.charged_cgroup, 1);
                 }
                 false
             });
@@ -2490,13 +3284,10 @@ impl SocketTable {
                     return true;
                 }
                 if pb.charged_cgroup != 0 {
-                    to_enqueue.push(pb.charged_cgroup);
+                    self.enqueue_port_uncharge(pb.charged_cgroup, 1);
                 }
                 false
             });
-        }
-        for cgid in to_enqueue {
-            self.enqueue_port_uncharge(cgid, 1);
         }
     }
 
@@ -2557,19 +3348,26 @@ impl SocketTable {
 
     /// J2-2: charge one per-namespace half-open (SYN-queue) slot. Returns false
     /// (caller falls back to stateless SYN cookies) when the tenant is at its cap.
-    /// Root (ns 0) is never charged. Charged in `queue_syn`, uncharged in
-    /// `take_syn` / the listener-close drain.
+    /// Root (ns 0) is exempt only from this tenant-fairness counter. Every
+    /// half-open child's object, queue backing, and cached packet remains under
+    /// the global SocketObject/SocketPayload admission gates. Charged in the
+    /// SYN publication transaction and uncharged in `take_syn` / listener close.
     fn try_inc_ns_syn(&self, ns_id: NamespaceId) -> bool {
         if ns_id == NamespaceId(0) {
             return true;
         }
         let mut counts = self.per_ns_syn_counts.lock();
-        let count = counts.entry(ns_id).or_insert(0);
-        if *count >= Self::MAX_HALF_OPEN_PER_NS {
+        if let Some(count) = counts.get_mut(&ns_id) {
+            if *count >= Self::MAX_HALF_OPEN_PER_NS {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+        if counts.ensure_capacity_for(1).is_err() {
             return false;
         }
-        *count += 1;
-        true
+        counts.insert_unique_reserved(ns_id, 1).is_ok()
     }
 
     /// J2-2: uncharge one per-namespace half-open slot.
@@ -2616,19 +3414,21 @@ impl SocketTable {
             return Ok(());
         }
         let mut counts = self.per_ns_send_bytes.lock();
-        let e = counts.entry(ns_id).or_insert(0);
-        let projected = match e.checked_add(additional) {
+        let current = counts.get(&ns_id).copied().unwrap_or(0);
+        let projected = match current.checked_add(additional) {
             Some(p) if p <= Self::MAX_SEND_BYTES_PER_NS => p,
-            _ => {
-                // Reservation rejected: leave the counter untouched. Drop a freshly
-                // inserted zero entry so a denied charge cannot pin a stale key.
-                if *e == 0 {
-                    counts.remove(&ns_id);
-                }
-                return Err(SocketError::WouldBlock);
-            }
+            _ => return Err(SocketError::WouldBlock),
         };
-        *e = projected;
+        if let Some(e) = counts.get_mut(&ns_id) {
+            *e = projected;
+        } else {
+            counts
+                .ensure_capacity_for(1)
+                .map_err(|_| SocketError::NoMemory)?;
+            counts
+                .insert_unique_reserved(ns_id, projected)
+                .map_err(|_| SocketError::NoMemory)?;
+        }
         tcb.ns_charged_send_bytes = tcb.ns_charged_send_bytes.saturating_add(additional);
         Ok(())
     }
@@ -2652,7 +3452,9 @@ impl SocketTable {
         }
         let mut counts = self.per_ns_send_bytes.lock();
         if live > charged {
-            let e = counts.entry(ns_id).or_insert(0);
+            let e = counts
+                .get_mut(&ns_id)
+                .expect("R180-11 send counter slot was not prepared before payload growth");
             *e = e.saturating_add(live - charged);
         } else if let Some(c) = counts.get_mut(&ns_id) {
             let now = c.saturating_sub(charged - live);
@@ -2693,7 +3495,7 @@ impl SocketTable {
     /// before.
     fn handle_ack_reconciled(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         tcb: &mut TcpControlBlock,
         ack_num: u32,
         now_ms: u64,
@@ -2709,7 +3511,7 @@ impl SocketTable {
     /// SYN-SENT connect-timeout site; `cleanup_tcp_connection` inlines the same
     /// sequence under its already-held guard. The last-ref `impl Drop for
     /// SocketState` is the catch-all for the close-non-keep path that nulls nothing.
-    fn detach_tcp_uncharged(&self, sock: &Arc<SocketState>) {
+    fn detach_tcp_uncharged(&self, sock: &SocketArc) {
         let mut g = sock.tcp.lock();
         if let Some(ts) = g.as_mut() {
             let charged = ts.control.ns_charged_send_bytes;
@@ -2727,11 +3529,12 @@ impl SocketTable {
         *g = None;
     }
 
-    /// J2-4: per-namespace RECV-memory budget PRE-GATE. DECIDE-only — takes NO
-    /// charge and mutates nothing (counter or mirror); it only decides whether
-    /// admitting `grow_by` more recv bytes for this connection would push the
-    /// namespace aggregate past the cap. Root (ns 0) / zero are admitted. The actual
-    /// counter move happens later in `reconcile_ns_recv` AFTER the buffer mutation,
+    /// J2-4: per-namespace RECV-memory budget PRE-GATE. It takes no byte charge
+    /// and does not move the TCB mirror; it decides whether `grow_by` would push
+    /// the namespace aggregate past the cap and prepares a zero-valued counter
+    /// slot so post-allocation reconciliation is allocation-free. Root (ns 0) /
+    /// zero are admitted. The actual counter move happens later in
+    /// `reconcile_ns_recv` AFTER the buffer mutation,
     /// because recv's true F-delta is unknown pre-mutation (ooo_insert returns a
     /// merge-adjusted delta; ooo_drain is net-neutral-except-FIN-clear). `grow_by`
     /// is the UPPER bound on F-growth (payload.len()/useful.len()), so the gate is
@@ -2746,7 +3549,7 @@ impl SocketTable {
         if ns_id == NamespaceId(0) || grow_by == 0 {
             return Ok(());
         }
-        let counts = self.per_ns_recv_bytes.lock();
+        let mut counts = self.per_ns_recv_bytes.lock();
         let live = counts.get(&ns_id).copied().unwrap_or(0);
         let charged = tcb.ns_charged_recv_bytes;
         // The namespace footprint EXCLUDING this connection's current contribution,
@@ -2754,7 +3557,17 @@ impl SocketTable {
         let other_conns = live.saturating_sub(charged);
         let conn_after = charged.saturating_add(grow_by);
         match other_conns.checked_add(conn_after) {
-            Some(projected) if projected <= Self::MAX_RECV_BYTES_PER_NS => Ok(()),
+            Some(projected) if projected <= Self::MAX_RECV_BYTES_PER_NS => {
+                if !counts.contains_key(&ns_id) {
+                    counts
+                        .ensure_capacity_for(1)
+                        .map_err(|_| SocketError::NoMemory)?;
+                    counts
+                        .insert_unique_reserved(ns_id, 0)
+                        .map_err(|_| SocketError::NoMemory)?;
+                }
+                Ok(())
+            }
             _ => Err(SocketError::WouldBlock),
         }
     }
@@ -2774,11 +3587,16 @@ impl SocketTable {
         }
         let charged = tcb.ns_charged_recv_bytes;
         if live == charged {
+            if live == 0 {
+                self.per_ns_recv_bytes.lock().remove(&ns_id);
+            }
             return;
         }
         let mut counts = self.per_ns_recv_bytes.lock();
         if live > charged {
-            let e = counts.entry(ns_id).or_insert(0);
+            let e = counts
+                .get_mut(&ns_id)
+                .expect("R180-11 recv counter slot was not prepared before payload growth");
             *e = e.saturating_add(live - charged);
         } else if let Some(c) = counts.get_mut(&ns_id) {
             let now = c.saturating_sub(charged - live);
@@ -2817,21 +3635,26 @@ impl SocketTable {
     /// block, so `if let Some(s) = self.sockets.write().remove(..) { .. }` would
     /// hold the write lock across the body; routing the removal through this helper
     /// confines the guard to the call.
-    fn remove_socket(&self, socket_id: u64) -> Option<Arc<SocketState>> {
+    fn remove_socket(&self, socket_id: u64) -> Option<SocketArc> {
         self.sockets.write().remove(&socket_id)
     }
 
     /// J2-1/J2-2 self-test (Phase J.2 per-tenant TCP budgets). Exercises the
-    /// per-namespace connection + half-open counters directly on a fresh
-    /// `SocketTable`: cap enforcement (fail-closed), namespace isolation, root
-    /// exemption, remove-at-0 bookkeeping, and — critically — that the stale-Weak
+    /// per-namespace connection + half-open counters directly on the
+    /// boot-quiescent global `SocketTable`, using reserved high namespace IDs:
+    /// cap enforcement (fail-closed), namespace isolation, root exemption,
+    /// remove-at-0 bookkeeping, and — critically — that the stale-Weak
     /// reaper (`conns_retain_accounted`) UNCHARGES pruned entries (the leak fix a
     /// per-socket flag could not provide). Any failure panics; `make boot-check`
     /// surfaces it via the serial log. Wired into the boot integration suite.
     pub fn run_per_ns_budget_self_test() {
-        let table = SocketTable::new();
-        let ns_a = NamespaceId(1);
-        let ns_b = NamespaceId(2);
+        // RF180-52: never instantiate SocketTable on a kernel stack; its fixed
+        // deferred-uncharge array alone exceeds the AP stack. Deferred process
+        // work remains gated until boot self-tests finish, so isolated high IDs
+        // make the production singleton a safe, allocation-neutral fixture.
+        let table = socket_table();
+        let ns_a = NamespaceId(0x7100_0001);
+        let ns_b = NamespaceId(0x7100_0002);
         let root = NamespaceId(0);
 
         // --- J2-1 connection budget: cap (fail-closed), isolation, root exemption ---
@@ -2871,18 +3694,37 @@ impl SocketTable {
         // wedges at its cap forever (self-DoS). Build a tcp_conns map of dead Weaks
         // and confirm conns_retain_accounted prunes AND uncharges exactly them,
         // leaving an unrelated namespace's count untouched.
-        let ns_dead = NamespaceId(3);
-        let ns_other = NamespaceId(4);
+        let ns_dead = NamespaceId(0x7100_0003);
+        let ns_other = NamespaceId(0x7100_0004);
         const N_DEAD: u32 = 5;
         for _ in 0..N_DEAD {
             table.try_inc_ns_conn(ns_dead).unwrap();
         }
         table.try_inc_ns_conn(ns_other).unwrap(); // unrelated tenant, no map entry
-        let mut conns: BTreeMap<TcpLookupKey, Weak<SocketState>> = BTreeMap::new();
+        let mut conns: AdmittedMap<TcpLookupKey, SocketWeak> =
+            AdmittedMap::new(HeapClass::SocketObject);
+        let dead_owner = SocketState::try_new_arc(
+            0,
+            SocketDomain::Inet4,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
+            SocketLabel {
+                creator: ProcessCtx::new(0, 0, 0, 0, 0, 0),
+                secmark: 0,
+            },
+            ns_dead,
+        )
+        .expect("J2 self-test dead-Weak owner admission");
+        let dead = Arc::downgrade(&dead_owner);
+        drop(dead_owner);
         for i in 0..N_DEAD {
-            // Weak::new() never upgrades (strong_count() == 0) -> pruned.
-            conns.insert((ns_dead, i, 0u16, 0u32, 0u16), Weak::new());
+            // The sole strong owner is gone, while cloned weak handles keep the
+            // charged Arc control block valid until the reaper destroys them.
+            conns
+                .try_insert((ns_dead, i, 0u16, 0u32, 0u16), dead.clone())
+                .expect("J2 self-test admitted conn map insert");
         }
+        drop(dead);
         table.conns_retain_accounted(&mut conns);
         assert!(
             conns.is_empty(),
@@ -2936,9 +3778,9 @@ impl SocketTable {
         // --- J2-6 send-byte budget: hard cap, isolation, root exemption,
         //     reserve->refund reconcile, remove-at-0, and the load-bearing
         //     Drop/detach residual regressions ---
-        let ns_s = NamespaceId(10);
-        let ns_t = NamespaceId(11);
-        let ns_u = NamespaceId(12);
+        let ns_s = NamespaceId(0x7100_0010);
+        let ns_t = NamespaceId(0x7100_0011);
+        let ns_u = NamespaceId(0x7100_0012);
 
         // (1) HARD cap, fail-closed, atomic reservation (no partial-apply on reject).
         let mut tcb_a =
@@ -3051,14 +3893,15 @@ impl SocketTable {
                 creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
                 secmark: 0,
             };
-            let sock = Arc::new(SocketState::new(
+            let sock = SocketState::try_new_arc(
                 u64::MAX,
                 SocketDomain::Inet4,
                 SocketType::Stream,
                 SocketProtocol::Tcp,
                 label,
                 drop_ns,
-            ));
+            )
+            .expect("J2 self-test socket admission");
             let tcb = TcpControlBlock::new_client(
                 Ipv4Addr([10, 0, 0, 11]),
                 11,
@@ -3066,7 +3909,7 @@ impl SocketTable {
                 12,
                 0,
             );
-            sock.attach_tcp(tcb);
+            sock.attach_tcp(tcb).expect("J2 self-test TCP waiters");
             {
                 let mut g = sock.tcp.lock();
                 let ts = g.as_mut().expect("tcb attached");
@@ -3094,14 +3937,15 @@ impl SocketTable {
                 creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
                 secmark: 0,
             };
-            let sock = Arc::new(SocketState::new(
+            let sock = SocketState::try_new_arc(
                 u64::MAX - 1,
                 SocketDomain::Inet4,
                 SocketType::Stream,
                 SocketProtocol::Tcp,
                 label,
                 detach_ns,
-            ));
+            )
+            .expect("J2 self-test socket admission");
             let tcb = TcpControlBlock::new_client(
                 Ipv4Addr([10, 0, 0, 13]),
                 13,
@@ -3109,7 +3953,7 @@ impl SocketTable {
                 14,
                 0,
             );
-            sock.attach_tcp(tcb);
+            sock.attach_tcp(tcb).expect("J2 self-test TCP waiters");
             {
                 let mut g = sock.tcp.lock();
                 let ts = g.as_mut().expect("tcb attached");
@@ -3134,7 +3978,7 @@ impl SocketTable {
         //     sum, tear ONE down, assert the counter drops to exactly the other's
         //     mirror (not 0, not the sum). This is the only test that proves the
         //     cross-sibling accumulation the whole budget exists to enforce.
-        let ns_agg = NamespaceId(13);
+        let ns_agg = NamespaceId(0x7100_0013);
         let mut tcb_x = TcpControlBlock::new_client(
             Ipv4Addr([10, 0, 0, 15]),
             15,
@@ -3177,17 +4021,20 @@ impl SocketTable {
         // Drive the counter via a TCB's ooo_bytes (a plain field — no multi-MiB
         // allocation) + reconcile_ns_recv; the gate is decide-only so it is tested
         // separately. recv_buffer is exercised directly only in the FIN-clear case.
-        let ns_rs = NamespaceId(20);
-        let ns_rt = NamespaceId(21);
-        let ns_ru = NamespaceId(22);
-        let ns_ragg = NamespaceId(23);
-        let ns_rx = NamespaceId(24);
+        let ns_rs = NamespaceId(0x7100_0020);
+        let ns_rt = NamespaceId(0x7100_0021);
+        let ns_ru = NamespaceId(0x7100_0022);
+        let ns_ragg = NamespaceId(0x7100_0023);
+        let ns_rx = NamespaceId(0x7100_0024);
 
         // (1) Aggregate cap (decide-only gate): drive ns_rs to the cap, assert a
         //     sibling (charged==0) is rejected — proving it is an aggregate, not
         //     per-conn, cap.
         let mut rtcb_a =
             TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 1]), 1, Ipv4Addr([10, 1, 0, 2]), 2, 0);
+        table
+            .try_charge_ns_recv_gate(ns_rs, &rtcb_a, SocketTable::MAX_RECV_BYTES_PER_NS)
+            .expect("J2 recv test gate");
         rtcb_a.ooo_bytes = SocketTable::MAX_RECV_BYTES_PER_NS as u32;
         table.reconcile_ns_recv(ns_rs, &mut rtcb_a);
         assert_eq!(
@@ -3234,6 +4081,9 @@ impl SocketTable {
             10,
             0,
         );
+        table
+            .try_charge_ns_recv_gate(ns_ru, &rtcb_u, 8192)
+            .expect("J2 recv test gate");
         rtcb_u.ooo_bytes = 8192;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
         assert_eq!(
@@ -3267,8 +4117,15 @@ impl SocketTable {
             0,
         );
         for _ in 0..1000 {
-            rtcb_fin.recv_buffer.push_back(0u8);
+            rtcb_fin
+                .recv_buffer
+                .try_push(0u8)
+                .map_err(|_| ())
+                .expect("J2 recv self-test admitted byte");
         }
+        table
+            .try_charge_ns_recv_gate(ns_ru, &rtcb_fin, 5000)
+            .expect("J2 recv FIN test gate");
         rtcb_fin.ooo_bytes = 4000;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
         assert_eq!(
@@ -3301,7 +4158,13 @@ impl SocketTable {
             16,
             0,
         );
+        table
+            .try_charge_ns_recv_gate(ns_ragg, &rtcb_x, 3000)
+            .expect("J2 recv aggregate x gate");
         rtcb_x.ooo_bytes = 3000;
+        table
+            .try_charge_ns_recv_gate(ns_ragg, &rtcb_y, 5000)
+            .expect("J2 recv aggregate y gate");
         rtcb_y.ooo_bytes = 5000;
         table.reconcile_ns_recv(ns_ragg, &mut rtcb_x);
         table.reconcile_ns_recv(ns_ragg, &mut rtcb_y);
@@ -3331,6 +4194,9 @@ impl SocketTable {
             18,
             0,
         );
+        table
+            .try_charge_ns_recv_gate(ns_rx, &rtcb_near, SocketTable::MAX_RECV_BYTES_PER_NS - 1000)
+            .expect("J2 recv near-cap gate");
         rtcb_near.ooo_bytes = (SocketTable::MAX_RECV_BYTES_PER_NS - 1000) as u32;
         table.reconcile_ns_recv(ns_rx, &mut rtcb_near);
         let rtcb_probe = TcpControlBlock::new_client(
@@ -3381,14 +4247,15 @@ impl SocketTable {
                 creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
                 secmark: 0,
             };
-            let sock = Arc::new(SocketState::new(
+            let sock = SocketState::try_new_arc(
                 u64::MAX - 2,
                 SocketDomain::Inet4,
                 SocketType::Stream,
                 SocketProtocol::Tcp,
                 label,
                 rdrop_ns,
-            ));
+            )
+            .expect("J2 recv self-test socket admission");
             let mut tcb = TcpControlBlock::new_client(
                 Ipv4Addr([10, 1, 0, 23]),
                 23,
@@ -3396,8 +4263,11 @@ impl SocketTable {
                 24,
                 0,
             );
+            gtable
+                .try_charge_ns_recv_gate(rdrop_ns, &tcb, 256 * 1024)
+                .expect("J2 recv drop gate");
             tcb.ooo_bytes = 256 * 1024;
-            sock.attach_tcp(tcb);
+            sock.attach_tcp(tcb).expect("J2 recv self-test TCP waiters");
             {
                 let mut g = sock.tcp.lock();
                 let ts = g.as_mut().expect("tcb attached");
@@ -3420,14 +4290,15 @@ impl SocketTable {
                 creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
                 secmark: 0,
             };
-            let sock = Arc::new(SocketState::new(
+            let sock = SocketState::try_new_arc(
                 u64::MAX - 3,
                 SocketDomain::Inet4,
                 SocketType::Stream,
                 SocketProtocol::Tcp,
                 label,
                 rdetach_ns,
-            ));
+            )
+            .expect("J2 recv self-test socket admission");
             let mut tcb = TcpControlBlock::new_client(
                 Ipv4Addr([10, 1, 0, 25]),
                 25,
@@ -3435,8 +4306,11 @@ impl SocketTable {
                 26,
                 0,
             );
+            gtable
+                .try_charge_ns_recv_gate(rdetach_ns, &tcb, 128 * 1024)
+                .expect("J2 recv detach gate");
             tcb.ooo_bytes = 128 * 1024;
-            sock.attach_tcp(tcb);
+            sock.attach_tcp(tcb).expect("J2 recv self-test TCP waiters");
             {
                 let mut g = sock.tcp.lock();
                 let ts = g.as_mut().expect("tcb attached");
@@ -3452,36 +4326,54 @@ impl SocketTable {
             !gtable.per_ns_recv_bytes.lock().contains_key(&rdetach_ns),
             "J2-recv: a post-detach Drop must not double-subtract"
         );
+
+        // RF180-52: the old stack-local table discarded these deliberate
+        // over-cap fixtures on return. The global fixture must release the two
+        // retained send counters and the retained recv-cap counter explicitly.
+        table.uncharge_ns_send_residual(ns_s, tcb_a.ns_charged_send_bytes);
+        table.uncharge_ns_send_residual(ns_t, tcb_c.ns_charged_send_bytes);
+        table.uncharge_ns_recv_residual(ns_rs, rtcb_a.ns_charged_recv_bytes);
+        for test_ns in [ns_s, ns_t] {
+            assert!(!table.per_ns_send_bytes.lock().contains_key(&test_ns));
+        }
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_rs));
+        release_empty_boot_test_backing(&table.per_ns_conn_counts);
+        release_empty_boot_test_backing(&table.per_ns_syn_counts);
+        release_empty_boot_test_backing(&table.per_ns_send_bytes);
+        release_empty_boot_test_backing(&table.per_ns_recv_bytes);
     }
 
     /// J2-8: in-kernel self-test for the per-cgroup ephemeral-port budget
     /// MECHANISM — the membership/leak-class logic the budget's correctness rests
     /// on (the cgroup arithmetic itself is tested in `cgroup::run_ports_budget_self_test`).
     ///
-    /// Runs against a LOCAL `SocketTable`, manipulating `PortBinding` values
-    /// directly and asserting the `port_uncharge_pending` bookkeeping. The boot
+    /// Runs against the boot-quiescent global `SocketTable`, manipulating
+    /// isolated high-ID `PortBinding` values directly and asserting the
+    /// `port_uncharge_pending` bookkeeping. The boot
     /// process is in the root cgroup (id 0, exempt) so a behavioural charge would
     /// be a no-op; instead this proves the dangerous classes — uncharge-once via
     /// the ptr-eq remove choke-point, refund-the-displaced-charge, dead-Weak
     /// reaping (incl. the port-availability prune), the netns-teardown backstop,
     /// and fold-by-cgid drain idempotency.
     pub fn run_per_cgroup_port_budget_self_test() {
-        let mk = |id: u64, ns: NamespaceId| -> Arc<SocketState> {
+        let mk = |id: u64, ns: NamespaceId| -> SocketArc {
             let label = SocketLabel {
                 creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
                 secmark: 0,
             };
-            Arc::new(SocketState::new(
+            SocketState::try_new_arc(
                 id,
                 SocketDomain::Inet4,
                 SocketType::Dgram,
                 SocketProtocol::Udp,
                 label,
                 ns,
-            ))
+            )
+            .expect("J2 port self-test socket admission")
         };
-        let table = SocketTable::new();
-        let ns = NamespaceId(9);
+        // RF180-52: avoid a >64 KiB SocketTable temporary on the BSP stack.
+        let table = socket_table();
+        let ns = NamespaceId(0x7200_0001);
 
         // (1) Fresh insert is FreshGrowth (nothing displaced to refund).
         let s1 = mk(101, ns);
@@ -3644,7 +4536,7 @@ impl SocketTable {
 
         // (7) Netns-teardown backstop: remove ALL (ns,*) bindings (alive or dead),
         //     enqueue the charged ones, and leave other namespaces untouched.
-        let other_ns = NamespaceId(10);
+        let other_ns = NamespaceId(0x7200_0002);
         let s_a = mk(300, ns);
         let s_b = mk(301, ns);
         let s_c = mk(302, other_ns);
@@ -4017,7 +4909,7 @@ impl SocketTable {
         //      gated); a subsequent connect-style repair stamps charge-0
         //      Ephemeral — net effect exactly one uncharge, no double-refund,
         //      no new undercount.
-        let drain_ns2 = NamespaceId(11);
+        let drain_ns2 = NamespaceId(0x7200_0003);
         let s_drain = mk(606, drain_ns2);
         {
             let mut b = table.tcp_bindings.lock();
@@ -4054,6 +4946,24 @@ impl SocketTable {
         }
         table.drain_deferred_port_uncharges();
 
+        // The old stack-local fixture discarded surviving live bindings on
+        // return. Remove the exact high-ID test namespaces before process
+        // deferred work is published so the production singleton starts clean.
+        for test_ns in [ns, other_ns, drain_ns2] {
+            table.drain_ns_port_bindings(test_ns);
+        }
+        table.drain_deferred_port_uncharges();
+        {
+            let udp = table.udp_bindings.lock();
+            let tcp = table.tcp_bindings.lock();
+            for test_ns in [ns, other_ns, drain_ns2] {
+                assert!(!udp.keys().any(|(entry_ns, _)| *entry_ns == test_ns));
+                assert!(!tcp.keys().any(|(entry_ns, _)| *entry_ns == test_ns));
+            }
+        }
+        release_empty_boot_test_backing(&table.udp_bindings);
+        release_empty_boot_test_backing(&table.tcp_bindings);
+
         // Keep every live socket alive through all assertions above.
         let _ = (
             &s1, &s_other, &live, &s_a, &s_b, &s_c, &live_keep, &listener, &child, &s_x, &s_udp,
@@ -4084,50 +4994,14 @@ impl SocketTable {
         &self,
         label: SocketLabel,
         net_ns_id: NamespaceId,
-    ) -> Result<Arc<SocketState>, SocketError> {
-        // R76-3 FIX: Check and increment namespace quota before creating socket
-        self.try_inc_ns_count(net_ns_id)?;
-
-        // Build LSM context
-        let mut ctx = NetCtx::new(0, UDP_PROTO as u16);
-        ctx.cap = Some(CapId::INVALID);
-
-        // Check LSM policy
-        if let Err(_e) = hook_net_socket(&label.creator, &ctx) {
-            self.dec_ns_count(net_ns_id); // Rollback quota
-            return Err(SocketError::PermissionDenied);
-        }
-
-        // R107-5 FIX: Allocate socket ID with overflow protection.
-        // Uses fetch_update + checked_add to prevent u64 wrap-around and ID collision,
-        // matching the R105-5 pattern applied to IPC endpoint IDs.
-        let id = match self.next_socket_id.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| current.checked_add(1),
-        ) {
-            Ok(prev) => prev,
-            Err(_) => {
-                self.dec_ns_count(net_ns_id); // Rollback quota
-                return Err(SocketError::IdExhausted);
-            }
-        };
-
-        // Create socket state with namespace binding
-        let sock = Arc::new(SocketState::new(
-            id,
-            SocketDomain::Inet4,
-            SocketType::Dgram,
-            SocketProtocol::Udp,
+    ) -> Result<SocketArc, SocketError> {
+        self.create_socket_prepared(
             label,
             net_ns_id,
-        ));
-
-        // Register in table
-        self.sockets.write().insert(id, sock.clone());
-        self.created.fetch_add(1, Ordering::Relaxed);
-
-        Ok(sock)
+            SocketType::Dgram,
+            SocketProtocol::Udp,
+            UDP_PROTO as u16,
+        )
     }
 
     /// Create a TCP socket.
@@ -4153,49 +5027,341 @@ impl SocketTable {
         &self,
         label: SocketLabel,
         net_ns_id: NamespaceId,
-    ) -> Result<Arc<SocketState>, SocketError> {
-        // R76-3 FIX: Check and increment namespace quota before creating socket
-        self.try_inc_ns_count(net_ns_id)?;
+    ) -> Result<SocketArc, SocketError> {
+        self.create_socket_prepared(
+            label,
+            net_ns_id,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
+            TCP_PROTO as u16,
+        )
+    }
 
-        // Build LSM context
-        let mut ctx = NetCtx::new(0, TCP_PROTO as u16);
-        ctx.cap = Some(CapId::INVALID);
+    /// Fallibly duplicate a transient wire segment. Cached SYN-ACK storage is
+    /// aggregate-admitted separately; response copies never use infallible
+    /// `Vec::clone` under RX pressure.
+    fn try_clone_wire_segment(bytes: &[u8]) -> Option<WirePacket> {
+        WirePacket::try_copy_from_slice(bytes).ok()
+    }
 
-        // Check LSM policy
-        if let Err(_e) = hook_net_socket(&label.creator, &ctx) {
-            self.dec_ns_count(net_ns_id); // Rollback quota
-            return Err(SocketError::PermissionDenied);
+    #[inline]
+    fn passive_syn_ack_build_faulted(&self) -> bool {
+        #[cfg(test)]
+        {
+            return self
+                .fail_next_passive_syn_ack_build
+                .swap(false, Ordering::AcqRel);
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    #[inline]
+    fn simultaneous_syn_ack_build_faulted(&self) -> bool {
+        #[cfg(test)]
+        {
+            return self
+                .fail_next_simultaneous_syn_ack_build
+                .swap(false, Ordering::AcqRel);
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Restore an ID consumed by a passive-open transaction that never became
+    /// visible. Every production ID allocator holds `sockets.write()`, so the
+    /// compare-exchange is exact while the caller retains that guard. The CAS is
+    /// still used as defense in depth against future allocators that fail to
+    /// preserve the serialization contract.
+    fn rollback_unpublished_socket_id(&self, id: u64) {
+        let Some(next) = id.checked_add(1) else {
+            return;
+        };
+        let restored =
+            self.next_socket_id
+                .compare_exchange(next, id, Ordering::Relaxed, Ordering::Relaxed);
+        debug_assert!(
+            restored.is_ok(),
+            "R180-11 unpublished socket ID was not the allocation frontier"
+        );
+    }
+
+    /// Atomically publish a fully prepared stateful passive-open child.
+    ///
+    /// The caller holds `listener.listen`. This routine then takes the registry
+    /// locks in the established order `listen > sockets > tcp_conns` and keeps
+    /// all three through publication. Thus no lookup can observe a child until
+    /// its TCB, cached SYN-ACK, SYN membership, namespace accounting, socket ID,
+    /// socket-table entry, and 4-tuple entry are all committed. Every allocation
+    /// and every reversible quota reservation precedes ID consumption.
+    fn try_publish_pending_syn_child(
+        &self,
+        listen_state: &mut TcpListenState,
+        key: TcpLookupKey,
+        mut child: SocketArc,
+        syn_ack: WirePacket,
+        syn_sent_at: u64,
+    ) -> bool {
+        if listen_state.syn_queue.len() >= listen_state.syn_backlog
+            || listen_state.syn_queue.contains_key(&key)
+            || listen_state.syn_queue.ensure_capacity_for(1).is_err()
+        {
+            return false;
         }
 
-        // R107-5 FIX: Allocate socket ID with overflow protection.
-        // Uses fetch_update + checked_add to prevent u64 wrap-around and ID collision,
-        // matching the R105-5 pattern applied to IPC endpoint IDs.
+        let mut sockets = self.sockets.write();
+        if sockets.ensure_capacity_for(1).is_err() {
+            return false;
+        }
+
+        let mut conns = self.tcp_conns.lock();
+        self.conns_retain_accounted(&mut conns);
+        if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS
+            || conns.get(&key).and_then(|weak| weak.upgrade()).is_some()
+            || conns.ensure_capacity_for(1).is_err()
+        {
+            return false;
+        }
+
+        if self.try_inc_ns_count(key.0).is_err() {
+            return false;
+        }
+        if self.try_inc_ns_conn(key.0).is_err() {
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if !listen_state.try_reserve_syn_slot(&key, self) {
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+
         let id = match self.next_socket_id.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| current.checked_add(1),
         ) {
-            Ok(prev) => prev,
+            Ok(id) => id,
             Err(_) => {
-                self.dec_ns_count(net_ns_id); // Rollback quota
+                listen_state.cancel_syn_slot(key.0, self);
+                self.dec_ns_conn(key.0);
+                self.dec_ns_count(key.0);
+                return false;
+            }
+        };
+        let Some(unique_child) = Arc::get_mut(&mut child) else {
+            self.rollback_unpublished_socket_id(id);
+            listen_state.cancel_syn_slot(key.0, self);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        };
+        unique_child.id = id;
+
+        let pending = PendingSyn {
+            key,
+            sock: child.clone(),
+            syn_ack,
+            syn_sent_at,
+        };
+        if !listen_state.publish_syn_reserved(pending, self) {
+            self.rollback_unpublished_socket_id(id);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if sockets.insert_unique_reserved(id, child.clone()).is_err() {
+            listen_state.take_syn(&key, self);
+            self.rollback_unpublished_socket_id(id);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if conns
+            .insert_unique_reserved(key, Arc::downgrade(&child))
+            .is_err()
+        {
+            sockets.remove(&id);
+            listen_state.take_syn(&key, self);
+            self.rollback_unpublished_socket_id(id);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+
+        true
+    }
+
+    /// Atomically publish a fully prepared SYN-cookie child into the socket,
+    /// connection, and accept registries. The listener guard prevents accept()
+    /// from observing the child until every other registry has committed; the
+    /// socket and connection guards provide the same guarantee to ID/4-tuple
+    /// lookups.
+    fn try_publish_cookie_child(
+        &self,
+        listener: &SocketArc,
+        key: TcpLookupKey,
+        mut child: SocketArc,
+    ) -> bool {
+        let mut listen_guard = listener.listen.lock();
+        let Some(listen_state) = listen_guard.as_mut() else {
+            return false;
+        };
+        if listen_state.accept_queue.len() >= listen_state.accept_backlog
+            || listen_state.accept_queue.ensure_capacity_for(1).is_err()
+        {
+            return false;
+        }
+
+        let mut sockets = self.sockets.write();
+        if sockets.ensure_capacity_for(1).is_err() {
+            return false;
+        }
+
+        let mut conns = self.tcp_conns.lock();
+        self.conns_retain_accounted(&mut conns);
+        if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS
+            || conns.get(&key).and_then(|weak| weak.upgrade()).is_some()
+            || conns.ensure_capacity_for(1).is_err()
+        {
+            return false;
+        }
+
+        if self.try_inc_ns_count(key.0).is_err() {
+            return false;
+        }
+        if self.try_inc_ns_conn(key.0).is_err() {
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if !listen_state.try_reserve_accept_slot() {
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+
+        let id = match self.next_socket_id.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                listen_state.cancel_accept_slot();
+                self.dec_ns_conn(key.0);
+                self.dec_ns_count(key.0);
+                return false;
+            }
+        };
+        let Some(unique_child) = Arc::get_mut(&mut child) else {
+            self.rollback_unpublished_socket_id(id);
+            listen_state.cancel_accept_slot();
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        };
+        unique_child.id = id;
+
+        if sockets.insert_unique_reserved(id, child.clone()).is_err() {
+            self.rollback_unpublished_socket_id(id);
+            listen_state.cancel_accept_slot();
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if !listen_state.publish_accept_reserved(child.clone()) {
+            sockets.remove(&id);
+            self.rollback_unpublished_socket_id(id);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+        if conns
+            .insert_unique_reserved(key, Arc::downgrade(&child))
+            .is_err()
+        {
+            let queued = listen_state.accept_queue.pop();
+            if !queued
+                .as_ref()
+                .map_or(false, |queued| Arc::ptr_eq(queued, &child))
+            {
+                if let Some(queued) = queued {
+                    let _ = listen_state.accept_queue.push_reserved(queued);
+                }
+                panic!("R180-11 cookie child was not the accept-queue tail");
+            }
+            child.counted_in_active.store(false, Ordering::Release);
+            dec_active_conn();
+            sockets.remove(&id);
+            self.rollback_unpublished_socket_id(id);
+            self.dec_ns_conn(key.0);
+            self.dec_ns_count(key.0);
+            return false;
+        }
+
+        listen_state.accept_waiters.wake_one();
+        true
+    }
+
+    /// R180-11 FIX: one transactional funnel for every active socket birth.
+    /// Registry backing, namespace policy, Arc bytes, and the ID are prepared
+    /// in that order; the ID is consumed only after every fallible allocation
+    /// succeeds, and publication itself is allocation-free.
+    fn create_socket_prepared(
+        &self,
+        label: SocketLabel,
+        net_ns_id: NamespaceId,
+        ty: SocketType,
+        proto: SocketProtocol,
+        protocol_number: u16,
+    ) -> Result<SocketArc, SocketError> {
+        let mut ctx = NetCtx::new(0, protocol_number);
+        ctx.cap = Some(CapId::INVALID);
+        hook_net_socket(&label.creator, &ctx).map_err(|_| SocketError::PermissionDenied)?;
+
+        let mut sockets = self.sockets.write();
+        sockets
+            .ensure_capacity_for(1)
+            .map_err(|_| SocketError::NoMemory)?;
+        self.try_inc_ns_count(net_ns_id)?;
+
+        let mut sock =
+            match SocketState::try_new_arc(0, SocketDomain::Inet4, ty, proto, label, net_ns_id) {
+                Ok(sock) => sock,
+                Err(error) => {
+                    drop(sockets);
+                    self.dec_ns_count(net_ns_id);
+                    return Err(error);
+                }
+            };
+
+        let id = match self.next_socket_id.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                drop(sockets);
+                self.dec_ns_count(net_ns_id);
                 return Err(SocketError::IdExhausted);
             }
         };
-
-        // Create socket state with namespace binding
-        let sock = Arc::new(SocketState::new(
-            id,
-            SocketDomain::Inet4,
-            SocketType::Stream,
-            SocketProtocol::Tcp,
-            label,
-            net_ns_id,
-        ));
-
-        // Register in table
-        self.sockets.write().insert(id, sock.clone());
+        Arc::get_mut(&mut sock)
+            .expect("new socket Arc unexpectedly aliased before publication")
+            .id = id;
+        if sockets.insert_unique_reserved(id, sock.clone()).is_err() {
+            self.rollback_unpublished_socket_id(id);
+            drop(sockets);
+            self.dec_ns_count(net_ns_id);
+            return Err(SocketError::IdExhausted);
+        }
+        drop(sockets);
         self.created.fetch_add(1, Ordering::Relaxed);
-
         Ok(sock)
     }
 
@@ -4247,7 +5413,25 @@ impl SocketTable {
     /// refunding on cap-drop.
     pub fn bind_udp(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        ip: Ipv4Addr,
+        port: Option<u16>,
+        can_bind_privileged: bool,
+        policy: BindCharge,
+    ) -> Result<u16, SocketError> {
+        // R180-21 FIX: one shared socket handle admits one bind/connect state
+        // transaction at a time.  The private helper prevents listen/send
+        // auto-bind from recursively acquiring this non-reentrant lock.
+        let _operation = self.lock_socket_operation(sock);
+        self.bind_udp_locked(sock, current, cap_id, ip, port, can_bind_privileged, policy)
+    }
+
+    /// Bind implementation for callers already holding `sock.operation`.
+    fn bind_udp_locked(
+        &self,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         ip: Ipv4Addr,
@@ -4258,6 +5442,9 @@ impl SocketTable {
         // Validate socket type
         if sock.ty != SocketType::Dgram || sock.proto != SocketProtocol::Udp {
             return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
         }
 
         // Check if already bound
@@ -4293,6 +5480,17 @@ impl SocketTable {
 
         // Check LSM policy using CURRENT process context
         hook_net_bind(current, &ctx)?;
+
+        // R180-11 FIX: pre-grow retained registry backing before the cgroup
+        // charge. A later race is still handled fallibly with full rollback.
+        {
+            let mut bindings = self.udp_bindings.lock();
+            if !bindings.contains_key(&(sock.net_ns_id, chosen_port)) {
+                bindings
+                    .ensure_capacity_for(1)
+                    .map_err(|_| SocketError::NoMemory)?;
+            }
+        }
 
         // J2-8 / R169-6 slice 2: resolve + charge the per-cgroup port budget
         // AFTER LSM admits and BEFORE taking the binding lock (lock-ordering:
@@ -4341,6 +5539,7 @@ impl SocketTable {
         // forbidden by the lock-ordering invariant).
         let mut port_in_use = false;
         let mut evicted: Option<u64> = None;
+        let mut publication_error = None;
         {
             let mut bindings = self.udp_bindings.lock();
             if bindings
@@ -4348,14 +5547,18 @@ impl SocketTable {
                 .map_or(false, |pb| pb.sock.upgrade().is_some())
             {
                 port_in_use = true;
-            } else if let InsertOutcome::DisplacedCharge(old) = Self::insert_binding_charged(
-                &mut bindings,
-                binding_key,
-                sock,
-                charged_cgroup,
-                policy.kind(),
-            ) {
-                evicted = Some(old);
+            } else {
+                match Self::try_insert_binding_charged(
+                    &mut bindings,
+                    binding_key,
+                    sock,
+                    charged_cgroup,
+                    policy.kind(),
+                ) {
+                    Ok(InsertOutcome::DisplacedCharge(old)) => evicted = Some(old),
+                    Ok(InsertOutcome::FreshGrowth) => {}
+                    Err(error) => publication_error = Some(error),
+                }
             }
         }
         // J2-8: enqueue any evicted stale charge (deferred; drained in process
@@ -4369,6 +5572,13 @@ impl SocketTable {
             uncharge_port_cgroup(charged_cgroup, 1);
             return Err(SocketError::PortInUse);
         }
+        if let Some(error) = publication_error {
+            uncharge_port_cgroup(charged_cgroup, 1);
+            return Err(error);
+        }
+
+        #[cfg(test)]
+        self.pause_operation_commit_for_test(TEST_PAUSE_BIND_COMMIT);
 
         // Update socket state
         sock.bind_local(ip, chosen_port);
@@ -4413,7 +5623,24 @@ impl SocketTable {
     /// displacing it.
     pub fn bind_tcp(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        ip: Ipv4Addr,
+        port: Option<u16>,
+        can_bind_privileged: bool,
+        policy: BindCharge,
+    ) -> Result<u16, SocketError> {
+        // R180-21 FIX: serialize the full bind transaction, including quota
+        // charge, binding-map publication, metadata commit, and every rollback.
+        let _operation = self.lock_socket_operation(sock);
+        self.bind_tcp_locked(sock, current, cap_id, ip, port, can_bind_privileged, policy)
+    }
+
+    /// Bind implementation for callers already holding `sock.operation`.
+    fn bind_tcp_locked(
+        &self,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         ip: Ipv4Addr,
@@ -4424,6 +5651,9 @@ impl SocketTable {
         // Validate socket type
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
             return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
         }
 
         // Check if already bound
@@ -4458,6 +5688,16 @@ impl SocketTable {
         // Check LSM policy
         hook_net_bind(current, &ctx)?;
 
+        // R180-11 FIX: prepare map capacity before the reversible quota charge.
+        {
+            let mut bindings = self.tcp_bindings.lock();
+            if !bindings.contains_key(&(sock.net_ns_id, chosen_port)) {
+                bindings
+                    .ensure_capacity_for(1)
+                    .map_err(|_| SocketError::NoMemory)?;
+            }
+        }
+
         // J2-8 / R169-6 slice 2: charge AFTER LSM, BEFORE the binding lock
         // (see bind_udp for the full ordering + UDP-EXPLICIT INVARIANT notes;
         // here the TCP while-alive arms enforce hold-until-close via
@@ -4485,6 +5725,7 @@ impl SocketTable {
         // Register port binding (never return from inside the L8 section).
         let mut port_in_use = false;
         let mut evicted: Option<u64> = None;
+        let mut publication_error = None;
         {
             let mut bindings = self.tcp_bindings.lock();
             if bindings
@@ -4492,14 +5733,18 @@ impl SocketTable {
                 .map_or(false, |pb| pb.sock.upgrade().is_some())
             {
                 port_in_use = true;
-            } else if let InsertOutcome::DisplacedCharge(old) = Self::insert_binding_charged(
-                &mut bindings,
-                binding_key,
-                sock,
-                charged_cgroup,
-                policy.kind(),
-            ) {
-                evicted = Some(old);
+            } else {
+                match Self::try_insert_binding_charged(
+                    &mut bindings,
+                    binding_key,
+                    sock,
+                    charged_cgroup,
+                    policy.kind(),
+                ) {
+                    Ok(InsertOutcome::DisplacedCharge(old)) => evicted = Some(old),
+                    Ok(InsertOutcome::FreshGrowth) => {}
+                    Err(error) => publication_error = Some(error),
+                }
             }
         }
         if let Some(old) = evicted {
@@ -4510,12 +5755,50 @@ impl SocketTable {
             uncharge_port_cgroup(charged_cgroup, 1);
             return Err(SocketError::PortInUse);
         }
+        if let Some(error) = publication_error {
+            uncharge_port_cgroup(charged_cgroup, 1);
+            return Err(error);
+        }
+
+        #[cfg(test)]
+        self.pause_operation_commit_for_test(TEST_PAUSE_BIND_COMMIT);
 
         // Update socket state
         sock.bind_local(ip, chosen_port);
         self.bind_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(chosen_port)
+    }
+
+    /// Roll back the ephemeral binding created by this `listen()` attempt.
+    ///
+    /// The caller holds `sock.operation`, so no sibling bind/connect/listen can
+    /// replace the socket's metadata while this runs. The binding lock still
+    /// performs a pointer-identity check as defense in depth: a recycled or
+    /// foreign `(namespace, port)` owner is never removed or uncharged.
+    fn rollback_listen_auto_bind_locked(&self, sock: &SocketArc, port: u16) {
+        let key = (sock.net_ns_id, port);
+        let sock_ptr = Arc::as_ptr(sock);
+        let (owned, charged_cgroup) = {
+            let mut bindings = self.tcp_bindings.lock();
+            let owned = Self::peek_binding_kind(&bindings, key, sock_ptr).is_some();
+            let charged_cgroup = if owned {
+                Self::remove_binding_charged(&mut bindings, key, Some(sock_ptr))
+            } else {
+                None
+            };
+            (owned, charged_cgroup)
+        };
+        if let Some(cgid) = charged_cgroup {
+            uncharge_port_cgroup(cgid, 1);
+        }
+        if owned {
+            let mut meta = sock.meta.lock();
+            if meta.local_port == Some(port) {
+                meta.local_ip = None;
+                meta.local_port = None;
+            }
+        }
     }
 
     /// Transition a TCP socket into LISTEN state (R51-1).
@@ -4534,15 +5817,23 @@ impl SocketTable {
     /// - Auto-binds to ephemeral port if not already bound
     pub fn listen(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         backlog: u32,
         can_bind_privileged: bool,
     ) -> Result<(), SocketError> {
+        // R180-21 FIX: listen's implicit bind and listen-state publication are
+        // one socket operation.  Use the locked bind helper to avoid recursive
+        // acquisition while keeping bind-vs-connect/listen atomic.
+        let _operation = self.lock_socket_operation(sock);
+
         // Validate socket type
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
             return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
         }
 
         // Cannot listen on connected socket
@@ -4557,8 +5848,15 @@ impl SocketTable {
 
         let backlog = backlog.max(1) as usize;
 
-        // Auto-bind if not bound
-        if sock.local_port().is_none() {
+        // R180-11 FIX: prepare every standalone waiter Arc before auto-bind or
+        // any other externally visible listen side effect.
+        let tcp_waiters = PreparedTcpWaiters::try_new()?;
+        let listen_state = TcpListenState::try_new(backlog)?;
+
+        // Auto-bind if not bound. `auto_bound_port` is a transaction-local
+        // ownership proof used only to undo this attempt if a later listen
+        // policy/precondition check fails.
+        let auto_bound_port = if sock.local_port().is_none() {
             let local_ip = sock
                 .local_ip()
                 .map(Ipv4Addr)
@@ -4580,7 +5878,7 @@ impl SocketTable {
             // BindCharge::Explicit with hold-until-close teardown; a listener on
             // an EXPLICITLY-bound socket skips this auto-bind entirely — its
             // binding was already charged once at sys_bind.)
-            let _ = self.bind_tcp(
+            let port = self.bind_tcp_locked(
                 sock,
                 current,
                 cap_id,
@@ -4589,12 +5887,20 @@ impl SocketTable {
                 can_bind_privileged,
                 BindCharge::Ephemeral,
             )?;
-        }
+            Some(port)
+        } else {
+            None
+        };
 
         // LSM listen hook
         let mut ctx = self.ctx_from_socket(sock);
         ctx.cap = Some(cap_id);
-        hook_net_listen(current, &ctx, backlog as u32)?;
+        if let Err(error) = hook_net_listen(current, &ctx, backlog as u32) {
+            if let Some(port) = auto_bound_port {
+                self.rollback_listen_auto_bind_locked(sock, port);
+            }
+            return Err(error.into());
+        }
 
         // Install listen TCB + queues
         let meta = sock.meta_snapshot();
@@ -4602,10 +5908,24 @@ impl SocketTable {
             .local_ip
             .map(Ipv4Addr)
             .unwrap_or(Ipv4Addr([0, 0, 0, 0]));
-        let lport = meta.local_port.ok_or(SocketError::InvalidState)?;
+        let lport = match meta.local_port {
+            Some(port) => port,
+            None => {
+                if let Some(port) = auto_bound_port {
+                    self.rollback_listen_auto_bind_locked(sock, port);
+                }
+                return Err(SocketError::InvalidState);
+            }
+        };
 
-        sock.attach_tcp(TcpControlBlock::new_listen(lip, lport));
-        sock.install_listen_state(TcpListenState::new(backlog));
+        #[cfg(test)]
+        self.pause_operation_commit_for_test(TEST_PAUSE_LISTEN_COMMIT);
+
+        *sock.tcp.lock() = Some(TcpSocketState::from_prepared(
+            TcpControlBlock::new_listen(lip, lport),
+            tcp_waiters,
+        ));
+        sock.install_listen_state(listen_state);
 
         Ok(())
     }
@@ -4615,11 +5935,7 @@ impl SocketTable {
     /// # R75-1 FIX: Network Namespace Isolation
     ///
     /// Listener lookup is scoped to the specified network namespace.
-    fn lookup_tcp_listener(
-        &self,
-        net_ns_id: NamespaceId,
-        local_port: u16,
-    ) -> Option<Arc<SocketState>> {
+    fn lookup_tcp_listener(&self, net_ns_id: NamespaceId, local_port: u16) -> Option<SocketArc> {
         // R75-1 FIX: Use namespace-scoped binding key
         let binding_key = (net_ns_id, local_port);
         let mut bindings = self.tcp_bindings.lock();
@@ -4643,8 +5959,8 @@ impl SocketTable {
     /// Poll the accept queue of a listening socket (non-blocking) (R51-1).
     pub fn poll_accept_ready(
         &self,
-        listener: &Arc<SocketState>,
-    ) -> Result<Option<Arc<SocketState>>, SocketError> {
+        listener: &SocketArc,
+    ) -> Result<Option<SocketArc>, SocketError> {
         if !listener.is_listening() {
             return Err(SocketError::InvalidState);
         }
@@ -4674,14 +5990,20 @@ impl SocketTable {
     /// Complete UDP datagram ready for IPv4 encapsulation.
     pub fn send_to_udp(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         dst_port: u16,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SocketError> {
+    ) -> Result<WirePacket, SocketError> {
+        // R180-21 FIX: serialize the check-or-auto-bind portion.  A second
+        // sender that observed `None` before another core committed the bind
+        // now waits and then reuses the committed port instead of spuriously
+        // failing with PortInUse or publishing a second binding.
+        let operation = self.lock_socket_operation(sock);
+
         // Validate socket type
         if sock.ty != SocketType::Dgram || sock.proto != SocketProtocol::Udp {
             return Err(SocketError::InvalidType);
@@ -4700,7 +6022,7 @@ impl SocketTable {
                 // (ephemeral range is 49152-65535, well above privileged port limit)
                 // J2-8: ACTIVE-OPEN ephemeral auto-bind -> charge the per-cgroup
                 // ports.max budget (BindCharge::Ephemeral).
-                self.bind_udp(
+                self.bind_udp_locked(
                     sock,
                     current,
                     cap_id,
@@ -4711,6 +6033,10 @@ impl SocketTable {
                 )?
             }
         };
+        drop(operation);
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
 
         // Build LSM context with actual CapId
         let mut ctx = self.ctx_from_socket(sock);
@@ -4726,35 +6052,20 @@ impl SocketTable {
         // Build UDP datagram
         let datagram = build_udp_datagram(src_ip, dst_ip, local_port, dst_port, payload)?;
 
-        // R158-2 FIX: Seed conntrack so reply packets are classified as ESTABLISHED.
-        // Use the IP that will appear in the outgoing IP header (network_config().our_ip)
-        // rather than the socket-layer src_ip, which may be 0.0.0.0 for unbound sockets.
-        #[cfg(feature = "conntrack")]
-        {
-            use crate::conntrack::ct_process_udp;
-            let ct_src = if src_ip == crate::Ipv4Addr([0, 0, 0, 0]) {
-                crate::stack::network_config().our_ip
-            } else {
-                src_ip
-            };
-            let now_ms = self.time_wait_now();
-            let _ = ct_process_udp(
-                sock.net_ns_id.0,
-                ct_src,
-                dst_ip,
-                local_port,
-                dst_port,
-                payload.len(),
-                now_ms,
-            );
-        }
-
-        // Update statistics
-        sock.tx_bytes
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
-        sock.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+        // RF180-41 REVIEW FIX: conntrack is owned by the generic egress
+        // transaction. Seeding here would publish an unqueued datagram and
+        // double-account the successful path.
 
         Ok(datagram)
+    }
+
+    /// Commit UDP transmit statistics only after the device accepted the exact
+    /// datagram. Construction, firewall rejection, and QueueFull leave counters
+    /// unchanged.
+    pub fn commit_udp_send(&self, sock: &SocketArc, payload_len: usize) {
+        sock.tx_bytes
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+        sock.tx_datagrams.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Initiate a TCP connect (client-side SYN).
@@ -4790,7 +6101,7 @@ impl SocketTable {
     /// RX path integration in Phase 2.
     pub fn connect(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         src_ip: Ipv4Addr,
@@ -4798,6 +6109,13 @@ impl SocketTable {
         dst_port: u16,
         timeout_ns: Option<u64>,
     ) -> Result<TcpConnectResult, SocketError> {
+        // R180-21 FIX: the active-open transaction is serialized per socket
+        // from validation through quota charge, both registry publications,
+        // metadata/TCB commit, and segment construction.  This prevents two
+        // shared-handle connect callers from publishing different 4-tuples and
+        // then overwriting one another's metadata/TCB.
+        let operation = self.lock_socket_operation(sock);
+
         // Validate socket type
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
             return Err(SocketError::InvalidType);
@@ -4851,6 +6169,57 @@ impl SocketTable {
         ctx.remote_port = dst_port;
         ctx.cap = Some(cap_id);
         hook_net_connect(current, &ctx)?;
+
+        // R180-11 FIX: prepare all active-open allocations before quota or map
+        // publication: waiter Arcs, SYN bytes, and registry backing.
+        let prepared_waiters = PreparedTcpWaiters::try_new()?;
+        let iss = generate_isn(local_ip, local_port, dst_ip, dst_port);
+        let mut prepared_tcb =
+            TcpControlBlock::new_client(local_ip, local_port, dst_ip, dst_port, iss);
+        let egress_token = next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN)?;
+        prepared_tcb.state = TcpState::Closed;
+        prepared_tcb.active_open_pending = true;
+        prepared_tcb.pending_reply_token = Some(egress_token);
+        prepared_tcb.snd_una = iss;
+        prepared_tcb.snd_nxt = iss.wrapping_add(1);
+        prepared_tcb.snd_wnd = TCP_DEFAULT_WINDOW as u32;
+        prepared_tcb.rcv_wscale = calc_wscale(prepared_tcb.rcv_wnd);
+        prepared_tcb.wscale_requested = true;
+        prepared_tcb.sack_requested = true;
+        let syn_wnd = Self::encode_adv_window(&prepared_tcb, prepared_tcb.rcv_wnd);
+        let syn_options = [
+            TcpOptionKind::WindowScale(prepared_tcb.rcv_wscale),
+            TcpOptionKind::SackPermitted,
+        ];
+        let segment = try_build_tcp_segment_with_options(
+            local_ip,
+            dst_ip,
+            local_port,
+            dst_port,
+            iss,
+            0,
+            TCP_FLAG_SYN,
+            syn_wnd,
+            &syn_options,
+            &[],
+        )
+        .map_err(|_| SocketError::NoMemory)?;
+        {
+            let mut bindings = self.tcp_bindings.lock();
+            if !bindings.contains_key(&(sock.net_ns_id, local_port)) {
+                bindings
+                    .ensure_capacity_for(1)
+                    .map_err(|_| SocketError::NoMemory)?;
+            }
+        }
+        {
+            let mut conns = self.tcp_conns.lock();
+            if !conns.contains_key(&conn_key) {
+                conns
+                    .ensure_capacity_for(1)
+                    .map_err(|_| SocketError::NoMemory)?;
+            }
+        }
 
         // J2-8: charge the per-cgroup ephemeral-port budget for an ACTIVE-OPEN
         // allocation, AFTER LSM admits and BEFORE any binding lock (lock-ordering
@@ -4931,13 +6300,13 @@ impl SocketTable {
                         charged_cgroup == 0 || did_alloc,
                         "connect: non-zero speculative charge implies did_alloc"
                     );
-                    if let InsertOutcome::DisplacedCharge(old) = Self::insert_binding_charged(
+                    if let InsertOutcome::DisplacedCharge(old) = Self::try_insert_binding_charged(
                         &mut bindings,
                         binding_key,
                         sock,
                         charged_cgroup,
                         BindKind::Ephemeral,
-                    ) {
+                    )? {
                         self.enqueue_port_uncharge(old, 1);
                     }
                     binding_registered = true;
@@ -4961,12 +6330,21 @@ impl SocketTable {
                 if conns.get(&conn_key).and_then(|w| w.upgrade()).is_some() {
                     return Err(SocketError::PortInUse);
                 }
+                conns
+                    .ensure_capacity_for(1)
+                    .map_err(|_| SocketError::NoMemory)?;
                 // J2-1: per-namespace connection budget (composes with the global
                 // cap checked above; both must pass). On over-quota this `?` exits
                 // the registration closure with QuotaExceeded -> EAGAIN, dropping
                 // the `conns` guard before the binding rollback below.
                 self.try_inc_ns_conn(conn_key.0)?;
-                conns.insert(conn_key, Arc::downgrade(sock));
+                if conns
+                    .insert_unique_reserved(conn_key, Arc::downgrade(sock))
+                    .is_err()
+                {
+                    self.dec_ns_conn(conn_key.0);
+                    return Err(SocketError::PortInUse);
+                }
                 conn_registered = true;
             }
 
@@ -4976,10 +6354,9 @@ impl SocketTable {
         // On registration failure, clean up any partial registrations
         if let Err(e) = registration_result {
             if conn_registered {
-                // J2-1: uncharge the per-namespace connection charged at insert.
-                if self.tcp_conns.lock().remove(&conn_key).is_some() {
-                    self.dec_ns_conn(conn_key.0);
-                }
+                // RF180-36 FIX: rollback may run after tuple reuse; release only
+                // the registration still owned by this connect transaction.
+                self.remove_tcp_conn_exact_owner(conn_key, sock);
             }
             if binding_registered {
                 // R75-1 FIX: Remove using namespace-scoped key.
@@ -5014,52 +6391,17 @@ impl SocketTable {
             return Err(e);
         }
 
+        #[cfg(test)]
+        self.pause_operation_commit_for_test(TEST_PAUSE_CONNECT_COMMIT);
+
         // Update socket metadata (connection is now registered)
         sock.bind_local(local_ip, local_port);
         sock.set_remote(dst_ip, dst_port);
 
-        // Generate Initial Sequence Number (ISN) per RFC 6528
-        let iss = generate_isn(local_ip, local_port, dst_ip, dst_port);
-
-        // Build TCB in SYN_SENT state
-        let mut tcb = TcpControlBlock::new_client(local_ip, local_port, dst_ip, dst_port, iss);
-        tcb.state = TcpState::SynSent;
-        tcb.snd_una = iss;
-        tcb.snd_nxt = iss.wrapping_add(1); // SYN consumes one sequence number
-        tcb.snd_wnd = TCP_DEFAULT_WINDOW as u32;
-
-        // R58: RFC 7323 Window Scaling - calculate and set our scale factor
-        // WSopt MUST only appear in SYN segments
-        tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
-        tcb.wscale_requested = true;
-
-        // SACK-Permitted (RFC 2018): advertise SACK capability in SYN
-        tcb.sack_requested = true;
-
-        // Calculate scaled window for SYN
-        let syn_wnd = Self::encode_adv_window(&tcb, tcb.rcv_wnd);
-        sock.attach_tcp(tcb);
-
-        // Build the SYN segment with Window Scale + SACK-Permitted options
-        let tcp_guard = sock.tcp.lock();
-        let tcb_ref = tcp_guard.as_ref().unwrap();
-        let syn_options = [
-            TcpOptionKind::WindowScale(tcb_ref.control.rcv_wscale),
-            TcpOptionKind::SackPermitted,
-        ];
-        drop(tcp_guard);
-        let segment = build_tcp_segment_with_options(
-            local_ip,
-            dst_ip,
-            local_port,
-            dst_port,
-            iss,
-            0,
-            TCP_FLAG_SYN,
-            syn_wnd,
-            &syn_options,
-            &[],
-        );
+        *sock.tcp.lock() = Some(TcpSocketState::from_prepared(
+            prepared_tcb,
+            prepared_waiters,
+        ));
 
         let result = TcpConnectResult {
             segment,
@@ -5067,6 +6409,7 @@ impl SocketTable {
             src_ip: local_ip,
             dst_ip,
             dst_port,
+            egress_binding: self.bind_tcp_reply(sock, egress_token),
         };
 
         // Non-blocking connect: return result immediately with InProgress
@@ -5074,7 +6417,20 @@ impl SocketTable {
         if timeout_ns == Some(0) {
             // For non-blocking, we still return the result so the SYN can be transmitted
             // The socket is in SYN_SENT state; completion happens via RX path
+            drop(operation);
+            if sock.is_closed() {
+                return Err(SocketError::Closed);
+            }
             return Ok(result);
+        }
+
+        // A spin mutex must never be held across a scheduler wait.  Socket
+        // metadata and the SYN-SENT TCB are already committed, so concurrent
+        // bind/connect callers will fail validation while we sleep.  Terminal
+        // rollback paths reacquire this same lock before tearing the attempt down.
+        drop(operation);
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
         }
 
         // Blocking connect: wait for state transition signaled via TCP waiters
@@ -5086,149 +6442,48 @@ impl SocketTable {
                     if matches!(sock.tcp_state(), Some(TcpState::Established)) {
                         return Ok(result);
                     }
-                    // Connection was reset or failed
-                    if matches!(sock.tcp_state(), Some(TcpState::Closed)) {
-                        // Clean up on failed connection
-                        // R75-1 FIX: Use namespace-scoped binding key
-                        let binding_key = (sock.net_ns_id, local_port);
-                        // J2-8 / R169-6 slice 2: while-alive teardown via the
-                        // kind-gated choke-point — an own charged Explicit
-                        // binding is PURE-SKIPPED (hold-until-close), an own
-                        // charged Ephemeral is removed + refunded +
-                        // local-cleared (ghost-bind fix). Block-scoped so the
-                        // L8 guard drops before the L5 uncharge / meta lock.
-                        let action = {
-                            let mut bindings = self.tcp_bindings.lock();
-                            Self::resolve_while_alive_teardown(
-                                &mut bindings,
-                                binding_key,
-                                Arc::as_ptr(sock),
-                            )
-                        };
-                        if let TeardownAction::Removed(Some(c)) = action {
-                            uncharge_port_cgroup(c, 1);
-                            // Ghost-bind clear — lexically Ephemeral-only (a
-                            // charged Explicit took SkipExplicit above).
-                            let mut m = sock.meta.lock();
-                            m.local_ip = None;
-                            m.local_port = None;
-                        }
-                        // J2-1: uncharge the per-namespace connection.
-                        if self.tcp_conns.lock().remove(&conn_key).is_some() {
-                            self.dec_ns_conn(conn_key.0);
-                        }
-                        return Err(SocketError::Closed);
+                    if !matches!(sock.tcp_state(), Some(TcpState::Closed) | None) {
+                        // A wake may be unrelated/spurious. Preserve the live
+                        // attempt and report that it remains in progress.
+                        return Err(SocketError::InProgress);
                     }
-                    // Still in SYN_SENT or other intermediate state
-                    return Err(SocketError::InProgress);
+
+                    // Reacquire the operation lock for terminal rollback. A
+                    // SYN-ACK that committed while we waited wins this re-check.
+                    let _operation = self.lock_socket_operation(sock);
+                    if matches!(sock.tcp_state(), Some(TcpState::Established)) {
+                        return Ok(result);
+                    }
+                    self.abort_tcp_connect_locked(sock);
+                    return Err(SocketError::Closed);
                 }
                 WaitOutcome::TimedOut => {
-                    // Timeout - the SYN was sent but no response
-                    // Clean up resources to allow retry or close
-                    // R75-1 FIX: Use namespace-scoped binding key
-                    let binding_key = (sock.net_ns_id, local_port);
-                    // J2-8 / R169-6 slice 2: kind-gated while-alive teardown
-                    // (see the Woken->Closed arm). Belt-and-suspenders with the
-                    // deferred cleanup_tcp_connection path — BTreeMap::remove
-                    // is the single arbiter, so only one of them gets the
-                    // charge; an own charged Explicit binding is PURE-SKIPPED
-                    // on BOTH (hold-until-close).
-                    let action = {
-                        let mut bindings = self.tcp_bindings.lock();
-                        Self::resolve_while_alive_teardown(
-                            &mut bindings,
-                            binding_key,
-                            Arc::as_ptr(sock),
-                        )
-                    };
-                    if let TeardownAction::Removed(Some(c)) = action {
-                        uncharge_port_cgroup(c, 1);
-                        // Ghost-bind clear — lexically Ephemeral-only (a
-                        // charged Explicit took SkipExplicit above).
-                        let mut m = sock.meta.lock();
-                        m.local_ip = None;
-                        m.local_port = None;
+                    let _operation = self.lock_socket_operation(sock);
+                    // Establishment racing the deadline wins once committed.
+                    if matches!(sock.tcp_state(), Some(TcpState::Established)) {
+                        return Ok(result);
                     }
-                    // J2-1: uncharge the per-namespace connection.
-                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
-                        self.dec_ns_conn(conn_key.0);
-                    }
-                    // Reset socket metadata to allow retry after close
-                    {
-                        let mut meta = sock.meta.lock();
-                        meta.remote_ip = None;
-                        meta.remote_port = None;
-                    }
-                    // J2-6: clear the TCB through the unified helper, which first
-                    // uncharges any residual per-namespace send bytes (today 0 in
-                    // SYN-SENT since the socket can't send pre-ESTABLISHED, but
-                    // leak-proof for any future pre-ESTABLISHED data buffering).
-                    self.detach_tcp_uncharged(sock);
+                    self.abort_tcp_connect_locked(sock);
                     return Err(SocketError::Timeout);
                 }
                 WaitOutcome::Closed => {
-                    // R75-1 FIX: Use namespace-scoped binding key
-                    let binding_key = (sock.net_ns_id, local_port);
-                    // J2-8 / R169-6 slice 2: kind-gated while-alive teardown
-                    // (see the Woken->Closed arm). Belt-and-suspenders with the
-                    // deferred cleanup_tcp_connection path — BTreeMap::remove
-                    // is the single arbiter, so only one of them gets the
-                    // charge; an own charged Explicit binding is PURE-SKIPPED
-                    // on BOTH (hold-until-close).
-                    let action = {
-                        let mut bindings = self.tcp_bindings.lock();
-                        Self::resolve_while_alive_teardown(
-                            &mut bindings,
-                            binding_key,
-                            Arc::as_ptr(sock),
-                        )
-                    };
-                    if let TeardownAction::Removed(Some(c)) = action {
-                        uncharge_port_cgroup(c, 1);
-                        // Ghost-bind clear — lexically Ephemeral-only (a
-                        // charged Explicit took SkipExplicit above).
-                        let mut m = sock.meta.lock();
-                        m.local_ip = None;
-                        m.local_port = None;
-                    }
-                    // J2-1: uncharge the per-namespace connection.
-                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
-                        self.dec_ns_conn(conn_key.0);
-                    }
+                    let _operation = self.lock_socket_operation(sock);
+                    self.abort_tcp_connect_locked(sock);
                     return Err(SocketError::Closed);
                 }
                 WaitOutcome::Interrupted => {
                     // R171-F3 FIX: a pending kill interrupted the blocking connect.
-                    // Mirror the TimedOut teardown so the in-flight SYN_SENT
-                    // binding / port-charge / per-ns conn are released (no J2 quota
-                    // leak), then report EINTR.
-                    let binding_key = (sock.net_ns_id, local_port);
-                    let action = {
-                        let mut bindings = self.tcp_bindings.lock();
-                        Self::resolve_while_alive_teardown(
-                            &mut bindings,
-                            binding_key,
-                            Arc::as_ptr(sock),
-                        )
-                    };
-                    if let TeardownAction::Removed(Some(c)) = action {
-                        uncharge_port_cgroup(c, 1);
-                        let mut m = sock.meta.lock();
-                        m.local_ip = None;
-                        m.local_port = None;
-                    }
-                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
-                        self.dec_ns_conn(conn_key.0);
-                    }
-                    {
-                        let mut meta = sock.meta.lock();
-                        meta.remote_ip = None;
-                        meta.remote_port = None;
-                    }
-                    self.detach_tcp_uncharged(sock);
+                    // Unified rollback releases binding/quota/TCB state before EINTR.
+                    let _operation = self.lock_socket_operation(sock);
+                    self.abort_tcp_connect_locked(sock);
                     return Err(SocketError::Interrupted);
                 }
-                WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+                WaitOutcome::NoProcess => {
+                    // An error return must not retain a published SYN-SENT ghost.
+                    let _operation = self.lock_socket_operation(sock);
+                    self.abort_tcp_connect_locked(sock);
+                    return Err(SocketError::NoProcess);
+                }
             }
         }
 
@@ -5254,57 +6509,69 @@ impl SocketTable {
     /// # Returns
     ///
     /// Received datagram on success.
-    pub fn recv_from_udp(
+    /// Transactional UDP receive: LSM-check and expose the exact front packet
+    /// to `commit` while holding `rx_queue`; dequeue/account only after the
+    /// caller confirms all user copyouts succeeded.
+    pub fn recv_from_udp_with_commit<E, F>(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         timeout_ns: Option<u64>,
-    ) -> Result<PendingDatagram, SocketError> {
-        // Validate socket type
+        mut commit: F,
+    ) -> Result<usize, RecvTransactionError<E>>
+    where
+        F: FnMut(&PendingDatagram) -> Result<usize, E>,
+    {
         if sock.ty != SocketType::Dgram || sock.proto != SocketProtocol::Udp {
-            return Err(SocketError::InvalidType);
+            return Err(RecvTransactionError::Socket(SocketError::InvalidType));
         }
 
         loop {
-            // Check if closed
             if sock.is_closed() {
-                return Err(SocketError::Closed);
+                return Err(RecvTransactionError::Socket(SocketError::Closed));
             }
 
-            // R152-13 FIX: Peek at front datagram and perform LSM check BEFORE popping.
-            // This prevents data loss when LSM denies the recv operation.
-            // Codex review: pop must happen under the SAME lock to avoid checked-A-popped-B race.
-            {
-                let mut queue = sock.rx_queue.lock();
-                if let Some(pkt) = queue.front() {
-                    let mut ctx = self.ctx_from_socket(sock);
-                    ctx.remote = ipv4_to_u64(pkt.src_ip.0);
-                    ctx.remote_port = pkt.src_port;
-                    ctx.cap = Some(cap_id);
+            let mut queue = sock.rx_queue.lock();
+            if let Some(pkt) = queue.front() {
+                let mut ctx = self.ctx_from_socket(sock);
+                ctx.remote = ipv4_to_u64(pkt.src_ip.0);
+                ctx.remote_port = pkt.src_port;
+                ctx.cap = Some(cap_id);
+                hook_net_recv(current, &ctx, pkt.data.len())
+                    .map_err(|error| RecvTransactionError::Socket(error.into()))?;
 
-                    hook_net_recv(current, &ctx, pkt.data.len())?;
+                let copied = commit(pkt).map_err(RecvTransactionError::Commit)?;
+                if copied > pkt.data.len() {
+                    return Err(RecvTransactionError::Socket(SocketError::InvalidState));
+                }
+                let packet_len = pkt.data.len();
+                let removed = queue.pop_front();
+                if removed.is_none() {
+                    return Err(RecvTransactionError::Socket(SocketError::InvalidState));
+                }
+                let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_sub(packet_len)),
+                );
+                return Ok(copied);
+            }
 
-                    // LSM approved — pop the exact datagram we checked (same lock held)
-                    let pkt = queue.pop_front().unwrap();
-                    // Account for global UDP bytes
-                    let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(pkt.data.len())),
-                    );
-                    return Ok(pkt);
-                } else {
-                    drop(queue);
-                    // Block on wait queue
-                    match sock.waiters.wait_with_timeout(timeout_ns) {
-                        WaitOutcome::Woken => continue,
-                        WaitOutcome::TimedOut => return Err(SocketError::Timeout),
-                        WaitOutcome::Closed => return Err(SocketError::Closed),
-                        WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
-                        // R171-F3: pending kill — interrupt the blocking recv (EINTR).
-                        WaitOutcome::Interrupted => return Err(SocketError::Interrupted),
-                    }
+            drop(queue);
+            match sock.waiters.wait_with_timeout(timeout_ns) {
+                WaitOutcome::Woken => continue,
+                WaitOutcome::TimedOut => {
+                    return Err(RecvTransactionError::Socket(SocketError::Timeout))
+                }
+                WaitOutcome::Closed => {
+                    return Err(RecvTransactionError::Socket(SocketError::Closed))
+                }
+                WaitOutcome::NoProcess => {
+                    return Err(RecvTransactionError::Socket(SocketError::NoProcess))
+                }
+                WaitOutcome::Interrupted => {
+                    return Err(RecvTransactionError::Socket(SocketError::Interrupted))
                 }
             }
         }
@@ -5338,11 +6605,11 @@ impl SocketTable {
     /// Caller is responsible for transmitting each segment.
     pub fn tcp_send(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         payload: &[u8],
-    ) -> Result<(usize, Vec<Vec<u8>>), SocketError> {
+    ) -> Result<(usize, mm::AdmittedVec<WirePacket>), SocketError> {
         // Validate socket type
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
             return Err(SocketError::InvalidType);
@@ -5387,6 +6654,16 @@ impl SocketTable {
             return Err(SocketError::InvalidState);
         }
 
+        // RF180-27 REVIEW FIX: a zero-length stream send performs no payload
+        // copy or sequence mutation, but it does not bypass connection-state
+        // validation. Linux may report EPIPE instead of ENOTCONN; this kernel's
+        // established InvalidState mapping is ENOTCONN. Once the connected TCB
+        // and LSM policy are validated, return allocation-free without touching
+        // congestion, idle, retransmission, or accounting state.
+        if payload.is_empty() {
+            return Ok((0, mm::AdmittedVec::new(HeapClass::SocketObject)));
+        }
+
         // Get current timestamp for idle validation and retransmission tracking
         let now_ms = self.time_wait_now();
 
@@ -5419,7 +6696,8 @@ impl SocketTable {
         // first (cheapest). On over-quota the caller retries after ACKs drain. The
         // reservation advances the per-TCB mirror; the post-buffering reconcile
         // below refunds the (payload.len() - offset) shortfall if OOM truncates the
-        // segmentation loop. Root (ns 0) is exempt.
+        // segmentation loop. Root is exempt only from this per-namespace fairness
+        // counter; all retained and syscall-staged bytes remain globally admitted.
         self.try_charge_ns_send(sock.net_ns_id, &mut tcp_state.control, payload.len())?;
 
         // Get current sequence numbers
@@ -5434,7 +6712,10 @@ impl SocketTable {
         // R163-10 FIX: Start with Vec::new() instead of Vec::with_capacity so
         // the segments list itself has no infallible reservation. Each slot is
         // reserved fallibly inside the loop via try_reserve(1) before push.
-        let mut segments: Vec<Vec<u8>> = Vec::new();
+        // RF180-41 FIX: both each serialized packet and the owner-list backing
+        // participate in aggregate admission for their complete lifetimes.
+        let mut segments: mm::AdmittedVec<WirePacket> =
+            mm::AdmittedVec::new(HeapClass::SocketObject);
         let mut offset = 0usize;
 
         while offset < payload.len() {
@@ -5458,7 +6739,7 @@ impl SocketTable {
                 break;
             }
 
-            let segment = build_tcp_segment(
+            let segment = match crate::tcp::try_build_tcp_segment(
                 local_ip,
                 remote_ip,
                 local_port,
@@ -5468,39 +6749,55 @@ impl SocketTable {
                 flags,
                 advertised_wnd,
                 seg_payload,
-            );
-
-            // R163-10 FIX: build_tcp_segment returns empty Vec on OOM; do not
-            // queue an empty (malformed) packet or advance accounting.
-            if segment.is_empty() {
-                break;
-            }
+            ) {
+                Ok(segment) => segment,
+                Err(_) => break,
+            };
 
             // Buffer segment for potential retransmission
             // This enables reliable delivery: segments are kept until ACKed
             // R162-9 FIX: Fallible allocation for retransmission buffer copy.
-            let mut retrans_data = Vec::new();
-            if retrans_data.try_reserve_exact(seg_payload.len()).is_err() {
-                break; // Stop sending more segments; already-buffered ones will be retransmitted
-            }
-            retrans_data.extend_from_slice(seg_payload);
-
-            // R163-10 FIX: Reserve a slot in the send_buffer VecDeque fallibly
-            // before push_back. If send_buffer is full or OOM, break and leave
-            // already-queued segments for transmission.
-            if tcp_state.control.send_buffer.try_reserve(1).is_err() {
+            // R180-11 FIX: both queue backing and owned retransmit payload are
+            // globally admitted before publication.
+            if tcp_state
+                .control
+                .send_buffer
+                .ensure_capacity_for(1)
+                .is_err()
+            {
                 break;
             }
-            tcp_state.control.send_buffer.push_back(TcpSegment {
-                seq,
-                data: retrans_data,
-                sent_at: now_ms,
-                retrans_count: 0,
-                sacked: false,
-                lost: false,
-            });
+            let retrans_data =
+                match AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, seg_payload) {
+                    Ok(data) => data,
+                    Err(_) => break,
+                };
+            if tcp_state
+                .control
+                .send_buffer
+                .push_reserved(TcpSegment {
+                    seq,
+                    data: retrans_data,
+                    sent_at: now_ms,
+                    retrans_count: 0,
+                    sacked: false,
+                    lost: false,
+                    retransmit_pending: false,
+                    retransmit_in_flight: false,
+                    retransmit_requires_rto: false,
+                    tx_reject_count: 0,
+                    retry_not_before_ms: 0,
+                })
+                .is_err()
+            {
+                break;
+            }
 
-            segments.push(segment);
+            if segments.try_push(segment).is_err() {
+                // Capacity was just prepared; treat invariant failure as OOM
+                // and leave sequence/accounting at the last committed chunk.
+                break;
+            }
             offset = end;
         }
 
@@ -5562,11 +6859,11 @@ impl SocketTable {
     /// Serialized FIN segment for transmission (if needed), or None.
     pub fn tcp_shutdown(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         how: i32,
-    ) -> Result<Option<Vec<u8>>, SocketError> {
+    ) -> Result<Option<SerializedTcpPacket>, SocketError> {
         const SHUT_RD: i32 = 0;
         const SHUT_WR: i32 = 1;
         const SHUT_RDWR: i32 = 2;
@@ -5610,6 +6907,10 @@ impl SocketTable {
         ctx.cap = Some(cap_id);
         hook_net_shutdown(current, &ctx, how).map_err(|_| SocketError::PermissionDenied)?;
 
+        let operation = self.lock_socket_operation(sock);
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
         let mut guard = sock.tcp.lock();
         let tcp_state = guard.as_mut().ok_or(SocketError::InvalidState)?;
 
@@ -5629,20 +6930,9 @@ impl SocketTable {
         // R58: Use scaled window advertisement
         let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
-        // FIN consumes 1 sequence number
-        tcp_state.control.snd_nxt = tcp_state.control.snd_nxt.wrapping_add(1);
-        tcp_state.control.fin_sent = true;
-        tcp_state.control.fin_sent_time = self.time_wait_now();
-        tcp_state.control.fin_retries = 0;
-
-        // State transition
-        tcp_state.control.state = match tcp_state.control.state {
-            TcpState::Established => TcpState::FinWait1,
-            TcpState::CloseWait => TcpState::LastAck,
-            other => other, // Should not happen due to can_send() check
-        };
-
-        let fin_segment = build_tcp_segment(
+        // RF180-25 FIX: allocation/admission and complete serialization precede
+        // every sequence/state mutation. ENOMEM leaves shutdown retryable.
+        let fin_segment = try_build_tcp_segment_admitted(
             local_ip,
             remote_ip,
             local_port,
@@ -5652,12 +6942,38 @@ impl SocketTable {
             TCP_FLAG_FIN | TCP_FLAG_ACK,
             advertised_wnd,
             &[],
-        );
+        )
+        .map_err(|_| SocketError::NoMemory)?;
+
+        let next_state = match tcp_state.control.state {
+            TcpState::Established => TcpState::FinWait1,
+            TcpState::CloseWait => TcpState::LastAck,
+            other => other, // Should not happen due to can_send() check
+        };
+        tcp_state.control.snd_nxt = tcp_state.control.snd_nxt.wrapping_add(1);
+        tcp_state.control.fin_sent = true;
+        tcp_state.control.fin_sent_time = self.time_wait_now();
+        tcp_state.control.fin_retries = 0;
+        tcp_state.control.state = next_state;
 
         drop(guard);
+
+        #[cfg(test)]
+        self.pause_operation_commit_for_test(TEST_PAUSE_SHUTDOWN_COMMIT);
+
+        drop(operation);
+
+        // RF180-26 REVIEW FIX: the FIN and its sequence/state transition were
+        // committed while this operation owned the serialization lock.  A
+        // racing close may publish `closed` and run its deferred finalizer when
+        // the guard is released, but it observes FinWait1/LastAck and preserves
+        // that same graceful-close transaction.  Rejecting here discarded the
+        // sole prepared FIN after consuming sequence space, leaving recovery to
+        // a later retransmission timer.  The operation linearized first, so its
+        // prepared packet must be returned to the caller exactly once.
         sock.wake_tcp_waiters();
 
-        Ok(Some(fin_segment))
+        Ok(Some(SerializedTcpPacket { bytes: fin_segment }))
     }
 
     /// Receive TCP data (blocking with optional timeout).
@@ -5679,116 +6995,130 @@ impl SocketTable {
     /// # Returns
     ///
     /// Vector of received bytes (may be less than max_len).
-    pub fn tcp_recv(
+    /// Transactional TCP receive. The shared receive operation is serialized;
+    /// bytes are staged without draining, copied out under the TCP lock, and
+    /// removed/accounted only after the caller reports copyout success.
+    pub fn tcp_recv_with_commit<E, F>(
         &self,
-        sock: &Arc<SocketState>,
+        sock: &SocketArc,
         current: &ProcessCtx,
         cap_id: CapId,
         max_len: usize,
         timeout_ns: Option<u64>,
-    ) -> Result<Vec<u8>, SocketError> {
-        // Validate socket type
+        mut commit: F,
+    ) -> Result<usize, RecvTransactionError<E>>
+    where
+        F: FnMut(&[u8]) -> Result<(), E>,
+    {
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
-            return Err(SocketError::InvalidType);
+            return Err(RecvTransactionError::Socket(SocketError::InvalidType));
         }
         if sock.is_closed() {
-            return Err(SocketError::Closed);
+            return Err(RecvTransactionError::Socket(SocketError::Closed));
+        }
+        // RF180-27 FIX: a zero-length receive is an immediate successful
+        // no-op after type/closed/LSM validation. Without this gate, a
+        // non-empty receive buffer produced `actual == 0` forever and spun
+        // while retaining the operation lock.  Do not require a TCB or touch
+        // receive state: Linux also permits recv(..., 0) on an unconnected
+        // stream socket.
+        if max_len == 0 {
+            let mut ctx = self.ctx_from_socket(sock);
+            ctx.cap = Some(cap_id);
+            hook_net_recv(current, &ctx, 0)
+                .map_err(|error| RecvTransactionError::Socket(error.into()))?;
+            return Ok(0);
         }
 
         loop {
-            // Get data waiters for blocking
-            let waiters = sock.tcp_data_waiters().ok_or(SocketError::Closed)?;
+            let waiters = sock
+                .tcp_data_waiters()
+                .ok_or(RecvTransactionError::Socket(SocketError::Closed))?;
 
-            // Try to get data from buffer
             {
+                // Serialize syscall consumers across the LSM gap. RX/ACK paths
+                // do not take this process-context lock and remain interrupt-safe.
+                let _operation = self.lock_socket_operation(sock);
+                if sock.is_closed() {
+                    return Err(RecvTransactionError::Socket(SocketError::Closed));
+                }
                 let mut guard = sock.tcp.lock();
-                let tcp_state = guard.as_mut().ok_or(SocketError::Closed)?;
-
-                // Check connection state for receive capability
+                let tcp_state = guard
+                    .as_mut()
+                    .ok_or(RecvTransactionError::Socket(SocketError::Closed))?;
                 if tcp_state.control.state.is_closed() {
-                    return Err(SocketError::Closed);
+                    return Err(RecvTransactionError::Socket(SocketError::Closed));
                 }
                 if !tcp_state.control.state.can_receive() {
-                    return Err(SocketError::InvalidState);
+                    return Err(RecvTransactionError::Socket(SocketError::InvalidState));
                 }
 
-                // Check if we have data in the buffer
                 if !tcp_state.control.recv_buffer.is_empty() {
-                    let take = core::cmp::min(max_len, tcp_state.control.recv_buffer.len());
-
-                    // R152-14 FIX: Perform LSM check BEFORE draining recv_buffer.
-                    // This prevents permanent data loss when LSM denies the recv.
+                    let requested = core::cmp::min(max_len, tcp_state.control.recv_buffer.len());
                     drop(guard);
+
                     let mut ctx = self.ctx_from_socket(sock);
                     ctx.cap = Some(cap_id);
-                    hook_net_recv(current, &ctx, take)?;
+                    hook_net_recv(current, &ctx, requested)
+                        .map_err(|error| RecvTransactionError::Socket(error.into()))?;
 
-                    // Re-acquire TCP lock and drain buffer after LSM approval
-                    // Codex review: if another reader drained the buffer during LSM check,
-                    // actual_take can be 0 — loop again instead of returning spurious EOF.
                     let mut guard = sock.tcp.lock();
-                    let tcp_state = guard.as_mut().ok_or(SocketError::Closed)?;
-                    let actual_take = core::cmp::min(take, tcp_state.control.recv_buffer.len());
-                    if actual_take == 0 {
-                        // Buffer was drained by another reader — retry the loop
-                        drop(guard);
+                    let tcp_state = guard
+                        .as_mut()
+                        .ok_or(RecvTransactionError::Socket(SocketError::Closed))?;
+                    let actual = core::cmp::min(requested, tcp_state.control.recv_buffer.len());
+                    if actual == 0 {
                         continue;
                     }
-                    // R162-9 FIX: Fallible allocation for tcp_recv drain buffer.
-                    let mut data = Vec::new();
-                    if data.try_reserve_exact(actual_take).is_err() {
-                        drop(guard);
-                        return Err(SocketError::NoMemory);
-                    }
-                    for _ in 0..actual_take {
-                        if let Some(b) = tcp_state.control.recv_buffer.pop_front() {
-                            data.push(b);
-                        }
-                    }
 
-                    // R158-10 FIX: Retry OOO drain after freeing recv_buffer space.
-                    // Without this, contiguous OOO data could sit undelivered until
-                    // the next packet arrival, causing unnecessary read stalls.
+                    // R180-11 FIX: the transactional read snapshot is admitted
+                    // for its complete allocator capacity and remains charged
+                    // across user copyout/commit.
+                    let data = AdmittedVec::try_copy_from_slice(
+                        HeapClass::SocketPayload,
+                        &tcp_state.control.recv_buffer.as_slice()[..actual],
+                    )
+                    .map_err(|_| RecvTransactionError::Socket(SocketError::NoMemory))?;
+
+                    commit(data.as_slice()).map_err(RecvTransactionError::Commit)?;
+
+                    // Lock-held length preflight above makes this commit
+                    // allocation-free and infallible.
+                    for _ in 0..actual {
+                        let removed = tcp_state.control.recv_buffer.pop_front();
+                        debug_assert!(removed.is_some());
+                    }
                     tcp_state.control.ooo_drain_contiguous();
-
-                    // J2-4: the consumer drained recv_buffer (and ooo_drain may have
-                    // FIN-cleared OOO) — reconcile the per-ns recv counter DOWN to the
-                    // now-smaller true F (returns budget to the tenant as the app reads).
                     self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
-
-                    // R161-11 FIX: OOO drain in recv path may deliver buffered FIN,
-                    // triggering FinWait2→TimeWait. Initialize time_wait_start.
                     if tcp_state.control.state == TcpState::TimeWait
                         && tcp_state.control.time_wait_start == 0
                     {
                         tcp_state.control.time_wait_start = self.time_wait_now();
                     }
-
                     drop(guard);
-
-                    // Update statistics
-                    sock.rx_bytes
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-                    return Ok(data);
+                    sock.rx_bytes.fetch_add(actual as u64, Ordering::Relaxed);
+                    return Ok(actual);
                 }
 
-                // R145-3 FIX: EOF — FIN received and recv buffer fully drained.
-                // Return empty Vec (0 bytes) per POSIX instead of blocking
-                // forever or returning InvalidState.
                 if tcp_state.control.fin_received {
-                    return Ok(Vec::new());
+                    return Ok(0);
                 }
             }
 
-            // No data available, block on wait queue
             match waiters.wait_with_timeout(timeout_ns) {
                 WaitOutcome::Woken => continue,
-                WaitOutcome::TimedOut => return Err(SocketError::Timeout),
-                WaitOutcome::Closed => return Err(SocketError::Closed),
-                WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
-                // R171-F3: pending kill — interrupt the blocking recv (EINTR).
-                WaitOutcome::Interrupted => return Err(SocketError::Interrupted),
+                WaitOutcome::TimedOut => {
+                    return Err(RecvTransactionError::Socket(SocketError::Timeout))
+                }
+                WaitOutcome::Closed => {
+                    return Err(RecvTransactionError::Socket(SocketError::Closed))
+                }
+                WaitOutcome::NoProcess => {
+                    return Err(RecvTransactionError::Socket(SocketError::NoProcess))
+                }
+                WaitOutcome::Interrupted => {
+                    return Err(RecvTransactionError::Socket(SocketError::Interrupted))
+                }
             }
         }
     }
@@ -5900,7 +7230,12 @@ impl SocketTable {
     ///
     /// For UDP sockets or TCP sockets already closing, immediate cleanup occurs.
     pub fn close(&self, socket_id: u64) {
-        // Fetch the socket without removing it; TCP may need graceful FIN shutdown.
+        // RF180-26 FIX: close-on-drop can run under the Process table lock. Do
+        // not block on the socket-operation mutex: publish the close first, then
+        // try to claim the idle lock. If an operation is active, its guard runs
+        // the exact same finalizer after unlocking. The closed publication makes
+        // every later operation fail validation while the in-flight operation is
+        // ordered before this close and fully cleaned by the finalizer.
         let sock = {
             let sockets = self.sockets.read();
             sockets.get(&socket_id).cloned()
@@ -5909,9 +7244,28 @@ impl SocketTable {
         let Some(sock) = sock else {
             return;
         };
+        if sock.close_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        sock.mark_closed();
+
+        let idle_lock = sock.operation.try_lock();
+        if let Some(lock) = idle_lock {
+            drop(SocketOperationGuard {
+                table: self,
+                sock: &sock,
+                lock: Some(lock),
+            });
+        }
+    }
+
+    /// Complete a close after no pre-close userspace operation owns the socket
+    /// operation lock. Called exactly once by `maybe_finalize_deferred_close`.
+    fn finish_close(&self, sock: &SocketArc) {
+        let socket_id = sock.id;
 
         let mut keep_registered = false;
-        let mut fin_to_send: Option<(Ipv4Addr, Vec<u8>, u64)> = None;
+        let mut fin_to_send: Option<(Ipv4Addr, WirePacket, u64)> = None;
 
         // TCP sockets may need to send FIN and stay registered for TIME_WAIT/ACK handling.
         if sock.proto == SocketProtocol::Tcp {
@@ -5934,15 +7288,11 @@ impl SocketTable {
                                 // R58: Use scaled window
                                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
-                                // FIN consumes one sequence number
-                                tcp_state.control.snd_nxt =
-                                    tcp_state.control.snd_nxt.wrapping_add(1);
-                                tcp_state.control.fin_sent = true;
-                                tcp_state.control.fin_sent_time = self.time_wait_now();
-                                tcp_state.control.fin_retries = 0;
-                                tcp_state.control.state = TcpState::FinWait1;
-
-                                let fin_segment = build_tcp_segment(
+                                // RF180-25 FIX: admit and fully serialize FIN
+                                // work before consuming sequence space or
+                                // publishing the closing state. On pressure we
+                                // fall back to immediate terminal cleanup.
+                                let fin_segment = try_build_tcp_segment_admitted(
                                     local_ip,
                                     remote_ip,
                                     local_port,
@@ -5953,7 +7303,17 @@ impl SocketTable {
                                     advertised_wnd,
                                     &[],
                                 );
-                                fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
+                                if let Ok(fin_segment) = fin_segment {
+                                    tcp_state.control.snd_nxt =
+                                        tcp_state.control.snd_nxt.wrapping_add(1);
+                                    tcp_state.control.fin_sent = true;
+                                    tcp_state.control.fin_sent_time = self.time_wait_now();
+                                    tcp_state.control.fin_retries = 0;
+                                    tcp_state.control.state = TcpState::FinWait1;
+                                    fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
+                                } else {
+                                    keep_registered = false;
+                                }
                             }
                         }
                         TcpState::CloseWait => {
@@ -5965,14 +7325,7 @@ impl SocketTable {
                                 // R58: Use scaled window
                                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
-                                tcp_state.control.snd_nxt =
-                                    tcp_state.control.snd_nxt.wrapping_add(1);
-                                tcp_state.control.fin_sent = true;
-                                tcp_state.control.fin_sent_time = self.time_wait_now();
-                                tcp_state.control.fin_retries = 0;
-                                tcp_state.control.state = TcpState::LastAck;
-
-                                let fin_segment = build_tcp_segment(
+                                let fin_segment = try_build_tcp_segment_admitted(
                                     local_ip,
                                     remote_ip,
                                     local_port,
@@ -5983,7 +7336,17 @@ impl SocketTable {
                                     advertised_wnd,
                                     &[],
                                 );
-                                fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
+                                if let Ok(fin_segment) = fin_segment {
+                                    tcp_state.control.snd_nxt =
+                                        tcp_state.control.snd_nxt.wrapping_add(1);
+                                    tcp_state.control.fin_sent = true;
+                                    tcp_state.control.fin_sent_time = self.time_wait_now();
+                                    tcp_state.control.fin_retries = 0;
+                                    tcp_state.control.state = TcpState::LastAck;
+                                    fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
+                                } else {
+                                    keep_registered = false;
+                                }
                             }
                         }
                         TcpState::FinWait1
@@ -6073,43 +7436,18 @@ impl SocketTable {
             // DEADLOCK FIX (Codex review): Collect children first while holding
             // listen lock, then release it before calling cleanup_tcp_connection,
             // which may acquire sockets.write() lock internally.
-            let mut children_to_cleanup: Vec<Arc<SocketState>> = Vec::new();
             // J2-2: count the half-open SYNs drained below; the per-namespace
             // half-open uncharge is deferred to the proven dec_ns_count safe
             // context (all drained SYNs share this listener's namespace).
             let mut drained_syn_count: u64 = 0;
-            if sock.is_listening() {
-                let mut listen_guard = sock.listen.lock();
-                if let Some(mut listen_state) = listen_guard.take() {
-                    // Collect half-open SYN queue children
-                    let syn_keys: Vec<TcpLookupKey> =
-                        listen_state.syn_queue.keys().cloned().collect();
-                    for key in syn_keys {
-                        if let Some(pending) = listen_state.syn_queue.remove(&key) {
-                            pending.sock.mark_closed();
-                            children_to_cleanup.push(pending.sock);
-
-                            // R74-5 FIX: Decrement half-open counter when cleaning up SYN queue
-                            dec_half_open();
-                            // J2-2: account the per-namespace half-open drain (deferred).
-                            drained_syn_count += 1;
-                        }
-                    }
-                    // Collect established-but-not-accepted queue children.
-                    // R121-3 FIX (Codex review): Do NOT decrement the active connection
-                    // counter here. These children will be processed by
-                    // cleanup_tcp_connection() below, which decrements iff
-                    // counted_in_active is true. Decrementing here as well would
-                    // cause a double-decrement for accept-queue sockets.
-                    while let Some(child) = listen_state.accept_queue.pop_front() {
-                        child.mark_closed();
-                        children_to_cleanup.push(child);
-                    }
-                    // Wake any blocked accept() to return ECONNABORTED
-                    listen_state.accept_waiters.close();
-                    listen_state.accept_waiters.wake_all();
-                }
-                // listen_guard is dropped here, releasing the listen lock
+            let mut detached_listen = if sock.is_listening() {
+                sock.listen.lock().take()
+            } else {
+                None
+            };
+            if let Some(listen_state) = detached_listen.as_ref() {
+                listen_state.accept_waiters.close();
+                listen_state.accept_waiters.wake_all();
             }
 
             let meta = sock.meta_snapshot();
@@ -6156,18 +7494,9 @@ impl SocketTable {
                         Ipv4Addr(rip),
                         rport,
                     );
-                    if self.tcp_conns.lock().remove(&key).is_some() {
-                        // J2-1: uncharge the per-namespace connection (bound to
-                        // tcp_conns membership, independent of counted_in_active).
-                        self.dec_ns_conn(key.0);
-                        // R121-3 FIX (Codex review): Only decrement if this socket
-                        // was counted via try_inc_active_conn() in queue_accept().
-                        // Client-initiated connections (sys_connect) are never
-                        // counted, so decrementing them would drift the counter low.
-                        if sock.counted_in_active.load(Ordering::Acquire) {
-                            dec_active_conn();
-                        }
-                    }
+                    // RF180-36 FIX: a delayed close must not remove or uncharge a
+                    // same-tuple replacement published after this socket detached.
+                    self.remove_tcp_conn_exact_owner(key, &sock);
                 }
             }
 
@@ -6175,12 +7504,34 @@ impl SocketTable {
             sock.mark_closed();
             self.closed_count.fetch_add(1, Ordering::Relaxed);
 
-            // R52-2 FIX: Cleanup children AFTER releasing all locks above
-            // This prevents deadlock with cleanup_tcp_connection() which may
-            // acquire sockets.write() lock.
-            for child in children_to_cleanup {
-                self.cleanup_tcp_connection(&child);
+            // R180-11 FIX: detached listen state permits allocation-free,
+            // one-at-a-time child teardown with no listen lock held.
+            if let Some(mut listen_state) = detached_listen.take() {
+                loop {
+                    let key = listen_state.syn_queue.keys().next().copied();
+                    let Some(key) = key else { break };
+                    if let Some(pending) = listen_state.syn_queue.remove(&key) {
+                        pending.sock.mark_closed();
+                        dec_half_open();
+                        drained_syn_count = drained_syn_count.saturating_add(1);
+                        self.cleanup_tcp_connection(&pending.sock);
+                    }
+                }
+                while let Some(child) = listen_state.accept_queue.pop_front() {
+                    child.mark_closed();
+                    self.cleanup_tcp_connection(&child);
+                }
             }
+
+            // RF180-26 FIX: a close racing the last commit of bind/connect/
+            // listen must not leave metadata or a TCB reachable through an Arc
+            // retained by the losing syscall thread. Registry removals above are
+            // pointer-gated; this final object-local scrub is allocation-free.
+            if sock.proto == SocketProtocol::Tcp {
+                self.cleanup_tcp_connection(&sock);
+            }
+            *sock.meta.lock() = SocketMeta::new();
+            sock.clear_listen_state();
 
             // R76-3 FIX: Decrement per-namespace socket count AFTER releasing sockets lock
             // to avoid deadlock (Codex review fix: lock ordering with per_ns_counts)
@@ -6197,7 +7548,7 @@ impl SocketTable {
     }
 
     /// Get a socket by ID.
-    pub fn get(&self, socket_id: u64) -> Option<Arc<SocketState>> {
+    pub fn get(&self, socket_id: u64) -> Option<SocketArc> {
         self.sockets.read().get(&socket_id).cloned()
     }
 
@@ -6406,7 +7757,7 @@ impl SocketTable {
         local_port: u16,
         remote_ip: Ipv4Addr,
         remote_port: u16,
-    ) -> Option<Arc<SocketState>> {
+    ) -> Option<SocketArc> {
         let key = tcp_map_key_from_parts(net_ns_id, local_ip, local_port, remote_ip, remote_port);
         let mut conns = self.tcp_conns.lock();
         match conns.get(&key).and_then(|w| w.upgrade()) {
@@ -6420,6 +7771,60 @@ impl SocketTable {
                 None
             }
         }
+    }
+
+    fn bind_tcp_reply(&self, sock: &SocketArc, operation_token: u64) -> TcpReplyBinding {
+        TcpReplyBinding {
+            sock: sock.clone(),
+            socket_id: sock.id,
+            socket_generation: sock.owner_generation,
+            operation_token,
+        }
+    }
+
+    pub(crate) fn lock_tcp_reply_operation<'a>(
+        &'a self,
+        binding: &'a TcpReplyBinding,
+        response: &TcpHeader,
+    ) -> Option<TcpReplyOperation<'a>> {
+        let guard = self.lock_socket_operation(&binding.sock);
+        let operation = TcpReplyOperation {
+            guard,
+            token: binding.operation_token,
+        };
+        let sock = operation.guard.sock;
+        if sock.id != binding.socket_id
+            || sock.owner_generation != binding.socket_generation
+            || sock.close_pending.load(Ordering::Acquire)
+            || sock.is_closed()
+            || !operation.exact_registry_owner()
+        {
+            return None;
+        }
+
+        let tcp_guard = sock.tcp.lock();
+        let tcp_state = tcp_guard.as_ref()?;
+        if tcp_state.control.pending_reply_token != Some(binding.operation_token) {
+            return None;
+        }
+        let exact_packet = if tcp_state.control.active_open_pending {
+            tcp_state.control.state == TcpState::Closed
+                && response.flags == TCP_FLAG_SYN
+                && response.seq_num == tcp_state.control.iss
+                && response.ack_num == 0
+        } else if let Some(pending) = tcp_state.control.pending_handshake {
+            tcp_state.control.state == TcpState::SynSent
+                && response.flags == pending.response_flags
+                && response.seq_num == pending.response_seq
+                && response.ack_num == pending.response_ack
+        } else {
+            tcp_state.control.state == TcpState::SynReceived
+                && response.flags & (TCP_FLAG_SYN | TCP_FLAG_ACK) == (TCP_FLAG_SYN | TCP_FLAG_ACK)
+                && response.seq_num == tcp_state.control.iss
+                && response.ack_num == tcp_state.control.rcv_nxt
+        };
+        drop(tcp_guard);
+        exact_packet.then_some(operation)
     }
 
     /// P0-2 FIX: Attempt to reclaim one TCP connection slot by evicting the
@@ -6443,51 +7848,43 @@ impl SocketTable {
     /// after cleanup/eviction (i.e. the caller may proceed to create a
     /// connection).
     fn try_evict_time_wait_for_cookie(&self, now_ms: u64) -> bool {
-        // Phase 1: collect live socket Arcs while holding tcp_conns briefly.
-        let candidates: Vec<Arc<SocketState>> = {
+        // R180-11 FIX: scan under the registry leaf with try-lock-only TCB
+        // probes and retain just one Arc. This avoids a cleanup-time Vec
+        // allocation without introducing a blocking conns -> tcp edge.
+        let victim: Option<SocketArc> = {
             let mut conns = self.tcp_conns.lock();
             self.conns_retain_accounted(&mut conns);
             if conns.len() < TCP_MAX_ACTIVE_CONNECTIONS {
                 return true; // stale-Weak pruning alone freed capacity
             }
-            conns.values().filter_map(|w| w.upgrade()).collect()
+            let mut oldest_start = u64::MAX;
+            let mut victim = None;
+            for weak in conns.values() {
+                let Some(sock) = weak.upgrade() else { continue };
+                if !sock.is_closed() {
+                    continue;
+                }
+                let Some(guard) = sock.tcp.try_lock() else {
+                    continue;
+                };
+                let Some(tcp_state) = guard.as_ref() else {
+                    continue;
+                };
+                if tcp_state.control.state != TcpState::TimeWait {
+                    continue;
+                }
+                let start = if tcp_state.control.time_wait_start == 0 {
+                    now_ms
+                } else {
+                    tcp_state.control.time_wait_start
+                };
+                if start < oldest_start {
+                    oldest_start = start;
+                    victim = Some(sock.clone());
+                }
+            }
+            victim
         };
-
-        // Phase 2: scan for the oldest closed TIME_WAIT socket.
-        // Only consider sockets that are both in TIME_WAIT state AND already
-        // marked closed (user-space FD released).  try_lock avoids deadlock
-        // if another core is mid-operation on a socket.
-        let mut oldest_start: u64 = u64::MAX;
-        let mut victim: Option<Arc<SocketState>> = None;
-
-        for sock in &candidates {
-            if !sock.is_closed() {
-                continue; // still has user-space reference
-            }
-            let guard = match sock.tcp.try_lock() {
-                Some(g) => g,
-                None => continue,
-            };
-            let tcp_state = match guard.as_ref() {
-                Some(s) => s,
-                None => continue,
-            };
-            if tcp_state.control.state != TcpState::TimeWait {
-                continue;
-            }
-            // time_wait_start == 0 means just entered — treat as "now".
-            let start = if tcp_state.control.time_wait_start == 0 {
-                now_ms
-            } else {
-                tcp_state.control.time_wait_start
-            };
-            if start < oldest_start {
-                oldest_start = start;
-                victim = Some(sock.clone());
-            }
-        }
-        // Drop candidate list before cleanup (releases Arc refs).
-        drop(candidates);
 
         let victim = match victim {
             Some(v) => v,
@@ -6538,7 +7935,7 @@ impl SocketTable {
     ///
     /// # Returns
     /// TCP segment to transmit (ACK or RST) if a response is required.
-    pub fn process_tcp_segment(
+    pub(crate) fn process_tcp_segment(
         &self,
         net_ns_id: NamespaceId,
         src_ip: Ipv4Addr,
@@ -6546,7 +7943,11 @@ impl SocketTable {
         header: &TcpHeader,
         payload: &[u8],
         options: &TcpOptions,
-    ) -> Option<Vec<u8>> {
+        reply_binding: &mut Option<TcpReplyBinding>,
+        ingress_handshake_committed: &mut bool,
+    ) -> Option<WirePacket> {
+        *reply_binding = None;
+        *ingress_handshake_committed = false;
         // R160-9 FIX: Reject invalid TCP flag combinations per RFC 793 §3.4.
         // SYN+RST is always invalid (connection-setup contradicts abort).
         // SYN+FIN is suspicious and rejected by modern stacks. These malformed
@@ -6722,7 +8123,23 @@ impl SocketTable {
 
                                 // Handle retransmitted SYN: resend cached SYN-ACK
                                 if let Some(existing) = listen_state.get_syn(&syn_key) {
-                                    return Some(existing.syn_ack.clone());
+                                    let retry =
+                                        Self::try_clone_wire_segment(existing.syn_ack.as_slice())?;
+                                    let token =
+                                        next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN).ok()?;
+                                    {
+                                        let mut child_tcp = existing.sock.tcp.lock();
+                                        let child_state = child_tcp.as_mut()?;
+                                        if child_state.control.state != TcpState::SynReceived
+                                            || child_state.control.passive_egress_confirmed
+                                        {
+                                            return None;
+                                        }
+                                        child_state.control.pending_reply_token = Some(token);
+                                    }
+                                    *reply_binding =
+                                        Some(self.bind_tcp_reply(&existing.sock, token));
+                                    return Some(retry);
                                 }
 
                                 // Get current timestamp for SYN cookie timing
@@ -6766,7 +8183,6 @@ impl SocketTable {
                                     }
 
                                     // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
-                                    SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                                     let cookie_iss = generate_syn_cookie_isn(
                                         now_ms,
                                         dst_ip,
@@ -6779,7 +8195,10 @@ impl SocketTable {
                                     // Build SYN-ACK with cookie ISN and MSS option
                                     // Note: Window scaling is NOT preserved in SYN cookies
                                     let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
-                                    let syn_ack = build_tcp_segment_with_options(
+                                    if self.passive_syn_ack_build_faulted() {
+                                        return None;
+                                    }
+                                    let syn_ack = match try_build_tcp_segment_with_options(
                                         dst_ip,
                                         src_ip,
                                         header.dst_port,
@@ -6790,77 +8209,34 @@ impl SocketTable {
                                         TCP_DEFAULT_WINDOW, // Unscaled window
                                         &syn_ack_options,
                                         &[],
-                                    );
+                                    ) {
+                                        Ok(segment) => segment,
+                                        Err(_) => return None,
+                                    };
+                                    // RF180-7 FIX: count only a cookie whose complete
+                                    // option-bearing SYN-ACK was actually prepared.
+                                    SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
 
-                                    // No state allocated - SYN cookie is stateless
-                                    // R107-3 FIX: Seed synthetic conntrack state so the
-                                    // returning ACK is not classified as invalid mid-stream.
-                                    // Step 1: Register the incoming SYN (creates SynSent entry)
-                                    // Step 2: Register the outgoing SYN-ACK (advances to SynRecv)
-                                    #[cfg(feature = "conntrack")]
-                                    {
-                                        use crate::conntrack::ct_process_tcp;
-                                        let _ = ct_process_tcp(
-                                            listener.net_ns_id.0,
-                                            src_ip,
-                                            dst_ip,
-                                            header.src_port,
-                                            header.dst_port,
-                                            header.flags,
-                                            payload.len(),
-                                            now_ms,
-                                        );
-                                        let _ = ct_process_tcp(
-                                            listener.net_ns_id.0,
-                                            dst_ip,
-                                            src_ip,
-                                            header.dst_port,
-                                            header.src_port,
-                                            TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                            0,
-                                            now_ms,
-                                        );
-                                    }
+                                    // RF180-41 REVIEW FIX: ingress already created
+                                    // the SYN flow. The returned SYN-ACK advances it
+                                    // only in transmit_prepared_reply after queueing.
                                     return Some(syn_ack);
                                 }
 
-                                // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
-                                // Without this check, TCP listeners could create unlimited child sockets
-                                // bypassing the MAX_SOCKETS_PER_NS quota, leading to DoS via connection
-                                // floods and potential count underflow when sockets are later closed.
-                                if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
-                                    // Quota exceeded: silently drop SYN like backlog-full scenario.
-                                    // This prevents attackers from exhausting socket resources via
-                                    // connection floods while appearing as normal packet loss.
-                                    return None;
-                                }
-
-                                // Create child socket inheriting listener properties
-                                // R75-1 FIX: Child socket inherits parent listener's network namespace
-                                // R107-5 FIX: Overflow-safe socket ID allocation
-                                let child_id = match self.next_socket_id.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |current| current.checked_add(1),
-                                ) {
-                                    Ok(prev) => prev,
-                                    Err(_) => {
-                                        self.dec_ns_count(listener.net_ns_id); // Rollback quota
-                                        return None; // ID space exhausted, drop like backlog-full
-                                    }
-                                };
-                                let child = Arc::new(SocketState::new(
-                                    child_id,
+                                // R180-11 FIX: build the complete child privately with ID 0.
+                                // The real ID and every registry/counter publication are committed
+                                // together below, after all fallible Arc/TCB/cache allocations.
+                                let child = match SocketState::try_new_arc(
+                                    0,
                                     listener.domain,
                                     listener.ty,
                                     listener.proto,
                                     listener.label,
                                     listener.net_ns_id,
-                                ));
-
-                                // Register in socket table
-                                self.sockets.write().insert(child_id, child.clone());
-                                self.created.fetch_add(1, Ordering::Relaxed);
+                                ) {
+                                    Ok(child) => child,
+                                    Err(_) => return None,
+                                };
 
                                 // Set local and remote addresses
                                 child.bind_local(dst_ip, header.dst_port);
@@ -6902,7 +8278,9 @@ impl SocketTable {
                                 }
                                 tcb.sack_requested = true;
 
-                                child.attach_tcp(tcb);
+                                if child.attach_tcp(tcb).is_err() {
+                                    return None;
+                                }
 
                                 // R58: Calculate window for SYN-ACK (unscaled per RFC 7323)
                                 // RFC 7323 Section 2.2: The window field in SYN and SYN-ACK
@@ -6919,6 +8297,9 @@ impl SocketTable {
 
                                 // Build SYN-ACK segment with MSS, SACK-Permitted, and optional WSopt
                                 // RFC 793: SYN consumes 1 sequence number
+                                if self.passive_syn_ack_build_faulted() {
+                                    return None;
+                                }
                                 let syn_ack = if options.window_scale.is_some() {
                                     // Include MSS, WSopt, and SACK-Permitted in response
                                     let our_scale = {
@@ -6930,7 +8311,7 @@ impl SocketTable {
                                         TcpOptionKind::WindowScale(our_scale),
                                         TcpOptionKind::SackPermitted,
                                     ];
-                                    build_tcp_segment_with_options(
+                                    try_build_tcp_segment_with_options(
                                         dst_ip,
                                         src_ip,
                                         header.dst_port,
@@ -6948,7 +8329,7 @@ impl SocketTable {
                                         TcpOptionKind::Mss(cookie_mss),
                                         TcpOptionKind::SackPermitted,
                                     ];
-                                    build_tcp_segment_with_options(
+                                    try_build_tcp_segment_with_options(
                                         dst_ip,
                                         src_ip,
                                         header.dst_port,
@@ -6961,6 +8342,15 @@ impl SocketTable {
                                         &[],
                                     )
                                 };
+                                // RF180-7 FIX: a passive child must not become
+                                // observable unless its initial and cached SYN-ACK
+                                // are both complete. In particular, option
+                                // serialization OOM cannot publish a TCB that claims
+                                // window-scale/SACK state absent from the wire.
+                                let syn_ack = match syn_ack {
+                                    Ok(segment) => segment,
+                                    Err(_) => return None,
+                                };
 
                                 // Register connection for demux.
                                 // J2-1: charge the per-namespace connection budget bound
@@ -6968,89 +8358,50 @@ impl SocketTable {
                                 // its connection cap, skip the insert + SYN queue and fall
                                 // back to stateless SYN cookies (handled below), exactly
                                 // like the global half-open / queue_syn failure path.
-                                let ns_conn_charged = {
-                                    let mut conns = self.tcp_conns.lock();
-                                    if self.try_inc_ns_conn(syn_key.0).is_ok() {
-                                        // Bind the charge to a genuine membership growth: the
-                                        // dup-check for this path ran under an earlier, separate
-                                        // tcp_conns lock (TOCTOU), so if the key raced in, insert
-                                        // would REPLACE without growing the map — undo the extra
-                                        // charge to keep count == live tcp_conns key count.
-                                        if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
-                                            self.dec_ns_conn(syn_key.0);
-                                        }
-                                        true
-                                    } else {
-                                        false
-                                    }
+                                let cached_syn_ack = match WirePacket::try_copy_from_slice(&syn_ack)
+                                {
+                                    Ok(cached) => cached,
+                                    Err(_) => return None,
                                 };
 
-                                // Queue half-open connection in SYN queue (only if it was
-                                // charged + registered above).
-                                if ns_conn_charged {
-                                    let pending = PendingSyn {
-                                        key: syn_key,
-                                        sock: child.clone(),
-                                        syn_ack: syn_ack.clone(),
-                                        syn_sent_at: now_ms,
+                                let token = match next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN) {
+                                    Ok(token) => token,
+                                    Err(_) => return None,
+                                };
+                                {
+                                    let mut child_tcp = child.tcp.lock();
+                                    let Some(child_state) = child_tcp.as_mut() else {
+                                        return None;
                                     };
+                                    child_state.control.pending_reply_token = Some(token);
+                                }
+                                let binding_owner = child.clone();
+                                let published = self.try_publish_pending_syn_child(
+                                    listen_state,
+                                    syn_key,
+                                    child,
+                                    cached_syn_ack,
+                                    now_ms,
+                                );
 
-                                    // SYN cookie path handles the backlog-full case above,
-                                    // but queue_syn can still fail due to the global/per-ns
-                                    // half-open limit.
-                                    if listen_state.queue_syn(pending, self) {
-                                        // R155-9 FIX: Seed conntrack for the inbound SYN +
-                                        // outbound SYN-ACK so the final ACK transitions to
-                                        // Established. Same pattern as the SYN cookie path.
-                                        #[cfg(feature = "conntrack")]
-                                        {
-                                            use crate::conntrack::ct_process_tcp;
-                                            let _ = ct_process_tcp(
-                                                listener.net_ns_id.0,
-                                                src_ip,
-                                                dst_ip,
-                                                header.src_port,
-                                                header.dst_port,
-                                                header.flags,
-                                                payload.len(),
-                                                now_ms,
-                                            );
-                                            let _ = ct_process_tcp(
-                                                listener.net_ns_id.0,
-                                                dst_ip,
-                                                src_ip,
-                                                header.dst_port,
-                                                header.src_port,
-                                                TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                                0,
-                                                now_ms,
-                                            );
-                                        }
-                                        return Some(syn_ack);
-                                    }
-
-                                    // R106-2 FIX: queue_syn failed. J2-1: uncharge the
-                                    // per-namespace connection charged above and remove the
-                                    // tcp_conns entry before falling back to SYN cookies.
-                                    if self.tcp_conns.lock().remove(&syn_key).is_some() {
-                                        self.dec_ns_conn(syn_key.0);
-                                    }
+                                if published {
+                                    self.created.fetch_add(1, Ordering::Relaxed);
+                                    // RF180-41 REVIEW FIX: child publication records
+                                    // the accepted ingress SYN, not an unsent SYN-ACK.
+                                    // Conntrack transition is deferred to device queue.
+                                    *reply_binding =
+                                        Some(self.bind_tcp_reply(&binding_owner, token));
+                                    return Some(syn_ack);
                                 }
 
-                                // Clean up the child socket + fall back to SYN cookies.
-                                // Reached when queue_syn failed OR the per-namespace
-                                // connection budget was exceeded (ns_conn_charged == false,
-                                // in which case the child was never inserted into tcp_conns).
-                                self.sockets.write().remove(&child_id);
-                                // R77-4 FIX: Rollback quota on failure path
-                                self.dec_ns_count(listener.net_ns_id);
+                                // Publication/admission failed without leaving a live ID,
+                                // counter, or registry entry. Fall back statelessly.
 
                                 // Fall back to stateless SYN cookie SYN-ACK
                                 // R137-2 FIX: Rate limit fallback SYN-cookie path as well.
                                 if !allow_syn_cookie_ack(now_ms) {
                                     return None;
                                 }
-                                SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                                 let cookie_iss = generate_syn_cookie_isn(
                                     now_ms,
                                     dst_ip,
@@ -7060,7 +8411,10 @@ impl SocketTable {
                                     mss_index,
                                 );
                                 let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
-                                let cookie_syn_ack = build_tcp_segment_with_options(
+                                if self.passive_syn_ack_build_faulted() {
+                                    return None;
+                                }
+                                let cookie_syn_ack = match try_build_tcp_segment_with_options(
                                     dst_ip,
                                     src_ip,
                                     header.dst_port,
@@ -7071,33 +8425,14 @@ impl SocketTable {
                                     TCP_DEFAULT_WINDOW,
                                     &syn_ack_options,
                                     &[],
-                                );
-                                // R107-3 FIX: Seed synthetic conntrack state for this
-                                // SYN-cookie handshake (SYN-ACK retry path).
-                                #[cfg(feature = "conntrack")]
-                                {
-                                    use crate::conntrack::ct_process_tcp;
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        src_ip,
-                                        dst_ip,
-                                        header.src_port,
-                                        header.dst_port,
-                                        header.flags,
-                                        payload.len(),
-                                        now_ms,
-                                    );
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        dst_ip,
-                                        src_ip,
-                                        header.dst_port,
-                                        header.src_port,
-                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                        0,
-                                        now_ms,
-                                    );
-                                }
+                                ) {
+                                    Ok(segment) => segment,
+                                    Err(_) => return None,
+                                };
+                                // R132-5 FIX: count only successfully built cookie replies.
+                                SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed);
+                                // RF180-41 REVIEW FIX: the fallback cookie remains
+                                // stateless until its admitted reply is queued.
                                 return Some(cookie_syn_ack);
                             }
                         }
@@ -7183,8 +8518,8 @@ impl SocketTable {
 
                                 // Check accept queue capacity
                                 {
-                                    let listen_guard = listener.listen.lock();
-                                    if let Some(listen_state) = listen_guard.as_ref() {
+                                    let mut listen_guard = listener.listen.lock();
+                                    if let Some(listen_state) = listen_guard.as_mut() {
                                         if listen_state.accept_queue.len()
                                             >= listen_state.accept_backlog
                                         {
@@ -7192,43 +8527,30 @@ impl SocketTable {
                                             return self
                                                 .build_tcp_rst(dst_ip, src_ip, header, payload);
                                         }
+                                        if listen_state.accept_queue.ensure_capacity_for(1).is_err()
+                                        {
+                                            return self
+                                                .build_tcp_rst(dst_ip, src_ip, header, payload);
+                                        }
                                     }
                                 }
 
-                                // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
-                                // This is the SYN cookie completion path - without this check, validated
-                                // cookies could create unlimited sockets bypassing namespace quotas.
-                                if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
-                                    // Quota exceeded: behave like accept queue full and send RST
-                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                                }
-
-                                // Create child socket for the connection
-                                // R75-1 FIX: Child socket inherits parent listener's network namespace
-                                // R107-5 FIX: Overflow-safe socket ID allocation
-                                let child_id = match self.next_socket_id.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |current| current.checked_add(1),
-                                ) {
-                                    Ok(prev) => prev,
-                                    Err(_) => {
-                                        self.dec_ns_count(listener.net_ns_id); // Rollback quota
-                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                                        // ID exhausted
-                                    }
-                                };
-                                let child = Arc::new(SocketState::new(
-                                    child_id,
+                                // R180-11 FIX: as in the stateful SYN path, construct a
+                                // private ID-0 child. The transaction helper assigns the real
+                                // ID only after all TCB/waiter/map backing is prepared.
+                                let child = match SocketState::try_new_arc(
+                                    0,
                                     listener.domain,
                                     listener.ty,
                                     listener.proto,
                                     listener.label,
                                     listener.net_ns_id,
-                                ));
-
-                                self.sockets.write().insert(child_id, child.clone());
-                                self.created.fetch_add(1, Ordering::Relaxed);
+                                ) {
+                                    Ok(child) => child,
+                                    Err(_) => {
+                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload)
+                                    }
+                                };
 
                                 child.bind_local(dst_ip, header.dst_port);
                                 child.set_remote(src_ip, header.src_port);
@@ -7278,47 +8600,14 @@ impl SocketTable {
                                 // Process the ACK to update snd_una
                                 handle_ack(&mut tcb, header.ack_num, now_ms);
 
-                                child.attach_tcp(tcb);
-
-                                // Register connection.
-                                // J2-1: charge the per-namespace connection budget bound
-                                // to this insertion. On over-quota, tear down the child
-                                // (cleanup_tcp_connection removes it from the sockets map +
-                                // dec_ns_count) and send RST — mirrors accept-queue-full.
-                                // The conns guard is dropped before cleanup_tcp_connection,
-                                // which re-locks tcp_conns (non-reentrant).
-                                {
-                                    let mut conns = self.tcp_conns.lock();
-                                    if self.try_inc_ns_conn(syn_key.0).is_err() {
-                                        drop(conns);
-                                        child.mark_closed();
-                                        self.cleanup_tcp_connection(&child);
-                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                                    }
-                                    // Bind the charge to a genuine membership growth (TOCTOU:
-                                    // the dup-check ran under an earlier, separate tcp_conns
-                                    // lock; a raced-in key would make insert REPLACE).
-                                    if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
-                                        self.dec_ns_conn(syn_key.0);
-                                    }
-                                }
-
-                                // Add to accept queue
-                                if !listener.push_accept_ready(child.clone()) {
-                                    // Accept queue became full between check and push
-                                    child.mark_closed();
-                                    // R129-2 FIX: cleanup_tcp_connection now handles dec_ns_count
-                                    // when removing from sockets map. The explicit dec_ns_count
-                                    // (R77-4) that was here is no longer needed and would cause
-                                    // a double-decrement.
-                                    self.cleanup_tcp_connection(&child);
+                                if child.attach_tcp(tcb).is_err() {
                                     return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                                 }
 
-                                // Wake waiting accept()
-                                child.wake_tcp_waiters();
-
-                                // No response needed - connection is established
+                                if !self.try_publish_cookie_child(&listener, syn_key, child) {
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                }
+                                self.created.fetch_add(1, Ordering::Relaxed);
                                 return None;
                             } else {
                                 SYN_COOKIES_REJECTED.fetch_add(1, Ordering::Relaxed);
@@ -7357,33 +8646,36 @@ impl SocketTable {
                         // Both endpoints independently sent SYN to each other.
                         // Accept the remote's SYN, transition to SYN-RECEIVED,
                         // and respond with SYN+ACK (our original ISS + ACK their SYN).
-                        tcp_state.control.irs = header.seq_num;
-                        tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(1);
-
-                        // Process peer's TCP options (MSS, window scale, SACK)
-                        if tcp_state.control.wscale_requested {
-                            if let Some(peer_scale) = options.window_scale {
-                                tcp_state.control.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
-                                tcp_state.control.wscale_received = true;
-                            }
-                        }
-                        if tcp_state.control.sack_requested && options.sack_permitted {
-                            tcp_state.control.sack_received = true;
-                        }
+                        // RF180-7 FIX: stage every peer-derived TCB field privately.
+                        // The option-bearing SYN-ACK allocation is still fallible;
+                        // no handshake state may become durable until that packet is
+                        // complete, otherwise a later normal SYN-ACK can inherit stale
+                        // SACK/window-scale/MSS negotiation from a reply never sent.
+                        let peer_irs = header.seq_num;
+                        let peer_rcv_nxt = header.seq_num.wrapping_add(1);
+                        let peer_snd_wscale = tcp_state
+                            .control
+                            .wscale_requested
+                            .then(|| {
+                                options
+                                    .window_scale
+                                    .map(|scale| scale.min(TCP_MAX_WINDOW_SCALE))
+                            })
+                            .flatten();
+                        let peer_sack_received =
+                            tcp_state.control.sack_requested && options.sack_permitted;
                         // R150-2 FIX: Process peer MSS from bare SYN (simultaneous open).
                         // Without this, snd_mss stays at TCP_DEFAULT_MSS (536) →
                         // initial_cwnd = 536 × 10 = 5360 instead of 1460 × 10 = 14600.
-                        if let Some(mss) = options.mss {
-                            let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
-                            tcp_state.control.snd_mss = clamped;
-                            tcp_state.control.cwnd = initial_cwnd(tcp_state.control.snd_mss);
-                        }
-
-                        // Initialize send window (unscaled per RFC 7323 §2.2)
-                        tcp_state.control.snd_wnd = decode_window(header.window, 0);
-                        tcp_state.control.snd_wl1 = header.seq_num;
-
-                        tcp_state.control.state = TcpState::SynReceived;
+                        let (peer_snd_mss, peer_cwnd) = match options.mss {
+                            Some(mss) => {
+                                let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
+                                (clamped, initial_cwnd(clamped))
+                            }
+                            None => (tcp_state.control.snd_mss, tcp_state.control.cwnd),
+                        };
+                        // SYN/SYN-ACK windows are unscaled per RFC 7323 §2.2.
+                        let peer_snd_wnd = decode_window(header.window, 0);
 
                         // Build SYN+ACK: retransmit our SYN (snd_una = ISS) + ACK their SYN
                         // R163-10 FIX: Replace infallible alloc::vec![...] + push() opts
@@ -7398,14 +8690,17 @@ impl SocketTable {
                             .control
                             .sack_requested
                             .then(|| TcpOptionKind::SackPermitted);
+                        if self.simultaneous_syn_ack_build_faulted() {
+                            return None;
+                        }
                         let syn_ack = match (wscale_opt, sack_opt) {
-                            (Some(ws), Some(_sack)) => build_tcp_segment_with_options(
+                            (Some(ws), Some(_sack)) => try_build_tcp_segment_with_options(
                                 dst_ip,
                                 src_ip,
                                 header.dst_port,
                                 header.src_port,
                                 tcp_state.control.snd_una,
-                                tcp_state.control.rcv_nxt,
+                                peer_rcv_nxt,
                                 TCP_FLAG_SYN | TCP_FLAG_ACK,
                                 TCP_DEFAULT_WINDOW,
                                 &[
@@ -7415,25 +8710,25 @@ impl SocketTable {
                                 ],
                                 &[],
                             ),
-                            (Some(ws), None) => build_tcp_segment_with_options(
+                            (Some(ws), None) => try_build_tcp_segment_with_options(
                                 dst_ip,
                                 src_ip,
                                 header.dst_port,
                                 header.src_port,
                                 tcp_state.control.snd_una,
-                                tcp_state.control.rcv_nxt,
+                                peer_rcv_nxt,
                                 TCP_FLAG_SYN | TCP_FLAG_ACK,
                                 TCP_DEFAULT_WINDOW,
                                 &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), ws],
                                 &[],
                             ),
-                            (None, Some(_sack)) => build_tcp_segment_with_options(
+                            (None, Some(_sack)) => try_build_tcp_segment_with_options(
                                 dst_ip,
                                 src_ip,
                                 header.dst_port,
                                 header.src_port,
                                 tcp_state.control.snd_una,
-                                tcp_state.control.rcv_nxt,
+                                peer_rcv_nxt,
                                 TCP_FLAG_SYN | TCP_FLAG_ACK,
                                 TCP_DEFAULT_WINDOW,
                                 &[
@@ -7442,20 +8737,56 @@ impl SocketTable {
                                 ],
                                 &[],
                             ),
-                            (None, None) => build_tcp_segment_with_options(
+                            (None, None) => try_build_tcp_segment_with_options(
                                 dst_ip,
                                 src_ip,
                                 header.dst_port,
                                 header.src_port,
                                 tcp_state.control.snd_una,
-                                tcp_state.control.rcv_nxt,
+                                peer_rcv_nxt,
                                 TCP_FLAG_SYN | TCP_FLAG_ACK,
                                 TCP_DEFAULT_WINDOW,
                                 &[TcpOptionKind::Mss(TCP_ETHERNET_MSS)],
                                 &[],
                             ),
                         };
+                        // RF180-7 FIX: keep the complete active-open TCB unchanged
+                        // if the simultaneous-open SYN-ACK cannot be prepared.
+                        let syn_ack = match syn_ack {
+                            Ok(segment) => segment,
+                            Err(_) => return None,
+                        };
+                        let token = match next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN) {
+                            Ok(token) => token,
+                            Err(_) => return None,
+                        };
+                        // RF180-41 REVIEW FIX: keep SYN-SENT externally visible
+                        // until this exact SYN-ACK reaches the device queue. A
+                        // policy/QueueFull failure leaves the peer's retransmitted
+                        // SYN able to replace this provisional snapshot.
+                        let control = &mut tcp_state.control;
+                        control.pending_reply_token = Some(token);
+                        control.pending_handshake = Some(PendingHandshakeCommit {
+                            response_flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
+                            response_seq: control.snd_una,
+                            response_ack: peer_rcv_nxt,
+                            target_state: TcpState::SynReceived,
+                            irs: peer_irs,
+                            rcv_nxt: peer_rcv_nxt,
+                            ack_to_apply: None,
+                            snd_wscale: peer_snd_wscale.unwrap_or(0),
+                            wscale_received: peer_snd_wscale.is_some(),
+                            sack_received: peer_sack_received,
+                            snd_mss: peer_snd_mss,
+                            cwnd: peer_cwnd,
+                            snd_wnd: peer_snd_wnd,
+                            snd_wl1: peer_irs,
+                            snd_wl2: None,
+                            rcv_wnd: control.rcv_wnd,
+                            wake_connect: false,
+                        });
 
+                        *reply_binding = Some(self.bind_tcp_reply(&sock, token));
                         drop(guard);
                         return Some(syn_ack);
                     }
@@ -7484,90 +8815,120 @@ impl SocketTable {
                     return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                 }
 
+                // RF180-41 REVIEW FIX: prepare the mandatory third-handshake ACK
+                // before mutating negotiation, ACK, or connection state. If
+                // aggregate admission is exhausted, leave the complete SYN-SENT
+                // transaction retryable for the peer's retransmitted SYN-ACK.
+                let peer_rcv_nxt = header.seq_num.wrapping_add(1);
+                let wscale_will_be_enabled =
+                    tcp_state.control.wscale_requested && options.window_scale.is_some();
+                let prospective_rcv_wnd = if wscale_will_be_enabled {
+                    tcp_state.control.rcv_wnd
+                } else {
+                    tcp_state.control.rcv_wnd.min(u16::MAX as u32)
+                };
+                let consumed = (tcp_state.control.recv_buffer.len() as u32)
+                    .saturating_add(tcp_state.control.ooo_bytes);
+                let available = prospective_rcv_wnd.saturating_sub(consumed);
+                let rcv_scale = if wscale_will_be_enabled {
+                    tcp_state.control.rcv_wscale
+                } else {
+                    0
+                };
+                let handshake_adv_wnd = encode_window(available, rcv_scale, true);
+                let ack_segment = match try_build_tcp_segment_admitted(
+                    dst_ip,
+                    src_ip,
+                    header.dst_port,
+                    header.src_port,
+                    tcp_state.control.snd_nxt,
+                    peer_rcv_nxt,
+                    TCP_FLAG_ACK,
+                    handshake_adv_wnd,
+                    &[],
+                ) {
+                    Ok(segment) => segment,
+                    Err(_) => return None,
+                };
+
+                let peer_snd_wscale = if tcp_state.control.wscale_requested {
+                    options
+                        .window_scale
+                        .map(|scale| scale.min(TCP_MAX_WINDOW_SCALE))
+                } else {
+                    None
+                };
+                let peer_sack_received = tcp_state.control.sack_requested && options.sack_permitted;
+                let (peer_snd_mss, peer_cwnd) = match options.mss {
+                    Some(mss) => {
+                        let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
+                        (clamped, initial_cwnd(clamped))
+                    }
+                    None => (tcp_state.control.snd_mss, tcp_state.control.cwnd),
+                };
+
                 // Accept the remote's ISN and transition to ESTABLISHED
-                tcp_state.control.irs = header.seq_num;
                 // R51-3 FIX: Ignore SYN-ACK payload (not buffered, breaks integrity)
                 // RFC 793: SYN consumes 1 sequence number only.
                 // TCP Fast Open (RFC 7413) would require explicit negotiation and
                 // buffering of early data before ACKing, which we don't support.
-                let syn_len = 1u32;
-                tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
-                // Update snd_una and refresh RTT estimates from ACK
-                self.handle_ack_reconciled(
-                    &sock,
-                    &mut tcp_state.control,
-                    header.ack_num,
-                    self.time_wait_now(),
-                );
+                let ack_observed_at = self.time_wait_now();
 
                 // R58: RFC 7323 Window Scaling - process WSopt from SYN-ACK
                 // Window scaling is ONLY negotiated if we sent WSopt in our SYN
                 // AND the peer includes WSopt in their SYN-ACK.
-                if tcp_state.control.wscale_requested {
-                    if let Some(peer_scale) = options.window_scale {
-                        // Clamp to maximum allowed scale factor
-                        tcp_state.control.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
-                        tcp_state.control.wscale_received = true;
-                    }
-                    // If peer didn't send WSopt, window scaling is disabled
-                    // (snd_wscale remains 0, wscale_received remains false)
-                }
+                // Negotiation is staged below and becomes visible at queue commit.
 
                 // RFC 2018: SACK negotiation — record peer's SACK capability.
                 // SACK is active only when both sides exchanged SACK-Permitted
                 // during the SYN/SYN-ACK handshake.
-                if tcp_state.control.sack_requested && options.sack_permitted {
-                    tcp_state.control.sack_received = true;
-                }
+                // SACK negotiation is likewise provisional until queue commit.
                 // R150-2 FIX: Process peer MSS from SYN-ACK. Without this,
                 // snd_mss stays at TCP_DEFAULT_MSS (536) for ALL connect()-initiated
                 // connections → initial_cwnd = 536 × 10 = 5360 bytes instead of
                 // 1460 × 10 = 14600 bytes, throttling throughput ~60% in slow-start.
-                if let Some(mss) = options.mss {
-                    let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
-                    tcp_state.control.snd_mss = clamped;
-                    tcp_state.control.cwnd = initial_cwnd(tcp_state.control.snd_mss);
-                }
+                // MSS/cwnd negotiation is staged in the pending snapshot.
 
                 // Initialize send window from SYN-ACK (window field is never scaled on SYNs)
                 // RFC 7323 Section 2.2: Scaling takes effect only after SYN exchange completes
-                tcp_state.control.snd_wnd = decode_window(
+                let peer_snd_wnd = decode_window(
                     header.window,
                     0, // RFC 7323: SYN/SYN-ACK window is unscaled
                 );
-                tcp_state.control.snd_wl1 = header.seq_num;
-                tcp_state.control.snd_wl2 = header.ack_num;
-                tcp_state.control.state = TcpState::Established;
+
+                let token = match next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN) {
+                    Ok(token) => token,
+                    Err(_) => return None,
+                };
 
                 // R58 FIX: RFC 793 semantics - if window scaling was not negotiated,
                 // cap receive window to 16 bits to avoid accepting more data than
                 // we can advertise without scaling. This ensures sequence/window
                 // checks remain consistent with advertised window.
-                if !tcp_state.control.wscale_enabled()
-                    && tcp_state.control.rcv_wnd > u16::MAX as u32
-                {
-                    tcp_state.control.rcv_wnd = u16::MAX as u32;
-                }
+                tcp_state.control.pending_reply_token = Some(token);
+                tcp_state.control.pending_handshake = Some(PendingHandshakeCommit {
+                    response_flags: TCP_FLAG_ACK,
+                    response_seq: tcp_state.control.snd_nxt,
+                    response_ack: peer_rcv_nxt,
+                    target_state: TcpState::Established,
+                    irs: header.seq_num,
+                    rcv_nxt: peer_rcv_nxt,
+                    ack_to_apply: Some((header.ack_num, ack_observed_at)),
+                    snd_wscale: peer_snd_wscale.unwrap_or(0),
+                    wscale_received: peer_snd_wscale.is_some(),
+                    sack_received: peer_sack_received,
+                    snd_mss: peer_snd_mss,
+                    cwnd: peer_cwnd,
+                    snd_wnd: peer_snd_wnd,
+                    snd_wl1: header.seq_num,
+                    snd_wl2: Some(header.ack_num),
+                    rcv_wnd: prospective_rcv_wnd,
+                    wake_connect: true,
+                });
 
-                // R58: Compute scaled window for final handshake ACK
-                let handshake_adv_wnd = Self::current_adv_window(&tcp_state.control);
-
-                // Build ACK segment to complete 3-way handshake
-                let ack_segment = build_tcp_segment(
-                    dst_ip,                    // src (our IP)
-                    src_ip,                    // dst (peer IP)
-                    header.dst_port,           // src port (our port)
-                    header.src_port,           // dst port (peer port)
-                    tcp_state.control.snd_nxt, // seq = our next seq
-                    tcp_state.control.rcv_nxt, // ack = their ISN + 1 + data
-                    TCP_FLAG_ACK,
-                    handshake_adv_wnd,
-                    &[],
-                );
-
-                // Wake any threads blocked in connect()
+                // Wake is deferred until transmit_prepared_reply commits.
+                *reply_binding = Some(self.bind_tcp_reply(&sock, token));
                 drop(guard);
-                sock.wake_tcp_waiters();
 
                 Some(ack_segment)
             }
@@ -7597,6 +8958,7 @@ impl SocketTable {
                 let seq_in_recv_window = segment_in_recv_window(
                     header.seq_num,
                     payload.len(),
+                    is_fin,
                     tcp_state.control.rcv_nxt,
                     tcp_state.control.rcv_wnd,
                 );
@@ -7618,9 +8980,6 @@ impl SocketTable {
                     return Some(win_ack);
                 }
 
-                // Track whether fast retransmit was triggered
-                let mut fast_retransmit_seg: Option<Vec<u8>> = None;
-
                 if ack_in_range {
                     // RFC 2018 / RFC 6675: Extract SACK blocks from incoming segment
                     // for sender scoreboard processing and loss-based retransmission.
@@ -7631,9 +8990,10 @@ impl SocketTable {
                     };
 
                     // Combined ACK processing + SACK scoreboard + congestion control.
-                    // apply_ack_and_cc returns (Some(segment), _) if fast retransmit was triggered,
-                    // and (_, true) if RFC 3042 Limited Transmit requests new data.
-                    let (retransmit_seg, limited_transmit) = self.apply_ack_and_cc(
+                    // TCB -> conntrack -> device is the one-way egress lock
+                    // order. Keeping this TCB guard across the bounded queue
+                    // call makes retransmission metadata publication atomic.
+                    let (_retransmit_queued, limited_transmit) = self.apply_ack_and_cc(
                         &mut tcp_state.control,
                         header.ack_num,
                         advertised_wnd,
@@ -7645,8 +9005,8 @@ impl SocketTable {
                         sack_blocks,
                         !payload.is_empty(),
                         header.window,
+                        |segment| transmit_tcp_segment(src_ip, segment, sock.net_ns_id.0).is_ok(),
                     );
-                    fast_retransmit_seg = retransmit_seg;
 
                     // J2-6: apply_ack_and_cc ran handle_ack internally (freeing acked
                     // send bytes); reconcile the per-namespace send counter here at
@@ -7693,7 +9053,7 @@ impl SocketTable {
                 // R155-15 FIX: Track whether OOO drain delivered a buffered FIN,
                 // so that state waiters are also woken (not just data waiters).
                 let mut ooo_fin_delivered = false;
-                let mut response: Option<Vec<u8>> = None;
+                let mut response: Option<WirePacket> = None;
                 // R144-1 FIX: Save rcv_nxt AFTER in-order data but BEFORE OOO drain.
                 //
                 // When a segment carries both data and FIN, rcv_nxt advances by
@@ -7761,19 +9121,17 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
-                        // R162-9 FIX: Fallible recv_buffer growth
+                        // R180-11 FIX: admitted detached growth, then
+                        // allocation-free publication into the live TCB.
                         if tcp_state
                             .control
                             .recv_buffer
-                            .try_reserve(payload.len())
+                            .try_extend_from_slice(payload)
                             .is_err()
                         {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             return None;
                         }
-                        tcp_state
-                            .control
-                            .recv_buffer
-                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
 
@@ -7920,16 +9278,27 @@ impl SocketTable {
                                 return Some(ack);
                             }
                         }
-                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
-                        let dup_ack = Self::build_sack_ack(
-                            &tcp_state.control,
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            ack_wnd,
-                        );
-                        return Some(dup_ack);
+                        // R180-L2 FIX: payload ending exactly at RCV.NXT is fully
+                        // duplicate, but a FIN at that position is new sequence
+                        // space.  Fall through to the state-specific FIN handler;
+                        // every other fully-duplicate segment remains a dup-ACK.
+                        if !duplicate_payload_has_new_fin(
+                            header.seq_num,
+                            payload.len(),
+                            is_fin,
+                            tcp_state.control.rcv_nxt,
+                        ) {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let dup_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(dup_ack);
+                        }
                     }
                 }
 
@@ -8024,28 +9393,7 @@ impl SocketTable {
                         sock.wake_tcp_data_waiters();
                     }
 
-                    // RFC 5681: If fast retransmit was triggered, transmit it now
-                    // Priority: data ACK first (we already have one), fast retransmit happens via timer
-                    // However, if the peer's ACK was a dup ACK, the data_ack response handles it
-                    if let Some(fr_seg) = fast_retransmit_seg {
-                        // Transmit fast retransmit segment asynchronously
-                        let meta = sock.meta_snapshot();
-                        if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
-                            let _ = transmit_tcp_segment(remote_ip, &fr_seg, sock.net_ns_id.0);
-                        }
-                    }
-
                     return Some(data_ack);
-                }
-
-                // RFC 5681: Handle fast retransmit even for pure ACK (no data response)
-                if let Some(fr_seg) = fast_retransmit_seg {
-                    drop(guard);
-                    let meta = sock.meta_snapshot();
-                    if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
-                        let _ = transmit_tcp_segment(remote_ip, &fr_seg, sock.net_ns_id.0);
-                    }
-                    return None; // Fast retransmit sent via transmit_tcp_segment
                 }
 
                 // Pure ACK with no data - nothing more to do
@@ -8068,6 +9416,7 @@ impl SocketTable {
                 let seq_in_recv_window = segment_in_recv_window(
                     header.seq_num,
                     payload.len(),
+                    is_fin,
                     tcp_state.control.rcv_nxt,
                     tcp_state.control.rcv_wnd,
                 );
@@ -8146,7 +9495,7 @@ impl SocketTable {
                 let mut data_received = false;
                 // R155-15 FIX: Track OOO-drain-delivered FIN for wake side effects.
                 let mut ooo_fin_delivered = false;
-                let mut response: Option<Vec<u8>> = None;
+                let mut response: Option<WirePacket> = None;
                 // R144-1 FIX: See Established-state comment for rationale.
                 let mut fin_expected_seq: Option<u32> = None;
 
@@ -8199,19 +9548,16 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
-                        // R162-9 FIX: Fallible recv_buffer growth
+                        // R180-11 FIX: reserve allocator capacity before retain.
                         if tcp_state
                             .control
                             .recv_buffer
-                            .try_reserve(payload.len())
+                            .try_extend_from_slice(payload)
                             .is_err()
                         {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             return None;
                         }
-                        tcp_state
-                            .control
-                            .recv_buffer
-                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                         // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
@@ -8347,16 +9693,25 @@ impl SocketTable {
                                 return Some(ack);
                             }
                         }
-                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
-                        let dup_ack = Self::build_sack_ack(
-                            &tcp_state.control,
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            ack_wnd,
-                        );
-                        return Some(dup_ack);
+                        // R180-L2 FIX: consume an in-order FIN independently of
+                        // whether any retransmitted payload byte was new.
+                        if !duplicate_payload_has_new_fin(
+                            header.seq_num,
+                            payload.len(),
+                            is_fin,
+                            tcp_state.control.rcv_nxt,
+                        ) {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let dup_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(dup_ack);
+                        }
                     }
                 }
 
@@ -8478,6 +9833,7 @@ impl SocketTable {
                 let seq_in_recv_window = segment_in_recv_window(
                     header.seq_num,
                     payload.len(),
+                    is_fin,
                     tcp_state.control.rcv_nxt,
                     tcp_state.control.rcv_wnd,
                 );
@@ -8544,7 +9900,7 @@ impl SocketTable {
                 let mut data_received = false;
                 // R155-15 FIX: Track OOO-drain-delivered FIN for wake side effects.
                 let mut ooo_fin_delivered = false;
-                let mut response: Option<Vec<u8>> = None;
+                let mut response: Option<WirePacket> = None;
                 // R144-1 FIX: See Established-state comment for rationale.
                 let mut fin_expected_seq: Option<u32> = None;
 
@@ -8597,19 +9953,16 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
-                        // R162-9 FIX: Fallible recv_buffer growth
+                        // R180-11 FIX: reserve allocator capacity before retain.
                         if tcp_state
                             .control
                             .recv_buffer
-                            .try_reserve(payload.len())
+                            .try_extend_from_slice(payload)
                             .is_err()
                         {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             return None;
                         }
-                        tcp_state
-                            .control
-                            .recv_buffer
-                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                         // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
@@ -8745,16 +10098,25 @@ impl SocketTable {
                                 return Some(ack);
                             }
                         }
-                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
-                        let dup_ack = Self::build_sack_ack(
-                            &tcp_state.control,
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            ack_wnd,
-                        );
-                        return Some(dup_ack);
+                        // R180-L2 FIX: consume an in-order FIN independently of
+                        // whether any retransmitted payload byte was new.
+                        if !duplicate_payload_has_new_fin(
+                            header.seq_num,
+                            payload.len(),
+                            is_fin,
+                            tcp_state.control.rcv_nxt,
+                        ) {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let dup_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(dup_ack);
+                        }
                     }
                 }
 
@@ -9169,7 +10531,6 @@ impl SocketTable {
             // ================================================================
             TcpState::TimeWait => {
                 // R58: Use scaled window advertisement
-                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
 
                 // R164-4 FIX: Check for retransmitted FIN BEFORE the window check.
@@ -9237,6 +10598,21 @@ impl SocketTable {
                     header.src_port,
                 );
 
+                if tcp_state.control.passive_open {
+                    drop(guard);
+                    return self.process_passive_final_ack(
+                        &sock,
+                        net_ns_id,
+                        src_ip,
+                        dst_ip,
+                        header,
+                        payload,
+                        syn_key,
+                        reply_binding,
+                        ingress_handshake_committed,
+                    );
+                }
+
                 // Handle retransmitted SYN: resend cached SYN-ACK
                 if is_syn && !is_ack {
                     // R75-1 FIX: Look up listener within the specified namespace
@@ -9245,10 +10621,18 @@ impl SocketTable {
                         if let Some(listen_state) = listen_guard.as_ref() {
                             if let Some(pending) = listen_state.get_syn(&syn_key) {
                                 drop(guard);
-                                return Some(pending.syn_ack.clone());
+                                return Self::try_clone_wire_segment(pending.syn_ack.as_slice());
                             }
                         }
                     }
+                    return None;
+                }
+
+                // RF180-41 REVIEW FIX: the child registries retain the staged
+                // half-open object so a retransmitted SYN can reuse its cached
+                // response, but no ACK/data may complete or use that child until
+                // the SYN-ACK's device-queue transaction confirms egress.
+                if !tcp_state.control.passive_egress_confirmed {
                     return None;
                 }
 
@@ -9307,6 +10691,7 @@ impl SocketTable {
                 tcp_state.control.snd_wl1 = header.seq_num;
                 tcp_state.control.snd_wl2 = header.ack_num;
                 tcp_state.control.state = TcpState::Established;
+                *ingress_handshake_committed = true;
 
                 // R58 FIX: RFC 793 semantics - if window scaling was not negotiated,
                 // cap receive window to 16 bits to avoid accepting more data than
@@ -9322,7 +10707,7 @@ impl SocketTable {
                 // RFC 793 §3.4 permits data on the third handshake segment.
                 // Without this, the payload is silently discarded and the peer
                 // must retransmit, adding an unnecessary RTT of latency.
-                let mut ack_response: Option<Vec<u8>> = None;
+                let mut ack_response: Option<WirePacket> = None;
                 let is_fin = header.flags & TCP_FLAG_FIN != 0;
 
                 // R154-7 FIX: Apply LSM recv hook BEFORE buffering piggybacked data.
@@ -9376,19 +10761,16 @@ impl SocketTable {
                                 ack_wnd,
                             ));
                         } else {
-                            // R162-9 FIX: Fallible recv_buffer growth
+                            // R180-11 FIX: reserve allocator capacity before retain.
                             if tcp_state
                                 .control
                                 .recv_buffer
-                                .try_reserve(payload.len())
+                                .try_extend_from_slice(payload)
                                 .is_err()
                             {
+                                self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                                 return None;
                             }
-                            tcp_state
-                                .control
-                                .recv_buffer
-                                .extend(payload.iter().copied());
                             tcp_state.control.rcv_nxt =
                                 tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                             // J2-4: reconcile to true F (== recv_buffer.len(); ooo_bytes==0
@@ -9485,6 +10867,215 @@ impl SocketTable {
         }
     }
 
+    /// Complete a listener-owned third handshake segment as one transaction.
+    /// Lock order is listener -> child TCB -> namespace recv leaf. Every
+    /// fallible accept/payload/reply preparation happens before Established is
+    /// published, and the exact SYN entry is moved to the reserved accept slot
+    /// under the same listener guard.
+    #[allow(clippy::too_many_arguments)]
+    fn process_passive_final_ack(
+        &self,
+        sock: &SocketArc,
+        net_ns_id: NamespaceId,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        header: &TcpHeader,
+        payload: &[u8],
+        syn_key: TcpLookupKey,
+        reply_binding: &mut Option<TcpReplyBinding>,
+        ingress_handshake_committed: &mut bool,
+    ) -> Option<WirePacket> {
+        let is_syn = header.flags & TCP_FLAG_SYN != 0;
+        let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+        if !payload.is_empty() {
+            let mut ctx = self.ctx_from_socket(sock);
+            ctx.remote = ipv4_to_u64(src_ip.0);
+            ctx.remote_port = header.src_port;
+            if hook_net_recv(&sock.label.creator, &ctx, payload.len()).is_err() {
+                return None;
+            }
+        }
+
+        let listener = self.lookup_tcp_listener(net_ns_id, header.dst_port)?;
+        let mut listen_guard = listener.listen.lock();
+        let listen_state = listen_guard.as_mut()?;
+        if !listen_state
+            .get_syn(&syn_key)
+            .is_some_and(|pending| Arc::ptr_eq(&pending.sock, sock))
+        {
+            return None;
+        }
+
+        if is_syn && !is_ack {
+            let retry = {
+                let pending = listen_state.get_syn(&syn_key)?;
+                Self::try_clone_wire_segment(pending.syn_ack.as_slice())?
+            };
+            let token = next_nonzero_generation(&NEXT_TCP_EGRESS_TOKEN).ok()?;
+            let mut child_guard = sock.tcp.lock();
+            let child = child_guard.as_mut()?;
+            if child.control.state != TcpState::SynReceived || !child.control.passive_open {
+                return None;
+            }
+            child.control.pending_reply_token = Some(token);
+            drop(child_guard);
+            *reply_binding = Some(self.bind_tcp_reply(sock, token));
+            return Some(retry);
+        }
+
+        if !is_ack {
+            return None;
+        }
+
+        let mut child_guard = sock.tcp.lock();
+        let child = child_guard.as_mut()?;
+        if child.control.state != TcpState::SynReceived
+            || !child.control.passive_open
+            || !child.control.passive_egress_confirmed
+        {
+            return None;
+        }
+
+        let ack_valid = header.ack_num == child.control.snd_nxt;
+        let recv_wnd = child.control.rcv_wnd.max(1);
+        let sequence_valid = if payload.is_empty() && header.flags & TCP_FLAG_FIN == 0 {
+            seq_in_window(header.seq_num, child.control.rcv_nxt, recv_wnd)
+        } else {
+            header.seq_num == child.control.rcv_nxt
+        };
+        if !ack_valid || !sequence_valid {
+            child.control.state = TcpState::Closed;
+            child.control.pending_reply_token = None;
+            let retired = listen_state.take_syn(&syn_key, self);
+            drop(child_guard);
+            drop(listen_guard);
+            drop(retired);
+            sock.mark_closed();
+            self.cleanup_tcp_connection(sock);
+            return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+        }
+
+        if !listen_state.try_reserve_accept_slot() {
+            return None;
+        }
+
+        if self
+            .try_charge_ns_recv_gate(sock.net_ns_id, &child.control, payload.len())
+            .is_err()
+        {
+            listen_state.cancel_accept_slot();
+            return None;
+        }
+        if child
+            .control
+            .recv_buffer
+            .ensure_capacity_for(payload.len())
+            .is_err()
+        {
+            self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+            listen_state.cancel_accept_slot();
+            return None;
+        }
+
+        let fin = header.flags & TCP_FLAG_FIN != 0;
+        let prospective_rcv_nxt = child
+            .control
+            .rcv_nxt
+            .wrapping_add(payload.len() as u32)
+            .wrapping_add(u32::from(fin));
+        let committed_rcv_wnd = if child.control.wscale_enabled() {
+            child.control.rcv_wnd
+        } else {
+            child.control.rcv_wnd.min(u16::MAX as u32)
+        };
+        let prospective_used = child
+            .control
+            .recv_buffer
+            .len()
+            .saturating_add(payload.len());
+        let prospective_window = committed_rcv_wnd.saturating_sub(prospective_used as u32);
+        let response = if payload.is_empty() && !fin {
+            None
+        } else {
+            match try_build_tcp_segment_admitted(
+                dst_ip,
+                src_ip,
+                header.dst_port,
+                header.src_port,
+                child.control.snd_nxt,
+                prospective_rcv_nxt,
+                TCP_FLAG_ACK,
+                Self::encode_adv_window(&child.control, prospective_window),
+                &[],
+            ) {
+                Ok(packet) => Some(packet),
+                Err(_) => {
+                    self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+                    listen_state.cancel_accept_slot();
+                    return None;
+                }
+            }
+        };
+
+        if !payload.is_empty() {
+            child
+                .control
+                .recv_buffer
+                .try_extend_from_slice(payload)
+                .expect("RF180-41 passive payload lost pre-reserved capacity");
+            self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+        }
+        self.handle_ack_reconciled(
+            sock,
+            &mut child.control,
+            header.ack_num,
+            self.time_wait_now(),
+        );
+        child.control.snd_wnd = decode_window(header.window, child.control.effective_snd_wscale());
+        child.control.snd_wl1 = header.seq_num;
+        child.control.snd_wl2 = header.ack_num;
+        child.control.rcv_wnd = committed_rcv_wnd;
+        child.control.rcv_nxt = prospective_rcv_nxt;
+        child.control.established_at = self.time_wait_now();
+        child.control.last_activity = child.control.established_at;
+        child.control.state = if fin {
+            child.control.fin_received = true;
+            TcpState::CloseWait
+        } else {
+            TcpState::Established
+        };
+
+        let pending = listen_state
+            .take_syn(&syn_key, self)
+            .expect("RF180-41 exact passive SYN entry vanished under listener guard");
+        assert!(
+            Arc::ptr_eq(&pending.sock, sock),
+            "RF180-41 passive SYN identity changed under listener guard"
+        );
+        let PendingSyn {
+            sock: accept_sock,
+            syn_ack: retired_syn_ack,
+            ..
+        } = pending;
+        assert!(
+            listen_state.publish_accept_reserved(accept_sock),
+            "RF180-41 reserved passive accept publication failed"
+        );
+        listen_state.waiters().wake_one();
+
+        let wake_data = !payload.is_empty() || fin;
+        drop(child_guard);
+        drop(listen_guard);
+        drop(retired_syn_ack);
+        *ingress_handshake_committed = true;
+        if wake_data {
+            sock.wake_tcp_data_waiters();
+        }
+        sock.wake_tcp_waiters();
+        response
+    }
+
     /// Get the current timestamp for TCP timing operations.
     ///
     /// # R53-2 FIX (Timestamp Precision)
@@ -9541,9 +11132,9 @@ impl SocketTable {
     /// # Returns
     ///
     /// A tuple of:
-    /// - `Option<Vec<u8>>`: Retransmit segment if fast retransmit or partial-ACK was triggered
+    /// - `bool`: retransmission was accepted by the egress queue
     /// - `bool`: True if RFC 3042 Limited Transmit was signaled (caller should wake sender)
-    fn apply_ack_and_cc(
+    fn apply_ack_and_cc<F>(
         &self,
         tcb: &mut TcpControlBlock,
         ack_num: u32,
@@ -9556,7 +11147,11 @@ impl SocketTable {
         sack_blocks: &[SackBlock],
         has_payload: bool,
         peer_raw_window: u16,
-    ) -> (Option<Vec<u8>>, bool) {
+        queue: F,
+    ) -> (bool, bool)
+    where
+        F: FnOnce(&WirePacket) -> bool,
+    {
         // Process ACK and get update info
         let ack_update = handle_ack(tcb, ack_num, now_ms);
 
@@ -9574,60 +11169,156 @@ impl SocketTable {
         // Segments with data or window changes are NOT duplicate ACKs.
         let peer_adv_wnd = decode_window(peer_raw_window, tcb.effective_snd_wscale());
         let is_window_update = peer_adv_wnd != tcb.snd_wnd;
-        let is_pure_dup_ack = ack_update.duplicate && !has_payload && !is_window_update;
+        let has_eligible_segment = tcb
+            .send_buffer
+            .iter()
+            .any(|segment| !segment.retransmit_in_flight && segment.retry_due(now_ms));
+        if ack_update.duplicate && !has_eligible_segment {
+            // A duplicate ACK cannot signal loss when no data is outstanding.
+            // Clear stale evidence so later data cannot inherit a poisoned count.
+            tcb.dup_ack_count = 0;
+        }
+        let is_pure_dup_ack =
+            ack_update.duplicate && !has_payload && !is_window_update && has_eligible_segment;
 
         // Update congestion control and check for fast retransmit
         // R55-1: Pass ack_num for NewReno partial ACK detection
+        let congestion_before = (
+            tcb.cwnd,
+            tcb.ssthresh,
+            tcb.dup_ack_count,
+            tcb.congestion_state,
+            tcb.recover,
+        );
         let action =
             update_congestion_control(tcb, ack_update.newly_acked, is_pure_dup_ack, ack_num);
 
-        // Handle congestion control actions
-        match action {
-            // R55-1: Both FastRetransmit and RetransmitNext trigger segment retransmission
-            CongestionAction::FastRetransmit | CongestionAction::RetransmitNext => {
-                // RFC 6675: When SACK is enabled, prefer retransmitting the earliest
-                // segment marked as lost rather than blindly retransmitting the front.
-                let retransmit_idx = if tcb.sack_enabled() {
-                    tcb.sack_find_lost_segment().or(Some(0))
-                } else {
-                    Some(0)
-                };
-
-                if let Some(idx) = retransmit_idx {
-                    if let Some(seg) = tcb.send_buffer.get_mut(idx) {
-                        let flags = TCP_FLAG_ACK
-                            | if !seg.data.is_empty() {
-                                TCP_FLAG_PSH
-                            } else {
-                                0
-                            };
-                        seg.retrans_count = seg.retrans_count.saturating_add(1);
-                        seg.sent_at = now_ms;
-                        tcb.last_activity = now_ms;
-
-                        return (
-                            Some(build_tcp_segment(
-                                local_ip,
-                                remote_ip,
-                                local_port,
-                                remote_port,
-                                seg.seq,
-                                tcb.rcv_nxt,
-                                flags,
-                                advertised_wnd,
-                                &seg.data,
-                            )),
-                            false,
-                        );
-                    }
-                }
-            }
-            // R56-1: RFC 3042 Limited Transmit — signal caller to wake sender
-            CongestionAction::LimitedTransmit => return (None, true),
-            CongestionAction::None => {}
+        if action == CongestionAction::LimitedTransmit {
+            return (false, true);
         }
 
-        (None, false)
+        // FastRetransmit/RetransmitNext select new work. A previously failed
+        // NewReno retransmission remains an explicit per-segment task and is
+        // retried on the next ACK even when this ACK has no new CC action.
+        let action_idx = if matches!(
+            action,
+            CongestionAction::FastRetransmit | CongestionAction::RetransmitNext
+        ) {
+            let first_eligible = tcb
+                .send_buffer
+                .iter()
+                .position(|segment| !segment.retransmit_in_flight && segment.retry_due(now_ms));
+            if tcb.sack_enabled() {
+                tcb.sack_find_lost_segment()
+                    .filter(|idx| {
+                        tcb.send_buffer
+                            .get(*idx)
+                            .map(|segment| {
+                                !segment.retransmit_in_flight && segment.retry_due(now_ms)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .or(first_eligible)
+            } else {
+                first_eligible
+            }
+        } else {
+            None
+        };
+        let retransmit_idx = action_idx.or_else(|| {
+            tcb.send_buffer.iter().position(|seg| {
+                seg.retransmit_pending && !seg.retransmit_in_flight && seg.retry_due(now_ms)
+            })
+        });
+
+        if let Some(idx) = retransmit_idx {
+            if let Some(seg) = tcb.send_buffer.get_mut(idx) {
+                let flags = TCP_FLAG_ACK
+                    | if !seg.data.is_empty() {
+                        TCP_FLAG_PSH
+                    } else {
+                        0
+                    };
+                // RF180-41 REVIEW FIX: prepare the exact wire owner first. A
+                // NewReno partial ACK keeps its valid ACK progress but records
+                // an explicit retry task if allocation fails; triple-duplicate
+                // CC state is restored so another duplicate ACK retriggers it.
+                let packet = match try_build_tcp_segment_admitted(
+                    local_ip,
+                    remote_ip,
+                    local_port,
+                    remote_port,
+                    seg.seq,
+                    tcb.rcv_nxt,
+                    flags,
+                    advertised_wnd,
+                    &seg.data,
+                ) {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        if action == CongestionAction::FastRetransmit {
+                            (
+                                tcb.cwnd,
+                                tcb.ssthresh,
+                                tcb.dup_ack_count,
+                                tcb.congestion_state,
+                                tcb.recover,
+                            ) = congestion_before;
+                        } else if action == CongestionAction::RetransmitNext {
+                            seg.retransmit_pending = true;
+                        }
+                        return (false, false);
+                    }
+                };
+                if !queue(&packet) {
+                    // Policy/device rejection is not a transmission. Keep the
+                    // admitted retry explicit and leave sent_at/retrans_count
+                    // unchanged. A triple-duplicate transition is also rolled
+                    // back: Fast Recovery must not become externally visible
+                    // until its retransmission is accepted by egress.
+                    seg.retransmit_pending = true;
+                    seg.record_tx_rejection(now_ms);
+                    if action == CongestionAction::FastRetransmit {
+                        (
+                            tcb.cwnd,
+                            tcb.ssthresh,
+                            tcb.dup_ack_count,
+                            tcb.congestion_state,
+                            tcb.recover,
+                        ) = congestion_before;
+                    }
+                    return (false, false);
+                }
+                seg.retransmit_pending = false;
+                seg.retransmit_requires_rto = false;
+                seg.clear_tx_rejection();
+                seg.retrans_count = seg.retrans_count.saturating_add(1);
+                seg.sent_at = now_ms;
+                // `handle_ack` already records the inbound ACK as activity. This
+                // assignment additionally timestamps the admitted outbound work.
+                tcb.last_activity = now_ms;
+
+                return (true, false);
+            }
+        }
+
+        if action == CongestionAction::FastRetransmit {
+            (
+                tcb.cwnd,
+                tcb.ssthresh,
+                tcb.dup_ack_count,
+                tcb.congestion_state,
+                tcb.recover,
+            ) = congestion_before;
+        } else if action == CongestionAction::RetransmitNext && tcb.send_buffer.is_empty() {
+            // A partial-ACK action without remaining retransmittable data is an
+            // inconsistent recovery point, not permission to stay stuck in FR.
+            tcb.cwnd = tcb.ssthresh.max(tcb.snd_mss as u32);
+            tcb.dup_ack_count = 0;
+            tcb.congestion_state = crate::tcp::TcpCongestionState::CongestionAvoidance;
+        }
+
+        (false, false)
     }
 
     /// Sweep TIME_WAIT connections and clean up those that exceeded 2MSL.
@@ -9641,6 +11332,158 @@ impl SocketTable {
     /// * `current_time_ms` - Monotonic timestamp in milliseconds
     pub fn sweep_time_wait(&self, current_time_ms: u64) {
         self.run_tcp_timers(current_time_ms, true);
+    }
+
+    #[inline]
+    fn prepare_timer_cleanup_slot<T>(&self, worklist: &mut AdmittedVec<T>) -> bool {
+        #[cfg(test)]
+        if self
+            .fail_next_timer_cleanup_reserve
+            .swap(false, Ordering::AcqRel)
+        {
+            return false;
+        }
+        worklist.ensure_capacity_for(1).is_ok()
+    }
+
+    #[inline]
+    fn publish_timer_work<T>(worklist: &mut AdmittedVec<T>, work: T) {
+        if worklist.push_reserved(work).is_err() {
+            panic!("RF180-25 admitted timer worklist capacity invariant violated");
+        }
+    }
+
+    /// Queue one data retransmission, then publish its retry/RTO metadata under
+    /// the TCB lock. Queue rejection clears only the in-flight reservation; the
+    /// pending work and original timestamps remain retryable.
+    fn finish_data_retransmit(&self, work: DataRetransmitWork, now_ms: u64) -> bool {
+        self.finish_data_retransmit_with_queue(work, now_ms, |dst_ip, packet, net_ns_id| {
+            transmit_tcp_segment(dst_ip, packet, net_ns_id).is_ok()
+        })
+    }
+
+    fn finish_data_retransmit_with_queue<F>(
+        &self,
+        work: DataRetransmitWork,
+        now_ms: u64,
+        queue: F,
+    ) -> bool
+    where
+        F: FnOnce(Ipv4Addr, &WirePacket, u64) -> bool,
+    {
+        let queued = queue(work.dst_ip, &work.packet, work.net_ns_id);
+        let mut guard = work.sock.tcp.lock();
+        let Some(tcp_state) = guard.as_mut() else {
+            return queued;
+        };
+        let Some(idx) = tcp_state
+            .control
+            .send_buffer
+            .iter()
+            .position(|segment| segment.seq == work.seq && segment.retransmit_in_flight)
+        else {
+            // A concurrent ACK legitimately retired the original segment.
+            return queued;
+        };
+
+        let ack_generation_unchanged = tcp_state.control.peer_ack_generation == work.ack_generation;
+        let requires_rto = {
+            let segment = tcp_state
+                .control
+                .send_buffer
+                .get_mut(idx)
+                .expect("RF180-41 retransmit completion index vanished");
+            segment.retransmit_in_flight = false;
+            if !queued {
+                segment.retransmit_pending = true;
+                segment.record_tx_rejection(now_ms);
+                return false;
+            }
+            let requires_rto = segment.retransmit_requires_rto && ack_generation_unchanged;
+            segment.retransmit_pending = false;
+            segment.retransmit_requires_rto = false;
+            segment.clear_tx_rejection();
+            segment.retrans_count = segment.retrans_count.saturating_add(1);
+            segment.sent_at = now_ms;
+            requires_rto
+        };
+
+        if requires_rto {
+            handle_retransmission_timeout(&mut tcp_state.control);
+            tcp_state.control.sack_clear_scoreboard();
+            tcp_state.control.retries = tcp_state.control.retries.saturating_add(1);
+            tcp_state.control.rto_ms = tcp_state
+                .control
+                .rto_ms
+                .saturating_mul(2)
+                .min(TCP_MAX_RTO_MS);
+        }
+        tcp_state.control.last_activity = now_ms;
+        true
+    }
+
+    fn finish_fin_retransmit(&self, work: FinRetransmitWork, now_ms: u64) -> bool {
+        self.finish_fin_retransmit_with_queue(work, now_ms, |dst_ip, packet, net_ns_id| {
+            transmit_tcp_segment(dst_ip, packet, net_ns_id).is_ok()
+        })
+    }
+
+    fn finish_fin_retransmit_with_queue<F>(
+        &self,
+        work: FinRetransmitWork,
+        now_ms: u64,
+        queue: F,
+    ) -> bool
+    where
+        F: FnOnce(Ipv4Addr, &WirePacket, u64) -> bool,
+    {
+        let queued = queue(work.dst_ip, &work.packet, work.net_ns_id);
+        let mut guard = work.sock.tcp.lock();
+        let Some(tcp_state) = guard.as_mut() else {
+            return queued;
+        };
+        tcp_state.control.fin_retransmit_in_flight = false;
+        if queued
+            && tcp_state.control.fin_sent
+            && matches!(
+                tcp_state.control.state,
+                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+            )
+        {
+            tcp_state.control.fin_retries = tcp_state.control.fin_retries.saturating_add(1);
+            tcp_state.control.fin_sent_time = now_ms;
+        }
+        queued
+    }
+
+    fn finish_keepalive(&self, work: KeepaliveWork) -> bool {
+        self.finish_keepalive_with_queue(work, |dst_ip, packet, net_ns_id| {
+            transmit_tcp_segment(dst_ip, packet, net_ns_id).is_ok()
+        })
+    }
+
+    fn finish_keepalive_with_queue<F>(&self, work: KeepaliveWork, queue: F) -> bool
+    where
+        F: FnOnce(Ipv4Addr, &WirePacket, u64) -> bool,
+    {
+        let queued = queue(work.dst_ip, &work.packet, work.net_ns_id);
+        let mut guard = work.sock.tcp.lock();
+        let Some(tcp_state) = guard.as_mut() else {
+            return queued;
+        };
+        tcp_state.control.keepalive_probe_in_flight = false;
+        if queued
+            && tcp_state.control.keepalive_enabled
+            && tcp_state.control.peer_ack_generation == work.ack_generation
+            && matches!(
+                tcp_state.control.state,
+                TcpState::Established | TcpState::CloseWait
+            )
+        {
+            tcp_state.control.keepalive_probes_sent =
+                tcp_state.control.keepalive_probes_sent.saturating_add(1);
+        }
+        queued
     }
 
     /// Run TCP timers for retransmission and optional TIME_WAIT cleanup.
@@ -9672,8 +11515,8 @@ impl SocketTable {
     /// # Safety
     ///
     /// R150-1 FIX: This function must NOT be called from hard IRQ context.
-    /// It allocates heap memory (Vec, build_tcp_segment → Vec<u8>) and may
-    /// transmit packets (transmit_tcp_segment → device spinlock + DMA alloc).
+    /// It allocates admitted worklists and wire packets and may transmit packets
+    /// (transmit_tcp_segment → device spinlock + DMA allocation).
     ///
     /// Uses try_lock on the sockets lock to avoid blocking. If the lock is
     /// held, the sweep is skipped and returns `false`.
@@ -9684,11 +11527,16 @@ impl SocketTable {
         self.time_wait_clock
             .store(current_time_ms, Ordering::Relaxed);
 
-        // Collect sockets for cleanup and FIN retransmissions
-        let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
-        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
+        // Retransmission worklists are transient, but every growth remains
+        // fallible. Cleanup is detection-only in this non-blocking pass: no
+        // state is irreversibly closed until the blocking pass owns the work.
+        let mut needs_cleanup = false;
+        let mut collection_complete = true;
+        let mut fin_retransmit: AdmittedVec<FinRetransmitWork> =
+            AdmittedVec::new(HeapClass::SocketObject);
         // Data segment retransmissions (TCP retransmission RFC 6298)
-        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
+        let mut data_retransmit: AdmittedVec<DataRetransmitWork> =
+            AdmittedVec::new(HeapClass::SocketObject);
         // R149-2 FIX: Track whether any expired SYN entries were detected
         // (non-destructive; actual removal deferred to blocking path).
         let mut has_expired_syn = false;
@@ -9747,7 +11595,6 @@ impl SocketTable {
             let mut need_init_timestamp = false;
             let mut need_init_fin_time = false;
             let mut need_fin_retransmit = false;
-            let mut mark_timeout_close = false;
 
             if let Some(tcp_state) = tcp_guard.as_mut() {
                 // TIME_WAIT handling
@@ -9781,7 +11628,6 @@ impl SocketTable {
                     {
                         // Timeout expired - peer never sent FIN, cleanup connection
                         should_cleanup = true;
-                        mark_timeout_close = true;
                     }
                 }
 
@@ -9790,6 +11636,7 @@ impl SocketTable {
                     tcp_state.control.state,
                     TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
                 ) && tcp_state.control.fin_sent
+                    && !tcp_state.control.fin_retransmit_in_flight
                 {
                     let fin_start = tcp_state.control.fin_sent_time;
                     if fin_start == 0 {
@@ -9811,8 +11658,12 @@ impl SocketTable {
 
                 // Data retransmission: check send_buffer for segments past RTO
                 // This handles reliable delivery for established connections
+                if tcp_state.control.retries >= TCP_MAX_RETRIES {
+                    should_cleanup = true;
+                }
                 if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
-                    if !tcp_state.control.send_buffer.is_empty()
+                    if !should_cleanup
+                        && !tcp_state.control.send_buffer.is_empty()
                         && matches!(
                             tcp_state.control.state,
                             TcpState::Established
@@ -9836,76 +11687,91 @@ impl SocketTable {
                         // 1. Check timeout with immutable borrow
                         // 2. Enter loss recovery
                         // 3. Build retransmit segment with mutable borrow
-                        let needs_retransmit = tcp_state
+                        let pending_idx = tcp_state.control.send_buffer.iter().position(|seg| {
+                            seg.retransmit_pending
+                                && !seg.retransmit_in_flight
+                                && seg.retry_due(current_time_ms)
+                        });
+                        let rto_idx = tcp_state
                             .control
                             .send_buffer
                             .front()
-                            .map(|seg| current_time_ms.saturating_sub(seg.sent_at) >= rto)
-                            .unwrap_or(false);
+                            .filter(|seg| {
+                                !seg.retransmit_in_flight
+                                    && seg.retry_due(current_time_ms)
+                                    && current_time_ms.saturating_sub(seg.sent_at) >= rto
+                            })
+                            .map(|_| 0);
+                        let retransmit_idx = pending_idx.or(rto_idx);
 
-                        if needs_retransmit {
-                            // RFC 5681: Enter loss recovery BEFORE retransmitting
-                            // This sets ssthresh = max(FlightSize/2, 2*SMSS) and cwnd = 1*SMSS
-                            handle_retransmission_timeout(&mut tcp_state.control);
+                        if let Some(retransmit_idx) = retransmit_idx {
+                            let is_pending = pending_idx == Some(retransmit_idx);
+                            // Reserve the deferred-work slot and build the packet before
+                            // advancing RTO/retry state. OOM leaves the segment eligible
+                            // for the blocking retry instead of recording a send that
+                            // never occurred.
+                            let prepared = if data_retransmit.ensure_capacity_for(1).is_err() {
+                                None
+                            } else {
+                                tcp_state
+                                    .control
+                                    .send_buffer
+                                    .get_mut(retransmit_idx)
+                                    .and_then(|segment| {
+                                        let flags = TCP_FLAG_ACK
+                                            | if !segment.data.is_empty() {
+                                                TCP_FLAG_PSH
+                                            } else {
+                                                0
+                                            };
+                                        try_build_tcp_segment_admitted(
+                                            local_ip,
+                                            remote_ip,
+                                            local_port,
+                                            remote_port,
+                                            segment.seq,
+                                            ack,
+                                            flags,
+                                            advertised_wnd,
+                                            &segment.data,
+                                        )
+                                        .ok()
+                                    })
+                            };
 
-                            // RFC 6675: Clear SACK scoreboard on RTO — all SACKed/lost flags
-                            // become stale after timeout-based recovery resets the send state.
-                            tcp_state.control.sack_clear_scoreboard();
-
-                            // RFC 5681 §3.1: Retransmit ONLY the first unacked segment
-                            if let Some(first_seg) = tcp_state.control.send_buffer.front_mut() {
-                                let flags = TCP_FLAG_ACK
-                                    | if !first_seg.data.is_empty() {
-                                        TCP_FLAG_PSH
-                                    } else {
-                                        0
-                                    };
-                                let seg_bytes = build_tcp_segment(
-                                    local_ip,
-                                    remote_ip,
-                                    local_port,
-                                    remote_port,
-                                    first_seg.seq,
-                                    ack,
-                                    flags,
-                                    advertised_wnd,
-                                    &first_seg.data,
+                            if let Some(seg_bytes) = prepared {
+                                let segment_seq = tcp_state
+                                    .control
+                                    .send_buffer
+                                    .get(retransmit_idx)
+                                    .expect("RF180-41 prepared timer segment vanished")
+                                    .seq;
+                                Self::publish_timer_work(
+                                    &mut data_retransmit,
+                                    DataRetransmitWork {
+                                        sock: sock.clone(),
+                                        dst_ip: remote_ip,
+                                        packet: seg_bytes,
+                                        net_ns_id: sock.net_ns_id.0,
+                                        seq: segment_seq,
+                                        ack_generation: tcp_state.control.peer_ack_generation,
+                                    },
                                 );
-
-                                // Update segment tracking
-                                first_seg.retrans_count = first_seg.retrans_count.saturating_add(1);
-                                first_seg.sent_at = current_time_ms;
-
-                                // R57-1: Update activity timestamp for idle detection
-                                tcp_state.control.last_activity = current_time_ms;
-
-                                data_retransmit.push((remote_ip, seg_bytes, sock.net_ns_id.0));
-                            }
-
-                            // Exponential backoff: double RTO on each retransmission
-                            tcp_state.control.retries = tcp_state.control.retries.saturating_add(1);
-                            tcp_state.control.rto_ms = tcp_state
-                                .control
-                                .rto_ms
-                                .saturating_mul(2)
-                                .min(TCP_MAX_RTO_MS);
-
-                            // Connection timeout: too many retries
-                            if tcp_state.control.retries >= TCP_MAX_RETRIES {
-                                tcp_state.control.state = TcpState::Closed;
-                                should_cleanup = true;
-                                mark_timeout_close = true;
+                                if let Some(segment) =
+                                    tcp_state.control.send_buffer.get_mut(retransmit_idx)
+                                {
+                                    segment.retransmit_pending = true;
+                                    segment.retransmit_requires_rto |= !is_pending;
+                                    segment.retransmit_in_flight = true;
+                                }
+                            } else {
+                                collection_complete = false;
                             }
                         }
                     }
                 }
             }
             drop(tcp_guard);
-
-            // Mark socket closed if connection timed out
-            if mark_timeout_close {
-                sock.mark_closed();
-            }
 
             // Initialize TIME_WAIT timestamp if needed
             if need_init_timestamp {
@@ -9945,6 +11811,7 @@ impl SocketTable {
                                 tcp_state.control.state,
                                 TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
                             ) && tcp_state.control.fin_sent
+                                && !tcp_state.control.fin_retransmit_in_flight
                                 && tcp_state.control.fin_retries < TCP_MAX_FIN_RETRIES
                             {
                                 let window_after = tcp_state
@@ -9955,24 +11822,35 @@ impl SocketTable {
                                 let seq = tcp_state.control.snd_nxt.wrapping_sub(1);
                                 let ack = tcp_state.control.rcv_nxt;
 
-                                let seg = build_tcp_segment(
-                                    local_ip,
-                                    remote_ip,
-                                    local_port,
-                                    remote_port,
-                                    seq,
-                                    ack,
-                                    TCP_FLAG_FIN | TCP_FLAG_ACK,
-                                    Self::encode_adv_window(&tcp_state.control, window_after),
-                                    &[],
-                                );
-
-                                // Update retransmission bookkeeping
-                                tcp_state.control.fin_retries =
-                                    tcp_state.control.fin_retries.saturating_add(1);
-                                tcp_state.control.fin_sent_time = current_time_ms;
-
-                                fin_retransmit.push((remote_ip, seg, sock.net_ns_id.0));
+                                if fin_retransmit.ensure_capacity_for(1).is_ok() {
+                                    let seg = try_build_tcp_segment_admitted(
+                                        local_ip,
+                                        remote_ip,
+                                        local_port,
+                                        remote_port,
+                                        seq,
+                                        ack,
+                                        TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                        Self::encode_adv_window(&tcp_state.control, window_after),
+                                        &[],
+                                    );
+                                    if let Ok(seg) = seg {
+                                        Self::publish_timer_work(
+                                            &mut fin_retransmit,
+                                            FinRetransmitWork {
+                                                sock: sock.clone(),
+                                                dst_ip: remote_ip,
+                                                packet: seg,
+                                                net_ns_id: sock.net_ns_id.0,
+                                            },
+                                        );
+                                        tcp_state.control.fin_retransmit_in_flight = true;
+                                    } else {
+                                        collection_complete = false;
+                                    }
+                                } else {
+                                    collection_complete = false;
+                                }
                             }
                         }
                     }
@@ -9986,23 +11864,9 @@ impl SocketTable {
             // due to retransmission timeout (already in Closed state with
             // mark_timeout_close flag set).
             if should_cleanup {
-                // Retransmission timeout case: socket already marked closed and
-                // state set to Closed in the retransmission loop above
-                if mark_timeout_close {
-                    to_cleanup.push(sock.clone());
-                } else if let Some(mut guard) = sock.tcp.try_lock() {
-                    if let Some(tcp_state) = guard.as_mut() {
-                        if tcp_state.control.state == TcpState::TimeWait
-                            || matches!(
-                                tcp_state.control.state,
-                                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
-                            )
-                        {
-                            tcp_state.control.state = TcpState::Closed;
-                            to_cleanup.push(sock.clone());
-                        }
-                    }
-                }
+                // Detection only. The blocking pass revalidates the live state,
+                // reserves cleanup storage, then performs the terminal transition.
+                needs_cleanup = true;
             }
 
             // R52-1 FIX: Sweep half-open SYN queue for listening sockets
@@ -10048,18 +11912,24 @@ impl SocketTable {
         //
         // All blocking cleanup is deferred to `run_tcp_timers_blocking()` in
         // process context (called from `drain_deferred_tcp_timers()`).
-        // Only non-blocking network transmits (FIN/data retransmissions) proceed here.
-        let needs_blocking_cleanup = !to_cleanup.is_empty() || has_expired_syn;
+        // Queue completion briefly re-locks only the owning TCB after the
+        // device operation; this function runs in deferred process context.
+        let mut needs_blocking_cleanup = needs_cleanup || has_expired_syn || !collection_complete;
 
         // Transmit any pending FIN retransmissions (best-effort, no locks needed)
-        for (dst_ip, seg, ns_id) in fin_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
+        while let Some(work) = fin_retransmit.pop() {
+            if !self.finish_fin_retransmit(work, current_time_ms) {
+                collection_complete = false;
+            }
         }
 
         // Transmit data segment retransmissions (RFC 6298, no locks needed)
-        for (dst_ip, seg, ns_id) in data_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
+        while let Some(work) = data_retransmit.pop() {
+            if !self.finish_data_retransmit(work, current_time_ms) {
+                collection_complete = false;
+            }
         }
+        needs_blocking_cleanup |= !collection_complete;
 
         // If any sockets need blocking cleanup, signal incomplete to caller
         // so work is deferred to safe (non-IRQ) context.
@@ -10076,31 +11946,40 @@ impl SocketTable {
     /// Called from syscall return path to drain deferred timer work when IRQ-time
     /// processing was incomplete due to lock contention.
     ///
-    /// Unlike run_tcp_timers(), this function uses blocking locks and is guaranteed
-    /// to complete (unless the kernel is severely broken). This ensures timer work
-    /// is not starved indefinitely under sustained lock contention.
+    /// Unlike run_tcp_timers(), this function uses blocking locks. Transient
+    /// worklist/packet allocation is still fallible; on pressure it leaves the
+    /// affected socket state retryable and returns `false`, preserving the
+    /// deferred flag for the next process-context opportunity.
     ///
     /// # Returns
     ///
-    /// Always `true` since blocking locks guarantee completion.
+    /// `true` only when every detected item was collected and processed.
     pub fn run_tcp_timers_blocking(&self, current_time_ms: u64, sweep_time_wait: bool) -> bool {
         // Update cached time so RX path can stamp new TIME_WAIT transitions
         self.time_wait_clock
             .store(current_time_ms, Ordering::Relaxed);
 
-        // Collect sockets for cleanup and FIN retransmissions
-        let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
-        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
-        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
-        let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
+        // RF180-25 FIX: every deferred owner and serialized packet is admitted
+        // before publication. Worklist backing uses SocketObject; wire bytes use
+        // SocketPayload and retain that charge through transmit/drop.
+        let mut to_cleanup: AdmittedVec<SocketArc> = AdmittedVec::new(HeapClass::SocketObject);
+        let mut fin_retransmit: AdmittedVec<FinRetransmitWork> =
+            AdmittedVec::new(HeapClass::SocketObject);
+        let mut data_retransmit: AdmittedVec<DataRetransmitWork> =
+            AdmittedVec::new(HeapClass::SocketObject);
+        let mut syn_timeouts: AdmittedVec<(SocketArc, Ipv4Addr, Option<WirePacket>)> =
+            AdmittedVec::new(HeapClass::SocketObject);
         // R148-I3 FIX: Collect keepalive probes to send after releasing locks.
         // R160-8 FIX: Extended tuple includes conntrack seeding metadata.
-        let mut keepalive_probes: Vec<(Ipv4Addr, Vec<u8>, u64, Ipv4Addr, u16, u16)> = Vec::new();
+        let mut keepalive_probes: AdmittedVec<KeepaliveWork> =
+            AdmittedVec::new(HeapClass::SocketObject);
         // R148-3 FIX: Collect listeners for deferred SYN queue sweep outside
         // sockets lock. Sweeping under sockets.read() creates AB-BA deadlock
         // with the SYN handler path: sockets.read()->listen.lock() vs
         // listen.lock()->sockets.write().
-        let mut listeners_to_sweep: Vec<Arc<SocketState>> = Vec::new();
+        let mut listeners_to_sweep: AdmittedVec<SocketArc> =
+            AdmittedVec::new(HeapClass::SocketObject);
+        let mut collection_complete = true;
 
         // R65-6 FIX: Use blocking read lock - safe in non-IRQ context
         let sockets_guard = self.sockets.read();
@@ -10117,21 +11996,27 @@ impl SocketTable {
                 _ => None,
             };
 
+            // RF180-7 FIX: prepare the irreversible cleanup handoff before
+            // taking the TCB lock. If this socket proves due below, validation,
+            // the terminal state transition, and worklist publication all occur
+            // under that single lock. A failed preflight therefore leaves every
+            // timer state retryable without a stale detection/relock window.
+            let cleanup_slot_ready = self.prepare_timer_cleanup_slot(&mut to_cleanup);
+
             // R65-6 FIX: Use blocking lock for per-socket state
             let mut tcp_guard = sock.tcp.lock();
 
             let mut should_cleanup = false;
-            let mut need_init_timestamp = false;
-            let mut need_init_fin_time = false;
             let mut need_fin_retransmit = false;
             let mut mark_timeout_close = false;
+            let mut queued_timeout_close = false;
 
             if let Some(tcp_state) = tcp_guard.as_mut() {
                 // TIME_WAIT handling
                 if tcp_state.control.state == TcpState::TimeWait {
                     let start = tcp_state.control.time_wait_start;
                     if start == 0 {
-                        need_init_timestamp = true;
+                        tcp_state.control.time_wait_start = current_time_ms;
                     } else if sweep_time_wait
                         && current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS
                     {
@@ -10155,10 +12040,11 @@ impl SocketTable {
                     tcp_state.control.state,
                     TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
                 ) && tcp_state.control.fin_sent
+                    && !tcp_state.control.fin_retransmit_in_flight
                 {
                     let fin_start = tcp_state.control.fin_sent_time;
                     if fin_start == 0 {
-                        need_init_fin_time = true;
+                        tcp_state.control.fin_sent_time = current_time_ms;
                     } else {
                         let fin_timeout =
                             core::cmp::max(tcp_state.control.rto_ms, TCP_FIN_TIMEOUT_MS);
@@ -10172,70 +12058,106 @@ impl SocketTable {
                     }
                 }
 
+                if tcp_state.control.retries >= TCP_MAX_RETRIES {
+                    should_cleanup = true;
+                    mark_timeout_close = true;
+                }
+
                 // Data retransmission
-                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
-                    if !tcp_state.control.send_buffer.is_empty()
-                        && matches!(
-                            tcp_state.control.state,
-                            TcpState::Established
-                                | TcpState::CloseWait
-                                | TcpState::FinWait1
-                                | TcpState::FinWait2
-                                | TcpState::Closing
-                                | TcpState::LastAck
-                        )
-                    {
-                        let rto = tcp_state.control.rto_ms;
-                        let ack = tcp_state.control.rcv_nxt;
-                        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
+                if !mark_timeout_close {
+                    if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                        if !tcp_state.control.send_buffer.is_empty()
+                            && matches!(
+                                tcp_state.control.state,
+                                TcpState::Established
+                                    | TcpState::CloseWait
+                                    | TcpState::FinWait1
+                                    | TcpState::FinWait2
+                                    | TcpState::Closing
+                                    | TcpState::LastAck
+                            )
+                        {
+                            let rto = tcp_state.control.rto_ms;
+                            let ack = tcp_state.control.rcv_nxt;
+                            let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
-                        let needs_retransmit = tcp_state
-                            .control
-                            .send_buffer
-                            .front()
-                            .map(|seg| current_time_ms.saturating_sub(seg.sent_at) >= rto)
-                            .unwrap_or(false);
-
-                        if needs_retransmit {
-                            handle_retransmission_timeout(&mut tcp_state.control);
-
-                            if let Some(first_seg) = tcp_state.control.send_buffer.front_mut() {
-                                let flags = TCP_FLAG_ACK
-                                    | if !first_seg.data.is_empty() {
-                                        TCP_FLAG_PSH
-                                    } else {
-                                        0
-                                    };
-                                let seg_bytes = build_tcp_segment(
-                                    local_ip,
-                                    remote_ip,
-                                    local_port,
-                                    remote_port,
-                                    first_seg.seq,
-                                    ack,
-                                    flags,
-                                    advertised_wnd,
-                                    &first_seg.data,
-                                );
-
-                                first_seg.retrans_count = first_seg.retrans_count.saturating_add(1);
-                                first_seg.sent_at = current_time_ms;
-                                tcp_state.control.last_activity = current_time_ms;
-
-                                data_retransmit.push((remote_ip, seg_bytes, sock.net_ns_id.0));
-                            }
-
-                            tcp_state.control.retries = tcp_state.control.retries.saturating_add(1);
-                            tcp_state.control.rto_ms = tcp_state
+                            let pending_idx =
+                                tcp_state.control.send_buffer.iter().position(|seg| {
+                                    seg.retransmit_pending
+                                        && !seg.retransmit_in_flight
+                                        && seg.retry_due(current_time_ms)
+                                });
+                            let rto_idx = tcp_state
                                 .control
-                                .rto_ms
-                                .saturating_mul(2)
-                                .min(TCP_MAX_RTO_MS);
+                                .send_buffer
+                                .front()
+                                .filter(|seg| {
+                                    !seg.retransmit_in_flight
+                                        && seg.retry_due(current_time_ms)
+                                        && current_time_ms.saturating_sub(seg.sent_at) >= rto
+                                })
+                                .map(|_| 0);
+                            let retransmit_idx = pending_idx.or(rto_idx);
 
-                            if tcp_state.control.retries >= TCP_MAX_RETRIES {
-                                tcp_state.control.state = TcpState::Closed;
-                                should_cleanup = true;
-                                mark_timeout_close = true;
+                            if let Some(retransmit_idx) = retransmit_idx {
+                                let is_pending = pending_idx == Some(retransmit_idx);
+                                let prepared = if data_retransmit.ensure_capacity_for(1).is_err() {
+                                    None
+                                } else {
+                                    tcp_state
+                                        .control
+                                        .send_buffer
+                                        .get_mut(retransmit_idx)
+                                        .and_then(|segment| {
+                                            let flags = TCP_FLAG_ACK
+                                                | if !segment.data.is_empty() {
+                                                    TCP_FLAG_PSH
+                                                } else {
+                                                    0
+                                                };
+                                            try_build_tcp_segment_admitted(
+                                                local_ip,
+                                                remote_ip,
+                                                local_port,
+                                                remote_port,
+                                                segment.seq,
+                                                ack,
+                                                flags,
+                                                advertised_wnd,
+                                                &segment.data,
+                                            )
+                                            .ok()
+                                        })
+                                };
+
+                                if let Some(seg_bytes) = prepared {
+                                    let segment_seq = tcp_state
+                                        .control
+                                        .send_buffer
+                                        .get(retransmit_idx)
+                                        .expect("RF180-41 prepared blocking segment vanished")
+                                        .seq;
+                                    Self::publish_timer_work(
+                                        &mut data_retransmit,
+                                        DataRetransmitWork {
+                                            sock: sock.clone(),
+                                            dst_ip: remote_ip,
+                                            packet: seg_bytes,
+                                            net_ns_id: sock.net_ns_id.0,
+                                            seq: segment_seq,
+                                            ack_generation: tcp_state.control.peer_ack_generation,
+                                        },
+                                    );
+                                    if let Some(segment) =
+                                        tcp_state.control.send_buffer.get_mut(retransmit_idx)
+                                    {
+                                        segment.retransmit_pending = true;
+                                        segment.retransmit_requires_rto |= !is_pending;
+                                        segment.retransmit_in_flight = true;
+                                    }
+                                } else {
+                                    collection_complete = false;
+                                }
                             }
                         }
                     }
@@ -10245,7 +12167,9 @@ impl SocketTable {
                 // Send probes only when idle (no outstanding data) in a state
                 // where the connection should remain alive.
                 if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
-                    if tcp_state.control.keepalive_enabled
+                    if !mark_timeout_close
+                        && tcp_state.control.keepalive_enabled
+                        && !tcp_state.control.keepalive_probe_in_flight
                         && tcp_state.control.send_buffer.is_empty()
                         && matches!(
                             tcp_state.control.state,
@@ -10256,88 +12180,68 @@ impl SocketTable {
                         let idle_ms =
                             current_time_ms.saturating_sub(tcp_state.control.last_activity);
                         let probes_sent = tcp_state.control.keepalive_probes_sent as u64;
-                        let threshold = tcp_state.control.keepalive_idle_ms
-                            + probes_sent * tcp_state.control.keepalive_interval_ms;
+                        let threshold = tcp_state.control.keepalive_idle_ms.saturating_add(
+                            probes_sent.saturating_mul(tcp_state.control.keepalive_interval_ms),
+                        );
 
                         if idle_ms >= threshold {
                             if tcp_state.control.keepalive_probes_sent
                                 >= tcp_state.control.keepalive_probes_max
                             {
-                                // Connection dead — too many unanswered probes
-                                tcp_state.control.state = TcpState::Closed;
+                                // Connection dead — terminal transition is deferred
+                                // until a cleanup worklist slot is guaranteed.
                                 should_cleanup = true;
                                 mark_timeout_close = true;
                             } else {
                                 // Send keepalive probe: seq = snd_una - 1 to elicit ACK
                                 let advertised_wnd = Self::current_adv_window(&tcp_state.control);
-                                let probe = build_tcp_segment(
-                                    local_ip,
-                                    remote_ip,
-                                    local_port,
-                                    remote_port,
-                                    tcp_state.control.snd_una.wrapping_sub(1),
-                                    tcp_state.control.rcv_nxt,
-                                    TCP_FLAG_ACK,
-                                    advertised_wnd,
-                                    &[],
-                                );
-                                tcp_state.control.keepalive_probes_sent =
-                                    tcp_state.control.keepalive_probes_sent.saturating_add(1);
-                                keepalive_probes.push((
-                                    remote_ip,
-                                    probe,
-                                    sock.net_ns_id.0,
-                                    local_ip,
-                                    local_port,
-                                    remote_port,
-                                ));
+                                if keepalive_probes.ensure_capacity_for(1).is_ok() {
+                                    let probe = try_build_tcp_segment_admitted(
+                                        local_ip,
+                                        remote_ip,
+                                        local_port,
+                                        remote_port,
+                                        tcp_state.control.snd_una.wrapping_sub(1),
+                                        tcp_state.control.rcv_nxt,
+                                        TCP_FLAG_ACK,
+                                        advertised_wnd,
+                                        &[],
+                                    );
+                                    if let Ok(probe) = probe {
+                                        Self::publish_timer_work(
+                                            &mut keepalive_probes,
+                                            KeepaliveWork {
+                                                sock: sock.clone(),
+                                                dst_ip: remote_ip,
+                                                packet: probe,
+                                                net_ns_id: sock.net_ns_id.0,
+                                                ack_generation: tcp_state
+                                                    .control
+                                                    .peer_ack_generation,
+                                            },
+                                        );
+                                        tcp_state.control.keepalive_probe_in_flight = true;
+                                    } else {
+                                        collection_complete = false;
+                                    }
+                                } else {
+                                    collection_complete = false;
+                                }
                             }
                         }
                     }
                 }
-            }
-            drop(tcp_guard);
 
-            if mark_timeout_close {
-                sock.mark_closed();
-            }
-
-            // Initialize TIME_WAIT timestamp if needed
-            if need_init_timestamp {
-                let mut guard = sock.tcp.lock();
-                if let Some(tcp_state) = guard.as_mut() {
-                    if tcp_state.control.state == TcpState::TimeWait
-                        && tcp_state.control.time_wait_start == 0
-                    {
-                        tcp_state.control.time_wait_start = current_time_ms;
-                    }
-                }
-            }
-
-            // Initialize FIN timestamp if needed
-            if need_init_fin_time {
-                let mut guard = sock.tcp.lock();
-                if let Some(tcp_state) = guard.as_mut() {
-                    if matches!(
-                        tcp_state.control.state,
-                        TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
-                    ) && tcp_state.control.fin_sent
-                        && tcp_state.control.fin_sent_time == 0
-                    {
-                        tcp_state.control.fin_sent_time = current_time_ms;
-                    }
-                }
-            }
-
-            // Build FIN retransmission segment
-            if need_fin_retransmit {
-                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
-                    let mut guard = sock.tcp.lock();
-                    if let Some(tcp_state) = guard.as_mut() {
+                // Build and publish FIN retransmission work while the same TCB
+                // identity/state lock used for detection is still held. Packet
+                // and worklist allocation complete before retry counters move.
+                if need_fin_retransmit && !should_cleanup {
+                    if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
                         if matches!(
                             tcp_state.control.state,
                             TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
                         ) && tcp_state.control.fin_sent
+                            && !tcp_state.control.fin_retransmit_in_flight
                             && tcp_state.control.fin_retries < TCP_MAX_FIN_RETRIES
                         {
                             let window_after = tcp_state
@@ -10347,52 +12251,71 @@ impl SocketTable {
                             let seq = tcp_state.control.snd_nxt.wrapping_sub(1);
                             let ack = tcp_state.control.rcv_nxt;
 
-                            let seg = build_tcp_segment(
-                                local_ip,
-                                remote_ip,
-                                local_port,
-                                remote_port,
-                                seq,
-                                ack,
-                                TCP_FLAG_FIN | TCP_FLAG_ACK,
-                                Self::encode_adv_window(&tcp_state.control, window_after),
-                                &[],
-                            );
-
-                            tcp_state.control.fin_retries =
-                                tcp_state.control.fin_retries.saturating_add(1);
-                            tcp_state.control.fin_sent_time = current_time_ms;
-
-                            fin_retransmit.push((remote_ip, seg, sock.net_ns_id.0));
+                            let prepared = if fin_retransmit.ensure_capacity_for(1).is_err() {
+                                None
+                            } else {
+                                try_build_tcp_segment_admitted(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    seq,
+                                    ack,
+                                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                    Self::encode_adv_window(&tcp_state.control, window_after),
+                                    &[],
+                                )
+                                .ok()
+                            };
+                            if let Some(segment) = prepared {
+                                Self::publish_timer_work(
+                                    &mut fin_retransmit,
+                                    FinRetransmitWork {
+                                        sock: sock.clone(),
+                                        dst_ip: remote_ip,
+                                        packet: segment,
+                                        net_ns_id: sock.net_ns_id.0,
+                                    },
+                                );
+                                tcp_state.control.fin_retransmit_in_flight = true;
+                            } else {
+                                collection_complete = false;
+                            }
                         }
+                    }
+                }
+
+                // RF180-7 FIX: this is the cleanup commit point for every
+                // blocking timer kind (TIME_WAIT, FIN_WAIT_2, FIN retry, data
+                // retry, and keepalive). No observer can make ACK/FIN progress
+                // between the due-state proof and the Closed publication.
+                if should_cleanup {
+                    if cleanup_slot_ready {
+                        tcp_state.control.state = TcpState::Closed;
+                        Self::publish_timer_work(&mut to_cleanup, sock.clone());
+                        queued_timeout_close = mark_timeout_close;
+                    } else {
+                        collection_complete = false;
                     }
                 }
             }
+            drop(tcp_guard);
 
-            // Handle cleanup
-            if should_cleanup {
-                if mark_timeout_close {
-                    to_cleanup.push(sock.clone());
-                } else {
-                    let mut guard = sock.tcp.lock();
-                    if let Some(tcp_state) = guard.as_mut() {
-                        if tcp_state.control.state == TcpState::TimeWait
-                            || matches!(
-                                tcp_state.control.state,
-                                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
-                            )
-                        {
-                            tcp_state.control.state = TcpState::Closed;
-                            to_cleanup.push(sock.clone());
-                        }
-                    }
-                }
+            // mark_closed() re-enters the TCB to wake waiters, so call it only
+            // after the transaction lock is released. The Closed transition and
+            // cleanup Arc are already durably committed at this point.
+            if queued_timeout_close {
+                sock.mark_closed();
             }
 
             // R148-3 FIX: Defer SYN queue sweep outside sockets lock to avoid
             // AB-BA deadlock with the RX SYN handler path.
             if sweep_time_wait && sock.is_listening() {
-                listeners_to_sweep.push(sock.clone());
+                if listeners_to_sweep.ensure_capacity_for(1).is_ok() {
+                    Self::publish_timer_work(&mut listeners_to_sweep, sock.clone());
+                } else {
+                    collection_complete = false;
+                }
             }
         }
 
@@ -10405,15 +12328,24 @@ impl SocketTable {
             for listener in &listeners_to_sweep {
                 let mut listen_guard = listener.listen.lock();
                 if let Some(listen_state) = listen_guard.as_mut() {
-                    let mut expired_keys: Vec<TcpLookupKey> = Vec::new();
-                    for (key, pending) in listen_state.syn_queue.iter() {
-                        if current_time_ms.saturating_sub(pending.syn_sent_at) >= TCP_SYN_TIMEOUT_MS
-                        {
-                            expired_keys.push(*key);
+                    loop {
+                        let expired_key = listen_state
+                            .syn_queue
+                            .iter()
+                            .find(|(_, pending)| {
+                                current_time_ms.saturating_sub(pending.syn_sent_at)
+                                    >= TCP_SYN_TIMEOUT_MS
+                            })
+                            .map(|(key, _)| *key);
+                        let Some(key) = expired_key else {
+                            break;
+                        };
+                        // Reserve the irreversible cleanup handoff before removing
+                        // the SYN entry/counters. On OOM leave it queued for retry.
+                        if syn_timeouts.ensure_capacity_for(1).is_err() {
+                            collection_complete = false;
+                            break;
                         }
-                    }
-
-                    for key in expired_keys {
                         if let Some(pending) = listen_state.take_syn(&key, self) {
                             let rst_seg = {
                                 let mut tcb_guard = pending.sock.tcp.lock();
@@ -10424,7 +12356,7 @@ impl SocketTable {
                                     let seq = tcb.control.snd_nxt;
                                     let ack = tcb.control.rcv_nxt;
 
-                                    Some(build_tcp_segment(
+                                    try_build_tcp_segment_admitted(
                                         local_ip,
                                         remote_ip,
                                         key.2,
@@ -10434,90 +12366,67 @@ impl SocketTable {
                                         TCP_FLAG_RST | TCP_FLAG_ACK,
                                         0,
                                         &[],
-                                    ))
+                                    )
+                                    .ok()
                                 } else {
                                     None
                                 }
                             };
 
-                            syn_timeouts.push((
-                                pending.sock.clone(),
-                                Ipv4Addr(key.3.to_be_bytes()),
-                                rst_seg,
-                            ));
+                            Self::publish_timer_work(
+                                &mut syn_timeouts,
+                                (pending.sock, Ipv4Addr(key.3.to_be_bytes()), rst_seg),
+                            );
                         }
                     }
                 }
             }
         }
 
-        // Cleanup phase (outside sockets lock)
-        let mut ids_to_remove: Vec<u64> = Vec::new();
-        for sock in &to_cleanup {
-            self.cleanup_tcp_connection(sock);
+        // Cleanup phase (outside sockets lock). Pop work directly; no secondary
+        // ID/namespace vectors are needed, so cleanup remains allocation-free.
+        while let Some(sock) = to_cleanup.pop() {
+            self.cleanup_tcp_connection(&sock);
             if sock.is_closed() {
-                ids_to_remove.push(sock.id);
+                if self.sockets.write().remove(&sock.id).is_some() {
+                    self.dec_ns_count(sock.net_ns_id);
+                }
             }
         }
 
-        for (child, dst_ip, rst_seg) in syn_timeouts {
+        while let Some((child, dst_ip, rst_seg)) = syn_timeouts.pop() {
             let child_ns = child.net_ns_id.0;
             child.mark_closed();
             self.cleanup_tcp_connection(&child);
             if let Some(seg) = rst_seg {
                 let _ = transmit_tcp_segment(dst_ip, &seg, child_ns);
             }
-            ids_to_remove.push(child.id);
-        }
-
-        // R129-2 FIX: Mirror the non-blocking sweep path (run_tcp_timers) and
-        // decrement per-namespace socket count when actually removing sockets.
-        // For sockets already removed by cleanup_tcp_connection (mark_closed path),
-        // remove() returns None and dec_ns_count is not called (no double-decrement).
-        let mut ns_ids_to_decrement: Vec<NamespaceId> = Vec::new();
-        if !ids_to_remove.is_empty() {
-            let mut sockets = self.sockets.write();
-            for id in ids_to_remove {
-                if let Some(sock) = sockets.remove(&id) {
-                    ns_ids_to_decrement.push(sock.net_ns_id);
-                }
+            if self.sockets.write().remove(&child.id).is_some() {
+                self.dec_ns_count(child.net_ns_id);
             }
         }
-        for ns_id in ns_ids_to_decrement {
-            self.dec_ns_count(ns_id);
-        }
 
-        for (dst_ip, seg, ns_id) in fin_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
-        }
-
-        for (dst_ip, seg, ns_id) in data_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
-        }
-
-        // R148-I3 + R160-8 FIX: Send keepalive probes with conntrack seeding.
-        // Without conntrack refresh, idle connections could see their conntrack
-        // entry expire while the socket layer still considers the connection alive.
-        for (dst_ip, seg, ns_id, local_ip, local_port, remote_port) in keepalive_probes {
-            #[cfg(feature = "conntrack")]
-            {
-                use crate::conntrack::ct_process_tcp;
-                let _ = ct_process_tcp(
-                    ns_id,
-                    local_ip,
-                    dst_ip,
-                    local_port,
-                    remote_port,
-                    TCP_FLAG_ACK,
-                    0,
-                    current_time_ms,
-                );
+        while let Some(work) = fin_retransmit.pop() {
+            if !self.finish_fin_retransmit(work, current_time_ms) {
+                collection_complete = false;
             }
-            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
-        // Blocking variant always succeeds
-        true
+        while let Some(work) = data_retransmit.pop() {
+            if !self.finish_data_retransmit(work, current_time_ms) {
+                collection_complete = false;
+            }
+        }
+
+        // Generic egress refreshes conntrack transactionally; no pre-seed is
+        // allowed before the queue operation.
+        while let Some(work) = keepalive_probes.pop() {
+            if !self.finish_keepalive(work) {
+                collection_complete = false;
+            }
+        }
+
+        collection_complete
     }
 
     /// Clean up TCP connection resources (bindings and 4-tuple registration).
@@ -10528,7 +12437,7 @@ impl SocketTable {
     /// If the socket was marked closed by close() (indicating graceful shutdown
     /// initiated by the local side), this function also removes the socket from
     /// the sockets map to prevent memory leaks.
-    fn cleanup_tcp_connection(&self, sock: &Arc<SocketState>) {
+    fn cleanup_tcp_connection(&self, sock: &SocketArc) {
         let meta = sock.meta_snapshot();
 
         // R51-1 FIX: Only remove local port binding if this socket owns it.
@@ -10605,19 +12514,9 @@ impl SocketTable {
         ) {
             let key =
                 tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
-            if self.tcp_conns.lock().remove(&key).is_some() {
-                // J2-1: uncharge the per-namespace connection (bound to tcp_conns
-                // membership, independent of counted_in_active).
-                self.dec_ns_conn(key.0);
-                // R121-3 FIX: Only decrement the global active connection counter
-                // if this socket was previously counted via try_inc_active_conn()
-                // in queue_accept(). Client-initiated connections (sys_connect)
-                // are never counted, so decrementing them would artificially lower
-                // the counter and weaken connection-flood DoS protection.
-                if sock.counted_in_active.load(Ordering::Acquire) {
-                    dec_active_conn();
-                }
-            }
+            // RF180-36 FIX: metadata is a snapshot, so ownership must be checked
+            // against the live Weak before removing a potentially reused tuple.
+            self.remove_tcp_conn_exact_owner(key, sock);
         }
 
         // Clear remote metadata to allow retry
@@ -10683,12 +12582,23 @@ impl SocketTable {
     /// # Arguments
     ///
     /// * `sock` - The socket with a connection attempt to abort
-    pub fn abort_tcp_connect(&self, sock: &Arc<SocketState>) {
+    pub fn abort_tcp_connect(&self, sock: &SocketArc) {
+        // R180-21 FIX: TX-failure rollback participates in the same per-socket
+        // transaction protocol as bind/connect initiation.
+        let _operation = self.lock_socket_operation(sock);
+        self.abort_tcp_connect_locked(sock);
+    }
+
+    /// Abort helper for callers already holding `sock.operation`.
+    fn abort_tcp_connect_locked(&self, sock: &SocketArc) {
         // Transition TCB to Closed state
         {
             let mut guard = sock.tcp.lock();
             if let Some(tcp_state) = guard.as_mut() {
                 tcp_state.control.state = TcpState::Closed;
+                tcp_state.control.active_open_pending = false;
+                tcp_state.control.pending_handshake = None;
+                tcp_state.control.pending_reply_token = None;
             }
         }
         // Clean up all connection resources
@@ -10708,7 +12618,7 @@ impl SocketTable {
         remote_ip: Ipv4Addr,
         header: &TcpHeader,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
+    ) -> Option<WirePacket> {
         // R63-4 FIX: Rate limit RST responses to prevent amplification attacks
         if !allow_rst(self.time_wait_now()) {
             return None;
@@ -10720,7 +12630,7 @@ impl SocketTable {
 
         if is_ack {
             // RFC 793: <SEQ=SEG.ACK><CTL=RST>
-            Some(build_tcp_segment(
+            crate::tcp::try_build_tcp_segment(
                 local_ip,
                 remote_ip,
                 header.dst_port,
@@ -10730,7 +12640,8 @@ impl SocketTable {
                 TCP_FLAG_RST,
                 0,
                 &[],
-            ))
+            )
+            .ok()
         } else {
             // RFC 793: <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
             let mut seg_len = payload.len() as u32;
@@ -10742,7 +12653,7 @@ impl SocketTable {
             }
             let ack_num = header.seq_num.wrapping_add(seg_len);
 
-            Some(build_tcp_segment(
+            crate::tcp::try_build_tcp_segment(
                 local_ip,
                 remote_ip,
                 header.dst_port,
@@ -10752,7 +12663,8 @@ impl SocketTable {
                 TCP_FLAG_RST | TCP_FLAG_ACK,
                 0,
                 &[],
-            ))
+            )
+            .ok()
         }
     }
 }
@@ -10774,11 +12686,16 @@ pub struct TableStats {
 // Global Singleton
 // ============================================================================
 
-static SOCKET_TABLE: Once<SocketTable> = Once::new();
+// RF180-52 FIX: construct the large global table directly in static storage.
+// `SocketTable` contains the 4096-slot deferred-uncharge array, so routing its
+// const constructor through `Once::call_once` materialized a value larger than
+// an AP's 16 KiB kernel stack before moving it into the singleton. Static const
+// initialization removes that transient stack object entirely.
+static SOCKET_TABLE: SocketTable = SocketTable::new();
 
 /// Get the global socket table.
 pub fn socket_table() -> &'static SocketTable {
-    SOCKET_TABLE.call_once(SocketTable::new)
+    &SOCKET_TABLE
 }
 
 // ============================================================================
@@ -10886,7 +12803,1995 @@ pub fn test_reset_counters() {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::vec::Vec;
+
+    // Tests below reset process-global TCP counters. Serialize every reset-based
+    // probe so the hosted runner's parallel scheduling cannot manufacture
+    // cross-test counter drift or hide an exactly-once cleanup regression.
+    static TEST_TCP_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_test_tcp_counters() -> std::sync::MutexGuard<'static, ()> {
+        TEST_TCP_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Host socket tests link the production `security` dependency without the
+    // kernel linker script.  Supply inert section-boundary symbols so the test
+    // binary can link; none of the socket tests execute the hardening routines
+    // that interpret these addresses.
+    #[unsafe(no_mangle)]
+    static kernel_start: u8 = 0;
+    #[unsafe(no_mangle)]
+    static text_start: u8 = 0;
+    #[unsafe(no_mangle)]
+    static text_end: u8 = 0;
+    #[unsafe(no_mangle)]
+    static rodata_start: u8 = 0;
+    #[unsafe(no_mangle)]
+    static rodata_end: u8 = 0;
+    #[unsafe(no_mangle)]
+    static data_start: u8 = 0;
+    #[unsafe(no_mangle)]
+    static data_end: u8 = 0;
+    #[unsafe(no_mangle)]
+    static bss_start: u8 = 0;
+    #[unsafe(no_mangle)]
+    static bss_end: u8 = 0;
+    #[unsafe(no_mangle)]
+    static kernel_end: u8 = 0;
+
+    fn test_socket(id: u64, ty: SocketType, proto: SocketProtocol) -> SocketArc {
+        test_socket_in_ns(id, ty, proto, NamespaceId(0))
+    }
+
+    fn test_socket_in_ns(
+        id: u64,
+        ty: SocketType,
+        proto: SocketProtocol,
+        namespace: NamespaceId,
+    ) -> SocketArc {
+        mm::publish_heap_budgets();
+        SocketState::try_new_arc(
+            id,
+            SocketDomain::Inet4,
+            ty,
+            proto,
+            SocketLabel {
+                creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+                secmark: 0,
+            },
+            namespace,
+        )
+        .expect("hosted socket admission")
+    }
+
+    #[test]
+    fn deferred_port_uncharges_do_not_alias_empty_sentinel() {
+        let mut pending = DeferredPortUncharges::new();
+
+        assert!(pending.get(&0).is_none());
+        pending.enqueue(0, 7);
+        pending.enqueue(7, 0);
+        assert!(pending.is_empty());
+
+        pending.enqueue(7, 2);
+        pending.enqueue(7, 3);
+        assert_eq!(pending.get(&7).copied(), Some(5));
+        assert_eq!(pending.take_one(), Some((7, 5)));
+        assert!(pending.is_empty());
+        assert_eq!(pending.take_one(), None);
+    }
+
+    #[test]
+    fn rf180_25_socket_arc_charge_outlives_payload_until_control_block_free() {
+        let sock = test_socket(0x1800, SocketType::Dgram, SocketProtocol::Udp);
+        let allocator = *Arc::allocator(&sock);
+        assert!(allocator.charge_is_live_for_test());
+        assert_eq!(sock.net_ns_id, NamespaceId(0));
+        let weak = Arc::downgrade(&sock);
+        drop(sock);
+        assert!(
+            allocator.charge_is_live_for_test(),
+            "payload drop must not release the Arc control-block charge"
+        );
+        drop(weak);
+        assert!(
+            !allocator.charge_is_live_for_test(),
+            "final Weak drop must deallocate then release the charge"
+        );
+    }
+
+    #[test]
+    fn rf180_25_socket_arc_allocator_capability_is_single_use() {
+        let sock = test_socket(0x1801, SocketType::Dgram, SocketProtocol::Udp);
+        let allocator = *Arc::allocator(&sock);
+        let layout = Layout::from_size_align(64, 8).expect("valid test layout");
+
+        assert!(
+            Allocator::allocate(&allocator, layout).is_err(),
+            "a copied Arc allocator capability must not allocate uncharged backing"
+        );
+        assert!(allocator.charge_is_live_for_test());
+        assert_eq!(sock.net_ns_id, NamespaceId(0));
+
+        let weak = Arc::downgrade(&sock);
+        drop(sock);
+        assert!(allocator.charge_is_live_for_test());
+        drop(weak);
+        assert!(!allocator.charge_is_live_for_test());
+    }
+
+    #[test]
+    fn rf180_25_standalone_wait_queue_uses_control_block_lifetime_charge() {
+        mm::publish_heap_budgets();
+        let queue = WaitQueue::try_new_arc().expect("standalone wait-queue admission");
+        let allocator = *Arc::allocator(&queue);
+        let weak = Arc::downgrade(&queue);
+        drop(queue);
+        assert!(allocator.charge_is_live_for_test());
+        drop(weak);
+        assert!(!allocator.charge_is_live_for_test());
+    }
+
+    #[test]
+    fn r180_registry_fault_rolls_back_quota_id_and_publication() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        table.sockets.write().fail_next_growth_for_test();
+        let label = SocketLabel {
+            creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+            secmark: 0,
+        };
+        assert!(matches!(
+            table.create_udp_socket(label, NamespaceId(41)),
+            Err(SocketError::NoMemory)
+        ));
+        assert!(table.sockets.read().is_empty());
+        assert!(table.per_ns_counts.lock().is_empty());
+        assert_eq!(table.next_socket_id.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rf180_36_stale_tcp_owner_cannot_remove_same_tuple_replacement() {
+        let _counter_guard = lock_test_tcp_counters();
+        test_reset_counters();
+        let table = SocketTable::new();
+        let namespace = NamespaceId(0x1836);
+        let local_ip = Ipv4Addr([10, 36, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 36, 0, 2]);
+        let key = tcp_map_key_from_parts(namespace, local_ip, 31_836, remote_ip, 41_836);
+        let stale = test_socket_in_ns(
+            0x1836_01,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
+            namespace,
+        );
+        let replacement = test_socket_in_ns(
+            0x1836_02,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
+            namespace,
+        );
+
+        let publish_owner = |owner: &SocketArc| {
+            let mut conns = table.tcp_conns.lock();
+            conns
+                .ensure_capacity_for(1)
+                .expect("TCP registry admission");
+            table
+                .try_inc_ns_conn(namespace)
+                .expect("namespace connection admission");
+            conns
+                .insert_unique_reserved(key, Arc::downgrade(owner))
+                .expect("exact TCP owner publication");
+            assert!(try_inc_active_conn(), "global active admission");
+            owner.counted_in_active.store(true, Ordering::Release);
+        };
+
+        // First teardown releases the old owner and clears its exactly-once bit.
+        publish_owner(&stale);
+        assert!(table.remove_tcp_conn_exact_owner(key, &stale));
+        assert!(!stale.counted_in_active.load(Ordering::Acquire));
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(!table.per_ns_conn_counts.lock().contains_key(&namespace));
+        assert_eq!(test_get_active_conn_count(), 0);
+
+        // Reuse the tuple, then replay stale cleanup from the old socket. The
+        // replacement and both of its accounting dimensions must survive.
+        publish_owner(&replacement);
+        assert!(!table.remove_tcp_conn_exact_owner(key, &stale));
+        assert!(
+            table
+                .tcp_conns
+                .lock()
+                .get(&key)
+                .and_then(|weak| weak.upgrade())
+                .map_or(false, |owner| Arc::ptr_eq(&owner, &replacement)),
+            "stale cleanup removed the replacement owner"
+        );
+        assert_eq!(
+            table.per_ns_conn_counts.lock().get(&namespace).copied(),
+            Some(1)
+        );
+        assert!(replacement.counted_in_active.load(Ordering::Acquire));
+        assert_eq!(test_get_active_conn_count(), 1);
+
+        // The exact replacement owner releases the same counters once; a
+        // duplicate cleanup is inert.
+        assert!(table.remove_tcp_conn_exact_owner(key, &replacement));
+        assert!(!table.remove_tcp_conn_exact_owner(key, &replacement));
+        assert!(!replacement.counted_in_active.load(Ordering::Acquire));
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(!table.per_ns_conn_counts.lock().contains_key(&namespace));
+        assert_eq!(test_get_active_conn_count(), 0);
+
+        // A dead Weak is not a live owner and remains the responsibility of the
+        // accounted stale-entry reaper; the exact-owner funnel must not consume
+        // it or bypass the reaper's namespace uncharge.
+        let dead = test_socket_in_ns(
+            0x1836_03,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
+            namespace,
+        );
+        let dead_weak = Arc::downgrade(&dead);
+        drop(dead);
+        {
+            let mut conns = table.tcp_conns.lock();
+            table
+                .try_inc_ns_conn(namespace)
+                .expect("dead-Weak namespace admission");
+            conns
+                .insert_unique_reserved(key, dead_weak)
+                .expect("dead-Weak registry publication");
+        }
+        assert!(!table.remove_tcp_conn_exact_owner(key, &stale));
+        assert!(table.tcp_conns.lock().contains_key(&key));
+        assert_eq!(
+            table.per_ns_conn_counts.lock().get(&namespace).copied(),
+            Some(1)
+        );
+        {
+            let mut conns = table.tcp_conns.lock();
+            table.conns_retain_accounted(&mut conns);
+        }
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(!table.per_ns_conn_counts.lock().contains_key(&namespace));
+    }
+
+    #[test]
+    fn r180_passive_syn_oom_has_no_counter_or_publication_drift() {
+        let _counter_guard = lock_test_tcp_counters();
+        test_reset_counters();
+        let table = SocketTable::new();
+        let namespace = NamespaceId(42);
+        let child = test_socket_in_ns(0x1801, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        child
+            .attach_tcp(TcpControlBlock::new_server(
+                Ipv4Addr([10, 0, 0, 1]),
+                8080,
+                Ipv4Addr([10, 0, 0, 2]),
+                40000,
+                1,
+                2,
+            ))
+            .expect("passive child waiter admission");
+        let mut listen = TcpListenState::try_new(8).expect("listen waiter admission");
+        listen.syn_queue.fail_next_growth_for_test();
+        let key = (namespace, 0x0a00_0001, 8080, 0x0a00_0002, 40000);
+        let pending = PendingSyn {
+            key,
+            sock: child,
+            syn_ack: WirePacket::try_copy_from_slice(&[1, 2, 3, 4])
+                .expect("cached SYN-ACK admission"),
+            syn_sent_at: 0,
+        };
+        assert!(!listen.queue_syn(pending, &table));
+        assert!(listen.syn_queue.is_empty());
+        assert_eq!(test_get_half_open_count(), 0);
+        assert!(!table.per_ns_syn_counts.lock().contains_key(&namespace));
+    }
+
+    #[test]
+    fn rf180_7_passive_syn_ack_build_failure_precedes_all_publication() {
+        let _counter_guard = lock_test_tcp_counters();
+        test_reset_counters();
+        let table = SocketTable::new();
+        let namespace = NamespaceId(0x1807);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let local_port = 8080;
+        let remote_port = 40_000;
+        let listener = test_socket_in_ns(99, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        listener.bind_local(local_ip, local_port);
+        listener
+            .attach_tcp(TcpControlBlock::new_listen(local_ip, local_port))
+            .expect("listener waiter admission");
+        listener.install_listen_state(TcpListenState::try_new(8).expect("listen admission"));
+        {
+            let mut bindings = table.tcp_bindings.lock();
+            SocketTable::insert_binding_charged(
+                &mut bindings,
+                (namespace, local_port),
+                &listener,
+                0,
+                BindKind::Explicit,
+            );
+        }
+
+        table
+            .fail_next_passive_syn_ack_build
+            .store(true, Ordering::Release);
+        let header = TcpHeader::new(
+            remote_port,
+            local_port,
+            100,
+            0,
+            TCP_FLAG_SYN,
+            TCP_DEFAULT_WINDOW,
+        );
+        let options = TcpOptions {
+            mss: Some(TCP_ETHERNET_MSS),
+            window_scale: Some(2),
+            sack_permitted: true,
+            ..TcpOptions::default()
+        };
+        assert!(table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &header,
+                &[],
+                &options,
+                &mut None,
+                &mut false,
+            )
+            .is_none());
+
+        assert_eq!(table.next_socket_id.load(Ordering::Relaxed), 1);
+        assert!(table.sockets.read().is_empty());
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(table.per_ns_counts.lock().is_empty());
+        assert!(table.per_ns_conn_counts.lock().is_empty());
+        assert!(table.per_ns_syn_counts.lock().is_empty());
+        assert_eq!(test_get_half_open_count(), 0);
+        assert_eq!(test_get_active_conn_count(), 0);
+        let listen = listener.listen.lock();
+        assert!(listen.as_ref().unwrap().syn_queue.is_empty());
+        assert!(listen.as_ref().unwrap().accept_queue.is_empty());
+    }
+
+    #[test]
+    fn rf180_7_simultaneous_open_build_failure_preserves_complete_tcb() {
+        let table = SocketTable::new();
+        let namespace = NamespaceId(0x1808);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let local_port = 30_000;
+        let remote_port = 40_000;
+        let sock = test_socket_in_ns(0x1808, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb = TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 77);
+        tcb.state = TcpState::SynSent;
+        tcb.snd_nxt = tcb.iss.wrapping_add(1);
+        tcb.irs = 7;
+        tcb.rcv_nxt = 8;
+        tcb.snd_wscale = 0;
+        tcb.rcv_wscale = 3;
+        tcb.wscale_requested = true;
+        tcb.wscale_received = false;
+        tcb.sack_requested = true;
+        tcb.sack_received = false;
+        tcb.snd_wnd = 9;
+        tcb.snd_wl1 = 10;
+        let before = (
+            tcb.state,
+            tcb.irs,
+            tcb.rcv_nxt,
+            tcb.snd_wscale,
+            tcb.wscale_received,
+            tcb.sack_received,
+            tcb.snd_mss,
+            tcb.cwnd,
+            tcb.snd_wnd,
+            tcb.snd_wl1,
+        );
+        sock.attach_tcp(tcb)
+            .expect("simultaneous-open waiter admission");
+
+        let key = tcp_map_key_from_parts(namespace, local_ip, local_port, remote_ip, remote_port);
+        {
+            let mut conns = table.tcp_conns.lock();
+            conns
+                .ensure_capacity_for(1)
+                .expect("connection-map admission");
+            conns
+                .insert_unique_reserved(key, Arc::downgrade(&sock))
+                .expect("simultaneous-open publication");
+        }
+
+        let header = TcpHeader::new(
+            remote_port,
+            local_port,
+            0x1234_5678,
+            0,
+            TCP_FLAG_SYN,
+            32_000,
+        );
+        let options = TcpOptions {
+            mss: Some(TCP_ETHERNET_MSS),
+            window_scale: Some(9),
+            sack_permitted: true,
+            ..TcpOptions::default()
+        };
+
+        table
+            .fail_next_simultaneous_syn_ack_build
+            .store(true, Ordering::Release);
+        assert!(table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &header,
+                &[],
+                &options,
+                &mut None,
+                &mut false,
+            )
+            .is_none());
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard
+                .as_ref()
+                .expect("TCB retained after build failure")
+                .control;
+            assert_eq!(
+                (
+                    control.state,
+                    control.irs,
+                    control.rcv_nxt,
+                    control.snd_wscale,
+                    control.wscale_received,
+                    control.sack_received,
+                    control.snd_mss,
+                    control.cwnd,
+                    control.snd_wnd,
+                    control.snd_wl1,
+                ),
+                before,
+                "failed SYN-ACK preparation must not leave stale negotiation state"
+            );
+        }
+
+        let mut reply_binding = None;
+        let syn_ack = table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &header,
+                &[],
+                &options,
+                &mut reply_binding,
+                &mut false,
+            )
+            .expect("retransmitted peer SYN must retry SYN-ACK preparation");
+        assert!(!syn_ack.is_empty());
+        let syn_ack_header =
+            crate::tcp::parse_tcp_header(&syn_ack).expect("prepared simultaneous SYN-ACK parses");
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().expect("TCB retained before commit").control;
+            assert_eq!(control.state, TcpState::SynSent);
+            assert!(control.pending_handshake.is_some());
+        }
+        let mut operation = table
+            .lock_tcp_reply_operation(
+                reply_binding
+                    .as_ref()
+                    .expect("simultaneous SYN-ACK has an identity binding"),
+                &syn_ack_header,
+            )
+            .expect("simultaneous SYN-ACK binding remains current");
+        assert!(operation.commit(&syn_ack_header, 0));
+        drop(operation);
+        let guard = sock.tcp.lock();
+        let control = &guard.as_ref().expect("TCB retained after retry").control;
+        assert_eq!(control.state, TcpState::SynReceived);
+        assert_eq!(control.irs, header.seq_num);
+        assert_eq!(control.rcv_nxt, header.seq_num.wrapping_add(1));
+        assert_eq!(control.snd_wscale, 9);
+        assert!(control.wscale_received);
+        assert!(control.sack_received);
+        assert_eq!(control.snd_mss, TCP_ETHERNET_MSS);
+        assert_eq!(control.snd_wnd, decode_window(header.window, 0));
+        assert_eq!(control.snd_wl1, header.seq_num);
+    }
+
+    #[test]
+    fn rf180_41_active_syn_ack_admission_failure_preserves_syn_sent_transaction() {
+        let table = SocketTable::new();
+        let namespace = NamespaceId(0x1841);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let local_port = 30_041;
+        let remote_port = 40_041;
+        let sock = test_socket_in_ns(0x1841, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb = TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 77);
+        tcb.state = TcpState::SynSent;
+        tcb.snd_nxt = tcb.iss.wrapping_add(1);
+        tcb.rcv_wscale = 3;
+        tcb.wscale_requested = true;
+        tcb.sack_requested = true;
+        let before_handshake = (
+            tcb.state,
+            tcb.irs,
+            tcb.rcv_nxt,
+            tcb.snd_una,
+            tcb.snd_wscale,
+            tcb.wscale_received,
+            tcb.sack_received,
+            tcb.snd_mss,
+            tcb.cwnd,
+        );
+        let before_windows = (tcb.snd_wnd, tcb.snd_wl1, tcb.snd_wl2, tcb.rcv_wnd);
+        let expected_ack = tcb.snd_nxt;
+        sock.attach_tcp(tcb)
+            .expect("active-handshake waiter admission");
+
+        let key = tcp_map_key_from_parts(namespace, local_ip, local_port, remote_ip, remote_port);
+        {
+            let mut conns = table.tcp_conns.lock();
+            conns
+                .ensure_capacity_for(1)
+                .expect("connection-map admission");
+            conns
+                .insert_unique_reserved(key, Arc::downgrade(&sock))
+                .expect("active-handshake publication");
+        }
+
+        let header = TcpHeader::new(
+            remote_port,
+            local_port,
+            0x1234_5678,
+            expected_ack,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            32_000,
+        );
+        let options = TcpOptions {
+            mss: Some(TCP_ETHERNET_MSS),
+            window_scale: Some(9),
+            sack_permitted: true,
+            ..TcpOptions::default()
+        };
+
+        WirePacket::fail_next_admission_for_test();
+        assert!(table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &header,
+                &[],
+                &options,
+                &mut None,
+                &mut false,
+            )
+            .is_none());
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard
+                .as_ref()
+                .expect("TCB retained after final-ACK allocation failure")
+                .control;
+            assert_eq!(
+                (
+                    control.state,
+                    control.irs,
+                    control.rcv_nxt,
+                    control.snd_una,
+                    control.snd_wscale,
+                    control.wscale_received,
+                    control.sack_received,
+                    control.snd_mss,
+                    control.cwnd,
+                ),
+                before_handshake,
+                "failed final-ACK preparation must leave SYN-SENT retryable"
+            );
+            assert_eq!(
+                (
+                    control.snd_wnd,
+                    control.snd_wl1,
+                    control.snd_wl2,
+                    control.rcv_wnd,
+                ),
+                before_windows,
+                "failed final-ACK preparation must preserve window state"
+            );
+        }
+
+        let mut reply_binding = None;
+        let ack = table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &header,
+                &[],
+                &options,
+                &mut reply_binding,
+                &mut false,
+            )
+            .expect("retransmitted SYN-ACK must retry final-ACK preparation");
+        let ack_header = crate::tcp::parse_tcp_header(&ack).expect("prepared final ACK parses");
+        assert_eq!(ack_header.flags, TCP_FLAG_ACK);
+        assert_eq!(ack_header.ack_num, header.seq_num.wrapping_add(1));
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().expect("TCB retained before commit").control;
+            assert_eq!(control.state, TcpState::SynSent);
+            assert!(control.pending_handshake.is_some());
+        }
+        let mut operation = table
+            .lock_tcp_reply_operation(
+                reply_binding
+                    .as_ref()
+                    .expect("final ACK has an identity binding"),
+                &ack_header,
+            )
+            .expect("final ACK binding remains current");
+        assert!(operation.commit(&ack_header, 0));
+        drop(operation);
+        let guard = sock.tcp.lock();
+        let control = &guard
+            .as_ref()
+            .expect("TCB retained after handshake")
+            .control;
+        assert_eq!(control.state, TcpState::Established);
+        assert_eq!(control.rcv_nxt, header.seq_num.wrapping_add(1));
+        assert_eq!(control.snd_wscale, 9);
+        assert!(control.wscale_received);
+        assert!(control.sack_received);
+    }
+
+    #[test]
+    fn rf180_41_fast_retransmit_admission_failure_preserves_retry_state() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 30_042, remote_ip, 40_042, 77);
+        tcb.state = TcpState::Established;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 104;
+        tcb.snd_wnd = 4096;
+        tcb.dup_ack_count = 2;
+        tcb.last_activity = 7;
+        tcb.keepalive_probes_sent = 3;
+        tcb.send_buffer
+            .try_push(TcpSegment {
+                seq: 100,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[1, 2, 3, 4])
+                    .expect("fast-retransmit payload admission"),
+                sent_at: 10,
+                retrans_count: 0,
+                sacked: false,
+                lost: false,
+                retransmit_pending: false,
+                retransmit_in_flight: false,
+                retransmit_requires_rto: false,
+                tx_reject_count: 0,
+                retry_not_before_ms: 0,
+            })
+            .map_err(|_| ())
+            .expect("fast-retransmit queue admission");
+        tcb.send_buffer_bytes = 4;
+        let congestion_before = (
+            tcb.cwnd,
+            tcb.ssthresh,
+            tcb.dup_ack_count,
+            tcb.congestion_state,
+            tcb.recover,
+        );
+
+        WirePacket::fail_next_admission_for_test();
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            100,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_042,
+            40_042,
+            20,
+            &[],
+            false,
+            4096,
+            |_| panic!("allocation failure must not reach the queue closure"),
+        );
+        assert!(!queued);
+        assert!(!limited);
+        assert_eq!(
+            (
+                tcb.cwnd,
+                tcb.ssthresh,
+                tcb.dup_ack_count,
+                tcb.congestion_state,
+                tcb.recover,
+            ),
+            congestion_before,
+            "failed fast-retransmit preparation must remain retriggerable"
+        );
+        let segment = tcb
+            .send_buffer
+            .front()
+            .expect("retransmit segment retained");
+        assert_eq!(segment.retrans_count, 0);
+        assert_eq!(segment.sent_at, 10);
+        assert!(!segment.retransmit_pending);
+        assert_eq!(
+            tcb.last_activity, 20,
+            "the received ACK remains valid inbound activity"
+        );
+        assert_eq!(
+            tcb.keepalive_probes_sent, 0,
+            "a peer ACK must still clear keepalive probes"
+        );
+
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            100,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_042,
+            40_042,
+            21,
+            &[],
+            false,
+            4096,
+            |_| true,
+        );
+        assert!(queued, "next duplicate ACK must retry retransmit");
+        assert!(!limited);
+        let segment = tcb
+            .send_buffer
+            .front()
+            .expect("retransmit segment retained");
+        assert_eq!(segment.retrans_count, 1);
+        assert_eq!(segment.sent_at, 21);
+        assert!(!segment.retransmit_pending);
+    }
+
+    #[test]
+    fn rf180_41_empty_send_buffer_duplicate_acks_cannot_poison_recovery() {
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 30_044, remote_ip, 40_044, 78);
+        tcb.state = TcpState::Established;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 104;
+        tcb.snd_wnd = 4096;
+        tcb.dup_ack_count = 2;
+        let congestion_before = (tcb.cwnd, tcb.ssthresh, tcb.congestion_state, tcb.recover);
+        let queue_called = core::cell::Cell::new(false);
+
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            100,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_044,
+            40_044,
+            20,
+            &[],
+            false,
+            4096,
+            |_| {
+                queue_called.set(true);
+                true
+            },
+        );
+
+        assert!(!queued);
+        assert!(!limited);
+        assert!(!queue_called.get());
+        assert_eq!(tcb.dup_ack_count, 0, "stale duplicate evidence is cleared");
+        assert_eq!(
+            (tcb.cwnd, tcb.ssthresh, tcb.congestion_state, tcb.recover,),
+            congestion_before
+        );
+    }
+
+    #[test]
+    fn rf180_41_fast_retransmit_queue_rejection_preserves_metadata() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 30_045, remote_ip, 40_045, 79);
+        tcb.state = TcpState::Established;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 104;
+        tcb.snd_wnd = 4096;
+        tcb.dup_ack_count = 2;
+        tcb.send_buffer
+            .try_push(TcpSegment {
+                seq: 100,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[1, 2, 3, 4])
+                    .expect("fast-retransmit payload admission"),
+                sent_at: 10,
+                retrans_count: 0,
+                sacked: false,
+                lost: false,
+                retransmit_pending: false,
+                retransmit_in_flight: false,
+                retransmit_requires_rto: true,
+                tx_reject_count: 0,
+                retry_not_before_ms: 0,
+            })
+            .map_err(|_| ())
+            .expect("fast-retransmit queue admission");
+        tcb.send_buffer_bytes = 4;
+        let congestion_before = (
+            tcb.cwnd,
+            tcb.ssthresh,
+            tcb.dup_ack_count,
+            tcb.congestion_state,
+            tcb.recover,
+        );
+        let queue_called = core::cell::Cell::new(false);
+
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            100,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_045,
+            40_045,
+            20,
+            &[],
+            false,
+            4096,
+            |_| {
+                queue_called.set(true);
+                false
+            },
+        );
+
+        assert!(!queued);
+        assert!(!limited);
+        assert!(queue_called.get());
+        assert_eq!(
+            (
+                tcb.cwnd,
+                tcb.ssthresh,
+                tcb.dup_ack_count,
+                tcb.congestion_state,
+                tcb.recover,
+            ),
+            congestion_before,
+            "QueueFull cannot publish Fast Recovery"
+        );
+        let segment = tcb.send_buffer.front().expect("segment retained");
+        assert!(segment.retransmit_pending);
+        assert!(segment.retransmit_requires_rto);
+        assert!(!segment.retransmit_in_flight);
+        assert_eq!(segment.retrans_count, 0);
+        assert_eq!(segment.sent_at, 10);
+    }
+
+    #[test]
+    fn rf180_41_newreno_partial_ack_allocation_failure_retries_pending_segment() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 30_043, remote_ip, 40_043, 77);
+        tcb.state = TcpState::Established;
+        tcb.congestion_state = crate::tcp::TcpCongestionState::FastRecovery;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 108;
+        tcb.recover = 108;
+        tcb.snd_wnd = 4096;
+
+        for (seq, bytes) in [(100, &[1u8, 2, 3, 4][..]), (104, &[5u8, 6, 7, 8][..])] {
+            tcb.send_buffer
+                .try_push(TcpSegment {
+                    seq,
+                    data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, bytes)
+                        .expect("NewReno payload admission"),
+                    sent_at: 10,
+                    retrans_count: 0,
+                    sacked: false,
+                    lost: false,
+                    retransmit_pending: false,
+                    retransmit_in_flight: false,
+                    retransmit_requires_rto: false,
+                    tx_reject_count: 0,
+                    retry_not_before_ms: 0,
+                })
+                .map_err(|_| ())
+                .expect("NewReno queue admission");
+        }
+        tcb.send_buffer_bytes = 8;
+
+        WirePacket::fail_next_admission_for_test();
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            104,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_043,
+            40_043,
+            20,
+            &[],
+            false,
+            4096,
+            |_| panic!("allocation failure must not reach the queue closure"),
+        );
+        assert!(!queued);
+        assert!(!limited);
+        assert_eq!(tcb.snd_una, 104, "valid partial-ACK progress is retained");
+        assert_eq!(tcb.send_buffer.len(), 1);
+        let pending = tcb.send_buffer.front().expect("remaining NewReno segment");
+        assert_eq!(pending.seq, 104);
+        assert!(pending.retransmit_pending);
+        assert_eq!(pending.retrans_count, 0);
+        assert_eq!(pending.sent_at, 10);
+
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            104,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_043,
+            40_043,
+            21,
+            &[],
+            false,
+            4096,
+            |_| true,
+        );
+        assert!(queued, "the next ACK must retry pending NewReno work");
+        assert!(!limited);
+        let retried = tcb.send_buffer.front().expect("retried NewReno segment");
+        assert!(!retried.retransmit_pending);
+        assert_eq!(retried.retrans_count, 1);
+        assert_eq!(retried.sent_at, 21);
+    }
+
+    #[test]
+    fn rf180_41_newreno_queue_rejection_preserves_retransmit_metadata() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 30_046, remote_ip, 40_046, 80);
+        tcb.state = TcpState::Established;
+        tcb.congestion_state = crate::tcp::TcpCongestionState::FastRecovery;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 108;
+        tcb.recover = 108;
+        tcb.snd_wnd = 4096;
+        for (seq, bytes) in [(100, &[1u8, 2, 3, 4][..]), (104, &[5u8, 6, 7, 8][..])] {
+            tcb.send_buffer
+                .try_push(TcpSegment {
+                    seq,
+                    data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, bytes)
+                        .expect("NewReno payload admission"),
+                    sent_at: 10,
+                    retrans_count: 0,
+                    sacked: false,
+                    lost: false,
+                    retransmit_pending: false,
+                    retransmit_in_flight: false,
+                    retransmit_requires_rto: false,
+                    tx_reject_count: 0,
+                    retry_not_before_ms: 0,
+                })
+                .map_err(|_| ())
+                .expect("NewReno queue admission");
+        }
+        tcb.send_buffer_bytes = 8;
+
+        let (queued, limited) = table.apply_ack_and_cc(
+            &mut tcb,
+            104,
+            TCP_DEFAULT_WINDOW,
+            local_ip,
+            remote_ip,
+            30_046,
+            40_046,
+            20,
+            &[],
+            false,
+            4096,
+            |_| false,
+        );
+
+        assert!(!queued);
+        assert!(!limited);
+        assert_eq!(tcb.snd_una, 104, "the peer's valid ACK remains committed");
+        assert_eq!(tcb.send_buffer.len(), 1);
+        let segment = tcb.send_buffer.front().expect("remaining segment retained");
+        assert_eq!(segment.seq, 104);
+        assert!(segment.retransmit_pending);
+        assert!(!segment.retransmit_in_flight);
+        assert_eq!(segment.retrans_count, 0);
+        assert_eq!(segment.sent_at, 10);
+    }
+
+    #[test]
+    fn rf180_41_timer_queue_rejection_preserves_data_fin_and_keepalive_metadata() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+
+        let data_sock = test_socket(0x1804_4101, SocketType::Stream, SocketProtocol::Tcp);
+        let mut data_tcb = TcpControlBlock::new_client(local_ip, 31_001, remote_ip, 41_001, 81);
+        data_tcb.state = TcpState::Established;
+        data_tcb.peer_ack_generation = 7;
+        data_tcb.retries = 2;
+        data_tcb.rto_ms = 500;
+        data_tcb.last_activity = 9;
+        data_tcb
+            .send_buffer
+            .try_push(TcpSegment {
+                seq: 100,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[1, 2, 3, 4])
+                    .expect("timer payload admission"),
+                sent_at: 10,
+                retrans_count: 0,
+                sacked: false,
+                lost: false,
+                retransmit_pending: true,
+                retransmit_in_flight: true,
+                retransmit_requires_rto: true,
+                tx_reject_count: 0,
+                retry_not_before_ms: 0,
+            })
+            .map_err(|_| ())
+            .expect("timer segment admission");
+        data_tcb.send_buffer_bytes = 4;
+        let data_cwnd = data_tcb.cwnd;
+        data_sock.attach_tcp(data_tcb).expect("attach data TCB");
+        assert!(!table.finish_data_retransmit_with_queue(
+            DataRetransmitWork {
+                sock: data_sock.clone(),
+                dst_ip: remote_ip,
+                packet: WirePacket::try_copy_from_slice(&[0xaa; 20])
+                    .expect("data work packet admission"),
+                net_ns_id: 0,
+                seq: 100,
+                ack_generation: 7,
+            },
+            20,
+            |_, _, _| false,
+        ));
+        {
+            let guard = data_sock.tcp.lock();
+            let control = &guard.as_ref().expect("data TCB retained").control;
+            let segment = control.send_buffer.front().expect("data segment retained");
+            assert!(segment.retransmit_pending);
+            assert!(!segment.retransmit_in_flight);
+            assert!(segment.retransmit_requires_rto);
+            assert_eq!(segment.sent_at, 10);
+            assert_eq!(segment.retrans_count, 0);
+            assert_eq!(control.retries, 2);
+            assert_eq!(control.rto_ms, 500);
+            assert_eq!(control.cwnd, data_cwnd);
+            assert_eq!(control.last_activity, 9);
+        }
+
+        let fin_sock = test_socket(0x1804_4102, SocketType::Stream, SocketProtocol::Tcp);
+        let mut fin_tcb = TcpControlBlock::new_client(local_ip, 31_002, remote_ip, 41_002, 82);
+        fin_tcb.state = TcpState::FinWait1;
+        fin_tcb.fin_sent = true;
+        fin_tcb.fin_retransmit_in_flight = true;
+        fin_tcb.fin_retries = 3;
+        fin_tcb.fin_sent_time = 11;
+        fin_sock.attach_tcp(fin_tcb).expect("attach FIN TCB");
+        assert!(!table.finish_fin_retransmit_with_queue(
+            FinRetransmitWork {
+                sock: fin_sock.clone(),
+                dst_ip: remote_ip,
+                packet: WirePacket::try_copy_from_slice(&[0xbb; 20])
+                    .expect("FIN work packet admission"),
+                net_ns_id: 0,
+            },
+            21,
+            |_, _, _| false,
+        ));
+        {
+            let guard = fin_sock.tcp.lock();
+            let control = &guard.as_ref().expect("FIN TCB retained").control;
+            assert!(!control.fin_retransmit_in_flight);
+            assert_eq!(control.fin_retries, 3);
+            assert_eq!(control.fin_sent_time, 11);
+        }
+
+        let keepalive_sock = test_socket(0x1804_4103, SocketType::Stream, SocketProtocol::Tcp);
+        let mut keepalive_tcb =
+            TcpControlBlock::new_client(local_ip, 31_003, remote_ip, 41_003, 83);
+        keepalive_tcb.state = TcpState::Established;
+        keepalive_tcb.keepalive_enabled = true;
+        keepalive_tcb.keepalive_probe_in_flight = true;
+        keepalive_tcb.keepalive_probes_sent = 2;
+        keepalive_tcb.peer_ack_generation = 9;
+        keepalive_sock
+            .attach_tcp(keepalive_tcb)
+            .expect("attach keepalive TCB");
+        assert!(!table.finish_keepalive_with_queue(
+            KeepaliveWork {
+                sock: keepalive_sock.clone(),
+                dst_ip: remote_ip,
+                packet: WirePacket::try_copy_from_slice(&[0xcc; 20])
+                    .expect("keepalive work packet admission"),
+                net_ns_id: 0,
+                ack_generation: 9,
+            },
+            |_, _, _| false,
+        ));
+        let guard = keepalive_sock.tcp.lock();
+        let control = &guard.as_ref().expect("keepalive TCB retained").control;
+        assert!(!control.keepalive_probe_in_flight);
+        assert_eq!(control.keepalive_probes_sent, 2);
+    }
+
+    #[test]
+    fn rf180_41_peer_ack_generation_suppresses_false_rto_and_keepalive_publication() {
+        mm::publish_heap_budgets();
+        let table = SocketTable::new();
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+
+        let data_sock = test_socket(0x1804_4111, SocketType::Stream, SocketProtocol::Tcp);
+        let mut data_tcb = TcpControlBlock::new_client(local_ip, 31_011, remote_ip, 41_011, 84);
+        data_tcb.state = TcpState::Established;
+        data_tcb.peer_ack_generation = 2;
+        data_tcb.retries = 4;
+        data_tcb.rto_ms = 600;
+        data_tcb
+            .send_buffer
+            .try_push(TcpSegment {
+                seq: 200,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[5, 6, 7, 8])
+                    .expect("ACK-race payload admission"),
+                sent_at: 12,
+                retrans_count: 0,
+                sacked: false,
+                lost: false,
+                retransmit_pending: true,
+                retransmit_in_flight: true,
+                retransmit_requires_rto: true,
+                tx_reject_count: 0,
+                retry_not_before_ms: 0,
+            })
+            .map_err(|_| ())
+            .expect("ACK-race segment admission");
+        data_tcb.send_buffer_bytes = 4;
+        let data_cwnd = data_tcb.cwnd;
+        data_sock.attach_tcp(data_tcb).expect("attach ACK-race TCB");
+        assert!(table.finish_data_retransmit_with_queue(
+            DataRetransmitWork {
+                sock: data_sock.clone(),
+                dst_ip: remote_ip,
+                packet: WirePacket::try_copy_from_slice(&[0xdd; 20])
+                    .expect("ACK-race work packet admission"),
+                net_ns_id: 0,
+                seq: 200,
+                ack_generation: 1,
+            },
+            30,
+            |_, _, _| true,
+        ));
+        {
+            let guard = data_sock.tcp.lock();
+            let control = &guard.as_ref().expect("ACK-race TCB retained").control;
+            let segment = control
+                .send_buffer
+                .front()
+                .expect("ACK-race segment retained");
+            assert_eq!(segment.retrans_count, 1);
+            assert_eq!(segment.sent_at, 30);
+            assert!(!segment.retransmit_pending);
+            assert!(!segment.retransmit_requires_rto);
+            assert_eq!(control.retries, 4, "peer ACK suppresses false RTO retry");
+            assert_eq!(control.rto_ms, 600, "peer ACK suppresses false backoff");
+            assert_eq!(
+                control.cwnd, data_cwnd,
+                "peer ACK suppresses false loss recovery"
+            );
+        }
+
+        let keepalive_sock = test_socket(0x1804_4112, SocketType::Stream, SocketProtocol::Tcp);
+        let mut keepalive_tcb =
+            TcpControlBlock::new_client(local_ip, 31_012, remote_ip, 41_012, 85);
+        keepalive_tcb.state = TcpState::Established;
+        keepalive_tcb.keepalive_enabled = true;
+        keepalive_tcb.keepalive_probe_in_flight = true;
+        keepalive_tcb.keepalive_probes_sent = 0;
+        keepalive_tcb.peer_ack_generation = 2;
+        keepalive_sock
+            .attach_tcp(keepalive_tcb)
+            .expect("attach keepalive ACK-race TCB");
+        assert!(table.finish_keepalive_with_queue(
+            KeepaliveWork {
+                sock: keepalive_sock.clone(),
+                dst_ip: remote_ip,
+                packet: WirePacket::try_copy_from_slice(&[0xee; 20])
+                    .expect("keepalive ACK-race work packet admission"),
+                net_ns_id: 0,
+                ack_generation: 1,
+            },
+            |_, _, _| true,
+        ));
+        let guard = keepalive_sock.tcp.lock();
+        let control = &guard
+            .as_ref()
+            .expect("keepalive ACK-race TCB retained")
+            .control;
+        assert!(!control.keepalive_probe_in_flight);
+        assert_eq!(control.keepalive_probes_sent, 0);
+    }
+
+    fn assert_timer_cleanup_reserve_failure_is_retryable<F>(
+        state: TcpState,
+        sweep_time_wait: bool,
+        configure: F,
+    ) where
+        F: FnOnce(&mut TcpControlBlock),
+    {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1807, SocketType::Stream, SocketProtocol::Tcp);
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 1]),
+            30_000,
+            Ipv4Addr([10, 0, 0, 2]),
+            40_000,
+            1,
+        );
+        tcb.state = state;
+        configure(&mut tcb);
+        // RF180-25 FIX: timer eligibility depends on the socket metadata
+        // 4-tuple, not merely the TCB key. The old keepalive case omitted this
+        // publication and therefore never reached the fifth cleanup kind.
+        sock.bind_local(tcb.key.local_ip, tcb.key.local_port);
+        sock.set_remote(tcb.key.remote_ip, tcb.key.remote_port);
+        sock.attach_tcp(tcb).expect("timer test waiter admission");
+        {
+            let mut sockets = table.sockets.write();
+            sockets
+                .ensure_capacity_for(1)
+                .expect("timer registry admission");
+            sockets
+                .insert_unique_reserved(sock.id, sock.clone())
+                .expect("timer socket publication");
+        }
+
+        table
+            .fail_next_timer_cleanup_reserve
+            .store(true, Ordering::Release);
+        assert!(
+            !table.run_tcp_timers_blocking(1_000_000, sweep_time_wait),
+            "cleanup handoff OOM must preserve deferred retry"
+        );
+        assert_eq!(
+            sock.tcp_state(),
+            Some(state),
+            "cleanup handoff OOM must not publish Closed"
+        );
+        assert!(table.sockets.read().contains_key(&sock.id));
+
+        assert!(table.run_tcp_timers_blocking(1_000_000, sweep_time_wait));
+        assert!(
+            sock.tcp.lock().is_none(),
+            "retry with a prepared handoff must complete cleanup"
+        );
+    }
+
+    #[test]
+    fn rf180_25_all_five_timer_cleanup_kinds_roll_back_on_worklist_oom() {
+        let mut completed_cases = 0usize;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::TimeWait, true, |tcb| {
+            tcb.time_wait_start = 1;
+        });
+        completed_cases += 1;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::FinWait2, true, |tcb| {
+            tcb.fin_wait2_start = 1;
+        });
+        completed_cases += 1;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::FinWait1, false, |tcb| {
+            tcb.fin_sent = true;
+            tcb.fin_sent_time = 1;
+            tcb.fin_retries = TCP_MAX_FIN_RETRIES;
+        });
+        completed_cases += 1;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::Established, false, |tcb| {
+            tcb.retries = TCP_MAX_RETRIES;
+        });
+        completed_cases += 1;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::Established, false, |tcb| {
+            tcb.keepalive_enabled = true;
+            tcb.keepalive_idle_ms = 1;
+            tcb.keepalive_interval_ms = 1;
+            tcb.keepalive_probes_sent = tcb.keepalive_probes_max;
+            tcb.last_activity = 1;
+        });
+        completed_cases += 1;
+        assert_eq!(completed_cases, 5, "all timer cleanup classes must execute");
+    }
+
+    #[test]
+    fn rf180_7_ack_and_fin_progress_win_before_timer_transaction() {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1808, SocketType::Stream, SocketProtocol::Tcp);
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 1]),
+            30_001,
+            Ipv4Addr([10, 0, 0, 2]),
+            40_001,
+            1,
+        );
+        // Model an expired FIN_WAIT_2 observation followed by peer FIN progress
+        // before the timer obtains the TCB transaction lock.
+        tcb.state = TcpState::TimeWait;
+        tcb.fin_wait2_start = 1;
+        tcb.time_wait_start = 999_999;
+        // Model a previously exhausted data timer whose ACK progress reset the
+        // retry state before this transaction begins.
+        tcb.retries = 0;
+        tcb.last_activity = 999_999;
+        sock.attach_tcp(tcb)
+            .expect("timer progress waiter admission");
+        {
+            let mut sockets = table.sockets.write();
+            sockets
+                .ensure_capacity_for(1)
+                .expect("timer registry admission");
+            sockets
+                .insert_unique_reserved(sock.id, sock.clone())
+                .expect("timer socket publication");
+        }
+
+        assert!(table.run_tcp_timers_blocking(1_000_000, true));
+        let guard = sock.tcp.lock();
+        let live = &guard.as_ref().expect("progressed TCB must survive").control;
+        assert_eq!(live.state, TcpState::TimeWait);
+        assert_eq!(live.time_wait_start, 999_999);
+        assert_eq!(live.retries, 0);
+    }
+
+    #[test]
+    fn r180_stateful_passive_publication_rolls_back_id_and_all_accounting() {
+        let _counter_guard = lock_test_tcp_counters();
+        test_reset_counters();
+        let table = SocketTable::new();
+        let namespace = NamespaceId(43);
+
+        // Occupy ID 1 without advancing the allocator. This injects the only
+        // post-ID failure that the reserved publication path can encounter and
+        // proves the rollback is exact while `sockets.write()` serializes IDs.
+        let blocker = test_socket(1, SocketType::Dgram, SocketProtocol::Udp);
+        {
+            let mut sockets = table.sockets.write();
+            sockets.ensure_capacity_for(1).expect("registry admission");
+            sockets
+                .insert_unique_reserved(1, blocker)
+                .expect("ID blocker publication");
+        }
+
+        let child = test_socket_in_ns(0, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        child
+            .attach_tcp(TcpControlBlock::new_server(
+                Ipv4Addr([10, 0, 0, 1]),
+                8080,
+                Ipv4Addr([10, 0, 0, 2]),
+                40000,
+                1,
+                2,
+            ))
+            .expect("passive child waiter admission");
+        let mut listen = TcpListenState::try_new(8).expect("listen waiter admission");
+        let key = (namespace, 0x0a00_0001, 8080, 0x0a00_0002, 40000);
+        let cached =
+            WirePacket::try_copy_from_slice(&[1, 2, 3, 4]).expect("cached SYN-ACK admission");
+
+        assert!(!table.try_publish_pending_syn_child(&mut listen, key, child, cached, 0));
+        assert_eq!(table.next_socket_id.load(Ordering::Relaxed), 1);
+        assert_eq!(table.sockets.read().len(), 1);
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(listen.syn_queue.is_empty());
+        assert!(table.per_ns_counts.lock().is_empty());
+        assert!(table.per_ns_conn_counts.lock().is_empty());
+        assert!(table.per_ns_syn_counts.lock().is_empty());
+        assert_eq!(test_get_half_open_count(), 0);
+    }
+
+    #[test]
+    fn r180_cookie_passive_publication_rolls_back_id_accept_and_active_count() {
+        let _counter_guard = lock_test_tcp_counters();
+        test_reset_counters();
+        let table = SocketTable::new();
+        let namespace = NamespaceId(44);
+        let blocker = test_socket(1, SocketType::Dgram, SocketProtocol::Udp);
+        {
+            let mut sockets = table.sockets.write();
+            sockets.ensure_capacity_for(1).expect("registry admission");
+            sockets
+                .insert_unique_reserved(1, blocker)
+                .expect("ID blocker publication");
+        }
+
+        let listener = test_socket_in_ns(99, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        listener.install_listen_state(TcpListenState::try_new(8).expect("listen admission"));
+        let child = test_socket_in_ns(0, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        let mut tcb = TcpControlBlock::new_server(
+            Ipv4Addr([10, 0, 0, 1]),
+            8080,
+            Ipv4Addr([10, 0, 0, 2]),
+            40000,
+            1,
+            2,
+        );
+        tcb.state = TcpState::Established;
+        child
+            .attach_tcp(tcb)
+            .expect("cookie child waiter admission");
+        let key = (namespace, 0x0a00_0001, 8080, 0x0a00_0002, 40000);
+
+        assert!(!table.try_publish_cookie_child(&listener, key, child));
+        assert_eq!(table.next_socket_id.load(Ordering::Relaxed), 1);
+        assert_eq!(table.sockets.read().len(), 1);
+        assert!(table.tcp_conns.lock().is_empty());
+        let listen = listener.listen.lock();
+        assert!(listen.as_ref().unwrap().accept_queue.is_empty());
+        drop(listen);
+        assert!(table.per_ns_counts.lock().is_empty());
+        assert!(table.per_ns_conn_counts.lock().is_empty());
+        assert_eq!(test_get_active_conn_count(), 0);
+    }
+
+    #[test]
+    fn r180_listen_auto_bind_rollback_is_owner_checked_and_clears_metadata() {
+        let table = SocketTable::new();
+        let namespace = NamespaceId(45);
+        let sock = test_socket_in_ns(77, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        let port = 49_152;
+        sock.bind_local(Ipv4Addr([0, 0, 0, 0]), port);
+        {
+            let mut bindings = table.tcp_bindings.lock();
+            bindings.ensure_capacity_for(1).expect("binding admission");
+            assert!(bindings
+                .insert_unique_reserved(
+                    (namespace, port),
+                    PortBinding {
+                        sock: Arc::downgrade(&sock),
+                        charged_cgroup: 0,
+                        kind: BindKind::Ephemeral,
+                    },
+                )
+                .is_ok());
+        }
+
+        table.rollback_listen_auto_bind_locked(&sock, port);
+        assert!(!table.tcp_bindings.lock().contains_key(&(namespace, port)));
+        assert_eq!(sock.local_port(), None);
+        assert_eq!(sock.local_ip(), None);
+    }
+
+    #[test]
+    fn r180_udp_queue_growth_dequeue_and_teardown_are_symmetric() {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1802, SocketType::Dgram, SocketProtocol::Udp);
+        assert!(sock.enqueue_rx(Ipv4Addr([10, 0, 0, 2]), 40000, &[0x5a; 128], 1,));
+        let (queue_charge, payload_charge) = {
+            let queue = sock.rx_queue.lock();
+            (
+                queue.charged_bytes_for_test(),
+                queue.front().unwrap().data.charged_bytes_for_test(),
+            )
+        };
+        assert!(queue_charge > 0 && payload_charge > 0);
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let copied = table
+            .recv_from_udp_with_commit(&sock, &current, CapId::INVALID, Some(0), |packet| {
+                Ok::<usize, ()>(packet.data.len())
+            })
+            .expect("UDP dequeue commit");
+        assert_eq!(copied, 128);
+        let queue = sock.rx_queue.lock();
+        assert!(queue.is_empty());
+        assert_eq!(queue.charged_bytes_for_test(), queue_charge);
+        drop(queue);
+        drop(sock); // queue backing charge and socket charge release by RAII
+    }
+
+    #[test]
+    fn r180_tcp_all_retained_queue_states_drop_cleanly() {
+        let sock = test_socket(0x1803, SocketType::Stream, SocketProtocol::Tcp);
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 1]),
+            1000,
+            Ipv4Addr([10, 0, 0, 2]),
+            2000,
+            1,
+        );
+        tcb.send_buffer
+            .try_push(TcpSegment {
+                seq: 1,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[1, 2, 3])
+                    .expect("send payload admission"),
+                sent_at: 0,
+                retrans_count: 0,
+                sacked: false,
+                lost: false,
+                retransmit_pending: false,
+                retransmit_in_flight: false,
+                retransmit_requires_rto: false,
+                tx_reject_count: 0,
+                retry_not_before_ms: 0,
+            })
+            .map_err(|_| ())
+            .expect("send queue admission");
+        tcb.send_buffer_bytes = 3;
+        tcb.recv_buffer
+            .try_extend_from_slice(&[4, 5, 6])
+            .expect("recv queue admission");
+        tcb.ooo_queue
+            .try_push(crate::tcp::OooSegment {
+                seq: 10,
+                data: AdmittedVec::try_copy_from_slice(HeapClass::SocketPayload, &[7, 8, 9])
+                    .expect("OOO payload admission"),
+                fin: false,
+            })
+            .map_err(|_| ())
+            .expect("OOO queue admission");
+        sock.attach_tcp(tcb).expect("TCP waiter admission");
+        drop(sock);
+    }
+
+    #[test]
+    fn r180_recv_gate_placeholder_is_removed_after_payload_growth_failure() {
+        let table = SocketTable::new();
+        let namespace = NamespaceId(46);
+        let mut tcb = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 1]),
+            1000,
+            Ipv4Addr([10, 0, 0, 2]),
+            2000,
+            1,
+        );
+
+        tcb.recv_buffer.fail_next_growth_for_test();
+        table
+            .try_charge_ns_recv_gate(namespace, &tcb, 4)
+            .expect("recv counter-slot admission");
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&namespace).copied(),
+            Some(0)
+        );
+        assert!(tcb
+            .recv_buffer
+            .try_extend_from_slice(&[1, 2, 3, 4])
+            .is_err());
+        table.reconcile_ns_recv(namespace, &mut tcb);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&namespace));
+
+        tcb.ooo_queue.fail_next_growth_for_test();
+        table
+            .try_charge_ns_recv_gate(namespace, &tcb, 4)
+            .expect("OOO counter-slot admission");
+        assert_eq!(tcb.ooo_insert(100, &[5, 6, 7, 8], false), 0);
+        table.reconcile_ns_recv(namespace, &mut tcb);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&namespace));
+    }
+
+    fn assert_concurrent_bind_is_single_commit(ty: SocketType, proto: SocketProtocol) {
+        const WORKERS: usize = 8;
+        let table = Arc::new(SocketTable::new());
+        let sock = test_socket(1, ty, proto);
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+
+        for worker in 0..WORKERS {
+            let table = table.clone();
+            let sock = sock.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let port = 20_000 + worker as u16;
+                barrier.wait();
+                let current = ProcessCtx::new(worker + 1, worker + 1, 0, 0, 0, 0);
+                let result = match proto {
+                    SocketProtocol::Udp => table.bind_udp(
+                        &sock,
+                        &current,
+                        CapId::INVALID,
+                        Ipv4Addr([127, 0, 0, 1]),
+                        Some(port),
+                        true,
+                        BindCharge::None,
+                    ),
+                    SocketProtocol::Tcp => table.bind_tcp(
+                        &sock,
+                        &current,
+                        CapId::INVALID,
+                        Ipv4Addr([127, 0, 0, 1]),
+                        Some(port),
+                        true,
+                        BindCharge::None,
+                    ),
+                };
+                (port, result)
+            }));
+        }
+
+        let mut winner = None;
+        for handle in handles {
+            let (candidate, result) = handle.join().expect("bind worker panicked");
+            match result {
+                Ok(port) => {
+                    assert_eq!(port, candidate);
+                    assert!(
+                        winner.replace(port).is_none(),
+                        "more than one bind committed"
+                    );
+                }
+                Err(SocketError::PortInUse) => {}
+                Err(other) => panic!("unexpected bind result: {other:?}"),
+            }
+        }
+
+        let winner = winner.expect("one bind must commit");
+        let meta = sock.meta_snapshot();
+        assert_eq!(meta.local_port, Some(winner));
+        assert_eq!(meta.local_ip, Some([127, 0, 0, 1]));
+
+        let owner_is_socket = match proto {
+            SocketProtocol::Udp => {
+                let bindings = table.udp_bindings.lock();
+                assert_eq!(bindings.len(), 1, "losing UDP binds left ghost entries");
+                bindings
+                    .get(&(NamespaceId(0), winner))
+                    .and_then(|binding| binding.sock.upgrade())
+                    .map_or(false, |owner| Arc::ptr_eq(&owner, &sock))
+            }
+            SocketProtocol::Tcp => {
+                let bindings = table.tcp_bindings.lock();
+                assert_eq!(bindings.len(), 1, "losing TCP binds left ghost entries");
+                bindings
+                    .get(&(NamespaceId(0), winner))
+                    .and_then(|binding| binding.sock.upgrade())
+                    .map_or(false, |owner| Arc::ptr_eq(&owner, &sock))
+            }
+        };
+        assert!(
+            owner_is_socket,
+            "committed binding does not match socket metadata"
+        );
+    }
+
+    fn test_label() -> SocketLabel {
+        SocketLabel {
+            creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+            secmark: 0,
+        }
+    }
+
+    fn arm_operation_commit_pause(table: &SocketTable, kind: u8) {
+        table.test_operation_resume.store(false, Ordering::Release);
+        table.test_operation_paused.store(false, Ordering::Release);
+        table
+            .test_operation_pause_kind
+            .store(kind, Ordering::Release);
+    }
+
+    fn wait_for_operation_commit_pause(table: &SocketTable) {
+        for _ in 0..1_000_000 {
+            if table.test_operation_paused.load(Ordering::Acquire) {
+                return;
+            }
+            thread::yield_now();
+        }
+        panic!("state operation did not reach deterministic commit pause");
+    }
+
+    fn resume_operation_commit(table: &SocketTable) {
+        table.test_operation_resume.store(true, Ordering::Release);
+    }
+
+    fn assert_close_left_no_publication(
+        table: &SocketTable,
+        sock: &SocketArc,
+        namespace: NamespaceId,
+    ) {
+        assert!(!table.sockets.read().contains_key(&sock.id));
+        assert!(table.udp_bindings.lock().is_empty());
+        assert!(table.tcp_bindings.lock().is_empty());
+        assert!(table.tcp_conns.lock().is_empty());
+        assert!(!table.per_ns_counts.lock().contains_key(&namespace));
+        assert!(!table.per_ns_conn_counts.lock().contains_key(&namespace));
+        assert!(!table.per_ns_syn_counts.lock().contains_key(&namespace));
+        assert!(!table.per_ns_send_bytes.lock().contains_key(&namespace));
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&namespace));
+        assert!(table.port_uncharge_pending.lock().is_empty());
+        assert_eq!(sock.meta_snapshot(), SocketMeta::new());
+        assert!(sock.tcp.lock().is_none());
+        assert!(sock.listen.lock().is_none());
+        assert!(sock.is_closed());
+    }
+
+    #[test]
+    fn rf180_26_close_vs_bind_leaves_no_registry_metadata_or_quota_ghost() {
+        mm::publish_heap_budgets();
+        let table = Arc::new(SocketTable::new());
+        let namespace = NamespaceId(0x1826_01);
+        let sock = table
+            .create_udp_socket(test_label(), namespace)
+            .expect("close-vs-bind socket admission");
+        arm_operation_commit_pause(&table, TEST_PAUSE_BIND_COMMIT);
+
+        let worker_table = table.clone();
+        let worker_sock = sock.clone();
+        let worker = thread::spawn(move || {
+            worker_table.bind_udp(
+                &worker_sock,
+                &ProcessCtx::new(2, 2, 0, 0, 0, 0),
+                CapId::INVALID,
+                Ipv4Addr([127, 0, 0, 1]),
+                Some(31_026),
+                true,
+                BindCharge::None,
+            )
+        });
+
+        wait_for_operation_commit_pause(&table);
+        table.close(sock.id);
+        resume_operation_commit(&table);
+        let _ = worker.join().expect("close-vs-bind worker panicked");
+        assert_close_left_no_publication(&table, &sock, namespace);
+    }
+
+    #[test]
+    fn rf180_26_close_vs_connect_leaves_no_tuple_tcb_or_quota_ghost() {
+        mm::publish_heap_budgets();
+        let table = Arc::new(SocketTable::new());
+        let namespace = NamespaceId(0x1826_02);
+        let sock = table
+            .create_tcp_socket(test_label(), namespace)
+            .expect("close-vs-connect socket admission");
+        arm_operation_commit_pause(&table, TEST_PAUSE_CONNECT_COMMIT);
+
+        let worker_table = table.clone();
+        let worker_sock = sock.clone();
+        let worker = thread::spawn(move || {
+            worker_table.connect(
+                &worker_sock,
+                &ProcessCtx::new(3, 3, 0, 0, 0, 0),
+                CapId::INVALID,
+                Ipv4Addr([10, 26, 0, 1]),
+                Ipv4Addr([10, 26, 0, 2]),
+                41_026,
+                Some(0),
+            )
+        });
+
+        wait_for_operation_commit_pause(&table);
+        table.close(sock.id);
+        resume_operation_commit(&table);
+        assert!(matches!(
+            worker.join().expect("close-vs-connect worker panicked"),
+            Err(SocketError::Closed)
+        ));
+        assert_close_left_no_publication(&table, &sock, namespace);
+    }
+
+    #[test]
+    fn rf180_26_close_vs_listen_leaves_no_binding_tcb_or_backlog_ghost() {
+        mm::publish_heap_budgets();
+        let table = Arc::new(SocketTable::new());
+        let namespace = NamespaceId(0x1826_03);
+        let sock = table
+            .create_tcp_socket(test_label(), namespace)
+            .expect("close-vs-listen socket admission");
+        arm_operation_commit_pause(&table, TEST_PAUSE_LISTEN_COMMIT);
+
+        let worker_table = table.clone();
+        let worker_sock = sock.clone();
+        let worker = thread::spawn(move || {
+            worker_table.listen(
+                &worker_sock,
+                &ProcessCtx::new(4, 4, 0, 0, 0, 0),
+                CapId::INVALID,
+                16,
+                true,
+            )
+        });
+
+        wait_for_operation_commit_pause(&table);
+        table.close(sock.id);
+        resume_operation_commit(&table);
+        let _ = worker.join().expect("close-vs-listen worker panicked");
+        assert_close_left_no_publication(&table, &sock, namespace);
+    }
+
+    fn assert_shutdown_close_race_returns_committed_fin(
+        initial_state: TcpState,
+        expected_state: TcpState,
+        namespace: NamespaceId,
+    ) {
+        mm::publish_heap_budgets();
+        let table = Arc::new(SocketTable::new());
+        let sock = table
+            .create_tcp_socket(test_label(), namespace)
+            .expect("shutdown-vs-close socket admission");
+        let local_ip = Ipv4Addr([10, 27, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 27, 0, 2]);
+        let local_port = 31_027;
+        let remote_port = 41_027;
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb =
+            TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 0x1800);
+        tcb.state = initial_state;
+        tcb.snd_nxt = 0x1801;
+        tcb.rcv_nxt = 0x2801;
+        sock.attach_tcp(tcb).expect("hosted TCP waiter admission");
+        arm_operation_commit_pause(&table, TEST_PAUSE_SHUTDOWN_COMMIT);
+
+        let worker_table = table.clone();
+        let worker_sock = sock.clone();
+        let worker = thread::spawn(move || {
+            let packet = worker_table
+                .tcp_shutdown(
+                    &worker_sock,
+                    &ProcessCtx::new(5, 5, 0, 0, 0, 0),
+                    CapId::INVALID,
+                    1,
+                )
+                .expect("shutdown that committed FIN must succeed")
+                .expect("shutdown that committed FIN must return its packet");
+            assert!(packet.len() >= 20);
+            (packet[13], packet.len())
+        });
+
+        wait_for_operation_commit_pause(&table);
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().expect("committed TCB").control;
+            assert_eq!(control.state, expected_state);
+            assert!(control.fin_sent);
+            assert_eq!(control.snd_nxt, 0x1802);
+        }
+
+        // close() publishes closed while shutdown still owns the operation
+        // lock. Releasing the deterministic pause transfers finalization to
+        // the shutdown guard's Drop implementation.
+        table.close(sock.id);
+        assert!(sock.is_closed());
+        resume_operation_commit(&table);
+
+        let (flags, packet_len) = worker.join().expect("shutdown worker panicked");
+        assert_ne!(flags & TCP_FLAG_FIN, 0, "prepared packet lost its FIN flag");
+        assert_ne!(flags & TCP_FLAG_ACK, 0, "prepared packet lost its ACK flag");
+        assert!(packet_len >= 20, "FIN packet is shorter than a TCP header");
+
+        {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().expect("graceful close retains TCB").control;
+            assert_eq!(control.state, expected_state);
+            assert!(control.fin_sent);
+            assert_eq!(control.snd_nxt, 0x1802);
+        }
+        assert!(
+            table.sockets.read().contains_key(&sock.id),
+            "graceful close must retain the socket for FIN ACK/retry processing"
+        );
+    }
+
+    #[test]
+    fn rf180_26_shutdown_established_close_race_returns_prepared_fin() {
+        assert_shutdown_close_race_returns_committed_fin(
+            TcpState::Established,
+            TcpState::FinWait1,
+            NamespaceId(0x1826_04),
+        );
+    }
+
+    #[test]
+    fn rf180_26_shutdown_close_wait_close_race_returns_prepared_fin() {
+        assert_shutdown_close_race_returns_committed_fin(
+            TcpState::CloseWait,
+            TcpState::LastAck,
+            NamespaceId(0x1826_05),
+        );
+    }
+
+    fn assert_duplicate_payload_fin_transition(
+        initial_state: TcpState,
+        expected_state: TcpState,
+        rcv_nxt: u32,
+    ) {
+        let table = SocketTable::new();
+        let sock = test_socket(2, SocketType::Stream, SocketProtocol::Tcp);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let local_port = 30_000;
+        let remote_port = 40_000;
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb =
+            TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 100);
+        tcb.state = initial_state;
+        tcb.snd_una = 100;
+        tcb.snd_nxt = 100;
+        tcb.snd_wnd = TCP_DEFAULT_WINDOW as u32;
+        tcb.rcv_nxt = rcv_nxt;
+        tcb.rcv_wnd = 128;
+        sock.attach_tcp(tcb).expect("hosted TCP waiter admission");
+
+        let key =
+            tcp_map_key_from_parts(NamespaceId(0), local_ip, local_port, remote_ip, remote_port);
+        table
+            .tcp_conns
+            .lock()
+            .try_insert(key, Arc::downgrade(&sock))
+            .expect("hosted conn registry admission");
+
+        let payload = [0x5a; 4];
+        let header = TcpHeader::new(
+            remote_port,
+            local_port,
+            rcv_nxt.wrapping_sub(payload.len() as u32),
+            100,
+            TCP_FLAG_ACK | TCP_FLAG_FIN,
+            TCP_DEFAULT_WINDOW,
+        );
+        let response = table.process_tcp_segment(
+            NamespaceId(0),
+            remote_ip,
+            local_ip,
+            &header,
+            &payload,
+            &TcpOptions::default(),
+            &mut None,
+            &mut false,
+        );
+        assert!(response.is_some(), "an in-order FIN must be acknowledged");
+
+        let guard = sock.tcp.lock();
+        let tcb = &guard.as_ref().expect("TCB must remain present").control;
+        assert_eq!(tcb.state, expected_state);
+        assert!(tcb.fin_received);
+        assert_eq!(tcb.rcv_nxt, rcv_nxt.wrapping_add(1));
+        assert!(
+            tcb.recv_buffer.is_empty(),
+            "fully duplicate payload must not be delivered twice"
+        );
+    }
 
     #[test]
     fn test_socket_domain_from_raw() {
@@ -10933,11 +14838,444 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_copyout_failure_preserves_front_datagram() {
+        let table = SocketTable::new();
+        let sock = test_socket(90, SocketType::Dgram, SocketProtocol::Udp);
+        assert!(sock.enqueue_rx(Ipv4Addr([10, 1, 2, 3]), 1234, b"payload", 1));
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+
+        let failed =
+            table.recv_from_udp_with_commit(&sock, &current, CapId::INVALID, Some(0), |_packet| {
+                Err::<usize, _>(())
+            });
+        assert!(matches!(failed, Err(RecvTransactionError::Commit(()))));
+        assert_eq!(sock.rx_queue.lock().len(), 1);
+
+        let copied = table
+            .recv_from_udp_with_commit(&sock, &current, CapId::INVALID, Some(0), |packet| {
+                assert_eq!(packet.data.as_slice(), b"payload");
+                Ok::<usize, ()>(packet.data.len())
+            })
+            .expect("retry must receive the same datagram");
+        assert_eq!(copied, 7);
+        assert!(sock.rx_queue.lock().is_empty());
+    }
+
+    #[test]
+    fn test_tcp_copyout_failure_preserves_stream_prefix() {
+        let table = SocketTable::new();
+        let sock = test_socket(91, SocketType::Stream, SocketProtocol::Tcp);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 1000, remote_ip, 2000, 1);
+        tcb.state = TcpState::Established;
+        tcb.recv_buffer
+            .try_extend_from_slice(b"stream")
+            .expect("hosted recv buffer admission");
+        sock.attach_tcp(tcb).expect("hosted TCP waiter admission");
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+
+        let failed =
+            table.tcp_recv_with_commit(&sock, &current, CapId::INVALID, 6, Some(0), |_bytes| {
+                Err::<(), _>(())
+            });
+        assert!(matches!(failed, Err(RecvTransactionError::Commit(()))));
+        assert_eq!(
+            sock.tcp.lock().as_ref().unwrap().control.recv_buffer.len(),
+            6
+        );
+
+        let copied = table
+            .tcp_recv_with_commit(&sock, &current, CapId::INVALID, 6, Some(0), |bytes| {
+                assert_eq!(bytes, b"stream");
+                Ok::<(), ()>(())
+            })
+            .expect("retry must receive the same stream prefix");
+        assert_eq!(copied, 6);
+        assert!(sock
+            .tcp
+            .lock()
+            .as_ref()
+            .unwrap()
+            .control
+            .recv_buffer
+            .is_empty());
+    }
+
+    #[test]
+    fn rf180_27_zero_length_tcp_send_is_allocation_free_and_non_mutating() {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1827_01, SocketType::Stream, SocketProtocol::Tcp);
+        let local_ip = Ipv4Addr([10, 27, 1, 1]);
+        let remote_ip = Ipv4Addr([10, 27, 1, 2]);
+        let local_port = 31_127;
+        let remote_port = 41_127;
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb =
+            TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 0x2710);
+        tcb.state = TcpState::Established;
+        tcb.snd_nxt = 0x2711;
+        tcb.snd_una = 0x2710;
+        tcb.last_activity = 7;
+        sock.attach_tcp(tcb).expect("hosted TCP waiter admission");
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+
+        sock.tcp
+            .lock()
+            .as_mut()
+            .unwrap()
+            .control
+            .send_buffer
+            .fail_next_growth_for_test();
+        let before_tx = sock.tx_bytes.load(Ordering::Relaxed);
+        let before = {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().unwrap().control;
+            (
+                control.state,
+                control.snd_una,
+                control.snd_nxt,
+                control.cwnd,
+                control.last_activity,
+                control.send_buffer.len(),
+                control.send_buffer_bytes,
+                control.ns_charged_send_bytes,
+            )
+        };
+
+        let (sent, segments) = table
+            .tcp_send(&sock, &current, CapId::INVALID, &[])
+            .expect("validated zero-length TCP send");
+        assert_eq!(sent, 0);
+        assert!(segments.is_empty());
+        assert_eq!(sock.tx_bytes.load(Ordering::Relaxed), before_tx);
+
+        let after = {
+            let guard = sock.tcp.lock();
+            let control = &guard.as_ref().unwrap().control;
+            (
+                control.state,
+                control.snd_una,
+                control.snd_nxt,
+                control.cwnd,
+                control.last_activity,
+                control.send_buffer.len(),
+                control.send_buffer_bytes,
+                control.ns_charged_send_bytes,
+            )
+        };
+        assert_eq!(after, before, "zero TCP send mutated transport state");
+        assert!(
+            sock.tcp
+                .lock()
+                .as_mut()
+                .unwrap()
+                .control
+                .send_buffer
+                .ensure_capacity_for(1)
+                .is_err(),
+            "zero TCP send must not touch retransmission queue allocation"
+        );
+
+        let unconnected = test_socket(0x1827_02, SocketType::Stream, SocketProtocol::Tcp);
+        assert!(matches!(
+            table.tcp_send(&unconnected, &current, CapId::INVALID, &[]),
+            Err(SocketError::InvalidState)
+        ));
+        assert!(unconnected.tcp.lock().is_none());
+    }
+
+    #[test]
+    fn rf180_27_zero_length_udp_send_emits_header_only_datagram() {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1827_03, SocketType::Dgram, SocketProtocol::Udp);
+        let src_ip = Ipv4Addr([10, 27, 2, 1]);
+        let dst_ip = Ipv4Addr([10, 27, 2, 2]);
+        let src_port = 31_227;
+        let dst_port = 41_227;
+        sock.bind_local(src_ip, src_port);
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let before_datagrams = sock.tx_datagrams.load(Ordering::Relaxed);
+        let before_bytes = sock.tx_bytes.load(Ordering::Relaxed);
+
+        let datagram = table
+            .send_to_udp(
+                &sock,
+                &current,
+                CapId::INVALID,
+                src_ip,
+                dst_ip,
+                dst_port,
+                &[],
+            )
+            .expect("zero-length UDP send must serialize a datagram");
+
+        assert_eq!(datagram.len(), 8, "UDP header has a fixed eight-byte size");
+        assert_eq!(u16::from_be_bytes([datagram[0], datagram[1]]), src_port);
+        assert_eq!(u16::from_be_bytes([datagram[2], datagram[3]]), dst_port);
+        assert_eq!(u16::from_be_bytes([datagram[4], datagram[5]]), 8);
+        assert_eq!(
+            sock.tx_datagrams.load(Ordering::Relaxed),
+            before_datagrams,
+            "packet construction must not account an unqueued datagram"
+        );
+        table.commit_udp_send(&sock, 0);
+        assert_eq!(
+            sock.tx_datagrams.load(Ordering::Relaxed),
+            before_datagrams + 1
+        );
+        assert_eq!(sock.tx_bytes.load(Ordering::Relaxed), before_bytes);
+    }
+
+    #[test]
+    fn rf180_27_zero_length_tcp_recv_is_immediate_and_non_consuming() {
+        let table = SocketTable::new();
+        let sock = test_socket(92, SocketType::Stream, SocketProtocol::Tcp);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let mut tcb = TcpControlBlock::new_client(local_ip, 1000, remote_ip, 2000, 1);
+        tcb.state = TcpState::Established;
+        tcb.recv_buffer
+            .try_extend_from_slice(b"retained")
+            .expect("hosted recv buffer admission");
+        sock.attach_tcp(tcb).expect("hosted TCP waiter admission");
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let mut commit_called = false;
+
+        let copied = table
+            .tcp_recv_with_commit(&sock, &current, CapId::INVALID, 0, None, |_bytes| {
+                commit_called = true;
+                Ok::<(), ()>(())
+            })
+            .expect("zero-length receive must not block");
+
+        assert_eq!(copied, 0);
+        assert!(!commit_called);
+        assert_eq!(
+            sock.tcp.lock().as_ref().unwrap().control.recv_buffer.len(),
+            b"retained".len()
+        );
+
+        let unconnected = test_socket(0x1827_04, SocketType::Stream, SocketProtocol::Tcp);
+        let copied = table
+            .tcp_recv_with_commit(
+                &unconnected,
+                &current,
+                CapId::INVALID,
+                0,
+                Some(0),
+                |_bytes| Err::<(), _>("zero receive invoked commit"),
+            )
+            .expect("Linux-compatible zero recv does not require a connection");
+        assert_eq!(copied, 0);
+        assert!(unconnected.tcp.lock().is_none());
+    }
+
+    #[test]
+    fn rf180_27_zero_length_udp_recv_consumes_one_and_reports_source() {
+        let table = SocketTable::new();
+        let sock = test_socket(0x1827_05, SocketType::Dgram, SocketProtocol::Udp);
+        assert!(sock.enqueue_rx(Ipv4Addr([10, 27, 3, 1]), 31_327, b"first", 1));
+        assert!(sock.enqueue_rx(Ipv4Addr([10, 27, 3, 2]), 31_328, b"second", 2));
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let mut observed = None;
+
+        let copied = table
+            .recv_from_udp_with_commit(&sock, &current, CapId::INVALID, Some(0), |packet| {
+                observed = Some((packet.src_ip, packet.src_port, packet.payload().to_vec()));
+                Ok::<usize, ()>(0)
+            })
+            .expect("zero-length UDP receive must consume one datagram");
+
+        assert_eq!(copied, 0);
+        assert_eq!(
+            observed,
+            Some((Ipv4Addr([10, 27, 3, 1]), 31_327, b"first".to_vec()))
+        );
+        let queue = sock.rx_queue.lock();
+        assert_eq!(queue.len(), 1, "zero recv must consume exactly one packet");
+        let next = queue.front().expect("second datagram remains queued");
+        assert_eq!(next.src_ip, Ipv4Addr([10, 27, 3, 2]));
+        assert_eq!(next.src_port, 31_328);
+        assert_eq!(next.payload(), b"second");
+    }
+
+    #[test]
     fn test_segment_partial_left_overlap_window() {
-        assert!(segment_in_recv_window(990, 11, 1000, 128));
-        assert!(!segment_in_recv_window(990, 10, 1000, 128));
-        assert!(segment_in_recv_window(1127, 1, 1000, 128));
-        assert!(!segment_in_recv_window(1128, 1, 1000, 128));
-        assert!(segment_in_recv_window(u32::MAX, 4, 2, 128));
+        assert!(segment_in_recv_window(990, 11, false, 1000, 128));
+        assert!(!segment_in_recv_window(990, 10, false, 1000, 128));
+        assert!(segment_in_recv_window(990, 10, true, 1000, 128));
+        assert!(segment_in_recv_window(1127, 1, false, 1000, 128));
+        assert!(!segment_in_recv_window(1128, 1, false, 1000, 128));
+        assert!(segment_in_recv_window(u32::MAX, 4, false, 2, 128));
+    }
+
+    #[test]
+    fn test_concurrent_udp_binds_commit_once() {
+        assert_concurrent_bind_is_single_commit(SocketType::Dgram, SocketProtocol::Udp);
+    }
+
+    #[test]
+    fn test_concurrent_tcp_binds_commit_once() {
+        assert_concurrent_bind_is_single_commit(SocketType::Stream, SocketProtocol::Tcp);
+    }
+
+    #[test]
+    fn test_concurrent_tcp_connects_publish_one_tuple() {
+        const WORKERS: usize = 8;
+        let table = Arc::new(SocketTable::new());
+        let sock = test_socket(3, SocketType::Stream, SocketProtocol::Tcp);
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+
+        for worker in 0..WORKERS {
+            let table = table.clone();
+            let sock = sock.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let dst_ip = Ipv4Addr([10, 1, 0, worker as u8 + 1]);
+                let dst_port = 41_000 + worker as u16;
+                barrier.wait();
+                let current = ProcessCtx::new(worker + 1, worker + 1, 0, 0, 0, 0);
+                let result = table.connect(
+                    &sock,
+                    &current,
+                    CapId::INVALID,
+                    Ipv4Addr([10, 1, 1, 1]),
+                    dst_ip,
+                    dst_port,
+                    Some(0),
+                );
+                (dst_ip, dst_port, result)
+            }));
+        }
+
+        let mut winner = None;
+        for handle in handles {
+            let (dst_ip, dst_port, result) = handle.join().expect("connect worker panicked");
+            match result {
+                Ok(_) => assert!(
+                    winner.replace((dst_ip, dst_port)).is_none(),
+                    "more than one connect transaction committed"
+                ),
+                Err(SocketError::AlreadyConnected) => {}
+                Err(other) => panic!("unexpected connect result: {other:?}"),
+            }
+        }
+
+        let (remote_ip, remote_port) = winner.expect("one connect must commit");
+        let meta = sock.meta_snapshot();
+        let local_ip = Ipv4Addr(meta.local_ip.expect("connected socket has local IP"));
+        let local_port = meta.local_port.expect("connected socket has local port");
+        assert_eq!(meta.remote_ip, Some(remote_ip.0));
+        assert_eq!(meta.remote_port, Some(remote_port));
+        assert_eq!(
+            sock.tcp_state(),
+            Some(TcpState::Closed),
+            "connect preparation must not expose SYN-SENT before device acceptance"
+        );
+        assert!(
+            sock.tcp
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.control.active_open_pending),
+            "the winning connect retains an identity-bound provisional SYN"
+        );
+
+        let key =
+            tcp_map_key_from_parts(NamespaceId(0), local_ip, local_port, remote_ip, remote_port);
+        let conns = table.tcp_conns.lock();
+        assert_eq!(conns.len(), 1, "losing connects left ghost 4-tuples");
+        assert!(
+            conns
+                .get(&key)
+                .and_then(|entry| entry.upgrade())
+                .map_or(false, |owner| Arc::ptr_eq(&owner, &sock)),
+            "published 4-tuple does not match committed socket metadata"
+        );
+        drop(conns);
+
+        let bindings = table.tcp_bindings.lock();
+        assert_eq!(bindings.len(), 1, "connect race left ghost local bindings");
+        assert!(bindings.contains_key(&(NamespaceId(0), local_port)));
+    }
+
+    #[test]
+    fn test_concurrent_listen_auto_bind_is_reentrant_safe() {
+        const WORKERS: usize = 4;
+        let table = Arc::new(SocketTable::new());
+        let sock = test_socket(4, SocketType::Stream, SocketProtocol::Tcp);
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+        for worker in 0..WORKERS {
+            let table = table.clone();
+            let sock = sock.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                table.listen(
+                    &sock,
+                    &ProcessCtx::new(worker + 1, worker + 1, 0, 0, 0, 0),
+                    CapId::INVALID,
+                    16,
+                    true,
+                )
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().expect("listen worker panicked"), Ok(()));
+        }
+        assert!(sock.is_listening());
+        let local_port = sock.local_port().expect("listener must be bound");
+        let bindings = table.tcp_bindings.lock();
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings.contains_key(&(NamespaceId(0), local_port)));
+    }
+
+    #[test]
+    fn test_concurrent_udp_send_auto_bind_commits_once() {
+        const WORKERS: usize = 4;
+        let table = Arc::new(SocketTable::new());
+        let sock = test_socket(5, SocketType::Dgram, SocketProtocol::Udp);
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+        for worker in 0..WORKERS {
+            let table = table.clone();
+            let sock = sock.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                table.send_to_udp(
+                    &sock,
+                    &ProcessCtx::new(worker + 1, worker + 1, 0, 0, 0, 0),
+                    CapId::INVALID,
+                    Ipv4Addr([10, 2, 0, 1]),
+                    Ipv4Addr([10, 2, 0, worker as u8 + 2]),
+                    42_000 + worker as u16,
+                    &[worker as u8],
+                )
+            }));
+        }
+        for handle in handles {
+            assert!(
+                handle.join().expect("UDP send worker panicked").is_ok(),
+                "a racing sender must reuse the committed auto-bind"
+            );
+        }
+        let local_port = sock.local_port().expect("UDP sender must be auto-bound");
+        let bindings = table.udp_bindings.lock();
+        assert_eq!(bindings.len(), 1, "UDP auto-bind race left ghost ports");
+        assert!(bindings.contains_key(&(NamespaceId(0), local_port)));
+    }
+
+    #[test]
+    fn test_duplicate_payload_new_fin_transitions_all_receive_states() {
+        assert_duplicate_payload_fin_transition(TcpState::Established, TcpState::CloseWait, 5_000);
+        assert_duplicate_payload_fin_transition(TcpState::FinWait1, TcpState::TimeWait, 6_000);
+        assert_duplicate_payload_fin_transition(TcpState::FinWait2, TcpState::TimeWait, 7_000);
+        // Wraparound tripwire: duplicate data crosses 2^32 and FIN is RCV.NXT.
+        assert_duplicate_payload_fin_transition(TcpState::Established, TcpState::CloseWait, 2);
     }
 }
