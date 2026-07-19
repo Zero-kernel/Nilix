@@ -7,5 +7,11 @@ description = "Per-CPU storage abstraction for SMP support"
 [lib]
 path = "lib.rs"
 
+[features]
+# Hosted unit/integration tests execute as ordinary userspace processes and
+# cannot access the kernel's LAPIC MMIO mapping. This feature is deliberately
+# opt-in and is never enabled by the kernel build.
+host_harness = []
+
 [dependencies]
 spin = "0.9"

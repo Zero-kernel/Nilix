@@ -17,6 +17,11 @@
 
 #![no_std]
 
+#[cfg(all(feature = "host_harness", target_os = "none"))]
+compile_error!(
+    "cpu_local/host_harness is test-only and must never be enabled for a bare-metal kernel build"
+);
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -27,12 +32,13 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 use spin::Once;
 
 /// Maximum number of CPUs supported
-const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = 64;
 
 /// Invalid LAPIC ID marker
 const INVALID_LAPIC_ID: u32 = u32::MAX;
 
 /// Invalid CPU ID marker for reverse mapping
+#[cfg(not(feature = "host_harness"))]
 const INVALID_CPU_ID: usize = usize::MAX;
 
 /// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
@@ -663,6 +669,24 @@ impl<T> CpuLocal<T> {
 /// could cause slot aliasing. In debug builds, this generates a warning.
 #[inline]
 pub fn current_cpu_id() -> usize {
+    current_cpu_id_impl()
+}
+
+/// Hosted tests have one deterministic logical CPU and no LAPIC MMIO mapping.
+///
+/// RF180 hosted-verification fix: keep hardware discovery entirely out of the
+/// hosted execution path. This is feature-gated rather than target-gated so an
+/// accidental non-kernel target never silently changes production semantics.
+#[cfg(feature = "host_harness")]
+#[inline]
+fn current_cpu_id_impl() -> usize {
+    0
+}
+
+/// Production CPU identification through the registered LAPIC-to-logical map.
+#[cfg(not(feature = "host_harness"))]
+#[inline]
+fn current_cpu_id_impl() -> usize {
     // R169-L7 FIX: in x2APIC mode the APIC ID comes from an MSR, can exceed 8 bits
     // (overflowing the 256-entry reverse map), and the xAPIC MMIO ID register read
     // below is invalid. Reading it would alias another CPU's per-CPU slot, so fail
@@ -939,5 +963,13 @@ pub fn clear_fpu_owner_all_cpus(pid: usize) {
         if let Some(per_cpu) = PER_CPU_DATA.get_cpu(cpu_id) {
             per_cpu.clear_fpu_owner_if(pid);
         }
+    }
+}
+
+#[cfg(all(test, feature = "host_harness"))]
+mod host_harness_tests {
+    #[test]
+    fn current_cpu_id_is_deterministic_without_lapic_mmio() {
+        assert_eq!(super::current_cpu_id(), 0);
     }
 }
