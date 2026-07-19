@@ -28,6 +28,8 @@
 //! ```
 
 #![no_std]
+// R180-11: Arc::try_new for fallible socket publication.
+#![feature(allocator_api)]
 
 extern crate alloc;
 extern crate security;
@@ -39,6 +41,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+mod admitted;
 use spin::{Mutex, Once, RwLock};
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -58,6 +62,8 @@ pub mod tcp;
 pub mod udp;
 pub mod virtio_net;
 
+pub use admitted::WirePacket;
+
 pub use arp::{
     build_arp_reply, build_arp_request, build_gratuitous_arp, parse_arp, process_arp,
     serialize_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
@@ -68,8 +74,8 @@ pub use device::{
     DeviceCaps, LinkStatus, MacAddress, NetDevice, NetError, OperatingMode, RxError, TxError,
 };
 pub use ethernet::{
-    build_ethernet_frame, parse_ethernet, EthAddr, EthError, EthHeader, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4,
+    build_ethernet_frame, parse_ethernet, try_build_ethernet_frame_from_parts, EthAddr, EthError,
+    EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
 pub use firewall::{
     firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match, CtStateMask,
@@ -90,20 +96,23 @@ pub use ipv4::{
 };
 pub use socket::{
     register_cgroup_port_hooks, register_socket_wait_hooks, socket_table, BindCharge,
-    CgroupPortHooks, PendingDatagram, SockPollReadiness, SocketDomain, SocketError, SocketLabel,
-    SocketProtocol, SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
-    TcpConnectResult, WaitOutcome, WaitQueue,
+    CgroupPortHooks, PendingDatagram, RecvTransactionError, SerializedTcpPacket, SockPollReadiness,
+    SocketArc, SocketArcAllocator, SocketDomain, SocketError, SocketLabel, SocketProtocol,
+    SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
+    TcpConnectResult, WaitOutcome, WaitQueue, WaitQueueArc,
 };
 pub use stack::{
-    handle_timer_tick, network_config, process_frame, transmit_tcp_segment, transmit_udp_datagram,
-    DropReason, NetConfigSnapshot, NetStats, ProcessResult,
+    handle_timer_tick, network_config, process_frame, transmit_prepared_reply,
+    transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram, DropReason,
+    NetConfigSnapshot, NetStats, PreparedReply, PreparedReplyTxError, ProcessResult,
 };
 pub use tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,
     decode_window, encode_window, generate_isn, generate_syn_cookie_isn, handle_ack,
     handle_retransmission_timeout, initial_cwnd, parse_tcp_header, parse_tcp_options, seq_ge,
     seq_gt, seq_in_window, seq_le, seq_lt, serialize_tcp_option, serialize_tcp_options,
-    syn_cookie_select_mss, update_congestion_control, update_rtt, validate_cwnd_after_idle,
+    syn_cookie_select_mss, try_build_tcp_segment, try_build_tcp_segment_with_options,
+    try_compute_tcp_checksum, update_congestion_control, update_rtt, validate_cwnd_after_idle,
     validate_syn_cookie, verify_tcp_checksum, AckUpdate, CongestionAction, SynCookieData,
     TcpCongestionState, TcpConnKey, TcpControlBlock, TcpError, TcpHeader, TcpOptionKind,
     TcpOptions, TcpResult, TcpSegment, TcpState, TcpStats, TCP_DEFAULT_MSS,
