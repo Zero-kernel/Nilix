@@ -77,6 +77,7 @@
 //!    subsystem for security monitoring (via syscall layer hooks).
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
@@ -84,7 +85,10 @@ extern crate drivers;
 #[macro_use]
 extern crate klog;
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use mm::{
+    arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass, HeapReservation,
+};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
@@ -143,6 +147,9 @@ pub const MAX_CAP_SLOTS: usize = 65535;
 #[derive(Debug)]
 pub struct CapTable {
     inner: Mutex<CapTableInner>,
+    /// Charge for the `Arc<CapTable>` allocation used by production process
+    /// tables. Declared after `inner`, so all vector backing is destroyed first.
+    _arc_charge: Option<HeapCharge>,
 }
 
 /// Internal table state guarded by the CapTable lock.
@@ -155,10 +162,108 @@ struct CapTableInner {
     /// R29-4 FIX: Changed from u32 to u16 to match new CapId encoding.
     free: Vec<u16>,
 
+    /// Lifetime charges for the exact retained vector capacities. The vectors
+    /// are declared first so their allocations are deallocated before uncharge.
+    slots_charge: Option<HeapCharge>,
+    free_charge: Option<HeapCharge>,
+
     /// Next generation counter (monotonically increasing).
     /// R29-4 FIX: Extended from u32 to u64 (48 bits used, ~281 trillion allocations).
     /// Starts at 1; generation 0 is reserved for INVALID.
     next_generation: u64,
+
+    /// RF180-37: capability identities removed from `free` but not yet
+    /// published in `slots`. A prepared socket/accept transaction owns each
+    /// reservation and either installs it allocation-free or returns it through
+    /// Drop. Empty-table backing must not be reclaimed while this is non-zero.
+    reserved_allocations: usize,
+}
+
+/// Detached ownership of one unpublished capability-table slot.
+///
+/// RF180-37: socket and accept publication reserve capability capacity and a
+/// generation before creating/dequeuing network state. The slot remains absent
+/// from lookup/iteration until [`PreparedCapAllocation::install`], and Drop
+/// returns it to the free list without publishing an entry.
+#[must_use = "dropping a prepared capability allocation cancels its unpublished slot"]
+pub struct PreparedCapAllocation<'a> {
+    table: &'a CapTable,
+    index: u16,
+    generation: u64,
+    active: bool,
+}
+
+impl PreparedCapAllocation<'_> {
+    /// Publish into the already-reserved identity. This performs no allocation
+    /// and cannot return a recoverable error; a mismatch is table corruption.
+    pub fn install(mut self, entry: CapEntry) -> CapId {
+        let cap_id = interrupts::without_interrupts(|| {
+            let mut inner = self.table.inner.lock();
+            inner.install_reserved(self.index, self.generation, entry)
+        });
+        self.active = false;
+        cap_id
+    }
+}
+
+impl Drop for PreparedCapAllocation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            interrupts::without_interrupts(|| {
+                let mut inner = self.table.inner.lock();
+                inner.cancel_reserved(self.index);
+            });
+        }
+    }
+}
+
+struct PreparedCapVec<T> {
+    values: Vec<T>,
+    reservation: HeapReservation,
+}
+
+fn prepare_cap_vec<T>(capacity: usize) -> Result<PreparedCapVec<T>, CapError> {
+    let estimated = vec_charge_bytes::<T>(capacity).map_err(|_| CapError::OutOfMemory)?;
+    let mut reservation =
+        try_reserve_heap(HeapClass::Capability, estimated).map_err(|_| CapError::OutOfMemory)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| CapError::OutOfMemory)?;
+    let actual = vec_charge_bytes::<T>(values.capacity()).map_err(|_| CapError::OutOfMemory)?;
+    reservation
+        .resize(actual)
+        .map_err(|_| CapError::OutOfMemory)?;
+    Ok(PreparedCapVec {
+        values,
+        reservation,
+    })
+}
+
+fn install_cap_vec<T>(
+    live: &mut Vec<T>,
+    charge: &mut Option<HeapCharge>,
+    mut prepared: PreparedCapVec<T>,
+) {
+    assert!(
+        prepared.values.capacity() >= live.len(),
+        "R180-7 capability replacement backing too small"
+    );
+    let replacement_charge = prepared
+        .reservation
+        .commit()
+        .expect("R180-7 capability heap ledger corrupt during commit");
+    let mut old = core::mem::take(live);
+    for value in old.drain(..) {
+        prepared.values.push(value);
+    }
+    // R180-7 FIX: deallocate the old allocator backing before releasing its
+    // lifetime charge. No table mutation can allocate after this handoff.
+    drop(old);
+    let old_charge = charge.take();
+    *live = prepared.values;
+    *charge = Some(replacement_charge);
+    drop(old_charge);
 }
 
 /// Slot ties a capability entry to its generation counter.
@@ -213,11 +318,29 @@ impl CapTable {
         Self::with_capacity(DEFAULT_CAP_SLOTS)
     }
 
+    /// Fallible production constructor. The table's two retained vectors and
+    /// outer Arc are admitted before allocation and charged for exact capacity.
+    pub fn try_new_arc() -> Result<Arc<Self>, CapError> {
+        let arc_bytes = arc_charge_bytes::<CapTable>().map_err(|_| CapError::OutOfMemory)?;
+        let arc_reservation = try_reserve_heap(HeapClass::Capability, arc_bytes)
+            .map_err(|_| CapError::OutOfMemory)?;
+        let inner = CapTableInner::try_with_capacity(DEFAULT_CAP_SLOTS)?;
+        let arc_charge = arc_reservation
+            .commit()
+            .map_err(|_| CapError::OutOfMemory)?;
+        Arc::try_new(Self {
+            inner: Mutex::new(inner),
+            _arc_charge: Some(arc_charge),
+        })
+        .map_err(|_| CapError::OutOfMemory)
+    }
+
     /// Create an empty capability table with explicit initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.min(MAX_CAP_SLOTS);
         Self {
             inner: Mutex::new(CapTableInner::with_capacity(capacity)),
+            _arc_charge: None,
         }
     }
 
@@ -235,6 +358,22 @@ impl CapTable {
         interrupts::without_interrupts(|| {
             let mut inner = self.inner.lock();
             inner.allocate(entry)
+        })
+    }
+
+    /// RF180-37: reserve all capability-table resources before an external
+    /// object is published. The returned token is invisible to lookup and
+    /// guarantees that `install` is allocation-free and infallible.
+    pub fn prepare_allocation(&self) -> Result<PreparedCapAllocation<'_>, CapError> {
+        let (index, generation) = interrupts::without_interrupts(|| {
+            let mut inner = self.inner.lock();
+            inner.reserve_allocation()
+        })?;
+        Ok(PreparedCapAllocation {
+            table: self,
+            index,
+            generation,
+            active: true,
         })
     }
 
@@ -442,17 +581,23 @@ impl CapTable {
         interrupts::without_interrupts(|| {
             let inner = self.inner.lock();
             let capacity = inner.slots.len().min(MAX_CAP_SLOTS);
-            let mut slots = Vec::new();
-            slots.try_reserve_exact(capacity).map_err(|_| ())?;
-            slots.resize(capacity, None);
-            let mut free = Vec::new();
-            free.try_reserve_exact(capacity).map_err(|_| ())?;
-            free.extend((0..capacity).map(|i| i as u16));
+            let arc_bytes = arc_charge_bytes::<CapTable>().map_err(|_| ())?;
+            let arc_reservation =
+                try_reserve_heap(HeapClass::Capability, arc_bytes).map_err(|_| ())?;
+            let mut slots_prepared =
+                prepare_cap_vec::<Option<CapSlot>>(capacity).map_err(|_| ())?;
+            for _ in 0..capacity {
+                slots_prepared.values.push(None);
+            }
+            let free_prepared = prepare_cap_vec::<u16>(capacity).map_err(|_| ())?;
 
             let mut new_inner = CapTableInner {
-                slots,
-                free,
+                slots: slots_prepared.values,
+                free: free_prepared.values,
+                slots_charge: Some(slots_prepared.reservation.commit().map_err(|_| ())?),
+                free_charge: Some(free_prepared.reservation.commit().map_err(|_| ())?),
                 next_generation: inner.next_generation,
+                reserved_allocations: 0,
             };
 
             for (idx, slot_opt) in inner.slots.iter().enumerate() {
@@ -465,8 +610,16 @@ impl CapTable {
 
             new_inner.rebuild_free_list();
 
+            // A CLOFORK-only parent can yield a completely empty child table.
+            // Return all unused backing rather than retaining a high-water
+            // allocation that no child capability owns.
+            new_inner.reclaim_if_unused();
+
+            let arc_charge = arc_reservation.commit().map_err(|_| ())?;
+
             Ok(Self {
                 inner: Mutex::new(new_inner),
+                _arc_charge: Some(arc_charge),
             })
         })
     }
@@ -513,10 +666,7 @@ impl CapTable {
     /// revoking them would corrupt their independent lifecycle the moment a
     /// non-fd allocation site lands. They are left untouched: the child
     /// inherits them exactly as `try_clone_for_fork` copied them.
-    pub fn reconcile_refcounts_after_fork(
-        &mut self,
-        child_counts: &alloc::collections::BTreeMap<CapId, usize>,
-    ) {
+    pub fn reconcile_refcounts_after_fork(&mut self, child_counts: &[(CapId, usize)]) {
         interrupts::without_interrupts(|| {
             let mut inner = self.inner.lock();
             // Index loop (the apply_cloexec style) — ZERO allocation under the
@@ -529,7 +679,11 @@ impl CapTable {
                     // BV-3: only fd-lifecycle-managed caps are reconciled.
                     Some(slot) if slot.entry.object.is_fd_backed() => {
                         let cid = CapId::from_parts(idx as u16, slot.generation);
-                        let child_fd_count = child_counts.get(&cid).copied().unwrap_or(0);
+                        let child_fd_count = child_counts
+                            .binary_search_by_key(&cid, |entry| entry.0)
+                            .ok()
+                            .map(|index| child_counts[index].1)
+                            .unwrap_or(0);
                         if child_fd_count == 0 {
                             // CRITICAL-9: no child fd references this cap →
                             // orphan → revoke (below, outside this borrow).
@@ -547,7 +701,7 @@ impl CapTable {
                         // plain-data drop — no wakeup/re-lock side effect
                         // (the design-v3 Fix 2b "revoke outside lock" concern
                         // does not apply to a private table).
-                        let _ = inner.revoke(cid);
+                        let _ = inner.revoke_retaining_capacity(cid);
                     }
                     Some((_, child_fd_count)) => {
                         // Overwrite the verbatim-copied refcount with the
@@ -561,6 +715,11 @@ impl CapTable {
                     None => {}
                 }
             }
+            // RF180-37 defense in depth: reclaim only after the fixed-range
+            // index walk. Reclaiming from the final in-loop revoke would empty
+            // `slots` and make the next loop index panic; live reservations also
+            // veto reclamation through `reclaim_if_unused`.
+            inner.reclaim_if_unused();
         });
     }
 
@@ -601,6 +760,12 @@ impl CapTable {
                     }
                 }
             }
+
+            // If exec removed the final live capability, destroy both retained
+            // vectors before returning their charges.  Keeping the initial
+            // table high-water allocation after a CLOEXEC-only workload would
+            // otherwise let empty processes pin aggregate Capability budget.
+            inner.reclaim_if_unused();
         });
     }
 }
@@ -612,6 +777,33 @@ impl Default for CapTable {
 }
 
 impl CapTableInner {
+    fn try_with_capacity(capacity: usize) -> Result<Self, CapError> {
+        let capacity = capacity.min(MAX_CAP_SLOTS);
+        let mut slots = prepare_cap_vec::<Option<CapSlot>>(capacity)?;
+        for _ in 0..capacity {
+            slots.values.push(None);
+        }
+        let mut free = prepare_cap_vec::<u16>(capacity)?;
+        free.values.extend((0..capacity).map(|i| i as u16));
+        Ok(Self {
+            slots: slots.values,
+            free: free.values,
+            slots_charge: Some(
+                slots
+                    .reservation
+                    .commit()
+                    .expect("R180-7 capability slots ledger corrupt"),
+            ),
+            free_charge: Some(
+                free.reservation
+                    .commit()
+                    .expect("R180-7 capability free-list ledger corrupt"),
+            ),
+            next_generation: 1,
+            reserved_allocations: 0,
+        })
+    }
+
     /// Initialize the table state with preallocated slots.
     fn with_capacity(capacity: usize) -> Self {
         // R30-1 FIX: Avoid u16 truncation - capacity limited to MAX_CAP_SLOTS (65535)
@@ -624,12 +816,35 @@ impl CapTableInner {
         Self {
             slots,
             free,
+            slots_charge: None,
+            free_charge: None,
             next_generation: 1, // Start at 1; 0 is reserved for INVALID
+            reserved_allocations: 0,
         }
     }
 
     /// Allocate a new capability.
     fn allocate(&mut self, entry: CapEntry) -> Result<CapId, CapError> {
+        let (index, generation) = self.reserve_allocation()?;
+        Ok(self.install_reserved(index, generation, entry))
+    }
+
+    /// Reserve one unpublished capability identity and every backing resource
+    /// needed to install it. No state visible through lookup is changed.
+    fn reserve_allocation(&mut self) -> Result<(u16, u64), CapError> {
+        // R29-4/R25-2: consume a unique generation at reservation time so the
+        // later publication has no fallible work. Cancellation deliberately
+        // does not recycle generations: another allocation may have committed
+        // in between, and monotonic stale-ID protection wins over reuse.
+        const MAX_GENERATION: u64 = 0x0000_FFFF_FFFF_FFFF;
+        if self.next_generation >= MAX_GENERATION {
+            return Err(CapError::GenerationExhausted);
+        }
+        let next_reserved = self
+            .reserved_allocations
+            .checked_add(1)
+            .ok_or(CapError::OutOfMemory)?;
+
         // Try to get a slot from the free list
         // R29-4 FIX: index is now u16
         let index: u16 = if let Some(idx) = self.free.pop() {
@@ -649,29 +864,45 @@ impl CapTableInner {
             // With this, every `free.push` for an existing slot is allocation-free by
             // construction (free already has room for all slots). Both reserves run BEFORE the
             // push, so an OOM leaves the table in its exact prior state (no half-grow).
-            let new_len = self.slots.len() + 1;
-            if self.free.capacity() < new_len {
-                self.free
-                    .try_reserve(new_len - self.free.len())
-                    .map_err(|_| CapError::OutOfMemory)?;
+            let new_len = self
+                .slots
+                .len()
+                .checked_add(1)
+                .ok_or(CapError::OutOfMemory)?;
+            let preferred = self
+                .slots
+                .capacity()
+                .max(self.free.capacity())
+                .max(DEFAULT_CAP_SLOTS)
+                .checked_mul(2)
+                .unwrap_or(MAX_CAP_SLOTS)
+                .min(MAX_CAP_SLOTS)
+                .max(new_len);
+            let slots_prepared = if self.slots.capacity() < new_len {
+                Some(prepare_cap_vec::<Option<CapSlot>>(preferred)?)
+            } else {
+                None
+            };
+            let free_prepared = if self.free.capacity() < new_len {
+                Some(prepare_cap_vec::<u16>(preferred)?)
+            } else {
+                None
+            };
+
+            // Both detached allocations succeeded before either live backing
+            // changes, so allocation failure is transaction-neutral.
+            if let Some(prepared) = slots_prepared {
+                install_cap_vec(&mut self.slots, &mut self.slots_charge, prepared);
             }
-            self.slots
-                .try_reserve(1)
-                .map_err(|_| CapError::OutOfMemory)?;
+            if let Some(prepared) = free_prepared {
+                install_cap_vec(&mut self.free, &mut self.free_charge, prepared);
+            }
             let new_idx = self.slots.len() as u16;
             self.slots.push(None); // within reserved capacity -> cannot realloc
             new_idx
         };
 
-        // R29-4 FIX: Extended generation to 48 bits (~281 trillion allocations)
-        // R25-2 FIX: Fail on generation exhaustion instead of wrapping
-        // R32-CAP-1 FIX: Use checked_add instead of wrapping_add for defense-in-depth
         let generation = self.next_generation;
-        // Check against 48-bit limit (0x0000_FFFF_FFFF_FFFF)
-        const MAX_GENERATION: u64 = 0x0000_FFFF_FFFF_FFFF;
-        if self.next_generation >= MAX_GENERATION {
-            return Err(CapError::GenerationExhausted);
-        }
         self.next_generation = self
             .next_generation
             .checked_add(1)
@@ -681,10 +912,41 @@ impl CapTableInner {
             self.next_generation = 1;
         }
 
-        // Store the capability
-        self.slots[index as usize] = Some(CapSlot { generation, entry });
+        self.reserved_allocations = next_reserved;
+        Ok((index, generation))
+    }
 
-        Ok(CapId::from_parts(index, generation))
+    /// Commit a previously reserved identity. The reservation owns an exact
+    /// vacant slot, so any mismatch is a fatal internal invariant violation.
+    fn install_reserved(&mut self, index: u16, generation: u64, entry: CapEntry) -> CapId {
+        let index_usize = index as usize;
+        assert!(
+            self.reserved_allocations != 0
+                && index_usize < self.slots.len()
+                && self.slots[index_usize].is_none()
+                && !self.free.contains(&index),
+            "RF180-37: corrupt prepared capability at install"
+        );
+        self.slots[index as usize] = Some(CapSlot { generation, entry });
+        self.reserved_allocations -= 1;
+
+        CapId::from_parts(index, generation)
+    }
+
+    /// Cancel a prepared identity without publishing a capability.
+    fn cancel_reserved(&mut self, index: u16) {
+        let index_usize = index as usize;
+        assert!(
+            self.reserved_allocations != 0
+                && index_usize < self.slots.len()
+                && self.slots[index_usize].is_none()
+                && !self.free.contains(&index),
+            "RF180-37: corrupt prepared capability at rollback"
+        );
+        debug_assert!(self.free.capacity() >= self.slots.len());
+        self.free.push(index);
+        self.reserved_allocations -= 1;
+        self.reclaim_if_unused();
     }
 
     /// Look up a capability by ID.
@@ -707,6 +969,14 @@ impl CapTableInner {
 
     /// Revoke a capability.
     fn revoke(&mut self, cap_id: CapId) -> Result<CapEntry, CapError> {
+        let entry = self.revoke_retaining_capacity(cap_id)?;
+        self.reclaim_if_unused();
+        Ok(entry)
+    }
+
+    /// Revoke without changing vector identity/capacity. Callers walking slot
+    /// indices use this form and perform one reclamation after the walk.
+    fn revoke_retaining_capacity(&mut self, cap_id: CapId) -> Result<CapEntry, CapError> {
         if !cap_id.is_valid() {
             return Err(CapError::InvalidCapId);
         }
@@ -720,6 +990,7 @@ impl CapTableInner {
         match &self.slots[index] {
             Some(slot) if slot.generation == cap_id.generation() => {
                 let old_slot = self.slots[index].take().unwrap();
+                debug_assert!(self.free.capacity() >= self.slots.len());
                 self.free.push(index as u16);
                 Ok(old_slot.entry)
             }
@@ -777,6 +1048,20 @@ impl CapTableInner {
                 self.free.push(idx as u16);
             }
         }
+    }
+
+    fn reclaim_if_unused(&mut self) {
+        if self.reserved_allocations != 0 || self.slots.iter().any(Option::is_some) {
+            return;
+        }
+        let slots = core::mem::take(&mut self.slots);
+        let free = core::mem::take(&mut self.free);
+        drop(slots);
+        drop(free);
+        let slots_charge = self.slots_charge.take();
+        let free_charge = self.free_charge.take();
+        drop(slots_charge);
+        drop(free_charge);
     }
 }
 
@@ -857,6 +1142,115 @@ mod tests {
         assert!(table.lookup(cap_id).is_err());
     }
 
+    #[test]
+    fn capability_growth_rejection_is_transaction_neutral() {
+        // Unit tests do not publish the runtime heap ledger. The first slot is
+        // pre-existing; the second allocation must therefore reject at detached
+        // admission without changing either live vector or generation state.
+        let mut inner = CapTableInner::with_capacity(1);
+        let first = inner
+            .allocate(CapEntry::new(CapObject::Process(1), CapRights::SIGNAL))
+            .expect("preallocated capability slot");
+        let before = (
+            inner.slots.len(),
+            inner.slots.capacity(),
+            inner.free.len(),
+            inner.free.capacity(),
+            inner.next_generation,
+        );
+
+        assert_eq!(
+            inner.allocate(CapEntry::new(CapObject::Process(2), CapRights::SIGNAL)),
+            Err(CapError::OutOfMemory)
+        );
+        assert_eq!(
+            (
+                inner.slots.len(),
+                inner.slots.capacity(),
+                inner.free.len(),
+                inner.free.capacity(),
+                inner.next_generation,
+            ),
+            before,
+            "rejected detached growth must leave both vectors and generation exact"
+        );
+        assert!(inner.lookup(first).is_ok());
+    }
+
+    #[test]
+    fn rf180_37_prepared_capability_is_invisible_and_rollback_exact() {
+        // Exercise the locked inner transaction directly so this remains a
+        // true hosted test (x86 interrupt masking is privileged in user mode).
+        let mut inner = CapTableInner::with_capacity(1);
+        let before_generation = inner.next_generation;
+        let (index, _generation) = inner
+            .reserve_allocation()
+            .expect("preallocate capability identity");
+        assert_eq!(inner.reserved_allocations, 1);
+        assert!(inner.free.is_empty());
+        assert!(inner.slots.iter().all(Option::is_none));
+
+        inner.cancel_reserved(index);
+        assert_eq!(inner.reserved_allocations, 0);
+        assert!(inner.slots.is_empty(), "empty rollback reclaims backing");
+        assert!(
+            inner.free.is_empty(),
+            "reclaimed table has no stale free IDs"
+        );
+        assert_eq!(
+            inner.next_generation,
+            before_generation + 1,
+            "cancelled identities still consume generations"
+        );
+    }
+
+    #[test]
+    fn rf180_37_prepared_capability_survives_last_live_revoke() {
+        let mut inner = CapTableInner::with_capacity(2);
+        let live = inner
+            .allocate(CapEntry::new(CapObject::Process(1), CapRights::SIGNAL))
+            .expect("initial live capability");
+        let (index, generation) = inner
+            .reserve_allocation()
+            .expect("reserve second capability");
+
+        inner.revoke(live).expect("revoke last published slot");
+        assert_eq!(inner.reserved_allocations, 1);
+        assert_eq!(inner.slots.len(), 2, "reservation pins exact backing");
+
+        let installed = inner.install_reserved(
+            index,
+            generation,
+            CapEntry::new(CapObject::Process(2), CapRights::SIGNAL),
+        );
+        assert!(inner.lookup(installed).is_ok());
+        assert_eq!(inner.slots.iter().filter(|slot| slot.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn rf180_37_index_walk_revoke_defers_backing_reclamation() {
+        let mut inner = CapTableInner::with_capacity(2);
+        let first = inner
+            .allocate(CapEntry::new(CapObject::Process(1), CapRights::SIGNAL))
+            .expect("first capability");
+        let second = inner
+            .allocate(CapEntry::new(CapObject::Process(2), CapRights::SIGNAL))
+            .expect("second capability");
+
+        inner
+            .revoke_retaining_capacity(first)
+            .expect("revoke first while iterating");
+        inner
+            .revoke_retaining_capacity(second)
+            .expect("revoke final while iterating");
+        assert_eq!(inner.slots.len(), 2, "fixed index range must stay valid");
+        assert!(inner.slots.iter().all(Option::is_none));
+
+        inner.reclaim_if_unused();
+        assert!(inner.slots.is_empty());
+        assert!(inner.free.is_empty());
+    }
+
     /// R177-1 FIX: Test that decrement_refcount saturates at 0 (no underflow wrap).
     ///
     /// This test verifies defense-in-depth hardening: while no reachable double-decrement
@@ -888,7 +1282,7 @@ mod tests {
     // double-decrement in debug builds, so test saturation behavior separately
     // in release or with #[should_panic] in debug.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "refcount underflow"))]
+    #[should_panic(expected = "refcount underflow")]
     fn test_refcount_underflow_detection() {
         let table = CapTable::new();
 
@@ -900,30 +1294,6 @@ mod tests {
         let _ = table.decrement_refcount(cap_id).unwrap();
         assert_eq!(table.get_refcount(cap_id), Some(0));
 
-        // Second decrement on the same entry (simulating a double-decrement bug):
-        // - In debug builds: panics due to debug_assert!(prev != 0)
-        // - In release builds: saturates at 0 (defense-in-depth)
-        let _should_revoke_again = table.decrement_refcount(cap_id).unwrap();
-
-        // Only reaches here in release builds
-        #[cfg(not(debug_assertions))]
-        {
-            assert!(
-                !should_revoke_again,
-                "Second decrement from 0 should return false (saturated)"
-            );
-            assert_eq!(
-                table.get_refcount(cap_id),
-                Some(0),
-                "Refcount should saturate at 0, not wrap"
-            );
-
-            // Verify the slot is NOT permanently leaked (revoke still works)
-            let revoked = table.revoke(cap_id);
-            assert!(
-                revoked.is_ok(),
-                "Slot should still be revocable after saturation"
-            );
-        }
+        let _ = table.decrement_refcount(cap_id);
     }
 }
