@@ -4,13 +4,55 @@
 //! - arch 模块通过此钩子调用调度器的定时器处理
 //! - syscall 模块通过此钩子触发重调度检查
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use cpu_local::CpuLocal;
+use cpu_local::{current_cpu, CpuLocal};
 use spin::{Mutex, Once};
 
 /// 定时器回调类型：在定时器中断时调用
 pub type TimerCallback = fn();
+/// Bounded callback runnable at an IRQ-return soft progress point after
+/// `irq_exit` with IF=1. It must not sleep, schedule, allocate, or retain a lock
+/// across a context switch. Spin/blocking MMIO work is permitted because the
+/// interrupted CPL3 context holds no kernel lock and nested CPL0 timers do not
+/// recurse into the progress point.
+pub type SoftProgressCallback = fn();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackRegistrationError {
+    Full,
+}
+
+struct CallbackSlots<const N: usize> {
+    slots: [Option<fn()>; N],
+}
+
+impl<const N: usize> CallbackSlots<N> {
+    const fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    fn register(&mut self, callback: fn()) -> Result<(), CallbackRegistrationError> {
+        if self
+            .slots
+            .iter()
+            .flatten()
+            .any(|registered| core::ptr::fn_addr_eq(*registered, callback))
+        {
+            return Ok(());
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(CallbackRegistrationError::Full)?;
+        *slot = Some(callback);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> [Option<fn()>; N] {
+        self.slots
+    }
+}
 
 /// RF178-33: Distinguish a normal process-context scheduling point from the
 /// timer IRQ-return fast path. The latter must remain strictly bounded.
@@ -24,7 +66,11 @@ pub enum ReschedOrigin {
 pub type ReschedCallback = fn(force: bool, origin: ReschedOrigin);
 
 /// R39-6 FIX: 全局定时器回调列表（支持多个回调，按注册顺序依次调用）
-static TIMER_CBS: Mutex<Vec<TimerCallback>> = Mutex::new(Vec::new());
+const MAX_TIMER_CALLBACKS: usize = 4;
+const MAX_DEFERRED_CALLBACKS: usize = 4;
+static TIMER_CBS: Mutex<CallbackSlots<MAX_TIMER_CALLBACKS>> = Mutex::new(CallbackSlots::new());
+static SOFT_PROGRESS_CBS: Mutex<CallbackSlots<MAX_DEFERRED_CALLBACKS>> =
+    Mutex::new(CallbackSlots::new());
 
 /// 全局重调度回调
 /// RF178-33: immutable after early scheduler initialization. IRQ-return
@@ -56,6 +102,21 @@ fn assert_kernel_entry_state() {
 /// sets the flag and another clears it.
 static IRQ_RESCHED_PENDING: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
 
+/// Level-triggered request for process-safe deferred callbacks. IRQ producers
+/// set it; a CPL3-return soft progress point or ordinary process scheduling
+/// swaps it clear before taking the callback snapshot. Racing producers re-arm
+/// the level and are never overwritten after callback execution.
+static IRQ_SOFT_PROGRESS_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// RF180-52 FIX: one-way publication barrier for process-context deferred work.
+///
+/// APs become interrupt-capable during SMP bring-up, before the scheduler,
+/// IPC callbacks, IOMMU soft-progress callbacks, and network/socket globals are
+/// fully initialized. No process-context drain may cross this gate until the
+/// BSP has published every dependency. A Release publication paired with the
+/// Acquire reads below also makes those initialization writes visible to APs.
+static PROCESS_DEFERRED_WORK_READY: AtomicBool = AtomicBool::new(false);
+
 /// R169-L9/L10/L11: cadence of the global stranded-port-charge sweep. One
 /// `sweep_stranded_port_charges()` pass runs every `PORT_CHARGE_SWEEP_INTERVAL`
 /// full process-context deferred-work drains, amortizing its full-map scan. A
@@ -83,12 +144,70 @@ pub fn force_init_resched_locals() {
 /// R148-I6 FIX: Disable interrupts while holding TIMER_CBS lock to prevent
 /// deadlock if a timer IRQ fires during registration and on_scheduler_tick()
 /// tries to acquire the same lock.
-pub fn register_timer_callback(cb: TimerCallback) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut cbs = TIMER_CBS.lock();
-        // R161-I2 FIX: Bounds check before push to prevent unbounded growth.
-        if cbs.len() < MAX_TIMER_CALLBACKS {
-            cbs.push(cb);
+pub fn register_timer_callback(cb: TimerCallback) -> Result<(), CallbackRegistrationError> {
+    x86_64::instructions::interrupts::without_interrupts(|| TIMER_CBS.lock().register(cb))
+}
+
+/// Register fixed-capacity process-context deferred work. Registration is
+/// checked and allocation-free; callbacks are copied out before invocation.
+pub fn register_soft_progress_callback(
+    cb: SoftProgressCallback,
+) -> Result<(), CallbackRegistrationError> {
+    x86_64::instructions::interrupts::without_interrupts(|| SOFT_PROGRESS_CBS.lock().register(cb))
+}
+
+/// Request process-safe deferred work from IRQ context.
+#[inline]
+pub fn request_soft_progress_from_irq() {
+    IRQ_SOFT_PROGRESS_PENDING.store(true, Ordering::Release);
+}
+
+/// Publish that every dependency of the process-context deferred-work drain is
+/// initialized. This is a one-way boot transition and must be called only by
+/// the BSP after all callback registrations and subsystem globals are complete.
+#[inline]
+pub fn mark_process_deferred_work_ready() {
+    PROCESS_DEFERRED_WORK_READY.store(true, Ordering::Release);
+}
+
+/// Whether process-context deferred work may run on this CPU.
+#[inline]
+pub fn process_deferred_work_ready() -> bool {
+    PROCESS_DEFERRED_WORK_READY.load(Ordering::Acquire)
+}
+
+fn drain_level_triggered_deferred(pending: &AtomicBool, mut invoke_snapshot: impl FnMut()) -> bool {
+    if !pending.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    invoke_snapshot();
+    true
+}
+
+/// Run the fixed deferred callback snapshot at a safe process-context progress
+/// point. Callers must have completed IRQ accounting and enabled interrupts.
+pub fn drain_requested_soft_progress() {
+    debug_assert!(
+        x86_64::instructions::interrupts::are_enabled(),
+        "deferred callbacks require IF=1"
+    );
+    debug_assert!(
+        !current_cpu().in_irq(),
+        "deferred callbacks require irq_count=0"
+    );
+
+    // RF180-52: retain the level-triggered pending bit until the BSP has
+    // published every callback dependency. This also protects the direct
+    // CPL3 IRQ-return progress point, not only reschedule_if_needed().
+    if !process_deferred_work_ready() {
+        return;
+    }
+    assert_kernel_entry_state();
+
+    let _ = drain_level_triggered_deferred(&IRQ_SOFT_PROGRESS_PENDING, || {
+        let deferred_callbacks = SOFT_PROGRESS_CBS.lock().snapshot();
+        for callback in deferred_callbacks.iter().flatten() {
+            callback();
         }
     });
 }
@@ -99,9 +218,6 @@ pub fn register_timer_callback(cb: TimerCallback) {
 pub fn register_resched_callback(cb: ReschedCallback) {
     RESCHED_CB.call_once(|| cb);
 }
-
-/// Maximum number of timer callbacks (prevents allocation in IRQ context)
-const MAX_TIMER_CALLBACKS: usize = 4;
 
 /// 调用定时器回调
 ///
@@ -122,22 +238,14 @@ const MAX_TIMER_CALLBACKS: usize = 4;
 #[inline]
 pub fn on_scheduler_tick() {
     // Copy callbacks to fixed stack array (no heap allocation in IRQ context)
-    let mut callbacks: [Option<TimerCallback>; MAX_TIMER_CALLBACKS] = [None; MAX_TIMER_CALLBACKS];
     // R148-I6 FIX: Blocking lock() is safe here because register_timer_callback()
     // now wraps its lock acquisition in without_interrupts(), preventing timer IRQ
     // from firing while the registration lock is held.  Using try_lock() here would
     // skip ticks and break per-CPU scheduler time-slice accounting and timeout progress.
-    let count = {
-        let guard = TIMER_CBS.lock();
-        let n = guard.len().min(MAX_TIMER_CALLBACKS);
-        for (i, cb) in guard.iter().take(n).enumerate() {
-            callbacks[i] = Some(*cb);
-        }
-        n
-    };
+    let callbacks = TIMER_CBS.lock().snapshot();
 
     // Call callbacks outside of lock
-    for cb in callbacks.iter().take(count) {
+    for cb in callbacks.iter() {
         if let Some(f) = cb {
             f();
         }
@@ -164,6 +272,23 @@ pub fn on_scheduler_tick() {
 /// process-context path where deferred destruction work gets done.
 #[inline]
 pub fn reschedule_if_needed() {
+    reschedule_if_needed_inner(None);
+}
+
+/// Run the full process-context deferred drain, invoke `post_drain`, and only
+/// then enter the scheduler callback.
+///
+/// RF180-54: the AP bootstrap acknowledgement must be published after every
+/// deferred-work dependency has been exercised, but before the reschedule
+/// callback can context-switch and delay the AP's return indefinitely. The
+/// hook must therefore be allocation-free, nonblocking, and safe with IRQs
+/// enabled.
+#[inline]
+pub fn reschedule_if_needed_with_post_drain(post_drain: fn()) {
+    reschedule_if_needed_inner(Some(post_drain));
+}
+
+fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // R169-5 FIX (D1-CGROUP-IRQ-L5): This is the full process-context
     // deferred-work drain — it performs BLOCKING Level-8 (sockets/tcp_conns
     // teardown) and non-IRQ-safe Level-5 (CGROUP_REGISTRY port-uncharge,
@@ -178,8 +303,21 @@ pub fn reschedule_if_needed() {
         "reschedule_if_needed() (full L8 + L5 deferred-work drain) must run with \
          interrupts ENABLED — never from an IRQ-off context (R169-5)"
     );
+    // RF180-52: APs are online and interrupt-capable before the scheduler and
+    // every deferred-work dependency are initialized. Fail closed until the
+    // BSP's Release publication; otherwise the first AP idle iteration can
+    // enter callback, network, cgroup, and scheduler paths against incomplete
+    // boot-time registration and publication state.
+    if !process_deferred_work_ready() {
+        return;
+    }
     // P1-A D1-ARC-ENTRY-STATE: process-context schedule must run with kernel GS.
     assert_kernel_entry_state();
+
+    // Share the same level-triggered handoff as the CPL3 IRQ-return soft
+    // progress point. The swap happens before snapshot/invocation, so a racing
+    // producer remains armed for the next safe point.
+    drain_requested_soft_progress();
 
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
@@ -234,6 +372,13 @@ pub fn reschedule_if_needed() {
     // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
     let irq_pending = IRQ_RESCHED_PENDING.with(|flag| flag.swap(false, Ordering::SeqCst));
 
+    // RF180-54: this is the exact completion boundary for one full deferred
+    // drain. Run the AP acknowledgement before a scheduler callback can switch
+    // away and prevent this kernel frame from returning.
+    if let Some(post_drain) = post_drain {
+        post_drain();
+    }
+
     // R160-3 FIX: Copy callback out of lock before invoking. The previous
     // `if let Some(cb) = *RESCHED_CB.lock() { cb(...); }` pattern held the
     // MutexGuard across the callback (Rust 2021 temporary lifetime rules).
@@ -284,4 +429,27 @@ pub fn force_reschedule_from_irq() {
 #[inline]
 pub fn request_resched_from_irq() {
     IRQ_RESCHED_PENDING.with(|flag| flag.store(true, Ordering::SeqCst));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rf180_deferred_level_rearms_when_producer_races_callback() {
+        let pending = AtomicBool::new(true);
+        let mut callbacks = 0usize;
+        assert!(drain_level_triggered_deferred(&pending, || {
+            callbacks += 1;
+            pending.store(true, Ordering::Release);
+        }));
+        assert_eq!(callbacks, 1);
+        assert!(pending.load(Ordering::Acquire));
+
+        assert!(drain_level_triggered_deferred(&pending, || callbacks += 1));
+        assert_eq!(callbacks, 2);
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(!drain_level_triggered_deferred(&pending, || callbacks += 1));
+        assert_eq!(callbacks, 2);
+    }
 }
