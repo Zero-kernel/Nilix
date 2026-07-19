@@ -52,10 +52,21 @@
 //! residual (not a physically fenced allocator region). Live free-space can
 //! still be consumed by general residual growth; subsystem admission remains
 //! fallible.
+//!
+//! # R180-7..13 partial close (2026-07-16)
+//!
+//! Numeric object caps that previously dwarfed residual (MAX_MAP_COUNT 65536,
+//! MAX_SOCKETS_PER_NS 8192, MAX_RW_SIZE == HEAP) are now residual-derived so
+//! declared limits cannot alone exceed GENERAL_RESIDUAL_BYTES. Full runtime
+//! aggregate admission for every PCB/cap/RCU/RAMFS path remains D1 design work
+//! (D1-RES-HEAP-BUDGET-SCOPE). This closes the "cap >> residual" subclass.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::memory::HEAP_SIZE_BYTES;
+use crate::heap_admission::{
+    self, ADMITTED_HEAP_BYTES, NORMAL_UNADMITTED_RESERVE_BYTES, REGISTERED_FIXED_RESERVE_BYTES,
+};
+use crate::memory::{EMERGENCY_HEAP_SIZE_BYTES, HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES};
 
 // ============================================================================
 // Named budget identifiers
@@ -79,6 +90,8 @@ pub enum HeapBudgetId {
     AuditRing = 3,
     /// Exec image staging buffer (transient peak; not retained across exec).
     ExecImagePeak = 4,
+    /// Complete exec transaction staging (image + argv/env + stack scratch).
+    ExecTransactionPeak = 5,
 }
 
 /// Number of hard-floor slots (excludes transient peaks).
@@ -91,18 +104,21 @@ pub const HARD_FLOOR_COUNT: usize = 4;
 /// Reserved headroom that no subsystem may claim. Covers allocator
 /// fragmentation, small ad-hoc Vec growth, and emergency paths.
 ///
-/// 128 KiB = HEAP/8.
-pub const RESERVED_HEADROOM_BYTES: usize = HEAP_SIZE_BYTES / 8;
+/// 128 KiB total: 64 KiB physically isolated emergency arena plus 64 KiB
+/// normal-arena space withheld from runtime admission.
+pub const RESERVED_HEADROOM_BYTES: usize =
+    EMERGENCY_HEAP_SIZE_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES;
 
-/// Conntrack hard floor. Historical claim was HEAP/2 (512 KiB) which alone
-/// left too little for coexistence. Reduced to HEAP/4 (256 KiB).
-pub const CONNTRACK_HARD_BYTES: usize = HEAP_SIZE_BYTES / 4;
+/// Conntrack hard floor. Kept at the audited 256 KiB capacity when the
+/// physical arena grows; heap growth must not silently expand an
+/// attacker-controlled retained table.
+pub const CONNTRACK_HARD_BYTES: usize = 256 * 1024;
 
 /// Futex hard floor. Historical claim HEAP/4 (256 KiB) → HEAP/8 (128 KiB).
-pub const FUTEX_HARD_BYTES: usize = HEAP_SIZE_BYTES / 8;
+pub const FUTEX_HARD_BYTES: usize = 128 * 1024;
 
 /// Page-cache metadata hard floor. Historical HEAP/8 (128 KiB) → HEAP/16 (64 KiB).
-pub const PAGE_CACHE_META_HARD_BYTES: usize = HEAP_SIZE_BYTES / 16;
+pub const PAGE_CACHE_META_HARD_BYTES: usize = 64 * 1024;
 
 /// Audit ring hard floor for the *default* capacity path.
 ///
@@ -111,11 +127,17 @@ pub const PAGE_CACHE_META_HARD_BYTES: usize = HEAP_SIZE_BYTES / 16;
 /// P2-A sets `audit::MAX_CAPACITY = DEFAULT_CAPACITY` so retained ring memory
 /// cannot grow past this hard floor via `audit::init`. Export staging remains
 /// separate and fallible (`try_reserve_exact`).
-pub const AUDIT_RING_HARD_BYTES: usize = HEAP_SIZE_BYTES / 16;
+pub const AUDIT_RING_HARD_BYTES: usize = 64 * 1024;
 
-/// Exec image staging peak (transient). Historical 512 KiB equalled half the
-/// heap; reduced to HEAP/4 (256 KiB) so hard+peak+headroom still fits.
-pub const EXEC_IMAGE_PEAK_BYTES: usize = HEAP_SIZE_BYTES / 4;
+/// Maximum ELF image accepted by exec/spawn. This is one component of the
+/// larger aggregate transaction reservation below.
+pub const EXEC_IMAGE_PEAK_BYTES: usize = 256 * 1024;
+
+/// R180-10 FIX: conservative admission for the complete exec staging lifetime.
+/// This covers a maximum image, both 128 KiB string sets and their nested Vec
+/// metadata, pathname/execfn, loader ledgers, and initial-stack serialization.
+/// It is admission, not eagerly allocated memory.
+pub const EXEC_TRANSACTION_PEAK_BYTES: usize = 1024 * 1024;
 
 /// Compile-time table of hard floors (order matches [`HeapBudgetId`] 0..HARD_FLOOR_COUNT).
 pub const HARD_FLOOR_BYTES: [usize; HARD_FLOOR_COUNT] = [
@@ -141,25 +163,27 @@ pub const HARD_FLOORS_SUM_BYTES: usize = {
 };
 
 /// Maximum single transient peak charged against residual.
-pub const TRANSIENT_PEAK_BYTES: usize = EXEC_IMAGE_PEAK_BYTES;
+pub const TRANSIENT_PEAK_BYTES: usize = EXEC_TRANSACTION_PEAK_BYTES;
 
-/// Bytes remaining for general (non-registered) kernel heap use after hard
-/// floors, reserved headroom, and the max transient peak are set aside.
-pub const GENERAL_RESIDUAL_BYTES: usize = HEAP_SIZE_BYTES
-    .saturating_sub(HARD_FLOORS_SUM_BYTES)
-    .saturating_sub(RESERVED_HEADROOM_BYTES)
-    .saturating_sub(TRANSIENT_PEAK_BYTES);
+/// Bytes in the shared runtime-admission pool after hard floors and normal
+/// unadmitted headroom. Transient reservations consume this pool dynamically;
+/// they are not subtracted twice here.
+pub const GENERAL_RESIDUAL_BYTES: usize = ADMITTED_HEAP_BYTES;
 
 // ----------------------------------------------------------------------------
 // Const coexistence gate — fails the build if a future edit re-introduces
 // over-commit of hard floors + peak + headroom against the real heap size.
 // ----------------------------------------------------------------------------
-const _: () = assert!(HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES <= HEAP_SIZE_BYTES);
+const _: () = assert!(HARD_FLOORS_SUM_BYTES == REGISTERED_FIXED_RESERVE_BYTES);
 const _: () = assert!(
-    HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES + TRANSIENT_PEAK_BYTES <= HEAP_SIZE_BYTES
+    HARD_FLOORS_SUM_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + ADMITTED_HEAP_BYTES
+        == NORMAL_HEAP_SIZE_BYTES
 );
+const _: () = assert!(NORMAL_HEAP_SIZE_BYTES + EMERGENCY_HEAP_SIZE_BYTES == HEAP_SIZE_BYTES);
+const _: () = assert!(TRANSIENT_PEAK_BYTES <= ADMITTED_HEAP_BYTES);
 const _: () = assert!(CONNTRACK_HARD_BYTES > 0);
 const _: () = assert!(FUTEX_HARD_BYTES > 0);
+const _: () = assert!(heap_admission::HeapClass::Futex.limit_bytes() == FUTEX_HARD_BYTES);
 const _: () = assert!(PAGE_CACHE_META_HARD_BYTES > 0);
 const _: () = assert!(AUDIT_RING_HARD_BYTES > 0);
 const _: () = assert!(EXEC_IMAGE_PEAK_BYTES > 0);
@@ -208,6 +232,7 @@ pub const fn hard_floor_bytes(id: HeapBudgetId) -> usize {
             // Peak is NOT a hard floor — do not let callers treat it as one.
             0
         }
+        HeapBudgetId::ExecTransactionPeak => 0,
     }
 }
 
@@ -220,6 +245,7 @@ pub const fn budget_bytes(id: HeapBudgetId) -> usize {
         HeapBudgetId::PageCacheMeta => PAGE_CACHE_META_HARD_BYTES,
         HeapBudgetId::AuditRing => AUDIT_RING_HARD_BYTES,
         HeapBudgetId::ExecImagePeak => EXEC_IMAGE_PEAK_BYTES,
+        HeapBudgetId::ExecTransactionPeak => EXEC_TRANSACTION_PEAK_BYTES,
     }
 }
 
@@ -230,43 +256,45 @@ pub const fn transient_peak_bytes() -> usize {
 }
 
 // ============================================================================
-// Transient-peak admission (single-holder)
+// Aggregate exec-transaction admission
 // ============================================================================
 
-/// Live holders of the registered transient peak (exec image staging).
+/// Live holders of aggregate exec-transaction reservations.
 ///
-/// The coexistence proof charges at most ONE peak against residual. Concurrent
-/// `sys_execve` / `sys_spawn_image` paths must serialize peak ownership so
-/// `N * EXEC_IMAGE_PEAK_BYTES` cannot stack on top of full hard floors.
+/// The byte ledger is authoritative: transactions coexist only while their
+/// sum fits. The counter is observability and an underflow tripwire, not the
+/// admission decision.
 static TRANSIENT_PEAK_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 
-/// RAII guard for the exec-image transient peak.
-///
-/// Acquiring fails with `Err(())` when another holder is live. Drop releases
-/// exactly one holder. Zero heap allocation; safe under IRQ-off if needed.
+/// RAII guard for the complete exec-transaction peak.
 #[must_use = "dropping TransientPeakGuard releases the peak slot"]
 pub struct TransientPeakGuard {
-    _priv: (),
+    reservation: Option<heap_admission::HeapReservation>,
 }
 
 impl TransientPeakGuard {
-    /// Try to admit one transient-peak holder.
-    ///
-    /// Returns `Err(())` if another holder is already live (caller maps to
-    /// ENOMEM / EAGAIN as appropriate). Uses a CAS loop; never blocks.
+    /// Try to admit one complete exec transaction before any user staging.
     pub fn try_acquire() -> Result<Self, ()> {
+        Self::try_acquire_bytes(TRANSIENT_PEAK_BYTES)
+    }
+
+    fn try_acquire_bytes(bytes: usize) -> Result<Self, ()> {
+        let reservation =
+            heap_admission::try_reserve(heap_admission::HeapClass::Exec, bytes).map_err(|_| ())?;
         loop {
             let cur = TRANSIENT_PEAK_HOLDERS.load(Ordering::Acquire);
-            if cur != 0 {
-                return Err(());
-            }
+            let next = cur.checked_add(1).ok_or(())?;
             match TRANSIENT_PEAK_HOLDERS.compare_exchange_weak(
-                0,
-                1,
+                cur,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self { _priv: () }),
+                Ok(_) => {
+                    return Ok(Self {
+                        reservation: Some(reservation),
+                    })
+                }
                 Err(_) => core::hint::spin_loop(),
             }
         }
@@ -275,13 +303,14 @@ impl TransientPeakGuard {
 
 impl Drop for TransientPeakGuard {
     fn drop(&mut self) {
-        // Release-store 0: the peak buffer is about to be dropped by the holder;
-        // a subsequent acquirer may proceed.
-        TRANSIENT_PEAK_HOLDERS.store(0, Ordering::Release);
+        // Return admitted bytes before publishing the holder-count decrement.
+        drop(self.reservation.take());
+        let previous = TRANSIENT_PEAK_HOLDERS.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "exec transaction holder counter underflow");
     }
 }
 
-/// Current number of live transient-peak holders (0 or 1 under correct use).
+/// Current number of live aggregate exec reservations.
 #[inline]
 pub fn transient_peak_holders() -> usize {
     TRANSIENT_PEAK_HOLDERS.load(Ordering::Acquire)
@@ -352,13 +381,14 @@ pub fn publish_and_assert() {
         head,
         heap
     );
+    assert_eq!(
+        hard + NORMAL_UNADMITTED_RESERVE_BYTES + ADMITTED_HEAP_BYTES,
+        NORMAL_HEAP_SIZE_BYTES,
+        "R180 normal-arena partition mismatch"
+    );
     assert!(
-        hard + head + peak <= heap,
-        "P2-A heap budget over-commit: hard {} + headroom {} + peak {} > heap {}",
-        hard,
-        head,
-        peak,
-        heap
+        peak <= ADMITTED_HEAP_BYTES,
+        "exec peak exceeds admitted pool"
     );
 
     // Per-slot positivity (defensive against a zeroed table entry).
@@ -373,6 +403,7 @@ pub fn publish_and_assert() {
         i += 1;
     }
 
+    heap_admission::publish();
     BUDGETS_PUBLISHED.store(true, Ordering::Release);
 
     klog_always!(
@@ -401,15 +432,20 @@ pub fn publish_and_assert() {
 
 /// Pure arithmetic + policy self-test. Panics on any invariant failure.
 ///
-/// Safe to call before or after [`publish_and_assert`]; does not allocate.
+/// Call after [`publish_and_assert`]; does not allocate.
 pub fn run_heap_budget_self_test() {
-    // 1) Coexistence: hard + headroom + peak fit the real heap.
-    assert!(
-        HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES + TRANSIENT_PEAK_BYTES <= HEAP_SIZE_BYTES,
-        "coexistence broken"
+    // 1) Physical and admitted partitions cover the heap exactly.
+    assert_eq!(
+        HARD_FLOORS_SUM_BYTES
+            + NORMAL_UNADMITTED_RESERVE_BYTES
+            + ADMITTED_HEAP_BYTES
+            + EMERGENCY_HEAP_SIZE_BYTES,
+        HEAP_SIZE_BYTES,
+        "coexistence partition broken"
     );
-    // 2) Hard floors alone leave headroom free.
-    assert!(HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES <= HEAP_SIZE_BYTES);
+    assert!(TRANSIENT_PEAK_BYTES <= ADMITTED_HEAP_BYTES);
+    // 2) Hard floors leave both runtime admission and physical emergency space.
+    assert!(HARD_FLOORS_SUM_BYTES + RESERVED_HEADROOM_BYTES < HEAP_SIZE_BYTES);
     // 3) No hard floor claims the whole heap.
     let mut i = 0;
     while i < HARD_FLOOR_COUNT {
@@ -438,23 +474,33 @@ pub fn run_heap_budget_self_test() {
         "peak must not count as a hard floor"
     );
     assert_eq!(
+        hard_floor_bytes(HeapBudgetId::ExecTransactionPeak),
+        0,
+        "transaction peak must not count as a hard floor"
+    );
+    assert_eq!(
         budget_bytes(HeapBudgetId::ExecImagePeak),
         EXEC_IMAGE_PEAK_BYTES
     );
-    assert_eq!(transient_peak_bytes(), EXEC_IMAGE_PEAK_BYTES);
-    // 4b) Transient-peak single-holder admission.
+    assert_eq!(
+        budget_bytes(HeapBudgetId::ExecTransactionPeak),
+        EXEC_TRANSACTION_PEAK_BYTES
+    );
+    assert_eq!(transient_peak_bytes(), EXEC_TRANSACTION_PEAK_BYTES);
+    // 4b) Aggregate holder accounting. Use small reservations because this
+    // self-test runs after boot services have live charges; a full transaction
+    // reservation must not make the test depend on ambient workload.
     assert_eq!(transient_peak_holders(), 0);
     {
-        let g1 = TransientPeakGuard::try_acquire().expect("first peak acquire");
+        let g1 = TransientPeakGuard::try_acquire_bytes(4096).expect("first peak acquire");
         assert_eq!(transient_peak_holders(), 1);
-        assert!(
-            TransientPeakGuard::try_acquire().is_err(),
-            "second concurrent peak must be refused"
-        );
+        let g2 = TransientPeakGuard::try_acquire_bytes(4096).expect("second peak acquire");
+        assert_eq!(transient_peak_holders(), 2);
+        drop(g2);
         drop(g1);
     }
     assert_eq!(transient_peak_holders(), 0);
-    let g2 = TransientPeakGuard::try_acquire().expect("re-acquire after release");
+    let g2 = TransientPeakGuard::try_acquire_bytes(4096).expect("re-acquire after release");
     drop(g2);
     assert_eq!(transient_peak_holders(), 0);
     // 5) Residual arithmetic is consistent with the published snapshot shape.
@@ -464,15 +510,11 @@ pub fn run_heap_budget_self_test() {
     assert_eq!(snap.reserved_headroom_bytes, RESERVED_HEADROOM_BYTES);
     assert_eq!(snap.transient_peak_bytes, TRANSIENT_PEAK_BYTES);
     assert_eq!(snap.general_residual_bytes, GENERAL_RESIDUAL_BYTES);
-    // 6) Residual non-negative is already guaranteed by saturating_sub + const
-    //    assert; re-check the non-saturating identity for the live numbers.
+    // 6) Re-check the normal-arena partition.
     assert_eq!(
-        HARD_FLOORS_SUM_BYTES
-            + RESERVED_HEADROOM_BYTES
-            + TRANSIENT_PEAK_BYTES
-            + GENERAL_RESIDUAL_BYTES,
-        HEAP_SIZE_BYTES,
-        "partition of heap must be exact"
+        HARD_FLOORS_SUM_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + GENERAL_RESIDUAL_BYTES,
+        NORMAL_HEAP_SIZE_BYTES,
+        "normal heap partition must be exact"
     );
     // 7) Historical over-claim regression: the OLD fractions must NOT reappear
     //    as the live hard floors (class re-open guard).
@@ -488,4 +530,5 @@ pub fn run_heap_budget_self_test() {
         PAGE_CACHE_META_HARD_BYTES <= HEAP_SIZE_BYTES / 16,
         "page-cache meta must not re-claim >1/16 heap"
     );
+    heap_admission::run_heap_admission_self_test();
 }
