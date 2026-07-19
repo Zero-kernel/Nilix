@@ -753,21 +753,30 @@ pub struct Dirent64 {
     // followed by name bytes + '\0'
 }
 
+/// Linux `d_name[]` flexible-tail offset. `size_of::<Dirent64>()` is 24 due
+/// to Rust/C tail padding; the wire header is exactly 19 bytes.
+pub const DIRENT64_NAME_OFFSET: usize = core::mem::offset_of!(Dirent64, d_type) + 1;
+const _: [(); 19] = [(); DIRENT64_NAME_OFFSET];
+
 /// IPv4 socket address (struct sockaddr_in)
 ///
 /// Layout matches the kernel's SockAddrIn for syscall compatibility:
 /// - family: Address family (AF_INET = 2)
 /// - port: Port number in network byte order (big-endian)
-/// - addr: IPv4 address in network byte order (big-endian)
+/// - addr: exact four IPv4 network-order bytes
 /// - padding: 8 bytes to match sockaddr size
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Default)]
 pub struct SockAddrIn {
     pub family: u16,
     pub port: u16,
-    pub addr: u32,
+    pub addr: [u8; 4],
     pub padding: [u8; 8],
 }
+
+const _: [(); 16] = [(); core::mem::size_of::<SockAddrIn>()];
+const _: [(); 4] = [(); core::mem::offset_of!(SockAddrIn, addr)];
+const _: [(); 4] = [(); core::mem::align_of::<SockAddrIn>()];
 
 impl SockAddrIn {
     /// Create a new IPv4 socket address.
@@ -779,9 +788,14 @@ impl SockAddrIn {
         Self {
             family: AF_INET as u16,
             port: port.to_be(),
-            addr: u32::from_be_bytes(ip),
+            addr: ip,
             padding: [0; 8],
         }
+    }
+
+    /// Return the exact network-order IPv4 bytes.
+    pub const fn ip_bytes(&self) -> [u8; 4] {
+        self.addr
     }
 }
 

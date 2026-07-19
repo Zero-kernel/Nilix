@@ -47,7 +47,8 @@ use userspace::libc::{getchar, print, print_int, println, putchar, strncmp};
 use userspace::syscall::{
     is_error, parse_ipv4, sys_chdir, sys_close, sys_connect, sys_exit, sys_getcwd, sys_getdents64,
     sys_getpid, sys_getppid, sys_open, sys_read, sys_recvfrom, sys_sendto, sys_socket, sys_stat,
-    sys_uname, sys_write, Dirent64, SockAddrIn, Stat, UtsName, AF_INET, IPPROTO_TCP, SOCK_STREAM,
+    sys_uname, sys_write, Dirent64, SockAddrIn, Stat, UtsName, AF_INET, DIRENT64_NAME_OFFSET,
+    IPPROTO_TCP, SOCK_STREAM,
 };
 
 /// Maximum command line length
@@ -385,19 +386,24 @@ where
         }
         let mut offset = 0usize;
         while offset < nread as usize {
+            let remaining = (nread as usize).saturating_sub(offset);
+            if remaining < mem::size_of::<Dirent64>() {
+                return false;
+            }
             let ptr = unsafe { buf.as_ptr().add(offset) as *const Dirent64 };
             let dirent = unsafe { core::ptr::read_unaligned(ptr) };
             if dirent.d_reclen == 0 {
                 return false;
             }
-            let header_size = mem::size_of::<Dirent64>();
-            if (dirent.d_reclen as usize) <= header_size {
+            let header_size = DIRENT64_NAME_OFFSET;
+            let record_len = dirent.d_reclen as usize;
+            if record_len <= header_size || record_len > remaining || record_len & 7 != 0 {
                 return false;
             }
-            let name_len = (dirent.d_reclen as usize).saturating_sub(header_size);
+            let name_len = record_len - header_size;
             let name_ptr = unsafe { (ptr as *const u8).add(header_size) };
             visitor(name_ptr, name_len, dirent.d_type);
-            offset += dirent.d_reclen as usize;
+            offset += record_len;
         }
     }
     true
