@@ -234,8 +234,8 @@ pub use ipc_namespace::{
 // F.1: Network namespace support
 pub use net_namespace::{
     clone_net_namespace, init as init_net_namespace, move_device as move_net_device,
-    print_net_namespace_info, test_is_net_ns_initialized, NetNamespace, NetNamespaceFd, NetNsError,
-    CLONE_NEWNET, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
+    net_ns_owns_device, print_net_namespace_info, test_is_net_ns_initialized, NetNamespace,
+    NetNamespaceFd, NetNsError, CLONE_NEWNET, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
 };
 // F.1: User namespace support
 pub use user_namespace::{
@@ -331,6 +331,11 @@ pub fn init() {
     // upcall). Must be after process::init + cgroup registry init; precedes
     // userspace, so any non-zero cgroup charge always sees a registered hook.
     syscall::register_cgroup_port_hooks();
+
+    // D1-ISO-NETNS-DATAPLANE: Register the TX device-ownership hooks (net ->
+    // net_namespace upcall). Must precede userspace so no child netns can ever
+    // transmit against an unregistered gate (which admits only the root ns).
+    syscall::register_netns_device_hooks();
 
     // Register socket timeout checker as timer callback
     scheduler_hook::register_timer_callback(syscall::check_socket_timeouts)
