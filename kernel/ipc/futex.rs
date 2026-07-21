@@ -553,8 +553,11 @@ pub fn futex_wait(
     // re-check of `unlinked` — the first-publish guard. waiter_count>=1 then pins the bucket
     // table-resident (cleanup_empty_bucket's emptiness gate fails), so all later re-locks of
     // `bucket` operate on the live table entry. If a reaper unlinked it in the get->lock gap
-    // we retry; on exhaustion fail closed (WouldBlock -> userspace retries) rather than
-    // enqueue on an orphan no waker can find.
+    // we retry; on exhaustion fail closed rather than enqueue on an orphan no waker can find.
+    // R181-1 FIX: exhaustion returns TooManyBuckets (-> ENOMEM), NOT WouldBlock (-> EAGAIN).
+    // EAGAIN means "futex word mismatched, retry immediately" — under sustained reaper
+    // thrashing that spins userspace in a livelock. Retry exhaustion is a transient resource
+    // failure, so it must surface as one.
     let (bucket, queue) = {
         let mut attempt = 0;
         loop {
@@ -564,7 +567,7 @@ pub fn futex_wait(
                 drop(b);
                 attempt += 1;
                 if attempt >= FUTEX_REVALIDATE_RETRIES {
-                    return Err(FutexError::WouldBlock);
+                    return Err(FutexError::TooManyBuckets);
                 }
                 continue;
             }
@@ -725,7 +728,10 @@ pub fn futex_lock_pi(
                 drop(b);
                 attempt += 1;
                 if attempt >= FUTEX_REVALIDATE_RETRIES {
-                    return Err(FutexError::WouldBlock);
+                    // R181-1 FIX: same class as futex_wait — retry exhaustion on
+                    // tombstoned buckets is a resource failure (ENOMEM), not a
+                    // futex-word race (EAGAIN would livelock the LOCK_PI caller).
+                    return Err(FutexError::TooManyBuckets);
                 }
                 continue;
             }
