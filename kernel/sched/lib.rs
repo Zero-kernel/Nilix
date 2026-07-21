@@ -17,7 +17,6 @@ pub use kernel_core::process;
 pub mod cpuset;
 pub mod enhanced_scheduler;
 pub mod lock_ordering;
-pub mod scheduler;
 
 // Re-export Scheduler for runtime tests
 pub use enhanced_scheduler::Scheduler;
@@ -32,8 +31,4 @@ pub fn init() {
     klog_always!("Scheduler module initialized");
     enhanced_scheduler::init();
     // Note: cpuset::init() should be called after CPU enumeration in main.rs
-}
-
-pub fn schedule() {
-    // 简单的调度函数
 }
