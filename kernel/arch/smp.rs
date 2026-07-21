@@ -95,6 +95,16 @@ const AP_READY_TIMEOUT: usize = 1_000_000;
 const PROCESS_DEFERRED_ACK_TIMEOUT_SECONDS: u64 = 30;
 const PROCESS_DEFERRED_ACK_MAX_SPINS: u64 = 250_000_000;
 
+/// S-4 FIX: consult the HPET deadline only once per this many spins.
+///
+/// `ProcessDeferredAckDeadline::expired()` is an MMIO read; performing it on
+/// every failed ACK spin serializes the wait loop on uncached MMIO traffic.
+/// Batching adds at most `PROCESS_DEFERRED_ACK_HPET_POLL_INTERVAL - 1` spins
+/// of deadline-detection latency (microseconds against a 30 s deadline); the
+/// independent spin ceiling below is checked every iteration and stays exact.
+/// Must be a power of two (used as a mask).
+const PROCESS_DEFERRED_ACK_HPET_POLL_INTERVAL: u64 = 1024;
+
 #[derive(Clone, Copy)]
 struct ProcessDeferredAckDeadline {
     start: u64,
@@ -1125,8 +1135,12 @@ pub fn wait_for_process_deferred_acknowledgements() {
             break;
         }
         spins = spins.saturating_add(1);
+        // S-4 FIX: the spin ceiling is exact (checked every iteration); the
+        // HPET MMIO deadline read is batched to every
+        // PROCESS_DEFERRED_ACK_HPET_POLL_INTERVAL spins.
         if spins >= PROCESS_DEFERRED_ACK_MAX_SPINS
-            || deadline.map(|value| value.expired()).unwrap_or(false)
+            || (spins & (PROCESS_DEFERRED_ACK_HPET_POLL_INTERVAL - 1) == 0
+                && deadline.map(|value| value.expired()).unwrap_or(false))
         {
             panic!("RF180-58: timed out waiting for AP deferred-work acknowledgements");
         }
@@ -1643,11 +1657,33 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
         let entry_len = table[offset + 1] as usize;
 
         if entry_len < 2 || offset + entry_len > total_len {
-            break;
+            // S-3 FIX: a structurally malformed entry invalidates the whole
+            // table. Accepting the valid prefix would silently start fewer
+            // APs from a corrupt MADT; fail closed to BSP-only enumeration,
+            // matching the RF180-58 duplicate/over-capacity polarity.
+            klog_always!(
+                "[SMP] rejecting malformed MADT entry (type={}, len={}, offset={}, total={})",
+                entry_type,
+                entry_len,
+                offset,
+                total_len
+            );
+            return None;
         }
 
         // Entry type 0 = Processor Local APIC
-        if entry_type == 0 && entry_len >= core::mem::size_of::<ProcessorLocalApic>() {
+        if entry_type == 0 {
+            if entry_len < core::mem::size_of::<ProcessorLocalApic>() {
+                // S-3 FIX: a truncated Local APIC entry is the same structural
+                // corruption as a malformed generic entry; reject the whole
+                // table rather than silently skipping a CPU record.
+                klog_always!(
+                    "[SMP] rejecting truncated MADT Local APIC entry (len={}, offset={})",
+                    entry_len,
+                    offset
+                );
+                return None;
+            }
             let pla = &*(table[offset..].as_ptr() as *const ProcessorLocalApic);
             // Check if processor is enabled (bit 0)
             if pla.flags & 1 != 0 {
@@ -1670,6 +1706,17 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
         }
 
         offset += entry_len;
+    }
+
+    // S-3 FIX: the walk must consume the table exactly. A 1-byte trailing
+    // remainder exits the loop "successfully" but is the same structural
+    // corruption as a malformed entry; reject the whole table.
+    if offset != total_len {
+        klog_always!(
+            "[SMP] rejecting MADT with trailing garbage ({} byte(s) after last entry)",
+            total_len - offset
+        );
+        return None;
     }
 
     if ids.is_empty() {
