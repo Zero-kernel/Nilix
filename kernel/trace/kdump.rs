@@ -38,7 +38,7 @@ use core::{
 use compliance::{fips_state, FipsState};
 // R141-8 FIX: Use chacha20_xor_keystream instead of direct ChaCha20Rng access
 // to respect the FIPS API boundary.
-use security::{chacha20_xor_keystream, try_fill_random, KptrGuard};
+use security::{chacha20_xor_keystream, kptr_strongly_seeded, try_fill_random, KptrGuard};
 
 // ============================================================================
 // Constants
@@ -684,6 +684,62 @@ fn capture_stack_bytes(dst: &mut [u8], rsp: u64) -> usize {
 // Pointer Redaction
 // ============================================================================
 
+/// S-5 FIX: Recognizable sentinel substituted for kernel pointers whenever the
+/// kptr secret is still TSC-weak. A hash under a weak/guessable secret is
+/// potentially invertible (splitmix64 is bijective; a known-plaintext pair can
+/// recover the secret), so exporting it into the dump would leak KASLR layout.
+/// A constant carries no pointer identity at all. Non-canonical on purpose so
+/// dump analysis can never mistake it for a live kernel address.
+const KDUMP_WEAK_SEED_SENTINEL: u64 = 0x5eed_dead_0000_0000;
+
+/// Pure decision core for the kdump export redaction — testable without
+/// touching the global seeding state.
+#[inline]
+fn redacted_word_for(val: u64, strongly_seeded: bool) -> u64 {
+    if strongly_seeded {
+        KptrGuard::from_addr(val).obfuscated_value()
+    } else {
+        KDUMP_WEAK_SEED_SENTINEL
+    }
+}
+
+/// S-5 FIX: single owner for every kernel-pointer export into the dump.
+/// Strong seed ⇒ obfuscated hash (correlatable for offline dedup, not
+/// invertible); weak seed ⇒ constant sentinel (leaks nothing).
+#[inline]
+fn redact_kernel_word(val: u64) -> u64 {
+    redacted_word_for(val, kptr_strongly_seeded())
+}
+
+/// S-5 boot self-test: pin the redaction decision core.
+///
+/// Asserts on the PURE predicate (`redacted_word_for`), not the global state,
+/// so it is deterministic regardless of whether the boot reseed succeeded:
+/// (a) weak seed ⇒ the constant sentinel, independent of the input pointer
+///     (two distinct pointers must collapse to the identical constant);
+/// (b) strong seed ⇒ exactly the KptrGuard obfuscated hash (delegation), and
+///     never the raw pointer value for a kernel address.
+pub fn run_kdump_redaction_self_test() {
+    const PTR_A: u64 = 0xffff_8000_0000_1000;
+    const PTR_B: u64 = 0xffff_8000_1234_5000;
+
+    assert_eq!(
+        redacted_word_for(PTR_A, false),
+        KDUMP_WEAK_SEED_SENTINEL,
+        "S-5: weak-seed redaction must be the constant sentinel"
+    );
+    assert_eq!(
+        redacted_word_for(PTR_B, false),
+        KDUMP_WEAK_SEED_SENTINEL,
+        "S-5: weak-seed redaction must not depend on the pointer value"
+    );
+    assert_eq!(
+        redacted_word_for(PTR_A, true),
+        KptrGuard::from_addr(PTR_A).obfuscated_value(),
+        "S-5: strong-seed redaction must delegate to the kptr hash"
+    );
+}
+
 /// Redact all kernel pointers in registers.
 fn redact_regs(mut regs: CpuRegs) -> CpuRegs {
     regs.rax = redact_if_kernel_ptr(regs.rax);
@@ -705,7 +761,7 @@ fn redact_regs(mut regs: CpuRegs) -> CpuRegs {
     regs.rsp = redact_if_kernel_ptr(regs.rsp);
 
     // CR3 is always sensitive - always redact
-    regs.cr3 = KptrGuard::from_addr(regs.cr3).obfuscated_value();
+    regs.cr3 = redact_kernel_word(regs.cr3);
     regs
 }
 
@@ -716,7 +772,7 @@ fn redact_stack_words(stack: &mut [u8]) {
         word_bytes.copy_from_slice(chunk);
         let word = u64::from_le_bytes(word_bytes);
         if is_kernel_address(word) {
-            let redacted = KptrGuard::from_addr(word).obfuscated_value();
+            let redacted = redact_kernel_word(word);
             chunk.copy_from_slice(&redacted.to_le_bytes());
         }
     }
@@ -733,7 +789,7 @@ fn redact_ascii_hex_kernel_ptrs(buf: &mut [u8]) {
         if buf[i] == b'0' && (buf[i + 1] == b'x' || buf[i + 1] == b'X') {
             if let Some(val) = parse_hex_u64_16(&buf[i + 2..i + 18]) {
                 if is_kernel_address(val) {
-                    let redacted = KptrGuard::from_addr(val).obfuscated_value();
+                    let redacted = redact_kernel_word(val);
                     write_hex_u64_16(&mut buf[i + 2..i + 18], redacted);
                     i += 18;
                     continue;
@@ -794,7 +850,7 @@ fn is_canonical_address(addr: u64) -> bool {
 #[inline]
 fn redact_if_kernel_ptr(val: u64) -> u64 {
     if is_kernel_address(val) {
-        KptrGuard::from_addr(val).obfuscated_value()
+        redact_kernel_word(val)
     } else {
         val
     }

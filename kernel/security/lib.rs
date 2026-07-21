@@ -54,7 +54,7 @@ pub use kaslr::{
     KptiContext, PartialKaslrFeature, PartialKaslrStatus, TextKaslrStatus, TrampolineDesc,
     KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
 };
-pub use kptr::KptrGuard;
+pub use kptr::{kptr_strongly_seeded, KptrGuard};
 pub use memory_hardening::{
     CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,
 };

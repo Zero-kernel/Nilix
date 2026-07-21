@@ -202,7 +202,9 @@ pub fn reseed_from_entropy() -> u64 {
 /// CSPRNG (strong) rather than the TSC fallback (weak). Turns KPTR_STRONG_SEEDED
 /// from a write-only flag into a readable property so a caller that must not
 /// expose hashed kernel pointers under weak seeding can gate on it.
-#[allow(dead_code)] // Public query API; consumers wired as KASLR-leak gating lands.
+/// S-5 FIX: consumed by the kdump export choke-point (`trace::kdump`), which
+/// substitutes a constant sentinel for the obfuscated hash while the secret is
+/// still TSC-weak (a weak-secret hash is potentially invertible; a constant is not).
 pub fn kptr_strongly_seeded() -> bool {
     KPTR_STRONG_SEEDED.load(Ordering::SeqCst)
 }
