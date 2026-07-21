@@ -445,11 +445,15 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 /// BSP's ready bit before the AP's own `init_syscall_percpu` + swapgs.
 static SYSCALL_GS_READY_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// P1-A: Assert that `IA32_GS_BASE` points into the kernel `SYSCALL_PERCPU` array.
+/// P1-A: Assert that `IA32_GS_BASE` points at **this CPU's** `SYSCALL_PERCPU` slot.
 ///
 /// After a correct CPL3→kernel entry (`swapgs` on syscall/timer Ring-3 path, or
 /// already-kernel GS on CPL0 IRQ), GS must address per-CPU syscall metadata.
 /// Scheduling or KPTI CR3 loads with user GS active is the R178-1 class.
+///
+/// S-2 (D3-ARC-GS-ASSERT): the check is exact-slot, not array-range. A foreign
+/// CPU's slot inside `SYSCALL_PERCPU` would still mean cross-CPU state
+/// corruption on schedule, so range membership alone is insufficient.
 ///
 /// No-op until **this** CPU has completed `init_syscall_percpu` (bit in
 /// `SYSCALL_GS_READY_MASK`).
@@ -466,29 +470,64 @@ pub fn assert_kernel_gs_base() {
     }
 
     let gs_base = unsafe { rdmsr(IA32_GS_BASE) };
-    // SAFETY: SYSCALL_PERCPU is a static mut array with fixed layout for the life of
-    // the kernel; we only read its address range for a bounds check.
-    let (start, end) = unsafe {
-        let start = SYSCALL_PERCPU.as_ptr() as u64;
-        let end =
-            start + (core::mem::size_of::<SyscallPerCpu>() as u64) * (SYSCALL_MAX_CPUS as u64);
-        (start, end)
-    };
 
     assert!(
-        gs_base >= start && gs_base < end,
-        "P1-A ENTRY-STATE: CPU {} IA32_GS_BASE=0x{:x} outside SYSCALL_PERCPU [0x{:x}, 0x{:x}) — \
-         missing swapgs / enter_kernel_state before schedule?",
+        gs_base_is_exact_slot(gs_base, cpu),
+        "P1-A ENTRY-STATE: CPU {} IA32_GS_BASE=0x{:x} != exact SYSCALL_PERCPU slot 0x{:x} — \
+         missing swapgs / enter_kernel_state before schedule, or foreign-CPU GS slot?",
         cpu,
         gs_base,
-        start,
-        end
+        expected_gs_slot(cpu)
     );
 }
 
+/// S-2: the enforcement predicate — `gs_base` must be **exactly** this CPU's
+/// `SYSCALL_PERCPU` slot. Factored out so the negative self-test exercises the
+/// same predicate the production assertion uses (an array-range check would
+/// wrongly return true for a foreign CPU's slot).
+#[inline]
+fn gs_base_is_exact_slot(gs_base: u64, cpu: usize) -> bool {
+    gs_base == expected_gs_slot(cpu)
+}
+
+/// S-2: address of the exact `SYSCALL_PERCPU[cpu]` slot this CPU must have in
+/// `IA32_GS_BASE` after kernel entry.
+///
+/// # Panics
+/// Panics if `cpu >= SYSCALL_MAX_CPUS`; callers gate on the ready mask first.
+#[inline]
+fn expected_gs_slot(cpu: usize) -> u64 {
+    assert!(
+        cpu < SYSCALL_MAX_CPUS,
+        "CPU index out of SYSCALL_PERCPU range"
+    );
+    // SAFETY: raw address computation only (addr_of! creates no reference to
+    // the mutable static); SYSCALL_PERCPU has fixed layout for the kernel's life.
+    unsafe {
+        (core::ptr::addr_of!(SYSCALL_PERCPU) as u64)
+            + (core::mem::size_of::<SyscallPerCpu>() as u64) * (cpu as u64)
+    }
+}
+
 /// Boot self-check: kernel GS must already be active after `init_syscall_percpu(0)`.
+///
+/// S-2 negative probe: an adjacent CPU's slot must NOT satisfy the exact-slot
+/// predicate — this pins the D3-ARC-GS-ASSERT hardening (exact ownership, not
+/// array-range membership).
 pub fn run_entry_state_gs_self_test() {
     assert_kernel_gs_base();
+
+    let cpu = cpu_local::current_cpu_id();
+    if cpu + 1 < SYSCALL_MAX_CPUS {
+        // Feed the adjacent slot's address through the SAME enforcement
+        // predicate: it lies inside SYSCALL_PERCPU, so a regressed
+        // array-range check would accept it; the exact-slot check must not.
+        let foreign = expected_gs_slot(cpu + 1);
+        assert!(
+            !gs_base_is_exact_slot(foreign, cpu),
+            "S-2 GS self-test: adjacent-slot address must fail the exact-slot predicate"
+        );
+    }
 }
 
 /// 系统调用入口是否已初始化
