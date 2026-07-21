@@ -4480,6 +4480,46 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .count()
 }
 
+/// R181-3 FIX: lock-order-safe CLONE_VM share re-count for callers that HOLD a
+/// Process::inner lock (the cgroupfs/attach migration window). The blocking
+/// `address_space_share_count` takes PROCESS_TABLE then locks every
+/// Process::inner — calling it while holding one Process::inner inverts the
+/// Level-5 order (ABBA). This variant fails CLOSED instead of blocking:
+///
+/// - `PROCESS_TABLE` is acquired via `try_lock`; contention aborts the count.
+/// - The slot whose lock the CALLER already holds (`held_pid`) is counted
+///   WITHOUT locking (the caller holds it; its membership cannot change).
+/// - Every other slot uses `try_lock`; ANY contended sibling aborts the count
+///   (a skipped sibling could be the CLONE_VM partner we exist to detect —
+///   skipping would silently under-count, re-opening the bypass).
+///
+/// Returns `Some(count)` on a complete observation, `None` on any contention.
+/// Callers treat `None` as EBUSY (transient; userspace retries).
+pub fn try_address_space_share_count_holding(
+    memory_space: usize,
+    held_pid: ProcessId,
+) -> Option<usize> {
+    if memory_space == 0 {
+        return Some(0);
+    }
+    let table = PROCESS_TABLE.try_lock()?;
+    let mut count = 0usize;
+    for (pid, slot) in table.iter().enumerate() {
+        let Some(p) = slot else { continue };
+        if pid == held_pid {
+            // Caller holds this lock; it counts itself via the held guard's
+            // memory_space, which the caller has already verified.
+            count += 1;
+            continue;
+        }
+        let guard = p.try_lock()?;
+        if guard.memory_space == memory_space && guard.state != ProcessState::Terminated {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
 // D3-ARC-MM-SHARED: The following sync_vm_siblings_* functions have been deleted.
 // With shared MmState (Arc<Mutex<MmState>>), CLONE_VM siblings share a single
 // MmState instance. Mutations are automatically visible to all siblings through
