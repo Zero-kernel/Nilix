@@ -4,7 +4,7 @@ This directory contains all QA security audit reports for the Zero-OS kernel.
 
 ## Latest Audit
 
-**[qa-2026-07-16.md](qa-2026-07-16.md)** - R180 full-codebase security audit; implementation closure synchronized through the July 19 RF180-59 review-fix follow-up
+**[qa-2026-07-20.md](qa-2026-07-20.md)** - R181 full-codebase security audit after S2-wave hardening and D2-SEC LSM integration (0 CRITICAL, 0 HIGH, 5 MEDIUM+LOW; all fixed same-day)
 
 ## Audit Summaries
 
@@ -23,6 +23,7 @@ Audits are organized chronologically by date. Each audit represents a full-codeb
 
 ### 2026 Audits
 
+- **R181** (July 20): post-S2-wave + D2-SEC full audit - [qa-2026-07-20.md](qa-2026-07-20.md), [fix summary](../fixes/R181-fix-summary.md)
 - **R180** (July 16-19): full audit plus convergence closure - [qa-2026-07-16.md](qa-2026-07-16.md), [first continuation](../reviewfix/reviewfix-2026-07-19.md), [authoritative follow-up](../reviewfix/reviewfix-2026-07-19-v2.md)
 - **R178-R179** (July 10-14): entry/resource review-fix and focused verification - [qa-2026-07-10.md](qa-2026-07-10.md) through [qa-2026-07-14.md](qa-2026-07-14.md)
 - **R174** (July 2): prior comprehensive audit - [qa-2026-07-02-v5.md](qa-2026-07-02-v5.md)

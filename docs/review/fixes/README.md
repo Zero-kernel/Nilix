@@ -2,6 +2,10 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R181 Fixes (July 2026)
+
+- **[R181-fix-summary.md](R181-fix-summary.md)** - R181 fix round (5/5 actionable closed: futex errno class, CLONE_VM migration re-count primitive both front doors, accept backoff + 2 documented dispositions; MODE C, avg 1.2 iterations)
+
 ## R180 Fixes (July 2026)
 
 - **[R180-fix-summary.md](R180-fix-summary.md)** - R180 historical review-fix plus convergence through RF180-59 (32/32 implementation findings closed; design blockers retained; MODE D)
