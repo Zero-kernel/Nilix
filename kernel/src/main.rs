@@ -60,7 +60,6 @@ static BOOT_PHASE_COMPLETE: core::sync::atomic::AtomicBool =
 mod demo;
 mod integration_test;
 mod interrupt_demo;
-mod process_demo;
 mod runtime_tests;
 mod shell;
 mod stack_guard;
@@ -481,6 +480,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 if report.kptr_guard_active {
                     klog!(Info, "        - kptr guard: active");
                 }
+                // S-5: pin the kdump export redaction decision core (weak seed ⇒
+                // constant sentinel; strong seed ⇒ kptr hash). Pure-predicate
+                // test — passes deterministically whether or not the CSPRNG
+                // reseed above succeeded.
+                trace::kdump::run_kdump_redaction_self_test();
+                klog!(Info, "        - kdump redaction self-test: passed (S-5)");
                 if let Some(spectre) = &report.spectre_status {
                     klog!(Info, "        - Spectre mitigations: {}", spectre.summary());
                 }
@@ -490,6 +495,27 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // lock_profile() provides defense-in-depth against direct calls.
                 compliance::lock_profile();
                 klog_always!("        - Profile locked (immutable until reboot)");
+                // D2-SEC-LSM FIX: install the LSM policy slot for ALL profiles
+                // (kills the null-slot fallback branch), then install the
+                // minimal enforcing secure-baseline policy under the Secure
+                // profile — fail closed if the installation did not take.
+                lsm::init();
+                if policy.profile == compliance::HardeningProfile::Secure {
+                    lsm::set_policy(&lsm::SECURE_BASELINE);
+                    if lsm::active_policy_name() != "secure-baseline" {
+                        panic!(
+                            "Secure profile requires the secure-baseline LSM policy (active: {})",
+                            lsm::active_policy_name()
+                        );
+                    }
+                }
+                // Representative-denial self-test on the policy OBJECT —
+                // profile-independent, no audit traffic, no global slot use.
+                lsm::run_secure_baseline_self_test();
+                klog_always!(
+                    "        - LSM policy: {} (secure-baseline self-test passed)",
+                    lsm::active_policy_name()
+                );
 
                 // P1-1 FIX: Log PolicySurface enforcement summary so operators
                 // can verify which security features are active at boot.
