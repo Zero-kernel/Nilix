@@ -1260,6 +1260,33 @@ pub fn register_cgroup_port_hooks() {
     net::register_cgroup_port_hooks(&KERNEL_CGROUP_PORT_HOOKS);
 }
 
+/// D1-ISO-NETNS-DATAPLANE: Kernel implementation of the TX device-ownership
+/// verification hook.
+///
+/// Bridges the net crate's namespace-gated TX device resolver (which cannot
+/// depend on kernel_core — dependency cycle) to the NetNamespace device
+/// registry: root (ns 0) owns all registered devices by default; a child
+/// namespace owns exactly the devices added via `add_device` / `move_device`
+/// (CAP_NET_ADMIN-gated). Unknown / destroyed namespace ids own nothing.
+struct KernelNetNsDeviceHooks;
+
+impl net::NetNsDeviceHooks for KernelNetNsDeviceHooks {
+    fn ns_owns_device(&self, ns_id: u64, device_index: u32) -> bool {
+        crate::net_namespace::net_ns_owns_device(ns_id, device_index)
+    }
+}
+
+/// Static instance of KernelNetNsDeviceHooks for registration.
+static KERNEL_NETNS_DEVICE_HOOKS: KernelNetNsDeviceHooks = KernelNetNsDeviceHooks;
+
+/// D1-ISO-NETNS-DATAPLANE: Register the TX device-ownership hooks with the net
+/// crate. Called during kernel initialization (before userspace), so no child
+/// netns can transmit before the ownership gate is live; pre-registration the
+/// net-side gate admits only the root namespace (fail-closed).
+pub fn register_netns_device_hooks() {
+    net::register_netns_device_hooks(&KERNEL_NETNS_DEVICE_HOOKS);
+}
+
 /// Timer callback to check socket wait timeouts.
 ///
 /// Called from scheduler tick to wake processes whose timeouts have expired.
@@ -17156,6 +17183,16 @@ fn sys_accept_common(
     // after every descriptor/capability resource is prepared do we atomically
     // recheck and pop. ENOMEM/EMFILE/LSM rejection therefore leaves the child
     // queued and retryable; a competing acceptor yields LostRace and retries.
+    //
+    // R181-4 FIX: LostRace retries are bounded. Under sustained contention
+    // (many threads accepting on one listener) an unbounded immediate-retry
+    // loop monopolizes the CPU. After ACCEPT_LOST_RACE_YIELD_THRESHOLD
+    // consecutive losses a non-blocking caller returns EAGAIN (a lost race
+    // IS "no connection available for this caller" — POSIX-correct), and a
+    // blocking caller yields the CPU before retrying, so competing acceptors
+    // and the rest of the system always make progress.
+    const ACCEPT_LOST_RACE_YIELD_THRESHOLD: u32 = 16;
+    let mut lost_races: u32 = 0;
     let (prepared, child) = loop {
         let attempt = accept_after_preflight(
             socket.poll_readiness().readable,
@@ -17168,7 +17205,20 @@ fn sys_accept_common(
         )?;
         match attempt {
             AcceptPublicationAttempt::Ready { prepared, child } => break (prepared, child),
-            AcceptPublicationAttempt::LostRace => continue,
+            AcceptPublicationAttempt::LostRace => {
+                lost_races += 1;
+                if lost_races >= ACCEPT_LOST_RACE_YIELD_THRESHOLD {
+                    if listener_nonblock {
+                        return Err(SyscallError::EAGAIN);
+                    }
+                    lost_races = 0;
+                    if let Some(proc) = current_pid().and_then(get_process) {
+                        proc.lock().enter_ready_at(crate::get_ticks());
+                    }
+                    crate::force_reschedule();
+                }
+                continue;
+            }
             AcceptPublicationAttempt::NotReady => {
                 if listener_nonblock {
                     return Err(SyscallError::EAGAIN);
@@ -18192,6 +18242,20 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // changed memory_space. Return EAGAIN so caller can retry.
     if proc.memory_space != memory_space {
         return Err(SyscallError::EAGAIN);
+    }
+
+    // R181-3 FIX: identity re-verify alone does not close the CLONE_VM race —
+    // a clone in the check->lock gap adds a sibling WITHOUT changing this
+    // task's memory_space value. Authoritative re-count under the held lock
+    // via the fail-closed try_lock variant (the blocking counter would
+    // ABBA-invert the Level-5 PROCESS_TABLE -> Process::inner order). Any
+    // contention aborts to EAGAIN — an incomplete observation must never
+    // admit the migration (a skipped sibling could BE the CLONE_VM partner).
+    if memory_space != 0 {
+        match crate::process::try_address_space_share_count_holding(memory_space, pid) {
+            Some(count) if count <= 1 => {}
+            _ => return Err(SyscallError::EAGAIN),
+        }
     }
 
     // R171 M2-1 SLICE-1 FIX: refuse to re-home a task that is mid-`sys_exec`.
