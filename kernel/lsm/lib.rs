@@ -63,7 +63,10 @@ use audit::{emit_lsm_denial, AuditLsmReason, AuditObject, AuditSubject};
 
 pub mod policy;
 
-pub use policy::{DenyAllPolicy, LsmError, LsmPolicy, LsmResult, PermissivePolicy};
+pub use policy::{
+    run_secure_baseline_self_test, DenyAllPolicy, LsmError, LsmPolicy, LsmResult, PermissivePolicy,
+    SecureBaselinePolicy, SECURE_BASELINE,
+};
 
 // ============================================================================
 // Local Type Definitions (to avoid cyclic dependency with kernel_core/vfs)
@@ -571,6 +574,14 @@ pub fn policy() -> &'static dyn LsmPolicy {
 #[cfg(not(feature = "lsm"))]
 pub fn policy() -> &'static dyn LsmPolicy {
     &PERMISSIVE
+}
+
+/// D2-SEC-LSM FIX: Name of the currently active policy — the fail-closed
+/// presence check for Secure-profile boot (`kernel/src/main.rs`) asserts the
+/// enforcing policy actually took effect instead of trusting `set_policy` blindly.
+#[inline]
+pub fn active_policy_name() -> &'static str {
+    policy().name()
 }
 
 // ============================================================================

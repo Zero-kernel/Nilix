@@ -532,7 +532,6 @@ impl LsmPolicy for PermissivePolicy {
 /// Useful for testing or as a starting point for restrictive policies.
 /// All hooks return `Err(LsmError::Denied)`.
 pub struct DenyAllPolicy;
-
 impl LsmPolicy for DenyAllPolicy {
     fn name(&self) -> &'static str {
         "deny-all"
@@ -817,4 +816,199 @@ impl LsmPolicy for DenyAllPolicy {
     fn kpatch_unload(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
         Err(LsmError::Denied)
     }
+}
+
+// ============================================================================
+// Secure Baseline Policy (D2-SEC-LSM-INTEGRATION)
+// ============================================================================
+
+/// D2-SEC-LSM FIX: mmap/mprotect protection bits (Linux ABI values, matching
+/// the `prot` argument the memory hooks receive from the syscall layer).
+const PROT_WRITE: u32 = 0x2;
+const PROT_EXEC: u32 = 0x4;
+
+/// Deny a mapping/protection that is simultaneously writable and executable.
+///
+/// User-space W^X, enforced as defense-in-depth BENEATH the kernel-side
+/// `strict_wxorx` validation (which covers kernel mappings only). A JIT-less
+/// Secure-profile system has no legitimate W+X user mapping.
+#[inline]
+fn deny_user_wx(prot: u32) -> LsmResult {
+    if prot & (PROT_WRITE | PROT_EXEC) == (PROT_WRITE | PROT_EXEC) {
+        Err(LsmError::Denied)
+    } else {
+        Ok(())
+    }
+}
+
+/// D2-SEC-LSM FIX: Minimal enforcing policy installed by the Secure hardening
+/// profile at boot (`kernel/src/main.rs`), closing the R180 design finding
+/// that production never installs an enforcing LSM policy.
+///
+/// # Enforcement surface (deliberately minimal)
+///
+/// Each denial below is DEFENSE-IN-DEPTH: it backs an independent primary
+/// check, so a bug in that primary check no longer suffices to escalate.
+///
+/// 1. **User W^X** (`memory_mmap`/`memory_mprotect`) — LIVE TODAY: both hooks
+///    are called from the mmap/mprotect syscall handlers
+///    (`kernel_core/syscall.rs`). No simultaneous PROT_WRITE|PROT_EXEC user
+///    mapping; kernel mappings are covered separately by `strict_wxorx`.
+/// 2. **Livepatch** — LIVE TODAY via the livepatch ops delegation (R102-13):
+///    inherits the trait's R104-6 default-DENY for all `kpatch_*` hooks — the
+///    Secure profile keeps kernel live-patching denied even for root (unlike
+///    PermissivePolicy, which overrides to allow).
+/// 3. **Root-minting** (`task_setuid`/`task_setresuid`) — TRAIT-COMPLETE,
+///    dormant: the kernel has no setuid-family syscalls yet, so these hooks
+///    currently have no caller. The arms are implemented now so the second
+///    layer exists the day the syscalls land (a DAC bypass bug then still
+///    cannot mint root); the self-test pins their semantics.
+/// 4. **Ptrace confinement** (Yama-like) — TRAIT-COMPLETE, dormant for the
+///    same reason (no ptrace syscall yet): a non-root tracer may only trace
+///    same-euid targets and never a root process.
+///
+/// Everything else stays `Ok(())` — the policy is honest about being minimal:
+/// it denies only classes with a second independent check or with no
+/// legitimate Secure-profile use. It is side-effect free, alloc-free, and
+/// lock-free (IRQ-safe per the trait contract).
+pub struct SecureBaselinePolicy;
+
+/// The single static instance installed by Secure-profile boot.
+pub static SECURE_BASELINE: SecureBaselinePolicy = SecureBaselinePolicy;
+
+impl LsmPolicy for SecureBaselinePolicy {
+    fn name(&self) -> &'static str {
+        "secure-baseline"
+    }
+
+    fn priority(&self) -> u32 {
+        10
+    }
+
+    fn memory_mmap(
+        &self,
+        _task: &ProcessCtx,
+        _addr: u64,
+        _len: u64,
+        prot: u32,
+        _flags: u32,
+    ) -> LsmResult {
+        deny_user_wx(prot)
+    }
+
+    fn memory_mprotect(&self, _task: &ProcessCtx, _addr: u64, _len: u64, prot: u32) -> LsmResult {
+        deny_user_wx(prot)
+    }
+
+    fn task_setuid(&self, task: &ProcessCtx, new_uid: u32, new_gid: u32) -> LsmResult {
+        if task.euid != 0 && (new_uid == 0 || new_gid == 0) {
+            Err(LsmError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn task_setresuid(&self, task: &ProcessCtx, ruid: u32, euid: u32, suid: u32) -> LsmResult {
+        if task.euid != 0 && (ruid == 0 || euid == 0 || suid == 0) {
+            Err(LsmError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ptrace(&self, tracer: &ProcessCtx, target: &ProcessCtx, _op: u32) -> LsmResult {
+        let target_is_root = target.uid == 0 || target.euid == 0;
+        if tracer.euid != 0 && (target_is_root || tracer.euid != target.euid) {
+            Err(LsmError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
+    // kpatch_load / kpatch_enable / kpatch_disable / kpatch_unload:
+    // deliberately NOT overridden — the trait defaults (R104-6) deny them,
+    // and the Secure profile keeps that denial even for root.
+}
+
+/// D2-SEC-LSM boot self-test: representative denials against the policy
+/// OBJECT directly (not through the `hook_*` wrappers), so it is
+/// profile-independent, emits no audit records, and touches no global slot.
+pub fn run_secure_baseline_self_test() {
+    let user_a = ProcessCtx::new(100, 100, 1000, 1000, 1000, 1000);
+    let user_b = ProcessCtx::new(101, 101, 1001, 1001, 1001, 1001);
+    let root = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+
+    // 1. User W^X: W+X denied on both hooks; RW and RX allowed.
+    assert!(
+        SECURE_BASELINE
+            .memory_mmap(&user_a, 0, 4096, PROT_WRITE | PROT_EXEC, 0)
+            .is_err(),
+        "secure-baseline: W+X mmap must be denied"
+    );
+    assert!(
+        SECURE_BASELINE
+            .memory_mprotect(&user_a, 0, 4096, PROT_WRITE | PROT_EXEC)
+            .is_err(),
+        "secure-baseline: W+X mprotect must be denied"
+    );
+    assert!(
+        SECURE_BASELINE
+            .memory_mmap(&user_a, 0, 4096, 0x1 | PROT_WRITE, 0)
+            .is_ok(),
+        "secure-baseline: RW mmap must be allowed"
+    );
+    assert!(
+        SECURE_BASELINE
+            .memory_mprotect(&user_a, 0, 4096, 0x1 | PROT_EXEC)
+            .is_ok(),
+        "secure-baseline: RX mprotect must be allowed (loader transition)"
+    );
+
+    // 2. Root-minting: nonroot -> 0 denied; root credential drop allowed.
+    assert!(
+        SECURE_BASELINE.task_setuid(&user_a, 0, 1000).is_err(),
+        "secure-baseline: nonroot setuid to 0 must be denied"
+    );
+    assert!(
+        SECURE_BASELINE
+            .task_setresuid(&user_a, 1000, 0, 1000)
+            .is_err(),
+        "secure-baseline: nonroot setresuid minting euid 0 must be denied"
+    );
+    assert!(
+        SECURE_BASELINE.task_setuid(&root, 1000, 1000).is_ok(),
+        "secure-baseline: root credential drop must be allowed"
+    );
+    assert!(
+        SECURE_BASELINE.task_setuid(&root, 0, 0).is_ok(),
+        "secure-baseline: root retaining root must be allowed"
+    );
+
+    // 3. Ptrace confinement.
+    assert!(
+        SECURE_BASELINE.ptrace(&user_a, &user_b, 0).is_err(),
+        "secure-baseline: cross-uid nonroot ptrace must be denied"
+    );
+    assert!(
+        SECURE_BASELINE.ptrace(&user_a, &root, 0).is_err(),
+        "secure-baseline: nonroot tracing root must be denied"
+    );
+    assert!(
+        SECURE_BASELINE.ptrace(&user_a, &user_a, 0).is_ok(),
+        "secure-baseline: same-euid ptrace must be allowed"
+    );
+    assert!(
+        SECURE_BASELINE.ptrace(&root, &user_a, 0).is_ok(),
+        "secure-baseline: root tracer must be allowed"
+    );
+
+    // 4. Livepatch stays denied even for root (inherited R104-6 defaults).
+    assert!(
+        SECURE_BASELINE.kpatch_load(&root, 4096).is_err(),
+        "secure-baseline: kpatch_load must stay denied even for root"
+    );
+    assert!(
+        SECURE_BASELINE.kpatch_enable(&root, 1).is_err(),
+        "secure-baseline: kpatch_enable must stay denied even for root"
+    );
 }
