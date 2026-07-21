@@ -16,7 +16,7 @@ A security-first hybrid microkernel operating system written in Rust for the x86
 ## 1. Overview
 
 Nilix is an enterprise-grade hybrid kernel inspired by Linux's modular design, hardened
-through **172 successive security-audit rounds**. It pairs a capability- and LSM-gated
+through **181 successive security-audit rounds**. It pairs a capability- and LSM-gated
 in-kernel hot path with a roadmap toward a de-privileged Linux-compatible user-space
 personality.
 
@@ -37,8 +37,8 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate is currently **QUALIFIED** (0 open HIGH findings)
-after the R172 audit + same-day remediation. See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate is currently **BLOCKED** (zero-HIGH streak candidate 1/3)
+after the R181 audit. See [Section 6](#6-security-audit-status).
 
 | Subsystem | Status | Highlights |
 |-----------|--------|-----------|
@@ -150,8 +150,9 @@ Nilix/
   *(fd-table → capability integration is still in progress; file-descriptor access remains
   ambient for now.)*
 - **LSM** — a pluggable `LsmPolicy` trait with 40+ hook points across syscalls, task lifecycle,
-  VFS, memory, IPC, signals, network, and livepatch; default policy is permissive, with
-  deny-all and custom policies supported. Denials are fail-closed and audited.
+  VFS, memory, IPC, signals, network, and livepatch; the Secure profile enforces the
+  `SecureBaselinePolicy` (W^X on mmap/mprotect, kpatch default-deny), while Balanced/Performance
+  remain permissive. Denials are fail-closed and audited.
 - **Seccomp / Pledge** — a BPF-like filter VM with 18 pledge promises and a fast-allow bitmap;
   a boot-time partition self-test guards against seccomp/dispatch divergence.
 - **Audit** — SHA-256 (FIPS 180-4) hash-chained events with an optional HMAC-SHA256 mode,
@@ -183,7 +184,8 @@ with overlap detection), ICMP, and UDP. TCP implements the full state machine an
 handshake, RFC 6298 RTT/RTO with Karn's algorithm, NewReno congestion control, window scaling,
 SYN cookies, listen/accept, and graceful close. Above the protocols sit connection tracking,
 a stateful priority-ordered firewall (ACCEPT/DROP/REJECT, default-DROP), and a
-capability-based socket API with per-hook LSM mediation.
+capability-based socket API with per-hook LSM mediation. Network namespace TX ownership gates
+prevent isolated namespaces from egressing on devices they do not own.
 
 ### 3.8 SMP, IOMMU & Concurrency
 
@@ -317,17 +319,18 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **172** |
-| Cumulative findings | ~1,254 |
-| Findings fixed/resolved | ~1,152 |
-| Latest round | R172 (`docs/review/qa-2026-06-23.md`) |
-| 1.0-Preview release gate | **QUALIFIED** — 0 open HIGH |
+| Audit rounds | **181** |
+| Cumulative findings | ~1,261 |
+| Findings fixed/resolved | ~1,159 |
+| Latest round | R181 (`docs/review/audits/qa-2026-07-20.md`) |
+| 1.0-Preview release gate | **BLOCKED** — zero-HIGH streak 1/3 |
 
-The most recent round (**R172**) was the first full audit over the new user-mode ABI
-foundation. It surfaced a pre-existing context-switch CRITICAL (a fresh task's first switch-out
-could resume into Ring-0 with a user RIP) plus eight HIGH findings; all were fixed and
-peer-converged the same day, restoring the 0-HIGH streak and re-qualifying the gate. Per-round
-reports live in `docs/review/`, and the live plan is `docs/next-phase-plan.md`.
+The most recent round (**R181**) was the first full-codebase audit after the S2-wave hardening
+and D2-SEC LSM integration. It found **0 CRITICAL / 0 HIGH / 5 MEDIUM+LOW** actionable findings
+across 10/10 subsystem coverage; all five were fixed and converged the same day (2026-07-20),
+qualifying R181 as zero-HIGH streak candidate 1/3. The 1.0-Preview gate requires three consecutive
+zero-HIGH rounds. Per-round reports live in `docs/review/`, and the live plan is
+`docs/review/nextplan/`.
 
 ---
 
