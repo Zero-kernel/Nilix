@@ -476,6 +476,7 @@ pub fn test_tcp_checksum_wire_oracle() {
 }
 
 /// P2-A: kernel-heap byte-budget arbiter coexistence + query API.
+/// D1-RES: oracle coexistence proof + all 15 HeapClass boundaries.
 pub fn test_heap_budget_arbiter() {
     klog_always!("  [TEST] Heap Budget Arbiter (P2-A)...");
     mm::run_heap_budget_self_test();
@@ -515,6 +516,64 @@ pub fn test_heap_budget_arbiter() {
     );
     klog_always!("    ✓ named hard floors derived from arbiter (no independent HEAP/N fractions)");
     klog_always!("    ✓ aggregate exec/I/O admission + exact nested-buffer release");
+
+    // D1-RES: runtime coexistence oracle (PO-RES-02). Fixed-floor consumers
+    // (page-cache + audit) are not charged through the admission ledger.
+    // Conntrack + Futex ARE ledger-charged and must NOT be re-attributed.
+    //
+    // Protocol: capture the unledgered baseline BEFORE the boundary stress,
+    // re-measure AFTER it. The boundary test drives every class gate and the
+    // global gate through full reserve/release cycles, so any unledgered
+    // residue it leaks (or any ledger/allocator divergence it causes) shows
+    // up as drift. Drift past the declared 64 KiB unadmitted reserve fails
+    // the boot. This proves the accounting identity live, not just at rest.
+    let measure = || -> (usize, usize) {
+        let allocator_used = mm::NORMAL_HEAP_SIZE_BYTES - mm::heap_free_bytes();
+        let pagecache_meta_live = (mm::PAGE_CACHE.stats().nr_pages as usize) * 256;
+        let audit_ring_live = audit::stats().map_or(0, |s| {
+            s.capacity as usize * core::mem::size_of::<Option<audit::AuditEvent>>()
+        });
+        (allocator_used, pagecache_meta_live + audit_ring_live)
+    };
+
+    let (used_before, floors_before) = measure();
+    let adm_before = mm::heap_admission_snapshot();
+    let baseline_unledgered = used_before
+        .saturating_sub(adm_before.committed_bytes)
+        .saturating_sub(floors_before);
+    // Absolute leg: the self-derived baseline is only accepted under a named,
+    // budgeted ceiling — otherwise the drift leg would tautologically accept
+    // any pre-existing unledgered footprint. Together these bound total
+    // unattributed use by (boot ceiling + 64 KiB runtime reserve).
+    assert!(
+        baseline_unledgered <= mm::BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES,
+        "D1-RES: boot unledgered footprint {} B exceeds budget {} B",
+        baseline_unledgered,
+        mm::BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES
+    );
+
+    // D1-RES-HEAP-BUDGET-SCOPE: exhaustive boundary self-test (PO-RES-02).
+    mm::run_heap_admission_boundary_self_test();
+    klog_always!("    ✓ all 15 HeapClass boundaries + global ceiling + exact ledger restoration");
+
+    let (used_after, floors_after) = measure();
+    match mm::check_coexistence(used_after, floors_after, Some(baseline_unledgered)) {
+        mm::CoexistenceVerdict::Sound { unattributed_bytes } => {
+            klog_always!(
+                "    ✓ D1-RES oracle: baseline={} B, post-stress unledgered={} B, drift <= {} B reserve",
+                baseline_unledgered,
+                unattributed_bytes,
+                mm::NORMAL_UNADMITTED_RESERVE_BYTES
+            );
+        }
+        mm::CoexistenceVerdict::NotQuiescent { reserved_bytes } => {
+            panic!(
+                "D1-RES: oracle with pending reservations ({}B)",
+                reserved_bytes
+            );
+        }
+        verdict => panic!("D1-RES: oracle coexistence failed: {verdict:?}"),
+    }
 }
 
 /// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.
