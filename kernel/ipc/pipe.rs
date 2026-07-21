@@ -427,6 +427,13 @@ impl Pipe {
 
             // RF180-42 FIX: allocate possible WaitQueue growth only after
             // proving the operation would block, and before re-taking Pipe.inner.
+            // R181-5 DISPOSITION (accept-as-is): if data races in between the
+            // first pass and this reservation, the under-lock re-check below
+            // returns the data and `capacity` is dropped — the reservation is
+            // transient, bounded by the waiter count, and reclaimed immediately;
+            // reserving-then-rechecking is the correct order (the inverse —
+            // arming the wait before reserving — reintroduces the RF180-42
+            // alloc-under-lock hazard this pattern exists to prevent).
             let mut capacity = self
                 .read_wait
                 .prepare_current_wait_capacity()
