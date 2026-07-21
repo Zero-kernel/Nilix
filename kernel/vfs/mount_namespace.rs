@@ -389,10 +389,12 @@ impl MountNamespace {
         self.mounts.read().len()
     }
 
-    /// Get all mount paths in this namespace.
-    pub fn mount_paths(&self) -> Vec<String> {
-        self.mounts.read().keys().cloned().collect()
-    }
+    // S-6 FIX: `mount_paths()` (keys().cloned().collect() into an infallible Vec
+    // over the user-growable mount map) was deleted: it had zero callers, and any
+    // future caller would have inherited an unbounded infallible allocation — the
+    // exact D2-ERR-VFS-FALLIBILITY class. Enumeration goes through `find_mount`/
+    // `mount_count`; a future listing API must be fallible (try_reserve) and
+    // bounded.
 
     /// Find the mount point for a given path.
     ///

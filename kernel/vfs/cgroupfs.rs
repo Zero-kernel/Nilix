@@ -445,6 +445,11 @@ impl CgroupDirInode {
     }
 
     /// Get control files available for this cgroup
+    ///
+    /// S-6: the `collect()` below is structurally bounded — the iterator is a
+    /// filter over `CtrlKind::all()` (a fixed compile-time enum array), so the
+    /// allocation is capped at `CtrlKind::all().len()` entries regardless of
+    /// user input. Not user-growable; exempt from the infallible-collect debt.
     fn available_ctrl_files(&self) -> Vec<CtrlKind> {
         let cgroup = match cgroup::lookup_cgroup(self.cgroup_id) {
             Some(cg) => cg,
@@ -761,7 +766,16 @@ impl CgroupCtrlInode {
                 // charges but leaves other siblings in the source cgroup with
                 // physical memory still mapped, enabling memory.max bypass.
                 // Note: must NOT hold proc.lock() when calling
-                // address_space_share_count (it acquires PROCESS_TABLE lock).
+                // address_space_share_count (it acquires PROCESS_TABLE and
+                // iterates locking Process::inner — holding our Process::inner
+                // first inverts the documented Level 5 ordering).
+                //
+                // R181-3: this lock-free read is only the cheap PREFLIGHT. A
+                // CLONE_VM in the check->lock gap adds a sibling without
+                // changing memory_space, so the authoritative gate is the
+                // fail-closed try_lock re-count under the held Process lock
+                // below (mirrors the R180-3 preflight-auth + under-lock
+                // re-auth shape).
                 let memory_space = proc.lock().memory_space;
                 if memory_space != 0 && process::address_space_share_count(memory_space) > 1 {
                     return Err(FsError::Busy);
@@ -800,6 +814,20 @@ impl CgroupCtrlInode {
                 // changed it between the share-count check (lock-free) and here.
                 if proc_guard.memory_space != memory_space {
                     return Err(FsError::Busy);
+                }
+                // R181-3 FIX: identity re-verify alone does NOT close the
+                // CLONE_VM race — a clone in the check->lock gap adds a sibling
+                // WITHOUT changing this task's memory_space value. Re-count
+                // under the held lock via the fail-closed try_lock variant
+                // (the blocking counter would ABBA-invert the Level-5 order
+                // PROCESS_TABLE -> Process::inner). Any contention aborts to
+                // EBUSY: a skipped sibling could BE the CLONE_VM partner, so
+                // an incomplete observation must never admit the migration.
+                if memory_space != 0 {
+                    match process::try_address_space_share_count_holding(memory_space, pid) {
+                        Some(count) if count <= 1 => {}
+                        _ => return Err(FsError::Busy),
+                    }
                 }
                 // SLICE-1: refuse to re-home a task mid-`sys_exec`. Its load_elf
                 // charge (to the exec-time snapshot cgroup, Process lock dropped) must
