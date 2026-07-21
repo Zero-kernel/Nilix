@@ -1017,6 +1017,21 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
     // Between chunks, interrupts are re-enabled and per-CPU state is cleared,
     // making task migration safe (same pattern as R109-1 fix for bulk copies).
     //
+    // R181-2 CONTRACT: this chunked copy is NOT an atomic snapshot of user
+    // memory. A concurrent thread that munmap/mmap-races or plain-stores into
+    // the source range can make later chunks observe different content than
+    // earlier chunks (a "hybrid" string). This is the same contract as Linux
+    // strncpy_from_user: NO copy-from-user primitive is atomic against other
+    // user threads — even a single-chunk copy races byte-by-byte with stores
+    // from another CPU, so holding SMAP/IRQ-off across the whole string would
+    // not close the window (and would trade an integrity non-issue for an
+    // unbounded IRQ-off DoS, violating Safety > Efficiency > Speed). Kernel
+    // safety is preserved unconditionally: every chunk re-validates its own
+    // mapping (EFAULT on unmap), bounds are checked per byte, and the result
+    // is treated as untrusted userspace bytes by every consumer. Consumers
+    // that need semantic validity (e.g. exec's argv/envp) MUST validate the
+    // COPIED buffer, never re-read user memory (single-fetch rule).
+    //
     // R110-1 FIX: Copy bytes into a stack-local buffer inside the SMAP window,
     // then extend the Vec *outside* the window.  This avoids heap allocation
     // (Vec growth/realloc) while interrupts are disabled and SMAP is bypassed.
