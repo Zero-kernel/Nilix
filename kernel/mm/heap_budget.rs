@@ -181,6 +181,19 @@ const _: () = assert!(
 );
 const _: () = assert!(NORMAL_HEAP_SIZE_BYTES + EMERGENCY_HEAP_SIZE_BYTES == HEAP_SIZE_BYTES);
 const _: () = assert!(TRANSIENT_PEAK_BYTES <= ADMITTED_HEAP_BYTES);
+// D1-RES partition non-oversubscription: the boot unledgered footprint budget
+// plus the two floors whose real allocations are NOT ledger-charged
+// (page-cache metadata, audit ring) must fit inside the withheld fixed
+// reserve. Conntrack and futex charge their real allocations through the
+// runtime ledger (within ADMITTED_HEAP_BYTES), so their floor withholding is
+// physically available to the boot footprint — the boot budget is a carve-out
+// of existing withheld bytes, not a new allowance on top of the partition.
+const _: () = assert!(
+    heap_admission::BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES
+        + PAGE_CACHE_META_HARD_BYTES
+        + AUDIT_RING_HARD_BYTES
+        <= REGISTERED_FIXED_RESERVE_BYTES
+);
 const _: () = assert!(CONNTRACK_HARD_BYTES > 0);
 const _: () = assert!(FUTEX_HARD_BYTES > 0);
 const _: () = assert!(heap_admission::HeapClass::Futex.limit_bytes() == FUTEX_HARD_BYTES);
