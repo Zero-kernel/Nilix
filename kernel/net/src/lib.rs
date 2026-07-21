@@ -95,11 +95,12 @@ pub use ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
 };
 pub use socket::{
-    register_cgroup_port_hooks, register_socket_wait_hooks, socket_table, BindCharge,
-    CgroupPortHooks, PendingDatagram, RecvTransactionError, SerializedTcpPacket, SockPollReadiness,
-    SocketArc, SocketArcAllocator, SocketDomain, SocketError, SocketLabel, SocketProtocol,
-    SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
-    TcpConnectResult, WaitOutcome, WaitQueue, WaitQueueArc,
+    register_cgroup_port_hooks, register_netns_device_hooks, register_socket_wait_hooks,
+    socket_table, BindCharge, CgroupPortHooks, NetNsDeviceHooks, PendingDatagram,
+    RecvTransactionError, SerializedTcpPacket, SockPollReadiness, SocketArc, SocketArcAllocator,
+    SocketDomain, SocketError, SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable,
+    SocketType, SocketWaitHooks, TableStats, TcpConnectResult, WaitOutcome, WaitQueue,
+    WaitQueueArc,
 };
 pub use stack::{
     handle_timer_tick, network_config, process_frame, transmit_prepared_reply,
@@ -219,6 +220,18 @@ impl NetDeviceRegistry {
             .map(|d| d.device.clone())
     }
 
+    /// D1-ISO-NETNS-DATAPLANE FIX: resolve a device together with its stable
+    /// registry index in ONE read-lock critical section, so ownership gating
+    /// checks the SAME device object the caller will transmit on (no
+    /// name→handle / name→index split-lookup drift).
+    fn get_by_name_with_index(&self, name: &str) -> Option<(NetDeviceHandle, usize)> {
+        let devices = self.devices.read();
+        devices
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| (d.device.clone(), d.index))
+    }
+
     fn get_by_index(&self, index: usize) -> Option<NetDeviceHandle> {
         let devices = self.devices.read();
         devices
@@ -252,6 +265,12 @@ pub fn register_device<D: NetDevice + 'static>(device: D) -> Result<usize, NetEr
 /// Get a device by name.
 pub fn get_device(name: &str) -> Option<NetDeviceHandle> {
     registry().get_by_name(name)
+}
+
+/// D1-ISO-NETNS-DATAPLANE FIX: get a device by name along with its stable
+/// registry index (single critical section — see `get_by_name_with_index`).
+pub fn get_device_with_index(name: &str) -> Option<(NetDeviceHandle, usize)> {
+    registry().get_by_name_with_index(name)
 }
 
 /// Get a device by registration index.

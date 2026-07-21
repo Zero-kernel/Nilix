@@ -32,9 +32,9 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use cap::NamespaceId;
 use core::any::Any;
@@ -158,6 +158,14 @@ impl Drop for NsCountGuard {
 lazy_static::lazy_static! {
     /// Root network namespace - contains physical devices by default
     pub static ref ROOT_NET_NAMESPACE: Arc<NetNamespace> = Arc::new(NetNamespace::new_root());
+
+    /// D1-ISO-NETNS-DATAPLANE FIX: id -> namespace lookup for the TX
+    /// device-ownership gate. Holds Weak so the registry never extends a
+    /// namespace's lifetime (Drop still fires when the last process exits);
+    /// rows are removed in NetNamespace::drop, so the map size tracks LIVE
+    /// child namespaces (bounded by MAX_NET_NS_COUNT), not cumulative ids.
+    static ref NET_NS_BY_ID: RwLock<BTreeMap<u64, Weak<NetNamespace>>> =
+        RwLock::new(BTreeMap::new());
 }
 
 /// Next available namespace ID (starts at 1, 0 is reserved for root)
@@ -257,6 +265,12 @@ impl NetNamespace {
 
         // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
         count_guard.commit();
+
+        // D1-ISO-NETNS-DATAPLANE FIX: publish the id -> namespace row consumed
+        // by the TX device-ownership gate. Weak: the registry must never keep a
+        // dead namespace alive. Published AFTER commit so a row always refers to
+        // a fully constructed, counted namespace; the matching remove is in Drop.
+        NET_NS_BY_ID.write().insert(id, Arc::downgrade(&child));
 
         Ok(child)
     }
@@ -394,6 +408,37 @@ pub fn root_net_namespace() -> Arc<NetNamespace> {
     ROOT_NET_NAMESPACE.clone()
 }
 
+/// D1-ISO-NETNS-DATAPLANE FIX: does namespace `ns_id` own device `device_idx`?
+///
+/// Ownership truth for the net crate's TX gate (via `NetNsDeviceHooks`):
+/// - ns 0 (root) owns every registered physical device by default — physical
+///   devices live in the root namespace unless explicitly moved out;
+/// - a child namespace owns exactly the devices in its `devices` set
+///   (populated only by `add_device` / `move_device`, which require
+///   CAP_NET_ADMIN or host root);
+/// - an unknown or already-destroyed ns id owns nothing (fail-closed: the
+///   Weak row is gone or upgrades to None).
+///
+/// Lock context: takes only NET_NS_BY_ID (read) then the namespace's own
+/// `devices` RwLock (read) — both leaf locks, never held together with any
+/// process/socket/device-registry lock. Callable from any TX context.
+pub fn net_ns_owns_device(ns_id: u64, device_idx: u32) -> bool {
+    if ns_id == 0 {
+        return true;
+    }
+    let ns = {
+        let map = NET_NS_BY_ID.read();
+        match map.get(&ns_id) {
+            Some(weak) => weak.upgrade(),
+            None => None,
+        }
+    };
+    match ns {
+        Some(ns) => ns.has_device(device_idx),
+        None => false,
+    }
+}
+
 /// Move a device from one namespace to another.
 ///
 /// # Security
@@ -407,6 +452,17 @@ pub fn root_net_namespace() -> Arc<NetNamespace> {
 /// or root (euid == 0) to move devices between namespaces. Without this
 /// check, unprivileged processes could hijack network devices from the
 /// host namespace or inject devices into other namespaces.
+///
+/// # D1-ISO-NETNS-DATAPLANE: TX revocation contract
+///
+/// TX authorization linearizes at the ownership CHECK (`net_ns_owns_device`
+/// inside the net crate's `resolve_authorized_tx_device`), not at device
+/// enqueue. A transmit that passed the check before `move_device` returns may
+/// still hit the driver queue afterwards; the window is bounded by one
+/// in-flight `build_frame_and_transmit` / `transmit_prepared_reply` call (no
+/// handle caching across calls). Strong drain-before-return semantics would
+/// require a per-device ownership generation synchronized with driver
+/// enqueue — deliberately NOT implemented; do not claim drain semantics here.
 pub fn move_device(
     device_idx: u32,
     from: &Arc<NetNamespace>,
@@ -445,6 +501,11 @@ pub fn move_device(
 impl Drop for NetNamespace {
     fn drop(&mut self) {
         if self.level > 0 {
+            // D1-ISO-NETNS-DATAPLANE FIX: remove the id -> namespace row so the
+            // registry tracks live namespaces only. A stale Weak would upgrade
+            // to None anyway (fail-closed at the gate), but removing keeps the
+            // map bounded by live count, matching the firewall-table contract.
+            NET_NS_BY_ID.write().remove(&self.id.0);
             // R121-1 FIX: Clean up per-namespace firewall table to prevent
             // unbounded growth of the global FIREWALL_TABLES map.
             net::firewall::firewall_remove_ns(self.id.0);

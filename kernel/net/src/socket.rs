@@ -429,6 +429,58 @@ fn cgroup_port_hooks() -> Option<&'static dyn CgroupPortHooks> {
     CGROUP_PORT_HOOKS.get().copied()
 }
 
+// ============================================================================
+// D1-ISO-NETNS-DATAPLANE: Device ownership verification hook
+// ============================================================================
+//
+// The TX path (build_frame_and_transmit, transmit_prepared_reply, etc.) resolves
+// the eth0 device globally. A socket in a child netns (created via CLONE_NEWNET,
+// no devices in the namespace) can currently transmit out the root ns's eth0/IP/MAC.
+// This hook gates TX on device ownership: the socket's netns must own the target device.
+
+/// Verify whether a network namespace owns a device.
+///
+/// # Design
+/// Net crate cannot depend on kernel_core (dependency cycle). Ownership queries
+/// are injected via a trait object, following the SocketWaitHooks + CgroupPortHooks pattern.
+///
+/// # Semantics
+/// - Root namespace (ns_id == 0) owns all registered devices by default.
+/// - Child namespaces own only devices explicitly added via NetNamespace::add_device/move_device.
+/// - Early boot (hook not yet registered): default to allowing ns_id == 0 only.
+pub trait NetNsDeviceHooks: Send + Sync {
+    /// Check if namespace ns_id owns device_index.
+    /// Returns true iff the device was added to the namespace via add_device or move_device.
+    fn ns_owns_device(&self, ns_id: u64, device_index: u32) -> bool;
+}
+
+static NETNS_DEVICE_HOOKS: spin::Once<&'static dyn NetNsDeviceHooks> = spin::Once::new();
+
+/// Register namespace device ownership hooks (called from kernel_core::init).
+pub fn register_netns_device_hooks(hooks: &'static dyn NetNsDeviceHooks) {
+    NETNS_DEVICE_HOOKS.call_once(|| hooks);
+}
+
+#[inline]
+fn netns_device_hooks() -> Option<&'static dyn NetNsDeviceHooks> {
+    NETNS_DEVICE_HOOKS.get().copied()
+}
+
+/// Single owner predicate for TX device-ownership decisions (used by stack.rs).
+///
+/// Fail-closed contract:
+/// - Hook registered   => exactly the hook's answer (kernel_core registry truth).
+/// - Hook unregistered => only the root namespace (ns 0) may use any device.
+///   Registration precedes userspace (kernel_core::init), so no child netns can
+///   exist while unregistered; this arm only covers early boot / host tests.
+#[inline]
+pub fn netns_owns_device(ns_id: u64, device_index: u32) -> bool {
+    match netns_device_hooks() {
+        Some(hooks) => hooks.ns_owns_device(ns_id, device_index),
+        None => ns_id == 0,
+    }
+}
+
 /// Resolve the current task's cgroup id for a port charge, or 0 (root / exempt)
 /// when there is no process context or no hook is registered yet.
 ///
@@ -12819,6 +12871,25 @@ mod tests {
         TEST_TCP_COUNTER_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // D1-ISO-NETNS-DATAPLANE: with no NetNsDeviceHooks registered (host tests
+    // never register one), the TX ownership predicate must admit ONLY the root
+    // namespace — the fail-closed early-boot contract.
+    #[test]
+    fn d1_iso_unregistered_device_gate_admits_only_root_ns() {
+        assert!(
+            netns_owns_device(0, 0),
+            "unregistered gate must admit the root namespace"
+        );
+        assert!(
+            !netns_owns_device(1, 0),
+            "unregistered gate must deny child namespace 1"
+        );
+        assert!(
+            !netns_owns_device(u64::MAX, 7),
+            "unregistered gate must deny arbitrary namespace ids"
+        );
     }
 
     // Host socket tests link the production `security` dependency without the

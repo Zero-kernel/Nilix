@@ -1352,6 +1352,39 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
     cfg.gateway_mac
 }
 
+/// D1-ISO-NETNS-DATAPLANE FIX: single owner for physical-egress device
+/// resolution. EVERY non-loopback TX path (direct egress and prepared-reply)
+/// MUST obtain its device through this resolver — never via a bare
+/// `get_device` — so namespace dataplane isolation cannot be bypassed by
+/// adding a new transmit call site that forgets the gate.
+///
+/// Fail-closed contract (Safety > Efficiency > Speed):
+/// - the handle and its stable registry index come from ONE registry
+///   critical section (`get_device_with_index`), so the ownership decision
+///   binds to the SAME device object the caller transmits on;
+/// - a namespace that does not own the device gets `TxError::FirewallDenied`
+///   (policy denial, maps to EPERM) — a child netns created by CLONE_NEWNET
+///   starts with NO devices and therefore cannot reach the root ns's uplink
+///   with the root ns's IP/MAC;
+/// - unregistered hook (early boot / host tests) admits only the root ns.
+fn resolve_authorized_tx_device(net_ns_id: u64) -> Result<crate::NetDeviceHandle, TxError> {
+    let (dev, index) = match crate::get_device_with_index("eth0") {
+        Some(pair) => pair,
+        None => return Err(TxError::LinkDown),
+    };
+    // Checked narrowing: registry indices are monotonic and bounded by
+    // MAX_NET_DEVICES in practice, but a theoretical > u32::MAX index must
+    // deny, never alias another device's index (fail-closed).
+    let index = match u32::try_from(index) {
+        Ok(index) => index,
+        Err(_) => return Err(TxError::FirewallDenied),
+    };
+    if !crate::socket::netns_owns_device(net_ns_id, index) {
+        return Err(TxError::FirewallDenied);
+    }
+    Ok(dev)
+}
+
 /// Build complete Ethernet frame and transmit via network device.
 /// R162-7-2 FIX: Added net_ns_id for per-namespace egress firewall evaluation.
 fn build_frame_and_transmit(
@@ -1467,13 +1500,12 @@ fn build_frame_and_transmit(
     };
     data.copy_from_slice(&frame);
 
-    // Transmit via network device
-    let dev = match get_device("eth0") {
-        Some(d) => d,
-        None => {
-            return Err(TxError::LinkDown);
-        }
-    };
+    // Transmit via network device.
+    // D1-ISO-NETNS-DATAPLANE FIX: resolution goes through the single
+    // namespace-gated resolver — a netns that does not own the device cannot
+    // egress on it (fail-closed EPERM), closing the policy-only TX isolation
+    // hole where a CLONE_NEWNET child transmitted with the root ns's IP/MAC.
+    let dev = resolve_authorized_tx_device(net_ns_id)?;
 
     #[cfg(feature = "conntrack")]
     {
@@ -1638,10 +1670,16 @@ pub fn transmit_prepared_reply(
         Ok(net_ns_id) => net_ns_id,
         Err(error) => return Err(PreparedReplyTxError::Retryable(error, reply)),
     };
-    let dev = match get_device("eth0") {
-        Some(dev) => dev,
-        None => {
-            return Err(PreparedReplyTxError::Retryable(TxError::LinkDown, reply));
+    // D1-ISO-NETNS-DATAPLANE FIX: prepared replies egress through the same
+    // namespace-gated resolver as direct TX. `Retryable` here follows the
+    // existing preflight convention (egress-firewall Deny is also returned as
+    // Retryable(FirewallDenied, reply)): it hands the admitted owner back so
+    // the caller decides to drop; callers must treat FirewallDenied as a
+    // terminal policy verdict, not a transient queue state.
+    let dev = match resolve_authorized_tx_device(net_ns_id) {
+        Ok(dev) => dev,
+        Err(error) => {
+            return Err(PreparedReplyTxError::Retryable(error, reply));
         }
     };
     transmit_prepared_reply_with_queue(reply, now_ms, net_ns_id, stats, move |buf| {
