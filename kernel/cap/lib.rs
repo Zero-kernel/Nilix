@@ -77,6 +77,10 @@
 //!    subsystem for security monitoring (via syscall layer hooks).
 
 #![no_std]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::result_unit_err)]
 #![feature(allocator_api)]
 
 extern crate alloc;

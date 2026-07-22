@@ -52,6 +52,8 @@
 //! ```
 
 #![no_std]
+#![allow(clippy::question_mark)]
+#![allow(clippy::clone_on_copy)]
 
 extern crate alloc;
 

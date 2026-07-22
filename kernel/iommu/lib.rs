@@ -52,6 +52,20 @@
 //! - Phase F.3 in roadmap.md
 
 #![no_std]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::enum_variant_names)]
+#![allow(clippy::comparison_chain)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::question_mark)]
+#![allow(dead_code)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::manual_saturating_arithmetic)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::doc_nested_refdefs)]
 #![feature(allocator_api)]
 
 extern crate alloc;

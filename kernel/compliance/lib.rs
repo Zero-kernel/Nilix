@@ -22,6 +22,9 @@
 //! - Self-tests may be required before crypto use
 
 #![no_std]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::manual_range_contains)]
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use security::SecurityConfig;

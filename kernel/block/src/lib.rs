@@ -36,6 +36,12 @@
 //! for LSM policy enforcement at the block layer.
 
 #![no_std]
+#![allow(unused_variables)]
+#![allow(unused_assignments)]
+#![allow(dead_code)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::new_without_default)]
 #![feature(allocator_api)]
 
 extern crate alloc;

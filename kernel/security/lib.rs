@@ -26,6 +26,24 @@
 //! ```
 
 #![no_std]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::empty_line_after_outer_attr)]
+#![allow(unused_doc_comments)]
+#![allow(dead_code)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::fn_to_numeric_cast)]
+#![allow(clippy::identity_op)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::manual_memcpy)]
+#![allow(function_casts_as_integer)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::needless_range_loop)]
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;

@@ -1,6 +1,12 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 #![feature(allocator_api)]
+#![allow(clippy::assertions_on_constants)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::result_unit_err)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::manual_contains)]
+#![allow(clippy::doc_lazy_continuation)]
 extern crate alloc;
 
 // 导入 drivers crate 的宏

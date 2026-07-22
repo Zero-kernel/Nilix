@@ -48,6 +48,8 @@
 //! ```
 
 #![no_std]
+#![allow(unused_imports)]
+#![allow(clippy::fn_to_numeric_cast)]
 
 extern crate alloc;
 

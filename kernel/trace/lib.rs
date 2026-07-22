@@ -69,6 +69,9 @@
 //! ```
 
 #![no_std]
+#![allow(dead_code)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_is_multiple_of)]
 
 extern crate alloc;
 

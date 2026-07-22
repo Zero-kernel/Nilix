@@ -69,7 +69,7 @@ macro_rules! syscall_stub {
     // Variant 1: No arguments
     ($name:ident, $errno:ident, $reason:expr) => {
         fn $name() -> SyscallResult {
-            klog::klog_warn!(concat!(stringify!($name), ": ", $reason));
+            klog::klog!(Warn,concat!(stringify!($name), ": ", $reason));
             Err(SyscallError::$errno)
         }
     };
@@ -83,7 +83,7 @@ macro_rules! syscall_stub {
             )+
 
             // Log reason for unimplemented status
-            klog::klog_warn!(concat!(stringify!($name), ": ", $reason));
+            klog::klog!(Warn,concat!(stringify!($name), ": ", $reason));
 
             // Return error immediately (no further work)
             Err(SyscallError::$errno)
@@ -149,7 +149,7 @@ macro_rules! syscall_stub_with_flags {
             let unsupported = flags & !$supported;
 
             if unsupported != 0 {
-                klog::klog_warn!(
+                klog::klog!(Warn,
                     concat!(stringify!($name), ": ", $reason, " (flags={:#x})"),
                     unsupported
                 );
@@ -170,6 +170,7 @@ mod tests {
     // Mock types for testing
     type SyscallResult = Result<usize, SyscallError>;
 
+    #[allow(clippy::upper_case_acronyms)]
     #[derive(Debug, PartialEq)]
     enum SyscallError {
         EFAULT,

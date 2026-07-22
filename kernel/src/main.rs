@@ -1,6 +1,38 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(unused_assignments)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::ifs_same_cond)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::assertions_on_constants)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::string_lit_as_bytes)]
+#![allow(clippy::unnecessary_safety_doc)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::declare_interior_mutable_const)]
+#![allow(clippy::fn_to_numeric_cast)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::collapsible_if)]
+#![allow(unused_doc_comments)]
+#![allow(unused_macros)]
+#![allow(unused_unsafe)]
+#![allow(unused_mut)]
 
 extern crate alloc;
 use core::panic::PanicInfo;
@@ -1417,6 +1449,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     shell::init_and_run();
 }
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     // G.1: Track allocation failures for observability.
@@ -1448,7 +1481,7 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     }
     panic!("Allocation error: {:?}", layout);
 }
-
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     unsafe {

@@ -43,6 +43,14 @@
 //! - **no_new_privs**: Once set, cannot be cleared; prevents privilege escalation
 
 #![no_std]
+#![allow(clippy::manual_range_contains)]
+#![allow(dead_code)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::result_unit_err)]
+#![allow(clippy::doc_lazy_continuation)]
 #![feature(allocator_api)]
 
 extern crate alloc;

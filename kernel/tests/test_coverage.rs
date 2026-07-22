@@ -1,4 +1,5 @@
 //! Compile-time test coverage enforcement
+#![allow(clippy::manual_strip)]
 //!
 //! These tests run during `cargo test` to enforce minimum test coverage
 //! and detect stale placeholder tests.

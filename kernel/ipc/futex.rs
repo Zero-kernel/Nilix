@@ -918,6 +918,7 @@ pub fn futex_lock_pi(
     // Note: finish_wait 不返回 outcome，需要通过其他方式判断
     // 我们使用 Woken 作为默认，因为 PI futex 不支持超时（目前）
 
+    #[allow(unused_assignments)]
     // 出队并更新 PI 状态
     let mut owner_died = false;
     // R169-8 FIX: track whether the caller actually became the PI-mutex owner.

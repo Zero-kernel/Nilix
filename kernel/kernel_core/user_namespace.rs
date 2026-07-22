@@ -901,6 +901,7 @@ impl FileOps for UserNamespaceFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_root_namespace_identity() {
