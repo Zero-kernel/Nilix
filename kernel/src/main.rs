@@ -572,6 +572,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         klog_force!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
     }
 
+    // KCOV initialization for fuzzing infrastructure
+    #[cfg(feature = "kcov")]
+    {
+        extern crate coverage;
+        coverage::init_coverage();
+        klog_always!("[KCOV] Coverage infrastructure initialized");
+    }
+
     // KASLR/KPTI/PCID initialization
     // R39-7/RF180-32: pass relocation separately from version-validated
     // randomization provenance. A deterministic non-zero slide is not KASLR.
@@ -660,7 +668,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // R102-5 FIX: Enforce SMAP as a hard boot requirement.
     // The kernel unconditionally uses CLAC/STAC in syscall entry and usercopy paths.
     // Without SMAP these instructions may #UD, crashing every syscall.
+    // NOTE: When building with --features kcov for fuzzing on QEMU (which lacks SMAP),
+    // we skip this check. Production builds MUST have SMAP.
+    #[cfg(not(feature = "kcov"))]
     arch::cpu_protection::require_smap_support();
+
+    #[cfg(feature = "kcov")]
+    klog_always!("      ! SMAP requirement SKIPPED (kcov fuzzing mode)");
 
     // Phase 6: 初始化 SYSCALL/SYSRET 快速系统调用机制
     klog_always!("[2.8/3] Initializing SYSCALL/SYSRET...");

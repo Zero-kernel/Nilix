@@ -13,6 +13,10 @@ path = "lib.rs"
 # memory.rs and cpu_local::current_cpu_id().
 host_harness = ["cpu_local/host_harness"]
 
+# fuzz_runner: enable KCOV instrumentation and raise boot heap budget to accommodate
+# the coverage infrastructure overhead. This feature is propagated from the kernel crate.
+fuzz_runner = []
+
 [dependencies]
 drivers = { path = "../drivers" }
 cpu_local = { path = "../cpu_local" }

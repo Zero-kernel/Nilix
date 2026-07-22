@@ -2,6 +2,7 @@
 members = [
     "bootloader",
     "kernel",
+    "tools/fuzz_executor",
 ]
 # Userspace is excluded because it uses a different target (x86_64-unknown-none)
 exclude = [

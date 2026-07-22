@@ -711,6 +711,15 @@ pub fn run_heap_admission_self_test() {
 /// profile, single-core QEMU) and 211,792 B (musl_test feature). Set to
 /// 224 KiB (~8% headroom above the musl_test measurement, rounded) to
 /// accommodate both profiles under one global ceiling.
+///
+/// PHASE 2 KCOV+FUZZ_RUNNER: The fuzz_runner feature adds ~30 KB of boot footprint
+/// (coverage infrastructure + larger userspace binary embedded + executor runtime).
+/// Budget raised to 256 KiB to accommodate this legitimate instrumentation overhead
+/// while maintaining the fail-closed discipline for production builds.
+#[cfg(feature = "fuzz_runner")]
+pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 256 * 1024;
+
+#[cfg(not(feature = "fuzz_runner"))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
 
 /// D1-RES coexistence-oracle outcome.

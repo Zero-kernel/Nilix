@@ -207,6 +207,16 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() 
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len() }> =
     AlignedElfData(*include_bytes!("clone_test.elf"));
 
+/// Embedded KCOV fuzz runner test program with proper alignment
+///
+/// Tests kernel coverage infrastructure (Phase 2):
+/// - KCOV syscalls (init, enable, disable, dump, reset)
+/// - Coverage collection and reporting
+/// - Multi-cycle coverage tests
+#[cfg(feature = "fuzz_runner")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("fuzz_runner.elf").len() }> =
+    AlignedElfData(*include_bytes!("fuzz_runner.elf"));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -218,7 +228,8 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len()
     feature = "shell",
     feature = "syscall_test",
     feature = "musl_test",
-    feature = "clone_test"
+    feature = "clone_test",
+    feature = "fuzz_runner"
 )))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
@@ -236,11 +247,14 @@ const PROCESS_NAME: &str = "syscall_test";
 const PROCESS_NAME: &str = "musl_test";
 #[cfg(feature = "clone_test")]
 const PROCESS_NAME: &str = "clone_test";
+#[cfg(feature = "fuzz_runner")]
+const PROCESS_NAME: &str = "fuzz_runner";
 #[cfg(not(any(
     feature = "shell",
     feature = "syscall_test",
     feature = "musl_test",
-    feature = "clone_test"
+    feature = "clone_test",
+    feature = "fuzz_runner"
 )))]
 const PROCESS_NAME: &str = "hello";
 
