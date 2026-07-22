@@ -46,18 +46,17 @@ impl SyscallSpec {
         }
 
         let num = if parts[0].starts_with("0x") {
-            i64::from_str_radix(&parts[0][2..], 16)
-                .context("Failed to parse syscall number")?
+            i64::from_str_radix(&parts[0][2..], 16).context("Failed to parse syscall number")?
         } else {
-            parts[0].parse::<i64>()
+            parts[0]
+                .parse::<i64>()
                 .context("Failed to parse syscall number")?
         };
 
         let mut args = [0u64; 6];
         for (i, part) in parts.iter().skip(1).take(6).enumerate() {
             args[i] = if part.starts_with("0x") {
-                u64::from_str_radix(&part[2..], 16)
-                    .context(format!("Failed to parse arg{}", i))?
+                u64::from_str_radix(&part[2..], 16).context(format!("Failed to parse arg{}", i))?
             } else {
                 part.parse::<u64>()
                     .context(format!("Failed to parse arg{}", i))?
@@ -85,23 +84,13 @@ impl SyscallSpec {
 #[derive(Debug)]
 enum ExecutionResult {
     /// Completed successfully
-    Ok {
-        edge_count: usize,
-        duration_us: u64,
-    },
+    Ok { edge_count: usize, duration_us: u64 },
     /// Process crashed
-    Crash {
-        signal: Signal,
-        duration_us: u64,
-    },
+    Crash { signal: Signal, duration_us: u64 },
     /// Exceeded timeout
-    Timeout {
-        duration_us: u64,
-    },
+    Timeout { duration_us: u64 },
     /// KCOV initialization failed
-    KcovFailed {
-        error: String,
-    },
+    KcovFailed { error: String },
 }
 
 /// Raw syscall wrapper
@@ -246,8 +235,7 @@ unsafe fn execute_sequence_child(sequence: &[SyscallSpec]) -> i32 {
 
 /// Load syscall sequence from file
 fn load_sequence(path: &PathBuf) -> Result<Vec<SyscallSpec>> {
-    let file = File::open(path)
-        .context(format!("Failed to open {}", path.display()))?;
+    let file = File::open(path).context(format!("Failed to open {}", path.display()))?;
 
     let reader = BufReader::new(file);
     let mut sequence = Vec::new();
@@ -264,8 +252,12 @@ fn load_sequence(path: &PathBuf) -> Result<Vec<SyscallSpec>> {
         match SyscallSpec::parse(line) {
             Ok(spec) => sequence.push(spec),
             Err(e) => {
-                eprintln!("Warning: Failed to parse line {}: {} (error: {})",
-                         line_num + 1, line, e);
+                eprintln!(
+                    "Warning: Failed to parse line {}: {} (error: {})",
+                    line_num + 1,
+                    line,
+                    e
+                );
                 // Continue parsing, don't fail on parse errors
             }
         }
@@ -281,21 +273,37 @@ fn load_sequence(path: &PathBuf) -> Result<Vec<SyscallSpec>> {
 /// Print execution result
 fn print_result(path: &PathBuf, result: &ExecutionResult) {
     match result {
-        ExecutionResult::Ok { edge_count, duration_us } => {
-            println!("[OK] {} - {} edges in {}μs",
-                    path.display(), edge_count, duration_us);
+        ExecutionResult::Ok {
+            edge_count,
+            duration_us,
+        } => {
+            println!(
+                "[OK] {} - {} edges in {}μs",
+                path.display(),
+                edge_count,
+                duration_us
+            );
         }
-        ExecutionResult::Crash { signal, duration_us } => {
-            println!("[CRASH] {} - signal {:?} after {}μs",
-                    path.display(), signal, duration_us);
+        ExecutionResult::Crash {
+            signal,
+            duration_us,
+        } => {
+            println!(
+                "[CRASH] {} - signal {:?} after {}μs",
+                path.display(),
+                signal,
+                duration_us
+            );
         }
         ExecutionResult::Timeout { duration_us } => {
-            println!("[TIMEOUT] {} - exceeded limit at {}μs",
-                    path.display(), duration_us);
+            println!(
+                "[TIMEOUT] {} - exceeded limit at {}μs",
+                path.display(),
+                duration_us
+            );
         }
         ExecutionResult::KcovFailed { error } => {
-            println!("[KCOV_FAIL] {} - {}",
-                    path.display(), error);
+            println!("[KCOV_FAIL] {} - {}", path.display(), error);
         }
     }
 }
@@ -314,8 +322,7 @@ fn main() -> Result<()> {
 
     let sequence_path = PathBuf::from(&args[1]);
     let timeout_ms = if args.len() >= 3 {
-        args[2].parse::<u64>()
-            .context("Invalid timeout value")?
+        args[2].parse::<u64>().context("Invalid timeout value")?
     } else {
         5000 // Default 5 second timeout
     };
