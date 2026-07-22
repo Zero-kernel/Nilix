@@ -48,7 +48,8 @@ fn main() {
 
     // Collect all crash files
     let crashes = collect_crashes(&args.crash_dir);
-    println!("\n[TRIAGE] Total crashes: {}", crashes.len());
+    let total_crashes = crashes.len();
+    println!("\n[TRIAGE] Total crashes: {}", total_crashes);
 
     if crashes.is_empty() {
         println!("[TRIAGE] No crashes to triage");
@@ -65,7 +66,7 @@ fn main() {
     println!("[TRIAGE] Unique crashes: {}", unique_crashes.len());
 
     if !unique_crashes.is_empty() {
-        let dedup_rate = (1.0 - (unique_crashes.len() as f64 / crashes.len() as f64)) * 100.0;
+        let dedup_rate = (1.0 - (unique_crashes.len() as f64 / total_crashes as f64)) * 100.0;
         println!("[TRIAGE] Deduplication rate: {:.1}%", dedup_rate);
     }
 
@@ -80,11 +81,11 @@ fn main() {
     for (idx, crash) in final_crashes.iter().enumerate() {
         let output_file = args.output_dir.join(format!("unique-{:03}.txt", idx + 1));
         let content = format!(
-            "Type: {}\nMessage: {}\nSignature: \nOriginal: {:?}\n\n--- Details ---\n\n{}",
+            "Type: {}\nMessage: {}\nSignature: {}\nOriginal: {}\n\n--- Details ---\n\n{}",
             crash.crash_type,
             crash.message,
             crash.signature,
-            crash.file_path,
+            crash.file_path.display(),
             fs::read_to_string(&crash.file_path).unwrap_or_else(|_| "Unable to read crash file".to_string())
         );
         fs::write(&output_file, content).ok();

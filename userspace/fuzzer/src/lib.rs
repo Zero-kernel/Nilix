@@ -1,11 +1,3 @@
-// Fuzzer library - modules for fuzzing infrastructure
+// Fuzzer library - placeholder for future shared modules
+// Currently, all fuzzing logic is in self-contained binaries in src/bin/
 
-pub mod continuous;
-pub mod crash_triage;
-pub mod corpus_sync;
-pub mod dashboard;
-pub mod minimizer;
-pub mod state_machine;
-pub mod stateful_coverage;
-pub mod transactions;
-pub mod ipc_coordinator;

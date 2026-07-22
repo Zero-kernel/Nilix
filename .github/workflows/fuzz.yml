@@ -101,8 +101,8 @@ jobs:
       - name: Build continuous fuzzer
         run: |
           echo "Building continuous fuzzer binary..."
-          cd userspace/fuzzer
-          cargo build --release --bin continuous-fuzzer --target x86_64-unknown-linux-gnu
+          # Build from repo root to avoid inheriting userspace/.cargo/config.toml
+          cargo build --release --manifest-path userspace/fuzzer/Cargo.toml --bin continuous-fuzzer --target x86_64-unknown-linux-gnu
 
       - name: Run continuous fuzzer
         id: run_fuzzer
@@ -364,8 +364,8 @@ jobs:
 
       - name: Build crash triage tool
         run: |
-          cd userspace/fuzzer
-          cargo build --release --bin crash-triage --target x86_64-unknown-linux-gnu
+          # Build from repo root to avoid inheriting userspace/.cargo/config.toml
+          cargo build --release --manifest-path userspace/fuzzer/Cargo.toml --bin crash-triage --target x86_64-unknown-linux-gnu
 
       - name: Run crash triage
         id: triage
