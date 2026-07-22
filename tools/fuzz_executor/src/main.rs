@@ -13,10 +13,10 @@
 use anyhow::{Context, Result};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::unistd::{fork, ForkResult};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Syscall numbers for KCOV
@@ -24,6 +24,7 @@ const SYS_KCOV_INIT: i64 = 520;
 const SYS_KCOV_ENABLE: i64 = 521;
 const SYS_KCOV_DISABLE: i64 = 522;
 const SYS_KCOV_DUMP: i64 = 523;
+#[allow(dead_code)]
 const SYS_KCOV_RESET: i64 = 524;
 
 // KCOV buffer size
@@ -45,18 +46,19 @@ impl SyscallSpec {
             anyhow::bail!("Empty line");
         }
 
-        let num = if parts[0].starts_with("0x") {
-            i64::from_str_radix(&parts[0][2..], 16).context("Failed to parse syscall number")?
+        let num = if let Some(stripped) = parts[0].strip_prefix("0x") {
+            i64::from_str_radix(stripped, 16).context("Failed to parse syscall number")?
         } else {
             parts[0]
                 .parse::<i64>()
                 .context("Failed to parse syscall number")?
         };
 
+        // Parse arguments
         let mut args = [0u64; 6];
         for (i, part) in parts.iter().skip(1).take(6).enumerate() {
-            args[i] = if part.starts_with("0x") {
-                u64::from_str_radix(&part[2..], 16).context(format!("Failed to parse arg{}", i))?
+            args[i] = if let Some(stripped) = part.strip_prefix("0x") {
+                u64::from_str_radix(stripped, 16).context(format!("Failed to parse arg{}", i))?
             } else {
                 part.parse::<u64>()
                     .context(format!("Failed to parse arg{}", i))?
@@ -213,7 +215,7 @@ unsafe fn execute_sequence_child(sequence: &[SyscallSpec]) -> i32 {
     }
 
     // Step 5: Dump coverage
-    let mut coverage_buf = vec![0u8; KCOV_BUFFER_SIZE];
+    let coverage_buf = vec![0u8; KCOV_BUFFER_SIZE];
     let edge_count = syscall(
         SYS_KCOV_DUMP,
         coverage_buf.as_ptr() as u64,
@@ -271,7 +273,7 @@ fn load_sequence(path: &PathBuf) -> Result<Vec<SyscallSpec>> {
 }
 
 /// Print execution result
-fn print_result(path: &PathBuf, result: &ExecutionResult) {
+fn print_result(path: &Path, result: &ExecutionResult) {
     match result {
         ExecutionResult::Ok {
             edge_count,

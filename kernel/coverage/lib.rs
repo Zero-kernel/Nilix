@@ -53,7 +53,6 @@
 //! - SMAP-compliant: all userspace access gated
 
 #![no_std]
-#![feature(const_mut_refs)]
 
 extern crate alloc;
 extern crate spin;
@@ -76,6 +75,12 @@ pub struct CoverageBuffer {
     edge_count: u32,
     /// Whether coverage collection is active
     enabled: bool,
+}
+
+impl Default for CoverageBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CoverageBuffer {
@@ -181,15 +186,13 @@ pub fn enable_coverage() -> Option<Arc<Mutex<CoverageBuffer>>> {
 /// This is the hot path, called from `record_edge!()` macro.
 /// Must be IRQ-safe, no allocations, no blocking.
 #[inline]
-pub fn record_edge_for_current(edge_id: u32) {
+pub fn record_edge_for_current(_edge_id: u32) {
     // Fast path: check if coverage is globally enabled
-    if !is_coverage_enabled() {
-        return;
+    if is_coverage_enabled() {
+        // Get current process's coverage buffer
+        // This will be integrated with kernel_core::process::with_current_process
+        // For now, this is a no-op until the full integration is complete
     }
-
-    // Get current process's coverage buffer
-    // This will be integrated with kernel_core::process::with_current_process
-    // For now, this is a no-op until the full integration is complete
 
     // TODO: Integrate with kernel_core to access current process:
     // with_current_process(|proc| {
@@ -254,6 +257,7 @@ macro_rules! record_edge {
 }
 
 /// Compile-time FNV-1a hash for generating edge IDs
+#[allow(dead_code)]
 const fn const_fnv1a_hash(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261; // FNV offset basis
     let mut i = 0;

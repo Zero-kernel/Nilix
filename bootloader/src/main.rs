@@ -48,7 +48,7 @@ const KERNEL_PHYS_WINDOW_END: u64 = 1024 * 1024 * 1024;
 /// Number of bounded placement slots, including slide zero.
 const KASLR_SLOT_COUNT: usize = (KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY + 1) as usize;
 
-const _: () = assert!(KASLR_MAX_SLIDE % KASLR_SLIDE_GRANULARITY == 0);
+const _: () = assert!(KASLR_MAX_SLIDE.is_multiple_of(KASLR_SLIDE_GRANULARITY));
 const _: () = assert!(KERNEL_PHYS_BASE + KASLR_MAX_SLIDE < KERNEL_PHYS_WINDOW_END);
 const _: () = assert!(KASLR_SLOT_COUNT <= u16::MAX as usize + 1);
 
@@ -181,6 +181,7 @@ fn apply_rela_dyn_relocations(
 /// Probe RDRAND safely before the permutation consumes additional samples.
 /// A successful sample is deliberately discarded; provenance is published
 /// only after the complete unbiased shuffle succeeds.
+#[allow(dead_code)]
 fn probe_rdrand_entropy() -> bool {
     #[cfg(feature = "kaslr")]
     {
