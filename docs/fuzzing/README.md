@@ -21,7 +21,8 @@
 ## Quick Navigation
 
 ### 📖 Read First
-- **[CI-INTEGRATION.md](CI-INTEGRATION.md)** - 🚀 **CI integration guide** ⭐ **START HERE**
+- **[CI-REFACTORING.md](CI-REFACTORING.md)** - 🔧 **CI Refactoring Complete** ⭐ **NEW**
+- **[CI-INTEGRATION.md](CI-INTEGRATION.md)** - 🚀 Complete CI integration guide
 - **[PHASE7_COMPLETE.md](PHASE7_COMPLETE.md)** - 🎉 Phase 7 completion report
 - **[phase7-architecture.md](phase7-architecture.md)** - CI integration design
 - **[PHASE6_COMPLETE.md](PHASE6_COMPLETE.md)** - Phase 6 completion report

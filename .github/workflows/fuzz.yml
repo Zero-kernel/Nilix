@@ -1,7 +1,7 @@
 name: Comprehensive Kernel Fuzzing
 
 on:
-  # Scheduled runs - every 6 hours for continuous fuzzing, daily for cargo-fuzz
+  # Scheduled runs
   schedule:
     - cron: '0 */6 * * *'  # Continuous KCOV fuzzing every 6 hours
     - cron: '0 2 * * *'    # Cargo-fuzz targets daily at 2 AM UTC
@@ -12,7 +12,7 @@ on:
       mode:
         description: 'Fuzzing mode'
         required: true
-        default: 'continuous'
+        default: 'both'
         type: choice
         options:
           - continuous  # KCOV-based continuous fuzzing
@@ -31,7 +31,7 @@ on:
         required: false
         default: '4'
 
-  # Trigger on kernel changes
+  # Trigger on kernel/fuzzer changes
   push:
     branches:
       - main
@@ -42,21 +42,26 @@ on:
       - '.github/workflows/fuzz.yml'
 
 jobs:
-  # Job 1: Kernel fuzzer via make test-fuzz
-  kernel-fuzz:
-    name: Kernel Fuzzer (KCOV-based)
+  # Job 1: Continuous KCOV-based fuzzing (Phase 2-7 implementation)
+  continuous-fuzzing:
+    name: Continuous Fuzzer Worker ${{ matrix.worker }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 400  # 6h + overhead
     if: |
       github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'continuous' || github.event.inputs.mode == 'both') ||
       github.event_name == 'push'
 
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3, 4]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2025-12-08
@@ -67,38 +72,149 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf build-essential
 
-      - name: Build kernel with KCOV
-        run: |
-          if grep -q "test-fuzz" Makefile; then
-            make test-fuzz || echo "Fuzzer test completed"
-          else
-            echo "No test-fuzz target found, building kernel normally"
-            make build || make kernel
-          fi
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-kcov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-kcov-
 
-      - name: Check for crashes in QEMU output
+      - name: Restore corpus from previous run
+        uses: actions/cache@v4
+        with:
+          path: corpus-worker-${{ matrix.worker }}/
+          key: continuous-corpus-${{ github.sha }}-worker-${{ matrix.worker }}
+          restore-keys: |
+            continuous-corpus-${{ github.sha }}-
+            continuous-corpus-
+
+      - name: Build KCOV-instrumented kernel
+        run: |
+          echo "Building kernel with KCOV instrumentation..."
+          make build-kcov
+          ls -lh esp-kcov/ || echo "esp-kcov directory not found"
+
+      - name: Build continuous fuzzer
+        run: |
+          echo "Building continuous fuzzer binary..."
+          cd userspace/fuzzer
+          cargo build --release --bin continuous-fuzzer
+
+      - name: Run continuous fuzzer
+        id: run_fuzzer
+        run: |
+          duration_hours=${{ github.event.inputs.duration || '6' }}
+          duration_secs=$((duration_hours * 3600))
+
+          echo "Running continuous fuzzer for ${duration_hours}h (${duration_secs}s)"
+          echo "Worker: ${{ matrix.worker }}"
+
+          mkdir -p corpus-worker-${{ matrix.worker }}
+          mkdir -p crashes-worker-${{ matrix.worker }}
+          mkdir -p dashboard-worker-${{ matrix.worker }}
+
+          # Run fuzzer with timeout
+          timeout ${duration_secs} \
+            userspace/fuzzer/target/release/continuous-fuzzer \
+            --corpus-dir corpus-worker-${{ matrix.worker }} \
+            --crash-dir crashes-worker-${{ matrix.worker }} \
+            --dashboard-dir dashboard-worker-${{ matrix.worker }} \
+            --worker-id ${{ matrix.worker }} \
+            --max-time ${duration_secs} \
+            --report-interval 300 \
+            2>&1 | tee fuzzer-worker-${{ matrix.worker }}.log \
+            || exit_code=$?
+
+          # Exit code 124 = timeout (expected), 0 = max-time reached
+          if [ ${exit_code:-0} -eq 124 ] || [ ${exit_code:-0} -eq 0 ]; then
+            echo "status=completed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "::warning::Fuzzer exited with code ${exit_code}"
+          fi
+        continue-on-error: true
+
+      - name: Check for crashes
         if: always()
+        id: check_crashes
         run: |
-          if [ -f serial.log ]; then
-            echo "=== QEMU Serial Output ==="
-            cat serial.log
+          crash_count=$(find crashes-worker-${{ matrix.worker }} -type f 2>/dev/null | wc -l || echo 0)
+          echo "crashes=${crash_count}" >> $GITHUB_OUTPUT
 
-            # Check for panics or crashes
-            if grep -i "panic\|crash\|ERROR" serial.log; then
-              echo "::warning::Potential crashes detected in kernel fuzzer"
-            fi
+          if [ "$crash_count" -gt 0 ]; then
+            echo "::warning::Worker ${{ matrix.worker }} found $crash_count crash(es)"
+            echo "Crash files:"
+            ls -lh crashes-worker-${{ matrix.worker }}/ || true
           else
-            echo "No serial.log found"
+            echo "Worker ${{ matrix.worker }}: No crashes found"
           fi
 
-      - name: Upload serial logs
+      - name: Extract stats from fuzzer log
+        if: always()
+        id: extract_stats
+        run: |
+          log_file="fuzzer-worker-${{ matrix.worker }}.log"
+
+          if [ -f "$log_file" ]; then
+            # Extract final stats from log
+            iterations=$(grep -oP "Iterations: \K[0-9]+" "$log_file" | tail -1 || echo "0")
+            corpus_size=$(grep -oP "Corpus: \K[0-9]+" "$log_file" | tail -1 || echo "0")
+            coverage=$(grep -oP "Coverage: \K[0-9]+" "$log_file" | tail -1 || echo "0")
+
+            echo "iterations=${iterations}" >> $GITHUB_OUTPUT
+            echo "corpus_size=${corpus_size}" >> $GITHUB_OUTPUT
+            echo "coverage=${coverage}" >> $GITHUB_OUTPUT
+
+            echo "Worker ${{ matrix.worker }} stats:"
+            echo "  Iterations: ${iterations}"
+            echo "  Corpus: ${corpus_size}"
+            echo "  Coverage: ${coverage} edges"
+          else
+            echo "No log file found"
+            echo "iterations=0" >> $GITHUB_OUTPUT
+            echo "corpus_size=0" >> $GITHUB_OUTPUT
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload crashes
+        if: always() && steps.check_crashes.outputs.crashes > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-crashes-worker-${{ matrix.worker }}
+          path: crashes-worker-${{ matrix.worker }}/
+          retention-days: 90
+
+      - name: Upload dashboard
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-fuzz-serial-log
-          path: serial.log
+          name: continuous-dashboard-worker-${{ matrix.worker }}
+          path: |
+            dashboard-worker-${{ matrix.worker }}/*.html
+            dashboard-worker-${{ matrix.worker }}/*.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-corpus-worker-${{ matrix.worker }}
+          path: corpus-worker-${{ matrix.worker }}/
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Upload fuzzer log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-log-worker-${{ matrix.worker }}
+          path: fuzzer-worker-${{ matrix.worker }}.log
+          retention-days: 7
 
   # Job 2: Cargo-fuzz libFuzzer targets
   cargo-fuzz-targets:
@@ -131,6 +247,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2025-12-08
           components: rust-src
 
       - name: Cache cargo
@@ -139,7 +256,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
@@ -151,6 +270,15 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
+
+      - name: Create fuzz directory if needed
+        run: |
+          if [ ! -d "fuzz" ]; then
+            echo "Creating fuzz directory structure..."
+            cargo fuzz init
+          fi
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          mkdir -p fuzz/artifacts/${{ matrix.target }}
 
       - name: Run fuzzer
         run: |
@@ -202,6 +330,7 @@ jobs:
           name: cargo-fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}/
           retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload output
         if: always()
@@ -211,71 +340,220 @@ jobs:
           path: fuzz/fuzz_output_${{ matrix.target }}.txt
           retention-days: 7
 
-  # Job 3: Summary report
-  summary:
-    name: Fuzzing Summary
+  # Job 3: Crash triage and deduplication
+  crash-triage:
+    name: Crash Triage
     runs-on: ubuntu-latest
-    needs: [kernel-fuzz, cargo-fuzz-targets]
+    needs: [continuous-fuzzing, cargo-fuzz-targets]
     if: always()
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+
+      - name: Download all crash artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-crashes/
+          pattern: '*-crashes-*'
+
+      - name: Build crash triage tool
+        run: |
+          cd userspace/fuzzer
+          cargo build --release --bin crash-triage
+
+      - name: Run crash triage
+        id: triage
+        run: |
+          echo "Running crash triage..."
+
+          userspace/fuzzer/target/release/crash-triage \
+            --crash-dir all-crashes/ \
+            --output-dir triaged-crashes/ \
+            --dedup \
+            --minimize \
+            2>&1 | tee triage.log || true
+
+          # Extract stats
+          unique=$(grep -oP "Unique crashes: \K[0-9]+" triage.log | tail -1 || echo "0")
+          total=$(grep -oP "Total crashes: \K[0-9]+" triage.log | tail -1 || echo "0")
+
+          echo "unique_crashes=${unique}" >> $GITHUB_OUTPUT
+          echo "total_crashes=${total}" >> $GITHUB_OUTPUT
+
+          if [ "$unique" -gt 0 ]; then
+            echo "::warning::Found $unique unique crash(es) after deduplication"
+          fi
+
+      - name: Create GitHub issues for new crashes
+        if: steps.triage.outputs.unique_crashes > 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Creating GitHub issues for unique crashes..."
+
+          for crash_file in triaged-crashes/unique-*.txt; do
+            if [ -f "$crash_file" ]; then
+              crash_id=$(basename "$crash_file" .txt)
+
+              # Extract crash type and message
+              crash_type=$(head -1 "$crash_file" | grep -oP "Type: \K.*" || echo "unknown")
+              crash_msg=$(head -5 "$crash_file" | grep -oP "Message: \K.*" || echo "No message")
+
+              # Create issue
+              gh issue create \
+                --title "[Fuzzing] $crash_type: $crash_msg" \
+                --body "$(cat $crash_file)" \
+                --label "fuzzing,bug,needs-triage" \
+                || echo "Failed to create issue for $crash_id"
+            fi
+          done
+
+      - name: Upload triaged crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triaged-crashes
+          path: triaged-crashes/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload triage log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-log
+          path: triage.log
+          retention-days: 30
+
+  # Job 4: Aggregate report
+  aggregate-report:
+    name: Aggregate Report
+    runs-on: ubuntu-latest
+    needs: [continuous-fuzzing, cargo-fuzz-targets, crash-triage]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
-      - name: Generate summary
+      - name: Generate aggregate report
         run: |
-          echo "# Fuzzing Report" > summary.md
-          echo "" >> summary.md
-          echo "**Run:** ${{ github.run_id }}" >> summary.md
-          echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> summary.md
-          echo "" >> summary.md
+          echo "# Comprehensive Fuzzing Report" > aggregate-report.md
+          echo "" >> aggregate-report.md
+          echo "**Run:** ${{ github.run_id }}" >> aggregate-report.md
+          echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> aggregate-report.md
+          echo "**Trigger:** ${{ github.event_name }}" >> aggregate-report.md
+          echo "" >> aggregate-report.md
 
-          # Check for kernel fuzzer logs
-          echo "## Kernel Fuzzer (KCOV)" >> summary.md
-          if [ -f artifacts/kernel-fuzz-serial-log/serial.log ]; then
-            if grep -qi "panic\|crash\|ERROR" artifacts/kernel-fuzz-serial-log/serial.log; then
-              echo "⚠️ Issues detected - see serial log artifact" >> summary.md
-            else
-              echo "✓ Completed without panics" >> summary.md
+          # Continuous fuzzing summary
+          echo "## Continuous Fuzzing (KCOV-based)" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          total_iterations=0
+          total_corpus=0
+          max_coverage=0
+          total_crashes=0
+
+          for i in 1 2 3 4; do
+            log="artifacts/continuous-log-worker-$i/fuzzer-worker-$i.log"
+            if [ -f "$log" ]; then
+              iterations=$(grep -oP "Iterations: \K[0-9]+" "$log" | tail -1 || echo "0")
+              corpus=$(grep -oP "Corpus: \K[0-9]+" "$log" | tail -1 || echo "0")
+              coverage=$(grep -oP "Coverage: \K[0-9]+" "$log" | tail -1 || echo "0")
+              crashes=$(find "artifacts/continuous-crashes-worker-$i" -type f 2>/dev/null | wc -l || echo "0")
+
+              total_iterations=$((total_iterations + iterations))
+              total_corpus=$((total_corpus + corpus))
+              if [ "$coverage" -gt "$max_coverage" ]; then
+                max_coverage=$coverage
+              fi
+              total_crashes=$((total_crashes + crashes))
+
+              echo "- **Worker $i:** $iterations iterations, $corpus corpus, $coverage edges, $crashes crashes" >> aggregate-report.md
             fi
-          else
-            echo "No output available" >> summary.md
-          fi
-          echo "" >> summary.md
+          done
 
-          # Check for cargo-fuzz crashes
-          echo "## Cargo-Fuzz Targets" >> summary.md
-          echo "" >> summary.md
+          echo "" >> aggregate-report.md
+          echo "**Totals:**" >> aggregate-report.md
+          echo "- Iterations: $total_iterations" >> aggregate-report.md
+          echo "- Corpus size: $total_corpus" >> aggregate-report.md
+          echo "- Max coverage: $max_coverage edges" >> aggregate-report.md
+          echo "- Crashes found: $total_crashes" >> aggregate-report.md
+          echo "" >> aggregate-report.md
 
-          crash_count=0
+          # Cargo-fuzz summary
+          echo "## Cargo-Fuzz Targets" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          cargo_crash_count=0
           for dir in artifacts/cargo-fuzz-crashes-*; do
             if [ -d "$dir" ]; then
               target=$(basename "$dir" | sed 's/cargo-fuzz-crashes-//')
               crashes=$(find "$dir" -type f | wc -l)
-              crash_count=$((crash_count + crashes))
-              echo "- **$target**: $crashes crash(es)" >> summary.md
+              cargo_crash_count=$((cargo_crash_count + crashes))
+              if [ "$crashes" -gt 0 ]; then
+                echo "- **$target:** $crashes crash(es)" >> aggregate-report.md
+              fi
             fi
           done
 
-          if [ "$crash_count" -eq 0 ]; then
-            echo "✓ No crashes found across all targets" >> summary.md
+          if [ "$cargo_crash_count" -eq 0 ]; then
+            echo "✓ No crashes found across all cargo-fuzz targets" >> aggregate-report.md
           else
-            echo "" >> summary.md
-            echo "**Total crashes:** $crash_count" >> summary.md
+            echo "" >> aggregate-report.md
+            echo "**Total cargo-fuzz crashes:** $cargo_crash_count" >> aggregate-report.md
+          fi
+          echo "" >> aggregate-report.md
+
+          # Crash triage summary
+          echo "## Crash Triage" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          if [ -f "artifacts/triage-log/triage.log" ]; then
+            unique=$(grep -oP "Unique crashes: \K[0-9]+" artifacts/triage-log/triage.log | tail -1 || echo "0")
+            total=$((total_crashes + cargo_crash_count))
+
+            if [ "$total" -gt 0 ]; then
+              dedup_rate=$(awk "BEGIN {printf \"%.1f\", (1 - $unique/$total) * 100}")
+              echo "- **Total crashes:** $total" >> aggregate-report.md
+              echo "- **Unique crashes:** $unique" >> aggregate-report.md
+              echo "- **Deduplication rate:** ${dedup_rate}%" >> aggregate-report.md
+
+              if [ "$unique" -gt 0 ]; then
+                echo "- **GitHub issues created:** $unique" >> aggregate-report.md
+              fi
+            else
+              echo "✓ No crashes found - kernel is clean!" >> aggregate-report.md
+            fi
+          else
+            echo "No triage data available" >> aggregate-report.md
           fi
 
-          cat summary.md
+          echo "" >> aggregate-report.md
+          echo "---" >> aggregate-report.md
+          echo "*Report generated by Nilix comprehensive fuzzing infrastructure*" >> aggregate-report.md
+
+          cat aggregate-report.md
 
       - name: Add to step summary
         if: always()
-        run: cat summary.md >> $GITHUB_STEP_SUMMARY
+        run: cat aggregate-report.md >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload summary
+      - name: Upload aggregate report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzzing-summary
-          path: summary.md
-          retention-days: 30
+          name: aggregate-report
+          path: aggregate-report.md
+          retention-days: 90

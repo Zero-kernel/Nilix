@@ -3,7 +3,18 @@ name = "fuzzer"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "continuous-fuzzer"
+path = "src/bin/continuous-fuzzer.rs"
+
+[[bin]]
+name = "crash-triage"
+path = "src/bin/crash-triage.rs"
+
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+walkdir = "2.4"
+md5 = "0.7"
 
 [profile.release]
 opt-level = 2
