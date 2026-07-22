@@ -467,7 +467,9 @@ impl SecurityTest for SpectreV2RetpolineTest {
         // environments (QEMU qemu64 CPU doesn't support IBRS). Production systems
         // should either enable retpoline compilation or use CPUs with IBRS support.
         if status.retpoline_required {
-            return TestResult::Warning("Retpoline required but not available (acceptable in test/CI)");
+            return TestResult::Warning(
+                "Retpoline required but not available (acceptable in test/CI)",
+            );
         }
 
         TestResult::Warning("No Spectre V2 mitigation detected")
