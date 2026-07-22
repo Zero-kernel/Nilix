@@ -1,0 +1,31 @@
+# Syscall: fork
+# Number: 57
+# Signature: pid_t fork(void)
+
+[syscall]
+name = "fork"
+number = 57
+description = "Create a child process"
+
+# No arguments for fork
+
+# Return value specification
+[syscall.returns]
+success = { type = "pid_t", range = [0, 32768], description = "child PID in parent, 0 in child" }
+error = { type = "errno", values = ["ENOMEM", "EAGAIN"] }
+
+# Resource tracking: creates a new process
+[syscall.resources]
+creates = ["process"]
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "process_creation",
+    "memory_duplication",
+    "fd_table_clone",
+    "page_table_copy",
+    "scheduler_admission",
+    "resource_limits",
+    "error_handling",
+]

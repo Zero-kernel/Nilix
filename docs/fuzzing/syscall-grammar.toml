@@ -1,0 +1,525 @@
+# Syscall Grammar for Phase 3: TOML-based Syscall Descriptions
+# This file describes 10 core syscalls with proper argument generation rules
+
+# =============================================================================
+# Syscall: read (syscall number 0)
+# =============================================================================
+[[syscall]]
+name = "read"
+number = 0
+category = "io"
+description = "Read bytes from a file descriptor"
+
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraint = "fd_valid"
+description = "File descriptor (0=stdin, >=3 for regular files)"
+
+[[syscall.args]]
+name = "buf"
+type = "ptr_mut"
+constraint = "buffer"
+size_from = "count"
+description = "Pointer to buffer for read data"
+
+[[syscall.args]]
+name = "count"
+type = "usize"
+constraint = "size"
+min = 0
+max = 1048576  # MAX_RW_SIZE = 1MB
+description = "Number of bytes to read"
+
+[[syscall.edges]]
+id = 1000
+description = "sys_read entry"
+
+[[syscall.edges]]
+id = 1001
+description = "sys_read stdin path"
+
+[[syscall.edges]]
+id = 1002
+description = "sys_read stdout/stderr error"
+
+[[syscall.edges]]
+id = 1003
+description = "sys_read fd callback path"
+
+# =============================================================================
+# Syscall: write (syscall number 1)
+# =============================================================================
+[[syscall]]
+name = "write"
+number = 1
+category = "io"
+description = "Write bytes to a file descriptor"
+
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraint = "fd_valid"
+description = "File descriptor (1=stdout, 2=stderr, >=3 for regular files)"
+
+[[syscall.args]]
+name = "buf"
+type = "ptr_const"
+constraint = "buffer"
+size_from = "count"
+description = "Pointer to data to write"
+
+[[syscall.args]]
+name = "count"
+type = "usize"
+constraint = "size"
+min = 0
+max = 1048576  # MAX_RW_SIZE = 1MB
+description = "Number of bytes to write"
+
+[[syscall.edges]]
+id = 1010
+description = "sys_write entry"
+
+[[syscall.edges]]
+id = 1011
+description = "sys_write stdout/stderr path"
+
+[[syscall.edges]]
+id = 1012
+description = "sys_write stdin error"
+
+[[syscall.edges]]
+id = 1013
+description = "sys_write fd callback path"
+
+# =============================================================================
+# Syscall: open (syscall number 2)
+# =============================================================================
+[[syscall]]
+name = "open"
+number = 2
+category = "io"
+description = "Open a file and return a file descriptor"
+
+[[syscall.args]]
+name = "path"
+type = "ptr_const"
+constraint = "cstring"
+max_len = 4096
+description = "Path to file (null-terminated string)"
+
+[[syscall.args]]
+name = "flags"
+type = "i32"
+constraint = "open_flags"
+description = "Open flags (O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=0x40, O_CLOEXEC=0x80000)"
+
+[[syscall.args]]
+name = "mode"
+type = "u32"
+constraint = "file_mode"
+description = "File permissions (e.g., 0644)"
+
+[[syscall.edges]]
+id = 1020
+description = "sys_open entry"
+
+[[syscall.edges]]
+id = 1021
+description = "sys_open_internal entry"
+
+# =============================================================================
+# Syscall: close (syscall number 3)
+# =============================================================================
+[[syscall]]
+name = "close"
+number = 3
+category = "io"
+description = "Close a file descriptor"
+
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraint = "fd_valid"
+min = 3  # Cannot close stdin/stdout/stderr
+description = "File descriptor to close (must be >= 3)"
+
+[[syscall.edges]]
+id = 1030
+description = "sys_close entry"
+
+[[syscall.edges]]
+id = 1031
+description = "sys_close stdio error"
+
+[[syscall.edges]]
+id = 1032
+description = "sys_close callback path"
+
+# =============================================================================
+# Syscall: brk (syscall number 12)
+# =============================================================================
+[[syscall]]
+name = "brk"
+number = 12
+category = "memory"
+description = "Change data segment size"
+
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraint = "address"
+align = 4096  # Page-aligned
+min = 0
+max = 0x00007FFF_FFFF_F000  # USER_SPACE_TOP
+description = "New program break address (0 = query current)"
+
+[[syscall.edges]]
+id = 1040
+description = "sys_brk entry"
+
+[[syscall.edges]]
+id = 1041
+description = "sys_brk query path"
+
+# =============================================================================
+# Syscall: mmap (syscall number 9)
+# =============================================================================
+[[syscall]]
+name = "mmap"
+number = 9
+category = "memory"
+description = "Map memory region"
+
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraint = "address"
+align = 4096
+description = "Suggested address (0 = kernel chooses)"
+
+[[syscall.args]]
+name = "length"
+type = "usize"
+constraint = "size"
+min = 1
+max = 268435456  # 256MB max
+description = "Size of mapping in bytes"
+
+[[syscall.args]]
+name = "prot"
+type = "i32"
+constraint = "mmap_prot"
+description = "Protection flags (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4, PROT_NONE=0)"
+
+[[syscall.args]]
+name = "flags"
+type = "i32"
+constraint = "mmap_flags"
+description = "Mapping flags (MAP_PRIVATE=2, MAP_ANONYMOUS=0x20)"
+
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraint = "fd_or_minus_one"
+description = "File descriptor (-1 for anonymous)"
+
+[[syscall.args]]
+name = "offset"
+type = "i64"
+constraint = "offset"
+description = "File offset (ignored for anonymous)"
+
+[[syscall.edges]]
+id = 1050
+description = "sys_mmap entry"
+
+[[syscall.edges]]
+id = 1051
+description = "sys_mmap W^X violation"
+
+[[syscall.edges]]
+id = 1052
+description = "sys_mmap file-backed unsupported"
+
+[[syscall.edges]]
+id = 1053
+description = "sys_mmap anonymous mapping path"
+
+# =============================================================================
+# Syscall: munmap (syscall number 11)
+# =============================================================================
+[[syscall]]
+name = "munmap"
+number = 11
+category = "memory"
+description = "Unmap memory region"
+
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraint = "address"
+align = 4096
+description = "Start address (must be page-aligned)"
+
+[[syscall.args]]
+name = "length"
+type = "usize"
+constraint = "size"
+min = 1
+max = 268435456  # 256MB max
+description = "Size of mapping to unmap"
+
+[[syscall.edges]]
+id = 1060
+description = "sys_munmap entry"
+
+[[syscall.edges]]
+id = 1061
+description = "sys_munmap validation passed"
+
+# =============================================================================
+# Syscall: fork (syscall number 57)
+# =============================================================================
+[[syscall]]
+name = "fork"
+number = 57
+category = "process"
+description = "Create a new process"
+
+# fork has no arguments
+
+[[syscall.edges]]
+id = 1070
+description = "sys_fork entry"
+
+# =============================================================================
+# Syscall: execve (syscall number 59)
+# =============================================================================
+[[syscall]]
+name = "execve"
+number = 59
+category = "process"
+description = "Execute a program"
+
+[[syscall.args]]
+name = "pathname"
+type = "ptr_const"
+constraint = "cstring"
+max_len = 4096
+description = "Path to executable"
+
+[[syscall.args]]
+name = "argv"
+type = "ptr_ptr_const"
+constraint = "string_array"
+max_count = 256
+description = "Array of argument strings (null-terminated)"
+
+[[syscall.args]]
+name = "envp"
+type = "ptr_ptr_const"
+constraint = "string_array"
+max_count = 256
+description = "Array of environment strings (null-terminated)"
+
+[[syscall.edges]]
+id = 1080
+description = "sys_execve entry"
+
+# =============================================================================
+# Syscall: exit (syscall number 60)
+# =============================================================================
+[[syscall]]
+name = "exit"
+number = 60
+category = "process"
+description = "Terminate the calling process"
+
+[[syscall.args]]
+name = "exit_code"
+type = "i32"
+constraint = "integer"
+min = -128
+max = 127
+description = "Exit status code"
+
+[[syscall.edges]]
+id = 1090
+description = "sys_exit entry"
+
+# =============================================================================
+# Constraint Definitions
+# =============================================================================
+
+[constraints]
+
+[constraints.fd_valid]
+type = "range"
+generator = "fd_pool"
+description = "Valid file descriptor (0, 1, 2, or opened FD)"
+
+[constraints.fd_or_minus_one]
+type = "enum"
+values = [-1, 0, 1, 2, 3, 4, 5]
+description = "File descriptor or -1 for anonymous"
+
+[constraints.buffer]
+type = "pointer"
+generator = "user_buffer"
+description = "Valid userspace buffer"
+
+[constraints.cstring]
+type = "string"
+generator = "path_string"
+null_terminated = true
+description = "Null-terminated string"
+
+[constraints.string_array]
+type = "pointer_array"
+generator = "string_array"
+null_terminated = true
+description = "Null-terminated array of string pointers"
+
+[constraints.size]
+type = "range"
+generator = "size_value"
+description = "Size value with min/max bounds"
+
+[constraints.address]
+type = "pointer"
+generator = "user_address"
+description = "Userspace address"
+
+[constraints.open_flags]
+type = "bitflags"
+generator = "open_flags"
+values = [0, 1, 2, 0x40, 0x200, 0x400, 0x80000]
+description = "Open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND, O_CLOEXEC)"
+
+[constraints.file_mode]
+type = "octal"
+generator = "file_mode"
+values = [0o644, 0o755, 0o666, 0o600]
+description = "File permission mode"
+
+[constraints.mmap_prot]
+type = "bitflags"
+generator = "mmap_prot"
+values = [0, 1, 2, 4]
+exclude_combinations = [[2, 4]]  # W^X: cannot combine WRITE and EXEC
+description = "Memory protection flags"
+
+[constraints.mmap_flags]
+type = "bitflags"
+generator = "mmap_flags"
+values = [2, 0x20]  # MAP_PRIVATE, MAP_ANONYMOUS
+description = "Memory mapping flags"
+
+[constraints.offset]
+type = "range"
+generator = "offset_value"
+min = 0
+max = 1073741824  # 1GB
+description = "File offset"
+
+[constraints.integer]
+type = "range"
+generator = "integer_value"
+description = "Arbitrary integer within bounds"
+
+# =============================================================================
+# Generator Configuration
+# =============================================================================
+
+[generators]
+
+[generators.fd_pool]
+type = "pool"
+initial = [0, 1, 2]  # stdin, stdout, stderr always available
+dynamic = true
+description = "Track opened file descriptors"
+
+[generators.user_buffer]
+type = "allocator"
+pool_size = 16
+buffer_sizes = [16, 64, 256, 1024, 4096]
+description = "Allocate userspace buffers"
+
+[generators.path_string]
+type = "corpus"
+values = [
+    "/",
+    "/test",
+    "/test.txt",
+    "/nonexistent",
+    "/dev/null",
+    "/proc/self",
+    "relative/path",
+    "",
+    "a" * 4096,  # max length
+]
+description = "File path corpus"
+
+[generators.string_array]
+type = "combinator"
+base_generator = "path_string"
+max_elements = 256
+description = "Array of strings"
+
+[generators.size_value]
+type = "weighted"
+ranges = [
+    { min = 0, max = 0, weight = 10 },      # Zero
+    { min = 1, max = 16, weight = 30 },     # Small
+    { min = 17, max = 4096, weight = 40 },  # Medium
+    { min = 4097, max = 1048576, weight = 20 }, # Large
+]
+description = "Size with realistic distribution"
+
+[generators.user_address]
+type = "weighted"
+ranges = [
+    { value = 0, weight = 20 },                    # NULL
+    { min = 0x1000, max = 0x10000, weight = 30 },  # Low
+    { min = 0x400000, max = 0x800000, weight = 40 }, # Typical
+    { min = 0x7fff_ffff_0000, max = 0x7fff_ffff_f000, weight = 10 }, # High
+]
+align = 4096
+description = "Userspace address with realistic distribution"
+
+[generators.open_flags]
+type = "bitwise_combination"
+base_flags = [0, 1, 2]  # O_RDONLY, O_WRONLY, O_RDWR (mutually exclusive)
+optional_flags = [0x40, 0x200, 0x400, 0x80000]  # O_CREAT, O_TRUNC, O_APPEND, O_CLOEXEC
+description = "Valid combinations of open flags"
+
+[generators.file_mode]
+type = "enum"
+values = [0o644, 0o755, 0o666, 0o600, 0o777, 0o000]
+description = "Common file permission modes"
+
+[generators.mmap_prot]
+type = "bitwise_combination"
+base_flags = [0, 1, 2, 4]  # NONE, READ, WRITE, EXEC
+exclude_patterns = [[2, 4]]  # W^X policy
+description = "Memory protection flags respecting W^X"
+
+[generators.mmap_flags]
+type = "bitwise_combination"
+required_flags = [2, 0x20]  # MAP_PRIVATE | MAP_ANONYMOUS (only supported combination)
+description = "Only anonymous private mappings supported"
+
+[generators.offset_value]
+type = "weighted"
+ranges = [
+    { value = 0, weight = 50 },  # Start of file
+    { min = 1, max = 4096, weight = 30 },  # Small offset
+    { min = 4097, max = 1048576, weight = 20 },  # Large offset
+]
+description = "File offset with common patterns"
+
+[generators.integer_value]
+type = "uniform"
+description = "Uniform distribution within specified bounds"

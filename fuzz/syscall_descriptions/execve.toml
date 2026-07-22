@@ -1,0 +1,52 @@
+# Syscall: execve
+# Number: 59
+# Signature: int execve(const char *pathname, char *const argv[], char *const envp[])
+
+[syscall]
+name = "execve"
+number = 59
+description = "Execute a program"
+
+# Argument 1: pathname (path to executable)
+[[syscall.args]]
+name = "pathname"
+type = "const_ptr_u8"
+constraints = [
+    { type = "string", max_len = 256, charset = "printable" },
+    { type = "null_terminated", required = true },
+]
+
+# Argument 2: argv (argument vector)
+[[syscall.args]]
+name = "argv"
+type = "const_ptr_const_ptr_u8"
+constraints = [
+    { type = "string_array", max_count = 32, max_string_len = 256 },
+    { type = "null_terminated_array", required = true },
+]
+
+# Argument 3: envp (environment vector)
+[[syscall.args]]
+name = "envp"
+type = "const_ptr_const_ptr_u8"
+constraints = [
+    { type = "string_array", max_count = 64, max_string_len = 256 },
+    { type = "null_terminated_array", required = true },
+]
+
+# Return value specification (only returns on error)
+[syscall.returns]
+success = { type = "no_return", description = "does not return on success" }
+error = { type = "errno", values = ["ENOENT", "EACCES", "ENOMEM", "E2BIG", "ENOEXEC"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "path_resolution",
+    "elf_parsing",
+    "memory_replacement",
+    "stack_setup",
+    "argument_copy",
+    "environment_copy",
+    "error_handling",
+]

@@ -1,0 +1,32 @@
+# Syscall: brk
+# Number: 12
+# Signature: int brk(void *addr)
+
+[syscall]
+name = "brk"
+number = 12
+description = "Change the location of the program break (heap boundary)"
+
+# Argument 1: addr (new program break address)
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraints = [
+    { type = "range", min = 0, max = 0xFFFFFFFFFFFF },  # 48-bit address space
+    { type = "alignment", bytes = 4096 },  # Page-aligned
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "usize", description = "new program break address" }
+error = { type = "errno", values = ["ENOMEM", "EINVAL"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "heap_expansion",
+    "heap_shrinkage",
+    "memory_limit_check",
+    "page_allocation",
+    "error_handling",
+]

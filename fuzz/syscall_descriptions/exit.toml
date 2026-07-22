@@ -1,0 +1,35 @@
+# Syscall: exit
+# Number: 60
+# Signature: void exit(int status)
+
+[syscall]
+name = "exit"
+number = 60
+description = "Terminate the calling process"
+
+# Argument 1: status (exit status code)
+[[syscall.args]]
+name = "status"
+type = "i32"
+constraints = [
+    { type = "range", min = 0, max = 255 },
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "no_return", description = "does not return" }
+error = { type = "none", description = "cannot fail" }
+
+# Resource tracking: destroys the current process
+[syscall.resources]
+destroys = ["process", "all_fds", "all_mappings"]
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "process_cleanup",
+    "fd_table_teardown",
+    "memory_release",
+    "parent_notification",
+    "scheduler_removal",
+]

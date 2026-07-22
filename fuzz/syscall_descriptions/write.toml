@@ -1,0 +1,50 @@
+# Syscall: write
+# Number: 1
+# Signature: ssize_t write(int fd, const void *buf, size_t count)
+
+[syscall]
+name = "write"
+number = 1
+description = "Write bytes from a buffer to a file descriptor"
+
+# Argument 1: fd (file descriptor)
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraints = [
+    { type = "range", min = 0, max = 1023 },
+    { type = "resource", kind = "fd", must_exist = true },
+]
+
+# Argument 2: buf (input buffer pointer)
+[[syscall.args]]
+name = "buf"
+type = "const_ptr_u8"
+constraints = [
+    { type = "buffer", min_size = 1, max_size = 65536 },
+    { type = "readable", required = true },
+]
+
+# Argument 3: count (number of bytes to write)
+[[syscall.args]]
+name = "count"
+type = "usize"
+constraints = [
+    { type = "range", min = 0, max = 65536 },
+    { type = "matches_buffer", arg = "buf" },
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "ssize_t", range = [0, 65536] }
+error = { type = "errno", values = ["EBADF", "EFAULT", "EINVAL", "EIO", "ENOSPC"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "fd_table_lookup",
+    "vfs_write",
+    "buffer_validation",
+    "quota_check",
+    "error_handling",
+]

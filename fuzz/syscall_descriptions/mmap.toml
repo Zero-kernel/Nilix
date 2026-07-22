@@ -1,0 +1,87 @@
+# Syscall: mmap
+# Number: 9
+# Signature: void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+
+[syscall]
+name = "mmap"
+number = 9
+description = "Map files or devices into memory"
+
+# Argument 1: addr (hint address for mapping)
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraints = [
+    { type = "range", min = 0, max = 0xFFFFFFFFFFFF },
+    { type = "alignment", bytes = 4096 },  # Page-aligned
+]
+
+# Argument 2: length (size of mapping in bytes)
+[[syscall.args]]
+name = "length"
+type = "usize"
+constraints = [
+    { type = "range", min = 1, max = 1073741824 },  # 1 byte to 1GB
+]
+
+# Argument 3: prot (protection flags)
+[[syscall.args]]
+name = "prot"
+type = "i32"
+constraints = [
+    { type = "bitmask", values = [
+        "PROT_NONE",   # 0
+        "PROT_READ",   # 1
+        "PROT_WRITE",  # 2
+        "PROT_EXEC",   # 4
+    ]},
+]
+
+# Argument 4: flags (mapping flags)
+[[syscall.args]]
+name = "flags"
+type = "i32"
+constraints = [
+    { type = "bitmask", values = [
+        "MAP_SHARED",    # 0x01
+        "MAP_PRIVATE",   # 0x02
+        "MAP_FIXED",     # 0x10
+        "MAP_ANONYMOUS", # 0x20
+    ]},
+    { type = "required_one_of", values = ["MAP_SHARED", "MAP_PRIVATE"] },
+]
+
+# Argument 5: fd (file descriptor, -1 for anonymous)
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraints = [
+    { type = "range", min = -1, max = 1023 },
+]
+conditional = { depends_on = "flags", not_has_flag = "MAP_ANONYMOUS" }
+
+# Argument 6: offset (offset in file)
+[[syscall.args]]
+name = "offset"
+type = "i64"
+constraints = [
+    { type = "range", min = 0, max = 0x7FFFFFFFFFFFFFFF },
+    { type = "alignment", bytes = 4096 },  # Page-aligned
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "ptr", range = [4096, 0xFFFFFFFFFFFF] }
+error = { type = "errno", values = ["ENOMEM", "EBADF", "EINVAL", "EACCES", "EOVERFLOW"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "address_validation",
+    "page_allocation",
+    "mapping_creation",
+    "permission_setup",
+    "fd_mapping",
+    "anonymous_mapping",
+    "error_handling",
+]

@@ -1,0 +1,49 @@
+# Syscall: read
+# Number: 0
+# Signature: ssize_t read(int fd, void *buf, size_t count)
+
+[syscall]
+name = "read"
+number = 0
+description = "Read bytes from a file descriptor into a buffer"
+
+# Argument 1: fd (file descriptor)
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraints = [
+    { type = "range", min = 0, max = 1023 },
+    { type = "resource", kind = "fd", must_exist = true },
+]
+
+# Argument 2: buf (output buffer pointer)
+[[syscall.args]]
+name = "buf"
+type = "mut_ptr_u8"
+constraints = [
+    { type = "buffer", min_size = 1, max_size = 65536 },
+    { type = "writable", required = true },
+]
+
+# Argument 3: count (number of bytes to read)
+[[syscall.args]]
+name = "count"
+type = "usize"
+constraints = [
+    { type = "range", min = 0, max = 65536 },
+    { type = "matches_buffer", arg = "buf" },
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "ssize_t", range = [0, 65536] }
+error = { type = "errno", values = ["EBADF", "EFAULT", "EINVAL", "EIO"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "fd_table_lookup",
+    "vfs_read",
+    "buffer_validation",
+    "error_handling",
+]

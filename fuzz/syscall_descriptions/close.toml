@@ -1,0 +1,35 @@
+# Syscall: close
+# Number: 3
+# Signature: int close(int fd)
+
+[syscall]
+name = "close"
+number = 3
+description = "Close a file descriptor"
+
+# Argument 1: fd (file descriptor to close)
+[[syscall.args]]
+name = "fd"
+type = "i32"
+constraints = [
+    { type = "range", min = 0, max = 1023 },
+    { type = "resource", kind = "fd", must_exist = true },
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "i32", value = 0 }
+error = { type = "errno", values = ["EBADF", "EINTR", "EIO"] }
+
+# Resource tracking: destroys a file descriptor
+[syscall.resources]
+destroys = ["fd"]
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "fd_table_lookup",
+    "fd_release",
+    "vfs_close",
+    "error_handling",
+]

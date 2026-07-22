@@ -1,0 +1,40 @@
+# Syscall: munmap
+# Number: 11
+# Signature: int munmap(void *addr, size_t length)
+
+[syscall]
+name = "munmap"
+number = 11
+description = "Unmap a memory region"
+
+# Argument 1: addr (start address of mapping to unmap)
+[[syscall.args]]
+name = "addr"
+type = "usize"
+constraints = [
+    { type = "range", min = 4096, max = 0xFFFFFFFFFFFF },
+    { type = "alignment", bytes = 4096 },  # Must be page-aligned
+]
+
+# Argument 2: length (size of region to unmap)
+[[syscall.args]]
+name = "length"
+type = "usize"
+constraints = [
+    { type = "range", min = 1, max = 1073741824 },  # 1 byte to 1GB
+]
+
+# Return value specification
+[syscall.returns]
+success = { type = "i32", value = 0 }
+error = { type = "errno", values = ["EINVAL"] }
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "address_validation",
+    "mapping_lookup",
+    "page_deallocation",
+    "tlb_flush",
+    "error_handling",
+]

@@ -1,0 +1,62 @@
+# Syscall: open
+# Number: 2
+# Signature: int open(const char *pathname, int flags, mode_t mode)
+
+[syscall]
+name = "open"
+number = 2
+description = "Open a file and return a file descriptor"
+
+# Argument 1: pathname (file path string)
+[[syscall.args]]
+name = "pathname"
+type = "const_ptr_u8"
+constraints = [
+    { type = "string", max_len = 256, charset = "printable" },
+    { type = "null_terminated", required = true },
+]
+
+# Argument 2: flags (open flags bitmask)
+[[syscall.args]]
+name = "flags"
+type = "i32"
+constraints = [
+    { type = "bitmask", values = [
+        "O_RDONLY",    # 0
+        "O_WRONLY",    # 1
+        "O_RDWR",      # 2
+        "O_CREAT",     # 0x40
+        "O_EXCL",      # 0x80
+        "O_TRUNC",     # 0x200
+        "O_APPEND",    # 0x400
+        "O_NONBLOCK",  # 0x800
+    ]},
+]
+
+# Argument 3: mode (file permissions, only used with O_CREAT)
+[[syscall.args]]
+name = "mode"
+type = "u32"
+constraints = [
+    { type = "range", min = 0, max = 511 },  # 0o777
+]
+conditional = { depends_on = "flags", has_flag = "O_CREAT" }
+
+# Return value specification
+[syscall.returns]
+success = { type = "fd", range = [0, 1023] }
+error = { type = "errno", values = ["ENOENT", "EACCES", "ENOMEM", "EMFILE", "EEXIST", "EISDIR"] }
+
+# Resource tracking: creates a file descriptor
+[syscall.resources]
+creates = ["fd"]
+
+# Coverage hints: edges to instrument
+[syscall.coverage]
+key_paths = [
+    "path_resolution",
+    "permission_check",
+    "fd_allocation",
+    "vfs_open",
+    "error_handling",
+]

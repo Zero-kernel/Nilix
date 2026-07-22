@@ -1,0 +1,11 @@
+[package]
+name = "syscall_gen"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "syscall_gen"
+path = "src/lib.rs"
+
+[dependencies]
+# No dependencies - this is a no_std library for argument generation
