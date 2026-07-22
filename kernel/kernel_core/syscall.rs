@@ -3688,6 +3688,14 @@ pub fn syscall_dispatcher(
         514 => sys_kpatch_enable_all(),
         515 => sys_kpatch_disable_all(),
 
+        // KCOV (Kernel Code Coverage) syscalls (Zero-OS specific, 520-524)
+        // Used for coverage-guided fuzzing infrastructure
+        520 => sys_kcov_init(arg0 as usize),
+        521 => sys_kcov_enable(),
+        522 => sys_kcov_disable(),
+        523 => sys_kcov_dump(arg0 as usize, arg1 as usize),
+        524 => sys_kcov_reset(),
+
         // M0-6 poll/select: I/O multiplexing (poll/select/pselect6/ppoll).
         // ppoll/pselect6 timeout args are *mut: raw-Linux writes remaining time
         // back (glibc hides this in a local; man ppoll/pselect6 NOTES).
@@ -3725,6 +3733,13 @@ pub fn syscall_dispatcher(
 
         // Process wait
         247 => sys_waitid(arg0 as i32, arg1 as i32, arg2 as *mut u8, arg3 as i32),
+
+        // KCOV coverage syscalls (Phase 1)
+        520 => sys_kcov_init(arg0 as usize),
+        521 => sys_kcov_enable(),
+        522 => sys_kcov_disable(),
+        523 => sys_kcov_dump(arg0 as usize, arg1 as usize),
+        524 => sys_kcov_reset(),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -3808,6 +3823,21 @@ pub fn syscall_dispatcher(
 
 /// sys_exit - 终止当前进程
 fn sys_exit(exit_code: i32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1090); // sys_exit entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(pid) = current_pid() {
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook,
@@ -3881,6 +3911,21 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
 /// calling thread, but shared resources (mutexes, file locks) may be in
 /// inconsistent states in the child.
 fn sys_fork() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1070); // sys_fork entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
 
@@ -6493,6 +6538,21 @@ fn sys_execve(
     argv: *const *const u8,
     envp: *const *const u8,
 ) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1080); // sys_execve entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use crate::process::{current_pid, get_process};
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -7006,8 +7066,37 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
 /// not the global (kernel internal) PID. For processes in the root namespace,
 /// these are the same.
 fn sys_getpid() -> SyscallResult {
+    // Manual coverage trace point
+    #[cfg(feature = "kcov")]
+    {
+        let pid = current_pid();
+        if let Some(p) = pid {
+            if let Some(proc_arc) = get_process(p) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1); // Edge 1: entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
+
+    // Manual coverage trace point
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(proc) = proc_arc.try_lock() {
+            if let Some(ref buf) = proc.coverage_buffer {
+                if let Some(mut coverage) = buf.try_lock() {
+                    coverage.record_edge(2); // Edge 2: after process lookup
+                }
+            }
+        }
+    }
 
     let ns_pid = {
         let proc = proc_arc.lock();
@@ -7017,6 +7106,18 @@ fn sys_getpid() -> SyscallResult {
         crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
             .ok_or(SyscallError::EFAULT)?
     };
+
+    // Manual coverage trace point
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(proc) = proc_arc.try_lock() {
+            if let Some(ref buf) = proc.coverage_buffer {
+                if let Some(mut coverage) = buf.try_lock() {
+                    coverage.record_edge(3); // Edge 3: before return
+                }
+            }
+        }
+    }
 
     Ok(ns_pid)
 }
@@ -7030,6 +7131,18 @@ fn sys_getppid() -> SyscallResult {
     let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
 
+    // Manual coverage trace point
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(proc) = proc_arc.try_lock() {
+            if let Some(ref buf) = proc.coverage_buffer {
+                if let Some(mut coverage) = buf.try_lock() {
+                    coverage.record_edge(1); // Edge 1: entry
+                }
+            }
+        }
+    }
+
     let proc = proc_arc.lock();
     let parent_global_pid = proc.ppid;
 
@@ -7039,6 +7152,16 @@ fn sys_getppid() -> SyscallResult {
 
     // If parent_pid is 0, the process has no parent (init)
     if parent_global_pid == 0 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(proc) = proc_arc.try_lock() {
+                if let Some(ref buf) = proc.coverage_buffer {
+                    if let Some(mut coverage) = buf.try_lock() {
+                        coverage.record_edge(2); // Edge 2: no parent
+                    }
+                }
+            }
+        }
         return Ok(0);
     }
 
@@ -7046,13 +7169,43 @@ fn sys_getppid() -> SyscallResult {
     if let Some(ns) = owning_ns {
         // Look up parent's PID in our namespace
         if let Some(ns_ppid) = ns.lookup_ns_pid(parent_global_pid) {
+            #[cfg(feature = "kcov")]
+            {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(3); // Edge 3: parent visible
+                        }
+                    }
+                }
+            }
             return Ok(ns_ppid);
         }
         // Parent not visible in our namespace - return 0 (orphan semantics)
         // This happens when parent is in an ancestor namespace
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(proc) = proc_arc.try_lock() {
+                if let Some(ref buf) = proc.coverage_buffer {
+                    if let Some(mut coverage) = buf.try_lock() {
+                        coverage.record_edge(4); // Edge 4: parent not visible
+                    }
+                }
+            }
+        }
         Ok(0)
     } else {
         // No namespace chain - return global PID (root namespace)
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(proc) = proc_arc.try_lock() {
+                if let Some(ref buf) = proc.coverage_buffer {
+                    if let Some(mut coverage) = buf.try_lock() {
+                        coverage.record_edge(5); // Edge 5: root namespace
+                    }
+                }
+            }
+        }
         Ok(parent_global_pid)
     }
 }
@@ -9488,6 +9641,21 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallRe
 /// 回调返回的 bytes_read 必须 clamp 到请求的 count，防止恶意/错误回调
 /// 返回超大值导致切片越界 panic。
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1000); // sys_read entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
         0 => return Ok(0),
@@ -9502,6 +9670,20 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // R23-5 fix: 阻塞模式 - 如果没有输入则等待
     // 使用 prepare-check-finish 模式避免丢失唤醒竞态
     if fd == 0 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1001); // sys_read stdin path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // R158-I8 FIX: removed unconditional debug kprintln (log spam + info disclosure).
 
         // R180-10 FIX: the reservation remains live across the indefinite
@@ -9552,7 +9734,36 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 
     // stdout/stderr 不支持读取
     if fd == 1 || fd == 2 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1002); // sys_read stdout/stderr error path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return Err(SyscallError::EBADF);
+    }
+
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1003); // sys_read fd callback path
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 获取回调函数指针并立即释放锁
@@ -9586,6 +9797,21 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 /// 回调返回的 bytes_written 必须 clamp 到请求的 count，防止恶意/错误回调
 /// 返回超大值。
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1010); // sys_write entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
         0 => return Ok(0),
@@ -9605,6 +9831,20 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
     // Display valid UTF-8 as text; replace invalid sequences with U+FFFD.
     if fd == 1 || fd == 2 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1011); // sys_write stdout/stderr path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // R162-17 FIX: Avoid infallible from_utf8_lossy which can allocate ~3x
         // input size on all-invalid bytes. Print in chunks using from_utf8
         // on valid spans and individual replacement chars for invalid bytes.
@@ -9634,9 +9874,37 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         }
         Ok(tmp.len())
     } else if fd == 0 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1012); // sys_write stdin error path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // stdin 不支持写入
         Err(SyscallError::EBADF)
     } else {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1013); // sys_write fd callback path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 获取回调函数指针并立即释放锁
         let write_fn = {
             let callback = FD_WRITE_CALLBACK.lock();
@@ -9839,6 +10107,21 @@ fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
 /// # Security (Z-3 fix)
 /// 使用 fault-tolerant copy_user_cstring 复制用户路径，防止 TOCTOU 和内核 panic
 fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1020); // sys_open entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use crate::usercopy::copy_user_cstring;
 
     // 验证路径指针
@@ -9920,6 +10203,21 @@ impl Drop for FdPublicationReservation {
 /// This eliminates TOCTOU window in sys_openat where the path could be modified
 /// between checking the first byte and calling sys_open.
 fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1021); // sys_open_internal entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -10184,9 +10482,53 @@ fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
 
 /// sys_close - 关闭文件描述符
 fn sys_close(fd: i32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1030); // sys_close entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 标准流不能关闭（简化实现）
     if fd <= 2 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1031); // sys_close stdio error path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return Err(SyscallError::EBADF);
+    }
+
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1032); // sys_close callback path
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 获取回调函数指针并立即释放锁
@@ -10688,6 +11030,21 @@ impl Drop for StackGrowReservation {
 /// - brk(addr > current) 扩展堆，分配匿名页
 /// - brk(addr < current) 收缩堆，释放页面
 fn sys_brk(addr: usize) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1040); // sys_brk entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use mm::memory::FrameAllocator;
     use mm::page_table::with_current_manager;
     use x86_64::structures::paging::{Page, PageTableFlags};
@@ -10703,6 +11060,20 @@ fn sys_brk(addr: usize) -> SyscallResult {
 
     // 查询模式：返回当前 brk
     if addr == 0 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1041); // sys_brk query path
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return Ok(mm_arc.lock().brk);
     }
 
@@ -12233,6 +12604,21 @@ fn sys_mmap(
     fd: i32,
     _offset: i64,
 ) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1050); // sys_mmap entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use mm::memory::FrameAllocator;
     use mm::page_table::with_current_manager;
     use x86_64::structures::paging::{Page, PageTableFlags};
@@ -12251,6 +12637,20 @@ fn sys_mmap(
     // PROT_WRITE = 0x2, PROT_EXEC = 0x4
     // Mirrors the check in sys_mprotect for consistency
     if (prot & 0x2 != 0) && (prot & 0x4 != 0) {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1051); // sys_mmap W^X violation
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return Err(SyscallError::EPERM);
     }
 
@@ -12259,7 +12659,36 @@ fn sys_mmap(
     // implemented (for anonymous mappings), but file-backed mappings are not
     // yet supported.
     if fd >= 0 {
+        #[cfg(feature = "kcov")]
+        {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    if let Some(proc) = proc_arc.try_lock() {
+                        if let Some(ref buf) = proc.coverage_buffer {
+                            if let Some(mut coverage) = buf.try_lock() {
+                                coverage.record_edge(1052); // sys_mmap file-backed unsupported
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1053); // sys_mmap anonymous mapping path
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // R29-3 FIX: Call LSM hook for anonymous mmap operations
@@ -12804,6 +13233,21 @@ fn sys_mmap(
 ///
 /// 使用当前进程的地址空间进行取消映射，确保进程隔离
 fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1060); // sys_munmap entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use mm::memory::FrameAllocator;
     use mm::page_table::with_current_manager;
     use x86_64::structures::paging::Page;
@@ -12816,6 +13260,21 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
     if length == 0 {
         return Err(SyscallError::EINVAL);
+    }
+
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(pid) = current_pid() {
+            if let Some(proc_arc) = get_process(pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1061); // sys_munmap validation passed
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 获取当前进程
@@ -15136,24 +15595,80 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
 
 /// sys_getuid - 获取真实用户ID
 fn sys_getuid() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(global_pid) = current_pid() {
+            if let Some(proc_arc) = get_process(global_pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
     Ok(creds.uid as usize)
 }
 
 /// sys_geteuid - 获取有效用户ID
 fn sys_geteuid() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(global_pid) = current_pid() {
+            if let Some(proc_arc) = get_process(global_pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
     Ok(creds.euid as usize)
 }
 
 /// sys_getgid - 获取真实组ID
 fn sys_getgid() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(global_pid) = current_pid() {
+            if let Some(proc_arc) = get_process(global_pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
     Ok(creds.gid as usize)
 }
 
 /// sys_getegid - 获取有效组ID
 fn sys_getegid() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        if let Some(global_pid) = current_pid() {
+            if let Some(proc_arc) = get_process(global_pid) {
+                if let Some(proc) = proc_arc.try_lock() {
+                    if let Some(ref buf) = proc.coverage_buffer {
+                        if let Some(mut coverage) = buf.try_lock() {
+                            coverage.record_edge(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
     Ok(creds.egid as usize)
 }
@@ -19959,6 +20474,145 @@ fn sys_waitid(
 ) -> Result<usize, SyscallError> {
     // M0-6: waitid is like wait4 but with siginfo_t and WNOWAIT support
     // Current wait4 implementation could be adapted
+    Err(SyscallError::ENOSYS)
+}
+
+// ============================================================================
+// KCOV (Kernel Code Coverage) Syscalls - Fuzzing Infrastructure
+// ============================================================================
+
+/// Initialize KCOV for current task
+///
+/// Allocates a coverage buffer and prepares the task for coverage collection.
+/// Must be called before sys_kcov_enable.
+///
+/// # Arguments
+/// - `buf_size`: Size of coverage buffer in bytes (must be <= 4096)
+///
+/// # Returns
+/// - Success: 0
+/// - Error: EINVAL (invalid size), ENOMEM (allocation failed), EEXIST (already initialized)
+#[cfg(feature = "kcov")]
+fn sys_kcov_init(buf_size: usize) -> Result<usize, SyscallError> {
+    extern crate coverage;
+
+    // Validate buffer size
+    if buf_size == 0 || buf_size > coverage::KCOV_BUFFER_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Get current process
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Check if already initialized
+    {
+        let proc = proc_arc.lock();
+        if proc.coverage_buffer.is_some() {
+            return Err(SyscallError::EEXIST);
+        }
+    }
+
+    // Enable coverage and store buffer in process
+    let buf = coverage::enable_coverage().ok_or(SyscallError::ENOMEM)?;
+
+    {
+        let mut proc = proc_arc.lock();
+        proc.coverage_buffer = Some(buf);
+    }
+
+    Ok(0)
+}
+
+#[cfg(not(feature = "kcov"))]
+fn sys_kcov_init(_buf_size: usize) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// Enable coverage collection for current task
+#[cfg(feature = "kcov")]
+fn sys_kcov_enable() -> Result<usize, SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let buf = proc.coverage_buffer.as_ref().ok_or(SyscallError::EINVAL)?;
+    buf.lock().enable();
+    Ok(0)
+}
+
+#[cfg(not(feature = "kcov"))]
+fn sys_kcov_enable() -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// Disable coverage collection for current task
+#[cfg(feature = "kcov")]
+fn sys_kcov_disable() -> Result<usize, SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let buf = proc.coverage_buffer.as_ref().ok_or(SyscallError::EINVAL)?;
+    buf.lock().disable();
+    Ok(0)
+}
+
+#[cfg(not(feature = "kcov"))]
+fn sys_kcov_disable() -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// Dump coverage data to userspace
+#[cfg(feature = "kcov")]
+fn sys_kcov_dump(user_buf: usize, len: usize) -> Result<usize, SyscallError> {
+    extern crate coverage;
+
+    if user_buf == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    if len > coverage::KCOV_BUFFER_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let buf = proc.coverage_buffer.as_ref().ok_or(SyscallError::EINVAL)?;
+    let buf_lock = buf.lock();
+
+    // Allocate temporary kernel buffer
+    let mut kernel_buf = alloc::vec![0u8; len];
+    let copied = buf_lock.copy_to_user(&mut kernel_buf);
+
+    // Copy to userspace via SMAP-compliant path
+    crate::usercopy::copy_to_user_safe(user_buf as *mut u8, &kernel_buf[..copied])
+        .map_err(|_| SyscallError::EFAULT)?;
+
+    Ok(buf_lock.edge_count())
+}
+
+#[cfg(not(feature = "kcov"))]
+fn sys_kcov_dump(_user_buf: usize, _len: usize) -> Result<usize, SyscallError> {
+    Err(SyscallError::ENOSYS)
+}
+
+/// Reset coverage data
+#[cfg(feature = "kcov")]
+fn sys_kcov_reset() -> Result<usize, SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let buf = proc.coverage_buffer.as_ref().ok_or(SyscallError::EINVAL)?;
+    buf.lock().reset();
+    Ok(0)
+}
+
+#[cfg(not(feature = "kcov"))]
+fn sys_kcov_reset() -> Result<usize, SyscallError> {
     Err(SyscallError::ENOSYS)
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "coverage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spin = "0.9"
+cpu_local = { path = "../cpu_local" }
+
+[lib]
+name = "coverage"
+path = "lib.rs"
+
+[features]
+default = []
+# Enable KCOV instrumentation (compile-time flag)
+kcov = []

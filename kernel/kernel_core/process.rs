@@ -2111,6 +2111,15 @@ pub struct Process {
     /// corresponding parent wake. Reapers must wait until this handoff clears.
     pub switch_reap_pending: AtomicBool,
 
+    // ========== KCOV (Kernel Code Coverage) ==========
+    /// Coverage buffer for fuzzing infrastructure
+    ///
+    /// When initialized via sys_kcov_init, tracks which code edges were hit
+    /// during task execution. Used for coverage-guided fuzzing.
+    /// None = coverage not initialized for this task.
+    #[cfg(feature = "kcov")]
+    pub coverage_buffer: Option<alloc::sync::Arc<spin::Mutex<coverage::CoverageBuffer>>>,
+
     /// Aggregate lifetime charge for construction-time shared control blocks
     /// and the retained process-name buffer. The outer PCB Arc has an
     /// independent allocator-owned charge that survives the last strong owner
@@ -2452,6 +2461,9 @@ impl Process {
             // R169-9: teardown bookkeeping starts unclaimed / not-done.
             teardown_claimed: core::sync::atomic::AtomicBool::new(false),
             teardown_done: core::sync::atomic::AtomicBool::new(false),
+            // KCOV: coverage not initialized at birth
+            #[cfg(feature = "kcov")]
+            coverage_buffer: None,
             _heap_charge: heap_charge,
         }
     }

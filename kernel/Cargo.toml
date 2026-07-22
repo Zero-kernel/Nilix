@@ -15,6 +15,10 @@ syscall_test = []
 musl_test = []
 # Enable clone syscall test program
 clone_test = []
+# Enable KCOV fuzz runner test program (Phase 2 completion)
+fuzz_runner = ["mm/fuzz_runner", "kcov"]
+# Enable kernel code coverage instrumentation for fuzzing
+kcov = ["coverage/kcov", "kernel_core/kcov"]
 
 [dependencies]
 spin = "0.9"
@@ -42,6 +46,7 @@ compliance = { path = "compliance" }
 livepatch = { path = "livepatch" }
 klog = { path = "klog" }
 sync_safe = { path = "sync_safe" }
+coverage = { path = "coverage", optional = true }
 
 # 暂时移除 crossbeam-queue，或确保正确配置
 # crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }

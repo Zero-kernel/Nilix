@@ -23,8 +23,10 @@ path = "lib.rs"
 # Declaring it off silences the warning + keeps the dead seed compiled out
 # (removing the superseded R155-8 seed is a separate follow-up).
 # sched_debug: a debug kprintln macro (sched_affinity_debug!); off keeps it out.
+# kcov: enables KCOV coverage collection syscalls (sys_kcov_*) and per-process coverage buffers
 conntrack = ["net/conntrack"]
 sched_debug = []
+kcov = ["coverage"]
 
 [dependencies]
 spin = "0.9"
@@ -45,3 +47,4 @@ trace = { path = "../trace" }
 compliance = { path = "../compliance" }
 livepatch = { path = "../livepatch" }
 klog = { path = "../klog" }
+coverage = { path = "../coverage", optional = true }
