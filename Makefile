@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -196,6 +196,43 @@ build-clone-test:
 # Run clone test (serial output)
 run-clone-test: build-clone-test
 	@echo "=== 启动内核（Clone Test模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) \
+		-nographic
+
+# Build with KCOV fuzz runner (Phase 2 completion test)
+build-fuzz-runner:
+	@echo "=== 编译 KCOV Fuzz Runner ==="
+	cd userspace && musl-gcc -static -o fuzz_runner.elf fuzz_runner.c
+	cp userspace/fuzz_runner.elf kernel/src/fuzz_runner.elf
+
+	@echo "=== 构建 Bootloader (UEFI) ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
+
+	@echo "=== 构建 Kernel (Bare Metal) with KCOV ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,fuzz_runner
+
+	@echo "=== 准备 EFI ESP 目录 ==="
+	mkdir -p $(ESP_DIR)
+
+	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+
+	@echo "复制 Kernel 到 ESP/kernel.elf"
+	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+
+	@echo "=== 内核信息 ==="
+	@readelf -h esp/kernel.elf | grep "Entry\|Type"
+	@echo "=== Fuzz Runner ELF 信息 ==="
+	@readelf -h kernel/src/fuzz_runner.elf | grep "Entry\|Type"
+	@echo "=== 构建完成（KCOV Fuzz Runner模式）==="
+
+# Run fuzz runner (Phase 2 verification)
+run-fuzz-runner: build-fuzz-runner
+	@echo "=== 启动内核（KCOV Fuzz Runner模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
@@ -569,6 +606,81 @@ lint-repr-c-copy:
 # Unified lint target: runs all CI lint checks.
 lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy
 
+# ============================================================================
+# Extended Test Suite - Stress, Performance, Security, SMP
+# ============================================================================
+
+# Stress test suite - catches resource leaks and stability issues
+stress-test: build
+	@echo "=== Running Stress Test Suite ==="
+	@STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+
+stress-test-extended: build
+	@echo "=== Running Extended Stress Test Suite ==="
+	@STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+
+# Performance regression gate - prevents accidental slowdowns
+test-perf: build
+	@echo "=== Running Performance Regression Gate ==="
+	@bash scripts/perf_regression_test.sh esp
+
+# Security mitigation tests - hardware/compiler-dependent validation
+test-security-mitigations: build
+	@echo "=== Running Security Mitigation Tests ==="
+	@echo "Security tests are integrated into runtime_tests.rs"
+	@echo "Run 'make test' to execute the full test suite including security tests"
+
+# Melting test - sustained maximum load (real hardware only)
+test-melting:
+	@echo "=== Running Melting Test Suite ==="
+	@echo "WARNING: Melting tests should be run on real hardware"
+	@MELT_DURATION=600 bash scripts/melting_test.sh
+
+# Extended SMP validation - 8-core and 16-core stress
+test-smp-extended: build
+	@echo "=== Running Extended SMP Test Suite ==="
+	@bash scripts/extended_smp_test.sh esp
+
+# Comprehensive test suite - all test categories
+test-comprehensive: build ensure-ext3-image
+	@echo "=== Running Comprehensive Test Suite ==="
+	@echo ""
+	@echo "1. Boot health check..."
+	@bash scripts/boot_check.sh esp || exit 1
+	@echo ""
+	@echo "2. Runtime test suite..."
+	@bash scripts/kernel_test.sh esp || exit 1
+	@echo ""
+	@echo "3. Musl conformance..."
+	@bash scripts/musl_check.sh "$(MUSL_ESP)" || exit 1
+	@echo ""
+	@echo "4. SMP 2-core validation..."
+	@bash scripts/smp_test.sh esp || exit 1
+	@echo ""
+	@echo "5. SMP 4-core validation..."
+	@bash scripts/smp_test_4core.sh esp || exit 1
+	@echo ""
+	@echo "6. Extended SMP validation..."
+	@bash scripts/extended_smp_test.sh esp || exit 1
+	@echo ""
+	@echo "7. Ext3/JBD2 production gate..."
+	@bash scripts/kernel_test.sh esp || exit 1
+	@echo ""
+	@echo "8. Stress test suite..."
+	@STRESS_DURATION=60 bash scripts/stress_test.sh esp || exit 1
+	@echo ""
+	@echo "9. Performance regression gate..."
+	@bash scripts/perf_regression_test.sh esp || exit 1
+	@echo ""
+	@echo "=== ✅ Comprehensive Test Suite PASSED ==="
+
+# Quick smoke test - essential gates only
+test-quick: build
+	@echo "=== Running Quick Smoke Test ==="
+	@bash scripts/boot_check.sh esp || exit 1
+	@bash scripts/kernel_test.sh esp || exit 1
+	@echo "=== ✅ Quick Smoke Test PASSED ==="
+
 # ──────────────────────────────────────────────────────────────────────────
 # Code-style + clippy gates — plain local cargo, exactly what CI runs.
 # `make fmt-check` / `make clippy` need a local Rust toolchain (see
@@ -709,3 +821,62 @@ help:
 	@echo "  - SMP模式会启动多个CPU核心，可用SMP_CPUS环境变量指定数量"
 	@echo "  - AFL++模糊测试需要先安装AFL++工具链"
 	@echo "  - 按Ctrl+C可以随时停止QEMU或AFL++"
+
+# ============================================================================
+# KCOV: Kernel Code Coverage for Fuzzing
+# ============================================================================
+
+# Build kernel with KCOV instrumentation enabled
+build-kcov:
+	@echo "=== 构建 Bootloader (UEFI) ==="
+	cd bootloader && \
+	bash -c "source ~/.cargo/env && CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr"
+
+	@echo "=== 构建 Kernel (Bare Metal) with KCOV ==="
+	cd kernel && \
+	bash -c "source ~/.cargo/env && CARGO_TARGET_DIR=../kernel-target \
+	RUSTFLAGS='-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort' \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,fuzz_runner"
+
+	@echo "=== 准备 EFI ESP 目录 ==="
+	mkdir -p esp-kcov/EFI/BOOT
+
+	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi esp-kcov/EFI/BOOT/BOOTX64.EFI
+
+	@echo "复制 Kernel 到 ESP/kernel.elf"
+	cp kernel-target/x86_64-unknown-none/release/kernel esp-kcov/kernel.elf
+
+	@echo "=== 内核信息 ==="
+	@readelf -h esp-kcov/kernel.elf | grep "Entry\|Type"
+	@echo "=== 构建完成（KCOV模式）==="
+	@echo ""
+	@echo "注意: KCOV instrumentation adds ~5-10% overhead"
+	@echo "查看串口输出中的 '[KCOV] Initialized N edge guards' 消息"
+
+# Build KCOV userspace test program
+userspace/kcov_test: userspace/kcov_test.c
+	@echo "=== Building KCOV test program ==="
+	clang -nostdlib -static -fno-stack-protector -O2 \
+		-o userspace/kcov_test userspace/kcov_test.c
+
+# Run kernel with KCOV in serial mode for automated testing
+run-kcov: build-kcov
+	@echo "=== 启动内核（KCOV模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	@echo "查找: [KCOV] Coverage infrastructure initialized"
+	$(QEMU) $(QEMU_COMMON) \
+		-drive format=raw,file=fat:rw:esp-kcov \
+		-nographic
+
+# Run KCOV test: build kernel+test, boot, look for test output
+test-kcov: build-kcov userspace/kcov_test
+	@echo "=== Running KCOV Integration Test ==="
+	@echo "Building test program and booting kernel..."
+	timeout 25 $(QEMU) $(QEMU_COMMON) \
+		-drive format=raw,file=fat:rw:esp-kcov \
+		-nographic -serial stdio || true
+	@echo ""
+	@echo "=== Test Complete ==="
+	@echo "Look for '[KCOV] Coverage infrastructure initialized' in output above"
+
