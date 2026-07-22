@@ -1,0 +1,12 @@
+# Fuzzer-specific build configuration
+# Override parent userspace config to build as normal Linux binaries
+
+[build]
+# Build for native Linux host, not bare metal
+target = "x86_64-unknown-linux-gnu"
+
+# No custom rustflags needed for hosted binaries
+[target.x86_64-unknown-linux-gnu]
+# Use system linker (no custom linker script)
+
+# No need for build-std - use pre-built std

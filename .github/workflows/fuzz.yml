@@ -102,7 +102,7 @@ jobs:
         run: |
           echo "Building continuous fuzzer binary..."
           cd userspace/fuzzer
-          cargo build --release --bin continuous-fuzzer
+          cargo build --release --bin continuous-fuzzer --target x86_64-unknown-linux-gnu
 
       - name: Run continuous fuzzer
         id: run_fuzzer
@@ -119,7 +119,7 @@ jobs:
 
           # Run fuzzer with timeout
           timeout ${duration_secs} \
-            userspace/fuzzer/target/release/continuous-fuzzer \
+            userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/continuous-fuzzer \
             --corpus-dir corpus-worker-${{ matrix.worker }} \
             --crash-dir crashes-worker-${{ matrix.worker }} \
             --dashboard-dir dashboard-worker-${{ matrix.worker }} \
@@ -365,14 +365,14 @@ jobs:
       - name: Build crash triage tool
         run: |
           cd userspace/fuzzer
-          cargo build --release --bin crash-triage
+          cargo build --release --bin crash-triage --target x86_64-unknown-linux-gnu
 
       - name: Run crash triage
         id: triage
         run: |
           echo "Running crash triage..."
 
-          userspace/fuzzer/target/release/crash-triage \
+          userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/crash-triage \
             --crash-dir all-crashes/ \
             --output-dir triaged-crashes/ \
             --dedup \
