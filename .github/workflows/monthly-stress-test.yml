@@ -1,0 +1,134 @@
+name: Monthly Stress Test
+
+on:
+  schedule:
+    # Run at 2:00 AM UTC on the last day of every month
+    - cron: '0 2 28-31 * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  check-last-day:
+    runs-on: ubuntu-latest
+    outputs:
+      is-last-day: ${{ steps.check.outputs.is-last-day }}
+    steps:
+      - name: Check if today is the last day of the month
+        id: check
+        run: |
+          TODAY=$(date +%d)
+          TOMORROW=$(date -d tomorrow +%d)
+          if [ "$TOMORROW" = "01" ]; then
+            echo "is-last-day=true" >> $GITHUB_OUTPUT
+          else
+            echo "is-last-day=false" >> $GITHUB_OUTPUT
+          fi
+
+  stress-test:
+    needs: check-last-day
+    if: needs.check-last-day.outputs.is-last-day == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src, llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+
+      - name: Build kernel
+        run: |
+          make build
+        env:
+          OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
+
+      - name: Run standard stress test (60s per scenario)
+        id: stress-standard
+        run: |
+          STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+        continue-on-error: true
+        env:
+          OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
+
+      - name: Run extended stress test (300s per scenario)
+        id: stress-extended
+        if: success()
+        run: |
+          STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+        continue-on-error: true
+        env:
+          OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
+
+      - name: Create stress test report
+        if: always()
+        run: |
+          cat > stress-report.md << 'EOF'
+          # Monthly Stress Test Report
+
+          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Commit:** ${{ github.sha }}
+          **Branch:** ${{ github.ref_name }}
+
+          ## Results
+
+          ### Standard Stress Test (60s per scenario)
+          Status: ${{ steps.stress-standard.outcome }}
+
+          ### Extended Stress Test (300s per scenario)
+          Status: ${{ steps.stress-extended.outcome }}
+
+          ## Summary
+
+          - ✅ Standard Test: ${{ steps.stress-standard.outcome == 'success' && 'PASS' || 'FAIL' }}
+          - ✅ Extended Test: ${{ steps.stress-extended.outcome == 'success' && 'PASS' || steps.stress-extended.outcome == 'skipped' && 'SKIPPED' || 'FAIL' }}
+
+          See workflow logs for detailed output.
+          EOF
+
+      - name: Upload stress test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-report-${{ github.run_number }}
+          path: stress-report.md
+          retention-days: 90
+
+      - name: Comment on commit (if failure)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const message = `## ⚠️ Monthly Stress Test Failed
+
+            The monthly stress test suite failed on the last day of the month.
+
+            - **Commit:** ${{ github.sha }}
+            - **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Please review the logs and address any stability issues.`;
+
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: message
+            });
+
+      - name: Fail workflow if tests failed
+        if: steps.stress-standard.outcome == 'failure' || steps.stress-extended.outcome == 'failure'
+        run: |
+          echo "Stress tests failed - see logs above"
+          exit 1

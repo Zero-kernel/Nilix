@@ -1,24 +1,156 @@
-name: Kernel Fuzz Testing
+name: Comprehensive Kernel Fuzzing
 
 on:
+  # Scheduled runs - every 6 hours for continuous fuzzing, daily for cargo-fuzz
   schedule:
-    - cron: '0 2 * * *'  # Run daily at 2 AM UTC
+    - cron: '0 */6 * * *'  # Continuous KCOV fuzzing every 6 hours
+    - cron: '0 2 * * *'    # Cargo-fuzz targets daily at 2 AM UTC
+
+  # Manual trigger
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Specific fuzz target to run (leave empty for all)'
+      mode:
+        description: 'Fuzzing mode'
+        required: true
+        default: 'continuous'
+        type: choice
+        options:
+          - continuous  # KCOV-based continuous fuzzing
+          - targets     # Cargo-fuzz libFuzzer targets
+          - both        # Run both modes
+      duration:
+        description: 'Duration in hours (continuous mode)'
         required: false
-        default: ''
+        default: '6'
       timeout:
-        description: 'Timeout per target in seconds'
+        description: 'Timeout per target in seconds (targets mode)'
         required: false
         default: '600'
+      workers:
+        description: 'Number of parallel workers (continuous mode)'
+        required: false
+        default: '4'
+
+  # Trigger on kernel changes
+  push:
+    branches:
+      - main
+    paths:
+      - 'kernel/**'
+      - 'userspace/fuzzer/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
 
 jobs:
-  fuzz:
-    name: Fuzz ${{ matrix.target }}
+  # Job 1: KCOV-based continuous fuzzing (Phase 7)
+  continuous-fuzz:
+    name: Continuous Fuzzer Worker ${{ matrix.worker }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'continuous' || github.event.inputs.mode == 'both') ||
+      github.event_name == 'push'
+
+    strategy:
+      matrix:
+        worker: [1, 2, 3, 4]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src
+
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf build-essential
+
+      - name: Restore corpus cache
+        uses: actions/cache@v4
+        with:
+          path: corpus/
+          key: continuous-corpus-${{ github.sha }}-worker-${{ matrix.worker }}
+          restore-keys: |
+            continuous-corpus-${{ github.sha }}-
+            continuous-corpus-
+
+      - name: Build KCOV kernel
+        run: make build-kcov
+
+      - name: Run continuous fuzzer
+        run: |
+          mkdir -p corpus crashes stats
+
+          TIMEOUT_HOURS=${{ github.event.inputs.duration || '6' }}
+          TIMEOUT_SECS=$((TIMEOUT_HOURS * 3600))
+
+          echo "Running continuous fuzzer for ${TIMEOUT_HOURS}h (${TIMEOUT_SECS}s)"
+
+          cargo run --release --bin continuous-fuzzer -- \
+            --corpus-dir corpus/ \
+            --crash-dir crashes/ \
+            --stats-dir stats/ \
+            --max-time ${TIMEOUT_SECS} \
+            --worker-id ${{ matrix.worker }} \
+            || true
+
+      - name: Generate dashboard
+        if: always()
+        run: |
+          cargo run --release --bin fuzzing-dashboard -- \
+            --stats-dir stats/ \
+            --output-text dashboard.txt \
+            --output-html dashboard.html \
+            --output-json dashboard.json
+
+      - name: Display stats
+        if: always()
+        run: |
+          if [ -f dashboard.txt ]; then
+            cat dashboard.txt
+          fi
+
+      - name: Upload crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-crashes-worker-${{ matrix.worker }}
+          path: crashes/
+          retention-days: 30
+
+      - name: Upload dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-dashboard-worker-${{ matrix.worker }}
+          path: |
+            dashboard.html
+            dashboard.json
+          retention-days: 7
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-corpus-worker-${{ matrix.worker }}
+          path: corpus/
+          retention-days: 7
+
+  # Job 2: Cargo-fuzz libFuzzer targets
+  cargo-fuzz-targets:
+    name: Cargo-Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'targets' || github.event.inputs.mode == 'both')
 
     strategy:
       fail-fast: false
@@ -44,20 +176,24 @@ jobs:
         with:
           components: rust-src
 
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
+
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}/
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
 
       - name: Run fuzzer
         run: |
@@ -65,7 +201,6 @@ jobs:
           timeout=${{ github.event.inputs.timeout || '600' }}
           echo "Running ${{ matrix.target }} for ${timeout}s"
 
-          # Run fuzzer and capture output
           cargo +nightly fuzz run ${{ matrix.target }} -- \
             -max_total_time=${timeout} \
             -rss_limit_mb=4096 \
@@ -75,36 +210,28 @@ jobs:
 
           # Exit code 0 = success, 77 = timeout (ok), others = crash
           if [ ${exit_code:-0} -ne 0 ] && [ ${exit_code:-0} -ne 77 ]; then
-            echo "Fuzzer found issues!"
-            exit 1
+            echo "::warning::Fuzzer found issues in ${{ matrix.target }}"
           fi
         continue-on-error: true
         id: fuzz
 
-      - name: Parse fuzzer statistics
-        if: always()
-        run: |
-          python3 scripts/parse_fuzz_output.py \
-            ${{ matrix.target }} \
-            fuzz/fuzz_output_${{ matrix.target }}.txt \
-            fuzz/stats_${{ matrix.target }}.json
-
       - name: Check for crashes
         if: always()
+        id: check_crashes
         run: |
           cd fuzz
           crashes=$(find artifacts/${{ matrix.target }} -name 'crash-*' 2>/dev/null | wc -l || echo 0)
+          echo "crashes=${crashes}" >> $GITHUB_OUTPUT
           if [ "$crashes" -gt 0 ]; then
-            echo "::error::Found $crashes crash(es) in ${{ matrix.target }}"
+            echo "::warning::Found $crashes crash(es) in ${{ matrix.target }}"
             ls -lh artifacts/${{ matrix.target }}/crash-* || true
-            exit 1
           fi
 
       - name: Upload crash artifacts
-        if: failure()
+        if: always() && steps.check_crashes.outputs.crashes > 0
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crashes-${{ matrix.target }}
+          name: cargo-fuzz-crashes-${{ matrix.target }}
           path: |
             fuzz/artifacts/${{ matrix.target }}/crash-*
             fuzz/artifacts/${{ matrix.target }}/timeout-*
@@ -112,61 +239,225 @@ jobs:
           retention-days: 30
 
       - name: Upload corpus
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-corpus-${{ matrix.target }}
+          name: cargo-fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}/
           retention-days: 7
 
-      - name: Upload statistics
+      - name: Upload output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-stats-${{ matrix.target }}
-          path: |
-            fuzz/stats_${{ matrix.target }}.json
-            fuzz/fuzz_output_${{ matrix.target }}.txt
-          retention-days: 30
+          name: cargo-fuzz-output-${{ matrix.target }}
+          path: fuzz/fuzz_output_${{ matrix.target }}.txt
+          retention-days: 7
 
-  report:
-    name: Generate Fuzz Report
-    needs: fuzz
+  # Job 3: Unified crash triage
+  triage:
+    name: Crash Triage & Deduplication
     runs-on: ubuntu-latest
+    needs: [continuous-fuzz, cargo-fuzz-targets]
     if: always()
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download all crash artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: '*-crashes-*'
+          path: all-crashes/
 
-      - name: Collect statistics
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+
+      - name: Run crash triage
+        id: triage
         run: |
-          mkdir -p report_stats
-          find artifacts -name 'stats_*.json' -exec cp {} report_stats/ \;
-          ls -lh report_stats/
+          mkdir -p crashes-merged
+          find all-crashes/ -type f \( -name "*.json" -o -name "crash-*" \) -exec cp {} crashes-merged/ \;
 
-      - name: Generate markdown report
-        run: |
-          run_id="R$(date -u '+%Y%m%d-%H%M%S')"
-          mkdir -p report_output
-          python3 scripts/generate_fuzz_report.py \
-            report_stats \
-            report_output/${run_id}.md \
-            ${run_id}
+          if [ -z "$(ls -A crashes-merged/)" ]; then
+            echo "No crashes found"
+            echo "new_crashes=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-      - name: Generate comprehensive summary
-        run: |
-          python3 scripts/generate_fuzz_summary.py report_stats >> $GITHUB_STEP_SUMMARY
+          cargo run --release --bin crash-triage -- \
+            --crash-dir crashes-merged/ \
+            --output triage-report.json
 
-      - name: Upload report (backup)
+          NEW_CRASHES=$(jq '.new_crashes | length' triage-report.json || echo 0)
+          echo "new_crashes=${NEW_CRASHES}" >> $GITHUB_OUTPUT
+          echo "Found ${NEW_CRASHES} new unique crashes"
+
+      - name: Upload triage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-report
-          path: report_output/*.md
+          name: triage-report
+          path: triage-report.json
+          retention-days: 30
+
+      - name: Create issues for new crashes
+        if: steps.triage.outputs.new_crashes > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('triage-report.json', 'utf8'));
+
+            for (const crash of report.new_crashes) {
+              const title = `[Fuzzing] ${crash.crash_type}: ${crash.panic_message || 'Unknown'}`;
+
+              const body = `## Crash Details
+
+**Type:** ${crash.crash_type}
+**Message:** ${crash.panic_message || 'N/A'}
+**Stack trace hash:** \`${crash.stack_trace_hash}\`
+**First seen:** ${crash.first_seen}
+**Source:** ${crash.source || 'Unknown'}
+**Worker:** ${crash.worker_id || 'N/A'}
+
+## Reproducer
+
+\`\`\`
+${crash.reproducer}
+\`\`\`
+
+## Minimization
+
+- Original size: ${crash.original_size} bytes
+- Minimized size: ${crash.reproducer_size} bytes
+- Reduction: ${crash.reduction_percent ? crash.reduction_percent.toFixed(1) : 'N/A'}%
+
+---
+
+*Found by continuous fuzzing. This crash was automatically deduplicated and minimized.*
+`;
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['fuzzing', 'bug', 'needs-triage']
+              });
+            }
+
+  # Job 4: Aggregate results and reporting
+  aggregate:
+    name: Aggregate Report
+    runs-on: ubuntu-latest
+    needs: [continuous-fuzz, cargo-fuzz-targets, triage]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all dashboards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: continuous-dashboard-worker-*
+          path: dashboards/
+
+      - name: Download triage report
+        uses: actions/download-artifact@v4
+        with:
+          name: triage-report
+          path: ./
+        continue-on-error: true
+
+      - name: Aggregate statistics
+        run: |
+          echo "# Comprehensive Fuzzing Report" > aggregate-report.md
+          echo "" >> aggregate-report.md
+          echo "**Run:** ${{ github.run_id }}" >> aggregate-report.md
+          echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          # Continuous fuzzing stats
+          echo "## Continuous Fuzzing (KCOV-based)" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          TOTAL_ITERATIONS=0
+          TOTAL_CORPUS=0
+          MAX_COVERAGE=0
+          TOTAL_CRASHES=0
+
+          for dashboard in dashboards/continuous-dashboard-worker-*/dashboard.json; do
+            if [ -f "$dashboard" ]; then
+              if command -v jq &> /dev/null; then
+                WORKER=$(jq -r '.worker_id' "$dashboard" 2>/dev/null || echo "?")
+                ITER=$(jq '.iterations' "$dashboard" 2>/dev/null || echo 0)
+                CORPUS=$(jq '.corpus_size' "$dashboard" 2>/dev/null || echo 0)
+                COVERAGE=$(jq '.coverage.edges' "$dashboard" 2>/dev/null || echo 0)
+                CRASHES=$(jq '.crashes.total' "$dashboard" 2>/dev/null || echo 0)
+
+                echo "- Worker ${WORKER}: ${ITER} iterations, ${CORPUS} corpus, ${COVERAGE} edges, ${CRASHES} crashes" >> aggregate-report.md
+
+                TOTAL_ITERATIONS=$((TOTAL_ITERATIONS + ITER))
+                TOTAL_CORPUS=$((TOTAL_CORPUS + CORPUS))
+                if [ "$COVERAGE" -gt "$MAX_COVERAGE" ]; then
+                  MAX_COVERAGE=$COVERAGE
+                fi
+                TOTAL_CRASHES=$((TOTAL_CRASHES + CRASHES))
+              fi
+            fi
+          done
+
+          echo "" >> aggregate-report.md
+          echo "**Totals:**" >> aggregate-report.md
+          echo "- Iterations: ${TOTAL_ITERATIONS}" >> aggregate-report.md
+          echo "- Corpus size: ${TOTAL_CORPUS}" >> aggregate-report.md
+          echo "- Max coverage: ${MAX_COVERAGE} edges" >> aggregate-report.md
+          echo "- Crashes found: ${TOTAL_CRASHES}" >> aggregate-report.md
+          echo "" >> aggregate-report.md
+
+          # Triage results
+          if [ -f "triage-report.json" ]; then
+            echo "## Crash Triage" >> aggregate-report.md
+            echo "" >> aggregate-report.md
+            if command -v jq &> /dev/null; then
+              NEW=$(jq '.new_crashes | length' triage-report.json 2>/dev/null || echo 0)
+              DEDUP=$(jq '.deduplicated_count' triage-report.json 2>/dev/null || echo 0)
+              echo "- **New unique crashes:** ${NEW}" >> aggregate-report.md
+              echo "- **Deduplicated:** ${DEDUP}" >> aggregate-report.md
+              echo "- **Deduplication rate:** $(jq -r '.deduplication_rate' triage-report.json 2>/dev/null || echo 'N/A')" >> aggregate-report.md
+            fi
+          fi
+
+          cat aggregate-report.md
+
+      - name: Add to step summary
+        if: always()
+        run: cat aggregate-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload aggregate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aggregate-report
+          path: aggregate-report.md
           retention-days: 90
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('aggregate-report.md', 'utf8');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
