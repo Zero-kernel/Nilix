@@ -418,15 +418,22 @@ impl SecurityTest for SpectreV1BoundsCheckTest {
 
         // Simulate accessing an array with bounds check
         let test_array = [1u8, 2, 3, 4, 5];
-        let index = 10usize; // Out of bounds
+        let safe_index = 2usize; // Valid index
+        let unsafe_index = 10usize; // Out of bounds
 
-        // This should NOT panic - we're checking the bounds
-        if index < test_array.len() {
-            let _value = test_array[index];
+        // This should work - within bounds
+        if safe_index < test_array.len() {
+            let _value = test_array[safe_index];
+        } else {
+            return TestResult::Fail("Bounds check failed for valid index");
+        }
+
+        // This should be prevented by bounds check
+        if unsafe_index < test_array.len() {
             return TestResult::Fail("Bounds check not enforced");
         }
 
-        // The bounds check prevented speculative execution
+        // The bounds check prevented out-of-bounds access
         TestResult::Pass
     }
 }
@@ -488,7 +495,7 @@ impl SecurityTest for SmapEnforcementTest {
                 // CR4.SMAP should be set (bit 21)
                 let cr4: u64;
                 unsafe {
-                    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+                    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
                 }
 
                 let smap_bit = 1u64 << 21;
@@ -527,7 +534,7 @@ impl SecurityTest for SmepEnforcementTest {
                 // CR4.SMEP should be set (bit 20)
                 let cr4: u64;
                 unsafe {
-                    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+                    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
                 }
 
                 let smep_bit = 1u64 << 20;

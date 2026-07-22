@@ -25,3 +25,4 @@ mm = { path = "../mm" }
 drivers = { path = "../drivers" }
 klog = { path = "../klog" }
 cpu_local = { path = "../cpu_local" }
+raw-cpuid = "11.0"
