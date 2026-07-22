@@ -3,8 +3,8 @@ name: Comprehensive Kernel Fuzzing
 on:
   # Scheduled runs
   schedule:
-    - cron: '0 */6 * * *'  # Continuous KCOV fuzzing every 6 hours
-    - cron: '0 2 * * *'    # Cargo-fuzz targets daily at 2 AM UTC
+    - cron: '0 2 * * 0'    # Weekly comprehensive fuzzing (Sunday 2 AM UTC, 1 hour)
+    - cron: '0 2 * * *'    # Daily cargo-fuzz targets (2 AM UTC, 10 minutes)
 
   # Manual trigger
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
         required: false
         default: '4'
 
-  # Trigger on kernel/fuzzer changes
+  # Quick fuzzing on push (5 minutes)
   push:
     branches:
       - main
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 400  # 6h + overhead
     if: |
-      github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *' ||
+      github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'continuous' || github.event.inputs.mode == 'both') ||
       github.event_name == 'push'
 
@@ -107,11 +107,21 @@ jobs:
       - name: Run continuous fuzzer
         id: run_fuzzer
         run: |
-          duration_hours=${{ github.event.inputs.duration || '6' }}
-          duration_secs=$((duration_hours * 3600))
+          # Determine duration based on trigger
+          if [ "${{ github.event_name }}" == "push" ]; then
+            duration_hours=0.083  # 5 minutes (300 seconds)
+            duration_secs=300
+          elif [ "${{ github.event_name }}" == "schedule" ] && [ "${{ github.event.schedule }}" == "0 2 * * 0" ]; then
+            duration_hours=1  # 1 hour for weekly run
+            duration_secs=3600
+          else
+            duration_hours=${{ github.event.inputs.duration || '6' }}
+            duration_secs=$((duration_hours * 3600))
+          fi
 
           echo "Running continuous fuzzer for ${duration_hours}h (${duration_secs}s)"
           echo "Worker: ${{ matrix.worker }}"
+          echo "Trigger: ${{ github.event_name }}"
 
           mkdir -p corpus-worker-${{ matrix.worker }}
           mkdir -p crashes-worker-${{ matrix.worker }}
@@ -125,7 +135,7 @@ jobs:
             --dashboard-dir dashboard-worker-${{ matrix.worker }} \
             --worker-id ${{ matrix.worker }} \
             --max-time ${duration_secs} \
-            --report-interval 300 \
+            --report-interval 60 \
             2>&1 | tee fuzzer-worker-${{ matrix.worker }}.log \
             || exit_code=$?
 
