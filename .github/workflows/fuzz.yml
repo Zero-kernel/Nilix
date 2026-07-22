@@ -313,33 +313,36 @@ jobs:
             const report = JSON.parse(fs.readFileSync('triage-report.json', 'utf8'));
 
             for (const crash of report.new_crashes) {
-              const title = `[Fuzzing] ${crash.crash_type}: ${crash.panic_message || 'Unknown'}`;
+              const title = '[Fuzzing] ' + crash.crash_type + ': ' + (crash.panic_message || 'Unknown');
 
-              const body = `## Crash Details
+              const bodyParts = [
+                '## Crash Details',
+                '',
+                '**Type:** ' + crash.crash_type,
+                '**Message:** ' + (crash.panic_message || 'N/A'),
+                '**Stack trace hash:** `' + crash.stack_trace_hash + '`',
+                '**First seen:** ' + crash.first_seen,
+                '**Source:** ' + (crash.source || 'Unknown'),
+                '**Worker:** ' + (crash.worker_id || 'N/A'),
+                '',
+                '## Reproducer',
+                '',
+                '```',
+                crash.reproducer,
+                '```',
+                '',
+                '## Minimization',
+                '',
+                '- Original size: ' + crash.original_size + ' bytes',
+                '- Minimized size: ' + crash.reproducer_size + ' bytes',
+                '- Reduction: ' + (crash.reduction_percent ? crash.reduction_percent.toFixed(1) : 'N/A') + '%',
+                '',
+                '---',
+                '',
+                '*Found by continuous fuzzing. This crash was automatically deduplicated and minimized.*'
+              ];
 
-**Type:** ${crash.crash_type}
-**Message:** ${crash.panic_message || 'N/A'}
-**Stack trace hash:** \`${crash.stack_trace_hash}\`
-**First seen:** ${crash.first_seen}
-**Source:** ${crash.source || 'Unknown'}
-**Worker:** ${crash.worker_id || 'N/A'}
-
-## Reproducer
-
-\`\`\`
-${crash.reproducer}
-\`\`\`
-
-## Minimization
-
-- Original size: ${crash.original_size} bytes
-- Minimized size: ${crash.reproducer_size} bytes
-- Reduction: ${crash.reduction_percent ? crash.reduction_percent.toFixed(1) : 'N/A'}%
-
----
-
-*Found by continuous fuzzing. This crash was automatically deduplicated and minimized.*
-`;
+              const body = bodyParts.join('\n');
 
               await github.rest.issues.create({
                 owner: context.repo.owner,
