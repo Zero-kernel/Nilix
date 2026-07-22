@@ -1,0 +1,9 @@
+[package]
+name = "fuzz_executor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "signal"] }
+anyhow = "1.0"
