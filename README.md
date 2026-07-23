@@ -37,11 +37,15 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate is currently **BLOCKED** (zero-HIGH streak candidate 1/3)
-after the R181 audit. See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate achieved **UNBLOCKED** status with zero-HIGH streak 3/3
+complete (R181 + R182 + R183) on 2026-07-22. See [Section 6](#6-security-audit-status).
 
-**Recent Additions (2026-07-21):** Production-ready fuzzing infrastructure with KCOV coverage tracking,
-coverage-guided mutation, resource-aware stateful fuzzing, and continuous CI integration. See [Section 5.5](#55-fuzzing-infrastructure).
+**Recent Additions:**
+- **2026-07-23:** U.S2 SLICE-3B capability infrastructure — FileOps trait with cap_id/set_cap_id methods, 
+  interior mutability via spin::once::Once, regular file capability allocation in syscall layer, and 
+  credential generation TOCTOU defense during VFS open.
+- **2026-07-21:** Production-ready fuzzing infrastructure with KCOV coverage tracking,
+  coverage-guided mutation, resource-aware stateful fuzzing, and continuous CI integration. See [Section 5.5](#55-fuzzing-infrastructure).
 
 | Subsystem | Status | Highlights |
 |-----------|--------|-----------|
@@ -154,8 +158,8 @@ Nilix/
 
 - **Capabilities** — non-forgeable `CapId` (generation + index), `CapRights` bitflags, a per-process
   `CapTable`, and capability syscalls (allocate / revoke / delegate) gated by LSM + audited.
-  *(fd-table → capability integration is still in progress; file-descriptor access remains
-  ambient for now.)*
+  Regular files allocate capabilities at open time with rights derived from open flags; pipes
+  carry pre-allocated capabilities. *(Full fd-table → capability integration ongoing under Phase U.)*
 - **LSM** — a pluggable `LsmPolicy` trait with 40+ hook points across syscalls, task lifecycle,
   VFS, memory, IPC, signals, network, and livepatch; the Secure profile enforces the
   `SecureBaselinePolicy` (W^X on mmap/mprotect, kpatch default-deny), while Balanced/Performance
@@ -404,18 +408,18 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **181** |
+| Audit rounds | **183** (R181–R183 completed 2026-07-22) |
 | Cumulative findings | ~1,261 |
 | Findings fixed/resolved | ~1,159 |
-| Latest round | R181 (`docs/review/audits/qa-2026-07-20.md`) |
-| 1.0-Preview release gate | **BLOCKED** — zero-HIGH streak 1/3 |
+| Latest round | R183 (`docs/review/audits/qa-2026-07-22-v2.md`) |
+| 1.0-Preview release gate | **UNBLOCKED** — zero-HIGH streak 3/3 COMPLETE |
 
-The most recent round (**R181**) was the first full-codebase audit after the S2-wave hardening
-and D2-SEC LSM integration. It found **0 CRITICAL / 0 HIGH / 5 MEDIUM+LOW** actionable findings
-across 10/10 subsystem coverage; all five were fixed and converged the same day (2026-07-20),
-qualifying R181 as zero-HIGH streak candidate 1/3. The 1.0-Preview gate requires three consecutive
-zero-HIGH rounds. Per-round reports live in `docs/review/`, and the live plan is
-`docs/review/nextplan/`.
+The most recent round (**R183**) was a cumulative evidence verification audit on the immutable 
+tree (HEAD d4190e3) after R181's comprehensive full-codebase audit and R182's targeted verification. 
+It found **0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW** across systematic spot-checks, qualifying 
+as zero-HIGH streak 3/3. The three consecutive zero-HIGH rounds (R181 comprehensive + R182 targeted 
++ R183 cumulative) on the same immutable tree unblocked the 1.0-Preview gate. Per-round reports 
+live in `docs/review/`, and the live plan is `docs/review/nextplan/`.
 
 ---
 
@@ -437,8 +441,10 @@ zero-HIGH rounds. Per-round reports live in `docs/review/`, and the live plan is
   de-privileged Linux-compatible personality. Milestone **M0** builds the user-mode foundation
   (auxv, signal delivery, missing syscalls, exec disambiguation, user-stack guards) on the
   existing Linux cABI, proven by the static-musl conformance gate, before the native/personality
-  fork is committed.
-- IOMMU DMAR table-discovery wiring; full demand-grown user stacks; capability-backed fd tables.
+  fork is committed. **U.S2 SLICE-3B complete (2026-07-23):** FileOps trait capability 
+  infrastructure with cap_id/set_cap_id methods, interior mutability via spin::once::Once, 
+  and regular file capability allocation at open time.
+- IOMMU DMAR table-discovery wiring; full demand-grown user stacks.
 
 **Future**
 
