@@ -330,6 +330,10 @@ impl Inode for ProcRootInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -425,6 +429,10 @@ impl Inode for ProcSelfSymlink {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
@@ -554,6 +562,10 @@ impl Inode for ProcPidDirInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -623,6 +635,10 @@ impl Inode for ProcPidStatusInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -686,6 +702,10 @@ impl Inode for ProcPidCmdlineInode {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
@@ -753,6 +773,10 @@ impl Inode for ProcPidStatInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -816,6 +840,10 @@ impl Inode for ProcPidMapsInode {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
@@ -916,6 +944,10 @@ impl Inode for ProcPidFdDirInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -982,6 +1014,10 @@ impl Inode for ProcPidFdSymlink {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -1035,6 +1071,10 @@ impl Inode for ProcMeminfoInode {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
@@ -1092,6 +1132,10 @@ impl Inode for ProcCpuinfoInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -1147,6 +1191,10 @@ impl Inode for ProcUptimeInode {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 // ============================================================================
@@ -1200,6 +1248,10 @@ impl Inode for ProcVersionInode {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
