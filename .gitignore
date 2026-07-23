@@ -6,6 +6,7 @@
 /.r180-*
 userspace/target/
 userspace-target/
+userspace/fuzzer/target/
 Cargo.lock
 
 

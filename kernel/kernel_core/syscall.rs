@@ -10250,7 +10250,8 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
 
     // Reserve both the numeric slot and files.max credit BEFORE VFS may create
     // or truncate an inode. The guard rolls back on every `?` below.
-    let fd_reservation = FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
+    let fd_reservation =
+        FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
 
     // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
     // RUNG 2: VFS failure auto-rollback via Drop (fd_reservation + PreparedFileHandle)
@@ -10296,10 +10297,7 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
 
                 // Allocate the capability via cap_table.allocate()
                 let cap_entry = cap::CapEntry::with_flags(
-                    cap::CapObject::RegularFile(cap::RegularFile {
-                        inode_id,
-                        fs_id,
-                    }),
+                    cap::CapObject::RegularFile(cap::RegularFile { inode_id, fs_id }),
                     rights,
                     cap_flags,
                 );
@@ -16417,7 +16415,8 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
 
     // R180-23: admit FD slot + files.max before resolve/open can create or
     // truncate. The reservation remains invisible to guessed FD lookups.
-    let fd_reservation = FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
+    let fd_reservation =
+        FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
 
     // Call VFS with resolve flags — VFS enforces LSM hooks
     let mut file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;

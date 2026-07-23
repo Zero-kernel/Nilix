@@ -2919,11 +2919,7 @@ impl Process {
 
         // Construct the plain-data RegularFile identity (NO Arc allocation)
         let reg_file = cap::RegularFile { inode_id, fs_id };
-        let entry = cap::CapEntry::with_flags(
-            cap::CapObject::RegularFile(reg_file),
-            rights,
-            flags,
-        );
+        let entry = cap::CapEntry::with_flags(cap::CapObject::RegularFile(reg_file), rights, flags);
 
         // Install into the reserved slot (allocation-free, infallible given
         // the PreparedCapAllocation token)
