@@ -387,6 +387,10 @@ impl crate::process::FileOps for SocketFile {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+
     fn type_name(&self) -> &'static str {
         "SocketFile"
     }
@@ -1442,6 +1446,9 @@ pub fn run_fileops_cap_id_self_test() {
             crate::process::FileDescriptor::try_new(NoCapFile, mm::HeapClass::CoreProcess)
         }
         fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
             self
         }
         fn type_name(&self) -> &'static str {
@@ -10231,6 +10238,10 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     //   2. Risk of policy desync if one layer is bypassed.
     let open_flags = flags as u32;
 
+    // U.S2-SLICE-3B: Snapshot credential generation BEFORE VFS work to detect
+    // TOCTOU changes (setuid/setgid/setgroups during open).
+    let cred_gen_before = process.lock().cred_generation();
+
     // 获取 VFS 回调
     let open_fn = {
         let callback = VFS_OPEN_CALLBACK.lock();
@@ -10239,16 +10250,90 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
 
     // Reserve both the numeric slot and files.max credit BEFORE VFS may create
     // or truncate an inode. The guard rolls back on every `?` below.
-    let fd_reservation = FdPublicationReservation::try_new(process, open_flags & 0x80000 != 0)?;
+    let fd_reservation = FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
 
     // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
-    let file_ops = open_fn(&path_str, flags as u32, mode)?;
+    // RUNG 2: VFS failure auto-rollback via Drop (fd_reservation + PreparedFileHandle)
+    let mut file_ops = open_fn(&path_str, flags as u32, mode)?;
 
-    // R39-4 FIX: O_CLOEXEC 常量定义
-    let fd = fd_reservation.install(file_ops).map_err(|rejected| {
-        drop(rejected);
-        SyscallError::EMFILE
-    })?;
+    // U.S2-SLICE-3B: Allocate CapId for regular files under SINGLE Process lock
+    let fd = {
+        let mut proc = process.lock();
+
+        // RUNG 3a: Credential TOCTOU defense
+        if proc.cred_generation() != cred_gen_before {
+            drop(proc);
+            drop(file_ops); // FileHandle Drop outside lock (R170-6)
+            return Err(SyscallError::EAGAIN); // Benign retry signal
+        }
+
+        // RUNG 3b: Cap allocation for regular files only
+        // Use FileOps::stat() to check if this is a regular file (avoids VFS module dependency)
+        const S_IFREG: u32 = 0o100000; // Regular file type
+        if let Ok(stat) = file_ops.stat() {
+            if (stat.mode & S_IFMT) == S_IFREG {
+                // This is a regular file - allocate a capability
+                // (pipes, sockets, devices have their own cap allocation paths)
+                let inode_id = stat.ino;
+                let fs_id = stat.dev;
+
+                // Derive cap rights from open flags
+                let mut rights = cap::CapRights::empty();
+                let acc_mode = open_flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+                if acc_mode == 0 || acc_mode == 2 {
+                    rights |= cap::CapRights::READ;
+                }
+                if acc_mode == 1 || acc_mode == 2 {
+                    rights |= cap::CapRights::WRITE;
+                }
+
+                // Derive cap flags from open flags
+                let mut cap_flags = cap::CapFlags::empty();
+                if open_flags & 0x80000 != 0 {
+                    // O_CLOEXEC
+                    cap_flags |= cap::CapFlags::CLOEXEC;
+                }
+
+                // Allocate the capability via cap_table.allocate()
+                let cap_entry = cap::CapEntry::with_flags(
+                    cap::CapObject::RegularFile(cap::RegularFile {
+                        inode_id,
+                        fs_id,
+                    }),
+                    rights,
+                    cap_flags,
+                );
+
+                let cap_id = match proc.cap_table.allocate(cap_entry) {
+                    Ok(cid) => cid,
+                    Err(_e) => {
+                        drop(proc); // Unlock BEFORE Drop
+                        drop(file_ops); // FileHandle Drop outside lock (R170-6)
+                        return Err(SyscallError::EMFILE); // TableFull maps to EMFILE
+                    }
+                };
+
+                // RUNG 4: Attach cap_id to FileHandle via FileOps::set_cap_id()
+                // This calls through the trait, so VFS FileHandle can implement it
+                // without kernel_core needing to import vfs module (avoids circular dependency)
+                file_ops.set_cap_id(cap_id);
+            }
+        }
+
+        // Install the fd (infallible by FdPublicationReservation contract)
+        let fd = match fd_reservation.install(file_ops) {
+            Ok(fd) => fd,
+            Err(rejected) => {
+                // Defense-in-depth: UNREACHABLE by contract, but handle gracefully
+                drop(proc);
+                drop(rejected);
+                return Err(SyscallError::EMFILE);
+            }
+        };
+
+        drop(proc); // Unlock
+        fd
+    };
 
     Ok(fd as usize)
 }
@@ -16332,10 +16417,56 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
 
     // R180-23: admit FD slot + files.max before resolve/open can create or
     // truncate. The reservation remains invisible to guessed FD lookups.
-    let fd_reservation = FdPublicationReservation::try_new(process, open_flags & 0x80000 != 0)?;
+    let fd_reservation = FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
 
     // Call VFS with resolve flags — VFS enforces LSM hooks
-    let file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
+    let mut file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
+
+    // U.S2 SLICE-3B: Allocate CapId for regular files (same as sys_open_internal)
+    // This happens AFTER VFS returns but BEFORE fd install, under Process lock
+    const S_IFREG: u32 = 0o100000; // Regular file type
+    if let Ok(stat) = file_ops.stat() {
+        if (stat.mode & S_IFMT) == S_IFREG {
+            // Allocate capability for regular file
+            let cap_entry = cap::CapEntry::with_flags(
+                cap::CapObject::RegularFile(cap::RegularFile {
+                    inode_id: stat.ino,
+                    fs_id: stat.dev,
+                }),
+                {
+                    let mut rights = cap::CapRights::empty();
+                    let acc_mode = open_flags & 0x3;
+                    if acc_mode == 0 || acc_mode == 2 {
+                        rights |= cap::CapRights::READ;
+                    }
+                    if acc_mode == 1 || acc_mode == 2 {
+                        rights |= cap::CapRights::WRITE;
+                    }
+                    rights
+                },
+                {
+                    let mut cap_flags = cap::CapFlags::empty();
+                    if open_flags & 0x80000 != 0 {
+                        cap_flags |= cap::CapFlags::CLOEXEC;
+                    }
+                    cap_flags
+                },
+            );
+
+            let proc_guard = process.lock();
+            match proc_guard.cap_table.allocate(cap_entry) {
+                Ok(cap_id) => {
+                    drop(proc_guard);
+                    file_ops.set_cap_id(cap_id);
+                }
+                Err(_) => {
+                    drop(proc_guard);
+                    drop(file_ops); // FileHandle Drop outside lock
+                    return Err(SyscallError::EMFILE);
+                }
+            }
+        }
+    }
 
     // O_CLOEXEC flag
     let fd = fd_reservation.install(file_ops).map_err(|rejected| {

@@ -397,6 +397,9 @@ pub trait FileOps: Send + Sync {
     /// 获取 Any 引用用于向下转型
     fn as_any(&self) -> &dyn Any;
 
+    /// 获取 Any 可变引用用于向下转型（U.S2 SLICE-3B: set_cap_id after VFS returns）
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     /// 获取类型名称（用于调试）
     fn type_name(&self) -> &'static str;
 
@@ -439,6 +442,26 @@ pub trait FileOps: Send + Sync {
     /// ("fd closed during I/O"), never panic.
     fn cap_id(&self) -> Option<cap::CapId> {
         None
+    }
+
+    /// U.S2 SLICE-3B: Set the CapId for this file descriptor.
+    ///
+    /// Called by syscall layer after allocating a capability but before installing
+    /// the fd. Only implemented by cap-bearing types (FileHandle for regular files,
+    /// PipeHandle for pipes, SocketFile for sockets). The default no-op is for
+    /// non-cap-bearing types (namespace fds, special files).
+    ///
+    /// # Contract
+    ///
+    /// - Must be called exactly once per fd, immediately after cap allocation
+    /// - Must store the cap_id so that subsequent cap_id() calls return Some(id)
+    /// - Must use interior mutability (OnceCell or similar) since this is &self
+    /// - Must panic if called twice (OnceCell::set returns Err on second call)
+    ///
+    /// The default no-op silently ignores the cap_id, which is correct for types
+    /// that don't carry capabilities (they never call this method).
+    fn set_cap_id(&self, _id: cap::CapId) {
+        // Default: no-op for non-cap-bearing types
     }
 
     /// R41-1 FIX: 获取文件状态信息（用于 fstat）
@@ -564,6 +587,13 @@ impl core::ops::Deref for FileDescriptor {
     #[inline]
     fn deref(&self) -> &Self::Target {
         self.ops.as_ref()
+    }
+}
+
+impl core::ops::DerefMut for FileDescriptor {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ops.as_mut()
     }
 }
 
@@ -1872,6 +1902,23 @@ pub struct Process {
     /// 普通 fork 会 clone 凭证到新的 Arc。
     pub credentials: Arc<RwLock<Credentials>>,
 
+    /// U.S2 SLICE-3B: Credential generation counter for LSM TOCTOU defense.
+    ///
+    /// Incremented atomically whenever credentials are mutated (setuid/setgid/
+    /// setresuid/setresgid/setgroups/setfsuid/setfsgid/capset/exec credential
+    /// reset). VFS open operations capture this generation at ladder entry and
+    /// validate it at cap allocation (inside the LSM hook's credential read) to
+    /// detect credential changes during the lock-free VFS path traversal, closing
+    /// the TOCTOU window where a racing credential mutation could grant authority
+    /// to a capability that was authorized under stale credentials.
+    ///
+    /// Born at 0; incremented via `fetch_add(1, AcqRel)` at every credential
+    /// mutation site (the Release ensures the credential write is visible before
+    /// the generation bump; the Acquire on read ensures the generation check
+    /// happens before the credential read). A generation mismatch triggers EAGAIN
+    /// retry (syscall layer re-enters with fresh credentials + generation).
+    pub cred_generation: AtomicU64,
+
     /// 文件创建掩码 (umask)
     /// 新建文件的权限 = mode & !umask
     pub umask: u16,
@@ -2414,6 +2461,8 @@ impl Process {
             // to root explicitly by create_process(), and fork()/clone() inherit
             // credentials from the parent process via independent clone.
             credentials,
+            // U.S2 SLICE-3B: Credential generation starts at 0 (born-clean).
+            cred_generation: AtomicU64::new(0),
             umask: 0o022,
             // OOM killer 支持 - 默认中立设置
             nice: 0,
@@ -2816,6 +2865,71 @@ impl Process {
                 let _ = self.cap_table.revoke(cap_id);
             }
         }
+    }
+
+    /// U.S2-SLICE-3B FIX: Allocate a CapId for a regular file, following the
+    /// SLICE-3A pipe pattern (prepare → install).
+    ///
+    /// This method performs the TWO-PHASE allocation mandated by the SLICE-3A
+    /// design:
+    /// 1. **Prepare**: Reserve cap-table slot BEFORE touching Process lock
+    /// 2. **Install**: Publish the CapId while holding Process lock, then
+    ///    immediately call `file_handle.set_cap_id(cap_id)` to link it
+    ///
+    /// # Arguments
+    /// * `inode_id` - Inode number within the owning filesystem
+    /// * `fs_id` - Filesystem identifier for cross-mount disambiguation
+    /// * `rights` - Capability rights (typically READ | WRITE based on open flags)
+    /// * `flags` - Capability flags (e.g., CLOEXEC if O_CLOEXEC was set)
+    ///
+    /// # Returns
+    /// * `Ok(CapId)` - Successfully allocated capability
+    /// * `Err(CapError::TableFull)` - Cap table exhausted (maps to EMFILE at syscall)
+    /// * `Err(CapError::OutOfMemory)` - Heap exhausted during preparation
+    ///
+    /// # Lock Context
+    /// Caller MUST hold the Process lock. The cap_table's inner spinlock is a
+    /// LEAF (without_interrupts + no re-entrant callbacks), so this is safe.
+    ///
+    /// # Safety Invariant
+    /// The caller MUST immediately call `file_handle.set_cap_id(cap_id)` after
+    /// this returns Ok. Failure to do so creates an orphaned CapId that will
+    /// never be decremented, violating the refcount invariant (SLICE-3A design
+    /// defect #1: funnel-unreachable-orphan leak).
+    pub fn allocate_file_cap(
+        &self,
+        inode_id: u64,
+        fs_id: u64,
+        rights: cap::CapRights,
+        flags: cap::CapFlags,
+    ) -> Result<cap::CapId, cap::CapError> {
+        // SLICE-3A TWO-PHASE: Prepare cap allocation OUTSIDE any Process lock
+        // (this was already done by the caller before acquiring the lock in the
+        // canonical install flow, but we re-prepare here for non-install paths
+        // like dup/fork that may call this under lock).
+        //
+        // NOTE: This method is called UNDER Process lock in the canonical flow
+        // (FdPublicationReservation::install → allocate_file_cap), so the
+        // prepare_allocation() here happens while holding the lock. This is
+        // SAFE because CapTable::prepare_allocation() only acquires its own
+        // inner spinlock (LEAF, no re-entrant callbacks). The TWO-PHASE
+        // separation happens at the SYSCALL layer (PreparedFileHandle allocated
+        // before FdPublicationReservation), not at this helper's call site.
+        let prepared = self.cap_table.prepare_allocation()?;
+
+        // Construct the plain-data RegularFile identity (NO Arc allocation)
+        let reg_file = cap::RegularFile { inode_id, fs_id };
+        let entry = cap::CapEntry::with_flags(
+            cap::CapObject::RegularFile(reg_file),
+            rights,
+            flags,
+        );
+
+        // Install into the reserved slot (allocation-free, infallible given
+        // the PreparedCapAllocation token)
+        let cap_id = prepared.install(entry);
+
+        Ok(cap_id)
     }
 
     /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
@@ -3316,6 +3430,22 @@ impl Process {
     pub fn restore_static_priority(&mut self) {
         self.base_dynamic_priority = self.priority;
         self.recompute_effective_priority();
+    }
+
+    /// U.S2-3B FIX: Read current credential generation counter for LSM TOCTOU
+    /// defense. Incremented on every credential mutation (setuid/setgid/setgroups).
+    #[inline]
+    pub fn cred_generation(&self) -> u64 {
+        self.cred_generation.load(Ordering::Acquire)
+    }
+
+    /// U.S2-3B FIX: Increment credential generation counter after any credential
+    /// mutation. Called by setuid/setgid/setgroups syscalls and exec credential
+    /// transitions.
+    #[inline]
+    pub fn bump_cred_generation(&self) {
+        // lint-fetch-add: allow - generation counter, wrapping is safe
+        self.cred_generation.fetch_add(1, Ordering::Release);
     }
 }
 

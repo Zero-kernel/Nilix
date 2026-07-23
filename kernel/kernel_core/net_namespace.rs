@@ -587,6 +587,10 @@ impl FileOps for NetNamespaceFd {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn type_name(&self) -> &'static str {
         "net_namespace_fd"
     }

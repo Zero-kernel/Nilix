@@ -868,6 +868,10 @@ impl FileOps for UserNamespaceFd {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn type_name(&self) -> &'static str {
         "user_namespace_fd"
     }

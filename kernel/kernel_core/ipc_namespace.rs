@@ -398,6 +398,20 @@ impl FileOps for IpcNamespaceFd {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    /// U.S2-SLICE-3B: IPC namespace fds are NOT cap-bearing (default None is correct).
+    fn cap_id(&self) -> Option<cap::CapId> {
+        None
+    }
+
+    /// U.S2-SLICE-3B: IPC namespace fds are NOT cap-bearing (no-op is correct).
+    fn set_cap_id(&self, _id: cap::CapId) {
+        // No-op: namespace fds don't carry capabilities
+    }
+
     fn type_name(&self) -> &'static str {
         "ipc_namespace_fd"
     }

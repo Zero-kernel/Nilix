@@ -882,7 +882,10 @@ pub struct PipeHandle {
     /// `duplicate()`/`clone_box()` copy — dup/fork/CLONE_THREAD copies share
     /// the SAME CapId, and the per-fd refcount bump happens at each INSTALL
     /// site (U.S3-A3), never inside the clone itself (U.S3-A2 purity).
-    cap_id: Option<cap::CapId>,
+    ///
+    /// U.S2 SLICE-3B: Interior mutability via spin::once::Once to match FileOps
+    /// trait contract (&self for set_cap_id).
+    cap_id: spin::once::Once<cap::CapId>,
 }
 
 impl PipeHandle {
@@ -892,7 +895,7 @@ impl PipeHandle {
             pipe,
             end_type: PipeEndType::Read,
             flags,
-            cap_id: None,
+            cap_id: spin::once::Once::new(),
         }
     }
 
@@ -902,7 +905,7 @@ impl PipeHandle {
             pipe,
             end_type: PipeEndType::Write,
             flags,
-            cap_id: None,
+            cap_id: spin::once::Once::new(),
         }
     }
 
@@ -913,8 +916,11 @@ impl PipeHandle {
     /// (CRITICAL-6 ordering). Idempotence is not needed — each handle is set
     /// exactly once on the create path; test fixtures may also set it to pin
     /// the accessor contract.
-    pub fn set_cap_id(&mut self, cap_id: cap::CapId) {
-        self.cap_id = Some(cap_id);
+    ///
+    /// U.S2 SLICE-3B: Uses spin::once::Once for interior mutability to match
+    /// FileOps trait contract (&self). Panics on duplicate calls (Once guard).
+    pub(crate) fn set_cap_id(&self, cap_id: cap::CapId) {
+        self.cap_id.call_once(|| cap_id);
     }
 
     /// 获取端类型
@@ -980,6 +986,8 @@ impl PipeHandle {
     /// count here (transient I/O clones included), while the cap refcount is
     /// bumped only at fd INSTALL sites (dup/F_DUPFD/CLONE_THREAD — U.S3-A3)
     /// and never inside the clone itself (U.S3-A2 purity).
+    ///
+    /// U.S2 SLICE-3B: Once::poll() + call_once to copy the cap_id if set.
     pub fn duplicate(&self) -> Self {
         // 增加相应端的引用计数
         match self.end_type {
@@ -987,11 +995,16 @@ impl PipeHandle {
             PipeEndType::Write => self.pipe.add_writer(),
         }
 
+        let new_cap_id = spin::once::Once::new();
+        if let Some(id) = self.cap_id.poll().copied() {
+            new_cap_id.call_once(|| id);
+        }
+
         PipeHandle {
             pipe: self.pipe.clone(),
             end_type: self.end_type,
             flags: self.flags,
-            cap_id: self.cap_id,
+            cap_id: new_cap_id,
         }
     }
 
@@ -1060,6 +1073,10 @@ impl FileOps for PipeHandle {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn type_name(&self) -> &'static str {
         match self.end_type {
             PipeEndType::Read => "PipeRead",
@@ -1073,8 +1090,20 @@ impl FileOps for PipeHandle {
     /// downcasting. `None` for never-installed handles (test pipes). A revoked
     /// cap (CLONE_THREAD sibling raced last-close) makes the decrement a
     /// documented no-op — see `decrement_fd_cap`.
+    ///
+    /// U.S2 SLICE-3B: Uses spin::once::Once::poll() to read the cap_id.
     fn cap_id(&self) -> Option<cap::CapId> {
-        self.cap_id
+        self.cap_id.poll().copied()
+    }
+
+    /// U.S2-SLICE-3B: set the CapId allocated at the sys_pipe install site.
+    ///
+    /// Called by sys_pipe after allocating both pipe end caps under Process lock,
+    /// BEFORE fd installation. This override is required by the FileOps contract
+    /// so the generic fd→cap lifecycle (dup bump, close decrement) covers pipes
+    /// without downcasting.
+    fn set_cap_id(&self, cap_id: cap::CapId) {
+        self.set_cap_id(cap_id);
     }
 
     /// M0-6 poll/select: hand the poll layer a probe over the shared Pipe Arc.

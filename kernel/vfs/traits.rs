@@ -241,6 +241,9 @@ pub trait Inode: Send + Sync {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn Any;
+
+    /// Get as mutable Any for downcasting (U.S2-SLICE-3B cap_id attachment)
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// File handle wrapper that implements FileOps
@@ -488,6 +491,7 @@ impl PreparedFileHandle {
             offset: self.offset,
             flags,
             seekable,
+            cap_id: spin::once::Once::new(), // U.S2 SLICE-3B: born uninitialized; set at install
         })
     }
 }
@@ -502,6 +506,17 @@ pub struct FileHandle {
     pub flags: OpenFlags,
     /// Whether this handle supports seeking
     pub seekable: bool,
+    /// U.S2 SLICE-3B: Capability ID for this regular file handle.
+    ///
+    /// Allocated lazily on first successful fd install (set by the syscall layer
+    /// via set_cap_id after LSM authorization). OnceCell ensures immutability after
+    /// first write — a handle can be installed at most once, and clone() preserves
+    /// the cap_id so dup/fork children share the same capability identity.
+    ///
+    /// None (uninitialized) means this handle was never successfully installed in
+    /// an fd_table (e.g., open failed after PreparedFileHandle allocation but before
+    /// install). The FileOps::cap_id() accessor returns None for uninstalled handles.
+    pub(crate) cap_id: spin::once::Once<cap::CapId>,
 }
 
 /// R41-3 FIX: Implement Clone for FileHandle to allow dropping process lock before I/O.
@@ -510,21 +525,51 @@ pub struct FileHandle {
 /// reads/writes from a clone update the original handle's position.
 /// This enables fd_read/fd_write to release the process lock before performing
 /// potentially blocking I/O operations while maintaining correct file position.
+///
+/// U.S2 SLICE-3B: Clone also copies the cap_id if set. OnceCell's poll() is
+/// lock-free; if the original has a cap_id, the clone gets the same cap_id
+/// (dup/fork children share capability identity). If unset, the clone stays unset.
 impl Clone for FileHandle {
     fn clone(&self) -> Self {
+        let cap_id = spin::once::Once::new();
+        if let Some(&id) = self.cap_id.poll() {
+            cap_id.call_once(|| id);
+        }
         Self {
             inode: Arc::clone(&self.inode),
             offset: self.offset.clone(),
             flags: self.flags,
             seekable: self.seekable,
+            cap_id,
         }
     }
 }
 
 impl FileHandle {
+    /// U.S2 SLICE-3B: Get the underlying inode for cap allocation.
+    ///
+    /// Returns a reference to the Arc<dyn Inode> backing this handle.
+    pub(crate) fn inode(&self) -> &Arc<dyn Inode> {
+        &self.inode
+    }
+
     fn try_clone_descriptor(&self) -> Result<FileDescriptor, ()> {
         let prepared = FileDescriptor::try_prepare(HeapClass::Vfs)?;
         Ok(prepared.finalize(self.clone()))
+    }
+
+    /// U.S2 SLICE-3B: Set the capability ID for this handle.
+    ///
+    /// Called by the syscall layer after LSM authorization and before fd install.
+    /// OnceCell ensures this can only be called once per handle — a handle can be
+    /// installed at most once. Subsequent calls (e.g., dup on an already-installed
+    /// handle) are no-ops because the cap_id is already set and clone() copies it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice with different cap_ids (impossible under correct usage).
+    pub(crate) fn set_cap_id(&self, id: cap::CapId) {
+        self.cap_id.call_once(|| id);
     }
 
     /// Read from current offset
@@ -624,8 +669,29 @@ impl FileOps for FileHandle {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn type_name(&self) -> &'static str {
         "FileHandle"
+    }
+
+    /// U.S2 SLICE-3B: Return the capability ID if this handle was installed.
+    ///
+    /// Returns Some(cap_id) if set_cap_id() was called (successful fd install),
+    /// None if this handle was never installed (e.g., open failed after allocation
+    /// but before install, or a transient clone used for lock-free I/O).
+    fn cap_id(&self) -> Option<cap::CapId> {
+        self.cap_id.poll().copied()
+    }
+
+    /// U.S2 SLICE-3B: Set the capability ID for this file handle.
+    ///
+    /// Called by syscall layer after allocating a capability but before installing
+    /// the fd. Uses the FileHandle's internal set_cap_id method (OnceCell-based).
+    fn set_cap_id(&self, id: cap::CapId) {
+        self.set_cap_id(id);
     }
 
     /// R41-1 FIX: Return actual inode metadata for fstat.
