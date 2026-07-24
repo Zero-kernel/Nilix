@@ -1954,6 +1954,21 @@ pub fn update_rtt(tcb: &mut TcpControlBlock, sample_us: u64) {
 ///
 /// - Uses seq_gt() for wraparound-safe sequence comparison
 /// - Karn's algorithm prevents RTT corruption from retransmissions
+///
+/// # Precondition (caller-enforced; R184-7)
+///
+/// This function assumes `snd_una < ack_num <= snd_nxt` — i.e. the ACK
+/// acknowledges data actually sent. It does NOT itself reject a fabricated
+/// future ACK (`ack_num > snd_nxt`); the RFC 793 §3.9 acceptability test that
+/// bounds `ack_num <= snd_nxt` (inclusive) is enforced by EVERY caller before
+/// this runs — the socket-layer per-state ACK guards
+/// (`socket.rs` established/FIN_WAIT/CLOSING/etc.: `seq_ge(snd_nxt, ack_num)`)
+/// and the exact `ack_num == snd_nxt` handshake/SYN-cookie gates. A future
+/// caller that invokes `handle_ack` WITHOUT that guard would let a crafted ACK
+/// clear the send buffer and advance `snd_una` past `snd_nxt` (data loss). R184-7
+/// was audited as a HIGH on this function in isolation and verified a FALSE
+/// POSITIVE precisely because all 10 production callers guard it; this note
+/// pins the contract so the guard is not dropped by a future caller.
 pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUpdate {
     let mut update = AckUpdate::default();
 
