@@ -6743,13 +6743,15 @@ impl SocketTable {
             return Err(SocketError::WouldBlock);
         }
 
-        // J2-6: per-namespace TX-memory budget — reserve `payload.len()` headroom
-        // atomically (HARD cap, fail-closed). The per-conn cap above is checked
-        // first (cheapest). On over-quota the caller retries after ACKs drain. The
-        // reservation advances the per-TCB mirror; the post-buffering reconcile
-        // below refunds the (payload.len() - offset) shortfall if OOM truncates the
-        // segmentation loop. Root is exempt only from this per-namespace fairness
-        // counter; all retained and syscall-staged bytes remain globally admitted.
+        // RF184-3 FIX: J2-6 per-namespace TX-memory budget — reserve the requested
+        // payload.len() before segmentation while TCP lock is held. The reservation
+        // will be reconciled to the actual buffered amount after segmentation,
+        // eliminating the post-buffer fallible charge that caused accounting desync.
+        // Original R184-3 claimed a TOCTOU race between charge and reconcile, but
+        // the TCP lock serializes send and ACK paths — no race exists. However,
+        // charging AFTER buffering with ? operator (R184-3 line 6871) created a
+        // real bug: charge failure left segments in send_buffer without incrementing
+        // send_buffer_bytes, causing permanent desync.
         self.try_charge_ns_send(sock.net_ns_id, &mut tcp_state.control, payload.len())?;
 
         // Get current sequence numbers
@@ -6858,8 +6860,9 @@ impl SocketTable {
         // retransmission buffers. Advancing snd_nxt past unbuffered data
         // causes irrecoverable sequence number corruption on packet loss.
         if offset == 0 {
-            // J2-6: nothing was buffered — refund the full per-ns reservation
-            // (reconcile sees live == old send_buffer_bytes < mirror) before exit.
+            // RF184-3 FIX: nothing was buffered — refund the full speculative
+            // reservation before exit. reconcile_ns_send trues the per-ns counter
+            // to match send_buffer_bytes (still zero), releasing the reservation.
             self.reconcile_ns_send(sock.net_ns_id, &mut tcp_state.control);
             drop(guard);
             return Err(SocketError::NoMemory);
@@ -6868,8 +6871,11 @@ impl SocketTable {
         tcp_state.control.send_buffer_bytes =
             tcp_state.control.send_buffer_bytes.saturating_add(offset);
 
-        // J2-6: true the per-ns counter to the bytes actually buffered, refunding
-        // the (payload.len() - offset) over-reservation when OOM truncated the loop.
+        // RF184-3 FIX: reconcile the speculative reservation to the actual buffered
+        // amount. send_buffer_bytes now reflects `offset` bytes; reconcile_ns_send
+        // refunds (payload.len() - offset) by trueing the per-ns counter to match
+        // the updated send_buffer_bytes. This eliminates the post-buffer fallible
+        // charge that caused accounting desync when charge failed after buffering.
         self.reconcile_ns_send(sock.net_ns_id, &mut tcp_state.control);
 
         tcp_state.control.snd_nxt = base_seq.wrapping_add(offset as u32);
