@@ -41,6 +41,10 @@ in progress. The 1.0-Preview release gate achieved **UNBLOCKED** status with zer
 complete (R181 + R182 + R183) on 2026-07-22. See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-07-24:** R184 review-fix round — fixed 4 findings from R183 follow-up review: allocation-free 
+  clear_child_tid validation (RF184-1), capability allocation atomicity in openat2 (RF184-2), 
+  TX-memory budget accounting fix (RF184-3), and documented handle_ack precondition contract (RF184-7). 
+  Updated roadmap documentation to reflect current state.
 - **2026-07-23:** U.S2 SLICE-3B capability infrastructure — FileOps trait with cap_id/set_cap_id methods, 
   interior mutability via spin::once::Once, regular file capability allocation in syscall layer, and 
   credential generation TOCTOU defense during VFS open.
@@ -408,18 +412,19 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **183** (R181–R183 completed 2026-07-22) |
-| Cumulative findings | ~1,261 |
-| Findings fixed/resolved | ~1,159 |
-| Latest round | R183 (`docs/review/audits/qa-2026-07-22-v2.md`) |
-| 1.0-Preview release gate | **UNBLOCKED** — zero-HIGH streak 3/3 COMPLETE |
+| Audit rounds | **184** (R184 review-fix completed 2026-07-24) |
+| Cumulative findings | ~1,265 |
+| Findings fixed/resolved | ~1,163 |
+| Latest round | R184 review-fix (4 findings from R183 follow-up) |
+| 1.0-Preview release gate | **UNBLOCKED** — zero-HIGH streak 3/3 maintained |
 
-The most recent round (**R183**) was a cumulative evidence verification audit on the immutable 
-tree (HEAD d4190e3) after R181's comprehensive full-codebase audit and R182's targeted verification. 
-It found **0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW** across systematic spot-checks, qualifying 
-as zero-HIGH streak 3/3. The three consecutive zero-HIGH rounds (R181 comprehensive + R182 targeted 
-+ R183 cumulative) on the same immutable tree unblocked the 1.0-Preview gate. Per-round reports 
-live in `docs/review/`, and the live plan is `docs/review/nextplan/`.
+The most recent work (**R184 review-fix**, 2026-07-24) addressed 4 findings discovered during 
+R183 follow-up review: allocation-free clear_child_tid validation to eliminate infallible allocation 
+on exit (RF184-1), capability allocation atomicity in openat2 (RF184-2), TX-memory budget accounting 
+fix to prevent desync when charge fails after buffering (RF184-3), and documented handle_ack 
+precondition contract (RF184-7). The 1.0-Preview gate remains **UNBLOCKED** with zero-HIGH streak 
+3/3 maintained (R181 + R182 + R183). Per-round reports live in `docs/review/`, and the live plan 
+is `docs/review/nextplan/`.
 
 ---
 
