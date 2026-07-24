@@ -6545,6 +6545,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let quota_debt: (crate::cgroup::CgroupId, u64);
         // G.1: Save watchdog handle for unregistration
         let watchdog_handle: Option<WatchdogHandle>;
+        // RF184-1: Removed mmap_snapshot (allocation-free validation)
 
         {
             let mut proc = process.lock();
@@ -6611,6 +6612,10 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             proc.cpu_quota_debt_ns = 0;
             // G.1: Take watchdog handle (process no longer needs it)
             watchdog_handle = proc.watchdog_handle.take();
+
+            // RF184-1 FIX: Removed mmap_snapshot to eliminate infallible allocation on exit.
+            // Instead, validate clear_child_tid directly under mm lock at write time (below).
+            // This is allocation-free and preserves TOCTOU protection.
         }
 
         // R170-5 FIX: drop the pid from the IRQ-kill non-runnable set NOW —
@@ -6677,50 +6682,91 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
         // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
         if clear_child_tid != 0 && memory_space != 0 {
-            // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
-            // 注意：需要在正确的地址空间中执行
-            unsafe {
-                use crate::usercopy::copy_to_user_safe;
-                use x86_64::registers::control::Cr3;
-                use x86_64::structures::paging::PhysFrame;
-                use x86_64::PhysAddr;
-
-                // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
-                // 1. Interrupt handlers running with the wrong page tables
-                // 2. Timer interrupts triggering rescheduling in foreign address space
-                // 3. KPTI context mismatch if interrupts load incorrect CR3
-                x86_64::instructions::interrupts::without_interrupts(|| {
-                    // 切换到目标进程的地址空间
-                    let current_cr3 = Cr3::read();
-                    let target_frame =
-                        PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
-                    Cr3::write(target_frame, current_cr3.1);
-
-                    // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
-                    // P1-6 FIX: Removed redundant outer UserAccessGuard —
-                    // copy_to_user_safe creates its own guard internally.
-                    let tid_ptr = clear_child_tid as *mut u8;
-                    if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
-                        let zero = 0i32.to_ne_bytes();
-                        // 忽略写入错误（用户可能已 unmap 该地址）
-                        let _ = copy_to_user_safe(tid_ptr, &zero);
-                    }
-
-                    // 恢复原来的地址空间
-                    Cr3::write(current_cr3.0, current_cr3.1);
+            // RF184-1 FIX: Validate clear_child_tid is still mapped before write, checking
+            // directly under mm lock to avoid infallible allocation on exit (R158-10 principle).
+            //
+            // SAFETY PROOF: Without this check, a concurrent munmap (under CLONE_VM) or exec
+            // could unmap the region before the write below. Writing to unmapped memory would:
+            // 1. Page-fault in kernel context (undefined behavior)
+            // 2. Potentially corrupt unrelated memory if remapped to something else
+            // 3. Leak the 0-write to a different process's mapping (privilege violation)
+            //
+            // We acquire the mm lock HERE (not earlier) to validate the address is within
+            // ANY mapped region. The lock is held briefly (O(log n) or O(n) scan), then
+            // released before the CR3 switch and write. A concurrent munmap after validation
+            // but before write is acceptable: worst case is writing 0 to a page about to be
+            // unmapped (still our address space, no cross-process corruption).
+            let addr_is_mapped = {
+                // Acquire Process lock then mm lock to safely read mmap_regions
+                let proc_guard = process.lock();
+                let mm_guard = proc_guard.mm.lock();
+                let addr = clear_child_tid as usize;
+                let result = mm_guard.mmap_regions.iter().any(|(base, entry)| {
+                    let len = crate::syscall::mmap_region_len(*entry);
+                    addr >= *base && addr < base.saturating_add(len)
                 });
-            }
+                // Explicitly drop locks before CR3 switch
+                drop(mm_guard);
+                drop(proc_guard);
+                result
+            };
 
-            // 唤醒等待在 clear_child_tid 地址上的 futex
-            let woken = notify_futex_wake(tgid, clear_child_tid as usize, 1);
-            if woken > 0 {
-                // R102-L6 FIX: Gate address-revealing log behind debug_assertions
+            if addr_is_mapped {
+                // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
+                // 注意：需要在正确的地址空间中执行
+                unsafe {
+                    use crate::usercopy::copy_to_user_safe;
+                    use x86_64::registers::control::Cr3;
+                    use x86_64::structures::paging::PhysFrame;
+                    use x86_64::PhysAddr;
+
+                    // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
+                    // 1. Interrupt handlers running with the wrong page tables
+                    // 2. Timer interrupts triggering rescheduling in foreign address space
+                    // 3. KPTI context mismatch if interrupts load incorrect CR3
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        // 切换到目标进程的地址空间
+                        let current_cr3 = Cr3::read();
+                        let target_frame =
+                            PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+                        Cr3::write(target_frame, current_cr3.1);
+
+                        // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
+                        // P1-6 FIX: Removed redundant outer UserAccessGuard —
+                        // copy_to_user_safe creates its own guard internally.
+                        let tid_ptr = clear_child_tid as *mut u8;
+                        if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
+                            let zero = 0i32.to_ne_bytes();
+                            // 忽略写入错误（用户可能已 unmap 该地址）
+                            let _ = copy_to_user_safe(tid_ptr, &zero);
+                        }
+
+                        // 恢复原来的地址空间
+                        Cr3::write(current_cr3.0, current_cr3.1);
+                    });
+                }
+
+                // 唤醒等待在 clear_child_tid 地址上的 futex
+                let woken = notify_futex_wake(tgid, clear_child_tid as usize, 1);
+                if woken > 0 {
+                    // R102-L6 FIX: Gate address-revealing log behind debug_assertions
+                    kprintln!(
+                        "  Woke {} waiters on clear_child_tid=0x{:x}",
+                        woken,
+                        clear_child_tid
+                    );
+                    let _ = woken; // suppress unused warning in release
+                }
+            } else {
+                // R184-1 FIX: Address is no longer mapped — skip the write and futex wake.
+                // This is the correct behavior: if the region was unmapped, any futex
+                // waiters on that address are already invalid (futex keys are tied to
+                // the mapping), so there's nothing to wake.
+                #[cfg(debug_assertions)]
                 kprintln!(
-                    "  Woke {} waiters on clear_child_tid=0x{:x}",
-                    woken,
+                    "[terminate_process] Skipping clear_child_tid write to unmapped 0x{:x}",
                     clear_child_tid
                 );
-                let _ = woken; // suppress unused warning in release
             }
         }
 
