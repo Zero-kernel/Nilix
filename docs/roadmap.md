@@ -1,1116 +1,648 @@
-# Zero-OS Development Roadmap
+# Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Last Updated:** 2026-02-06
-**Architecture:** Security-First Hybrid Kernel
-**Design Principle:** Security > Correctness > Efficiency > Performance
+**Version:** 4.0 — first unified edition (merges the former `roadmap.md` and `roadmap-enterprise.md`)
+**Snapshot:** 2026-07-23 · branch `main` @ `1344025ac` (working tree carries 4 uncommitted R184-fix files:
+`kernel_core/process.rs`, `kernel_core/syscall.rs`, `net/src/socket.rs`, `net/src/tcp.rs`; the remote build
+host is one style-only commit ahead at `2e4ad20`)
+**Design principle:** Security > Correctness > Efficiency > Performance
+**Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
+`docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
 
-This document outlines the development roadmap for Zero-OS, a microkernel operating system written in Rust for x86_64 architecture, designed to evolve toward enterprise-grade security.
-
----
-
-## Executive Summary
-
-### Current Status: Phase G IN PROGRESS (Production Readiness) · Phase U (User Mode & ABI) DESIGN-LOCKED
-
-> **2026-06-18 — User-Mode ABI direction decided: Compat-ZeroABI (converge-later).** A capability-first **native core ABI** + a **de-privileged Linux-compat personality**, realized as a *hybrid* (in-kernel capability/LSM-gated hot path + a userspace server for the cold/dangerous surface). Target: **glibc + full Linux/OCI**, **dynamic linking in scope**. The user-mode foundation (auxv, SysV entry stack, signal delivery, ~30 missing syscalls, exec disambiguation) is being built **first on the existing Linux cABI** (milestone **M0**) and proven by a static-musl conformance gate, *before* the native/personality fork is committed. Decided via a 17-agent analysis workflow (6-dim analysis → 7 adversarial verifications → 3-architect panel). See **Phase U** below and `docs/next-phase-plan.md`.
-
-Zero-OS has completed SMP infrastructure and resource governance:
-- **99 security audits** with 496 issues found, 454 fixed (91.5%)
-- **R95-R99 Security**: 28 new issues found, 27 fixed in-round + 16 retroactive fixes (ext2 filesystem hardening, conntrack bypass, DMA/VirtIO lifecycle, syscall safety, NetBuf overflow, signal handling)
-- **R94 Security**: 16 issues found, **ALL 16 FIXED** (ECDSA KAT, FIPS fail-closed, PID namespace, TLB shootdown, kdump scrub, HMAC key scrub, firewall default DROP, IOMMU legacy signaling, verify_chain_hmac, **IOMMU kernel domain SLPT**)
-- **R93 Security Debt**: ALL 18 issues FIXED (fork namespace escape, livepatch hardening, fail-open patterns, cgroup escape, kdump, TLB shootdown, FIPS KATs, panic redaction)
-- **Ring 3 user mode** with SYSCALL/SYSRET support
-- **Thread support** with Clone syscall and TLS inheritance
-- **VFS** with POSIX DAC permissions, procfs, ext2
-- **Security hardening**: W^X, SMEP/SMAP/UMIP, SHA-256 hash-chained audit, CSPRNG
-- **Phase A**: ~90% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, Audit gate ✅, KASLR partial)
-- **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
-- **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
-- **Phase D**: ✅ **COMPLETE** (Full network stack with loopback validation)
-  - D.1: virtio-net driver, NetDevice trait ✅
-  - D.2: TCP client/server with RFC 6298 RTT ✅
-  - D.3: TCP hardening (MSS/WS validation, SYN cookies) ✅
-  - D.4: Runtime loopback tests (UDP, TCP SYN, conntrack, firewall) ✅
-- **Phase E**: ✅ **COMPLETE** (SMP & Concurrency)
-  - E.1: LAPIC/IOAPIC initialization ✅, AP boot ✅, IPI ✅
-  - E.2: TLB shootdown ✅ (IPI-based, PCID support, per-CPU queue)
-  - E.3: PerCpuData ✅, Per-CPU runqueues ✅, FPU save areas ✅
-  - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph), **Futex PI ✅** (R72-1, R72-2)
-  - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
-  - E.6: Cpuset CPU isolation ✅ (runtime test added)
-- **Phase F**: ✅ **COMPLETE** (Resource Governance)
-  - F.1: Namespaces ✅ **COMPLETE**
-    - PID namespace ✅ (CLONE_NEWPID, cascade kill, namespace-local PIDs)
-    - Mount namespace ✅ (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
-    - IPC namespace ✅ (CLONE_NEWIPC, endpoint table partitioned by namespace - R75-2)
-    - Network namespace ✅ (CLONE_NEWNET, socket table partitioned by namespace - R75-1)
-    - User namespace ✅ (CLONE_NEWUSER, UID/GID mapping, unprivileged container support)
-  - F.2: Cgroups v2 ✅ **COMPLETE**
-    - Core infrastructure ✅ (CgroupNode, Registry, limits, stats, deleted flag - R77-1)
-    - PIDs controller ✅ (fork protection, task tracking)
-    - CPU controller ✅ (cpu.weight time slice scaling, cpu.max quota enforcement with throttling)
-    - Memory controller ✅ (try_charge_memory/uncharge_memory in mmap/munmap/brk)
-    - Syscalls ✅ (sys_cgroup_create/destroy/attach/set_limit/get_stats)
-    - IO controller ✅ (io.max bps/iops with token bucket, throttle/wait_for_io_window, stats)
-    - cgroup2 filesystem ✅ (/sys/fs/cgroup cgroupfs mount, control files)
-  - F.3: IOMMU/VT-d ✅ **COMPLETE**
-    - Core infrastructure ✅ (DMAR parser, VT-d driver, domain management, public API)
-    - Fail-closed security ✅ (ensure_iommu_ready, translation_enabled checks)
-    - DMA isolation ✅ (second-level page tables with AGAW support)
-    - Device domain binding ✅ (context table programming with validation)
-    - Interrupt remapping ✅ (IRTE allocation, MSI passthrough)
-    - Fault handling ✅ (FRI rotation, flood mitigation, address redaction)
-    - Device isolation ✅ (bus master disable, PCI config serialization)
-    - Device detach ✅ (atomic domain tracking, multi-segment support)
-    - VM passthrough ✅ (create_vm_domain, assign/unassign_device_to_vm, R88 hardening)
-- **R91**: current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, Profiler control race ✅ (ALL 3 FIXED)
-- **R90**: IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ (ALL 4 FIXED)
-- **R88**: VM passthrough IR enable ✅, Unassign cleanup order ✅ (ALL 2 FIXED)
-- **R93**: Fork namespace escape ✅, Livepatch compile guard ✅, Fail-open patterns ✅, Cgroup attach ✅, ELF cgroup ✅, Identity map ✅, kdump fallback ✅, TLB shootdown ✅ (ALL 9 CRITICAL/HIGH FIXED)
-- **R77**: TCP child socket quota ✅, Fork cpuset rollback ✅, delete_cgroup race ✅, Memory accounting CAS ✅, Namespace guard ✅ (ALL 5 FIXED)
-- **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
-- **R76**: Socket namespace enforcement ✅, Namespace count limits ✅, Per-namespace socket quotas ✅ (ALL 3 FIXED)
-- **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
-- **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
-- **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
-- **R57**: Idle cwnd validation ✅ (RFC 2861 stale burst prevention)
-- **R58**: Window Scaling ✅ (RFC 7323 WSopt negotiation, up to 256KB windows)
-- **R59**: Ephemeral port randomization ✅ (RFC 6056 CSPRNG)
-- **R60**: IP fragment reassembly ✅ (RFC 791/815/5722 security hardening)
-- **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
-- **R66**: TCP options validation ✅, VirtIO hardening ✅, Runtime network tests ✅
-- **R72**: RCU memory ordering fix ✅, PI chain iterative ✅, Futex waiter cleanup ✅
-- **R74**: Mount namespace materialization fix ✅ (eager snapshot prevents mount leakage)
-
-### Gap Analysis vs Linux Kernel
-
-| Category | Linux | Zero-OS | Gap |
-|----------|-------|---------|-----|
-| **SMP** | 256+ CPUs | Multi-core (per-CPU runqueues, load balancing, affinity) | CPU isolation, NUMA |
-| **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
-| **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
-| **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
-| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅, User ✅ namespaces; Cgroups v2 PIDs ✅, CPU ✅, Memory ✅, IO ✅, Syscalls ✅, cgroupfs ✅ | ✅ Container foundation complete |
-| **Virtualization** | KVM/QEMU | IOMMU/VT-d ✅ (DMA isolation, device passthrough prep, interrupt remapping, VM domain API) | ✅ IOMMU complete, KVM/hypervisor pending |
-| **User Space / ABI** | glibc/musl + ld.so, full POSIX | Byte-exact Linux x86-64 syscall ABI (~95 real syscalls), working TLS + pthread-join; **no auxv / signal-delivery / dynamic-linking yet** — no real libc binary runs end-to-end | Phase U: M0 foundation → Compat-ZeroABI (native core + Linux personality) |
+Nilix — **N**ilix **I**s **L**inux **I**ndependent e**X**istence — is a security-first hybrid kernel written
+in Rust (`no_std`) for x86_64: Linux-*compatible* (byte-exact syscall ABI; a real statically-linked musl
+libc binary runs unmodified end-to-end) yet Linux-*independent* (a from-scratch kernel, not a fork). The
+GitHub repository is `Zero-kernel/Nilix`; local directories, crate names, and in-code identifiers
+deliberately retain the historical `Zero-os` naming — do not "fix" them.
 
 ---
 
-## Completed Features
+## 0. How to Read This Document
 
-### Core Infrastructure (Phase 1-2)
+**Authority order** — when sources conflict, the earlier one wins:
 
-- [x] UEFI Bootloader with ELF parsing
-- [x] High-half kernel mapping (0xffffffff80000000)
-- [x] VGA text mode driver + Framebuffer (GOP)
-- [x] Serial port output (0x3F8)
-- [x] IDT with 20+ exception handlers
-- [x] Heap allocator (LockedHeap)
-- [x] Buddy physical page allocator
-- [x] GDT/TSS for user-kernel transitions
-- [x] IST for double fault safety
+1. Code and build configuration (what exists and is actually wired);
+2. CI gates and in-kernel runtime tests (what is observed to work);
+3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.38, 2026-07-23);
+4. Audit / review-fix reports in `docs/review/` (security and open-risk status);
+5. `README.md` (public summary — authoritative only where code/tests/plan do not contradict it; where they
+   do, this document records the reconciliation and the README is stale, as with the gate status in §8);
+6. This document's narrative sections.
 
-### Process Management (Phase 3)
+**Maturity legend** used throughout:
 
-- [x] Process Control Block (PCB) structure
-- [x] Enhanced scheduler (MLFQ with priority buckets)
-- [x] Context switch framework (176-byte + FPU/SIMD)
-- [x] Fork API with COW implementation
-- [x] Clone syscall (CLONE_VM | CLONE_THREAD)
-- [x] TLS inheritance for child threads
-- [x] Per-process address space isolation (CR3)
-- [x] Preemptive scheduling (timer connected)
-- [x] IRQ-safe COW reference counting
+| Label | Meaning |
+|---|---|
+| ✅ Validated | Wired into the active path and exercised by a named CI gate or runtime test |
+| 🟢 Implemented | Wired into the active path; validation partial or indirect |
+| 🟡 Partial | Present but incomplete, feature-gated, or inert pending another component |
+| 🔵 Planned | Not built yet; has a concrete milestone |
+| ⚪ Directional | Long-term intent; no committed milestone |
 
-### IPC (Phase 4)
+Code presence alone is never counted as "implemented" — each claim below was traced
+capability → interface → call site/wiring → default configuration, against the snapshot above, by a
+full-source survey (all 26 kernel crates, bootloader, userspace, fuzzing, scripts, CI) on 2026-07-23.
 
-- [x] Capability-based message queues
-- [x] Pipes with blocking I/O
-- [x] Futex (FUTEX_WAIT/FUTEX_WAKE)
-- [x] Signals (SIGKILL, SIGTERM, SIGSTOP, SIGCONT)
-- [x] Per-process file descriptor table
-
-### VFS (Phase 5)
-
-- [x] VFS layer with inode abstraction
-- [x] ramfs (memory-backed)
-- [x] devfs (/dev/null, /dev/zero, /dev/console)
-- [x] POSIX DAC permissions (owner/group/other/umask)
-- [x] Sticky bit semantics
-- [x] Path traversal permission checks
-
-### User Mode (Phase 6)
-
-- [x] SYSCALL/SYSRET MSR configuration
-- [x] IRETQ-based Ring 3 entry
-- [x] System call framework (50+ defined, ~35 implemented)
-- [x] User/kernel segment selectors (CS=0x23, SS=0x1B)
-
-### Security Hardening
-
-- [x] W^X enforcement (no writable+executable pages)
-- [x] SMEP/SMAP/UMIP enabled
-- [x] User pointer validation
-- [x] mmap page zeroing (info leak prevention)
-- [x] Kernel stack guard pages
-- [x] CSPRNG (ChaCha20 + RDRAND/RDSEED)
-- [x] kptr guard (kernel pointer obfuscation)
-- [x] Spectre/Meltdown basic mitigations (IBRS/IBPB/STIBP)
-- [x] Audit subsystem (hash-chained events)
+**Counting method:** file and line counts are raw `wc -l` over `*.rs` (comments and blanks included),
+`target/` excluded, at the snapshot commit. They are inventory metadata, not a maturity measure. Audit
+statistics are assembled from the per-round reports in `docs/review/`; "findings filed" includes findings
+that later verification refuted as false positives (see §11).
 
 ---
 
-## Architecture Vision: Hybrid Kernel
+## 1. Executive Status Snapshot
+
+**Milestone:** approaching **1.0-Preview**. Phases A–G are complete; **Phase U** (user-mode Linux ABI,
+strategy *Compat-ZeroABI*) is in progress with milestone M0 done and native-capability slice U.S2-3B landed.
+
+**Release gate:** the 1.0-Preview gate is currently **BLOCKED** (2026-07-23). It was first unblocked on
+2026-07-22 (zero-HIGH streak 3/3 over R181–R183), then **re-blocked one day later** when round R184 found
+one real CRITICAL (exit-path use-after-free, fixed) and one real HIGH (capability-attach TOCTOU, fixed),
+resetting the streak. Current state: **0 open CRITICAL / 0 open HIGH / 0 open actionable MEDIUM**; streak
+rebuilt to 1/3 (R185 clean); the remaining blockers are the streak itself and **2 open D1 design findings**
+(§14). Note: `README.md` §6 still says "UNBLOCKED" — it predates R184 and is stale on this point.
+
+| Dimension | State (2026-07-23) |
+|---|---|
+| Audit history | **185 rounds** (R1 2025-12-09 → R185 2026-07-23); ~1,315 findings filed, ~1,161 fixed (§11) |
+| Open security debt | 0 CRITICAL, 0 HIGH, 0 actionable MEDIUM/LOW; 6 tracked design findings (2 D1 open + gate-blocking, 3 D2 partial-open, 1 D3 implemented-pending-closure) |
+| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 193,656 lines (`kernel/`); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
+| Syscall surface | **121 distinct syscall numbers dispatched** (~125 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native |
+| Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
+| Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
+| Build/test baseline | build OK · lint 4/4 OK · runtime tests 18 passed / 39 deferred / 0 failed · 0 panic · 0 NX violation |
+
+**Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
+advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
+randomization is what's active); livepatch inert until real signing keys are provisioned; KCOV edge
+recording is a no-op (management syscalls only); interrupts still routed via legacy PIC (IOAPIC driver
+present, init disabled); x2APIC unsupported (hard cap at 64 CPUs); no IPv6; virtio-only device drivers.
+
+---
+
+## 2. Vision, Design Principles, Non-Goals
+
+**Vision (unchanged from the enterprise roadmap):** an enterprise-grade secure server kernel offering
+defense in depth (capability + LSM/MAC + DAC + audit), memory safety (Rust + hardware protections),
+strong process isolation, capability-secured IPC, and compliance-ready tamper-evident logging — reached
+security-first: every feature lands on an audited foundation, fail-closed by default.
+
+**Principles** (enforced in code, not aspiration):
+
+1. **Memory safety** — the kernel is written in Rust (`no_std`); safety rests on Rust's guarantees
+   *plus* audited `unsafe` blocks at the hardware/ABI boundary (MMIO, page tables, context switch, usercopy,
+   virtqueues) and hardware protections (NX/W^X/SMEP/SMAP/UMIP). "Memory-safe" here means Rust-checked with
+   a reviewed, minimized unsafe surface — not zero `unsafe`.
+2. **Security before features** — the cap/LSM/seccomp framework predates storage and network.
+3. **Fail-closed** — deny by default: firewall default-DROP, seccomp post-init missing-evaluator → Kill,
+   IOMMU gate rejects DMA while probing, audit cannot be disabled once initialized, livepatch LSM hooks
+   default to EPERM, corrupted profile state decays to Secure, corrupted FIPS state decays to Failed.
+3. **Minimal TCB trajectory** — hybrid architecture: hot/safe paths in-kernel behind capability/LSM gates;
+   the cold/dangerous Linux personality surface is planned to move to a de-privileged server (U.S4).
+4. **Audit everything** — SHA-256/HMAC hash-chained events on security decisions; ~40 emit sites.
+5. **Fallible allocation** — kernel paths use reserve-before-commit heap admission (15 budget classes,
+   compile-time partition proof) instead of OOM-aborting allocations.
+
+**Non-goals (current horizon):** multi-architecture support (x86_64 only), desktop/GUI, ABI stability
+promises before 1.0, certification claims (FIPS *mode* exists with real KATs, but no formal validation),
+power management / hotplug, and Secure Boot chain (bootloader does not verify `kernel.elf` signatures).
+
+---
+
+## 3. Architecture & Trust Boundaries
+
+### 3.1 Hybrid-kernel architecture (current vs. planned)
 
 ```
-+------------------------------------------------------------------+
-|                        USER SPACE                                 |
-|  +---------------+  +---------------+  +---------------+          |
-|  | FS Server     |  | Net Server    |  | Policy Daemon |          |
-|  | (ext2, FAT)   |  | (TCP/IP L7)   |  | (LSM policy)  |          |
-|  +-------+-------+  +-------+-------+  +-------+-------+          |
-|          |                  |                  |                  |
-|          v                  v                  v                  |
-|  +----------------------------------------------------------+    |
-|  |         Capability-Based IPC + Shared Memory              |    |
-|  +----------------------------------------------------------+    |
-+------------------------------------------------------------------+
-|                       KERNEL SPACE                                |
-|  +------------------+  +------------------+  +------------------+ |
-|  | Scheduler        |  | VMM/PMM          |  | IPC Fast Path    | |
-|  | (MLFQ + Per-CPU) |  | (COW, Page Cache)|  | (Ring Buffers)   | |
-|  +------------------+  +------------------+  +------------------+ |
-|  +------------------+  +------------------+  +------------------+ |
-|  | Interrupt/Trap   |  | Block Layer      |  | Capability DB    | |
-|  | (APIC/IOAPIC)    |  | (virtio-blk)     |  | + LSM Hooks      | |
-|  +------------------+  +------------------+  +------------------+ |
-|  +------------------+  +------------------+  +------------------+ |
-|  | Network L2-L4    |  | Basic Drivers    |  | Audit Engine     | |
-|  | (TCP/IP core)    |  | (Timer,RNG,UART) |  | (Hash-chained)   | |
-|  +------------------+  +------------------+  +------------------+ |
-+------------------------------------------------------------------+
-|                        HARDWARE                                   |
-+------------------------------------------------------------------+
++--------------------------------------------------------------------------+
+|                              USER SPACE                                  |
+|  [current]  Ring-3 programs: native shell, syscall/clone/kcov tests,     |
+|             static-musl binaries (hello_musl), fuzz runners              |
+|  [planned]  De-privileged Linux "personality" server (U.S4): ld.so/exec  |
+|             brokering, /proc, ptrace, ioctl demux, OCI orchestration     |
+|  [planned]  FS/Net/Policy servers (long-term microkernel-ward migration) |
++--------------------------------------------------------------------------+
+|                     SYSCALL / LSM TRUST BOUNDARY                          |
+|   seccomp/pledge filter -> LSM hooks (53) -> capability check -> DAC      |
++--------------------------------------------------------------------------+
+|                             KERNEL SPACE (current)                        |
+|  Scheduler (per-CPU MLFQ)   MM (buddy/COW/page-cache)   IPC (pipe/MQ/    |
+|  + cpuset + lockdep         + heap-admission ledger      futex-PI)       |
+|  VFS (ramfs/ext2-ext3/proc/dev/cgroupfs/initramfs)  Block (virtio-blk)   |
+|  Net L2-L4 (virtio-net, ARP/IPv4/ICMP/UDP/TCP + conntrack + firewall)    |
+|  Security (cap, LSM, seccomp, audit, compliance, hardening, crypto)      |
+|  Containers (5 namespaces, cgroups v2 x6)   IOMMU/VT-d   Livepatch       |
+|  Observability (trace/counters/watchdog/profiler/kdump)   KCOV (partial) |
++--------------------------------------------------------------------------+
+|                        HARDWARE TRUST BOUNDARY                            |
+|  Ring 0/3, NX/W^X, SMEP/SMAP/UMIP, IOMMU DMA isolation, RDRAND/RDSEED    |
++--------------------------------------------------------------------------+
 ```
 
-### Design Rationale
+The **hybrid** stance is deliberate: performance- and DoS-critical layers (scheduler, VMM, IPC fast path,
+block, net L2–L4, capability/LSM decisions, audit) live in-kernel; complexity-heavy or dangerous
+semantics (dynamic linker policy, /proc breadth, ptrace, ioctl demux, OCI) are slated for a de-privileged
+user-space server once synchronous IPC + shared memory land (U.S3 → U.S4, §9).
 
-**In-Kernel (Performance Critical)**:
-1. Scheduler - Direct hardware access, minimal latency
-2. VMM/PMM - Page tables, COW, page cache
-3. IPC Fast Path - Zero-copy ring buffers
-4. Interrupt Handling - APIC, exception handlers
-5. Block Layer - I/O critical path
-6. Network L2-L4 - TCP/IP core for DoS protection
-7. Capability/LSM - Security-critical decisions
-8. Audit - Tamper-evident logging
+### 3.2 Threat model
 
-**User-Space (Isolation & Modularity)**:
-1. File System Servers - ext2, tmpfs policy
-2. Network L7 - Application protocols
-3. Device Managers - Hot-plug, USB complex protocols
-4. Policy Daemons - LSM policy loading, audit shipping
-5. Init/Service Manager - PID 1 supervision
+| Attacker profile | Goal | Current mitigations | Remaining gap |
+|---|---|---|---|
+| Malicious tenant (container) | Escape isolation, cross-tenant access | Per-process CR3, 5 namespaces, cgroups v2 (6 controllers), per-tenant net quotas (J.2), fail-closed netns TX device gate | D1-ISO residual (per-ns dataplane config resolver); cgroup namespace absent |
+| Remote attacker | Network exploitation | Default-DROP stateful firewall, conntrack caps, SYN cookies, challenge-ACK limit, RFC 5961/6528, fragment-reassembly bounds, rate limiters | IPv6 absent (no surface, also no parity); TLS/crypto offload out of scope |
+| Compromised process | Privilege escalation | Ring 3 + SMEP/SMAP/UMIP, W^X, seccomp/pledge, LSM SecureBaseline (user W^X, root-minting block, Yama-like ptrace), stack guards, SROP-defended sigreturn | KPTI inert (single CR3) — Meltdown-class reliance is on hardware immunity; text KASLR verify-only |
+| Malicious/compromised device | DMA into kernel memory | VT-d DMA isolation wired at boot (fail-closed gate, RAII unmap, bus-master-off on failure), virtqueue used-ring validation, IRTE SID verification | Secure-profile still legacy-proceeds when *no* IOMMU exists (documented residual); needs real-hardware validation |
+| Insider / operator | Data exfiltration, log tampering | Hash-chained audit (cannot be disabled once init), HMAC set-once key, capability-gated export, kptr redaction, kdump encryption | Remote/persistent audit delivery is hook-only (no storage backend) |
+| Supply chain | Malicious kernel/patch code | Livepatch ECDSA-P256 (KAT-gated, fail-closed), compile-error on insecure stub in release | No Secure Boot / kernel-image signing; livepatch trust keys not yet provisioned |
 
----
-
-## Future Phases (Security-First Order)
-
-### Phase A: Security Foundation [IN PROGRESS]
-
-**Goal**: Establish minimum trusted base before adding features.
-
-**Priority**: Critical
-**Dependencies**: None (current baseline)
-**Status**: ~80% Complete
-
-#### A.1 Usercopy API Hardening ✅ COMPLETE
-
-- [x] Unified `copy_from_user` / `copy_to_user` with SMAP guard (kernel/kernel_core/usercopy.rs)
-- [x] Path string copy with length limits (`strncpy_from_user` with MAX_PATH)
-- [x] Alignment and bounds validation (range checks, canonical address validation)
-- [x] STAC/CLAC wrapper for all user memory access (`with_user_access!` macro)
-
-#### A.2 Syscall Coverage (Partial)
-
-- [ ] Eliminate all ENOSYS returns for defined syscalls (many still return ENOSYS)
-- [x] Proper error code semantics (errno constants defined)
-- [x] User-space signal handler infrastructure (signal dispatch in place)
-
-#### A.3 Audit Enhancement (Mostly Complete)
-
-- [x] Upgrade hash chain to SHA-256 (FNV-1a → SHA-256, domain separation)
-- [x] Overflow handling policy (drop oldest with `dropped` counter)
-- [x] Read-only export interface with capability gate (main.rs:450-469, CAP_AUDIT_READ)
-- [ ] Persistent flush hook (for future storage)
-- [ ] HMAC support (placeholder exists, not implemented)
-
-#### A.4 KASLR/KPTI Preparation (Partial)
-
-- [x] Linker script layering for randomization (KernelLayout struct with slide field)
-- [x] KASLR slide reservation (with_slide() constructor ready)
-- [x] KPTI dual page table skeleton (KptiContext with user_cr3/kernel_cr3)
-- [ ] PCID support detection (field exists, not detected at boot)
-- [ ] Actual KASLR slide application (layout remains fixed)
-
-#### A.5 Spectre/Meltdown Hardening ✅ COMPLETE
-
-- [x] Context switch IBPB on untrusted transition (issue_ibpb/try_ibpb)
-- [x] RSB stuffing (spectre.rs rsb_fill with 32 entries)
-- [x] IBRS/STIBP/SSBD detection and enablement (init() enables all supported)
-- [x] Retpoline build option (cfg feature gate)
-- [x] SWAPGS fence (CVE-2019-1125 mitigated in syscall.rs)
-- [x] VulnerabilityInfo detection (reads IA32_ARCH_CAPABILITIES)
-
-#### A.6 SMP-Ready Interfaces (Stubs) ✅ COMPLETE
-
-- [x] Per-CPU data structure abstraction (kernel/cpu_local with CpuLocal<T>)
-- [x] IPI type definitions (arch/ipi.rs - 5 types with vectors 0xFB-0xFF)
-- [x] TLB shootdown API (mm/tlb_shootdown.rs - single-core with assert_single_core_mode)
-- [x] Lock ordering documentation (sched/lock_ordering.rs - 9 levels documented)
-
-**Security Requirements**:
-- W^X/NX/SMEP/SMAP/UMIP enabled by default
-- panic-on-UB configurable
-- kptr guard active
-- Audit cannot be disabled
-
-**Testing Strategy**:
-- Syscall fuzzer for all implemented syscalls
-- Usercopy property tests
-- Audit chain integrity verification
-- KASLR randomness validation
+**Trust anchors:** hardware RNG (RDRAND/RDSEED) → ChaCha20 CSPRNG (fast-key-erasure); non-forgeable
+generation-versioned capabilities; SHA-256/HMAC audit chain; UEFI firmware is *trusted but unverified*
+(no Secure Boot chain yet — directional, §13).
 
 ---
 
-### Phase B: Capability & MAC Framework [COMPLETE ✅]
+## 4. Kernel Composition
 
-**Goal**: Unified object capability model + LSM hooks + syscall filtering.
+The kernel is a Cargo workspace of focused crates under `kernel/<subsystem>/`; the bootloader and
+user-space programs are separate build units. Line counts are `wc -l` over `*.rs` at the snapshot commit.
 
-**Priority**: Critical
-**Dependencies**: Phase A
-**Status**: ✅ **COMPLETE** - All hooks integrated into syscall/process/VFS paths (verified 2026-01-02)
+### 4.1 Kernel crates (146 files · 193,656 LOC)
 
-#### B.1 Capability System (Scaffolded - kernel/cap/)
+The `kernel/` tree is **26 build units — 25 library crates plus one entry-binary crate (`src`)**. The LOC
+column is raw `wc -l` over `*.rs`; the 193,656 total is *all* `.rs` under `kernel/` (the surveyed kernel
+workspace, including in-tree test/mock files), and is distinct from the top-level `bootloader/`,
+`userspace/`, and `fuzz/` trees counted separately in §1.
 
-```rust
-// Implemented in kernel/cap/types.rs
-pub struct CapId(u64);  // idx(32) | gen(32) ✅
+| Crate | Files | LOC | Responsibility | Maturity |
+|---|---:|---:|---|---|
+| `kernel_core` | 22 | 52,029 | PCB & process table, fork/exec/clone, 121-syscall dispatcher, signals, 5 namespaces, cgroups v2, RCU, SMAP usercopy, KCOV syscalls, fd→capability wiring | 🟢 Implemented |
+| `net` | 17 | 33,690 | virtio-net, ARP/IPv4/ICMP/UDP/TCP, conntrack, default-DROP firewall, capability+LSM socket layer, per-tenant quotas, netns TX gate | 🟢 Implemented |
+| `vfs` | 11 | 21,912 | inode/dentry, FileOps (+cap_id), ramfs, **ext2/ext3 rw with JBD2 journaling**, procfs, devfs, initramfs (CPIO), cgroupfs, CoW mount tables, DAC, openat2 RESOLVE_* | 🟢 Implemented |
+| `mm` | 12 | 12,327 | reservation-aware buddy allocator, dual heap + 15-class admission ledger (compile-time partition proof), page tables, page cache (LRU/writeback), TLB shootdown (IPI+PCID), OOM killer, DMA/IOMMU gate | ✅ Validated |
+| `iommu` | 6 | 9,875 | Intel VT-d: DMAR ACPI parse, root/context tables, second-level page tables (AGAW), interrupt remapping, fault handling, device isolation/detach, VM-passthrough API | 🟡 Partial (wired at boot; needs real-HW validation) |
+| `arch` | 11 | 9,755 | GDT/TSS/IST, IDT (20 exceptions + IRQ/IPI), context switch, SYSCALL/SYSRET entry hardening, LAPIC/IOAPIC/HPET, SMP bring-up (INIT-SIPI-SIPI), IPIs | 🟢 Implemented |
+| `ipc` | 5 | 7,314 | capability message queues (per-ns), pipes (cap-preallocated), futex (WAIT/WAKE/PI, bucket budgets), WaitQueue/KMutex/Semaphore/CondVar | 🟢 Implemented |
+| `security` | 9 | 5,938 | W^X/NX validator, KASLR (partial active + text verify), KPTI machinery, Spectre suite (IBRS/IBPB/STIBP/SSBD/RSB/SWAPGS), ChaCha20 CSPRNG, kptr guard, 9 runtime tests | 🟡 Partial (KPTI inert; retpoline no codegen) |
+| `sched` | 5 | 4,965 | per-CPU MLFQ (bounded selector), work stealing + load balancing, starvation boost, cpuset isolation, 9-level lockdep | ✅ Validated (one orphan file — §12) |
+| `block` | 4 | 3,933 | Bio/RequestQueue/BlockDevice, virtio-blk (PCI/MMIO), RAII IOMMU lifecycle, bounds-checked BIO | 🟢 Implemented |
+| `audit` | 1 | 3,197 | SHA-256/HMAC hash-chained ring, FIFO overflow policy, cursor export, 8 event classes, mandatory-at-Secure, FIPS-KAT crypto submodule | 🟢 Implemented |
+| `trace` | 5 | 2,933 | tracepoints, 15 per-CPU counters, hung-task watchdog (512 slots), PC-sampling profiler (seqlock), encrypted/redacted kdump | 🟢 Implemented (read-guard fail-open until installed — §12) |
+| `lsm` | 2 | 2,857 | 53 LSM hook points, lock-free AtomicPtr policy registry, PermissivePolicy/DenyAllPolicy/**SecureBaselinePolicy**, denial→audit bridge | 🟢 Implemented (feature-on in shipped build) |
+| `livepatch` | 2 | 2,570 | INT3-detour kpatch, ECDSA-P256 (KAT-gated, fail-closed), dependency topo-sort, batch enable/disable, rollback, W^X seal_exec | 🟡 Partial (inert: trust keys are placeholders) |
+| `seccomp` | 2 | 2,371 | BPF-like filter VM, 5 actions, 18 pledge promises, 512-bit fast-allow, chain caps, boot self-tests | 🟢 Implemented (TSYNC fail-closed rejected; 4 promises inert) |
+| `cap` | 2 | 2,011 | generation+index CapId (48+16 bit), CapRights, CapTable (allocate/lookup/revoke/delegate), fork/exec/dup refcount reconciliation | 🟢 Implemented |
+| `drivers` | 4 | 1,709 | VGA text, GOP framebuffer console, PS/2 keyboard, raw COM1 serial | 🟢 Implemented (`uart_16550` dep unused — §12) |
+| `virtio` | 3 | 1,073 | shared virtqueue transport, used-ring validation (id bounds/replay/double-free), MMIO+PCI-modern | ✅ Validated |
+| `cpu_local` | 1 | 975 | `CpuLocal<T>`, LAPIC-ID↔CPU-index map, per-CPU data, BSP/AP init, online mask | ✅ Validated |
+| `compliance` | 1 | 926 | Secure/Balanced/Performance profiles (boot-locked), FIPS mode (sticky, real KATs), crypto allow-list | 🟢 Implemented |
+| `coverage` | 1 | 322 | KCOV per-task bitmap + `record_edge!` macro | 🟡 Partial (recorder is a no-op — §12) |
+| `klog` | 1 | 264 | profile-aware `klog!`/`klog_force!`/`klog_always!`/`kprintln!` | 🟢 Implemented |
+| `tlb_ops` | 1 | 296 | INVPCID/PCID primitives (all 4 types, fallbacks) | ✅ Validated |
+| `crypto` | 1 | 212 | shared SHA-256 (FIPS 180-4) | ✅ Validated |
+| `sync_safe` | 1 | 165 | IRQ-context-aware mutex (debug fail-loud on lock-in-IRQ) | ✅ Validated |
+| `src` (entry) | 13 | 9,090 | `_start` boot orchestrator, ~30 runtime tests + 25 P0 regressions, native shell, Ring-3 launcher, stack-guard installer | 🟢 Implemented |
 
-pub enum CapObject {  // ✅ Defined
-    Endpoint(Arc<Endpoint>),
-    File(Arc<File>),
-    Socket(Arc<Socket>),
-    Shm(Arc<Shm>),
-    Timer(Arc<Timer>),
-    Process(Pid),
-    Namespace(NsId),
-}
+(Plus `kernel/build.rs` 315, `kernel/fuzz/mock_kernel.rs` 346, `kernel/tests/test_coverage.rs` 286.)
 
-bitflags! {
-    pub struct CapRights: u64 {  // ✅ Defined
-        const READ      = 1 << 0;
-        const WRITE     = 1 << 1;
-        const EXEC      = 1 << 2;
-        const IOCTL     = 1 << 3;
-        const ADMIN     = 1 << 4;
-        const MAP       = 1 << 5;
-        const BIND      = 1 << 6;
-        const CONNECT   = 1 << 7;
-        const SIGNAL    = 1 << 8;
-        const BYPASS_DAC = 1 << 30;
-    }
-}
-```
+### 4.2 Bootloader (1 file · 1,171 LOC)
 
-- [x] CapId structure with generation counter (types.rs)
-- [x] CapObject enum with all variants (types.rs)
-- [x] CapRights bitflags (types.rs)
-- [x] CapEntry with rights and object (types.rs)
-- [x] CapTable with allocate/lookup/revoke (lib.rs)
-- [ ] **Integration**: fd_table -> CapId (NOT connected to syscalls — tracked in Phase U / S2)
-- [x] **Integration**: Process CapTable field (PRESENT in PCB — `cap_table: Arc<CapTable>` at process.rs:830; only the syscall wiring remains)
-- [ ] Delegation with rights restriction
-- [ ] O_PATH/CLOEXEC/CLOFORK semantics
+UEFI (`uefi` 0.29) loader: reads `kernel.elf`, applies static-PIE `R_X86_64_RELATIVE` relocations with an
+RDRAND-derived KASLR slide (Fisher-Yates over 2 MiB slots, ≤512 MiB), builds 4-level page tables
+(1 GiB high-half + 4 GiB identity), captures GOP framebuffer + ACPI RSDP + cmdline, `exit_boot_services`,
+jumps to `_start`. Boot-phase W^X compromise (2 MiB huge pages RWX until the kernel hardens NX) is
+explicit and handed off to `enforce_nx_for_kernel()`. No kernel-image signature verification (§13).
 
-#### B.2 LSM Hook Infrastructure (Scaffolded - kernel/lsm/)
+### 4.3 User space & tooling
 
-**Hook Points Defined**:
-- Syscall: enter/exit ✅
-- Process: fork/exec/exit/setuid ✅
-- VFS: lookup/open/create/mmap/chmod/mount ✅
-- IPC: mq send/recv, pipe, futex, shm ✅
-- Signal: send_signal, ptrace ✅
-- Network: socket/bind/connect/send/recv ✅
-
-```rust
-// Implemented in kernel/lsm/lib.rs
-trait LsmPolicy: Send + Sync {  // ✅ Trait defined
-    fn syscall_enter(&self, ctx: &SyscallCtx) -> Result<()>;
-    fn file_open(&self, task: &Task, inode: &Inode, flags: OpenFlags) -> Result<()>;
-    fn ipc_send(&self, task: &Task, ep: &Endpoint, bytes: usize) -> Result<()>;
-    // ... other hooks
-}
-```
-
-- [x] LsmPolicy trait with all hooks (lib.rs)
-- [x] LsmContext wrapper (lib.rs)
-- [x] DefaultPolicy (permissive) (policy.rs)
-- [x] Hook registration infrastructure (lib.rs)
-- [x] **Integration**: Hooks called from syscall dispatch (syscall.rs:1141, 1268)
-- [x] **Integration**: Hooks called from VFS operations (file_open, file_create, etc.)
-- [x] Build-time feature gate (lsm feature in Cargo.toml)
-
-#### B.3 Seccomp/Pledge (Complete - kernel/seccomp/)
-
-- [x] SeccompFilter structure (types.rs)
-- [x] SeccompRule with syscall matching (types.rs)
-- [x] SeccompAction enum (Allow/Log/Errno/Trap/Kill) (types.rs)
-- [x] PledgePromise enum (Stdio/Rpath/Wpath/etc.) (types.rs)
-- [x] Filter evaluation logic (lib.rs)
-- [x] **Integration**: Per-process filter storage in PCB (process.rs:460-471)
-- [x] **Integration**: sys_seccomp implemented (syscall 317, syscall.rs:3825)
-- [x] Fork inheritance policy (syscall.rs:1703-1704)
-
-#### B.4 Audit Integration (Complete)
-
-- [x] AuditSecurityClass enum (Lsm/Seccomp/Capability) (audit/lib.rs)
-- [x] emit_lsm_denial helper function (audit/lib.rs)
-- [x] emit_seccomp_violation helper function (audit/lib.rs)
-- [x] emit_capability_event helper function (audit/lib.rs)
-- [x] **Integration**: Helpers called from security paths (lsm hooks emit audit events)
-- [x] MAC decision logging from real denials (lsm::emit_denial_audit)
-- [x] Seccomp violation tracking (seccomp::notify_violation)
-
-**Security Requirements**:
-- Default-allow policy initially
-- Policy load requires ADMIN capability
-- Deny decisions are fail-closed
-- Generation counter prevents use-after-free
-
-**Testing Strategy**:
-- Capability/LSM/audit API unit tests
-- Fork/exec inheritance behavior tests
-- Seccomp rule matching (table-driven)
-- Fuzzer coverage of syscall dispatch path
+- **Ring-3 programs** (~9.7k LOC): native shell (~30 commands), syscall/clone/kcov tests,
+  `hello_musl.c` (static-musl conformance target), and the fuzzing runner family. The init program is
+  feature-selected (`shell` / `syscall_test` / `musl_test` / `clone_test` / `fuzz_runner` / default hello).
+- **Fuzzing** (`fuzz/` ~1.9k LOC + `userspace/fuzzer/`): 10 cargo-fuzz targets (syscall, vfs_path,
+  elf_loader, network_packet, signal, memory, ipc, scheduler, cgroup, futex); 10 TOML syscall
+  descriptions; coverage-guided mutation, resource tracking, stateful state machines, corpus sync, crash
+  triage. Backed by a `mock_kernel` harness. **Caveat:** in-kernel KCOV edge feedback is not yet live
+  (§12), so continuous-mode coverage guidance is limited until that lands.
+- **Scripts / CI:** `scripts/` holds the gate implementations (boot_check, kernel_test, musl_check, SMP,
+  stress, perf, melting, IOMMU, AFL). Workflows: `ci.yml` (fmt/clippy · build · lint · boot+test+musl),
+  `fuzz.yml` (continuous + cargo-fuzz targets + triage + corpus), `afl_fuzz.yml`, `monthly-stress-test.yml`.
 
 ---
 
-### Phase C: Storage Foundation [COMPLETE ✅]
+## 5. Capability Matrix (code-verified)
 
-**Goal**: Usable persistent storage with full permission chain.
+*Within this section, a ✅ bullet means the capability is implemented and wired on the active path (at
+least the 🟢 tier of §0; the crate table in §4.1 carries the finer Validated-vs-Implemented split), and 🟡
+marks a capability that is partial or inert. Every "gap" is stated explicitly.*
 
-**Priority**: High
-**Dependencies**: Phase B (LSM/Capability hooks) ✅
-**Status**: ✅ **COMPLETE** (2026-01-04) - All storage infrastructure ready, devfs read/write fixed
+### 5.1 Boot & memory
 
-#### C.1 Block Layer ✅
+- ✅ UEFI static-PIE boot, high-half map at `0xFFFFFFFF80000000`, KASLR slide from bootloader.
+- ✅ Reservation-aware buddy allocator (orders 0–10, 4 MiB max): heap/kernel/framebuffer/UEFI regions
+  withheld per-page; transactional preflight-then-commit; sticky poison on metadata contradiction.
+- ✅ Dual heap: normal `LockedHeap` + a physically-isolated emergency allocator; **15-class heap-admission
+  ledger** with a *compile-time* proof that hard floors + reserve + admitted == heap size.
+- ✅ COW fork with boot-reserved refcount table; two-phase clone plan (mid-clone OOM leaves parent intact).
+- ✅ Page cache: intrusive LRU, dirty writeback, pressure reclaim, cgroup-charged, bounded (256 pages).
+- ✅ TLB shootdown: per-CPU IPI mailboxes, PCID/INVPCID (3 flush paths), fail-closed ACK (retry→panic).
+- ✅ OOM killer: watermark → cache reclaim → generation-bound scored victim kill, audited.
+- ✅ Guard pages: kernel RSP0 stack, #DF IST stack, NMI IST stack, user stacks (demand-grow floor).
 
-- [x] virtio-blk driver (kernel/block/src/virtio/blk.rs)
-- [x] BIO queue abstraction (kernel/block/src/lib.rs)
-- [x] Minimal I/O scheduler (FIFO)
-- [x] Request batching (VirtQueue)
-- [x] PCI transport with 64-bit BAR support
+### 5.2 Process, threads, scheduler
 
-#### C.2 Page Cache ✅
+- ✅ PCB: pid/tgid/generation, credentials (+generation for TOCTOU defense), affinity/cpuset, 5 namespace
+  pairs, TLS (FS/GS), seccomp/pledge, `cap_table`, per-task rlimits (**advisory-only**), cgroup membership.
+- ✅ fork/exec/clone: COW fork; `CLONE_VM/FS/FILES/SIGHAND/THREAD/SETTLS/*TID/NEW{PID,NS,IPC,NET,USER}`;
+  path-based `execve` with `#!` shebang chains (depth 4); raw-image spawn split to syscall 517 (closes the
+  old confused-deputy); ELF loader rejects W^X segments, overlaps, non-canonical/out-of-range entry, ET_DYN.
+- ✅ auxv: 19 `AT_*` entries incl. `AT_RANDOM`, `AT_SECURE` (seam; no setuid-exec path wired yet).
+- ✅ Scheduler: per-CPU MLFQ (256 priority buckets), **bounded rotating selector (≤16 visits — a security
+  invariant)**, work stealing + periodic load balancing, starvation boosting, cpuset isolation; IRQ-return
+  path is entirely try-lock with `need_resched` rearm; (pid,generation) identity defeats PID-reuse/ABA.
+- ✅ wait/exit: zombie reaping (`wait4`/`waitpid`), SIGCHLD, orphan reparent, exactly-once teardown atomics.
 
-- [x] Radix/tree-based page cache (kernel/mm/page_cache.rs)
-- [x] Page lifecycle with memory pressure handler
-- [x] Writeback policy (dirty page tracking)
-- [x] Cache invalidation (reclaim_pages)
+### 5.3 IPC & signals
 
-#### C.3 File Systems ✅
+- ✅ Pipes: ring buffer, PIPE_BUF-atomic writes, dual-layer refcount, EINTR, **capability IDs
+  pre-allocated at fd-install** (U.S2-3A) with exact rollback.
+- ✅ Capability message queues: per-namespace partitioned registry, unforgeable (pid,generation) sender ACLs.
+- ✅ Futex: WAIT/WAKE/WAIT_TIMEOUT/LOCK_PI/UNLOCK_PI, PI chains (depth 64), per-TGID/global bucket budgets,
+  owner-death (robust) *semantics*. **Gap:** the userspace `robust_list` is stored but not walked on exit.
+- ✅ Signals: 64 signals, per-task masks/dispositions, handler delivery on syscall-return with SROP-defended
+  `rt_sigframe` + `rt_sigreturn`, EINTR wake. **Gaps:** `sigaltstack` unimplemented (frame hardcodes
+  SS_DISABLE); nesting capped at 1.
 
-- [x] ext2 read/write (kernel/vfs/ext2.rs)
-- [x] tmpfs/ramfs (kernel/vfs/ramfs.rs)
-- [x] procfs (/proc/self, /proc/[pid], /proc/meminfo) (kernel/vfs/procfs.rs)
-- [x] Mount table and superblock cache
-- [x] initramfs (CPIO archive) support
-- [x] devfs character device read/write (FileHandle pattern)
+### 5.4 Security framework
 
-#### C.4 Permission Chain Integration ✅
+- ✅ Capabilities: `CapId` = 48-bit generation + 16-bit index; `CapRights` (READ..BYPASS_MAC, AUDIT_*,
+  TRACE_READ); allocate/lookup/revoke/delegate; NOXFER + non-transferable namespace caps; generation
+  exhaustion is an error, not a wrap; double-decrement panics (abort). **fd→capability is wired**:
+  `FileOps::cap_id/set_cap_id` set at open/dup/fork, validated at close; regular files and pipes carry caps.
+- ✅ LSM: **53 hook points** across syscall/process/VFS/memory/IPC/signal/network/livepatch; lock-free
+  policy switch; `SecureBaselinePolicy` (the Secure-profile enforcer) blocks user W^X, non-root→uid/gid 0,
+  confines ptrace (Yama-like), and keeps kpatch deny-by-default even for root. `lsm` feature is **on** in
+  the shipped kernel/kernel_core/vfs builds. Every deny-capable hook emits a denial audit event.
+- ✅ Seccomp/pledge: BPF-like VM (out-of-bounds jump fails closed to Trap), 5 actions (most-restrictive
+  wins), **18 pledge promises** — 14 map to syscall sets; **UNIX/INET/DNS/PTRACE are parseable but map to no
+  syscalls yet (inert — they grant nothing, not a silent-allow)** — 512-bit fast-allow bitmap (disabled if
+  any LdArg), chain caps (64/256/2048), boot cap self-test + pledge/BPF divergence oracle.
+  `no_new_privs` enforced. **TSYNC is deliberately unsupported and fail-closed-rejected** at the boundary.
+- ✅ Audit: SHA-256 hash chain (domain-separated), optional HMAC-SHA256 (set-once, 16–32 B key,
+  CAP_AUDIT_WRITE gated), 256-entry ring with FIFO-evict + dropped counter, cursor export (CAP_AUDIT_READ),
+  cannot be disabled once initialized, mandatory + halt-on-fail under Secure. Persistence is hook-only.
+- ✅ Compliance: Secure/Balanced/Performance profiles (boot-locked, corrupted→Secure); sticky FIPS mode
+  with real KATs (SHA-256, HMAC-SHA256, ECDSA-P256 RFC 6979) and a crypto allow-list. No AES-GCM KAT yet.
 
-```
-MAC (LSM hook) → CapRights → DAC (uid/gid/mode) → ACL →
-inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
-```
+### 5.5 Memory-safety hardening
 
-- [x] All FS ops through LSM + DAC (R25-9 fix)
-- [x] Path resolution depth limit (MAX_PATH_DEPTH)
-- [x] RESOLVE_NO_SYMLINKS flag (openat2 syscall 437)
-- [x] ResolveFlags: NO_SYMLINKS, NO_MAGICLINKS, BENEATH, IN_ROOT, NO_XDEV
-- [x] O_NOFOLLOW, O_PATH open flags
-- [x] Symlink loop detection (max 40 hops)
-- [ ] Full capability integration
+- ✅ W^X validator (walks live CR3, zero-violation contract); single-pass section NX (`.text` R-X, etc.).
+- ✅ SMEP/SMAP/UMIP enabled (SMAP a hard boot requirement); CLAC on every IRQ/exception/syscall entry.
+- ✅ Spectre/Meltdown suite: IBRS/IBPB/STIBP/SSBD (per-CPU, BSP-floor admission for weaker APs),
+  RSB stuffing (32 entries + LFENCE), SWAPGS+LFENCE on entry/exit (CVE-2019-1125). **Retpoline is a status
+  field with no codegen** (honestly declared off). SpectreV1 is LFENCE-in-syscall-path (partial).
+- ✅ ChaCha20 CSPRNG (fast-key-erasure, RDSEED→RDRAND, never zero-fill, 1 MiB reseed), FIPS-gated.
+- ✅ kptr guard (per-boot secret; truthfully reports weak-TSC vs hardware-RNG seeding).
+- 🟡 **KASLR:** text KASLR is *verify-only* (bootloader-supplied slide, currently effectively off); the
+  active randomization is partial KASLR — kernel-stack, user-mmap, and heap bases via CSPRNG.
+- 🟡 **KPTI:** dual-CR3 contexts, seqlock install, PCID allocator, trampoline descriptor all coded, but MM
+  does not yet produce distinct user/kernel roots, so production runs single-CR3 and switches no-op. The
+  live plan tracks this as "R121-2 KPTI trampoline DEFERRED (non-gating)."
 
-#### C.5 OOM Killer ✅
+### 5.6 VFS & storage
 
-- [x] Memory pressure detection (kernel/mm/oom_killer.rs)
-- [x] Process scoring (OomProcessInfo)
-- [x] Kill policy (callback-based, audit event emission)
+- ✅ ramfs (root fs), **ext2/ext3 read-write with JBD2 ordered-data journaling** (plus a Zero-OS-private
+  writer-intent journal format, SHA-256 intent hashing, ownership-graph mount validation), procfs
+  (self/meminfo/cpuinfo/uptime/version/per-PID, access-filtered), devfs (null/zero/console + block nodes),
+  initramfs (CPIO newc, hardlink-aware, read-only), cgroupfs (`/sys/fs/cgroup`).
+- ✅ POSIX DAC (owner/group/other, umask, sticky bit dual-end on rename/unlink), host-mapped credentials
+  (defeats userns euid spoofing), openat2 all RESOLVE_* flags, O_NOFOLLOW/O_PATH, symlink loop cap (40),
+  per-namespace CoW mount tables (eager materialization), renameat2 RENAME_NOREPLACE.
+- ✅ Credential-generation TOCTOU defense: DAC/LSM decisions bound to the exact inode; open re-stats the
+  parent and re-checks ino-stability + DAC before create/truncate; rename revalidates both ends.
+- ✅ Storage backend: virtio-blk (PCI+MMIO), Bio/RequestQueue, RAII IOMMU unmap. **Gaps:** AHCI/NVMe absent;
+  block I/O is synchronous (polling); multiqueue/discard constants defined but unwired.
 
-**Security Requirements**:
-- Write operations enforce W^X
-- Path traversal validates at each component
-- Mount requires ADMIN capability
-- No executable pages from untrusted storage without explicit allow
+### 5.7 Network
 
-**Testing Strategy**:
-- ext2 compatibility tests
-- Page cache consistency tests
-- Permission matrix (MAC/Cap/DAC/flags) table-driven
-- fstress (concurrent open/read)
+- ✅ virtio-net; Ethernet/ARP (anti-poisoning, RX/TX token buckets); IPv4 (checksum, TTL, source-route
+  reject, fragment reassembly with RFC 5722 overlap reject + per-source/global/per-NS caps + 30 s timeout);
+  ICMP (echo/unreachable/time-exceeded, type whitelist, rate limit); UDP (pseudo-header checksum,
+  zero-checksum drop).
+- ✅ TCP: 11-state FSM, 3-way handshake incl. simultaneous open, RFC 6298 RTO + Karn, NewReno,
+  **SACK (RFC 2018/6675, real scoreboard)**, **Timestamps (RFC 7323)**, window scaling, SYN cookies,
+  challenge-ACK (RFC 5961), keyed ISN (RFC 6528), listen/accept, graceful close. *(SACK + Timestamps were
+  listed as gaps in the old roadmaps — they are now implemented and wired.)*
+- ✅ Conntrack (TCP/UDP/ICMP, per-state timeouts, LRU, heap-derived cap 256, per-NS cap 64); **default-DROP
+  stateful firewall** (priority-ordered, ACCEPT/DROP/REJECT, per-namespace tables, catch-all-Accept
+  removed); capability + per-hook LSM socket API; **fail-closed netns TX device-ownership gate**;
+  per-tenant (J.2) socket/half-open/byte/port quotas.
+- ✅ **Gaps:** no IPv6 datapath; virtio-only (no e1000); no checksum/TSO offload, mergeable RX, or multiqueue.
 
----
+### 5.8 SMP, IOMMU & concurrency
 
-### Phase D: Network Foundation [IN PROGRESS]
+- ✅ LAPIC + AP bring-up via INIT-SIPI-SIPI (≤64 CPUs), strict/fail-closed MADT parse, 5 IPI types,
+  IPI TLB shootdown, PCID/INVPCID, `CpuLocal<T>`, RCU grace periods, 9-level lockdep. **Gaps:** IOAPIC
+  driver present but init **disabled** (still on legacy 8259 PIC); **x2APIC unsupported** (hard cap 64 CPUs).
+- 🟡 IOMMU/VT-d: DMAR ACPI parse (strict, 1 GiB-bounded, TOCTOU-hardened two-pass), root/context tables,
+  second-level page tables (AGAW 39/48-bit, validated against CAP.SAGAW), interrupt remapping (SID-verified
+  IRTE), fault handling (FRI rotation, flood quarantine), device isolation/detach, VM-passthrough API.
+  **IOMMU init IS wired into boot** (`main.rs` step 7.53, before net/block probes) — the "DMAR discovery
+  stubbed" comment in `main.rs` is *stale*; discovery works where a DMAR table exists (default QEMU has
+  none → correct legacy fallback). Needs real-hardware validation before ✅.
 
-**Goal**: Minimal usable network stack with kernel protection.
+### 5.9 Containers
 
-**Priority**: High
-**Dependencies**: Phase B (Cap/LSM), Phase A (usercopy)
-**Status**: D.1 Driver infrastructure complete. See [phase-d-network-plan.md](phase-d-network-plan.md) for detailed implementation plan.
+- ✅ Five namespaces — PID (32-level nesting, cascade init-kill, vpid chains), mount (CoW tables), IPC
+  (SysV), network (per-NS devices/sockets + TX gate), user (UID/GID maps, ≤5 extents, unprivileged
+  containers) — via `clone`/`unshare`/`setns`.
+- ✅ Cgroups v2, **six controllers**: CPU (weight + max quota with contention-deferred debt), memory
+  (max/high, charge/uncharge), pids (fork gate), io (bytes/iops token bucket), **files (fd count)**,
+  **net (ephemeral ports)** — exposed via syscalls + `/sys/fs/cgroup` with subtree delegation.
+  **Gap:** no cgroup namespace; unprivileged delegation partial.
 
-**MVP Scope** (Phase D.1):
-- virtio-net driver + IPv4 + ICMP (ping working)
-- UDP sockets with LSM integration
-- Security primitives (ISN randomization, rate limiting)
-- TCP deferred to Phase D.2
+### 5.10 User mode & Linux ABI (Phase U / M0)
 
-#### D.1 Drivers ✅ COMPLETE
-
-- [x] Shared VirtIO transport crate (kernel/virtio/)
-- [x] NetBuf/BufPool packet buffer system (kernel/net/buffer.rs)
-- [x] NetDevice trait abstraction (kernel/net/device.rs)
-- [x] virtio-net driver MVP (kernel/net/virtio_net.rs)
-- [x] VirtIO security hardening (R43: used.id validation, chain traversal limits, double-free detection)
-- [ ] e1000 (fallback)
-- [ ] Network device registration and discovery
-- [ ] Interrupt coalescing
-
-#### D.2 Protocol Stack [IN PROGRESS]
-
-- [x] Ethernet frame parsing (kernel/net/ethernet.rs)
-- [x] IPv4 header validation with security checks (kernel/net/ipv4.rs)
-- [x] ICMP echo (ping) with rate limiting (kernel/net/icmp.rs)
-- [x] Protocol stack integration (kernel/net/stack.rs)
-- [x] Checksum verification (RFC 791 one's complement)
-- [x] Source routing rejection (LSRR/SSRR per RFC 1122)
-- [x] Broadcast echo suppression (Smurf attack prevention)
-- [x] ARP protocol (kernel/net/arp.rs) - RFC 826 with anti-spoofing
-- [x] UDP protocol (kernel/net/udp.rs) - RFC 768 with strict checksums
-- [x] Socket API (kernel/net/socket.rs) - Capability-based UDP sockets with LSM hooks
-- [x] **R48 FIXED**: VirtIO used.idx rewind attack prevention
-- [x] **R48 FIXED**: NetBuf Drop impl (memory leak prevention)
-- [x] **R48 FIXED**: ARP gratuitous learning restriction (poisoning prevention)
-- [x] **R48 FIXED**: LSM check before UDP datagram copy (resource exhaustion)
-- [x] **R48 FIXED**: Early IPv4 fragment filter (CPU DoS prevention)
-- [x] **R49 FIXED**: NetBuf zero-fill before release (information leak prevention)
-- [x] **R49 FIXED**: Huge page cleanup on process exit (memory leak prevention)
-- [x] **R49 FIXED**: NET_BIND_SERVICE capability for privileged ports
-- [x] TCP header parsing (kernel/net/tcp.rs) - RFC 793 with options support
-- [x] TCP state machine (TcpControlBlock, TcpState enum)
-- [x] TCP 3-way handshake (connect SYN → SYN-ACK → ACK)
-- [x] TCP data transfer (PSH+ACK segments, receive buffering)
-- [x] **R50 FIXED**: Keyed ISN generation (RFC 6528 compliant, CSPRNG-seeded)
-- [x] **R50 FIXED**: Sequence window validation (RFC 793/5961)
-- [x] **R50 FIXED**: RST validation + challenge ACK (RFC 5961 Section 3.2)
-- [x] **R50 FIXED**: Global connection limit with stale entry pruning (DoS prevention)
-- [x] **R53 IMPLEMENTED**: TCP retransmission (RFC 6298 RTT/RTO, Karn's algorithm, exponential backoff)
-- [x] **R53-3 FIXED**: Dual timer system (200ms retransmission, 1s TIME_WAIT cleanup)
-- [x] **R55 IMPLEMENTED**: NewReno congestion control (RFC 6582) with partial ACK handling
-- [x] **R56 IMPLEMENTED**: Limited Transmit (RFC 3042) for small-window recovery
-- [x] **R57 IMPLEMENTED**: Idle cwnd validation (RFC 2861) for stale burst prevention
-- [x] **R58 IMPLEMENTED**: Window Scaling (RFC 7323) - WSopt negotiation, 256KB default window
-- [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
-- [x] **R51-1 FIXED**: TCP listen/accept (passive open) - SYN/accept queues implemented
-- [x] **R60 IMPLEMENTED**: Fragment reassembly with RFC 791/815/5722 security hardening
-- [x] **R51-2 FIXED**: Cap TCP sendto allocation (prevent OOM DoS)
-- [x] **R51-3 FIXED**: Ignore SYN-ACK payload (set rcv_nxt = seq+1 only)
-- [x] **R51-4 FIXED**: Rollback socket/cap on fd exhaustion
-- [x] **R51-5 FIXED**: Abort connect on TX failure
-- [x] **R51-6 FIXED**: Initialize FIN/TIME_WAIT timers immediately
-- [x] **R52-1 FIXED**: SYN queue timeout (30s) for half-open connection cleanup
-- [x] **R52-2 FIXED**: Listener close cleanup (SYN/accept queue resource release)
-
-#### D.3 Protection Mechanisms
-
-- [x] Rate limiting (token bucket, 10pps burst 20)
-- [x] Broadcast/multicast response suppression
-- [x] MAC filtering (process only frames addressed to us)
-- [x] ARP rate limiting (RX 50pps, TX 20pps) and cache anti-spoofing
-- [x] ISN randomization (RFC 6528) - R50-1 keyed hash
-- [x] **R54-1 FIXED**: ISN secret auto-upgrade (weak→strong once CSPRNG ready)
-- [x] **R54-2 FIXED**: Challenge ACK rate limiting (100/sec token bucket)
-- [x] **R59-1 IMPLEMENTED**: Ephemeral port randomization (RFC 6056 style CSPRNG)
-- [x] **R59-2 FIXED**: CSPRNG fallback uses RDTSC mixing (not predictable counter)
-- [x] **R60 IMPLEMENTED**: Fragment reassembly anti-DoS (per-source limits, overlap rejection)
-- [x] **R61 IMPLEMENTED**: SYN cookies (RFC 4987) - stateless SYN-ACK on backlog full
-- [x] **R63 IMPLEMENTED**: Conntrack state machine (TCP/UDP/ICMP tracking, direction fix, LRU eviction)
-- [x] **R63 IMPLEMENTED**: Basic firewall (match + action table, stateful filtering, ACCEPT/DROP/REJECT)
-- [x] **R66-1 FIXED**: TCP MSS minimum validation (RFC 879, 536 bytes minimum)
-- [x] **R66-2 FIXED**: TCP Window Scale maximum validation (RFC 7323, max shift 14)
-
-#### D.4 Socket API ✅ COMPLETE
-
-- [x] Socket as CapId handle (kernel/net/socket.rs)
-- [x] LSM hooks for create/bind/connect/send/recv
-- [x] Per-socket security context (SocketLabel)
-- [x] NET_BIND_SERVICE capability for privileged ports (R49-3)
-- [ ] Zero-copy path reservation (pinned buffers)
-
-**Security Requirements**:
-- Default DROP policy option
-- Conntrack resource limits
-- Fragment/TTL/checksum anomaly protection
-- Each socket bound to security context
-
-**Testing Strategy**:
-- Loopback self-test
-- TCP/UDP interop suite
-- SYN flood benchmark
-- Firewall rule table-driven tests
-- Audit event coverage
+- ✅ Ring-3 via SYSCALL/SYSRET, **121 dispatched syscalls**, full SysV auxv, ELF loading with DoS guards,
+  shebang resolution, path-based execve vs. native image-spawn disambiguation, signal delivery.
+- ✅ **Headline:** a statically-linked musl libc binary runs end-to-end (crt→auxv→`printf`→`writev`→
+  `exit(0)`), proven by the bidirectional fail-closed `make musl-check` gate.
+- 🟡 Intentionally divergent from full Linux at M0: rlimits advisory (not enforced on brk/mmap); no dynamic
+  linking (ld.so/PT_INTERP/vDSO), no user-space ASLR; `chown`/`mremap`/`waitid` are stubs; `link` EPERM;
+  `sigaltstack` absent; setuid-exec not wired.
 
 ---
 
-### Phase E: SMP & Concurrency [IN PROGRESS]
+## 6. Gap Analysis vs Linux
 
-**Goal**: Multi-core support with correct synchronization.
+Scoped to the actual target (UEFI/QEMU x86_64 server workloads), not "Linux parity" in the abstract.
 
-**Priority**: Medium-High (can be deferred after D)
-**Dependencies**: Phase A.6 (SMP-ready interfaces)
-**Status**: E.1/E.3 complete, AP bootstrap integrated in main.rs, APs park in HLT loop awaiting scheduler work
+| Area | Linux | Nilix | Assessment |
+|---|---|---|---|
+| Boot / arch | EFISTUB/GRUB, full ACPI, x2APIC, CET | UEFI single-stage, RSDP/MADT/DMAR/HPET only, xAPIC, no CET | Strong; missing DSDT/SSDT, x2APIC, shadow stacks, Secure Boot |
+| Memory | SLUB/SLAB, NUMA, swap, THP, KASAN | buddy + global heap + admission ledger, COW, page cache, PCID | Core is production-grade; **no slab allocator**, no NUMA/swap/THP |
+| Process | task_struct, NPTL, ptrace | full PCB, COW fork, clone flags, 64 signals | Mature; thread-group basics only, no ptrace, sigaltstack absent |
+| Scheduler | CFS/EEVDF, cgroup sched | per-CPU MLFQ, work-steal, cpuset, cgroup CPU quota | Solid for the workload; not CFS-class fairness |
+| Security | LSM+SELinux/AppArmor, seccomp-bpf, caps | LSM (53 hooks) + SecureBaseline, seccomp+pledge, capabilities | Framework complete; exceeds many Linux *defaults*; no policy-language MAC |
+| Containers | 7 namespaces, cgroups v2 | 5 namespaces + cgroups v2 (6 controllers) | Near-parity; **no cgroup or time namespace** |
+| Network | full TCP/IP + netfilter + IPv6 | TCP (NewReno/SACK/TS/WS/cookies) + UDP/ICMP + conntrack + firewall | Strong IPv4; **no IPv6**, no NAT, no L7 |
+| Storage | ext4/xfs/btrfs/zfs, io_uring | ext2/ext3 (JBD2), ramfs, procfs, devfs, cgroupfs | ext2/3 with journaling is well beyond the old "ramfs/devfs" gap; no modern FS, sync I/O only |
+| Drivers | 10M+ LOC | VGA/serial/PS-2/virtio-net/virtio-blk | Minimal by design (virtio-only); no driver framework |
+| Virtualization | KVM | IOMMU/VT-d passthrough prep | IOMMU present; no hypervisor |
+| User space | glibc/musl + ld.so, full POSIX | byte-exact syscall ABI, **static-musl runs** | M0 foundation; no dynamic linking / vDSO / user ASLR yet |
 
-**R67 SMP Security Blockers** (2026-01-18): **ALL FIXED ✅**
-- ~~R67-1 (CRITICAL): TLB shootdown ineffective~~ ✅
-- ~~R67-2 (HIGH): Shared trampoline data races~~ ✅
-- ~~R67-4 (HIGH): Scheduler globals not per-CPU~~ ✅
-- ~~R67-5 (HIGH): Page table mutations lack cross-CPU serialization~~ ✅
-- ~~R67-6 (HIGH): Fork/COW lacks per-MM lock~~ ✅
-- ~~R67-8 (HIGH): SYSCALL per-CPU arrays use slot 0 only~~ ✅
-- ~~R67-9 (HIGH): SYSRET path missing RFLAGS mask~~ ✅
-- ~~R67-11 (HIGH): Syscall scratch stack depth unchecked~~ ✅
-- ~~R67-3 (MEDIUM): LAPIC ID verification~~ ✅
-- ~~R67-7 (MEDIUM): IRQ FPU nesting~~ ✅
-- ~~R67-10 (MEDIUM): Context switch FPU interrupt safety~~ ✅
-
-#### E.1 Hardware Initialization
-
-- [x] LAPIC initialization (kernel/arch/apic.rs - init_lapic, lapic_eoi, lapic_id)
-- [x] IOAPIC initialization (kernel/arch/apic.rs - init_ioapic, ioapic_route_irq)
-- [ ] HPET timer
-- [x] AP boot infrastructure (kernel/arch/smp.rs - start_aps, ap_rust_entry, ACPI MADT parsing)
-- [x] AP trampoline (kernel/arch/smp.rs - generate_trampoline() runtime binary blob)
-- [x] IPI type table (kernel/arch/ipi.rs - 5 types 0xFB-0xFF, kernel/arch/apic.rs - send_ipi/send_init_ipi/send_sipi)
-- [x] AP boot integration (main.rs hooks arch::apic::init(), init_bsp(), start_aps())
-
-#### E.2 TLB Shootdown
-
-- [x] IPI-driven global/range invalidation (kernel/mm/tlb_shootdown.rs - R70 fixes)
-- [ ] Batched shootdown
-- [x] Online CPU count guard (assert_single_core_mode, R70-2 mailbox serialization)
-- [x] PCID/ASID support (kernel/tlb_ops crate - INVPCID types 0-3, init_invpcid_support)
-
-#### E.3 Per-CPU Data
-
-- [x] Per-CPU segment (%gs) - CpuLocal<T> abstraction (kernel/cpu_local/lib.rs)
-- [x] Syscall stack per-CPU (PerCpuData.syscall_stack_top)
-- [x] Scheduler runqueue per-CPU (R69-1 fix - CpuLocal<Mutex<ReadyQueues>>)
-- [x] IRQ stack per-CPU (PerCpuData.irq_stack_top)
-- [x] Safe cross-CPU access API (current_cpu(), init_bsp(), init_ap())
-- [x] Per-CPU FPU save areas (R66-7 fix - kernel/arch/interrupts.rs)
-- [x] LAPIC ID → CPU index mapping (kernel/cpu_local/lib.rs - register_cpu_id, current_cpu_id)
-
-#### E.4 Synchronization
-
-- [x] Lock class annotations (LockClassKey, LockLevel in lock_ordering.rs)
-- [x] Runtime lockdep checker (debug) - LockdepMutex with IRQ-safe validation (R71-3 fix)
-- [x] RCU/epoch-based garbage collection - call_rcu with grace period advancement (R71-1 fix)
-- [x] Futex priority inheritance - Iterative PI propagation (R72-1, R72-2 fixes)
-
-#### E.5 Scheduler SMP
-
-- [x] Per-CPU runqueues (R69-1 - CpuLocal<Mutex<ReadyQueues>> in enhanced_scheduler.rs)
-- [x] Load balancing (R69 - work stealing + periodic migration in balance_queues())
-- [x] CPU affinity (R72 - sched_setaffinity/sched_getaffinity syscalls 203/204)
-- [x] CPU isolation (cpuset) - Runtime test validates hierarchical mask enforcement
-
-**Security Requirements**:
-- Cross-CPU kernel pointers obfuscated (kptr guard)
-- IPI path audited
-- SMP enable gate: assert IPI/TLB ready
-- No global lock held during user code execution
-
-**Testing Strategy**:
-- SMP self-check (IPI ping-pong, TLB flush verification)
-- RCU torture test
-- Lockdep scenario tests
-- Scheduler timing consistency
+**Net:** the security framework, container isolation, and SMP concurrency are the strongest areas
+(production-grade for the QEMU target); the widest gaps are driver breadth, a slab allocator, IPv6, modern
+filesystems, and the still-open user-space dynamic-linking work (Phase U).
 
 ---
 
-### Phase F: Resource Governance [IN PROGRESS]
+## 7. Phase Chronology (A–U)
 
-**Goal**: Multi-tenant resource isolation.
+The project evolved through a security-first phase order. Phases A–G are complete; the H–T bands were
+**hardening/QA work arcs** (audit rounds and the S-wave hardening series), not separate feature phases —
+they folded into the continuous audit process (§11) rather than delivering new subsystems. Phase U is the
+current feature frontier.
 
-**Priority**: Medium
-**Dependencies**: Phase B (Cap/LSM), Phase C (storage), Phase D (network)
-**Status**: F.1 Complete, F.2-F.3 pending
-
-#### F.1 Namespaces ✅ **COMPLETE**
-
-- [x] PID namespace (isolated PID numbering)
-  - Hierarchical namespace tree with MAX_PID_NS_LEVEL=32 depth
-  - CLONE_NEWPID and unshare(CLONE_NEWPID) support
-  - Namespace-aware getpid/getppid/gettid/kill syscalls
-  - Init death cascade (SIGKILL to all namespace members)
-  - fork/clone/wait return namespace-local PIDs
-- [x] Mount namespace (isolated FS view) ✅ **COMPLETE** (2026-01-25)
-  - `kernel/kernel_core/mount_namespace.rs`: Core MountNamespace structure
-  - Per-namespace mount tables in VFS (`NamespaceMountTable`)
-  - CLONE_NEWNS in sys_clone with copy-on-write mount table
-  - sys_unshare(CLONE_NEWNS) for process mount namespace isolation
-  - sys_setns (syscall 308) for mount namespace switching
-  - MountNamespaceFd for namespace file descriptor wrapper
-  - R74-2 fix: Eager materialization prevents mount leakage
-  - Security: CAP_SYS_ADMIN or root required, single-threaded validation
-  - Runtime test: `MountNamespaceIsolationTest` (hierarchy, IDs, isolation, depth limit)
-  - Audit events: `AuditObject::Namespace` for clone/unshare/setns logging
-  - See [phase-f-mount-namespace-plan.md](phase-f-mount-namespace-plan.md) for details
-- [x] IPC namespace (isolated message queues) ✅ **COMPLETE** (2026-01-25)
-  - `kernel/kernel_core/ipc_namespace.rs`: Core IpcNamespace structure
-  - Hierarchical namespace tree with MAX_IPC_NS_LEVEL=32 depth
-  - CLONE_NEWIPC in sys_clone creates isolated IPC namespace
-  - Isolated System V IPC resources (message queues, semaphores, shared memory)
-  - IpcNamespaceFd for namespace file descriptor wrapper
-  - Security: CAP_SYS_ADMIN or root required
-  - Runtime test: `IpcNamespaceIsolationTest` (hierarchy, IDs, refcounting, depth limit)
-  - Audit events: `AuditObject::Namespace` for clone logging
-- [x] Network namespace (isolated stack) ✅ **COMPLETE** (2026-01-25)
-  - `kernel/kernel_core/net_namespace.rs`: Core NetNamespace structure
-  - Hierarchical namespace tree with MAX_NET_NS_LEVEL=32 depth
-  - CLONE_NEWNET in sys_clone creates isolated network namespace
-  - Device management (add_device, remove_device, move_device)
-  - Each namespace has loopback interface by default
-  - NetNamespaceFd for namespace file descriptor wrapper
-  - Security: CAP_NET_ADMIN or root required
-  - Runtime test: `NetNamespaceIsolationTest` (hierarchy, IDs, devices, refcounting, depth limit)
-  - Audit events: `AuditObject::Namespace` for clone logging
-- [x] User namespace (UID/GID mapping) ✅ **COMPLETE** (2026-01-27)
-  - `kernel/kernel_core/user_namespace.rs`: Core UserNamespace structure
-  - Hierarchical namespace tree with MAX_USER_NS_LEVEL=32 depth
-  - CLONE_NEWUSER in sys_clone creates isolated user namespace
-  - UID/GID mapping tables (up to 5 extents each, single-write semantics)
-  - Mapping functions: map_uid_to_ns, map_uid_from_ns, map_gid_to_ns, map_gid_from_ns
-  - UserNamespaceFd for namespace file descriptor wrapper
-  - Security: Does NOT require CAP_SYS_ADMIN (enables unprivileged containers)
-  - Permission checks: Root can set arbitrary mappings, non-root can only map own ID
-  - Parent containment validation: Child mappings must be within parent's mapped ranges
-  - CAS-based namespace count limiting (MAX_USER_NS_COUNT=1024)
-  - Codex security review: 3 issues fixed (CAS loop, permission checks, parent validation)
-
-#### F.2 Cgroups v2 ✅ **COMPLETE**
-
-**Core Infrastructure** ✅
-- [x] CgroupNode hierarchy management
-- [x] CGROUP_REGISTRY global state
-- [x] Limits: MAX_CGROUP_DEPTH=8, MAX_CGROUPS=4096
-- [x] CgroupStats (lock-free atomic counters)
-- [x] PCB integration (cgroup_id field, inheritance)
-- [x] Codex security review (3 issues fixed)
-
-**Controllers**
-- [x] pids controller (process count limit in fork path)
-- [x] cpu controller (cpu.weight time slice scaling, cpu.max quota enforcement with IRQ-safe throttling)
-- [x] memory controller (try_charge_memory CAS in mmap/brk, uncharge_memory in munmap/brk-shrink)
-- [x] io controller (io.max bps/iops with token bucket algorithm, stale token clamping, oversized I/O support)
-
-**Syscalls & Interface** ✅
-- [x] sys_cgroup_create / sys_cgroup_destroy (syscalls 500/501)
-- [x] sys_cgroup_attach (syscall 502, self-migration)
-- [x] sys_cgroup_set_limit / sys_cgroup_get_stats (syscalls 503/504)
-- [x] cgroup2 filesystem (/sys/fs/cgroup) - cgroupfs mount with control files
-
-#### F.3 IOMMU/VT-d [IN PROGRESS]
-
-**Core Infrastructure** ✅
-- [x] ACPI DMAR table parser (kernel/iommu/dmar.rs) - strict bounds checking, OOB prevention
-- [x] VT-d hardware driver (kernel/iommu/vtd.rs) - register interface, root/context tables
-- [x] Domain management (kernel/iommu/domain.rs) - identity/paged domains, overlap rejection
-- [x] Public API (kernel/iommu/lib.rs) - init, attach_device, map_range, unmap_range
-- [x] Fail-closed security model (ensure_iommu_ready, translation_enabled checks)
-- [x] Codex security review R79: 3 issues fixed (fail-open paths, DMAR OOB, identity aliasing)
-
-**DMA Isolation** ✅
-- [x] Second-level page table allocation (alloc_zeroed_page_table with direct map validation)
-- [x] 4-level page table walk (PML4→PDPT→PD→PT for 48-bit AGAW)
-- [x] 3-level page table walk (PDPT→PD→PT for 39-bit AGAW)
-- [x] Page table locking (page_table_lock prevents concurrent mutation)
-- [x] Superpage detection and rejection (PS bit checking)
-- [x] VT-d A/D flags handling (don't set reserved bits)
-- [x] Codex security review R80: 5 issues fixed (direct map, locking, AGAW, A/D, superpage)
-
-**Device Domain Binding** ✅
-- [x] Root table allocation (init_root_table with CAS, direct map validation)
-- [x] Context table allocation (ensure_context_table with CAS)
-- [x] Context entry programming (attach_device with domain type handling)
-- [x] Pass-through capability check (ECAP.PT validation, fail-closed)
-- [x] Context cache invalidation (invalidate_context_device after programming)
-- [x] IOTLB invalidation (domain-level after entry programming)
-- [x] Codex security review R81: 3 issues (2 fixed, 1 documented)
-
-**VirtIO Integration** ✅
-- [x] IOMMU attach before bus mastering (kernel/net/src/pci.rs, kernel/block/src/pci.rs)
-- [x] Fail-closed error handling (skip device if attach fails)
-- [x] Bus master cleanup on probe failure (disable DMA capability)
-- [x] Net/Block subsystem integration (lib.rs cleanup paths)
-- [x] Codex security review R82: 4 issues fixed (attach order, cleanup paths)
-
-**Interrupt Remapping** ✅
-- [x] Interrupt Remapping Table Entry (IRTE) structure (kernel/iommu/interrupt.rs)
-- [x] InterruptRemappingTable with bitmap allocator (256 entries default)
-- [x] IrteHandle for MSI/MSI-X address/data programming
-- [x] ECAP.IR hardware support detection
-- [x] IRTA register programming with EIM support
-- [x] GCMD.IRE enable with GSTS.IRES polling
-- [x] Fail-closed when platform DMAR requires IR
-- [x] Graceful degradation when IR not required
-- [x] Codex security review R84: 3 issues fixed (concurrency, cleanup, zeroing), 1 documented (x2APIC)
-
-**Fault Handling** ✅
-- [x] FaultReason/FaultType enums with security-relevant detection
-- [x] FaultRecord structure with BDF parsing
-- [x] read_fault_records() with FRI-based rotation (R85-1)
-- [x] Checked MMIO pointer arithmetic (R85-2)
-- [x] read_and_clear_fault_status() with full W1C (R85-3)
-- [x] Fault flood mitigation with interrupt masking (R85-4)
-- [x] Console/audit logging with address redaction (R85-5)
-- [x] VtdUnit integration (read_fault_records, set_fault_interrupt_enabled)
-- [x] Public API (handle_dma_faults, FaultConfig)
-- [x] Codex security review R85: 5 issues fixed (100% fix rate)
-
-**Device Isolation** ✅
-- [x] PCI configuration space access (legacy I/O port 0xCF8/0xCFC)
-- [x] Bus Master Enable disable with verification read-back
-- [x] Segment validation for multi-segment systems (R86-1)
-- [x] PCI config RMW serialization via global lock (R86-2)
-- [x] IOTLB/context invalidation after isolation (R86-3)
-- [x] Forced console logging in isolation mode (R86-4)
-- [x] VtdUnit get_device_domain() for domain lookup
-- [x] Codex security review R86: 4 issues fixed (100% fix rate)
-
-**Device Detach API** ✅
-- [x] detach_device() public API (kernel/iommu/lib.rs)
-- [x] detach_device_from_domain() for specific domain detach
-- [x] VtdUnit::detach_device() with validation chain
-- [x] VtdUnit::disable_bus_mastering() helper with read-back verification
-- [x] DeviceNotAttached error variant
-- [x] Atomic domain tracking update (R87-1 fix)
-- [x] Multi-segment graceful degradation (R87-2 fix)
-- [x] Codex security review R87: 2 issues fixed (100% fix rate)
-
-**VM Passthrough Preparation** ✅
-- [x] VM domain registry (VM_DOMAINS, VM_DEVICE_IRTES tracking)
-- [x] create_vm_domain() for isolated VM address spaces
-- [x] assign_device_to_vm() with IRTE allocation and rollback
-- [x] unassign_device_from_vm() with detach-first ordering (R88-2)
-- [x] VtdUnit::interrupt_remapping_table() accessor
-- [x] IR enable enforcement for passthrough (R88-1 fix)
-- [x] Device detach priority over IR cleanup (R88-2 fix)
-- [x] Codex security review R88: 2 issues fixed (100% fix rate)
-
-**Security Requirements**:
-- Default resource limits
-- Cross-namespace ops require ADMIN cap
-- IOMMU binding validation
-- OOM policy configurable
-
-**Testing Strategy**:
-- Namespace isolation matrix
-- Cgroup stress and throttle tests
-- DMA pollution prevention tests
+| Phase | Theme | Status | Evidence |
+|---|---|---|---|
+| A | Security foundation: usercopy/SMAP, Spectre suite, audit upgrade, SMP-ready interfaces | ✅ Complete | `security/`, `kernel_core/usercopy.rs` |
+| B | Capability + LSM + seccomp framework, wired into syscall/VFS/process | ✅ Complete | `cap/`, `lsm/`, `seccomp/` |
+| C | Storage: virtio-blk, page cache, ext2, procfs/devfs/initramfs, OOM killer, openat2 | ✅ Complete | `block/`, `vfs/`, `mm/page_cache.rs` |
+| D | Network: full IPv4 TCP/IP with conntrack + stateful firewall | ✅ Complete | `net/` (17 files) |
+| E | SMP & concurrency: AP boot, IPI TLB shootdown, per-CPU sched, RCU, lockdep, futex PI | ✅ Complete | `arch/smp.rs`, `sched/`, `cpu_local/` |
+| F | Resource governance: 5 namespaces, cgroups v2 (6 controllers), IOMMU/VT-d driver | ✅ Complete | `kernel_core/*_namespace.rs`, `cgroup.rs`, `iommu/` |
+| G | Production readiness: KASLR/KPTI machinery, tracing/watchdog/profiler/kdump, livepatch | ✅ Complete (KPTI inert, §5.5) | `security/kaslr.rs`, `trace/`, `livepatch/` |
+| H–T | Hardening / QA work arcs (S-wave, R100–R185 audit series) | ✅ Folded into §11 | `docs/review/` |
+| **U** | **User Mode & Linux ABI (Compat-ZeroABI)** | 🟡 **In progress** (M0 done; U.S2-3B landed) | §9 |
 
 ---
 
-### Phase G: Production Readiness [IN PROGRESS]
+## 8. 1.0-Preview Release Gate
 
-**Goal**: Observable, compliant, updatable.
+**Gate definition:** three consecutive full-codebase audit rounds with **zero HIGH and zero CRITICAL**
+findings on an immutable tree (the "zero-HIGH streak 3/3"), plus resolution of all D1 (highest-severity)
+design findings.
 
-**Priority**: Medium
-**Dependencies**: All previous phases
-**Status**: ✅ **G.1 COMPLETE** (tracepoints, counters, watchdog, profiler, kdump all implemented)
+**Current status: BLOCKED (2026-07-23).**
 
-#### G.1 Observability ✅ **COMPLETE**
+| Gate item | State |
+|---|---|
+| Zero-HIGH streak | **1/3** — reached 3/3 on 2026-07-22 (R181–R183), then reset by R184's real CRITICAL+HIGH; R185 (clean) rebuilt it to 1/3 |
+| Open CRITICAL / HIGH / MEDIUM | 0 / 0 / 0 actionable (R184's 1 CRITICAL + 1 HIGH fixed; 10 of 11 reported HIGH and all 18 MEDIUM were verified false positives) |
+| D1 design findings | **2 open** (D1-RES heap-admission scope proof; D1-ISO per-namespace dataplane config) — **these block the gate** |
+| Proof-obligation ledger | 8 of 12 PO artifacts complete |
 
-- [x] Tracepoints/counters infrastructure ✅ (R89 - trace crate with per-CPU counters)
-- [x] Health monitoring (watchdog, hung-task) ✅ (R89 - 512-slot watchdog table)
-- [x] Sampling profiler ✅ (R91 - PC sampling with per-CPU ring buffers, seqlock publishing)
-- [x] Counter hot-path integration ✅ (all 15 TraceCounter variants wired to hot paths)
-- [x] kdump (encrypted, redacted) ✅ (R92 - ChaCha20 encryption, KptrGuard redaction, panic-safe)
+**What "unblocked" will and won't mean:** clearing the gate qualifies the tree for a **1.0-Preview**
+(feature-and-hardening milestone) — it is **not** a general-availability, production-certified, or
+ABI-stable release. Phase U (dynamic linking, glibc, OCI) remains ahead, KPTI is still inert, and
+real-hardware/bare-metal validation is outstanding.
 
-#### G.2 Live Patching ✅ **SECURITY COMPLETE** (R93 issues fixed)
-
-**R93 Security Fixes Completed:**
-- [x] Compile-time guard against insecure-ecdsa-stub in release builds (R93-2)
-- [x] Default fail-closed when no ECDSA verifier wired (R93-2)
-- [x] Patch target/handler address validation within kernel .text (R93-10)
-- [x] W^X seal_exec enforcement - required trait method (R93-11)
-- [x] Target mapping validation before volatile access (R93-12)
-- [x] sys_kpatch_unload syscall for patch lifecycle (R93-13)
-
-**Remaining for Production:**
-- [x] Real ECDSA P-256 signature verification ✅ (p256 + ecdsa crates, KAT-gated, RFC 6979 test vector)
-- [x] Rollback policy ✅ (rollback_recent_patches() auto-disables patches within TSC window on fault)
-- [ ] Patch dependency tracking (ordered enable/disable)
-
-#### G.3 Compliance ✅ **SECURITY COMPLETE** (R93 issues fixed)
-
-**R93 Security Fixes Completed:**
-- [x] FIPS self-tests with real KATs (R93-14) - SHA-256 + HMAC-SHA256 NIST vectors
-- [x] kdump FIPS cipher selection (R93-15) - fail-closed in FIPS mode
-- [x] Panic output redaction in Secure profile (R93-16)
-- [x] Cgroup capability/namespace model (R93-17) - CAP_SYS_ADMIN checks
-
-**Remaining for Production:**
-- [ ] Hardening profiles policy wiring (Secure/Balanced/Performance)
-- [ ] Audit remote delivery (sys_audit_export)
-- [ ] Cgroup delegation for unprivileged container managers
-- [x] ECDSA KAT when signature verification implemented ✅ (delegates to livepatch::ecdsa_p256 KAT)
-
-**Security Requirements**:
-- Debug interfaces require Cap/LSM authorization
-- Dump redaction with kptr guard
-- Patch signature mandatory
-
-**Testing Strategy**:
-- Trace/kdump regression
-- Hot patch drill
-- Benchmark and regression
-- Compliance config scan
+> **README reconciliation:** `README.md` §6 currently states the gate is "UNBLOCKED (streak 3/3)". That
+> reflected the 2026-07-22 state and is stale as of R184 (2026-07-23). This roadmap is authoritative;
+> the README should be updated to "BLOCKED — streak 1/3, rebuilding" on its next edit.
 
 ---
 
-### Phase U: User Mode & ABI [DESIGN-LOCKED 2026-06-18]
+## 9. Current Execution — Phase U (Compat-ZeroABI)
 
-**Goal**: Run real user-space software with a security-first ABI. Decision: **Compat-ZeroABI** — a clean capability-first **native core ABI** plus a **de-privileged Linux-compat personality**, reached via a **converge-later** sequencing.
+**Decision (2026-06-18, locked):** a capability-first **native core ABI** plus a **de-privileged
+Linux-compat personality**, sequenced *converge-later* — build the user-mode foundation on the existing
+Linux cABI first (M0), prove it with a musl gate, then fork the native/personality split. Reached via a
+17-agent analysis workflow (6-dimension analysis → 7 adversarial `file:line` verifications → 3-architect
+panel). Target: glibc + full Linux/OCI, dynamic linking in scope.
 
-**Priority**: High (the next strategic frontier after Phase G)
-**Dependencies**: Phases A–F (process model, cap/LSM/seccomp, namespaces, cgroups), Phase G observability
-**Status**: Decision locked; **M0 foundation pending** (no real libc binary runs end-to-end yet under any strategy)
+**Slice status:**
 
-#### Why this decision
-
-A 17-agent analysis workflow (6-dimension analysis → 7 adversarial `file:line` verifications → 3-architect judge panel → synthesis) established the load-bearing fact: **the Linux syscall surface looks ~60–70% built but the pieces that let a libc binary *start and run* are structurally absent.** Verified gaps:
-- **No auxv** built on the initial user stack (`sys_exec` stops at the envp NULL; zero `AT_*` symbols) → a real musl/glibc crt cannot start.
-- **No signal-handler delivery** (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` all ENOSYS; `SignalAction` has no `Handler` variant, no signal frame, no sigreturn trampoline).
-- **No dynamic linking** (PT_LOAD-only loader, rejects ET_DYN/PIE, no PT_INTERP/ld.so).
-- **`execve(59)` is a raw in-memory-image loader** (confused-deputy: path bytes parsed as ELF), not path-based execve.
-- `cap_table` exists on every PCB but is **unwired** (live surface uses the ambient `fd_table`).
-
-What *does* work and is reused: byte-exact Linux x86-64 numbering, SysV registers, Linux errno, ~95 real syscalls, and a fully-working **TLS + pthread-join** path.
-
-The build-out is unavoidable under any strategy; the only question is *where the messy Linux semantics land*. Compat-ZeroABI keeps them out of the kernel TCB (security-first) while still running unmodified Linux/OCI workloads (enterprise) and finally activating the capability model as a differentiator.
-
-#### Architecture: native core + **hybrid** personality
-
-- **Native core ABI** — small, freezable, capability-first surface in a disjoint syscall block (reserve **600–631**). Five frozen primitives: `native_invoke`, `native_spawn`, `native_endpoint_call` (synchronous call/reply — *does not exist yet*), `native_event_wait`, `native_cap_op`. Wire `cap_table` by making the Linux `fd` an index that resolves to a `CapId` (preserves all fd invariants).
-- **Hybrid personality (honest feasibility verdict)** — a *fully* de-privileged personality is **infeasible today**: IPC is async-only, 4 KiB-capped, no zero-copy (`sys_mmap` ignores flags, `CapObject::Shm` is a stub), so a per-syscall userspace round-trip is untenable on hot paths. Realized form:
-  - **In-kernel, capability/LSM-gated path** for hot/safe syscalls (read/write/lseek/fstat/futex/mmap/clock_gettime).
-  - **De-privileged userspace server** for the cold/dangerous surface only: ld.so/exec brokering, `/proc`, ptrace, signal disposition, ioctl demux, OCI orchestration (jailed in its own namespaces + cgroup + seccomp, holding only delegated caps).
-- **vDSO / TLS / robust-futex stay core mechanism**; ld.so/PT_INTERP/PIE/ASLR/auxv *policy* lives in the personality.
-
-#### Phased roadmap (S0–S3 reversible; **S4 = point of no return**)
-
-- **U.M0 — Universal foundation on the existing cABI** *(gate: static musl hello runs to completion, exit 0)*: auxv builder + SysV entry stack; minimal startup syscalls (clock_gettime/readv/rt_sigprocmask); **musl conformance harness** (`scripts/musl_check.sh`); exec disambiguation; signal delivery end-to-end; ~30-syscall fill (fcntl, poll/select, pread/pwrite, rlimits, mremap, rename/link/symlink/readlink/statx, pipe2, ioctl/termios) with seccomp↔dispatch reconciliation; user-stack guard page + demand-grow.
-- **U.S1** — exec disambiguation hardened (native raw-image spawn vs Linux path-based execve on disjoint numbers).
-- **U.S2** — native core cap-wiring (`fd_table` value → `CapId`; land the 5 native syscalls). Closes the `roadmap.md` B.1 fd→CapId seam.
-- **U.S3** — synchronous IPC + shared memory (the gate); **measure cold-path latency**.
-- **U.S4** — personality stand-up (**point of no return**): cold/dangerous Linux semantics move to the de-privileged server; hot/safe syscalls stay in-kernel.
-- **U.S5** — dynamic linking (ld.so/PT_INTERP/PIE/ASLR + vDSO).
-- **U.S6** — glibc (robust-futex list, TLS, vDSO clock_gettime).
-- **U.S7** — full Linux/OCI (compose with namespaces + cgroups to run unmodified container images).
-
-**Security Requirements**: native ABI minimal and frozen; compat personality runs with least authority; native vs Linux exec/spawn on disjoint entry points; signal-frame and sigreturn paths validate restored RIP/RSP canonically (SROP defense); seccomp/LSM policy reconciled against the actually-dispatched surface.
-
-**Testing Strategy**: a musl/glibc **conformance gate** in CI that boots a real libc binary and asserts a libc-attributable serial marker **and** clean exit 0 (today `make test` always exits 0); extend to a static busybox-style program, then dynamically-linked + a representative runtime as later milestones complete. See `docs/next-phase-plan.md` for the M0 work-item breakdown with `file:line` seams.
+| Slice | Scope | Status |
+|---|---|---|
+| U.M0 | auxv + SysV entry stack, startup syscalls, musl conformance gate, exec disambiguation, signal delivery, ~30-syscall fill, user-stack guard | ✅ **Done** (musl-check green) |
+| U.S1 | exec disambiguation hardened (native raw-image spawn vs. Linux path-execve on disjoint numbers — syscall 517) | ✅ Done |
+| U.S2 | native core cap-wiring: fd value → CapId; land native syscalls | 🟡 In progress — **3A** (pipe CapIds) + **3B** (FileOps cap_id trait infra, commit `b179cd6`) **done**; 3B audited sound (R184) |
+| U.S2-4/5 | `native_cap_op(604)` + seccomp 600–631; generation-exhaustion errno | 🔵 Planned (unblocked, parked behind the streak) |
+| U.S3 | synchronous IPC + shared memory (the gate); measure cold-path latency | 🔵 Planned |
+| U.S4 | personality stand-up (**point of no return**): cold/dangerous Linux semantics move to the de-privileged server | 🔵 Planned |
+| U.S5 | dynamic linking (ld.so/PT_INTERP/PIE/ASLR + vDSO) | 🔵 Planned |
+| U.S6 | glibc (robust-futex list walk, TLS, vDSO clock_gettime) | ⚪ Directional |
+| U.S7 | full Linux/OCI (unmodified container images over namespaces + cgroups) | ⚪ Directional |
 
 ---
 
-## Testing Strategy
+## 10. Forward Roadmap
 
-### Current Tests
+### Near term (from the live plan v15.38, gate-directed)
 
-- Buddy allocator self-test
-- Boot sequence validation
-- Integration tests in QEMU
-- Clone/thread test suite
+1. **R186 audit — streak candidate 2/3** (over an unchanged tree). Must run in Codex-cooperative mode or
+   apply the hardened orchestrator backstop with a **caller/lock-context lens** (re-read every CRITICAL/HIGH
+   candidate together with its enclosing lock scope and all call sites) — the lens whose absence caused
+   R184 to over-report HIGH by 10×.
+2. **R187 — streak candidate 3/3.** Clean → the streak side of the gate is satisfied.
+3. **D1 residual mitigation** (the real gate-blocking implementation work): D1-RES whole-heap
+   admission/ownership scope proof; D1-ISO `AuthorizedTxDevice` + per-namespace dataplane config resolver.
+4. **Housekeeping cleanups** (§12): delete `sched/process.rs` and `kernel_core/kcov_syscalls.rs` orphans;
+   remove dead demo modules; correct the stale IOMMU/DMAR boot comment; either wire the KCOV recorder or
+   mark it explicitly non-functional; drop the unused `uart_16550` dependency.
 
-### Testing Infrastructure Needed
+### Mid term (remaining Phase U)
 
-| Category | Tests |
-|----------|-------|
-| **Syscall** | Fuzzer for all 35+ syscalls, error path coverage |
-| **Memory** | COW stress, mmap/munmap cycles, page cache consistency |
-| **IPC** | Pipe throughput, futex contention, signal delivery |
-| **Security** | Capability inheritance, LSM policy enforcement, audit integrity |
-| **SMP** | Lock contention, TLB shootdown, scheduler fairness |
-| **Storage** | FS compatibility, I/O error handling |
-| **Network** | Protocol compliance, DoS resistance |
+5. **U.S2-4/5** native capability syscalls + seccomp reconciliation for the 600–631 native block.
+6. **U.S3** synchronous IPC + shared memory, then measure cold-path latency (the U.S4 go/no-go gate).
+7. **U.S4** de-privileged personality stand-up — the point of no return for the hybrid split.
+8. **U.S5** dynamic linking: ld.so/PT_INTERP/PIE, user-space ASLR, vDSO.
 
-### Debugging Tools
+### Long term (directional)
 
-- QEMU monitor integration
-- GDB remote debugging (:1234)
-- Serial console logging
-- kdump analysis (future)
-
----
-
-## Code Quality Metrics
-
-### Audit History
-
-| Date | Round | Issues Found | Fixed | Notes |
-|------|-------|--------------|-------|-------|
-| 2025-12-09 | 1-3 | 25 | 24 | Initial security baseline |
-| 2025-12-10 | 4-7 | 22 | 21 | Preemption, COW, scheduler |
-| 2025-12-11 | 8-13 | 23 | 19 | IPC, signals, context switch |
-| 2025-12-15-16 | 16-19 | 11 | 10 | VFS, W^X, audit subsystem |
-| 2025-12-17-18 | 20-22 | 29 | 19 | Ring 3, SYSCALL/SYSRET |
-| 2025-12-20 | 23-24 | 12 | 12 | Thread/Clone, TLS, usercopy |
-| 2025-12-23 to 2026-01-02 | 25-40 | 36 | 32 | Cap/LSM/Seccomp integration, VirtIO |
-| 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 |
-| 2026-01-04 | 42 | 5 | 5 | procfs PID-reuse, getdents64, page cache - **ALL FIXED** |
-| 2026-01-05 | 43 | 5 | 5 | VirtIO used.id OOB, descriptor chain loop, double-free - **ALL FIXED** |
-| 2026-01-06 | 44-47 | 16 | 16 | ARP/UDP/Socket API, VirtIO hardening - **ALL FIXED** |
-| 2026-01-07 | 48 | 6 | 6 | Network stack security audit - **ALL R48 FIXED** |
-| 2026-01-08 | 49 | 3 | 3 | NetBuf leak, NET_BIND_SERVICE - **ALL R49 FIXED** |
-| 2026-01-09 | 50 | 6 | 6 | TCP ISN/RST/limits, FIN/close states - **ALL R50 FIXED** |
-| 2026-01-10 | 51 | 6 | 6 | TCP resource mgmt, listen/accept - **ALL R51 FIXED** |
-| 2026-01-11 | 52-53 | 6 | 6 | SYN queue timeout, listener cleanup, RTT/RTO, timer granularity - **ALL FIXED** |
-| 2026-01-12 | 54-58 | 12 | 10 | ISN upgrade, Challenge ACK, NewReno, Limited Transmit, Idle cwnd, Window Scaling - **2 DEFERRED** |
-| 2026-01-13 | 59 | 2 | 2 | Ephemeral port randomization, CSPRNG fallback security - **ALL FIXED** |
-| 2026-01-13 | 60 | 10 | 10 | IP fragment reassembly (RFC 791/815/5722), security hardening - **ALL FIXED** |
-| 2026-01-13 | 61 | 2 | 2 | SYN cookies (RFC 4987), ACK validation, pure ACK enforcement - **ALL FIXED** |
-| 2026-01-14 | 62 | 7 | 6 | ARP static eviction, timer contention, fragment byte limits, SYN cookie age, ISN entropy, LSM hooks - **6 FIXED, 1 DEFERRED** |
-| 2026-01-14 | - | - | - | **Conntrack state machine implemented** (TCP/UDP/ICMP tracking, stateful firewall foundation) |
-| 2026-01-15 | 63-64 | 12 | 11 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count, firewall - **11 FIXED, 1 DOCUMENTED** |
-| 2026-01-16 | 65 | 26 | 17 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **17 FIXED, 9 OPEN** |
-| 2026-01-17 | 66 | 11 | 11 | TCP options validation (MSS/WS), VirtIO-blk ring init/jump detection/double-free, scheduler priority cap, fragment CAS, per-CPU FPU - **ALL FIXED** |
-| 2026-01-18 | 67 | 11 | 11 | **SMP SECURITY AUDIT** - TLB shootdown ✅, trampoline claim flag ✅, LAPIC verification ✅, scheduler per-CPU ✅, PT cross-CPU lock ✅, fork/COW lock ✅, FPU nesting ✅, syscall GS-relative ✅, SYSRET RFLAGS ✅, syscall depth ✅, context switch FPU ✅ - **ALL FIXED** |
-| 2026-01-19 | 68 | 7 | 7 | TLB shootdown ACK timeout, COW TLB flush, FPU nesting safety - **ALL FIXED** |
-| 2026-01-20 | 69 | 5 | 5 | PhysicalPageRefCount ABA race, lazy FPU migration, load balancer affinity, ASID writer starvation, lock ordering docs - **ALL FIXED** |
-| 2026-01-21 | 70 | 3 | 3 | AP idle loop race, TLB mailbox overwrite, CPU affinity semantics - **ALL FIXED** |
-| 2026-01-22 | 71 | 4 | 4 | RCU grace period progress, RCU memory ordering, Lockdep IRQ window, TLB self-ACK safety - **ALL FIXED** |
-| 2026-01-22 | 72 | 0 | 0 | CPU affinity syscalls (sched_setaffinity/sched_getaffinity) - **E.5 FEATURE** |
-| 2026-01-25 | 74 | 1 | 1 | Mount namespace materialization (R74-2 eager snapshot) - **F.1 FEATURE** |
-| 2026-01-25 | - | 0 | 0 | Mount namespace runtime test + audit events - **F.1 COMPLETE** |
-| 2026-01-26 | 75 | 4 | 4 | **Namespace structure** - IPC/Net resource isolation gaps ✅, move_device permission ✅, NS FD refcount ✅ |
-| 2026-01-26 | 76 | 3 | 3 | **Namespace enforcement** - Socket NS check ✅, NS count limits ✅, Socket quotas ✅ (F.1 COMPLETE) |
-| 2026-01-27 | 77 | 5 | 5 | **Resource accounting** - TCP child socket quota ✅, Fork cpuset leak ✅, delete_cgroup race ✅, Memory CAS ✅, NS guard ✅ |
-| 2026-01-27 | 78 | 3 | 3 | **User namespace** - CAS count guard ✅, Permission checks ✅, Parent containment validation ✅ (F.1 COMPLETE) |
-| 2026-01-27 | 79 | 3 | 3 | **IOMMU/VT-d** - Fail-open paths ✅, DMAR OOB reads ✅, Identity aliasing ✅ (F.3 IN PROGRESS) |
-| 2026-01-27 | 80 | 5 | 5 | **SL page tables** - Direct map range check ✅, PT lock concurrency ✅, AGAW-aware walk ✅, A/D flags reserved ✅, Superpage corruption ✅ |
-| 2026-01-27 | 81 | 3 | 2 | **Context table** - Context/IOTLB invalidation ✅, Pass-through capability check ✅, Direct map bound (documented) |
-| 2026-01-27 | 82 | 4 | 4 | **VirtIO IOMMU integration** - Attach before bus master ✅, Fail-closed on attach error ✅, Disable bus master on probe fail ✅, Net/Block cleanup ✅ |
-| 2026-01-28 | 83 | 5 | 5 | **IOMMU/Cgroup security** - Page table atomicity ✅, setns fail-closed ✅, PIDs hierarchy ✅, AGAW validation ✅, CPU quota contention ✅ |
-| 2026-01-28 | 84 | 4 | 3 | **Interrupt Remapping** - Concurrent setup race ✅, IRTA cleanup ✅, IR table zeroing ✅, x2APIC mode (documented) |
-| 2026-01-28 | 85 | 5 | 5 | **Fault Handling** - FRI rotation ✅, MMIO bounds check ✅, FRI W1C clear ✅, Fault flood mitigation ✅, Address redaction ✅ |
-| 2026-01-28 | 86 | 4 | 4 | **Device Isolation** - Segment validation ✅, PCI RMW serialization ✅, IOTLB quiesce ✅, Forced logging ✅ |
-| 2026-01-28 | 87 | 2 | 2 | **Device Detach API** - Atomic domain tracking ✅, Multi-segment graceful degradation ✅ |
-| 2026-01-28 | 88 | 2 | 2 | **VM Passthrough** - IR enable verification ✅, Unassign cleanup order ✅ |
-| 2026-01-28 | 89 | 4 | 3 | **Observability (G.1)** - Watchdog race ✅, 64-bit generation ✅, transmute fix ✅, counter wrap (documented) |
-| 2026-01-29 | 90 | 4 | 4 | **Cross-subsystem** - IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ |
-| 2026-01-30 | 91 | 3 | 3 | **Profiler (G.1)** - current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, profiler control race ✅ |
-| 2026-01-30 | 92 | 5 | 5 | **kdump (G.1)** - Multi-CPU race ✅, Stack page boundary ✅, ASCII hex redaction ✅, Key cleanup ✅, try_fill_random fallback ✅ |
-| 2026-01-31 | 93 | 18 | 18 | **SECURITY DEBT** - Fork NS escape (CRITICAL) ✅, Livepatch guard (CRITICAL) ✅, Fail-open (HIGH) ✅, sys_access (HIGH) ✅, cgroup_attach (HIGH) ✅, ELF cgroup (HIGH) ✅, Identity map (HIGH) ✅, kdump fallback (HIGH) ✅, TLB shootdown (HIGH) ✅, Livepatch address (HIGH) ✅, seal_exec (HIGH) ✅, target mapping (MEDIUM) ✅, kpatch_unload (MEDIUM) ✅, FIPS KATs (MEDIUM) ✅, kdump FIPS (MEDIUM) ✅, panic redact (MEDIUM) ✅, cgroup caps (MEDIUM) ✅, ELF filesz (LOW) ✅ - **ALL 18 FIXED** |
-| 2026-02-01 | 94 | 16 | 16 | **SECURITY AUDIT** - Identity map USER_ACCESSIBLE (CRITICAL) ✅, insecure-ecdsa-stub guard (CRITICAL) ✅, ECDSA KAT deadlock (HIGH) ✅, fips_state fail-open (HIGH) ✅, PID translation fail-open (HIGH) ✅, Firewall default DROP (HIGH) ✅, IOMMU legacy signaling (HIGH) ✅, IOMMU kernel domain SLPT (HIGH) ✅, TLB shootdown mailbox (MEDIUM→HIGH) ✅, current_profile fallback (MEDIUM) ✅, KAT negative tests (MEDIUM) ✅, kdump storage scrub (MEDIUM) ✅, HMAC key scrub (MEDIUM) ✅, cgroup TaskNotAttached (MEDIUM) ✅, kdump emit-once (LOW) ✅, verify_chain_hmac (LOW) ✅ - **ALL 16 FIXED** |
-| 2026-02-02 | 95 | 8 | 8 | **DMA/CONNTRACK/EXT2** - Conntrack bypass (CRITICAL) ✅, Cpuset escape (CRITICAL) ✅, sys_fstatat/sys_openat ptr deref (HIGH) ✅, ext2 unaligned reads (HIGH) ✅, VirtIO DMA leak (HIGH) ✅, DMA leak amplification (MEDIUM) ✅, DMA drop fence (MEDIUM) ✅, IOMMU PTE ordering (LOW) ✅ - **ALL 8 FIXED** |
-| 2026-02-03 | 96 | 9 | 9 | **EXT2/CONNTRACK/VIRTIO** - ext2 indirect block UB (HIGH) ✅, Conntrack LRU growth (HIGH) ✅, VirtIO RX lifecycle (HIGH) ✅, ext2 dir entry UB (HIGH) ✅, ext2 superblock overflow (MEDIUM) ✅, DmaError classification (MEDIUM) ✅, 3 LOW ✅ - **ALL 9 FIXED** |
-| 2026-02-04 | 97 | 4 | 3+1 | **SYSCALL/EXT2** - sys_writev overflow+UB (HIGH) ✅, ext2 file_block truncation (HIGH) ✅, ext2 superblock validation (MEDIUM) ✅, VirtIO-net IOMMU mapping (DESIGN, documented) - **3 FIXED, 1 DOCUMENTED** |
-| 2026-02-05 | 98 | 3 | 3 | **SIGNAL/NET/TIMER** - SIGSTOP/SIGCONT lost wakeups (HIGH) ✅, NetBuf IOMMU fault storm (MEDIUM) ✅, BSP idle loop drain (LOW) ✅ - **ALL 3 FIXED** |
-| 2026-02-06 | 99 | 4 | 4 | **NET/EXT2** - NetBuf integer overflow bypasses size check (HIGH) ✅, ext2 read_block bounds (MEDIUM) ✅, ext2 BGDT overflow (MEDIUM) ✅, ext2 validate_block deadlock (LOW) ✅ - **ALL 4 FIXED** |
-| **Total** | **99** | **496** | **454 (91.5%)** | **42 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
-
-### Current Status
-
-- **Fixed**: 454 issues (91.5%)
-- **Open**: 42 issues (8.5%)
-  - R65 remaining issues (SMP-related, non-blocking)
-  - R81-3 (Direct map bound) documented risk
-  - R84-4 (x2APIC mode) documented limitation
-  - R89-4 (Counter overflow) documented acceptable risk
-- **Phase E Progress**: ✅ **COMPLETE**
-  - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
-  - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
-  - E.3 Per-CPU Data: ✅ CpuLocal<T>, per-CPU stacks, runqueues
-  - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71), Futex PI (R72)
-  - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
-  - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
-- **Phase F Progress**: ✅ **COMPLETE**
-  - F.1 Namespaces: ✅ **COMPLETE** - All 5 types: PID/Mount/IPC/Network/User with full isolation (R75-R78)
-  - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem + R83 hierarchical PIDs
-  - F.3 IOMMU/VT-d: ✅ **COMPLETE** - Core infrastructure ✅, Second-level page tables ✅, Context table ✅, VirtIO integration ✅, Interrupt Remapping ✅ (R84), Fault Handling ✅ (R85), Device Isolation ✅ (R86), Device Detach API ✅ (R87), **VM Passthrough ✅** (R88)
-- **Phase G Progress**: **G.1/G.2/G.3 SECURITY COMPLETE**
-  - G.1 Observability: ✅ **COMPLETE** - Tracepoints, Per-CPU counters, Watchdog (R89), Profiler (R91), Counter integration, kdump (R92)
-  - G.2 Live Patching: ✅ **SECURITY COMPLETE** - R93-2,10,11,12,13 fixed; ECDSA P-256 ✅; Rollback policy ✅; remaining: dependencies
-  - G.3 Compliance: ✅ **SECURITY COMPLETE** - R93-14,15,16,17 fixed; remaining: hardening profiles, audit delivery
-- **R93 Security Debt**: ✅ **FULLY RESOLVED** - All 18 issues fixed (2 CRITICAL, 9 HIGH, 5 MEDIUM, 2 LOW)
-- **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
-- **Container Foundation**: COMPLETE - All 5 namespace types + Cgroups v2 provide full container isolation
-- **Virtualization Foundation**: COMPLETE - IOMMU/VT-d with VM passthrough preparation
-- **R93 Key Fixes**: Fork namespace escape (CRITICAL), Livepatch compile guard (CRITICAL), Fail-closed patterns, Cgroup authorization, ELF memory accounting, Identity map isolation, kdump encryption required, TLB shootdown fail-closed, Address validation, seal_exec, kpatch_unload, FIPS KATs, Panic redaction, Cgroup capabilities
-- **R94 Key Fixes**: ECDSA KAT deadlock-free, FIPS/Profile fail-closed, PID namespace fail-closed, TLB shootdown mailbox panic, kdump storage scrub, HMAC key scrub, cgroup attach fail-closed, firewall default DROP, IOMMU legacy fail-closed, verify_chain_hmac, **IOMMU kernel domain SLPT**
-- **R95 Key Fixes**: Conntrack state bypass (CRITICAL), Cpuset escape (CRITICAL), sys_fstatat/sys_openat user ptr, ext2 unaligned reads, VirtIO DMA leak, DMA lifecycle
-- **R96 Key Fixes**: ext2 indirect block UB, Conntrack LRU unbounded growth, VirtIO RX lifecycle, ext2 dir entry UB, syscall TOCTOU
-- **R97 Key Fixes**: sys_writev integer overflow + unaligned UB, ext2 file_block u64→u32 truncation, ext2 superblock validation
-- **R98 Key Fixes**: SIGSTOP/SIGCONT state overwrite lost wakeups (H-34), NetBuf IOMMU fault storm, BSP idle loop timer drain
-- **R99 Key Fixes**: NetBuf integer overflow bypasses DMA size check, ext2 read_block bounds validation, ext2 BGDT checked arithmetic, ext2 validate_block lock-free (deadlock fix)
-
-See [qa-2026-02-06.md](review/qa-2026-02-06.md) for latest audit report.
+9. **U.S6/S7** glibc compatibility (robust-futex list walk, vDSO clock_gettime) and full Linux/OCI
+   (unmodified container images).
+10. Enterprise/perf capabilities: slab allocator, NUMA-aware scheduling, per-tenant network budgets beyond
+    J.2, KVM/hypervisor support, IPv6, a modern journaling FS, real KPTI dual-root (unblocks Meltdown-class
+    defense-in-depth), x2APIC / >64 CPUs, Secure Boot + kernel-image signing, bare-metal validation.
 
 ---
 
-## Version History
+## 11. Security-Audit History
+
+Nilix is developed under continuous adversarial review: each round audits the kernel, files findings by
+severity, fixes them, and converges via bidirectional peer review (Claude Code + the Codex MCP, or
+independent Claude-solo skeptic fleets when Codex is unavailable) before the round closes.
+
+| Era | Rounds | Focus | Outcome |
+|---|---|---|---|
+| Baseline | R1–R24 (2025-12) | Boot, memory, process isolation, IPC, VFS, Ring 3 | ~138 filed, ~111 fixed |
+| Framework | R25–R49 (2025-12→2026-01) | Cap/LSM/seccomp integration, storage, early network | ext2, page cache, VirtIO hardening |
+| Network | R50–R99 (2026-01→02) | TCP/IP hardening, conntrack, firewall, DMA/ext2 | R99 close: 496 filed / 454 fixed |
+| Governance | R100–R155 (2026-02→05) | Namespaces, cgroups, IOMMU, MSR/GS, fetch_add sweep | ~881 filed / ~95.8% fixed by R155 |
+| Concurrency | R156–R180 (2026-05→07) | IRQ-safety (sync_safe), deadlock/liveness, heap-admission, ABBA | R172 context-switch CRITICAL; R180 32 impl findings |
+| Gate push | R181–R185 (2026-07) | Zero-HIGH streak + U.S2 cap infra + design queue | R181–R183 clean (3/3); R184 1C+1H real; R185 clean (1/3) |
+
+**Cumulative (through R185):** ~1,315 findings filed, ~1,161 fixed. The remaining ~154 filed-but-not-fixed
+findings are **not open vulnerabilities**; their approximate disposition is:
+
+- **Verification-refuted false positives** — the dominant share. R184 alone contributed 28 (10 HIGH + 18
+  MEDIUM refuted with line-cited evidence); earlier rounds recalibrated or refuted many more on
+  orchestrator re-read (the R169/R177/R178 lesson).
+- **Documented / accepted-risk / deferred** — a small set: R40 KASLR/KPTI architectural, R65 SMP,
+  R81-3 / R84-4 / R89-4 documented risks, R121-2 KPTI trampoline (deferred, non-gating).
+- **Duplicate / superseded** — findings re-filed across rounds then merged.
+- **Currently open actionable: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW.** The only open items are the 6
+  design findings below (2 of them gate-blocking).
+
+These are estimates aggregated across 185 rounds; the authoritative per-round disposition lives in
+`docs/review/`. The count above is *findings-filed*, not *distinct-defects* — the audit false-positive rate
+is itself tracked as a process risk (§14).
+
+**Design findings (6 tracked from R180 — 5 open, 1 implemented pending closure):**
+
+| ID | Sev | Title | State |
+|---|---|---|---|
+| D1-RES-HEAP-BUDGET-SCOPE | D1 | whole-heap admission/ownership scope proof | **open** — executable leg done; formal proof pending (**blocks gate**) |
+| D1-ISO-NETNS-DATAPLANE | D1 | per-namespace device-ownership + dataplane isolation | **open** — fail-closed TX gate landed; config resolver PO pending (**blocks gate**) |
+| D2-ARC-CLONE-LOCK | D2 | cross-registry lock-ordering / transaction API | open — partial (point primitive) |
+| D2-ERR-VFS-FALLIBILITY | D2 | end-to-end VFS fallibility (prepare/commit) | open — partial (local pattern; lint pending) |
+| D2-TST-ABI-BYTES | D2 | static ABI-layout oracle vs. wrapper drift | open — partial (musl behavioral oracles) |
+| D3-RES-COW-RESERVATION | D3 | COW metadata reservation transaction | implemented (overlap oracle + test) — pending formal closure |
+
+(PO = *proof obligation*, the design queue's closure artifacts; 8 of 12 complete as of 2026-07-22.)
+
+**Process risk — audit calibration:** the R184 MODE-S (Codex-unavailable) round produced a ~91%
+false-positive rate on HIGH by analyzing function-local logic without the enclosing lock scope or callers.
+The mitigation is now mandatory: audits run Codex-cooperative, or apply an orchestrator re-read with a
+caller/lock-context lens, before any finding is treated as real. Per-round reports live in `docs/review/`;
+the live plan is `docs/review/nextplan/`.
+
+---
+
+## 12. Known Debt, Cleanups & Deferred Items
+
+Surfaced by the 2026-07-23 full-source survey — none block the gate, but all are tracked so "surveyed"
+never reads as "clean":
+
+- **Orphaned files:** `kernel/sched/process.rs` (279 LOC legacy PCB, superseded by `kernel_core::process`)
+  and `kernel/kernel_core/kcov_syscalls.rs` (147-line stale patch fragment, superseded by handlers in
+  `syscall.rs`) — both un-`mod`'d dead code; delete candidates.
+- **KCOV recorder is a no-op:** the management syscalls (520–524) and per-task buffer exist, but
+  `record_edge_for_current` is a TODO and `record_edge!` is never invoked — coverage dumps return 0 edges.
+  KCOV is scaffolding until this lands; continuous-fuzzing coverage feedback is limited meanwhile.
+- **Livepatch inert:** trusted ECDSA-P256 key slots are all-zero placeholders → verification fail-closes to
+  ENOSYS until real keys are provisioned (boot warns). The mechanism (KAT-gated verify, topo-sort deps,
+  rollback, W^X seal) is complete.
+- **KPTI inert / text-KASLR verify-only** (§5.5) — the highest-value hardening residuals.
+- **Stale in-code comment:** `main.rs` claims DMAR discovery is stubbed; the `dmar.rs` parser is actually a
+  complete fail-closed RSDP/XSDT walker (§5.8). Correct the comment.
+- **trace read-guard fail-open until installed:** metric exports are ungated until `install_read_guard` runs
+  at boot — a boot-ordering hazard.
+- **Unused dependency:** `drivers` declares `uart_16550` but hand-rolls COM1 port I/O; the real serial init
+  lives in `arch`. Drop the dep or adopt the crate.
+- **Deferred syscalls/features:** `sigaltstack`, `robust_list` exit walk, `mremap`/`chown`/`waitid` real
+  bodies, rlimit enforcement, setuid-exec, cgroup namespace — tracked in the Phase U / feature backlog.
+- **~20 of 25 P0 regression tests are placeholders** awaiting fork/exec/futex/signal/VFS syscall infra
+  (they report `Warning`/deferred, counted separately from failures).
+
+---
+
+## 13. Testing, CI & Fuzzing
+
+**CI (`.github/workflows/ci.yml`)** — four parallel jobs on every push/PR to `main`:
+`fmt-check + clippy` · `build` (PIE/build-std/hardened) · `lint` (4 custom source gates) · `boot-check +
+test + musl-check`.
+
+**Boot/conformance gates** read real exit codes from the serial log + `-d int` interrupt log (never QEMU's
+own exit code):
+
+- `make boot-check` — kernel reaches user space/idle **and** zero NX-violation instruction-fetch #PF
+  (the `v=0e e=0011` signature).
+- `make test` — parses the in-kernel `=== Test Summary: N passed, M deferred, K failed ===` with `K==0`,
+  zero panic, zero NX #PF; exit polarity 0 PASS / 1 FAILED / 2 NOT-RUN.
+- `make musl-check` — builds `--features musl_test`, asserts the libc-attributable marker (`42 * 2 = 84`),
+  the success line, clean `exit 0`, zero NX #PF, no panic; **bidirectional and fail-closed** (the default
+  native-Rust kernel, which also exits 0, never prints the libc marker → fails the gate).
+
+**Custom lints (`make lint`):** `lint-release` (no ungated `println!`), `lint-smap` (only `usercopy.rs`
+instantiates `UserAccessGuard`), `lint-fetch-add` (no bare `fetch_add(1)` for IDs/refcounts), `lint-repr-c-copy`
+(padding-safety annotation on `#[repr(C)]` user-boundary copies).
+
+**Runtime tests (~30 core + 25 P0 regressions + 4 heavy-stress):** heap/buddy, cap-table lifecycle,
+seccomp (strict + pledge), audit hash chain, network parse/loopback, SMP online/IPI/TLB, cpuset,
+scheduler affinity/starvation, process creation, security subsystem, TCP SYN-flood limit, all 5 namespace
+isolation tests. Extended suites: `stress_test.sh` (6 scenarios), `extended_smp_test.sh` (8/16-core),
+`perf_regression_test.sh` (framework; benchmarks pending), `melting_test.sh` (bare-metal thermal, needs HW).
+
+**Fuzzing:** 10 cargo-fuzz targets + 10 TOML syscall descriptions + a coverage-guided mutation engine,
+resource tracking, stateful state machines, corpus sync, and 95%+ crash-triage dedup, backed by a
+`mock_kernel` harness. `fuzz.yml` runs continuous + target modes + triage + corpus sync; `afl_fuzz.yml`
+and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV coverage feedback is pending
+(§12), so the continuous mode's guidance is currently structural rather than coverage-driven.
+
+---
+
+## 14. Risks & Dependencies
+
+| Risk | Severity | Status | Note |
+|---|---|---|---|
+| Audit over-reporting (solo mode, no lock/caller context) | Process | **Active** | R184 was 91% false-positive on HIGH; R186+ must use Codex or the caller/lock lens |
+| D1 design debt (heap-scope proof, netns dataplane) | D1 | Open | **Blocks the 1.0-Preview gate** |
+| KPTI inert (single-CR3) | Design | Deferred (R121-2) | Meltdown-class defense relies on hardware immunity until MM dual-root lands |
+| No real-hardware validation | Coverage | Open | QEMU-only; melting/bare-metal gates are frameworks |
+| Livepatch trust keys unprovisioned | Ops | Open | mechanism complete, non-functional until keys wired |
+| Zero host-side unit tests | Coverage | Waived (D-3) | in-kernel runtime tests + fuzzing are the substitute; Phase K arc |
+| Single build target (x86_64/UEFI/virtio) | Scope | By design | no portability layer; not a near-term goal |
+
+---
+
+## 15. Version History
 
 | Version | Date | Milestone |
-|---------|------|-----------|
-| 0.1.x | 2025-12-09/10 | Phase 1-2: Boot, memory, security fixes |
-| 0.2.0 | 2025-12-10 | Phase 2: Process isolation |
-| 0.3.x | 2025-12-11 | Phase 3-4: Multi-process, IPC |
-| 0.4.x | 2025-12-15/16 | Phase 5: VFS, security hardening |
-| 0.5.x | 2025-12-17/18 | Phase 6.1: Ring 3, SYSCALL/SYSRET |
-| **0.6.x** | **2025-12-20** | **Phase 6.2: Thread/Clone, security fixes** |
-| **0.6.5** | **2025-12-21** | **Phase A: Security foundation (~80%), Phase B scaffolded** |
-| 0.7.0 | TBD | Phase A: Security foundation complete |
-| 0.8.0 | TBD | Phase B: Capability/MAC |
-| 0.9.0 | TBD | Phase C: Storage |
-| 0.10.0 | TBD | Phase D: Network |
-| 0.11.0 | TBD | Phase E: SMP |
-| 1.0.0 | TBD | First stable release |
+|---|---|---|
+| 0.1–0.5 | 2025-12 | Boot, memory, process isolation, IPC, VFS, Ring 3 |
+| 0.6.x | 2025-12→2026-01 | Threads/Clone; Phase A/B security framework |
+| 0.7–0.9 | 2026-01→02 | Phase C storage, Phase D network |
+| 0.10–0.12 | 2026-02→05 | Phase E SMP, Phase F governance (namespaces, cgroups, IOMMU) |
+| 0.13.x | 2026-05→07 | Phase G production-readiness hardening; concurrency/IRQ-safety arc |
+| 0.14.x | 2026-07 | Phase U M0 (static-musl runs); U.S2 cap infra; 1.0-Preview gate push |
+| 1.0-Preview | TBD | zero-HIGH streak 3/3 + D1 resolved (gate) |
+| 1.0.0 | TBD | first stable release (post Phase U personality) |
 
 ---
 
-## Contributing Guidelines
+*This unified roadmap reflects a security-first approach — correctness and isolation before performance —
+and is grounded in a full read of the source tree at the snapshot commit above, cross-checked against the
+live plan and audit reports. It supersedes both prior roadmap documents. For the authoritative per-round
+security status see `docs/review/`; for live priorities see `docs/review/nextplan/`.*
 
-1. All code changes require security review for:
-   - Syscall implementations
-   - Memory management changes
-   - IPC/network code
-   - Capability checks
-
-2. Run `make build && make test` before committing
-
-3. Security-sensitive PRs require:
-   - Threat model documentation
-   - LSM hook integration
-   - Audit event emission
-   - Fuzz coverage
-
-4. Follow existing code patterns and Rust idioms
-
----
-
-*This roadmap reflects a security-first approach, prioritizing correctness and isolation over performance optimization. SMP support is intentionally deferred until the security framework is complete.*
