@@ -16452,11 +16452,28 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
                 },
             );
 
+            // R184-2 FIX: Hold Process lock across both cap allocation AND set_cap_id
+            // to maintain the allocate_file_cap safety contract (line 2895): "The caller
+            // MUST immediately call `file_handle.set_cap_id(cap_id)` after this returns Ok".
+            //
+            // SAFETY PROOF: The original code released the lock between allocation and
+            // attachment, creating a window where:
+            // 1. Cap is allocated (refcount=1) but not yet attached to the FileHandle
+            // 2. A concurrent CLONE_THREAD could observe the cap without its fd installed
+            // 3. If fd_reservation.install() subsequently fails (line 16472), the orphaned
+            //    cap would never be decremented (no handle knows about it)
+            //
+            // This pattern is inconsistent with sys_open_internal (lines 10307-10319),
+            // which correctly holds the lock across both operations. The fix matches the
+            // canonical pattern: allocate → attach → unlock → install fd.
+            //
+            // spin::once::Once is a spinlock (not a blocking mutex), and CapTable::allocate()
+            // is documented as LEAF (line 2892), so holding the lock across set_cap_id is safe.
             let proc_guard = process.lock();
             match proc_guard.cap_table.allocate(cap_entry) {
                 Ok(cap_id) => {
+                    file_ops.set_cap_id(cap_id); // R184-2 FIX: BEFORE unlock
                     drop(proc_guard);
-                    file_ops.set_cap_id(cap_id);
                 }
                 Err(_) => {
                     drop(proc_guard);
