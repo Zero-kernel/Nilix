@@ -25,7 +25,6 @@
 //! pointer (an SROP info-leak gate).
 
 use crate::syscall::SyscallError;
-use alloc::vec::Vec;
 
 // ── Component sizes (bytes) ──
 const PRETCODE_SIZE: u64 = 8;
@@ -36,6 +35,11 @@ const SIGINFO_SIZE: u64 = 128;
 pub const FXSAVE_SIZE: usize = 512;
 /// Total frame size (pretcode + ucontext + siginfo + fpstate).
 const FRAME_SIZE: u64 = PRETCODE_SIZE + UC_SIZE + SIGINFO_SIZE + FXSAVE_SIZE as u64; // 952
+
+/// D1RES-R1: byte size of the caller-provided in-place staging buffer for
+/// `assemble_sigframe`. Derived from `FRAME_SIZE` (single source of truth — no
+/// duplicated `952`) so a layout-constant change cannot desynchronize the buffer.
+pub const SIGFRAME_SIZE: usize = FRAME_SIZE as usize;
 
 // ── Offsets from `frame_base` ──
 const OFF_PRETCODE: u64 = 0;
@@ -237,11 +241,17 @@ fn put_u32(buf: &mut [u8], off: u64, val: u32) {
     buf[o..o + 4].copy_from_slice(&val.to_ne_bytes());
 }
 
-/// Assemble the full `rt_sigframe` into a ZERO-FILLED kernel buffer (pure; the zero
-/// fill is load-bearing — it provides the siginfo/ucontext padding, the FXSAVE
-/// reserved-tail zeroing, and prevents any kernel-stack residue from leaking to
-/// userspace). `fpstate` must be the 512-byte live FXSAVE image (already sanitized of
-/// the kernel-stack residue tail by the caller via `sanitize_fxsave_for_export`).
+/// Assemble the full `rt_sigframe` IN PLACE into the caller-provided kernel buffer
+/// (pure; heap-free — D1RES-R1). The function zero-fills the ENTIRE buffer before any
+/// field write; the zero fill is LOAD-BEARING — it provides the siginfo/ucontext
+/// padding, the FXSAVE reserved-tail zeroing, and prevents any kernel-stack residue
+/// (including the caller's own dead stack bytes when the buffer is reused) from
+/// leaking to userspace. `fpstate` must be the 512-byte live FXSAVE image already
+/// sanitized via `sanitize_fxsave_for_export`. Errs (`EFAULT`) ONLY if `layout.len`
+/// disagrees with `SIGFRAME_SIZE` — a corrupt layout must never reach the usercopy;
+/// the gate runs BEFORE any byte is written. The layout ABI (offsets, `FRAME_SIZE`,
+/// `frame_base % 16 == 8`, fixed fpstate offset) is unchanged — only the staging
+/// container moved from a heap `Vec` to this caller stack buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_sigframe(
     layout: &SigframeLayout,
@@ -250,11 +260,16 @@ pub fn assemble_sigframe(
     signum: u32,
     handler: u64,
     restorer: u64,
-) -> Result<Vec<u8>, SyscallError> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.try_reserve_exact(layout.len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    buf.resize(layout.len, 0); // zero-fill is LOAD-BEARING (padding + no residue leak).
+    out: &mut [u8; SIGFRAME_SIZE],
+) -> Result<(), SyscallError> {
+    // Overflow gate BEFORE any write: a corrupt layout can never diverge the
+    // initialized region from the caller's fixed-size usercopy. Unreachable in
+    // practice (compute_sigframe_layout always sets len == FRAME_SIZE).
+    if layout.len != SIGFRAME_SIZE {
+        return Err(SyscallError::EFAULT);
+    }
+    out.fill(0); // zero-fill is LOAD-BEARING (padding + no residue leak).
+    let mut buf: &mut [u8] = &mut out[..];
 
     // pretcode = SA_RESTORER (the handler `ret`s here, which issues rt_sigreturn).
     put_u64(&mut buf, OFF_PRETCODE, restorer);
@@ -296,7 +311,7 @@ pub fn assemble_sigframe(
 
     // `handler` is recorded by the caller into the live frame's RIP — not stored here.
     let _ = handler;
-    Ok(buf)
+    Ok(())
 }
 
 /// First byte of the NON-architectural FXSAVE tail. The legacy `fxsave64` area lays
@@ -490,7 +505,8 @@ fn selftest_assemble_roundtrip() {
             "FXSAVE reserved tail byte {i} must be zeroed (info-leak gate)"
         );
     }
-    let buf = assemble_sigframe(&layout, &ctx, &fx, 10, 0xCAFE, 0xBEEF).expect("assemble");
+    let mut buf = [0u8; SIGFRAME_SIZE];
+    assemble_sigframe(&layout, &ctx, &fx, 10, 0xCAFE, 0xBEEF, &mut buf).expect("assemble");
     assert_eq!(buf.len(), FRAME_SIZE as usize);
     // pretcode == restorer.
     assert_eq!(read_u64(&buf, OFF_PRETCODE), 0xBEEF);
@@ -505,6 +521,60 @@ fn selftest_assemble_roundtrip() {
     // fpstate pointer (ABI shape) and the FIXED re-derivation must agree.
     assert_eq!(read_u64(&buf, MC_FPSTATE_PTR), layout.fpstate_va);
     assert_eq!(layout.uc_va + SIGRETURN_FPSTATE_FROM_UC, layout.fpstate_va);
+}
+
+/// D1RES-R1 — info-leak oracle + length gate for the heap-free in-place builder.
+/// (a) Residue: assembling IDENTICAL inputs into a 0xA5-poisoned buffer and a fresh
+/// zeroed buffer must produce byte-identical frames AND leave no 0xA5 sentinel —
+/// proving every padding gap (uc_link, uc_stack tail, uc_sigmask, mcontext reserved,
+/// siginfo tail, FXSAVE tail) is deterministically written or zeroed, so buffer reuse
+/// cannot leak kernel-stack residue. (b) Length gate: a corrupt `layout.len` (either
+/// direction) is rejected with EFAULT BEFORE any byte is written.
+fn selftest_assemble_inplace_residue_and_len_gate() {
+    let floor = 0x10_0000u64;
+    let layout = compute_sigframe_layout(0x40_0000, floor).expect("layout");
+    let mut ctx = SavedUserContext::default();
+    ctx.rip = 0x12_3456;
+    ctx.rsp = 0x40_0000;
+    ctx.rax = 0x1122_3344_5566_7788;
+    ctx.rflags = 0x202;
+    let mut fx = [0u8; FXSAVE_SIZE];
+    fx[FXSAVE_MXCSR_OFF] = 0x80; // no input byte is 0xA5 (the poison sentinel)
+
+    // (a) residue oracle: poisoned vs fresh must be byte-identical, no sentinel left.
+    let mut poisoned = [0xA5u8; SIGFRAME_SIZE];
+    let mut fresh = [0u8; SIGFRAME_SIZE];
+    assemble_sigframe(&layout, &ctx, &fx, 10, 0xCAFE, 0xBEEF, &mut poisoned).expect("assemble");
+    assemble_sigframe(&layout, &ctx, &fx, 10, 0xCAFE, 0xBEEF, &mut fresh).expect("assemble");
+    assert!(
+        poisoned[..] == fresh[..],
+        "poisoned-buffer frame must equal the fresh frame — kernel-stack residue leak"
+    );
+    assert!(
+        poisoned.iter().all(|&b| b != 0xA5),
+        "0xA5 sentinel must not survive assembly (an unwritten byte leaked)"
+    );
+
+    // (b) length gate: corrupt layout.len (both directions) rejected pre-write.
+    let mut bad_short = layout;
+    bad_short.len = SIGFRAME_SIZE - 1;
+    let mut sink = [0u8; SIGFRAME_SIZE];
+    assert_eq!(
+        assemble_sigframe(&bad_short, &ctx, &fx, 10, 0xCAFE, 0xBEEF, &mut sink),
+        Err(SyscallError::EFAULT),
+        "len < SIGFRAME_SIZE must be rejected"
+    );
+    let mut bad_long = layout;
+    bad_long.len = SIGFRAME_SIZE + 1;
+    assert_eq!(
+        assemble_sigframe(&bad_long, &ctx, &fx, 10, 0xCAFE, 0xBEEF, &mut sink),
+        Err(SyscallError::EFAULT),
+        "len > SIGFRAME_SIZE must be rejected"
+    );
+    assert!(
+        sink.iter().all(|&b| b == 0),
+        "rejection must precede construction — target buffer untouched"
+    );
 }
 
 fn selftest_mxcsr_and_rflags() {
@@ -573,7 +643,8 @@ fn selftest_mcontext_roundtrip() {
     ctx.r15 = 0xDEAD_BEEF;
     ctx.rflags = 0x3 | 0x3000 /*IOPL*/ | 0x100 /*TF*/; // dirty: must be sanitized on parse.
     let fx = [0u8; FXSAVE_SIZE];
-    let buf = assemble_sigframe(&layout, &ctx, &fx, 11, 0xCAFE, 0xBEEF).expect("assemble");
+    let mut buf = [0u8; SIGFRAME_SIZE];
+    assemble_sigframe(&layout, &ctx, &fx, 11, 0xCAFE, 0xBEEF, &mut buf).expect("assemble");
 
     // Extract the 256-byte sigcontext at the mcontext offset (uc + 40).
     let mc_off = (SIGRETURN_MCONTEXT_FROM_UC + OFF_UC) as usize; // = OFF_MCONTEXT
@@ -689,6 +760,7 @@ fn selftest_sigframe_floor() {
 pub fn run_signal_frame_self_test() {
     selftest_layout_alignment();
     selftest_assemble_roundtrip();
+    selftest_assemble_inplace_residue_and_len_gate();
     selftest_mxcsr_and_rflags();
     selftest_srop_canonical();
     selftest_mcontext_roundtrip();

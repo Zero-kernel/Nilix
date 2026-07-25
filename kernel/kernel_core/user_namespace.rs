@@ -880,10 +880,11 @@ impl FileOps for UserNamespaceFd {
         Ok(VfsStat {
             dev: 0,
             ino: self.ns.id().raw(),
-            mode: 0o444,
             nlink: 1,
+            mode: 0o444,
             uid: 0,
             gid: 0,
+            pad0: 0,
             rdev: 0,
             size: 0,
             blksize: 0,
@@ -894,6 +895,9 @@ impl FileOps for UserNamespaceFd {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
         })
     }
 }

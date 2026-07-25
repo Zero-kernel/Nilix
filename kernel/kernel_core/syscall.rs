@@ -178,6 +178,11 @@ struct TimeSpec {
 const _: [(); 16] = [(); core::mem::size_of::<TimeSpec>()];
 
 /// struct utsname (Linux ABI, fixed-size strings)
+///
+/// D2-ABI-STAT-LAYOUT (LOW leg): Linux `new_utsname` is 6 x [u8;65] = 390
+/// bytes INCLUDING `domainname`. The former 5-field 325-byte layout left the
+/// caller's last 65 bytes unwritten (musl/glibc buffers are 390B), i.e.
+/// domainname read back as uninitialized user stack. Enforced by abi-check.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UtsName {
@@ -186,6 +191,7 @@ struct UtsName {
     release: [u8; 65],
     version: [u8; 65],
     machine: [u8; 65],
+    domainname: [u8; 65],
 }
 
 impl Default for UtsName {
@@ -196,12 +202,13 @@ impl Default for UtsName {
             release: [0; 65],
             version: [0; 65],
             machine: [0; 65],
+            domainname: [0; 65],
         }
     }
 }
 
-// H.0.1-3: Compile-time ABI size assertion.
-const _: [(); 325] = [(); core::mem::size_of::<UtsName>()];
+// H.0.1-3: Compile-time ABI size assertion (Linux new_utsname).
+const _: [(); 390] = [(); core::mem::size_of::<UtsName>()];
 
 /// Linux dirent64 layout for getdents64 syscall
 #[repr(C)]
@@ -412,10 +419,11 @@ impl crate::process::FileOps for SocketFile {
         Ok(VfsStat {
             dev: 0,
             ino: self.socket_id,
-            mode: S_IFSOCK | 0o666, // Socket with rw-rw-rw- permissions
             nlink: 1,
+            mode: S_IFSOCK | 0o666, // Socket with rw-rw-rw- permissions
             uid: 0,
             gid: 0,
+            pad0: 0,
             rdev: 0,
             size: 0,
             blksize: 4096,
@@ -426,6 +434,9 @@ impl crate::process::FileOps for SocketFile {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
         })
     }
 }
@@ -468,6 +479,47 @@ use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 /// 键盘/串口中断通过 wake_stdin_waiters() 唤醒等待者。
 static STDIN_WAITERS: spin::Mutex<VecDeque<ProcessId>> = spin::Mutex::new(VecDeque::new());
 
+/// D1-RES R2 (LEG-2): bound on live entries in each blocking-wait registry
+/// (STDIN_WAITERS, SocketWaiters). Chosen for the unledgered-waiter byte budget
+/// (see the SocketWaiters `const _` assertion): 96 × 320 B = 30,720 B, strictly
+/// under NORMAL_UNADMITTED_RESERVE_BYTES/2 = 32 KiB. Each registry dedups per pid,
+/// so live entries are bounded by resident tasks (each PCB charges
+/// `arc_charge_bytes::<Mutex<Process>>()` to CoreProcess via `try_new_pcb`, so the
+/// resident count is CoreProcess-admission-bounded). Beyond this cap the gates
+/// degrade to a SAFE bounded spurious-wake / busy-retry — never a lost wakeup or
+/// unbounded memory.
+pub(crate) const WAITER_REGISTRY_MAX_ENTRIES: usize = 96;
+
+/// D1-RES R2: outcome of `stdin_prepare_to_wait`. Replaces the old `bool` so the
+/// registry-full case can decline to publish Blocked (a Blocked publish without a
+/// queue entry would be a lost wakeup → hang).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinWaitPrepare {
+    /// Enqueued (or already present) and Blocked published — proceed to wait.
+    Enqueued,
+    /// No current process — the caller returns EOF (RISK-1 contract preserved).
+    NoProcess,
+    /// Registry at capacity for a NEW pid — NOT enqueued, NOT blocked; the caller
+    /// busy-retries. Unreachable while resident tasks <= WAITER_REGISTRY_MAX_ENTRIES.
+    RegistryFull,
+}
+
+/// D1-RES R2: boot-time pre-reservation of the blocking-wait registries. Builds a
+/// `VecDeque` with `WAITER_REGISTRY_MAX_ENTRIES` capacity OUTSIDE the lock, then
+/// swaps it in under the lock (swap is allocation-free). After this, `push_back`
+/// up to the cap is allocation-free forever — closing both the unledgered-drift
+/// residual and the alloc-under-spinlock hard-rule tension for stdin. Boot-only,
+/// called once pre-scheduler; failure is a broken-partition condition (fail-closed).
+pub fn init_blocking_waiter_registries() -> Result<(), ()> {
+    let mut fresh: VecDeque<ProcessId> = VecDeque::new();
+    fresh
+        .try_reserve_exact(WAITER_REGISTRY_MAX_ENTRIES)
+        .map_err(|_| ())?;
+    let mut guard = STDIN_WAITERS.lock();
+    core::mem::swap(&mut *guard, &mut fresh);
+    Ok(())
+}
+
 /// R149-1 FIX: Deferred stdin wake flag for IRQ handlers.
 ///
 /// Keyboard/serial IRQ handlers must NOT acquire PROCESS_TABLE or Process
@@ -487,11 +539,12 @@ static STDIN_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 ///
 /// # Returns
 ///
-/// 成功入队返回 true，无当前进程返回 false
-fn stdin_prepare_to_wait() -> bool {
+/// `Enqueued` on success, `NoProcess` if there is no current process, or
+/// `RegistryFull` if the registry is at capacity for a NEW pid (D1-RES R2).
+fn stdin_prepare_to_wait() -> StdinWaitPrepare {
     let pid = match current_pid() {
         Some(p) => p,
-        None => return false,
+        None => return StdinWaitPrepare::NoProcess,
     };
 
     // 在关中断状态下操作
@@ -502,6 +555,13 @@ fn stdin_prepare_to_wait() -> bool {
         // 这防止了当 force_reschedule 返回（因没有其他进程）时
         // 进程在循环中反复将自己添加到队列导致内存耗尽
         if !waiters.iter().any(|&p| p == pid) {
+            // D1-RES R2: bound + allocation-free (capacity was pre-reserved to
+            // WAITER_REGISTRY_MAX_ENTRIES). Refuse a NEW pid at the cap WITHOUT
+            // publishing Blocked — the caller busy-retries; never a lost wakeup.
+            if waiters.len() >= WAITER_REGISTRY_MAX_ENTRIES {
+                debug_assert!(false, "stdin waiter registry full (resident tasks > cap)");
+                return StdinWaitPrepare::RegistryFull;
+            }
             waiters.push_back(pid);
         }
 
@@ -513,15 +573,15 @@ fn stdin_prepare_to_wait() -> bool {
             // state-flip wake fires only on state==Blocked, so it would be lost). Leaving the
             // task Running makes stdin_finish_wait's HLT loop recheck wait_should_abort /
             // has_deliverable_signal on its first iteration and return EINTR. Keeping the
-            // `true` return preserves the EOF/EINTR distinction at the caller (a `false`
+            // `Enqueued` return preserves the EOF/EINTR distinction at the caller (a `NoProcess`
             // return is EOF, not EINTR — RISK-1).
             if !crate::signal::should_abort_pending_block(&proc) {
                 proc.enter_blocked_at(crate::get_ticks());
             }
         }
-    });
 
-    true
+        StdinWaitPrepare::Enqueued
+    })
 }
 
 /// R158-8 FIX: Cancel a prepared wait when data arrives on the double-check path.
@@ -689,34 +749,65 @@ pub fn drain_deferred_stdin_wakes() {
 // Socket Wait Hooks Implementation (scheduler integration for net crate)
 // ============================================================================
 
-use alloc::collections::BTreeMap;
+// D1-RES R2: SocketWaiters is now a fixed `.bss` slot array (below) — no BTreeMap.
 
-/// Per-queue waiter tracking for socket blocking operations.
+/// D1-RES R2: the SocketWaiters registry is a FIXED, preallocated flat array of
+/// `WAITER_REGISTRY_MAX_ENTRIES` slots living in `.bss` (inside the static
+/// `SOCKET_WAITERS`), so it consumes ZERO heap and performs ZERO allocation under
+/// the SOCKET_WAITERS spinlock — eliminating BOTH the unledgered-heap residual and
+/// the alloc-under-spinlock hard-rule tension that the prior
+/// `BTreeMap<_, VecDeque<_>>` carried (it allocated a node + deque per new waiter
+/// under the lock, and an OOM there hit the alloc-error path on a recoverable
+/// path). All operations are linear scans over the fixed slot array (<= 96 entries
+/// → trivial, bounded cost); FIFO wake order is preserved via a per-slot sequence.
+const SOCKET_WAITER_SLOTS: usize = WAITER_REGISTRY_MAX_ENTRIES;
+
+/// One fixed slot in the flat SocketWaiters registry. `Copy` so the whole array is
+/// a const-initializable `.bss` value with no heap backing.
+#[derive(Clone, Copy)]
+struct SocketWaiterSlot {
+    occupied: bool,
+    queue_addr: usize,
+    pid: ProcessId,
+    generation: u64,
+    deadline: Option<u64>,
+    /// Monotonic insertion order, for FIFO wake within a queue.
+    seq: u64,
+}
+
+impl SocketWaiterSlot {
+    const EMPTY: SocketWaiterSlot = SocketWaiterSlot {
+        occupied: false,
+        queue_addr: 0,
+        pid: 0,
+        generation: 0,
+        deadline: None,
+        seq: 0,
+    };
+}
+
+/// Per-queue waiter tracking for socket blocking operations (flat `.bss` registry).
 ///
-/// Uses the WaitQueue address as a unique identifier. Each queue maintains
-/// a FIFO list of waiting process IDs with optional timeout deadlines.
+/// Uses the WaitQueue address as the queue identifier. Waiters on the same queue
+/// are woken in FIFO order (lowest `seq` first). D1-RES R2: a fixed slot array — no
+/// heap, no allocation under the lock; `add_or_refresh_waiter` returns `false` when
+/// every slot is occupied (the sole registration site maps that to a spurious
+/// `Woken`, a safe bounded degradation, never a lost wakeup).
 struct SocketWaiters {
-    /// Map from queue address to list of `(ProcessId, generation, deadline_ticks)`.
-    /// Deadline is None for indefinite wait, Some(ticks) for timeout.
-    ///
-    /// R165-9 FIX: each waiter carries the monotonic `generation` of the
-    /// `wait()` call that enqueued it (mirrors the IPC WaitQueue R165-4 fix).
-    waiters: BTreeMap<usize, VecDeque<(ProcessId, u64, Option<u64>)>>,
-    // M4-1b: the former `timed_out: BTreeMap<ProcessId, u64>` was removed — the
-    // timeout marker now lives per-PCB in `Process.socket_timeout_marker`, set
-    // under the proc lock at the Blocked->Ready transition (no IRQ heap alloc) and
-    // consumed by the waiter's epilogue via `process::consume_socket_timeout`.
+    slots: [SocketWaiterSlot; SOCKET_WAITER_SLOTS],
     /// Monotonic generation counter, advanced on each `wait()` registration.
-    /// All access is under the `SOCKET_WAITERS` lock, so a plain counter
-    /// suffices (no atomics needed).
+    /// All access is under the `SOCKET_WAITERS` lock, so a plain counter suffices.
     next_generation: u64,
+    /// Monotonic insertion sequence, for FIFO wake ordering within a queue.
+    next_seq: u64,
 }
 
 impl SocketWaiters {
     const fn new() -> Self {
         SocketWaiters {
-            waiters: BTreeMap::new(),
+            slots: [SocketWaiterSlot::EMPTY; SOCKET_WAITER_SLOTS],
             next_generation: 1,
+            next_seq: 1,
         }
     }
 
@@ -730,42 +821,70 @@ impl SocketWaiters {
     /// Add the current process to a wait queue, or refresh its generation and
     /// deadline if it is already queued.
     ///
-    /// R165-9 FIX: on a duplicate (spurious re-entry of `wait()` for the same
-    /// PID) we REFRESH the existing entry's generation/deadline to this wait's
-    /// values, so a subsequent timeout is attributed to the current wait and a
-    /// legitimate timeout is never dropped (mirrors sync.rs R165-4).
+    /// R165-9 FIX: on a duplicate (spurious re-entry of `wait()` for the same PID)
+    /// we REFRESH the existing slot's generation/deadline (keeping its FIFO seq), so
+    /// a subsequent timeout is attributed to the current wait and a legitimate
+    /// timeout is never dropped (mirrors sync.rs R165-4).
+    ///
+    /// D1-RES R2: returns `false` when every slot is occupied — a fixed-array
+    /// refusal with NO allocation. The sole registration site maps `false` to a
+    /// spurious `Woken` (after yielding) BEFORE any Blocked publish (a safe bounded
+    /// degradation, never a lost wakeup).
     fn add_or_refresh_waiter(
         &mut self,
         queue_addr: usize,
         pid: ProcessId,
         generation: u64,
         deadline: Option<u64>,
-    ) {
-        let queue = self.waiters.entry(queue_addr).or_insert_with(VecDeque::new);
-        if let Some(entry) = queue.iter_mut().find(|(p, _, _)| *p == pid) {
-            entry.1 = generation;
-            entry.2 = deadline;
-        } else {
-            queue.push_back((pid, generation, deadline));
+    ) -> bool {
+        // REFRESH arm: an existing (queue,pid) slot keeps its FIFO seq; only gen +
+        // deadline are updated. Never consumes a new slot.
+        for slot in self.slots.iter_mut() {
+            if slot.occupied && slot.queue_addr == queue_addr && slot.pid == pid {
+                slot.generation = generation;
+                slot.deadline = deadline;
+                return true;
+            }
         }
+        // NEW-entry arm: claim the first free slot. If none, the registry is full
+        // (bounded by SOCKET_WAITER_SLOTS) → refuse WITHOUT allocating anything.
+        let seq = self.next_seq;
+        for slot in self.slots.iter_mut() {
+            if !slot.occupied {
+                *slot = SocketWaiterSlot {
+                    occupied: true,
+                    queue_addr,
+                    pid,
+                    generation,
+                    deadline,
+                    seq,
+                };
+                self.next_seq = self.next_seq.wrapping_add(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// D1-RES R2: total occupied slots. Trivial fixed-array scan; no heap, no
+    /// shadow counter that could desync.
+    fn total_entries(&self) -> usize {
+        self.slots.iter().filter(|s| s.occupied).count()
     }
 
     /// Remove a specific process from a queue (on wakeup or timeout).
     ///
-    /// R165-9 FIX: when `expected` is `Some(gen)`, only the entry whose
-    /// generation matches is removed — a newer wait by the same PID is left
-    /// intact. Returns true iff an entry was removed.
+    /// R165-9 FIX: when `expected` is `Some(gen)`, only the slot whose generation
+    /// matches is cleared — a newer wait by the same PID is left intact. Returns
+    /// true iff a slot was cleared.
     fn remove_waiter(&mut self, queue_addr: usize, pid: ProcessId, expected: Option<u64>) -> bool {
-        if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-            if let Some(pos) = queue
-                .iter()
-                .position(|(p, g, _)| *p == pid && expected.map_or(true, |e| *g == e))
+        for slot in self.slots.iter_mut() {
+            if slot.occupied
+                && slot.queue_addr == queue_addr
+                && slot.pid == pid
+                && expected.map_or(true, |e| slot.generation == e)
             {
-                queue.remove(pos);
-                // Clean up empty queue entries
-                if queue.is_empty() {
-                    self.waiters.remove(&queue_addr);
-                }
+                slot.occupied = false;
                 return true;
             }
         }
@@ -779,35 +898,41 @@ impl SocketWaiters {
     // `check_timeouts`, and CONSUMED by the wait epilogue via
     // `process::consume_socket_timeout` (exact-generation, swap-to-clear).
 
-    /// Wake one waiter from a queue (FIFO order).
+    /// Wake one waiter from a queue (FIFO order — lowest insertion seq first).
     fn wake_one(&mut self, queue_addr: usize) -> Option<ProcessId> {
-        if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-            while let Some((pid, _, _)) = queue.pop_front() {
-                // Verify process still exists and is blocked
-                if let Some(proc_arc) = get_process(pid) {
-                    let mut proc = proc_arc.lock();
-                    if proc.state == ProcessState::Blocked {
-                        proc.enter_ready_at(crate::get_ticks());
-                        // Clean up empty queue
-                        if queue.is_empty() {
-                            self.waiters.remove(&queue_addr);
-                        }
-                        return Some(pid);
-                    }
+        loop {
+            // Find the lowest-seq occupied slot for this queue (FIFO front).
+            let mut best: Option<usize> = None;
+            let mut best_seq = u64::MAX;
+            for (i, slot) in self.slots.iter().enumerate() {
+                if slot.occupied && slot.queue_addr == queue_addr && slot.seq < best_seq {
+                    best_seq = slot.seq;
+                    best = Some(i);
                 }
-                // Process gone or not blocked, try next
             }
-            // All waiters invalid, clean up
-            self.waiters.remove(&queue_addr);
+            let i = best?;
+            let pid = self.slots[i].pid;
+            // Consume this slot regardless (matches the old pop_front: a woken OR an
+            // invalid front entry is removed) — then try to ready the process.
+            self.slots[i].occupied = false;
+            if let Some(proc_arc) = get_process(pid) {
+                let mut proc = proc_arc.lock();
+                if proc.state == ProcessState::Blocked {
+                    proc.enter_ready_at(crate::get_ticks());
+                    return Some(pid);
+                }
+            }
+            // Process gone or not blocked — discard and try the next-oldest.
         }
-        None
     }
 
     /// Wake all waiters from a queue.
     fn wake_all(&mut self, queue_addr: usize) -> usize {
         let mut woken = 0;
-        if let Some(mut queue) = self.waiters.remove(&queue_addr) {
-            while let Some((pid, _, _)) = queue.pop_front() {
+        for slot in self.slots.iter_mut() {
+            if slot.occupied && slot.queue_addr == queue_addr {
+                let pid = slot.pid;
+                slot.occupied = false;
                 if let Some(proc_arc) = get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
@@ -820,156 +945,85 @@ impl SocketWaiters {
         woken
     }
 
-    /// Check and wake timed-out waiters. Called from timer interrupt.
+    /// Check and wake timed-out waiters. Called from the timer interrupt.
     ///
-    /// Also cleans up waiters for processes that have exited, preventing
-    /// memory leaks and stale entries in the waiter queues.
-    ///
-    /// Uses fixed-size stack buffer to avoid heap allocation in IRQ context.
+    /// Also cleans up waiters for processes that have exited. D1-RES R2: with the
+    /// flat `.bss` slot array, clearing a slot is an in-place write — there is no
+    /// BTreeMap node to free, so the former M4-1c deferred-reap machinery is gone.
+    /// Index iteration lets us act (clear) in place during the single scan.
     fn check_timeouts(&mut self, current_ticks: u64) {
-        // Maximum timeouts processed per tick to avoid spending too long in IRQ
+        // Cap the wakes per tick to bound time spent in the IRQ.
         const MAX_TIMEOUTS_PER_TICK: usize = 16;
-
-        // Use stack array instead of Vec to avoid IRQ-context allocation
-        // Each entry: (queue_addr, pid, generation, is_timeout vs is_exited)
-        let mut expired: [Option<(usize, ProcessId, u64, bool)>; MAX_TIMEOUTS_PER_TICK] =
-            [None; MAX_TIMEOUTS_PER_TICK];
         let mut count = 0;
 
-        // Collect expired or exited waiters
-        for (&queue_addr, queue) in self.waiters.iter() {
-            for &(pid, generation, deadline) in queue.iter() {
-                if count >= MAX_TIMEOUTS_PER_TICK {
-                    break; // Will catch remaining on next tick
-                }
-                let is_timeout = deadline.map(|dl| current_ticks >= dl).unwrap_or(false);
-                // R171-G5-1 FIX: never block PROCESS_TABLE in this IRQ tick scan.
-                // A contended table (try_get_process == None) is NOT "exited" — it
-                // defers: the entry is left untouched and re-evaluated next tick.
-                let is_exited = matches!(try_get_process(pid), Some(None));
-                if is_timeout || is_exited {
-                    expired[count] = Some((queue_addr, pid, generation, is_timeout));
+        for i in 0..self.slots.len() {
+            if count >= MAX_TIMEOUTS_PER_TICK {
+                break; // remaining caught on the next tick
+            }
+            if !self.slots[i].occupied {
+                continue;
+            }
+            let pid = self.slots[i].pid;
+            let generation = self.slots[i].generation;
+            let deadline = self.slots[i].deadline;
+            let is_timeout = deadline.map(|dl| current_ticks >= dl).unwrap_or(false);
+            // R171-G5-1: tri-state try_get_process — NEVER block PROCESS_TABLE in IRQ.
+            // A contended table (None) is NOT "exited": leave the slot, retry next tick.
+            let tri = try_get_process(pid);
+            let is_exited = matches!(tri, Some(None));
+            if !(is_timeout || is_exited) {
+                continue;
+            }
+            match tri {
+                None => continue, // contended table — defer this slot
+                // Process gone — clear membership; set NO marker (R155-12).
+                Some(None) => {
+                    self.slots[i].occupied = false;
                     count += 1;
                 }
-            }
-        }
-
-        // Wake expired waiters and drop entries for dead processes.
-        // M4-1c: empty-queue BTreeMap node frees are deferred OUT of this timer IRQ
-        // (R151-5 dealloc class). We only record THAT a queue emptied; the actual
-        // `self.waiters` node free runs in process context (drain_empty_queues).
-        let mut emptied = false;
-
-        for entry in expired.iter().take(count).flatten() {
-            let (queue_addr, pid, generation, is_timeout) = *entry;
-
-            if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-                // R165-9 FIX: act only on the EXACT (pid, generation) we recorded
-                // above, so a newer wait by the same PID is left undisturbed.
-                if queue.iter().any(|(p, g, _)| *p == pid && *g == generation) {
-                    // R155-2 FIX: try_lock BEFORE removing from queue.
-                    // If contended, skip — the entry stays with its original
-                    // deadline and will be retried on the next tick.
-                    //
-                    // R165-9 FIX: only record a timeout when THIS call performs the
-                    // Blocked->Ready transition. If the process exited, its lock is
-                    // contended, or a normal wake already readied it, we must not
-                    // leave a stale timeout marker (mirrors sync.rs timeout_wake).
-                    // R171-G5-1 FIX: tri-state try_get_process — never block
-                    // PROCESS_TABLE in IRQ context.
-                    match try_get_process(pid) {
-                        // Contended table: defer this waiter (leave it queued with
-                        // its original deadline; retried next tick). Do NOT remove.
-                        None => continue,
-                        // Process gone — fall through to remove membership; set NO
-                        // marker (R155-12: no stale timeout flag for a dead process).
-                        Some(None) => {}
-                        Some(Some(proc_arc)) => {
-                            if let Some(mut proc) = proc_arc.try_lock() {
-                                if proc.state == ProcessState::Blocked {
-                                    // M4-1b: SET the per-PCB socket timeout marker
-                                    // (Release) STRICTLY BEFORE state=Ready, both
-                                    // inside THIS held proc-lock critical section —
-                                    // the proc-lock release/acquire hand-off (NOT the
-                                    // Release on the atomic) is the marker-before-wake
-                                    // edge every `state` reader honors. Replaces the
-                                    // IRQ-allocating SocketWaiters.timed_out.insert
-                                    // (R151-5 heap-alloc-in-IRQ class). The store and
-                                    // the Ready store MUST stay in the same proc-lock
-                                    // section; moving either out silently breaks it.
-                                    if is_timeout {
-                                        proc.socket_timeout_marker.store(
-                                            crate::process::pack_timeout_marker(generation),
-                                            core::sync::atomic::Ordering::Release,
-                                        );
-                                    }
-                                    proc.enter_ready_at(crate::get_ticks());
-                                }
-                            } else {
-                                continue;
+                Some(Some(proc_arc)) => {
+                    // R155-2: try_lock BEFORE clearing. Contended → leave the slot.
+                    if let Some(mut proc) = proc_arc.try_lock() {
+                        if proc.state == ProcessState::Blocked {
+                            // M4-1b: SET the per-PCB timeout marker (Release) STRICTLY
+                            // BEFORE state=Ready, both inside THIS held proc-lock
+                            // critical section — the proc-lock release/acquire hand-off
+                            // (NOT the atomic's Release) is the marker-before-wake edge
+                            // every `state` reader honors. Only on a real timeout that
+                            // THIS call transitions to Ready (R165-9); a dead/contended/
+                            // already-woken task leaves no stale marker.
+                            if is_timeout {
+                                proc.socket_timeout_marker.store(
+                                    crate::process::pack_timeout_marker(generation),
+                                    core::sync::atomic::Ordering::Release,
+                                );
                             }
+                            proc.enter_ready_at(crate::get_ticks());
                         }
-                    }
-
-                    // Lock succeeded (or process gone) — now remove our exact entry
-                    if let Some(pos) = queue
-                        .iter()
-                        .position(|(p, g, _)| *p == pid && *g == generation)
-                    {
-                        queue.remove(pos);
-                    }
-
-                    // M4-1c: note that this queue emptied; defer the BTreeMap node
-                    // free to process context (no heap dealloc in the timer IRQ).
-                    if queue.is_empty() {
-                        emptied = true;
+                        // Lock succeeded — clear our exact slot (woken or already-ready).
+                        self.slots[i].occupied = false;
+                        count += 1;
+                    } else {
+                        continue; // contended proc lock: retry next tick
                     }
                 }
             }
         }
-
-        // M4-1c CLOSURE: the empty-queue BTreeMap node free that previously ran HERE
-        // (`self.waiters.remove(addr)`, a global-LockedHeap dealloc in this timer
-        // IRQ — the R151-5 dealloc class) is GONE, along with its `queues_to_clean`
-        // tracking array. We only FLAG that a queue emptied; the actual node free is
-        // reaped in process context by `drain_empty_queues`, driven from the
-        // unconditional `reschedule_if_needed` deferred-work drain (gated by
-        // SOCKET_WAITER_CLEANUP_PENDING so the O(n) reap runs only after a tick that
-        // actually emptied a queue). `Release` pairs with the `Acquire` load in
-        // `drain_socket_waiter_cleanup`; the authoritative clear is the
-        // `swap(false)`-under-SOCKET_WAITERS in `drain_empty_queues`.
-        if emptied {
-            SOCKET_WAITER_CLEANUP_PENDING.store(true, AtomicOrdering::Release);
-        }
-
-        // M4-1b: the per-PCB socket_timeout_marker dies with the PCB, so the former
-        // periodic stale-marker prune (PID-reuse cleanup of the deleted `timed_out`
-        // BTreeMap) is no longer needed.
+        // D1-RES R2: no deferred node free — a cleared slot is reclaimed in place.
     }
 
-    /// M4-1c: pure, testable reap of empty wait-queue nodes. Frees the BTreeMap
-    /// nodes that `check_timeouts` (timer IRQ) intentionally left behind. Returns the
-    /// number of empty queues freed. `BTreeMap::retain` re-checks `is_empty()` under
-    /// the SOCKET_WAITERS lock, so a queue that a concurrent `add_or_refresh_waiter`
-    /// re-populated between the IRQ mark and this reap is KEPT (non-empty) — we never
-    /// cache+blind-remove a queue address.
+    /// D1-RES R2: with the flat `.bss` slot array there are no BTreeMap nodes to
+    /// free, so the former M4-1c deferred reap is a no-op. Retained (returning 0)
+    /// only so external callers compile.
     fn reap_empty_queues(&mut self) -> usize {
-        let before = self.waiters.len();
-        self.waiters.retain(|_, queue| !queue.is_empty());
-        before - self.waiters.len()
+        0
     }
 
-    /// M4-1c: process-context drain of empty wait-queue nodes (the BTreeMap node free
-    /// deferred out of the timer IRQ). The caller MUST hold SOCKET_WAITERS. The
-    /// `swap(false)` is the authoritative claim+clear of the pending flag: because
-    /// `check_timeouts` (which sets the flag) and this drain are mutually excluded by
-    /// SOCKET_WAITERS, the swap can never clear a flag that corresponds to an
-    /// un-reaped empty queue (any emptying is either before our `retain` — reaped —
-    /// or after our unlock — its `store(true)` then follows our `swap(false)`).
+    /// D1-RES R2: no-op (see `reap_empty_queues`). `check_timeouts` no longer sets
+    /// SOCKET_WAITER_CLEANUP_PENDING, so `drain_socket_waiter_cleanup`'s fast-path
+    /// `load` always short-circuits; the swap here is kept for source compatibility.
     fn drain_empty_queues(&mut self) {
-        if SOCKET_WAITER_CLEANUP_PENDING.swap(false, AtomicOrdering::AcqRel) {
-            let _ = self.reap_empty_queues();
-        }
+        let _ = SOCKET_WAITER_CLEANUP_PENDING.swap(false, AtomicOrdering::AcqRel);
     }
 }
 
@@ -1018,58 +1072,77 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
         // while interrupts are disabled and SOCKET_WAITERS is locked.
         // This closes the missed-wakeup race where wake_one() can run between
         // a pre-check and waiter registration.
-        let (my_gen, immediate) = x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut waiters = SOCKET_WAITERS.lock();
+        let (my_gen, immediate, registry_full) =
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut waiters = SOCKET_WAITERS.lock();
 
-            // R165-9 FIX: allocate this wait's unique generation under the lock,
-            // then register (or, on spurious re-entry for the same PID, refresh
-            // the existing entry's generation + deadline to this wait's values).
-            let my_gen = waiters.alloc_generation();
-            waiters.add_or_refresh_waiter(queue_addr, pid, my_gen, deadline);
-
-            // R152-2 FIX: Check for pending wake AFTER registration.
-            // If a wake arrived before we registered, consume the token and
-            // remove ourselves — no need to block.
-            if queue.try_consume_wakeup() {
-                waiters.remove_waiter(queue_addr, pid, Some(my_gen));
-                return (my_gen, Some(net::WaitOutcome::Woken));
-            }
-
-            // Mark process as blocked
-            if let Some(proc_arc) = get_process(pid) {
-                let mut proc = proc_arc.lock();
-                // M4-1b: entry-clear (born-clean). The prior wait's epilogue swap
-                // should already have zeroed this; the debug_assert is the tripwire
-                // for that invariant and the store is the belt so a future exit path
-                // that forgets to consume can never leak a stale incomparable
-                // generation into THIS wait. Must precede Blocked (the IRQ/inline
-                // timeout-set only fires on a Blocked, still-queued entry); the whole
-                // enqueue+block runs under SOCKET_WAITERS + IRQs-off, so no marker can
-                // be set between enqueue above and this clear.
-                debug_assert!(
-                    proc.socket_timeout_marker
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        == 0,
-                    "M4-1b: socket_timeout_marker not born-clean at wait entry"
-                );
-                proc.socket_timeout_marker
-                    .store(0, core::sync::atomic::Ordering::Relaxed);
-                // R172-12 FIX: recheck kill/signal UNDER the proc lock before publishing
-                // Blocked (the data double-check at :928 ran, but not a kill/signal recheck).
-                // On a raced-in kill/handler-signal the bare state-flip wake would be lost; an
-                // UNTIMED socket recv/accept then has no backstop -> permanent strand. Bail
-                // with Interrupted (mapped to EINTR at the recv/accept callers); remove our
-                // waiter (exact gen) below, after dropping the proc lock (waiters is the outer
-                // lock). Born-clean marker means no socket_timeout_marker cleanup is owed.
-                if crate::signal::should_abort_pending_block(&proc) {
-                    drop(proc);
-                    waiters.remove_waiter(queue_addr, pid, Some(my_gen));
-                    return (my_gen, Some(net::WaitOutcome::Interrupted));
+                // R165-9 FIX: allocate this wait's unique generation under the lock,
+                // then register (or, on spurious re-entry for the same PID, refresh
+                // the existing entry's generation + deadline to this wait's values).
+                let my_gen = waiters.alloc_generation();
+                // D1-RES R2: gate NEW registrations at the fixed slot count. On refusal
+                // (all slots occupied), signal `registry_full` so the caller YIELDS the
+                // CPU before returning a spurious Woken — a non-yielding retry could burn
+                // a core on SMP or starve the very tasks that would free a slot. The
+                // spurious Woken is safe (every wait() caller re-checks its data and
+                // retries on Woken, exactly as wake_all produces; no Blocked was
+                // published). Unreachable while resident tasks <= SOCKET_WAITER_SLOTS.
+                if !waiters.add_or_refresh_waiter(queue_addr, pid, my_gen, deadline) {
+                    return (my_gen, None, true);
                 }
-                proc.enter_blocked_at(crate::get_ticks());
-            }
-            (my_gen, None)
-        });
+
+                // R152-2 FIX: Check for pending wake AFTER registration.
+                // If a wake arrived before we registered, consume the token and
+                // remove ourselves — no need to block.
+                if queue.try_consume_wakeup() {
+                    waiters.remove_waiter(queue_addr, pid, Some(my_gen));
+                    return (my_gen, Some(net::WaitOutcome::Woken), false);
+                }
+
+                // Mark process as blocked
+                if let Some(proc_arc) = get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    // M4-1b: entry-clear (born-clean). The prior wait's epilogue swap
+                    // should already have zeroed this; the debug_assert is the tripwire
+                    // for that invariant and the store is the belt so a future exit path
+                    // that forgets to consume can never leak a stale incomparable
+                    // generation into THIS wait. Must precede Blocked (the IRQ/inline
+                    // timeout-set only fires on a Blocked, still-queued entry); the whole
+                    // enqueue+block runs under SOCKET_WAITERS + IRQs-off, so no marker can
+                    // be set between enqueue above and this clear.
+                    debug_assert!(
+                        proc.socket_timeout_marker
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            == 0,
+                        "M4-1b: socket_timeout_marker not born-clean at wait entry"
+                    );
+                    proc.socket_timeout_marker
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
+                    // R172-12 FIX: recheck kill/signal UNDER the proc lock before publishing
+                    // Blocked (the data double-check at :928 ran, but not a kill/signal recheck).
+                    // On a raced-in kill/handler-signal the bare state-flip wake would be lost; an
+                    // UNTIMED socket recv/accept then has no backstop -> permanent strand. Bail
+                    // with Interrupted (mapped to EINTR at the recv/accept callers); remove our
+                    // waiter (exact gen) below, after dropping the proc lock (waiters is the outer
+                    // lock). Born-clean marker means no socket_timeout_marker cleanup is owed.
+                    if crate::signal::should_abort_pending_block(&proc) {
+                        drop(proc);
+                        waiters.remove_waiter(queue_addr, pid, Some(my_gen));
+                        return (my_gen, Some(net::WaitOutcome::Interrupted), false);
+                    }
+                    proc.enter_blocked_at(crate::get_ticks());
+                }
+                (my_gen, None, false)
+            });
+
+        // D1-RES R2: registry full — YIELD the CPU (release SOCKET_WAITERS first,
+        // which happened when the closure returned) so the tasks that would free a
+        // slot can run, THEN return the spurious Woken. Matches the stdin RegistryFull
+        // path; prevents a non-yielding busy-retry on a full registry.
+        if registry_full {
+            crate::force_reschedule();
+            return net::WaitOutcome::Woken;
+        }
 
         if let Some(outcome) = immediate {
             return outcome;
@@ -1330,71 +1403,66 @@ pub fn drain_socket_waiter_cleanup() {
     });
 }
 
-/// M4-1c self-test: the deferred empty-queue reap (`reap_empty_queues`). Drives a
-/// LOCAL `SocketWaiters` (same module) — no global, no PROCESS_TABLE. Catches the
-/// mis-wires a green build/boot cannot: a reap that frees a re-populated queue (a
-/// live waiter silently dropped — the headline race), a reap that never drains (slow
-/// node leak), or one that over-reaps live queues.
+/// D1-RES R2 self-test: the flat `.bss` SocketWaiters registry. Drives a LOCAL
+/// `SocketWaiters` (same module) — no global, no PROCESS_TABLE. Pins add / refresh
+/// (no new slot) / generation-matched remove / unconditional remove / capacity
+/// refusal WITHOUT allocation — the properties a green build/boot cannot catch.
 pub fn run_socket_waiter_deferred_free_self_test() {
     let q1: usize = 0xFFFF_FFFF_8000_1000;
     let q2: usize = 0xFFFF_FFFF_8000_2000;
-    let q3: usize = 0xFFFF_FFFF_8000_3000;
 
-    // (1) IRQ PATH LEAVES THE EMPTY QUEUE IN PLACE (node NOT freed in IRQ): add then
-    // empty a queue's deque — exactly what check_timeouts now does (VecDeque::remove,
-    // no map free). The node must still be present and empty.
     let mut sw = SocketWaiters::new();
-    sw.add_or_refresh_waiter(q1, 7, 1, None);
-    sw.waiters.get_mut(&q1).unwrap().clear(); // simulate the IRQ removing the last waiter
+
+    // (1) ADD + occupancy count.
+    assert!(sw.add_or_refresh_waiter(q1, 7, 1, None));
+    assert!(sw.add_or_refresh_waiter(q1, 8, 1, None));
+    assert!(sw.add_or_refresh_waiter(q2, 9, 1, None));
     assert!(
-        sw.waiters.contains_key(&q1) && sw.waiters[&q1].is_empty(),
-        "M4-1c: the timer IRQ must leave the empty queue node in place (no IRQ free)"
+        sw.total_entries() == 3,
+        "flat registry must hold 3 occupied slots"
     );
 
-    // (2) PROCESS-CONTEXT REAP FREES EXACTLY THE EMPTY NODE.
+    // (2) REFRESH: an existing (queue,pid) updates gen/deadline WITHOUT a new slot.
+    assert!(sw.add_or_refresh_waiter(q1, 7, 5, Some(42)));
     assert!(
-        sw.reap_empty_queues() == 1,
-        "M4-1c: reap must free the one empty queue"
-    );
-    assert!(
-        !sw.waiters.contains_key(&q1),
-        "M4-1c: the empty queue node must be gone after reap"
+        sw.total_entries() == 3,
+        "refresh of an existing waiter must not consume a slot"
     );
 
-    // (3) REAP MUST NOT FREE A RE-POPULATED QUEUE (headline): empty q2, then a NEW
-    // waiter arrives on the same address before the reap — the reap must keep it.
-    sw.add_or_refresh_waiter(q2, 8, 1, None);
-    sw.waiters.get_mut(&q2).unwrap().clear(); // IRQ emptied it
-    sw.add_or_refresh_waiter(q2, 9, 2, None); // a fresh wait re-populates the same addr
+    // (3) GENERATION-MATCHED remove: wrong gen is a no-op; exact gen clears the slot.
     assert!(
-        sw.reap_empty_queues() == 0,
-        "M4-1c: reap must not free a re-populated queue"
+        !sw.remove_waiter(q1, 7, Some(999)),
+        "wrong-generation remove must be a no-op (R165-9)"
     );
     assert!(
-        sw.waiters.contains_key(&q2) && sw.waiters[&q2].iter().any(|&(p, _, _)| p == 9),
-        "M4-1c: the fresh re-registered waiter must survive the reap"
+        sw.remove_waiter(q1, 7, Some(5)),
+        "exact-generation remove must succeed"
     );
+    assert!(sw.total_entries() == 2, "one slot cleared");
 
-    // (4) IDEMPOTENT / NO-OP ON A CLEAN MAP.
-    assert!(
-        sw.reap_empty_queues() == 0,
-        "M4-1c: reap on a map with no empty queues is a no-op"
-    );
+    // (4) UNCONDITIONAL remove (expected == None).
+    assert!(sw.remove_waiter(q2, 9, None));
+    assert!(sw.total_entries() == 1);
+    // removing a gone entry is a no-op.
+    assert!(!sw.remove_waiter(q2, 9, None));
 
-    // (5) MULTIPLE EMPTY + MULTIPLE LIVE, ONE REAP: q1 + q3 empty, q2 live.
-    sw.add_or_refresh_waiter(q1, 10, 1, None);
-    sw.add_or_refresh_waiter(q3, 11, 1, None);
-    sw.waiters.get_mut(&q1).unwrap().clear();
-    sw.waiters.get_mut(&q3).unwrap().clear();
+    // (5) CAPACITY REFUSAL without allocation: fill every slot, then a NEW waiter
+    // must be refused (false) while a REFRESH of an existing one still succeeds.
+    let mut full = SocketWaiters::new();
+    for i in 0..SOCKET_WAITER_SLOTS {
+        assert!(
+            full.add_or_refresh_waiter(0xDEAD_0000 + i, 1000 + i, 1, None),
+            "slot {i} must be accepted below capacity"
+        );
+    }
+    assert!(full.total_entries() == SOCKET_WAITER_SLOTS);
     assert!(
-        sw.reap_empty_queues() == 2,
-        "M4-1c: reap must free exactly the empty queues"
+        !full.add_or_refresh_waiter(0xBEEF_0000, 9999, 1, None),
+        "a NEW waiter past capacity must be refused (no allocation)"
     );
     assert!(
-        sw.waiters.contains_key(&q2)
-            && !sw.waiters.contains_key(&q1)
-            && !sw.waiters.contains_key(&q3),
-        "M4-1c: live queues must be preserved, empties freed"
+        full.add_or_refresh_waiter(0xDEAD_0000, 1000, 2, Some(7)),
+        "a REFRESH of an existing waiter must still succeed at capacity"
     );
 }
 
@@ -2353,29 +2421,47 @@ pub struct DirEntry {
 }
 
 /// VFS 文件状态信息
+///
+/// D2-ABI-STAT-LAYOUT FIX: this IS the Linux x86-64 `struct stat` wire layout
+/// (arch/x86/include/uapi/asm/stat.h, 144 bytes): dev@0, ino@8, nlink(u64)@16,
+/// mode@24, uid@28, gid@32, pad0@36, rdev(u64)@40, size(i64)@48,
+/// blksize(i64)@56, blocks(i64)@64, atim@72, mtim@88, ctim@104, unused@120.
+/// musl reads these exact offsets — the former 112-byte private layout
+/// misparsed under every musl `stat()`/`fstat()` caller (st_mode was read from
+/// what the kernel wrote as uid). The layout has ZERO implicit padding:
+/// `pad0`/`unused*` are explicit fields, always written as 0
+/// (`copy_vfs_stat_to_user` serializes into a zeroed buffer). Enforced by
+/// `make abi-check` (Leg-B reference table + Leg-C gcc offsetof cross-check)
+/// and the Ring-3 `MUSL-STAT-OK` smoke.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VfsStat {
     pub dev: u64,
     pub ino: u64,
+    pub nlink: u64,
     pub mode: u32,
-    pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
-    pub rdev: u32,
-    pub size: u64,
-    pub blksize: u32,
-    pub blocks: u64,
+    pub pad0: u32,
+    pub rdev: u64,
+    pub size: i64,
+    pub blksize: i64,
+    pub blocks: i64,
     pub atime_sec: i64,
     pub atime_nsec: i64,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
     pub ctime_sec: i64,
     pub ctime_nsec: i64,
+    pub unused0: i64,
+    pub unused1: i64,
+    pub unused2: i64,
 }
 
-// H.0.1-3: Compile-time ABI size assertion (112 = 2 implicit 4-byte padding gaps).
-const _: [(); 112] = [(); core::mem::size_of::<VfsStat>()];
+// D2-ABI-STAT-LAYOUT: Linux x86-64 struct stat is exactly 144 bytes, align 8,
+// with no implicit padding (the two former gaps are explicit fields now).
+const _: [(); 144] = [(); core::mem::size_of::<VfsStat>()];
+const _: [(); 8] = [(); core::mem::align_of::<VfsStat>()];
 
 lazy_static::lazy_static! {
     /// 管道创建回调
@@ -8075,8 +8161,9 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         }
     };
 
-    // Phase 2 (NO lock held — faultable copy_to_user + heap alloc): snapshot the
-    // interrupted context + FXSAVE, build the sigframe, copy it to the user stack.
+    // Phase 2 (NO lock held — faultable copy_to_user; heap-free in-place staging,
+    // D1RES-R1): snapshot the interrupted context + FXSAVE, build the sigframe, copy
+    // it to the user stack.
     let snap = with_current_syscall_frame_mut(pid, |frame, fx| {
         // The SYSCALL path saved user RIP into RCX and user RFLAGS into R11.
         let ctx = crate::signal_frame::SavedUserContext {
@@ -8127,17 +8214,24 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
             Err(_) => terminate_self_and_halt(pid, 139),
         };
-    let buf = match crate::signal_frame::assemble_sigframe(
+    // D1RES-R1: heap-free staging — assembled in place into a kernel-stack buffer
+    // (assemble_sigframe zero-fills it; the zero fill is load-bearing). Removes the
+    // former fallible heap alloc + its OOM-kill-on-delivery leg from this path.
+    let mut buf = [0u8; crate::signal_frame::SIGFRAME_SIZE];
+    if crate::signal_frame::assemble_sigframe(
         &layout,
         &ctx,
         &fxcopy,
         sig.as_u8() as u32,
         handler,
         restorer,
-    ) {
-        Ok(b) => b,
-        Err(_) => terminate_self_and_halt(pid, 139),
-    };
+        &mut buf,
+    )
+    .is_err()
+    {
+        // Corrupt layout (len mismatch) — same fatal disposition as a failed layout.
+        terminate_self_and_halt(pid, 139);
+    }
     // M0-7 SLICE 5: PRE-GROW the user stack to back the sigframe write
     // (Ring-0 writer #1 of 3). The sigframe writes to [frame_base, rsp), which may
     // land in the lazy region. Pre-grow ensures the pages are mapped BEFORE the
@@ -8375,17 +8469,23 @@ pub fn try_deliver_signal_on_irq_return(
     };
 
     // Build the signal frame.
-    let frame_bytes = match crate::signal_frame::assemble_sigframe(
+    // D1RES-R1: heap-free in-place staging — also removes the former fallible heap
+    // alloc performed while HOLDING the proc_arc try_lock guard (FIX A graph),
+    // restoring the no-alloc-under-spinlock rule on this path.
+    let mut frame_bytes = [0u8; crate::signal_frame::SIGFRAME_SIZE];
+    if crate::signal_frame::assemble_sigframe(
         &layout,
         &interrupted_ctx,
         fpu_state,
         sig.as_u8() as u32,
         handler,
         restorer,
-    ) {
-        Ok(bytes) => bytes,
-        Err(_) => return None, // Frame build failed — defer.
-    };
+        &mut frame_bytes,
+    )
+    .is_err()
+    {
+        return None; // Corrupt layout — defer (disposition unchanged).
+    }
 
     let frame_base = layout.frame_base;
 
@@ -9705,9 +9805,19 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
             }
 
             // 无数据：先入队再检查（避免丢失唤醒）
-            if !stdin_prepare_to_wait() {
-                // 无当前进程，返回 0 (EOF)
-                return Ok(0);
+            match stdin_prepare_to_wait() {
+                StdinWaitPrepare::Enqueued => {}
+                StdinWaitPrepare::NoProcess => {
+                    // 无当前进程，返回 0 (EOF)
+                    return Ok(0);
+                }
+                StdinWaitPrepare::RegistryFull => {
+                    // D1-RES R2: registry at capacity for a new pid — no Blocked
+                    // publish, no lost wakeup. Bounded busy-retry (yield the CPU).
+                    // Unreachable while resident tasks <= WAITER_REGISTRY_MAX_ENTRIES.
+                    crate::force_reschedule();
+                    continue;
+                }
             }
 
             // R180-L1: every exit from the post-enqueue second check must
@@ -10374,8 +10484,10 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 }
 
 /// R113-1 FIX: Copy VfsStat to userspace via a zeroed byte buffer so that
-/// implicit `#[repr(C)]` padding bytes (after `rdev` and after `blksize`) are
-/// guaranteed to be zero, preventing kernel memory disclosure.
+/// every byte of the 144-byte Linux stat record is kernel-controlled.
+/// D2-ABI-STAT-LAYOUT: the layout no longer has implicit padding (pad0 and
+/// unused0..2 are explicit fields, serialized as 0 below); the zeroed staging
+/// buffer is retained as defense-in-depth.
 #[inline]
 fn copy_vfs_stat_to_user(user_dst: *mut VfsStat, stat: &VfsStat) -> Result<(), SyscallError> {
     let mut buf = [0u8; mem::size_of::<VfsStat>()];
@@ -10390,10 +10502,11 @@ fn copy_vfs_stat_to_user(user_dst: *mut VfsStat, stat: &VfsStat) -> Result<(), S
 
     put!(dev);
     put!(ino);
-    put!(mode);
     put!(nlink);
+    put!(mode);
     put!(uid);
     put!(gid);
+    put!(pad0);
     put!(rdev);
     put!(size);
     put!(blksize);
@@ -10404,6 +10517,9 @@ fn copy_vfs_stat_to_user(user_dst: *mut VfsStat, stat: &VfsStat) -> Result<(), S
     put!(mtime_nsec);
     put!(ctime_sec);
     put!(ctime_nsec);
+    put!(unused0);
+    put!(unused1);
+    put!(unused2);
 
     copy_to_user(user_dst as *mut u8, &buf)
 }
@@ -10467,10 +10583,11 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         VfsStat {
             dev: 0,
             ino: fd as u64,
-            mode: 0o020000 | 0o666, // S_IFCHR | rw-rw-rw-
             nlink: 1,
+            mode: 0o020000 | 0o666, // S_IFCHR | rw-rw-rw-
             uid: 0,
             gid: 0,
+            pad0: 0,
             rdev: 0,
             size: 0,
             blksize: 4096,
@@ -10481,6 +10598,9 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
         }
     } else {
         // R41-1 FIX: 查询 fd 对象获取真实元数据
@@ -14825,6 +14945,27 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 return Err(SyscallError::EBUSY);
             }
 
+            // D2-ARC: fail-closed isolation recount UNDER the held Process::inner.
+            // The R142-8 preflight ran lock-dropped and the re-check above verified
+            // ONLY seccomp_installing (fail-open for the isolation predicate). STRICT
+            // sandboxes the WHOLE address space, so re-verify via the registry txn
+            // using proc.tgid/proc.memory_space re-read under THIS lock (authoritative,
+            // not the stale preflight tuple). DEFENSE-IN-DEPTH (R181-3 uniformity):
+            // the 0-sibling preflight admits only the caller (mid-syscall), so no live
+            // actor can clone into the space — this is not a confirmed exploit fix, it
+            // removes the implicit non-local liveness assumption.
+            match crate::process::try_seccomp_isolation_recount_holding(
+                pid,
+                proc.tgid,
+                proc.memory_space,
+            ) {
+                Some((threads, vm_siblings)) if threads <= 1 && vm_siblings == 0 => {}
+                // Predicate failure → EPERM (matches this arm's preflight rejections).
+                Some(_) => return Err(SyscallError::EPERM),
+                // Table/PCB contention → EBUSY (transient; matches the installing vocab).
+                None => return Err(SyscallError::EBUSY),
+            }
+
             if proc.seccomp_generation == u64::MAX {
                 return Err(SyscallError::EOVERFLOW);
             }
@@ -14912,6 +15053,35 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Re-check after reacquiring lock
             if proc.seccomp_installing {
                 return Err(SyscallError::EBUSY);
+            }
+
+            // D2-ARC: fail-closed isolation recount UNDER the held Process::inner.
+            // Unlike STRICT, the TSYNC case has a REAL residual: with threads>1
+            // admitted, a live sibling on another CPU can clone(CLONE_VM w/o
+            // CLONE_THREAD) in the R142-8 lock-drop window. This recount NARROWS that
+            // window (it catches pure-VM siblings that published before the recount,
+            // which the relock missed) but does NOT close the TOCTOU: the caller's
+            // held lock never blocks a sibling clone, the clone gate checks only the
+            // cloning task's own seccomp_installing, and post-install an unfiltered
+            // TSYNC sibling can still clone a pure-VM task (TSYNC does not fan the
+            // filter out). R37-1 TSYNC residual stays OPEN (clone-side space-member
+            // gate). Defense-in-depth. Errno mirrors the preflight ORDER: threads-
+            // without-TSYNC → EPERM (R25-6) before vm_siblings → EBUSY (R37-1);
+            // contention → EBUSY.
+            match crate::process::try_seccomp_isolation_recount_holding(
+                pid,
+                proc.tgid,
+                proc.memory_space,
+            ) {
+                Some((threads, vm_siblings)) => {
+                    if threads > 1 && !tsync_requested {
+                        return Err(SyscallError::EPERM);
+                    }
+                    if vm_siblings > 0 {
+                        return Err(SyscallError::EBUSY);
+                    }
+                }
+                None => return Err(SyscallError::EBUSY),
             }
 
             if proc.seccomp_generation == u64::MAX {
@@ -17224,8 +17394,10 @@ fn sys_uname(buf: *mut UtsName) -> SyscallResult {
     fill_field(&mut uts.release, "0.6.5");
     fill_field(&mut uts.version, "Security Foundation Phase A");
     fill_field(&mut uts.machine, "x86_64");
+    // D2-ABI-STAT-LAYOUT: Linux default for an unset NIS domain name.
+    fill_field(&mut uts.domainname, "(none)");
 
-    // lint-repr-c-copy: allow (no-padding: UtsName {[u8;65]×5} = 325 bytes, alignment=1)
+    // lint-repr-c-copy: allow (no-padding: UtsName {[u8;65]×6} = 390 bytes, alignment=1)
     let uts_bytes = unsafe {
         core::slice::from_raw_parts(
             &uts as *const UtsName as *const u8,

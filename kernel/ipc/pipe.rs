@@ -1136,10 +1136,11 @@ impl FileOps for PipeHandle {
         Ok(VfsStat {
             dev: 0,
             ino: self.pipe_id() as u64,
-            mode: 0o010000 | 0o666, // S_IFIFO | rw-rw-rw-
             nlink: 1,
+            mode: 0o010000 | 0o666, // S_IFIFO | rw-rw-rw-
             uid: 0,
             gid: 0,
+            pad0: 0,
             rdev: 0,
             size: 0,
             blksize: 4096,
@@ -1150,6 +1151,9 @@ impl FileOps for PipeHandle {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
         })
     }
 }
