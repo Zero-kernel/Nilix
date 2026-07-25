@@ -24,6 +24,8 @@ use mm::{
 };
 use seccomp::{PledgeState, SeccompState};
 use spin::{Mutex, Once, RwLock};
+// D2-ARC: fixed held-pid registry for the alloc-free process-registry transaction.
+use core::cell::Cell;
 // G.1 Observability: Watchdog integration for hung-task detection
 use trace::watchdog::{register_watchdog, unregister_watchdog, WatchdogConfig, WatchdogHandle};
 use x86_64::{
@@ -3778,6 +3780,272 @@ pub fn run_process_table_retirement_self_test() {
     );
 }
 
+/// D2-ARC: self-test for the ProcessRegistryTransaction API. Every enforcement leg
+/// runs against a PRIVATE table fixture (never the global PROCESS_TABLE), then one
+/// read-only graceful-skip probe of the live table. RF180-40/44 discipline: the
+/// CoreProcess heap-class charge is asserted to restore EXACTLY after the fixture
+/// drops. All visit closures are alloc-free; no klog occurs while any lock is held.
+pub fn run_process_registry_txn_self_test() {
+    const SENTINEL: usize = 0xD2A2_C000;
+    const OTHER_SPACE: usize = 0x0E11_5000;
+    let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
+    {
+        let table = Mutex::new(AdmittedVec::<Option<ProcessArc>>::new(
+            HeapClass::CoreProcess,
+        ));
+        {
+            let mut t = table.lock();
+            t.try_reserve_exact(6).expect("D2-ARC fixture backing");
+            t.push_reserved(None)
+                .unwrap_or_else(|_| panic!("D2-ARC fixture slot 0"));
+            for pid in 1..=5usize {
+                let arc = Process::try_new_pcb(
+                    pid,
+                    1,
+                    ProcessNameSnapshot::from_parts("d2arc-txn-fixture", ""),
+                    120,
+                )
+                .expect("D2-ARC fixture pcb");
+                t.push_reserved(Some(arc))
+                    .unwrap_or_else(|_| panic!("D2-ARC fixture slot"));
+            }
+            // Stage tgid/space/state:
+            //   pid 1,2: tgid 1, SENTINEL, live   (thread group)
+            //   pid 3:   tgid 1, SENTINEL, Zombie (share-count includes; recount excludes)
+            //   pid 4:   tgid 4, SENTINEL, live   (pure CLONE_VM sibling)
+            //   pid 5:   tgid 5, OTHER,    live   (neither)
+            for pid in 1..=5usize {
+                if let Some(Some(arc)) = t.get(pid) {
+                    let mut g = arc.lock();
+                    match pid {
+                        1 | 2 => {
+                            g.tgid = 1;
+                            g.memory_space = SENTINEL;
+                            g.state = ProcessState::Ready;
+                        }
+                        3 => {
+                            g.tgid = 1;
+                            g.memory_space = SENTINEL;
+                            g.state = ProcessState::Zombie;
+                        }
+                        4 => {
+                            g.tgid = 4;
+                            g.memory_space = SENTINEL;
+                            g.state = ProcessState::Ready;
+                        }
+                        _ => {
+                            g.tgid = 5;
+                            g.memory_space = OTHER_SPACE;
+                            g.state = ProcessState::Ready;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Leg 1: happy-path scan visits exactly the 5 live slots.
+        let n = with_registry_txn_on(&table, |txn| {
+            let mut n = 0usize;
+            txn.try_visit_all_except(None, |_p, _| n += 1)?;
+            Ok(n)
+        })
+        .expect("D2-ARC leg1");
+        assert_eq!(n, 5, "D2-ARC leg1: happy scan visits all live slots");
+
+        // Leg 2: guard + scan composition (held pid skipped, contains() true).
+        with_registry_txn_on(&table, |txn| {
+            let _g1 = txn.try_lock_process(1)?;
+            assert!(txn.contains(1), "D2-ARC leg2: contains(held) true");
+            let mut n = 0usize;
+            txn.try_visit_all_except(None, |_p, _| n += 1)?;
+            assert_eq!(n, 4, "D2-ARC leg2: scan skips the txn-held pid");
+            Ok(())
+        })
+        .expect("D2-ARC leg2");
+
+        // Leg 3: same-pid re-lock → OrderViolation.
+        with_registry_txn_on(&table, |txn| {
+            let _g2 = txn.try_lock_process(2)?;
+            assert_eq!(
+                txn.try_lock_process(2).err(),
+                Some(RegistryTxnError::OrderViolation),
+                "D2-ARC leg3: same-pid re-lock rejected"
+            );
+            Ok(())
+        })
+        .expect("D2-ARC leg3");
+
+        // Leg 4: descending-order → OrderViolation; legal re-lock after drop.
+        with_registry_txn_on(&table, |txn| {
+            {
+                let _g3 = txn.try_lock_process(3)?;
+                assert_eq!(
+                    txn.try_lock_process(1).err(),
+                    Some(RegistryTxnError::OrderViolation),
+                    "D2-ARC leg4: descending-order rejected"
+                );
+            }
+            // g3 dropped → pid 3 re-lockable.
+            let _g3b = txn.try_lock_process(3)?;
+            Ok(())
+        })
+        .expect("D2-ARC leg4");
+
+        // Leg 5: guard cap → TooManyGuards on the 5th simultaneous guard.
+        with_registry_txn_on(&table, |txn| {
+            let _a = txn.try_lock_process(1)?;
+            let _b = txn.try_lock_process(2)?;
+            let _c = txn.try_lock_process(3)?;
+            let _d = txn.try_lock_process(4)?;
+            assert_eq!(
+                txn.try_lock_process(5).err(),
+                Some(RegistryTxnError::TooManyGuards),
+                "D2-ARC leg5: guard cap enforced"
+            );
+            Ok(())
+        })
+        .expect("D2-ARC leg5");
+
+        // Leg 6: sibling contention → clean abort, no leaked locks.
+        {
+            let external = {
+                let t = table.lock();
+                t.get(4).and_then(|s| s.clone()).expect("D2-ARC pid4 arc")
+            };
+            let held = external.lock(); // hold pid 4's inner externally
+            let r = with_registry_txn_on(&table, |txn| {
+                let mut n = 0usize;
+                txn.try_visit_all_except(None, |_p, _| n += 1)?;
+                Ok(n)
+            });
+            assert_eq!(
+                r.err(),
+                Some(RegistryTxnError::Contention),
+                "D2-ARC leg6: scan aborts on contention"
+            );
+            drop(held);
+            assert!(
+                table.try_lock().is_some(),
+                "D2-ARC leg6: table free after abort"
+            );
+            let t = table.lock();
+            for pid in 1..=5usize {
+                if let Some(Some(arc)) = t.get(pid) {
+                    assert!(
+                        arc.try_lock().is_some(),
+                        "D2-ARC leg6: no leaked PCB lock after abort"
+                    );
+                }
+            }
+        }
+
+        // Leg 7: guard release on early Err return from the closure.
+        let r: Result<(), RegistryTxnError> = with_registry_txn_on(&table, |txn| {
+            let _g = txn.try_lock_process(2)?;
+            Err(RegistryTxnError::NotFound)
+        });
+        assert_eq!(
+            r.err(),
+            Some(RegistryTxnError::NotFound),
+            "D2-ARC leg7: early Err propagates"
+        );
+        {
+            let t = table.lock();
+            if let Some(Some(arc)) = t.get(2) {
+                assert!(
+                    arc.try_lock().is_some(),
+                    "D2-ARC leg7: guard released on early return"
+                );
+            }
+        }
+
+        // Leg 8: table contention → Contention without deadlock.
+        {
+            let held = table.lock();
+            let r = with_registry_txn_on(&table, |txn| txn.try_visit_all_except(None, |_p, _| {}));
+            assert_eq!(
+                r.err(),
+                Some(RegistryTxnError::Contention),
+                "D2-ARC leg8: table contention aborts"
+            );
+            drop(held);
+        }
+
+        // Leg 9a: share-count shape (mirrors try_address_space_share_count_holding —
+        // includes Zombie, excludes Terminated). skip pid 1; SENTINEL live-or-zombie:
+        // pids 2,3(Zombie),4 = 3; + contains(1) = 4.
+        let share = with_registry_txn_on(&table, |txn| {
+            let mut c = 0usize;
+            txn.try_visit_all_except(Some(1), |_p, p| {
+                if p.memory_space == SENTINEL && p.state != ProcessState::Terminated {
+                    c += 1;
+                }
+            })?;
+            if txn.contains(1) {
+                c += 1;
+            }
+            // NotFound on the empty slot 0.
+            assert_eq!(
+                txn.try_lock_process(0).err(),
+                Some(RegistryTxnError::NotFound),
+                "D2-ARC leg9: NotFound on empty slot"
+            );
+            Ok(c)
+        })
+        .expect("D2-ARC leg9a");
+        assert_eq!(
+            share, 4,
+            "D2-ARC leg9a: share-count shape (Zombie included)"
+        );
+
+        // Leg 9b: seccomp-recount shape (mirrors try_seccomp_isolation_recount_holding
+        // — excludes Zombie+Terminated; threads = same tgid, vm = diff tgid same space).
+        // held_tgid=1, skip pid 1: threads = pid 2 (+contains(1)) = 2; vm = pid 4 = 1.
+        let (threads, vm) = with_registry_txn_on(&table, |txn| {
+            let mut threads = 0usize;
+            let mut vm = 0usize;
+            txn.try_visit_all_except(Some(1), |_p, p| {
+                if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+                    return;
+                }
+                if p.tgid == 1 {
+                    threads += 1;
+                } else if p.memory_space == SENTINEL {
+                    vm += 1;
+                }
+            })?;
+            if txn.contains(1) {
+                threads += 1;
+            }
+            Ok((threads, vm))
+        })
+        .expect("D2-ARC leg9b");
+        assert_eq!(
+            (threads, vm),
+            (2, 1),
+            "D2-ARC leg9b: recount shape (threads/vm split, Zombie excluded)"
+        );
+    }
+
+    // Leg 10: exact CoreProcess charge restoration after the fixture drops.
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::CoreProcess),
+        before,
+        "D2-ARC leg10: fixture must restore CoreProcess charge exactly"
+    );
+
+    // Read-only probe of the LIVE global table — graceful-skip on contention, never
+    // fails boot. klog only AFTER the txn returns (never under a held lock).
+    match with_process_registry_txn(|txn| {
+        let mut n = 0usize;
+        txn.try_visit_all_except(None, |_p, _| n += 1)?;
+        Ok(n)
+    }) {
+        Ok(n) => klog!(Info, "[D2-ARC] live-table txn probe ok ({} live PCBs)", n),
+        Err(_) => klog!(Warn, "[D2-ARC] live-table txn probe skipped (contention)"),
+    }
+}
+
 /// RF178-33: installed once during boot, then read lock-free from the
 /// timer-return context-switch path.
 static KPTI_CR3_UPDATE: Once<KptiCr3UpdateCallback> = Once::new();
@@ -4640,22 +4908,79 @@ pub fn try_address_space_share_count_holding(
     if memory_space == 0 {
         return Some(0);
     }
-    let table = PROCESS_TABLE.try_lock()?;
-    let mut count = 0usize;
-    for (pid, slot) in table.iter().enumerate() {
-        let Some(p) = slot else { continue };
-        if pid == held_pid {
-            // Caller holds this lock; it counts itself via the held guard's
-            // memory_space, which the caller has already verified.
+    // D2-ARC: reimplemented on the ProcessRegistryTxn combinator with provably
+    // identical observable semantics to the original hand-rolled scan:
+    //   - same table try_lock (contention → None via `.ok()`),
+    //   - same ascending per-slot try_lock-check-drop with abort-on-ANY-contention
+    //     (the `?` inside the visit propagates Contention exactly like the old `?`),
+    //   - `held_pid` counted +1 IFF its slot is occupied (`contains` replicates the
+    //     old `let Some(p) = slot else { continue }` guard before the held_pid arm;
+    //     the caller-held-lock membership argument is unchanged — the caller holds
+    //     this PCB's Process::inner and has already verified its memory_space),
+    //   - same predicate, same alloc-free property, same lock hold windows.
+    // OrderViolation/TooManyGuards are unreachable here (no TxnProcessGuards taken),
+    // so `.ok()` maps exactly the original None-on-contention surface. Both
+    // production callers (sys_cgroup_attach R181-3 arm; cgroupfs cgroup.procs arm)
+    // remain byte-for-byte untouched — the narrowest honest adoption.
+    with_process_registry_txn(|txn| {
+        let mut count = 0usize;
+        txn.try_visit_all_except(Some(held_pid), |_pid, p| {
+            if p.memory_space == memory_space && p.state != ProcessState::Terminated {
+                count += 1;
+            }
+        })?;
+        if txn.contains(held_pid) {
             count += 1;
-            continue;
         }
-        let guard = p.try_lock()?;
-        if guard.memory_space == memory_space && guard.state != ProcessState::Terminated {
-            count += 1;
+        Ok(count)
+    })
+    .ok()
+}
+
+/// D2-ARC second consumer: fail-closed under-held-`Process::inner` recount of the
+/// seccomp isolation predicates. Returns `Some((thread_group_count,
+/// pure_vm_sibling_count))` on a complete observation, `None` on any contention.
+///
+/// Mirrors `thread_group_size` (self-inclusive; excludes Zombie+Terminated) and
+/// `non_thread_group_vm_share_count` (excludes same-tgid tasks + Zombie+Terminated;
+/// 0 for `memory_space == 0`) EXACTLY, but never blocks — the blocking scans would
+/// ABBA-invert Level-5 `PROCESS_TABLE → Process::inner` when called under a held
+/// `Process::inner` (the R181-3 rationale). The caller must hold `held_pid`'s
+/// `Process::inner` and pass `held_tgid`/`held_memory_space` read UNDER that lock;
+/// the held task is live by contract (executing a syscall), so the `contains` leg
+/// counts it into `threads` unconditionally.
+///
+/// SEVERITY NOTE (see the seccomp call sites): this recount NARROWS the stale-
+/// preflight window but does NOT close the R37-1 TSYNC TOCTOU — it is
+/// defense-in-depth, not a race fix. A residual recount→commit window remains (the
+/// caller's held lock never blocks a sibling's clone; the clone gate checks only
+/// the cloning task's own `seccomp_installing`), and post-install an unfiltered
+/// TSYNC-admitted sibling can still clone a pure-VM task (TSYNC does not fan the
+/// filter out). The R37-1 TSYNC residual stays OPEN (clone-side space-member gate).
+pub fn try_seccomp_isolation_recount_holding(
+    held_pid: ProcessId,
+    held_tgid: ProcessId,
+    held_memory_space: usize,
+) -> Option<(usize, usize)> {
+    with_process_registry_txn(|txn| {
+        let mut threads = 0usize;
+        let mut vm_siblings = 0usize;
+        txn.try_visit_all_except(Some(held_pid), |_pid, p| {
+            if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+                return;
+            }
+            if p.tgid == held_tgid {
+                threads += 1;
+            } else if held_memory_space != 0 && p.memory_space == held_memory_space {
+                vm_siblings += 1;
+            }
+        })?;
+        if txn.contains(held_pid) {
+            threads += 1;
         }
-    }
-    Some(count)
+        Ok((threads, vm_siblings))
+    })
+    .ok()
 }
 
 // D3-ARC-MM-SHARED: The following sync_vm_siblings_* functions have been deleted.
@@ -4699,7 +5024,218 @@ pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: Process
         .count()
 }
 
-/// R101-9 FIX: Get a snapshot of all active PIDs from the process table.
+// ============================================================================
+// D2-ARC-CLONE-LOCK: ProcessRegistryTransaction — fail-closed cross-registry
+// try-lock API (Level-5 PROCESS_TABLE + Process::inner).
+//
+// This is the SANCTIONED way to observe PROCESS_TABLE (Level 5) while a
+// Process::inner (Level 5) is already held. ALL acquisition inside it is
+// try-only and fail-closed (Contention aborts; callers surface EAGAIN/EBUSY), so
+// no blocking cycle can ever form — deadlock-freedom derives SOLELY from try-only
+// acquisition. It generalizes the R181-3 primitive's already-proven
+// try-lock-under-held-Process::inner profile (the documented Level-5 exception).
+//
+// This is NOT transactional memory: there is no mutation journal and no rollback.
+// Consumers MUST validate-everything-then-mutate — all fallible observation under
+// the txn, any mutation only AFTER the txn returns Ok — so an Err return leaves
+// state untouched by construction.
+//
+// FORBIDDEN inside the closure (same-CPU silent infinite spin that lockdep CANNOT
+// catch — PROCESS_TABLE / Process::inner are plain spin::Mutex, not LockdepMutex):
+//   - anything that (re)acquires PROCESS_TABLE or blocking-locks a Process::inner:
+//     get_process / try_get_process / current_generation / thread_group_size /
+//     address_space_share_count / non_thread_group_vm_share_count /
+//     process_table_snapshot;
+//   - any allocation (RF180-44): no Vec / format! / klog! while the table is held;
+//   - no sleep, no user copy, no driver IO, no blocking lock.
+// Not for IRQ context (IRQ table readers use the try_get_process tri-state,
+// R171-G5-1). Nested with_process_registry_txn fails closed as Contention
+// (spin try_lock on the self-held table returns None).
+//
+// Guard-ordering rule: multiple caller-held TxnProcessGuards must be acquired in
+// strictly-ascending pid order (runtime-enforced by register(), max 4). This is a
+// determinism/hygiene contract only — it is NOT what makes the API safe.
+// try_visit_all_except's TRANSIENT per-slot guards are EXEMPT from this rule (they
+// may try-lock pids below a held guard) and are safe SOLELY because acquisition is
+// try-only with the guard dropped before the next slot. No blocking variant of the
+// scan may EVER be added on the strength of the ordering discipline.
+// ============================================================================
+
+/// Error from a process-registry transaction. Every variant means "observation
+/// incomplete, nothing mutated" — callers map it to EAGAIN/EBUSY (transient).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryTxnError {
+    /// A try-lock (table or a PCB) was contended — abort, nothing acquired.
+    Contention,
+    /// The requested pid has no live table slot.
+    NotFound,
+    /// Same-pid re-lock, or out-of-ascending-order acquisition of a held guard.
+    OrderViolation,
+    /// More than MAX_TXN_GUARDS simultaneous caller-held guards requested.
+    TooManyGuards,
+}
+
+/// Max simultaneously caller-held `TxnProcessGuard`s. No production site holds >1
+/// published PCB guard; 4 is headroom. The fixed array keeps the txn alloc-free.
+pub const MAX_TXN_GUARDS: usize = 4;
+
+/// A process-registry transaction. Holds ONLY a reborrow of the entry-frame-owned
+/// `PROCESS_TABLE` guard (never process guards → non-self-referential) plus a fixed
+/// held-pid registry. `Cell` makes it `!Sync`, which is correct: single-thread
+/// closure scope.
+pub struct ProcessRegistryTxn<'t> {
+    table: &'t AdmittedVec<Option<ProcessArc>>,
+    held: Cell<[Option<ProcessId>; MAX_TXN_GUARDS]>,
+}
+
+/// A locked PCB handed to the caller by `try_lock_process`. Its lifetime is bound
+/// to `&'a self` (the txn), so it cannot escape the closure. `Drop` unregisters the
+/// pid from the held registry BEFORE the inner guard releases the lock — the only
+/// inconsistency window is held-but-unregistered, which fails CLOSED.
+pub struct TxnProcessGuard<'a, 't> {
+    txn: &'a ProcessRegistryTxn<'t>,
+    pid: ProcessId,
+    guard: spin::MutexGuard<'a, Process>,
+}
+
+impl core::ops::Deref for TxnProcessGuard<'_, '_> {
+    type Target = Process;
+    fn deref(&self) -> &Process {
+        &self.guard
+    }
+}
+
+impl core::ops::DerefMut for TxnProcessGuard<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Process {
+        &mut self.guard
+    }
+}
+
+impl Drop for TxnProcessGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.txn.unregister(self.pid);
+    }
+}
+
+impl<'t> ProcessRegistryTxn<'t> {
+    /// Register a caller-held pid: reject same-pid re-lock and descending order
+    /// (both → OrderViolation), else claim the first free slot (else TooManyGuards).
+    fn register(&self, pid: ProcessId) -> Result<(), RegistryTxnError> {
+        let mut slots = self.held.get();
+        for s in slots.iter() {
+            if let Some(h) = s {
+                if *h == pid || pid < *h {
+                    return Err(RegistryTxnError::OrderViolation);
+                }
+            }
+        }
+        for s in slots.iter_mut() {
+            if s.is_none() {
+                *s = Some(pid);
+                self.held.set(slots);
+                return Ok(());
+            }
+        }
+        Err(RegistryTxnError::TooManyGuards)
+    }
+
+    fn unregister(&self, pid: ProcessId) {
+        let mut slots = self.held.get();
+        for s in slots.iter_mut() {
+            if *s == Some(pid) {
+                *s = None;
+                break;
+            }
+        }
+        self.held.set(slots);
+    }
+
+    /// Try-lock a PCB by pid, returning a guard the caller holds in a local.
+    /// NEVER txn-lock a pid whose `Process::inner` you already hold OUTSIDE the txn
+    /// (pass it as `skip_pid` to scans instead) — spin try_lock would see it as
+    /// contention and abort cleanly, but it is a contract violation.
+    pub fn try_lock_process<'a>(
+        &'a self,
+        pid: ProcessId,
+    ) -> Result<TxnProcessGuard<'a, 't>, RegistryTxnError> {
+        let arc = self
+            .table
+            .get(pid)
+            .and_then(|slot| slot.as_ref())
+            .ok_or(RegistryTxnError::NotFound)?;
+        self.register(pid)?;
+        match arc.try_lock() {
+            Some(guard) => Ok(TxnProcessGuard {
+                txn: self,
+                pid,
+                guard,
+            }),
+            None => {
+                self.unregister(pid);
+                Err(RegistryTxnError::Contention)
+            }
+        }
+    }
+
+    /// Lockless check: does `pid` currently occupy a live table slot? Used to count
+    /// a caller-held pid (whose `Process::inner` the caller already holds) without
+    /// re-locking it — the R181-3 held-leg argument.
+    pub fn contains(&self, pid: ProcessId) -> bool {
+        self.table
+            .get(pid)
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Visit every live PCB except `skip_pid` and any caller-held txn pids (the
+    /// holder observes those via its own guards). Per-slot try-lock-check-drop with
+    /// abort-on-ANY-contention — identical hold-window profile to the R181-3 scan.
+    pub fn try_visit_all_except(
+        &self,
+        skip_pid: Option<ProcessId>,
+        mut visit: impl FnMut(ProcessId, &Process),
+    ) -> Result<(), RegistryTxnError> {
+        let held = self.held.get();
+        for (pid, slot) in self.table.iter().enumerate() {
+            let Some(arc) = slot.as_ref() else { continue };
+            if Some(pid) == skip_pid {
+                continue;
+            }
+            if held.iter().any(|h| *h == Some(pid)) {
+                continue;
+            }
+            let guard = arc.try_lock().ok_or(RegistryTxnError::Contention)?;
+            visit(pid, &guard);
+            // guard drops here, before the next slot — never 2 transient held.
+        }
+        Ok(())
+    }
+}
+
+/// Fixture-injectable core of the transaction (RF180-44 retirement-test precedent):
+/// acquires the table guard in THIS frame (drops strictly after every process guard
+/// — borrow-checker enforced), builds the txn over a reborrow, runs `f`.
+fn with_registry_txn_on<T>(
+    table: &Mutex<AdmittedVec<Option<ProcessArc>>>,
+    f: impl FnOnce(&ProcessRegistryTxn<'_>) -> Result<T, RegistryTxnError>,
+) -> Result<T, RegistryTxnError> {
+    let guard = table.try_lock().ok_or(RegistryTxnError::Contention)?;
+    let txn = ProcessRegistryTxn {
+        table: &guard,
+        held: Cell::new([None; MAX_TXN_GUARDS]),
+    };
+    f(&txn)
+}
+
+/// Run a fail-closed transaction against the global `PROCESS_TABLE`. See the module
+/// contract above: NOT transactional memory (validate-everything-then-mutate), no
+/// allocation / klog / blocking lock inside the closure, not for IRQ context.
+pub fn with_process_registry_txn<T>(
+    f: impl FnOnce(&ProcessRegistryTxn<'_>) -> Result<T, RegistryTxnError>,
+) -> Result<T, RegistryTxnError> {
+    with_registry_txn_on(&PROCESS_TABLE, f)
+}
+
 ///
 /// Returns a Vec of all PIDs that have live process entries.
 ///

@@ -113,6 +113,30 @@
 //! also acquired with `try_lock`, so this out-of-order exception path can fail
 //! closed but can never wait and complete a lock cycle. USER_MODE proves it did
 //! not interrupt a kernel thread already holding one of these locks.
+//!
+//! D2-ARC ProcessRegistryTransaction rule: `process::with_process_registry_txn`
+//! is the ONLY sanctioned way to observe PROCESS_TABLE (Level 5) while a
+//! `Process::inner` (Level 5) is already held (generalizing the R181-3 exception).
+//! ALL acquisition inside it is try-only and fail-closed — Contention aborts and
+//! callers surface EAGAIN/EBUSY — so no blocking cycle can form. Deadlock-freedom
+//! derives SOLELY from try-only acquisition; the strictly-ascending-pid /
+//! same-pid-dedupe rule enforced by `register()` applies ONLY to caller-held
+//! `TxnProcessGuard`s and is a determinism/hygiene contract, NOT the safety basis
+//! (`try_visit_all_except`'s transient per-slot guards are exempt and may try-lock
+//! pids below a held guard). NO blocking variant of the scan may EVER be added on
+//! the strength of the ordering discipline. FORBIDDEN inside the closure (same-CPU
+//! silent infinite spin that lockdep CANNOT catch — PROCESS_TABLE / Process::inner
+//! are plain `spin::Mutex`, not `LockdepMutex`): anything acquiring PROCESS_TABLE
+//! or blocking-locking a `Process::inner` — `get_process` / `try_get_process` /
+//! `current_generation` / `thread_group_size` / `address_space_share_count` /
+//! `non_thread_group_vm_share_count` / `process_table_snapshot` — plus any
+//! allocation (RF180-44: no Vec / `format!` / `klog!`), sleep, user copy, driver
+//! IO, or blocking lock. Not for IRQ context (IRQ readers use the `try_get_process`
+//! tri-state, R171-G5-1). The mutating blocking batch `request_exit_group_atomic`
+//! (blocking closure of the clone-escape window is load-bearing) and the
+//! skip-per-slot `oom_snapshot` (skip-not-abort recovery is load-bearing) stay
+//! OUTSIDE this API; the `reparent_orphans` one-PCB-lock-at-a-time invariant
+//! (process.rs) is unchanged and stricter for that path.
 //! | ENDPOINT_REGISTRY | ipc/ipc.rs | 7 | Mutex<HashMap> | Global |
 //! | VGA_BUFFER | drivers/vga_buffer.rs | 8 | Mutex | Global |
 //! | SERIAL_PORT | drivers/serial.rs | 8 | Mutex | Global |
@@ -221,6 +245,37 @@
 //!   (R169-3 forced-drain-at-delete, R169-5 IRQs-enabled AP drain). Categorizing it
 //!   as a plain "takes no further lock" leaf (without this deferred-L5 caveat)
 //!   would understate the contract.
+//!
+//! # D1-ISO: TX Device-Ownership Gate (netns dataplane isolation)
+//!
+//! The type-enforced TX gate (net/src/stack.rs `tx_auth` + kernel_core
+//! net_namespace.rs `net_ns_owns_device`) adds these Level-8 reads on the
+//! physical TX paths:
+//!
+//! ```text
+//! NET_NS_BY_ID (RwLock read)         > NetNamespace.devices (RwLock read)
+//! NET_REGISTRY.devices (RwLock read)   [always released before any per-device Mutex]
+//! ```
+//!
+//! - The pair `NET_NS_BY_ID > devices` is taken ONLY inside
+//!   `net_ns_owns_device` at token MINT time (leaf pair — never held together
+//!   with the device-registry lock, any socket lock, or the per-device Mutex).
+//!   Both physical sinks mint BEFORE taking `sock.operation`; the device
+//!   callback that later runs under `sock.operation` holds ONLY the per-device
+//!   Mutex — the minted token carries pre-verified authority and re-checks
+//!   nothing (see the tx_auth revocation contract for why a sink re-check is
+//!   deferred to Phase I.3).
+//! - Mint-path Weak upgrade: on process-driven send paths the sending PCB pins
+//!   the namespace Arc, so the upgrade is never the last strong ref there; on
+//!   the RX-reply path a last-ref `NetNamespace::Drop` after the upgrade is
+//!   lock-safe because the NET_NS_BY_ID read guard is released before the
+//!   upgraded Arc drops (Drop's NET_NS_BY_ID.write() cannot self-deadlock).
+//! - Registry metadata accessors (`get_device_with_index`, `device_mac`,
+//!   `device_index`, `device_tx_stats`) copy the Arc/numbers under the registry
+//!   read lock and RELEASE it before any per-device Mutex is taken (never
+//!   nested). `device_tx_stats` then takes the per-device Mutex for one
+//!   coherent three-field snapshot; callers must not hold locks that rank
+//!   below the per-device lock.
 //! - R169-6 slice 2 (HOLD-UNTIL-CLOSE): a CHARGED `BindKind::Explicit` binding
 //!   (explicit `bind(non-zero)`) is held until close. TCP enforces this via the
 //!   five while-alive PURE-SKIP arms (`resolve_while_alive_teardown` — the kind
