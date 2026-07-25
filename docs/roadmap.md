@@ -1,9 +1,9 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.0 — first unified edition (merges the former `roadmap.md` and `roadmap-enterprise.md`)
-**Snapshot:** 2026-07-23 · branch `main` @ `1344025ac` (working tree carries 4 uncommitted R184-fix files:
-`kernel_core/process.rs`, `kernel_core/syscall.rs`, `net/src/socket.rs`, `net/src/tcp.rs`; the remote build
-host is one style-only commit ahead at `2e4ad20`)
+**Version:** 4.1 — design-queue closure update (2026-07-24; was 4.0 first unified edition)
+**Snapshot:** 2026-07-24 · branch `main` @ `732f330` (working tree carries the full design-queue round
+uncommitted: D1-RES/D1-ISO/D2-ABI/D2-ERR/D2-TST + R184 residual fixes; remote is the authoritative
+build host)
 **Design principle:** Security > Correctness > Efficiency > Performance
 **Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
 `docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
@@ -22,7 +22,7 @@ deliberately retain the historical `Zero-os` naming — do not "fix" them.
 
 1. Code and build configuration (what exists and is actually wired);
 2. CI gates and in-kernel runtime tests (what is observed to work);
-3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.38, 2026-07-23);
+3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.41, 2026-07-24);
 4. Audit / review-fix reports in `docs/review/` (security and open-risk status);
 5. `README.md` (public summary — authoritative only where code/tests/plan do not contradict it; where they
    do, this document records the reconciliation and the README is stale, as with the gate status in §8);
@@ -54,22 +54,24 @@ that later verification refuted as false positives (see §11).
 **Milestone:** approaching **1.0-Preview**. Phases A–G are complete; **Phase U** (user-mode Linux ABI,
 strategy *Compat-ZeroABI*) is in progress with milestone M0 done and native-capability slice U.S2-3B landed.
 
-**Release gate:** the 1.0-Preview gate is currently **BLOCKED** (2026-07-23). It was first unblocked on
-2026-07-22 (zero-HIGH streak 3/3 over R181–R183), then **re-blocked one day later** when round R184 found
-one real CRITICAL (exit-path use-after-free, fixed) and one real HIGH (capability-attach TOCTOU, fixed),
-resetting the streak. Current state: **0 open CRITICAL / 0 open HIGH / 0 open actionable MEDIUM**; streak
-rebuilt to 1/3 (R185 clean); the remaining blockers are the streak itself and **2 open D1 design findings**
-(§14). Note: `README.md` §6 still says "UNBLOCKED" — it predates R184 and is stale on this point.
+**Release gate:** the 1.0-Preview gate is currently **BLOCKED on streak ONLY** (2026-07-24). It was first
+unblocked on 2026-07-22 (zero-HIGH streak 3/3 over R181–R183), then **re-blocked one day later** when
+round R184 found one real CRITICAL (exit-path use-after-free, fixed) and one real HIGH
+(capability-attach TOCTOU, fixed), resetting the streak. Current state: **0 open CRITICAL / 0 open HIGH
+/ 0 open actionable MEDIUM**; streak rebuilt to **1/3** (R185 clean); **both D1 design findings
+RESOLVED 2026-07-24** (D1-RES + D1-ISO) and all D2s dispositioned incl. D2-ABI-STAT-LAYOUT — design
+queue is D3-backlog-only and no longer gate-blocking. Sole remaining gate item: zero-HIGH streak 3/3
+(next = R186 → 2/3). Note: `README.md` §6 still says "UNBLOCKED" — it predates R184 and is stale.
 
 | Dimension | State (2026-07-23) |
 |---|---|
 | Audit history | **185 rounds** (R1 2025-12-09 → R185 2026-07-23); ~1,315 findings filed, ~1,161 fixed (§11) |
-| Open security debt | 0 CRITICAL, 0 HIGH, 0 actionable MEDIUM/LOW; 6 tracked design findings (2 D1 open + gate-blocking, 3 D2 partial-open, 1 D3 implemented-pending-closure) |
+| Open security debt | 0 CRITICAL, 0 HIGH, 0 actionable MEDIUM/LOW; design queue D3-backlog-only (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs, D1-RES breadth); all D1/D2 dispositioned 2026-07-24 |
 | Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 193,656 lines (`kernel/`); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
 | Syscall surface | **121 distinct syscall numbers dispatched** (~125 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Build/test baseline | build OK · lint 4/4 OK · runtime tests 18 passed / 39 deferred / 0 failed · 0 panic · 0 NX violation |
+| Build/test baseline | build OK · lint (incl. abi-oracle + lint-fallible) OK · runtime tests **19** passed / 39 deferred / 0 failed · 0 panic · 0 NX · musl-check 6 markers (incl. MUSL-STAT-OK / MUSL-UNAME-OK) |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
@@ -147,7 +149,7 @@ user-space server once synchronous IPC + shared memory land (U.S3 → U.S4, §9)
 
 | Attacker profile | Goal | Current mitigations | Remaining gap |
 |---|---|---|---|
-| Malicious tenant (container) | Escape isolation, cross-tenant access | Per-process CR3, 5 namespaces, cgroups v2 (6 controllers), per-tenant net quotas (J.2), fail-closed netns TX device gate | D1-ISO residual (per-ns dataplane config resolver); cgroup namespace absent |
+| Malicious tenant (container) | Escape isolation, cross-tenant access | Per-process CR3, 5 namespaces, cgroups v2 (6 controllers), per-tenant net quotas (J.2), fail-closed netns TX device gate (type-enforced token, 2026-07-24) | D3 NETNS-DATAPLANE-CONFIG (per-ns dataplane config, Phase I.3); cgroup namespace absent |
 | Remote attacker | Network exploitation | Default-DROP stateful firewall, conntrack caps, SYN cookies, challenge-ACK limit, RFC 5961/6528, fragment-reassembly bounds, rate limiters | IPv6 absent (no surface, also no parity); TLS/crypto offload out of scope |
 | Compromised process | Privilege escalation | Ring 3 + SMEP/SMAP/UMIP, W^X, seccomp/pledge, LSM SecureBaseline (user W^X, root-minting block, Yama-like ptrace), stack guards, SROP-defended sigreturn | KPTI inert (single CR3) — Meltdown-class reliance is on hardware immunity; text KASLR verify-only |
 | Malicious/compromised device | DMA into kernel memory | VT-d DMA isolation wired at boot (fail-closed gate, RAII unmap, bus-master-off on failure), virtqueue used-ring validation, IRTE SID verification | Secure-profile still legacy-proceeds when *no* IOMMU exists (documented residual); needs real-hardware validation |
@@ -427,7 +429,7 @@ design findings.
 |---|---|
 | Zero-HIGH streak | **1/3** — reached 3/3 on 2026-07-22 (R181–R183), then reset by R184's real CRITICAL+HIGH; R185 (clean) rebuilt it to 1/3 |
 | Open CRITICAL / HIGH / MEDIUM | 0 / 0 / 0 actionable (R184's 1 CRITICAL + 1 HIGH fixed; 10 of 11 reported HIGH and all 18 MEDIUM were verified false positives) |
-| D1 design findings | **2 open** (D1-RES heap-admission scope proof; D1-ISO per-namespace dataplane config) — **these block the gate** |
+| D1 design findings | **0 open** (D1-RES RESOLVED 2026-07-24: heap oracle + R1-R4 closure; D1-ISO RESOLVED 2026-07-24: type-enforced TX token + Option-B claim narrowing — residual config arc re-filed as D3 NETNS-DATAPLANE-CONFIG, Phase I.3) |
 | Proof-obligation ledger | 8 of 12 PO artifacts complete |
 
 **What "unblocked" will and won't mean:** clearing the gate qualifies the tree for a **1.0-Preview**
@@ -469,13 +471,14 @@ panel). Target: glibc + full Linux/OCI, dynamic linking in scope.
 
 ### Near term (from the live plan v15.38, gate-directed)
 
-1. **R186 audit — streak candidate 2/3** (over an unchanged tree). Must run in Codex-cooperative mode or
+1. **R186 audit — streak candidate 2/3** (over the **post-design-queue** tree: D1-ISO + D2-ABI + D1-RES + lint gates). Must run in Codex-cooperative mode or
    apply the hardened orchestrator backstop with a **caller/lock-context lens** (re-read every CRITICAL/HIGH
    candidate together with its enclosing lock scope and all call sites) — the lens whose absence caused
    R184 to over-report HIGH by 10×.
 2. **R187 — streak candidate 3/3.** Clean → the streak side of the gate is satisfied.
-3. **D1 residual mitigation** (the real gate-blocking implementation work): D1-RES whole-heap
-   admission/ownership scope proof; D1-ISO `AuthorizedTxDevice` + per-namespace dataplane config resolver.
+3. **D1 residual mitigation — DONE 2026-07-24** (both D1s resolved): D1-RES whole-heap
+   admission/ownership closure (R1-R4 + oracle); D1-ISO `AuthorizedTxDevice` type-enforced TX gate +
+   Option-B claim narrowing. Per-namespace dataplane config re-filed as D3 NETNS-DATAPLANE-CONFIG (Phase I.3).
 4. **Housekeeping cleanups** (§12): delete `sched/process.rs` and `kernel_core/kcov_syscalls.rs` orphans;
    remove dead demo modules; correct the stale IOMMU/DMAR boot comment; either wire the KCOV recorder or
    mark it explicitly non-functional; drop the unused `uart_16550` dependency.
@@ -521,23 +524,29 @@ findings are **not open vulnerabilities**; their approximate disposition is:
 - **Documented / accepted-risk / deferred** — a small set: R40 KASLR/KPTI architectural, R65 SMP,
   R81-3 / R84-4 / R89-4 documented risks, R121-2 KPTI trampoline (deferred, non-gating).
 - **Duplicate / superseded** — findings re-filed across rounds then merged.
-- **Currently open actionable: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW.** The only open items are the 6
-  design findings below (2 of them gate-blocking).
+- **Currently open actionable: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW.** As of 2026-07-24 all 6
+  R180 design findings below are dispositioned AND the follow-on D2-ABI-STAT-LAYOUT is RESOLVED
+  (VfsStat → Linux x86-64 stat 144B, UtsName → 390B, musl-proven); the open design queue is
+  D3-backlog-only (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC clone-side, D2-ARC demoted legs,
+  D1-RES validation breadth).
 
 These are estimates aggregated across 185 rounds; the authoritative per-round disposition lives in
 `docs/review/`. The count above is *findings-filed*, not *distinct-defects* — the audit false-positive rate
 is itself tracked as a process risk (§14).
 
-**Design findings (6 tracked from R180 — 5 open, 1 implemented pending closure):**
+**Design findings (6 tracked from R180 — all 6 dispositioned as of 2026-07-24; 0 gate-blocking):**
 
 | ID | Sev | Title | State |
 |---|---|---|---|
-| D1-RES-HEAP-BUDGET-SCOPE | D1 | whole-heap admission/ownership scope proof | **open** — executable leg done; formal proof pending (**blocks gate**) |
-| D1-ISO-NETNS-DATAPLANE | D1 | per-namespace device-ownership + dataplane isolation | **open** — fail-closed TX gate landed; config resolver PO pending (**blocks gate**) |
-| D2-ARC-CLONE-LOCK | D2 | cross-registry lock-ordering / transaction API | open — partial (point primitive) |
-| D2-ERR-VFS-FALLIBILITY | D2 | end-to-end VFS fallibility (prepare/commit) | open — partial (local pattern; lint pending) |
-| D2-TST-ABI-BYTES | D2 | static ABI-layout oracle vs. wrapper drift | open — partial (musl behavioral oracles) |
-| D3-RES-COW-RESERVATION | D3 | COW metadata reservation transaction | implemented (overlap oracle + test) — pending formal closure |
+| D1-RES-HEAP-BUDGET-SCOPE | ~~D1~~ | whole-heap admission/ownership scope proof | **RESOLVED 2026-07-24** — R1 in-place sigframe, R2 stdin/socket `.bss` rewrites, R3 intrusive allocator, R4 instrumented peak ceiling, combined-load probe; D3 validation-breadth backlog only |
+| D1-ISO-NETNS-DATAPLANE | ~~D1~~ | per-namespace device-ownership + dataplane isolation | **RESOLVED 2026-07-24** — type-enforced `tx_auth::AuthorizedTxDevice` token (sole driver-transmit path), Option-B claim narrowing (`docs/namespace-isolation.md`), `net_ns_tx_isolation` boot test; feature gap re-filed as **D3 NETNS-DATAPLANE-CONFIG** (Phase I.3) |
+| D2-ARC-CLONE-LOCK | ~~D2~~→D3 | cross-registry lock-ordering / transaction API | demoted 2026-07-24 — `ProcessRegistryTxn` + seccomp recount landed; D3 backlog (compile-time tokens, front-door unification, R37-1 TSYNC clone-side) |
+| D2-ERR-VFS-FALLIBILITY | ~~D2~~ | end-to-end VFS fallibility (prepare/commit) | **RESOLVED 2026-07-24** — `make lint-fallible` mechanized + 2 real fixes (pending tracking commit) |
+| D2-TST-ABI-BYTES | ~~D2~~ | static ABI-layout oracle vs. wrapper drift | **RESOLVED 2026-07-24** — 3-leg `make abi-check` oracle (pending tracking commit) |
+| D2-ABI-STAT-LAYOUT | ~~D2~~ | VfsStat/UtsName Linux wire layouts | **RESOLVED 2026-07-24** — VfsStat → exact Linux x86-64 `struct stat` 144B; UtsName → 390B `new_utsname`; fallible TryFrom→EOVERFLOW; shell mirrors lockstepped; oracle LINUX_UAPI + gcc Leg-C; musl `MUSL-STAT-OK`/`MUSL-UNAME-OK` REQUIRED markers |
+| D3-RES-COW-RESERVATION | D3 | COW metadata reservation transaction | **CLOSED 2026-07-24** — PO-MM-01 claims re-verified live; lazy reservation → Phase L |
+| D3 NETNS-DATAPLANE-CONFIG | D3 | per-ns dataplane feature arc (from D1-ISO Option-B) | **OPEN** — Phase I.3 (not a security gap; fail-closed today) |
+| D3 R37-1-TSYNC-CLONE-SIDE | D3 | TSYNC clone-side residual | **dispositioned** — revisit with TSYNC impl (F-5/Phase M) |
 
 (PO = *proof obligation*, the design queue's closure artifacts; 8 of 12 complete as of 2026-07-22.)
 
@@ -617,7 +626,7 @@ and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV covera
 | Risk | Severity | Status | Note |
 |---|---|---|---|
 | Audit over-reporting (solo mode, no lock/caller context) | Process | **Active** | R184 was 91% false-positive on HIGH; R186+ must use Codex or the caller/lock lens |
-| D1 design debt (heap-scope proof, netns dataplane) | D1 | Open | **Blocks the 1.0-Preview gate** |
+| D1 design debt (heap-scope proof, netns dataplane) | ~~D1~~ | **RESOLVED 2026-07-24** | No longer blocks the gate; residual feature arc = D3 NETNS-DATAPLANE-CONFIG |
 | KPTI inert (single-CR3) | Design | Deferred (R121-2) | Meltdown-class defense relies on hardware immunity until MM dual-root lands |
 | No real-hardware validation | Coverage | Open | QEMU-only; melting/bare-metal gates are frameworks |
 | Livepatch trust keys unprovisioned | Ops | Open | mechanism complete, non-functional until keys wired |

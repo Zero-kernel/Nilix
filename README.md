@@ -37,8 +37,8 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate achieved **UNBLOCKED** status with zero-HIGH streak 3/3
-complete (R181 + R182 + R183) on 2026-07-22. See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate is currently **BLOCKED on streak 1/3** (reset by R184, 
+rebuilt by R185). See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
 - **2026-07-24:** R184 review-fix round — fixed 4 findings from R183 follow-up review: allocation-free 
@@ -412,19 +412,19 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **184** (R184 review-fix completed 2026-07-24) |
-| Cumulative findings | ~1,265 |
-| Findings fixed/resolved | ~1,163 |
-| Latest round | R184 review-fix (4 findings from R183 follow-up) |
-| 1.0-Preview release gate | **UNBLOCKED** — zero-HIGH streak 3/3 maintained |
+| Audit rounds | **185** (R185 completed 2026-07-24) |
+| Cumulative findings | ~1,315 |
+| Findings fixed/resolved | ~1,161 |
+| Latest round | R185 (clean) — streak rebuilt to 1/3 |
+| 1.0-Preview release gate | **BLOCKED** — zero-HIGH streak 1/3 (need 2 more clean rounds) |
 
-The most recent work (**R184 review-fix**, 2026-07-24) addressed 4 findings discovered during 
-R183 follow-up review: allocation-free clear_child_tid validation to eliminate infallible allocation 
-on exit (RF184-1), capability allocation atomicity in openat2 (RF184-2), TX-memory budget accounting 
-fix to prevent desync when charge fails after buffering (RF184-3), and documented handle_ack 
-precondition contract (RF184-7). The 1.0-Preview gate remains **UNBLOCKED** with zero-HIGH streak 
-3/3 maintained (R181 + R182 + R183). Per-round reports live in `docs/review/`, and the live plan 
-is `docs/review/nextplan/`.
+The most recent work includes **R184 review-fix** (4 findings from R183 follow-up) and the 
+**design-queue closure round** (2026-07-24): both D1 findings resolved (D1-RES heap oracle + 
+R1-R4 fixes; D1-ISO type-enforced TX token), all D2s dispositioned (D2-ABI including MUSL-STAT 
+layout fixes, D2-ERR, D2-TST), leaving only D3-backlog items. R185 audit was clean, rebuilding 
+the zero-HIGH streak to 1/3. The 1.0-Preview gate is **BLOCKED on streak only** — need 2 more 
+clean rounds (R186 → 2/3, R187 → 3/3 → UNBLOCKED). Per-round reports live in `docs/review/`, 
+and the live plan is `docs/review/nextplan/`.
 
 ---
 
