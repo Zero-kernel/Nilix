@@ -585,9 +585,9 @@ fn do_stat(args: &[u8]) {
     println("");
 
     print("  Size: ");
-    print_int(st.size as i64);
+    print_int(st.size);
     print("  Blocks: ");
-    print_int(st.blocks as i64);
+    print_int(st.blocks);
     println("");
 
     print("Device: ");

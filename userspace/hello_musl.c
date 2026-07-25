@@ -14,6 +14,8 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 
 // M0-6 poll/select Ring-3 smoke: exercises the real syscall boundary (dispatch
 // arms, PollFd / fd_set copy-in, revents / fd_set write-back, timeout casts) that
@@ -153,6 +155,68 @@ static void socket_zero_length_smoke(void) {
     close(tcp);
 }
 
+// D2-ABI-STAT-LAYOUT Ring-3 smoke: the kernel must emit the exact Linux x86-64
+// struct stat (144B) wire layout musl compiles against (st_nlink u64@16,
+// st_mode@24, st_rdev@40, ...). Buffers are prefilled with 0x5a so stale bytes
+// cannot fake a pass; the explicit pad (@36) and reserved tail (@120..144)
+// must come back zero, proving the kernel wrote the FULL record and no stale
+// data leaks through the gaps. The fstat leg uses a pipe fd (deterministic
+// S_IFIFO from the kernel's pipe FileOps) instead of fd 1, whose backing
+// object is a harness detail.
+static void stat_abi_smoke(void) {
+    _Static_assert(sizeof(struct stat) == 144, "x86-64 struct stat must be 144 bytes");
+
+    struct stat st;
+    memset(&st, 0x5a, sizeof(st));
+    errno = 0;
+    int r = stat("/", &st);
+    int st_errno = errno;
+    const unsigned char *b = (const unsigned char *)&st;
+    int pad_zero = (b[36] | b[37] | b[38] | b[39]) == 0;
+    int tail_zero = 1;
+    for (size_t i = 120; i < 144; i++) {
+        if (b[i] != 0) tail_zero = 0;
+    }
+
+    int pfd[2];
+    struct stat pst;
+    memset(&pst, 0x5a, sizeof(pst));
+    int rp = -1;
+    if (pipe(pfd) == 0) {
+        rp = fstat(pfd[0], &pst);
+        close(pfd[0]);
+        close(pfd[1]);
+    }
+
+    if (r == 0 && S_ISDIR(st.st_mode) && st.st_nlink >= 1 && st.st_size >= 0 &&
+        pad_zero && tail_zero && rp == 0 && S_ISFIFO(pst.st_mode)) {
+        puts("MUSL-STAT-OK");
+    } else {
+        printf("MUSL-STAT-FAIL r=%d errno=%d mode=%o nlink=%lu size=%lld pad=%d "
+               "tail=%d rp=%d pmode=%o\n",
+               r, st_errno, (unsigned)st.st_mode, (unsigned long)st.st_nlink,
+               (long long)st.st_size, pad_zero, tail_zero, rp,
+               (unsigned)pst.st_mode);
+    }
+}
+
+// D2-ABI-STAT-LAYOUT (LOW leg): the kernel must write the full 390-byte Linux
+// new_utsname INCLUDING domainname ("(none)" default). Before the fix the
+// kernel wrote only 325 bytes, leaving domainname as stale caller memory —
+// the 0x5a prefill would surface that as a mismatch here.
+static void uname_abi_smoke(void) {
+    _Static_assert(sizeof(struct utsname) == 390, "x86-64 new_utsname must be 390 bytes");
+
+    struct utsname u;
+    memset(&u, 0x5a, sizeof(u));
+    if (uname(&u) == 0 && strcmp(u.sysname, "Zero-OS") == 0 &&
+        strcmp(u.domainname, "(none)") == 0) {
+        puts("MUSL-UNAME-OK");
+    } else {
+        printf("MUSL-UNAME-FAIL sys=%.8s dom=%.8s\n", u.sysname, u.domainname);
+    }
+}
+
 int main(int argc, char *argv[]) {
     // Test 1: Simple write syscall
     const char *msg = "Hello from musl libc!\n";
@@ -174,6 +238,12 @@ int main(int argc, char *argv[]) {
 
     // Test 6 (RF180-27): zero-length socket validation/semantics.
     socket_zero_length_smoke();
+
+    // Test 7 (D2-ABI-STAT-LAYOUT): Linux stat wire-layout end-to-end.
+    stat_abi_smoke();
+
+    // Test 8 (D2-ABI-STAT-LAYOUT LOW leg): full new_utsname write.
+    uname_abi_smoke();
 
     return 0;
 }

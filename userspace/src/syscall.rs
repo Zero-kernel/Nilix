@@ -721,25 +721,33 @@ pub unsafe fn sys_recvfrom(
 // ============================================================================
 
 /// File status structure (matches kernel VfsStat)
+///
+/// D2-ABI-STAT-LAYOUT: this is the Linux x86-64 `struct stat` wire layout
+/// (144 bytes) — MUST stay in lockstep with kernel_core's VfsStat, or the
+/// kernel's 144-byte write overruns this buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Stat {
     pub dev: u64,
     pub ino: u64,
+    pub nlink: u64,
     pub mode: u32,
-    pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
-    pub rdev: u32,
-    pub size: u64,
-    pub blksize: u32,
-    pub blocks: u64,
+    pub pad0: u32,
+    pub rdev: u64,
+    pub size: i64,
+    pub blksize: i64,
+    pub blocks: i64,
     pub atime_sec: i64,
     pub atime_nsec: i64,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
     pub ctime_sec: i64,
     pub ctime_nsec: i64,
+    pub unused0: i64,
+    pub unused1: i64,
+    pub unused2: i64,
 }
 
 /// Directory entry header returned by getdents64
@@ -800,6 +808,10 @@ impl SockAddrIn {
 }
 
 /// System name structure (uname)
+///
+/// D2-ABI-STAT-LAYOUT: Linux `new_utsname` = 6 x [u8;65] = 390 bytes
+/// INCLUDING domainname — lockstep with the kernel's UtsName (the kernel
+/// writes all 390 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UtsName {
@@ -808,6 +820,7 @@ pub struct UtsName {
     pub release: [u8; 65],
     pub version: [u8; 65],
     pub machine: [u8; 65],
+    pub domainname: [u8; 65],
 }
 
 impl Default for UtsName {
@@ -818,6 +831,7 @@ impl Default for UtsName {
             release: [0; 65],
             version: [0; 65],
             machine: [0; 65],
+            domainname: [0; 65],
         }
     }
 }
