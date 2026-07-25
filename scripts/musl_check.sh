@@ -69,6 +69,12 @@ MUSL_POLL_MARKER='MUSL-POLL-OK'
 # EDESTADDRREQ, and a parseable header-only UDP datagram reaches the production
 # default-deny firewall as EPERM rather than malformed-buffer EINVAL.
 MUSL_SOCKET_ZERO_MARKER='MUSL-SOCKET-ZERO-OK'
+# D2-ABI-STAT-LAYOUT markers: printed only if the kernel emits the exact Linux
+# x86-64 struct stat (144B) / new_utsname (390B) wire layouts — stat("/") is
+# S_ISDIR with zeroed pad/reserved bytes (0x5a-prefilled buffer), a pipe fd
+# fstats as S_IFIFO, and uname fills domainname with "(none)".
+MUSL_STAT_MARKER='MUSL-STAT-OK'
+MUSL_UNAME_MARKER='MUSL-UNAME-OK'
 # Accept both the sys_exit ("exited with code") and reaper ("terminated with
 # exit code") phrasings; the musl Ring-3 path emits the latter.
 EXIT_RE='Process [0-9]+ (exited with code|terminated with exit code) 0'
@@ -157,6 +163,8 @@ has_printf=0;  grep -Fq "$MUSL_PRINTF_MARKER"  "$ser" 2>/dev/null && has_printf=
 has_success=0; grep -Fq "$MUSL_SUCCESS_MARKER" "$ser" 2>/dev/null && has_success=1
 has_poll=0;    grep -Fq "$MUSL_POLL_MARKER"    "$ser" 2>/dev/null && has_poll=1
 has_socket_zero=0; grep -Fq "$MUSL_SOCKET_ZERO_MARKER" "$ser" 2>/dev/null && has_socket_zero=1
+has_stat=0;    grep -Fq "$MUSL_STAT_MARKER"    "$ser" 2>/dev/null && has_stat=1
+has_uname=0;   grep -Fq "$MUSL_UNAME_MARKER"   "$ser" 2>/dev/null && has_uname=1
 has_exit=0;    grep -qE "$EXIT_RE"             "$ser" 2>/dev/null && has_exit=1
 has_panic=0;   grep -Fq "$PANIC_MARKER"        "$ser" 2>/dev/null && has_panic=1
 
@@ -183,6 +191,16 @@ if [ "$has_socket_zero" -ne 1 ]; then
     echo "    => sendto(44)/recvfrom(45) validation, TCP zero-length semantics, or UDP policy classification failed (see MUSL-SOCKET-ZERO-FAIL on serial)"
     rc=1
 fi
+if [ "$has_stat" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: stat ABI marker missing (expected '$MUSL_STAT_MARKER')"
+    echo "    => kernel stat/fstat wire layout is not the Linux x86-64 struct stat (see MUSL-STAT-FAIL on serial; finding D2-ABI-STAT-LAYOUT)"
+    rc=1
+fi
+if [ "$has_uname" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: uname ABI marker missing (expected '$MUSL_UNAME_MARKER')"
+    echo "    => kernel uname did not write the full 390-byte new_utsname incl. domainname (see MUSL-UNAME-FAIL on serial)"
+    rc=1
+fi
 if [ "$has_exit" -ne 1 ]; then
     echo "MUSL-CHECK FAIL: no clean exit marker within ${TO}s (expected 'Process N ... exit code 0')"
     rc=1
@@ -206,9 +224,9 @@ if [ "$rc" -ne 0 ]; then
     tail -40 "$ser" 2>/dev/null | sed 's/^/    /'
 else
     if [ "$resets" -gt 0 ]; then
-        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero markers + clean exit + 0 NX faults; $resets cpu_reset marker(s) observed, not gated)"
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI markers + clean exit + 0 NX faults; $resets cpu_reset marker(s) observed, not gated)"
     else
-        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero markers + clean exit + 0 NX faults)"
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI markers + clean exit + 0 NX faults)"
     fi
 fi
 exit "$rc"

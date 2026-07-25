@@ -131,9 +131,17 @@ fi
 # -display none + serial-to-file (never trust -nographic stdio alone)
 # -d int,cpu_reset for the NX signature without changing guest layout
 # single-core (SMP is test-smp's job)
+# D1-ISO: user-mode virtio-net (same device the run* targets attach, romfile=
+# suppresses the PXE option ROM) so the net_ns_tx_isolation runtime test can
+# exercise its driver-reach legs — without it eth0 never registers and the
+# TX device-ownership gate is only Warning-covered. restrict=on isolates the
+# guest from ALL external networking (slirp accepts + drops egress, so virtio
+# descriptor completion still works); ipv6=off silences unsolicited RA noise.
 timeout "$TO" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:rw:"$ESP" \
     "${disk_args[@]}" \
+    -netdev user,id=net0,restrict=on,ipv6=off \
+    -device virtio-net-pci,netdev=net0,romfile= \
     -m 256M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \

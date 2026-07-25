@@ -46,12 +46,19 @@ jobs:
         run: make build
 
   lint:
-    name: custom lints (grep gates)
+    name: custom lints (grep gates + ABI oracle)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: make lint
         run: make lint
+      # Explicit steps so a future selective-target refactor of `lint` cannot
+      # silently drop these gates (they also run inside `make lint`). ubuntu-latest
+      # ships python3 + gcc, so the lint job stays checkout-only.
+      - name: make lint-fallible (VFS fallibility gate, explicit)
+        run: make lint-fallible
+      - name: make abi-check (ABI layout oracle — Rust source vs Linux x86-64 reference)
+        run: make abi-check
 
   boot:
     name: boot-check + test + musl-check (QEMU)

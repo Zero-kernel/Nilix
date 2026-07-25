@@ -29,6 +29,15 @@ Cargo.lock
 !/scripts/generate_fuzz_report.py
 !/scripts/generate_fuzz_summary.py
 !/scripts/parse_fuzz_output.py
+# D2-TST/D2-ERR gate harnesses (design-queue round 2026-07-24). NOTE: after this
+# whitelist lands, the files still need a one-time manual `git add -f` + commit
+# (Git Rule: commits are user-initiated) before the CI lint job can see them.
+!/scripts/abi_layout_oracle.py
+!/scripts/lint_fallible.sh
+# Directory trap: /scripts/* ignores the directory ENTRY, so per-file negation
+# cannot descend — both the dir and its contents must be negated.
+!/scripts/lint_fallible_fixtures/
+!/scripts/lint_fallible_fixtures/*
 /esp
 /bootloader-target
 /kernel-target

@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -603,8 +603,62 @@ lint-repr-c-copy:
 		echo "OK: All repr(C) struct copies in audited files are annotated."; \
 	fi
 
+# D2-ERR-VFS-FALLIBILITY: mechanized VFS fallibility lint.
+# Flags INFALLIBLE heap-growth on recoverable VFS paths (an OOM there panics the
+# kernel instead of returning ENOMEM). Pure POSIX grep/awk (no ripgrep — the CI
+# lint job provisions nothing). Suppression = comment / fn-scope try_reserve guard /
+# DELIBERATE test exclusion (boot self-tests are boot-fatal-by-policy on OOM) /
+# bounded string literal / annotation. See docs/design/PO-VFS-01 section 4.2.
+lint-fallible: lint-fallible-selftest
+	@echo "=== Lint: VFS fallibility (infallible alloc on recoverable paths) ==="
+	@HITS=$$(bash scripts/lint_fallible.sh kernel/vfs) ; \
+	if [ -n "$$HITS" ]; then \
+		echo "ERROR: unguarded infallible-allocation candidates in kernel/vfs:"; \
+		echo "$$HITS"; \
+		echo ""; \
+		echo "Fix: reserve fallibly (try_reserve / FallibleOrderedMap) before growth,"; \
+		echo "or annotate on the line or <=3 lines above:"; \
+		echo "  // lint-fallible: PREALLOCATED(<evidence>) | BOUNDED(<bound>) | INFALLIBLE-OK(<reason>)"; \
+		echo "  // lint-fallible-fn: <token>(<reason>)   (above a fn; blesses its body)"; \
+		echo "Grammar: docs/design/PO-VFS-01-vfs-fallibility-contract.md section 4.2."; \
+		exit 1; \
+	else \
+		echo "OK: kernel/vfs infallible-allocation candidates are all guarded/annotated."; \
+	fi
+
+# Both-directions self-test (PE-04): proves the lint still CATCHES (violation.rs, exactly
+# 21 planted hits) and does not over-flag (annotated_pass.rs, 0 hits) BEFORE it gates the
+# tree. A count drift means a regex alternation regressed or the fixture changed unpinned.
+lint-fallible-selftest:
+	@echo "=== Lint: VFS fallibility self-test (fixtures) ==="
+	@N=$$(bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/violation.rs | grep -c .) ; \
+	if [ "$$N" -ne 22 ]; then \
+		echo "ERROR: violation fixture caught $$N lines, expected 22."; \
+		echo "  (scanner regressed, OR the fixture changed without updating this count)"; \
+		exit 1; \
+	fi ; \
+	P=$$(bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs | grep -c .) ; \
+	if [ "$$P" -ne 0 ]; then \
+		echo "ERROR: annotated_pass fixture produced $$P false positive(s), expected 0."; \
+		bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs; \
+		exit 1; \
+	fi ; \
+	echo "OK: lint-fallible self-test (22 caught / 0 false positives)."
+
+# D2-TST-ABI-BYTES: cross-language ABI layout gate.
+# Leg A parses the kernel Rust sources (repr(C) layout engine + demand-driven const
+# eval); Leg B is an explicit Linux x86-64 KERNEL-ABI reference table (uapi citations,
+# NOT glibc variants); Leg C re-checks the reference table against gcc-native structs
+# via offsetof/sizeof. Layout only — byte order/overflow/errno are behavioral and are
+# covered by `make musl-check`. Exit 0=match, 1=layout mismatch, 2=source-drift/parse/
+# toolchain failure (fail closed — no --skip-cc here, so a missing gcc fails the gate).
+abi-check:
+	@echo "=== ABI layout oracle: kernel Rust source vs Linux x86-64 reference ==="
+	python3 scripts/abi_layout_oracle.py --self-test
+	python3 scripts/abi_layout_oracle.py --check --work-dir target/abi-oracle
+
 # Unified lint target: runs all CI lint checks.
-lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy
+lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible abi-check
 
 # ============================================================================
 # Extended Test Suite - Stress, Performance, Security, SMP
