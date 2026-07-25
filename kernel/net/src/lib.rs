@@ -115,8 +115,8 @@ pub use ethernet::{
     EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
 pub use firewall::{
-    firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match, CtStateMask,
-    FirewallAction, FirewallPacket, FirewallRule, FirewallRuleBuilder, FirewallStats,
+    firewall_default_rules, firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match,
+    CtStateMask, FirewallAction, FirewallPacket, FirewallRule, FirewallRuleBuilder, FirewallStats,
     FirewallStatsSnapshot, FirewallTable, FirewallVerdict, IpCidrMatch, PortRange,
 };
 pub use fragment::{
@@ -202,7 +202,12 @@ pub const MAX_NET_DEVICES: usize = 8;
 // ============================================================================
 
 /// Handle type for registered network devices.
-pub type NetDeviceHandle = Arc<Mutex<Box<dyn NetDevice>>>;
+///
+/// D1-ISO-NETNS-DATAPLANE: demoted to `pub(crate)` so a transmit-capable device
+/// handle can NEVER egress the `net` crate. The only sanctioned way to reach the
+/// driver `transmit` is via `stack::tx_auth::AuthorizedTxDevice`, minted by the
+/// namespace-gated resolver. (No out-of-crate user existed.)
+pub(crate) type NetDeviceHandle = Arc<Mutex<Box<dyn NetDevice>>>;
 
 /// A registered network device entry.
 struct RegisteredDevice {
@@ -249,14 +254,6 @@ impl NetDeviceRegistry {
         Ok(index)
     }
 
-    fn get_by_name(&self, name: &str) -> Option<NetDeviceHandle> {
-        let devices = self.devices.read();
-        devices
-            .iter()
-            .find(|d| d.name == name)
-            .map(|d| d.device.clone())
-    }
-
     /// D1-ISO-NETNS-DATAPLANE FIX: resolve a device together with its stable
     /// registry index in ONE read-lock critical section, so ownership gating
     /// checks the SAME device object the caller will transmit on (no
@@ -267,14 +264,6 @@ impl NetDeviceRegistry {
             .iter()
             .find(|d| d.name == name)
             .map(|d| (d.device.clone(), d.index))
-    }
-
-    fn get_by_index(&self, index: usize) -> Option<NetDeviceHandle> {
-        let devices = self.devices.read();
-        devices
-            .iter()
-            .find(|d| d.index == index)
-            .map(|d| d.device.clone())
     }
 
     fn count(&self) -> usize {
@@ -299,20 +288,66 @@ pub fn register_device<D: NetDevice + 'static>(device: D) -> Result<usize, NetEr
     registry().register(device)
 }
 
-/// Get a device by name.
-pub fn get_device(name: &str) -> Option<NetDeviceHandle> {
-    registry().get_by_name(name)
-}
-
-/// D1-ISO-NETNS-DATAPLANE FIX: get a device by name along with its stable
-/// registry index (single critical section — see `get_by_name_with_index`).
-pub fn get_device_with_index(name: &str) -> Option<(NetDeviceHandle, usize)> {
+/// D1-ISO-NETNS-DATAPLANE: resolve (handle, stable index) for the SOLE sanctioned
+/// consumer — `stack::tx_auth::resolve_authorized_tx_device`. Demoted to
+/// `pub(crate)` and contract-pinned: a transmit-capable handle may egress the
+/// registry ONLY into that resolver (or the tx_auth host tests). Adding any other
+/// NON-TEST caller re-opens the ungated-TX bypass this closes — treat as a
+/// security regression (grep gate: exactly one non-test caller).
+pub(crate) fn get_device_with_index(name: &str) -> Option<(NetDeviceHandle, usize)> {
     registry().get_by_name_with_index(name)
 }
 
-/// Get a device by registration index.
-pub fn get_device_by_index(index: usize) -> Option<NetDeviceHandle> {
-    registry().get_by_index(index)
+/// D1-ISO-NETNS-DATAPLANE: metadata-only MAC accessor. Returns the device MAC
+/// WITHOUT handing out a transmit-capable handle (transmit authority and metadata
+/// reads are now distinct capabilities). The registry read-lock is released before
+/// the per-device Mutex is taken (never nested).
+pub(crate) fn device_mac(name: &str) -> Option<[u8; 6]> {
+    let handle = registry().get_by_name_with_index(name)?.0;
+    let mac = handle.lock().mac_address();
+    Some(mac)
+}
+
+/// D1-ISO-NETNS-DATAPLANE: metadata-only stable-registry-index accessor. The
+/// index is an EPHEMERAL IDENTIFIER for diagnostics/tests (it is what the
+/// per-namespace ownership sets key on), NOT a capability: holding an index
+/// grants no transmit authority — the tx_auth resolver re-derives (handle,
+/// index) in one registry critical section and performs the ownership check
+/// itself.
+pub fn device_index(name: &str) -> Option<usize> {
+    registry()
+        .get_by_name_with_index(name)
+        .map(|(_, index)| index)
+}
+
+/// One coherent TX-side stats snapshot of a registered device (numbers only,
+/// never a handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceTxStats {
+    /// Packets whose transmission COMPLETED (drivers increment this at
+    /// descriptor reclaim, not at enqueue).
+    pub tx_packets: u64,
+    /// Driver-reported TX errors.
+    pub tx_errors: u64,
+    /// Free TX descriptor slots, in whole-packet units.
+    pub tx_queue_space: usize,
+}
+
+/// D1-ISO-NETNS-DATAPLANE: metadata-only TX-stats accessor for diagnostics and
+/// the `net_ns_tx_isolation` boot test.
+///
+/// Lock contract: clones the device Arc under the registry read lock, RELEASES
+/// it, then takes the per-device Mutex for ONE coherent three-field snapshot
+/// (registry and device locks are never nested). Callers must not hold locks
+/// that rank below the per-device (Level-8) lock.
+pub fn device_tx_stats(name: &str) -> Option<DeviceTxStats> {
+    let handle = registry().get_by_name_with_index(name)?.0;
+    let device = handle.lock();
+    Some(DeviceTxStats {
+        tx_packets: device.tx_packets(),
+        tx_errors: device.tx_errors(),
+        tx_queue_space: device.tx_queue_space(),
+    })
 }
 
 /// Get the number of registered devices.

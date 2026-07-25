@@ -51,7 +51,6 @@ use crate::firewall::{firewall_table_for_ns, FirewallAction, FirewallPacket, Fir
 use crate::fragment::{
     cleanup_expired_fragments, process_fragment as reassemble_fragment, FragmentDropReason,
 };
-use crate::get_device;
 use crate::icmp::{
     build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER,
     ICMP_TYPE_ECHO_REQUEST,
@@ -1301,9 +1300,9 @@ fn resolve_mac_from_device(cfg: &mut NetConfig) {
     if cfg.our_mac != EthAddr::ZERO {
         return;
     }
-    if let Some(dev) = get_device("eth0") {
-        let mac_bytes = dev.lock().mac_address();
-        cfg.our_mac = EthAddr(mac_bytes);
+    // D1-ISO: metadata-only read — no transmit-capable handle egresses the registry.
+    if let Some(mac) = crate::device_mac("eth0") {
+        cfg.our_mac = EthAddr(mac);
     }
 }
 
@@ -1352,38 +1351,91 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
     cfg.gateway_mac
 }
 
-/// D1-ISO-NETNS-DATAPLANE FIX: single owner for physical-egress device
-/// resolution. EVERY non-loopback TX path (direct egress and prepared-reply)
-/// MUST obtain its device through this resolver — never via a bare
-/// `get_device` — so namespace dataplane isolation cannot be bypassed by
-/// adding a new transmit call site that forgets the gate.
+/// D1-ISO-NETNS-DATAPLANE: `tx_auth` owns the ONLY path to the driver `transmit`.
+/// A transmit-capable `NetDeviceHandle` no longer egresses the `net` registry
+/// (its accessor is `pub(crate)` + sole-caller-pinned); the sole way to reach
+/// `NetDevice::transmit` is `AuthorizedTxDevice`, minted only by the namespace-
+/// gated resolver below. This turns the TX device-ownership gate from convention
+/// (a resolver a new call site could forget) into a type-enforced capability:
+/// adding a new physical-TX site is impossible without obtaining a token, and a
+/// token is impossible to obtain without the ownership check.
 ///
 /// Fail-closed contract (Safety > Efficiency > Speed):
-/// - the handle and its stable registry index come from ONE registry
-///   critical section (`get_device_with_index`), so the ownership decision
-///   binds to the SAME device object the caller transmits on;
+/// - the handle + its stable registry index come from ONE registry critical
+///   section, so ownership binds to the SAME device object the token transmits on;
 /// - a namespace that does not own the device gets `TxError::FirewallDenied`
-///   (policy denial, maps to EPERM) — a child netns created by CLONE_NEWNET
-///   starts with NO devices and therefore cannot reach the root ns's uplink
-///   with the root ns's IP/MAC;
-/// - unregistered hook (early boot / host tests) admits only the root ns.
-fn resolve_authorized_tx_device(net_ns_id: u64) -> Result<crate::NetDeviceHandle, TxError> {
-    let (dev, index) = match crate::get_device_with_index("eth0") {
-        Some(pair) => pair,
-        None => return Err(TxError::LinkDown),
-    };
-    // Checked narrowing: registry indices are monotonic and bounded by
-    // MAX_NET_DEVICES in practice, but a theoretical > u32::MAX index must
-    // deny, never alias another device's index (fail-closed).
-    let index = match u32::try_from(index) {
-        Ok(index) => index,
-        Err(_) => return Err(TxError::FirewallDenied),
-    };
-    if !crate::socket::netns_owns_device(net_ns_id, index) {
-        return Err(TxError::FirewallDenied);
+///   (EPERM) — a CLONE_NEWNET child starts with NO devices;
+/// - an unregistered hook (early boot / host tests) admits only the root ns.
+///
+/// Scope of the type barrier: OUT-OF-CRATE bypass is impossible by construction
+/// (no transmit-capable handle egresses the `net` crate). In-crate, the raw
+/// registry lookup (`get_device_with_index`) is a one-caller audited TCB
+/// (contract pinned in lib.rs), not a type barrier.
+mod tx_auth {
+    use super::TxError;
+    use crate::{NetBuf, NetDeviceHandle};
+
+    /// A single-use capability authorizing exactly one driver enqueue on the device
+    /// whose ownership `resolve_authorized_tx_device` verified. Deliberately NOT
+    /// Clone/Copy/Default and exposes no accessor returning the raw handle — so a
+    /// transmit-capable handle can be neither forged nor duplicated, and every
+    /// physical-TX site must route through this type.
+    pub(super) struct AuthorizedTxDevice {
+        dev: NetDeviceHandle,
     }
-    Ok(dev)
+
+    impl AuthorizedTxDevice {
+        /// Consume the token and enqueue `buf` on the authorized device — the SOLE
+        /// `NetDevice::transmit` call in the tree. Takes ONLY the per-device spin
+        /// Mutex (no registry/namespace lock), so it is safe inside conntrack egress
+        /// closures (RF180-41 context: no conntrack lock is held across the device
+        /// callback) and adds no allocation. Dropping an UNCONSUMED token is safe
+        /// (authorized-but-unsent); the registry keeps a strong ref to every
+        /// registered device for the kernel's lifetime (no unregister API), so
+        /// dropping the token's Arc clone never runs a device destructor — re-audit
+        /// destructor timing if hot-unregister is ever added.
+        ///
+        /// D1-ISO revocation contract (safe-scope): authority is granted at MINT
+        /// time; a later `remove_device`/`move_device` is NOT synchronous with an
+        /// already-minted token (in-flight window = this one enqueue). No concurrent
+        /// production mutator exists today: `move_device` is CAP-gated and unwired
+        /// to any syscall, and the only runtime add/remove_device callers are the
+        /// single-threaded boot-time runtime tests. A sink re-check here (to honor
+        /// in-kernel reassignment landing after mint) is deferred to Phase I.3
+        /// (NETNS-DATAPLANE-CONFIG) and requires an ownership-generation / token-
+        /// pinning design: a naive re-check would upgrade a `NET_NS_BY_ID` Weak
+        /// whose last-ref drop could run `NetNamespace::Drop` teardown under the
+        /// per-socket `operation` spinlock the TCP reply sinks hold — so the safe
+        /// closure is: check at mint, carry the verified handle, no namespace lock
+        /// at the sink.
+        pub(super) fn transmit(self, buf: NetBuf) -> Result<(), (TxError, NetBuf)> {
+            let mut device = self.dev.lock();
+            device.transmit(buf)
+        }
+    }
+
+    /// Resolve the egress device for `net_ns_id`, fail-closed, minting a token only
+    /// when the namespace owns the device.
+    pub(super) fn resolve_authorized_tx_device(
+        net_ns_id: u64,
+    ) -> Result<AuthorizedTxDevice, TxError> {
+        let (dev, index) = match crate::get_device_with_index("eth0") {
+            Some(pair) => pair,
+            None => return Err(TxError::LinkDown),
+        };
+        // Checked narrowing: a theoretical > u32::MAX index must deny, never alias
+        // another device's index (fail-closed).
+        let index = match u32::try_from(index) {
+            Ok(index) => index,
+            Err(_) => return Err(TxError::FirewallDenied),
+        };
+        if !crate::socket::netns_owns_device(net_ns_id, index) {
+            return Err(TxError::FirewallDenied);
+        }
+        Ok(AuthorizedTxDevice { dev })
+    }
 }
+use tx_auth::resolve_authorized_tx_device;
 
 /// Build complete Ethernet frame and transmit via network device.
 /// R162-7-2 FIX: Added net_ns_id for per-namespace egress firewall evaluation.
@@ -1536,10 +1588,7 @@ fn build_frame_and_transmit(
                         tcp.flags,
                         payload.len() - header_len,
                         ct_now_ms,
-                        move || {
-                            let mut device = dev.lock();
-                            device.transmit(buf).map_err(|(error, _returned)| error)
-                        },
+                        move || dev.transmit(buf).map_err(|(error, _returned)| error),
                         || operation.commit(&tcp, ct_now_ms),
                     );
                     drop(operation);
@@ -1554,10 +1603,7 @@ fn build_frame_and_transmit(
                         tcp.flags,
                         payload.len() - header_len,
                         ct_now_ms,
-                        move || {
-                            let mut device = dev.lock();
-                            device.transmit(buf).map_err(|(error, _returned)| error)
-                        },
+                        move || dev.transmit(buf).map_err(|(error, _returned)| error),
                     )
                 }
             }
@@ -1576,18 +1622,11 @@ fn build_frame_and_transmit(
                     udp.dst_port,
                     payload.len() - UDP_HEADER_LEN,
                     ct_now_ms,
-                    move || {
-                        let mut device = dev.lock();
-                        device.transmit(buf).map_err(|(error, _returned)| error)
-                    },
+                    move || dev.transmit(buf).map_err(|(error, _returned)| error),
                 )
             }
             _ => {
-                let result = {
-                    let mut device = dev.lock();
-                    device.transmit(buf)
-                };
-                return result.map_err(|(error, _returned)| error);
+                return dev.transmit(buf).map_err(|(error, _returned)| error);
             }
         };
 
@@ -1612,21 +1651,14 @@ fn build_frame_and_transmit(
             let mut operation = socket_table()
                 .lock_tcp_reply_operation(binding, &tcp)
                 .ok_or(TxError::InvalidBuffer)?;
-            let result = {
-                let mut device = dev.lock();
-                device.transmit(buf)
-            };
+            let result = dev.transmit(buf);
             return match result {
                 Ok(()) if operation.commit(&tcp, 0) => Ok(()),
                 Ok(()) => Err(TxError::InvalidBuffer),
                 Err((error, _returned)) => Err(error),
             };
         }
-        let result = {
-            let mut device = dev.lock();
-            device.transmit(buf)
-        };
-        result.map_err(|(error, _returned)| error)
+        dev.transmit(buf).map_err(|(error, _returned)| error)
     }
 }
 
@@ -1683,8 +1715,7 @@ pub fn transmit_prepared_reply(
         }
     };
     transmit_prepared_reply_with_queue(reply, now_ms, net_ns_id, stats, move |buf| {
-        let mut device = dev.lock();
-        device.transmit(buf)
+        dev.transmit(buf)
     })
 }
 
@@ -2485,5 +2516,99 @@ mod tests {
 
         assert_eq!(ct_drain_ns(NS), 1);
         firewall_remove_ns(NS);
+    }
+
+    /// D1-ISO-NETNS-DATAPLANE (T1 support): minimal mock so the namespace-gated
+    /// resolver can find an "eth0" on the host. The full sink path is
+    /// host-infeasible (`alloc_dma_buffer` fails before any driver is reached),
+    /// so driver-reach is proven by the `net_ns_tx_isolation` boot test instead.
+    struct MockEthDevice;
+
+    impl crate::NetDevice for MockEthDevice {
+        fn name(&self) -> &str {
+            "eth0"
+        }
+        fn mac_address(&self) -> crate::MacAddress {
+            [0x02, 0xd1, 0x15, 0x00, 0x00, 0x01]
+        }
+        fn set_mac_address(&mut self, _mac: crate::MacAddress) -> Result<(), crate::NetError> {
+            Err(crate::NetError::NotSupported)
+        }
+        fn capabilities(&self) -> crate::DeviceCaps {
+            crate::DeviceCaps::default()
+        }
+        fn link_status(&self) -> crate::LinkStatus {
+            crate::LinkStatus::UP_UNKNOWN
+        }
+        fn operating_mode(&self) -> crate::OperatingMode {
+            crate::OperatingMode::Polling
+        }
+        fn set_operating_mode(
+            &mut self,
+            _mode: crate::OperatingMode,
+        ) -> Result<(), crate::NetError> {
+            Ok(())
+        }
+        fn enable_interrupts(&mut self) -> Result<(), crate::NetError> {
+            Ok(())
+        }
+        fn disable_interrupts(&mut self) -> Result<(), crate::NetError> {
+            Ok(())
+        }
+        fn transmit(&mut self, _buf: NetBuf) -> Result<(), (TxError, NetBuf)> {
+            Ok(())
+        }
+        fn reclaim_tx(&mut self) -> usize {
+            0
+        }
+        fn tx_queue_space(&self) -> usize {
+            64
+        }
+        fn receive(&mut self) -> Result<Option<NetBuf>, crate::RxError> {
+            Ok(None)
+        }
+        fn replenish_rx(&mut self, _pool: &crate::BufPool, _count: usize) -> usize {
+            0
+        }
+        fn rx_queue_depth(&self) -> usize {
+            0
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn handle_interrupt(&mut self) {}
+    }
+
+    /// D1-ISO-NETNS-DATAPLANE (T1, resolver-level): the resolver is the sole
+    /// token mint and is fail-closed on namespace ownership. On the host no
+    /// `NetNsDeviceHooks` is ever registered (registration happens only in
+    /// kernel_core::init on the boot path), so the unregistered arm must admit
+    /// ONLY ns 0.
+    ///
+    /// T2 from the original design (a sink recheck-method test) is deliberately
+    /// ABSENT: under the mint-time safe-scope there is no runtime re-check to
+    /// test, and the single-use / non-Clone properties are compile-time enforced.
+    #[test]
+    fn d1iso_resolver_gates_tx_by_namespace_ownership() {
+        // Make "eth0" resolvable. The registry rejects duplicate names, so if a
+        // parallel test already registered one this is a no-op — every assert
+        // below is invariant to WHICH eth0 instance is registered.
+        let _ = crate::register_device(MockEthDevice);
+
+        // Non-root namespace owning no devices: fail-closed EPERM mapping.
+        const CHILD_NS: u64 = 0x7e57_d150_0001;
+        assert!(
+            matches!(
+                resolve_authorized_tx_device(CHILD_NS),
+                Err(TxError::FirewallDenied)
+            ),
+            "unowned non-root ns must be denied at the resolver"
+        );
+
+        // Root namespace: admitted by the unregistered-hook arm; a token mints.
+        let token = resolve_authorized_tx_device(0)
+            .expect("root ns must be admitted by the unregistered-hook arm");
+        // Dropping an unconsumed token is safe (authorized-but-unsent).
+        drop(token);
     }
 }

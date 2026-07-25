@@ -668,6 +668,15 @@ pub fn firewall_table() -> Arc<FirewallTable> {
     firewall_table_for_ns(0)
 }
 
+/// D1-ISO-NETNS-DATAPLANE: the pristine R94-12 default-deny rule set
+/// (INVALID-drop + ESTABLISHED/RELATED-accept; the DROP default policy applies
+/// to everything else). For tests and administrative restore after a scoped
+/// rule change — pair every root-table `replace_rules` with a restore to this
+/// set.
+pub fn firewall_default_rules() -> Vec<FirewallRule> {
+    default_rules()
+}
+
 /// R121-1 FIX (Codex review): Remove the firewall table for a destroyed namespace.
 ///
 /// Must be called when a network namespace is destroyed to prevent unbounded

@@ -422,6 +422,17 @@ pub fn root_net_namespace() -> Arc<NetNamespace> {
 /// Lock context: takes only NET_NS_BY_ID (read) then the namespace's own
 /// `devices` RwLock (read) — both leaf locks, never held together with any
 /// process/socket/device-registry lock. Callable from any TX context.
+///
+/// D1ISO mint-time contract (TX-gate callers, via `NetNsDeviceHooks`): both
+/// physical TX sinks mint their `AuthorizedTxDevice` token — i.e. call this —
+/// BEFORE taking the per-socket `operation` spinlock. Process-driven send
+/// paths may hold per-socket send locks here, but a send implies a live
+/// process whose PCB pins the namespace Arc, so the Weak upgrade below can
+/// never hold the LAST strong reference on those paths. On the RX-reply path
+/// no socket lock is held at mint, and a last-reference teardown triggered by
+/// dropping the upgraded Arc is lock-safe: the NET_NS_BY_ID read guard is
+/// released (scoped block below) before `ns` drops, so `NetNamespace::Drop`'s
+/// NET_NS_BY_ID.write() cannot self-deadlock.
 pub fn net_ns_owns_device(ns_id: u64, device_idx: u32) -> bool {
     if ns_id == 0 {
         return true;
@@ -599,10 +610,11 @@ impl FileOps for NetNamespaceFd {
         Ok(crate::VfsStat {
             dev: 0,
             ino: self.ns.id().raw(),
-            mode: 0o444,
             nlink: 1,
+            mode: 0o444,
             uid: 0,
             gid: 0,
+            pad0: 0,
             rdev: 0,
             size: 0,
             blksize: 0,
@@ -613,6 +625,9 @@ impl FileOps for NetNamespaceFd {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
         })
     }
 }
