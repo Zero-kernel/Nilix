@@ -271,26 +271,43 @@ impl FsError {
 // ============================================================================
 
 /// Convert VFS Stat to kernel_core VfsStat for syscall interface.
-impl From<Stat> for VfsStat {
-    fn from(stat: Stat) -> Self {
-        VfsStat {
+///
+/// D2-ABI-STAT-LAYOUT: the target is the Linux x86-64 `struct stat` wire
+/// layout (nlink/rdev widen to u64; size/blksize/blocks are signed). Every
+/// in-tree filesystem's maximum file size/block count is orders of magnitude
+/// below `i64::MAX` (ext2 ≤ 2 TiB, ramfs/initramfs bounded by RAM), but the
+/// bound is ENFORCED fail-closed here rather than assumed: an oversized value
+/// (future fs, malformed metadata) maps to `EOVERFLOW` exactly as Linux stat
+/// does — never a silently negative ABI value, never a panic.
+impl TryFrom<Stat> for VfsStat {
+    type Error = SyscallError;
+
+    fn try_from(stat: Stat) -> Result<Self, SyscallError> {
+        if stat.size > i64::MAX as u64 || stat.blocks > i64::MAX as u64 {
+            return Err(SyscallError::EOVERFLOW);
+        }
+        Ok(VfsStat {
             dev: stat.dev,
             ino: stat.ino,
+            nlink: u64::from(stat.nlink),
             mode: stat.mode.to_raw(),
-            nlink: stat.nlink,
             uid: stat.uid,
             gid: stat.gid,
-            rdev: stat.rdev,
-            size: stat.size,
-            blksize: stat.blksize,
-            blocks: stat.blocks,
+            pad0: 0,
+            rdev: u64::from(stat.rdev),
+            size: stat.size as i64,
+            blksize: i64::from(stat.blksize),
+            blocks: stat.blocks as i64,
             atime_sec: stat.atime.sec,
             atime_nsec: stat.atime.nsec,
             mtime_sec: stat.mtime.sec,
             mtime_nsec: stat.mtime.nsec,
             ctime_sec: stat.ctime.sec,
             ctime_nsec: stat.ctime.nsec,
-        }
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
+        })
     }
 }
 

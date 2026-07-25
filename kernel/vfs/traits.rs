@@ -699,7 +699,8 @@ impl FileOps for FileHandle {
     /// via inherited/pre-policy fds that bypass path-based R153-2 check.
     fn stat(&self) -> Result<VfsStat, SyscallError> {
         let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
-        let vfs_stat = VfsStat::from(inode_stat);
+        // D2-ABI-STAT-LAYOUT: oversized size/blocks fail closed as EOVERFLOW.
+        let vfs_stat = VfsStat::try_from(inode_stat)?;
         if let Some(task) = lsm::ProcessCtx::from_current() {
             lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
         }
