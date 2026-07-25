@@ -392,6 +392,7 @@ impl InitramfsInode {
         gid: u32,
         mtime: TimeSpec,
     ) -> Arc<Self> {
+        // lint-fallible: INFALLIBLE-OK(boot CPIO unpack; boot-fatal on OOM by policy)
         Arc::new(Self {
             fs_id,
             ino,
@@ -422,6 +423,7 @@ impl InitramfsInode {
         mtime: TimeSpec,
         data: &[u8],
     ) -> Arc<Self> {
+        // lint-fallible: INFALLIBLE-OK(boot CPIO unpack; boot-fatal on OOM by policy)
         let buf: Arc<[u8]> = data.to_vec().into();
         let size = buf.len() as u64;
         Arc::new(Self {
@@ -446,6 +448,7 @@ impl InitramfsInode {
     /// RF178-27 FIX: Install a later CPIO hardlink payload into the already
     /// attached inode. Conflicting non-empty payloads are a malformed archive.
     fn install_file_data(&self, bytes: &[u8], mtime: TimeSpec) -> Result<(), FsError> {
+        // lint-fallible: INFALLIBLE-OK(boot CPIO unpack; boot-fatal on OOM by policy)
         let replacement: Arc<[u8]> = bytes.to_vec().into();
         match &self.kind {
             NodeKind::File { data } => {
@@ -478,6 +481,7 @@ impl InitramfsInode {
         mtime: TimeSpec,
         data: &[u8],
     ) -> Arc<Self> {
+        // lint-fallible: INFALLIBLE-OK(boot CPIO unpack; boot-fatal on OOM by policy)
         let target: Arc<[u8]> = data.to_vec().into();
         let size = target.len() as u64;
         Arc::new(Self {

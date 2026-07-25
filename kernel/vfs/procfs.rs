@@ -289,6 +289,7 @@ impl Inode for ProcRootInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
+                    // lint-fallible: BOUNDED(static procfs entry name, <32B)
                     name: String::from(name),
                     ino: (offset + 2) as u64,
                     file_type,
@@ -549,6 +550,7 @@ impl Inode for ProcPidDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
+                    // lint-fallible: BOUNDED(static procfs entry name, <32B)
                     name: String::from(name),
                     ino: self.ino() * 10 + offset as u64,
                     file_type,

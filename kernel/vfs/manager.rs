@@ -1339,6 +1339,15 @@ impl Vfs {
         loop {
             match inode.readdir(offset)? {
                 Some((next_offset, entry)) => {
+                    // D2-ERR-VFS-FALLIBILITY FIX: amortized fallible growth. A
+                    // directory with an attacker-influenced entry count must return
+                    // ENOMEM, never OOM-panic on this recoverable path (ext2
+                    // push_owner house pattern, ext2.rs:3455). This legacy/internal
+                    // readdir has no callers outside vfs; the getdents syscall path
+                    // uses the already-fallible vfs_readdir_callback.
+                    if entries.len() == entries.capacity() {
+                        entries.try_reserve(1).map_err(|_| FsError::NoMem)?;
+                    }
                     entries.push(entry);
                     offset = next_offset;
                 }
@@ -2016,7 +2025,7 @@ fn vfs_open_with_resolve_callback(
 /// Called by sys_stat to get file status through VFS
 fn vfs_stat_callback(path: &str) -> Result<VfsStat, SyscallError> {
     let stat = VFS.stat(path).map_err(fs_error_to_syscall)?;
-    Ok(vfs_stat_from(stat))
+    vfs_stat_from(stat)
 }
 
 /// VFS lstat callback (M0-6 SLICE 3) — stat the LINK itself, not its target.
@@ -2025,29 +2034,16 @@ fn vfs_stat_callback(path: &str) -> Result<VfsStat, SyscallError> {
 /// `Vfs::stat_nofollow` (no-follow final component).
 fn vfs_stat_nofollow_callback(path: &str) -> Result<VfsStat, SyscallError> {
     let stat = VFS.stat_nofollow(path).map_err(fs_error_to_syscall)?;
-    Ok(vfs_stat_from(stat))
+    vfs_stat_from(stat)
 }
 
 /// Shared conversion from the VFS `Stat` to the ABI `VfsStat`.
-fn vfs_stat_from(stat: Stat) -> VfsStat {
-    VfsStat {
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: stat.mode.to_raw(),
-        nlink: stat.nlink,
-        uid: stat.uid,
-        gid: stat.gid,
-        rdev: stat.rdev,
-        size: stat.size,
-        blksize: stat.blksize,
-        blocks: stat.blocks,
-        atime_sec: stat.atime.sec,
-        atime_nsec: stat.atime.nsec,
-        mtime_sec: stat.mtime.sec,
-        mtime_nsec: stat.mtime.nsec,
-        ctime_sec: stat.ctime.sec,
-        ctime_nsec: stat.ctime.nsec,
-    }
+///
+/// D2-ABI-STAT-LAYOUT: targets the Linux x86-64 `struct stat` wire layout —
+/// delegates to the single `TryFrom<Stat>` impl in types.rs (oversized
+/// size/blocks fail closed as `EOVERFLOW`, matching Linux stat semantics).
+fn vfs_stat_from(stat: Stat) -> Result<VfsStat, SyscallError> {
+    VfsStat::try_from(stat)
 }
 
 /// VFS lseek callback for syscall registration

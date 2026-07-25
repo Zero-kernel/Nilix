@@ -325,6 +325,7 @@ impl MountNamespace {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
             .map_err(|_| MountNsError::NoMemory)?;
 
+        // lint-fallible: BOUNDED(one child namespace per unshare/clone; count bounded by the process table)
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
@@ -441,6 +442,7 @@ impl MountNamespace {
 
         best_match.map(|(mount_path, mount)| {
             let relative = if path.len() > mount_path.len() {
+                // lint-fallible: BOUNDED(PATH_MAX-class substring; &Option return blocks a fallible refactor this round — backlog)
                 path[mount_path.len()..].to_string()
             } else {
                 "/".to_string()
@@ -463,6 +465,7 @@ impl MountNamespace {
 
         // For non-root paths, ensure trailing slash for prefix check
         let path_with_slash = if path.ends_with('/') {
+            // lint-fallible: BOUNDED(PATH_MAX-class path; bool return blocks a fallible refactor this round — backlog)
             path.to_string()
         } else {
             format!("{}/", path)
@@ -504,13 +507,14 @@ fn normalize_mount_path(path: &str) -> Result<String, MountNsError> {
         return Err(MountNsError::InvalidPath);
     }
 
-    // Special case for root
-    if path == "/" {
-        return Ok("/".to_string());
-    }
-
-    let mut components: Vec<&str> = Vec::new();
-
+    // D2-ERR-VFS-FALLIBILITY FIX: two-pass allocation-fallible normalization.
+    // Pass 1 validates (reject "..") and sums the EXACT output capacity WITHOUT
+    // materializing an infallibly-growing `Vec<&str>` scratch (the prior code did,
+    // turning an attacker-influenced deep path into an OOM panic on a recoverable
+    // syscall path). Pass 2 builds into a `try_reserve`'d String, returning
+    // MountNsError::NoMemory on OOM. Mirrors manager.rs::try_join_path_iter.
+    let mut need = 0usize;
+    let mut count = 0usize;
     for component in path.split('/') {
         match component {
             "" | "." => {} // Skip empty and current dir
@@ -518,20 +522,37 @@ fn normalize_mount_path(path: &str) -> Result<String, MountNsError> {
                 // Reject ".." to prevent escape attacks
                 return Err(MountNsError::InvalidPath);
             }
-            _ => components.push(component),
+            _ => {
+                // one '/' separator + the component bytes
+                need = need
+                    .checked_add(1)
+                    .and_then(|n| n.checked_add(component.len()))
+                    .ok_or(MountNsError::NoMemory)?;
+                count += 1;
+            }
         }
     }
 
-    if components.is_empty() {
-        Ok("/".to_string())
-    } else {
-        let mut result = String::new();
-        for c in components {
-            result.push('/');
-            result.push_str(c);
-        }
-        Ok(result)
+    // No real components (root, or a path of only "." / empty segments).
+    if count == 0 {
+        let mut root = String::new();
+        root.try_reserve(1).map_err(|_| MountNsError::NoMemory)?;
+        root.push('/');
+        return Ok(root);
     }
+
+    let mut result = String::new();
+    result
+        .try_reserve(need)
+        .map_err(|_| MountNsError::NoMemory)?;
+    for component in path.split('/') {
+        // ".." already rejected in pass 1; "" / "." are skipped.
+        if !component.is_empty() && component != "." {
+            result.push('/');
+            result.push_str(component);
+        }
+    }
+    Ok(result)
 }
 
 /// Simple FNV-1a 64-bit hash for path hashing (used in audit events).
@@ -556,6 +577,7 @@ lazy_static::lazy_static! {
     ///
     /// All processes start in the root namespace unless CLONE_NEWNS is used.
     /// This is initialized on first access and contains the initial mount table.
+    // lint-fallible: INFALLIBLE-OK(lazy_static root namespace; one-time boot init, boot-fatal on OOM by policy)
     pub static ref ROOT_MNT_NAMESPACE: Arc<MountNamespace> = Arc::new(MountNamespace::new_root());
 
     /// Counter for generating unique namespace IDs.
@@ -600,6 +622,7 @@ pub fn copy_mounts(from: &MountNamespace, to: &MountNamespace) {
 
     // Deep copy each mount entry
     for (path, mount) in src.iter() {
+        // lint-fallible: BOUNDED(MAX_MOUNTS_PER_NS; deep-copy of a bounded table. Alloc-under-RwLock + BTreeMap->FallibleOrderedMap migration tracked as backlog)
         dst.insert(
             path.clone(),
             Mount {
@@ -670,6 +693,7 @@ pub fn add_mount(
         return Err(MountNsError::MountExists);
     }
 
+    // lint-fallible: BOUNDED(MAX_MOUNTS_PER_NS; one mount inserted after the contains_key gate. FallibleOrderedMap migration tracked as backlog)
     table.insert(normalized_path.clone(), mount);
 
     // Emit audit event (use Fs kind for mount operations)

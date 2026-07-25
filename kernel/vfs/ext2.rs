@@ -1099,6 +1099,7 @@ pub fn run_ext2_journal_transaction_self_test() {
         let transaction_blocks = metadata_count + 2;
         let source_start = journal_logical_offset(1);
         let source_end = source_start + transaction_blocks * BLOCK_SIZE;
+        // lint-fallible: BOUNDED(journal self-test scaffold; transaction_blocks <= JOURNAL_MAX_METADATA_BLOCKS+2, fixed)
         let source = image[source_start..source_end].to_vec();
         image[journal_logical_offset(1)..journal_logical_offset(0) + 8 * BLOCK_SIZE].fill(0);
         for index in 0..transaction_blocks {
@@ -3787,6 +3788,7 @@ struct SparseGapCollectVisitor<'a> {
 }
 
 impl SparseGapVisitor for SparseGapCollectVisitor<'_> {
+    // lint-fallible-fn: PREALLOCATED(mapping_nodes/branch_indices reserved to self.expected.* in the plan phase; len bound-checked before each push)
     fn mapping_node(&mut self, physical: u32, branch: Option<u16>) -> Result<(), FsError> {
         if self.mapping_nodes.len() >= self.expected.mapping_nodes {
             return Err(FsError::Invalid);
@@ -3802,6 +3804,7 @@ impl SparseGapVisitor for SparseGapCollectVisitor<'_> {
         Ok(())
     }
 
+    // lint-fallible-fn: PREALLOCATED(targets reserved to self.expected.data_targets in the plan phase; len bound-checked before push)
     fn data_target(&mut self, file_block: u32, target: SparseGapTarget) -> Result<(), FsError> {
         if self.targets.len() >= self.expected.data_targets {
             return Err(FsError::Invalid);
@@ -8704,6 +8707,7 @@ impl Ext2Fs {
                 {
                     return Err(FsError::Invalid);
                 }
+                // lint-fallible: PREALLOCATED(capacity re-checked at the guard just above; branches reserved by prepare_branches)
                 scratch.branches.push(SparseGapBranch {
                     index: branch,
                     physical: indirect,

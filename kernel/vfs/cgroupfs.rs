@@ -242,12 +242,14 @@ impl CgroupFs {
 
         // Root directory maps to root cgroup (id=0)
         // R154-2 FIX: Deterministic inode computation
+        // lint-fallible: BOUNDED(one root inode per cgroupfs mount; fixed)
         let root = Arc::new(CgroupDirInode {
             fs_id,
             ino: cgroup_dir_ino(0),
             cgroup_id: 0,
         });
 
+        // lint-fallible: BOUNDED(one CgroupFs object per mount; fixed)
         Arc::new(Self { fs_id, root })
     }
 }
@@ -305,6 +307,7 @@ impl FileSystem for CgroupFs {
             Ok(child) => {
                 // R154-2 FIX: Deterministic inode from cgroup_id
                 let ino = cgroup_dir_ino(child.id());
+                // lint-fallible: BOUNDED(one inode per mkdir; live cgroup count is pids-controller bounded)
                 Ok(Arc::new(CgroupDirInode {
                     fs_id: self.fs_id,
                     ino,
@@ -414,6 +417,7 @@ impl CgroupDirInode {
 
             // R154-2 FIX: Deterministic inode from cgroup_id + control index
             let ino = cgroup_ctrl_ino(self.cgroup_id, kind.index());
+            // lint-fallible: BOUNDED(one inode per control-file lookup)
             return Ok(Arc::new(CgroupCtrlInode {
                 fs_id,
                 ino,
@@ -433,6 +437,7 @@ impl CgroupDirInode {
             if name == id_str {
                 // R154-2 FIX: Deterministic inode from child cgroup_id
                 let ino = cgroup_dir_ino(child_id);
+                // lint-fallible: BOUNDED(one inode per child-dir lookup)
                 return Ok(Arc::new(CgroupDirInode {
                     fs_id,
                     ino,
@@ -466,6 +471,7 @@ impl CgroupDirInode {
                 }
             })
             .copied()
+            // lint-fallible: BOUNDED(CtrlKind::all() is a fixed compile-time enum set)
             .collect()
     }
 }
@@ -526,6 +532,7 @@ impl Inode for CgroupDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
+                    // lint-fallible: BOUNDED(kind.filename() is a static &str, <32B)
                     name: String::from(kind.filename()),
                     // R154-2 FIX: Deterministic inode
                     ino: cgroup_ctrl_ino(self.cgroup_id, kind.index()),
@@ -606,6 +613,7 @@ impl CgroupCtrlInode {
                         let quota_display = if quota == u64::MAX {
                             String::from("max")
                         } else {
+                            // lint-fallible: BOUNDED(u64 decimal, <=20 bytes)
                             quota.to_string()
                         };
                         format!("{} {}\n", quota_display, period)
@@ -646,14 +654,17 @@ impl CgroupCtrlInode {
             CtrlKind::IoMax => {
                 let mut parts = Vec::new();
                 if let Some(bps) = limits.io_max_bytes_per_sec {
+                    // lint-fallible: BOUNDED(<=2 io.max parts: static keys + u64 values)
                     parts.push(format!("rbps={} wbps={}", bps, bps));
                 }
                 if let Some(iops) = limits.io_max_iops_per_sec {
+                    // lint-fallible: BOUNDED(<=2 io.max parts: static keys + u64 values)
                     parts.push(format!("riops={} wiops={}", iops, iops));
                 }
                 if parts.is_empty() {
                     String::from("default\n")
                 } else {
+                    // lint-fallible: BOUNDED(<=2 parts joined)
                     parts.join(" ") + "\n"
                 }
             }
@@ -1292,6 +1303,7 @@ fn apply_limit(
 /// `CtrlKind::required_controller()` — every controller that gates a control
 /// file's visibility is advertised here, otherwise `files.max`/`ports.max`/
 /// `vfs_dir.max` would appear in a directory whose controller is unlisted.
+// lint-fallible-fn: BOUNDED(<=6 static controller names + one join; CgroupControllers is a fixed bitflag set)
 fn controllers_string(controllers: CgroupControllers) -> String {
     let mut parts = Vec::new();
     if controllers.contains(CgroupControllers::CPU) {
