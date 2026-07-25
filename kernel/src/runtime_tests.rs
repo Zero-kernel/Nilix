@@ -1742,6 +1742,8 @@ pub fn run_all_runtime_tests() -> TestReport {
         &IpcNamespaceIsolationTest,
         // F.1 Network Namespace Tests
         &NetNamespaceIsolationTest,
+        // D1-ISO TX device-ownership gate (both sinks, A/B/A, stale-ns)
+        &NetNsTxIsolationTest,
     ];
 
     // Add 25 P0 regression tests (R172-R174 findings)
@@ -1849,6 +1851,8 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         &IpcNamespaceIsolationTest,
         // F.1 Network Namespace Tests
         &NetNamespaceIsolationTest,
+        // D1-ISO TX device-ownership gate (both sinks, A/B/A, stale-ns)
+        &NetNsTxIsolationTest,
     ];
 
     // Add 25 P0 regression tests
@@ -2737,6 +2741,385 @@ impl RuntimeTest for NetNamespaceIsolationTest {
         // ✅ Reference counting
         // ✅ MAX_NET_NS_LEVEL depth limit
         // ✅ Subsystem initialization
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D1-ISO TX Device-Ownership Isolation Test (net_ns_tx_isolation)
+// ============================================================================
+
+/// D1-ISO-NETNS-DATAPLANE: prove the fail-closed TX device-ownership gate at
+/// BOTH physical egress sinks (direct `build_frame_and_transmit` and the
+/// prepared-reply path), with A/B/A ownership-toggle attribution, root-ns
+/// preservation, and stale-namespace fail-closure.
+///
+/// Determinism: the deny legs run BEFORE any admit leg, and the runtime-test
+/// phase is the only TX producer at boot, so the enqueue observable is exact.
+/// Asynchronous TX-completion reclaim (IRQ/poll driven) is tolerated by
+/// measuring enq = Δtx_packets + (space_before − space_after) with SIGNED
+/// arithmetic — invariant under completion (+1 completed / −1 in-flight),
+/// +1 per driver enqueue.
+struct NetNsTxIsolationTest;
+
+impl NetNsTxIsolationTest {
+    /// Driver enqueues between two coherent stats snapshots (see type doc).
+    fn enq_delta(a: &net::DeviceTxStats, b: &net::DeviceTxStats) -> i64 {
+        (b.tx_packets as i64 - a.tx_packets as i64)
+            + (a.tx_queue_space as i64 - b.tx_queue_space as i64)
+    }
+
+    fn snapshot() -> Result<net::DeviceTxStats, TestResult> {
+        net::device_tx_stats("eth0").ok_or_else(|| {
+            TestResult::Fail(String::from("eth0 TX stats became unavailable mid-test"))
+        })
+    }
+}
+
+impl RuntimeTest for NetNsTxIsolationTest {
+    fn name(&self) -> &'static str {
+        "net_ns_tx_isolation"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D1-ISO fail-closed TX device-ownership gate at both egress sinks"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{
+            clone_net_namespace, net_ns_owns_device, NetNamespace, ROOT_NET_NAMESPACE,
+        };
+        use net::{FirewallAction, FirewallRule, IpCidrMatch, PortRange, ProcessResult, TxError};
+
+        // Leg 0: preconditions — QEMU virtio-net registers eth0 under `make test`.
+        let Some(eth0_idx_usize) = net::device_index("eth0") else {
+            return TestResult::Warning(String::from(
+                "eth0 absent — TX-isolation legs need QEMU virtio-net (make test provides it)",
+            ));
+        };
+        let eth0_idx = match u32::try_from(eth0_idx_usize) {
+            Ok(idx) => idx,
+            Err(_) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 0: eth0 registry index {} exceeds u32 (ownership sets are u32-keyed)",
+                    eth0_idx_usize
+                ));
+            }
+        };
+        let cfg = net::network_config();
+        if cfg.our_mac.0 == [0u8; 6] {
+            return TestResult::Fail(String::from(
+                "leg 0: our MAC is zero — uninitialized network config would mask the gate",
+            ));
+        }
+
+        // Cleanup guard: whatever leg fails, revoke any granted ownership and
+        // restore the pristine root firewall rule set (both actions idempotent).
+        struct TxIsoGuard {
+            child: alloc::sync::Arc<NetNamespace>,
+            eth0_idx: u32,
+            device_added: bool,
+            root_rules_dirty: bool,
+        }
+        impl Drop for TxIsoGuard {
+            fn drop(&mut self) {
+                if self.device_added {
+                    let _ = self.child.remove_device(self.eth0_idx);
+                }
+                if self.root_rules_dirty {
+                    net::firewall_table().replace_rules(net::firewall_default_rules());
+                }
+            }
+        }
+
+        // Leg 1: child netns (starts with ZERO devices) + accept-all rule in the
+        // CHILD table ONLY — the per-ns default-deny fires before the ownership
+        // gate, so accept-all makes every later denial attributable to the gate.
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid = child.id().raw();
+        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9001)
+            .priority(i32::MAX)
+            .action(FirewallAction::Accept)
+            .build()]);
+        let mut guard = TxIsoGuard {
+            child: child.clone(),
+            eth0_idx,
+            device_added: false,
+            root_rules_dirty: false,
+        };
+
+        let dst = net::Ipv4Addr([203, 0, 113, 77]); // TEST-NET-3, never routed
+        let datagram = match net::build_udp_datagram(cfg.our_ip, dst, 49_400, 47_555, b"D1-ISO") {
+            Ok(d) => d,
+            Err(e) => return TestResult::Fail(alloc::format!("leg 2: UDP build failed: {:?}", e)),
+        };
+
+        // Leg 2: SINK-1 DENY — the child ns does not own eth0.
+        let s0 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        match net::transmit_udp_datagram(dst, &datagram, cid) {
+            Err(TxError::FirewallDenied) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2 (sink 1): child-ns TX must be Err(FirewallDenied), got {:?}",
+                    other
+                ));
+            }
+        }
+        let s1 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s0, &s1) != 0 || s1.tx_errors != s0.tx_errors {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: denied TX must not reach the driver (enq_delta={}, tx_errors {} -> {})",
+                Self::enq_delta(&s0, &s1),
+                s0.tx_errors,
+                s1.tx_errors
+            ));
+        }
+
+        // Leg 3: SINK-2 DENY + child-ns RX alive. A hand-built ICMP echo request
+        // (synthetic remote) processed IN the child ns must produce a Reply
+        // (accept-all admits it; the ICMP token bucket has boot headroom), and
+        // transmitting that reply must be denied at the prepared-reply sink.
+        let remote_mac = net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x77]);
+        let remote_ip = net::Ipv4Addr([198, 51, 100, 77]); // TEST-NET-2
+        let build_echo_frame = |seq: u16| -> Result<net::WirePacket, String> {
+            let mut p = alloc::vec![0u8; 24];
+            p[0] = net::ICMP_TYPE_ECHO_REQUEST;
+            p[4..6].copy_from_slice(&0x7e57u16.to_be_bytes());
+            p[6..8].copy_from_slice(&seq.to_be_bytes());
+            for (i, b) in p[8..].iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            let len = p.len();
+            let ck = net::compute_checksum(&p, len);
+            p[2..4].copy_from_slice(&ck.to_be_bytes());
+            let ip_hdr = net::build_ipv4_header(
+                remote_ip,
+                cfg.our_ip,
+                net::Ipv4Proto::Icmp,
+                p.len() as u16,
+                64,
+            );
+            net::try_build_ethernet_frame_from_parts(
+                cfg.our_mac,
+                remote_mac,
+                net::ETHERTYPE_IPV4,
+                &[&ip_hdr, &p],
+            )
+            .map_err(|e| alloc::format!("echo frame build failed: {:?}", e))
+        };
+        let frame = match build_echo_frame(1) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(alloc::format!("leg 3: {}", e)),
+        };
+        let mut arp_cache = net::ArpCache::new(60_000, 256);
+        let stats = net::NetStats::new();
+        let now_ms = 5_000u64;
+        let reply = match net::process_frame(
+            &frame,
+            cfg.our_mac,
+            cfg.our_ip,
+            &mut arp_cache,
+            &stats,
+            cap::NamespaceId::new(cid),
+            now_ms,
+        ) {
+            ProcessResult::Reply(r) => r,
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: child-ns ICMP echo must produce a Reply (RX path alive), got {:?}",
+                    other
+                ));
+            }
+        };
+        let s2 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        match net::transmit_prepared_reply(reply, now_ms, &stats) {
+            Err(net::PreparedReplyTxError::Retryable(TxError::FirewallDenied, _)) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3 (sink 2): child-ns reply TX must be Retryable(FirewallDenied), got {:?}",
+                    other
+                ));
+            }
+        }
+        let s3 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s2, &s3) != 0 || s3.tx_errors != s2.tx_errors {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: denied reply must not reach the driver (enq_delta={})",
+                Self::enq_delta(&s2, &s3)
+            ));
+        }
+
+        // Leg 4: ADMIT (A/B/A attribution + revocation on the very next call).
+        if let Err(e) = child.add_device(eth0_idx) {
+            return TestResult::Fail(alloc::format!("leg 4: add_device failed: {:?}", e));
+        }
+        guard.device_added = true;
+        let s4 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if let Err(e) = net::transmit_udp_datagram(dst, &datagram, cid) {
+            return TestResult::Fail(alloc::format!(
+                "leg 4 (admit): owned-device TX must be admitted, got {:?}",
+                e
+            ));
+        }
+        let s5 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s4, &s5) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: admitted TX must enqueue exactly once (enq_delta={}, driver-reach proof)",
+                Self::enq_delta(&s4, &s5)
+            ));
+        }
+
+        // Leg 4b (SINK-2 ADMIT, availability): while ownership holds, a child-ns
+        // ICMP echo must be repliable END-TO-END through the prepared-reply sink
+        // — otherwise transmit_prepared_reply could regress into always-deny
+        // while every deny leg stays green (Codex review finding).
+        let frame2 = match build_echo_frame(2) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(alloc::format!("leg 4b: {}", e)),
+        };
+        let reply2 = match net::process_frame(
+            &frame2,
+            cfg.our_mac,
+            cfg.our_ip,
+            &mut arp_cache,
+            &stats,
+            cap::NamespaceId::new(cid),
+            now_ms,
+        ) {
+            ProcessResult::Reply(r) => r,
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4b: owned child-ns ICMP echo must produce a Reply, got {:?}",
+                    other
+                ));
+            }
+        };
+        let s5b = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if let Err(e) = net::transmit_prepared_reply(reply2, now_ms, &stats) {
+            return TestResult::Fail(alloc::format!(
+                "leg 4b (sink 2 admit): owned-device reply TX must succeed, got {:?}",
+                e
+            ));
+        }
+        let s5c = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s5b, &s5c) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4b: admitted reply must enqueue exactly once (enq_delta={})",
+                Self::enq_delta(&s5b, &s5c)
+            ));
+        }
+        if let Err(e) = child.remove_device(eth0_idx) {
+            return TestResult::Fail(alloc::format!("leg 4: remove_device failed: {:?}", e));
+        }
+        guard.device_added = false;
+        match net::transmit_udp_datagram(dst, &datagram, cid) {
+            Err(TxError::FirewallDenied) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4 (revoke): same ns, same rules, ownership toggled off — must be \
+                     Err(FirewallDenied) on the very next call, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 5: NS-0 STILL WORKS — scoped /32 + single-port accept appended to
+        // the pristine default set, restored on every path (guard backstop).
+        guard.root_rules_dirty = true;
+        let mut root_rules = net::firewall_default_rules();
+        root_rules.push(
+            FirewallRule::builder(9002)
+                .priority(1500)
+                .proto(net::Ipv4Proto::Udp)
+                .dst_ip(IpCidrMatch::host(dst))
+                .dst_port(PortRange::single(47_555))
+                .action(FirewallAction::Accept)
+                .build(),
+        );
+        net::firewall_table().replace_rules(root_rules);
+        let s6 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if let Err(e) = net::transmit_udp_datagram(dst, &datagram, 0) {
+            return TestResult::Fail(alloc::format!(
+                "leg 5: root-ns TX must remain admitted (gate must not regress ns 0), got {:?}",
+                e
+            ));
+        }
+        let s7 = match Self::snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s6, &s7) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 5: root-ns TX must enqueue exactly once (enq_delta={})",
+                Self::enq_delta(&s6, &s7)
+            ));
+        }
+        net::firewall_table().replace_rules(net::firewall_default_rules());
+        guard.root_rules_dirty = false;
+
+        // Leg 6: ownership truth table + stale-ns fail-closure. The guard is
+        // fully disarmed; drop it so the child Arc count is exactly ours.
+        drop(guard);
+        if net_ns_owns_device(cid, eth0_idx) {
+            return TestResult::Fail(String::from(
+                "leg 6: ownership must be revoked after remove_device",
+            ));
+        }
+        if !net_ns_owns_device(0, eth0_idx) {
+            return TestResult::Fail(String::from(
+                "leg 6: root ns must own every registered device",
+            ));
+        }
+        if let Err(e) = child.add_device(eth0_idx) {
+            return TestResult::Fail(alloc::format!("leg 6: re-add_device failed: {:?}", e));
+        }
+        if !net_ns_owns_device(cid, eth0_idx) {
+            return TestResult::Fail(String::from(
+                "leg 6: live re-added device must be owned (pre-drop truth)",
+            ));
+        }
+        drop(child);
+        if net_ns_owns_device(cid, eth0_idx) {
+            return TestResult::Fail(String::from(
+                "leg 6: a destroyed namespace id must own NOTHING (stale-ns fail-closed)",
+            ));
+        }
+
         TestResult::Pass
     }
 }

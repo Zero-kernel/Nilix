@@ -722,6 +722,30 @@ pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 256 * 1024;
 #[cfg(not(feature = "fuzz_runner"))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
 
+/// D1-RES R4: fail-closed ceiling on `mm::heap_peak_used_bytes()` at the boot
+/// integration checkpoint — the first PEAK (not endpoint) bound for the boot
+/// residual. CALIBRATED (measured + ~25%, rounded to 32 KiB, same provenance
+/// protocol as BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES): the default runtime-suite
+/// boot measured a peak of 1,239,112 B (≈1210 KiB, incl. the transient 1 MiB
+/// contiguity probe); 1210 KiB × 1.27 ≈ 1536 KiB. fuzz_runner carries larger
+/// boot instrumentation → 1792 KiB. Must exceed the endpoint carve-out and stay
+/// under the arena. Re-measure and re-pin if the boot allocation profile changes.
+#[cfg(feature = "fuzz_runner")]
+pub const BOOT_PEAK_USED_MAX_BYTES: usize = 1792 * 1024;
+
+#[cfg(not(feature = "fuzz_runner"))]
+pub const BOOT_PEAK_USED_MAX_BYTES: usize = 1536 * 1024;
+
+const _: () = assert!(BOOT_PEAK_USED_MAX_BYTES >= BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES);
+const _: () = assert!(BOOT_PEAK_USED_MAX_BYTES < NORMAL_HEAP_SIZE_BYTES);
+
+/// D1-RES: the largest single contiguous object any consumer may request — the
+/// stdin/pipe/socket-payload 1 MiB contract. Used by the combined-load contiguity
+/// probe. Must fit a single admitted `BlockingIo` charge and the admitted arena.
+pub const LARGEST_SINGLE_ALLOCATION_BYTES: usize = 1024 * 1024;
+
+const _: () = assert!(LARGEST_SINGLE_ALLOCATION_BYTES <= ADMITTED_HEAP_BYTES);
+
 /// D1-RES coexistence-oracle outcome.
 ///
 /// The oracle proves the admission ledger and the live allocator cannot

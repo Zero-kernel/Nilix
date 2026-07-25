@@ -45,8 +45,9 @@ pub use heap_admission::{
     run_heap_admission_self_test, snapshot as heap_admission_snapshot,
     try_reserve as try_reserve_heap, vec_charge_bytes, vec_growth_charge_bytes, CoexistenceVerdict,
     HeapAdmissionError, HeapAdmissionSnapshot, HeapCharge, HeapClass, HeapReservation,
-    ADMITTED_HEAP_BYTES, BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES, HEAP_CLASS_COUNT,
-    NORMAL_UNADMITTED_RESERVE_BYTES, REGISTERED_FIXED_RESERVE_BYTES,
+    ADMITTED_HEAP_BYTES, BOOT_PEAK_USED_MAX_BYTES, BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES,
+    HEAP_CLASS_COUNT, LARGEST_SINGLE_ALLOCATION_BYTES, NORMAL_UNADMITTED_RESERVE_BYTES,
+    REGISTERED_FIXED_RESERVE_BYTES,
 };
 pub use heap_budget::{
     budget_bytes, general_residual_bytes, hard_floor_bytes, hard_floors_sum_bytes,
@@ -59,9 +60,9 @@ pub use heap_budget::{
     TRANSIENT_PEAK_BYTES,
 };
 pub use memory::{
-    emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes, run_emergency_heap_self_test,
-    BootInfo, EmergencyAllocator, FrameAllocator, MemoryMapInfo, EMERGENCY_HEAP_SIZE_BYTES,
-    NORMAL_HEAP_SIZE_BYTES,
+    emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes, heap_peak_used_bytes,
+    run_emergency_heap_self_test, BootInfo, EmergencyAllocator, FrameAllocator, MemoryMapInfo,
+    EMERGENCY_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
 };
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,

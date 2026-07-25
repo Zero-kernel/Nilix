@@ -22,9 +22,11 @@ pub fn test_page_table() {
 pub fn test_process_control_block() {
     kernel_core::process::Process::run_arc_lifetime_self_test();
     kernel_core::process::run_process_table_retirement_self_test();
+    kernel_core::process::run_process_registry_txn_self_test();
     klog_always!("  [TEST] Process Control Block...");
     klog_always!("    [PASS] RF180-40 process Arc/Weak exact-lifetime admission");
     klog_always!("    [PASS] RF180-44 process-table deferred retirement");
+    klog_always!("    [PASS] D2-ARC process-registry transaction (fail-closed try-lock API)");
     klog_always!("    ✓ Process structure defined");
     klog_always!("    ✓ Priority system implemented");
     klog_always!("    ✓ State management ready");
@@ -574,6 +576,54 @@ pub fn test_heap_budget_arbiter() {
         }
         verdict => panic!("D1-RES: oracle coexistence failed: {verdict:?}"),
     }
+
+    // D1-RES combined-load validation (Leg B — physical, quiescent single-CPU).
+    // (1) ADMITTED CONTIGUITY PROBE: prove the post-boot arena can still satisfy
+    // one maximum admitted object (1 MiB — the stdin/pipe/socket-payload contract).
+    {
+        let charge = mm::vec_charge_bytes::<u8>(mm::LARGEST_SINGLE_ALLOCATION_BYTES)
+            .expect("D1-RES: 1 MiB charge computation");
+        let reservation = mm::try_reserve_heap(mm::HeapClass::BlockingIo, charge)
+            .expect("D1-RES: 1 MiB must admit at the quiescent checkpoint");
+        let mut probe: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let ok = probe
+            .try_reserve_exact(mm::LARGEST_SINGLE_ALLOCATION_BYTES)
+            .is_ok();
+        assert!(
+            ok,
+            "D1-RES: post-boot arena cannot satisfy one maximum admitted object (fragmentation)"
+        );
+        drop(probe);
+        drop(reservation);
+        klog_always!("    ✓ D1-RES contiguity probe: 1 MiB admitted object satisfiable");
+    }
+    // (2) RESTORATION RE-CHECK: prove the probe left zero residue and the oracle
+    // identity still holds live.
+    let (used_restored, floors_restored) = measure();
+    match mm::check_coexistence(used_restored, floors_restored, Some(baseline_unledgered)) {
+        mm::CoexistenceVerdict::Sound { .. } => {
+            klog_always!("    ✓ D1-RES oracle re-Sound after probe (exact restoration)");
+        }
+        verdict => panic!("D1-RES: post-probe oracle not Sound: {verdict:?}"),
+    }
+    // (3) PEAK LEG (R4): first real PEAK (not endpoint) evidence — logged as the
+    // calibration source, asserted monotone >= endpoint and <= the ceiling.
+    let peak = mm::heap_peak_used_bytes();
+    klog_always!(
+        "    ✓ D1-RES heap PEAK used = {} B (ceiling {} B); unledgered waiter bound 96 x 320 = 30720 B <= {} B",
+        peak,
+        mm::BOOT_PEAK_USED_MAX_BYTES,
+        mm::NORMAL_UNADMITTED_RESERVE_BYTES / 2
+    );
+    assert!(
+        peak >= used_restored,
+        "D1-RES: peak {peak} < endpoint {used_restored} (instrumentation bug)"
+    );
+    assert!(
+        peak <= mm::BOOT_PEAK_USED_MAX_BYTES,
+        "D1-RES: heap peak {peak} B exceeds ceiling {} B",
+        mm::BOOT_PEAK_USED_MAX_BYTES
+    );
 }
 
 /// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.

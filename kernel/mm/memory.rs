@@ -1,7 +1,7 @@
 use crate::buddy_allocator;
 use crate::page_table::PHYSICAL_MEMORY_OFFSET;
 use alloc::boxed::Box;
-use core::alloc::{AllocError, Allocator, Layout};
+use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::hint::spin_loop;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -139,8 +139,49 @@ const MAX_RESERVED_RANGES: usize = 64;
 // error. The static itself is kept in BOTH configs (init_heap_allocator_at and
 // the heap-stats path reference it), so only the global registration is gated.
 // The kernel build never enables `host_harness`, so its allocator is unchanged.
-#[cfg_attr(not(feature = "host_harness"), global_allocator)]
+//
+// D1-RES R4: the global registration is the `InstrumentedKernelHeap` ZST shim
+// below (not `ALLOCATOR` directly) so every allocation updates the monotone
+// `HEAP_PEAK_USED_BYTES` high-water under the SAME lock it already takes.
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// D1-RES R4: monotone high-water of normal-arena USED bytes
+/// (`NORMAL_HEAP_SIZE_BYTES - free`), updated inside the single allocator lock
+/// every `alloc` already holds. Normal arena only; excludes the emergency arena.
+static HEAP_PEAK_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// D1-RES R4: ZST `#[global_allocator]` shim over `ALLOCATOR`. Semantics are
+/// IDENTICAL to `linked_list_allocator::LockedHeap`'s own `GlobalAlloc` impl
+/// (delegate to `allocate_first_fit` / `deallocate` on the same inner `Heap`)
+/// plus one `fetch_max` of the used-bytes peak computed under the single
+/// already-held lock — exact, no double-acquire, no new lock-order edge. The
+/// shim itself never allocates or logs. A pre-init or OOM alloc returns
+/// `Err → null`, which `handle_alloc_error` turns into the same fail-closed halt
+/// as before this shim existed.
+struct InstrumentedKernelHeap;
+
+unsafe impl GlobalAlloc for InstrumentedKernelHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut heap = ALLOCATOR.lock();
+        match heap.allocate_first_fit(layout) {
+            Ok(ptr) => {
+                let used = NORMAL_HEAP_SIZE_BYTES.saturating_sub(heap.free());
+                HEAP_PEAK_USED_BYTES.fetch_max(used, Ordering::Relaxed);
+                ptr.as_ptr()
+            }
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        ALLOCATOR
+            .lock()
+            .deallocate(NonNull::new_unchecked(ptr), layout);
+    }
+}
+
+#[cfg_attr(not(feature = "host_harness"), global_allocator)]
+static GLOBAL_HEAP: InstrumentedKernelHeap = InstrumentedKernelHeap;
 
 /// R180-7..13 FIX: physically disjoint recovery allocator.
 ///
@@ -1279,6 +1320,15 @@ impl FrameAllocator {
 #[inline]
 pub fn heap_free_bytes() -> usize {
     ALLOCATOR.lock().free()
+}
+
+/// D1-RES R4: monotone peak of normal-arena USED bytes since allocator init.
+/// Normal arena only; excludes the emergency arena. The first real peak evidence
+/// for the boot-path residual (R4) — the integration checkpoint logs it as the
+/// calibration source and asserts it under `BOOT_PEAK_USED_MAX_BYTES`.
+#[inline]
+pub fn heap_peak_used_bytes() -> usize {
+    HEAP_PEAK_USED_BYTES.load(Ordering::Relaxed)
 }
 
 /// Free bytes in the physically isolated emergency arena.

@@ -414,6 +414,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // Fail-closed: over-committed hard floors panic here rather than OOM later.
     mm::publish_heap_budgets();
     klog_always!("      ✓ Heap budget arbiter published (hard floors coexistence proven)");
+    // D1-RES R2: pre-reserve the blocking-wait registries (STDIN_WAITERS) to
+    // WAITER_REGISTRY_MAX_ENTRIES so per-blocked-task pushes are allocation-free
+    // (closes the unledgered-drift + alloc-under-spinlock residual). Boot-time,
+    // single-threaded, pre-scheduler; a failure is a broken-partition condition.
+    kernel_core::syscall::init_blocking_waiter_registries()
+        .expect("D1-RES: blocking-wait registry boot pre-reserve failed");
 
     // 初始化页表管理器
     // Bootloader 创建了恒等映射（物理地址 == 虚拟地址），所以物理偏移量为 0
