@@ -1,9 +1,9 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.1 — design-queue closure update (2026-07-24; was 4.0 first unified edition)
-**Snapshot:** 2026-07-24 · branch `main` @ `732f330` (working tree carries the full design-queue round
-uncommitted: D1-RES/D1-ISO/D2-ABI/D2-ERR/D2-TST + R184 residual fixes; remote is the authoritative
-build host)
+**Version:** 4.2 — D3 PENDING-FRAME v2 update (2026-07-27; was 4.1 design-queue closure 2026-07-24)
+**Snapshot:** 2026-07-27 · branch `main` @ `7ef667c` (working tree carries D3 PENDING-FRAME v2
+uncommitted: park-on-miss + retransmit-on-learn, gateway-fallback delivery retired; remote is the
+authoritative build host)
 **Design principle:** Security > Correctness > Efficiency > Performance
 **Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
 `docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
@@ -63,12 +63,18 @@ RESOLVED 2026-07-24** (D1-RES + D1-ISO) and all D2s dispositioned incl. D2-ABI-S
 queue is D3-backlog-only and no longer gate-blocking. Sole remaining gate item: zero-HIGH streak 3/3
 (next = R186 → 2/3). `README.md` §6 and `README_zh.md` §6 were reconciled to this state on 2026-07-25.
 
-**Feature work since the gate snapshot:** the **D3 NETNS-DATAPLANE** arc landed 2026-07-25 in eight
-legs — per-namespace ARP caches (`HeapClass::NetnsConfig`), a per-namespace byte sub-budget
-(`NsByteBudget`, 16 KiB), the RX-wiring start gate, per-namespace network configuration, per-namespace
-routing, a bounded process-context RX ingress loop, external-device RX completion (static `BufPool`;
-**`eth0` receive is live**), and ARP request-TX probe emission. This is feature work on a D3-backlog
-item, not a gate item — it does not affect the streak.
+**Feature work since the gate snapshot:** the **D3 PENDING-FRAME v2** architecture landed 2026-07-27 —
+park-on-miss + retransmit-on-learn fully retires gateway-fallback delivery (the `neighbor_fallbacks`
+counter and fallback logic are deleted). On-link ARP misses now park data frames in a per-cache 8-slot
+FIFO (3-second TTL, oldest-evicted on full, EthAddr::ZERO placeholder patched under lock at pop) and
+probe for the neighbor. Learned neighbors trigger `drain_parked_ready`, which pops ready frames,
+patches destination MACs, and retransmits via the prepared path (fresh ownership gate + egress firewall
++ deferred UDP conntrack at queue-accept). Ownership gate moved BEFORE park AND probe admission
+(ownership-denied namespaces draw no ring claim, no bucket token, no queue slot). Counter conservation
+holds in quiescence: `parked_total == occupancy + retransmitted + expired + evicted + flushed +
+retx_failures`. This is feature work on a D3-backlog item, not a gate item — it does not affect the
+streak. The **D3 NETNS-DATAPLANE** arc (per-namespace ARP caches, byte sub-budget, RX-wiring, addressing,
+routing, RX ingress loop, **eth0 RX live**, ARP request-TX probes) landed 2026-07-25 in eight legs.
 
 | Dimension | State (2026-07-23) |
 |---|---|

@@ -43,6 +43,13 @@ in progress. The 1.0-Preview release gate is currently **BLOCKED on streak 1/3**
 rebuilt by R185). See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-07-27:** D3 PENDING-FRAME v2 — park-on-miss + retransmit-on-learn architecture retires
+  gateway-fallback delivery. On-link ARP misses now park data frames in a per-cache 8-slot FIFO
+  (3-second TTL, oldest-evicted on full) and probe for the neighbor; learned neighbors trigger
+  frame retransmission via `drain_parked_ready`. Ownership gate moved before park AND probe
+  admission (ownership-denied namespaces draw no ring/bucket/queue resources). Counter conservation
+  holds in quiescence: `parked_total == occupancy + retransmitted + expired + evicted + flushed +
+  retx_failures`.
 - **2026-07-25:** D3 network-namespace dataplane — per-namespace ARP caches, addressing and
   routing, all charged to a per-namespace byte budget; a bounded process-context RX ingress
   loop; external-device RX completion (the kernel now ingests real external frames on `eth0`);
