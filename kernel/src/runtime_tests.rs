@@ -1737,6 +1737,7 @@ pub fn run_all_runtime_tests() -> TestReport {
         &NetNsRxPoolLifecycleTest,
         &NetNsRxEth0SlirpTest,
         &NetNsArpProbeTxTest,
+        &NetNsPendingFrameTest,
     ];
 
     // Add 25 P0 regression tests (R172-R174 findings)
@@ -4752,7 +4753,6 @@ impl RuntimeTest for NetNsRoutingTest {
         let offlink_ip = net::Ipv4Addr([192, 0, 2, 9]);
         let planted_offlink_mac = net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x0f, 0x0f]);
         let plant_ms = 360_000u64;
-        let fb_base;
         {
             let cache = child.arp_cache();
             let mut c = cache.lock();
@@ -4764,7 +4764,6 @@ impl RuntimeTest for NetNsRoutingTest {
             ) {
                 return TestResult::Fail(alloc::format!("leg 2: neighbor plant failed: {:?}", e));
             }
-            fb_base = c.neighbor_fallbacks();
         }
 
         // (a) On-link neighbor with an entry resolves to the NEIGHBOR MAC.
@@ -4810,30 +4809,25 @@ impl RuntimeTest for NetNsRoutingTest {
                 ));
             }
         }
-        // Off-link resolves never touch the fallback meter.
-        if child.arp_cache().lock().neighbor_fallbacks() != fb_base {
-            return TestResult::Fail(String::from(
-                "leg 2b: off-link resolution must not count as an on-link fallback",
-            ));
-        }
 
-        // (c) On-link MISS: gateway fallback, metered exactly once.
+        // (c) On-link MISS (D3 v2): NeighborUnresolved — parking has no pub
+        // seam and zero frames landed on the child-ns cache (production sends
+        // via the root's device would have parked on the ROOT cache; the test
+        // resolver ONLY runs the cached-classification stages).
         match net::resolve_dst_mac(net::Ipv4Addr([10, 87, 0, 77]), &cfg, cid) {
-            Ok(mac) if mac == cfg.gateway_mac => {}
+            Err(TxError::NeighborUnresolved) => {}
             other => {
                 return TestResult::Fail(alloc::format!(
-                    "leg 2c: on-link miss must fall back to the gateway (temporary, \
-                     metered), got {:?}",
+                    "leg 2c: on-link miss must return NeighborUnresolved (v2 park path has \
+                     no pub seam), got {:?}",
                     other
                 ));
             }
         }
-        let fb_after = child.arp_cache().lock().neighbor_fallbacks();
-        if fb_after != fb_base + 1 {
-            return TestResult::Fail(alloc::format!(
-                "leg 2c: exactly one metered fallback expected ({} -> {})",
-                fb_base,
-                fb_after
+        // No park event occurred → pending counter still zero.
+        if child.arp_cache().lock().pending_frame_count() != 0 {
+            return TestResult::Fail(String::from(
+                "leg 2c: resolve seam cannot park (zero frames in child pending queue expected)",
             ));
         }
 
@@ -4866,28 +4860,45 @@ impl RuntimeTest for NetNsRoutingTest {
             }
         }
 
-        // (f) Root regression: on-link SLIRP hosts keep their pre-routing
-        // wire bytes (gateway MAC via the metered fallback).
+        // (f) Root regression: on-link SLIRP hosts (D3 v2 pre-registration).
+        // Before reconfig root is UNCONFIGURED — the global cache arm applies.
+        // Production TX would check ownership and fail-close, but the pub
+        // resolver seam bypasses the gate → returns NeighborUnresolved for the
+        // pre-registration window (no cache to park into, no gateway to fall
+        // back to — off-link requires a reachable next-hop in the config).
         let root_cfg = net::network_config();
         match net::resolve_dst_mac(net::Ipv4Addr([10, 0, 2, 3]), &root_cfg, 0) {
-            Ok(mac) if mac == root_cfg.gateway_mac => {}
+            Err(TxError::NeighborUnresolved) => {}
             other => {
                 return TestResult::Fail(alloc::format!(
-                    "leg 2f: root on-link SLIRP host must still resolve to the gateway \
-                     MAC (wire-behavior preservation), got {:?}",
+                    "leg 2f: root pre-registration on-link miss must return \
+                     NeighborUnresolved (no cache to park into), got {:?}",
                     other
                 ));
             }
         }
 
-        // (g) Unknown namespace: cache-free arm returns the snapshot
-        // gateway; the TX ownership gate downstream is what denies it.
+        // (g) Unknown namespace: on-link in the snapshot classifies via the
+        // cache-free arm. D3 v2: that arm returns NeighborUnresolved on miss
+        // (no fallback MAC — pre-registration semantics). The TX ownership
+        // gate downstream would deny it anyway (LinkDown), but resolve already
+        // fail-closes here.
         match net::resolve_dst_mac(neighbor_ip, &cfg, u64::MAX) {
+            Err(TxError::LinkDown) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2g: unknown-ns on-link miss must return LinkDown (cache-free arm \\
+                     fail-closes), got {:?}",
+                    other
+                ));
+            }
+        }
+        // Off-link control: unknown-ns off-link still resolves to gateway.
+        match net::resolve_dst_mac(offlink_ip, &cfg, u64::MAX) {
             Ok(mac) if mac == cfg.gateway_mac => {}
             other => {
                 return TestResult::Fail(alloc::format!(
-                    "leg 2g: unknown-ns cache-free arm must return the snapshot gateway, \
-                     got {:?}",
+                    "leg 2g: unknown-ns off-link must resolve to gateway, got {:?}",
                     other
                 ));
             }
@@ -6131,10 +6142,6 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                     .load(Ordering::Relaxed),
             )
         };
-        let root_fallbacks = || {
-            kernel_core::net_namespace::lookup_net_ns(0)
-                .map(|ns| ns.arp_cache().lock().neighbor_fallbacks())
-        };
         let send_to = |dst: Ipv4Addr| -> Result<(), TestResult> {
             let datagram = net::build_udp_datagram(cfg.our_ip, dst, 49_600, 47_700, b"D3-PROBE")
                 .map_err(|e| {
@@ -6142,7 +6149,7 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 })?;
             net::transmit_udp_datagram(dst, &datagram, 0).map_err(|e| {
                 TestResult::Fail(alloc::format!(
-                    "root on-link send to {:?} must succeed via gateway fallback, got {:?}",
+                    "root on-link send to {:?} must succeed (D3 v2: parks), got {:?}",
                     dst,
                     e
                 ))
@@ -6173,9 +6180,9 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 continue;
             }
             let (sent_a, dup_a, lim_a, _) = probe_counters();
-            let Some(fb_a) = root_fallbacks() else {
-                return TestResult::Fail(String::from("root netns lookup failed"));
-            };
+            let parked_a = kernel_core::net_namespace::lookup_net_ns(0)
+                .map(|ns| ns.arp_cache().lock().pending_frame_count())
+                .unwrap_or(0);
             let sa = match NetNsRxIngressTest::eth0_snapshot() {
                 Ok(s) => s,
                 Err(fail) => return fail,
@@ -6184,29 +6191,29 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 return fail;
             }
             let (sent_b, dup_b, lim_b, _) = probe_counters();
-            let Some(fb_b) = root_fallbacks() else {
-                return TestResult::Fail(String::from("root netns lookup failed"));
-            };
+            let parked_b = kernel_core::net_namespace::lookup_net_ns(0)
+                .map(|ns| ns.arp_cache().lock().pending_frame_count())
+                .unwrap_or(0);
             let sb = match NetNsRxIngressTest::eth0_snapshot() {
                 Ok(s) => s,
                 Err(fail) => return fail,
             };
-            if fb_b != fb_a + 1 || dup_b != dup_a {
+            if parked_b != parked_a + 1 || dup_b != dup_a {
                 return TestResult::Fail(alloc::format!(
-                    "leg B: a fresh-target miss must meter exactly one fallback and \
-                     no duplicate (fallbacks {}->{}, suppressed {}->{})",
-                    fb_a,
-                    fb_b,
+                    "leg B: a fresh-target miss must park exactly one frame and \
+                     no duplicate (parked {}->{}, suppressed {}->{})",
+                    parked_a,
+                    parked_b,
                     dup_a,
                     dup_b
                 ));
             }
             let enq = NetNsRxIngressTest::enq_delta(&sa, &sb);
-            if sent_b == sent_a + 1 && lim_b == lim_a && enq == 2 {
+            if sent_b == sent_a + 1 && lim_b == lim_a && enq == 1 {
                 probed_target = Some(dst);
                 break;
             }
-            if sent_b == sent_a && lim_b == lim_a + 1 && enq == 1 {
+            if sent_b == sent_a && lim_b == lim_a + 1 && enq == 0 {
                 // A drained bucket (prior pass / boot flows): wait TWO
                 // refill tokens of REAL clock (8 pps ⇒ 125 ms each) on the
                 // same 1000 Hz tick source the probe path reads — spin
@@ -6247,17 +6254,23 @@ impl RuntimeTest for NetNsArpProbeTxTest {
         let _cleanup = RootArpDynamicCleanup { ip: target };
         // Post-success baselines for leg C (nothing runs in between).
         let (sent1, dup1, _, _) = probe_counters();
+        let parked1 = kernel_core::net_namespace::lookup_net_ns(0)
+            .map(|ns| ns.arp_cache().lock().pending_frame_count())
+            .unwrap_or(0);
         let s1 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
         };
 
         // ---- Leg C: an immediate second send to the SAME target is ring-
-        // suppressed (µs apart ≪ the 1 s interval): data enqueues, no probe.
+        // suppressed (µs apart ≪ the 1 s interval): data parks, no probe.
         if let Err(fail) = send_to(target) {
             return fail;
         }
         let (sent2, dup2, _lim2, _fail2) = probe_counters();
+        let parked2 = kernel_core::net_namespace::lookup_net_ns(0)
+            .map(|ns| ns.arp_cache().lock().pending_frame_count())
+            .unwrap_or(0);
         let s2 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
@@ -6272,9 +6285,16 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 dup2
             ));
         }
-        if NetNsRxIngressTest::enq_delta(&s1, &s2) != 1 {
+        if parked2 != parked1 + 1 {
             return TestResult::Fail(alloc::format!(
-                "leg C: only the data frame must enqueue (enq_delta {})",
+                "leg C: the duplicate-suppressed send must still park (parked {}->{})",
+                parked1,
+                parked2
+            ));
+        }
+        if NetNsRxIngressTest::enq_delta(&s1, &s2) != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg C: no eth0 enqueue until learn pops parked frames (enq_delta {})",
                 NetNsRxIngressTest::enq_delta(&s1, &s2)
             ));
         }
@@ -6329,35 +6349,27 @@ impl RuntimeTest for NetNsArpProbeTxTest {
             }
         }
         let (sent3, dup3, _lim3, _fail3) = probe_counters();
-        let Some(fb3) = root_fallbacks() else {
-            return TestResult::Fail(String::from("root netns lookup failed"));
-        };
         if let Err(fail) = send_to(target) {
             return fail;
         }
-        let (sent4, dup4, _lim4, _fail4) = probe_counters();
-        let Some(fb4) = root_fallbacks() else {
-            return TestResult::Fail(String::from("root netns lookup failed"));
-        };
         let s4 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
         };
-        if sent4 != sent3 || dup4 != dup3 || fb4 != fb3 {
+        let (sent4, dup4, _lim4, _fail4) = probe_counters();
+        if sent4 != sent3 || dup4 != dup3 {
             return TestResult::Fail(alloc::format!(
                 "leg D: a cache HIT must neither probe nor meter (probes_sent {}->{}, \
-                 suppressed {}->{}, fallbacks {}->{})",
+                 suppressed {}->{})",
                 sent3,
                 sent4,
                 dup3,
-                dup4,
-                fb3,
-                fb4
+                dup4
             ));
         }
-        if NetNsRxIngressTest::enq_delta(&s2, &s4) != 1 {
+        if NetNsRxIngressTest::enq_delta(&s2, &s4) != 2 {
             return TestResult::Fail(alloc::format!(
-                "leg D: only the data frame must enqueue (enq_delta {})",
+                "leg D: the learned reply must pop BOTH parked frames (enq_delta {})",
                 NetNsRxIngressTest::enq_delta(&s2, &s4)
             ));
         }
@@ -6436,6 +6448,204 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                  (probe_tx_failures {}->{})",
                 fail0,
                 fail6
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3 PENDING-FRAME v2 (netns_pending_frame)
+// ============================================================================
+
+/// D3 PENDING-FRAME v2 GATING TEST: park-on-miss, retransmit-on-learn,
+/// expiry, eviction, reconfig flush, ownership-denied no-park, counter
+/// conservation, ResolvedLate hit.
+///
+/// Architecture: allocate a child namespace, plant test fixtures via
+/// filtered polls, drive drains explicitly via the pub seam
+/// `net::drain_parked_ready`, quiesce background RX for determinism.
+struct NetNsPendingFrameTest;
+
+impl RuntimeTest for NetNsPendingFrameTest {
+    fn name(&self) -> &'static str {
+        "netns_pending_frame"
+    }
+
+    fn description(&self) -> &'static str {
+        "D3 PENDING-FRAME v2: park→learn→pop wire proof, expiry, eviction, flush, counters"
+    }
+
+    fn run(&self) -> TestResult {
+        use core::sync::atomic::Ordering;
+        use kernel_core::net_namespace::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr};
+
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        if net::device_index("eth0").is_none() {
+            return TestResult::Warning(String::from(
+                "eth0 absent — pending-frame gates need QEMU virtio-net (make test provides it)",
+            ));
+        }
+
+        // Leg 1: park→planted-learn→pop wiring proof (one frame).
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => return TestResult::Fail(alloc::format!("clone_net_namespace: {:?}", e)),
+        };
+        let cid = child.id().raw();
+        let cfg = net::NetConfigSnapshot {
+            our_ip: Ipv4Addr([10, 88, 0, 1]),
+            our_mac: EthAddr([0x02, 0x00, 0x00, 0x00, 0x88, 0x01]),
+            gateway_ip: Ipv4Addr([10, 88, 0, 254]),
+            gateway_mac: EthAddr([0x02, 0x00, 0x00, 0x00, 0x88, 0xfe]),
+            subnet_prefix_len: 24,
+        };
+        if let Err(e) = child.set_net_config(cfg) {
+            return TestResult::Fail(alloc::format!("set_net_config: {:?}", e));
+        }
+        let target_ip = Ipv4Addr([10, 88, 0, 9]);
+        let target_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x88, 0x09]);
+
+        let base = alloc_arp_test_clock_window();
+        let ingress_stats = net::rx_ingress_net_stats();
+
+        // Park one frame via on-link miss send.
+        let datagram = match net::build_udp_datagram(
+            cfg.our_ip,
+            target_ip,
+            50_001,
+            50_002,
+            b"D3-PENDING",
+        ) {
+            Ok(d) => d,
+            Err(e) => return TestResult::Fail(alloc::format!("build_udp_datagram: {:?}", e)),
+        };
+        if let Err(e) = net::transmit_udp_datagram(target_ip, &datagram, cid) {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: on-link miss send must park (Ok), got {:?}",
+                e
+            ));
+        }
+        let ctrs1 = child.arp_cache().lock().pending_frame_counters();
+        if ctrs1.parked_total != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: exactly one frame must park (parked_total {})",
+                ctrs1.parked_total
+            ));
+        }
+
+        // Plant the learned reply via synthetic device.
+        let shared = RX_INGRESS_TEST_SHARED
+            .call_once(|| {
+                alloc::sync::Arc::new(spin::Mutex::new(RxIngressTestShared {
+                    frames: alloc::collections::VecDeque::new(),
+                    error_arm: false,
+                }))
+            })
+            .clone();
+        if net::device_index("rxtest0").is_none() {
+            if let Err(e) = net::register_device(SyntheticRxDevice {
+                shared: shared.clone(),
+            }) {
+                return TestResult::Fail(alloc::format!("synthetic device register: {:?}", e));
+            }
+        }
+        let reply = arp::build_arp_reply(target_mac, target_ip, cfg.our_mac, cfg.our_ip);
+        shared.lock().frames.push_back(reply.to_vec());
+        let _ = net::rx_ingress_poll_filtered(base + 1000, 8, &["rxtest0"]);
+
+        // Drain pops the parked frame and enqueues on eth0.
+        let s1 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        let accepted = net::drain_parked_ready(cid, base + 1100);
+        let s2 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if accepted != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: drain must accept exactly 1 (got {})",
+                accepted
+            ));
+        }
+        if NetNsRxIngressTest::enq_delta(&s1, &s2) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: popped frame must enqueue on eth0 (enq_delta {})",
+                NetNsRxIngressTest::enq_delta(&s1, &s2)
+            ));
+        }
+        let ctrs2 = child.arp_cache().lock().pending_frame_counters();
+        if ctrs2.retransmitted != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: accepted drain counts retransmitted (got {})",
+                ctrs2.retransmitted
+            ));
+        }
+
+        // Leg 2: expiry-before-ready drops frame (TTL=3s, wait 3.5s).
+        let target2 = Ipv4Addr([10, 88, 0, 10]);
+        if let Err(e) = net::transmit_udp_datagram(target2, &datagram, cid) {
+            return TestResult::Fail(alloc::format!("leg 2: park send: {:?}", e));
+        }
+        let now_expire = base + 4600;
+        let accepted2 = net::drain_parked_ready(cid, now_expire);
+        if accepted2 != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: expired frame must not pop (accepted {})",
+                accepted2
+            ));
+        }
+        let ctrs3 = child.arp_cache().lock().pending_frame_counters();
+        if ctrs3.expired != 1 {
+            return TestResult::Fail(alloc::format!("leg 2: expired counter (got {})", ctrs3.expired));
+        }
+
+        // Leg 3: FIFO eviction by park_seq (fill 8 slots, 9th evicts oldest).
+        for k in 0..9u8 {
+            let dst = Ipv4Addr([10, 88, 0, 20 + k as u8]);
+            let _ = net::transmit_udp_datagram(dst, &datagram, cid);
+        }
+        let ctrs4 = child.arp_cache().lock().pending_frame_counters();
+        if ctrs4.evicted != 1 {
+            return TestResult::Fail(alloc::format!("leg 3: one eviction (got {})", ctrs4.evicted));
+        }
+        if child.arp_cache().lock().pending_frame_count() != 8 {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: 8 slots max (count {})",
+                child.arp_cache().lock().pending_frame_count()
+            ));
+        }
+
+        // Leg 4: reconfig flush via set_net_config.
+        if let Err(e) = child.set_net_config(cfg) {
+            return TestResult::Fail(alloc::format!("leg 4: set_net_config: {:?}", e));
+        }
+        let ctrs5 = child.arp_cache().lock().pending_frame_counters();
+        if ctrs5.flushed != 8 {
+            return TestResult::Fail(alloc::format!("leg 4: flush 8 frames (got {})", ctrs5.flushed));
+        }
+        if child.arp_cache().lock().pending_frame_count() != 0 {
+            return TestResult::Fail(String::from("leg 4: flush clears queue"));
+        }
+
+        // Leg 5: counter conservation (quiescent invariant).
+        let ctrs_final = child.arp_cache().lock().pending_frame_counters();
+        let total = ctrs_final.parked_total;
+        let accounted = ctrs_final.retransmitted
+            + ctrs_final.expired
+            + ctrs_final.evicted
+            + ctrs_final.flushed
+            + ctrs_final.retx_failures;
+        if total != accounted {
+            return TestResult::Fail(alloc::format!(
+                "leg 5: counter conservation violated (parked_total {} != accounted {})",
+                total,
+                accounted
             ));
         }
 
