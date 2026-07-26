@@ -6326,15 +6326,15 @@ impl RuntimeTest for NetNsArpProbeTxTest {
             return TestResult::Fail(String::from("leg D: ARP reply frame admission failed"));
         }
         shared.lock().frames.push_back(reply.to_vec());
-        let base = alloc_arp_test_clock_window();
-        let processed = net::rx_ingress_poll_filtered(base, 8, &["rxtest0"]);
+        let now_ms = kernel_core::time::get_ticks();
+        let processed = net::rx_ingress_poll_filtered(now_ms, 8, &["rxtest0"]);
         if processed != 1 {
             return TestResult::Fail(alloc::format!(
                 "leg D: exactly the planted reply must process, got {}",
                 processed
             ));
         }
-        if NetNsRxIngressTest::root_lookup(target, base) != Some(neighbor_mac) {
+        if NetNsRxIngressTest::root_lookup(target, now_ms) != Some(neighbor_mac) {
             return TestResult::Fail(String::from(
                 "leg D: the planted reply must learn into the ROOT cache",
             ));
