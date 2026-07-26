@@ -144,7 +144,11 @@ pub use stack::{
     transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram, DropReason,
     NetConfigSnapshot, NetStats, PreparedReply, PreparedReplyTxError, ProcessResult,
     quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters, rx_ingress_net_stats,
+    rx_ingress_poll, rx_ingress_poll_filtered, rx_ingress_poll_throttled, rx_ingress_pool_stats,
+    transmit_prepared_reply, transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram,
     tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop, PreparedReply,
+    PreparedReplyTxError, ProcessResult, RxIngressCounters, RxIngressQuiesceGuard, RxPoolStats,
+    RX_BUF_POOL_SIZE, RX_DEVICE_OUTSTANDING_CAP, RX_INGRESS_POLL_BUDGET,
 };
 pub use tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,

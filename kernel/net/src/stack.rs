@@ -40,9 +40,9 @@ use core::cmp;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
-use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpStats};
-use crate::buffer::NetBuf;
-use crate::device::TxError;
+use crate::arp::{process_arp, ArpCache, ArpError, ArpResult, ArpStats};
+use crate::buffer::{BufPool, NetBuf};
+use crate::device::{RxError, TxError};
 use crate::ethernet::{
     build_ethernet_frame_from_parts, parse_ethernet, try_build_ethernet_frame_from_parts, EthAddr,
     EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
@@ -2512,6 +2512,30 @@ const _: () = assert!(
     "background RX budget must cover every registrable device (fairness invariant)"
 );
 
+/// D3-NETNS-DATAPLANE RX-COMPLETION: buffers in the shared production RX
+/// pool. Fixed at construction (`BufPool` never re-grows), so this constant
+/// IS the hard DMA bound for external-device RX: 32 x 4 KiB pages = 128 KiB
+/// of physical memory — deliberately OUTSIDE heap admission (DMA pages are
+/// not heap-arena bytes; charging them into a `HeapClass` would falsify the
+/// coexistence ledger, Codex round-21/22). Visibility instead via
+/// [`rx_ingress_pool_stats`].
+pub const RX_BUF_POOL_SIZE: usize = 32;
+
+/// The most pool buffers one device may OWN at a time — posted descriptors
+/// plus completed-but-undelivered plus recycle-pending (the
+/// `NetDevice::rx_owned_rx_buffers` invariant). Bounds how much of the
+/// shared pool a single device can pin. Starvation bound (documented, not
+/// asserted): the pool fully stocks at most POOL_SIZE / CAP = 2 devices;
+/// additional pooled devices degrade to partial stocking. Today's production
+/// population is eth0 alone.
+pub const RX_DEVICE_OUTSTANDING_CAP: usize = 16;
+
+const _: () = assert!(RX_DEVICE_OUTSTANDING_CAP >= 1);
+const _: () = assert!(RX_BUF_POOL_SIZE >= RX_DEVICE_OUTSTANDING_CAP);
+
+/// Minimum spacing between throttled background polls. Coarse by design: the
+/// bring-up loop is a liveness floor, not a throughput path (production RX
+/// needs a recurring wake source — IRQ vectors are not wired to any device).
 const RX_INGRESS_MIN_INTERVAL_MS: u64 = 10;
 
 /// Loop-level RX ingress telemetry, distinct from the per-frame `NetStats`
@@ -2534,6 +2558,19 @@ struct RxIngressStats {
     /// Polls that consumed their entire frame budget (work may remain).
     budget_exhausted: AtomicU64,
     /// Shared-pool construction attempts rolled back for falling short of
+    /// `RX_BUF_POOL_SIZE` (full-or-retry policy — an under-provisioned
+    /// candidate is dropped whole and the next poll retries) or failing
+    /// fallible metadata allocation.
+    pool_init_failures: AtomicU64,
+    /// Replenish passes where a PARTICIPATING device posted fewer buffers
+    /// than requested (descriptor/headroom shortfalls; round-23 finding 3).
+    /// Non-participating devices (synthetics that refuse pool stocking) are
+    /// excluded — their permanent shortfall is noise, and pool-empty draws
+    /// are counted separately by `BufPool::pool_empty_allocs`, which a
+    /// refusing stub never touches.
+    replenish_shortfalls: AtomicU64,
+}
+
 static RX_INGRESS_STATS: RxIngressStats = RxIngressStats {
     rx_errors: AtomicU64::new(0),
     owner_unavailable_skips: AtomicU64::new(0),
@@ -2639,16 +2676,67 @@ impl Drop for RxIngressQuiesceGuard {
     }
 }
 
+/// The shared production RX buffer pool (bound: [`RX_BUF_POOL_SIZE`]).
 /// Installed FULL-OR-NEVER by [`ensure_rx_ingress_pool`]; absent until the
 /// first successful construction.
+static RX_INGRESS_POOL: Once<BufPool> = Once::new();
+
+/// One coherent snapshot of the shared RX pool (test/diagnostic
+/// observability). `dma_bytes` reports ACTUAL mapped bytes — which the
+/// full-or-retry install policy keeps equal to the configured bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxPoolStats {
+    pub total: usize,
+    pub available: usize,
+    pub in_use: usize,
+    pub dma_bytes: usize,
+    pub pool_empty_allocs: u64,
+}
+
+/// Snapshot the shared RX pool, or `None` while no pool is installed
+/// (construction not yet attempted, or every attempt so far fell short and
+/// rolled back — `pool_init_failures` counts those).
+pub fn rx_ingress_pool_stats() -> Option<RxPoolStats> {
     let pool = RX_INGRESS_POOL.get()?;
     // ONE `available` read keeps the (available, in_use) pair coherent
+    // (`BufPool::in_use` would re-take the lock and could tear the pair).
+    let available = pool.available();
+    Some(RxPoolStats {
+        total: pool.total(),
+        available,
+        in_use: pool.total() - available,
+        dma_bytes: pool.total() * DMA_PAGE_SIZE,
+        pool_empty_allocs: pool.pool_empty_allocs(),
+    })
+}
+
+/// Get-or-construct the shared RX pool, FULL-OR-RETRY (Codex round-22 R1):
+/// a construction attempt that cannot allocate every buffer is dropped whole
+/// (its pages free immediately), counted in `pool_init_failures`, and the
+/// next poll retries — the 10 ms background throttle is the natural bounded
+/// backoff, so no extra retry state exists. Only an exact-size pool is ever
+/// installed: sizing, tests, and the starvation bound all reason about ONE
+/// capacity, and an empty or partial pool is unrepresentable.
+///
 /// Caller MUST hold `RX_INGRESS_ACTIVE` — the non-reentrant drain guard
 /// doubles as the construction lock, so concurrent double-construction
 /// (and a racing double `call_once`) is structurally impossible.
+fn ensure_rx_ingress_pool() -> Option<&'static BufPool> {
     if let Some(pool) = RX_INGRESS_POOL.get() {
         return Some(pool);
     }
+    // `with_layout` directly, NOT `BufPool::new`: metadata allocation is
+    // fallible and `new()` would panic the drain site on heap pressure
+    // (round-23 finding 2). None (metadata OOM) and a DMA-page shortfall are
+    // the same outcome here: count, drop the candidate, retry next poll.
+    let candidate = BufPool::with_layout(
+        RX_BUF_POOL_SIZE,
+        crate::DEFAULT_MTU,
+        crate::DEFAULT_HEADROOM,
+        crate::DEFAULT_TAILROOM,
+    );
+    match candidate {
+        Some(candidate) if candidate.total() == RX_BUF_POOL_SIZE => {
             Some(RX_INGRESS_POOL.call_once(|| candidate))
         }
         _ => {
@@ -2684,6 +2772,12 @@ impl Drop for RxIngressQuiesceGuard {
 /// attribution; this comment is the tripwire.
 mod rx_auth {
     use crate::device::RxError;
+    use crate::{BufPool, NetBuf, NetDeviceHandle, MAX_NET_DEVICES};
+
+    /// Poll-scoped capability authorizing bounded frame ingestion from one
+    /// registered device. Deliberately NOT Clone/Copy and exposes no accessor
+    /// returning the raw handle — receive-capable handles can be neither
+    /// forged nor duplicated outside this module.
     pub(super) struct AuthorizedRxDevice {
         dev: NetDeviceHandle,
     }
@@ -2708,6 +2802,70 @@ mod rx_auth {
         /// tx_packets now advance on background polls; the enq_delta test
         /// invariant is signed exactly so completions may land between
         /// snapshots.
+        pub(super) fn service_completions(&self) {
+            let mut device = self.dev.lock();
+            let _ = device.poll();
+        }
+
+        /// Top the device up from the shared pool, in ONE device-lock section
+        /// so the owned/recycle reads and the posting are atomic against
+        /// every other stocker. The request is
+        /// `recycle_pending + (CAP - owned)`: reposting recycle-pending
+        /// buffers is OWNERSHIP-NEUTRAL (they merely move recycle -> posted),
+        /// so the cap still holds — owned' <= owned + (CAP - owned) = CAP —
+        /// while a capped device with a recycle backlog is still ASKED to
+        /// repost (round-23 finding 1: without that term it strands its
+        /// buffers until zero descriptors remain and RX goes inert). LOCK
+        /// ORDER: device mutex -> pool mutex (`replenish_rx` takes pool
+        /// locks under the device lock); the reverse order is forbidden
+        /// everywhere in the kernel.
+        pub(super) fn replenish_to_cap(&self, pool: &BufPool) -> ReplenishOutcome {
+            let mut device = self.dev.lock();
+            if !device.supports_rx_replenishment() {
+                return ReplenishOutcome::Unsupported;
+            }
+            let owned = device.rx_owned_rx_buffers();
+            let repost = device.rx_recycle_pending();
+            let requested = repost + super::RX_DEVICE_OUTSTANDING_CAP.saturating_sub(owned);
+            if requested == 0 {
+                return ReplenishOutcome::Attempted {
+                    requested: 0,
+                    posted: 0,
+                };
+            }
+            let posted = device.replenish_rx(pool, requested);
+            ReplenishOutcome::Attempted { requested, posted }
+        }
+    }
+
+    /// Outcome of one replenish pass (rounds 23-24: a supporting device's
+    /// shortfall must be COUNTED unambiguously — including the otherwise
+    /// silent first-stock failure where a descriptor-starved device posts
+    /// nothing, draws nothing from the pool, and reads `Ok(None)` on
+    /// receive. The explicit capability replaces the behavioral
+    /// participation heuristic, which hid exactly that case).
+    pub(super) enum ReplenishOutcome {
+        /// Device declared `supports_rx_replenishment() == false` — a
+        /// permanently-refusing test synthetic; no shortfall accounting.
+        Unsupported,
+        /// A supporting device was asked for `requested` postings and
+        /// delivered `posted`; `posted < requested` is a counted shortfall.
+        Attempted { requested: usize, posted: usize },
+    }
+
+    /// Resolve registered devices as poll-scoped RX capabilities from ONE
+    /// registry read section (released before any device mutex is taken).
+    ///
+    /// `filter: None` (production) enumerates ALL devices in registration
+    /// order — iterating every device rather than hardcoding "eth0" is what
+    /// lets synthetic devices gate the ingress tests, and is required anyway
+    /// once multiple devices exist. `filter: Some(names)` NARROWS the
+    /// capability set to the named devices, in the CALLER'S name order
+    /// (which therefore pins fairness quotas) — the deterministic-test aid
+    /// behind `rx_ingress_poll_filtered`; each name match takes one brief
+    /// per-device lock with no other lock held. Names should be distinct
+    /// (a duplicate would mint two capabilities to the same device and
+    /// double its quota); resolution is capped at `MAX_NET_DEVICES`.
     pub(super) fn resolve_rx_devices(
         filter: Option<&[&str]>,
     ) -> ([Option<AuthorizedRxDevice>; MAX_NET_DEVICES], usize) {
@@ -2776,6 +2934,17 @@ impl Drop for RxIngressGuard {
 /// (future) must capture config+cache together PER FRAME instead.
 ///
 /// Buffer lifecycle (round-22 R3): every received `NetBuf` takes ONE return
+/// path after `process_frame` — `BufPool::try_free` sends pool-origin
+/// buffers home (provenance verified against the pool's immutable phys-addr
+/// set, so the fixed pool can never drain OR absorb a foreign buffer) and
+/// hands foreign buffers (self-stocking synthetic devices) back for a normal
+/// drop. Either way the RX buffer is released BEFORE reply TX allocates its
+/// own, keeping the loop's peak DMA footprint at one frame. Completion
+/// servicing and replenish-to-cap run for EVERY device on EVERY poll —
+/// including empty, error, and budget-exhausted exits (round-20 step 4) —
+/// so external devices stay stocked: per device, service completions first
+/// (used-ring reap + TX reclaim, bounded by ring size), then the fair drain,
+/// then top back up to `RX_DEVICE_OUTSTANDING_CAP` from the shared pool
 /// (installed full-or-retry by `ensure_rx_ingress_pool`; a pool-less poll
 /// still drains self-stocking devices, only stocking is pool-gated).
 ///
@@ -2810,6 +2979,10 @@ pub fn rx_ingress_poll(now_ms: u64, budget: usize) -> usize {
 /// test that must count frames polls ONLY its own synthetic devices through
 /// this entry. Production paths use the unfiltered entries; narrowing grants
 /// nothing (a subset of the same poll-scoped capabilities).
+pub fn rx_ingress_poll_filtered(now_ms: u64, budget: usize, names: &[&str]) -> usize {
+    if budget == 0 || names.is_empty() {
+        return 0;
+    }
     if RX_INGRESS_ACTIVE
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -2871,6 +3044,23 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
         // completion reaping and the replenish below must reach EVERY device
         // on EVERY poll (round-20 step 4), or a budget-exhausting flood on
         // one device would starve the others' descriptor stocking.
+        dev.service_completions();
+        // Fair share for this device (see fn doc); devices_left >= 1.
+        let mut quota = if remaining == 0 {
+            0
+        } else {
+            remaining.div_ceil(device_count - index)
+        };
+        loop {
+            if quota == 0 {
+                break;
+            }
+            let buf = match dev.receive_one() {
+                Ok(Some(buf)) => buf,
+                // Err(NoPacket) is the "empty" convention for drivers that
+                // signal it as an error; neither is a device fault.
+                Ok(None) | Err(RxError::NoPacket) => break,
+                Err(_) => {
                     RX_INGRESS_STATS.rx_errors.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
@@ -2893,6 +3083,14 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
             // before reply TX allocates its own.
             match pool {
                 Some(pool) => {
+                    if let Err(foreign) = pool.try_free(buf) {
+                        drop(foreign);
+                    }
+                }
+                None => drop(buf),
+            }
+            if let ProcessResult::Reply(reply) = result {
+                if transmit_prepared_reply(reply, now_ms, stats).is_err() {
                     RX_INGRESS_STATS
                         .reply_tx_failures
                         .fetch_add(1, Ordering::Relaxed);
@@ -2904,6 +3102,10 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
         // devices' shortfalls are counted (rounds 23-24: including the
         // otherwise-silent first-stock failure).
         if let Some(pool) = pool {
+            if let rx_auth::ReplenishOutcome::Attempted { requested, posted } =
+                dev.replenish_to_cap(pool)
+            {
+                if posted < requested {
                     RX_INGRESS_STATS
                         .replenish_shortfalls
                         .fetch_add(1, Ordering::Relaxed);
@@ -3292,8 +3494,11 @@ mod tests {
         fn replenish_rx(&mut self, _pool: &crate::BufPool, _count: usize) -> usize {
             0
         }
-        fn rx_queue_depth(&self) -> usize {
+        fn rx_owned_rx_buffers(&self) -> usize {
             0
+        }
+        fn supports_rx_replenishment(&self) -> bool {
+            false
         }
         fn poll(&mut self) -> bool {
             false

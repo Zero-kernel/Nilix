@@ -840,8 +840,18 @@ impl NetDevice for VirtioNetDevice {
         posted
     }
 
-    fn rx_queue_depth(&self) -> usize {
+    fn rx_owned_rx_buffers(&self) -> usize {
+        // D3-NETNS-DATAPLANE RX-COMPLETION: owned = posted + completed-but-
+        // undelivered + recycle-pending. Counting only `rx_inflight` would let
+        // completions piling up in `rx_ready` read as zero depth and bypass
+        // the ingress loop's per-device pool cap (Codex round-21 finding 4).
         self.rx_inflight.iter().filter(|e| e.is_some()).count()
+            + self.rx_ready.len()
+            + self.rx_recycle.len()
+    }
+
+    fn rx_recycle_pending(&self) -> usize {
+        self.rx_recycle.len()
     }
 
     fn poll(&mut self) -> bool {

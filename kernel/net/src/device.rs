@@ -312,8 +312,46 @@ pub trait NetDevice: Send {
     /// Number of buffers successfully posted.
     fn replenish_rx(&mut self, pool: &BufPool, count: usize) -> usize;
 
-    /// Get the number of buffers currently posted to the RX queue.
-    fn rx_queue_depth(&self) -> usize;
+    /// D3-NETNS-DATAPLANE RX-COMPLETION invariant: the number of RX buffers
+    /// this device currently OWNS from the replenish pool's perspective —
+    /// posted descriptors PLUS completed-but-undelivered PLUS recycle-pending
+    /// buffers, and every other driver-internal queue that holds a buffer
+    /// obtained via `replenish_rx`.
+    ///
+    /// The ingress loop's per-device outstanding cap is computed as
+    /// `CAP - rx_owned_rx_buffers()`. Counting only posted descriptors is a
+    /// CAP BYPASS: completions accumulating in a ready queue would read as
+    /// zero depth and let the device absorb the shared pool far beyond its
+    /// cap (Codex round-21 finding 4).
+    fn rx_owned_rx_buffers(&self) -> usize;
+
+    /// Buffers waiting in a driver-internal recycle queue for reposting via
+    /// `replenish_rx` (a subset of [`Self::rx_owned_rx_buffers`]). Reposting
+    /// these is OWNERSHIP-NEUTRAL — the buffer merely moves recycle-pending
+    /// -> posted — so the ingress loop's replenish request is
+    /// `rx_recycle_pending() + (CAP - owned)`: without the first term, a
+    /// device at its cap with a growing recycle backlog would never be asked
+    /// to repost and could strand every buffer it owns, ending with ZERO
+    /// posted descriptors (Codex round-23 finding 1). Defaults to 0 for
+    /// drivers without a recycle queue.
+    fn rx_recycle_pending(&self) -> usize {
+        0
+    }
+
+    /// Whether this device participates in shared-pool RX stocking (its
+    /// `replenish_rx` genuinely attempts to post pool buffers). TELEMETRY
+    /// ROUTING ONLY (Codex round-24): the ingress loop counts replenish
+    /// shortfalls for participating devices — including the otherwise-silent
+    /// first-stock failure, where a descriptor-starved device posts nothing,
+    /// draws nothing from the pool, and reads `Ok(None)` on receive — and
+    /// skips permanently-refusing test synthetics. Misdeclaration cannot
+    /// corrupt state (unlike buffer provenance, which is VERIFIED at the
+    /// pool via `try_free`, never trusted from devices): a false `true`
+    /// inflates a counter; a false `false` hides that device's starvation
+    /// telemetry. Defaults to `true` — real drivers stock from the pool.
+    fn supports_rx_replenishment(&self) -> bool {
+        true
+    }
 
     // ========================================================================
     // Polling & Interrupt Handling

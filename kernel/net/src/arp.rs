@@ -405,6 +405,11 @@ impl ArpCache {
         });
     }
 
+    /// D3-NETNS-DATAPLANE RX-COMPLETION test seam: remove ONE dynamic entry
+    /// by IP. Static entries (the authoritative gateway seeds) are refused —
+    /// this cannot be used to displace a config-derived mapping. Returns
+    /// whether an entry was removed. Capacity charge is unaffected (this
+    /// cache charges capacity, not membership). Production motivation: the
     /// Check if an entry is expired.
     fn is_expired(&self, entry: &ArpEntry, now_ms: u64) -> bool {
         // Static entries never expire

@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 use core::slice;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
@@ -386,6 +387,18 @@ impl NetBuf {
 pub struct BufPool {
     /// Available buffers.
     buffers: Mutex<Vec<NetBuf>>,
+    /// D3-NETNS-DATAPLANE RX-COMPLETION provenance set: the DMA base physical
+    /// address of every buffer this pool constructed, sorted for binary
+    /// search. Built once at construction and immutable afterwards — pool
+    /// pages are owned for the pool's whole life (in the pool or loaned out),
+    /// so membership can never go stale, and `DmaBuffer` ownership guarantees
+    /// no two live `NetBuf`s share a base address. `try_free` uses this to
+    /// reject foreign buffers instead of silently absorbing them (which would
+    /// corrupt `in_use()` into a usize underflow).
+    home: Vec<u64>,
+    /// Failed `alloc()` calls that found the pool empty (exhaustion
+    /// telemetry, distinct from construction shortfall).
+    pool_empty_allocs: AtomicU64,
     /// MTU for buffers in this pool.
     mtu: usize,
     /// Headroom for buffers in this pool.
@@ -407,6 +420,13 @@ impl BufPool {
     ///
     /// A new buffer pool. If memory allocation fails for some buffers,
     /// the pool will contain fewer than `pool_size` buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if pool METADATA allocation fails (`with_layout` also returns
+    /// `None` for heap OOM, which this constructor cannot distinguish from a
+    /// bad layout). Fallible callers — the production RX path — must use
+    /// [`Self::with_layout`] directly.
     pub fn new(pool_size: usize) -> Self {
         // Default layout (64 + 1500 + 64 = 1628) always fits in a page
         Self::with_layout(pool_size, DEFAULT_MTU, DEFAULT_HEADROOM, DEFAULT_TAILROOM)
@@ -424,8 +444,14 @@ impl BufPool {
     ///
     /// # Returns
     ///
-    /// `None` if the layout exceeds page size. Otherwise returns the pool
-    /// (which may contain fewer buffers than requested if memory is low).
+    /// `None` if the layout exceeds page size OR if pool metadata (the
+    /// buffer/provenance vectors — bounded, ~70 bytes per slot) cannot be
+    /// allocated: metadata allocation is FALLIBLE (`try_reserve_exact`), so
+    /// a heap-pressure construction attempt fails cleanly instead of
+    /// panicking in the caller's context (Codex round-23 finding 2; the
+    /// production caller retries on its next poll). Otherwise returns the
+    /// pool, which may contain fewer DMA buffers than requested if physical
+    /// memory is low.
     pub fn with_layout(
         pool_size: usize,
         mtu: usize,
@@ -440,7 +466,10 @@ impl BufPool {
             return None;
         }
 
-        let mut buffers = Vec::with_capacity(pool_size);
+        let mut buffers: Vec<NetBuf> = Vec::new();
+        if buffers.try_reserve_exact(pool_size).is_err() {
+            return None;
+        }
         let mut allocated = 0;
 
         for _ in 0..pool_size {
@@ -465,8 +494,22 @@ impl BufPool {
             );
         }
 
+        // Provenance set (see the field doc): sorted base phys addrs.
+        // Fallible for the same reason as `buffers` above; the DMA pages in
+        // `buffers` free normally on this early return.
+        let mut home: Vec<u64> = Vec::new();
+        if home.try_reserve_exact(buffers.len()).is_err() {
+            return None;
+        }
+        for buf in &buffers {
+            home.push(buf.buffer_phys_addr().as_u64());
+        }
+        home.sort_unstable();
+
         Some(BufPool {
             buffers: Mutex::new(buffers),
+            home,
+            pool_empty_allocs: AtomicU64::new(0),
             mtu,
             headroom,
             tailroom,
@@ -478,9 +521,14 @@ impl BufPool {
     ///
     /// # Returns
     ///
-    /// `Some(NetBuf)` if a buffer is available, `None` if the pool is empty.
+    /// `Some(NetBuf)` if a buffer is available, `None` if the pool is empty
+    /// (counted in [`Self::pool_empty_allocs`]).
     pub fn alloc(&self) -> Option<NetBuf> {
-        self.buffers.lock().pop()
+        let buf = self.buffers.lock().pop();
+        if buf.is_none() {
+            self.pool_empty_allocs.fetch_add(1, Ordering::Relaxed);
+        }
+        buf
     }
 
     /// Return a buffer to the pool.
@@ -492,9 +540,39 @@ impl BufPool {
     /// just `alloc()`d, or came from a recycle queue that only ever holds
     /// previously-posted pool buffers). Callers that CANNOT prove origin
     /// (e.g. the RX ingress loop, which receives buffers from arbitrary
+    /// registered devices) MUST use [`Self::try_free`] instead — freeing a
+    /// foreign buffer here corrupts the `in_use()` ledger.
     pub fn free(&self, mut buf: NetBuf) {
         buf.reset();
         self.buffers.lock().push(buf);
+    }
+
+    /// Return a buffer to the pool ONLY if this pool constructed it
+    /// (provenance verified against the immutable `home` set).
+    ///
+    /// D3-NETNS-DATAPLANE RX-COMPLETION: the ingress loop routes EVERY
+    /// received buffer through this one call — pool-origin buffers go home
+    /// (closing the fixed pool's lifecycle so it can never drain), foreign
+    /// buffers (self-stocking synthetic devices) are handed back for a normal
+    /// drop. This is verification, not trust: no trait flag or per-device
+    /// declaration can corrupt the ledger (Codex round-21 finding 3).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the buffer belonged to this pool and was returned;
+    /// `Err(buf)` handing a foreign buffer back to the caller.
+    pub fn try_free(&self, buf: NetBuf) -> Result<(), NetBuf> {
+        let base = buf.buffer_phys_addr().as_u64();
+        if self.home.binary_search(&base).is_err() {
+            return Err(buf);
+        }
+        self.free(buf);
+        Ok(())
+    }
+
+    /// Failed `alloc()` calls that found the pool empty.
+    pub fn pool_empty_allocs(&self) -> u64 {
+        self.pool_empty_allocs.load(Ordering::Relaxed)
     }
 
     /// Returns the number of buffers currently available in the pool.
