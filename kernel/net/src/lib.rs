@@ -140,9 +140,7 @@ pub use socket::{
     WaitQueueArc,
 };
 pub use stack::{
-    handle_timer_tick, network_config, process_frame, transmit_prepared_reply,
-    transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram, DropReason,
-    NetConfigSnapshot, NetStats, PreparedReply, PreparedReplyTxError, ProcessResult,
+    handle_timer_tick, network_config, next_hop, prepare_arp_probe, process_frame,
     quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters, rx_ingress_net_stats,
     rx_ingress_poll, rx_ingress_poll_filtered, rx_ingress_poll_throttled, rx_ingress_pool_stats,
     transmit_prepared_reply, transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram,

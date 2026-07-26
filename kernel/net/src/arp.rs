@@ -87,6 +87,24 @@ pub const DEFAULT_TX_RATE_PPS: u64 = 20;
 /// Default ARP TX burst capacity
 pub const DEFAULT_TX_BURST: u64 = 40;
 
+/// D3 ARP-PROBE: probe-throttle ring size — how many distinct unresolved
+/// on-link IPs one cache tracks for per-IP probe suppression. Heap-free by
+/// design (inline array); working sets beyond this let a hot IP re-claim
+/// early through oldest-replacement, and the probe token buckets remain the
+/// hard bound.
+pub const ARP_PROBE_RING_SIZE: usize = 8;
+
+/// D3 ARP-PROBE: minimum spacing between admitted probes for the SAME IP
+/// (per cache). RFC 1122 §2.3.2.1-flavored 1 s retransmission spacing.
+pub const ARP_PROBE_INTERVAL_MS: u64 = 1_000;
+
+/// D3 ARP-PROBE: per-cache probe admission rate (packets per second).
+/// Deliberately BELOW the reply TX rate — probes are speculative traffic.
+pub const DEFAULT_PROBE_RATE_PPS: u64 = 8;
+
+/// D3 ARP-PROBE: per-cache probe admission burst capacity.
+pub const DEFAULT_PROBE_BURST: u64 = 8;
+
 // ============================================================================
 // ARP Operation Code
 // ============================================================================
@@ -195,6 +213,32 @@ pub struct ArpEntry {
 // ARP Cache
 // ============================================================================
 
+/// D3 ARP-PROBE: one probe-throttle ring slot — the last time this cache
+/// ADMITTED a probe claim for `ip`. Claims are retained even when a token
+/// bucket later denies or the motivating data TX fails: conservative
+/// fail-closed throttling (Codex round-26 Q1 — the ring meters admission
+/// attempts, never confirmed transmissions).
+#[derive(Debug, Clone, Copy)]
+struct ProbeSlot {
+    ip: Ipv4Addr,
+    last_probe_ms: u64,
+}
+
+/// D3 ARP-PROBE: outcome of [`ArpCache::admit_probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAdmission {
+    /// Ring claim and per-cache probe bucket both passed — the caller may
+    /// emit ONE probe intent for this IP.
+    Admitted,
+    /// A claim for this IP is younger than [`ARP_PROBE_INTERVAL_MS`], or
+    /// the clock regressed below the recorded claim (conservative
+    /// suppress — a rewound clock must throttle harder, never spam).
+    DuplicateSuppressed,
+    /// The ring claim succeeded but the per-cache probe bucket denied. The
+    /// claim is RETAINED — this IP re-attempts only after the interval.
+    RateLimited,
+}
+
 /// ARP cache with anti-spoofing protection
 ///
 /// # Security Features
@@ -219,7 +263,20 @@ pub struct ArpCache {
     /// D3 NETNS-ROUTING: count of on-link destinations resolved to the
     /// GATEWAY MAC because no neighbor entry existed — the explicitly
     /// temporary compatibility fallback. ARP request-TX v1 REDUCES this
+    /// debt (a probe follows the miss, so later sends hit the learned
+    /// entry); only the pending-frame queue (v2) retires fallback delivery
+    /// itself. Still measurable per namespace.
     neighbor_fallbacks: u64,
+    /// D3 ARP-PROBE: per-IP probe suppression ring (heap-free, inline).
+    /// Claimed under this cache's own mutex by the TX resolver's on-link
+    /// miss arm — see [`Self::admit_probe`].
+    probe_ring: [Option<ProbeSlot>; ARP_PROBE_RING_SIZE],
+    /// D3 ARP-PROBE: per-cache probe rate limiter — per-namespace isolation
+    /// (Codex round-26 D3: a global-only bucket would let one namespace's
+    /// unresolved fan-out starve every other namespace's probes). The
+    /// global [`ARP_PROBE_RATE_LIMITER`] backstops the AGGREGATE behind it,
+    /// mirroring the established RX/TX dual-limiter pattern.
+    probe_rate_limiter: TokenBucket,
 }
 
 impl ArpCache {
@@ -247,6 +304,8 @@ impl ArpCache {
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
             neighbor_fallbacks: 0,
+            probe_ring: [None; ARP_PROBE_RING_SIZE],
+            probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
         }
     }
 
@@ -279,6 +338,11 @@ impl ArpCache {
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
             neighbor_fallbacks: 0,
+            probe_ring: [None; ARP_PROBE_RING_SIZE],
+            probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
+        }
+    }
+
     /// Look up a MAC address for the given IP.
     ///
     /// Returns `None` if not found or expired.
@@ -410,6 +474,15 @@ impl ArpCache {
     /// this cannot be used to displace a config-derived mapping. Returns
     /// whether an entry was removed. Capacity charge is unaffected (this
     /// cache charges capacity, not membership). Production motivation: the
+    /// SLIRP round-trip boot test must un-learn its probe target so a suite
+    /// re-run in the same boot sees a virgin cache.
+    pub fn remove_dynamic(&mut self, ip: Ipv4Addr) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.ip == ip && e.kind == ArpEntryKind::Dynamic));
+        self.entries.len() != before
+    }
+
     /// Check if an entry is expired.
     fn is_expired(&self, entry: &ArpEntry, now_ms: u64) -> bool {
         // Static entries never expire
@@ -445,6 +518,73 @@ impl ArpCache {
     /// by the TX resolver under this cache's own mutex.
     pub(crate) fn count_neighbor_fallback(&mut self) {
         self.neighbor_fallbacks = self.neighbor_fallbacks.saturating_add(1);
+    }
+
+    /// D3 ARP-PROBE: claim a probe slot for `ip` and admit the claim
+    /// against the per-cache probe bucket. Called by the TX resolver under
+    /// this cache's own mutex, on the on-link-miss fallback arm only (a
+    /// cache HIT never probes; off-link destinations resolve through the
+    /// gateway and are never probed).
+    ///
+    /// Ring semantics (heap-free, deterministic):
+    /// - An existing claim for `ip` suppresses re-claims until
+    ///   [`ARP_PROBE_INTERVAL_MS`] has elapsed; a REGRESSED clock
+    ///   (`now_ms < last_probe_ms`) also suppresses — fail-closed, the
+    ///   same direction as [`TokenBucket`]'s monotonic guard.
+    /// - A new IP takes the first vacant slot, else REPLACES the slot with
+    ///   the minimum `last_probe_ms` (FIRST minimum on ties —
+    ///   deterministic, Codex round-26 D2). Working sets larger than the
+    ///   ring degrade per-IP spacing through eviction; the token buckets
+    ///   stay the hard bound.
+    /// - Claims are retained on bucket denial AND when the motivating data
+    ///   TX later fails: the bucket meters admitted intents, not confirmed
+    ///   transmissions (Codex round-26 Q1).
+    ///
+    /// # Clock domain
+    ///
+    /// On SHARED caches (per-namespace or the pre-registration global)
+    /// this must only ever be fed the real kernel clock: the bucket is
+    /// monotonic fail-closed, so one fake-clock call would deny every
+    /// later real-clock admission. Fixed-clock tests use standalone
+    /// instances.
+    pub fn admit_probe(&mut self, ip: Ipv4Addr, now_ms: u64) -> ProbeAdmission {
+        if let Some(slot) = self
+            .probe_ring
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.ip == ip)
+        {
+            if now_ms < slot.last_probe_ms || now_ms - slot.last_probe_ms < ARP_PROBE_INTERVAL_MS {
+                return ProbeAdmission::DuplicateSuppressed;
+            }
+            slot.last_probe_ms = now_ms;
+        } else {
+            let target = match self.probe_ring.iter().position(Option::is_none) {
+                Some(vacant) => vacant,
+                None => {
+                    // Full ring: replace the oldest claim (first minimum).
+                    let mut oldest = 0;
+                    let mut oldest_ms = u64::MAX;
+                    for (index, slot) in self.probe_ring.iter().enumerate() {
+                        if let Some(slot) = slot {
+                            if slot.last_probe_ms < oldest_ms {
+                                oldest_ms = slot.last_probe_ms;
+                                oldest = index;
+                            }
+                        }
+                    }
+                    oldest
+                }
+            };
+            self.probe_ring[target] = Some(ProbeSlot {
+                ip,
+                last_probe_ms: now_ms,
+            });
+        }
+        if !self.probe_rate_limiter.allow(now_ms) {
+            return ProbeAdmission::RateLimited;
+        }
+        ProbeAdmission::Admitted
     }
 
     /// Clear all dynamic entries.
@@ -535,6 +675,16 @@ pub struct ArpStats {
     pub cache_hits: AtomicU64,
     /// Cache misses
     pub cache_misses: AtomicU64,
+    /// D3 ARP-PROBE: probe requests actually accepted by the TX queue.
+    pub probes_sent: AtomicU64,
+    /// D3 ARP-PROBE: admitted probe intents that failed to build or
+    /// enqueue (best-effort v1 drops them — no pending queue).
+    pub probe_tx_failures: AtomicU64,
+    /// D3 ARP-PROBE: probe claims denied by a probe token bucket
+    /// (per-cache or the global aggregate backstop).
+    pub probe_rate_limited: AtomicU64,
+    /// D3 ARP-PROBE: probe claims suppressed by the per-IP interval ring.
+    pub probe_duplicate_suppressed: AtomicU64,
 }
 
 impl ArpStats {
@@ -549,6 +699,10 @@ impl ArpStats {
             cache_conflicts: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            probes_sent: AtomicU64::new(0),
+            probe_tx_failures: AtomicU64::new(0),
+            probe_rate_limited: AtomicU64::new(0),
+            probe_duplicate_suppressed: AtomicU64::new(0),
         }
     }
 
@@ -595,6 +749,27 @@ impl ArpStats {
     #[inline]
     pub fn inc_cache_misses(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_probes_sent(&self) {
+        self.probes_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_probe_tx_failures(&self) {
+        self.probe_tx_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_probe_rate_limited(&self) {
+        self.probe_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_probe_duplicate_suppressed(&self) {
+        self.probe_duplicate_suppressed
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -812,6 +987,18 @@ pub static ARP_RX_RATE_LIMITER: TokenBucket =
 /// Global ARP rate limiter for TX replies.
 pub static ARP_TX_RATE_LIMITER: TokenBucket =
     TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST);
+
+/// D3 ARP-PROBE: global AGGREGATE probe backstop across every cache —
+/// bounds total ARP-request wire load as namespace counts grow (round-20:
+/// the separate probe bucket is the aggregate hard bound). Sits BEHIND
+/// each cache's own `probe_rate_limiter` and is drawn ONLY at EMISSION,
+/// after the motivating data frame passed the ownership-gated TX queue
+/// (Codex round-27 F3: an admission-time draw would let one gated-out
+/// namespace pin the shared bucket at empty — per-cache rate equals the
+/// global refill rate). Real-clock only — see `ArpCache::admit_probe`
+/// clock-domain note.
+pub static ARP_PROBE_RATE_LIMITER: TokenBucket =
+    TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST);
 
 // ============================================================================
 // ARP Processing Result
