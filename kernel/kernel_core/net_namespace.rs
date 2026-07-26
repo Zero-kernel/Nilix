@@ -662,7 +662,12 @@ impl NetNamespace {
         // may re-seed the old gateway mapping after this flush — that is
         // self-healing, not persistent: every send re-asserts its own
         // snapshot's gateway via ArpCache::seed_static_gateway (round-10).
-        self.arp_cache.lock().clear_all();
+        // D3 PENDING-FRAME v2: parked frames embed the old identity — the
+        // flush RETURNS them and their heap-releasing drop runs strictly
+        // after the cache mutex (the guard is a temporary that ends with
+        // the statement).
+        let flushed = self.arp_cache.lock().clear_all();
+        drop(flushed);
         Ok(())
     }
 }
