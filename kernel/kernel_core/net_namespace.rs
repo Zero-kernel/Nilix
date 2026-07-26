@@ -190,6 +190,7 @@ static NEXT_NET_NS_ID: AtomicU64 = AtomicU64::new(1);
 /// - Socket bindings (same port can be used in different namespaces)
 /// - Firewall rules
 /// - D3-NETNS-DATAPLANE: Per-namespace ARP cache
+/// D3 NETNS-SUBBUDGET-1: per-namespace byte ceiling for dataplane CONFIG
 /// state charged to `HeapClass::NetnsConfig`.
 ///
 /// Sizing: the only consumer today is the per-ns ARP cache (256 entries of
@@ -199,6 +200,8 @@ static NEXT_NET_NS_ID: AtomicU64 = AtomicU64::new(1);
 /// ~70% slack for entry-layout drift. The limit is a CEILING, not an
 /// entitlement — the shared 512 KiB class can exhaust first (by design:
 /// budgets bound per-ns blast radius, they do not guarantee availability).
+pub const NETNS_CONFIG_BUDGET_BYTES: usize = 16 * 1024;
+
 pub struct NetNamespace {
     /// Unique namespace identifier
     id: NamespaceId,
@@ -231,10 +234,15 @@ pub struct NetNamespace {
     /// TX ownership gate restricts traffic to the root namespace.
     arp_cache: Arc<Mutex<ArpCache>>,
 
+    /// D3 NETNS-SUBBUDGET-1: this namespace's config byte budget, shared as
+    /// a capability — every allocation-owning object charged against it
     /// (today: `arp_cache`'s entry storage) holds an `Arc` clone and takes a
     /// dual lease (shared class + this budget) on growth. Root is NOT
     /// exempt. `Drop` closes it to NEW leases; usage is never zeroed —
     /// orphaned allocations release when they really drop.
+    config_budget: Arc<mm::NsByteBudget>,
+
+    /// `config_budget` interaction.
 }
 
 impl fmt::Debug for NetNamespace {
@@ -251,6 +259,9 @@ impl fmt::Debug for NetNamespace {
 impl NetNamespace {
     /// Create the root network namespace.
     fn new_root() -> Self {
+        // D3 NETNS-SUBBUDGET-1: root gets the same ceiling as children —
+        // no exemption, so a root-ns dataplane leak is bounded identically.
+        let config_budget = Arc::new(mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES));
         Self {
             id: NamespaceId::new(0),
             parent: None,
@@ -261,7 +272,11 @@ impl NetNamespace {
             // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry
             // storage dual-leased against the NetnsConfig class ceiling AND
             // this namespace's config budget.
+            arp_cache: Arc::new(Mutex::new(ArpCache::with_defaults_budgeted(
                 mm::HeapClass::NetnsConfig,
+                Arc::clone(&config_budget),
+            ))),
+            config_budget,
         }
     }
 
@@ -292,6 +307,9 @@ impl NetNamespace {
                 NetNsError::NamespaceIdOverflow
             })?;
 
+        // D3 NETNS-SUBBUDGET-1: per-child config budget, created before the
+        // child so the cache can hold its clone from birth.
+        let config_budget = Arc::new(mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES));
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
@@ -302,7 +320,11 @@ impl NetNamespace {
             // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry
             // storage dual-leased against the NetnsConfig class ceiling AND
             // this namespace's config budget.
+            arp_cache: Arc::new(Mutex::new(ArpCache::with_defaults_budgeted(
                 mm::HeapClass::NetnsConfig,
+                Arc::clone(&config_budget),
+            ))),
+            config_budget,
         });
 
         // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
@@ -417,6 +439,24 @@ impl NetNamespace {
     #[inline]
     pub fn arp_cache(&self) -> Arc<Mutex<ArpCache>> {
         Arc::clone(&self.arp_cache)
+    }
+
+    /// D3 NETNS-SUBBUDGET-1: shared handle to this namespace's config byte
+    /// budget. Same capability the namespace's own consumers hold — used
+    /// for observability (`snapshot`) and by future budgeted config state
+    /// (routing tables, firewall stores). Holding it across namespace
+    /// destruction is safe: `Drop` only closes the budget to NEW leases.
+    ///
+    /// CAPABILITY CONTRACT (round-6 review): the returned `Arc` carries
+    /// accounting authority (`try_lease`) and close authority (`close`).
+    /// Kernel-internal only — never derivable from a user-controlled
+    /// surface. Pass it ONLY to consumers owned by THIS namespace; charging
+    /// another namespace's state against it mis-attributes consumption
+    /// (accounting confusion / per-ns DoS) even though neither ledger can
+    /// be corrupted and the shared class ceiling still binds.
+    #[inline]
+    pub fn config_budget(&self) -> Arc<mm::NsByteBudget> {
+        Arc::clone(&self.config_budget)
     }
 
 }
@@ -586,6 +626,14 @@ pub fn move_device(
 /// R76-2 FIX: Decrement global namespace counter when namespace is destroyed.
 impl Drop for NetNamespace {
     fn drop(&mut self) {
+        // D3 NETNS-SUBBUDGET-1: a dying namespace stops admitting config
+        // bytes immediately. close() only blocks NEW leases — outstanding
+        // ones (e.g. an ARP cache Arc still held by an in-flight RX path)
+        // release when their allocations really drop, so usage stays
+        // truthful and the class ledger never double-releases. Lock-free
+        // atomic store: safe in this arbitrary drop context. (Root is
+        // immortal — a static Arc — so this fires for children only.)
+        self.config_budget.close();
         if self.level > 0 {
             // D1-ISO-NETNS-DATAPLANE FIX: remove the id -> namespace row so the
             // registry tracks live namespaces only. A stale Weak would upgrade

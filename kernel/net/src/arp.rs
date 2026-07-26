@@ -36,11 +36,13 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::sync::Arc;
+
 use crate::admitted::{AdmittedVec, WirePacket};
 use crate::ethernet::{build_ethernet_frame, EthAddr, ETHERTYPE_ARP};
 use crate::icmp::TokenBucket;
 use crate::ipv4::Ipv4Addr;
-use mm::HeapClass;
+use mm::{HeapClass, NsByteBudget};
 
 // ============================================================================
 // ARP Constants (RFC 826)
@@ -254,6 +256,23 @@ impl ArpCache {
         Self::new_in_class(DEFAULT_CACHE_TTL_MS, DEFAULT_CACHE_MAX_ENTRIES, class)
     }
 
+    /// D3 NETNS-SUBBUDGET-1: Default-sized cache whose entry storage takes
+    /// a dual lease on every growth — the shared `class` ceiling AND the
+    /// owning namespace's byte budget. Either rejection surfaces to callers
+    /// as `ArpError::NoMemory`; the budget limit is a ceiling, not an
+    /// entitlement (class exhaustion can reject below the owner's limit).
+    ///
+    /// CALLER CONTRACT: `budget` MUST be the config budget of the namespace
+    /// that OWNS this cache. A foreign budget keeps both ledgers internally
+    /// balanced but attributes consumption to the wrong namespace
+    /// (accounting confusion / cross-ns DoS).
+    pub fn with_defaults_budgeted(class: HeapClass, budget: Arc<NsByteBudget>) -> Self {
+        ArpCache {
+            entries: AdmittedVec::with_ns_budget(class, budget),
+            ttl_ms: DEFAULT_CACHE_TTL_MS,
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+            rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
+            tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
     /// Look up a MAC address for the given IP.
     ///
     /// Returns `None` if not found or expired.

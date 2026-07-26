@@ -7,6 +7,7 @@
 //! replace the live backing without another allocation.  The old allocation
 //! is destroyed before its lifetime charge is released.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 #[cfg(test)]
@@ -19,6 +20,7 @@ extern crate std;
 use mm::fallible_map::{FallibleOrderedMap, PreparedOrderedMapBacking};
 use mm::{
     try_reserve_heap, vec_charge_bytes, HeapAdmissionError, HeapCharge, HeapClass, HeapReservation,
+    NsBudgetLease, NsByteBudget,
 };
 
 /// Allocation/admission failure for retained socket containers.
@@ -297,9 +299,15 @@ fn capacity_plan(
 /// Detached aggregate-admitted `Vec` capacity. Allocation and ledger
 /// reservation happen before the live owner is borrowed; installation only
 /// moves elements and swaps already-owned backing.
+///
+/// D3 NETNS-SUBBUDGET-1: when the owning [`AdmittedVec`] carries a per-owner
+/// [`NsByteBudget`], the matching [`NsBudgetLease`] is attached here BEFORE
+/// installation, so a rejected lease drops the whole prepared object and its
+/// class reservation rolls back with it (failure-atomic dual admission).
 pub(crate) struct PreparedAdmittedVecCapacity<T> {
     values: Vec<T>,
     reservation: HeapReservation,
+    ns_lease: Option<NsBudgetLease>,
 }
 
 /// Obsolete `Vec` backing and its matching charge. Callers that install under a
@@ -308,6 +316,7 @@ pub(crate) struct PreparedAdmittedVecCapacity<T> {
 pub(crate) struct RetiredAdmittedVecCapacity<T> {
     _values: Vec<T>,
     _charge: Option<HeapCharge>,
+    _ns_lease: Option<NsBudgetLease>,
 }
 
 impl<T> PreparedAdmittedVecCapacity<T> {
@@ -331,7 +340,20 @@ impl<T> PreparedAdmittedVecCapacity<T> {
         Ok(Self {
             values,
             reservation,
+            ns_lease: None,
         })
+    }
+
+    /// D3 NETNS-SUBBUDGET-1: attach the per-owner lease mirroring this
+    /// prepared backing's class reservation. Must cover exactly
+    /// `self.reservation.bytes()`; installation rejects a budgeted owner
+    /// whose prepared capacity arrives without a lease.
+    pub(crate) fn attach_ns_lease(&mut self, lease: NsBudgetLease) {
+        debug_assert!(
+            self.ns_lease.is_none(),
+            "prepared admitted Vec capacity double-leased"
+        );
+        self.ns_lease = Some(lease);
     }
 }
 
@@ -378,13 +400,19 @@ impl<K: Ord, V> PreparedAdmittedMapCapacity<K, V> {
 
 /// A retained `Vec` whose backing allocation owns a whole-heap charge.
 ///
-/// `values` is deliberately declared before `charge`: Rust drops fields in
-/// declaration order, so the allocator backing is gone before the ledger
-/// releases its bytes on final destruction.
+/// `values` is deliberately declared before `charge` and `ns_lease`: Rust
+/// drops fields in declaration order, so the allocator backing is gone before
+/// either ledger (class charge, per-owner budget lease) releases its bytes on
+/// final destruction.
 pub struct AdmittedVec<T> {
     values: Vec<T>,
     charge: Option<HeapCharge>,
     class: HeapClass,
+    /// D3 NETNS-SUBBUDGET-1: optional per-owner byte budget. When present,
+    /// every growth takes a dual lease (class reservation + owner budget)
+    /// and the live backing keeps the lease in `ns_lease`.
+    budget: Option<Arc<NsByteBudget>>,
+    ns_lease: Option<NsBudgetLease>,
     #[cfg(test)]
     fail_next_growth: bool,
 }
@@ -395,6 +423,24 @@ impl<T> AdmittedVec<T> {
             values: Vec::new(),
             charge: None,
             class,
+            budget: None,
+            ns_lease: None,
+            #[cfg(test)]
+            fail_next_growth: false,
+        }
+    }
+
+    /// D3 NETNS-SUBBUDGET-1: a Vec whose growth charges BOTH the shared
+    /// class ledger and the given per-owner byte budget. The budget limit is
+    /// a ceiling, not an entitlement — class exhaustion can still reject
+    /// growth below the owner's limit.
+    pub(crate) fn with_ns_budget(class: HeapClass, budget: Arc<NsByteBudget>) -> Self {
+        Self {
+            values: Vec::new(),
+            charge: None,
+            class,
+            budget: Some(budget),
+            ns_lease: None,
             #[cfg(test)]
             fail_next_growth: false,
         }
@@ -434,8 +480,13 @@ impl<T> AdmittedVec<T> {
         &mut self,
         mut prepared: PreparedAdmittedVecCapacity<T>,
     ) -> Result<RetiredAdmittedVecCapacity<T>, PreparedAdmittedVecCapacity<T>> {
+        // D3 NETNS-SUBBUDGET-1: a budgeted owner only accepts backing that
+        // carries its matching lease, and an unbudgeted owner never accepts
+        // a leased one — either mismatch means the dual accounting would
+        // diverge, so refuse the install (fail-closed).
         if prepared.values.capacity() < self.values.len()
             || prepared.reservation.class() != self.class
+            || self.budget.is_some() != prepared.ns_lease.is_some()
         {
             return Err(prepared);
         }
@@ -449,9 +500,14 @@ impl<T> AdmittedVec<T> {
         }
         self.values = prepared.values;
         let old_charge = self.charge.replace(replacement_charge);
+        // The retiring lease must outlive the retiring backing exactly like
+        // the retiring class charge does: both ride in the Retired owner and
+        // release together once every relevant lock/IRQ guard is gone.
+        let old_ns_lease = core::mem::replace(&mut self.ns_lease, prepared.ns_lease.take());
         Ok(RetiredAdmittedVecCapacity {
             _values: old_values,
             _charge: old_charge,
+            _ns_lease: old_ns_lease,
         })
     }
 
@@ -493,7 +549,27 @@ impl<T> AdmittedVec<T> {
         let Some(plan) = self.capacity_plan_for(additional)? else {
             return Ok(());
         };
-        let prepared = PreparedAdmittedVecCapacity::try_from_plan(plan)?;
+        let mut prepared = PreparedAdmittedVecCapacity::try_from_plan(plan)?;
+        if let Some(budget) = &self.budget {
+            // D3 NETNS-SUBBUDGET-1: dual lease — the per-owner budget
+            // mirrors the class reservation byte-for-byte. On rejection
+            // `prepared` drops here and its reservation Drop rolls the class
+            // ledger back, so neither ledger retains a phantom charge
+            // (failure-atomic). Realloc peak (old charge + new reservation
+            // coexisting until the Retired owner drops) is charged to the
+            // budget the same way it is to the class.
+            //
+            // Deliberate fail-closed asymmetry (round-6 review): the class
+            // path retries at plan.required() when preferred fails, but a
+            // budget rejection of the realized (preferred) capacity is NOT
+            // retried at required — growth near the budget edge rejects
+            // slightly early rather than adding a second lease path. This
+            // only ever rejects MORE, never over-admits.
+            let lease = budget
+                .try_lease(prepared.reservation.bytes())
+                .map_err(|_| AdmittedAllocError::NoMemory)?;
+            prepared.attach_ns_lease(lease);
+        }
         match self.install_prepared_deferred(prepared) {
             Ok(retired) => {
                 drop(retired);

@@ -1016,6 +1016,183 @@ pub fn run_heap_admission_boundary_self_test() {
     );
 }
 
+// ============================================================================
+// D3 NETNS-SUBBUDGET-1: per-owner byte sub-budget within a heap class
+// ============================================================================
+
+/// Error surface of [`NsByteBudget::try_lease`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NsBudgetError {
+    /// The owning object (e.g. a network namespace) was destroyed; the
+    /// budget accepts no NEW reservations. Existing leases stay charged
+    /// until their allocations actually drop.
+    Closed,
+    /// The lease would exceed the budget's limit (fail-closed).
+    QuotaExceeded,
+    /// Arithmetic overflow computing the new usage (fail-closed).
+    ArithmeticOverflow,
+}
+
+/// Observability snapshot of one [`NsByteBudget`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NsBudgetSnapshot {
+    pub limit_bytes: usize,
+    pub used_bytes: usize,
+    /// Count of lease attempts rejected for `QuotaExceeded`/`Closed` —
+    /// distinguishes per-owner quota rejection from class/global rejection
+    /// even when the caller's public error collapses both to "no memory".
+    pub rejected: u64,
+    pub closed: bool,
+}
+
+/// D3 NETNS-SUBBUDGET-1: a shared per-owner byte budget layered UNDER a
+/// [`HeapClass`] ceiling.
+///
+/// One owner (today: a network namespace) allocates a budget and hands
+/// `Arc` clones to every allocation-owning object charged against it
+/// (today: its per-ns `ArpCache`; later: routing tables, firewall stores).
+/// Consumers take [`NsBudgetLease`]s that mirror their class charge 1:1 and
+/// attach the lease to the allocation itself, so the final free releases
+/// budget and class accounting exactly once and in the same place.
+///
+/// SEMANTICS (aligned 2026-07-25, Codex round-5):
+/// - The limit is a CEILING, not an entitlement: budgets over-commit the
+///   shared class, so hitting the class ceiling can still reject a lease-
+///   holder's growth. Availability guarantees are explicitly out of scope.
+/// - `close()` (owner teardown) only blocks NEW leases. It never zeroes
+///   usage: orphaned allocations release on their real drop.
+/// - Lock-free CAS; callable from any context; no ordering interaction with
+///   the class ledger (the class keeps its own atomics).
+pub struct NsByteBudget {
+    limit_bytes: usize,
+    used_bytes: AtomicU64,
+    rejected: AtomicU64,
+    closed: AtomicBool,
+}
+
+impl NsByteBudget {
+    pub const fn new(limit_bytes: usize) -> Self {
+        Self {
+            limit_bytes,
+            used_bytes: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Reserve `bytes` against this budget, returning an RAII lease that
+    /// releases them on drop. A zero-byte lease succeeds on an OPEN budget
+    /// and is a pure no-op (its drop releases nothing); a closed budget
+    /// rejects even zero-byte leases, so "no lease after close" holds
+    /// unconditionally (round-6 review fix).
+    pub fn try_lease(
+        self: &alloc::sync::Arc<Self>,
+        bytes: usize,
+    ) -> Result<NsBudgetLease, NsBudgetError> {
+        // Closed check FIRST — before the zero-byte fast path — so teardown
+        // observability can rely on a closed budget admitting NOTHING new.
+        if self.closed.load(Ordering::Acquire) {
+            self.rejected.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (saturation-free telemetry counter)
+            return Err(NsBudgetError::Closed);
+        }
+        if bytes == 0 {
+            return Ok(NsBudgetLease {
+                budget: alloc::sync::Arc::clone(self),
+                bytes: 0,
+            });
+        }
+        let bytes_u64 = bytes as u64;
+        let limit = self.limit_bytes as u64;
+        let mut current = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = match current.checked_add(bytes_u64) {
+                Some(next) => next,
+                None => {
+                    self.rejected.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (telemetry)
+                    return Err(NsBudgetError::ArithmeticOverflow);
+                }
+            };
+            if next > limit {
+                self.rejected.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (telemetry)
+                return Err(NsBudgetError::QuotaExceeded);
+            }
+            match self.used_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(NsBudgetLease {
+                        budget: alloc::sync::Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Owner teardown: refuse all NEW leases from now on. Usage is NOT
+    /// zeroed — outstanding leases release when their allocations drop.
+    ///
+    /// AUTHORITY: by contract only the budget's OWNER (the object whose
+    /// teardown this represents, e.g. `NetNamespace::drop`) may call this.
+    /// Any `Arc` holder CAN reach it — misuse denies config growth for the
+    /// owner's domain (accounting DoS) but can never corrupt either ledger.
+    ///
+    /// NOT a linearizable seal: a `try_lease` that passed its closed check
+    /// concurrently with this store may still succeed. close() blocks
+    /// leases that BEGIN admission after it; it does not guarantee usage
+    /// never rises after close() returns. The eventual bound is unchanged
+    /// (every lease still releases on its allocation's real drop).
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub fn snapshot(&self) -> NsBudgetSnapshot {
+        NsBudgetSnapshot {
+            limit_bytes: self.limit_bytes,
+            used_bytes: self.used_bytes.load(Ordering::Acquire) as usize,
+            rejected: self.rejected.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Acquire),
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let prev = self.used_bytes.fetch_sub(bytes as u64, Ordering::AcqRel);
+        assert!(
+            prev >= bytes as u64,
+            "ns byte-budget accounting corrupt: release {bytes} exceeds usage {prev}"
+        );
+    }
+}
+
+/// RAII lease on an [`NsByteBudget`]. Attach it to the allocation whose
+/// bytes it mirrors (next to the allocation's `HeapCharge`) so both ledgers
+/// release exactly once, when the allocation truly drops.
+#[must_use = "an NsBudgetLease must live exactly as long as the allocation it charges"]
+pub struct NsBudgetLease {
+    budget: alloc::sync::Arc<NsByteBudget>,
+    bytes: usize,
+}
+
+impl NsBudgetLease {
+    #[inline]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for NsBudgetLease {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

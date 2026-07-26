@@ -45,8 +45,9 @@ pub use heap_admission::{
     run_heap_admission_self_test, snapshot as heap_admission_snapshot,
     try_reserve as try_reserve_heap, vec_charge_bytes, vec_growth_charge_bytes, CoexistenceVerdict,
     HeapAdmissionError, HeapAdmissionSnapshot, HeapCharge, HeapClass, HeapReservation,
-    ADMITTED_HEAP_BYTES, BOOT_PEAK_USED_MAX_BYTES, BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES,
-    HEAP_CLASS_COUNT, LARGEST_SINGLE_ALLOCATION_BYTES, NORMAL_UNADMITTED_RESERVE_BYTES,
+    NsBudgetError, NsBudgetLease, NsBudgetSnapshot, NsByteBudget, ADMITTED_HEAP_BYTES,
+    BOOT_PEAK_USED_MAX_BYTES, BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES, HEAP_CLASS_COUNT,
+    LARGEST_SINGLE_ALLOCATION_BYTES, NORMAL_UNADMITTED_RESERVE_BYTES,
     REGISTERED_FIXED_RESERVE_BYTES,
 };
 pub use heap_budget::{
