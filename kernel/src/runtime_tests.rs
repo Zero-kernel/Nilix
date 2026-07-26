@@ -6506,6 +6506,16 @@ impl RuntimeTest for NetNsPendingFrameTest {
         if let Err(e) = child.set_net_config(cfg) {
             return TestResult::Fail(alloc::format!("set_net_config: {:?}", e));
         }
+
+        // Assign eth0 to the child namespace so it can transmit (D3 ownership pre-gate).
+        let eth0_idx = match net::device_index("eth0") {
+            Some(idx) => idx as u32,
+            None => return TestResult::Fail(String::from("eth0 device index not found")),
+        };
+        if let Err(e) = child.add_device(eth0_idx) {
+            return TestResult::Fail(alloc::format!("add_device eth0: {:?}", e));
+        }
+
         let target_ip = Ipv4Addr([10, 88, 0, 9]);
         let target_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x88, 0x09]);
 
