@@ -644,7 +644,7 @@ impl NetworkLoopbackTest {
     /// Test UDP packet processing through the network stack
     fn test_udp_loopback(&self) -> Result<(), String> {
         use cap::NamespaceId;
-        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
+        use net::{stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
 
         // Setup test addresses
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -661,21 +661,14 @@ impl NetworkLoopbackTest {
         )?;
 
         // Create test context
-        let mut arp_cache = ArpCache::new(60_000, 256); // 60s TTL, 256 max entries
         let stats = NetStats::new();
         let now_ms = 1000u64;
 
         // Process the frame
         // R90-2 FIX: Pass root namespace ID for test
-        let result = net::process_frame(
-            &frame,
-            our_mac,
-            our_ip,
-            &mut arp_cache,
-            &stats,
-            NamespaceId::new(0),
-            now_ms,
-        );
+        // D3 NETNS-DATAPLANE: ARP cache is now resolved per-namespace inside process_frame
+        let result =
+            net::process_frame(&frame, our_mac, our_ip, &stats, NamespaceId::new(0), now_ms);
 
         // The frame should be handled (delivered to socket layer) or replied.
         // With R94-12's default-deny firewall, NEW UDP packets may be dropped
@@ -703,8 +696,8 @@ impl NetworkLoopbackTest {
     fn test_invalid_tcp_drop(&self) -> Result<(), String> {
         use cap::NamespaceId;
         use net::{
-            arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_FIN,
-            TCP_FLAG_RST, TCP_FLAG_SYN,
+            stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_FIN, TCP_FLAG_RST,
+            TCP_FLAG_SYN,
         };
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -748,21 +741,14 @@ impl NetworkLoopbackTest {
         .map_err(|e| alloc::format!("Ethernet build failed: {:?}", e))?;
 
         // Create test context
-        let mut arp_cache = ArpCache::new(60_000, 256); // 60s TTL, 256 max entries
         let stats = NetStats::new();
         let now_ms = 2000u64;
 
         // Process the frame
         // R90-2 FIX: Pass root namespace ID for test
-        let result = net::process_frame(
-            &frame,
-            our_mac,
-            our_ip,
-            &mut arp_cache,
-            &stats,
-            NamespaceId::new(0),
-            now_ms,
-        );
+        // D3 NETNS-DATAPLANE: ARP cache is now resolved per-namespace inside process_frame
+        let result =
+            net::process_frame(&frame, our_mac, our_ip, &stats, NamespaceId::new(0), now_ms);
 
         // Invalid TCP flags should be dropped (or handled without reply)
         match result {
@@ -813,7 +799,7 @@ impl NetworkLoopbackTest {
     /// Test valid TCP SYN packet processing
     fn test_tcp_syn(&self) -> Result<(), String> {
         use cap::NamespaceId;
-        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
+        use net::{stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         let our_ip = Ipv4Addr([10, 0, 0, 1]);
@@ -852,21 +838,14 @@ impl NetworkLoopbackTest {
         .map_err(|e| alloc::format!("Ethernet build failed: {:?}", e))?;
 
         // Create test context
-        let mut arp_cache = ArpCache::new(60_000, 256);
         let stats = NetStats::new();
         let now_ms = 3000u64;
 
         // Process the frame
         // R90-2 FIX: Pass root namespace ID for test
-        let result = net::process_frame(
-            &frame,
-            our_mac,
-            our_ip,
-            &mut arp_cache,
-            &stats,
-            NamespaceId::new(0),
-            now_ms,
-        );
+        // D3 NETNS-DATAPLANE: ARP cache is now resolved per-namespace inside process_frame
+        let result =
+            net::process_frame(&frame, our_mac, our_ip, &stats, NamespaceId::new(0), now_ms);
 
         // Valid SYN should be processed (either handled, replied with RST, or dropped if no listener)
         match result {
@@ -1744,6 +1723,20 @@ pub fn run_all_runtime_tests() -> TestReport {
         &NetNamespaceIsolationTest,
         // D1-ISO TX device-ownership gate (both sinks, A/B/A, stale-ns)
         &NetNsTxIsolationTest,
+        // D3-NETNS-DATAPLANE per-namespace ARP cache (isolation + fail-closed RX)
+        &NetNsArpIsolationTest,
+        // D3-NETNS-DATAPLANE ARP rate-limiter + NetnsConfig admission exhaustion
+        &NetNsArpExhaustionTest,
+        &NetNsArpSubbudgetTest,
+        &NetNsArpTxLimiterTest,
+        &NetNsArpLruEvictionTest,
+        &NetNsConfigIsolationTest,
+        &NetNsRoutingTest,
+        // D3-NETNS-DATAPLANE RX ingress loop (rx_auth capability + bounded drain)
+        &NetNsRxIngressTest,
+        &NetNsRxPoolLifecycleTest,
+        &NetNsRxEth0SlirpTest,
+        &NetNsArpProbeTxTest,
     ];
 
     // Add 25 P0 regression tests (R172-R174 findings)
@@ -1853,6 +1846,20 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         &NetNamespaceIsolationTest,
         // D1-ISO TX device-ownership gate (both sinks, A/B/A, stale-ns)
         &NetNsTxIsolationTest,
+        // D3-NETNS-DATAPLANE per-namespace ARP cache (isolation + fail-closed RX)
+        &NetNsArpIsolationTest,
+        // D3-NETNS-DATAPLANE ARP rate-limiter + NetnsConfig admission exhaustion
+        &NetNsArpExhaustionTest,
+        &NetNsArpSubbudgetTest,
+        &NetNsArpTxLimiterTest,
+        &NetNsArpLruEvictionTest,
+        &NetNsConfigIsolationTest,
+        &NetNsRoutingTest,
+        // D3-NETNS-DATAPLANE RX ingress loop (rx_auth capability + bounded drain)
+        &NetNsRxIngressTest,
+        &NetNsRxPoolLifecycleTest,
+        &NetNsRxEth0SlirpTest,
+        &NetNsArpProbeTxTest,
     ];
 
     // Add 25 P0 regression tests
@@ -2791,6 +2798,13 @@ impl RuntimeTest for NetNsTxIsolationTest {
         };
         use net::{FirewallAction, FirewallRule, IpCidrMatch, PortRange, ProcessResult, TxError};
 
+        // D3 RX-COMPLETION: eth0 RX is live — SLIRP responses elicited by
+        // this test's own egress could land inside the eth0/firewall snapshot
+        // windows via a background drain (RX frames are processed as root and
+        // tick the ROOT table this test swaps rules on). Quiesce the
+        // throttled background poll for the whole body.
+        let _quiesce = net::quiesce_rx_ingress_background();
+
         // Leg 0: preconditions — QEMU virtio-net registers eth0 under `make test`.
         let Some(eth0_idx_usize) = net::device_index("eth0") else {
             return TestResult::Warning(String::from(
@@ -2845,6 +2859,25 @@ impl RuntimeTest for NetNsTxIsolationTest {
             }
         };
         let cid = child.id().raw();
+        // D3 NETNS-CONFIG: TX now requires the sending namespace's OWN
+        // addressing — an unconfigured child fails LinkDown at config
+        // acquisition, BEFORE the firewall and the ownership gate (that
+        // fail-closed contract has its own test, netns_config_isolation).
+        // This test's subject is the OWNERSHIP gate, so configure the
+        // child: like the accept-all rule below, this makes every later
+        // denial attributable to the gate.
+        if let Err(e) = child.set_net_config(net::NetConfigSnapshot {
+            our_ip: net::Ipv4Addr([10, 90, 0, 2]),
+            our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x90, 0x02]),
+            gateway_ip: net::Ipv4Addr([10, 90, 0, 1]),
+            gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x90, 0x01]),
+            subnet_prefix_len: 24,
+        }) {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: child set_net_config failed: {:?}",
+                e
+            ));
+        }
         net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9001)
             .priority(i32::MAX)
             .action(FirewallAction::Accept)
@@ -2925,14 +2958,13 @@ impl RuntimeTest for NetNsTxIsolationTest {
             Ok(f) => f,
             Err(e) => return TestResult::Fail(alloc::format!("leg 3: {}", e)),
         };
-        let mut arp_cache = net::ArpCache::new(60_000, 256);
         let stats = net::NetStats::new();
         let now_ms = 5_000u64;
+        // D3 NETNS-DATAPLANE: ARP cache is now resolved per-namespace inside process_frame
         let reply = match net::process_frame(
             &frame,
             cfg.our_mac,
             cfg.our_ip,
-            &mut arp_cache,
             &stats,
             cap::NamespaceId::new(cid),
             now_ms,
@@ -3007,7 +3039,6 @@ impl RuntimeTest for NetNsTxIsolationTest {
             &frame2,
             cfg.our_mac,
             cfg.our_ip,
-            &mut arp_cache,
             &stats,
             cap::NamespaceId::new(cid),
             now_ms,
@@ -3117,6 +3148,3294 @@ impl RuntimeTest for NetNsTxIsolationTest {
         if net_ns_owns_device(cid, eth0_idx) {
             return TestResult::Fail(String::from(
                 "leg 6: a destroyed namespace id must own NOTHING (stale-ns fail-closed)",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE Per-Namespace ARP Cache Isolation Test (netns_arp_isolation)
+// ============================================================================
+
+/// D3-NETNS-DATAPLANE FIRST-SLICE: RX ARP processing must use the RECEIVING
+/// namespace's own cache (resolved through the `NetNsDeviceHooks` upcall),
+/// isolated from every other namespace, and must drop fail-closed when the
+/// namespace cannot be resolved.
+///
+/// Addressing is test-local (`process_frame` takes our_mac/our_ip as
+/// parameters), so no leg interacts with the real device configuration. The
+/// only residue is one Dynamic entry for a test-reserved IP in the root
+/// cache (TTL-expired after 5 min; the IP collides with no real traffic).
+struct NetNsArpIsolationTest;
+
+impl RuntimeTest for NetNsArpIsolationTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_isolation"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3-NETNS-DATAPLANE per-namespace ARP cache isolation + fail-closed RX"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr, ProcessResult};
+
+        let our_mac = EthAddr([0x02, 0, 0, 0, 0, 0x51]);
+        let our_ip = Ipv4Addr([10, 51, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 51, 0, 2]);
+        let remote_mac_a = EthAddr([0x02, 0, 0, 0, 0, 0x52]);
+        let remote_mac_b = EthAddr([0x02, 0, 0, 0, 0, 0x53]);
+        let stats = net::NetStats::new();
+        let now_ms = 7_000u64;
+
+        // Leg 1: root-ns ARP request for our IP produces a Reply through the
+        // per-ns hook path (hooks are registered by kernel_core::init long
+        // before the runtime suite runs).
+        let req = arp::build_arp_request(remote_mac_a, remote_ip, our_ip);
+        if req.is_empty() {
+            return TestResult::Fail(String::from("leg 1: ARP request frame admission failed"));
+        }
+        match net::process_frame(
+            req.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(0),
+            now_ms,
+        ) {
+            ProcessResult::Reply(_) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: root-ns ARP request for our IP must produce a Reply, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 2: root learns from a reply addressed to us, into ROOT's own
+        // per-ns cache (verified through the kernel_core registry, i.e. the
+        // exact object the hook serves).
+        let reply_a = arp::build_arp_reply(remote_mac_a, remote_ip, our_mac, our_ip);
+        if reply_a.is_empty() {
+            return TestResult::Fail(String::from("leg 2: ARP reply frame admission failed"));
+        }
+        if let ProcessResult::Dropped(reason) = net::process_frame(
+            reply_a.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(0),
+            now_ms,
+        ) {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: root-ns ARP reply learn was dropped: {:?}",
+                reason
+            ));
+        }
+        let root_sees = kernel_core::net_namespace::lookup_net_ns(0)
+            .and_then(|ns| ns.arp_cache().lock().lookup(remote_ip, now_ms));
+        if root_sees != Some(remote_mac_a) {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: root cache must have learned {:?} -> {:?}, got {:?}",
+                remote_ip,
+                remote_mac_a,
+                root_sees
+            ));
+        }
+
+        // Leg 3 (isolation proof): a child namespace learns the SAME IP with
+        // a DIFFERENT MAC. With a shared cache this is exactly the update the
+        // anti-spoofing conflict check rejects; with per-ns caches both
+        // mappings coexist and neither namespace sees the other's.
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid = child.id().raw();
+        let reply_b = arp::build_arp_reply(remote_mac_b, remote_ip, our_mac, our_ip);
+        if reply_b.is_empty() {
+            return TestResult::Fail(String::from("leg 3: ARP reply frame admission failed"));
+        }
+        if let ProcessResult::Dropped(reason) = net::process_frame(
+            reply_b.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(cid),
+            now_ms,
+        ) {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: child-ns ARP reply learn was dropped: {:?} (cross-ns conflict \
+                 firing would mean the caches are NOT isolated)",
+                reason
+            ));
+        }
+        let child_sees = child.arp_cache().lock().lookup(remote_ip, now_ms);
+        if child_sees != Some(remote_mac_b) {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: child cache must map {:?} -> {:?}, got {:?}",
+                remote_ip,
+                remote_mac_b,
+                child_sees
+            ));
+        }
+        let root_still = kernel_core::net_namespace::lookup_net_ns(0)
+            .and_then(|ns| ns.arp_cache().lock().lookup(remote_ip, now_ms));
+        if root_still != Some(remote_mac_a) {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: child learn must not touch the root mapping (want {:?}, got {:?})",
+                remote_mac_a,
+                root_still
+            ));
+        }
+
+        // Leg 4: destroyed namespace id => fail-closed drop (the registry
+        // row is removed by NetNamespace::Drop, so the hook resolves None).
+        let dead_id = {
+            let doomed = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 4: clone_net_namespace failed: {:?}",
+                        e
+                    ));
+                }
+            };
+            doomed.id().raw()
+        };
+        match net::process_frame(
+            req.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(dead_id),
+            now_ms,
+        ) {
+            ProcessResult::Dropped(net::stack::DropReason::NetNsUnavailable) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4: destroyed-ns ARP must be Dropped(NetNsUnavailable), got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 5: never-existed namespace id => same fail-closed drop.
+        match net::process_frame(
+            req.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(u64::MAX),
+            now_ms,
+        ) {
+            ProcessResult::Dropped(net::stack::DropReason::NetNsUnavailable) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 5: unknown-ns ARP must be Dropped(NetNsUnavailable), got {:?}",
+                    other
+                ));
+            }
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE ARP Exhaustion / Fail-Closed Paths Test (netns_arp_exhaustion)
+// ============================================================================
+
+/// D3-NETNS-DATAPLANE (Codex round-2 test-breadth leg): the two fail-closed
+/// resource paths of the per-namespace ARP dataplane —
+/// (1) RX rate-limiter exhaustion must drop `RateLimited` without corrupting
+///     the cache, and
+/// (2) `HeapClass::NetnsConfig` admission exhaustion must surface as a
+///     `NoMemory` drop (no panic, no cross-class spillover) and RECOVER once
+///     the pressure is released.
+///
+/// Clock discipline: the ARP token buckets enforce monotonic time and are
+/// shared (global backstop) across tests, so this test's fake clocks
+/// (60s / 120s) deliberately sit ABOVE `netns_arp_isolation`'s (7s) and one
+/// refill window apart from each other.
+struct NetNsArpExhaustionTest;
+
+impl RuntimeTest for NetNsArpExhaustionTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_exhaustion"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3-NETNS-DATAPLANE ARP rate-limiter + NetnsConfig admission fail-closed paths"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr, ProcessResult};
+
+        let our_mac = EthAddr([0x02, 0, 0, 0, 0, 0x61]);
+        let our_ip = Ipv4Addr([10, 61, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 61, 0, 2]);
+        let remote_mac = EthAddr([0x02, 0, 0, 0, 0, 0x62]);
+        let stats = net::NetStats::new();
+
+        // Leg 1: per-cache RX rate limiter (fresh bucket, burst 100; the
+        // global backstop refills to cap by now_ms=60_000). 101 same-MAC
+        // refresh replies at ONE tick: no refill can occur mid-leg, no TX
+        // limiter involvement, only the first frame grows the cache.
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid = child.id().raw();
+        let reply = arp::build_arp_reply(remote_mac, remote_ip, our_mac, our_ip);
+        if reply.is_empty() {
+            return TestResult::Fail(String::from("leg 1: ARP reply frame admission failed"));
+        }
+        let now_ms = 60_000u64;
+        let mut handled = 0u32;
+        let mut limited = 0u32;
+        for _ in 0..101 {
+            match net::process_frame(
+                reply.as_slice(),
+                our_mac,
+                our_ip,
+                &stats,
+                cap::NamespaceId::new(cid),
+                now_ms,
+            ) {
+                ProcessResult::Handled => handled += 1,
+                ProcessResult::Dropped(net::stack::DropReason::ArpError(
+                    net::arp::ArpError::RateLimited,
+                )) => limited += 1,
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 1: same-tick ARP burst produced unexpected result {:?} \
+                         (after {} handled / {} limited)",
+                        other,
+                        handled,
+                        limited
+                    ));
+                }
+            }
+        }
+        if limited == 0 {
+            return TestResult::Fail(String::from(
+                "leg 1: 101 same-tick ARP frames must trip the RX rate limiter at least once",
+            ));
+        }
+        if handled == 0 {
+            return TestResult::Fail(String::from(
+                "leg 1: a fresh bucket must admit at least one frame (limiter must not \
+                 be pre-drained)",
+            ));
+        }
+        // Rate limiting must not corrupt the learned state.
+        if child.arp_cache().lock().lookup(remote_ip, now_ms) != Some(remote_mac) {
+            return TestResult::Fail(String::from(
+                "leg 1: rate-limited burst corrupted the learned mapping",
+            ));
+        }
+
+        // Leg 2: NetnsConfig class exhaustion. Greedily absorb the class's
+        // remaining headroom with held reservations, halving the chunk on
+        // every rejection; stop once the snapshot shows less headroom than
+        // one raw ArpEntry could ever need.
+        let child2 = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid2 = child2.id().raw();
+        let mut pressure: Vec<mm::HeapReservation> = Vec::new();
+        let mut chunk: usize = 512 * 1024;
+        let mut spins = 0u32;
+        while chunk > 0 && spins < 256 {
+            spins += 1;
+            match mm::try_reserve_heap(mm::HeapClass::NetnsConfig, chunk) {
+                Ok(r) => pressure.push(r),
+                Err(_) => chunk /= 2,
+            }
+        }
+        let snap = mm::heap_class_snapshot(mm::HeapClass::NetnsConfig);
+        let remaining = snap
+            .capacity_bytes
+            .saturating_sub(snap.committed_bytes)
+            .saturating_sub(snap.reserved_bytes);
+        if remaining >= 24 {
+            // Could not establish pressure (e.g. the shared global admission
+            // pool saturated first) — report honestly instead of asserting a
+            // failure the setup never created.
+            return TestResult::Warning(alloc::format!(
+                "leg 2: could not exhaust NetnsConfig headroom (remaining={} B after {} \
+                 reservations)",
+                remaining,
+                pressure.len()
+            ));
+        }
+        // 120s: one full refill window after leg 1 drained the shared global
+        // RX bucket, so only admission (not rate limiting) can drop this.
+        let now_ms2 = 120_000u64;
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(cid2),
+            now_ms2,
+        ) {
+            ProcessResult::Dropped(net::stack::DropReason::ArpError(
+                net::arp::ArpError::NoMemory,
+            )) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: learn under exhausted NetnsConfig must drop NoMemory \
+                     (fail-closed), got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 3: recovery — releasing the pressure must make the SAME frame
+        // learnable again (admission failure left the cache empty and sane).
+        drop(pressure);
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(cid2),
+            now_ms2,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: after releasing pressure the same learn must succeed, got {:?}",
+                    other
+                ));
+            }
+        }
+        if child2.arp_cache().lock().lookup(remote_ip, now_ms2) != Some(remote_mac) {
+            return TestResult::Fail(String::from(
+                "leg 3: post-recovery learn must be visible in the namespace's cache",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+/// D3 NETNS-SUBBUDGET-1: the per-namespace config byte budget must scope
+/// rejection to ITS namespace only (ceiling semantics), recover when leases
+/// release, and close-without-zeroing on namespace teardown.
+struct NetNsArpSubbudgetTest;
+
+impl RuntimeTest for NetNsArpSubbudgetTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_subbudget"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3 NETNS-SUBBUDGET-1 per-ns budget scoping, recovery, and close-on-teardown"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr, ProcessResult};
+
+        let our_mac = EthAddr([0x02, 0, 0, 0, 0, 0x71]);
+        let our_ip = Ipv4Addr([10, 71, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 71, 0, 2]);
+        let remote_mac = EthAddr([0x02, 0, 0, 0, 0, 0x72]);
+        let stats = net::NetStats::new();
+        // 200s: strictly after every earlier ARP test tick (7s / 60s / 120s).
+        // The ARP TokenBuckets enforce monotonic time and the global RX
+        // backstop is SHARED across tests — by 200s it has refilled to cap,
+        // so only admission (never rate limiting) can drop frames here.
+        let now_ms = 200_000u64;
+
+        let reply = arp::build_arp_reply(remote_mac, remote_ip, our_mac, our_ip);
+        if reply.is_empty() {
+            return TestResult::Fail(String::from("ARP reply frame admission failed"));
+        }
+
+        // Leg 1: budget-scoped rejection. Fill child A's budget with a held
+        // lease; a learn in A must drop NoMemory while a FRESH child B still
+        // learns the same frame. B's success proves the shared NetnsConfig
+        // class had headroom, so A's rejection can only be budget-scoped.
+        let child_a = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: clone_net_namespace (A) failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let child_b = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: clone_net_namespace (B) failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let a_budget = child_a.config_budget();
+        let before = a_budget.snapshot();
+        if before.closed || before.used_bytes != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: fresh namespace budget must start open and empty, got {:?}",
+                before
+            ));
+        }
+        let fill = match a_budget.try_lease(before.limit_bytes.saturating_sub(before.used_bytes)) {
+            Ok(lease) => lease,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: filling lease on a fresh budget failed: {:?}",
+                    e
+                ));
+            }
+        };
+        // Round-6 review: prove failure-atomicity on the LEDGER, not just the
+        // error surface — the rejected learn must leave the NetnsConfig class
+        // snapshot byte-identical (its transient reservation fully rolled
+        // back), while A's budget stays at its filled level.
+        let class_before = mm::heap_class_snapshot(mm::HeapClass::NetnsConfig);
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(child_a.id().raw()),
+            now_ms,
+        ) {
+            ProcessResult::Dropped(net::stack::DropReason::ArpError(
+                net::arp::ArpError::NoMemory,
+            )) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: learn under a full per-ns budget must drop NoMemory \
+                     (fail-closed), got {:?}",
+                    other
+                ));
+            }
+        }
+        if mm::heap_class_snapshot(mm::HeapClass::NetnsConfig) != class_before {
+            return TestResult::Fail(String::from(
+                "leg 1: budget rejection must roll the class ledger back exactly \
+                 (failure-atomic dual lease)",
+            ));
+        }
+        if a_budget.snapshot().rejected == 0 {
+            return TestResult::Fail(String::from(
+                "leg 1: budget rejection telemetry must increment on the refused lease",
+            ));
+        }
+        if child_a
+            .arp_cache()
+            .lock()
+            .lookup(remote_ip, now_ms)
+            .is_some()
+        {
+            return TestResult::Fail(String::from(
+                "leg 1: the rejected learn must leave A's cache untouched",
+            ));
+        }
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(child_b.id().raw()),
+            now_ms,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: fresh child B must still learn under class headroom, got {:?}",
+                    other
+                ));
+            }
+        }
+        if child_b.arp_cache().lock().lookup(remote_ip, now_ms) != Some(remote_mac) {
+            return TestResult::Fail(String::from(
+                "leg 1: B's learn must be visible in B's cache",
+            ));
+        }
+
+        // Leg 2: recovery — releasing the filling lease must make the SAME
+        // frame learnable in A, and the successful growth must hold bytes
+        // MIRRORED across both ledgers (round-6 review: budget<->class
+        // parity, charge capacity not membership).
+        drop(fill);
+        let class_before_recovery = mm::heap_class_snapshot(mm::HeapClass::NetnsConfig);
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(child_a.id().raw()),
+            now_ms,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: after releasing the lease the same learn must succeed, got {:?}",
+                    other
+                ));
+            }
+        }
+        if child_a.arp_cache().lock().lookup(remote_ip, now_ms) != Some(remote_mac) {
+            return TestResult::Fail(String::from(
+                "leg 2: post-recovery learn must be visible in A's cache",
+            ));
+        }
+        let a_used = a_budget.snapshot().used_bytes;
+        if a_used == 0 {
+            return TestResult::Fail(String::from(
+                "leg 2: a successful learn must hold per-ns budget bytes",
+            ));
+        }
+        let class_after_recovery = mm::heap_class_snapshot(mm::HeapClass::NetnsConfig);
+        let class_delta = class_after_recovery
+            .committed_bytes
+            .saturating_sub(class_before_recovery.committed_bytes);
+        if class_delta != a_used
+            || class_after_recovery.reserved_bytes != class_before_recovery.reserved_bytes
+        {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: budget usage must mirror the class charge byte-for-byte \
+                 (budget {} B, class committed delta {} B)",
+                a_used,
+                class_delta
+            ));
+        }
+
+        // Leg 3: teardown. Learn in child C, keep budget + cache handles,
+        // drop the namespace: the budget must be CLOSED to new leases with
+        // usage UNCHANGED (close never zeroes), and only the real cache
+        // drop returns the bytes.
+        let child_c = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: clone_net_namespace (C) failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let c_budget = child_c.config_budget();
+        let c_cache = child_c.arp_cache();
+        match net::process_frame(
+            reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(child_c.id().raw()),
+            now_ms,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: learn in a live child C must succeed, got {:?}",
+                    other
+                ));
+            }
+        }
+        let held = c_budget.snapshot();
+        if held.used_bytes == 0 || held.closed {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: after a learn C's budget must be open with bytes held, got {:?}",
+                held
+            ));
+        }
+        drop(child_c);
+        let after_drop = c_budget.snapshot();
+        if !after_drop.closed {
+            return TestResult::Fail(String::from(
+                "leg 3: namespace teardown must close its config budget",
+            ));
+        }
+        if after_drop.used_bytes != held.used_bytes {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: close must never zero usage (held {} B, saw {} B)",
+                held.used_bytes,
+                after_drop.used_bytes
+            ));
+        }
+        match c_budget.try_lease(1) {
+            Err(mm::NsBudgetError::Closed) => {}
+            Ok(_) => {
+                return TestResult::Fail(String::from(
+                    "leg 3: a closed budget must refuse new leases",
+                ));
+            }
+            Err(other) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: closed budget must reject with Closed, got {:?}",
+                    other
+                ));
+            }
+        }
+        // Round-6 review fix: even ZERO-byte leases must be refused after
+        // close — "no lease after close" holds unconditionally.
+        match c_budget.try_lease(0) {
+            Err(mm::NsBudgetError::Closed) => {}
+            Ok(_) => {
+                return TestResult::Fail(String::from(
+                    "leg 3: a closed budget must refuse zero-byte leases too",
+                ));
+            }
+            Err(other) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: closed budget must reject zero-byte lease with Closed, got {:?}",
+                    other
+                ));
+            }
+        }
+        drop(c_cache);
+        let after_free = c_budget.snapshot();
+        if after_free.used_bytes != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: dropping the last cache handle must release all budget bytes \
+                 (still holding {} B)",
+                after_free.used_bytes
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE ARP TX Rate Limiter Test (netns_arp_tx_limiter)
+// ============================================================================
+
+/// D3-NETNS-DATAPLANE test-breadth residual: TX rate-limiter exhaustion.
+/// Sends 101 same-tick ARP requests that would trigger replies, exhausting
+/// the per-cache TX token bucket (burst 40, rate 20 PPS). At least one
+/// request must be dropped `RateLimited` without corrupting the cache.
+///
+/// Clock discipline: 250 000 ms (above the 200 000 ms watermark from
+/// `netns_arp_subbudget`).
+struct NetNsArpTxLimiterTest;
+
+impl RuntimeTest for NetNsArpTxLimiterTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_tx_limiter"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3-NETNS-DATAPLANE ARP TX rate-limiter exhaustion fail-closed"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr, ProcessResult};
+
+        let our_mac = EthAddr([0x02, 0, 0, 0, 0, 0x71]);
+        let our_ip = Ipv4Addr([10, 71, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 71, 0, 2]);
+        let remote_mac = EthAddr([0x02, 0, 0, 0, 0, 0x72]);
+        let stats = net::NetStats::new();
+
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("clone_net_namespace failed: {:?}", e));
+            }
+        };
+        let cid = child.id().raw();
+
+        // Build an ARP request AS THE REMOTE asking for our IP — the
+        // builder's `our_*` params are the SENDER's identity, so an
+        // incoming request that our stack must answer carries the remote's
+        // MAC/IP as sender and our IP as target.
+        let request = arp::build_arp_request(remote_mac, remote_ip, our_ip);
+        if request.is_empty() {
+            return TestResult::Fail(String::from("ARP request frame admission failed"));
+        }
+
+        // 101 same-tick requests. Both TX buckets (per-cache + global) are
+        // at burst cap 40 here (nothing TX-heavy ran since 7s; refilled by
+        // 250s), while the RX buckets hold 100 — so the FIRST RateLimited
+        // must come from the TX limiter, and replied can never exceed 40.
+        let now_ms = 250_000u64;
+        let mut replied = 0u32;
+        let mut limited = 0u32;
+        for _ in 0..101 {
+            match net::process_frame(
+                request.as_slice(),
+                our_mac,
+                our_ip,
+                &stats,
+                cap::NamespaceId::new(cid),
+                now_ms,
+            ) {
+                ProcessResult::Reply(_) => replied += 1,
+                ProcessResult::Dropped(net::stack::DropReason::ArpError(
+                    net::arp::ArpError::RateLimited,
+                )) => limited += 1,
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "same-tick ARP request burst produced unexpected result {:?} \
+                         (after {} replied / {} limited)",
+                        other,
+                        replied,
+                        limited
+                    ));
+                }
+            }
+        }
+        if replied == 0 {
+            return TestResult::Fail(String::from(
+                "a fresh TX bucket must emit at least one reply (limiter must not \
+                 be pre-drained)",
+            ));
+        }
+        if limited == 0 {
+            return TestResult::Fail(alloc::format!(
+                "TX rate limiter must drop at least one of 101 same-tick requests \
+                 (replied={}, limited={})",
+                replied,
+                limited
+            ));
+        }
+        // TX burst cap is 40 while the RX caps are 100: replied > 40 would
+        // mean the drops came from the RX limiter, not the TX limiter.
+        if replied > 40 {
+            return TestResult::Fail(alloc::format!(
+                "replied={} exceeds the TX burst cap 40 — the TX limiter was not \
+                 the binding limiter",
+                replied
+            ));
+        }
+
+        // R65-7 anti-poisoning regression: plain requests must NEVER learn
+        // the sender's mapping (only replies addressed to us learn).
+        if child.arp_cache().lock().lookup(remote_ip, now_ms).is_some() {
+            return TestResult::Fail(String::from(
+                "ARP requests must not learn the sender mapping (R65-7 anti-poisoning)",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE ARP LRU Eviction Test (netns_arp_lru_eviction)
+// ============================================================================
+
+/// D3-NETNS-DATAPLANE test-breadth residual: LRU eviction of the oldest
+/// dynamic entry when the cache reaches `max_entries`. Fills the cache to
+/// its limit (default 256), then inserts one more dynamic entry — the
+/// oldest dynamic entry must be evicted, and the new entry must be visible.
+///
+/// Clock discipline: 300 000 ms (above 250 000 ms from TX-limiter test).
+struct NetNsArpLruEvictionTest;
+
+impl RuntimeTest for NetNsArpLruEvictionTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_lru_eviction"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3-NETNS-DATAPLANE ARP LRU eviction at max_entries boundary"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{arp, EthAddr, Ipv4Addr, ProcessResult};
+
+        let our_mac = EthAddr([0x02, 0, 0, 0, 0, 0x81]);
+        let our_ip = Ipv4Addr([10, 81, 0, 1]);
+        let stats = net::NetStats::new();
+
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("clone_net_namespace failed: {:?}", e));
+            }
+        };
+        let cid = child.id().raw();
+        let cache = child.arp_cache();
+        let max_entries = cache.lock().max_entries();
+
+        // Fill the cache to exactly max_entries. The fill subnet (10.82/16)
+        // is DISJOINT from our_ip (10.81.0.1) — a fill IP equal to our_ip
+        // would trip the reflection-attack guard (CacheConflict). The clock
+        // advances 20 ms per frame: the RX buckets refill at 50 PPS, so a
+        // same-tick fill of 256 would exhaust the 100-token burst; 20 ms
+        // per frame grants exactly one refill token per frame and also
+        // makes the LRU order (oldest first) unambiguous.
+        let base_ms = 300_000u64;
+        let mut now_ms = base_ms;
+        for i in 0..max_entries {
+            now_ms = base_ms + (i as u64) * 20;
+            // Last octet stays in 0..=127: R159-15 sender-IP validation
+            // rejects .255 directed-broadcast sources (InvalidSender).
+            let remote_ip = Ipv4Addr([10, 82, 1 + ((i >> 7) & 0xff) as u8, (i & 0x7f) as u8]);
+            let remote_mac = EthAddr([0x02, 0, 0, 0, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8]);
+            let reply = arp::build_arp_reply(remote_mac, remote_ip, our_mac, our_ip);
+            if reply.is_empty() {
+                return TestResult::Fail(alloc::format!(
+                    "ARP reply frame admission failed at entry {}",
+                    i
+                ));
+            }
+            match net::process_frame(
+                reply.as_slice(),
+                our_mac,
+                our_ip,
+                &stats,
+                cap::NamespaceId::new(cid),
+                now_ms,
+            ) {
+                ProcessResult::Handled => {}
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "filling cache at entry {}: expected Handled, got {:?}",
+                        i,
+                        other
+                    ));
+                }
+            }
+        }
+
+        // Verify cache is full
+        let len_before = cache.lock().len();
+        if len_before != max_entries {
+            return TestResult::Fail(alloc::format!(
+                "cache must be full (expected {} entries, got {})",
+                max_entries,
+                len_before
+            ));
+        }
+
+        // The first entry (10.82.1.0) should be visible before eviction
+        let first_ip = Ipv4Addr([10, 82, 1, 0]);
+        let first_mac = EthAddr([0x02, 0, 0, 0, 0, 0]);
+        if cache.lock().lookup(first_ip, now_ms) != Some(first_mac) {
+            return TestResult::Fail(String::from(
+                "first entry must be visible in the full cache",
+            ));
+        }
+
+        // Insert one more dynamic entry (should evict the first/oldest).
+        // Third octet 9 is disjoint from every fill IP (third octet 1..=2),
+        // and the last octet avoids the .255 directed-broadcast rejection.
+        let now_evict = now_ms + 100;
+        let evicting_ip = Ipv4Addr([10, 82, 9, 9]);
+        let evicting_mac = EthAddr([0x02, 0, 0, 0, 255, 255]);
+        let evicting_reply = arp::build_arp_reply(evicting_mac, evicting_ip, our_mac, our_ip);
+        if evicting_reply.is_empty() {
+            return TestResult::Fail(String::from("evicting ARP reply frame admission failed"));
+        }
+        match net::process_frame(
+            evicting_reply.as_slice(),
+            our_mac,
+            our_ip,
+            &stats,
+            cap::NamespaceId::new(cid),
+            now_evict,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "inserting evicting entry: expected Handled, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Cache length must remain at max_entries (eviction, not growth)
+        let len_after = cache.lock().len();
+        if len_after != max_entries {
+            return TestResult::Fail(alloc::format!(
+                "cache length must stay at max_entries after LRU eviction \
+                 (expected {}, got {})",
+                max_entries,
+                len_after
+            ));
+        }
+
+        // The first/oldest entry must be evicted
+        if cache.lock().lookup(first_ip, now_evict).is_some() {
+            return TestResult::Fail(String::from(
+                "first entry must be evicted after inserting beyond max_entries",
+            ));
+        }
+
+        // The new entry must be visible
+        if cache.lock().lookup(evicting_ip, now_evict) != Some(evicting_mac) {
+            return TestResult::Fail(String::from("evicting entry must be visible in the cache"));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3 NETNS-CONFIG Per-Namespace Network Configuration Test (netns_config_isolation)
+// ============================================================================
+
+/// D3 NETNS-CONFIG (PO-NET-01 §4.3 Phase 2): every namespace transmits with
+/// its OWN addressing, never another namespace's.
+///
+/// Legs:
+/// 1. Root acquisition delegates to the global config (single authority —
+///    root stores NO per-ns copy that could drift).
+/// 2. A fresh child is UNCONFIGURED: acquisition and TX fail closed
+///    (LinkDown), and the failed send leaves the child's firewall
+///    statistics untouched — config acquisition precedes policy, so a
+///    namespace without identity is refused BEFORE its packet is ever
+///    evaluated against anyone's source address.
+/// 3. Setter validation battery — every rejection fail-closed, nothing
+///    stored (the setter is the future netns-admin syscall seam).
+/// 4. Configured child: acquisition returns EXACTLY the stored values and
+///    the root's addressing is undisturbed (isolation money leg).
+/// 5. Reconfiguration flushes the namespace ARP cache (static AND dynamic
+///    — stale neighbor state from the old addressing must not survive)
+///    and publishes the new addressing.
+/// 6. Unknown namespace id fails closed (unknown / destroyed /
+///    unconfigured are deliberately one collapsed None).
+/// 7. TX-path identity proof (needs eth0): a child-table firewall rule
+///    keyed on the CHILD's configured source IP fires (accepted +1, zero
+///    default hits), while the same rule keyed on the ROOT's IP misses
+///    (default-deny fires) — the egress firewall evaluated the child's
+///    OWN identity, closing the borrowed-root-identity class.
+///
+/// Clock: only direct cache inserts (never `process_frame`), so the global
+/// ARP token buckets never tick — the 305 300 fake-clock watermark is
+/// unaffected; the planted entry uses 360 000 to respect the monotonic
+/// ordering discipline anyway, and it is flushed before the real-tick
+/// gateway seed from leg 7's sends can share the cache.
+struct NetNsConfigIsolationTest;
+
+impl RuntimeTest for NetNsConfigIsolationTest {
+    fn name(&self) -> &'static str {
+        "netns_config_isolation"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, NetConfigError, ROOT_NET_NAMESPACE};
+        use net::{FirewallAction, FirewallRule, IpCidrMatch, TxError};
+
+        // D3 RX-COMPLETION: eth0 RX is live — SLIRP responses elicited by
+        // this test's own leg-7 egress could land inside the firewall-stats
+        // snapshot windows via a background drain (RX frames are processed as
+        // root and tick the ROOT table). Quiesce the throttled background
+        // poll for the whole body; queued frames just wait.
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        // Leg 1: root acquisition == global config (hook delegation).
+        let global = net::network_config();
+        let root_cfg = match net::tx_net_config(0) {
+            Ok(c) => c,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: root tx_net_config must succeed, got {:?}",
+                    e
+                ));
+            }
+        };
+        if root_cfg.our_ip != global.our_ip
+            || root_cfg.our_mac != global.our_mac
+            || root_cfg.gateway_ip != global.gateway_ip
+            || root_cfg.gateway_mac != global.gateway_mac
+            || root_cfg.subnet_prefix_len != global.subnet_prefix_len
+        {
+            return TestResult::Fail(String::from(
+                "leg 1: root acquisition must delegate to the global config",
+            ));
+        }
+        if ROOT_NET_NAMESPACE.net_config().is_some() {
+            return TestResult::Fail(String::from(
+                "leg 1: root must not store a per-ns config copy (drift hazard)",
+            ));
+        }
+
+        // Leg 2: fresh child = unconfigured => fail-closed BEFORE policy.
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid = child.id().raw();
+        if child.net_config().is_some() {
+            return TestResult::Fail(String::from("leg 2: fresh child must be unconfigured"));
+        }
+        match net::tx_net_config(cid) {
+            Err(TxError::LinkDown) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: unconfigured child acquisition must be Err(LinkDown), got {:?}",
+                    other
+                ));
+            }
+        }
+        // stats() lazily creates the child table — take the baseline BEFORE
+        // the send so the deltas are exact.
+        let fw = net::firewall_table_for_ns(cid);
+        let fw0 = fw.stats();
+        let dst = net::Ipv4Addr([192, 0, 2, 99]); // TEST-NET-1, never routed
+        let src_seed = net::Ipv4Addr([10, 83, 0, 2]);
+        let datagram = match net::build_udp_datagram(src_seed, dst, 49_500, 47_600, b"D3-CFG") {
+            Ok(d) => d,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("leg 2: UDP build failed: {:?}", e));
+            }
+        };
+        match net::transmit_udp_datagram(dst, &datagram, cid) {
+            Err(TxError::LinkDown) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: unconfigured child TX must be Err(LinkDown), got {:?}",
+                    other
+                ));
+            }
+        }
+        let fw1 = fw.stats();
+        if fw1.rule_evaluations != fw0.rule_evaluations || fw1.default_hits != fw0.default_hits {
+            return TestResult::Fail(String::from(
+                "leg 2: a send refused at config acquisition must never reach firewall \
+                 evaluation",
+            ));
+        }
+
+        // Leg 3: setter validation battery (fail-closed, nothing stored).
+        let base = net::NetConfigSnapshot {
+            our_ip: net::Ipv4Addr([10, 83, 0, 2]),
+            our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x83, 0x02]),
+            gateway_ip: net::Ipv4Addr([10, 83, 0, 1]),
+            gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x83, 0x01]),
+            subnet_prefix_len: 24,
+        };
+        if !matches!(
+            ROOT_NET_NAMESPACE.set_net_config(base),
+            Err(NetConfigError::RootImmutable)
+        ) {
+            return TestResult::Fail(String::from(
+                "leg 3: root set_net_config must be rejected as RootImmutable",
+            ));
+        }
+        let rejects = [
+            (
+                net::NetConfigSnapshot {
+                    subnet_prefix_len: 0,
+                    ..base
+                },
+                NetConfigError::InvalidPrefix,
+                "prefix 0",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    subnet_prefix_len: 33,
+                    ..base
+                },
+                NetConfigError::InvalidPrefix,
+                "prefix 33",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_mac: net::EthAddr([0u8; 6]),
+                    ..base
+                },
+                NetConfigError::InvalidSourceMac,
+                "zero source MAC",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_mac: net::EthAddr([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]),
+                    ..base
+                },
+                NetConfigError::InvalidSourceMac,
+                "multicast source MAC",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    gateway_mac: net::EthAddr([0xffu8; 6]),
+                    ..base
+                },
+                NetConfigError::InvalidGatewayMac,
+                "broadcast gateway MAC",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_ip: net::Ipv4Addr([10, 83, 0, 255]),
+                    ..base
+                },
+                NetConfigError::InvalidSourceIp,
+                "directed-broadcast source IP",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    gateway_ip: net::Ipv4Addr([0, 0, 0, 0]),
+                    ..base
+                },
+                NetConfigError::InvalidGatewayIp,
+                "unspecified gateway IP",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    gateway_ip: net::Ipv4Addr([10, 84, 0, 1]),
+                    ..base
+                },
+                NetConfigError::GatewayOffSubnet,
+                "off-subnet gateway",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    gateway_ip: net::Ipv4Addr([10, 83, 0, 2]),
+                    ..base
+                },
+                NetConfigError::GatewayIsSelf,
+                "gateway equal to source",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_ip: net::Ipv4Addr([10, 83, 0, 63]),
+                    subnet_prefix_len: 26,
+                    ..base
+                },
+                NetConfigError::InvalidSourceIp,
+                "source = /26 directed broadcast (host part all-ones)",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_ip: net::Ipv4Addr([10, 83, 0, 0]),
+                    subnet_prefix_len: 26,
+                    ..base
+                },
+                NetConfigError::InvalidSourceIp,
+                "source = /26 network address (host part all-zeros)",
+            ),
+            (
+                net::NetConfigSnapshot {
+                    our_ip: net::Ipv4Addr([10, 83, 0, 2]),
+                    gateway_ip: net::Ipv4Addr([10, 83, 0, 63]),
+                    subnet_prefix_len: 26,
+                    ..base
+                },
+                NetConfigError::InvalidGatewayIp,
+                "gateway = /26 directed broadcast (host part all-ones)",
+            ),
+        ];
+        for (bad, want, what) in rejects {
+            match child.set_net_config(bad) {
+                Err(e) if e == want => {}
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 3: {} must be rejected with {:?}, got {:?}",
+                        what,
+                        want,
+                        other
+                    ));
+                }
+            }
+        }
+        if child.net_config().is_some() {
+            return TestResult::Fail(String::from(
+                "leg 3: rejected configs must leave the namespace unconfigured",
+            ));
+        }
+        // RFC 3021 /31 point-to-point must remain configurable — including
+        // the .255 UPPER endpoint (round-11: the wire path's prefix-blind
+        // .255 heuristic must not leak into config validation; only the
+        // exact subnet-relative check decides broadcast-ness). Also prove
+        // the other newly-exact class: a mid-subnet .255 host in a /16.
+        // Ephemeral namespace so this test child stays unconfigured for
+        // leg 4.
+        {
+            let p2p = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 3: /31 clone_net_namespace failed: {:?}",
+                        e
+                    ));
+                }
+            };
+            if let Err(e) = p2p.set_net_config(net::NetConfigSnapshot {
+                our_ip: net::Ipv4Addr([10, 85, 0, 254]),
+                our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x85, 0x02]),
+                gateway_ip: net::Ipv4Addr([10, 85, 0, 255]),
+                gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x85, 0x03]),
+                subnet_prefix_len: 31,
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: RFC 3021 /31 with .255 endpoint must be accepted, got {:?}",
+                    e
+                ));
+            }
+            if let Err(e) = p2p.set_net_config(net::NetConfigSnapshot {
+                our_ip: net::Ipv4Addr([10, 86, 0, 255]),
+                our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x86, 0x02]),
+                gateway_ip: net::Ipv4Addr([10, 86, 0, 1]),
+                gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x86, 0x01]),
+                subnet_prefix_len: 16,
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3: mid-subnet .255 host in a /16 must be accepted (subnet \
+                     broadcast is 10.86.255.255), got {:?}",
+                    e
+                ));
+            }
+        }
+
+        // Leg 4: configure; acquisition returns EXACTLY the stored values.
+        if let Err(e) = child.set_net_config(base) {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: valid set_net_config failed: {:?}",
+                e
+            ));
+        }
+        let got = match net::tx_net_config(cid) {
+            Ok(c) => c,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4: configured child acquisition must succeed, got {:?}",
+                    e
+                ));
+            }
+        };
+        if got.our_ip != base.our_ip
+            || got.our_mac != base.our_mac
+            || got.gateway_ip != base.gateway_ip
+            || got.gateway_mac != base.gateway_mac
+            || got.subnet_prefix_len != base.subnet_prefix_len
+        {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: acquisition must return exactly the configured values, got {:?}",
+                got
+            ));
+        }
+        match net::tx_net_config(0) {
+            Ok(r) if r.our_ip == global.our_ip && r.our_mac == global.our_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4: configuring a child must not disturb the root's addressing, \
+                     got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 5: reconfiguration flushes ALL neighbor state and publishes
+        // the new addressing. Direct insert — token buckets never tick.
+        let plant_ms = 360_000u64;
+        {
+            let cache = child.arp_cache();
+            let mut cache = cache.lock();
+            if let Err(e) = cache.insert(
+                net::Ipv4Addr([10, 83, 0, 7]),
+                net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x83, 0x07]),
+                net::arp::ArpEntryKind::Dynamic,
+                plant_ms,
+            ) {
+                return TestResult::Fail(alloc::format!("leg 5: cache plant failed: {:?}", e));
+            }
+            if cache.len() != 1 {
+                return TestResult::Fail(alloc::format!(
+                    "leg 5: planted entry must be present (len {})",
+                    cache.len()
+                ));
+            }
+        }
+        let re = net::NetConfigSnapshot {
+            our_ip: net::Ipv4Addr([10, 84, 0, 2]),
+            our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x84, 0x02]),
+            gateway_ip: net::Ipv4Addr([10, 84, 0, 1]),
+            gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x84, 0x01]),
+            subnet_prefix_len: 24,
+        };
+        if let Err(e) = child.set_net_config(re) {
+            return TestResult::Fail(alloc::format!("leg 5: reconfiguration failed: {:?}", e));
+        }
+        if child.arp_cache().lock().len() != 0 {
+            return TestResult::Fail(String::from(
+                "leg 5: reconfiguration must flush ALL prior neighbor state (static + dynamic)",
+            ));
+        }
+        match net::tx_net_config(cid) {
+            Ok(c) if c.our_ip == re.our_ip && c.gateway_mac == re.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 5: acquisition must see the new addressing, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 6: unknown namespace id fails closed (collapsed contract).
+        match net::tx_net_config(u64::MAX) {
+            Err(TxError::LinkDown) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 6: unknown namespace id must fail closed (LinkDown), got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Leg 7: TX-path identity proof — needs eth0 for the ownership gate.
+        if net::device_index("eth0").is_none() {
+            return TestResult::Warning(String::from(
+                "legs 1-6 passed; TX-path identity legs skipped — eth0 absent (make test \
+                 provides QEMU virtio-net)",
+            ));
+        }
+        // Positive: a child-table rule keyed on the CHILD's configured
+        // source IP must fire. Action Accept (table default stays Drop):
+        // acceptance proves the match AND lets the send proceed to the
+        // ownership gate, so it still errors FirewallDenied (the child owns
+        // no device) — the same attribution trick as netns_tx_isolation.
+        let fw2 = fw.stats();
+        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9102)
+            .priority(i32::MAX)
+            .src_ip(IpCidrMatch::host(re.our_ip))
+            .action(FirewallAction::Accept)
+            .build()]);
+        match net::transmit_udp_datagram(dst, &datagram, cid) {
+            Err(TxError::FirewallDenied) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 7: configured child TX must pass the src-keyed accept rule and be \
+                     denied at the ownership gate, got {:?}",
+                    other
+                ));
+            }
+        }
+        let fw3 = fw.stats();
+        if fw3.packets_accepted != fw2.packets_accepted + 1 || fw3.default_hits != fw2.default_hits
+        {
+            return TestResult::Fail(alloc::format!(
+                "leg 7: the rule keyed on the CHILD's source IP must match exactly once \
+                 (accepted {} -> {}, default_hits {} -> {}): the egress firewall must \
+                 evaluate the child's OWN identity",
+                fw2.packets_accepted,
+                fw3.packets_accepted,
+                fw2.default_hits,
+                fw3.default_hits
+            ));
+        }
+        // Round-10 observability: the accepted send must have reached L2
+        // resolution WITH THE CHILD'S OWN SNAPSHOT — resolve_dst_mac seeds
+        // the namespace's static gateway mapping from it (statics never
+        // expire, so any later now_ms sees the entry). Constructed L3/L2
+        // bytes and the conntrack egress commit stay unobservable until the
+        // TX-loopback leg (explicitly deferred in the plan row).
+        {
+            let cache = child.arp_cache();
+            let cache = cache.lock();
+            if cache.lookup(re.gateway_ip, plant_ms) != Some(re.gateway_mac) {
+                return TestResult::Fail(String::from(
+                    "leg 7: the accepted send must seed the CHILD's own gateway mapping \
+                     (L2 resolution ran with another namespace's snapshot?)",
+                ));
+            }
+            if cache.len() != 1 {
+                return TestResult::Fail(alloc::format!(
+                    "leg 7: exactly the gateway seed expected in the child cache (len {})",
+                    cache.len()
+                ));
+            }
+        }
+        // Negative control: the same rule keyed on the ROOT's IP must MISS
+        // (default-deny fires) — the firewall never saw the root's identity.
+        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9103)
+            .priority(i32::MAX)
+            .src_ip(IpCidrMatch::host(global.our_ip))
+            .action(FirewallAction::Accept)
+            .build()]);
+        match net::transmit_udp_datagram(dst, &datagram, cid) {
+            Err(TxError::FirewallDenied) => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 7 (control): root-IP-keyed rule must miss and default-deny must \
+                     fire, got {:?}",
+                    other
+                ));
+            }
+        }
+        let fw4 = fw.stats();
+        if fw4.default_hits != fw3.default_hits + 1 || fw4.packets_accepted != fw3.packets_accepted
+        {
+            return TestResult::Fail(alloc::format!(
+                "leg 7 (control): a rule keyed on the ROOT's IP must NOT match a child \
+                 send (default_hits {} -> {}, accepted {} -> {})",
+                fw3.default_hits,
+                fw4.default_hits,
+                fw3.packets_accepted,
+                fw4.packets_accepted
+            ));
+        }
+        // The default-denied control send must die at the firewall, BEFORE
+        // L2 resolution — no new cache activity in the child namespace.
+        if child.arp_cache().lock().len() != 1 {
+            return TestResult::Fail(String::from(
+                "leg 7 (control): a firewall-denied send must not reach L2 resolution",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3 NETNS-ROUTING Per-Namespace Next-Hop Selection Test (netns_routing)
+// ============================================================================
+
+/// D3 NETNS-ROUTING (PO-NET-01 §4.3 Phase 3 item 8): per-namespace next-hop
+/// selection from the namespace's OWN addressing snapshot.
+///
+/// Legs:
+/// 1. `next_hop` classification table on a /24 config — specials
+///    (unspecified / limited broadcast / multicast) are Unroutable, self +
+///    loopback are Local, the subnet's network and directed-broadcast
+///    addresses are Unroutable, neighbors (including the gateway itself)
+///    are OnLink, everything off-subnet is Gateway. Plus RFC 3021 /31:
+///    the .255 peer classifies OnLink (never broadcast), self is Local.
+/// 2. REAL-SEAM proofs through `resolve_dst_mac` on a configured child
+///    (Codex round-13: classification alone proves nothing about the
+///    resolution path): (a) on-link neighbor with a cache entry resolves
+///    to the NEIGHBOR MAC — the first time the stack emits neighbor-exact
+///    L2; (b) an off-link destination resolves to the gateway even when a
+///    mapping for it is planted (routing decision outranks cache — closes
+///    the planted-off-link-steering surface); (c) an on-link MISS falls
+///    back to the gateway MAC and increments the namespace's
+///    `neighbor_fallbacks` meter exactly once (the temporary
+///    compatibility debt, measurable until ARP request-TX lands);
+///    (d) Local/Unroutable destinations fail closed `Err(Unreachable)` at
+///    the seam; (e) the gateway itself resolves through its static seed;
+///    (f) root regression: an on-link SLIRP host (10.0.2.3) still
+///    resolves to the gateway MAC — wire bytes identical to pre-routing;
+///    (g) unknown namespace: cache-free arm returns the snapshot gateway
+///    (fail-closed downstream at the TX ownership gate).
+///
+/// Clock: direct cache inserts only (no `process_frame`) — ARP token
+/// buckets never tick; plants use ≥360 000 per the watermark discipline.
+/// `resolve_dst_mac` reads real ticks internally: `saturating_sub` makes
+/// future-stamped plants simply "fresh", never stale.
+struct NetNsRoutingTest;
+
+impl RuntimeTest for NetNsRoutingTest {
+    fn name(&self) -> &'static str {
+        "netns_routing"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::{clone_net_namespace, ROOT_NET_NAMESPACE};
+        use net::{NextHop, TxError};
+
+        // Leg 1: pure classification on a /24 snapshot.
+        let cfg = net::NetConfigSnapshot {
+            our_ip: net::Ipv4Addr([10, 87, 0, 2]),
+            our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x87, 0x02]),
+            gateway_ip: net::Ipv4Addr([10, 87, 0, 1]),
+            gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x87, 0x01]),
+            subnet_prefix_len: 24,
+        };
+        let table = [
+            (
+                net::Ipv4Addr([0, 0, 0, 0]),
+                NextHop::Unroutable,
+                "unspecified",
+            ),
+            (
+                net::Ipv4Addr([255, 255, 255, 255]),
+                NextHop::Unroutable,
+                "limited broadcast",
+            ),
+            (
+                net::Ipv4Addr([224, 0, 0, 1]),
+                NextHop::Unroutable,
+                "multicast",
+            ),
+            (net::Ipv4Addr([10, 87, 0, 2]), NextHop::Local, "self"),
+            (net::Ipv4Addr([127, 0, 0, 1]), NextHop::Local, "loopback"),
+            (
+                net::Ipv4Addr([10, 87, 0, 0]),
+                NextHop::Unroutable,
+                "subnet network address",
+            ),
+            (
+                net::Ipv4Addr([10, 87, 0, 255]),
+                NextHop::Unroutable,
+                "subnet directed broadcast",
+            ),
+            (
+                net::Ipv4Addr([10, 87, 0, 9]),
+                NextHop::OnLink,
+                "on-link neighbor",
+            ),
+            (
+                net::Ipv4Addr([10, 87, 0, 1]),
+                NextHop::OnLink,
+                "the gateway itself",
+            ),
+            (net::Ipv4Addr([192, 0, 2, 9]), NextHop::Gateway, "off-link"),
+            (
+                net::Ipv4Addr([10, 88, 0, 9]),
+                NextHop::Gateway,
+                "adjacent-subnet off-link",
+            ),
+        ];
+        for (dst, want, what) in table {
+            let got = net::next_hop(dst, &cfg);
+            if got != want {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: {} must classify {:?}, got {:?}",
+                    what,
+                    want,
+                    got
+                ));
+            }
+        }
+        // RFC 3021 /31: the .255 peer is a HOST (OnLink), never broadcast.
+        let cfg31 = net::NetConfigSnapshot {
+            our_ip: net::Ipv4Addr([10, 85, 1, 254]),
+            our_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x85, 0x04]),
+            gateway_ip: net::Ipv4Addr([10, 85, 1, 255]),
+            gateway_mac: net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x85, 0x05]),
+            subnet_prefix_len: 31,
+        };
+        if net::next_hop(net::Ipv4Addr([10, 85, 1, 255]), &cfg31) != NextHop::OnLink {
+            return TestResult::Fail(String::from(
+                "leg 1: /31 .255 peer must classify OnLink (RFC 3021), not broadcast",
+            ));
+        }
+        if net::next_hop(net::Ipv4Addr([10, 85, 1, 254]), &cfg31) != NextHop::Local {
+            return TestResult::Fail(String::from("leg 1: /31 self must classify Local"));
+        }
+
+        // Leg 2: real-seam resolution on a configured child namespace.
+        let child = match clone_net_namespace(ROOT_NET_NAMESPACE.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: clone_net_namespace failed: {:?}",
+                    e
+                ));
+            }
+        };
+        let cid = child.id().raw();
+        if let Err(e) = child.set_net_config(cfg) {
+            return TestResult::Fail(alloc::format!("leg 2: set_net_config failed: {:?}", e));
+        }
+        let neighbor_ip = net::Ipv4Addr([10, 87, 0, 9]);
+        let neighbor_mac = net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x87, 0x09]);
+        let offlink_ip = net::Ipv4Addr([192, 0, 2, 9]);
+        let planted_offlink_mac = net::EthAddr([0x02, 0x00, 0x00, 0x00, 0x0f, 0x0f]);
+        let plant_ms = 360_000u64;
+        let fb_base;
+        {
+            let cache = child.arp_cache();
+            let mut c = cache.lock();
+            if let Err(e) = c.insert(
+                neighbor_ip,
+                neighbor_mac,
+                net::arp::ArpEntryKind::Dynamic,
+                plant_ms,
+            ) {
+                return TestResult::Fail(alloc::format!("leg 2: neighbor plant failed: {:?}", e));
+            }
+            fb_base = c.neighbor_fallbacks();
+        }
+
+        // (a) On-link neighbor with an entry resolves to the NEIGHBOR MAC.
+        match net::resolve_dst_mac(neighbor_ip, &cfg, cid) {
+            Ok(mac) if mac == neighbor_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2a: on-link neighbor must resolve to its OWN MAC, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // (b) Off-link resolves to the gateway — even with a planted entry.
+        match net::resolve_dst_mac(offlink_ip, &cfg, cid) {
+            Ok(mac) if mac == cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2b: off-link must resolve to the gateway, got {:?}",
+                    other
+                ));
+            }
+        }
+        {
+            let cache = child.arp_cache();
+            let mut c = cache.lock();
+            if let Err(e) = c.insert(
+                offlink_ip,
+                planted_offlink_mac,
+                net::arp::ArpEntryKind::Dynamic,
+                plant_ms + 100,
+            ) {
+                return TestResult::Fail(alloc::format!("leg 2b: off-link plant failed: {:?}", e));
+            }
+        }
+        match net::resolve_dst_mac(offlink_ip, &cfg, cid) {
+            Ok(mac) if mac == cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2b: a PLANTED off-link mapping must not steer the frame — gateway \
+                     required, got {:?}",
+                    other
+                ));
+            }
+        }
+        // Off-link resolves never touch the fallback meter.
+        if child.arp_cache().lock().neighbor_fallbacks() != fb_base {
+            return TestResult::Fail(String::from(
+                "leg 2b: off-link resolution must not count as an on-link fallback",
+            ));
+        }
+
+        // (c) On-link MISS: gateway fallback, metered exactly once.
+        match net::resolve_dst_mac(net::Ipv4Addr([10, 87, 0, 77]), &cfg, cid) {
+            Ok(mac) if mac == cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2c: on-link miss must fall back to the gateway (temporary, \
+                     metered), got {:?}",
+                    other
+                ));
+            }
+        }
+        let fb_after = child.arp_cache().lock().neighbor_fallbacks();
+        if fb_after != fb_base + 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2c: exactly one metered fallback expected ({} -> {})",
+                fb_base,
+                fb_after
+            ));
+        }
+
+        // (d) Local / Unroutable fail closed at the seam.
+        for (dst, what) in [
+            (cfg.our_ip, "self"),
+            (net::Ipv4Addr([224, 0, 0, 1]), "multicast"),
+            (net::Ipv4Addr([10, 87, 0, 255]), "subnet directed broadcast"),
+        ] {
+            match net::resolve_dst_mac(dst, &cfg, cid) {
+                Err(TxError::Unreachable) => {}
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 2d: {} must be Err(Unreachable), got {:?}",
+                        what,
+                        other
+                    ));
+                }
+            }
+        }
+
+        // (e) The gateway itself resolves through its static seed.
+        match net::resolve_dst_mac(cfg.gateway_ip, &cfg, cid) {
+            Ok(mac) if mac == cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2e: the gateway must resolve via its static seed, got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // (f) Root regression: on-link SLIRP hosts keep their pre-routing
+        // wire bytes (gateway MAC via the metered fallback).
+        let root_cfg = net::network_config();
+        match net::resolve_dst_mac(net::Ipv4Addr([10, 0, 2, 3]), &root_cfg, 0) {
+            Ok(mac) if mac == root_cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2f: root on-link SLIRP host must still resolve to the gateway \
+                     MAC (wire-behavior preservation), got {:?}",
+                    other
+                ));
+            }
+        }
+
+        // (g) Unknown namespace: cache-free arm returns the snapshot
+        // gateway; the TX ownership gate downstream is what denies it.
+        match net::resolve_dst_mac(neighbor_ip, &cfg, u64::MAX) {
+            Ok(mac) if mac == cfg.gateway_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2g: unknown-ns cache-free arm must return the snapshot gateway, \
+                     got {:?}",
+                    other
+                ));
+            }
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE RX Ingress Loop Test (netns_rx_ingress)
+// ============================================================================
+
+/// Shared state between the test body and the registered synthetic device
+/// (the registry hands out no handles, so the device and the test communicate
+/// through this Arc). Frames are stored as raw bytes; the device materializes
+/// a `NetBuf` (DMA-backed) only when the ingress loop pops one.
+struct RxIngressTestShared {
+    frames: alloc::collections::VecDeque<Vec<u8>>,
+    /// One-shot: next `receive()` returns `Err(IoError)` and disarms, proving
+    /// the loop counts the error and moves on (bounded, no spin).
+    error_arm: bool,
+}
+
+/// The registry has no removal API, so the device (and this shared state)
+/// lives for the kernel's lifetime; a re-run of the suite reuses both.
+static RX_INGRESS_TEST_SHARED: spin::Once<alloc::sync::Arc<spin::Mutex<RxIngressTestShared>>> =
+    spin::Once::new();
+
+/// Deterministic `NetDevice` for gating the RX ingress loop: yields exactly
+/// the frames the test plants, in FIFO order. TX-inert by contract — ingress
+/// replies are attributed to the root namespace and egress via the TX
+/// resolver's device ("eth0"), so any transmit landing here is a regression.
+struct SyntheticRxDevice {
+    shared: alloc::sync::Arc<spin::Mutex<RxIngressTestShared>>,
+}
+
+impl net::NetDevice for SyntheticRxDevice {
+    fn name(&self) -> &str {
+        "rxtest0"
+    }
+
+    fn mac_address(&self) -> net::MacAddress {
+        [0x02, 0x00, 0x00, 0x00, 0xa2, 0x00]
+    }
+
+    fn set_mac_address(&mut self, _mac: net::MacAddress) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn capabilities(&self) -> net::DeviceCaps {
+        net::DeviceCaps::minimal()
+    }
+
+    fn link_status(&self) -> net::LinkStatus {
+        net::LinkStatus::UP_UNKNOWN
+    }
+
+    fn operating_mode(&self) -> net::OperatingMode {
+        net::OperatingMode::Polling
+    }
+
+    fn set_operating_mode(&mut self, mode: net::OperatingMode) -> Result<(), net::NetError> {
+        if mode == net::OperatingMode::Polling {
+            Ok(())
+        } else {
+            Err(net::NetError::NotSupported)
+        }
+    }
+
+    fn enable_interrupts(&mut self) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn disable_interrupts(&mut self) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn transmit(&mut self, buf: net::NetBuf) -> Result<(), (net::TxError, net::NetBuf)> {
+        // See type doc: nothing may egress through the synthetic RX device.
+        Err((net::TxError::IoError, buf))
+    }
+
+    fn reclaim_tx(&mut self) -> usize {
+        0
+    }
+
+    fn tx_queue_space(&self) -> usize {
+        0
+    }
+
+    fn receive(&mut self) -> Result<Option<net::NetBuf>, net::RxError> {
+        let bytes = {
+            let mut shared = self.shared.lock();
+            if shared.error_arm {
+                shared.error_arm = false;
+                return Err(net::RxError::IoError);
+            }
+            match shared.frames.pop_front() {
+                Some(bytes) => bytes,
+                None => return Ok(None),
+            }
+            // Shared lock released before DMA allocation below.
+        };
+        let dma = match mm::dma::alloc_dma_buffer(mm::dma::DMA_PAGE_SIZE) {
+            Ok(dma) => dma,
+            Err(_) => return Err(net::RxError::BufferError),
+        };
+        let mut buf = match net::NetBuf::with_defaults(dma) {
+            Some(buf) => buf,
+            None => return Err(net::RxError::BufferError),
+        };
+        match buf.push_tail(bytes.len()) {
+            Some(data) => data.copy_from_slice(&bytes),
+            None => return Err(net::RxError::BufferError),
+        }
+        Ok(Some(buf))
+    }
+
+    fn replenish_rx(&mut self, _pool: &net::BufPool, _count: usize) -> usize {
+        0
+    }
+
+    fn rx_owned_rx_buffers(&self) -> usize {
+        // Owns NO pool buffers — frames are self-allocated inside receive(),
+        // and the replenish offer above is refused. The planted-queue length
+        // is deliberately NOT reported here: this counter feeds the ingress
+        // loop's pool-cap math, not a backlog gauge.
+        0
+    }
+
+    fn supports_rx_replenishment(&self) -> bool {
+        // Permanently refuses pool stocking — shortfall telemetry must not
+        // count this device (round-24: telemetry routing only).
+        false
+    }
+
+    fn poll(&mut self) -> bool {
+        false
+    }
+
+    fn handle_interrupt(&mut self) {}
+}
+
+/// D3-NETNS-DATAPLANE RX-INGRESS: deterministic gating of the bounded RX
+/// ingress loop through a synthetic device registered in the REAL registry —
+/// the loop's device enumeration, budget accounting, per-frame processing,
+/// reply egress, and loop-level counters are all observed end to end.
+///
+/// Determinism (RX-COMPLETION rework): eth0 RX is LIVE now, and the host
+/// side emits unsolicited frames (SLIRP IPv6 router advertisements etc.) at
+/// arbitrary times — exact frame counts against the full device set are
+/// impossible. Every counting leg therefore drains through
+/// `rx_ingress_poll_filtered(.., &["rxtest0"])`, the capability-narrowed
+/// test entry: the synthetic device fully determines every filtered poll
+/// outcome, and `processed` asserts stay EXACT. Background polls are
+/// quiesced for the test's whole body: idle-loop `schedule()` on any CPU
+/// otherwise drives the throttled drain, and a background steal would
+/// process planted frames at the REAL clock against this test's fake clocks
+/// (learning entries that then look expired, and advancing shared ARP token
+/// buckets).
+///
+/// Clock discipline: ARP token buckets enforce monotonic time and the ARP
+/// clock watermark before this test is 360_000 — this test uses
+/// 420_000..=420_500. The NEXT ARP test must use now_ms >= 480_000 (the
+/// SLIRP round-trip test consumes 480_000..=486_400 with a pass-advancing
+/// base; see NetNsRxEth0SlirpTest).
+struct NetNsRxIngressTest;
+
+impl NetNsRxIngressTest {
+    fn eth0_snapshot() -> Result<net::DeviceTxStats, TestResult> {
+        net::device_tx_stats("eth0").ok_or_else(|| {
+            TestResult::Fail(String::from("eth0 TX stats became unavailable mid-test"))
+        })
+    }
+
+    /// Driver enqueues between two coherent snapshots (same signed invariant
+    /// as `NetNsTxIsolationTest::enq_delta` — tolerant of async completion).
+    fn enq_delta(a: &net::DeviceTxStats, b: &net::DeviceTxStats) -> i64 {
+        (b.tx_packets as i64 - a.tx_packets as i64)
+            + (a.tx_queue_space as i64 - b.tx_queue_space as i64)
+    }
+
+    fn root_lookup(ip: net::Ipv4Addr, now_ms: u64) -> Option<net::EthAddr> {
+        kernel_core::net_namespace::lookup_net_ns(0)
+            .and_then(|ns| ns.arp_cache().lock().lookup(ip, now_ms))
+    }
+}
+
+impl RuntimeTest for NetNsRxIngressTest {
+    fn name(&self) -> &'static str {
+        "netns_rx_ingress"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3-NETNS-DATAPLANE bounded RX ingress loop via a synthetic registry device"
+    }
+
+    fn run(&self) -> TestResult {
+        use core::sync::atomic::Ordering;
+        use net::{arp, EthAddr, Ipv4Addr};
+
+        // Quiesce background RX polling for the whole test body (RAII-scoped,
+        // and a barrier: no in-flight background poll survives this call).
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        // Leg 0: preconditions. QEMU virtio-net registers eth0 under `make
+        // test`; the reply-TX leg egresses through it.
+        if net::device_index("eth0").is_none() {
+            return TestResult::Warning(String::from(
+                "eth0 absent — RX-ingress reply legs need QEMU virtio-net (make test provides it)",
+            ));
+        }
+        let cfg = match net::tx_net_config(0) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 0: root net config must be available, got {:?}",
+                    e
+                ));
+            }
+        };
+        if cfg.our_mac.0 == [0u8; 6] {
+            return TestResult::Fail(String::from(
+                "leg 0: root MAC still zero (autodetect should have filled it with eth0 present)",
+            ));
+        }
+
+        let shared = RX_INGRESS_TEST_SHARED
+            .call_once(|| {
+                alloc::sync::Arc::new(spin::Mutex::new(RxIngressTestShared {
+                    frames: alloc::collections::VecDeque::new(),
+                    error_arm: false,
+                }))
+            })
+            .clone();
+        if net::device_index("rxtest0").is_none() {
+            if let Err(e) = net::register_device(SyntheticRxDevice {
+                shared: shared.clone(),
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 0: synthetic device registration failed: {:?}",
+                    e
+                ));
+            }
+        }
+        let plant = |bytes: Vec<u8>| shared.lock().frames.push_back(bytes);
+
+        // Neighbor fixtures on the root subnet: dodge our_ip, the gateway
+        // (its cache entry is a Static seed — a dynamic insert for it would
+        // CacheConflict), and the .0/.255-adjacent source validation.
+        let mut neighbor = cfg.our_ip.octets();
+        neighbor[3] = 0x4d;
+        let neighbor_ip = Ipv4Addr(neighbor);
+        let mut requester = cfg.our_ip.octets();
+        requester[3] = 0x4e;
+        let requester_ip = Ipv4Addr(requester);
+        if neighbor_ip == cfg.our_ip
+            || neighbor_ip == cfg.gateway_ip
+            || requester_ip == cfg.our_ip
+            || requester_ip == cfg.gateway_ip
+        {
+            return TestResult::Fail(alloc::format!(
+                "leg 0: fixture IPs {:?}/{:?} collide with root addressing {:?}/{:?}",
+                neighbor_ip,
+                requester_ip,
+                cfg.our_ip,
+                cfg.gateway_ip
+            ));
+        }
+        let neighbor_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0xa2, 0x4d]);
+        let requester_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0xa2, 0x4e]);
+
+        let c0 = net::rx_ingress_counters();
+        let ingress_stats = net::rx_ingress_net_stats();
+
+        // Leg 1: ARP-reply cache warming THROUGH the loop — a planted reply
+        // addressed to the real root identity is popped from the synthetic
+        // device, processed as root (v1 attribution), and learned into ROOT's
+        // per-ns cache. R65-7 context: replies addressed to us may learn.
+        let now1 = 420_000u64;
+        let reply = arp::build_arp_reply(neighbor_mac, neighbor_ip, cfg.our_mac, cfg.our_ip);
+        if reply.is_empty() {
+            return TestResult::Fail(String::from("leg 1: ARP reply frame admission failed"));
+        }
+        plant(reply.to_vec());
+        let processed = net::rx_ingress_poll_filtered(now1, 8, &["rxtest0"]);
+        if processed != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: poll must process exactly the planted frame (eth0 is \
+                 receive-inert), got {}",
+                processed
+            ));
+        }
+        if Self::root_lookup(neighbor_ip, now1) != Some(neighbor_mac) {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: root cache must have learned {:?} -> {:?} via the ingress loop",
+                neighbor_ip,
+                neighbor_mac
+            ));
+        }
+        if !shared.lock().frames.is_empty() {
+            return TestResult::Fail(String::from("leg 1: device queue must be drained"));
+        }
+
+        // Leg 2: reply egress — an ARP request for our IP makes the loop
+        // build a reply and transmit it through the namespace-gated prepared-
+        // reply path onto eth0 (observed as exactly one driver enqueue).
+        // R65-7: the REQUESTER's mapping must NOT be learned.
+        let now2 = 420_100u64;
+        let req = arp::build_arp_request(requester_mac, requester_ip, cfg.our_ip);
+        if req.is_empty() {
+            return TestResult::Fail(String::from("leg 2: ARP request frame admission failed"));
+        }
+        let tx_replies_before = ingress_stats.arp_stats.tx_replies.load(Ordering::Relaxed);
+        let s0 = match Self::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        plant(req.to_vec());
+        let processed = net::rx_ingress_poll_filtered(now2, 8, &["rxtest0"]);
+        if processed != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: poll must process exactly the planted request, got {}",
+                processed
+            ));
+        }
+        let s1 = match Self::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if Self::enq_delta(&s0, &s1) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: the ARP reply must egress via eth0 (want enq_delta 1, got {})",
+                Self::enq_delta(&s0, &s1)
+            ));
+        }
+        let tx_replies_after = ingress_stats.arp_stats.tx_replies.load(Ordering::Relaxed);
+        if tx_replies_after != tx_replies_before + 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: committed ARP reply must tick tx_replies (want +1, got {} -> {})",
+                tx_replies_before,
+                tx_replies_after
+            ));
+        }
+        if Self::root_lookup(requester_ip, now2).is_some() {
+            return TestResult::Fail(String::from(
+                "leg 2: R65-7 violation — an ARP REQUEST must never learn the requester",
+            ));
+        }
+
+        // Leg 3: a malformed runt frame consumes budget and is counted by the
+        // protocol-layer ledger, never wedging the loop. With budget == 1 the
+        // poll consumes its entire budget, so the (documented, conservative)
+        // budget_exhausted counter ticks even though the queue is now empty.
+        let now3 = 420_200u64;
+        let net_rx_errors_before = ingress_stats.rx_errors.load(Ordering::Relaxed);
+        let exhausted_before = net::rx_ingress_counters().budget_exhausted;
+        plant(alloc::vec![0u8; 10]);
+        let processed = net::rx_ingress_poll_filtered(now3, 1, &["rxtest0"]);
+        if processed != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: the runt frame must be received and consume budget, got {}",
+                processed
+            ));
+        }
+        let net_rx_errors_after = ingress_stats.rx_errors.load(Ordering::Relaxed);
+        if net_rx_errors_after != net_rx_errors_before + 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: the runt must be dropped as a parse error (want +1, got {} -> {})",
+                net_rx_errors_before,
+                net_rx_errors_after
+            ));
+        }
+        if net::rx_ingress_counters().budget_exhausted != exhausted_before + 1 {
+            return TestResult::Fail(String::from(
+                "leg 3: a poll that consumes its whole budget must tick budget_exhausted",
+            ));
+        }
+
+        // Leg 4: budget exhaustion leaves excess frames QUEUED (not dropped);
+        // a second drain finishes the backlog without re-ticking exhaustion.
+        let now4 = 420_300u64;
+        let fixtures = [
+            (
+                Ipv4Addr([neighbor[0], neighbor[1], neighbor[2], 0x51]),
+                EthAddr([0x02, 0, 0, 0, 0xa2, 0x51]),
+            ),
+            (
+                Ipv4Addr([neighbor[0], neighbor[1], neighbor[2], 0x52]),
+                EthAddr([0x02, 0, 0, 0, 0xa2, 0x52]),
+            ),
+            (
+                Ipv4Addr([neighbor[0], neighbor[1], neighbor[2], 0x53]),
+                EthAddr([0x02, 0, 0, 0, 0xa2, 0x53]),
+            ),
+        ];
+        for (ip, mac) in fixtures.iter() {
+            let frame = arp::build_arp_reply(*mac, *ip, cfg.our_mac, cfg.our_ip);
+            if frame.is_empty() {
+                return TestResult::Fail(String::from("leg 4: ARP reply frame admission failed"));
+            }
+            plant(frame.to_vec());
+        }
+        let exhausted_before = net::rx_ingress_counters().budget_exhausted;
+        let processed = net::rx_ingress_poll_filtered(now4, 2, &["rxtest0"]);
+        if processed != 2 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: budget 2 must process exactly 2 of 3 frames, got {}",
+                processed
+            ));
+        }
+        if net::rx_ingress_counters().budget_exhausted != exhausted_before + 1 {
+            return TestResult::Fail(String::from(
+                "leg 4: exhausting the budget with work remaining must tick budget_exhausted",
+            ));
+        }
+        if shared.lock().frames.len() != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: the third frame must stay queued, queue len {}",
+                shared.lock().frames.len()
+            ));
+        }
+        let processed = net::rx_ingress_poll_filtered(now4, 8, &["rxtest0"]);
+        if processed != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: second drain must process the queued remainder, got {}",
+                processed
+            ));
+        }
+        if net::rx_ingress_counters().budget_exhausted != exhausted_before + 1 {
+            return TestResult::Fail(String::from(
+                "leg 4: a drain that empties the devices under budget must NOT tick \
+                 budget_exhausted",
+            ));
+        }
+        for (ip, mac) in fixtures.iter() {
+            if Self::root_lookup(*ip, now4) != Some(*mac) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 4: {:?} -> {:?} must be learned across the two drains",
+                    ip,
+                    mac
+                ));
+            }
+        }
+
+        // Leg 5: a device receive() error is counted once and bounded — the
+        // loop moves on (no spin, no wedge) and the next poll is clean.
+        let now5 = 420_400u64;
+        let rx_errors_before = net::rx_ingress_counters().rx_errors;
+        shared.lock().error_arm = true;
+        let processed = net::rx_ingress_poll_filtered(now5, 8, &["rxtest0"]);
+        if processed != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 5: an error poll must process nothing, got {}",
+                processed
+            ));
+        }
+        if net::rx_ingress_counters().rx_errors != rx_errors_before + 1 {
+            return TestResult::Fail(String::from(
+                "leg 5: the armed receive() error must tick rx_errors exactly once",
+            ));
+        }
+        let processed = net::rx_ingress_poll_filtered(now5, 8, &["rxtest0"]);
+        if processed != 0 || net::rx_ingress_counters().rx_errors != rx_errors_before + 1 {
+            return TestResult::Fail(String::from(
+                "leg 5: the error must be one-shot (disarmed) and never re-counted",
+            ));
+        }
+
+        // Leg 6: the quiesce guard gates the THROTTLED background entry (the
+        // production drain site) but not explicit polls — a planted frame
+        // survives a throttled call and drains explicitly.
+        let now6 = 420_500u64;
+        let frame = arp::build_arp_reply(neighbor_mac, neighbor_ip, cfg.our_mac, cfg.our_ip);
+        if frame.is_empty() {
+            return TestResult::Fail(String::from("leg 6: ARP reply frame admission failed"));
+        }
+        plant(frame.to_vec());
+        if net::rx_ingress_poll_throttled(now6) != 0 || shared.lock().frames.len() != 1 {
+            return TestResult::Fail(String::from(
+                "leg 6: a quiesced throttled poll must be a no-op with the frame left queued",
+            ));
+        }
+        let processed = net::rx_ingress_poll_filtered(now6, 8, &["rxtest0"]);
+        if processed != 1 || !shared.lock().frames.is_empty() {
+            return TestResult::Fail(alloc::format!(
+                "leg 6: the explicit poll must drain the queued frame, got {}",
+                processed
+            ));
+        }
+
+        // Whole-test invariants: the owner-context and reply-TX failure paths
+        // must never have fired (hooks + root config were present throughout;
+        // every reply enqueue succeeded — those two arms are untestable in
+        // this harness in the FIRING direction, so zero-delta is the test).
+        // The device queue ends EMPTY, so the re-enabled background poll
+        // (guard drop) finds only inert devices.
+        let c1 = net::rx_ingress_counters();
+        if c1.owner_unavailable_skips != c0.owner_unavailable_skips {
+            return TestResult::Fail(String::from(
+                "invariant: owner_unavailable_skips must stay untouched with hooks registered",
+            ));
+        }
+        if c1.reply_tx_failures != c0.reply_tx_failures {
+            return TestResult::Fail(alloc::format!(
+                "invariant: no reply TX may fail in this test (delta {})",
+                c1.reply_tx_failures - c0.reply_tx_failures
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE RX Pool Lifecycle Test (netns_rx_pool_lifecycle)
+// ============================================================================
+
+/// Shared state for the POOLED synthetic device: `planted` payloads are
+/// delivered by filling buffers previously stocked FROM the shared RX pool
+/// via `replenish_rx` — the faithful pool-origin lifecycle, unlike
+/// `SyntheticRxDevice`'s self-allocated frames.
+struct RxPoolTestShared {
+    planted: alloc::collections::VecDeque<Vec<u8>>,
+    stocked: Vec<net::NetBuf>,
+}
+
+/// Same lifetime story as `RX_INGRESS_TEST_SHARED`: the registry has no
+/// removal, so the device and this state live for the kernel's lifetime.
+static RX_POOL_TEST_SHARED: spin::Once<alloc::sync::Arc<spin::Mutex<RxPoolTestShared>>> =
+    spin::Once::new();
+
+/// Deterministic pool-origin `NetDevice`: the ingress loop stocks it from the
+/// shared pool (`replenish_to_cap`), `receive()` fills one stocked buffer per
+/// planted payload, and the loop's `try_free` sends the buffer home — the
+/// exact lifecycle eth0 exercises, minus the hardware. TX-inert by contract.
+struct SyntheticPooledRxDevice {
+    shared: alloc::sync::Arc<spin::Mutex<RxPoolTestShared>>,
+}
+
+impl net::NetDevice for SyntheticPooledRxDevice {
+    fn name(&self) -> &str {
+        "rxpool0"
+    }
+
+    fn mac_address(&self) -> net::MacAddress {
+        [0x02, 0x00, 0x00, 0x00, 0xa3, 0x00]
+    }
+
+    fn set_mac_address(&mut self, _mac: net::MacAddress) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn capabilities(&self) -> net::DeviceCaps {
+        net::DeviceCaps::minimal()
+    }
+
+    fn link_status(&self) -> net::LinkStatus {
+        net::LinkStatus::UP_UNKNOWN
+    }
+
+    fn operating_mode(&self) -> net::OperatingMode {
+        net::OperatingMode::Polling
+    }
+
+    fn set_operating_mode(&mut self, mode: net::OperatingMode) -> Result<(), net::NetError> {
+        if mode == net::OperatingMode::Polling {
+            Ok(())
+        } else {
+            Err(net::NetError::NotSupported)
+        }
+    }
+
+    fn enable_interrupts(&mut self) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn disable_interrupts(&mut self) -> Result<(), net::NetError> {
+        Err(net::NetError::NotSupported)
+    }
+
+    fn transmit(&mut self, buf: net::NetBuf) -> Result<(), (net::TxError, net::NetBuf)> {
+        Err((net::TxError::IoError, buf))
+    }
+
+    fn reclaim_tx(&mut self) -> usize {
+        0
+    }
+
+    fn tx_queue_space(&self) -> usize {
+        0
+    }
+
+    fn receive(&mut self) -> Result<Option<net::NetBuf>, net::RxError> {
+        let mut shared = self.shared.lock();
+        if shared.planted.is_empty() {
+            return Ok(None);
+        }
+        // Starved of stocked buffers => report empty and leave the payload
+        // queued (mirrors a NIC with no posted descriptors).
+        let Some(mut buf) = shared.stocked.pop() else {
+            return Ok(None);
+        };
+        let bytes = shared.planted.pop_front().expect("checked non-empty above");
+        match buf.push_tail(bytes.len()) {
+            Some(data) => data.copy_from_slice(&bytes),
+            None => {
+                // Fixture larger than a reset buffer's tailroom — a test bug;
+                // restock the untouched buffer and surface a device error.
+                shared.stocked.push(buf);
+                return Err(net::RxError::BufferError);
+            }
+        }
+        Ok(Some(buf))
+    }
+
+    fn replenish_rx(&mut self, pool: &net::BufPool, count: usize) -> usize {
+        let mut shared = self.shared.lock();
+        let mut posted = 0;
+        for _ in 0..count {
+            match pool.alloc() {
+                Some(buf) => {
+                    shared.stocked.push(buf);
+                    posted += 1;
+                }
+                None => break,
+            }
+        }
+        posted
+    }
+
+    fn rx_owned_rx_buffers(&self) -> usize {
+        // Every stocked buffer is pool-origin and owned by this device — the
+        // exact quantity the ingress loop's cap math must see.
+        self.shared.lock().stocked.len()
+    }
+
+    fn poll(&mut self) -> bool {
+        false
+    }
+
+    fn handle_interrupt(&mut self) {}
+}
+
+/// D3-NETNS-DATAPLANE RX-COMPLETION: the shared-pool buffer lifecycle,
+/// deterministically — full-or-retry install, stock-to-cap, the per-device
+/// owned cap, return-home steady state (the round-20 forcing fact: without
+/// the loop's `try_free` a fixed pool drains permanently), foreign-buffer
+/// origin discrimination, and (in_use + available == total) ledger parity.
+///
+/// Determinism: every poll is capability-filtered to the synthetic devices,
+/// and the background drain is quiesced, so eth0's owned-buffer count is
+/// FROZEN for the whole body (completions may land in its used ring, but
+/// ownership only moves inside a poll that includes eth0) — pool in_use
+/// deltas are therefore exactly the synthetic devices' doing.
+///
+/// Clock: non-ARP garbage frames only — no ARP/ICMP token bucket contact, so
+/// small fixed fake clocks are safe regardless of the ARP watermark.
+struct NetNsRxPoolLifecycleTest;
+
+impl RuntimeTest for NetNsRxPoolLifecycleTest {
+    fn name(&self) -> &'static str {
+        "netns_rx_pool_lifecycle"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify D3 RX shared-pool stock/return-home/cap/provenance lifecycle"
+    }
+
+    fn run(&self) -> TestResult {
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        // Leg 0: devices (idempotent — the registry has no removal API).
+        let pool_shared = RX_POOL_TEST_SHARED
+            .call_once(|| {
+                alloc::sync::Arc::new(spin::Mutex::new(RxPoolTestShared {
+                    planted: alloc::collections::VecDeque::new(),
+                    stocked: Vec::new(),
+                }))
+            })
+            .clone();
+        if net::device_index("rxpool0").is_none() {
+            if let Err(e) = net::register_device(SyntheticPooledRxDevice {
+                shared: pool_shared.clone(),
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 0: rxpool0 registration failed: {:?}",
+                    e
+                ));
+            }
+        }
+        let rx_shared = RX_INGRESS_TEST_SHARED
+            .call_once(|| {
+                alloc::sync::Arc::new(spin::Mutex::new(RxIngressTestShared {
+                    frames: alloc::collections::VecDeque::new(),
+                    error_arm: false,
+                }))
+            })
+            .clone();
+        if net::device_index("rxtest0").is_none() {
+            if let Err(e) = net::register_device(SyntheticRxDevice {
+                shared: rx_shared.clone(),
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg 0: rxtest0 registration failed: {:?}",
+                    e
+                ));
+            }
+        }
+        let pool_stats = || net::rx_ingress_pool_stats();
+
+        // Leg 1: stock-to-cap. The filtered poll installs the pool
+        // (full-or-retry) and replenishes rxpool0 to the cap.
+        let processed = net::rx_ingress_poll_filtered(1_000, 8, &["rxpool0"]);
+        if processed != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: nothing planted, poll must process 0, got {}",
+                processed
+            ));
+        }
+        let s1 = match pool_stats() {
+            Some(s) => s,
+            None => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: shared pool must install full-or-retry (init failures: {})",
+                    net::rx_ingress_counters().pool_init_failures
+                ));
+            }
+        };
+        if s1.total != net::RX_BUF_POOL_SIZE {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: full-or-retry forbids partial installs (total {} != {})",
+                s1.total,
+                net::RX_BUF_POOL_SIZE
+            ));
+        }
+        if s1.dma_bytes != net::RX_BUF_POOL_SIZE * mm::dma::DMA_PAGE_SIZE {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: dma_bytes must report actual mapped bytes, got {}",
+                s1.dma_bytes
+            ));
+        }
+        let stocked = pool_shared.lock().stocked.len();
+        if stocked != net::RX_DEVICE_OUTSTANDING_CAP {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: rxpool0 must stock to the cap ({}), got {}",
+                net::RX_DEVICE_OUTSTANDING_CAP,
+                stocked
+            ));
+        }
+        if s1.in_use + s1.available != s1.total {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: ledger parity broken: {} + {} != {}",
+                s1.in_use,
+                s1.available,
+                s1.total
+            ));
+        }
+        if s1.in_use < stocked {
+            return TestResult::Fail(alloc::format!(
+                "leg 1: in_use {} cannot be below rxpool0's stocked {}",
+                s1.in_use,
+                stocked
+            ));
+        }
+
+        // Legs 2+3: return-home steady state + cap invariant. Each round
+        // delivers 3 runts THROUGH pool buffers; without the loop's try_free
+        // the pool would drift -3 available per round (permanent drain).
+        let baseline_in_use = s1.in_use;
+        for round in 0..3u64 {
+            for _ in 0..3 {
+                pool_shared.lock().planted.push_back(alloc::vec![0u8; 10]);
+            }
+            let processed = net::rx_ingress_poll_filtered(2_000 + round, 8, &["rxpool0"]);
+            if processed != 3 {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2 round {}: must process exactly the 3 planted runts, got {}",
+                    round,
+                    processed
+                ));
+            }
+            if !pool_shared.lock().planted.is_empty() {
+                return TestResult::Fail(alloc::format!("leg 2 round {}: backlog left", round));
+            }
+            let s = match pool_stats() {
+                Some(s) => s,
+                None => return TestResult::Fail(String::from("leg 2: pool stats vanished")),
+            };
+            if s.in_use != baseline_in_use {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2 round {}: return-home broken — in_use drifted {} -> {} \
+                     (fixed pool would drain permanently)",
+                    round,
+                    baseline_in_use,
+                    s.in_use
+                ));
+            }
+            if s.in_use + s.available != s.total {
+                return TestResult::Fail(alloc::format!("leg 2 round {}: parity broken", round));
+            }
+            let stocked = pool_shared.lock().stocked.len();
+            if stocked != net::RX_DEVICE_OUTSTANDING_CAP {
+                return TestResult::Fail(alloc::format!(
+                    "leg 3 round {}: post-drain replenish must restock to the cap \
+                     and never beyond it, got {}",
+                    round,
+                    stocked
+                ));
+            }
+        }
+
+        // Leg 4: origin discrimination — rxtest0's self-allocated frames are
+        // FOREIGN: processed normally, but try_free must reject them (a
+        // silent absorption would corrupt in_use and grow the fixed pool).
+        for _ in 0..2 {
+            rx_shared.lock().frames.push_back(alloc::vec![0u8; 10]);
+        }
+        let processed = net::rx_ingress_poll_filtered(3_000, 8, &["rxtest0"]);
+        if processed != 2 {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: both foreign runts must process, got {}",
+                processed
+            ));
+        }
+        let s4 = match pool_stats() {
+            Some(s) => s,
+            None => return TestResult::Fail(String::from("leg 4: pool stats vanished")),
+        };
+        if s4.in_use != baseline_in_use || s4.total != net::RX_BUF_POOL_SIZE {
+            return TestResult::Fail(alloc::format!(
+                "leg 4: foreign buffers must not enter the pool (in_use {} -> {}, total {})",
+                baseline_in_use,
+                s4.in_use,
+                s4.total
+            ));
+        }
+        if s4.in_use + s4.available != s4.total {
+            return TestResult::Fail(String::from("leg 4: parity broken"));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3-NETNS-DATAPLANE eth0 SLIRP RX Round-Trip (netns_rx_eth0_slirp) — GATING
+// ============================================================================
+
+/// Shared pass-advancing fake-clock allocator for EVERY fixed-clock ARP
+/// test beyond the 480_000 watermark: the global ARP token buckets are
+/// monotonic and shared, so each test — and each suite pass — must claim a
+/// FRESH clock window. Two INDEPENDENT pass-advancing bases would collide
+/// across suite passes (pass 2 of one test regressing below pass 1's usage
+/// of the other → fail-closed rate-limit drops); one allocator hands out
+/// strictly increasing 60_000 ms stripes in DRAW order, registration-
+/// agnostic. Each drawer may claim at most [base, base + 59_999].
+static ARP_TEST_CLOCK_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(480_000);
+
+fn alloc_arp_test_clock_window() -> u64 {
+    ARP_TEST_CLOCK_BASE.fetch_add(60_000, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII cleanup: a learned probe-target entry must not outlive its test.
+/// The routing test's root regression leg asserts 10.0.2.3 resolves via the
+/// GATEWAY (an on-link cache MISS) — a retained dynamic entry would silently
+/// change that leg's meaning on a suite re-run. Used by the SLIRP round-trip
+/// test (10.0.2.3) and the ARP probe-TX test (its per-pass targets).
+struct RootArpDynamicCleanup {
+    ip: net::Ipv4Addr,
+}
+
+impl Drop for RootArpDynamicCleanup {
+    fn drop(&mut self) {
+        if let Some(ns) = kernel_core::net_namespace::lookup_net_ns(0) {
+            ns.arp_cache().lock().remove_dynamic(self.ip);
+        }
+    }
+}
+
+/// D3-NETNS-DATAPLANE RX-COMPLETION GATING LEG (Codex round-20 step 6): a
+/// REAL external round trip — one ownership-gated ARP probe egresses eth0,
+/// QEMU's SLIRP answers for its DNS host, the ingress loop pops the reply
+/// from live virtio RX descriptors, and the root cache learns the mapping.
+/// This is the first packet the kernel has ever RECEIVED from outside.
+///
+/// Quiesce is MANDATORY here, not a nicety: a background steal would process
+/// the reply at the REAL clock, which the monotonic ARP buckets (advanced to
+/// fake ~486k by earlier tests) rate-limit into a silent drop — the reply
+/// must be consumed by this test's own fake-clock polls.
+///
+/// Probe target = 10.0.2.3 (SLIRP's DNS host), NOT the gateway: the gateway
+/// mapping is a STATIC seed the cache correctly refuses to overwrite, so a
+/// gateway probe would be learn-invisible. Rerun safety: pass-advancing
+/// clock base + delta asserts (TX enqueue AND rx-reply-processed must BOTH
+/// move) + RAII un-learn of the probe target.
+///
+/// Clock: draws one 60_000 ms stripe per pass from the SHARED allocator
+/// (`alloc_arp_test_clock_window`, first stripe 480_000) and claims
+/// [base, base + 6_400] of it. Every fixed-clock ARP test MUST draw from
+/// the same allocator — see its doc for the cross-test collision analysis.
+struct NetNsRxEth0SlirpTest;
+
+impl RuntimeTest for NetNsRxEth0SlirpTest {
+    fn name(&self) -> &'static str {
+        "netns_rx_eth0_slirp"
+    }
+
+    fn description(&self) -> &'static str {
+        "GATING: real SLIRP ARP round-trip through live eth0 RX descriptors"
+    }
+
+    fn run(&self) -> TestResult {
+        use core::sync::atomic::Ordering;
+        use net::Ipv4Addr;
+
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        if net::device_index("eth0").is_none() {
+            return TestResult::Warning(String::from(
+                "eth0 absent — the SLIRP round trip needs QEMU virtio-net (make test provides it)",
+            ));
+        }
+        let cfg = match net::tx_net_config(0) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("root net config unavailable: {:?}", e));
+            }
+        };
+        if cfg.our_mac.0 == [0u8; 6] {
+            return TestResult::Fail(String::from("root MAC still zero with eth0 present"));
+        }
+        if cfg.gateway_ip != Ipv4Addr([10, 0, 2, 2]) {
+            return TestResult::Warning(alloc::format!(
+                "non-SLIRP topology (gateway {:?}) — the 10.0.2.3 ARP-answer gate only \
+                 holds under QEMU user networking",
+                cfg.gateway_ip
+            ));
+        }
+        let dns_ip = Ipv4Addr([10, 0, 2, 3]);
+        if dns_ip == cfg.our_ip {
+            return TestResult::Fail(String::from("fixture collision: our_ip is 10.0.2.3"));
+        }
+
+        let base = alloc_arp_test_clock_window();
+        let _cleanup = RootArpDynamicCleanup { ip: dns_ip };
+
+        // Prime: one UNFILTERED poll installs the pool (full-or-retry),
+        // stocks eth0's RX descriptors, and drains any stale backlog.
+        let _ = net::rx_ingress_poll(base, 32);
+        if net::rx_ingress_pool_stats().is_none() {
+            return TestResult::Fail(alloc::format!(
+                "shared pool must install before the probe (init failures: {})",
+                net::rx_ingress_counters().pool_init_failures
+            ));
+        }
+        let ingress_stats = net::rx_ingress_net_stats();
+        let rx_replies_before = ingress_stats.arp_stats.rx_replies.load(Ordering::Relaxed);
+        let s0 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+
+        // Probe + bounded-retry ingest. A successful enqueue consumes the
+        // owner (fresh prepare per re-emission); Retryable hands it back.
+        let mut probes_enqueued = 0u32;
+        let mut last_tx_error: Option<net::TxError> = None;
+        let mut learned: Option<net::EthAddr> = None;
+        let mut final_now = base;
+        let mut pending = match net::prepare_arp_probe(0, dns_ip) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("prepare_arp_probe failed: {:?}", e));
+            }
+        };
+        for attempt in 0..64u64 {
+            let now = base + 100 + attempt * 100;
+            final_now = now;
+            if let Some(probe) = pending.take() {
+                match net::transmit_prepared_reply(probe, now, ingress_stats) {
+                    Ok(()) => probes_enqueued += 1,
+                    Err(net::PreparedReplyTxError::Retryable(e, owner)) => {
+                        last_tx_error = Some(e);
+                        pending = Some(owner);
+                    }
+                    Err(net::PreparedReplyTxError::Consumed(e)) => {
+                        last_tx_error = Some(e);
+                    }
+                }
+            }
+            let _ = net::rx_ingress_poll(now, 32);
+            if ingress_stats.arp_stats.rx_replies.load(Ordering::Relaxed) > rx_replies_before {
+                if let Some(mac) = NetNsRxIngressTest::root_lookup(dns_ip, now) {
+                    learned = Some(mac);
+                    break;
+                }
+            }
+            if pending.is_none() && attempt % 16 == 15 {
+                pending = net::prepare_arp_probe(0, dns_ip).ok();
+            }
+            for _ in 0..50_000 {
+                core::hint::spin_loop();
+            }
+        }
+
+        if probes_enqueued == 0 {
+            return TestResult::Fail(alloc::format!(
+                "no probe ever enqueued (last TX error {:?})",
+                last_tx_error
+            ));
+        }
+        let s1 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if NetNsRxIngressTest::enq_delta(&s0, &s1) < 1 {
+            return TestResult::Fail(alloc::format!(
+                "probe never reached the driver (enq_delta {}, probes_enqueued {})",
+                NetNsRxIngressTest::enq_delta(&s0, &s1),
+                probes_enqueued
+            ));
+        }
+        let Some(mac) = learned else {
+            let c = net::rx_ingress_counters();
+            let rx_replies_after = ingress_stats.arp_stats.rx_replies.load(Ordering::Relaxed);
+            return TestResult::Fail(alloc::format!(
+                "SLIRP reply never learned: probes_enqueued={} rx_replies {}->{} \
+                 counters={:?} pool={:?}",
+                probes_enqueued,
+                rx_replies_before,
+                rx_replies_after,
+                c,
+                net::rx_ingress_pool_stats()
+            ));
+        };
+        if mac == net::EthAddr([0u8; 6]) {
+            return TestResult::Fail(String::from("learned an all-zero MAC"));
+        }
+        // The authoritative gateway seed must have survived the round trip.
+        if NetNsRxIngressTest::root_lookup(cfg.gateway_ip, final_now) != Some(cfg.gateway_mac) {
+            return TestResult::Fail(String::from(
+                "gateway static seed disturbed by the probe round trip",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
+// D3 ARP REQUEST-TX v1 (netns_arp_probe_tx)
+// ============================================================================
+
+/// Per-boot pass counter for the probe test's LIVE-leg targets: the ROOT
+/// cache's probe ring and probe buckets run on the REAL clock and persist
+/// across suite passes, so each pass probes FRESH on-link IPs (a repeated
+/// target would be interval-suppressed by the previous pass's ring claim).
+static ARP_PROBE_TEST_PASS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// RAII restore of the ROOT firewall table to the pristine default set —
+/// the probe test appends one port-scoped accept for its fixture sends
+/// (the defaults do not admit arbitrary UDP; tx-isolation leg-5 lesson),
+/// and every exit path must put the defaults back (TxIsoGuard discipline).
+struct RootFwRestore;
+
+impl Drop for RootFwRestore {
+    fn drop(&mut self) {
+        net::firewall_table().replace_rules(net::firewall_default_rules());
+    }
+}
+
+/// D3 ARP REQUEST-TX v1: the on-link-miss TX path admits a bucket-bounded
+/// ARP probe (per-cache ring + per-cache bucket + global backstop) and
+/// emits it AFTER the data frame is accepted; learning the reply retires
+/// both the probe and the gateway fallback for that neighbor.
+///
+/// Leg A proves the admission semantics DETERMINISTICALLY on a standalone
+/// `ArpCache` at fixed clocks (its ring and per-cache bucket are instance
+/// state — nothing global is touched, so the fixed clocks poison no shared
+/// bucket). The LIVE legs then prove the production wiring end-to-end with
+/// delta asserts: real clock, per-pass-fresh targets, background RX
+/// quiesced for the whole body (planted/unsolicited replies must not be
+/// processed between legs; explicit filtered polls are unaffected).
+struct NetNsArpProbeTxTest;
+
+impl RuntimeTest for NetNsArpProbeTxTest {
+    fn name(&self) -> &'static str {
+        "netns_arp_probe_tx"
+    }
+
+    fn description(&self) -> &'static str {
+        "D3 ARP request-TX v1: ring/bucket admission + post-enqueue probe emission"
+    }
+
+    fn run(&self) -> TestResult {
+        use core::sync::atomic::Ordering;
+        use net::{arp, EthAddr, FirewallAction, FirewallRule, Ipv4Addr, PortRange};
+
+        let _quiesce = net::quiesce_rx_ingress_background();
+
+        // ---- Leg A: deterministic admission semantics (standalone cache,
+        // fixed clocks; the exact token ledger is asserted in comments).
+        {
+            use net::arp::ProbeAdmission as A;
+            let mut cache = arp::ArpCache::new(300_000, 16);
+            let p1 = Ipv4Addr([192, 168, 9, 1]);
+
+            // Fresh claim admits (bucket initializes at burst 8, spends → 7).
+            if cache.admit_probe(p1, 1_000) != A::Admitted {
+                return TestResult::Fail(String::from("leg A1: fresh claim must admit"));
+            }
+            // Inside the interval: ring suppresses BEFORE any bucket draw.
+            if cache.admit_probe(p1, 1_999) != A::DuplicateSuppressed {
+                return TestResult::Fail(String::from("leg A2: intra-interval re-claim"));
+            }
+            // Clock regression: conservative suppress, never a re-probe.
+            if cache.admit_probe(p1, 900) != A::DuplicateSuppressed {
+                return TestResult::Fail(String::from("leg A3: regressed clock must suppress"));
+            }
+            // Interval elapsed: re-admit (bucket refilled to cap by +1 s).
+            if cache.admit_probe(p1, 2_000) != A::Admitted {
+                return TestResult::Fail(String::from("leg A4: post-interval re-claim"));
+            }
+
+            // Fill: 8 NEW IPs at one instant. q0..q6 take the 7 vacant
+            // slots; q7 finds the ring full and evicts the sole minimum —
+            // p1@2_000 (index 0). Bucket: refilled to 8 at t=20_000, then
+            // 8 spends → 0 tokens.
+            let q = |k: u8| Ipv4Addr([192, 168, 9, 10 + k]);
+            for k in 0..8u8 {
+                if cache.admit_probe(q(k), 20_000) != A::Admitted {
+                    return TestResult::Fail(alloc::format!("leg A5: fill q{} must admit", k));
+                }
+            }
+            // p1 is gone: its re-claim takes the INSERT path (all slots tie
+            // at 20_000 → first minimum = index 0, q7's slot), and the dry
+            // bucket denies → RateLimited with the claim RETAINED.
+            if cache.admit_probe(p1, 20_001) != A::RateLimited {
+                return TestResult::Fail(String::from(
+                    "leg A6: evicted p1 must re-insert and rate-limit on the dry bucket",
+                ));
+            }
+            // ORACLE: q7 was just evicted by p1's retained claim. Resident
+            // would mean DuplicateSuppressed (1 ms old); evicted means the
+            // insert path hits the dry bucket → RateLimited.
+            if cache.admit_probe(q(7), 20_002) != A::RateLimited {
+                return TestResult::Fail(String::from(
+                    "leg A7: q7 must have been evicted (first-minimum tie-break)",
+                ));
+            }
+            // Survivor control: q1 is still resident@20_000 → suppressed —
+            // proving EXACTLY the first-minimum slot was replaced.
+            if cache.admit_probe(q(1), 20_003) != A::DuplicateSuppressed {
+                return TestResult::Fail(String::from("leg A8: q1 must have survived"));
+            }
+            // Recovery: +1 s refills the bucket to cap and q1's interval
+            // has elapsed → Admitted.
+            if cache.admit_probe(q(1), 21_010) != A::Admitted {
+                return TestResult::Fail(String::from("leg A9: bucket must recover in 1 s"));
+            }
+        }
+
+        // ---- Live preconditions (mirror the SLIRP test's Warning gates).
+        if net::device_index("eth0").is_none() {
+            return TestResult::Warning(String::from(
+                "leg A passed; live legs need QEMU virtio-net eth0 (make test provides it)",
+            ));
+        }
+        let cfg = match net::tx_net_config(0) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!("root net config unavailable: {:?}", e));
+            }
+        };
+        if cfg.our_mac.0 == [0u8; 6] {
+            return TestResult::Fail(String::from("root MAC still zero with eth0 present"));
+        }
+        if cfg.subnet_prefix_len > 24 {
+            return TestResult::Warning(alloc::format!(
+                "leg A passed; live-leg fixtures assume a /24-or-wider subnet (prefix {})",
+                cfg.subnet_prefix_len
+            ));
+        }
+
+        // On-link fixture targets: our_ip with a swapped last octet (the
+        // ingress test's derivation), collision-dodged against our own and
+        // the gateway's addresses. Per-pass-fresh for the single-probe legs.
+        let pass = ARP_PROBE_TEST_PASS.fetch_add(1, Ordering::Relaxed);
+        let fixture = |octet: u8| -> Ipv4Addr {
+            let mut o = cfg.our_ip.octets();
+            o[3] = octet;
+            Ipv4Addr(o)
+        };
+        let mut octet = 160 + (pass % 24) as u8;
+        for _ in 0..3 {
+            let candidate = fixture(octet);
+            if candidate != cfg.our_ip && candidate != cfg.gateway_ip {
+                break;
+            }
+            octet = 160 + ((octet - 160 + 1) % 24);
+        }
+        let target = fixture(octet);
+        if target == cfg.our_ip || target == cfg.gateway_ip {
+            return TestResult::Fail(String::from("fixture collision could not be dodged"));
+        }
+
+        // Root egress policy: the pristine defaults do not admit arbitrary
+        // UDP — append ONE accept scoped to the fixture port, restored on
+        // every exit path. The firewall runs BEFORE resolution, so a denied
+        // send would never reach probe admission at all (leg B's original
+        // FirewallDenied failure mode).
+        let mut fixture_rules = net::firewall_default_rules();
+        fixture_rules.push(
+            FirewallRule::builder(9201)
+                .priority(1500)
+                .proto(net::Ipv4Proto::Udp)
+                .dst_port(PortRange::single(47_700))
+                .action(FirewallAction::Accept)
+                .build(),
+        );
+        net::firewall_table().replace_rules(fixture_rules);
+        let _fw_restore = RootFwRestore;
+
+        let ingress_stats = net::rx_ingress_net_stats();
+        let probe_counters = || {
+            (
+                ingress_stats.arp_stats.probes_sent.load(Ordering::Relaxed),
+                ingress_stats
+                    .arp_stats
+                    .probe_duplicate_suppressed
+                    .load(Ordering::Relaxed),
+                ingress_stats
+                    .arp_stats
+                    .probe_rate_limited
+                    .load(Ordering::Relaxed),
+                ingress_stats
+                    .arp_stats
+                    .probe_tx_failures
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let root_fallbacks = || {
+            kernel_core::net_namespace::lookup_net_ns(0)
+                .map(|ns| ns.arp_cache().lock().neighbor_fallbacks())
+        };
+        let send_to = |dst: Ipv4Addr| -> Result<(), TestResult> {
+            let datagram = net::build_udp_datagram(cfg.our_ip, dst, 49_600, 47_700, b"D3-PROBE")
+                .map_err(|e| {
+                    TestResult::Fail(alloc::format!("UDP build for {:?} failed: {:?}", dst, e))
+                })?;
+            net::transmit_udp_datagram(dst, &datagram, 0).map_err(|e| {
+                TestResult::Fail(alloc::format!(
+                    "root on-link send to {:?} must succeed via gateway fallback, got {:?}",
+                    dst,
+                    e
+                ))
+            })
+        };
+
+        // ---- Leg B: one on-link-miss send emits data + probe (exactly 2
+        // enqueues under quiesce) and meters one fallback. The live probe
+        // buckets are REAL-CLOCK state persisting across suite passes (a
+        // prior pass's leg E drains them; refill is 8 pps), so this leg
+        // retries against PER-ATTEMPT-FRESH targets with a bounded
+        // real-clock refill backoff instead of assuming headroom (Codex
+        // round-27/28 F5). Every
+        // attempt still asserts an EXACT ledger: fallback +1 and no dup
+        // always; then EITHER the probe emitted (+1 sent, 2 enqueues —
+        // success) OR a bucket denied (+1 limited, 1 enqueue — the data
+        // frame still egressed; wait for refill and retry).
+        let (_, _, _, fail0) = probe_counters();
+        let mut probed_target: Option<Ipv4Addr> = None;
+        for attempt in 0..8u8 {
+            let dst = if attempt == 0 {
+                target
+            } else {
+                // Aux per-attempt range, disjoint from every other leg.
+                fixture(130 + attempt)
+            };
+            if dst == cfg.our_ip || dst == cfg.gateway_ip {
+                continue;
+            }
+            let (sent_a, dup_a, lim_a, _) = probe_counters();
+            let Some(fb_a) = root_fallbacks() else {
+                return TestResult::Fail(String::from("root netns lookup failed"));
+            };
+            let sa = match NetNsRxIngressTest::eth0_snapshot() {
+                Ok(s) => s,
+                Err(fail) => return fail,
+            };
+            if let Err(fail) = send_to(dst) {
+                return fail;
+            }
+            let (sent_b, dup_b, lim_b, _) = probe_counters();
+            let Some(fb_b) = root_fallbacks() else {
+                return TestResult::Fail(String::from("root netns lookup failed"));
+            };
+            let sb = match NetNsRxIngressTest::eth0_snapshot() {
+                Ok(s) => s,
+                Err(fail) => return fail,
+            };
+            if fb_b != fb_a + 1 || dup_b != dup_a {
+                return TestResult::Fail(alloc::format!(
+                    "leg B: a fresh-target miss must meter exactly one fallback and \
+                     no duplicate (fallbacks {}->{}, suppressed {}->{})",
+                    fb_a,
+                    fb_b,
+                    dup_a,
+                    dup_b
+                ));
+            }
+            let enq = NetNsRxIngressTest::enq_delta(&sa, &sb);
+            if sent_b == sent_a + 1 && lim_b == lim_a && enq == 2 {
+                probed_target = Some(dst);
+                break;
+            }
+            if sent_b == sent_a && lim_b == lim_a + 1 && enq == 1 {
+                // A drained bucket (prior pass / boot flows): wait TWO
+                // refill tokens of REAL clock (8 pps ⇒ 125 ms each) on the
+                // same 1000 Hz tick source the probe path reads — spin
+                // hints alone are not a time unit (Codex round-28). The
+                // spin cap only guards a dead timer; the retry ledger
+                // catches whatever state the wait actually reached.
+                let wait_from = kernel_core::time::get_ticks();
+                let mut spins = 0u64;
+                while kernel_core::time::get_ticks().saturating_sub(wait_from) < 260
+                    && spins < 150_000_000
+                {
+                    spin_loop();
+                    spins += 1;
+                }
+                continue;
+            }
+            return TestResult::Fail(alloc::format!(
+                "leg B: attempt ledger violated (probes_sent {}->{}, rate_limited \
+                 {}->{}, enq_delta {})",
+                sent_a,
+                sent_b,
+                lim_a,
+                lim_b,
+                enq
+            ));
+        }
+        let Some(target) = probed_target else {
+            let (s, d, l, f) = probe_counters();
+            return TestResult::Fail(alloc::format!(
+                "leg B: no probe emitted within 8 fresh-target attempts \
+                 (probes_sent={} suppressed={} rate_limited={} failures={})",
+                s,
+                d,
+                l,
+                f
+            ));
+        };
+        let _cleanup = RootArpDynamicCleanup { ip: target };
+        // Post-success baselines for leg C (nothing runs in between).
+        let (sent1, dup1, _, _) = probe_counters();
+        let s1 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+
+        // ---- Leg C: an immediate second send to the SAME target is ring-
+        // suppressed (µs apart ≪ the 1 s interval): data enqueues, no probe.
+        if let Err(fail) = send_to(target) {
+            return fail;
+        }
+        let (sent2, dup2, _lim2, _fail2) = probe_counters();
+        let s2 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if sent2 != sent1 || dup2 != dup1 + 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg C: duplicate must be ring-suppressed (probes_sent {}->{}, \
+                 suppressed {}->{})",
+                sent1,
+                sent2,
+                dup1,
+                dup2
+            ));
+        }
+        if NetNsRxIngressTest::enq_delta(&s1, &s2) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg C: only the data frame must enqueue (enq_delta {})",
+                NetNsRxIngressTest::enq_delta(&s1, &s2)
+            ));
+        }
+
+        // ---- Leg D: a learned reply retires probe AND fallback for the
+        // target. Planted on the synthetic RX device and pulled through the
+        // capability-narrowed ingress poll at a fresh allocator stripe.
+        let shared = RX_INGRESS_TEST_SHARED
+            .call_once(|| {
+                alloc::sync::Arc::new(spin::Mutex::new(RxIngressTestShared {
+                    frames: alloc::collections::VecDeque::new(),
+                    error_arm: false,
+                }))
+            })
+            .clone();
+        if net::device_index("rxtest0").is_none() {
+            if let Err(e) = net::register_device(SyntheticRxDevice {
+                shared: shared.clone(),
+            }) {
+                return TestResult::Fail(alloc::format!(
+                    "leg D: synthetic device registration failed: {:?}",
+                    e
+                ));
+            }
+        }
+        let neighbor_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0xa7, target.octets()[3]]);
+        let reply = arp::build_arp_reply(neighbor_mac, target, cfg.our_mac, cfg.our_ip);
+        if reply.is_empty() {
+            return TestResult::Fail(String::from("leg D: ARP reply frame admission failed"));
+        }
+        shared.lock().frames.push_back(reply.to_vec());
+        let base = alloc_arp_test_clock_window();
+        let processed = net::rx_ingress_poll_filtered(base, 8, &["rxtest0"]);
+        if processed != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg D: exactly the planted reply must process, got {}",
+                processed
+            ));
+        }
+        if NetNsRxIngressTest::root_lookup(target, base) != Some(neighbor_mac) {
+            return TestResult::Fail(String::from(
+                "leg D: the planted reply must learn into the ROOT cache",
+            ));
+        }
+        match net::resolve_dst_mac(target, &cfg, 0) {
+            Ok(mac) if mac == neighbor_mac => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg D: resolution must now return the learned MAC, got {:?}",
+                    other
+                ));
+            }
+        }
+        let (sent3, dup3, _lim3, _fail3) = probe_counters();
+        let Some(fb3) = root_fallbacks() else {
+            return TestResult::Fail(String::from("root netns lookup failed"));
+        };
+        if let Err(fail) = send_to(target) {
+            return fail;
+        }
+        let (sent4, dup4, _lim4, _fail4) = probe_counters();
+        let Some(fb4) = root_fallbacks() else {
+            return TestResult::Fail(String::from("root netns lookup failed"));
+        };
+        let s4 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if sent4 != sent3 || dup4 != dup3 || fb4 != fb3 {
+            return TestResult::Fail(alloc::format!(
+                "leg D: a cache HIT must neither probe nor meter (probes_sent {}->{}, \
+                 suppressed {}->{}, fallbacks {}->{})",
+                sent3,
+                sent4,
+                dup3,
+                dup4,
+                fb3,
+                fb4
+            ));
+        }
+        if NetNsRxIngressTest::enq_delta(&s2, &s4) != 1 {
+            return TestResult::Fail(alloc::format!(
+                "leg D: only the data frame must enqueue (enq_delta {})",
+                NetNsRxIngressTest::enq_delta(&s2, &s4)
+            ));
+        }
+
+        // ---- Leg E (LAST — drains the live buckets; later passes' leg B
+        // absorbs that via its retry): 32 distinct fresh on-link targets.
+        // The load-bearing assert is CLOCK-FREE (Codex round-27/28 F5):
+        // every attempted send claims a fresh ring slot, so it ticks
+        // EXACTLY ONE of probes_sent (admitted by both buckets),
+        // probe_rate_limited (either bucket denied), or probe_tx_failures
+        // — the ledger balances whatever the refill timing. The companion
+        // bounds use the MEASURED loop duration on the real 1000 Hz tick
+        // source instead of assuming a wall-clock budget.
+        let (sent5, _dup5, lim5, fail5) = probe_counters();
+        let leg_e_start = kernel_core::time::get_ticks();
+        let mut attempts = 0u64;
+        for k in 0..32u8 {
+            let dst = fixture(190 + k);
+            if dst == cfg.our_ip || dst == cfg.gateway_ip {
+                continue;
+            }
+            if let Err(fail) = send_to(dst) {
+                return fail;
+            }
+            attempts += 1;
+        }
+        let leg_e_elapsed = kernel_core::time::get_ticks().saturating_sub(leg_e_start);
+        let (sent6, _dup6, lim6, fail6) = probe_counters();
+        if (sent6 - sent5) + (lim6 - lim5) + (fail6 - fail5) != attempts {
+            return TestResult::Fail(alloc::format!(
+                "leg E: admission ledger must balance — every fresh claim is \
+                 exactly one sent, limited, or failed (attempts {}, probes_sent \
+                 {}->{}, rate_limited {}->{}, failures {}->{})",
+                attempts,
+                sent5,
+                sent6,
+                lim5,
+                lim6,
+                fail5,
+                fail6
+            ));
+        }
+        // Admission upper bound from the MEASURED duration: per-cache burst
+        // 8 + tokens refilled while the loop ran (8 pps) + 1 slack for a
+        // partial token in flight.
+        let max_admissions = 8 + (leg_e_elapsed * 8) / 1000 + 1;
+        if sent6 - sent5 > max_admissions {
+            return TestResult::Fail(alloc::format!(
+                "leg E: admissions exceeded the bucket bound for the measured \
+                 window (probes_sent {}->{}, elapsed {} ms, bound {})",
+                sent5,
+                sent6,
+                leg_e_elapsed,
+                max_admissions
+            ));
+        }
+        // Exhaustion applies only when the measured window PROVES refill
+        // could not keep pace: under 2 s the buckets grant at most
+        // 8 + 16 + 1 = 25 < 30+ attempts, so some claim MUST have been
+        // limited. On a pathologically stalled host the check is vacuous
+        // and the ledger equality above stays the load-bearing proof.
+        if attempts >= 30 && leg_e_elapsed < 2_000 && lim6 == lim5 {
+            return TestResult::Fail(alloc::format!(
+                "leg E: {} distinct misses in {} ms must exhaust the probe \
+                 buckets (probes_sent {}->{}, rate_limited {})",
+                attempts,
+                leg_e_elapsed,
+                sent5,
+                sent6,
+                lim6
+            ));
+        }
+        if fail6 != fail0 {
+            return TestResult::Fail(alloc::format!(
+                "probe emission must never fail on a healthy device \
+                 (probe_tx_failures {}->{})",
+                fail0,
+                fail6
             ));
         }
 
