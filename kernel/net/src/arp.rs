@@ -423,6 +423,53 @@ impl ArpCache {
         self.entries.retain(|e| e.kind == ArpEntryKind::Static);
     }
 
+    /// D3 NETNS-CONFIG: Drop every entry — static AND dynamic.
+    ///
+    /// Reconfiguration flush: when a namespace's addressing changes, ALL
+    /// prior neighbor state is suspect — dynamic entries were learned on
+    /// the old subnet, and the static gateway seed maps the OLD gateway
+    /// (Codex round-9: stale ARP state must not survive reconfiguration).
+    /// The backing capacity (and its heap-class / ns-budget charge) is
+    /// retained; only the logical contents are discarded.
+    pub fn clear_all(&mut self) {
+        self.entries.retain(|_| false);
+    }
+
+    /// D3 NETNS-CONFIG: authoritatively (re)seed the static gateway mapping
+    /// from the sending namespace's OWN configuration snapshot.
+    ///
+    /// Unlike `insert`, an existing entry for `ip` — static OR dynamic, any
+    /// MAC — is REPLACED. This does not weaken the anti-poisoning contracts
+    /// (R65-7 / R101-11 / insert's static protection): those defend the
+    /// cache against WIRE-derived updates (learned replies, gratuitous
+    /// ARP); this seed's values come from the kernel's own namespace
+    /// configuration, which outranks whatever the cache holds. Without
+    /// replacement, a bounded in-flight send from the PREVIOUS
+    /// configuration generation can re-seed the OLD gateway MAC after the
+    /// reconfiguration flush, and the stale static entry then survives
+    /// forever — statics never expire, never evict, and plain `insert`
+    /// refuses to overwrite them (Codex round-10 finding). With
+    /// replacement, every send re-asserts its snapshot's values, so
+    /// pollution is bounded by the in-flight send itself — the documented
+    /// non-quiescence envelope of `set_net_config`.
+    pub fn seed_static_gateway(
+        &mut self,
+        ip: Ipv4Addr,
+        mac: EthAddr,
+        now_ms: u64,
+    ) -> Result<(), ArpError> {
+        if let Some(pos) = self.entries.iter().position(|e| e.ip == ip) {
+            let existing = &self.entries[pos];
+            if existing.kind == ArpEntryKind::Static && existing.mac == mac {
+                // Already correct — refresh the timestamp only.
+                self.entries[pos].updated_at = now_ms;
+                return Ok(());
+            }
+            let _ = self.entries.remove(pos);
+        }
+        self.insert(ip, mac, ArpEntryKind::Static, now_ms)
+    }
+
     /// R101-11 FIX: Check if a static entry exists for the given IP.
     ///
     /// Used by gratuitous ARP processing to protect static entries (e.g., gateway)

@@ -1279,13 +1279,28 @@ const DEFAULT_GATEWAY_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 2]);
 /// This is the standard MAC QEMU assigns to its SLIRP gateway.
 const DEFAULT_GATEWAY_MAC: EthAddr = EthAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
 
+/// D3 NETNS-CONFIG: default subnet prefix length for the root namespace's
+/// addressing (QEMU SLIRP provisions 10.0.2.0/24).
+const DEFAULT_SUBNET_PREFIX_LEN: u8 = 24;
+
 /// Network configuration for TX path.
+///
+/// D3 NETNS-CONFIG: this global is the ROOT namespace's addressing
+/// authority AND the pre-hook-registration fallback — one object, so the
+/// two can never drift (the kernel_core `ns_net_config` hook DELEGATES ns 0
+/// here instead of storing a root copy). Child namespaces never read it:
+/// their addressing lives on `NetNamespace` and reaches the TX path through
+/// the hook. A zero `our_mac` means "autodetect pending" (the lazy eth0
+/// fill below retries at every snapshot) — a root-only state; child configs
+/// reject zero MACs at the kernel_core setter, so for children the
+/// zero-MAC/administratively-down ambiguity is unrepresentable.
 #[derive(Clone, Copy)]
 struct NetConfig {
     our_ip: Ipv4Addr,
     our_mac: EthAddr,
     gateway_ip: Ipv4Addr,
     gateway_mac: EthAddr,
+    subnet_prefix_len: u8,
 }
 
 impl Default for NetConfig {
@@ -1295,17 +1310,28 @@ impl Default for NetConfig {
             our_mac: EthAddr::ZERO,
             gateway_ip: DEFAULT_GATEWAY_IP,
             gateway_mac: DEFAULT_GATEWAY_MAC,
+            subnet_prefix_len: DEFAULT_SUBNET_PREFIX_LEN,
         }
     }
 }
 
 /// Public snapshot of network configuration.
-#[derive(Clone, Copy)]
+///
+/// D3 NETNS-CONFIG: also the per-namespace configuration VALUE — what a
+/// child namespace stores and what `tx_net_config` returns for every
+/// namespace. `Copy` by design: dataplane consumers hold an inert
+/// by-value snapshot, never a reference into namespace state.
+#[derive(Debug, Clone, Copy)]
 pub struct NetConfigSnapshot {
     pub our_ip: Ipv4Addr,
     pub our_mac: EthAddr,
     pub gateway_ip: Ipv4Addr,
     pub gateway_mac: EthAddr,
+    /// D3 NETNS-CONFIG: prefix length of the namespace's on-link subnet.
+    /// Carried in the SAME atomic snapshot as the addresses (Codex
+    /// round-9: the routing leg's on-link determination must never mix a
+    /// prefix from one configuration generation with addresses from
+    pub subnet_prefix_len: u8,
 }
 
 /// Global network state for TX path.
@@ -1347,17 +1373,59 @@ pub fn network_config() -> NetConfigSnapshot {
         our_mac: cfg.our_mac,
         gateway_ip: cfg.gateway_ip,
         gateway_mac: cfg.gateway_mac,
+        subnet_prefix_len: cfg.subnet_prefix_len,
     }
 }
 
-/// Resolve destination MAC address.
+/// D3 NETNS-CONFIG: Resolve the network configuration the TX path must use
+/// for namespace `net_ns_id` — the namespace's OWN addressing, never another
+/// namespace's (per-ns identity is the Phase 2 half of PO-NET-01 §4.3;
+/// before this, every namespace transmitted with the root's IP/MAC and the
+/// egress firewall evaluated a child's packet against the ROOT's source IP).
 ///
-/// For now, we use the gateway MAC for all destinations.
-/// A proper implementation would check if dst_ip is on the local subnet
-/// and use ARP for local destinations.
-fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
-    let state = net_state();
-    let mut cache = state.arp.lock();
+/// # Selection (fail-closed)
+///
+/// - Hooks registered: exactly the hook's answer. Root (ns 0) resolves to
+///   the global config (the hook delegates — root has no second stored copy
+///   to drift); a child resolves to its stored per-ns config.
+/// - Hooks registered + `None` (unknown, destroyed, or alive-but-
+///   unconfigured namespace — deliberately collapsed: all three mean "this
+///   namespace has no usable network identity"):
+///   `Err(TxError::LinkDown)` (ENETDOWN). The send must fail BEFORE
+///   firewall/conntrack evaluation — evaluating policy against a borrowed
+///   identity is the vulnerability class this leg closes.
+/// - Hooks unregistered (early boot / host tests): root only, from the
+///   global config; non-root ids fail closed at the access itself (no child
+///   ns can exist in this window — same enforcement style as
+///   `resolve_dst_mac`'s pre-registration arm).
+///
+/// # Contract for callers
+///
+/// Call ONCE per send and thread the returned snapshot through every
+/// downstream consumer (conntrack key, firewall packet, L3 source, L2
+/// source, ARP gateway seed) — the RF180-41 single-snapshot invariant.
+/// Reconfiguration is NOT a quiescence barrier: a send that already
+/// acquired its snapshot completes with the old identity (bounded by one
+/// in-flight send, mirroring the move_device TX-revocation contract).
+pub fn tx_net_config(net_ns_id: u64) -> Result<NetConfigSnapshot, TxError> {
+    match crate::socket::netns_net_config(net_ns_id) {
+        Some(cfg) => Ok(cfg),
+        None if net_ns_id == 0 && !crate::socket::netns_device_hooks_registered() => {
+            Ok(network_config())
+        }
+        None => Err(TxError::LinkDown),
+    }
+}
+
+    let prefix = cfg.subnet_prefix_len;
+    if prefix == 0 || prefix > 32 {
+        // Defensive fail-closed arm — unreachable through setter-validated
+        // snapshots. Deliberately NO debug_assert: this is a public
+        // non-panicking API on ANY input, debug kernels included (Codex
+        // round-14).
+    cfg: &NetConfigSnapshot,
+    net_ns_id: u64,
+    now_ms: u64,
 /// holds no lock across its return (see `NetNsDeviceHooks::ns_arp_cache`),
 /// and send paths hold their per-socket locks only while the sending
 /// process pins the namespace, so the hook's internal namespace-handle drop
@@ -1370,6 +1438,11 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
 /// stay unobservable until TX-loopback). Capability-safe: this resolves
 /// addressing only — no transmit authority egresses (that is
 /// `tx_auth::AuthorizedTxDevice`). Side effects: seeds the namespace's
+    cfg: &NetConfigSnapshot,
+    net_ns_id: u64,
+) -> Result<EthAddr, TxError> {
+    cfg: &NetConfigSnapshot,
+    net_ns_id: u64,
 
     // R162-20 FIX: Use actual kernel time for ARP cache TTL checks.
     // Previously hardcoded to 0, causing dynamic entries to never expire.
@@ -1386,9 +1459,18 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
         Some(cache) => {
             let mut cache = cache.lock();
 
-    // Try direct lookup first
-    if let Some(mac) = cache.lookup(dst_ip, now_ms) {
-        return mac;
+            // Ensure gateway is always in cache. D3 NETNS-CONFIG:
+            // authoritative seed — the caller's config snapshot outranks
+            // the cache, healing a stale post-reconfiguration gateway
+            // entry (see ArpCache::seed_static_gateway).
+            let _ = cache.seed_static_gateway(cfg.gateway_ip, cfg.gateway_mac, now_ms);
+
+            // Ensure gateway is always in cache. D3 NETNS-CONFIG:
+            // authoritative seed — the caller's config snapshot outranks
+            // the cache, healing a stale post-reconfiguration gateway
+            // entry (see ArpCache::seed_static_gateway).
+            let _ = cache.seed_static_gateway(cfg.gateway_ip, cfg.gateway_mac, now_ms);
+
     }
 
     // Fall back to gateway MAC for off-link destinations
@@ -1507,7 +1589,13 @@ fn build_frame_and_transmit(
     // conntrack feature is enabled; without it, ct_state is None and
     // stateful rules won't match, but stateless DROP/REJECT rules still fire.
     let (src_port, dst_port) = transport.ports();
-    let cfg_pre = network_config();
+    // D3 NETNS-CONFIG: acquire the sending namespace's OWN addressing —
+    // fail-closed LinkDown before ANY policy runs if it has none.
+    // Previously this read the global (root) config for every namespace,
+    // so a child's packet was firewall/conntrack-evaluated against the
+    // ROOT's source IP. One acquisition; the snapshot rules every
+    // downstream consumer (RF180-41).
+    let cfg_pre = tx_net_config(net_ns_id)?;
 
     // Conntrack-aware ct_state lookup (only with conntrack feature).
     #[cfg(feature = "conntrack")]
@@ -1763,6 +1851,10 @@ pub fn transmit_prepared_reply(
     })
 }
 
+    let cfg = tx_net_config(net_ns_id)?;
+    if cfg.our_mac.0 == [0u8; 6] {
+        return Err(TxError::LinkDown);
+    }
 fn transmit_prepared_reply_with_queue<F>(
     reply: PreparedReply,
     now_ms: u64,
@@ -2279,6 +2371,17 @@ fn apply_firewall_verdict(
 /// `sys_move_net_device` is hard-gated ENOSYS — so root is the only owner any
 /// device can have today. ARMING `move_device` MUST introduce an inverse
 /// ownership lookup (+ generation, so a mid-poll move cannot attribute a frame
+/// root addressing is immutable (`set_net_config` rejects level 0 and the
+/// global config has no post-boot mutation surface; the one-shot lazy MAC
+/// autodetect only fills a zero MAC, and a zero-MAC capture skips the poll
+/// fail-closed below), so no frame can be processed under one generation and
+/// learned into another generation's ARP cache. Per-namespace attribution
+/// (future) must capture config+cache together PER FRAME instead.
+///
+/// Buffer lifecycle (round-22 R3): every received `NetBuf` takes ONE return
+    let cfg = match tx_net_config(0) {
+        Ok(cfg) => cfg,
+        Err(_) => {
 // ============================================================================
 // Timer Maintenance
 // ============================================================================

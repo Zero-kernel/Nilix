@@ -91,6 +91,74 @@ pub enum NetNsError {
     NamespaceIdOverflow,
 }
 
+/// D3 NETNS-CONFIG: Errors from [`NetNamespace::set_net_config`].
+///
+/// A dedicated enum (not `NetNsError`): these are the validation contracts
+/// the future netns-admin syscall surface will map to errnos, and they must
+/// not disturb existing exhaustive matches on `NetNsError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetConfigError {
+    /// Root's addressing authority is the net crate's global config
+    /// (single source of truth, delegated to by the `ns_net_config` hook);
+    /// mutating it through the per-ns seam is not a valid operation this
+    /// slice (Codex round-9: a root setter would let root config and the
+    /// pre-registration fallback drift).
+    RootImmutable,
+    /// Prefix length outside 1..=32. /0 would put every address on-link,
+    /// which is not host addressing.
+    InvalidPrefix,
+    /// Source MAC is zero, multicast, or broadcast. Zero means
+    /// "autodetect pending" and is a ROOT-ONLY state — a child config must
+    /// carry a concrete unicast MAC.
+    InvalidSourceMac,
+    /// Gateway MAC is zero, multicast, or broadcast.
+    InvalidGatewayMac,
+    /// Source IP fails the prefix-independent validity check (broadcast,
+    /// multicast, unspecified, loopback, 0/8), or — for /1../30 prefixes —
+    /// its host part is all-zeros (the subnet's network address) or
+    /// all-ones (its directed broadcast). Exact subnet-relative rejection
+    /// replaces the wire path's prefix-blind .255 heuristic (rounds
+    /// 10-11).
+    InvalidSourceIp,
+    /// Gateway IP fails the same prefix-independent validity check, or —
+    /// for /1../30 prefixes — is the subnet's network or directed-
+    /// broadcast address.
+    InvalidGatewayIp,
+    /// Gateway is not on the configured subnet — this slice has no routing
+    /// module, so an off-link gateway could never be reached. (A /32
+    /// prefix therefore admits no gateway at all: point-to-point configs
+    /// need the routing leg's on-link logic.)
+    GatewayOffSubnet,
+    /// Gateway equals the source address.
+    GatewayIsSelf,
+}
+
+/// D3 NETNS-CONFIG: a MAC a namespace may be CONFIGURED with — a concrete
+/// unicast address only. Zero (autodetect-pending) is a root-only state,
+/// and any address with the I/G bit set (multicast, including broadcast)
+/// can never source a frame.
+#[inline]
+fn is_configurable_unicast_mac(mac: net::EthAddr) -> bool {
+    mac.0 != [0u8; 6] && (mac.0[0] & 0x01) == 0
+}
+
+/// D3 NETNS-CONFIG (round-11): configuration-time IP validity — the
+/// prefix-INDEPENDENT half of `Ipv4Addr::is_valid_source`. The wire-path
+/// "last octet 255" heuristic is deliberately OMITTED here: with the
+/// configured prefix in hand, `set_net_config`'s exact subnet-relative
+/// check decides broadcast-ness (R44-3's own TODO anticipated exactly this
+/// call site). A .255 address that is NOT the configured subnet's
+/// broadcast — an RFC 3021 /31 upper endpoint (x.y.z.254/31 ↔ x.y.z.255),
+/// or a mid-subnet host like x.y.0.255/16 — is a legitimate host; one
+/// that IS the broadcast is rejected exactly. The WIRE path keeps the
+/// blunt prefix-blind heuristic unchanged (it validates untrusted remote
+/// sources, where no prefix is known).
+#[inline]
+fn is_configurable_host_ip(ip: net::Ipv4Addr) -> bool {
+    !(ip.is_broadcast() || ip.is_multicast() || ip.is_unspecified() || ip.is_loopback())
+        && ip.octets()[0] != 0
+}
+
 // ============================================================================
 // R77-5 FIX: Namespace Count Guard
 // ============================================================================
@@ -242,7 +310,21 @@ pub struct NetNamespace {
     /// orphaned allocations release when they really drop.
     config_budget: Arc<mm::NsByteBudget>,
 
+    /// D3 NETNS-CONFIG: this namespace's network addressing (PO-NET-01
+    /// §4.3 Phase 2). `None` = unconfigured — TX in this namespace fails
+    /// closed (`TxError::LinkDown`) BEFORE firewall/conntrack evaluation,
+    /// so a child can never borrow the root's identity.
+    ///
+    /// ROOT'S FIELD IS ALWAYS `None`: the root namespace's addressing
+    /// authority is the net crate's global config, DELEGATED to by the
+    /// `ns_net_config` hook — storing a root copy here would create a
+    /// second authority that could drift from the pre-registration
+    /// fallback (Codex round-9). Mutation is child-only via
+    /// [`Self::set_net_config`]; nothing mutates the global config.
+    ///
+    /// Tiny inline `Copy` value behind a leaf mutex — no heap, no
     /// `config_budget` interaction.
+    net_config: Mutex<Option<net::NetConfigSnapshot>>,
 }
 
 impl fmt::Debug for NetNamespace {
@@ -277,6 +359,10 @@ impl NetNamespace {
                 Arc::clone(&config_budget),
             ))),
             config_budget,
+            // D3 NETNS-CONFIG: root NEVER stores a config here — the
+            // ns_net_config hook delegates ns 0 to the net crate's global
+            // config (single authority, see the field doc).
+            net_config: Mutex::new(None),
         }
     }
 
@@ -325,6 +411,12 @@ impl NetNamespace {
                 Arc::clone(&config_budget),
             ))),
             config_budget,
+            // D3 NETNS-CONFIG: children are born UNCONFIGURED — TX fails
+            // closed (LinkDown) until set_net_config gives this namespace
+            // its own identity. No inherited addressing: inheriting the
+            // parent's IP/MAC is exactly the identity-borrowing class the
+            // per-ns config exists to close.
+            net_config: Mutex::new(None),
         });
 
         // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
@@ -459,6 +551,120 @@ impl NetNamespace {
         Arc::clone(&self.config_budget)
     }
 
+    /// D3 NETNS-CONFIG: this namespace's stored addressing, or `None` when
+    /// unconfigured. Root always reads `None` here — its authority is the
+    /// net crate's global config (see the field doc); the `ns_net_config`
+    /// hook performs that delegation, so dataplane callers never see the
+    /// asymmetry. `Copy` snapshot out from under a leaf mutex; no lock is
+    /// held across the return.
+    #[inline]
+    pub fn net_config(&self) -> Option<net::NetConfigSnapshot> {
+        *self.net_config.lock()
+    }
+
+    /// D3 NETNS-CONFIG: configure (or reconfigure) this CHILD namespace's
+    /// addressing. This is the seam the future netns-admin syscall will
+    /// call — validation therefore lives HERE, not at the (future) ABI
+    /// layer (Codex round-9 Q4: validate before it becomes a syscall seam).
+    ///
+    /// # Validation (fail-closed, all checks precede any state change)
+    ///
+    /// - Child namespaces only — root's authority is the global config
+    ///   ([`NetConfigError::RootImmutable`]).
+    /// - `subnet_prefix_len` in 1..=32.
+    /// - Source and gateway MACs: concrete unicast (zero = the root-only
+    ///   autodetect state; I/G-bit addresses can never source a frame).
+    /// - Source and gateway IPs: prefix-independent validity
+    ///   (`is_configurable_host_ip` — broadcast/multicast/unspecified/
+    ///   loopback/0-net) plus the EXACT subnet-relative network/
+    ///   directed-broadcast rejection for /1../30 below. The wire path's
+    ///   prefix-blind .255 heuristic is deliberately not used here
+    ///   (round-11: it would block RFC 3021 /31 endpoints and mid-subnet
+    ///   .255 hosts that are genuinely valid for the configured prefix).
+    /// - Gateway distinct from the source and ON the configured subnet —
+    ///   no routing module exists this slice, so an off-link gateway could
+    ///   never be reached.
+    ///
+    /// # Reconfiguration semantics
+    ///
+    /// On success the namespace's ARP cache is cleared — static AND
+    /// dynamic: every prior mapping was learned under the old addressing,
+    /// and the static gateway seed maps the OLD gateway. Reconfiguration
+    /// is NOT a quiescence barrier: a send that already acquired its
+    /// config snapshot completes with the old identity, bounded by one
+    /// in-flight send (the same envelope as the move_device TX-revocation
+    /// contract).
+    ///
+    /// # Lock context
+    ///
+    /// Takes the config mutex, releases it, THEN takes the ARP-cache mutex
+    /// — strictly sequential leaf locks, never nested.
+    pub fn set_net_config(&self, cfg: net::NetConfigSnapshot) -> Result<(), NetConfigError> {
+        if self.level == 0 {
+            return Err(NetConfigError::RootImmutable);
+        }
+        if cfg.subnet_prefix_len == 0 || cfg.subnet_prefix_len > 32 {
+            return Err(NetConfigError::InvalidPrefix);
+        }
+        if !is_configurable_unicast_mac(cfg.our_mac) {
+            return Err(NetConfigError::InvalidSourceMac);
+        }
+        if !is_configurable_unicast_mac(cfg.gateway_mac) {
+            return Err(NetConfigError::InvalidGatewayMac);
+        }
+        // Round-11: prefix-independent validity only — the exact
+        // subnet-relative check below owns broadcast/network rejection
+        // (the wire path's prefix-blind .255 heuristic would wrongly
+        // block RFC 3021 /31 endpoints and mid-subnet .255 hosts).
+        if !is_configurable_host_ip(cfg.our_ip) {
+            return Err(NetConfigError::InvalidSourceIp);
+        }
+        if !is_configurable_host_ip(cfg.gateway_ip) {
+            return Err(NetConfigError::InvalidGatewayIp);
+        }
+        if cfg.gateway_ip == cfg.our_ip {
+            return Err(NetConfigError::GatewayIsSelf);
+        }
+        // On-link check. Prefix is 1..=32 here, so the shift is 0..=31 —
+        // never the undefined 32-bit shift.
+        let mask: u32 = u32::MAX << (32 - u32::from(cfg.subnet_prefix_len));
+        let our = u32::from_be_bytes(cfg.our_ip.octets());
+        let gw = u32::from_be_bytes(cfg.gateway_ip.octets());
+        if (our ^ gw) & mask != 0 {
+            return Err(NetConfigError::GatewayOffSubnet);
+        }
+        // D3 round-10 FIX: prefix-relative validation — `is_valid_source`
+        // has no prefix, so it cannot see subnet-specific special
+        // addresses (e.g. 10.83.0.63/26 is a directed broadcast and
+        // 10.83.0.0/26 a network address, both generically "valid"). For
+        // ordinary subnets (/1../30) the all-zeros host part is the
+        // network address and the all-ones host part the directed
+        // broadcast — neither is a host. /31 (RFC 3021 point-to-point:
+        // both values ARE hosts) and /32 are deliberately exempt.
+        if cfg.subnet_prefix_len <= 30 {
+            let host_mask = !mask;
+            let our_host = our & host_mask;
+            if our_host == 0 || our_host == host_mask {
+                return Err(NetConfigError::InvalidSourceIp);
+            }
+            let gw_host = gw & host_mask;
+            if gw_host == 0 || gw_host == host_mask {
+                return Err(NetConfigError::InvalidGatewayIp);
+            }
+        }
+
+        {
+            *self.net_config.lock() = Some(cfg);
+        }
+        // Reconfiguration flush (config mutex already released; see the
+        // lock-context doc). Capacity and its budget charge are retained.
+        // A bounded in-flight send from the OLD configuration generation
+        // may re-seed the old gateway mapping after this flush — that is
+        // self-healing, not persistent: every send re-asserts its own
+        // snapshot's gateway via ArpCache::seed_static_gateway (round-10).
+        self.arp_cache.lock().clear_all();
+        Ok(())
+    }
 }
 
 // ============================================================================

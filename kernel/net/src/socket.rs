@@ -472,6 +472,17 @@ pub trait NetNsDeviceHooks: Send + Sync {
     /// revocation leg (ownership generation / token pinning), NOT this hook.
     fn ns_arp_cache(&self, ns_id: u64) -> Option<Arc<Mutex<crate::arp::ArpCache>>>;
 
+    /// D3 NETNS-CONFIG: Return namespace `ns_id`'s network configuration
+    /// (addresses, gateway, subnet prefix), or `None` if the namespace is
+    /// unknown, destroyed, or has no configuration yet — three states the
+    /// dataplane deliberately treats identically (fail-closed: no usable
+    /// network identity, Codex round-9 Q2).
+    ///
+    /// Root (ns 0) must resolve to the net crate's global config — the
+    /// implementation DELEGATES rather than storing a root copy, so root
+    /// addressing has a single authority that cannot drift from the
+    /// pre-registration fallback.
+    ///
     /// Same liveness + lock contract as [`Self::ns_arp_cache`]: the value
     /// is a `Copy` snapshot taken under the namespace's own config lock and
     /// returned with no lock held across the return; `Some` proves the
@@ -479,6 +490,7 @@ pub trait NetNsDeviceHooks: Send + Sync {
     /// merely completes with the snapshot it acquired — the TX ownership
     /// gate downstream still denies egress for a namespace that owns no
     /// device.
+    fn ns_net_config(&self, ns_id: u64) -> Option<crate::stack::NetConfigSnapshot>;
 }
 
 static NETNS_DEVICE_HOOKS: spin::Once<&'static dyn NetNsDeviceHooks> = spin::Once::new();
@@ -522,6 +534,21 @@ pub fn netns_owns_device(ns_id: u64, device_index: u32) -> bool {
 #[inline]
 pub fn netns_arp_cache(ns_id: u64) -> Option<Arc<Mutex<crate::arp::ArpCache>>> {
     netns_device_hooks().and_then(|hooks| hooks.ns_arp_cache(ns_id))
+}
+
+/// D3 NETNS-CONFIG: Resolve namespace `ns_id`'s network configuration
+/// through the registered hook (used by the TX path's `tx_net_config`).
+///
+/// Fail-closed contract:
+/// - Hook registered => the hook's answer (`None` for unknown / destroyed /
+///   unconfigured namespaces — deliberately collapsed).
+/// - Hook unregistered (early boot / host tests) => `None`; callers decide
+///   their own pre-registration fallback via
+///   [`netns_device_hooks_registered`] (the TX path admits root only, from
+///   the global config).
+#[inline]
+pub fn netns_net_config(ns_id: u64) -> Option<crate::stack::NetConfigSnapshot> {
+    netns_device_hooks().and_then(|hooks| hooks.ns_net_config(ns_id))
 }
 
 /// D3-NETNS-DATAPLANE: Whether the kernel_core namespace hooks are live.

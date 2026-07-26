@@ -1373,7 +1373,27 @@ impl net::NetNsDeviceHooks for KernelNetNsDeviceHooks {
         crate::net_namespace::lookup_net_ns(ns_id).map(|ns| ns.arp_cache())
     }
 
+    /// D3 NETNS-CONFIG: hand the net crate namespace `ns_id`'s addressing.
+    ///
+    /// Root DELEGATES to `net::network_config()` — the global config IS the
+    /// root namespace's addressing authority (no stored root copy exists,
+    /// so root and the pre-registration fallback cannot drift; the existing
+    /// root-only lazy eth0 MAC fill is reused unchanged). Children return
+    /// their stored per-ns config; unknown / destroyed / unconfigured
+    /// namespaces => `None` (fail-closed LinkDown at the TX acquisition).
+    ///
+    /// Lock safety: the net -> hook -> `net::network_config()` reentry
+    /// takes only the NET_STATE config mutex (plus the device-registry read
+    /// inside the lazy MAC fill) — leaf locks the TX path does not hold at
+    /// config acquisition (the snapshot is acquired before any firewall /
+    /// conntrack / ARP lock). The child arm copies a `Copy` snapshot under
+    /// the namespace's own config mutex, and the upgraded namespace Arc
+    /// drops before this method returns — the same teardown-safety envelope
     /// as `ns_arp_cache` above.
+    fn ns_net_config(&self, ns_id: u64) -> Option<net::NetConfigSnapshot> {
+        if ns_id == 0 {
+            return Some(net::network_config());
+        }
         crate::net_namespace::lookup_net_ns(ns_id).and_then(|ns| ns.net_config())
     }
 }

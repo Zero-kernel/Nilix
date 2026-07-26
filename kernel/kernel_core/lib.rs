@@ -273,8 +273,8 @@ pub use ipc_namespace::{
 // F.1: Network namespace support
 pub use net_namespace::{
     clone_net_namespace, init as init_net_namespace, move_device as move_net_device,
-    net_ns_owns_device, print_net_namespace_info, test_is_net_ns_initialized, NetNamespace,
-    NetNamespaceFd, NetNsError, CLONE_NEWNET, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
+    net_ns_owns_device, print_net_namespace_info, test_is_net_ns_initialized, NetConfigError,
+    NetNamespace, NetNamespaceFd, NetNsError, CLONE_NEWNET, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
 };
 // F.1: User namespace support
 pub use user_namespace::{
