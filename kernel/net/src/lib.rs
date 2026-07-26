@@ -104,7 +104,8 @@ pub use admitted::WirePacket;
 pub use arp::{
     build_arp_reply, build_arp_request, build_gratuitous_arp, parse_arp, process_arp,
     serialize_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
-    ArpStats, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
+    ArpStats, PendingFrameCounters, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
+    PENDING_FRAME_SLOTS, PENDING_FRAME_TTL_MS,
 };
 pub use buffer::{BufPool, NetBuf};
 pub use device::{
@@ -140,13 +141,13 @@ pub use socket::{
     WaitQueueArc,
 };
 pub use stack::{
-    handle_timer_tick, network_config, next_hop, prepare_arp_probe, process_frame,
-    quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters, rx_ingress_net_stats,
-    rx_ingress_poll, rx_ingress_poll_filtered, rx_ingress_poll_throttled, rx_ingress_pool_stats,
-    transmit_prepared_reply, transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram,
-    tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop, PreparedReply,
-    PreparedReplyTxError, ProcessResult, RxIngressCounters, RxIngressQuiesceGuard, RxPoolStats,
-    RX_BUF_POOL_SIZE, RX_DEVICE_OUTSTANDING_CAP, RX_INGRESS_POLL_BUDGET,
+    drain_parked_ready, handle_timer_tick, network_config, next_hop, prepare_arp_probe,
+    process_frame, quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters,
+    rx_ingress_net_stats, rx_ingress_poll, rx_ingress_poll_filtered, rx_ingress_poll_throttled,
+    rx_ingress_pool_stats, transmit_prepared_reply, transmit_tcp_connect, transmit_tcp_segment,
+    transmit_udp_datagram, tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop,
+    PreparedReply, PreparedReplyTxError, ProcessResult, RxIngressCounters, RxIngressQuiesceGuard,
+    RxPoolStats, RX_BUF_POOL_SIZE, RX_DEVICE_OUTSTANDING_CAP, RX_INGRESS_POLL_BUDGET,
 };
 pub use tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,

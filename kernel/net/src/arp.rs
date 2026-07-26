@@ -42,6 +42,7 @@ use crate::admitted::{AdmittedVec, WirePacket};
 use crate::ethernet::{build_ethernet_frame, EthAddr, ETHERTYPE_ARP};
 use crate::icmp::TokenBucket;
 use crate::ipv4::Ipv4Addr;
+use crate::stack::PreparedReply;
 use mm::{HeapClass, NsByteBudget};
 
 // ============================================================================
@@ -104,6 +105,20 @@ pub const DEFAULT_PROBE_RATE_PPS: u64 = 8;
 
 /// D3 ARP-PROBE: per-cache probe admission burst capacity.
 pub const DEFAULT_PROBE_BURST: u64 = 8;
+
+/// D3 PENDING-FRAME v2: bounded per-cache queue of data frames PARKED on an
+/// on-link ARP miss — gateway-fallback DELIVERY is retired; the frame waits
+/// for the neighbor to be learned. Global-per-cache bound: one unresolved
+/// neighbor may occupy every slot (deliberate — the queue serves ONE
+/// namespace, and eviction keeps the newest application intent).
+pub const PENDING_FRAME_SLOTS: usize = 8;
+
+/// D3 PENDING-FRAME v2: parked-frame lifetime — three probe intervals, so a
+/// frame outlives ~3 admitted probes for its target before dropping on
+/// expiry. Probe-bucket denial does NOT extend the TTL: congestion must
+/// never retain frames indefinitely. Expiry is evaluated BEFORE readiness
+/// (`now_ms >= expires_at` wins over a learn landing at the same instant).
+pub const PENDING_FRAME_TTL_MS: u64 = 3 * ARP_PROBE_INTERVAL_MS;
 
 // ============================================================================
 // ARP Operation Code
@@ -239,6 +254,164 @@ pub enum ProbeAdmission {
     RateLimited,
 }
 
+// ============================================================================
+// D3 PENDING-FRAME v2: park-on-miss queue
+// ============================================================================
+
+/// D3 PENDING-FRAME v2: cumulative lifecycle counters for one cache's
+/// pending-frame queue. Saturating; every successfully parked frame reaches
+/// EXACTLY ONE terminal counter, so in quiescence:
+///
+/// `parked_total == occupancy + retransmitted + expired + evicted + flushed
+///  + retx_failures`
+///
+/// (`retransmitted` means the device queue ACCEPTED the popped frame, never
+/// mere extraction; frames in flight between pop and queue-accept make the
+/// identity transiently under-count — quiescent-only invariant.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingFrameCounters {
+    /// Frames accepted into the queue (cumulative).
+    pub parked_total: u64,
+    /// Popped frames the device queue accepted after a learn.
+    pub retransmitted: u64,
+    /// Frames dropped at TTL expiry (no learn arrived in time).
+    pub expired: u64,
+    /// Frames displaced by a newer park on a full queue (oldest-first).
+    pub evicted: u64,
+    /// Frames discarded by a reconfiguration flush ([`ArpCache::clear_all`]).
+    pub flushed: u64,
+    /// Popped frames whose retransmission failed (policy/ownership/queue) —
+    /// never re-parked, dropped fail-closed.
+    pub retx_failures: u64,
+}
+
+/// D3 PENDING-FRAME v2: one parked data frame — a fully built, policy-passed
+/// wire frame whose destination MAC is the ZERO placeholder until the
+/// neighbor is learned ([`PreparedReply::patch_dst_mac`] runs under the cache
+/// lock at pop; no unpatched frame can leave the queue toward a device).
+/// Identity fields (`our_mac`/`our_ip`) are COPIES from the ORIGINAL config
+/// snapshot for interval re-probes; `park_seq` (per-cache monotonic) is the
+/// FIFO release and eviction key — timestamps alone cannot order same-ms
+/// parks and regress with the clock.
+pub(crate) struct ParkedFrame {
+    pub(crate) reply: PreparedReply,
+    pub(crate) target_ip: Ipv4Addr,
+    pub(crate) our_mac: EthAddr,
+    pub(crate) our_ip: Ipv4Addr,
+    pub(crate) expires_at: u64,
+    pub(crate) park_seq: u64,
+}
+
+/// D3 PENDING-FRAME v2: bounded move-out batch. Destruction discipline: the
+/// cache mutex is a leaf lock and frame drops release heap admissions — every
+/// batch MUST be dropped (or consumed) strictly AFTER the cache guard.
+/// (`pub` because `clear_all` is a cross-crate seam; the contents remain
+/// crate-private — external callers can only bind and drop the batch.)
+#[must_use = "drop or transmit the batch only after releasing the ARP-cache mutex"]
+pub struct PendingFrameBatch {
+    frames: [Option<ParkedFrame>; PENDING_FRAME_SLOTS],
+    len: usize,
+}
+
+impl PendingFrameBatch {
+    fn new() -> Self {
+        Self {
+            frames: core::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, frame: ParkedFrame) {
+        debug_assert!(self.len < PENDING_FRAME_SLOTS);
+        if self.len < PENDING_FRAME_SLOTS {
+            self.frames[self.len] = Some(frame);
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn into_frames(self) -> impl Iterator<Item = ParkedFrame> {
+        self.frames.into_iter().flatten()
+    }
+}
+
+/// D3 PENDING-FRAME v2: one interval-admitted re-probe intent popped by the
+/// sweep — identity from the parked frame's ORIGINAL snapshot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingProbe {
+    pub(crate) target_ip: Ipv4Addr,
+    pub(crate) our_mac: EthAddr,
+    pub(crate) our_ip: Ipv4Addr,
+}
+
+/// D3 PENDING-FRAME v2: bounded batch of admitted re-probe intents.
+pub(crate) struct PendingProbeBatch {
+    probes: [Option<PendingProbe>; PENDING_FRAME_SLOTS],
+    len: usize,
+}
+
+impl PendingProbeBatch {
+    fn new() -> Self {
+        Self {
+            probes: [None; PENDING_FRAME_SLOTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, probe: PendingProbe) {
+        debug_assert!(self.len < PENDING_FRAME_SLOTS);
+        if self.len < PENDING_FRAME_SLOTS {
+            self.probes[self.len] = Some(probe);
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn into_probes(self) -> impl Iterator<Item = PendingProbe> {
+        self.probes.into_iter().flatten()
+    }
+}
+
+/// D3 PENDING-FRAME v2: the pending keys observed under ONE cache-lock hold,
+/// taken BEFORE the sweep's ownership check (which must run without the cache
+/// lock). The drain re-probes only keys in this snapshot: a frame parked
+/// between the two lock holds ran its OWN post-gate initial admission and
+/// needs no sweep probe yet.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingKeySnapshot {
+    keys: [Option<Ipv4Addr>; PENDING_FRAME_SLOTS],
+    len: usize,
+    occupied: bool,
+}
+
+impl PendingKeySnapshot {
+    /// Any frame present (live or expired) — the sweep must run.
+    pub(crate) fn occupied(&self) -> bool {
+        self.occupied
+    }
+
+    /// At least one UNEXPIRED key — worth an ownership check for re-probes.
+    pub(crate) fn has_live_keys(&self) -> bool {
+        self.len != 0
+    }
+
+    fn contains(&self, target_ip: Ipv4Addr) -> bool {
+        self.keys[..self.len].iter().any(|k| *k == Some(target_ip))
+    }
+}
+
+/// D3 PENDING-FRAME v2: everything one sweep moved out of the queue. All
+/// three batches leave the cache lock with the caller; `ready` frames are
+/// already dst-MAC-patched and transmit through the ownership-gated prepared
+/// path, `retired` frames (expired) just drop, `probes` emit afresh.
+pub(crate) struct PendingDrain {
+    pub(crate) ready: PendingFrameBatch,
+    pub(crate) retired: PendingFrameBatch,
+    pub(crate) probes: PendingProbeBatch,
+}
+
 /// ARP cache with anti-spoofing protection
 ///
 /// # Security Features
@@ -260,13 +433,16 @@ pub struct ArpCache {
     pub rx_rate_limiter: TokenBucket,
     /// R102-12 FIX: Per-interface TX rate limiter.
     pub tx_rate_limiter: TokenBucket,
-    /// D3 NETNS-ROUTING: count of on-link destinations resolved to the
-    /// GATEWAY MAC because no neighbor entry existed — the explicitly
-    /// temporary compatibility fallback. ARP request-TX v1 REDUCES this
-    /// debt (a probe follows the miss, so later sends hit the learned
-    /// entry); only the pending-frame queue (v2) retires fallback delivery
-    /// itself. Still measurable per namespace.
-    neighbor_fallbacks: u64,
+    /// D3 PENDING-FRAME v2: data frames parked on an on-link miss, awaiting
+    /// the neighbor learn (retired the metered gateway-fallback delivery).
+    /// Guarded by this cache's own mutex like every other field; frames are
+    /// MOVED OUT under the lock and dropped/transmitted strictly after it.
+    parked: [Option<ParkedFrame>; PENDING_FRAME_SLOTS],
+    /// D3 PENDING-FRAME v2: monotonic park sequence — FIFO release/eviction
+    /// key (same-ms parks and clock regressions cannot reorder it).
+    next_park_seq: u64,
+    /// D3 PENDING-FRAME v2: lifecycle counters (see [`PendingFrameCounters`]).
+    pending_counters: PendingFrameCounters,
     /// D3 ARP-PROBE: per-IP probe suppression ring (heap-free, inline).
     /// Claimed under this cache's own mutex by the TX resolver's on-link
     /// miss arm — see [`Self::admit_probe`].
@@ -303,7 +479,9 @@ impl ArpCache {
             // R102-12 FIX: Per-interface rate limiters with same defaults as global.
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
-            neighbor_fallbacks: 0,
+            parked: core::array::from_fn(|_| None),
+            next_park_seq: 0,
+            pending_counters: PendingFrameCounters::default(),
             probe_ring: [None; ARP_PROBE_RING_SIZE],
             probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
         }
@@ -337,7 +515,9 @@ impl ArpCache {
             max_entries: DEFAULT_CACHE_MAX_ENTRIES,
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
-            neighbor_fallbacks: 0,
+            parked: core::array::from_fn(|_| None),
+            next_park_seq: 0,
+            pending_counters: PendingFrameCounters::default(),
             probe_ring: [None; ARP_PROBE_RING_SIZE],
             probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
         }
@@ -507,17 +687,256 @@ impl ArpCache {
         self.max_entries
     }
 
-    /// D3 NETNS-ROUTING: how many on-link destinations this cache resolved
-    /// to the gateway MAC for lack of a neighbor entry (the metered
-    /// temporary fallback — see `resolve_dst_mac`).
-    pub fn neighbor_fallbacks(&self) -> u64 {
-        self.neighbor_fallbacks
+    /// D3 PENDING-FRAME v2: snapshot of this cache's pending-frame lifecycle
+    /// counters (conservation identity documented on
+    /// [`PendingFrameCounters`]).
+    pub fn pending_frame_counters(&self) -> PendingFrameCounters {
+        self.pending_counters
     }
 
-    /// D3 NETNS-ROUTING: meter one on-link-miss gateway fallback. Called
-    /// by the TX resolver under this cache's own mutex.
-    pub(crate) fn count_neighbor_fallback(&mut self) {
-        self.neighbor_fallbacks = self.neighbor_fallbacks.saturating_add(1);
+    /// D3 PENDING-FRAME v2: current pending-queue occupancy.
+    pub fn pending_frame_count(&self) -> usize {
+        self.parked.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// D3 PENDING-FRAME v2: park one policy-passed data frame awaiting the
+    /// neighbor learn for `target_ip`.
+    ///
+    /// CALLER CONTRACT (post-gate discipline, v1 round-27 F3 direction):
+    /// the TX ownership gate for this namespace ALREADY passed — an
+    /// ownership-denied send must never occupy queue slots or, downstream,
+    /// draw probe claims. The frame's destination MAC is the ZERO
+    /// placeholder; the ONLY exits from the queue are the dst-patched ready
+    /// pop, expiry, eviction, and the reconfiguration flush — no unpatched
+    /// frame can reach a device.
+    ///
+    /// A full queue displaces the OLDEST frame (minimum `park_seq` — the
+    /// drop-head unresolved-neighbor discipline, keeping the newest
+    /// application intent). The displaced frame is RETURNED: its drop
+    /// releases heap admissions, so the caller drops it strictly AFTER this
+    /// cache's mutex.
+    pub(crate) fn park_pending(
+        &mut self,
+        reply: PreparedReply,
+        target_ip: Ipv4Addr,
+        our_mac: EthAddr,
+        our_ip: Ipv4Addr,
+        now_ms: u64,
+    ) -> Option<ParkedFrame> {
+        let slot = match self.parked.iter().position(Option::is_none) {
+            Some(vacant) => vacant,
+            None => {
+                // Full: first minimum park_seq = the oldest park. The
+                // sequence (not the timestamp) orders same-ms parks and is
+                // immune to clock regression.
+                let mut oldest = 0;
+                let mut oldest_seq = u64::MAX;
+                for (index, frame) in self.parked.iter().enumerate() {
+                    if let Some(frame) = frame {
+                        if frame.park_seq < oldest_seq {
+                            oldest_seq = frame.park_seq;
+                            oldest = index;
+                        }
+                    }
+                }
+                oldest
+            }
+        };
+        let evicted = self.parked[slot].take();
+        if evicted.is_some() {
+            self.pending_counters.evicted = self.pending_counters.evicted.saturating_add(1);
+        }
+        let park_seq = self.next_park_seq;
+        // Wrap is unreachable (2^64 parks); wrapping keeps release ordering
+        // deterministic rather than sticking every later park at one seq.
+        self.next_park_seq = self.next_park_seq.wrapping_add(1);
+        self.pending_counters.parked_total = self.pending_counters.parked_total.saturating_add(1);
+        self.parked[slot] = Some(ParkedFrame {
+            reply,
+            target_ip,
+            our_mac,
+            our_ip,
+            expires_at: now_ms.saturating_add(PENDING_FRAME_TTL_MS),
+            park_seq,
+        });
+        evicted
+    }
+
+    /// D3 PENDING-FRAME v2: the pending keys visible NOW — taken under one
+    /// cache-lock hold BEFORE the sweep's ownership check (which must run
+    /// with no cache lock held). See [`PendingKeySnapshot`].
+    pub(crate) fn pending_key_snapshot(&self, now_ms: u64) -> PendingKeySnapshot {
+        let mut snapshot = PendingKeySnapshot {
+            keys: [None; PENDING_FRAME_SLOTS],
+            len: 0,
+            occupied: false,
+        };
+        for frame in self.parked.iter().flatten() {
+            snapshot.occupied = true;
+            if now_ms >= frame.expires_at || snapshot.contains(frame.target_ip) {
+                continue;
+            }
+            if snapshot.len < PENDING_FRAME_SLOTS {
+                snapshot.keys[snapshot.len] = Some(frame.target_ip);
+                snapshot.len += 1;
+            }
+        }
+        snapshot
+    }
+
+    /// D3 PENDING-FRAME v2: one sweep over the pending queue, under this
+    /// cache's mutex. In order:
+    ///
+    /// 1. EXPIRY (always, even ownership-denied — reclamation must not
+    ///    depend on authorization): `now_ms >= expires_at` frames move to
+    ///    `retired`. Expiry deliberately precedes readiness — a learn
+    ///    landing at the deadline instant loses ("drop on expiry" is the
+    ///    hard boundary).
+    /// 2. READY POP (authorized only), FIFO by `park_seq`: targets with a
+    ///    live cache entry patch their dst MAC here under the lock and move
+    ///    to `ready` for the ownership-gated prepared-reply path.
+    /// 3. RE-PROBES (authorized only): for STILL-parked keys in `snapshot`,
+    ///    one [`Self::admit_probe`] per distinct key — the ring interval
+    ///    throttles to ~1/s per IP regardless of sweep cadence. Sweep
+    ///    denials tick NO stats counters: `probe_duplicate_suppressed` /
+    ///    `probe_rate_limited` meter TX-path admission attempts, and a
+    ///    ~10 ms sweep would flood them with interval suppressions.
+    ///
+    /// An `ownership_authorized == false` sweep leaves live frames parked
+    /// (they expire on the TTL; no revocation path exists today — see the
+    /// production sweep site) and admits no probes — a denied namespace
+    /// must not draw ring claims or bucket tokens.
+    ///
+    /// Every returned batch MUST outlive this cache's guard and be
+    /// consumed/dropped after it (frame drops release heap admissions).
+    pub(crate) fn drain_pending(
+        &mut self,
+        now_ms: u64,
+        ownership_authorized: bool,
+        snapshot: &PendingKeySnapshot,
+    ) -> PendingDrain {
+        let mut ready = PendingFrameBatch::new();
+        let mut retired = PendingFrameBatch::new();
+        let mut probes = PendingProbeBatch::new();
+
+        for slot in 0..PENDING_FRAME_SLOTS {
+            let expired = self.parked[slot]
+                .as_ref()
+                .is_some_and(|frame| now_ms >= frame.expires_at);
+            if expired {
+                if let Some(frame) = self.parked[slot].take() {
+                    self.pending_counters.expired =
+                        self.pending_counters.expired.saturating_add(1);
+                    retired.push(frame);
+                }
+            }
+        }
+
+        if !ownership_authorized {
+            return PendingDrain {
+                ready,
+                retired,
+                probes,
+            };
+        }
+
+        let (order, len) = self.ordered_pending_indices();
+        for slot in order[..len].iter().copied() {
+            let Some(target_ip) = self.parked[slot].as_ref().map(|frame| frame.target_ip) else {
+                continue;
+            };
+            let Some(mac) = self.lookup(target_ip, now_ms) else {
+                continue;
+            };
+            let Some(mut frame) = self.parked[slot].take() else {
+                continue;
+            };
+            if frame.reply.patch_dst_mac(mac) {
+                ready.push(frame);
+            } else {
+                // Structurally unreachable (parked frames carry a full
+                // Ethernet header); fail-closed — never emit unpatched.
+                self.pending_counters.retx_failures =
+                    self.pending_counters.retx_failures.saturating_add(1);
+                retired.push(frame);
+            }
+        }
+
+        let mut seen: [Option<Ipv4Addr>; PENDING_FRAME_SLOTS] = [None; PENDING_FRAME_SLOTS];
+        let mut seen_len = 0usize;
+        for slot in 0..PENDING_FRAME_SLOTS {
+            let Some((target_ip, our_mac, our_ip)) = self.parked[slot]
+                .as_ref()
+                .map(|frame| (frame.target_ip, frame.our_mac, frame.our_ip))
+            else {
+                continue;
+            };
+            if !snapshot.contains(target_ip)
+                || seen[..seen_len].iter().any(|key| *key == Some(target_ip))
+            {
+                continue;
+            }
+            seen[seen_len] = Some(target_ip);
+            seen_len += 1;
+            if self.admit_probe(target_ip, now_ms) == ProbeAdmission::Admitted {
+                probes.push(PendingProbe {
+                    target_ip,
+                    our_mac,
+                    our_ip,
+                });
+            }
+        }
+
+        PendingDrain {
+            ready,
+            retired,
+            probes,
+        }
+    }
+
+    /// D3 PENDING-FRAME v2: fold one drain's post-lock transmission results
+    /// back into the lifecycle counters (one re-lock per sweep, not per
+    /// frame). `accepted` = device queue accepted; `failed` = dropped
+    /// fail-closed (policy/ownership/queue) — popped frames are NEVER
+    /// re-parked.
+    pub(crate) fn record_pending_tx_outcomes(&mut self, accepted: u64, failed: u64) {
+        self.pending_counters.retransmitted = self
+            .pending_counters
+            .retransmitted
+            .saturating_add(accepted);
+        self.pending_counters.retx_failures =
+            self.pending_counters.retx_failures.saturating_add(failed);
+    }
+
+    /// D3 PENDING-FRAME v2: occupied slot indices in ascending `park_seq`
+    /// order (insertion sort over ≤ [`PENDING_FRAME_SLOTS`] entries — FIFO
+    /// release, deterministic under same-ms parks).
+    fn ordered_pending_indices(&self) -> ([usize; PENDING_FRAME_SLOTS], usize) {
+        let mut indices = [0usize; PENDING_FRAME_SLOTS];
+        let mut len = 0;
+        for (slot, frame) in self.parked.iter().enumerate() {
+            if frame.is_some() {
+                indices[len] = slot;
+                len += 1;
+            }
+        }
+        let seq_of = |slot: usize| -> u64 {
+            self.parked[slot]
+                .as_ref()
+                .map(|frame| frame.park_seq)
+                .unwrap_or(u64::MAX)
+        };
+        for i in 1..len {
+            let candidate = indices[i];
+            let candidate_seq = seq_of(candidate);
+            let mut j = i;
+            while j > 0 && seq_of(indices[j - 1]) > candidate_seq {
+                indices[j] = indices[j - 1];
+                j -= 1;
+            }
+            indices[j] = candidate;
+        }
+        (indices, len)
     }
 
     /// D3 ARP-PROBE: claim a probe slot for `ip` and admit the claim
@@ -600,8 +1019,26 @@ impl ArpCache {
     /// (Codex round-9: stale ARP state must not survive reconfiguration).
     /// The backing capacity (and its heap-class / ns-budget charge) is
     /// retained; only the logical contents are discarded.
-    pub fn clear_all(&mut self) {
+    ///
+    /// D3 PENDING-FRAME v2: parked frames embed the PRE-reconfiguration
+    /// identity (source MAC/IP baked into their bytes) — they flush with
+    /// the entries and are RETURNED so the caller drops them strictly
+    /// after this cache's mutex (frame drops release heap admissions).
+    /// The probe ring and buckets are REAL-clock throttle state and
+    /// deliberately survive: reconfiguration must not grant a rate reset.
+    pub fn clear_all(&mut self) -> PendingFrameBatch {
         self.entries.retain(|_| false);
+        let mut flushed = PendingFrameBatch::new();
+        for slot in &mut self.parked {
+            if let Some(frame) = slot.take() {
+                flushed.push(frame);
+            }
+        }
+        self.pending_counters.flushed = self
+            .pending_counters
+            .flushed
+            .saturating_add(flushed.len() as u64);
+        flushed
     }
 
     /// D3 NETNS-CONFIG: authoritatively (re)seed the static gateway mapping
