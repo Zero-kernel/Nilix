@@ -432,6 +432,11 @@ pub fn process_frame(
             // cache. The hook returns the cache Arc, never a namespace handle,
             // so no namespace reference is held across ARP processing.
             //
+            // RX-WIRING CONTRACT (Codex round-2): pre-registration this drops
+            // root-ns ARP too. There is no production RX caller today; the
+            // future ingress loop MUST start only after kernel_core registers
+            // the hooks (assert at wiring time), and must decide its own
+            // policy for a namespace dying mid-frame (the `Some` below proves
             // liveness at lookup only — see `NetNsDeviceHooks::ns_arp_cache`).
             let arp_cache = match crate::socket::netns_arp_cache(net_ns_id.0) {
                 Some(cache) => cache,

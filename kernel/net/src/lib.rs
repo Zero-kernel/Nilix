@@ -573,6 +573,16 @@ pub fn init(iommu_required: bool) -> usize {
 // D3-NETNS-DATAPLANE: RX Ingress Lifecycle Contract
 // ============================================================================
 
+/// D3-NETNS-DATAPLANE RX-WIRING CONTRACT (Phase I.3 revocation leg): any
+/// production RX loop (IRQ handler, polling task, or otherwise) that will call
+/// `process_frame` with non-root namespace IDs MUST:
+///
+/// 1. **Start ONLY after `netns_device_hooks_registered()` returns true.**
+///    Call `assert_netns_hooks_for_rx()` at wiring time (e.g., after IRQ
+///    registration, before the first poll). This ensures the per-ns ARP path
+///    never runs before kernel_core has seeded the namespace registry.
+///
+/// 2. **Pin namespace liveness for the frame's entire processing lifetime**
 ///    OR revalidate before emitting replies. The current `ns_arp_cache` hook
 ///    contract proves liveness AT LOOKUP only — a namespace may be destroyed
 ///    while RX processing still holds its cache Arc. An orphaned cache stays
@@ -606,3 +616,11 @@ pub fn init(iommu_required: bool) -> usize {
 /// This function enforces #1 at the call site; #2 is a future RX-loop
 /// implementation obligation documented here for when that loop is wired.
 #[inline]
+pub fn assert_netns_hooks_for_rx() {
+    assert!(
+        crate::socket::netns_device_hooks_registered(),
+        "D3-NETNS-DATAPLANE RX-WIRING CONTRACT: production RX loop started \
+         before netns_device_hooks were registered — ARP per-ns cache lookups \
+         would fail-closed, breaking root-ns ARP until userspace init"
+    );
+}
