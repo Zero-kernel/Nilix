@@ -216,6 +216,10 @@ pub struct ArpCache {
     pub rx_rate_limiter: TokenBucket,
     /// R102-12 FIX: Per-interface TX rate limiter.
     pub tx_rate_limiter: TokenBucket,
+    /// D3 NETNS-ROUTING: count of on-link destinations resolved to the
+    /// GATEWAY MAC because no neighbor entry existed — the explicitly
+    /// temporary compatibility fallback. ARP request-TX v1 REDUCES this
+    neighbor_fallbacks: u64,
 }
 
 impl ArpCache {
@@ -242,6 +246,7 @@ impl ArpCache {
             // R102-12 FIX: Per-interface rate limiters with same defaults as global.
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
+            neighbor_fallbacks: 0,
         }
     }
 
@@ -273,6 +278,7 @@ impl ArpCache {
             max_entries: DEFAULT_CACHE_MAX_ENTRIES,
             rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
             tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
+            neighbor_fallbacks: 0,
     /// Look up a MAC address for the given IP.
     ///
     /// Returns `None` if not found or expired.
@@ -416,6 +422,24 @@ impl ArpCache {
     /// Check if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Get the maximum number of entries allowed in the cache.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// D3 NETNS-ROUTING: how many on-link destinations this cache resolved
+    /// to the gateway MAC for lack of a neighbor entry (the metered
+    /// temporary fallback — see `resolve_dst_mac`).
+    pub fn neighbor_fallbacks(&self) -> u64 {
+        self.neighbor_fallbacks
+    }
+
+    /// D3 NETNS-ROUTING: meter one on-link-miss gateway fallback. Called
+    /// by the TX resolver under this cache's own mutex.
+    pub(crate) fn count_neighbor_fallback(&mut self) {
+        self.neighbor_fallbacks = self.neighbor_fallbacks.saturating_add(1);
     }
 
     /// Clear all dynamic entries.

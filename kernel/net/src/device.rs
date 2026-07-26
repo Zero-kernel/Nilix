@@ -164,6 +164,11 @@ pub enum TxError {
     LinkDown,
     /// The egress firewall rejected the packet before device publication.
     FirewallDenied,
+    /// D3 NETNS-ROUTING: the destination can never be reached from this
+    /// namespace — self/loopback (until the TX-loopback leg delivers
+    /// them), multicast, broadcast, unspecified, or the configured
+    /// subnet's network/directed-broadcast address (ENETUNREACH).
+    Unreachable,
     /// Buffer is invalid (too large, misaligned, etc.).
     InvalidBuffer,
     /// Ordinary heap/admission failed while preparing the packet owner.

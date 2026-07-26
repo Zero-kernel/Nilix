@@ -143,6 +143,7 @@ pub use stack::{
     handle_timer_tick, network_config, process_frame, transmit_prepared_reply,
     transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram, DropReason,
     NetConfigSnapshot, NetStats, PreparedReply, PreparedReplyTxError, ProcessResult,
+    tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop, PreparedReply,
 };
 pub use tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,

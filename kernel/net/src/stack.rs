@@ -1331,6 +1331,8 @@ pub struct NetConfigSnapshot {
     /// Carried in the SAME atomic snapshot as the addresses (Codex
     /// round-9: the routing leg's on-link determination must never mix a
     /// prefix from one configuration generation with addresses from
+    /// another). Consumed by `next_hop` (per-ns routing, PO-NET-01 §4.3
+    /// Phase 3) for the on-link/off-link/host-part determination.
     pub subnet_prefix_len: u8,
 }
 
@@ -1417,15 +1419,108 @@ pub fn tx_net_config(net_ns_id: u64) -> Result<NetConfigSnapshot, TxError> {
     }
 }
 
+/// D3 NETNS-ROUTING: where a destination must be sent, decided from the
+/// sending namespace's OWN configuration snapshot.
+///
+/// This is the per-namespace next-hop selection PO-NET-01 §4.3 Phase 3
+/// item 8 requires. A mutable routing TABLE is deliberately NOT built yet:
+/// with one egress interface and no veth/admin surface, exactly two routes
+/// exist and both derive from the snapshot (connected = the configured
+/// subnet, default = the configured gateway). The table becomes a real
+/// structure when veth / multi-interface / route-admin land (recorded as
+/// their prerequisite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextHop {
+    /// Destination is this namespace itself (`dst == our_ip`, or 127/8).
+    /// NOT deliverable yet — the TX-loopback leg owns delivery; until it
+    /// lands the TX path fails these closed rather than leaking
+    /// self-addressed frames to the gateway.
+    Local,
+    /// Destination is a neighbor on the configured subnet: the frame's L2
+    /// destination is the neighbor itself (resolved from the namespace's
+    /// ARP cache).
+    OnLink,
+    /// Destination is off-link: the frame's L2 destination is the
+    /// configured gateway, ALWAYS — a cached mapping for an off-link IP
+    /// must never override the routing decision.
+    Gateway,
+    /// Destination can never be a unicast egress target: unspecified,
+    /// multicast, limited broadcast, the configured subnet's network /
+    /// directed-broadcast address (for /1../30), or a malformed prefix
+    /// (defensive: unreachable through validated configs). Fail-closed.
+    Unroutable,
+}
+
+/// D3 NETNS-ROUTING: classify `dst` against namespace addressing `cfg`.
+///
+/// Pure and non-panicking for ANY input (public API contract): a prefix
+/// outside 1..=32 classifies `Unroutable` (fail-closed) instead of
+/// panicking on shift overflow — real snapshots are setter-validated, so
+/// this arm is defensive only.
+///
+/// Special destinations are classified BEFORE subnet math so none of them
+/// can ever become gateway-unicast traffic (Codex round-13): unspecified /
+/// limited-broadcast / multicast → [`NextHop::Unroutable`]; `our_ip` /
+/// loopback → [`NextHop::Local`]. On the configured subnet, the network
+/// address (host part all-zeros) and directed broadcast (all-ones) are
+/// `Unroutable` for /1../30; /31 (RFC 3021 — both values are hosts) and
+/// /32 have no such special addresses. The configured gateway itself
+/// classifies `OnLink` (it IS a neighbor; setter-validated on-subnet).
+pub fn next_hop(dst: Ipv4Addr, cfg: &NetConfigSnapshot) -> NextHop {
+    if dst.is_unspecified() || dst.is_broadcast() || dst.is_multicast() {
+        return NextHop::Unroutable;
+    }
+    if dst == cfg.our_ip || dst.is_loopback() {
+        return NextHop::Local;
+    }
     let prefix = cfg.subnet_prefix_len;
     if prefix == 0 || prefix > 32 {
         // Defensive fail-closed arm — unreachable through setter-validated
         // snapshots. Deliberately NO debug_assert: this is a public
         // non-panicking API on ANY input, debug kernels included (Codex
         // round-14).
+        return NextHop::Unroutable;
+    }
+    // Prefix is 1..=32, so the shift is 0..=31 — never undefined.
+    let mask: u32 = u32::MAX << (32 - u32::from(prefix));
+    let our = u32::from_be_bytes(cfg.our_ip.octets());
+    let d = u32::from_be_bytes(dst.octets());
+    if (our ^ d) & mask != 0 {
+        // Off-link: a host forwards to its gateway; any farther-subnet
+        // special addresses are the routers' problem, not ours.
+        return NextHop::Gateway;
+    }
+    if prefix <= 30 {
+        let host = d & !mask;
+        if host == 0 || host == !mask {
+            // The subnet's network address / directed broadcast — never a
+            // unicast egress target.
+            return NextHop::Unroutable;
+        }
+    }
+    NextHop::OnLink
+}
+
+    /// meters `neighbor_fallbacks` EXACTLY through it and must never
     cfg: &NetConfigSnapshot,
     net_ns_id: u64,
     now_ms: u64,
+    cache.count_neighbor_fallback();
+/// D3 NETNS-ROUTING: routing-aware. The [`next_hop`] decision (computed
+/// from the caller's OWN snapshot) governs:
+///
+/// - `Local` / `Unroutable` → `Err(TxError::Unreachable)` — fail-closed
+///   BEFORE any cache access; a self-addressed, loopback, multicast,
+///   broadcast, or subnet-special destination must never egress as
+///   gateway-unicast (`Local` becomes deliverable when the TX-loopback
+///   leg lands).
+/// - `Gateway` (off-link) → the configured gateway MAC, ALWAYS. The dst
+///   cache lookup is deliberately SKIPPED: a cached mapping for an
+///   off-link IP (plantable by a spoofed reply addressed to us) must not
+///   override the routing decision.
+/// - `OnLink` → the neighbor's cached MAC. On a miss the resolver falls
+///   back to the gateway MAC as an EXPLICITLY TEMPORARY compatibility
+///   measure, metered by the cache's `neighbor_fallbacks` counter. ARP
 /// holds no lock across its return (see `NetNsDeviceHooks::ns_arp_cache`),
 /// and send paths hold their per-socket locks only while the sending
 /// process pins the namespace, so the hook's internal namespace-handle drop
@@ -1443,6 +1538,10 @@ pub fn tx_net_config(net_ns_id: u64) -> Result<NetConfigSnapshot, TxError> {
 ) -> Result<EthAddr, TxError> {
     cfg: &NetConfigSnapshot,
     net_ns_id: u64,
+    let hop = match next_hop(dst_ip, cfg) {
+        NextHop::Local | NextHop::Unroutable => return Err(TxError::Unreachable),
+        routable => routable,
+    };
 
     // R162-20 FIX: Use actual kernel time for ARP cache TTL checks.
     // Previously hardcoded to 0, causing dynamic entries to never expire.
@@ -1465,12 +1564,21 @@ pub fn tx_net_config(net_ns_id: u64) -> Result<NetConfigSnapshot, TxError> {
             // entry (see ArpCache::seed_static_gateway).
             let _ = cache.seed_static_gateway(cfg.gateway_ip, cfg.gateway_mac, now_ms);
 
+            if hop == NextHop::OnLink {
+                if let Some(mac) = cache.lookup(dst_ip, now_ms) {
+                    return Ok((mac, None));
+                }
+                // Metered temporary fallback — see the doc above.
             // Ensure gateway is always in cache. D3 NETNS-CONFIG:
             // authoritative seed — the caller's config snapshot outranks
             // the cache, healing a stale post-reconfiguration gateway
             // entry (see ArpCache::seed_static_gateway).
             let _ = cache.seed_static_gateway(cfg.gateway_ip, cfg.gateway_mac, now_ms);
 
+            if hop == NextHop::OnLink {
+                if let Some(mac) = cache.lookup(dst_ip, now_ms) {
+                    return Ok((mac, None));
+                }
     }
 
     // Fall back to gateway MAC for off-link destinations
@@ -1659,6 +1767,8 @@ fn build_frame_and_transmit(
     }
 
     // D3-NETNS-DATAPLANE: Pass net_ns_id to use per-namespace ARP cache.
+    // D3 NETNS-ROUTING: fallible — Local/Unroutable destinations fail
+    // closed (Unreachable) instead of egressing as gateway-unicast.
 
     // Build IPv4 header
     let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
@@ -1851,9 +1961,20 @@ pub fn transmit_prepared_reply(
     })
 }
 
+/// * `Unreachable` — `next_hop` did not classify the target ON-LINK
+///   (off-link destinations resolve THROUGH the gateway; probing them is
+///   never meaningful, and specials must never egress as ARP targets).
+/// * `NoMemory` — frame admission failed.
     let cfg = tx_net_config(net_ns_id)?;
     if cfg.our_mac.0 == [0u8; 6] {
         return Err(TxError::LinkDown);
+    }
+    if next_hop(target_ip, &cfg) != NextHop::OnLink {
+        return Err(TxError::Unreachable);
+    }
+    let frame = crate::arp::build_arp_request(cfg.our_mac, cfg.our_ip, target_ip);
+    if frame.is_empty() {
+        return Err(TxError::NoMemory);
     }
 fn transmit_prepared_reply_with_queue<F>(
     reply: PreparedReply,

@@ -2006,6 +2006,7 @@ pub enum SyscallError {
     EADDRINUSE = -98,      // 地址已被使用
     EADDRNOTAVAIL = -99,   // 无法分配请求的地址
     ENETDOWN = -100,       // 网络不可用
+    ENETUNREACH = -101,    // D3 NETNS-ROUTING: 网络不可达 (unroutable destination)
     ECONNREFUSED = -111,   // 连接被拒绝
     EISCONN = -106,        // 套接字已连接
     ENOTCONN = -107,       // 传输端点未连接
@@ -3179,6 +3180,9 @@ fn tx_error_to_syscall(err: net::TxError) -> SyscallError {
         net::TxError::QueueFull => SyscallError::EAGAIN,
         net::TxError::LinkDown => SyscallError::ENETDOWN,
         net::TxError::FirewallDenied => SyscallError::EPERM,
+        // D3 NETNS-ROUTING: Local (until TX-loopback delivers) and
+        // Unroutable destinations fail closed as network-unreachable.
+        net::TxError::Unreachable => SyscallError::ENETUNREACH,
         net::TxError::InvalidBuffer => SyscallError::EINVAL,
         net::TxError::NoMemory => SyscallError::ENOMEM,
         net::TxError::NoBuffers => SyscallError::ENOBUFS,
