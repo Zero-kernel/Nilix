@@ -198,6 +198,24 @@ pub struct PreparedReply {
     stat: PreparedReplyStat,
     reject_count: u8,
     retry_not_before_ms: u64,
+    deferred_ct: DeferredCt,
+}
+
+/// D3 PENDING-FRAME v2: which egress conntrack transaction was DEFERRED when
+/// this frame bypassed the direct-TX path (parked on an on-link miss). The
+/// prepared transaction consults this EXPLICITLY — never inferred from the
+/// frame's protocol alone — so a future prepared UDP reply that committed
+/// conntrack elsewhere stays untouched by default. Parked TCP needs no
+/// marker: the transaction's existing TCP arm already runs the direct path's
+/// `ct_egress_tcp_with_commit` coupling (`operation = None` for bindingless
+/// frames), and ICMP/raw parity is by omission (the direct path does not
+/// conntrack-commit them either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredCt {
+    /// No deferred transaction.
+    None,
+    /// Parked UDP data frame: run `ct_egress_udp` at queue-accept.
+    Udp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +237,30 @@ impl PreparedReply {
             stat: PreparedReplyStat::None,
             reject_count: 0,
             retry_not_before_ms: 0,
+            deferred_ct: DeferredCt::None,
         }
+    }
+
+    /// D3 PENDING-FRAME v2: mark this parked UDP data frame's conntrack
+    /// egress transaction as deferred to queue-accept (see [`DeferredCt`]).
+    fn with_deferred_udp_ct(mut self) -> Self {
+        self.deferred_ct = DeferredCt::Udp;
+        self
+    }
+
+    /// D3 PENDING-FRAME v2: overwrite the frame's destination MAC (bytes
+    /// 0..6) — the pop-time patch that turns a parked ZERO-placeholder frame
+    /// into a deliverable one, run under the owning ARP cache's mutex so no
+    /// unpatched frame can leave the pending queue. Returns `false` (frame
+    /// untouched) when the frame is shorter than an Ethernet destination —
+    /// structurally unreachable for parked frames, checked fail-closed.
+    pub(crate) fn patch_dst_mac(&mut self, mac: EthAddr) -> bool {
+        let bytes = self.frame.as_mut_slice();
+        let Some(dst) = bytes.get_mut(..6) else {
+            return false;
+        };
+        dst.copy_from_slice(&mac.0);
+        true
     }
 
     fn bind_tcp(&mut self, binding: Option<TcpReplyBinding>) {
@@ -292,6 +333,7 @@ impl core::fmt::Debug for PreparedReply {
             .field("stat", &self.stat)
             .field("reject_count", &self.reject_count)
             .field("retry_not_before_ms", &self.retry_not_before_ms)
+            .field("deferred_ct", &self.deferred_ct)
             .finish()
     }
 }
@@ -1506,12 +1548,14 @@ pub fn next_hop(dst: Ipv4Addr, cfg: &NetConfigSnapshot) -> NextHop {
 }
 
 /// D3 ARP-PROBE: an ADMITTED probe intent — the on-link target plus the
-/// sender identity COPIED from the data packet's own config snapshot at
-/// resolution time. Emission never re-acquires configuration: the probe
-/// stays bound to the exact identity whose data frame motivated it
-/// (round-20 — a re-acquired snapshot could name a different
-/// post-reconfiguration identity than that frame; `prepare_arp_probe`
-/// re-acquires and remains the external/test seam).
+/// sender identity COPIED from the data packet's own config snapshot.
+/// Emission never re-acquires configuration: the probe stays bound to the
+/// exact identity whose data frame motivated it (round-20 — a re-acquired
+/// snapshot could name a different post-reconfiguration identity than that
+/// frame; `prepare_arp_probe` re-acquires and remains the external/test
+/// seam). D3 PENDING-FRAME v2: intents are built at the PARK site (after
+/// the ownership pre-gate) and by the pending sweep's interval re-probes —
+/// never at resolution.
 struct ProbeIntent {
     our_mac: EthAddr,
     our_ip: Ipv4Addr,
@@ -1519,72 +1563,18 @@ struct ProbeIntent {
     net_ns_id: u64,
 }
 
-/// D3 ARP-PROBE: resolver probe policy.
-enum ProbeMode {
-    /// Resolution only — no ring claims, no bucket draws, no intents. The
-    /// pub [`resolve_dst_mac`] seam observes: the netns_routing boot test
-    /// meters `neighbor_fallbacks` EXACTLY through it and must never
-    /// perturb probe state.
-    Observe,
-    /// TX path: on the on-link-miss fallback, run the full probe admission
-    /// (per-IP ring + per-cache bucket under the held cache lock, then the
-    /// global aggregate backstop); a fully admitted claim yields a
-    /// [`ProbeIntent`] for post-enqueue emission.
-    Claim,
-}
-
-/// D3 ARP-PROBE: on-link-miss fallback bookkeeping for one cache arm —
-/// meter the gateway fallback and, in [`ProbeMode::Claim`], run probe
-/// admission (per-IP ring + PER-CACHE bucket, both under the held cache
-/// lock). Counter routing: either probe bucket's denial is one
-/// `probe_rate_limited` — the per-cache one here at admission, the global
-/// aggregate backstop in [`emit_arp_probe`] at emission (Codex round-27
-/// F3: post-gate placement, see the match arm below).
-///
-/// Residual (documented, bounded): admission runs at RESOLUTION time, so a
-/// send later denied at the TX ownership gate has still drawn PER-CACHE
-/// claims — the egress FIREWALL ran before resolution, only ownership is
-/// outstanding. That waste is confined to the sender's own cache budget
-/// and refills at bucket rate; no probe EGRESSES for such a send (emission
-/// requires data-TX success) and the shared global bucket is untouched.
-/// The pending-frame queue (v2) naturally moves admission behind the gate.
-fn on_link_miss_fallback(
-    cache: &mut crate::arp::ArpCache,
-    dst_ip: Ipv4Addr,
-    cfg: &NetConfigSnapshot,
-    net_ns_id: u64,
-    now_ms: u64,
-    mode: &ProbeMode,
-) -> Option<ProbeIntent> {
-    cache.count_neighbor_fallback();
-    let ProbeMode::Claim = mode else {
-        return None;
-    };
-    let arp_stats = &RX_INGRESS_NET_STATS.arp_stats;
-    match cache.admit_probe(dst_ip, now_ms) {
-        // Codex round-27 F3: admission ends at the PER-CACHE bucket. The
-        // global aggregate backstop is deliberately NOT drawn here — it is
-        // drawn in `emit_arp_probe`, after the ownership-gated data enqueue
-        // succeeded. Drawing it at admission would let a configured but
-        // device-less namespace (every send denied at the TX gate) drain
-        // the shared bucket at its per-cache rate — which EQUALS the global
-        // refill rate, i.e. a permanent starvation of every legitimate
-        // namespace's probes. Here it can only waste its own budget.
-        crate::arp::ProbeAdmission::Admitted => Some(ProbeIntent {
-            our_mac: cfg.our_mac,
-            our_ip: cfg.our_ip,
-            target_ip: dst_ip,
-            net_ns_id,
-        }),
-        crate::arp::ProbeAdmission::DuplicateSuppressed => {
-            arp_stats.inc_probe_duplicate_suppressed();
-            None
-        }
-        crate::arp::ProbeAdmission::RateLimited => {
-            arp_stats.inc_probe_rate_limited();
-            None
-        }
-    }
+/// D3 PENDING-FRAME v2: the resolver's routing outcome. An on-link miss is
+/// CONTROL FLOW, not an error and no longer a gateway fallback: the TX path
+/// parks the data frame and probes; the pub [`resolve_dst_mac`] seam maps it
+/// to [`TxError::NeighborUnresolved`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedDst {
+    /// A deliverable L2 destination (neighbor entry, or the configured
+    /// gateway for off-link routes).
+    Mac(EthAddr),
+    /// On-link destination with no neighbor entry in a LIVE per-ns cache —
+    /// park-and-probe territory.
+    OnLinkMiss,
 }
 
 /// Resolve the L2 destination for `dst_ip` in namespace `net_ns_id`.
@@ -1601,25 +1591,26 @@ fn on_link_miss_fallback(
 ///   cache lookup is deliberately SKIPPED: a cached mapping for an
 ///   off-link IP (plantable by a spoofed reply addressed to us) must not
 ///   override the routing decision.
-/// - `OnLink` → the neighbor's cached MAC. On a miss the resolver falls
-///   back to the gateway MAC as an EXPLICITLY TEMPORARY compatibility
-///   measure, metered by the cache's `neighbor_fallbacks` counter. ARP
-///   request-TX v1 REDUCES the debt — the TX path ([`ProbeMode::Claim`])
-///   admits a bucket-bounded probe on the miss, so later sends hit the
-///   learned entry; the pending-frame queue (v2) retires fallback
-///   delivery itself. This fallback is unreachable for special
-///   destinations (they errored above).
+/// - `OnLink` → the neighbor's cached MAC. D3 PENDING-FRAME v2: a miss is
+///   `Err(TxError::NeighborUnresolved)` (EHOSTUNREACH) at this seam — the
+///   metered temporary gateway fallback is RETIRED. The TX path does not
+///   take this error: it parks the data frame post-ownership-gate and
+///   probes; the frame retransmits when the neighbor is learned (see
+///   [`drain_parked_ready`]) and drops on expiry.
 ///
-/// # Cache selection (fail-closed, unchanged)
+/// # Cache selection (fail-closed)
 ///
 /// - Hooks registered + live namespace: that namespace's own cache.
 /// - Hooks registered + unknown/destroyed namespace: NO cache is read or
-///   written (the TX ownership gate downstream denies the transmit) — the
-///   routing decision still applies, then gateway MAC from the snapshot,
-///   uncounted (no cache to meter against) and probe-free (no ring to
-///   claim against).
+///   written. Off-link still resolves to the snapshot gateway (the TX
+///   ownership gate downstream denies the transmit); an on-link miss is
+///   `Err(TxError::LinkDown)` (the unknown/destroyed-namespace convention,
+///   matching `tx_net_config`) — v2 also closes the sliver where such a
+///   frame could egress bearing the gateway MAC.
 /// - Hooks unregistered (early boot / host tests): the global cache, for
-///   the ROOT namespace only — enforced at the access itself.
+///   the ROOT namespace only — enforced at the access itself. An on-link
+///   miss here is `Err(TxError::NeighborUnresolved)`: no drain choke point
+///   exists pre-registration, so parking would strand frames.
 ///
 /// # Lock context
 ///
@@ -1636,26 +1627,29 @@ fn on_link_miss_fallback(
 /// stay unobservable until TX-loopback). Capability-safe: this resolves
 /// addressing only — no transmit authority egresses (that is
 /// `tx_auth::AuthorizedTxDevice`). Side effects: seeds the namespace's
-/// static gateway entry and meters on-link fallbacks — NEVER probe state
-/// (this is the [`ProbeMode::Observe`] seam).
+/// static gateway entry — NEVER probe or pending-queue state (those belong
+/// to the TX path's post-gate park site).
 pub fn resolve_dst_mac(
     dst_ip: Ipv4Addr,
     cfg: &NetConfigSnapshot,
     net_ns_id: u64,
 ) -> Result<EthAddr, TxError> {
-    resolve_dst_mac_inner(dst_ip, cfg, net_ns_id, ProbeMode::Observe).map(|(mac, _intent)| mac)
+    match resolve_dst_mac_inner(dst_ip, cfg, net_ns_id)? {
+        ResolvedDst::Mac(mac) => Ok(mac),
+        ResolvedDst::OnLinkMiss => Err(TxError::NeighborUnresolved),
+    }
 }
 
-/// D3 ARP-PROBE: the full resolver — [`resolve_dst_mac`] semantics plus,
-/// in [`ProbeMode::Claim`], probe admission on the on-link-miss fallback.
-/// Returns the resolved MAC and the admitted intent (if any); the caller
-/// emits the intent only AFTER its data frame is accepted by the TX queue.
+/// D3 PENDING-FRAME v2: the full resolver — [`resolve_dst_mac`] semantics
+/// with the on-link miss surfaced as CONTROL FLOW ([`ResolvedDst`]) for the
+/// TX path's park-and-probe arm. Probe admission no longer happens here:
+/// it moved behind the TX ownership gate (the v1 round-27 F3 residual —
+/// an ownership-denied send must not draw even its own cache's claims).
 fn resolve_dst_mac_inner(
     dst_ip: Ipv4Addr,
     cfg: &NetConfigSnapshot,
     net_ns_id: u64,
-    mode: ProbeMode,
-) -> Result<(EthAddr, Option<ProbeIntent>), TxError> {
+) -> Result<ResolvedDst, TxError> {
     let hop = match next_hop(dst_ip, cfg) {
         NextHop::Local | NextHop::Unroutable => return Err(TxError::Unreachable),
         routable => routable,
@@ -1664,8 +1658,6 @@ fn resolve_dst_mac_inner(
     // R162-20 FIX: Use actual kernel time for ARP cache TTL checks.
     // Previously hardcoded to 0, causing dynamic entries to never expire.
     let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
-
-    let mut probe_intent = None;
 
     match crate::socket::netns_arp_cache(net_ns_id) {
         Some(cache) => {
@@ -1679,11 +1671,12 @@ fn resolve_dst_mac_inner(
 
             if hop == NextHop::OnLink {
                 if let Some(mac) = cache.lookup(dst_ip, now_ms) {
-                    return Ok((mac, None));
+                    return Ok(ResolvedDst::Mac(mac));
                 }
-                // Metered temporary fallback — see the doc above.
-                probe_intent =
-                    on_link_miss_fallback(&mut cache, dst_ip, cfg, net_ns_id, now_ms, &mode);
+                // v2: no fallback, no metering, no probe claims — the TX
+                // path parks post-gate; the pub seam maps this to
+                // NeighborUnresolved.
+                return Ok(ResolvedDst::OnLinkMiss);
             }
         }
         None if net_ns_id == 0 && !crate::socket::netns_device_hooks_registered() => {
@@ -1705,24 +1698,28 @@ fn resolve_dst_mac_inner(
 
             if hop == NextHop::OnLink {
                 if let Some(mac) = cache.lookup(dst_ip, now_ms) {
-                    return Ok((mac, None));
+                    return Ok(ResolvedDst::Mac(mac));
                 }
-                probe_intent =
-                    on_link_miss_fallback(&mut cache, dst_ip, cfg, net_ns_id, now_ms, &mode);
+                // Pre-registration parking would STRAND frames (the drain
+                // choke point does not exist yet) — fail closed instead.
+                return Err(TxError::NeighborUnresolved);
             }
         }
         None => {
             // Namespace unknown/destroyed (hooks registered), or a non-root
             // id in the pre-registration window: fail-closed — touch no
-            // shared cache. The TX ownership gate downstream denies this
-            // transmit; the returned gateway MAC never reaches the wire,
-            // and no probe state exists to claim.
+            // shared cache. Off-link falls through to the snapshot gateway
+            // (the TX ownership gate downstream denies the transmit); an
+            // on-link miss fails HERE — v2 retired the sliver where a
+            // dead-namespace frame could leave carrying the gateway MAC.
+            if hop == NextHop::OnLink {
+                return Err(TxError::LinkDown);
+            }
         }
     }
 
-    // Off-link destinations, and the metered on-link-miss compatibility
-    // fallback (plus the cache-free fail-closed arm).
-    Ok((cfg.gateway_mac, probe_intent))
+    // Off-link destinations resolve through the configured gateway.
+    Ok(ResolvedDst::Mac(cfg.gateway_mac))
 }
 
 /// D1-ISO-NETNS-DATAPLANE: `tx_auth` owns the ONLY path to the driver `transmit`.
@@ -1909,9 +1906,24 @@ fn build_frame_and_transmit(
     // D3-NETNS-DATAPLANE: Pass net_ns_id to use per-namespace ARP cache.
     // D3 NETNS-ROUTING: fallible — Local/Unroutable destinations fail
     // closed (Unreachable) instead of egressing as gateway-unicast.
-    // D3 ARP-PROBE: Claim mode — an on-link miss admits a bucket-bounded
-    // probe intent, emitted below ONLY after the data frame is accepted.
-    let (dst_mac, probe_intent) = resolve_dst_mac_inner(dst_ip, &cfg, net_ns_id, ProbeMode::Claim)?;
+    // D3 PENDING-FRAME v2: an on-link miss DIVERTS to the park-and-probe
+    // path (ownership pre-gate → park → post-gate probe admission) —
+    // gateway-fallback delivery is retired. Everything below the divert is
+    // the resolved HIT path.
+    let dst_mac = match resolve_dst_mac_inner(dst_ip, &cfg, net_ns_id)? {
+        ResolvedDst::Mac(mac) => mac,
+        ResolvedDst::OnLinkMiss => {
+            return park_on_link_miss(
+                proto,
+                dst_ip,
+                payload,
+                transport,
+                net_ns_id,
+                tcp_binding,
+                &cfg,
+            );
+        }
+    };
 
     // Build IPv4 header
     let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
@@ -2011,23 +2023,17 @@ fn build_frame_and_transmit(
                 )
             }
             _ => {
-                return finish_data_tx(
-                    dev.transmit(buf).map_err(|(error, _returned)| error),
-                    probe_intent,
-                );
+                return dev.transmit(buf).map_err(|(error, _returned)| error);
             }
         };
 
-        return finish_data_tx(
-            match outcome {
-                CtEgressResult::Committed(_) => Ok(()),
-                CtEgressResult::Rejected(_) => Err(TxError::InvalidBuffer),
-                CtEgressResult::QueueFailed(error) => Err(error),
-                CtEgressResult::QueuedOwnerStale(_) => Err(TxError::InvalidBuffer),
-                CtEgressResult::StateLost { .. } => Err(TxError::IoError),
-            },
-            probe_intent,
-        );
+        return match outcome {
+            CtEgressResult::Committed(_) => Ok(()),
+            CtEgressResult::Rejected(_) => Err(TxError::InvalidBuffer),
+            CtEgressResult::QueueFailed(error) => Err(error),
+            CtEgressResult::QueuedOwnerStale(_) => Err(TxError::InvalidBuffer),
+            CtEgressResult::StateLost { .. } => Err(TxError::IoError),
+        };
     }
 
     #[cfg(not(feature = "conntrack"))]
@@ -2048,16 +2054,10 @@ fn build_frame_and_transmit(
                 Ok(()) => Err(TxError::InvalidBuffer),
                 Err((error, _returned)) => Err(error),
             };
-            // D3 ARP-PROBE: release the reply-operation lock before the
-            // best-effort probe emission (which takes the device lock
-            // afresh) — emission never needs socket state.
             drop(operation);
-            return finish_data_tx(result, probe_intent);
+            return result;
         }
-        finish_data_tx(
-            dev.transmit(buf).map_err(|(error, _returned)| error),
-            probe_intent,
-        )
+        dev.transmit(buf).map_err(|(error, _returned)| error)
     }
 }
 
@@ -2165,59 +2165,292 @@ pub fn prepare_arp_probe(net_ns_id: u64, target_ip: Ipv4Addr) -> Result<Prepared
     Ok(probe)
 }
 
-/// D3 ARP-PROBE: complete one data-TX attempt — on SUCCESS, emit the
-/// admitted probe intent (if any). Failure paths drop the intent: no probe
-/// should chase a frame that never entered the queue, and the ring claim
-/// stays (conservative — the bucket metered an admission, not a
-/// transmission). Includes the post-queue commit failures (e.g. a TCP
-/// reply-binding commit refusal after the device accepted the frame):
-/// probes are best-effort, and skipping one there costs only a future
-/// optimization (Codex round-26 Q4).
-fn finish_data_tx(
-    result: Result<(), TxError>,
-    probe_intent: Option<ProbeIntent>,
-) -> Result<(), TxError> {
-    if result.is_ok() {
-        if let Some(intent) = probe_intent {
-            emit_arp_probe(intent);
+/// D3 PENDING-FRAME v2: collapse a prepared-transaction error to the
+/// direct-TX result shape. The frame owner is DROPPED — direct sends have
+/// no retry queue (the caller retries at its own layer, exactly as after a
+/// failed device enqueue), and a late-hit/popped frame is never re-parked.
+fn prepared_reply_error(error: PreparedReplyTxError) -> TxError {
+    match error {
+        PreparedReplyTxError::Retryable(error, reply) => {
+            drop(reply);
+            error
         }
+        PreparedReplyTxError::Consumed(error) => error,
     }
-    result
 }
 
-/// D3 ARP-PROBE: best-effort emission of one ADMITTED probe intent, after
-/// the data frame that motivated it was accepted by the TX queue.
+/// D3 PENDING-FRAME v2: the on-link-miss TX arm — park the data frame and
+/// probe; gateway-fallback DELIVERY is retired.
+///
+/// Order (each placement is load-bearing):
+///
+/// 1. OWNERSHIP PRE-GATE: the same namespace-gated resolver every direct
+///    send uses, minted and dropped unconsumed (documented-safe). Probe
+///    admission and queue occupancy sit strictly BEHIND it — the v1
+///    round-27 F3 residual is closed: an ownership-denied namespace draws
+///    NO ring claim, NO bucket token, NO queue slot, and gets the same
+///    `FirewallDenied` as a direct send. This check is ADMISSION control;
+///    delivery re-resolves ownership afresh inside
+///    [`transmit_prepared_reply`], which remains the authoritative gate.
+/// 2. Build the full wire frame with the ZERO destination placeholder —
+///    patched under the cache lock at pop/late-hit; expiry, eviction and
+///    the reconfiguration flush DROP frames, so no unpatched bytes can
+///    reach a device.
+/// 3. Bound active-open SYN (`transmit_tcp_connect`): a cache HIT here
+///    behaves as a direct send — the binding rides the prepared
+///    transaction and SYN-SENT publishes at queue-accept, preserving that
+///    contract exactly. On a CONFIRMED miss, ARP-queue acceptance IS the
+///    SYN's lower-layer TX acceptance: SYN-SENT publishes NOW through the
+///    normal binding commit (socket locks — taken with NO cache lock
+///    held), the binding is consumed, and the frame parks bindingless. A
+///    parked SYN that later expires/evicts is loss-after-acceptance —
+///    recovered by TCP-level retransmission/timeout like any post-queue
+///    drop. Residual (bounded to the µs between the two lock holds,
+///    documented): a learn racing the commit delivers immediately, and a
+///    delivery failure THERE surfaces as `Err` after SYN-SENT published.
+/// 4. Park-or-late-hit under ONE cache lock ([`park_or_resolve_late`]),
+///    probe admission post-gate, emission post-lock.
+///
+/// Parking returns `Ok(())`: the datagram is ACCEPTED for delivery (Linux
+/// unresolved-neighbor queue semantics) — it retransmits on learn and
+/// drops on expiry ([`crate::arp::PENDING_FRAME_TTL_MS`]).
+fn park_on_link_miss(
+    proto: Ipv4Proto,
+    dst_ip: Ipv4Addr,
+    payload: &[u8],
+    transport: ValidatedTransport,
+    net_ns_id: u64,
+    tcp_binding: Option<TcpReplyBinding>,
+    cfg: &NetConfigSnapshot,
+) -> Result<(), TxError> {
+    // (1) Ownership pre-gate — mint and drop.
+    drop(resolve_authorized_tx_device(net_ns_id)?);
+
+    // The namespace died between resolution and here (sliver): fail closed
+    // with tx_net_config's unknown/destroyed convention.
+    let cache = crate::socket::netns_arp_cache(net_ns_id).ok_or(TxError::LinkDown)?;
+
+    let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+
+    // (2) Full wire frame, ZERO dst placeholder (RF180-41: one admitted
+    // allocation; the DMA copy happens at delivery in the prepared path).
+    let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
+    let frame = try_build_ethernet_frame_from_parts(
+        EthAddr::ZERO,
+        cfg.our_mac,
+        ETHERTYPE_IPV4,
+        &[&ip_hdr, payload],
+    )
+    .map_err(|_| TxError::NoMemory)?;
+
+    let mut reply = PreparedReply::new(frame);
+    reply.authorize(net_ns_id, now_ms);
+    if proto == Ipv4Proto::Udp {
+        // Defer the direct path's ct_egress_udp coupling to queue-accept.
+        reply = reply.with_deferred_udp_ct();
+    }
+
+    // (3) Bound active-open SYN.
+    if let Some(binding) = tcp_binding {
+        let ValidatedTransport::Tcp(tcp) = transport else {
+            return Err(TxError::InvalidBuffer);
+        };
+        let header_len = tcp.header_len();
+        if header_len < TCP_HEADER_MIN_LEN || header_len > payload.len() {
+            return Err(TxError::InvalidBuffer);
+        }
+        {
+            let guard = cache.lock();
+            if let Some(mac) = guard.lookup(dst_ip, now_ms) {
+                drop(guard);
+                if !reply.patch_dst_mac(mac) {
+                    return Err(TxError::InvalidBuffer);
+                }
+                reply.bind_tcp(Some(binding));
+                return transmit_prepared_reply(reply, now_ms, &RX_INGRESS_NET_STATS)
+                    .map_err(prepared_reply_error);
+            }
+        }
+        // Confirmed miss: publish SYN-SENT now (ARP-queue acceptance is
+        // the SYN's TX acceptance) — socket locks with no cache lock held.
+        let mut operation = socket_table()
+            .lock_tcp_reply_operation(&binding, &tcp)
+            .ok_or(TxError::InvalidBuffer)?;
+        let committed = operation.commit(&tcp, now_ms);
+        drop(operation);
+        drop(binding);
+        if !committed {
+            return Err(TxError::InvalidBuffer);
+        }
+    }
+
+    // (4) Park or late-hit; probe admission strictly post-gate.
+    park_or_resolve_late(&cache, reply, dst_ip, net_ns_id, cfg, now_ms)
+}
+
+/// D3 PENDING-FRAME v2: under ONE cache-lock hold, either the neighbor was
+/// learned since resolution (LATE HIT — patch and deliver synchronously
+/// through the ownership-gated prepared path; no pending counters, no
+/// probe claims) or the frame parks and probe admission runs. Admission is
+/// post-gate BY CONSTRUCTION (every caller passed the ownership pre-gate);
+/// denial counters keep their v1 TX-path semantics on the dataplane
+/// ledger. The displaced frame of a full queue drops strictly AFTER the
+/// lock (its drop releases heap admissions).
+fn park_or_resolve_late(
+    cache: &alloc::sync::Arc<Mutex<crate::arp::ArpCache>>,
+    mut reply: PreparedReply,
+    target_ip: Ipv4Addr,
+    net_ns_id: u64,
+    cfg: &NetConfigSnapshot,
+    now_ms: u64,
+) -> Result<(), TxError> {
+    let stats = &RX_INGRESS_NET_STATS;
+    let mut guard = cache.lock();
+    if let Some(mac) = guard.lookup(target_ip, now_ms) {
+        drop(guard);
+        if !reply.patch_dst_mac(mac) {
+            return Err(TxError::InvalidBuffer);
+        }
+        return transmit_prepared_reply(reply, now_ms, stats).map_err(prepared_reply_error);
+    }
+    let evicted = guard.park_pending(reply, target_ip, cfg.our_mac, cfg.our_ip, now_ms);
+    let probe = match guard.admit_probe(target_ip, now_ms) {
+        crate::arp::ProbeAdmission::Admitted => Some(ProbeIntent {
+            our_mac: cfg.our_mac,
+            our_ip: cfg.our_ip,
+            target_ip,
+            net_ns_id,
+        }),
+        crate::arp::ProbeAdmission::DuplicateSuppressed => {
+            stats.arp_stats.inc_probe_duplicate_suppressed();
+            None
+        }
+        crate::arp::ProbeAdmission::RateLimited => {
+            stats.arp_stats.inc_probe_rate_limited();
+            None
+        }
+    };
+    drop(guard);
+    // Heap-releasing drop strictly outside the cache mutex.
+    drop(evicted);
+    if let Some(intent) = probe {
+        emit_arp_probe(intent);
+    }
+    Ok(())
+}
+
+/// D3 PENDING-FRAME v2: service `net_ns_id`'s pending-frame queue — the
+/// retransmit-on-learn / expiry / interval-re-probe choke point.
+///
+/// Shape (lock discipline is the point):
+/// 1. Snapshot the pending keys under one short cache-lock hold; empty
+///    queue = one integer-cheap early exit.
+/// 2. ONE fresh ownership check for the namespace, with NO cache lock held
+///    (mint-and-drop through the canonical TX resolver). Denied sweeps
+///    still expire (reclamation must not depend on authorization) but pop
+///    nothing and admit no probes; live frames wait for the TTL — no
+///    revocation path exists today (`move_device` ENOSYS, no device
+///    unregister), so denial here means the namespace never re-qualified.
+/// 3. Drain under the cache lock: expiry-first, FIFO ready pop (dst MAC
+///    patched under the lock), per-key interval re-probe admission scoped
+///    to the step-1 snapshot.
+/// 4. AFTER the lock: retired frames drop; ready frames deliver through
+///    [`transmit_prepared_reply`] (fresh authoritative ownership gate +
+///    egress-firewall re-check + the deferred conntrack/TCP transaction at
+///    queue-accept); outcomes fold back in ONE re-lock; admitted re-probes
+///    emit through the global bucket ([`emit_arp_probe`]).
+///
+/// Failures drop the frame fail-closed (`retx_failures`) — never re-park.
+/// Concurrent calls are safe: the cache mutex serializes, and each frame
+/// is MOVED OUT exactly once, so duplicate delivery is structural nonsense.
+///
+/// Callers: the RX ingress poll services ROOT every pass (a learn ingested
+/// in poll N retransmits in poll N; the same call is the idle expiry
+/// sweep) — root-only by the same v1 attribution as RX itself, since
+/// production children own no devices and cannot park (pre-gate). Runtime
+/// tests service their own child namespaces through this same pub seam.
+/// Capability-safe: every transmit re-derives its own authority.
+///
+/// Returns the number of frames the device queue accepted.
+pub fn drain_parked_ready(net_ns_id: u64, now_ms: u64) -> usize {
+    let Some(cache) = crate::socket::netns_arp_cache(net_ns_id) else {
+        return 0;
+    };
+    let snapshot = cache.lock().pending_key_snapshot(now_ms);
+    if !snapshot.occupied() {
+        return 0;
+    }
+    let authorized =
+        snapshot.has_live_keys() && resolve_authorized_tx_device(net_ns_id).is_ok();
+
+    let drain = cache
+        .lock()
+        .drain_pending(now_ms, authorized, &snapshot);
+
+    // Everything below runs with NO cache lock held.
+    drop(drain.retired);
+
+    let stats = &RX_INGRESS_NET_STATS;
+    let mut accepted = 0u64;
+    let mut failed = 0u64;
+    for frame in drain.ready.into_frames() {
+        match transmit_prepared_reply(frame.reply, now_ms, stats) {
+            Ok(()) => accepted += 1,
+            Err(PreparedReplyTxError::Retryable(_, owner)) => {
+                drop(owner);
+                failed += 1;
+            }
+            Err(PreparedReplyTxError::Consumed(_)) => failed += 1,
+        }
+    }
+    if accepted != 0 || failed != 0 {
+        cache.lock().record_pending_tx_outcomes(accepted, failed);
+    }
+    for probe in drain.probes.into_probes() {
+        emit_arp_probe(ProbeIntent {
+            our_mac: probe.our_mac,
+            our_ip: probe.our_ip,
+            target_ip: probe.target_ip,
+            net_ns_id,
+        });
+    }
+    accepted as usize
+}
+
+/// D3 ARP-PROBE: best-effort emission of one ADMITTED probe intent. D3
+/// PENDING-FRAME v2: intents originate at the park site (after the TX
+/// ownership pre-gate) and from the pending sweep's interval re-probes —
+/// admission is post-gate everywhere, so the F3 starvation shape (an
+/// ownership-denied namespace draining shared probe budget) cannot arise.
 ///
 /// - The GLOBAL probe bucket ([`crate::arp::ARP_PROBE_RATE_LIMITER`]) is
-///   drawn here first — the post-gate placement is load-bearing, see the
-///   inline round-27 F3 comment. Its denial is one `probe_rate_limited`.
-/// - Identity comes from the intent — the data packet's own snapshot,
+///   drawn here — the aggregate backstop behind every per-cache bucket.
+///   Its denial is one `probe_rate_limited`.
+/// - Identity comes from the intent — the parked frame's own snapshot,
 ///   never re-acquired (see [`ProbeIntent`]).
 /// - Ownership is re-verified downstream: [`transmit_prepared_reply`]
 ///   resolves the authorized device afresh, so a namespace torn down
-///   between data-TX and probe-TX fail-closes into one
+///   between admission and probe-TX fail-closes into one
 ///   `probe_tx_failures` (Codex round-26 Q3 — bounded completion).
 /// - No recursion: the ARP request embeds the broadcast destination, so
 ///   its egress never re-enters [`resolve_dst_mac_inner`].
-/// - No retry/pending queue in v1 — a failed probe is dropped and counted;
-///   the ring claim already throttles re-attempts to the interval. A reply
-///   learned between claim and emission costs at most one redundant,
-///   bucket-bounded probe.
-/// - Lock context: the ARP cache lock dropped at resolution and the data
-///   frame's device grant was consumed by its transmit — the fresh device
-///   resolve here never overlaps a held device lock.
+/// - A failed probe is dropped and counted; the ring claim already
+///   throttles re-attempts to the interval, and the pending sweep re-admits
+///   while the frame stays parked. A reply learned between claim and
+///   emission costs at most one redundant, bucket-bounded probe.
+/// - Lock context: every caller emits AFTER dropping the ARP cache lock —
+///   the fresh device resolve here never overlaps a held cache or device
+///   lock.
 /// - Ledger: counters land on the dataplane stats
 ///   ([`rx_ingress_net_stats`]) — the same instance where `ArpReply` TX
 ///   commits and reply/learn observability already live.
 fn emit_arp_probe(intent: ProbeIntent) {
     let stats = &RX_INGRESS_NET_STATS;
     let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
-    // Codex round-27 F3: the GLOBAL aggregate backstop is drawn HERE —
-    // strictly after the ownership-gated data enqueue succeeded — never at
-    // admission. An ownership-denied namespace therefore cannot starve the
-    // shared bucket (its per-cache rate equals the global refill rate, so
-    // an admission-time draw would pin the aggregate at empty); the only
-    // budget it can waste is its own cache's.
+    // The GLOBAL aggregate backstop — drawn at emission only, and every
+    // admission (park site or sweep) sits behind the TX ownership gate
+    // (v2 closed the round-27 F3 residual at its root: a denied namespace
+    // cannot reach admission at all, let alone this shared bucket).
     if !crate::arp::ARP_PROBE_RATE_LIMITER.allow(now_ms) {
         stats.arp_stats.inc_probe_rate_limited();
         return;
@@ -2299,7 +2532,8 @@ where
     #[cfg(feature = "conntrack")]
     if eth.ethertype == ETHERTYPE_IPV4 {
         use crate::conntrack::{
-            conntrack_table, ct_egress_tcp_with_commit, CtEgressResult, FlowKey, IPPROTO_TCP,
+            conntrack_table, ct_egress_tcp_with_commit, ct_egress_udp, CtEgressResult, FlowKey,
+            IPPROTO_TCP,
         };
 
         let (ip, _options, l4_bytes) = match parse_ipv4(ip_bytes) {
@@ -2311,6 +2545,70 @@ where
                 ));
             }
         };
+
+        // D3 PENDING-FRAME v2: a parked UDP data frame deferred its
+        // ct_egress_udp coupling to THIS queue-accept — run the direct
+        // path's exact transaction (same validation, conntrack state only
+        // if the queue invocation succeeds). Consulted EXPLICITLY via the
+        // deferred-CT marker, never inferred from the protocol alone: a
+        // future prepared UDP reply that committed conntrack elsewhere
+        // stays on the plain path by default.
+        if reply.deferred_ct == DeferredCt::Udp && ip.proto() == Some(Ipv4Proto::Udp) {
+            let udp = match crate::udp::parse_udp_header(l4_bytes) {
+                Ok(udp) => udp,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
+            };
+            // Mirror the direct path's length coupling (RF180-51 family):
+            // the UDP header's own length must cover exactly the L4 bytes.
+            if udp.length as usize != l4_bytes.len() || l4_bytes.len() < UDP_HEADER_LEN {
+                return Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                ));
+            }
+            let outcome = ct_egress_udp(
+                net_ns_id,
+                ip.src,
+                ip.dst,
+                udp.src_port,
+                udp.dst_port,
+                l4_bytes.len() - UDP_HEADER_LEN,
+                now_ms,
+                queue,
+            );
+            return match outcome {
+                CtEgressResult::Committed(_) => {
+                    reply.commit_stat(stats);
+                    Ok(())
+                }
+                CtEgressResult::Rejected(_) => Err(PreparedReplyTxError::Retryable(
+                    TxError::InvalidBuffer,
+                    reply,
+                )),
+                CtEgressResult::QueueFailed(error) => {
+                    let mut reply = reply;
+                    if error == TxError::QueueFull {
+                        reply.note_queue_rejection(now_ms);
+                    }
+                    Err(PreparedReplyTxError::Retryable(error, reply))
+                }
+                CtEgressResult::QueuedOwnerStale(_) => {
+                    reply.commit_stat(stats);
+                    Err(PreparedReplyTxError::Consumed(TxError::InvalidBuffer))
+                }
+                CtEgressResult::StateLost { queued } => {
+                    if queued {
+                        reply.commit_stat(stats);
+                    }
+                    Err(PreparedReplyTxError::Consumed(TxError::IoError))
+                }
+            };
+        }
         if ip.proto() == Some(Ipv4Proto::Tcp) {
             let tcp = match parse_tcp_header(l4_bytes) {
                 Ok(tcp) => tcp,
@@ -3281,6 +3579,13 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
     // (lazy MAC autodetect). Fail-closed on absence; nothing is dequeued and
     // nothing is stocked on the skip paths (stocking waits for a poll that
     // can also process — see the counter doc).
+    // D3 v2 FIX: Install the pool BEFORE zero-MAC check. Pool installation
+    // is MAC-independent (just DMA allocation); the zero-MAC check prevents
+    // packet PROCESSING, not pool setup. This fixes netns_rx_pool_lifecycle
+    // which filters to synthetic devices and expects pool installation even
+    // when eth0 MAC autodetect hasn't run yet.
+    let pool = ensure_rx_ingress_pool();
+
     let cfg = match tx_net_config(0) {
         Ok(cfg) => cfg,
         Err(_) => {
@@ -3299,8 +3604,6 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
             .fetch_add(1, Ordering::Relaxed);
         return 0;
     }
-
-    let pool = ensure_rx_ingress_pool();
     let (devices, device_count) = rx_auth::resolve_rx_devices(filter);
     let stats = &RX_INGRESS_NET_STATS;
     let mut remaining = budget;
@@ -3383,6 +3686,18 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
             }
         }
     }
+    // D3 PENDING-FRAME v2: service the ROOT namespace's pending queue every
+    // poll — a learn ingested above retransmits its parked frames in this
+    // SAME poll; with nothing learned this is the expiry / interval-re-probe
+    // sweep, which must run even on frameless polls. Root-only by the same
+    // v1 attribution as RX itself: production children own no devices and
+    // therefore cannot park (ownership pre-gate); test-owned child caches
+    // are drained by their tests through the same pub seam. Lock context:
+    // no device/cache/registry lock is held here (per-device guards drop
+    // inside the loop above), and the drain takes the cache mutex only in
+    // bounded lookup/move-out windows — reply TX inside it resolves its own
+    // authority exactly like the Reply arm above.
+    drain_parked_ready(0, now_ms);
     if remaining == 0 {
         RX_INGRESS_STATS
             .budget_exhausted
