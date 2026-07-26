@@ -169,6 +169,12 @@ pub enum TxError {
     /// them), multicast, broadcast, unspecified, or the configured
     /// subnet's network/directed-broadcast address (ENETUNREACH).
     Unreachable,
+    /// D3 PENDING-FRAME v2: an on-link destination with NO neighbor entry
+    /// yet (EHOSTUNREACH). Surfaced by the pub `resolve_dst_mac` seam and
+    /// the pre-registration global-cache window; the production TX path
+    /// does not return it for live namespaces — it parks the frame and
+    /// probes instead (retransmit-on-learn, drop-on-expiry).
+    NeighborUnresolved,
     /// Buffer is invalid (too large, misaligned, etc.).
     InvalidBuffer,
     /// Ordinary heap/admission failed while preparing the packet owner.

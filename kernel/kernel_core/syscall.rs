@@ -2007,6 +2007,7 @@ pub enum SyscallError {
     EADDRNOTAVAIL = -99,   // 无法分配请求的地址
     ENETDOWN = -100,       // 网络不可用
     ENETUNREACH = -101,    // D3 NETNS-ROUTING: 网络不可达 (unroutable destination)
+    EHOSTUNREACH = -113,   // D3 PENDING-FRAME v2: 主机不可达 (on-link neighbor unresolved)
     ECONNREFUSED = -111,   // 连接被拒绝
     EISCONN = -106,        // 套接字已连接
     ENOTCONN = -107,       // 传输端点未连接
@@ -3183,6 +3184,11 @@ fn tx_error_to_syscall(err: net::TxError) -> SyscallError {
         // D3 NETNS-ROUTING: Local (until TX-loopback delivers) and
         // Unroutable destinations fail closed as network-unreachable.
         net::TxError::Unreachable => SyscallError::ENETUNREACH,
+        // D3 PENDING-FRAME v2: an unresolved on-link neighbor is
+        // host-unreachable (Linux neighbor-resolution-failure errno). The
+        // production TX path parks instead of returning this; it surfaces
+        // only through resolution seams and the pre-registration window.
+        net::TxError::NeighborUnresolved => SyscallError::EHOSTUNREACH,
         net::TxError::InvalidBuffer => SyscallError::EINVAL,
         net::TxError::NoMemory => SyscallError::ENOMEM,
         net::TxError::NoBuffers => SyscallError::ENOBUFS,
