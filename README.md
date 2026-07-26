@@ -28,9 +28,11 @@ personality.
 - **Security Framework** — object capabilities, an LSM hook layer (40+ hook points),
   seccomp/pledge syscall filtering, and a SHA-256 hash-chained tamper-evident audit log.
 - **Containers** — five namespaces (PID/mount/IPC/net/user) and cgroups v2 (CPU, memory, PIDs,
-  I/O, FD, port controllers).
+  I/O, FD, port controllers), plus a per-namespace network dataplane (isolated ARP caches,
+  addressing, and routing) held under per-namespace byte budgets.
 - **Network** — a full software TCP/IP stack (TCP with NewReno, window scaling, SYN cookies,
-  connection tracking, and a stateful default-DROP firewall).
+  connection tracking, and a stateful default-DROP firewall), fed by a bounded process-context
+  RX ingress loop that ingests real frames off `eth0`.
 - **Linux ABI** — a byte-exact x86-64 syscall surface; a real **static-musl libc binary runs
   end-to-end** under the user-mode ABI (Phase U / milestone M0).
 
@@ -41,6 +43,11 @@ in progress. The 1.0-Preview release gate is currently **BLOCKED on streak 1/3**
 rebuilt by R185). See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-07-25:** D3 network-namespace dataplane — per-namespace ARP caches, addressing and
+  routing, all charged to a per-namespace byte budget; a bounded process-context RX ingress
+  loop; external-device RX completion (the kernel now ingests real external frames on `eth0`);
+  and ARP request-TX probe emission. Eleven new `netns_*` boot tests bring the in-kernel suite
+  to **30 passed / 39 deferred / 0 failed**. See [Section 3.9](#39-containers).
 - **2026-07-24:** R184 review-fix round — fixed 4 findings from R183 follow-up review: allocation-free 
   clear_child_tid validation (RF184-1), capability allocation atomicity in openat2 (RF184-2), 
   TX-memory budget accounting fix (RF184-3), and documented handle_ack precondition contract (RF184-7). 
@@ -60,9 +67,9 @@ rebuilt by R185). See [Section 6](#6-security-audit-status).
 | Hardening | ✅ Complete | W^X/NX, SMEP/SMAP/UMIP, KASLR, KPTI, Spectre/Meltdown mitigations, ChaCha20 CSPRNG, kptr guard |
 | Security Framework | ✅ Complete | Capabilities, LSM (40+ hooks), seccomp/pledge, SHA-256/HMAC hash-chained audit, compliance profiles |
 | VFS & Storage | ✅ Complete | ramfs, ext2, procfs, devfs, initramfs (CPIO), cgroupfs, DAC + openat2 RESOLVE flags, virtio-blk |
-| Network | ✅ Complete | virtio-net, ARP, IPv4 (+reassembly), ICMP, UDP, TCP, conntrack, stateful firewall |
+| Network | ✅ Complete | virtio-net, ARP, IPv4 (+reassembly), ICMP, UDP, TCP, conntrack, stateful firewall, bounded RX ingress loop with live `eth0` receive |
 | SMP & Concurrency | ✅ Complete | LAPIC/IOAPIC, AP boot (≤64 CPUs), IPI TLB shootdown, PCID/INVPCID, RCU, lockdep |
-| Containers | ✅ Complete | PID/mount/IPC/net/user namespaces, cgroups v2 (6 controllers) |
+| Containers | ✅ Complete | PID/mount/IPC/net/user namespaces, cgroups v2 (6 controllers), per-namespace network dataplane (ARP/addressing/routing under per-NS byte budgets) |
 | IOMMU / VT-d | 🟡 Infrastructure | Full Intel VT-d driver (DMA isolation, IRQ remapping, fault handling); DMAR discovery wiring pending |
 | Live Patching | 🟡 Infrastructure | ECDSA P-256 signed kpatch, INT3 detour, fail-closed LSM gate |
 | User Mode & ABI (Phase U / M0) | 🟡 In Progress | Ring 3, 100+ Linux syscalls, SysV auxv, signal delivery, static-musl libc runs end-to-end |
@@ -202,6 +209,18 @@ a stateful priority-ordered firewall (ACCEPT/DROP/REJECT, default-DROP), and a
 capability-based socket API with per-hook LSM mediation. Network namespace TX ownership gates
 prevent isolated namespaces from egressing on devices they do not own.
 
+Receive runs as a **bounded process-context ingress loop** rather than in interrupt context: the
+scheduler's deferred-work drain polls the registered devices under a self-throttled ~10 ms
+window with a fixed frame budget and a fair per-device quantum, so no single device can starve
+the others. Buffers come from a statically pre-allocated DMA pool (32 × 4 KiB) that sits
+deliberately outside heap admission — provenance is verified at the pool on free, and each
+device is capped on the number of buffers it may own. With completion servicing and replenish
+wired through the virtio-net driver, the kernel ingests **real external frames on `eth0`**: the
+`netns_rx_eth0_slirp` gate drives an ARP probe out to the QEMU SLIRP gateway and asserts the
+reply is received and learned. On the transmit side, an on-link cache miss now emits a
+rate-limited **ARP request probe** (per-namespace ring and token bucket, with a global bucket
+drawn only at emission so a device-less namespace cannot pin the shared budget).
+
 ### 3.8 SMP, IOMMU & Concurrency
 
 LAPIC/IOAPIC init, AP bring-up via INIT-SIPI-SIPI (up to 64 CPUs), five IPI types, IPI-driven
@@ -217,6 +236,19 @@ Five namespaces — PID (cascade init-kill), mount (CoW tables), IPC (System V),
 `clone(2)`/`unshare(2)`/`setns(2)`. Cgroups v2 provide CPU (`cpu.weight`/`cpu.max`), memory
 (`memory.max`/`memory.high` + OOM events), PIDs, I/O (token-bucket `io.max`), FD, and port
 controllers, exposed via syscalls and a `/sys/fs/cgroup` cgroupfs mount, with subtree delegation.
+
+The network namespace owns a real **per-namespace dataplane**, not just a device list. Each
+namespace (root included) holds its own ARP cache, so the same IP may legitimately map to
+different MACs in different namespaces and neither can poison the other; the net crate reaches
+that state only through a `NetNsDeviceHooks` upcall that hands back the cache itself, never a
+namespace handle, and fails closed when the namespace is unknown or already destroyed. Each
+namespace also carries its own validated address/gateway/subnet configuration and derives its
+own routing decisions (local / on-link / gateway / unroutable, surfaced to user space as
+`ENETUNREACH`). Children are born unconfigured and must be configured explicitly; root delegates
+to the global config rather than keeping a second copy that could drift. All of this config
+state is charged both to a global `NetnsConfig` heap class and to a **16 KiB per-namespace byte
+budget**, from which root is deliberately *not* exempt, so a leak in one namespace's dataplane
+cannot consume another's.
 
 ### 3.10 User Mode & Linux ABI (Phase U / M0)
 
@@ -449,6 +481,11 @@ and the live plan is `docs/review/nextplan/`.
   fork is committed. **U.S2 SLICE-3B complete (2026-07-23):** FileOps trait capability 
   infrastructure with cap_id/set_cap_id methods, interior mutability via spin::once::Once, 
   and regular file capability allocation at open time.
+- **D3 network-namespace dataplane** (Phase I.3) — per-namespace ARP caches, addressing, routing
+  and byte budgets are landed, along with a bounded RX ingress loop and live `eth0` receive.
+  Next: a pending-frame queue that parks a frame on an on-link miss and retransmits it when the
+  ARP reply arrives (retiring today's metered gateway fallback), then the firewall admin syscall
+  surface, and `veth` pairs with a real routing table.
 - IOMMU DMAR table-discovery wiring; full demand-grown user stacks.
 
 **Future**

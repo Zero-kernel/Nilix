@@ -33,10 +33,18 @@ Linux 兼容用户态人格（personality）。
 ### 当前状态
 
 **里程碑：** 接近 **1.0-Preview** —— Phase A–G 已完成；**Phase U**（用户态 ABI）进行中。
-1.0-Preview 发布门禁在 2026-07-22 已达到 **已解除阻塞** 状态，零 HIGH 连续记录 3/3 完成
-（R181 + R182 + R183）。详见[第 6 节](#6-安全审计状态)。
+1.0-Preview 发布门禁曾于 2026-07-22 解除阻塞（R181–R183 达成零 HIGH 连续记录 3/3），但次日
+R184 发现一个真实 CRITICAL 与一个真实 HIGH（均已修复），连续记录被重置。当前门禁
+**仍被阻塞**，零 HIGH 连续记录为 **1/3**（由 R185 重建）。详见[第 6 节](#6-安全审计状态)。
 
 **最近新增：**
+- **2026-07-25：** D3 网络命名空间数据平面 —— 每命名空间 ARP 缓存、地址配置与路由，全部计入
+  每命名空间字节预算；有界的进程上下文 RX 入站轮询循环；外部设备 RX 完成路径（内核现已能在
+  `eth0` 上接收真实外部帧）；以及 ARP 请求探测发送。新增 11 个 `netns_*` 启动测试，使内核内
+  测试套件达到 **30 通过 / 39 延后 / 0 失败**。详见[第 3.9 节](#39-容器)。
+- **2026-07-24：** R184 review-fix 轮次 —— 修复 R183 后续评审的 4 项发现：无分配的
+  clear_child_tid 校验（RF184-1）、openat2 中的能力分配原子性（RF184-2）、TX 内存预算记账修正
+  （RF184-3），以及 handle_ack 前置条件契约的文档化（RF184-7）。
 - **2026-07-23：** U.S2 SLICE-3B 能力基础设施 —— FileOps trait 添加 cap_id/set_cap_id 方法，
   通过 spin::once::Once 实现内部可变性，系统调用层为常规文件分配能力，以及 VFS 打开期间的
   凭证生成 TOCTOU 防御。
@@ -51,13 +59,14 @@ Linux 兼容用户态人格（personality）。
 | 安全加固                       | ✅ 完成     | W^X/NX、SMEP/SMAP/UMIP、KASLR、KPTI、Spectre/Meltdown 缓解、ChaCha20 CSPRNG、kptr 守护          |
 | 安全框架                       | ✅ 完成     | 能力、LSM（40+ 钩子）、seccomp/pledge、SHA-256/HMAC 哈希链审计、合规配置                        |
 | VFS 与存储                     | ✅ 完成     | ramfs、ext2、procfs、devfs、initramfs（CPIO）、cgroupfs、DAC + openat2 RESOLVE 标志、virtio-blk |
-| 网络                           | ✅ 完成     | virtio-net、ARP、IPv4（含重组）、ICMP、UDP、TCP、conntrack、有状态防火墙                        |
+| 网络                           | ✅ 完成     | virtio-net、ARP、IPv4（含重组）、ICMP、UDP、TCP、conntrack、有状态防火墙、有界 RX 入站循环与 `eth0` 实时接收 |
 | SMP 与并发                     | ✅ 完成     | LAPIC/IOAPIC、AP 启动（≤64 核）、IPI TLB shootdown、PCID/INVPCID、RCU、lockdep                 |
-| 容器                           | ✅ 完成     | PID/mount/IPC/net/user 命名空间、cgroups v2（6 个控制器）                                       |
+| 容器                           | ✅ 完成     | PID/mount/IPC/net/user 命名空间、cgroups v2（6 个控制器）、每命名空间网络数据平面（ARP/地址/路由，受每 NS 字节预算约束） |
 | IOMMU / VT-d                   | 🟡 基础设施 | 完整 Intel VT-d 驱动（DMA 隔离、中断重映射、故障处理）；DMAR 发现接线待完成                     |
 | 实时补丁                       | 🟡 基础设施 | ECDSA P-256 签名的 kpatch、INT3 detour、fail-closed 的 LSM 门控                                 |
 | 用户模式与 ABI（Phase U / M0） | 🟡 进行中   | Ring 3、100+ Linux 系统调用、SysV auxv、信号投递、静态 musl libc 端到端运行                     |
-| CI 与质量门禁                  | ✅ 完成     | GitHub Actions（fmt/clippy、build、lint、boot+musl）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子      |
+| 模糊测试与测试                 | ✅ 完成     | KCOV 覆盖率跟踪、覆盖引导的变异、状态化模糊测试、4 个并行 CI worker、10 个 cargo-fuzz 目标、扩展测试套件（压力/SMP/安全） |
+| CI 与质量门禁                  | ✅ 完成     | GitHub Actions（fmt/clippy、build、lint、boot+musl+fuzz）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子      |
 
 ---
 
@@ -174,7 +183,17 @@ VFS inode 抽象之上有 ramfs、ext2（读/写，页缓存支持）、procfs�
 （校验和、源路由拒绝、带重叠检测的分片重组）、ICMP 与 UDP。TCP 实现完整状态机与三次握手、
 RFC 6298 RTT/RTO（含 Karn 算法）、NewReno 拥塞控制、窗口缩放、SYN cookies、listen/accept 与
 优雅关闭。协议之上是连接跟踪、优先级有序的有状态防火墙（ACCEPT/DROP/REJECT、默认 DROP），
-以及带逐钩子 LSM 仲裁的基于能力的套接字 API。
+以及带逐钩子 LSM 仲裁的基于能力的套接字 API。网络命名空间的 TX 归属门禁阻止被隔离的命名空间
+从其并不拥有的设备上发包。
+
+接收路径运行为**有界的进程上下文入站循环**，而非中断上下文：调度器的延迟工作 drain 点在一个
+自限流的 ~10 ms 窗口内轮询已注册设备，配有固定的帧预算与公平的每设备配额，因此任何单个设备
+都无法饿死其它设备。缓冲区来自静态预分配的 DMA 池（32 × 4 KiB），该池刻意置于堆准入之外 ——
+归属在释放时由池自身校验，且每个设备可持有的缓冲区数量设有上限。随着完成处理与补充逻辑接入
+virtio-net 驱动，内核已能在 **`eth0` 上接收真实外部帧**：`netns_rx_eth0_slirp` 门禁向 QEMU
+SLIRP 网关发出 ARP 探测，并断言回复被接收并学习。在发送侧，on-link 缓存未命中现在会发出限速的
+**ARP 请求探测**（每命名空间的环形缓冲与令牌桶；全局令牌桶仅在真正发射时扣减，因此一个没有
+设备的命名空间无法长期占死共享预算）。
 
 ### 3.8 SMP、IOMMU 与并发
 
@@ -190,6 +209,16 @@ LAPIC/IOAPIC 初始化、经 INIT-SIPI-SIPI 的 AP 启动（最多 64 核）、�
 驱动。Cgroups v2 提供 CPU（`cpu.weight`/`cpu.max`）、内存（`memory.max`/`memory.high` + OOM
 事件）、PID、I/O（令牌桶 `io.max`）、FD 与端口控制器，经由系统调用与 `/sys/fs/cgroup`
 cgroupfs 挂载暴露，并支持子树委派。
+
+网络命名空间拥有真正的**每命名空间数据平面**，而不只是一份设备清单。每个命名空间（含 root）
+持有自己的 ARP 缓存，因此同一个 IP 在不同命名空间中可以合法地映射到不同的 MAC，且彼此无法
+投毒；net crate 只能通过 `NetNsDeviceHooks` 上调触达该状态，上调返回的是缓存本身而非命名空间
+句柄，并在命名空间未知或已销毁时 fail-closed。每个命名空间还持有各自经过校验的
+地址/网关/子网配置，并据此做出自己的路由判定（local / on-link / gateway / unroutable，向用户态
+呈现为 `ENETUNREACH`）。子命名空间创建时处于未配置状态，必须显式配置；root 则委派给全局配置，
+而不是保留可能与之漂移的第二份副本。所有这些配置状态同时计入全局 `NetnsConfig` 堆类别与
+**16 KiB 的每命名空间字节预算**（root 刻意不豁免），因此某个命名空间数据平面的泄漏不会侵占
+其它命名空间的额度。
 
 ### 3.10 用户模式与 Linux ABI（Phase U / M0）
 
@@ -279,7 +308,44 @@ QEMU 自身的退出码读取（`-no-reboot -no-shutdown` 下 timeout 是健康�
 | `lint-fetch-add`   | 核心/VFS 路径中 ID/引用计数不得用裸 `fetch_add(1)` —— 改用 `fetch_update` + `checked_add`（或显式 `// lint-fetch-add: allow`） |
 | `lint-repr-c-copy` | 用户边界上对 `#[repr(C)]` 结构体的每个 `from_raw_parts` / `copy_nonoverlapping` / `transmute` 都必须带 padding 安全注解          |
 
-### 5.4 风格门禁与 pre-push 钩子
+### 5.4 扩展测试套件
+
+除核心 CI 门禁外，Nilix 还具备完整的压力、性能与扩展 SMP 测试：
+
+- **压力测试**（`scripts/stress_test.sh`）—— 六种场景，覆盖内存压力、CPU 饱和、SMP 争用、
+  持续 I/O 与进程翻搅，每场景 60–300 秒。经 `make stress-test`（标准）或
+  `make stress-test-extended`（每场景 5 分钟）调用。
+- **扩展 SMP**（`scripts/extended_smp_test.sh`）—— 验证 8 核与 16 核启动、IPI 广播与多 CPU
+  锁争用。经 `make test-smp-extended` 运行。
+- **性能回归门禁**（`scripts/perf_regression_test.sh`）—— 用于检测系统调用延迟、上下文切换与
+  缺页回归的框架。经 `make test-perf` 调用（基准测试待补）。
+- **安全测试**（`kernel/security/tests.rs`）—— 九项运行时测试，验证 W^X、RNG、kptr 守护、
+  Spectre V1/V2、SMAP 与 SMEP 缓解。已并入标准 `make test` 套件。
+- **熔炼测试**（`scripts/melting_test.sh`）—— 持续满载场景（10 分钟以上）用于裸机热验证。
+  框架已就位，需真实硬件。
+
+完整文档位于 `docs/testing/`。
+
+### 5.5 模糊测试基础设施
+
+Nilix 具备**生产就绪的模糊测试基础设施**，能力对标并在若干方面超出 Linux syzkaller，并在 CI 中
+持续进行覆盖引导的模糊测试：
+
+- **KCOV 覆盖率跟踪** —— 在系统调用入口通过手工插桩实现每任务边缘覆盖（13 个插桩系统调用，
+  5 个 KCOV 管理系统调用）。IRQ 安全，禁用时零开销。
+- **系统调用描述** —— 基于 TOML 的类型安全定义，带约束（范围、标志、枚举）与资源关系
+  （fd → 文件，pid → 进程），已描述 20+ 个核心系统调用。
+- **覆盖引导变异** —— 具备 8 种变异策略的遗传算法；语料库管理跟踪可扩展覆盖的"有趣"输入。
+- **资源感知模糊测试** —— 跟踪五类资源（fd、pid、addr、port、cap_id），含约束校验、依赖跟踪
+  与泄漏检测。
+- **状态化模糊测试** —— 带状态机的协议感知模糊测试、IPC 协调器与输入最小化器（增量调试，
+  体积缩减 70%+）。
+- **混合策略** —— 基于 KCOV 的持续模糊测试（4 worker × 6 小时，每 6 小时一轮）配合 10 个专用
+  cargo-fuzz 目标（每日，每目标 600 秒）。
+
+完整文档位于 `docs/fuzzing/`（7 份阶段指南，33,000+ 字）。
+
+### 5.6 风格门禁与 pre-push 钩子
 
 - **`make fmt-check`** —— 对 workspace 与 userspace 执行 `cargo fmt --all --check`。
   `rustfmt.toml` 固定 `newline_style = "Windows"`，因为仓库存储 CRLF blob。
@@ -300,16 +366,21 @@ Nilix 在持续的对抗式评审流程下开发：每一轮审计内核、按�
 
 | 指标                 | 数值                                     |
 | -------------------- | ---------------------------------------- |
-| 审计轮次             | **181**                            |
-| 累计发现             | ~1,261                                   |
-| 已修复/解决的发现    | ~1,159                                   |
-| 最新轮次             | R181（`docs/review/audits/qa-2026-07-20.md`） |
-| 1.0-Preview 发布门禁 | **已阻塞** —— 零 HIGH 连续记录 1/3      |
+| 审计轮次             | **185**（R185 于 2026-07-24 完成）        |
+| 累计发现             | ~1,315                                   |
+| 已修复/解决的发现    | ~1,161                                   |
+| 最新轮次             | R185（干净）—— 连续记录重建至 1/3         |
+| 1.0-Preview 发布门禁 | **已阻塞** —— 零 HIGH 连续记录 1/3（尚需 2 轮干净轮次） |
 
-最近一轮（**R181**）是 S2 波强化和 D2-SEC LSM 集成后的首次全代码库审计。它在 10/10 子系统
-覆盖中发现了 **0 CRITICAL / 0 HIGH / 5 MEDIUM+LOW** 可操作问题；全部五项于当日（2026-07-20）
-修复并收敛，使 R181 成为零 HIGH 连续记录候选 1/3。1.0-Preview 门禁要求三轮连续零 HIGH。
-逐轮报告位于 `docs/review/`，实时计划见 `docs/review/nextplan/`。
+最近的工作包括 **R184 review-fix**（R183 后续评审的 4 项发现）与 **设计队列收口轮次**
+（2026-07-24）：两项 D1 发现均已解决（D1-RES 堆预言机 + R1–R4 修复；D1-ISO 类型强制的 TX
+令牌），所有 D2 已定性处置（含 D2-ABI 的 MUSL-STAT 布局修复、D2-ERR、D2-TST），仅余 D3 待办项。
+R185 审计为干净轮次，将零 HIGH 连续记录重建至 1/3。1.0-Preview 门禁现**仅**受连续记录阻塞 ——
+还需两轮干净轮次（R186 → 2/3，R187 → 3/3 → 解除阻塞）。逐轮报告位于 `docs/review/`，
+实时计划见 `docs/review/nextplan/`。
+
+> 注：D3 网络命名空间数据平面（2026-07-25）属于 D3 待办项上的**功能开发**，不是门禁项，
+> 因此不影响连续记录。
 
 ---
 
@@ -330,6 +401,10 @@ Nilix 在持续的对抗式评审流程下开发：每一轮审计内核、按�
 - **Phase U —— 用户模式与 ABI**（*Compat-ZeroABI*）：能力优先的原生核心，加上去特权化的
   Linux 兼容人格。里程碑 **M0** 在既有 Linux cABI 之上构建用户态基础（auxv、信号投递、缺失的
   系统调用、exec 消歧、用户栈守护），由静态 musl 一致性门禁证明，之后再提交原生/人格分叉。
+- **D3 网络命名空间数据平面**（Phase I.3）—— 每命名空间的 ARP 缓存、地址配置、路由与字节预算
+  均已落地，另有有界 RX 入站循环与 `eth0` 实时接收。下一步：待发帧队列（在 on-link 未命中时
+  暂存数据帧，待 ARP 回复到达后重传，以退役当前带计量的网关回退路径），随后是防火墙管理系统
+  调用面，以及 `veth` 对与真正的路由表。
 - IOMMU DMAR 表发现接线；完整的按需增长用户栈；能力支撑的 fd 表。
 
 **未来**

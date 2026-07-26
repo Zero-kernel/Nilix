@@ -61,17 +61,24 @@ round R184 found one real CRITICAL (exit-path use-after-free, fixed) and one rea
 / 0 open actionable MEDIUM**; streak rebuilt to **1/3** (R185 clean); **both D1 design findings
 RESOLVED 2026-07-24** (D1-RES + D1-ISO) and all D2s dispositioned incl. D2-ABI-STAT-LAYOUT — design
 queue is D3-backlog-only and no longer gate-blocking. Sole remaining gate item: zero-HIGH streak 3/3
-(next = R186 → 2/3). Note: `README.md` §6 still says "UNBLOCKED" — it predates R184 and is stale.
+(next = R186 → 2/3). `README.md` §6 and `README_zh.md` §6 were reconciled to this state on 2026-07-25.
+
+**Feature work since the gate snapshot:** the **D3 NETNS-DATAPLANE** arc landed 2026-07-25 in eight
+legs — per-namespace ARP caches (`HeapClass::NetnsConfig`), a per-namespace byte sub-budget
+(`NsByteBudget`, 16 KiB), the RX-wiring start gate, per-namespace network configuration, per-namespace
+routing, a bounded process-context RX ingress loop, external-device RX completion (static `BufPool`;
+**`eth0` receive is live**), and ARP request-TX probe emission. This is feature work on a D3-backlog
+item, not a gate item — it does not affect the streak.
 
 | Dimension | State (2026-07-23) |
 |---|---|
 | Audit history | **185 rounds** (R1 2025-12-09 → R185 2026-07-23); ~1,315 findings filed, ~1,161 fixed (§11) |
 | Open security debt | 0 CRITICAL, 0 HIGH, 0 actionable MEDIUM/LOW; design queue D3-backlog-only (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs, D1-RES breadth); all D1/D2 dispositioned 2026-07-24 |
-| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 193,656 lines (`kernel/`); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
-| Syscall surface | **121 distinct syscall numbers dispatched** (~125 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native |
+| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 201,294 lines (`kernel/`, measured 2026-07-25); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
+| Syscall surface | **122 distinct syscall numbers dispatched** (~126 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Build/test baseline | build OK · lint (incl. abi-oracle + lint-fallible) OK · runtime tests **19** passed / 39 deferred / 0 failed · 0 panic · 0 NX · musl-check 6 markers (incl. MUSL-STAT-OK / MUSL-UNAME-OK) |
+| Build/test baseline | build OK · lint (incl. abi-oracle + lint-fallible) OK · runtime tests **30** passed / 39 deferred / 0 failed · 0 panic · 0 NX · musl-check 6 markers (incl. MUSL-STAT-OK / MUSL-UNAME-OK) — re-verified 2026-07-25 on the post-D3 tree |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
@@ -149,7 +156,7 @@ user-space server once synchronous IPC + shared memory land (U.S3 → U.S4, §9)
 
 | Attacker profile | Goal | Current mitigations | Remaining gap |
 |---|---|---|---|
-| Malicious tenant (container) | Escape isolation, cross-tenant access | Per-process CR3, 5 namespaces, cgroups v2 (6 controllers), per-tenant net quotas (J.2), fail-closed netns TX device gate (type-enforced token, 2026-07-24) | D3 NETNS-DATAPLANE-CONFIG (per-ns dataplane config, Phase I.3); cgroup namespace absent |
+| Malicious tenant (container) | Escape isolation, cross-tenant access | Per-process CR3, 5 namespaces, cgroups v2 (6 controllers), per-tenant net quotas (J.2), fail-closed netns TX device gate (type-enforced token, 2026-07-24), per-NS dataplane isolation — ARP cache, addressing, routing, 16 KiB byte budget (2026-07-25) | cgroup namespace absent; per-NS firewall admin surface and `veth` still missing; `move_net_device` gated off pending the per-NS capability model |
 | Remote attacker | Network exploitation | Default-DROP stateful firewall, conntrack caps, SYN cookies, challenge-ACK limit, RFC 5961/6528, fragment-reassembly bounds, rate limiters | IPv6 absent (no surface, also no parity); TLS/crypto offload out of scope |
 | Compromised process | Privilege escalation | Ring 3 + SMEP/SMAP/UMIP, W^X, seccomp/pledge, LSM SecureBaseline (user W^X, root-minting block, Yama-like ptrace), stack guards, SROP-defended sigreturn | KPTI inert (single CR3) — Meltdown-class reliance is on hardware immunity; text KASLR verify-only |
 | Malicious/compromised device | DMA into kernel memory | VT-d DMA isolation wired at boot (fail-closed gate, RAII unmap, bus-master-off on failure), virtqueue used-ring validation, IRTE SID verification | Secure-profile still legacy-proceeds when *no* IOMMU exists (documented residual); needs real-hardware validation |
@@ -177,7 +184,7 @@ workspace, including in-tree test/mock files), and is distinct from the top-leve
 | Crate | Files | LOC | Responsibility | Maturity |
 |---|---:|---:|---|---|
 | `kernel_core` | 22 | 52,029 | PCB & process table, fork/exec/clone, 121-syscall dispatcher, signals, 5 namespaces, cgroups v2, RCU, SMAP usercopy, KCOV syscalls, fd→capability wiring | 🟢 Implemented |
-| `net` | 17 | 33,690 | virtio-net, ARP/IPv4/ICMP/UDP/TCP, conntrack, default-DROP firewall, capability+LSM socket layer, per-tenant quotas, netns TX gate | 🟢 Implemented |
+| `net` | 17 | 35,741 | virtio-net, ARP/IPv4/ICMP/UDP/TCP, conntrack, default-DROP firewall, capability+LSM socket layer, per-tenant quotas, netns TX gate, per-NS dataplane (ARP/config/routing), bounded RX ingress loop + `BufPool`, ARP probe TX | 🟢 Implemented |
 | `vfs` | 11 | 21,912 | inode/dentry, FileOps (+cap_id), ramfs, **ext2/ext3 rw with JBD2 journaling**, procfs, devfs, initramfs (CPIO), cgroupfs, CoW mount tables, DAC, openat2 RESOLVE_* | 🟢 Implemented |
 | `mm` | 12 | 12,327 | reservation-aware buddy allocator, dual heap + 15-class admission ledger (compile-time partition proof), page tables, page cache (LRU/writeback), TLB shootdown (IPI+PCID), OOM killer, DMA/IOMMU gate | ✅ Validated |
 | `iommu` | 6 | 9,875 | Intel VT-d: DMAR ACPI parse, root/context tables, second-level page tables (AGAW), interrupt remapping, fault handling, device isolation/detach, VM-passthrough API | 🟡 Partial (wired at boot; needs real-HW validation) |
@@ -336,7 +343,21 @@ marks a capability that is partial or inert. Every "gap" is stated explicitly.*
   stateful firewall** (priority-ordered, ACCEPT/DROP/REJECT, per-namespace tables, catch-all-Accept
   removed); capability + per-hook LSM socket API; **fail-closed netns TX device-ownership gate**;
   per-tenant (J.2) socket/half-open/byte/port quotas.
+- ✅ **Per-namespace dataplane (D3, 2026-07-25):** per-NS ARP cache (same IP may map to different MACs
+  in different namespaces; reached only via the `NetNsDeviceHooks::ns_arp_cache` upcall, fail-closed on
+  unknown/destroyed NS), per-NS validated address/gateway/subnet config (root delegates to the global
+  config — no second copy to drift; children born unconfigured), per-NS routing
+  (`next_hop` → Local/OnLink/Gateway/Unroutable, `ENETUNREACH`), all charged to `HeapClass::NetnsConfig`
+  **and** a 16 KiB per-NS `NsByteBudget` (root not exempt).
+- ✅ **RX ingress (D3, 2026-07-25):** bounded process-context poll at the scheduler deferred-work drain
+  (~10 ms self-throttled window, budget 32, fair per-device quantum, poll-scoped `rx_auth` capability);
+  static 32 × 4 KiB `BufPool` outside heap admission with pool-verified provenance and a per-device
+  owned-buffer cap; virtio-net completion servicing + replenish → **`eth0` receive is live**
+  (`netns_rx_eth0_slirp` gate: ARP probe out, SLIRP reply received and learned). On-link TX misses emit
+  rate-limited **ARP request probes** (per-NS ring + bucket; global bucket drawn at emission only).
 - ✅ **Gaps:** no IPv6 datapath; virtio-only (no e1000); no checksum/TSO offload, mergeable RX, or multiqueue.
+  No pending-frame queue yet — an on-link miss still falls back to the gateway MAC (metered) while the
+  probe is in flight; `move_net_device` (518) is dispatched but hard-gated `ENOSYS`.
 
 ### 5.8 SMP, IOMMU & concurrency
 
@@ -353,7 +374,8 @@ marks a capability that is partial or inert. Every "gap" is stated explicitly.*
 ### 5.9 Containers
 
 - ✅ Five namespaces — PID (32-level nesting, cascade init-kill, vpid chains), mount (CoW tables), IPC
-  (SysV), network (per-NS devices/sockets + TX gate), user (UID/GID maps, ≤5 extents, unprivileged
+  (SysV), network (per-NS devices/sockets + TX gate **+ per-NS dataplane: ARP cache, addressing,
+  routing, 16 KiB byte budget**), user (UID/GID maps, ≤5 extents, unprivileged
   containers) — via `clone`/`unshare`/`setns`.
 - ✅ Cgroups v2, **six controllers**: CPU (weight + max quota with contention-deferred debt), memory
   (max/high, charge/uncharge), pids (fork gate), io (bytes/iops token bucket), **files (fd count)**,
@@ -478,7 +500,12 @@ panel). Target: glibc + full Linux/OCI, dynamic linking in scope.
 2. **R187 — streak candidate 3/3.** Clean → the streak side of the gate is satisfied.
 3. **D1 residual mitigation — DONE 2026-07-24** (both D1s resolved): D1-RES whole-heap
    admission/ownership closure (R1-R4 + oracle); D1-ISO `AuthorizedTxDevice` type-enforced TX gate +
-   Option-B claim narrowing. Per-namespace dataplane config re-filed as D3 NETNS-DATAPLANE-CONFIG (Phase I.3).
+   Option-B claim narrowing. Per-namespace dataplane config re-filed as D3 NETNS-DATAPLANE-CONFIG (Phase I.3)
+   and **largely landed 2026-07-25** across eight legs (see §1 and §5.7).
+   - *D3 residual (next feature work, not gate-blocking):* pending-frame queue v2 — park the data frame
+     on an on-link ARP miss and retransmit it on learn/timeout, retiring the metered gateway-fallback
+     delivery path and moving probe admission past the ownership gate; then the per-NS firewall admin
+     syscall surface, `veth` pairs + a real routing table, and arming `move_net_device`.
 4. **Housekeeping cleanups** (§12): delete `sched/process.rs` and `kernel_core/kcov_syscalls.rs` orphans;
    remove dead demo modules; correct the stale IOMMU/DMAR boot comment; either wire the KCOV recorder or
    mark it explicitly non-functional; drop the unused `uart_16550` dependency.
@@ -545,7 +572,7 @@ is itself tracked as a process risk (§14).
 | D2-TST-ABI-BYTES | ~~D2~~ | static ABI-layout oracle vs. wrapper drift | **RESOLVED 2026-07-24** — 3-leg `make abi-check` oracle (pending tracking commit) |
 | D2-ABI-STAT-LAYOUT | ~~D2~~ | VfsStat/UtsName Linux wire layouts | **RESOLVED 2026-07-24** — VfsStat → exact Linux x86-64 `struct stat` 144B; UtsName → 390B `new_utsname`; fallible TryFrom→EOVERFLOW; shell mirrors lockstepped; oracle LINUX_UAPI + gcc Leg-C; musl `MUSL-STAT-OK`/`MUSL-UNAME-OK` REQUIRED markers |
 | D3-RES-COW-RESERVATION | D3 | COW metadata reservation transaction | **CLOSED 2026-07-24** — PO-MM-01 claims re-verified live; lazy reservation → Phase L |
-| D3 NETNS-DATAPLANE-CONFIG | D3 | per-ns dataplane feature arc (from D1-ISO Option-B) | **OPEN** — Phase I.3 (not a security gap; fail-closed today) |
+| D3 NETNS-DATAPLANE-CONFIG | D3 | per-ns dataplane feature arc (from D1-ISO Option-B) | **LARGELY LANDED 2026-07-25** — 8 legs: per-NS ARP cache, `NsByteBudget`, RX-wiring gate, per-NS config, per-NS routing, RX ingress loop, external RX completion (`eth0` live), ARP probe TX; 11 `netns_*` boot tests. Residual: pending-frame queue, firewall admin surface, veth + routing table, `move_net_device` arming |
 | D3 R37-1-TSYNC-CLONE-SIDE | D3 | TSYNC clone-side residual | **dispositioned** — revisit with TSYNC impl (F-5/Phase M) |
 
 (PO = *proof obligation*, the design queue's closure artifacts; 8 of 12 complete as of 2026-07-22.)
@@ -610,7 +637,10 @@ instantiates `UserAccessGuard`), `lint-fetch-add` (no bare `fetch_add(1)` for ID
 **Runtime tests (~30 core + 25 P0 regressions + 4 heavy-stress):** heap/buddy, cap-table lifecycle,
 seccomp (strict + pledge), audit hash chain, network parse/loopback, SMP online/IPI/TLB, cpuset,
 scheduler affinity/starvation, process creation, security subsystem, TCP SYN-flood limit, all 5 namespace
-isolation tests. Extended suites: `stress_test.sh` (6 scenarios), `extended_smp_test.sh` (8/16-core),
+isolation tests, and (2026-07-25) **11 `netns_*` D3 dataplane tests** — ARP isolation/exhaustion/LRU
+eviction/TX limiter, per-NS sub-budget, per-NS config isolation, routing classification, the RX ingress
+loop, RX pool lifecycle, the live `eth0` SLIRP round-trip, and ARP probe TX. Current in-kernel tally:
+**30 passed / 39 deferred / 0 failed**. Extended suites: `stress_test.sh` (6 scenarios), `extended_smp_test.sh` (8/16-core),
 `perf_regression_test.sh` (framework; benchmarks pending), `melting_test.sh` (bare-metal thermal, needs HW).
 
 **Fuzzing:** 10 cargo-fuzz targets + 10 TOML syscall descriptions + a coverage-guided mutation engine,
@@ -644,7 +674,7 @@ and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV covera
 | 0.7–0.9 | 2026-01→02 | Phase C storage, Phase D network |
 | 0.10–0.12 | 2026-02→05 | Phase E SMP, Phase F governance (namespaces, cgroups, IOMMU) |
 | 0.13.x | 2026-05→07 | Phase G production-readiness hardening; concurrency/IRQ-safety arc |
-| 0.14.x | 2026-07 | Phase U M0 (static-musl runs); U.S2 cap infra; 1.0-Preview gate push |
+| 0.14.x | 2026-07 | Phase U M0 (static-musl runs); U.S2 cap infra; 1.0-Preview gate push; D3 per-namespace network dataplane (live `eth0` RX) |
 | 1.0-Preview | TBD | zero-HIGH streak 3/3 + D1 resolved (gate) |
 | 1.0.0 | TBD | first stable release (post Phase U personality) |
 
