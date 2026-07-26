@@ -37,7 +37,7 @@
 //! - Broadcast/multicast sources are rejected
 
 use core::cmp;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpStats};
@@ -1506,6 +1506,7 @@ pub fn next_hop(dst: Ipv4Addr, cfg: &NetConfigSnapshot) -> NextHop {
     net_ns_id: u64,
     now_ms: u64,
     cache.count_neighbor_fallback();
+    let arp_stats = &RX_INGRESS_NET_STATS.arp_stats;
 /// D3 NETNS-ROUTING: routing-aware. The [`next_hop`] decision (computed
 /// from the caller's OWN snapshot) governs:
 ///
@@ -1976,6 +1977,16 @@ pub fn transmit_prepared_reply(
     if frame.is_empty() {
         return Err(TxError::NoMemory);
     }
+///   ([`rx_ingress_net_stats`]) — the same instance where `ArpReply` TX
+///   commits and reply/learn observability already live.
+    let stats = &RX_INGRESS_NET_STATS;
+    let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+    // Codex round-27 F3: the GLOBAL aggregate backstop is drawn HERE —
+    // strictly after the ownership-gated data enqueue succeeded — never at
+    // admission. An ownership-denied namespace therefore cannot starve the
+    // shared bucket (its per-cache rate equals the global refill rate, so
+    // an admission-time draw would pin the aggregate at empty); the only
+    // budget it can waste is its own cache's.
 fn transmit_prepared_reply_with_queue<F>(
     reply: PreparedReply,
     now_ms: u64,
@@ -2483,6 +2494,183 @@ fn apply_firewall_verdict(
     }
 }
 
+// ============================================================================
+// D3-NETNS-DATAPLANE RX-INGRESS: bounded process-context polling (bring-up)
+// ============================================================================
+
+/// Frames drained per throttled background poll. Bounds the work one
+/// deferred-work pass can absorb (Safety > Speed: a flood cannot monopolize a
+/// syscall-return / reschedule path — excess frames wait for the next pass).
+pub const RX_INGRESS_POLL_BUDGET: usize = 32;
+
+// Round-18 invariant: the stateless per-device fair quantum only guarantees
+// every device a slot when the budget covers the device count; with a smaller
+// budget the first productive devices win every poll. The production entry
+// must never be in that regime.
+const _: () = assert!(
+    RX_INGRESS_POLL_BUDGET >= crate::MAX_NET_DEVICES,
+    "background RX budget must cover every registrable device (fairness invariant)"
+);
+
+const RX_INGRESS_MIN_INTERVAL_MS: u64 = 10;
+
+/// Loop-level RX ingress telemetry, distinct from the per-frame `NetStats`
+/// that `process_frame` maintains (those count protocol outcomes; these count
+/// drain-loop outcomes the protocol layer never sees).
+struct RxIngressStats {
+    /// Device `receive()` errors (bounded to one per device per poll).
+    rx_errors: AtomicU64,
+    /// Polls skipped fail-closed because the attributed owner context was
+    /// unavailable/unusable (no root config, or zero-MAC autodetect pending).
+    /// Deliberately a SKIP counter, not a drop counter (round-17): nothing is
+    /// dequeued on this path — frames stay on their device queues and are
+    /// retried next pass. Becomes a per-frame drop counter only when
+    /// per-device attribution lands (a frame from a destroyed owner must then
+    /// be consumed and dropped, not left queued forever).
+    owner_unavailable_skips: AtomicU64,
+    /// Ingress-generated replies that failed `transmit_prepared_reply` and
+    /// were dropped (bring-up policy: count + drop, never stall the drain).
+    reply_tx_failures: AtomicU64,
+    /// Polls that consumed their entire frame budget (work may remain).
+    budget_exhausted: AtomicU64,
+    /// Shared-pool construction attempts rolled back for falling short of
+static RX_INGRESS_STATS: RxIngressStats = RxIngressStats {
+    rx_errors: AtomicU64::new(0),
+    owner_unavailable_skips: AtomicU64::new(0),
+    reply_tx_failures: AtomicU64::new(0),
+    budget_exhausted: AtomicU64::new(0),
+    pool_init_failures: AtomicU64::new(0),
+    replenish_shortfalls: AtomicU64::new(0),
+};
+
+/// Protocol-layer stats instance fed to `process_frame` by the ingress loop
+/// (there is no other production RX caller, so this is the loop's own ledger).
+static RX_INGRESS_NET_STATS: NetStats = NetStats::new();
+
+/// Non-reentrant drain guard: at most ONE ingress poll runs at a time,
+/// system-wide. Concurrent callers bail out empty-handed instead of queueing
+/// (the frames are not going anywhere; the holder is already draining them).
+/// Round-17: the guard also serializes the THROTTLE decision — the last-poll
+/// timestamp is read, checked, and advanced only while holding it, so
+/// background polls can never execute with out-of-order `now_ms`.
+static RX_INGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Timestamp (ms) of the last throttled background poll. Read/advanced ONLY
+/// under `RX_INGRESS_ACTIVE` (see above).
+static RX_INGRESS_LAST_POLL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of live [`RxIngressQuiesceGuard`]s. Non-zero => the THROTTLED
+/// background entry is a no-op. A depth counter (not a bool) so overlapping
+/// test scopes compose and cannot unbalance each other.
+static RX_INGRESS_BG_QUIESCE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Copy-out snapshot of the loop-level RX ingress counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxIngressCounters {
+    pub rx_errors: u64,
+    pub owner_unavailable_skips: u64,
+    pub reply_tx_failures: u64,
+    pub budget_exhausted: u64,
+    pub pool_init_failures: u64,
+    pub replenish_shortfalls: u64,
+}
+
+/// Snapshot the loop-level RX ingress counters (test/diagnostic observability).
+pub fn rx_ingress_counters() -> RxIngressCounters {
+    RxIngressCounters {
+        rx_errors: RX_INGRESS_STATS.rx_errors.load(Ordering::Relaxed),
+        owner_unavailable_skips: RX_INGRESS_STATS
+            .owner_unavailable_skips
+            .load(Ordering::Relaxed),
+        reply_tx_failures: RX_INGRESS_STATS.reply_tx_failures.load(Ordering::Relaxed),
+        budget_exhausted: RX_INGRESS_STATS.budget_exhausted.load(Ordering::Relaxed),
+        pool_init_failures: RX_INGRESS_STATS.pool_init_failures.load(Ordering::Relaxed),
+        replenish_shortfalls: RX_INGRESS_STATS
+            .replenish_shortfalls
+            .load(Ordering::Relaxed),
+    }
+}
+
+/// The protocol-layer stats ledger the ingress loop feeds to `process_frame`
+/// (test/diagnostic observability — e.g. ARP reply/learn counters for frames
+/// that entered through a registered device rather than a direct test call).
+pub fn rx_ingress_net_stats() -> &'static NetStats {
+    &RX_INGRESS_NET_STATS
+}
+
+/// Scoped quiescence of the THROTTLED background RX poll (deterministic-test
+/// aid). While at least one guard is live, `rx_ingress_poll_throttled` is a
+/// no-op; explicit `rx_ingress_poll` calls are unaffected. Dropping the guard
+/// re-enables background polling (depth-counted, so scopes compose).
+///
+/// Why tests need this: idle-loop `schedule()` on any CPU drives the
+/// background poll, and a background steal of a planted frame would process
+/// it at the REAL clock against fake-clock ARP token buckets/TTLs (entries
+/// learned at real uptime then look expired to the test's fake-clock
+/// lookups). Production never constructs one; the only effect while held is
+/// that background frames wait on their device queues.
+pub struct RxIngressQuiesceGuard(());
+
+/// Quiesce the throttled background RX poll for the guard's lifetime.
+///
+/// Round-17: this is a BARRIER, not just a flag — when this returns, no
+/// in-flight background poll remains and none can start. A poll that read a
+/// zero depth before our increment became visible necessarily holds
+/// `RX_INGRESS_ACTIVE` (the authoritative depth check happens INSIDE the
+/// guard), so waiting for the guard to clear waits that poll out; polls are
+/// budget-bounded, so the wait is microsecond-scale. SeqCst on the depth
+/// pairs with the SeqCst re-check in the throttled entry.
+///
+/// Caller contract (round-18): never construct one from inside RX frame
+/// processing, and never while holding a lock the active poll may need
+/// (device mutex, registry, ARP cache, socket/conntrack) — the wait-for-idle
+/// spin would deadlock against the poll it is waiting out.
+pub fn quiesce_rx_ingress_background() -> RxIngressQuiesceGuard {
+    RX_INGRESS_BG_QUIESCE_DEPTH.fetch_add(1, Ordering::SeqCst);
+    while RX_INGRESS_ACTIVE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    RxIngressQuiesceGuard(())
+}
+
+impl Drop for RxIngressQuiesceGuard {
+    fn drop(&mut self) {
+        RX_INGRESS_BG_QUIESCE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Installed FULL-OR-NEVER by [`ensure_rx_ingress_pool`]; absent until the
+/// first successful construction.
+    let pool = RX_INGRESS_POOL.get()?;
+    // ONE `available` read keeps the (available, in_use) pair coherent
+/// Caller MUST hold `RX_INGRESS_ACTIVE` — the non-reentrant drain guard
+/// doubles as the construction lock, so concurrent double-construction
+/// (and a racing double `call_once`) is structurally impossible.
+    if let Some(pool) = RX_INGRESS_POOL.get() {
+        return Some(pool);
+    }
+            Some(RX_INGRESS_POOL.call_once(|| candidate))
+        }
+        _ => {
+            RX_INGRESS_STATS
+                .pool_init_failures
+                .fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// D3-NETNS-DATAPLANE RX-INGRESS: `rx_auth` owns the ONLY path to the driver
+/// `receive`, mirroring `tx_auth` for the ingress direction: no raw
+/// `NetDeviceHandle` egresses the registry except into these two audited
+/// resolvers (contract pinned at `rx_device_handles` in lib.rs).
+///
+/// Granularity is deliberately DIFFERENT from `tx_auth`: TX tokens are
+/// single-use because each egress is an authority-bearing act (namespace
+/// ownership is checked per mint). An RX capability is poll-scoped — it
+/// authorizes bounded frame INGESTION during one drain pass, because ingress
+/// attribution is not an authority check on the poller: the frames are
+/// namespace-gated INSIDE `process_frame` (per-ns ARP cache / config hooks,
 /// fail-closed `NetNsUnavailable`). Re-resolving the registry per frame would
 /// buy no isolation and add lock churn (Efficiency).
 ///
@@ -2492,6 +2680,94 @@ fn apply_firewall_verdict(
 /// `sys_move_net_device` is hard-gated ENOSYS — so root is the only owner any
 /// device can have today. ARMING `move_device` MUST introduce an inverse
 /// ownership lookup (+ generation, so a mid-poll move cannot attribute a frame
+/// to a stale owner) and rework `resolve_rx_devices` to carry per-device
+/// attribution; this comment is the tripwire.
+mod rx_auth {
+    use crate::device::RxError;
+    pub(super) struct AuthorizedRxDevice {
+        dev: NetDeviceHandle,
+    }
+
+    impl AuthorizedRxDevice {
+        /// Pop at most one received frame. Takes ONLY the per-device spin
+        /// Mutex, released before the caller touches the frame — never call
+        /// back into the stack (process_frame / transmit paths) while this
+        /// guard is live: root `network_config()` re-enters the device
+        /// registry (lazy MAC autodetect) and reply TX takes the egress
+        /// device's own mutex.
+        pub(super) fn receive_one(&self) -> Result<Option<NetBuf>, RxError> {
+            let mut device = self.dev.lock();
+            device.receive()
+        }
+
+        /// Service driver completions under the per-device mutex only:
+        /// used-ring reaping into the driver's bounded ready queue plus TX
+        /// descriptor reclaim, both bounded by the device ring size. Runs
+        /// BEFORE the drain so `receive_one` pops freshly reaped frames.
+        /// Its TX reclaim is the FIRST production reclaim path — device
+        /// tx_packets now advance on background polls; the enq_delta test
+        /// invariant is signed exactly so completions may land between
+        /// snapshots.
+    pub(super) fn resolve_rx_devices(
+        filter: Option<&[&str]>,
+    ) -> ([Option<AuthorizedRxDevice>; MAX_NET_DEVICES], usize) {
+        let (handles, count) = crate::rx_device_handles();
+        let mut out: [Option<AuthorizedRxDevice>; MAX_NET_DEVICES] =
+            [const { None }; MAX_NET_DEVICES];
+        let mut resolved = 0;
+        match filter {
+            None => {
+                for handle in handles.into_iter().flatten() {
+                    out[resolved] = Some(AuthorizedRxDevice { dev: handle });
+                    resolved += 1;
+                }
+                debug_assert_eq!(resolved, count);
+            }
+            Some(names) => {
+                for name in names {
+                    if resolved == MAX_NET_DEVICES {
+                        break;
+                    }
+                    for handle in handles.iter().flatten() {
+                        let matches = handle.lock().name() == *name;
+                        if matches {
+                            out[resolved] = Some(AuthorizedRxDevice {
+                                dev: handle.clone(),
+                            });
+                            resolved += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (out, resolved)
+    }
+}
+
+/// RAII release for the non-reentrant drain guard (covers every early return).
+struct RxIngressGuard;
+
+impl Drop for RxIngressGuard {
+    fn drop(&mut self) {
+        RX_INGRESS_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+/// D3-NETNS-DATAPLANE RX-INGRESS: bounded, non-reentrant RX drain over every
+/// registered device (bring-up path; production RX needs a recurring wake
+/// source once device IRQ vectors are wired).
+///
+/// Per poll: captures the attributed owner context ONCE (v1 = root, see
+/// `rx_auth`), then for each device pops frames under the per-device mutex
+/// only and processes each frame with NO lock held (`process_frame` re-enters
+/// per-ns hooks; root `network_config()` re-enters the device registry; reply
+/// TX takes the egress device mutex). Ingress-generated replies egress through
+/// `transmit_prepared_reply` — the same namespace-gated, firewall-checked path
+/// as every other prepared reply — with failures counted and dropped.
+///
+/// Captured-context coherence: the config is captured before the first frame
+/// and reused for the whole pass. For ns 0 this cannot go stale mid-poll:
 /// root addressing is immutable (`set_net_config` rejects level 0 and the
 /// global config has no post-boot mutation surface; the one-shot lazy MAC
 /// autodetect only fills a zero MAC, and a zero-MAC capture skips the poll
@@ -2500,9 +2776,187 @@ fn apply_firewall_verdict(
 /// (future) must capture config+cache together PER FRAME instead.
 ///
 /// Buffer lifecycle (round-22 R3): every received `NetBuf` takes ONE return
+/// (installed full-or-retry by `ensure_rx_ingress_pool`; a pool-less poll
+/// still drains self-stocking devices, only stocking is pool-gated).
+///
+/// Work bound and fairness (round-17): at most `budget` frames total across
+/// ALL devices — malformed frames consume budget too (`process_frame` counts
+/// entry enforces `RX_INGRESS_POLL_BUDGET >= MAX_NET_DEVICES` at compile
+/// time. This explicit entry deliberately does NOT touch the background
+/// throttle's last-poll timestamp: tests drive it with large fake clocks, and
+/// advancing the throttle clock to a fake future would stall real-clock
+/// background polling for the difference.
+pub fn rx_ingress_poll(now_ms: u64, budget: usize) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    if RX_INGRESS_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return 0;
+    }
+    let _guard = RxIngressGuard;
+    rx_ingress_poll_locked(now_ms, budget, None)
+}
+
+/// Deterministic-test entry (Codex round-21 finding 6): same non-reentrant
+/// guard, same start-gate assert, same captured-root-context drain body as
+/// [`rx_ingress_poll`], but the drained capability set is NARROWED to the
+/// named devices — iteration (and therefore fairness quota) order is the
+/// caller's name order. Exact-count assertions are impossible against the
+/// full device set once eth0 RX is live: the host side emits unsolicited
+/// frames (e.g. SLIRP IPv6 router advertisements) at arbitrary times, so a
+/// test that must count frames polls ONLY its own synthetic devices through
+/// this entry. Production paths use the unfiltered entries; narrowing grants
+/// nothing (a subset of the same poll-scoped capabilities).
+    if RX_INGRESS_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return 0;
+    }
+    let _guard = RxIngressGuard;
+    rx_ingress_poll_locked(now_ms, budget, Some(names))
+}
+
+/// The drain body. Caller MUST hold `RX_INGRESS_ACTIVE` (see the three entry
+/// points); everything else about lock discipline is documented on
+/// [`rx_ingress_poll`].
+fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -> usize {
+    // RX-WIRING CONTRACT start-gate (lib.rs): the per-ns ARP path must never
+    // run before kernel_core registers the namespace hooks. Safe to assert
+    // unconditionally at the production drain site: the deferred-work ready
+    // gate is armed (main.rs) strictly AFTER kernel_core::init registered the
+    // hooks, so reaching this poll pre-registration is a boot-order
+    // regression worth failing loudly. Descriptor stocking happens strictly
+    // after this assert (round-20 contract).
+    crate::assert_netns_hooks_for_rx();
+
+    // Captured owner context, v1 attribution = root (see rx_auth). Acquired
+    // BEFORE any device mutex: the root arm re-enters the device registry
+    // (lazy MAC autodetect). Fail-closed on absence; nothing is dequeued and
+    // nothing is stocked on the skip paths (stocking waits for a poll that
+    // can also process — see the counter doc).
     let cfg = match tx_net_config(0) {
         Ok(cfg) => cfg,
         Err(_) => {
+            RX_INGRESS_STATS
+                .owner_unavailable_skips
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+    };
+    // Zero-MAC = root autodetect still pending. Processing would filter
+    // against (and stamp replies with) an all-zero MAC — skip fail-closed;
+    // queued frames are retried once autodetect fills the MAC.
+    if cfg.our_mac.0 == [0u8; 6] {
+        RX_INGRESS_STATS
+            .owner_unavailable_skips
+            .fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+
+    let pool = ensure_rx_ingress_pool();
+    let (devices, device_count) = rx_auth::resolve_rx_devices(filter);
+    let stats = &RX_INGRESS_NET_STATS;
+    let mut remaining = budget;
+    let mut processed = 0usize;
+
+    for (index, slot) in devices.iter().enumerate().take(device_count) {
+        let Some(dev) = slot.as_ref() else {
+            continue;
+        };
+        // Pre-service completions even when the budget is already spent:
+        // completion reaping and the replenish below must reach EVERY device
+        // on EVERY poll (round-20 step 4), or a budget-exhausting flood on
+        // one device would starve the others' descriptor stocking.
+                    RX_INGRESS_STATS.rx_errors.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            };
+            quota -= 1;
+            remaining -= 1;
+            processed += 1;
+            // No lock held across this call (device guard dropped inside
+            // receive_one); per-frame namespace gating happens inside.
+            let result = process_frame(
+                buf.data(),
+                cfg.our_mac,
+                cfg.our_ip,
+                stats,
+                NamespaceId::new(0),
+                now_ms,
+            );
+            // Uniform provenance return (round-22 R3): pool buffers go home,
+            // foreign buffers drop. Either way the RX DMA buffer is released
+            // before reply TX allocates its own.
+            match pool {
+                Some(pool) => {
+                    RX_INGRESS_STATS
+                        .reply_tx_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // POST-drain replenish, unconditionally — also on empty/error/
+        // budget-exhausted device exits (round-20 step 4). Supporting
+        // devices' shortfalls are counted (rounds 23-24: including the
+        // otherwise-silent first-stock failure).
+        if let Some(pool) = pool {
+                    RX_INGRESS_STATS
+                        .replenish_shortfalls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    if remaining == 0 {
+        RX_INGRESS_STATS
+            .budget_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    processed
+}
+
+/// Throttled background entry for the kernel deferred-work drain site
+/// (process context, beside the deferred TCP timer drain). Self-limiting so
+/// an unconditional call per reschedule stays bounded: a quiesce depth check
+/// and a coarse minimum interval, both re-checked AUTHORITATIVELY inside the
+/// non-reentrant guard (round-17). Guard-serializing the throttle decision
+/// makes background `now_ms` values strictly increasing into the drain: a
+/// caller whose timestamp is stale (<= the last poll that won) fails the
+/// inner interval check and skips, so two racing CPUs can never execute
+/// polls in reversed timestamp order. The pre-guard checks are only a cheap
+/// fast path to avoid CAS churn; the guard-held re-checks decide.
+pub fn rx_ingress_poll_throttled(now_ms: u64) -> usize {
+    if RX_INGRESS_BG_QUIESCE_DEPTH.load(Ordering::SeqCst) != 0 {
+        return 0;
+    }
+    let last = RX_INGRESS_LAST_POLL_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < RX_INGRESS_MIN_INTERVAL_MS {
+        return 0;
+    }
+    if RX_INGRESS_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return 0;
+    }
+    let _guard = RxIngressGuard;
+    // Authoritative re-checks, serialized by the guard. The depth re-check
+    // pairs with the wait-for-idle barrier in quiesce_rx_ingress_background.
+    if RX_INGRESS_BG_QUIESCE_DEPTH.load(Ordering::SeqCst) != 0 {
+        return 0;
+    }
+    let last = RX_INGRESS_LAST_POLL_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < RX_INGRESS_MIN_INTERVAL_MS {
+        return 0;
+    }
+    RX_INGRESS_LAST_POLL_MS.store(now_ms, Ordering::Relaxed);
+    rx_ingress_poll_locked(now_ms, RX_INGRESS_POLL_BUDGET, None)
+}
+
 // ============================================================================
 // Timer Maintenance
 // ============================================================================

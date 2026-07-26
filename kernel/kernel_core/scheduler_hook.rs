@@ -322,6 +322,12 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
 
+    // D3-NETNS-DATAPLANE RX-INGRESS: bounded bring-up RX poll beside the TCP
+    // drain. Self-throttled inside the net crate (quiesce flag + ~10ms CAS
+    // window + non-reentrant guard); the ready gate above guarantees
+    // kernel_core::init registered the netns device hooks before this runs.
+    crate::time::poll_net_rx_ingress();
+
     // R169-L9/L10/L11: rate-gated ns-agnostic stranded-port-charge sweep. The
     // alloc-time `reap_dead_bindings` only visits the namespace of an active
     // ephemeral allocation, so a socket dropped without close(), a charge stranded

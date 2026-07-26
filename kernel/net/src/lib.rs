@@ -143,6 +143,7 @@ pub use stack::{
     handle_timer_tick, network_config, process_frame, transmit_prepared_reply,
     transmit_tcp_connect, transmit_tcp_segment, transmit_udp_datagram, DropReason,
     NetConfigSnapshot, NetStats, PreparedReply, PreparedReplyTxError, ProcessResult,
+    quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters, rx_ingress_net_stats,
     tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop, PreparedReply,
 };
 pub use tcp::{
@@ -208,6 +209,9 @@ pub const MAX_NET_DEVICES: usize = 8;
 /// handle can NEVER egress the `net` crate. The only sanctioned way to reach the
 /// driver `transmit` is via `stack::tx_auth::AuthorizedTxDevice`, minted by the
 /// namespace-gated resolver. (No out-of-crate user existed.)
+/// D3-NETNS-DATAPLANE RX-INGRESS: the only sanctioned way to reach the driver
+/// `receive` is likewise `stack::rx_auth::AuthorizedRxDevice` — raw handles stay
+/// confined to those two audited in-crate resolvers.
 pub(crate) type NetDeviceHandle = Arc<Mutex<Box<dyn NetDevice>>>;
 
 /// A registered network device entry.
@@ -267,6 +271,24 @@ impl NetDeviceRegistry {
             .map(|d| (d.device.clone(), d.index))
     }
 
+    /// D3-NETNS-DATAPLANE RX-INGRESS: snapshot every registered device handle in
+    /// ONE read-lock critical section. Registration order is preserved and the
+    /// registry lock is released before ANY per-device mutex is taken (the RX
+    /// poll must never nest device locks under the registry lock — root
+    /// `network_config()` re-enters this registry for its lazy MAC autodetect).
+    /// Heap-free: registration is capped at `MAX_NET_DEVICES`, so a fixed array
+    /// suffices and the poll path allocates nothing.
+    fn snapshot_handles(&self) -> ([Option<NetDeviceHandle>; MAX_NET_DEVICES], usize) {
+        let devices = self.devices.read();
+        let mut out: [Option<NetDeviceHandle>; MAX_NET_DEVICES] = [const { None }; MAX_NET_DEVICES];
+        let mut count = 0;
+        for entry in devices.iter().take(MAX_NET_DEVICES) {
+            out[count] = Some(entry.device.clone());
+            count += 1;
+        }
+        (out, count)
+    }
+
     fn count(&self) -> usize {
         self.devices.read().len()
     }
@@ -294,9 +316,22 @@ pub fn register_device<D: NetDevice + 'static>(device: D) -> Result<usize, NetEr
 /// `pub(crate)` and contract-pinned: a transmit-capable handle may egress the
 /// registry ONLY into that resolver (or the tx_auth host tests). Adding any other
 /// NON-TEST caller re-opens the ungated-TX bypass this closes — treat as a
-/// security regression (grep gate: exactly one non-test caller).
+/// security regression (grep gate: exactly one non-test caller). The RX side has
+/// its OWN sibling seam below (`rx_device_handles`) with its own one-caller gate;
+/// do NOT widen this one for ingress.
 pub(crate) fn get_device_with_index(name: &str) -> Option<(NetDeviceHandle, usize)> {
     registry().get_by_name_with_index(name)
+}
+
+/// D3-NETNS-DATAPLANE RX-INGRESS: snapshot ALL registered device handles for the
+/// SOLE sanctioned consumer — `stack::rx_auth::resolve_rx_devices`. Contract-pinned
+/// exactly like `get_device_with_index` above: a device handle may egress the
+/// registry ONLY into the rx_auth resolver, which wraps it in a poll-scoped
+/// receive-only capability. Adding any other NON-TEST caller re-opens the
+/// raw-device-handle bypass the tx_auth/rx_auth split closes — treat as a
+/// security regression (grep gate: exactly one non-test caller).
+pub(crate) fn rx_device_handles() -> ([Option<NetDeviceHandle>; MAX_NET_DEVICES], usize) {
+    registry().snapshot_handles()
 }
 
 /// D1-ISO-NETNS-DATAPLANE: metadata-only MAC accessor. Returns the device MAC

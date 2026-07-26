@@ -212,3 +212,16 @@ pub fn drain_deferred_tcp_timers() {
     }
     // If still incomplete, leave deferred flag set for next opportunity
 }
+
+/// D3-NETNS-DATAPLANE RX-INGRESS: bring-up process-context RX drain, sibling of
+/// `drain_deferred_tcp_timers` at the same deferred-work drain site.
+///
+/// Unconditional per-pass call is safe: all rate limiting lives in the net
+/// crate (`rx_ingress_poll_throttled` — quiesce flag, ~10ms window claimed by
+/// CAS, non-reentrant guard), and the drain site's `process_deferred_work_ready`
+/// gate guarantees `kernel_core::init` (which registers the netns device hooks)
+/// completed before the first call, satisfying the RX-WIRING start-gate the
+/// poll asserts. Uses the same process-context clock as the TCP drain.
+pub fn poll_net_rx_ingress() {
+    let _ = net::rx_ingress_poll_throttled(current_timestamp_ms());
+}

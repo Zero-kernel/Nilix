@@ -486,6 +486,12 @@ impl BufPool {
     /// Return a buffer to the pool.
     ///
     /// The buffer is reset before being returned to the pool.
+    ///
+    /// CONTRACT: the caller asserts pool origin. The driver-internal
+    /// replenish failure paths satisfy this by construction (the buffer was
+    /// just `alloc()`d, or came from a recycle queue that only ever holds
+    /// previously-posted pool buffers). Callers that CANNOT prove origin
+    /// (e.g. the RX ingress loop, which receives buffers from arbitrary
     pub fn free(&self, mut buf: NetBuf) {
         buf.reset();
         self.buffers.lock().push(buf);
