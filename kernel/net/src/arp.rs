@@ -825,8 +825,7 @@ impl ArpCache {
                 .is_some_and(|frame| now_ms >= frame.expires_at);
             if expired {
                 if let Some(frame) = self.parked[slot].take() {
-                    self.pending_counters.expired =
-                        self.pending_counters.expired.saturating_add(1);
+                    self.pending_counters.expired = self.pending_counters.expired.saturating_add(1);
                     retired.push(frame);
                 }
             }
@@ -900,10 +899,8 @@ impl ArpCache {
     /// fail-closed (policy/ownership/queue) — popped frames are NEVER
     /// re-parked.
     pub(crate) fn record_pending_tx_outcomes(&mut self, accepted: u64, failed: u64) {
-        self.pending_counters.retransmitted = self
-            .pending_counters
-            .retransmitted
-            .saturating_add(accepted);
+        self.pending_counters.retransmitted =
+            self.pending_counters.retransmitted.saturating_add(accepted);
         self.pending_counters.retx_failures =
             self.pending_counters.retx_failures.saturating_add(failed);
     }

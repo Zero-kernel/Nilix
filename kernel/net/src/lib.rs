@@ -104,8 +104,8 @@ pub use admitted::WirePacket;
 pub use arp::{
     build_arp_reply, build_arp_request, build_gratuitous_arp, parse_arp, process_arp,
     serialize_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
-    ArpStats, PendingFrameCounters, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
-    PENDING_FRAME_SLOTS, PENDING_FRAME_TTL_MS,
+    ArpStats, PendingFrameCounters, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER, PENDING_FRAME_SLOTS,
+    PENDING_FRAME_TTL_MS,
 };
 pub use buffer::{BufPool, NetBuf};
 pub use device::{

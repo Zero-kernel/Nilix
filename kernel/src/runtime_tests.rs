@@ -6513,16 +6513,11 @@ impl RuntimeTest for NetNsPendingFrameTest {
         let ingress_stats = net::rx_ingress_net_stats();
 
         // Park one frame via on-link miss send.
-        let datagram = match net::build_udp_datagram(
-            cfg.our_ip,
-            target_ip,
-            50_001,
-            50_002,
-            b"D3-PENDING",
-        ) {
-            Ok(d) => d,
-            Err(e) => return TestResult::Fail(alloc::format!("build_udp_datagram: {:?}", e)),
-        };
+        let datagram =
+            match net::build_udp_datagram(cfg.our_ip, target_ip, 50_001, 50_002, b"D3-PENDING") {
+                Ok(d) => d,
+                Err(e) => return TestResult::Fail(alloc::format!("build_udp_datagram: {:?}", e)),
+            };
         if let Err(e) = net::transmit_udp_datagram(target_ip, &datagram, cid) {
             return TestResult::Fail(alloc::format!(
                 "leg 1: on-link miss send must park (Ok), got {:?}",
@@ -6602,7 +6597,10 @@ impl RuntimeTest for NetNsPendingFrameTest {
         }
         let ctrs3 = child.arp_cache().lock().pending_frame_counters();
         if ctrs3.expired != 1 {
-            return TestResult::Fail(alloc::format!("leg 2: expired counter (got {})", ctrs3.expired));
+            return TestResult::Fail(alloc::format!(
+                "leg 2: expired counter (got {})",
+                ctrs3.expired
+            ));
         }
 
         // Leg 3: FIFO eviction by park_seq (fill 8 slots, 9th evicts oldest).
@@ -6612,7 +6610,10 @@ impl RuntimeTest for NetNsPendingFrameTest {
         }
         let ctrs4 = child.arp_cache().lock().pending_frame_counters();
         if ctrs4.evicted != 1 {
-            return TestResult::Fail(alloc::format!("leg 3: one eviction (got {})", ctrs4.evicted));
+            return TestResult::Fail(alloc::format!(
+                "leg 3: one eviction (got {})",
+                ctrs4.evicted
+            ));
         }
         if child.arp_cache().lock().pending_frame_count() != 8 {
             return TestResult::Fail(alloc::format!(
@@ -6627,7 +6628,10 @@ impl RuntimeTest for NetNsPendingFrameTest {
         }
         let ctrs5 = child.arp_cache().lock().pending_frame_counters();
         if ctrs5.flushed != 8 {
-            return TestResult::Fail(alloc::format!("leg 4: flush 8 frames (got {})", ctrs5.flushed));
+            return TestResult::Fail(alloc::format!(
+                "leg 4: flush 8 frames (got {})",
+                ctrs5.flushed
+            ));
         }
         if child.arp_cache().lock().pending_frame_count() != 0 {
             return TestResult::Fail(String::from("leg 4: flush clears queue"));

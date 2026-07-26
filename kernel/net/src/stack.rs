@@ -2380,12 +2380,9 @@ pub fn drain_parked_ready(net_ns_id: u64, now_ms: u64) -> usize {
     if !snapshot.occupied() {
         return 0;
     }
-    let authorized =
-        snapshot.has_live_keys() && resolve_authorized_tx_device(net_ns_id).is_ok();
+    let authorized = snapshot.has_live_keys() && resolve_authorized_tx_device(net_ns_id).is_ok();
 
-    let drain = cache
-        .lock()
-        .drain_pending(now_ms, authorized, &snapshot);
+    let drain = cache.lock().drain_pending(now_ms, authorized, &snapshot);
 
     // Everything below runs with NO cache lock held.
     drop(drain.retired);
