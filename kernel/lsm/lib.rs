@@ -1742,6 +1742,52 @@ pub fn hook_net_control(ctx: &NetControlCtx) -> LsmResult {
 }
 
 // ============================================================================
+// Network Namespace Device Assignment Hook (D3 NETNS-DATAPLANE-CONFIG)
+// ============================================================================
+
+/// Hook: network device reassignment between namespaces.
+///
+/// Called before a network device is moved from one network namespace to
+/// another. This is a privileged operation that affects network isolation
+/// boundaries.
+///
+/// # Arguments
+///
+/// * `task` - Process attempting the device move
+/// * `device_idx` - Network device index being moved
+/// * `from_ns_id` - Source network namespace ID
+/// * `to_ns_id` - Destination network namespace ID
+///
+/// # Returns
+///
+/// `Ok(())` if operation is allowed, `Err(LsmError::Denied)` if blocked by policy
+#[inline]
+pub fn hook_net_device_move(
+    task: &ProcessCtx,
+    device_idx: u32,
+    from_ns_id: u64,
+    to_ns_id: u64,
+) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        // Device move is a control-plane operation that requires CAP_NET_ADMIN.
+        // Policies can implement additional restrictions (e.g., deny device moves
+        // from specific namespaces, or require explicit device allowlists).
+        let res = policy().net_device_move(task, device_idx, from_ns_id, to_ns_id);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_device_move", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, device_idx, from_ns_id, to_ns_id);
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Livepatch Hooks (R102-13)
 // ============================================================================
 

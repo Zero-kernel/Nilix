@@ -41,7 +41,13 @@ use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use mm::HeapClass;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
+
+// D3-NETNS-DATAPLANE: per-namespace dataplane state (ARP cache) lives in the
+// net crate; kernel_core owns the namespace objects and serves lookups to the
+// net crate through the `NetNsDeviceHooks` trait (net cannot depend on
+// kernel_core — dependency cycle).
+use net::arp::ArpCache;
 
 // ============================================================================
 // Constants
@@ -183,6 +189,16 @@ static NEXT_NET_NS_ID: AtomicU64 = AtomicU64::new(1);
 /// - Routing table
 /// - Socket bindings (same port can be used in different namespaces)
 /// - Firewall rules
+/// - D3-NETNS-DATAPLANE: Per-namespace ARP cache
+/// state charged to `HeapClass::NetnsConfig`.
+///
+/// Sizing: the only consumer today is the per-ns ARP cache (256 entries of
+/// ~24 bytes). Its worst transient is the final doubling, where the old
+/// 128-entry backing and the new 256-entry backing coexist until the retired
+/// owner drops: 128*24 + 256*24 = 9216 bytes. 16 KiB covers that peak with
+/// ~70% slack for entry-layout drift. The limit is a CEILING, not an
+/// entitlement — the shared 512 KiB class can exhaust first (by design:
+/// budgets bound per-ns blast radius, they do not guarantee availability).
 pub struct NetNamespace {
     /// Unique namespace identifier
     id: NamespaceId,
@@ -201,6 +217,24 @@ pub struct NetNamespace {
 
     /// Loopback interface is always present (127.0.0.1)
     has_loopback: bool,
+
+    /// D3-NETNS-DATAPLANE FIRST-SLICE: Per-namespace ARP cache.
+    ///
+    /// Each namespace (including root) owns isolated IP->MAC mappings; entry
+    /// storage is heap-admitted to `HeapClass::NetnsConfig`. Held behind an
+    /// `Arc` so the net crate's hook accessor can hand the cache out WITHOUT
+    /// handing out a namespace reference — ARP processing then never holds
+    /// anything whose drop could run `NetNamespace::Drop` teardown.
+    ///
+    /// The global cache in the net crate remains only as the TX fallback for
+    /// the pre-hook-registration window (early boot / host tests), where the
+    /// TX ownership gate restricts traffic to the root namespace.
+    arp_cache: Arc<Mutex<ArpCache>>,
+
+    /// (today: `arp_cache`'s entry storage) holds an `Arc` clone and takes a
+    /// dual lease (shared class + this budget) on growth. Root is NOT
+    /// exempt. `Drop` closes it to NEW leases; usage is never zeroed —
+    /// orphaned allocations release when they really drop.
 }
 
 impl fmt::Debug for NetNamespace {
@@ -224,6 +258,10 @@ impl NetNamespace {
             refcount: AtomicU32::new(1),
             devices: RwLock::new(BTreeSet::new()),
             has_loopback: true,
+            // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry
+            // storage dual-leased against the NetnsConfig class ceiling AND
+            // this namespace's config budget.
+                mm::HeapClass::NetnsConfig,
         }
     }
 
@@ -261,6 +299,10 @@ impl NetNamespace {
             refcount: AtomicU32::new(1),
             devices: RwLock::new(BTreeSet::new()), // Empty - only loopback
             has_loopback: true,
+            // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry
+            // storage dual-leased against the NetnsConfig class ceiling AND
+            // this namespace's config budget.
+                mm::HeapClass::NetnsConfig,
         });
 
         // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
@@ -361,6 +403,22 @@ impl NetNamespace {
     pub fn device_count(&self) -> usize {
         self.devices.read().len()
     }
+
+    /// D3-NETNS-DATAPLANE: Get this namespace's ARP cache.
+    ///
+    /// Returns a clone of the cache `Arc`, NOT a namespace reference: the
+    /// caller (ultimately the net crate's RX/TX paths, via the
+    /// `NetNsDeviceHooks::ns_arp_cache` hook) can lock and use the cache
+    /// while holding nothing that pins this namespace, so dropping what it
+    /// holds can never run `NetNamespace::Drop` teardown. A clone held
+    /// across namespace destruction merely delays freeing the cache
+    /// allocation itself — per-ns entries are private to the namespace and
+    /// no registry row is affected.
+    #[inline]
+    pub fn arp_cache(&self) -> Arc<Mutex<ArpCache>> {
+        Arc::clone(&self.arp_cache)
+    }
+
 }
 
 // ============================================================================
@@ -448,6 +506,23 @@ pub fn net_ns_owns_device(ns_id: u64, device_idx: u32) -> bool {
         Some(ns) => ns.has_device(device_idx),
         None => false,
     }
+}
+
+/// D3-NETNS-DATAPLANE: Look up a network namespace by ID.
+///
+/// Returns the root namespace for ID 0, or looks up child namespaces
+/// in the registry. Returns None if the namespace ID is unknown or
+/// the namespace has been destroyed.
+///
+/// # Lock context
+///
+/// Takes NET_NS_BY_ID (read) — a leaf lock. Safe to call from any context.
+pub fn lookup_net_ns(ns_id: u64) -> Option<Arc<NetNamespace>> {
+    if ns_id == 0 {
+        return Some(ROOT_NET_NAMESPACE.clone());
+    }
+    let map = NET_NS_BY_ID.read();
+    map.get(&ns_id).and_then(|weak| weak.upgrade())
 }
 
 /// Move a device from one namespace to another.

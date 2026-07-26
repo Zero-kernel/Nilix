@@ -339,6 +339,10 @@ pub enum DropReason {
     ConntrackExhausted,
     /// A socket-accepted handshake could not finalize its exact conntrack flow.
     ConntrackInvalid,
+    /// D3-NETNS-DATAPLANE: RX namespace is unknown/destroyed (or the kernel
+    /// namespace hooks are not registered yet), so no per-namespace ARP cache
+    /// exists to process the frame against. Fail-closed drop.
+    NetNsUnavailable,
     /// Dropped by firewall
     Firewall {
         rule_id: Option<u32>,
@@ -369,18 +373,20 @@ pub enum DropReason {
 /// * `frame` - Raw Ethernet frame bytes
 /// * `our_mac` - Our MAC address (for filtering and responses)
 /// * `our_ip` - Our IP address (for filtering and responses)
-/// * `arp_cache` - ARP cache for address resolution
 /// * `stats` - Statistics counters
 /// * `net_ns_id` - Network namespace of the receiving device
 /// * `now_ms` - Current time in milliseconds (for rate limiting)
 ///
 /// # Returns
 /// `ProcessResult` indicating what action to take
+///
+/// # D3 NETNS-DATAPLANE-CONFIG: Per-namespace ARP cache
+/// Looks up the namespace's ARP cache using `net_ns_id` instead of accepting
+/// it as a parameter. This implements per-namespace dataplane state.
 pub fn process_frame(
     frame: &[u8],
     our_mac: EthAddr,
     our_ip: Ipv4Addr,
-    arp_cache: &mut ArpCache,
     stats: &NetStats,
     net_ns_id: NamespaceId,
     now_ms: u64,
@@ -418,12 +424,30 @@ pub fn process_frame(
             )
         }
         ETHERTYPE_ARP => {
+            // D3-NETNS-DATAPLANE: resolve the RECEIVING namespace's ARP cache
+            // through the kernel_core hook. Fail-closed: an ARP frame may only
+            // be learned into (and answered from) the cache of a LIVE, resolved
+            // namespace — an unknown/destroyed ns, or a pre-registration RX
+            // (no hook yet), drops the frame rather than touching any shared
+            // cache. The hook returns the cache Arc, never a namespace handle,
+            // so no namespace reference is held across ARP processing.
+            //
+            // liveness at lookup only — see `NetNsDeviceHooks::ns_arp_cache`).
+            let arp_cache = match crate::socket::netns_arp_cache(net_ns_id.0) {
+                Some(cache) => cache,
+                None => {
+                    stats.inc_rx_errors();
+                    return ProcessResult::Dropped(DropReason::NetNsUnavailable);
+                }
+            };
+            let mut arp_cache_guard = arp_cache.lock();
+
             // Process ARP packet
             match process_arp(
                 eth_payload,
                 our_mac,
                 our_ip,
-                arp_cache,
+                &mut arp_cache_guard,
                 &stats.arp_stats,
                 now_ms,
             ) {
@@ -1329,6 +1353,18 @@ pub fn network_config() -> NetConfigSnapshot {
 fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
     let state = net_state();
     let mut cache = state.arp.lock();
+/// holds no lock across its return (see `NetNsDeviceHooks::ns_arp_cache`),
+/// and send paths hold their per-socket locks only while the sending
+/// process pins the namespace, so the hook's internal namespace-handle drop
+/// never runs teardown here.
+///
+/// # Visibility
+///
+/// `pub` as the runtime tests' real-seam observable (Codex round-13: the
+/// routing proof must exercise the ACTUAL resolution path, and frame bytes
+/// stay unobservable until TX-loopback). Capability-safe: this resolves
+/// addressing only — no transmit authority egresses (that is
+/// `tx_auth::AuthorizedTxDevice`). Side effects: seeds the namespace's
 
     // R162-20 FIX: Use actual kernel time for ARP cache TTL checks.
     // Previously hardcoded to 0, causing dynamic entries to never expire.
@@ -1341,6 +1377,9 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
         ArpEntryKind::Static,
         now_ms,
     );
+    match crate::socket::netns_arp_cache(net_ns_id) {
+        Some(cache) => {
+            let mut cache = cache.lock();
 
     // Try direct lookup first
     if let Some(mac) = cache.lookup(dst_ip, now_ms) {
@@ -1526,7 +1565,7 @@ fn build_frame_and_transmit(
         return Err(TxError::LinkDown);
     }
 
-    let dst_mac = resolve_dst_mac(dst_ip, &cfg);
+    // D3-NETNS-DATAPLANE: Pass net_ns_id to use per-namespace ARP cache.
 
     // Build IPv4 header
     let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
@@ -2226,6 +2265,15 @@ fn apply_firewall_verdict(
     }
 }
 
+/// fail-closed `NetNsUnavailable`). Re-resolving the registry per frame would
+/// buy no isolation and add lock churn (Efficiency).
+///
+/// v1 ATTRIBUTION CONTRACT: every registered device is attributed to the ROOT
+/// namespace (ns 0). No inverse device→owner mapping exists in the tree —
+/// `net_ns_owns_device(0, _)` admits root for every device and
+/// `sys_move_net_device` is hard-gated ENOSYS — so root is the only owner any
+/// device can have today. ARMING `move_device` MUST introduce an inverse
+/// ownership lookup (+ generation, so a mid-poll move cannot attribute a frame
 // ============================================================================
 // Timer Maintenance
 // ============================================================================
@@ -2491,18 +2539,9 @@ mod tests {
         let frame =
             try_build_ethernet_frame_from_parts(local_mac, peer_mac, ETHERTYPE_IPV4, &[&ip, &syn])
                 .expect("test ingress frame admission");
-        let mut arp = ArpCache::with_defaults();
         let stats = NetStats::new();
         assert!(matches!(
-            process_frame(
-                &frame,
-                local_mac,
-                local_ip,
-                &mut arp,
-                &stats,
-                NamespaceId(NS),
-                42_000,
-            ),
+            process_frame(&frame, local_mac, local_ip, &stats, NamespaceId(NS), 42_000,),
             ProcessResult::Dropped(DropReason::Firewall { .. })
         ));
 

@@ -452,6 +452,33 @@ pub trait NetNsDeviceHooks: Send + Sync {
     /// Check if namespace ns_id owns device_index.
     /// Returns true iff the device was added to the namespace via add_device or move_device.
     fn ns_owns_device(&self, ns_id: u64, device_index: u32) -> bool;
+
+    /// D3-NETNS-DATAPLANE: Return namespace `ns_id`'s ARP cache, or `None`
+    /// if the namespace is unknown or already destroyed (fail-closed).
+    ///
+    /// Returns the cache Arc (not the namespace) so callers hold no
+    /// namespace reference while processing ARP: dropping the returned Arc
+    /// can never run `NetNamespace::Drop` teardown. The implementation must
+    /// drop any namespace handle it upgrades BEFORE returning, outside any
+    /// registry guard (see kernel_core's `lookup_net_ns` lock contract).
+    ///
+    /// LIVENESS CONTRACT (Codex round-2): `Some` proves the namespace was
+    /// alive AT LOOKUP only. The namespace may be destroyed while the caller
+    /// still holds the cache Arc; the orphaned cache stays memory-safe and
+    /// private (never another namespace's), and in-flight ARP work merely
+    /// completes against it. A future production RX loop that must not emit
+    /// replies for dead namespaces has to pin liveness for the frame's whole
+    /// lifetime or revalidate before emission — that is the Phase I.3
+    /// revocation leg (ownership generation / token pinning), NOT this hook.
+    fn ns_arp_cache(&self, ns_id: u64) -> Option<Arc<Mutex<crate::arp::ArpCache>>>;
+
+    /// Same liveness + lock contract as [`Self::ns_arp_cache`]: the value
+    /// is a `Copy` snapshot taken under the namespace's own config lock and
+    /// returned with no lock held across the return; `Some` proves the
+    /// namespace was alive AT LOOKUP only. A send racing namespace death
+    /// merely completes with the snapshot it acquired — the TX ownership
+    /// gate downstream still denies egress for a namespace that owns no
+    /// device.
 }
 
 static NETNS_DEVICE_HOOKS: spin::Once<&'static dyn NetNsDeviceHooks> = spin::Once::new();
@@ -479,6 +506,31 @@ pub fn netns_owns_device(ns_id: u64, device_index: u32) -> bool {
         Some(hooks) => hooks.ns_owns_device(ns_id, device_index),
         None => ns_id == 0,
     }
+}
+
+/// D3-NETNS-DATAPLANE: Resolve namespace `ns_id`'s ARP cache through the
+/// registered hook (used by stack.rs for RX ARP processing and TX MAC
+/// resolution).
+///
+/// Fail-closed contract:
+/// - Hook registered + live namespace => that namespace's cache.
+/// - Hook registered + unknown/destroyed namespace => `None`.
+/// - Hook unregistered (early boot / host tests) => `None`; callers decide
+///   their own pre-registration fallback via
+///   [`netns_device_hooks_registered`] (the TX path falls back to the global
+///   root cache; the RX ARP path drops the frame).
+#[inline]
+pub fn netns_arp_cache(ns_id: u64) -> Option<Arc<Mutex<crate::arp::ArpCache>>> {
+    netns_device_hooks().and_then(|hooks| hooks.ns_arp_cache(ns_id))
+}
+
+/// D3-NETNS-DATAPLANE: Whether the kernel_core namespace hooks are live.
+///
+/// Lets callers distinguish "namespace lookup failed" (fail-closed) from
+/// "pre-registration window" (early boot / host tests, root-only traffic).
+#[inline]
+pub fn netns_device_hooks_registered() -> bool {
+    NETNS_DEVICE_HOOKS.get().is_some()
 }
 
 /// Resolve the current task's cgroup id for a port charge, or 0 (root / exempt)

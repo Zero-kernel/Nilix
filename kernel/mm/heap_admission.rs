@@ -71,9 +71,19 @@ pub enum HeapClass {
     /// timed-wait registry.  This class mirrors the named 128 KiB futex floor
     /// so hostile futex churn cannot consume Scheduler admission.
     Futex = 14,
+    /// D3-NETNS-DATAPLANE: Per-namespace network configuration state.
+    /// Includes per-ns ARP cache, routing tables, and dataplane metadata.
+    /// 512 KiB ceiling allows ~256 ARP entries + routing state per namespace.
+    /// NOTE (Codex round-2): the ceiling is CLASS-GLOBAL — all namespaces
+    /// share it, bounded per-ns only by each structure's own cap (e.g. the
+    /// 256-entry ARP cache). Per-namespace sub-accounting is a Phase I.3
+    /// leg; until then heavy population of many namespaces can cause
+    /// cross-ns admission failures inside this class (fail-closed, no
+    /// spillover into other classes).
+    NetnsConfig = 15,
 }
 
-pub const HEAP_CLASS_COUNT: usize = 15;
+pub const HEAP_CLASS_COUNT: usize = 16;
 
 impl HeapClass {
     /// D1-RES: authoritative class table for exhaustive boundary tests and
@@ -95,6 +105,7 @@ impl HeapClass {
         Self::Device,
         Self::FilesystemIo,
         Self::Futex,
+        Self::NetnsConfig,
     ];
 
     #[inline]
@@ -134,6 +145,10 @@ impl HeapClass {
             // allocator capacity rounding; validation is smaller and disjoint.
             Self::FilesystemIo => 352 * 1024,
             Self::Futex => 128 * 1024,
+            // D3-NETNS-DATAPLANE: Per-namespace dataplane state.
+            // 512 KiB supports ~256 ARP entries (28 bytes each) + routing tables
+            // + per-ns firewall metadata + allocator slack.
+            Self::NetnsConfig => 512 * 1024,
         }
     }
 }
@@ -184,6 +199,7 @@ static GLOBAL_STATE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static TEST_LEDGER_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static CLASS_STATES: [AtomicU64; HEAP_CLASS_COUNT] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

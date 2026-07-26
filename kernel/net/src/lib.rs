@@ -568,3 +568,41 @@ pub fn init(iommu_required: bool) -> usize {
 
     registered
 }
+
+// ============================================================================
+// D3-NETNS-DATAPLANE: RX Ingress Lifecycle Contract
+// ============================================================================
+
+///    OR revalidate before emitting replies. The current `ns_arp_cache` hook
+///    contract proves liveness AT LOOKUP only — a namespace may be destroyed
+///    while RX processing still holds its cache Arc. An orphaned cache stays
+///    memory-safe and never becomes another namespace's, so ARP learning/reply
+///    generation complete without unsafety. A loop that must not emit replies
+///    for destroyed namespaces has two options:
+///    - Hold a namespace `Arc<NetNamespace>` (upgraded from the registry's
+///      Weak, proving liveness) for the frame's entire lifetime, OR
+///    - Revalidate liveness immediately before calling the driver's `transmit`
+///      (drop the reply if the lookup now fails).
+///
+/// The current RX surface (`process_frame` in runtime_tests.rs boot tests)
+/// satisfies #1 trivially — hook registration precedes the test suite. It does
+/// NOT satisfy #2, but that is safe because the boot-test namespaces are torn
+/// down synchronously at the end of each test leg with no concurrent RX, so no
+/// frame can be in-flight when a namespace drops. A FUTURE concurrent RX loop
+/// (IRQ-driven or polling) wired for multi-namespace traffic must implement one
+/// of the #2 strategies above.
+///
+/// **Why this contract exists:**
+/// - Without #1, `process_frame`'s ARP arm would call `ns_arp_cache(ns_id)`
+///   before the hook is registered → `None` → `NetNsUnavailable` drop for ALL
+///   frames (including root-ns ARP) until userspace starts. The boot-time hook
+///   registration (kernel_core::init, line ~377) closes that window.
+/// - Without #2, a reply ARP packet could be emitted "from" a namespace that
+///   was destroyed between learning and transmission. The packet itself is
+///   memory-safe (its cache Arc is private, never another ns's), but its source
+///   IP/namespace attribution would be stale. Whether that is acceptable depends
+///   on the system's revocation semantics (best-effort vs strict).
+///
+/// This function enforces #1 at the call site; #2 is a future RX-loop
+/// implementation obligation documented here for when that loop is wired.
+#[inline]

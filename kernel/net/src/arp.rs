@@ -218,12 +218,23 @@ pub struct ArpCache {
 
 impl ArpCache {
     /// Create a new ARP cache with specified TTL and capacity.
+    ///
+    /// Entries are heap-admitted to `HeapClass::SocketObject` (the global
+    /// cache's class). Per-namespace caches use [`Self::new_in_class`] with
+    /// `HeapClass::NetnsConfig` so per-ns dataplane state is accounted
+    /// against the per-ns config ceiling, not the socket budget.
     pub fn new(ttl_ms: u64, max_entries: usize) -> Self {
+        Self::new_in_class(ttl_ms, max_entries, HeapClass::SocketObject)
+    }
+
+    /// D3-NETNS-DATAPLANE: Create a new ARP cache whose entry storage is
+    /// heap-admitted to `class`.
+    pub fn new_in_class(ttl_ms: u64, max_entries: usize, class: HeapClass) -> Self {
         ArpCache {
             // RF180-41 REVIEW FIX: the declared maximum is the truthful
             // logical limit. Backing grows only through fallible aggregate
             // admission; there is no hidden 64-entry infallible prefix.
-            entries: AdmittedVec::new(HeapClass::SocketObject),
+            entries: AdmittedVec::new(class),
             ttl_ms,
             max_entries,
             // R102-12 FIX: Per-interface rate limiters with same defaults as global.
@@ -235,6 +246,12 @@ impl ArpCache {
     /// Create a cache with default settings (5 min TTL, 256 entries).
     pub fn with_defaults() -> Self {
         Self::new(DEFAULT_CACHE_TTL_MS, DEFAULT_CACHE_MAX_ENTRIES)
+    }
+
+    /// D3-NETNS-DATAPLANE: Default-sized cache heap-admitted to `class`
+    /// (per-namespace caches charge `HeapClass::NetnsConfig`).
+    pub fn with_defaults_in_class(class: HeapClass) -> Self {
+        Self::new_in_class(DEFAULT_CACHE_TTL_MS, DEFAULT_CACHE_MAX_ENTRIES, class)
     }
 
     /// Look up a MAC address for the given IP.

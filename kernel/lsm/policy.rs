@@ -459,6 +459,30 @@ pub trait LsmPolicy: Send + Sync {
         Ok(())
     }
 
+    /// D3 NETNS-DATAPLANE-CONFIG: Called when a network device is moved between namespaces.
+    ///
+    /// Device reassignment affects network isolation boundaries. The caller
+    /// must hold CAP_NET_ADMIN in both source and target namespaces (checked
+    /// by the kernel before this hook), but policies can impose additional
+    /// restrictions (e.g., deny moves from specific namespaces, require
+    /// explicit device allowlists).
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - Process attempting the move
+    /// * `device_idx` - Network device index being moved
+    /// * `from_ns_id` - Source network namespace ID
+    /// * `to_ns_id` - Destination network namespace ID
+    fn net_device_move(
+        &self,
+        task: &ProcessCtx,
+        device_idx: u32,
+        from_ns_id: u64,
+        to_ns_id: u64,
+    ) -> LsmResult {
+        Ok(())
+    }
+
     // ========================================================================
     // Livepatch Hooks (R102-13)
     // ========================================================================

@@ -1351,6 +1351,31 @@ impl net::NetNsDeviceHooks for KernelNetNsDeviceHooks {
     fn ns_owns_device(&self, ns_id: u64, device_index: u32) -> bool {
         crate::net_namespace::net_ns_owns_device(ns_id, device_index)
     }
+
+    /// D3-NETNS-DATAPLANE: hand the net crate namespace `ns_id`'s ARP cache.
+    ///
+    /// Unknown/destroyed namespace => `None` (fail-closed at the net-side
+    /// callers: RX ARP drops, TX resolves to gateway only).
+    ///
+    /// Lock safety: `lookup_net_ns` releases the NET_NS_BY_ID read guard
+    /// before returning, and the upgraded namespace Arc is dropped HERE,
+    /// inside the closure — before this method returns. If that drop is the
+    /// last reference, `NetNamespace::Drop` (NET_NS_BY_ID.write + net-crate
+    /// leaf-lock drains) runs with no registry guard held; net-side callers
+    /// invoke this hook before taking any ARP-cache lock, and TX send paths
+    /// hold per-socket locks only while a live sending process pins the
+    /// namespace (never the last reference) — the same envelope as
+    /// `net_ns_owns_device` above.
+    fn ns_arp_cache(
+        &self,
+        ns_id: u64,
+    ) -> Option<alloc::sync::Arc<spin::Mutex<net::arp::ArpCache>>> {
+        crate::net_namespace::lookup_net_ns(ns_id).map(|ns| ns.arp_cache())
+    }
+
+    /// as `ns_arp_cache` above.
+        crate::net_namespace::lookup_net_ns(ns_id).and_then(|ns| ns.net_config())
+    }
 }
 
 /// Static instance of KernelNetNsDeviceHooks for registration.
@@ -3764,6 +3789,9 @@ pub fn syscall_dispatcher(
             arg2 as *const *const u8,
             arg3 as *const *const u8,
         ),
+
+        // D3 NETNS-DATAPLANE-CONFIG: Move network device between namespaces
+        518 => sys_move_net_device(arg0 as u32, arg1 as i32),
 
         // G.3 Compliance syscalls (Zero-OS specific, 505-508)
         505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
@@ -8948,6 +8976,179 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
             parent_id,
         },
         &[308, fd as u64, old_ns_id], // syscall 308 = setns, fd, old_ns_id
+        0,
+        crate::time::current_timestamp_ms(),
+    );
+
+    Ok(0)
+}
+
+/// D3 NETNS-DATAPLANE-CONFIG: Move a network device between namespaces.
+///
+/// **HARD-GATED ENOSYS (2026-07-25, Codex round-2 finding):** the body below
+/// is INCOMPLETE and is now explicitly disabled at the top of the function
+/// rather than "unreachable by convention". Previously the only barrier was
+/// that no `NetNamespaceFd` construction path exists (fd resolution always
+/// fails EBADF) — but that is a property of TODAY's tree; the first commit
+/// that constructs a `NetNamespaceFd` (e.g. wiring /proc/[pid]/ns/net) would
+/// have silently armed this path with its known gaps. The explicit gate makes
+/// un-arming a deliberate act tied to closing the blockers:
+/// 1. No NetNamespaceFd construction path exists (fd resolution always fails EBADF)
+/// 2. Root namespace device set is never seeded (can't move devices OUT of root)
+/// 3. move_device() checks global CAP_ADMIN once, not per-namespace CAP_NET_ADMIN
+/// 4. TX authorization revocation protocol not implemented (ownership generation deferred)
+/// 5. Namespace Drop doesn't re-home devices (orphaning risk)
+///
+/// See D3 NETNS-DATAPLANE-CONFIG in plan v15.41 for full Phase I.3 requirements.
+/// Adversarial review findings: 1 UNSAFE + 4 INCOMPLETE (2026-07-25).
+///
+/// Reassigns ownership of a network device from the current process's network
+/// namespace to a target namespace identified by a file descriptor.
+///
+/// # Arguments
+///
+/// * `device_idx` - Network device index (from ifconfig or ip link)
+/// * `target_netns_fd` - File descriptor referencing the target NetNamespace
+///
+/// # Returns
+///
+/// ENOSYS unconditionally until the Phase I.3 blockers above are closed.
+/// Design-target errno contract once armed:
+/// - EBADF: `target_netns_fd` is invalid or not a network namespace fd
+/// - EPERM: Missing CAP_NET_ADMIN in source or target namespace
+/// - ENODEV: Device not found or not owned by current namespace
+/// - EINVAL: Source and target namespaces are the same
+/// - EBUSY: Device is in use and cannot be moved
+///
+/// # Security
+///
+/// DOCUMENTED (not yet enforced): Requires CAP_NET_ADMIN in BOTH source and target namespaces.
+/// ACTUAL: Checks global CAP_ADMIN once via move_device() (isolation gap).
+/// LSM policies may impose additional restrictions.
+///
+/// # Safety
+///
+/// The device ownership transfer has a bounded in-flight window: one transmit
+/// call may reach the driver queue after the move completes. Strong drain
+/// semantics are not implemented (would require per-device ownership
+/// generation synchronized with driver enqueue).
+fn sys_move_net_device(device_idx: u32, target_netns_fd: i32) -> SyscallResult {
+    // D3 NETNS-DATAPLANE-CONFIG hard gate: the implementation below has a
+    // known per-ns capability-model gap (blocker 3) and no revocation
+    // protocol (blocker 4). Fail-closed with ENOSYS until Phase I.3 closes
+    // them. Arming this syscall = flipping the const AFTER closing blockers
+    // 2-5 above — a deliberate, reviewable act, not a side effect of adding
+    // the first NetNamespaceFd constructor.
+    const MOVE_NET_DEVICE_ARMED: bool = false;
+    if !MOVE_NET_DEVICE_ARMED {
+        return Err(SyscallError::ENOSYS);
+    }
+
+    // Get current process and validate single-threaded
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Network namespace operations require single-threaded process
+    // (same constraint as setns - prevents thread-local divergence)
+    let tgid = {
+        let proc = proc_arc.lock();
+        proc.tgid
+    };
+    let thread_count = crate::thread_group_size(tgid);
+    if thread_count > 1 {
+        kprintln!(
+            "[sys_move_net_device] Denied: thread group has {} threads (must be 1)",
+            thread_count
+        );
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Get current (source) network namespace
+    let source_ns = {
+        let proc = proc_arc.lock();
+        proc.net_ns.clone()
+    };
+
+    // Resolve target namespace from fd
+    let target_ns = {
+        let proc = proc_arc.lock();
+        let fd_entry = proc.get_fd(target_netns_fd).ok_or(SyscallError::EBADF)?;
+        if let Some(ns_fd) = fd_entry
+            .as_any()
+            .downcast_ref::<crate::net_namespace::NetNamespaceFd>()
+        {
+            ns_fd.namespace()
+        } else {
+            kprintln!(
+                "[sys_move_net_device] fd {} is not a network namespace fd",
+                target_netns_fd
+            );
+            return Err(SyscallError::EBADF);
+        }
+    };
+
+    // Reject no-op moves
+    if source_ns.id() == target_ns.id() {
+        kprintln!(
+            "[sys_move_net_device] Source and target are the same namespace (id={})",
+            source_ns.id().raw()
+        );
+        return Err(SyscallError::EINVAL);
+    }
+
+    // LSM hook: gate device reassignment (after validation, before mutation)
+    {
+        let ctx = {
+            let proc = proc_arc.lock();
+            lsm_process_ctx_from(&proc)
+        };
+        if lsm::hook_net_device_move(&ctx, device_idx, source_ns.id().raw(), target_ns.id().raw())
+            .is_err()
+        {
+            kprintln!(
+                "[sys_move_net_device] LSM denied device {} move from ns {} to ns {}",
+                device_idx,
+                source_ns.id().raw(),
+                target_ns.id().raw()
+            );
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    klog!(
+        Info,
+        "[sys_move_net_device] Process {} moving device {} from ns {} (level {}) to ns {} (level {})",
+        pid,
+        device_idx,
+        source_ns.id().raw(),
+        source_ns.level(),
+        target_ns.id().raw(),
+        target_ns.level()
+    );
+
+    // Perform the device move (checks CAP_NET_ADMIN internally)
+    crate::net_namespace::move_device(device_idx, &source_ns, &target_ns).map_err(|e| {
+        kprintln!("[sys_move_net_device] move_device failed: {:?}", e);
+        match e {
+            crate::net_namespace::NetNsError::DeviceNotFound => SyscallError::ENXIO,
+            crate::net_namespace::NetNsError::DeviceExists => SyscallError::EBUSY,
+            crate::net_namespace::NetNsError::PermissionDenied => SyscallError::EPERM,
+            _ => SyscallError::EINVAL,
+        }
+    })?;
+
+    // Audit: Device reassignment (security-relevant boundary change)
+    let _ = audit::emit(
+        AuditKind::Network,
+        AuditOutcome::Success,
+        get_audit_subject(),
+        AuditObject::None,
+        &[
+            518,
+            device_idx as u64,
+            source_ns.id().raw(),
+            target_ns.id().raw(),
+        ],
         0,
         crate::time::current_timestamp_ms(),
     );
