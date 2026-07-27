@@ -185,8 +185,9 @@ impl NetStats {
 // Packet Processing Result
 // ============================================================================
 
-/// A complete ingress-generated frame whose policy decision and conntrack
-/// publication remain bound to the eventual device-queue operation.
+/// A complete prepared egress frame whose policy decision and conntrack
+/// publication remain bound to the eventual device-queue operation. This is
+/// used by both ingress-generated replies and outbound frames parked on ARP.
 ///
 /// The type is intentionally non-cloneable and does not expose its owned
 /// `WirePacket`. Callers may inspect the bytes, but must consume the owner with
@@ -198,7 +199,19 @@ pub struct PreparedReply {
     stat: PreparedReplyStat,
     reject_count: u8,
     retry_not_before_ms: u64,
+    egress_class: PreparedEgressClass,
     deferred_ct: DeferredCt,
+}
+
+/// Firewall semantics for the final prepared-frame policy recheck.
+///
+/// Ingress-generated replies use the reply-only ESTABLISHED/RELATED floor.
+/// Frames parked by direct egress remain outbound data and must retain the
+/// direct path's NEW/lookup classification when policy is rechecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedEgressClass {
+    IngressReply,
+    DeferredOutbound,
 }
 
 /// D3 PENDING-FRAME v2: which egress conntrack transaction was DEFERRED when
@@ -237,8 +250,15 @@ impl PreparedReply {
             stat: PreparedReplyStat::None,
             reject_count: 0,
             retry_not_before_ms: 0,
+            egress_class: PreparedEgressClass::IngressReply,
             deferred_ct: DeferredCt::None,
         }
+    }
+
+    /// Preserve direct-egress firewall semantics across an ARP-miss park.
+    fn with_deferred_outbound(mut self) -> Self {
+        self.egress_class = PreparedEgressClass::DeferredOutbound;
+        self
     }
 
     /// D3 PENDING-FRAME v2: mark this parked UDP data frame's conntrack
@@ -521,8 +541,9 @@ pub fn process_frame(
     // firewall before allowing the frame to leave. Frames that fail the egress check are
     // silently dropped so the caller sees Dropped(Firewall) instead of Reply.
     if let ProcessResult::Reply(ref mut reply_frame) = result {
+        let egress_class = reply_frame.egress_class;
         if !matches!(
-            egress_firewall_allows_reply(reply_frame, net_ns_id.0, now_ms),
+            egress_firewall_allows_prepared(reply_frame, net_ns_id.0, now_ms, egress_class),
             EgressFirewallDecision::Allow
         ) {
             return ProcessResult::Dropped(DropReason::Firewall {
@@ -594,7 +615,50 @@ enum EgressFirewallDecision {
     Malformed,
 }
 
-/// R163-7 FIX: Evaluate an outbound reply frame against the egress firewall.
+#[cfg(feature = "conntrack")]
+fn egress_ct_decision(
+    net_ns_id: u64,
+    proto: Ipv4Proto,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    egress_class: PreparedEgressClass,
+) -> Option<crate::conntrack::CtDecision> {
+    use crate::conntrack::{conntrack_table, CtDecision, FlowKey};
+
+    let proto_u8 = match proto {
+        Ipv4Proto::Tcp => 6u8,
+        Ipv4Proto::Udp => 17u8,
+        Ipv4Proto::Icmp => 1u8,
+        _ => 0u8,
+    };
+    let (key, _) = FlowKey::from_packet(
+        net_ns_id,
+        proto_u8,
+        src_ip,
+        dst_ip,
+        src_port.unwrap_or(0),
+        dst_port.unwrap_or(0),
+    );
+    let entry = conntrack_table().lookup(&key);
+
+    match egress_class {
+        PreparedEgressClass::IngressReply => Some(match entry {
+            Some(_) => CtDecision::Established,
+            None => CtDecision::Related,
+        }),
+        PreparedEgressClass::DeferredOutbound => entry.map(|entry| {
+            if entry.seen_reply {
+                CtDecision::Established
+            } else {
+                CtDecision::New
+            }
+        }),
+    }
+}
+
+/// R163-7 FIX: Evaluate a prepared frame against the egress firewall.
 ///
 /// Parses the complete Ethernet+IPv4 frame, extracts protocol/port information,
 /// and evaluates the egress firewall rules for the given namespace. Returns
@@ -604,13 +668,12 @@ enum EgressFirewallDecision {
 /// ARP frames (non-IPv4) are always allowed because ARP has no IP-level firewall
 /// semantics. Malformed kernel-generated frames fail closed.
 #[cfg(feature = "conntrack")]
-fn egress_firewall_allows_reply(
+fn egress_firewall_allows_prepared(
     frame: &[u8],
     net_ns_id: u64,
     now_ms: u64,
+    egress_class: PreparedEgressClass,
 ) -> EgressFirewallDecision {
-    use crate::conntrack::{conntrack_table, FlowKey};
-
     // Parse Ethernet header; non-IPv4 frames (ARP, etc.) are passed through.
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
         Ok(r) => r,
@@ -637,32 +700,20 @@ fn egress_firewall_allows_reply(
     };
     let (src_port, dst_port) = transport.ports();
 
-    // R165-7 FIX: This hook only evaluates kernel-generated reply frames
-    // (ProcessResult::Reply — ICMP echo replies, TCP RSTs, REJECT responses),
-    // i.e. responses to a just-received ingress packet. Such a frame must never
-    // be classified `New`. In particular an ICMP echo reply cannot share a
-    // FlowKey with its request (the type/code pseudo-ports differ: request 0x800
-    // vs reply 0x000) and this lookup does not reconstruct ICMP pseudo-ports, so
-    // the naive lookup returns `New` and the default ruleset silently drops the
-    // host's own ping reply. Treat any found flow as Established, and floor an
-    // unmatched reply to Related, so the default accept-ESTABLISHED/RELATED rule
-    // permits legitimate replies. Operators can still drop these with an explicit
-    // higher-priority egress rule (evaluated before the default accept rule).
-    let ct_decision = {
-        let sp = src_port.unwrap_or(0);
-        let dp = dst_port.unwrap_or(0);
-        let proto_u8 = match proto {
-            Ipv4Proto::Tcp => 6u8,
-            Ipv4Proto::Udp => 17u8,
-            Ipv4Proto::Icmp => 1u8,
-            _ => 0u8,
-        };
-        let (key, _) = FlowKey::from_packet(net_ns_id, proto_u8, ip_hdr.src, ip_hdr.dst, sp, dp);
-        Some(match conntrack_table().lookup(&key) {
-            Some(_) => crate::conntrack::CtDecision::Established,
-            None => crate::conntrack::CtDecision::Related,
-        })
-    };
+    // R165-7 FIX: ingress replies must never be classified `New`; an unmatched
+    // reply floors to Related so default policy can admit legitimate responses.
+    // Parked outbound data is different: policy may have changed while ARP was
+    // unresolved, so it retains the direct path's actual NEW/lookup result and
+    // cannot inherit the reply-only Related floor.
+    let ct_decision = egress_ct_decision(
+        net_ns_id,
+        proto,
+        ip_hdr.src,
+        ip_hdr.dst,
+        src_port,
+        dst_port,
+        egress_class,
+    );
 
     let fw_pkt = FirewallPacket {
         net_ns_id,
@@ -684,8 +735,8 @@ fn egress_firewall_allows_reply(
     }
 }
 
-/// R165-6 FIX: Evaluate STATELESS egress rules on reply frames in non-conntrack
-/// builds instead of bypassing the firewall entirely.
+/// R165-6 FIX: Evaluate STATELESS egress rules on prepared frames in
+/// non-conntrack builds instead of bypassing the firewall entirely.
 ///
 /// The previous non-conntrack variant returned `true` unconditionally, so a
 /// stateless egress DROP/REJECT rule (src/dst IP, port, proto — all evaluable
@@ -693,15 +744,17 @@ fn egress_firewall_allows_reply(
 /// rules) was enforced on the TX path (R164-7) but silently bypassed for every
 /// locally-generated reply frame (ICMP echo replies, TCP RSTs, REJECT responses).
 /// This mirrors the conntrack variant's parse+evaluate path with `ct_state: None`,
-/// closing the asymmetric-enforcement gap.
+/// closing the asymmetric-enforcement gap; parked outbound data takes the same
+/// stateless path because no conntrack classification exists in this build.
 ///
 /// Non-IPv4 (ARP, etc.) passes through; malformed generated frames fail closed, matching
 /// the conntrack variant's behavior for kernel-generated replies.
 #[cfg(not(feature = "conntrack"))]
-fn egress_firewall_allows_reply(
+fn egress_firewall_allows_prepared(
     frame: &[u8],
     net_ns_id: u64,
     now_ms: u64,
+    _egress_class: PreparedEgressClass,
 ) -> EgressFirewallDecision {
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
         Ok(r) => r,
@@ -1113,7 +1166,7 @@ fn process_icmp(
         // matched the request flow (0x800) and always carried seen_reply=false,
         // so the egress reply firewall still saw it as `New`. The reply path now
         // floors kernel-generated replies to Related/Established in
-        // egress_firewall_allows_reply, which is what actually lets the default
+        // egress_firewall_allows_prepared, which is what actually lets the default
         // ESTABLISHED/RELATED accept rule pass legitimate ping replies. Seeding a
         // bogus half-open flow served no purpose and only polluted the table.
 
@@ -1842,33 +1895,18 @@ fn build_frame_and_transmit(
     // downstream consumer (RF180-41).
     let cfg_pre = tx_net_config(net_ns_id)?;
 
-    // Conntrack-aware ct_state lookup (only with conntrack feature).
+    // Conntrack-aware ct_state lookup (only with conntrack feature). Keep this
+    // coupled to prepared-frame rechecks through one classifier.
     #[cfg(feature = "conntrack")]
-    let ct_decision = {
-        let sp = src_port.unwrap_or(0);
-        let dp = dst_port.unwrap_or(0);
-        let proto_u8 = match proto {
-            Ipv4Proto::Tcp => 6u8,
-            Ipv4Proto::Udp => 17u8,
-            Ipv4Proto::Icmp => 1u8,
-            _ => 0u8,
-        };
-        let (key, _) = crate::conntrack::FlowKey::from_packet(
-            net_ns_id,
-            proto_u8,
-            cfg_pre.our_ip,
-            dst_ip,
-            sp,
-            dp,
-        );
-        crate::conntrack::conntrack_table().lookup(&key).map(|e| {
-            if e.seen_reply {
-                crate::conntrack::CtDecision::Established
-            } else {
-                crate::conntrack::CtDecision::New
-            }
-        })
-    };
+    let ct_decision = egress_ct_decision(
+        net_ns_id,
+        proto,
+        cfg_pre.our_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        PreparedEgressClass::DeferredOutbound,
+    );
     #[cfg(not(feature = "conntrack"))]
     let ct_decision: Option<crate::conntrack::CtDecision> = None;
 
@@ -2061,8 +2099,8 @@ fn build_frame_and_transmit(
     }
 }
 
-/// Queue an ingress-generated reply and commit all state that depends on that
-/// queue acceptance.
+/// Queue a prepared frame and commit all state that depends on that queue
+/// acceptance.
 ///
 /// RF180-41 REVIEW FIX: `process_frame` performs an initial egress-policy check
 /// but does not claim that the returned frame was sent. This consuming API
@@ -2079,7 +2117,7 @@ fn preflight_prepared_reply(reply: &PreparedReply, now_ms: u64) -> Result<u64, T
     if reply.is_empty() || reply.len() > DMA_PAGE_SIZE {
         return Err(TxError::InvalidBuffer);
     }
-    match egress_firewall_allows_reply(reply, net_ns_id, now_ms) {
+    match egress_firewall_allows_prepared(reply, net_ns_id, now_ms, reply.egress_class) {
         EgressFirewallDecision::Allow => {}
         EgressFirewallDecision::Deny => return Err(TxError::FirewallDenied),
         EgressFirewallDecision::Malformed => return Err(TxError::InvalidBuffer),
@@ -2087,8 +2125,8 @@ fn preflight_prepared_reply(reply: &PreparedReply, now_ms: u64) -> Result<u64, T
     Ok(net_ns_id)
 }
 
-/// Queue an ingress-generated reply and commit conntrack/socket state only
-/// after the device accepts that exact admitted owner.
+/// Queue a prepared frame and commit conntrack/socket state only after the
+/// device accepts that exact admitted owner.
 ///
 /// On any policy, preparation, or queue error, returns the original owner so
 /// the caller may retry without reconstructing or duplicating the frame.
@@ -2243,7 +2281,7 @@ fn park_on_link_miss(
     )
     .map_err(|_| TxError::NoMemory)?;
 
-    let mut reply = PreparedReply::new(frame);
+    let mut reply = PreparedReply::new(frame).with_deferred_outbound();
     reply.authorize(net_ns_id, now_ms);
     if proto == Ipv4Proto::Udp {
         // Defer the direct path's ct_egress_udp coupling to queue-accept.
@@ -3694,7 +3732,14 @@ fn rx_ingress_poll_locked(now_ms: u64, budget: usize, filter: Option<&[&str]>) -
     // inside the loop above), and the drain takes the cache mutex only in
     // bounded lookup/move-out windows — reply TX inside it resolves its own
     // authority exactly like the Reply arm above.
-    drain_parked_ready(0, now_ms);
+    //
+    // Clock-domain invariant: parking and probe admission use the trusted
+    // socket clock. Explicit RX test polls may use a synthetic monotonic ARP
+    // clock, so forwarding `now_ms` here could instantly expire real-clock
+    // parked frames. Production polls already pass this same trusted clock;
+    // the fallback preserves host-test behavior before hook registration.
+    let pending_now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(now_ms);
+    drain_parked_ready(0, pending_now_ms);
     if remaining == 0 {
         RX_INGRESS_STATS
             .budget_exhausted

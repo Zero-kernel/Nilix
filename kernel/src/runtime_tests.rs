@@ -5756,12 +5756,31 @@ impl RuntimeTest for NetNsRxPoolLifecycleTest {
 /// across suite passes (pass 2 of one test regressing below pass 1's usage
 /// of the other → fail-closed rate-limit drops); one allocator hands out
 /// strictly increasing 60_000 ms stripes in DRAW order, registration-
-/// agnostic. Each drawer may claim at most [base, base + 59_999].
+/// agnostic. The first stripe is also anchored at current boot time so a
+/// long-running kernel cannot make a synthetic learn immediately stale to a
+/// real-clock pending drain. Each drawer may claim at most
+/// [base, base + 59_999].
 static ARP_TEST_CLOCK_BASE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(480_000);
 
 fn alloc_arp_test_clock_window() -> u64 {
-    ARP_TEST_CLOCK_BASE.fetch_add(60_000, core::sync::atomic::Ordering::Relaxed)
+    use core::sync::atomic::Ordering;
+
+    let real_floor = kernel_core::time::get_ticks();
+    let mut observed = ARP_TEST_CLOCK_BASE.load(Ordering::Relaxed);
+    loop {
+        let base = observed.max(real_floor);
+        let next = base.saturating_add(60_000);
+        match ARP_TEST_CLOCK_BASE.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return base,
+            Err(current) => observed = current,
+        }
+    }
 }
 
 /// RAII cleanup: a learned probe-target entry must not outlive its test.
@@ -5778,6 +5797,22 @@ impl Drop for RootArpDynamicCleanup {
         if let Some(ns) = kernel_core::net_namespace::lookup_net_ns(0) {
             ns.arp_cache().lock().remove_dynamic(self.ip);
         }
+    }
+}
+
+/// Keep the root pending-frame fixture repeatable within one boot. Callers
+/// hold the RX-background quiesce guard, so advancing one explicit drain past
+/// the TTL can only retire frames left by runtime-test sends.
+struct RootPendingFrameCleanup;
+
+fn expire_root_pending_test_frames() {
+    let expire_at = kernel_core::time::get_ticks().saturating_add(net::PENDING_FRAME_TTL_MS);
+    let _ = net::drain_parked_ready(0, expire_at);
+}
+
+impl Drop for RootPendingFrameCleanup {
+    fn drop(&mut self) {
+        expire_root_pending_test_frames();
     }
 }
 
@@ -6085,6 +6120,9 @@ impl RuntimeTest for NetNsArpProbeTxTest {
             ));
         }
 
+        expire_root_pending_test_frames();
+        let _pending_cleanup = RootPendingFrameCleanup;
+
         // On-link fixture targets: our_ip with a swapped last octet (the
         // ingress test's derivation), collision-dodged against our own and
         // the gateway's addresses. Per-pass-fresh for the single-probe legs.
@@ -6326,17 +6364,52 @@ impl RuntimeTest for NetNsArpProbeTxTest {
             return TestResult::Fail(String::from("leg D: ARP reply frame admission failed"));
         }
         shared.lock().frames.push_back(reply.to_vec());
-        let now_ms = kernel_core::time::get_ticks();
-        let processed = net::rx_ingress_poll_filtered(now_ms, 8, &["rxtest0"]);
+        // Shared ARP RX buckets were advanced by earlier fixed-clock tests;
+        // their fail-closed monotonic contract rejects real boot ticks here.
+        // The ingress drain independently uses the canonical parking clock.
+        let root_retx_before = match kernel_core::net_namespace::lookup_net_ns(0) {
+            Some(ns) => ns.arp_cache().lock().pending_frame_counters().retransmitted,
+            None => return TestResult::Fail(String::from("leg D: ROOT namespace disappeared")),
+        };
+        let (sent_before_learn, _, _, _) = probe_counters();
+        let arp_now_ms = alloc_arp_test_clock_window();
+        let processed = net::rx_ingress_poll_filtered(arp_now_ms, 8, &["rxtest0"]);
         if processed != 1 {
             return TestResult::Fail(alloc::format!(
                 "leg D: exactly the planted reply must process, got {}",
                 processed
             ));
         }
-        if NetNsRxIngressTest::root_lookup(target, now_ms) != Some(neighbor_mac) {
+        if NetNsRxIngressTest::root_lookup(target, arp_now_ms) != Some(neighbor_mac) {
             return TestResult::Fail(String::from(
                 "leg D: the planted reply must learn into the ROOT cache",
+            ));
+        }
+        let s3 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        let root_retx_after = match kernel_core::net_namespace::lookup_net_ns(0) {
+            Some(ns) => ns.arp_cache().lock().pending_frame_counters().retransmitted,
+            None => return TestResult::Fail(String::from("leg D: ROOT namespace disappeared")),
+        };
+        if root_retx_after != root_retx_before.saturating_add(2) {
+            return TestResult::Fail(alloc::format!(
+                "leg D: learning must retransmit both parked frames (retransmitted {}->{})",
+                root_retx_before,
+                root_retx_after
+            ));
+        }
+        let (sent_after_learn, _, _, _) = probe_counters();
+        let expected_enqueues = 2 + sent_after_learn.saturating_sub(sent_before_learn) as i64;
+        if NetNsRxIngressTest::enq_delta(&s2, &s3) != expected_enqueues {
+            return TestResult::Fail(alloc::format!(
+                "leg D: wire ledger must contain two retransmits plus re-probes \
+                 (enq_delta {}, expected {}, probes_sent {}->{})",
+                NetNsRxIngressTest::enq_delta(&s2, &s3),
+                expected_enqueues,
+                sent_before_learn,
+                sent_after_learn
             ));
         }
         match net::resolve_dst_mac(target, &cfg, 0) {
@@ -6367,10 +6440,10 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 dup4
             ));
         }
-        if NetNsRxIngressTest::enq_delta(&s2, &s4) != 2 {
+        if NetNsRxIngressTest::enq_delta(&s3, &s4) != 1 {
             return TestResult::Fail(alloc::format!(
-                "leg D: the learned reply must pop BOTH parked frames (enq_delta {})",
-                NetNsRxIngressTest::enq_delta(&s2, &s4)
+                "leg D: the cache-hit send must enqueue exactly once (enq_delta {})",
+                NetNsRxIngressTest::enq_delta(&s3, &s4)
             ));
         }
 
@@ -6463,9 +6536,9 @@ impl RuntimeTest for NetNsArpProbeTxTest {
 /// expiry, eviction, reconfig flush, ownership-denied no-park, counter
 /// conservation, ResolvedLate hit.
 ///
-/// Architecture: allocate a child namespace, plant test fixtures via
-/// filtered polls, drive drains explicitly via the pub seam
-/// `net::drain_parked_ready`, quiesce background RX for determinism.
+/// Architecture: allocate a child namespace, learn through the shared ARP
+/// handler with explicit child attribution, drive drains through the pub seam
+/// `net::drain_parked_ready`, and quiesce background RX for determinism.
 struct NetNsPendingFrameTest;
 
 impl RuntimeTest for NetNsPendingFrameTest {
@@ -6480,7 +6553,10 @@ impl RuntimeTest for NetNsPendingFrameTest {
     fn run(&self) -> TestResult {
         use core::sync::atomic::Ordering;
         use kernel_core::net_namespace::{clone_net_namespace, ROOT_NET_NAMESPACE};
-        use net::{arp, EthAddr, Ipv4Addr};
+        use net::{
+            arp, EthAddr, FirewallAction, FirewallRule, IpCidrMatch, Ipv4Addr, PortRange,
+            ProcessResult,
+        };
 
         let _quiesce = net::quiesce_rx_ingress_background();
 
@@ -6519,7 +6595,23 @@ impl RuntimeTest for NetNsPendingFrameTest {
         let target_ip = Ipv4Addr([10, 88, 0, 9]);
         let target_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x88, 0x09]);
 
-        let base = alloc_arp_test_clock_window();
+        // This test exercises pending delivery, not firewall policy. Preserve
+        // the child table's default-deny baseline and admit only this fixture's
+        // exact UDP flow; namespace teardown removes the ephemeral table.
+        let mut fixture_rules = net::firewall_default_rules();
+        fixture_rules.push(
+            FirewallRule::builder(9202)
+                .priority(1500)
+                .src_ip(IpCidrMatch::host(cfg.our_ip))
+                .dst_ip(IpCidrMatch::new(Ipv4Addr([10, 88, 0, 0]), 24))
+                .proto(net::Ipv4Proto::Udp)
+                .src_port(PortRange::single(50_001))
+                .dst_port(PortRange::single(50_002))
+                .action(FirewallAction::Accept)
+                .build(),
+        );
+        net::firewall_table_for_ns(cid).replace_rules(fixture_rules.clone());
+
         let ingress_stats = net::rx_ingress_net_stats();
 
         // Park one frame via on-link miss send.
@@ -6542,32 +6634,42 @@ impl RuntimeTest for NetNsPendingFrameTest {
             ));
         }
 
-        // Plant the learned reply via synthetic device.
-        let shared = RX_INGRESS_TEST_SHARED
-            .call_once(|| {
-                alloc::sync::Arc::new(spin::Mutex::new(RxIngressTestShared {
-                    frames: alloc::collections::VecDeque::new(),
-                    error_arm: false,
-                }))
-            })
-            .clone();
-        if net::device_index("rxtest0").is_none() {
-            if let Err(e) = net::register_device(SyntheticRxDevice {
-                shared: shared.clone(),
-            }) {
-                return TestResult::Fail(alloc::format!("synthetic device register: {:?}", e));
+        // The production RX loop is root-attributed in this phase. Exercise
+        // the shared ARP handler directly with the child identity, as the
+        // namespace-isolation gate does, so the learn reaches CHILD's cache.
+        let reply = arp::build_arp_reply(target_mac, target_ip, cfg.our_mac, cfg.our_ip);
+        if reply.is_empty() {
+            return TestResult::Fail(String::from("leg 1: ARP reply frame admission failed"));
+        }
+        let arp_now_ms = alloc_arp_test_clock_window();
+        match net::process_frame(
+            reply.as_slice(),
+            cfg.our_mac,
+            cfg.our_ip,
+            ingress_stats,
+            child.id(),
+            arp_now_ms,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 1: child-attributed ARP learn must be handled, got {:?}",
+                    other
+                ));
             }
         }
-        let reply = arp::build_arp_reply(target_mac, target_ip, cfg.our_mac, cfg.our_ip);
-        shared.lock().frames.push_back(reply.to_vec());
-        let _ = net::rx_ingress_poll_filtered(base + 1000, 8, &["rxtest0"]);
+        if child.arp_cache().lock().lookup(target_ip, arp_now_ms) != Some(target_mac) {
+            return TestResult::Fail(String::from(
+                "leg 1: planted reply must learn into the child cache",
+            ));
+        }
 
         // Drain pops the parked frame and enqueues on eth0.
         let s1 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
         };
-        let accepted = net::drain_parked_ready(cid, base + 1100);
+        let accepted = net::drain_parked_ready(cid, kernel_core::time::get_ticks());
         let s2 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
@@ -6592,28 +6694,102 @@ impl RuntimeTest for NetNsPendingFrameTest {
             ));
         }
 
-        // Leg 2: expiry-before-ready drops frame (TTL=3s, wait 3.5s).
-        let target2 = Ipv4Addr([10, 88, 0, 10]);
-        if let Err(e) = net::transmit_udp_datagram(target2, &datagram, cid) {
+        // Leg 2: policy is rechecked with outbound (not reply) conntrack
+        // semantics. Revoking the fixture allow while resolution is pending
+        // must fail closed even though the ARP learn makes the frame ready.
+        let revoked_ip = Ipv4Addr([10, 88, 0, 10]);
+        if let Err(e) = net::transmit_udp_datagram(revoked_ip, &datagram, cid) {
             return TestResult::Fail(alloc::format!("leg 2: park send: {:?}", e));
         }
-        let now_expire = base + 4600;
-        let accepted2 = net::drain_parked_ready(cid, now_expire);
-        if accepted2 != 0 {
+        let ctrs_before_revoke = child.arp_cache().lock().pending_frame_counters();
+        if ctrs_before_revoke.parked_total != ctrs2.parked_total.saturating_add(1) {
             return TestResult::Fail(alloc::format!(
-                "leg 2: expired frame must not pop (accepted {})",
-                accepted2
+                "leg 2: revocation fixture must park exactly once (parked_total {}->{})",
+                ctrs2.parked_total,
+                ctrs_before_revoke.parked_total
+            ));
+        }
+        let revoked_reply = arp::build_arp_reply(target_mac, revoked_ip, cfg.our_mac, cfg.our_ip);
+        if revoked_reply.is_empty() {
+            return TestResult::Fail(String::from("leg 2: ARP reply frame admission failed"));
+        }
+        let revoked_arp_now_ms = alloc_arp_test_clock_window();
+        match net::process_frame(
+            revoked_reply.as_slice(),
+            cfg.our_mac,
+            cfg.our_ip,
+            ingress_stats,
+            child.id(),
+            revoked_arp_now_ms,
+        ) {
+            ProcessResult::Handled => {}
+            other => {
+                return TestResult::Fail(alloc::format!(
+                    "leg 2: child-attributed ARP learn must be handled, got {:?}",
+                    other
+                ));
+            }
+        }
+        if child
+            .arp_cache()
+            .lock()
+            .lookup(revoked_ip, revoked_arp_now_ms)
+            != Some(target_mac)
+        {
+            return TestResult::Fail(String::from(
+                "leg 2: planted reply must learn before policy revocation",
+            ));
+        }
+
+        net::firewall_table_for_ns(cid).replace_rules(net::firewall_default_rules());
+        let sr0 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        let accepted_revoked = net::drain_parked_ready(cid, kernel_core::time::get_ticks());
+        let sr1 = match NetNsRxIngressTest::eth0_snapshot() {
+            Ok(s) => s,
+            Err(fail) => return fail,
+        };
+        if accepted_revoked != 0 || NetNsRxIngressTest::enq_delta(&sr0, &sr1) != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: revoked pending frame must not enqueue (accepted {}, enq_delta {})",
+                accepted_revoked,
+                NetNsRxIngressTest::enq_delta(&sr0, &sr1)
+            ));
+        }
+        let ctrs_after_revoke = child.arp_cache().lock().pending_frame_counters();
+        if ctrs_after_revoke.retx_failures != ctrs_before_revoke.retx_failures.saturating_add(1) {
+            return TestResult::Fail(alloc::format!(
+                "leg 2: policy denial must count one retransmit failure (retx_failures {}->{})",
+                ctrs_before_revoke.retx_failures,
+                ctrs_after_revoke.retx_failures
+            ));
+        }
+        net::firewall_table_for_ns(cid).replace_rules(fixture_rules.clone());
+
+        // Leg 3: expiry-before-ready drops frame (TTL=3s, wait 3.5s).
+        let target3 = Ipv4Addr([10, 88, 0, 11]);
+        if let Err(e) = net::transmit_udp_datagram(target3, &datagram, cid) {
+            return TestResult::Fail(alloc::format!("leg 3: park send: {:?}", e));
+        }
+        let now_expire = kernel_core::time::get_ticks().saturating_add(3_500);
+        let accepted3 = net::drain_parked_ready(cid, now_expire);
+        if accepted3 != 0 {
+            return TestResult::Fail(alloc::format!(
+                "leg 3: expired frame must not pop (accepted {})",
+                accepted3
             ));
         }
         let ctrs3 = child.arp_cache().lock().pending_frame_counters();
         if ctrs3.expired != 1 {
             return TestResult::Fail(alloc::format!(
-                "leg 2: expired counter (got {})",
+                "leg 3: expired counter (got {})",
                 ctrs3.expired
             ));
         }
 
-        // Leg 3: FIFO eviction by park_seq (fill 8 slots, 9th evicts oldest).
+        // Leg 4: FIFO eviction by park_seq (fill 8 slots, 9th evicts oldest).
         for k in 0..9u8 {
             let dst = Ipv4Addr([10, 88, 0, 20 + k as u8]);
             let _ = net::transmit_udp_datagram(dst, &datagram, cid);
@@ -6621,33 +6797,33 @@ impl RuntimeTest for NetNsPendingFrameTest {
         let ctrs4 = child.arp_cache().lock().pending_frame_counters();
         if ctrs4.evicted != 1 {
             return TestResult::Fail(alloc::format!(
-                "leg 3: one eviction (got {})",
+                "leg 4: one eviction (got {})",
                 ctrs4.evicted
             ));
         }
         if child.arp_cache().lock().pending_frame_count() != 8 {
             return TestResult::Fail(alloc::format!(
-                "leg 3: 8 slots max (count {})",
+                "leg 4: 8 slots max (count {})",
                 child.arp_cache().lock().pending_frame_count()
             ));
         }
 
-        // Leg 4: reconfig flush via set_net_config.
+        // Leg 5: reconfig flush via set_net_config.
         if let Err(e) = child.set_net_config(cfg) {
-            return TestResult::Fail(alloc::format!("leg 4: set_net_config: {:?}", e));
+            return TestResult::Fail(alloc::format!("leg 5: set_net_config: {:?}", e));
         }
         let ctrs5 = child.arp_cache().lock().pending_frame_counters();
         if ctrs5.flushed != 8 {
             return TestResult::Fail(alloc::format!(
-                "leg 4: flush 8 frames (got {})",
+                "leg 5: flush 8 frames (got {})",
                 ctrs5.flushed
             ));
         }
         if child.arp_cache().lock().pending_frame_count() != 0 {
-            return TestResult::Fail(String::from("leg 4: flush clears queue"));
+            return TestResult::Fail(String::from("leg 5: flush clears queue"));
         }
 
-        // Leg 5: counter conservation (quiescent invariant).
+        // Leg 6: counter conservation (quiescent invariant).
         let ctrs_final = child.arp_cache().lock().pending_frame_counters();
         let total = ctrs_final.parked_total;
         let accounted = ctrs_final.retransmitted
@@ -6657,7 +6833,7 @@ impl RuntimeTest for NetNsPendingFrameTest {
             + ctrs_final.retx_failures;
         if total != accounted {
             return TestResult::Fail(alloc::format!(
-                "leg 5: counter conservation violated (parked_total {} != accounted {})",
+                "leg 6: counter conservation violated (parked_total {} != accounted {})",
                 total,
                 accounted
             ));
