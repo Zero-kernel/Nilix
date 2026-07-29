@@ -1529,8 +1529,8 @@ pub fn run_ext2_journal_transaction_self_test() {
     let dev: Arc<dyn BlockDevice> = writable_plain;
     assert!(matches!(Ext2Fs::mount(dev), Err(FsError::NotSupported)));
 
-    let read_only_plain =
-        Arc::try_new(CrashBlockDevice::new_read_only(plain)).expect("read-only plain Ext2 device");
+    let read_only_plain = Arc::try_new(CrashBlockDevice::new_read_only(plain.clone()))
+        .expect("read-only plain Ext2 device");
     let before = read_only_plain.durable_snapshot();
     let dev: Arc<dyn BlockDevice> = read_only_plain.clone();
     let read_only_fs = Ext2Fs::mount(dev).expect("mount read-only plain Ext2");
@@ -1544,6 +1544,22 @@ pub fn run_ext2_journal_transaction_self_test() {
     drop(read_only_fs);
     drop(read_only_plain);
     drop(before);
+
+    // R186-7: plain read-only ext2 is not exempt from ownership validation.
+    // Make the ordinary file alias the root directory's allocated data block;
+    // the mount must reject the duplicate owner before exposing either inode.
+    let file_offset = 5 * BLOCK_SIZE + (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
+    let mut aliased_file: Ext2InodeRaw = read_struct(&plain, file_offset);
+    aliased_file.size_lo = 1;
+    aliased_file.blocks_lo = (BLOCK_SIZE / 512) as u32;
+    aliased_file.block[0] = 7;
+    copy_struct(&mut plain, file_offset, &aliased_file);
+    let aliased_plain = Arc::try_new(CrashBlockDevice::new_read_only(plain))
+        .expect("aliased read-only plain Ext2 device");
+    let dev: Arc<dyn BlockDevice> = aliased_plain.clone();
+    assert!(matches!(Ext2Fs::mount(dev), Err(FsError::Invalid)));
+    assert_eq!(aliased_plain.operation.load(Ordering::Acquire), 0);
+    drop(aliased_plain);
 
     // A clean journal does not make ordinary inode mappings trustworthy.  A
     // free, structural, or journal-owned target must fail the full ownership
@@ -3352,6 +3368,23 @@ struct Ext2Journal {
 }
 
 impl Ext2Journal {
+    /// Empty ownership context for a plain, explicitly read-only ext2 image.
+    /// Virtual reads fall through to physical blocks and no blocks are reserved
+    /// as journal-owned, while the same complete ownership graph is still built.
+    fn plain_image() -> Self {
+        Self {
+            blocks: Vec::new(),
+            mapping_blocks: Vec::new(),
+            owned_blocks: Vec::new(),
+            max_len: 0,
+            first: 0,
+            next_sequence: 0,
+            start: 0,
+            uuid: [0; 16],
+            feature_incompat: 0,
+        }
+    }
+
     #[inline]
     fn physical(&self, logical: u32) -> Result<u32, FsError> {
         if logical >= self.max_len {
@@ -4429,7 +4462,11 @@ impl Ext2Fs {
     fn initialize_journal(self: &Arc<Self>) -> Result<(), FsError> {
         let sb = *self.superblock.read();
         if (sb.feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL) == 0 {
-            return Ok(());
+            // R186-7: an explicitly read-only plain ext2 image still needs the
+            // same complete ownership proof. Otherwise two allocated inodes may
+            // alias data/metadata blocks and disclose another object's contents.
+            let plain = Ext2Journal::plain_image();
+            return self.validate_block_ownership(&plain, &[], &[]);
         }
 
         let journal_inode = self.read_inode_raw(sb.journal_inum)?;
@@ -4466,12 +4503,27 @@ impl Ext2Fs {
         let pre_images = self.validate_recovery_grammar(overlay, post_images, intent)?;
         self.validate_checkpoint_homes(overlay, &pre_images, post_images, &mut verification)?;
         self.validate_recovery_overlay(&journal, overlay, post_images, intent, &mut verification)?;
-        if !self.dev.is_read_only() {
-            if !pre_images.is_empty() {
-                self.validate_writable_ownership(&journal, overlay, &pre_images)?;
-            }
-            self.validate_writable_ownership(&journal, overlay, post_images)?;
+        // R186-7 FIX: validate block ownership for READ-ONLY mounts too.
+        //
+        // The scan was gated on writability, on the assumption that only writes
+        // can do damage. That is wrong in two ways for a crafted image:
+        //
+        //   - Reads expose confidentiality. Without an ownership graph, one
+        //     inode's data blocks may alias another inode's — or the journal's,
+        //     or the inode table's — so an unprivileged read through a crafted
+        //     directory entry can disclose metadata it has no claim to.
+        //   - "Read-only" is a property of the current mount, not of the image.
+        //     Admitting an unvalidated image read-only and validating it only if
+        //     it is later mounted writable leaves the ownership proof optional.
+        //
+        // The scan is pure validation over the post-replay virtual image (it
+        // performs no writes), so running it for a read-only mount is sound. A
+        // failure now refuses the mount outright: an image whose blocks cannot be
+        // proven singly-owned is not admitted at all.
+        if !pre_images.is_empty() {
+            self.validate_block_ownership(&journal, overlay, &pre_images)?;
         }
+        self.validate_block_ownership(&journal, overlay, post_images)?;
         if !active_recovery {
             self.ensure_recovery_feature()?;
         }
@@ -5418,12 +5470,22 @@ impl Ext2Fs {
     }
 
     /// RF180-13 FIX: establish one complete block-ownership graph before the
-    /// filesystem can become writable.  Every allocated bitmap bit must have
+    /// filesystem is admitted.  Every allocated bitmap bit must have
     /// exactly one structural, journal, resize, inode-data, mapping-node, or
     /// ACL owner, and every owner must be allocated.  The scan operates on the
     /// virtual post-replay image so a recovery plan is proven before any home
     /// block or RECOVER feature write occurs.
-    fn validate_writable_ownership(
+    ///
+    /// R186-7: renamed from `validate_writable_ownership`. The old name encoded
+    /// the bug — it was only ever called for writable mounts, leaving read-only
+    /// mounts with no ownership proof at all. This scan performs no writes and is
+    /// now a precondition of ADMITTING the image, in either mode.
+    ///
+    /// Note that skipping bitmap-clear inode slots (below) is sound only because
+    /// `read_inode_raw` refuses to load an inode whose bitmap bit is clear; the
+    /// two checks compose into "a reachable inode is allocated and owns every
+    /// block it exposes" (INV-VFS-01). Neither half is sufficient alone.
+    fn validate_block_ownership(
         &self,
         journal: &Ext2Journal,
         overlay: &[JournalOverlayEntry],
@@ -5527,7 +5589,8 @@ impl Ext2Fs {
         let sectors_per_block = self.block_size / 512;
         let mut free_inodes_total = 0u64;
         let mut saw_root = false;
-        let mut saw_journal = false;
+        let has_journal = proposed.feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL != 0;
+        let mut saw_journal = !has_journal;
         let mut saw_resize = proposed.feature_compat & EXT2_FEATURE_COMPAT_RESIZE_INODE == 0;
 
         for group in 0..groups {
@@ -7441,6 +7504,59 @@ impl Ext2Fs {
         self.dev.flush().map_err(|_| FsError::Io)
     }
 
+    /// R186-7: is `ino`'s inode-bitmap bit set?
+    ///
+    /// This is the authority that binds an on-disk inode NUMBER to an actually
+    /// ALLOCATED object. Callers that resolve an inode number originating from
+    /// untrusted on-disk data (directory entries) must consult it before treating
+    /// the inode-table slot as an object.
+    ///
+    /// `bitmap_block` and `blocks_count` are passed in so the caller's already-read
+    /// group descriptor and superblock snapshot are reused rather than re-locked.
+    fn inode_is_allocated_in(
+        &self,
+        ino: u32,
+        bitmap_block: u32,
+        blocks_count: u32,
+    ) -> Result<bool, FsError> {
+        // A bitmap outside the filesystem cannot be consulted; refusing is the
+        // only fail-closed answer (never "assume allocated").
+        if bitmap_block == 0 || bitmap_block >= blocks_count {
+            return Err(FsError::Invalid);
+        }
+
+        let (_group, index) = self.inode_group_index(ino);
+
+        let mut bitmap_buf = Vec::new();
+        bitmap_buf
+            .try_reserve_exact(self.block_size as usize)
+            .map_err(|_| FsError::NoSpace)?;
+        bitmap_buf.resize(self.block_size as usize, 0u8);
+        self.read_block(bitmap_block, &mut bitmap_buf)?;
+
+        let byte = bitmap_buf.get(index / 8).copied().ok_or(FsError::Invalid)?;
+        Ok(byte & (1u8 << (index % 8)) != 0)
+    }
+
+    /// R186-7: allocation check that resolves the bitmap block itself.
+    ///
+    /// Used by the cache-hit assertion, which has no descriptor snapshot in hand.
+    fn inode_is_allocated(&self, ino: u32) -> Result<bool, FsError> {
+        let sb = self.superblock.read();
+        if ino == 0 || ino > sb.inodes_count {
+            return Err(FsError::NotFound);
+        }
+        let blocks_count = sb.blocks_count;
+        drop(sb);
+
+        let (group, _index) = self.inode_group_index(ino);
+        let bitmap_block = {
+            let descs = self.group_descs.read();
+            descs.get(group).ok_or(FsError::Invalid)?.inode_bitmap
+        };
+        self.inode_is_allocated_in(ino, bitmap_block, blocks_count)
+    }
+
     /// Read raw inode from disk
     fn read_inode_raw(&self, ino: u32) -> Result<Ext2InodeRaw, FsError> {
         self.ensure_io_healthy()?;
@@ -7454,18 +7570,35 @@ impl Ext2Fs {
         // Calculate group and index
         let (group, index) = self.inode_group_index(ino);
 
-        // Get inode table block
+        // Get inode table block and bitmap block
         // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
         let group_descs = self.group_descs.read();
         if group >= group_descs.len() {
             return Err(FsError::Invalid);
         }
         let inode_table_block = group_descs[group].inode_table;
+        let inode_bitmap_block = group_descs[group].inode_bitmap;
         drop(group_descs);
 
         // Validate inode table block is within filesystem bounds
         if inode_table_block == 0 || inode_table_block >= blocks_count {
             return Err(FsError::Invalid);
+        }
+
+        // R186-7 FIX: Check the inode bitmap allocation bit before loading.
+        //
+        // Directory lookup passes any nonzero inode number here, and the only
+        // prior check was numeric range. A crafted image could therefore point a
+        // directory entry at a FREE inode-table slot carrying permissive metadata
+        // whose block pointers alias blocks owned by a different inode — a DAC and
+        // block-ownership bypass. It also slipped past the mount ownership scan,
+        // which deliberately skips bitmap-clear slots.
+        //
+        // Binding on-disk identity to allocation state closes both: a free slot is
+        // not an object, so it cannot be loaded, and the ownership scan's skip
+        // becomes correct rather than a hole.
+        if !self.inode_is_allocated_in(ino, inode_bitmap_block, blocks_count)? {
+            return Err(FsError::NotFound);
         }
 
         // Calculate offset within inode table
@@ -8352,11 +8485,64 @@ impl Ext2Fs {
     }
 
     /// RF178-37 FIX: load or return the canonical in-memory inode wrapper.
+    ///
+    /// R186-7: the bitmap-allocation gate lives in `read_inode_raw`, which only
+    /// runs on a cache MISS. A cache hit therefore bypasses it. That is safe today
+    /// and the reasoning is recorded here because it is a load-bearing precondition
+    /// rather than an accident:
+    ///
+    ///   - The cache starts empty at mount, so the FIRST load of any inode goes
+    ///     through `read_inode_raw` and is bitmap-checked. A crafted directory
+    ///     entry pointing at a bitmap-free inode is rejected there.
+    ///   - Nothing in this driver ever frees an inode: the `FileSystem` impl
+    ///     exposes only `fs_id`/`fs_type`/`root_inode`/`lookup`, and `Inode`
+    ///     exposes no unlink/rmdir/create. No code path clears an inode bitmap
+    ///     bit, so a cached entry cannot outlive its allocation.
+    ///
+    /// If an inode-free path is ever added it MUST invalidate this cache entry
+    /// atomically with clearing the bitmap bit, otherwise a subsequent lookup
+    /// through a stale or aliasing directory entry would resolve to a freed inode
+    /// and write through it into blocks that have been reallocated to another
+    /// file. `debug_assert_inode_allocated` below exists to catch exactly that
+    /// regression in checked builds.
     fn load_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<Ext2Inode>, FsError> {
-        self.inode_cache.get_or_try_insert_with(ino, || {
+        let cached = self.inode_cache.get_or_try_insert_with(ino, || {
             let raw = self.read_inode_raw(ino)?;
             self.new_inode_from_raw(ino, raw)
-        })
+        })?;
+        self.debug_assert_inode_allocated(ino);
+        Ok(cached)
+    }
+
+    /// R186-7: re-verify the bitmap bit for an inode served from the cache.
+    ///
+    /// Compiled out of release builds — the release-path guarantee is the
+    /// no-free-path argument documented on `load_inode`, not a per-lookup block
+    /// read (which would cost one device read per path component). In checked
+    /// builds this turns "someone added an inode-free path and forgot to
+    /// invalidate the cache" from a silent cross-file corruption primitive into an
+    /// immediate, located failure.
+    #[inline]
+    fn debug_assert_inode_allocated(&self, ino: u32) {
+        #[cfg(debug_assertions)]
+        {
+            match self.inode_is_allocated(ino) {
+                Ok(true) => {}
+                Ok(false) => panic!(
+                    "R186-7: ext2 inode {} served from cache but its bitmap bit is \
+                     CLEAR — an inode-free path must invalidate the inode cache \
+                     atomically with clearing the bitmap",
+                    ino
+                ),
+                // An I/O or bounds failure here is not evidence of the violation
+                // this assertion targets; the ordinary error paths cover it.
+                Err(_) => {}
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = ino;
+        }
     }
 
     /// Calculate group and index for an inode number
@@ -9721,6 +9907,7 @@ impl Inode for Ext2Inode {
         block_buf
             .try_reserve_exact(fs.block_size as usize)
             .map_err(|_| FsError::NoSpace)?;
+        // lint-fallible: PREALLOCATED(exact try_reserve_exact on the line above)
         block_buf.resize(fs.block_size as usize, 0u8);
         let min_rec = size_of::<Ext2DirEntryHead>();
 
