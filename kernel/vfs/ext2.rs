@@ -1523,7 +1523,31 @@ pub fn run_ext2_journal_transaction_self_test() {
     plain_super.feature_incompat &= !EXT3_FEATURE_INCOMPAT_RECOVER;
     plain_super.journal_uuid = [0; 16];
     plain_super.journal_inum = 0;
+    // R186-7 REGRESSION: clearing HAS_JOURNAL alone does not produce a valid
+    // plain ext2 image.  The synthetic journal inode has zero links and still
+    // owns blocks 8 through 15, so the complete ownership scan correctly rejects it.
+    // Model journal removal fully: retain inode 8's reserved bitmap bit, clear
+    // its inode contents, release its data blocks, and reconcile both free-block
+    // counters.  Free-block contents need not be erased by ext2.
+    const SYNTHETIC_JOURNAL_BLOCKS: u32 = 8;
+    let journal_inode_offset =
+        5 * BLOCK_SIZE + (JOURNAL_INO as usize - 1) * size_of::<Ext2InodeRaw>();
+    copy_struct(&mut plain, journal_inode_offset, &Ext2InodeRaw::default());
+    for block in JOURNAL_FIRST_PHYS..JOURNAL_FIRST_PHYS + SYNTHETIC_JOURNAL_BLOCKS {
+        let bit = block - 1;
+        plain[3 * BLOCK_SIZE + (bit / 8) as usize] &= !(1u8 << (bit % 8));
+    }
+    plain_super.free_blocks_count = plain_super
+        .free_blocks_count
+        .checked_add(SYNTHETIC_JOURNAL_BLOCKS)
+        .expect("plain ext2 free-block count");
     copy_struct(&mut plain, SUPERBLOCK_OFFSET as usize, &plain_super);
+    let mut plain_desc: Ext2GroupDesc = read_struct(&plain, 2 * BLOCK_SIZE);
+    plain_desc.free_blocks_count = plain_desc
+        .free_blocks_count
+        .checked_add(SYNTHETIC_JOURNAL_BLOCKS as u16)
+        .expect("plain ext2 group free-block count");
+    copy_struct(&mut plain, 2 * BLOCK_SIZE, &plain_desc);
     let writable_plain =
         Arc::try_new(CrashBlockDevice::new(plain.clone())).expect("writable plain Ext2 device");
     let dev: Arc<dyn BlockDevice> = writable_plain;
