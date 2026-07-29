@@ -577,3 +577,50 @@ pub struct DirEntry {
     /// File type
     pub file_type: FileType,
 }
+
+/// R186-8: fallibly build a `DirEntry` name from a `&str`.
+///
+/// `DirEntry::name` is a heap `String`, so every `Inode::readdir` implementation
+/// allocates once per entry. Those allocations used `to_string` / `String::from` /
+/// `String::clone`, all of which abort the kernel on failure — reachable by any
+/// unprivileged directory enumeration under heap pressure. Directory enumeration
+/// must return ENOMEM instead.
+///
+/// A single shared constructor matters beyond deduplication: the per-filesystem
+/// copies were individually "obviously bounded" (a static entry name, a decimal
+/// pid) and each was therefore annotated as exempt from the fallibility lint. The
+/// bound is real but irrelevant — a small allocation still aborts when the heap is
+/// exhausted, and boundedness is not fallibility.
+pub fn try_dirent_name(name: &str) -> Result<String, FsError> {
+    let mut out = String::new();
+    out.try_reserve_exact(name.len())
+        .map_err(|_| FsError::NoMem)?;
+    out.push_str(name);
+    Ok(out)
+}
+
+/// R186-8: fallibly render an unsigned integer as a `DirEntry` name.
+///
+/// Replaces `format!("{}", n)` in the procfs/cgroupfs readdir bodies. `format!`
+/// allocates infallibly and cannot be made fallible in place, so the digits are
+/// rendered into a stack buffer first and only the exact final length is
+/// reserved on the heap. `u64::MAX` is 20 digits, so 20 bytes always suffices and
+/// the formatting step itself cannot fail.
+pub fn try_dirent_name_from_u64(value: u64) -> Result<String, FsError> {
+    let mut digits = [0u8; 20];
+    let mut len = 0usize;
+    let mut remaining = value;
+    loop {
+        // Fill from the end so the digits come out most-significant first.
+        len += 1;
+        digits[digits.len() - len] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    let start = digits.len() - len;
+    // The buffer holds only ASCII digits by construction.
+    let rendered = core::str::from_utf8(&digits[start..]).map_err(|_| FsError::Invalid)?;
+    try_dirent_name(rendered)
+}

@@ -234,7 +234,8 @@ impl Inode for DevDirInode {
             Ok(Some((
                 offset + 1,
                 DirEntry {
-                    name: name.clone(),
+                    // R186-8: fallible name copy (was an infallible String::clone).
+                    name: crate::types::try_dirent_name(name)?,
                     ino: inode.ino(),
                     file_type: stat.mode.file_type,
                 },

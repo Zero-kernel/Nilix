@@ -532,8 +532,11 @@ impl Inode for CgroupDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    // lint-fallible: BOUNDED(kind.filename() is a static &str, <32B)
-                    name: String::from(kind.filename()),
+                    // R186-8: was annotated BOUNDED and left infallible. The bound
+                    // is real but irrelevant — a 32-byte allocation still aborts
+                    // the kernel on an exhausted heap, and unprivileged directory
+                    // enumeration must return ENOMEM instead.
+                    name: crate::types::try_dirent_name(kind.filename())?,
                     // R154-2 FIX: Deterministic inode
                     ino: cgroup_ctrl_ino(self.cgroup_id, kind.index()),
                     file_type: FileType::Regular,
@@ -551,7 +554,10 @@ impl Inode for CgroupDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    name: format!("{}", child_id),
+                    // R186-8: `format!` allocates infallibly and cannot be made
+                    // fallible in place; render into a stack buffer, then reserve
+                    // the exact length.
+                    name: crate::types::try_dirent_name_from_u64(child_id as u64)?,
                     // R154-2 FIX: Deterministic inode
                     ino: cgroup_dir_ino(child_id),
                     file_type: FileType::Directory,

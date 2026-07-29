@@ -1348,6 +1348,11 @@ impl Vfs {
                     if entries.len() == entries.capacity() {
                         entries.try_reserve(1).map_err(|_| FsError::NoMem)?;
                     }
+                    // R186-8: unlike the getdents staging loop, this legacy helper
+                    // returns `Result<Vec<DirEntry>, FsError>` — an all-or-nothing
+                    // API with no partial-result contract to honour, so surfacing
+                    // NoMem here is correct rather than a discarded prefix.
+                    // lint-fallible: PREALLOCATED(capacity ensured directly above)
                     entries.push(entry);
                     offset = next_offset;
                 }
@@ -2442,6 +2447,39 @@ fn classify_readdir_reserve(
     }
 }
 
+/// R186-8 FIX: apply the SAME partial-result rule to an allocation failure raised
+/// by `Inode::readdir` itself.
+///
+/// Making per-entry name construction fallible creates a second way for the
+/// staging loop to hit OOM: the filesystem now returns `NoMem`/`NoSpace` instead
+/// of aborting. The loop's only error leg returned immediately and dropped the
+/// whole `entries` vector, so a failure on entry 500 of an enumeration threw away
+/// 499 complete records — a violation of the getdents64 partial-result contract
+/// and, worse, a silent one: userspace would see ENOMEM for a call that had
+/// already consumed no cookie and could never make progress.
+///
+/// Allocation failure is therefore classified exactly like a staging-reservation
+/// failure: ENOMEM only while nothing is complete, otherwise commit the prefix and
+/// leave the failing entry for the next call (the cookie is not advanced past it,
+/// and `commit_readdir_copy_result` only publishes after a successful copyout, so
+/// the retry re-reads the same entry).
+///
+/// Errors that are NOT allocation failures keep propagating: an I/O error or
+/// corrupt on-disk record must not be disguised as end-of-directory.
+fn classify_readdir_error(
+    completed_entries: usize,
+    error: FsError,
+) -> Result<ReaddirReserveAction, SyscallError> {
+    let transient_alloc_failure = matches!(error, FsError::NoMem | FsError::NoSpace);
+    if !transient_alloc_failure {
+        return Err(fs_error_to_syscall(error));
+    }
+    if completed_entries == 0 {
+        return Err(SyscallError::ENOMEM);
+    }
+    Ok(ReaddirReserveAction::FinishPartial)
+}
+
 fn vfs_readdir_callback(
     fd: i32,
     max_bytes: usize,
@@ -2549,7 +2587,19 @@ fn vfs_readdir_callback(
                 offset = next;
             }
             Ok(None) => break,
-            Err(e) => return Err(fs_error_to_syscall(e)),
+            Err(e) => {
+                // R186-8 FIX: an allocation failure inside `readdir` must not
+                // discard the completed prefix. Break BEFORE `estimated_bytes` is
+                // advanced (it is only advanced on the append path), so the byte
+                // count still matches `entries` exactly and
+                // `commit_readdir_copy_result`'s equality check holds.
+                match classify_readdir_error(entries.len(), e)? {
+                    ReaddirReserveAction::FinishPartial => break,
+                    // `classify_readdir_error` never returns Append; it either
+                    // propagates the error or requests the partial commit.
+                    ReaddirReserveAction::Append => break,
+                }
+            }
         }
     }
 

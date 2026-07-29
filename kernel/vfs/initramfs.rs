@@ -636,7 +636,8 @@ impl Inode for InitramfsInode {
                     return Ok(Some((
                         1,
                         DirEntry {
-                            name: ".".to_string(),
+                            // R186-8: fallible name construction (see types.rs).
+                            name: crate::types::try_dirent_name(".")?,
                             ino: self.ino,
                             file_type: FileType::Directory,
                         },
@@ -648,7 +649,7 @@ impl Inode for InitramfsInode {
                     return Ok(Some((
                         2,
                         DirEntry {
-                            name: "..".to_string(),
+                            name: crate::types::try_dirent_name("..")?,
                             ino: self.ino, // Parent would need separate tracking
                             file_type: FileType::Directory,
                         },
@@ -666,7 +667,8 @@ impl Inode for InitramfsInode {
                     return Ok(Some((
                         offset + 1,
                         DirEntry {
-                            name: name.clone(),
+                            // R186-8: fallible name copy (was String::clone).
+                            name: crate::types::try_dirent_name(name)?,
                             ino: child.ino,
                             file_type: ft,
                         },

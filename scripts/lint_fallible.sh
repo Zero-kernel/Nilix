@@ -75,6 +75,11 @@ for f in $files; do
                     fname=substr(l, RSTART, RLENGTH); sub(/^fn[[:space:]]+/, "", fname)
                 }
                 istest[rid] = (fname ~ /(^|_)test(_|$)/) ? 1 : 0
+                # R186-8: readdir bodies are scanned under a STRICTER rule (see
+                # pass 2). Every Inode::readdir builds a DirEntry name on the heap
+                # per entry, and unprivileged enumeration reaches it, so the usual
+                # "bounded literal" and fn-scope-guard escapes do not apply there.
+                isreaddir[rid] = (fname == "readdir") ? 1 : 0
                 # #[test]/#[cfg(test)] within 3 lines above
                 for (k=i-1;k>=i-3 && k>=1;k--) if (a[k] ~ /#\[(cfg\()?test/) istest[rid]=1
                 # fn-level annotation within 3 lines above
@@ -84,7 +89,7 @@ for f in $files; do
             } else if (l ~ /^}/) {
                 # top-level close brace: open a fresh no-fn region so file-scope
                 # items never inherit a preceding fn guard
-                rid++; istest[rid]=0; fnallow[rid]=0; guard[rid]=0
+                rid++; istest[rid]=0; fnallow[rid]=0; guard[rid]=0; isreaddir[rid]=0
             }
             reg[i]=rid
             if (l ~ GUARD) guard[reg[i]]=1
@@ -97,13 +102,31 @@ for f in $files; do
             if (stripped ~ /^\/\//) continue                 # pure comment/doc line
             if (l ~ FNLINE) continue                          # fn declaration, not a call
             code=l; sub(/[[:space:]]*\/\/.*$/,"",code)        # strip trailing comment
+            r=reg[i]
+
+            # R186-8: strict rule inside `readdir`. Every entry name is a heap
+            # String built per call on an unprivileged enumeration path, so the two
+            # escapes that hid this class are BOTH withheld here:
+            #   - literal-source suppression ("." .to_string()) — a bounded
+            #     allocation still aborts the kernel on an exhausted heap;
+            #   - fn-scope guard inheritance — one `try_reserve` elsewhere in the
+            #     body must not bless a different infallible allocation.
+            # `.clone()` and `format!` are added as candidates because they were the
+            # two forms the general rule could not see at all.
+            if (!istest[r] && isreaddir[r]) {
+                if (code ~ CAND || code ~ /\.clone\(\)/ || code ~ /format!\(/) {
+                    allowed=0
+                    for (k=i;k>=i-3 && k>=1;k--) if (a[k] ~ ALLOW) allowed=1
+                    if (!allowed) { printf "%s:%d:%s\n", FILENAME, i, l; continue }
+                }
+            }
+
             # literal-source suppression: remove bounded literal forms, then re-test
             probe=code
             gsub(/"[^"]*"\.to_string\(\)/,"",probe)
             gsub(/"[^"]*"\.to_owned\(\)/,"",probe)
             gsub(/String::from\("[^"]*"\)/,"",probe)
             if (probe !~ CAND) continue
-            r=reg[i]
             if (istest[r] || fnallow[r] || guard[r]) continue
             # line-level annotation on the hit line or up to 3 lines above
             allowed=0

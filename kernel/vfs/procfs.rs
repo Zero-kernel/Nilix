@@ -289,8 +289,10 @@ impl Inode for ProcRootInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    // lint-fallible: BOUNDED(static procfs entry name, <32B)
-                    name: String::from(name),
+                    // R186-8: was annotated BOUNDED and left infallible. Bounded is
+                    // not fallible — a small allocation still aborts the kernel on
+                    // an exhausted heap.
+                    name: crate::types::try_dirent_name(name)?,
                     ino: (offset + 2) as u64,
                     file_type,
                 },
@@ -316,7 +318,8 @@ impl Inode for ProcRootInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    name: format!("{}", display_pid),
+                    // R186-8: fallible decimal rendering (was infallible format!).
+                    name: crate::types::try_dirent_name_from_u64(display_pid as u64)?,
                     // R142-3 FIX: Use namespace-local PID for inode number to
                     // prevent leaking global kernel PIDs via d_ino in getdents64().
                     ino: 1000 + display_pid as u64,
@@ -550,8 +553,8 @@ impl Inode for ProcPidDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    // lint-fallible: BOUNDED(static procfs entry name, <32B)
-                    name: String::from(name),
+                    // R186-8: bounded is not fallible (see the /proc root readdir).
+                    name: crate::types::try_dirent_name(name)?,
                     ino: self.ino() * 10 + offset as u64,
                     file_type,
                 },
@@ -934,7 +937,8 @@ impl Inode for ProcPidFdDirInode {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    name: format!("{}", fd),
+                    // R186-8: fallible decimal rendering (was infallible format!).
+                    name: crate::types::try_dirent_name_from_u64(fd as u64)?,
                     ino: self.ino() * 1000 + fd as u64,
                     file_type: FileType::Symlink,
                 },

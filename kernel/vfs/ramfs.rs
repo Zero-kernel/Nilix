@@ -966,7 +966,10 @@ impl Inode for RamFsInode {
                     return Ok(Some((
                         1,
                         DirEntry {
-                            name: ".".to_string(),
+                            // R186-8: fallible even for a 1-byte literal — a small
+                            // allocation still aborts on an exhausted heap, and
+                            // "bounded" is not the same property as "fallible".
+                            name: crate::types::try_dirent_name(".")?,
                             ino: self.ino,
                             file_type: FileType::Directory,
                         },
@@ -977,7 +980,7 @@ impl Inode for RamFsInode {
                     return Ok(Some((
                         2,
                         DirEntry {
-                            name: "..".to_string(),
+                            name: crate::types::try_dirent_name("..")?,
                             ino: self.ino,
                             file_type: FileType::Directory,
                         },
@@ -998,7 +1001,9 @@ impl Inode for RamFsInode {
                         Ok(Some((
                             offset + 1,
                             DirEntry {
-                                name: name.clone(),
+                                // R186-8: attacker-influenced length — the old
+                                // String::clone aborted the kernel on OOM.
+                                name: crate::types::try_dirent_name(name)?,
                                 ino: inode.ino,
                                 file_type,
                             },
