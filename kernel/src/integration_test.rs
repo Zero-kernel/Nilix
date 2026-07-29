@@ -175,6 +175,15 @@ pub fn test_syscalls() {
     // U.S2-SLICE-3 extends it: fd-backed orphans (0 child fds) are REVOKED
     // (CRITICAL-9 slot-leak class), Pipe rides the Socket class, and
     // non-fd-backed caps (Endpoint) stay VERBATIM (BV-3 scoping).
+    // R186-1: pin the capability-reservation half of the open/openat publication
+    // transaction. The production path's single Process guard prevents recursive
+    // locking; this pure CapTable probe specifically verifies that a reserved slot
+    // is invisible until installed, its id is stable, and cancellation cannot
+    // alias the capability that later reuses the slot.
+    kernel_core::syscall::run_fd_publication_transaction_self_test();
+    klog_always!(
+        "    ✓ R186-1 cap reservation: invisible-before-install + id stability + cancel-no-alias"
+    );
     kernel_core::syscall::run_fork_reconcile_refcount_self_test();
     klog_always!(
         "    ✓ U.S3-SLICE-2/U.S2-SLICE-3 fork reconciliation: refcount correction + orphan revoke + BV-3 scoping"

@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
 use mm::{arc_charge_bytes, try_reserve_heap, AdmittedMap, HeapClass};
-use spin::{Mutex, RwLock};
+use spin::Mutex;
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
 use x86_64::{
@@ -551,11 +551,11 @@ fn fork_inner(
         // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
         let credential_arc_reservation = try_reserve_heap(
             HeapClass::CoreProcess,
-            arc_charge_bytes::<RwLock<crate::process::Credentials>>()
+            arc_charge_bytes::<crate::process::SharedCredentials>()
                 .map_err(|_| ForkError::MemoryAllocationFailed)?,
         )
         .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        let credentials = Arc::try_new(RwLock::new(child_credentials))
+        let credentials = Arc::try_new(crate::process::SharedCredentials::new(child_credentials))
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
         let old_credentials = core::mem::replace(&mut child.credentials, credentials);
         drop(old_credentials);
@@ -1111,6 +1111,52 @@ pub unsafe fn copy_page_table_cow(
 /// #PF handler can retry (the page remains read-only, next write re-triggers #PF).
 /// This makes COW resolution IRQ-safe without restructuring the entire handler.
 ///
+/// # R186-10 FIX: remove the redundant global lock; classify the outcome exactly
+///
+/// Two defects were fixed here.
+///
+/// **1. Contention killed valid tasks.** `COW_FAULT_LOCK.try_lock()` failure
+/// returned `Err(ProcessNotFound)`, and the sole `#PF` caller treats every `Err`
+/// as fatal — so any process able to create global COW contention could terminate
+/// unrelated, entirely valid writers.
+///
+/// The repair is not to translate that error better but to delete its cause.
+/// `COW_FAULT_LOCK` was **strictly redundant**: every mutation below runs inside
+/// `with_current_manager`, which holds the single global `PT_LOCK`
+/// (`mm/page_table.rs`) across the whole closure — translate, refcount claim,
+/// frame allocation, copy, unmap, remap, shootdown and release. Two concurrent
+/// COW faults were therefore already serialized by `PT_LOCK` before this lock was
+/// ever consulted; it added a second contention point and no ordering. It is gone,
+/// which eliminates the DoS class rather than mitigating it.
+///
+/// **2. Spinning on `PT_LOCK` from `#PF` can deadlock.** `#PF` is an interrupt
+/// gate (IF=0), and the `PT_LOCK` holder issues cross-CPU TLB shootdown IPIs and
+/// waits for acknowledgement. A faulting CPU that blocks on `PT_LOCK` with
+/// interrupts disabled can never acknowledge, so the holder waits on us while we
+/// wait on the holder. This now uses the non-blocking `try_with_current_manager`
+/// (whose own contract states an exception path must never spin on that lock) and
+/// reports `Busy`.
+///
+/// Retrying on `Busy` is safe *because* it goes through `IRETQ`, which restores
+/// `IF=1`: the shootdown IPI is serviced between attempts, so the holder always
+/// makes progress and the retry always terminates. This is a genuine progress
+/// argument, not an optimistic one — but the handler still bounds the retry so a
+/// pathological same-CPU re-entrancy becomes a diagnosable failure instead of a
+/// silent hang.
+///
+/// # Disposition taxonomy
+///
+/// The previous shape collapsed every `Err` into `NotCow`, so an out-of-memory or
+/// corrupt-metadata failure on a page that genuinely *is* COW was reported as "not
+/// a COW page" — indistinguishable from a real protection violation, and therefore
+/// undiagnosable in the field. Each outcome is now distinct:
+///
+/// - `Handled` — resolved (or already resolved by another CPU); resume.
+/// - `Busy` — `PT_LOCK` contended; re-execute the faulting instruction.
+/// - `NotCow` — genuinely not a COW page; fall through to normal fault handling.
+/// - `Fatal` — a COW page that could not be resolved; the task cannot continue,
+///   but the reason is recorded rather than disguised as `NotCow`.
+///
 /// # Arguments
 ///
 /// * `pid` - 触发页错误的进程ID
@@ -1119,23 +1165,33 @@ pub unsafe fn copy_page_table_cow(
 /// # Safety
 ///
 /// 此函数分配新的物理页并更新页表
-pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result<(), ForkError> {
-    use mm::page_table::with_current_manager;
-    use spin::Mutex;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CowFaultResult {
+    /// COW fault successfully handled, resume execution
+    Handled,
+    /// Page-table lock contended; re-execute the faulting instruction
+    Busy,
+    /// Not a COW fault (page absent, or present and not COW-marked)
+    NotCow,
+    /// A COW page that could not be resolved. Not recoverable for this task.
+    Fatal(CowFaultFailure),
+}
 
-    // R65-21 FIX + R174-A4 FIX: Global lock to serialize COW page fault handling,
-    // now using try_lock() for IRQ safety. On contention, the fault retries naturally
-    // (page remains read-only, next write re-triggers #PF).
-    static COW_FAULT_LOCK: Mutex<()> = Mutex::new(());
-    let _cow_guard = match COW_FAULT_LOCK.try_lock() {
-        Some(guard) => guard,
-        None => {
-            // R174-A4 FIX: Lock contended - return transient error so #PF handler
-            // can retry. The page remains read-only, so the next write will
-            // re-trigger #PF. This is IRQ-safe (no blocking).
-            return Err(ForkError::ProcessNotFound); // Transient contention, retry
-        }
-    };
+/// R186-10: why an otherwise-valid COW resolution could not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CowFaultFailure {
+    /// No physical frame available for the private copy.
+    OutOfMemory,
+    /// COW marker present without consistent refcount metadata, or the
+    /// ownership ledger could not be advanced. Never guess at ownership.
+    MetadataCorrupt,
+    /// The page-table update (unmap/remap/flag change) failed; the previous
+    /// mapping was restored where possible.
+    MappingFailed,
+}
+
+pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFaultResult {
+    use mm::page_table::try_with_current_manager;
 
     let virt = VirtAddr::new(fault_addr as u64);
     let page = Page::containing_address(virt);
@@ -1150,13 +1206,18 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     // 使用基于当前 CR3 的页表管理器，确保操作正确的地址空间
     let mut frame_alloc = FrameAllocator::new();
 
-    with_current_manager(VirtAddr::new(0), |manager| -> Result<(), ForkError> {
+    // R186-10 FIX: non-blocking acquisition (see the deadlock rationale above).
+    // `None` means PT_LOCK is contended, which is transient and retryable — it is
+    // NOT a property of the faulting page and must never terminate the task.
+    let outcome = try_with_current_manager(VirtAddr::new(0), |manager| -> CowFaultResult {
         // R114-3 FIX: Read PTE flags UNDER PT_LOCK via translate_with_flags().
         // This eliminates the TOCTOU window that existed when find_pte() was called
         // outside the lock scope.
-        let (old_phys, flags) = manager
-            .translate_with_flags(virt)
-            .ok_or(ForkError::PageTableCopyFailed)?;
+        let Some((old_phys, flags)) = manager.translate_with_flags(virt) else {
+            // Nothing mapped here at all: this is an ordinary access violation,
+            // not a COW resolution failure.
+            return CowFaultResult::NotCow;
+        };
 
         // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
         // Another thread may have resolved this COW fault while we were waiting for the lock.
@@ -1169,11 +1230,11 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
                 // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
                 // On SMP, other CPUs sharing this address space may have stale TLB entries.
                 mm::flush_current_as_page(virt);
-                return Ok(());
+                return CowFaultResult::Handled;
             } else {
                 // Page is not COW and not writable - this is NOT a COW fault
-                // Return error so caller can handle it appropriately (e.g., SIGSEGV)
-                return Err(ForkError::PageTableCopyFailed);
+                // Let the caller handle it appropriately (e.g., SIGSEGV)
+                return CowFaultResult::NotCow;
             }
         }
 
@@ -1194,7 +1255,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
                     let restored = PAGE_REF_COUNT
                         .restore_unique_claim(old_frame.start_address().as_u64() as usize);
                     debug_assert!(restored, "failed to restore unique COW claim");
-                    return Err(ForkError::PageTableCopyFailed);
+                    return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
                 }
                 if !PAGE_REF_COUNT.finish_unique_claim(old_frame.start_address().as_u64() as usize)
                 {
@@ -1206,7 +1267,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
                         .restore_unique_claim(old_frame.start_address().as_u64() as usize);
                     debug_assert!(restored, "failed to unwind unique COW finalization");
                     mm::flush_current_as_page(virt);
-                    return Err(ForkError::PageTableCopyFailed);
+                    return CowFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
                 }
                 mm::flush_current_as_page(virt);
                 kprintln!(
@@ -1214,20 +1275,24 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
                     pid,
                     fault_addr
                 );
-                return Ok(());
+                return CowFaultResult::Handled;
             }
             CowUniqueClaim::Shared => {}
             CowUniqueClaim::Invalid => {
                 // A COW marker without tracking metadata cannot be repaired
                 // safely: do not allocate/copy and then guess at ownership.
-                return Err(ForkError::PageTableCopyFailed);
+                return CowFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
             }
         }
 
         // 分配新物理页
-        let new_frame = frame_alloc
-            .allocate_frame()
-            .ok_or(ForkError::MemoryAllocationFailed)?;
+        let Some(new_frame) = frame_alloc.allocate_frame() else {
+            // R186-10: a genuine COW page we cannot satisfy under memory
+            // pressure. Reported as OutOfMemory, NOT as "not a COW page" —
+            // the previous collapse made allocator exhaustion look identical
+            // to an ordinary protection violation in every diagnostic.
+            return CowFaultResult::Fatal(CowFaultFailure::OutOfMemory);
+        };
 
         // 复制页内容（使用高半区直映访问物理内存）
         let old_virt = mm::phys_to_virt(old_frame.start_address());
@@ -1237,7 +1302,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         // H-35 fix: Check unmap result - if it fails, deallocate the new frame and return error
         if manager.unmap_page(page).is_err() {
             frame_alloc.deallocate_frame(new_frame);
-            return Err(ForkError::PageTableCopyFailed);
+            return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
         }
 
         // 设置新标志：移除 COW，添加 WRITABLE
@@ -1256,7 +1321,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
             mm::flush_current_as_page(virt);
             // Deallocate the new frame we allocated
             frame_alloc.deallocate_frame(new_frame);
-            return Err(ForkError::PageTableCopyFailed);
+            return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
         }
 
         // H-35 & R68-4 FIX: Flush TLB on ALL CPUs to ensure the new writable mapping is effective.
@@ -1290,8 +1355,13 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
             pid,
             fault_addr
         );
-        Ok(())
-    })
+        CowFaultResult::Handled
+    });
+
+    // R186-10 FIX: `None` is PT_LOCK contention only — transient, and a property
+    // of the system rather than of this page or this task. It must never be
+    // conflated with a resolution failure.
+    outcome.unwrap_or(CowFaultResult::Busy)
 }
 
 // RF178-31 FIX: COW refcount storage is a boot-reserved physical-frame table

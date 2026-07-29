@@ -365,8 +365,11 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         }
         Err(e) => {
             klog!(Error, "      ✗ Failed to load ELF: {:?}", e);
-            // Restore original CR3
+            // R186-13 FIX: Rollback fresh address space on ELF load failure.
+            // Restore saved CR3 FIRST (memory_space must not be active when freed),
+            // then free the leaked kernel address space.
             kernel_core::process::activate_memory_space(saved_cr3, None);
+            kernel_core::process::free_address_space(memory_space);
             return None;
         }
     };
@@ -389,7 +392,12 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
             }
             Err(e) => {
                 klog!(Error, "      ✗ Failed to create KPTI user PML4: {:?}", e);
+                // R186-13 FIX: Rollback fresh address space on KPTI creation failure.
+                // Restore saved CR3 FIRST (memory_space must not be active when freed),
+                // then free the leaked kernel address space. No KPTI user PML4 to free
+                // at this point (creation failed).
                 kernel_core::process::activate_memory_space(saved_cr3, None);
+                kernel_core::process::free_address_space(memory_space);
                 return None;
             }
         }

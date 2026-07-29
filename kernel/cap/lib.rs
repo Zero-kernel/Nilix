@@ -198,6 +198,22 @@ pub struct PreparedCapAllocation<'a> {
 }
 
 impl PreparedCapAllocation<'_> {
+    /// R186-1 FIX: the exact identity this reservation will publish.
+    ///
+    /// `reserve_allocation` consumes both the slot index and the generation up
+    /// front, and `install_reserved` derives the published id from precisely
+    /// those two values, so this is the same `CapId` that [`Self::install`]
+    /// returns — a read of committed reservation state, not a prediction.
+    ///
+    /// Exposing it lets a caller bind the id into the object being published
+    /// (for example `FileOps::set_cap_id`) while the reservation is still
+    /// rollback-armed, so every fallible step of a publication transaction can
+    /// precede every irreversible one.
+    #[inline]
+    pub fn cap_id(&self) -> CapId {
+        CapId::from_parts(self.index, self.generation)
+    }
+
     /// Publish into the already-reserved identity. This performs no allocation
     /// and cannot return a recoverable error; a mismatch is table corruption.
     pub fn install(mut self, entry: CapEntry) -> CapId {

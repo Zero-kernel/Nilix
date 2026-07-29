@@ -89,6 +89,14 @@ pub enum NetNsError {
     InvalidState,
     /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
     NamespaceIdOverflow,
+    /// R186-3 FIX: a required allocation for the namespace, its ARP cache, its
+    /// config budget, or the id registry row could not be satisfied.
+    ///
+    /// `MAX_NET_NS_COUNT` is a CARDINALITY bound, not a byte reservation, so a
+    /// count check cannot stand in for admission: an unprivileged
+    /// `CLONE_NEWUSER|CLONE_NEWNET` reaches namespace construction and must be
+    /// able to fail with ENOMEM rather than reach the allocator's panic handler.
+    OutOfMemory,
 }
 
 /// D3 NETNS-CONFIG: Errors from [`NetNamespace::set_net_config`].
@@ -167,9 +175,10 @@ fn is_configurable_host_ip(ip: net::Ipv4Addr) -> bool {
 ///
 /// # R77-5 FIX
 ///
-/// This guard ensures that the global namespace count is correctly maintained
-/// even if `Arc::new()` fails (OOM) after the count has been incremented.
-/// The guard automatically decrements the count on drop unless `commit()` is called.
+/// This guard owns the global namespace count until ownership is transferred to
+/// a constructed `NetNamespace`. Before that point it automatically decrements
+/// on failure. Afterwards `NetNamespace::drop` is the sole decrement owner,
+/// including when `Arc::try_new` drops its input after an allocation failure.
 ///
 /// ## Problem
 ///
@@ -183,9 +192,10 @@ fn is_configurable_host_ip(ip: net::Ipv4Addr) -> bool {
 ///
 /// Use RAII pattern to ensure automatic rollback:
 /// ```ignore
-/// let guard = NsCountGuard::new(&NET_NS_COUNT)?;  // Count incremented
-/// let child = Arc::new(Self { ... });              // If OOM, guard drops and rolls back
-/// guard.commit();                                  // Success - prevent rollback
+/// let guard = NsCountGuard::new(&NET_NS_COUNT)?; // Count incremented
+/// let child = Self { ... };                       // NetNamespace::drop can now roll back
+/// guard.commit();                                 // Transfer count ownership to child
+/// let child = Arc::try_new(child)?;               // On OOM, child drops exactly once
 /// ```
 struct NsCountGuard {
     counter: &'static AtomicU32,
@@ -210,7 +220,8 @@ impl NsCountGuard {
 
     /// Commit the count increment, preventing rollback on drop.
     ///
-    /// Call this after the namespace has been successfully created.
+    /// Call immediately after constructing the namespace value and before any
+    /// operation that may drop it.
     fn commit(mut self) {
         self.committed = true;
     }
@@ -238,8 +249,14 @@ lazy_static::lazy_static! {
     /// namespace's lifetime (Drop still fires when the last process exits);
     /// rows are removed in NetNamespace::drop, so the map size tracks LIVE
     /// child namespaces (bounded by MAX_NET_NS_COUNT), not cumulative ids.
-    static ref NET_NS_BY_ID: RwLock<BTreeMap<u64, Weak<NetNamespace>>> =
-        RwLock::new(BTreeMap::new());
+    ///
+    /// R186-3 FIX: was `BTreeMap`, whose `insert` is INFALLIBLE — an unprivileged
+    /// namespace creation under memory pressure aborted the kernel while growing
+    /// this map. `AdmittedMap` makes the growth both fallible (`try_insert`) and
+    /// charged against the aggregate heap ledger, so the registry participates in
+    /// admission instead of merely being bounded by a count.
+    static ref NET_NS_BY_ID: RwLock<mm::AdmittedMap<u64, Weak<NetNamespace>>> =
+        RwLock::new(mm::AdmittedMap::new(mm::HeapClass::NetnsConfig));
 }
 
 /// Next available namespace ID (starts at 1, 0 is reserved for root)
@@ -373,9 +390,8 @@ impl NetNamespace {
     ///
     /// # R77-5 FIX
     ///
-    /// Uses `NsCountGuard` to ensure the global namespace count is correctly
-    /// maintained even if `Arc::new()` fails (OOM). The guard automatically
-    /// rolls back the count increment on failure.
+    /// Uses `NsCountGuard` to own the global namespace count until a concrete
+    /// `NetNamespace` exists; ownership then transfers to `NetNamespace::drop`.
     pub fn new_child(parent: Arc<NetNamespace>) -> Result<Arc<Self>, NetNsError> {
         if parent.level >= MAX_NET_NS_LEVEL {
             return Err(NetNsError::MaxDepthExceeded);
@@ -393,23 +409,42 @@ impl NetNamespace {
                 NetNsError::NamespaceIdOverflow
             })?;
 
+        // R186-3 FIX: every allocation on this path is fallible. The count guard
+        // owns rollback until a concrete NetNamespace exists; its Drop owns
+        // rollback from that point through registry publication.
+        //
+        // Before, `Arc::new` (three times) and `BTreeMap::insert` were infallible:
+        // an unprivileged `CLONE_NEWUSER|CLONE_NEWNET` under memory pressure
+        // reached the allocator's panic handler instead of returning ENOMEM.
+        // `MAX_NET_NS_COUNT` did not prevent this — it bounds how MANY namespaces
+        // exist, not how many BYTES each one needs.
+        //
+        // Ordering: allocate subordinate objects, construct the namespace,
+        // transfer count ownership to its Drop, then publish the weak registry
+        // row. Every failure therefore has exactly one rollback owner.
+
         // D3 NETNS-SUBBUDGET-1: per-child config budget, created before the
         // child so the cache can hold its clone from birth.
-        let config_budget = Arc::new(mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES));
-        let child = Arc::new(Self {
+        let config_budget = Arc::try_new(mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES))
+            .map_err(|_| NetNsError::OutOfMemory)?;
+
+        // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry storage
+        // dual-leased against the NetnsConfig class ceiling AND this namespace's
+        // config budget.
+        let arp_cache = Arc::try_new(Mutex::new(ArpCache::with_defaults_budgeted(
+            mm::HeapClass::NetnsConfig,
+            Arc::clone(&config_budget),
+        )))
+        .map_err(|_| NetNsError::OutOfMemory)?;
+
+        let child = Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
             level: parent.level.saturating_add(1),
             refcount: AtomicU32::new(1),
             devices: RwLock::new(BTreeSet::new()), // Empty - only loopback
             has_loopback: true,
-            // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry
-            // storage dual-leased against the NetnsConfig class ceiling AND
-            // this namespace's config budget.
-            arp_cache: Arc::new(Mutex::new(ArpCache::with_defaults_budgeted(
-                mm::HeapClass::NetnsConfig,
-                Arc::clone(&config_budget),
-            ))),
+            arp_cache,
             config_budget,
             // D3 NETNS-CONFIG: children are born UNCONFIGURED — TX fails
             // closed (LinkDown) until set_net_config gives this namespace
@@ -417,16 +452,29 @@ impl NetNamespace {
             // parent's IP/MAC is exactly the identity-borrowing class the
             // per-ns config exists to close.
             net_config: Mutex::new(None),
-        });
+        };
 
-        // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
+        // Count ownership transfers to NetNamespace::drop before Arc allocation.
+        // Arc::try_new drops its input on OOM, so keeping the guard armed across
+        // that call would decrement once from NetNamespace::drop and once again
+        // from NsCountGuard::drop. From this point every failure drops `child`,
+        // which performs the one authoritative rollback.
         count_guard.commit();
+        let child = Arc::try_new(child).map_err(|_| NetNsError::OutOfMemory)?;
 
         // D1-ISO-NETNS-DATAPLANE FIX: publish the id -> namespace row consumed
         // by the TX device-ownership gate. Weak: the registry must never keep a
-        // dead namespace alive. Published AFTER commit so a row always refers to
-        // a fully constructed, counted namespace; the matching remove is in Drop.
-        NET_NS_BY_ID.write().insert(id, Arc::downgrade(&child));
+        // dead namespace alive; the matching remove is in Drop.
+        //
+        // R186-3: fallible insert. On failure the row is absent and `child`
+        // drops, rolling the namespace count back exactly once.
+        if NET_NS_BY_ID
+            .write()
+            .try_insert(id, Arc::downgrade(&child))
+            .is_err()
+        {
+            return Err(NetNsError::OutOfMemory);
+        }
 
         Ok(child)
     }

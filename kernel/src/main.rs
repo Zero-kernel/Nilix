@@ -546,6 +546,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                             lsm::active_policy_name()
                         );
                     }
+                    // R186-11 FIX: Enforce is_secure() predicate under Secure profile.
+                    // The SecurityReport::is_secure() method validates that all required
+                    // protections (NX, W^X, identity cleanup, RNG, kptr guard, Spectre
+                    // mitigations, security tests) are active with zero violations. Under
+                    // Secure profile, boot must fail-closed if any protection is missing or
+                    // degraded. This prevents semantic bypass where the profile is set to
+                    // Secure but hardening features are silently skipped or failed.
+                    if !report.is_secure() {
+                        panic!(
+                            "Secure profile requires all security protections active (is_secure() failed)"
+                        );
+                    }
                 }
                 // Representative-denial self-test on the policy OBJECT —
                 // profile-independent, no audit traffic, no global slot use.

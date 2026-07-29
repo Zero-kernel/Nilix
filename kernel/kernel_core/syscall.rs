@@ -1576,6 +1576,100 @@ pub fn run_fileops_cap_id_self_test() {
     );
 }
 
+/// R186-1: self-test for the open/openat publication transaction.
+///
+/// The CRITICAL bug was that `sys_open_internal` held `process.lock()` across
+/// `FdPublicationReservation::install`, which re-acquired the same non-reentrant
+/// mutex — every successful `open(2)` self-deadlocked. The adversarial review of
+/// the first repair then found a second defect: a capability allocated and
+/// attached before a failing publication was never released.
+///
+/// Both are structural, so this test asserts the structural invariants rather
+/// than trying to reproduce a hang (a real deadlock would wedge the gate instead
+/// of failing it):
+///
+/// 1. A reserved capability slot is INVISIBLE until published — the leak-free
+///    half of the two-phase commit. Dropping the reservation must return the
+///    slot rather than strand a live-but-unreferenced capability.
+/// 2. `PreparedCapAllocation::cap_id()` returns exactly the id `install` later
+///    publishes. The publication path binds that id into the FileHandle BEFORE
+///    the descriptor is installed, so if these ever diverged, every opened file
+///    would carry a capability id that addresses a different slot.
+/// 3. Reserve→drop→reserve reuses the slot index but never the generation, so a
+///    stale id from an abandoned transaction cannot resolve to the next one.
+///
+/// PURE: operates on a standalone `CapTable`; no process or VFS state is touched.
+pub fn run_fd_publication_transaction_self_test() {
+    let table = cap::CapTable::new();
+
+    let entry = || {
+        cap::CapEntry::new(
+            cap::CapObject::RegularFile(cap::RegularFile {
+                inode_id: 4242,
+                fs_id: 7,
+            }),
+            cap::CapRights::READ,
+        )
+    };
+
+    // (1) A reservation that is dropped instead of installed publishes nothing.
+    let abandoned_id = {
+        let reservation = table
+            .prepare_allocation()
+            .expect("R186-1 self-test: capability reservation");
+        let id = reservation.cap_id();
+        assert!(
+            table.lookup(id).is_err(),
+            "R186-1: a RESERVED capability must not be visible to lookup — if it \
+             were, a failed publication would leave a live capability that no \
+             file descriptor references (the accounting leak the first repair \
+             attempt left behind)"
+        );
+        id
+        // reservation drops here → slot returned to the free list
+    };
+    assert!(
+        table.lookup(abandoned_id).is_err(),
+        "R186-1: dropping a prepared capability must cancel it, not publish it"
+    );
+
+    // (2) cap_id() must equal the id install() publishes. The open path attaches
+    // cap_id() to the FileHandle before publishing, so a mismatch would hand
+    // userspace a descriptor pointing at the wrong capability slot.
+    let reservation = table
+        .prepare_allocation()
+        .expect("R186-1 self-test: second capability reservation");
+    let predicted = reservation.cap_id();
+    let published = reservation.install(entry());
+    assert!(
+        predicted == published,
+        "R186-1: PreparedCapAllocation::cap_id() must be the identity install() \
+         publishes; the open path binds it into the FileHandle before publication"
+    );
+    assert!(
+        table.lookup(published).is_ok(),
+        "R186-1: an installed capability must be visible to lookup"
+    );
+
+    // (3) The abandoned transaction's id must not alias the published one, even
+    // though the slot index is reused from the free list.
+    assert!(
+        abandoned_id != published,
+        "R186-1: a cancelled reservation must not share an identity with the \
+         next publication — generations are consumed at reservation time and \
+         are never recycled"
+    );
+    assert!(
+        table.lookup(abandoned_id).is_err(),
+        "R186-1: a stale id from a cancelled transaction must not resolve to the \
+         capability that later reused its slot"
+    );
+
+    table
+        .revoke(published)
+        .expect("R186-1 self-test: revoke published capability");
+}
+
 /// U.S3-SLICE-2: self-test for fork reconciliation of thread-shared cap_table.
 ///
 /// When a CLONE_THREAD thread (sharing its cap_table Arc with siblings) calls
@@ -4184,6 +4278,28 @@ const CLONE_NEWNET: u64 = crate::CLONE_NEWNET;
 /// This is intentional to enable unprivileged container creation.
 const CLONE_NEWUSER: u64 = crate::CLONE_NEWUSER;
 
+// R186-2 FIX: Bitmask of flags incompatible with non-CLONE_VM fork path.
+// Fork creates an independent child with COW address space, inherited namespaces,
+// and independent fd_table/TLS/TID state. It CANNOT honor isolation flags
+// (CLONE_NEW*), sharing flags (CLONE_FS/FILES/SIGHAND), or pointer-setup flags
+// (CLONE_SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID) that require operating
+// on the child after creation. A non-null alternate stack is likewise unsupported
+// on the fork delegation path. Reject every such semantic before sys_fork rather
+// than returning success after silently discarding part of the caller's request.
+const NON_VM_INCOMPATIBLE: u64 = CLONE_NEWNS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_SETTLS
+    | CLONE_CHILD_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_PARENT_SETTID
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD;
+
 /// sys_clone - 创建线程/轻量级进程
 ///
 /// 根据 flags 创建新的执行上下文，支持共享地址空间（线程）或独立地址空间（进程）。
@@ -4599,6 +4715,17 @@ fn sys_clone(
         )
     };
 
+    // R186-2 FIX: Fail-closed validation for non-CLONE_VM + incompatible flags.
+    // Fork (non-CLONE_VM path below at line 4618) creates an independent child with
+    // inherited namespaces and cannot honor isolation/sharing/pointer-setup flags.
+    // Reject the combination here (after capability checks and namespace snapshots
+    // have passed, before any child creation) to prevent silent semantic bypass.
+    // This makes the isolation bypass structurally impossible by blocking delegation
+    // to sys_fork when incompatible flags are present.
+    if flags & CLONE_VM == 0 && (flags & NON_VM_INCOMPATIBLE != 0 || !stack.is_null()) {
+        return Err(SyscallError::EINVAL);
+    }
+
     // 决定使用的地址空间
     let (child_space, is_shared_space) = if flags & CLONE_VM != 0 {
         // CLONE_VM: 共享父进程的地址空间
@@ -4696,27 +4823,15 @@ fn sys_clone(
     let new_ipc_ns = if flags & CLONE_NEWIPC != 0 {
         match crate::ipc_namespace::clone_ipc_namespace(parent_ipc_ns_for_children.clone()) {
             Ok(ns) => {
+                // R186-12 FIX: Audit emission moved to post-commit (after scheduler_permit.commit()).
+                // Namespace creation succeeds here, but the audit SUCCESS record must reflect
+                // the final committed state, not the prepare phase. Early emission causes audit
+                // truth violation: a namespace that rolls back on later error still emitted SUCCESS.
                 klog!(
                     Info,
                     "[sys_clone] Created new IPC namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
-                );
-
-                // F.1 Audit: Emit namespace creation event
-                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
-                let _ = audit::emit(
-                    AuditKind::Process,
-                    AuditOutcome::Success,
-                    get_audit_subject(),
-                    AuditObject::Namespace {
-                        ns_id: ns.id().raw(),
-                        ns_type: CLONE_NEWIPC as u32,
-                        parent_id,
-                    },
-                    &[56, flags, CLONE_NEWIPC], // syscall 56 = clone
-                    0,
-                    crate::time::current_timestamp_ms(),
                 );
 
                 Some(ns)
@@ -4749,28 +4864,16 @@ fn sys_clone(
     let new_net_ns = if flags & CLONE_NEWNET != 0 {
         match crate::net_namespace::clone_net_namespace(parent_net_ns_for_children.clone()) {
             Ok(ns) => {
+                // R186-12 FIX: Audit emission moved to post-commit (after scheduler_permit.commit()).
+                // Namespace creation succeeds here, but the audit SUCCESS record must reflect
+                // the final committed state, not the prepare phase. Early emission causes audit
+                // truth violation: a namespace that rolls back on later error still emitted SUCCESS.
                 klog!(
                     Info,
                     "[sys_clone] Created new network namespace: id={}, level={}, has_loopback={}",
                     ns.id().raw(),
                     ns.level(),
                     ns.has_loopback()
-                );
-
-                // F.1 Audit: Emit namespace creation event
-                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
-                let _ = audit::emit(
-                    AuditKind::Process,
-                    AuditOutcome::Success,
-                    get_audit_subject(),
-                    AuditObject::Namespace {
-                        ns_id: ns.id().raw(),
-                        ns_type: CLONE_NEWNET as u32,
-                        parent_id,
-                    },
-                    &[56, flags, CLONE_NEWNET], // syscall 56 = clone
-                    0,
-                    crate::time::current_timestamp_ms(),
                 );
 
                 Some(ns)
@@ -4807,27 +4910,15 @@ fn sys_clone(
     let new_user_ns = if flags & CLONE_NEWUSER != 0 {
         match crate::user_namespace::clone_user_namespace(parent_user_ns_for_children.clone()) {
             Ok(ns) => {
+                // R186-12 FIX: Audit emission moved to post-commit (after scheduler_permit.commit()).
+                // Namespace creation succeeds here, but the audit SUCCESS record must reflect
+                // the final committed state, not the prepare phase. Early emission causes audit
+                // truth violation: a namespace that rolls back on later error still emitted SUCCESS.
                 klog!(
                     Info,
                     "[sys_clone] Created new user namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
-                );
-
-                // Emit audit event for user namespace creation
-                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
-                let _ = audit::emit(
-                    AuditKind::Process,
-                    AuditOutcome::Success,
-                    get_audit_subject(),
-                    AuditObject::Namespace {
-                        ns_id: ns.id().raw(),
-                        ns_type: CLONE_NEWUSER as u32,
-                        parent_id,
-                    },
-                    &[56, flags, CLONE_NEWUSER], // syscall 56 = clone
-                    0,
-                    crate::time::current_timestamp_ms(),
                 );
 
                 Some(ns)
@@ -4993,12 +5084,12 @@ fn sys_clone(
             };
             let reservation = mm::try_reserve_heap(
                 mm::HeapClass::CoreProcess,
-                mm::arc_charge_bytes::<spin::RwLock<crate::process::Credentials>>()
+                mm::arc_charge_bytes::<crate::process::SharedCredentials>()
                     .map_err(|_| SyscallError::ENOMEM)?,
             )
             .map_err(|_| SyscallError::ENOMEM)?;
-            let credentials =
-                Arc::try_new(spin::RwLock::new(credentials)).map_err(|_| SyscallError::ENOMEM)?;
+            let credentials = Arc::try_new(crate::process::SharedCredentials::new(credentials))
+                .map_err(|_| SyscallError::ENOMEM)?;
             Ok::<_, SyscallError>(Some((credentials, reservation)))
         })();
         match prepared {
@@ -5652,6 +5743,64 @@ fn sys_clone(
     if let Some(guard) = new_mount_table_guard.as_mut() {
         guard.commit();
     }
+
+    // R186-12 FIX: Post-commit audit emission for IPC/NET/USER namespaces.
+    // Audit SUCCESS records must only be emitted after the child is committed to the scheduler.
+    // Early emission (pre-commit) creates audit truth violations: if a later error causes rollback,
+    // the audit log claims SUCCESS for a namespace that was never finalized.
+    // This mirrors the mount namespace audit pattern (RF180-16).
+
+    if let Some(ref new_ipc_ns) = new_ipc_ns {
+        let parent_id = new_ipc_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_ipc_ns.id().raw(),
+                ns_type: CLONE_NEWIPC as u32,
+                parent_id,
+            },
+            &[56, flags, CLONE_NEWIPC],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
+    }
+
+    if let Some(ref new_net_ns) = new_net_ns {
+        let parent_id = new_net_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_net_ns.id().raw(),
+                ns_type: CLONE_NEWNET as u32,
+                parent_id,
+            },
+            &[56, flags, CLONE_NEWNET],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
+    }
+
+    if let Some(ref new_user_ns) = new_user_ns {
+        let parent_id = new_user_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_user_ns.id().raw(),
+                ns_type: CLONE_NEWUSER as u32,
+                parent_id,
+            },
+            &[56, flags, CLONE_NEWUSER],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
+    }
+
     // RF180-16: audit SUCCESS belongs to COMMIT, never PREPARE. Every clone
     // failure above leaves the guard armed, rolls the VFS table back, and emits
     // no success record for a namespace that was never published.
@@ -8923,17 +9072,14 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // R74-3 FIX: Prevent mount namespace divergence in multi-threaded processes.
-    //
-    // setns(CLONE_NEWNS) cannot be used by multi-threaded processes because
-    // it would cause thread-local namespace divergence. All threads in a
-    // thread group must share the same mount namespace.
-    //
-    // This matches Linux behavior.
-    let tgid = {
+    // Snapshot tgid and current mount namespace before validation/LSM work
+    let (tgid, current_mount_ns) = {
         let proc = proc_arc.lock();
-        proc.tgid
+        (proc.tgid, proc.mount_ns.clone())
     };
+
+    // R74-3: Early thread-count validation (non-authoritative, just fail-fast)
+    // The authoritative recount happens under PROCESS_TABLE lock at publication
     let thread_count = crate::thread_group_size(tgid);
     if thread_count > 1 {
         kprintln!(
@@ -8973,26 +9119,103 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         }
     }
 
+    // Get old namespace for audit (from snapshot, avoids re-locking)
+    let old_ns_id = current_mount_ns.id().raw();
+
+    // R186-9 FIX: make the authoritative recount and the namespace publication ONE
+    // transaction, using the sanctioned fail-closed registry primitive.
+    //
+    // The bug: `thread_group_size` above is advisory. It releases every lock before
+    // the switch, so a concurrent `CLONE_THREAD` can publish a sibling into
+    // PROCESS_TABLE in the gap and the group ends up with a SPLIT mount namespace —
+    // exactly the isolation invariant (INV-ISO-01) this check exists to preserve.
+    //
+    // Why `with_process_registry_txn` and not `PROCESS_TABLE.lock()`: taking the
+    // table lock and then BLOCKING on each `Process::inner` inverts the Level-5
+    // order that other paths acquire in the opposite direction (R181-3 / D2-ARC),
+    // which is an ABBA deadlock, not merely a style issue. The transaction is
+    // try-only throughout and fails CLOSED — any contention aborts having mutated
+    // nothing, and the caller reports EAGAIN so userspace retries.
+    //
+    // Fail-closed direction matters here: a skipped sibling could BE the thread we
+    // exist to detect, so an incomplete observation must never be treated as
+    // "single-threaded".
+    //
+    // The recount reproduces `thread_group_size` semantics EXACTLY — same tgid,
+    // excluding Zombie and Terminated. Counting dead siblings would reject a
+    // legitimate single-threaded `setns` merely because an earlier thread had not
+    // yet been reaped.
+    //
+    // AUTHORIZATION: the cap/root gate above ran before this transaction, and it is
+    // sound to rely on that snapshot BECAUSE of what the transaction proves. Nothing
+    // outside this thread group can mutate this process's credentials or capability
+    // table, and the recount proves the group contains exactly one live thread — the
+    // caller, which is executing this syscall and therefore not concurrently changing
+    // its own credentials. There is consequently no actor able to invalidate the
+    // authorization between the check and the publication.
+    //
+    // The displaced namespace Arcs are moved OUT and dropped only after the
+    // transaction returns: a last-reference drop inside the closure would run
+    // arbitrary destructor code (and possibly allocate) while PROCESS_TABLE is held.
+    let publication = crate::process::with_process_registry_txn(|txn| {
+        // Identity. The caller is executing this syscall and `proc_arc` is a held
+        // strong reference, so its PCB cannot be freed nor its pid recycled while
+        // this transaction runs — the slot necessarily still holds the PCB we
+        // authorized. `contains` plus the tgid/namespace revalidation below are
+        // belt-and-braces against a future path that could violate that.
+        if !txn.contains(pid) {
+            return Ok(Err(SyscallError::ESRCH));
+        }
+
+        let mut proc = txn.try_lock_process(pid)?;
+
+        // Authoritative recount, indivisible with CLONE_THREAD publication.
+        // `try_visit_all_except` skips the pid whose guard we hold, so the caller
+        // is counted separately; it is live by contract (running this syscall).
+        let mut live_threads = 1usize;
+        txn.try_visit_all_except(None, |_pid, sibling| {
+            if sibling.tgid == tgid
+                && !matches!(
+                    sibling.state,
+                    crate::process::ProcessState::Zombie | crate::process::ProcessState::Terminated
+                )
+            {
+                live_threads = live_threads.saturating_add(1);
+            }
+        })?;
+        if live_threads > 1 {
+            return Ok(Err(SyscallError::EINVAL));
+        }
+
+        // Revalidate the source: identity and the namespace we authorized against.
+        if proc.tgid != tgid || !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns) {
+            return Ok(Err(SyscallError::EAGAIN));
+        }
+
+        // Publication. Infallible: `Arc::clone` only bumps a refcount, and the
+        // displaced Arcs are handed back so their Drop runs outside the table lock.
+        let displaced_self = core::mem::replace(&mut proc.mount_ns, target_ns.clone());
+        let displaced_children =
+            core::mem::replace(&mut proc.mount_ns_for_children, target_ns.clone());
+        Ok(Ok((displaced_self, displaced_children)))
+    });
+
+    // Contention aborted the observation with nothing mutated.
+    let displaced = match publication {
+        Ok(Ok(displaced)) => displaced,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(SyscallError::EAGAIN),
+    };
+    // Old namespace references released outside every registry lock.
+    drop(displaced);
+
     klog!(
         Info,
-        "[sys_setns] Process {} switching to mount namespace id={}, level={}",
+        "[sys_setns] Process {} switched to mount namespace id={}, level={}",
         pid,
         target_ns.id().raw(),
         target_ns.level()
     );
-
-    // Get old namespace for audit before switching
-    let old_ns_id = {
-        let proc = proc_arc.lock();
-        proc.mount_ns.id().raw()
-    };
-
-    // Switch current process mount namespace (and future children)
-    {
-        let mut proc = proc_arc.lock();
-        proc.mount_ns = target_ns.clone();
-        proc.mount_ns_for_children = target_ns.clone();
-    }
 
     // F.1 Audit: Emit namespace switch event
     let parent_id = target_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
@@ -10513,22 +10736,54 @@ impl FdPublicationReservation {
         })
     }
 
-    fn install(
+    /// R186-1 FIX: publish through a Process guard the caller ALREADY holds.
+    ///
+    /// D2-ARC-FD-PUBLICATION: `install` below acquires `self.process` internally.
+    /// A caller holding that same guard therefore spins forever on the
+    /// non-reentrant mutex — the R186-1 CRITICAL, which every successful
+    /// `open`/`openat` hit. This variant borrows the live guard so a second
+    /// acquisition is impossible by construction.
+    ///
+    /// The error leg settles the reservation THROUGH THE CALLER'S GUARD and
+    /// disarms `active`. That is load-bearing, not tidiness: allowing `Drop` to
+    /// run here would re-enter `self.process.lock()` while the caller still owns
+    /// it, reproducing the very deadlock this method exists to remove.
+    ///
+    /// The returned `FileDescriptor` must be dropped only after the caller
+    /// releases the guard (R170-6: `FileHandle::drop` may re-enter the VFS).
+    fn install_with_guard(
         mut self,
+        proc: &mut crate::process::Process,
         desc: crate::process::FileDescriptor,
     ) -> Result<i32, crate::process::FileDescriptor> {
-        let result = {
-            let mut process = self.process.lock();
-            process.install_reserved_fd(self.fd, desc)
-        };
-
-        match result {
+        match proc.install_reserved_fd(self.fd, desc) {
             Ok(()) => {
                 self.active = false;
                 Ok(self.fd)
             }
-            Err(desc) => Err(desc),
+            Err(desc) => {
+                if !proc.cancel_fd_reservation(self.fd) {
+                    klog!(
+                        Error,
+                        "R186-1: FD publication rollback rejected under caller guard"
+                    );
+                }
+                self.active = false;
+                Err(desc)
+            }
         }
+    }
+
+    /// Publish for callers that hold NO Process guard. This is the only place a
+    /// reservation may acquire the Process lock itself; anyone already holding it
+    /// must use [`Self::install_with_guard`] (R186-1).
+    fn install(
+        self,
+        desc: crate::process::FileDescriptor,
+    ) -> Result<i32, crate::process::FileDescriptor> {
+        let process = self.process.clone();
+        let mut guard = process.lock();
+        self.install_with_guard(&mut guard, desc)
     }
 }
 
@@ -10598,81 +10853,145 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     // RUNG 2: VFS failure auto-rollback via Drop (fd_reservation + PreparedFileHandle)
     let mut file_ops = open_fn(&path_str, flags as u32, mode)?;
 
-    // U.S2-SLICE-3B: Allocate CapId for regular files under SINGLE Process lock
-    let fd = {
+    // U.S2-SLICE-3B / R186-1 FIX: single-guard two-phase publication transaction.
+    //
+    // PHASE 1 — every fallible step, nothing published: credential re-check, LSM
+    // mediation, and capability-slot RESERVATION. Each failure unwinds through
+    // RAII (`PreparedCapAllocation::drop` returns the slot, the FD reservation's
+    // Drop returns the descriptor number and its files.max credit) leaving no
+    // capability and no descriptor visible.
+    //
+    // PHASE 2 — every irreversible step, under the SAME guard, all infallible:
+    // bind the reserved CapId into the handle, install the descriptor into the
+    // reserved slot, publish the capability entry. Both publications are
+    // allocation-free, so there is no window in which one is observable without
+    // the other, and no failure can strand a cap that no handle references.
+    //
+    // This closes BOTH halves of R186-1: the deterministic self-deadlock (the
+    // guard is never re-acquired — `install_with_guard` borrows it) and the
+    // capability-accounting leak the previous `drop(proc)` shape left behind.
+    let (fd, published_cap) = {
         let mut proc = process.lock();
 
         // RUNG 3a: Credential TOCTOU defense
-        if proc.cred_generation() != cred_gen_before {
+        if !proc.cred_generation_is_current(cred_gen_before) {
             drop(proc);
             drop(file_ops); // FileHandle Drop outside lock (R170-6)
             return Err(SyscallError::EAGAIN); // Benign retry signal
         }
 
-        // RUNG 3b: Cap allocation for regular files only
-        // Use FileOps::stat() to check if this is a regular file (avoids VFS module dependency)
+        // Owned handle to the capability table. Taking it by Arc clone ends the
+        // immutable borrow of `proc` immediately, so the reservation below can
+        // coexist with the `&mut proc` that FD publication needs.
+        let cap_table = proc.cap_table.clone();
+
+        // RUNG 3b: Cap reservation for regular files only. Classification is
+        // security-sensitive: a stat failure must abort rather than silently
+        // publishing a regular handle without its capability and LSM mediation.
         const S_IFREG: u32 = 0o100000; // Regular file type
-        if let Ok(stat) = file_ops.stat() {
-            if (stat.mode & S_IFMT) == S_IFREG {
-                // This is a regular file - allocate a capability
-                // (pipes, sockets, devices have their own cap allocation paths)
-                let inode_id = stat.ino;
-                let fs_id = stat.dev;
-
-                // Derive cap rights from open flags
-                let mut rights = cap::CapRights::empty();
-                let acc_mode = open_flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-                if acc_mode == 0 || acc_mode == 2 {
-                    rights |= cap::CapRights::READ;
-                }
-                if acc_mode == 1 || acc_mode == 2 {
-                    rights |= cap::CapRights::WRITE;
-                }
-
-                // Derive cap flags from open flags
-                let mut cap_flags = cap::CapFlags::empty();
-                if open_flags & 0x80000 != 0 {
-                    // O_CLOEXEC
-                    cap_flags |= cap::CapFlags::CLOEXEC;
-                }
-
-                // Allocate the capability via cap_table.allocate()
-                let cap_entry = cap::CapEntry::with_flags(
-                    cap::CapObject::RegularFile(cap::RegularFile { inode_id, fs_id }),
-                    rights,
-                    cap_flags,
-                );
-
-                let cap_id = match proc.cap_table.allocate(cap_entry) {
-                    Ok(cid) => cid,
-                    Err(_e) => {
-                        drop(proc); // Unlock BEFORE Drop
-                        drop(file_ops); // FileHandle Drop outside lock (R170-6)
-                        return Err(SyscallError::EMFILE); // TableFull maps to EMFILE
-                    }
-                };
-
-                // RUNG 4: Attach cap_id to FileHandle via FileOps::set_cap_id()
-                // This calls through the trait, so VFS FileHandle can implement it
-                // without kernel_core needing to import vfs module (avoids circular dependency)
-                file_ops.set_cap_id(cap_id);
-            }
-        }
-
-        // Install the fd (infallible by FdPublicationReservation contract)
-        let fd = match fd_reservation.install(file_ops) {
-            Ok(fd) => fd,
-            Err(rejected) => {
-                // Defense-in-depth: UNREACHABLE by contract, but handle gracefully
+        let stat = match file_ops.stat() {
+            Ok(stat) => stat,
+            Err(_) => {
                 drop(proc);
-                drop(rejected);
-                return Err(SyscallError::EMFILE);
+                drop(file_ops);
+                return Err(SyscallError::EIO);
             }
         };
+        let is_regular = (stat.mode & S_IFMT) == S_IFREG;
 
-        drop(proc); // Unlock
-        fd
+        let prepared_cap = if is_regular {
+            // Derive cap rights from open flags
+            let mut rights = cap::CapRights::empty();
+            let acc_mode = open_flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+            if acc_mode == 0 || acc_mode == 2 {
+                rights |= cap::CapRights::READ;
+            }
+            if acc_mode == 1 || acc_mode == 2 {
+                rights |= cap::CapRights::WRITE;
+            }
+
+            // Derive cap flags from open flags
+            let mut cap_flags = cap::CapFlags::empty();
+            if open_flags & 0x80000 != 0 {
+                // O_CLOEXEC
+                cap_flags |= cap::CapFlags::CLOEXEC;
+            }
+
+            let cap_entry = cap::CapEntry::with_flags(
+                cap::CapObject::RegularFile(cap::RegularFile {
+                    inode_id: stat.ino,
+                    fs_id: stat.dev,
+                }),
+                rights,
+                cap_flags,
+            );
+
+            // Build proc_ctx for LSM/audit using the canonical helper
+            let proc_ctx = lsm_process_ctx_from(&proc);
+            // The context read takes the shared credential read lock. Recheck
+            // after that snapshot so a sibling mutation cannot pair new
+            // credentials with the generation captured before VFS traversal.
+            if !proc.cred_generation_is_current(cred_gen_before) {
+                drop(proc);
+                drop(file_ops);
+                return Err(SyscallError::EAGAIN);
+            }
+
+            // R186-16: LSM mediates the allocation BEFORE any slot is consumed.
+            if let Err(err) =
+                lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+            {
+                drop(proc);
+                drop(file_ops); // FileHandle Drop outside lock (R170-6)
+                return Err(lsm_error_to_syscall(err));
+            }
+
+            match cap_table.prepare_allocation() {
+                Ok(reservation) => Some((reservation, cap_entry, proc_ctx)),
+                Err(err) => {
+                    drop(proc);
+                    drop(file_ops); // FileHandle Drop outside lock (R170-6)
+                    return Err(cap_error_to_syscall(err));
+                }
+            }
+        } else {
+            None
+        };
+
+        // RUNG 4: bind the reserved CapId to the FileHandle via FileOps::set_cap_id()
+        // BEFORE publication. The id is already owned by the reservation, so this
+        // cannot fail and cannot be observed until Phase 2 publishes the entry.
+        if let Some((reservation, _, _)) = prepared_cap.as_ref() {
+            file_ops.set_cap_id(reservation.cap_id());
+        }
+
+        // ---- PHASE 2: publication. No fallible operation may appear below. ----
+        match fd_reservation.install_with_guard(&mut proc, file_ops) {
+            Ok(fd) => {
+                // Publish the capability into its reserved identity (infallible).
+                let published = prepared_cap.map(|(reservation, entry, proc_ctx)| {
+                    let cap_id = reservation.install(entry);
+                    (proc_ctx, cap_id)
+                });
+                (fd, published)
+            }
+            Err(rejected) => {
+                // Defense-in-depth: UNREACHABLE by the reservation contract
+                // (`install_reserved_fd` panics on ledger corruption rather than
+                // returning). Handled anyway so the capability reservation is
+                // released by Drop instead of leaking an unreferenced slot.
+                drop(prepared_cap);
+                drop(proc);
+                drop(rejected); // FileHandle Drop outside lock (R170-6)
+                return Err(SyscallError::EMFILE);
+            }
+        }
     };
+
+    // Audit the capability grant after the Process guard is released.
+    if let Some((proc_ctx, cap_id)) = published_cap {
+        emit_cap_allocate_audit(&proc_ctx, cap_id);
+    }
 
     Ok(fd as usize)
 }
@@ -14967,6 +15286,19 @@ fn to_u8_checked(val: u64) -> Result<u8, SyscallError> {
     Ok(val as u8)
 }
 
+// R186-15 FIX: Validate shift amounts at translation time to prevent
+// arithmetic overflow in overflow-checked kernel builds. Shr(64..=255)
+// would panic in debug/checked builds when executing `acc >>= shift` with
+// a 64-bit accumulator. The semantic constraint is 0..=63, not just u8 range.
+/// Convert u64 to shift amount (0..=63) with semantic validation
+#[inline]
+fn to_shift_amount_checked(val: u64) -> Result<u8, SyscallError> {
+    if val > 63 {
+        return Err(SyscallError::EINVAL);
+    }
+    Ok(val as u8)
+}
+
 /// Translate user-space instruction to kernel SeccompInsn
 fn translate_user_insn(insn: &UserSeccompInsn) -> Result<seccomp::SeccompInsn, SyscallError> {
     match insn.op {
@@ -14981,7 +15313,9 @@ fn translate_user_insn(insn: &UserSeccompInsn) -> Result<seccomp::SeccompInsn, S
         SECCOMP_USER_OP_LD_CONST => Ok(seccomp::SeccompInsn::LdConst(insn.arg0)),
         SECCOMP_USER_OP_AND => Ok(seccomp::SeccompInsn::And(insn.arg0)),
         SECCOMP_USER_OP_OR => Ok(seccomp::SeccompInsn::Or(insn.arg0)),
-        SECCOMP_USER_OP_SHR => Ok(seccomp::SeccompInsn::Shr(to_u8_checked(insn.arg0)?)),
+        SECCOMP_USER_OP_SHR => Ok(seccomp::SeccompInsn::Shr(to_shift_amount_checked(
+            insn.arg0,
+        )?)),
         SECCOMP_USER_OP_JMP_EQ => Ok(seccomp::SeccompInsn::JmpEq(
             insn.arg0,
             to_u8_checked(insn.arg1)?,
@@ -16808,6 +17142,9 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // hook_file_create and hook_file_open with real inode context.
     // See sys_open_internal R105-1 comment for rationale.
 
+    // R186-18: snapshot the shared credential generation before VFS resolve/open.
+    let cred_gen_before = process.lock().cred_generation();
+
     // Get VFS callback with resolve support
     let open_fn = {
         let callback = VFS_OPEN_WITH_RESOLVE_CALLBACK.lock();
@@ -16822,74 +17159,130 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // Call VFS with resolve flags — VFS enforces LSM hooks
     let mut file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
 
-    // U.S2 SLICE-3B: Allocate CapId for regular files (same as sys_open_internal)
-    // This happens AFTER VFS returns but BEFORE fd install, under Process lock
+    // Classification is security-sensitive. A metadata error cannot select the
+    // capability-free branch for a regular handle.
     const S_IFREG: u32 = 0o100000; // Regular file type
-    if let Ok(stat) = file_ops.stat() {
-        if (stat.mode & S_IFMT) == S_IFREG {
-            // Allocate capability for regular file
-            let cap_entry = cap::CapEntry::with_flags(
-                cap::CapObject::RegularFile(cap::RegularFile {
-                    inode_id: stat.ino,
-                    fs_id: stat.dev,
-                }),
-                {
-                    let mut rights = cap::CapRights::empty();
-                    let acc_mode = open_flags & 0x3;
-                    if acc_mode == 0 || acc_mode == 2 {
-                        rights |= cap::CapRights::READ;
-                    }
-                    if acc_mode == 1 || acc_mode == 2 {
-                        rights |= cap::CapRights::WRITE;
-                    }
-                    rights
-                },
-                {
-                    let mut cap_flags = cap::CapFlags::empty();
-                    if open_flags & 0x80000 != 0 {
-                        cap_flags |= cap::CapFlags::CLOEXEC;
-                    }
-                    cap_flags
-                },
-            );
-
-            // R184-2 FIX: Hold Process lock across both cap allocation AND set_cap_id
-            // to maintain the allocate_file_cap safety contract (line 2895): "The caller
-            // MUST immediately call `file_handle.set_cap_id(cap_id)` after this returns Ok".
-            //
-            // SAFETY PROOF: The original code released the lock between allocation and
-            // attachment, creating a window where:
-            // 1. Cap is allocated (refcount=1) but not yet attached to the FileHandle
-            // 2. A concurrent CLONE_THREAD could observe the cap without its fd installed
-            // 3. If fd_reservation.install() subsequently fails (line 16472), the orphaned
-            //    cap would never be decremented (no handle knows about it)
-            //
-            // This pattern is inconsistent with sys_open_internal (lines 10307-10319),
-            // which correctly holds the lock across both operations. The fix matches the
-            // canonical pattern: allocate → attach → unlock → install fd.
-            //
-            // spin::once::Once is a spinlock (not a blocking mutex), and CapTable::allocate()
-            // is documented as LEAF (line 2892), so holding the lock across set_cap_id is safe.
-            let proc_guard = process.lock();
-            match proc_guard.cap_table.allocate(cap_entry) {
-                Ok(cap_id) => {
-                    file_ops.set_cap_id(cap_id); // R184-2 FIX: BEFORE unlock
-                    drop(proc_guard);
-                }
-                Err(_) => {
-                    drop(proc_guard);
-                    drop(file_ops); // FileHandle Drop outside lock
-                    return Err(SyscallError::EMFILE);
-                }
-            }
+    let stat = match file_ops.stat() {
+        Ok(stat) => stat,
+        Err(_) => {
+            drop(file_ops);
+            return Err(SyscallError::EIO);
         }
+    };
+    if (stat.mode & S_IFMT) == S_IFREG {
+        // Allocate capability for regular file
+        let cap_entry = cap::CapEntry::with_flags(
+            cap::CapObject::RegularFile(cap::RegularFile {
+                inode_id: stat.ino,
+                fs_id: stat.dev,
+            }),
+            {
+                let mut rights = cap::CapRights::empty();
+                let acc_mode = open_flags & 0x3;
+                if acc_mode == 0 || acc_mode == 2 {
+                    rights |= cap::CapRights::READ;
+                }
+                if acc_mode == 1 || acc_mode == 2 {
+                    rights |= cap::CapRights::WRITE;
+                }
+                rights
+            },
+            {
+                let mut cap_flags = cap::CapFlags::empty();
+                if open_flags & 0x80000 != 0 {
+                    cap_flags |= cap::CapFlags::CLOEXEC;
+                }
+                cap_flags
+            },
+        );
+
+        // R184-2 FIX: Hold Process lock across both cap allocation AND set_cap_id
+        // to maintain the allocate_file_cap safety contract (line 2895): "The caller
+        // MUST immediately call `file_handle.set_cap_id(cap_id)` after this returns Ok".
+        //
+        // SAFETY PROOF: The original code released the lock between allocation and
+        // attachment, creating a window where:
+        // 1. Cap is allocated (refcount=1) but not yet attached to the FileHandle
+        // 2. A concurrent CLONE_THREAD could observe the cap without its fd installed
+        // 3. If fd_reservation.install() subsequently fails, the orphaned cap would
+        //    never be decremented (no handle knows about it)
+        //
+        // R186-16: LSM mediates the allocation and the grant is audited.
+        //
+        // R186-1 FIX: the same single-guard two-phase transaction as
+        // `sys_open_internal`. Reserving the capability slot (fallible) strictly
+        // before publishing both the descriptor and the capability entry
+        // (infallible) removes the leak window this comment used to describe as
+        // merely theoretical: a failing `install` no longer strands an allocated,
+        // unreferenced capability.
+        let mut proc_guard = process.lock();
+        if !proc_guard.cred_generation_is_current(cred_gen_before) {
+            drop(proc_guard);
+            drop(file_ops);
+            return Err(SyscallError::EAGAIN);
+        }
+        let cap_table = proc_guard.cap_table.clone();
+
+        // Build proc_ctx for LSM/audit using the canonical helper
+        let proc_ctx = lsm_process_ctx_from(&proc_guard);
+        if !proc_guard.cred_generation_is_current(cred_gen_before) {
+            drop(proc_guard);
+            drop(file_ops);
+            return Err(SyscallError::EAGAIN);
+        }
+
+        if let Err(err) =
+            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+        {
+            drop(proc_guard);
+            drop(file_ops); // FileHandle Drop outside lock
+            return Err(lsm_error_to_syscall(err)); // Preserve EPERM from LSM
+        }
+
+        let reservation = match cap_table.prepare_allocation() {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                drop(proc_guard);
+                drop(file_ops); // FileHandle Drop outside lock
+                return Err(cap_error_to_syscall(err));
+            }
+        };
+
+        file_ops.set_cap_id(reservation.cap_id()); // R184-2 FIX: BEFORE publication
+
+        // ---- publication: infallible from here ----
+        let fd = match fd_reservation.install_with_guard(&mut proc_guard, file_ops) {
+            Ok(fd) => fd,
+            Err(rejected) => {
+                drop(reservation);
+                drop(proc_guard);
+                drop(rejected); // FileHandle Drop outside lock
+                return Err(SyscallError::EMFILE);
+            }
+        };
+        let cap_id = reservation.install(cap_entry);
+        drop(proc_guard);
+
+        emit_cap_allocate_audit(&proc_ctx, cap_id);
+        return Ok(fd as usize);
     }
 
-    // O_CLOEXEC flag
-    let fd = fd_reservation.install(file_ops).map_err(|rejected| {
-        drop(rejected);
-        SyscallError::EMFILE
-    })?;
+    // Non-regular files carry no capability, but still publish only if the VFS
+    // traversal's credential generation remains current.
+    let mut proc_guard = process.lock();
+    if !proc_guard.cred_generation_is_current(cred_gen_before) {
+        drop(proc_guard);
+        drop(file_ops);
+        return Err(SyscallError::EAGAIN);
+    }
+    let fd = match fd_reservation.install_with_guard(&mut proc_guard, file_ops) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            drop(proc_guard);
+            drop(rejected);
+            return Err(SyscallError::EMFILE);
+        }
+    };
 
     Ok(fd as usize)
 }

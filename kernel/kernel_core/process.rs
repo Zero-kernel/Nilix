@@ -1898,28 +1898,11 @@ pub struct Process {
     // ========== 进程凭证 (DAC支持) ==========
     /// R39-3 FIX: 共享凭证结构
     ///
-    /// 使用 Arc<RwLock<Credentials>> 实现线程间共享凭证。
+    /// 使用 Arc<SharedCredentials> 实现线程间共享凭证和代际。
     /// CLONE_THREAD 创建的线程共享同一个 Arc，因此 setuid/setgid
     /// 等操作会影响所有同进程的线程（符合 POSIX 语义）。
     /// 普通 fork 会 clone 凭证到新的 Arc。
-    pub credentials: Arc<RwLock<Credentials>>,
-
-    /// U.S2 SLICE-3B: Credential generation counter for LSM TOCTOU defense.
-    ///
-    /// Incremented atomically whenever credentials are mutated (setuid/setgid/
-    /// setresuid/setresgid/setgroups/setfsuid/setfsgid/capset/exec credential
-    /// reset). VFS open operations capture this generation at ladder entry and
-    /// validate it at cap allocation (inside the LSM hook's credential read) to
-    /// detect credential changes during the lock-free VFS path traversal, closing
-    /// the TOCTOU window where a racing credential mutation could grant authority
-    /// to a capability that was authorized under stale credentials.
-    ///
-    /// Born at 0; incremented via `fetch_add(1, AcqRel)` at every credential
-    /// mutation site (the Release ensures the credential write is visible before
-    /// the generation bump; the Acquire on read ensures the generation check
-    /// happens before the credential read). A generation mismatch triggers EAGAIN
-    /// retry (syscall layer re-enters with fresh credentials + generation).
-    pub cred_generation: AtomicU64,
+    pub credentials: Arc<SharedCredentials>,
 
     /// 文件创建掩码 (umask)
     /// 新建文件的权限 = mode & !umask
@@ -2196,7 +2179,7 @@ impl Process {
         ))));
         let cap_table = Arc::new(CapTable::new());
         let thread_group_exiting = Arc::new(AtomicBool::new(false));
-        let credentials = Arc::new(RwLock::new(Credentials {
+        let credentials = Arc::new(SharedCredentials::new(Credentials {
             uid: 65534,
             gid: 65534,
             euid: 65534,
@@ -2232,7 +2215,7 @@ impl Process {
         for bytes in [
             arc_charge_bytes::<Mutex<MmState>>(),
             arc_charge_bytes::<AtomicBool>(),
-            arc_charge_bytes::<RwLock<Credentials>>(),
+            arc_charge_bytes::<SharedCredentials>(),
         ] {
             let bytes = bytes.map_err(|_| ProcessCreateError::OutOfMemory)?;
             fixed_total = fixed_total
@@ -2275,7 +2258,7 @@ impl Process {
         let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
         let thread_group_exiting =
             Arc::try_new(AtomicBool::new(false)).map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let credentials = Arc::try_new(RwLock::new(Credentials {
+        let credentials = Arc::try_new(SharedCredentials::new(Credentials {
             uid: 65534,
             gid: 65534,
             euid: 65534,
@@ -2380,7 +2363,7 @@ impl Process {
         mm: Arc<Mutex<MmState>>,
         cap_table: Arc<CapTable>,
         thread_group_exiting: Arc<AtomicBool>,
-        credentials: Arc<RwLock<Credentials>>,
+        credentials: Arc<SharedCredentials>,
         heap_charge: Option<HeapCharge>,
     ) -> Self {
         Process {
@@ -2463,8 +2446,6 @@ impl Process {
             // to root explicitly by create_process(), and fork()/clone() inherit
             // credentials from the parent process via independent clone.
             credentials,
-            // U.S2 SLICE-3B: Credential generation starts at 0 (born-clean).
-            cred_generation: AtomicU64::new(0),
             umask: 0o022,
             // OOM killer 支持 - 默认中立设置
             nice: 0,
@@ -3434,16 +3415,17 @@ impl Process {
     /// defense. Incremented on every credential mutation (setuid/setgid/setgroups).
     #[inline]
     pub fn cred_generation(&self) -> u64 {
-        self.cred_generation.load(Ordering::Acquire)
+        self.credentials.generation()
     }
 
-    /// U.S2-3B FIX: Increment credential generation counter after any credential
-    /// mutation. Called by setuid/setgid/setgroups syscalls and exec credential
-    /// transitions.
+    /// Check a VFS authorization snapshot while holding the shared credential
+    /// read lock. A writer publishes its new generation before releasing the
+    /// matching write lock, so this cannot pair post-mutation credentials with
+    /// a pre-mutation generation.
     #[inline]
-    pub fn bump_cred_generation(&self) {
-        // lint-fetch-add: allow - generation counter, wrapping is safe
-        self.cred_generation.fetch_add(1, Ordering::Release);
+    pub fn cred_generation_is_current(&self, expected: u64) -> bool {
+        let _credentials = self.credentials.read();
+        self.credentials.generation() == expected
     }
 }
 
@@ -5617,6 +5599,48 @@ pub struct Credentials {
     pub supplementary_groups: AdmittedVec<u32>,
 }
 
+/// R186-18: credentials and their mutation generation share one Arc identity.
+///
+/// `CLONE_THREAD` siblings already share the credential lock; keeping the
+/// generation in the same object ensures a mutation by any sibling invalidates
+/// every opener's snapshot. Writers publish the generation after a successful
+/// mutation while still holding the write lock. Final authorization snapshots
+/// take the read lock before checking the generation, so they cannot observe new
+/// credentials paired with the old generation.
+#[derive(Debug)]
+pub struct SharedCredentials {
+    credentials: RwLock<Credentials>,
+    generation: AtomicU64,
+}
+
+impl SharedCredentials {
+    pub fn new(credentials: Credentials) -> Self {
+        Self {
+            credentials: RwLock::new(credentials),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn publish_mutation(&self) {
+        // lint-fetch-add: allow - generation counter, wrapping is safe
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl core::ops::Deref for SharedCredentials {
+    type Target = RwLock<Credentials>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.credentials
+    }
+}
+
 /// Allocation-free scalar credential snapshot used by authorization callers.
 #[derive(Debug, Clone, Copy)]
 pub struct CredentialIds {
@@ -5899,7 +5923,10 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), Credential
     }
     let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
     let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
-    let credentials = Arc::clone(&process.lock().credentials);
+    let credentials = {
+        let proc = process.lock();
+        Arc::clone(&proc.credentials)
+    };
     let mut creds = credentials.write();
     if creds.euid != 0 {
         return Err(CredentialsError::PermissionDenied);
@@ -5910,6 +5937,10 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), Credential
         .map_err(|_| CredentialsError::OutOfMemory)?;
     normalize_groups(&mut replacement);
     let old = core::mem::replace(&mut creds.supplementary_groups, replacement);
+    // R186-18: publish while the write lock still excludes authorization
+    // snapshots. The generation belongs to this shared credential object, so
+    // every CLONE_THREAD sibling observes the mutation.
+    credentials.publish_mutation();
     drop(creds);
     drop(old);
     Ok(())
@@ -5933,7 +5964,10 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), Credential
 pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
     let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
     let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
-    let credentials = Arc::clone(&process.lock().credentials);
+    let credentials = {
+        let proc = process.lock();
+        Arc::clone(&proc.credentials)
+    };
     let mut creds = credentials.write();
     if creds.euid != 0 {
         return Err(CredentialsError::PermissionDenied);
@@ -5952,6 +5986,7 @@ pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
             .push_reserved(gid)
             .map_err(|_| CredentialsError::OutOfMemory)?;
         normalize_groups(&mut creds.supplementary_groups);
+        credentials.publish_mutation();
     }
     Ok(())
 }
@@ -5973,13 +6008,20 @@ pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
 pub fn remove_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
     let pid = current_pid().ok_or(CredentialsError::NoCurrentProcess)?;
     let process = get_process(pid).ok_or(CredentialsError::NoCurrentProcess)?;
-    let credentials = Arc::clone(&process.lock().credentials);
+    let credentials = {
+        let proc = process.lock();
+        Arc::clone(&proc.credentials)
+    };
     let mut creds = credentials.write();
     if creds.euid != 0 {
         return Err(CredentialsError::PermissionDenied);
     }
 
+    let old_len = creds.supplementary_groups.len();
     creds.supplementary_groups.retain(|&g| g != gid);
+    if creds.supplementary_groups.len() != old_len {
+        credentials.publish_mutation();
+    }
     Ok(())
 }
 
