@@ -931,8 +931,16 @@ struct AuditRing {
     next_id: u64,
     /// Hash of the last event (chain head) - SHA-256
     prev_hash: [u8; 32],
-    /// Accumulated dropped count since last emit
-    dropped: u64,
+    // R186-14 FIX: Separate dropped counters to prevent stats() reporting zero.
+    // Before: `mem::take(&mut self.dropped)` in push() transferred the counter
+    // into event.dropped, resetting the field to zero, so stats() always returned
+    // zero and the user never saw the cumulative drop count.
+    /// Cumulative dropped count since boot (never reset, for stats() API)
+    dropped_total: u64,
+    /// Dropped count since last snapshot (reset on drain_into, for snapshot metadata)
+    dropped_since_snapshot: u64,
+    /// Dropped count for next event (transferred via mem::take in push())
+    dropped_pending: u64,
     /// RF178-21 FIX: Changes whenever the buffered export view changes.
     ///
     /// Export and snapshot use this sequence to reject a stale pre-allocation
@@ -963,7 +971,9 @@ impl AuditRing {
             len: 0,
             next_id: 0,
             prev_hash: ZERO_HASH,
-            dropped: 0,
+            dropped_total: 0,          // R186-14 FIX: Cumulative counter for stats()
+            dropped_since_snapshot: 0, // R186-14 FIX: Since-snapshot for drain_into()
+            dropped_pending: 0,        // R186-14 FIX: Pending for next event
             content_version: 0,
             hmac_key: HmacKey::empty(), // R65-15 FIX: Initialize empty key
         })
@@ -999,7 +1009,10 @@ impl AuditRing {
         // RF178-20 FIX: Never change authentication mode after record zero.
         // If an early emitter won the race, this boot remains uniformly SHA
         // rather than producing a chain no single verifier can validate.
-        if self.next_id != 0 || self.len != 0 || self.dropped != 0 || self.prev_hash != ZERO_HASH {
+        if self.next_id != 0 || self.len != 0
+            || self.dropped_total != 0  // R186-14 FIX: Check cumulative counter
+            || self.prev_hash != ZERO_HASH
+        {
             return Err(AuditError::KeyAlreadySet);
         }
         self.hmac_key.data[..key.len()].copy_from_slice(key);
@@ -1035,7 +1048,10 @@ impl AuditRing {
 
         // Evict oldest event if buffer is full
         if self.len == self.buf.len() {
-            self.dropped = self.dropped.saturating_add(1);
+            // R186-14 FIX: Increment all three counters on drop
+            self.dropped_total = self.dropped_total.saturating_add(1);
+            self.dropped_since_snapshot = self.dropped_since_snapshot.saturating_add(1);
+            self.dropped_pending = self.dropped_pending.saturating_add(1);
             self.buf[self.head] = None;
             self.head = (self.head + 1) % self.buf.len();
             self.len -= 1;
@@ -1045,7 +1061,9 @@ impl AuditRing {
         event.id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         event.prev_hash = self.prev_hash;
-        event.dropped = core::mem::take(&mut self.dropped);
+        // R186-14 FIX: Transfer only dropped_pending into event, leaving
+        // dropped_total and dropped_since_snapshot intact for stats/snapshot
+        event.dropped = core::mem::take(&mut self.dropped_pending);
 
         // R65-15 FIX: Use HMAC-SHA256 when key is set, otherwise plain SHA-256
         event.hash = if self.hmac_key.is_set() {
@@ -1088,10 +1106,13 @@ impl AuditRing {
             }
         }
 
+        // R186-14 FIX: Snapshot metadata uses dropped_since_snapshot counter,
+        // then resets it. dropped_total remains intact for stats() API.
         let metadata = AuditSnapshotMetadata {
-            dropped: self.dropped,
+            dropped: self.dropped_since_snapshot,
             tail_hash: self.tail_hash(),
         };
+        self.dropped_since_snapshot = 0; // R186-14 FIX: Reset since-snapshot counter
 
         for i in 0..drain_len {
             let idx = (self.head + i) % self.buf.len();
@@ -1268,10 +1289,12 @@ impl AuditRing {
 
     /// Get statistics
     fn stats(&self) -> AuditStats {
+        // R186-14 FIX: Return dropped_total (cumulative lifetime counter)
+        // instead of dropped (which was reset to zero by mem::take in push())
         AuditStats {
             total_events: self.next_id,
             buffered_events: self.len as u64,
-            dropped_events: self.dropped,
+            dropped_events: self.dropped_total,
             capacity: self.buf.len() as u64,
             tail_hash: self.prev_hash,
         }
