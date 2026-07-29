@@ -11748,6 +11748,19 @@ impl SocketTable {
                     }
                 }
 
+                // R186-5 FIX: SYN_SENT deadline — see the identical arm in
+                // `run_tcp_timers_blocking` for the full rationale. Both sweeps must
+                // carry it: whichever one runs must be able to reap an active open
+                // whose SYN was parked-and-dropped on the ARP queue, or simply lost.
+                if tcp_state.control.state == TcpState::SynSent {
+                    let started = tcp_state.control.last_activity;
+                    if started == 0 {
+                        tcp_state.control.last_activity = current_time_ms;
+                    } else if current_time_ms.saturating_sub(started) >= TCP_SYN_TIMEOUT_MS {
+                        should_cleanup = true;
+                    }
+                }
+
                 // R65-5 FIX: FIN_WAIT_2 idle timeout handling
                 //
                 // Without this timeout, connections can remain in FIN_WAIT_2 indefinitely
@@ -12158,6 +12171,47 @@ impl SocketTable {
                         && current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS
                     {
                         should_cleanup = true;
+                    }
+                }
+
+                // R186-5 FIX: give SYN_SENT a durable timeout owner.
+                //
+                // `SYN_SENT` was the one active state with NO timer at all. The
+                // initial SYN is never placed in `send_buffer`, so the data
+                // retransmission arm below (which requires a non-empty send buffer)
+                // never selects it, `control.retries` is never advanced for it, and
+                // the `retries >= TCP_MAX_RETRIES` cleanup can therefore never fire.
+                // `TCP_SYN_TIMEOUT_MS` was consulted only against a LISTENER's
+                // syn_queue — never against a connecting socket.
+                //
+                // Consequences, both reachable by an unprivileged process:
+                //   - A nonblocking `connect()` to an unresolved on-link address
+                //     returns EINPROGRESS after the frame is merely PARKED on the
+                //     ARP queue. Every terminal outcome for a parked frame
+                //     (eviction, TTL expiry, flush on reconfiguration, transmit
+                //     failure) silently drops it, leaving the tuple, the ephemeral
+                //     port, the TCB and the connection credit charged until an
+                //     explicit close that may never come.
+                //   - Even a SYN that reaches the wire and is simply lost leaves the
+                //     same residue.
+                // Flooding either case exhausts the 1024-per-netns / 4096 global
+                // connection caps.
+                //
+                // A timeout here is the durable owner the state machine requires,
+                // and it closes both paths with one mechanism rather than patching
+                // each parked-frame terminal: however a socket arrives in SYN_SENT,
+                // it now has a deadline. `last_activity` is stamped when SYN_SENT is
+                // published (`TcpReplyOperation::commit`), so the deadline starts at
+                // acceptance. Reaching it tears the connection down and marks it
+                // timed-out, which releases every charge and makes the failure
+                // observable to poll/select instead of hanging silently.
+                if tcp_state.control.state == TcpState::SynSent {
+                    let started = tcp_state.control.last_activity;
+                    if started == 0 {
+                        tcp_state.control.last_activity = current_time_ms;
+                    } else if current_time_ms.saturating_sub(started) >= TCP_SYN_TIMEOUT_MS {
+                        should_cleanup = true;
+                        mark_timeout_close = true;
                     }
                 }
 
