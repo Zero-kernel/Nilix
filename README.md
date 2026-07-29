@@ -16,7 +16,7 @@ A security-first hybrid microkernel operating system written in Rust for the x86
 ## 1. Overview
 
 Nilix is an enterprise-grade hybrid kernel inspired by Linux's modular design, hardened
-through **181 successive security-audit rounds**. It pairs a capability- and LSM-gated
+through **186 successive security-audit rounds**. It pairs a capability- and LSM-gated
 in-kernel hot path with a roadmap toward a de-privileged Linux-compatible user-space
 personality.
 
@@ -39,10 +39,18 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate is currently **BLOCKED on streak 1/3** (reset by R184, 
-rebuilt by R185). See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate is currently **BLOCKED** on one HIGH finding
+(`R186-4`, VMA/MM aggregate admission) and its design parent. The zero-HIGH streak is **0/3**;
+all other R186 actionable findings are fixed. See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-07-28:** R186 remediation — 16 of 17 actionable findings are fully fixed and one
+  remains open. The landed set removes the open/openat publication
+  deadlock, makes netns and VFS allocation paths fallible, validates VirtIO PCI capability
+  windows against atomically sized BARs with device decoders off, rejects invalid ext2 inode
+  and block-ownership aliases, gives `SYN_SENT` a terminal timeout owner, distinguishes
+  retryable COW contention, shares credential generations across threads, and makes
+  audit/capability reporting truthful. The default gate is **31 passed / 39 deferred / 0 failed**.
 - **2026-07-27:** D3 PENDING-FRAME v2 — park-on-miss + retransmit-on-learn architecture retires
   gateway-fallback delivery. On-link ARP misses now park data frames in a per-cache 8-slot FIFO
   (3-second TTL, oldest-evicted on full) and probe for the neighbor; learned neighbors trigger
@@ -315,7 +323,7 @@ Four parallel jobs:
 |-----|------|---------|
 | **rustfmt + clippy** | `make fmt-check` · `make clippy` | All crates rustfmt-clean; clippy reports no errors |
 | **build** | `make build` | Bootloader + kernel compile (PIE / build-std / hardened flags) |
-| **custom lints** | `make lint` | Four grep-based source gates pass (below) |
+| **custom lints** | `make lint` | Four structural source lints plus VFS fallibility and ABI-layout gates pass (below) |
 | **boot + test + musl** | `make boot-check` · `make test` · `make musl-check` | Kernel boots clean to user space, runtime suite scores clean, and a static-musl binary runs end-to-end |
 
 ### 5.2 Boot & conformance gates
@@ -342,7 +350,7 @@ normal end of a healthy run).
 
 ### 5.3 Custom source lints (`make lint`)
 
-Lightweight grep-based gates that catch regressions the compiler can't:
+Six repository-specific gates catch invariants the compiler cannot prove:
 
 | Gate | Enforces |
 |------|----------|
@@ -350,6 +358,8 @@ Lightweight grep-based gates that catch regressions the compiler can't:
 | `lint-smap` | Only `usercopy.rs` may instantiate `UserAccessGuard` (SMAP-window minimization) |
 | `lint-fetch-add` | No bare `fetch_add(1)` for IDs/refcounts in core/VFS paths — use `fetch_update` + `checked_add` (or an explicit `// lint-fetch-add: allow`) |
 | `lint-repr-c-copy` | Every `from_raw_parts` / `copy_nonoverlapping` / `transmute` on a `#[repr(C)]` struct at the user boundary must carry a padding-safety annotation |
+| `lint-fallible` | Recoverable VFS paths, especially `readdir`, must use fallible name/allocation staging; its fixture self-test must catch 22 candidates with 0 false positives |
+| `abi-check` | Kernel Rust `#[repr(C)]` layouts must match the cited Linux x86-64 UAPI oracle (11 structs, 100 values, 17 tripwires, with a C compiler cross-check) |
 
 ### 5.4 Extended test suite (NEW)
 
@@ -451,19 +461,19 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **185** (R185 completed 2026-07-24) |
-| Cumulative findings | ~1,315 |
-| Findings fixed/resolved | ~1,161 |
-| Latest round | R185 (clean) — streak rebuilt to 1/3 |
-| 1.0-Preview release gate | **BLOCKED** — zero-HIGH streak 1/3 (need 2 more clean rounds) |
+| Audit rounds | **186** (R186 completed 2026-07-28) |
+| Cumulative findings | ~1,333 (historical IDs include merged/refuted findings) |
+| Findings fixed/resolved | ~1,177 |
+| Latest round | R186 — 16 fixed, 1 actionable open, 1 INFO |
+| Current actionable debt | **1 HIGH** (`R186-4`) |
+| 1.0-Preview release gate | **BLOCKED** — one HIGH remains; zero-HIGH streak 0/3 |
 
-The most recent work includes **R184 review-fix** (4 findings from R183 follow-up) and the 
-**design-queue closure round** (2026-07-24): both D1 findings resolved (D1-RES heap oracle + 
-R1-R4 fixes; D1-ISO type-enforced TX token), all D2s dispositioned (D2-ABI including MUSL-STAT 
-layout fixes, D2-ERR, D2-TST), leaving only D3-backlog items. R185 audit was clean, rebuilding 
-the zero-HIGH streak to 1/3. The 1.0-Preview gate is **BLOCKED on streak only** — need 2 more 
-clean rounds (R186 → 2/3, R187 → 3/3 → UNBLOCKED). Per-round reports live in `docs/review/`, 
-and the live plan is `docs/review/nextplan/`.
+R186 found 18 issues in total: 17 actionable findings and one INFO. Sixteen actionables are
+fully fixed, including `R186-18` through a generation counter owned by the shared credential
+object and checked by both open ladders; `R186-4` remains the sole HIGH blocker. The round
+therefore reset the zero-HIGH streak to 0/3 and reopened the aggregate heap-admission design
+parent. See the [R186 report](docs/review/audits/qa-2026-07-28.md) for the exact status and the
+[current plan](docs/review/nextplan/next-phase-plan-2026-07-23-v2.md) for the remaining work.
 
 ---
 

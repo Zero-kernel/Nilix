@@ -2,6 +2,11 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R186 Fixes (July 2026)
+
+- **[R186 audit/fix record](../audits/qa-2026-07-28.md)** - 16 actionables fixed and `R186-4` open; includes safety rationale, convergence notes, and gate results.
+- **[Current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)** - Live remaining-work and release-gate status.
+
 ## R181 Fixes (July 2026)
 
 - **[R181-fix-summary.md](R181-fix-summary.md)** - R181 fix round (5/5 actionable closed: futex errno class, CLONE_VM migration re-count primitive both front doors, accept backoff + 2 documented dispositions; MODE C, avg 1.2 iterations)
@@ -62,7 +67,7 @@ This directory contains fix plans, implementation details, and summaries for sec
 - Resource exhaustion prevention
 
 ### Architecture Compliance
-- IRQ safety propagation (see [../../safety/](../../safety/))
+- IRQ safety propagation (see [../../overview/06-security/safety/](../../overview/06-security/safety/))
 - Lock hierarchy enforcement
 - TLB coherency fixes
 - FPU state management
@@ -79,7 +84,8 @@ All fixes must pass:
 - ✅ Build (make build exit 0)
 - ✅ Lint (clippy clean)
 - ✅ Unit tests (cargo test)
-- ✅ Integration tests (17 single-core + 22 SMP tests)
+- ✅ Default runtime gate (`make test`; currently 31 passed / 39 deferred / 0 failed)
+- ✅ Targeted SMP/boot gates when the affected path requires them
 - ✅ Boot check (serial success markers)
 - ✅ Codex peer review (convergence gate)
 
@@ -87,6 +93,6 @@ All fixes must pass:
 
 - **[../audits/](../audits/)** - Security audit reports
 - **[../remediation/](../remediation/)** - Remediation roadmaps
-- **[../../reports/](../../reports/)** - Implementation status reports
-- **[../../safety/](../../safety/)** - IRQ safety and sync primitive documentation
-- **[../../testing/](../../testing/)** - Test coverage and implementation plans
+- **[../../overview/reports/](../../overview/reports/)** - Implementation status reports
+- **[../../overview/06-security/safety/](../../overview/06-security/safety/)** - IRQ safety and sync primitive documentation
+- **[../../overview/testing/](../../overview/testing/)** - Test coverage and implementation plans

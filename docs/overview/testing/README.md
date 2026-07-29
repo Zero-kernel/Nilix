@@ -15,6 +15,9 @@ This directory contains test coverage analysis, expansion plans, and implementat
 
 ## Test Suite Overview
 
+**Last verified:** 2026-07-29 — remote `make build`, `make lint`, and `make test` passed;
+the runtime gate reported **31 passed / 39 deferred / 0 failed**, with 0 panic and 0 NX faults.
+
 The Zero-OS kernel maintains a comprehensive test suite covering:
 
 ### Unit Tests
@@ -25,8 +28,8 @@ The Zero-OS kernel maintains a comprehensive test suite covering:
 
 ### Integration Tests
 - Full kernel boot tests
-- Multi-core SMP tests (22 2-core tests)
-- Single-core regression tests (17 tests)
+- Default runtime/self-test gate (`make test`)
+- Targeted multi-core SMP gates (2/4/8/16-core)
 - Cross-subsystem interaction tests
 
 ### Regression Tests
@@ -69,7 +72,8 @@ The Zero-OS kernel maintains a comprehensive test suite covering:
 ### Build and Lint
 ```bash
 make build    # Build all crates
-make lint     # Run clippy
+make lint     # Run repository-specific safety/fallibility/ABI gates
+make clippy   # Run Rust clippy across build units
 ```
 
 ### Unit Tests
@@ -83,26 +87,26 @@ cargo test <test_name>  # Specific test
 ### Integration Tests
 ```bash
 make boot-check         # Boot test with success markers
-make test-smp          # SMP tests (22 2-core tests)
-make test-single       # Single-core tests (17 tests)
+make test               # Runtime/self-test gate with parsed summary
+make test-smp           # Targeted 2-core SMP gate
+make test-smp-4core     # Targeted 4-core SMP gate
+make test-smp-extended  # 8/16-core extended validation
 ```
 
 ### Boot Check
 ```bash
 make boot-check
-# Look for: "Test Summary: 17 passed, 0 failed"
-# Serial line 236 marker confirms successful boot
+# Gate parses user-mode/idle success and rejects panic or NX-fault signatures.
 ```
 
 ## Test Success Criteria
 
 All changes must pass:
 - ✅ `make build` - Exit code 0
-- ✅ `make lint` - No clippy warnings
-- ✅ Unit tests - All passing
+- ✅ `make lint` - Structural source, VFS fallibility, and ABI-layout gates pass
+- ✅ `make test` - Parseable summary with 0 failed, 0 panic, and 0 NX faults
 - ✅ Boot check - Serial success markers present
-- ✅ SMP tests - 22 2-core tests passing
-- ✅ Single-core tests - 17 tests passing
+- ✅ Targeted SMP tests when required by the affected subsystem
 
 ## Coverage Goals
 
@@ -141,7 +145,7 @@ See [test-coverage-expansion-plan.md](test-coverage-expansion-plan.md) for the r
 - Automated test runs
 - Coverage reporting
 
-See [../.github/workflows/](.github/workflows/) for CI configuration.
+See [.github/workflows/](../../../.github/workflows/) for CI configuration.
 
 ## Writing Tests
 
@@ -213,9 +217,9 @@ This prevents regressions and validates the fix.
 
 ## Related Documentation
 
-- **[../review/audits/](../review/audits/)** - Security audits that drive test requirements
-- **[../review/fixes/](../review/fixes/)** - Fixes that require regression tests
-- **[../safety/](../safety/)** - IRQ safety testing requirements
+- **[../../review/audits/](../../review/audits/)** - Security audits that drive test requirements
+- **[../../review/fixes/](../../review/fixes/)** - Fixes that require regression tests
+- **[../06-security/safety/](../06-security/safety/)** - IRQ safety testing requirements
 - **[../reports/](../reports/)** - Test implementation status reports
 
 ## Test Metrics

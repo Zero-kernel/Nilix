@@ -4,10 +4,16 @@ This directory contains final implementation status reports and comprehensive su
 
 ## Current Status
 
+- **[R186 audit and fix record](../../review/audits/qa-2026-07-28.md)** - Authoritative live security status
+- **[Current next-phase plan](../../review/nextplan/next-phase-plan-2026-07-23-v2.md)** - Live release blockers and priorities
 - **[FINAL_IMPLEMENTATION_STATUS.md](FINAL_IMPLEMENTATION_STATUS.md)** - Final implementation status report for latest QA round
 - **[COMPLETE_QA_REMEDIATION_FINAL.md](COMPLETE_QA_REMEDIATION_FINAL.md)** - Complete QA remediation final summary
 - **[COMPREHENSIVE_RECONSTRUCTION_SUMMARY.md](COMPREHENSIVE_RECONSTRUCTION_SUMMARY.md)** - Comprehensive reconstruction summary
 - **[QA_FIXES_AND_TESTS_COMPLETE.md](QA_FIXES_AND_TESTS_COMPLETE.md)** - QA fixes and tests completion report
+
+The named `FINAL_*` reports are historical snapshots. As of 2026-07-29 the 1.0-Preview gate is
+**BLOCKED** on one HIGH (`R186-4`), the sole open R186 actionable. The default remote
+build/lint/test gates are green at 31 passed / 39 deferred / 0 failed.
 
 ## Report Types
 
@@ -60,8 +66,15 @@ Current gate status is tracked in each final status report.
 
 ## Audit Round Coverage
 
-### R174 (July 2026)
+### R186 (July 2026)
 Latest comprehensive audit and remediation:
+- 18 filed findings: 17 actionable plus 1 INFO
+- 16 actionables fully fixed; `R186-4` open
+- Gate: BLOCKED (0 CRITICAL, 1 HIGH)
+- Full record: [qa-2026-07-28.md](../../review/audits/qa-2026-07-28.md)
+
+### R174 (July 2026)
+Historical comprehensive audit and remediation:
 - Full codebase security review
 - HIGH severity fixes (FPU state leak, clone double-uncharge, IRQ deadlocks)
 - Regression test suite expansion
@@ -88,7 +101,7 @@ Quota and cgroup memory safety:
 - Memory pinning telescoping
 - Cgroup delete gates
 
-See [../review/audits/](../review/audits/) for detailed audit reports.
+See [../../review/audits/](../../review/audits/) for detailed audit reports.
 
 ## Quality Metrics
 
@@ -113,8 +126,8 @@ Reports track key quality metrics:
 - Test pass rate
 
 ### Concurrency
-- SMP tests (22 2-core tests)
-- Single-core tests (17 tests)
+- Default runtime gate score (currently 31 passed / 39 deferred / 0 failed)
+- Targeted 2/4/8/16-core SMP gate results
 - Race detector runs
 - Deadlock detector runs
 
@@ -124,24 +137,24 @@ All work documented in final status reports has passed:
 - ✅ Build verification (make build)
 - ✅ Lint verification (clippy)
 - ✅ Unit tests (cargo test)
-- ✅ Integration tests (boot-check)
-- ✅ SMP tests (22 2-core tests passing)
+- ✅ Integration/runtime tests (`make test`)
+- ✅ Targeted SMP tests when required by the affected subsystem
 - ✅ Codex peer review (convergence gate)
 
 ## Related Documentation
 
-- **[../review/audits/](../review/audits/)** - Detailed QA audit reports (R170-R174)
-- **[../review/fixes/](../review/fixes/)** - Fix plans and implementation details
-- **[../review/remediation/](../review/remediation/)** - Remediation roadmaps and open findings
+- **[../../review/audits/](../../review/audits/)** - Detailed QA audit reports through R186
+- **[../../review/fixes/](../../review/fixes/)** - Fix plans and implementation details
+- **[../../review/remediation/](../../review/remediation/)** - Remediation roadmaps and open findings
 - **[../testing/](../testing/)** - Test coverage and implementation documentation
-- **[../safety/](../safety/)** - IRQ safety and lock ordering documentation
+- **[../06-security/safety/](../06-security/safety/)** - IRQ safety and lock ordering documentation
 - **[../architecture/](../architecture/)** - Subsystem architecture documentation
 
 ## Using These Reports
 
 ### For Contributors
-- Read the latest FINAL_IMPLEMENTATION_STATUS.md to understand current state
-- Check gate status before starting new work
+- Read the R186 audit/fix record and current next-phase plan to understand live state
+- Treat the `FINAL_*` reports as historical snapshots
 - Refer to known issues and limitations
 
 ### For Reviewers

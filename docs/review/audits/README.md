@@ -4,7 +4,7 @@ This directory contains all QA security audit reports for the Zero-OS kernel.
 
 ## Latest Audit
 
-**[qa-2026-07-20.md](qa-2026-07-20.md)** - R181 full-codebase security audit after S2-wave hardening and D2-SEC LSM integration (0 CRITICAL, 0 HIGH, 5 MEDIUM+LOW; all fixed same-day)
+**[qa-2026-07-28.md](qa-2026-07-28.md)** - R186 full-codebase security audit and fix-round record. Current debt: 1 HIGH open (`R186-4`), the sole open actionable; default gates are green at 31 passed / 39 deferred / 0 failed.
 
 ## Audit Summaries
 
@@ -23,10 +23,14 @@ Audits are organized chronologically by date. Each audit represents a full-codeb
 
 ### 2026 Audits
 
+- **R186** (July 28): full-codebase findings and remediation record - [qa-2026-07-28.md](qa-2026-07-28.md)
+- **R185** (July 23): clean caller/lock-context verification round - [qa-2026-07-23-v2.md](qa-2026-07-23-v2.md)
+- **R184** (July 23): findings round - [qa-2026-07-23.md](qa-2026-07-23.md), with review-fix records in [../reviewfix/](../reviewfix/)
+- **R182-R183** (July 22): streak audits and follow-up - [qa-2026-07-22.md](qa-2026-07-22.md) through [qa-2026-07-22-v2.md](qa-2026-07-22-v2.md)
 - **R181** (July 20): post-S2-wave + D2-SEC full audit - [qa-2026-07-20.md](qa-2026-07-20.md), [fix summary](../fixes/R181-fix-summary.md)
 - **R180** (July 16-19): full audit plus convergence closure - [qa-2026-07-16.md](qa-2026-07-16.md), [first continuation](../reviewfix/reviewfix-2026-07-19.md), [authoritative follow-up](../reviewfix/reviewfix-2026-07-19-v2.md)
 - **R178-R179** (July 10-14): entry/resource review-fix and focused verification - [qa-2026-07-10.md](qa-2026-07-10.md) through [qa-2026-07-14.md](qa-2026-07-14.md)
-- **R174** (July 2): prior comprehensive audit - [qa-2026-07-02-v5.md](qa-2026-07-02-v5.md)
+- **R174** (July 2): historical comprehensive audit - [qa-2026-07-02-v5.md](qa-2026-07-02-v5.md)
 - **R173** (June 23-July 2): IRQ safety and R172 follow-ons - [qa-2026-06-23.md](qa-2026-06-23.md) through [qa-2026-07-02-r173-fixes.md](qa-2026-07-02-r173-fixes.md)
 - **R172** (June): VFS/ramfs audit and follow-ons - [qa-2026-06-*.md](.)
 - **R170-R171** (Jan-May): Quota system, cgroup memory safety - qa-2026-01-* through qa-2026-05-*
@@ -40,7 +44,7 @@ Historical audits from December 2025 - see qa-2025-*.md files
 1. **Audit**: Full-codebase security review → qa-YYYY-MM-DD.md
 2. **Findings**: Issues categorized by severity (CRITICAL/HIGH/MEDIUM/LOW) → see [../fixes/](../fixes/)
 3. **Remediation**: Fix implementation and verification → see [../remediation/](../remediation/)
-4. **Summary**: Status report and next steps → see [../../reports/](../../reports/)
+4. **Summary**: Status report and next steps → see [../../overview/reports/](../../overview/reports/)
 
 ## Finding Severity Levels
 
@@ -53,5 +57,5 @@ Historical audits from December 2025 - see qa-2025-*.md files
 
 - **[../fixes/](../fixes/)** - R17x fix plans and implementation details
 - **[../remediation/](../remediation/)** - Remediation roadmaps and open findings inventory
-- **[../../reports/](../../reports/)** - Final implementation status reports
-- **[../../safety/](../../safety/)** - IRQ safety analysis and sync primitive migration guides
+- **[../../overview/reports/](../../overview/reports/)** - Final implementation status reports
+- **[../../overview/06-security/safety/](../../overview/06-security/safety/)** - IRQ safety analysis and sync primitive migration guides

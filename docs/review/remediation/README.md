@@ -4,8 +4,12 @@ This directory contains remediation roadmaps and open findings inventory for ong
 
 ## Current Remediation Status
 
-- **[remediation-roadmap-2026-07-02.md](remediation-roadmap-2026-07-02.md)** - Current remediation roadmap and priorities
-- **[open-findings-inventory-2026-07-02.md](open-findings-inventory-2026-07-02.md)** - Comprehensive inventory of open findings
+- **[R186 audit/fix record](../audits/qa-2026-07-28.md)** - Authoritative current finding status
+- **[Current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)** - Live priorities and release-gate blockers
+- **[remediation-roadmap-2026-07-02.md](remediation-roadmap-2026-07-02.md)** - Historical R174-era remediation roadmap
+- **[open-findings-inventory-2026-07-02.md](open-findings-inventory-2026-07-02.md)** - Historical R174-era inventory
+
+Current 1.0-Preview status: **BLOCKED** on one HIGH (`R186-4`), the sole open R186 actionable. The default remote build/lint/test gates are green.
 
 ## Remediation Workflow
 
@@ -71,8 +75,8 @@ The project maintains a quality gate for 1.0-Preview readiness:
 - **RE-QUALIFIED**: Previously qualified, then re-audited and re-qualified
 
 Current gate status documented in:
-- [remediation-roadmap-2026-07-02.md](remediation-roadmap-2026-07-02.md)
-- [../../reports/FINAL_IMPLEMENTATION_STATUS.md](../../reports/FINAL_IMPLEMENTATION_STATUS.md)
+- [R186 audit/fix record](../audits/qa-2026-07-28.md)
+- [current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)
 
 ## Open Findings Management
 
@@ -84,19 +88,19 @@ The open findings inventory tracks:
 - Current status and owner
 - Verification plan
 
-See [open-findings-inventory-2026-07-02.md](open-findings-inventory-2026-07-02.md) for the current inventory.
+See the [current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md) for live work. The dated inventory above is retained as historical context.
 
 ## Related Documentation
 
-- **[../audits/](../audits/)** - Security audit reports (R170-R174)
+- **[../audits/](../audits/)** - Security audit reports through R186
 - **[../fixes/](../fixes/)** - Fix plans and implementation details
-- **[../../reports/](../../reports/)** - Final status reports and summaries
-- **[../../safety/](../../safety/)** - IRQ safety and lock ordering documentation
-- **[../../testing/](../../testing/)** - Test coverage and regression test plans
+- **[../../overview/reports/](../../overview/reports/)** - Final status reports and summaries
+- **[../../overview/06-security/safety/](../../overview/06-security/safety/)** - IRQ safety and lock ordering documentation
+- **[../../overview/testing/](../../overview/testing/)** - Test coverage and regression test plans
 
 ## Next Phase Planning
 
-See [../../next-phase-plan.md](../../next-phase-plan.md) for:
+See the [current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md) for:
 - Phase H/I/J/K/L/M feature roadmap
 - Systematic audit plans (H.0.x)
 - Bug fix priorities (P0/P1/P2/P3)

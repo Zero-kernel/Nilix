@@ -2,6 +2,9 @@
 
 This document provides a high-level overview of the Nilix testing infrastructure.
 
+**Last verified:** 2026-07-29 — `make build`, `make lint`, and `make test` passed remotely;
+the runtime gate reported **31 passed / 39 deferred / 0 failed**, with 0 panic and 0 NX faults.
+
 ## Test Categories
 
 ### 1. Boot Tests ✅
