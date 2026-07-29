@@ -285,8 +285,20 @@ impl VirtioTransport {
                 if t.notify_len == 0 {
                     return;
                 }
-                // Bounds check: offset + 2 (u16 write) must fit within notify window
+                // Bounds check: offset + 2 (u16 write) must fit within notify window.
+                //
+                // R186-6: `notify_len` is now an extent the capability walk PROVED
+                // lies inside a sized BAR aperture, so this check is aperture-
+                // relative. Previously it was relative to the device's own
+                // unvalidated claim — a device could declare a 1 GiB notify length
+                // and pass this check while writing far outside anything it owns.
                 if offset_bytes > t.notify_len.saturating_sub(2) {
+                    return;
+                }
+                // R186-6: the write is a `*mut u16`; an odd offset would be an
+                // unaligned MMIO access. `notify_off_multiplier` is device-supplied
+                // and need not be even.
+                if offset_bytes % 2 != 0 {
                     return;
                 }
                 let notify_ptr = t.notify_base.add(offset_bytes as usize) as *mut u16;
@@ -309,29 +321,61 @@ impl VirtioTransport {
         }
     }
 
+    /// R186-6: byte length of the device-config window, when one is known.
+    ///
+    /// `None` for MMIO, whose config region is a fixed spec offset rather than a
+    /// device-declared window.
+    pub fn device_config_len(&self) -> Option<usize> {
+        match self {
+            VirtioTransport::Mmio(_) => None,
+            VirtioTransport::Pci(t) => Some(t.device_cfg_len as usize),
+        }
+    }
+
     /// Read raw bytes from the device-specific configuration region.
     ///
+    /// R186-6: bounded against the validated device-config window. Previously this
+    /// walked `offset + i` with no extent recorded anywhere, so a caller (or a
+    /// device that declared a short window) could read past the mapped span. Reads
+    /// that would leave the window are refused and reported, never truncated
+    /// silently into a partially-filled buffer that the caller would interpret as
+    /// device state.
+    ///
     /// # Safety
-    /// Caller must ensure bounds are valid for the target device.
-    pub unsafe fn read_config_bytes(&self, offset: usize, buf: &mut [u8]) {
+    /// Caller must ensure the transport is initialized and the region is mapped.
+    pub unsafe fn read_config_bytes(&self, offset: usize, buf: &mut [u8]) -> bool {
+        if let Some(window) = self.device_config_len() {
+            let Some(end) = offset.checked_add(buf.len()) else {
+                return false;
+            };
+            if end > window {
+                return false;
+            }
+        }
         let base = self.device_config_base();
         for (i, byte) in buf.iter_mut().enumerate() {
             *byte = read_volatile(base.add(offset + i));
         }
+        true
     }
 
     /// Read a device-specific configuration struct using volatile byte copy.
     ///
     /// This is a generic method that reads the device config into any `repr(C)` struct.
     ///
+    /// R186-6: returns `None` when `size_of::<T>()` exceeds the validated
+    /// device-config window rather than reading outside it.
+    ///
     /// # Safety
     /// The type `T` must be `repr(C)` and match the device's config layout.
-    pub unsafe fn read_config_struct<T: Copy>(&self) -> T {
+    pub unsafe fn read_config_struct<T: Copy>(&self) -> Option<T> {
         let mut out = MaybeUninit::<T>::uninit();
         let raw =
             core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, core::mem::size_of::<T>());
-        self.read_config_bytes(0, raw);
-        out.assume_init()
+        if !self.read_config_bytes(0, raw) {
+            return None;
+        }
+        Some(out.assume_init())
     }
 }
 
@@ -412,6 +456,8 @@ pub struct VirtioPciAddrs {
     pub virtio_device_type: u16,
     /// Common configuration structure physical address
     pub common_cfg: u64,
+    /// R186-6: common-cfg window length (bytes), proven inside its BAR.
+    pub common_cfg_len: u32,
     /// Notification structure base physical address
     pub notify_base: u64,
     /// Notification capability length (bytes) for bounds checking
@@ -420,8 +466,16 @@ pub struct VirtioPciAddrs {
     pub notify_off_multiplier: u32,
     /// ISR status register physical address
     pub isr: u64,
+    /// R186-6: ISR window length (bytes), proven inside its BAR.
+    pub isr_len: u32,
     /// Device-specific configuration physical address
     pub device_cfg: u64,
+    /// R186-6: device-cfg window length (bytes), proven inside its BAR.
+    ///
+    /// Carried so `read_config_bytes` can bound its reads. Previously the driver
+    /// read `size_of::<T>()` bytes from a pointer with no recorded extent, and the
+    /// mapped span was a hardcoded 16-byte guess.
+    pub device_cfg_len: u32,
 }
 
 /// virtio-pci common configuration structure (VirtIO 1.1+).
@@ -481,6 +535,9 @@ pub struct VirtioPciTransport {
     pub(crate) isr: *mut u8,
     /// Pointer to device configuration
     pub(crate) device_cfg: *mut u8,
+    /// R186-6: validated byte length of the device-config window, so config reads
+    /// can be bounded instead of trusting `size_of::<T>()`.
+    pub(crate) device_cfg_len: u32,
 }
 
 // SAFETY: VirtioPciTransport contains raw pointers to MMIO regions
@@ -503,11 +560,16 @@ impl VirtioPciTransport {
     pub unsafe fn from_addrs(addrs: VirtioPciAddrs, virt_offset: u64) -> Option<Self> {
         // Validate required capabilities
         // R35-VIRTIO-1 FIX: Modern notify capability must advertise a usable window
+        // R186-6: every window must have arrived with a validated extent. A zero
+        // length means the capability walk did not prove containment in a sized
+        // BAR, so the address must not become a mapped pointer.
         if addrs.virtio_device_type == 0
             || addrs.common_cfg == 0
             || addrs.notify_base == 0
             || addrs.device_cfg == 0
             || addrs.notify_len < 2
+            || addrs.common_cfg_len == 0
+            || addrs.device_cfg_len == 0
         {
             return None;
         }
@@ -530,6 +592,7 @@ impl VirtioPciTransport {
             notify_off_multiplier: addrs.notify_off_multiplier,
             isr,
             device_cfg,
+            device_cfg_len: addrs.device_cfg_len,
         })
     }
 }

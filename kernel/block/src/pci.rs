@@ -19,6 +19,8 @@ const VIRTIO_BLK_TRANSITIONAL: u16 = 0x1001;
 const VIRTIO_BLK_MODERN: u16 = 0x1042;
 
 const PCI_COMMAND_OFFSET: u8 = 0x04;
+const PCI_COMMAND_MEMORY_SPACE: u16 = 0x02;
+const PCI_COMMAND_BUS_MASTER: u16 = 0x04;
 const PCI_BAR0_OFFSET: u8 = 0x10;
 const PCI_SUBSYSTEM_ID: u8 = 0x2E; // Subsystem ID (contains virtio device type)
 const PCI_CAP_PTR: u8 = 0x34;
@@ -114,13 +116,44 @@ fn pci_config_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
 #[must_use = "failure to clear PCI bus mastering must be handled fail-closed"]
 fn clear_bus_master(bus: u8, dev: u8, func: u8) -> bool {
     let cmd = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd & !0x04);
+    pci_config_write16(
+        bus,
+        dev,
+        func,
+        PCI_COMMAND_OFFSET,
+        cmd & !PCI_COMMAND_BUS_MASTER,
+    );
     let verify = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-    let cleared = verify & 0x04 == 0;
+    let cleared = verify & PCI_COMMAND_BUS_MASTER == 0;
     if !cleared {
         klog!(
             Warn,
             "    ! BME still set after clear for {:02x}:{:02x}.{}",
+            bus,
+            dev,
+            func
+        );
+    }
+    cleared
+}
+
+/// R186-6: disable both address decode and DMA before a BAR sizing probe.
+///
+/// Firmware may leave Memory Space Enable set across a warm boot. BAR sizing
+/// temporarily writes all-ones into the address registers, so probing with MSE
+/// set can make the device claim the probe address. The caller holds the global
+/// PCI config lock; keep the clear and readback in that same transaction.
+#[must_use = "failure to disable PCI decoders must be handled fail-closed"]
+fn clear_memory_and_bus_master(bus: u8, dev: u8, func: u8) -> bool {
+    let cmd = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+    let disabled = PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd & !disabled);
+    let verify = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+    let cleared = verify & disabled == 0;
+    if !cleared {
+        klog!(
+            Warn,
+            "    ! MSE/BME still set after clear for {:02x}:{:02x}.{}",
             bus,
             dev,
             func
@@ -152,44 +185,145 @@ pub fn disable_bus_master(pci_id: PciDeviceId) -> bool {
 /// Read a BAR (Base Address Register) and return the physical address.
 ///
 /// Handles both 32-bit and 64-bit BARs. Returns None for I/O BARs.
-fn read_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<u64> {
+/// R186-6: minimum bytes the block driver actually accesses in each window.
+/// `VirtioPciCommonCfg` is 56 bytes; notify is a `u16`; ISR is one byte; the
+/// virtio-blk config carries at least the 8-byte capacity field.
+const VIRTIO_COMMON_CFG_MIN_LEN: u64 = 56;
+const VIRTIO_NOTIFY_MIN_LEN: u64 = 2;
+const VIRTIO_ISR_MIN_LEN: u64 = 1;
+const VIRTIO_BLK_DEVICE_CFG_MIN_LEN: u64 = 8;
+
+/// R186-6: a memory BAR whose base AND SIZE are both known.
+///
+/// Mirrors `net::pci::ValidatedBar`. The two drivers keep separate config-space
+/// accessors (this one runs with `PCI_CONFIG_LOCK` held across the whole scan,
+/// the net one locks per access), so the type is duplicated rather than shared;
+/// the containment rule they enforce is identical.
+#[derive(Clone, Copy, Debug)]
+struct ValidatedBar {
+    base: u64,
+    len: u64,
+}
+
+impl ValidatedBar {
+    /// Is `[offset, offset + len)` wholly inside this aperture? All arithmetic is
+    /// checked — the release profile enables no overflow checks, so an unchecked
+    /// sum on device-supplied values wraps silently and passes a naive compare.
+    fn phys_for(&self, offset: u64, len: u64) -> Option<u64> {
+        if len == 0 {
+            return None;
+        }
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        self.base.checked_add(offset)
+    }
+}
+
+/// R186-6: determine a memory BAR's base and size via the spec write-all-ones
+/// probe. See `net::pci::size_bar` for the full rationale; the ordering
+/// requirements are the same — Memory Space decode must be OFF, and the original
+/// BAR value is restored on every path.
+///
+/// NOTE: unlike the net driver, callers here already hold `PCI_CONFIG_LOCK` for
+/// the whole bus scan, so this must NOT take it again (it is not reentrant).
+fn size_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<ValidatedBar> {
     if bar >= 6 {
         return None;
     }
     let off = PCI_BAR0_OFFSET + bar * 4;
     let low = pci_config_read32(bus, dev, func, off);
 
-    // DEBUG: Print raw BAR value
-    // kprintln!("      [BAR] bar{} raw low={:#x}", bar, low);
-
     // Check if this is an I/O BAR (bit 0 = 1)
     if low & 1 != 0 {
         return None;
     }
 
-    // Check BAR type (bits 1-2)
+    // Check BAR type (bits 1-2). 1 and 3 are reserved encodings; treating them as
+    // 32-bit (as the old code did) invents an aperture width for a malformed BAR.
     let bar_type = (low >> 1) & 0x3;
+    let is_64bit = match bar_type {
+        0 => false,
+        2 => true,
+        _ => return None,
+    };
+    if is_64bit && bar >= 5 {
+        return None; // No room for the high dword
+    }
 
-    if bar_type == 2 {
-        // 64-bit BAR: read the high 32 bits from the next BAR
-        // The address might be entirely in the high 32 bits!
-        if bar >= 5 {
-            return None; // No room for high 32 bits
-        }
-        let high = pci_config_read32(bus, dev, func, off + 4);
-        let base_low = (low & !0xFu32) as u64;
-        let base = base_low | ((high as u64) << 32);
-        if base == 0 {
-            return None;
-        }
-        Some(base)
+    let high = if is_64bit {
+        pci_config_read32(bus, dev, func, off + 4)
     } else {
-        // 32-bit BAR
-        let base = (low & !0xFu32) as u64;
-        if base == 0 {
-            return None;
+        0
+    };
+    let base = ((low & !0xFu32) as u64) | ((high as u64) << 32);
+    if base == 0 {
+        return None;
+    }
+
+    let (size_low, size_high) = probe_bar(bus, dev, func, off, low, is_64bit.then_some(high));
+
+    let mask = ((size_low & !0xFu32) as u64) | ((size_high as u64) << 32);
+    if mask == 0 {
+        return None; // Unimplemented BAR
+    }
+    let len = (!mask).wrapping_add(1);
+    if len == 0 || !len.is_power_of_two() || base % len != 0 {
+        return None;
+    }
+    base.checked_add(len)?;
+
+    Some(ValidatedBar { base, len })
+}
+
+/// R186-6: perform one atomic BAR sizing transaction and restore the BAR.
+///
+/// A 64-bit BAR is one resource, so both halves must contain all-ones before
+/// either mask half is read. Probing each dword independently can return a mask
+/// that never existed as one device resource. The caller already holds
+/// `PCI_CONFIG_LOCK`, and Memory Space decode has been verified off.
+fn probe_bar(
+    bus: u8,
+    dev: u8,
+    func: u8,
+    offset: u8,
+    original_low: u32,
+    original_high: Option<u32>,
+) -> (u32, u32) {
+    let low_address = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset & 0xFC) as u32);
+    let high_address = low_address + 4;
+    unsafe {
+        outl(PCI_CONFIG_ADDRESS, low_address);
+        outl(PCI_CONFIG_DATA, u32::MAX);
+        if original_high.is_some() {
+            outl(PCI_CONFIG_ADDRESS, high_address);
+            outl(PCI_CONFIG_DATA, u32::MAX);
         }
-        Some(base)
+
+        outl(PCI_CONFIG_ADDRESS, low_address);
+        let readback_low = inl(PCI_CONFIG_DATA);
+        let readback_high = if original_high.is_some() {
+            outl(PCI_CONFIG_ADDRESS, high_address);
+            inl(PCI_CONFIG_DATA)
+        } else {
+            u32::MAX
+        };
+
+        // Restore the high half first and the low half last. Decode is disabled,
+        // but this ordering also avoids exposing an original low half paired with
+        // an all-ones high half if the device observes config writes internally.
+        if let Some(high) = original_high {
+            outl(PCI_CONFIG_ADDRESS, high_address);
+            outl(PCI_CONFIG_DATA, high);
+        }
+        outl(PCI_CONFIG_ADDRESS, low_address);
+        outl(PCI_CONFIG_DATA, original_low);
+        (readback_low, readback_high)
     }
 }
 
@@ -201,6 +335,18 @@ fn read_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<u64> {
 fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
     let mut caps = VirtioPciAddrs::default();
     let mut found_caps = 0u8;
+    // R186-6: inventory BARs sequentially before trusting a capability's BAR
+    // index. A 64-bit BAR consumes two slots; leaving the high slot lazily
+    // probeable would let a hostile capability reinterpret it as an independent
+    // 32-bit aperture.
+    let mut bar_cache: [Option<ValidatedBar>; 6] = [None; 6];
+    let mut bar = 0u8;
+    while bar < 6 {
+        let low = pci_config_read32(bus, dev, func, PCI_BAR0_OFFSET + bar * 4);
+        let consumes_pair = low & 1 == 0 && ((low >> 1) & 0x3) == 2;
+        bar_cache[usize::from(bar)] = size_bar(bus, dev, func, bar);
+        bar = bar.saturating_add(if consumes_pair { 2 } else { 1 });
+    }
 
     // Start from the capability pointer
     let mut ptr = pci_config_read8(bus, dev, func, PCI_CAP_PTR);
@@ -239,39 +385,59 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
             let cfg_type = pci_config_read8(bus, dev, func, ptr + 3);
             let bar = pci_config_read8(bus, dev, func, ptr + 4);
             let offset = pci_config_read32(bus, dev, func, ptr + 8);
+            // R186-6: the capability's declared length, previously read only for
+            // the notify cap. Every window needs a recorded extent to validate.
+            let cap_window_len = pci_config_read32(bus, dev, func, ptr + 12);
 
             found_caps += 1;
 
-            if let Some(bar_base) = read_bar(bus, dev, func, bar) {
-                let phys = bar_base + offset as u64;
+            // R186-6: prove the FULL declared window lies inside a SIZED BAR
+            // aperture before deriving a physical address from it. The old
+            // `bar_base + offset` had no length and no bound, so a hostile device
+            // could point CPU MMIO writes anywhere — outside IOMMU DMA containment.
+            let required_len = match cfg_type {
+                VIRTIO_PCI_CAP_COMMON_CFG => VIRTIO_COMMON_CFG_MIN_LEN,
+                VIRTIO_PCI_CAP_NOTIFY_CFG => VIRTIO_NOTIFY_MIN_LEN,
+                VIRTIO_PCI_CAP_ISR_CFG => VIRTIO_ISR_MIN_LEN,
+                VIRTIO_PCI_CAP_DEVICE_CFG => VIRTIO_BLK_DEVICE_CFG_MIN_LEN,
+                _ => 0,
+            };
 
-                match cfg_type {
-                    VIRTIO_PCI_CAP_COMMON_CFG => {
-                        caps.common_cfg = phys;
-                    }
-                    VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                        caps.notify_base = phys;
-                        // R34-VIRTIO-1 FIX: Read notify capability length for bounds checking
-                        // The length field is at offset 12-15 within the capability structure
-                        let notify_len = pci_config_read32(bus, dev, func, ptr + 12);
-                        caps.notify_len = notify_len;
-                        // Notify capability has extra field at offset 16
-                        // R169-L8 FIX: ptr+16 must not wrap the u8 add; only read
-                        // it when ptr <= 0xEF (0xEF+16 == 0xFF). A cap claiming
-                        // length >= 20 at a higher start is malformed — skip the
-                        // optional multiplier rather than overflow.
-                        if cap_len >= 20 && ptr <= 0xEF {
-                            caps.notify_off_multiplier =
-                                pci_config_read32(bus, dev, func, ptr + 16);
+            if required_len != 0 && (cap_window_len as u64) >= required_len {
+                let resource = bar_cache.get(usize::from(bar)).copied().flatten();
+
+                if let Some(phys) =
+                    resource.and_then(|res| res.phys_for(offset as u64, cap_window_len as u64))
+                {
+                    match cfg_type {
+                        VIRTIO_PCI_CAP_COMMON_CFG => {
+                            caps.common_cfg = phys;
+                            caps.common_cfg_len = cap_window_len;
                         }
+                        VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                            caps.notify_base = phys;
+                            // R34-VIRTIO-1 FIX: notify length for bounds checking.
+                            caps.notify_len = cap_window_len;
+                            // Notify capability has extra field at offset 16
+                            // R169-L8 FIX: ptr+16 must not wrap the u8 add; only read
+                            // it when ptr <= 0xEF (0xEF+16 == 0xFF). A cap claiming
+                            // length >= 20 at a higher start is malformed — skip the
+                            // optional multiplier rather than overflow.
+                            if cap_len >= 20 && ptr <= 0xEF {
+                                caps.notify_off_multiplier =
+                                    pci_config_read32(bus, dev, func, ptr + 16);
+                            }
+                        }
+                        VIRTIO_PCI_CAP_ISR_CFG => {
+                            caps.isr = phys;
+                            caps.isr_len = cap_window_len;
+                        }
+                        VIRTIO_PCI_CAP_DEVICE_CFG => {
+                            caps.device_cfg = phys;
+                            caps.device_cfg_len = cap_window_len;
+                        }
+                        _ => {}
                     }
-                    VIRTIO_PCI_CAP_ISR_CFG => {
-                        caps.isr = phys;
-                    }
-                    VIRTIO_PCI_CAP_DEVICE_CFG => {
-                        caps.device_cfg = phys;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -295,8 +461,8 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 /// Scans all device slots on buses 0-255 looking for a virtio-blk device
 /// (vendor 0x1af4, device 0x1001 transitional or 0x1042 modern).
 ///
-/// When found, enables memory access and bus mastering, then parses
-/// the PCI capability list to extract virtio-pci configuration addresses.
+/// When found, disables device decoders, validates and sizes all capability
+/// windows, then enables memory access and bus mastering.
 ///
 /// # Returns
 /// * `Some((pci_id, pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
@@ -336,13 +502,12 @@ pub fn probe_virtio_blk(
                     continue;
                 }
 
-                // R180-17 (iteration-2): clear any firmware-enabled BME BEFORE
-                // attach so a partial-unit / failed attach window cannot leave
-                // the device bus-mastering untranslated. Re-enable only after
-                // successful domain attach (below).
-                if !clear_bus_master(bus, dev, func) {
+                // R186-6: firmware may leave both DMA and memory decode active.
+                // Disable and verify both before IOMMU attach and, critically,
+                // before the write-all-ones BAR sizing transaction below.
+                if !clear_memory_and_bus_master(bus, dev, func) {
                     panic!(
-                        "R180-17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{}",
+                        "R186-6: cannot fail closed: PCI MSE/BME remains set for {:02x}:{:02x}.{}",
                         bus, dev, func
                     );
                 }
@@ -390,14 +555,15 @@ pub fn probe_virtio_blk(
                     }
                 }
 
-                // Enable MEM space access + BUS MASTER for DMA
-                let mut cmd =
-                    (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-                cmd |= 0x2 /* MEM */ | 0x4 /* BUS MASTER */;
-                pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd);
-
-                // Try to read modern PCI capabilities for both transitional and modern devices
+                // Size BARs and validate every declared capability window while
+                // Memory Space decode is still off. Enable decode/DMA only after
+                // that containment proof succeeds.
                 if let Some(mut caps) = read_virtio_pci_caps(bus, dev, func) {
+                    let mut cmd =
+                        (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+                    cmd |= PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+                    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd);
+
                     // Read subsystem ID which contains the virtio device type
                     let subsystem_id = pci_config_read16(bus, dev, func, PCI_SUBSYSTEM_ID);
                     caps.virtio_device_type = subsystem_id;
@@ -413,11 +579,11 @@ pub fn probe_virtio_blk(
                     );
                     return Some((pci_id, caps, "vda"));
                 } else {
-                    // R82-2 FIX: Disable bus mastering if device lacks modern caps
-                    // to prevent orphaned DMA-capable device
-                    if !clear_bus_master(bus, dev, func) {
+                    // Keep both decoders disabled when capability validation
+                    // fails; verify the fail-closed state before continuing.
+                    if !clear_memory_and_bus_master(bus, dev, func) {
                         panic!(
-                            "R180-17: cannot fail closed: PCI BME remains set for {:02x}:{:02x}.{}",
+                            "R186-6: cannot fail closed: PCI MSE/BME remains set for {:02x}:{:02x}.{}",
                             bus, dev, func
                         );
                     }

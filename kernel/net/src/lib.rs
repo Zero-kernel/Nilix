@@ -429,14 +429,53 @@ static NET_MMIO_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// # Safety
 /// The caller must ensure the physical address is a valid MMIO region.
 unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
-    // Allocate virtual address space (page-aligned)
-    let aligned_size = (size + 0xFFF) & !0xFFF;
-    let offset = NET_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
-
-    if offset + aligned_size as u64 > NET_MMIO_VIRT_SIZE {
-        klog!(Error, "      [NET MMIO] Virtual space exhausted");
+    // R186-6: the physical base must be page-aligned. `mm::map_mmio` rounds down
+    // via `PhysFrame::containing_address`, so an unaligned base silently skews
+    // `virt_offset` by `phys_base & 0xFFF` for every derived pointer and leaves
+    // the tail of the window unmapped. Refuse instead of mapping a skewed view.
+    if phys_base % 0x1000 != 0 {
+        klog!(
+            Error,
+            "      [NET MMIO] refusing unaligned phys base {:#x}",
+            phys_base
+        );
         return Err(NetError::IoError);
     }
+
+    // Allocate virtual address space (page-aligned)
+    let aligned_size = size
+        .checked_add(0xFFF)
+        .map(|value| value & !0xFFF)
+        .ok_or(NetError::IoError)?;
+    if aligned_size == 0 {
+        return Err(NetError::IoError);
+    }
+
+    // R186-6: reserve the VA range TRANSACTIONALLY.
+    //
+    // The previous code did `fetch_add` and only then compared against the limit,
+    // so an oversized request (a device-declared notify length could reach ~4 GiB)
+    // consumed the reservation permanently and pushed the bump pointer past the
+    // end — after which EVERY later `map_pci_mmio` failed for the lifetime of the
+    // boot. One malformed device could therefore deny MMIO to every subsequent
+    // NIC. `fetch_update` commits only a reservation that fits, and the checked
+    // add cannot wrap.
+    let offset = NET_MMIO_OFFSET
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            let end = current.checked_add(aligned_size as u64)?;
+            if end > NET_MMIO_VIRT_SIZE {
+                return None;
+            }
+            Some(end)
+        })
+        .map_err(|_| {
+            klog!(
+                Error,
+                "      [NET MMIO] Virtual space exhausted (need {:#x})",
+                aligned_size
+            );
+            NetError::IoError
+        })?;
 
     let virt_addr = NET_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
@@ -479,34 +518,54 @@ unsafe fn map_virtio_pci_regions(
     // The regions are: common_cfg, notify_base, isr, device_cfg
     // They're typically close together in a single BAR
 
-    let min_addr = [
-        addrs.common_cfg,
-        addrs.notify_base,
-        addrs.isr,
-        addrs.device_cfg,
-    ]
-    .iter()
-    .filter(|&&a| a != 0)
-    .min()
-    .copied()
-    .ok_or(NetError::NotSupported)?;
+    // R186-6: derive the span from the VALIDATED window extents, with checked
+    // arithmetic throughout.
+    //
+    // The previous computation was unsound in three ways. (1) Every bound used a
+    // hardcoded guess (64 / 4 / 16 bytes) instead of the capability's declared
+    // length, so a window larger than the guess was mapped short and a later read
+    // ran off the end of the mapping. (2) The max side did not filter absent
+    // (zero) windows, so an unpopulated capability still contributed to the span.
+    // (3) All of `base + len`, `max - min` and `size + 0xFFF` were unchecked; the
+    // release profile enables no overflow checks, so a device-controlled
+    // `notify_len` near `u32::MAX` wrapped silently.
+    //
+    // Each length is now the extent the capability walk already proved to lie
+    // inside a sized BAR, so the mapped span cannot exceed what the device
+    // legitimately decodes.
+    let windows = [
+        (addrs.common_cfg, addrs.common_cfg_len as u64),
+        (addrs.notify_base, addrs.notify_len as u64),
+        (addrs.isr, addrs.isr_len as u64),
+        (addrs.device_cfg, addrs.device_cfg_len as u64),
+    ];
 
-    let max_addr = [
-        addrs.common_cfg + 64, // VirtioPciCommonCfg is ~64 bytes
-        addrs.notify_base + addrs.notify_len as u64,
-        addrs.isr + 4,
-        addrs.device_cfg + 16, // Device config varies, use reasonable size
-    ]
-    .iter()
-    .max()
-    .copied()
-    .ok_or(NetError::NotSupported)?;
+    let mut min_addr: Option<u64> = None;
+    let mut max_addr: Option<u64> = None;
+    for (base, len) in windows {
+        // A window is present only if it has both an address and a proven extent.
+        if base == 0 || len == 0 {
+            continue;
+        }
+        let end = base.checked_add(len).ok_or(NetError::NotSupported)?;
+        min_addr = Some(min_addr.map_or(base, |current: u64| current.min(base)));
+        max_addr = Some(max_addr.map_or(end, |current: u64| current.max(end)));
+    }
 
-    let size = (max_addr - min_addr) as usize;
-    let size = (size + 0xFFF) & !0xFFF; // Page align
+    let min_addr = min_addr.ok_or(NetError::NotSupported)?;
+    let max_addr = max_addr.ok_or(NetError::NotSupported)?;
 
-    // Map the entire range
-    let virt_offset = map_pci_mmio(min_addr, size)?;
+    // Align the base DOWN to a page so the whole span stays covered once
+    // `map_pci_mmio` maps page-granular frames, and keep the base page-aligned as
+    // that function now requires.
+    let map_base = min_addr & !0xFFF;
+    let span = max_addr
+        .checked_sub(map_base)
+        .ok_or(NetError::NotSupported)?;
+    let size = usize::try_from(span).map_err(|_| NetError::NotSupported)?;
+
+    // Map the validated range.
+    let virt_offset = map_pci_mmio(map_base, size)?;
 
     Ok((*addrs, virt_offset))
 }

@@ -22,9 +22,9 @@ use mm::dma::{alloc_dma_buffer, DmaBuffer};
 use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass};
 
 use super::{
-    blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkConfig,
-    VirtioBlkReqHeader, VirtioPciAddrs, VirtioPciTransport, VirtioTransport, VringAvail, VringDesc,
-    VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE,
+    blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkReqHeader,
+    VirtioPciAddrs, VirtioPciTransport, VirtioTransport, VringAvail, VringDesc, VringUsed,
+    VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE,
     VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
     VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
@@ -669,11 +669,28 @@ impl VirtioBlkDevice {
             return Err(BlockError::NotSupported);
         }
 
-        // Read device config using the generic read_config_struct method
-        let config: VirtioBlkConfig = transport.read_config_struct();
-        let capacity = config.capacity;
-        let sector_size = if config.blk_size != 0 {
-            config.blk_size
+        // R186-6: capacity is the only mandatory virtio-blk config field. Read
+        // exactly its eight bytes so a spec-valid minimal device-config window is
+        // accepted. `blk_size` lives at offset 20 and is required/read only when
+        // VIRTIO_BLK_F_BLK_SIZE was actually negotiated.
+        let mut capacity_bytes = [0u8; 8];
+        if !transport.read_config_bytes(0, &mut capacity_bytes) {
+            Self::reset_probe_transport(transport, pci_id, "capacity window too small")?;
+            return Err(BlockError::NotSupported);
+        }
+        let capacity = u64::from_le_bytes(capacity_bytes);
+        let sector_size = if driver_features & blk_features::VIRTIO_BLK_F_BLK_SIZE != 0 {
+            let mut block_size_bytes = [0u8; 4];
+            if !transport.read_config_bytes(20, &mut block_size_bytes) {
+                Self::reset_probe_transport(transport, pci_id, "block-size window too small")?;
+                return Err(BlockError::NotSupported);
+            }
+            let block_size = u32::from_le_bytes(block_size_bytes);
+            if block_size != 0 {
+                block_size
+            } else {
+                512
+            }
         } else {
             512
         };
