@@ -1826,7 +1826,7 @@ pub struct Process {
     /// - 标志（CLOEXEC、CLOFORK 等）
     ///
     /// 使用 Arc 包装以支持 fork 时的高效克隆。
-    pub cap_table: Arc<CapTable>,
+    cap_table: Arc<CapTable>,
 
     /// 退出码
     pub exit_code: Option<i32>,
@@ -1902,7 +1902,7 @@ pub struct Process {
     /// CLONE_THREAD 创建的线程共享同一个 Arc，因此 setuid/setgid
     /// 等操作会影响所有同进程的线程（符合 POSIX 语义）。
     /// 普通 fork 会 clone 凭证到新的 Arc。
-    pub credentials: Arc<SharedCredentials>,
+    credentials: Arc<SharedCredentials>,
 
     /// 文件创建掩码 (umask)
     /// 新建文件的权限 = mode & !umask
@@ -2850,67 +2850,6 @@ impl Process {
         }
     }
 
-    /// U.S2-SLICE-3B FIX: Allocate a CapId for a regular file, following the
-    /// SLICE-3A pipe pattern (prepare → install).
-    ///
-    /// This method performs the TWO-PHASE allocation mandated by the SLICE-3A
-    /// design:
-    /// 1. **Prepare**: Reserve cap-table slot BEFORE touching Process lock
-    /// 2. **Install**: Publish the CapId while holding Process lock, then
-    ///    immediately call `file_handle.set_cap_id(cap_id)` to link it
-    ///
-    /// # Arguments
-    /// * `inode_id` - Inode number within the owning filesystem
-    /// * `fs_id` - Filesystem identifier for cross-mount disambiguation
-    /// * `rights` - Capability rights (typically READ | WRITE based on open flags)
-    /// * `flags` - Capability flags (e.g., CLOEXEC if O_CLOEXEC was set)
-    ///
-    /// # Returns
-    /// * `Ok(CapId)` - Successfully allocated capability
-    /// * `Err(CapError::TableFull)` - Cap table exhausted (maps to EMFILE at syscall)
-    /// * `Err(CapError::OutOfMemory)` - Heap exhausted during preparation
-    ///
-    /// # Lock Context
-    /// Caller MUST hold the Process lock. The cap_table's inner spinlock is a
-    /// LEAF (without_interrupts + no re-entrant callbacks), so this is safe.
-    ///
-    /// # Safety Invariant
-    /// The caller MUST immediately call `file_handle.set_cap_id(cap_id)` after
-    /// this returns Ok. Failure to do so creates an orphaned CapId that will
-    /// never be decremented, violating the refcount invariant (SLICE-3A design
-    /// defect #1: funnel-unreachable-orphan leak).
-    pub fn allocate_file_cap(
-        &self,
-        inode_id: u64,
-        fs_id: u64,
-        rights: cap::CapRights,
-        flags: cap::CapFlags,
-    ) -> Result<cap::CapId, cap::CapError> {
-        // SLICE-3A TWO-PHASE: Prepare cap allocation OUTSIDE any Process lock
-        // (this was already done by the caller before acquiring the lock in the
-        // canonical install flow, but we re-prepare here for non-install paths
-        // like dup/fork that may call this under lock).
-        //
-        // NOTE: This method is called UNDER Process lock in the canonical flow
-        // (FdPublicationReservation::install → allocate_file_cap), so the
-        // prepare_allocation() here happens while holding the lock. This is
-        // SAFE because CapTable::prepare_allocation() only acquires its own
-        // inner spinlock (LEAF, no re-entrant callbacks). The TWO-PHASE
-        // separation happens at the SYSCALL layer (PreparedFileHandle allocated
-        // before FdPublicationReservation), not at this helper's call site.
-        let prepared = self.cap_table.prepare_allocation()?;
-
-        // Construct the plain-data RegularFile identity (NO Arc allocation)
-        let reg_file = cap::RegularFile { inode_id, fs_id };
-        let entry = cap::CapEntry::with_flags(cap::CapObject::RegularFile(reg_file), rights, flags);
-
-        // Install into the reserved slot (allocation-free, infallible given
-        // the PreparedCapAllocation token)
-        let cap_id = prepared.install(entry);
-
-        Ok(cap_id)
-    }
-
     /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
     ///
     /// # Arguments
@@ -3418,13 +3357,191 @@ impl Process {
         self.credentials.generation()
     }
 
-    /// Check a VFS authorization snapshot while holding the shared credential
-    /// read lock. A writer publishes its new generation before releasing the
-    /// matching write lock, so this cannot pair post-mutation credentials with
-    /// a pre-mutation generation.
+    /// Try to read credentials without exposing a writable credential lock to
+    /// callers or yielding while the caller holds this PCB lock.
+    ///
+    /// R186 review-fix: mutation is intentionally confined to this module's
+    /// generation-publishing transaction, so no caller can change credentials
+    /// while bypassing the shared generation counter.
+    #[inline]
+    pub fn try_credentials_read(&self) -> Option<CredentialReadGuard<'_>> {
+        self.credentials.try_read()
+    }
+
+    /// Clone the shared credential identity for a transaction that must keep a
+    /// read guard alive independently of a mutable `Process` borrow.
+    #[inline]
+    pub fn shared_credentials(&self) -> Arc<SharedCredentials> {
+        Arc::clone(&self.credentials)
+    }
+
+    /// Bind an owned authorization token to this exact PCB credential identity.
+    #[inline]
+    pub fn credentials_match_authorization(&self, authorization: &CredentialAuthorization) -> bool {
+        authorization.matches(&self.credentials)
+    }
+
+    /// Install the exact credential identity selected by clone/fork preparation
+    /// before the child is schedulable.
+    #[inline]
+    pub(crate) fn install_shared_credentials_for_clone(
+        &mut self,
+        credentials: Arc<SharedCredentials>,
+    ) {
+        assert_eq!(
+            self.state,
+            ProcessState::Provisioning,
+            "credential identity may only be installed on a provisioning child"
+        );
+        assert_eq!(
+            self.credentials.generation(),
+            0,
+            "provisioning child credential identity was already mutated"
+        );
+        self.credentials = credentials;
+    }
+
+    /// Read-only capability-table observability for boot diagnostics.
+    #[inline]
+    pub fn capability_count(&self) -> usize {
+        self.cap_table.len()
+    }
+
+    /// Opaque cloneable authority for this exact capability table. Cross-crate
+    /// brokers may carry it, but cannot dereference it or invoke raw mint APIs.
+    pub fn capability_table_authority(&self) -> CapabilityTableAuthority {
+        CapabilityTableAuthority {
+            table: Arc::clone(&self.cap_table),
+        }
+    }
+
+    /// Identity-bound, LSM-mediated two-phase mint broker. Raw production-table
+    /// access never leaves this module; callers receive only an opaque prepared
+    /// grant whose authorization token remains live through publication/audit.
+    pub fn prepare_capability_allocation_authorized<'a>(
+        &self,
+        authority: &'a CapabilityTableAuthority,
+        authorization: CredentialAuthorization,
+    ) -> Result<crate::syscall::AuthorizedCapReservation<'a>, SyscallError> {
+        if !self.credentials_match_authorization(&authorization)
+            || !Arc::ptr_eq(&self.cap_table, &authority.table)
+        {
+            return Err(SyscallError::EPERM);
+        }
+        let credentials = authorization.read();
+        let proc_ctx = LsmProcessCtx::new(
+            self.pid,
+            self.tgid,
+            credentials.uid,
+            credentials.gid,
+            credentials.euid,
+            credentials.egid,
+        );
+        lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+            .map_err(|_| SyscallError::EPERM)?;
+        let capability = authority
+            .table
+            .prepare_allocation()
+            .map_err(crate::syscall::cap_error_to_syscall)?;
+        drop(credentials);
+        Ok(crate::syscall::AuthorizedCapReservation::new(
+            capability,
+            proc_ctx,
+            authorization,
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn capability_table_is_shared(&self) -> bool {
+        Arc::strong_count(&self.cap_table) > 1
+    }
+
+    pub(crate) fn try_clone_capability_table_for_fork(
+        &self,
+        reconciled_refcounts: Option<&[(cap::CapId, usize)]>,
+    ) -> Result<CapabilityTableInheritance, ()> {
+        let mut table = self.cap_table.try_clone_for_fork()?;
+        if let Some(refcounts) = reconciled_refcounts {
+            table.reconcile_refcounts_after_fork(refcounts);
+        }
+        let table = Arc::try_new(table).map_err(|_| ())?;
+        Ok(CapabilityTableInheritance { table })
+    }
+
+    #[inline]
+    pub(crate) fn share_capability_table(&self) -> CapabilityTableInheritance {
+        CapabilityTableInheritance {
+            table: Arc::clone(&self.cap_table),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn install_capability_table(&mut self, inheritance: CapabilityTableInheritance) {
+        self.cap_table = inheritance.table;
+    }
+
+    #[inline]
+    pub(crate) fn capability_increment_refcount(&self, cap_id: cap::CapId) {
+        let _ = self.cap_table.increment_refcount(cap_id);
+    }
+
+    #[inline]
+    pub(crate) fn capability_lookup(
+        &self,
+        cap_id: cap::CapId,
+    ) -> Result<cap::CapEntry, cap::CapError> {
+        self.cap_table.lookup(cap_id)
+    }
+
+    #[inline]
+    pub(crate) fn apply_capability_cloexec(&mut self) {
+        self.cap_table.apply_cloexec();
+    }
+
+    /// Adopt accounting for a freshly loaded boot image into an unscheduled PCB.
+    ///
+    /// `load_elf` has already hard-charged the image data to this process's
+    /// cgroup (the boot caller passes cgroup 0). Intermediate page-table frames
+    /// are knowable only after mapping, so they receive the same forced kmem
+    /// charge and provenance fold used by the normal exec success transaction.
+    ///
+    /// # Contract
+    ///
+    /// The process must be unscheduled, own a fresh nonzero address space, and
+    /// have no prior image accounting. No fallible operation may follow this
+    /// commit before the setup receipt is disarmed; its rollback path routes
+    /// through `free_process_resources`, which releases both accounting lanes.
+    pub fn commit_boot_loaded_image_accounting(
+        &mut self,
+        load_result: &crate::elf_loader::ElfLoadResult,
+    ) {
+        assert_ne!(
+            self.memory_space, 0,
+            "boot image requires an owned address space"
+        );
+        let mut mm = self.mm.lock();
+        assert_eq!(
+            mm.elf_charged_bytes, 0,
+            "boot image accounting committed twice"
+        );
+        assert_eq!(mm.pt_charged_bytes, 0, "boot PT accounting committed twice");
+
+        let pt_bytes = (load_result.pt_frames.len() as u64).saturating_mul(0x1000);
+        if pt_bytes > 0 {
+            crate::cgroup::charge_memory_forced(self.cgroup_id, pt_bytes);
+            mm.record_pt_charge(&load_result.pt_frames);
+        }
+        mm.elf_charged_bytes = load_result.charged_bytes;
+        mm.stack_floor_committed = crate::elf_loader::user_stack_mapped_floor() as usize;
+        mm.brk_start = load_result.brk_start;
+        mm.brk = load_result.brk_start;
+    }
+
+    /// Check a VFS authorization snapshot. Operation-spanning callers already
+    /// own a `CredentialAuthorization`, so reopening reader admission here can
+    /// deadlock behind a queued writer and is unnecessary.
     #[inline]
     pub fn cred_generation_is_current(&self, expected: u64) -> bool {
-        let _credentials = self.credentials.read();
         self.credentials.generation() == expected
     }
 }
@@ -4450,13 +4567,13 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
     // inherit credentials from the parent via fork()/clone().
     if ppid == 0 {
         let mut proc = process.lock();
-        *proc.credentials.write() = Credentials {
+        proc.credentials.replace_unpublished(Credentials {
             uid: 0,
             gid: 0,
             euid: 0,
             egid: 0,
             supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        };
+        });
     }
 
     // F.1 PID Namespace: Assign namespace chain for the new process
@@ -4676,13 +4793,13 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
     // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
     if ppid == 0 {
         let mut proc = process.lock();
-        *proc.credentials.write() = Credentials {
+        proc.credentials.replace_unpublished(Credentials {
             uid: 0,
             gid: 0,
             euid: 0,
             egid: 0,
             supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        };
+        });
     }
 
     // Assign PID namespace chain using the specified target namespace.
@@ -5609,13 +5726,38 @@ pub struct Credentials {
 /// credentials paired with the old generation.
 #[derive(Debug)]
 pub struct SharedCredentials {
+    /// Serializes credential-changing transactions against both ordinary
+    /// credential readers and authorization spans that include side effects
+    /// outside the credential lock (for example VFS create/truncate).
+    authorization_state: AtomicUsize,
     credentials: RwLock<Credentials>,
     generation: AtomicU64,
 }
 
+enum CredentialMutation<T> {
+    Changed(T),
+    Unchanged(T),
+}
+
 impl SharedCredentials {
+    const AUTH_READER: usize = 2;
+    const AUTH_WRITER: usize = 1;
+    const AUTH_SPIN_BUDGET: u32 = 64;
+
+    #[inline]
+    fn wait_for_authorization_turn(spins: &mut u32) {
+        if *spins < Self::AUTH_SPIN_BUDGET {
+            *spins += 1;
+            core::hint::spin_loop();
+        } else {
+            *spins = 0;
+            crate::scheduler_hook::force_reschedule();
+        }
+    }
+
     pub fn new(credentials: Credentials) -> Self {
         Self {
+            authorization_state: AtomicUsize::new(0),
             credentials: RwLock::new(credentials),
             generation: AtomicU64::new(0),
         }
@@ -5627,17 +5769,317 @@ impl SharedCredentials {
     }
 
     #[inline]
-    pub fn publish_mutation(&self) {
+    fn publish_mutation(&self) {
         // lint-fetch-add: allow - generation counter, wrapping is safe
         self.generation.fetch_add(1, Ordering::Release);
     }
+
+    fn try_acquire_read_admission(&self) -> Option<CredentialReadAdmission<'_>> {
+        let state = self.authorization_state.load(Ordering::Acquire);
+        if state & Self::AUTH_WRITER != 0 {
+            return None;
+        }
+        let next = state
+            .checked_add(Self::AUTH_READER)
+            .expect("credential reader count overflow");
+        self.authorization_state
+            .compare_exchange(state, next, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| CredentialReadAdmission { identity: self })
+    }
+
+    /// Nonblocking read-only access for lock-held and recovery paths. Ordinary
+    /// readers participate in the same writer-fair admission gate as long-lived
+    /// authorization tokens; once a writer claims admission, callers fail
+    /// closed and may retry without yielding under an outer PCB/VFS lock.
+    #[inline]
+    pub fn try_read(&self) -> Option<CredentialReadGuard<'_>> {
+        let admission = self.try_acquire_read_admission()?;
+        let credentials = self.credentials.try_read()?;
+        Some(CredentialReadGuard {
+            credentials,
+            _admission: admission,
+        })
+    }
+
+    /// Begin an owned authorization span. Runtime credential writers cannot
+    /// enter until every returned token is dropped.
+    pub fn begin_authorization(self: &Arc<Self>) -> CredentialAuthorization {
+        let mut spins = 0;
+        loop {
+            let state = self.authorization_state.load(Ordering::Acquire);
+            if state & Self::AUTH_WRITER != 0 {
+                Self::wait_for_authorization_turn(&mut spins);
+                continue;
+            }
+            let next = state
+                .checked_add(Self::AUTH_READER)
+                .expect("credential authorization reader count overflow");
+            if self
+                .authorization_state
+                .compare_exchange_weak(state, next, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return CredentialAuthorization {
+                    identity: Arc::clone(self),
+                };
+            }
+        }
+    }
+
+    /// Single-attempt admission for callers that cannot yield because they
+    /// already hold an outer transaction lock. A queued writer wins; callers
+    /// fail closed and may retry the syscall.
+    pub fn try_begin_authorization(self: &Arc<Self>) -> Option<CredentialAuthorization> {
+        let state = self.authorization_state.load(Ordering::Acquire);
+        if state & Self::AUTH_WRITER != 0 {
+            return None;
+        }
+        let next = state
+            .checked_add(Self::AUTH_READER)
+            .expect("credential authorization reader count overflow");
+        self.authorization_state
+            .compare_exchange(state, next, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| CredentialAuthorization {
+                identity: Arc::clone(self),
+            })
+    }
+
+    fn mutate<T>(
+        &self,
+        mutation: impl FnOnce(&mut Credentials) -> Result<CredentialMutation<T>, CredentialsError>,
+    ) -> Result<T, CredentialsError> {
+        let _operation = CredentialMutationGuard::acquire(self);
+        let mut credentials = self.credentials.write();
+        match mutation(&mut credentials)? {
+            CredentialMutation::Changed(value) => {
+                self.publish_mutation();
+                Ok(value)
+            }
+            CredentialMutation::Unchanged(value) => Ok(value),
+        }
+    }
+
+    /// Replace credentials before the PCB is published. This is construction,
+    /// not a runtime authorization transition, so the initial generation stays
+    /// at zero. The assertion prevents accidental use on a live identity.
+    fn replace_unpublished(&self, credentials: Credentials) {
+        let _operation = CredentialMutationGuard::acquire(self);
+        assert_eq!(
+            self.generation(),
+            0,
+            "credential identity replacement attempted after runtime mutation"
+        );
+        *self.credentials.write() = credentials;
+    }
 }
 
-impl core::ops::Deref for SharedCredentials {
-    type Target = RwLock<Credentials>;
+/// Owned proof that one exact credential identity cannot mutate for the
+/// lifetime of an authorization/publication transaction.
+pub struct CredentialAuthorization {
+    identity: Arc<SharedCredentials>,
+}
+
+struct CredentialReadAdmission<'a> {
+    identity: &'a SharedCredentials,
+}
+
+impl Drop for CredentialReadAdmission<'_> {
+    fn drop(&mut self) {
+        let previous = self
+            .identity
+            .authorization_state
+            .fetch_sub(SharedCredentials::AUTH_READER, Ordering::Release);
+        assert!(previous >= SharedCredentials::AUTH_READER);
+    }
+}
+
+/// Composite ordinary credential reader. Field order is intentional: Rust
+/// drops the RwLock guard before the admission unit, so a queued writer can
+/// never enter the underlying write lock while this read guard remains live.
+pub struct CredentialReadGuard<'a> {
+    credentials: spin::RwLockReadGuard<'a, Credentials>,
+    _admission: CredentialReadAdmission<'a>,
+}
+
+impl core::ops::Deref for CredentialReadGuard<'_> {
+    type Target = Credentials;
 
     fn deref(&self) -> &Self::Target {
         &self.credentials
+    }
+}
+
+pub struct CapabilityTableAuthority {
+    table: Arc<CapTable>,
+}
+
+pub(crate) struct CapabilityTableInheritance {
+    table: Arc<CapTable>,
+}
+
+impl CredentialAuthorization {
+    #[inline]
+    pub fn read(&self) -> spin::RwLockReadGuard<'_, Credentials> {
+        // This token already owns one reader unit. Reopening admission here
+        // could deadlock behind a queued writer that is waiting for this exact
+        // authorization span to complete.
+        self.identity.credentials.read()
+    }
+
+    #[inline]
+    fn matches(&self, identity: &Arc<SharedCredentials>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+
+    /// Derive a nested token without reopening reader admission. A queued
+    /// writer may already own the odd pending bit, but the existing token proves
+    /// mutation cannot start until both reader units are released.
+    pub fn derive(&self) -> Self {
+        let mut state = self.identity.authorization_state.load(Ordering::Acquire);
+        loop {
+            assert!(state >= SharedCredentials::AUTH_READER);
+            let next = state
+                .checked_add(SharedCredentials::AUTH_READER)
+                .expect("credential authorization reader count overflow");
+            match self.identity.authorization_state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => state = observed,
+            }
+        }
+        Self {
+            identity: Arc::clone(&self.identity),
+        }
+    }
+}
+
+impl Drop for CredentialAuthorization {
+    fn drop(&mut self) {
+        let previous = self
+            .identity
+            .authorization_state
+            .fetch_sub(SharedCredentials::AUTH_READER, Ordering::Release);
+        assert!(previous >= SharedCredentials::AUTH_READER);
+    }
+}
+
+struct CredentialMutationGuard<'a> {
+    identity: &'a SharedCredentials,
+}
+
+impl<'a> CredentialMutationGuard<'a> {
+    fn try_claim(identity: &'a SharedCredentials) -> bool {
+        let state = identity.authorization_state.load(Ordering::Acquire);
+        state & SharedCredentials::AUTH_WRITER == 0
+            && identity
+                .authorization_state
+                .compare_exchange(
+                    state,
+                    state | SharedCredentials::AUTH_WRITER,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
+    fn acquire(identity: &'a SharedCredentials) -> Self {
+        let mut spins = 0;
+        loop {
+            if Self::try_claim(identity) {
+                break;
+            }
+            SharedCredentials::wait_for_authorization_turn(&mut spins);
+        }
+
+        // Owning the odd bit closes reader admission. Drain readers that
+        // linearized before the writer claim; no later reader can barge.
+        while identity.authorization_state.load(Ordering::Acquire) != SharedCredentials::AUTH_WRITER
+        {
+            SharedCredentials::wait_for_authorization_turn(&mut spins);
+        }
+        Self { identity }
+    }
+}
+
+impl Drop for CredentialMutationGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.identity.authorization_state.swap(0, Ordering::Release);
+        assert_eq!(previous, SharedCredentials::AUTH_WRITER);
+    }
+}
+
+#[cfg(test)]
+mod credential_gate_tests {
+    use super::*;
+
+    fn test_identity() -> SharedCredentials {
+        SharedCredentials::new(Credentials {
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+        })
+    }
+
+    #[test]
+    fn rf186_credential_writer_claim_blocks_ordinary_reader_barging() {
+        let identity = test_identity();
+        let reader = identity.try_read().expect("initial ordinary reader");
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_READER
+        );
+
+        assert!(CredentialMutationGuard::try_claim(&identity));
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_READER | SharedCredentials::AUTH_WRITER
+        );
+        assert!(identity.try_read().is_none());
+
+        drop(reader);
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_WRITER
+        );
+        drop(CredentialMutationGuard {
+            identity: &identity,
+        });
+        assert_eq!(identity.authorization_state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rf186_derived_authorization_accounts_behind_pending_writer() {
+        let identity = Arc::new(test_identity());
+        let authorization = identity.begin_authorization();
+        let derived = authorization.derive();
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_READER * 2
+        );
+
+        assert!(CredentialMutationGuard::try_claim(&identity));
+        assert!(identity.try_begin_authorization().is_none());
+        drop(derived);
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_READER | SharedCredentials::AUTH_WRITER
+        );
+        drop(authorization);
+        assert_eq!(
+            identity.authorization_state.load(Ordering::Acquire),
+            SharedCredentials::AUTH_WRITER
+        );
+        drop(CredentialMutationGuard {
+            identity: identity.as_ref(),
+        });
     }
 }
 
@@ -5667,7 +6109,7 @@ pub fn current_credentials() -> Option<CredentialIds> {
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
-    let creds = proc.credentials.read();
+    let creds = proc.credentials.try_read()?;
     Some(CredentialIds {
         uid: creds.uid,
         gid: creds.gid,
@@ -5696,7 +6138,7 @@ pub fn current_host_euid() -> Option<u32> {
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
 
-    let ns_euid = proc.credentials.read().euid;
+    let ns_euid = proc.credentials.try_read()?.euid;
     let user_ns = proc.user_ns.clone();
     // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
     // across the uid_map read lock.
@@ -5736,7 +6178,7 @@ pub fn current_host_egid() -> Option<u32> {
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
 
-    let ns_egid = proc.credentials.read().egid;
+    let ns_egid = proc.credentials.try_read()?.egid;
     let user_ns = proc.user_ns.clone();
     // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
     // across the gid_map read lock.
@@ -5825,7 +6267,9 @@ pub fn current_supplementary_groups() -> Result<Option<AdmittedVec<u32>>, Creden
         return Ok(None);
     };
     let credentials = Arc::clone(&proc.lock().credentials);
-    let creds = credentials.read();
+    let creds = credentials
+        .try_read()
+        .ok_or(CredentialsError::PermissionDenied)?;
     AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, &creds.supplementary_groups)
         .map(Some)
         .map_err(|_| CredentialsError::OutOfMemory)
@@ -5876,7 +6320,7 @@ fn snapshot_current_groups() -> Option<(
     let pid = current_pid()?;
     let process = get_process(pid)?;
     let proc = process.lock();
-    let credentials = proc.credentials.read();
+    let credentials = proc.credentials.try_read()?;
     let len = credentials.supplementary_groups.len().min(NGROUPS_MAX);
     let mut groups = [0u32; NGROUPS_MAX];
     groups[..len].copy_from_slice(&credentials.supplementary_groups[..len]);
@@ -5927,21 +6371,23 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), Credential
         let proc = process.lock();
         Arc::clone(&proc.credentials)
     };
-    let mut creds = credentials.write();
-    if creds.euid != 0 {
-        return Err(CredentialsError::PermissionDenied);
-    }
+    let old = credentials.mutate(|creds| {
+        if creds.euid != 0 {
+            return Err(CredentialsError::PermissionDenied);
+        }
 
-    // RF180-17 FIX: complete the admitted replacement before publication.
-    let mut replacement = AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, groups)
-        .map_err(|_| CredentialsError::OutOfMemory)?;
-    normalize_groups(&mut replacement);
-    let old = core::mem::replace(&mut creds.supplementary_groups, replacement);
-    // R186-18: publish while the write lock still excludes authorization
-    // snapshots. The generation belongs to this shared credential object, so
-    // every CLONE_THREAD sibling observes the mutation.
-    credentials.publish_mutation();
-    drop(creds);
+        // RF180-17 FIX: complete the admitted replacement before publication.
+        let mut replacement = AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, groups)
+            .map_err(|_| CredentialsError::OutOfMemory)?;
+        normalize_groups(&mut replacement);
+        if creds.supplementary_groups.as_slice() == replacement.as_slice() {
+            return Ok(CredentialMutation::Unchanged(None));
+        }
+        Ok(CredentialMutation::Changed(Some(core::mem::replace(
+            &mut creds.supplementary_groups,
+            replacement,
+        ))))
+    })?;
     drop(old);
     Ok(())
 }
@@ -5968,12 +6414,14 @@ pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
         let proc = process.lock();
         Arc::clone(&proc.credentials)
     };
-    let mut creds = credentials.write();
-    if creds.euid != 0 {
-        return Err(CredentialsError::PermissionDenied);
-    }
+    credentials.mutate(|creds| {
+        if creds.euid != 0 {
+            return Err(CredentialsError::PermissionDenied);
+        }
 
-    if !creds.supplementary_groups.contains(&gid) {
+        if creds.supplementary_groups.contains(&gid) {
+            return Ok(CredentialMutation::Unchanged(()));
+        }
         if creds.supplementary_groups.len() >= NGROUPS_MAX {
             return Err(CredentialsError::TooManyGroups);
         }
@@ -5986,9 +6434,8 @@ pub fn add_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
             .push_reserved(gid)
             .map_err(|_| CredentialsError::OutOfMemory)?;
         normalize_groups(&mut creds.supplementary_groups);
-        credentials.publish_mutation();
-    }
-    Ok(())
+        Ok(CredentialMutation::Changed(()))
+    })
 }
 
 /// 从当前进程移除一个附属组
@@ -6012,17 +6459,19 @@ pub fn remove_supplementary_group(gid: u32) -> Result<(), CredentialsError> {
         let proc = process.lock();
         Arc::clone(&proc.credentials)
     };
-    let mut creds = credentials.write();
-    if creds.euid != 0 {
-        return Err(CredentialsError::PermissionDenied);
-    }
+    credentials.mutate(|creds| {
+        if creds.euid != 0 {
+            return Err(CredentialsError::PermissionDenied);
+        }
 
-    let old_len = creds.supplementary_groups.len();
-    creds.supplementary_groups.retain(|&g| g != gid);
-    if creds.supplementary_groups.len() != old_len {
-        credentials.publish_mutation();
-    }
-    Ok(())
+        let old_len = creds.supplementary_groups.len();
+        creds.supplementary_groups.retain(|&g| g != gid);
+        if creds.supplementary_groups.len() != old_len {
+            Ok(CredentialMutation::Changed(()))
+        } else {
+            Ok(CredentialMutation::Unchanged(()))
+        }
+    })
 }
 
 /// 获取当前进程的umask
@@ -6047,47 +6496,23 @@ pub fn set_current_umask(new_mask: u16) -> Option<u16> {
 
 // ========== 能力表访问 ==========
 
-/// 获取当前进程的能力表（CapTable）
+/// Test the current process's aggregate capability rights without exposing its
+/// mutable capability table to callers.
 ///
-/// 返回能力表的 Arc 克隆，调用者可以直接使用 CapTable 的方法
-/// （如 allocate、lookup、revoke、delegate 等）进行操作。
-///
-/// # Returns
-///
-/// 如果当前有运行中的进程，返回 Some(Arc<CapTable>)；
-/// 如果在内核线程中调用（无当前进程），返回 None。
-pub fn current_cap_table() -> Option<Arc<CapTable>> {
-    let pid = current_pid()?;
+/// RF186-12: raw `CapTable` access made unmediated mint/revoke APIs reachable
+/// outside kernel-core. Keep production tables private and export only the
+/// narrow authorization query required by policy gates. Missing current-process
+/// state fails closed.
+pub fn current_has_cap_rights(rights: cap::CapRights) -> bool {
+    let Some(pid) = current_pid() else {
+        return false;
+    };
     let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
-    Some(proc.cap_table.clone())
-}
-
-/// 对当前进程的能力表执行操作
-///
-/// 提供一个便捷的方式来对能力表执行操作，而无需手动获取 Arc。
-///
-/// # Arguments
-///
-/// * `f` - 接受 &CapTable 引用的闭包
-///
-/// # Returns
-///
-/// 如果当前有运行中的进程，返回闭包的返回值；否则返回 None。
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let can_write = with_current_cap_table(|table| {
-///     table.check_rights(cap_id, CapRights::WRITE).unwrap_or(false)
-/// });
-/// ```
-pub fn with_current_cap_table<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&CapTable) -> R,
-{
-    current_cap_table().map(|table| f(&table))
+    let Some(Some(process)) = table.get(pid) else {
+        return false;
+    };
+    let authorized = process.lock().cap_table.has_rights(rights);
+    authorized
 }
 
 // ========== Seccomp/Pledge 沙箱访问 ==========
@@ -7167,11 +7592,21 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             proc.clear_child_tid = 0;
             // R25-7 + R39-3 FIX: Capture credentials from shared structure
             {
-                let creds = proc.credentials.read();
-                lsm_uid = creds.uid;
-                lsm_gid = creds.gid;
-                lsm_euid = creds.euid;
-                lsm_egid = creds.egid;
+                if let Some(creds) = proc.credentials.try_read() {
+                    lsm_uid = creds.uid;
+                    lsm_gid = creds.gid;
+                    lsm_euid = creds.euid;
+                    lsm_egid = creds.egid;
+                } else {
+                    // Teardown cannot wait while holding the PCB. An in-flight
+                    // credential writer makes the subject unavailable, so use
+                    // the unprivileged overflow identity for fail-closed exit
+                    // mediation rather than bypassing writer admission.
+                    lsm_uid = 65534;
+                    lsm_gid = 65534;
+                    lsm_euid = 65534;
+                    lsm_egid = 65534;
+                }
             } // Drop creds read guard before mutable access below
               // RF180-16: transfer the admitted chain; a dying task no longer
               // needs namespace visibility and teardown must not allocate.
@@ -7936,9 +8371,10 @@ pub fn cleanup_zombie(pid: ProcessId) {
 ///   for ppid != 0; that is done later in `fork_inner()`. Detaching an unattached
 ///   task causes `fetch_sub` underflow on cgroup task counters.
 ///
-/// - **No cpuset task_left** — `notify_cpuset_task_joined()` is called in
-///   `fork_inner()` (fork.rs), not in `create_process()` for ppid != 0. Decrementing
-///   a never-incremented counter causes `fetch_sub` underflow.
+/// - **Conditional cpuset task_left** — `create_process()` joins kernel-created
+///   tasks (`ppid == 0`) immediately, while ordinary children are joined later by
+///   `fork_inner()`. Rollback records that distinction under the PCB lock and only
+///   decrements the cpuset counter for the former.
 ///
 /// - **No IPC cleanup** — the child never registered IPC endpoints.
 ///
@@ -7983,6 +8419,8 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
                     AdmittedVec::new(HeapClass::CoreProcess),
                 );
                 let watchdog_handle = proc.watchdog_handle.take();
+                let joined_cpuset = proc.ppid == 0;
+                let cpuset_id = proc.cpuset_id;
 
                 // Determine whether another live process shares this address space.
                 // If memory_space was already zeroed by the caller (to prevent
@@ -8006,7 +8444,14 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
                 };
 
                 drop(proc);
-                Some((process, keep_address_space, pid_ns_chain, watchdog_handle))
+                Some((
+                    process,
+                    keep_address_space,
+                    pid_ns_chain,
+                    watchdog_handle,
+                    joined_cpuset,
+                    cpuset_id,
+                ))
             } else {
                 None
             }
@@ -8022,7 +8467,15 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
     drop(retired_process_table);
 
     // Phase 2: Free resources without cross-subsystem callbacks.
-    if let Some((process, keep_address_space, pid_ns_chain, watchdog_handle)) = cleanup_info {
+    if let Some((
+        process,
+        keep_address_space,
+        pid_ns_chain,
+        watchdog_handle,
+        joined_cpuset,
+        cpuset_id,
+    )) = cleanup_info
+    {
         // G.1 Observability: Unregister watchdog before releasing other resources.
         if let Some(handle) = watchdog_handle {
             if unregister_watchdog(&handle).is_err() {
@@ -8041,8 +8494,12 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
         // F.1 PID Namespace: Detach from all namespaces.
         crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
 
-        // NOTE: No IPC cleanup, no cpuset task_left, no cgroup detach,
-        // no scheduler removal — none of those subsystems were joined.
+        if joined_cpuset {
+            notify_cpuset_task_left(cpuset_id);
+        }
+
+        // NOTE: No IPC cleanup, cgroup detach, or scheduler removal — none of
+        // those subsystems were joined. Cpuset rollback is conditional above.
 
         klog!(Info, "Cleaned up unscheduled process {}", pid);
     }

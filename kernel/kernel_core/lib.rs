@@ -99,11 +99,11 @@ pub use process::{
     allocate_kernel_stack,
     // F.1 PID Namespace: create process in specific namespace
     create_process_in_namespace,
-    current_cap_table,
     current_cgroup_id, // F.2: Cgroup ID for resource accounting
     current_credentials,
     current_egid,
     current_euid,
+    current_has_cap_rights,
     current_host_egid,                 // R135-1: host-mapped egid for DAC
     current_host_euid,                 // R133-1: host-mapped euid for privilege gates
     current_host_supplementary_groups, // R135-1: host-mapped supplementary groups for DAC
@@ -141,7 +141,6 @@ pub use process::{
     sync_kpti_cr3,
     // Thread group support (R33-1 fix)
     thread_group_size,
-    with_current_cap_table,
     CpusetTaskJoinedCallback,
     CpusetTaskLeftCallback,
     // DAC support
@@ -186,13 +185,14 @@ pub use syscall::{
     // U.S2-SLICE-3: canonical LSM-gated cap allocator, error mappers, and LSM
     // subject constructor, shared with the out-of-crate pipe cap-install site
     // (ipc::pipe_create_callback).
-    cap_allocate_with_lsm,
     cap_error_to_syscall,
     drain_deferred_stdin_wakes,
     lsm_error_to_syscall,
     lsm_process_ctx_from,
+    lsm_process_ctx_from_credentials,
     // R144-2 FIX: Decode mmap region flags to permission string for procfs
     mmap_flags_to_perms,
+    prepare_process_cap_allocation_authorized,
     register_fd_close_callback,
     register_fd_read_callback,
     register_fd_write_callback,
@@ -216,6 +216,8 @@ pub use syscall::{
     // R74-2 test helper
     test_is_mount_ns_callback_registered,
     wake_stdin_waiters,
+    AuthorizedCapGrant,
+    AuthorizedCapReservation,
     DirEntry,
     FileType,
     SyscallError,
@@ -389,12 +391,8 @@ pub fn init() {
         }
 
         // Second check: CAP_AUDIT_READ capability
-        if let Some(has_cap) =
-            with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ))
-        {
-            if has_cap {
-                return Ok(());
-            }
+        if current_has_cap_rights(cap::CapRights::AUDIT_READ) {
+            return Ok(());
         }
 
         Err(audit::AuditError::AccessDenied)
