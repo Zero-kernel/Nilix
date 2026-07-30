@@ -15,3 +15,10 @@ fixes are reviewed; defects are numbered `RF{N}-{k}`.
   as PARTIAL and re-repaired by RF180-56..59; complete SMP oracle/window/supervisor,
   independently bounded duplicate-free single-BSP admission, and isolated final-musl-package
   provenance.
+- `reviewfix-2026-07-29.md` — **R186 fix review (current).** 10 defects filed and repaired
+  (`RF186-1`…`RF186-8`, `RF186-11`, `RF186-12`): 2 outright FAIL — R186-1's fix relocated the
+  open/openat PCB recursion, R186-10's COW retry budget made cross-CPU contention user-fatal — and 8
+  PARTIAL. Adds typed BAR-aperture authority + all-or-nothing MMIO transactions, an owned credential
+  authorization span, allocation-free `cgroupfs` readdir, ext2 dirent/inode type binding, and a
+  `#[must_use]` two-phase mediated `CapTable` mint. **MODE S** (Codex unreachable) — converged but
+  unwitnessed; `RF186-4`/`RF186-7` flagged for re-derivation. Records host unit-test execution debt.

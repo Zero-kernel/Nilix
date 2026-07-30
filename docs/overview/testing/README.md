@@ -21,10 +21,20 @@ the runtime gate reported **31 passed / 39 deferred / 0 failed**, with 0 panic a
 The Zero-OS kernel maintains a comprehensive test suite covering:
 
 ### Unit Tests
-- Subsystem-level tests (cargo test per crate)
+- Subsystem-level `#[cfg(test)]` tests per crate — **but see the caveat below: these are not gated
+  and most do not execute**
 - Primitive testing (sync, allocator, data structures)
 - Edge case validation
 - Error path coverage
+
+> **Host unit-test caveat (measured 2026-07-29).** No Makefile target and no CI job runs
+> `cargo test`. Of the crates carrying `#[cfg(test)]` modules, only `audit` actually runs on the host
+> (15 passed / 0 failed); the `mm`, `block`, `net`, `seccomp` and `kernel_core` test binaries abort at
+> the first allocation (`memory allocation of 4 bytes failed`, SIGABRT) because they link the kernel's
+> `global_allocator` and the kernel heap is uninitialized on the host. This is **pre-existing and
+> A/B-verified**, and `kernel/seccomp/lib.rs:533` documents the convention: structural checks belong in
+> the in-kernel boot suite, "*NOT `#[cfg(test)]`, which does not compile under the no_std cross-build*".
+> Treat the in-kernel boot suite (§ Runtime Tests) as the authoritative regression vehicle.
 
 ### Integration Tests
 - Full kernel boot tests

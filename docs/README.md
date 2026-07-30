@@ -83,16 +83,23 @@ Each subdirectory has a README.md providing:
 
 ## Quality Gate Status
 
-Current gate status for 1.0-Preview: **BLOCKED**
+Current gate status for 1.0-Preview: **BLOCKED** (measured 2026-07-29)
 - ✅ 0 open CRITICAL findings
-- ❌ 1 open HIGH finding (`R186-4`, VMA/MM aggregate admission)
+- ❌ 1 open HIGH finding (`R186-4`, VMA/MM aggregate admission); zero-HIGH streak 0/3
 - ✅ 16 of 17 actionable R186 findings fully fixed; `R186-4` is the sole open actionable
-- ✅ Default remote gates: build/lint clean; `make test` = 31 passed / 39 deferred / 0 failed
+- ✅ Those fixes then review-fixed: 10 `RF186-*` defects filed and repaired (2026-07-29)
+- ✅ Remote gates all green: fmt-check, clippy, lint (incl. abi-oracle + lint-fallible 22/0), build,
+  boot-check, musl-check; `make test` = **31 passed / 39 deferred / 0 failed**, 0 panic, 0 NX
+- ⚠️ Host `#[cfg(test)]` unit tests are **ungated and mostly non-executing** — only the `audit` crate's
+  run (15/0); `mm`/`block`/`net`/`seccomp` test binaries abort on the uninitialized kernel heap
+  (pre-existing). The in-kernel boot suite is the real regression vehicle.
 
-See the [R186 audit/fix record](review/audits/qa-2026-07-28.md) for details.
+See the [R186 audit/fix record](review/audits/qa-2026-07-28.md) and the
+[RF186 review-fix report](review/reviewfix/reviewfix-2026-07-29.md) for details.
 
 ## Recent Audit Rounds
 
+- **RF186** (July 29, 2026): Review of the R186 fixes — 10 defects filed and repaired - [reviewfix/reviewfix-2026-07-29.md](review/reviewfix/reviewfix-2026-07-29.md)
 - **R186** (July 28, 2026): Latest full-codebase audit and fix record - [audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md)
 - **R185** (July 23, 2026): Clean verification round - [audits/qa-2026-07-23-v2.md](review/audits/qa-2026-07-23-v2.md)
 - **R184** (July 23, 2026): Findings round and review-fix - [audits/qa-2026-07-23.md](review/audits/qa-2026-07-23.md)

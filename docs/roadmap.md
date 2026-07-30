@@ -1,9 +1,9 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.2 — D3 PENDING-FRAME v2 update (2026-07-27; was 4.1 design-queue closure 2026-07-24)
-**Snapshot:** 2026-07-27 · branch `main` @ `7ef667c` (working tree carries D3 PENDING-FRAME v2
-uncommitted: park-on-miss + retransmit-on-learn, gateway-fallback delivery retired; remote is the
-authoritative build host)
+**Version:** 4.3 — R186 + RF186 review-fix update (2026-07-29; was 4.2 D3 PENDING-FRAME v2 2026-07-27)
+**Snapshot:** 2026-07-29 · branch `main`, post-R186 tree with the RF186 review-fix round landed
+(10 review-fix defects repaired; all gates re-measured on the remote Linux build host, which remains
+the authoritative execution environment)
 **Design principle:** Security > Correctness > Efficiency > Performance
 **Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
 `docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
@@ -25,7 +25,8 @@ deliberately retain the historical `Zero-os` naming — do not "fix" them.
 3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.41, 2026-07-24);
 4. Audit / review-fix reports in `docs/review/` (security and open-risk status);
 5. `README.md` (public summary — authoritative only where code/tests/plan do not contradict it; where they
-   do, this document records the reconciliation and the README is stale, as with the gate status in §8);
+   do, this document records the reconciliation. As of 2026-07-29 the README §6 gate status agrees with
+   this document: BLOCKED on `R186-4` with the zero-HIGH streak at 0/3);
 6. This document's narrative sections.
 
 **Maturity legend** used throughout:
@@ -54,14 +55,17 @@ that later verification refuted as false positives (see §11).
 **Milestone:** approaching **1.0-Preview**. Phases A–G are complete; **Phase U** (user-mode Linux ABI,
 strategy *Compat-ZeroABI*) is in progress with milestone M0 done and native-capability slice U.S2-3B landed.
 
-**Release gate:** the 1.0-Preview gate is currently **BLOCKED on streak ONLY** (2026-07-24). It was first
-unblocked on 2026-07-22 (zero-HIGH streak 3/3 over R181–R183), then **re-blocked one day later** when
-round R184 found one real CRITICAL (exit-path use-after-free, fixed) and one real HIGH
-(capability-attach TOCTOU, fixed), resetting the streak. Current state: **0 open CRITICAL / 0 open HIGH
-/ 0 open actionable MEDIUM**; streak rebuilt to **1/3** (R185 clean); **both D1 design findings
-RESOLVED 2026-07-24** (D1-RES + D1-ISO) and all D2s dispositioned incl. D2-ABI-STAT-LAYOUT — design
-queue is D3-backlog-only and no longer gate-blocking. Sole remaining gate item: zero-HIGH streak 3/3
-(next = R186 → 2/3). `README.md` §6 and `README_zh.md` §6 were reconciled to this state on 2026-07-25.
+**Release gate:** the 1.0-Preview gate is **BLOCKED on both an open HIGH and the streak** (2026-07-29).
+The gate was first unblocked on 2026-07-22 (zero-HIGH streak 3/3 over R181–R183), re-blocked on
+2026-07-23 by R184's real CRITICAL + HIGH (both fixed), then rebuilt to streak 1/3 by R185. **R186
+(2026-07-28) reset it to 0/3**: a full-codebase round that filed 18 issues (1 CRITICAL, 7 HIGH,
+4 MEDIUM, 5 LOW, 1 INFO) and re-opened the aggregate heap-admission design parent. Current state:
+**0 open CRITICAL / 1 open HIGH (`R186-4`, VMA/MM metadata outside aggregate admission) / 0 open
+actionable MEDIUM**; streak **0/3**. The **RF186 review-fix pass (2026-07-29)** then reviewed the
+landed R186 fixes and filed + repaired 10 defects in them (`RF186-1`…`RF186-12`); it earns no streak
+credit and did not touch `R186-4`. D1-ISO remains RESOLVED; **D1-RES was re-opened** as
+`D1-RES-HEAP-ADMISSION-REOPENED`, the design parent of `R186-4`, so the design queue is once again
+gate-blocking. Remaining gate items: close `R186-4` + its design parent, then rebuild the streak to 3/3.
 
 **Feature work since the gate snapshot:** the **D3 PENDING-FRAME v2** architecture landed 2026-07-27 —
 park-on-miss + retransmit-on-learn fully retires gateway-fallback delivery (the `neighbor_fallbacks`
@@ -76,15 +80,16 @@ retx_failures`. This is feature work on a D3-backlog item, not a gate item — i
 streak. The **D3 NETNS-DATAPLANE** arc (per-namespace ARP caches, byte sub-budget, RX-wiring, addressing,
 routing, RX ingress loop, **eth0 RX live**, ARP request-TX probes) landed 2026-07-25 in eight legs.
 
-| Dimension | State (2026-07-23) |
+| Dimension | State (2026-07-29) |
 |---|---|
-| Audit history | **185 rounds** (R1 2025-12-09 → R185 2026-07-23); ~1,315 findings filed, ~1,161 fixed (§11) |
-| Open security debt | 0 CRITICAL, 0 HIGH, 0 actionable MEDIUM/LOW; design queue D3-backlog-only (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs, D1-RES breadth); all D1/D2 dispositioned 2026-07-24 |
-| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 201,294 lines (`kernel/`, measured 2026-07-25); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
+| Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28, RF186 review-fix 2026-07-29); ~1,333 findings filed, ~1,177 fixed (§11) |
+| Open security debt | 0 CRITICAL, **1 HIGH** (`R186-4`), 0 actionable MEDIUM/LOW; design queue is gate-blocking again via `D1-RES-HEAP-ADMISSION-REOPENED` (parent of `R186-4`), plus D3 backlog (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs) |
+| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 205,745 lines (`kernel/`, measured 2026-07-29); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
 | Syscall surface | **122 distinct syscall numbers dispatched** (~126 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Build/test baseline | build OK · lint (incl. abi-oracle + lint-fallible) OK · runtime tests **30** passed / 39 deferred / 0 failed · 0 panic · 0 NX · musl-check 6 markers (incl. MUSL-STAT-OK / MUSL-UNAME-OK) — re-verified 2026-07-25 on the post-D3 tree |
+| Build/test baseline | fmt-check OK · clippy OK · lint (incl. abi-oracle + lint-fallible 22/0) OK · build OK · runtime tests **31** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK (libc + poll + socket-zero + MUSL-STAT-OK + MUSL-UNAME-OK, exit 0) — all measured 2026-07-29 on the post-RF186 tree |
+| Host unit tests | **Not gated and largely non-executing:** no target runs `cargo test`; only the `audit` crate's host tests run (15 passed / 0 failed). `mm`/`block`/`net`/`seccomp` test binaries abort at first allocation (uninitialized kernel heap) — pre-existing, A/B verified 2026-07-29. Real regression coverage lives in the in-kernel boot suite |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
@@ -180,33 +185,33 @@ generation-versioned capabilities; SHA-256/HMAC audit chain; UEFI firmware is *t
 The kernel is a Cargo workspace of focused crates under `kernel/<subsystem>/`; the bootloader and
 user-space programs are separate build units. Line counts are `wc -l` over `*.rs` at the snapshot commit.
 
-### 4.1 Kernel crates (146 files · 193,656 LOC)
+### 4.1 Kernel crates (146 files · 205,745 LOC)
 
 The `kernel/` tree is **26 build units — 25 library crates plus one entry-binary crate (`src`)**. The LOC
-column is raw `wc -l` over `*.rs`; the 193,656 total is *all* `.rs` under `kernel/` (the surveyed kernel
+column is raw `wc -l` over `*.rs`; the 205,745 total is *all* `.rs` under `kernel/` (the surveyed kernel
 workspace, including in-tree test/mock files), and is distinct from the top-level `bootloader/`,
 `userspace/`, and `fuzz/` trees counted separately in §1.
 
 | Crate | Files | LOC | Responsibility | Maturity |
 |---|---:|---:|---|---|
-| `kernel_core` | 22 | 52,029 | PCB & process table, fork/exec/clone, 121-syscall dispatcher, signals, 5 namespaces, cgroups v2, RCU, SMAP usercopy, KCOV syscalls, fd→capability wiring | 🟢 Implemented |
-| `net` | 17 | 35,741 | virtio-net, ARP/IPv4/ICMP/UDP/TCP, conntrack, default-DROP firewall, capability+LSM socket layer, per-tenant quotas, netns TX gate, per-NS dataplane (ARP/config/routing), bounded RX ingress loop + `BufPool`, ARP probe TX | 🟢 Implemented |
-| `vfs` | 11 | 21,912 | inode/dentry, FileOps (+cap_id), ramfs, **ext2/ext3 rw with JBD2 journaling**, procfs, devfs, initramfs (CPIO), cgroupfs, CoW mount tables, DAC, openat2 RESOLVE_* | 🟢 Implemented |
-| `mm` | 12 | 12,327 | reservation-aware buddy allocator, dual heap + 15-class admission ledger (compile-time partition proof), page tables, page cache (LRU/writeback), TLB shootdown (IPI+PCID), OOM killer, DMA/IOMMU gate | ✅ Validated |
+| `kernel_core` | 22 | 54,521 | PCB & process table, fork/exec/clone, 121-syscall dispatcher, signals, 5 namespaces, cgroups v2, RCU, SMAP usercopy, KCOV syscalls, fd→capability wiring | 🟢 Implemented |
+| `net` | 17 | 37,281 | virtio-net, ARP/IPv4/ICMP/UDP/TCP, conntrack, default-DROP firewall, capability+LSM socket layer, per-tenant quotas, netns TX gate, per-NS dataplane (ARP/config/routing), bounded RX ingress loop + `BufPool`, ARP probe TX | 🟢 Implemented |
+| `vfs` | 11 | 22,301 | inode/dentry, FileOps (+cap_id), ramfs, **ext2/ext3 rw with JBD2 journaling**, procfs, devfs, initramfs (CPIO), cgroupfs, CoW mount tables, DAC, openat2 RESOLVE_* | 🟢 Implemented |
+| `mm` | 12 | 12,904 | reservation-aware buddy allocator, dual heap + 15-class admission ledger (compile-time partition proof), page tables, page cache (LRU/writeback), TLB shootdown (IPI+PCID), OOM killer, DMA/IOMMU gate | ✅ Validated |
 | `iommu` | 6 | 9,875 | Intel VT-d: DMAR ACPI parse, root/context tables, second-level page tables (AGAW), interrupt remapping, fault handling, device isolation/detach, VM-passthrough API | 🟡 Partial (wired at boot; needs real-HW validation) |
-| `arch` | 11 | 9,755 | GDT/TSS/IST, IDT (20 exceptions + IRQ/IPI), context switch, SYSCALL/SYSRET entry hardening, LAPIC/IOAPIC/HPET, SMP bring-up (INIT-SIPI-SIPI), IPIs | 🟢 Implemented |
-| `ipc` | 5 | 7,314 | capability message queues (per-ns), pipes (cap-preallocated), futex (WAIT/WAKE/PI, bucket budgets), WaitQueue/KMutex/Semaphore/CondVar | 🟢 Implemented |
+| `arch` | 11 | 9,794 | GDT/TSS/IST, IDT (20 exceptions + IRQ/IPI), context switch, SYSCALL/SYSRET entry hardening, LAPIC/IOAPIC/HPET, SMP bring-up (INIT-SIPI-SIPI), IPIs | 🟢 Implemented |
+| `ipc` | 5 | 7,299 | capability message queues (per-ns), pipes (cap-preallocated), futex (WAIT/WAKE/PI, bucket budgets), WaitQueue/KMutex/Semaphore/CondVar | 🟢 Implemented |
 | `security` | 9 | 5,938 | W^X/NX validator, KASLR (partial active + text verify), KPTI machinery, Spectre suite (IBRS/IBPB/STIBP/SSBD/RSB/SWAPGS), ChaCha20 CSPRNG, kptr guard, 9 runtime tests | 🟡 Partial (KPTI inert; retpoline no codegen) |
-| `sched` | 5 | 4,965 | per-CPU MLFQ (bounded selector), work stealing + load balancing, starvation boost, cpuset isolation, 9-level lockdep | ✅ Validated (one orphan file — §12) |
-| `block` | 4 | 3,933 | Bio/RequestQueue/BlockDevice, virtio-blk (PCI/MMIO), RAII IOMMU lifecycle, bounds-checked BIO | 🟢 Implemented |
-| `audit` | 1 | 3,197 | SHA-256/HMAC hash-chained ring, FIFO overflow policy, cursor export, 8 event classes, mandatory-at-Secure, FIPS-KAT crypto submodule | 🟢 Implemented |
+| `sched` | 5 | 4,981 | per-CPU MLFQ (bounded selector), work stealing + load balancing, starvation boost, cpuset isolation, 9-level lockdep | ✅ Validated (one orphan file — §12) |
+| `block` | 4 | 4,252 | Bio/RequestQueue/BlockDevice, virtio-blk (PCI/MMIO), RAII IOMMU lifecycle, bounds-checked BIO | 🟢 Implemented |
+| `audit` | 1 | 3,266 | SHA-256/HMAC hash-chained ring, FIFO overflow policy, cursor export, 8 event classes, mandatory-at-Secure, FIPS-KAT crypto submodule | 🟢 Implemented |
 | `trace` | 5 | 2,933 | tracepoints, 15 per-CPU counters, hung-task watchdog (512 slots), PC-sampling profiler (seqlock), encrypted/redacted kdump | 🟢 Implemented (read-guard fail-open until installed — §12) |
-| `lsm` | 2 | 2,857 | 53 LSM hook points, lock-free AtomicPtr policy registry, PermissivePolicy/DenyAllPolicy/**SecureBaselinePolicy**, denial→audit bridge | 🟢 Implemented (feature-on in shipped build) |
+| `lsm` | 2 | 2,927 | 53 LSM hook points, lock-free AtomicPtr policy registry, PermissivePolicy/DenyAllPolicy/**SecureBaselinePolicy**, denial→audit bridge | 🟢 Implemented (feature-on in shipped build) |
 | `livepatch` | 2 | 2,570 | INT3-detour kpatch, ECDSA-P256 (KAT-gated, fail-closed), dependency topo-sort, batch enable/disable, rollback, W^X seal_exec | 🟡 Partial (inert: trust keys are placeholders) |
-| `seccomp` | 2 | 2,371 | BPF-like filter VM, 5 actions, 18 pledge promises, 512-bit fast-allow, chain caps, boot self-tests | 🟢 Implemented (TSYNC fail-closed rejected; 4 promises inert) |
-| `cap` | 2 | 2,011 | generation+index CapId (48+16 bit), CapRights, CapTable (allocate/lookup/revoke/delegate), fork/exec/dup refcount reconciliation | 🟢 Implemented |
+| `seccomp` | 2 | 2,421 | BPF-like filter VM, 5 actions, 18 pledge promises, 512-bit fast-allow, chain caps, boot self-tests | 🟢 Implemented (TSYNC fail-closed rejected; 4 promises inert) |
+| `cap` | 2 | 2,027 | generation+index CapId (48+16 bit), CapRights, CapTable (allocate/lookup/revoke/delegate), fork/exec/dup refcount reconciliation | 🟢 Implemented |
 | `drivers` | 4 | 1,709 | VGA text, GOP framebuffer console, PS/2 keyboard, raw COM1 serial | 🟢 Implemented (`uart_16550` dep unused — §12) |
-| `virtio` | 3 | 1,073 | shared virtqueue transport, used-ring validation (id bounds/replay/double-free), MMIO+PCI-modern | ✅ Validated |
+| `virtio` | 3 | 1,343 | shared virtqueue transport, used-ring validation (id bounds/replay/double-free), MMIO+PCI-modern | ✅ Validated |
 | `cpu_local` | 1 | 975 | `CpuLocal<T>`, LAPIC-ID↔CPU-index map, per-CPU data, BSP/AP init, online mask | ✅ Validated |
 | `compliance` | 1 | 926 | Secure/Balanced/Performance profiles (boot-locked), FIPS mode (sticky, real KATs), crypto allow-list | 🟢 Implemented |
 | `coverage` | 1 | 322 | KCOV per-task bitmap + `record_edge!` macro | 🟡 Partial (recorder is a no-op — §12) |
@@ -214,7 +219,7 @@ workspace, including in-tree test/mock files), and is distinct from the top-leve
 | `tlb_ops` | 1 | 296 | INVPCID/PCID primitives (all 4 types, fallbacks) | ✅ Validated |
 | `crypto` | 1 | 212 | shared SHA-256 (FIPS 180-4) | ✅ Validated |
 | `sync_safe` | 1 | 165 | IRQ-context-aware mutex (debug fail-loud on lock-in-IRQ) | ✅ Validated |
-| `src` (entry) | 13 | 9,090 | `_start` boot orchestrator, ~30 runtime tests + 25 P0 regressions, native shell, Ring-3 launcher, stack-guard installer | 🟢 Implemented |
+| `src` (entry) | 13 | 13,296 | `_start` boot orchestrator, ~30 runtime tests + 25 P0 regressions, native shell, Ring-3 launcher, stack-guard installer | 🟢 Implemented |
 
 (Plus `kernel/build.rs` 315, `kernel/fuzz/mock_kernel.rs` 346, `kernel/tests/test_coverage.rs` 286.)
 
@@ -451,23 +456,24 @@ current feature frontier.
 findings on an immutable tree (the "zero-HIGH streak 3/3"), plus resolution of all D1 (highest-severity)
 design findings.
 
-**Current status: BLOCKED (2026-07-23).**
+**Current status: BLOCKED (2026-07-29).**
 
 | Gate item | State |
 |---|---|
-| Zero-HIGH streak | **1/3** — reached 3/3 on 2026-07-22 (R181–R183), then reset by R184's real CRITICAL+HIGH; R185 (clean) rebuilt it to 1/3 |
-| Open CRITICAL / HIGH / MEDIUM | 0 / 0 / 0 actionable (R184's 1 CRITICAL + 1 HIGH fixed; 10 of 11 reported HIGH and all 18 MEDIUM were verified false positives) |
-| D1 design findings | **0 open** (D1-RES RESOLVED 2026-07-24: heap oracle + R1-R4 closure; D1-ISO RESOLVED 2026-07-24: type-enforced TX token + Option-B claim narrowing — residual config arc re-filed as D3 NETNS-DATAPLANE-CONFIG, Phase I.3) |
+| Zero-HIGH streak | **0/3** — reached 3/3 on 2026-07-22 (R181–R183), reset by R184's real CRITICAL+HIGH, rebuilt to 1/3 by R185, then **reset to 0/3 by R186** (1 CRITICAL + 7 HIGH filed). The RF186 review-fix pass earns no streak credit |
+| Open CRITICAL / HIGH / MEDIUM | 0 / **1** / 0 actionable — `R186-4`: VMA/MM metadata (`FallibleOrderedMap`/`Vec` ownership) sits outside whole-heap aggregate admission, so PROT_NONE and fork pressure bypass the ledger |
+| D1 design findings | **1 open** — `D1-RES-HEAP-ADMISSION-REOPENED` (the design parent of `R186-4`: whole-heap closure excludes live consumers). D1-ISO remains RESOLVED 2026-07-24 (type-enforced TX token + Option-B claim narrowing; residual config arc re-filed as D3 NETNS-DATAPLANE-CONFIG, Phase I.3) |
 | Proof-obligation ledger | 8 of 12 PO artifacts complete |
+| Gate-relevant test debt | Host `#[cfg(test)]` unit tests are ungated and mostly non-executing (§1); the in-kernel boot suite is the real coverage vehicle |
 
 **What "unblocked" will and won't mean:** clearing the gate qualifies the tree for a **1.0-Preview**
 (feature-and-hardening milestone) — it is **not** a general-availability, production-certified, or
 ABI-stable release. Phase U (dynamic linking, glibc, OCI) remains ahead, KPTI is still inert, and
 real-hardware/bare-metal validation is outstanding.
 
-> **README reconciliation:** `README.md` §6 currently states the gate is "UNBLOCKED (streak 3/3)". That
-> reflected the 2026-07-22 state and is stale as of R184 (2026-07-23). This roadmap is authoritative;
-> the README should be updated to "BLOCKED — streak 1/3, rebuilding" on its next edit.
+> **README reconciliation:** resolved. `README.md` §6 and `README_zh.md` §6 were reconciled to this
+> state on 2026-07-29 and now report "BLOCKED — one HIGH (`R186-4`) remains; zero-HIGH streak 0/3",
+> matching this table. No outstanding divergence.
 
 ---
 

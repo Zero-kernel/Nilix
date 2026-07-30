@@ -41,9 +41,21 @@ personality.
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
 in progress. The 1.0-Preview release gate is currently **BLOCKED** on one HIGH finding
 (`R186-4`, VMA/MM aggregate admission) and its design parent. The zero-HIGH streak is **0/3**;
-all other R186 actionable findings are fixed. See [Section 6](#6-security-audit-status).
+all other R186 actionable findings are fixed and have since been review-fixed.
+See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-07-29:** R186 review-fix pass — the landed R186 fixes were re-reviewed against their own
+  lock contexts, caller sets, and rollback paths; **10 review-fix defects (`RF186-1`…`RF186-12`)
+  were filed and repaired**. The two outright failures: R186-1's fix had *relocated* the
+  open/openat PCB recursion rather than removing it, and R186-10's COW retry budget had made
+  ordinary cross-CPU page-table contention user-fatal (now resolved by PT-lock owner identity, so
+  only true same-CPU re-entry is fatal). The pass also gives device MMIO a typed BAR-aperture
+  authority with an all-or-nothing mapping transaction and staged MSE/BME activation, holds one
+  credential identity across the whole mediate → mint → publish → audit span, makes `readdir`
+  allocation-free in `cgroupfs`, binds ext2 dirent types to the authoritative inode mode, and
+  encapsulates `CapTable` behind a `#[must_use]` two-phase mediated mint. All CI gates green;
+  the boot suite measures **31 passed / 39 deferred / 0 failed**.
 - **2026-07-28:** R186 remediation — 16 of 17 actionable findings are fully fixed and one
   remains open. The landed set removes the open/openat publication
   deadlock, makes netns and VFS allocation paths fallible, validates VirtIO PCI capability
@@ -461,10 +473,11 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **186** (R186 completed 2026-07-28) |
+| Audit rounds | **186** (R186 completed 2026-07-28; review-fix pass 2026-07-29) |
 | Cumulative findings | ~1,333 (historical IDs include merged/refuted findings) |
 | Findings fixed/resolved | ~1,177 |
 | Latest round | R186 — 16 fixed, 1 actionable open, 1 INFO |
+| Latest review-fix pass | RF186 — 10 defects filed and repaired in the R186 fixes |
 | Current actionable debt | **1 HIGH** (`R186-4`) |
 | 1.0-Preview release gate | **BLOCKED** — one HIGH remains; zero-HIGH streak 0/3 |
 
@@ -474,6 +487,17 @@ object and checked by both open ladders; `R186-4` remains the sole HIGH blocker.
 therefore reset the zero-HIGH streak to 0/3 and reopened the aggregate heap-admission design
 parent. See the [R186 report](docs/review/audits/qa-2026-07-28.md) for the exact status and the
 [current plan](docs/review/nextplan/next-phase-plan-2026-07-23-v2.md) for the remaining work.
+
+The **RF186 review-fix pass (2026-07-29)** then reviewed those fixes rather than the original
+findings, and found that ten of them closed only the reported instance and not the class — two
+outright (`RF186-1`, `RF186-6`), eight partially. All ten are repaired; `R186-4` is untouched by
+the pass, so the streak stays 0/3 (a review-fix pass earns no streak credit). The pass was run in
+**MODE S** — the Codex MCP peer was unreachable, so convergence rests on orchestrator `file:line`
+re-reads rather than an independent session, and `RF186-4`/`RF186-7` are flagged for re-derivation
+by the next audit round. It also records **test debt**: the new `#[cfg(test)]` assertions in
+`seccomp`/`net`/`block`/`kernel_core` do not execute anywhere, because no target runs `cargo test`
+and those crates' host test binaries abort on the uninitialized kernel heap (pre-existing, A/B
+verified). See the [RF186 report](docs/review/reviewfix/reviewfix-2026-07-29.md).
 
 ---
 
