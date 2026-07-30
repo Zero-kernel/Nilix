@@ -1649,8 +1649,7 @@ const _: [(); AuditExportRecord::SIZE] = [(); core::mem::size_of::<AuditExportRe
 ///
 /// ```rust,ignore
 /// fn check_audit_read_cap() -> Result<(), AuditError> {
-///     let current = get_current_process();
-///     if current.cap_table.has_rights(CapRights::AUDIT_READ) {
+///     if kernel_core::current_has_cap_rights(CapRights::AUDIT_READ) {
 ///         Ok(())
 ///     } else {
 ///         Err(AuditError::AccessDenied)
@@ -2642,8 +2641,35 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
     Ok(snapshot)
 }
 
-/// Get audit statistics without draining events
+/// Get audit statistics without draining events.
+///
+/// Statistics include live occupancy, cumulative loss, and the hash-chain tail,
+/// so they are protected by the same `CAP_AUDIT_READ` boundary as snapshot and
+/// export. Kernel accounting that only needs the fixed allocation footprint must
+/// use [`ring_capacity_bytes`] instead of widening this interface.
 pub fn stats() -> Result<AuditStats, AuditError> {
+    if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
+        return Err(AuditError::Uninitialized);
+    }
+
+    ensure_snapshot_authorized()?;
+
+    interrupts::without_interrupts(|| {
+        let ring = AUDIT_RING.lock();
+        if let Some(ref r) = *ring {
+            Ok(r.stats())
+        } else {
+            Err(AuditError::Uninitialized)
+        }
+    })
+}
+
+/// Return the fixed heap footprint reserved for audit-ring event slots.
+///
+/// This intentionally exposes no live occupancy, loss counter, event identity,
+/// or hash-chain state. It exists solely for kernel boot/coexistence accounting,
+/// whose caller may run without a userspace credential context.
+pub fn ring_capacity_bytes() -> Result<usize, AuditError> {
     if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
         return Err(AuditError::Uninitialized);
     }
@@ -2651,7 +2677,7 @@ pub fn stats() -> Result<AuditStats, AuditError> {
     interrupts::without_interrupts(|| {
         let ring = AUDIT_RING.lock();
         if let Some(ref r) = *ring {
-            Ok(r.stats())
+            Ok(r.buf.len() * core::mem::size_of::<Option<AuditEvent>>())
         } else {
             Err(AuditError::Uninitialized)
         }
@@ -2995,6 +3021,26 @@ mod tests {
     }
 
     #[test]
+    fn rf186_14_cumulative_loss_survives_snapshot_delta_reset() {
+        let mut ring = AuditRing::with_capacity(2).expect("private ring allocation");
+        ring.push(private_test_event(1));
+        ring.push(private_test_event(2));
+        ring.push(private_test_event(3));
+
+        assert_eq!(ring.stats().dropped_events, 1);
+        let mut events = Vec::new();
+        reserve_capture_storage(&mut events, ring.len).expect("snapshot reservation");
+        let metadata = ring.drain_into(&mut events).expect("reserved drain");
+        assert_eq!(metadata.dropped, 1);
+        assert_eq!(ring.stats().dropped_events, 1);
+
+        let mut empty = Vec::new();
+        let next = ring.drain_into(&mut empty).expect("empty drain");
+        assert_eq!(next.dropped, 0, "snapshot delta resets exactly once");
+        assert_eq!(ring.stats().dropped_events, 1, "lifetime loss is monotonic");
+    }
+
+    #[test]
     fn test_sha256_known_vector() {
         // NIST test vector: SHA-256("abc") = ba7816bf...
         let digest = Sha256::digest(b"abc");
@@ -3031,9 +3077,9 @@ mod tests {
         // Pre-computed: SHA-256 of 128 'a's
         // echo -n "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" | sha256sum
         let expected = [
-            0x76, 0xb7, 0xd0, 0x74, 0xc5, 0x46, 0x4f, 0x46, 0x85, 0xa5, 0x4b, 0x5b, 0xdd, 0x69,
-            0x60, 0xde, 0x46, 0x83, 0x45, 0x41, 0x72, 0x6d, 0x1c, 0x35, 0xbd, 0x02, 0xdb, 0x2a,
-            0x6c, 0x4d, 0xa7, 0xa2,
+            0x68, 0x36, 0xcf, 0x13, 0xba, 0xc4, 0x00, 0xe9, 0x10, 0x50, 0x71, 0xcd, 0x6a, 0xf4,
+            0x70, 0x84, 0xdf, 0xac, 0xad, 0x4e, 0x5e, 0x30, 0x2c, 0x94, 0xbf, 0xed, 0x24, 0xe0,
+            0x13, 0xaf, 0xb7, 0x3e,
         ];
         assert_eq!(digest, expected);
     }
@@ -3149,9 +3195,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hmac_sha256_rfc4231_vector() {
-        // RFC 4231 Test Case 2:
-        // Key = "key" (4 bytes)
+    fn test_hmac_sha256_known_vector() {
+        // Widely used HMAC-SHA256 known-answer vector:
+        // Key = "key" (3 bytes)
         // Data = "The quick brown fox jumps over the lazy dog"
         // Expected HMAC = f7bc83f430538424b132...
         let digest = hmac_sha256(b"key", |w| {
@@ -3160,12 +3206,12 @@ mod tests {
 
         let expected = [
             0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24, 0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f,
-            0xb1, 0x43, 0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x10, 0xbd, 0x0a, 0x1e, 0x82, 0x64,
-            0x72, 0xa3, 0xd3, 0xaa,
+            0xb1, 0x43, 0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59, 0x97, 0x47, 0x9d, 0xbc,
+            0x2d, 0x1a, 0x3c, 0xd8,
         ];
         assert_eq!(
             digest, expected,
-            "HMAC-SHA256 must match RFC 4231 test vector"
+            "HMAC-SHA256 must match the known-answer vector"
         );
     }
 

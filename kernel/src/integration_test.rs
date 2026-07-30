@@ -541,9 +541,7 @@ pub fn test_heap_budget_arbiter() {
     let measure = || -> (usize, usize) {
         let allocator_used = mm::NORMAL_HEAP_SIZE_BYTES - mm::heap_free_bytes();
         let pagecache_meta_live = (mm::PAGE_CACHE.stats().nr_pages as usize) * 256;
-        let audit_ring_live = audit::stats().map_or(0, |s| {
-            s.capacity as usize * core::mem::size_of::<Option<audit::AuditEvent>>()
-        });
+        let audit_ring_live = audit::ring_capacity_bytes().unwrap_or(0);
         (allocator_used, pagecache_meta_live + audit_ring_live)
     };
 
