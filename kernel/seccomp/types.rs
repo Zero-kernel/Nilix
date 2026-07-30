@@ -661,7 +661,12 @@ fn interpret_program(
                 pc += 1;
             }
             SeccompInsn::Shr(shift) => {
-                acc >>= shift;
+                let Some(shifted) = acc.checked_shr(shift as u32) else {
+                    // RF186-11 defense in depth: trusted construction bugs must
+                    // fail closed even if validation was accidentally bypassed.
+                    return SeccompAction::Trap;
+                };
+                acc = shifted;
                 pc += 1;
             }
             // R32-SECCOMP-2 FIX: All jump instructions must validate pc bounds
@@ -1077,6 +1082,9 @@ fn validate_program_with_limit(prog: &[SeccompInsn], max_insns: usize) -> Result
         match insn {
             SeccompInsn::LdArg(idx) if *idx >= 6 => {
                 return Err(SeccompError::InvalidArgIndex);
+            }
+            SeccompInsn::Shr(shift) if *shift >= 64 => {
+                return Err(SeccompError::InvalidInstruction);
             }
             SeccompInsn::JmpEq(_, t, f)
             | SeccompInsn::JmpNe(_, t, f)
@@ -1549,4 +1557,46 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 /// at args=0; the headline parity check is over the arg-insensitive BPF union.
 pub fn promise_allows_syscall_probe(promises: PledgePromises, syscall_nr: u64) -> bool {
     promise_allows_syscall(promises, syscall_nr, &[0u64; 6])
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn rf186_11_shift_range_is_central_and_interpreter_is_fail_closed() {
+        let invalid = vec![
+            SeccompInsn::LdConst(u64::MAX),
+            SeccompInsn::Shr(64),
+            SeccompInsn::Ret(SeccompAction::Allow),
+        ];
+        assert_eq!(
+            validate_program_with_limit(&invalid, MAX_INSNS),
+            Err(SeccompError::InvalidInstruction)
+        );
+        assert_eq!(
+            validate_program_with_limit(&invalid, MAX_TRUSTED_INSNS),
+            Err(SeccompError::InvalidInstruction)
+        );
+        assert_eq!(
+            interpret_program(&invalid, SeccompAction::Kill, 0, &[0; 6]),
+            SeccompAction::Trap,
+            "a trusted-construction bug must trap rather than panic or mask"
+        );
+
+        let valid = vec![
+            SeccompInsn::LdConst(u64::MAX),
+            SeccompInsn::Shr(63),
+            SeccompInsn::JmpEq(1, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Allow),
+            SeccompInsn::Ret(SeccompAction::Kill),
+        ];
+        assert!(validate_program(&valid).is_ok());
+        assert_eq!(
+            interpret_program(&valid, SeccompAction::Kill, 0, &[0; 6]),
+            SeccompAction::Allow
+        );
+    }
 }
