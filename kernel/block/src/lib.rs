@@ -938,12 +938,25 @@ pub fn list_devices() -> Result<Vec<String>, BlockError> {
 /// never returned to the allocator. `commit` is the only way to disarm it.
 pub struct ProbedBlockDevice {
     pending: Option<(Arc<dyn BlockDevice>, &'static str)>,
+    mmio_mapping: Option<BlockPciMmioMapping>,
 }
 
 impl ProbedBlockDevice {
     fn new(device: Arc<dyn BlockDevice>, name: &'static str) -> Self {
         Self {
             pending: Some((device, name)),
+            mmio_mapping: None,
+        }
+    }
+
+    fn new_pci(
+        device: Arc<dyn BlockDevice>,
+        name: &'static str,
+        mmio_mapping: BlockPciMmioMapping,
+    ) -> Self {
+        Self {
+            pending: Some((device, name)),
+            mmio_mapping: Some(mmio_mapping),
         }
     }
 
@@ -966,6 +979,9 @@ impl ProbedBlockDevice {
 
     /// Finish publication after every registry has committed successfully.
     pub fn commit(mut self) -> (Arc<dyn BlockDevice>, &'static str) {
+        if let Some(mapping) = self.mmio_mapping.take() {
+            mapping.commit();
+        }
         self.pending
             .take()
             .expect("probed block device committed twice")
@@ -988,6 +1004,12 @@ impl Drop for ProbedBlockDevice {
             #[cfg(test)]
             let _ = (name, error);
             core::mem::forget(device);
+            if let Some(mapping) = self.mmio_mapping.take() {
+                // Quarantine the VA reservation/mapping with the device whose
+                // quiescence could not be proven. Reusing it would let a later
+                // device inherit an alias still associated with failed hardware.
+                mapping.quarantine();
+            }
         }
     }
 }
@@ -1007,8 +1029,6 @@ pub fn init() {
 // High Address MMIO Mapping
 // ============================================================================
 
-use core::sync::atomic::AtomicU64 as MmioAtomicU64;
-
 /// Base virtual address for mapping MMIO regions above 4GB.
 /// This is in the kernel's higher-half address space, separate from the kernel image.
 const HIGH_MMIO_VIRT_BASE: u64 = 0xffff_ffff_4000_0000;
@@ -1016,75 +1036,193 @@ const HIGH_MMIO_VIRT_BASE: u64 = 0xffff_ffff_4000_0000;
 /// Maximum size of the high MMIO virtual address region (256 MB).
 const HIGH_MMIO_VIRT_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Current offset within the high MMIO virtual address region.
-static HIGH_MMIO_OFFSET: MmioAtomicU64 = MmioAtomicU64::new(0);
+/// Serialized VA allocator. Its guard remains held until the probed block
+/// device either commits publication or rolls back, making the bump rewindable.
+static HIGH_MMIO_OFFSET: Mutex<u64> = Mutex::new(0);
 
-/// Physical address threshold - addresses at or above this need mapping.
-const PHYS_4GB: u64 = 0x1_0000_0000;
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockMmioWindow {
+    phys: u64,
+    len: usize,
+}
 
-/// Map a physical MMIO region and return the virtual offset to use.
-///
-/// For physical addresses below 4GB, the bootloader's identity mapping is used
-/// (virt_offset = 0, meaning virt == phys).
-///
-/// For physical addresses at or above 4GB, this function allocates a virtual
-/// address in the HIGH_MMIO_VIRT region and creates the mapping.
-///
-/// # Arguments
-/// * `phys_base` - Physical base address of the MMIO region
-/// * `size` - Size of the MMIO region in bytes
-///
-/// # Returns
-/// * `Ok(virt_offset)` - Offset to add to physical address to get virtual address
-/// * `Err(BlockError)` - Mapping failed
-///
-/// # Safety
-/// The caller must ensure the physical address is a valid MMIO region.
-unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> {
-    // If below 4GB, use identity mapping
-    if phys_base < PHYS_4GB && phys_base.saturating_add(size as u64) <= PHYS_4GB {
-        return Ok(0);
+struct BlockPciMmioMapping {
+    allocator: Option<spin::MutexGuard<'static, u64>>,
+    reservation_start: u64,
+    phys_anchor: u64,
+    virt_anchor: u64,
+    windows: [BlockMmioWindow; 4],
+    window_count: usize,
+    virt_offset: u64,
+    committed: bool,
+}
+
+impl BlockPciMmioMapping {
+    fn commit(mut self) {
+        self.committed = true;
+        drop(self.allocator.take());
     }
 
-    // Allocate virtual address space (page-aligned)
-    let aligned_size = (size + 0xFFF) & !0xFFF;
-    let offset = HIGH_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
-
-    if offset + aligned_size as u64 > HIGH_MMIO_VIRT_SIZE {
-        klog!(Error, "      [ERROR] High MMIO virtual space exhausted");
-        return Err(BlockError::NoMem);
+    /// Preserve the VA reservation and live mappings for hardware whose DMA
+    /// quiescence is ambiguous, but release the allocator serialization guard.
+    /// Forgetting `self` would also forget that guard and permanently deadlock
+    /// every later block-device probe.
+    fn quarantine(mut self) {
+        self.committed = true;
+        drop(self.allocator.take());
     }
+}
 
-    let virt_addr = HIGH_MMIO_VIRT_BASE + offset;
-    let virt_offset = virt_addr as i64 - phys_base as i64;
-
-    klog!(
-        Info,
-        "      [MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
-        phys_base,
-        virt_addr,
-        aligned_size
-    );
-
-    // Create the mapping using the mm crate's map_mmio function
-    use x86_64::{PhysAddr, VirtAddr};
-    let mut frame_alloc = mm::FrameAllocator::new();
-
-    match mm::map_mmio(
-        VirtAddr::new(virt_addr),
-        PhysAddr::new(phys_base),
-        aligned_size,
-        &mut frame_alloc,
-    ) {
-        Ok(()) => {
-            klog!(Info, "      [MMIO] Mapping successful");
-            Ok(virt_offset)
+impl Drop for BlockPciMmioMapping {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
         }
-        Err(e) => {
-            klog!(Error, "      [ERROR] MMIO mapping failed: {:?}", e);
-            Err(BlockError::NoMem)
+        let mut frame_allocator = mm::FrameAllocator::new();
+        for window in self.windows[..self.window_count].iter().rev() {
+            let virt = self
+                .virt_anchor
+                .checked_add(window.phys - self.phys_anchor)
+                .expect("validated virtio-blk MMIO reservation overflowed");
+            unsafe {
+                mm::unmap_mmio(
+                    x86_64::VirtAddr::new(virt),
+                    window.len,
+                    &mut frame_allocator,
+                )
+                .unwrap_or_else(|_| panic!("RF186-4: virtio-blk MMIO rollback failed"));
+            }
+        }
+        if let Some(offset) = self.allocator.as_mut() {
+            **offset = self.reservation_start;
         }
     }
+}
+
+fn block_mmio_windows(
+    addrs: &virtio::VirtioPciAddrs,
+) -> Result<([BlockMmioWindow; 4], usize), BlockError> {
+    let declared = [addrs.common_cfg, addrs.notify, addrs.isr, addrs.device_cfg];
+    let mut pages = [BlockMmioWindow::default(); 4];
+    let mut count = 0usize;
+    for authority in declared {
+        if !authority.is_present() {
+            continue;
+        }
+        let (page_start, page_len) = authority.page_cover().ok_or(BlockError::Invalid)?;
+        mm::checked_physical_range(page_start, page_len).ok_or(BlockError::Invalid)?;
+        let page_len = usize::try_from(page_len)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(BlockError::Invalid)?;
+        pages[count] = BlockMmioWindow {
+            phys: page_start,
+            len: page_len,
+        };
+        count += 1;
+    }
+    if count == 0 {
+        return Err(BlockError::Invalid);
+    }
+    for left in 0..count {
+        for right in (left + 1)..count {
+            if pages[right].phys < pages[left].phys {
+                pages.swap(left, right);
+            }
+        }
+    }
+    let mut merged = [BlockMmioWindow::default(); 4];
+    let mut merged_count = 0usize;
+    for window in pages[..count].iter().copied() {
+        if merged_count != 0 {
+            let previous = &mut merged[merged_count - 1];
+            let previous_end = previous
+                .phys
+                .checked_add(previous.len as u64)
+                .ok_or(BlockError::Invalid)?;
+            if window.phys <= previous_end {
+                let window_end = window
+                    .phys
+                    .checked_add(window.len as u64)
+                    .ok_or(BlockError::Invalid)?;
+                previous.len = usize::try_from(previous_end.max(window_end) - previous.phys)
+                    .map_err(|_| BlockError::Invalid)?;
+                continue;
+            }
+        }
+        merged[merged_count] = window;
+        merged_count += 1;
+    }
+    Ok((merged, merged_count))
+}
+
+/// Map only validated capability pages while reserving a uniform virtual span.
+/// Physical holes between windows remain unmapped, and Drop unwinds both page
+/// tables and the serialized VA reservation until publication commits.
+unsafe fn map_block_pci_mmio(
+    addrs: &virtio::VirtioPciAddrs,
+) -> Result<BlockPciMmioMapping, BlockError> {
+    let (windows, window_count) = block_mmio_windows(addrs)?;
+    let phys_anchor = windows[0].phys;
+    let last = windows[window_count - 1];
+    let span_end = last
+        .phys
+        .checked_add(last.len as u64)
+        .ok_or(BlockError::Invalid)?;
+    let span = span_end
+        .checked_sub(phys_anchor)
+        .ok_or(BlockError::Invalid)?;
+    let allocator = HIGH_MMIO_OFFSET.lock();
+    let reservation_start = *allocator;
+    let reservation_end = reservation_start
+        .checked_add(span)
+        .filter(|end| *end <= HIGH_MMIO_VIRT_SIZE)
+        .ok_or(BlockError::NoMem)?;
+    let virt_anchor = HIGH_MMIO_VIRT_BASE
+        .checked_add(reservation_start)
+        .ok_or(BlockError::NoMem)?;
+    HIGH_MMIO_VIRT_BASE
+        .checked_add(reservation_end)
+        .ok_or(BlockError::NoMem)?;
+    let virt_offset = virt_anchor
+        .checked_sub(phys_anchor)
+        .ok_or(BlockError::Invalid)?;
+    let mut transaction = BlockPciMmioMapping {
+        allocator: Some(allocator),
+        reservation_start,
+        phys_anchor,
+        virt_anchor,
+        windows,
+        window_count: 0,
+        virt_offset,
+        committed: false,
+    };
+    let mut frame_allocator = mm::FrameAllocator::new();
+    for window in windows[..window_count].iter().copied() {
+        let virt = virt_anchor
+            .checked_add(window.phys - phys_anchor)
+            .ok_or(BlockError::NoMem)?;
+        let phys = x86_64::PhysAddr::try_new(window.phys).map_err(|_| BlockError::Invalid)?;
+        let last_phys = window
+            .phys
+            .checked_add(window.len.saturating_sub(1) as u64)
+            .ok_or(BlockError::Invalid)?;
+        x86_64::PhysAddr::try_new(last_phys).map_err(|_| BlockError::Invalid)?;
+        mm::map_mmio(
+            x86_64::VirtAddr::new(virt),
+            phys,
+            window.len,
+            &mut frame_allocator,
+        )
+        .map_err(|_| BlockError::NoMem)?;
+        transaction.windows[transaction.window_count] = window;
+        transaction.window_count += 1;
+    }
+    **transaction
+        .allocator
+        .as_mut()
+        .expect("MMIO allocator guard") = reservation_end;
+    Ok(transaction)
 }
 
 /// Probe for block devices and register them with VFS.
@@ -1147,54 +1285,21 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
 
     // Then, try PCI transport (virtio-pci modern)
     if let Some((pci_id, pci_addrs, name)) = pci::probe_virtio_blk(iommu_required) {
-        // Calculate the range of physical addresses that need to be mapped
-        let phys_addrs = [
-            pci_addrs.common_cfg,
-            pci_addrs.notify_base,
-            pci_addrs.isr,
-            pci_addrs.device_cfg,
-        ];
-
-        // Find the minimum non-zero physical address
-        let min_phys = phys_addrs
-            .iter()
-            .filter(|&&a| a != 0)
-            .copied()
-            .min()
-            .unwrap_or(0);
-
-        // Find the maximum address (assume each region is at most 4KB)
-        let max_phys = phys_addrs
-            .iter()
-            .filter(|&&a| a != 0)
-            .copied()
-            .max()
-            .unwrap_or(0)
-            + 0x1000; // Add 4KB for the last region
-
-        let mmio_size = (max_phys - min_phys) as usize;
-
-        // Map high MMIO if needed
-        let virt_offset = match unsafe { map_high_mmio(min_phys, mmio_size) } {
-            Ok(offset) => {
-                // Convert i64 offset to u64 using wrapping arithmetic
-                // This works because Rust's as conversion uses wrapping
-                offset as u64
-            }
+        let mapping = match unsafe { map_block_pci_mmio(&pci_addrs) } {
+            Ok(mapping) => mapping,
             Err(e) => {
-                // R82-3 FIX: Disable bus mastering on MMIO mapping failure
-                // R180-17: verify the command-register clear under the shared
-                // PCI-config lock; continuing with BME set is not fail-closed.
-                if !pci::disable_bus_master(pci_id) {
-                    panic!("R180-17: cannot fail closed after virtio-blk MMIO mapping failure");
+                if !pci::disable_memory_and_bus_master(pci_id) {
+                    panic!("RF186-4: cannot fail closed after virtio-blk MMIO mapping failure");
                 }
-                klog!(Error,
-                    "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
-                    min_phys, max_phys, e
+                klog!(
+                    Error,
+                    "    Failed to map validated virtio-blk MMIO windows: {:?} (MSE/BME disabled)",
+                    e
                 );
                 return None;
             }
         };
+        let virt_offset = mapping.virt_offset;
 
         match unsafe { virtio::VirtioBlkDevice::probe_pci(pci_id, pci_addrs, virt_offset, name) } {
             Ok(device) => {
@@ -1211,14 +1316,11 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
                     capacity,
                     sector_size
                 );
-                return Some(ProbedBlockDevice::new(device, name));
+                return Some(ProbedBlockDevice::new_pci(device, name, mapping));
             }
             Err(e) => {
-                // R82-3 FIX: Disable bus mastering on driver probe failure
-                // R180-17: verify the command-register clear under the shared
-                // PCI-config lock; continuing with BME set is not fail-closed.
-                if !pci::disable_bus_master(pci_id) {
-                    panic!("R180-17: cannot fail closed after virtio-blk probe failure");
+                if !pci::disable_memory_and_bus_master(pci_id) {
+                    panic!("RF186-4: cannot fail closed after virtio-blk probe failure");
                 }
                 klog!(Warn,
                     "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",
@@ -1226,7 +1328,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
                     pci_id.bus,
                     pci_id.device,
                     pci_id.function,
-                    pci_addrs.common_cfg,
+                    pci_addrs.common_cfg.phys(),
                     e
                 );
             }
@@ -1246,6 +1348,27 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn block_mmio_preflight_rejects_page_above_architectural_width() {
+        let above_width = 1u64 << 52;
+        let window = virtio::VirtioPciBarWindow::try_new(
+            above_width,
+            0x1000,
+            0,
+            8,
+            virtio::VirtioPciWindowAccess::Device,
+        )
+        .expect("synthetic window is internally BAR-contained");
+        let addrs = virtio::VirtioPciAddrs {
+            device_cfg: window,
+            ..virtio::VirtioPciAddrs::default()
+        };
+        assert!(matches!(
+            block_mmio_windows(&addrs),
+            Err(BlockError::Invalid)
+        ));
+    }
 
     /// Host stack alignment is otherwise ABI-dependent. The second 512-byte
     /// half is always sector-aligned and never 1024-byte aligned, which makes

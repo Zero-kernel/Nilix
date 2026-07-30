@@ -12,11 +12,11 @@ pub use blk::VirtioBlkDevice;
 
 // Re-export shared VirtIO primitives from the virtio crate
 pub use virtio::{
-    mb, mmio, rmb, wmb, MmioTransport, VirtioPciAddrs, VirtioPciTransport, VirtioTransport,
-    VringAvail, VringDesc, VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1,
-    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
-    VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT,
-    VRING_DESC_F_WRITE,
+    mb, mmio, rmb, wmb, MmioTransport, VirtioPciAddrs, VirtioPciBarWindow, VirtioPciTransport,
+    VirtioPciWindowAccess, VirtioTransport, VringAvail, VringDesc, VringUsed, VringUsedElem,
+    VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
 
 // ============================================================================

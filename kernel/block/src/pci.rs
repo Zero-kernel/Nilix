@@ -7,7 +7,7 @@
 
 use core::arch::asm;
 
-use crate::virtio::VirtioPciAddrs;
+use crate::virtio::{VirtioPciAddrs, VirtioPciBarWindow};
 use iommu::{attach_device, PciDeviceId};
 
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
@@ -108,35 +108,6 @@ fn pci_config_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
 }
 
 /// R180-17 FIX: clear and verify PCI bus-master enable on refusal paths.
-///
-/// Firmware/warm-boot may leave BME set. Skipping a device without clearing
-/// BME leaves it capable of untranslated DMA when IOMMU attach failed. The
-/// caller must hold [`iommu::PCI_CONFIG_LOCK`] across this operation so the
-/// command-register RMW and readback are one atomic PCI-config transaction.
-#[must_use = "failure to clear PCI bus mastering must be handled fail-closed"]
-fn clear_bus_master(bus: u8, dev: u8, func: u8) -> bool {
-    let cmd = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-    pci_config_write16(
-        bus,
-        dev,
-        func,
-        PCI_COMMAND_OFFSET,
-        cmd & !PCI_COMMAND_BUS_MASTER,
-    );
-    let verify = (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
-    let cleared = verify & PCI_COMMAND_BUS_MASTER == 0;
-    if !cleared {
-        klog!(
-            Warn,
-            "    ! BME still set after clear for {:02x}:{:02x}.{}",
-            bus,
-            dev,
-            func
-        );
-    }
-    cleared
-}
-
 /// R186-6: disable both address decode and DMA before a BAR sizing probe.
 ///
 /// Firmware may leave Memory Space Enable set across a warm boot. BAR sizing
@@ -168,6 +139,12 @@ fn clear_memory_and_bus_master(bus: u8, dev: u8, func: u8) -> bool {
 /// driver failure/recovery paths that are outside the initial PCI scan.
 #[must_use = "failure to clear PCI bus mastering must be handled fail-closed"]
 pub fn disable_bus_master(pci_id: PciDeviceId) -> bool {
+    disable_memory_and_bus_master(pci_id)
+}
+
+/// Disable and verify both MMIO decode and DMA for a discovered device.
+#[must_use = "failure to clear PCI MSE/BME must be handled fail-closed"]
+pub fn disable_memory_and_bus_master(pci_id: PciDeviceId) -> bool {
     // Legacy CF8/CFC configuration access can address only segment zero. Do
     // not report success after accidentally touching the same BDF elsewhere.
     if pci_id.segment != 0 {
@@ -179,7 +156,7 @@ pub fn disable_bus_master(pci_id: PciDeviceId) -> bool {
         return false;
     }
     let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
-    clear_bus_master(pci_id.bus, pci_id.device, pci_id.function)
+    clear_memory_and_bus_master(pci_id.bus, pci_id.device, pci_id.function)
 }
 
 /// Read a BAR (Base Address Register) and return the physical address.
@@ -262,7 +239,7 @@ fn size_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<ValidatedBar> {
         return None;
     }
 
-    let (size_low, size_high) = probe_bar(bus, dev, func, off, low, is_64bit.then_some(high));
+    let (size_low, size_high) = probe_bar(bus, dev, func, off, low, is_64bit.then_some(high))?;
 
     let mask = ((size_low & !0xFu32) as u64) | ((size_high as u64) << 32);
     if mask == 0 {
@@ -272,7 +249,7 @@ fn size_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<ValidatedBar> {
     if len == 0 || !len.is_power_of_two() || base % len != 0 {
         return None;
     }
-    base.checked_add(len)?;
+    mm::checked_physical_range(base, len)?;
 
     Some(ValidatedBar { base, len })
 }
@@ -290,7 +267,7 @@ fn probe_bar(
     offset: u8,
     original_low: u32,
     original_high: Option<u32>,
-) -> (u32, u32) {
+) -> Option<(u32, u32)> {
     let low_address = 0x8000_0000u32
         | ((bus as u32) << 16)
         | ((dev as u32) << 11)
@@ -323,7 +300,19 @@ fn probe_bar(
         }
         outl(PCI_CONFIG_ADDRESS, low_address);
         outl(PCI_CONFIG_DATA, original_low);
-        (readback_low, readback_high)
+        outl(PCI_CONFIG_ADDRESS, low_address);
+        let restored_low = inl(PCI_CONFIG_DATA);
+        if let Some(high) = original_high {
+            outl(PCI_CONFIG_ADDRESS, high_address);
+            let restored = inl(PCI_CONFIG_DATA);
+            if restored != high {
+                return None;
+            }
+        }
+        if restored_low != original_low {
+            return None;
+        }
+        Some((readback_low, readback_high))
     }
 }
 
@@ -406,18 +395,27 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
             if required_len != 0 && (cap_window_len as u64) >= required_len {
                 let resource = bar_cache.get(usize::from(bar)).copied().flatten();
 
-                if let Some(phys) =
-                    resource.and_then(|res| res.phys_for(offset as u64, cap_window_len as u64))
-                {
+                let access = match cfg_type {
+                    VIRTIO_PCI_CAP_COMMON_CFG => virtio::VirtioPciWindowAccess::Common,
+                    VIRTIO_PCI_CAP_NOTIFY_CFG => virtio::VirtioPciWindowAccess::Notify,
+                    VIRTIO_PCI_CAP_ISR_CFG => virtio::VirtioPciWindowAccess::Isr,
+                    _ => virtio::VirtioPciWindowAccess::Device,
+                };
+                if let Some(window) = resource.and_then(|res| {
+                    VirtioPciBarWindow::try_new(
+                        res.base,
+                        res.len,
+                        offset as u64,
+                        cap_window_len,
+                        access,
+                    )
+                }) {
                     match cfg_type {
                         VIRTIO_PCI_CAP_COMMON_CFG => {
-                            caps.common_cfg = phys;
-                            caps.common_cfg_len = cap_window_len;
+                            caps.common_cfg = window;
                         }
                         VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                            caps.notify_base = phys;
-                            // R34-VIRTIO-1 FIX: notify length for bounds checking.
-                            caps.notify_len = cap_window_len;
+                            caps.notify = window;
                             // Notify capability has extra field at offset 16
                             // R169-L8 FIX: ptr+16 must not wrap the u8 add; only read
                             // it when ptr <= 0xEF (0xEF+16 == 0xFF). A cap claiming
@@ -429,12 +427,10 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
                             }
                         }
                         VIRTIO_PCI_CAP_ISR_CFG => {
-                            caps.isr = phys;
-                            caps.isr_len = cap_window_len;
+                            caps.isr = window;
                         }
                         VIRTIO_PCI_CAP_DEVICE_CFG => {
-                            caps.device_cfg = phys;
-                            caps.device_cfg_len = cap_window_len;
+                            caps.device_cfg = window;
                         }
                         _ => {}
                     }
@@ -449,7 +445,7 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
     }
 
     // Validate that we have the required capabilities
-    if caps.common_cfg != 0 && caps.notify_base != 0 && caps.device_cfg != 0 {
+    if caps.common_cfg.is_present() && caps.notify.is_present() && caps.device_cfg.is_present() {
         Some(caps)
     } else {
         None
@@ -563,6 +559,18 @@ pub fn probe_virtio_blk(
                         (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
                     cmd |= PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
                     pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd);
+                    let enabled =
+                        (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+                    let required = PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+                    if enabled & required != required {
+                        if !clear_memory_and_bus_master(bus, dev, func) {
+                            panic!(
+                                "RF186-4: cannot restore fail-closed PCI command for {:02x}:{:02x}.{}",
+                                bus, dev, func
+                            );
+                        }
+                        continue;
+                    }
 
                     // Read subsystem ID which contains the virtio device type
                     let subsystem_id = pci_config_read16(bus, dev, func, PCI_SUBSYSTEM_ID);
@@ -575,7 +583,12 @@ pub fn probe_virtio_blk(
                     };
                     klog!(Info,
                         "    Found virtio-blk ({}) at PCI {:02x}:{:02x}.{}, type={}, common_cfg={:#x}",
-                        dev_type, bus, dev, func, subsystem_id, caps.common_cfg
+                        dev_type,
+                        bus,
+                        dev,
+                        func,
+                        subsystem_id,
+                        caps.common_cfg.phys()
                     );
                     return Some((pci_id, caps, "vda"));
                 } else {
