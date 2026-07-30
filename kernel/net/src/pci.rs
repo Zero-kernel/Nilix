@@ -9,7 +9,7 @@ use core::arch::asm;
 // PCI config-space user). Without it, an RMW here could interleave with an
 // IOMMU config access on another CPU and corrupt the CF8 address latch.
 use iommu::{attach_device, PciDeviceId, PCI_CONFIG_LOCK};
-use virtio::VirtioPciAddrs;
+use virtio::{VirtioPciAddrs, VirtioPciBarWindow};
 
 // ============================================================================
 // PCI Constants
@@ -197,12 +197,10 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                 // at all.
                 let caps = read_virtio_caps(bus, dev, func);
 
-                // Enable memory space and bus mastering
-                // R165-20 FIX: atomic RMW so a concurrent IOMMU config write
-                // cannot be lost between the read and the write-back.
-                if caps.is_some() {
-                    pci_update16(bus, dev, func, PCI_COMMAND, |cmd| cmd | 0x06);
-                }
+                // RF186-4: enumeration returns authority only, never an active
+                // DMA function. MSE is enabled only after the MMIO rollback
+                // guard exists; BME is enabled only after every fallible queue
+                // and publication resource has been prepared.
 
                 // Try to read modern capabilities
                 if let Some(mut addrs) = caps {
@@ -214,7 +212,7 @@ pub fn probe_virtio_net(iommu_required: bool) -> Vec<VirtioNetPciDevice> {
                         bus,
                         dev,
                         func,
-                        addrs.common_cfg
+                        addrs.common_cfg.phys()
                     );
 
                     devices.push(VirtioNetPciDevice {
@@ -349,15 +347,24 @@ fn read_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 
             if let Some(resource) = bar_cache.get(usize::from(bar)).copied().flatten() {
                 // Validate the FULL declared length, not just the first byte.
-                if let Some(phys) = resource.phys_for(offset as u64, cap_window_len as u64) {
+                if let Some(window) = VirtioPciBarWindow::try_new(
+                    resource.base,
+                    resource.len,
+                    offset as u64,
+                    cap_window_len,
+                    match cfg_type {
+                        VIRTIO_PCI_CAP_COMMON_CFG => virtio::VirtioPciWindowAccess::Common,
+                        VIRTIO_PCI_CAP_NOTIFY_CFG => virtio::VirtioPciWindowAccess::Notify,
+                        VIRTIO_PCI_CAP_ISR_CFG => virtio::VirtioPciWindowAccess::Isr,
+                        _ => virtio::VirtioPciWindowAccess::Device,
+                    },
+                ) {
                     match cfg_type {
                         VIRTIO_PCI_CAP_COMMON_CFG => {
-                            addrs.common_cfg = phys;
-                            addrs.common_cfg_len = cap_window_len;
+                            addrs.common_cfg = window;
                         }
                         VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                            addrs.notify_base = phys;
-                            addrs.notify_len = cap_window_len;
+                            addrs.notify = window;
                             // R169-L8 FIX: ptr+16 must not wrap the u8 add; only read
                             // it when ptr <= 0xEF (0xEF+16 == 0xFF). A cap claiming
                             // length >= 20 at a higher start is malformed — skip the
@@ -367,12 +374,10 @@ fn read_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
                             }
                         }
                         VIRTIO_PCI_CAP_ISR_CFG => {
-                            addrs.isr = phys;
-                            addrs.isr_len = cap_window_len;
+                            addrs.isr = window;
                         }
                         VIRTIO_PCI_CAP_DEVICE_CFG => {
-                            addrs.device_cfg = phys;
-                            addrs.device_cfg_len = cap_window_len;
+                            addrs.device_cfg = window;
                         }
                         _ => {}
                     }
@@ -387,7 +392,7 @@ fn read_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
     }
 
     // Require at least common_cfg, notify, and device_cfg for modern device
-    if addrs.common_cfg != 0 && addrs.notify_base != 0 && addrs.device_cfg != 0 {
+    if addrs.common_cfg.is_present() && addrs.notify.is_present() && addrs.device_cfg.is_present() {
         Some(addrs)
     } else {
         None
@@ -497,7 +502,7 @@ fn size_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<ValidatedBar> {
 
     // --- sizing probe, original values restored on every path ---
     let (size_low, size_high) =
-        raw_probe_bar(bus, dev, func, offset, low, is_64bit.then_some(high));
+        raw_probe_bar(bus, dev, func, offset, low, is_64bit.then_some(high))?;
 
     // Assemble the decoded-address mask, then invert to get the size.
     let mask = ((size_low & !0xF) as u64) | ((size_high as u64) << 32);
@@ -512,7 +517,7 @@ fn size_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<ValidatedBar> {
         return None;
     }
     // The window must not wrap the physical address space.
-    base.checked_add(len)?;
+    mm::checked_physical_range(base, len)?;
 
     Some(ValidatedBar {
         base,
@@ -533,7 +538,7 @@ fn raw_probe_bar(
     offset: u8,
     original_low: u32,
     original_high: Option<u32>,
-) -> (u32, u32) {
+) -> Option<(u32, u32)> {
     unsafe {
         let low_address = pci_config_address(bus, dev, func, offset);
         let high_address = pci_config_address(bus, dev, func, offset + 4);
@@ -559,7 +564,18 @@ fn raw_probe_bar(
         }
         outl(PCI_CONFIG_ADDRESS, low_address);
         outl(PCI_CONFIG_DATA, original_low);
-        (readback_low, readback_high)
+        outl(PCI_CONFIG_ADDRESS, low_address);
+        let restored_low = inl(PCI_CONFIG_DATA);
+        if restored_low != original_low {
+            return None;
+        }
+        if let Some(high) = original_high {
+            outl(PCI_CONFIG_ADDRESS, high_address);
+            if inl(PCI_CONFIG_DATA) != high {
+                return None;
+            }
+        }
+        Some((readback_low, readback_high))
     }
 }
 
@@ -676,7 +692,42 @@ unsafe fn inl(port: u16) -> u32 {
 /// This should be called when a device fails to initialize properly after
 /// bus mastering was enabled, to prevent orphaned DMA-capable devices.
 pub fn disable_bus_master(slot: &PciSlot) {
-    disable_bus_master_bdf(slot.bus, slot.device, slot.function);
+    if !try_disable_memory_and_bus_master(slot) {
+        panic!(
+            "R186-6: cannot fail closed: PCI MSE/BME remains set for {:02x}:{:02x}.{}",
+            slot.bus, slot.device, slot.function
+        );
+    }
+}
+
+/// Clear and read-back both PCI DMA and MMIO-decode authority without
+/// panicking. Probe guards use this form so they can quarantine all live
+/// ownership before escalating a device that refuses containment.
+pub fn try_disable_memory_and_bus_master(slot: &PciSlot) -> bool {
+    let bits = PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+    let verify = pci_update16(slot.bus, slot.device, slot.function, PCI_COMMAND, |cmd| {
+        cmd & !bits
+    });
+    verify & bits == 0
+}
+
+/// Enable MMIO decoding while keeping DMA authority disabled. The read-back is
+/// serialized with the update so a failed activation is fail-closed.
+pub fn enable_memory_space(slot: &PciSlot) -> bool {
+    let verify = pci_update16(slot.bus, slot.device, slot.function, PCI_COMMAND, |cmd| {
+        (cmd | PCI_COMMAND_MEMORY_SPACE) & !PCI_COMMAND_BUS_MASTER
+    });
+    verify & (PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER) == PCI_COMMAND_MEMORY_SPACE
+}
+
+/// Grant DMA authority only after the caller owns a complete unpublished-device
+/// rollback transaction. MSE must remain enabled for reset acknowledgement.
+pub fn enable_bus_master(slot: &PciSlot) -> bool {
+    let required = PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+    let verify = pci_update16(slot.bus, slot.device, slot.function, PCI_COMMAND, |cmd| {
+        cmd | required
+    });
+    verify & required == required
 }
 
 /// R180-17: clear BME by BDF (probe/refusal path before a PciSlot exists).

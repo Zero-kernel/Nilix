@@ -153,6 +153,8 @@ pub enum NetError {
     InvalidConfig,
     /// Device is not initialized.
     NotInitialized,
+    /// Control-plane owner allocation or registry growth failed.
+    NoMemory,
 }
 
 /// Errors from transmit operations.
@@ -223,6 +225,21 @@ pub enum RxError {
 /// Implementations should be safe to call from interrupt context (where noted)
 /// and must handle internal synchronization appropriately.
 pub trait NetDevice: Send {
+    /// Publication hook used only by the PCI ownership transaction after BME
+    /// is enabled and before registry insertion. Non-DMA synthetic devices do
+    /// not require an activation transition.
+    #[doc(hidden)]
+    unsafe fn activate_unpublished(&mut self) -> Result<(), NetError> {
+        Ok(())
+    }
+
+    /// Attempt to prove an unpublished DMA device quiescent. Returning false
+    /// requires the caller to retain/quarantine the final owner permanently.
+    #[doc(hidden)]
+    fn rollback_unpublished(&mut self) -> bool {
+        true
+    }
+
     // ========================================================================
     // Device Identity & Configuration
     // ========================================================================

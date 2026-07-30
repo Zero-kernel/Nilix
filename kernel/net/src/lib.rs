@@ -77,7 +77,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod admitted;
 use spin::{Mutex, Once, RwLock};
@@ -238,25 +238,33 @@ impl NetDeviceRegistry {
         }
     }
 
-    fn register<D: NetDevice + 'static>(&self, device: D) -> Result<usize, NetError> {
+    fn register_handle(&self, device: NetDeviceHandle) -> Result<usize, NetError> {
+        let mut name = String::new();
+        {
+            let guard = device.lock();
+            name.try_reserve_exact(guard.name().len())
+                .map_err(|_| NetError::NoMemory)?;
+            name.push_str(guard.name());
+        }
+
         let mut devices = self.devices.write();
 
         if devices.len() >= MAX_NET_DEVICES {
             return Err(NetError::InvalidState);
         }
 
-        let name = String::from(device.name());
         if devices.iter().any(|d| d.name == name) {
             return Err(NetError::InvalidConfig);
         }
 
+        devices.try_reserve(1).map_err(|_| NetError::NoMemory)?;
+
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
-        let handle: NetDeviceHandle = Arc::new(Mutex::new(Box::new(device)));
 
         devices.push(RegisteredDevice {
             name,
             index,
-            device: handle,
+            device,
         });
 
         Ok(index)
@@ -311,7 +319,9 @@ fn registry() -> &'static NetDeviceRegistry {
 
 /// Register a network device in the global registry.
 pub fn register_device<D: NetDevice + 'static>(device: D) -> Result<usize, NetError> {
-    registry().register(device)
+    let boxed: Box<dyn NetDevice> = Box::try_new(device).map_err(|_| NetError::NoMemory)?;
+    let handle = Arc::try_new(Mutex::new(boxed)).map_err(|_| NetError::NoMemory)?;
+    registry().register_handle(handle)
 }
 
 /// D1-ISO-NETNS-DATAPLANE: resolve (handle, stable index) for the SOLE sanctioned
@@ -410,164 +420,262 @@ const NET_MMIO_VIRT_BASE: u64 = 0xffff_ffff_5000_0000;
 /// Maximum size of the network MMIO virtual address region (64 MB).
 const NET_MMIO_VIRT_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Current offset within the network MMIO virtual address region.
-static NET_MMIO_OFFSET: AtomicU64 = AtomicU64::new(0);
+/// Serialized bump allocator. Holding this lock through device probe makes a
+/// failed reservation rewindable without racing a later device allocation.
+static NET_MMIO_OFFSET: Mutex<u64> = Mutex::new(0);
 
-/// Map a physical MMIO region and return the virtual offset to use.
-///
-/// After security hardening, identity mapping is read-only, so we must
-/// explicitly map MMIO regions to a writable virtual address range.
-///
-/// # Arguments
-/// * `phys_base` - Physical base address of the MMIO region
-/// * `size` - Size of the MMIO region in bytes
-///
-/// # Returns
-/// * `Ok(virt_offset)` - Offset to add to physical address to get virtual address
-/// * `Err(NetError)` - Mapping failed
-///
-/// # Safety
-/// The caller must ensure the physical address is a valid MMIO region.
-unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
-    // R186-6: the physical base must be page-aligned. `mm::map_mmio` rounds down
-    // via `PhysFrame::containing_address`, so an unaligned base silently skews
-    // `virt_offset` by `phys_base & 0xFFF` for every derived pointer and leaves
-    // the tail of the window unmapped. Refuse instead of mapping a skewed view.
-    if phys_base % 0x1000 != 0 {
-        klog!(
-            Error,
-            "      [NET MMIO] refusing unaligned phys base {:#x}",
-            phys_base
-        );
-        return Err(NetError::IoError);
+#[derive(Clone, Copy, Debug, Default)]
+struct MmioPageWindow {
+    phys: u64,
+    len: usize,
+}
+
+struct PciMmioMapping {
+    allocator: Option<spin::MutexGuard<'static, u64>>,
+    reservation_start: u64,
+    phys_anchor: u64,
+    virt_anchor: u64,
+    windows: [MmioPageWindow; 4],
+    window_count: usize,
+    virt_offset: u64,
+    committed: bool,
+}
+
+impl PciMmioMapping {
+    fn commit(mut self) {
+        self.committed = true;
+        drop(self.allocator.take());
     }
 
-    // Allocate virtual address space (page-aligned)
-    let aligned_size = size
-        .checked_add(0xFFF)
-        .map(|value| value & !0xFFF)
-        .ok_or(NetError::IoError)?;
-    if aligned_size == 0 {
-        return Err(NetError::IoError);
+    /// Preserve VA/PTE ownership for hardware whose DMA quiescence is not
+    /// proven, while releasing allocator serialization for later devices.
+    fn quarantine(mut self) {
+        self.committed = true;
+        drop(self.allocator.take());
     }
+}
 
-    // R186-6: reserve the VA range TRANSACTIONALLY.
-    //
-    // The previous code did `fetch_add` and only then compared against the limit,
-    // so an oversized request (a device-declared notify length could reach ~4 GiB)
-    // consumed the reservation permanently and pushed the bump pointer past the
-    // end — after which EVERY later `map_pci_mmio` failed for the lifetime of the
-    // boot. One malformed device could therefore deny MMIO to every subsequent
-    // NIC. `fetch_update` commits only a reservation that fits, and the checked
-    // add cannot wrap.
-    let offset = NET_MMIO_OFFSET
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            let end = current.checked_add(aligned_size as u64)?;
-            if end > NET_MMIO_VIRT_SIZE {
-                return None;
-            }
-            Some(end)
-        })
-        .map_err(|_| {
-            klog!(
-                Error,
-                "      [NET MMIO] Virtual space exhausted (need {:#x})",
-                aligned_size
-            );
-            NetError::IoError
-        })?;
+/// Ready PCI device not yet published in the global registry. Drop is the sole
+/// rollback authority: it proves reset + command-bit containment before freeing
+/// DMA or unmapping MMIO, otherwise quarantines both owners.
+struct ProbedPciNetDevice {
+    slot: pci::PciSlot,
+    device: Option<NetDeviceHandle>,
+    mapping: Option<PciMmioMapping>,
+}
 
-    let virt_addr = NET_MMIO_VIRT_BASE + offset;
-    let virt_offset = virt_addr as i64 - phys_base as i64;
-
-    klog!(
-        Info,
-        "      [NET MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
-        phys_base,
-        virt_addr,
-        aligned_size
-    );
-
-    // Create the mapping using the mm crate's map_mmio function
-    let mut frame_alloc = mm::FrameAllocator::new();
-
-    match mm::map_mmio(
-        VirtAddr::new(virt_addr),
-        PhysAddr::new(phys_base),
-        aligned_size,
-        &mut frame_alloc,
-    ) {
-        Ok(()) => {
-            klog!(Info, "      [NET MMIO] Mapping successful");
-            Ok(virt_offset)
+impl ProbedPciNetDevice {
+    fn new(slot: pci::PciSlot, device: NetDeviceHandle, mapping: PciMmioMapping) -> Self {
+        Self {
+            slot,
+            device: Some(device),
+            mapping: Some(mapping),
         }
-        Err(e) => {
-            klog!(Error, "      [NET MMIO] Mapping failed: {:?}", e);
-            Err(NetError::IoError)
+    }
+
+    fn handle(&self) -> NetDeviceHandle {
+        Arc::clone(self.device.as_ref().expect("probed net device committed"))
+    }
+
+    fn commit(mut self) {
+        if let Some(mapping) = self.mapping.take() {
+            mapping.commit();
+        }
+        drop(
+            self.device
+                .take()
+                .expect("probed net device committed twice"),
+        );
+    }
+}
+
+impl Drop for ProbedPciNetDevice {
+    fn drop(&mut self) {
+        let Some(device) = self.device.take() else {
+            return;
+        };
+        let reset_acked = device.lock().rollback_unpublished();
+        let contained = pci::try_disable_memory_and_bus_master(&self.slot);
+        if reset_acked && contained {
+            drop(device);
+            return;
+        }
+
+        core::mem::forget(device);
+        if let Some(mapping) = self.mapping.take() {
+            mapping.quarantine();
+        }
+        klog_force!(
+            "RF186-4: virtio-net {:02x}:{:02x}.{} rollback reset_acked={} contained={}; quarantined device and MMIO ownership",
+            self.slot.bus,
+            self.slot.device,
+            self.slot.function,
+            reset_acked,
+            contained
+        );
+        if !contained {
+            panic!("RF186-4: PCI network device refused MSE/BME containment");
         }
     }
 }
 
-/// Map all MMIO regions from VirtioPciAddrs and return modified addrs with virtual offset.
-///
-/// This creates proper page table mappings for all PCI capability regions.
-unsafe fn map_virtio_pci_regions(
+fn rollback_inactive_pci_mapping(slot: &pci::PciSlot, mapping: PciMmioMapping) {
+    if pci::try_disable_memory_and_bus_master(slot) {
+        drop(mapping);
+        return;
+    }
+    mapping.quarantine();
+    panic!(
+        "RF186-4: inactive PCI network probe refused MSE/BME containment at {:02x}:{:02x}.{}",
+        slot.bus, slot.device, slot.function
+    );
+}
+
+impl Drop for PciMmioMapping {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut frame_allocator = mm::FrameAllocator::new();
+        for window in self.windows[..self.window_count].iter().rev() {
+            let virt = self
+                .virt_anchor
+                .checked_add(window.phys - self.phys_anchor)
+                .expect("validated virtio-net MMIO reservation overflowed");
+            unsafe {
+                mm::unmap_mmio(VirtAddr::new(virt), window.len, &mut frame_allocator)
+                    .unwrap_or_else(|_| panic!("RF186-4: virtio-net MMIO rollback failed"));
+            }
+        }
+        if let Some(offset) = self.allocator.as_mut() {
+            **offset = self.reservation_start;
+        }
+    }
+}
+
+fn merged_mmio_windows(
     addrs: &virtio::VirtioPciAddrs,
-) -> Result<(virtio::VirtioPciAddrs, i64), NetError> {
-    // Calculate total MMIO range we need to map
-    // The regions are: common_cfg, notify_base, isr, device_cfg
-    // They're typically close together in a single BAR
-
-    // R186-6: derive the span from the VALIDATED window extents, with checked
-    // arithmetic throughout.
-    //
-    // The previous computation was unsound in three ways. (1) Every bound used a
-    // hardcoded guess (64 / 4 / 16 bytes) instead of the capability's declared
-    // length, so a window larger than the guess was mapped short and a later read
-    // ran off the end of the mapping. (2) The max side did not filter absent
-    // (zero) windows, so an unpopulated capability still contributed to the span.
-    // (3) All of `base + len`, `max - min` and `size + 0xFFF` were unchecked; the
-    // release profile enables no overflow checks, so a device-controlled
-    // `notify_len` near `u32::MAX` wrapped silently.
-    //
-    // Each length is now the extent the capability walk already proved to lie
-    // inside a sized BAR, so the mapped span cannot exceed what the device
-    // legitimately decodes.
-    let windows = [
-        (addrs.common_cfg, addrs.common_cfg_len as u64),
-        (addrs.notify_base, addrs.notify_len as u64),
-        (addrs.isr, addrs.isr_len as u64),
-        (addrs.device_cfg, addrs.device_cfg_len as u64),
-    ];
-
-    let mut min_addr: Option<u64> = None;
-    let mut max_addr: Option<u64> = None;
-    for (base, len) in windows {
-        // A window is present only if it has both an address and a proven extent.
-        if base == 0 || len == 0 {
+) -> Result<([MmioPageWindow; 4], usize), NetError> {
+    let declared = [addrs.common_cfg, addrs.notify, addrs.isr, addrs.device_cfg];
+    let mut pages = [MmioPageWindow::default(); 4];
+    let mut count = 0usize;
+    for authority in declared {
+        if !authority.is_present() {
             continue;
         }
-        let end = base.checked_add(len).ok_or(NetError::NotSupported)?;
-        min_addr = Some(min_addr.map_or(base, |current: u64| current.min(base)));
-        max_addr = Some(max_addr.map_or(end, |current: u64| current.max(end)));
+        let (page_start, page_len) = authority.page_cover().ok_or(NetError::NotSupported)?;
+        mm::checked_physical_range(page_start, page_len).ok_or(NetError::NotSupported)?;
+        let page_len = usize::try_from(page_len)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(NetError::NotSupported)?;
+        pages[count] = MmioPageWindow {
+            phys: page_start,
+            len: page_len,
+        };
+        count += 1;
     }
+    if count == 0 {
+        return Err(NetError::NotSupported);
+    }
+    for left in 0..count {
+        for right in (left + 1)..count {
+            if pages[right].phys < pages[left].phys {
+                pages.swap(left, right);
+            }
+        }
+    }
+    let mut merged = [MmioPageWindow::default(); 4];
+    let mut merged_count = 0usize;
+    for window in pages[..count].iter().copied() {
+        if merged_count != 0 {
+            let previous = &mut merged[merged_count - 1];
+            let previous_end = previous
+                .phys
+                .checked_add(previous.len as u64)
+                .ok_or(NetError::NotSupported)?;
+            if window.phys <= previous_end {
+                let window_end = window
+                    .phys
+                    .checked_add(window.len as u64)
+                    .ok_or(NetError::NotSupported)?;
+                previous.len = usize::try_from(previous_end.max(window_end) - previous.phys)
+                    .map_err(|_| NetError::NotSupported)?;
+                continue;
+            }
+        }
+        merged[merged_count] = window;
+        merged_count += 1;
+    }
+    Ok((merged, merged_count))
+}
 
-    let min_addr = min_addr.ok_or(NetError::NotSupported)?;
-    let max_addr = max_addr.ok_or(NetError::NotSupported)?;
-
-    // Align the base DOWN to a page so the whole span stays covered once
-    // `map_pci_mmio` maps page-granular frames, and keep the base page-aligned as
-    // that function now requires.
-    let map_base = min_addr & !0xFFF;
-    let span = max_addr
-        .checked_sub(map_base)
+/// Map only pages intersecting validated capability windows. The virtual span
+/// preserves one uniform physical-to-virtual offset, but physical holes between
+/// BAR windows remain unmapped.
+unsafe fn map_virtio_pci_regions(
+    addrs: &virtio::VirtioPciAddrs,
+) -> Result<PciMmioMapping, NetError> {
+    let (windows, window_count) = merged_mmio_windows(addrs)?;
+    let phys_anchor = windows[0].phys;
+    let last = windows[window_count - 1];
+    let span_end = last
+        .phys
+        .checked_add(last.len as u64)
         .ok_or(NetError::NotSupported)?;
-    let size = usize::try_from(span).map_err(|_| NetError::NotSupported)?;
-
-    // Map the validated range.
-    let virt_offset = map_pci_mmio(map_base, size)?;
-
-    Ok((*addrs, virt_offset))
+    let span = span_end
+        .checked_sub(phys_anchor)
+        .ok_or(NetError::NotSupported)?;
+    let allocator = NET_MMIO_OFFSET.lock();
+    let reservation_start = *allocator;
+    let reservation_end = reservation_start
+        .checked_add(span)
+        .filter(|end| *end <= NET_MMIO_VIRT_SIZE)
+        .ok_or(NetError::IoError)?;
+    let virt_anchor = NET_MMIO_VIRT_BASE
+        .checked_add(reservation_start)
+        .ok_or(NetError::IoError)?;
+    NET_MMIO_VIRT_BASE
+        .checked_add(reservation_end)
+        .ok_or(NetError::IoError)?;
+    let virt_offset = virt_anchor
+        .checked_sub(phys_anchor)
+        .ok_or(NetError::NotSupported)?;
+    let mut transaction = PciMmioMapping {
+        allocator: Some(allocator),
+        reservation_start,
+        phys_anchor,
+        virt_anchor,
+        windows,
+        window_count: 0,
+        virt_offset,
+        committed: false,
+    };
+    let mut frame_allocator = mm::FrameAllocator::new();
+    for window in windows[..window_count].iter().copied() {
+        let virt = virt_anchor
+            .checked_add(window.phys - phys_anchor)
+            .ok_or(NetError::IoError)?;
+        let phys = PhysAddr::try_new(window.phys).map_err(|_| NetError::IoError)?;
+        let last_phys = window
+            .phys
+            .checked_add(window.len.saturating_sub(1) as u64)
+            .ok_or(NetError::IoError)?;
+        PhysAddr::try_new(last_phys).map_err(|_| NetError::IoError)?;
+        mm::map_mmio(VirtAddr::new(virt), phys, window.len, &mut frame_allocator).map_err(
+            |error| {
+                klog!(Error, "      [NET MMIO] mapping failed: {:?}", error);
+                NetError::IoError
+            },
+        )?;
+        transaction.windows[transaction.window_count] = window;
+        transaction.window_count += 1;
+    }
+    **transaction
+        .allocator
+        .as_mut()
+        .expect("MMIO allocator guard") = reservation_end;
+    Ok(transaction)
 }
 
 // ============================================================================
@@ -599,8 +707,8 @@ pub fn init(iommu_required: bool) -> usize {
             // Map the MMIO regions for this device.
             // After security hardening, identity mapping is read-only,
             // so we must create explicit writable mappings.
-            let virt_offset = match unsafe { map_virtio_pci_regions(&pci_dev.addrs) } {
-                Ok((_, offset)) => offset,
+            let mapping = match unsafe { map_virtio_pci_regions(&pci_dev.addrs) } {
+                Ok(mapping) => mapping,
                 Err(e) => {
                     // R82-4 FIX: Disable bus mastering on MMIO mapping failure
                     pci::disable_bus_master(&pci_dev.slot);
@@ -615,44 +723,87 @@ pub fn init(iommu_required: bool) -> usize {
                 }
             };
 
-            match unsafe { VirtioNetDevice::probe_pci(pci_dev.addrs, virt_offset as u64, &name) } {
-                Ok(device) => {
-                    let mac = device.mac_address();
-                    let link = device.link_status();
+            if !pci::enable_memory_space(&pci_dev.slot) {
+                rollback_inactive_pci_mapping(&pci_dev.slot, mapping);
+                klog!(Error, "      ! virtio-net MSE activation failed");
+                continue;
+            }
 
-                    match register_device(device) {
-                        Ok(_) => {
-                            klog!(Info,
-                                "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
-                                name,
-                                pci_dev.slot.bus,
-                                pci_dev.slot.device,
-                                pci_dev.slot.function,
-                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                                if link.up { "up" } else { "down" }
-                            );
-                            registered += 1;
-                        }
-                        Err(e) => {
-                            // R82-4 FIX: Disable bus mastering on registration failure
-                            pci::disable_bus_master(&pci_dev.slot);
-                            klog!(
-                                Error,
-                                "      ! Failed to register {}: {:?} (bus master disabled)",
-                                name,
-                                e
-                            );
-                        }
-                    }
-                }
+            let virt_offset = mapping.virt_offset;
+            let device = match unsafe {
+                VirtioNetDevice::probe_pci(pci_dev.addrs, virt_offset, &name)
+            } {
+                Ok(device) => device,
                 Err(e) => {
-                    // R82-4 FIX: Disable bus mastering on driver probe failure
-                    pci::disable_bus_master(&pci_dev.slot);
+                    rollback_inactive_pci_mapping(&pci_dev.slot, mapping);
                     klog!(Error,
-                        "      ! virtio-net probe @ {:02x}:{:02x}.{} failed: {:?} (bus master disabled)",
+                        "      ! virtio-net probe @ {:02x}:{:02x}.{} failed: {:?} (MSE/BME disabled)",
                         pci_dev.slot.bus,
                         pci_dev.slot.device,
                         pci_dev.slot.function,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let boxed: Box<dyn NetDevice> = match Box::try_new(device) {
+                Ok(device) => device,
+                Err(_) => {
+                    rollback_inactive_pci_mapping(&pci_dev.slot, mapping);
+                    klog!(Error, "      ! virtio-net owner allocation failed");
+                    continue;
+                }
+            };
+            let handle = match Arc::try_new(Mutex::new(boxed)) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    rollback_inactive_pci_mapping(&pci_dev.slot, mapping);
+                    klog!(Error, "      ! virtio-net shared owner allocation failed");
+                    continue;
+                }
+            };
+            let probed = ProbedPciNetDevice::new(pci_dev.slot, handle, mapping);
+
+            if !pci::enable_bus_master(&pci_dev.slot) {
+                drop(probed);
+                klog!(Error, "      ! virtio-net BME activation failed");
+                continue;
+            }
+            let activation = unsafe { probed.handle().lock().activate_unpublished() };
+            if let Err(error) = activation {
+                drop(probed);
+                klog!(Error, "      ! virtio-net DRIVER_OK failed: {:?}", error);
+                continue;
+            }
+
+            let (mac, link) = {
+                let device = probed.handle();
+                let device = device.lock();
+                (device.mac_address(), device.link_status())
+            };
+            match registry().register_handle(probed.handle()) {
+                Ok(_) => {
+                    // Registry insertion is the final fallible step. Commit is
+                    // allocation-free and immediately transfers sole ownership.
+                    probed.commit();
+                    klog!(Info,
+                        "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
+                        name,
+                        pci_dev.slot.bus,
+                        pci_dev.slot.device,
+                        pci_dev.slot.function,
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                        if link.up { "up" } else { "down" }
+                    );
+                    registered += 1;
+                }
+                Err(e) => {
+                    drop(probed);
+                    klog!(
+                        Error,
+                        "      ! Failed to register {}: {:?} (device rolled back or quarantined)",
+                        name,
                         e
                     );
                 }
@@ -721,4 +872,30 @@ pub fn assert_netns_hooks_for_rx() {
          before netns_device_hooks were registered — ARP per-ns cache lookups \
          would fail-closed, breaking root-ns ARP until userspace init"
     );
+}
+
+#[cfg(test)]
+mod mmio_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn net_mmio_preflight_rejects_page_above_architectural_width() {
+        let above_width = 1u64 << 52;
+        let window = virtio::VirtioPciBarWindow::try_new(
+            above_width,
+            0x1000,
+            0,
+            8,
+            virtio::VirtioPciWindowAccess::Device,
+        )
+        .expect("synthetic window is internally BAR-contained");
+        let addrs = virtio::VirtioPciAddrs {
+            device_cfg: window,
+            ..virtio::VirtioPciAddrs::default()
+        };
+        assert!(matches!(
+            merged_mmio_windows(&addrs),
+            Err(NetError::NotSupported)
+        ));
+    }
 }

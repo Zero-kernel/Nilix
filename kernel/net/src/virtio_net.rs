@@ -124,6 +124,11 @@ pub struct VirtioNetDevice {
     rx_recycle: Vec<NetBuf>,
     /// Statistics
     stats: NetStats,
+    /// True only after transport-specific DMA authority and DRIVER_OK commit.
+    dma_activated: bool,
+    /// Set only after acknowledged reset; suppresses a second MMIO teardown in
+    /// `Drop` after the outer PCI guard has cleared MSE.
+    teardown_complete: bool,
 }
 
 /// Network device statistics.
@@ -155,6 +160,8 @@ struct RxInflight {
 // which are accessed through synchronized mechanisms.
 unsafe impl Send for VirtioNetDevice {}
 
+const PUBLICATION_RESET_ACK_SPINS: u32 = 1_000_000;
+
 impl VirtioNetDevice {
     /// Probe and initialize a virtio-net device via MMIO transport.
     ///
@@ -167,7 +174,10 @@ impl VirtioNetDevice {
     ) -> Result<Self, NetError> {
         let transport =
             MmioTransport::probe(mmio_phys, virt_offset).ok_or(NetError::NotInitialized)?;
-        Self::init_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)
+        let mut device =
+            Self::init_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)?;
+        device.activate_dma()?;
+        Ok(device)
     }
 
     /// Probe and initialize a virtio-net device via PCI transport.
@@ -251,21 +261,38 @@ impl VirtioNetDevice {
             Self::setup_queue(&transport, QUEUE_TX, PHYSICAL_MEMORY_OFFSET)?;
         let tx_size = tx_queue.size() as usize;
 
-        // Set DRIVER_OK to indicate we're ready
-        transport.set_status(transport.status() | VIRTIO_STATUS_DRIVER_OK);
-
-        // Initialize inflight buffer tracking
-        let mut tx_inflight = Vec::with_capacity(tx_size);
+        // Prepare every fallible owner before PCI grants bus-master authority or
+        // DRIVER_OK. A partial probe can therefore release DMA allocations while
+        // BME is still provably clear.
+        let mut tx_inflight = Vec::new();
+        tx_inflight
+            .try_reserve_exact(tx_size)
+            .map_err(|_| NetError::NoMemory)?;
         tx_inflight.resize_with(tx_size, || None);
         // R44-1 FIX: Initialize driver-owned chain metadata
-        let mut tx_chain_next = Vec::with_capacity(tx_size);
+        let mut tx_chain_next = Vec::new();
+        tx_chain_next
+            .try_reserve_exact(tx_size)
+            .map_err(|_| NetError::NoMemory)?;
         tx_chain_next.resize_with(tx_size, || None);
 
-        let mut rx_inflight = Vec::with_capacity(rx_size);
+        let mut rx_inflight = Vec::new();
+        rx_inflight
+            .try_reserve_exact(rx_size)
+            .map_err(|_| NetError::NoMemory)?;
         rx_inflight.resize_with(rx_size, || None);
         // R44-1 FIX: Initialize driver-owned chain metadata
-        let mut rx_chain_next = Vec::with_capacity(rx_size);
+        let mut rx_chain_next = Vec::new();
+        rx_chain_next
+            .try_reserve_exact(rx_size)
+            .map_err(|_| NetError::NoMemory)?;
         rx_chain_next.resize_with(rx_size, || None);
+
+        let mut owned_name = String::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| NetError::NoMemory)?;
+        owned_name.push_str(name);
 
         kprintln!(
             "[net] {} ({}) MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -280,7 +307,7 @@ impl VirtioNetDevice {
         );
 
         Ok(Self {
-            name: String::from(name),
+            name: owned_name,
             transport,
             rx_queue,
             tx_queue,
@@ -302,7 +329,42 @@ impl VirtioNetDevice {
             rx_ready: Vec::new(),
             rx_recycle: Vec::new(),
             stats: NetStats::default(),
+            dma_activated: false,
+            teardown_complete: false,
         })
+    }
+
+    /// Publish DRIVER_OK only after the caller has granted the transport DMA
+    /// authority and armed an owner+mapping rollback guard.
+    pub(crate) unsafe fn activate_dma(&mut self) -> Result<(), NetError> {
+        self.transport
+            .set_status(self.transport.status() | VIRTIO_STATUS_DRIVER_OK);
+        if self.transport.status() & VIRTIO_STATUS_DRIVER_OK == 0 {
+            return Err(NetError::InvalidState);
+        }
+        self.dma_activated = true;
+        Ok(())
+    }
+
+    /// Quiesce an unpublished active device before any DMA-backed owner is
+    /// released. A false result means the caller must quarantine the final
+    /// owner and its MMIO mapping.
+    pub(crate) fn rollback_unpublished(&mut self) -> bool {
+        unsafe {
+            self.transport.queue_ready(QUEUE_RX, false);
+            self.transport.queue_ready(QUEUE_TX, false);
+            if !self
+                .transport
+                .reset_and_await_ack(PUBLICATION_RESET_ACK_SPINS)
+            {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.dma_activated = false;
+        self.teardown_complete = true;
+        true
     }
 
     /// Setup a single virtqueue.
@@ -571,21 +633,30 @@ impl VirtioNetDevice {
 /// permanent physical memory and IOMMU mapping leaks.
 impl Drop for VirtioNetDevice {
     fn drop(&mut self) {
-        // SAFETY: These operations are safe as we're the only owner of the device
-        // at this point (we're being dropped), and the device is being torn down.
-        unsafe {
-            // Disable queues first to stop accepting new operations
-            self.transport.queue_ready(QUEUE_RX, false);
-            self.transport.queue_ready(QUEUE_TX, false);
-
-            // Reset the device to stop all DMA operations
-            // This ensures no in-flight DMA transactions will complete after we
-            // free the DMA buffers.
-            self.transport.reset();
+        if self.teardown_complete {
+            return;
         }
 
-        // Memory fence to ensure all writes are visible before dropping buffers
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // A PCI probe that never granted BME may free its staged allocations
+        // without treating reset acknowledgement as a DMA-drain proof. It still
+        // resets best-effort while MMIO decode is available.
+        if !self.dma_activated {
+            unsafe {
+                self.transport.queue_ready(QUEUE_RX, false);
+                self.transport.queue_ready(QUEUE_TX, false);
+                self.transport.reset();
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+
+        // SAFETY: These operations are safe as we're the only owner of the device
+        // at this point (we're being dropped), and the device is being torn down.
+        if !self.rollback_unpublished() {
+            panic!(
+                "RF186-4: refusing to release active virtio-net DMA ownership without reset acknowledgement"
+            );
+        }
 
         // DMA buffers (rx_queue_dma, tx_queue_dma) will be automatically
         // dropped after this, which will:
@@ -596,6 +667,14 @@ impl Drop for VirtioNetDevice {
 }
 
 impl NetDevice for VirtioNetDevice {
+    unsafe fn activate_unpublished(&mut self) -> Result<(), NetError> {
+        self.activate_dma()
+    }
+
+    fn rollback_unpublished(&mut self) -> bool {
+        VirtioNetDevice::rollback_unpublished(self)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
