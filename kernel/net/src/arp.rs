@@ -43,7 +43,7 @@ use crate::ethernet::{build_ethernet_frame, EthAddr, ETHERTYPE_ARP};
 use crate::icmp::TokenBucket;
 use crate::ipv4::Ipv4Addr;
 use crate::stack::PreparedReply;
-use mm::{HeapClass, NsByteBudget};
+use mm::{HeapCharge, HeapClass, NsByteBudget};
 
 // ============================================================================
 // ARP Constants (RFC 826)
@@ -453,6 +453,10 @@ pub struct ArpCache {
     /// global [`ARP_PROBE_RATE_LIMITER`] backstops the AGGREGATE behind it,
     /// mirroring the established RX/TX dual-limiter pattern.
     probe_rate_limiter: TokenBucket,
+    /// Optional charge for an enclosing retained Arc allocation. Per-netns
+    /// caches attach this before `Arc::try_new`; global boot caches leave it
+    /// empty because they predate runtime heap-admission publication.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl ArpCache {
@@ -484,6 +488,7 @@ impl ArpCache {
             pending_counters: PendingFrameCounters::default(),
             probe_ring: [None; ARP_PROBE_RING_SIZE],
             probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
+            _arc_heap_charge: None,
         }
     }
 
@@ -520,7 +525,15 @@ impl ArpCache {
             pending_counters: PendingFrameCounters::default(),
             probe_ring: [None; ARP_PROBE_RING_SIZE],
             probe_rate_limiter: TokenBucket::new(DEFAULT_PROBE_RATE_PPS, DEFAULT_PROBE_BURST),
+            _arc_heap_charge: None,
         }
+    }
+
+    /// Retain the exact-lifetime charge for the Arc that will own this cache.
+    pub fn retain_arc_heap_charge(mut self, charge: HeapCharge) -> Self {
+        debug_assert!(self._arc_heap_charge.is_none());
+        self._arc_heap_charge = Some(charge);
+        self
     }
 
     /// Look up a MAC address for the given IP.

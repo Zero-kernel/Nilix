@@ -1068,6 +1068,10 @@ pub struct NsByteBudget {
     used_bytes: AtomicU64,
     rejected: AtomicU64,
     closed: AtomicBool,
+    /// Optional charge for the retained `Arc<NsByteBudget>` allocation. The
+    /// charge lives in the Arc payload, so clones cannot outlive its ledger
+    /// ownership.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl NsByteBudget {
@@ -1077,7 +1081,16 @@ impl NsByteBudget {
             used_bytes: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            _arc_heap_charge: None,
         }
+    }
+
+    /// Attach the already-committed charge for the Arc allocation that will
+    /// own this value. Intended for fallible retained-object constructors.
+    pub fn retain_arc_heap_charge(mut self, charge: HeapCharge) -> Self {
+        debug_assert!(self._arc_heap_charge.is_none());
+        self._arc_heap_charge = Some(charge);
+        self
     }
 
     /// Reserve `bytes` against this budget, returning an RAII lease that

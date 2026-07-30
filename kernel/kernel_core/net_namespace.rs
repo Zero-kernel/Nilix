@@ -40,7 +40,7 @@ use cap::NamespaceId;
 use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use mm::HeapClass;
+use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
 use spin::{Mutex, RwLock};
 
 // D3-NETNS-DATAPLANE: per-namespace dataplane state (ARP cache) lives in the
@@ -342,6 +342,19 @@ pub struct NetNamespace {
     /// Tiny inline `Copy` value behind a leaf mutex — no heap, no
     /// `config_budget` interaction.
     net_config: Mutex<Option<net::NetConfigSnapshot>>,
+
+    /// RF186-2: exact-lifetime charge for this namespace's Arc allocation.
+    /// Root is constructed before runtime admission is published and stores
+    /// `None`; every user-reachable child stores `Some`.
+    _arc_heap_charge: Option<HeapCharge>,
+}
+
+fn reserve_netns_arc_charge<T>() -> Result<HeapCharge, NetNsError> {
+    let bytes = arc_charge_bytes::<T>().map_err(|_| NetNsError::OutOfMemory)?;
+    try_reserve_heap(HeapClass::NetnsConfig, bytes)
+        .map_err(|_| NetNsError::OutOfMemory)?
+        .commit()
+        .map_err(|_| NetNsError::OutOfMemory)
 }
 
 impl fmt::Debug for NetNamespace {
@@ -380,6 +393,7 @@ impl NetNamespace {
             // ns_net_config hook delegates ns 0 to the net crate's global
             // config (single authority, see the field doc).
             net_config: Mutex::new(None),
+            _arc_heap_charge: None,
         }
     }
 
@@ -425,17 +439,27 @@ impl NetNamespace {
 
         // D3 NETNS-SUBBUDGET-1: per-child config budget, created before the
         // child so the cache can hold its clone from birth.
-        let config_budget = Arc::try_new(mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES))
-            .map_err(|_| NetNsError::OutOfMemory)?;
+        let config_budget_charge = reserve_netns_arc_charge::<mm::NsByteBudget>()?;
+        let config_budget = Arc::try_new(
+            mm::NsByteBudget::new(NETNS_CONFIG_BUDGET_BYTES)
+                .retain_arc_heap_charge(config_budget_charge),
+        )
+        .map_err(|_| NetNsError::OutOfMemory)?;
 
         // D3-NETNS-DATAPLANE: bounded per-ns cache (256 entries), entry storage
         // dual-leased against the NetnsConfig class ceiling AND this namespace's
         // config budget.
-        let arp_cache = Arc::try_new(Mutex::new(ArpCache::with_defaults_budgeted(
-            mm::HeapClass::NetnsConfig,
-            Arc::clone(&config_budget),
-        )))
+        let arp_cache_charge = reserve_netns_arc_charge::<Mutex<ArpCache>>()?;
+        let arp_cache = Arc::try_new(Mutex::new(
+            ArpCache::with_defaults_budgeted(
+                mm::HeapClass::NetnsConfig,
+                Arc::clone(&config_budget),
+            )
+            .retain_arc_heap_charge(arp_cache_charge),
+        ))
         .map_err(|_| NetNsError::OutOfMemory)?;
+
+        let namespace_charge = reserve_netns_arc_charge::<NetNamespace>()?;
 
         let child = Self {
             id: NamespaceId::new(id),
@@ -452,6 +476,7 @@ impl NetNamespace {
             // parent's IP/MAC is exactly the identity-borrowing class the
             // per-ns config exists to close.
             net_config: Mutex::new(None),
+            _arc_heap_charge: Some(namespace_charge),
         };
 
         // Count ownership transfers to NetNamespace::drop before Arc allocation.
@@ -854,9 +879,7 @@ pub fn move_device(
     to: &Arc<NetNamespace>,
 ) -> Result<(), NetNsError> {
     // R75-3 FIX: Security check - require CAP_NET_ADMIN (mapped to ADMIN) or root
-    let has_cap_admin =
-        crate::process::with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
-            .unwrap_or(false);
+    let has_cap_admin = crate::process::current_has_cap_rights(cap::CapRights::ADMIN);
     // R133-1 FIX: Host-global gates must check host-mapped identity.
     // Fail-closed: if we can't determine host identity, assume non-root.
     let is_root = crate::current_is_host_root();
