@@ -20,7 +20,8 @@ pub mod transport;
 
 pub use queue::VirtQueue;
 pub use transport::{
-    MmioTransport, VirtioPciAddrs, VirtioPciCommonCfg, VirtioPciTransport, VirtioTransport,
+    MmioTransport, VirtioPciAddrs, VirtioPciBarWindow, VirtioPciCommonCfg, VirtioPciTransport,
+    VirtioPciWindowAccess, VirtioTransport,
 };
 
 use core::sync::atomic::{fence, Ordering};

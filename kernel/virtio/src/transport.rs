@@ -298,10 +298,14 @@ impl VirtioTransport {
                 // R186-6: the write is a `*mut u16`; an odd offset would be an
                 // unaligned MMIO access. `notify_off_multiplier` is device-supplied
                 // and need not be even.
-                if offset_bytes % 2 != 0 {
+                let Some(notify_addr) = (t.notify_base as usize).checked_add(offset_bytes as usize)
+                else {
+                    return;
+                };
+                if notify_addr % core::mem::align_of::<u16>() != 0 {
                     return;
                 }
-                let notify_ptr = t.notify_base.add(offset_bytes as usize) as *mut u16;
+                let notify_ptr = notify_addr as *mut u16;
                 write_volatile(notify_ptr, queue);
                 // Memory barrier after notify
                 fence(Ordering::SeqCst);
@@ -446,6 +450,105 @@ impl MmioTransport {
 // PCI Transport
 // ============================================================================
 
+/// A VirtIO PCI capability window bound to the exact sized BAR that authorizes
+/// its CPU mapping.
+///
+/// Construction rejects a capability unless both its byte range and the full
+/// page-rounded range that the kernel page table must map are contained in the
+/// same BAR. This prevents a sub-page capability at a BAR edge from granting
+/// access to adjacent RAM or another device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtioPciWindowAccess {
+    Common,
+    Notify,
+    Isr,
+    Device,
+}
+
+impl VirtioPciWindowAccess {
+    const fn required_alignment(self) -> u64 {
+        match self {
+            Self::Common => core::mem::align_of::<VirtioPciCommonCfg>() as u64,
+            Self::Notify => core::mem::align_of::<u16>() as u64,
+            Self::Isr | Self::Device => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct VirtioPciBarWindow {
+    phys: u64,
+    len: u32,
+    bar_base: u64,
+    bar_len: u64,
+}
+
+impl VirtioPciBarWindow {
+    const PAGE_MASK: u64 = 0xFFF;
+
+    pub fn try_new(
+        bar_base: u64,
+        bar_len: u64,
+        offset: u64,
+        len: u32,
+        access: VirtioPciWindowAccess,
+    ) -> Option<Self> {
+        if bar_base == 0 || bar_len == 0 || len == 0 {
+            return None;
+        }
+        let access_align = access.required_alignment();
+        let bar_end = bar_base.checked_add(bar_len)?;
+        let phys = bar_base.checked_add(offset)?;
+        let end = phys.checked_add(u64::from(len))?;
+        if end > bar_end || phys & (access_align - 1) != 0 {
+            return None;
+        }
+
+        let page_start = phys & !Self::PAGE_MASK;
+        let page_end = end.checked_add(Self::PAGE_MASK)? & !Self::PAGE_MASK;
+        if page_start < bar_base || page_end > bar_end || page_start >= page_end {
+            return None;
+        }
+
+        Some(Self {
+            phys,
+            len,
+            bar_base,
+            bar_len,
+        })
+    }
+
+    pub const fn is_present(self) -> bool {
+        self.phys != 0 && self.len != 0 && self.bar_base != 0 && self.bar_len != 0
+    }
+
+    pub const fn phys(self) -> u64 {
+        self.phys
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn page_cover(self) -> Option<(u64, u64)> {
+        if !self.is_present() {
+            return None;
+        }
+        let bar_end = self.bar_base.checked_add(self.bar_len)?;
+        let end = self.phys.checked_add(u64::from(self.len))?;
+        let page_start = self.phys & !Self::PAGE_MASK;
+        let page_end = end.checked_add(Self::PAGE_MASK)? & !Self::PAGE_MASK;
+        if page_start < self.bar_base || page_end > bar_end || page_start >= page_end {
+            return None;
+        }
+        Some((page_start, page_end - page_start))
+    }
+}
+
 /// Parsed PCI capability addresses for virtio-pci modern transport.
 ///
 /// These addresses are obtained by parsing the PCI capability list
@@ -454,28 +557,16 @@ impl MmioTransport {
 pub struct VirtioPciAddrs {
     /// VirtIO device type from PCI subsystem ID (e.g., 2 for block device)
     pub virtio_device_type: u16,
-    /// Common configuration structure physical address
-    pub common_cfg: u64,
-    /// R186-6: common-cfg window length (bytes), proven inside its BAR.
-    pub common_cfg_len: u32,
-    /// Notification structure base physical address
-    pub notify_base: u64,
-    /// Notification capability length (bytes) for bounds checking
-    pub notify_len: u32,
+    /// Common configuration window and its BAR authority.
+    pub common_cfg: VirtioPciBarWindow,
+    /// Notification window and its BAR authority.
+    pub notify: VirtioPciBarWindow,
     /// Notify offset multiplier (from notify capability)
     pub notify_off_multiplier: u32,
-    /// ISR status register physical address
-    pub isr: u64,
-    /// R186-6: ISR window length (bytes), proven inside its BAR.
-    pub isr_len: u32,
-    /// Device-specific configuration physical address
-    pub device_cfg: u64,
-    /// R186-6: device-cfg window length (bytes), proven inside its BAR.
-    ///
-    /// Carried so `read_config_bytes` can bound its reads. Previously the driver
-    /// read `size_of::<T>()` bytes from a pointer with no recorded extent, and the
-    /// mapped span was a hardcoded 16-byte guess.
-    pub device_cfg_len: u32,
+    /// ISR status-register window and its BAR authority.
+    pub isr: VirtioPciBarWindow,
+    /// Device-specific configuration window and its BAR authority.
+    pub device_cfg: VirtioPciBarWindow,
 }
 
 /// virtio-pci common configuration structure (VirtIO 1.1+).
@@ -564,35 +655,150 @@ impl VirtioPciTransport {
         // length means the capability walk did not prove containment in a sized
         // BAR, so the address must not become a mapped pointer.
         if addrs.virtio_device_type == 0
-            || addrs.common_cfg == 0
-            || addrs.notify_base == 0
-            || addrs.device_cfg == 0
-            || addrs.notify_len < 2
-            || addrs.common_cfg_len == 0
-            || addrs.device_cfg_len == 0
+            || !addrs.common_cfg.is_present()
+            || !addrs.notify.is_present()
+            || !addrs.device_cfg.is_present()
+            || addrs.notify.len() < 2
+            || addrs.common_cfg.phys() % (core::mem::align_of::<VirtioPciCommonCfg>() as u64) != 0
+            || addrs.notify.phys() % (core::mem::align_of::<u16>() as u64) != 0
         {
             return None;
         }
 
-        // Use wrapping_add for offset calculation
-        let common_cfg = addrs.common_cfg.wrapping_add(virt_offset) as *mut VirtioPciCommonCfg;
-        let notify_base = addrs.notify_base.wrapping_add(virt_offset) as *mut u8;
-        let isr = if addrs.isr != 0 {
-            addrs.isr.wrapping_add(virt_offset) as *mut u8
+        let common_addr = addrs.common_cfg.phys().checked_add(virt_offset)?;
+        let notify_addr = addrs.notify.phys().checked_add(virt_offset)?;
+        if common_addr % (core::mem::align_of::<VirtioPciCommonCfg>() as u64) != 0
+            || notify_addr % (core::mem::align_of::<u16>() as u64) != 0
+        {
+            return None;
+        }
+        let common_cfg = common_addr as *mut VirtioPciCommonCfg;
+        let notify_base = notify_addr as *mut u8;
+        let isr = if addrs.isr.is_present() {
+            addrs.isr.phys().checked_add(virt_offset)? as *mut u8
         } else {
             core::ptr::null_mut()
         };
-        let device_cfg = addrs.device_cfg.wrapping_add(virt_offset) as *mut u8;
+        let device_cfg = addrs.device_cfg.phys().checked_add(virt_offset)? as *mut u8;
 
         Some(Self {
             virtio_device_type: addrs.virtio_device_type as u32,
             common_cfg,
             notify_base,
-            notify_len: addrs.notify_len,
+            notify_len: addrs.notify.len(),
             notify_off_multiplier: addrs.notify_off_multiplier,
             isr,
             device_cfg,
-            device_cfg_len: addrs.device_cfg_len,
+            device_cfg_len: addrs.device_cfg.len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VirtioPciAddrs, VirtioPciBarWindow, VirtioPciTransport, VirtioPciWindowAccess};
+
+    #[test]
+    fn pci_bar_window_requires_page_cover_inside_aperture() {
+        let valid =
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 0x120, 0x80, VirtioPciWindowAccess::Common)
+                .expect("capability and page cover are within BAR");
+        assert_eq!(valid.phys(), 0x4120);
+        assert_eq!(valid.page_cover(), Some((0x4000, 0x1000)));
+
+        assert!(
+            VirtioPciBarWindow::try_new(0x4800, 0x1800, 0, 0x10, VirtioPciWindowAccess::Device,)
+                .is_none(),
+            "page rounding before a non-aligned BAR must fail closed"
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(
+                0x4000,
+                0x1800,
+                0x1700,
+                0x10,
+                VirtioPciWindowAccess::Device,
+            )
+            .is_none(),
+            "page rounding beyond the BAR tail must fail closed"
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(
+                u64::MAX - 0x1000,
+                0x2000,
+                0,
+                4,
+                VirtioPciWindowAccess::Device,
+            )
+            .is_none(),
+            "BAR arithmetic overflow must fail closed"
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 1, 0x80, VirtioPciWindowAccess::Common,)
+                .is_none(),
+            "misaligned typed MMIO authority must fail closed"
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 1, 0x80, VirtioPciWindowAccess::Notify,)
+                .is_none(),
+            "misaligned notify authority must fail closed"
+        );
+
+        assert!(VirtioPciBarWindow::try_new(
+            0x4000,
+            0x2000,
+            4,
+            0x80,
+            VirtioPciWindowAccess::Common,
+        )
+        .is_none());
+        assert!(VirtioPciBarWindow::try_new(
+            0x4000,
+            0x2000,
+            8,
+            0x80,
+            VirtioPciWindowAccess::Common,
+        )
+        .is_some());
+        assert!(
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 2, 2, VirtioPciWindowAccess::Notify,)
+                .is_some()
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 1, 1, VirtioPciWindowAccess::Isr,)
+                .is_some()
+        );
+        assert!(
+            VirtioPciBarWindow::try_new(0x4000, 0x2000, 3, 1, VirtioPciWindowAccess::Device,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pci_transport_rejects_misaligned_final_virtual_addresses() {
+        let common_cfg =
+            VirtioPciBarWindow::try_new(0x4000, 0x1000, 0, 0x80, VirtioPciWindowAccess::Common)
+                .expect("aligned common capability");
+        let notify =
+            VirtioPciBarWindow::try_new(0x5000, 0x1000, 0, 2, VirtioPciWindowAccess::Notify)
+                .expect("aligned notify capability");
+        let device_cfg =
+            VirtioPciBarWindow::try_new(0x6000, 0x1000, 0, 8, VirtioPciWindowAccess::Device)
+                .expect("byte device capability");
+        let addrs = VirtioPciAddrs {
+            virtio_device_type: 1,
+            common_cfg,
+            notify,
+            notify_off_multiplier: 2,
+            isr: VirtioPciBarWindow::default(),
+            device_cfg,
+        };
+
+        let backing = [0u64; 1536];
+        let virt_offset = (backing.as_ptr() as u64)
+            .checked_sub(0x4000)
+            .expect("test buffer address exceeds synthetic physical base")
+            + 1;
+        assert!(unsafe { VirtioPciTransport::from_addrs(addrs, virt_offset) }.is_none());
     }
 }
