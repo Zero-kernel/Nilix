@@ -449,30 +449,27 @@ impl CgroupDirInode {
         Err(FsError::NotFound)
     }
 
-    /// Get control files available for this cgroup
-    ///
-    /// S-6: the `collect()` below is structurally bounded — the iterator is a
-    /// filter over `CtrlKind::all()` (a fixed compile-time enum array), so the
-    /// allocation is capped at `CtrlKind::all().len()` entries regardless of
-    /// user input. Not user-growable; exempt from the infallible-collect debt.
-    fn available_ctrl_files(&self) -> Vec<CtrlKind> {
-        let cgroup = match cgroup::lookup_cgroup(self.cgroup_id) {
-            Some(cg) => cg,
-            None => return Vec::new(),
-        };
+    /// Select one visible control file and count the complete fixed enum set
+    /// without allocating. RF186-5: `readdir` must remain operational under
+    /// heap exhaustion; even a bounded `collect()` can invoke the OOM handler.
+    fn available_ctrl_file_at(&self, target: usize) -> Result<(Option<CtrlKind>, usize), FsError> {
+        let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let controllers = cgroup.controllers();
-
-        CtrlKind::all()
-            .iter()
-            .filter(|kind| {
-                match kind.required_controller() {
-                    Some(req) => controllers.contains(req),
-                    None => true, // Always available (cgroup.procs, etc.)
-                }
-            })
-            .copied()
-            // lint-fallible: BOUNDED(CtrlKind::all() is a fixed compile-time enum set)
-            .collect()
+        let mut selected = None;
+        let mut visible = 0usize;
+        for kind in CtrlKind::all().iter().copied() {
+            let enabled = kind
+                .required_controller()
+                .map_or(true, |required| controllers.contains(required));
+            if !enabled {
+                continue;
+            }
+            if visible == target {
+                selected = Some(kind);
+            }
+            visible += 1;
+        }
+        Ok((selected, visible))
     }
 }
 
@@ -523,12 +520,10 @@ impl Inode for CgroupDirInode {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
-        let ctrl_files = self.available_ctrl_files();
-        let ctrl_count = ctrl_files.len();
+        let (ctrl_file, ctrl_count) = self.available_ctrl_file_at(offset)?;
 
         // First, list control files
-        if offset < ctrl_count {
-            let kind = ctrl_files[offset];
+        if let Some(kind) = ctrl_file {
             return Ok(Some((
                 offset + 1,
                 DirEntry {
@@ -722,10 +717,7 @@ impl CgroupCtrlInode {
         let is_root = kernel_core::current_is_host_root();
         let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let is_delegate = !is_root && cgroup.is_delegated_to(euid);
-        let has_cap_admin = kernel_core::with_current_cap_table(|tbl| {
-            tbl.has_rights(kernel_core::CapRights::ADMIN)
-        })
-        .unwrap_or(false);
+        let has_cap_admin = kernel_core::current_has_cap_rights(kernel_core::CapRights::ADMIN);
 
         // RF180-2 FIX: root, CAP_SYS_ADMIN, and delegation are a union of
         // independent grants.  The old outer gate rejected CAP-only callers
@@ -1429,16 +1421,23 @@ pub fn run_cgroupfs_j2_abi_self_test() {
         ino: cgroup_dir_ino(cg2_id),
         cgroup_id: cg2_id,
     };
-    let avail = dir.available_ctrl_files();
+    let has_visible = |wanted| {
+        (0..CtrlKind::all().len()).any(|index| {
+            dir.available_ctrl_file_at(index)
+                .ok()
+                .and_then(|(kind, _)| kind)
+                == Some(wanted)
+        })
+    };
     assert!(
-        avail.contains(&CtrlKind::FilesMax),
+        has_visible(CtrlKind::FilesMax),
         "cgroupfs: files.max must be visible under the FILES controller"
     );
     // ports.max must be hidden when the NET controller is absent (robust to
     // whatever controller set create_cgroup grants the child).
     if !cg2.controllers().contains(CgroupControllers::NET) {
         assert!(
-            !avail.contains(&CtrlKind::PortsMax),
+            !has_visible(CtrlKind::PortsMax),
             "cgroupfs: ports.max must be hidden without the NET controller"
         );
     }

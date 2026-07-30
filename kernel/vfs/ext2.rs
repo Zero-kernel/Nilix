@@ -10030,25 +10030,25 @@ impl Inode for Ext2Inode {
                 let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
                 let name = fallible_lossy_name(name_bytes)?;
 
-                let file_type = match head.file_type {
-                    // R134-6 FIX: EXT2_FT_UNKNOWN — fall back to inode mode
-                    // when the filetype feature is absent.  Without this,
-                    // legacy ext2 images report everything as Regular.
-                    0 => {
-                        match fs.read_inode_raw(head.inode) {
-                            Ok(raw_inode) => match raw_inode.mode & EXT2_S_IFMT {
-                                EXT2_S_IFREG => FileType::Regular,
-                                EXT2_S_IFDIR => FileType::Directory,
-                                EXT2_S_IFLNK => FileType::Symlink,
-                                0x2000 => FileType::CharDevice, // S_IFCHR
-                                0x6000 => FileType::BlockDevice, // S_IFBLK
-                                0x1000 => FileType::Fifo,       // S_IFIFO
-                                0xC000 => FileType::Socket,     // S_IFSOCK
-                                _ => FileType::Regular,
-                            },
-                            Err(_) => FileType::Regular,
-                        }
-                    }
+                // RF186-5: one allocation-bound gate for every live dirent.
+                // `read_inode_raw` first proves the bitmap bit, then loads the
+                // inode. Deriving the type from mode also prevents a crafted
+                // known d_type from contradicting the authoritative inode.
+                let raw_inode = fs.read_inode_raw(head.inode)?;
+                let actual_type = match raw_inode.mode & EXT2_S_IFMT {
+                    EXT2_S_IFREG => FileType::Regular,
+                    EXT2_S_IFDIR => FileType::Directory,
+                    EXT2_S_IFLNK => FileType::Symlink,
+                    0x2000 => FileType::CharDevice,
+                    0x6000 => FileType::BlockDevice,
+                    0x1000 => FileType::Fifo,
+                    0xC000 => FileType::Socket,
+                    _ => return Err(FsError::Invalid),
+                };
+
+                let advertised_type = match head.file_type {
+                    // EXT2_FT_UNKNOWN trusts the allocation-bound inode mode.
+                    0 => actual_type,
                     EXT2_FT_REG_FILE => FileType::Regular,
                     EXT2_FT_DIR => FileType::Directory,
                     EXT2_FT_SYMLINK => FileType::Symlink,
@@ -10060,6 +10060,10 @@ impl Inode for Ext2Inode {
                     EXT2_FT_SOCK => FileType::Socket,
                     _ => return Err(FsError::Invalid),
                 };
+                if advertised_type != actual_type {
+                    return Err(FsError::Invalid);
+                }
+                let file_type = actual_type;
 
                 // R165-21 FIX: return the byte offset of the NEXT record as the
                 // resume cookie; the next call starts exactly here.
