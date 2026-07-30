@@ -11748,11 +11748,13 @@ impl SocketTable {
                     }
                 }
 
-                // R186-5 FIX: SYN_SENT deadline — see the identical arm in
+                // R186-5/RF186-3: active-open deadline — see the identical arm in
                 // `run_tcp_timers_blocking` for the full rationale. Both sweeps must
                 // carry it: whichever one runs must be able to reap an active open
-                // whose SYN was parked-and-dropped on the ARP queue, or simply lost.
-                if tcp_state.control.state == TcpState::SynSent {
+                // whose SYN was parked-and-dropped, simply lost, or moved into
+                // SYN-RECEIVED by a bare simultaneous-open SYN. Passive listener
+                // children are owned exclusively by the listener SYN-queue timer.
+                if tcp_state.control.active_open_needs_timeout() {
                     let started = tcp_state.control.last_activity;
                     if started == 0 {
                         tcp_state.control.last_activity = current_time_ms;
@@ -12174,7 +12176,7 @@ impl SocketTable {
                     }
                 }
 
-                // R186-5 FIX: give SYN_SENT a durable timeout owner.
+                // R186-5/RF186-3: give every active handshake a durable timeout owner.
                 //
                 // `SYN_SENT` was the one active state with NO timer at all. The
                 // initial SYN is never placed in `send_buffer`, so the data
@@ -12199,13 +12201,15 @@ impl SocketTable {
                 //
                 // A timeout here is the durable owner the state machine requires,
                 // and it closes both paths with one mechanism rather than patching
-                // each parked-frame terminal: however a socket arrives in SYN_SENT,
-                // it now has a deadline. `last_activity` is stamped when SYN_SENT is
-                // published (`TcpReplyOperation::commit`), so the deadline starts at
-                // acceptance. Reaching it tears the connection down and marks it
+                // each parked-frame terminal. RF186-3 extends the same ownership
+                // through simultaneous-open SYN-RECEIVED when `passive_open` is
+                // false; listener children remain under the SYN queue's timer.
+                // `last_activity` is stamped when SYN_SENT is published and is
+                // preserved across the simultaneous-open transition. Reaching the
+                // deadline tears the connection down and marks it
                 // timed-out, which releases every charge and makes the failure
                 // observable to poll/select instead of hanging silently.
-                if tcp_state.control.state == TcpState::SynSent {
+                if tcp_state.control.active_open_needs_timeout() {
                     let started = tcp_state.control.last_activity;
                     if started == 0 {
                         tcp_state.control.last_activity = current_time_ms;
@@ -14322,7 +14326,7 @@ mod tests {
     }
 
     #[test]
-    fn rf180_25_all_five_timer_cleanup_kinds_roll_back_on_worklist_oom() {
+    fn rf186_3_all_timer_cleanup_kinds_roll_back_on_worklist_oom() {
         let mut completed_cases = 0usize;
         assert_timer_cleanup_reserve_failure_is_retryable(TcpState::TimeWait, true, |tcb| {
             tcb.time_wait_start = 1;
@@ -14350,7 +14354,17 @@ mod tests {
             tcb.last_activity = 1;
         });
         completed_cases += 1;
-        assert_eq!(completed_cases, 5, "all timer cleanup classes must execute");
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::SynSent, false, |tcb| {
+            tcb.last_activity = 1;
+            tcb.passive_open = false;
+        });
+        completed_cases += 1;
+        assert_timer_cleanup_reserve_failure_is_retryable(TcpState::SynReceived, false, |tcb| {
+            tcb.last_activity = 1;
+            tcb.passive_open = false;
+        });
+        completed_cases += 1;
+        assert_eq!(completed_cases, 7, "all timer cleanup classes must execute");
     }
 
     #[test]

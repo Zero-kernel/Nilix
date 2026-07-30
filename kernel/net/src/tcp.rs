@@ -1134,6 +1134,15 @@ pub struct OooSegment {
 }
 
 impl TcpControlBlock {
+    /// True while a locally initiated handshake still owns the active-open
+    /// deadline. A bare peer SYN moves simultaneous open to SYN-RECEIVED, but
+    /// `passive_open` remains false; listener children set it true at birth.
+    #[inline]
+    pub(crate) fn active_open_needs_timeout(&self) -> bool {
+        self.state == TcpState::SynSent
+            || (self.state == TcpState::SynReceived && !self.passive_open)
+    }
+
     /// Create a new TCB for an outgoing connection (client)
     pub fn new_client(
         local_ip: Ipv4Addr,
@@ -3652,6 +3661,29 @@ mod tests {
         assert!(TcpState::Established.can_send());
         assert!(TcpState::Established.can_receive());
         assert!(!TcpState::TimeWait.can_receive());
+    }
+
+    #[test]
+    fn rf186_3_active_timeout_owns_simultaneous_open_but_not_passive_child() {
+        let local = Ipv4Addr::new(10, 0, 0, 1);
+        let remote = Ipv4Addr::new(10, 0, 0, 2);
+        let mut active = TcpControlBlock::new_client(local, 1000, remote, 2000, 1);
+
+        active.state = TcpState::SynSent;
+        assert!(active.active_open_needs_timeout());
+        active.state = TcpState::SynReceived;
+        assert!(!active.passive_open);
+        assert!(active.active_open_needs_timeout());
+        active.state = TcpState::Established;
+        assert!(!active.active_open_needs_timeout());
+
+        let passive = TcpControlBlock::new_server(local, 1000, remote, 2000, 1, 2);
+        assert_eq!(passive.state, TcpState::SynReceived);
+        assert!(passive.passive_open);
+        assert!(
+            !passive.active_open_needs_timeout(),
+            "listener SYN queue is the passive child's sole timeout owner"
+        );
     }
 
     #[test]
