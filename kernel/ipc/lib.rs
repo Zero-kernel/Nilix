@@ -66,41 +66,6 @@ pub use futex::{
 // 系统调用回调实现
 // ============================================================================
 
-/// U.S2-SLICE-3: cap-only rollback stage for a pipe cap that never got its fd
-/// installed (design-v3 Fix 1 single-decrement pattern + audit parity).
-///
-/// The generic teardown funnel (`remove_fd` → `decrement_fd_cap`) can only
-/// reach caps that an fd carries; a cap allocated but not (yet) fd-installed
-/// is unreachable from every funnel path, so the CREATE path itself must pay
-/// it back on error. Decrement ONCE; revoke only when that decrement reports
-/// refcount→0 (on this path the count is 1 by construction, but the pattern
-/// stays uniform and double-decrement-proof); emit the audit Revoke event
-/// (mirroring the sys_socket EMFILE rollback). NEVER call this for a cap
-/// whose fd was installed — that cap rolls back through `remove_fd` instead
-/// (CRITICAL-4/7: one owner per teardown edge, no double-decrement).
-///
-/// Lock context: called under the owning Process lock. CapTable is a leaf
-/// spinlock and `CapObject::Pipe` is plain data (revoke drops no `Arc`, fires
-/// no wakeups), so the in-lock revoke is side-effect-free (see
-/// `decrement_fd_cap`'s SLICE-3 caution note).
-fn revoke_uninstalled_pipe_cap(proc: &process::Process, cap_id: cap::CapId, ctx: &lsm::ProcessCtx) {
-    if let Ok(true) = proc.cap_table.decrement_refcount(cap_id) {
-        let _ = proc.cap_table.revoke(cap_id);
-        let subject =
-            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
-        let timestamp = kernel_core::get_ticks();
-        let _ = audit::emit_capability_event(
-            audit::AuditOutcome::Success,
-            subject,
-            cap_id.raw(),
-            audit::AuditCapOperation::Revoke,
-            None,
-            0,
-            timestamp,
-        );
-    }
-}
-
 /// 创建管道的系统调用回调
 ///
 /// 创建一个管道，分配两个文件描述符给当前进程
@@ -175,8 +140,14 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let alloc_result: Result<(i32, i32), SyscallError> = 'install: {
         let mut proc = process.lock(); // SINGLE lock acquisition (CRITICAL-1)
 
-        // LSM subject from the LOCKED proc's current creds (CRITICAL-3).
-        let proc_ctx = kernel_core::lsm_process_ctx_from(&proc);
+        // RF186-7/RF186-12: keep the exact credential identity read-locked
+        // through mediation and both cap/FD publications, and route every raw
+        // production-table mutation through the kernel-core broker.
+        let credentials = proc.shared_credentials();
+        let read_authorization = credentials
+            .try_begin_authorization()
+            .ok_or(kernel_core::SyscallError::EAGAIN)?;
+        let write_authorization = read_authorization.derive();
         let pipe_id = read_handle.as_ref().expect("private read handle").pipe_id();
 
         // Reserve both admitted FD-table slots and files.max charges before
@@ -194,23 +165,18 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
             break 'install Err(SyscallError::EMFILE);
         };
 
-        // Allocate BOTH caps before EITHER fd install (CRITICAL-6), each
-        // LSM-gated + audit-emitting (cap_allocate_with_lsm — the exact
-        // sys_socket composition: hook, allocate, audit Allocate).
-        let read_cap = match kernel_core::cap_allocate_with_lsm(
-            &proc.cap_table,
-            cap::CapEntry::new(
-                cap::CapObject::Pipe(cap::Pipe {
-                    pipe_id,
-                    end_type: cap::PipeEndType::Read,
-                }),
-                cap::CapRights::READ,
-            ),
-            Some(&proc_ctx),
+        // Reserve BOTH capability identities before either becomes visible.
+        // Each reservation owns its exact credential authorization and rolls
+        // back by RAII, so a second-reservation failure can never leave an
+        // orphaned first CapId or rely on arbitrary-id revocation.
+        let cap_authority = proc.capability_table_authority();
+        let read_capability = match kernel_core::prepare_process_cap_allocation_authorized(
+            &proc,
+            &cap_authority,
+            read_authorization,
         ) {
-            Ok(id) => id,
+            Ok(reservation) => reservation,
             Err(e) => {
-                // Nothing cap-allocated yet — both handles tear down outside.
                 assert!(proc.cancel_fd_reservation(write_fd));
                 assert!(proc.cancel_fd_reservation(read_fd));
                 rollback_outside[0] = read_handle.take();
@@ -218,22 +184,13 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
                 break 'install Err(e);
             }
         };
-        let write_cap = match kernel_core::cap_allocate_with_lsm(
-            &proc.cap_table,
-            cap::CapEntry::new(
-                cap::CapObject::Pipe(cap::Pipe {
-                    pipe_id,
-                    end_type: cap::PipeEndType::Write,
-                }),
-                cap::CapRights::WRITE,
-            ),
-            Some(&proc_ctx),
+        let write_capability = match kernel_core::prepare_process_cap_allocation_authorized(
+            &proc,
+            &cap_authority,
+            write_authorization,
         ) {
-            Ok(id) => id,
+            Ok(reservation) => reservation,
             Err(e) => {
-                // design-v3 Fix 1 (CRITICAL-4): the read cap is now an orphan
-                // (no fd will ever carry it) — cap-only rollback stage.
-                revoke_uninstalled_pipe_cap(&proc, read_cap, &proc_ctx);
                 assert!(proc.cancel_fd_reservation(write_fd));
                 assert!(proc.cancel_fd_reservation(read_fd));
                 rollback_outside[0] = read_handle.take();
@@ -241,6 +198,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
                 break 'install Err(e);
             }
         };
+        let read_cap = read_capability.cap_id();
+        let write_cap = write_capability.cap_id();
 
         // Attach the CapIds BEFORE install (CRITICAL-7: from the moment an fd
         // carries the cap, the remove_fd funnel is its ONLY teardown edge).
@@ -266,6 +225,28 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
             .unwrap_or_else(|_| panic!("reserved pipe read FD commit failed"));
         proc.install_reserved_fd(write_fd, write_descriptor)
             .unwrap_or_else(|_| panic!("reserved pipe write FD commit failed"));
+
+        // Both descriptor publications are complete and all remaining work is
+        // allocation-free. Publish both reserved capabilities, then audit both
+        // grants while their credential authorization tokens are still owned.
+        let read_grant = read_capability.install(cap::CapEntry::new(
+            cap::CapObject::Pipe(cap::Pipe {
+                pipe_id,
+                end_type: cap::PipeEndType::Read,
+            }),
+            cap::CapRights::READ,
+        ));
+        let write_grant = write_capability.install(cap::CapEntry::new(
+            cap::CapObject::Pipe(cap::Pipe {
+                pipe_id,
+                end_type: cap::PipeEndType::Write,
+            }),
+            cap::CapRights::WRITE,
+        ));
+        let audited_read_cap = read_grant.audit();
+        let audited_write_cap = write_grant.audit();
+        debug_assert_eq!(audited_read_cap, read_cap);
+        debug_assert_eq!(audited_write_cap, write_cap);
 
         Ok((read_fd, write_fd))
     };

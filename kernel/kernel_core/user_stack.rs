@@ -76,7 +76,7 @@ const USER_SPACE_TOP: u64 = 0x0000_8000_0000_0000;
 /// POD credential snapshot for the identity auxv entries
 /// (AT_UID / AT_EUID / AT_GID / AT_EGID / AT_SECURE).
 ///
-/// The CALLER takes this under a scoped `proc.credentials.read()` that is dropped
+/// The CALLER takes this under a scoped `proc.try_credentials_read()` guard that is dropped
 /// BEFORE [`build_initial_user_stack`] is called — the builder never touches the PCB
 /// or any lock.
 #[derive(Clone, Copy)]

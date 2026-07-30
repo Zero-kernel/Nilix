@@ -11,8 +11,8 @@ use crate::cgroup;
 use crate::fork::{cow_flag, cow_readonly_flag, PAGE_REF_COUNT};
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
-    current_net_ns_id, current_pid, get_process, terminate_self_and_halt, try_get_process,
-    wait_should_abort, with_current_cap_table, ProcessId, ProcessState,
+    current_has_cap_rights, current_net_ns_id, current_pid, get_process, terminate_self_and_halt,
+    try_get_process, wait_should_abort, ProcessId, ProcessState,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -3303,9 +3303,22 @@ fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {
 /// (ipc::pipe_create_callback) build the LSM subject from the SAME canonical
 /// constructor as the in-crate sites (sys_socket/sys_accept) — a locked-proc
 /// snapshot of the CURRENT credentials (CRITICAL-3: never VFS-cached values).
-pub fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
-    // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
-    let creds = proc.credentials.read();
+pub fn lsm_process_ctx_from(
+    proc: &crate::process::Process,
+) -> Result<lsm::ProcessCtx, SyscallError> {
+    let creds = proc.try_credentials_read().ok_or(SyscallError::EAGAIN)?;
+    Ok(lsm_process_ctx_from_credentials(proc, &creds))
+}
+
+/// Build an LSM subject from credentials whose read guard is already held.
+///
+/// R186 review-fix: authorization transactions use this form so the same
+/// credential state remains immutable through capability/FD publication.
+#[inline]
+pub fn lsm_process_ctx_from_credentials(
+    proc: &crate::process::Process,
+    creds: &crate::process::Credentials,
+) -> lsm::ProcessCtx {
     lsm::ProcessCtx::new(
         proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid,
     )
@@ -3329,7 +3342,10 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
     let (parent_ctx, child_ctx) = {
         let parent = parent_arc.lock();
         let child = child_arc.lock();
-        (lsm_process_ctx_from(&parent), lsm_process_ctx_from(&child))
+        (
+            lsm_process_ctx_from(&parent)?,
+            lsm_process_ctx_from(&child)?,
+        )
     };
 
     if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
@@ -3373,41 +3389,97 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
 /// U.S2-SLICE-3: `pub` — the pipe cap-install site (ipc::pipe_create_callback)
 /// allocates both pipe-end caps through this same LSM-gated, audit-emitting
 /// composition instead of hand-rolling the hook/allocate/audit sequence.
-pub fn cap_allocate_with_lsm(
-    cap_table: &cap::CapTable,
-    entry: cap::CapEntry,
-    proc_ctx: Option<&lsm::ProcessCtx>,
-) -> Result<cap::CapId, SyscallError> {
-    // Create a placeholder CapId for LSM check (will be replaced by actual ID)
-    let placeholder_id = cap::CapId::INVALID;
+/// Opaque two-phase capability mint. The reservation owns the authorization
+/// token and canonical LSM subject, so callers cannot mix a subject from one
+/// process with another process's capability table or outlive the credential
+/// state that was mediated.
+pub struct AuthorizedCapReservation<'a> {
+    capability: cap::PreparedCapAllocation<'a>,
+    proc_ctx: lsm::ProcessCtx,
+    _authorization: crate::process::CredentialAuthorization,
+}
 
-    // LSM hook: check permission before allocation
-    if let Some(ctx) = proc_ctx {
-        if let Err(err) = lsm::hook_task_cap_modify(ctx, placeholder_id, lsm::cap_op::ALLOCATE) {
-            return Err(lsm_error_to_syscall(err));
+impl<'a> AuthorizedCapReservation<'a> {
+    pub(crate) fn new(
+        capability: cap::PreparedCapAllocation<'a>,
+        proc_ctx: lsm::ProcessCtx,
+        authorization: crate::process::CredentialAuthorization,
+    ) -> Self {
+        Self {
+            capability,
+            proc_ctx,
+            _authorization: authorization,
         }
     }
 
-    // Perform the allocation
-    let cap_id = cap_table.allocate(entry).map_err(cap_error_to_syscall)?;
-
-    // Emit audit event on success
-    if let Some(ctx) = proc_ctx {
-        let subject =
-            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
-        let timestamp = crate::time::get_ticks();
-        let _ = audit::emit_capability_event(
-            audit::AuditOutcome::Success,
-            subject,
-            cap_id.raw(),
-            audit::AuditCapOperation::Allocate,
-            None,
-            0,
-            timestamp,
-        );
+    #[inline]
+    pub fn cap_id(&self) -> cap::CapId {
+        self.capability.cap_id()
     }
 
-    Ok(cap_id)
+    #[inline]
+    fn process_context(&self) -> &lsm::ProcessCtx {
+        &self.proc_ctx
+    }
+
+    pub fn install(self, entry: cap::CapEntry) -> AuthorizedCapGrant {
+        let Self {
+            capability,
+            proc_ctx,
+            _authorization,
+        } = self;
+        let cap_id = capability.install(entry);
+        AuthorizedCapGrant {
+            cap_id,
+            proc_ctx,
+            _authorization,
+            audited: false,
+        }
+    }
+}
+
+/// Cross-crate broker entry point. The capability-table authority is obtained
+/// from the exact locked Process and never exposed to the caller; the returned
+/// reservation still owns the credential authorization through publication.
+fn prepare_cap_allocation_authorized<'a>(
+    process: &crate::process::Process,
+    authority: &'a crate::process::CapabilityTableAuthority,
+    authorization: crate::process::CredentialAuthorization,
+) -> Result<AuthorizedCapReservation<'a>, SyscallError> {
+    process.prepare_capability_allocation_authorized(authority, authorization)
+}
+
+pub fn prepare_process_cap_allocation_authorized<'a>(
+    process: &crate::process::Process,
+    authority: &'a crate::process::CapabilityTableAuthority,
+    authorization: crate::process::CredentialAuthorization,
+) -> Result<AuthorizedCapReservation<'a>, SyscallError> {
+    prepare_cap_allocation_authorized(process, authority, authorization)
+}
+
+#[must_use = "installed capability grants must complete allocation audit"]
+pub struct AuthorizedCapGrant {
+    cap_id: cap::CapId,
+    proc_ctx: lsm::ProcessCtx,
+    _authorization: crate::process::CredentialAuthorization,
+    audited: bool,
+}
+
+impl AuthorizedCapGrant {
+    pub fn audit(mut self) -> cap::CapId {
+        emit_cap_allocate_audit(&self.proc_ctx, self.cap_id);
+        self.audited = true;
+        self.cap_id
+    }
+}
+
+impl Drop for AuthorizedCapGrant {
+    fn drop(&mut self) {
+        if !self.audited {
+            emit_cap_allocate_audit(&self.proc_ctx, self.cap_id);
+            self.audited = true;
+        }
+    }
 }
 
 /// Revoke a capability with LSM check and audit logging.
@@ -3431,33 +3503,33 @@ pub fn cap_allocate_with_lsm(
 fn cap_revoke_with_lsm(
     cap_table: &cap::CapTable,
     cap_id: cap::CapId,
-    proc_ctx: Option<&lsm::ProcessCtx>,
+    proc_ctx: &lsm::ProcessCtx,
 ) -> Result<cap::CapEntry, SyscallError> {
     // LSM hook: check permission before revocation
-    if let Some(ctx) = proc_ctx {
-        if let Err(err) = lsm::hook_task_cap_modify(ctx, cap_id, lsm::cap_op::REVOKE) {
-            return Err(lsm_error_to_syscall(err));
-        }
+    if let Err(err) = lsm::hook_task_cap_modify(proc_ctx, cap_id, lsm::cap_op::REVOKE) {
+        return Err(lsm_error_to_syscall(err));
     }
 
     // Perform the revocation
     let entry = cap_table.revoke(cap_id).map_err(cap_error_to_syscall)?;
 
     // Emit audit event on success
-    if let Some(ctx) = proc_ctx {
-        let subject =
-            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
-        let timestamp = crate::time::get_ticks();
-        let _ = audit::emit_capability_event(
-            audit::AuditOutcome::Success,
-            subject,
-            cap_id.raw(),
-            audit::AuditCapOperation::Revoke,
-            None,
-            0,
-            timestamp,
-        );
-    }
+    let subject = audit::AuditSubject::new(
+        proc_ctx.pid as u32,
+        proc_ctx.uid,
+        proc_ctx.gid,
+        proc_ctx.cap.map(|c| c.raw()),
+    );
+    let timestamp = crate::time::get_ticks();
+    let _ = audit::emit_capability_event(
+        audit::AuditOutcome::Success,
+        subject,
+        cap_id.raw(),
+        audit::AuditCapOperation::Revoke,
+        None,
+        0,
+        timestamp,
+    );
 
     Ok(entry)
 }
@@ -4234,6 +4306,7 @@ fn sys_fork() -> SyscallResult {
                 ForkError::CgroupPidsLimitExceeded
                 | ForkError::CgroupFilesLimitExceeded
                 | ForkError::MmapTransientState
+                | ForkError::CredentialBusy
                 | ForkError::SchedulerAdmissionFailed => Err(SyscallError::EAGAIN),
                 ForkError::SecurityDenied => Err(SyscallError::EPERM),
                 ForkError::NamespaceTranslationFailed => Err(SyscallError::EFAULT),
@@ -4300,6 +4373,35 @@ const NON_VM_INCOMPATIBLE: u64 = CLONE_NEWNS
     | CLONE_SIGHAND
     | CLONE_THREAD;
 
+const SUPPORTED_CLONE_FLAGS: u64 = CLONE_VM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_CHILD_SETTID
+    | CLONE_NEWPID
+    | CLONE_NEWNS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWUSER;
+
+#[inline]
+fn clone_flags_supported(flags: u64) -> bool {
+    flags & !SUPPORTED_CLONE_FLAGS == 0
+}
+
+#[cfg(test)]
+mod rf186_clone_contract_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_sharing_flags_fail_closed() {
+        for flag in [CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD] {
+            assert!(!clone_flags_supported(CLONE_VM | flag));
+        }
+        assert!(clone_flags_supported(CLONE_VM | CLONE_SETTLS));
+    }
+}
+
 /// sys_clone - 创建线程/轻量级进程
 ///
 /// 根据 flags 创建新的执行上下文，支持共享地址空间（线程）或独立地址空间（进程）。
@@ -4336,24 +4438,19 @@ fn sys_clone(
     let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
 
     // 支持的 flags
-    let supported_flags = CLONE_VM
-        | CLONE_FS
-        | CLONE_FILES
-        | CLONE_SIGHAND
-        | CLONE_THREAD
-        | CLONE_SETTLS
-        | CLONE_PARENT_SETTID
-        | CLONE_CHILD_CLEARTID
-        | CLONE_CHILD_SETTID
-        | CLONE_NEWPID   // F.1: PID namespace support
-        | CLONE_NEWNS    // F.1: Mount namespace support
-        | CLONE_NEWIPC   // F.1: IPC namespace support
-        | CLONE_NEWNET   // F.1: Network namespace support
-        | CLONE_NEWUSER; // F.1: User namespace support
+    // RF186 review-fix: CLONE_FS/FILES/SIGHAND are not accepted until their
+    // state is carried by true shared ownership objects. The former VM path
+    // deep-copied descriptor and signal tables and copied umask while returning
+    // success, silently violating the caller's isolation contract. CLONE_THREAD
+    // necessarily depends on CLONE_SIGHAND (and real pthread callers also use
+    // FILES/FS), so advertising it while those semantics are absent is equally
+    // unsafe. Plain CLONE_VM remains supported with explicitly independent
+    // non-VM state.
+    let supported_flags = SUPPORTED_CLONE_FLAGS;
 
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
-    if flags & !supported_flags != 0 {
+    if !clone_flags_supported(flags) {
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         kprintln!(
             "sys_clone: unsupported flags 0x{:x}",
@@ -4412,8 +4509,7 @@ fn sys_clone(
     // the gates on CLONE_NEWNS/NEWIPC/NEWNET. Previously ungated, allowing
     // unprivileged PID namespace creation and quota exhaustion.
     if flags & CLONE_NEWPID != 0 && !creating_user_ns {
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
         let is_root = crate::current_is_host_root();
         if !is_root && !has_cap_admin {
             kprintln!("[sys_clone] CLONE_NEWPID denied: requires CAP_SYS_ADMIN or root");
@@ -4430,8 +4526,7 @@ fn sys_clone(
 
     // F.1 Security: CLONE_NEWNS requires CAP_SYS_ADMIN (CapRights::ADMIN) or root
     if flags & CLONE_NEWNS != 0 && !creating_user_ns {
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         // R143-2 FIX: Use current_is_host_root() instead of namespace-local euid==0
         // for consistency with sys_setns and cgroup governance gates.
@@ -4451,8 +4546,7 @@ fn sys_clone(
 
     // F.1 Security: CLONE_NEWIPC requires CAP_SYS_ADMIN or root
     if flags & CLONE_NEWIPC != 0 && !creating_user_ns {
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
         let is_root = crate::current_is_host_root();
@@ -4471,8 +4565,7 @@ fn sys_clone(
 
     // F.1 Security: CLONE_NEWNET requires CAP_NET_ADMIN (CapRights::ADMIN) or root
     if flags & CLONE_NEWNET != 0 && !creating_user_ns {
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
         let is_root = crate::current_is_host_root();
@@ -4628,20 +4721,11 @@ fn sys_clone(
 
         let cap_clone = if flags & CLONE_THREAD != 0 {
             // Thread: share parent's cap_table (via Arc)
-            parent.cap_table.clone()
+            parent.share_capability_table()
         } else {
             // R25-8 FIX: Non-thread cases must inherit and filter CLOFORK entries
-            // R161-4 FIX: Fallible clone + Arc wrapping
-            let cloned = match parent.cap_table.try_clone_for_fork() {
-                Ok(cloned) => cloned,
-                Err(_) => {
-                    drop(parent);
-                    drop(fd_snapshot);
-                    drop(cloexec_snapshot);
-                    return Err(SyscallError::ENOMEM);
-                }
-            };
-            match Arc::try_new(cloned) {
+            // R161-4 FIX: Fallible clone + Arc wrapping, sealed in Process.
+            match parent.try_clone_capability_table_for_fork(None) {
                 Ok(cloned) => cloned,
                 Err(_) => {
                     drop(parent);
@@ -4688,7 +4772,7 @@ fn sys_clone(
             parent.user_stack,
             parent.fs_base,
             parent.gs_base,
-            parent.credentials.clone(), // R39-3 FIX: 获取凭证 Arc
+            parent.shared_credentials(), // R39-3 FIX: 获取凭证 Arc
             parent.umask,
             parent.rlimits, // M0-6: [RLimit; N] is Copy — snapshot under parent lock
             parent.sigactions, // M0 item 5: [SigAction; NSIG] is Copy
@@ -4756,6 +4840,7 @@ fn sys_clone(
                     ForkError::CgroupPidsLimitExceeded
                     | ForkError::CgroupFilesLimitExceeded
                     | ForkError::MmapTransientState
+                    | ForkError::CredentialBusy
                     | ForkError::SchedulerAdmissionFailed => SyscallError::EAGAIN,
                     ForkError::SecurityDenied => SyscallError::EPERM,
                     ForkError::NamespaceTranslationFailed => SyscallError::EFAULT,
@@ -4951,7 +5036,7 @@ fn sys_clone(
     };
 
     // F.1: Handle CLONE_NEWPID - create child in new PID namespace
-    let child_pid = if flags & CLONE_NEWPID != 0 {
+    let (child_pid, new_pid_ns) = if flags & CLONE_NEWPID != 0 {
         // Create a new child PID namespace
         let new_ns =
             crate::pid_namespace::PidNamespace::new_child(Arc::clone(&parent_pid_ns_for_children))
@@ -4976,11 +5061,21 @@ fn sys_clone(
             new_ns.level()
         );
         // Create process in the new namespace
-        create_process_in_namespace(child_name, parent_pid, parent_priority, new_ns)
-            .map_err(|_| SyscallError::ENOMEM)?
+        let child_pid = create_process_in_namespace(
+            child_name,
+            parent_pid,
+            parent_priority,
+            Arc::clone(&new_ns),
+        )
+        .map_err(|_| SyscallError::ENOMEM)?;
+        (child_pid, Some(new_ns))
     } else {
         // Regular process creation - inherits parent's pid_ns_for_children
-        create_process(child_name, parent_pid, parent_priority).map_err(|_| SyscallError::ENOMEM)?
+        (
+            create_process(child_name, parent_pid, parent_priority)
+                .map_err(|_| SyscallError::ENOMEM)?,
+            None,
+        )
     };
 
     let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
@@ -5069,7 +5164,9 @@ fn sys_clone(
 
     let mut prepared_private_credentials = if flags & CLONE_THREAD == 0 {
         let prepared = (|| {
-            let parent = parent_credentials_arc.read();
+            let parent = parent_credentials_arc
+                .try_read()
+                .ok_or(SyscallError::EAGAIN)?;
             let supplementary_groups = mm::AdmittedVec::try_copy_from_slice(
                 mm::HeapClass::CoreProcess,
                 &parent.supplementary_groups,
@@ -5328,13 +5425,12 @@ fn sys_clone(
         // 这确保同一进程的线程共享 setuid/setgid 变更，
         // 而不同进程保持凭证独立。
         if flags & CLONE_THREAD != 0 {
-            child.credentials = Arc::clone(&parent_credentials_arc);
+            child.install_shared_credentials_for_clone(Arc::clone(&parent_credentials_arc));
         } else {
             let (credentials, reservation) = prepared_private_credentials
                 .take()
                 .expect("private clone credentials must be prepared");
-            let old = core::mem::replace(&mut child.credentials, credentials);
-            drop(old);
+            child.install_shared_credentials_for_clone(credentials);
             drop(reservation);
         }
         child.umask = parent_umask;
@@ -5430,7 +5526,7 @@ fn sys_clone(
 
         // R133-5 FIX: Use pre-captured cap_table clone instead of re-acquiring
         // parent lock. See snapshot above (under parent lock block).
-        child.cap_table = parent_cap_table_clone;
+        child.install_capability_table(parent_cap_table_clone);
 
         // U.S3-A3 FIX: pay the per-fd cap refcounts for the CLONE_THREAD case.
         // A thread SHARES the parent's cap_table (Arc), while its fd_table is a
@@ -5448,7 +5544,7 @@ fn sys_clone(
         if flags & CLONE_THREAD != 0 {
             for desc in child.fd_table.values() {
                 if let Some(cid) = desc.cap_id() {
-                    let _ = child.cap_table.increment_refcount(cid);
+                    child.capability_increment_refcount(cid);
                 }
             }
         }
@@ -5744,7 +5840,7 @@ fn sys_clone(
         guard.commit();
     }
 
-    // R186-12 FIX: Post-commit audit emission for IPC/NET/USER namespaces.
+    // R186-12/RF186-8: Post-commit audit emission for every namespace type.
     // Audit SUCCESS records must only be emitted after the child is committed to the scheduler.
     // Early emission (pre-commit) creates audit truth violations: if a later error causes rollback,
     // the audit log claims SUCCESS for a namespace that was never finalized.
@@ -5796,6 +5892,26 @@ fn sys_clone(
                 parent_id,
             },
             &[56, flags, CLONE_NEWUSER],
+            0,
+            crate::time::current_timestamp_ms(),
+        );
+    }
+
+    if let Some(ref new_pid_ns) = new_pid_ns {
+        let parent_id = new_pid_ns
+            .parent()
+            .map(|parent| parent.id().raw())
+            .unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_pid_ns.id().raw(),
+                ns_type: CLONE_NEWPID as u32,
+                parent_id,
+            },
+            &[56, flags, CLONE_NEWPID],
             0,
             crate::time::current_timestamp_ms(),
         );
@@ -6210,7 +6326,7 @@ fn exec_from_bytes(
     // SECURE) under a scoped lock released before the builder runs.
     let stack_creds = {
         let proc = process.lock();
-        let creds = proc.credentials.read();
+        let creds = proc.try_credentials_read().ok_or(SyscallError::EAGAIN)?;
         crate::user_stack::StackCreds {
             uid: creds.uid,
             euid: creds.euid,
@@ -6477,7 +6593,7 @@ fn exec_from_bytes(
         // 新加载的程序不应继承标记为 CLOEXEC 的能力，这与文件描述符
         // 的 CLOEXEC 语义一致。apply_cloexec() 会将这些条目撤销并
         // 返回到空闲列表，同时递增生成计数器防止旧 CapId 被复用。
-        proc.cap_table.apply_cloexec();
+        proc.apply_capability_cloexec();
 
         // R39-4 FIX: 应用 FD_CLOEXEC：关闭带有 close-on-exec 标志的文件描述符
         //
@@ -7677,7 +7793,11 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         // 获取目标进程凭证
         // R39-3 FIX: 使用共享凭证读取目标进程 uid
         let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
-        let target_uid = target.lock().credentials.read().uid;
+        let target_uid = target
+            .lock()
+            .try_credentials_read()
+            .ok_or(SyscallError::EAGAIN)?
+            .uid;
 
         // R101-5/R101-13 FIX: User namespace-aware permission check.
         //
@@ -8818,7 +8938,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
     {
         let ctx = {
             let proc = proc_arc.lock();
-            lsm_process_ctx_from(&proc)
+            lsm_process_ctx_from(&proc)?
         };
         if lsm::hook_task_unshare(&ctx, flags).is_err() {
             return Err(SyscallError::EPERM);
@@ -8828,8 +8948,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
     // R180-22 PREPARE: both supported namespace types have the same host-admin
     // gate.  Authorize the full requested flag set before constructing either
     // namespace so a mixed request cannot commit one leg and fail the other.
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
     let is_root = crate::current_is_host_root();
     if !is_root && !has_cap_admin {
         kprintln!("[sys_unshare] permission denied: requires CAP_SYS_ADMIN or host root");
@@ -9057,8 +9176,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     }
 
     // F.1 Security: Require CAP_SYS_ADMIN (CapRights::ADMIN) or root
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
     // R83-2 FIX: Fail-closed - if euid cannot be determined, deny access
     // Previously used unwrap_or(true) which would grant root access on None
     // R135-3 FIX: Use host-mapped root check. Namespace root must NOT be
@@ -9112,7 +9230,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     {
         let ctx = {
             let proc = proc_arc.lock();
-            lsm_process_ctx_from(&proc)
+            lsm_process_ctx_from(&proc)?
         };
         if lsm::hook_task_setns(&ctx, CLONE_NEWNS as u64, target_ns.id().raw()).is_err() {
             return Err(SyscallError::EPERM);
@@ -9353,7 +9471,7 @@ fn sys_move_net_device(device_idx: u32, target_netns_fd: i32) -> SyscallResult {
     {
         let ctx = {
             let proc = proc_arc.lock();
-            lsm_process_ctx_from(&proc)
+            lsm_process_ctx_from(&proc)?
         };
         if lsm::hook_net_device_move(&ctx, device_idx, source_ns.id().raw(), target_ns.id().raw())
             .is_err()
@@ -10010,7 +10128,7 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // U.S3-A3 FIX: bump the shared CapEntry refcount for the installed
             // copy only after publication succeeds.
             if let Some(cid) = proc.get_fd(new_fd).and_then(|d| d.cap_id()) {
-                let _ = proc.cap_table.increment_refcount(cid);
+                proc.capability_increment_refcount(cid);
             }
 
             Ok(new_fd as usize)
@@ -10834,9 +10952,14 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     //   2. Risk of policy desync if one layer is bypassed.
     let open_flags = flags as u32;
 
-    // U.S2-SLICE-3B: Snapshot credential generation BEFORE VFS work to detect
-    // TOCTOU changes (setuid/setgid/setgroups during open).
-    let cred_gen_before = process.lock().cred_generation();
+    // RF186-7: keep one credential identity stable across the complete VFS
+    // authorization and side-effect span. The separate operation gate allows
+    // VFS/LSM callbacks to read current credentials without recursively taking
+    // the credential RwLock, while credential writers cannot race create or
+    // truncate and turn a later EAGAIN into a failure-after-side-effect.
+    let credentials = process.lock().shared_credentials();
+    let credential_authorization = credentials.begin_authorization();
+    let cred_gen_before = credentials.generation();
 
     // 获取 VFS 回调
     let open_fn = {
@@ -10852,6 +10975,19 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
     // RUNG 2: VFS failure auto-rollback via Drop (fd_reservation + PreparedFileHandle)
     let mut file_ops = open_fn(&path_str, flags as u32, mode)?;
+
+    // RF186-1: classify before taking the Process lock. `FileHandle::stat()`
+    // performs an LSM current-subject lookup, which re-enters the current PCB;
+    // invoking it under `process.lock()` is a deterministic self-deadlock.
+    const S_IFREG: u32 = 0o100000;
+    let stat = match file_ops.stat() {
+        Ok(stat) => stat,
+        Err(_) => {
+            drop(file_ops);
+            return Err(SyscallError::EIO);
+        }
+    };
+    let is_regular = (stat.mode & S_IFMT) == S_IFREG;
 
     // U.S2-SLICE-3B / R186-1 FIX: single-guard two-phase publication transaction.
     //
@@ -10873,8 +11009,13 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     let (fd, published_cap) = {
         let mut proc = process.lock();
 
-        // RUNG 3a: Credential TOCTOU defense
-        if !proc.cred_generation_is_current(cred_gen_before) {
+        // RUNG 3a / RF186-7: check under a read guard and KEEP that guard
+        // through LSM mediation plus FD/cap publication. A CLONE_THREAD sibling
+        // therefore cannot mutate credentials after the check but before the
+        // authorization result becomes visible.
+        if !proc.credentials_match_authorization(&credential_authorization)
+            || proc.cred_generation() != cred_gen_before
+        {
             drop(proc);
             drop(file_ops); // FileHandle Drop outside lock (R170-6)
             return Err(SyscallError::EAGAIN); // Benign retry signal
@@ -10883,22 +11024,9 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         // Owned handle to the capability table. Taking it by Arc clone ends the
         // immutable borrow of `proc` immediately, so the reservation below can
         // coexist with the `&mut proc` that FD publication needs.
-        let cap_table = proc.cap_table.clone();
+        let cap_authority = proc.capability_table_authority();
 
-        // RUNG 3b: Cap reservation for regular files only. Classification is
-        // security-sensitive: a stat failure must abort rather than silently
-        // publishing a regular handle without its capability and LSM mediation.
-        const S_IFREG: u32 = 0o100000; // Regular file type
-        let stat = match file_ops.stat() {
-            Ok(stat) => stat,
-            Err(_) => {
-                drop(proc);
-                drop(file_ops);
-                return Err(SyscallError::EIO);
-            }
-        };
-        let is_regular = (stat.mode & S_IFMT) == S_IFREG;
-
+        // RUNG 3b: Cap reservation for regular files only.
         let prepared_cap = if is_regular {
             // Derive cap rights from open flags
             let mut rights = cap::CapRights::empty();
@@ -10926,32 +11054,16 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
                 cap_flags,
             );
 
-            // Build proc_ctx for LSM/audit using the canonical helper
-            let proc_ctx = lsm_process_ctx_from(&proc);
-            // The context read takes the shared credential read lock. Recheck
-            // after that snapshot so a sibling mutation cannot pair new
-            // credentials with the generation captured before VFS traversal.
-            if !proc.cred_generation_is_current(cred_gen_before) {
-                drop(proc);
-                drop(file_ops);
-                return Err(SyscallError::EAGAIN);
-            }
-
-            // R186-16: LSM mediates the allocation BEFORE any slot is consumed.
-            if let Err(err) =
-                lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
-            {
-                drop(proc);
-                drop(file_ops); // FileHandle Drop outside lock (R170-6)
-                return Err(lsm_error_to_syscall(err));
-            }
-
-            match cap_table.prepare_allocation() {
-                Ok(reservation) => Some((reservation, cap_entry, proc_ctx)),
+            match prepare_cap_allocation_authorized(
+                &proc,
+                &cap_authority,
+                credential_authorization.derive(),
+            ) {
+                Ok(reservation) => Some((reservation, cap_entry)),
                 Err(err) => {
                     drop(proc);
                     drop(file_ops); // FileHandle Drop outside lock (R170-6)
-                    return Err(cap_error_to_syscall(err));
+                    return Err(err);
                 }
             }
         } else {
@@ -10961,7 +11073,7 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         // RUNG 4: bind the reserved CapId to the FileHandle via FileOps::set_cap_id()
         // BEFORE publication. The id is already owned by the reservation, so this
         // cannot fail and cannot be observed until Phase 2 publishes the entry.
-        if let Some((reservation, _, _)) = prepared_cap.as_ref() {
+        if let Some((reservation, _)) = prepared_cap.as_ref() {
             file_ops.set_cap_id(reservation.cap_id());
         }
 
@@ -10969,10 +11081,7 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         match fd_reservation.install_with_guard(&mut proc, file_ops) {
             Ok(fd) => {
                 // Publish the capability into its reserved identity (infallible).
-                let published = prepared_cap.map(|(reservation, entry, proc_ctx)| {
-                    let cap_id = reservation.install(entry);
-                    (proc_ctx, cap_id)
-                });
+                let published = prepared_cap.map(|(reservation, entry)| reservation.install(entry));
                 (fd, published)
             }
             Err(rejected) => {
@@ -10989,8 +11098,8 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     };
 
     // Audit the capability grant after the Process guard is released.
-    if let Some((proc_ctx, cap_id)) = published_cap {
-        emit_cap_allocate_audit(&proc_ctx, cap_id);
+    if let Some(grant) = published_cap {
+        grant.audit();
     }
 
     Ok(fd as usize)
@@ -11836,7 +11945,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
     // R131-1 FIX: Use lsm_process_ctx_from() instead of ProcessCtx::from_current()
     // to avoid deadlock. from_current() calls current_credentials() which re-acquires
     // the same Process mutex we already hold → deterministic self-deadlock.
-    let ctx = lsm_process_ctx_from(&proc);
+    let ctx = lsm_process_ctx_from(&proc)?;
     if lsm::hook_memory_brk(&ctx, addr as u64).is_err() {
         return Err(SyscallError::EPERM);
     }
@@ -14073,7 +14182,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
         // R131-2 FIX: Use lsm_process_ctx_from() instead of ProcessCtx::from_current()
         // to avoid deadlock.
-        let ctx = lsm_process_ctx_from(&proc);
+        let ctx = lsm_process_ctx_from(&proc)?;
         if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
             return Err(SyscallError::EPERM);
         }
@@ -15717,7 +15826,7 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
         let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
         let ctx = {
             let proc = proc_arc.lock();
-            lsm_process_ctx_from(&proc)
+            lsm_process_ctx_from(&proc)?
         };
         if lsm::hook_task_prctl(&ctx, option, arg2).is_err() {
             return Err(SyscallError::EPERM);
@@ -16094,8 +16203,7 @@ fn can_set_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
     }
 
     // Check for CAP_SYS_NICE (using ADMIN capability as closest match)
-    let has_cap =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap = current_has_cap_rights(cap::CapRights::ADMIN);
     if has_cap {
         return Ok(true);
     }
@@ -17142,8 +17250,11 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // hook_file_create and hook_file_open with real inode context.
     // See sys_open_internal R105-1 comment for rationale.
 
-    // R186-18: snapshot the shared credential generation before VFS resolve/open.
-    let cred_gen_before = process.lock().cred_generation();
+    // RF186-7: serialize credential mutation against the full resolve/open and
+    // publication span, including create/truncate side effects.
+    let credentials = process.lock().shared_credentials();
+    let credential_authorization = credentials.begin_authorization();
+    let cred_gen_before = credentials.generation();
 
     // Get VFS callback with resolve support
     let open_fn = {
@@ -17216,35 +17327,25 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
         // merely theoretical: a failing `install` no longer strands an allocated,
         // unreferenced capability.
         let mut proc_guard = process.lock();
-        if !proc_guard.cred_generation_is_current(cred_gen_before) {
-            drop(proc_guard);
-            drop(file_ops);
-            return Err(SyscallError::EAGAIN);
-        }
-        let cap_table = proc_guard.cap_table.clone();
-
-        // Build proc_ctx for LSM/audit using the canonical helper
-        let proc_ctx = lsm_process_ctx_from(&proc_guard);
-        if !proc_guard.cred_generation_is_current(cred_gen_before) {
-            drop(proc_guard);
-            drop(file_ops);
-            return Err(SyscallError::EAGAIN);
-        }
-
-        if let Err(err) =
-            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+        if !proc_guard.credentials_match_authorization(&credential_authorization)
+            || proc_guard.cred_generation() != cred_gen_before
         {
             drop(proc_guard);
-            drop(file_ops); // FileHandle Drop outside lock
-            return Err(lsm_error_to_syscall(err)); // Preserve EPERM from LSM
+            drop(file_ops);
+            return Err(SyscallError::EAGAIN);
         }
+        let cap_authority = proc_guard.capability_table_authority();
 
-        let reservation = match cap_table.prepare_allocation() {
+        let reservation = match prepare_cap_allocation_authorized(
+            &proc_guard,
+            &cap_authority,
+            credential_authorization.derive(),
+        ) {
             Ok(reservation) => reservation,
             Err(err) => {
                 drop(proc_guard);
                 drop(file_ops); // FileHandle Drop outside lock
-                return Err(cap_error_to_syscall(err));
+                return Err(err);
             }
         };
 
@@ -17260,17 +17361,19 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
                 return Err(SyscallError::EMFILE);
             }
         };
-        let cap_id = reservation.install(cap_entry);
+        let grant = reservation.install(cap_entry);
         drop(proc_guard);
 
-        emit_cap_allocate_audit(&proc_ctx, cap_id);
+        grant.audit();
         return Ok(fd as usize);
     }
 
     // Non-regular files carry no capability, but still publish only if the VFS
     // traversal's credential generation remains current.
     let mut proc_guard = process.lock();
-    if !proc_guard.cred_generation_is_current(cred_gen_before) {
+    if !proc_guard.credentials_match_authorization(&credential_authorization)
+        || proc_guard.cred_generation() != cred_gen_before
+    {
         drop(proc_guard);
         drop(file_ops);
         return Err(SyscallError::EAGAIN);
@@ -17320,7 +17423,7 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
     // documented dead handle (ops fail, close is a no-op decrement) — same
     // accepted race class as clone_box's dead-socket note above.
     if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
-        let _ = proc.cap_table.increment_refcount(cid);
+        proc.capability_increment_refcount(cid);
     }
     Ok(newfd as usize)
 }
@@ -17374,7 +17477,7 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         // copy, under the held Process lock (see sys_dup for the failure-race
         // note).
         if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
-            let _ = proc.cap_table.increment_refcount(cid);
+            proc.capability_increment_refcount(cid);
         }
         displaced
     };
@@ -17432,7 +17535,7 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
         // copy, under the held Process lock (see sys_dup for the failure-race
         // note).
         if let Some(cid) = proc.get_fd(newfd).and_then(|d| d.cap_id()) {
-            let _ = proc.cap_table.increment_refcount(cid);
+            proc.capability_increment_refcount(cid);
         }
 
         removed
@@ -18144,8 +18247,7 @@ fn resolve_socket(
 
         // Lookup capability entry
         let entry = proc
-            .cap_table
-            .lookup(cap_id)
+            .capability_lookup(cap_id)
             .map_err(cap_error_to_syscall)?;
 
         // Verify it's a socket with matching ID
@@ -18185,14 +18287,19 @@ fn resolve_socket(
 struct PreparedSocketPublication<'a> {
     descriptor: crate::process::PreparedFileDescriptor<SocketFile>,
     fd_reservation: FdPublicationReservation,
-    capability: cap::PreparedCapAllocation<'a>,
-    proc_ctx: lsm::ProcessCtx,
+    capability: AuthorizedCapReservation<'a>,
+    net_ns_id: cap::NamespaceId,
 }
 
 impl PreparedSocketPublication<'_> {
     #[inline]
     fn process_context(&self) -> &lsm::ProcessCtx {
-        &self.proc_ctx
+        self.capability.process_context()
+    }
+
+    #[inline]
+    fn net_ns_id(&self) -> cap::NamespaceId {
+        self.net_ns_id
     }
 
     /// Publish the capability and descriptor through resources that were fully
@@ -18202,14 +18309,15 @@ impl PreparedSocketPublication<'_> {
         cap_entry: cap::CapEntry,
         socket_id: u64,
         nonblocking: bool,
-    ) -> (i32, cap::CapId, lsm::ProcessCtx) {
+    ) -> (i32, cap::CapId) {
         let Self {
             descriptor,
             fd_reservation,
             capability,
-            proc_ctx,
+            net_ns_id: _,
         } = self;
-        let cap_id = capability.install(cap_entry);
+        let cap_id = capability.cap_id();
+        let grant = capability.install(cap_entry);
         let desc = descriptor.finalize(SocketFile::new(cap_id, socket_id, nonblocking));
         let fd = match fd_reservation.install(desc) {
             Ok(fd) => fd,
@@ -18217,7 +18325,9 @@ impl PreparedSocketPublication<'_> {
                 panic!("RF180-37: prepared socket FD publication invariant failed")
             }
         };
-        (fd, cap_id, proc_ctx)
+        let audited_cap_id = grant.audit();
+        debug_assert_eq!(cap_id, audited_cap_id);
+        (fd, cap_id)
     }
 }
 
@@ -18226,10 +18336,10 @@ impl PreparedSocketPublication<'_> {
 /// resource bundle through ordinary RAII.
 fn socket_publish_after_preflight<P, S, E>(
     preflight: impl FnOnce() -> Result<P, E>,
-    publish: impl FnOnce() -> Result<S, E>,
+    publish: impl FnOnce(&P) -> Result<S, E>,
 ) -> Result<(P, S), E> {
     let prepared = preflight()?;
-    let published = publish()?;
+    let published = publish(&prepared)?;
     Ok((prepared, published))
 }
 
@@ -18319,20 +18429,17 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         _ => return Err(SyscallError::EPROTONOSUPPORT),
     }
 
-    // Get security label from current process
-    let label = net::SocketLabel::from_current(0).ok_or(SyscallError::ESRCH)?;
-
-    // R75-1 FIX: Get current process's network namespace for socket isolation.
-    // Fail-closed: if we can't determine the namespace, refuse to create socket.
-    let net_ns_id = current_net_ns_id().ok_or(SyscallError::ESRCH)?;
-
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // RF180-37 FIX: prepare the exact SocketFile allocation, numeric fd,
     // files.max charge, CLOEXEC slot, capability backing, and capability LSM
     // permission before create_* publishes a socket in the global table.
-    let cap_table = { process.lock().cap_table.clone() };
+    let (cap_authority, credentials) = {
+        let proc = process.lock();
+        (proc.capability_table_authority(), proc.shared_credentials())
+    };
+    let credential_authorization = credentials.begin_authorization();
     let ((prepared, socket), rights) = {
         let mut rights = cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND;
         if ty == net::SocketType::Stream && proto == net::SocketProtocol::Tcp {
@@ -18345,35 +18452,42 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
                     crate::process::FileDescriptor::try_prepare(mm::HeapClass::SocketObject)
                         .map_err(|_| SyscallError::ENOMEM)?;
                 let fd_reservation = FdPublicationReservation::try_new(process.clone(), cloexec)?;
-                let proc_ctx = {
+                let (capability, net_ns_id) = {
                     let proc = process.lock();
-                    let proc_ctx = lsm_process_ctx_from(&proc);
-                    lsm::hook_task_cap_modify(
-                        &proc_ctx,
-                        cap::CapId::INVALID,
-                        lsm::cap_op::ALLOCATE,
-                    )
-                    .map_err(lsm_error_to_syscall)?;
-                    proc_ctx
+                    let net_ns_id = proc.net_ns.id();
+                    let capability = prepare_cap_allocation_authorized(
+                        &proc,
+                        &cap_authority,
+                        credential_authorization,
+                    )?;
+                    (capability, net_ns_id)
                 };
-                let capability = cap_table
-                    .prepare_allocation()
-                    .map_err(cap_error_to_syscall)?;
                 Ok(PreparedSocketPublication {
                     descriptor,
                     fd_reservation,
                     capability,
-                    proc_ctx,
+                    net_ns_id,
                 })
             },
-            || match (ty, proto) {
-                (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
-                    .create_udp_socket(label, net_ns_id)
-                    .map_err(socket_error_to_syscall),
-                (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
-                    .create_tcp_socket(label, net_ns_id)
-                    .map_err(socket_error_to_syscall),
-                _ => Err(SyscallError::EPROTONOSUPPORT),
+            |prepared| {
+                // RF186-7: derive the socket's persistent MAC subject from the
+                // same owned credential authorization that mediated and reserved
+                // its capability. The authorization remains live through socket,
+                // capability, FD and audit publication, so a sibling credential
+                // writer cannot splice two identities into one operation.
+                let label = net::SocketLabel {
+                    creator: *prepared.process_context(),
+                    secmark: 0,
+                };
+                match (ty, proto) {
+                    (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
+                        .create_udp_socket(label, prepared.net_ns_id())
+                        .map_err(socket_error_to_syscall),
+                    (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
+                        .create_tcp_socket(label, prepared.net_ns_id())
+                        .map_err(socket_error_to_syscall),
+                    _ => Err(SyscallError::EPROTONOSUPPORT),
+                }
             },
         )?;
         (pair, rights)
@@ -18387,8 +18501,7 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         rights,
         cap::CapFlags::empty(),
     );
-    let (fd, cap_id, proc_ctx) = prepared.commit(cap_entry, socket.id, nonblock);
-    emit_cap_allocate_audit(&proc_ctx, cap_id);
+    let (fd, _cap_id) = prepared.commit(cap_entry, socket.id, nonblock);
 
     Ok(fd as usize)
 }
@@ -18398,27 +18511,26 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
 /// pending child available to another or later accept attempt.
 fn prepare_accept_publication<'a>(
     process: crate::process::ProcessArc,
-    cap_table: &'a cap::CapTable,
+    cap_authority: &'a crate::process::CapabilityTableAuthority,
     cloexec: bool,
 ) -> Result<PreparedSocketPublication<'a>, SyscallError> {
     let descriptor = crate::process::FileDescriptor::try_prepare(mm::HeapClass::SocketObject)
         .map_err(|_| SyscallError::ENOMEM)?;
     let fd_reservation = FdPublicationReservation::try_new(process.clone(), cloexec)?;
-    let proc_ctx = {
+    let (credentials, net_ns_id) = {
         let proc = process.lock();
-        let proc_ctx = lsm_process_ctx_from(&proc);
-        lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
-            .map_err(lsm_error_to_syscall)?;
-        proc_ctx
+        (proc.shared_credentials(), proc.net_ns.id())
     };
-    let capability = cap_table
-        .prepare_allocation()
-        .map_err(cap_error_to_syscall)?;
+    let authorization = credentials.begin_authorization();
+    let capability = {
+        let proc = process.lock();
+        prepare_cap_allocation_authorized(&proc, cap_authority, authorization)?
+    };
     Ok(PreparedSocketPublication {
         descriptor,
         fd_reservation,
         capability,
-        proc_ctx,
+        net_ns_id,
     })
 }
 
@@ -18457,9 +18569,7 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     // R49-3 FIX: Compute privileged port binding permission
     // R134-3 FIX: Use host-mapped root check instead of namespace euid==0.
     // Namespace root must NOT be able to bind privileged ports on the host network.
-    let has_net_bind_cap =
-        with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
-            .unwrap_or(false);
+    let has_net_bind_cap = current_has_cap_rights(cap::CapRights::NET_BIND_SERVICE);
     let can_bind_privileged = crate::current_is_host_root() || has_net_bind_cap;
 
     // Early check for privileged port access
@@ -18563,9 +18673,7 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 
     // Compute privileged-port permission for auto-bind
     // R134-3 FIX: Use host-mapped root check instead of namespace euid==0.
-    let has_net_bind_cap =
-        with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
-            .unwrap_or(false);
+    let has_net_bind_cap = current_has_cap_rights(cap::CapRights::NET_BIND_SERVICE);
     let can_bind_privileged = crate::current_is_host_root() || has_net_bind_cap;
 
     net::socket_table()
@@ -18631,7 +18739,7 @@ fn sys_accept_common(
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let cap_table = { process.lock().cap_table.clone() };
+    let cap_authority = { process.lock().capability_table_authority() };
     let cloexec = accept_flags & SOCK_CLOEXEC != 0;
     // Linux accept() does not inherit O_NONBLOCK from the listener; only
     // accept4(SOCK_NONBLOCK) marks the returned descriptor non-blocking.
@@ -18654,7 +18762,7 @@ fn sys_accept_common(
     let (prepared, child) = loop {
         let attempt = accept_after_preflight(
             socket.poll_readiness().readable,
-            || prepare_accept_publication(process.clone(), cap_table.as_ref(), cloexec),
+            || prepare_accept_publication(process.clone(), &cap_authority, cloexec),
             || {
                 net::socket_table()
                     .poll_accept_ready(&socket)
@@ -18725,8 +18833,7 @@ fn sys_accept_common(
         child_rights,
         cap::CapFlags::empty(),
     );
-    let (new_fd, new_cap, proc_ctx) = prepared.commit(cap_entry, child.id, child_nonblock);
-    emit_cap_allocate_audit(&proc_ctx, new_cap);
+    let (new_fd, _new_cap) = prepared.commit(cap_entry, child.id, child_nonblock);
 
     // R162-11/R180-24: peer-address copy failure is non-fatal after the child
     // descriptor is valid. Copy at most the caller-provided length and report
@@ -18765,7 +18872,7 @@ mod rf180_37_socket_publication_tests {
             let socket_publications = Cell::new(0usize);
             let result = socket_publish_after_preflight(
                 || Err::<(), _>(error),
-                || {
+                |_| {
                     socket_publications.set(socket_publications.get() + 1);
                     Ok(())
                 },
@@ -18784,7 +18891,7 @@ mod rf180_37_socket_publication_tests {
         let drops = Cell::new(0usize);
         let result = socket_publish_after_preflight(
             || Ok::<_, SyscallError>(DropMarker(&drops)),
-            || Err::<(), _>(SyscallError::ENOMEM),
+            |_| Err::<(), _>(SyscallError::ENOMEM),
         );
         assert!(matches!(result, Err(SyscallError::ENOMEM)));
         assert_eq!(drops.get(), 1, "failed create must roll preflight back");
@@ -19500,8 +19607,7 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
     // P1-3: Also allow delegated owners of the parent cgroup
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
 
     if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(parent_id)
     {
@@ -19545,8 +19651,7 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     // since delegation inherits from ancestors)
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
 
     if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(cgroup_id)
     {
@@ -19580,8 +19685,7 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
 /// within the cgroup and its descendants. Pass `uid = u64::MAX` to revoke.
 fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> {
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
 
     // P1-3: Allow host root, CAP_SYS_ADMIN, or delegated subtree managers.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
@@ -19665,8 +19769,7 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
 
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
     let is_root = crate::current_is_host_root();
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
     // R134-2: host-mapped euid for delegation identity.
     let host_euid = crate::process::current_host_euid();
 
@@ -19860,8 +19963,7 @@ fn sys_cgroup_set_limit(
     // P1-3: Delegated owners may set limits bounded by parent ceilings
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
     let is_host_root = crate::current_is_host_root();
 
     let is_delegated = !has_cap_admin && !is_host_root && is_cgroup_delegated_to_caller(cgroup_id);
@@ -20012,8 +20114,7 @@ fn cgroup_stats_collect_and_copy(
     // P1-3: Stats access should respect delegation boundaries.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin =
-        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
     if !crate::current_is_host_root() && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id)
     {
         return Err(SyscallError::EPERM);
@@ -20144,8 +20245,7 @@ fn sys_fips_enable() -> Result<usize, SyscallError> {
     let _creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
     if !crate::current_is_host_root() {
         // Check for CAP_ADMIN capability (system administration rights)
-        let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::ADMIN));
-        if has_cap != Some(true) {
+        if !current_has_cap_rights(cap::CapRights::ADMIN) {
             return Err(SyscallError::EPERM);
         }
     }
@@ -20292,8 +20392,7 @@ fn sys_audit_export(
     let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
     let caller_is_root = crate::current_is_host_root();
     if !caller_is_root {
-        let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ));
-        if has_cap != Some(true) {
+        if !current_has_cap_rights(cap::CapRights::AUDIT_READ) {
             return Err(SyscallError::EPERM);
         }
     }
@@ -20666,7 +20765,7 @@ fn poll_classify(p: &crate::process::Process, fd: i32) -> FdKind {
                 // caller's net-ns id, all under this ONE Process lock — the probe
                 // pass must never re-take the Process lock per socket fd (that
                 // amplification defeats the IRQ try-lock-defer, R171-G5-1).
-                match p.cap_table.lookup(cap_id) {
+                match p.capability_lookup(cap_id) {
                     Ok(entry) => match &entry.object {
                         cap::CapObject::Socket(ref h) if h.socket_id == socket_id => {
                             FdKind::Socket {

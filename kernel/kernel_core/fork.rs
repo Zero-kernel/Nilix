@@ -55,6 +55,8 @@ pub enum ForkError {
     /// R122-1 FIX: mmap_regions contains in-flight PENDING_MAP/PENDING_UNMAP entries;
     /// fork must be retried after the concurrent mmap/munmap completes.
     MmapTransientState,
+    /// A credential writer has closed reader admission; retry after it commits.
+    CredentialBusy,
     /// R180-19: LSM rejected the prospective child during PREPARE.
     SecurityDenied,
     /// R180-19: the child's PID namespace membership cannot be represented to
@@ -205,7 +207,9 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
         let visible_pid = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain)
             .map(|ns| crate::pid_namespace::pid_in_namespace(&ns, child_pid))
             .unwrap_or(Some(child_pid));
-        let parent_creds = parent.credentials.read();
+        let parent_creds = parent
+            .try_credentials_read()
+            .ok_or(ForkError::CredentialBusy)?;
         let parent_ctx = lsm::ProcessCtx::new(
             parent.pid,
             parent.tgid,
@@ -486,17 +490,12 @@ fn fork_inner(
         // DoS class, fail-safe: revoke-too-late, never premature). Reconciliation:
         // COUNT the child's actual per-cap fd references and OVERWRITE each
         // CapEntry.refcount to match. Safe under parent lock; child not visible yet.
-        let mut raw_cap_table = parent
-            .cap_table
-            .try_clone_for_fork()
-            .map_err(|_| ForkError::MemoryAllocationFailed)?;
-
         // Reconcile only if parent's cap_table Arc::strong_count > 1 (shared).
         // A non-shared parent (standalone process or the last survivor of a thread
         // group) has cap refcounts that already equal its own fd count, so the
         // verbatim copy is correct. Checking `> 1` avoids the O(fds × caps) scan
         // on the common non-threaded fork path.
-        if Arc::strong_count(&parent.cap_table) > 1 {
+        let cap_table = if parent.capability_table_is_shared() {
             // Build a histogram: CapId → count of child fds carrying it.
             let mut child_cap_counts =
                 [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
@@ -524,14 +523,16 @@ fn fork_inner(
                     unique_len += 1;
                 }
             }
-            // Overwrite each CapEntry.refcount to match the child's fd count.
-            // try_clone_for_fork gave us a fresh CapTable with its own inner Mutex;
-            // no lock needed here (child not visible, parent still locked).
-            raw_cap_table.reconcile_refcounts_after_fork(&child_cap_counts[..unique_len]);
-        }
+            parent
+                .try_clone_capability_table_for_fork(Some(&child_cap_counts[..unique_len]))
+                .map_err(|_| ForkError::MemoryAllocationFailed)?
+        } else {
+            parent
+                .try_clone_capability_table_for_fork(None)
+                .map_err(|_| ForkError::MemoryAllocationFailed)?
+        };
 
-        child.cap_table =
-            Arc::try_new(raw_cap_table).map_err(|_| ForkError::MemoryAllocationFailed)?;
+        child.install_capability_table(cap_table);
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
@@ -557,8 +558,7 @@ fn fork_inner(
         .map_err(|_| ForkError::MemoryAllocationFailed)?;
         let credentials = Arc::try_new(crate::process::SharedCredentials::new(child_credentials))
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        let old_credentials = core::mem::replace(&mut child.credentials, credentials);
-        drop(old_credentials);
+        child.install_shared_credentials_for_clone(credentials);
         drop(credential_arc_reservation);
         child.umask = parent.umask;
 
@@ -1084,33 +1084,6 @@ pub unsafe fn copy_page_table_cow(
 ///
 /// 当进程尝试写入COW页时调用
 ///
-/// # R65-21 FIX: Race Condition Prevention
-///
-/// This function now uses a global lock to serialize COW page fault handling.
-/// Without synchronization, two threads writing to the same COW page simultaneously
-/// could cause:
-/// - Both threads unmapping/mapping independently
-/// - Double-decrementing the old page's reference count (use-after-free)
-/// - One thread's new mapping being overwritten by the other
-///
-/// The lock ensures only one COW resolution happens at a time. After acquiring
-/// the lock, we re-check if the page is still COW (another thread may have
-/// resolved it while we were waiting).
-///
-/// # R174-A4 FIX: IRQ-Safe try_lock Pattern
-///
-/// The #PF handler does NOT call irq_enter()/irq_exit(), so if a timer IRQ
-/// fires mid-COW while holding the Process lock, the timer's pending-kill
-/// check can block waiting for the same lock → cross-CPU deadlock on SMP:
-///   CPU A: process context holds Process lock, IRQs enabled
-///   CPU B: #PF (COW) → tries to acquire Process lock → spins forever (IRQs disabled)
-///   CPU A: tries to send IPI to CPU B → CPU B can't respond (IRQs disabled)
-///   → DEADLOCK
-///
-/// FIX: Use try_lock() on COW_FAULT_LOCK. On contention, return EAGAIN so the
-/// #PF handler can retry (the page remains read-only, next write re-triggers #PF).
-/// This makes COW resolution IRQ-safe without restructuring the entire handler.
-///
 /// # R186-10 FIX: remove the redundant global lock; classify the outcome exactly
 ///
 /// Two defects were fixed here.
@@ -1139,10 +1112,10 @@ pub unsafe fn copy_page_table_cow(
 ///
 /// Retrying on `Busy` is safe *because* it goes through `IRETQ`, which restores
 /// `IF=1`: the shootdown IPI is serviced between attempts, so the holder always
-/// makes progress and the retry always terminates. This is a genuine progress
-/// argument, not an optimistic one — but the handler still bounds the retry so a
-/// pathological same-CPU re-entrancy becomes a diagnosable failure instead of a
-/// silent hang.
+/// makes progress and the retry terminates. This is a genuine progress argument,
+/// not an optimistic one. There is no user-fatal contention budget: the handler
+/// uses PT-lock owner identity to panic only on true same-CPU re-entry, which is a
+/// kernel invariant violation rather than ordinary cross-CPU contention.
 ///
 /// # Disposition taxonomy
 ///

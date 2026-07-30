@@ -553,6 +553,8 @@ pub enum SignalError {
     NoSuchProcess,
     /// Permission denied
     PermissionDenied,
+    /// A credential writer has closed reader admission; caller may retry.
+    CredentialBusy,
 }
 
 impl From<SignalError> for SyscallError {
@@ -561,6 +563,7 @@ impl From<SignalError> for SyscallError {
             SignalError::InvalidSignal => SyscallError::EINVAL,
             SignalError::NoSuchProcess => SyscallError::ESRCH,
             SignalError::PermissionDenied => SyscallError::EPERM,
+            SignalError::CredentialBusy => SyscallError::EAGAIN,
         }
     }
 }
@@ -664,7 +667,11 @@ fn send_signal_inner(
 
                 // R65-26 FIX: Read target UID from the same Arc we'll use for signal delivery
                 // This closes the TOCTOU window where PID could be reused between check and delivery
-                let target_uid = process_arc.lock().credentials.read().uid;
+                let target_uid = process_arc
+                    .lock()
+                    .try_credentials_read()
+                    .ok_or(SignalError::CredentialBusy)?
+                    .uid;
 
                 // POSIX 权限检查：
                 // 1. Host root (host-mapped euid == 0) 可以发信号给任何进程
