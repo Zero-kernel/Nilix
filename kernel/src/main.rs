@@ -61,7 +61,7 @@ extern crate klog;
 
 // A.3 Audit capability gate imports
 use cap::CapRights;
-use kernel_core::process::{current_credentials, current_is_host_root, with_current_cap_table};
+use kernel_core::process::{current_credentials, current_has_cap_rights, current_is_host_root};
 // G.1 Observability: Counter integration for allocation failures
 use trace::counters::{increment_counter, TraceCounter};
 
@@ -1124,12 +1124,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 if current_is_host_root() {
                     return Ok(());
                 }
-                if let Some(has_cap) =
-                    with_current_cap_table(|table| table.has_rights(CapRights::AUDIT_READ))
-                {
-                    if has_cap {
-                        return Ok(());
-                    }
+                if current_has_cap_rights(CapRights::AUDIT_READ) {
+                    return Ok(());
                 }
                 // Deny all others
                 Err(audit::AuditError::AccessDenied)
@@ -1155,12 +1151,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     return Ok(());
                 }
                 // Allow processes with CAP_AUDIT_WRITE capability
-                if let Some(has_cap) =
-                    with_current_cap_table(|table| table.has_rights(CapRights::AUDIT_WRITE))
-                {
-                    if has_cap {
-                        return Ok(());
-                    }
+                if current_has_cap_rights(CapRights::AUDIT_WRITE) {
+                    return Ok(());
                 }
                 // Deny all others
                 Err(audit::AuditError::AccessDenied)
@@ -1317,12 +1309,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             return true;
         }
         // Allow processes with CAP_TRACE_READ capability
-        if let Some(has_cap) =
-            with_current_cap_table(|table| table.has_rights(CapRights::TRACE_READ))
-        {
-            if has_cap {
-                return true;
-            }
+        if current_has_cap_rights(CapRights::TRACE_READ) {
+            return true;
         }
         false
     });
