@@ -2796,7 +2796,7 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
         // calling from_current(). from_current() triggers current_credentials() which
         // re-acquires the same Process mutex → deterministic self-deadlock.
         let task = {
-            let creds = proc.credentials.read();
+            let creds = proc.try_credentials_read().ok_or(FsError::Busy)?;
             LsmProcessCtx::new(
                 proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid,
             )

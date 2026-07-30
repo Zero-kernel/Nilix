@@ -501,7 +501,7 @@ impl Inode for ProcPidDirInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -598,7 +598,7 @@ impl Inode for ProcPidStatusInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -669,7 +669,7 @@ impl Inode for ProcPidCmdlineInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -738,7 +738,7 @@ impl Inode for ProcPidStatInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -807,7 +807,7 @@ impl Inode for ProcPidMapsInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -893,7 +893,7 @@ impl Inode for ProcPidFdDirInode {
 
     fn stat(&self) -> Result<Stat, FsError> {
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino(),
@@ -982,7 +982,7 @@ impl Inode for ProcPidFdSymlink {
         // PID-reuse information leaks. If the original process exits and a new
         // process reuses the PID, we must not expose the new process's FD info.
         let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
-        let (uid, gid) = get_process_owner(&process);
+        let (uid, gid) = get_process_owner(&process)?;
         let target = get_fd_target(&process, self.fd)?;
         Ok(Stat {
             dev: self.fs_id,
@@ -1545,10 +1545,10 @@ fn list_pids() -> Result<AdmittedVec<u32>, FsError> {
 /// Get process owner (uid, gid)
 ///
 /// R29-1 FIX: Now returns actual process credentials
-fn get_process_owner(process: &BoundProcess) -> (u32, u32) {
+fn get_process_owner(process: &BoundProcess) -> Result<(u32, u32), FsError> {
     let process = process.lock();
-    let creds = process.credentials.read();
-    (creds.uid, creds.gid)
+    let creds = process.try_credentials_read().ok_or(FsError::Busy)?;
+    Ok((creds.uid, creds.gid))
 }
 
 /// R140-5 FIX: Map a process's UID through its user namespace to obtain the host UID.
@@ -1568,7 +1568,7 @@ fn get_process_host_uid_opt(pid: u32) -> Option<u32> {
     let (ns_uid, user_ns) = match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
-            let ns_uid = p.credentials.read().uid;
+            let ns_uid = p.try_credentials_read()?.uid;
             let user_ns = p.user_ns.clone();
             (ns_uid, user_ns)
         }
@@ -1585,7 +1585,7 @@ fn get_process_host_uid_opt(pid: u32) -> Option<u32> {
 fn get_bound_process_host_uid_opt(process: &BoundProcess) -> Option<u32> {
     let (ns_uid, user_ns) = {
         let process = process.lock();
-        let ns_uid = process.credentials.read().uid;
+        let ns_uid = process.try_credentials_read()?.uid;
         (ns_uid, process.user_ns.clone())
     };
     user_ns.map_uid_from_ns(ns_uid)
@@ -1676,7 +1676,7 @@ fn generate_status(
                 ('S', "sleeping")
             }
         };
-        let creds = process.credentials.read();
+        let creds = process.try_credentials_read().ok_or(FsError::Busy)?;
         StatusSnap {
             name: AdmittedString::try_from_str(HeapClass::Procfs, process.name.as_str())
                 .map_err(|_| FsError::NoSpace)?,
