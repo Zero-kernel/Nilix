@@ -19,7 +19,9 @@
 use alloc::string::ToString;
 use kernel_core::elf_loader::load_elf;
 use kernel_core::fork::{create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4};
-use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessArc};
+use kernel_core::process::{
+    cleanup_unscheduled_process, create_process, get_process, FxSaveArea, ProcessArc,
+};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -239,6 +241,61 @@ fn user_elf() -> &'static [u8] {
     &USER_ELF_ALIGNED.0
 }
 
+/// Owns every resource published or allocated while preparing the boot user
+/// process. Until `commit`, dropping the receipt restores the boot CR3, attaches
+/// any prepared address-space roots and ELF charge to the PCB, and routes all
+/// teardown through the normal unscheduled-process cleanup transaction.
+struct UsermodeSetupReceipt {
+    pid: kernel_core::ProcessId,
+    process: ProcessArc,
+    saved_cr3: usize,
+    memory_space: usize,
+    user_memory_space: usize,
+    elf_charged_bytes: u64,
+    committed: bool,
+}
+
+impl UsermodeSetupReceipt {
+    fn new(pid: kernel_core::ProcessId, process: ProcessArc, saved_cr3: usize) -> Self {
+        Self {
+            pid,
+            process,
+            saved_cr3,
+            memory_space: 0,
+            user_memory_space: 0,
+            elf_charged_bytes: 0,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) -> ProcessArc {
+        kernel_core::process::activate_memory_space(self.saved_cr3, None);
+        self.committed = true;
+        self.process.clone()
+    }
+}
+
+impl Drop for UsermodeSetupReceipt {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        // The prepared hierarchy may still be the active CR3. Restore the boot
+        // root before making either root reclaimable.
+        kernel_core::process::activate_memory_space(self.saved_cr3, None);
+
+        {
+            let mut proc = self.process.lock();
+            proc.memory_space = self.memory_space;
+            proc.user_memory_space = self.user_memory_space;
+            proc.mm.lock().elf_charged_bytes = self.elf_charged_bytes;
+        }
+
+        cleanup_unscheduled_process(self.pid);
+    }
+}
+
 #[cfg(feature = "shell")]
 const PROCESS_NAME: &str = "shell";
 #[cfg(feature = "syscall_test")]
@@ -289,6 +346,17 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
     };
     klog!(Info, "      ✓ Process created with PID {}", pid);
 
+    // create_process() success guarantees publication. Retain the Arc for the
+    // whole preparation transaction so configuration and the final handoff never
+    // depend on a second racy table lookup.
+    let process = get_process(pid).unwrap_or_else(|| {
+        panic!(
+            "create_process returned PID {} without a published PCB",
+            pid
+        )
+    });
+    let mut setup = UsermodeSetupReceipt::new(pid, process, saved_cr3);
+
     // U.S2-SLICE-3 (CRITICAL-13): boot cap-budget instrumentation for the musl
     // gate. sys_pipe now allocates 2 cap slots; if the boot path ever consumed
     // most of the DEFAULT_CAP_SLOTS(64) preallocation, the first pipe would
@@ -298,25 +366,20 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
     // virtual and boot allocates no caps into the init process).
     #[cfg(feature = "musl_test")]
     {
-        if let Some(proc_arc) = kernel_core::process::get_process(pid) {
-            let used = {
-                let proc = proc_arc.lock();
-                proc.cap_table.len()
-            };
-            let slots = kernel_core::DEFAULT_CAP_SLOTS;
+        let used = setup.process.lock().capability_count();
+        let slots = kernel_core::DEFAULT_CAP_SLOTS;
+        klog_always!(
+            "Boot cap budget: {}/{} slots used before musl test (headroom {})",
+            used,
+            slots,
+            slots.saturating_sub(used)
+        );
+        if slots.saturating_sub(used) < 10 {
             klog_always!(
-                "Boot cap budget: {}/{} slots used before musl test (headroom {})",
-                used,
-                slots,
-                slots.saturating_sub(used)
+                "WARNING: boot consumed {} cap slots (<10 headroom); musl pipe(2 caps) \
+                 may trigger cap-table grow — consider raising DEFAULT_CAP_SLOTS",
+                used
             );
-            if slots.saturating_sub(used) < 10 {
-                klog_always!(
-                    "WARNING: boot consumed {} cap slots (<10 headroom); musl pipe(2 caps) \
-                     may trigger cap-table grow — consider raising DEFAULT_CAP_SLOTS",
-                    used
-                );
-            }
         }
     }
 
@@ -332,6 +395,7 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
             return None;
         }
     };
+    setup.memory_space = memory_space;
 
     // Step 3: Switch to new address space and load ELF
     klog!(Info, "[3/5] Loading ELF binary...");
@@ -365,14 +429,10 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         }
         Err(e) => {
             klog!(Error, "      ✗ Failed to load ELF: {:?}", e);
-            // R186-13 FIX: Rollback fresh address space on ELF load failure.
-            // Restore saved CR3 FIRST (memory_space must not be active when freed),
-            // then free the leaked kernel address space.
-            kernel_core::process::activate_memory_space(saved_cr3, None);
-            kernel_core::process::free_address_space(memory_space);
             return None;
         }
     };
+    setup.elf_charged_bytes = load_result.charged_bytes;
 
     // Step 3.5: Create KPTI user PML4 if KPTI is enabled.
     //
@@ -388,16 +448,11 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
                 // about the user CR3 so that syscall entry/exit assembly switches correctly.
                 kernel_core::process::activate_memory_space(memory_space, Some(user_phys));
                 klog!(Info, "      ✓ KPTI user PML4 at phys 0x{:x}", user_phys);
+                setup.user_memory_space = user_phys;
                 user_phys
             }
             Err(e) => {
                 klog!(Error, "      ✗ Failed to create KPTI user PML4: {:?}", e);
-                // R186-13 FIX: Rollback fresh address space on KPTI creation failure.
-                // Restore saved CR3 FIRST (memory_space must not be active when freed),
-                // then free the leaked kernel address space. No KPTI user PML4 to free
-                // at this point (creation failed).
-                kernel_core::process::activate_memory_space(saved_cr3, None);
-                kernel_core::process::free_address_space(memory_space);
                 return None;
             }
         }
@@ -439,27 +494,14 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         }
         Err(e) => {
             klog!(Error, "      ✗ Failed to build initial user stack: {:?}", e);
-            // Rollback (order matters — mirrors ExecSpaceGuard::drop): restore the
-            // saved (boot) CR3 FIRST. `free_address_space` requires the AS to no longer
-            // be the active CR3 on any CPU (process.rs:4966); at this point CR3 still
-            // points at `memory_space`, so freeing it before the switch would release
-            // the live page tables. THEN free the fresh KPTI user PML4 + kernel AS.
-            // (The never-scheduled process is left behind — cleanup_unscheduled_process
-            // is unsafe here because create_process(ppid=0) already did the cpuset join;
-            // pre-existing boot-diagnostic residual, out of M0 #1 scope.)
-            kernel_core::process::activate_memory_space(saved_cr3, None);
-            if user_memory_space != 0 {
-                free_kpti_user_pml4(user_memory_space);
-            }
-            kernel_core::process::free_address_space(memory_space);
             return None;
         }
     };
 
     // Step 4: Update process PCB with loaded state
     klog!(Info, "[4/5] Configuring process context...");
-    if let Some(process) = get_process(pid) {
-        let mut proc = process.lock();
+    {
+        let mut proc = setup.process.lock();
 
         // Set memory space (kernel CR3 root)
         proc.memory_space = memory_space;
@@ -473,8 +515,7 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         // architectural mapped floor; without this the boot Ring-3 diagnostic / musl-gate
         // process keeps the MmState::new sentinel (0) and a future SLICE-5 grow would EINVAL.
         // Process -> MmState lock order (proc held).
-        proc.mm.lock().stack_floor_committed =
-            kernel_core::elf_loader::user_stack_mapped_floor() as usize;
+        proc.commit_boot_loaded_image_accounting(&load_result);
 
         // Set up context for Ring 3 execution
         proc.context.rip = load_result.entry;
@@ -518,19 +559,11 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         klog!(Info, "        RSP:   0x{:x}", load_result.user_stack_top);
         klog!(Info, "        CS:    0x{:x} (Ring 3)", proc.context.cs);
         klog!(Info, "        SS:    0x{:x} (Ring 3)", proc.context.ss);
-    } else {
-        klog!(Error, "      ✗ Failed to get process");
-        // Clean up KPTI user PML4 if it was created
-        if user_memory_space != 0 {
-            free_kpti_user_pml4(user_memory_space);
-        }
-        kernel_core::process::activate_memory_space(saved_cr3, None);
-        return None;
     }
 
-    // Restore kernel address space before the BSP can enable interrupts and
-    // make this process runnable.
-    kernel_core::process::activate_memory_space(saved_cr3, None);
+    // Ownership has moved into the configured PCB. Restore the kernel address
+    // space and disarm rollback before the BSP can enable interrupts.
+    let process = setup.commit();
 
     klog!(Info, "\n✓ Ring 3 test process prepared!");
     klog!(
@@ -551,7 +584,7 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         "  Expected output: \"Hello from Ring 3!\" followed by PID\n"
     );
 
-    get_process(pid)
+    Some(process)
 }
 
 /// Quick Ring 3 transition test (direct jump, blocking)
