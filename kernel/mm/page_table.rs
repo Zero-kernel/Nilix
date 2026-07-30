@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::{
     instructions::interrupts,
@@ -37,6 +38,41 @@ pub const APIC_VIRT_ADDR: u64 = 0xffff_ffff_fee0_0000; // PML4[511] unused slot
 ///
 /// Long-term solution: Per-address-space locks + TLB shootdown with ACK.
 static PT_LOCK: Mutex<()> = Mutex::new(());
+const NO_PT_LOCK_OWNER: usize = usize::MAX;
+static PT_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_PT_LOCK_OWNER);
+
+struct PtLockGuard {
+    _guard: spin::MutexGuard<'static, ()>,
+}
+
+impl Drop for PtLockGuard {
+    fn drop(&mut self) {
+        PT_LOCK_OWNER_CPU.store(NO_PT_LOCK_OWNER, Ordering::Release);
+    }
+}
+
+#[inline]
+fn lock_pt() -> PtLockGuard {
+    let guard = PT_LOCK.lock();
+    PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
+    PtLockGuard { _guard: guard }
+}
+
+#[inline]
+fn try_lock_pt() -> Option<PtLockGuard> {
+    let guard = PT_LOCK.try_lock()?;
+    PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
+    Some(PtLockGuard { _guard: guard })
+}
+
+/// CPU that currently owns the global page-table lock, if any.
+#[inline]
+pub fn pt_lock_owner_cpu() -> Option<usize> {
+    match PT_LOCK_OWNER_CPU.load(Ordering::Acquire) {
+        NO_PT_LOCK_OWNER => None,
+        cpu => Some(cpu),
+    }
+}
 
 /// R67-5 FIX: Public helper to acquire the global page table lock.
 ///
@@ -58,7 +94,7 @@ pub fn with_pt_lock<T, F>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let _guard = PT_LOCK.lock();
+    let _guard = lock_pt();
     f()
 }
 
@@ -122,7 +158,7 @@ where
     F: FnOnce(&mut PageTableManager) -> T,
 {
     // R67-5 FIX: Acquire global page table lock to serialize cross-CPU modifications
-    let _pt_guard = PT_LOCK.lock();
+    let _pt_guard = lock_pt();
 
     // R32-MM-1 FIX: Disable interrupts to prevent CR3 switch during page table operations
     interrupts::without_interrupts(|| {
@@ -139,14 +175,16 @@ where
 ///
 /// # Safety
 ///
-/// Caller must ensure `physical_memory_offset` is valid and the PT_LOCK is not held by the current CPU.
-/// A contended global PT lock returns `None`; an exception path must never spin
-/// on a lock whose holder may need the faulting CPU to make forward progress.
+/// Caller must ensure `physical_memory_offset` is valid. A contended global PT
+/// lock—including same-CPU re-entry—returns `None`; the exception dispatcher
+/// distinguishes proven same-CPU ownership from ordinary cross-CPU contention.
+/// This function itself never spins on a holder that may need the faulting CPU
+/// to make forward progress.
 pub unsafe fn try_with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> Option<T>
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
-    let _pt_guard = PT_LOCK.try_lock()?;
+    let _pt_guard = try_lock_pt()?;
     Some(interrupts::without_interrupts(|| {
         let _ = physical_memory_offset;
         let phys_offset = get_phys_offset();
@@ -1256,104 +1294,360 @@ pub unsafe fn ensure_pte_range(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
     // R67-5 FIX: Acquire global page table lock
-    let _pt_guard = PT_LOCK.lock();
+    let _pt_guard = lock_pt();
     ensure_pte_range_unlocked(start, size, frame_allocator)
 }
 
-/// Map or tighten an MMIO region with RW+NX+uncached flags.
+const MMIO_PAGE_BYTES: usize = 0x1000;
+const MAX_MMIO_MAP_BYTES: usize = 256 * 1024 * 1024;
+// One 256-MiB range needs at most 128 PTs + one PD + one PDPT. Keep three
+// spare slots for boundary crossings and defensive accounting.
+const MAX_MMIO_TRACKED_TABLES: usize = 132;
+
+struct MmioPtRecorder<'a> {
+    inner: &'a mut crate::memory::FrameAllocator,
+    tracked: &'a mut [Option<PhysFrame<Size4KiB>>; MAX_MMIO_TRACKED_TABLES],
+    tracked_len: &'a mut usize,
+}
+
+unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let frame = self.inner.allocate_frame()?;
+        if *self.tracked_len >= self.tracked.len() {
+            self.inner.deallocate_frame(frame);
+            return None;
+        }
+        self.tracked[*self.tracked_len] = Some(frame);
+        *self.tracked_len += 1;
+        Some(frame)
+    }
+}
+
+#[cfg(test)]
+mod physical_range_tests {
+    use super::{
+        checked_mmio_page_count, checked_physical_range_for_bits, cpu_physical_address_bits,
+        MapError,
+    };
+    use x86_64::{PhysAddr, VirtAddr};
+
+    #[test]
+    fn runtime_physical_width_bounds_complete_range() {
+        let limit36 = 1u64 << 36;
+        assert!(checked_physical_range_for_bits(limit36 - 0x1000, 0x1000, 36).is_some());
+        assert!(checked_physical_range_for_bits(limit36, 1, 36).is_none());
+        assert!(checked_physical_range_for_bits(limit36 - 0x1000, 0x1001, 36).is_none());
+
+        let limit52 = 1u64 << 52;
+        assert!(checked_physical_range_for_bits(limit52 - 0x1000, 0x1000, 52).is_some());
+        assert!(checked_physical_range_for_bits(0, 0, 52).is_none());
+        assert!(checked_physical_range_for_bits(u64::MAX, 2, 52).is_none());
+        assert!(checked_physical_range_for_bits(0, 1, 0).is_none());
+        assert!(checked_physical_range_for_bits(0, 1, 53).is_none());
+    }
+
+    #[test]
+    fn central_mmio_page_count_rejects_rounded_range_crossing_maxphyaddr() {
+        let bits = cpu_physical_address_bits().unwrap_or(52);
+        let limit = 1u64 << bits;
+        let start = limit - 0x1000;
+        let phys = PhysAddr::try_new(start).expect("last in-width page is architectural");
+        assert!(matches!(
+            checked_mmio_page_count(VirtAddr::new(0x1000), phys, 0x1001),
+            Err(MapError::InvalidRange)
+        ));
+    }
+}
+
+static CPU_PHYSICAL_ADDRESS_BITS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+fn cpu_physical_address_bits() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+
+    let cached = CPU_PHYSICAL_ADDRESS_BITS.load(Ordering::Acquire);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let max_extended = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    if max_extended < 0x8000_0008 {
+        return None;
+    }
+    let bits = (unsafe { core::arch::x86_64::__cpuid(0x8000_0008) }.eax & 0xff) as u8;
+    if bits == 0 || bits > 52 {
+        return None;
+    }
+    let _ =
+        CPU_PHYSICAL_ADDRESS_BITS.compare_exchange(0, bits, Ordering::AcqRel, Ordering::Acquire);
+    Some(bits)
+}
+
+fn checked_physical_range_for_bits(start: u64, len: u64, bits: u8) -> Option<PhysAddr> {
+    if len == 0 || bits == 0 || bits > 52 {
+        return None;
+    }
+    let last = start.checked_add(len - 1)?;
+    let limit = 1u64.checked_shl(u32::from(bits))?;
+    if start >= limit || last >= limit {
+        return None;
+    }
+    let start = PhysAddr::try_new(start).ok()?;
+    PhysAddr::try_new(last).ok()?;
+    Some(start)
+}
+
+/// Validate a complete CPU physical range against arithmetic overflow, the
+/// x86_64 architectural ceiling, and this CPU's runtime MAXPHYADDR.
+pub fn checked_physical_range(start: u64, len: u64) -> Option<PhysAddr> {
+    checked_physical_range_for_bits(start, len, cpu_physical_address_bits()?)
+}
+
+fn checked_mmio_page_count(virt: VirtAddr, phys: PhysAddr, size: usize) -> Result<usize, MapError> {
+    if size == 0
+        || virt.as_u64() & (MMIO_PAGE_BYTES as u64 - 1) != 0
+        || phys.as_u64() & (MMIO_PAGE_BYTES as u64 - 1) != 0
+    {
+        return Err(MapError::InvalidRange);
+    }
+    let mapped_len = size
+        .checked_add(MMIO_PAGE_BYTES - 1)
+        .map(|value| value & !(MMIO_PAGE_BYTES - 1))
+        .ok_or(MapError::InvalidRange)?;
+    if mapped_len == 0 || mapped_len > MAX_MMIO_MAP_BYTES {
+        return Err(MapError::InvalidRange);
+    }
+    let tail = (mapped_len - 1) as u64;
+    virt.as_u64()
+        .checked_add(tail)
+        .ok_or(MapError::InvalidRange)?;
+    checked_physical_range(phys.as_u64(), mapped_len as u64).ok_or(MapError::InvalidRange)?;
+    Ok(mapped_len / MMIO_PAGE_BYTES)
+}
+
+/// Map a previously vacant, page-aligned MMIO region with RW+NX+uncached flags.
 ///
-/// This function ensures the target pages are at 4KB granularity and applies
-/// MMIO-appropriate flags (writable, non-executable, non-cacheable).
+/// RF186-4: this is a strict transaction. Existing/non-present ownership state
+/// is rejected; every leaf mapped by a failed call is removed, every page-table
+/// frame allocated by the call is detached and returned, and remote translation
+/// caches are invalidated before any reclaimed frame can be reused.
 ///
 /// # Safety
 ///
-/// - Caller must ensure addresses are valid
-/// - TLB will be flushed automatically
-///
-/// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
-///
-/// # Security (R67-5 fix)
-///
-/// Acquires global PT_LOCK once to serialize all page table modifications,
-/// avoiding deadlock by using unlocked internal helpers.
+/// The caller must own the complete virtual range as a private MMIO reservation
+/// and prove the physical range is a validated device aperture.
 pub unsafe fn map_mmio(
     virt: VirtAddr,
     phys: PhysAddr,
     size: usize,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut crate::memory::FrameAllocator,
 ) -> Result<(), MapError> {
-    // R67-5 FIX: Acquire global page table lock ONCE at top level
-    let _pt_guard = PT_LOCK.lock();
+    let pages = checked_mmio_page_count(virt, phys, size)?;
+    let mapped_len = pages * MMIO_PAGE_BYTES;
+    let _pt_guard = lock_pt();
+    let mut tracked = [None; MAX_MMIO_TRACKED_TABLES];
+    let mut tracked_len = 0usize;
+    let mut reclaimed = [None; MAX_MMIO_TRACKED_TABLES];
+    let mut mapped_pages = 0usize;
 
-    // R32-MM-2 FIX: Pre-calculate page count with overflow checking
-    let pages = size.checked_add(0xfff).ok_or(MapError::InvalidRange)? / 0x1000;
-
-    // R67-5 FIX: Keep CR3 stable and avoid preemption while the global lock is held.
-    // Combine PTE splitting and mapping under a single interrupt-disabled section
-    // to prevent CR3 switches while modifying page tables.
     let result = interrupts::without_interrupts(|| {
-        // First ensure all pages are at 4KB granularity (use unlocked version)
-        ensure_pte_range_unlocked(virt, size, frame_allocator)?;
-
-        let flags = mmio_flags();
         let phys_offset = get_phys_offset();
         let level_4_table = active_level_4_table(phys_offset);
         let mapper = OffsetPageTable::new(level_4_table, phys_offset);
         let mut mgr = PageTableManager { mapper };
 
-        for i in 0..pages {
-            // R32-MM-2 FIX: Use checked arithmetic for offset calculation
-            let offset = (i as u64)
-                .checked_mul(0x1000)
-                .ok_or(MapError::InvalidRange)?;
-            let virt_u64 = virt
-                .as_u64()
-                .checked_add(offset)
-                .ok_or(MapError::InvalidRange)?;
-            let phys_u64 = phys
-                .as_u64()
-                .checked_add(offset)
-                .ok_or(MapError::InvalidRange)?;
-            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_u64));
-            let frame = PhysFrame::containing_address(PhysAddr::new(phys_u64));
-
-            match mgr.map_page(page, frame, flags, frame_allocator) {
-                Ok(()) => {}
-                Err(MapError::PageAlreadyMapped) => {
-                    // Verify existing mapping points to same physical frame
-                    match mgr.translate_addr(page.start_address()) {
-                        Some(mapped) if mapped == frame.start_address() => {
-                            // Same frame, just update flags
-                            mgr.update_flags(page, flags)
-                                .map_err(|_| MapError::ParentEntryHugePage)?;
-                        }
-                        Some(_) => {
-                            // Different frame mapped - conflict
-                            return Err(MapError::PageAlreadyMapped);
-                        }
-                        None => {
-                            // Inconsistent page table state
-                            return Err(MapError::ParentEntryHugePage);
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
+        // Preflight the complete virtual reservation before allocating a single
+        // paging structure. Hidden non-present PTE ownership and huge parents
+        // both fail closed through page_slot_is_unused().
+        for index in 0..pages {
+            let offset = (index * MMIO_PAGE_BYTES) as u64;
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virt.as_u64() + offset))
+                .map_err(|_| MapError::InvalidRange)?;
+            if !mgr.page_slot_is_unused(page) {
+                return Err(MapError::PageAlreadyMapped);
             }
         }
+
+        let failure = {
+            let mut recorder = MmioPtRecorder {
+                inner: frame_allocator,
+                tracked: &mut tracked,
+                tracked_len: &mut tracked_len,
+            };
+            let mut failure = None;
+            for index in 0..pages {
+                let offset = (index * MMIO_PAGE_BYTES) as u64;
+                let page =
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(virt.as_u64() + offset))
+                        .map_err(|_| MapError::InvalidRange)?;
+                let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(
+                    phys.as_u64() + offset,
+                ))
+                .map_err(|_| MapError::InvalidRange)?;
+                if let Err(error) = mgr.map_page(page, frame, mmio_flags(), &mut recorder) {
+                    failure = Some(error);
+                    break;
+                }
+                mapped_pages += 1;
+            }
+            failure
+        };
+
+        if let Some(error) = failure {
+            for index in 0..mapped_pages {
+                let offset = (index * MMIO_PAGE_BYTES) as u64;
+                let page =
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(virt.as_u64() + offset))
+                        .expect("validated MMIO rollback page");
+                mgr.unmap_page(page)
+                    .unwrap_or_else(|_| panic!("RF186-4: MMIO leaf rollback failed"));
+            }
+            let rollback = mgr.rollback_tracked_leaf_tables(
+                virt,
+                mapped_len,
+                &tracked,
+                tracked_len,
+                &mut reclaimed,
+                false,
+            );
+            if !rollback.all_accounted {
+                panic!("RF186-4: MMIO page-table rollback accounting failed");
+            }
+            return Err(error);
+        }
+
         Ok(())
     });
 
-    result?;
+    // rollback_tracked_leaf_tables issued the paging-structure shootdown before
+    // returning reclaimed frames. Return them only while PT_LOCK still excludes
+    // another mapper from observing/reusing the detached hierarchy.
+    for frame in reclaimed.into_iter().flatten() {
+        frame_allocator.deallocate_frame(frame);
+    }
+    drop(_pt_guard);
+    crate::tlb_shootdown::flush_current_as_range(virt, mapped_len);
+    result
+}
 
-    // R68-2 FIX: Propagate MMIO mapping/permission updates to ALL CPUs.
-    //
-    // MMIO mappings are typically shared across all CPUs (e.g., LAPIC, VGA buffer),
-    // so remote CPUs must also invalidate their TLB entries. Using local-only flush
-    // leaves stale entries on other CPUs, which could cause incorrect MMIO behavior
-    // or permission bypass if the update was to tighten access.
-    //
-    // flush_current_as_range handles large ranges efficiently (full flush fallback).
-    crate::tlb_shootdown::flush_current_as_range(virt, pages * 0x1000);
+/// Remove a complete MMIO transaction created by [`map_mmio`].
+///
+/// The range is preflighted before mutation and empty paging structures are
+/// reclaimed bottom-up without heap allocation. This is used by driver mapping
+/// transactions to unwind earlier windows when a later window fails.
+pub unsafe fn unmap_mmio(
+    virt: VirtAddr,
+    size: usize,
+    frame_allocator: &mut crate::memory::FrameAllocator,
+) -> Result<(), UnmapError> {
+    let pages = checked_mmio_page_count(virt, PhysAddr::new(0), size)
+        .map_err(|_| UnmapError::InvalidRange)?;
+    let mapped_len = pages * MMIO_PAGE_BYTES;
+    let _pt_guard = lock_pt();
+    let mut reclaimed = [None; MAX_MMIO_TRACKED_TABLES];
+    let mut reclaimed_len = 0usize;
 
+    interrupts::without_interrupts(|| {
+        let phys_offset = get_phys_offset();
+        let level_4_table = active_level_4_table(phys_offset);
+        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+        let mut mgr = PageTableManager { mapper };
+        for index in 0..pages {
+            let address = VirtAddr::new(virt.as_u64() + (index * MMIO_PAGE_BYTES) as u64);
+            let Some((_, flags)) = mgr.translate_with_flags(address) else {
+                return Err(UnmapError::PageNotMapped);
+            };
+            let required = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE
+                | PageTableFlags::NO_CACHE;
+            if !flags.contains(required) {
+                return Err(UnmapError::InvalidRange);
+            }
+        }
+        for index in 0..pages {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(
+                virt.as_u64() + (index * MMIO_PAGE_BYTES) as u64,
+            ))
+            .map_err(|_| UnmapError::InvalidRange)?;
+            mgr.unmap_page(page)?;
+        }
+
+        detach_empty_mmio_tables(
+            &mut mgr,
+            virt,
+            mapped_len,
+            &mut reclaimed,
+            &mut reclaimed_len,
+        );
+        Ok(())
+    })?;
+
+    crate::tlb_shootdown::flush_all_address_spaces();
+    for frame in reclaimed.into_iter().take(reclaimed_len).flatten() {
+        frame_allocator.deallocate_frame(frame);
+    }
+    drop(_pt_guard);
     Ok(())
+}
+
+unsafe fn detach_empty_mmio_tables(
+    manager: &mut PageTableManager,
+    start: VirtAddr,
+    len: usize,
+    reclaimed: &mut [Option<PhysFrame<Size4KiB>>; MAX_MMIO_TRACKED_TABLES],
+    reclaimed_len: &mut usize,
+) {
+    const PT_SPAN: u64 = 0x20_0000;
+    fn empty(table: &PageTable) -> bool {
+        table.iter().all(|entry| entry.is_unused())
+    }
+    fn record(
+        output: &mut [Option<PhysFrame<Size4KiB>>; MAX_MMIO_TRACKED_TABLES],
+        len: &mut usize,
+        frame: PhysFrame<Size4KiB>,
+    ) {
+        if *len >= output.len() {
+            panic!("RF186-4: MMIO table reclaim capacity exceeded");
+        }
+        output[*len] = Some(frame);
+        *len += 1;
+    }
+
+    let start_u = start.as_u64();
+    let end_u = start_u + (len as u64 - 1);
+    let pml4 = manager.mapper.level_4_table_mut();
+
+    let mut cursor = start_u & !(PT_SPAN - 1);
+    loop {
+        let addr = VirtAddr::new(cursor);
+        let pml4e = &pml4[usize::from(addr.p4_index())];
+        if pml4e.flags().contains(PageTableFlags::PRESENT) {
+            let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
+            let pdpte = &pdpt[usize::from(addr.p3_index())];
+            if pdpte.flags().contains(PageTableFlags::PRESENT)
+                && !pdpte.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                let pd = &mut *phys_to_virt(pdpte.addr()).as_mut_ptr::<PageTable>();
+                let pde = &mut pd[usize::from(addr.p2_index())];
+                if pde.flags().contains(PageTableFlags::PRESENT)
+                    && !pde.flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    let table = &*phys_to_virt(pde.addr()).as_ptr::<PageTable>();
+                    if empty(table) {
+                        let frame = PhysFrame::containing_address(pde.addr());
+                        pde.set_unused();
+                        record(reclaimed, reclaimed_len, frame);
+                    }
+                }
+            }
+        }
+        match cursor.checked_add(PT_SPAN) {
+            Some(next) if next <= end_u => cursor = next,
+            _ => break,
+        }
+    }
+
+    // Empty PD/PDPT frames remain reachable for reuse. Runtime KPTI roots may
+    // carry upper paging-structure entries by value; detaching those tables
+    // without a global root registry could leave a stale peer-root alias.
 }
