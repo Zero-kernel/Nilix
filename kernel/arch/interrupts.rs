@@ -420,72 +420,6 @@ static AP_TIMER_SEEN: [AtomicBool; 64] = {
     [INIT; 64]
 };
 
-// ============================================================================
-// R186-10: bounded COW `Busy` retry, per CPU.
-//
-// A `Busy` disposition re-executes the faulting instruction. That terminates
-// whenever the PT_LOCK holder is another CPU, because IRETQ re-enables
-// interrupts between attempts and the holder's TLB-shootdown IPI is serviced.
-// The one case with no forward progress is the holder being THIS cpu's own
-// interrupted context, which is a kernel bug rather than contention. Left
-// unbounded it would present as an unexplained hard hang; bounding it turns
-// that into a reported fatal fault.
-//
-// Only the owning CPU touches its slot, so `Relaxed` is sufficient — these are
-// diagnostics, not synchronization.
-// ============================================================================
-
-/// Consecutive `Busy` results tolerated for the same faulting address before the
-/// fault is escalated. Large enough that ordinary multi-CPU contention (bounded
-/// by one page-table critical section per attempt) can never reach it.
-const COW_BUSY_RETRY_LIMIT: u32 = 1 << 16;
-
-static COW_BUSY_ADDR: [AtomicU64; 64] = {
-    const INIT: AtomicU64 = AtomicU64::new(u64::MAX);
-    [INIT; 64]
-};
-
-static COW_BUSY_COUNT: [AtomicU32; 64] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; 64]
-};
-
-/// Record one `Busy` for `fault_addr` and report whether the retry budget for
-/// this CPU is spent. A different address resets the streak: progress on any
-/// other page proves the lock is being released.
-fn cow_busy_retry_exhausted(fault_addr: usize) -> bool {
-    let cpu = cpu_local::current_cpu_id();
-    let Some(addr_slot) = COW_BUSY_ADDR.get(cpu) else {
-        return false;
-    };
-    let Some(count_slot) = COW_BUSY_COUNT.get(cpu) else {
-        return false;
-    };
-
-    let addr = fault_addr as u64;
-    if addr_slot.load(Ordering::Relaxed) != addr {
-        addr_slot.store(addr, Ordering::Relaxed);
-        count_slot.store(1, Ordering::Relaxed);
-        return false;
-    }
-
-    let attempts = count_slot.load(Ordering::Relaxed).saturating_add(1);
-    count_slot.store(attempts, Ordering::Relaxed);
-    attempts >= COW_BUSY_RETRY_LIMIT
-}
-
-/// Any non-`Busy` outcome means this CPU made progress; forget the streak so a
-/// later, unrelated contention episode starts from a full budget.
-fn clear_cow_busy_streak() {
-    let cpu = cpu_local::current_cpu_id();
-    if let Some(slot) = COW_BUSY_ADDR.get(cpu) {
-        slot.store(u64::MAX, Ordering::Relaxed);
-    }
-    if let Some(slot) = COW_BUSY_COUNT.get(cpu) {
-        slot.store(0, Ordering::Relaxed);
-    }
-}
-
 lazy_static! {
     /// 全局中断描述符表
     static ref IDT: InterruptDescriptorTable = {
@@ -1251,7 +1185,6 @@ extern "x86-interrupt" fn page_fault_handler(
             match unsafe { kernel_core::fork::handle_cow_page_fault(pid, fault_addr) } {
                 kernel_core::fork::CowFaultResult::Handled => {
                     // G.1: Track successful COW page fault handling
-                    clear_cow_busy_streak();
                     increment_counter(TraceCounter::CowFaults, 1);
                     return; // COW resolved, resume execution
                 }
@@ -1263,32 +1196,26 @@ extern "x86-interrupt" fn page_fault_handler(
                     // attempts — that is what makes this terminate rather than
                     // livelock, and it is also why we must NOT spin here with
                     // interrupts disabled.
-                    if cow_busy_retry_exhausted(fault_addr) {
-                        // Defense in depth. Retrying can only fail forever if
-                        // the contending holder is THIS cpu's own interrupted
-                        // context — a kernel bug that would otherwise present
-                        // as an unexplained hard hang. Fall through to fatal
-                        // handling so it is reported instead of hidden.
-                        klog_force!(
-                            "R186-10: COW retry exhausted at {:#x} (pid {}) — PT_LOCK \
-                             appears held by this CPU's interrupted context",
-                            fault_addr,
-                            pid
+                    let cpu = cpu_local::current_cpu_id();
+                    if mm::pt_lock_owner_cpu() == Some(cpu) {
+                        panic!(
+                            "RF186-6: same-CPU PT_LOCK reentry during COW fault at {:#x} (pid {})",
+                            fault_addr, pid
                         );
-                    } else {
-                        return;
                     }
+                    // Ordinary cross-CPU contention is never user-fatal. Return
+                    // through IRETQ so interrupts and scheduling make progress,
+                    // then retry the still-read-only instruction without a budget.
+                    return;
                 }
                 kernel_core::fork::CowFaultResult::NotCow => {
                     // Genuinely not a COW page - fall through to normal handling
-                    clear_cow_busy_streak();
                 }
                 kernel_core::fork::CowFaultResult::Fatal(reason) => {
                     // A real COW page we could not resolve. Terminating is
                     // correct, but the reason must be recorded: the previous
                     // code reported allocator exhaustion and refcount
                     // corruption as "not a COW page", making both invisible.
-                    clear_cow_busy_streak();
                     klog_force!(
                         "R186-10: COW resolution failed at {:#x} (pid {}): {:?}",
                         fault_addr,
