@@ -286,6 +286,20 @@ fn install_cap_vec<T>(
     drop(old_charge);
 }
 
+/// RF186-24 FIX: choose bounded amortized backing without doubling the default
+/// floor itself. Empty-table regrowth must retain the same default capacity as
+/// a fresh production table (64, not 128), while established tables still grow
+/// geometrically and all paths remain capped by the u16 slot domain.
+#[inline]
+fn cap_growth_target(current_capacity: usize, required: usize) -> usize {
+    debug_assert!(required <= MAX_CAP_SLOTS);
+    current_capacity
+        .checked_mul(2)
+        .unwrap_or(MAX_CAP_SLOTS)
+        .clamp(DEFAULT_CAP_SLOTS, MAX_CAP_SLOTS)
+        .max(required)
+}
+
 /// Slot ties a capability entry to its generation counter.
 #[derive(Debug)]
 struct CapSlot {
@@ -889,24 +903,32 @@ impl CapTableInner {
                 .len()
                 .checked_add(1)
                 .ok_or(CapError::OutOfMemory)?;
-            let preferred = self
-                .slots
-                .capacity()
-                .max(self.free.capacity())
-                .max(DEFAULT_CAP_SLOTS)
-                .checked_mul(2)
-                .unwrap_or(MAX_CAP_SLOTS)
-                .min(MAX_CAP_SLOTS)
-                .max(new_len);
-            let slots_prepared = if self.slots.capacity() < new_len {
-                Some(prepare_cap_vec::<Option<CapSlot>>(preferred)?)
-            } else {
-                None
+            let current_capacity = self.slots.capacity().max(self.free.capacity());
+            let preferred = cap_growth_target(current_capacity, new_len);
+            let needs_slots = self.slots.capacity() < new_len;
+            let needs_free = self.free.capacity() < new_len;
+            let prepare_growth = |capacity| {
+                let slots = if needs_slots {
+                    Some(prepare_cap_vec::<Option<CapSlot>>(capacity)?)
+                } else {
+                    None
+                };
+                let free = if needs_free {
+                    Some(prepare_cap_vec::<u16>(capacity)?)
+                } else {
+                    None
+                };
+                Ok::<_, CapError>((slots, free))
             };
-            let free_prepared = if self.free.capacity() < new_len {
-                Some(prepare_cap_vec::<u16>(preferred)?)
-            } else {
-                None
+            // RF186-24 FIX: spare amortized capacity is optional. If the class
+            // ledger cannot admit `preferred`, retry the complete detached pair
+            // at the exact required size before reporting OOM. Both attempts are
+            // transaction-neutral because no live backing changes until the
+            // complete pair has succeeded.
+            let (slots_prepared, free_prepared) = match prepare_growth(preferred) {
+                Ok(prepared) => prepared,
+                Err(_) if preferred != new_len => prepare_growth(new_len)?,
+                Err(error) => return Err(error),
             };
 
             // Both detached allocations succeeded before either live backing
@@ -1085,6 +1107,74 @@ impl CapTableInner {
     }
 }
 
+/// RF186-23/RF186-24 boot regression: exercise real charged production backing
+/// after the heap-admission ledger is published. Sole cancellation must reclaim
+/// both vectors and their charges; recovery must use bounded default backing,
+/// consume exactly one new generation, and restore the class ledger on drop.
+pub fn run_reclaim_growth_self_test() {
+    let before = mm::heap_class_snapshot(HeapClass::Capability);
+    {
+        let table = CapTable::try_new_arc().expect("RF186 charged capability table");
+        let initial_capacity = interrupts::without_interrupts(|| {
+            let inner = table.inner.lock();
+            assert_eq!(inner.slots.len(), DEFAULT_CAP_SLOTS);
+            assert_eq!(inner.free.len(), DEFAULT_CAP_SLOTS);
+            assert!(inner.slots_charge.is_some() && inner.free_charge.is_some());
+            (inner.slots.capacity(), inner.free.capacity())
+        });
+
+        let abandoned = table
+            .prepare_allocation()
+            .expect("RF186 sole capability reservation");
+        let abandoned_id = abandoned.cap_id();
+        drop(abandoned);
+        interrupts::without_interrupts(|| {
+            let inner = table.inner.lock();
+            assert_eq!(inner.reserved_allocations, 0);
+            assert!(inner.slots.is_empty() && inner.free.is_empty());
+            assert_eq!((inner.slots.capacity(), inner.free.capacity()), (0, 0));
+            assert!(inner.slots_charge.is_none() && inner.free_charge.is_none());
+        });
+
+        let recovered = table
+            .prepare_allocation()
+            .expect("RF186 capability regrowth after reclaim");
+        let recovered_id = recovered.cap_id();
+        assert_eq!(recovered_id.index(), 0);
+        assert_eq!(
+            recovered_id.generation(),
+            abandoned_id
+                .generation()
+                .checked_add(1)
+                .expect("RF186 capability generation must be incrementable")
+        );
+        assert_ne!(recovered_id, abandoned_id);
+        interrupts::without_interrupts(|| {
+            let inner = table.inner.lock();
+            assert_eq!(inner.reserved_allocations, 1);
+            assert_eq!(
+                (inner.slots.capacity(), inner.free.capacity()),
+                initial_capacity,
+                "empty capability regrowth must not double default backing"
+            );
+            assert!(inner.slots_charge.is_some() && inner.free_charge.is_some());
+        });
+
+        drop(recovered);
+        interrupts::without_interrupts(|| {
+            let inner = table.inner.lock();
+            assert_eq!(inner.reserved_allocations, 0);
+            assert!(inner.slots.is_empty() && inner.free.is_empty());
+            assert!(inner.slots_charge.is_none() && inner.free_charge.is_none());
+        });
+    }
+    assert_eq!(
+        mm::heap_class_snapshot(HeapClass::Capability),
+        before,
+        "RF186 capability reclaim/regrowth leaked class admission"
+    );
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -1222,6 +1312,72 @@ mod tests {
             before_generation + 1,
             "cancelled identities still consume generations"
         );
+    }
+
+    #[test]
+    fn rf186_23_empty_rollback_reclaims_and_growth_target_is_bounded() {
+        // RF186-23 FIX: pin the distinction that the boot self-test missed.
+        // A sole reservation cancellation reclaims all empty backing; it does
+        // not promise that the next reservation reuses the old slot index.
+        let mut inner = CapTableInner::with_capacity(DEFAULT_CAP_SLOTS);
+        let (abandoned_index, abandoned_generation) = inner
+            .reserve_allocation()
+            .expect("reserve sole capability identity");
+        assert_eq!(abandoned_index as usize, DEFAULT_CAP_SLOTS - 1);
+
+        inner.cancel_reserved(abandoned_index);
+        assert_eq!(inner.reserved_allocations, 0);
+        assert!(inner.slots.is_empty(), "sole rollback must reclaim slots");
+        assert!(inner.free.is_empty(), "sole rollback must reclaim free IDs");
+        assert_eq!(
+            inner.next_generation,
+            abandoned_generation + 1,
+            "cancelled identities consume generations monotonically"
+        );
+
+        // Hosted cap tests deliberately leave the global heap ledger
+        // unpublished, so actual charged regrowth is covered by the boot
+        // self-test. Keep the pure target policy executable here.
+        assert_eq!(cap_growth_target(0, 1), DEFAULT_CAP_SLOTS);
+        assert_eq!(
+            cap_growth_target(DEFAULT_CAP_SLOTS, DEFAULT_CAP_SLOTS + 1),
+            DEFAULT_CAP_SLOTS * 2
+        );
+        assert_eq!(
+            cap_growth_target(MAX_CAP_SLOTS, MAX_CAP_SLOTS),
+            MAX_CAP_SLOTS
+        );
+    }
+
+    #[test]
+    fn rf186_23_pinned_backing_reuses_slot_with_new_generation() {
+        // Exact index reuse is a conditional internal behavior only while a
+        // live capability pins the backing. Keep that case separate from the
+        // empty-table reclamation contract above.
+        let mut inner = CapTableInner::with_capacity(2);
+        let live = inner
+            .allocate(CapEntry::new(CapObject::Process(1), CapRights::SIGNAL))
+            .expect("allocate backing pin");
+        let (abandoned_index, abandoned_generation) = inner
+            .reserve_allocation()
+            .expect("reserve pinned capability identity");
+
+        inner.cancel_reserved(abandoned_index);
+        assert_eq!(inner.slots.len(), 2, "live capability must pin backing");
+        let (recovered_index, recovered_generation) = inner
+            .reserve_allocation()
+            .expect("reuse cancelled slot while backing remains pinned");
+        assert_eq!(recovered_index, abandoned_index);
+        assert_eq!(recovered_generation, abandoned_generation + 1);
+        assert_ne!(
+            CapId::from_parts(recovered_index, recovered_generation),
+            CapId::from_parts(abandoned_index, abandoned_generation)
+        );
+
+        inner.cancel_reserved(recovered_index);
+        inner.revoke(live).expect("release backing pin");
+        assert_eq!(inner.reserved_allocations, 0);
+        assert!(inner.slots.is_empty() && inner.free.is_empty());
     }
 
     #[test]

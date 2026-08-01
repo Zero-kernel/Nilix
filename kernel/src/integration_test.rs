@@ -179,10 +179,29 @@ pub fn test_syscalls() {
     // transaction. The production path's single Process guard prevents recursive
     // locking; this pure CapTable probe specifically verifies that a reserved slot
     // is invisible until installed, its id is stable, and cancellation cannot
-    // alias the capability that later reuses the slot.
+    // alias a capability published by a later transaction.
     kernel_core::syscall::run_fd_publication_transaction_self_test();
     klog_always!(
         "    ✓ R186-1 cap reservation: invisible-before-install + id stability + cancel-no-alias"
+    );
+    cap::run_reclaim_growth_self_test();
+    klog_always!(
+        "    ✓ RF186 capability rollback: reclaim + bounded regrowth + ledger restoration"
+    );
+    // RF186 review-fix: pin the final cross-crate publication invariants. The
+    // pipe probe injects failure at the second cap reservation and proves both
+    // FD/files.max reservations are returned, the first cap reservation is
+    // cancelled, empty backing is reclaimed, and its consumed generation cannot
+    // alias the recovered reservation. The broker probe rejects wrong-table and
+    // wrong-credential authority without consuming capacity. The audit probe
+    // executes the exact grant RAII owner with a deterministic emitter and
+    // proves explicit completion and Drop fallback each fire exactly once while
+    // the authorization proof remains live.
+    ipc::run_pipe_second_cap_failure_self_test();
+    kernel_core::process::Process::run_capability_authority_binding_self_test();
+    kernel_core::syscall::run_authorized_cap_grant_audit_self_test();
+    klog_always!(
+        "    ✓ RF186 pipe/cap publication: second-reserve rollback + authority binding + exactly-once audit"
     );
     kernel_core::syscall::run_fork_reconcile_refcount_self_test();
     klog_always!(

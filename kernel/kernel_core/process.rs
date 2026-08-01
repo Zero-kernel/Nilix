@@ -2334,6 +2334,87 @@ impl Process {
         );
     }
 
+    /// RF186 review-fix regression for the opaque capability-table broker.
+    /// Both fixtures remain private and unpublished. A table authority from a
+    /// different PCB and an authorization token from a different credential
+    /// identity must each fail before LSM mediation or slot reservation.
+    pub fn run_capability_authority_binding_self_test() {
+        let primary = Process::new(
+            0x186_5003,
+            1,
+            String::from("rf186-cap-authority-primary"),
+            120,
+        );
+        let foreign = Process::new(
+            0x186_5004,
+            1,
+            String::from("rf186-cap-authority-foreign"),
+            120,
+        );
+        let primary_authority = primary.capability_table_authority();
+        let foreign_authority = foreign.capability_table_authority();
+
+        let primary_credentials = primary.shared_credentials();
+        let control = primary
+            .prepare_capability_allocation_authorized(
+                &primary_authority,
+                primary_credentials.begin_authorization(),
+            )
+            .expect("correctly bound capability authority control");
+        let cancelled_control_id = control.cap_id();
+        drop(control);
+        assert_eq!(primary.capability_count(), 0);
+
+        let wrong_table = primary.prepare_capability_allocation_authorized(
+            &foreign_authority,
+            primary_credentials.begin_authorization(),
+        );
+        assert!(
+            matches!(wrong_table, Err(SyscallError::EPERM)),
+            "capability broker accepted authority for a different table"
+        );
+
+        let foreign_credentials = foreign.shared_credentials();
+        let wrong_identity = primary.prepare_capability_allocation_authorized(
+            &primary_authority,
+            foreign_credentials.begin_authorization(),
+        );
+        assert!(
+            matches!(wrong_identity, Err(SyscallError::EPERM)),
+            "capability broker accepted authorization for a different credential identity"
+        );
+
+        assert_eq!(primary.capability_count(), 0);
+        assert_eq!(foreign.capability_count(), 0);
+        // RF186-23 FIX: dropping the sole control reservation must reclaim the
+        // empty table. The two rejected broker calls must consume neither a
+        // slot nor a generation, so the first successful recovery regrows at
+        // index 0 with exactly the next identity generation.
+        let recovered = primary
+            .prepare_capability_allocation_authorized(
+                &primary_authority,
+                primary_credentials.begin_authorization(),
+            )
+            .expect("rejected mismatches must not consume capability capacity");
+        let recovered_id = recovered.cap_id();
+        assert_eq!(
+            recovered_id.index(),
+            0,
+            "sole reservation cancellation must reclaim empty capability backing"
+        );
+        assert_eq!(
+            recovered_id.generation(),
+            cancelled_control_id
+                .generation()
+                .checked_add(1)
+                .expect("RF186 capability generation must be incrementable"),
+            "rejected capability authorities must not consume generations"
+        );
+        assert_ne!(recovered_id, cancelled_control_id);
+        drop(recovered);
+        assert_eq!(primary.capability_count(), 0);
+    }
+
     /// RF180-17 FIX: publish an already-admitted name with no allocation or
     /// recoverable failure in exec's post-PONR commit window.
     pub fn commit_prepared_name(&mut self, prepared: PreparedProcessName) {

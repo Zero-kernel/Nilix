@@ -62,6 +62,133 @@ pub use futex::{
     FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
 };
 
+/// Reserve both unpublished pipe capability identities as one rollback-safe
+/// preparation step. If the second reservation fails, Rust drops the first
+/// token before returning the error; `PreparedCapAllocation` and the
+/// authorization-bearing kernel-core wrapper both use that Drop edge to cancel
+/// the exact reservation without publishing or arbitrary-ID revocation. If it
+/// was the table's sole use, cancellation also releases the empty backing.
+fn prepare_pipe_capability_pair<T, E>(
+    reserve_read: impl FnOnce() -> Result<T, E>,
+    reserve_write: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, T), E> {
+    let read = reserve_read()?;
+    let write = reserve_write()?;
+    Ok((read, write))
+}
+
+/// Cancel the two FD reservations owned by one failed pipe publication. Reverse
+/// order mirrors stack rollback and makes a stale/double-cancel a fail-stop
+/// invariant violation instead of silently leaking a `files.max` charge.
+fn cancel_pipe_fd_pair(proc: &mut process::Process, read_fd: i32, write_fd: i32) {
+    assert!(proc.cancel_fd_reservation(write_fd));
+    assert!(proc.cancel_fd_reservation(read_fd));
+}
+
+/// RF186 review-fix regression: a deterministic failure of the SECOND pipe
+/// capability reservation must unwind the first capability slot and both FD
+/// reservations. The fixture is never registered in `PROCESS_TABLE`; root
+/// cgroup FD charging is explicitly exempt, and every local reservation is
+/// cancelled before return.
+pub fn run_pipe_second_cap_failure_self_test() {
+    use core::cell::Cell;
+
+    let mut fixture = process::Process::new(
+        0x186_5001,
+        1,
+        alloc::string::String::from("rf186-pipe-cap-rollback"),
+        120,
+    );
+    assert_eq!(fixture.total_fd_charge_count(), 0);
+    assert_eq!(fixture.capability_count(), 0);
+
+    let read_fd = fixture.reserve_fd().expect("RF186 pipe read FD reserve");
+    let write_fd = fixture.reserve_fd().expect("RF186 pipe write FD reserve");
+    assert_eq!(fixture.total_fd_charge_count(), 2);
+
+    let foreign = process::Process::new(
+        0x186_5002,
+        1,
+        alloc::string::String::from("rf186-pipe-cap-foreign"),
+        120,
+    );
+    let cap_authority = fixture.capability_table_authority();
+    let foreign_authority = foreign.capability_table_authority();
+    let credentials = fixture.shared_credentials();
+    let first_id = Cell::new(cap::CapId::INVALID);
+    let result = prepare_pipe_capability_pair(
+        || {
+            let reservation = kernel_core::prepare_process_cap_allocation_authorized(
+                &fixture,
+                &cap_authority,
+                credentials.begin_authorization(),
+            )?;
+            first_id.set(reservation.cap_id());
+            Ok(reservation)
+        },
+        || {
+            // Deterministically fail at the same identity-bound broker call
+            // used by production, after the first real fixture-table slot has
+            // been reserved. The foreign authority must be rejected before it
+            // can reserve or publish anything in either table.
+            kernel_core::prepare_process_cap_allocation_authorized(
+                &fixture,
+                &foreign_authority,
+                credentials.begin_authorization(),
+            )
+        },
+    );
+    assert!(matches!(result, Err(SyscallError::EPERM)));
+
+    // This is the same error arm used by `pipe_create_callback` below.
+    cancel_pipe_fd_pair(&mut fixture, read_fd, write_fd);
+
+    assert_eq!(
+        fixture.total_fd_charge_count(),
+        0,
+        "second cap-reservation failure leaked an FD/files.max charge"
+    );
+    assert!(fixture.get_fd(read_fd).is_none() && fixture.get_fd(write_fd).is_none());
+    assert_eq!(fixture.capability_count(), 0);
+    assert_eq!(foreign.capability_count(), 0);
+
+    // RF186-23 FIX: the cancelled reservation was the table's sole use, so
+    // rollback must reclaim its empty backing. A later reservation therefore
+    // regrows at index 0, consumes the next generation, and cannot alias the
+    // abandoned identity. Exact index reuse is only valid while other live or
+    // reserved capabilities pin the old backing.
+    let recovered = kernel_core::prepare_process_cap_allocation_authorized(
+        &fixture,
+        &cap_authority,
+        credentials.begin_authorization(),
+    )
+    .expect("cancelled pipe capability capacity must remain available");
+    let abandoned_id = first_id.get();
+    let recovered_id = recovered.cap_id();
+    assert_eq!(
+        recovered_id.index(),
+        0,
+        "sole reservation rollback must reclaim empty capability backing"
+    );
+    assert_eq!(
+        recovered_id.generation(),
+        abandoned_id
+            .generation()
+            .checked_add(1)
+            .expect("RF186 capability generation must be incrementable"),
+        "rollback must consume exactly one generation and rejected authority must consume none"
+    );
+    assert_ne!(recovered_id, abandoned_id);
+    drop(recovered);
+
+    let recovered_read_fd = fixture.reserve_fd().expect("recovered read FD reserve");
+    let recovered_write_fd = fixture.reserve_fd().expect("recovered write FD reserve");
+    assert_eq!((recovered_read_fd, recovered_write_fd), (read_fd, write_fd));
+    cancel_pipe_fd_pair(&mut fixture, recovered_read_fd, recovered_write_fd);
+    assert_eq!(fixture.total_fd_charge_count(), 0);
+    assert_eq!(fixture.capability_count(), 0);
+}
+
 // ============================================================================
 // 系统调用回调实现
 // ============================================================================
@@ -84,15 +211,13 @@ pub use futex::{
 /// - **CRITICAL-5**: `CapObject::Pipe` carries plain `{pipe_id, end_type}`
 ///   data — the `Arc<Pipe>` stays exclusively in the `PipeHandle`s, so a
 ///   revoke can never double-close the pipe.
-/// - **CRITICAL-6**: BOTH caps are allocated before EITHER fd is installed;
-///   the rollback ladder below is exact at every rung.
-/// - **CRITICAL-7 + LEAK FIX (deviation from design-v2/v3)**: an INSTALLED
-///   fd's cap rolls back only through the `remove_fd` funnel; an UNINSTALLED
-///   cap is funnel-unreachable and takes the cap-only stage
-///   (`revoke_uninstalled_pipe_cap`). design-v2/v3's arms dropped the
-///   rejected boxes without paying the uninstalled caps back — 1-2 slots
-///   leaked per failed sys_pipe (TableFull DoS class); the ladder here closes
-///   that.
+/// - **CRITICAL-6/7 + LEAK FIX (deviation from design-v2/v3)**: BOTH
+///   capability identities are prepared before EITHER fd or capability is
+///   visible. Any pre-publication failure drops the prepared reservations,
+///   cancelling their exact generation-bound ownership by RAII and reclaiming
+///   empty table backing; no arbitrary-ID revocation path exists. Once
+///   installed, each fd's capability rolls back only through the `remove_fd`
+///   funnel.
 /// - **R170-6**: every rollback `PipeHandle` Drop (close → wake) runs OUTSIDE
 ///   the Process lock via `rollback_outside`.
 fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
@@ -170,29 +295,25 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         // back by RAII, so a second-reservation failure can never leave an
         // orphaned first CapId or rely on arbitrary-id revocation.
         let cap_authority = proc.capability_table_authority();
-        let read_capability = match kernel_core::prepare_process_cap_allocation_authorized(
-            &proc,
-            &cap_authority,
-            read_authorization,
+        let (read_capability, write_capability) = match prepare_pipe_capability_pair(
+            || {
+                kernel_core::prepare_process_cap_allocation_authorized(
+                    &proc,
+                    &cap_authority,
+                    read_authorization,
+                )
+            },
+            || {
+                kernel_core::prepare_process_cap_allocation_authorized(
+                    &proc,
+                    &cap_authority,
+                    write_authorization,
+                )
+            },
         ) {
-            Ok(reservation) => reservation,
+            Ok(reservations) => reservations,
             Err(e) => {
-                assert!(proc.cancel_fd_reservation(write_fd));
-                assert!(proc.cancel_fd_reservation(read_fd));
-                rollback_outside[0] = read_handle.take();
-                rollback_outside[1] = write_handle.take();
-                break 'install Err(e);
-            }
-        };
-        let write_capability = match kernel_core::prepare_process_cap_allocation_authorized(
-            &proc,
-            &cap_authority,
-            write_authorization,
-        ) {
-            Ok(reservation) => reservation,
-            Err(e) => {
-                assert!(proc.cancel_fd_reservation(write_fd));
-                assert!(proc.cancel_fd_reservation(read_fd));
+                cancel_pipe_fd_pair(&mut proc, read_fd, write_fd);
                 rollback_outside[0] = read_handle.take();
                 rollback_outside[1] = write_handle.take();
                 break 'install Err(e);

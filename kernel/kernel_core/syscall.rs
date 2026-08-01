@@ -1590,12 +1590,14 @@ pub fn run_fileops_cap_id_self_test() {
 ///
 /// 1. A reserved capability slot is INVISIBLE until published — the leak-free
 ///    half of the two-phase commit. Dropping the reservation must return the
-///    slot rather than strand a live-but-unreferenced capability.
+///    reservation rather than strand a live-but-unreferenced capability; if it
+///    was the table's sole use, the empty backing is reclaimed.
 /// 2. `PreparedCapAllocation::cap_id()` returns exactly the id `install` later
 ///    publishes. The publication path binds that id into the FileHandle BEFORE
 ///    the descriptor is installed, so if these ever diverged, every opened file
 ///    would carry a capability id that addresses a different slot.
-/// 3. Reserve→drop→reserve reuses the slot index but never the generation, so a
+/// 3. Reserve→drop→reserve never reuses the complete identity. Empty-table
+///    reclamation may change the slot index; monotonic generations ensure a
 ///    stale id from an abandoned transaction cannot resolve to the next one.
 ///
 /// PURE: operates on a standalone `CapTable`; no process or VFS state is touched.
@@ -1626,7 +1628,7 @@ pub fn run_fd_publication_transaction_self_test() {
              attempt left behind)"
         );
         id
-        // reservation drops here → slot returned to the free list
+        // reservation drops here → reservation cancelled; empty backing reclaimed
     };
     assert!(
         table.lookup(abandoned_id).is_err(),
@@ -1651,8 +1653,9 @@ pub fn run_fd_publication_transaction_self_test() {
         "R186-1: an installed capability must be visible to lookup"
     );
 
-    // (3) The abandoned transaction's id must not alias the published one, even
-    // though the slot index is reused from the free list.
+    // (3) The abandoned transaction's id must not alias the published one. A
+    // sole cancelled reservation reclaims empty backing, so the next slot index
+    // is intentionally not part of the public identity contract.
     assert!(
         abandoned_id != published,
         "R186-1: a cancelled reservation must not share an identity with the \
@@ -1662,7 +1665,7 @@ pub fn run_fd_publication_transaction_self_test() {
     assert!(
         table.lookup(abandoned_id).is_err(),
         "R186-1: a stale id from a cancelled transaction must not resolve to the \
-         capability that later reused its slot"
+         capability published by a later transaction"
     );
 
     table
@@ -3430,10 +3433,12 @@ impl<'a> AuthorizedCapReservation<'a> {
         } = self;
         let cap_id = capability.install(entry);
         AuthorizedCapGrant {
-            cap_id,
-            proc_ctx,
-            _authorization,
-            audited: false,
+            pending_audit: PendingCapAllocationAudit::new(
+                cap_id,
+                proc_ctx,
+                _authorization,
+                KernelCapAllocationAuditEmitter,
+            ),
         }
     }
 }
@@ -3459,27 +3464,155 @@ pub fn prepare_process_cap_allocation_authorized<'a>(
 
 #[must_use = "installed capability grants must complete allocation audit"]
 pub struct AuthorizedCapGrant {
+    // This RAII object also owns the credential authorization. Its Drop runs
+    // the audit fallback before any field (including the authorization token)
+    // is released, preserving the mediated subject through observation.
+    pending_audit: PendingCapAllocationAudit<
+        KernelCapAllocationAuditEmitter,
+        crate::process::CredentialAuthorization,
+    >,
+}
+
+trait CapAllocationAuditEmitter {
+    fn emit(&self, proc_ctx: &lsm::ProcessCtx, cap_id: cap::CapId);
+}
+
+struct KernelCapAllocationAuditEmitter;
+
+impl CapAllocationAuditEmitter for KernelCapAllocationAuditEmitter {
+    #[inline]
+    fn emit(&self, proc_ctx: &lsm::ProcessCtx, cap_id: cap::CapId) {
+        emit_cap_allocate_audit(proc_ctx, cap_id);
+    }
+}
+
+/// Exactly-once audit owner for one already-published capability. The
+/// authorization proof is deliberately retained inside this Drop-bearing
+/// object, so both explicit completion and fallback emission observe the exact
+/// credential identity that was mediated through publication.
+struct PendingCapAllocationAudit<E: CapAllocationAuditEmitter, A> {
     cap_id: cap::CapId,
     proc_ctx: lsm::ProcessCtx,
-    _authorization: crate::process::CredentialAuthorization,
-    audited: bool,
+    _authorization: A,
+    emitter: E,
+    pending: bool,
+}
+
+impl<E: CapAllocationAuditEmitter, A> PendingCapAllocationAudit<E, A> {
+    fn new(cap_id: cap::CapId, proc_ctx: lsm::ProcessCtx, authorization: A, emitter: E) -> Self {
+        Self {
+            cap_id,
+            proc_ctx,
+            _authorization: authorization,
+            emitter,
+            pending: true,
+        }
+    }
+
+    #[inline]
+    fn emit_once(&mut self) {
+        if self.pending {
+            // Disarm first. Audit emission is currently non-panicking, but this
+            // ordering also prevents a future re-entrant/unwinding path from
+            // reporting the same successful allocation twice.
+            self.pending = false;
+            self.emitter.emit(&self.proc_ctx, self.cap_id);
+        }
+    }
+
+    fn complete(mut self) -> cap::CapId {
+        let cap_id = self.cap_id;
+        self.emit_once();
+        cap_id
+    }
+}
+
+impl<E: CapAllocationAuditEmitter, A> Drop for PendingCapAllocationAudit<E, A> {
+    fn drop(&mut self) {
+        self.emit_once();
+    }
 }
 
 impl AuthorizedCapGrant {
-    pub fn audit(mut self) -> cap::CapId {
-        emit_cap_allocate_audit(&self.proc_ctx, self.cap_id);
-        self.audited = true;
-        self.cap_id
+    pub fn audit(self) -> cap::CapId {
+        self.pending_audit.complete()
     }
 }
 
-impl Drop for AuthorizedCapGrant {
-    fn drop(&mut self) {
-        if !self.audited {
-            emit_cap_allocate_audit(&self.proc_ctx, self.cap_id);
-            self.audited = true;
+/// RF186 review-fix regression for mandatory allocation audit completion.
+/// Uses the exact generic RAII owner embedded in `AuthorizedCapGrant`, with an
+/// allocation-free probe emitter, so explicit completion and Drop fallback are
+/// both deterministic and independent of the global audit ring.
+pub fn run_authorized_cap_grant_audit_self_test() {
+    use core::cell::Cell;
+
+    struct AuthorizationDropProbe<'a>(&'a Cell<bool>);
+
+    impl Drop for AuthorizationDropProbe<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
         }
     }
+
+    struct CountingEmitter<'a> {
+        count: &'a Cell<usize>,
+        authorization_dropped: &'a Cell<bool>,
+        expected_pid: usize,
+        expected_cap: cap::CapId,
+    }
+
+    impl CapAllocationAuditEmitter for CountingEmitter<'_> {
+        fn emit(&self, proc_ctx: &lsm::ProcessCtx, cap_id: cap::CapId) {
+            assert_eq!(proc_ctx.pid, self.expected_pid);
+            assert_eq!(cap_id, self.expected_cap);
+            assert!(
+                !self.authorization_dropped.get(),
+                "cap allocation audit ran after authorization proof was released"
+            );
+            self.count.set(self.count.get() + 1);
+        }
+    }
+
+    let count = Cell::new(0usize);
+    let authorization_dropped = Cell::new(false);
+    let proc_ctx = lsm::ProcessCtx::new(0x186_5002, 0x186_5002, 1000, 1000, 1000, 1000);
+    let explicit_cap = cap::CapId::from_parts(17, 186);
+    let explicit = PendingCapAllocationAudit::new(
+        explicit_cap,
+        proc_ctx,
+        AuthorizationDropProbe(&authorization_dropped),
+        CountingEmitter {
+            count: &count,
+            authorization_dropped: &authorization_dropped,
+            expected_pid: proc_ctx.pid,
+            expected_cap: explicit_cap,
+        },
+    );
+    assert_eq!(explicit.complete(), explicit_cap);
+    assert_eq!(
+        count.get(),
+        1,
+        "explicit grant audit must emit exactly once"
+    );
+    assert!(authorization_dropped.get());
+
+    authorization_dropped.set(false);
+    let fallback_cap = cap::CapId::from_parts(18, 186);
+    {
+        let _fallback = PendingCapAllocationAudit::new(
+            fallback_cap,
+            proc_ctx,
+            AuthorizationDropProbe(&authorization_dropped),
+            CountingEmitter {
+                count: &count,
+                authorization_dropped: &authorization_dropped,
+                expected_pid: proc_ctx.pid,
+                expected_cap: fallback_cap,
+            },
+        );
+    }
+    assert_eq!(count.get(), 2, "Drop fallback must emit exactly once");
+    assert!(authorization_dropped.get());
 }
 
 /// Revoke a capability with LSM check and audit logging.
