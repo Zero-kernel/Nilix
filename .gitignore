@@ -34,6 +34,7 @@ Cargo.lock
 # (Git Rule: commits are user-initiated) before the CI lint job can see them.
 !/scripts/abi_layout_oracle.py
 !/scripts/lint_fallible.sh
+!/scripts/hosted_subcrate_tests.sh
 # Directory trap: /scripts/* ignores the directory ENTRY, so per-file negation
 # cannot descend — both the dir and its contents must be negated.
 !/scripts/lint_fallible_fixtures/
