@@ -230,6 +230,12 @@ struct NetDeviceRegistry {
     next_index: AtomicUsize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryAllocationPoint {
+    DeviceName,
+    DeviceVector,
+}
+
 impl NetDeviceRegistry {
     fn new() -> Self {
         Self {
@@ -239,9 +245,23 @@ impl NetDeviceRegistry {
     }
 
     fn register_handle(&self, device: NetDeviceHandle) -> Result<usize, NetError> {
+        self.register_handle_with_fault(device, |_| false)
+    }
+
+    /// Single implementation of registry publication, with a private fault
+    /// boundary used by deterministic rollback tests. Production always passes
+    /// a closure that returns false, which is inlined away.
+    fn register_handle_with_fault(
+        &self,
+        device: NetDeviceHandle,
+        mut fail_allocation: impl FnMut(RegistryAllocationPoint) -> bool,
+    ) -> Result<usize, NetError> {
         let mut name = String::new();
         {
             let guard = device.lock();
+            if fail_allocation(RegistryAllocationPoint::DeviceName) {
+                return Err(NetError::NoMemory);
+            }
             name.try_reserve_exact(guard.name().len())
                 .map_err(|_| NetError::NoMemory)?;
             name.push_str(guard.name());
@@ -257,6 +277,9 @@ impl NetDeviceRegistry {
             return Err(NetError::InvalidConfig);
         }
 
+        if fail_allocation(RegistryAllocationPoint::DeviceVector) {
+            return Err(NetError::NoMemory);
+        }
         devices.try_reserve(1).map_err(|_| NetError::NoMemory)?;
 
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -439,12 +462,16 @@ struct PciMmioMapping {
     window_count: usize,
     virt_offset: u64,
     committed: bool,
+    #[cfg(test)]
+    lifecycle_log: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 impl PciMmioMapping {
     fn commit(mut self) {
         self.committed = true;
         drop(self.allocator.take());
+        #[cfg(test)]
+        self.record_lifecycle("mapping-commit");
     }
 
     /// Preserve VA/PTE ownership for hardware whose DMA quiescence is not
@@ -452,6 +479,28 @@ impl PciMmioMapping {
     fn quarantine(mut self) {
         self.committed = true;
         drop(self.allocator.take());
+        #[cfg(test)]
+        self.record_lifecycle("mapping-quarantine");
+    }
+
+    #[cfg(test)]
+    fn record_lifecycle(&self, event: &'static str) {
+        if let Some(log) = &self.lifecycle_log {
+            log.lock().push(event);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnpublishedRollbackProof {
+    reset_acked: bool,
+    contained: bool,
+}
+
+impl UnpublishedRollbackProof {
+    #[inline]
+    const fn ownership_can_be_released(self) -> bool {
+        self.reset_acked && self.contained
     }
 }
 
@@ -462,6 +511,8 @@ struct ProbedPciNetDevice {
     slot: pci::PciSlot,
     device: Option<NetDeviceHandle>,
     mapping: Option<PciMmioMapping>,
+    #[cfg(test)]
+    containment_hook: Option<Arc<dyn Fn(&pci::PciSlot) -> bool + Send + Sync>>,
 }
 
 impl ProbedPciNetDevice {
@@ -470,6 +521,8 @@ impl ProbedPciNetDevice {
             slot,
             device: Some(device),
             mapping: Some(mapping),
+            #[cfg(test)]
+            containment_hook: None,
         }
     }
 
@@ -487,36 +540,113 @@ impl ProbedPciNetDevice {
                 .expect("probed net device committed twice"),
         );
     }
+
+    #[cfg(test)]
+    fn with_containment_hook(
+        mut self,
+        hook: Arc<dyn Fn(&pci::PciSlot) -> bool + Send + Sync>,
+    ) -> Self {
+        self.containment_hook = Some(hook);
+        self
+    }
+
+    #[inline]
+    fn contain_pci_command(&self) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = &self.containment_hook {
+            return hook(&self.slot);
+        }
+        pci::try_disable_memory_and_bus_master(&self.slot)
+    }
+
+    /// Consume every unpublished owner according to the reset/readback proof.
+    /// The safe path drops the device before MMIO is unmapped. Either failed
+    /// proof quarantines both owners and releases only allocator serialization.
+    fn rollback_owners(&mut self) -> Option<UnpublishedRollbackProof> {
+        let device = self.device.take()?;
+        assert!(
+            self.mapping.is_some(),
+            "RF186-4: unpublished PCI device lost its MMIO rollback owner"
+        );
+
+        let reset_acked = device.lock().rollback_unpublished();
+        let contained = self.contain_pci_command();
+        let proof = UnpublishedRollbackProof {
+            reset_acked,
+            contained,
+        };
+
+        if proof.ownership_can_be_released() {
+            // The final DMA owner must die before its register mapping is
+            // removed. This ordering is explicit rather than relying on field
+            // drop order after `Drop::drop` returns.
+            drop(device);
+            drop(
+                self.mapping
+                    .take()
+                    .expect("unpublished PCI device MMIO rollback owner"),
+            );
+        } else {
+            // Losing either proof forbids releasing DMA-backed ownership or
+            // unmapping registers. Keep both alive, but never retain the global
+            // MMIO allocator mutex while a device is quarantined.
+            core::mem::forget(device);
+            self.mapping
+                .take()
+                .expect("unpublished PCI device MMIO quarantine owner")
+                .quarantine();
+        }
+
+        Some(proof)
+    }
 }
 
 impl Drop for ProbedPciNetDevice {
     fn drop(&mut self) {
-        let Some(device) = self.device.take() else {
+        let Some(proof) = self.rollback_owners() else {
             return;
         };
-        let reset_acked = device.lock().rollback_unpublished();
-        let contained = pci::try_disable_memory_and_bus_master(&self.slot);
-        if reset_acked && contained {
-            drop(device);
+        if proof.ownership_can_be_released() {
             return;
         }
-
-        core::mem::forget(device);
-        if let Some(mapping) = self.mapping.take() {
-            mapping.quarantine();
-        }
+        // RF186-21 FIX: the forced kernel logger performs VGA/serial I/O that
+        // is valid in the kernel but faults in the hosted `cargo test`
+        // process before `catch_unwind` can observe the fail-stop panic.
+        // Suppress only that diagnostic in the crate's host-test build; real
+        // kernel builds retain the log, and quarantine plus panic semantics
+        // remain identical in every build.
+        #[cfg(not(test))]
         klog_force!(
             "RF186-4: virtio-net {:02x}:{:02x}.{} rollback reset_acked={} contained={}; quarantined device and MMIO ownership",
             self.slot.bus,
             self.slot.device,
             self.slot.function,
-            reset_acked,
-            contained
+            proof.reset_acked,
+            proof.contained
         );
-        if !contained {
+        if !proof.contained {
             panic!("RF186-4: PCI network device refused MSE/BME containment");
         }
     }
+}
+
+/// Registry insertion is the final fallible publication step. Returning an
+/// error drops the still-armed probe guard; success immediately disarms it.
+fn publish_probed_pci_device(
+    registry: &NetDeviceRegistry,
+    probed: ProbedPciNetDevice,
+) -> Result<usize, NetError> {
+    publish_probed_pci_device_with_fault(registry, probed, |_| false)
+}
+
+fn publish_probed_pci_device_with_fault(
+    registry: &NetDeviceRegistry,
+    probed: ProbedPciNetDevice,
+    fail_allocation: impl FnMut(RegistryAllocationPoint) -> bool,
+) -> Result<usize, NetError> {
+    let index = registry.register_handle_with_fault(probed.handle(), fail_allocation)?;
+    probed.commit();
+    Ok(index)
 }
 
 fn rollback_inactive_pci_mapping(slot: &pci::PciSlot, mapping: PciMmioMapping) {
@@ -547,9 +677,12 @@ impl Drop for PciMmioMapping {
                     .unwrap_or_else(|_| panic!("RF186-4: virtio-net MMIO rollback failed"));
             }
         }
-        if let Some(offset) = self.allocator.as_mut() {
-            **offset = self.reservation_start;
+        if let Some(mut offset) = self.allocator.take() {
+            *offset = self.reservation_start;
+            drop(offset);
         }
+        #[cfg(test)]
+        self.record_lifecycle("mapping-release");
     }
 }
 
@@ -650,6 +783,8 @@ unsafe fn map_virtio_pci_regions(
         window_count: 0,
         virt_offset,
         committed: false,
+        #[cfg(test)]
+        lifecycle_log: None,
     };
     let mut frame_allocator = mm::FrameAllocator::new();
     for window in windows[..window_count].iter().copied() {
@@ -782,11 +917,8 @@ pub fn init(iommu_required: bool) -> usize {
                 let device = device.lock();
                 (device.mac_address(), device.link_status())
             };
-            match registry().register_handle(probed.handle()) {
+            match publish_probed_pci_device(registry(), probed) {
                 Ok(_) => {
-                    // Registry insertion is the final fallible step. Commit is
-                    // allocation-free and immediately transfers sole ownership.
-                    probed.commit();
                     klog!(Info,
                         "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                         name,
@@ -799,7 +931,6 @@ pub fn init(iommu_required: bool) -> usize {
                     registered += 1;
                 }
                 Err(e) => {
-                    drop(probed);
                     klog!(
                         Error,
                         "      ! Failed to register {}: {:?} (device rolled back or quarantined)",
@@ -875,8 +1006,182 @@ pub fn assert_netns_hooks_for_rx() {
 }
 
 #[cfg(test)]
-mod mmio_preflight_tests {
+mod tests {
     use super::*;
+    extern crate std;
+    use self::std::panic::{catch_unwind, AssertUnwindSafe};
+
+    static PCI_TRANSACTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct FaultInjectedNetDevice {
+        name: &'static str,
+        reset_acked: bool,
+        lifecycle_log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for FaultInjectedNetDevice {
+        fn drop(&mut self) {
+            self.lifecycle_log.lock().push("device-drop");
+        }
+    }
+
+    impl NetDevice for FaultInjectedNetDevice {
+        fn rollback_unpublished(&mut self) -> bool {
+            self.lifecycle_log.lock().push("reset");
+            self.reset_acked
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn mac_address(&self) -> MacAddress {
+            [0; 6]
+        }
+
+        fn set_mac_address(&mut self, _mac: MacAddress) -> Result<(), NetError> {
+            Err(NetError::NotSupported)
+        }
+
+        fn capabilities(&self) -> DeviceCaps {
+            DeviceCaps::minimal()
+        }
+
+        fn link_status(&self) -> LinkStatus {
+            LinkStatus::DOWN
+        }
+
+        fn operating_mode(&self) -> OperatingMode {
+            OperatingMode::Polling
+        }
+
+        fn set_operating_mode(&mut self, _mode: OperatingMode) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn enable_interrupts(&mut self) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn disable_interrupts(&mut self) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn transmit(&mut self, buf: NetBuf) -> Result<(), (TxError, NetBuf)> {
+            Err((TxError::IoError, buf))
+        }
+
+        fn reclaim_tx(&mut self) -> usize {
+            0
+        }
+
+        fn tx_queue_space(&self) -> usize {
+            0
+        }
+
+        fn receive(&mut self) -> Result<Option<NetBuf>, RxError> {
+            Ok(None)
+        }
+
+        fn replenish_rx(&mut self, _pool: &BufPool, _count: usize) -> usize {
+            0
+        }
+
+        fn rx_owned_rx_buffers(&self) -> usize {
+            0
+        }
+
+        fn supports_rx_replenishment(&self) -> bool {
+            false
+        }
+
+        fn poll(&mut self) -> bool {
+            false
+        }
+
+        fn handle_interrupt(&mut self) {}
+    }
+
+    fn lifecycle_log() -> Arc<Mutex<Vec<&'static str>>> {
+        Arc::new(Mutex::new(Vec::with_capacity(8)))
+    }
+
+    fn fault_device(
+        name: &'static str,
+        reset_acked: bool,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    ) -> NetDeviceHandle {
+        let device: Box<dyn NetDevice> = Box::new(FaultInjectedNetDevice {
+            name,
+            reset_acked,
+            lifecycle_log: log,
+        });
+        Arc::new(Mutex::new(device))
+    }
+
+    fn test_mapping(
+        log: Arc<Mutex<Vec<&'static str>>>,
+        reservation_start: u64,
+        allocated_offset: u64,
+    ) -> PciMmioMapping {
+        let mut allocator = NET_MMIO_OFFSET.lock();
+        *allocator = allocated_offset;
+        PciMmioMapping {
+            allocator: Some(allocator),
+            reservation_start,
+            phys_anchor: 0,
+            virt_anchor: 0,
+            windows: [MmioPageWindow::default(); 4],
+            window_count: 0,
+            virt_offset: 0,
+            committed: false,
+            lifecycle_log: Some(log),
+        }
+    }
+
+    fn test_probed_device(
+        name: &'static str,
+        reset_acked: bool,
+        contained: bool,
+        log: Arc<Mutex<Vec<&'static str>>>,
+        reservation_start: u64,
+        allocated_offset: u64,
+    ) -> ProbedPciNetDevice {
+        // Allocate every test owner before taking the synthetic MMIO allocator
+        // guard, mirroring the production rule that the guard must not be held
+        // across unrelated fallible setup.
+        let device = fault_device(name, reset_acked, Arc::clone(&log));
+        let containment_log = Arc::clone(&log);
+        let containment_hook: Arc<dyn Fn(&pci::PciSlot) -> bool + Send + Sync> =
+            Arc::new(move |_slot| {
+                containment_log.lock().push("contain");
+                contained
+            });
+        let mapping = test_mapping(Arc::clone(&log), reservation_start, allocated_offset);
+        ProbedPciNetDevice::new(
+            pci::PciSlot {
+                bus: 0,
+                device: 1,
+                function: 0,
+            },
+            device,
+            mapping,
+        )
+        .with_containment_hook(containment_hook)
+    }
+
+    fn assert_allocator_released(expected_offset: u64) {
+        let mut allocator = NET_MMIO_OFFSET
+            .try_lock()
+            .expect("rollback retained the network MMIO allocator mutex");
+        assert_eq!(*allocator, expected_offset);
+        *allocator = 0;
+    }
+
+    fn assert_events(log: &Arc<Mutex<Vec<&'static str>>>, expected: &[&'static str]) {
+        let events = log.lock();
+        assert_eq!(events.as_slice(), expected);
+    }
 
     #[test]
     fn net_mmio_preflight_rejects_page_above_architectural_width() {
@@ -897,5 +1202,129 @@ mod mmio_preflight_tests {
             merged_mmio_windows(&addrs),
             Err(NetError::NotSupported)
         ));
+    }
+
+    #[test]
+    fn unpublished_rollback_orders_reset_containment_owner_drop_then_unmap() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+        let log = lifecycle_log();
+        let probed = test_probed_device("eth-rf186", true, true, Arc::clone(&log), 0x1000, 0x3000);
+
+        drop(probed);
+
+        assert_events(
+            &log,
+            &["reset", "contain", "device-drop", "mapping-release"],
+        );
+        assert_allocator_released(0x1000);
+    }
+
+    #[test]
+    fn reset_timeout_quarantines_dma_and_mmio_but_releases_allocator_guard() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+        let log = lifecycle_log();
+        let mut probed =
+            test_probed_device("eth-rf186", false, true, Arc::clone(&log), 0x1000, 0x3000);
+
+        let proof = probed
+            .rollback_owners()
+            .expect("armed unpublished rollback transaction");
+
+        assert_eq!(
+            proof,
+            UnpublishedRollbackProof {
+                reset_acked: false,
+                contained: true,
+            }
+        );
+        assert!(!proof.ownership_can_be_released());
+        assert_events(&log, &["reset", "contain", "mapping-quarantine"]);
+        assert_allocator_released(0x3000);
+        drop(probed);
+    }
+
+    #[test]
+    fn command_containment_failure_quarantines_before_fail_stop_decision() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+        let log = lifecycle_log();
+        let probed = test_probed_device("eth-rf186", true, false, Arc::clone(&log), 0x1000, 0x3000);
+
+        let fail_stop = catch_unwind(AssertUnwindSafe(|| drop(probed)));
+        assert!(
+            fail_stop.is_err(),
+            "PCI command-containment refusal did not reach the production Drop fail-stop"
+        );
+        assert_events(&log, &["reset", "contain", "mapping-quarantine"]);
+        assert_allocator_released(0x3000);
+    }
+
+    #[test]
+    fn registry_allocation_faults_rollback_without_consuming_index() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+
+        for fault in [
+            RegistryAllocationPoint::DeviceName,
+            RegistryAllocationPoint::DeviceVector,
+        ] {
+            let registry = NetDeviceRegistry::new();
+            let log = lifecycle_log();
+            let probed =
+                test_probed_device("eth-rf186", true, true, Arc::clone(&log), 0x1000, 0x3000);
+
+            let result =
+                publish_probed_pci_device_with_fault(&registry, probed, |point| point == fault);
+
+            assert_eq!(result, Err(NetError::NoMemory));
+            assert_eq!(registry.count(), 0);
+            assert_eq!(registry.next_index.load(Ordering::SeqCst), 0);
+            assert_events(
+                &log,
+                &["reset", "contain", "device-drop", "mapping-release"],
+            );
+            assert_allocator_released(0x1000);
+        }
+    }
+
+    #[test]
+    fn duplicate_registry_failure_rolls_back_and_preserves_registry_identity() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+        let registry = NetDeviceRegistry::new();
+        let existing_log = lifecycle_log();
+        registry
+            .register_handle(fault_device("eth-rf186", true, existing_log))
+            .expect("seed duplicate registry entry");
+
+        let log = lifecycle_log();
+        let probed = test_probed_device("eth-rf186", true, true, Arc::clone(&log), 0x1000, 0x3000);
+
+        let result = publish_probed_pci_device(&registry, probed);
+
+        assert_eq!(result, Err(NetError::InvalidConfig));
+        assert_eq!(registry.count(), 1);
+        assert_eq!(registry.next_index.load(Ordering::SeqCst), 1);
+        assert_events(
+            &log,
+            &["reset", "contain", "device-drop", "mapping-release"],
+        );
+        assert_allocator_released(0x1000);
+    }
+
+    #[test]
+    fn successful_registry_publication_commits_without_rollback() {
+        let _serial = PCI_TRANSACTION_TEST_LOCK.lock();
+        let registry = NetDeviceRegistry::new();
+        let log = lifecycle_log();
+        let probed = test_probed_device("eth-rf186", true, true, Arc::clone(&log), 0x1000, 0x3000);
+
+        let index = publish_probed_pci_device(&registry, probed).expect("publish synthetic device");
+
+        assert_eq!(index, 0);
+        assert_eq!(registry.count(), 1);
+        assert_eq!(registry.next_index.load(Ordering::SeqCst), 1);
+        assert_events(&log, &["mapping-commit"]);
+        assert_allocator_released(0x3000);
+
+        drop(registry);
+        assert_events(&log, &["mapping-commit", "device-drop"]);
     }
 }

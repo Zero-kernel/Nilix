@@ -3835,7 +3835,14 @@ mod tests {
     fn rf180_51_malformed_transport_never_collapses_into_firewall_denial() {
         use crate::firewall::{firewall_remove_ns, FirewallRule};
 
-        const DIRECT_NS: u64 = 0x7e57_1805_1001;
+        // RF186-20 FIX: hosted net tests intentionally register no
+        // NetNsDeviceHooks. Non-root identities must therefore fail closed at
+        // tx_net_config before policy, which made this stale RF180 oracle test
+        // LinkDown instead of reaching the firewall. Namespace 0 is the sole
+        // legitimate host-harness fallback and its table remains pristine
+        // default-deny, so it proves the intended valid-header policy path
+        // without weakening child-namespace identity isolation.
+        const DIRECT_NS: u64 = 0;
         const REPLY_NS: u64 = 0x7e57_1805_1002;
         let local_ip = Ipv4Addr::new(192, 0, 2, 51);
         let peer_ip = Ipv4Addr::new(192, 0, 2, 52);
@@ -3911,6 +3918,10 @@ mod tests {
         let local_port = 8080;
         let now_ms = 41_000;
 
+        // RF186-22 FIX: both RF180-41 hosted tests intentionally exercise the
+        // process-wide conntrack singleton. Serialize only those test owners so
+        // default-parallel execution cannot consume each other's global permit.
+        let _conntrack_serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
         ct_drain_ns(NS);
         let seeded = ct_process_tcp(
             NS,
@@ -4016,6 +4027,7 @@ mod tests {
         let peer_port = 40_002;
         let local_port = 8081;
 
+        let _conntrack_serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
         ct_drain_ns(NS);
         firewall_remove_ns(NS);
         let firewall = firewall_table_for_ns(NS);

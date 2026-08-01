@@ -2096,6 +2096,12 @@ impl ConntrackTable {
 
 static CONNTRACK_TABLE: Once<ConntrackTable> = Once::new();
 
+// RF186-22 FIX: only hosted tests that mutate the global singleton take this
+// guard. The singleton's production concurrency remains fully exercised and
+// production code must never acquire a test-serialization lock.
+#[cfg(all(test, feature = "conntrack"))]
+pub(crate) static GLOBAL_CONNTRACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Get the global conntrack table.
 pub fn conntrack_table() -> &'static ConntrackTable {
     CONNTRACK_TABLE.call_once(ConntrackTable::new)
