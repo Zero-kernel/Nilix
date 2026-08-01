@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -745,6 +745,12 @@ test-quick: build
 # rustfmt.toml pins newline_style=Windows (the repo is CRLF) so fmt is stable.
 # ──────────────────────────────────────────────────────────────────────────
 
+# Hosted unit tests for the explicit kernel sub-crate allowlist. The runner
+# preserves Rust's default-parallel scheduler, isolates Cargo target dirs, and
+# count-pins every suite so a missing registration/filter cannot pass as 0 tests.
+test-hosted-subcrates:
+	@bash scripts/hosted_subcrate_tests.sh
+
 # Enable the repo's pre-push hook (runs fmt-check + clippy before each push).
 hooks:
 	git config --local core.hooksPath .githooks
@@ -783,6 +789,7 @@ clean:
 	cargo clean
 	rm -rf kernel-target
 	rm -rf bootloader-target
+	rm -rf hosted-subcrate-target
 	rm -rf esp
 	rm -f qemu-debug.log qemu-verbose.log qemu-smp.log disk-ext2.img
 
@@ -850,6 +857,7 @@ help:
 	@echo "  make run-both     - 图形+串口组合模式"
 	@echo "  make debug        - GDB调试模式（等待GDB连接）"
 	@echo "  make test         - 运行时套件门禁（Test Summary + panic/NX；exit 0/1/2）"
+	@echo "  make test-hosted-subcrates - 主机侧内核子 crate 测试（169 tests + 3 compile checks，默认并行，精确计数门禁）"
 	@echo ""
 	@echo "SMP多核模式:"
 	@echo "  make run-smp      - 启用SMP多核模式（默认2核）"
