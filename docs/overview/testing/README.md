@@ -15,26 +15,25 @@ This directory contains test coverage analysis, expansion plans, and implementat
 
 ## Test Suite Overview
 
-**Last verified:** 2026-07-29 — remote `make build`, `make lint`, and `make test` passed;
+**Last verified:** 2026-07-30 — remote `make build`, `make lint`, and `make test` passed;
 the runtime gate reported **31 passed / 39 deferred / 0 failed**, with 0 panic and 0 NX faults.
 
 The Zero-OS kernel maintains a comprehensive test suite covering:
 
 ### Unit Tests
-- Subsystem-level `#[cfg(test)]` tests per crate — **but see the caveat below: these are not gated
-  and most do not execute**
+- Subsystem-level `#[cfg(test)]` tests per crate, with a host-safe allowlist enforced by CI
 - Primitive testing (sync, allocator, data structures)
 - Edge case validation
 - Error path coverage
 
-> **Host unit-test caveat (measured 2026-07-29).** No Makefile target and no CI job runs
-> `cargo test`. Of the crates carrying `#[cfg(test)]` modules, only `audit` actually runs on the host
-> (15 passed / 0 failed); the `mm`, `block`, `net`, `seccomp` and `kernel_core` test binaries abort at
-> the first allocation (`memory allocation of 4 bytes failed`, SIGABRT) because they link the kernel's
-> `global_allocator` and the kernel heap is uninitialized on the host. This is **pre-existing and
-> A/B-verified**, and `kernel/seccomp/lib.rs:533` documents the convention: structural checks belong in
-> the in-kernel boot suite, "*NOT `#[cfg(test)]`, which does not compile under the no_std cross-build*".
-> Treat the in-kernel boot suite (§ Runtime Tests) as the authoritative regression vehicle.
+> **Hosted unit-test gate (measured 2026-07-30).** `make test-hosted-subcrates` runs 169
+> default-parallel tests: audit 15, MM 19, block 9, seccomp 14, net 110, and two focused
+> RF186 capability lifecycle tests. Every suite has an exact passed/failed/ignored/measured/filtered
+> oracle. IPC, kernel_core, and kernel `--tests` code is compile-checked on the Linux host.
+> The allowlist is deliberate: the complete capability suite retains an older privileged-interrupt
+> hosted SIGSEGV, and full kernel/kernel_core execution requires boot allocator, IRQ, and MMIO state.
+> Those paths remain covered by the in-kernel runtime, boot, and musl gates rather than being
+> weakened or silently skipped in a hosted process.
 
 ### Integration Tests
 - Full kernel boot tests

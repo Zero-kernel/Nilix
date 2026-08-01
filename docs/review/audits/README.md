@@ -4,7 +4,13 @@ This directory contains all QA security audit reports for the Zero-OS kernel.
 
 ## Latest Audit
 
-**[qa-2026-07-28.md](qa-2026-07-28.md)** - R186 full-codebase security audit and fix-round record. Current debt: 1 HIGH open (`R186-4`), the sole open actionable; default gates are green at 31 passed / 39 deferred / 0 failed.
+**[qa-2026-07-28.md](qa-2026-07-28.md)** - R186 audit/fix record:
+16/17 actionables fixed, 0 partial, `R186-4` sole open HIGH. The
+[authoritative Stage-3 source and environment closure](../reviewfix/reviewfix-2026-07-30.md)
+records `R186-18` fixed and review-verified, `RF186-1`…`RF186-24`
+repaired, and 0 escalations. Focused/default-parallel checks and the complete final
+remote ladder are green (net 110/110; conntrack stress 50/50; `make test`
+31/39/0; boot and musl PASS).
 
 ## Audit Summaries
 

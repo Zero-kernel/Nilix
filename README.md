@@ -45,17 +45,15 @@ all other R186 actionable findings are fixed and have since been review-fixed.
 See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
-- **2026-07-29:** R186 review-fix pass — the landed R186 fixes were re-reviewed against their own
-  lock contexts, caller sets, and rollback paths; **10 review-fix defects (`RF186-1`…`RF186-12`)
-  were filed and repaired**. The two outright failures: R186-1's fix had *relocated* the
-  open/openat PCB recursion rather than removing it, and R186-10's COW retry budget had made
-  ordinary cross-CPU page-table contention user-fatal (now resolved by PT-lock owner identity, so
-  only true same-CPU re-entry is fatal). The pass also gives device MMIO a typed BAR-aperture
-  authority with an all-or-nothing mapping transaction and staged MSE/BME activation, holds one
-  credential identity across the whole mediate → mint → publish → audit span, makes `readdir`
-  allocation-free in `cgroupfs`, binds ext2 dirent types to the authoritative inode mode, and
-  encapsulates `CapTable` behind a `#[must_use]` two-phase mediated mint. All CI gates green;
-  the boot suite measures **31 passed / 39 deferred / 0 failed**.
+- **2026-07-30:** Authoritative R186 ReviewFix source and environment closure — 16 landed fixes
+  were reviewed: **2 PASS / 12 PARTIAL / 2 FAIL**. All **24 review-fix defects**
+  (`RF186-1`…`RF186-24`) are repaired with **0 escalations**; the source/test
+  judges and independent RF186-20..24 security reviewer returned **SAFE**.
+  `R186-18` is fixed and review-verified. The sole open actionable remains
+  `R186-4` (HIGH), so 1.0-Preview remains blocked on it plus
+  `D1-RES-HEAP-ADMISSION-REOPENED`, and the zero-HIGH streak remains **0/3**.
+  Focused/default-parallel checks and the final remote ladder are green: net 110/110,
+  conntrack stress 50/50, `make test` 31/39/0, and boot/musl PASS.
 - **2026-07-28:** R186 remediation — 16 of 17 actionable findings are fully fixed and one
   remains open. The landed set removes the open/openat publication
   deadlock, makes netns and VFS allocation paths fallible, validates VirtIO PCI capability
@@ -473,31 +471,35 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **186** (R186 completed 2026-07-28; review-fix pass 2026-07-29) |
+| Audit rounds | **186** (R186 completed 2026-07-28; authoritative ReviewFix verdict/repair convergence 2026-07-30) |
 | Cumulative findings | ~1,333 (historical IDs include merged/refuted findings) |
 | Findings fixed/resolved | ~1,177 |
 | Latest round | R186 — 16 fixed, 1 actionable open, 1 INFO |
-| Latest review-fix pass | RF186 — 10 defects filed and repaired in the R186 fixes |
+| Latest review-fix pass | RF186 — 16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL); 24/24 RF defects repaired, 0 escalated; final ladder green |
 | Current actionable debt | **1 HIGH** (`R186-4`) |
 | 1.0-Preview release gate | **BLOCKED** — one HIGH remains; zero-HIGH streak 0/3 |
 
-R186 found 18 issues in total: 17 actionable findings and one INFO. Sixteen actionables are
-fully fixed, including `R186-18` through a generation counter owned by the shared credential
-object and checked by both open ladders; `R186-4` remains the sole HIGH blocker. The round
-therefore reset the zero-HIGH streak to 0/3 and reopened the aggregate heap-admission design
-parent. See the [R186 report](docs/review/audits/qa-2026-07-28.md) for the exact status and the
-[current plan](docs/review/nextplan/next-phase-plan-2026-07-23-v2.md) for the remaining work.
+R186 found 18 issues in total: 17 actionable findings and one INFO. Sixteen actionables
+are fully fixed; `R186-18` is fixed and review-verified through shared credential
+generation, writer-fair authorization, and stable subject ownership across side effects
+and publication. `R186-4` remains the sole HIGH blocker. The round therefore reset the
+zero-HIGH streak to 0/3 and reopened the aggregate heap-admission design parent. See the
+[R186 report](docs/review/audits/qa-2026-07-28.md) and the
+[current plan](docs/review/nextplan/next-phase-plan-2026-07-23-v2.md).
 
-The **RF186 review-fix pass (2026-07-29)** then reviewed those fixes rather than the original
-findings, and found that ten of them closed only the reported instance and not the class — two
-outright (`RF186-1`, `RF186-6`), eight partially. All ten are repaired; `R186-4` is untouched by
-the pass, so the streak stays 0/3 (a review-fix pass earns no streak credit). The pass was run in
-**MODE S** — the Codex MCP peer was unreachable, so convergence rests on orchestrator `file:line`
-re-reads rather than an independent session, and `RF186-4`/`RF186-7` are flagged for re-derivation
-by the next audit round. It also records **test debt**: the new `#[cfg(test)]` assertions in
-`seccomp`/`net`/`block`/`kernel_core` do not execute anywhere, because no target runs `cargo test`
-and those crates' host test binaries abort on the uninitialized kernel heap (pre-existing, A/B
-verified). See the [RF186 report](docs/review/reviewfix/reviewfix-2026-07-29.md).
+The authoritative **RF186 ReviewFix closure** reviewed all 16 landed fixes: 2 PASS,
+12 PARTIAL, and 2 FAIL. All 24 defects (`RF186-1`…`RF186-24`) are repaired with
+0 escalations. Final execution passes net 110/110 under default parallelism, conntrack
+stress 50/50, and the complete fmt/clippy/build/lint/test/boot/musl ladder.
+`R186-4` was never fixed and remains outside the Stage-3 verdict scope, so the gate
+and streak remain unchanged.
+
+CI now runs `make test-hosted-subcrates`: **169 default-parallel hosted tests** across
+audit, MM, block, seccomp, net, and the focused RF186 capability lifecycle pair, plus
+compile checks for IPC, kernel_core, and kernel test code. Exact test-count oracles prevent
+zero-test/filter drift from passing silently. Full capability and privileged kernel suites
+remain QEMU-only because hosted execution cannot safely run interrupt/MMIO paths. See the
+[authoritative RF186 report](docs/review/reviewfix/reviewfix-2026-07-30.md).
 
 ---
 
@@ -524,9 +526,9 @@ verified). See the [RF186 report](docs/review/reviewfix/reviewfix-2026-07-29.md)
   and regular file capability allocation at open time.
 - **D3 network-namespace dataplane** (Phase I.3) — per-namespace ARP caches, addressing, routing
   and byte budgets are landed, along with a bounded RX ingress loop and live `eth0` receive.
-  Next: a pending-frame queue that parks a frame on an on-link miss and retransmits it when the
-  ARP reply arrives (retiring today's metered gateway fallback), then the firewall admin syscall
-  surface, and `veth` pairs with a real routing table.
+  The pending-frame queue is also landed: on-link misses park and later retransmit frames, and the
+  metered gateway-fallback delivery path is retired. Remaining work is the firewall-admin syscall
+  surface, `veth` pairs with a real routing table, and capability-safe device-move arming.
 - IOMMU DMAR table-discovery wiring; full demand-grown user stacks.
 
 **Future**

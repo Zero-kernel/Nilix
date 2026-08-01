@@ -9,7 +9,7 @@ This directory contains remediation roadmaps and open findings inventory for ong
 - **[remediation-roadmap-2026-07-02.md](remediation-roadmap-2026-07-02.md)** - Historical R174-era remediation roadmap
 - **[open-findings-inventory-2026-07-02.md](open-findings-inventory-2026-07-02.md)** - Historical R174-era inventory
 
-Current 1.0-Preview status: **BLOCKED** on one HIGH (`R186-4`), the sole open R186 actionable. The default remote build/lint/test gates are green.
+Current 1.0-Preview status: **BLOCKED** on one HIGH (`R186-4`), the sole open R186 actionable. The final Stage-3 remote ladder is green (`make test` 31/39/0; boot/musl PASS); all 24 RF186 defects are repaired.
 
 ## Remediation Workflow
 

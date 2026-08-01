@@ -1,10 +1,11 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.3 — R186 + RF186 review-fix update (2026-07-29; was 4.2 D3 PENDING-FRAME v2 2026-07-27)
-**Snapshot:** 2026-07-29 · branch `main`, post-R186 tree with the RF186 review-fix round landed
-(10 review-fix defects repaired; all gates re-measured on the remote Linux build host, which remains
-the authoritative execution environment)
-**Design principle:** Security > Correctness > Efficiency > Performance
+**Version:** 4.4 — authoritative R186 ReviewFix verdict/repair convergence (2026-07-30; was 4.3 initial RF186 record)
+**Snapshot:** 2026-07-30 · authoritative R186 Stage-3 state: 16 fixes reviewed
+(2 PASS / 12 PARTIAL / 2 FAIL), `RF186-1`…`RF186-24` repaired, 0 escalations;
+approved eight-file source payload uploaded with local/remote SHA-256 parity and the complete
+focused, default-parallel, build, lint, boot, and musl verification ladder green
+**Design principle:** Security and safety > operational efficiency > speed; defense-in-depth over minimal diffs
 **Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
 `docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
 
@@ -22,10 +23,10 @@ deliberately retain the historical `Zero-os` naming — do not "fix" them.
 
 1. Code and build configuration (what exists and is actually wired);
 2. CI gates and in-kernel runtime tests (what is observed to work);
-3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.41, 2026-07-24);
+3. The live plan in `docs/review/nextplan/` (current priorities — plan v15.52, 2026-07-30);
 4. Audit / review-fix reports in `docs/review/` (security and open-risk status);
 5. `README.md` (public summary — authoritative only where code/tests/plan do not contradict it; where they
-   do, this document records the reconciliation. As of 2026-07-29 the README §6 gate status agrees with
+   do, this document records the reconciliation. As of 2026-07-30 the README §6 gate status agrees with
    this document: BLOCKED on `R186-4` with the zero-HIGH streak at 0/3);
 6. This document's narrative sections.
 
@@ -55,17 +56,16 @@ that later verification refuted as false positives (see §11).
 **Milestone:** approaching **1.0-Preview**. Phases A–G are complete; **Phase U** (user-mode Linux ABI,
 strategy *Compat-ZeroABI*) is in progress with milestone M0 done and native-capability slice U.S2-3B landed.
 
-**Release gate:** the 1.0-Preview gate is **BLOCKED on both an open HIGH and the streak** (2026-07-29).
-The gate was first unblocked on 2026-07-22 (zero-HIGH streak 3/3 over R181–R183), re-blocked on
-2026-07-23 by R184's real CRITICAL + HIGH (both fixed), then rebuilt to streak 1/3 by R185. **R186
-(2026-07-28) reset it to 0/3**: a full-codebase round that filed 18 issues (1 CRITICAL, 7 HIGH,
-4 MEDIUM, 5 LOW, 1 INFO) and re-opened the aggregate heap-admission design parent. Current state:
-**0 open CRITICAL / 1 open HIGH (`R186-4`, VMA/MM metadata outside aggregate admission) / 0 open
-actionable MEDIUM**; streak **0/3**. The **RF186 review-fix pass (2026-07-29)** then reviewed the
-landed R186 fixes and filed + repaired 10 defects in them (`RF186-1`…`RF186-12`); it earns no streak
-credit and did not touch `R186-4`. D1-ISO remains RESOLVED; **D1-RES was re-opened** as
-`D1-RES-HEAP-ADMISSION-REOPENED`, the design parent of `R186-4`, so the design queue is once again
-gate-blocking. Remaining gate items: close `R186-4` + its design parent, then rebuild the streak to 3/3.
+**Release gate:** the 1.0-Preview gate is **BLOCKED on both an open HIGH and the streak**
+(2026-07-30). R186 filed 18 issues and reset the streak to 0/3. Current state:
+**0 open CRITICAL / 1 open HIGH (`R186-4`) / 0 open actionable MEDIUM or LOW**;
+16/17 actionable findings are fixed. The authoritative RF186 ReviewFix reviewed all
+16 landed fixes (2 PASS / 12 PARTIAL / 2 FAIL) and repaired `RF186-1`…`RF186-24`
+with 0 escalations; the source/test judges and final RF186-20..24 security reviewer returned
+SAFE. It earns no streak credit
+and did not touch `R186-4`. `D1-RES-HEAP-ADMISSION-REOPENED` remains the gate-blocking
+design parent. Remaining gate work: close `R186-4` and its parent, then rebuild the
+zero-HIGH streak to 3/3.
 
 **Feature work since the gate snapshot:** the **D3 PENDING-FRAME v2** architecture landed 2026-07-27 —
 park-on-miss + retransmit-on-learn fully retires gateway-fallback delivery (the `neighbor_fallbacks`
@@ -80,16 +80,17 @@ retx_failures`. This is feature work on a D3-backlog item, not a gate item — i
 streak. The **D3 NETNS-DATAPLANE** arc (per-namespace ARP caches, byte sub-budget, RX-wiring, addressing,
 routing, RX ingress loop, **eth0 RX live**, ARP request-TX probes) landed 2026-07-25 in eight legs.
 
-| Dimension | State (2026-07-29) |
+| Dimension | State (2026-07-30) |
 |---|---|
-| Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28, RF186 review-fix 2026-07-29); ~1,333 findings filed, ~1,177 fixed (§11) |
+| Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28; authoritative RF186 verdict/repair convergence 2026-07-30); ~1,333 findings filed, ~1,177 fixed (§11) |
 | Open security debt | 0 CRITICAL, **1 HIGH** (`R186-4`), 0 actionable MEDIUM/LOW; design queue is gate-blocking again via `D1-RES-HEAP-ADMISSION-REOPENED` (parent of `R186-4`), plus D3 backlog (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs) |
 | Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 205,745 lines (`kernel/`, measured 2026-07-29); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
 | Syscall surface | **122 distinct syscall numbers dispatched** (~126 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Build/test baseline | fmt-check OK · clippy OK · lint (incl. abi-oracle + lint-fallible 22/0) OK · build OK · runtime tests **31** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK (libc + poll + socket-zero + MUSL-STAT-OK + MUSL-UNAME-OK, exit 0) — all measured 2026-07-29 on the post-RF186 tree |
-| Host unit tests | **Not gated and largely non-executing:** no target runs `cargo test`; only the `audit` crate's host tests run (15 passed / 0 failed). `mm`/`block`/`net`/`seccomp` test binaries abort at first allocation (uninitialized kernel heap) — pre-existing, A/B verified 2026-07-29. Real regression coverage lives in the in-kernel boot suite |
+| Last completed remote baseline | fmt-check OK · clippy OK · lint OK · build OK · runtime tests **31** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK — measured after the final eight-file ReviewFix payload on 2026-07-30 |
+| Final R186 ReviewFix verification | Capability regressions **2/2**; conntrack pair plus **50/50** stress; net default-parallel **110/110**; IPC, kernel_core, and kernel hosted compile checks; eight-file local/remote SHA-256 parity; complete independent remote ladder **PASS** |
+| Host unit tests | CI-gated `make test-hosted-subcrates`: **169 default-parallel tests** across audit/MM/block/seccomp/net plus focused RF186 capability lifecycle, with exact-count oracles; IPC/kernel_core/kernel test code compile-checked; privileged execution remains QEMU-only |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
@@ -367,8 +368,9 @@ marks a capability that is partial or inert. Every "gap" is stated explicitly.*
   (`netns_rx_eth0_slirp` gate: ARP probe out, SLIRP reply received and learned). On-link TX misses emit
   rate-limited **ARP request probes** (per-NS ring + bucket; global bucket drawn at emission only).
 - ✅ **Gaps:** no IPv6 datapath; virtio-only (no e1000); no checksum/TSO offload, mergeable RX, or multiqueue.
-  No pending-frame queue yet — an on-link miss still falls back to the gateway MAC (metered) while the
-  probe is in flight; `move_net_device` (518) is dispatched but hard-gated `ENOSYS`.
+  The pending-frame queue is landed and gateway-fallback delivery is retired. Remaining work includes
+  firewall administration, `veth` plus a real routing table, and capability-safe arming of
+  `move_net_device` (518), which remains hard-gated `ENOSYS`.
 
 ### 5.8 SMP, IOMMU & concurrency
 
@@ -456,7 +458,7 @@ current feature frontier.
 findings on an immutable tree (the "zero-HIGH streak 3/3"), plus resolution of all D1 (highest-severity)
 design findings.
 
-**Current status: BLOCKED (2026-07-29).**
+**Current status: BLOCKED (2026-07-30).**
 
 | Gate item | State |
 |---|---|
@@ -464,16 +466,17 @@ design findings.
 | Open CRITICAL / HIGH / MEDIUM | 0 / **1** / 0 actionable — `R186-4`: VMA/MM metadata (`FallibleOrderedMap`/`Vec` ownership) sits outside whole-heap aggregate admission, so PROT_NONE and fork pressure bypass the ledger |
 | D1 design findings | **1 open** — `D1-RES-HEAP-ADMISSION-REOPENED` (the design parent of `R186-4`: whole-heap closure excludes live consumers). D1-ISO remains RESOLVED 2026-07-24 (type-enforced TX token + Option-B claim narrowing; residual config arc re-filed as D3 NETNS-DATAPLANE-CONFIG, Phase I.3) |
 | Proof-obligation ledger | 8 of 12 PO artifacts complete |
-| Gate-relevant test debt | Host `#[cfg(test)]` unit tests are ungated and mostly non-executing (§1); the in-kernel boot suite is the real coverage vehicle |
+| Gate-relevant test debt | Hosted CI now gates 169 default-parallel tests plus three test-code compile checks. Physical hostile-device/DMA/IOMMU, crafted-ext2, true readdir-OOM, RF186-24 exact-fallback injection, and privileged no_std execution remain explicit debt |
 
 **What "unblocked" will and won't mean:** clearing the gate qualifies the tree for a **1.0-Preview**
 (feature-and-hardening milestone) — it is **not** a general-availability, production-certified, or
 ABI-stable release. Phase U (dynamic linking, glibc, OCI) remains ahead, KPTI is still inert, and
 real-hardware/bare-metal validation is outstanding.
 
-> **README reconciliation:** resolved. `README.md` §6 and `README_zh.md` §6 were reconciled to this
-> state on 2026-07-29 and now report "BLOCKED — one HIGH (`R186-4`) remains; zero-HIGH streak 0/3",
-> matching this table. No outstanding divergence.
+> **README reconciliation:** updated for the authoritative 2026-07-30 Stage-3 state:
+> 16 fixes reviewed, 24 RF defects repaired, 0 escalations; approved eight-file payload uploaded,
+> hash-verified, and the complete focused/default-parallel plus remote gate ladder passed.
+> Gate status remains “BLOCKED — one HIGH (`R186-4`) plus its D1 parent; streak 0/3”.
 
 ---
 
@@ -503,24 +506,18 @@ panel). Target: glibc + full Linux/OCI, dynamic linking in scope.
 
 ## 10. Forward Roadmap
 
-### Near term (from the live plan v15.38, gate-directed)
+### Near term (from the live plan v15.52, gate-directed)
 
-1. **R186 audit — streak candidate 2/3** (over the **post-design-queue** tree: D1-ISO + D2-ABI + D1-RES + lint gates). Must run in Codex-cooperative mode or
-   apply the hardened orchestrator backstop with a **caller/lock-context lens** (re-read every CRITICAL/HIGH
-   candidate together with its enclosing lock scope and all call sites) — the lens whose absence caused
-   R184 to over-report HIGH by 10×.
-2. **R187 — streak candidate 3/3.** Clean → the streak side of the gate is satisfied.
-3. **D1 residual mitigation — DONE 2026-07-24** (both D1s resolved): D1-RES whole-heap
-   admission/ownership closure (R1-R4 + oracle); D1-ISO `AuthorizedTxDevice` type-enforced TX gate +
-   Option-B claim narrowing. Per-namespace dataplane config re-filed as D3 NETNS-DATAPLANE-CONFIG (Phase I.3)
-   and **largely landed 2026-07-25** across eight legs (see §1 and §5.7).
-   - *D3 residual (next feature work, not gate-blocking):* pending-frame queue v2 — park the data frame
-     on an on-link ARP miss and retransmit it on learn/timeout, retiring the metered gateway-fallback
-     delivery path and moving probe admission past the ownership gate; then the per-NS firewall admin
-     syscall surface, `veth` pairs + a real routing table, and arming `move_net_device`.
-4. **Housekeeping cleanups** (§12): delete `sched/process.rs` and `kernel_core/kcov_syscalls.rs` orphans;
-   remove dead demo modules; correct the stale IOMMU/DMAR boot comment; either wire the KCOV recorder or
-   mark it explicitly non-functional; drop the unused `uart_16550` dependency.
+1. **Remain at the user-directed Stage-3 hold:** land and verify the hosted sub-crate CI gate,
+   synchronize ReviewFix records, and do not invoke the next stage.
+2. **Only after explicit user resume, run `kernel-next-phase`:** carry `R186-4` and
+   `D1-RES-HEAP-ADMISSION-REOPENED` as the top mandatory plan item.
+3. **Implement R186-4 as one aggregate, amount-symmetric admission transaction.**
+   A partial multi-ledger design is explicitly rejected because it cannot provide secure rollback.
+4. **Run the next full audit only after R186-4 closes.** The nominal R187 round may then become
+   zero-HIGH streak candidate **1/3**, not 3/3.
+5. Continue non-gating D3 feature work after the security blocker: firewall administration,
+   veth/routing-table support, and arming `move_net_device`.
 
 ### Mid term (remaining Phase U)
 
@@ -552,39 +549,35 @@ independent Claude-solo skeptic fleets when Codex is unavailable) before the rou
 | Network | R50–R99 (2026-01→02) | TCP/IP hardening, conntrack, firewall, DMA/ext2 | R99 close: 496 filed / 454 fixed |
 | Governance | R100–R155 (2026-02→05) | Namespaces, cgroups, IOMMU, MSR/GS, fetch_add sweep | ~881 filed / ~95.8% fixed by R155 |
 | Concurrency | R156–R180 (2026-05→07) | IRQ-safety (sync_safe), deadlock/liveness, heap-admission, ABBA | R172 context-switch CRITICAL; R180 32 impl findings |
-| Gate push | R181–R185 (2026-07) | Zero-HIGH streak + U.S2 cap infra + design queue | R181–R183 clean (3/3); R184 1C+1H real; R185 clean (1/3) |
+| Gate push | R181–R186 (2026-07) | Zero-HIGH streak + U.S2 cap infra + design queue | R181–R183 clean; R184 real 1C+1H; R185 clean; R186 left 1 HIGH open and Stage 3 repaired 24 fix escapes |
 
-**Cumulative (through R185):** ~1,315 findings filed, ~1,161 fixed. The remaining ~154 filed-but-not-fixed
-findings are **not open vulnerabilities**; their approximate disposition is:
+**Cumulative (through R186):** ~1,333 findings filed and ~1,177 fixed/resolved.
+Historical filed-but-not-fixed IDs include refuted, merged, accepted-risk, superseded,
+and deferred findings; they are not all open vulnerabilities.
 
-- **Verification-refuted false positives** — the dominant share. R184 alone contributed 28 (10 HIGH + 18
-  MEDIUM refuted with line-cited evidence); earlier rounds recalibrated or refuted many more on
-  orchestrator re-read (the R169/R177/R178 lesson).
-- **Documented / accepted-risk / deferred** — a small set: R40 KASLR/KPTI architectural, R65 SMP,
-  R81-3 / R84-4 / R89-4 documented risks, R121-2 KPTI trampoline (deferred, non-gating).
-- **Duplicate / superseded** — findings re-filed across rounds then merged.
-- **Currently open actionable: 0 CRITICAL / 0 HIGH / 0 MEDIUM / 0 LOW.** As of 2026-07-24 all 6
-  R180 design findings below are dispositioned AND the follow-on D2-ABI-STAT-LAYOUT is RESOLVED
-  (VfsStat → Linux x86-64 stat 144B, UtsName → 390B, musl-proven); the open design queue is
-  D3-backlog-only (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC clone-side, D2-ARC demoted legs,
-  D1-RES validation breadth).
+- **Currently open actionable:** 0 CRITICAL / **1 HIGH (`R186-4`)** /
+  0 MEDIUM / 0 LOW.
+- **Current gate-blocking design debt:** `D1-RES-HEAP-ADMISSION-REOPENED`,
+  the parent of `R186-4`.
+- The six historical R180 design findings retain their recorded dispositions, but the
+  later R186 consumer evidence reopened aggregate heap admission under a new design ID.
 
-These are estimates aggregated across 185 rounds; the authoritative per-round disposition lives in
-`docs/review/`. The count above is *findings-filed*, not *distinct-defects* — the audit false-positive rate
-is itself tracked as a process risk (§14).
+These are estimates aggregated across 186 rounds; authoritative per-round disposition
+lives in `docs/review/`.
 
-**Design findings (6 tracked from R180 — all 6 dispositioned as of 2026-07-24; 0 gate-blocking):**
+**Design findings (historical R180 six plus the R186 reopened parent):**
 
 | ID | Sev | Title | State |
 |---|---|---|---|
 | D1-RES-HEAP-BUDGET-SCOPE | ~~D1~~ | whole-heap admission/ownership scope proof | **RESOLVED 2026-07-24** — R1 in-place sigframe, R2 stdin/socket `.bss` rewrites, R3 intrusive allocator, R4 instrumented peak ceiling, combined-load probe; D3 validation-breadth backlog only |
+| D1-RES-HEAP-ADMISSION-REOPENED | D1 | aggregate admission excludes live VMA/MM metadata | **OPEN / GATE-BLOCKING** — parent of `R186-4`; the prior R180 closure remains historical but was invalidated by this newly proven consumer |
 | D1-ISO-NETNS-DATAPLANE | ~~D1~~ | per-namespace device-ownership + dataplane isolation | **RESOLVED 2026-07-24** — type-enforced `tx_auth::AuthorizedTxDevice` token (sole driver-transmit path), Option-B claim narrowing (`docs/namespace-isolation.md`), `net_ns_tx_isolation` boot test; feature gap re-filed as **D3 NETNS-DATAPLANE-CONFIG** (Phase I.3) |
 | D2-ARC-CLONE-LOCK | ~~D2~~→D3 | cross-registry lock-ordering / transaction API | demoted 2026-07-24 — `ProcessRegistryTxn` + seccomp recount landed; D3 backlog (compile-time tokens, front-door unification, R37-1 TSYNC clone-side) |
 | D2-ERR-VFS-FALLIBILITY | ~~D2~~ | end-to-end VFS fallibility (prepare/commit) | **RESOLVED 2026-07-24** — `make lint-fallible` mechanized + 2 real fixes (pending tracking commit) |
 | D2-TST-ABI-BYTES | ~~D2~~ | static ABI-layout oracle vs. wrapper drift | **RESOLVED 2026-07-24** — 3-leg `make abi-check` oracle (pending tracking commit) |
 | D2-ABI-STAT-LAYOUT | ~~D2~~ | VfsStat/UtsName Linux wire layouts | **RESOLVED 2026-07-24** — VfsStat → exact Linux x86-64 `struct stat` 144B; UtsName → 390B `new_utsname`; fallible TryFrom→EOVERFLOW; shell mirrors lockstepped; oracle LINUX_UAPI + gcc Leg-C; musl `MUSL-STAT-OK`/`MUSL-UNAME-OK` REQUIRED markers |
 | D3-RES-COW-RESERVATION | D3 | COW metadata reservation transaction | **CLOSED 2026-07-24** — PO-MM-01 claims re-verified live; lazy reservation → Phase L |
-| D3 NETNS-DATAPLANE-CONFIG | D3 | per-ns dataplane feature arc (from D1-ISO Option-B) | **LARGELY LANDED 2026-07-25** — 8 legs: per-NS ARP cache, `NsByteBudget`, RX-wiring gate, per-NS config, per-NS routing, RX ingress loop, external RX completion (`eth0` live), ARP probe TX; 11 `netns_*` boot tests. Residual: pending-frame queue, firewall admin surface, veth + routing table, `move_net_device` arming |
+| D3 NETNS-DATAPLANE-CONFIG | D3 | per-ns dataplane feature arc (from D1-ISO Option-B) | **LARGELY LANDED 2026-07-27** — per-NS ARP cache, `NsByteBudget`, RX-wiring gate, per-NS config/routing, RX ingress, external RX completion (`eth0` live), ARP probe TX, and pending-frame queue with gateway-fallback delivery retired. Residual: firewall admin surface, veth + routing table, `move_net_device` arming |
 | D3 R37-1-TSYNC-CLONE-SIDE | D3 | TSYNC clone-side residual | **dispositioned** — revisit with TSYNC impl (F-5/Phase M) |
 
 (PO = *proof obligation*, the design queue's closure artifacts; 8 of 12 complete as of 2026-07-22.)
@@ -667,12 +660,12 @@ and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV covera
 
 | Risk | Severity | Status | Note |
 |---|---|---|---|
-| Audit over-reporting (solo mode, no lock/caller context) | Process | **Active** | R184 was 91% false-positive on HIGH; R186+ must use Codex or the caller/lock lens |
-| D1 design debt (heap-scope proof, netns dataplane) | ~~D1~~ | **RESOLVED 2026-07-24** | No longer blocks the gate; residual feature arc = D3 NETNS-DATAPLANE-CONFIG |
+| Audit over-reporting (solo mode, no lock/caller context) | Process | **Active** | R187+ must retain the caller/lock-context lens and independent convergence evidence |
+| Aggregate heap-admission design debt | D1 | **OPEN / gate-blocking** | `D1-RES-HEAP-ADMISSION-REOPENED` is the parent of `R186-4`; D1-ISO remains resolved |
 | KPTI inert (single-CR3) | Design | Deferred (R121-2) | Meltdown-class defense relies on hardware immunity until MM dual-root lands |
 | No real-hardware validation | Coverage | Open | QEMU-only; melting/bare-metal gates are frameworks |
 | Livepatch trust keys unprovisioned | Ops | Open | mechanism complete, non-functional until keys wired |
-| Zero host-side unit tests | Coverage | Waived (D-3) | in-kernel runtime tests + fuzzing are the substitute; Phase K arc |
+| Host-side unit-test coverage | Coverage | **CI-gated allowlist** | 169 default-parallel tests with exact-count oracles plus IPC/kernel_core/kernel test-code checks; privileged suites remain boot/QEMU-only |
 | Single build target (x86_64/UEFI/virtio) | Scope | By design | no portability layer; not a near-term goal |
 
 ---
@@ -696,4 +689,3 @@ and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV covera
 and is grounded in a full read of the source tree at the snapshot commit above, cross-checked against the
 live plan and audit reports. It supersedes both prior roadmap documents. For the authoritative per-round
 security status see `docs/review/`; for live priorities see `docs/review/nextplan/`.*
-

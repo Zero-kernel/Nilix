@@ -2,16 +2,18 @@
 
 This document provides a high-level overview of the Nilix testing infrastructure.
 
-**Last verified:** 2026-07-29 — `make fmt-check`, `make clippy`, `make lint`, `make build`,
+**Last verified:** 2026-07-30 — `make fmt-check`, `make clippy`, `make lint`, `make build`,
 `make test`, `make boot-check` and `make musl-check` all passed remotely; the runtime gate reported
 **31 passed / 39 deferred / 0 failed**, with 0 panic and 0 NX faults.
 
-> **Host `cargo test` is not part of the gate set and mostly does not run.** Only the `audit` crate's
-> host tests execute (15 passed / 0 failed, measured 2026-07-29). Test binaries for `mm`, `block`,
-> `net`, `seccomp` and `kernel_core` abort at the first allocation because they link the kernel's
-> uninitialized `global_allocator` — pre-existing and A/B-verified. In-kernel boot tests below are the
-> authoritative regression coverage; a new `#[cfg(test)]` assertion in those crates documents intent
-> but does not execute.
+> **Hosted sub-crate tests are now a fail-closed CI gate.** `make test-hosted-subcrates` runs
+> **169 tests under Rust's default parallel scheduler**: audit 15, MM 19, block 9, seccomp 14,
+> net 110, and the two RF186 capability lifecycle regressions. `mm/host_harness` removes the
+> kernel allocator/LAPIC assumptions for those approved suites. Exact summary oracles reject
+> command failure, count drift, ignored/measured drift, or an accidental zero-test filter.
+> IPC, kernel_core, and kernel test code receive hosted compile checks. Full capability and
+> privileged kernel suites remain QEMU-only because interrupt/MMIO execution is invalid in an
+> ordinary hosted process; the boot/runtime gates below remain authoritative for those paths.
 
 ## Test Categories
 

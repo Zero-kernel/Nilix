@@ -83,23 +83,29 @@ Each subdirectory has a README.md providing:
 
 ## Quality Gate Status
 
-Current gate status for 1.0-Preview: **BLOCKED** (measured 2026-07-29)
+Current gate status for 1.0-Preview: **BLOCKED** (authoritative state 2026-07-30)
+
 - ✅ 0 open CRITICAL findings
 - ❌ 1 open HIGH finding (`R186-4`, VMA/MM aggregate admission); zero-HIGH streak 0/3
 - ✅ 16 of 17 actionable R186 findings fully fixed; `R186-4` is the sole open actionable
-- ✅ Those fixes then review-fixed: 10 `RF186-*` defects filed and repaired (2026-07-29)
-- ✅ Remote gates all green: fmt-check, clippy, lint (incl. abi-oracle + lint-fallible 22/0), build,
-  boot-check, musl-check; `make test` = **31 passed / 39 deferred / 0 failed**, 0 panic, 0 NX
-- ⚠️ Host `#[cfg(test)]` unit tests are **ungated and mostly non-executing** — only the `audit` crate's
-  run (15/0); `mm`/`block`/`net`/`seccomp` test binaries abort on the uninitialized kernel heap
-  (pre-existing). The in-kernel boot suite is the real regression vehicle.
+- ✅ Authoritative ReviewFix closure: 16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL);
+  all 24 `RF186-*` defects repaired, 0 escalated
+- ✅ Final remote ladder: fmt-check, clippy, lint, build, boot-check, and musl-check PASS;
+  `make test` = **31 passed / 39 deferred / 0 failed**, 0 panic, 0 NX
+- ✅ Focused/default-parallel evidence: capability 2/2, conntrack stress 50/50,
+  and net 110/110
+- ✅ Hosted sub-crate CI: **169 default-parallel tests** (audit/MM/block/seccomp/net +
+  focused RF186 capability lifecycle) with exact-count oracles, plus IPC/kernel_core/kernel
+  test-code compile checks. Privileged suites remain QEMU-only by explicit contract
 
 See the [R186 audit/fix record](review/audits/qa-2026-07-28.md) and the
-[RF186 review-fix report](review/reviewfix/reviewfix-2026-07-29.md) for details.
+[authoritative RF186 review-fix report](review/reviewfix/reviewfix-2026-07-30.md).
 
 ## Recent Audit Rounds
 
-- **RF186** (July 29, 2026): Review of the R186 fixes — 10 defects filed and repaired - [reviewfix/reviewfix-2026-07-29.md](review/reviewfix/reviewfix-2026-07-29.md)
+- **RF186 final** (July 30, 2026): 16 fixes reviewed; 2 PASS / 12 PARTIAL / 2 FAIL;
+  24/24 defects repaired, 0 escalated; final environment ladder green -
+  [reviewfix/reviewfix-2026-07-30.md](review/reviewfix/reviewfix-2026-07-30.md)
 - **R186** (July 28, 2026): Latest full-codebase audit and fix record - [audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md)
 - **R185** (July 23, 2026): Clean verification round - [audits/qa-2026-07-23-v2.md](review/audits/qa-2026-07-23-v2.md)
 - **R184** (July 23, 2026): Findings round and review-fix - [audits/qa-2026-07-23.md](review/audits/qa-2026-07-23.md)

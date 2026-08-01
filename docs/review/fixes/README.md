@@ -4,8 +4,14 @@ This directory contains fix plans, implementation details, and summaries for sec
 
 ## R186 Fixes (July 2026)
 
-- **[R186 audit/fix record](../audits/qa-2026-07-28.md)** - 16 actionables fixed and `R186-4` open; includes safety rationale, convergence notes, and gate results.
-- **[Current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)** - Live remaining-work and release-gate status.
+- **[R186 audit/fix record](../audits/qa-2026-07-28.md)** - 16/17 actionables fixed,
+  0 partial, `R186-4` sole open HIGH.
+- **[Authoritative R186 ReviewFix](../reviewfix/reviewfix-2026-07-30.md)** -
+  16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL); 24/24 RF defects repaired,
+  0 escalated. Source and environment closure are complete; focused/default-parallel
+  checks and the full final remote ladder are green.
+- **[Current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)** -
+  Live remaining-work and release-gate status, version 15.53 current-state override.
 
 ## R181 Fixes (July 2026)
 
@@ -80,14 +86,13 @@ This directory contains fix plans, implementation details, and summaries for sec
 
 ## Verification Standards
 
-All fixes must pass:
-- ✅ Build (make build exit 0)
-- ✅ Lint (clippy clean)
-- ✅ Unit tests (cargo test)
-- ✅ Default runtime gate (`make test`; currently 31 passed / 39 deferred / 0 failed)
-- ✅ Targeted SMP/boot gates when the affected path requires them
-- ✅ Boot check (serial success markers)
-- ✅ Codex peer review (convergence gate)
+All fixes must record:
+
+- Build and lint results
+- Relevant hosted tests when supported, otherwise an explicit NOT-RUN/PENDING disposition
+- Default runtime and boot-gate results
+- Targeted SMP or hardware-path verification where required
+- Independent review/convergence evidence and the actual operating mode
 
 ## Related Documentation
 

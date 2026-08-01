@@ -5,18 +5,18 @@ This directory contains final implementation status reports and comprehensive su
 ## Current Status
 
 - **[R186 audit and fix record](../../review/audits/qa-2026-07-28.md)** - Authoritative live security status
-- **[RF186 review-fix report](../../review/reviewfix/reviewfix-2026-07-29.md)** - Review of the R186 fixes: 10 defects filed and repaired
+- **[Authoritative RF186 review-fix report](../../review/reviewfix/reviewfix-2026-07-30.md)** - 16 fixes reviewed; 2 PASS / 12 PARTIAL / 2 FAIL; 24/24 defects repaired; final ladder green
 - **[Current next-phase plan](../../review/nextplan/next-phase-plan-2026-07-23-v2.md)** - Live release blockers and priorities
 - **[FINAL_IMPLEMENTATION_STATUS.md](FINAL_IMPLEMENTATION_STATUS.md)** - Final implementation status report for latest QA round
 - **[COMPLETE_QA_REMEDIATION_FINAL.md](COMPLETE_QA_REMEDIATION_FINAL.md)** - Complete QA remediation final summary
 - **[COMPREHENSIVE_RECONSTRUCTION_SUMMARY.md](COMPREHENSIVE_RECONSTRUCTION_SUMMARY.md)** - Comprehensive reconstruction summary
 - **[QA_FIXES_AND_TESTS_COMPLETE.md](QA_FIXES_AND_TESTS_COMPLETE.md)** - QA fixes and tests completion report
 
-The named `FINAL_*` reports are historical snapshots. As of 2026-07-29 the 1.0-Preview gate is
-**BLOCKED** on one HIGH (`R186-4`), the sole open R186 actionable, with the zero-HIGH streak at 0/3.
-The remote gates are green — fmt-check, clippy, lint, build, boot-check and musl-check all pass, and
-`make test` measures 31 passed / 39 deferred / 0 failed. The R186 fixes themselves were subsequently
-review-fixed: 10 `RF186-*` defects filed and repaired on 2026-07-29.
+The named `FINAL_*` reports are historical snapshots. As of 2026-07-30 the
+1.0-Preview gate is **BLOCKED** on one HIGH (`R186-4`) and its D1 design parent,
+with the zero-HIGH streak at 0/3. Stage 3 reviewed 16 fixes
+(2 PASS / 12 PARTIAL / 2 FAIL), repaired all 24 RF186 defects with 0 escalations,
+and completed the final remote ladder at 31 passed / 39 deferred / 0 failed.
 
 ## Report Types
 
@@ -75,8 +75,9 @@ Latest comprehensive audit and remediation:
 - 16 actionables fully fixed; `R186-4` open
 - Gate: BLOCKED (0 CRITICAL, 1 HIGH); zero-HIGH streak reset to 0/3
 - Full record: [qa-2026-07-28.md](../../review/audits/qa-2026-07-28.md)
-- Fix review (RF186, July 29): 10 defects in the landed fixes filed and repaired —
-  [reviewfix-2026-07-29.md](../../review/reviewfix/reviewfix-2026-07-29.md)
+- Authoritative fix review (RF186 final, July 30): 16 fixes reviewed,
+  24/24 defects repaired, 0 escalated; final ladder green —
+  [reviewfix-2026-07-30.md](../../review/reviewfix/reviewfix-2026-07-30.md)
 
 ### R174 (July 2026)
 Historical comprehensive audit and remediation:
@@ -138,13 +139,13 @@ Reports track key quality metrics:
 
 ## Verification Standards
 
-All work documented in final status reports has passed:
-- ✅ Build verification (make build)
-- ✅ Lint verification (clippy)
-- ✅ Unit tests (cargo test)
-- ✅ Integration/runtime tests (`make test`)
-- ✅ Targeted SMP tests when required by the affected subsystem
-- ✅ Codex peer review (convergence gate)
+Every report must record each relevant gate honestly as PASS, FAIL, NOT-RUN, or PENDING:
+
+- Build and lint verification
+- Default integration/runtime and boot verification
+- Hosted `cargo test` only where a supported harness exists
+- Targeted SMP/hardware-path gates where required
+- Independent review/convergence evidence, including the actual operating mode
 
 ## Related Documentation
 
