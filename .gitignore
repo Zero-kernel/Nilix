@@ -52,6 +52,7 @@ userspace/clippy-userspace-target
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/*.log
+/hosted-subcrate-review-target/
 
 #no_need
 *.backup
