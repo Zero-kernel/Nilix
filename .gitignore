@@ -7,7 +7,7 @@
 userspace/target/
 userspace-target/
 userspace/fuzzer/target/
-Cargo.lock
+# Cargo.lock: TRACKED for reproducible kernel builds (security-critical deps)
 
 
 # Binaries
