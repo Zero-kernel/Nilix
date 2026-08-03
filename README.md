@@ -39,21 +39,26 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate is currently **BLOCKED** on one HIGH finding
-(`R186-4`, VMA/MM aggregate admission) and its design parent. The zero-HIGH streak is **0/3**;
-all other R186 actionable findings are fixed and have since been review-fixed.
-See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate is currently **BLOCKED on the zero-HIGH streak only**
+(currently **1/3** after R186-4 fix). All R186 actionable findings are now fixed and verified,
+including the former gate-blocking `R186-4` (VMA/MM aggregate admission). See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-08-03:** R186-4 HIGH fix complete — VMA/MM metadata admission via `AdmittedMap` migration.
+  All `mmap_regions` and `pt_charged_frames` maps now use `AdmittedMap<HeapClass::CoreProcess>`,
+  charging their backing Vec capacity to the per-process heap budget. Fork uses
+  `from_sorted_vec_charged` with `shrink_to_fit` pre-charge to prevent capacity amplification.
+  Three convergence issues resolved: (1) shrink before charge, (2) propagate errors instead of
+  panic, (3) no double-uncharge on reservation failure. Three new runtime tests validate coexistence,
+  pressure scenarios, and fork combined-load. The zero-HIGH streak advances to **1/3**; 1.0-Preview
+  is now blocked on streak only. Gate status: `make test` **34 passed / 39 deferred / 0 failed**;
+  boot-check, musl-check, and all CI gates remain green.
 - **2026-07-30:** Authoritative R186 ReviewFix source and environment closure — 16 landed fixes
   were reviewed: **2 PASS / 12 PARTIAL / 2 FAIL**. All **24 review-fix defects**
   (`RF186-1`…`RF186-24`) are repaired with **0 escalations**; the source/test
   judges and independent RF186-20..24 security reviewer returned **SAFE**.
-  `R186-18` is fixed and review-verified. The sole open actionable remains
-  `R186-4` (HIGH), so 1.0-Preview remains blocked on it plus
-  `D1-RES-HEAP-ADMISSION-REOPENED`, and the zero-HIGH streak remains **0/3**.
   Focused/default-parallel checks and the final remote ladder are green: net 110/110,
-  conntrack stress 50/50, `make test` 31/39/0, and boot/musl PASS.
+  conntrack stress 50/50, and boot/musl PASS.
 - **2026-07-28:** R186 remediation — 16 of 17 actionable findings are fully fixed and one
   remains open. The landed set removes the open/openat publication
   deadlock, makes netns and VFS allocation paths fallible, validates VirtIO PCI capability

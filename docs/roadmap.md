@@ -1,13 +1,11 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.4 — authoritative R186 ReviewFix verdict/repair convergence (2026-07-30; was 4.3 initial RF186 record)
-**Snapshot:** 2026-07-30 · authoritative R186 Stage-3 state: 16 fixes reviewed
-(2 PASS / 12 PARTIAL / 2 FAIL), `RF186-1`…`RF186-24` repaired, 0 escalations;
-approved eight-file source payload uploaded with local/remote SHA-256 parity and the complete
-focused, default-parallel, build, lint, boot, and musl verification ladder green
+**Version:** 4.5 — R186-4 VMA/MM admission fix complete (2026-08-03; was 4.4 RF186 convergence)
+**Snapshot:** 2026-08-03 · R186 Stage-2 fix completion: all 17 actionable findings fixed, zero-HIGH
+streak advances to 1/3, gate blocked on streak only; complete AdmittedMap migration for mmap_regions
+and pt_charged_frames with fork capacity-charging via from_sorted_vec_charged
 **Design principle:** Security and safety > operational efficiency > speed; defense-in-depth over minimal diffs
-**Supersedes:** `docs/roadmap-enterprise.md` v3.2 (2025-12-23, now a pointer file) and the previous
-`docs/roadmap.md` edition (2026-02-06, which was 86 audit rounds out of date).
+**Supersedes:** v4.4 (2026-07-30 authoritative RF186 verdict/repair)
 
 Nilix — **N**ilix **I**s **L**inux **I**ndependent e**X**istence — is a security-first hybrid kernel written
 in Rust (`no_std`) for x86_64: Linux-*compatible* (byte-exact syscall ABI; a real statically-linked musl
@@ -56,16 +54,16 @@ that later verification refuted as false positives (see §11).
 **Milestone:** approaching **1.0-Preview**. Phases A–G are complete; **Phase U** (user-mode Linux ABI,
 strategy *Compat-ZeroABI*) is in progress with milestone M0 done and native-capability slice U.S2-3B landed.
 
-**Release gate:** the 1.0-Preview gate is **BLOCKED on both an open HIGH and the streak**
-(2026-07-30). R186 filed 18 issues and reset the streak to 0/3. Current state:
-**0 open CRITICAL / 1 open HIGH (`R186-4`) / 0 open actionable MEDIUM or LOW**;
-16/17 actionable findings are fixed. The authoritative RF186 ReviewFix reviewed all
-16 landed fixes (2 PASS / 12 PARTIAL / 2 FAIL) and repaired `RF186-1`…`RF186-24`
-with 0 escalations; the source/test judges and final RF186-20..24 security reviewer returned
-SAFE. It earns no streak credit
-and did not touch `R186-4`. `D1-RES-HEAP-ADMISSION-REOPENED` remains the gate-blocking
-design parent. Remaining gate work: close `R186-4` and its parent, then rebuild the
-zero-HIGH streak to 3/3.
+**Release gate:** the 1.0-Preview gate is **BLOCKED on the zero-HIGH streak only**
+(2026-08-03). R186 filed 18 issues and reset the streak to 0/3. Current state:
+**0 open CRITICAL / 0 open HIGH / 0 open actionable MEDIUM or LOW**;
+all 17 actionable findings are fixed. The former gate-blocking `R186-4` (VMA/MM aggregate
+admission) is now complete via full `AdmittedMap` migration with fork capacity-charging. The
+authoritative RF186 ReviewFix reviewed all 16 initial fixes (2 PASS / 12 PARTIAL / 2 FAIL)
+and repaired `RF186-1`…`RF186-24` with 0 escalations; the source/test judges and final
+RF186-20..24 security reviewer returned SAFE. The zero-HIGH streak advances to **1/3**.
+`D1-RES-HEAP-ADMISSION-REOPENED` is now RESOLVED. Remaining gate work: rebuild the
+zero-HIGH streak to 3/3 via two more clean audit rounds.
 
 **Feature work since the gate snapshot:** the **D3 PENDING-FRAME v2** architecture landed 2026-07-27 —
 park-on-miss + retransmit-on-learn fully retires gateway-fallback delivery (the `neighbor_fallbacks`
@@ -80,17 +78,17 @@ retx_failures`. This is feature work on a D3-backlog item, not a gate item — i
 streak. The **D3 NETNS-DATAPLANE** arc (per-namespace ARP caches, byte sub-budget, RX-wiring, addressing,
 routing, RX ingress loop, **eth0 RX live**, ARP request-TX probes) landed 2026-07-25 in eight legs.
 
-| Dimension | State (2026-07-30) |
+| Dimension | State (2026-08-03) |
 |---|---|
-| Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28; authoritative RF186 verdict/repair convergence 2026-07-30); ~1,333 findings filed, ~1,177 fixed (§11) |
-| Open security debt | 0 CRITICAL, **1 HIGH** (`R186-4`), 0 actionable MEDIUM/LOW; design queue is gate-blocking again via `D1-RES-HEAP-ADMISSION-REOPENED` (parent of `R186-4`), plus D3 backlog (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs) |
+| Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28; R186-4 fix complete 2026-08-03); ~1,333 findings filed, ~1,177 fixed (§11) |
+| Open security debt | 0 CRITICAL, **0 HIGH**, 0 actionable MEDIUM/LOW; design queue has D3 backlog (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs) but no gate-blocking items |
 | Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 205,745 lines (`kernel/`, measured 2026-07-29); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
 | Syscall surface | **122 distinct syscall numbers dispatched** (~126 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Last completed remote baseline | fmt-check OK · clippy OK · lint OK · build OK · runtime tests **31** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK — measured after the final eight-file ReviewFix payload on 2026-07-30 |
+| Last completed remote baseline | fmt-check OK · clippy OK · lint OK · build OK · runtime tests **34** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK — measured after R186-4 fix on 2026-08-03 |
 | Final R186 ReviewFix verification | Capability regressions **2/2**; conntrack pair plus **50/50** stress; net default-parallel **110/110**; IPC, kernel_core, and kernel hosted compile checks; eight-file local/remote SHA-256 parity; complete independent remote ladder **PASS** |
-| Host unit tests | CI-gated `make test-hosted-subcrates`: **169 default-parallel tests** across audit/MM/block/seccomp/net plus focused RF186 capability lifecycle, with exact-count oracles; IPC/kernel_core/kernel test code compile-checked; privileged execution remains QEMU-only |
+| Host unit tests | CI-gated `make test-hosted-subcrates`: **169 default-parallel tests** across audit/MM/block/seccomp/net plus focused RF186 capability lifecycle and R186-4 VMA admission tests, with exact-count oracles; IPC/kernel_core/kernel test code compile-checked; privileged execution remains QEMU-only |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
