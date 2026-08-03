@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -77,7 +77,7 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf build-essential
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -88,7 +88,7 @@ jobs:
             ${{ runner.os }}-cargo-kcov-
 
       - name: Restore corpus from previous run
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: corpus-worker-${{ matrix.worker }}/
           key: continuous-corpus-${{ github.sha }}-worker-${{ matrix.worker }}
@@ -196,7 +196,7 @@ jobs:
 
       - name: Upload crashes
         if: always() && steps.check_crashes.outputs.crashes > 0
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: continuous-crashes-worker-${{ matrix.worker }}
           path: crashes-worker-${{ matrix.worker }}/
@@ -204,7 +204,7 @@ jobs:
 
       - name: Upload dashboard
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: continuous-dashboard-worker-${{ matrix.worker }}
           path: |
@@ -215,7 +215,7 @@ jobs:
 
       - name: Upload corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: continuous-corpus-worker-${{ matrix.worker }}
           path: corpus-worker-${{ matrix.worker }}/
@@ -224,7 +224,7 @@ jobs:
 
       - name: Upload fuzzer log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: continuous-log-worker-${{ matrix.worker }}
           path: fuzzer-worker-${{ matrix.worker }}.log
@@ -258,7 +258,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -267,7 +267,7 @@ jobs:
           components: rust-src
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -280,7 +280,7 @@ jobs:
         run: cargo install cargo-fuzz
 
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}/
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
@@ -330,7 +330,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: always() && steps.check_crashes.outputs.crashes > 0
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cargo-fuzz-crashes-${{ matrix.target }}
           path: |
@@ -341,7 +341,7 @@ jobs:
 
       - name: Upload corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cargo-fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}/
@@ -350,7 +350,7 @@ jobs:
 
       - name: Upload output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cargo-fuzz-output-${{ matrix.target }}
           path: fuzz/fuzz_output_${{ matrix.target }}.txt
@@ -368,7 +368,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -376,7 +376,7 @@ jobs:
           toolchain: nightly-2025-12-08
 
       - name: Download all crash artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: all-crashes/
           pattern: '*-crashes-*'
@@ -436,7 +436,7 @@ jobs:
 
       - name: Upload triaged crashes
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: triaged-crashes
           path: triaged-crashes/
@@ -445,7 +445,7 @@ jobs:
 
       - name: Upload triage log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: triage-log
           path: triage.log
@@ -462,10 +462,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
 
@@ -574,7 +574,7 @@ jobs:
 
       - name: Upload aggregate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aggregate-report
           path: aggregate-report.md
