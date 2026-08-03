@@ -638,6 +638,22 @@ fn fork_inner(
                 },
             ));
 
+            // R186-4 FIX: Construct child's mmap_regions with charged admission.
+            // The snap Vec is already allocated and populated; from_sorted_vec_charged
+            // charges the Vec's capacity (not len) to CoreProcess heap class before
+            // constructing the AdmittedMap. On admission failure, the Vec is returned
+            // for cleanup and we return ENOMEM to the fork caller.
+            let child_mmap_regions = match mm::AdmittedMap::from_sorted_vec_charged(
+                snap,
+                mm::HeapClass::CoreProcess,
+            ) {
+                Ok(map) => map,
+                Err((snap, _error)) => {
+                    drop(snap);
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+            };
+
             let child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
                 // child's region map is now a `FallibleOrderedMap`, adopted in
@@ -649,7 +665,10 @@ fn fork_inner(
                 // and `from_sorted_vec` consumes that Vec verbatim. `snap` is
                 // strictly key-sorted because it is built from the parent's
                 // ordered `mmap_regions.iter()` (debug-asserted by from_sorted_vec).
-                mmap_regions: crate::fallible_map::FallibleOrderedMap::from_sorted_vec(snap),
+                //
+                // R186-4 FIX: Migrated to AdmittedMap with from_sorted_vec_charged,
+                // which charges the Vec capacity to CoreProcess before adoption.
+                mmap_regions: child_mmap_regions,
                 brk_start: parent_mm.brk_start,
                 brk: parent_mm.brk,
                 next_mmap_addr: parent_mm.next_mmap_addr,
@@ -670,7 +689,10 @@ fn fork_inner(
                 // region therefore uncharges 0 (the basis rides to last-exit,
                 // over-count-safe), preserving today's +P(parent)/-P(child exit)
                 // fork balance with zero new fork PT-recording surface.
-                pt_charged_frames: crate::fallible_map::FallibleOrderedMap::new(),
+                //
+                // R186-4 FIX: Migrated to AdmittedMap; child starts with empty ledger
+                // (AdmittedMap::new charges nothing for zero capacity).
+                pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
                 pt_inherited_bytes: parent_mm.pt_charged_bytes,
                 pt_ledger_authoritative: false,
                 // Transient pending counters reset for child — no in-flight
