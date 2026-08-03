@@ -24,7 +24,7 @@ jobs:
     name: rustfmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2025-12-08
@@ -40,7 +40,7 @@ jobs:
     name: build (bootloader + kernel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2025-12-08
@@ -54,7 +54,7 @@ jobs:
     name: custom lints (grep gates + ABI oracle)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: make lint
         run: make lint
       # Explicit steps so a future selective-target refactor of `lint` cannot
@@ -72,7 +72,7 @@ jobs:
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
       CARGO_TARGET_DIR: hosted-subcrate-target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2025-12-08
@@ -87,7 +87,7 @@ jobs:
     name: boot-check + test + musl-check (QEMU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2025-12-08
