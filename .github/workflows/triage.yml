@@ -1,0 +1,246 @@
+name: Triage
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    # Metadata-only: never check out or execute untrusted pull request code.
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: triage-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Apply ownership, risk, and size labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Ensure managed labels exist
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const labels = [
+              ["area: boot", "5319e7", "Bootloader, early boot, kernel entry, and image layout"],
+              ["area: arch/x86", "1d76db", "x86_64 interrupts, context switch, APIC, SMP, and TLB operations"],
+              ["area: memory", "0e8a16", "Allocators, page tables, COW, admission, cache, and OOM"],
+              ["area: process/ABI", "006b75", "Processes, syscalls, usercopy, signals, ELF, and Linux ABI"],
+              ["area: scheduler/concurrency", "7057ff", "Scheduling, CPU-local state, synchronization, RCU, and lock ordering"],
+              ["area: IPC", "bfdadc", "Pipes, futexes, message queues, and IPC namespaces"],
+              ["area: storage/VFS", "c2e0c6", "VFS, filesystems, block I/O, and storage images"],
+              ["area: network", "0e8a16", "Network stack, sockets, firewall, conntrack, and network namespaces"],
+              ["area: security", "b60205", "Capabilities, LSM, seccomp, audit, hardening, crypto, and livepatch"],
+              ["area: hardware/IOMMU", "d4c5f9", "Drivers, VirtIO, DMA, and IOMMU/VT-d"],
+              ["area: userspace", "fbca04", "Ring-3 programs, libc compatibility, and userspace support"],
+              ["area: observability", "c5def5", "Tracing, logging, profiling, watchdog, dump, and KCOV support"],
+              ["area: fuzzing", "d93f0b", "Fuzz targets, corpora, executors, triage, and KCOV workflows"],
+              ["area: tests", "d4c5f9", "Unit, hosted, runtime, QEMU, SMP, stress, and conformance tests"],
+              ["area: tooling/CI", "000000", "Build system, scripts, hooks, automation, and repository tooling"],
+              ["dependencies", "0366d6", "Dependency or toolchain updates"],
+              ["performance", "f9d0c4", "Measured performance or resource-usage work"],
+              ["security", "b60205", "Security-sensitive hardening or privately coordinated remediation"],
+              ["breaking change", "d93f0b", "Intentionally changes ABI, compatibility, or required migration"],
+              ["risk: ABI", "006b75", "Touches syscall, layout, usercopy, or userspace compatibility contracts"],
+              ["risk: concurrency", "7057ff", "Touches IRQ, preemption, atomics, locking, or SMP behavior"],
+              ["risk: unsafe", "b60205", "Adds or changes unsafe, MMIO, page-table, or raw-pointer behavior"],
+              ["risk: resource accounting", "fbca04", "Touches quotas, admission, rollback, or attacker-controlled resource use"],
+              ["priority: critical", "b60205", "Release-blocking exploitable bug, corruption, or panic path"],
+              ["priority: high", "d93f0b", "Release-blocking safety, concurrency, or exhaustion defect"],
+              ["needs: triage", "fbca04", "Needs maintainer classification, verification, and priority"],
+              ["needs: reproduction", "fef2c0", "Needs a current, minimal, repeatable reproducer or more evidence"],
+              ["tracking", "1d76db", "Tracks an accepted multi-step project or release-gate item"],
+              ["stale", "ededed", "Awaiting updated information after prolonged inactivity"],
+              ["no-stale", "1d76db", "Exempt from inactivity automation"],
+              ["size: XS", "c2e0c6", "Fewer than 50 review lines, excluding generated/binary artifacts"],
+              ["size: S", "7fdbca", "50-199 review lines, excluding generated/binary artifacts"],
+              ["size: M", "fbca04", "200-499 review lines, excluding generated/binary artifacts"],
+              ["size: L", "f9a825", "500-999 review lines, excluding generated/binary artifacts"],
+              ["size: XL", "d93f0b", "At least 1000 review lines, excluding generated/binary artifacts"],
+            ];
+
+            for (const [name, color, description] of labels) {
+              try {
+                const current = await github.rest.issues.getLabel({ ...context.repo, name });
+                if (current.data.color !== color || current.data.description !== description) {
+                  await github.rest.issues.updateLabel({
+                    ...context.repo,
+                    name,
+                    color,
+                    description,
+                  });
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name,
+                  color,
+                  description,
+                });
+              }
+            }
+
+      - name: Label pull request by changed paths
+        if: github.event_name == 'pull_request_target'
+        uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          repo-token: ${{ github.token }}
+          sync-labels: true
+
+      - name: Apply pull request size label
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const sizeLabels = ["size: XS", "size: S", "size: M", "size: L", "size: XL"];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const excludedSuffixes = [".lock", ".elf", ".efi", ".img"];
+            const changedLines = files.reduce((total, file) => {
+              if (excludedSuffixes.some((suffix) => file.filename.endsWith(suffix))) return total;
+              return total + file.additions + file.deletions;
+            }, 0);
+
+            let target = "size: XL";
+            if (changedLines < 50) target = "size: XS";
+            else if (changedLines < 200) target = "size: S";
+            else if (changedLines < 500) target = "size: M";
+            else if (changedLines < 1000) target = "size: L";
+
+            const current = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            for (const label of current) {
+              if (sizeLabels.includes(label.name) && label.name !== target) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name: label.name,
+                });
+              }
+            }
+            if (!current.some((label) => label.name === target)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [target],
+              });
+            }
+            core.info(`Applied ${target} for ${changedLines} review lines.`);
+
+      - name: Apply pull request title labels
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const title = context.payload.pull_request.title || "";
+            const match = title.match(/^(feat|fix|perf|docs|test|ci)(?:\(([^)]+)\))?(!)?:\s+/i);
+            const typeLabels = {
+              feat: "enhancement",
+              fix: "bug",
+              perf: "performance",
+              docs: "documentation",
+              test: "area: tests",
+              ci: "area: tooling/CI",
+            };
+            const current = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const isBreaking = match?.[3] === "!" ||
+              /\bBREAKING[ -]CHANGE\b/i.test(context.payload.pull_request.body || "");
+            const hasBreaking = current.some((label) => label.name === "breaking change");
+
+            if (isBreaking && !hasBreaking) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ["breaking change"],
+              });
+            } else if (!isBreaking && hasBreaking) {
+              await github.rest.issues.removeLabel({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                name: "breaking change",
+              });
+            }
+
+            if (!match) {
+              core.info("No managed conventional title type found.");
+              return;
+            }
+
+            const additions = [typeLabels[match[1].toLowerCase()]];
+            const scope = (match[2] || "").toLowerCase();
+            if (/^(security|cap|lsm|seccomp|audit|livepatch)$/.test(scope)) {
+              additions.push("security");
+            }
+            const existing = new Set(current.map((label) => label.name));
+            const missing = additions.filter((label) => !existing.has(label));
+            if (missing.length > 0) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: missing,
+              });
+            }
+
+      - name: Route new issue
+        if: github.event_name == 'issues'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const body = context.payload.issue.body || "";
+            const answer = (heading) => body.match(new RegExp(`^### ${heading}\\r?\\n+\\s*(.+)$`, "m"))?.[1]?.trim();
+            const areaLabels = {
+              "Bootloader and early boot": "area: boot",
+              "x86_64 architecture and interrupts": "area: arch/x86",
+              "Memory management": "area: memory",
+              "Processes, syscalls, and Linux ABI": "area: process/ABI",
+              "Scheduler, SMP, and synchronization": "area: scheduler/concurrency",
+              "IPC and signals": "area: IPC",
+              "VFS, filesystems, and block I/O": "area: storage/VFS",
+              "Network stack and namespaces": "area: network",
+              "Capabilities, LSM, seccomp, and audit": "area: security",
+              "Drivers, VirtIO, and IOMMU": "area: hardware/IOMMU",
+              "Userspace and musl compatibility": "area: userspace",
+              "Fuzzing and test infrastructure": "area: fuzzing",
+              "Build, CI, and tooling": "area: tooling/CI",
+              "Documentation": "documentation",
+            };
+
+            const labels = new Set(["needs: triage"]);
+            const area = areaLabels[answer("Affected subsystem")];
+            if (area) labels.add(area);
+            if (/^\[Performance\]:/i.test(context.payload.issue.title || "")) labels.add("performance");
+            if (/^\[Tracking\]:/i.test(context.payload.issue.title || "")) labels.add("tracking");
+            if (answer("Proposal type") === "Security hardening") labels.add("security");
+
+            const failureMode = answer("Failure mode") || "";
+            if (failureMode.includes("Linux ABI")) labels.add("risk: ABI");
+            if (failureMode.includes("Concurrency")) labels.add("risk: concurrency");
+            if (failureMode.includes("Resource exhaustion")) labels.add("risk: resource accounting");
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              labels: [...labels],
+            });

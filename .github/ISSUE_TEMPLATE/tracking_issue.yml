@@ -1,0 +1,77 @@
+name: Accepted work tracking issue
+description: Track an accepted RFC, audit remediation, release gate, or other multi-step maintainer project.
+title: "[Tracking]: "
+labels:
+  - tracking
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tracking issues organize already accepted work. Start with the feature/RFC form when the design or priority has not been approved.
+
+  - type: input
+    id: parent
+    attributes:
+      label: Accepted parent decision
+      description: Link the accepted RFC, audit finding, remediation plan, or release-gate record.
+      placeholder: "#123 or docs/review/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Target outcome
+      description: State the user/kernel outcome and invariant that will hold when this tracking issue closes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Define included subsystems/work and explicitly exclude adjacent tasks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: work_items
+    attributes:
+      label: Work items
+      description: Use checkboxes with one independently reviewable issue or pull request per item.
+      placeholder: |
+        - [ ] #124 — prerequisite/infrastructure
+        - [ ] #125 — implementation slice
+        - [ ] #126 — regression and integration evidence
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and ordering
+      description: Record prerequisite issues, patch ordering, external blockers, hardware access, and parallelizable work.
+
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion criteria
+      description: List the exact CI/runtime/SMP/ABI/fuzz/hardware/documentation evidence required before closure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and residual work
+      description: Track trust-boundary, unsafe, concurrency, resource, compatibility, rollout, and deferred-validation risks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Current status
+      description: Summarize completed work, active slice, next action, and current blocker.
+    validations:
+      required: true

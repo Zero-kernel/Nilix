@@ -6,6 +6,8 @@ on:
     - cron: '0 2 28-31 * *'
   workflow_dispatch:  # Allow manual trigger
 
+permissions: {}
+
 jobs:
   check-last-day:
     runs-on: ubuntu-latest
@@ -28,6 +30,8 @@ jobs:
     if: needs.check-last-day.outputs.is-last-day == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write # checkout plus failure-only commit comment
 
     steps:
       - name: Checkout code

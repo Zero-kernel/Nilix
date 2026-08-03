@@ -1,0 +1,42 @@
+name: Documentation issue
+description: Report incorrect, missing, stale, contradictory, or hard-to-follow documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched existing issues and checked the current `main` documentation.
+          required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Provide a repository path, heading, symbol, or URL.
+      placeholder: "docs/roadmap.md#32-threat-model"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and impact
+      description: Quote the incorrect or missing material and explain how it misleads a reader, contributor, operator, or auditor.
+    validations:
+      required: true
+
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested correction
+      description: Describe the expected content and cite code, tests, specifications, or authoritative project records.
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add related audit IDs, screenshots, links, or affected translations.

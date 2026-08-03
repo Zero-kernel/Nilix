@@ -1,6 +1,6 @@
-[Switch to Chinese (切换到中文)](README_zh.md)
-
 # Nilix
+
+[Switch to Chinese (切换到中文)](README_zh.md)
 
 A security-first hybrid microkernel operating system written in Rust for the x86_64 architecture.
 
@@ -427,8 +427,9 @@ The `.github/workflows/fuzz.yml` workflow runs:
 - **Continuous mode** — 4 parallel workers generating syscall sequences, tracking coverage,
   mutating inputs, every 6 hours.
 - **Target mode** — 10 libFuzzer cargo-fuzz targets (structure-aware fuzzing), daily at 2 AM UTC.
-- **Crash triage** — 95%+ deduplication rate, automatic minimization, GitHub issue creation with
-  reproducers.
+- **Crash triage** — 95%+ deduplication rate and automatic minimization; public issues contain
+  only a workflow/evidence pointer until maintainers classify the candidate under
+  [SECURITY.md](SECURITY.md), never an automatic reproducer disclosure.
 - **Corpus sync** — corpus cached across runs, aggregate reporting (text/HTML/JSON dashboards).
 
 Trigger on push to `main` affecting `kernel/**`, `userspace/fuzzer/**`, or `fuzz/**`. Manual
@@ -548,21 +549,31 @@ See [docs/roadmap.md](docs/roadmap.md) and
 
 ## 8. Contributing
 
-See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full setup (toolchain, hooks, PR flow). In short:
+Community and maintenance entry points:
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — toolchain, kernel invariants, risk-selected tests,
+  RFCs, commits, pull requests, and review.
+- **[SUPPORT.md](SUPPORT.md)** — where and how to file bugs, proposals, performance reports,
+  documentation issues, and questions.
+- **[SECURITY.md](SECURITY.md)** — private vulnerability reporting, threat scope, evidence,
+  and coordinated disclosure.
+- **[GOVERNANCE.md](GOVERNANCE.md)** — roles, decisions, review/merge policy, issue lifecycle,
+  and release gates.
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** — expected behavior in project spaces.
+
+In short:
 
 1. Contributors with a local Rust toolchain build, lint, and test locally — exactly what CI
    does. (The maintainer's Windows mirror has no toolchain and offloads to a Linux build host.)
-2. Run `make build`, `make lint`, `make boot-check`, and (for ABI changes) `make musl-check`
-   before pushing; enable the pre-push `fmt-check` + `clippy` hook with `make hooks`.
-3. New features need documentation updates; bug fixes should include regression tests
-   (the kernel runs in-kernel self-tests on boot).
+2. Run the core gates plus the checks selected by risk: ABI, SMP/concurrency, storage,
+   fuzzing, performance, and hardware changes each require different evidence.
+3. Open an RFC before architecture, trust-boundary, ABI, dependency, or cross-subsystem
+   implementation. Bug and security fixes should include regression tests.
 4. Git commits are manual — nothing is auto-committed or auto-pushed.
 
 ---
 
 ## 9. License
-
-This project is for educational and research purposes.
 
 ---
 

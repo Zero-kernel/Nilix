@@ -1,0 +1,65 @@
+name: Build or usage question
+description: Ask a focused question about building, booting, testing, or understanding Nilix.
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions should be specific enough to improve project documentation. Use the bug form when current `main` behaves incorrectly.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched the README, contributor guide, documentation index, and open/closed issues.
+          required: true
+        - label: This question contains no credentials, private logs, or vulnerability details.
+          required: true
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      options:
+        - Development environment and toolchain
+        - Building or QEMU/OVMF boot
+        - Tests, fuzzing, or CI
+        - Kernel architecture or subsystem behavior
+        - Linux ABI and userspace
+        - Documentation navigation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Nilix revision
+      placeholder: "commit SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal and constraints
+      description: Explain what you are trying to accomplish and the environment or constraints involved.
+    validations:
+      required: true
+
+  - type: textarea
+    id: attempts
+    attributes:
+      label: What have you tried?
+      description: Include exact commands, relevant configuration, documentation consulted, and redacted output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add any other detail needed to give a precise answer.

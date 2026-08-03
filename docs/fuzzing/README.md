@@ -13,7 +13,7 @@
 - **7,460+ lines of code** across 20 modules
 - **33,000+ words of documentation** across 28 files
 - **Complete CI/CD integration** with GitHub Actions
-- **Automatic crash triage** and issue creation
+- **Automatic crash triage** and security-aware public triage markers
 - **100% feature parity** with syzkaller
 
 ---
@@ -78,7 +78,7 @@ Total: ~1,150 lines
 - **Automatic minimization:** Reduces reproducers by 70%
 - **Corpus synchronization:** Shares inputs across workers
 - **Performance dashboard:** Text/HTML/JSON metrics
-- **Automatic issue creation:** New crashes filed as GitHub issues
+- **Security-aware issue creation:** New candidates get a public workflow pointer, never an automatic reproducer disclosure
 
 ---
 
@@ -269,10 +269,10 @@ Workers: 4 (for continuous mode)
 ### View Results
 
 **Crashes:**
-- Automatically filed as GitHub issues
-- Tagged with `[Fuzzing]` prefix
-- Includes minimized reproducer
-- Labels: `fuzzing`, `bug`, `needs-triage`
+- Automatically filed as minimal GitHub triage markers
+- Tagged with the `[Fuzzing]` prefix and `bug` label
+- Public body links the workflow run but intentionally omits the reproducer
+- Maintainers classify the candidate under [SECURITY.md](../../SECURITY.md) before sharing details
 
 **Dashboards:**
 - Download artifacts from workflow run

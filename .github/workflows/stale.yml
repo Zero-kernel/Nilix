@@ -1,0 +1,43 @@
+name: Stale information requests
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stale-information-requests
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      # Kernel bugs, accepted RFCs, tracking issues, and pull requests are not
+      # aged out. Only questions and reports explicitly awaiting reproduction
+      # enter this workflow.
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 21
+          stale-issue-label: stale
+          any-of-issue-labels: "needs: reproduction,question"
+          exempt-issue-labels: "security,no-stale,tracking,priority: critical,priority: high"
+          exempt-all-assignees: true
+          remove-stale-when-updated: true
+          stale-issue-message: |
+            This issue is waiting for current reproduction details or a follow-up answer and has had no activity for 60 days.
+
+            Please test current `main` and add the requested commands, environment, serial logs, or other evidence. Without an update, it will close in 21 days. Confirmed kernel defects and accepted tracking items are not closed merely because they are old.
+          close-issue-message: |
+            Closing because the requested information was not provided after an additional 21 days. If this still applies to current `main`, open a new issue with a complete, current reproduction and link this issue for history.
+          close-issue-reason: not_planned
+          operations-per-run: 100
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          enable-statistics: true

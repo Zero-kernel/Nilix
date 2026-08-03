@@ -41,12 +41,16 @@ on:
       - 'fuzz/**'
       - '.github/workflows/fuzz.yml'
 
+permissions: {}
+
 jobs:
   # Job 1: Continuous KCOV-based fuzzing (Phase 2-7 implementation)
   continuous-fuzzing:
     name: Continuous Fuzzer Worker ${{ matrix.worker }}
     runs-on: ubuntu-latest
     timeout-minutes: 400  # 6h + overhead
+    permissions:
+      contents: read
     if: |
       github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'continuous' || github.event.inputs.mode == 'both') ||
@@ -231,6 +235,8 @@ jobs:
     name: Cargo-Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     if: |
       github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'targets' || github.event.inputs.mode == 'both')
@@ -356,6 +362,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [continuous-fuzzing, cargo-fuzz-targets]
     if: always()
+    permissions:
+      contents: read
+      issues: write
 
     steps:
       - name: Checkout code
@@ -400,7 +409,7 @@ jobs:
             echo "::warning::Found $unique unique crash(es) after deduplication"
           fi
 
-      - name: Create GitHub issues for new crashes
+      - name: Create public triage markers without reproducer details
         if: steps.triage.outputs.unique_crashes > 0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -411,15 +420,16 @@ jobs:
             if [ -f "$crash_file" ]; then
               crash_id=$(basename "$crash_file" .txt)
 
-              # Extract crash type and message
+              # Keep public metadata deliberately narrow. A crash may cross a
+              # kernel trust boundary; never paste its reproducer automatically.
               crash_type=$(head -1 "$crash_file" | grep -oP "Type: \K.*" || echo "unknown")
-              crash_msg=$(head -5 "$crash_file" | grep -oP "Message: \K.*" || echo "No message")
 
-              # Create issue
+              # Create an evidence pointer, not a public disclosure. Maintainers
+              # classify the candidate under SECURITY.md before sharing details.
               gh issue create \
-                --title "[Fuzzing] $crash_type: $crash_msg" \
-                --body "$(cat $crash_file)" \
-                --label "fuzzing,bug,needs-triage" \
+                --title "[Fuzzing]: $crash_type candidate from run ${{ github.run_id }}" \
+                --body "Automated fuzzing produced a unique crash candidate in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Reproducer details are intentionally omitted pending maintainer security triage under SECURITY.md. Internal candidate ID: $crash_id." \
+                --label "bug" \
                 || echo "Failed to create issue for $crash_id"
             fi
           done
@@ -447,6 +457,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [continuous-fuzzing, cargo-fuzz-targets, crash-triage]
     if: always()
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code

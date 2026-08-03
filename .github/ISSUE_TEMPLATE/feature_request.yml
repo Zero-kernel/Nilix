@@ -1,0 +1,122 @@
+name: Feature or RFC proposal
+description: Propose a capability, architectural change, ABI extension, or tracked design decision.
+title: "[RFC]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Significant kernel, ABI, dependency, or trust-boundary changes require design agreement before implementation. Describe the problem and invariants before code structure.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched existing issues, the roadmap, and current architecture documentation.
+          required: true
+        - label: I separated this proposal from unrelated cleanup or implementation work.
+          required: true
+
+  - type: dropdown
+    id: proposal_type
+    attributes:
+      label: Proposal type
+      options:
+        - Focused feature
+        - Architecture or trust-boundary RFC
+        - Linux ABI or syscall extension
+        - Hardware or driver support
+        - Security hardening
+        - Developer tooling or test infrastructure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      options:
+        - Bootloader and early boot
+        - x86_64 architecture and interrupts
+        - Memory management
+        - Processes, syscalls, and Linux ABI
+        - Scheduler, SMP, and synchronization
+        - IPC and signals
+        - VFS, filesystems, and block I/O
+        - Network stack and namespaces
+        - Capabilities, LSM, seccomp, and audit
+        - Drivers, VirtIO, and IOMMU
+        - Userspace and musl compatibility
+        - Fuzzing and test infrastructure
+        - Build, CI, and tooling
+        - Documentation
+        - Other or cross-cutting
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Explain the concrete limitation, affected users/workloads, and why the current behavior is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: goals
+    attributes:
+      label: Goals and non-goals
+      description: State measurable outcomes and explicitly exclude adjacent work that is not part of this proposal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design
+      description: Describe interfaces, ownership, lifecycle, error handling, resource accounting, and migration or rollout steps.
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and trust-boundary analysis
+      description: Cover attacker-controlled inputs, privilege boundaries, unsafe code, IRQ/lock context, fallible allocation, fail-closed behavior, and new TCB or dependency surface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include simpler designs, userspace placement, deferral, and relevant prior art from Linux, seL4, Redox, Asterinas, or other kernels.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: List unit/runtime/QEMU/SMP/musl/fuzz/performance evidence needed to accept the change.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: implementation
+    attributes:
+      label: Implementation intent
+      options:
+        - I plan to implement this after design agreement
+        - I may implement this with maintainer guidance
+        - I am proposing the design only
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add diagrams, specification references, prototypes, benchmarks, dependencies, or related tracking items.

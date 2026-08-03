@@ -1,6 +1,6 @@
-# Zero-OS Documentation
+# Nilix Documentation
 
-Comprehensive documentation for the Zero-OS kernel project.
+Comprehensive documentation for the Nilix kernel project.
 
 ## Directory Structure
 
@@ -42,14 +42,16 @@ Subsystem, architecture, safety, testing, and report documentation.
 ## Quick Navigation
 
 ### For New Contributors
-1. Start with [architecture/ARCHITECTURE.md](overview/architecture/ARCHITECTURE.md) for subsystem overview
-2. Review the [R186 audit/fix record](review/audits/qa-2026-07-28.md) for current status
-3. Check the [current next-phase plan](review/nextplan/next-phase-plan-2026-07-23-v2.md) for open work
+1. Read the canonical [contributor guide](../CONTRIBUTING.md) and [governance model](../GOVERNANCE.md)
+2. Start with [architecture/ARCHITECTURE.md](overview/architecture/ARCHITECTURE.md) for subsystem overview
+3. Review the [R186 audit/fix record](review/audits/qa-2026-07-28.md) for current status
+4. Check the [current next-phase plan](review/nextplan/next-phase-plan-2026-07-23-v2.md) for open work
 
 ### For Security Auditors
-1. Latest audit: [review/audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md) (R186)
-2. Fix history: [review/fixes/](review/fixes/)
-3. Open findings: [review/remediation/](review/remediation/)
+1. Read the public threat model in [roadmap.md](roadmap.md#32-threat-model) and report vulnerabilities under [SECURITY.md](../SECURITY.md)
+2. Latest audit: [review/audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md) (R186)
+3. Fix history: [review/fixes/](review/fixes/)
+4. Open findings: [review/remediation/](review/remediation/)
 
 ### For Developers Fixing Bugs
 1. Check the [current next-phase plan](review/nextplan/next-phase-plan-2026-07-23-v2.md) for the prioritized bug list

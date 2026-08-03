@@ -1,0 +1,101 @@
+name: Performance regression
+description: Report a measured kernel, boot, syscall, I/O, network, or memory-performance regression.
+title: "[Performance]: "
+labels:
+  - performance
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance reports must be repeatable and compare equivalent builds and environments. Correctness and security are never traded away for a benchmark result.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I repeated both baseline and candidate measurements and report their variation.
+          required: true
+        - label: Both revisions were built with equivalent profiles, features, firmware, and hardware/VM settings.
+          required: true
+        - label: I searched for an existing report and verified the regression on current `main`.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      options:
+        - Bootloader and early boot
+        - x86_64 architecture and interrupts
+        - Memory management
+        - Processes, syscalls, and Linux ABI
+        - Scheduler, SMP, and synchronization
+        - IPC and signals
+        - VFS, filesystems, and block I/O
+        - Network stack and namespaces
+        - Capabilities, LSM, seccomp, and audit
+        - Drivers, VirtIO, and IOMMU
+        - Userspace and musl compatibility
+        - Fuzzing and test infrastructure
+        - Build, CI, and tooling
+        - Other or cross-cutting
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Controlled environment
+      description: Include host/hardware, CPU topology and frequency controls, QEMU command/version, OVMF, RAM, storage/network backend, and background-load controls.
+    validations:
+      required: true
+
+  - type: input
+    id: revisions
+    attributes:
+      label: Baseline and candidate revisions
+      placeholder: "Baseline: <sha>; candidate: <sha>"
+    validations:
+      required: true
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and measurement method
+      description: Provide exact build/run commands, warmup, sample count, statistic used, units, and raw-data location.
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Report baseline, candidate, absolute/relative delta, and variance or confidence interval.
+      placeholder: |
+        | Revision | Median | Range | Samples |
+        | --- | ---: | ---: | ---: |
+        | baseline | ... | ... | ... |
+        | candidate | ... | ... | ... |
+    validations:
+      required: true
+
+  - type: textarea
+    id: profiling
+    attributes:
+      label: Profiling and bisect evidence
+      description: Add counters, traces, profiles, suspected functions, and `git bisect` results when available.
+
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness and security checks
+      description: Confirm the compared builds pass relevant gates and note any changed safety, accounting, or fail-closed behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add related issues, known noise sources, or constraints.

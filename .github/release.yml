@@ -1,0 +1,37 @@
+changelog:
+  exclude:
+    labels:
+      - duplicate
+      - invalid
+      - question
+      - stale
+      - wontfix
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking change
+    - title: Security hardening
+      labels:
+        - security
+    - title: Features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Performance
+      labels:
+        - performance
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Tests and fuzzing
+      labels:
+        - "area: tests"
+        - "area: fuzzing"
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Other changes
+      labels:
+        - "*"

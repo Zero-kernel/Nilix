@@ -4,7 +4,8 @@ name: AFL++ Kernel Fuzzing
 # cannot fuzz the bare-metal Nilix kernel (x86_64-unknown-none).
 # See docs/fuzz/AFL_STATUS.md for alternatives (userspace wrappers or libFuzzer).
 #
-# To enable for userspace test programs, remove the 'if: false' condition below.
+# To enable after adapting this to a supported userspace target, set the
+# repository Actions variable ENABLE_AFL_QEMU=true. It is absent by default.
 
 on:
   schedule:
@@ -20,9 +21,12 @@ on:
         required: false
         default: '4'
 
+permissions:
+  contents: read
+
 jobs:
   afl-fuzz:
-    if: false  # Disabled: AFL++ QEMU mode incompatible with bare-metal kernel
+    if: vars.ENABLE_AFL_QEMU == 'true'
     name: AFL++ Full-Kernel Fuzzing
     runs-on: ubuntu-latest
     timeout-minutes: 1500  # 25 hours max

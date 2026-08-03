@@ -40,5 +40,10 @@ core
 !README.md
 !README_zh.md
 !CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!GOVERNANCE.md
+!SECURITY.md
+!SUPPORT.md
+!.github/pull_request_template.md
 !roadmap.md
 !roadmap-enterprise.md

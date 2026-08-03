@@ -1,0 +1,167 @@
+name: Kernel bug report
+description: Report a reproducible boot, kernel, userspace ABI, or tooling defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping harden Nilix. File one defect per issue and lead with observed evidence.
+
+        **Do not report vulnerabilities here.** Use [GitHub private vulnerability reporting](https://github.com/Zero-kernel/Nilix/security/advisories/new) when behavior crosses a trust boundary or could enable privilege escalation, isolation bypass, memory corruption, or attacker-triggered denial of service.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched open and closed issues and did not find an equivalent report.
+          required: true
+        - label: I reproduced this on the current `main` branch, or explained below why that is not possible.
+          required: true
+        - label: This issue contains no secrets, embargoed vulnerability details, or confidential images/logs.
+          required: true
+        - label: I am reporting one independently actionable defect.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      description: Choose the closest owner. Maintainers may refine this during triage.
+      options:
+        - Bootloader and early boot
+        - x86_64 architecture and interrupts
+        - Memory management
+        - Processes, syscalls, and Linux ABI
+        - Scheduler, SMP, and synchronization
+        - IPC and signals
+        - VFS, filesystems, and block I/O
+        - Network stack and namespaces
+        - Capabilities, LSM, seccomp, and audit
+        - Drivers, VirtIO, and IOMMU
+        - Userspace and musl compatibility
+        - Fuzzing and test infrastructure
+        - Build, CI, and tooling
+        - Documentation
+        - Other or cross-cutting
+    validations:
+      required: true
+
+  - type: dropdown
+    id: failure_mode
+    attributes:
+      label: Failure mode
+      options:
+        - Boot failure or reset
+        - Kernel panic, exception, or triple fault
+        - Hang, deadlock, or livelock
+        - Incorrect kernel or userspace behavior
+        - Linux ABI or musl incompatibility
+        - Concurrency or SMP-only failure
+        - Resource exhaustion or accounting failure
+        - Hardware- or VM-specific failure
+        - Performance regression
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Nilix revision
+      description: Provide the exact commit SHA. If the tree is modified, state that explicitly.
+      placeholder: "98d6249 (clean tree)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Execution environment
+      description: Include host OS, QEMU or physical hardware, CPU model/features, OVMF version/path, RAM, SMP count, and build features.
+      placeholder: |
+        Host: Ubuntu 24.04 x86_64
+        Target: QEMU 9.x, qemu64,+smep,+smap,+umip,+rdrand
+        Firmware: OVMF ...
+        Memory/CPUs: 256 MiB / 4 CPUs
+        Command: SMP_CPUS=4 make test-smp-4core
+        Features or local changes: none
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: Reproducibility
+      options:
+        - Always
+        - Intermittent but repeatable
+        - Reproduced once
+        - Unable to reproduce locally
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Observed problem and impact
+      description: State what failed, who or what can trigger it, and the practical impact. Avoid speculative impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the shortest deterministic commands, source reproducer, disk/network fixture construction, and trigger sequence.
+      placeholder: |
+        1. `make build`
+        2. `SMP_CPUS=4 make test-smp-4core`
+        3. Wait for ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Cite the relevant Nilix invariant, Linux x86-64 ABI rule, hardware manual, RFC, or known-good revision when useful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact panic, exception vector/error code, failed assertion, return value, or observable state.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial log and diagnostics
+      description: Paste the smallest relevant serial/QEMU/GDB excerpt. Preserve timestamps and register values; redact host paths or identifiers if needed.
+      render: shell
+
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Reproducer source or artifacts
+      description: Link or attach only redistributable, minimized inputs. Prefer source/scripts over opaque binaries. Do not publish a security reproducer.
+
+  - type: input
+    id: regression
+    attributes:
+      label: Regression range
+      description: If known, provide the last good revision and first bad revision or the result of `git bisect`.
+      placeholder: "Good: <sha>; bad: <sha>; Fixes candidate: <sha>"
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add suspected files/functions, timing conditions, workarounds, related audit IDs, or other verified facts.

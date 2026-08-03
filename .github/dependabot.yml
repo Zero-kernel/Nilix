@@ -1,0 +1,102 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      kernel-workspace-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /userspace
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - "area: userspace"
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      userspace-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /userspace/fuzzer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - "area: fuzzing"
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      fuzzer-tools-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:30"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - "area: fuzzing"
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      fuzz-targets-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      time: "11:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - "area: tooling/CI"
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      github-actions:
+        patterns:
+          - "*"

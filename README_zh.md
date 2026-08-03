@@ -1,6 +1,6 @@
-[Switch to English (切换到英文)](README.md)
-
 # Nilix
+
+[Switch to English (切换到英文)](README.md)
 
 一个以安全为先的混合微内核操作系统，使用 Rust 编写，面向 x86_64 架构。
 
@@ -448,20 +448,27 @@ kernel_core 与 kernel 的测试代码。精确测试数量门禁可阻止零测
 
 ## 8. 贡献指南
 
-完整的环境搭建（工具链、钩子、PR 流程）见 **[CONTRIBUTING.md](CONTRIBUTING.md)**。简而言之：
+社区与维护入口：
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** —— 工具链、内核安全不变量、按风险选择的测试、
+  RFC、提交、PR 与评审流程。
+- **[SUPPORT.md](SUPPORT.md)** —— Bug、提案、性能回归、文档问题和使用问题的提交方式。
+- **[SECURITY.md](SECURITY.md)** —— 私密漏洞报告、威胁范围、证据要求与协调披露。
+- **[GOVERNANCE.md](GOVERNANCE.md)** —— 角色、决策、评审合并、Issue 生命周期与发布门禁。
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** —— 项目社区空间的行为规范。
+
+简而言之：
 
 1. 拥有本地 Rust 工具链的贡献者在本地完成构建、lint 与测试——与 CI 完全一致。（维护者的
    Windows 镜像没有工具链，会卸载到 Linux 构建主机。）
-2. 推送前运行 `make build`、`make lint`、`make boot-check`，并（对 ABI 改动）运行
-   `make musl-check`；用 `make hooks` 启用 pre-push 的 `fmt-check` + `clippy` 钩子。
-3. 新功能需要更新文档；bug 修复应包含回归测试（内核在启动时运行内核内自检）。
+2. 运行核心门禁，并按风险补充验证：ABI、SMP/并发、存储、模糊测试、性能和硬件改动
+   分别需要对应证据。
+3. 架构、信任边界、ABI、依赖或跨子系统实现前先提交 RFC；Bug 与安全修复应包含回归测试。
 4. Git 提交为手动 —— 不会自动提交或自动推送。
 
 ---
 
 ## 9. 许可证
-
-本项目用于教育和研究目的。
 
 ---
 

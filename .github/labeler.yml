@@ -1,0 +1,142 @@
+# Path-based pull request routing. Labels describe review ownership and risk;
+# issue kind and lifecycle labels are managed separately by triage.yml.
+
+"area: boot":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "bootloader/**"
+          - "kernel/src/main.rs"
+          - "kernel/kernel.ld"
+
+"area: arch/x86":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/arch/**"
+          - "kernel/tlb_ops/**"
+          - "kernel/src/stack_guard.rs"
+          - "kernel/src/interrupt_demo.rs"
+
+"area: memory":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/mm/**"
+
+"area: process/ABI":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/kernel_core/process.rs"
+          - "kernel/kernel_core/fork.rs"
+          - "kernel/kernel_core/elf_loader.rs"
+          - "kernel/kernel_core/syscall.rs"
+          - "kernel/kernel_core/syscall_macros.rs"
+          - "kernel/kernel_core/usercopy.rs"
+          - "kernel/kernel_core/user_stack.rs"
+          - "kernel/kernel_core/signal.rs"
+          - "kernel/kernel_core/signal_frame.rs"
+          - "kernel/kernel_core/poll.rs"
+          - "scripts/abi_layout_check.py"
+
+"area: scheduler/concurrency":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/sched/**"
+          - "kernel/cpu_local/**"
+          - "kernel/sync_safe/**"
+          - "kernel/kernel_core/rcu.rs"
+          - "kernel/kernel_core/scheduler_hook.rs"
+
+"area: IPC":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/ipc/**"
+          - "kernel/kernel_core/ipc_namespace.rs"
+
+"area: storage/VFS":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/vfs/**"
+          - "kernel/block/**"
+          - "disk-ext2.img"
+
+"area: network":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/net/**"
+          - "kernel/kernel_core/net_namespace.rs"
+
+"area: security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/security/**"
+          - "kernel/cap/**"
+          - "kernel/lsm/**"
+          - "kernel/seccomp/**"
+          - "kernel/audit/**"
+          - "kernel/compliance/**"
+          - "kernel/crypto/**"
+          - "kernel/livepatch/**"
+          - "SECURITY.md"
+
+"area: hardware/IOMMU":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/drivers/**"
+          - "kernel/virtio/**"
+          - "kernel/iommu/**"
+
+"area: userspace":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "userspace/**"
+
+"area: observability":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/trace/**"
+          - "kernel/klog/**"
+          - "kernel/coverage/**"
+
+"area: fuzzing":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "fuzz/**"
+          - "tools/fuzz_executor/**"
+          - "scripts/*fuzz*"
+          - "scripts/*afl*"
+          - "scripts/*kcov*"
+
+"area: tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "kernel/tests/**"
+          - "kernel/src/runtime_tests.rs"
+          - "kernel/src/test_framework.rs"
+          - "kernel/src/integration_test.rs"
+          - "scripts/*test*.sh"
+          - "scripts/boot_check.sh"
+          - "scripts/musl_check.sh"
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "README*"
+
+"area: tooling/CI":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".githooks/**"
+          - ".pre-commit-config.yaml"
+          - "Makefile"
+          - "scripts/**"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "**/Cargo.toml"
+          - "**/Cargo.lock"
+          - "rust-toolchain.toml"
+          - ".github/dependabot.yml"

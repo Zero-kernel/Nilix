@@ -1,0 +1,35 @@
+# Nilix currently has one primary maintainer. These rules make review ownership
+# explicit and identify high-risk paths. A GitHub ruleset must enable
+# "Require review from Code Owners" for approval to be enforced.
+#
+# GitHub applies the last matching rule, so retain the primary owner on any
+# overlapping rules added later.
+
+* @YUZHEthefool
+
+/.github/ @YUZHEthefool
+/.githooks/ @YUZHEthefool
+/.pre-commit-config.yaml @YUZHEthefool
+/Cargo.toml @YUZHEthefool
+/Cargo.lock @YUZHEthefool
+/Makefile @YUZHEthefool
+/rust-toolchain.toml @YUZHEthefool
+
+/bootloader/ @YUZHEthefool
+/kernel/arch/ @YUZHEthefool
+/kernel/mm/ @YUZHEthefool
+/kernel/kernel_core/ @YUZHEthefool
+/kernel/sched/ @YUZHEthefool
+/kernel/ipc/ @YUZHEthefool
+/kernel/vfs/ @YUZHEthefool
+/kernel/net/ @YUZHEthefool
+/kernel/security/ @YUZHEthefool
+/kernel/cap/ @YUZHEthefool
+/kernel/lsm/ @YUZHEthefool
+/kernel/seccomp/ @YUZHEthefool
+/kernel/audit/ @YUZHEthefool
+/kernel/iommu/ @YUZHEthefool
+/kernel/virtio/ @YUZHEthefool
+/kernel/livepatch/ @YUZHEthefool
+/SECURITY.md @YUZHEthefool
+/GOVERNANCE.md @YUZHEthefool

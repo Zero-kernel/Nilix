@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Zero-kernel/Nilix/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose exploit details in a public issue.
+  - name: Read the contributor guide
+    url: https://github.com/Zero-kernel/Nilix/blob/main/CONTRIBUTING.md
+    about: Review the build, test, kernel-safety, and pull request requirements before contributing.
+  - name: Review the architecture and roadmap
+    url: https://github.com/Zero-kernel/Nilix/blob/main/docs/roadmap.md
+    about: Check current trust boundaries, non-goals, release gates, and planned work.
