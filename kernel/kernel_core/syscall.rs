@@ -8400,10 +8400,13 @@ fn main_sigframe_stack(rsp: u64) -> Option<crate::signal_frame::SigframeStack> {
 /// adjacent mappings: a mapping beginning exactly at RSP wins over a lower VMA
 /// whose exclusive top is RSP. If that upper candidate is invalid, we do not
 /// fall back and grant the lower mapping authority over the frame write.
-fn locate_sigframe_vma(
+fn locate_sigframe_vma<M>(
     rsp: u64,
-    regions: &crate::fallible_map::FallibleOrderedMap<usize, MmapEntry>,
-) -> crate::signal_frame::SigframeStack {
+    regions: &M,
+) -> crate::signal_frame::SigframeStack
+where
+    M: MmapRegions,
+{
     use crate::signal_frame::SigframeStack;
 
     let Ok(rsp_key) = usize::try_from(rsp) else {
@@ -8430,6 +8433,23 @@ fn locate_sigframe_vma(
     // candidate. `rsp == base` is accepted as provenance too, but the layout
     // floor then rejects the downward frame rather than borrowing a lower VMA.
     SigframeStack::Mmap { floor: base as u64 }
+}
+
+/// Trait for mmap_regions operations (supports both FallibleOrderedMap and AdmittedMap)
+trait MmapRegions {
+    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)>;
+}
+
+impl MmapRegions for crate::fallible_map::FallibleOrderedMap<usize, MmapEntry> {
+    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
+        self.range(range)
+    }
+}
+
+impl MmapRegions for mm::AdmittedMap<usize, MmapEntry> {
+    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
+        self.range(range)
+    }
 }
 
 /// Pure RF178-34 regression coverage for the shared VMA locator and the

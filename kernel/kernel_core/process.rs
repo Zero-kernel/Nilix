@@ -1194,7 +1194,11 @@ pub struct MmState {
     /// D2-MMAP-LIFECYCLE Phase 2: values are the typed `MmapEntry` newtype
     /// (a `#[repr(transparent)]` wrapper over the same packed word) so the magic
     /// bit-arithmetic above is accessed through named, contract-enforcing methods.
-    pub mmap_regions: crate::fallible_map::FallibleOrderedMap<usize, crate::syscall::MmapEntry>,
+    ///
+    /// R186-4 FIX: Migrated from bare FallibleOrderedMap to AdmittedMap<HeapClass::CoreProcess>.
+    /// The map now charges its backing Vec capacity (not len) to the per-process heap budget at
+    /// construction and growth, and uncharges on Drop. This closes the VMA metadata admission gap.
+    pub mmap_regions: mm::AdmittedMap<usize, crate::syscall::MmapEntry>,
 
     /// Heap start address (page-aligned end of ELF BSS)
     pub brk_start: usize,
@@ -1252,7 +1256,11 @@ pub struct MmState {
     /// image replacement. `FallibleOrderedMap` ⇒ every insert is fallible
     /// (`try_reserve`); on OOM the frames fall back to `pt_inherited_bytes`
     /// (over-count-safe — they reclaim at teardown, never a bypass).
-    pub pt_charged_frames: crate::fallible_map::FallibleOrderedMap<u64, ()>,
+    ///
+    /// R186-4 FIX: Migrated from bare FallibleOrderedMap to AdmittedMap<HeapClass::CoreProcess>.
+    /// The map now charges its backing Vec capacity to the per-process heap budget at construction
+    /// and growth, and uncharges on Drop. This closes the PT metadata admission gap.
+    pub pt_charged_frames: mm::AdmittedMap<u64, ()>,
 
     /// R171-CG1x0 FIX (M2-1 SLICE-0): the portion of `pt_charged_bytes` that is
     /// NOT individually tracked in `pt_charged_frames` and therefore reclaims only
@@ -1364,7 +1372,8 @@ pub struct MmState {
 impl MmState {
     pub fn new(next_mmap_addr: usize) -> Self {
         Self {
-            mmap_regions: crate::fallible_map::FallibleOrderedMap::new(),
+            // R186-4 FIX: Initialize with CoreProcess HeapClass for admission control
+            mmap_regions: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             brk_start: 0,
             brk: 0,
             next_mmap_addr,
@@ -1373,7 +1382,8 @@ impl MmState {
             pt_charged_bytes: 0,
             // R171-CG1x0 FIX (M2-1 SLICE-0): fresh AS — empty ledger, no inherited
             // basis, authoritative (INVARIANT I' holds: 0 == 0 + 0).
-            pt_charged_frames: crate::fallible_map::FallibleOrderedMap::new(),
+            // R186-4 FIX: Initialize with CoreProcess HeapClass for admission control
+            pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             pt_inherited_bytes: 0,
             pt_ledger_authoritative: true,
             brk_pending_growth: 0,
@@ -9255,10 +9265,30 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
 /// built UNCHARGED by brk/ELF (absent from the ledger) is correctly NOT debited — closing
 /// the cross-origin `memory.max` under-count. Pure and side-effect-scoped to `ledger`
 /// so the property is unit-testable without a live process context.
-pub fn pt_ledger_reconcile<I: Iterator<Item = u64>>(
-    ledger: &mut crate::fallible_map::FallibleOrderedMap<u64, ()>,
+/// Trait for PT ledger operations (supports both FallibleOrderedMap and AdmittedMap)
+pub trait PtLedger {
+    fn remove(&mut self, key: &u64) -> Option<()>;
+}
+
+impl PtLedger for crate::fallible_map::FallibleOrderedMap<u64, ()> {
+    fn remove(&mut self, key: &u64) -> Option<()> {
+        self.remove(key)
+    }
+}
+
+impl PtLedger for mm::AdmittedMap<u64, ()> {
+    fn remove(&mut self, key: &u64) -> Option<()> {
+        self.remove(key)
+    }
+}
+
+pub fn pt_ledger_reconcile<I: Iterator<Item = u64>, M>(
+    ledger: &mut M,
     reclaimed_phys: I,
-) -> u64 {
+) -> u64
+where
+    M: PtLedger,
+{
     let mut pt_freed: u64 = 0;
     for fa in reclaimed_phys {
         if ledger.remove(&fa).is_some() {
