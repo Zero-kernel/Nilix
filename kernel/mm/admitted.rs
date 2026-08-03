@@ -254,10 +254,11 @@ impl<T> AdmittedVec<T> {
         }
         // Resource admission already succeeded during detached preparation;
         // commit can fail only if the global ledger is corrupt.
+        // FIX: Propagate error instead of panicking kernel (R186-4 convergence issue #2)
         let replacement_charge = prepared
             .reservation
             .commit()
-            .expect("RF180-43 admitted vec commit invariant");
+            .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
         let mut old_values = core::mem::take(&mut self.values);
         for value in old_values.drain(..) {
             prepared.values.push(value);
@@ -980,6 +981,63 @@ impl<K: Ord, V> AdmittedMap<K, V> {
         self.map.range(range)
     }
 
+    /// R186-4 FIX: Mutable range iterator for in-place value updates (mprotect uses this).
+    #[inline]
+    pub fn range_mut<R: RangeBounds<K>>(
+        &mut self,
+        range: R,
+    ) -> impl DoubleEndedIterator<Item = (&K, &mut V)> {
+        self.map.range_mut(range)
+    }
+
+    /// R186-4 FIX: Construct an AdmittedMap from a pre-sorted Vec with upfront heap admission.
+    /// This is the charged analogue of FallibleOrderedMap::from_sorted_vec, used by fork to
+    /// construct the child's mmap_regions and pt_charged_frames with capacity-based charging.
+    ///
+    /// The charge is computed as `entries.capacity() * size_of::<(K, V)>()` and reserved from
+    /// `class` BEFORE constructing the map. On success, the map owns the charge and will release
+    /// it on Drop. On admission failure, returns the original Vec so the caller can roll back.
+    ///
+    /// INVARIANT: `entries` must be sorted strictly-ascending by key (same as from_sorted_vec).
+    pub fn from_sorted_vec_charged(
+        mut entries: Vec<(K, V)>,
+        class: HeapClass,
+    ) -> Result<Self, (Vec<(K, V)>, AdmittedAllocError)> {
+        // FIX: Shrink to fit before charging to prevent fork capacity amplification
+        // (R186-4 convergence issue #1)
+        // This eliminates spare capacity that would be charged but unused in child process.
+        entries.shrink_to_fit();
+
+        let capacity_bytes = match vec_charge_bytes::<(K, V)>(entries.capacity()) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err((entries, error.into())),
+        };
+        match try_reserve(class, capacity_bytes) {
+            Ok(reservation) => {
+                // FIX: Propagate error instead of panicking (R186-4 convergence issue #2)
+                let charge = match reservation.commit() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Commit failed - return the Vec so caller can clean up
+                        return Err((entries, AdmittedAllocError::CapacityInvariant));
+                    }
+                };
+                let map = FallibleOrderedMap::from_sorted_vec(entries);
+                Ok(Self {
+                    map,
+                    charge: Some(charge),
+                    class,
+                })
+            }
+            Err(error) => {
+                // FIX: The reservation was never committed, so no charge to release
+                // (R186-4 convergence issue #3 - original review was incorrect here)
+                // try_reserve fails BEFORE commit, so no leak occurs
+                Err((entries, error.into()))
+            }
+        }
+    }
+
     fn prepare_target(
         &self,
         target: usize,
@@ -1081,6 +1139,12 @@ impl<K: Ord, V> AdmittedMap<K, V> {
             self.install_prepared(prepared)?;
         }
         Ok(())
+    }
+
+    /// Reserve capacity for at least `additional` more entries. Similar to
+    /// `ensure_capacity_for`, but matches the `try_reserve` API expected by callers.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), AdmittedAllocError> {
+        self.ensure_capacity_for(additional)
     }
 
     pub fn insert_unique_reserved(&mut self, key: K, value: V) -> Result<(), (K, V)> {
