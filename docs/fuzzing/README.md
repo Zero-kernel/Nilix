@@ -2,29 +2,35 @@
 
 **Project:** Nilix (formerly Zero-OS) Kernel  
 **Goal:** syzkaller-style coverage-guided fuzzing infrastructure  
-**Status:** 🎉 ALL 7 PHASES COMPLETE ✅
+**Status:** 🚧 KCOV primitives and cargo-fuzz targets are active; the host-driven QEMU loop is not yet connected
 
 ---
 
-## 🎉 ANNOUNCEMENT: Fuzzing Infrastructure Complete
+## Current implementation status
 
-**All 7 phases implemented!** Nilix now has a production-ready, continuously running fuzzing system comparable to Linux syzkaller.
+The phase documents below record the intended seven-phase architecture and historical milestones.
+They are not all active in the current CI data path. Today, GitHub Actions runs three host-safe
+cargo-fuzz targets that call kernel parsers on pushes, all 10 registered targets on scheduled/manual
+runs, and a separate KCOV build/pipeline smoke. Seven of the 10 targets are self-contained model
+harnesses. The smoke simulator executes no kernel input and is intentionally unable to create crash
+evidence. Host-driven mutation and coverage feedback for a QEMU Nilix guest remain future work.
 
 - **7,460+ lines of code** across 20 modules
 - **33,000+ words of documentation** across 28 files
-- **Complete CI/CD integration** with GitHub Actions
-- **Automatic crash triage** and security-aware public triage markers
-- **100% feature parity** with syzkaller
+- **CI integration** for cargo-fuzz and KCOV build validation
+- **Opaque private-candidate triage** and security-aware public pointers
+- **Architecture prototypes** for the future syzkaller-style guest loop
 
 ---
 
 ## Quick Navigation
 
 ### 📖 Read First
-- **[CI-REFACTORING.md](CI-REFACTORING.md)** - 🔧 **CI Refactoring Complete** ⭐ **NEW**
-- **[CI-INTEGRATION.md](CI-INTEGRATION.md)** - 🚀 Complete CI integration guide
-- **[PHASE7_COMPLETE.md](PHASE7_COMPLETE.md)** - 🎉 Phase 7 completion report
-- **[phase7-architecture.md](phase7-architecture.md)** - CI integration design
+- **This index and the live [workflow](../../.github/workflows/fuzz.yml)** are the current operational reference.
+- Retired CI integration/refactoring notes are intentionally not operational references; their
+  simulator, public-artifact, and reproducer-upload flows are unsafe.
+- **[PHASE7_COMPLETE.md](PHASE7_COMPLETE.md)** - Historical completion report, not current CI behavior
+- **[phase7-architecture.md](phase7-architecture.md)** - Historical CI integration design
 - **[PHASE6_COMPLETE.md](PHASE6_COMPLETE.md)** - Phase 6 completion report
 - **[PHASE5_COMPLETE.md](PHASE5_COMPLETE.md)** - Phase 5 completion report
 - **[PHASE4_COMPLETE.md](PHASE4_COMPLETE.md)** - Phase 4 completion report
@@ -39,7 +45,7 @@
   - Phase 4: Coverage-guided mutation ✅
   - Phase 5: Resource tracking ✅
   - Phase 6: Stateful fuzzing ✅
-  - Phase 7: CI integration ✅ DONE
+  - Phase 7: CI integration 🚧 partially integrated; the QEMU feedback loop remains future work
 - **[phase7-architecture.md](phase7-architecture.md)** - Phase 7 detailed design ⭐ NEW
 - **[phase6-architecture.md](phase6-architecture.md)** - Phase 6 detailed design
 - **[phase5-architecture.md](phase5-architecture.md)** - Phase 5 detailed design
@@ -56,7 +62,7 @@
 
 ---
 
-## Phase 7 Deliverables (🎉 NEW - FINAL PHASE)
+## Phase 7 design artifacts (partially integrated)
 
 ### CI Integration & Continuous Fuzzing
 ```
@@ -72,13 +78,14 @@ userspace/fuzzer/
 Total: ~1,150 lines
 ```
 
-### Key Features
-- **Continuous fuzzing:** Runs 24/7 in GitHub Actions (4 parallel workers)
-- **Automatic crash triage:** Deduplicates by signature (95%+ rate)
-- **Automatic minimization:** Reduces reproducers by 70%
-- **Corpus synchronization:** Shares inputs across workers
-- **Performance dashboard:** Text/HTML/JSON metrics
-- **Security-aware issue creation:** New candidates get a public workflow pointer, never an automatic reproducer disclosure
+### Active CI features
+- **Push fuzzing:** Short runs of VFS, network, and ELF targets that call real kernel parser code
+- **Scheduled fuzzing:** All 10 cargo-fuzz targets
+- **Private candidate triage:** Raw inputs/logs remain inside the ephemeral runner; public metadata
+  contains only a keyed HMAC ID
+- **Corpus caching:** Per-target corpora are saved only after clean runs and are never public artifacts
+- **Security-aware issue creation:** Opaque candidates get a workflow pointer, never an automatic reproducer disclosure
+- **KCOV/pipeline smoke:** Build validation and dashboard plumbing, explicitly excluded from fuzz evidence
 
 ---
 
@@ -235,19 +242,24 @@ sys_kcov_reset() → 0 on success
 
 ### Automatic Runs
 
-The fuzzing system runs automatically on schedule:
+Cargo-fuzz targets run automatically on schedule and on relevant pushes. Three targets call real
+kernel parser code; the other seven registered targets are self-contained model harnesses:
 
-**Continuous fuzzing (KCOV-based):**
-- Schedule: Every 6 hours
-- Duration: 6 hours per run
-- Workers: 4 parallel instances
-- Output: Crashes, dashboards, corpus
+**KCOV build and pipeline smoke:**
+- Schedule: Weekly
+- Executes: CI plumbing only (zero kernel fuzz inputs)
+- Output: A clearly labelled smoke log/dashboard; never crash evidence
 
 **Cargo-fuzz targets:**
 - Schedule: Daily at 2 AM UTC
 - Duration: 600 seconds per target
-- Targets: 10 specialized fuzzers
-- Output: Crashes, corpus, statistics
+- Targets: All 10 registered fuzzers (3 kernel parsers plus 7 model harnesses)
+- Output: Public result status plus opaque HMAC candidate IDs; raw findings stay private to the runner
+
+**Push quick targets:**
+- Duration: 60 seconds per target
+- Targets: `fuzz_vfs_path`, `fuzz_network_packet`, and `fuzz_elf_loader`
+- Output: The same public-safe result metadata as scheduled target runs
 
 ### Manual Runs
 
@@ -257,39 +269,45 @@ Trigger manually via GitHub Actions:
 Actions → Comprehensive Kernel Fuzzing → Run workflow
 
 Mode:
-  - continuous: KCOV-based fuzzing only
   - targets: Cargo-fuzz targets only
-  - both: Run both modes ⭐ Recommended
+  - smoke: KCOV build and CI plumbing only (not fuzz evidence)
+  - both: Run targets and smoke
 
-Duration: 6 (hours, for continuous mode)
 Timeout: 600 (seconds per target, for cargo-fuzz)
-Workers: 4 (for continuous mode)
 ```
 
 ### View Results
 
 **Crashes:**
-- Automatically filed as minimal GitHub triage markers
+- Automatically filed as opaque GitHub triage markers when private fingerprinting is configured
 - Tagged with the `[Fuzzing]` prefix and `bug` label
-- Public body links the workflow run but intentionally omits the reproducer
+- Public body links the workflow run but omits target, stack, payload, and ordinary payload hashes
 - Maintainers classify the candidate under [SECURITY.md](../../SECURITY.md) before sharing details
+- Configure a stable random `FUZZ_FINGERPRINT_KEY` repository secret (at least 32 bytes); findings
+  fail closed and publish nothing if it is missing
+- An existing open Issue with the same opaque ID is reused; a matching closed Issue is reopened and
+  receives a new workflow pointer. The lookup covers the full open/closed Issue history.
 
 **Dashboards:**
 - Download artifacts from workflow run
-- `dashboard-worker-N/dashboard.html` for visual view
-- `dashboard-worker-N/dashboard.json` for programmatic access
+- `fuzz-smoke-dashboard/dashboard.html` for visual smoke status
+- `fuzz-smoke-dashboard/dashboard.json` for programmatic smoke status
+- These dashboards report zero kernel executions and are not coverage evidence
 
 **Aggregate stats:**
 - Visible in workflow step summary
 - Download `aggregate-report.md` artifact
+- Reports distinguish targets that were not requested, failed/incomplete matrices, private
+  candidates, and complete clean runs; a missing manifest is never reported as clean
 
 **Corpus:**
-- Cached between runs automatically
-- Download `corpus-worker-N/` to inspect inputs
+- Clean-run cargo-fuzz corpora are cached per target between runs
+- Corpora and raw fuzzer output are never uploaded as public artifacts
+- A run that observes any finding is not saved back to the corpus cache
 
 ### See Also
 
-- **[CI-INTEGRATION.md](CI-INTEGRATION.md)** - Complete CI integration guide with troubleshooting
+- Historical CI integration/refactoring notes are retired; use this index and the live workflow.
 
 ---
 
@@ -401,21 +419,22 @@ let count = syscall(SYS_KCOV_DUMP, buf, len);
 | Phase 4: Mutation | ✅ Complete | 2026-07-21 |
 | Phase 5: Resources | ✅ Complete | 2026-07-21 |
 | Phase 6: Stateful | ✅ Complete | 2026-07-21 |
-| Phase 7: CI | ⏳ Next | TBD |
+| Phase 7: CI | 🚧 Partial: cargo-fuzz + smoke only | 2026-08-03 |
 
 ---
 
-## Next Steps: Phase 7
+## Remaining Phase 7 Work
 
 ### Goal
-CI integration and continuous fuzzing
+Connect the existing prototypes to a real, host-driven QEMU feedback loop without weakening the
+private disclosure boundary.
 
 ### Deliverables
-1. Continuous fuzzing infrastructure (24/7 operation)
-2. Automatic crash triage and deduplication
-3. Corpus synchronization across fuzzing runs
-4. Performance dashboards and real-time metrics
-5. GitHub Actions / CI pipeline integration
+1. A real kernel input transport and execution oracle for the QEMU guest
+2. Host-driven mutation informed by guest KCOV feedback
+3. A durable private channel for verified reproducers and diagnostic output
+4. Corpus synchronization for the real guest executor
+5. Performance dashboards based on measured kernel executions rather than simulation
 
 ### Success Criteria
 - Fuzzer runs continuously in CI
@@ -465,7 +484,8 @@ For questions about the fuzzing infrastructure:
 
 ---
 
-**Last Updated:** 2026-07-21  
-**Current Phase:** 6 of 7 COMPLETE ✅  
-**Progress:** 86%  
-**Next Milestone:** Phase 7 - CI integration and continuous fuzzing
+**Last Updated:** 2026-08-03
+
+**Current Phase:** Phase 7 partially integrated (cargo-fuzz + pipeline smoke)
+
+**Next Milestone:** Real host-driven QEMU execution and KCOV feedback loop

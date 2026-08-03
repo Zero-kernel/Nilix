@@ -85,8 +85,9 @@ including the former gate-blocking `R186-4` (VMA/MM aggregate admission). See [S
 - **2026-07-23:** U.S2 SLICE-3B capability infrastructure — FileOps trait with cap_id/set_cap_id methods, 
   interior mutability via spin::once::Once, regular file capability allocation in syscall layer, and 
   credential generation TOCTOU defense during VFS open.
-- **2026-07-21:** Production-ready fuzzing infrastructure with KCOV coverage tracking,
-  coverage-guided mutation, resource-aware stateful fuzzing, and continuous CI integration. See [Section 5.5](#55-fuzzing-infrastructure).
+- **2026-07-21 (historical):** KCOV primitives, fuzzing architecture prototypes, and the first CI
+  integration landed. The original "production-ready continuous fuzzing" claim was later retired:
+  that worker was a pipeline simulator, not a kernel executor. See [Section 5.5](#55-fuzzing-infrastructure).
 
 | Subsystem | Status | Highlights |
 |-----------|--------|-----------|
@@ -103,7 +104,7 @@ including the former gate-blocking `R186-4` (VMA/MM aggregate admission). See [S
 | IOMMU / VT-d | 🟡 Infrastructure | Full Intel VT-d driver (DMA isolation, IRQ remapping, fault handling); DMAR discovery wiring pending |
 | Live Patching | 🟡 Infrastructure | ECDSA P-256 signed kpatch, INT3 detour, fail-closed LSM gate |
 | User Mode & ABI (Phase U / M0) | 🟡 In Progress | Ring 3, 100+ Linux syscalls, SysV auxv, signal delivery, static-musl libc runs end-to-end |
-| Fuzzing & Testing | ✅ Complete | KCOV coverage tracking, coverage-guided mutation, stateful fuzzing, 4 parallel CI workers, 10 cargo-fuzz targets, extended test suite (stress/SMP/security) |
+| Fuzzing & Testing | 🚧 Active | KCOV coverage primitives, 10 cargo-fuzz targets, opaque private-candidate triage, and an extended test suite (stress/SMP/security); the QEMU continuous-input loop is not yet wired into CI |
 | CI & Quality Gates | ✅ Complete | GitHub Actions (fmt/clippy, build, lint, boot+musl+fuzz), custom lint gates, local-first pre-push hook with optional SSH offload |
 
 ---
@@ -397,8 +398,9 @@ Full documentation lives in `docs/testing/`.
 
 ### 5.5 Fuzzing infrastructure (NEW)
 
-Nilix has a **production-ready fuzzing infrastructure** matching and exceeding Linux syzkaller
-capabilities, with continuous coverage-guided fuzzing in CI:
+Nilix has KCOV coverage primitives, syscall-generation prototypes, and host-side libFuzzer
+targets. The QEMU continuous-input/coverage-feedback loop is still under development, so CI keeps
+its plumbing simulator isolated from all crash evidence and issue creation.
 
 #### Architecture
 
@@ -416,25 +418,31 @@ capabilities, with continuous coverage-guided fuzzing in CI:
 - **Stateful fuzzing** — protocol-aware fuzzing with state machines (FileDescriptor: CLOSED ↔ OPEN,
   MemoryRegion: UNMAPPED → MAPPED → PROTECTED, ProcessLifecycle: INIT → FORKED → EXEC → ZOMBIE),
   IPC coordinator, and input minimizer (delta debugging, 70%+ size reduction).
-- **Hybrid approach** — KCOV-based continuous fuzzing (4 workers × 6h, every 6h) for protocol bugs
-  plus 10 specialized cargo-fuzz targets (VFS, ELF, signal, etc.) for parsing bugs (daily, 600s
-  per target).
+- **Hybrid path** — a scheduled KCOV kernel build and explicitly labelled pipeline smoke check,
+  plus 10 specialized cargo-fuzz targets (VFS, ELF, signal, etc.) for host-safe parsing and model
+  checks. A real QEMU continuous executor remains future work.
 
 #### CI Integration
 
 The `.github/workflows/fuzz.yml` workflow runs:
 
-- **Continuous mode** — 4 parallel workers generating syscall sequences, tracking coverage,
-  mutating inputs, every 6 hours.
-- **Target mode** — 10 libFuzzer cargo-fuzz targets (structure-aware fuzzing), daily at 2 AM UTC.
-- **Crash triage** — 95%+ deduplication rate and automatic minimization; public issues contain
-  only a workflow/evidence pointer until maintainers classify the candidate under
-  [SECURITY.md](SECURITY.md), never an automatic reproducer disclosure.
-- **Corpus sync** — corpus cached across runs, aggregate reporting (text/HTML/JSON dashboards).
+- **Push mode** — 60-second runs of the VFS path, network packet, and ELF loader targets, each of
+  which calls real kernel parser code.
+- **Scheduled target mode** — all 10 libFuzzer targets, daily at 2 AM UTC.
+- **KCOV/pipeline smoke** — builds the KCOV kernel and checks CI plumbing, but is explicitly marked
+  as zero kernel fuzz executions and cannot upload crash artifacts.
+- **Private candidate triage** — raw libFuzzer output and finding inputs stay inside the ephemeral
+  runner. Candidate artifacts and Issue bodies contain only a stable keyed HMAC identifier and a
+  workflow pointer; they omit payloads, stack traces, ordinary hashes, and target names. Public
+  matrix job names and result manifests still identify the target that ran and its candidate count.
+- **Corpus cache** — clean-run cargo-fuzz corpora are cached across runs but never published as
+  artifacts; a run with any finding is not saved back to the cache.
 
-Trigger on push to `main` affecting `kernel/**`, `userspace/fuzzer/**`, or `fuzz/**`. Manual
-dispatch allows mode selection (continuous / targets / both) with tunable duration, timeout,
-and worker count.
+Pushes to `main` affecting `kernel/**`, `userspace/fuzzer/**`, or `fuzz/**` run the three real-kernel
+parser targets. Manual dispatch offers `targets`, `smoke`, and `both`; only target runs can produce
+fuzz findings. Candidate reporting requires a stable, randomly generated repository secret named
+`FUZZ_FINGERPRINT_KEY` (at least 32 bytes); a finding fails closed if that private channel is not
+configured.
 
 Full documentation lives in `docs/fuzzing/` (7 phase guides, 33,000+ words, architectural deep-dive).
 
@@ -446,14 +454,15 @@ make build-fuzz-runner
 make run-fuzz-runner
 
 # Run single cargo-fuzz target
-cd fuzz && cargo fuzz run elf_parser -- -max_total_time=60
+cd fuzz && cargo +nightly fuzz run fuzz_elf_loader -- -max_total_time=60
 
 # Run all cargo-fuzz targets
 cd fuzz && ./run_all_fuzz.sh
 ```
 
-The fuzzing infrastructure is **complete and production-ready** as of 2026-07-21. It continuously
-runs in CI, finding bugs 24/7 with zero manual intervention.
+The cargo-fuzz path and crash-evidence pipeline run in CI today. Connecting the in-guest KCOV
+executor to host-driven mutation, corpus exchange, and reproducible crash export remains an open
+engineering milestone.
 
 ### 5.6 Style gates & pre-push hook
 

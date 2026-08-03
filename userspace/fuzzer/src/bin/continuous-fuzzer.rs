@@ -1,27 +1,28 @@
-// Continuous fuzzer binary for CI integration
-// Implements Phase 7 continuous fuzzing loop
+//! Fuzz-pipeline smoke simulator for CI plumbing.
+//!
+//! This binary deliberately does not execute Nilix or generate fuzz inputs.  It
+//! exists only to exercise long-running process handling and dashboard uploads
+//! in the workflow.  In particular, it must never create corpus, coverage, or
+//! crash artifacts: those are evidence produced only by a real fuzz target.
 
-use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use clap::Parser;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "Nilix continuous fuzzer")]
+#[clap(
+    author,
+    version,
+    about = "Nilix fuzz-pipeline smoke simulator (does not execute the kernel)"
+)]
 struct Args {
-    /// Corpus directory
-    #[clap(long, default_value = "corpus")]
-    corpus_dir: PathBuf,
-
-    /// Crash output directory
-    #[clap(long, default_value = "crashes")]
-    crash_dir: PathBuf,
-
     /// Dashboard output directory
     #[clap(long, default_value = "dashboard")]
     dashboard_dir: PathBuf,
 
-    /// Worker ID
+    /// Worker ID shown in smoke-test output
     #[clap(long, default_value = "1")]
     worker_id: u32,
 
@@ -33,182 +34,188 @@ struct Args {
     #[clap(long, default_value = "300")]
     report_interval: u64,
 
-    /// Maximum iterations
+    /// Maximum heartbeat iterations
     #[clap(long)]
     max_iterations: Option<u64>,
+
+    /// Delay between heartbeats (test-only tuning knob)
+    #[clap(long, default_value = "10", hide = true)]
+    iteration_delay_ms: u64,
 }
 
-fn main() {
+#[derive(Debug, Clone, Copy)]
+struct SmokeStats {
+    heartbeats: u64,
+    elapsed: Duration,
+}
+
+fn main() -> io::Result<()> {
     let args = Args::parse();
+    run(&args).map(|_| ())
+}
 
-    println!("=== Nilix Continuous Fuzzer ===");
+fn run(args: &Args) -> io::Result<SmokeStats> {
+    println!("=== Nilix Fuzz-Pipeline Smoke Simulator ===");
     println!("Worker ID: {}", args.worker_id);
-    println!("Corpus: {:?}", args.corpus_dir);
-    println!("Crashes: {:?}", args.crash_dir);
     println!("Dashboard: {:?}", args.dashboard_dir);
+    println!("[SIMULATOR] No kernel code or fuzz input is executed.");
 
-    // Create directories
-    fs::create_dir_all(&args.corpus_dir).expect("Failed to create corpus dir");
-    fs::create_dir_all(&args.crash_dir).expect("Failed to create crash dir");
-    fs::create_dir_all(&args.dashboard_dir).expect("Failed to create dashboard dir");
+    fs::create_dir_all(&args.dashboard_dir)?;
 
-    // Initialize stats
-    let mut iterations = 0u64;
-    let mut corpus_size = 0u64;
-    let mut coverage = 0u64;
-    let mut crashes = 0u64;
-
+    let mut heartbeats = 0u64;
     let start_time = Instant::now();
     let mut last_report = Instant::now();
 
-    println!("\n[FUZZER] Starting continuous fuzzing loop...\n");
-
-    // Main fuzzing loop
     loop {
-        // Check exit conditions
         if let Some(max_time) = args.max_time {
             if start_time.elapsed().as_secs() >= max_time {
-                println!("\n[FUZZER] Max time reached, stopping");
+                println!("[SIMULATOR] Max time reached, stopping");
                 break;
             }
         }
 
         if let Some(max_iter) = args.max_iterations {
-            if iterations >= max_iter {
-                println!("\n[FUZZER] Max iterations reached, stopping");
+            if heartbeats >= max_iter {
+                println!("[SIMULATOR] Max heartbeats reached, stopping");
                 break;
             }
         }
 
-        // Simulate fuzzing iteration
-        // TODO: Replace with actual fuzzer implementation
-        iterations += 1;
+        heartbeats += 1;
 
-        // Simulate coverage growth
-        if iterations % 100 == 0 {
-            coverage += 1;
-        }
-
-        // Simulate corpus growth
-        if iterations % 50 == 0 {
-            corpus_size += 1;
-        }
-
-        // Simulate occasional crashes (1 in 10000)
-        if iterations % 10000 == 0 {
-            crashes += 1;
-            let crash_file = args.crash_dir.join(format!("crash-{:06}.txt", crashes));
-            fs::write(&crash_file, format!("Crash #{} at iteration {}\n", crashes, iterations))
-                .ok();
-            println!("[CRASH] Found crash #{} at iteration {}", crashes, iterations);
-        }
-
-        // Periodic reporting
         if last_report.elapsed().as_secs() >= args.report_interval {
-            print_stats(iterations, corpus_size, coverage, crashes, start_time.elapsed());
+            let stats = SmokeStats {
+                heartbeats,
+                elapsed: start_time.elapsed(),
+            };
+            print_stats(stats);
+            write_dashboard(&args.dashboard_dir, stats)?;
             last_report = Instant::now();
-
-            // Write dashboard
-            write_dashboard(&args.dashboard_dir, iterations, corpus_size, coverage, crashes, start_time.elapsed());
         }
 
-        // Small delay to simulate work
-        std::thread::sleep(Duration::from_millis(10));
+        if args.iteration_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(args.iteration_delay_ms));
+        }
     }
 
-    // Final report
-    println!("\n=== Final Statistics ===");
-    print_stats(iterations, corpus_size, coverage, crashes, start_time.elapsed());
+    let stats = SmokeStats {
+        heartbeats,
+        elapsed: start_time.elapsed(),
+    };
+    println!("\n=== Final Smoke Statistics ===");
+    print_stats(stats);
+    write_dashboard(&args.dashboard_dir, stats)?;
+    println!("[SIMULATOR] Smoke test completed");
 
-    // Write final dashboard
-    write_dashboard(&args.dashboard_dir, iterations, corpus_size, coverage, crashes, start_time.elapsed());
-
-    println!("\n[FUZZER] Fuzzing completed");
+    Ok(stats)
 }
 
-fn print_stats(iterations: u64, corpus_size: u64, coverage: u64, crashes: u64, elapsed: Duration) {
-    let elapsed_secs = elapsed.as_secs();
-    let exec_per_sec = if elapsed_secs > 0 {
-        iterations as f64 / elapsed_secs as f64
+fn print_stats(stats: SmokeStats) {
+    let elapsed_secs = stats.elapsed.as_secs();
+    let heartbeats_per_sec = if elapsed_secs > 0 {
+        stats.heartbeats as f64 / elapsed_secs as f64
     } else {
         0.0
     };
 
-    println!("[STATS] Iterations: {}", iterations);
-    println!("[STATS] Corpus: {}", corpus_size);
-    println!("[STATS] Coverage: {} edges", coverage);
-    println!("[STATS] Crashes: {}", crashes);
-    println!("[STATS] Runtime: {}s ({:.2}h)", elapsed_secs, elapsed_secs as f64 / 3600.0);
-    println!("[STATS] Exec/sec: {:.2}", exec_per_sec);
+    println!("[SMOKE] Heartbeats: {}", stats.heartbeats);
+    println!("[SMOKE] Kernel executions: 0");
+    println!("[SMOKE] Runtime: {elapsed_secs}s");
+    println!("[SMOKE] Heartbeats/sec: {heartbeats_per_sec:.2}");
 }
 
-fn write_dashboard(dir: &PathBuf, iterations: u64, corpus_size: u64, coverage: u64, crashes: u64, elapsed: Duration) {
-    let elapsed_secs = elapsed.as_secs();
-    let exec_per_sec = if elapsed_secs > 0 {
-        iterations as f64 / elapsed_secs as f64
+fn write_dashboard(dir: &Path, stats: SmokeStats) -> io::Result<()> {
+    let elapsed_secs = stats.elapsed.as_secs();
+    let heartbeats_per_sec = if elapsed_secs > 0 {
+        stats.heartbeats as f64 / elapsed_secs as f64
     } else {
         0.0
     };
 
-    // Write JSON dashboard
     let json_content = format!(
         r#"{{
-  "iterations": {},
-  "corpus_size": {},
-  "coverage": {},
-  "crashes": {},
+  "mode": "simulator",
+  "kernel_executions": 0,
+  "heartbeats": {},
   "runtime_secs": {},
-  "exec_per_sec": {:.2}
+  "heartbeats_per_sec": {:.2}
 }}"#,
-        iterations, corpus_size, coverage, crashes, elapsed_secs, exec_per_sec
+        stats.heartbeats, elapsed_secs, heartbeats_per_sec
     );
+    fs::write(dir.join("dashboard.json"), json_content)?;
 
-    fs::write(dir.join("dashboard.json"), json_content).ok();
-
-    // Write HTML dashboard
     let html_content = format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>Fuzzing Dashboard</title>
+    <title>Nilix Fuzz-Pipeline Smoke Simulator</title>
     <style>
         body {{ font-family: monospace; margin: 20px; background: #1e1e1e; color: #d4d4d4; }}
         h1 {{ color: #4ec9b0; }}
+        .warning {{ color: #f0c674; }}
         .metric {{ margin: 10px 0; padding: 10px; background: #252526; border-left: 3px solid #007acc; }}
         .label {{ color: #9cdcfe; font-weight: bold; }}
         .value {{ color: #ce9178; }}
     </style>
 </head>
 <body>
-    <h1>Nilix Fuzzing Dashboard</h1>
-    <div class="metric">
-        <span class="label">Iterations:</span>
-        <span class="value">{}</span>
-    </div>
-    <div class="metric">
-        <span class="label">Corpus Size:</span>
-        <span class="value">{}</span>
-    </div>
-    <div class="metric">
-        <span class="label">Coverage:</span>
-        <span class="value">{} edges</span>
-    </div>
-    <div class="metric">
-        <span class="label">Crashes:</span>
-        <span class="value">{}</span>
-    </div>
-    <div class="metric">
-        <span class="label">Runtime:</span>
-        <span class="value">{}s ({:.2}h)</span>
-    </div>
-    <div class="metric">
-        <span class="label">Exec/sec:</span>
-        <span class="value">{:.2}</span>
-    </div>
+    <h1>Nilix Fuzz-Pipeline Smoke Simulator</h1>
+    <p class="warning">This smoke test does not execute the kernel or produce fuzz evidence.</p>
+    <div class="metric"><span class="label">Kernel executions:</span> <span class="value">0</span></div>
+    <div class="metric"><span class="label">Heartbeats:</span> <span class="value">{}</span></div>
+    <div class="metric"><span class="label">Runtime:</span> <span class="value">{}s</span></div>
+    <div class="metric"><span class="label">Heartbeats/sec:</span> <span class="value">{:.2}</span></div>
 </body>
 </html>"#,
-        iterations, corpus_size, coverage, crashes, elapsed_secs, elapsed_secs as f64 / 3600.0, exec_per_sec
+        stats.heartbeats, elapsed_secs, heartbeats_per_sec
     );
+    fs::write(dir.join("dashboard.html"), html_content)
+}
 
-    fs::write(dir.join("dashboard.html"), html_content).ok();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn smoke_run_never_creates_fuzz_evidence() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("nilix-fuzz-smoke-{}-{nonce}", std::process::id()));
+        let dashboard_dir = root.join("dashboard");
+        let args = Args {
+            dashboard_dir: dashboard_dir.clone(),
+            worker_id: 1,
+            max_time: None,
+            report_interval: u64::MAX,
+            max_iterations: Some(10_001),
+            iteration_delay_ms: 0,
+        };
+
+        let stats = run(&args).unwrap();
+        assert_eq!(stats.heartbeats, 10_001);
+        assert!(dashboard_dir.join("dashboard.json").is_file());
+
+        let mut files = fs::read_dir(&dashboard_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files, vec!["dashboard.html", "dashboard.json"]);
+
+        let dashboard: Value =
+            serde_json::from_slice(&fs::read(dashboard_dir.join("dashboard.json")).unwrap())
+                .unwrap();
+        assert_eq!(dashboard["mode"], "simulator");
+        assert_eq!(dashboard["kernel_executions"], 0);
+        for forbidden in ["corpus", "coverage", "crashes", "findings"] {
+            assert!(dashboard.get(forbidden).is_none());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

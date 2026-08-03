@@ -1,37 +1,26 @@
 name: Comprehensive Kernel Fuzzing
 
 on:
-  # Scheduled runs
   schedule:
-    - cron: '0 2 * * 0'    # Weekly comprehensive fuzzing (Sunday 2 AM UTC, 1 hour)
-    - cron: '0 2 * * *'    # Daily cargo-fuzz targets (2 AM UTC, 10 minutes)
+    - cron: '0 2 * * 0'    # Weekly KCOV build and pipeline smoke
+    - cron: '0 2 * * *'    # Daily cargo-fuzz targets
 
-  # Manual trigger
   workflow_dispatch:
     inputs:
       mode:
         description: 'Fuzzing mode'
         required: true
-        default: 'both'
+        default: 'targets'
         type: choice
         options:
-          - continuous  # KCOV-based continuous fuzzing
-          - targets     # Cargo-fuzz libFuzzer targets
-          - both        # Run both modes
-      duration:
-        description: 'Duration in hours (continuous mode)'
-        required: false
-        default: '6'
+          - targets  # Cargo-fuzz libFuzzer targets
+          - smoke    # KCOV build + CI plumbing smoke (no fuzz evidence)
+          - both     # Run targets and the smoke job
       timeout:
-        description: 'Timeout per target in seconds (targets mode)'
+        description: 'Seconds per cargo-fuzz target (1-1200)'
         required: false
         default: '600'
-      workers:
-        description: 'Number of parallel workers (continuous mode)'
-        required: false
-        default: '4'
 
-  # Quick fuzzing on push (5 minutes)
   push:
     branches:
       - main
@@ -44,22 +33,51 @@ on:
 permissions: {}
 
 jobs:
-  # Job 1: Continuous KCOV-based fuzzing (Phase 2-7 implementation)
-  continuous-fuzzing:
-    name: Continuous Fuzzer Worker ${{ matrix.worker }}
+  fuzz-tools-test:
+    name: Fuzz Tool Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 400  # 6h + overhead
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+          components: clippy
+
+      - name: Cache fuzz-tool build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/fuzzer/target/
+          key: ${{ runner.os }}-fuzz-tools-${{ hashFiles('userspace/fuzzer/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-tools-
+
+      - name: Test fuzz tools
+        run: cargo test --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu
+
+      - name: Lint fuzz tools
+        run: cargo clippy --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+
+  # This job validates the KCOV build and CI plumbing. It executes no fuzz
+  # input and cannot produce candidate metadata or crash artifacts.
+  fuzz-pipeline-smoke:
+    name: KCOV Build and Fuzz-Pipeline Smoke
+    needs: fuzz-tools-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     if: |
       github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'continuous' || github.event.inputs.mode == 'both') ||
-      github.event_name == 'push'
-
-    strategy:
-      fail-fast: false
-      matrix:
-        worker: [1, 2, 3, 4]
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'both')
 
     steps:
       - name: Checkout code
@@ -87,174 +105,82 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-kcov-
 
-      - name: Restore corpus from previous run
-        uses: actions/cache@v6
-        with:
-          path: corpus-worker-${{ matrix.worker }}/
-          key: continuous-corpus-${{ github.sha }}-worker-${{ matrix.worker }}
-          restore-keys: |
-            continuous-corpus-${{ github.sha }}-
-            continuous-corpus-
-
       - name: Build KCOV-instrumented kernel
         run: |
-          echo "Building kernel with KCOV instrumentation..."
           make build-kcov
-          ls -lh esp-kcov/ || echo "esp-kcov directory not found"
+          test -f esp-kcov/kernel.elf
 
-      - name: Build continuous fuzzer
-        run: |
-          echo "Building continuous fuzzer binary..."
-          # Build from repo root to avoid inheriting userspace/.cargo/config.toml
-          cargo build --release --manifest-path userspace/fuzzer/Cargo.toml --bin continuous-fuzzer --target x86_64-unknown-linux-gnu
+      - name: Build fuzz-pipeline smoke simulator
+        run: cargo build --locked --release --manifest-path userspace/fuzzer/Cargo.toml --bin fuzz-pipeline-smoke --target x86_64-unknown-linux-gnu
 
-      - name: Run continuous fuzzer
-        id: run_fuzzer
+      - name: Run fuzz-pipeline smoke simulator
+        id: run_smoke
         run: |
-          # Determine duration based on trigger
-          if [ "${{ github.event_name }}" == "push" ]; then
-            duration_hours=0.083  # 5 minutes (300 seconds)
-            duration_secs=300
-          elif [ "${{ github.event_name }}" == "schedule" ] && [ "${{ github.event.schedule }}" == "0 2 * * 0" ]; then
-            duration_hours=1  # 1 hour for weekly run
-            duration_secs=3600
-          else
-            duration_hours=${{ github.event.inputs.duration || '6' }}
-            duration_secs=$((duration_hours * 3600))
+          mkdir -p fuzz-smoke-dashboard
+          set +e
+          userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/fuzz-pipeline-smoke \
+            --dashboard-dir fuzz-smoke-dashboard \
+            --worker-id 1 \
+            --max-iterations 1000 \
+            --iteration-delay-ms 1 \
+            --report-interval 1 \
+            > fuzz-smoke.log 2>&1
+          exit_code=$?
+          set -e
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::error::Fuzz-pipeline smoke failed"
+            exit "$exit_code"
           fi
 
-          echo "Running continuous fuzzer for ${duration_hours}h (${duration_secs}s)"
-          echo "Worker: ${{ matrix.worker }}"
-          echo "Trigger: ${{ github.event_name }}"
-
-          mkdir -p corpus-worker-${{ matrix.worker }}
-          mkdir -p crashes-worker-${{ matrix.worker }}
-          mkdir -p dashboard-worker-${{ matrix.worker }}
-
-          # Run fuzzer with timeout
-          timeout ${duration_secs} \
-            userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/continuous-fuzzer \
-            --corpus-dir corpus-worker-${{ matrix.worker }} \
-            --crash-dir crashes-worker-${{ matrix.worker }} \
-            --dashboard-dir dashboard-worker-${{ matrix.worker }} \
-            --worker-id ${{ matrix.worker }} \
-            --max-time ${duration_secs} \
-            --report-interval 60 \
-            2>&1 | tee fuzzer-worker-${{ matrix.worker }}.log \
-            || exit_code=$?
-
-          # Exit code 124 = timeout (expected), 0 = max-time reached
-          if [ ${exit_code:-0} -eq 124 ] || [ ${exit_code:-0} -eq 0 ]; then
-            echo "status=completed" >> $GITHUB_OUTPUT
-          else
-            echo "status=failed" >> $GITHUB_OUTPUT
-            echo "::warning::Fuzzer exited with code ${exit_code}"
-          fi
-        continue-on-error: true
-
-      - name: Check for crashes
-        if: always()
-        id: check_crashes
+      - name: Validate smoke output allowlist
         run: |
-          crash_count=$(find crashes-worker-${{ matrix.worker }} -type f 2>/dev/null | wc -l || echo 0)
-          echo "crashes=${crash_count}" >> $GITHUB_OUTPUT
-
-          if [ "$crash_count" -gt 0 ]; then
-            echo "::warning::Worker ${{ matrix.worker }} found $crash_count crash(es)"
-            echo "Crash files:"
-            ls -lh crashes-worker-${{ matrix.worker }}/ || true
-          else
-            echo "Worker ${{ matrix.worker }}: No crashes found"
+          actual=$(find fuzz-smoke-dashboard -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected=$(printf 'dashboard.html\ndashboard.json')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Smoke simulator produced an unexpected output file"
+            exit 1
           fi
+          grep -q '"mode": "simulator"' fuzz-smoke-dashboard/dashboard.json
+          grep -q '"kernel_executions": 0' fuzz-smoke-dashboard/dashboard.json
 
-      - name: Extract stats from fuzzer log
-        if: always()
-        id: extract_stats
-        run: |
-          log_file="fuzzer-worker-${{ matrix.worker }}.log"
-
-          if [ -f "$log_file" ]; then
-            # Extract final stats from log
-            iterations=$(grep -oP "Iterations: \K[0-9]+" "$log_file" | tail -1 || echo "0")
-            corpus_size=$(grep -oP "Corpus: \K[0-9]+" "$log_file" | tail -1 || echo "0")
-            coverage=$(grep -oP "Coverage: \K[0-9]+" "$log_file" | tail -1 || echo "0")
-
-            echo "iterations=${iterations}" >> $GITHUB_OUTPUT
-            echo "corpus_size=${corpus_size}" >> $GITHUB_OUTPUT
-            echo "coverage=${coverage}" >> $GITHUB_OUTPUT
-
-            echo "Worker ${{ matrix.worker }} stats:"
-            echo "  Iterations: ${iterations}"
-            echo "  Corpus: ${corpus_size}"
-            echo "  Coverage: ${coverage} edges"
-          else
-            echo "No log file found"
-            echo "iterations=0" >> $GITHUB_OUTPUT
-            echo "corpus_size=0" >> $GITHUB_OUTPUT
-            echo "coverage=0" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload crashes
-        if: always() && steps.check_crashes.outputs.crashes > 0
-        uses: actions/upload-artifact@v7
-        with:
-          name: continuous-crashes-worker-${{ matrix.worker }}
-          path: crashes-worker-${{ matrix.worker }}/
-          retention-days: 90
-
-      - name: Upload dashboard
+      - name: Upload smoke dashboard
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: continuous-dashboard-worker-${{ matrix.worker }}
+          name: fuzz-smoke-dashboard
           path: |
-            dashboard-worker-${{ matrix.worker }}/*.html
-            dashboard-worker-${{ matrix.worker }}/*.json
-          retention-days: 90
-          if-no-files-found: ignore
+            fuzz-smoke-dashboard/dashboard.html
+            fuzz-smoke-dashboard/dashboard.json
+          retention-days: 30
+          if-no-files-found: error
 
-      - name: Upload corpus
+      - name: Upload smoke log
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: continuous-corpus-worker-${{ matrix.worker }}
-          path: corpus-worker-${{ matrix.worker }}/
+          name: fuzz-smoke-log
+          path: fuzz-smoke.log
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: error
 
-      - name: Upload fuzzer log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: continuous-log-worker-${{ matrix.worker }}
-          path: fuzzer-worker-${{ matrix.worker }}.log
-          retention-days: 7
-
-  # Job 2: Cargo-fuzz libFuzzer targets
   cargo-fuzz-targets:
     name: Cargo-Fuzz ${{ matrix.target }}
+    needs: fuzz-tools-test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
     if: |
       github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'targets' || github.event.inputs.mode == 'both')
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'targets' || github.event.inputs.mode == 'both') ||
+      github.event_name == 'push'
 
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - fuzz_syscall
-          - fuzz_vfs_path
-          - fuzz_signal_delivery
-          - fuzz_memory_ops
-          - fuzz_ipc_message
-          - fuzz_scheduler
-          - fuzz_network_packet
-          - fuzz_cgroup_ops
-          - fuzz_elf_loader
-          - fuzz_futex_ops
+        # Pushes use the three host-safe targets that call real kernel parser
+        # code. Scheduled/manual runs retain the complete target set.
+        target: ${{ fromJSON(github.event_name == 'push' && '["fuzz_vfs_path","fuzz_network_packet","fuzz_elf_loader"]' || '["fuzz_syscall","fuzz_vfs_path","fuzz_signal_delivery","fuzz_memory_ops","fuzz_ipc_message","fuzz_scheduler","fuzz_network_packet","fuzz_cgroup_ops","fuzz_elf_loader","fuzz_futex_ops"]') }}
 
     steps:
       - name: Checkout repository
@@ -266,311 +192,369 @@ jobs:
           toolchain: nightly-2025-12-08
           components: rust-src
 
-      - name: Cache cargo
+      - name: Cache cargo build
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+            fuzz/target/
+            userspace/fuzzer/target/
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('fuzz/Cargo.lock', 'userspace/fuzzer/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-fuzz-
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # Build before any secret is present so dependency build scripts never
+      # inherit the private fingerprinting key.
+      - name: Build candidate triage tool
+        run: cargo build --locked --release --manifest-path userspace/fuzzer/Cargo.toml --bin crash-triage --target x86_64-unknown-linux-gnu
 
       - name: Restore corpus
-        uses: actions/cache@v6
+        id: restore_corpus
+        uses: actions/cache/restore@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}/
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
-      - name: Create fuzz directory if needed
+      - name: Prepare fuzz directories
         run: |
-          if [ ! -d "fuzz" ]; then
-            echo "Creating fuzz directory structure..."
-            cargo fuzz init
-          fi
           mkdir -p fuzz/corpus/${{ matrix.target }}
           mkdir -p fuzz/artifacts/${{ matrix.target }}
 
-      - name: Run fuzzer
+      # Raw libFuzzer output can include Base64 reproducers and stack traces.
+      # Keep it only in RUNNER_TEMP; never tee, cat, summarize, or upload it.
+      - name: Run fuzzer privately
+        id: run_fuzzer
+        env:
+          FUZZ_TIMEOUT: ${{ github.event_name == 'push' && '60' || github.event.inputs.timeout || '600' }}
         run: |
-          cd fuzz
-          timeout=${{ github.event.inputs.timeout || '600' }}
-          echo "Running ${{ matrix.target }} for ${timeout}s"
+          timeout="$FUZZ_TIMEOUT"
+          if ! [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || [ "$timeout" -gt 1200 ]; then
+            echo "::error::Fuzz timeout must be an integer from 1 through 1200"
+            exit 1
+          fi
 
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
-            -max_total_time=${timeout} \
+          private_log="$RUNNER_TEMP/libfuzzer-output.log"
+          set +e
+          cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} -- \
+            -max_total_time="$timeout" \
             -rss_limit_mb=4096 \
             -print_final_stats=1 \
-            2>&1 | tee fuzz_output_${{ matrix.target }}.txt \
-            || exit_code=$?
+            > "$private_log" 2>&1
+          exit_code=$?
+          set -e
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
 
-          # Exit code 0 = success, 77 = timeout (ok), others = crash
-          if [ ${exit_code:-0} -ne 0 ] && [ ${exit_code:-0} -ne 77 ]; then
-            echo "::warning::Fuzzer found issues in ${{ matrix.target }}"
-          fi
-        continue-on-error: true
-        id: fuzz
-
-      - name: Check for crashes
+      - name: Count private findings
         if: always()
-        id: check_crashes
+        id: count_findings
         run: |
-          cd fuzz
-          crashes=$(find artifacts/${{ matrix.target }} -name 'crash-*' 2>/dev/null | wc -l || echo 0)
-          echo "crashes=${crashes}" >> $GITHUB_OUTPUT
-          if [ "$crashes" -gt 0 ]; then
-            echo "::warning::Found $crashes crash(es) in ${{ matrix.target }}"
-            ls -lh artifacts/${{ matrix.target }}/crash-* || true
+          findings=$(find fuzz/artifacts/${{ matrix.target }} -maxdepth 1 -type f \
+            \( -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'leak-*' \) \
+            2>/dev/null | wc -l)
+          echo "findings=${findings}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate fuzzer outcome
+        if: always()
+        id: validate_fuzzer
+        env:
+          FUZZ_EXIT_CODE: ${{ steps.run_fuzzer.outputs.exit_code }}
+          FUZZ_FINDINGS: ${{ steps.count_findings.outputs.findings }}
+        run: |
+          if ! [[ "$FUZZ_EXIT_CODE" =~ ^[0-9]+$ ]] || ! [[ "$FUZZ_FINDINGS" =~ ^[0-9]+$ ]]; then
+            echo "::error::Fuzzer did not produce valid private result metadata"
+            exit 1
+          fi
+          if [ "$FUZZ_EXIT_CODE" -ne 0 ] && [ "$FUZZ_FINDINGS" -eq 0 ]; then
+            echo "::error::Fuzzer failed without producing a private finding"
+            exit 1
           fi
 
-      - name: Upload crash artifacts
-        if: always() && steps.check_crashes.outputs.crashes > 0
-        uses: actions/upload-artifact@v7
-        with:
-          name: cargo-fuzz-crashes-${{ matrix.target }}
-          path: |
-            fuzz/artifacts/${{ matrix.target }}/crash-*
-            fuzz/artifacts/${{ matrix.target }}/timeout-*
-            fuzz/artifacts/${{ matrix.target }}/oom-*
-          retention-days: 30
+      # A stable repository secret makes the public ID opaque even for tiny
+      # inputs. If it is absent, findings fail closed and no artifact is sent.
+      - name: Create opaque candidate metadata
+        if: steps.count_findings.outputs.findings > 0
+        id: create_candidates
+        env:
+          NILIX_FUZZ_FINGERPRINT_KEY: ${{ secrets.FUZZ_FINGERPRINT_KEY }}
+          FUZZ_FINDINGS: ${{ steps.count_findings.outputs.findings }}
+        run: |
+          if [ "${#NILIX_FUZZ_FINGERPRINT_KEY}" -lt 32 ]; then
+            echo "::error::Private fuzz candidate fingerprinting is not configured"
+            exit 1
+          fi
 
-      - name: Upload corpus
-        if: always()
+          input_root="$RUNNER_TEMP/nilix-finding-input"
+          input_dir="$input_root/cargo-fuzz-crashes-${{ matrix.target }}"
+          candidate_dir="fuzz/candidates"
+          private_triage_log="$RUNNER_TEMP/candidate-triage.log"
+          mkdir -p "$input_dir" "$candidate_dir"
+          if ! find fuzz/artifacts/${{ matrix.target }} -maxdepth 1 -type f \
+            \( -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'leak-*' \) \
+            -exec cp -- {} "$input_dir/" \; \
+            > /dev/null 2> "$private_triage_log"; then
+            echo "::error::Failed to stage a private fuzz candidate"
+            exit 1
+          fi
+
+          if ! userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/crash-triage \
+            --crash-dir "$input_root" \
+            --output-dir "$candidate_dir" \
+            --expected-findings "$FUZZ_FINDINGS" \
+            --dedup \
+            >> "$private_triage_log" 2>&1; then
+            echo "::error::Private fuzz candidate triage failed"
+            exit 1
+          fi
+
+          candidate_count=$(find "$candidate_dir" -maxdepth 1 -type f -name 'candidate-*.txt' | wc -l)
+          if [ "$candidate_count" -eq 0 ]; then
+            echo "::error::Private findings produced no opaque candidate metadata"
+            exit 1
+          fi
+          echo "candidate_count=${candidate_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload opaque candidate metadata
+        if: steps.create_candidates.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: cargo-fuzz-corpus-${{ matrix.target }}
+          name: fuzz-candidates-${{ strategy.job-index }}
+          path: fuzz/candidates/candidate-*.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Save clean corpus
+        if: steps.validate_fuzzer.outcome == 'success' && steps.count_findings.outputs.findings == '0'
+        uses: actions/cache/save@v6
+        with:
           path: fuzz/corpus/${{ matrix.target }}/
-          retention-days: 7
-          if-no-files-found: ignore
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload output
-        if: always()
+      - name: Write public result manifest
+        if: always() && !cancelled()
+        id: write_result
+        env:
+          RUN_OUTCOME: ${{ steps.run_fuzzer.outcome }}
+          COUNT_OUTCOME: ${{ steps.count_findings.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate_fuzzer.outcome }}
+          CANDIDATE_OUTCOME: ${{ steps.create_candidates.outcome }}
+          FINDINGS: ${{ steps.count_findings.outputs.findings }}
+          CANDIDATE_COUNT: ${{ steps.create_candidates.outputs.candidate_count }}
+        run: |
+          status=completed
+          candidate_count=0
+          if [ "$RUN_OUTCOME" != "success" ] || [ "$COUNT_OUTCOME" != "success" ] || [ "$VALIDATE_OUTCOME" != "success" ]; then
+            status=incomplete
+          elif ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then
+            status=incomplete
+          elif [ "$FINDINGS" -gt 0 ]; then
+            if [ "$CANDIDATE_OUTCOME" != "success" ] || ! [[ "$CANDIDATE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+              status=incomplete
+            else
+              candidate_count="$CANDIDATE_COUNT"
+            fi
+          fi
+          printf 'Schema: nilix-fuzz-result-v1\nStatus: %s\nCandidate-Count: %s\n' \
+            "$status" "$candidate_count" > fuzz-result.txt
+
+      - name: Upload public result manifest
+        if: always() && !cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: cargo-fuzz-output-${{ matrix.target }}
-          path: fuzz/fuzz_output_${{ matrix.target }}.txt
-          retention-days: 7
+          name: fuzz-result-${{ strategy.job-index }}
+          path: fuzz-result.txt
+          retention-days: 30
+          if-no-files-found: error
 
-  # Job 3: Crash triage and deduplication
-  crash-triage:
-    name: Crash Triage
+  candidate-reporting:
+    name: Report Opaque Fuzz Candidates
+    needs: cargo-fuzz-targets
+    if: ${{ !cancelled() && needs.cargo-fuzz-targets.result == 'success' }}
     runs-on: ubuntu-latest
-    needs: [continuous-fuzzing, cargo-fuzz-targets]
-    if: always()
     permissions:
       contents: read
       issues: write
+    concurrency:
+      group: nilix-fuzz-candidate-reporting
+      cancel-in-progress: false
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2025-12-08
-
-      - name: Download all crash artifacts
+      - name: Download opaque candidate metadata
         uses: actions/download-artifact@v8
         with:
-          path: all-crashes/
-          pattern: '*-crashes-*'
+          path: candidates/
+          pattern: 'fuzz-candidates-*'
 
-      - name: Build crash triage tool
+      - name: Validate candidate metadata
+        id: candidates
         run: |
-          # Build from repo root to avoid inheriting userspace/.cargo/config.toml
-          cargo build --release --manifest-path userspace/fuzzer/Cargo.toml --bin crash-triage --target x86_64-unknown-linux-gnu
+          mkdir -p candidates
+          candidate_count=0
+          while IFS= read -r -d '' candidate_file; do
+            schema=$(grep -m1 -oP '^Schema: \K.*' "$candidate_file" || true)
+            candidate_id=$(grep -m1 -oP '^Candidate-ID: \K.*' "$candidate_file" || true)
+            line_count=$(wc -l < "$candidate_file")
+            if [ "$schema" != "nilix-fuzz-candidate-v1" ] || \
+               ! [[ "$candidate_id" =~ ^hmac-sha256:[0-9a-f]{64}$ ]] || \
+               [ "$line_count" -ne 2 ]; then
+              echo "::error::Rejected malformed public candidate metadata"
+              exit 1
+            fi
+            candidate_count=$((candidate_count + 1))
+          done < <(find candidates -type f -name 'candidate-*.txt' -print0)
+          echo "candidate_count=${candidate_count}" >> "$GITHUB_OUTPUT"
 
-      - name: Run crash triage
-        id: triage
-        run: |
-          echo "Running crash triage..."
-
-          userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/crash-triage \
-            --crash-dir all-crashes/ \
-            --output-dir triaged-crashes/ \
-            --dedup \
-            --minimize \
-            2>&1 | tee triage.log || true
-
-          # Extract stats
-          unique=$(grep -oP "Unique crashes: \K[0-9]+" triage.log | tail -1 || echo "0")
-          total=$(grep -oP "Total crashes: \K[0-9]+" triage.log | tail -1 || echo "0")
-
-          echo "unique_crashes=${unique}" >> $GITHUB_OUTPUT
-          echo "total_crashes=${total}" >> $GITHUB_OUTPUT
-
-          if [ "$unique" -gt 0 ]; then
-            echo "::warning::Found $unique unique crash(es) after deduplication"
-          fi
-
-      - name: Create public triage markers without reproducer details
-        if: steps.triage.outputs.unique_crashes > 0
+      - name: Create or reuse public security pointers
+        if: steps.candidates.outputs.candidate_count > 0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          echo "Creating GitHub issues for unique crashes..."
-
-          for crash_file in triaged-crashes/unique-*.txt; do
-            if [ -f "$crash_file" ]; then
-              crash_id=$(basename "$crash_file" .txt)
-
-              # Keep public metadata deliberately narrow. A crash may cross a
-              # kernel trust boundary; never paste its reproducer automatically.
-              crash_type=$(head -1 "$crash_file" | grep -oP "Type: \K.*" || echo "unknown")
-
-              # Create an evidence pointer, not a public disclosure. Maintainers
-              # classify the candidate under SECURITY.md before sharing details.
-              gh issue create \
-                --title "[Fuzzing]: $crash_type candidate from run ${{ github.run_id }}" \
-                --body "Automated fuzzing produced a unique crash candidate in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Reproducer details are intentionally omitted pending maintainer security triage under SECURITY.md. Internal candidate ID: $crash_id." \
-                --label "bug" \
-                || echo "Failed to create issue for $crash_id"
+          matches_file="$RUNNER_TEMP/fuzz-candidate-issue-matches.tsv"
+          private_query_log="$RUNNER_TEMP/fuzz-candidate-issue-query.log"
+          while IFS= read -r -d '' candidate_file; do
+            candidate_id=$(grep -m1 -oP '^Candidate-ID: \K.*' "$candidate_file")
+            marker="<!-- nilix-fuzz-candidate-id:${candidate_id} -->"
+            if ! gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GH_REPO}/issues?state=all&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select((.body // \"\") | contains(\"${marker}\")) | [.number, (.state | ascii_upcase)] | @tsv" \
+              > "$matches_file" 2> "$private_query_log"; then
+              echo "::error::Failed to query existing fuzz candidate pointers"
+              exit 1
             fi
-          done
+            mapfile -t matches < "$matches_file"
 
-      - name: Upload triaged crashes
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: triaged-crashes
-          path: triaged-crashes/
-          retention-days: 90
-          if-no-files-found: ignore
+            if [ "${#matches[@]}" -gt 0 ]; then
+              IFS=$'\t' read -r issue_number issue_state <<< "${matches[0]}"
+              if [ "$issue_state" = "CLOSED" ]; then
+                gh issue reopen "$issue_number"
+                gh issue comment "$issue_number" \
+                  --body "The opaque candidate was observed again in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Details remain private under SECURITY.md."
+              else
+                echo "Opaque candidate is already tracked by #${issue_number}"
+              fi
+              continue
+            fi
 
-      - name: Upload triage log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: triage-log
-          path: triage.log
-          retention-days: 30
+            issue_body="Automated fuzzing observed a private candidate in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Potential security details and the reproducer were not written to public logs or artifacts. Maintainers should coordinate under SECURITY.md. Opaque candidate ID: ${candidate_id}."
+            issue_body+=$'\n\n'
+            issue_body+="$marker"
+            gh issue create \
+              --title "[Fuzzing]: private candidate from run ${{ github.run_id }}" \
+              --body "$issue_body" \
+              --label "bug"
+          done < <(find candidates -type f -name 'candidate-*.txt' -print0)
 
-  # Job 4: Aggregate report
   aggregate-report:
     name: Aggregate Report
+    needs: [fuzz-tools-test, fuzz-pipeline-smoke, cargo-fuzz-targets, candidate-reporting]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    needs: [continuous-fuzzing, cargo-fuzz-targets, crash-triage]
-    if: always()
     permissions:
       contents: read
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Download all artifacts
+      - name: Download public artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts/
 
       - name: Generate aggregate report
+        env:
+          TOOLS_RESULT: ${{ needs.fuzz-tools-test.result }}
+          SMOKE_RESULT: ${{ needs.fuzz-pipeline-smoke.result }}
+          CARGO_RESULT: ${{ needs.cargo-fuzz-targets.result }}
+          REPORTING_RESULT: ${{ needs.candidate-reporting.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          DISPATCH_MODE: ${{ github.event.inputs.mode }}
         run: |
-          echo "# Comprehensive Fuzzing Report" > aggregate-report.md
-          echo "" >> aggregate-report.md
-          echo "**Run:** ${{ github.run_id }}" >> aggregate-report.md
-          echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> aggregate-report.md
-          echo "**Trigger:** ${{ github.event_name }}" >> aggregate-report.md
-          echo "" >> aggregate-report.md
+          expected_targets=0
+          if [ "$EVENT_NAME" = "push" ]; then
+            expected_targets=3
+          elif [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "0 2 * * *" ]; then
+            expected_targets=10
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && { [ "$DISPATCH_MODE" = "targets" ] || [ "$DISPATCH_MODE" = "both" ]; }; then
+            expected_targets=10
+          fi
 
-          # Continuous fuzzing summary
-          echo "## Continuous Fuzzing (KCOV-based)" >> aggregate-report.md
-          echo "" >> aggregate-report.md
+          {
+            echo "# Comprehensive Fuzzing Report"
+            echo
+            echo "**Run:** ${{ github.run_id }}"
+            echo "**Commit:** ${{ github.sha }}"
+            echo "**Trigger:** ${{ github.event_name }}"
+            echo
+            echo "## Job status"
+            echo
+            echo "- Fuzz tool tests: $TOOLS_RESULT"
+            echo "- KCOV/pipeline smoke: $SMOKE_RESULT"
+            echo "- Cargo-fuzz matrix: $CARGO_RESULT"
+            echo "- Opaque candidate reporting: $REPORTING_RESULT"
+            echo
+          } > aggregate-report.md
 
-          total_iterations=0
-          total_corpus=0
-          max_coverage=0
-          total_crashes=0
-
-          for i in 1 2 3 4; do
-            log="artifacts/continuous-log-worker-$i/fuzzer-worker-$i.log"
-            if [ -f "$log" ]; then
-              iterations=$(grep -oP "Iterations: \K[0-9]+" "$log" | tail -1 || echo "0")
-              corpus=$(grep -oP "Corpus: \K[0-9]+" "$log" | tail -1 || echo "0")
-              coverage=$(grep -oP "Coverage: \K[0-9]+" "$log" | tail -1 || echo "0")
-              crashes=$(find "artifacts/continuous-crashes-worker-$i" -type f 2>/dev/null | wc -l || echo "0")
-
-              total_iterations=$((total_iterations + iterations))
-              total_corpus=$((total_corpus + corpus))
-              if [ "$coverage" -gt "$max_coverage" ]; then
-                max_coverage=$coverage
-              fi
-              total_crashes=$((total_crashes + crashes))
-
-              echo "- **Worker $i:** $iterations iterations, $corpus corpus, $coverage edges, $crashes crashes" >> aggregate-report.md
-            fi
-          done
-
-          echo "" >> aggregate-report.md
-          echo "**Totals:**" >> aggregate-report.md
-          echo "- Iterations: $total_iterations" >> aggregate-report.md
-          echo "- Corpus size: $total_corpus" >> aggregate-report.md
-          echo "- Max coverage: $max_coverage edges" >> aggregate-report.md
-          echo "- Crashes found: $total_crashes" >> aggregate-report.md
-          echo "" >> aggregate-report.md
-
-          # Cargo-fuzz summary
-          echo "## Cargo-Fuzz Targets" >> aggregate-report.md
-          echo "" >> aggregate-report.md
-
-          cargo_crash_count=0
-          for dir in artifacts/cargo-fuzz-crashes-*; do
-            if [ -d "$dir" ]; then
-              target=$(basename "$dir" | sed 's/cargo-fuzz-crashes-//')
-              crashes=$(find "$dir" -type f | wc -l)
-              cargo_crash_count=$((cargo_crash_count + crashes))
-              if [ "$crashes" -gt 0 ]; then
-                echo "- **$target:** $crashes crash(es)" >> aggregate-report.md
-              fi
-            fi
-          done
-
-          if [ "$cargo_crash_count" -eq 0 ]; then
-            echo "✓ No crashes found across all cargo-fuzz targets" >> aggregate-report.md
-          else
+          if [ "$expected_targets" -eq 0 ]; then
+            echo "## Cargo-fuzz targets" >> aggregate-report.md
             echo "" >> aggregate-report.md
-            echo "**Total cargo-fuzz crashes:** $cargo_crash_count" >> aggregate-report.md
-          fi
-          echo "" >> aggregate-report.md
-
-          # Crash triage summary
-          echo "## Crash Triage" >> aggregate-report.md
-          echo "" >> aggregate-report.md
-
-          if [ -f "artifacts/triage-log/triage.log" ]; then
-            unique=$(grep -oP "Unique crashes: \K[0-9]+" artifacts/triage-log/triage.log | tail -1 || echo "0")
-            total=$((total_crashes + cargo_crash_count))
-
-            if [ "$total" -gt 0 ]; then
-              dedup_rate=$(awk "BEGIN {printf \"%.1f\", (1 - $unique/$total) * 100}")
-              echo "- **Total crashes:** $total" >> aggregate-report.md
-              echo "- **Unique crashes:** $unique" >> aggregate-report.md
-              echo "- **Deduplication rate:** ${dedup_rate}%" >> aggregate-report.md
-
-              if [ "$unique" -gt 0 ]; then
-                echo "- **GitHub issues created:** $unique" >> aggregate-report.md
-              fi
-            else
-              echo "✓ No crashes found - kernel is clean!" >> aggregate-report.md
-            fi
+            echo "Not requested for this run." >> aggregate-report.md
+          elif [ "$CARGO_RESULT" != "success" ]; then
+            echo "## Cargo-fuzz targets: INCOMPLETE" >> aggregate-report.md
+            echo "" >> aggregate-report.md
+            echo "The matrix did not complete successfully; no clean result is claimed." >> aggregate-report.md
           else
-            echo "No triage data available" >> aggregate-report.md
+            mapfile -t result_files < <(find artifacts -type f -name 'fuzz-result.txt' | sort)
+            completed_results=0
+            candidate_count=0
+            malformed=0
+            for result_file in "${result_files[@]}"; do
+              schema=$(grep -m1 -oP '^Schema: \K.*' "$result_file" || true)
+              status=$(grep -m1 -oP '^Status: \K.*' "$result_file" || true)
+              count=$(grep -m1 -oP '^Candidate-Count: \K.*' "$result_file" || true)
+              if [ "$schema" != "nilix-fuzz-result-v1" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+                malformed=1
+                continue
+              fi
+              if [ "$status" = "completed" ]; then
+                completed_results=$((completed_results + 1))
+              else
+                malformed=1
+              fi
+              candidate_count=$((candidate_count + count))
+            done
+
+            if [ "${#result_files[@]}" -ne "$expected_targets" ] || \
+               [ "$completed_results" -ne "$expected_targets" ] || \
+               [ "$malformed" -ne 0 ] || \
+               [ "$REPORTING_RESULT" != "success" ]; then
+              echo "## Cargo-fuzz targets: INCOMPLETE" >> aggregate-report.md
+              echo "" >> aggregate-report.md
+              echo "Expected $expected_targets complete result manifests; no clean result is claimed." >> aggregate-report.md
+            elif [ "$candidate_count" -gt 0 ]; then
+              echo "## Cargo-fuzz targets: PRIVATE CANDIDATES OBSERVED" >> aggregate-report.md
+              echo "" >> aggregate-report.md
+              echo "$candidate_count opaque candidate(s) were routed through SECURITY.md without public reproducers." >> aggregate-report.md
+            else
+              echo "## Cargo-fuzz targets: COMPLETE" >> aggregate-report.md
+              echo "" >> aggregate-report.md
+              echo "No findings were observed by the selected targets." >> aggregate-report.md
+            fi
           fi
 
           echo "" >> aggregate-report.md
-          echo "---" >> aggregate-report.md
-          echo "*Report generated by Nilix comprehensive fuzzing infrastructure*" >> aggregate-report.md
-
+          echo "Raw fuzzer output, findings, and corpora are never uploaded as public artifacts." >> aggregate-report.md
           cat aggregate-report.md
 
       - name: Add to step summary
         if: always()
-        run: cat aggregate-report.md >> $GITHUB_STEP_SUMMARY
+        run: cat aggregate-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload aggregate report
         if: always()
@@ -579,3 +563,4 @@ jobs:
           name: aggregate-report
           path: aggregate-report.md
           retention-days: 90
+          if-no-files-found: error

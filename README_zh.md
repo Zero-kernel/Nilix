@@ -65,8 +65,9 @@ Linux 兼容用户态人格（personality）。
 - **2026-07-23：** U.S2 SLICE-3B 能力基础设施 —— FileOps trait 添加 cap_id/set_cap_id 方法，
   通过 spin::once::Once 实现内部可变性，系统调用层为常规文件分配能力，以及 VFS 打开期间的
   凭证生成 TOCTOU 防御。
-- **2026-07-21：** 生产就绪的模糊测试基础设施，包含 KCOV 覆盖率跟踪、覆盖引导的变异、
-  资源感知的状态模糊测试，以及持续 CI 集成。详见[第 5.5 节](#55-模糊测试基础设施)。
+- **2026-07-21（历史记录）：** KCOV 原语、模糊测试架构原型和首版 CI 集成落地。后来已撤回
+  “生产就绪的持续模糊测试”这一说法：当时的 worker 只是流水线模拟器，并未执行内核输入。
+  当前状态详见[第 5.5 节](#55-模糊测试基础设施)。
 
 | 子系统                         | 状态        | 要点                                                                                            |
 | 启动与内存                     | ✅ 完成     | UEFI 静态 PIE 启动、高半区映射、预留感知伙伴分配器、页缓存、COW fork、守护页、OOM killer        |
@@ -82,7 +83,7 @@ Linux 兼容用户态人格（personality）。
 | IOMMU / VT-d                   | 🟡 基础设施 | 完整 Intel VT-d 驱动（DMA 隔离、中断重映射、故障处理）；DMAR 发现接线待完成                     |
 | 实时补丁                       | 🟡 基础设施 | ECDSA P-256 签名的 kpatch、INT3 detour、fail-closed 的 LSM 门控                                 |
 | 用户模式与 ABI（Phase U / M0） | 🟡 进行中   | Ring 3、100+ Linux 系统调用、SysV auxv、信号投递、静态 musl libc 端到端运行                     |
-| 模糊测试与测试                 | ✅ 完成     | KCOV 覆盖率跟踪、覆盖引导的变异、状态化模糊测试、4 个并行 CI worker、10 个 cargo-fuzz 目标、扩展测试套件（压力/SMP/安全） |
+| 模糊测试与测试                 | 🚧 进行中   | KCOV 原语、10 个 cargo-fuzz 目标（其中 3 个直接调用内核解析器）、不透明私密候选分流；QEMU 覆盖反馈执行环尚未接入 CI |
 | CI 与质量门禁                  | ✅ 完成     | GitHub Actions（fmt/clippy、build、lint、boot+musl+fuzz）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子      |
 
 ---
@@ -347,20 +348,22 @@ QEMU 自身的退出码读取（`-no-reboot -no-shutdown` 下 timeout 是健康�
 
 ### 5.5 模糊测试基础设施
 
-Nilix 具备**生产就绪的模糊测试基础设施**，能力对标并在若干方面超出 Linux syzkaller，并在 CI 中
-持续进行覆盖引导的模糊测试：
+Nilix 目前具备可用的宿主机 cargo-fuzz 路径、KCOV 原语和面向未来 QEMU 执行环的架构原型；它还
+不是生产就绪的 syzkaller 等价物。当前 CI 行为如下：
 
 - **KCOV 覆盖率跟踪** —— 在系统调用入口通过手工插桩实现每任务边缘覆盖（13 个插桩系统调用，
   5 个 KCOV 管理系统调用）。IRQ 安全，禁用时零开销。
 - **系统调用描述** —— 基于 TOML 的类型安全定义，带约束（范围、标志、枚举）与资源关系
   （fd → 文件，pid → 进程），已描述 20+ 个核心系统调用。
-- **覆盖引导变异** —— 具备 8 种变异策略的遗传算法；语料库管理跟踪可扩展覆盖的"有趣"输入。
-- **资源感知模糊测试** —— 跟踪五类资源（fd、pid、addr、port、cap_id），含约束校验、依赖跟踪
-  与泄漏检测。
-- **状态化模糊测试** —— 带状态机的协议感知模糊测试、IPC 协调器与输入最小化器（增量调试，
-  体积缩减 70%+）。
-- **混合策略** —— 基于 KCOV 的持续模糊测试（4 worker × 6 小时，每 6 小时一轮）配合 10 个专用
-  cargo-fuzz 目标（每日，每目标 600 秒）。
+- **架构原型** —— 覆盖引导变异、资源跟踪、状态机与语料库组件已经存在，但尚未连接成由宿主机
+  驱动 QEMU Nilix guest 的持续反馈环。
+- **真实解析器目标** —— push 对 VFS 路径、网络报文和 ELF 加载器做 60 秒短跑，这 3 个 target
+  直接调用内核解析代码；每日任务运行全部 10 个已注册 target，其余 7 个是自包含模型 harness。
+- **流水线 smoke** —— 构建 KCOV 内核并验证 CI 接线，但明确记录 0 次内核 fuzz 执行，不能产生
+  crash、corpus 或 coverage 证据。
+- **私密候选分流** —— 原始 libFuzzer 日志和 finding 输入只留在临时 runner；公开候选文件与 Issue
+  正文只携带带密钥的 HMAC 标识和 workflow 指针，不公开 payload、栈、普通哈希或 target 名。
+  仓库管理员必须配置至少 32 字节的 `FUZZ_FINGERPRINT_KEY`，否则发现 finding 时会 fail closed。
 
 完整文档位于 `docs/fuzzing/`（7 份阶段指南，33,000+ 字）。
 
