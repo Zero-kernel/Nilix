@@ -8400,10 +8400,7 @@ fn main_sigframe_stack(rsp: u64) -> Option<crate::signal_frame::SigframeStack> {
 /// adjacent mappings: a mapping beginning exactly at RSP wins over a lower VMA
 /// whose exclusive top is RSP. If that upper candidate is invalid, we do not
 /// fall back and grant the lower mapping authority over the frame write.
-fn locate_sigframe_vma<M>(
-    rsp: u64,
-    regions: &M,
-) -> crate::signal_frame::SigframeStack
+fn locate_sigframe_vma<M>(rsp: u64, regions: &M) -> crate::signal_frame::SigframeStack
 where
     M: MmapRegions,
 {
@@ -8437,17 +8434,26 @@ where
 
 /// Trait for mmap_regions operations (supports both FallibleOrderedMap and AdmittedMap)
 trait MmapRegions {
-    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)>;
+    fn range(
+        &self,
+        range: impl core::ops::RangeBounds<usize>,
+    ) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)>;
 }
 
 impl MmapRegions for crate::fallible_map::FallibleOrderedMap<usize, MmapEntry> {
-    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
+    fn range(
+        &self,
+        range: impl core::ops::RangeBounds<usize>,
+    ) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
         self.range(range)
     }
 }
 
 impl MmapRegions for mm::AdmittedMap<usize, MmapEntry> {
-    fn range(&self, range: impl core::ops::RangeBounds<usize>) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
+    fn range(
+        &self,
+        range: impl core::ops::RangeBounds<usize>,
+    ) -> impl DoubleEndedIterator<Item = (&usize, &MmapEntry)> {
         self.range(range)
     }
 }

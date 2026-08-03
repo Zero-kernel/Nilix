@@ -231,7 +231,7 @@ impl RuntimeTest for VmaHeapAdmissionTest {
         // Verify heap budgets are published (P2-A prerequisite)
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budget arbiter not published - P2-A prerequisite missing"
+                "Heap budget arbiter not published - P2-A prerequisite missing",
             ));
         }
 
@@ -260,11 +260,12 @@ impl RuntimeTest for VmaHeapAdmissionTest {
         // FA-09: Amount-symmetric check with tolerance for concurrent allocation
         // (not exact equality which can fail spuriously)
         const TOLERANCE_BYTES: usize = 4096; // 1 page tolerance
-        let residual_delta = if snap_after.general_residual_bytes > snap_before.general_residual_bytes {
-            snap_after.general_residual_bytes - snap_before.general_residual_bytes
-        } else {
-            snap_before.general_residual_bytes - snap_after.general_residual_bytes
-        };
+        let residual_delta =
+            if snap_after.general_residual_bytes > snap_before.general_residual_bytes {
+                snap_after.general_residual_bytes - snap_before.general_residual_bytes
+            } else {
+                snap_before.general_residual_bytes - snap_after.general_residual_bytes
+            };
 
         if residual_delta > TOLERANCE_BYTES {
             return TestResult::Fail(alloc::format!(
@@ -336,7 +337,7 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
 
         if inserted_count == 0 {
             return TestResult::Fail(String::from(
-                "Could not insert any entries - CoreProcess floor may be zero"
+                "Could not insert any entries - CoreProcess floor may be zero",
             ));
         }
 
@@ -355,7 +356,7 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
             let beyond_capacity_result = test_map.try_insert(9999, 9999);
             if beyond_capacity_result.is_ok() {
                 return TestResult::Fail(String::from(
-                    "Insert beyond capacity succeeded when it should have failed"
+                    "Insert beyond capacity succeeded when it should have failed",
                 ));
             }
         }
@@ -375,10 +376,7 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
                     }
                 }
                 None => {
-                    return TestResult::Fail(alloc::format!(
-                        "Failed to remove existing key {}",
-                        i
-                    ));
+                    return TestResult::Fail(alloc::format!("Failed to remove existing key {}", i));
                 }
             }
         }
@@ -387,7 +385,7 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
         let reclaim_test = test_map.try_insert(10000, 20000);
         if reclaim_test.is_err() {
             return TestResult::Fail(String::from(
-                "Could not insert after removing entries - capacity not reclaimed"
+                "Could not insert after removing entries - capacity not reclaimed",
             ));
         }
 
@@ -405,7 +403,7 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
         // Test 7: Verify heap budgets remained stable
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budgets not published after pressure test"
+                "Heap budgets not published after pressure test",
             ));
         }
 
@@ -436,7 +434,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
         // Verify prerequisites
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budget arbiter not published - cannot test admission"
+                "Heap budget arbiter not published - cannot test admission",
             ));
         }
 
@@ -480,15 +478,13 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
         let len_before = entries_with_spare.len();
         if capacity_before <= len_before {
             return TestResult::Fail(String::from(
-                "Test setup failed: Vec has no spare capacity to test shrink_to_fit fix"
+                "Test setup failed: Vec has no spare capacity to test shrink_to_fit fix",
             ));
         }
 
         // Call from_sorted_vec_charged - should shrink before charging (fix #1)
-        let child_map_result = AdmittedMap::from_sorted_vec_charged(
-            entries_with_spare,
-            mm::HeapClass::CoreProcess,
-        );
+        let child_map_result =
+            AdmittedMap::from_sorted_vec_charged(entries_with_spare, mm::HeapClass::CoreProcess);
 
         match child_map_result {
             Ok(child_map) => {
@@ -506,7 +502,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
 
                 if snap_after_fork.heap_total_bytes != snap_initial.heap_total_bytes {
                     return TestResult::Fail(String::from(
-                        "Heap total changed after fork - structural invariant violated"
+                        "Heap total changed after fork - structural invariant violated",
                     ));
                 }
 
@@ -521,14 +517,11 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                 }
 
                 // Phase 3: Verify error path doesn't leak (issue #3)
-                let huge_entries: Vec<(usize, usize)> = (0..100000)
-                    .map(|i| (i * 4096, i))
-                    .collect();
+                let huge_entries: Vec<(usize, usize)> =
+                    (0..100000).map(|i| (i * 4096, i)).collect();
 
-                match AdmittedMap::from_sorted_vec_charged(
-                    huge_entries,
-                    mm::HeapClass::CoreProcess,
-                ) {
+                match AdmittedMap::from_sorted_vec_charged(huge_entries, mm::HeapClass::CoreProcess)
+                {
                     Ok(_) => {
                         // Budget is large - not a problem
                     }
@@ -536,14 +529,14 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                         // Verify the Vec was returned (no leak)
                         if returned_vec.len() != 100000 {
                             return TestResult::Fail(String::from(
-                                "Error path didn't return original Vec - potential leak"
+                                "Error path didn't return original Vec - potential leak",
                             ));
                         }
                         // Verify heap budgets are still stable
                         let snap_after_fail = mm::heap_budget_snapshot();
                         if snap_after_fail.heap_total_bytes != snap_initial.heap_total_bytes {
                             return TestResult::Fail(String::from(
-                                "Heap total changed after failed fork - leak detected"
+                                "Heap total changed after failed fork - leak detected",
                             ));
                         }
                     }
@@ -555,7 +548,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                 // Fork admission failed - verify no leak
                 if returned_vec.len() != len_before {
                     return TestResult::Fail(String::from(
-                        "Fork admission failed and Vec length changed - data loss"
+                        "Fork admission failed and Vec length changed - data loss",
                     ));
                 }
 

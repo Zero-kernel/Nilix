@@ -9282,10 +9282,7 @@ impl PtLedger for mm::AdmittedMap<u64, ()> {
     }
 }
 
-pub fn pt_ledger_reconcile<I: Iterator<Item = u64>, M>(
-    ledger: &mut M,
-    reclaimed_phys: I,
-) -> u64
+pub fn pt_ledger_reconcile<I: Iterator<Item = u64>, M>(ledger: &mut M, reclaimed_phys: I) -> u64
 where
     M: PtLedger,
 {

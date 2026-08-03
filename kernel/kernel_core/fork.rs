@@ -643,16 +643,14 @@ fn fork_inner(
             // charges the Vec's capacity (not len) to CoreProcess heap class before
             // constructing the AdmittedMap. On admission failure, the Vec is returned
             // for cleanup and we return ENOMEM to the fork caller.
-            let child_mmap_regions = match mm::AdmittedMap::from_sorted_vec_charged(
-                snap,
-                mm::HeapClass::CoreProcess,
-            ) {
-                Ok(map) => map,
-                Err((snap, _error)) => {
-                    drop(snap);
-                    return Err(ForkError::MemoryAllocationFailed);
-                }
-            };
+            let child_mmap_regions =
+                match mm::AdmittedMap::from_sorted_vec_charged(snap, mm::HeapClass::CoreProcess) {
+                    Ok(map) => map,
+                    Err((snap, _error)) => {
+                        drop(snap);
+                        return Err(ForkError::MemoryAllocationFailed);
+                    }
+                };
 
             let child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
