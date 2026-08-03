@@ -21,7 +21,7 @@ fuzz_runner = ["mm/fuzz_runner", "kcov"]
 kcov = ["coverage/kcov", "kernel_core/kcov"]
 
 [dependencies]
-spin = "0.9"
+spin = "0.12"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "=0.15.4"
 uart_16550 = "0.6"
