@@ -10,7 +10,7 @@ edition = "2021"
 kaslr = []
 
 [dependencies]
-uefi = { version = "0.29", features = ["alloc", "global_allocator", "logger"] }
+uefi = { version = "0.39", features = ["alloc", "global_allocator", "logger"] }
 log = "0.4"
 xmas-elf = "0.9"
 x86_64 = "0.15"
