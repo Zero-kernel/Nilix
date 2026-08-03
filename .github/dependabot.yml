@@ -13,6 +13,17 @@ updates:
       - dependencies
     commit-message:
       prefix: chore(deps)
+    # Keep known-incompatible updates from reopening after maintainer review.
+    # Remove these entries once the pinned compiler/bootloader APIs are migrated.
+    ignore:
+      # 0.15.5 implements Step methods removed by nightly-2025-12-08.
+      - dependency-name: x86_64
+        versions:
+          - 0.15.5
+      # uefi >= 0.30 requires a dedicated SystemTable/Boot Services migration.
+      - dependency-name: uefi
+        update-types:
+          - version-update:semver-major
     groups:
       kernel-workspace-minor-and-patch:
         patterns:
