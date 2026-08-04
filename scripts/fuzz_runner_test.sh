@@ -193,7 +193,8 @@ while true; do
 done
 
 stop_qemu
-tr -d '\r' < "$serial_log" > "$normalized_log"
+# Normalize: remove \r and strip shell prompts from E2E marker lines
+tr -d '\r' < "$serial_log" | sed 's/^.*nilix# \(NILIX_KCOV_E2E_\)/\1/' > "$normalized_log"
 
 case "$run_state" in
     complete) ;;
