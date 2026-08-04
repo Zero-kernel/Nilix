@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 boot-check musl-check test-smp test-smp-4core fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-kcov run-kcov
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 boot-check musl-check test-smp test-smp-4core test-smp-extended stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -19,6 +19,18 @@ MUSL_KERNEL := $(MUSL_TARGET_DIR)/x86_64-unknown-none/release/kernel
 # RF180-59 FIX: the feature artifact's final package/boot input is isolated too.
 MUSL_ESP := $(MUSL_TARGET_DIR)/esp
 MUSL_ESP_DIR := $(CURDIR)/$(MUSL_ESP)/EFI/BOOT
+STRESS_TARGET_DIR := kernel-target/stress
+STRESS_KERNEL := $(STRESS_TARGET_DIR)/x86_64-unknown-none/release/kernel
+STRESS_ESP := esp-stress
+STRESS_ESP_DIR := $(CURDIR)/$(STRESS_ESP)/EFI/BOOT
+STRESS_RUNNER_USER := userspace/stress_runner.elf
+STRESS_RUNNER_EMBEDDED := kernel/src/stress_runner.elf
+KCOV_TARGET_DIR := kernel-target/kcov
+KCOV_KERNEL := $(KCOV_TARGET_DIR)/x86_64-unknown-none/release/kernel
+KCOV_ESP := esp-kcov
+KCOV_ESP_DIR := $(CURDIR)/$(KCOV_ESP)/EFI/BOOT
+KCOV_RUNNER_USER := userspace/fuzz_runner.elf
+KCOV_RUNNER_EMBEDDED := kernel/src/fuzz_runner.elf
 
 all: build
 
@@ -200,42 +212,110 @@ run-clone-test: build-clone-test
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
 
-# Build with KCOV fuzz runner (Phase 2 completion test)
-build-fuzz-runner:
-	@echo "=== 编译 KCOV Fuzz Runner ==="
-	cd userspace && musl-gcc -static -o fuzz_runner.elf fuzz_runner.c
-	cp userspace/fuzz_runner.elf kernel/src/fuzz_runner.elf
+# Build the bounded static-musl workload embedded by the monthly stress kernel.
+build-stress-runner:
+	@echo "=== Building bounded Ring-3 stress workload ==="
+	musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		-o "$(STRESS_RUNNER_USER)" userspace/stress_runner.c
+	cp "$(STRESS_RUNNER_USER)" "$(STRESS_RUNNER_EMBEDDED)"
+	@cmp -s "$(STRESS_RUNNER_USER)" "$(STRESS_RUNNER_EMBEDDED)"
+	@echo "Stress guest SHA-256: $$(sha256sum "$(STRESS_RUNNER_EMBEDDED)" | awk '{print $$1}')"
+	@readelf -h "$(STRESS_RUNNER_EMBEDDED)" | grep "Entry\|Type"
 
-	@echo "=== 构建 Bootloader (UEFI) ==="
+# Keep feature-specific Cargo output and the packaged ESP isolated from normal
+# and KCOV builds, so a reused artifact can never boot the wrong guest program.
+build-stress: build-stress-runner
+	@echo "=== Building bootloader for Ring-3 stress workload ==="
 	cd bootloader && \
 	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
-	@echo "=== 构建 Kernel (Bare Metal) with KCOV ==="
+	@echo "=== Building isolated Ring-3 stress kernel ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
-	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,fuzz_runner
+	CARGO_TARGET_DIR=../$(STRESS_TARGET_DIR) \
+	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features stress_runner
 
-	@echo "=== 准备 EFI ESP 目录 ==="
-	mkdir -p $(ESP_DIR)
+	@echo "=== Preparing isolated stress ESP ==="
+	mkdir -p "$(STRESS_ESP_DIR)"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(STRESS_ESP_DIR)/BOOTX64.EFI"
+	cp "$(STRESS_KERNEL)" "$(STRESS_ESP)/kernel.elf"
+	@cmp -s "$(STRESS_KERNEL)" "$(STRESS_ESP)/kernel.elf"
+	@echo "Stress kernel SHA-256: $$(sha256sum "$(STRESS_ESP)/kernel.elf" | awk '{print $$1}')"
+	@readelf -h "$(STRESS_ESP)/kernel.elf" | grep "Entry\|Type"
 
-	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
-	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+run-stress: QEMU_ESP := $(STRESS_ESP)
+run-stress: build-stress ensure-ext3-image
+	@echo "=== Starting configured combined Ring-3 stress profile ==="
+	@STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 bash scripts/stress_test.sh "$(STRESS_ESP)"
 
-	@echo "复制 Kernel 到 ESP/kernel.elf"
-	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+# Compatibility alias for the deterministic KCOV guest executor build.
+build-fuzz-runner: build-kcov
 
-	@echo "=== 内核信息 ==="
-	@readelf -h esp/kernel.elf | grep "Entry\|Type"
-	@echo "=== Fuzz Runner ELF 信息 ==="
-	@readelf -h kernel/src/fuzz_runner.elf | grep "Entry\|Type"
-	@echo "=== 构建完成（KCOV Fuzz Runner模式）==="
-
-# Run fuzz runner (Phase 2 verification)
+# Run the deterministic KCOV guest executor interactively.
+run-fuzz-runner: QEMU_ESP := $(KCOV_ESP)
 run-fuzz-runner: build-fuzz-runner
 	@echo "=== 启动内核（KCOV Fuzz Runner模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
+
+# === Phase 7: Syzkaller-Style Coverage-Guided Fuzzing ===
+
+# Build the host-side syzkaller-style fuzzer (runs on Linux, not bare-metal)
+build-syz-fuzzer:
+	@echo "=== Building Syzkaller-Style Host Fuzzer ==="
+	cd userspace/nilix-syz-fuzzer && \
+	chmod +x build-isolated.sh && \
+	./build-isolated.sh
+	@echo "=== Host Fuzzer Built: userspace/nilix-syz-fuzzer/target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer ==="
+
+# Build the guest executor for syzkaller fuzzing
+build-syz-executor:
+	@echo "=== Building Syzkaller Guest Executor ==="
+	cd userspace && \
+	musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		-o nilix_syz_executor.elf nilix_syz_executor.c
+	@echo "=== Guest Executor Built: userspace/nilix_syz_executor.elf ==="
+
+# Run syzkaller-style fuzzing campaign (requires KCOV kernel)
+# Usage: make run-syz-fuzz [DURATION=3600] [WORKERS=4]
+DURATION ?= 3600
+WORKERS ?= 4
+run-syz-fuzz: build-kcov build-syz-executor build-syz-fuzzer
+	@echo "=== Starting Syzkaller-Style Fuzzing Campaign ==="
+	@echo "Duration: $(DURATION)s | Workers: $(WORKERS)"
+	@echo "Kernel: $(KCOV_ESP)/kernel.elf"
+	cd userspace/nilix-syz-fuzzer && \
+	./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
+		--kernel ../../$(KCOV_ESP)/kernel.elf \
+		--corpus-dir ./syz-corpus \
+		--crash-dir ./syz-crashes \
+		--timeout $(DURATION) \
+		--workers $(WORKERS) \
+		--program-timeout 30 \
+		--ovmf $(OVMF_PATH)
+
+# Quick smoke test for syzkaller infrastructure
+test-syz: build-kcov build-syz-executor build-syz-fuzzer
+	@echo "=== Running Syzkaller Infrastructure Smoke Test ==="
+	cd userspace/nilix-syz-fuzzer && \
+	timeout 60 ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
+		--kernel ../../$(KCOV_ESP)/kernel.elf \
+		--corpus-dir ./test-corpus \
+		--crash-dir ./test-crashes \
+		--timeout 60 \
+		--workers 1 \
+		--program-timeout 10 \
+		--ovmf $(OVMF_PATH) \
+		|| true
+	@echo "=== Smoke Test Complete ==="
+	@if [ -d userspace/nilix-syz-fuzzer/test-corpus ]; then \
+		echo "Corpus entries: $$(find userspace/nilix-syz-fuzzer/test-corpus -name 'prog-*.bin' | wc -l)"; \
+	fi
+	@if [ -d userspace/nilix-syz-fuzzer/test-crashes ]; then \
+		echo "Crashes found: $$(find userspace/nilix-syz-fuzzer/test-crashes -name 'crash-*.bin' | wc -l)"; \
+	fi
+
 
 # 通用QEMU参数
 # -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
@@ -664,14 +744,22 @@ lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible abi-c
 # Extended Test Suite - Stress, Performance, Security, SMP
 # ============================================================================
 
-# Stress test suite - catches resource leaks and stability issues
-stress-test: build
-	@echo "=== Running Stress Test Suite ==="
-	@STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+# Stress protocol self-tests reject malformed configs/logs and fake recovery
+# before an expensive QEMU run is allowed to start.
+stress-test-selftest:
+	@echo "=== Running Stress-v2 Host Protocol Self-Tests ==="
+	@bash scripts/stress_test_test.sh
 
-stress-test-extended: build
+# Stress test suite - catches resource leaks and stability issues
+stress-test: build-stress ensure-ext3-image
+	@echo "=== Running Stress Test Suite ==="
+	@bash scripts/stress_test_test.sh
+	@STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh "$(STRESS_ESP)"
+
+stress-test-extended: build-stress ensure-ext3-image
 	@echo "=== Running Extended Stress Test Suite ==="
-	@STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh esp
+	@bash scripts/stress_test_test.sh
+	@STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh "$(STRESS_ESP)"
 
 # Performance regression gate - prevents accidental slowdowns
 test-perf: build
@@ -696,7 +784,7 @@ test-smp-extended: build
 	@bash scripts/extended_smp_test.sh esp
 
 # Comprehensive test suite - all test categories
-test-comprehensive: build ensure-ext3-image
+test-comprehensive: build build-stress ensure-ext3-image
 	@echo "=== Running Comprehensive Test Suite ==="
 	@echo ""
 	@echo "1. Boot health check..."
@@ -721,7 +809,8 @@ test-comprehensive: build ensure-ext3-image
 	@bash scripts/kernel_test.sh esp || exit 1
 	@echo ""
 	@echo "8. Stress test suite..."
-	@STRESS_DURATION=60 bash scripts/stress_test.sh esp || exit 1
+	@bash scripts/stress_test_test.sh || exit 1
+	@STRESS_DURATION=60 bash scripts/stress_test.sh "$(STRESS_ESP)" || exit 1
 	@echo ""
 	@echo "9. Performance regression gate..."
 	@bash scripts/perf_regression_test.sh esp || exit 1
@@ -791,6 +880,8 @@ clean:
 	rm -rf bootloader-target
 	rm -rf hosted-subcrate-target
 	rm -rf esp
+	rm -rf esp-stress
+	rm -f userspace/stress_runner.elf kernel/src/stress_runner.elf
 	rm -f qemu-debug.log qemu-verbose.log qemu-smp.log disk-ext2.img
 
 # AFL++ Fuzzing Targets
@@ -888,57 +979,52 @@ help:
 # KCOV: Kernel Code Coverage for Fuzzing
 # ============================================================================
 
-# Build kernel with KCOV instrumentation enabled
-build-kcov:
+# Rebuild the deterministic guest executor from source on every KCOV build.
+build-kcov-runner:
+	@echo "=== Building deterministic KCOV guest executor ==="
+	musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		-o "$(KCOV_RUNNER_USER)" userspace/fuzz_runner.c
+	cp "$(KCOV_RUNNER_USER)" "$(KCOV_RUNNER_EMBEDDED)"
+	@cmp -s "$(KCOV_RUNNER_USER)" "$(KCOV_RUNNER_EMBEDDED)"
+	@echo "KCOV guest SHA-256: $$(sha256sum "$(KCOV_RUNNER_EMBEDDED)" | awk '{print $$1}')"
+	@readelf -h "$(KCOV_RUNNER_EMBEDDED)" | grep "Entry\|Type"
+
+# Build the isolated kernel artifact containing the freshly built guest.
+build-kcov: build-kcov-runner
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	bash -c "source ~/.cargo/env && CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr"
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with KCOV ==="
 	cd kernel && \
-	bash -c "source ~/.cargo/env && CARGO_TARGET_DIR=../kernel-target \
-	RUSTFLAGS='-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort' \
-	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,fuzz_runner"
+	CARGO_TARGET_DIR=../$(KCOV_TARGET_DIR) \
+	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,fuzz_runner
 
-	@echo "=== 准备 EFI ESP 目录 ==="
-	mkdir -p esp-kcov/EFI/BOOT
+	@echo "=== Preparing isolated KCOV ESP ==="
+	mkdir -p "$(KCOV_ESP_DIR)"
 
-	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
-	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi esp-kcov/EFI/BOOT/BOOTX64.EFI
+	@echo "Copying bootloader to the KCOV ESP"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(KCOV_ESP_DIR)/BOOTX64.EFI"
 
-	@echo "复制 Kernel 到 ESP/kernel.elf"
-	cp kernel-target/x86_64-unknown-none/release/kernel esp-kcov/kernel.elf
+	@echo "Copying the isolated KCOV kernel to the KCOV ESP"
+	cp "$(KCOV_KERNEL)" "$(KCOV_ESP)/kernel.elf"
+	@cmp -s "$(KCOV_KERNEL)" "$(KCOV_ESP)/kernel.elf"
+	@echo "KCOV kernel SHA-256: $$(sha256sum "$(KCOV_ESP)/kernel.elf" | awk '{print $$1}')"
 
 	@echo "=== 内核信息 ==="
-	@readelf -h esp-kcov/kernel.elf | grep "Entry\|Type"
+	@readelf -h "$(KCOV_ESP)/kernel.elf" | grep "Entry\|Type"
 	@echo "=== 构建完成（KCOV模式）==="
-	@echo ""
-	@echo "注意: KCOV instrumentation adds ~5-10% overhead"
-	@echo "查看串口输出中的 '[KCOV] Initialized N edge guards' 消息"
 
-# Build KCOV userspace test program
-userspace/kcov_test: userspace/kcov_test.c
-	@echo "=== Building KCOV test program ==="
-	clang -nostdlib -static -fno-stack-protector -O2 \
-		-o userspace/kcov_test userspace/kcov_test.c
-
-# Run kernel with KCOV in serial mode for automated testing
+# Run the KCOV kernel interactively from its single isolated ESP.
+run-kcov: QEMU_ESP := $(KCOV_ESP)
 run-kcov: build-kcov
 	@echo "=== 启动内核（KCOV模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
-	@echo "查找: [KCOV] Coverage infrastructure initialized"
 	$(QEMU) $(QEMU_COMMON) \
-		-drive format=raw,file=fat:rw:esp-kcov \
 		-nographic
 
-# Run KCOV test: build kernel+test, boot, look for test output
-test-kcov: build-kcov userspace/kcov_test
-	@echo "=== Running KCOV Integration Test ==="
-	@echo "Building test program and booting kernel..."
-	timeout 25 $(QEMU) $(QEMU_COMMON) \
-		-drive format=raw,file=fat:rw:esp-kcov \
-		-nographic -serial stdio || true
-	@echo ""
-	@echo "=== Test Complete ==="
-	@echo "Look for '[KCOV] Coverage infrastructure initialized' in output above"
+# Boot QEMU and validate the deterministic guest executor markers.
+test-kcov: build-kcov
+	bash scripts/fuzz_runner_test.sh "$(KCOV_ESP)"
 
