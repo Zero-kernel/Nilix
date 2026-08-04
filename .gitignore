@@ -7,6 +7,8 @@ userspace-target/
 userspace/fuzzer/target/
 # Cargo.lock: TRACKED for reproducible kernel builds (security-critical deps)
 
+#python
+__pycache__
 
 # Binaries
 /.vscode
@@ -27,6 +29,15 @@ userspace/clippy-userspace-target
 /fuzz/corpus/
 /fuzz/artifacts/*.log
 /hosted-subcrate-review-target/
+
+#docs
+docs/fuzzing
+docs/cabifunc
+docs/skills
+docs/testing
+docs/overview
+docs/review
+docs/design
 
 #no_need
 *.backup
