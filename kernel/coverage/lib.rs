@@ -53,19 +53,25 @@
 //! - SMAP-compliant: all userspace access gated
 
 #![no_std]
-#![feature(allocator_api)]
-
 extern crate alloc;
 extern crate spin;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
-use cpu_local::CpuLocal;
-use spin::{Mutex, Once};
+use spin::Once;
 
 /// Maximum coverage buffer size (4KB = 32K edges).
 pub const KCOV_BUFFER_SIZE: usize = 4096;
+
+/// Failure returned while constructing a task-owned coverage bitmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageAllocError {
+    /// The requested byte length is outside the supported `1..=4096` range.
+    InvalidSize,
+    /// The global allocator could not provide the bitmap backing allocation.
+    AllocationFailed,
+}
 
 /// Coverage buffer: bitmap tracking which edges have been hit
 #[derive(Debug)]
@@ -83,15 +89,17 @@ impl CoverageBuffer {
     ///
     /// The length is immutable and bounded by [`KCOV_BUFFER_SIZE`], which keeps
     /// per-task memory consumption predictable even for hostile callers.
-    pub fn try_new(buffer_size: usize) -> Option<Self> {
+    pub fn try_new(buffer_size: usize) -> Result<Self, CoverageAllocError> {
         if buffer_size == 0 || buffer_size > KCOV_BUFFER_SIZE {
-            return None;
+            return Err(CoverageAllocError::InvalidSize);
         }
 
         let mut bitmap = Vec::new();
-        bitmap.try_reserve_exact(buffer_size).ok()?;
+        bitmap
+            .try_reserve_exact(buffer_size)
+            .map_err(|_| CoverageAllocError::AllocationFailed)?;
         bitmap.resize(buffer_size, 0);
-        Some(Self {
+        Ok(Self {
             bitmap,
             edge_count: 0,
             enabled: false,
@@ -156,6 +164,12 @@ impl CoverageBuffer {
         self.bitmap.len()
     }
 
+    /// Allocator capacity whose complete backing allocation must be accounted.
+    #[inline]
+    pub fn bitmap_capacity(&self) -> usize {
+        self.bitmap.capacity()
+    }
+
     /// Reset coverage data
     pub fn reset(&mut self) {
         self.bitmap.fill(0);
@@ -172,26 +186,90 @@ pub type CurrentTaskRecorder = fn(u32);
 static CURRENT_TASK_RECORDER: Once<CurrentTaskRecorder> = Once::new();
 
 /// Suppresses recursive tracepoints on the same CPU while the recorder bridge runs.
-static RECORDER_ACTIVE: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
+///
+/// A fixed array is deliberate: tracing must never be the first user of a lazy,
+/// heap-backed `CpuLocal` slab while the allocator or a kernel lock is held.
+static RECORDER_ACTIVE: [AtomicBool; cpu_local::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; cpu_local::MAX_CPUS];
 
-struct RecorderGuard;
+/// Preemption pin binding all per-CPU accesses in one recorder invocation to a
+/// stable logical CPU. The retry closes the sample-before-disable migration
+/// window; dropping the guard restores the exact prior nesting depth.
+struct StableCpuPin {
+    cpu_id: usize,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl StableCpuPin {
+    #[inline]
+    fn new() -> Self {
+        loop {
+            let cpu_id = cpu_local::current_cpu_id();
+            if cpu_local::current_cpu_id() != cpu_id {
+                core::hint::spin_loop();
+                continue;
+            }
+
+            let per_cpu = cpu_local::PER_CPU_DATA
+                .get_cpu(cpu_id)
+                .unwrap_or_else(|| panic!("KCOV: missing per-CPU slot for CPU {cpu_id}"));
+            per_cpu.preempt_disable();
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+            if cpu_local::current_cpu_id() == cpu_id {
+                return Self {
+                    cpu_id,
+                    _not_send: PhantomData,
+                };
+            }
+
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            per_cpu.preempt_enable();
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn per_cpu(&self) -> &'static cpu_local::PerCpuData {
+        cpu_local::PER_CPU_DATA
+            .get_cpu(self.cpu_id)
+            .unwrap_or_else(|| panic!("KCOV: missing pinned per-CPU slot for CPU {}", self.cpu_id))
+    }
+}
+
+impl Drop for StableCpuPin {
+    #[inline]
+    fn drop(&mut self) {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.per_cpu().preempt_enable();
+    }
+}
+
+struct RecorderGuard {
+    cpu_id: usize,
+    _pin: StableCpuPin,
+}
 
 impl RecorderGuard {
     #[inline]
     fn try_enter() -> Option<Self> {
-        let already_active = RECORDER_ACTIVE.with(|active| active.swap(true, Ordering::Relaxed));
-        if already_active {
-            None
-        } else {
-            Some(Self)
+        let pin = StableCpuPin::new();
+        if pin.per_cpu().in_irq() {
+            return None;
         }
+
+        let cpu_id = pin.cpu_id;
+        RECORDER_ACTIVE[cpu_id]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self { cpu_id, _pin: pin })
     }
 }
 
 impl Drop for RecorderGuard {
     #[inline]
     fn drop(&mut self) {
-        RECORDER_ACTIVE.with(|active| active.store(false, Ordering::Relaxed));
+        RECORDER_ACTIVE[self.cpu_id].store(false, Ordering::Release);
     }
 }
 
@@ -203,9 +281,10 @@ pub fn init_coverage(recorder: CurrentTaskRecorder) {
         "KCOV current-task recorder registered more than once"
     );
 
-    // CpuLocal allocates and initializes the complete MAX_CPUS slot array through
-    // one global Once. The BSP call therefore prepares every future AP slot too.
-    RECORDER_ACTIVE.force_init();
+    // The recursion state itself is static. Pre-initialize only the shared
+    // preemption metadata used by the stable-CPU guard, while still in boot
+    // process context, so the first tracepoint cannot allocate.
+    cpu_local::PER_CPU_DATA.force_init();
     COVERAGE_ENABLED.store(true, Ordering::Release);
 }
 
@@ -215,27 +294,13 @@ pub fn is_coverage_enabled() -> bool {
     COVERAGE_ENABLED.load(Ordering::Acquire)
 }
 
-/// Enable coverage for the current task (allocates buffer)
-///
-/// # Returns
-/// - `Some(buffer)`: Successfully allocated
-/// - `None`: Allocation failed
-pub fn enable_coverage(buffer_size: usize) -> Option<Arc<Mutex<CoverageBuffer>>> {
-    if !is_coverage_enabled() {
-        return None;
-    }
-
-    let buffer = CoverageBuffer::try_new(buffer_size)?;
-    Arc::try_new(Mutex::new(buffer)).ok()
-}
-
 /// Record an edge hit for the current task
 ///
 /// This is the hot path, called from `record_edge!()` macro.
 /// Must be IRQ-safe, no allocations, no blocking.
 #[inline]
 pub fn record_edge_for_current(edge_id: u32) {
-    if !is_coverage_enabled() || cpu_local::current_cpu().in_irq() {
+    if !is_coverage_enabled() {
         return;
     }
 
@@ -362,18 +427,28 @@ mod tests {
 
     #[test]
     fn test_explicit_buffer_size_is_enforced() {
-        assert!(CoverageBuffer::try_new(0).is_none());
-        assert!(CoverageBuffer::try_new(KCOV_BUFFER_SIZE + 1).is_none());
+        assert!(matches!(
+            CoverageBuffer::try_new(0),
+            Err(CoverageAllocError::InvalidSize)
+        ));
+        assert!(matches!(
+            CoverageBuffer::try_new(KCOV_BUFFER_SIZE + 1),
+            Err(CoverageAllocError::InvalidSize)
+        ));
 
         let mut buf = CoverageBuffer::try_new(17).expect("small KCOV buffer");
         assert_eq!(buf.bitmap_len(), 17);
+        assert!(buf.bitmap_capacity() >= buf.bitmap_len());
         let mut snapshot = [0u8; 17];
         buf.enable();
         buf.record_edge(0);
         buf.record_edge((17 * 8 - 1) as u32);
         assert_eq!(buf.copy_to_user(&mut snapshot), snapshot.len());
         assert_eq!(buf.edge_count(), 2);
-        assert_eq!(snapshot.iter().map(|byte| byte.count_ones()).sum::<u32>(), 2);
+        assert_eq!(
+            snapshot.iter().map(|byte| byte.count_ones()).sum::<u32>(),
+            2
+        );
     }
 
     #[test]
@@ -387,9 +462,30 @@ mod tests {
     }
 
     #[test]
-    fn test_current_task_recorder_suppresses_recursion() {
+    fn test_current_task_recorder_suppresses_recursion_restores_preemption_and_rejects_irq() {
         init_coverage(recursive_test_recorder);
+        let before = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
         record_edge_for_current(0x1234_5678);
         assert_eq!(RECORDED_EDGE.load(Ordering::Relaxed), 0x1234_5678);
+        assert_eq!(
+            cpu_local::current_cpu()
+                .preempt_count
+                .load(Ordering::Relaxed),
+            before
+        );
+
+        RECORDED_EDGE.store(0, Ordering::Relaxed);
+        cpu_local::current_cpu().irq_enter();
+        record_edge_for_current(0xfeed_beef);
+        cpu_local::current_cpu().irq_exit();
+        assert_eq!(RECORDED_EDGE.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            cpu_local::current_cpu()
+                .preempt_count
+                .load(Ordering::Relaxed),
+            before
+        );
     }
 }

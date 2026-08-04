@@ -81,9 +81,13 @@ pub enum HeapClass {
     /// cross-ns admission failures inside this class (fail-closed, no
     /// spillover into other classes).
     NetnsConfig = 15,
+    /// Retained per-task KCOV bitmaps and transient dump snapshots. Keeping
+    /// fuzzing memory isolated prevents hostile coverage churn from starving
+    /// process construction or ordinary blocking I/O.
+    Coverage = 16,
 }
 
-pub const HEAP_CLASS_COUNT: usize = 16;
+pub const HEAP_CLASS_COUNT: usize = 17;
 
 impl HeapClass {
     /// D1-RES: authoritative class table for exhaustive boundary tests and
@@ -106,6 +110,7 @@ impl HeapClass {
         Self::FilesystemIo,
         Self::Futex,
         Self::NetnsConfig,
+        Self::Coverage,
     ];
 
     #[inline]
@@ -149,6 +154,7 @@ impl HeapClass {
             // 512 KiB supports ~256 ARP entries (28 bytes each) + routing tables
             // + per-ns firewall metadata + allocator slack.
             Self::NetnsConfig => 512 * 1024,
+            Self::Coverage => 256 * 1024,
         }
     }
 }
@@ -199,6 +205,7 @@ static GLOBAL_STATE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static TEST_LEDGER_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static CLASS_STATES: [AtomicU64; HEAP_CLASS_COUNT] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -873,7 +880,7 @@ pub fn run_heap_admission_boundary_self_test() {
 
     let global_before = snapshot();
 
-    // 1) Per-class gate: for all 15 classes, fill the remaining class
+    // 1) Per-class gate: for every class, fill the remaining class
     //    headroom exactly, prove the next byte is rejected with ClassLimit
     //    (not a panic), then release and prove exact restoration.
     for class in HeapClass::ALL {

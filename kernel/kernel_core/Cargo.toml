@@ -48,3 +48,6 @@ compliance = { path = "../compliance" }
 livepatch = { path = "../livepatch" }
 klog = { path = "../klog" }
 coverage = { path = "../coverage", optional = true }
+
+[dev-dependencies]
+cpu_local = { path = "../cpu_local", features = ["host_harness"] }

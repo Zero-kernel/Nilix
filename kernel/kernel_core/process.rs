@@ -13,6 +13,8 @@ use alloc::{
 use cap::CapTable;
 use core::any::Any;
 use core::ptr::NonNull;
+#[cfg(feature = "kcov")]
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
@@ -1596,6 +1598,41 @@ pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     r
 }
 
+#[cfg(feature = "kcov")]
+#[derive(Debug)]
+pub(crate) struct TaskKcovState {
+    /// The mutex and its Vec must be destroyed before admission is released.
+    buffer: Mutex<coverage::CoverageBuffer>,
+    _bitmap_charge: HeapCharge,
+}
+
+#[cfg(feature = "kcov")]
+impl TaskKcovState {
+    /// Allocate and account a private, not-yet-published task coverage bitmap.
+    pub(crate) fn try_new(size: usize) -> Result<Self, coverage::CoverageAllocError> {
+        if size == 0 || size > coverage::KCOV_BUFFER_SIZE {
+            return Err(coverage::CoverageAllocError::InvalidSize);
+        }
+        let estimated = vec_charge_bytes::<u8>(size)
+            .map_err(|_| coverage::CoverageAllocError::AllocationFailed)?;
+        let mut reservation = try_reserve_heap(HeapClass::Coverage, estimated)
+            .map_err(|_| coverage::CoverageAllocError::AllocationFailed)?;
+        let buffer = coverage::CoverageBuffer::try_new(size)?;
+        let actual = vec_charge_bytes::<u8>(buffer.bitmap_capacity())
+            .map_err(|_| coverage::CoverageAllocError::AllocationFailed)?;
+        reservation
+            .resize(actual)
+            .map_err(|_| coverage::CoverageAllocError::AllocationFailed)?;
+        let bitmap_charge = reservation.commit().unwrap_or_else(|error| {
+            panic!("KCOV bitmap reservation commit corrupt after allocation: {error:?}")
+        });
+        Ok(Self {
+            buffer: Mutex::new(buffer),
+            _bitmap_charge: bitmap_charge,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Process {
     /// 进程ID（唯一标识，也是 Linux 语义中的 tid）
@@ -2160,7 +2197,7 @@ pub struct Process {
     /// during task execution. Used for coverage-guided fuzzing.
     /// None = coverage not initialized for this task.
     #[cfg(feature = "kcov")]
-    pub coverage_buffer: Option<alloc::sync::Arc<spin::Mutex<coverage::CoverageBuffer>>>,
+    kcov: Option<TaskKcovState>,
 
     /// Aggregate lifetime charge for construction-time shared control blocks
     /// and the retained process-name buffer. The outer PCB Arc has an
@@ -2586,9 +2623,31 @@ impl Process {
             teardown_done: core::sync::atomic::AtomicBool::new(false),
             // KCOV: coverage not initialized at birth
             #[cfg(feature = "kcov")]
-            coverage_buffer: None,
+            kcov: None,
             _heap_charge: heap_charge,
         }
+    }
+
+    #[cfg(feature = "kcov")]
+    #[inline]
+    pub(crate) fn task_kcov_initialized(&self) -> bool {
+        self.kcov.is_some()
+    }
+
+    /// Install a fully allocated private KCOV state exactly once.
+    ///
+    /// Returning the rejected owner lets the syscall drop its bitmap and heap
+    /// charge after releasing the PCB lock.
+    #[cfg(feature = "kcov")]
+    pub(crate) fn install_task_kcov(
+        &mut self,
+        state: TaskKcovState,
+    ) -> Result<usize, TaskKcovState> {
+        if self.kcov.is_some() {
+            return Err(state);
+        }
+        self.kcov = Some(state);
+        Ok(task_kcov_switch_token(self))
     }
 
     /// 分配新的文件描述符
@@ -4257,6 +4316,61 @@ static KPTI_CR3_UPDATE: Once<KptiCr3UpdateCallback> = Once::new();
 static CURRENT_PID: cpu_local::CpuLocal<AtomicUsize> =
     cpu_local::CpuLocal::new(|| AtomicUsize::new(0));
 
+/// Raw pointer to the coverage mutex owned by the task currently executing on
+/// each CPU. A fixed array keeps the recorder hot path allocation-free.
+#[cfg(feature = "kcov")]
+static CURRENT_KCOV_BUFFER: [AtomicPtr<Mutex<coverage::CoverageBuffer>>; cpu_local::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; cpu_local::MAX_CPUS];
+
+/// Stable-CPU preemption pin for task-token publication and access.
+#[cfg(feature = "kcov")]
+struct KcovCpuPin {
+    cpu_id: usize,
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "kcov")]
+impl KcovCpuPin {
+    #[inline]
+    fn new() -> Self {
+        loop {
+            let cpu_id = cpu_local::current_cpu_id();
+            if cpu_local::current_cpu_id() != cpu_id {
+                core::hint::spin_loop();
+                continue;
+            }
+
+            let per_cpu = cpu_local::PER_CPU_DATA
+                .get_cpu(cpu_id)
+                .unwrap_or_else(|| panic!("KCOV task token: missing per-CPU slot {cpu_id}"));
+            per_cpu.preempt_disable();
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            if cpu_local::current_cpu_id() == cpu_id {
+                return Self {
+                    cpu_id,
+                    _not_send: core::marker::PhantomData,
+                };
+            }
+
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            per_cpu.preempt_enable();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(feature = "kcov")]
+impl Drop for KcovCpuPin {
+    #[inline]
+    fn drop(&mut self) {
+        let per_cpu = cpu_local::PER_CPU_DATA
+            .get_cpu(self.cpu_id)
+            .unwrap_or_else(|| panic!("KCOV task token: lost per-CPU slot {}", self.cpu_id));
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        per_cpu.preempt_enable();
+    }
+}
+
 /// M4-1 (force-init): pre-allocate the `CURRENT_PID` per-CPU slab in process context
 /// before IRQs are enabled. `current_pid()` is called from the raw timer ISR
 /// (arch/interrupts.rs) BEFORE `on_scheduler_tick`; without this the first AP timer IRQ
@@ -5012,32 +5126,265 @@ pub fn current_pid() -> Option<ProcessId> {
     }
 }
 
+/// Non-blocking current-task KCOV access failure.
+#[cfg(feature = "kcov")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KcovAccessError {
+    NotInitialized,
+    Contended,
+}
+
+/// Capture the immutable token for a PCB while its lock is already held.
+///
+/// Once installed, task KCOV state is never moved or removed. The PCB itself is
+/// stable inside its process Arc, so this pointer remains valid until teardown.
+#[inline]
+pub fn task_kcov_switch_token(proc: &Process) -> usize {
+    #[cfg(feature = "kcov")]
+    {
+        return proc
+            .kcov
+            .as_ref()
+            .map(|state| &state.buffer as *const Mutex<coverage::CoverageBuffer> as usize)
+            .unwrap_or(0);
+    }
+
+    #[cfg(not(feature = "kcov"))]
+    {
+        let _ = proc;
+        0
+    }
+}
+
+/// Publish the selected task's KCOV mutex for this CPU.
+///
+/// The scheduler calls this at the final switch boundary, after scheduler-tail
+/// hooks, so kernel work before the actual switch remains attributed to the
+/// outgoing task. `sys_kcov_init` also calls it after first-time installation
+/// for the already-running current task.
+#[inline]
+pub fn publish_current_kcov_token(token: usize) {
+    #[cfg(feature = "kcov")]
+    {
+        let pin = KcovCpuPin::new();
+        CURRENT_KCOV_BUFFER[pin.cpu_id].store(
+            token as *mut Mutex<coverage::CoverageBuffer>,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(not(feature = "kcov"))]
+    let _ = token;
+}
+
+/// Run a short, allocation-free operation against the selected task's bitmap.
+///
+/// This path never consults `PROCESS_TABLE` and never locks a PCB. Preemption is
+/// pinned while the raw token is loaded and used, and `try_lock` makes recursive
+/// or concurrent KCOV access fail closed instead of spinning.
+#[cfg(feature = "kcov")]
+pub fn try_with_current_kcov<R>(
+    f: impl FnOnce(&mut coverage::CoverageBuffer) -> R,
+) -> Result<R, KcovAccessError> {
+    let pin = KcovCpuPin::new();
+    let raw = CURRENT_KCOV_BUFFER[pin.cpu_id].load(Ordering::Acquire);
+    if raw.is_null() {
+        return Err(KcovAccessError::NotInitialized);
+    }
+
+    // SAFETY: tokens point only at installed, immovable TaskKcovState mutexes.
+    // The current task remains on-CPU while `pin` is live, and task teardown is
+    // gated by `on_cpu`, so the PCB and this field cannot be destroyed here.
+    let buffer = unsafe { &*raw };
+    let Some(mut coverage) = buffer.try_lock() else {
+        return Err(KcovAccessError::Contended);
+    };
+    Ok(f(&mut coverage))
+}
+
 /// Best-effort KCOV recorder bridge for the task running on this CPU.
 ///
 /// The coverage crate cannot depend on kernel_core without creating a Cargo
 /// dependency cycle, so it calls this function through a boot-registered
-/// function pointer. Every lock acquisition is non-blocking: tracepoints may be
-/// reached from code that already holds the process table, PCB, or coverage
-/// buffer lock, and dropping an edge is preferable to recursive deadlock.
+/// function pointer. Unrelated process-table and PCB locks are deliberately
+/// absent; only direct KCOV-buffer contention may drop an edge.
 #[cfg(feature = "kcov")]
 #[inline]
 pub fn record_kcov_edge_for_current(edge_id: u32) {
-    let Some(pid) = current_pid() else {
-        return;
-    };
-    let Some(Some(process)) = try_get_process(pid) else {
-        return;
-    };
-    let Some(proc) = process.try_lock() else {
-        return;
-    };
-    let Some(buffer) = proc.coverage_buffer.as_ref() else {
-        return;
-    };
-    let Some(mut coverage) = buffer.try_lock() else {
-        return;
-    };
-    coverage.record_edge(edge_id);
+    let _ = try_with_current_kcov(|coverage| coverage.record_edge(edge_id));
+}
+
+#[cfg(all(test, feature = "kcov"))]
+mod kcov_task_tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn class_snapshots() -> [mm::HeapAdmissionSnapshot; mm::HEAP_CLASS_COUNT] {
+        core::array::from_fn(|index| mm::heap_class_snapshot(HeapClass::ALL[index]))
+    }
+
+    #[test]
+    fn task_kcov_is_accounted_nonblocking_task_local_and_noninherited() {
+        let _serial = TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        publish_current_kcov_token(0);
+
+        let baseline = class_snapshots();
+        let parent = Mutex::new(Process::new(
+            0x4b43_4f56,
+            1,
+            alloc::string::String::from("kcov-parent"),
+            120,
+        ));
+        let parent_state = TaskKcovState::try_new(17).expect("parent KCOV allocation");
+        let parent_charge = parent_state._bitmap_charge.bytes();
+        let parent_token = parent
+            .lock()
+            .install_task_kcov(parent_state)
+            .expect("first parent KCOV install");
+
+        let installed = class_snapshots();
+        for (index, class) in HeapClass::ALL.into_iter().enumerate() {
+            if class == HeapClass::Coverage {
+                assert_eq!(
+                    installed[index].committed_bytes,
+                    baseline[index].committed_bytes + parent_charge
+                );
+                assert_eq!(
+                    installed[index].reserved_bytes,
+                    baseline[index].reserved_bytes
+                );
+            } else {
+                assert_eq!(
+                    installed[index], baseline[index],
+                    "KCOV allocation changed unrelated heap class {class:?}"
+                );
+            }
+        }
+
+        publish_current_kcov_token(parent_token);
+        try_with_current_kcov(coverage::CoverageBuffer::enable).expect("enable parent KCOV");
+
+        // The recorder must work while the parent PCB lock is owned: it uses
+        // only the published bitmap token and therefore cannot recurse here.
+        {
+            let parent_guard = parent.lock();
+            let before = try_with_current_kcov(|buffer| buffer.edge_count())
+                .expect("read parent count while PCB locked");
+            record_kcov_edge_for_current(7);
+            let after = try_with_current_kcov(|buffer| buffer.edge_count())
+                .expect("record parent edge while PCB locked");
+            assert_eq!(after, before + 1);
+            drop(parent_guard);
+        }
+
+        // Direct bitmap contention must be try-only and mutation-free.
+        let before_contention = try_with_current_kcov(|buffer| buffer.edge_count())
+            .expect("parent count before contention");
+        {
+            let parent_guard = parent.lock();
+            let held_buffer = parent_guard
+                .kcov
+                .as_ref()
+                .expect("installed parent KCOV")
+                .buffer
+                .lock();
+            assert_eq!(
+                try_with_current_kcov(|buffer| {
+                    buffer.record_edge(8);
+                }),
+                Err(KcovAccessError::Contended)
+            );
+            drop(held_buffer);
+            drop(parent_guard);
+        }
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count())
+                .expect("parent count after contention"),
+            before_contention
+        );
+
+        // A second initialization is rejected without replacing or clearing
+        // the original bitmap. The rejected owner is dropped outside the lock.
+        let duplicate = TaskKcovState::try_new(17).expect("duplicate KCOV candidate");
+        let rejected = {
+            let mut parent_guard = parent.lock();
+            parent_guard
+                .install_task_kcov(duplicate)
+                .expect_err("duplicate KCOV install must fail")
+        };
+        drop(rejected);
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count()).expect("original bitmap retained"),
+            before_contention
+        );
+
+        // A freshly constructed child starts without KCOV state; installing a
+        // separate bitmap then proves switch-token attribution is task-local.
+        let child = Mutex::new(Process::new(
+            0x4b43_4f57,
+            0x4b43_4f56,
+            alloc::string::String::from("kcov-child"),
+            120,
+        ));
+        assert_eq!(task_kcov_switch_token(&child.lock()), 0);
+        let child_token = child
+            .lock()
+            .install_task_kcov(TaskKcovState::try_new(17).expect("child KCOV allocation"))
+            .expect("first child KCOV install");
+        publish_current_kcov_token(child_token);
+        try_with_current_kcov(coverage::CoverageBuffer::enable).expect("enable child KCOV");
+        record_kcov_edge_for_current(47);
+        let child_count =
+            try_with_current_kcov(|buffer| buffer.edge_count()).expect("child edge count");
+        assert_eq!(child_count, 1);
+
+        publish_current_kcov_token(parent_token);
+        record_kcov_edge_for_current(31);
+        let parent_count =
+            try_with_current_kcov(|buffer| buffer.edge_count()).expect("parent edge count");
+        assert_eq!(parent_count, before_contention + 1);
+        publish_current_kcov_token(child_token);
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count()).expect("child remains isolated"),
+            child_count
+        );
+
+        publish_current_kcov_token(0);
+        drop(child);
+        drop(parent);
+        assert_eq!(
+            class_snapshots(),
+            baseline,
+            "KCOV teardown leaked admission"
+        );
+
+        // Exhaust only the dedicated Coverage class. Failure must neither
+        // allocate/publish state nor perturb the already-full snapshot.
+        let coverage_before = mm::heap_class_snapshot(HeapClass::Coverage);
+        let headroom = coverage_before
+            .capacity_bytes
+            .checked_sub(coverage_before.committed_bytes + coverage_before.reserved_bytes)
+            .expect("valid Coverage class snapshot");
+        let exhaustion = try_reserve_heap(HeapClass::Coverage, headroom)
+            .expect("fill remaining Coverage class headroom");
+        let full = mm::heap_class_snapshot(HeapClass::Coverage);
+        assert!(matches!(
+            TaskKcovState::try_new(1),
+            Err(coverage::CoverageAllocError::AllocationFailed)
+        ));
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Coverage), full);
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count()),
+            Err(KcovAccessError::NotInitialized)
+        );
+        drop(exhaustion);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Coverage),
+            coverage_before
+        );
+    }
 }
 
 /// R106-1 FIX: 获取当前进程的 generation 值。

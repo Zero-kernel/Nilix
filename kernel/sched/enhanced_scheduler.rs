@@ -670,6 +670,7 @@ struct PreparedSwitch {
     next_fs_base: u64,
     next_gs_base: u64,
     next_wd_handle: Option<WatchdogHandle>,
+    next_kcov_token: usize,
 }
 
 #[inline]
@@ -2401,6 +2402,7 @@ impl Scheduler {
         let next_fs_base = next.fs_base;
         let next_gs_base = next.gs_base;
         let next_wd_handle = next.watchdog_handle;
+        let next_kcov_token = process::task_kcov_switch_token(&next);
         let next_generation = next.generation;
 
         if let Some(old) = old.as_mut() {
@@ -2437,6 +2439,7 @@ impl Scheduler {
             next_fs_base,
             next_gs_base,
             next_wd_handle,
+            next_kcov_token,
         })
     }
 
@@ -2474,11 +2477,13 @@ impl Scheduler {
                 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
                 Msr::new(MSR_FS_BASE).write(prepared.next_fs_base);
                 Msr::new(MSR_KERNEL_GS_BASE).write(prepared.next_gs_base);
+                process::publish_current_kcov_token(prepared.next_kcov_token);
                 switch_to_user(prepared.old_ctx_ptr, prepared.next_ctx_ptr);
             }
         } else {
             unsafe {
                 assert_kernel_context(prepared.next_ctx_ptr);
+                process::publish_current_kcov_token(prepared.next_kcov_token);
                 switch_context(prepared.old_ctx_ptr, prepared.next_ctx_ptr);
             }
         }

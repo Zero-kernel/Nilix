@@ -873,9 +873,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         kernel_core::rcu::force_init_rcu_locals();
         #[cfg(feature = "kcov")]
         {
-            // init_coverage force-initializes one CpuLocal slab containing every
-            // possible CPU slot. A single BSP call therefore covers all APs before
-            // start_aps(), with no first-trace heap allocation in IRQ context.
+            // KCOV recursion state is a fixed allocation-free CPU array. Register
+            // the task bridge here, after BSP per-CPU preemption metadata exists,
+            // so the first tracepoint cannot trigger lazy allocation.
             coverage::init_coverage(kernel_core::process::record_kcov_edge_for_current);
             klog_always!("[KCOV] Coverage infrastructure initialized");
         }
