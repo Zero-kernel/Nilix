@@ -2,7 +2,7 @@ name: Comprehensive Kernel Fuzzing
 
 on:
   schedule:
-    - cron: '0 2 * * 0'    # Weekly KCOV build and pipeline smoke
+    - cron: '0 2 * * 0'    # Weekly KCOV guest E2E and pipeline smoke
     - cron: '0 2 * * *'    # Daily cargo-fuzz targets
 
   workflow_dispatch:
@@ -14,8 +14,8 @@ on:
         type: choice
         options:
           - targets  # Cargo-fuzz libFuzzer targets
-          - smoke    # KCOV build + CI plumbing smoke (no fuzz evidence)
-          - both     # Run targets and the smoke job
+          - smoke    # QEMU KCOV E2E + independent zero-execution simulator smoke
+          - both     # Targets + QEMU KCOV E2E + zero-execution simulator smoke
       timeout:
         description: 'Seconds per cargo-fuzz target (1-1200)'
         required: false
@@ -26,8 +26,11 @@ on:
       - main
     paths:
       - 'kernel/**'
+      - 'userspace/fuzz_runner.c'
       - 'userspace/fuzzer/**'
       - 'fuzz/**'
+      - 'scripts/fuzz_runner_test.sh'
+      - 'Makefile'
       - '.github/workflows/fuzz.yml'
 
 permissions: {}
@@ -66,10 +69,60 @@ jobs:
       - name: Lint fuzz tools
         run: cargo clippy --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 
-  # This job validates the KCOV build and CI plumbing. It executes no fuzz
-  # input and cannot produce candidate metadata or crash artifacts.
+  # This is a deterministic executor regression test, not a fuzz campaign. It
+  # boots a real Nilix guest and proves that two syscall programs produce
+  # non-zero, distinct, resettable KCOV bitmaps.
+  kcov-qemu-e2e:
+    name: KCOV Guest Executor E2E (QEMU)
+    needs: fuzz-tools-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'both') ||
+      github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src
+
+      - name: Install QEMU and guest build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf build-essential musl-tools
+
+      - name: Cache KCOV build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bootloader-target/
+            kernel-target/kcov/
+          key: ${{ runner.os }}-cargo-kcov-${{ hashFiles('**/Cargo.lock', 'userspace/fuzz_runner.c') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-kcov-
+
+      - name: Test KCOV host logic and exported macro
+        run: cargo test --locked --manifest-path kernel/coverage/Cargo.toml --features kcov
+
+      - name: Run real-QEMU KCOV executor E2E
+        env:
+          KERNEL_TEST_TIMEOUT: '120'
+        run: make test-kcov
+
+  # The simulator below validates dashboard plumbing only. It performs zero
+  # kernel executions and cannot produce candidate metadata or crash artifacts.
   fuzz-pipeline-smoke:
-    name: KCOV Build and Fuzz-Pipeline Smoke
+    name: Fuzz-Pipeline Smoke (Zero Kernel Executions)
     needs: fuzz-tools-test
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -87,28 +140,17 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2025-12-08
-          components: rust-src
 
-      - name: Install QEMU and dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf build-essential
-
-      - name: Cache cargo build
+      - name: Cache smoke build
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-kcov-${{ hashFiles('**/Cargo.lock') }}
+            userspace/fuzzer/target/
+          key: ${{ runner.os }}-fuzz-smoke-${{ hashFiles('userspace/fuzzer/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-kcov-
-
-      - name: Build KCOV-instrumented kernel
-        run: |
-          make build-kcov
-          test -f esp-kcov/kernel.elf
+            ${{ runner.os }}-fuzz-smoke-
 
       - name: Build fuzz-pipeline smoke simulator
         run: cargo build --locked --release --manifest-path userspace/fuzzer/Cargo.toml --bin fuzz-pipeline-smoke --target x86_64-unknown-linux-gnu
@@ -454,7 +496,7 @@ jobs:
 
   aggregate-report:
     name: Aggregate Report
-    needs: [fuzz-tools-test, fuzz-pipeline-smoke, cargo-fuzz-targets, candidate-reporting]
+    needs: [fuzz-tools-test, kcov-qemu-e2e, fuzz-pipeline-smoke, cargo-fuzz-targets, candidate-reporting]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -469,6 +511,7 @@ jobs:
       - name: Generate aggregate report
         env:
           TOOLS_RESULT: ${{ needs.fuzz-tools-test.result }}
+          KCOV_E2E_RESULT: ${{ needs.kcov-qemu-e2e.result }}
           SMOKE_RESULT: ${{ needs.fuzz-pipeline-smoke.result }}
           CARGO_RESULT: ${{ needs.cargo-fuzz-targets.result }}
           REPORTING_RESULT: ${{ needs.candidate-reporting.result }}
@@ -495,7 +538,8 @@ jobs:
             echo "## Job status"
             echo
             echo "- Fuzz tool tests: $TOOLS_RESULT"
-            echo "- KCOV/pipeline smoke: $SMOKE_RESULT"
+            echo "- KCOV QEMU executor E2E: $KCOV_E2E_RESULT"
+            echo "- Fuzz-pipeline smoke (zero kernel executions): $SMOKE_RESULT"
             echo "- Cargo-fuzz matrix: $CARGO_RESULT"
             echo "- Opaque candidate reporting: $REPORTING_RESULT"
             echo

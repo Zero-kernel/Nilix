@@ -1,273 +1,463 @@
+#define _GNU_SOURCE
+
 /*
- * Nilix KCOV Test Runner - Phase 2 Completion
+ * Deterministic Nilix KCOV guest executor test.
  *
- * Minimal test harness that runs inside Nilix to verify KCOV integration.
- * This is a simpler version of the Rust executor designed to run natively
- * in the Nilix userspace environment.
- *
- * Tests:
- * 1. Initialize KCOV
- * 2. Enable coverage collection
- * 3. Execute a sequence of syscalls
- * 4. Dump coverage and verify edge count > 0
- * 5. Report results
+ * This is an integration gate for the syscall executor and KCOV data path. It
+ * is deliberately not a fuzz campaign: two fixed syscall programs exercise
+ * coverage collection, reset, disabled collection, and repeatability inside a
+ * real QEMU guest.
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
-#include <errno.h>
 
-// KCOV syscall numbers
-#define SYS_KCOV_INIT    520
-#define SYS_KCOV_ENABLE  521
-#define SYS_KCOV_DISABLE 522
-#define SYS_KCOV_DUMP    523
-#define SYS_KCOV_RESET   524
+#define NILIX_SYS_WRITE 1
+#define NILIX_SYS_BRK 12
+#define NILIX_SYS_GETPID 39
+#define NILIX_SYS_GETPPID 110
+
+#define NILIX_SYS_KCOV_INIT 520
+#define NILIX_SYS_KCOV_ENABLE 521
+#define NILIX_SYS_KCOV_DISABLE 522
+#define NILIX_SYS_KCOV_DUMP 523
+#define NILIX_SYS_KCOV_RESET 524
 
 #define KCOV_BUFFER_SIZE 4096
 
-// Test results
+typedef enum {
+    OP_GETPID,
+    OP_GETPPID,
+    OP_WRITE,
+    OP_BRK_QUERY,
+} Operation;
+
 typedef struct {
-    int test_num;
-    const char *name;
-    int passed;
-    long edge_count;
-    const char *error;
-    int errno_val;
-} TestResult;
+    const Operation *operations;
+    size_t operation_count;
+} Program;
 
-// Helper to execute a syscall sequence
-static void execute_test_syscalls(void) {
-    // Execute various syscalls to generate coverage
-    syscall(39);  // getpid
-    syscall(110); // getppid
-    syscall(102); // getuid
-    syscall(107); // geteuid
-    syscall(104); // getgid
-    syscall(108); // getegid
+typedef struct {
+    long count;
+    size_t popcount;
+    uint64_t hash;
+} Snapshot;
+
+typedef struct {
+    const char *phase;
+    long code;
+    size_t operation_index;
+    int has_operation;
+} RunError;
+
+static const Operation PROGRAM_A_OPERATIONS[] = {OP_GETPID, OP_GETPPID};
+static const Operation PROGRAM_B_OPERATIONS[] = {OP_WRITE, OP_BRK_QUERY};
+
+static const Program PROGRAM_A = {
+    PROGRAM_A_OPERATIONS,
+    sizeof(PROGRAM_A_OPERATIONS) / sizeof(PROGRAM_A_OPERATIONS[0]),
+};
+
+static const Program PROGRAM_B = {
+    PROGRAM_B_OPERATIONS,
+    sizeof(PROGRAM_B_OPERATIONS) / sizeof(PROGRAM_B_OPERATIONS[0]),
+};
+
+static unsigned char bitmap_a[KCOV_BUFFER_SIZE];
+static unsigned char bitmap_b[KCOV_BUFFER_SIZE];
+static unsigned char bitmap_a_repeat[KCOV_BUFFER_SIZE];
+static unsigned char bitmap_scratch[KCOV_BUFFER_SIZE];
+
+static void flush_output(void) {
+    (void)fflush(stdout);
 }
 
-// Test 1: Basic KCOV initialization
-TestResult test_kcov_init(void) {
-    TestResult result = {1, "KCOV Initialization", 0, 0, NULL, 0};
-
-    errno = 0;
-    long ret = syscall(SYS_KCOV_INIT, KCOV_BUFFER_SIZE);
-    if (ret < 0) {
-        result.error = "kcov_init failed";
-        result.errno_val = errno;
-        return result;
+static long error_code(long result) {
+    if (result < 0 && errno != 0) {
+        return -errno;
     }
-
-    result.passed = 1;
     return result;
 }
 
-// Test 2: Enable/disable coverage
-TestResult test_kcov_enable_disable(void) {
-    TestResult result = {2, "KCOV Enable/Disable", 0, 0, NULL, 0};
-
-    // Enable
-    errno = 0;
-    long ret = syscall(SYS_KCOV_ENABLE);
-    if (ret < 0) {
-        result.error = "kcov_enable failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    // Disable
-    errno = 0;
-    ret = syscall(SYS_KCOV_DISABLE);
-    if (ret < 0) {
-        result.error = "kcov_disable failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    result.passed = 1;
-    return result;
+static int fail(const char *stage, long code) {
+    printf("NILIX_KCOV_E2E_FAIL stage=%s code=%ld\n", stage, code);
+    flush_output();
+    return 1;
 }
 
-// Test 3: Coverage collection
-TestResult test_kcov_collection(void) {
-    TestResult result = {3, "KCOV Coverage Collection", 0, 0, NULL, 0};
-
-    // Enable
-    errno = 0;
-    long ret = syscall(SYS_KCOV_ENABLE);
-    if (ret < 0) {
-        result.error = "kcov_enable failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    // Execute test syscalls
-    execute_test_syscalls();
-
-    // Disable
-    errno = 0;
-    ret = syscall(SYS_KCOV_DISABLE);
-    if (ret < 0) {
-        result.error = "kcov_disable failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    // Dump coverage
-    unsigned char coverage_buf[KCOV_BUFFER_SIZE];
-    errno = 0;
-    ret = syscall(SYS_KCOV_DUMP, coverage_buf, KCOV_BUFFER_SIZE);
-    if (ret < 0) {
-        result.error = "kcov_dump failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    result.edge_count = ret;
-
-    // Verify we got some coverage
-    if (ret == 0) {
-        result.error = "No edges collected (expected > 0)";
-        return result;
-    }
-
-    result.passed = 1;
-    return result;
-}
-
-// Test 4: Coverage reset
-TestResult test_kcov_reset(void) {
-    TestResult result = {4, "KCOV Reset", 0, 0, NULL, 0};
-
-    // Enable and collect some coverage
-    syscall(SYS_KCOV_ENABLE);
-    execute_test_syscalls();
-    syscall(SYS_KCOV_DISABLE);
-
-    // Reset
-    errno = 0;
-    long ret = syscall(SYS_KCOV_RESET);
-    if (ret < 0) {
-        result.error = "kcov_reset failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    // Dump should now return 0 edges
-    unsigned char coverage_buf[KCOV_BUFFER_SIZE];
-    errno = 0;
-    ret = syscall(SYS_KCOV_DUMP, coverage_buf, KCOV_BUFFER_SIZE);
-    if (ret < 0) {
-        result.error = "kcov_dump after reset failed";
-        result.errno_val = errno;
-        return result;
-    }
-
-    if (ret != 0) {
-        result.error = "Expected 0 edges after reset";
-        result.edge_count = ret;
-        return result;
-    }
-
-    result.passed = 1;
-    return result;
-}
-
-// Test 5: Multiple collection cycles
-TestResult test_kcov_multi_cycle(void) {
-    TestResult result = {5, "KCOV Multiple Cycles", 0, 0, NULL, 0};
-
-    // Cycle 1
-    syscall(SYS_KCOV_ENABLE);
-    syscall(39); // getpid
-    syscall(SYS_KCOV_DISABLE);
-
-    unsigned char buf1[KCOV_BUFFER_SIZE];
-    long edges1 = syscall(SYS_KCOV_DUMP, buf1, KCOV_BUFFER_SIZE);
-
-    // Reset
-    syscall(SYS_KCOV_RESET);
-
-    // Cycle 2
-    syscall(SYS_KCOV_ENABLE);
-    syscall(110); // getppid (different syscall)
-    syscall(SYS_KCOV_DISABLE);
-
-    unsigned char buf2[KCOV_BUFFER_SIZE];
-    long edges2 = syscall(SYS_KCOV_DUMP, buf2, KCOV_BUFFER_SIZE);
-
-    if (edges1 <= 0 || edges2 <= 0) {
-        result.error = "Expected positive edge count in both cycles";
-        return result;
-    }
-
-    result.edge_count = edges1 + edges2;
-    result.passed = 1;
-    return result;
-}
-
-// Print test result
-void print_result(TestResult result) {
-    printf("[Test %d] %s: ", result.test_num, result.name);
-
-    if (result.passed) {
-        printf("✓ PASS");
-        if (result.edge_count > 0) {
-            printf(" (%ld edges)", result.edge_count);
-        }
-        printf("\n");
+static int fail_run(const char *program_name, const RunError *error) {
+    if (error->has_operation) {
+        printf(
+            "NILIX_KCOV_E2E_FAIL stage=%s_%s code=%ld op=%zu\n",
+            program_name,
+            error->phase,
+            error->code,
+            error->operation_index
+        );
     } else {
-        printf("✗ FAIL");
-        if (result.error) {
-            printf(" - %s", result.error);
-        }
-        if (result.errno_val != 0) {
-            printf(" (errno=%d)", result.errno_val);
-        }
-        if (result.edge_count > 0) {
-            printf(" (edges: %ld)", result.edge_count);
-        }
-        printf("\n");
+        printf(
+            "NILIX_KCOV_E2E_FAIL stage=%s_%s code=%ld\n",
+            program_name,
+            error->phase,
+            error->code
+        );
     }
+    flush_output();
+    return 1;
+}
+
+static size_t bitmap_popcount(const unsigned char *bitmap) {
+    size_t count = 0;
+
+    for (size_t i = 0; i < KCOV_BUFFER_SIZE; ++i) {
+        unsigned char value = bitmap[i];
+        while (value != 0) {
+            count += value & 1U;
+            value >>= 1;
+        }
+    }
+
+    return count;
+}
+
+static uint64_t bitmap_hash(const unsigned char *bitmap) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+
+    for (size_t i = 0; i < KCOV_BUFFER_SIZE; ++i) {
+        hash ^= bitmap[i];
+        hash *= UINT64_C(1099511628211);
+    }
+
+    return hash;
+}
+
+static int bitmap_is_zero(const unsigned char *bitmap) {
+    for (size_t i = 0; i < KCOV_BUFFER_SIZE; ++i) {
+        if (bitmap[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int kcov_control(long syscall_number, long *failure_code) {
+    errno = 0;
+    const long result = syscall(syscall_number);
+    if (result != 0) {
+        *failure_code = error_code(result);
+        return -1;
+    }
+    return 0;
+}
+
+static int dump_snapshot(
+    unsigned char *bitmap,
+    Snapshot *snapshot,
+    const char **failure_phase,
+    long *failure_code
+) {
+    memset(bitmap, 0xa5, KCOV_BUFFER_SIZE);
+    errno = 0;
+    const long result = syscall(
+        NILIX_SYS_KCOV_DUMP,
+        bitmap,
+        (size_t)KCOV_BUFFER_SIZE
+    );
+    if (result < 0) {
+        *failure_phase = "dump";
+        *failure_code = error_code(result);
+        return -1;
+    }
+
+    snapshot->count = result;
+    snapshot->popcount = bitmap_popcount(bitmap);
+    snapshot->hash = bitmap_hash(bitmap);
+
+    if ((size_t)result != snapshot->popcount) {
+        *failure_phase = "count_popcount";
+        *failure_code = result;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int execute_operation(Operation operation, long *failure_code) {
+    long result;
+
+    errno = 0;
+    switch (operation) {
+        case OP_GETPID:
+            result = syscall(NILIX_SYS_GETPID);
+            if (result <= 0) {
+                *failure_code = error_code(result);
+                return -1;
+            }
+            return 0;
+        case OP_GETPPID:
+            result = syscall(NILIX_SYS_GETPPID);
+            if (result < 0) {
+                *failure_code = error_code(result);
+                return -1;
+            }
+            return 0;
+        case OP_WRITE: {
+            static const char payload = '\n';
+            result = syscall(NILIX_SYS_WRITE, 1, &payload, (size_t)1);
+            if (result != 1) {
+                *failure_code = error_code(result);
+                return -1;
+            }
+            return 0;
+        }
+        case OP_BRK_QUERY:
+            result = syscall(NILIX_SYS_BRK, 0);
+            if (result < 0) {
+                *failure_code = error_code(result);
+                return -1;
+            }
+            return 0;
+    }
+
+    *failure_code = -EINVAL;
+    return -1;
+}
+
+static int execute_program(
+    const Program *program,
+    size_t *failed_operation,
+    long *failure_code
+) {
+    for (size_t i = 0; i < program->operation_count; ++i) {
+        if (execute_operation(program->operations[i], failure_code) != 0) {
+            *failed_operation = i;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int collect_program(
+    const Program *program,
+    unsigned char *bitmap,
+    Snapshot *snapshot,
+    RunError *error
+) {
+    long code = 0;
+
+    if (kcov_control(NILIX_SYS_KCOV_ENABLE, &code) != 0) {
+        *error = (RunError){"enable", code, 0, 0};
+        return -1;
+    }
+
+    size_t failed_operation = 0;
+    if (execute_program(program, &failed_operation, &code) != 0) {
+        long disable_code = 0;
+        if (kcov_control(NILIX_SYS_KCOV_DISABLE, &disable_code) != 0) {
+            *error = (RunError){"disable_after_execute", disable_code, 0, 0};
+            return -1;
+        }
+        *error = (RunError){"execute", code, failed_operation, 1};
+        return -1;
+    }
+
+    if (kcov_control(NILIX_SYS_KCOV_DISABLE, &code) != 0) {
+        *error = (RunError){"disable", code, 0, 0};
+        return -1;
+    }
+
+    const char *dump_phase = NULL;
+    if (dump_snapshot(bitmap, snapshot, &dump_phase, &code) != 0) {
+        *error = (RunError){dump_phase, code, 0, 0};
+        return -1;
+    }
+    if (snapshot->count <= 0) {
+        *error = (RunError){"zero_coverage", snapshot->count, 0, 0};
+        return -1;
+    }
+
+    return 0;
+}
+
+static int reset_and_verify_zero(
+    unsigned char *bitmap,
+    Snapshot *snapshot,
+    const char **failure_phase,
+    long *failure_code
+) {
+    if (kcov_control(NILIX_SYS_KCOV_RESET, failure_code) != 0) {
+        *failure_phase = "reset";
+        return -1;
+    }
+    if (dump_snapshot(
+            bitmap,
+            snapshot,
+            failure_phase,
+            failure_code
+        ) != 0) {
+        return -1;
+    }
+    if (snapshot->count != 0 || snapshot->popcount != 0 || !bitmap_is_zero(bitmap)) {
+        *failure_phase = "reset_not_zero";
+        *failure_code = snapshot->count;
+        return -1;
+    }
+    return 0;
+}
+
+static void print_snapshot(
+    const char *name,
+    unsigned int iteration,
+    size_t operation_count,
+    const Snapshot *snapshot
+) {
+    printf(
+        "NILIX_KCOV_E2E_SEQ name=%s iteration=%u ops=%zu count=%ld "
+        "popcount=%zu hash=%016" PRIx64 "\n",
+        name,
+        iteration,
+        operation_count,
+        snapshot->count,
+        snapshot->popcount,
+        snapshot->hash
+    );
+    flush_output();
 }
 
 int main(void) {
-    printf("=====================================\n");
-    printf("  Nilix KCOV Test Runner - Phase 2\n");
-    printf("=====================================\n\n");
+    Snapshot snapshot_a;
+    Snapshot snapshot_b;
+    Snapshot snapshot_a_repeat;
+    Snapshot snapshot_disabled;
+    Snapshot snapshot_zero;
+    RunError run_error;
+    const char *failure_phase = NULL;
+    long code = 0;
+    size_t failed_operation = 0;
 
-    TestResult results[5];
-    int total_tests = 5;
-    int passed = 0;
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    printf("NILIX_KCOV_E2E_BEGIN version=1\n");
 
-    // Run tests
-    results[0] = test_kcov_init();
-    results[1] = test_kcov_enable_disable();
-    results[2] = test_kcov_collection();
-    results[3] = test_kcov_reset();
-    results[4] = test_kcov_multi_cycle();
-
-    // Print results
-    for (int i = 0; i < total_tests; i++) {
-        print_result(results[i]);
-        if (results[i].passed) {
-            passed++;
-        }
+    errno = 0;
+    const long init_result = syscall(NILIX_SYS_KCOV_INIT, (size_t)KCOV_BUFFER_SIZE);
+    if (init_result != 0) {
+        return fail("init", error_code(init_result));
     }
 
-    printf("\n=====================================\n");
-    printf("  Results: %d/%d tests passed\n", passed, total_tests);
-    printf("=====================================\n");
+    if (reset_and_verify_zero(
+            bitmap_scratch,
+            &snapshot_zero,
+            &failure_phase,
+            &code
+        ) != 0) {
+        return fail(failure_phase, code);
+    }
 
-    if (passed == total_tests) {
-        printf("\n🎉 Phase 2 COMPLETE: KCOV integration verified!\n\n");
-        return 0;
-    } else {
-        printf("\n❌ Phase 2 INCOMPLETE: %d tests failed\n\n", total_tests - passed);
+    if (collect_program(
+            &PROGRAM_A,
+            bitmap_a,
+            &snapshot_a,
+            &run_error
+        ) != 0) {
+        return fail_run("a1", &run_error);
+    }
+    print_snapshot("A", 1, PROGRAM_A.operation_count, &snapshot_a);
+
+    if (execute_program(&PROGRAM_B, &failed_operation, &code) != 0) {
+        printf(
+            "NILIX_KCOV_E2E_FAIL stage=disabled_execute code=%ld op=%zu\n",
+            code,
+            failed_operation
+        );
+        flush_output();
         return 1;
     }
+    if (dump_snapshot(
+            bitmap_scratch,
+            &snapshot_disabled,
+            &failure_phase,
+            &code
+        ) != 0) {
+        return fail(failure_phase, code);
+    }
+    if (snapshot_disabled.count != snapshot_a.count ||
+        snapshot_disabled.popcount != snapshot_a.popcount ||
+        memcmp(bitmap_scratch, bitmap_a, KCOV_BUFFER_SIZE) != 0) {
+        return fail("disabled_changed_coverage", snapshot_disabled.count);
+    }
+    printf(
+        "NILIX_KCOV_E2E_DISABLED count=%ld popcount=%zu hash=%016" PRIx64
+        " stable=1\n",
+        snapshot_disabled.count,
+        snapshot_disabled.popcount,
+        snapshot_disabled.hash
+    );
+
+    if (reset_and_verify_zero(
+            bitmap_scratch,
+            &snapshot_zero,
+            &failure_phase,
+            &code
+        ) != 0) {
+        return fail(failure_phase, code);
+    }
+    printf("NILIX_KCOV_E2E_RESET count=0 popcount=0\n");
+
+    if (collect_program(
+            &PROGRAM_B,
+            bitmap_b,
+            &snapshot_b,
+            &run_error
+        ) != 0) {
+        return fail_run("b1", &run_error);
+    }
+    print_snapshot("B", 1, PROGRAM_B.operation_count, &snapshot_b);
+
+    if (memcmp(bitmap_a, bitmap_b, KCOV_BUFFER_SIZE) == 0) {
+        return fail("a_b_not_distinct", snapshot_a.count);
+    }
+    printf("NILIX_KCOV_E2E_DIFF value=1\n");
+
+    if (reset_and_verify_zero(
+            bitmap_scratch,
+            &snapshot_zero,
+            &failure_phase,
+            &code
+        ) != 0) {
+        return fail(failure_phase, code);
+    }
+
+    if (collect_program(
+            &PROGRAM_A,
+            bitmap_a_repeat,
+            &snapshot_a_repeat,
+            &run_error
+        ) != 0) {
+        return fail_run("a2", &run_error);
+    }
+    print_snapshot("A", 2, PROGRAM_A.operation_count, &snapshot_a_repeat);
+
+    if (snapshot_a_repeat.count != snapshot_a.count ||
+        snapshot_a_repeat.popcount != snapshot_a.popcount ||
+        memcmp(bitmap_a_repeat, bitmap_a, KCOV_BUFFER_SIZE) != 0) {
+        return fail("a_repeat_unstable", snapshot_a_repeat.count);
+    }
+    printf("NILIX_KCOV_E2E_REPEAT name=A stable=1\n");
+
+    if (reset_and_verify_zero(
+            bitmap_scratch,
+            &snapshot_zero,
+            &failure_phase,
+            &code
+        ) != 0) {
+        return fail(failure_phase, code);
+    }
+    printf("NILIX_KCOV_E2E_FINAL_RESET count=0 popcount=0\n");
+    printf("NILIX_KCOV_E2E_PASS\n");
+    flush_output();
+    return 0;
 }
