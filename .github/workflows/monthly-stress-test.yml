@@ -31,11 +31,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write # checkout plus failure-only commit comment
+      contents: read
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Validate stress test runner
+        run: |
+          test -r scripts/stress_test.sh
+          bash -n scripts/stress_test.sh
+          bash scripts/stress_test_test.sh
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -51,56 +57,67 @@ jobs:
       - name: Install QEMU and OVMF
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf
+          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs musl-tools
 
-      - name: Build kernel
+      - name: Build isolated Ring-3 stress kernel and I/O image
         run: |
-          make build
+          make build-stress
+          make ensure-ext3-image
         env:
           OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
 
-      - name: Run standard stress test (60s per scenario)
+      - name: Run standard Ring-3 stress workload (60s per profile)
         id: stress-standard
         run: |
-          STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh esp
-        continue-on-error: true
+          STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh esp-stress
         env:
           OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
 
-      - name: Run extended stress test (300s per scenario)
+      - name: Run extended Ring-3 stress workload (300s per profile)
         id: stress-extended
-        if: success()
+        if: steps.stress-standard.outcome == 'success'
         run: |
-          STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh esp
-        continue-on-error: true
+          STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh esp-stress
         env:
           OVMF_PATH: /usr/share/OVMF/OVMF_CODE.fd
 
       - name: Create stress test report
         if: always()
+        env:
+          STANDARD_OUTCOME: ${{ steps.stress-standard.outcome }}
+          EXTENDED_OUTCOME: ${{ steps.stress-extended.outcome }}
         run: |
-          cat > stress-report.md << 'EOF'
-          # Monthly Stress Test Report
+          status_label() {
+            case "$1" in
+              success) printf 'PASS' ;;
+              failure) printf 'FAIL' ;;
+              skipped) printf 'SKIPPED' ;;
+              cancelled) printf 'CANCELLED' ;;
+              *) printf 'NOT RUN' ;;
+            esac
+          }
 
-          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          **Commit:** ${{ github.sha }}
-          **Branch:** ${{ github.ref_name }}
+          generated_at="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          standard_outcome="${STANDARD_OUTCOME:-not-run}"
+          extended_outcome="${EXTENDED_OUTCOME:-not-run}"
+          standard_label="$(status_label "$standard_outcome")"
+          extended_label="$(status_label "$extended_outcome")"
 
-          ## Results
-
-          ### Standard Stress Test (60s per scenario)
-          Status: ${{ steps.stress-standard.outcome }}
-
-          ### Extended Stress Test (300s per scenario)
-          Status: ${{ steps.stress-extended.outcome }}
-
-          ## Summary
-
-          - ✅ Standard Test: ${{ steps.stress-standard.outcome == 'success' && 'PASS' || 'FAIL' }}
-          - ✅ Extended Test: ${{ steps.stress-extended.outcome == 'success' && 'PASS' || steps.stress-extended.outcome == 'skipped' && 'SKIPPED' || 'FAIL' }}
-
-          See workflow logs for detailed output.
-          EOF
+          {
+            printf '# Monthly Stress Test Report\n\n'
+            printf '**Date:** %s\n' "$generated_at"
+            printf '**Commit:** %s\n' "$GITHUB_SHA"
+            printf '**Branch:** %s\n\n' "$GITHUB_REF_NAME"
+            printf '## Results\n\n'
+            printf '### Standard Ring-3 Stress Workload (60s per profile)\n'
+            printf 'Status: %s (%s)\n\n' "$standard_label" "$standard_outcome"
+            printf '### Extended Ring-3 Stress Workload (300s per profile)\n'
+            printf 'Status: %s (%s)\n\n' "$extended_label" "$extended_outcome"
+            printf '## Summary\n\n'
+            printf -- '- Standard Test: %s\n' "$standard_label"
+            printf -- '- Extended Test: %s\n\n' "$extended_label"
+            printf 'See workflow logs for detailed output.\n'
+          } > stress-report.md
 
       - name: Upload stress test report
         if: always()
@@ -110,29 +127,29 @@ jobs:
           path: stress-report.md
           retention-days: 90
 
-      - name: Comment on commit (if failure)
-        if: failure()
+  notify-failure:
+    needs: stress-test
+    if: always() && needs.stress-test.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Comment on commit
         uses: actions/github-script@v9
         with:
           script: |
-            const message = `## ⚠️ Monthly Stress Test Failed
+            const message = `## Monthly Stress Test Failed
 
-            The monthly stress test suite failed on the last day of the month.
+            The monthly stress test job failed.
 
             - **Commit:** ${{ github.sha }}
             - **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Please review the logs and address any stability issues.`;
+            Please review the job logs and uploaded stress report.`;
 
-            github.rest.repos.createCommitComment({
+            await github.rest.repos.createCommitComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               commit_sha: context.sha,
               body: message
             });
-
-      - name: Fail workflow if tests failed
-        if: steps.stress-standard.outcome == 'failure' || steps.stress-extended.outcome == 'failure'
-        run: |
-          echo "Stress tests failed - see logs above"
-          exit 1
