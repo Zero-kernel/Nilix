@@ -1,0 +1,125 @@
+name: Syzkaller-Style Fuzzing
+
+on:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzzing duration in seconds'
+        required: false
+        default: '3600'
+      workers:
+        description: 'Number of parallel workers'
+        required: false
+        default: '4'
+
+jobs:
+  syzkaller-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools qemu-system-x86 ovmf
+          rustup toolchain install stable
+          rustup default stable
+
+      - name: Build KCOV-enabled kernel
+        run: |
+          cd kernel
+          make build-kcov
+
+      - name: Build guest executor
+        run: |
+          cd userspace
+          musl-gcc -std=c11 -static -O2 -Wall -Wextra \
+            -o nilix_syz_executor.elf nilix_syz_executor.c
+
+      - name: Build host fuzzer
+        run: |
+          cd userspace/nilix-syz-fuzzer
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Restore fuzzing corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: syz-corpus
+          key: nilix-syz-corpus-${{ github.sha }}
+          restore-keys: |
+            nilix-syz-corpus-
+
+      - name: Run fuzzer
+        run: |
+          cd userspace/nilix-syz-fuzzer
+          timeout ${{ github.event.inputs.duration || '3600' }} \
+            ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
+              --kernel ../../esp-kcov/kernel.elf \
+              --corpus-dir ./syz-corpus \
+              --crash-dir ./syz-crashes \
+              --timeout ${{ github.event.inputs.duration || '3600' }} \
+              --workers ${{ github.event.inputs.workers || '4' }} \
+              --program-timeout 30 \
+            || true
+
+      - name: Save fuzzing corpus
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: syz-corpus
+          key: nilix-syz-corpus-${{ github.sha }}
+
+      - name: Process crashes
+        if: always()
+        run: |
+          cd userspace/nilix-syz-fuzzer/syz-crashes
+          if [ -n "$(ls -A 2>/dev/null)" ]; then
+            echo "=== Crashes Found ==="
+            for crash in crash-*.bin; do
+              if [ -f "$crash" ]; then
+                sha256sum "$crash"
+                # Generate HMAC-based ID for deduplication
+                HMAC=$(sha256sum "$crash" | cut -d' ' -f1 | cut -c1-16)
+                echo "Crash ID: NILIX-FUZZ-${HMAC}"
+              fi
+            done
+          else
+            echo "No crashes found"
+          fi
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syzkaller-crashes-${{ github.run_number }}
+          path: userspace/nilix-syz-fuzzer/syz-crashes/
+          if-no-files-found: ignore
+
+      - name: Upload corpus snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syzkaller-corpus-${{ github.run_number }}
+          path: userspace/nilix-syz-fuzzer/syz-corpus/
+          if-no-files-found: ignore
+
+      - name: Report fuzzing statistics
+        if: always()
+        run: |
+          echo "=== Fuzzing Run Complete ==="
+          echo "Duration: ${{ github.event.inputs.duration || '3600' }}s"
+          echo "Workers: ${{ github.event.inputs.workers || '4' }}"
+          if [ -d "userspace/nilix-syz-fuzzer/syz-corpus" ]; then
+            CORPUS_SIZE=$(find userspace/nilix-syz-fuzzer/syz-corpus -name "prog-*.bin" | wc -l)
+            echo "Corpus entries: $CORPUS_SIZE"
+          fi
+          if [ -d "userspace/nilix-syz-fuzzer/syz-crashes" ]; then
+            CRASH_COUNT=$(find userspace/nilix-syz-fuzzer/syz-crashes -name "crash-*.bin" | wc -l)
+            echo "Unique crashes: $CRASH_COUNT"
+          fi
