@@ -5012,6 +5012,34 @@ pub fn current_pid() -> Option<ProcessId> {
     }
 }
 
+/// Best-effort KCOV recorder bridge for the task running on this CPU.
+///
+/// The coverage crate cannot depend on kernel_core without creating a Cargo
+/// dependency cycle, so it calls this function through a boot-registered
+/// function pointer. Every lock acquisition is non-blocking: tracepoints may be
+/// reached from code that already holds the process table, PCB, or coverage
+/// buffer lock, and dropping an edge is preferable to recursive deadlock.
+#[cfg(feature = "kcov")]
+#[inline]
+pub fn record_kcov_edge_for_current(edge_id: u32) {
+    let Some(pid) = current_pid() else {
+        return;
+    };
+    let Some(Some(process)) = try_get_process(pid) else {
+        return;
+    };
+    let Some(proc) = process.try_lock() else {
+        return;
+    };
+    let Some(buffer) = proc.coverage_buffer.as_ref() else {
+        return;
+    };
+    let Some(mut coverage) = buffer.try_lock() else {
+        return;
+    };
+    coverage.record_edge(edge_id);
+}
+
 /// R106-1 FIX: 获取当前进程的 generation 值。
 ///
 /// 与 `current_pid()` 配合使用，提供 (pid, generation) 二元组

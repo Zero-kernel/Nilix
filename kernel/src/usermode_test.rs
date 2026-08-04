@@ -219,6 +219,11 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len()
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("fuzz_runner.elf").len() }> =
     AlignedElfData(*include_bytes!("fuzz_runner.elf"));
 
+/// Embedded bounded Ring-3 workload used by the monthly stress gate.
+#[cfg(feature = "stress_runner")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("stress_runner.elf").len() }> =
+    AlignedElfData(*include_bytes!("stress_runner.elf"));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -231,6 +236,7 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("fuzz_runner.elf").len(
     feature = "syscall_test",
     feature = "musl_test",
     feature = "clone_test",
+    feature = "stress_runner",
     feature = "fuzz_runner"
 )))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
@@ -304,6 +310,8 @@ const PROCESS_NAME: &str = "syscall_test";
 const PROCESS_NAME: &str = "musl_test";
 #[cfg(feature = "clone_test")]
 const PROCESS_NAME: &str = "clone_test";
+#[cfg(feature = "stress_runner")]
+const PROCESS_NAME: &str = "stress_runner";
 #[cfg(feature = "fuzz_runner")]
 const PROCESS_NAME: &str = "fuzz_runner";
 #[cfg(not(any(
@@ -311,6 +319,7 @@ const PROCESS_NAME: &str = "fuzz_runner";
     feature = "syscall_test",
     feature = "musl_test",
     feature = "clone_test",
+    feature = "stress_runner",
     feature = "fuzz_runner"
 )))]
 const PROCESS_NAME: &str = "hello";

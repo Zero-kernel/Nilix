@@ -4184,13 +4184,6 @@ pub fn syscall_dispatcher(
         // Process wait
         247 => sys_waitid(arg0 as i32, arg1 as i32, arg2 as *mut u8, arg3 as i32),
 
-        // KCOV coverage syscalls (Phase 1)
-        520 => sys_kcov_init(arg0 as usize),
-        521 => sys_kcov_enable(),
-        522 => sys_kcov_disable(),
-        523 => sys_kcov_dump(arg0 as usize, arg1 as usize),
-        524 => sys_kcov_reset(),
-
         _ => Err(SyscallError::ENOSYS),
     };
 
@@ -7615,37 +7608,14 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
 /// not the global (kernel internal) PID. For processes in the root namespace,
 /// these are the same.
 fn sys_getpid() -> SyscallResult {
-    // Manual coverage trace point
     #[cfg(feature = "kcov")]
-    {
-        let pid = current_pid();
-        if let Some(p) = pid {
-            if let Some(proc_arc) = get_process(p) {
-                if let Some(proc) = proc_arc.try_lock() {
-                    if let Some(ref buf) = proc.coverage_buffer {
-                        if let Some(mut coverage) = buf.try_lock() {
-                            coverage.record_edge(1); // Edge 1: entry
-                        }
-                    }
-                }
-            }
-        }
-    }
+    coverage::record_edge!();
 
     let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
 
-    // Manual coverage trace point
     #[cfg(feature = "kcov")]
-    {
-        if let Some(proc) = proc_arc.try_lock() {
-            if let Some(ref buf) = proc.coverage_buffer {
-                if let Some(mut coverage) = buf.try_lock() {
-                    coverage.record_edge(2); // Edge 2: after process lookup
-                }
-            }
-        }
-    }
+    coverage::record_edge!();
 
     let ns_pid = {
         let proc = proc_arc.lock();
@@ -7656,17 +7626,8 @@ fn sys_getpid() -> SyscallResult {
             .ok_or(SyscallError::EFAULT)?
     };
 
-    // Manual coverage trace point
     #[cfg(feature = "kcov")]
-    {
-        if let Some(proc) = proc_arc.try_lock() {
-            if let Some(ref buf) = proc.coverage_buffer {
-                if let Some(mut coverage) = buf.try_lock() {
-                    coverage.record_edge(3); // Edge 3: before return
-                }
-            }
-        }
-    }
+    coverage::record_edge!();
 
     Ok(ns_pid)
 }
@@ -7680,17 +7641,8 @@ fn sys_getppid() -> SyscallResult {
     let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
 
-    // Manual coverage trace point
     #[cfg(feature = "kcov")]
-    {
-        if let Some(proc) = proc_arc.try_lock() {
-            if let Some(ref buf) = proc.coverage_buffer {
-                if let Some(mut coverage) = buf.try_lock() {
-                    coverage.record_edge(1); // Edge 1: entry
-                }
-            }
-        }
-    }
+    coverage::record_edge!();
 
     let proc = proc_arc.lock();
     let parent_global_pid = proc.ppid;
@@ -7702,15 +7654,7 @@ fn sys_getppid() -> SyscallResult {
     // If parent_pid is 0, the process has no parent (init)
     if parent_global_pid == 0 {
         #[cfg(feature = "kcov")]
-        {
-            if let Some(proc) = proc_arc.try_lock() {
-                if let Some(ref buf) = proc.coverage_buffer {
-                    if let Some(mut coverage) = buf.try_lock() {
-                        coverage.record_edge(2); // Edge 2: no parent
-                    }
-                }
-            }
-        }
+        coverage::record_edge!();
         return Ok(0);
     }
 
@@ -7719,42 +7663,18 @@ fn sys_getppid() -> SyscallResult {
         // Look up parent's PID in our namespace
         if let Some(ns_ppid) = ns.lookup_ns_pid(parent_global_pid) {
             #[cfg(feature = "kcov")]
-            {
-                if let Some(proc) = proc_arc.try_lock() {
-                    if let Some(ref buf) = proc.coverage_buffer {
-                        if let Some(mut coverage) = buf.try_lock() {
-                            coverage.record_edge(3); // Edge 3: parent visible
-                        }
-                    }
-                }
-            }
+            coverage::record_edge!();
             return Ok(ns_ppid);
         }
         // Parent not visible in our namespace - return 0 (orphan semantics)
         // This happens when parent is in an ancestor namespace
         #[cfg(feature = "kcov")]
-        {
-            if let Some(proc) = proc_arc.try_lock() {
-                if let Some(ref buf) = proc.coverage_buffer {
-                    if let Some(mut coverage) = buf.try_lock() {
-                        coverage.record_edge(4); // Edge 4: parent not visible
-                    }
-                }
-            }
-        }
+        coverage::record_edge!();
         Ok(0)
     } else {
         // No namespace chain - return global PID (root namespace)
         #[cfg(feature = "kcov")]
-        {
-            if let Some(proc) = proc_arc.try_lock() {
-                if let Some(ref buf) = proc.coverage_buffer {
-                    if let Some(mut coverage) = buf.try_lock() {
-                        coverage.record_edge(5); // Edge 5: root namespace
-                    }
-                }
-            }
-        }
+        coverage::record_edge!();
         Ok(parent_global_pid)
     }
 }
@@ -21715,7 +21635,7 @@ fn sys_kcov_init(buf_size: usize) -> Result<usize, SyscallError> {
     }
 
     // Enable coverage and store buffer in process
-    let buf = coverage::enable_coverage().ok_or(SyscallError::ENOMEM)?;
+    let buf = coverage::enable_coverage(buf_size).ok_or(SyscallError::ENOMEM)?;
 
     {
         let mut proc = proc_arc.lock();
@@ -21777,22 +21697,34 @@ fn sys_kcov_dump(user_buf: usize, len: usize) -> Result<usize, SyscallError> {
         return Err(SyscallError::EINVAL);
     }
 
+    // Allocation and usercopy may fault or enter memory-management paths. Keep
+    // both outside the PCB and coverage locks so KCOV cannot invert those lock
+    // orders or recursively deadlock while servicing a userspace page fault.
+    let mut kernel_buf = alloc::vec![0u8; len];
+
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let proc = proc_arc.lock();
-
-    let buf = proc.coverage_buffer.as_ref().ok_or(SyscallError::EINVAL)?;
-    let buf_lock = buf.lock();
-
-    // Allocate temporary kernel buffer
-    let mut kernel_buf = alloc::vec![0u8; len];
-    let copied = buf_lock.copy_to_user(&mut kernel_buf);
+    let buffer = {
+        let proc = proc_arc.lock();
+        proc.coverage_buffer
+            .as_ref()
+            .cloned()
+            .ok_or(SyscallError::EINVAL)?
+    };
+    let (copied, edge_count) = {
+        let coverage = buffer.lock();
+        if len != coverage.bitmap_len() {
+            return Err(SyscallError::EINVAL);
+        }
+        let copied = coverage.copy_to_user(&mut kernel_buf);
+        (copied, coverage.edge_count())
+    };
 
     // Copy to userspace via SMAP-compliant path
     crate::usercopy::copy_to_user_safe(user_buf as *mut u8, &kernel_buf[..copied])
         .map_err(|_| SyscallError::EFAULT)?;
 
-    Ok(buf_lock.edge_count())
+    Ok(edge_count)
 }
 
 #[cfg(not(feature = "kcov"))]

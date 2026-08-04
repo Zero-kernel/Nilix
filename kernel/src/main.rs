@@ -622,14 +622,6 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         klog_force!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
     }
 
-    // KCOV initialization for fuzzing infrastructure
-    #[cfg(feature = "kcov")]
-    {
-        extern crate coverage;
-        coverage::init_coverage();
-        klog_always!("[KCOV] Coverage infrastructure initialized");
-    }
-
     // KASLR/KPTI/PCID initialization
     // R39-7/RF180-32: pass relocation separately from version-validated
     // randomization provenance. A deterministic non-zero slide is not KASLR.
@@ -879,6 +871,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         trace::counters::force_init_per_cpu_counters();
         kernel_core::process::force_init_current_pid();
         kernel_core::rcu::force_init_rcu_locals();
+        #[cfg(feature = "kcov")]
+        {
+            // init_coverage force-initializes one CpuLocal slab containing every
+            // possible CPU slot. A single BSP call therefore covers all APs before
+            // start_aps(), with no first-trace heap allocation in IRQ context.
+            coverage::init_coverage(kernel_core::process::record_kcov_edge_for_current);
+            klog_always!("[KCOV] Coverage infrastructure initialized");
+        }
         klog_always!("      ✓ BSP per-CPU data initialized");
 
         // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP

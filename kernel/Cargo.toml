@@ -15,6 +15,8 @@ syscall_test = []
 musl_test = []
 # Enable clone syscall test program
 clone_test = []
+# Enable the bounded monthly Ring-3 stress workload
+stress_runner = []
 # Enable KCOV fuzz runner test program (Phase 2 completion)
 fuzz_runner = ["mm/fuzz_runner", "kcov"]
 # Enable kernel code coverage instrumentation for fuzzing
