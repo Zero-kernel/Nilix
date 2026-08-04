@@ -38,10 +38,22 @@ This document provides a high-level overview of the Nilix testing infrastructure
 - **extended_smp_test.sh** - 8/16-core validation ⚡ NEW
 - Tests: Multi-CPU init, IPI, TLB shootdown, lock contention
 
-### 5. Stress Tests ⚡ NEW
-- **stress_test.sh** - Resource leak and stability validation
-- Tests: Memory pressure, CPU saturation, SMP contention, I/O sustained, process churn
-- Duration: 60-300 seconds per test
+### 5. QEMU Stability Soak Tests ⚡ ENHANCED (2026-08-04)
+- **stress_test.sh** - Sustained Ring-3 workload stability validation under varied VM profiles
+- **Basic stress runner** (`stress_runner.c`) - 635 lines, 5 workload phases
+  - Memory (mmap/munmap validation)
+  - CPU (computational kernel)
+  - Process (fork/wait lifecycle)
+  - File I/O (ramfs + ext3)
+  - Combined concurrent workload + sustained heartbeat loop
+- **Advanced stress runner** (`stress_runner_advanced.c`) - 541 lines, security-focused
+  - Permission boundary validation (null ptr, invalid fd, kernel addresses, overflow sizes)
+  - Concurrency stress (parallel syscall hammering, race detection)
+  - Resource exhaustion (fd limits, memory pressure)
+  - Signal resilience (SIGUSR1 during syscall execution)
+  - Failure injection (double close, unmapped munmap, invalid operations)
+- Profiles: constrained memory (192M), multi-vCPU (4 cores), SMP, block I/O, single-vCPU, extended combined
+- Duration: 60-300 seconds per test with mandatory heartbeat freshness checks
 - Gate: `make stress-test` or `make stress-test-extended`
 
 ### 6. Performance Tests ⚡ NEW
@@ -62,10 +74,19 @@ This document provides a high-level overview of the Nilix testing infrastructure
 - Status: Framework in place, requires bare metal infrastructure
 - Gate: `make test-melting`
 
-### 9. Fuzzing ✅
-- **syzkaller + KCOV** integration complete
-- Tests: Syscall sequences, edge cases, input validation
-- Coverage-guided fuzzing with kernel code coverage
+### 9. Fuzzing 🚧 ENHANCED (2026-08-04)
+- Host cargo-fuzz parser/model targets plus a deterministic KCOV QEMU guest E2E
+- Guest gate validates KCOV enable/disable/reset/dump, bitmap counts, sequence differentiation,
+  repeat stability, and fail-closed panic/NX/timeout handling
+- **NEW:** Syzkaller-style syscall descriptions (`.syz` format) — 600+ lines defining 40+ syscalls
+  with resource types, flag combinations, interesting values, and coverage hints
+- **NEW:** Host-driven fuzzing architecture specification (see `docs/fuzzing/syzkaller-integration.md`)
+  - Grammar-aware mutation engine
+  - Coverage-guided corpus evolution
+  - virtio-serial guest executor transport
+  - HMAC-based crash deduplication
+- **Status:** Deterministic E2E operational; full host-driven mutation loop Phase 7.1-7.5 not started
+- Host-driven guest mutation, corpus feedback, and crash replay remain in progress
 
 ## Quick Reference
 
@@ -80,8 +101,8 @@ make test-smp          # 2-core
 make test-smp-4core    # 4-core
 make test-smp-extended # 8/16-core ⚡ NEW
 
-# Stress and performance ⚡ NEW
-make stress-test       # 60s stress tests
+# Stability soak and performance ⚡ NEW
+make stress-test       # 60s QEMU stability profiles
 make test-perf         # Performance regression gate
 
 # Comprehensive (run on PR)
@@ -103,7 +124,7 @@ make test-quick        # Boot + runtime only
 | Performance | 6 benchmarks | ~2 min | PR / Nightly |
 | Security | 9 tests | ~1 min | Every commit (integrated) |
 | Melting | 5 scenarios | 30+ min | Release / Real HW |
-| Fuzzing | Continuous | Ongoing | Background |
+| Fuzzing | Cargo-fuzz + deterministic QEMU KCOV E2E | Scheduled / per change | CI |
 
 ## Coverage Summary
 
@@ -114,7 +135,7 @@ make test-quick        # Boot + runtime only
 - SMP validation (2/4/8/16-core)
 - Stress testing suite
 - Security mitigation tests (9 tests)
-- Fuzzing infrastructure (syzkaller + KCOV)
+- Deterministic QEMU KCOV lifecycle and syscall-sequence regression
 
 ⚠️ **Framework in Place (Implementation Pending):**
 - Performance benchmarks (needs dedicated benchmark code)
@@ -172,9 +193,33 @@ MELT_DURATION=1800 make test-melting  # Real hardware
 - **Memory files** - Session context (uncommitted worktree, R180 status, skill loop)
 - **Script comments** - Inline documentation in each test script
 
-## Recent Additions (2026-07-21)
+## Recent Additions (2026-08-04)
 
-1. ⚡ **Stress test suite** (`stress_test.sh`) - 6 stress scenarios
+1. ⚡ **Advanced security stress runner** (`stress_runner_advanced.c`) - 541 lines
+   - Permission boundary validation (null pointers, invalid fds, kernel addresses, overflows)
+   - Concurrency stress testing (race conditions, parallel syscall execution)
+   - Resource exhaustion validation (fd limits, memory pressure)
+   - Signal resilience testing (SIGUSR1 delivery during syscalls)
+   - Systematic failure injection (double close, unmapped munmap, invalid operations)
+
+2. ⚡ **Syzkaller-style syscall descriptions** (`docs/fuzzing/syscall-descriptions.syz`) - 600+ lines
+   - Complete grammar for 40+ Nilix syscalls
+   - Resource dependency tracking (fd, pid, addr)
+   - Flag combination seeds and interesting value hints
+   - Multi-syscall sequence templates (file lifecycle, memory lifecycle, signal handling)
+   - Edge case test patterns (null pointers, invalid flags, size overflows)
+   - Coverage hints for mutation guidance
+
+3. ⚡ **Host-driven fuzzing architecture** (`docs/fuzzing/syzkaller-integration.md`)
+   - Complete Phase 7 specification for coverage-guided fuzzing
+   - Grammar-aware mutation engine design
+   - QEMU guest executor with virtio-serial transport
+   - Coverage extraction and corpus management
+   - Integration with existing HMAC-based crash triaging
+
+### Previous Additions (2026-07-21)
+
+1. ⚡ **QEMU stability soak suite** (`stress_test.sh`) - 6 VM configuration profiles
 2. ⚡ **Performance gate** (`perf_regression_test.sh`) - Framework for regression detection
 3. ⚡ **Security tests** - Added Spectre V1/V2, SMAP, SMEP validation
 4. ⚡ **Melting tests** (`melting_test.sh`) - Framework for sustained load testing
@@ -183,12 +228,18 @@ MELT_DURATION=1800 make test-melting  # Real hardware
 
 ## Next Steps
 
-1. Implement dedicated performance benchmark userspace programs
-2. Set up bare metal boot infrastructure for melting tests
-3. Add historical performance tracking
-4. Integrate real hardware test machines into CI pipeline
+1. **Implement Phase 7.1-7.5 host-driven fuzzing** (syzkaller-style mutation loop)
+   - Build QEMU executor with virtio-serial transport
+   - Implement grammar-aware mutation engine
+   - Wire up coverage-guided corpus evolution
+   - Integrate with GitHub Actions CI
+
+2. Implement dedicated performance benchmark userspace programs
+3. Set up bare metal boot infrastructure for melting tests
+4. Add historical performance tracking
+5. Integrate real hardware test machines into CI pipeline
 
 ---
 
-**Status:** Implementation complete for goal requirements  
-**Last Updated:** 2026-07-21
+**Status:** Stress testing enhanced, fuzzing architecture specified (host-driven loop not yet implemented)  
+**Last Updated:** 2026-08-04

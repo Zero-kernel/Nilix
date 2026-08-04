@@ -2,7 +2,7 @@
 
 **Project:** Nilix (formerly Zero-OS) Kernel  
 **Goal:** syzkaller-style coverage-guided fuzzing infrastructure  
-**Status:** 🚧 KCOV primitives and cargo-fuzz targets are active; the host-driven QEMU loop is not yet connected
+**Status:** 🚧 KCOV guest E2E and cargo-fuzz targets are active; the host-driven mutation loop is not yet connected
 
 ---
 
@@ -11,13 +11,17 @@
 The phase documents below record the intended seven-phase architecture and historical milestones.
 They are not all active in the current CI data path. Today, GitHub Actions runs three host-safe
 cargo-fuzz targets that call kernel parsers on pushes, all 10 registered targets on scheduled/manual
-runs, and a separate KCOV build/pipeline smoke. Seven of the 10 targets are self-contained model
-harnesses. The smoke simulator executes no kernel input and is intentionally unable to create crash
-evidence. Host-driven mutation and coverage feedback for a QEMU Nilix guest remain future work.
+runs, and a deterministic QEMU KCOV guest E2E. Seven of the 10 targets are self-contained model
+harnesses. The guest E2E executes fixed syscall programs and proves the KCOV control/data path, but it
+does not accept host-generated programs or feed coverage into a mutation corpus.
+
+**NEW (2026-08-04):** Syzkaller-style syscall descriptions (`.syz` format) and host-driven fuzzing
+architecture are now documented in [syzkaller-integration.md](syzkaller-integration.md). The full
+host-driven mutation loop remains future work (Phase 7.1-7.5).
 
 - **7,460+ lines of code** across 20 modules
 - **33,000+ words of documentation** across 28 files
-- **CI integration** for cargo-fuzz and KCOV build validation
+- **CI integration** for cargo-fuzz and a real QEMU KCOV guest regression
 - **Opaque private-candidate triage** and security-aware public pointers
 - **Architecture prototypes** for the future syzkaller-style guest loop
 
@@ -85,7 +89,7 @@ Total: ~1,150 lines
   contains only a keyed HMAC ID
 - **Corpus caching:** Per-target corpora are saved only after clean runs and are never public artifacts
 - **Security-aware issue creation:** Opaque candidates get a workflow pointer, never an automatic reproducer disclosure
-- **KCOV/pipeline smoke:** Build validation and dashboard plumbing, explicitly excluded from fuzz evidence
+- **KCOV QEMU E2E:** Deterministic in-guest syscall programs with strict coverage and crash oracles
 
 ---
 
@@ -231,10 +235,9 @@ sys_kcov_reset() → 0 on success
 ```
 
 ### ✅ Manual Instrumentation
-6 syscalls with 13 edges:
-- `sys_getpid` (3 edges)
-- `sys_getppid` (5 edges)
-- `sys_getuid`, `sys_geteuid`, `sys_getgid`, `sys_getegid` (1 edge each)
+Selected syscall tracepoints include `getpid`, `getppid`, `read`, `write`, `open`, `close`, `brk`,
+`mmap`, and `munmap`. The QEMU gate deliberately exercises both the exported current-task
+`record_edge!` path and existing direct manual tracepoints.
 
 ---
 
@@ -245,10 +248,16 @@ sys_kcov_reset() → 0 on success
 Cargo-fuzz targets run automatically on schedule and on relevant pushes. Three targets call real
 kernel parser code; the other seven registered targets are self-contained model harnesses:
 
-**KCOV build and pipeline smoke:**
-- Schedule: Weekly
-- Executes: CI plumbing only (zero kernel fuzz inputs)
-- Output: A clearly labelled smoke log/dashboard; never crash evidence
+**KCOV QEMU guest E2E:**
+- Trigger: Relevant changes and manual/scheduled fuzz workflow runs
+- Executes: Two fixed syscall programs in a freshly built KCOV guest
+- Oracle: Non-zero self-consistent coverage, reset/disabled semantics, distinct programs, stable replay,
+  and no panic, NX fault, early exit, or timeout
+
+**Pipeline simulator smoke:**
+- Schedule: Weekly and manual `smoke`/`both` runs
+- Executes: Dashboard/report plumbing only, with zero kernel executions
+- Output: `fuzz-smoke-dashboard` and `fuzz-smoke-log`; neither is coverage or crash evidence
 
 **Cargo-fuzz targets:**
 - Schedule: Daily at 2 AM UTC
@@ -270,8 +279,8 @@ Actions → Comprehensive Kernel Fuzzing → Run workflow
 
 Mode:
   - targets: Cargo-fuzz targets only
-  - smoke: KCOV build and CI plumbing only (not fuzz evidence)
-  - both: Run targets and smoke
+  - smoke: Deterministic KCOV QEMU guest E2E plus the zero-execution simulator smoke
+  - both: Run targets, the guest E2E, and the zero-execution simulator smoke
 
 Timeout: 600 (seconds per target, for cargo-fuzz)
 ```
@@ -288,11 +297,14 @@ Timeout: 600 (seconds per target, for cargo-fuzz)
 - An existing open Issue with the same opaque ID is reused; a matching closed Issue is reopened and
   receives a new workflow pointer. The lookup covers the full open/closed Issue history.
 
-**Dashboards:**
-- Download artifacts from workflow run
-- `fuzz-smoke-dashboard/dashboard.html` for visual smoke status
-- `fuzz-smoke-dashboard/dashboard.json` for programmatic smoke status
-- These dashboards report zero kernel executions and are not coverage evidence
+**Guest E2E logs:**
+- The job requires exact `NILIX_KCOV_E2E_*` markers from the Ring-3 runner
+- Count/popcount consistency and distinct/stable bitmap hashes are checked before PASS
+- A guest E2E pass is regression evidence for fixed programs, not evidence of a continuous fuzz campaign
+
+**Simulator dashboards:**
+- `fuzz-smoke-dashboard/dashboard.html` and `dashboard.json` remain plumbing-only artifacts
+- Their manifest explicitly records `kernel_executions: 0`; they are not KCOV evidence
 
 **Aggregate stats:**
 - Visible in workflow step summary
@@ -321,25 +333,15 @@ make build-kcov
 
 ### Run on QEMU
 ```bash
-timeout 45 qemu-system-x86_64 \
-  -M q35 -m 512M -cpu qemu64 -smp 1 \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_VARS.fd \
-  -drive format=raw,file=fat:rw:esp-kcov \
-  -serial stdio -display none -no-reboot
+make test-kcov
 ```
 
-### Verify Boot
-```bash
-grep "KCOV" serial-kcov-phase2.txt
-# Expected output:
-# [KCOV] Coverage infrastructure initialized
-# ! SMAP requirement SKIPPED (kcov fuzzing mode)
-```
+`make test-kcov` rebuilds the guest runner, packages one `esp-kcov`, boots it, and requires the
+terminal `NILIX_KCOV_E2E_PASS` marker plus all intermediate lifecycle assertions.
 
 ### Use from Userspace
 ```rust
-// See userspace/kcov_test.rs for complete example
+// The CI guest implementation is userspace/fuzz_runner.c.
 syscall(SYS_KCOV_INIT, 4096);
 syscall(SYS_KCOV_ENABLE);
 getpid();  // Coverage collected
@@ -353,10 +355,9 @@ let count = syscall(SYS_KCOV_DUMP, buf, len);
 
 ### Why Manual Instrumentation?
 - LLVM `-C instrument-coverage` conflicts with `-Z build-std`
-- Matches Linux KCOV design (manual `-fsanitize-coverage=trace-pc`)
 - Explicit and reviewable
-- Zero overhead when disabled
-- Comparable performance to LLVM callbacks
+- Compiled out of normal non-KCOV builds
+- Best-effort and non-blocking in KCOV builds; it is not equivalent to compiler-wide instrumentation
 
 ### Why Per-Task Buffers?
 - Prevents cross-task contamination
@@ -376,19 +377,23 @@ let count = syscall(SYS_KCOV_DUMP, buf, len);
 
 | Feature | Linux KCOV | Nilix KCOV | Status |
 |---------|-----------|-----------|--------|
-| Per-task buffers | ✓ | ✓ | Match |
-| Edge tracking | ✓ | ✓ | Match |
-| IRQ-safe | ✓ | ✓ | Match |
-| Manual instrumentation | ✓ `-fsanitize-coverage` | ✓ `record_edge()` | Match |
-| Interface | ioctl | syscalls | Better |
-| Comparison mode | ✓ | Phase 4 | Planned |
-| Remote collection | ✓ debugfs | Phase 7 | Planned |
+| Per-task buffers | ✓ | ✓ 4 KiB bitmap | Implemented |
+| Automatic compiler instrumentation | ✓ sanitizer coverage | No; selected `record_edge!` tracepoints | Gap |
+| IRQ exclusion | ✓ | Hardware IRQ context skipped | Partial |
+| Control interface | `ioctl` | Private syscalls 520-524 | Different ABI |
+| Comparison mode | ✓ | No | Gap |
+| Remote coverage collection | ✓ | No | Gap |
+| Guest regression | syzkaller/external tooling | Two fixed QEMU syscall programs | Deterministic only |
 
-**Verdict:** Architecturally equivalent with better syscall ergonomics.
+**Verdict:** Nilix implements and tests a useful KCOV subset. Compiler-wide coverage and the
+host-driven syzkaller feedback loop remain open work.
 
 ---
 
-## Metrics
+## Historical Prototype Metrics
+
+The following table inventories the phase prototypes. It is not a measurement of live guest
+coverage, corpus quality, or syzkaller equivalence.
 
 | Metric | Phase 2 | Phase 3 | Phase 4 | Phase 5 | Phase 6 | Total |
 |--------|---------|---------|---------|---------|---------|-------|
@@ -419,7 +424,7 @@ let count = syscall(SYS_KCOV_DUMP, buf, len);
 | Phase 4: Mutation | ✅ Complete | 2026-07-21 |
 | Phase 5: Resources | ✅ Complete | 2026-07-21 |
 | Phase 6: Stateful | ✅ Complete | 2026-07-21 |
-| Phase 7: CI | 🚧 Partial: cargo-fuzz + smoke only | 2026-08-03 |
+| Phase 7: CI | 🚧 Partial: cargo-fuzz + deterministic guest E2E | 2026-08-04 |
 
 ---
 
@@ -484,8 +489,8 @@ For questions about the fuzzing infrastructure:
 
 ---
 
-**Last Updated:** 2026-08-03
+**Last Updated:** 2026-08-04
 
-**Current Phase:** Phase 7 partially integrated (cargo-fuzz + pipeline smoke)
+**Current Phase:** Phase 7 partially integrated (cargo-fuzz + deterministic QEMU KCOV guest E2E)
 
 **Next Milestone:** Real host-driven QEMU execution and KCOV feedback loop

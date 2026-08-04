@@ -47,3 +47,4 @@ core
 !.github/pull_request_template.md
 !roadmap.md
 !roadmap-enterprise.md
+!docs/**/*.md
