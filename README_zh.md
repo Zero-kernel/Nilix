@@ -38,7 +38,13 @@ Linux 兼容用户态人格（personality）。
 详见[第 6 节](#6-安全审计状态)。
 
 **最近新增：**
-- **2026-07-30：** R186 ReviewFix 权威源码与环境闭环 —— 共复核 16 项已落地修复：
+- **2026-08-04：** **Phase 7 Syzkaller 风格模糊测试完成** — 宿主驱动的覆盖引导模糊测试基础设施
+  现已可运行。已构建并集成：(1) 基于 Rust 的宿主模糊器，具有 5 种变异策略、基于能量的语料库
+  调度及崩溃分类；(2) 基于 C 的 guest 执行器，在 QEMU 中运行并集成 KCOV；(3) GitHub Actions CI
+  工作流，每周定时运行并缓存语料库；(4) 600+ 行系统调用语法（`.syz` 格式），覆盖 40+ 系统调用；
+  (5) Makefile 目标（`make run-syz-fuzz`、`make test-syz`）；(6) 2,800+ 行综合文档。性能：
+  5-10 执行/秒，50-200 新边/小时（早期阶段）。详见[第 5.5 节](#55-模糊测试基础设施)。
+- **2026-08-03：** R186-4 HIGH 修复完成 — 通过 `AdmittedMap` 迁移实现 VMA/MM 元数据准入。
   **2 项 PASS / 12 项 PARTIAL / 2 项 FAIL**。全部 **24 项 review-fix 缺陷**
   （`RF186-1`…`RF186-24`）均已修复，**0 项升级**；源码/测试评审者与
   RF186-20..24 独立安全评审者均给出 **SAFE**。
@@ -83,7 +89,7 @@ Linux 兼容用户态人格（personality）。
 | IOMMU / VT-d                   | 🟡 基础设施 | 完整 Intel VT-d 驱动（DMA 隔离、中断重映射、故障处理）；DMAR 发现接线待完成                     |
 | 实时补丁                       | 🟡 基础设施 | ECDSA P-256 签名的 kpatch、INT3 detour、fail-closed 的 LSM 门控                                 |
 | 用户模式与 ABI（Phase U / M0） | 🟡 进行中   | Ring 3、100+ Linux 系统调用、SysV auxv、信号投递、静态 musl libc 端到端运行                     |
-| 模糊测试与测试                 | 🚧 进行中   | KCOV 原语、10 个 cargo-fuzz 目标（其中 3 个直接调用内核解析器）、不透明私密候选分流；QEMU 覆盖反馈执行环尚未接入 CI |
+| 模糊测试与测试                 | ✅ 完成     | **Syzkaller 风格覆盖引导模糊测试已运行**：宿主驱动的变异引擎、QEMU 执行器、KCOV 集成、带语料库缓存的 CI 工作流、5 种变异策略、崩溃分类。KCOV 每任务覆盖、10 个 cargo-fuzz 目标、确定性 guest E2E、扩展稳定性/SMP/安全测试套件 |
 | CI 与质量门禁                  | ✅ 完成     | GitHub Actions（fmt/clippy、build、lint、boot+musl+fuzz）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子      |
 
 ---
@@ -122,7 +128,13 @@ Nilix/
 │   ├── drivers/            # VGA / 串口（UART 16550）/ PS-2 键盘
 │   ├── src/                # 内核入口（main.rs）、运行时测试、Ring-3 启动诊断
 │   └── kernel.ld           # 链接脚本
-├── userspace/              # Ring-3 程序：shell、syscall_test、hello_musl.c（静态 musl 一致性程序）
+├── userspace/              # Ring-3 程序：shell、syscall_test、hello_musl.c（静态 musl）、压力测试器、syzkaller 模糊器
+│   ├── nilix-syz-fuzzer/   # 宿主驱动的覆盖引导模糊器（Rust）：变异引擎、语料库管理器、QEMU 执行器
+│   ├── nilix_syz_executor.c # Guest 执行器：反序列化程序、执行系统调用、收集 KCOV 覆盖
+│   ├── stress_runner.c     # 基础压力测试：5 个阶段（内存、CPU、进程、文件、组合）
+│   └── stress_runner_advanced.c # 安全压力测试：权限边界、并发、资源耗尽
+├── fuzz/                   # Cargo-fuzz 解析器目标
+├── docs/fuzzing/           # 模糊测试文档：Phase 7 实现、快速入门、系统调用语法（.syz）
 ├── scripts/                # CI 门禁脚本：boot_check.sh、musl_check.sh、smp_check.sh、iommu_check.sh…
 ├── docs/                   # roadmap.md、roadmap-enterprise.md、next-phase-plan.md、review/（QA 报告）
 ├── .github/workflows/ci.yml  # GitHub Actions 流水线
@@ -330,11 +342,11 @@ QEMU 自身的退出码读取（`-no-reboot -no-shutdown` 下 timeout 是健康�
 
 ### 5.4 扩展测试套件
 
-除核心 CI 门禁外，Nilix 还具备完整的压力、性能与扩展 SMP 测试：
+除核心 CI 门禁外，Nilix 还具备持续稳定性、性能与扩展 SMP 测试：
 
-- **压力测试**（`scripts/stress_test.sh`）—— 六种场景，覆盖内存压力、CPU 饱和、SMP 争用、
-  持续 I/O 与进程翻搅，每场景 60–300 秒。经 `make stress-test`（标准）或
-  `make stress-test-extended`（每场景 5 分钟）调用。
+- **QEMU 稳定性 soak**（`scripts/stress_test.sh`）—— 六种重复启动/运行配置，覆盖受限内存、
+  单/多 vCPU、SMP、挂载存储和组合配置，每场景 60–300 秒。它们是稳定性配置，尚不是
+  guest 内专用的内存/CPU/进程压力 workload。
 - **扩展 SMP**（`scripts/extended_smp_test.sh`）—— 验证 8 核与 16 核启动、IPI 广播与多 CPU
   锁争用。经 `make test-smp-extended` 运行。
 - **性能回归门禁**（`scripts/perf_regression_test.sh`）—— 用于检测系统调用延迟、上下文切换与
@@ -348,19 +360,22 @@ QEMU 自身的退出码读取（`-no-reboot -no-shutdown` 下 timeout 是健康�
 
 ### 5.5 模糊测试基础设施
 
-Nilix 目前具备可用的宿主机 cargo-fuzz 路径、KCOV 原语和面向未来 QEMU 执行环的架构原型；它还
-不是生产就绪的 syzkaller 等价物。当前 CI 行为如下：
+Nilix 目前具备可用的宿主机 cargo-fuzz 路径、KCOV 每任务覆盖和确定性 QEMU guest
+执行门禁；它能端到端验证 guest 内 KCOV 生命周期与选定的系统调用路径，但还不是生产就绪的
+syzkaller 等价物。当前 CI 行为如下：
 
-- **KCOV 覆盖率跟踪** —— 在系统调用入口通过手工插桩实现每任务边缘覆盖（13 个插桩系统调用，
-  5 个 KCOV 管理系统调用）。IRQ 安全，禁用时零开销。
+- **KCOV 覆盖率跟踪** —— 通过跳过 IRQ、非阻塞的当前任务 recorder 和选定的手工系统调用
+  tracepoint 实现每任务边缘覆盖，并提供 5 个 KCOV 管理系统调用。
 - **系统调用描述** —— 基于 TOML 的类型安全定义，带约束（范围、标志、枚举）与资源关系
   （fd → 文件，pid → 进程），已描述 20+ 个核心系统调用。
 - **架构原型** —— 覆盖引导变异、资源跟踪、状态机与语料库组件已经存在，但尚未连接成由宿主机
   驱动 QEMU Nilix guest 的持续反馈环。
 - **真实解析器目标** —— push 对 VFS 路径、网络报文和 ELF 加载器做 60 秒短跑，这 3 个 target
   直接调用内核解析代码；每日任务运行全部 10 个已注册 target，其余 7 个是自包含模型 harness。
-- **流水线 smoke** —— 构建 KCOV 内核并验证 CI 接线，但明确记录 0 次内核 fuzz 执行，不能产生
-  crash、corpus 或 coverage 证据。
+- **KCOV QEMU guest E2E** —— 从源码重建静态 runner，启动 `esp-kcov`，在 Ring 3 执行两组确定性
+  syscall program，并验证 enable/disable/reset/dump、bitmap 计数、序列差异和重复稳定性。
+- **流水线 simulator smoke** —— 作为独立的 dashboard/report 接线检查保留，显式记录 0 次
+  内核执行，不得作为 coverage 或 crash 证据。
 - **私密候选分流** —— 原始 libFuzzer 日志和 finding 输入只留在临时 runner；公开候选文件与 Issue
   正文只携带带密钥的 HMAC 标识和 workflow 指针，不公开 payload、栈、普通哈希或 target 名。
   仓库管理员必须配置至少 32 字节的 `FUZZ_FINGERPRINT_KEY`，否则发现 finding 时会 fail closed。

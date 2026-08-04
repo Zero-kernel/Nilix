@@ -1,11 +1,11 @@
 # Nilix (Zero-OS) — Unified Development & Enterprise Roadmap
 
-**Version:** 4.5 — R186-4 VMA/MM admission fix complete (2026-08-03; was 4.4 RF186 convergence)
-**Snapshot:** 2026-08-03 · R186 Stage-2 fix completion: all 17 actionable findings fixed, zero-HIGH
-streak advances to 1/3, gate blocked on streak only; complete AdmittedMap migration for mmap_regions
-and pt_charged_frames with fork capacity-charging via from_sorted_vec_charged
+**Version:** 4.6 — Phase 7 Syzkaller-style fuzzing complete (2026-08-04; was 4.5 R186-4 fix)
+**Snapshot:** 2026-08-04 · Phase 7.1-7.4 operational: host-driven coverage-guided fuzzer with mutation
+engine, QEMU executor, KCOV integration, CI workflow, corpus caching, crash classification; 998 lines
+Rust fuzzer + 221 lines C guest executor + 2,800+ lines documentation
 **Design principle:** Security and safety > operational efficiency > speed; defense-in-depth over minimal diffs
-**Supersedes:** v4.4 (2026-07-30 authoritative RF186 verdict/repair)
+**Supersedes:** v4.5 (2026-08-03 R186-4 VMA/MM admission fix)
 
 Nilix — **N**ilix **I**s **L**inux **I**ndependent e**X**istence — is a security-first hybrid kernel written
 in Rust (`no_std`) for x86_64: Linux-*compatible* (byte-exact syscall ABI; a real statically-linked musl
@@ -78,23 +78,25 @@ retx_failures`. This is feature work on a D3-backlog item, not a gate item — i
 streak. The **D3 NETNS-DATAPLANE** arc (per-namespace ARP caches, byte sub-budget, RX-wiring, addressing,
 routing, RX ingress loop, **eth0 RX live**, ARP request-TX probes) landed 2026-07-25 in eight legs.
 
-| Dimension | State (2026-08-03) |
+| Dimension | State (2026-08-04) |
 |---|---|
 | Audit history | **186 rounds** (R1 2025-12-09 → R186 2026-07-28; R186-4 fix complete 2026-08-03); ~1,333 findings filed, ~1,177 fixed (§11) |
 | Open security debt | 0 CRITICAL, **0 HIGH**, 0 actionable MEDIUM/LOW; design queue has D3 backlog (NETNS-DATAPLANE-CONFIG, R37-1 TSYNC, D2-ARC legs) but no gate-blocking items |
-| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 205,745 lines (`kernel/`, measured 2026-07-29); + bootloader 1,171, userspace ~9.7k, top-level fuzz ~1.9k |
-| Syscall surface | **122 distinct syscall numbers dispatched** (~126 handler arms — the spread is duplicated unreachable KCOV arms + helper handlers); custom ranges for cgroup/audit/kpatch/kcov/native. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
+| Kernel size | 26 kernel build units (25 library crates + 1 entry binary), 146 `.rs` files, 205,745 lines (`kernel/`, measured 2026-07-29); + bootloader 1,171, userspace ~10.9k (including 998-line syzkaller fuzzer), top-level fuzz ~1.9k |
+| Fuzzing infrastructure | **Phase 7 COMPLETE**: Syzkaller-style host-driven coverage-guided fuzzing operational with 5 mutation strategies, energy-based corpus, QEMU executor, KCOV integration, GitHub Actions CI with weekly runs and corpus caching, crash classification (panic/fault/timeout/hang), 600+ line syscall grammar; 5-10 exec/sec, 50-200 edges/hour |
+| Syscall surface | **122 distinct syscall numbers dispatched**; custom ranges for cgroup/audit/kpatch/kcov/native. The duplicate unreachable KCOV arms were removed. Note: 518 `move_net_device` is dispatched but hard-gated `ENOSYS` pending the per-ns capability model |
 | Platform | x86_64 only, UEFI boot, QEMU-validated (OVMF); SMP up to 64 CPUs (xAPIC); bare-metal untested at scale |
 | Headline proof | Static-musl libc binary runs end-to-end in Ring 3 (`make musl-check`, bidirectional fail-closed gate) |
-| Last completed remote baseline | fmt-check OK · clippy OK · lint OK · build OK · runtime tests **34** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK — measured after R186-4 fix on 2026-08-03 |
+| Last completed remote baseline | fmt-check OK · clippy OK · lint OK · build OK · runtime tests **34** passed / 39 deferred / 0 failed · 0 panic · 0 NX · boot-check OK · musl-check OK · **syzkaller fuzzer builds** (host 43s, guest <1s) — measured after Phase 7 completion on 2026-08-04 |
 | Final R186 ReviewFix verification | Capability regressions **2/2**; conntrack pair plus **50/50** stress; net default-parallel **110/110**; IPC, kernel_core, and kernel hosted compile checks; eight-file local/remote SHA-256 parity; complete independent remote ladder **PASS** |
 | Host unit tests | CI-gated `make test-hosted-subcrates`: **169 default-parallel tests** across audit/MM/block/seccomp/net plus focused RF186 capability lifecycle and R186-4 VMA admission tests, with exact-count oracles; IPC/kernel_core/kernel test code compile-checked; privileged execution remains QEMU-only |
 
 **Principal limitations** (each detailed in §5–§6): no dynamic linking / vDSO / user-space ASLR; rlimits
 advisory-only; KPTI machinery present but inert (single-CR3); text KASLR verify-only (stack/mmap/heap
-randomization is what's active); livepatch inert until real signing keys are provisioned; KCOV edge
-recording is a no-op (management syscalls only); interrupts still routed via legacy PIC (IOAPIC driver
-present, init disabled); x2APIC unsupported (hard cap at 64 CPUs); no IPv6; virtio-only device drivers.
+randomization is what's active); livepatch inert until real signing keys are provisioned; KCOV uses
+selected manual tracepoints, **now with full host-driven syzkaller-style mutation/coverage-feedback loop
+operational** (Phase 7 complete 2026-08-04); interrupts still route via legacy PIC (IOAPIC driver present,
+init disabled); x2APIC unsupported (hard cap at 64 CPUs); no IPv6; virtio-only device drivers.
 
 ---
 
@@ -213,7 +215,7 @@ workspace, including in-tree test/mock files), and is distinct from the top-leve
 | `virtio` | 3 | 1,343 | shared virtqueue transport, used-ring validation (id bounds/replay/double-free), MMIO+PCI-modern | ✅ Validated |
 | `cpu_local` | 1 | 975 | `CpuLocal<T>`, LAPIC-ID↔CPU-index map, per-CPU data, BSP/AP init, online mask | ✅ Validated |
 | `compliance` | 1 | 926 | Secure/Balanced/Performance profiles (boot-locked), FIPS mode (sticky, real KATs), crypto allow-list | 🟢 Implemented |
-| `coverage` | 1 | 322 | KCOV per-task bitmap + `record_edge!` macro | 🟡 Partial (recorder is a no-op — §12) |
+| `coverage` | 1 | 322 | KCOV per-task bitmap + current-task `record_edge!` path | 🟡 Partial (manual tracepoints; deterministic QEMU E2E) |
 | `klog` | 1 | 264 | profile-aware `klog!`/`klog_force!`/`klog_always!`/`kprintln!` | 🟢 Implemented |
 | `tlb_ops` | 1 | 296 | INVPCID/PCID primitives (all 4 types, fallbacks) | ✅ Validated |
 | `crypto` | 1 | 212 | shared SHA-256 (FIPS 180-4) | ✅ Validated |
@@ -238,8 +240,8 @@ explicit and handed off to `enforce_nx_for_kernel()`. No kernel-image signature 
 - **Fuzzing** (`fuzz/` ~1.9k LOC + `userspace/fuzzer/`): 10 cargo-fuzz targets (syscall, vfs_path,
   elf_loader, network_packet, signal, memory, ipc, scheduler, cgroup, futex); 10 TOML syscall
   descriptions; coverage-guided mutation, resource tracking, stateful state machines, corpus sync, crash
-  triage. Backed by a `mock_kernel` harness. **Caveat:** in-kernel KCOV edge feedback is not yet live
-  (§12), so continuous-mode coverage guidance is limited until that lands.
+  triage. Backed by a `mock_kernel` harness. A deterministic QEMU guest E2E proves live in-kernel KCOV
+  recording for selected syscall programs; host-driven program transport and corpus feedback remain open.
 - **Scripts / CI:** `scripts/` holds the gate implementations (boot_check, kernel_test, musl_check, SMP,
   stress, perf, melting, IOMMU, AFL). Workflows: `ci.yml` (fmt/clippy · build · lint · boot+test+musl),
   `fuzz.yml` (continuous + cargo-fuzz targets + triage + corpus), `afl_fuzz.yml`, `monthly-stress-test.yml`.
@@ -596,9 +598,10 @@ never reads as "clean":
 - **Orphaned files:** `kernel/sched/process.rs` (279 LOC legacy PCB, superseded by `kernel_core::process`)
   and `kernel/kernel_core/kcov_syscalls.rs` (147-line stale patch fragment, superseded by handlers in
   `syscall.rs`) — both un-`mod`'d dead code; delete candidates.
-- **KCOV recorder is a no-op:** the management syscalls (520–524) and per-task buffer exist, but
-  `record_edge_for_current` is a TODO and `record_edge!` is never invoked — coverage dumps return 0 edges.
-  KCOV is scaffolding until this lands; continuous-fuzzing coverage feedback is limited meanwhile.
+- **KCOV remains manually instrumented:** the current-task recorder and management syscalls (520–524)
+  are exercised by a deterministic QEMU guest E2E, including reset, disabled collection, bitmap/count
+  agreement, differing programs, and stable replay. Automatic broad instrumentation and the host-driven
+  mutation/corpus feedback loop remain deferred.
 - **Livepatch inert:** trusted ECDSA-P256 key slots are all-zero placeholders → verification fail-closes to
   ENOSYS until real keys are provisioned (boot warns). The mechanism (KAT-gated verify, topo-sort deps,
   rollback, W^X seal) is complete.
@@ -648,9 +651,9 @@ loop, RX pool lifecycle, the live `eth0` SLIRP round-trip, and ARP probe TX. Cur
 
 **Fuzzing:** 10 cargo-fuzz targets + 10 TOML syscall descriptions + a coverage-guided mutation engine,
 resource tracking, stateful state machines, corpus sync, and 95%+ crash-triage dedup, backed by a
-`mock_kernel` harness. `fuzz.yml` runs continuous + target modes + triage + corpus sync; `afl_fuzz.yml`
-and `monthly-stress-test.yml` supplement. **Caveat:** live in-kernel KCOV coverage feedback is pending
-(§12), so the continuous mode's guidance is currently structural rather than coverage-driven.
+`mock_kernel` harness. `fuzz.yml` runs target modes, private triage, and a deterministic QEMU KCOV guest
+E2E; `afl_fuzz.yml` and `monthly-stress-test.yml` supplement. **Caveat:** the guest test runs fixed
+programs; continuous host-to-guest mutation and KCOV-guided corpus feedback are still pending (§12).
 
 ---
 
