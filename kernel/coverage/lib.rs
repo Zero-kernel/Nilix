@@ -53,17 +53,18 @@
 //! - SMAP-compliant: all userspace access gated
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate alloc;
 extern crate spin;
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
+use cpu_local::CpuLocal;
+use spin::{Mutex, Once};
 
-/// Maximum coverage buffer size (4KB = 32K edges)
+/// Maximum coverage buffer size (4KB = 32K edges).
 pub const KCOV_BUFFER_SIZE: usize = 4096;
 
 /// Coverage buffer: bitmap tracking which edges have been hit
@@ -77,20 +78,24 @@ pub struct CoverageBuffer {
     enabled: bool,
 }
 
-impl Default for CoverageBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CoverageBuffer {
-    /// Create a new coverage buffer
-    pub fn new() -> Self {
-        CoverageBuffer {
-            bitmap: vec![0u8; KCOV_BUFFER_SIZE],
+    /// Create a coverage buffer with an explicit byte length.
+    ///
+    /// The length is immutable and bounded by [`KCOV_BUFFER_SIZE`], which keeps
+    /// per-task memory consumption predictable even for hostile callers.
+    pub fn try_new(buffer_size: usize) -> Option<Self> {
+        if buffer_size == 0 || buffer_size > KCOV_BUFFER_SIZE {
+            return None;
+        }
+
+        let mut bitmap = Vec::new();
+        bitmap.try_reserve_exact(buffer_size).ok()?;
+        bitmap.resize(buffer_size, 0);
+        Some(Self {
+            bitmap,
             edge_count: 0,
             enabled: false,
-        }
+        })
     }
 
     /// Enable coverage collection
@@ -116,7 +121,7 @@ impl CoverageBuffer {
             return;
         }
 
-        let byte_idx = (edge_id as usize / 8) % KCOV_BUFFER_SIZE;
+        let byte_idx = (edge_id as usize / 8) % self.bitmap.len();
         let bit_idx = edge_id % 8;
 
         // Check if this edge was already hit
@@ -145,6 +150,12 @@ impl CoverageBuffer {
         self.edge_count as usize
     }
 
+    /// Configured bitmap length in bytes.
+    #[inline]
+    pub fn bitmap_len(&self) -> usize {
+        self.bitmap.len()
+    }
+
     /// Reset coverage data
     pub fn reset(&mut self) {
         self.bitmap.fill(0);
@@ -155,8 +166,46 @@ impl CoverageBuffer {
 /// Global coverage enabled flag
 static COVERAGE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Kernel-owned bridge that resolves the current task and records into its buffer.
+pub type CurrentTaskRecorder = fn(u32);
+
+static CURRENT_TASK_RECORDER: Once<CurrentTaskRecorder> = Once::new();
+
+/// Suppresses recursive tracepoints on the same CPU while the recorder bridge runs.
+static RECORDER_ACTIVE: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
+
+struct RecorderGuard;
+
+impl RecorderGuard {
+    #[inline]
+    fn try_enter() -> Option<Self> {
+        let already_active = RECORDER_ACTIVE.with(|active| active.swap(true, Ordering::Relaxed));
+        if already_active {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for RecorderGuard {
+    #[inline]
+    fn drop(&mut self) {
+        RECORDER_ACTIVE.with(|active| active.store(false, Ordering::Relaxed));
+    }
+}
+
 /// Initialize the coverage subsystem
-pub fn init_coverage() {
+pub fn init_coverage(recorder: CurrentTaskRecorder) {
+    let installed = *CURRENT_TASK_RECORDER.call_once(|| recorder);
+    assert!(
+        core::ptr::fn_addr_eq(installed, recorder),
+        "KCOV current-task recorder registered more than once"
+    );
+
+    // CpuLocal allocates and initializes the complete MAX_CPUS slot array through
+    // one global Once. The BSP call therefore prepares every future AP slot too.
+    RECORDER_ACTIVE.force_init();
     COVERAGE_ENABLED.store(true, Ordering::Release);
 }
 
@@ -171,14 +220,13 @@ pub fn is_coverage_enabled() -> bool {
 /// # Returns
 /// - `Some(buffer)`: Successfully allocated
 /// - `None`: Allocation failed
-pub fn enable_coverage() -> Option<Arc<Mutex<CoverageBuffer>>> {
+pub fn enable_coverage(buffer_size: usize) -> Option<Arc<Mutex<CoverageBuffer>>> {
     if !is_coverage_enabled() {
         return None;
     }
 
-    // Allocate coverage buffer
-    let buffer = CoverageBuffer::new();
-    Some(Arc::new(Mutex::new(buffer)))
+    let buffer = CoverageBuffer::try_new(buffer_size)?;
+    Arc::try_new(Mutex::new(buffer)).ok()
 }
 
 /// Record an edge hit for the current task
@@ -186,22 +234,18 @@ pub fn enable_coverage() -> Option<Arc<Mutex<CoverageBuffer>>> {
 /// This is the hot path, called from `record_edge!()` macro.
 /// Must be IRQ-safe, no allocations, no blocking.
 #[inline]
-pub fn record_edge_for_current(_edge_id: u32) {
-    // Fast path: check if coverage is globally enabled
-    if is_coverage_enabled() {
-        // Get current process's coverage buffer
-        // This will be integrated with kernel_core::process::with_current_process
-        // For now, this is a no-op until the full integration is complete
+pub fn record_edge_for_current(edge_id: u32) {
+    if !is_coverage_enabled() || cpu_local::current_cpu().in_irq() {
+        return;
     }
 
-    // TODO: Integrate with kernel_core to access current process:
-    // with_current_process(|proc| {
-    //     if let Some(ref buffer) = proc.coverage_buffer {
-    //         if let Some(mut buf) = buffer.try_lock() {
-    //             buf.record_edge(edge_id);
-    //         }
-    //     }
-    // });
+    let Some(_guard) = RecorderGuard::try_enter() else {
+        return;
+    };
+
+    if let Some(recorder) = CURRENT_TASK_RECORDER.get().copied() {
+        recorder(edge_id);
+    }
 }
 
 /// Manual trace point for testing coverage infrastructure
@@ -221,8 +265,6 @@ pub fn trace_pc(edge_id: u32) {
         return;
     }
 
-    // This will be completed when kernel_core integration is done
-    // For now, this ensures the code compiles and can be called
     record_edge_for_current(edge_id);
 }
 
@@ -247,7 +289,7 @@ macro_rules! record_edge {
         {
             // Generate unique edge ID from file:line
             const EDGE_ID: u32 = {
-                let file_hash = const_fnv1a_hash(file!().as_bytes());
+                let file_hash = $crate::const_fnv1a_hash(file!().as_bytes());
                 let line_hash = line!();
                 file_hash.wrapping_mul(31).wrapping_add(line_hash)
             };
@@ -257,8 +299,8 @@ macro_rules! record_edge {
 }
 
 /// Compile-time FNV-1a hash for generating edge IDs
-#[allow(dead_code)]
-const fn const_fnv1a_hash(bytes: &[u8]) -> u32 {
+#[doc(hidden)]
+pub const fn const_fnv1a_hash(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261; // FNV offset basis
     let mut i = 0;
     while i < bytes.len() {
@@ -272,10 +314,18 @@ const fn const_fnv1a_hash(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicU32;
+
+    static RECORDED_EDGE: AtomicU32 = AtomicU32::new(0);
+
+    fn recursive_test_recorder(edge_id: u32) {
+        RECORDED_EDGE.store(edge_id, Ordering::Relaxed);
+        record_edge_for_current(edge_id.wrapping_add(1));
+    }
 
     #[test]
     fn test_coverage_buffer_basic() {
-        let mut buf = CoverageBuffer::new();
+        let mut buf = CoverageBuffer::try_new(KCOV_BUFFER_SIZE).expect("KCOV test buffer");
         assert_eq!(buf.edge_count(), 0);
 
         buf.enable();
@@ -293,14 +343,14 @@ mod tests {
 
     #[test]
     fn test_coverage_buffer_disabled() {
-        let mut buf = CoverageBuffer::new();
+        let mut buf = CoverageBuffer::try_new(KCOV_BUFFER_SIZE).expect("KCOV test buffer");
         buf.record_edge(0);
         assert_eq!(buf.edge_count(), 0); // Should be 0 when disabled
     }
 
     #[test]
     fn test_coverage_buffer_reset() {
-        let mut buf = CoverageBuffer::new();
+        let mut buf = CoverageBuffer::try_new(KCOV_BUFFER_SIZE).expect("KCOV test buffer");
         buf.enable();
         buf.record_edge(0);
         buf.record_edge(1);
@@ -311,6 +361,22 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_buffer_size_is_enforced() {
+        assert!(CoverageBuffer::try_new(0).is_none());
+        assert!(CoverageBuffer::try_new(KCOV_BUFFER_SIZE + 1).is_none());
+
+        let mut buf = CoverageBuffer::try_new(17).expect("small KCOV buffer");
+        assert_eq!(buf.bitmap_len(), 17);
+        let mut snapshot = [0u8; 17];
+        buf.enable();
+        buf.record_edge(0);
+        buf.record_edge((17 * 8 - 1) as u32);
+        assert_eq!(buf.copy_to_user(&mut snapshot), snapshot.len());
+        assert_eq!(buf.edge_count(), 2);
+        assert_eq!(snapshot.iter().map(|byte| byte.count_ones()).sum::<u32>(), 2);
+    }
+
+    #[test]
     fn test_const_fnv1a_hash() {
         let hash1 = const_fnv1a_hash(b"test");
         let hash2 = const_fnv1a_hash(b"test");
@@ -318,5 +384,12 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_current_task_recorder_suppresses_recursion() {
+        init_coverage(recursive_test_recorder);
+        record_edge_for_current(0x1234_5678);
+        assert_eq!(RECORDED_EDGE.load(Ordering::Relaxed), 0x1234_5678);
     }
 }
