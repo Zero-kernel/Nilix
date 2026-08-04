@@ -1,0 +1,411 @@
+# Nilix Kernel Syscall Descriptions for Syzkaller-Style Fuzzing
+#
+# Security > Correctness > Efficiency > Performance
+#
+# This file defines the Nilix kernel syscall interface in a syzkaller-compatible
+# format for coverage-guided fuzzing. Each syscall is described with:
+# - Argument types and constraints
+# - Resource dependencies (fd, pid, memory regions)
+# - Return value semantics
+# - Valid flag combinations
+#
+# Syntax: syzkaller description language v2
+# Reference: https://github.com/google/syzkaller/blob/master/docs/syscall_descriptions.md
+
+include <stddef.h>
+include <fcntl.h>
+include <sys/mman.h>
+include <signal.h>
+
+# Core resource types
+resource fd[int32]: 0, AT_FDCWD
+resource pid[int32]: 0
+resource addr[intptr]
+
+# Memory protection flags
+define PROT_NONE	0x0
+define PROT_READ	0x1
+define PROT_WRITE	0x2
+define PROT_EXEC	0x4
+
+# mmap flags
+define MAP_SHARED	0x01
+define MAP_PRIVATE	0x02
+define MAP_FIXED	0x10
+define MAP_ANONYMOUS	0x20
+
+# Open flags
+define O_RDONLY		0x0000
+define O_WRONLY		0x0001
+define O_RDWR		0x0002
+define O_CREAT		0x0040
+define O_EXCL		0x0080
+define O_TRUNC		0x0200
+define O_APPEND		0x0400
+define O_NONBLOCK	0x0800
+define O_CLOEXEC	0x80000
+
+# File operations
+sys_read(fd fd, buf buffer[out], count len[buf]) len[buf]
+sys_write(fd fd, buf buffer[in], count len[buf]) len[buf]
+sys_open(path ptr[in, filename], flags flags[open_flags], mode int32) fd
+sys_close(fd fd)
+sys_lseek(fd fd, offset fileoff, whence flags[seek_whence]) fileoff
+sys_stat(path ptr[in, filename], statbuf ptr[out, stat])
+sys_fstat(fd fd, statbuf ptr[out, stat])
+sys_unlink(path ptr[in, filename])
+sys_rename(oldpath ptr[in, filename], newpath ptr[in, filename])
+sys_mkdir(path ptr[in, filename], mode int32)
+sys_rmdir(path ptr[in, filename])
+sys_getdents(fd fd, dirp ptr[out, array[int8]], count len[dirp]) len[dirp]
+sys_readlink(path ptr[in, filename], buf buffer[out], bufsiz len[buf]) len[buf]
+sys_symlink(target ptr[in, filename], linkpath ptr[in, filename])
+
+open_flags = O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC
+seek_whence = 0, 1, 2
+
+# Memory management
+sys_brk(addr addr) addr
+sys_mmap(addr addr, length len[addr], prot flags[mmap_prot], flags flags[mmap_flags], fd fd, offset fileoff[int64]) addr
+sys_munmap(addr addr, length len[addr])
+sys_mprotect(addr addr, len len[addr], prot flags[mmap_prot])
+
+mmap_prot = PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC
+mmap_flags = MAP_SHARED, MAP_PRIVATE, MAP_FIXED, MAP_ANONYMOUS
+
+# Process management
+sys_fork() pid
+sys_execve(filename ptr[in, filename], argv ptr[in, array[ptr[in, string]]], envp ptr[in, array[ptr[in, string]]])
+sys_exit(code int32)
+sys_wait4(status ptr[out, int32])
+sys_getpid() pid
+sys_getppid() pid
+sys_kill(pid pid, sig signalno)
+sys_clone(flags flags[clone_flags], stack addr, parent_tid ptr[out, int32], child_tid ptr[out, int32], tls intptr) pid
+
+clone_flags = 0x00010000, 0x00020000, 0x00040000, 0x00080000
+
+# Signal handling
+sys_rt_sigaction(sig signalno, act ptr[in, sigaction], oldact ptr[out, sigaction], sigsetsize len[sigset])
+sys_rt_sigprocmask(how flags[sigprocmask_how], set ptr[in, sigset], oldset ptr[out, sigset], sigsetsize len[sigset])
+sys_sigaltstack(ss ptr[in, stack_t], old_ss ptr[out, stack_t])
+
+sigprocmask_how = 0, 1, 2
+signalno = 1, 2, 3, 6, 9, 10, 11, 14, 15
+
+# Futex operations
+sys_futex(uaddr ptr[in, int32], op flags[futex_op], val int32, timeout ptr[in, timespec], uaddr2 ptr[in, int32], val3 int32)
+
+futex_op = 0, 1, 2, 3, 128, 129
+
+# Networking (virtio-net)
+sys_socket(domain flags[socket_domain], type flags[socket_type], protocol int32) fd
+sys_bind(sockfd fd, addr ptr[in, sockaddr], addrlen len[addr])
+sys_listen(sockfd fd, backlog int32)
+sys_accept(sockfd fd, addr ptr[out, sockaddr], addrlen ptr[inout, len[addr]]) fd
+sys_connect(sockfd fd, addr ptr[in, sockaddr], addrlen len[addr])
+sys_sendto(sockfd fd, buf buffer[in], len len[buf], flags int32, dest_addr ptr[in, sockaddr], addrlen len[dest_addr]) len[buf]
+sys_recvfrom(sockfd fd, buf buffer[out], len len[buf], flags int32, src_addr ptr[out, sockaddr], addrlen ptr[inout, len[src_addr]]) len[buf]
+
+socket_domain = 2, 10
+socket_type = 1, 2, 3
+
+# Cgroup operations (if enabled)
+sys_cgroup_create(name ptr[in, string], parent_fd fd)
+sys_cgroup_destroy(cgroup_fd fd)
+sys_cgroup_attach(cgroup_fd fd, pid pid)
+
+# KCOV operations (fuzzing infrastructure)
+sys_kcov_init(size int32)
+sys_kcov_enable()
+sys_kcov_disable()
+sys_kcov_dump(buf ptr[out, array[int32]], len len[buf]) len[buf]
+sys_kcov_reset()
+
+# Type definitions
+type buffer[dir] ptr[dir, array[int8]]
+type fileoff[underlying] underlying
+type filename string[filename]
+
+stat {
+	st_dev		int64
+	st_ino		int64
+	st_mode		int32
+	st_nlink	int32
+	st_uid		int32
+	st_gid		int32
+	st_rdev		int64
+	st_size		int64
+	st_blksize	int32
+	st_blocks	int64
+}
+
+sigaction {
+	sa_handler	intptr
+	sa_flags	int32
+	sa_restorer	intptr
+	sa_mask		int64
+}
+
+sigset {
+	mask	int64
+}
+
+stack_t {
+	ss_sp		addr
+	ss_flags	int32
+	ss_size		intptr
+}
+
+timespec {
+	tv_sec		int64
+	tv_nsec		int64
+}
+
+sockaddr [
+	in	sockaddr_in
+	in6	sockaddr_in6
+]
+
+sockaddr_in {
+	family	const[2, int16]
+	port	int16be
+	addr	int32be
+	pad		array[const[0, int8], 8]
+}
+
+sockaddr_in6 {
+	family		const[10, int16]
+	port		int16be
+	flowinfo	int32
+	addr		array[int8, 16]
+	scope_id	int32
+}
+
+# Resource generation rules
+# These define how to generate valid instances of resource types
+
+# Generate file descriptors by opening files
+fd = sys_open, sys_socket, sys_accept
+
+# Generate process IDs by forking
+pid = sys_fork, sys_clone, sys_getpid
+
+# Generate addresses by mapping memory
+addr = sys_mmap, sys_brk
+
+# Mutation hints for coverage-guided fuzzing
+# These guide the fuzzer toward interesting input combinations
+
+# Interesting integer values
+interesting_int8 = 0, 1, -1, 127, -128, 16, 32, 64
+interesting_int16 = 0, 1, -1, 0x7fff, -0x8000, 0x100, 0x200
+interesting_int32 = 0, 1, -1, 0x7fffffff, -0x80000000, 0x10000, 0x100000
+interesting_size = 0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536
+
+# Interesting addresses (page-aligned boundaries)
+interesting_addr = 0, 0x1000, 0x10000, 0x100000, 0x7fff0000, 0x80000000
+
+# File path corpus seeds
+filename_seeds = "/", "/tmp", "/dev/null", "/proc/self", "/nilix-test.tmp",
+                 "/mnt/test", "/very/long/path/that/exercises/buffer/limits/in/vfs/layer",
+                 ".", "..", "/./.", "/../..", "//double//slash"
+
+# Flag combination seeds
+# These are known-valid combinations that serve as mutation seeds
+mmap_prot_seeds = PROT_NONE, PROT_READ, PROT_READ|PROT_WRITE, PROT_READ|PROT_EXEC
+mmap_flags_seeds = MAP_PRIVATE|MAP_ANONYMOUS, MAP_SHARED|MAP_ANONYMOUS, MAP_PRIVATE|MAP_FIXED
+open_flags_seeds = O_RDONLY, O_WRONLY, O_RDWR, O_RDWR|O_CREAT, O_RDWR|O_CREAT|O_EXCL
+
+# Syscall sequences that create interesting kernel states
+# These multi-syscall sequences are mutation seeds for stateful fuzzing
+
+# File lifecycle
+sequence file_lifecycle {
+	$fd = sys_open("/nilix-test.tmp", O_RDWR|O_CREAT, 0600)
+	sys_write($fd, "test data", 9)
+	sys_lseek($fd, 0, 0)
+	sys_read($fd, $buf[16], 16)
+	sys_close($fd)
+	sys_unlink("/nilix-test.tmp")
+}
+
+# Memory lifecycle
+sequence memory_lifecycle {
+	$addr = sys_mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+	sys_mprotect($addr, 4096, PROT_READ)
+	sys_munmap($addr, 4096)
+}
+
+# Process lifecycle
+sequence process_lifecycle {
+	$pid = sys_fork()
+	sys_wait4($status)
+}
+
+# Signal handling
+sequence signal_handling {
+	sys_rt_sigaction(10, $act, 0, 8)
+	$pid = sys_getpid()
+	sys_kill($pid, 10)
+}
+
+# Concurrent file access
+sequence concurrent_files {
+	$fd1 = sys_open("/nilix-concurrent.tmp", O_RDWR|O_CREAT, 0600)
+	$fd2 = sys_open("/nilix-concurrent.tmp", O_RDONLY, 0)
+	sys_write($fd1, "data", 4)
+	sys_read($fd2, $buf[16], 16)
+	sys_close($fd1)
+	sys_close($fd2)
+	sys_unlink("/nilix-concurrent.tmp")
+}
+
+# KCOV coverage collection
+sequence kcov_collection {
+	sys_kcov_init(4096)
+	sys_kcov_enable()
+	sys_getpid()
+	sys_getppid()
+	sys_kcov_disable()
+	sys_kcov_dump($buf[1024], 1024)
+	sys_kcov_reset()
+}
+
+# Edge cases and boundary conditions for fuzzer exploration
+
+# Test null pointer handling
+test_case null_pointers {
+	sys_read(0, 0, 1)  # Expected: -EFAULT
+	sys_write(1, 0, 1)  # Expected: -EFAULT
+	sys_stat(0, $statbuf)  # Expected: -EFAULT
+}
+
+# Test invalid file descriptors
+test_case invalid_fds {
+	sys_close(-1)  # Expected: -EBADF
+	sys_read(9999, $buf[16], 16)  # Expected: -EBADF
+	sys_write(-42, "data", 4)  # Expected: -EBADF
+}
+
+# Test size overflows
+test_case size_overflows {
+	sys_mmap(0, 0xffffffffffffffff, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)  # Expected: -ENOMEM or -EINVAL
+	sys_read(0, $buf[16], 0xffffffffffffffff)  # Expected: -EINVAL
+}
+
+# Test invalid flags
+test_case invalid_flags {
+	sys_open("/test", 0xdeadbeef, 0600)  # Expected: -EINVAL
+	sys_mmap(0, 4096, 0xff, 0xff, -1, 0)  # Expected: -EINVAL
+}
+
+# Test kernel address space boundaries
+test_case kernel_addresses {
+	sys_munmap(0xffff800000000000, 4096)  # Expected: -EINVAL (kernel space)
+	sys_mprotect(0xfffffffffffff000, 4096, PROT_READ)  # Expected: -EINVAL
+}
+
+# Test unaligned operations
+test_case unaligned_operations {
+	sys_mmap(0x1001, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0)  # Expected: -EINVAL (unaligned)
+}
+
+# Test double-free patterns
+test_case double_operations {
+	$fd = sys_open("/test.tmp", O_RDWR|O_CREAT, 0600)
+	sys_close($fd)
+	sys_close($fd)  # Expected: -EBADF (double close)
+
+	$addr = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+	sys_munmap($addr, 4096)
+	sys_munmap($addr, 4096)  # Expected: -EINVAL (double unmap)
+}
+
+# Test race conditions
+test_case concurrent_close {
+	$fd = sys_open("/race.tmp", O_RDWR|O_CREAT, 0600)
+	# Fork and both parent/child close same fd
+	$pid = sys_fork()
+	sys_close($fd)
+}
+
+# Test resource exhaustion
+test_case resource_exhaustion {
+	# Open many files until limit
+	repeat(100) {
+		sys_open("/nilix-exhaust.tmp", O_RDWR|O_CREAT, 0600)
+	}
+}
+
+# Coverage hints for guiding mutation
+# These tell the fuzzer which syscall combinations are likely to discover new edges
+
+coverage_hint fork_then_exec {
+	syscalls: [sys_fork, sys_execve, sys_wait4]
+	priority: high
+	reason: "Complex process state transitions"
+}
+
+coverage_hint mmap_then_fork {
+	syscalls: [sys_mmap, sys_fork, sys_wait4, sys_munmap]
+	priority: high
+	reason: "Memory sharing across processes"
+}
+
+coverage_hint signal_during_syscall {
+	syscalls: [sys_rt_sigaction, sys_kill, sys_read]
+	priority: medium
+	reason: "Signal interruption of blocking syscalls"
+}
+
+coverage_hint futex_contention {
+	syscalls: [sys_fork, sys_futex, sys_wait4]
+	priority: medium
+	reason: "Futex synchronization under contention"
+}
+
+coverage_hint kcov_with_complex_syscalls {
+	syscalls: [sys_kcov_enable, sys_fork, sys_execve, sys_kcov_disable, sys_kcov_dump]
+	priority: high
+	reason: "Coverage collection across complex operations"
+}
+
+# Sanitizer annotations for detecting bugs
+
+# Use-after-free detection patterns
+uaf_pattern file_uaf {
+	sys_close($fd)
+	sys_read($fd, $buf, 16)  # Potential UAF if fd struct reused
+}
+
+uaf_pattern memory_uaf {
+	sys_munmap($addr, 4096)
+	# Access to $addr here would be UAF
+}
+
+# Leak detection patterns
+leak_pattern unclosed_fd {
+	$fd = sys_open("/test", O_RDONLY, 0)
+	# Missing sys_close($fd)
+	sys_exit(0)  # Leak detector should flag
+}
+
+leak_pattern unmapped_memory {
+	$addr = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+	# Missing sys_munmap($addr, 4096)
+	sys_exit(0)  # Leak detector should flag
+}
+
+# Deadlock detection patterns
+deadlock_pattern futex_self_wait {
+	sys_futex($addr, 0, 1, 0, 0, 0)  # Wait on futex never woken
+}
+
+# Data race detection patterns
+race_pattern concurrent_write {
+	# Both processes write to same shared memory
+	$addr = sys_mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0)
+	$pid = sys_fork()
+	sys_write($addr, "race", 4)  # Potential data race
+}
