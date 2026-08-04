@@ -3,6 +3,9 @@ name = "nilix-syz-fuzzer"
 version = "0.1.0"
 edition = "2021"
 
+# Standalone package — not part of Zero-OS workspace
+[workspace]
+
 # Host fuzzer runs on Linux, not bare-metal
 [lib]
 name = "nilix_syz_fuzzer"
