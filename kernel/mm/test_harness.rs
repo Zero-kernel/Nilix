@@ -23,7 +23,9 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(addr: u64) -> Self {
-        Self { start_addr: addr & !0xFFF }
+        Self {
+            start_addr: addr & !0xFFF,
+        }
     }
 }
 
@@ -148,12 +150,17 @@ impl BuddyAllocatorHarness {
         // Check for memory leaks
         assert_eq!(
             self.allocated_pages,
-            self.allocated.values().map(|(_, count)| count).sum::<usize>(),
+            self.allocated
+                .values()
+                .map(|(_, count)| count)
+                .sum::<usize>(),
             "Allocator integrity failed: page count mismatch"
         );
 
         // Total allocated + free should equal total
-        let free_pages: usize = self.free_lists.iter()
+        let free_pages: usize = self
+            .free_lists
+            .iter()
             .enumerate()
             .map(|(order, list): (usize, &Vec<u64>)| list.len() * (1 << order))
             .sum();
@@ -161,7 +168,9 @@ impl BuddyAllocatorHarness {
         assert!(
             self.allocated_pages + free_pages <= self.total_pages,
             "Allocator integrity failed: total pages exceeded (allocated={}, free={}, total={})",
-            self.allocated_pages, free_pages, self.total_pages
+            self.allocated_pages,
+            free_pages,
+            self.total_pages
         );
     }
 
@@ -203,7 +212,8 @@ impl BuddyAllocatorHarness {
 
                 // Allocate the first half
                 let frame_count = 1usize << target_order;
-                self.allocated.insert(current_addr, (target_order, frame_count));
+                self.allocated
+                    .insert(current_addr, (target_order, frame_count));
                 self.allocated_pages += frame_count;
 
                 let mut frames = Vec::new();
@@ -384,7 +394,11 @@ impl PageTableHarness {
     pub fn verify_integrity(&self) {
         // Check all mappings are canonical and aligned
         for (&va, entry) in &self.mappings {
-            assert!(Self::is_canonical(va), "Non-canonical VA in page table: {:#x}", va);
+            assert!(
+                Self::is_canonical(va),
+                "Non-canonical VA in page table: {:#x}",
+                va
+            );
             assert_eq!(va & 0xFFF, 0, "Misaligned VA in page table: {:#x}", va);
             assert!(entry.flags.present, "Non-present entry in page table");
 
