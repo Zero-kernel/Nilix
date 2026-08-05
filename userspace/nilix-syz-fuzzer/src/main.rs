@@ -2,19 +2,13 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use clap::Parser;
 
-mod executor;
-mod program;
-mod coverage;
-mod mutator;
-mod corpus;
-mod stats;
-
-use executor::QemuExecutor;
-use program::SyscallProgram;
-use coverage::CoverageTracker;
-use mutator::SyscallMutator;
-use corpus::Corpus;
-use stats::FuzzStats;
+use nilix_syz_fuzzer::executor::{QemuExecutor, ExecutionResult};
+use nilix_syz_fuzzer::program::SyscallProgram;
+use nilix_syz_fuzzer::coverage::CoverageTracker;
+use nilix_syz_fuzzer::mutator::SyscallMutator;
+use nilix_syz_fuzzer::corpus::Corpus;
+use nilix_syz_fuzzer::stats::FuzzStats;
+use nilix_syz_fuzzer::disk::Ext3Tools;
 
 #[derive(Parser, Debug)]
 #[command(name = "nilix-syz-fuzzer")]
@@ -109,10 +103,12 @@ fn main() -> Result<()> {
             &args.kernel,
             args.ovmf.as_deref(),
             args.program_timeout,
+            128,  // 128 MiB disk
+            Ext3Tools::default(),
         )?;
 
         match executor.execute(&program)? {
-            executor::ExecutionResult::Success(cov) => {
+            ExecutionResult::Success(cov) => {
                 if coverage.is_new(&cov) {
                     println!("[+] New coverage discovered! Total edges: {}", coverage.total_edges());
                     corpus.add(program, cov.clone())?;
@@ -121,7 +117,7 @@ fn main() -> Result<()> {
                 }
                 stats.successes += 1;
             }
-            executor::ExecutionResult::Crash(info) => {
+            ExecutionResult::Crash(info) => {
                 println!("[!] CRASH detected: {}", info.classification);
                 let crash_file = args.crash_dir.join(format!(
                     "crash-{}.bin",
@@ -133,10 +129,10 @@ fn main() -> Result<()> {
                 program.save_to_file(&crash_file)?;
                 stats.crashes += 1;
             }
-            executor::ExecutionResult::Timeout => {
+            ExecutionResult::Timeout => {
                 stats.timeouts += 1;
             }
-            executor::ExecutionResult::Hang => {
+            ExecutionResult::Hang => {
                 println!("[!] HANG detected");
                 stats.hangs += 1;
             }

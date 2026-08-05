@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

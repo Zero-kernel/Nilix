@@ -3,4 +3,6 @@
 [build]
 target = "x86_64-unknown-linux-gnu"
 
-# Do NOT inherit build-std from parent — use prebuilt stdlib
+# NOTE: Parent userspace/.cargo/config.toml has [unstable] build-std = ["core"]
+# which CANNOT be overridden in nested configs. The build-isolated.sh script
+# must handle this by temporarily renaming the parent .cargo directory.

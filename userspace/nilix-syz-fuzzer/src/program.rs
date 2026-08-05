@@ -17,6 +17,7 @@ pub const SYS_SCHED_YIELD: u32 = 24;
 pub const SYS_GETPID: u32 = 39;
 pub const SYS_UNAME: u32 = 63;
 pub const SYS_GETCWD: u32 = 79;
+pub const SYS_READLINK: u32 = 89;
 pub const SYS_GETTIMEOFDAY: u32 = 96;
 pub const SYS_GETRLIMIT: u32 = 97;
 pub const SYS_GETUID: u32 = 102;

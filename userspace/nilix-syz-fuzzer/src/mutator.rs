@@ -97,6 +97,18 @@ impl SyscallMutator {
             Argument::Buffer(buf) => {
                 self.mutate_buffer(buf);
             }
+            Argument::Output { capacity } => {
+                // Mutate output buffer capacity
+                *capacity = self.mutate_integer(*capacity as u64) as u32;
+            }
+            Argument::InOut { data, capacity } => {
+                // Mutate either data or capacity
+                if self.rng.gen_bool(0.5) {
+                    self.mutate_buffer(data);
+                } else {
+                    *capacity = self.mutate_integer(*capacity as u64) as u32;
+                }
+            }
             Argument::Null => {
                 // Replace with random value
                 program.syscalls[syscall_idx].args[arg_idx] =

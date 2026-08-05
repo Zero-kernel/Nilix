@@ -74,7 +74,7 @@ run_suite audit 15 0 \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
-run_suite mm 19 0 \
+run_suite mm 24 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -126,4 +126,4 @@ run_check kernel-tests \
     --features mm/host_harness \
     --tests --locked
 
-echo "OK: hosted kernel sub-crate CI gate passed (169 tests; 3 test-code compile checks; default parallelism)."
+echo "OK: hosted kernel sub-crate CI gate passed (174 tests; 3 test-code compile checks; default parallelism)."

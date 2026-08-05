@@ -143,7 +143,8 @@ pub fn encode_program(program: &SyscallProgram, identity: &ExecutionIdentity) ->
     bytes[..8].copy_from_slice(PROGRAM_MAGIC);
     put_u16(&mut bytes, 8, PROTOCOL_VERSION)?;
     put_u16(&mut bytes, 10, PROGRAM_HEADER_SIZE as u16)?;
-    put_u32(&mut bytes, 12, u32::try_from(bytes.len())?)?;
+    let total_len = u32::try_from(bytes.len())?;
+    put_u32(&mut bytes, 12, total_len)?;
     put_u32(&mut bytes, 16, 0)?;
     put_u32(&mut bytes, 20, u32::try_from(program.syscalls.len())?)?;
     put_u32(&mut bytes, 24, KCOV_BITMAP_SIZE as u32)?;
