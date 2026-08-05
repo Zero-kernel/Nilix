@@ -221,8 +221,9 @@ jobs:
       fail-fast: false
       matrix:
         # Pushes use the three host-safe targets that call real kernel parser
-        # code. Scheduled/manual runs retain the complete target set.
-        target: ${{ fromJSON(github.event_name == 'push' && '["fuzz_vfs_path","fuzz_network_packet","fuzz_elf_loader"]' || '["fuzz_syscall","fuzz_vfs_path","fuzz_signal_delivery","fuzz_memory_ops","fuzz_ipc_message","fuzz_scheduler","fuzz_network_packet","fuzz_cgroup_ops","fuzz_elf_loader","fuzz_futex_ops"]') }}
+        # code, plus fuzz_syscall_qemu for real kernel execution.
+        # Scheduled/manual runs retain the complete target set.
+        target: ${{ fromJSON(github.event_name == 'push' && '["fuzz_vfs_path","fuzz_network_packet","fuzz_elf_loader","fuzz_syscall_qemu"]' || '["fuzz_syscall","fuzz_vfs_path","fuzz_signal_delivery","fuzz_memory_ops","fuzz_ipc_message","fuzz_scheduler","fuzz_network_packet","fuzz_cgroup_ops","fuzz_elf_loader","fuzz_futex_ops","fuzz_syscall_qemu"]') }}
 
     steps:
       - name: Checkout repository
@@ -249,10 +250,21 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
+      # Install QEMU and musl-tools for the fuzz_syscall_qemu target
+      - name: Install QEMU and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 musl-tools
+
       # Build before any secret is present so dependency build scripts never
       # inherit the private fingerprinting key.
       - name: Build candidate triage tool
         run: cargo build --locked --release --manifest-path userspace/fuzzer/Cargo.toml --bin crash-triage --target x86_64-unknown-linux-gnu
+
+      # Build QEMU fuzzer dependencies (KCOV kernel + executor) for fuzz_syscall_qemu
+      - name: Build QEMU fuzzer dependencies
+        if: matrix.target == 'fuzz_syscall_qemu'
+        run: make build-fuzz-qemu-deps
 
       - name: Restore corpus
         id: restore_corpus
@@ -283,11 +295,22 @@ jobs:
 
           private_log="$RUNNER_TEMP/libfuzzer-output.log"
           set +e
-          cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} -- \
-            -max_total_time="$timeout" \
-            -rss_limit_mb=4096 \
-            -print_final_stats=1 \
-            > "$private_log" 2>&1
+
+          # QEMU fuzzer needs the qemu-executor feature flag
+          if [ "${{ matrix.target }}" = "fuzz_syscall_qemu" ]; then
+            cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} --features qemu-executor -- \
+              -max_total_time="$timeout" \
+              -rss_limit_mb=4096 \
+              -print_final_stats=1 \
+              > "$private_log" 2>&1
+          else
+            cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} -- \
+              -max_total_time="$timeout" \
+              -rss_limit_mb=4096 \
+              -print_final_stats=1 \
+              > "$private_log" 2>&1
+          fi
+
           exit_code=$?
           set -e
           echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
@@ -521,11 +544,11 @@ jobs:
         run: |
           expected_targets=0
           if [ "$EVENT_NAME" = "push" ]; then
-            expected_targets=3
+            expected_targets=4
           elif [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "0 2 * * *" ]; then
-            expected_targets=10
+            expected_targets=11
           elif [ "$EVENT_NAME" = "workflow_dispatch" ] && { [ "$DISPATCH_MODE" = "targets" ] || [ "$DISPATCH_MODE" = "both" ]; }; then
-            expected_targets=10
+            expected_targets=11
           fi
 
           {
