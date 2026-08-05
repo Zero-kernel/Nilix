@@ -88,6 +88,10 @@ pub use tlb_shootdown::{
     force_init_tlb_shootdown_locals, get_stats as get_tlb_stats,
 };
 
+// Host harness for fuzzing - only available when host_harness feature is enabled
+#[cfg(feature = "host_harness")]
+pub mod test_harness;
+
 pub fn init() {
     klog_always!("Memory management module initialized");
 }
