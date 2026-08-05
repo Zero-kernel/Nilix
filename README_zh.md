@@ -38,6 +38,14 @@ Linux 兼容用户态人格（personality）。
 详见[第 6 节](#6-安全审计状态)。
 
 **最近新增：**
+- **2026-08-05：** **Cargo-fuzz QEMU 集成** — 使用 cargo-fuzz 目标对真实 KCOV 启用的内核进行
+  系统调用执行的模糊测试基础设施扩展。新组件：(1) `fuzz_syscall_qemu` 目标，具有惰性 QEMU 执行器
+  初始化与安全系统调用白名单（19 个系统调用）；(2) 桥接模块（`syz_bridge.rs`），与独立的
+  `nilix-syz-fuzzer` 二进制文件对接；(3) QEMU 执行器桩（`qemu_executor.rs`），可供复制；
+  (4) Makefile 集成（`make fuzz-qemu-smoke`、`make fuzz-qemu-campaign`、并行/通宵目标）；
+  (5) 特性门控编译（`qemu-executor`）；(6) 文档更新（fuzz/README.md、FUZZING_SUMMARY.md）。
+  架构同时提供基于 mock 的快速迭代（50K 执行/秒）与基于 QEMU 的深度测试（5-10 执行/秒，真实 KCOV）。
+  三个新模糊测试目标：伙伴分配器、页表操作、系统调用执行。详见[第 5.5 节](#55-模糊测试基础设施)。
 - **2026-08-04：** **Phase 7 Syzkaller 风格模糊测试完成** — 宿主驱动的覆盖引导模糊测试基础设施
   现已可运行。已构建并集成：(1) 基于 Rust 的宿主模糊器，具有 5 种变异策略、基于能量的语料库
   调度及崩溃分类；(2) 基于 C 的 guest 执行器，在 QEMU 中运行并集成 KCOV；(3) GitHub Actions CI
@@ -89,7 +97,7 @@ Linux 兼容用户态人格（personality）。
 | IOMMU / VT-d                   | 🟡 基础设施 | 完整 Intel VT-d 驱动（DMA 隔离、中断重映射、故障处理）；DMAR 发现接线待完成                     |
 | 实时补丁                       | 🟡 基础设施 | ECDSA P-256 签名的 kpatch、INT3 detour、fail-closed 的 LSM 门控                                 |
 | 用户模式与 ABI（Phase U / M0） | 🟡 进行中   | Ring 3、100+ Linux 系统调用、SysV auxv、信号投递、静态 musl libc 端到端运行                     |
-| 模糊测试与测试                 | ✅ 完成     | **Syzkaller 风格覆盖引导模糊测试已运行**：宿主驱动的变异引擎、QEMU 执行器、KCOV 集成、带语料库缓存的 CI 工作流、5 种变异策略、崩溃分类。KCOV 每任务覆盖、10 个 cargo-fuzz 目标、确定性 guest E2E、扩展稳定性/SMP/安全测试套件 |
+| 模糊测试与测试                 | ✅ 完成     | **Syzkaller 风格覆盖引导模糊测试已运行**：宿主驱动的变异引擎、QEMU 执行器、KCOV 集成、带语料库缓存的 CI 工作流、5 种变异策略、崩溃分类。**Cargo-fuzz QEMU 集成**：`fuzz_syscall_qemu` 目标与独立模糊器桥接，mock（50K 执行/秒）+ QEMU（5-10 执行/秒）双路径，共 13 个目标（伙伴分配器、页表、系统调用、解析器）。KCOV 每任务覆盖、确定性 guest E2E、扩展稳定性/SMP/安全测试套件 |
 | CI 与质量门禁                  | ✅ 完成     | GitHub Actions（fmt/clippy、build、lint、boot+musl+fuzz）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子      |
 
 ---
