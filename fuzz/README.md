@@ -21,6 +21,17 @@ Tests syscall entry points with focus on R173/R174 fixes:
 - **Clone operations** - R174-A2
 - **Futex operations** - R172-08
 
+### 1b. `fuzz_syscall_qemu` - QEMU-Based Syscall Fuzzing (NEW)
+Real kernel execution with KCOV coverage feedback:
+- **38 syscalls** across File I/O, Memory, IPC, Process/Time
+- **File I/O:** open, read, write, stat, lseek, pread64/pwrite64
+- **Memory Mgmt:** mmap, mprotect, munmap, brk (R168/R171/R174)
+- **IPC:** pipe, select, poll, socketpair (M0-5 EINTR)
+- **Isolation:** QEMU virtualization, tmpfs-only, 16 MiB guest RAM
+- **Performance:** 5-10 exec/sec, coverage-guided sequence generation
+
+See `docs/fuzzing/EXPANDED_SYSCALL_ALLOWLIST.md` for full allowlist details.
+
 ### 2. `fuzz_vfs_path` - VFS Path Operations
 Tests filesystem operations:
 - **Path traversal** attacks (../, multiple slashes)
@@ -98,14 +109,33 @@ rustup install nightly
 ```bash
 cd fuzz
 
-# Run syscall fuzzer
+# Run syscall fuzzer (host-based, fast)
 cargo +nightly fuzz run fuzz_syscall
+
+# Run QEMU-based syscall fuzzer (real kernel execution)
+cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor
 
 # Run with specific timeout and iterations
 cargo +nightly fuzz run fuzz_syscall -- -max_total_time=300 -runs=1000000
 
 # Run with custom dictionary
 cargo +nightly fuzz run fuzz_syscall -- -dict=dictionaries/syscall.dict
+```
+
+### QEMU Fuzzer Quick Start
+
+```bash
+# Prerequisites: Build KCOV kernel and executor
+make build-fuzz-qemu-deps
+
+# Smoke test (5 minutes)
+make fuzz-qemu-smoke
+
+# Campaign run (1 hour)
+make fuzz-qemu-campaign
+
+# Overnight soak (8 hours)
+make fuzz-qemu-overnight
 ```
 
 ### Run all fuzz targets (parallel)

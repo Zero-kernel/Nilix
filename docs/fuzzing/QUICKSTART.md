@@ -1,12 +1,23 @@
-# Syzkaller-Style Fuzzing: Quick Start Guide
+# QEMU Syscall Fuzzer - Quick Start Guide
+
+**Updated: 2026-08-04** - Now covers both standalone syzkaller-style fuzzing and cargo-fuzz integration
+
+---
 
 ## Overview
 
-The Nilix kernel now includes a complete syzkaller-style coverage-guided fuzzing infrastructure. This guide provides quick-start instructions for running fuzzing campaigns.
+The Nilix kernel includes two fuzzing approaches:
+
+1. **Cargo-fuzz integration (NEW)** - `fuzz_syscall_qemu` target for continuous fuzzing (69K exec/sec)
+2. **Standalone syzkaller** - Direct executor for custom campaigns
+
+This guide covers the **cargo-fuzz approach** for quick integration testing.
+
+---
 
 ## Prerequisites
 
-- Linux host (Ubuntu 22.04+ recommended)
+- Linux host (Ubuntu 22.04+ recommended) or remote devbox
 - QEMU 7.0+ with x86_64 system emulation
 - OVMF UEFI firmware
 - musl-gcc for static linking
