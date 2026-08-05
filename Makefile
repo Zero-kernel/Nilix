@@ -1028,3 +1028,71 @@ run-kcov: build-kcov
 test-kcov: build-kcov
 	bash scripts/fuzz_runner_test.sh "$(KCOV_ESP)"
 
+
+# === Phase 8: Cargo-Fuzz Integration with QEMU Executor ===
+
+# Build prerequisites for QEMU-based cargo-fuzz
+build-fuzz-qemu-deps: build-kcov build-syz-fuzzer
+	@echo "=== QEMU Fuzzing Prerequisites Ready ==="
+
+# Run cargo-fuzz with QEMU executor (5-minute smoke test)
+fuzz-qemu-smoke: build-fuzz-qemu-deps
+	@echo "=== Running QEMU-Based Cargo-Fuzz Smoke Test ==="
+	cd fuzz && \
+	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
+		-max_total_time=300 \
+		-timeout=15 \
+		-rss_limit_mb=4096 \
+		-print_final_stats=1
+	@echo "=== Smoke Test Complete ==="
+	@if [ -d fuzz/artifacts/fuzz_syscall_qemu ]; then \
+		CRASHES=$$(find fuzz/artifacts/fuzz_syscall_qemu -name 'crash-*' | wc -l); \
+		echo "Crashes found: $$CRASHES"; \
+		if [ $$CRASHES -gt 0 ]; then \
+			echo "ERROR: Crashes detected!"; \
+			exit 1; \
+		fi; \
+	fi
+
+# Run extended QEMU fuzzing campaign (1 hour)
+fuzz-qemu-campaign: build-fuzz-qemu-deps
+	@echo "=== Running 1-Hour QEMU Fuzzing Campaign ==="
+	cd fuzz && \
+	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
+		-max_total_time=3600 \
+		-timeout=12 \
+		-rss_limit_mb=4096 \
+		-print_final_stats=1
+
+# Run overnight QEMU fuzzing (8 hours)
+fuzz-qemu-overnight: build-fuzz-qemu-deps
+	@echo "=== Running Overnight QEMU Fuzzing (8 hours) ==="
+	cd fuzz && \
+	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
+		-max_total_time=28800 \
+		-timeout=10 \
+		-rss_limit_mb=8192 \
+		-print_final_stats=1
+
+# Parallel QEMU fuzzing with 4 workers (requires 4x memory)
+fuzz-qemu-parallel: build-fuzz-qemu-deps
+	@echo "=== Running Parallel QEMU Fuzzing (4 workers) ==="
+	cd fuzz && \
+	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor --jobs=4 -- \
+		-max_total_time=3600 \
+		-timeout=15 \
+		-rss_limit_mb=4096 \
+		-print_final_stats=1
+
+# List all available cargo-fuzz targets
+fuzz-list:
+	@echo "=== Available Cargo-Fuzz Targets ==="
+	@cd fuzz && cargo +nightly fuzz list
+
+# Clean cargo-fuzz artifacts and corpus
+fuzz-clean:
+	@echo "=== Cleaning Cargo-Fuzz Artifacts ==="
+	rm -rf fuzz/corpus/* fuzz/artifacts/* fuzz/coverage/*
+	rm -rf fuzz/target/
+	@echo "=== Cleaned ==="
+
