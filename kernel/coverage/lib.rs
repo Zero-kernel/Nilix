@@ -487,7 +487,10 @@ mod tests {
             buf.copy_to_slice_exact(&mut too_long),
             Err(CoverageCopyError::LengthMismatch)
         );
-        assert_eq!(too_long, [0x5a; 3], "long destination must remain untouched");
+        assert_eq!(
+            too_long, [0x5a; 3],
+            "long destination must remain untouched"
+        );
 
         let mut exact = [0u8; 2];
         assert_eq!(buf.copy_to_slice_exact(&mut exact), Ok(()));
@@ -524,7 +527,8 @@ mod tests {
     }
 
     #[test]
-    fn test_current_task_recorder_suppresses_recursion_restores_preemption_and_rejects_async_context() {
+    fn test_current_task_recorder_suppresses_recursion_restores_preemption_and_rejects_async_context(
+    ) {
         init_coverage(recursive_test_recorder);
         let before = cpu_local::current_cpu()
             .preempt_count
