@@ -1,11 +1,12 @@
 // Corpus management for coverage-guided fuzzing
 // Phase 4: Stores test cases that increase coverage
 
-#![no_std]
+// `main.rs` owns the crate-level `#![no_std]` contract. Keeping this as a
+// normal module also lets the host regression harness compile the real types.
 
 extern crate alloc;
-use alloc::vec::Vec;
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 /// A single syscall with arguments
 #[derive(Clone, Debug)]
@@ -103,7 +104,8 @@ impl Corpus {
             // Cull oldest entries if over limit
             if self.entries.len() > self.max_size {
                 // Sort by energy (descending), remove lowest
-                self.entries.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap());
+                self.entries
+                    .sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap());
                 self.entries.truncate(self.max_size);
             }
 
@@ -124,23 +126,34 @@ impl Corpus {
 
         if total_energy == 0.0 {
             // Fallback: uniform random
-            let idx = simple_rand(seed) % self.entries.len();
+            let idx = (simple_rand(seed) % self.entries.len() as u64) as usize;
             return Some(&mut self.entries[idx]);
         }
 
-        // Weighted random selection
+        // Choose by index first, then take the one mutable borrow needed to
+        // update the selected entry. This keeps the legacy no-std module
+        // valid under the host regression harness as well as the guest build.
         let mut target = (simple_rand(seed) as f32 / u64::MAX as f32) * total_energy;
+        let mut selected = None;
 
-        for entry in &mut self.entries {
+        for (index, entry) in self.entries.iter().enumerate() {
             target -= entry.energy;
             if target <= 0.0 {
-                entry.selection_count += 1;
-                return Some(entry);
+                selected = Some(index);
+                break;
             }
         }
 
-        // Fallback: last entry
-        Some(&mut self.entries[self.entries.len() - 1])
+        if let Some(index) = selected {
+            let entry = &mut self.entries[index];
+            entry.selection_count += 1;
+            return Some(entry);
+        }
+
+        // Floating-point roundoff can leave a tiny positive remainder; retain
+        // the legacy fallback while taking only one mutable borrow.
+        let last_index = self.entries.len() - 1;
+        Some(&mut self.entries[last_index])
     }
 
     /// Update energy for all entries
@@ -190,14 +203,14 @@ fn calculate_energy(entry: &CorpusEntry) -> f32 {
     let productivity = if entry.descendant_count > 0 {
         entry.productive_descendants as f32 / entry.descendant_count as f32
     } else {
-        1.0  // New entries get full boost
+        1.0 // New entries get full boost
     };
     energy *= productivity;
 
     // Penalty: longer execution = less energy
     energy /= (entry.exec_time_us as f32 / 1000.0).max(1.0);
 
-    energy.max(0.01)  // Minimum energy to keep entries in play
+    energy.max(0.01) // Minimum energy to keep entries in play
 }
 
 /// Simple PRNG (xorshift64)
