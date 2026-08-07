@@ -2,6 +2,15 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R187 Fixes (August 2026)
+
+- **[R187-fix-summary.md](R187-fix-summary.md)** - KCOV remediation: 7/7 findings fixed,
+  0 rejected, 0 open; IRQ/NMI async-context and CPU-topology hardening verified alongside devbox
+  build/lint/test and KCOV E2E PASS; targeted hosted suites pass 6/6, 9/9, 1/1, and 1/1;
+  Cargo all-targets executes the three executor regressions; Stage-3 review-fix pending.
+- **[R187 audit/fix record](../audits/qa-2026-08-05.md)** - authoritative per-finding
+  dispositions, verification evidence, and plan-impact handoff.
+
 ## R186 Fixes (July 2026)
 
 - **[R186 audit/fix record](../audits/qa-2026-07-28.md)** - 16/17 actionables fixed,
@@ -10,8 +19,8 @@ This directory contains fix plans, implementation details, and summaries for sec
   16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL); 24/24 RF defects repaired,
   0 escalated. Source and environment closure are complete; focused/default-parallel
   checks and the full final remote ladder are green.
-- **[Current next-phase plan](../nextplan/next-phase-plan-2026-07-23-v2.md)** -
-  Live remaining-work and release-gate status, version 15.53 current-state override.
+- **[Current next-phase plan](../nextplan/next-phase-plan-2026-08-01.md)** -
+  Live remaining-work, R187 Stage-2 status, and release-gate state (Stage-3 review next).
 
 ## R181 Fixes (July 2026)
 
