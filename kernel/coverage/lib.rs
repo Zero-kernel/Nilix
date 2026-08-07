@@ -7,11 +7,28 @@
 //!
 //! # Architecture
 //!
-//! - **Per-task coverage buffer**: Each process has its own 4KB bitmap
-//! - **Edge-based coverage**: Tracks unique control-flow edges, not just blocks
+//! - **Per-task coverage buffer**: Each process has a requested `1..=4096` byte bitmap
+//! - **Edge-based coverage**: Tracks occupied coverage bitmap slots for control-flow edges
 //! - **Manual instrumentation**: Use `record_edge!()` at strategic points
 //! - **IRQ-safe**: Uses `try_lock()`, never blocks
 //! - **SMAP-compliant**: Userspace access via proper copy primitives
+//!
+//! # Build and access requirements
+//!
+//! The kernel must be built with the `kcov` feature. Without that feature, the
+//! KCOV syscalls return `ENOSYS`. KCOV is a privileged observability interface:
+//! callers must be host root or hold the dedicated KCOV capability before they
+//! can allocate, control, reset, or export a task's bitmap.
+//!
+//! # Bitmap semantics
+//!
+//! The bitmap has `8 * configured_byte_length` observable slots. An
+//! instrumentation identifier maps to `edge_id % slot_count`; therefore two
+//! distinct identifiers can collide and set the same slot. The syscall return
+//! value and [`CoverageBuffer::edge_count`] report the number of occupied
+//! bitmap slots (the bitmap popcount), not the number of globally unique
+//! control-flow edges. Consumers must treat saturation and collisions as
+//! normal lossy-coverage behavior.
 //!
 //! # Usage
 //!
@@ -40,10 +57,10 @@
 //! read(fd, buf, 100);
 //! close(fd);
 //!
-//! // Dump coverage and get edge count
+//! // Dump coverage and get the occupied bitmap-slot count.
 //! uint8_t coverage[4096];
-//! long edges = syscall(523, coverage, 4096);  // sys_kcov_dump
-//! printf("Hit %ld unique edges\n", edges);
+//! long occupied_slots = syscall(523, coverage, 4096);  // sys_kcov_dump
+//! printf("Hit %ld occupied coverage slots\n", occupied_slots);
 //! ```
 //!
 //! # Safety
@@ -57,11 +74,10 @@ extern crate alloc;
 extern crate spin;
 
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 
-/// Maximum coverage buffer size (4KB = 32K edges).
+/// Maximum coverage buffer size (4KB = 32,768 observable bitmap slots).
 pub const KCOV_BUFFER_SIZE: usize = 4096;
 
 /// Failure returned while constructing a task-owned coverage bitmap.
@@ -73,12 +89,19 @@ pub enum CoverageAllocError {
     AllocationFailed,
 }
 
+/// Failure returned when a caller requests a partial KCOV bitmap snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageCopyError {
+    /// The destination length does not exactly match the configured bitmap.
+    LengthMismatch,
+}
+
 /// Coverage buffer: bitmap tracking which edges have been hit
 #[derive(Debug)]
 pub struct CoverageBuffer {
-    /// The coverage bitmap (1 bit per edge)
+    /// Fixed-size, lossy coverage bitmap (one bit per observable slot).
     bitmap: Vec<u8>,
-    /// Number of unique edges hit
+    /// Saturating count of occupied bitmap slots (always the bitmap popcount).
     edge_count: u32,
     /// Whether coverage collection is active
     enabled: bool,
@@ -116,10 +139,11 @@ impl CoverageBuffer {
         self.enabled = false;
     }
 
-    /// Record that an edge was hit
+    /// Record that an instrumentation identifier was hit.
     ///
     /// # Arguments
-    /// - `edge_id`: Unique identifier for this edge (typically file:line hash)
+    /// - `edge_id`: Deterministic identifier for this edge (typically a
+    ///   file-and-line hash). IDs alias modulo the bitmap slot count.
     ///
     /// # Safety
     /// IRQ-safe, no allocations, no blocking
@@ -132,28 +156,36 @@ impl CoverageBuffer {
         let byte_idx = (edge_id as usize / 8) % self.bitmap.len();
         let bit_idx = edge_id % 8;
 
-        // Check if this edge was already hit
+        // Check whether this bitmap slot was already occupied. Distinct IDs
+        // that alias this slot intentionally do not increase the count.
         let byte = &mut self.bitmap[byte_idx];
         let mask = 1u8 << bit_idx;
 
         if (*byte & mask) == 0 {
-            // First time hitting this edge
+            // First hit for this observable bitmap slot.
             *byte |= mask;
             self.edge_count = self.edge_count.saturating_add(1);
         }
     }
 
-    /// Copy coverage data to userspace buffer
+    /// Copy a complete bitmap snapshot into an exactly sized destination.
     ///
-    /// # Returns
-    /// Number of bytes actually copied
-    pub fn copy_to_user(&self, dst: &mut [u8]) -> usize {
-        let len = core::cmp::min(dst.len(), self.bitmap.len());
-        dst[..len].copy_from_slice(&self.bitmap[..len]);
-        len
+    /// R187-3 FIX: partial snapshots are rejected before mutating `dst`, which
+    /// makes a staging-buffer length mismatch fail closed even if a future
+    /// caller bypasses the syscall's outer length validation.
+    pub fn copy_to_slice_exact(&self, dst: &mut [u8]) -> Result<(), CoverageCopyError> {
+        if dst.len() != self.bitmap.len() {
+            return Err(CoverageCopyError::LengthMismatch);
+        }
+        dst.copy_from_slice(&self.bitmap);
+        Ok(())
     }
 
-    /// Get number of unique edges hit
+    /// Get the number of occupied coverage bitmap slots.
+    ///
+    /// This value is the snapshot bitmap popcount, not a count of globally
+    /// unique instrumentation identifiers because IDs may collide modulo the
+    /// configured slot count.
     pub fn edge_count(&self) -> usize {
         self.edge_count as usize
     }
@@ -189,87 +221,72 @@ static CURRENT_TASK_RECORDER: Once<CurrentTaskRecorder> = Once::new();
 ///
 /// A fixed array is deliberate: tracing must never be the first user of a lazy,
 /// heap-backed `CpuLocal` slab while the allocator or a kernel lock is held.
+/// R187-7 FIX: every access below obtains a checked slot reference after strict
+/// CPU-topology admission; the fixed capacity is never indexed directly.
 static RECORDER_ACTIVE: [AtomicBool; cpu_local::MAX_CPUS] =
     [const { AtomicBool::new(false) }; cpu_local::MAX_CPUS];
 
-/// Preemption pin binding all per-CPU accesses in one recorder invocation to a
-/// stable logical CPU. The retry closes the sample-before-disable migration
-/// window; dropping the guard restores the exact prior nesting depth.
-struct StableCpuPin {
-    cpu_id: usize,
-    _not_send: PhantomData<*const ()>,
+/// Return the static recursion slot only after a capacity check.
+///
+/// The caller must still obtain its CPU ID from `CurrentCpuPin`; this helper
+/// prevents an invalid topology result from ever becoming an array index.
+#[inline]
+fn recorder_active_slot(cpu_id: usize) -> Option<&'static AtomicBool> {
+    RECORDER_ACTIVE.get(cpu_id)
 }
 
-impl StableCpuPin {
-    #[inline]
-    fn new() -> Self {
-        loop {
-            let cpu_id = cpu_local::current_cpu_id();
-            if cpu_local::current_cpu_id() != cpu_id {
-                core::hint::spin_loop();
-                continue;
-            }
+#[cfg(test)]
+static RECORDER_PIN_ATTEMPTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
-            let per_cpu = cpu_local::PER_CPU_DATA
-                .get_cpu(cpu_id)
-                .unwrap_or_else(|| panic!("KCOV: missing per-CPU slot for CPU {cpu_id}"));
-            per_cpu.preempt_disable();
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+/// Acquire the shared CPU pin for the recorder.
+///
+/// Keeping this wrapper local makes the IRQ admission invariant observable in
+/// the regression test without adding any production-state instrumentation.
+#[inline]
+fn try_pin_recorder_cpu() -> Option<cpu_local::CurrentCpuPin> {
+    #[cfg(test)]
+    RECORDER_PIN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 
-            if cpu_local::current_cpu_id() == cpu_id {
-                return Self {
-                    cpu_id,
-                    _not_send: PhantomData,
-                };
-            }
-
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            per_cpu.preempt_enable();
-            core::hint::spin_loop();
-        }
-    }
-
-    #[inline]
-    fn per_cpu(&self) -> &'static cpu_local::PerCpuData {
-        cpu_local::PER_CPU_DATA
-            .get_cpu(self.cpu_id)
-            .unwrap_or_else(|| panic!("KCOV: missing pinned per-CPU slot for CPU {}", self.cpu_id))
-    }
-}
-
-impl Drop for StableCpuPin {
-    #[inline]
-    fn drop(&mut self) {
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        self.per_cpu().preempt_enable();
-    }
+    cpu_local::try_pin_current_online_cpu()
 }
 
 struct RecorderGuard {
-    cpu_id: usize,
-    _pin: StableCpuPin,
+    active: &'static AtomicBool,
+    _pin: cpu_local::CurrentCpuPin,
 }
 
 impl RecorderGuard {
     #[inline]
     fn try_enter() -> Option<Self> {
-        let pin = StableCpuPin::new();
-        if pin.per_cpu().in_irq() {
+        // R187-2 FIX: reject a known IRQ/NMI or other IF-masked context before
+        // disabling preemption or touching recorder state. The stable post-pin
+        // check below closes the race with async entry or CPU migration after
+        // this first observation.
+        if cpu_local::try_current_online_cpu_in_non_task_context() != Some(false) {
             return None;
         }
 
-        let cpu_id = pin.cpu_id;
-        RECORDER_ACTIVE[cpu_id]
+        // R187-7 FIX: only a registered, online CPU can obtain a pin. An
+        // unavailable AP or invalid mapping drops this best-effort edge rather
+        // than borrowing CPU 0's state or indexing the static array.
+        let pin = try_pin_recorder_cpu()?;
+        if pin.in_non_task_context() {
+            return None;
+        }
+
+        let active = recorder_active_slot(pin.cpu_id())?;
+        active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(Self { cpu_id, _pin: pin })
+        Some(Self { active, _pin: pin })
     }
 }
 
 impl Drop for RecorderGuard {
     #[inline]
     fn drop(&mut self) {
-        RECORDER_ACTIVE[self.cpu_id].store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -335,7 +352,7 @@ pub fn trace_pc(edge_id: u32) {
 
 /// Macro to record coverage at a specific code location
 ///
-/// Generates a unique edge ID from file and line number.
+/// Generates a deterministic edge ID from file and line number.
 ///
 /// # Example
 ///
@@ -352,7 +369,7 @@ macro_rules! record_edge {
     () => {{
         #[cfg(feature = "kcov")]
         {
-            // Generate unique edge ID from file:line
+            // Generate deterministic edge ID from file:line.
             const EDGE_ID: u32 = {
                 let file_hash = $crate::const_fnv1a_hash(file!().as_bytes());
                 let line_hash = line!();
@@ -363,7 +380,7 @@ macro_rules! record_edge {
     }};
 }
 
-/// Compile-time FNV-1a hash for generating edge IDs
+/// Compile-time FNV-1a hash for generating deterministic edge IDs.
 #[doc(hidden)]
 pub const fn const_fnv1a_hash(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261; // FNV offset basis
@@ -443,12 +460,57 @@ mod tests {
         buf.enable();
         buf.record_edge(0);
         buf.record_edge((17 * 8 - 1) as u32);
-        assert_eq!(buf.copy_to_user(&mut snapshot), snapshot.len());
+        assert_eq!(buf.copy_to_slice_exact(&mut snapshot), Ok(()));
         assert_eq!(buf.edge_count(), 2);
         assert_eq!(
             snapshot.iter().map(|byte| byte.count_ones()).sum::<u32>(),
             2
         );
+    }
+
+    #[test]
+    fn exact_snapshot_rejects_length_mismatch_without_partial_copy() {
+        let mut buf = CoverageBuffer::try_new(2).expect("small KCOV buffer");
+        buf.enable();
+        buf.record_edge(0);
+        buf.record_edge(15);
+
+        let mut too_short = [0xa5u8; 1];
+        assert_eq!(
+            buf.copy_to_slice_exact(&mut too_short),
+            Err(CoverageCopyError::LengthMismatch)
+        );
+        assert_eq!(too_short, [0xa5], "short destination must remain untouched");
+
+        let mut too_long = [0x5au8; 3];
+        assert_eq!(
+            buf.copy_to_slice_exact(&mut too_long),
+            Err(CoverageCopyError::LengthMismatch)
+        );
+        assert_eq!(too_long, [0x5a; 3], "long destination must remain untouched");
+
+        let mut exact = [0u8; 2];
+        assert_eq!(buf.copy_to_slice_exact(&mut exact), Ok(()));
+        assert_eq!(exact, [0b0000_0001, 0b1000_0000]);
+    }
+
+    #[test]
+    fn colliding_identifiers_count_one_occupied_slot() {
+        let mut buf = CoverageBuffer::try_new(1).expect("one-byte KCOV buffer");
+        buf.enable();
+
+        // Both identifiers map to slot 3 because the bitmap has only eight
+        // slots. The count is bitmap occupancy, not source-ID cardinality.
+        buf.record_edge(3);
+        buf.record_edge(3 + 8);
+        assert_eq!(buf.edge_count(), 1);
+
+        // A different slot contributes exactly one more occupied bit.
+        buf.record_edge(4);
+        assert_eq!(buf.edge_count(), 2);
+        let mut snapshot = [0u8; 1];
+        assert_eq!(buf.copy_to_slice_exact(&mut snapshot), Ok(()));
+        assert_eq!(snapshot[0].count_ones() as usize, buf.edge_count());
     }
 
     #[test]
@@ -462,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_current_task_recorder_suppresses_recursion_restores_preemption_and_rejects_irq() {
+    fn test_current_task_recorder_suppresses_recursion_restores_preemption_and_rejects_async_context() {
         init_coverage(recursive_test_recorder);
         let before = cpu_local::current_cpu()
             .preempt_count
@@ -477,7 +539,21 @@ mod tests {
         );
 
         RECORDED_EDGE.store(0, Ordering::Relaxed);
+        let pin_attempts_before_irq = RECORDER_PIN_ATTEMPTS.load(Ordering::Relaxed);
         cpu_local::current_cpu().irq_enter();
+        assert!(RecorderGuard::try_enter().is_none());
+        assert_eq!(
+            RECORDER_PIN_ATTEMPTS.load(Ordering::Relaxed),
+            pin_attempts_before_irq,
+            "IRQ rejection must not attempt to acquire the KCOV CPU pin"
+        );
+        assert_eq!(
+            cpu_local::current_cpu()
+                .preempt_count
+                .load(Ordering::Relaxed),
+            before,
+            "IRQ rejection must happen before KCOV takes a preemption pin"
+        );
         record_edge_for_current(0xfeed_beef);
         cpu_local::current_cpu().irq_exit();
         assert_eq!(RECORDED_EDGE.load(Ordering::Relaxed), 0);
@@ -487,5 +563,54 @@ mod tests {
                 .load(Ordering::Relaxed),
             before
         );
+
+        // R187-2: NMI does not necessarily clear IF or increment irq_count.
+        // The allocation-free global NMI counter must nevertheless reject the
+        // outer recorder before it attempts a CPU pin or invokes the bridge.
+        RECORDED_EDGE.store(0, Ordering::Relaxed);
+        let pin_attempts_before_nmi = RECORDER_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::nmi_enter();
+        let nmi_guard_rejected = RecorderGuard::try_enter().is_none();
+        let nmi_pin_attempts = RECORDER_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        let nmi_preempt_count = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
+        record_edge_for_current(0xfeed_c0de);
+        let nmi_recorded_edge = RECORDED_EDGE.load(Ordering::Relaxed);
+        let nmi_pin_attempts_after_record = RECORDER_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        let nmi_preempt_after_record = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
+        cpu_local::nmi_exit();
+
+        assert!(nmi_guard_rejected);
+        assert_eq!(
+            nmi_pin_attempts, pin_attempts_before_nmi,
+            "NMI rejection must not attempt to acquire the KCOV CPU pin"
+        );
+        assert_eq!(
+            nmi_pin_attempts_after_record, pin_attempts_before_nmi,
+            "the public NMI recording path must not attempt to acquire the KCOV CPU pin"
+        );
+        assert_eq!(
+            nmi_preempt_count, before,
+            "NMI rejection must happen before KCOV takes a preemption pin"
+        );
+        assert_eq!(
+            nmi_preempt_after_record, before,
+            "the public NMI recording path must not take a KCOV preemption pin"
+        );
+        assert_eq!(
+            nmi_recorded_edge, 0,
+            "NMI recording must be dropped before entering the task bridge"
+        );
+    }
+
+    #[test]
+    fn recorder_active_slots_are_capacity_bounded() {
+        assert!(recorder_active_slot(0).is_some());
+        assert!(recorder_active_slot(cpu_local::MAX_CPUS - 1).is_some());
+        assert!(recorder_active_slot(cpu_local::MAX_CPUS).is_none());
+        assert!(recorder_active_slot(usize::MAX).is_none());
     }
 }

@@ -1,8 +1,9 @@
 //! Minimal per-CPU storage for SMP support
 //!
-//! Provides a simple per-CPU storage abstraction using CPU ID indexed arrays.
-//! Currently uses a single-core fallback (CPU ID always 0) until full SMP
-//! support with APIC enumeration is implemented.
+//! Provides a bounded per-CPU storage abstraction indexed by logical CPU IDs.
+//! Early bootstrap retains a narrow CPU-0 fallback, but normal SMP operation
+//! resolves registered LAPIC identities and fails closed for unknown topology.
+//! Topology-sensitive users should use the strict registered-and-online APIs.
 //!
 //! # Usage
 //!
@@ -29,16 +30,20 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use spin::Once;
+use spin::{Mutex, Once};
 
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 64;
+
+// The online-CPU topology is represented by one u64. Keep the capacity and
+// its bitmap representation coupled at compile time so a future capacity bump
+// cannot turn a shift below into undefined topology admission.
+const _: () = assert!(MAX_CPUS <= u64::BITS as usize);
 
 /// Invalid LAPIC ID marker
 const INVALID_LAPIC_ID: u32 = u32::MAX;
 
 /// Invalid CPU ID marker for reverse mapping
-#[cfg(not(feature = "host_harness"))]
 const INVALID_CPU_ID: usize = usize::MAX;
 
 /// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
@@ -60,6 +65,15 @@ pub const LAPIC_MMIO_DEFAULT_BASE: u32 = 0xFEE0_0000;
 /// IRQ nesting counters, FPU save areas, and scheduler state.
 static CPU_LOCAL_SMP_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Global NMI nesting depth used by no-allocation asynchronous-context gates.
+///
+/// This is intentionally global rather than CPU-local: an NMI can arrive
+/// before the heap-backed `CpuLocal` storage is initialized, when consulting a
+/// per-CPU slot would itself be unsafe. Best-effort facilities conservatively
+/// drop work on every CPU while any NMI is active; that trades a negligible
+/// sampling gap for an early-boot-safe, allocation-free fail-closed policy.
+static NMI_CONTEXT_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Mark SMP initialization complete for the cpu_local subsystem.
 ///
 /// Called by arch SMP bring-up code once all CPU registrations are finished.
@@ -68,6 +82,31 @@ static CPU_LOCAL_SMP_DONE: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn set_smp_init_done() {
     CPU_LOCAL_SMP_DONE.store(true, Ordering::Release);
+}
+
+/// Enter an NMI context without consulting heap-backed CPU-local storage.
+///
+/// The architecture entry stub calls this before any work that may reach an
+/// allocator, lock, or KCOV tracepoint. Nested NMIs are supported.
+#[inline]
+pub fn nmi_enter() {
+    NMI_CONTEXT_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Leave an NMI context entered through [`nmi_enter`].
+#[inline]
+pub fn nmi_exit() {
+    let old = NMI_CONTEXT_COUNT.fetch_sub(1, Ordering::AcqRel);
+    assert!(old > 0, "nmi_exit called with count already 0");
+}
+
+/// Return whether any CPU is currently executing an NMI handler.
+///
+/// This global answer deliberately makes best-effort tracing conservative on
+/// another CPU as well, which is necessary before per-CPU storage exists.
+#[inline]
+pub fn nmi_active() -> bool {
+    NMI_CONTEXT_COUNT.load(Ordering::Acquire) > 0
 }
 
 /// Authoritative LAPIC MMIO base shared by `current_cpu_id()` and `arch::apic`.
@@ -147,6 +186,11 @@ static LAPIC_ID_REVERSE_MAP: [AtomicUsize; LAPIC_ID_REVERSE_MAP_SIZE] = {
     const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
     [INIT; LAPIC_ID_REVERSE_MAP_SIZE]
 };
+
+/// Serializes LAPIC-ID registration so the forward and reverse maps remain a
+/// bijection while AP topology is being admitted. Registration runs only
+/// during BSP/AP bring-up, before ordinary interrupt traffic begins.
+static CPU_ID_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
 
 // ============================================================================
 // Per-CPU Data Structure for SMP Support (Phase E)
@@ -672,6 +716,28 @@ pub fn current_cpu_id() -> usize {
     current_cpu_id_impl()
 }
 
+/// Resolve the current CPU only when its LAPIC ID has an explicit logical-CPU
+/// registration.
+///
+/// Unlike [`current_cpu_id`], this never applies the early-boot CPU-0 fallback.
+/// Best-effort facilities such as KCOV use it to fail closed rather than
+/// attributing work from a not-yet-admitted AP to the BSP's per-CPU state.
+#[inline]
+pub fn try_current_registered_cpu_id() -> Option<usize> {
+    #[cfg(feature = "host_harness")]
+    {
+        Some(0)
+    }
+
+    #[cfg(not(feature = "host_harness"))]
+    {
+        match current_cpu_lookup() {
+            CurrentCpuLookup::Registered(cpu_id) => Some(cpu_id),
+            CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+        }
+    }
+}
+
 /// Hosted tests have one deterministic logical CPU and no LAPIC MMIO mapping.
 ///
 /// RF180 hosted-verification fix: keep hardware discovery entirely out of the
@@ -683,10 +749,29 @@ fn current_cpu_id_impl() -> usize {
     0
 }
 
+/// Result of a hardware LAPIC-to-logical-CPU lookup.
+#[cfg(not(feature = "host_harness"))]
+enum CurrentCpuLookup {
+    Registered(usize),
+    X2ApicActive,
+    Unregistered(u32),
+}
+
+/// Verify that a reverse-map candidate still agrees with the authoritative
+/// logical-CPU-to-LAPIC map.
+///
+/// A reverse entry alone is not a registration proof: firmware or a buggy
+/// re-registration could otherwise leave a stale entry that aliases KCOV (and
+/// other per-CPU state) to an unrelated online CPU.
+#[inline]
+fn registered_cpu_mapping_matches(cpu_id: usize, lapic_id: u32) -> bool {
+    cpu_id < MAX_CPUS && LAPIC_ID_MAP[cpu_id].load(Ordering::Acquire) == lapic_id
+}
+
 /// Production CPU identification through the registered LAPIC-to-logical map.
 #[cfg(not(feature = "host_harness"))]
 #[inline]
-fn current_cpu_id_impl() -> usize {
+fn current_cpu_lookup() -> CurrentCpuLookup {
     // R169-L7 FIX: in x2APIC mode the APIC ID comes from an MSR, can exceed 8 bits
     // (overflowing the 256-entry reverse map), and the xAPIC MMIO ID register read
     // below is invalid. Reading it would alias another CPU's per-CPU slot, so fail
@@ -694,7 +779,7 @@ fn current_cpu_id_impl() -> usize {
     // only); the kernel never enables x2APIC, so on supported hardware this branch
     // is never taken.
     if X2APIC_ACTIVE.load(Ordering::Acquire) {
-        panic!("current_cpu_id: x2APIC mode is unsupported (would alias per-CPU data)");
+        return CurrentCpuLookup::X2ApicActive;
     }
 
     // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
@@ -704,32 +789,49 @@ fn current_cpu_id_impl() -> usize {
     // the identity-map hardening carve-out preserves.
     let apic_id = unsafe {
         let id_reg = (lapic_mmio_base() as usize + 0x20) as *const u32;
-        (core::ptr::read_volatile(id_reg) >> 24) as usize
+        core::ptr::read_volatile(id_reg) >> 24
     };
 
     // R67-8 FIX: O(1) reverse lookup instead of linear search
-    let cpu_idx = if apic_id < LAPIC_ID_REVERSE_MAP_SIZE {
-        LAPIC_ID_REVERSE_MAP[apic_id].load(Ordering::Relaxed)
+    let cpu_idx = if (apic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE {
+        LAPIC_ID_REVERSE_MAP[apic_id as usize].load(Ordering::Acquire)
     } else {
         INVALID_CPU_ID
     };
 
-    // Return valid CPU index if found
-    if cpu_idx < MAX_CPUS {
-        return cpu_idx;
+    // R187-7 FIX: a valid reverse entry must also agree with the forward map.
+    // This rejects stale/reassigned LAPIC mappings instead of aliasing their
+    // per-CPU KCOV state to a currently online logical slot.
+    if registered_cpu_mapping_matches(cpu_idx, apic_id) {
+        return CurrentCpuLookup::Registered(cpu_idx);
     }
 
-    // R151-6 FIX: After SMP init, an unregistered LAPIC ID is a critical bug
-    // that would silently alias CPU 0's per-CPU data. Panic immediately.
-    if CPU_LOCAL_SMP_DONE.load(Ordering::Acquire) {
-        panic!(
-            "current_cpu_id: LAPIC ID {} not registered after SMP init complete",
-            apic_id
-        );
-    }
+    CurrentCpuLookup::Unregistered(apic_id)
+}
 
-    // Fallback to CPU 0 - only safe during early boot before registration
-    0
+/// Production CPU identification through the registered LAPIC-to-logical map.
+#[cfg(not(feature = "host_harness"))]
+#[inline]
+fn current_cpu_id_impl() -> usize {
+    match current_cpu_lookup() {
+        CurrentCpuLookup::Registered(cpu_id) => cpu_id,
+        CurrentCpuLookup::X2ApicActive => {
+            panic!("current_cpu_id: x2APIC mode is unsupported (would alias per-CPU data)");
+        }
+        CurrentCpuLookup::Unregistered(apic_id) => {
+            // R151-6 FIX: After SMP init, an unregistered LAPIC ID is a critical bug
+            // that would silently alias CPU 0's per-CPU data. Panic immediately.
+            if CPU_LOCAL_SMP_DONE.load(Ordering::Acquire) {
+                panic!(
+                    "current_cpu_id: LAPIC ID {} not registered after SMP init complete",
+                    apic_id
+                );
+            }
+
+            // Fallback to CPU 0 - only safe during early boot before registration.
+            0
+        }
+    }
 }
 
 /// Register the LAPIC ID to CPU index mapping.
@@ -751,12 +853,56 @@ fn current_cpu_id_impl() -> usize {
 /// Panics if `cpu_id` is out of range.
 pub fn register_cpu_id(cpu_id: usize, lapic_id: u32) {
     assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
-    LAPIC_ID_MAP[cpu_id].store(lapic_id, Ordering::Relaxed);
+    assert!(
+        (lapic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE,
+        "LAPIC ID {} exceeds the xAPIC reverse-map capacity",
+        lapic_id
+    );
 
-    // R67-8 FIX: Populate reverse mapping for O(1) lookup
-    if (lapic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE {
-        LAPIC_ID_REVERSE_MAP[lapic_id as usize].store(cpu_id, Ordering::Relaxed);
+    let _registration = CPU_ID_REGISTRATION_LOCK.lock();
+    let previous_lapic = LAPIC_ID_MAP[cpu_id].load(Ordering::Acquire);
+    assert!(
+        previous_lapic == INVALID_LAPIC_ID || previous_lapic == lapic_id || !is_cpu_online(cpu_id),
+        "CPU {} is online and cannot change LAPIC ID {} to {}",
+        cpu_id,
+        previous_lapic,
+        lapic_id
+    );
+    let claimed_by = LAPIC_ID_REVERSE_MAP[lapic_id as usize].load(Ordering::Acquire);
+    assert!(
+        claimed_by == INVALID_CPU_ID || claimed_by == cpu_id,
+        "LAPIC ID {} is already registered to CPU {}",
+        lapic_id,
+        claimed_by
+    );
+    assert!(
+        claimed_by == INVALID_CPU_ID || previous_lapic == lapic_id,
+        "LAPIC ID {} has a stale reverse mapping for CPU {}",
+        lapic_id,
+        cpu_id
+    );
+
+    if previous_lapic != INVALID_LAPIC_ID && previous_lapic != lapic_id {
+        assert!(
+            (previous_lapic as usize) < LAPIC_ID_REVERSE_MAP_SIZE,
+            "CPU {} had an out-of-range prior LAPIC ID {}",
+            cpu_id,
+            previous_lapic
+        );
+        let old_owner = LAPIC_ID_REVERSE_MAP[previous_lapic as usize].load(Ordering::Acquire);
+        assert_eq!(
+            old_owner, cpu_id,
+            "CPU {} had a non-bijective LAPIC mapping for ID {}",
+            cpu_id, previous_lapic
+        );
+        LAPIC_ID_REVERSE_MAP[previous_lapic as usize].store(INVALID_CPU_ID, Ordering::Release);
     }
+
+    // Publish forward first and reverse second. A concurrent reader can only
+    // observe an incomplete mapping and fail closed because it validates both
+    // directions in `registered_cpu_mapping_matches`.
+    LAPIC_ID_MAP[cpu_id].store(lapic_id, Ordering::Release);
+    LAPIC_ID_REVERSE_MAP[lapic_id as usize].store(cpu_id, Ordering::Release);
 }
 
 /// Get the maximum number of supported CPUs
@@ -778,11 +924,16 @@ pub fn lapic_id_for_cpu(cpu_id: usize) -> Option<u32> {
     if cpu_id >= MAX_CPUS {
         return None;
     }
-    let id = LAPIC_ID_MAP[cpu_id].load(Ordering::Relaxed);
-    if id == INVALID_LAPIC_ID {
+    let lapic_id = LAPIC_ID_MAP[cpu_id].load(Ordering::Acquire);
+    if lapic_id == INVALID_LAPIC_ID || (lapic_id as usize) >= LAPIC_ID_REVERSE_MAP_SIZE {
         None
+    } else if LAPIC_ID_REVERSE_MAP[lapic_id as usize].load(Ordering::Acquire) == cpu_id {
+        Some(lapic_id)
     } else {
-        Some(id)
+        // Registration publishes a forward/reverse pair. Returning a forward
+        // entry without its reciprocal reverse entry could target a stale or
+        // reassigned LAPIC during AP topology changes, so fail closed.
+        None
     }
 }
 
@@ -927,7 +1078,177 @@ pub fn online_cpu_mask() -> u64 {
 /// Test one logical CPU ID against the same authoritative bitmap.
 #[inline]
 pub fn is_cpu_online(cpu_id: usize) -> bool {
-    cpu_id < 64 && (online_cpu_mask() & (1u64 << cpu_id)) != 0
+    cpu_id < MAX_CPUS && (online_cpu_mask() & (1u64 << cpu_id)) != 0
+}
+
+/// Admit a logical CPU only when a prior LAPIC lookup produced a valid ID and
+/// that ID is currently online.
+///
+/// Keeping the capacity check ahead of the shift makes this helper safe for
+/// every caller, including best-effort KCOV paths that must fail closed rather
+/// than turn an unknown topology result into a static-array index.
+#[inline]
+fn registered_online_cpu_id(registered_cpu_id: Option<usize>, online_mask: u64) -> Option<usize> {
+    let cpu_id = registered_cpu_id?;
+    if cpu_id >= MAX_CPUS || (online_mask & (1u64 << cpu_id)) == 0 {
+        return None;
+    }
+    Some(cpu_id)
+}
+
+/// Resolve the current CPU only when it is both LAPIC-registered and online.
+///
+/// This is the strict admission boundary for fixed-capacity per-CPU state.
+/// Unlike [`current_cpu_id`], it never applies the early-boot CPU-0 fallback.
+#[inline]
+pub fn try_current_registered_online_cpu_id() -> Option<usize> {
+    registered_online_cpu_id(try_current_registered_cpu_id(), online_cpu_mask())
+}
+
+/// Read the architectural interrupt-enable flag without depending on the arch
+/// crate (which itself depends on `cpu_local`).
+///
+/// KCOV treats every IF-masked context conservatively as non-task context. On
+/// x86-64 this covers interrupt-gate entries and ordinary task critical
+/// sections; NMI is additionally accounted explicitly because its entry does
+/// not reliably clear IF. Other architectures currently retain the existing
+/// IRQ/NMI accounting until they provide an equivalent flag reader.
+#[inline]
+fn interrupts_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rflags: usize;
+        // SAFETY: PUSHFQ/POP only read the current CPU's RFLAGS and restore the
+        // stack pointer before returning. They do not alter interrupt state.
+        unsafe {
+            core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
+        }
+        (rflags & (1 << 9)) != 0
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
+}
+
+#[inline]
+fn is_non_task_context(in_irq: bool, in_nmi: bool, interrupts_enabled: bool) -> bool {
+    in_irq || in_nmi || !interrupts_enabled
+}
+
+/// Return whether the current, registered, online CPU is in non-task context.
+///
+/// `None` is deliberately fail-closed: callers must not attribute work to an
+/// unregistered or offline CPU. This is a pre-admission filter only; a caller
+/// that needs a stable CPU must re-check through [`CurrentCpuPin`] after pinning.
+#[inline]
+pub fn try_current_online_cpu_in_non_task_context() -> Option<bool> {
+    // Check the allocation-free global NMI gate first. An NMI can arrive
+    // before CPU-local storage and LAPIC registration are initialized, so no
+    // CPU-local lookup is safe on that path.
+    if nmi_active() {
+        return Some(true);
+    }
+
+    let cpu_id = try_current_registered_online_cpu_id()?;
+    // Hardware interrupt gates clear IF. Check it before consulting the
+    // heap-backed per-CPU slab so the common asynchronous path cannot make
+    // its first allocation while rejecting KCOV work.
+    let interrupts_enabled = interrupts_enabled();
+    if !interrupts_enabled {
+        return Some(true);
+    }
+    let per_cpu = PER_CPU_DATA.get_cpu(cpu_id)?;
+    Some(is_non_task_context(
+        per_cpu.in_irq(),
+        nmi_active(),
+        interrupts_enabled,
+    ))
+}
+
+/// Return whether the current, registered, online CPU is servicing an
+/// accounted hard IRQ.
+///
+/// This deliberately does not inspect IF. Scheduler switch code publishes a
+/// task token with IF masked, which is ordinary scheduler context rather than
+/// an IRQ handler. Callers that must reject every asynchronous context should
+/// use [`try_current_online_cpu_in_non_task_context`] instead.
+#[inline]
+pub fn try_current_online_cpu_in_irq_context() -> Option<bool> {
+    let cpu_id = try_current_registered_online_cpu_id()?;
+    Some(PER_CPU_DATA.get_cpu(cpu_id)?.in_irq())
+}
+
+/// A non-sendable preemption pin for a registered, online CPU.
+///
+/// The pin holds the validated per-CPU reference so dropping it never repeats
+/// CPU lookup or indexes a caller-owned per-CPU array. KCOV uses this to keep
+/// topology admission and preemption restoration fail-closed.
+pub struct CurrentCpuPin {
+    cpu_id: usize,
+    per_cpu: &'static PerCpuData,
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl CurrentCpuPin {
+    /// Return the validated logical CPU ID associated with this pin.
+    #[inline]
+    pub fn cpu_id(&self) -> usize {
+        self.cpu_id
+    }
+
+    /// Return whether this pinned CPU is in a non-task context.
+    #[inline]
+    pub fn in_non_task_context(&self) -> bool {
+        is_non_task_context(self.per_cpu.in_irq(), nmi_active(), interrupts_enabled())
+    }
+
+    /// Return whether the pinned CPU is servicing an accounted hard IRQ.
+    ///
+    /// Unlike [`Self::in_non_task_context`], this intentionally permits a
+    /// scheduler critical section with IF masked.
+    #[inline]
+    pub fn in_irq(&self) -> bool {
+        self.per_cpu.in_irq()
+    }
+}
+
+impl Drop for CurrentCpuPin {
+    #[inline]
+    fn drop(&mut self) {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.per_cpu.preempt_enable();
+    }
+}
+
+/// Try to pin the current CPU only after strict topology admission.
+///
+/// R187-7 FIX: KCOV must never use the legacy pre-SMP CPU-0 fallback for
+/// per-CPU tracing state. The retry closes the sample-before-disable migration
+/// window, while every unavailable/offline topology state drops the caller's
+/// best-effort operation without indexing a static array.
+#[inline]
+pub fn try_pin_current_online_cpu() -> Option<CurrentCpuPin> {
+    loop {
+        let cpu_id = try_current_registered_online_cpu_id()?;
+
+        let per_cpu = PER_CPU_DATA.get_cpu(cpu_id)?;
+        per_cpu.preempt_disable();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+        if try_current_registered_online_cpu_id() == Some(cpu_id) {
+            return Some(CurrentCpuPin {
+                cpu_id,
+                per_cpu,
+                _not_send: core::marker::PhantomData,
+            });
+        }
+
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        per_cpu.preempt_enable();
+        core::hint::spin_loop();
+    }
 }
 
 /// Mark a CPU as online (call this from AP initialization).
@@ -946,7 +1267,7 @@ pub fn is_cpu_online(cpu_id: usize) -> bool {
 #[inline]
 pub fn mark_cpu_online() {
     let cpu_id = current_cpu_id();
-    if cpu_id < 64 {
+    if cpu_id < MAX_CPUS {
         ONLINE_CPU_MASK.fetch_or(1u64 << cpu_id, Ordering::Release);
     }
 }
@@ -968,8 +1289,123 @@ pub fn clear_fpu_owner_all_cpus(pid: usize) {
 
 #[cfg(all(test, feature = "host_harness"))]
 mod host_harness_tests {
+    use core::sync::atomic::Ordering;
+
+    static TOPOLOGY_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     #[test]
     fn current_cpu_id_is_deterministic_without_lapic_mmio() {
         assert_eq!(super::current_cpu_id(), 0);
+    }
+
+    #[test]
+    fn strict_cpu_pin_is_registered_online_and_restores_preemption() {
+        assert_eq!(super::try_current_registered_cpu_id(), Some(0));
+        assert_eq!(super::try_current_registered_online_cpu_id(), Some(0));
+        assert_eq!(
+            super::try_current_online_cpu_in_non_task_context(),
+            Some(false)
+        );
+        assert_eq!(super::try_current_online_cpu_in_irq_context(), Some(false));
+        assert!(super::is_cpu_online(0));
+        assert!(!super::is_cpu_online(super::MAX_CPUS));
+        assert!(!super::is_cpu_online(usize::MAX));
+
+        let before = super::current_cpu().preempt_count.load(Ordering::Relaxed);
+        let pin = super::try_pin_current_online_cpu().expect("host CPU 0 is admitted");
+        assert_eq!(pin.cpu_id(), 0);
+        assert!(!pin.in_non_task_context());
+        assert_eq!(
+            super::current_cpu().preempt_count.load(Ordering::Relaxed),
+            before + 1
+        );
+        drop(pin);
+        assert_eq!(
+            super::current_cpu().preempt_count.load(Ordering::Relaxed),
+            before
+        );
+    }
+
+    #[test]
+    fn strict_topology_admission_rejects_unregistered_offline_and_out_of_range_ids() {
+        let highest = super::MAX_CPUS - 1;
+        let online = (1u64 << 0) | (1u64 << highest);
+
+        assert_eq!(super::registered_online_cpu_id(None, online), None);
+        assert_eq!(super::registered_online_cpu_id(Some(1), online), None);
+        assert_eq!(
+            super::registered_online_cpu_id(Some(super::MAX_CPUS), online),
+            None
+        );
+        assert_eq!(
+            super::registered_online_cpu_id(Some(usize::MAX), online),
+            None
+        );
+        assert_eq!(super::registered_online_cpu_id(Some(0), online), Some(0));
+        assert_eq!(
+            super::registered_online_cpu_id(Some(highest), online),
+            Some(highest)
+        );
+    }
+
+    #[test]
+    fn non_task_context_classifier_rejects_irq_and_interrupt_masking() {
+        assert!(!super::is_non_task_context(false, false, true));
+        assert!(super::is_non_task_context(true, false, true));
+        assert!(super::is_non_task_context(false, true, true));
+        assert!(super::is_non_task_context(false, false, false));
+        assert!(super::is_non_task_context(true, true, false));
+
+        super::current_cpu().irq_enter();
+        assert_eq!(super::try_current_online_cpu_in_irq_context(), Some(true));
+        super::current_cpu().irq_exit();
+        super::nmi_enter();
+        assert_eq!(
+            super::try_current_online_cpu_in_non_task_context(),
+            Some(true)
+        );
+        super::nmi_exit();
+    }
+
+    #[test]
+    fn registration_reassignment_clears_stale_reverse_entry() {
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
+        let cpu_id = super::MAX_CPUS - 2;
+        let first_lapic = 250;
+        let second_lapic = 251;
+
+        super::register_cpu_id(cpu_id, first_lapic);
+        assert!(super::registered_cpu_mapping_matches(cpu_id, first_lapic));
+        super::register_cpu_id(cpu_id, second_lapic);
+
+        assert_eq!(super::lapic_id_for_cpu(cpu_id), Some(second_lapic));
+        assert!(!super::registered_cpu_mapping_matches(cpu_id, first_lapic));
+        assert!(super::registered_cpu_mapping_matches(cpu_id, second_lapic));
+        assert_eq!(
+            super::LAPIC_ID_REVERSE_MAP[first_lapic as usize].load(Ordering::Acquire),
+            super::INVALID_CPU_ID
+        );
+        assert_eq!(
+            super::LAPIC_ID_REVERSE_MAP[second_lapic as usize].load(Ordering::Acquire),
+            cpu_id
+        );
+
+        // A forward entry alone is never enough to target a LAPIC. This
+        // models an interrupted/externally-corrupted registration and proves
+        // forward-map consumers fail closed until reciprocity is restored.
+        super::LAPIC_ID_REVERSE_MAP[second_lapic as usize]
+            .store(super::INVALID_CPU_ID, Ordering::Release);
+        assert_eq!(super::lapic_id_for_cpu(cpu_id), None);
+        super::LAPIC_ID_REVERSE_MAP[second_lapic as usize].store(cpu_id, Ordering::Release);
+        assert_eq!(super::lapic_id_for_cpu(cpu_id), Some(second_lapic));
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered")]
+    fn registration_rejects_duplicate_lapic_identity() {
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
+        let lapic_id = 249;
+        super::register_cpu_id(super::MAX_CPUS - 4, lapic_id);
+        super::register_cpu_id(super::MAX_CPUS - 3, lapic_id);
     }
 }

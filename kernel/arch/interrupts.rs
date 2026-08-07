@@ -774,8 +774,13 @@ extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
 
 /// #NMI - Non-Maskable Interrupt (不可屏蔽中断)
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    // R187-2 FIX: NMI delivery does not reliably clear RFLAGS.IF and bypasses
+    // the ordinary IRQ nesting counter. Account it explicitly so KCOV's
+    // task-context admission rejects every NMI before a CPU pin or mutex probe.
+    cpu_local::nmi_enter();
     clac_if_smap();
     // NMI：可能是硬件错误，静默处理
+    cpu_local::nmi_exit();
 }
 
 /// #BP - Breakpoint (断点)

@@ -4322,53 +4322,21 @@ static CURRENT_PID: cpu_local::CpuLocal<AtomicUsize> =
 static CURRENT_KCOV_BUFFER: [AtomicPtr<Mutex<coverage::CoverageBuffer>>; cpu_local::MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; cpu_local::MAX_CPUS];
 
-/// Stable-CPU preemption pin for task-token publication and access.
+#[cfg(all(test, feature = "kcov"))]
+static KCOV_TASK_PIN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, feature = "kcov"))]
+static KCOV_TRY_LOCK_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, feature = "kcov"))]
+static KCOV_PUBLICATION_PIN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Return a task-token slot only after proving that the logical CPU is in the
+/// static topology capacity.
 #[cfg(feature = "kcov")]
-struct KcovCpuPin {
-    cpu_id: usize,
-    _not_send: core::marker::PhantomData<*const ()>,
-}
-
-#[cfg(feature = "kcov")]
-impl KcovCpuPin {
-    #[inline]
-    fn new() -> Self {
-        loop {
-            let cpu_id = cpu_local::current_cpu_id();
-            if cpu_local::current_cpu_id() != cpu_id {
-                core::hint::spin_loop();
-                continue;
-            }
-
-            let per_cpu = cpu_local::PER_CPU_DATA
-                .get_cpu(cpu_id)
-                .unwrap_or_else(|| panic!("KCOV task token: missing per-CPU slot {cpu_id}"));
-            per_cpu.preempt_disable();
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            if cpu_local::current_cpu_id() == cpu_id {
-                return Self {
-                    cpu_id,
-                    _not_send: core::marker::PhantomData,
-                };
-            }
-
-            core::sync::atomic::compiler_fence(Ordering::SeqCst);
-            per_cpu.preempt_enable();
-            core::hint::spin_loop();
-        }
-    }
-}
-
-#[cfg(feature = "kcov")]
-impl Drop for KcovCpuPin {
-    #[inline]
-    fn drop(&mut self) {
-        let per_cpu = cpu_local::PER_CPU_DATA
-            .get_cpu(self.cpu_id)
-            .unwrap_or_else(|| panic!("KCOV task token: lost per-CPU slot {}", self.cpu_id));
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        per_cpu.preempt_enable();
-    }
+#[inline]
+fn current_kcov_slot(cpu_id: usize) -> Option<&'static AtomicPtr<Mutex<coverage::CoverageBuffer>>> {
+    CURRENT_KCOV_BUFFER.get(cpu_id)
 }
 
 /// M4-1 (force-init): pre-allocate the `CURRENT_PID` per-CPU slab in process context
@@ -5132,6 +5100,64 @@ pub fn current_pid() -> Option<ProcessId> {
 pub enum KcovAccessError {
     NotInitialized,
     Contended,
+    /// KCOV task state is never accessed from an IRQ handler.
+    InterruptContext,
+    /// The current CPU is not a registered, online topology member.
+    CpuUnavailable,
+}
+
+/// Admit a KCOV task-buffer operation only from a stable, non-IRQ CPU.
+///
+/// R187-2 FIX: this makes the no-IRQ policy self-enforcing even when a caller
+/// bypasses the outer `coverage::RecorderGuard`. R187-7 FIX: strict topology
+/// admission refuses the legacy pre-SMP CPU-0 fallback before a KCOV static
+/// slot can be selected.
+#[cfg(feature = "kcov")]
+#[inline]
+fn try_pin_kcov_task_context() -> Result<cpu_local::CurrentCpuPin, KcovAccessError> {
+    match cpu_local::try_current_online_cpu_in_non_task_context() {
+        Some(false) => {}
+        Some(true) => return Err(KcovAccessError::InterruptContext),
+        None => return Err(KcovAccessError::CpuUnavailable),
+    }
+
+    #[cfg(all(test, feature = "kcov"))]
+    // lint-fetch-add: allow — test-only attempt counter, never an ID/refcount.
+    KCOV_TASK_PIN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    let pin = cpu_local::try_pin_current_online_cpu().ok_or(KcovAccessError::CpuUnavailable)?;
+    if pin.in_non_task_context() {
+        return Err(KcovAccessError::InterruptContext);
+    }
+    Ok(pin)
+}
+
+/// Pin the current CPU for scheduler-side KCOV token publication.
+///
+/// Publication is an atomic pointer store, not coverage recording and not a
+/// mutex acquisition. The scheduler deliberately executes it with IF masked
+/// at the final switch boundary, so it must not use the broader task-context
+/// gate above. The global NMI gate is likewise intentionally not consumed
+/// here: an NMI on CPU A must not leave CPU B's outgoing token published across
+/// a scheduler switch. This is a scheduler/syscall-init-only primitive; its
+/// current CPU still rejects an actual accounted IRQ before pinning and retains
+/// the same strict registered-and-online topology admission as the recorder.
+#[cfg(feature = "kcov")]
+#[inline]
+fn try_pin_kcov_publication_context() -> Option<cpu_local::CurrentCpuPin> {
+    if cpu_local::try_current_online_cpu_in_irq_context() != Some(false) {
+        return None;
+    }
+
+    #[cfg(all(test, feature = "kcov"))]
+    // lint-fetch-add: allow — test-only attempt counter, never an ID/refcount.
+    KCOV_PUBLICATION_PIN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    let pin = cpu_local::try_pin_current_online_cpu()?;
+    if pin.in_irq() {
+        return None;
+    }
+    Some(pin)
 }
 
 /// Capture the immutable token for a PCB while its lock is already held.
@@ -5160,14 +5186,20 @@ pub fn task_kcov_switch_token(proc: &Process) -> usize {
 ///
 /// The scheduler calls this at the final switch boundary, after scheduler-tail
 /// hooks, so kernel work before the actual switch remains attributed to the
-/// outgoing task. `sys_kcov_init` also calls it after first-time installation
-/// for the already-running current task.
+/// outgoing task. It intentionally supports the scheduler's IF-masked critical
+/// section, while rejecting an accounted IRQ and an unavailable CPU. `sys_kcov_init`
+/// also calls it after first-time installation for the already-running current task.
 #[inline]
 pub fn publish_current_kcov_token(token: usize) {
     #[cfg(feature = "kcov")]
     {
-        let pin = KcovCpuPin::new();
-        CURRENT_KCOV_BUFFER[pin.cpu_id].store(
+        let Some(pin) = try_pin_kcov_publication_context() else {
+            return;
+        };
+        let Some(slot) = current_kcov_slot(pin.cpu_id()) else {
+            return;
+        };
+        slot.store(
             token as *mut Mutex<coverage::CoverageBuffer>,
             Ordering::Release,
         );
@@ -5180,14 +5212,15 @@ pub fn publish_current_kcov_token(token: usize) {
 /// Run a short, allocation-free operation against the selected task's bitmap.
 ///
 /// This path never consults `PROCESS_TABLE` and never locks a PCB. Preemption is
-/// pinned while the raw token is loaded and used, and `try_lock` makes recursive
+/// pinned only after IRQ and topology admission, and `try_lock` makes recursive
 /// or concurrent KCOV access fail closed instead of spinning.
 #[cfg(feature = "kcov")]
 pub fn try_with_current_kcov<R>(
     f: impl FnOnce(&mut coverage::CoverageBuffer) -> R,
 ) -> Result<R, KcovAccessError> {
-    let pin = KcovCpuPin::new();
-    let raw = CURRENT_KCOV_BUFFER[pin.cpu_id].load(Ordering::Acquire);
+    let pin = try_pin_kcov_task_context()?;
+    let slot = current_kcov_slot(pin.cpu_id()).ok_or(KcovAccessError::CpuUnavailable)?;
+    let raw = slot.load(Ordering::Acquire);
     if raw.is_null() {
         return Err(KcovAccessError::NotInitialized);
     }
@@ -5196,6 +5229,9 @@ pub fn try_with_current_kcov<R>(
     // The current task remains on-CPU while `pin` is live, and task teardown is
     // gated by `on_cpu`, so the PCB and this field cannot be destroyed here.
     let buffer = unsafe { &*raw };
+    #[cfg(all(test, feature = "kcov"))]
+    // lint-fetch-add: allow — test-only attempt counter, never an ID/refcount.
+    KCOV_TRY_LOCK_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let Some(mut coverage) = buffer.try_lock() else {
         return Err(KcovAccessError::Contended);
     };
@@ -5207,7 +5243,9 @@ pub fn try_with_current_kcov<R>(
 /// The coverage crate cannot depend on kernel_core without creating a Cargo
 /// dependency cycle, so it calls this function through a boot-registered
 /// function pointer. Unrelated process-table and PCB locks are deliberately
-/// absent; only direct KCOV-buffer contention may drop an edge.
+/// absent; IRQ/topology rejection and direct KCOV-buffer contention may drop an
+/// edge. The inner `try_with_current_kcov` gate also protects direct callers
+/// that bypass the coverage crate's outer recursion guard.
 #[cfg(feature = "kcov")]
 #[inline]
 pub fn record_kcov_edge_for_current(edge_id: u32) {
@@ -5230,6 +5268,19 @@ mod kcov_task_tests {
         mm::publish_heap_budgets();
         publish_current_kcov_token(0);
 
+        // Process::new lazily takes the static root mount namespace.  Its
+        // permanent admitted "/" path is bootstrap state, not a process or
+        // KCOV allocation, so initialize it before the exact teardown
+        // baseline rather than mistaking one-time global setup for a leak.
+        let root_mount_namespace = crate::mount_namespace::ROOT_MNT_NAMESPACE.clone();
+        drop(root_mount_namespace);
+        // R187-7: static token storage is capacity-bounded even if a future
+        // topology admission bug presents an invalid logical CPU ID.
+        assert!(current_kcov_slot(0).is_some());
+        assert!(current_kcov_slot(cpu_local::MAX_CPUS - 1).is_some());
+        assert!(current_kcov_slot(cpu_local::MAX_CPUS).is_none());
+        assert!(current_kcov_slot(usize::MAX).is_none());
+
         let baseline = class_snapshots();
         let parent = Mutex::new(Process::new(
             0x4b43_4f56,
@@ -5237,6 +5288,10 @@ mod kcov_task_tests {
             alloc::string::String::from("kcov-parent"),
             120,
         ));
+        // Process construction owns normal process/name allocations.  Capture
+        // the KCOV-installation baseline only after those are established so
+        // the following class-isolation assertion measures the bitmap alone.
+        let pre_kcov_install = class_snapshots();
         let parent_state = TaskKcovState::try_new(17).expect("parent KCOV allocation");
         let parent_charge = parent_state._bitmap_charge.bytes();
         let parent_token = parent
@@ -5249,20 +5304,88 @@ mod kcov_task_tests {
             if class == HeapClass::Coverage {
                 assert_eq!(
                     installed[index].committed_bytes,
-                    baseline[index].committed_bytes + parent_charge
+                    pre_kcov_install[index].committed_bytes + parent_charge
                 );
                 assert_eq!(
                     installed[index].reserved_bytes,
-                    baseline[index].reserved_bytes
+                    pre_kcov_install[index].reserved_bytes
                 );
             } else {
                 assert_eq!(
-                    installed[index], baseline[index],
+                    installed[index], pre_kcov_install[index],
                     "KCOV allocation changed unrelated heap class {class:?}"
                 );
             }
         }
 
+        publish_current_kcov_token(parent_token);
+        assert_eq!(
+            current_kcov_slot(0)
+                .expect("host KCOV slot")
+                .load(Ordering::Acquire) as usize,
+            parent_token,
+            "ordinary scheduler-side publication must install the selected task token"
+        );
+
+        // R187-7: the early-safe NMI counter is global so it can reject
+        // best-effort recording before CPU-local storage exists. A scheduler
+        // switch on another CPU must still publish/clear its own token while
+        // that global gate is set; otherwise an outgoing pointer can survive
+        // into the next task. This hosted simulation models that unrelated-NMI
+        // condition without claiming token publication is NMI-callable.
+        let publication_pin_attempts = KCOV_PUBLICATION_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::nmi_enter();
+        publish_current_kcov_token(0);
+        let publication_during_nmi = current_kcov_slot(0)
+            .expect("host KCOV slot")
+            .load(Ordering::Acquire);
+        let publication_nmi_pin_attempts = KCOV_PUBLICATION_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::nmi_exit();
+        assert_eq!(
+            publication_during_nmi,
+            core::ptr::null_mut(),
+            "a global NMI gate on another CPU must not retain a stale task token"
+        );
+        assert_eq!(
+            publication_nmi_pin_attempts,
+            publication_pin_attempts + 1,
+            "topology-only scheduler publication must still acquire its stable CPU pin"
+        );
+        publish_current_kcov_token(parent_token);
+
+        // R187-2/R187-7: token publication is scheduler-safe with IF masked,
+        // but must still reject an actual IRQ before it pins or overwrites the
+        // task-local slot. The real scheduler's `without_interrupts` section
+        // has `irq_count == 0`; this synthetic hard IRQ covers the opposite
+        // branch without attempting a privileged CLI instruction in hosted CI.
+        let publication_pin_attempts = KCOV_PUBLICATION_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::current_cpu().irq_enter();
+        publish_current_kcov_token(0);
+        assert_eq!(
+            current_kcov_slot(0)
+                .expect("host KCOV slot")
+                .load(Ordering::Acquire) as usize,
+            parent_token,
+            "IRQ-side publication must not clear the selected task token"
+        );
+        assert_eq!(
+            KCOV_PUBLICATION_PIN_ATTEMPTS.load(Ordering::Relaxed),
+            publication_pin_attempts,
+            "IRQ-side publication must reject before a KCOV CPU pin"
+        );
+        cpu_local::current_cpu().irq_exit();
+
+        // The scheduler path has IRQs masked but no accounted IRQ nesting;
+        // its topology-only publication must remain functional so an outgoing
+        // task token cannot survive into the next task's coverage path.
+        publish_current_kcov_token(0);
+        assert_eq!(
+            current_kcov_slot(0)
+                .expect("host KCOV slot")
+                .load(Ordering::Acquire),
+            core::ptr::null_mut(),
+            "scheduler-side publication must be able to clear a stale task token"
+        );
         publish_current_kcov_token(parent_token);
         try_with_current_kcov(coverage::CoverageBuffer::enable).expect("enable parent KCOV");
 
@@ -5278,6 +5401,86 @@ mod kcov_task_tests {
             assert_eq!(after, before + 1);
             drop(parent_guard);
         }
+
+        // R187-2: the public task bridge must reject IRQ callers even when
+        // they bypass coverage::RecorderGuard. It must neither take a pin nor
+        // mutate the selected task's bitmap.
+        let before_irq = try_with_current_kcov(|buffer| buffer.edge_count())
+            .expect("read parent count before simulated IRQ");
+        let preempt_before_irq = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
+        let pin_attempts_before_irq = KCOV_TASK_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        let try_lock_attempts_before_irq = KCOV_TRY_LOCK_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::current_cpu().irq_enter();
+        record_kcov_edge_for_current(0x1872);
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count()),
+            Err(KcovAccessError::InterruptContext)
+        );
+        assert_eq!(
+            cpu_local::current_cpu()
+                .preempt_count
+                .load(Ordering::Relaxed),
+            preempt_before_irq,
+            "IRQ rejection must happen before the KCOV task pin"
+        );
+        assert_eq!(
+            KCOV_TASK_PIN_ATTEMPTS.load(Ordering::Relaxed),
+            pin_attempts_before_irq,
+            "direct IRQ bridge call must not attempt to pin a KCOV CPU"
+        );
+        assert_eq!(
+            KCOV_TRY_LOCK_ATTEMPTS.load(Ordering::Relaxed),
+            try_lock_attempts_before_irq,
+            "direct IRQ bridge call must not attempt the KCOV mutex"
+        );
+        cpu_local::current_cpu().irq_exit();
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count())
+                .expect("read parent count after simulated IRQ"),
+            before_irq,
+            "direct IRQ bridge call must not record coverage"
+        );
+
+        // R187-2: NMI is independent of the normal IRQ nesting counter and
+        // may preserve IF. The bridge must use the allocation-free NMI gate
+        // before pinning or probing the KCOV mutex just as it does for IRQ.
+        let before_nmi = try_with_current_kcov(|buffer| buffer.edge_count())
+            .expect("read parent count before simulated NMI");
+        let preempt_before_nmi = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
+        let pin_attempts_before_nmi = KCOV_TASK_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        let try_lock_attempts_before_nmi = KCOV_TRY_LOCK_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::nmi_enter();
+        record_kcov_edge_for_current(0x1872_0001);
+        let nmi_access = try_with_current_kcov(|buffer| buffer.edge_count());
+        let nmi_preempt_count = cpu_local::current_cpu()
+            .preempt_count
+            .load(Ordering::Relaxed);
+        let nmi_pin_attempts = KCOV_TASK_PIN_ATTEMPTS.load(Ordering::Relaxed);
+        let nmi_try_lock_attempts = KCOV_TRY_LOCK_ATTEMPTS.load(Ordering::Relaxed);
+        cpu_local::nmi_exit();
+        assert_eq!(nmi_access, Err(KcovAccessError::InterruptContext));
+        assert_eq!(
+            nmi_preempt_count, preempt_before_nmi,
+            "NMI rejection must happen before the KCOV task pin"
+        );
+        assert_eq!(
+            nmi_pin_attempts, pin_attempts_before_nmi,
+            "direct NMI bridge call must not attempt to pin a KCOV CPU"
+        );
+        assert_eq!(
+            nmi_try_lock_attempts, try_lock_attempts_before_nmi,
+            "direct NMI bridge call must not attempt the KCOV mutex"
+        );
+        assert_eq!(
+            try_with_current_kcov(|buffer| buffer.edge_count())
+                .expect("read parent count after simulated NMI"),
+            before_nmi,
+            "direct NMI bridge call must not record coverage"
+        );
 
         // Direct bitmap contention must be try-only and mutation-free.
         let before_contention = try_with_current_kcov(|buffer| buffer.edge_count())

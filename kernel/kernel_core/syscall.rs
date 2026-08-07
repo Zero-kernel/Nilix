@@ -21322,6 +21322,34 @@ fn sys_waitid(
 // KCOV (Kernel Code Coverage) Syscalls - Fuzzing Infrastructure
 // ============================================================================
 
+/// Return whether a caller may access the KCOV control and export surface.
+///
+/// KCOV exposes kernel control-flow observations and consumes a bounded kernel
+/// allocation.  It is therefore a host-global debugging surface: namespace-root
+/// credentials cannot authorize it.  Trusted host root remains compatible with
+/// the in-tree fuzzing runner; delegated fuzzers need the explicit KCOV right.
+#[cfg(feature = "kcov")]
+#[inline]
+fn kcov_access_allowed(is_host_root: bool, has_kcov_right: bool) -> bool {
+    is_host_root || has_kcov_right
+}
+
+/// R187-1 FIX: Require host-root or the dedicated KCOV capability before every
+/// KCOV operation, including state-only operations, so no direct or future
+/// caller can allocate, enable, reset, or export coverage without authority.
+#[cfg(feature = "kcov")]
+#[inline]
+fn require_kcov_access() -> Result<(), SyscallError> {
+    if kcov_access_allowed(
+        crate::current_is_host_root(),
+        current_has_cap_rights(cap::CapRights::KCOV),
+    ) {
+        Ok(())
+    } else {
+        Err(SyscallError::EPERM)
+    }
+}
+
 /// Initialize KCOV for current task
 ///
 /// Allocates a coverage buffer and prepares the task for coverage collection.
@@ -21335,6 +21363,8 @@ fn sys_waitid(
 /// - Error: EINVAL (invalid size), ENOMEM (allocation failed), EEXIST (already initialized)
 #[cfg(feature = "kcov")]
 fn sys_kcov_init(buf_size: usize) -> Result<usize, SyscallError> {
+    require_kcov_access()?;
+
     if buf_size == 0 || buf_size > coverage::KCOV_BUFFER_SIZE {
         return Err(SyscallError::EINVAL);
     }
@@ -21382,6 +21412,8 @@ fn sys_kcov_init(_buf_size: usize) -> Result<usize, SyscallError> {
 /// Enable coverage collection for current task
 #[cfg(feature = "kcov")]
 fn sys_kcov_enable() -> Result<usize, SyscallError> {
+    require_kcov_access()?;
+
     crate::process::try_with_current_kcov(coverage::CoverageBuffer::enable)
         .map_err(kcov_access_error)?;
     Ok(0)
@@ -21395,6 +21427,8 @@ fn sys_kcov_enable() -> Result<usize, SyscallError> {
 /// Disable coverage collection for current task
 #[cfg(feature = "kcov")]
 fn sys_kcov_disable() -> Result<usize, SyscallError> {
+    require_kcov_access()?;
+
     crate::process::try_with_current_kcov(coverage::CoverageBuffer::disable)
         .map_err(kcov_access_error)?;
     Ok(0)
@@ -21408,6 +21442,8 @@ fn sys_kcov_disable() -> Result<usize, SyscallError> {
 /// Dump coverage data to userspace
 #[cfg(feature = "kcov")]
 fn sys_kcov_dump(user_buf: usize, len: usize) -> Result<usize, SyscallError> {
+    require_kcov_access()?;
+
     if user_buf == 0 {
         return Err(SyscallError::EINVAL);
     }
@@ -21429,11 +21465,15 @@ fn sys_kcov_dump(user_buf: usize, len: usize) -> Result<usize, SyscallError> {
     // Snapshot only while owning the KCOV mutex. Allocation and usercopy stay
     // outside it so faults and allocator paths cannot recurse into the lock.
     let edge_count = crate::process::try_with_current_kcov(|buffer| {
-        let copied = buffer.copy_to_user(&mut kernel_buf);
-        debug_assert_eq!(copied, len);
-        buffer.edge_count()
+        // R187-3 FIX: exact-copy is an independent invariant check.  It
+        // rejects both a shortened and an oversized staging slice before any
+        // bytes move, so refactors cannot silently turn this snapshot partial.
+        buffer
+            .copy_to_slice_exact(&mut kernel_buf)
+            .map_err(|_| SyscallError::EIO)?;
+        Ok::<usize, SyscallError>(buffer.edge_count())
     })
-    .map_err(kcov_access_error)?;
+    .map_err(kcov_access_error)??;
 
     // Copy to userspace via SMAP-compliant path
     crate::usercopy::copy_to_user_safe(user_buf as *mut u8, &kernel_buf)
@@ -21450,6 +21490,8 @@ fn sys_kcov_dump(_user_buf: usize, _len: usize) -> Result<usize, SyscallError> {
 /// Reset coverage data
 #[cfg(feature = "kcov")]
 fn sys_kcov_reset() -> Result<usize, SyscallError> {
+    require_kcov_access()?;
+
     crate::process::try_with_current_kcov(coverage::CoverageBuffer::reset)
         .map_err(kcov_access_error)?;
     Ok(0)
@@ -21465,7 +21507,22 @@ fn sys_kcov_reset() -> Result<usize, SyscallError> {
 fn kcov_access_error(error: crate::process::KcovAccessError) -> SyscallError {
     match error {
         crate::process::KcovAccessError::NotInitialized => SyscallError::EINVAL,
-        crate::process::KcovAccessError::Contended => SyscallError::EBUSY,
+        crate::process::KcovAccessError::Contended
+        | crate::process::KcovAccessError::InterruptContext
+        | crate::process::KcovAccessError::CpuUnavailable => SyscallError::EBUSY,
+    }
+}
+
+#[cfg(all(test, feature = "kcov"))]
+mod r187_kcov_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn host_root_or_explicit_kcov_right_is_required() {
+        assert!(!kcov_access_allowed(false, false));
+        assert!(kcov_access_allowed(true, false));
+        assert!(kcov_access_allowed(false, true));
+        assert!(kcov_access_allowed(true, true));
     }
 }
 

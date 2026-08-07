@@ -80,7 +80,7 @@ const RSDP_SEARCH_START: u64 = 0xE0000;
 const RSDP_SEARCH_END: u64 = 0x100000;
 
 /// Maximum CPUs we support
-const MAX_CPUS: usize = 64;
+const MAX_CPUS: usize = cpu_local::MAX_CPUS;
 
 /// Timeout for AP to signal ready (in spin iterations)
 const AP_READY_TIMEOUT: usize = 1_000_000;
@@ -836,6 +836,20 @@ pub fn set_rsdp_address(rsdp_phys: u64) {
     }
 }
 
+/// Return whether every firmware-reported LAPIC identity occurs exactly once.
+///
+/// The MADT list is bounded by `MAX_CPUS`, so this allocation-free O(n²) check
+/// is preferable to introducing a boot-time collection. Duplicate identities
+/// must be rejected before INIT/SIPI can target the same AP twice or publish a
+/// non-bijective CPU-local mapping.
+#[inline]
+fn lapic_ids_are_unique(lapic_ids: &[u32]) -> bool {
+    lapic_ids
+        .iter()
+        .enumerate()
+        .all(|(index, lapic_id)| !lapic_ids[..index].contains(lapic_id))
+}
+
 /// Start all Application Processors.
 ///
 /// This function:
@@ -859,6 +873,13 @@ pub fn start_aps() -> usize {
 
     // Enumerate all CPU LAPIC IDs
     let all_lapic_ids = enumerate_cpus();
+
+    // R187-7 FIX: validate the whole topology, not just the BSP entry. A
+    // duplicate AP identity would otherwise receive INIT/SIPI twice and later
+    // allow a stale reverse LAPIC map to alias KCOV per-CPU state.
+    if !lapic_ids_are_unique(&all_lapic_ids) {
+        panic!("R187-7: MADT contains duplicate LAPIC identities");
+    }
 
     // RF180-58 FIX: the BSP must appear exactly once. If firmware omits it, treating every
     // MADT entry as an AP could send INIT/SIPI to the running BSP and corrupt
@@ -1965,4 +1986,14 @@ fn delay_200us() {
 #[inline]
 fn delay_10ms() {
     delay_us(10_000);
+}
+
+#[cfg(test)]
+mod topology_tests {
+    #[test]
+    fn lapic_identity_validation_rejects_duplicates() {
+        assert!(super::lapic_ids_are_unique(&[0, 1, 2, 3]));
+        assert!(!super::lapic_ids_are_unique(&[0, 1, 1, 2]));
+        assert!(!super::lapic_ids_are_unique(&[7, 7]));
+    }
 }
