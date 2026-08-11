@@ -110,9 +110,12 @@ fn main() -> Result<()> {
         match executor.execute(&program)? {
             ExecutionResult::Success(cov) => {
                 if coverage.is_new(&cov) {
-                    println!("[+] New coverage discovered! Total edges: {}", coverage.total_edges());
                     corpus.add(program, cov.clone())?;
                     coverage.update(&cov);
+                    println!(
+                        "[+] New coverage discovered! Total occupied slots: {}",
+                        coverage.total_occupied_slots()
+                    );
                     stats.new_coverage += 1;
                 }
                 stats.successes += 1;
@@ -147,7 +150,10 @@ fn main() -> Result<()> {
     println!("\n=== Fuzzing Complete ===");
     stats.print_final();
     println!("Corpus entries: {}", corpus.len());
-    println!("Total edges:    {}", coverage.total_edges());
+    println!(
+        "Total occupied slots: {}",
+        coverage.total_occupied_slots()
+    );
 
     Ok(())
 }

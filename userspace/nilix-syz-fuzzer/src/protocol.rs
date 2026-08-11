@@ -17,6 +17,9 @@ pub const ARG_HEADER_SIZE: usize = 24;
 pub const MAX_PROGRAM_SIZE: usize = 256 * 1024;
 pub const KCOV_BITMAP_SIZE: usize = 4096;
 pub const RESULT_TAG_SIZE: usize = 32;
+/// Result-header field at byte 36. The wire offset is retained for V2
+/// compatibility; its meaning is the number of occupied KCOV bitmap slots.
+pub const RESULT_OCCUPIED_SLOT_COUNT_OFFSET: usize = 36;
 
 const PROGRAM_DIGEST_OFFSET: usize = 88;
 const PROGRAM_DIGEST_END: usize = PROGRAM_DIGEST_OFFSET + 32;
@@ -116,7 +119,7 @@ pub struct EncodedProgram {
 pub struct DecodedResult {
     pub coverage: Vec<u8>,
     pub returns: Vec<i64>,
-    pub edge_count: u32,
+    pub occupied_slot_count: u32,
     pub tag: [u8; 32],
 }
 
@@ -269,7 +272,7 @@ pub fn decode_result(bytes: &[u8], binding: &ProgramBinding) -> Result<DecodedRe
     let syscall_count = read_u32(bytes, 24)?;
     let executed_count = read_u32(bytes, 28)?;
     let kcov_len = read_u32(bytes, 32)? as usize;
-    let edge_count = read_u32(bytes, 36)?;
+    let occupied_slot_count = read_u32(bytes, RESULT_OCCUPIED_SLOT_COUNT_OFFSET)?;
     let returns_offset = read_u32(bytes, 40)? as usize;
     let bitmap_offset = read_u32(bytes, 44)? as usize;
     let tag_offset = read_u32(bytes, 48)? as usize;
@@ -316,12 +319,14 @@ pub fn decode_result(bytes: &[u8], binding: &ProgramBinding) -> Result<DecodedRe
     }
 
     let coverage = bytes[bitmap_offset..tag_offset].to_vec();
-    let popcount: u32 = coverage.iter().map(|byte| byte.count_ones()).sum();
-    if edge_count == 0 || popcount == 0 {
+    let occupied_slot_popcount: u32 = coverage.iter().map(|byte| byte.count_ones()).sum();
+    if occupied_slot_count == 0 || occupied_slot_popcount == 0 {
         bail!("result contains zero coverage");
     }
-    if edge_count != popcount {
-        bail!("KCOV edge count {edge_count} does not match bitmap popcount {popcount}");
+    if occupied_slot_count != occupied_slot_popcount {
+        bail!(
+            "KCOV occupied-slot count {occupied_slot_count} does not match bitmap popcount {occupied_slot_popcount}"
+        );
     }
 
     let mut returns = Vec::with_capacity(syscall_count as usize);
@@ -334,7 +339,7 @@ pub fn decode_result(bytes: &[u8], binding: &ProgramBinding) -> Result<DecodedRe
     Ok(DecodedResult {
         coverage,
         returns,
-        edge_count,
+        occupied_slot_count,
         tag,
     })
 }
@@ -592,7 +597,7 @@ fn encode_result_for_test(
     put_u32(&mut bytes, 32, KCOV_BITMAP_SIZE as u32)?;
     put_u32(
         &mut bytes,
-        36,
+        RESULT_OCCUPIED_SLOT_COUNT_OFFSET,
         coverage.iter().map(|byte| byte.count_ones()).sum(),
     )?;
     put_u32(&mut bytes, 40, RESULT_HEADER_SIZE as u32)?;
@@ -708,7 +713,7 @@ mod tests {
         let decoded = decode_result(&result, &encoded.binding).unwrap();
         assert_eq!(decoded.coverage, coverage);
         assert_eq!(decoded.returns, vec![123, -22]);
-        assert_eq!(decoded.edge_count, 4);
+        assert_eq!(decoded.occupied_slot_count, 4);
 
         let mut tampered = result.clone();
         tampered[RESULT_HEADER_SIZE] ^= 1;
@@ -725,7 +730,7 @@ mod tests {
         let mut coverage = vec![0u8; KCOV_BITMAP_SIZE];
         coverage[0] = 3;
         let mut result = encode_result_for_test(&encoded.binding, &[1, 2], &coverage).unwrap();
-        put_u32(&mut result, 36, 1).unwrap();
+        put_u32(&mut result, RESULT_OCCUPIED_SLOT_COUNT_OFFSET, 1).unwrap();
         reseal_result_tag(&mut result, &encoded.binding).unwrap();
         assert!(decode_result(&result, &encoded.binding).is_err());
     }

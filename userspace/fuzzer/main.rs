@@ -9,13 +9,13 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 mod corpus;
-mod mutator;
 mod executor;
+mod mutator;
 mod seeds;
 
-use corpus::{Corpus, CorpusEntry, has_new_coverage};
-use mutator::Mutator;
+use corpus::{has_new_coverage, Corpus, CorpusEntry};
 use executor::Executor;
+use mutator::Mutator;
 
 // Syscall numbers
 const SYS_WRITE: usize = 1;
@@ -51,25 +51,26 @@ pub extern "C" fn _start() -> ! {
         let result = executor.execute(seed);
 
         if result.success {
-            let entry = CorpusEntry::new(seed.clone(), result.edges, result.exec_time_us);
+            let occupied_slot_count = result.occupied_slots.len();
+            let entry = CorpusEntry::new(seed.clone(), result.occupied_slots, result.exec_time_us);
             corpus.add(entry);
 
             write_str("  Seed ");
             write_num(i + 1);
             write_str(": ");
-            write_num(result.edges.len());
-            write_str(" edges\n");
+            write_num(occupied_slot_count);
+            write_str(" occupied slots\n");
         }
     }
 
     write_str("\nSeed corpus: ");
     write_num(corpus.len());
     write_str(" entries, ");
-    write_num(corpus.total_edges());
-    write_str(" total edges\n\n");
+    write_num(corpus.total_occupied_slots());
+    write_str(" occupied slots\n\n");
 
     write_str("Starting fuzzing loop...\n");
-    write_str("Target: >25 edges (>67% coverage)\n\n");
+    write_str("Target: >=25 occupied KCOV slots\n\n");
 
     // Fuzzing loop
     let mut new_coverage_count = 0;
@@ -83,10 +84,18 @@ pub extern "C" fn _start() -> ! {
 
         // Select input from corpus
         let mut seed_val = (iteration as u64) * 7919;
-        let entry_idx = if let Some(entry) = corpus.select(&mut seed_val) {
-            // Mutate selected entry
-            let parent_sequence = entry.sequence.clone();
-            entry.descendant_count += 1;
+        if let Some(entry_index) = corpus.select(&mut seed_val) {
+            // RF187-2 FIX: retain only the stable corpus index while reading
+            // global occupied-slot state. A live mutable entry borrow would
+            // conflict with that immutable read and cannot be held across the
+            // later corpus insertion.
+            let parent_sequence = {
+                let Some(entry) = corpus.get_mut(entry_index) else {
+                    continue;
+                };
+                entry.descendant_count += 1;
+                entry.sequence.clone()
+            };
 
             let mutant = mutator.mutate(&parent_sequence);
 
@@ -98,14 +107,19 @@ pub extern "C" fn _start() -> ! {
             }
 
             // Check for new coverage
-            let (has_new, new_edges) = has_new_coverage(&result.edges, corpus.get_coverage());
+            let (has_new, new_slots) =
+                has_new_coverage(&result.occupied_slots, corpus.get_occupied_slots());
 
             if has_new {
                 // Update parent's productivity
+                let Some(entry) = corpus.get_mut(entry_index) else {
+                    continue;
+                };
                 entry.productive_descendants += 1;
 
                 // Add to corpus
-                let new_entry = CorpusEntry::new(mutant, result.edges.clone(), result.exec_time_us);
+                let new_entry =
+                    CorpusEntry::new(mutant, result.occupied_slots.clone(), result.exec_time_us);
                 corpus.add(new_entry);
 
                 new_coverage_count += 1;
@@ -114,18 +128,14 @@ pub extern "C" fn _start() -> ! {
                 write_str("[+] Iter ");
                 write_num(iteration);
                 write_str(": ");
-                write_num(new_edges.len());
-                write_str(" new edges (total: ");
-                write_num(corpus.total_edges());
+                write_num(new_slots.len());
+                write_str(" new occupied slots (total: ");
+                write_num(corpus.total_occupied_slots());
                 write_str(", corpus: ");
                 write_num(corpus.len());
                 write_str(")\n");
             }
-
-            Some(0)  // Placeholder
-        } else {
-            None
-        };
+        }
 
         // Print stats periodically
         if iteration % STATS_INTERVAL == 0 && iteration > 0 {
@@ -134,7 +144,7 @@ pub extern "C" fn _start() -> ! {
 
         // Check saturation (no new coverage in 2000 iterations)
         if iteration > last_new_iteration + 2000 {
-            write_str("\n[!] Coverage saturated (no new edges in 2000 iterations)\n");
+            write_str("\n[!] Coverage saturated (no new slots in 2000 iterations)\n");
             write_str("    Stopping early at iteration ");
             write_num(iteration);
             write_str("\n\n");
@@ -156,21 +166,19 @@ pub extern "C" fn _start() -> ! {
     write_num(corpus.len());
     write_str("\n");
 
-    write_str("Total unique edges: ");
-    write_num(corpus.total_edges());
-    write_str("\n");
-
-    let coverage_rate = (corpus.total_edges() * 100) / 37;  // 37 total instrumented edges
-    write_str("Coverage rate: ");
-    write_num(coverage_rate);
-    write_str("%\n\n");
+    // RF187-2 FIX: bitmap positions are lossy modulo slots, not source-edge
+    // identities. Report the observable occupied-slot count without deriving
+    // a source coverage percentage from the old hard-coded edge total.
+    write_str("Total occupied KCOV slots: ");
+    write_num(corpus.total_occupied_slots());
+    write_str("\n\n");
 
     // Success criteria check
-    if corpus.total_edges() >= 25 {
-        write_str("✓ SUCCESS: Coverage target achieved (>=25 edges)\n");
+    if corpus.total_occupied_slots() >= 25 {
+        write_str("✓ SUCCESS: Occupied-slot target achieved (>=25 slots)\n");
         exit(0);
     } else {
-        write_str("✗ Target not reached (target: >=25 edges)\n");
+        write_str("✗ Target not reached (target: >=25 occupied slots)\n");
         exit(1);
     }
 }
@@ -184,8 +192,8 @@ fn print_stats(iteration: usize, corpus: &Corpus, new_coverage_count: usize, las
     write_num(corpus.len());
     write_str("\n");
 
-    write_str("  Total edges: ");
-    write_num(corpus.total_edges());
+    write_str("  Total occupied slots: ");
+    write_num(corpus.total_occupied_slots());
     write_str("\n");
 
     write_str("  New coverage events: ");
@@ -219,7 +227,7 @@ fn write_num(mut n: usize) {
     }
 
     // Reverse
-    for j in 0..i/2 {
+    for j in 0..i / 2 {
         buf.swap(j, i - 1 - j);
     }
 

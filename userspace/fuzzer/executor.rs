@@ -20,11 +20,11 @@ const SYS_CLOCK_GETTIME: usize = 228;
 const SYS_EXIT_GROUP: usize = 231;
 const CLOCK_MONOTONIC: usize = 1;
 
-// Raw syscall return value for the kernel's only transient KCOV control error.
-// `try_with_current_kcov` returns EBUSY when an IRQ or recorder bridge owns the
-// bitmap's try-lock; all other control errors leave the executor unable to
-// prove that it restored its KCOV state.
+// The kernel currently maps both transient recorder contention and persistent
+// context/topology rejection to EBUSY. Bound retries so neither case can spin
+// forever while still giving ordinary contention a chance to clear.
 const SYSCALL_EBUSY: isize = -16;
+const KCOV_CONTROL_MAX_ATTEMPTS: usize = 4;
 
 const KCOV_BUFFER_SIZE: usize = 4096;
 const KCOV_SLOT_COUNT: usize = KCOV_BUFFER_SIZE * 8;
@@ -42,7 +42,7 @@ pub struct ExecutionResult {
     ///
     /// KCOV maps instrumentation IDs modulo its bitmap capacity, so distinct
     /// source edges can alias the same slot.
-    pub edges: Vec<u32>,
+    pub occupied_slots: Vec<u32>,
 
     /// Execution time in microseconds
     pub exec_time_us: u64,
@@ -123,7 +123,7 @@ impl Executor {
         // Convert the bitmap into canonical slot IDs. The kernel's return
         // value must equal the bitmap popcount; reject mismatches and signed
         // errno values (which appear as large usize values) fail-closed.
-        let Some(edges) = coverage_slots(&self.coverage_buf, occupied_slot_count) else {
+        let Some(occupied_slots) = coverage_slots(&self.coverage_buf, occupied_slot_count) else {
             return failed_execution();
         };
 
@@ -135,7 +135,7 @@ impl Executor {
         };
 
         ExecutionResult {
-            edges,
+            occupied_slots,
             exec_time_us,
             success: true,
         }
@@ -254,7 +254,7 @@ fn syscall6(
 
 fn failed_execution() -> ExecutionResult {
     ExecutionResult {
-        edges: Vec::new(),
+        occupied_slots: Vec::new(),
         exec_time_us: 0,
         success: false,
     }
@@ -262,23 +262,40 @@ fn failed_execution() -> ExecutionResult {
 
 /// Complete a KCOV control transition or contain the process.
 ///
-/// R187-5 FIX: KCOV control uses a try-lock, so a direct `EBUSY` is transient
-/// and must be retried.  Returning after any other failure would let ordinary
-/// fuzzer code execute while this executor cannot prove that recording was
-/// disabled or that its bitmap was reset.  `exit_group` is the fail-closed
-/// containment path; if it unexpectedly returns, no further syscalls execute.
+/// RF187-3 FIX: KCOV control uses a try-lock, so a direct `EBUSY` may be
+/// transient and receives a bounded retry window. The kernel also uses EBUSY
+/// for context/topology rejection, so persistent EBUSY must terminate instead
+/// of spinning forever. Returning after any failed disable/reset would let
+/// ordinary fuzzer code execute without a proven KCOV state. `exit_group` is
+/// the fail-closed containment path; if it unexpectedly returns, no further
+/// syscalls execute.
 fn complete_kcov_control_or_terminate(syscall_number: usize) {
-    loop {
-        let result = syscall0(syscall_number);
-        if result == 0 {
-            return;
-        }
-        if is_kcov_control_retryable(result) {
-            core::hint::spin_loop();
-            continue;
-        }
+    if try_complete_kcov_control(|| syscall0(syscall_number)).is_err() {
         terminate_after_kcov_control_failure();
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KcovControlFailure {
+    NonRetryable(usize),
+    BusyExhausted,
+}
+
+fn try_complete_kcov_control(mut invoke: impl FnMut() -> usize) -> Result<(), KcovControlFailure> {
+    for attempt in 0..KCOV_CONTROL_MAX_ATTEMPTS {
+        let result = invoke();
+        if result == 0 {
+            return Ok(());
+        }
+        if !is_kcov_control_retryable(result) {
+            return Err(KcovControlFailure::NonRetryable(result));
+        }
+        if attempt + 1 < KCOV_CONTROL_MAX_ATTEMPTS {
+            core::hint::spin_loop();
+        }
+    }
+
+    Err(KcovControlFailure::BusyExhausted)
 }
 
 #[inline]
@@ -387,9 +404,47 @@ mod tests {
     }
 
     #[test]
-    fn only_transient_kcov_lock_contention_is_retryable() {
+    fn kcov_control_retries_transient_contention_until_success() {
         assert!(is_kcov_control_retryable(SYSCALL_EBUSY as usize));
         assert!(!is_kcov_control_retryable(0));
         assert!(!is_kcov_control_retryable((-1isize) as usize));
+
+        let mut results = [SYSCALL_EBUSY as usize, SYSCALL_EBUSY as usize, 0].into_iter();
+        let mut attempts = 0;
+        assert_eq!(
+            try_complete_kcov_control(|| {
+                attempts += 1;
+                results.next().expect("bounded test result")
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn kcov_control_stops_on_non_retryable_error() {
+        let fatal = (-1isize) as usize;
+        let mut attempts = 0;
+        assert_eq!(
+            try_complete_kcov_control(|| {
+                attempts += 1;
+                fatal
+            }),
+            Err(KcovControlFailure::NonRetryable(fatal))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn kcov_control_exhausts_persistent_busy() {
+        let mut attempts = 0;
+        assert_eq!(
+            try_complete_kcov_control(|| {
+                attempts += 1;
+                SYSCALL_EBUSY as usize
+            }),
+            Err(KcovControlFailure::BusyExhausted)
+        );
+        assert_eq!(attempts, KCOV_CONTROL_MAX_ATTEMPTS);
     }
 }

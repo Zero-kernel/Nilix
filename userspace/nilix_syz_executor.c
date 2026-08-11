@@ -48,6 +48,7 @@
 #define ARG_HEADER_SIZE 24U
 #define RESULT_HEADER_SIZE 128U
 #define RESULT_TAG_SIZE 32U
+#define RESULT_OCCUPIED_SLOT_COUNT_OFFSET 36U
 
 #define KCOV_BUFFER_SIZE 4096U
 #define MAX_PROGRAM_SIZE (256U * 1024U)
@@ -478,7 +479,7 @@ static int emit_begin(const ParsedProgram *program) {
 
 static int emit_pass(
     const ParsedProgram *program,
-    uint32_t edge_count,
+    uint32_t occupied_slot_count,
     const uint8_t tag[32]
 ) {
     char run_hex[33];
@@ -495,11 +496,11 @@ static int emit_pass(
         marker,
         sizeof(marker),
         "NILIX_SYZ_V2_PASS seq=%016" PRIx64
-        " run=%s program=%s edges=%" PRIu32 " tag=%s\n",
+        " run=%s program=%s slots=%" PRIu32 " tag=%s\n",
         program->sequence,
         run_hex,
         program_hex,
-        edge_count,
+        occupied_slot_count,
         tag_hex
     );
     if (length < 0 || (size_t)length >= sizeof(marker)) {
@@ -1028,7 +1029,7 @@ static void materialize_arguments(const ParsedCall *call, uint64_t arguments[6])
 static int collect_coverage(
     const ParsedProgram *program,
     uint32_t *executed_count,
-    uint32_t *edge_count,
+    uint32_t *occupied_slot_count,
     ExecutorError *error
 ) {
     bool enabled = false;
@@ -1075,14 +1076,14 @@ static int collect_coverage(
         return set_error(error, "kcov_dump", result);
     }
     if ((uint64_t)result > (uint64_t)KCOV_BUFFER_SIZE * 8U) {
-        return set_error(error, "kcov_edge_range", result);
+        return set_error(error, "kcov_slot_range", result);
     }
 
-    const uint32_t counted_edges = bitmap_popcount(coverage_bitmap, sizeof(coverage_bitmap));
-    if ((uint32_t)result != counted_edges) {
+    const uint32_t counted_slots = bitmap_popcount(coverage_bitmap, sizeof(coverage_bitmap));
+    if ((uint32_t)result != counted_slots) {
         return set_error(error, "kcov_popcount", result);
     }
-    if (counted_edges == 0U) {
+    if (counted_slots == 0U) {
         return set_error(error, "kcov_zero", 0);
     }
 
@@ -1091,7 +1092,7 @@ static int collect_coverage(
         return set_error(error, "kcov_reset_after", result);
     }
 
-    *edge_count = counted_edges;
+    *occupied_slot_count = counted_slots;
     return 0;
 
     if (enabled) {
@@ -1102,7 +1103,7 @@ static int collect_coverage(
 static int build_result(
     const ParsedProgram *program,
     uint32_t executed_count,
-    uint32_t edge_count,
+    uint32_t occupied_slot_count,
     size_t *result_length,
     uint8_t tag[32],
     ExecutorError *error
@@ -1134,7 +1135,7 @@ static int build_result(
     write_le32(result_buffer + 24U, program->syscall_count);
     write_le32(result_buffer + 28U, executed_count);
     write_le32(result_buffer + 32U, KCOV_BUFFER_SIZE);
-    write_le32(result_buffer + 36U, edge_count);
+    write_le32(result_buffer + RESULT_OCCUPIED_SLOT_COUNT_OFFSET, occupied_slot_count);
     write_le32(result_buffer + 40U, RESULT_HEADER_SIZE);
     write_le32(result_buffer + 44U, (uint32_t)bitmap_offset);
     write_le32(result_buffer + 48U, (uint32_t)tag_offset);
@@ -1279,13 +1280,16 @@ static int run_self_test(void) {
 }
 
 int main(int argc, char **argv) {
-    ParsedProgram program;
+    // RF187-5 FIX: the pre-parse argument failure path still passes the
+    // identity container to emit_fail. Zero-initialize it so strict compilers
+    // and any future diagnostic refactor cannot observe indeterminate fields.
+    ParsedProgram program = {0};
     ExecutorError error = {"internal", -(int64_t)EIO};
     bool identity_available = false;
     size_t program_length = 0;
     size_t result_length = 0;
     uint32_t executed_count = 0;
-    uint32_t edge_count = 0;
+    uint32_t occupied_slot_count = 0;
     uint8_t result_tag[32];
 
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
@@ -1314,14 +1318,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (collect_coverage(&program, &executed_count, &edge_count, &error) != 0) {
+    if (collect_coverage(&program, &executed_count, &occupied_slot_count, &error) != 0) {
         (void)emit_fail(&program, true, &error);
         return 1;
     }
     if (build_result(
             &program,
             executed_count,
-            edge_count,
+            occupied_slot_count,
             &result_length,
             result_tag,
             &error
@@ -1333,7 +1337,7 @@ int main(int argc, char **argv) {
         (void)emit_fail(&program, true, &error);
         return 1;
     }
-    if (emit_pass(&program, edge_count, result_tag) != 0) {
+    if (emit_pass(&program, occupied_slot_count, result_tag) != 0) {
         return 1;
     }
     return 0;

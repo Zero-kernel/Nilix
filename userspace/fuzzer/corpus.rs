@@ -27,11 +27,11 @@ pub struct CorpusEntry {
     /// Syscall sequence
     pub sequence: Vec<Syscall>,
 
-    /// Coverage edges hit by this input
-    pub edges: Vec<u32>,
+    /// Occupied KCOV bitmap slots hit by this input
+    pub occupied_slots: Vec<u32>,
 
-    /// Number of unique edges
-    pub unique_edges: usize,
+    /// Number of occupied bitmap slots
+    pub occupied_slot_count: usize,
 
     /// Execution time in microseconds
     pub exec_time_us: u64,
@@ -50,12 +50,12 @@ pub struct CorpusEntry {
 }
 
 impl CorpusEntry {
-    pub fn new(sequence: Vec<Syscall>, edges: Vec<u32>, exec_time_us: u64) -> Self {
-        let unique_edges = edges.len();
+    pub fn new(sequence: Vec<Syscall>, occupied_slots: Vec<u32>, exec_time_us: u64) -> Self {
+        let occupied_slot_count = occupied_slots.len();
         Self {
             sequence,
-            edges,
-            unique_edges,
+            occupied_slots,
+            occupied_slot_count,
             exec_time_us,
             selection_count: 0,
             descendant_count: 0,
@@ -70,8 +70,8 @@ pub struct Corpus {
     /// All test cases
     entries: Vec<CorpusEntry>,
 
-    /// Global coverage bitmap (union of all entries)
-    global_edges: BTreeSet<u32>,
+    /// Union of occupied KCOV bitmap slots across all entries
+    global_slots: BTreeSet<u32>,
 
     /// Maximum corpus size
     max_size: usize,
@@ -81,19 +81,19 @@ impl Corpus {
     pub fn new(max_size: usize) -> Self {
         Self {
             entries: Vec::new(),
-            global_edges: BTreeSet::new(),
+            global_slots: BTreeSet::new(),
             max_size,
         }
     }
 
-    /// Add entry if it has new coverage
+    /// Add an entry if it occupies a previously unseen bitmap slot.
     /// Returns true if added
     pub fn add(&mut self, entry: CorpusEntry) -> bool {
         let mut has_new = false;
 
-        for &edge in &entry.edges {
-            if !self.global_edges.contains(&edge) {
-                self.global_edges.insert(edge);
+        for &slot in &entry.occupied_slots {
+            if !self.global_slots.contains(&slot) {
+                self.global_slots.insert(slot);
                 has_new = true;
             }
         }
@@ -115,8 +115,11 @@ impl Corpus {
         }
     }
 
-    /// Select entry based on energy (weighted random)
-    pub fn select(&mut self, seed: &mut u64) -> Option<&mut CorpusEntry> {
+    /// Select an entry based on energy (weighted random) and return its index.
+    ///
+    /// Returning an index, rather than a live mutable borrow, lets callers
+    /// inspect global corpus state before reacquiring the selected entry.
+    pub fn select(&mut self, seed: &mut u64) -> Option<usize> {
         if self.entries.is_empty() {
             return None;
         }
@@ -127,7 +130,8 @@ impl Corpus {
         if total_energy == 0.0 {
             // Fallback: uniform random
             let idx = (simple_rand(seed) % self.entries.len() as u64) as usize;
-            return Some(&mut self.entries[idx]);
+            self.entries[idx].selection_count += 1;
+            return Some(idx);
         }
 
         // Choose by index first, then take the one mutable borrow needed to
@@ -145,15 +149,15 @@ impl Corpus {
         }
 
         if let Some(index) = selected {
-            let entry = &mut self.entries[index];
-            entry.selection_count += 1;
-            return Some(entry);
+            self.entries[index].selection_count += 1;
+            return Some(index);
         }
 
         // Floating-point roundoff can leave a tiny positive remainder; retain
         // the legacy fallback while taking only one mutable borrow.
         let last_index = self.entries.len() - 1;
-        Some(&mut self.entries[last_index])
+        self.entries[last_index].selection_count += 1;
+        Some(last_index)
     }
 
     /// Update energy for all entries
@@ -163,14 +167,14 @@ impl Corpus {
         }
     }
 
-    /// Get global coverage set
-    pub fn get_coverage(&self) -> &BTreeSet<u32> {
-        &self.global_edges
+    /// Get the global set of occupied bitmap slots.
+    pub fn get_occupied_slots(&self) -> &BTreeSet<u32> {
+        &self.global_slots
     }
 
-    /// Get total unique edges discovered
-    pub fn total_edges(&self) -> usize {
-        self.global_edges.len()
+    /// Get the number of distinct occupied bitmap slots discovered.
+    pub fn total_occupied_slots(&self) -> usize {
+        self.global_slots.len()
     }
 
     /// Get corpus size
@@ -187,6 +191,11 @@ impl Corpus {
     pub fn get(&self, index: usize) -> Option<&CorpusEntry> {
         self.entries.get(index)
     }
+
+    /// Get a mutable corpus entry by a previously selected stable index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut CorpusEntry> {
+        self.entries.get_mut(index)
+    }
 }
 
 /// Calculate energy for an entry
@@ -196,8 +205,8 @@ fn calculate_energy(entry: &CorpusEntry) -> f32 {
     // Boost: fewer selections = more energy
     energy *= 1.0 / (1.0 + (entry.selection_count as f32).sqrt());
 
-    // Boost: more unique edges = more energy
-    energy *= entry.unique_edges as f32 / 10.0;
+    // Boost: more occupied slots = more energy
+    energy *= entry.occupied_slot_count as f32 / 10.0;
 
     // Boost: higher productivity = more energy
     let productivity = if entry.descendant_count > 0 {
@@ -226,15 +235,42 @@ fn simple_rand(seed: &mut u64) -> u64 {
     x
 }
 
-/// Check if edges contain new coverage
-pub fn has_new_coverage(edges: &[u32], global_edges: &BTreeSet<u32>) -> (bool, Vec<u32>) {
-    let mut new_edges = Vec::new();
+/// Check whether a bitmap snapshot contains previously unoccupied slots.
+pub fn has_new_coverage(occupied_slots: &[u32], global_slots: &BTreeSet<u32>) -> (bool, Vec<u32>) {
+    let mut new_slots = Vec::new();
 
-    for &edge in edges {
-        if !global_edges.contains(&edge) {
-            new_edges.push(edge);
+    for &slot in occupied_slots {
+        if !global_slots.contains(&slot) {
+            new_slots.push(slot);
         }
     }
 
-    (!new_edges.is_empty(), new_edges)
+    (!new_slots.is_empty(), new_slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_tracks_occupied_slots_without_source_edge_claims() {
+        let mut corpus = Corpus::new(4);
+        let first = CorpusEntry::new(Vec::new(), alloc::vec![0, 3, 31], 1);
+        assert!(corpus.add(first));
+        assert_eq!(corpus.total_occupied_slots(), 3);
+
+        let duplicate = CorpusEntry::new(Vec::new(), alloc::vec![3, 31], 1);
+        assert!(!corpus.add(duplicate));
+
+        let mut seed = 1;
+        let selected = corpus.select(&mut seed).expect("populated corpus");
+        assert_eq!(corpus.get_occupied_slots().len(), 3);
+        let selected_entry = corpus.get_mut(selected).expect("stable selected index");
+        selected_entry.productive_descendants += 1;
+        assert_eq!(selected_entry.selection_count, 1);
+
+        let (has_new, new_slots) = has_new_coverage(&[3, 7, 31], corpus.get_occupied_slots());
+        assert!(has_new);
+        assert_eq!(new_slots, alloc::vec![7]);
+    }
 }

@@ -163,7 +163,7 @@ impl QemuExecutor {
                         }));
                     }
                 };
-                if marker.edges != decoded.edge_count
+                if marker.occupied_slot_count != decoded.occupied_slot_count
                     || !constant_time_eq(&marker.tag, &decoded.tag)
                 {
                     return Ok(ExecutionResult::Crash(CrashInfo {
@@ -202,7 +202,7 @@ enum Observation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PassMarker {
-    edges: u32,
+    occupied_slot_count: u32,
     tag: [u8; 32],
 }
 
@@ -269,13 +269,18 @@ impl<'a> MarkerTracker<'a> {
             bail!("malformed PASS marker");
         }
         require_identity(fields[1], fields[2], fields[3], self.binding)?;
-        let edges_text = field_value(fields[4], "edges")?;
-        let edges: u32 = edges_text.parse().context("invalid PASS edge count")?;
-        if edges == 0 || edges.to_string() != edges_text {
-            bail!("PASS edge count is zero or non-canonical");
+        let slots_text = field_value(fields[4], "slots")?;
+        let occupied_slot_count: u32 = slots_text
+            .parse()
+            .context("invalid PASS occupied-slot count")?;
+        if occupied_slot_count == 0 || occupied_slot_count.to_string() != slots_text {
+            bail!("PASS occupied-slot count is zero or non-canonical");
         }
         let tag = parse_hex_array::<32>(field_value(fields[5], "tag")?, "PASS tag")?;
-        self.pass = Some(PassMarker { edges, tag });
+        self.pass = Some(PassMarker {
+            occupied_slot_count,
+            tag,
+        });
         Ok(())
     }
 
@@ -599,7 +604,7 @@ mod tests {
         tracker
             .process_line(
                 format!(
-                    "NILIX_SYZ_V2_PASS seq={} run={} program={} edges=3 tag={}",
+                    "NILIX_SYZ_V2_PASS seq={} run={} program={} slots=3 tag={}",
                     binding.sequence_hex(),
                     binding.run_hex(),
                     binding.program_hex(),
@@ -608,14 +613,14 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
-        assert_eq!(tracker.pass.unwrap().edges, 3);
+        assert_eq!(tracker.pass.unwrap().occupied_slot_count, 3);
     }
 
     #[test]
     fn marker_state_machine_rejects_spoofing_duplicates_and_bad_order() {
         let binding = binding();
         let pass = format!(
-            "NILIX_SYZ_V2_PASS seq={} run={} program={} edges=1 tag={}",
+            "NILIX_SYZ_V2_PASS seq={} run={} program={} slots=1 tag={}",
             binding.sequence_hex(),
             binding.run_hex(),
             binding.program_hex(),
@@ -636,6 +641,27 @@ mod tests {
         let mut mismatch = MarkerTracker::new(&binding);
         let bad = begin.replace("seq=0000000000000042", "seq=0000000000000043");
         assert!(mismatch.process_line(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn marker_state_machine_rejects_legacy_edge_field() {
+        let binding = binding();
+        let mut tracker = MarkerTracker::new(&binding);
+        let begin = format!(
+            "NILIX_SYZ_V2_BEGIN seq={} run={} program={}",
+            binding.sequence_hex(),
+            binding.run_hex(),
+            binding.program_hex()
+        );
+        tracker.process_line(begin.as_bytes()).unwrap();
+        let legacy = format!(
+            "NILIX_SYZ_V2_PASS seq={} run={} program={} edges=1 tag={}",
+            binding.sequence_hex(),
+            binding.run_hex(),
+            binding.program_hex(),
+            "11".repeat(32)
+        );
+        assert!(tracker.process_line(legacy.as_bytes()).is_err());
     }
 
     #[test]
