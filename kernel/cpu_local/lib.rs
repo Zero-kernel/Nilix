@@ -324,6 +324,14 @@ pub struct PerCpuData {
     pub preempt_count: AtomicU32,
     /// Interrupt disable nesting counter
     pub irq_count: AtomicU32,
+    /// True while a bounded callback drain runs on the IRQ-return path.
+    ///
+    /// IRQ return temporarily enables IF after `irq_exit()` so deferred work
+    /// can use its process-context locks.  It is still not an ordinary task
+    /// execution point: KCOV must not attribute callback tracepoints to the
+    /// interrupted task.  Keeping this bit in already-initialized per-CPU
+    /// storage avoids a lazy allocation in the very path it protects.
+    pub soft_progress_active: AtomicBool,
     /// Last task (PID) that owns the FPU on this CPU (NO_FPU_OWNER if none).
     ///
     /// Used for lazy FPU save/restore: when a #NM exception fires, we save
@@ -375,6 +383,7 @@ impl PerCpuData {
             lapic_id: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
             irq_count: AtomicU32::new(0),
+            soft_progress_active: AtomicBool::new(false),
             fpu_owner: AtomicUsize::new(NO_FPU_OWNER),
             need_resched: AtomicBool::new(false),
             _pad: [0; 3],
@@ -419,6 +428,7 @@ impl PerCpuData {
             .store(syscall_stack_top, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
         self.irq_count.store(0, Ordering::Relaxed);
+        self.soft_progress_active.store(false, Ordering::Relaxed);
         self.fpu_owner.store(NO_FPU_OWNER, Ordering::Relaxed);
         self.rcu_epoch.store(0, Ordering::Relaxed);
     }
@@ -465,6 +475,25 @@ impl PerCpuData {
     #[inline]
     pub fn in_irq(&self) -> bool {
         self.irq_count.load(Ordering::Relaxed) > 0
+    }
+
+    /// Return whether this CPU is executing the bounded IRQ-return soft drain.
+    #[inline]
+    pub fn in_soft_progress(&self) -> bool {
+        self.soft_progress_active.load(Ordering::Acquire)
+    }
+
+    /// Enter the IRQ-return soft-progress context exactly once.
+    ///
+    /// The guard is non-blocking and allocation-free.  A nested attempt is
+    /// rejected so a callback cannot recursively re-enter the drain while its
+    /// caller's task attribution is still ambiguous.
+    #[inline]
+    pub fn try_enter_soft_progress(&'static self) -> Option<SoftProgressGuard> {
+        self.soft_progress_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(SoftProgressGuard { per_cpu: self })
     }
 
     /// Mark that a reschedule is needed on this CPU.
@@ -973,6 +1002,28 @@ pub fn current_cpu() -> &'static PerCpuData {
     })
 }
 
+/// Allocation-free guard for the IRQ-return deferred callback drain.
+pub struct SoftProgressGuard {
+    per_cpu: &'static PerCpuData,
+}
+
+impl Drop for SoftProgressGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let was_active = self
+            .per_cpu
+            .soft_progress_active
+            .swap(false, Ordering::Release);
+        assert!(was_active, "soft-progress guard was not active");
+    }
+}
+
+/// Try to enter the current CPU's IRQ-return soft-progress context.
+#[inline]
+pub fn try_enter_soft_progress() -> Option<SoftProgressGuard> {
+    current_cpu().try_enter_soft_progress()
+}
+
 /// Initialize the bootstrap processor's per-CPU slot.
 ///
 /// Must be invoked during early boot before interrupts are enabled.
@@ -1081,6 +1132,21 @@ pub fn is_cpu_online(cpu_id: usize) -> bool {
     cpu_id < MAX_CPUS && (online_cpu_mask() & (1u64 << cpu_id)) != 0
 }
 
+/// Compute the online mask after admitting one logical CPU.
+///
+/// The transition is intentionally idempotent: repeated lifecycle callbacks
+/// cannot inflate a separate count because the count is always derived from
+/// the resulting bitmap. Keeping this small transition pure also lets the host
+/// topology harness exercise duplicate-publication behavior without mutating
+/// the global boot topology.
+#[inline]
+fn online_mask_after_publish(current_mask: u64, cpu_id: usize) -> Option<u64> {
+    if cpu_id >= MAX_CPUS {
+        return None;
+    }
+    Some(current_mask | (1u64 << cpu_id))
+}
+
 /// Admit a logical CPU only when a prior LAPIC lookup produced a valid ID and
 /// that ID is currently online.
 ///
@@ -1160,11 +1226,10 @@ pub fn try_current_online_cpu_in_non_task_context() -> Option<bool> {
         return Some(true);
     }
     let per_cpu = PER_CPU_DATA.get_cpu(cpu_id)?;
-    Some(is_non_task_context(
-        per_cpu.in_irq(),
-        nmi_active(),
-        interrupts_enabled,
-    ))
+    Some(
+        per_cpu.in_soft_progress()
+            || is_non_task_context(per_cpu.in_irq(), nmi_active(), interrupts_enabled),
+    )
 }
 
 /// Return whether the current, registered, online CPU is servicing an
@@ -1201,7 +1266,8 @@ impl CurrentCpuPin {
     /// Return whether this pinned CPU is in a non-task context.
     #[inline]
     pub fn in_non_task_context(&self) -> bool {
-        is_non_task_context(self.per_cpu.in_irq(), nmi_active(), interrupts_enabled())
+        self.per_cpu.in_soft_progress()
+            || is_non_task_context(self.per_cpu.in_irq(), nmi_active(), interrupts_enabled())
     }
 
     /// Return whether the pinned CPU is servicing an accounted hard IRQ.
@@ -1266,10 +1332,37 @@ pub fn try_pin_current_online_cpu() -> Option<CurrentCpuPin> {
 /// validation can distinguish registered-but-offline from truly online CPUs.
 #[inline]
 pub fn mark_cpu_online() {
-    let cpu_id = current_cpu_id();
-    if cpu_id < MAX_CPUS {
-        ONLINE_CPU_MASK.fetch_or(1u64 << cpu_id, Ordering::Release);
-    }
+    let cpu_id = try_current_registered_cpu_id()
+        .expect("cannot publish online topology for an unregistered LAPIC identity");
+    mark_cpu_online_with_id(cpu_id);
+}
+
+/// Publish a registered logical CPU as online.
+///
+/// Registration and online publication share `CPU_ID_REGISTRATION_LOCK`, so a
+/// re-registration cannot pass an offline check while this bit is being set.
+/// The reciprocal LAPIC map is validated again under the same lock, and the
+/// bitmap transition is idempotent for duplicate callbacks.
+#[inline]
+pub fn mark_cpu_online_with_id(cpu_id: usize) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+    let _registration = CPU_ID_REGISTRATION_LOCK.lock();
+    let lapic_id = LAPIC_ID_MAP[cpu_id].load(Ordering::Acquire);
+    assert!(
+        lapic_id != INVALID_LAPIC_ID
+            && (lapic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE
+            && LAPIC_ID_REVERSE_MAP[lapic_id as usize].load(Ordering::Acquire) == cpu_id,
+        "CPU {} cannot become online before reciprocal LAPIC registration",
+        cpu_id
+    );
+
+    // The idempotent transition is serialized under the lifecycle lock.
+    // Readers derive their count from this authoritative mask, so no second
+    // counter can diverge.
+    let current = ONLINE_CPU_MASK.load(Ordering::Relaxed);
+    let next = online_mask_after_publish(current, cpu_id)
+        .expect("validated CPU ID unexpectedly exceeded online-mask capacity");
+    ONLINE_CPU_MASK.store(next, Ordering::Release);
 }
 
 /// Clear FPU ownership for a process across all CPUs.
@@ -1368,6 +1461,30 @@ mod host_harness_tests {
     }
 
     #[test]
+    fn soft_progress_context_is_fail_closed_and_non_reentrant() {
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
+
+        assert_eq!(
+            super::try_current_online_cpu_in_non_task_context(),
+            Some(false)
+        );
+        let guard = super::try_enter_soft_progress().expect("outer soft-progress entry");
+        assert_eq!(
+            super::try_current_online_cpu_in_non_task_context(),
+            Some(true)
+        );
+        let pin = super::try_pin_current_online_cpu().expect("host CPU 0 is admitted");
+        assert!(pin.in_non_task_context());
+        assert!(super::try_enter_soft_progress().is_none());
+        drop(pin);
+        drop(guard);
+        assert_eq!(
+            super::try_current_online_cpu_in_non_task_context(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn registration_reassignment_clears_stale_reverse_entry() {
         let _serial = TOPOLOGY_TEST_LOCK.lock();
         let cpu_id = super::MAX_CPUS - 2;
@@ -1407,5 +1524,18 @@ mod host_harness_tests {
         let lapic_id = 249;
         super::register_cpu_id(super::MAX_CPUS - 4, lapic_id);
         super::register_cpu_id(super::MAX_CPUS - 3, lapic_id);
+    }
+
+    #[test]
+    fn duplicate_online_publication_is_idempotent() {
+        let mask = 1u64 | (1u64 << (super::MAX_CPUS - 1));
+        assert_eq!(
+            super::online_mask_after_publish(mask, super::MAX_CPUS - 1),
+            Some(mask)
+        );
+        assert_eq!(
+            super::online_mask_after_publish(mask, super::MAX_CPUS),
+            None
+        );
     }
 }

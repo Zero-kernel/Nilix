@@ -40,7 +40,7 @@
 
 use crate::apic;
 use core::sync::atomic::{AtomicU64, Ordering};
-use cpu_local::{current_cpu_id, lapic_id_for_cpu, max_cpus};
+use cpu_local::{current_cpu_id, is_cpu_online, lapic_id_for_cpu, max_cpus};
 
 // ============================================================================
 // IPI Vector Assignments
@@ -223,14 +223,15 @@ fn bump_stat(ipi_type: IpiType, count: u64) {
 /// # R68-6 FIX: Online Check
 ///
 /// Only sends IPI to CPUs that have completed initialization and are marked
-/// online in ONLINE_CPU_MASK. Sending to partially-initialized CPUs (which
+/// online in cpu_local's authoritative topology mask. Sending to partially-
+/// initialized CPUs (which
 /// have LAPIC IDs but no IDT/handler) would cause lost IPIs.
 #[inline]
 pub fn send_ipi(target_cpu: usize, ipi_type: IpiType) {
     // R68-6 FIX: Check online status before sending.
     // A CPU with a registered LAPIC ID but not yet marked online is still
     // in the initialization phase and cannot handle IPIs properly.
-    if !mm::tlb_shootdown::is_cpu_online(target_cpu) {
+    if !is_cpu_online(target_cpu) {
         return;
     }
     if let Some(dest_lapic) = lapic_id_for_cpu(target_cpu) {

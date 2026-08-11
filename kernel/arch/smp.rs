@@ -1378,21 +1378,23 @@ pub extern "C" fn ap_rust_entry(
     // - Deadlock if the requester blocks waiting for our ACK
     //
     // By enabling interrupts first, we guarantee that once we appear in the
-    // ONLINE_CPU_MASK, we can immediately service any IPIs sent to us.
+    // authoritative cpu_local online mask, we can immediately service any IPIs
+    // sent to us.
     //
     // Note: The IDT and LAPIC are already initialized above, so it's safe to
     // receive interrupts at this point.
     x86_64::instructions::interrupts::enable();
 
-    // R67-1 FIX: Register with TLB shootdown subsystem before signaling online
-    // This ensures the TLB shootdown guard (assert_single_core_mode) will correctly
-    // panic if SMP is enabled but IPI-based shootdown is not yet implemented.
+    // RF187-6: Publish one authoritative registered-and-online topology state.
+    // The TLB compatibility entry point delegates to cpu_local's serialized
+    // lifecycle transaction; IPI, TLB, scheduler, and KCOV all read that same
+    // mask. Publication occurs only after this AP can service interrupts.
     mm::tlb_shootdown::register_cpu_online();
-
-    // R70-2 FIX: Also update the cpu_local online count for scheduler's cpu_pool_size().
-    // This ensures num_online_cpus() returns the correct count for load balancing
-    // and kick_idle_cpus() iteration.
-    cpu_local::mark_cpu_online();
+    debug_assert!(cpu_local::is_cpu_online(cpu_idx));
+    debug_assert_eq!(
+        mm::tlb_shootdown::online_cpu_count() as usize,
+        cpu_local::num_online_cpus()
+    );
 
     // Signal that we're online
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);

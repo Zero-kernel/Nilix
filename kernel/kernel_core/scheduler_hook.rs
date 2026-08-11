@@ -204,6 +204,16 @@ pub fn drain_requested_soft_progress() {
     }
     assert_kernel_entry_state();
 
+    // RF187-5 FIX: IRQ return enables IF before reaching this shared drain,
+    // but the interrupted task is still not an ordinary task-context owner.
+    // Mark the whole snapshot/invocation window so KCOV admission remains
+    // fail-closed on both the IRQ-return and normal scheduler paths.  The
+    // guard is non-reentrant; a callback that tries to drain recursively is
+    // rejected instead of inheriting ambiguous task attribution.
+    let Some(_soft_progress_guard) = cpu_local::try_enter_soft_progress() else {
+        return;
+    };
+
     let _ = drain_level_triggered_deferred(&IRQ_SOFT_PROGRESS_PENDING, || {
         let deferred_callbacks = SOFT_PROGRESS_CBS.lock().snapshot();
         for callback in deferred_callbacks.iter().flatten() {
@@ -441,6 +451,30 @@ pub fn request_resched_from_irq() {
 mod tests {
     use super::*;
 
+    static RF187_CALLBACK_CALLS: AtomicU32 = AtomicU32::new(0);
+    static RF187_CALLBACK_SAW_SOFT_PROGRESS: AtomicBool = AtomicBool::new(false);
+    static RF187_CALLBACK_REENTRY_REJECTED: AtomicBool = AtomicBool::new(false);
+
+    fn rf187_callback_probe() {
+        RF187_CALLBACK_CALLS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
+                calls.checked_add(1)
+            })
+            .expect("RF187 callback probe count overflow");
+        RF187_CALLBACK_SAW_SOFT_PROGRESS.store(
+            cpu_local::current_cpu().in_soft_progress(),
+            Ordering::Release,
+        );
+        // Invoke the public production entry point recursively.  The outer
+        // SoftProgressGuard must reject this before the nested pending-bit
+        // swap, preserving level-triggered work for a later safe point.
+        drain_requested_soft_progress();
+        RF187_CALLBACK_REENTRY_REJECTED.store(
+            cpu_local::current_cpu().in_soft_progress(),
+            Ordering::Release,
+        );
+    }
+
     #[test]
     fn rf180_deferred_level_rearms_when_producer_races_callback() {
         let pending = AtomicBool::new(true);
@@ -457,5 +491,32 @@ mod tests {
         assert!(!pending.load(Ordering::Acquire));
         assert!(!drain_level_triggered_deferred(&pending, || callbacks += 1));
         assert_eq!(callbacks, 2);
+    }
+
+    #[test]
+    fn rf187_soft_progress_guard_spans_callback_and_rejects_nested_drain() {
+        // RF187-5 FIX: drive the public production drain with its real
+        // readiness and pending bits, then execute an actual callback from
+        // the copied callback snapshot.  Registration is performed directly
+        // in the fixed slot table because the public registration API masks
+        // interrupts (a privileged operation unavailable to a hosted test).
+        RF187_CALLBACK_CALLS.store(0, Ordering::Relaxed);
+        RF187_CALLBACK_SAW_SOFT_PROGRESS.store(false, Ordering::Relaxed);
+        RF187_CALLBACK_REENTRY_REJECTED.store(false, Ordering::Relaxed);
+        SOFT_PROGRESS_CBS
+            .lock()
+            .register(rf187_callback_probe)
+            .expect("test callback slot available");
+        PROCESS_DEFERRED_WORK_READY.store(true, Ordering::Release);
+        IRQ_SOFT_PROGRESS_PENDING.store(true, Ordering::Release);
+
+        drain_requested_soft_progress();
+
+        assert_eq!(RF187_CALLBACK_CALLS.load(Ordering::Acquire), 1);
+        assert!(RF187_CALLBACK_SAW_SOFT_PROGRESS.load(Ordering::Acquire));
+        assert!(RF187_CALLBACK_REENTRY_REJECTED.load(Ordering::Acquire));
+        assert!(!IRQ_SOFT_PROGRESS_PENDING.load(Ordering::Acquire));
+        assert!(!cpu_local::current_cpu().in_soft_progress());
+        PROCESS_DEFERRED_WORK_READY.store(false, Ordering::Release);
     }
 }

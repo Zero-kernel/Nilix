@@ -32,8 +32,8 @@ use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cpu_local::{
-    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox, PER_CPU_DATA,
-    TLB_SHOOTDOWN_QUEUE_LEN,
+    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, try_current_registered_cpu_id,
+    TlbShootdownMailbox, PER_CPU_DATA, TLB_SHOOTDOWN_QUEUE_LEN,
 };
 use x86_64::instructions::tlb;
 use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
@@ -66,21 +66,6 @@ static STATS_COALESCED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
 /// SMP support flag - now true since IPI-based shootdown is implemented
 static SMP_SHOOTDOWN_IMPLEMENTED: bool = true;
-
-/// R24-7 fix: Track number of online CPUs
-/// This counter must be incremented by the SMP bring-up code when each CPU comes online.
-/// Starts at 1 (BSP is always online).
-static ONLINE_CPU_COUNT: AtomicU64 = AtomicU64::new(1);
-
-/// Codex review fix: Per-CPU online bitmask for safe target selection.
-///
-/// Bit N is set when CPU N has fully initialized and can handle IPIs.
-/// This prevents sending IPIs to CPUs that have LAPIC IDs registered but
-/// haven't completed their initialization yet.
-///
-/// BSP (CPU 0) is marked online at init time. APs set their bit via
-/// `register_cpu_online_with_id()` after completing initialization.
-static ONLINE_CPU_MASK: AtomicU64 = AtomicU64::new(1); // BSP (bit 0) is always online
 
 /// Next generation number for TLB shootdown requests (monotonic, starts at 1).
 /// Zero is the unpublished queue-slot sentinel and may never be issued.
@@ -360,30 +345,31 @@ pub fn flush_all_local() {
 /// This function is safe to call from any context, but should only be called once per CPU
 /// during SMP initialization.
 pub fn register_cpu_online() {
-    let cpu_id = current_cpu_id();
+    let cpu_id = try_current_registered_cpu_id()
+        .expect("cannot publish TLB online state for an unregistered LAPIC identity");
     register_cpu_online_with_id(cpu_id);
 }
 
 /// Register a specific CPU as online by its ID.
 ///
 /// This is the preferred interface when the CPU ID is known (e.g., from AP trampoline data).
-/// Sets the corresponding bit in ONLINE_CPU_MASK with Release ordering.
+/// Delegates the corresponding online publication to cpu_local's authoritative
+/// mask with its serialized lifecycle ordering.
 ///
 /// # Arguments
 ///
 /// * `cpu_id` - The logical CPU index (0 = BSP, 1+ = APs)
 pub fn register_cpu_online_with_id(cpu_id: usize) {
-    if cpu_id >= 64 {
-        return; // Can't represent in bitmask, ignore
-    }
-    let mask = 1u64 << cpu_id;
-    ONLINE_CPU_MASK.fetch_or(mask, Ordering::Release);
-    ONLINE_CPU_COUNT.fetch_add(1, Ordering::SeqCst);
+    // `cpu_local` owns the lifecycle transaction and validates the reciprocal
+    // LAPIC registration under its topology lock. Keeping this compatibility
+    // entry point as a delegation prevents TLB/IPI and KCOV from observing
+    // different online masks or a duplicate-only count increment.
+    cpu_local::mark_cpu_online_with_id(cpu_id);
 }
 
 /// Check if a specific CPU is marked as online.
 ///
-/// Uses Acquire ordering to synchronize with the Release in `register_cpu_online_with_id`.
+/// Reads cpu_local's authoritative registered-and-online bitmap.
 ///
 /// # R68-6 FIX: Made public for IPI layer
 ///
@@ -391,18 +377,14 @@ pub fn register_cpu_online_with_id(cpu_id: usize) {
 /// CPUs that have LAPIC IDs registered but haven't completed initialization yet.
 #[inline]
 pub fn is_cpu_online(cpu_id: usize) -> bool {
-    if cpu_id >= 64 {
-        return false;
-    }
-    let mask = ONLINE_CPU_MASK.load(Ordering::Acquire);
-    (mask & (1u64 << cpu_id)) != 0
+    cpu_local::is_cpu_online(cpu_id)
 }
 
 /// Get the number of online CPUs.
 ///
 /// Returns the current count of online CPUs. Useful for debugging and SMP validation.
 pub fn online_cpu_count() -> u64 {
-    ONLINE_CPU_COUNT.load(Ordering::SeqCst)
+    cpu_local::num_online_cpus() as u64
 }
 
 // ============================================================================
@@ -468,7 +450,7 @@ fn tlb_ipi_sender() -> Option<TlbIpiSender> {
 /// Panics if multiple CPUs are online but IPI sender is not registered.
 #[inline]
 fn assert_single_core_mode() {
-    let cpu_count = ONLINE_CPU_COUNT.load(Ordering::SeqCst);
+    let cpu_count = cpu_local::num_online_cpus() as u64;
     if cpu_count > 1 && tlb_ipi_sender().is_none() {
         panic!(
             "TLB shootdown called with {} CPUs online but IPI sender not registered! \
@@ -536,7 +518,7 @@ fn collect_target_cpus(target_cr3: u64) -> CpuMask {
     // mutations before it can execute in the newly loaded CR3; a CPU switching
     // out flushes that CR3 before publishing its replacement snapshot.
     if target_cr3 != 0 {
-        let online = ONLINE_CPU_MASK.load(Ordering::Acquire);
+        let online = cpu_local::online_cpu_mask();
         let max_tracked = core::cmp::min(max_cpus(), 64);
         for (cpu, _) in CPU_ACTIVE_CR3.iter().enumerate().take(max_tracked) {
             if cpu == self_id || (online & (1u64 << cpu)) == 0 {

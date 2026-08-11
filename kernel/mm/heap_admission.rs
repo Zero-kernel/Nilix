@@ -413,6 +413,16 @@ pub fn is_published() -> bool {
 
 /// Reserve bytes before a fallible allocation or side effect.
 pub fn try_reserve(class: HeapClass, bytes: usize) -> Result<HeapReservation, HeapAdmissionError> {
+    // RF187-6 FIX: hosted sub-crate tests link `mm` as a dependency, so the
+    // kernel's normal boot publication hook is not executed before an admitted
+    // container is exercised. Keep the production contract strict (the feature
+    // is only enabled by the host harness) while making those tests model a
+    // published runtime ledger instead of turning every first fallible
+    // allocation into a misleading `NoMemory` result.
+    #[cfg(feature = "host_harness")]
+    if !is_published() {
+        publish();
+    }
     if !is_published() {
         return Err(HeapAdmissionError::NotPublished);
     }

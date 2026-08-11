@@ -7,10 +7,11 @@ edition = "2021"
 path = "lib.rs"
 
 [features]
-# host_harness: compile `mm` WITHOUT its #[global_allocator] registration and
+# host_harness: compile `mm` WITHOUT its #[global_allocator] registration,
 # make CPU-local lookup safe for an ordinary hosted process with no LAPIC MMIO
-# mapping. The feature is OFF for the kernel build; see the ALLOCATOR static in
-# memory.rs and cpu_local::current_cpu_id().
+# mapping, and lazily publish the admission ledger when a dependency-only test
+# binary has no kernel boot publication hook. The feature is OFF for the kernel
+# build; see the ALLOCATOR static in memory.rs and cpu_local::current_cpu_id().
 host_harness = ["cpu_local/host_harness"]
 
 # fuzz_runner: enable KCOV instrumentation and raise boot heap budget to accommodate
