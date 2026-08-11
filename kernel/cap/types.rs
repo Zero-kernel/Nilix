@@ -253,9 +253,14 @@ bitflags::bitflags! {
         // Observability rights (bits 42-43)
         /// Permission to read trace counters, tracepoint listings, watchdog status
         const TRACE_READ  = 1 << 42;
-        /// R187-1 FIX: Permission to initialize, control, and export a task's
-        /// KCOV bitmap. This is deliberately separate from `TRACE_READ`: KCOV
-        /// exposes kernel control-flow observations and changes recorder state.
+        /// RF187-1 FIX: reserved observability bit retained for capability-ABI
+        /// stability.
+        ///
+        /// RF187-1 policy: KCOV is currently host-root-only.  There is no
+        /// production mint or delegation path for this bit, and the KCOV
+        /// syscall gate intentionally does not treat it as authority.  A
+        /// future identity-bound issuance design may consume the bit only
+        /// after the authority and revocation protocol has been reviewed.
         const KCOV        = 1 << 43;
 
         // Convenience combinations

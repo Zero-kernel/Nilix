@@ -16,9 +16,12 @@
 //! # Build and access requirements
 //!
 //! The kernel must be built with the `kcov` feature. Without that feature, the
-//! KCOV syscalls return `ENOSYS`. KCOV is a privileged observability interface:
-//! callers must be host root or hold the dedicated KCOV capability before they
-//! can allocate, control, reset, or export a task's bitmap.
+//! KCOV syscalls return `ENOSYS`. KCOV is a host-global, privileged observability
+//! interface: callers must be host root before they can allocate, control,
+//! reset, or export a task's bitmap. Namespace-root credentials and the
+//! reserved `CapRights::KCOV` bit do not authorize access; a reviewed,
+//! identity-bound issuance protocol is required before delegated access can be
+//! enabled.
 //!
 //! # Bitmap semantics
 //!

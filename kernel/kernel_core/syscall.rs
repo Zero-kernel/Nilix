@@ -21326,24 +21326,25 @@ fn sys_waitid(
 ///
 /// KCOV exposes kernel control-flow observations and consumes a bounded kernel
 /// allocation.  It is therefore a host-global debugging surface: namespace-root
-/// credentials cannot authorize it.  Trusted host root remains compatible with
-/// the in-tree fuzzing runner; delegated fuzzers need the explicit KCOV right.
+/// credentials cannot authorize it.  The R187 authority-policy repair makes the
+/// surface explicitly host-root-only until a reviewed, identity-bound grant
+/// protocol exists.  Keeping the policy narrow is safer than treating an
+/// unissuable capability bit as if it were a usable delegation mechanism.
 #[cfg(feature = "kcov")]
 #[inline]
-fn kcov_access_allowed(is_host_root: bool, has_kcov_right: bool) -> bool {
-    is_host_root || has_kcov_right
+fn kcov_access_allowed(is_host_root: bool, _has_reserved_kcov_right: bool) -> bool {
+    is_host_root
 }
 
-/// R187-1 FIX: Require host-root or the dedicated KCOV capability before every
-/// KCOV operation, including state-only operations, so no direct or future
-/// caller can allocate, enable, reset, or export coverage without authority.
+/// RF187-1 FIX: KCOV is deliberately host-root-only until a production
+/// identity-bound issuance protocol is reviewed and implemented.  Every
+/// operation, including state-only operations, shares this single fail-closed
+/// gate so no direct or future caller can allocate, enable, reset, or export
+/// coverage without host-global authority.
 #[cfg(feature = "kcov")]
 #[inline]
 fn require_kcov_access() -> Result<(), SyscallError> {
-    if kcov_access_allowed(
-        crate::current_is_host_root(),
-        current_has_cap_rights(cap::CapRights::KCOV),
-    ) {
+    if kcov_access_allowed(crate::current_is_host_root(), false) {
         Ok(())
     } else {
         Err(SyscallError::EPERM)
@@ -21518,10 +21519,10 @@ mod r187_kcov_authorization_tests {
     use super::*;
 
     #[test]
-    fn host_root_or_explicit_kcov_right_is_required() {
+    fn only_host_root_can_authorize_kcov() {
         assert!(!kcov_access_allowed(false, false));
+        assert!(!kcov_access_allowed(false, true));
         assert!(kcov_access_allowed(true, false));
-        assert!(kcov_access_allowed(false, true));
         assert!(kcov_access_allowed(true, true));
     }
 }
