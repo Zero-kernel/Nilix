@@ -39,11 +39,24 @@ personality.
 ### Current Status
 
 **Milestone:** approaching **1.0-Preview** — Phase A–G complete; **Phase U** (user-mode ABI)
-in progress. The 1.0-Preview release gate is currently **BLOCKED on the zero-HIGH streak only**
-(currently **1/3** after R186-4 fix). All R186 actionable findings are now fixed and verified,
-including the former gate-blocking `R186-4` (VMA/MM aggregate admission). See [Section 6](#6-security-audit-status).
+in progress. The 1.0-Preview release gate remains **BLOCKED** on the carried `R186-4` HIGH
+(VMA/MM aggregate admission) and its design parent; the zero-HIGH streak is **0/3**. R187
+(KCOV remediation) closed clean — all 7 findings fixed and 8/8 review-fix defects repaired —
+but did not advance the streak, because `R186-4` is carried debt, not an R187 finding. See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-08-08:** **R187 KCOV remediation + ReviewFix closure** — the KCOV observability surface
+  was hardened across authority, admission context, and topology to make coverage *measurement*
+  accurate and fail-closed: (1) KCOV authority is **host-root-only** — the reserved
+  `CapRights::KCOV` bit no longer authorizes access, pending a reviewed identity-bound issuance
+  protocol; (2) an allocation-free IRQ-return **soft-progress guard** keeps KCOV admission
+  fail-closed on the deferred-callback drain and rejects recursive re-entry; (3) the CPU online
+  topology is unified under one authoritative `cpu_local` mask (TLB/IPI/scheduler/KCOV all read
+  it) with reciprocal-LAPIC validation and idempotent publication; (4) the fuzzer ABI reports
+  **occupied KCOV bitmap slots** (not source edges) and bounds KCOV control retries. ReviewFix
+  closure verified 7/7 fixes PASS and 8/8 review-fix defects repaired (0 escalated); the remote
+  fmt/clippy/build/lint/test/boot/musl ladder is green. The gate stays BLOCKED on carried
+  `R186-4`. See [Section 6](#6-security-audit-status).
 - **2026-08-05:** **Cargo-fuzz QEMU Integration** — Extended fuzzing infrastructure with cargo-fuzz targets
   for syscall execution against the real KCOV-enabled kernel. New components: (1) `fuzz_syscall_qemu` target
   with lazy QEMU executor initialization and safe syscall allowlist (19 syscalls); (2) Bridge module
@@ -513,7 +526,9 @@ make fuzz-clean               # Clean artifacts/corpus
 #### KCOV Infrastructure
 
 - **Per-task coverage tracking** — IRQ-skipping, non-blocking edge recording with manual syscall
-  tracepoints.
+  tracepoints. KCOV is a host-global privileged surface: authority is **host-root-only** (the
+  reserved `CapRights::KCOV` bit is retained for ABI stability but does not authorize access
+  until a reviewed identity-bound issuance protocol exists).
 - **Management syscalls** — `kcov_init`, `kcov_enable`, `kcov_disable`, `kcov_dump`, `kcov_reset`
   for coverage lifecycle control from Ring 3.
 - **Deterministic E2E gate** — QEMU guest executor validates KCOV enable/disable/reset/dump, bitmap
@@ -632,13 +647,13 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 
 | Metric | Value |
 |--------|-------|
-| Audit rounds | **186** (R186 completed 2026-07-28; authoritative ReviewFix verdict/repair convergence 2026-07-30) |
-| Cumulative findings | ~1,333 (historical IDs include merged/refuted findings) |
-| Findings fixed/resolved | ~1,177 |
-| Latest round | R186 — 16 fixed, 1 actionable open, 1 INFO |
-| Latest review-fix pass | RF186 — 16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL); 24/24 RF defects repaired, 0 escalated; final ladder green |
-| Current actionable debt | **1 HIGH** (`R186-4`) |
-| 1.0-Preview release gate | **BLOCKED** — one HIGH remains; zero-HIGH streak 0/3 |
+| Audit rounds | **187** (R187 KCOV remediation completed 2026-08-08; ReviewFix closure 2026-08-08) |
+| Cumulative findings | ~1,340 (historical IDs include merged/refuted findings) |
+| Findings fixed/resolved | ~1,184 |
+| Latest round | R187 — KCOV authority/access/topology; 7 fixes, 7 PASS (review-fix 8/8 repaired) |
+| Latest review-fix pass | RF187 — 7/7 fixes PASS, 8/8 RF defects repaired, 0 escalated; remote ladder green |
+| Current actionable debt | **1 HIGH** (`R186-4`, carried) |
+| 1.0-Preview release gate | **BLOCKED** — carried `R186-4` HIGH remains; zero-HIGH streak 0/3 |
 
 R186 found 18 issues in total: 17 actionable findings and one INFO. Sixteen actionables
 are fully fixed; `R186-18` is fixed and review-verified through shared credential
@@ -654,6 +669,18 @@ The authoritative **RF186 ReviewFix closure** reviewed all 16 landed fixes: 2 PA
 stress 50/50, and the complete fmt/clippy/build/lint/test/boot/musl ladder.
 `R186-4` was never fixed and remains outside the Stage-3 verdict scope, so the gate
 and streak remain unchanged.
+
+R187 (2026-08-08) audited the KCOV observability surface and recorded 7 findings —
+authority, IRQ/NMI/soft-progress admission, exact dump, occupied-slot collision semantics,
+fuzzer timing/control, documentation, and static CPU/topology safety. All 7 are fixed and the
+ReviewFix closure verified 7/7 PASS. Eight review-fix defects (RF187-1…RF187-8) were repaired
+with 0 escalations: KCOV authority is now host-root-only (the reserved `CapRights::KCOV` bit
+cannot elevate a caller), an allocation-free soft-progress guard spans the public
+deferred-callback drain, the CPU online topology is unified under one authoritative `cpu_local`
+mask, and the fuzzer ABI reports occupied bitmap slots with bounded KCOV control retries. R187
+added no new open HIGH; the gate remains BLOCKED on the carried `R186-4` and the streak stays
+0/3. See the [R187 report](docs/review/audits/qa-2026-08-05.md) and the
+[RF187 closure](docs/review/reviewfix/reviewfix-2026-08-08.md).
 
 CI now runs `make test-hosted-subcrates`: **169 default-parallel hosted tests** across
 audit, MM, block, seccomp, net, and the focused RF186 capability lifecycle pair, plus
