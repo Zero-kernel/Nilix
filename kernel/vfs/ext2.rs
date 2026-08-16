@@ -81,8 +81,26 @@ const JBD2_FLAG_ESCAPE: u16 = 0x0001;
 const JBD2_FLAG_SAME_UUID: u16 = 0x0002;
 const JBD2_FLAG_LAST_TAG: u16 = 0x0008;
 
-const JOURNAL_MAX_METADATA_BLOCKS: usize = 4;
-const JOURNAL_TRANSACTION_BLOCKS: u32 = 1 + JOURNAL_MAX_METADATA_BLOCKS as u32 + 1;
+/// Maximum metadata blocks a single JBD2 transaction may touch.  The
+/// direct-allocation grammar uses exactly `DIRECT_ALLOCATION_METADATA_BLOCKS`;
+/// the FileCreate grammar (`Ext2Fs::create`) may touch up to this many homes
+/// (5 when the new and parent inodes share one inode-table block, or 6 when
+/// they are distinct: inode bitmap, group descriptor, superblock, new-inode
+/// table block, parent-inode table block, parent dir data block).
+const JOURNAL_MAX_METADATA_BLOCKS: usize = 6;
+/// Fixed metadata-block count for the direct-allocation grammar (block bitmap,
+/// group descriptor, superblock, inode table).  Kept distinct from the
+/// `JOURNAL_MAX_METADATA_BLOCKS` ceiling so that raising the FileCreate limit
+/// does not silently grow this grammar's on-disk transaction size, its
+/// recovery candidate count, or its self-test fixtures.
+const DIRECT_ALLOCATION_METADATA_BLOCKS: usize = 4;
+/// Mount-time minimum journal capacity: the journal must hold the largest
+/// always-supported transaction (direct allocation).  FileCreate transactions
+/// are capacity-checked at create time and return `NotSupported` when the
+/// journal cannot hold a 6-block transaction, so they do not raise this floor
+/// (and images with small journals — including the R180-6 synthetic test
+/// image, `s_maxlen == 8` — remain mountable).
+const JOURNAL_TRANSACTION_BLOCKS: u32 = 1 + DIRECT_ALLOCATION_METADATA_BLOCKS as u32 + 1;
 const MAX_JOURNAL_BLOCKS: usize = 16 * 1024;
 
 // RF180-13 FIX: hostile-but-geometrically-valid images must not turn mount or
@@ -134,6 +152,8 @@ const ZERO_INTENT_MAGIC: [u8; 4] = *b"ZJ01";
 const ZERO_INTENT_VERSION: u16 = 1;
 const ZERO_INTENT_KIND_INODE_UPDATE: u8 = 1;
 const ZERO_INTENT_KIND_DIRECT_ALLOCATION: u8 = 2;
+const ZERO_INTENT_KIND_FILE_CREATE: u8 = 3;
+const ZERO_INTENT_KIND_FILE_RENAME: u8 = 4;
 const ZERO_INTENT_MAGIC_OFFSET: usize = JBD2_HEADER_BYTES;
 const ZERO_INTENT_VERSION_OFFSET: usize = 16;
 const ZERO_INTENT_KIND_OFFSET: usize = 18;
@@ -147,9 +167,33 @@ const ZERO_INTENT_OLD_INODE_OFFSET: usize =
     ZERO_INTENT_PREIMAGE_HASHES_OFFSET + ZERO_INTENT_PREIMAGE_HASH_BYTES;
 const ZERO_INTENT_DIGEST_OFFSET: usize = ZERO_INTENT_OLD_INODE_OFFSET + size_of::<Ext2InodeRaw>();
 const ZERO_INTENT_END: usize = ZERO_INTENT_DIGEST_OFFSET + 32;
+// FileCreate intent payload.  The digest occupies [ZERO_INTENT_DIGEST_OFFSET,
+// ZERO_INTENT_END) exactly as for the other two kinds, so INODE_UPDATE and
+// DIRECT_ALLOCATION keep their on-disk format byte-for-byte.  The two extra
+// FILE_CREATE fields live in the trailing zero region that `decode_commit_intent`
+// already requires to be zero for the other kinds; only FILE_CREATE writes them
+// and only FILE_CREATE relaxes the trailing-zero check to start at
+// `ZERO_INTENT_FILE_CREATE_END`.  `finish_transaction_digest` already hashes
+// [ZERO_INTENT_END..], so new_ino/parent_ino are inside the authenticated digest.
+const ZERO_INTENT_NEW_INO_OFFSET: usize = ZERO_INTENT_END;
+const ZERO_INTENT_PARENT_INO_OFFSET: usize = ZERO_INTENT_NEW_INO_OFFSET + 4;
+const ZERO_INTENT_FILE_CREATE_END: usize = ZERO_INTENT_PARENT_INO_OFFSET + 4;
+// FileRename intent payload (lives in the same trailing region, after the
+// FILE_CREATE fields).  Stores dir_off, rec_len, old_name_len, old_name so
+// recovery can reverse the in-place name rewrite.  new_name is NOT stored:
+// it is the post-image state, authenticated by the dir-block preimage hash.
+// `finish_transaction_digest` hashes [ZERO_INTENT_END..], so these fields are
+// inside the authenticated digest.
+const ZERO_INTENT_RENAME_DIR_OFF_OFFSET: usize = ZERO_INTENT_FILE_CREATE_END;
+const ZERO_INTENT_RENAME_REC_LEN_OFFSET: usize = ZERO_INTENT_RENAME_DIR_OFF_OFFSET + 4;
+const ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET: usize = ZERO_INTENT_RENAME_REC_LEN_OFFSET + 2;
+const ZERO_INTENT_RENAME_OLD_NAME_OFFSET: usize = ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET + 1;
+const ZERO_INTENT_FILE_RENAME_END: usize = ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255;
 const ZERO_INTENT_HASH_DOMAIN: &[u8] = b"Zero-OS ext3 journal intent v1\0";
 const _: () = assert!(size_of::<Ext2InodeRaw>() == 128);
 const _: () = assert!(ZERO_INTENT_END <= 1024);
+const _: () = assert!(ZERO_INTENT_FILE_CREATE_END <= 1024);
+const _: () = assert!(ZERO_INTENT_FILE_RENAME_END <= 1024);
 
 /// R180-6 FIX: validate the complete half-open write range before Ext2 can
 /// modify any block. The caller decides whether each mapped or direct-hole
@@ -589,6 +633,12 @@ pub fn run_ext2_mutation_scratch_self_test() {
             physical: 0,
             preimage_hashes,
             old_inode: next_raw,
+            new_ino: 0,
+            parent_ino: 0,
+            rename_dir_off: 0,
+            rename_rec_len: 0,
+            rename_old_name_len: 0,
+            rename_old_name: [0; 255],
         };
         let writes_before_recovery_validation = device.writes.load(Ordering::Relaxed);
         assert!(fs
@@ -1041,7 +1091,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     }
 
     fn resign_private_transaction(image: &mut [u8], metadata_count: usize) {
-        assert!(metadata_count == 1 || metadata_count == JOURNAL_MAX_METADATA_BLOCKS);
+        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
         let sequence = journal_sequence(image);
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(
@@ -1072,7 +1122,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     }
 
     fn resequence_private_transaction(image: &mut [u8], metadata_count: usize, sequence: u32) {
-        assert!(metadata_count == 1 || metadata_count == JOURNAL_MAX_METADATA_BLOCKS);
+        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
         write_be_u32(
             image,
             journal_logical_offset(0) + JBD2_SUPER_SEQUENCE_OFFSET,
@@ -1094,12 +1144,12 @@ pub fn run_ext2_journal_transaction_self_test() {
         start: u32,
         wrap: bool,
     ) {
-        assert!(metadata_count == 1 || metadata_count == JOURNAL_MAX_METADATA_BLOCKS);
+        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
         assert!((1..8).contains(&start));
         let transaction_blocks = metadata_count + 2;
         let source_start = journal_logical_offset(1);
         let source_end = source_start + transaction_blocks * BLOCK_SIZE;
-        // lint-fallible: BOUNDED(journal self-test scaffold; transaction_blocks <= JOURNAL_MAX_METADATA_BLOCKS+2, fixed)
+        // lint-fallible: BOUNDED(journal self-test scaffold; transaction_blocks <= DIRECT_ALLOCATION_METADATA_BLOCKS+2, fixed)
         let source = image[source_start..source_end].to_vec();
         image[journal_logical_offset(1)..journal_logical_offset(0) + 8 * BLOCK_SIZE].fill(0);
         for index in 0..transaction_blocks {
@@ -2426,7 +2476,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     let mut wrapped_one = active_mapped_log.clone();
     resequence_private_transaction(&mut wrapped_one, 1, 0);
     let mut stale_four = active_allocation_log.clone();
-    resequence_private_transaction(&mut stale_four, JOURNAL_MAX_METADATA_BLOCKS, 0);
+    resequence_private_transaction(&mut stale_four, DIRECT_ALLOCATION_METADATA_BLOCKS, 0);
     let stale_commit =
         stale_four[journal_logical_offset(6)..journal_logical_offset(6) + BLOCK_SIZE].to_vec();
     wrapped_one[journal_logical_offset(6)..journal_logical_offset(6) + BLOCK_SIZE]
@@ -2492,13 +2542,13 @@ pub fn run_ext2_journal_transaction_self_test() {
         (active_mapped_log.clone(), 1usize, 4u32, false),
         (
             active_allocation_log.clone(),
-            JOURNAL_MAX_METADATA_BLOCKS,
+            DIRECT_ALLOCATION_METADATA_BLOCKS,
             2u32,
             false,
         ),
         (
             active_allocation_log.clone(),
-            JOURNAL_MAX_METADATA_BLOCKS,
+            DIRECT_ALLOCATION_METADATA_BLOCKS,
             5u32,
             true,
         ),
@@ -2594,7 +2644,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     let second_tag = journal_logical_offset(1) + JBD2_HEADER_BYTES + JBD2_TAG_BYTES + 16;
     write_be_u32(&mut duplicate_four_home, second_tag, first_home)
         .expect("duplicate four-image descriptor home");
-    resign_private_transaction(&mut duplicate_four_home, JOURNAL_MAX_METADATA_BLOCKS);
+    resign_private_transaction(&mut duplicate_four_home, DIRECT_ALLOCATION_METADATA_BLOCKS);
     let before = duplicate_four_home.clone();
     let device = Arc::try_new(CrashBlockDevice::new(duplicate_four_home))
         .expect("duplicate four-image home device");
@@ -2620,7 +2670,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     .expect("synthetic logged free count is nonzero");
     forged_four_post[group_free_offset..group_free_offset + size_of::<u16>()]
         .copy_from_slice(&forged_free.to_le_bytes());
-    resign_private_transaction(&mut forged_four_post, JOURNAL_MAX_METADATA_BLOCKS);
+    resign_private_transaction(&mut forged_four_post, DIRECT_ALLOCATION_METADATA_BLOCKS);
     let before = forged_four_post.clone();
     let device = Arc::try_new(CrashBlockDevice::new(forged_four_post))
         .expect("forged four-image post-image device");
@@ -3465,6 +3515,10 @@ enum RecoveryHomeKind {
     Superblock,
     GroupDescriptors,
     BlockBitmap(usize),
+    /// Inode-allocation bitmap.  Distinct from `BlockBitmap` (which `recovery_home_kind`
+    /// already recognizes): the FileCreate grammar journals the inode bitmap (inode
+    /// allocation), not the block bitmap.
+    InodeBitmap(usize),
     InodeTable(usize),
 }
 
@@ -3487,6 +3541,18 @@ struct JournalCommitIntent {
     physical: u32,
     preimage_hashes: [[u8; 32]; JOURNAL_MAX_METADATA_BLOCKS],
     old_inode: Ext2InodeRaw,
+    /// FileCreate only: the newly allocated inode number and the parent
+    /// directory inode number.  Zero for INODE_UPDATE / DIRECT_ALLOCATION, whose
+    /// trailing payload region stays zero so their on-disk format is unchanged.
+    new_ino: u32,
+    parent_ino: u32,
+    /// FileRename only: the dirent offset, rec_len, and old name needed to
+    /// reverse the in-place name rewrite.  `rename_old_name_len` is 0 for the
+    /// other kinds; the trailing payload region for those kinds stays zero.
+    rename_dir_off: u32,
+    rename_rec_len: u16,
+    rename_old_name_len: u8,
+    rename_old_name: [u8; 255],
 }
 
 struct OwnershipWork {
@@ -3899,6 +3965,126 @@ struct DirectAllocationPlan {
     new_inode: Ext2InodeRaw,
 }
 
+/// Role of one metadata home within a FileCreate transaction.  The fixed
+/// commit-time ordering is: bitmap, group descriptor, superblock, then the
+/// inode-table home(s), then the parent directory data block.  When the new
+/// and parent inodes share one inode-table block the two inode edits coalesce
+/// into a single home, dropping the count from 6 to 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileCreateHomeRole {
+    Bitmap,
+    GroupDesc,
+    Superblock,
+    NewInode,
+    ParentInode,
+    /// New-inode and parent-inode edits applied to the same inode-table block.
+    CoalescedInode,
+    DirData,
+}
+
+/// Transactional file-creation plan.  All metadata homes — inode bitmap, group
+/// descriptor, superblock, the new inode's table block, the parent inode's
+/// table block (or one coalesced block), and the parent directory data block —
+/// commit in a single JBD2 transaction or none do.  See `Ext2Fs::create` for
+/// the pre-flight gates (all-zero new-inode slot, clean dir tail, distinct
+/// homes, journal capacity) that make the recovery preimage reversal exact.
+#[derive(Clone, Copy)]
+struct FileCreatePlan {
+    new_ino: u32,
+    parent_ino: u32,
+    group: usize,
+    // inode bitmap home
+    bitmap_block: u32,
+    bitmap_byte: usize,
+    bitmap_mask: u8,
+    // group descriptor home
+    group_desc_target: GroupDescWriteTarget,
+    old_group_desc: Ext2GroupDesc,
+    new_group_desc: Ext2GroupDesc,
+    // superblock home
+    old_superblock: Ext2Superblock,
+    new_superblock: Ext2Superblock,
+    // new-inode table home (also carries the parent edit when `coalesced`)
+    new_inode_target: InodeWriteTarget,
+    new_inode_raw: Ext2InodeRaw,
+    // parent-inode table home (unused when `coalesced`)
+    parent_inode_target: InodeWriteTarget,
+    old_parent_inode: Ext2InodeRaw,
+    new_parent_inode: Ext2InodeRaw,
+    coalesced: bool,
+    // parent directory data-block home: carve the new dirent from the last
+    // entry's rec_len tail.
+    dir_block: u32,
+    /// Offset of the former-last dirent whose rec_len is shrunk; its rec_len
+    /// field lives at `dir_last_off + offset_of!(Ext2DirEntryHead, rec_len)`.
+    dir_last_off: usize,
+    dir_old_rec_len: u16,
+    dir_minimal_rec_len: u16,
+    dir_new_off: usize,
+    dir_new_rec_len: u16,
+    dir_name_len: u8,
+    /// New dirent name bytes (exactly `dir_name_len` are meaningful).
+    dir_name: [u8; 255],
+}
+
+/// Map a FileCreate home index to its role, independent of the plan struct so
+/// recovery (which has only the intent, not the plan) shares the exact same
+/// ordering as commit-time.  Coalescing collapses the new/parent inode homes
+/// into one (count 5); otherwise they are distinct (count 6).
+fn file_create_role(coalesced: bool, index: usize) -> Option<FileCreateHomeRole> {
+    match (coalesced, index) {
+        (false, 0) | (true, 0) => Some(FileCreateHomeRole::Bitmap),
+        (false, 1) | (true, 1) => Some(FileCreateHomeRole::GroupDesc),
+        (false, 2) | (true, 2) => Some(FileCreateHomeRole::Superblock),
+        (false, 3) => Some(FileCreateHomeRole::NewInode),
+        (true, 3) => Some(FileCreateHomeRole::CoalescedInode),
+        (false, 4) => Some(FileCreateHomeRole::ParentInode),
+        (false, 5) | (true, 4) => Some(FileCreateHomeRole::DirData),
+        _ => None,
+    }
+}
+
+impl FileCreatePlan {
+    #[inline]
+    fn home_count(&self) -> usize {
+        if self.coalesced {
+            5
+        } else {
+            6
+        }
+    }
+
+    /// Map a commit-time home index to its role.  The ordering is fixed so the
+    /// descriptor tags, preimage hashes, and recovery overlay all agree.
+    #[inline]
+    fn home_role_at(&self, index: usize) -> Result<FileCreateHomeRole, FsError> {
+        file_create_role(self.coalesced, index).ok_or(FsError::Invalid)
+    }
+}
+
+/// Transactional same-directory rename plan for a regular file (renameat2
+/// RENAME_NOREPLACE).  The source dirent's name is rewritten in place (the
+/// dest name must fit in the source entry's rec_len), and the parent
+/// directory's mtime/ctime is bumped.  The inode itself is unchanged (nlink
+/// stays 1, no inode-table write for the moved file).  Two metadata homes:
+/// the parent directory data block and the parent inode's table block.
+#[derive(Clone, Copy)]
+struct RenamePlan {
+    parent_ino: u32,
+    parent_target: InodeWriteTarget,
+    old_parent_inode: Ext2InodeRaw,
+    new_parent_inode: Ext2InodeRaw,
+    dir_block: u32,
+    /// Offset of the dirent being renamed within `dir_block`.
+    dir_off: usize,
+    /// The entry's rec_len (unchanged by the in-place rewrite).
+    rec_len: u16,
+    old_name_len: u8,
+    old_name: [u8; 255],
+    new_name_len: u8,
+    new_name: [u8; 255],
+}
+
 #[derive(Clone, Copy)]
 enum JournalMetadataPlan {
     DirectAllocation(DirectAllocationPlan),
@@ -3908,14 +4094,18 @@ enum JournalMetadataPlan {
         old_inode: Ext2InodeRaw,
         new_inode: Ext2InodeRaw,
     },
+    FileCreate(FileCreatePlan),
+    Rename(RenamePlan),
 }
 
 impl JournalMetadataPlan {
     #[inline]
     fn metadata_blocks(self) -> usize {
         match self {
-            Self::DirectAllocation(_) => JOURNAL_MAX_METADATA_BLOCKS,
+            Self::DirectAllocation(_) => DIRECT_ALLOCATION_METADATA_BLOCKS,
             Self::InodeUpdate { .. } => 1,
+            Self::FileCreate(plan) => plan.home_count(),
+            Self::Rename(_) => 2,
         }
     }
 }
@@ -4183,6 +4373,742 @@ pub fn run_ext2_inode_cache_self_test() {
         ),
         Err(FsError::Invalid)
     ));
+}
+
+/// End-to-end self-test for transactional ext3 file creation (`Ext2Fs::create`).
+///
+/// Mounts a synthetic single-group ext3 image whose journal is large enough for
+/// a 6-home FileCreate transaction, creates a regular file, and verifies the
+/// on-disk state.  Then exercises the two crash boundaries: a crash before the
+/// commit block is durable leaves no visible change (all-or-nothing), and a
+/// crash after the commit but before checkpoint is replayed in full by recovery.
+/// This is the integrity test for the 6-block FileCreate journal grammar.
+pub fn run_ext2_create_self_test() {
+    const BLOCK_SIZE: usize = 1024;
+    const BLOCKS: usize = 32;
+    const JOURNAL_INO: u32 = 8;
+    const JOURNAL_FIRST_PHYS: u32 = 8;
+    const JOURNAL_MAXLEN: u32 = 12;
+    const FIRST_FREE_BLOCK: u32 = 20;
+    const NEW_INO: u32 = 11;
+
+    fn put<T>(image: &mut [u8], offset: usize, value: &T) {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+        };
+        image[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn build_image() -> Vec<u8> {
+        let mut image = Vec::new();
+        image.resize(BLOCKS * BLOCK_SIZE, 0u8);
+        let uuid = [0x5Au8; 16];
+        let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
+        sb.inodes_count = 16;
+        sb.blocks_count = BLOCKS as u32;
+        sb.free_blocks_count = 12;
+        sb.free_inodes_count = 6;
+        sb.first_data_block = 1;
+        sb.blocks_per_group = BLOCKS as u32;
+        sb.frags_per_group = BLOCKS as u32;
+        sb.inodes_per_group = 16;
+        sb.magic = EXT2_SUPER_MAGIC;
+        sb.state = 1;
+        sb.rev_level = 1;
+        sb.first_ino = 11;
+        sb.inode_size = size_of::<Ext2InodeRaw>() as u16;
+        sb.feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
+        sb.feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+        sb.feature_ro_compat = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
+        sb.uuid = [0xA5; 16];
+        sb.journal_uuid = uuid;
+        sb.journal_inum = JOURNAL_INO;
+        put(&mut image, SUPERBLOCK_OFFSET as usize, &sb);
+
+        let desc = Ext2GroupDesc {
+            block_bitmap: 3,
+            inode_bitmap: 4,
+            inode_table: 5,
+            free_blocks_count: 12,
+            free_inodes_count: 6,
+            used_dirs_count: 1,
+            ..Ext2GroupDesc::default()
+        };
+        put(&mut image, 2 * BLOCK_SIZE, &desc);
+
+        // Block bitmap (block 3): blocks 1..FIRST_FREE_BLOCK allocated.
+        for b in 1..FIRST_FREE_BLOCK {
+            let bit = (b - 1) as usize;
+            image[3 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+        // Inode bitmap (block 4): inodes 1..=10 allocated (root=2, journal=8).
+        for ino in 1..=10u32 {
+            let bit = (ino - 1) as usize;
+            image[4 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+
+        // Root inode (ino 2) at inode-table block 5, index 1.
+        let mut root = Ext2InodeRaw::default();
+        root.mode = EXT2_S_IFDIR | 0o755;
+        root.size_lo = BLOCK_SIZE as u32;
+        root.links_count = 2;
+        root.blocks_lo = 2;
+        root.block[0] = 7;
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(),
+            &root,
+        );
+
+        // Journal inode (ino 8) at index 7: 12 direct journal blocks.
+        let mut jin = Ext2InodeRaw::default();
+        jin.mode = EXT2_S_IFREG | 0o600;
+        jin.size_lo = (JOURNAL_MAXLEN as usize * BLOCK_SIZE) as u32;
+        jin.blocks_lo = (JOURNAL_MAXLEN as usize * 2) as u32;
+        for i in 0..JOURNAL_MAXLEN as usize {
+            jin.block[i] = JOURNAL_FIRST_PHYS + i as u32;
+        }
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(),
+            &jin,
+        );
+
+        // Root directory data block (block 7): "." and "..".
+        let dir = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        dir[0..4].copy_from_slice(&2u32.to_le_bytes());
+        dir[4..6].copy_from_slice(&12u16.to_le_bytes());
+        dir[6] = 1;
+        dir[7] = EXT2_FT_DIR;
+        dir[8] = b'.';
+        let rec2 = (BLOCK_SIZE - 12) as u16;
+        dir[12..16].copy_from_slice(&2u32.to_le_bytes());
+        dir[16..18].copy_from_slice(&rec2.to_le_bytes());
+        dir[18] = 2;
+        dir[19] = EXT2_FT_DIR;
+        dir[20] = b'.';
+        dir[21] = b'.';
+
+        // Journal superblock (physical block 8 = logical 0).
+        let jsuper = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
+            ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
+        write_be_u32(jsuper, 0, JBD2_MAGIC).expect("journal magic");
+        write_be_u32(jsuper, 4, JBD2_SUPERBLOCK_V2).expect("journal type");
+        write_be_u32(jsuper, JBD2_SUPER_BLOCKSIZE_OFFSET, BLOCK_SIZE as u32).expect("blocksize");
+        write_be_u32(jsuper, JBD2_SUPER_MAXLEN_OFFSET, JOURNAL_MAXLEN).expect("maxlen");
+        write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
+        write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
+        write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
+        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
+            .expect("features");
+        jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
+        write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
+        image
+    }
+
+    struct CreateCrashDevice {
+        live: Mutex<Vec<u8>>,
+        durable: Mutex<Vec<u8>>,
+        operation: AtomicU64,
+        fail_at: AtomicU64,
+        failed: AtomicBool,
+    }
+
+    impl CreateCrashDevice {
+        fn new(image: Vec<u8>, fail_at: u64) -> Self {
+            Self {
+                live: Mutex::new(image.clone()),
+                durable: Mutex::new(image),
+                operation: AtomicU64::new(0),
+                fail_at: AtomicU64::new(fail_at),
+                failed: AtomicBool::new(false),
+            }
+        }
+        fn durable_image(&self) -> Vec<u8> {
+            self.durable.lock().clone()
+        }
+        fn begin(&self) -> Result<u64, block::BlockError> {
+            if self.failed.load(Ordering::Acquire) {
+                return Err(block::BlockError::Io);
+            }
+            let op = self
+                .operation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+                .map_err(|_| block::BlockError::Io)?
+                + 1;
+            if self.fail_at.load(Ordering::Acquire) == op {
+                self.failed.store(true, Ordering::Release);
+                return Err(block::BlockError::Io);
+            }
+            Ok(op)
+        }
+    }
+
+    impl BlockDevice for CreateCrashDevice {
+        fn name(&self) -> &str {
+            "ext2-create-crash"
+        }
+        fn sector_size(&self) -> u32 {
+            512
+        }
+        fn capacity_sectors(&self) -> u64 {
+            (self.live.lock().len() / 512) as u64
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn submit_bio(&self, _bio: block::Bio) -> Result<(), block::BlockError> {
+            Err(block::BlockError::NotSupported)
+        }
+        fn read_sync(&self, sector: u64, buf: &mut [u8]) -> Result<usize, block::BlockError> {
+            let start = usize::try_from(sector)
+                .ok()
+                .and_then(|s| s.checked_mul(512))
+                .ok_or(block::BlockError::Invalid)?;
+            let end = start.checked_add(buf.len()).ok_or(block::BlockError::Invalid)?;
+            buf.copy_from_slice(
+                self.live
+                    .lock()
+                    .get(start..end)
+                    .ok_or(block::BlockError::Invalid)?,
+            );
+            Ok(buf.len())
+        }
+        fn write_sync(&self, sector: u64, buf: &[u8]) -> Result<usize, block::BlockError> {
+            let start = usize::try_from(sector)
+                .ok()
+                .and_then(|s| s.checked_mul(512))
+                .ok_or(block::BlockError::Invalid)?;
+            let end = start.checked_add(buf.len()).ok_or(block::BlockError::Invalid)?;
+            let _op = self.begin()?;
+            self.live
+                .lock()
+                .get_mut(start..end)
+                .ok_or(block::BlockError::Invalid)?
+                .copy_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&self) -> Result<(), block::BlockError> {
+            let _op = self.begin()?;
+            let mut live = self.live.lock();
+            let mut durable = self.durable.lock();
+            durable.copy_from_slice(&live);
+            Ok(())
+        }
+    }
+
+    fn assert_state(fs: &Arc<Ext2Fs>, created: bool) {
+        let expected_free = if created { 5u32 } else { 6 };
+        assert_eq!(
+            fs.superblock.read().free_inodes_count,
+            expected_free,
+            "superblock free_inodes_count"
+        );
+        assert_eq!(
+            fs.group_descs.read()[0].free_inodes_count as u32,
+            expected_free,
+            "group desc free_inodes_count"
+        );
+        assert_eq!(
+            fs.inode_is_allocated(NEW_INO).expect("bitmap check"),
+            created,
+            "inode {} allocation bit",
+            NEW_INO
+        );
+        let root = fs.root_inode();
+        match fs.lookup(&root, "newfile") {
+            Ok(inode) => {
+                assert!(created, "lookup must fail when create was rolled back");
+                let stat = inode.stat().expect("stat created inode");
+                assert!(stat.mode.is_file(), "created inode is a regular file");
+                assert_eq!(stat.mode.to_raw() & 0o7777, 0o600, "created inode perms");
+                assert_eq!(stat.size, 0, "created inode size");
+                assert_eq!(stat.nlink, 1, "created inode nlink");
+            }
+            Err(FsError::NotFound) => {
+                assert!(!created, "lookup must succeed when create was replayed");
+            }
+            Err(e) => panic!("unexpected lookup error: {:?}", e),
+        }
+    }
+
+    // Scenario A: happy path — create commits and is immediately visible.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 0))
+            .expect("happy-path device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount happy-path image");
+        let root = fs.root_inode();
+        let new_inode = fs
+            .create(&root, "newfile", FileMode::regular(0o600))
+            .expect("create happy path");
+        assert!(Arc::ptr_eq(&new_inode, &fs.lookup(&root, "newfile").expect("lookup")));
+        assert_state(&fs, true);
+        klog_always!("    Ext2Fs::create happy-path + 6-block commit passed");
+    }
+
+    // Scenario B: crash before the commit block is durable → all-or-nothing.
+    // The commit-block write is op 12 (the CrashBlockDevice counter shifts by
+    // one); failing there leaves the journal with descriptor + images but no
+    // commit, so recovery finds no authoritative transaction and leaves the fs
+    // unchanged.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 12))
+            .expect("crash-before-commit device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount crash-before-commit image");
+        let root = fs.root_inode();
+        assert!(
+            fs.create(&root, "newfile", FileMode::regular(0o600)).is_err(),
+            "create must fail when the commit write crashes"
+        );
+        drop(root);
+        drop(fs);
+        let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+            .expect("remount device");
+        let dev2_dyn: Arc<dyn BlockDevice> = dev2;
+        let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after crash-before-commit");
+        assert_state(&fs2, false);
+        klog_always!("    Ext2Fs::create crash-before-commit rollback passed");
+    }
+
+    // Scenario C: crash after the commit is durable but before checkpoint →
+    // recovery replays the full create.  The CrashBlockDevice counter shifts by
+    // one (fetch_update returns the new value), so the commit-block write is op
+    // 12, its flush op 13, and the first checkpoint home-block write op 14.
+    // Failing at op 14 (used here as 15 to clear the +1 shift and land on the
+    // first checkpoint write) leaves the commit durable, so recovery validates
+    // and replays the 6-block transaction.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 15))
+            .expect("crash-after-commit device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount crash-after-commit image");
+        let root = fs.root_inode();
+        assert!(
+            fs.create(&root, "newfile", FileMode::regular(0o600)).is_err(),
+            "create must fail when the checkpoint write crashes (committed + poison)"
+        );
+        drop(root);
+        drop(fs);
+        let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+            .expect("remount device");
+        let dev2_dyn: Arc<dyn BlockDevice> = dev2;
+        let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after crash-after-commit");
+        assert_state(&fs2, true);
+        klog_always!("    Ext2Fs::create crash-after-commit replay passed");
+    }
+
+    // Scenario D: coalesced 5-home path.  A subdirectory "sub" at ino 12
+    // (inode-table block 6) is the parent; the first free inode is 11 (also
+    // block 6), so new+parent share one inode-table block and the FileCreate
+    // plan coalesces their edits into a single CoalescedInode home (count 5,
+    // not 6).  This exercises the arm of build_metadata_image /
+    // metadata_preimage_hash / validate_recovery_file_create that applies and
+    // reverses BOTH the new-inode zero+init and the parent mtime/ctime update
+    // on one block — the path Scenarios A-C (6-home) do not touch.
+    fn build_coalesced_image() -> Vec<u8> {
+        let mut image = Vec::new();
+        image.resize(BLOCKS * BLOCK_SIZE, 0u8);
+        let uuid = [0x5Au8; 16];
+        let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
+        sb.inodes_count = 16;
+        sb.blocks_count = BLOCKS as u32;
+        sb.free_blocks_count = 11; // 12 minus the sub-dir data block (21)
+        sb.free_inodes_count = 5; // 11, 13-16 (ino 12 is the sub dir)
+        sb.first_data_block = 1;
+        sb.blocks_per_group = BLOCKS as u32;
+        sb.frags_per_group = BLOCKS as u32;
+        sb.inodes_per_group = 16;
+        sb.magic = EXT2_SUPER_MAGIC;
+        sb.state = 1;
+        sb.rev_level = 1;
+        sb.first_ino = 11;
+        sb.inode_size = size_of::<Ext2InodeRaw>() as u16;
+        sb.feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
+        sb.feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+        sb.feature_ro_compat = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
+        sb.uuid = [0xA5; 16];
+        sb.journal_uuid = uuid;
+        sb.journal_inum = JOURNAL_INO;
+        put(&mut image, SUPERBLOCK_OFFSET as usize, &sb);
+
+        let desc = Ext2GroupDesc {
+            block_bitmap: 3,
+            inode_bitmap: 4,
+            inode_table: 5,
+            free_blocks_count: 11,
+            free_inodes_count: 5,
+            used_dirs_count: 2, // root + sub
+            ..Ext2GroupDesc::default()
+        };
+        put(&mut image, 2 * BLOCK_SIZE, &desc);
+
+        // Block bitmap (block 3): blocks 1..FIRST_FREE_BLOCK + block 21.
+        // Bitmap bit for block N is (N - first_data_block); first_data_block=1.
+        for b in 1..FIRST_FREE_BLOCK {
+            let bit = (b - 1) as usize;
+            image[3 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+        let sub_block_bit = (21 - 1) as usize;
+        image[3 * BLOCK_SIZE + sub_block_bit / 8] |= 1u8 << (sub_block_bit % 8);
+        // Inode bitmap (block 4): inodes 1..=10 + ino 12 allocated.
+        for ino in 1..=10u32 {
+            let bit = (ino - 1) as usize;
+            image[4 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+        image[4 * BLOCK_SIZE + (11 / 8) as usize] |= 1u8 << (11 % 8); // ino 12 = bit 11
+
+        // Root inode (ino 2) at block 5, index 1.
+        let mut root = Ext2InodeRaw::default();
+        root.mode = EXT2_S_IFDIR | 0o755;
+        root.size_lo = BLOCK_SIZE as u32;
+        root.links_count = 3; // ".", "..", "sub"
+        root.blocks_lo = 2;
+        root.block[0] = 7;
+        put(&mut image, 5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(), &root);
+
+        // Sub-directory inode (ino 12) at block 6, index 11 (offset 384).
+        let mut sub = Ext2InodeRaw::default();
+        sub.mode = EXT2_S_IFDIR | 0o755;
+        sub.size_lo = BLOCK_SIZE as u32;
+        sub.links_count = 2;
+        sub.blocks_lo = 2;
+        sub.block[0] = 21;
+        put(&mut image, 6 * BLOCK_SIZE + 3 * size_of::<Ext2InodeRaw>(), &sub);
+
+        // Root directory data block (block 7): ".", "..", "sub".
+        let dir = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        dir[0..4].copy_from_slice(&2u32.to_le_bytes()); // "." -> root
+        dir[4..6].copy_from_slice(&12u16.to_le_bytes());
+        dir[6] = 1;
+        dir[7] = EXT2_FT_DIR;
+        dir[8] = b'.';
+        dir[12..16].copy_from_slice(&2u32.to_le_bytes()); // ".." -> root
+        dir[16..18].copy_from_slice(&12u16.to_le_bytes());
+        dir[18] = 2;
+        dir[19] = EXT2_FT_DIR;
+        dir[20] = b'.';
+        dir[21] = b'.';
+        dir[24..28].copy_from_slice(&12u32.to_le_bytes()); // "sub" -> ino 12
+        dir[28..30].copy_from_slice(&((BLOCK_SIZE - 24) as u16).to_le_bytes());
+        dir[30] = 3;
+        dir[31] = EXT2_FT_DIR;
+        dir[32] = b's';
+        dir[33] = b'u';
+        dir[34] = b'b';
+
+        // Sub-directory data block (block 21): ".", "..".
+        let subdir = &mut image[21 * BLOCK_SIZE..22 * BLOCK_SIZE];
+        subdir[0..4].copy_from_slice(&12u32.to_le_bytes()); // "." -> sub
+        subdir[4..6].copy_from_slice(&12u16.to_le_bytes());
+        subdir[6] = 1;
+        subdir[7] = EXT2_FT_DIR;
+        subdir[8] = b'.';
+        subdir[12..16].copy_from_slice(&2u32.to_le_bytes()); // ".." -> root
+        subdir[16..18].copy_from_slice(&((BLOCK_SIZE - 12) as u16).to_le_bytes());
+        subdir[18] = 2;
+        subdir[19] = EXT2_FT_DIR;
+        subdir[20] = b'.';
+        subdir[21] = b'.';
+
+        // Journal inode + superblock (same as build_image).
+        let mut jin = Ext2InodeRaw::default();
+        jin.mode = EXT2_S_IFREG | 0o600;
+        jin.size_lo = (JOURNAL_MAXLEN as usize * BLOCK_SIZE) as u32;
+        jin.blocks_lo = (JOURNAL_MAXLEN as usize * 2) as u32;
+        for i in 0..JOURNAL_MAXLEN as usize {
+            jin.block[i] = JOURNAL_FIRST_PHYS + i as u32;
+        }
+        put(&mut image, 5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(), &jin);
+        let jsuper = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
+            ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
+        write_be_u32(jsuper, 0, JBD2_MAGIC).expect("journal magic");
+        write_be_u32(jsuper, 4, JBD2_SUPERBLOCK_V2).expect("journal type");
+        write_be_u32(jsuper, JBD2_SUPER_BLOCKSIZE_OFFSET, BLOCK_SIZE as u32).expect("blocksize");
+        write_be_u32(jsuper, JBD2_SUPER_MAXLEN_OFFSET, JOURNAL_MAXLEN).expect("maxlen");
+        write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
+        write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
+        write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
+        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
+            .expect("features");
+        jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
+        write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
+        image
+    }
+
+    // D.1: coalesced happy path — create under "sub", new inode 11 shares
+    // block 6 with the parent (ino 12), so the plan is 5-home coalesced.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_coalesced_image(), 0))
+            .expect("coalesced happy-path device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount coalesced image");
+        let root = fs.root_inode();
+        let sub = fs.lookup(&root, "sub").expect("lookup sub");
+        assert!(sub.is_dir(), "sub is a directory");
+        let new_inode = fs
+            .create(&sub, "newfile", FileMode::regular(0o600))
+            .expect("coalesced create");
+        assert_eq!(new_inode.ino(), NEW_INO as u64, "new inode is 11");
+        // New inode (11) and parent (12) both resolve to block 6 → coalesced.
+        assert_eq!(
+            fs.inode_write_target(NEW_INO).expect("new target").block,
+            fs.inode_write_target(12).expect("parent target").block,
+            "coalesced: new+parent share one inode-table block"
+        );
+        assert_eq!(fs.superblock.read().free_inodes_count, 4, "free count 5->4");
+        assert_eq!(
+            fs.group_descs.read()[0].free_inodes_count as u32,
+            4,
+            "group free count 5->4"
+        );
+        assert!(fs.inode_is_allocated(NEW_INO).expect("alloc check"), "bit set");
+        let resolved = fs.lookup(&sub, "newfile").expect("lookup newfile under sub");
+        assert!(Arc::ptr_eq(&resolved, &new_inode), "cache-canonical Arc");
+        let stat = resolved.stat().expect("stat");
+        assert!(stat.mode.is_file(), "regular file");
+        assert_eq!(stat.mode.to_raw() & 0o7777, 0o600);
+        assert_eq!(stat.size, 0);
+        assert_eq!(stat.nlink, 1);
+        klog_always!("    Ext2Fs::create coalesced 5-home happy path passed");
+    }
+
+    // D.2: coalesced crash-after-commit replay — the CoalescedInode recovery
+    // arm must reverse both the new-inode zero+init and the parent restore.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_coalesced_image(), 15))
+            .expect("coalesced crash-after-commit device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount coalesced crash image");
+        let root = fs.root_inode();
+        let sub = fs.lookup(&root, "sub").expect("lookup sub");
+        assert!(
+            fs.create(&sub, "newfile", FileMode::regular(0o600)).is_err(),
+            "coalesced create must fail when the checkpoint write crashes"
+        );
+        drop(sub);
+        drop(root);
+        drop(fs);
+        let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+            .expect("remount device");
+        let dev2_dyn: Arc<dyn BlockDevice> = dev2;
+        let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after coalesced crash");
+        let root2 = fs2.root_inode();
+        let sub2 = fs2.lookup(&root2, "sub").expect("lookup sub after replay");
+        let nf = fs2.lookup(&sub2, "newfile").expect("lookup newfile after replay");
+        assert_eq!(nf.ino(), NEW_INO as u64);
+        assert_eq!(fs2.superblock.read().free_inodes_count, 4);
+        assert!(fs2.inode_is_allocated(NEW_INO).expect("alloc check"));
+        let stat = nf.stat().expect("stat");
+        assert!(stat.mode.is_file());
+        assert_eq!(stat.nlink, 1);
+        klog_always!("    Ext2Fs::create coalesced 5-home crash replay passed");
+    }
+
+    // ---- Ext2Fs::rename (same-directory, regular-file, NOREPLACE) ----
+    // Build an image with a pre-existing regular file "oldfile" at ino 11,
+    // allocated and linked as the last dirent in the root dir block (so the
+    // dir-data home is the parent's last direct block, matching recovery's
+    // re-derivation).
+    fn build_rename_image() -> Vec<u8> {
+        let mut image = Vec::new();
+        image.resize(BLOCKS * BLOCK_SIZE, 0u8);
+        let uuid = [0x5Au8; 16];
+        let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
+        sb.inodes_count = 16;
+        sb.blocks_count = BLOCKS as u32;
+        sb.free_blocks_count = 12;
+        sb.free_inodes_count = 5; // 1..=11 allocated
+        sb.first_data_block = 1;
+        sb.blocks_per_group = BLOCKS as u32;
+        sb.frags_per_group = BLOCKS as u32;
+        sb.inodes_per_group = 16;
+        sb.magic = EXT2_SUPER_MAGIC;
+        sb.state = 1;
+        sb.rev_level = 1;
+        sb.first_ino = 11;
+        sb.inode_size = size_of::<Ext2InodeRaw>() as u16;
+        sb.feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
+        sb.feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+        sb.feature_ro_compat = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
+        sb.uuid = [0xA5; 16];
+        sb.journal_uuid = uuid;
+        sb.journal_inum = JOURNAL_INO;
+        put(&mut image, SUPERBLOCK_OFFSET as usize, &sb);
+
+        let desc = Ext2GroupDesc {
+            block_bitmap: 3,
+            inode_bitmap: 4,
+            inode_table: 5,
+            free_blocks_count: 12,
+            free_inodes_count: 5,
+            used_dirs_count: 1,
+            ..Ext2GroupDesc::default()
+        };
+        put(&mut image, 2 * BLOCK_SIZE, &desc);
+
+        for b in 1..FIRST_FREE_BLOCK {
+            let bit = (b - 1) as usize;
+            image[3 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+        // Inode bitmap: inodes 1..=11 allocated (add bit 10 for ino 11).
+        for ino in 1..=10u32 {
+            let bit = (ino - 1) as usize;
+            image[4 * BLOCK_SIZE + bit / 8] |= 1u8 << (bit % 8);
+        }
+        image[4 * BLOCK_SIZE + (10 / 8) as usize] |= 1u8 << (10 % 8);
+
+        // Root inode (ino 2) at block 5, index 1.
+        let mut root = Ext2InodeRaw::default();
+        root.mode = EXT2_S_IFDIR | 0o755;
+        root.size_lo = BLOCK_SIZE as u32;
+        root.links_count = 2;
+        root.blocks_lo = 2;
+        root.block[0] = 7;
+        put(&mut image, 5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(), &root);
+
+        // "oldfile" inode (ino 11): table-relative offset (11-1)*128 from the
+        // inode table start (block 5) → lands in block 6 at offset 256.
+        let mut oldfile = Ext2InodeRaw::default();
+        oldfile.mode = EXT2_S_IFREG | 0o600;
+        oldfile.links_count = 1;
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + 10 * size_of::<Ext2InodeRaw>(),
+            &oldfile,
+        );
+
+        // Root dir block (block 7): "." (rec_len 12), ".." (rec_len 12),
+        // "oldfile" (rec_len = block_size - 24, extends to block end).
+        let dir = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        dir[0..4].copy_from_slice(&2u32.to_le_bytes());
+        dir[4..6].copy_from_slice(&12u16.to_le_bytes());
+        dir[6] = 1;
+        dir[7] = EXT2_FT_DIR;
+        dir[8] = b'.';
+        dir[12..16].copy_from_slice(&2u32.to_le_bytes());
+        dir[16..18].copy_from_slice(&12u16.to_le_bytes());
+        dir[18] = 2;
+        dir[19] = EXT2_FT_DIR;
+        dir[20] = b'.';
+        dir[21] = b'.';
+        let old_rec_len = (BLOCK_SIZE - 24) as u16;
+        dir[24..28].copy_from_slice(&11u32.to_le_bytes()); // oldfile -> ino 11
+        dir[28..30].copy_from_slice(&old_rec_len.to_le_bytes());
+        dir[30] = 7; // "oldfile" length
+        dir[31] = EXT2_FT_REG_FILE;
+        dir[32] = b'o';
+        dir[33] = b'l';
+        dir[34] = b'd';
+        dir[35] = b'f';
+        dir[36] = b'i';
+        dir[37] = b'l';
+        dir[38] = b'e';
+
+        // Journal inode + superblock (same as build_image).
+        let mut jin = Ext2InodeRaw::default();
+        jin.mode = EXT2_S_IFREG | 0o600;
+        jin.size_lo = (JOURNAL_MAXLEN as usize * BLOCK_SIZE) as u32;
+        jin.blocks_lo = (JOURNAL_MAXLEN as usize * 2) as u32;
+        for i in 0..JOURNAL_MAXLEN as usize {
+            jin.block[i] = JOURNAL_FIRST_PHYS + i as u32;
+        }
+        put(&mut image, 5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(), &jin);
+        let jsuper = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
+            ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
+        write_be_u32(jsuper, 0, JBD2_MAGIC).expect("journal magic");
+        write_be_u32(jsuper, 4, JBD2_SUPERBLOCK_V2).expect("journal type");
+        write_be_u32(jsuper, JBD2_SUPER_BLOCKSIZE_OFFSET, BLOCK_SIZE as u32).expect("blocksize");
+        write_be_u32(jsuper, JBD2_SUPER_MAXLEN_OFFSET, JOURNAL_MAXLEN).expect("maxlen");
+        write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
+        write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
+        write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
+        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
+            .expect("features");
+        jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
+        write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
+        image
+    }
+
+    fn assert_rename_state(fs: &Arc<Ext2Fs>, renamed: bool) {
+        let root = fs.root_inode();
+        match fs.lookup(&root, "newfile") {
+            Ok(inode) => {
+                assert!(renamed, "newfile must be absent when rename rolled back");
+                assert_eq!(inode.ino(), NEW_INO as u64, "newfile resolves to ino 11");
+            }
+            Err(FsError::NotFound) => {
+                assert!(!renamed, "newfile must be present when rename replayed");
+            }
+            Err(e) => panic!("unexpected newfile lookup: {:?}", e),
+        }
+        match fs.lookup(&root, "oldfile") {
+            Ok(_) => assert!(!renamed, "oldfile must be gone after rename"),
+            Err(FsError::NotFound) => assert!(renamed, "oldfile must remain when rolled back"),
+            Err(e) => panic!("unexpected oldfile lookup: {:?}", e),
+        }
+        // The inode (11) remains allocated either way (rename doesn't free it).
+        assert!(
+            fs.inode_is_allocated(NEW_INO).expect("alloc check"),
+            "ino 11 stays allocated across rename/rollback"
+        );
+    }
+
+    // Scenario E: rename happy path — "oldfile" → "newfile" in place.
+    {
+        let device =
+            Arc::try_new(CreateCrashDevice::new(build_rename_image(), 0)).expect("rename device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount rename image");
+        let root = fs.root_inode();
+        let old = fs.lookup(&root, "oldfile").expect("oldfile exists");
+        assert_eq!(old.ino(), NEW_INO as u64);
+        fs.rename(
+            &root,
+            "oldfile",
+            &root,
+            "newfile",
+            true,
+            NEW_INO as u64,
+            None,
+        )
+        .expect("rename happy path");
+        let new = fs.lookup(&root, "newfile").expect("newfile exists after rename");
+        assert_eq!(new.ino(), NEW_INO as u64, "newfile is the same inode");
+        assert!(matches!(fs.lookup(&root, "oldfile"), Err(FsError::NotFound)));
+        assert!(Arc::ptr_eq(&old, &new), "cache-canonical Arc unchanged");
+        // NOREPLACE: renaming onto an existing name must fail.
+        assert!(fs
+            .rename(&root, "newfile", &root, "newfile", true, NEW_INO as u64, None)
+            .is_err());
+        klog_always!("    Ext2Fs::rename happy path passed");
+    }
+
+    // Scenario F: crash after the rename commit is durable but before
+    // checkpoint → recovery replays the rename.  The CrashBlockDevice op
+    // counter (fetch_update returns the new value) makes the commit write +
+    // its flush land at op 10 for the 2-home rename tx; the first checkpoint
+    // home write is op 11.  Failing at op 11 leaves the commit durable.
+    {
+        let device =
+            Arc::try_new(CreateCrashDevice::new(build_rename_image(), 11)).expect("rename crash device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        let fs = Ext2Fs::mount(dev).expect("mount rename crash image");
+        let root = fs.root_inode();
+        assert!(
+            fs.rename(&root, "oldfile", &root, "newfile", true, NEW_INO as u64, None).is_err(),
+            "rename must fail when the checkpoint write crashes"
+        );
+        drop(root);
+        drop(fs);
+        let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+            .expect("remount device");
+        let dev2_dyn: Arc<dyn BlockDevice> = dev2;
+        let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after rename crash");
+        assert_rename_state(&fs2, true);
+        klog_always!("    Ext2Fs::rename crash-after-commit replay passed");
+    }
 }
 
 /// Ext2 filesystem instance
@@ -5214,7 +6140,12 @@ impl Ext2Fs {
         journal: &Ext2Journal,
         overlay: &mut [JournalOverlayEntry],
     ) -> Result<Vec<u8>, FsError> {
-        if !overlay.is_empty() && overlay.len() != 1 && overlay.len() != JOURNAL_MAX_METADATA_BLOCKS
+        if !overlay.is_empty()
+            && overlay.len() != 1
+            && overlay.len() != 2
+            && overlay.len() != DIRECT_ALLOCATION_METADATA_BLOCKS
+            && overlay.len() != 5
+            && overlay.len() != 6
         {
             return Err(FsError::NotSupported);
         }
@@ -5924,7 +6855,10 @@ impl Ext2Fs {
         }
         let intent = intent.ok_or(FsError::Invalid)?;
         if overlay.len() != usize::from(intent.metadata_count)
-            || (overlay.len() != 1 && overlay.len() != JOURNAL_MAX_METADATA_BLOCKS)
+            || !matches!(
+                overlay.len(),
+                1 | DIRECT_ALLOCATION_METADATA_BLOCKS | 2 | 5 | 6
+            )
             || post_images.len()
                 != overlay
                     .len()
@@ -5947,6 +6881,13 @@ impl Ext2Fs {
             if entry.flags & !JBD2_FLAG_ESCAPE != expected {
                 return Err(FsError::NotSupported);
             }
+        }
+
+        if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
+            return self.validate_recovery_file_create(intent, overlay, post_images);
+        }
+        if intent.kind == ZERO_INTENT_KIND_FILE_RENAME {
+            return self.validate_recovery_rename(intent, overlay, post_images);
         }
 
         let inode_target = self.inode_write_target(intent.inode_number)?;
@@ -5996,7 +6937,7 @@ impl Ext2Fs {
                 Self::replace_inode_in_block(pre, inode_target, &intent.old_inode)?;
             }
             ZERO_INTENT_KIND_DIRECT_ALLOCATION => {
-                if overlay.len() != JOURNAL_MAX_METADATA_BLOCKS {
+                if overlay.len() != DIRECT_ALLOCATION_METADATA_BLOCKS {
                     return Err(FsError::NotSupported);
                 }
                 let sb = *self.superblock.read();
@@ -6020,7 +6961,7 @@ impl Ext2Fs {
                     self.superblock_home_target().0,
                     inode_target.block,
                 ];
-                for order in 0..JOURNAL_MAX_METADATA_BLOCKS {
+                for order in 0..DIRECT_ALLOCATION_METADATA_BLOCKS {
                     let entry = overlay
                         .iter()
                         .find(|entry| entry.order as usize == order)
@@ -6137,6 +7078,336 @@ impl Ext2Fs {
         Ok(pre_images)
     }
 
+    /// Recovery-side validation + preimage reconstruction for a FileCreate
+    /// transaction.  Re-derives the home set from `intent` (new_ino, parent_ino,
+    /// old parent inode) + filesystem geometry, validates the overlay matches
+    /// the expected ordered homes, reverses each edit on a copy of the
+    /// post-images, and verifies every preimage hash.  This is the exact inverse
+    /// of `build_metadata_image`'s FileCreate arm and must match
+    /// `metadata_preimage_hash`'s FileCreate arm byte-for-byte (verified by the
+    /// 5/6-block FileCreate round-trip self-test).
+    fn validate_recovery_file_create(
+        &self,
+        intent: &JournalCommitIntent,
+        overlay: &[JournalOverlayEntry],
+        post_images: &[u8],
+    ) -> Result<Vec<u8>, FsError> {
+        let new_ino = intent.new_ino;
+        let parent_ino = intent.parent_ino;
+        if new_ino == 0 || parent_ino == 0 {
+            return Err(FsError::NotSupported);
+        }
+        let new_target = self.inode_write_target(new_ino)?;
+        let parent_target = self.inode_write_target(parent_ino)?;
+        let coalesced = new_target.block == parent_target.block;
+        let expected_count = if coalesced { 5 } else { 6 };
+        if overlay.len() != expected_count {
+            return Err(FsError::NotSupported);
+        }
+        let (new_group, new_index) = self.inode_group_index(new_ino);
+        let (bitmap_block, group_desc_target) = {
+            let descs = self.group_descs.read();
+            let desc = descs.get(new_group).copied().ok_or(FsError::Invalid)?;
+            (desc.inode_bitmap, self.group_desc_write_target(new_group)?)
+        };
+        if bitmap_block == 0 || bitmap_block >= self.blocks_count {
+            return Err(FsError::NotSupported);
+        }
+        let bitmap_byte = new_index / 8;
+        let bitmap_mask = 1u8 << (new_index % 8);
+        let super_home = self.superblock_home_target();
+        // Parent directory's last data block: the highest non-zero direct block
+        // pointer of the parent inode (block array unchanged in Case A, so the
+        // old and new parent inodes agree).
+        let mut dir_block = 0u32;
+        for index in 0..EXT2_NDIR_BLOCKS {
+            if intent.old_inode.block[index] != 0 {
+                dir_block = intent.old_inode.block[index];
+            }
+        }
+        if dir_block == 0 {
+            return Err(FsError::NotSupported);
+        }
+        let expected_home = |role: FileCreateHomeRole| -> u32 {
+            match role {
+                FileCreateHomeRole::Bitmap => bitmap_block,
+                FileCreateHomeRole::GroupDesc => group_desc_target.block,
+                FileCreateHomeRole::Superblock => super_home.0,
+                FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                    new_target.block
+                }
+                FileCreateHomeRole::ParentInode => parent_target.block,
+                FileCreateHomeRole::DirData => dir_block,
+            }
+        };
+        // Validate each overlay entry's home matches its role (ordered by the
+        // commit-time index `entry.order`).
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            let role = file_create_role(coalesced, order).ok_or(FsError::Invalid)?;
+            if entry.home != expected_home(role) {
+                return Err(FsError::NotSupported);
+            }
+        }
+        // Distinct-home invariant (defense-in-depth): no two roles share a block.
+        for a in 0..expected_count {
+            for b in (a + 1)..expected_count {
+                let ra = file_create_role(coalesced, a).ok_or(FsError::Invalid)?;
+                let rb = file_create_role(coalesced, b).ok_or(FsError::Invalid)?;
+                if expected_home(ra) == expected_home(rb) {
+                    return Err(FsError::NotSupported);
+                }
+            }
+        }
+
+        let mut pre_images = Vec::new();
+        pre_images
+            .try_reserve_exact(post_images.len())
+            .map_err(|_| FsError::NoMem)?;
+        pre_images.extend_from_slice(post_images);
+
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            let role = file_create_role(coalesced, order).ok_or(FsError::Invalid)?;
+            let image_end = entry
+                .image_offset
+                .checked_add(self.block_size as usize)
+                .ok_or(FsError::Invalid)?;
+            let image = pre_images
+                .get_mut(entry.image_offset..image_end)
+                .ok_or(FsError::Invalid)?;
+            match role {
+                FileCreateHomeRole::Bitmap => {
+                    let byte = image.get_mut(bitmap_byte).ok_or(FsError::Invalid)?;
+                    *byte &= !bitmap_mask;
+                }
+                FileCreateHomeRole::GroupDesc => {
+                    let off = group_desc_target
+                        .offset
+                        .checked_add(core::mem::offset_of!(Ext2GroupDesc, free_inodes_count))
+                        .ok_or(FsError::Invalid)?;
+                    let after = u16::from_le_bytes(
+                        image
+                            .get(off..off.checked_add(2).ok_or(FsError::Invalid)?)
+                            .ok_or(FsError::Invalid)?
+                            .try_into()
+                            .map_err(|_| FsError::Invalid)?,
+                    );
+                    let before = after.checked_add(1).ok_or(FsError::Invalid)?;
+                    image[off..off + 2].copy_from_slice(&before.to_le_bytes());
+                }
+                FileCreateHomeRole::Superblock => {
+                    let off = super_home
+                        .1
+                        .checked_add(core::mem::offset_of!(Ext2Superblock, free_inodes_count))
+                        .ok_or(FsError::Invalid)?;
+                    let after = u32::from_le_bytes(
+                        image
+                            .get(off..off.checked_add(4).ok_or(FsError::Invalid)?)
+                            .ok_or(FsError::Invalid)?
+                            .try_into()
+                            .map_err(|_| FsError::Invalid)?,
+                    );
+                    let before = after.checked_add(1).ok_or(FsError::Invalid)?;
+                    image[off..off + 4].copy_from_slice(&before.to_le_bytes());
+                }
+                FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                    // Pre-image slot was all zero (all-zero-slot gate at create).
+                    let start = new_target.start;
+                    let slot_end = start
+                        .checked_add(self.inode_size as usize)
+                        .ok_or(FsError::Invalid)?;
+                    image.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                    if role == FileCreateHomeRole::CoalescedInode {
+                        Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
+                    }
+                }
+                FileCreateHomeRole::ParentInode => {
+                    Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
+                }
+                FileCreateHomeRole::DirData => {
+                    Self::reverse_file_create_dir_data(image, new_ino, self.block_size as usize)?;
+                }
+            }
+        }
+
+        // Verify every preimage hash, indexed by commit-time order.
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            let image_end = entry
+                .image_offset
+                .checked_add(self.block_size as usize)
+                .ok_or(FsError::Invalid)?;
+            let image = pre_images
+                .get(entry.image_offset..image_end)
+                .ok_or(FsError::Invalid)?;
+            if Sha256::digest(image) != intent.preimage_hashes[order] {
+                return Err(FsError::Invalid);
+            }
+        }
+        Ok(pre_images)
+    }
+
+    /// Reverse a FileCreate directory-data edit: the new dirent (the entry whose
+    /// inode == `new_ino`) was carved from the former-last entry's `rec_len`
+    /// tail.  Restore the former-last entry's original `rec_len` (= its shrunk
+    /// `rec_len` + the new entry's `rec_len`) and zero the new entry's slot.
+    fn reverse_file_create_dir_data(
+        image: &mut [u8],
+        new_ino: u32,
+        block_size: usize,
+    ) -> Result<(), FsError> {
+        let head_size = size_of::<Ext2DirEntryHead>();
+        let mut off = 0usize;
+        let mut prev_off: Option<usize> = None;
+        while off < block_size
+            && off.checked_add(head_size).map_or(false, |end| end <= block_size)
+        {
+            let head: Ext2DirEntryHead =
+                unsafe { core::ptr::read_unaligned(image[off..].as_ptr() as *const _) };
+            let rec_len = usize::from(head.rec_len);
+            if rec_len < head_size || off.checked_add(rec_len).map_or(true, |end| end > block_size) {
+                return Err(FsError::Invalid);
+            }
+            if head.inode == new_ino {
+                let last_off = prev_off.ok_or(FsError::Invalid)?;
+                let rl_start = last_off.checked_add(4).ok_or(FsError::Invalid)?;
+                let rl_end = last_off.checked_add(6).ok_or(FsError::Invalid)?;
+                let minimal_rec_len = u16::from_le_bytes(
+                    image
+                        .get(rl_start..rl_end)
+                        .ok_or(FsError::Invalid)?
+                        .try_into()
+                        .map_err(|_| FsError::Invalid)?,
+                );
+                let old_rec_len = minimal_rec_len
+                    .checked_add(head.rec_len)
+                    .ok_or(FsError::Invalid)?;
+                image
+                    .get_mut(rl_start..rl_end)
+                    .ok_or(FsError::Invalid)?
+                    .copy_from_slice(&old_rec_len.to_le_bytes());
+                let new_end = off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+                image.get_mut(off..new_end).ok_or(FsError::Invalid)?.fill(0);
+                return Ok(());
+            }
+            prev_off = Some(off);
+            off = off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+        }
+        Err(FsError::Invalid)
+    }
+
+    /// Recovery-side validation + preimage reconstruction for a FileRename
+    /// transaction (2 homes: dir data at order 0, parent inode at order 1).
+    /// Re-derives the homes from `intent` (parent inode target + the parent's
+    /// last non-zero direct block), validates the overlay matches, reverses
+    /// each edit, and verifies the preimage hashes.  Exact inverse of
+    /// `metadata_preimage_hash`'s Rename arm (verified by the rename round-trip
+    /// self-test).
+    fn validate_recovery_rename(
+        &self,
+        intent: &JournalCommitIntent,
+        overlay: &[JournalOverlayEntry],
+        post_images: &[u8],
+    ) -> Result<Vec<u8>, FsError> {
+        let parent_ino = intent.inode_number;
+        if parent_ino == 0 {
+            return Err(FsError::NotSupported);
+        }
+        let parent_target = self.inode_write_target(parent_ino)?;
+        // Dir-data home: the parent's last non-zero direct block (block array
+        // unchanged by rename, so old_inode agrees).
+        let mut dir_block = 0u32;
+        for i in 0..EXT2_NDIR_BLOCKS {
+            if intent.old_inode.block[i] != 0 {
+                dir_block = intent.old_inode.block[i];
+            }
+        }
+        if dir_block == 0 {
+            return Err(FsError::NotSupported);
+        }
+        if overlay.len() != 2 {
+            return Err(FsError::NotSupported);
+        }
+        let expected_homes = [dir_block, parent_target.block];
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            if order >= 2 {
+                return Err(FsError::Invalid);
+            }
+            if entry.home != expected_homes[order] {
+                return Err(FsError::NotSupported);
+            }
+        }
+        // Distinct-home invariant: dir data block != parent inode table block.
+        if expected_homes[0] == expected_homes[1] {
+            return Err(FsError::NotSupported);
+        }
+
+        let dir_off = usize::try_from(intent.rename_dir_off).map_err(|_| FsError::Invalid)?;
+        let rec_len = usize::from(intent.rename_rec_len);
+        let head_size = size_of::<Ext2DirEntryHead>();
+        if dir_off >= self.block_size as usize
+            || rec_len < head_size
+            || dir_off.checked_add(rec_len).map_or(true, |e| e > self.block_size as usize)
+        {
+            return Err(FsError::Invalid);
+        }
+
+        let mut pre_images = Vec::new();
+        pre_images
+            .try_reserve_exact(post_images.len())
+            .map_err(|_| FsError::NoMem)?;
+        pre_images.extend_from_slice(post_images);
+
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            let image_end = entry
+                .image_offset
+                .checked_add(self.block_size as usize)
+                .ok_or(FsError::Invalid)?;
+            let image = pre_images
+                .get_mut(entry.image_offset..image_end)
+                .ok_or(FsError::Invalid)?;
+            match order {
+                0 => {
+                    // Dir data: restore the old name at dir_off + zero the tail.
+                    // `slot` is image[dir_off..dir_off+rec_len]; index within it
+                    // is 0..rec_len, so the zero-tail end is `rec_len`, not the
+                    // absolute dir_off+rec_len.
+                    let slot_end = dir_off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+                    let slot = image.get_mut(dir_off..slot_end).ok_or(FsError::Invalid)?;
+                    slot[6] = intent.rename_old_name_len;
+                    let old_len = usize::from(intent.rename_old_name_len);
+                    let name_end = 8usize.checked_add(old_len).ok_or(FsError::Invalid)?;
+                    slot.get_mut(8..name_end)
+                        .ok_or(FsError::Invalid)?
+                        .copy_from_slice(&intent.rename_old_name[..old_len]);
+                    slot.get_mut(name_end..rec_len).ok_or(FsError::Invalid)?.fill(0);
+                }
+                1 => {
+                    Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
+                }
+                _ => return Err(FsError::Invalid),
+            }
+        }
+
+        for entry in overlay {
+            let order = usize::try_from(entry.order).map_err(|_| FsError::Invalid)?;
+            let image_end = entry
+                .image_offset
+                .checked_add(self.block_size as usize)
+                .ok_or(FsError::Invalid)?;
+            let image = pre_images
+                .get(entry.image_offset..image_end)
+                .ok_or(FsError::Invalid)?;
+            if Sha256::digest(image) != intent.preimage_hashes[order] {
+                return Err(FsError::Invalid);
+            }
+        }
+        Ok(pre_images)
+    }
+
     fn recovery_home_kind(
         &self,
         home: u32,
@@ -6179,6 +7450,9 @@ impl Ext2Fs {
         let desc = descs.get(group).copied().ok_or(FsError::Invalid)?;
         if home == desc.block_bitmap {
             return Ok(Some(RecoveryHomeKind::BlockBitmap(group)));
+        }
+        if home == desc.inode_bitmap {
+            return Ok(Some(RecoveryHomeKind::InodeBitmap(group)));
         }
         let inode_end = (desc.inode_table as u64)
             .checked_add(inode_table_blocks)
@@ -6379,7 +7653,8 @@ impl Ext2Fs {
                 Some(
                     RecoveryHomeKind::Superblock
                     | RecoveryHomeKind::GroupDescriptors
-                    | RecoveryHomeKind::InodeTable(_),
+                    | RecoveryHomeKind::InodeTable(_)
+                    | RecoveryHomeKind::InodeBitmap(_),
                 ) => {}
                 None => {
                     // RF180-13 FIX: this implementation never journals file
@@ -6387,6 +7662,31 @@ impl Ext2Fs {
                     // homes have no bounded ownership proof at mount, so they
                     // are not replayed speculatively.  Newly published mapping
                     // trees are instead validated from their inode roots below.
+                    //
+                    // FileCreate / FileRename exception: both journal the parent
+                    // directory's data block as a metadata home — the only non-
+                    // structural home for these intents (the inode bitmap, used
+                    // by FileCreate, is recognized via `RecoveryHomeKind::InodeBitmap`;
+                    // the parent inode, used by both, via `InodeTable`).  Allow
+                    // exactly that home for a FILE_CREATE or FILE_RENAME intent;
+                    // it is the highest non-zero direct block of the parent inode
+                    // (block array unchanged by Case-A create / in-place rename,
+                    // so intent.old_inode agrees).
+                    if let Some(intent) = intent {
+                        if intent.kind == ZERO_INTENT_KIND_FILE_CREATE
+                            || intent.kind == ZERO_INTENT_KIND_FILE_RENAME
+                        {
+                            let mut dir_block = 0u32;
+                            for i in 0..EXT2_NDIR_BLOCKS {
+                                if intent.old_inode.block[i] != 0 {
+                                    dir_block = intent.old_inode.block[i];
+                                }
+                            }
+                            if dir_block != 0 && entry.home == dir_block {
+                                continue;
+                            }
+                        }
+                    }
                     return Err(FsError::NotSupported);
                 }
             }
@@ -6518,11 +7818,16 @@ impl Ext2Fs {
                     .checked_sub(group_start)
                     .ok_or(FsError::Invalid)?,
             );
-            if desc.free_inodes_count != current_desc.free_inodes_count
+            // FileCreate journals the inode bitmap and decrements free_inodes_count
+            // (inode allocation); its preimage proof (validated in
+            // validate_recovery_grammar) binds the count to the bitmap, so the
+            // change is admissible for a FILE_CREATE intent.  used_dirs_count is
+            // unchanged by regular-file creation.  Other kinds never touch inode
+            // allocation, so any change remains unsupported.
+            let file_create = intent.is_some_and(|i| i.kind == ZERO_INTENT_KIND_FILE_CREATE);
+            if (desc.free_inodes_count != current_desc.free_inodes_count && !file_create)
                 || desc.used_dirs_count != current_desc.used_dirs_count
             {
-                // Inode allocation/deallocation is outside this driver's
-                // journal writer and would require inode-bitmap provenance.
                 return Err(FsError::NotSupported);
             }
             descriptor_free_total = descriptor_free_total
@@ -6869,24 +8174,91 @@ impl Ext2Fs {
         if block.len() < ZERO_INTENT_END
             || block[ZERO_INTENT_MAGIC_OFFSET..ZERO_INTENT_MAGIC_OFFSET + 4] != ZERO_INTENT_MAGIC
             || read_be_u16(block, ZERO_INTENT_VERSION_OFFSET)? != ZERO_INTENT_VERSION
-            || block[ZERO_INTENT_END..].iter().any(|byte| *byte != 0)
         {
             return Err(FsError::Invalid);
         }
         let kind = block[ZERO_INTENT_KIND_OFFSET];
         let metadata_count = block[ZERO_INTENT_COUNT_OFFSET];
+        // Kind-aware trailing-zero check.  FILE_CREATE stores new_ino/parent_ino
+        // in [ZERO_INTENT_END..ZERO_INTENT_FILE_CREATE_END); every other kind
+        // keeps the whole [ZERO_INTENT_END..] region zero, so its on-disk format
+        // is unchanged.
+        let trailing_ok = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+            block.len() >= ZERO_INTENT_FILE_CREATE_END
+                && block[ZERO_INTENT_FILE_CREATE_END..].iter().all(|b| *b == 0)
+        } else if kind == ZERO_INTENT_KIND_FILE_RENAME {
+            block.len() >= ZERO_INTENT_FILE_RENAME_END
+                && block[ZERO_INTENT_FILE_RENAME_END..].iter().all(|b| *b == 0)
+        } else {
+            block[ZERO_INTENT_END..].iter().all(|b| *b == 0)
+        };
+        if !trailing_ok {
+            return Err(FsError::Invalid);
+        }
         let inode_number = read_be_u32(block, ZERO_INTENT_INODE_OFFSET)?;
         let file_block = read_be_u32(block, ZERO_INTENT_FILE_BLOCK_OFFSET)?;
         let physical = read_be_u32(block, ZERO_INTENT_PHYSICAL_OFFSET)?;
+        let new_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+            read_be_u32(block, ZERO_INTENT_NEW_INO_OFFSET)?
+        } else {
+            0
+        };
+        let parent_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+            read_be_u32(block, ZERO_INTENT_PARENT_INO_OFFSET)?
+        } else {
+            0
+        };
+        let rename_dir_off = if kind == ZERO_INTENT_KIND_FILE_RENAME {
+            read_be_u32(block, ZERO_INTENT_RENAME_DIR_OFF_OFFSET)?
+        } else {
+            0
+        };
+        let rename_rec_len = if kind == ZERO_INTENT_KIND_FILE_RENAME {
+            u16::from_be_bytes([
+                block[ZERO_INTENT_RENAME_REC_LEN_OFFSET],
+                block[ZERO_INTENT_RENAME_REC_LEN_OFFSET + 1],
+            ])
+        } else {
+            0
+        };
+        let rename_old_name_len = if kind == ZERO_INTENT_KIND_FILE_RENAME {
+            block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET]
+        } else {
+            0
+        };
+        let mut rename_old_name = [0u8; 255];
+        if kind == ZERO_INTENT_KIND_FILE_RENAME {
+            rename_old_name.copy_from_slice(
+                &block[ZERO_INTENT_RENAME_OLD_NAME_OFFSET
+                    ..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255],
+            );
+        }
         let valid_update = kind == ZERO_INTENT_KIND_INODE_UPDATE
             && metadata_count == 1
             && file_block == u32::MAX
             && physical == 0;
         let valid_direct = kind == ZERO_INTENT_KIND_DIRECT_ALLOCATION
-            && metadata_count == JOURNAL_MAX_METADATA_BLOCKS as u8
+            && metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS as u8
             && file_block < EXT2_NDIR_BLOCKS as u32
             && physical != 0;
-        if inode_number == 0 || (!valid_update && !valid_direct) {
+        let valid_file_create = kind == ZERO_INTENT_KIND_FILE_CREATE
+            && (metadata_count == 5 || metadata_count == 6)
+            && file_block == u32::MAX
+            && physical == 0
+            && new_ino != 0
+            && parent_ino != 0
+            && inode_number == parent_ino;
+        let valid_file_rename = kind == ZERO_INTENT_KIND_FILE_RENAME
+            && metadata_count == 2
+            && file_block == u32::MAX
+            && physical == 0
+            && inode_number != 0
+            && rename_dir_off != u32::MAX
+            && rename_rec_len >= size_of::<Ext2DirEntryHead>() as u16
+            && rename_old_name_len > 0;
+        if inode_number == 0
+            || (!valid_update && !valid_direct && !valid_file_create && !valid_file_rename)
+        {
             return Err(FsError::Invalid);
         }
         let mut preimage_hashes = [[0u8; 32]; JOURNAL_MAX_METADATA_BLOCKS];
@@ -6894,8 +8266,10 @@ impl Ext2Fs {
             let start = ZERO_INTENT_PREIMAGE_HASHES_OFFSET + index * 32;
             digest.copy_from_slice(&block[start..start + 32]);
         }
-        if metadata_count == 1
-            && preimage_hashes[1..]
+        // Preimage-hash slots beyond `metadata_count` must be zero.
+        let count = usize::from(metadata_count);
+        if count < JOURNAL_MAX_METADATA_BLOCKS
+            && preimage_hashes[count..]
                 .iter()
                 .any(|digest| *digest != [0u8; 32])
         {
@@ -6915,6 +8289,12 @@ impl Ext2Fs {
             physical,
             preimage_hashes,
             old_inode,
+            new_ino,
+            parent_ino,
+            rename_dir_off,
+            rename_rec_len,
+            rename_old_name_len,
+            rename_old_name,
         })
     }
 
@@ -6942,7 +8322,12 @@ impl Ext2Fs {
         commit: &[u8],
         expected_count: u8,
     ) -> Result<Option<JournalRecoveryPlan>, FsError> {
-        if expected_count != 1 && expected_count != JOURNAL_MAX_METADATA_BLOCKS as u8 {
+        if expected_count != 1
+            && expected_count != 2
+            && expected_count != DIRECT_ALLOCATION_METADATA_BLOCKS as u8
+            && expected_count != 5
+            && expected_count != 6
+        {
             return Err(FsError::Invalid);
         }
         let Some(intent) = Self::commit_candidate(commit, journal.next_sequence, expected_count)
@@ -7107,7 +8492,7 @@ impl Ext2Fs {
         let mut one_commit = Ext2MutationScratch::try_new(self.block_size)?;
         self.read_journal_block(journal, journal.first, descriptor.block_mut())?;
         let raw_block_bytes = self.block_size as usize;
-        let raw_bytes = JOURNAL_MAX_METADATA_BLOCKS
+        let raw_bytes = DIRECT_ALLOCATION_METADATA_BLOCKS
             .checked_mul(raw_block_bytes)
             .ok_or(FsError::Invalid)?;
         let mut raw_images = Vec::new();
@@ -7140,8 +8525,41 @@ impl Ext2Fs {
             Err(error) => return Err(error),
         };
 
-        // The one-image form was not authoritative. Reuse its candidate block
-        // as post-image 1, then capture only the remaining four-image blocks.
+        // Read the block at first+3 ONCE: it is the two-image (FileRename)
+        // commit AND the four-image form's image[2].  Reusing it keeps the
+        // four-image read-count invariant (each logical block read once).
+        // Reading stays lazy: a one-image transaction returns above before
+        // this block is read.
+        let first_plus_3 = journal.first.checked_add(3).ok_or(FsError::Invalid)?;
+        let mut block_first_plus_3 = Ext2MutationScratch::try_new(self.block_size)?;
+        if first_plus_3 < journal.max_len {
+            self.read_journal_block(journal, first_plus_3, block_first_plus_3.block_mut())?;
+            // Try the two-image FileRename form: images are the already-read
+            // image0 (first+1) and the one-image commit block (first+2); its
+            // commit is at first+3.
+            let mut two_images = Vec::new();
+            two_images
+                .try_reserve_exact(2 * raw_block_bytes)
+                .map_err(|_| FsError::NoMem)?;
+            two_images.resize(2 * raw_block_bytes, 0);
+            two_images[..raw_block_bytes].copy_from_slice(&raw_images[..raw_block_bytes]);
+            two_images[raw_block_bytes..2 * raw_block_bytes].copy_from_slice(one_commit.block());
+            match self.plan_recovery_candidate(
+                journal,
+                descriptor.block(),
+                &two_images,
+                block_first_plus_3.block(),
+                2,
+            ) {
+                Ok(Some(plan)) => return Ok(Some(plan)),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        // The one- and two-image forms were not authoritative. Build the four-
+        // image set: image[1] = one_commit (first+2), image[2] = the already-
+        // read first+3 (reused), image[3] = read first+4, commit = first+5.
         raw_images
             .try_reserve_exact(
                 raw_bytes
@@ -7155,22 +8573,27 @@ impl Ext2Fs {
             .get_mut(raw_block_bytes..second_image_end)
             .ok_or(FsError::Invalid)?
             .copy_from_slice(one_commit.block());
-        for index in 2..JOURNAL_MAX_METADATA_BLOCKS {
-            let index_u32 = u32::try_from(index).map_err(|_| FsError::Invalid)?;
-            let logical = journal
-                .first
-                .checked_add(1)
-                .and_then(|value| value.checked_add(index_u32))
-                .filter(|value| *value < journal.max_len)
-                .ok_or(FsError::Invalid)?;
-            let start = index.checked_mul(raw_block_bytes).ok_or(FsError::Invalid)?;
-            let end = start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
-            self.read_journal_block(
-                journal,
-                logical,
-                raw_images.get_mut(start..end).ok_or(FsError::Invalid)?,
-            )?;
+        if first_plus_3 < journal.max_len {
+            let img2_start = raw_block_bytes.checked_mul(2).ok_or(FsError::Invalid)?;
+            let img2_end = img2_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+            raw_images
+                .get_mut(img2_start..img2_end)
+                .ok_or(FsError::Invalid)?
+                .copy_from_slice(block_first_plus_3.block());
         }
+        // image[3] = first+4.
+        let first_plus_4 = journal
+            .first
+            .checked_add(4)
+            .filter(|value| *value < journal.max_len)
+            .ok_or(FsError::Invalid)?;
+        let img3_start = raw_block_bytes.checked_mul(3).ok_or(FsError::Invalid)?;
+        let img3_end = img3_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+        self.read_journal_block(
+            journal,
+            first_plus_4,
+            raw_images.get_mut(img3_start..img3_end).ok_or(FsError::Invalid)?,
+        )?;
         let mut four_commit = Ext2MutationScratch::try_new(self.block_size)?;
         self.read_journal_block(journal, four_commit_logical, four_commit.block_mut())?;
         match self.plan_recovery_candidate(
@@ -7178,24 +8601,77 @@ impl Ext2Fs {
             descriptor.block(),
             &raw_images,
             four_commit.block(),
-            JOURNAL_MAX_METADATA_BLOCKS as u8,
+            DIRECT_ALLOCATION_METADATA_BLOCKS as u8,
         ) {
-            Ok(Some(plan)) => Ok(Some(plan)),
-            Ok(None) => {
-                if let Some(error) = one_error {
-                    return Err(error);
-                }
-                // Neither slot contains an authoritative commit. The caller
-                // validates the current filesystem before clearing the tail.
-                Ok(Some(JournalRecoveryPlan {
-                    next_sequence: journal.next_sequence,
-                    overlay: Vec::new(),
-                    post_images: Vec::new(),
-                    intent: None,
-                }))
-            }
-            Err(error) => Err(error),
+            Ok(Some(plan)) => return Ok(Some(plan)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
+
+        // Neither the one- nor four-image form was authoritative.  Try the
+        // FileCreate forms (5 then 6 metadata homes).  Each count's commit slot
+        // is the next count's last post-image, so reuse the previously-read commit
+        // block instead of re-reading the same logical block.  Reading stays lazy:
+        // a 1- or 4-image transaction returns above before these blocks are read.
+        let mut prev_commit: Vec<u8> = four_commit.block().to_vec();
+        for count in [5u8, 6] {
+            let count_usize = usize::from(count);
+            let commit_logical = match journal
+                .first
+                .checked_add(1)
+                .and_then(|value| value.checked_add(count_usize as u32))
+                .filter(|value| *value < journal.max_len)
+            {
+                Some(value) => value,
+                None => break, // journal too short for this and all larger counts
+            };
+            let need = count_usize
+                .checked_mul(raw_block_bytes)
+                .ok_or(FsError::Invalid)?;
+            if raw_images.len() < need {
+                raw_images
+                    .try_reserve_exact(need - raw_images.len())
+                    .map_err(|_| FsError::NoMem)?;
+                raw_images.resize(need, 0);
+            }
+            // Image (count-1) is the previous count's commit slot, already in
+            // `prev_commit` (the same logical block).
+            let img_start = (count_usize - 1)
+                .checked_mul(raw_block_bytes)
+                .ok_or(FsError::Invalid)?;
+            let img_end = img_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+            raw_images
+                .get_mut(img_start..img_end)
+                .ok_or(FsError::Invalid)?
+                .copy_from_slice(&prev_commit);
+            let mut commit_scratch = Ext2MutationScratch::try_new(self.block_size)?;
+            self.read_journal_block(journal, commit_logical, commit_scratch.block_mut())?;
+            match self.plan_recovery_candidate(
+                journal,
+                descriptor.block(),
+                &raw_images[..need],
+                commit_scratch.block(),
+                count,
+            ) {
+                Ok(Some(plan)) => return Ok(Some(plan)),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+            prev_commit = commit_scratch.block().to_vec();
+        }
+
+        // No authoritative commit in any supported form.  Surface the one-image
+        // candidate's hard error if it had one; otherwise return an empty plan so
+        // the caller validates the current filesystem before clearing the tail.
+        if let Some(error) = one_error {
+            return Err(error);
+        }
+        Ok(Some(JournalRecoveryPlan {
+            next_sequence: journal.next_sequence,
+            overlay: Vec::new(),
+            post_images: Vec::new(),
+            intent: None,
+        }))
     }
 
     fn apply_internal_journal_recovery(&self, plan: &JournalRecoveryPlan) -> Result<(), FsError> {
@@ -7813,6 +9289,24 @@ impl Ext2Fs {
                     Err(FsError::Invalid)
                 }
             }
+            JournalMetadataPlan::FileCreate(plan) => {
+                let role = plan.home_role_at(index)?;
+                Ok(match role {
+                    FileCreateHomeRole::Bitmap => plan.bitmap_block,
+                    FileCreateHomeRole::GroupDesc => plan.group_desc_target.block,
+                    FileCreateHomeRole::Superblock => self.superblock_home_target().0,
+                    FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                        plan.new_inode_target.block
+                    }
+                    FileCreateHomeRole::ParentInode => plan.parent_inode_target.block,
+                    FileCreateHomeRole::DirData => plan.dir_block,
+                })
+            }
+            JournalMetadataPlan::Rename(plan) => match index {
+                0 => Ok(plan.dir_block),
+                1 => Ok(plan.parent_target.block),
+                _ => Err(FsError::Invalid),
+            },
         }
     }
 
@@ -7875,8 +9369,136 @@ impl Ext2Fs {
                 }
                 Self::replace_inode_in_block(block, inode_target, &new_inode)?;
             }
+            JournalMetadataPlan::FileCreate(plan) => {
+                let role = plan.home_role_at(index)?;
+                match role {
+                    FileCreateHomeRole::Bitmap => {
+                        let byte = block.get_mut(plan.bitmap_byte).ok_or(FsError::Invalid)?;
+                        *byte |= plan.bitmap_mask;
+                    }
+                    FileCreateHomeRole::GroupDesc => {
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                &plan.new_group_desc as *const _ as *const u8,
+                                size_of::<Ext2GroupDesc>(),
+                            )
+                        };
+                        let end = plan
+                            .group_desc_target
+                            .offset
+                            .checked_add(bytes.len())
+                            .ok_or(FsError::Invalid)?;
+                        block
+                            .get_mut(plan.group_desc_target.offset..end)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(bytes);
+                    }
+                    FileCreateHomeRole::Superblock => {
+                        let (_, offset) = self.superblock_home_target();
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                &plan.new_superblock as *const _ as *const u8,
+                                size_of::<Ext2Superblock>(),
+                            )
+                        };
+                        let end = offset.checked_add(bytes.len()).ok_or(FsError::Invalid)?;
+                        block.get_mut(offset..end).ok_or(FsError::Invalid)?.copy_from_slice(bytes);
+                    }
+                    FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                        // Zero the full on-disk inode slot, then write the
+                        // 128-byte raw inode.  `inode_size` may exceed 128 on a
+                        // rev-1 image; zeroing the tail keeps it fsck-clean.
+                        let start = plan.new_inode_target.start;
+                        let slot_end = start
+                            .checked_add(self.inode_size as usize)
+                            .ok_or(FsError::Invalid)?;
+                        block.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                        Self::replace_inode_in_block(
+                            block,
+                            plan.new_inode_target,
+                            &plan.new_inode_raw,
+                        )?;
+                        if role == FileCreateHomeRole::CoalescedInode {
+                            Self::replace_inode_in_block(
+                                block,
+                                plan.parent_inode_target,
+                                &plan.new_parent_inode,
+                            )?;
+                        }
+                    }
+                    FileCreateHomeRole::ParentInode => {
+                        Self::replace_inode_in_block(
+                            block,
+                            plan.parent_inode_target,
+                            &plan.new_parent_inode,
+                        )?;
+                    }
+                    FileCreateHomeRole::DirData => {
+                        Self::write_file_create_dirent(&plan, block)?;
+                    }
+                }
+            }
+            JournalMetadataPlan::Rename(plan) => match index {
+                0 => Self::write_rename_dirent(&plan, block)?,
+                1 => Self::replace_inode_in_block(block, plan.parent_target, &plan.new_parent_inode)?,
+                _ => return Err(FsError::Invalid),
+            },
         }
         Ok(home)
+    }
+
+    /// Rewrite the renamed dirent's name in place: the entry's inode and
+    /// rec_len are unchanged; only name_len, name, and the trailing padding
+    /// change.  The dest name must fit in `rec_len` (gated at plan-build).
+    fn write_rename_dirent(plan: &RenamePlan, block: &mut [u8]) -> Result<(), FsError> {
+        let slot_len = usize::from(plan.rec_len);
+        let slot_start = plan.dir_off;
+        let slot_end = slot_start.checked_add(slot_len).ok_or(FsError::Invalid)?;
+        // `slot` is block[dir_off..dir_off+rec_len]; index within it is 0..rec_len.
+        let slot = block.get_mut(slot_start..slot_end).ok_or(FsError::Invalid)?;
+        slot[6] = plan.new_name_len;
+        let new_len = usize::from(plan.new_name_len);
+        let name_end = 8usize.checked_add(new_len).ok_or(FsError::Invalid)?;
+        slot.get_mut(8..name_end)
+            .ok_or(FsError::Invalid)?
+            .copy_from_slice(&plan.new_name[..new_len]);
+        // Zero the padding between the new name and the entry's rec_len end so
+        // the preimage reversal (restore old name + zero tail) is exact.
+        slot.get_mut(name_end..slot_len).ok_or(FsError::Invalid)?.fill(0);
+        Ok(())
+    }
+
+    /// Write the carved directory entry for a FileCreate transaction into the
+    /// dir-data block image: shrink the former-last entry's `rec_len` to its
+    /// minimal size and place the new entry in the freed tail.  The pre-image
+    /// tail is all zero (gated at plan-build), so the new entry's padding stays
+    /// zero and the preimage reversal is exact.
+    fn write_file_create_dirent(plan: &FileCreatePlan, block: &mut [u8]) -> Result<(), FsError> {
+        let rec_len_off = plan
+            .dir_last_off
+            .checked_add(core::mem::offset_of!(Ext2DirEntryHead, rec_len))
+            .ok_or(FsError::Invalid)?;
+        block
+            .get_mut(rec_len_off..rec_len_off.checked_add(2).ok_or(FsError::Invalid)?)
+            .ok_or(FsError::Invalid)?
+            .copy_from_slice(&plan.dir_minimal_rec_len.to_le_bytes());
+        let new_end = plan
+            .dir_new_off
+            .checked_add(plan.dir_new_rec_len as usize)
+            .ok_or(FsError::Invalid)?;
+        let slot = block.get_mut(plan.dir_new_off..new_end).ok_or(FsError::Invalid)?;
+        slot.fill(0);
+        // Ext2DirEntryHead: inode@0, rec_len@4, name_len@6, file_type@7
+        slot[0..4].copy_from_slice(&plan.new_ino.to_le_bytes());
+        slot[4..6].copy_from_slice(&plan.dir_new_rec_len.to_le_bytes());
+        slot[6] = plan.dir_name_len;
+        slot[7] = EXT2_FT_REG_FILE;
+        let name_len = usize::from(plan.dir_name_len);
+        let name_end = 8usize.checked_add(name_len).ok_or(FsError::Invalid)?;
+        slot.get_mut(8..name_end)
+            .ok_or(FsError::Invalid)?
+            .copy_from_slice(&plan.dir_name[..name_len]);
+        Ok(())
     }
 
     fn hash_block_replacement(
@@ -7964,6 +9586,130 @@ impl Ext2Fs {
                     &Self::inode_bytes(&old_inode)[..inode_target.copy_len],
                 )
             }
+            JournalMetadataPlan::FileCreate(plan) => {
+                let role = plan.home_role_at(index)?;
+                // Build the pre-image by reversing this home's edit on a copy of
+                // the post-image, then hash the whole block.  This is the exact
+                // inverse of `build_metadata_image`'s FileCreate arm and must
+                // stay byte-identical to the recovery-side reversal in
+                // `validate_recovery_grammar` (verified by the 5/6-block
+                // FileCreate round-trip self-test).
+                let mut pre: Vec<u8> = Vec::new();
+                pre.try_reserve_exact(self.block_size as usize)
+                    .map_err(|_| FsError::NoMem)?;
+                pre.resize(self.block_size as usize, 0);
+                pre.copy_from_slice(post_image);
+                match role {
+                    FileCreateHomeRole::Bitmap => {
+                        let byte = pre.get_mut(plan.bitmap_byte).ok_or(FsError::Invalid)?;
+                        *byte &= !plan.bitmap_mask;
+                    }
+                    FileCreateHomeRole::GroupDesc => {
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                &plan.old_group_desc as *const _ as *const u8,
+                                size_of::<Ext2GroupDesc>(),
+                            )
+                        };
+                        let end = plan
+                            .group_desc_target
+                            .offset
+                            .checked_add(bytes.len())
+                            .ok_or(FsError::Invalid)?;
+                        pre.get_mut(plan.group_desc_target.offset..end)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(bytes);
+                    }
+                    FileCreateHomeRole::Superblock => {
+                        let (_, offset) = self.superblock_home_target();
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                &plan.old_superblock as *const _ as *const u8,
+                                size_of::<Ext2Superblock>(),
+                            )
+                        };
+                        let end = offset.checked_add(bytes.len()).ok_or(FsError::Invalid)?;
+                        pre.get_mut(offset..end).ok_or(FsError::Invalid)?.copy_from_slice(bytes);
+                    }
+                    FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                        // Pre-image slot was all zero (all-zero-slot gate).
+                        let start = plan.new_inode_target.start;
+                        let slot_end = start
+                            .checked_add(self.inode_size as usize)
+                            .ok_or(FsError::Invalid)?;
+                        pre.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                        if role == FileCreateHomeRole::CoalescedInode {
+                            Self::replace_inode_in_block(
+                                &mut pre,
+                                plan.parent_inode_target,
+                                &plan.old_parent_inode,
+                            )?;
+                        }
+                    }
+                    FileCreateHomeRole::ParentInode => {
+                        Self::replace_inode_in_block(
+                            &mut pre,
+                            plan.parent_inode_target,
+                            &plan.old_parent_inode,
+                        )?;
+                    }
+                    FileCreateHomeRole::DirData => {
+                        let rec_len_off = plan
+                            .dir_last_off
+                            .checked_add(core::mem::offset_of!(Ext2DirEntryHead, rec_len))
+                            .ok_or(FsError::Invalid)?;
+                        pre.get_mut(rec_len_off..rec_len_off.checked_add(2).ok_or(FsError::Invalid)?)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(&plan.dir_old_rec_len.to_le_bytes());
+                        let new_end = plan
+                            .dir_new_off
+                            .checked_add(plan.dir_new_rec_len as usize)
+                            .ok_or(FsError::Invalid)?;
+                        pre.get_mut(plan.dir_new_off..new_end)
+                            .ok_or(FsError::Invalid)?
+                            .fill(0);
+                    }
+                }
+                Ok(Sha256::digest(&pre))
+            }
+            JournalMetadataPlan::Rename(plan) => {
+                // Reverse the in-place name rewrite on a copy of the
+                // post-image, then hash the whole block.  This is the exact
+                // inverse of `write_rename_dirent` and must match the
+                // recovery-side reversal in `validate_recovery_rename`.
+                let mut pre: Vec<u8> = Vec::new();
+                pre.try_reserve_exact(self.block_size as usize)
+                    .map_err(|_| FsError::NoMem)?;
+                pre.resize(self.block_size as usize, 0);
+                pre.copy_from_slice(post_image);
+                match index {
+                    0 => {
+                        // Dir data: restore the old name at dir_off and zero the
+                        // tail.  `slot` is pre[dir_off..dir_off+rec_len]; index
+                        // within it is 0..rec_len, so the zero-tail end is
+                        // `rec_len`, not the absolute dir_off+rec_len.
+                        let rec_len = usize::from(plan.rec_len);
+                        let slot_end = plan.dir_off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+                        let slot = pre.get_mut(plan.dir_off..slot_end).ok_or(FsError::Invalid)?;
+                        slot[6] = plan.old_name_len;
+                        let old_len = usize::from(plan.old_name_len);
+                        let name_end = 8usize.checked_add(old_len).ok_or(FsError::Invalid)?;
+                        slot.get_mut(8..name_end)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(&plan.old_name[..old_len]);
+                        slot.get_mut(name_end..rec_len).ok_or(FsError::Invalid)?.fill(0);
+                    }
+                    1 => {
+                        Self::replace_inode_in_block(
+                            &mut pre,
+                            plan.parent_target,
+                            &plan.old_parent_inode,
+                        )?;
+                    }
+                    _ => return Err(FsError::Invalid),
+                }
+                Ok(Sha256::digest(&pre))
+            }
         }
     }
 
@@ -7974,12 +9720,18 @@ impl Ext2Fs {
         match plan {
             JournalMetadataPlan::DirectAllocation(plan) => JournalCommitIntent {
                 kind: ZERO_INTENT_KIND_DIRECT_ALLOCATION,
-                metadata_count: JOURNAL_MAX_METADATA_BLOCKS as u8,
+                metadata_count: DIRECT_ALLOCATION_METADATA_BLOCKS as u8,
                 inode_number: plan.inode_number,
                 file_block: plan.file_block,
                 physical: plan.phys_block,
                 preimage_hashes,
                 old_inode: plan.old_inode,
+                new_ino: 0,
+                parent_ino: 0,
+                rename_dir_off: 0,
+                rename_rec_len: 0,
+                rename_old_name_len: 0,
+                rename_old_name: [0; 255],
             },
             JournalMetadataPlan::InodeUpdate {
                 inode_number,
@@ -7993,6 +9745,45 @@ impl Ext2Fs {
                 physical: 0,
                 preimage_hashes,
                 old_inode,
+                new_ino: 0,
+                parent_ino: 0,
+                rename_dir_off: 0,
+                rename_rec_len: 0,
+                rename_old_name_len: 0,
+                rename_old_name: [0; 255],
+            },
+            JournalMetadataPlan::FileCreate(plan) => JournalCommitIntent {
+                kind: ZERO_INTENT_KIND_FILE_CREATE,
+                metadata_count: plan.home_count() as u8,
+                // `inode_number` carries the parent inode; recovery uses
+                // `parent_ino` directly, and the equality is a cheap cross-field
+                // invariant validated by `decode_commit_intent`.
+                inode_number: plan.parent_ino,
+                file_block: u32::MAX,
+                physical: 0,
+                preimage_hashes,
+                old_inode: plan.old_parent_inode,
+                new_ino: plan.new_ino,
+                parent_ino: plan.parent_ino,
+                rename_dir_off: 0,
+                rename_rec_len: 0,
+                rename_old_name_len: 0,
+                rename_old_name: [0; 255],
+            },
+            JournalMetadataPlan::Rename(plan) => JournalCommitIntent {
+                kind: ZERO_INTENT_KIND_FILE_RENAME,
+                metadata_count: 2,
+                inode_number: plan.parent_ino,
+                file_block: u32::MAX,
+                physical: 0,
+                preimage_hashes,
+                old_inode: plan.old_parent_inode,
+                new_ino: 0,
+                parent_ino: 0,
+                rename_dir_off: plan.dir_off as u32,
+                rename_rec_len: plan.rec_len,
+                rename_old_name_len: plan.old_name_len,
+                rename_old_name: plan.old_name,
             },
         }
     }
@@ -8016,6 +9807,27 @@ impl Ext2Fs {
         block[ZERO_INTENT_OLD_INODE_OFFSET..ZERO_INTENT_DIGEST_OFFSET]
             .copy_from_slice(Self::inode_bytes(&intent.old_inode));
         block[ZERO_INTENT_DIGEST_OFFSET..ZERO_INTENT_END].fill(0);
+        if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
+            if block.len() < ZERO_INTENT_FILE_CREATE_END {
+                return Err(FsError::Invalid);
+            }
+            write_be_u32(block, ZERO_INTENT_NEW_INO_OFFSET, intent.new_ino)?;
+            write_be_u32(block, ZERO_INTENT_PARENT_INO_OFFSET, intent.parent_ino)?;
+            block[ZERO_INTENT_FILE_CREATE_END..].fill(0);
+        } else if intent.kind == ZERO_INTENT_KIND_FILE_RENAME {
+            if block.len() < ZERO_INTENT_FILE_RENAME_END {
+                return Err(FsError::Invalid);
+            }
+            write_be_u32(block, ZERO_INTENT_RENAME_DIR_OFF_OFFSET, intent.rename_dir_off)?;
+            block[ZERO_INTENT_RENAME_REC_LEN_OFFSET..ZERO_INTENT_RENAME_REC_LEN_OFFSET + 2]
+                .copy_from_slice(&intent.rename_rec_len.to_be_bytes());
+            block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET] = intent.rename_old_name_len;
+            block[ZERO_INTENT_RENAME_OLD_NAME_OFFSET..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255]
+                .copy_from_slice(&intent.rename_old_name);
+            block[ZERO_INTENT_FILE_RENAME_END..].fill(0);
+        } else {
+            block[ZERO_INTENT_END..].fill(0);
+        }
         Ok(())
     }
 
@@ -8186,9 +9998,9 @@ impl Ext2Fs {
                         old_inode: *committed_raw,
                         new_inode: next_raw,
                     };
-                    let mut homes = [0u32; JOURNAL_MAX_METADATA_BLOCKS];
+                    let mut homes = [0u32; DIRECT_ALLOCATION_METADATA_BLOCKS];
                     let metadata_plan = JournalMetadataPlan::DirectAllocation(plan);
-                    for index in 0..JOURNAL_MAX_METADATA_BLOCKS {
+                    for index in 0..DIRECT_ALLOCATION_METADATA_BLOCKS {
                         homes[index] = self.metadata_home_block(metadata_plan, index)?;
                         if journal.contains_physical(homes[index]) {
                             return Err(FsError::Invalid);
@@ -9280,6 +11092,604 @@ impl FileSystem for Ext2Fs {
 
         // Search directory entries
         parent.dir_lookup(name)
+    }
+
+    /// Transactional ext3 file creation.  All metadata homes — inode bitmap,
+    /// group descriptor, superblock, the new inode's table block, the parent
+    /// inode's table block (or one coalesced block), and the parent directory
+    /// data block — commit in a single JBD2 transaction or none do, so a crash
+    /// leaves either a fully created file or no visible change.
+    ///
+    /// Scope: regular files in a single block group whose parent directory's
+    /// last data block has room for the new dirent in the last entry's rec_len
+    /// tail.  Directory growth, multi-group allocation, and reused (non-zero)
+    /// inode slots return `NotSupported` rather than risking a partial commit.
+    fn create(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        mode: FileMode,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        self.ensure_io_healthy()?;
+        if !mode.is_file() {
+            // mkdir is out of scope: it needs a directory data block and the
+            // "." / ".." seed entries.
+            return Err(FsError::NotSupported);
+        }
+        // Name validation: 1..=255 bytes, no NUL or '/'.
+        if name.is_empty()
+            || name.len() > 255
+            || name.as_bytes().iter().any(|&b| b == 0 || b == b'/')
+        {
+            return Err(FsError::Invalid);
+        }
+        let parent_ext2 = parent
+            .as_any()
+            .downcast_ref::<Ext2Inode>()
+            .ok_or(FsError::Invalid)?;
+        if !parent_ext2.is_dir_inner() {
+            return Err(FsError::NotDir);
+        }
+        let fs = parent_ext2.fs.upgrade().ok_or(FsError::Invalid)?;
+        if parent_ext2.fs_id != self.fs_id {
+            return Err(FsError::Invalid);
+        }
+        if fs.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let parent_ino = parent_ext2.ino;
+        let on_disk_mode = EXT2_S_IFREG as u32 | (mode.perm as u32 & 0o7777);
+        let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
+        let block_size_us = fs.block_size as usize;
+
+        // Lock order mirrors write_mutation: parent.write_lock -> parent.raw
+        // -> fs.meta_lock -> ensure_io_healthy -> read-only checks -> fs.journal.
+        let _parent_guard = parent_ext2.write_lock.lock();
+        let mut raw_guard = parent_ext2.raw.write();
+        let _meta = fs.meta_lock.lock();
+        fs.ensure_io_healthy()?;
+        let committed_parent = *raw_guard;
+        if committed_parent.flags & EXT2_IMMUTABLE_FL != 0 {
+            return Err(FsError::PermDenied);
+        }
+        if committed_parent.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+            return Err(FsError::NotSupported);
+        }
+        let journal_inum = fs.superblock.read().journal_inum;
+        let mut journal_guard = fs.journal.lock();
+        let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+        if parent_ino == journal_inum {
+            return Err(FsError::PermDenied);
+        }
+
+        // Dirent space: resolve the parent's last directory data block and carve
+        // the new entry from the last dirent's rec_len tail (Case A).
+        let dir_size = committed_parent.size_lo as u64;
+        if dir_size == 0 {
+            return Err(FsError::NotSupported);
+        }
+        let block_size = fs.block_size as u64;
+        let last_block_idx =
+            u32::try_from(dir_size.checked_sub(1).ok_or(FsError::Invalid)? / block_size)
+                .map_err(|_| FsError::Invalid)?;
+        // The dir-data home is re-derived at recovery time as the parent inode's
+        // highest non-zero DIRECT block pointer (the block array is unchanged in
+        // Case A).  An indirect-mapped last block (last_block_idx >=
+        // EXT2_NDIR_BLOCKS) would commit a home recovery cannot re-derive, so a
+        // crash after the commit would make the filesystem unmountable.  Reject
+        // indirect last blocks up front (this driver never grows a directory,
+        // so >12-block directories are out of scope anyway).
+        if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
+            return Err(FsError::NotSupported);
+        }
+        let dir_block_home =
+            match fs.map_file_block_with_scratch(&committed_parent, last_block_idx, &mut scratch)? {
+                Some(phys) => phys,
+                None => return Err(FsError::NotSupported),
+            };
+        fs.read_block(dir_block_home, scratch.block_mut())?;
+        let dir_block = scratch.block();
+        let head_size = size_of::<Ext2DirEntryHead>();
+        let mut off = 0usize;
+        let mut last_off = 0usize;
+        let mut last_rec_len = 0u16;
+        let mut last_name_len = 0u8;
+        while off.checked_add(head_size).map_or(false, |end| end <= block_size_us) {
+            let head: Ext2DirEntryHead =
+                unsafe { core::ptr::read_unaligned(dir_block[off..].as_ptr() as *const _) };
+            let rec_len = usize::from(head.rec_len);
+            // ext2 requires rec_len to be 4-aligned; reject a corrupt block up
+            // front so the carved entry stays 4-aligned.
+            if rec_len < head_size
+                || rec_len % 4 != 0
+                || off.checked_add(rec_len).map_or(true, |end| end > block_size_us)
+            {
+                return Err(FsError::Invalid);
+            }
+            last_off = off;
+            last_rec_len = head.rec_len;
+            last_name_len = head.name_len;
+            off = off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+        }
+        // The last entry must extend to the end of the block (Carve Case A).
+        if last_off
+            .checked_add(usize::from(last_rec_len))
+            .map_or(true, |end| end != block_size_us)
+        {
+            return Err(FsError::NotSupported);
+        }
+        let last_minimal = (8usize + usize::from(last_name_len) + 3) & !3;
+        if last_minimal > usize::from(last_rec_len) {
+            return Err(FsError::Invalid);
+        }
+        let new_rec_len = usize::from(last_rec_len) - last_minimal;
+        let new_entry_min = (8usize + name.len() + 3) & !3;
+        if new_rec_len < new_entry_min {
+            // No room in this block; directory growth is out of scope.
+            return Err(FsError::NotSupported);
+        }
+        let dir_new_off = last_off.checked_add(last_minimal).ok_or(FsError::Invalid)?;
+        let dir_old_rec_len = last_rec_len;
+        let dir_minimal_rec_len = u16::try_from(last_minimal).map_err(|_| FsError::Invalid)?;
+        let dir_new_rec_len = u16::try_from(new_rec_len).map_err(|_| FsError::Invalid)?;
+        // Clean-tail gate: the carved region must be all zero in the pre-image so
+        // the recovery preimage reversal is exact.
+        let carve_end = dir_new_off.checked_add(new_rec_len).ok_or(FsError::Invalid)?;
+        if dir_block[dir_new_off..carve_end].iter().any(|&b| b != 0) {
+            return Err(FsError::NotSupported);
+        }
+
+        // Allocate an inode in the parent's group (single-group scope).
+        let new_group = fs.inode_group_index(parent_ino).0;
+        let (bitmap_block, old_group_desc) = {
+            let descs = fs.group_descs.read();
+            let desc = descs.get(new_group).copied().ok_or(FsError::Invalid)?;
+            (desc.inode_bitmap, desc)
+        };
+        if bitmap_block == 0 || bitmap_block >= fs.blocks_count {
+            return Err(FsError::Invalid);
+        }
+        let first_ino = fs.superblock.read().first_ino;
+        let sb_inodes_count = fs.superblock.read().inodes_count;
+        fs.read_block(bitmap_block, scratch.block_mut())?;
+        let bitmap = scratch.block();
+        let mut new_ino = 0u32;
+        let mut new_index = 0usize;
+        for i in 0..fs.inodes_per_group as usize {
+            let ino = (new_group as u32)
+                .checked_mul(fs.inodes_per_group)
+                .and_then(|base| base.checked_add(i as u32 + 1))
+                .ok_or(FsError::Invalid)?;
+            if ino > sb_inodes_count {
+                break;
+            }
+            if ino < first_ino || ino == journal_inum {
+                continue;
+            }
+            if bitmap[i / 8] & (1u8 << (i % 8)) == 0 {
+                new_ino = ino;
+                new_index = i;
+                break;
+            }
+        }
+        if new_ino == 0 {
+            return Err(FsError::NoSpace);
+        }
+        if new_ino == journal_inum {
+            return Err(FsError::PermDenied);
+        }
+        let bitmap_byte = new_index / 8;
+        let bitmap_mask = 1u8 << (new_index % 8);
+        // bitmap_free_count cross-check (defense against a corrupt descriptor).
+        if old_group_desc.free_inodes_count as u32
+            != Ext2Fs::bitmap_free_count(bitmap, fs.inodes_per_group)?
+        {
+            return Err(FsError::Invalid);
+        }
+
+        // New inode target + all-zero-slot gate (reversal assumes a clean slot).
+        let new_inode_target = fs.inode_write_target(new_ino)?;
+        let slot_end = new_inode_target
+            .start
+            .checked_add(fs.inode_size as usize)
+            .ok_or(FsError::Invalid)?;
+        fs.read_block(new_inode_target.block, scratch.block_mut())?;
+        if scratch.block()[new_inode_target.start..slot_end]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err(FsError::NotSupported);
+        }
+        let now = TimeSpec::now();
+        let mut new_inode_raw = Ext2InodeRaw::default();
+        new_inode_raw.mode = on_disk_mode as u16;
+        new_inode_raw.links_count = 1;
+        new_inode_raw.atime = now.sec as u32;
+        new_inode_raw.ctime = now.sec as u32;
+        new_inode_raw.mtime = now.sec as u32;
+
+        // Parent transition: mtime/ctime bump; size/blocks unchanged (Case A).
+        let mut new_parent_inode = committed_parent;
+        new_parent_inode.mtime = now.sec as u32;
+        new_parent_inode.ctime = now.sec as u32;
+
+        // Free-count transitions (checked_sub, no u16/u32 wrap).
+        let new_group_desc = Ext2GroupDesc {
+            free_inodes_count: old_group_desc
+                .free_inodes_count
+                .checked_sub(1)
+                .ok_or(FsError::Invalid)?,
+            ..old_group_desc
+        };
+        let (old_superblock, new_superblock) = {
+            let sb = *fs.superblock.read();
+            let new_sb = Ext2Superblock {
+                free_inodes_count: sb
+                    .free_inodes_count
+                    .checked_sub(1)
+                    .ok_or(FsError::Invalid)?,
+                ..sb
+            };
+            (sb, new_sb)
+        };
+
+        let parent_inode_target = fs.inode_write_target(parent_ino)?;
+        let group_desc_target = fs.group_desc_write_target(new_group)?;
+        let super_home = fs.superblock_home_target().0;
+        let coalesced = new_inode_target.block == parent_inode_target.block;
+        let home_count = if coalesced { 5 } else { 6 };
+
+        // Distinct-home invariant + no journal-owned home + dir-data not structural.
+        let home_of = |role: FileCreateHomeRole| -> u32 {
+            match role {
+                FileCreateHomeRole::Bitmap => bitmap_block,
+                FileCreateHomeRole::GroupDesc => group_desc_target.block,
+                FileCreateHomeRole::Superblock => super_home,
+                FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
+                    new_inode_target.block
+                }
+                FileCreateHomeRole::ParentInode => parent_inode_target.block,
+                FileCreateHomeRole::DirData => dir_block_home,
+            }
+        };
+        for a in 0..home_count {
+            let ra = file_create_role(coalesced, a).ok_or(FsError::Invalid)?;
+            let ha = home_of(ra);
+            for b in (a + 1)..home_count {
+                let rb = file_create_role(coalesced, b).ok_or(FsError::Invalid)?;
+                if ha == home_of(rb) {
+                    return Err(FsError::NotSupported);
+                }
+            }
+            if journal.contains_physical(ha) {
+                return Err(FsError::Invalid);
+            }
+        }
+        if fs.is_structural_metadata_block(dir_block_home)? {
+            return Err(FsError::NotSupported);
+        }
+
+        // Journal capacity check (fail-closed NotSupported, never poison).
+        let transaction_blocks = u32::try_from(home_count)
+            .ok()
+            .and_then(|c| c.checked_add(2))
+            .ok_or(FsError::Invalid)?;
+        if journal
+            .first
+            .checked_add(transaction_blocks)
+            .map_or(true, |end| end > journal.max_len)
+        {
+            return Err(FsError::NotSupported);
+        }
+
+        // Build the plan and commit atomically.
+        let mut dir_name = [0u8; 255];
+        dir_name[..name.len()].copy_from_slice(name.as_bytes());
+        let new_inode_raw_for_publish = new_inode_raw;
+        let plan = FileCreatePlan {
+            new_ino,
+            parent_ino,
+            group: new_group,
+            bitmap_block,
+            bitmap_byte,
+            bitmap_mask,
+            group_desc_target,
+            old_group_desc,
+            new_group_desc,
+            old_superblock,
+            new_superblock,
+            new_inode_target,
+            new_inode_raw,
+            parent_inode_target,
+            old_parent_inode: committed_parent,
+            new_parent_inode,
+            coalesced,
+            dir_block: dir_block_home,
+            dir_last_off: last_off,
+            dir_old_rec_len,
+            dir_minimal_rec_len,
+            dir_new_off,
+            dir_new_rec_len,
+            dir_name_len: name.len() as u8,
+            dir_name,
+        };
+        let transaction_failure = match fs.commit_metadata_transaction(
+            journal,
+            JournalMetadataPlan::FileCreate(plan),
+            &mut scratch,
+        ) {
+            Ok(()) => None,
+            Err(failure) if failure.committed => Some(failure),
+            Err(failure) => {
+                if failure.poison {
+                    fs.io_faulted.store(true, Ordering::Release);
+                }
+                return Err(failure.error);
+            }
+        };
+
+        // Publish the in-memory state recovery will reconstruct.
+        *fs.superblock.write() = new_superblock;
+        fs.group_descs.write()[new_group] = new_group_desc;
+        *raw_guard = new_parent_inode;
+        let new_inode = fs
+            .inode_cache
+            .get_or_try_insert_with(new_ino, || {
+                fs.new_inode_from_raw(new_ino, new_inode_raw_for_publish)
+            })?;
+        if let Some(failure) = transaction_failure {
+            if failure.poison {
+                fs.io_faulted.store(true, Ordering::Release);
+            }
+            return Err(failure.error);
+        }
+        Ok(new_inode as Arc<dyn Inode>)
+    }
+
+    /// Transactional same-directory rename for a regular file (renameat2
+    /// RENAME_NOREPLACE).  The source dirent's name is rewritten in place (the
+    /// dest name must fit in the source entry's rec_len) and the parent
+    /// directory's mtime/ctime is bumped; the inode itself is unchanged.  Two
+    /// metadata homes commit in one JBD2 transaction or none do.
+    ///
+    /// Scope: same-directory, regular-file source, NOREPLACE (dest absent),
+    /// in-place name rewrite.  Cross-directory rename, directory rename,
+    /// overwrite rename, and a dest name too long for the source entry's
+    /// rec_len return `NotSupported`.  The source dirent must live in the
+    /// parent's last direct block so recovery can re-derive the dir-data home.
+    #[allow(clippy::too_many_arguments)]
+    fn rename(
+        &self,
+        old_parent: &Arc<dyn Inode>,
+        old_name: &str,
+        new_parent: &Arc<dyn Inode>,
+        new_name: &str,
+        noreplace: bool,
+        expected_src_ino: u64,
+        expected_dest_ino: Option<u64>,
+    ) -> Result<(), FsError> {
+        self.ensure_io_healthy()?;
+        // Name validation for both ends.
+        for name in [old_name, new_name] {
+            if name.is_empty()
+                || name.len() > 255
+                || name.as_bytes().iter().any(|&b| b == 0 || b == b'/')
+            {
+                return Err(FsError::Invalid);
+            }
+        }
+        let old_parent_ext2 = old_parent
+            .as_any()
+            .downcast_ref::<Ext2Inode>()
+            .ok_or(FsError::Invalid)?;
+        let new_parent_ext2 = new_parent
+            .as_any()
+            .downcast_ref::<Ext2Inode>()
+            .ok_or(FsError::Invalid)?;
+        if !old_parent_ext2.is_dir_inner() || !new_parent_ext2.is_dir_inner() {
+            return Err(FsError::NotDir);
+        }
+        // Same-directory only (cross-directory rename is out of scope).
+        if old_parent_ext2.ino != new_parent_ext2.ino
+            || old_parent_ext2.fs_id != new_parent_ext2.fs_id
+            || old_parent_ext2.fs_id != self.fs_id
+        {
+            return Err(FsError::NotSupported);
+        }
+        // NOREPLACE only: an existing dest (Some expected_dest_ino) is overwrite,
+        // which would need to free the dest inode — out of scope.
+        if !noreplace || expected_dest_ino.is_some() {
+            return Err(FsError::NotSupported);
+        }
+        let fs = old_parent_ext2.fs.upgrade().ok_or(FsError::Invalid)?;
+        if fs.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let parent_ino = old_parent_ext2.ino;
+        let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
+        let block_size_us = fs.block_size as usize;
+
+        // Lock order mirrors create/write_mutation.
+        let _parent_guard = old_parent_ext2.write_lock.lock();
+        let mut raw_guard = old_parent_ext2.raw.write();
+        let _meta = fs.meta_lock.lock();
+        fs.ensure_io_healthy()?;
+        let committed_parent = *raw_guard;
+        if committed_parent.flags & EXT2_IMMUTABLE_FL != 0 {
+            return Err(FsError::PermDenied);
+        }
+        if committed_parent.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+            return Err(FsError::NotSupported);
+        }
+        let journal_inum = fs.superblock.read().journal_inum;
+        let mut journal_guard = fs.journal.lock();
+        let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+        if parent_ino == journal_inum {
+            return Err(FsError::PermDenied);
+        }
+
+        // Under-lock revalidation via a MANUAL directory walk (dir_lookup would
+        // take raw.read() while we hold raw.write() → self-deadlock).  Walk all
+        // direct blocks: find the source (must be in the LAST block for recovery
+        // home re-derivation) and verify the dest is globally absent (NOREPLACE).
+        let dir_size = committed_parent.size_lo as u64;
+        if dir_size == 0 {
+            return Err(FsError::NotSupported);
+        }
+        let block_size = fs.block_size as u64;
+        let last_block_idx =
+            u32::try_from(dir_size.checked_sub(1).ok_or(FsError::Invalid)? / block_size)
+                .map_err(|_| FsError::Invalid)?;
+        if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
+            return Err(FsError::NotSupported);
+        }
+        let head_size = size_of::<Ext2DirEntryHead>();
+        let mut src_ino: u32 = 0;
+        let mut dir_off = 0usize;
+        let mut src_rec_len = 0u16;
+        let mut found_src = false;
+        let mut src_in_last = false;
+        for block_idx in 0..=last_block_idx {
+            let dir_block_home =
+                match fs.map_file_block_with_scratch(&committed_parent, block_idx, &mut scratch)? {
+                    Some(phys) => phys,
+                    None => return Err(FsError::NotSupported),
+                };
+            fs.read_block(dir_block_home, scratch.block_mut())?;
+            let dir_block = scratch.block();
+            let mut off = 0usize;
+            while off.checked_add(head_size).map_or(false, |end| end <= block_size_us) {
+                let head: Ext2DirEntryHead =
+                    unsafe { core::ptr::read_unaligned(dir_block[off..].as_ptr() as *const _) };
+                let rec_len = usize::from(head.rec_len);
+                if rec_len < head_size
+                    || rec_len % 4 != 0
+                    || off.checked_add(rec_len).map_or(true, |e| e > block_size_us)
+                {
+                    return Err(FsError::Invalid);
+                }
+                if head.inode != 0
+                    && head.name_len > 0
+                    && usize::from(head.name_len) <= rec_len - head_size
+                {
+                    let name_start = off.checked_add(head_size).ok_or(FsError::Invalid)?;
+                    let name_end = name_start
+                        .checked_add(usize::from(head.name_len))
+                        .ok_or(FsError::Invalid)?;
+                    let nb = &dir_block[name_start..name_end];
+                    if nb == new_name.as_bytes() {
+                        // NOREPLACE: dest must be absent.
+                        return Err(FsError::Exists);
+                    }
+                    if nb == old_name.as_bytes() {
+                        if block_idx == last_block_idx {
+                            src_ino = head.inode;
+                            dir_off = off;
+                            src_rec_len = head.rec_len;
+                            found_src = true;
+                            src_in_last = true;
+                        } else {
+                            // Source in an earlier block — recovery can't
+                            // re-derive the dir-data home.
+                            src_in_last = false;
+                        }
+                    }
+                }
+                off = off.checked_add(rec_len).ok_or(FsError::Invalid)?;
+            }
+        }
+        if !found_src || !src_in_last {
+            return Err(FsError::NotSupported);
+        }
+        let rec_len = src_rec_len;
+        // Verify the source inode matches the caller's expectation and is a
+        // regular file (directory rename is out of scope).  load_inode reads
+        // the source inode from disk — it does NOT take the parent's raw lock.
+        if src_ino as u64 != expected_src_ino {
+            return Err(FsError::PermDenied);
+        }
+        let src_inode = fs.load_inode(src_ino)?;
+        if !src_inode.is_file_inner() {
+            return Err(FsError::NotSupported);
+        }
+        // The dir-data home is the last block (re-derive it for the plan).
+        let dir_block_home =
+            match fs.map_file_block_with_scratch(&committed_parent, last_block_idx, &mut scratch)? {
+                Some(phys) => phys,
+                None => return Err(FsError::NotSupported),
+            };
+
+        // Dest name must fit in the source entry's rec_len (in-place rewrite).
+        let new_entry_min = (8usize + new_name.len() + 3) & !3;
+        if new_entry_min > usize::from(rec_len) {
+            return Err(FsError::NotSupported);
+        }
+
+        // Parent transition: mtime/ctime bump; size/blocks unchanged.
+        let now = TimeSpec::now();
+        let mut new_parent_inode = committed_parent;
+        new_parent_inode.mtime = now.sec as u32;
+        new_parent_inode.ctime = now.sec as u32;
+        let parent_target = fs.inode_write_target(parent_ino)?;
+
+        // Distinct-home invariant: dir data block != parent inode table block,
+        // and neither is journal-owned.
+        if dir_block_home == parent_target.block {
+            return Err(FsError::NotSupported);
+        }
+        if journal.contains_physical(dir_block_home) || journal.contains_physical(parent_target.block)
+        {
+            return Err(FsError::Invalid);
+        }
+        // Journal capacity (2 metadata blocks → 4 transaction blocks).
+        if journal
+            .first
+            .checked_add(4)
+            .map_or(true, |end| end > journal.max_len)
+        {
+            return Err(FsError::NotSupported);
+        }
+
+        let mut old_name_buf = [0u8; 255];
+        old_name_buf[..old_name.len()].copy_from_slice(old_name.as_bytes());
+        let mut new_name_buf = [0u8; 255];
+        new_name_buf[..new_name.len()].copy_from_slice(new_name.as_bytes());
+        let plan = RenamePlan {
+            parent_ino,
+            parent_target,
+            old_parent_inode: committed_parent,
+            new_parent_inode,
+            dir_block: dir_block_home,
+            dir_off,
+            rec_len,
+            old_name_len: old_name.len() as u8,
+            old_name: old_name_buf,
+            new_name_len: new_name.len() as u8,
+            new_name: new_name_buf,
+        };
+        match fs.commit_metadata_transaction(
+            journal,
+            JournalMetadataPlan::Rename(plan),
+            &mut scratch,
+        ) {
+            Ok(()) => {}
+            Err(failure) if failure.committed => {
+                *raw_guard = new_parent_inode;
+                if failure.poison {
+                    fs.io_faulted.store(true, Ordering::Release);
+                }
+                return Err(failure.error);
+            }
+            Err(failure) => {
+                if failure.poison {
+                    fs.io_faulted.store(true, Ordering::Release);
+                }
+                return Err(failure.error);
+            }
+        }
+        // Publish the in-memory parent state recovery will reconstruct.
+        *raw_guard = new_parent_inode;
+        Ok(())
     }
 }
 
