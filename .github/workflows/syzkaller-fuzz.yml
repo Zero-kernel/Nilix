@@ -27,30 +27,38 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools qemu-system-x86 ovmf
-          rustup toolchain install stable
-          rustup default stable
+          sudo apt-get install -y build-essential musl-tools qemu-system-x86 ovmf
+          # Pin the toolchain the repo's rust-toolchain.toml declares. build-kcov
+          # uses -Z build-std (nightly + rust-src + llvm-tools); build-syz-fuzzer
+          # pins +nightly-2025-12-08 via build-isolated.sh. Stable builds neither.
+          rustup toolchain install nightly-2025-12-08 --profile default \
+            --component rust-src --component llvm-tools-preview
+          rustup target add x86_64-unknown-uefi x86_64-unknown-none \
+            --toolchain nightly-2025-12-08
+          rustup default nightly-2025-12-08
 
       - name: Build KCOV-enabled kernel
-        run: |
-          cd kernel
-          make build-kcov
+        # build-kcov is a ROOT Makefile target that cds into kernel/ itself.
+        # Running it from kernel/ fails: "No rule to make target 'build-kcov'".
+        run: make build-kcov
 
       - name: Build guest executor
-        run: |
-          cd userspace
-          musl-gcc -std=c11 -static -O2 -Wall -Wextra \
-            -o nilix_syz_executor.elf nilix_syz_executor.c
+        # Canonical Makefile target (adds -Werror; single source of truth).
+        run: make build-syz-executor
 
       - name: Build host fuzzer
-        run: |
-          cd userspace/nilix-syz-fuzzer
-          cargo build --release --target x86_64-unknown-linux-gnu
+        # build-syz-fuzzer runs build-isolated.sh: it renames the parent
+        # userspace/.cargo (whose [unstable] build-std = ["core"] leaks into
+        # nested configs and breaks the std host build) and pins nightly.
+        run: make build-syz-fuzzer
 
       - name: Restore fuzzing corpus
         uses: actions/cache/restore@v4
         with:
-          path: syz-corpus
+          # The fuzzer runs from userspace/nilix-syz-fuzzer and uses
+          # --corpus-dir ./syz-corpus, so the corpus lives here (matching the
+          # upload/stat steps below). The old root-level path cached nothing.
+          path: userspace/nilix-syz-fuzzer/syz-corpus
           key: nilix-syz-corpus-${{ github.sha }}
           restore-keys: |
             nilix-syz-corpus-
@@ -72,7 +80,7 @@ jobs:
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: syz-corpus
+          path: userspace/nilix-syz-fuzzer/syz-corpus
           key: nilix-syz-corpus-${{ github.sha }}
 
       - name: Process crashes
