@@ -499,7 +499,8 @@ pub fn test_ext2_write() {
                                     .downcast_ref::<vfs::FileHandle>()
                                     .expect("reopen FileHandle");
                                 assert_eq!(
-                                    rd.inode.stat().expect("stat reopen").ino, probe_ino,
+                                    rd.inode.stat().expect("stat reopen").ino,
+                                    probe_ino,
                                     "create probe must be cache-canonical across opens"
                                 );
                                 let mut buf = [0u8; 1];
