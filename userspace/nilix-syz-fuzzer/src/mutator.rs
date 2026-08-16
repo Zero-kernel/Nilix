@@ -146,31 +146,27 @@ impl SyscallMutator {
     }
 
     fn generate_random_syscall(&mut self) -> Syscall {
-        // Common syscalls with their numbers
+        // Only generate allowlisted, argument-free syscalls so every mutated
+        // program passes `validate_syscall` and reaches the executor (which
+        // then exercises its result-publication path: open O_CREAT + renameat2).
+        // Argument-bearing syscalls (read/write/open/...) are not in the
+        // non-destructive allowlist and would be rejected before execution.
         let syscalls = [
-            (1, 3),    // read: fd, buf, count
-            (2, 3),    // write: fd, buf, count
-            (3, 3),    // open: path, flags, mode
-            (4, 1),    // close: fd
-            (12, 1),   // brk: addr
-            (39, 0),   // getpid
-            (110, 0),  // getppid
-            (200, 2),  // mmap: length, prot (simplified)
-            (201, 2),  // munmap: addr, length
+            24u32,  // sched_yield
+            39,     // getpid
+            102,    // getuid
+            104,    // getgid
+            107,    // geteuid
+            108,    // getegid
+            110,    // getppid
+            186,    // gettid
         ];
 
-        let &(syscall_num, arg_count) =
-            syscalls.get(self.rng.gen_range(0..syscalls.len()))
-                .unwrap();
-
-        let mut args = Vec::new();
-        for _ in 0..arg_count {
-            args.push(self.generate_random_argument());
-        }
+        let syscall_num = syscalls[self.rng.gen_range(0..syscalls.len())];
 
         Syscall {
             number: syscall_num,
-            args,
+            args: vec![],
         }
     }
 
