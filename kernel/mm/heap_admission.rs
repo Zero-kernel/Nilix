@@ -747,10 +747,19 @@ pub fn run_heap_admission_self_test() {
 ///
 /// PHASE 2 KCOV+FUZZ_RUNNER: The fuzz_runner feature adds ~30 KB of boot footprint
 /// (coverage infrastructure + larger userspace binary embedded + executor runtime).
-/// Budget raised to 256 KiB to accommodate this legitimate instrumentation overhead
-/// while maintaining the fail-closed discipline for production builds.
+///
+/// RE-PINNED (syz-fuzz crash triage, 2026-08-16): the prior 256 KiB ceiling was
+/// calibrated for a single-core Balanced boot and did not bound the KASLR-varied
+/// fuzz boot, which panicked at the `:576` assert on every run. Measured
+/// baseline_unledgered across fuzz boots (KASLR on, fresh syz ext3 disk):
+/// 279,816 / 284,392 / 284,928 / 288,864 B — max 288,864 B (≈282 KiB). Applying
+/// the same provenance protocol (measured max + ~25%, rounded to the next
+/// 32 KiB step): 288,864 × 1.27 ≈ 367 KiB → 384 KiB. This bounds the observed
+/// variance while maintaining the fail-closed discipline for production builds
+/// (the non-fuzz_runner 224 KiB value below is untouched). Re-measure and
+/// re-pin if the fuzz boot allocation profile changes again.
 #[cfg(feature = "fuzz_runner")]
-pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 256 * 1024;
+pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 384 * 1024;
 
 #[cfg(not(feature = "fuzz_runner"))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
