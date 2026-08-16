@@ -19,6 +19,12 @@ clone_test = []
 stress_runner = []
 # Enable KCOV fuzz runner test program (Phase 2 completion)
 fuzz_runner = ["mm/fuzz_runner", "kcov"]
+# Enable the syzkaller-style guest executor as the Ring-3 boot program. Unlike
+# fuzz_runner (a deterministic self-contained test), the syz executor reads a
+# fuzz program from the mounted ext3 disk (/mnt/test/syz-program.bin) and emits
+# NILIX_SYZ_V2_* markers for the host syz-fuzzer. Mutually exclusive with
+# fuzz_runner at the USER_ELF_ALIGNED selection (build one or the other).
+syz_executor = ["mm/syz_executor", "kcov"]
 # Enable kernel code coverage instrumentation for fuzzing
 kcov = ["coverage/kcov", "kernel_core/kcov"]
 

@@ -219,6 +219,19 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len()
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("fuzz_runner.elf").len() }> =
     AlignedElfData(*include_bytes!("fuzz_runner.elf"));
 
+/// Embedded syzkaller-style guest executor with proper alignment
+///
+/// The syz executor (userspace/nilix_syz_executor.c) is the Ring-3 boot program
+/// the host syz-fuzzer (userspace/nilix-syz-fuzzer) drives. It reads a fuzz
+/// program from the mounted ext3 disk at /mnt/test/syz-program.bin, runs it
+/// under per-task KCOV over a non-destructive syscall allowlist, emits
+/// NILIX_SYZ_V2_BEGIN/PASS/FAIL serial markers, and atomically publishes an
+/// authenticated result at /mnt/test/syz-result.bin. Mutually exclusive with
+/// fuzz_runner (which embeds its own deterministic test program).
+#[cfg(feature = "syz_executor")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("nilix_syz_executor.elf").len() }> =
+    AlignedElfData(*include_bytes!("nilix_syz_executor.elf"));
+
 /// Embedded bounded Ring-3 workload used by the monthly stress gate.
 #[cfg(feature = "stress_runner")]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("stress_runner.elf").len() }> =
@@ -237,7 +250,8 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("stress_runner.elf").le
     feature = "musl_test",
     feature = "clone_test",
     feature = "stress_runner",
-    feature = "fuzz_runner"
+    feature = "fuzz_runner",
+    feature = "syz_executor"
 )))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
@@ -314,13 +328,16 @@ const PROCESS_NAME: &str = "clone_test";
 const PROCESS_NAME: &str = "stress_runner";
 #[cfg(feature = "fuzz_runner")]
 const PROCESS_NAME: &str = "fuzz_runner";
+#[cfg(feature = "syz_executor")]
+const PROCESS_NAME: &str = "syz_executor";
 #[cfg(not(any(
     feature = "shell",
     feature = "syscall_test",
     feature = "musl_test",
     feature = "clone_test",
     feature = "stress_runner",
-    feature = "fuzz_runner"
+    feature = "fuzz_runner",
+    feature = "syz_executor"
 )))]
 const PROCESS_NAME: &str = "hello";
 
