@@ -32,6 +32,19 @@ KCOV_ESP_DIR := $(CURDIR)/$(KCOV_ESP)/EFI/BOOT
 KCOV_RUNNER_USER := userspace/fuzz_runner.elf
 KCOV_RUNNER_EMBEDDED := kernel/src/fuzz_runner.elf
 
+# Syzkaller-style executor kernel. Unlike build-kcov (which embeds the
+# deterministic fuzz_runner.elf test program for make test-kcov), build-syz-kcov
+# embeds nilix_syz_executor.elf — the Ring-3 program the host syz-fuzzer drives.
+# The executor reads a fuzz program from the mounted ext3 disk and emits
+# NILIX_SYZ_V2_* markers. Isolated target dir + ESP so a reused artifact can
+# never boot the wrong guest program (same discipline as KCOV/stress/musl).
+SYZ_TARGET_DIR := kernel-target/syz
+SYZ_KERNEL := $(SYZ_TARGET_DIR)/x86_64-unknown-none/release/kernel
+SYZ_ESP := esp-syz
+SYZ_ESP_DIR := $(CURDIR)/$(SYZ_ESP)/EFI/BOOT
+SYZ_EXEC_USER := userspace/nilix_syz_executor.elf
+SYZ_EXEC_EMBEDDED := kernel/src/nilix_syz_executor.elf
+
 all: build
 
 build:
@@ -1027,6 +1040,52 @@ run-kcov: build-kcov
 # Boot QEMU and validate the deterministic guest executor markers.
 test-kcov: build-kcov
 	bash scripts/fuzz_runner_test.sh "$(KCOV_ESP)"
+
+
+# === Syzkaller-Style Executor Kernel (embeds nilix_syz_executor.elf) ===
+
+# Build the syz guest executor and copy it into the kernel source tree so the
+# syz_executor feature can include_bytes! it. Mirrors build-kcov-runner.
+build-syz-executor-embedded:
+	@echo "=== Building syzkaller guest executor (embedded) ==="
+	musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror \
+		-o "$(SYZ_EXEC_USER)" userspace/nilix_syz_executor.c
+	cp "$(SYZ_EXEC_USER)" "$(SYZ_EXEC_EMBEDDED)"
+	@cmp -s "$(SYZ_EXEC_USER)" "$(SYZ_EXEC_EMBEDDED)"
+	@echo "syz executor SHA-256: $$(sha256sum "$(SYZ_EXEC_EMBEDDED)" | awk '{print $$1}')"
+	@readelf -h "$(SYZ_EXEC_EMBEDDED)" | grep "Entry\|Type"
+
+# Build the isolated kernel that boots the syz guest executor (reads a fuzz
+# program from the mounted ext3 disk, emits NILIX_SYZ_V2_* markers). Mirrors
+# build-kcov but with --features kcov,syz_executor and its own ESP. build-kcov
+# (esp-kcov, fuzz_runner.elf) stays the deterministic test-kcov path — untouched.
+build-syz-kcov: build-syz-executor-embedded
+	@echo "=== Building bootloader for syz executor kernel ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
+
+	@echo "=== Building isolated syz-executor kernel ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../$(SYZ_TARGET_DIR) \
+	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features kcov,syz_executor
+
+	@echo "=== Preparing isolated syz-executor ESP ==="
+	mkdir -p "$(SYZ_ESP_DIR)"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(SYZ_ESP_DIR)/BOOTX64.EFI"
+	cp "$(SYZ_KERNEL)" "$(SYZ_ESP)/kernel.elf"
+	@cmp -s "$(SYZ_KERNEL)" "$(SYZ_ESP)/kernel.elf"
+	@echo "syz-executor kernel SHA-256: $$(sha256sum "$(SYZ_ESP)/kernel.elf" | awk '{print $$1}')"
+	@readelf -h "$(SYZ_ESP)/kernel.elf" | grep "Entry\|Type"
+	@echo "=== 构建完成（syz executor 模式）==="
+
+# Run the syz-executor kernel interactively from its single isolated ESP.
+run-syz-kcov: QEMU_ESP := $(SYZ_ESP)
+run-syz-kcov: build-syz-kcov
+	@echo "=== 启动内核（syz executor 模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) \
+		-nographic
 
 
 # === Phase 8: Cargo-Fuzz Integration with QEMU Executor ===
