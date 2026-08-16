@@ -4401,6 +4401,9 @@ pub fn run_ext2_create_self_test() {
 
     fn build_image() -> Vec<u8> {
         let mut image = Vec::new();
+        image
+            .try_reserve_exact(BLOCKS * BLOCK_SIZE)
+            .expect("FileCreate synthetic image");
         image.resize(BLOCKS * BLOCK_SIZE, 0u8);
         let uuid = [0x5Au8; 16];
         let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
@@ -4499,8 +4502,12 @@ pub fn run_ext2_create_self_test() {
         write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
         write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
         write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
-        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
-            .expect("features");
+        write_be_u32(
+            jsuper,
+            JBD2_SUPER_FEATURE_INCOMPAT_OFFSET,
+            JBD2_FEATURE_INCOMPAT_ZERO_INTENT,
+        )
+        .expect("features");
         jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
         write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
         image
@@ -4565,7 +4572,9 @@ pub fn run_ext2_create_self_test() {
                 .ok()
                 .and_then(|s| s.checked_mul(512))
                 .ok_or(block::BlockError::Invalid)?;
-            let end = start.checked_add(buf.len()).ok_or(block::BlockError::Invalid)?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or(block::BlockError::Invalid)?;
             buf.copy_from_slice(
                 self.live
                     .lock()
@@ -4579,7 +4588,9 @@ pub fn run_ext2_create_self_test() {
                 .ok()
                 .and_then(|s| s.checked_mul(512))
                 .ok_or(block::BlockError::Invalid)?;
-            let end = start.checked_add(buf.len()).ok_or(block::BlockError::Invalid)?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or(block::BlockError::Invalid)?;
             let _op = self.begin()?;
             self.live
                 .lock()
@@ -4634,15 +4645,18 @@ pub fn run_ext2_create_self_test() {
 
     // Scenario A: happy path — create commits and is immediately visible.
     {
-        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 0))
-            .expect("happy-path device");
+        let device =
+            Arc::try_new(CreateCrashDevice::new(build_image(), 0)).expect("happy-path device");
         let dev: Arc<dyn BlockDevice> = device.clone();
         let fs = Ext2Fs::mount(dev).expect("mount happy-path image");
         let root = fs.root_inode();
         let new_inode = fs
             .create(&root, "newfile", FileMode::regular(0o600))
             .expect("create happy path");
-        assert!(Arc::ptr_eq(&new_inode, &fs.lookup(&root, "newfile").expect("lookup")));
+        assert!(Arc::ptr_eq(
+            &new_inode,
+            &fs.lookup(&root, "newfile").expect("lookup")
+        ));
         assert_state(&fs, true);
         klog_always!("    Ext2Fs::create happy-path + 6-block commit passed");
     }
@@ -4659,7 +4673,8 @@ pub fn run_ext2_create_self_test() {
         let fs = Ext2Fs::mount(dev).expect("mount crash-before-commit image");
         let root = fs.root_inode();
         assert!(
-            fs.create(&root, "newfile", FileMode::regular(0o600)).is_err(),
+            fs.create(&root, "newfile", FileMode::regular(0o600))
+                .is_err(),
             "create must fail when the commit write crashes"
         );
         drop(root);
@@ -4686,7 +4701,8 @@ pub fn run_ext2_create_self_test() {
         let fs = Ext2Fs::mount(dev).expect("mount crash-after-commit image");
         let root = fs.root_inode();
         assert!(
-            fs.create(&root, "newfile", FileMode::regular(0o600)).is_err(),
+            fs.create(&root, "newfile", FileMode::regular(0o600))
+                .is_err(),
             "create must fail when the checkpoint write crashes (committed + poison)"
         );
         drop(root);
@@ -4709,6 +4725,9 @@ pub fn run_ext2_create_self_test() {
     // on one block — the path Scenarios A-C (6-home) do not touch.
     fn build_coalesced_image() -> Vec<u8> {
         let mut image = Vec::new();
+        image
+            .try_reserve_exact(BLOCKS * BLOCK_SIZE)
+            .expect("FileCreate coalesced synthetic image");
         image.resize(BLOCKS * BLOCK_SIZE, 0u8);
         let uuid = [0x5Au8; 16];
         let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
@@ -4766,7 +4785,11 @@ pub fn run_ext2_create_self_test() {
         root.links_count = 3; // ".", "..", "sub"
         root.blocks_lo = 2;
         root.block[0] = 7;
-        put(&mut image, 5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(), &root);
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(),
+            &root,
+        );
 
         // Sub-directory inode (ino 12) at block 6, index 11 (offset 384).
         let mut sub = Ext2InodeRaw::default();
@@ -4775,7 +4798,11 @@ pub fn run_ext2_create_self_test() {
         sub.links_count = 2;
         sub.blocks_lo = 2;
         sub.block[0] = 21;
-        put(&mut image, 6 * BLOCK_SIZE + 3 * size_of::<Ext2InodeRaw>(), &sub);
+        put(
+            &mut image,
+            6 * BLOCK_SIZE + 3 * size_of::<Ext2InodeRaw>(),
+            &sub,
+        );
 
         // Root directory data block (block 7): ".", "..", "sub".
         let dir = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
@@ -4820,7 +4847,11 @@ pub fn run_ext2_create_self_test() {
         for i in 0..JOURNAL_MAXLEN as usize {
             jin.block[i] = JOURNAL_FIRST_PHYS + i as u32;
         }
-        put(&mut image, 5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(), &jin);
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(),
+            &jin,
+        );
         let jsuper = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
             ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
         write_be_u32(jsuper, 0, JBD2_MAGIC).expect("journal magic");
@@ -4830,8 +4861,12 @@ pub fn run_ext2_create_self_test() {
         write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
         write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
         write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
-        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
-            .expect("features");
+        write_be_u32(
+            jsuper,
+            JBD2_SUPER_FEATURE_INCOMPAT_OFFSET,
+            JBD2_FEATURE_INCOMPAT_ZERO_INTENT,
+        )
+        .expect("features");
         jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
         write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
         image
@@ -4863,8 +4898,13 @@ pub fn run_ext2_create_self_test() {
             4,
             "group free count 5->4"
         );
-        assert!(fs.inode_is_allocated(NEW_INO).expect("alloc check"), "bit set");
-        let resolved = fs.lookup(&sub, "newfile").expect("lookup newfile under sub");
+        assert!(
+            fs.inode_is_allocated(NEW_INO).expect("alloc check"),
+            "bit set"
+        );
+        let resolved = fs
+            .lookup(&sub, "newfile")
+            .expect("lookup newfile under sub");
         assert!(Arc::ptr_eq(&resolved, &new_inode), "cache-canonical Arc");
         let stat = resolved.stat().expect("stat");
         assert!(stat.mode.is_file(), "regular file");
@@ -4884,7 +4924,8 @@ pub fn run_ext2_create_self_test() {
         let root = fs.root_inode();
         let sub = fs.lookup(&root, "sub").expect("lookup sub");
         assert!(
-            fs.create(&sub, "newfile", FileMode::regular(0o600)).is_err(),
+            fs.create(&sub, "newfile", FileMode::regular(0o600))
+                .is_err(),
             "coalesced create must fail when the checkpoint write crashes"
         );
         drop(sub);
@@ -4896,7 +4937,9 @@ pub fn run_ext2_create_self_test() {
         let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after coalesced crash");
         let root2 = fs2.root_inode();
         let sub2 = fs2.lookup(&root2, "sub").expect("lookup sub after replay");
-        let nf = fs2.lookup(&sub2, "newfile").expect("lookup newfile after replay");
+        let nf = fs2
+            .lookup(&sub2, "newfile")
+            .expect("lookup newfile after replay");
         assert_eq!(nf.ino(), NEW_INO as u64);
         assert_eq!(fs2.superblock.read().free_inodes_count, 4);
         assert!(fs2.inode_is_allocated(NEW_INO).expect("alloc check"));
@@ -4913,6 +4956,9 @@ pub fn run_ext2_create_self_test() {
     // re-derivation).
     fn build_rename_image() -> Vec<u8> {
         let mut image = Vec::new();
+        image
+            .try_reserve_exact(BLOCKS * BLOCK_SIZE)
+            .expect("FileRename synthetic image");
         image.resize(BLOCKS * BLOCK_SIZE, 0u8);
         let uuid = [0x5Au8; 16];
         let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
@@ -4966,7 +5012,11 @@ pub fn run_ext2_create_self_test() {
         root.links_count = 2;
         root.blocks_lo = 2;
         root.block[0] = 7;
-        put(&mut image, 5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(), &root);
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>(),
+            &root,
+        );
 
         // "oldfile" inode (ino 11): table-relative offset (11-1)*128 from the
         // inode table start (block 5) → lands in block 6 at offset 256.
@@ -5014,7 +5064,11 @@ pub fn run_ext2_create_self_test() {
         for i in 0..JOURNAL_MAXLEN as usize {
             jin.block[i] = JOURNAL_FIRST_PHYS + i as u32;
         }
-        put(&mut image, 5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(), &jin);
+        put(
+            &mut image,
+            5 * BLOCK_SIZE + 7 * size_of::<Ext2InodeRaw>(),
+            &jin,
+        );
         let jsuper = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
             ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
         write_be_u32(jsuper, 0, JBD2_MAGIC).expect("journal magic");
@@ -5024,8 +5078,12 @@ pub fn run_ext2_create_self_test() {
         write_be_u32(jsuper, JBD2_SUPER_FIRST_OFFSET, 1).expect("first");
         write_be_u32(jsuper, JBD2_SUPER_SEQUENCE_OFFSET, 1).expect("sequence");
         write_be_u32(jsuper, JBD2_SUPER_START_OFFSET, 0).expect("start");
-        write_be_u32(jsuper, JBD2_SUPER_FEATURE_INCOMPAT_OFFSET, JBD2_FEATURE_INCOMPAT_ZERO_INTENT)
-            .expect("features");
+        write_be_u32(
+            jsuper,
+            JBD2_SUPER_FEATURE_INCOMPAT_OFFSET,
+            JBD2_FEATURE_INCOMPAT_ZERO_INTENT,
+        )
+        .expect("features");
         jsuper[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
         write_be_u32(jsuper, JBD2_SUPER_NR_USERS_OFFSET, 1).expect("nr_users");
         image
@@ -5074,13 +5132,26 @@ pub fn run_ext2_create_self_test() {
             None,
         )
         .expect("rename happy path");
-        let new = fs.lookup(&root, "newfile").expect("newfile exists after rename");
+        let new = fs
+            .lookup(&root, "newfile")
+            .expect("newfile exists after rename");
         assert_eq!(new.ino(), NEW_INO as u64, "newfile is the same inode");
-        assert!(matches!(fs.lookup(&root, "oldfile"), Err(FsError::NotFound)));
+        assert!(matches!(
+            fs.lookup(&root, "oldfile"),
+            Err(FsError::NotFound)
+        ));
         assert!(Arc::ptr_eq(&old, &new), "cache-canonical Arc unchanged");
         // NOREPLACE: renaming onto an existing name must fail.
         assert!(fs
-            .rename(&root, "newfile", &root, "newfile", true, NEW_INO as u64, None)
+            .rename(
+                &root,
+                "newfile",
+                &root,
+                "newfile",
+                true,
+                NEW_INO as u64,
+                None
+            )
             .is_err());
         klog_always!("    Ext2Fs::rename happy path passed");
     }
@@ -5091,13 +5162,22 @@ pub fn run_ext2_create_self_test() {
     // its flush land at op 10 for the 2-home rename tx; the first checkpoint
     // home write is op 11.  Failing at op 11 leaves the commit durable.
     {
-        let device =
-            Arc::try_new(CreateCrashDevice::new(build_rename_image(), 11)).expect("rename crash device");
+        let device = Arc::try_new(CreateCrashDevice::new(build_rename_image(), 11))
+            .expect("rename crash device");
         let dev: Arc<dyn BlockDevice> = device.clone();
         let fs = Ext2Fs::mount(dev).expect("mount rename crash image");
         let root = fs.root_inode();
         assert!(
-            fs.rename(&root, "oldfile", &root, "newfile", true, NEW_INO as u64, None).is_err(),
+            fs.rename(
+                &root,
+                "oldfile",
+                &root,
+                "newfile",
+                true,
+                NEW_INO as u64,
+                None
+            )
+            .is_err(),
             "rename must fail when the checkpoint write crashes"
         );
         drop(root);
@@ -7217,7 +7297,10 @@ impl Ext2Fs {
                     let slot_end = start
                         .checked_add(self.inode_size as usize)
                         .ok_or(FsError::Invalid)?;
-                    image.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                    image
+                        .get_mut(start..slot_end)
+                        .ok_or(FsError::Invalid)?
+                        .fill(0);
                     if role == FileCreateHomeRole::CoalescedInode {
                         Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
                     }
@@ -7261,12 +7344,18 @@ impl Ext2Fs {
         let mut off = 0usize;
         let mut prev_off: Option<usize> = None;
         while off < block_size
-            && off.checked_add(head_size).map_or(false, |end| end <= block_size)
+            && off
+                .checked_add(head_size)
+                .map_or(false, |end| end <= block_size)
         {
             let head: Ext2DirEntryHead =
                 unsafe { core::ptr::read_unaligned(image[off..].as_ptr() as *const _) };
             let rec_len = usize::from(head.rec_len);
-            if rec_len < head_size || off.checked_add(rec_len).map_or(true, |end| end > block_size) {
+            if rec_len < head_size
+                || off
+                    .checked_add(rec_len)
+                    .map_or(true, |end| end > block_size)
+            {
                 return Err(FsError::Invalid);
             }
             if head.inode == new_ino {
@@ -7349,7 +7438,9 @@ impl Ext2Fs {
         let head_size = size_of::<Ext2DirEntryHead>();
         if dir_off >= self.block_size as usize
             || rec_len < head_size
-            || dir_off.checked_add(rec_len).map_or(true, |e| e > self.block_size as usize)
+            || dir_off
+                .checked_add(rec_len)
+                .map_or(true, |e| e > self.block_size as usize)
         {
             return Err(FsError::Invalid);
         }
@@ -7383,7 +7474,9 @@ impl Ext2Fs {
                     slot.get_mut(8..name_end)
                         .ok_or(FsError::Invalid)?
                         .copy_from_slice(&intent.rename_old_name[..old_len]);
-                    slot.get_mut(name_end..rec_len).ok_or(FsError::Invalid)?.fill(0);
+                    slot.get_mut(name_end..rec_len)
+                        .ok_or(FsError::Invalid)?
+                        .fill(0);
                 }
                 1 => {
                     Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
@@ -8229,8 +8322,8 @@ impl Ext2Fs {
         let mut rename_old_name = [0u8; 255];
         if kind == ZERO_INTENT_KIND_FILE_RENAME {
             rename_old_name.copy_from_slice(
-                &block[ZERO_INTENT_RENAME_OLD_NAME_OFFSET
-                    ..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255],
+                &block
+                    [ZERO_INTENT_RENAME_OLD_NAME_OFFSET..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255],
             );
         }
         let valid_update = kind == ZERO_INTENT_KIND_INODE_UPDATE
@@ -8575,7 +8668,9 @@ impl Ext2Fs {
             .copy_from_slice(one_commit.block());
         if first_plus_3 < journal.max_len {
             let img2_start = raw_block_bytes.checked_mul(2).ok_or(FsError::Invalid)?;
-            let img2_end = img2_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+            let img2_end = img2_start
+                .checked_add(raw_block_bytes)
+                .ok_or(FsError::Invalid)?;
             raw_images
                 .get_mut(img2_start..img2_end)
                 .ok_or(FsError::Invalid)?
@@ -8588,11 +8683,15 @@ impl Ext2Fs {
             .filter(|value| *value < journal.max_len)
             .ok_or(FsError::Invalid)?;
         let img3_start = raw_block_bytes.checked_mul(3).ok_or(FsError::Invalid)?;
-        let img3_end = img3_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+        let img3_end = img3_start
+            .checked_add(raw_block_bytes)
+            .ok_or(FsError::Invalid)?;
         self.read_journal_block(
             journal,
             first_plus_4,
-            raw_images.get_mut(img3_start..img3_end).ok_or(FsError::Invalid)?,
+            raw_images
+                .get_mut(img3_start..img3_end)
+                .ok_or(FsError::Invalid)?,
         )?;
         let mut four_commit = Ext2MutationScratch::try_new(self.block_size)?;
         self.read_journal_block(journal, four_commit_logical, four_commit.block_mut())?;
@@ -8639,7 +8738,9 @@ impl Ext2Fs {
             let img_start = (count_usize - 1)
                 .checked_mul(raw_block_bytes)
                 .ok_or(FsError::Invalid)?;
-            let img_end = img_start.checked_add(raw_block_bytes).ok_or(FsError::Invalid)?;
+            let img_end = img_start
+                .checked_add(raw_block_bytes)
+                .ok_or(FsError::Invalid)?;
             raw_images
                 .get_mut(img_start..img_end)
                 .ok_or(FsError::Invalid)?
@@ -9402,7 +9503,10 @@ impl Ext2Fs {
                             )
                         };
                         let end = offset.checked_add(bytes.len()).ok_or(FsError::Invalid)?;
-                        block.get_mut(offset..end).ok_or(FsError::Invalid)?.copy_from_slice(bytes);
+                        block
+                            .get_mut(offset..end)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(bytes);
                     }
                     FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
                         // Zero the full on-disk inode slot, then write the
@@ -9412,7 +9516,10 @@ impl Ext2Fs {
                         let slot_end = start
                             .checked_add(self.inode_size as usize)
                             .ok_or(FsError::Invalid)?;
-                        block.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                        block
+                            .get_mut(start..slot_end)
+                            .ok_or(FsError::Invalid)?
+                            .fill(0);
                         Self::replace_inode_in_block(
                             block,
                             plan.new_inode_target,
@@ -9440,7 +9547,9 @@ impl Ext2Fs {
             }
             JournalMetadataPlan::Rename(plan) => match index {
                 0 => Self::write_rename_dirent(&plan, block)?,
-                1 => Self::replace_inode_in_block(block, plan.parent_target, &plan.new_parent_inode)?,
+                1 => {
+                    Self::replace_inode_in_block(block, plan.parent_target, &plan.new_parent_inode)?
+                }
                 _ => return Err(FsError::Invalid),
             },
         }
@@ -9455,7 +9564,9 @@ impl Ext2Fs {
         let slot_start = plan.dir_off;
         let slot_end = slot_start.checked_add(slot_len).ok_or(FsError::Invalid)?;
         // `slot` is block[dir_off..dir_off+rec_len]; index within it is 0..rec_len.
-        let slot = block.get_mut(slot_start..slot_end).ok_or(FsError::Invalid)?;
+        let slot = block
+            .get_mut(slot_start..slot_end)
+            .ok_or(FsError::Invalid)?;
         slot[6] = plan.new_name_len;
         let new_len = usize::from(plan.new_name_len);
         let name_end = 8usize.checked_add(new_len).ok_or(FsError::Invalid)?;
@@ -9464,7 +9575,9 @@ impl Ext2Fs {
             .copy_from_slice(&plan.new_name[..new_len]);
         // Zero the padding between the new name and the entry's rec_len end so
         // the preimage reversal (restore old name + zero tail) is exact.
-        slot.get_mut(name_end..slot_len).ok_or(FsError::Invalid)?.fill(0);
+        slot.get_mut(name_end..slot_len)
+            .ok_or(FsError::Invalid)?
+            .fill(0);
         Ok(())
     }
 
@@ -9486,7 +9599,9 @@ impl Ext2Fs {
             .dir_new_off
             .checked_add(plan.dir_new_rec_len as usize)
             .ok_or(FsError::Invalid)?;
-        let slot = block.get_mut(plan.dir_new_off..new_end).ok_or(FsError::Invalid)?;
+        let slot = block
+            .get_mut(plan.dir_new_off..new_end)
+            .ok_or(FsError::Invalid)?;
         slot.fill(0);
         // Ext2DirEntryHead: inode@0, rec_len@4, name_len@6, file_type@7
         slot[0..4].copy_from_slice(&plan.new_ino.to_le_bytes());
@@ -9629,7 +9744,9 @@ impl Ext2Fs {
                             )
                         };
                         let end = offset.checked_add(bytes.len()).ok_or(FsError::Invalid)?;
-                        pre.get_mut(offset..end).ok_or(FsError::Invalid)?.copy_from_slice(bytes);
+                        pre.get_mut(offset..end)
+                            .ok_or(FsError::Invalid)?
+                            .copy_from_slice(bytes);
                     }
                     FileCreateHomeRole::NewInode | FileCreateHomeRole::CoalescedInode => {
                         // Pre-image slot was all zero (all-zero-slot gate).
@@ -9637,7 +9754,9 @@ impl Ext2Fs {
                         let slot_end = start
                             .checked_add(self.inode_size as usize)
                             .ok_or(FsError::Invalid)?;
-                        pre.get_mut(start..slot_end).ok_or(FsError::Invalid)?.fill(0);
+                        pre.get_mut(start..slot_end)
+                            .ok_or(FsError::Invalid)?
+                            .fill(0);
                         if role == FileCreateHomeRole::CoalescedInode {
                             Self::replace_inode_in_block(
                                 &mut pre,
@@ -9658,9 +9777,11 @@ impl Ext2Fs {
                             .dir_last_off
                             .checked_add(core::mem::offset_of!(Ext2DirEntryHead, rec_len))
                             .ok_or(FsError::Invalid)?;
-                        pre.get_mut(rec_len_off..rec_len_off.checked_add(2).ok_or(FsError::Invalid)?)
-                            .ok_or(FsError::Invalid)?
-                            .copy_from_slice(&plan.dir_old_rec_len.to_le_bytes());
+                        pre.get_mut(
+                            rec_len_off..rec_len_off.checked_add(2).ok_or(FsError::Invalid)?,
+                        )
+                        .ok_or(FsError::Invalid)?
+                        .copy_from_slice(&plan.dir_old_rec_len.to_le_bytes());
                         let new_end = plan
                             .dir_new_off
                             .checked_add(plan.dir_new_rec_len as usize)
@@ -9690,14 +9811,18 @@ impl Ext2Fs {
                         // `rec_len`, not the absolute dir_off+rec_len.
                         let rec_len = usize::from(plan.rec_len);
                         let slot_end = plan.dir_off.checked_add(rec_len).ok_or(FsError::Invalid)?;
-                        let slot = pre.get_mut(plan.dir_off..slot_end).ok_or(FsError::Invalid)?;
+                        let slot = pre
+                            .get_mut(plan.dir_off..slot_end)
+                            .ok_or(FsError::Invalid)?;
                         slot[6] = plan.old_name_len;
                         let old_len = usize::from(plan.old_name_len);
                         let name_end = 8usize.checked_add(old_len).ok_or(FsError::Invalid)?;
                         slot.get_mut(8..name_end)
                             .ok_or(FsError::Invalid)?
                             .copy_from_slice(&plan.old_name[..old_len]);
-                        slot.get_mut(name_end..rec_len).ok_or(FsError::Invalid)?.fill(0);
+                        slot.get_mut(name_end..rec_len)
+                            .ok_or(FsError::Invalid)?
+                            .fill(0);
                     }
                     1 => {
                         Self::replace_inode_in_block(
@@ -9818,7 +9943,11 @@ impl Ext2Fs {
             if block.len() < ZERO_INTENT_FILE_RENAME_END {
                 return Err(FsError::Invalid);
             }
-            write_be_u32(block, ZERO_INTENT_RENAME_DIR_OFF_OFFSET, intent.rename_dir_off)?;
+            write_be_u32(
+                block,
+                ZERO_INTENT_RENAME_DIR_OFF_OFFSET,
+                intent.rename_dir_off,
+            )?;
             block[ZERO_INTENT_RENAME_REC_LEN_OFFSET..ZERO_INTENT_RENAME_REC_LEN_OFFSET + 2]
                 .copy_from_slice(&intent.rename_rec_len.to_be_bytes());
             block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET] = intent.rename_old_name_len;
@@ -11182,11 +11311,14 @@ impl FileSystem for Ext2Fs {
         if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
             return Err(FsError::NotSupported);
         }
-        let dir_block_home =
-            match fs.map_file_block_with_scratch(&committed_parent, last_block_idx, &mut scratch)? {
-                Some(phys) => phys,
-                None => return Err(FsError::NotSupported),
-            };
+        let dir_block_home = match fs.map_file_block_with_scratch(
+            &committed_parent,
+            last_block_idx,
+            &mut scratch,
+        )? {
+            Some(phys) => phys,
+            None => return Err(FsError::NotSupported),
+        };
         fs.read_block(dir_block_home, scratch.block_mut())?;
         let dir_block = scratch.block();
         let head_size = size_of::<Ext2DirEntryHead>();
@@ -11194,7 +11326,10 @@ impl FileSystem for Ext2Fs {
         let mut last_off = 0usize;
         let mut last_rec_len = 0u16;
         let mut last_name_len = 0u8;
-        while off.checked_add(head_size).map_or(false, |end| end <= block_size_us) {
+        while off
+            .checked_add(head_size)
+            .map_or(false, |end| end <= block_size_us)
+        {
             let head: Ext2DirEntryHead =
                 unsafe { core::ptr::read_unaligned(dir_block[off..].as_ptr() as *const _) };
             let rec_len = usize::from(head.rec_len);
@@ -11202,7 +11337,9 @@ impl FileSystem for Ext2Fs {
             // front so the carved entry stays 4-aligned.
             if rec_len < head_size
                 || rec_len % 4 != 0
-                || off.checked_add(rec_len).map_or(true, |end| end > block_size_us)
+                || off
+                    .checked_add(rec_len)
+                    .map_or(true, |end| end > block_size_us)
             {
                 return Err(FsError::Invalid);
             }
@@ -11234,7 +11371,9 @@ impl FileSystem for Ext2Fs {
         let dir_new_rec_len = u16::try_from(new_rec_len).map_err(|_| FsError::Invalid)?;
         // Clean-tail gate: the carved region must be all zero in the pre-image so
         // the recovery preimage reversal is exact.
-        let carve_end = dir_new_off.checked_add(new_rec_len).ok_or(FsError::Invalid)?;
+        let carve_end = dir_new_off
+            .checked_add(new_rec_len)
+            .ok_or(FsError::Invalid)?;
         if dir_block[dir_new_off..carve_end].iter().any(|&b| b != 0) {
             return Err(FsError::NotSupported);
         }
@@ -11432,11 +11571,9 @@ impl FileSystem for Ext2Fs {
         *fs.superblock.write() = new_superblock;
         fs.group_descs.write()[new_group] = new_group_desc;
         *raw_guard = new_parent_inode;
-        let new_inode = fs
-            .inode_cache
-            .get_or_try_insert_with(new_ino, || {
-                fs.new_inode_from_raw(new_ino, new_inode_raw_for_publish)
-            })?;
+        let new_inode = fs.inode_cache.get_or_try_insert_with(new_ino, || {
+            fs.new_inode_from_raw(new_ino, new_inode_raw_for_publish)
+        })?;
         if let Some(failure) = transaction_failure {
             if failure.poison {
                 fs.io_faulted.store(true, Ordering::Release);
@@ -11558,7 +11695,10 @@ impl FileSystem for Ext2Fs {
             fs.read_block(dir_block_home, scratch.block_mut())?;
             let dir_block = scratch.block();
             let mut off = 0usize;
-            while off.checked_add(head_size).map_or(false, |end| end <= block_size_us) {
+            while off
+                .checked_add(head_size)
+                .map_or(false, |end| end <= block_size_us)
+            {
                 let head: Ext2DirEntryHead =
                     unsafe { core::ptr::read_unaligned(dir_block[off..].as_ptr() as *const _) };
                 let rec_len = usize::from(head.rec_len);
@@ -11613,11 +11753,14 @@ impl FileSystem for Ext2Fs {
             return Err(FsError::NotSupported);
         }
         // The dir-data home is the last block (re-derive it for the plan).
-        let dir_block_home =
-            match fs.map_file_block_with_scratch(&committed_parent, last_block_idx, &mut scratch)? {
-                Some(phys) => phys,
-                None => return Err(FsError::NotSupported),
-            };
+        let dir_block_home = match fs.map_file_block_with_scratch(
+            &committed_parent,
+            last_block_idx,
+            &mut scratch,
+        )? {
+            Some(phys) => phys,
+            None => return Err(FsError::NotSupported),
+        };
 
         // Dest name must fit in the source entry's rec_len (in-place rewrite).
         let new_entry_min = (8usize + new_name.len() + 3) & !3;
@@ -11637,7 +11780,8 @@ impl FileSystem for Ext2Fs {
         if dir_block_home == parent_target.block {
             return Err(FsError::NotSupported);
         }
-        if journal.contains_physical(dir_block_home) || journal.contains_physical(parent_target.block)
+        if journal.contains_physical(dir_block_home)
+            || journal.contains_physical(parent_target.block)
         {
             return Err(FsError::Invalid);
         }
