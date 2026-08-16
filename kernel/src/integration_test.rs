@@ -387,6 +387,8 @@ pub fn test_ext2_write() {
     klog_always!("    RF178-39 fallible IOMMU mapping tracker passed");
     vfs::ext2::run_ext2_inode_cache_self_test();
     klog_always!("    RF178-37 canonical inode-cache lifecycle passed");
+    vfs::ext2::run_ext2_create_self_test();
+    klog_always!("    Ext2Fs::create transactional file creation passed");
 
     // Optional mounted-image probe. The deterministic fail-closed production
     // open/cache test above is the RF178-37 acceptance criterion.
@@ -457,6 +459,72 @@ pub fn test_ext2_write() {
                             Err(e) => {
                                 klog_always!(
                                     "    - /mnt/test/alloc.bin unavailable: {:?}; R180-6 JBD2 write probe skipped",
+                                    e
+                                );
+                            }
+                        }
+
+                        // Ext2Fs::create production probe: O_CREAT|O_EXCL must
+                        // traverse the transactional create path (was
+                        // result_open:-38 ENOSYS before Ext2Fs::create).  On a
+                        // fresh image the file is created (Ok) and the full probe
+                        // runs; on a reused image the file already exists (Err)
+                        // and the probe skips — the deterministic
+                        // run_ext2_create_self_test above verifies create every
+                        // boot regardless.
+                        let create_flags = vfs::OpenFlags::new(
+                            vfs::OpenFlags::O_WRONLY
+                                | vfs::OpenFlags::O_CREAT
+                                | vfs::OpenFlags::O_EXCL
+                                | vfs::OpenFlags::O_NOFOLLOW,
+                        );
+                        match vfs::open("/mnt/test/.syz-create-probe.bin", create_flags, 0o600) {
+                            Ok(probe_ops) => {
+                                let probe = probe_ops
+                                    .as_any()
+                                    .downcast_ref::<vfs::FileHandle>()
+                                    .expect("create probe FileHandle");
+                                assert_eq!(probe.write(b"X"), Ok(1), "create probe write");
+                                let probe_ino = probe.inode.stat().expect("stat create probe").ino;
+                                drop(probe);
+                                drop(probe_ops);
+                                let rd = vfs::open(
+                                    "/mnt/test/.syz-create-probe.bin",
+                                    vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY),
+                                    0,
+                                )
+                                .expect("reopen create probe O_RDONLY");
+                                let rd = rd
+                                    .as_any()
+                                    .downcast_ref::<vfs::FileHandle>()
+                                    .expect("reopen FileHandle");
+                                assert_eq!(
+                                    rd.inode.stat().expect("stat reopen").ino, probe_ino,
+                                    "create probe must be cache-canonical across opens"
+                                );
+                                let mut buf = [0u8; 1];
+                                assert_eq!(
+                                    rd.inode.read_at(0, &mut buf),
+                                    Ok(1),
+                                    "create probe readback"
+                                );
+                                assert_eq!(buf, *b"X");
+                                assert!(
+                                    matches!(
+                                        vfs::open(
+                                            "/mnt/test/.syz-create-probe.bin",
+                                            create_flags,
+                                            0o600
+                                        ),
+                                        Err(_),
+                                    ),
+                                    "O_CREAT|O_EXCL on existing must fail"
+                                );
+                                klog_always!("    Ext2Fs::create production probe passed");
+                            }
+                            Err(e) => {
+                                klog_always!(
+                                    "    - /mnt/test create probe unavailable ({:?}); create probe skipped",
                                     e
                                 );
                             }
