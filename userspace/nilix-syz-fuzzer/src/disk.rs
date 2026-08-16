@@ -12,6 +12,12 @@ use crate::program::MAX_SYSCALLS;
 
 const PROGRAM_GUEST_PATH: &str = "/test/syz-program.bin";
 const RESULT_GUEST_PATH: &str = "/test/syz-result.bin";
+/// Empty probe file the kernel's optional R180-6 JBD2 write self-test opens at
+/// `/mnt/test/alloc.bin` (see kernel/src/integration_test.rs). The production
+/// `ensure-ext3-image` Makefile fixture creates it; inject an empty copy here so
+/// the fuzz disk satisfies the probe and the self-test exercises the real JBD2
+/// allocation/commit path instead of skipping it.
+const ALLOC_PROBE_GUEST_PATH: &str = "/test/alloc.bin";
 const MIN_DISK_MIB: u64 = 16;
 const MAX_DISK_MIB: u64 = 1024;
 const MAX_RESULT_SIZE: usize =
@@ -57,9 +63,11 @@ impl Ext3Transport {
         let disk_path = work_dir.join("syz-disk.img");
         let program_path = work_dir.join("syz-program.host.bin");
         let verify_path = work_dir.join("syz-program.verify.bin");
+        let alloc_path = work_dir.join("syz-alloc-probe.host.bin");
         ensure_debugfs_safe_path(&disk_path)?;
         ensure_debugfs_safe_path(&program_path)?;
         ensure_debugfs_safe_path(&verify_path)?;
+        ensure_debugfs_safe_path(&alloc_path)?;
 
         let disk = OpenOptions::new()
             .write(true)
@@ -71,6 +79,8 @@ impl Ext3Transport {
         disk.sync_all().context("failed to sync fresh image file")?;
 
         write_new_file(&program_path, program)?;
+        // Empty probe file for the kernel's R180-6 JBD2 write self-test.
+        write_new_file(&alloc_path, &[])?;
 
         run_checked(
             &self.tools.mke2fs,
@@ -90,6 +100,15 @@ impl Ext3Transport {
             &self.tools.debugfs,
             &debugfs_args(&disk_path, true, &inject),
             "inject syz program into Ext3 image",
+        )?;
+        let inject_alloc = format!(
+            "write {} {ALLOC_PROBE_GUEST_PATH}",
+            utf8_path(&alloc_path)?
+        );
+        run_checked(
+            &self.tools.debugfs,
+            &debugfs_args(&disk_path, true, &inject_alloc),
+            "inject R180-6 alloc probe into Ext3 image",
         )?;
         self.repair_image(&disk_path)?;
 
