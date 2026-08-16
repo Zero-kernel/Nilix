@@ -18,6 +18,11 @@ host_harness = ["cpu_local/host_harness"]
 # the coverage infrastructure overhead. This feature is propagated from the kernel crate.
 fuzz_runner = []
 
+# syz_executor: same KCOV instrumentation + raised boot heap budget as fuzz_runner,
+# propagated from the kernel crate's syz_executor feature. The syz guest executor is a
+# KCOV Ring-3 program with equivalent boot footprint; it shares the raised budget.
+syz_executor = []
+
 [dependencies]
 drivers = { path = "../drivers" }
 cpu_local = { path = "../cpu_local" }

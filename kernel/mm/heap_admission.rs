@@ -757,11 +757,13 @@ pub fn run_heap_admission_self_test() {
 /// 32 KiB step): 288,864 × 1.27 ≈ 367 KiB → 384 KiB. This bounds the observed
 /// variance while maintaining the fail-closed discipline for production builds
 /// (the non-fuzz_runner 224 KiB value below is untouched). Re-measure and
-/// re-pin if the fuzz boot allocation profile changes again.
-#[cfg(feature = "fuzz_runner")]
+/// re-pin if the fuzz boot allocation profile changes again. The syz_executor
+/// feature shares this raised budget — it is a KCOV Ring-3 boot program with
+/// equivalent instrumentation footprint.
+#[cfg(any(feature = "fuzz_runner", feature = "syz_executor"))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 384 * 1024;
 
-#[cfg(not(feature = "fuzz_runner"))]
+#[cfg(not(any(feature = "fuzz_runner", feature = "syz_executor")))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
 
 /// D1-RES R4: fail-closed ceiling on `mm::heap_peak_used_bytes()` at the boot
@@ -772,10 +774,11 @@ pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
 /// contiguity probe); 1210 KiB × 1.27 ≈ 1536 KiB. fuzz_runner carries larger
 /// boot instrumentation → 1792 KiB. Must exceed the endpoint carve-out and stay
 /// under the arena. Re-measure and re-pin if the boot allocation profile changes.
-#[cfg(feature = "fuzz_runner")]
+/// The syz_executor feature shares this raised ceiling (same instrumentation class).
+#[cfg(any(feature = "fuzz_runner", feature = "syz_executor"))]
 pub const BOOT_PEAK_USED_MAX_BYTES: usize = 1792 * 1024;
 
-#[cfg(not(feature = "fuzz_runner"))]
+#[cfg(not(any(feature = "fuzz_runner", feature = "syz_executor")))]
 pub const BOOT_PEAK_USED_MAX_BYTES: usize = 1536 * 1024;
 
 const _: () = assert!(BOOT_PEAK_USED_MAX_BYTES >= BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES);
