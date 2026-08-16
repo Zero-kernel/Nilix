@@ -37,14 +37,14 @@ jobs:
             --toolchain nightly-2025-12-08
           rustup default nightly-2025-12-08
 
-      - name: Build KCOV-enabled kernel
-        # build-kcov is a ROOT Makefile target that cds into kernel/ itself.
-        # Running it from kernel/ fails: "No rule to make target 'build-kcov'".
-        run: make build-kcov
-
-      - name: Build guest executor
-        # Canonical Makefile target (adds -Werror; single source of truth).
-        run: make build-syz-executor
+      - name: Build syz-executor kernel
+        # build-syz-kcov embeds nilix_syz_executor.elf (the Ring-3 program the
+        # host syz-fuzzer drives) instead of build-kcov's deterministic
+        # fuzz_runner.elf. The executor reads a fuzz program from the mounted
+        # ext3 disk and emits NILIX_SYZ_V2_* markers the fuzzer monitors.
+        # build-syz-kcov also builds+embeds the executor, so the standalone
+        # build-syz-executor step is no longer needed here.
+        run: make build-syz-kcov
 
       - name: Build host fuzzer
         # build-syz-fuzzer runs build-isolated.sh: it renames the parent
@@ -68,7 +68,7 @@ jobs:
           cd userspace/nilix-syz-fuzzer
           timeout ${{ github.event.inputs.duration || '3600' }} \
             ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
-              --kernel ../../esp-kcov/kernel.elf \
+              --kernel ../../esp-syz/kernel.elf \
               --corpus-dir ./syz-corpus \
               --crash-dir ./syz-crashes \
               --timeout ${{ github.event.inputs.duration || '3600' }} \
