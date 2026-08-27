@@ -31,18 +31,19 @@ use spin::RwLock;
 // R25-9 FIX: Import LSM hooks for MAC enforcement
 use lsm::{FileCtx as LsmFileCtx, OpenFlags as LsmOpenFlags, ProcessCtx as LsmProcessCtx};
 
-/// Simple FNV-1a 64-bit hash for path hashing in LSM contexts
-/// R25-9 FIX: Used to generate path hashes for LSM hooks
+/// Cryptographic path identifier for LSM contexts.  Policy decisions must not
+/// be keyed by a forgeable FNV hash: an attacker who can choose a colliding
+/// path could otherwise alias another policy entry.  The first eight bytes of
+/// the canonical SHA-256 digest retain the existing u64 ABI while removing the
+/// practical collision attack.
 #[inline]
 fn hash_path(path: &str) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut h = OFFSET;
-    for b in path.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
+    let digest = kernel_crypto::sha256::Sha256::digest(path.as_bytes());
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    )
 }
 
 // ============================================================================
@@ -929,6 +930,12 @@ impl Vfs {
                     let target_len = next_stat.size.min(4096) as usize;
                     let mut buf = try_zeroed_buf(target_len)?;
                     let read_len = next.read_at(0, &mut buf)?;
+                    if read_len > buf.len() {
+                        // A filesystem callback must never be able to make a
+                        // caller slice beyond its supplied buffer.  Treat an
+                        // impossible count as corruption and fail closed.
+                        return Err(FsError::Invalid);
+                    }
                     let target = try_string_from_utf8_slice(&buf[..read_len])?;
 
                     // Build new path based on symlink target
@@ -1015,9 +1022,10 @@ impl Vfs {
         }
 
         // Resolve the final component in the parent's own filesystem WITHOUT
-        // following it. `find_mount` binds us to the correct namespace/mount for
-        // the fully-resolved parent path.
-        let (_, fs, _) = self.find_mount(&parent_path)?;
+        // following it.  The parent inode is authoritative: its path may have
+        // crossed a symlink into a different mount, so selecting by the
+        // original string would be a confused-deputy operation (U20-1).
+        let fs = self.filesystem_for_inode(&parent)?;
         fs.lookup(&parent, name)
     }
 
@@ -1126,7 +1134,7 @@ impl Vfs {
                     return Err(FsError::PermDenied);
                 }
 
-                let (_, fs, _) = self.find_mount(&path)?;
+                let fs = self.filesystem_for_inode(&parent)?;
                 // Apply umask and strip setuid/setgid bits for non-root
                 let requested = create_mode & 0o7777;
                 let masked = apply_umask(requested);
@@ -1382,8 +1390,10 @@ impl Vfs {
             return Err(FsError::PermDenied);
         }
 
-        // Find the filesystem
-        let (_, fs, _) = self.find_mount(&path)?;
+        // The resolved parent, not the lexical path string, selects the
+        // filesystem.  This prevents same-type mount crossings from mixing
+        // inode bookkeeping between filesystem instances (U20-1).
+        let fs = self.filesystem_for_inode(&parent)?;
 
         // Apply umask and strip setuid/setgid bits for non-root
         let masked = apply_umask(mode.perm);
@@ -1456,8 +1466,9 @@ impl Vfs {
             return Err(FsError::PermDenied);
         }
 
-        // Namespace-correct filesystem selection (same as create()).
-        let (_, fs, _) = self.find_mount(&path)?;
+        // Namespace-correct filesystem selection follows the resolved parent
+        // inode, not the pre-resolution path string (U20-1).
+        let fs = self.filesystem_for_inode(&parent)?;
 
         // C.4 revalidation: re-check parent identity + perms + absence right
         // before the mutation.
@@ -1502,6 +1513,9 @@ impl Vfs {
         // P2-C: fallible PATH_MAX buffer + owned target string (no infallible vec!/to_string).
         let mut buf = try_zeroed_buf(4096)?;
         let n = inode.read_at(0, &mut buf)?;
+        if n > buf.len() {
+            return Err(FsError::Invalid);
+        }
         let target = try_string_from_utf8_slice(&buf[..n])?;
         Ok(target)
     }
@@ -1527,7 +1541,7 @@ impl Vfs {
             return Err(FsError::PermDenied);
         }
 
-        let (_, fs, _) = self.find_mount(&path)?;
+        let fs = self.filesystem_for_inode(&parent)?;
 
         // Look up the child to check sticky bit permissions
         let child = fs.lookup(&parent, filename)?;
@@ -1655,7 +1669,7 @@ impl Vfs {
             return Err(FsError::PermDenied);
         }
         // (8) Single-component (non-following) source + dest lookup; capture inos.
-        let (_, ofs, _) = self.find_mount(&old_n)?;
+        let ofs = self.filesystem_for_inode(&oparent)?;
         let src = ofs.lookup(&oparent, oname)?;
         let src_ino = src.ino();
         let src_stat = src.stat()?;
@@ -1730,6 +1744,33 @@ impl Vfs {
         // Use current process's mount namespace if available, otherwise root
         let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
         self.find_mount_in_namespace(&ns, path)
+    }
+
+    /// Find the mounted filesystem instance that owns a resolved inode.
+    ///
+    /// Path-prefix lookup is insufficient after symlink traversal: `/link/x`
+    /// can resolve to an inode below a mount that is unrelated to the lexical
+    /// `/link` prefix.  All mutating VFS operations use this helper after
+    /// resolving their parent, so a same-type mount can never receive another
+    /// filesystem instance's inode (U20-1).
+    fn filesystem_for_inode(&self, inode: &Arc<dyn Inode>) -> Result<Arc<dyn FileSystem>, FsError> {
+        let fs_id = inode.fs_id();
+        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
+        let table = self.ensure_namespace_table(&ns)?;
+        let mounts = table.mounts.read();
+        for mount in mounts.values() {
+            if mount.fs.fs_id() == fs_id {
+                return Ok(Arc::clone(&mount.fs));
+            }
+        }
+        drop(mounts);
+        let root_fs = table.root_fs.read();
+        if let Some(fs) = root_fs.as_ref() {
+            if fs.fs_id() == fs_id {
+                return Ok(Arc::clone(fs));
+            }
+        }
+        Err(FsError::CrossDev)
     }
 
     /// Find the mount point for a given path within a specific mount namespace.

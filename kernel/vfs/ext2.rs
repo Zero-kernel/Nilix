@@ -7184,7 +7184,7 @@ impl Ext2Fs {
         if overlay.len() != expected_count {
             return Err(FsError::NotSupported);
         }
-        let (new_group, new_index) = self.inode_group_index(new_ino);
+        let (new_group, new_index) = self.inode_group_index(new_ino).ok_or(FsError::Invalid)?;
         let (bitmap_block, group_desc_target) = {
             let descs = self.group_descs.read();
             let desc = descs.get(new_group).copied().ok_or(FsError::Invalid)?;
@@ -9126,7 +9126,7 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
-        let (_group, index) = self.inode_group_index(ino);
+        let (_group, index) = self.inode_group_index(ino).ok_or(FsError::NotFound)?;
 
         let mut bitmap_buf = Vec::new();
         bitmap_buf
@@ -9150,7 +9150,7 @@ impl Ext2Fs {
         let blocks_count = sb.blocks_count;
         drop(sb);
 
-        let (group, _index) = self.inode_group_index(ino);
+        let (group, _index) = self.inode_group_index(ino).ok_or(FsError::NotFound)?;
         let bitmap_block = {
             let descs = self.group_descs.read();
             descs.get(group).ok_or(FsError::Invalid)?.inode_bitmap
@@ -9169,7 +9169,7 @@ impl Ext2Fs {
         drop(sb);
 
         // Calculate group and index
-        let (group, index) = self.inode_group_index(ino);
+        let (group, index) = self.inode_group_index(ino).ok_or(FsError::NotFound)?;
 
         // Get inode table block and bitmap block
         // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
@@ -9254,7 +9254,7 @@ impl Ext2Fs {
         let blocks_count = sb.blocks_count;
         drop(sb);
 
-        let (group, index) = self.inode_group_index(ino);
+        let (group, index) = self.inode_group_index(ino).ok_or(FsError::NotFound)?;
         // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
         let group_descs = self.group_descs.read();
         if group >= group_descs.len() {
@@ -10511,10 +10511,14 @@ impl Ext2Fs {
     }
 
     /// Calculate group and index for an inode number
-    fn inode_group_index(&self, ino: u32) -> (usize, usize) {
-        let group = ((ino - 1) / self.inodes_per_group) as usize;
-        let index = ((ino - 1) % self.inodes_per_group) as usize;
-        (group, index)
+    fn inode_group_index(&self, ino: u32) -> Option<(usize, usize)> {
+        if ino == 0 || self.inodes_per_group == 0 {
+            return None;
+        }
+        let zero_based = ino.checked_sub(1)?;
+        let group = (zero_based / self.inodes_per_group) as usize;
+        let index = (zero_based % self.inodes_per_group) as usize;
+        Some((group, index))
     }
 
     /// R28-5 Fix: Validate block number against filesystem bounds.
@@ -11379,7 +11383,7 @@ impl FileSystem for Ext2Fs {
         }
 
         // Allocate an inode in the parent's group (single-group scope).
-        let new_group = fs.inode_group_index(parent_ino).0;
+        let new_group = fs.inode_group_index(parent_ino).ok_or(FsError::Invalid)?.0;
         let (bitmap_block, old_group_desc) = {
             let descs = fs.group_descs.read();
             let desc = descs.get(new_group).copied().ok_or(FsError::Invalid)?;
@@ -12129,6 +12133,11 @@ impl Ext2Inode {
                             chunk,
                         );
                     }
+                    // R188-U24-2 FIX: writes that update a resident cache page
+                    // now enter the dirty/writeback state machine.  The old
+                    // path copied bytes into the page but never marked it,
+                    // making every production writeback scan vacuous.
+                    PAGE_CACHE.mark_dirty(&page);
                 }
             }
             remaining -= chunk;

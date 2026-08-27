@@ -6,6 +6,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -377,7 +378,15 @@ enum NodeKind {
 pub struct InitramfsInode {
     fs_id: u64,
     ino: u64,
+    /// Inode number of the containing directory.  Published atomically when
+    /// the node is attached so `readdir("..")` reports the real parent even
+    /// for generated intermediate directories.
+    parent_ino: AtomicU64,
     meta: RwLock<NodeMeta>,
+    /// Sorted directory-name index used by getdents resume cookies.  Keeping
+    /// an indexed side table avoids `BTreeMap::iter().nth(offset)` rescans on
+    /// every call (U21-4), while the map remains authoritative for lookup.
+    readdir_order: RwLock<Vec<String>>,
     kind: NodeKind,
 }
 
@@ -396,6 +405,7 @@ impl InitramfsInode {
         Arc::new(Self {
             fs_id,
             ino,
+            parent_ino: AtomicU64::new(ino),
             meta: RwLock::new(NodeMeta {
                 mode,
                 nlink,
@@ -406,6 +416,7 @@ impl InitramfsInode {
                 mtime,
                 ctime: mtime,
             }),
+            readdir_order: RwLock::new(Vec::new()),
             kind: NodeKind::Directory {
                 children: RwLock::new(FallibleOrderedMap::new()),
             },
@@ -429,6 +440,7 @@ impl InitramfsInode {
         Arc::new(Self {
             fs_id,
             ino,
+            parent_ino: AtomicU64::new(ino),
             meta: RwLock::new(NodeMeta {
                 mode,
                 nlink,
@@ -439,6 +451,7 @@ impl InitramfsInode {
                 mtime,
                 ctime: mtime,
             }),
+            readdir_order: RwLock::new(Vec::new()),
             kind: NodeKind::File {
                 data: RwLock::new(buf),
             },
@@ -487,6 +500,7 @@ impl InitramfsInode {
         Arc::new(Self {
             fs_id,
             ino,
+            parent_ino: AtomicU64::new(ino),
             meta: RwLock::new(NodeMeta {
                 mode,
                 nlink,
@@ -497,6 +511,7 @@ impl InitramfsInode {
                 mtime,
                 ctime: mtime,
             }),
+            readdir_order: RwLock::new(Vec::new()),
             kind: NodeKind::Symlink { target },
         })
     }
@@ -519,17 +534,29 @@ impl InitramfsInode {
 
         match &self.kind {
             NodeKind::Directory { children } => {
-                let mut guard = children.write();
-                if guard.contains_key(name) {
-                    // Allow replacing existing entry for hardlink support
+                child.parent_ino.store(self.ino, Ordering::Release);
+                let mut order = self.readdir_order.write();
+                if order.iter().any(|existing| existing == name) {
+                    // Allow replacing existing entry for hardlink support.
                     return Ok(());
                 }
+                order.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+                let mut ordered_name = String::new();
+                ordered_name
+                    .try_reserve(name.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                ordered_name.push_str(name);
+                let mut guard = children.write();
                 // R172-22-FOLLOWON: fallible key build + try_insert -> NoSpace (was an infallible
                 // BTreeMap::insert that aborts the kernel on OOM).
                 let mut key = String::new();
                 key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
                 key.push_str(name);
                 guard.try_insert(key, child).map_err(|_| FsError::NoSpace)?;
+                let position = order
+                    .binary_search_by(|existing| existing.as_str().cmp(name))
+                    .unwrap_or_else(|position| position);
+                order.insert(position, ordered_name);
                 Ok(())
             }
             _ => Err(FsError::NotDir),
@@ -629,7 +656,7 @@ impl Inode for InitramfsInode {
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         match &self.kind {
             NodeKind::Directory { children } => {
-                let guard = children.read();
+                let order = self.readdir_order.read();
 
                 // "." entry at offset 0
                 if offset == 0 {
@@ -650,7 +677,7 @@ impl Inode for InitramfsInode {
                         2,
                         DirEntry {
                             name: crate::types::try_dirent_name("..")?,
-                            ino: self.ino, // Parent would need separate tracking
+                            ino: self.parent_ino.load(Ordering::Acquire),
                             file_type: FileType::Directory,
                         },
                     )));
@@ -658,7 +685,11 @@ impl Inode for InitramfsInode {
 
                 // Real entries start at offset 2
                 let real_offset = offset - 2;
-                if let Some((name, child)) = guard.iter().nth(real_offset) {
+                if let Some(name) = order.get(real_offset) {
+                    let guard = children.read();
+                    let Some(child) = guard.get(name) else {
+                        return Err(FsError::Invalid);
+                    };
                     let ft = match &child.kind {
                         NodeKind::Directory { .. } => FileType::Directory,
                         NodeKind::File { .. } => FileType::Regular,

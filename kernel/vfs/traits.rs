@@ -656,9 +656,8 @@ impl FileHandle {
 }
 
 impl FileOps for FileHandle {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_descriptor()
-            .expect("FileHandle clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
@@ -754,6 +753,10 @@ mod rf180_37_tests {
         }
 
         fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }
     }

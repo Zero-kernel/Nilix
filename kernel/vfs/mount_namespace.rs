@@ -78,6 +78,12 @@ pub const MAX_MNT_NS_LEVEL: u8 = 32;
 /// namespace.
 pub const MAX_MOUNTS_PER_NS: usize = 4096;
 
+/// Bound every externally supplied mount path before normalization.  The
+/// mount-namespace table is a public API, so relying only on the per-mount
+/// count still permits one caller to force arbitrarily large string
+/// allocations while the namespace lock is held.
+pub const MAX_MOUNT_PATH_LEN: usize = 4096;
+
 // ============================================================================
 // Mount Flags
 // ============================================================================
@@ -503,7 +509,7 @@ impl core::fmt::Debug for MountNamespace {
 /// This function prevents path confusion attacks by ensuring consistent
 /// path representation in the mount table.
 fn normalize_mount_path(path: &str) -> Result<String, MountNsError> {
-    if path.is_empty() || !path.starts_with('/') {
+    if path.is_empty() || path.len() > MAX_MOUNT_PATH_LEN || !path.starts_with('/') {
         return Err(MountNsError::InvalidPath);
     }
 
@@ -614,29 +620,64 @@ pub fn init() -> Arc<MountNamespace> {
 /// The destination's existing mount table is cleared before copying.
 /// This should typically only be called on a freshly created namespace.
 pub fn copy_mounts(from: &MountNamespace, to: &MountNamespace) {
-    let src = from.mounts.read();
-    let mut dst = to.mounts.write();
-
-    // Clear destination (should already be empty for new namespace)
-    dst.clear();
-
-    // Deep copy each mount entry
-    for (path, mount) in src.iter() {
-        // lint-fallible: BOUNDED(MAX_MOUNTS_PER_NS; deep-copy of a bounded table. Alloc-under-RwLock + BTreeMap->FallibleOrderedMap migration tracked as backlog)
-        dst.insert(
-            path.clone(),
-            Mount {
-                path: mount.path.clone(),
-                fs: mount.fs.clone(),
-                flags: mount.flags,
-                source: mount.source.clone(),
-                fstype: mount.fstype.clone(),
-            },
-        );
+    // A self-copy used to acquire the same namespace's read lock and then its
+    // write lock, which deterministically deadlocked.  Treat it as an
+    // idempotent operation; this is also the only sensible result for a
+    // destination that is already the source.
+    if from.id == to.id {
+        return;
     }
 
-    // Copy root path
-    *to.root_path.write() = from.root_path.read().clone();
+    // Snapshot the scalar root path before taking either mount-table lock;
+    // otherwise the fixed table-lock order would still be undermined by a
+    // reverse root-path acquisition in a concurrent clone.
+    let source_root = from.root_path.read().clone();
+
+    // Cross-namespace callers can arrive in opposite directions.  Acquire
+    // the two mount locks in namespace-id order so copy_mounts(A,B) and
+    // copy_mounts(B,A) cannot form an ABBA cycle.  The same order is used for
+    // the root-path locks after the mount table snapshot is published.
+    if from.id.raw() < to.id.raw() {
+        let src = from.mounts.read();
+        let mut dst = to.mounts.write();
+        dst.clear();
+        for (path, mount) in src.iter() {
+            // lint-fallible: BOUNDED(MAX_MOUNTS_PER_NS; public secondary table; migration tracked)
+            dst.insert(
+                path.clone(),
+                Mount {
+                    path: mount.path.clone(),
+                    fs: mount.fs.clone(),
+                    flags: mount.flags,
+                    source: mount.source.clone(),
+                    fstype: mount.fstype.clone(),
+                },
+            );
+        }
+        drop(dst);
+        drop(src);
+        *to.root_path.write() = source_root;
+    } else {
+        let mut dst = to.mounts.write();
+        let src = from.mounts.read();
+        dst.clear();
+        for (path, mount) in src.iter() {
+            // lint-fallible: BOUNDED(MAX_MOUNTS_PER_NS; public secondary table; migration tracked)
+            dst.insert(
+                path.clone(),
+                Mount {
+                    path: mount.path.clone(),
+                    fs: mount.fs.clone(),
+                    flags: mount.flags,
+                    source: mount.source.clone(),
+                    fstype: mount.fstype.clone(),
+                },
+            );
+        }
+        drop(src);
+        drop(dst);
+        *to.root_path.write() = source_root;
+    }
 }
 
 /// Get a mount entry by path.
@@ -835,6 +876,22 @@ mod tests {
         assert_eq!(
             MountNamespace::new_child(current).err(),
             Some(MountNsError::MaxDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn copy_mounts_self_is_idempotent_and_nonblocking() {
+        let root = init();
+        copy_mounts(root.as_ref(), root.as_ref());
+        assert_eq!(root.mount_count(), 0);
+    }
+
+    #[test]
+    fn mount_path_length_is_bounded_before_normalization() {
+        let oversized = alloc::format!("/{}", "a".repeat(MAX_MOUNT_PATH_LEN));
+        assert_eq!(
+            normalize_mount_path(&oversized),
+            Err(MountNsError::InvalidPath)
         );
     }
 }
