@@ -2,6 +2,15 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R188 standalone audit remediation (August 2026)
+
+- **[R188-fix-summary.md](R188-fix-summary.md)** - remediation record for
+  `docs/security/full-codebase-audit-2026-08-07.md`; all three original HIGH findings and all
+  24 MEDIUM findings fixed, implementation-ready LOW/associated classes covered, residual architecture
+  items enumerated, and hosted unit-test evidence recorded. MODE S; synchronized Linux gates pass
+  (`make build`, `make lint`, runtime 34/39/0 with no panic/NX, and hosted 239 tests plus three
+  compile checks).
+
 ## R187 Fixes (August 2026)
 
 - **[R187-fix-summary.md](R187-fix-summary.md)** - KCOV remediation: 7/7 findings fixed,

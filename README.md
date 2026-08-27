@@ -42,9 +42,26 @@ personality.
 in progress. The 1.0-Preview release gate remains **BLOCKED** on the carried `R186-4` HIGH
 (VMA/MM aggregate admission) and its design parent; the zero-HIGH streak is **0/3**. R187
 (KCOV remediation) closed clean — all 7 findings fixed and 8/8 review-fix defects repaired —
-but did not advance the streak, because `R186-4` is carried debt, not an R187 finding. See [Section 6](#6-security-audit-status).
+but did not advance the streak, because `R186-4` is carried debt, not an R187 finding. A
+2026-08-07 standalone full-codebase audit (R188) was remediated on 2026-08-27 — all 3 HIGH and
+24 MEDIUM findings fixed, with residuals U37-1/U55-6/U29-3 explicitly open — but as a standalone
+audit it is not an R-series round and does not advance the streak. See [Section 6](#6-security-audit-status).
 
 **Recent Additions:**
+- **2026-08-27:** **R188 standalone full-codebase audit remediation** — a top-to-bottom
+  adversarial audit (2026-08-07) of the whole tree was remediated in one pass: all 3 HIGH
+  findings (cgroup port-uncharge accounting `U06-1`, signal-delivery RFLAGS sanitizer + PCB
+  lock-lifetime + sender-identity `U09-1/2/3`, robust-futex teardown `U34-1`) and all 24 MEDIUM
+  findings are fixed, plus the implementation-ready LOW/associated set. Coverage spans namespace
+  admission/authorization, VFS inode ownership and bounds, release-build bounds for
+  boot/UEFI/ELF/virtio/IOMMU/PCID/TLB, audit/compliance/crypto/LSM/livepatch integrity, allocator
+  diagnostics, scheduler and TLB contracts, keyboard/boot hardening, the runtime-test registry,
+  and the userspace fuzzing toolchain. Residual design work (`U37-1` KPTI/dual-CR3, `U55-6`
+  early-boot W+X transition, `U29-3` VM-passthrough lifecycle) remains explicitly open and is not
+  counted as fixed. This is a *standalone* audit, not an R-series round, so the zero-HIGH streak
+  stays **0/3** and the gate remains BLOCKED on carried `R186-4`. All remote gates pass: `make
+  build`/`lint`/`test` (34 passed / 39 deferred / 0 failed) and 239 hosted sub-crate tests. See
+  [Section 6](#6-security-audit-status).
 - **2026-08-08:** **R187 KCOV remediation + ReviewFix closure** — the KCOV observability surface
   was hardened across authority, admission context, and topology to make coverage *measurement*
   accurate and fail-closed: (1) KCOV authority is **host-root-only** — the reserved
@@ -652,6 +669,7 @@ kernel, files findings by severity, fixes them, and converges via bidirectional 
 | Findings fixed/resolved | ~1,184 |
 | Latest round | R187 — KCOV authority/access/topology; 7 fixes, 7 PASS (review-fix 8/8 repaired) |
 | Latest review-fix pass | RF187 — 7/7 fixes PASS, 8/8 RF defects repaired, 0 escalated; remote ladder green |
+| Standalone full-codebase audit | R188 (audit 2026-08-07; remediation 2026-08-27) — 3 HIGH + 24 MEDIUM fixed; not an R-series round; residuals U37-1/U55-6/U29-3 open; streak unchanged 0/3 |
 | Current actionable debt | **1 HIGH** (`R186-4`, carried) |
 | 1.0-Preview release gate | **BLOCKED** — carried `R186-4` HIGH remains; zero-HIGH streak 0/3 |
 
@@ -681,6 +699,16 @@ mask, and the fuzzer ABI reports occupied bitmap slots with bounded KCOV control
 added no new open HIGH; the gate remains BLOCKED on the carried `R186-4` and the streak stays
 0/3. See the [R187 report](docs/review/audits/qa-2026-08-05.md) and the
 [RF187 closure](docs/review/reviewfix/reviewfix-2026-08-08.md).
+
+A standalone full-codebase audit (R188, 2026-08-07) was remediated on 2026-08-27: all three HIGH
+findings (`U06-1` cgroup port-uncharge, `U09-1/2/3` signal-delivery ABI and lock lifetime,
+`U34-1` robust-futex teardown) and all 24 MEDIUM findings are fixed, along with the
+implementation-ready LOW/associated set. Residual design work — `U37-1` (KPTI/dual-CR3),
+`U55-6` (early-boot identity-map W+X transition), and `U29-3` (VM-passthrough lifecycle) —
+remains explicitly open and is not counted as fixed. This is a *standalone* audit, not part of
+the R-series, so it makes no zero-HIGH streak claim and the gate remains BLOCKED on carried
+`R186-4`. All remote gates pass against the synchronized tree. See the
+[audit document](docs/security/full-codebase-audit-2026-08-07.md) (§13 dispositions).
 
 CI now runs `make test-hosted-subcrates`: **169 default-parallel hosted tests** across
 audit, MM, block, seccomp, net, and the focused RF186 capability lifecycle pair, plus

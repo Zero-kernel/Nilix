@@ -4,6 +4,11 @@
 **Auditor:** Claude Code (Claude-solo orchestration + parallel adversarial verifier fleet)
 **Scope:** Entire Nilix kernel tree — 26 kernel build units, 146 `.rs` files, ~205,745 LOC under `kernel/`, plus `bootloader/` (1,171 LOC), `userspace/` (~10.9k LOC), and `fuzz/`/`userspace/nilix-syz-fuzzer` (~1.9k LOC). **Full-codebase, line-by-line** — not an R-series delta audit.
 **Document status:** **Standalone.** This is *not* part of the R-series audit timeline (`docs/review/audits/qa-*`), contributes *nothing* to the zero-HIGH streak, and carries *no* gate accounting. It is an independent, complete-tree security review under the binding design principle **Safety > Correctness > Efficiency > Performance** with mandatory defense-in-depth and fail-closed defaults.
+**Remediation status (verified 2026-08-27):** All HIGH and MEDIUM findings and all
+implementation-ready LOW/associated problem classes identified by this audit are fixed and
+synchronized to `40c-devbox-ts`. The full remote build/lint/runtime/hosted ladder passes. U37-1
+and U55-6 remain explicit architecture/boot-transition design work, while U29-3 is a non-live
+future-feature lifecycle note; none is counted as fixed. See §13.
 **Mode:** MODE S — Codex MCP and augment-context-engine-mcp were unavailable this session. The R184 false-positive guard (solo audits hit ~91% HIGH FP rate by ignoring enclosing lock scope/callers) was enforced structurally: every filed finding passed a second, independent adversarial verifier that re-read the cited code, traced callers and lock-holders, and defaulted to REFUTE.
 
 ---
@@ -447,13 +452,85 @@ The gate is currently blocked on `R186-4` (VMA/MM metadata admission) and its de
 
 - **Solo mode (MODE S).** Codex MCP and augment-context-engine-mcp were unavailable, so there was no bidirectional peer review with Codex. The R184 false-positive guard was enforced *structurally* via the independent adversarial verifier pass (67/198 = 34% refuted), but a second counterparty (Codex) would further harden confidence — particularly for the 3 HIGHs and the §9 gate-relevant LOWs, which a future round should re-verify with Codex present.
 - **Single-pass verification.** Each finding was verified by one verifier agent. High-severity findings (the 3 HIGHs) were verified with high confidence and detailed code traces, but a second independent verifier on the HIGHs would be ideal before any is treated as gate-blocking.
-- **No remote build/test run.** This audit is static (line-by-line read + caller/lock-context trace). It did not exercise the tree on the devbox — no `make build`/`make test`/`make lint`. Findings reflect the source at HEAD (`f5805df` + uncommitted working-tree changes per `git status`), not a built/tested artifact.
+- **No remote build/test run during the original audit.** The audit itself was static
+  (line-by-line read + caller/lock-context trace) and did not exercise the devbox. Findings reflect
+  the source at HEAD (`f5805df` + the then-uncommitted working-tree changes), not a built artifact;
+  the completed remediation's authoritative remote verification is recorded separately in §13.
 - **Line-range splits.** The largest files were split by line range across two agents. Where a finding spans a split boundary it could be missed; the splits were chosen at function boundaries to minimize this, and U12's labeling imprecision (§8) did not cause a coverage gap.
-- **Not part of the R-series.** This document carries no R-number, contributes no streak credit, and makes no gate claim. It is an independent, complete-tree security review. The authoritative per-round security status remains `docs/review/audits/`; the live plan remains `docs/review/nextplan/`.
 
 ---
 
-## 13. Mode Record
+## 13. R188 remediation status (2026-08-26; verified 2026-08-27)
+
+This section records the implementation pass requested against this standalone audit. The
+historical findings and severity counts above are preserved; this status section reports what is
+actually present in the current source and tests. Codex MCP was unavailable, so the pass used
+MODE S with independent fresh-context review lenses. No commit or push was created.
+
+### Disposition summary
+
+- **HIGH: 3/3 fixed.** U06-1 uses a blocking process-context cgroup lookup; U09-1/U09-2/U09-3
+  share the canonical signal-RFLAGS sanitizer, release the PCB lock before faultable usercopy,
+  and fail closed on missing sender identity; U34-1 performs a bounded, fault-tolerant robust-
+  futex exit walk with checked offsets, OWNER_DIED publication, and waiter wake-up.
+- **MEDIUM: 24/24 fixed.** This includes the procfs UID/GID map interface (U08-3) with direct
+  creator/parent-namespace authorization and generation revalidation; per-namespace fragment
+  transaction lanes (U16-1); ordered nested-SYSCALL active-bit detection (U33-1); Lockdep-
+  tracked cpuset roots (U40-1); permanently retired livepatch slots with bounded executable
+  quarantine (U43-3); and a build-wired ABI layout oracle replacing the dead mock suite (U54-1).
+- **LOW/associated: all listed classes fixed except U37-1 and U55-6.** Runtime checks, bounded
+  allocation, rollback, lock ordering, accounting, audit, and userspace/fuzzer hardening cover
+  the complete LOW table. U37-1 (KPTI/PCID architecture stubs) remains feature/design work;
+  U55-6 (the early-boot identity-map W+X transition) remains an explicit boot-transition design
+  residual. U55-7 is now a bounded 512-page handoff with a release-build fail-closed check.
+- **Informational:** U48-2 is bounded and returns `Busy` on contention; U55-5 has a capped,
+  fallible kernel-image buffer. U29-3 remains non-functional by design until VM passthrough has
+  a caller; it is fail-closed and carries no reachable security impact.
+
+The repaired classes include the associated paths that the original line findings exposed:
+conntrack replacement rollback and namespace charges, emergency-tier deferred port uncharges,
+fallible admitted-container publication, strict user-namespace map parsing, framebuffer/map
+containment, ICMP error-rate limiting, livepatch quarantine, and non-vacuous hosted test oracles.
+
+### Verification record
+
+Local checks and hosted suites passed:
+
+- `cargo fmt --all -- --check`, `cargo check -p kernel`, bootloader check, and bare-metal arch
+  build all pass.
+- Hosted `kernel_core`: **29/29**; `ipc` robust-futex: **4/4**; `vfs`: **22/22**; `net`:
+  **116/116**; `mm`: **25/25**; `audit`: **15/15**; `seccomp`: **14/14**; `block`: **9/9**.
+- Userspace core: **4/4**; userspace/fuzzer workspace: **27/27** across unit, binary,
+  integration, and scaffold targets; nilix-syz-fuzzer: **26/26**.
+- Runtime-test discovery reports **73/73 implemented** tests and **27 P0** tests. The hosted
+  sub-crate oracle is now **239 tests** plus three test-code compile checks under default
+  parallelism (audit 15, MM 25, block 9, seccomp 14, cap-RF186 2, net 116, IPC robust 4, VFS
+  22, kernel-core 29, coverage 3).
+
+Authoritative Linux verification completed on `40c-devbox-ts` against the synchronized tree:
+
+- `make build`: **PASS** (UEFI bootloader, bare-metal kernel, and ESP assembly).
+- `make lint`: **PASS**, including the VFS fallibility fixtures (**22/22**) and ABI layout oracle
+  (**11 structs, 100 values, 17 tripwires**).
+- `make test`: **PASS** — **34 passed, 39 deferred, 0 failed**, with **0 panic** and **0 NX fault**.
+- `make test-hosted-subcrates`: **PASS** — **239 tests** plus **3 test-code compile checks** under
+  default parallelism.
+
+The runtime gate contract treats the documented deferred syscall-infrastructure placeholders as
+non-failures, while still requiring zero failures, zero panics, and zero NX faults.
+
+Residual design work is intentionally explicit: U37-1 requires a reviewed KPTI trampoline/dual-
+CR3 design, U55-6 requires a safe pre-kernel identity-map permission transition, and U29-3 needs
+the VM passthrough caller/IRTE lifecycle before it can become executable feature code. These are
+not silently counted as fixed.
+
+This standalone document is not part of the R-series and makes no zero-HIGH streak claim. The
+authoritative per-round status remains in `docs/review/audits/`; the live plan is in
+`docs/review/nextplan/`.
+
+---
+
+## 14. Mode Record
 
 **Cooperation mode:** MODE S (Claude-solo). Codex MCP and augment-context-engine-mcp unavailable this session.
 **Substitution:** 59 line-by-line reader agents (one per audit unit) → independent adversarial verifier agent per filed finding (default REFUTE, re-read code + trace callers/lock-holders) → orchestrator synthesis. No fresh-context skeptic fleet was spawned beyond the verify pass; the verify pass *is* the R84 guard.
