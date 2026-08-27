@@ -17,7 +17,7 @@ use alloc::{
     sync::Arc,
 };
 use core::alloc::Layout;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::ops::Bound;
 use core::ptr::NonNull;
 #[cfg(test)]
@@ -42,6 +42,24 @@ pub const FUTEX_WAIT_TIMEOUT: i32 = 2;
 pub const FUTEX_LOCK_PI: i32 = 3;
 /// E.4 PI: 互斥锁解锁（带优先级继承）
 pub const FUTEX_UNLOCK_PI: i32 = 4;
+
+// Linux robust-futex ABI bits.  The low 30 bits carry the owner TID; bit 30
+// is FUTEX_OWNER_DIED and bit 31 is FUTEX_WAITERS.  Keep these constants local
+// to the futex implementation so user-provided list data can never be treated
+// as a kernel pointer or a wider owner identity.
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+
+// A hostile task may publish a cyclic or arbitrarily long robust list.  The
+// fixed walk bound is additionally clamped to the per-TGID futex bucket budget
+// below, so exit work cannot exceed the metadata budget already admitted for
+// that thread group.  CAS retries are bounded independently to prevent a
+// racing userspace writer from turning teardown into an unbounded loop.
+const MAX_ROBUST_LIST_ENTRIES: usize = 256;
+const MAX_ROBUST_CAS_RETRIES: usize = 4;
+const ROBUST_LIST_HEAD_SIZE: usize = 24;
+const _: () = assert!(MAX_ROBUST_LIST_ENTRIES > 0);
+const _: () = assert!(MAX_ROBUST_CAS_RETRIES > 0);
 
 /// Futex 错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +533,359 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
     // the caller serializes FUTEX_WAKE with the wait-queue lock. A concurrent
     // unmap is reported as EFAULT by the nofault helper.
     read_user_u32_atomic(UserAddr::new(uaddr)).map_err(|_| FutexError::Fault)
+}
+
+/// Return whether an address/range satisfies the architectural user-space
+/// contract used by robust-list accesses.  The no-fault usercopy helpers perform
+/// the final page-table access; this predicate rejects null/near-null,
+/// non-canonical, overflowing, and misaligned ranges before reaching assembly.
+#[inline]
+fn robust_user_range(addr: usize, len: usize, alignment: usize) -> bool {
+    alignment != 0
+        && addr & (alignment - 1) == 0
+        && addr >= kernel_core::usercopy::MMAP_MIN_ADDR
+        && addr
+            .checked_add(len)
+            .is_some_and(|end| end < kernel_core::usercopy::USER_SPACE_TOP)
+}
+
+/// Compute the futex word for one robust-list node using the Linux ABI's signed
+/// `futex_offset`: `futex = entry + futex_offset`.  (glibc normally publishes a
+/// negative offset because the lock word precedes the embedded list node.)  All
+/// arithmetic is checked; malformed offsets fail closed instead of wrapping
+/// into kernel/low memory.
+#[inline]
+fn robust_futex_address(entry: usize, futex_offset: i64) -> Option<usize> {
+    if futex_offset >= 0 {
+        entry.checked_add(futex_offset as usize)
+    } else {
+        let magnitude = futex_offset.checked_neg()? as usize;
+        entry.checked_sub(magnitude)
+    }
+}
+
+/// Pure robust-futex word transition.  A transition is produced only when the
+/// low 30 bits identify the exiting thread; all non-owner bits (including the
+/// FUTEX_WAITERS bit) are preserved, the owner TID is cleared, and
+/// FUTEX_OWNER_DIED is set according to the Linux ABI.
+#[inline]
+fn robust_owner_transition(word: u32, owner_tids: [u32; 2]) -> Option<u32> {
+    let tid = word & FUTEX_TID_MASK;
+    // An already-dead word has been published by an earlier exit.  Do not
+    // rewrite or wake it again: a recycled TID must never make a stale
+    // OWNER_DIED word look like ownership by the new task.
+    if tid == 0 || (tid != owner_tids[0] && tid != owner_tids[1]) || (word & FUTEX_OWNER_DIED) != 0
+    {
+        return None;
+    }
+    Some((word & !FUTEX_TID_MASK) | FUTEX_OWNER_DIED)
+}
+
+/// Atomically mark one robust futex as owner-dead.  A concurrent userspace
+/// owner update is retried a small, fixed number of times; a user-memory fault
+/// is returned to the caller so the complete robust walk can stop fail-closed.
+fn mark_robust_futex(uaddr: usize, owner_tids: [u32; 2]) -> Result<bool, ()> {
+    use kernel_core::usercopy::{compare_exchange_user_u32, read_user_u32_atomic, UserAddr};
+
+    if !robust_user_range(uaddr, size_of::<u32>(), align_of::<u32>()) {
+        return Err(());
+    }
+
+    for _ in 0..MAX_ROBUST_CAS_RETRIES {
+        let current = read_user_u32_atomic(UserAddr::new(uaddr))?;
+        let Some(updated) = robust_owner_transition(current, owner_tids) else {
+            return Ok(false);
+        };
+        match compare_exchange_user_u32(UserAddr::new(uaddr), current, updated)? {
+            true => return Ok(true),
+            false => continue,
+        }
+    }
+
+    // A continuously racing word is not a fault and must not make teardown
+    // spin forever.  The owner can only be released if one bounded CAS wins.
+    Ok(false)
+}
+
+/// Mark the in-kernel bucket corresponding to a robust futex and wake one
+/// waiter.  PI buckets owned by another live PID are left untouched: the user
+/// word may have been reused between the atomic update and this metadata lookup,
+/// and corrupting that owner would be worse than dropping a stale wake.  A PI
+/// bucket owned by the exiting PID is marked dead and is finalized by the normal
+/// generation-bound cleanup pass; non-PI buckets have no in-kernel owner and are
+/// woken directly here.
+fn release_robust_futex(tgid: ProcessId, uaddr: usize, dead_pid: ProcessId) {
+    let key = (tgid, uaddr);
+    let bucket = {
+        let table = FUTEX_TABLE.lock();
+        table.get(&key).cloned()
+    };
+    let Some(bucket) = bucket else {
+        // It is valid for a robust mutex to have no kernel bucket until a
+        // waiter executes FUTEX_WAIT.  The OWNER_DIED bit in user memory is the
+        // durable state for that case.
+        return;
+    };
+
+    let queue = {
+        let mut b = bucket.lock();
+        if let Some(owner) = b.owner {
+            if owner != dead_pid {
+                // Address reuse/metadata race: do not mark a different owner
+                // dead merely because a stale robust node names this address.
+                return;
+            }
+        }
+        b.owner_dead = true;
+        // For a PI owner, cleanup_process_futexes performs the ordered
+        // successor transfer after this callback.  Waking one here still
+        // releases a blocked waiter and mirrors the non-PI robust path; the
+        // wake operation is idempotent when the later transfer targets the same
+        // waiter.
+        b.queue.clone()
+    };
+
+    let _ = queue.wake_one();
+    cleanup_empty_bucket(key, &bucket);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RobustWalkOutcome {
+    Complete,
+    Limit,
+    Fault,
+}
+
+/// Walk one registered robust-list head.  This function performs no allocation:
+/// the visited-node array is fixed at the same bound as the work budget.  A
+/// malformed pointer, usercopy fault, or arithmetic overflow aborts the walk;
+/// entries already transitioned remain safely marked OWNER_DIED, matching
+/// Linux's fail-closed stop-on-fault behavior.
+fn walk_robust_list(
+    pid: ProcessId,
+    tgid: ProcessId,
+    head_addr: usize,
+    owner_tids: [u32; 2],
+) -> (RobustWalkOutcome, usize) {
+    use kernel_core::usercopy::{read_user_u64_atomic, UserAddr};
+
+    if !robust_user_range(head_addr, ROBUST_LIST_HEAD_SIZE, align_of::<usize>()) {
+        return (RobustWalkOutcome::Fault, 0);
+    }
+
+    let Some(offset_addr) = head_addr.checked_add(size_of::<usize>()) else {
+        return (RobustWalkOutcome::Fault, 0);
+    };
+    let Some(pending_addr) = offset_addr.checked_add(size_of::<usize>()) else {
+        return (RobustWalkOutcome::Fault, 0);
+    };
+
+    let list = match read_user_u64_atomic(UserAddr::new(head_addr)) {
+        Ok(value) => value as usize,
+        Err(_) => return (RobustWalkOutcome::Fault, 0),
+    };
+    let futex_offset = match read_user_u64_atomic(UserAddr::new(offset_addr)) {
+        Ok(value) => value as i64,
+        Err(_) => return (RobustWalkOutcome::Fault, 0),
+    };
+    let list_op_pending = match read_user_u64_atomic(UserAddr::new(pending_addr)) {
+        Ok(value) => value as usize,
+        Err(_) => return (RobustWalkOutcome::Fault, 0),
+    };
+
+    // The per-TGID metadata budget is a hard upper bound even if the global
+    // robust-list cap is raised later.  MAX_FUTEX_BUCKETS_PER_TGID is asserted
+    // non-zero at compile time above, so this bound always permits at least one
+    // well-formed node on a normally configured kernel.
+    let budget = MAX_ROBUST_LIST_ENTRIES.min(MAX_FUTEX_BUCKETS_PER_TGID);
+    // Reserve one bounded work slot for `list_op_pending`.  Otherwise a
+    // malicious list containing exactly `budget` linked entries could consume
+    // the entire quota and silently skip the in-flight acquisition node that
+    // Linux requires us to process separately.
+    let pending_slot = if list_op_pending != 0 { 1 } else { 0 };
+    let limit = budget.saturating_sub(pending_slot);
+    let mut visited = [0usize; MAX_ROBUST_LIST_ENTRIES];
+    let mut visited_len = 0usize;
+    let mut processed = 0usize;
+    let mut entry = list;
+    let mut hit_limit = false;
+
+    while entry != 0 && entry != head_addr {
+        if visited_len >= limit {
+            hit_limit = true;
+            break;
+        }
+        if !robust_user_range(entry, size_of::<usize>(), align_of::<usize>()) {
+            return (RobustWalkOutcome::Fault, processed);
+        }
+        if visited[..visited_len].contains(&entry) {
+            // A cyclic list is bounded and already fully visited up to the
+            // cycle; stop without repeatedly waking the same futex.
+            break;
+        }
+        visited[visited_len] = entry;
+        visited_len += 1;
+
+        let Some(futex_addr) = robust_futex_address(entry, futex_offset) else {
+            return (RobustWalkOutcome::Fault, processed);
+        };
+        if !robust_user_range(futex_addr, size_of::<u32>(), align_of::<u32>()) {
+            return (RobustWalkOutcome::Fault, processed);
+        }
+        match mark_robust_futex(futex_addr, owner_tids) {
+            Ok(true) => {
+                release_robust_futex(tgid, futex_addr, pid);
+                processed += 1;
+            }
+            Ok(false) => {}
+            Err(_) => return (RobustWalkOutcome::Fault, processed),
+        }
+
+        // Read the link only after processing this node.  A fault here stops
+        // the entire walk, but does not undo already-published OWNER_DIED bits.
+        entry = match read_user_u64_atomic(UserAddr::new(entry)) {
+            Ok(next) => next as usize,
+            Err(_) => return (RobustWalkOutcome::Fault, processed),
+        };
+    }
+
+    // Linux separately handles the node involved in an in-flight lock acquire.
+    // It may not be linked yet, so process it after the normal list while
+    // retaining the same global bound and duplicate suppression.
+    let pending_needs_visit = list_op_pending != 0
+        && list_op_pending != head_addr
+        && !visited[..visited_len].contains(&list_op_pending);
+    if pending_needs_visit && visited_len >= budget {
+        hit_limit = true;
+    } else if pending_needs_visit {
+        if !robust_user_range(list_op_pending, size_of::<usize>(), align_of::<usize>()) {
+            return (RobustWalkOutcome::Fault, processed);
+        }
+        let Some(futex_addr) = robust_futex_address(list_op_pending, futex_offset) else {
+            return (RobustWalkOutcome::Fault, processed);
+        };
+        if !robust_user_range(futex_addr, size_of::<u32>(), align_of::<u32>()) {
+            return (RobustWalkOutcome::Fault, processed);
+        }
+        match mark_robust_futex(futex_addr, owner_tids) {
+            Ok(true) => {
+                release_robust_futex(tgid, futex_addr, pid);
+                processed += 1;
+            }
+            Ok(false) => {}
+            Err(_) => return (RobustWalkOutcome::Fault, processed),
+        }
+    }
+
+    let outcome = if hit_limit {
+        RobustWalkOutcome::Limit
+    } else {
+        RobustWalkOutcome::Complete
+    };
+    (outcome, processed)
+}
+
+/// Exit-time robust-futex cleanup entry point with an explicit owner TID.  The
+/// process subsystem captures the namespace-local TID before it detaches the
+/// PCB's PID-namespace chain, then invokes this callback immediately after
+/// publishing `Zombie` while the address space is still retained.
+pub(crate) fn exit_robust_futexes_with_tid(
+    pid: ProcessId,
+    tgid: ProcessId,
+    generation: u64,
+    owner_tid: ProcessId,
+) {
+    let process = match process::get_process(pid) {
+        Some(process) => process,
+        None => return,
+    };
+    let (memory_space, head_addr, head_len) = {
+        let proc = process.lock();
+        if proc.generation != generation
+            || proc.tgid != tgid
+            || proc.state != process::ProcessState::Zombie
+        {
+            return;
+        }
+        (
+            proc.memory_space,
+            proc.robust_list_head as usize,
+            proc.robust_list_len,
+        )
+    };
+
+    if memory_space == 0 || head_addr == 0 || head_len != ROBUST_LIST_HEAD_SIZE {
+        return;
+    }
+    if memory_space & 0xfff != 0 {
+        // A CR3 root must be page aligned.  Reject malformed PCB state rather
+        // than rounding it into a potentially unrelated address space.
+        return;
+    }
+
+    // Robust futex words contain the TID as returned by `gettid()` in the
+    // owning PID namespace (`task_pid_vnr()` in Linux), not the kernel's
+    // global PID.  Matching the global PID as a second candidate would be
+    // unsafe in nested PID namespaces: it can collide with a different live
+    // thread's namespace-local TID and spuriously mark that mutex dead.
+    let owner_tids = [(owner_tid as u64 & FUTEX_TID_MASK as u64) as u32, 0];
+    let (outcome, processed) = unsafe {
+        use x86_64::registers::control::Cr3;
+        use x86_64::structures::paging::PhysFrame;
+        use x86_64::PhysAddr;
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let current_cr3 = Cr3::read();
+            let Some(target_phys) = PhysAddr::try_new(memory_space as u64).ok() else {
+                // A corrupted PCB must not be truncated by `PhysAddr::new`
+                // into an unrelated page-table root.
+                return (RobustWalkOutcome::Fault, 0);
+            };
+            let target_frame = PhysFrame::containing_address(target_phys);
+            if current_cr3.0 != target_frame {
+                Cr3::write(target_frame, current_cr3.1);
+            }
+            let result = walk_robust_list(pid, tgid, head_addr, owner_tids);
+            // Always restore the caller's address space before returning to the
+            // scheduler/exception path.  The closure has no early `return` edge
+            // after the switch, so this restore is unconditional.
+            if current_cr3.0 != target_frame {
+                Cr3::write(current_cr3.0, current_cr3.1);
+            }
+            result
+        })
+    };
+
+    #[cfg(debug_assertions)]
+    match outcome {
+        RobustWalkOutcome::Complete => {}
+        RobustWalkOutcome::Limit => kprintln!(
+            "[FUTEX] robust-list walk capped for pid {} (processed {})",
+            pid,
+            processed
+        ),
+        RobustWalkOutcome::Fault => kprintln!(
+            "[FUTEX] robust-list walk stopped on user fault for pid {} (processed {})",
+            pid,
+            processed
+        ),
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (outcome, processed);
+}
+
+/// Public compatibility wrapper for callers that still provide only the
+/// generation-bound PID/TGID identity.  Normal exit uses the explicit-TID
+/// callback above; this wrapper falls back to the global PID when the namespace
+/// chain is unavailable (for example, a diagnostic invocation).
+pub fn exit_robust_futexes(pid: ProcessId, tgid: ProcessId, generation: u64) {
+    let owner_tid = process::get_process(pid)
+        .and_then(|proc| {
+            let proc = proc.lock();
+            kernel_core::pid_in_owning_namespace(&proc.pid_ns_chain)
+        })
+        .unwrap_or(pid);
+    exit_robust_futexes_with_tid(pid, tgid, generation, owner_tid);
 }
 
 /// FUTEX_WAIT / FUTEX_WAIT_TIMEOUT 操作
@@ -1073,24 +1444,7 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
 
         // R162-8-2 / RF178-8: prune in place without BTreeMap::retain or a
         // scratch collection. AdmittedMap removal retains backing and never allocates.
-        loop {
-            let dead = b.pi_waiters.iter().find_map(|(waiter, _)| {
-                let is_dead = match process::get_process(*waiter) {
-                    None => true,
-                    Some(proc_arc) => matches!(
-                        proc_arc.lock().state,
-                        process::ProcessState::Zombie | process::ProcessState::Terminated
-                    ),
-                };
-                is_dead.then_some(*waiter)
-            });
-            match dead {
-                Some(waiter) => {
-                    b.pi_waiters.remove_retaining_capacity(&waiter);
-                }
-                None => break,
-            }
-        }
+        prune_dead_pi_waiters_locked(&mut b);
 
         let queue = b.queue.clone();
         let next = select_highest_waiter(&b.pi_waiters);
@@ -1313,6 +1667,11 @@ pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId, generation: u64)
                 // CRITICAL FIX: 选择最高优先级等待者作为继任者，而非唤醒全部
                 // 这保持了互斥语义
                 let queue = b.queue.clone();
+                // U34-2: a waiter may have become Zombie after the earlier
+                // per-PID sweep.  Never transfer ownership to a terminal PCB;
+                // prune those entries while the bucket is locked, immediately
+                // before selecting the successor.
+                prune_dead_pi_waiters_locked(&mut b);
                 let next = select_highest_waiter(&b.pi_waiters);
 
                 if let Some((next_pid, _prio)) = next {
@@ -1536,47 +1895,92 @@ fn select_highest_waiter(
         .map(|(pid, prio)| (*pid, *prio))
 }
 
+/// Remove PI waiters whose PCB has already reached a terminal state before a
+/// successor is selected.  A task can become `Zombie` between the normal
+/// per-PID cleanup pass and the owner's handoff; leaving that entry in
+/// `pi_waiters` lets `select_highest_waiter` grant the mutex to a dead task and
+/// can strand every live waiter behind it.  The scan/removal is entirely
+/// allocation-free because the admitted map retains its backing capacity.
+fn prune_dead_pi_waiters_locked(bucket: &mut FutexBucket) {
+    loop {
+        let dead = bucket.pi_waiters.iter().find_map(|(waiter, _)| {
+            let is_dead = match process::get_process(*waiter) {
+                None => true,
+                Some(proc_arc) => matches!(
+                    proc_arc.lock().state,
+                    process::ProcessState::Zombie | process::ProcessState::Terminated
+                ),
+            };
+            is_dead.then_some(*waiter)
+        });
+        match dead {
+            Some(waiter) => {
+                bucket.pi_waiters.remove_retaining_capacity(&waiter);
+            }
+            None => break,
+        }
+    }
+}
+
 /// E.4 PI: 获取当前最高优先级等待者的优先级（仅优先级值）
 fn highest_waiter_priority(bucket: &FutexBucket) -> Option<Priority> {
     bucket.pi_waiters.values().min().copied()
 }
 
-/// E.4 PI: Maximum PI chain propagation depth
+/// E.4 PI: Maximum number of distinct owners that can occur in a live chain.
 ///
-/// Limits the depth of PI chain traversal to prevent stack overflow from
-/// maliciously constructed long wait chains. 64 is a reasonable limit -
-/// real-world systems rarely have chains deeper than 5-10 levels.
-const MAX_PI_CHAIN_DEPTH: usize = 64;
+/// A live owner PID is admitted in the bounded process table, so using the
+/// table's PID ceiling as the walk bound covers every valid acyclic chain. The
+/// previous depth-64 cutoff could stop before reaching the CPU holder and leave
+/// it unboosted (U34-3). Cycle detection below keeps malformed cyclic graphs
+/// bounded without allocating a heap set.
+const MAX_PI_CHAIN_DEPTH: usize = process::PID_MAX;
+const PI_VISITED_WORDS: usize = (MAX_PI_CHAIN_DEPTH + 1).div_ceil(64);
+const _: () = assert!(PI_VISITED_WORDS * 64 > process::PID_MAX);
 
 /// E.4 PI: 将优先级捐赠应用于 owner 并沿等待链路传播（A -> B -> C）
 ///
 /// 支持链式优先级继承：如果 owner 也在等待其他 futex，则继续向上传播
 ///
 /// RF178-8: the PI graph has out-degree at most one (`waiting_on_futex`), so a
-/// cursor plus a fixed visited array is sufficient. This path is used during
+/// cursor plus a fixed owner bitmap is sufficient. This path is used during
 /// process exit; it must not allocate a Vec/BTreeSet or grow a boost map.
 fn apply_pi_and_propagate(
     key: FutexKey,
     owner: ProcessId,
     donated: Option<Priority>,
 ) -> Result<(), FutexError> {
-    let mut visited = [(0, 0); MAX_PI_CHAIN_DEPTH];
+    // One bit per admitted PID is enough: `waiting_on_futex` has out-degree
+    // at most one, and revisiting an owner proves a cycle even if the cycle
+    // uses a different futex key. This is 513 u64s for the current PID_MAX,
+    // fixed-size and allocation-free on the kernel stack.
+    let mut visited_owners = [0u64; PI_VISITED_WORDS];
     let mut visited_len = 0usize;
     let mut current = Some((key, owner, donated));
 
     while let Some((cur_key, cur_owner, donation)) = current.take() {
-        if visited[..visited_len].contains(&cur_key) {
+        if cur_owner == 0 || cur_owner > process::PID_MAX {
+            // A stale/corrupt PI edge must never be followed into an
+            // unbounded lookup sequence. Fail closed after the last valid
+            // owner already received its donation.
             break;
         }
         if visited_len == MAX_PI_CHAIN_DEPTH {
             kprintln!(
-                "[FUTEX] PI chain depth exceeded {} at key {:?}, truncating",
+                "[FUTEX] PI chain reached PID bound {} at key {:?}",
                 MAX_PI_CHAIN_DEPTH,
                 cur_key
             );
             break;
         }
-        visited[visited_len] = cur_key;
+        let owner_word = cur_owner / 64;
+        let owner_bit = 1u64 << (cur_owner % 64);
+        if (visited_owners[owner_word] & owner_bit) != 0 {
+            // Cyclic wait-for graph. Every distinct owner on the cycle has
+            // already received the donation; stop without spinning forever.
+            break;
+        }
+        visited_owners[owner_word] |= owner_bit;
         visited_len += 1;
 
         let proc = match process::get_process(cur_owner) {
@@ -1652,6 +2056,51 @@ fn recompute_pi_state_noalloc(key: FutexKey, bucket: &FutexBucketRef) {
     }
 }
 
+/// R188-U34 executable probe for the robust-futex exit contract.  The probe is
+/// deliberately pure and allocation-free so it can run during the hosted and
+/// boot integration suites without manufacturing a live user address space.
+/// Hardware-backed fault recovery is exercised by the exception-table helpers;
+/// these assertions pin the ABI transition, checked offset arithmetic, bounds,
+/// namespace-local TID choice, and the full-PID PI cycle budget.
+pub fn run_robust_futex_self_test() {
+    const WAITERS: u32 = 0x8000_0000;
+    let old = 7u32 | WAITERS;
+    let updated = robust_owner_transition(old, [7, 0])
+        .expect("R188-U34: matching namespace-local owner must transition");
+    assert_eq!(updated & FUTEX_TID_MASK, 0);
+    assert_eq!(updated & FUTEX_OWNER_DIED, FUTEX_OWNER_DIED);
+    assert_eq!(updated & WAITERS, WAITERS);
+    assert!(
+        robust_owner_transition(100, [7, 0]).is_none(),
+        "R188-U34: a foreign namespace-local TID must not be marked dead"
+    );
+    assert!(
+        robust_owner_transition(7 | FUTEX_OWNER_DIED, [7, 0]).is_none(),
+        "R188-U34: an already-dead word must not be woken twice"
+    );
+
+    assert_eq!(robust_futex_address(0x2000, -0x20), Some(0x1fe0));
+    assert_eq!(robust_futex_address(0x2000, 0x20), Some(0x2020));
+    assert!(robust_futex_address(0x10, i64::MIN).is_none());
+    assert!(robust_futex_address(usize::MAX, 1).is_none());
+
+    assert!(robust_user_range(
+        kernel_core::usercopy::MMAP_MIN_ADDR,
+        size_of::<u32>(),
+        align_of::<u32>()
+    ));
+    assert!(!robust_user_range(
+        kernel_core::usercopy::MMAP_MIN_ADDR + 1,
+        size_of::<u32>(),
+        align_of::<u32>()
+    ));
+    assert!(!robust_user_range(
+        kernel_core::usercopy::USER_SPACE_TOP - 2,
+        size_of::<u32>(),
+        align_of::<u32>()
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,6 +2120,58 @@ mod tests {
         if let Some(bucket) = bucket {
             cleanup_empty_bucket(key, &bucket);
         }
+    }
+
+    #[test]
+    fn robust_owner_transition_preserves_waiters_and_sets_owner_died() {
+        let owner = 0x1234u32;
+        // Only bits 30/31 are outside the owner-TID field.  Bit 29 is part
+        // of the low-30-bit TID and would (correctly) make this a foreign
+        // owner rather than an auxiliary flag.
+        let old = owner | 0x8000_0000;
+        let updated = robust_owner_transition(old, [owner, 0]).expect("owner must match");
+
+        assert_eq!(updated & FUTEX_TID_MASK, 0, "owner TID is cleared");
+        assert_ne!(updated & FUTEX_OWNER_DIED, 0, "OWNER_DIED is set");
+        assert_eq!(
+            updated & !(FUTEX_TID_MASK | FUTEX_OWNER_DIED),
+            old & !(FUTEX_TID_MASK | FUTEX_OWNER_DIED),
+            "non-owner bits other than OWNER_DIED, including FUTEX_WAITERS, are preserved"
+        );
+    }
+
+    #[test]
+    fn robust_owner_transition_rejects_foreign_or_empty_owner() {
+        assert!(robust_owner_transition(0, [7, 0]).is_none());
+        assert!(robust_owner_transition(8, [7, 0]).is_none());
+        assert!(robust_owner_transition(FUTEX_OWNER_DIED, [7, 0]).is_none());
+        assert!(robust_owner_transition(7 | FUTEX_OWNER_DIED, [7, 0]).is_none());
+    }
+
+    #[test]
+    fn robust_futex_address_uses_checked_signed_offset() {
+        assert_eq!(robust_futex_address(0x2000, 0x20), Some(0x2020));
+        assert_eq!(robust_futex_address(0x2000, -0x20), Some(0x1fe0));
+        assert_eq!(robust_futex_address(usize::MAX, 1), None);
+        assert_eq!(robust_futex_address(0x10, -0x20), None);
+        assert_eq!(robust_futex_address(0x2000, i64::MIN), None);
+    }
+
+    #[test]
+    fn robust_walk_limit_is_bounded_by_metadata_budget() {
+        let expected = MAX_ROBUST_LIST_ENTRIES.min(MAX_FUTEX_BUCKETS_PER_TGID);
+        assert!(expected > 0);
+        assert!(expected <= MAX_ROBUST_LIST_ENTRIES);
+        assert!(expected <= MAX_FUTEX_BUCKETS_PER_TGID);
+        assert!(expected.saturating_sub(1) < expected);
+    }
+
+    #[test]
+    fn pi_owner_cycle_bitmap_covers_every_admitted_pid() {
+        assert!(PI_VISITED_WORDS * 64 > process::PID_MAX);
+        let last = process::PID_MAX;
+        assert_eq!(last / 64, PI_VISITED_WORDS - 1);
+        assert!(last % 64 < 64);
     }
 
     #[test]

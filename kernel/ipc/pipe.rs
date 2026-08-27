@@ -223,6 +223,11 @@ struct PipeInner {
     read_pos: usize,
     /// 当前数据长度
     len: usize,
+    /// A reader has detached a prefix for a faultable copyout.  While set,
+    /// other readers must leave the prefix untouched; this replaces the old
+    /// lock-held callback protocol and keeps usercopy/page faults out of the
+    /// pipe spinlock.
+    read_inflight: bool,
     /// 读端引用计数
     readers: usize,
     /// 写端引用计数
@@ -244,6 +249,7 @@ impl PipeInner {
             capacity,
             read_pos: 0,
             len: 0,
+            read_inflight: false,
             readers: 1,
             writers: 1,
         })
@@ -271,6 +277,9 @@ impl PipeInner {
 
     /// 从缓冲区读取数据
     fn read(&mut self, dst: &mut [u8]) -> usize {
+        if self.read_inflight {
+            return 0;
+        }
         let to_read = core::cmp::min(dst.len(), self.len);
         if to_read == 0 {
             return 0;
@@ -303,12 +312,35 @@ impl PipeInner {
         to_read
     }
 
-    /// Consume an already-peeked prefix. The PipeInner lock spans both phases.
+    /// Consume an already-peeked prefix after its copyout commit succeeds.
     fn consume(&mut self, count: usize) {
         debug_assert!(count <= self.len);
         let count = count.min(self.len);
         self.read_pos = (self.read_pos + count) % self.capacity;
         self.len -= count;
+    }
+
+    #[inline]
+    fn begin_read_transaction(&mut self, dst: &mut [u8]) -> Option<usize> {
+        if self.read_inflight || self.len == 0 {
+            return None;
+        }
+        let count = self.peek(dst);
+        if count == 0 {
+            return None;
+        }
+        self.read_inflight = true;
+        Some(count)
+    }
+
+    #[inline]
+    fn finish_read_transaction(&mut self, count: usize, committed: bool) {
+        if self.read_inflight {
+            if committed {
+                self.consume(count);
+            }
+            self.read_inflight = false;
+        }
     }
 
     /// 向缓冲区写入数据
@@ -500,13 +532,31 @@ impl Pipe {
 
             {
                 let mut inner = self.inner.lock();
-                if inner.len > 0 {
-                    let count = inner.peek(dst);
-                    commit(&dst[..count]).map_err(PipeReadTransactionError::Commit)?;
-                    inner.consume(count);
+                if inner.len > 0 && !inner.read_inflight {
+                    let Some(count) = inner.begin_read_transaction(dst) else {
+                        continue;
+                    };
                     drop(inner);
-                    self.write_wait.wake_one();
-                    return Ok(count);
+                    let committed = commit(&dst[..count]);
+                    let mut inner = self.inner.lock();
+                    match committed {
+                        Ok(()) => {
+                            inner.finish_read_transaction(count, true);
+                            drop(inner);
+                            self.write_wait.wake_one();
+                            return Ok(count);
+                        }
+                        Err(error) => {
+                            inner.finish_read_transaction(count, false);
+                            // The bytes remain available after a failed
+                            // userspace commit. Wake another reader that may
+                            // have observed the temporary reservation and
+                            // gone to sleep.
+                            drop(inner);
+                            self.read_wait.wake_one();
+                            return Err(PipeReadTransactionError::Commit(error));
+                        }
+                    }
                 }
                 if inner.writers == 0 {
                     return Ok(0);
@@ -522,13 +572,27 @@ impl Pipe {
                 .map_err(|_| PipeReadTransactionError::Pipe(PipeError::NoMemory))?;
             let arm = {
                 let mut inner = self.inner.lock();
-                if inner.len > 0 {
-                    let count = inner.peek(dst);
-                    commit(&dst[..count]).map_err(PipeReadTransactionError::Commit)?;
-                    inner.consume(count);
+                if inner.len > 0 && !inner.read_inflight {
+                    let Some(count) = inner.begin_read_transaction(dst) else {
+                        continue;
+                    };
                     drop(inner);
-                    self.write_wait.wake_one();
-                    return Ok(count);
+                    let committed = commit(&dst[..count]);
+                    let mut inner = self.inner.lock();
+                    match committed {
+                        Ok(()) => {
+                            inner.finish_read_transaction(count, true);
+                            drop(inner);
+                            self.write_wait.wake_one();
+                            return Ok(count);
+                        }
+                        Err(error) => {
+                            inner.finish_read_transaction(count, false);
+                            drop(inner);
+                            self.read_wait.wake_one();
+                            return Err(PipeReadTransactionError::Commit(error));
+                        }
+                    }
                 }
                 if inner.writers == 0 {
                     return Ok(0);
@@ -1060,9 +1124,8 @@ impl Drop for PipeHandle {
 
 /// 实现 FileOps trait，支持在进程 fd_table 中存储
 impl FileOps for PipeHandle {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_duplicate_descriptor()
-            .expect("PipeHandle clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {

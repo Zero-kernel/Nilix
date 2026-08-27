@@ -1131,16 +1131,16 @@ impl KMutex {
 
     /// 释放锁
     ///
-    /// R154-16 FIX: Debug assertion verifying caller owns the lock.
+    /// R188-U35-2 FIX: ownership is a release-build safety boundary. A
+    /// non-owner must never clear the atomic lock and wake waiters, otherwise
+    /// mutual exclusion is silently destroyed.
     pub fn unlock(&self) {
-        debug_assert!(
-            {
-                let owner = self.owner.lock();
-                owner.is_none() || *owner == process::current_pid()
-            },
-            "KMutex::unlock() called by non-owner"
-        );
-        *self.owner.lock() = None;
+        let mut owner = self.owner.lock();
+        if owner.is_some() && *owner != process::current_pid() {
+            panic!("KMutex::unlock() called by non-owner");
+        }
+        *owner = None;
+        drop(owner);
         self.locked.store(false, Ordering::Release);
 
         // 唤醒一个等待者

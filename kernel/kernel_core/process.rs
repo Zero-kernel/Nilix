@@ -271,6 +271,14 @@ type SchedulerCleanupCallback = fn(ProcessId, u64);
 /// `(pid, generation)` (mirrors RF178-33 / P1-B scheduler cleanup).
 type IpcCleanupCallback = fn(ProcessId, ProcessId, cap::NamespaceId, u64); // (pid, tgid, ipc_ns_id, generation)
 
+/// Exit-time robust-futex callback. The process subsystem invokes this once
+/// after publishing `Zombie`, while the dying task's address space is still
+/// retained. The callback receives the generation-bound identity plus the TID
+/// as observed in the task's owning PID namespace (captured before teardown
+/// detaches that namespace chain), so the userspace owner word can be matched
+/// without leaking or guessing a global PID.
+pub type RobustFutexCleanupCallback = fn(ProcessId, ProcessId, u64, ProcessId); // (pid, tgid, generation, owner_tid)
+
 /// R180-19: identity-bound token for a pre-staged scheduler admission.
 ///
 /// The scheduler inserts the child into a fallible ready-queue slot while the
@@ -387,16 +395,17 @@ const FD_RESERVATION_WORDS: usize = (MAX_FD as usize + 63) / 64;
 /// 由于循环依赖限制，kernel_core 定义此 trait，具体类型（如 PipeHandle）
 /// 在各自的 crate（如 ipc）中实现。
 pub trait FileOps: Send + Sync {
-    /// 克隆此文件描述符（用于 fork）
-    fn clone_box(&self) -> FileDescriptor;
-
-    /// Fallibly clone this file description for fork/dup transactions.
+    /// Fallibly clone this file descriptor (used by fork/dup).
     ///
-    /// Persistent publication paths must use this method: `clone_box` is kept
-    /// only for legacy non-transactional callers while they are migrated.  An
-    /// implementation must prepare a [`FileDescriptor`] allocation before any
-    /// manual resource-refcount increment, then finalize it without allocation.
-    fn try_clone_box(&self) -> Result<FileDescriptor, ()>;
+    /// An infallible clone API could abort the kernel when descriptor storage
+    /// or admission is exhausted.  Callers propagate `Err(())` as a normal
+    /// rollback/`ENOMEM` path instead.
+    fn clone_box(&self) -> Result<FileDescriptor, ()>;
+
+    /// Compatibility alias for callers that use the explicit fallible name.
+    fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
+        self.clone_box()
+    }
 
     /// 获取 Any 引用用于向下转型
     fn as_any(&self) -> &dyn Any;
@@ -3951,10 +3960,11 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
 /// 使用 Option<Arc<Mutex<Process>>> 以支持 PID 作为直接索引。
 /// 索引 0 保留为空（PID 从 1 开始），实际进程存储在其 PID 对应的索引位置。
 lazy_static::lazy_static! {
-pub static ref PROCESS_TABLE: Mutex<AdmittedVec<Option<ProcessArc>>> =
+    pub static ref PROCESS_TABLE: Mutex<AdmittedVec<Option<ProcessArc>>> =
         Mutex::new(AdmittedVec::new(HeapClass::CoreProcess));
     static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
     static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
+    static ref ROBUST_FUTEX_CLEANUP: Mutex<Option<RobustFutexCleanupCallback>> = Mutex::new(None);
     /// R180-19: scheduler admission is registered as one atomic callback set so
     /// a permit can never be born without matching commit/cancel operations.
     static ref SCHEDULER_ADMISSION: Mutex<Option<SchedulerAdmissionCallbacks>> = Mutex::new(None);
@@ -7505,6 +7515,14 @@ pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
     *IPC_CLEANUP.lock() = Some(callback);
 }
 
+/// Register the exit-time robust-futex list walker supplied by the IPC crate.
+/// Registration is separate from the post-reap IPC cleanup callback because a
+/// robust list must be walked while the dying task's address space is still
+/// mapped (before `cleanup_zombie()` can free it).
+pub fn register_robust_futex_cleanup(callback: RobustFutexCleanupCallback) {
+    *ROBUST_FUTEX_CLEANUP.lock() = Some(callback);
+}
+
 /// Register the scheduler's prepare/commit/cancel admission transaction.
 pub fn register_scheduler_admission(
     reserve: SchedulerReserveCallback,
@@ -7547,6 +7565,22 @@ fn notify_ipc_process_cleanup(
     let callback = *IPC_CLEANUP.lock();
     if let Some(cb) = callback {
         cb(pid, tgid, ipc_ns_id, generation);
+    }
+}
+
+/// Invoke the robust-futex walker after a task publishes `Zombie`. No PCB lock
+/// is held here; the callback may snapshot user-memory metadata and temporarily
+/// switch to the target address space. A missing callback is a safe no-op during
+/// early boot, before the IPC subsystem has registered its implementation.
+fn notify_robust_futex_cleanup(
+    pid: ProcessId,
+    tgid: ProcessId,
+    generation: u64,
+    owner_tid: ProcessId,
+) {
+    let callback = *ROBUST_FUTEX_CLEANUP.lock();
+    if let Some(cb) = callback {
+        cb(pid, tgid, generation, owner_tid);
     }
 }
 
@@ -8202,6 +8236,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let parent_pid: ProcessId;
         let clear_child_tid: u64;
         let tgid: ProcessId;
+        let generation: u64;
+        let robust_owner_tid: ProcessId;
         let memory_space: usize;
         // R25-7 FIX: Save credentials for LSM exit hook
         let lsm_uid: u32;
@@ -8256,6 +8292,9 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // 获取 clear_child_tid 信息用于线程退出通知
             clear_child_tid = proc.clear_child_tid;
             tgid = proc.tgid;
+            generation = proc.generation;
+            robust_owner_tid =
+                crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(pid);
             memory_space = proc.memory_space;
             // 清除 clear_child_tid 避免重复处理
             proc.clear_child_tid = 0;
@@ -8316,6 +8355,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // pending_kill → defer; the direct terminate callers are
         // never-scheduled-child cleanups that are never deferred).
         clear_irq_kill_nonrunnable(pid);
+
+        // HIGH-3 / U34-1: walk and release userspace robust futexes while the
+        // dying task's address space is still retained. This callback is
+        // deliberately before deferred reaping/free_process_resources(); the
+        // post-reap IPC callback cannot safely dereference the user list.
+        notify_robust_futex_cleanup(pid, tgid, generation, robust_owner_tid);
 
         // R170-3 FIX: land the taken contention-deferred quota debt on its
         // origin cgroup (process context — the blocking walk is legal here).
@@ -10243,7 +10288,16 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
                 .mmap_regions
                 .values()
                 .fold(0usize, |total, &entry| {
-                    total.saturating_add(crate::syscall::mmap_region_len(entry))
+                    // U05-1 FIX: PROT_NONE VMAs reserve address space but do
+                    // not own resident frames. Counting them as RSS lets a
+                    // process win OOM victim selection merely by reserving a
+                    // large sparse range. Keep the snapshot aligned with the
+                    // cgroup charge invariant and skip non-resident entries.
+                    if entry.is_prot_none() {
+                        total
+                    } else {
+                        total.saturating_add(crate::syscall::mmap_region_len(entry))
+                    }
                 });
             (rss_bytes / 4096) as u64
         };

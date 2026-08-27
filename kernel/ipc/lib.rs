@@ -57,9 +57,9 @@ pub use pipe::{
 };
 
 pub use futex::{
-    active_futex_count, cleanup_process_futexes, futex_lock_pi, futex_unlock_pi, futex_wait,
-    futex_wake, FutexError, FutexTable, FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT,
-    FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
+    active_futex_count, cleanup_process_futexes, exit_robust_futexes, futex_lock_pi,
+    futex_unlock_pi, futex_wait, futex_wake, run_robust_futex_self_test, FutexError, FutexTable,
+    FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
 };
 
 /// Reserve both unpublished pipe capability identities as one rollback-safe
@@ -863,6 +863,10 @@ pub fn init() {
 
     // 注册IPC清理回调到进程管理子系统（包括端点和 futex 清理）
     kernel_core::register_ipc_cleanup(ipc_cleanup);
+
+    // HIGH-3 / U34-1: robust-list cleanup must run while the dying task's
+    // address space is still mapped, before the post-reap IPC drain.
+    process::register_robust_futex_cleanup(futex::exit_robust_futexes_with_tid);
 
     // 注册 futex 唤醒回调，用于线程退出时的 clear_child_tid 机制
     process::register_futex_wake(futex_wake_callback);
