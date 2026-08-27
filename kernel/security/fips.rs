@@ -102,6 +102,7 @@ pub(crate) fn begin_non_fips_operation() -> Result<NonFipsOperationGuard, FipsSt
 /// with Enabled or Failed).
 #[inline]
 pub fn set_fips_state(state: FipsState) {
+    const MAX_GATE_SPINS: u64 = 1_000_000;
     let desired = state as u8;
     // Refuse Disabled → Disabled (no-op that could mask a bug).
     if desired == FipsState::Disabled as u8 {
@@ -116,7 +117,12 @@ pub fn set_fips_state(state: FipsState) {
             return;
         }
         if gate & GATE_CLOSED != 0 {
+            let mut spins = 0u64;
             while fips_state() == FipsState::Disabled {
+                spins = spins.saturating_add(1);
+                if spins >= MAX_GATE_SPINS {
+                    panic!("FIPS state transition stalled while another transition owns the gate");
+                }
                 core::hint::spin_loop();
             }
             return;
@@ -132,7 +138,12 @@ pub fn set_fips_state(state: FipsState) {
         }
     }
 
+    let mut spins = 0u64;
     while NON_FIPS_GATE.load(Ordering::Acquire) & GATE_ACTIVE_MASK != 0 {
+        spins = spins.saturating_add(1);
+        if spins >= MAX_GATE_SPINS {
+            panic!("FIPS state transition stalled on active non-FIPS operations");
+        }
         core::hint::spin_loop();
     }
 

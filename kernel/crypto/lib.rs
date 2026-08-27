@@ -151,6 +151,20 @@ pub mod sha256 {
             for (i, chunk) in out.chunks_mut(4).enumerate() {
                 chunk.copy_from_slice(&self.state[i].to_be_bytes());
             }
+
+            // Hashers are also used by HMAC and audit-chain code.  Do not
+            // leave key-derived chaining state or a partial message block on
+            // the stack after finalization; volatile clearing keeps this
+            // hygiene from being optimized away in release builds.
+            for word in &mut self.state {
+                unsafe { core::ptr::write_volatile(word, 0) };
+            }
+            for byte in &mut self.buffer {
+                unsafe { core::ptr::write_volatile(byte, 0) };
+            }
+            self.buffer_len = 0;
+            self.total_len = 0;
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             out
         }
 

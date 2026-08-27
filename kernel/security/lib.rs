@@ -436,6 +436,7 @@ pub fn init(
                 report.wxorx_summary = Some(ValidationSummary {
                     scanned_entries: 0,
                     violations: 1,
+                    first_violation: Some(v),
                 });
 
                 if config.strict_wxorx {

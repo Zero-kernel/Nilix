@@ -617,7 +617,16 @@ pub fn hook_syscall_enter(ctx: &SyscallCtx) -> LsmResult {
 pub fn hook_syscall_exit(ctx: &SyscallCtx, ret: isize) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().syscall_exit(ctx, ret)
+        let res = policy().syscall_exit(ctx, ret);
+        if let Err(ref err) = res {
+            // R188-U42-3 FIX: exit-hook denials are security decisions too.
+            // Route them through the same denial→audit bridge as entry and
+            // mutation hooks so a policy cannot silently hide an enforcement
+            // result during teardown/return.
+            let subject = audit_subject_from_ctx(ctx.pid, ctx.uid, ctx.gid, ctx.cap);
+            emit_denial_audit(subject, AuditObject::None, "syscall_exit", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -685,7 +694,13 @@ pub fn hook_task_exec(task: &ProcessCtx, path_hash: u64) -> LsmResult {
 pub fn hook_task_exit(task: &ProcessCtx, code: i32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().task_exit(task, code)
+        let res = policy().task_exit(task, code);
+        if let Err(ref err) = res {
+            // R188-U42-3 FIX: preserve an audit trail for denied task exits.
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_exit", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {

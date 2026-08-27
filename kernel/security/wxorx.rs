@@ -36,6 +36,10 @@ pub struct ValidationSummary {
     pub scanned_entries: usize,
     /// Number of W^X violations found
     pub violations: usize,
+    /// First concrete violation observed during the walk.  Keeping the full
+    /// count and one location gives callers actionable diagnostics without
+    /// changing the fixed-size summary contract for subsequent entries.
+    pub first_violation: Option<Violation>,
 }
 
 /// Details about a W^X violation
@@ -111,6 +115,7 @@ pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, Wxorx
     let mut summary = ValidationSummary {
         scanned_entries: 0,
         violations: 0,
+        first_violation: None,
     };
 
     // Walk all PML4 entries
@@ -171,7 +176,15 @@ fn walk_pdpt(
         // Check for 1GB huge page
         if flags.contains(PageTableFlags::HUGE_PAGE) {
             if is_wxorx_violation(flags) {
-                summary.violations += 1;
+                record_violation(
+                    summary,
+                    Violation {
+                        virt_base: VirtAddr::new(virt_base),
+                        phys: pdpt_entry.addr(),
+                        level: PageLevel::Huge1G,
+                        flags,
+                    },
+                );
                 // Continue checking to count all violations
             }
             continue;
@@ -207,7 +220,15 @@ fn walk_pd(
         // Check for 2MB huge page
         if flags.contains(PageTableFlags::HUGE_PAGE) {
             if is_wxorx_violation(flags) {
-                summary.violations += 1;
+                record_violation(
+                    summary,
+                    Violation {
+                        virt_base: VirtAddr::new(virt_base),
+                        phys: pd_entry.addr(),
+                        level: PageLevel::Huge2M,
+                        flags,
+                    },
+                );
             }
             continue;
         }
@@ -232,14 +253,30 @@ fn walk_pt(pt: &PageTable, base: u64, summary: &mut ValidationSummary) -> Result
 
         summary.scanned_entries += 1;
         let flags = pt_entry.flags();
-        let _virt_addr = base + (pt_idx as u64 * 4096);
+        let virt_addr = base + (pt_idx as u64 * 4096);
 
         if is_wxorx_violation(flags) {
-            summary.violations += 1;
+            record_violation(
+                summary,
+                Violation {
+                    virt_base: VirtAddr::new(virt_addr),
+                    phys: pt_entry.addr(),
+                    level: PageLevel::P1,
+                    flags,
+                },
+            );
         }
     }
 
     Ok(())
+}
+
+#[inline]
+fn record_violation(summary: &mut ValidationSummary, violation: Violation) {
+    summary.violations = summary.violations.saturating_add(1);
+    if summary.first_violation.is_none() {
+        summary.first_violation = Some(violation);
+    }
 }
 
 /// Check if page flags violate W^X policy

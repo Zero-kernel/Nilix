@@ -512,6 +512,7 @@ impl KernelLayout {
 // ============================================================================
 
 // Linker-provided section boundaries (defined in kernel.ld)
+#[cfg(target_os = "none")]
 extern "C" {
     static kernel_start: u8;
     static text_start: u8;
@@ -524,6 +525,27 @@ extern "C" {
     static bss_end: u8;
     static kernel_end: u8;
 }
+
+#[cfg(not(target_os = "none"))]
+static kernel_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static text_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static text_end: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static rodata_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static rodata_end: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static data_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static data_end: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static bss_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static bss_end: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static kernel_end: u8 = 0;
 
 /// Convert a linker symbol reference to its virtual address
 #[inline]

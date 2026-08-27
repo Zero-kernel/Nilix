@@ -153,8 +153,9 @@ pub struct MitigationStatus {
     /// SWAPGS mitigation enabled (CVE-2019-1125)
     /// Always true - implemented unconditionally in syscall entry/exit
     pub swapgs_mitigated: bool,
-    /// RSB stuffing enabled
-    /// Always true - implemented unconditionally in context switch
+    /// RSB stuffing enabled for scheduler context-switch barriers.  This is
+    /// false while the mitigation policy is disabled because the barrier
+    /// intentionally returns before touching the stack.
     pub rsb_stuffing_enabled: bool,
 }
 
@@ -171,9 +172,9 @@ impl MitigationStatus {
             retpoline_required: false,
             ssbd_supported: false,
             ssbd_enabled: false,
-            // These are always enabled unconditionally
+            // SWAPGS remains unconditional; RSB follows the runtime policy.
             swapgs_mitigated: true,
-            rsb_stuffing_enabled: true,
+            rsb_stuffing_enabled: false,
         }
     }
 
@@ -296,9 +297,9 @@ pub fn detect() -> MitigationStatus {
         retpoline_required,
         ssbd_supported: ssbd,
         ssbd_enabled: false,
-        // These are always enabled unconditionally in our implementation
+        // SWAPGS is unconditional; RSB stuffing is policy-gated.
         swapgs_mitigated: true,
-        rsb_stuffing_enabled: true,
+        rsb_stuffing_enabled: policy_enabled(),
     }
 }
 

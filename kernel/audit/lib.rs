@@ -191,6 +191,11 @@ pub enum AuditSecurityClass {
     Capability = 3,
     /// P1-3: Cgroup delegation lifecycle (grant/revoke).
     CgroupDelegation = 4,
+    /// Cgroup hierarchy/resource governance operation.
+    CgroupGovernance = 5,
+    /// TCP Initial Sequence Numbers generated before strong entropy became
+    /// available.  This is an informational security-posture event.
+    WeakIsn = 6,
 }
 
 /// LSM denial reason code (stored in `args[2]`).
@@ -259,6 +264,16 @@ pub enum AuditCgroupDelegationOp {
     Grant = 1,
     /// Delegation revoked.
     Revoke = 2,
+}
+
+/// Cgroup governance operations tracked by the audit stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditCgroupGovernanceOp {
+    Create = 1,
+    Destroy = 2,
+    Attach = 3,
+    SetLimit = 4,
 }
 
 /// Argument layout for security events (shared across SecurityClass variants).
@@ -675,7 +690,8 @@ fn write_event_payload(hasher: &mut Sha256Writer, prev_hash: [u8; 32], event: &A
 
     // Arguments
     hasher.write_u8(event.arg_count);
-    for i in 0..event.arg_count as usize {
+    let arg_count = core::cmp::min(event.arg_count as usize, MAX_ARGS);
+    for i in 0..arg_count {
         hasher.write_u64(event.args[i]);
     }
 
@@ -1517,7 +1533,9 @@ pub struct AuditExportRecord {
     pub hash_trunc: [u8; 8],
     /// Number of events dropped before this one.
     pub dropped: u64,
-    /// Reserved for future use.
+    /// Seventh operation argument.  This occupies the historical reserved
+    /// slot so the fixed 128-byte ABI can carry all seven `AuditEvent` args
+    /// without changing record size.
     pub reserved: [u8; 8],
 }
 
@@ -1558,6 +1576,18 @@ impl AuditExportRecord {
             };
         }
 
+        // Preserve the seventh argument in the legacy reserved slot.  It is
+        // subject to the same syscall-pointer redaction as the first six.
+        let seventh = if event.arg_count as usize > 6 {
+            if should_redact {
+                0
+            } else {
+                event.args[6]
+            }
+        } else {
+            0
+        };
+
         let mut prev_hash_trunc = [0u8; 8];
         prev_hash_trunc.copy_from_slice(&event.prev_hash[..8]);
         let mut hash_trunc = [0u8; 8];
@@ -1580,7 +1610,7 @@ impl AuditExportRecord {
             prev_hash_trunc,
             hash_trunc,
             dropped: event.dropped,
-            reserved: [0; 8],
+            reserved: seventh.to_le_bytes(),
         }
     }
 
@@ -2401,6 +2431,55 @@ pub fn emit_cgroup_delegation_event(
         AuditObject::None,
         &args,
         errno,
+        timestamp,
+    )
+}
+
+/// Emit a successful cgroup governance mutation.  Governance is privileged
+/// but still needs a tamper-evident trail for delegated administrators.
+#[inline]
+pub fn emit_cgroup_governance_event(
+    subject: AuditSubject,
+    op: AuditCgroupGovernanceOp,
+    cgroup_id: u64,
+    old_value: u64,
+    new_value: u64,
+    detail: u64,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let args = [
+        AuditSecurityClass::CgroupGovernance as u64,
+        op as u64,
+        cgroup_id,
+        old_value,
+        new_value,
+        detail,
+    ];
+    emit(
+        AuditKind::Security,
+        AuditOutcome::Success,
+        subject,
+        AuditObject::None,
+        &args,
+        0,
+        timestamp,
+    )
+}
+
+/// Record that TCP generated an ISN while its temporary boot-time entropy
+/// source was still weak.  The event is intentionally informational: the
+/// connection remains functional, but operators must be able to distinguish
+/// early-boot exposure from a strong-entropy runtime (U14-3).
+#[inline]
+pub fn emit_weak_isn_observation(count: u32, timestamp: u64) -> Result<(), AuditError> {
+    let args = [AuditSecurityClass::WeakIsn as u64, count as u64];
+    emit(
+        AuditKind::Security,
+        AuditOutcome::Info,
+        AuditSubject::kernel(),
+        AuditObject::None,
+        &args,
+        0,
         timestamp,
     )
 }

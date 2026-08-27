@@ -389,6 +389,11 @@ pub fn is_profile_locked() -> bool {
 /// R93-1 FIX: Serialize FIPS enable attempts to avoid races between callers.
 static FIPS_ENABLING: AtomicBool = AtomicBool::new(false);
 
+/// Maximum number of bounded waits for another FIPS enable attempt.  FIPS
+/// enable is a privileged, cold-path operation; a bounded wait is preferable
+/// to allowing a stalled caller to pin a CPU forever.
+const FIPS_ENABLE_SPIN_LIMIT: usize = 1 << 20;
+
 /// Error type for FIPS operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FipsError {
@@ -402,6 +407,8 @@ pub enum FipsError {
     SelfTestFailed,
     /// Access denied (requires privilege).
     AccessDenied,
+    /// Another enable attempt has not completed within the bounded wait.
+    Busy,
 }
 
 /// Enable FIPS mode.
@@ -426,10 +433,22 @@ pub fn enable_fips_mode() -> Result<(), FipsError> {
     }
 
     // R93-1 FIX: Serialize enable attempts (prevents races between self-tests and state updates).
+    let mut waits = 0usize;
     while FIPS_ENABLING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        // Re-check the terminal state while waiting so a concurrent caller
+        // that completed the transition is observed without another lock.
+        match fips_state() {
+            FipsState::Enabled => return Err(FipsError::AlreadyEnabled),
+            FipsState::Failed => return Err(FipsError::EnableFailed),
+            FipsState::Disabled => {}
+        }
+        waits = waits.saturating_add(1);
+        if waits >= FIPS_ENABLE_SPIN_LIMIT {
+            return Err(FipsError::Busy);
+        }
         core::hint::spin_loop();
     }
 
@@ -499,8 +518,12 @@ pub fn is_algorithm_permitted(algorithm: CryptoAlgorithm) -> bool {
         CryptoAlgorithm::HmacSha256 => true,
         CryptoAlgorithm::EcdsaP256 => true,
         CryptoAlgorithm::EcdsaP384 => true,
-        CryptoAlgorithm::Aes128Gcm => true,
-        CryptoAlgorithm::Aes256Gcm => true,
+        // R188-U48-1 FIX: AES-GCM has no implemented KAT in this build.
+        // Do not attest an algorithm as approved merely because its enum is
+        // present; keep the policy fail-closed until a validated AES-GCM KAT
+        // is added to `run_all()` and passes during FIPS enablement.
+        CryptoAlgorithm::Aes128Gcm => false,
+        CryptoAlgorithm::Aes256Gcm => false,
 
         // Non-FIPS algorithms
         CryptoAlgorithm::ChaCha20 => false,

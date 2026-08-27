@@ -464,6 +464,19 @@ fn extract_patch_meta(img: &PatchImage<'_>) -> Result<(PatchMeta, usize), Errno>
 
 const MAX_PATCHES: usize = 64;
 
+/// Retired handler regions are quarantined instead of being freed immediately.
+/// A signed handler is arbitrary kernel code and cannot be trusted to execute
+/// the optional return hook, so reclamation must never depend on cooperation
+/// from that code.  The fixed bound keeps unload/reload memory use finite; once
+/// the quarantine is full, a further unload fails closed with `EBUSY`.
+const MAX_RETIRED_EXEC: usize = MAX_PATCHES;
+
+#[derive(Clone, Copy)]
+struct RetiredExec {
+    addr: usize,
+    len: usize,
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PatchState {
@@ -475,6 +488,11 @@ pub enum PatchState {
     Disabling = 5,
     Disabled = 6,
     Failed = 7,
+    /// The slot has been unloaded but its executable blob is quarantined.
+    /// It is intentionally never reused: a signed handler may return late
+    /// through an old slot index, and reusing the index would let that stale
+    /// callback mutate a newer patch's in-flight accounting.
+    Retired = 8,
 }
 
 impl PatchState {
@@ -488,6 +506,7 @@ impl PatchState {
             4 => PatchState::Enabled,
             5 => PatchState::Disabling,
             6 => PatchState::Disabled,
+            8 => PatchState::Retired,
             _ => PatchState::Failed,
         }
     }
@@ -521,13 +540,10 @@ struct PatchSlot {
 
     // R103-2 FIX: In-flight dispatch counter.
     //
-    // Incremented by `breakpoint_dispatch` before redirecting RIP into the handler,
-    // decremented after the handler returns (via return trampoline or wrapper).
-    // `kpatch_unload` must wait for this counter to reach 0 after `kpatch_disable`
-    // + `sync_cores()` to ensure no CPU is still executing handler code before
-    // freeing the exec memory.  Without this, a concurrent breakpoint_dispatch
-    // that loaded the handler address but has not yet executed `iretq` back to it
-    // would jump into freed memory.
+    // Incremented by `breakpoint_dispatch` before redirecting RIP into the handler
+    // and optionally decremented by a cooperative return hook.  Unload safety does
+    // not depend on this counter: executable blobs and their slot indices are both
+    // retired permanently, because signed handler code may omit or delay the hook.
     in_flight: AtomicU32,
 }
 
@@ -564,6 +580,32 @@ static TEXT_PATCH_LOCK: Mutex<()> = Mutex::new(());
 /// memory safety).  The double-lock is acceptable because `PATCH_META_TABLE` is
 /// only accessed in cold registration/unload/dependency-check paths.
 static PATCH_META_TABLE: Mutex<[Option<PatchMeta>; MAX_PATCHES]> = Mutex::new([None; MAX_PATCHES]);
+static RETIRED_EXEC: Mutex<[Option<RetiredExec>; MAX_RETIRED_EXEC]> =
+    Mutex::new([None; MAX_RETIRED_EXEC]);
+
+/// Place an executable region in the never-reused quarantine.  This is the
+/// safety backstop for handlers that do not call `kpatch_handler_return` (or
+/// call it too late): an in-flight CPU can continue executing valid bytes even
+/// after the slot is cleared and reused.
+fn quarantine_exec(addr: usize, len: usize) -> bool {
+    if addr == 0 || len == 0 {
+        return true;
+    }
+    let mut retired = RETIRED_EXEC.lock();
+    if retired
+        .iter()
+        .flatten()
+        .any(|entry| entry.addr == addr && entry.len == len)
+    {
+        return true;
+    }
+    if let Some(slot) = retired.iter_mut().find(|entry| entry.is_none()) {
+        *slot = Some(RetiredExec { addr, len });
+        true
+    } else {
+        false
+    }
+}
 
 fn init_patch_table() -> &'static [PatchSlot] {
     let mut v = Vec::with_capacity(MAX_PATCHES);
@@ -730,7 +772,7 @@ fn collect_patch_nodes(table: &'static [PatchSlot]) -> Result<Vec<(usize, u64, P
         ) {
             return Err(Errno::EBUSY);
         }
-        if st == PatchState::Failed {
+        if matches!(st, PatchState::Failed | PatchState::Retired) {
             continue; // Skip failed patches — they cannot participate in batch ops.
         }
         // R110-1 FIX: Treat missing metadata on a non-empty, non-failed slot as an
@@ -1419,6 +1461,7 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
             }
             PatchState::Empty => return Err(Errno::ENOENT),
             PatchState::Failed => return Err(Errno::EINVAL),
+            PatchState::Retired => return Err(Errno::ENOENT),
         }
     };
 
@@ -1486,6 +1529,7 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
             }
             PatchState::Empty => return Err(Errno::ENOENT),
             PatchState::Failed => return Err(Errno::EINVAL),
+            PatchState::Retired => return Err(Errno::ENOENT),
         }
     };
 
@@ -1522,7 +1566,8 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
     }
 }
 
-/// R93-13 FIX: Unload a previously disabled patch by id (frees exec allocation and clears slot).
+/// R93-13 FIX: Unload a previously disabled patch by id. Executable memory and
+/// the historical slot index are quarantined rather than reused.
 ///
 /// P1-4: Before unloading, verifies no `Enabled`/`Enabling` patch depends on this one.
 pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
@@ -1572,7 +1617,7 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     let exec_addr = slot.exec_addr.swap(0, Ordering::AcqRel);
     let exec_len = slot.exec_len.swap(0, Ordering::AcqRel);
 
-    // R103-2 FIX: Quiescence barrier before freeing handler memory.
+    // R103-2 FIX: Quiescence barrier before retiring handler memory.
     //
     // After kpatch_disable restores the original instruction, no NEW breakpoint
     // dispatches can start for this slot. However, a CPU that was already inside
@@ -1581,27 +1626,17 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     //
     // Step 1: IPI + serializing barrier — ensures every CPU has retired any
     //         in-progress breakpoint_dispatch that read the old handler address.
-    // Step 2: Spin-wait on `in_flight` counter — ensures every dispatch that
-    //         incremented the counter has completed the handler and returned.
+    // Step 2 used to spin on `in_flight` and trust a signed handler to call a
+    // return hook.  That is not a valid safety boundary: malformed-but-validly
+    // signed code can omit the hook forever.  The executable region is now
+    // quarantined, so this barrier is advisory only and unload never depends
+    // on handler cooperation.
     ops.sync_cores();
 
-    // Bounded spin: 10 ms max (10_000 iterations × ~1µs).  If a handler takes
-    // longer than this, something is catastrophically wrong.
-    const MAX_QUIESCENCE_SPINS: u32 = 10_000;
-    let mut quiesced = false;
-    for _ in 0..MAX_QUIESCENCE_SPINS {
-        if slot.in_flight.load(Ordering::Acquire) == 0 {
-            quiesced = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-
-    // R103-2 FIX: If handlers are still in-flight after the timeout,
-    // we MUST NOT free exec memory (UAF). Restore the slot to Disabled
-    // and let the caller retry later.
-    if !quiesced {
-        // Restore the exec addresses so the slot remains valid.
+    // R188-U43-3 FIX: never free a blob whose lifetime could still be observed
+    // by a redirected interrupt frame.  If the bounded quarantine is full,
+    // restore the slot and fail closed; no state or allocation is lost.
+    if !quarantine_exec(exec_addr, exec_len) {
         slot.exec_addr.store(exec_addr, Ordering::Release);
         slot.exec_len.store(exec_len, Ordering::Release);
         slot.state
@@ -1615,7 +1650,10 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     slot.orig_valid.store(0, Ordering::Release);
     slot.orig_byte.store(0, Ordering::Release);
     slot.enabled_tsc.store(0, Ordering::Release);
-    slot.in_flight.store(0, Ordering::Release); // R103-2 FIX: reset counter
+    // Do not reset `in_flight`: a handler that was redirected before the
+    // quiescence barrier may still execute its late return hook.  The slot is
+    // retired below, so that hook is ignored instead of decrementing a new
+    // generation's counter.
 
     // P1-4: Clear dependency metadata BEFORE advertising the slot as Empty.
     //
@@ -1627,13 +1665,18 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
         let _guard = PATCH_REG_LOCK.lock();
         let mut meta_table = PATCH_META_TABLE.lock();
         meta_table[slot_index] = None;
-        // Now make the slot reusable while still holding the lock.
-        slot.state.store(PatchState::Empty as u8, Ordering::Release);
+        // Do not make a slot carrying quarantined executable code reusable.
+        // A late signed-handler callback only has the historical slot index;
+        // retaining a terminal state prevents cross-generation accounting
+        // corruption.  The bounded table therefore fails closed once all
+        // slots have been retired.
+        slot.state
+            .store(PatchState::Retired as u8, Ordering::Release);
     }
 
-    if exec_len != 0 {
-        unsafe { ops.free_exec(exec_addr, exec_len) };
-    }
+    // `exec_addr/exec_len` are intentionally retained in RETIRED_EXEC.  They
+    // may only be reclaimed by a stop-the-world teardown that can prove no
+    // redirected frame remains; ordinary unload has no such proof.
 
     // R110-3 FIX: Avoid raw address in profile-visible output.
     // R120-2 FIX: Gate address detail behind #[cfg(debug_assertions)].
@@ -1781,13 +1824,14 @@ unsafe fn atomic_write_u8(addr: usize, value: u8) {
 ///    `breakpoint_dispatch` may redirect RIP to handler.
 /// 2. **Enabled → Disabling**: INT3 is replaced with original byte; handler memory
 ///    is still live (in-flight dispatches may still be executing handler code).
-/// 3. **Disabling → Disabled**: Full IPI + synchronize_rcu() ensures no CPU is
-///    executing handler code. Only then may handler memory be freed.
-/// 4. **Disabled → Unloaded**: `exec_addr` is freed via `ops.free_exec()`.
+/// 3. **Disabling → Disabled**: Full IPI synchronization prevents new stale
+///    dispatcher reads, but already-redirected signed code may still run.
+/// 4. **Disabled → Retired**: executable memory and the slot index are
+///    quarantined permanently; ordinary unload never frees/reuses either.
 ///
-/// **Critical**: `kpatch_unload` MUST NOT free exec memory unless the patch is
-/// `Disabled` AND a full CPU synchronization barrier has completed. Otherwise,
-/// a concurrent `breakpoint_dispatch` could redirect RIP into freed memory.
+/// **Critical**: `kpatch_unload` never frees exec memory and never reuses its
+/// slot, because a concurrent `breakpoint_dispatch` may already have redirected
+/// RIP and the signed handler is not trusted to cooperate with reclamation.
 pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
     let table = match patch_table_get() {
         Some(t) => t,
@@ -1816,19 +1860,26 @@ pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
             return false;
         }
 
-        // R103-2 FIX: Track in-flight dispatches so kpatch_unload can wait
-        // for all CPUs to finish executing handler code before freeing memory.
-        slot.in_flight.fetch_add(1, Ordering::AcqRel);
+        // R103-2 FIX: Track in-flight dispatches for diagnostics and cooperative
+        // handlers. Reclamation is independently protected by retirement.
+        if slot
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .is_err()
+        {
+            // Saturation is fail-closed: do not redirect another frame when
+            // the lifetime accounting cannot represent it.
+            return false;
+        }
 
         // Rewrite RIP to patch handler using Volatile::update().
         // The x86_64 crate's InterruptStackFrame wraps the value in Volatile
         // to prevent optimizations that could break exception handling.
         //
-        // NOTE: The in_flight counter is decremented by the handler epilogue
-        // (return trampoline). Handlers generated by the livepatch compiler
-        // are required to call `kpatch_handler_return(slot_index)` before
-        // returning, which calls `in_flight.fetch_sub(1)`. For safety, the
-        // kpatch_unload spin-wait has a bounded timeout as a backstop.
+        // NOTE: A cooperative handler may call `kpatch_handler_return`, but
+        // unload does not trust that call for memory or slot lifetime safety.
         unsafe {
             stack_frame.as_mut().update(|frame| {
                 frame.instruction_pointer = VirtAddr::new(handler as u64);
@@ -1841,9 +1892,8 @@ pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
 
 /// R103-2 FIX: Decrement the in-flight dispatch counter for a patch slot.
 ///
-/// Must be called by livepatch handler epilogues (return trampolines) to signal
-/// that the handler has finished executing.  `kpatch_unload` spin-waits on this
-/// counter reaching zero before freeing the handler's exec memory.
+/// May be called by cooperative livepatch handler epilogues to signal that the
+/// handler has finished executing. Unload safety does not depend on the hook.
 ///
 /// # Arguments
 ///
@@ -1855,7 +1905,18 @@ pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
 pub fn kpatch_handler_return(slot_index: usize) {
     if let Some(table) = patch_table_get() {
         if let Some(slot) = table.get(slot_index) {
-            slot.in_flight.fetch_sub(1, Ordering::AcqRel);
+            let state = PatchState::from_u8(slot.state.load(Ordering::Acquire));
+            if matches!(state, PatchState::Empty | PatchState::Retired) {
+                // The callback belongs to an unloaded generation.  Retired
+                // slots are never reused, so ignoring it is both safe and
+                // deterministic.
+                return;
+            }
+            let _ = slot
+                .in_flight
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
         }
     }
 }
@@ -2056,17 +2117,58 @@ fn is_kernel_canonical_u64(addr: u64) -> bool {
 // ============================================================================
 
 // R93-10/R93-12: Kernel .text bounds (from linker script) for address validation.
+#[cfg(target_os = "none")]
 extern "C" {
     // Defined by kernel/kernel.ld
     static text_start: u8;
     static text_end: u8;
 }
 
+// Hosted unit tests do not link the bare-metal kernel linker script.  Provide
+// inert section markers so validation tests can execute without unresolved
+// kernel image symbols; the production build continues to use the real
+// linker-provided bounds.
+#[cfg(not(target_os = "none"))]
+static text_start: u8 = 0;
+#[cfg(not(target_os = "none"))]
+static text_end: u8 = 0;
+
 #[inline]
 fn kernel_text_bounds() -> (usize, usize) {
     let start = core::ptr::addr_of!(text_start) as usize;
     let end = core::ptr::addr_of!(text_end) as usize;
     (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r188_retired_state_is_terminal_and_round_trips() {
+        assert_eq!(
+            PatchState::from_u8(PatchState::Retired as u8),
+            PatchState::Retired
+        );
+        assert_eq!(PatchState::from_u8(0xff), PatchState::Failed);
+    }
+
+    #[test]
+    fn r188_retired_exec_quarantine_deduplicates_regions() {
+        let before = RETIRED_EXEC
+            .lock()
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        assert!(quarantine_exec(0x1000_0000, 0x1000));
+        assert!(quarantine_exec(0x1000_0000, 0x1000));
+        let after = RETIRED_EXEC
+            .lock()
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        assert_eq!(after, before + 1);
+    }
 }
 
 /// R93-10 FIX: Check if address is within kernel .text section.
