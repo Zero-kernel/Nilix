@@ -98,7 +98,7 @@ const SYSCALL_FRAME_SIZE: usize = SYSCALL_FRAME_QWORDS * 8;
 ///
 /// **Budget breakdown (scratch stack usage before kernel-stack switch):**
 ///   - Register save frame:  SYSCALL_FRAME_QWORDS × 8 = 128 bytes
-///   - `cld` + nested-syscall detection (`lock cmpxchg`): negligible stack
+///   - `cld` + nested-syscall detection (`lock bts`): negligible stack
 ///   - `call get_rsp0`:      one return-address push = 8 bytes
 ///   - **Total estimated:**  ~136 bytes  ⇒  headroom ≈ 3.9 KiB
 ///
@@ -225,7 +225,7 @@ pub struct SyscallPerCpu {
     /// Pointer to current syscall frame on kernel stack
     pub frame_ptr: u64,
     /// R67-11 FIX: Per-CPU syscall active flag (0 = idle, 1 = active).
-    /// Accessed atomically via `lock cmpxchg` in assembly. Plain u64
+    /// Accessed atomically via `lock bts` in assembly. Plain u64
     /// (not AtomicU64) to maintain Copy trait for array initialization.
     pub syscall_active: u64,
 
@@ -400,6 +400,19 @@ const _: () = {
 /// R67-11 FIX: Error code for nested syscall rejection.
 /// Using -EBUSY (16) to indicate the syscall layer is busy.
 const SYSCALL_NESTED_ERROR: i64 = -16;
+
+/// A SYSCALL instruction does not push a return frame; it leaves the
+/// continuation RIP in RCX.  Ring-3 addresses in this kernel are restricted
+/// to the low canonical half, so bit 47 is a conservative origin classifier:
+/// set means the entry was issued from kernel/high-half code.  The trampoline
+/// uses this predicate before SWAPGS and treats every positive result as a
+/// fail-closed nested entry.  A non-canonical RCX with bit 47 set is therefore
+/// rejected too, rather than being allowed to reach a user-GS swap.
+#[inline]
+#[allow(dead_code)]
+const fn syscall_rcx_is_kernel_origin(rcx: u64) -> bool {
+    (rcx & (1u64 << 47)) != 0
+}
 
 // ============================================================================
 // MSR 操作
@@ -1040,11 +1053,32 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "clac",
 
         // CVE-2019-1125 SWAPGS 防护：
-        // 立即执行 SWAPGS 切换到内核 GS 基址，然后使用 LFENCE 序列化
-        // 以关闭推测执行窗口，防止攻击者利用 SWAPGS 推测泄露内核数据
+        // A SYSCALL executed by a kernel bug has RCX in the high half.  Test
+        // the hardware-saved return RIP while GS still has its caller's value,
+        // and serialize the test before the conditional branch.  This keeps a
+        // kernel-origin entry from speculatively executing SWAPGS with a
+        // kernel GS base (which would expose the caller's user GS to the
+        // trampoline).
+        "bt rcx, 47",
+        "lfence",
+        "jc 8f",
+
+        // User-origin entry: switch to this CPU's kernel GS base and fence
+        // speculation.  The active-bit reservation is deliberately the first
+        // memory operation after SWAPGS, before user-RSP/scratch metadata.
+        // R188-U33-1 FIX: `lock bts` is atomic and preserves every user GPR,
+        // unlike the old `cmpxchg` sequence which had to clobber RAX/RDX.
+        // A set bit means another entry owns the trampoline; return directly
+        // to user mode without touching the owner's state.
         // R67-8 FIX: After SWAPGS, GS points to this CPU's SyscallPerCpu structure
         "swapgs",
         "lfence",
+
+        // Reserve the trampoline for this entry only after GS points at the
+        // kernel per-CPU record.  `bts` leaves every user register untouched;
+        // a set bit means another entry already owns the scratch metadata.
+        "lock bts qword ptr gs:[{percpu_syscall_active}], 0",
+        "jc 7f",
 
         // R67-8 FIX: Use GS-relative addressing instead of hardcoded slot 0
         // GS:PERCPU_USER_RSP_OFFSET points to this CPU's user_rsp_shadow field
@@ -1089,18 +1123,6 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov dr6, rax",
 
         // ========================================
-        // R67-11 FIX: 嵌套 syscall 检测
-        // ========================================
-        // 使用 lock cmpxchg 原子地检测并设置 syscall_active 标志。
-        // 如果标志已经是 1（说明已有 syscall 正在处理），则设置 r15 = 1 标记为嵌套。
-        // 后续会根据 r15 决定是否跳过 dispatcher 并返回错误。
-        "xor r15d, r15d",                           // r15 = 0（假设是首次进入）
-        "xor eax, eax",                             // 期望值 = 0（空闲状态）
-        "mov edx, 1",                               // 新值 = 1（占用状态）
-        "lock cmpxchg qword ptr gs:[{percpu_syscall_active}], rdx",
-        "setnz r15b",                               // 如果 cmpxchg 失败（已被占用），r15 = 1
-
-        // ========================================
         // 阶段 4: 切换到内核栈
         // ========================================
         "mov r12, rsp",                             // r12 = 临时栈上的帧指针
@@ -1139,14 +1161,6 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // Z-1 fix: 保存用户 FPU/SIMD 状态
         "fxsave64 [r13]",
 
-        // ========================================
-        // R67-11 FIX: 嵌套 syscall 快速失败
-        // ========================================
-        // 如果 r15 != 0，说明这是嵌套 syscall（之前的 cmpxchg 失败）。
-        // 跳过 dispatcher，直接返回 -EBUSY 错误。
-        "test r15b, r15b",
-        "jnz 3f",                                   // 嵌套 syscall -> 跳转到错误返回
-
         // R67-8 FIX: 保存 syscall 帧指针供 clone/fork 使用 (via GS)
         "mov qword ptr gs:[{percpu_frame_ptr}], r12",
 
@@ -1183,12 +1197,6 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "jmp 4f",
 
         // ========================================
-        // R67-11 FIX: 嵌套 syscall 错误返回
-        // ========================================
-        "3:",
-        "mov rax, {nested_err}",                    // 返回 -EBUSY 表示嵌套 syscall
-
-        // ========================================
         // R67-11 FIX: 公共退出路径
         // ========================================
         "4:",
@@ -1202,14 +1210,9 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "fxrstor64 [r13]",
 
         // ========================================
-        // R67-11 FIX: 释放 syscall_active 标志
-        // ========================================
-        // 只有在这次进入成功获取标志（r15 == 0）时才释放。
-        // 如果是嵌套 syscall（r15 == 1），不需要释放。
-        "test r15b, r15b",
-        "jnz 5f",                                   // 嵌套 syscall，跳过释放
+        // R67-11 FIX: release the active bit.  Nested entries never reach
+        // this epilogue: they use the register-only paths at labels 7/8.
         "mov qword ptr gs:[{percpu_syscall_active}], 0",  // 释放标志
-        "5:",
 
         // R172-04 FIX: commit the staged per-task FS/GS bases to the MSRs HERE. This is
         // the sole TLS-restore site for a task RESUMED mid-syscall via the scheduler's
@@ -1332,6 +1335,31 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "sub rsp, 8",                               // 对齐填充
         "call {bad_return}",                        // syscall_bad_return() 不返回
 
+        // ========================================
+        // R188-U33-1: register-only nested-entry exits
+        // ========================================
+        // Label 7 handles a second user-origin entry while the active bit is
+        // owned.  The hardware left RSP on the user stack, so no stack switch
+        // is needed; sanitize the already-masked RFLAGS and SYSRET directly.
+        "7:",
+        "mov rax, {nested_err}",
+        "movabs r10, {rflags_user_mask}",
+        "and r11, r10",
+        "or r11, {rflags_if}",
+        "swapgs",
+        "lfence",
+        "sysretq",
+
+        // Label 8 handles a kernel-origin SYSCALL.  SYSCALL does not create a
+        // return frame, but it leaves the continuation in RCX and the caller's
+        // flags in R11.  Restore those flags and jump to the continuation;
+        // this preserves the kernel GS state and cannot pivot through user GS.
+        "8:",
+        "mov rax, {nested_err}",
+        "push r11",
+        "popfq",
+        "jmp rcx",
+
         // 符号绑定
         // R67-8 FIX: Use GS-relative offsets instead of hardcoded slot 0
         percpu_user_rsp = const PERCPU_USER_RSP_OFFSET,
@@ -1445,5 +1473,13 @@ mod tests {
         // Z-1 fix: 验证 FPU 保存区大小和对齐要求
         assert_eq!(FPU_SAVE_AREA_SIZE, 512);
         assert_eq!(FPU_SAVE_AREA_SIZE % 16, 0); // FXSAVE 需要 16B 对齐
+    }
+
+    #[test]
+    fn syscall_origin_classifier_rejects_high_half_and_accepts_user_half() {
+        assert!(!syscall_rcx_is_kernel_origin(0x0000_7fff_ffff_ffff));
+        assert!(syscall_rcx_is_kernel_origin(0xffff_8000_0000_0000));
+        // Non-canonical values with bit 47 set are fail-closed as well.
+        assert!(syscall_rcx_is_kernel_origin(0x0000_8000_0000_0000));
     }
 }

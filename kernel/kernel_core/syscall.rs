@@ -340,7 +340,7 @@ impl SocketFile {
 const S_IFSOCK: u32 = 0o140000;
 
 impl crate::process::FileOps for SocketFile {
-    fn clone_box(&self) -> crate::process::FileDescriptor {
+    fn clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
         // Increment the SOCKET refcount on clone (for dup/fork POSIX semantics).
         //
         // NOTE: If the socket was already closed/removed from the table,
@@ -367,7 +367,6 @@ impl crate::process::FileOps for SocketFile {
         // CapSlot::clone). See `remove_fd` (process.rs) for the matching decrement
         // via the generic `FileOps::cap_id()` accessor.
         self.try_clone_box()
-            .expect("socket fd clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
@@ -1552,8 +1551,8 @@ pub fn run_fileops_cap_id_self_test() {
     // pipe/file fds keep None until U.S2 SLICE-3 wires their caps).
     struct NoCapFile;
     impl FileOps for NoCapFile {
-        fn clone_box(&self) -> crate::process::FileDescriptor {
-            self.try_clone_box().expect("NoCapFile clone allocation")
+        fn clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
+            self.try_clone_box()
         }
         fn try_clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
             crate::process::FileDescriptor::try_new(NoCapFile, mm::HeapClass::CoreProcess)
@@ -3755,11 +3754,10 @@ pub fn syscall_dispatcher(
             let pid = match crate::process::current_pid() {
                 Some(pid) => pid,
                 None => {
-                    // No current PID — should not happen. Force halt as fallback.
-                    crate::scheduler_hook::force_reschedule();
-                    loop {
-                        core::hint::spin_loop();
-                    }
+                    // No current PID is an internal invariant failure.  Do
+                    // not enter an unbounded spin with interrupts enabled;
+                    // panic routes through the kernel's safe halt path.
+                    panic!("seccomp Kill without a current process");
                 }
             };
 
@@ -3787,10 +3785,7 @@ pub fn syscall_dispatcher(
             let pid = match crate::process::current_pid() {
                 Some(pid) => pid,
                 None => {
-                    crate::scheduler_hook::force_reschedule();
-                    loop {
-                        core::hint::spin_loop();
-                    }
+                    panic!("seccomp Trap without a current process");
                 }
             };
 
@@ -3857,16 +3852,37 @@ pub fn syscall_dispatcher(
         lsm_ctx.is_some(),
         "R142-4: LSM context missing for user syscall — kernel bug"
     );
-    if let Some(ref ctx) = lsm_ctx {
-        if let Err(err) = lsm::hook_syscall_enter(ctx) {
+    let lsm_ctx = match lsm_ctx {
+        Some(ctx) => ctx,
+        None => {
+            // R184-U01-1 FIX: a missing security context is an internal
+            // consistency failure, never an implicit allow.  `from_current`
+            // may legitimately fail while another CPU updates credentials;
+            // dispatching in that window would bypass every MAC hook.  Fail
+            // closed and leave the debug assertion above as a development
+            // tripwire for impossible kernel-entry paths.
             increment_counter(TraceCounter::SyscallDenied, 1);
-            // LSM denied the syscall - call exit hook and return error
-            let errno = lsm_error_to_syscall(err);
-            let ret = errno.as_i64();
-            let _ = lsm::hook_syscall_exit(ctx, ret as isize);
+            let subject = get_audit_subject();
+            let _ = audit::emit_lsm_denial(
+                subject,
+                AuditObject::None,
+                "syscall_context",
+                audit::AuditLsmReason::Internal,
+                SyscallError::EPERM as i32,
+                timestamp,
+            );
             increment_counter(TraceCounter::SyscallExit, 1);
-            return ret;
+            return SyscallError::EPERM.as_i64();
         }
+    };
+    if let Err(err) = lsm::hook_syscall_enter(&lsm_ctx) {
+        increment_counter(TraceCounter::SyscallDenied, 1);
+        // LSM denied the syscall - call exit hook and return error
+        let errno = lsm_error_to_syscall(err);
+        let ret = errno.as_i64();
+        let _ = lsm::hook_syscall_exit(&lsm_ctx, ret as isize);
+        increment_counter(TraceCounter::SyscallExit, 1);
+        return ret;
     }
 
     let result = match syscall_num {
@@ -4207,13 +4223,11 @@ pub fn syscall_dispatcher(
     );
 
     // LSM hook: notify security policy of syscall exit
-    if let Some(ref ctx) = lsm_ctx {
-        let ret = match &result {
-            Ok(val) => *val as isize,
-            Err(e) => e.as_i64() as isize,
-        };
-        let _ = lsm::hook_syscall_exit(ctx, ret);
-    }
+    let ret = match &result {
+        Ok(val) => *val as isize,
+        Err(e) => e.as_i64() as isize,
+    };
+    let _ = lsm::hook_syscall_exit(&lsm_ctx, ret);
 
     // R115-1 FIX: Honor cross-CPU exit requests at syscall return.
     //
@@ -6118,10 +6132,14 @@ fn exec_from_bytes(
     // M0-4 (Codex Fix A): enforce the current-task-only contract. The body below
     // switches the running CPU's CR3 and uses lsm_current_process_ctx(); a caller
     // passing a non-running process would corrupt the live address space.
-    debug_assert!(
-        current_pid() == Some(process.lock().pid),
-        "exec_from_bytes must run on the current task"
-    );
+    let process_pid = process.lock().pid;
+    let is_current = current_pid() == Some(process_pid);
+    debug_assert!(is_current, "exec_from_bytes must run on the current task");
+    if !is_current {
+        // R188-U01-2 FIX: this core switches the live CR3 and therefore cannot
+        // safely operate on an arbitrary PCB supplied by a future caller.
+        return Err(SyscallError::ESRCH);
+    }
 
     // R33-1 FIX: Refuse exec while other threads share this address space.
     // Calling exec in a multithreaded process would free the page tables while
@@ -6742,6 +6760,11 @@ fn exec_from_bytes(
         // M0-6 poll/select: a live ppoll/pselect6 mask stash cannot survive the
         // address-space replacement (the syscall that set it is being replaced).
         proc.poll_restore_blocked = None;
+        // Robust-list registration is address-space-local. Clear the old
+        // image's pointer before publishing the replacement so exit cleanup
+        // cannot dereference stale or newly-reused virtual memory.
+        proc.robust_list_head = 0;
+        proc.robust_list_len = 0;
 
         // M0-4 (gap g1): refresh the process name to the exec'd program's
         // basename (Linux `comm` semantics, <=15 chars). The pre-M0-4 exec path
@@ -7804,6 +7827,67 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     // PID 1 保护：只有 init 自己能向自己发信号
     // Note: This checks the target's global PID, so namespace PID 1 is protected
     // within that namespace, but global PID 1 is specially protected.
+    // R188-U02-2: fast-fail a same-PID-namespace attempt to signal a
+    // namespace init.  The authoritative, pinned-Arc check remains in
+    // `send_signal`; this probe only avoids doing the DAC/LSM work for the
+    // common container-local SIGKILL case.
+    let mut namespace_init_supervisor = false;
+    if self_global_pid != target_global_pid {
+        let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
+        let (target_init_ns, target_user_ns) = {
+            let target_proc = target.lock();
+            (
+                target_proc
+                    .pid_ns_chain
+                    .iter()
+                    .rev()
+                    .find(|membership| {
+                        membership.pid == 1 || membership.ns.is_init(target_global_pid)
+                    })
+                    .map(|membership| membership.ns.clone()),
+                target_proc.user_ns.clone(),
+            )
+        };
+        if let Some(init_ns) = target_init_ns {
+            let sender = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
+            let (same_namespace, ancestor_namespace, sender_user_ns) = {
+                let sender_proc = sender.lock();
+                let same = sender_proc
+                    .pid_ns_chain
+                    .iter()
+                    .any(|membership| alloc::sync::Arc::ptr_eq(&membership.ns, &init_ns));
+                let mut ancestor = false;
+                let mut cursor = init_ns.parent();
+                for _ in 0..=crate::pid_namespace::MAX_PID_NS_LEVEL {
+                    let Some(namespace) = cursor else {
+                        break;
+                    };
+                    if sender_proc
+                        .pid_ns_chain
+                        .iter()
+                        .any(|membership| alloc::sync::Arc::ptr_eq(&membership.ns, &namespace))
+                    {
+                        ancestor = true;
+                        break;
+                    }
+                    cursor = namespace.parent();
+                }
+                (same, ancestor, sender_proc.user_ns.clone())
+            };
+            let user_namespace_supervisor =
+                (crate::process::current_has_cap_rights(cap::CapRights::ADMIN)
+                    || crate::current_is_host_root())
+                    && crate::signal::user_namespace_is_strict_ancestor(
+                        &sender_user_ns,
+                        &target_user_ns,
+                    );
+            namespace_init_supervisor = ancestor_namespace || user_namespace_supervisor;
+            if same_namespace && !namespace_init_supervisor {
+                return Err(SyscallError::EPERM);
+            }
+        }
+    }
+
     if target_global_pid == 1 && self_global_pid != 1 {
         return Err(SyscallError::EPERM);
     }
@@ -7861,7 +7945,8 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         // 1. Root at HOST level (host_euid == 0) 可以发信号给任何进程
         // 2. sender host_uid == target host_uid
         // 3. sender host_euid == target host_uid
-        let has_permission = sender_host_euid == 0
+        let has_permission = namespace_init_supervisor
+            || sender_host_euid == 0
             || sender_host_uid == target_host_uid
             || sender_host_euid == target_host_uid;
 
@@ -8723,6 +8808,62 @@ pub fn sanitize_fxsave_for_export(area: &mut [u8; 512]) {
     }
 }
 
+// R188-U09-1 FIX: Keep the IRQ-return handler-entry flags on the same sanitizer
+// as the syscall-return path.  The second predicate is intentionally separate
+// defense-in-depth: if a future edit weakens `sanitize_user_rflags`, the IRQ
+// path fails closed instead of redirecting Ring 3 with TF/DF still set.
+#[inline]
+fn sanitize_irq_handler_rflags(raw: u64) -> Option<u64> {
+    let sanitized = crate::signal_frame::sanitize_user_rflags(raw);
+    crate::signal_frame::is_safe_handler_entry_rflags(sanitized).then_some(sanitized)
+}
+
+/// R188-U09-1 regression guard for the IRQ-return signal-entry contract.
+///
+/// This pure test exercises the exact helper used by the timer-IRQ redirect,
+/// rather than only testing the lower-level sanitizer.  A dirty interrupted
+/// context must enter the handler with IF set and IOPL/TF/DF cleared; an unsafe
+/// post-sanitization value must be rejected by the fail-closed predicate.
+pub fn run_irq_signal_delivery_self_test() {
+    const CF: u64 = 1u64 << 0;
+    const TF: u64 = 1u64 << 8;
+    const DF: u64 = 1u64 << 10;
+    const IF: u64 = 1u64 << 9;
+    const IOPL: u64 = 3u64 << 12;
+
+    let dirty = CF | TF | DF | IOPL;
+    let clean = sanitize_irq_handler_rflags(dirty)
+        .expect("R188-U09-1: shared IRQ handler RFLAGS sanitizer rejected clean output");
+    assert_eq!(clean, crate::signal_frame::sanitize_user_rflags(dirty));
+    assert_eq!(clean & IF, IF, "R188-U09-1: handler entry must force IF");
+    assert_eq!(
+        clean & (TF | DF | IOPL),
+        0,
+        "R188-U09-1: handler entry must clear TF/DF/IOPL"
+    );
+    assert_eq!(
+        clean & CF,
+        CF,
+        "R188-U09-1: ordinary user flags stay intact"
+    );
+    assert!(
+        crate::signal_frame::is_safe_handler_entry_rflags(clean),
+        "R188-U09-1: sanitized IRQ handler flags must pass the safety predicate"
+    );
+    assert!(
+        !crate::signal_frame::is_safe_handler_entry_rflags(IF | TF | DF),
+        "R188-U09-1: TF/DF in a redirect target must fail closed"
+    );
+    assert!(
+        !crate::signal_frame::is_safe_handler_entry_rflags(0),
+        "R188-U09-1: a redirect target without IF must fail closed"
+    );
+    assert!(
+        !crate::signal_frame::is_safe_handler_entry_rflags(IF | IOPL),
+        "R188-U09-1: privileged IOPL bits must fail closed"
+    );
+}
+
 /// M0-7 SLICE 3b: Attempt to deliver a handler signal on IRQ return to Ring-3.
 ///
 /// This is the IRQ-context sibling of `maybe_deliver_signal`. It uses an
@@ -8776,38 +8917,77 @@ pub fn try_deliver_signal_on_irq_return(
         }
     };
 
-    // Check delivery preconditions under the lock.
-    // RF178-35 FIX: fatal exit dominates handler delivery. This closes the
-    // race after the timer's initial pending-exit transaction.
-    if proc_guard
-        .pending_kill
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
-        return None;
-    }
-    if proc_guard.in_signal_handler {
-        return None; // Already in a handler — no nested delivery.
-    }
-    if proc_guard.exec_in_progress {
-        return None; // Exec in flight — defer.
-    }
+    // R188-U09-2 FIX: snapshot only the state needed for frame construction,
+    // perform the non-faulting stack classification while the PCB/MM lock order
+    // is established, then release the PCB lock before frame assembly and
+    // faultable usercopy.  Holding a spin::Mutex guard over copy_to_user lets a
+    // page fault/SMAP window retain a non-IRQ-safe lock and can deadlock a
+    // nested exception or another CPU's signal/exit path.
+    //
+    // The generation, disposition, blocked mask, and pending bit are checked
+    // again at commit below.  A concurrent state change therefore causes a
+    // fail-closed defer; it can never redirect a stale handler or overwrite a
+    // newer signal mask.
+    let (sig, sa, old_blocked, generation, stack, mm) = {
+        // RF178-35 FIX: fatal exit dominates handler delivery. This closes the
+        // race after the timer's initial pending-exit transaction.
+        if proc_guard
+            .pending_kill
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        if proc_guard.pid as u64 != pid {
+            return None; // Stale table/PCB identity — fail closed.
+        }
+        if matches!(
+            proc_guard.state,
+            ProcessState::Zombie | ProcessState::Terminated
+        ) {
+            return None; // Lifecycle teardown wins over signal-frame construction.
+        }
+        if proc_guard.in_signal_handler {
+            return None; // Already in a handler — no nested delivery.
+        }
+        if proc_guard.exec_in_progress {
+            return None; // Exec in flight — defer.
+        }
 
-    // Select the lowest-priority deliverable handler signal.
-    // Compute the deliverable mask (pending & !blocked, with uncatchables removed).
-    let deliverable = proc_guard.pending_signals.bits()
-        & !proc_guard.blocked
-        & !crate::signal::uncatchable_mask();
-    let sig = match crate::signal::select_lowest_deliverable(deliverable) {
-        Some(s) => s,
-        None => return None, // No deliverable signal.
+        // Select the lowest-priority deliverable handler signal.
+        // Compute the deliverable mask (pending & !blocked, with uncatchables removed).
+        let deliverable = proc_guard.pending_signals.bits()
+            & !proc_guard.blocked
+            & !crate::signal::uncatchable_mask();
+        let sig = match crate::signal::select_lowest_deliverable(deliverable) {
+            Some(s) => s,
+            None => return None, // No deliverable signal.
+        };
+        let index = (sig.as_u8() - 1) as usize;
+        let sa = proc_guard.sigactions[index];
+
+        // The IRQ hook is a handler-only fast path.  Default/ignored signals
+        // stay on the normal safe-point path, where their default action or
+        // pending-bit cleanup is applied with the full syscall context.
+        if !sa.is_handler() {
+            return None;
+        }
+
+        let stack = resolve_sigframe_stack_irq(interrupted_rsp, &proc_guard);
+        let mm = Arc::clone(&proc_guard.mm);
+        (
+            sig,
+            sa,
+            proc_guard.blocked,
+            proc_guard.generation,
+            stack,
+            mm,
+        )
     };
-
-    let sa = &proc_guard.sigactions[(sig.as_u8() - 1) as usize];
+    drop(proc_guard);
     let handler = sa.handler;
     let sa_flags = sa.flags;
     let sa_mask = sa.mask;
     let restorer = sa.restorer;
-    let old_blocked = proc_guard.blocked;
 
     // Construct SavedUserContext from the interrupted GPRs/ISF.
     // rax = interrupted user RAX (NOT a syscall result).
@@ -8832,8 +9012,17 @@ pub fn try_deliver_signal_on_irq_return(
         rflags: interrupted_rflags,
     };
 
-    // Resolve provenance with the same fail-closed VMA locator as syscall return.
-    let stack = resolve_sigframe_stack_irq(interrupted_rsp, &proc_guard);
+    // R188-U09-1 FIX: Both signal-entry paths use the canonical sanitizer.  Keep
+    // the safety check before any user-visible state mutation so a future
+    // sanitizer regression defers this attempt rather than committing a bad
+    // handler frame.
+    let new_rflags = match sanitize_irq_handler_rflags(interrupted_rflags) {
+        Some(flags) => flags,
+        None => {
+            crate::request_resched_from_irq();
+            return None;
+        }
+    };
 
     // Compute the layout.
     let layout = match crate::signal_frame::compute_sigframe_layout(
@@ -8872,9 +9061,11 @@ pub fn try_deliver_signal_on_irq_return(
         // Try to grow the stack to cover the frame
         let target_floor = (frame_base as usize) & !(PAGE_SIZE - 1);
 
-        // Check if we need to grow (R173-01 FIX: try_lock for IRQ safety)
+        // Check if we need to grow (R173-01 FIX: try_lock for IRQ safety).
+        // `mm` is the Arc snapshot taken before the PCB guard was released;
+        // no Process lock is held while probing it.
         let need_grow = {
-            let mm = match proc_guard.mm.try_lock() {
+            let mm = match mm.try_lock() {
                 Some(mm) => mm,
                 None => return None, // mm lock contended - defer signal delivery
             };
@@ -8888,7 +9079,10 @@ pub fn try_deliver_signal_on_irq_return(
         }
     }
 
-    // Write the frame to user memory. copy_to_user Err → DEFER (NOT terminate).
+    // R188-U09-2 FIX: Write the frame to user memory only after the PCB guard
+    // has been dropped above. `copy_to_user_addr` is faultable and its SMAP
+    // guard owns the IRQ-state window; never move it back under `proc_arc.lock`.
+    // Err → DEFER (NOT terminate).
     if crate::usercopy::copy_to_user_addr(
         crate::usercopy::UserAddr::new(frame_base as usize),
         &frame_bytes,
@@ -8898,9 +9092,9 @@ pub fn try_deliver_signal_on_irq_return(
         return None; // Fault on write — defer.
     }
 
-    // Commit the delivery under a fresh lock (we dropped proc_guard above).
+    // Commit the delivery under a fresh lock.  The frame was built and copied
+    // with no PCB guard held, so this lock is a short metadata transaction only.
     // FIX A: Use try_lock to avoid deadlock if another CPU holds the Process lock.
-    drop(proc_guard);
     let mut proc = match proc_arc.try_lock() {
         Some(g) => g,
         None => {
@@ -8914,10 +9108,26 @@ pub fn try_deliver_signal_on_irq_return(
             return None;
         }
     };
-    if proc
-        .pending_kill
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
+    let index = (sig.as_u8() - 1) as usize;
+    let stack_still_matches = resolve_sigframe_stack_irq(interrupted_rsp, &proc) == stack;
+    let snapshot_still_valid = proc.pid as u64 == pid
+        && proc.generation == generation
+        && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
+        && !proc
+            .pending_kill
+            .load(core::sync::atomic::Ordering::Acquire)
+        && !proc.in_signal_handler
+        && !proc.exec_in_progress
+        && proc.pending_signals.is_pending(sig)
+        && proc.blocked == old_blocked
+        && proc.sigactions[index] == sa
+        && stack_still_matches;
+    if !snapshot_still_valid {
+        // R188-U09-2 FIX: The usercopy completed against a snapshot that is no
+        // longer authoritative.  Never redirect with stale signal metadata;
+        // leave the pending state untouched and retry at a later IRQ/safe point.
+        drop(proc);
+        crate::request_resched_from_irq();
         return None;
     }
     proc.pending_signals.clear(sig);
@@ -8934,8 +9144,6 @@ pub fn try_deliver_signal_on_irq_return(
     drop(proc);
 
     // Return the redirect target: (handler RIP, frame_base RSP, sanitized RFLAGS).
-    // RFLAGS: clear TF/DF, force IF=1, preserve the rest within the safe mask.
-    let new_rflags = (interrupted_rflags & 0x00000DD5) | 0x00000202; // IF=1, reserved bit 1 always 1
     Some((handler, frame_base, new_rflags))
 }
 
@@ -10306,6 +10514,10 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResul
 
     // Call VFS positioned read (does not mutate fd offset)
     let bytes_read = pread_fn(fd, &mut tmp, offset as u64)?;
+    // R188-U02-1 FIX: a filesystem callback is an internal trust boundary.
+    // Clamp its reported count before slicing/copying so a buggy or malicious
+    // implementation cannot turn a bounded read into an out-of-bounds panic.
+    let bytes_read = bytes_read.min(tmp.len());
 
     // Copy result to user space
     if bytes_read > 0 {
@@ -10416,7 +10628,7 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
                     // D1-RES R2: registry at capacity for a new pid — no Blocked
                     // publish, no lost wakeup. Bounded busy-retry (yield the CPU).
                     // Unreachable while resident tasks <= WAITER_REGISTRY_MAX_ENTRIES.
-                    crate::force_reschedule();
+                    yield_with_deferred_work();
                     continue;
                 }
             }
@@ -15991,6 +16203,17 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
 // 其他系统调用
 // ============================================================================
 
+/// U10-3: a voluntary process-context yield is also a safe deferred-work
+/// progress point. IRQ-return scheduling remains deliberately nonblocking.
+#[inline]
+fn yield_with_deferred_work() {
+    if crate::scheduler_hook::process_deferred_work_ready() {
+        crate::scheduler_hook::reschedule_if_needed();
+    } else {
+        crate::force_reschedule();
+    }
+}
+
 /// sys_yield - 主动让出CPU
 fn sys_yield() -> SyscallResult {
     // 将当前进程状态设置为Ready
@@ -16004,7 +16227,7 @@ fn sys_yield() -> SyscallResult {
     // 强制触发重调度，立即执行上下文切换
     // 注意：force_reschedule() 可能不会返回（如果切换到其他进程）
     // 当本进程再次被调度时，会从这里继续执行
-    crate::force_reschedule();
+    yield_with_deferred_work();
 
     Ok(0)
 }
@@ -18580,7 +18803,7 @@ fn sys_accept_common(
                     if let Some(proc) = current_pid().and_then(get_process) {
                         proc.lock().enter_ready_at(crate::get_ticks());
                     }
-                    crate::force_reschedule();
+                    yield_with_deferred_work();
                 }
                 continue;
             }
@@ -19420,7 +19643,18 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
     }
 
     match cgroup::create_cgroup(parent_id, ctrl_flags) {
-        Ok(node) => Ok(node.id() as usize),
+        Ok(node) => {
+            let _ = audit::emit_cgroup_governance_event(
+                get_audit_subject(),
+                audit::AuditCgroupGovernanceOp::Create,
+                node.id(),
+                parent_id,
+                node.id(),
+                controllers as u64,
+                crate::time::get_ticks(),
+            );
+            Ok(node.id() as usize)
+        }
         Err(cgroup::CgroupError::OutOfMemory) => Err(SyscallError::ENOMEM),
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::DepthLimit) => Err(SyscallError::ENOSPC),
@@ -19458,7 +19692,18 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     }
 
     match cgroup::delete_cgroup(cgroup_id) {
-        Ok(()) => Ok(0),
+        Ok(()) => {
+            let _ = audit::emit_cgroup_governance_event(
+                get_audit_subject(),
+                audit::AuditCgroupGovernanceOp::Destroy,
+                cgroup_id,
+                cgroup_id,
+                0,
+                0,
+                crate::time::get_ticks(),
+            );
+            Ok(0)
+        }
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::NotEmpty) => Err(SyscallError::EBUSY),
         Err(cgroup::CgroupError::PermissionDenied) => Err(SyscallError::EPERM),
@@ -19717,6 +19962,16 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     );
 
     proc.cgroup_id = cgroup_id;
+    drop(proc);
+    let _ = audit::emit_cgroup_governance_event(
+        get_audit_subject(),
+        audit::AuditCgroupGovernanceOp::Attach,
+        cgroup_id,
+        from_id,
+        cgroup_id,
+        pid as u64,
+        crate::time::get_ticks(),
+    );
     Ok(0)
 }
 
@@ -19840,7 +20095,18 @@ fn sys_cgroup_set_limit(
     }
 
     match cgroup_node.set_limit(limits) {
-        Ok(()) => Ok(0),
+        Ok(()) => {
+            let _ = audit::emit_cgroup_governance_event(
+                get_audit_subject(),
+                audit::AuditCgroupGovernanceOp::SetLimit,
+                cgroup_id,
+                0,
+                value,
+                limit_type as u64,
+                crate::time::get_ticks(),
+            );
+            Ok(0)
+        }
         Err(cgroup::CgroupError::ControllerDisabled) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::InvalidLimit) => Err(SyscallError::EINVAL),
         Err(_) => Err(SyscallError::EINVAL),
@@ -20055,6 +20321,7 @@ fn sys_fips_enable() -> Result<usize, SyscallError> {
         Err(compliance::FipsError::AlreadyEnabled) => Err(SyscallError::EALREADY),
         Err(compliance::FipsError::EnableFailed) => Err(SyscallError::EIO), // R93-1 FIX
         Err(compliance::FipsError::SelfTestFailed) => Err(SyscallError::EIO),
+        Err(compliance::FipsError::Busy) => Err(SyscallError::EBUSY),
         Err(_) => Err(SyscallError::EPERM),
     }
 }

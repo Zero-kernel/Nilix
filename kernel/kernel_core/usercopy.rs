@@ -71,7 +71,6 @@ core::arch::global_asm!(
     // Copy one byte from user space [rsi] to kernel space [rdi]
     // Returns 0 on success, 1 on fault
     .global __zero_os_usercopy_get_u8
-    .type __zero_os_usercopy_get_u8, @function
 __zero_os_usercopy_get_u8:
 .Lget_u8_access:
     mov al, [rsi]           // Read byte from user space - may fault here
@@ -81,7 +80,6 @@ __zero_os_usercopy_get_u8:
 .Lget_u8_fixup:
     mov eax, 1              // Return 1 (fault)
     ret
-    .size __zero_os_usercopy_get_u8, .-__zero_os_usercopy_get_u8
 
     // Exception table entry for get_u8 (PC-relative for PIE/KASLR compatibility)
     // Each .long is a signed 32-bit offset from its own address to the target.
@@ -96,7 +94,6 @@ __zero_os_usercopy_get_u8:
     // four byte loads can synthesize a value that never existed concurrently.
     // Returns 0 on success, 1 on fault.
     .global __zero_os_usercopy_get_u32
-    .type __zero_os_usercopy_get_u32, @function
 __zero_os_usercopy_get_u32:
 .Lget_u32_access:
     mov eax, dword ptr [rsi] // Aligned atomic user load - may fault here
@@ -106,7 +103,6 @@ __zero_os_usercopy_get_u32:
 .Lget_u32_fixup:
     mov eax, 1
     ret
-    .size __zero_os_usercopy_get_u32, .-__zero_os_usercopy_get_u32
 
     .pushsection .ex_table,"a"
     .balign 8
@@ -114,10 +110,31 @@ __zero_os_usercopy_get_u32:
 .Lex_get_u32_fixup: .long .Lget_u32_fixup - .Lex_get_u32_fixup
     .popsection
 
+    // RF187-U34: Atomically copy one aligned u64 from user space [rsi] to
+    // kernel space [rdi].  Robust-list pointers and the signed futex offset
+    // are naturally word-sized on the x86_64 ABI; a single load prevents a
+    // concurrent userspace update from being synthesized from torn halves.
+    // Returns 0 on success, 1 on fault.
+    .global __zero_os_usercopy_get_u64
+__zero_os_usercopy_get_u64:
+.Lget_u64_access:
+    mov rax, qword ptr [rsi] // Aligned atomic user load - may fault here
+    mov qword ptr [rdi], rax
+    xor eax, eax
+    ret
+.Lget_u64_fixup:
+    mov eax, 1
+    ret
+
+    .pushsection .ex_table,"a"
+    .balign 8
+.Lex_get_u64_fault: .long .Lget_u64_access - .Lex_get_u64_fault
+.Lex_get_u64_fixup: .long .Lget_u64_fixup - .Lex_get_u64_fixup
+    .popsection
+
     // Write one byte (sil) to user space [rdi]
     // Returns 0 on success, 1 on fault
     .global __zero_os_usercopy_put_u8
-    .type __zero_os_usercopy_put_u8, @function
 __zero_os_usercopy_put_u8:
 .Lput_u8_access:
     mov [rdi], sil          // Write byte to user space - may fault here
@@ -126,13 +143,34 @@ __zero_os_usercopy_put_u8:
 .Lput_u8_fixup:
     mov eax, 1              // Return 1 (fault)
     ret
-    .size __zero_os_usercopy_put_u8, .-__zero_os_usercopy_put_u8
 
     // Exception table entry for put_u8 (PC-relative for PIE/KASLR compatibility)
     .pushsection .ex_table,"a"
     .balign 8
 .Lex_put_u8_fault:  .long .Lput_u8_access - .Lex_put_u8_fault
 .Lex_put_u8_fixup:  .long .Lput_u8_fixup - .Lex_put_u8_fixup
+    .popsection
+
+    // RF187-U34: fault-tolerant atomic compare-and-exchange of one aligned
+    // user u32.  Arguments are (addr=rdi, expected=rsi, desired=rdx).  The
+    // low 32 bits of the return value contain the value observed by cmpxchg;
+    // bit 32 is set only when the user access faulted.  This lets robust-futex
+    // teardown distinguish a racing owner update from an unmapped word and
+    // fail closed on the latter.
+    .global __zero_os_usercopy_cmpxchg_u32
+__zero_os_usercopy_cmpxchg_u32:
+.Lcmpxchg_u32_access:
+    mov eax, esi
+    lock cmpxchg dword ptr [rdi], edx
+    ret
+.Lcmpxchg_u32_fixup:
+    mov rax, 0x100000000
+    ret
+
+    .pushsection .ex_table,"a"
+    .balign 8
+.Lex_cmpxchg_u32_fault: .long .Lcmpxchg_u32_access - .Lex_cmpxchg_u32_fault
+.Lex_cmpxchg_u32_fixup: .long .Lcmpxchg_u32_fixup - .Lex_cmpxchg_u32_fixup
     .popsection
 
 "#
@@ -146,6 +184,14 @@ extern "C" {
     /// Copy one aligned u32 from user space with one atomic load.
     /// Returns 0 on success, 1 on fault.
     fn __zero_os_usercopy_get_u32(dst: *mut u32, src: *const u32) -> u32;
+
+    /// Copy one aligned u64 from user space with one atomic load.
+    /// Returns 0 on success, 1 on fault.
+    fn __zero_os_usercopy_get_u64(dst: *mut u64, src: *const u64) -> u32;
+
+    /// Atomically compare-and-exchange one aligned user u32.
+    /// Returns the observed old value in bits 0..31 and sets bit 32 on fault.
+    fn __zero_os_usercopy_cmpxchg_u32(dst: *mut u32, expected: u32, desired: u32) -> u64;
 
     /// Write one byte to user space.
     /// Returns 0 on success, 1 on fault.
@@ -769,6 +815,71 @@ pub fn read_user_u32_atomic(src: UserAddr) -> Result<u32, ()> {
         Ok(value)
     } else {
         Err(())
+    }
+}
+
+/// RF187-U34: fault-tolerant, atomic-width robust-list pointer read.
+///
+/// Robust-list pointers and the futex offset are 64-bit fields on x86_64.  A
+/// single aligned load is required here for the same reason as the u32 futex
+/// helper above: two narrower loads could observe a value that userspace never
+/// published.  Mapping faults are converted to `Err(())` by the exception
+/// table, so callers can abort the complete walk without risking a kernel fault.
+pub fn read_user_u64_atomic(src: UserAddr) -> Result<u64, ()> {
+    let addr = src.as_usize();
+    if addr & (core::mem::align_of::<u64>() - 1) != 0
+        || !validate_user_range(addr, core::mem::size_of::<u64>())
+    {
+        return Err(());
+    }
+
+    let _smap_guard = UserAccessGuard::new();
+    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u64>());
+    USER_COPY_STATE.with(|s| {
+        s.remaining
+            .store(core::mem::size_of::<u64>(), Ordering::SeqCst)
+    });
+
+    let mut value = 0u64;
+    let status =
+        unsafe { __zero_os_usercopy_get_u64(&mut value, src.as_const_ptr().cast::<u64>()) };
+    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
+    if status == 0 {
+        Ok(value)
+    } else {
+        Err(())
+    }
+}
+
+/// RF187-U34: fault-tolerant atomic compare-and-exchange of a user futex word.
+///
+/// `Ok(true)` means the word was replaced, `Ok(false)` means another thread
+/// changed it before the exchange, and `Err(())` means the address faulted or
+/// failed the range/alignment checks.  Callers must bound retries on `false` and
+/// abort their walk on `Err(())`.
+pub fn compare_exchange_user_u32(dst: UserAddr, expected: u32, desired: u32) -> Result<bool, ()> {
+    let addr = dst.as_usize();
+    if addr & (core::mem::align_of::<u32>() - 1) != 0
+        || !validate_user_range(addr, core::mem::size_of::<u32>())
+    {
+        return Err(());
+    }
+
+    let _smap_guard = UserAccessGuard::new();
+    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
+    USER_COPY_STATE.with(|s| {
+        s.remaining
+            .store(core::mem::size_of::<u32>(), Ordering::SeqCst)
+    });
+
+    let observed = unsafe {
+        __zero_os_usercopy_cmpxchg_u32(dst.as_mut_ptr().cast::<u32>(), expected, desired)
+    };
+    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
+    if observed & 0x1_0000_0000 != 0 {
+        Err(())
+    } else {
+        Ok(observed as u32 == expected)
     }
 }
 
@@ -1568,4 +1679,20 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
     // Reached max_copy without finding NUL
     // Do NOT write NUL - caller should check if returned == max_copy
     Ok(copied)
+}
+
+#[cfg(test)]
+mod robust_usercopy_tests {
+    use super::*;
+
+    #[test]
+    fn robust_atomic_helpers_reject_invalid_ranges_before_assembly() {
+        // Below MMAP_MIN_ADDR and misaligned addresses must be rejected without
+        // touching the exception-table helpers. This is the cheap first layer;
+        // mapped-but-faulting addresses are covered by the no-fault assembly in
+        // the target/boot test suite.
+        assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR - 8)).is_err());
+        assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR + 1)).is_err());
+        assert!(compare_exchange_user_u32(UserAddr::new(MMAP_MIN_ADDR + 1), 1, 2).is_err());
+    }
 }

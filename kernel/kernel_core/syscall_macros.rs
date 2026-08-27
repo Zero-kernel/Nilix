@@ -75,12 +75,14 @@ macro_rules! syscall_stub {
     };
 
     // Variant 2: With arguments
-    ($name:ident, $errno:ident, $reason:expr, $($arg_name:ident : $arg_type:ty),+ $(,)?) => {
-        fn $name($($arg_name: $arg_type),+) -> SyscallResult {
-            // Validate pointer arguments (fail-fast on NULL)
-            $(
-                syscall_stub!(@check_ptr $arg_name, $arg_type);
-            )+
+    ($name:ident, $errno:ident, $reason:expr, $($args:tt)+) => {
+        fn $name($($args)+) -> SyscallResult {
+            // Validate pointer arguments (fail-fast on NULL).  This is a
+            // token-munching pass rather than a type-fragment re-match:
+            // opaque `$ty` fragments cannot be matched against `*const`/`*mut`
+            // in a nested macro, which previously made the null-pointer check
+            // dead and let the stub return its generic errno (U54 oracle gap).
+            syscall_stub!(@check_args $($args)+);
 
             // Log reason for unimplemented status
             klog::klog!(Warn,concat!(stringify!($name), ": ", $reason));
@@ -88,6 +90,36 @@ macro_rules! syscall_stub {
             // Return error immediately (no further work)
             Err(SyscallError::$errno)
         }
+    };
+
+    (@check_args $arg_name:ident : *const $t:ty, $($rest:tt)+) => {
+        if $arg_name.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        syscall_stub!(@check_args $($rest)+);
+    };
+    (@check_args $arg_name:ident : *mut $t:ty, $($rest:tt)+) => {
+        if $arg_name.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        syscall_stub!(@check_args $($rest)+);
+    };
+    (@check_args $arg_name:ident : $arg_type:ty, $($rest:tt)+) => {
+        let _ = &$arg_name;
+        syscall_stub!(@check_args $($rest)+);
+    };
+    (@check_args $arg_name:ident : *const $t:ty) => {
+        if $arg_name.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+    };
+    (@check_args $arg_name:ident : *mut $t:ty) => {
+        if $arg_name.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+    };
+    (@check_args $arg_name:ident : $arg_type:ty) => {
+        let _ = &$arg_name;
     };
 
     // Helper: Check if argument is a pointer and validate it

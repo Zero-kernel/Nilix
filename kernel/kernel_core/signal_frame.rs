@@ -92,6 +92,8 @@ const RED_ZONE: u64 = 128;
 /// be force-set into a handler. IF (0x200) is always forced on.
 const RFLAGS_SANITIZE_AND: u64 = 0xFFFF_FFFF_FFE2_CFFF & !0x100 & !0x400;
 const RFLAGS_IF: u64 = 0x200;
+/// Flags that are never valid at the first instruction of a SysV signal handler.
+pub const HANDLER_ENTRY_FORBIDDEN_RFLAGS: u64 = (1u64 << 8) | (1u64 << 10); // TF | DF
 
 /// The architectural FXSAVE MXCSR mask fallback if `CPUID`/the live mask reports 0
 /// (Intel SDM: the default usable MXCSR mask is `0x0000_FFBF`). Masking the user
@@ -366,9 +368,22 @@ pub fn is_canonical_user_addr(addr: u64) -> bool {
 
 /// Sanitize a user-provided RFLAGS for resumption: clear all privileged/dangerous
 /// bits (IOPL/NT/RF/VM/VIF/VIP via the SYSRET mask, plus TF and DF) and force IF on.
+/// Both syscall-return and IRQ-return signal delivery MUST use this helper so
+/// handler-entry flags cannot diverge between the two paths.
 #[inline]
 pub fn sanitize_user_rflags(raw: u64) -> u64 {
     (raw & RFLAGS_SANITIZE_AND) | RFLAGS_IF
+}
+
+/// Defense-in-depth predicate for a handler-entry RFLAGS value.  Callers that
+/// redirect an IRQ return must check this after sanitization and defer if it
+/// fails closed; equality with the sanitizer also rejects every privileged bit,
+/// while the explicit TF/DF check documents the SysV handler-entry contract.
+#[inline]
+pub fn is_safe_handler_entry_rflags(rflags: u64) -> bool {
+    rflags == sanitize_user_rflags(rflags)
+        && rflags & HANDLER_ENTRY_FORBIDDEN_RFLAGS == 0
+        && rflags & RFLAGS_IF != 0
 }
 
 /// The sigcontext (uc_mcontext) byte length copied back at `rt_sigreturn`.
@@ -595,6 +610,14 @@ fn selftest_mxcsr_and_rflags() {
     assert_eq!(clean & 0x400, 0, "DF must be cleared");
     assert_eq!(clean & 0x3000, 0, "IOPL must be cleared");
     assert_eq!(clean & 0x1, 0x1, "user CF preserved");
+    assert!(
+        is_safe_handler_entry_rflags(clean),
+        "sanitized handler-entry flags must pass the shared safety predicate"
+    );
+    assert!(
+        !is_safe_handler_entry_rflags(dirty),
+        "dirty handler-entry flags must fail the shared safety predicate"
+    );
 }
 
 fn selftest_srop_canonical() {
