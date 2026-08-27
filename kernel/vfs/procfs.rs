@@ -17,6 +17,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_core::user_namespace;
 use kernel_core::FileDescriptor;
 // R29-1 FIX: Import process module for real process information
 use kernel_core::process::{self, ProcessArc, ProcessState, ProcessWeak, PROCESS_TABLE};
@@ -59,9 +60,20 @@ struct ProcIdentity {
     generation: u64,
     display_pid: u32,
     viewer_ns: Option<kernel_core::PidNamespaceArc>,
+    /// A procfs lookup may be opened by the creator of a newly-created user
+    /// namespace even though the target's UID is not mapped yet.  Keep the
+    /// creator's generation so a recycled PID can never inherit that map-write
+    /// authority.
+    id_map_parent: Option<IdMapParentAuth>,
 }
 
 type BoundProcess = ProcessArc;
+
+#[derive(Clone, Copy)]
+struct IdMapParentAuth {
+    pid: u32,
+    generation: u64,
+}
 
 // ============================================================================
 // ProcFs
@@ -453,8 +465,17 @@ struct ProcPidDirInode {
 
 impl ProcPidDirInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        // R31-1 FIX: Check access permission before returning child entries
-        if validate_proc_identity(&self.identity).is_none() {
+        // A newly-created user namespace has no UID mapping yet, so its
+        // creator cannot pass the normal host-UID /proc DAC check.  Permit the
+        // two map files through the narrowly-scoped map validator; every
+        // other child still uses the ordinary process-information check.
+        let id_map = matches!(name, "uid_map" | "gid_map");
+        if id_map {
+            if validate_proc_identity_for_id_map(&self.identity).is_none() {
+                return Err(FsError::PermDenied);
+            }
+        } else if validate_proc_identity(&self.identity).is_none() {
+            // R31-1 FIX: Check access permission before returning child entries
             return Err(FsError::PermDenied);
         }
         match name {
@@ -476,6 +497,18 @@ impl ProcPidDirInode {
             "maps" => Ok(try_new_procfs_arc(|charge| ProcPidMapsInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
+                _heap_charge: Some(charge),
+            })?),
+            "uid_map" => Ok(try_new_procfs_arc(|charge| ProcPidIdMapInode {
+                fs_id: self.fs_id,
+                identity: self.identity.clone(),
+                kind: IdMapKind::Uid,
+                _heap_charge: Some(charge),
+            })?),
+            "gid_map" => Ok(try_new_procfs_arc(|charge| ProcPidIdMapInode {
+                fs_id: self.fs_id,
+                identity: self.identity.clone(),
+                kind: IdMapKind::Gid,
                 _heap_charge: Some(charge),
             })?),
             "fd" => Ok(try_new_procfs_arc(|charge| ProcPidFdDirInode {
@@ -500,7 +533,12 @@ impl Inode for ProcPidDirInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        // Path traversal stats every intermediate directory before looking up
+        // its final component.  A map-authorized parent therefore needs the
+        // narrowly-scoped id-map validator here; readdir/open of the directory
+        // itself remain protected by the ordinary validator below.
+        let process =
+            validate_proc_identity_for_id_map(&self.identity).ok_or(FsError::PermDenied)?;
         let (uid, gid) = get_process_owner(&process)?;
         Ok(Stat {
             dev: self.fs_id,
@@ -537,11 +575,16 @@ impl Inode for ProcPidDirInode {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
-        // R31-1 FIX: Check access permission before listing entries
-        if validate_proc_identity(&self.identity).is_none() {
+        // A direct creator may need to enumerate the fixed map-file names
+        // before opening one.  The map-aware validator exposes only these
+        // names; lookup_child still applies ordinary DAC to every sensitive
+        // entry other than uid_map/gid_map.
+        if validate_proc_identity_for_id_map(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let entries = ["status", "cmdline", "stat", "maps", "fd"];
+        let entries = [
+            "status", "cmdline", "stat", "maps", "uid_map", "gid_map", "fd",
+        ];
 
         if offset < entries.len() {
             let name = entries[offset];
@@ -562,6 +605,171 @@ impl Inode for ProcPidDirInode {
         }
 
         Ok(None)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
+// /proc/[pid]/uid_map and gid_map
+// ============================================================================
+
+#[derive(Clone, Copy)]
+enum IdMapKind {
+    Uid,
+    Gid,
+}
+
+struct ProcPidIdMapInode {
+    fs_id: u64,
+    identity: ProcIdentity,
+    kind: IdMapKind,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl ProcPidIdMapInode {
+    fn mappings(&self) -> Result<(BoundProcess, Arc<kernel_core::UserNamespace>), FsError> {
+        let process =
+            validate_proc_identity_for_id_map(&self.identity).ok_or(FsError::PermDenied)?;
+        let ns = process.lock().user_ns.clone();
+        Ok((process, ns))
+    }
+
+    fn render(&self) -> Result<AdmittedString, FsError> {
+        let (_process, ns) = self.mappings()?;
+        let mappings = match self.kind {
+            IdMapKind::Uid => ns.uid_mappings(),
+            IdMapKind::Gid => ns.gid_mappings(),
+        };
+        let mut out = AdmittedString::new(HeapClass::Procfs);
+        if mappings.is_empty() && ns.is_root() {
+            // Root is an implicit identity map.  A u32 range cannot be
+            // represented as count 2^32, so use the largest ABI value.
+            out.try_push_str("0 0 4294967295\n")
+                .map_err(|_| FsError::NoSpace)?;
+        } else {
+            for mapping in mappings {
+                write!(
+                    &mut out,
+                    "{} {} {}\n",
+                    mapping.ns_id, mapping.host_id, mapping.count
+                )
+                .map_err(|_| FsError::NoSpace)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Inode for ProcPidIdMapInode {
+    fn ino(&self) -> u64 {
+        let base = match self.kind {
+            // Keep the map files in their own inode-number bands.  40000 and
+            // 50000 are already used by /proc/[pid]/maps and /proc/[pid]/fd;
+            // reusing either band would make fstat/inode caches conflate
+            // distinct procfs objects for the same PID.
+            IdMapKind::Uid => 60000,
+            IdMapKind::Gid => 70000,
+        };
+        base + self.identity.display_pid as u64
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        let process =
+            validate_proc_identity_for_id_map(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process)?;
+        // Linux treats uid_map/gid_map as kernel-mediated write interfaces:
+        // the direct creator may write even while the target UID is unmapped
+        // (and therefore cannot be represented by ordinary inode ownership).
+        // Advertise write permission to that already-authorized caller so the
+        // generic VFS DAC check does not reject a valid parent; write_at still
+        // repeats the authoritative relationship and namespace checks.
+        let creator_write = id_map_parent_still_authorized(&self.identity, &process);
+        let mode = if creator_write || kernel_core::current_is_host_root() {
+            0o666
+        } else {
+            0o644
+        };
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino(),
+            mode: FileMode::regular(mode),
+            nlink: 1,
+            uid,
+            gid,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        if validate_proc_identity_for_id_map(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let content = self.render()?;
+        read_from_content(&content, offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        // Mapping files are single-write interfaces.  Reject append/partial
+        // writes so a caller cannot bypass the parser by composing lines over
+        // multiple offsets.
+        if offset != 0 || data.is_empty() || data.len() > user_namespace::MAX_MAPPING_TEXT_BYTES {
+            return Err(FsError::Invalid);
+        }
+        let (target, ns) = self.mappings()?;
+        let (_, _, caller_is_host_root) = current_id_map_writer_snapshot(self.kind)?;
+        // Only host root or the target's direct creator may publish a map.
+        // The creator check is repeated at write time, including the parent
+        // generation and exact parent user namespace, so opening a procfs
+        // inode before a PID recycle cannot confer authority afterwards.
+        if !caller_is_host_root && !id_map_parent_still_authorized(&self.identity, &target) {
+            return Err(FsError::PermDenied);
+        }
+        let mappings = user_namespace::parse_mapping_text(data).map_err(|error| match error {
+            user_namespace::UserNsError::OutOfMemory => FsError::NoSpace,
+            user_namespace::UserNsError::PermissionDenied => FsError::PermDenied,
+            _ => FsError::Invalid,
+        })?;
+        let result = match self.kind {
+            // The public setters perform the same exact-parent namespace and
+            // credential snapshot check internally.  Procfs has already
+            // authenticated the direct creator above; using these canonical
+            // setters keeps the production write path tied to the API named by
+            // the user-namespace contract and closes future bypasses.
+            IdMapKind::Uid => ns.set_uid_map(mappings),
+            IdMapKind::Gid => ns.set_gid_map(mappings),
+        };
+        result.map(|_| data.len()).map_err(|error| match error {
+            user_namespace::UserNsError::OutOfMemory => FsError::NoSpace,
+            user_namespace::UserNsError::PermissionDenied => FsError::PermDenied,
+            user_namespace::UserNsError::MappingAlreadySet => FsError::Busy,
+            _ => FsError::Invalid,
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1416,7 +1624,9 @@ fn bind_proc_identity(
             .cloned()
             .ok_or(FsError::NotFound)?
     };
-    if !can_access_process(pid, &process) {
+    let ordinary_access = can_access_process(pid, &process);
+    let id_map_parent = id_map_parent_auth_for_target(pid, &process);
+    if !ordinary_access && id_map_parent.is_none() {
         return Err(FsError::PermDenied);
     }
     let (generation, display_pid, state) = {
@@ -1447,16 +1657,23 @@ fn bind_proc_identity(
         generation,
         display_pid,
         viewer_ns,
+        id_map_parent,
     };
-    if validate_proc_identity(&identity).is_none() {
+    // Re-check only the stable binding here.  An authorized parent is
+    // intentionally not required to pass ordinary /proc DAC while the child
+    // namespace has an empty UID map; map-file access revalidates the parent
+    // relationship on every operation below.
+    if validate_proc_identity_binding(&identity).is_none() {
         return Err(FsError::NotFound);
     }
     Ok(identity)
 }
 
-/// Verify permission, namespace membership, generation, and table-slot
-/// identity, returning the same exact process object the caller must snapshot.
-fn validate_proc_identity(identity: &ProcIdentity) -> Option<BoundProcess> {
+/// Verify namespace membership, generation, and table-slot identity, returning
+/// the same exact process object the caller must snapshot.  This deliberately
+/// omits DAC; map files need a separate narrowly-scoped parent authorization
+/// while a new child namespace's UID is still unmapped.
+fn validate_proc_identity_binding(identity: &ProcIdentity) -> Option<BoundProcess> {
     if !same_viewer_namespace(identity) {
         return None;
     }
@@ -1493,10 +1710,148 @@ fn validate_proc_identity(identity: &ProcIdentity) -> Option<BoundProcess> {
             None => identity.display_pid == identity.pid,
         }
     };
-    if !namespace_matches || !can_access_process(identity.pid, &process) {
+    if !namespace_matches {
         return None;
     }
     Some(process)
+}
+
+/// Verify the ordinary /proc DAC policy for a bound identity.
+fn validate_proc_identity(identity: &ProcIdentity) -> Option<BoundProcess> {
+    let process = validate_proc_identity_binding(identity)?;
+    if !can_access_process(identity.pid, &process) {
+        return None;
+    }
+    Some(process)
+}
+
+/// Capture the direct creator relationship used to reach a newly-created
+/// user-namespace map.  The caller's process generation is retained so a
+/// recycled PID cannot inherit the authority.
+fn id_map_parent_auth_for_target(pid: u32, target: &BoundProcess) -> Option<IdMapParentAuth> {
+    let caller_pid = process::current_pid()? as u32;
+    if caller_pid == pid {
+        return None;
+    }
+
+    let caller = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(caller_pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .cloned()?
+    };
+    let (caller_generation, caller_user_ns) = {
+        let caller_guard = caller.lock();
+        (caller_guard.generation, caller_guard.user_ns.clone())
+    };
+    let (target_ppid, target_parent_user_ns) = {
+        let target_guard = target.lock();
+        (target_guard.ppid, target_guard.user_ns.parent())
+    };
+
+    if target_ppid != caller_pid as usize {
+        return None;
+    }
+    match target_parent_user_ns {
+        Some(parent) if Arc::ptr_eq(&parent, &caller_user_ns) => Some(IdMapParentAuth {
+            pid: caller_pid,
+            generation: caller_generation,
+        }),
+        _ => None,
+    }
+}
+
+/// Revalidate the creator relationship at map-write time.  This check is
+/// intentionally independent of ordinary /proc DAC because the target UID may
+/// still be unmapped.
+fn id_map_parent_still_authorized(identity: &ProcIdentity, target: &BoundProcess) -> bool {
+    let Some(auth) = identity.id_map_parent else {
+        return false;
+    };
+    let Some(caller_pid) = process::current_pid().map(|pid| pid as u32) else {
+        return false;
+    };
+    if caller_pid != auth.pid {
+        return false;
+    }
+
+    let caller = {
+        let table = PROCESS_TABLE.lock();
+        match table
+            .get(caller_pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .cloned()
+        {
+            Some(caller) => caller,
+            None => return false,
+        }
+    };
+    let (caller_generation, caller_user_ns) = {
+        let caller_guard = caller.lock();
+        (caller_guard.generation, caller_guard.user_ns.clone())
+    };
+    if caller_generation != auth.generation {
+        return false;
+    }
+
+    let target_guard = target.lock();
+    if target_guard.ppid != caller_pid as usize
+        || matches!(
+            target_guard.state,
+            ProcessState::Zombie | ProcessState::Terminated
+        )
+    {
+        return false;
+    }
+    match target_guard.user_ns.parent() {
+        Some(parent) => Arc::ptr_eq(&parent, &caller_user_ns),
+        None => false,
+    }
+}
+
+/// Validate a map inode for read/stat/open.  Ordinary DAC remains sufficient;
+/// the creator exception is admitted only for the two id-map files.
+fn validate_proc_identity_for_id_map(identity: &ProcIdentity) -> Option<BoundProcess> {
+    let process = validate_proc_identity_binding(identity)?;
+    if can_access_process(identity.pid, &process)
+        || kernel_core::current_is_host_root()
+        || id_map_parent_still_authorized(identity, &process)
+    {
+        Some(process)
+    } else {
+        None
+    }
+}
+
+/// Snapshot the current map writer's namespace and effective ID.  The caller
+/// namespace is passed explicitly to UserNamespace so namespace-local UID 0
+/// cannot silently become a host-root bypass.
+fn current_id_map_writer_snapshot(
+    kind: IdMapKind,
+) -> Result<(Arc<kernel_core::UserNamespace>, u32, bool), FsError> {
+    let pid = process::current_pid().ok_or(FsError::PermDenied)? as u32;
+    let caller = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .get(pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .cloned()
+            .ok_or(FsError::PermDenied)?
+    };
+    let (caller_user_ns, caller_euid, caller_egid) = {
+        let caller_guard = caller.lock();
+        let creds = caller_guard.try_credentials_read().ok_or(FsError::Busy)?;
+        (caller_guard.user_ns.clone(), creds.euid, creds.egid)
+    };
+    let caller_id = match kind {
+        IdMapKind::Uid => caller_euid,
+        IdMapKind::Gid => caller_egid,
+    };
+    // Host-root status is derived from the same namespace/credential snapshot,
+    // avoiding a second PID-table lookup that could observe a recycled slot.
+    let caller_is_host_root = caller_user_ns.map_uid_from_ns(caller_euid) == Some(0);
+    Ok((caller_user_ns, caller_id, caller_is_host_root))
 }
 
 /// List all PIDs
@@ -2023,4 +2378,191 @@ fn generate_uptime() -> Result<AdmittedString, FsError> {
         "{}.{:02} {}.{:02}\n",
         uptime_secs, uptime_frac, idle_secs, idle_frac
     ))
+}
+
+#[cfg(test)]
+mod id_map_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use kernel_core::process::{Process, ProcessNameSnapshot};
+    use spin::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fixture() -> (ProcPidIdMapInode, ProcessArc) {
+        let process = Process::try_new_pcb(
+            1,
+            0,
+            ProcessNameSnapshot::from_parts("r188-id-map", ""),
+            120,
+        )
+        .expect("id-map inode process fixture");
+        let inode = ProcPidIdMapInode {
+            fs_id: 1,
+            identity: ProcIdentity {
+                process: Arc::downgrade(&process),
+                pid: 1,
+                generation: 1,
+                display_pid: 1,
+                viewer_ns: None,
+                id_map_parent: None,
+            },
+            kind: IdMapKind::Uid,
+            _heap_charge: None,
+        };
+        (inode, process)
+    }
+
+    #[test]
+    fn r188_id_map_write_is_single_bounded_record() {
+        let (inode, _process) = fixture();
+        assert_eq!(inode.write_at(1, b"0 1000 1\n"), Err(FsError::Invalid));
+        assert_eq!(inode.write_at(0, &[]), Err(FsError::Invalid));
+        let oversized = alloc::vec![b'0'; user_namespace::MAX_MAPPING_TEXT_BYTES + 1];
+        assert_eq!(inode.write_at(0, &oversized), Err(FsError::Invalid));
+    }
+
+    #[test]
+    fn r188_direct_parent_can_publish_unmapped_child_maps() {
+        let _serial = TEST_LOCK.lock();
+        let root_user_ns = user_namespace::root_user_namespace();
+        let child_user_ns =
+            user_namespace::UserNamespace::new_child(root_user_ns.clone()).expect("child ns");
+
+        // Pick a small group of currently-unused table slots so this hosted
+        // regression can coexist with a boot fixture that may already have an
+        // init task at PID 1.
+        let (parent_pid, target_pid, other_pid) = {
+            let table = PROCESS_TABLE.lock();
+            let mut found = None;
+            for parent_pid in 64..(64 + 256) {
+                let target_pid = parent_pid + 1;
+                let other_pid = parent_pid + 2;
+                if table.get(parent_pid).is_none_or(Option::is_none)
+                    && table.get(target_pid).is_none_or(Option::is_none)
+                    && table.get(other_pid).is_none_or(Option::is_none)
+                {
+                    found = Some((parent_pid, target_pid, other_pid));
+                    break;
+                }
+            }
+            found.expect("free process-table slots for id-map regression")
+        };
+
+        let parent = Process::try_new_pcb(
+            parent_pid,
+            0,
+            ProcessNameSnapshot::from_parts("r188-map-parent", ""),
+            120,
+        )
+        .expect("parent pcb");
+        let target = Process::try_new_pcb(
+            target_pid,
+            parent_pid,
+            ProcessNameSnapshot::from_parts("r188-map-target", ""),
+            120,
+        )
+        .expect("target pcb");
+        let other = Process::try_new_pcb(
+            other_pid,
+            0,
+            ProcessNameSnapshot::from_parts("r188-map-other", ""),
+            120,
+        )
+        .expect("other pcb");
+
+        {
+            let mut parent_guard = parent.lock();
+            parent_guard.state = ProcessState::Ready;
+            parent_guard.user_ns = root_user_ns.clone();
+            parent_guard.user_ns_for_children = root_user_ns.clone();
+        }
+        {
+            let mut target_guard = target.lock();
+            target_guard.state = ProcessState::Ready;
+            target_guard.user_ns = child_user_ns.clone();
+            target_guard.user_ns_for_children = child_user_ns.clone();
+        }
+        {
+            let mut other_guard = other.lock();
+            other_guard.state = ProcessState::Ready;
+            other_guard.user_ns = root_user_ns.clone();
+            other_guard.user_ns_for_children = root_user_ns.clone();
+        }
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let needed = other_pid + 1;
+            if table.len() < needed {
+                let missing = needed - table.len();
+                table
+                    .try_reserve_exact(missing)
+                    .expect("process-table test capacity");
+                while table.len() < needed {
+                    table
+                        .push_reserved(None)
+                        .expect("reserved process-table test slot");
+                }
+            }
+            assert!(table[parent_pid].is_none());
+            assert!(table[target_pid].is_none());
+            assert!(table[other_pid].is_none());
+            table[parent_pid] = Some(parent.clone());
+            table[target_pid] = Some(target.clone());
+            table[other_pid] = Some(other.clone());
+        }
+
+        process::set_current_pid(Some(parent_pid));
+        let fs = ProcFs::try_new().expect("procfs fixture");
+        let proc_root = fs.root_inode();
+        let target_dir = fs
+            .lookup(&proc_root, &target_pid.to_string())
+            .expect("parent can bind child proc directory for map access");
+        let uid_map = fs
+            .lookup(&target_dir, "uid_map")
+            .expect("uid_map lookup for direct parent");
+        let gid_map = fs
+            .lookup(&target_dir, "gid_map")
+            .expect("gid_map lookup for direct parent");
+
+        let uid_text = b"0 65534 1\n";
+        assert_eq!(uid_map.write_at(0, uid_text), Ok(uid_text.len()));
+        assert_eq!(uid_map.write_at(0, uid_text), Err(FsError::Busy));
+        let mut rendered = [0u8; 32];
+        let rendered_len = uid_map
+            .read_at(0, &mut rendered)
+            .expect("read published uid map");
+        assert_eq!(&rendered[..rendered_len], uid_text);
+
+        let gid_text = b"0 65534 1\n";
+        assert_eq!(gid_map.write_at(0, gid_text), Ok(gid_text.len()));
+
+        // A same-UID process is allowed to inspect an already-mapped file, but
+        // it is not the target's creator and must not gain write authority.
+        process::set_current_pid(Some(other_pid));
+        assert_eq!(uid_map.write_at(0, uid_text), Err(FsError::PermDenied));
+
+        process::set_current_pid(None);
+        drop(uid_map);
+        drop(gid_map);
+        drop(target_dir);
+        drop(proc_root);
+        drop(fs);
+
+        // Remove the exact Arc identities before dropping the local strong refs;
+        // no PID slot is left pointing at a test process.
+        let detached = {
+            let mut table = PROCESS_TABLE.lock();
+            (
+                table[parent_pid].take(),
+                table[target_pid].take(),
+                table[other_pid].take(),
+            )
+        };
+        drop(detached);
+        drop(parent);
+        drop(target);
+        drop(other);
+        drop(child_user_ns);
+    }
 }

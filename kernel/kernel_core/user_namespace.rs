@@ -49,9 +49,10 @@ use cap::NamespaceId;
 use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
 use spin::{Lazy, RwLock};
 
-use crate::{current_egid, current_euid, FileDescriptor, FileOps, SyscallError, VfsStat};
+use crate::{FileDescriptor, FileOps, SyscallError, VfsStat};
 
 // ============================================================================
 // Constants
@@ -71,6 +72,11 @@ pub const MAX_USER_NS_LEVEL: u8 = 32;
 /// - Map user range + nobody (2-3 extents)
 /// - Complex multi-tenant scenarios (up to 5 extents)
 pub const MAX_MAPPINGS: usize = 5;
+
+/// Maximum bytes accepted by the procfs uid_map/gid_map writers.  The map
+/// itself is capped at five extents; this bound also prevents a malformed
+/// writer from retaining an arbitrarily large staging buffer in the VFS.
+pub const MAX_MAPPING_TEXT_BYTES: usize = 4096;
 
 /// Maximum number of user namespaces system-wide.
 ///
@@ -125,6 +131,64 @@ pub struct UidGidMapping {
     pub count: u32,
 }
 
+/// Parse the Linux uid_map/gid_map text representation.
+///
+/// Parsing is kept in the kernel-core namespace module so every future writer
+/// (procfs or a dedicated syscall) gets the same strict grammar and bounds.
+pub fn parse_mapping_text(data: &[u8]) -> Result<Vec<UidGidMapping>, UserNsError> {
+    if data.is_empty() || data.len() > MAX_MAPPING_TEXT_BYTES {
+        return Err(UserNsError::InvalidMapping);
+    }
+    let text = core::str::from_utf8(data).map_err(|_| UserNsError::InvalidMapping)?;
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(MAX_MAPPINGS)
+        .map_err(|_| UserNsError::OutOfMemory)?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err(UserNsError::InvalidMapping);
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let ns_id = fields
+            .next()
+            .ok_or(UserNsError::InvalidMapping)?
+            .parse::<u32>()
+            .map_err(|_| UserNsError::InvalidMapping)?;
+        let host_id = fields
+            .next()
+            .ok_or(UserNsError::InvalidMapping)?
+            .parse::<u32>()
+            .map_err(|_| UserNsError::InvalidMapping)?;
+        let count = fields
+            .next()
+            .ok_or(UserNsError::InvalidMapping)?
+            .parse::<u32>()
+            .map_err(|_| UserNsError::InvalidMapping)?;
+        if fields.next().is_some()
+            || mappings.len() >= MAX_MAPPINGS
+            || count == 0
+            || ns_id.checked_add(count - 1).is_none()
+            || host_id.checked_add(count - 1).is_none()
+        {
+            return Err(if mappings.len() >= MAX_MAPPINGS {
+                UserNsError::TooManyMappings
+            } else {
+                UserNsError::InvalidMapping
+            });
+        }
+        mappings.push(UidGidMapping {
+            ns_id,
+            host_id,
+            count,
+        });
+    }
+    if mappings.is_empty() {
+        return Err(UserNsError::InvalidMapping);
+    }
+    Ok(mappings)
+}
+
 /// User namespace operation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserNsError {
@@ -142,6 +206,8 @@ pub enum UserNsError {
     PermissionDenied,
     /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
     NamespaceIdOverflow,
+    /// Namespace object admission/allocation failed.
+    OutOfMemory,
 }
 
 impl fmt::Display for UserNsError {
@@ -168,6 +234,7 @@ impl fmt::Display for UserNsError {
             UserNsError::MappingAlreadySet => write!(f, "mapping already set (single-write)"),
             UserNsError::PermissionDenied => write!(f, "permission denied"),
             UserNsError::NamespaceIdOverflow => write!(f, "namespace ID counter overflow"),
+            UserNsError::OutOfMemory => write!(f, "insufficient memory"),
         }
     }
 }
@@ -261,6 +328,9 @@ pub struct UserNamespace {
 
     /// Flag indicating GID map has been written (single-write semantics).
     gid_map_set: AtomicBool,
+
+    /// Exact heap charge for the namespace Arc allocation.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl fmt::Debug for UserNamespace {
@@ -291,6 +361,7 @@ impl UserNamespace {
             // Root mapping is implicitly fixed (identity)
             uid_map_set: AtomicBool::new(true),
             gid_map_set: AtomicBool::new(true),
+            _arc_heap_charge: None,
         }
     }
 
@@ -325,7 +396,11 @@ impl UserNamespace {
                 UserNsError::NamespaceIdOverflow
             })?;
 
-        let child = Arc::new(Self {
+        let arc_bytes =
+            arc_charge_bytes::<UserNamespace>().map_err(|_| UserNsError::OutOfMemory)?;
+        let arc_reservation = try_reserve_heap(HeapClass::CoreProcess, arc_bytes)
+            .map_err(|_| UserNsError::OutOfMemory)?;
+        let mut child = Arc::try_new(Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
             level: parent.level.saturating_add(1),
@@ -335,7 +410,16 @@ impl UserNamespace {
             // Child starts with unset mappings
             uid_map_set: AtomicBool::new(false),
             gid_map_set: AtomicBool::new(false),
-        });
+            _arc_heap_charge: None,
+        })
+        .map_err(|_| UserNsError::OutOfMemory)?;
+
+        let charge = arc_reservation
+            .commit()
+            .map_err(|_| UserNsError::OutOfMemory)?;
+        Arc::get_mut(&mut child)
+            .expect("fresh user namespace Arc must be unique")
+            ._arc_heap_charge = Some(charge);
 
         // Commit the count increment (won't be rolled back)
         guard.commit();
@@ -414,11 +498,15 @@ impl UserNamespace {
             return Some(host_uid);
         }
 
+        // A child map's outside ID is expressed in the parent namespace.  Map
+        // the global host ID through the parent chain first, then apply this
+        // namespace's extent.
+        let parent_uid = self.parent.as_ref()?.map_uid_to_ns(host_uid)?;
         let map = self.uid_map.read();
         for m in map.iter() {
             let end = m.host_id.checked_add(m.count)?;
-            if host_uid >= m.host_id && host_uid < end {
-                return Some(m.ns_id.saturating_add(host_uid.saturating_sub(m.host_id)));
+            if parent_uid >= m.host_id && parent_uid < end {
+                return m.ns_id.checked_add(parent_uid.saturating_sub(m.host_id));
             }
         }
         None
@@ -439,14 +527,19 @@ impl UserNamespace {
             return Some(ns_uid);
         }
 
-        let map = self.uid_map.read();
-        for m in map.iter() {
-            let end = m.ns_id.checked_add(m.count)?;
-            if ns_uid >= m.ns_id && ns_uid < end {
-                return Some(m.host_id.saturating_add(ns_uid.saturating_sub(m.ns_id)));
+        let parent_uid = {
+            let map = self.uid_map.read();
+            let mut mapped = None;
+            for m in map.iter() {
+                let end = m.ns_id.checked_add(m.count)?;
+                if ns_uid >= m.ns_id && ns_uid < end {
+                    mapped = Some(m.host_id.checked_add(ns_uid - m.ns_id)?);
+                    break;
+                }
             }
-        }
-        None
+            mapped?
+        };
+        self.parent.as_ref()?.map_uid_from_ns(parent_uid)
     }
 
     /// Translate a host GID into this namespace's GID.
@@ -464,11 +557,12 @@ impl UserNamespace {
             return Some(host_gid);
         }
 
+        let parent_gid = self.parent.as_ref()?.map_gid_to_ns(host_gid)?;
         let map = self.gid_map.read();
         for m in map.iter() {
             let end = m.host_id.checked_add(m.count)?;
-            if host_gid >= m.host_id && host_gid < end {
-                return Some(m.ns_id.saturating_add(host_gid.saturating_sub(m.host_id)));
+            if parent_gid >= m.host_id && parent_gid < end {
+                return m.ns_id.checked_add(parent_gid.saturating_sub(m.host_id));
             }
         }
         None
@@ -489,14 +583,19 @@ impl UserNamespace {
             return Some(ns_gid);
         }
 
-        let map = self.gid_map.read();
-        for m in map.iter() {
-            let end = m.ns_id.checked_add(m.count)?;
-            if ns_gid >= m.ns_id && ns_gid < end {
-                return Some(m.host_id.saturating_add(ns_gid.saturating_sub(m.ns_id)));
+        let parent_gid = {
+            let map = self.gid_map.read();
+            let mut mapped = None;
+            for m in map.iter() {
+                let end = m.ns_id.checked_add(m.count)?;
+                if ns_gid >= m.ns_id && ns_gid < end {
+                    mapped = Some(m.host_id.checked_add(ns_gid - m.ns_id)?);
+                    break;
+                }
             }
-        }
-        None
+            mapped?
+        };
+        self.parent.as_ref()?.map_gid_from_ns(parent_gid)
     }
 
     /// Set UID mapping table.
@@ -519,6 +618,38 @@ impl UserNamespace {
         set_mapping(&self.uid_map, &self.uid_map_set, mappings)
     }
 
+    /// Set the UID map on behalf of the process that created this namespace.
+    ///
+    /// Procfs keeps the process-relationship check (the writer must be the
+    /// target's direct parent, or host root) at the VFS boundary.  This method
+    /// performs the namespace-side half of that check and, importantly, does
+    /// not consult the ambient `current_euid()`: the caller snapshot captured
+    /// by procfs is passed in explicitly.  That prevents a namespace-local
+    /// UID 0 from being mistaken for host root when a caller races a setns or
+    /// credential change.
+    ///
+    /// `caller_is_namespace_root` must be derived from the caller's effective
+    /// UID (not the GID used for a gid_map write); it is supplied separately so
+    /// an egid of zero cannot grant UID/GID administration by accident.
+    pub fn set_uid_map_from_parent(
+        &self,
+        mappings: Vec<UidGidMapping>,
+        caller_user_ns: &Arc<UserNamespace>,
+        caller_id: u32,
+        caller_is_namespace_root: bool,
+        caller_is_host_root: bool,
+    ) -> Result<(), UserNsError> {
+        self.ensure_parent_mapping_allowed(
+            &mappings,
+            MappingKind::Uid,
+            caller_user_ns,
+            caller_id,
+            caller_is_namespace_root,
+            caller_is_host_root,
+        )?;
+        set_mapping(&self.uid_map, &self.uid_map_set, mappings)
+    }
+
     /// Set GID mapping table.
     ///
     /// This can only be called once (single-write semantics, matching Linux).
@@ -536,6 +667,28 @@ impl UserNamespace {
     pub fn set_gid_map(&self, mappings: Vec<UidGidMapping>) -> Result<(), UserNsError> {
         // Check permission before attempting to set mapping
         self.ensure_mapping_allowed(&mappings, MappingKind::Gid)?;
+        set_mapping(&self.gid_map, &self.gid_map_set, mappings)
+    }
+
+    /// Set the GID map on behalf of the process that created this namespace.
+    ///
+    /// See [`Self::set_uid_map_from_parent`] for the authorization contract.
+    pub fn set_gid_map_from_parent(
+        &self,
+        mappings: Vec<UidGidMapping>,
+        caller_user_ns: &Arc<UserNamespace>,
+        caller_id: u32,
+        caller_is_namespace_root: bool,
+        caller_is_host_root: bool,
+    ) -> Result<(), UserNsError> {
+        self.ensure_parent_mapping_allowed(
+            &mappings,
+            MappingKind::Gid,
+            caller_user_ns,
+            caller_id,
+            caller_is_namespace_root,
+            caller_is_host_root,
+        )?;
         set_mapping(&self.gid_map, &self.gid_map_set, mappings)
     }
 
@@ -569,48 +722,98 @@ impl UserNamespace {
         mappings: &[UidGidMapping],
         kind: MappingKind,
     ) -> Result<(), UserNsError> {
-        // Root namespace doesn't allow mapping changes
+        // Resolve the complete caller snapshot, including its user namespace.
+        // Looking only at the numeric euid would let UID 0 in an unrelated
+        // descendant namespace configure this target (the original dead-setter
+        // implementation had exactly that flaw).
+        let caller_pid = crate::process::current_pid().ok_or(UserNsError::PermissionDenied)?;
+        let caller = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table
+                .get(caller_pid)
+                .and_then(|slot| slot.as_ref())
+                .cloned()
+                .ok_or(UserNsError::PermissionDenied)?
+        };
+        let (caller_user_ns, caller_euid, caller_egid) = {
+            let caller_guard = caller.lock();
+            if matches!(
+                caller_guard.state,
+                crate::process::ProcessState::Zombie | crate::process::ProcessState::Terminated
+            ) {
+                return Err(UserNsError::PermissionDenied);
+            }
+            let creds = caller_guard
+                .try_credentials_read()
+                .ok_or(UserNsError::PermissionDenied)?;
+            (caller_guard.user_ns.clone(), creds.euid, creds.egid)
+        };
+        let caller_id = match kind {
+            MappingKind::Uid => caller_euid,
+            MappingKind::Gid => caller_egid,
+        };
+        let caller_is_namespace_root = caller_euid == 0;
+        let caller_is_host_root = caller_user_ns.map_uid_from_ns(caller_euid) == Some(0);
+        self.ensure_parent_mapping_allowed(
+            mappings,
+            kind,
+            &caller_user_ns,
+            caller_id,
+            caller_is_namespace_root,
+            caller_is_host_root,
+        )
+    }
+
+    /// Validate the namespace-side authorization for a procfs map writer.
+    ///
+    /// A non-root caller must be in the *exact* parent user namespace.  Merely
+    /// being UID 0 in a descendant namespace is not sufficient: capabilities
+    /// are scoped to the namespace that owns the target map.  Host root is a
+    /// deliberate exception, but even it remains subject to parent-range
+    /// containment so nested mappings cannot name IDs invisible to the parent.
+    fn ensure_parent_mapping_allowed(
+        &self,
+        mappings: &[UidGidMapping],
+        kind: MappingKind,
+        caller_user_ns: &Arc<UserNamespace>,
+        caller_id: u32,
+        caller_is_namespace_root: bool,
+        caller_is_host_root: bool,
+    ) -> Result<(), UserNsError> {
         if self.is_root() {
             return Err(UserNsError::PermissionDenied);
         }
 
-        // Get caller's effective ID
-        let caller_id = match kind {
-            MappingKind::Uid => current_euid().unwrap_or(u32::MAX),
-            MappingKind::Gid => current_egid().unwrap_or(u32::MAX),
-        };
-
-        // Root (euid/egid 0) can set arbitrary mappings
-        if caller_id == 0 {
-            // Still need to validate parent mapping containment
-            return self.validate_parent_containment(mappings, kind);
-        }
-
-        // Non-root: only allow single-extent mapping of own ID
-        if mappings.len() != 1 {
+        let parent = self.parent.as_ref().ok_or(UserNsError::PermissionDenied)?;
+        if !caller_is_host_root && !Arc::ptr_eq(parent, caller_user_ns) {
             return Err(UserNsError::PermissionDenied);
         }
 
-        let m = &mappings[0];
-
-        // Must map exactly one ID
-        if m.count != 1 {
-            return Err(UserNsError::PermissionDenied);
+        if !caller_is_host_root && !caller_is_namespace_root {
+            // A non-root writer may only map its own parent-namespace ID to a
+            // single namespace ID.  This is the unprivileged user-namespace
+            // rule and also prevents arbitrary range grants by a same-UID
+            // procfs peer.
+            if mappings.len() != 1 {
+                return Err(UserNsError::PermissionDenied);
+            }
+            let mapping = &mappings[0];
+            if mapping.count != 1 || mapping.host_id != caller_id {
+                return Err(UserNsError::PermissionDenied);
+            }
         }
 
-        // Must map caller's own host ID
-        if m.host_id != caller_id {
-            return Err(UserNsError::PermissionDenied);
-        }
-
-        // Validate parent containment
         self.validate_parent_containment(mappings, kind)
     }
 
-    /// Validate that all host IDs in mappings fall within parent's mapped range.
+    /// Validate that all IDs supplied in a child mapping are visible in the
+    /// parent namespace.
     ///
-    /// This prevents privilege escalation by ensuring a child namespace cannot
-    /// grant access to host IDs that the parent namespace cannot access.
+    /// The `host_id` field of a child map is an ID in the *parent namespace*,
+    /// not a host-global ID.  Therefore containment is checked against the
+    /// parent's `ns_id` ranges.  Checking the parent's `host_id` ranges would
+    /// reject valid nested maps (and could make the accepted set depend on an
+    /// unrelated outer mapping offset).
     fn validate_parent_containment(
         &self,
         mappings: &[UidGidMapping],
@@ -632,7 +835,8 @@ impl UserNamespace {
             MappingKind::Gid => parent.gid_mappings(),
         };
 
-        // Each extent's host range must be fully contained in parent's host ranges
+        // Each child extent's parent-namespace range must be fully contained in
+        // one of the parent's namespace-ID ranges.
         for m in mappings {
             if !range_within_parent(&parent_mappings, m.host_id, m.count) {
                 return Err(UserNsError::PermissionDenied);
@@ -649,30 +853,35 @@ fn set_mapping(
     flag: &AtomicBool,
     mappings: Vec<UidGidMapping>,
 ) -> Result<(), UserNsError> {
-    // Single-write semantics: fail if already set
-    if flag.swap(true, Ordering::SeqCst) {
+    // Fast path for the common repeated-write case.  Do not set the flag yet:
+    // readers use it as the publication bit, so setting it before the table
+    // write would expose a transient "set but empty" mapping.
+    if flag.load(Ordering::Acquire) {
         return Err(UserNsError::MappingAlreadySet);
     }
 
     // Validate mapping
     if mappings.is_empty() {
-        flag.store(false, Ordering::SeqCst);
         return Err(UserNsError::InvalidMapping);
     }
 
     if mappings.len() > MAX_MAPPINGS {
-        flag.store(false, Ordering::SeqCst);
         return Err(UserNsError::TooManyMappings);
     }
 
     if let Err(e) = validate_mappings(&mappings) {
-        flag.store(false, Ordering::SeqCst);
         return Err(e);
     }
 
-    // Store validated mappings
+    // Serialize the final single-write decision with the table publication.
+    // A concurrent writer that won the race re-checks the flag while holding
+    // the same lock and cannot overwrite the first committed map.
     let mut guard = table.write();
+    if flag.load(Ordering::Acquire) {
+        return Err(UserNsError::MappingAlreadySet);
+    }
     *guard = mappings;
+    flag.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -724,31 +933,38 @@ fn ranges_overlap(start_a: u32, count_a: u32, start_b: u32, count_b: u32) -> boo
     start_a < end_b && start_b < end_a
 }
 
-/// Check if a host ID range is fully contained within any of the parent's mapped ranges.
+/// Check if a parent-namespace ID range is fully contained within any of the
+/// parent's namespace-ID extents.
 ///
-/// For a child namespace to map [host_start, host_start + count), the entire range
-/// must fall within one of the parent's host ID ranges. This prevents privilege
-/// escalation through nested namespaces.
+/// For a child namespace to map [parent_id_start, parent_id_start + count), the
+/// entire range must fall within one of the parent's `ns_id` ranges. This
+/// prevents a child from naming IDs that are unmapped in its parent.
 ///
 /// # Arguments
 ///
 /// * `parent_mappings` - Parent namespace's mapping table
-/// * `host_start` - Start of the host ID range to check
+/// * `parent_id_start` - Start of the parent-namespace ID range to check
 /// * `count` - Number of IDs in the range
 ///
 /// # Returns
 ///
 /// true if the range is fully contained in some parent extent, false otherwise
-fn range_within_parent(parent_mappings: &[UidGidMapping], host_start: u32, count: u32) -> bool {
-    let host_end = match host_start.checked_add(count) {
+fn range_within_parent(
+    parent_mappings: &[UidGidMapping],
+    parent_id_start: u32,
+    count: u32,
+) -> bool {
+    let parent_id_end = match parent_id_start.checked_add(count) {
         Some(e) => e,
         None => return false, // Overflow means invalid range
     };
 
-    // Check if any parent extent fully contains this range
+    // Check if any parent namespace-ID extent fully contains this range.
     for pm in parent_mappings {
-        let pm_end = pm.host_id.saturating_add(pm.count);
-        if host_start >= pm.host_id && host_end <= pm_end {
+        let Some(pm_end) = pm.ns_id.checked_add(pm.count) else {
+            return false;
+        };
+        if parent_id_start >= pm.ns_id && parent_id_end <= pm_end {
             return true;
         }
     }
@@ -851,9 +1067,8 @@ impl Drop for UserNamespaceFd {
 }
 
 impl FileOps for UserNamespaceFd {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_box()
-            .expect("user namespace fd clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
@@ -957,5 +1172,232 @@ mod tests {
         assert!(ranges_overlap(0, 10, 5, 10));
         assert!(!ranges_overlap(0, 5, 5, 5));
         assert!(!ranges_overlap(10, 5, 0, 5));
+    }
+
+    #[test]
+    fn r188_mapping_text_parser_is_strict_and_bounded() {
+        let parsed = parse_mapping_text(b"0 1000 1\n10 2000 5\n").expect("valid map");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].host_id, 2000);
+        assert!(parse_mapping_text(b"0 1000").is_err());
+        assert!(parse_mapping_text(b"0 1000 0").is_err());
+        assert!(parse_mapping_text(b"0 1000 1 extra").is_err());
+        let too_many = b"0 1000 1\n1 1001 1\n2 1002 1\n3 1003 1\n4 1004 1\n5 1005 1\n";
+        assert_eq!(
+            parse_mapping_text(too_many),
+            Err(UserNsError::TooManyMappings)
+        );
+        assert!(parse_mapping_text(b"\xff").is_err());
+        assert!(parse_mapping_text(&[b'1'; MAX_MAPPING_TEXT_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn r188_mapping_validation_rejects_zero_and_overflow_ranges() {
+        assert!(validate_mappings(&[UidGidMapping {
+            ns_id: 0,
+            host_id: 0,
+            count: 0,
+        }])
+        .is_err());
+        assert!(validate_mappings(&[UidGidMapping {
+            ns_id: u32::MAX,
+            host_id: 0,
+            count: 2,
+        }])
+        .is_err());
+    }
+
+    #[test]
+    fn r188_parent_mapping_authorization_is_namespace_scoped() {
+        let root = ROOT_USER_NAMESPACE.clone();
+        let target = UserNamespace::new_child(root.clone()).expect("target namespace");
+        let mapping = vec![UidGidMapping {
+            ns_id: 0,
+            host_id: 1000,
+            count: 1,
+        }];
+
+        // An unprivileged writer in the exact parent may map only its own ID.
+        assert_eq!(
+            target.set_uid_map_from_parent(mapping.clone(), &root, 1000, false, false),
+            Ok(())
+        );
+
+        // The single-write rule remains enforced after authorization succeeds.
+        assert_eq!(
+            target.set_uid_map_from_parent(mapping.clone(), &root, 1000, false, false),
+            Err(UserNsError::MappingAlreadySet)
+        );
+
+        // A caller in a different user namespace cannot configure this child,
+        // even when its numeric UID is the same.
+        let other_parent = UserNamespace::new_child(root.clone()).expect("other namespace");
+        let other_target = UserNamespace::new_child(root.clone()).expect("other target");
+        assert_eq!(
+            other_target.set_uid_map_from_parent(
+                mapping.clone(),
+                &other_parent,
+                1000,
+                false,
+                false,
+            ),
+            Err(UserNsError::PermissionDenied)
+        );
+
+        // Host root is allowed to configure a child through a different view,
+        // but still cannot mutate the root namespace itself.
+        assert_eq!(
+            other_target.set_uid_map_from_parent(mapping, &root, 0, true, true),
+            Ok(())
+        );
+        assert_eq!(
+            root.set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 0,
+                    count: 1,
+                }],
+                &root,
+                0,
+                true,
+                true,
+            ),
+            Err(UserNsError::PermissionDenied)
+        );
+
+        // Validation failures do not consume the one-shot publication slot.
+        let retry_target = UserNamespace::new_child(root.clone()).expect("retry target");
+        assert_eq!(
+            retry_target.set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: u32::MAX,
+                    host_id: 1000,
+                    count: 1,
+                }],
+                &root,
+                1000,
+                false,
+                false,
+            ),
+            Err(UserNsError::InvalidMapping)
+        );
+        assert_eq!(
+            retry_target.set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 1000,
+                    count: 1,
+                }],
+                &root,
+                1000,
+                false,
+                false,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn r188_nested_parent_mapping_requires_containment() {
+        let root = ROOT_USER_NAMESPACE.clone();
+        let parent = UserNamespace::new_child(root.clone()).expect("parent namespace");
+        parent
+            .set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 1000,
+                    count: 10,
+                }],
+                &root,
+                0,
+                true,
+                true,
+            )
+            .expect("seed parent map");
+        parent
+            .set_gid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 1000,
+                    count: 10,
+                }],
+                &root,
+                0,
+                true,
+                true,
+            )
+            .expect("seed parent gid map");
+        let target = UserNamespace::new_child(parent.clone()).expect("nested namespace");
+
+        assert_eq!(
+            target.set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    // Child outside-IDs are parent-namespace IDs, so 5 is
+                    // covered by the parent's ns_id range 0..10.
+                    host_id: 5,
+                    count: 1,
+                }],
+                &parent,
+                0,
+                true,
+                false,
+            ),
+            Ok(())
+        );
+        target
+            .set_gid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 5,
+                    count: 1,
+                }],
+                &parent,
+                0,
+                true,
+                false,
+            )
+            .expect("nested gid map");
+        assert_eq!(target.map_uid_from_ns(0), Some(1005));
+        assert_eq!(target.map_uid_to_ns(1005), Some(0));
+        assert_eq!(target.map_gid_from_ns(0), Some(1005));
+        assert_eq!(target.map_gid_to_ns(1005), Some(0));
+
+        let rejected = UserNamespace::new_child(parent.clone()).expect("second nested namespace");
+        assert_eq!(
+            rejected.set_uid_map_from_parent(
+                vec![UidGidMapping {
+                    ns_id: 0,
+                    host_id: 2000,
+                    count: 1,
+                }],
+                &parent,
+                0,
+                true,
+                false,
+            ),
+            Err(UserNsError::PermissionDenied)
+        );
+
+        // The containment check is against the parent's namespace IDs, not
+        // its outer host IDs: the parent map is 0..10 -> 1000..1010.
+        assert!(range_within_parent(
+            &[UidGidMapping {
+                ns_id: 0,
+                host_id: 1000,
+                count: 10,
+            }],
+            5,
+            1,
+        ));
+        assert!(!range_within_parent(
+            &[UidGidMapping {
+                ns_id: 0,
+                host_id: 1000,
+                count: 10,
+            }],
+            1005,
+            1,
+        ));
     }
 }

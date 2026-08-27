@@ -986,9 +986,8 @@ impl Drop for NetNamespaceFd {
 }
 
 impl FileOps for NetNamespaceFd {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_box()
-            .expect("network namespace fd clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {

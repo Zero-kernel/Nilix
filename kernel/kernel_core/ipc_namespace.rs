@@ -36,7 +36,7 @@ use cap::NamespaceId;
 use core::any::Any;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use mm::HeapClass;
+use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
 use spin::RwLock;
 
 // ============================================================================
@@ -77,6 +77,8 @@ pub enum IpcNsError {
     NamespaceIdOverflow,
     /// R112-2 FIX: IPC key counter overflow (u64 exhausted)
     KeyOverflow,
+    /// Namespace object admission/allocation failed.
+    OutOfMemory,
 }
 
 // ============================================================================
@@ -185,6 +187,9 @@ pub struct IpcNamespace {
 
     /// Next available IPC key within this namespace
     next_key: AtomicU64,
+
+    /// Exact heap charge for the namespace Arc allocation.
+    _arc_heap_charge: Option<HeapCharge>,
 }
 
 impl fmt::Debug for IpcNamespace {
@@ -206,6 +211,7 @@ impl IpcNamespace {
             level: 0,
             refcount: AtomicU32::new(1),
             next_key: AtomicU64::new(1),
+            _arc_heap_charge: None,
         }
     }
 
@@ -233,13 +239,25 @@ impl IpcNamespace {
                 IpcNsError::NamespaceIdOverflow
             })?;
 
-        let child = Arc::new(Self {
+        let arc_bytes = arc_charge_bytes::<IpcNamespace>().map_err(|_| IpcNsError::OutOfMemory)?;
+        let arc_reservation = try_reserve_heap(HeapClass::CoreProcess, arc_bytes)
+            .map_err(|_| IpcNsError::OutOfMemory)?;
+        let mut child = Arc::try_new(Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
             level: parent.level.saturating_add(1),
             refcount: AtomicU32::new(1),
             next_key: AtomicU64::new(1),
-        });
+            _arc_heap_charge: None,
+        })
+        .map_err(|_| IpcNsError::OutOfMemory)?;
+
+        let charge = arc_reservation
+            .commit()
+            .map_err(|_| IpcNsError::OutOfMemory)?;
+        Arc::get_mut(&mut child)
+            .expect("fresh IPC namespace Arc must be unique")
+            ._arc_heap_charge = Some(charge);
 
         // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
         count_guard.commit();
@@ -379,9 +397,8 @@ impl Drop for IpcNamespaceFd {
 }
 
 impl FileOps for IpcNamespaceFd {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_box()
-            .expect("IPC namespace fd clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {

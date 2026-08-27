@@ -346,9 +346,8 @@ impl MountNamespaceFd {
 }
 
 impl FileOps for MountNamespaceFd {
-    fn clone_box(&self) -> FileDescriptor {
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_box()
-            .expect("mount namespace fd clone allocation/admission failed")
     }
 
     fn try_clone_box(&self) -> Result<FileDescriptor, ()> {
