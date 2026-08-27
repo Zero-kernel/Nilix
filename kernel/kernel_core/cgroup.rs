@@ -4167,15 +4167,37 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
     }
 
     // Collect the chain: target cgroup + ancestors with the NET controller.
-    let origin = lookup_cgroup(cgroup_id).ok_or(CgroupError::NotFound)?;
-    let chain = collect_controller_chain(&origin, CgroupControllers::NET)?;
+    // Keep the registry read lock across the deleted check and origin pin.
+    // Deletion takes the same registry in write mode before setting `deleted`
+    // and sampling the pin, so a charge can never publish after the delete
+    // gate has observed zero (U06-2).
+    let (origin, chain) = if cgroup_id == 0 {
+        let origin = ROOT_CGROUP.clone();
+        if origin.deleted.load(Ordering::Acquire) {
+            return Err(CgroupError::NotFound);
+        }
+        let chain = collect_controller_chain(&origin, CgroupControllers::NET)?;
+        origin.stats.pin_origin(&origin.stats.ports_pinned, count);
+        (origin, chain)
+    } else {
+        let registry = CGROUP_REGISTRY.read();
+        let origin = registry
+            .get(&cgroup_id)
+            .cloned()
+            .ok_or(CgroupError::NotFound)?;
+        if origin.deleted.load(Ordering::Acquire) {
+            return Err(CgroupError::NotFound);
+        }
+        let chain = collect_controller_chain(&origin, CgroupControllers::NET)?;
+        origin.stats.pin_origin(&origin.stats.ports_pinned, count);
+        drop(registry);
+        (origin, chain)
+    };
     // R170-2 FIX: pin the charge at the ORIGIN node (the node whose id the
     // caller stores as the uncharge key) FIRST, controller-INDEPENDENT — see
     // `CgroupStats::ports_pinned`. Pinned before the display charges so the
     // delete-gate can never observe display motion without the pin; unpinned
     // on rejection below.
-    origin.stats.pin_origin(&origin.stats.ports_pinned, count);
-
     if chain.len == 0 {
         // No NET controller anywhere: nothing to enforce or display-count,
         // but the PIN stays — the caller still stores this id and the later
@@ -4250,23 +4272,27 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
 /// task's cgroup (which may have migrated, or whose lookup would re-enter
 /// PROCESS_TABLE on the exec/cloexec teardown path).
 ///
-/// R173 IRQ-SAFETY FIX: Use try_lookup_cgroup to avoid blocking on CGROUP_REGISTRY.
-/// This is called from reschedule_if_needed() -> drain_deferred_port_uncharges(),
-/// which is process-context with IRQs enabled (debug_assert guards it), but
-/// defense-in-depth suggests using the try variant to prevent same-CPU deadlock.
+/// The lookup is intentionally blocking. Every production caller is either the
+/// process-context deferred-port drain or a direct teardown/rollback path after
+/// all net-binding locks have been released; none is reachable from IRQ or an
+/// IRQ-disabled scheduler path. Using `try_lookup_cgroup` here would turn a
+/// transient registry-writer contention into a dropped accounting operation:
+/// the deferred queue removes an entry before invoking this function, so there
+/// is no implicit retry once the function returns.
 pub fn uncharge_ports(cgroup_id: CgroupId, count: u64) {
     if count == 0 || cgroup_id == 0 {
         return;
     }
 
     let mut depth: u32 = 0;
-    // R173: Use try_lookup_cgroup for IRQ-safety defense-in-depth
-    let mut cursor = try_lookup_cgroup(cgroup_id);
-    if cursor.is_none() {
-        // Registry contended - defer uncharge (safe: charges are origin-pinned,
-        // so the cgroup can't be deleted while charges exist; next drain will retry)
-        return;
-    }
+    // HIGH-1/U06-1 FIX: this function's callers are process-context-only, so
+    // wait for a contended registry writer instead of dropping the uncharge.
+    // `drain_deferred_port_uncharges` removes each queue slot before calling
+    // here; a try-read miss would therefore permanently strand both the origin
+    // pin and every ancestor display counter (and make the delete gate fail
+    // forever). The IRQ callers use `try_lookup_cgroup` at their own sites; do
+    // not propagate that non-blocking policy into this accounting primitive.
+    let mut cursor = lookup_cgroup(cgroup_id);
     // R170-2 FIX: unpin at the ORIGIN node (controller-independent, symmetric
     // with try_charge_ports' pin; saturating).
     if let Some(o) = &cursor {
@@ -7092,4 +7118,94 @@ pub fn run_cgroup_exact_lifetime_self_test() {
 #[cfg(test)]
 pub fn test_is_initialized() -> bool {
     CGROUP_REGISTRY.read().contains_key(&0)
+}
+
+#[cfg(test)]
+mod high1_tests {
+    extern crate std;
+
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::thread;
+
+    /// HIGH-1/U06-1 regression: a deferred uncharge must wait for a registry
+    /// writer and complete, rather than treating read-lock contention as a
+    /// successful (but dropped) operation. The writer is held before the
+    /// worker is released toward `uncharge_ports`, so an early return exposes
+    /// the old lost-accounting behavior deterministically.
+    #[test]
+    fn uncharge_ports_waits_for_registry_writer() {
+        mm::publish_heap_budgets();
+        init();
+
+        let node =
+            create_cgroup(0, CgroupControllers::NET).expect("HIGH-1 regression cgroup creation");
+        let id = node.id();
+        try_charge_ports(id, 1).expect("HIGH-1 regression port charge");
+        assert_eq!(
+            node.stats.ports_pinned.load(Ordering::Acquire),
+            1,
+            "the test must begin with one origin pin"
+        );
+
+        // Hold the registry writer before allowing the worker to enter the
+        // blocking lookup. This models create/delete contention without
+        // exposing a test-only lock hook in the production API.
+        let writer = CGROUP_REGISTRY.write();
+        let ready = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(AtomicBool::new(false));
+        let attempting = StdArc::new(AtomicBool::new(false));
+        let done = StdArc::new(AtomicBool::new(false));
+        let worker_ready = ready.clone();
+        let worker_release = release.clone();
+        let worker_attempting = attempting.clone();
+        let worker_done = done.clone();
+        let worker = thread::spawn(move || {
+            worker_ready.store(true, Ordering::Release);
+            while !worker_release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            worker_attempting.store(true, Ordering::Release);
+            uncharge_ports(id, 1);
+            worker_done.store(true, Ordering::Release);
+        });
+
+        while !ready.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        release.store(true, Ordering::Release);
+        while !attempting.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        // The old try-read implementation returns immediately here, while the
+        // fixed blocking lookup cannot finish until `writer` is released.
+        let mut returned_while_contended = false;
+        for _ in 0..10_000 {
+            if done.load(Ordering::Acquire) {
+                returned_while_contended = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        drop(writer);
+        worker.join().expect("HIGH-1 regression worker panicked");
+        assert!(
+            !returned_while_contended,
+            "uncharge_ports returned while CGROUP_REGISTRY writer was held"
+        );
+        assert_eq!(
+            node.stats.ports_pinned.load(Ordering::Acquire),
+            0,
+            "registry contention must not strand the origin pin"
+        );
+        assert_eq!(
+            node.stats.ports_current.load(Ordering::Acquire),
+            0,
+            "registry contention must not strand the port display count"
+        );
+
+        delete_cgroup(id).expect("HIGH-1 regression cgroup cleanup");
+    }
 }

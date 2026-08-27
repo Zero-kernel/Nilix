@@ -34,6 +34,17 @@ use kernel_core::cgroup::{
 };
 use kernel_core::process::ProcessState;
 use kernel_core::{process, FileDescriptor};
+use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
+
+/// Runtime cgroupfs inode construction must participate in the fallible heap
+/// admission contract. The charge is embedded in each inode payload so it
+/// remains live exactly as long as the Arc (U21-1).
+fn try_new_cgroupfs_arc<T>(build: impl FnOnce(HeapCharge) -> T) -> Result<Arc<T>, FsError> {
+    let bytes = arc_charge_bytes::<T>().map_err(|_| FsError::NoSpace)?;
+    let reservation = try_reserve_heap(HeapClass::Cgroup, bytes).map_err(|_| FsError::NoSpace)?;
+    let charge = reservation.commit().map_err(|_| FsError::NoSpace)?;
+    Arc::try_new(build(charge)).map_err(|_| FsError::NoSpace)
+}
 
 /// Global cgroupfs ID counter (starts at 300 to avoid collision with other FS types)
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
@@ -141,6 +152,7 @@ impl CtrlKind {
         matches!(
             self,
             CtrlKind::Controllers
+                | CtrlKind::SubtreeControl
                 | CtrlKind::MemoryCurrent
                 | CtrlKind::PidsCurrent
                 | CtrlKind::IoStat
@@ -247,6 +259,7 @@ impl CgroupFs {
             fs_id,
             ino: cgroup_dir_ino(0),
             cgroup_id: 0,
+            _heap_charge: None,
         });
 
         // lint-fallible: BOUNDED(one CgroupFs object per mount; fixed)
@@ -308,11 +321,13 @@ impl FileSystem for CgroupFs {
                 // R154-2 FIX: Deterministic inode from cgroup_id
                 let ino = cgroup_dir_ino(child.id());
                 // lint-fallible: BOUNDED(one inode per mkdir; live cgroup count is pids-controller bounded)
-                Ok(Arc::new(CgroupDirInode {
+                try_new_cgroupfs_arc(|charge| CgroupDirInode {
                     fs_id: self.fs_id,
                     ino,
                     cgroup_id: child.id(),
-                }))
+                    _heap_charge: Some(charge),
+                })
+                .map(|inode| inode as Arc<dyn Inode>)
             }
             Err(CgroupError::DepthLimit) => Err(FsError::NoSpace),
             Err(CgroupError::CgroupLimit) => Err(FsError::NoSpace),
@@ -400,6 +415,7 @@ struct CgroupDirInode {
     fs_id: u64,
     ino: u64,
     cgroup_id: CgroupId,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl CgroupDirInode {
@@ -418,12 +434,14 @@ impl CgroupDirInode {
             // R154-2 FIX: Deterministic inode from cgroup_id + control index
             let ino = cgroup_ctrl_ino(self.cgroup_id, kind.index());
             // lint-fallible: BOUNDED(one inode per control-file lookup)
-            return Ok(Arc::new(CgroupCtrlInode {
+            return try_new_cgroupfs_arc(|charge| CgroupCtrlInode {
                 fs_id,
                 ino,
                 cgroup_id: self.cgroup_id,
                 kind,
-            }));
+                _heap_charge: Some(charge),
+            })
+            .map(|inode| inode as Arc<dyn Inode>);
         }
 
         // Otherwise, look for a child cgroup directory
@@ -438,11 +456,13 @@ impl CgroupDirInode {
                 // R154-2 FIX: Deterministic inode from child cgroup_id
                 let ino = cgroup_dir_ino(child_id);
                 // lint-fallible: BOUNDED(one inode per child-dir lookup)
-                return Ok(Arc::new(CgroupDirInode {
+                return try_new_cgroupfs_arc(|charge| CgroupDirInode {
                     fs_id,
                     ino,
                     cgroup_id: child_id,
-                }));
+                    _heap_charge: Some(charge),
+                })
+                .map(|inode| inode as Arc<dyn Inode>);
             }
         }
 
@@ -582,6 +602,7 @@ struct CgroupCtrlInode {
     ino: u64,
     cgroup_id: CgroupId,
     kind: CtrlKind,
+    _heap_charge: Option<HeapCharge>,
 }
 
 impl CgroupCtrlInode {
@@ -943,10 +964,11 @@ impl CgroupCtrlInode {
                 Ok(())
             }
             CtrlKind::SubtreeControl => {
-                // Parse +controller -controller format
-                // This would modify subtree_control field
-                // For now, return success (no-op since we don't have subtree_control field)
-                Ok(())
+                // R188-U21-2 FIX: this kernel does not yet maintain a
+                // subtree-controller mask.  Never report success for a write
+                // that had no effect; the file is also classified read-only
+                // above so normal VFS callers fail before reaching here.
+                Err(FsError::PermDenied)
             }
             // P1-3 NOTE: All limit-setting branches below use `apply_limit`,
             // which enforces delegation boundary checks when `is_delegate`.
@@ -1389,6 +1411,7 @@ pub fn run_cgroupfs_j2_abi_self_test() {
             ino: cgroup_ctrl_ino(cg_id, kind.index()),
             cgroup_id: cg_id,
             kind,
+            _heap_charge: None,
         }
         .read_content()
         .expect("cgroupfs self-test: read_content")
@@ -1410,6 +1433,7 @@ pub fn run_cgroupfs_j2_abi_self_test() {
         ino: cgroup_ctrl_ino(cg2_id, CtrlKind::FilesMax.index()),
         cgroup_id: cg2_id,
         kind: CtrlKind::FilesMax,
+        _heap_charge: None,
     }
     .read_content()
     .expect("cgroupfs self-test: read cg2 files.max");
@@ -1420,6 +1444,7 @@ pub fn run_cgroupfs_j2_abi_self_test() {
         fs_id: 0,
         ino: cgroup_dir_ino(cg2_id),
         cgroup_id: cg2_id,
+        _heap_charge: None,
     };
     let has_visible = |wanted| {
         (0..CtrlKind::all().len()).any(|index| {
