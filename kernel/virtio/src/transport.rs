@@ -331,7 +331,12 @@ impl VirtioTransport {
     /// device-declared window.
     pub fn device_config_len(&self) -> Option<usize> {
         match self {
-            VirtioTransport::Mmio(_) => None,
+            // VirtIO-MMIO exposes the device-specific configuration after the
+            // fixed 0x100-byte common register block.  The transport is
+            // probed from a page-sized MMIO mapping, so bound reads to the
+            // remaining page window instead of treating the pointer as
+            // unbounded.
+            VirtioTransport::Mmio(t) => Some(t.config_len),
             VirtioTransport::Pci(t) => Some(t.device_cfg_len as usize),
         }
     }
@@ -358,7 +363,10 @@ impl VirtioTransport {
         }
         let base = self.device_config_base();
         for (i, byte) in buf.iter_mut().enumerate() {
-            *byte = read_volatile(base.add(offset + i));
+            let Some(index) = offset.checked_add(i) else {
+                return false;
+            };
+            *byte = read_volatile(base.add(index));
         }
         true
     }
@@ -396,6 +404,9 @@ pub struct MmioTransport {
     pub(crate) base: *mut u8,
     /// Cached version value
     pub(crate) version: u32,
+    /// Validated size of the device-specific config window in the mapped
+    /// MMIO page (bytes after `mmio::CONFIG`).
+    pub(crate) config_len: usize,
 }
 
 // SAFETY: MmioTransport contains raw pointer to MMIO region which is
@@ -430,7 +441,16 @@ impl MmioTransport {
             return None;
         }
 
-        Some(Self { base, version })
+        // The MMIO transport is mapped as one page by the platform probe;
+        // reserve the portion after the fixed common register block for
+        // device-specific config reads.  Callers still receive an extent
+        // check in `read_config_bytes` before any volatile access.
+        const MMIO_CONFIG_WINDOW: usize = 0x100;
+        Some(Self {
+            base,
+            version,
+            config_len: MMIO_CONFIG_WINDOW,
+        })
     }
 
     /// Read a 32-bit register.

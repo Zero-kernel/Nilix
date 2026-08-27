@@ -886,10 +886,11 @@ pub fn attach_device_to_domain(device: PciDeviceId, domain_id: DomainId) -> Iomm
     }
 
     // Find the IOMMU unit responsible for this device
-    let units = IOMMU_UNITS.read();
-    let unit = units
+    let unit = IOMMU_UNITS
+        .read()
         .iter()
         .find(|u| u.handles_device(&device))
+        .cloned()
         .ok_or(IommuError::DeviceNotFound)?;
 
     // Verify translation is enabled on this unit (fail-closed)
@@ -898,14 +899,15 @@ pub fn attach_device_to_domain(device: PciDeviceId, domain_id: DomainId) -> Iomm
     }
 
     // Get or create domain
-    let domains = DOMAINS.read();
-    let domain = domains
+    let domain = DOMAINS
+        .read()
         .iter()
         .find(|d| d.id() == domain_id)
+        .cloned()
         .ok_or(IommuError::DomainNotFound)?;
 
     // Attach device to domain via the IOMMU unit
-    unit.attach_device(&device, domain)?;
+    unit.attach_device(&device, &domain)?;
 
     kprintln!(
         "[IOMMU] Attached device {:02x}:{:02x}.{} to domain {}",
@@ -976,10 +978,11 @@ pub fn detach_device_from_domain(device: PciDeviceId, domain_id: DomainId) -> Io
     // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     // Find the IOMMU unit responsible for this device
-    let units = IOMMU_UNITS.read();
-    let unit = units
+    let unit = IOMMU_UNITS
+        .read()
         .iter()
         .find(|u| u.handles_device(&device))
+        .cloned()
         .ok_or(IommuError::DeviceNotFound)?;
 
     // Verify translation is enabled on this unit (fail-closed)
@@ -988,11 +991,8 @@ pub fn detach_device_from_domain(device: PciDeviceId, domain_id: DomainId) -> Io
     }
 
     // Verify domain exists
-    {
-        let domains = DOMAINS.read();
-        if !domains.iter().any(|d| d.id() == domain_id) {
-            return Err(IommuError::DomainNotFound);
-        }
+    if !DOMAINS.read().iter().any(|d| d.id() == domain_id) {
+        return Err(IommuError::DomainNotFound);
     }
 
     // Detach device from domain via the IOMMU unit
@@ -1040,10 +1040,11 @@ pub fn map_range(
     // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0, so the legacy bypass
     // check was unreachable and contradicted our fail-closed design.
 
-    let domains = DOMAINS.read();
-    let domain = domains
+    let domain = DOMAINS
+        .read()
         .iter()
         .find(|d| d.id() == domain_id)
+        .cloned()
         .ok_or(IommuError::DomainNotFound)?;
 
     // A poisoned unit may contain an untracked-present context if admission
@@ -1086,10 +1087,11 @@ pub fn unmap_range(domain_id: DomainId, iova: u64, size: usize) -> IommuResult<(
     // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0, so the legacy bypass
     // check was unreachable and contradicted our fail-closed design.
 
-    let domains = DOMAINS.read();
-    let domain = domains
+    let domain = DOMAINS
+        .read()
         .iter()
         .find(|d| d.id() == domain_id)
+        .cloned()
         .ok_or(IommuError::DomainNotFound)?;
 
     domain.prepare_unmap(iova, size)?;

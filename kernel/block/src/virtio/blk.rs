@@ -145,6 +145,10 @@ pub struct VirtQueue {
     avail_phys: u64,
     /// Physical address of used ring.
     used_phys: u64,
+    /// Malformed device-controlled ring state quarantines the queue until a
+    /// full reset/reinitialization; this prevents forward-jump resync from
+    /// orphaning in-flight descriptor chains.
+    fatal: AtomicBool,
 }
 
 // SAFETY: VirtQueue contains raw pointers to DMA-able memory
@@ -246,12 +250,16 @@ impl VirtQueue {
             desc_phys,
             avail_phys,
             used_phys,
+            fatal: AtomicBool::new(false),
         })
     }
 
     /// Allocate a descriptor from the free list.
     /// R66-6 FIX: Track allocation in bitmap for double-free detection.
     fn alloc_desc(&self) -> Option<u16> {
+        if self.fatal.load(Ordering::Acquire) {
+            return None;
+        }
         let mut alloc = self.alloc_bitmap.lock();
         let mut free = self.free_list.lock();
         let idx = free.pop()?;
@@ -309,12 +317,9 @@ impl VirtQueue {
     /// Push a descriptor chain to the available ring.
     unsafe fn push_avail(&self, head: u16) {
         // R156-15 + R157-8 FIX: Runtime bounds check (defense-in-depth).
-        assert!(
-            head < self.size,
-            "push_avail: head {} >= size {}",
-            head,
-            self.size
-        );
+        if self.fatal.load(Ordering::Acquire) || self.size == 0 || head >= self.size {
+            return;
+        }
         let avail = &mut *self.avail;
         let idx = read_volatile(&avail.idx);
         let ring_idx = (idx % self.size) as usize;
@@ -332,6 +337,9 @@ impl VirtQueue {
 
     /// Check if there are used entries to process.
     fn has_used(&self) -> bool {
+        if self.fatal.load(Ordering::Acquire) {
+            return false;
+        }
         unsafe {
             let used = &*self.used;
             let used_idx = read_volatile(&used.idx);
@@ -370,9 +378,10 @@ impl VirtQueue {
                     pending,
                     self.size
                 );
-                // Reset last_used_idx to used_idx to prevent infinite loop
-                // but don't process any entries
-                self.last_used_idx.store(used_idx, Ordering::Relaxed);
+                // Do not resynchronize past the skipped entries: that would
+                // strand every descriptor in the interval.  Quarantine until
+                // reset_device rebuilds the complete software state.
+                self.fatal.store(true, Ordering::Release);
                 return None;
             }
 
@@ -405,14 +414,15 @@ impl VirtQueue {
     /// Get descriptor at index.
     #[allow(clippy::mut_from_ref)] // virtio ring descriptor: &self->&mut via raw pointer is the deliberate unsafe contract
     unsafe fn desc(&self, idx: u16) -> &mut VringDesc {
-        // R150-I2 FIX: Catch out-of-bounds descriptor access in debug builds.
-        debug_assert!(
-            idx < self.size,
-            "blk desc: idx {} >= size {}",
-            idx,
-            self.size
-        );
+        if idx >= self.size || self.fatal.load(Ordering::Acquire) {
+            panic!("virtio-blk descriptor index outside a live queue");
+        }
         &mut *self.desc.add(idx as usize)
+    }
+
+    #[inline]
+    fn clear_fatal(&self) {
+        self.fatal.store(false, Ordering::Release);
     }
 }
 
@@ -1229,6 +1239,7 @@ impl VirtioBlkDevice {
 
         // Reset virtqueue software state: used index, descriptor allocation.
         self.queue.last_used_idx.store(0, Ordering::Relaxed);
+        self.queue.clear_fatal();
 
         {
             let qsz = self.queue.size as usize;
@@ -1283,6 +1294,43 @@ impl VirtioBlkDevice {
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
                 kprintln!("[virtio-blk] R106-3: FEATURES_OK not accepted after reset");
                 return Err(BlockError::NotSupported);
+            }
+
+            // U41-3 FIX: device configuration is not immutable across a
+            // reset. Re-read the authoritative capacity and negotiated block
+            // size before publishing DRIVER_OK; if geometry changed, keep the
+            // device failed rather than issuing requests with stale bounds.
+            let mut capacity_bytes = [0u8; 8];
+            if !self.transport.read_config_bytes(0, &mut capacity_bytes) {
+                self.transport.set_status(VIRTIO_STATUS_FAILED);
+                return Err(BlockError::NotSupported);
+            }
+            let reset_capacity = u64::from_le_bytes(capacity_bytes);
+            let reset_sector_size = if driver_features & blk_features::VIRTIO_BLK_F_BLK_SIZE != 0 {
+                let mut block_size_bytes = [0u8; 4];
+                if !self.transport.read_config_bytes(20, &mut block_size_bytes) {
+                    self.transport.set_status(VIRTIO_STATUS_FAILED);
+                    return Err(BlockError::NotSupported);
+                }
+                let block_size = u32::from_le_bytes(block_size_bytes);
+                if block_size == 0 {
+                    512
+                } else {
+                    block_size
+                }
+            } else {
+                512
+            };
+            if reset_capacity != self.capacity || reset_sector_size != self.sector_size {
+                self.transport.set_status(VIRTIO_STATUS_FAILED);
+                kprintln!(
+                    "[virtio-blk] U41-3: geometry changed across reset (capacity {}->{}, sector {}->{})",
+                    self.capacity,
+                    reset_capacity,
+                    self.sector_size,
+                    reset_sector_size
+                );
+                return Err(BlockError::Offline);
             }
 
             // Validate queue size is still compatible.
@@ -1653,6 +1701,32 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn submit_bio(&self, mut bio: Bio) -> Result<(), BlockError> {
+        // U41-1: a BIO security tag is part of the device boundary, not
+        // advisory metadata.  Enforce the same file-permission hook used by
+        // VFS before touching DMA buffers or issuing a device request.  A
+        // missing tag is treated as an internal/kernel-originated BIO and is
+        // left to the caller's higher-level authorization contract; a present
+        // tag must never be silently ignored.
+        if let Some(tag) = bio.sec_tag {
+            let task = lsm::ProcessCtx::new(
+                tag.pid as usize,
+                tag.pid as usize,
+                tag.uid,
+                tag.uid,
+                tag.uid,
+                tag.uid,
+            );
+            let access_mask = match bio.op {
+                BioOp::Read => 0x04,                                  // MAY_READ
+                BioOp::Write | BioOp::Discard | BioOp::Flush => 0x02, // MAY_WRITE
+            };
+            let file_ctx = lsm::FileCtx::new(tag.ino, tag.mode, tag.path_hash);
+            if lsm::hook_file_permission(&task, file_ctx.inode, access_mask).is_err() {
+                bio.complete(Err(BlockError::PermissionDenied));
+                return Err(BlockError::PermissionDenied);
+            }
+        }
+
         // Synchronous fallback: process the BIO immediately using do_request/flush.
         // A proper async implementation would queue the BIO and use interrupt-driven
         // completion. This fallback enables page cache writeback and basic BIO users.

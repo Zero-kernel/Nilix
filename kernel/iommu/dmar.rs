@@ -454,7 +454,22 @@ impl RmrrEntry {
 
     /// Get size in bytes.
     pub fn size(&self) -> u64 {
-        self.limit_address - self.base_address + 1
+        // U28-2 FIX: RMRR addresses come from firmware.  Never let an
+        // inverted/overflowing inclusive range wrap into a huge allocation or
+        // mapping request; zero is the fail-closed representation for an
+        // invalid range and callers can use `checked_size` when they need to
+        // distinguish it from a legitimate zero-length rejection.
+        self.limit_address
+            .checked_sub(self.base_address)
+            .and_then(|span| span.checked_add(1))
+            .unwrap_or(0)
+    }
+
+    /// Return the inclusive RMRR size only when `base..=limit` is valid.
+    pub fn checked_size(&self) -> Option<u64> {
+        self.limit_address
+            .checked_sub(self.base_address)
+            .and_then(|span| span.checked_add(1))
     }
 }
 

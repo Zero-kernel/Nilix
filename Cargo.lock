@@ -68,6 +68,7 @@ dependencies = [
  "iommu",
  "klog",
  "lazy_static",
+ "lsm",
  "mm",
  "spin 0.9.9",
  "virtio",

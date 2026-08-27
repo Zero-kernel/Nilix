@@ -12,3 +12,4 @@ virtio = { path = "../virtio" }
 x86_64 = "0.15"
 iommu = { path = "../iommu" }
 klog = { path = "../klog" }
+lsm = { path = "../lsm", features = ["lsm"] }

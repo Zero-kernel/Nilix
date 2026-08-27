@@ -368,8 +368,18 @@ impl InterruptRemappingTable {
 
         let phys = frame.start_address().as_u64();
 
-        // Validate physical address is within direct map
-        if phys >= MAX_DIRECT_MAP_PHYS {
+        // U29-1 FIX: validate the complete multi-page allocation, not just
+        // its first frame.  A final page crossing the direct-map ceiling
+        // would make the zeroing write wrap into an unrelated physical range.
+        let allocation_bytes = pages.checked_mul(4096).ok_or(IommuError::InvalidRange)?;
+        let phys_end = match phys.checked_add(allocation_bytes as u64) {
+            Some(end) => end,
+            None => {
+                buddy_allocator::free_physical_pages(frame, pages);
+                return Err(IommuError::PageTableAllocFailed);
+            }
+        };
+        if phys >= MAX_DIRECT_MAP_PHYS || phys_end > MAX_DIRECT_MAP_PHYS {
             buddy_allocator::free_physical_pages(frame, pages);
             return Err(IommuError::PageTableAllocFailed);
         }
@@ -381,7 +391,7 @@ impl InterruptRemappingTable {
         // R84-3 FIX: Zero the entire allocation (all pages), not just the entries.
         // This prevents information disclosure through uninitialized memory if
         // the allocation ever drifts from the exact size needed for entries.
-        let zero_len = pages * 4096;
+        let zero_len = allocation_bytes;
         unsafe {
             ptr::write_bytes(virt_ptr as *mut u8, 0, zero_len);
         }

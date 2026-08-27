@@ -598,11 +598,14 @@ impl Domain {
     /// - The physical address points to a valid, mapped page table
     /// - The page_table_lock is held to prevent concurrent access
     unsafe fn table_from_phys(phys: u64) -> &'static mut SlPageTable {
-        // Note: Caller must have validated phys < MAX_DIRECT_MAP_PHYS
-        debug_assert!(
-            phys < MAX_DIRECT_MAP_PHYS,
-            "physical address out of direct map range"
-        );
+        // U29-4 FIX: this is a security boundary, not a debug-only contract.
+        // A corrupted present PTE must never be turned into an arbitrary
+        // direct-map reference in a release kernel.  Keep the panic path
+        // allocation-free and fail closed before `phys_to_virt` executes.
+        let end = phys.checked_add(IOMMU_PAGE_SIZE as u64).unwrap_or(u64::MAX);
+        if phys >= MAX_DIRECT_MAP_PHYS || end > MAX_DIRECT_MAP_PHYS || phys & 0xfff != 0 {
+            panic!("IOMMU page-table physical address outside direct map");
+        }
         let virt = phys_to_virt(PhysAddr::new(phys));
         &mut *virt.as_mut_ptr::<SlPageTable>()
     }

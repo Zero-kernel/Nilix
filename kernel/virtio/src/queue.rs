@@ -6,7 +6,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 
 use crate::{rmb, wmb, VringAvail, VringDesc, VringUsed, VringUsedElem};
@@ -41,6 +41,11 @@ pub struct VirtQueue {
     avail_phys: u64,
     /// Physical address of used ring.
     used_phys: u64,
+    /// Set when device-controlled ring metadata violates the VirtIO
+    /// monotonicity/bounds contract.  A poisoned queue is quarantined until
+    /// the owning driver performs a full reset/reinitialization; silently
+    /// resynchronizing would orphan in-flight descriptor chains.
+    fatal: AtomicBool,
 }
 
 // SAFETY: VirtQueue contains raw pointers to DMA-able memory
@@ -134,6 +139,7 @@ impl VirtQueue {
             desc_phys,
             avail_phys,
             used_phys,
+            fatal: AtomicBool::new(false),
         }
     }
 
@@ -171,6 +177,9 @@ impl VirtQueue {
     ///
     /// Returns `None` if no descriptors are available.
     pub fn alloc_desc(&self) -> Option<u16> {
+        if self.fatal.load(Ordering::Acquire) {
+            return None;
+        }
         // R44-8 LOCK ORDER FIX: Lock alloc_bitmap first, then free_list
         // This matches the order in free_desc to prevent deadlock
         let mut alloc = self.alloc_bitmap.lock();
@@ -225,6 +234,9 @@ impl VirtQueue {
     /// # Safety
     /// The caller must ensure the descriptor chain is properly set up.
     pub unsafe fn push_avail(&self, head: u16) {
+        if self.fatal.load(Ordering::Acquire) || head >= self.size || self.size == 0 {
+            return;
+        }
         let avail = &mut *self.avail;
         let idx = read_volatile(&avail.idx);
         let ring_idx = (idx % self.size) as usize;
@@ -242,6 +254,9 @@ impl VirtQueue {
 
     /// Check if there are used entries to process.
     pub fn has_used(&self) -> bool {
+        if self.fatal.load(Ordering::Acquire) {
+            return false;
+        }
         unsafe {
             let used = &*self.used;
             let used_idx = read_volatile(&used.idx);
@@ -288,9 +303,11 @@ impl VirtQueue {
                     // This prevents replaying already-processed slots
                     return None;
                 }
-                // Forward jump: resync to device index to avoid permanent stall
-                // but don't process any entries from this abnormal transition
-                self.last_used_idx.store(used_idx, Ordering::Relaxed);
+                // Forward jump: quarantine the queue.  Advancing `last` would
+                // permanently skip the intervening entries and leave every
+                // corresponding descriptor allocated forever.  The owning
+                // driver must reset and rebuild the queue before reuse.
+                self.fatal.store(true, Ordering::Release);
                 return None;
             }
 
@@ -325,17 +342,9 @@ impl VirtQueue {
     // \&mut from \&self is the deliberate unsafe interior-mutability contract (callers audited).
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn desc_mut(&self, idx: u16) -> &mut VringDesc {
-        // R150-I2 FIX / R154-I3 FIX: Bounds check is debug_assert (stripped in release).
-        // This is intentional: all callers are audited to pass driver-allocated indices
-        // bounded by queue size, so the check serves as a development-time invariant
-        // rather than a runtime guard. A release-mode panic here would be unrecoverable
-        // in an interrupt context.
-        debug_assert!(
-            idx < self.size,
-            "desc_mut: idx {} >= size {}",
-            idx,
-            self.size
-        );
+        if idx >= self.size || self.fatal.load(Ordering::Acquire) {
+            panic!("virtio descriptor index outside a live queue");
+        }
         &mut *self.desc.add(idx as usize)
     }
 
@@ -344,8 +353,15 @@ impl VirtQueue {
     /// # Safety
     /// The caller must ensure the index is valid.
     pub unsafe fn desc(&self, idx: u16) -> &VringDesc {
-        // R150-I2 FIX: Catch out-of-bounds descriptor access in debug builds.
-        debug_assert!(idx < self.size, "desc: idx {} >= size {}", idx, self.size);
+        if idx >= self.size || self.fatal.load(Ordering::Acquire) {
+            panic!("virtio descriptor index outside a live queue");
+        }
         &*self.desc.add(idx as usize)
+    }
+
+    /// Whether the queue has been quarantined after malformed device input.
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Acquire)
     }
 }
