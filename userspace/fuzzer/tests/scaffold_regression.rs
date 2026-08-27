@@ -7,13 +7,10 @@
 
 extern crate alloc;
 
-#[path = "../crash_triage.rs"]
-mod crash_triage;
-
 #[path = "../mod.rs"]
 mod legacy_scaffold;
 
-use crash_triage::{CrashInput, CrashTriageSystem, TriageResult};
+use legacy_scaffold::crash_triage::{CrashInput, CrashTriageSystem, TriageResult};
 
 #[test]
 fn crash_triage_preserves_inputs_without_a_verified_oracle() {

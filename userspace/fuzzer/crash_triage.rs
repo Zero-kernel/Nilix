@@ -319,6 +319,12 @@ impl CrashTriageSystem {
     }
 }
 
+impl Default for CrashTriageSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Delta-debug a byte input while preserving a positive oracle result.
 fn minimize_bytes<F>(input: &[u8], signature: &CrashSignature, tester: &mut F) -> Vec<u8>
 where
@@ -334,7 +340,7 @@ where
     const MAX_ITERATIONS: usize = 1_000;
 
     while best.len() > 1 && iterations < MAX_ITERATIONS {
-        let chunk = (best.len() + granularity - 1) / granularity;
+        let chunk = best.len().div_ceil(granularity);
         let mut reduced = false;
         let mut start = 0usize;
 

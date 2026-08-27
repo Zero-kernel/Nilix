@@ -192,99 +192,66 @@ fn apply_rela_dyn_relocations(
     info!("  {} relocations applied successfully", applied);
 }
 
+#[cfg(feature = "kaslr")]
+#[derive(Clone, Copy)]
+struct HardwareEntropyCapabilities {
+    rdseed: bool,
+    rdrand: bool,
+}
+
+/// Detect each hardware entropy instruction independently.
+///
+/// CPUID leaf 7 is queried only when the maximum basic leaf advertises it.
+/// This distinction is load-bearing: RDRAND support does not imply RDSEED
+/// support, and executing an unsupported instruction raises #UD in firmware.
+#[cfg(feature = "kaslr")]
+fn hardware_entropy_capabilities() -> HardwareEntropyCapabilities {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+    let maximum_basic_leaf = unsafe { __cpuid(0) }.eax;
+    let rdrand = if maximum_basic_leaf >= 1 {
+        (unsafe { __cpuid(1) }.ecx & (1 << 30)) != 0
+    } else {
+        false
+    };
+    let rdseed = if maximum_basic_leaf >= 7 {
+        (unsafe { __cpuid_count(7, 0) }.ebx & (1 << 18)) != 0
+    } else {
+        false
+    };
+
+    HardwareEntropyCapabilities { rdseed, rdrand }
+}
+
 /// Probe hardware entropy safely before the permutation consumes additional
-/// samples.  RDSEED is preferred when present; RDRAND is retained as a
-/// fallback and the TSC is mixed into every sample to prevent a virtualized
-/// deterministic stream from becoming the sole placement input.
+/// samples. RDSEED is preferred when present; RDRAND is retained as a
+/// fallback. The capability set is carried through the whole permutation so
+/// no later sample can execute an instruction that CPUID did not authorize;
+/// transient RDSEED backpressure can still fall through to supported RDRAND.
 /// A successful sample is deliberately discarded; provenance is published
 /// only after the complete unbiased shuffle succeeds.
-#[allow(dead_code)]
-fn probe_rdrand_entropy() -> bool {
-    #[cfg(feature = "kaslr")]
-    {
-        // CPUID.01H:ECX[30] = RDRAND; CPUID.07H:EBX[18] = RDSEED.
-        let (rdrand_available, rdseed_available): (bool, bool) = {
-            let ecx: u32;
-            let rdseed_ebx: u32;
-            unsafe {
-                core::arch::asm!(
-                    "push rbx",
-                    "mov eax, 1",
-                    "xor ecx, ecx",   // ECX=0 (sub-leaf 0) for CPUID leaf 1
-                    "cpuid",
-                    "pop rbx",
-                    lateout("eax") _,
-                    lateout("ecx") ecx,
-                    lateout("edx") _,
-                    // No `nomem` or `nostack` — push/pop uses both stack and memory.
-                );
-                core::arch::asm!(
-                    "push rbx",
-                    "mov eax, 7",
-                    "xor ecx, ecx",
-                    "cpuid",
-                    "mov {out_ebx:e}, ebx",
-                    "pop rbx",
-                    lateout("eax") _,
-                    out_ebx = lateout(reg) rdseed_ebx,
-                    lateout("ecx") _,
-                    lateout("edx") _,
-                );
-            }
-            ((ecx & (1 << 30)) != 0, (rdseed_ebx & (1 << 18)) != 0)
-        };
+#[cfg(feature = "kaslr")]
+fn probe_entropy_sources() -> Option<HardwareEntropyCapabilities> {
+    let capabilities = hardware_entropy_capabilities();
 
-        if rdseed_available {
-            for _ in 0..10 {
-                let value: u64;
-                let success: u8;
-                unsafe {
-                    core::arch::asm!(
-                        "rdseed {value}",
-                        "setc {success}",
-                        value = out(reg) value,
-                        success = out(reg_byte) success,
-                        options(nostack, nomem),
-                    );
-                }
-                if success == 1 {
-                    return true;
-                }
-            }
-        }
-
-        if !rdrand_available {
-            return false;
-        }
-
-        // Retry transient RDRAND backpressure before demoting the placement
-        // transaction to deterministic full-window relocation.
-        for _ in 0..10 {
-            let success: u8;
-            unsafe {
-                core::arch::asm!(
-                    "rdrand {value}",
-                    "setc {success}",
-                    value = out(reg) _,
-                    success = out(reg_byte) success,
-                    options(nostack, nomem),
-                );
-            }
-            if success == 1 {
-                return true;
-            }
-        }
-        false
-    }
-
-    #[cfg(not(feature = "kaslr"))]
-    {
-        false
+    let rdseed_ready = capabilities.rdseed && unsafe { next_rdseed_u64() }.is_some();
+    let rdrand_ready = capabilities.rdrand && unsafe { next_rdrand_u64() }.is_some();
+    if rdseed_ready || rdrand_ready {
+        Some(capabilities)
+    } else {
+        None
     }
 }
 
 #[cfg(feature = "kaslr")]
-fn next_rdseed_u64() -> Option<u64> {
+/// Read one RDSEED sample with bounded retries.
+///
+/// # Safety
+///
+/// The caller must first verify CPUID.07H:EBX[18]. Executing RDSEED without
+/// that capability raises #UD before the bootloader can install an exception
+/// handler.
+unsafe fn next_rdseed_u64() -> Option<u64> {
     for _ in 0..16 {
         let value: u64;
         let success: u8;
@@ -321,7 +288,14 @@ fn read_tsc_entropy() -> u64 {
 }
 
 #[cfg(feature = "kaslr")]
-fn next_rdrand_u64() -> Option<u64> {
+/// Read one RDRAND sample with bounded retries.
+///
+/// # Safety
+///
+/// The caller must first verify CPUID.01H:ECX[30]. Executing RDRAND without
+/// that capability raises #UD before the bootloader can install an exception
+/// handler.
+unsafe fn next_rdrand_u64() -> Option<u64> {
     for _ in 0..10 {
         let value: u64;
         let success: u8;
@@ -342,20 +316,25 @@ fn next_rdrand_u64() -> Option<u64> {
 }
 
 #[cfg(feature = "kaslr")]
-fn next_entropy_u64() -> Option<u64> {
+fn next_entropy_u64(sources: HardwareEntropyCapabilities) -> Option<u64> {
     let tsc = read_tsc_entropy();
-    if let Some(seed) = next_rdseed_u64() {
-        return Some(seed ^ tsc.rotate_left(17));
+    if sources.rdseed {
+        if let Some(seed) = unsafe { next_rdseed_u64() } {
+            return Some(seed ^ tsc.rotate_left(17));
+        }
     }
-    next_rdrand_u64().map(|random| random ^ tsc.rotate_left(29))
+    if sources.rdrand {
+        return unsafe { next_rdrand_u64() }.map(|random| random ^ tsc.rotate_left(29));
+    }
+    None
 }
 
 #[cfg(feature = "kaslr")]
-fn uniform_rdrand_below(upper: u64) -> Option<u64> {
-    assert!(upper > 0, "RDRAND bound must be non-zero");
+fn uniform_entropy_below(upper: u64, sources: HardwareEntropyCapabilities) -> Option<u64> {
+    assert!(upper > 0, "entropy bound must be non-zero");
     let threshold = upper.wrapping_neg() % upper;
     for _ in 0..32 {
-        let value = next_entropy_u64()?;
+        let value = next_entropy_u64(sources)?;
         if value >= threshold {
             return Some(value % upper);
         }
@@ -378,12 +357,12 @@ fn kernel_placement_order() -> ([u16; KASLR_SLOT_COUNT], bool) {
 
     #[cfg(feature = "kaslr")]
     {
-        if !probe_rdrand_entropy() {
+        let Some(sources) = probe_entropy_sources() else {
             return (deterministic, false);
-        }
+        };
         let mut shuffled = deterministic;
         for upper in (2..=KASLR_SLOT_COUNT).rev() {
-            let Some(other) = uniform_rdrand_below(upper as u64) else {
+            let Some(other) = uniform_entropy_below(upper as u64, sources) else {
                 return (deterministic, false);
             };
             shuffled.swap(upper - 1, other as usize);

@@ -500,7 +500,7 @@ Local checks and hosted suites passed:
   build all pass.
 - Hosted `kernel_core`: **29/29**; `ipc` robust-futex: **4/4**; `vfs`: **22/22**; `net`:
   **116/116**; `mm`: **25/25**; `audit`: **15/15**; `seccomp`: **14/14**; `block`: **9/9**.
-- Userspace core: **4/4**; userspace/fuzzer workspace: **27/27** across unit, binary,
+- Userspace core: **4/4**; userspace/fuzzer workspace: **25/25** across unit, binary,
   integration, and scaffold targets; nilix-syz-fuzzer: **26/26**.
 - Runtime-test discovery reports **73/73 implemented** tests and **27 P0** tests. The hosted
   sub-crate oracle is now **239 tests** plus three test-code compile checks under default
