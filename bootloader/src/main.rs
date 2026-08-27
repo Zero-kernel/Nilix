@@ -2,7 +2,7 @@
 #![no_main]
 
 extern crate alloc;
-use alloc::vec;
+use alloc::vec::Vec;
 use log::info;
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
@@ -39,11 +39,25 @@ const BOOT_INFO_KASLR_RANDOMIZED: u64 = 1 << 0;
 /// Maximum KASLR slide (512 MiB, within the 1GB high-half mapping)
 const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
 
-/// KASLR slide granularity (2 MiB aligned for huge page compatibility)
-const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
+/// KASLR slide granularity.  The initial page tables cover the whole 1 GiB
+/// window, so placement does not need to be constrained to huge-page
+/// boundaries.  A 64 KiB quantum provides materially more than the old
+/// eight-bit placement entropy while keeping the bounded permutation small.
+const KASLR_SLIDE_GRANULARITY: u64 = 64 * 1024;
 
 /// Physical window covered by the initial high-half 1 GiB mapping.
 const KERNEL_PHYS_WINDOW_END: u64 = 1024 * 1024 * 1024;
+
+/// Defensive upper bound for the kernel file read.  The UEFI file metadata is
+/// untrusted input; refusing an absurd length keeps a corrupt directory entry
+/// from turning the bootloader's initial allocation into an unbounded request.
+const KERNEL_MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Maximum post-ExitBootServices memory-map snapshot.  The buffer is sized for
+/// a deliberately generous descriptor budget (2 MiB) and is checked against
+/// the firmware-reported byte count before copying; a corrupt/hostile map is
+/// rejected without an out-of-bounds write.
+const MEMORY_MAP_COPY_PAGES: usize = 512;
 
 /// Number of bounded placement slots, including slide zero.
 const KASLR_SLOT_COUNT: usize = (KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY + 1) as usize;
@@ -178,21 +192,20 @@ fn apply_rela_dyn_relocations(
     info!("  {} relocations applied successfully", applied);
 }
 
-/// Probe RDRAND safely before the permutation consumes additional samples.
+/// Probe hardware entropy safely before the permutation consumes additional
+/// samples.  RDSEED is preferred when present; RDRAND is retained as a
+/// fallback and the TSC is mixed into every sample to prevent a virtualized
+/// deterministic stream from becoming the sole placement input.
 /// A successful sample is deliberately discarded; provenance is published
 /// only after the complete unbiased shuffle succeeds.
 #[allow(dead_code)]
 fn probe_rdrand_entropy() -> bool {
     #[cfg(feature = "kaslr")]
     {
-        // R119-2 FIX: Check CPUID.01H:ECX[30] for RDRAND support before executing
-        // the instruction. Without this check, RDRAND triggers #UD (Invalid Opcode)
-        // on pre-Ivy Bridge Intel or pre-Excavator AMD CPUs. CPUID clobbers EAX,
-        // EBX, ECX, EDX; we save/restore RBX via push/pop since LLVM may use it as
-        // a frame pointer or callee-saved register in the surrounding function.
-        // NOTE: push/pop touches the stack so we must NOT use options(nostack).
-        let rdrand_available: bool = {
+        // CPUID.01H:ECX[30] = RDRAND; CPUID.07H:EBX[18] = RDSEED.
+        let (rdrand_available, rdseed_available): (bool, bool) = {
             let ecx: u32;
+            let rdseed_ebx: u32;
             unsafe {
                 core::arch::asm!(
                     "push rbx",
@@ -205,9 +218,40 @@ fn probe_rdrand_entropy() -> bool {
                     lateout("edx") _,
                     // No `nomem` or `nostack` — push/pop uses both stack and memory.
                 );
+                core::arch::asm!(
+                    "push rbx",
+                    "mov eax, 7",
+                    "xor ecx, ecx",
+                    "cpuid",
+                    "mov {out_ebx:e}, ebx",
+                    "pop rbx",
+                    lateout("eax") _,
+                    out_ebx = lateout(reg) rdseed_ebx,
+                    lateout("ecx") _,
+                    lateout("edx") _,
+                );
             }
-            (ecx & (1 << 30)) != 0
+            ((ecx & (1 << 30)) != 0, (rdseed_ebx & (1 << 18)) != 0)
         };
+
+        if rdseed_available {
+            for _ in 0..10 {
+                let value: u64;
+                let success: u8;
+                unsafe {
+                    core::arch::asm!(
+                        "rdseed {value}",
+                        "setc {success}",
+                        value = out(reg) value,
+                        success = out(reg_byte) success,
+                        options(nostack, nomem),
+                    );
+                }
+                if success == 1 {
+                    return true;
+                }
+            }
+        }
 
         if !rdrand_available {
             return false;
@@ -240,6 +284,43 @@ fn probe_rdrand_entropy() -> bool {
 }
 
 #[cfg(feature = "kaslr")]
+fn next_rdseed_u64() -> Option<u64> {
+    for _ in 0..16 {
+        let value: u64;
+        let success: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdseed {value}",
+                "setc {success}",
+                value = out(reg) value,
+                success = out(reg_byte) success,
+                options(nostack, nomem),
+            );
+        }
+        if success == 1 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "kaslr")]
+#[inline]
+fn read_tsc_entropy() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+#[cfg(feature = "kaslr")]
 fn next_rdrand_u64() -> Option<u64> {
     for _ in 0..10 {
         let value: u64;
@@ -261,11 +342,20 @@ fn next_rdrand_u64() -> Option<u64> {
 }
 
 #[cfg(feature = "kaslr")]
+fn next_entropy_u64() -> Option<u64> {
+    let tsc = read_tsc_entropy();
+    if let Some(seed) = next_rdseed_u64() {
+        return Some(seed ^ tsc.rotate_left(17));
+    }
+    next_rdrand_u64().map(|random| random ^ tsc.rotate_left(29))
+}
+
+#[cfg(feature = "kaslr")]
 fn uniform_rdrand_below(upper: u64) -> Option<u64> {
     assert!(upper > 0, "RDRAND bound must be non-zero");
     let threshold = upper.wrapping_neg() % upper;
     for _ in 0..32 {
-        let value = next_rdrand_u64()?;
+        let value = next_entropy_u64()?;
         if value >= threshold {
             return Some(value % upper);
         }
@@ -513,6 +603,27 @@ pub struct BootInfo {
     pub kaslr_flags: u64,
 }
 
+const KERNEL_PAGE_SIZE: u64 = 4096;
+const KERNEL_PAGE_EXECUTABLE: u8 = 1 << 0;
+const KERNEL_PAGE_WRITABLE: u8 = 1 << 1;
+const KERNEL_PAGE_CLAIMED: u8 = 1 << 2;
+
+struct KernelPagePermissions {
+    phys_base: u64,
+    pages: Vec<u8>,
+}
+
+impl KernelPagePermissions {
+    fn get(&self, phys_page: u64) -> Option<u8> {
+        let offset = phys_page.checked_sub(self.phys_base)?;
+        if !offset.is_multiple_of(KERNEL_PAGE_SIZE) {
+            return None;
+        }
+        let index = usize::try_from(offset / KERNEL_PAGE_SIZE).ok()?;
+        self.pages.get(index).copied()
+    }
+}
+
 #[entry]
 fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     uefi::helpers::init(&mut system_table).unwrap();
@@ -522,7 +633,14 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // R39-7/RF180-32: get entry, relocation slide, image size, and provenance.
     // Codex Review Fix: kernel_size needed for accurate page table setup
-    let (entry_point, kaslr_slide, kernel_size, kaslr_randomized) = {
+    let (
+        entry_point,
+        kaslr_slide,
+        kernel_size,
+        kaslr_randomized,
+        actual_phys_base,
+        kernel_permissions,
+    ) = {
         let boot_services = system_table.boot_services();
 
         let fs_handle = boot_services
@@ -566,9 +684,17 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             .get_info::<FileInfo>(&mut info_buffer)
             .expect("Failed to get file info");
 
-        let file_size = info.file_size() as usize;
+        let file_size =
+            usize::try_from(info.file_size()).expect("kernel file size does not fit in usize");
+        if file_size == 0 || file_size > KERNEL_MAX_FILE_SIZE {
+            panic!("kernel.elf size outside the supported bootloader bound");
+        }
 
-        let mut kernel_data = vec![0; file_size];
+        let mut kernel_data = Vec::new();
+        kernel_data
+            .try_reserve_exact(file_size)
+            .expect("kernel.elf allocation failed");
+        kernel_data.resize(file_size, 0);
 
         // 循环读取直到完整读取整个文件
         let mut total_read = 0usize;
@@ -702,7 +828,20 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             core::ptr::write_bytes(actual_phys_base as *mut u8, 0, alloc_bytes);
         }
 
-        // 加载所有程序段到物理地址 0x100000
+        if !actual_phys_base.is_multiple_of(KERNEL_PAGE_SIZE) {
+            panic!("UEFI kernel allocation is not page aligned");
+        }
+        let mut page_permissions = Vec::new();
+        page_permissions
+            .try_reserve_exact(pages)
+            .expect("kernel page-permission allocation failed");
+        page_permissions.resize(pages, 0);
+        let mut kernel_permissions = KernelPagePermissions {
+            phys_base: actual_phys_base,
+            pages: page_permissions,
+        };
+
+        // 加载所有程序段 to the exact UEFI-selected physical address.
         for program_header in elf.program_iter() {
             if program_header.get_type() != Ok(Type::Load) {
                 continue;
@@ -716,6 +855,25 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let mem_size = program_header.mem_size();
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
+
+            // A zero-sized LOAD contributes no image bytes or permissions;
+            // skip it before the inclusive page-range calculation so
+            // `mem_size - 1` cannot accidentally classify the preceding page.
+            if mem_size == 0 {
+                continue;
+            }
+
+            // R188-U55-2 FIX: ELF metadata is attacker-controlled at the boot
+            // boundary.  A LOAD segment may not copy more initialized bytes
+            // than its destination reservation, and every arithmetic step must
+            // remain inside the exact page-aligned image allocation.
+            if file_size > mem_size {
+                panic!("ELF LOAD file_size exceeds mem_size");
+            }
+            let mem_size_usize =
+                usize::try_from(mem_size).expect("ELF LOAD mem_size does not fit in usize");
+            let file_size_usize =
+                usize::try_from(file_size).expect("ELF LOAD file_size does not fit in usize");
 
             // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
             // A malformed ELF could have segments pointing beyond the file, causing OOB read
@@ -733,12 +891,79 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
             // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
             // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
-            let phys_addr = actual_phys_base + (virt_addr - min_addr);
+            let segment_offset = virt_addr
+                .checked_sub(min_addr)
+                .expect("ELF LOAD virtual address below image base");
+            let phys_addr = actual_phys_base
+                .checked_add(segment_offset)
+                .expect("ELF LOAD physical address overflow");
+            let image_end = actual_phys_base
+                .checked_add(u64::try_from(alloc_bytes).expect("allocation size overflow"))
+                .expect("ELF image allocation end overflow");
+            let segment_mem_end = phys_addr
+                .checked_add(mem_size)
+                .expect("ELF LOAD destination overflow");
+            let segment_file_end = phys_addr
+                .checked_add(file_size)
+                .expect("ELF LOAD file destination overflow");
+            if phys_addr < actual_phys_base
+                || segment_mem_end > image_end
+                || segment_file_end > image_end
+            {
+                panic!("ELF LOAD destination exceeds allocated image");
+            }
+
+            // Classify final permissions at the architectural 4 KiB page
+            // granularity.  The kernel's legitimate text/data boundary can
+            // share a 2 MiB bucket, especially with a 64 KiB KASLR slide; a
+            // huge-page-only classifier would reject that image or force the
+            // whole bucket W+X.  Mixed buckets are split into 4 KiB leaves
+            // when the new page tables are built below.
+            let first_page = usize::try_from(
+                phys_addr
+                    .checked_sub(actual_phys_base)
+                    .expect("ELF LOAD starts below kernel allocation")
+                    / KERNEL_PAGE_SIZE,
+            )
+            .expect("ELF LOAD first page index overflow");
+            let last_page = usize::try_from(
+                segment_mem_end
+                    .saturating_sub(1)
+                    .checked_sub(actual_phys_base)
+                    .expect("ELF LOAD ends below kernel allocation")
+                    / KERNEL_PAGE_SIZE,
+            )
+            .expect("ELF LOAD last page index overflow");
+            if last_page >= kernel_permissions.pages.len() {
+                panic!("ELF LOAD permission range exceeds allocated image");
+            }
+            let segment_executable = program_header.flags().is_execute();
+            let segment_writable = program_header.flags().is_write();
+            let segment_permissions = KERNEL_PAGE_CLAIMED
+                | if segment_executable {
+                    KERNEL_PAGE_EXECUTABLE
+                } else {
+                    0
+                }
+                | if segment_writable {
+                    KERNEL_PAGE_WRITABLE
+                } else {
+                    0
+                };
+            for page_index in first_page..=last_page {
+                let current = kernel_permissions.pages[page_index];
+                if (segment_executable && current & KERNEL_PAGE_WRITABLE != 0)
+                    || (segment_writable && current & KERNEL_PAGE_EXECUTABLE != 0)
+                {
+                    panic!("ELF LOAD segments require a writable/executable 4 KiB page");
+                }
+                kernel_permissions.pages[page_index] = current | segment_permissions;
+            }
 
             // 清零整个段内存区域（包括.bss）
             unsafe {
                 let dest = phys_addr as *mut u8;
-                core::ptr::write_bytes(dest, 0, mem_size as usize);
+                core::ptr::write_bytes(dest, 0, mem_size_usize);
             }
 
             // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
@@ -746,7 +971,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 unsafe {
                     let dest = phys_addr as *mut u8;
                     let src = kernel_data.as_ptr().add(file_offset as usize);
-                    core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
+                    core::ptr::copy_nonoverlapping(src, dest, file_size_usize);
                 }
             }
 
@@ -782,6 +1007,13 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             info!("Kernel image load verified");
         }
 
+        for permissions in &kernel_permissions.pages {
+            if permissions & KERNEL_PAGE_EXECUTABLE != 0 && permissions & KERNEL_PAGE_WRITABLE != 0
+            {
+                panic!("ELF LOAD segments require a writable/executable 4 KiB page");
+            }
+        }
+
         // Text KASLR: Apply PIE relocations so absolute addresses in the
         // kernel image point to the correct (slid) virtual addresses.
         // This is a no-op when kaslr_slide == 0 and no .rela.dyn section exists.
@@ -813,7 +1045,14 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 "fixed placement"
             }
         );
-        (adjusted_entry, kaslr_slide, kernel_size, kaslr_randomized)
+        (
+            adjusted_entry,
+            kaslr_slide,
+            kernel_size,
+            kaslr_randomized,
+            actual_phys_base,
+            kernel_permissions,
+        )
     };
 
     // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
@@ -900,7 +1139,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pd_ptr = pd_frame as *mut PageTable;
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
-        // 使用2MB大页映射内核
+        // Map the high-half direct window with huge pages except for the small
+        // set of 2 MiB buckets that overlap the kernel image.  Those buckets
+        // use 4 KiB leaves so legitimate text/rodata/data boundaries retain
+        // exact W^X permissions even when KASLR shifts them within a huge page.
         // 虚拟地址 0xffffffff80000000 映射到物理地址 0
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
         // 虚拟 0xffffffff80000000 → 物理 0x0
@@ -914,13 +1156,25 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // The high-half mapping MUST remain at virtual→physical offset 0xffffffff80000000→0
         // because PHYSICAL_MEMORY_OFFSET is used throughout the kernel for phys_to_virt().
         //
-        // W^X 安全说明：
-        // - Calculate which PD entries contain the kernel
-        //   只有包含内核的条目设为可执行，其他设为 NX
-        //   由于 2MB 粒度太粗，无法正确分离代码和数据
-        //   暂时保持 RWX，由内核启动后通过 enforce_nx_for_kernel() 拆分为 4KB 页
-        let kernel_phys_start = KERNEL_PHYS_BASE + kaslr_slide;
-        let kernel_phys_end = kernel_phys_start + (kernel_size as u64);
+        // W^X safety:
+        // - LOAD permissions were classified per 4 KiB page before this
+        //   transaction.
+        // - Executable pages become RX, writable pages become RW+NX, and
+        //   read-only/gap pages become R+NX.
+        // - No final high-half leaf is both writable and executable.
+        // R188-U55-8 FIX: use the exact address returned by UEFI allocation,
+        // not a recomputation from the requested base and slide.  The latter
+        // can diverge on firmware that applies an address adjustment or on a
+        // future allocator implementation with a different placement policy.
+        let kernel_phys_start = actual_phys_base;
+        let kernel_phys_end = kernel_phys_start
+            .checked_add(
+                u64::try_from(kernel_permissions.pages.len())
+                    .expect("kernel page count exceeds u64")
+                    .checked_mul(KERNEL_PAGE_SIZE)
+                    .expect("kernel page extent overflow"),
+            )
+            .expect("kernel physical extent overflow");
         let start_pd_idx = (kernel_phys_start / 0x200000) as usize;
         // Last PD entry that actually contains kernel bytes (inclusive).
         // saturating_sub(1) handles the edge case where kernel_phys_end is
@@ -929,15 +1183,42 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let end_pd_idx = (kernel_phys_end.saturating_sub(1) / 0x200000) as usize;
 
         for i in 0..512usize {
-            let phys_addr = PhysAddr::new((i as u64) * 0x200000);
-            let flags = if i >= start_pd_idx && i <= end_pd_idx {
-                // Kernel code/data region: RWX for now, hardened by kernel later
-                Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE
+            let bucket_start = (i as u64) * 0x200000;
+            if i >= start_pd_idx && i <= end_pd_idx {
+                let pt_frame = boot_services
+                    .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+                    .expect("Failed to allocate kernel permission PT");
+                let pt_ptr = pt_frame as *mut PageTable;
+                core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
+
+                for page_index in 0..512usize {
+                    let phys_page = bucket_start
+                        .checked_add((page_index as u64) * KERNEL_PAGE_SIZE)
+                        .expect("kernel PT physical address overflow");
+                    let flags = match kernel_permissions.get(phys_page) {
+                        Some(permissions) if permissions & KERNEL_PAGE_EXECUTABLE != 0 => {
+                            Flags::PRESENT
+                        }
+                        Some(permissions) if permissions & KERNEL_PAGE_WRITABLE != 0 => {
+                            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                        }
+                        Some(permissions) if permissions & KERNEL_PAGE_CLAIMED != 0 => {
+                            Flags::PRESENT | Flags::NO_EXECUTE
+                        }
+                        Some(_) => Flags::PRESENT | Flags::NO_EXECUTE,
+                        None => Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
+                    };
+                    (&mut *pt_ptr)[page_index].set_addr(PhysAddr::new(phys_page), flags);
+                }
+
+                (&mut *pd_ptr)[i]
+                    .set_addr(PhysAddr::new(pt_frame), Flags::PRESENT | Flags::WRITABLE);
             } else {
-                // Non-kernel region: writable but not executable
-                Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE
-            };
-            (&mut *pd_ptr)[i].set_addr(phys_addr, flags);
+                (&mut *pd_ptr)[i].set_addr(
+                    PhysAddr::new(bucket_start),
+                    Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE,
+                );
+            }
         }
 
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
@@ -1073,9 +1354,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     };
 
     // 预先分配一块低地址缓冲区，用于在退出后保存内存映射副本，确保恒等映射可访问
-    // 64 页（256 KiB）足以容纳常见的内存映射
+    // Reserve a bounded, substantially larger map snapshot than the former
+    // 64-page assumption.  The exact firmware-reported size is checked below.
     let (memory_map_copy_ptr, memory_map_copy_len) = {
-        let pages = 64usize;
+        let pages = MEMORY_MAP_COPY_PAGES;
         let addr = system_table
             .boot_services()
             .allocate_pages(
@@ -1101,10 +1383,12 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let (memory_map_bytes, memory_map_meta) = memory_map.as_raw();
 
         // 确保预分配的缓冲区足够大
-        assert!(
-            memory_map_meta.map_size <= memory_map_copy_len,
-            "Memory map larger than reserved copy buffer"
-        );
+        if memory_map_meta.map_size > memory_map_copy_len {
+            // R188-U55-7 FIX: fail closed before the copy rather than relying
+            // on a brittle debug assertion.  Firmware that needs a larger map
+            // must increase the explicit bounded budget above.
+            panic!("UEFI memory map exceeds the bounded handoff buffer");
+        }
 
         // 复制内存映射到低地址缓冲区
         core::ptr::copy_nonoverlapping(
@@ -1127,7 +1411,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             cmdline,
             // R167-C/RF180-32: exact kernel image range for reservation-aware
             // MM. The slide records relocation; flags record whether it was random.
-            kernel_phys_base: KERNEL_PHYS_BASE + kaslr_slide,
+            kernel_phys_base: actual_phys_base,
             kernel_phys_size: kernel_size as u64,
             version: BOOT_INFO_VERSION,
             kaslr_flags: if kaslr_randomized {

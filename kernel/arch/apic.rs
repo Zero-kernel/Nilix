@@ -787,9 +787,12 @@ pub unsafe fn init_lapic() {
     // Set Destination Format Register to flat model
     lapic_write(lapic::DFR, 0xFFFF_FFFF);
 
-    // Set Logical Destination Register
-    // In flat model, bits 24-31 are the logical ID
-    lapic_write(lapic::LDR, 1 << 24);
+    // Set a per-CPU logical destination bit in flat mode.  Reusing literal 1
+    // on every CPU aliases all logical destinations and can deliver a
+    // broadcast IPI to the wrong scheduler.  LAPIC flat mode has eight bits;
+    // systems with larger IDs use physical-destination IPIs in this kernel.
+    let logical_bit = 1u32 << (id & 7);
+    lapic_write(lapic::LDR, logical_bit << 24);
 
     // Configure LVT entries: keep local sources masked, but allow legacy PIC via LINT0 (ExtINT)
     // LINT0 connects to the 8259 PIC's INTR output on the BSP; masking it blocks all PIC IRQs.
@@ -848,8 +851,10 @@ pub unsafe fn init_lapic_for_ap() {
     // Set Destination Format Register to flat model
     lapic_write(lapic::DFR, 0xFFFF_FFFF);
 
-    // Set Logical Destination Register
-    lapic_write(lapic::LDR, 1 << 24);
+    // Match the BSP's flat-mode logical assignment, but derive it from this
+    // AP's own LAPIC ID so logical destinations remain distinct.
+    let logical_bit = 1u32 << (lapic_id() & 7);
+    lapic_write(lapic::LDR, logical_bit << 24);
 
     // Mask all LVT entries - APs should NOT have ExtINT on LINT0
     // Only the BSP is connected to the 8259 PIC
@@ -1047,6 +1052,10 @@ unsafe fn ioapic_write(reg: u8, value: u32) {
 ///
 /// I/O APIC must be initialized and irq must be valid (0-23).
 pub unsafe fn ioapic_read_redir(irq: u8) -> u64 {
+    assert!(
+        (irq as usize) < ioapic_max_entries(),
+        "I/O APIC IRQ exceeds the discovered redirection table"
+    );
     let reg_low = ioapic::REDIR_TABLE_BASE + irq * 2;
     let reg_high = reg_low + 1;
 
@@ -1062,6 +1071,10 @@ pub unsafe fn ioapic_read_redir(irq: u8) -> u64 {
 ///
 /// I/O APIC must be initialized and irq must be valid (0-23).
 pub unsafe fn ioapic_write_redir(irq: u8, entry: u64) {
+    assert!(
+        (irq as usize) < ioapic_max_entries(),
+        "I/O APIC IRQ exceeds the discovered redirection table"
+    );
     let reg_low = ioapic::REDIR_TABLE_BASE + irq * 2;
     let reg_high = reg_low + 1;
 
@@ -1075,10 +1088,10 @@ pub unsafe fn ioapic_write_redir(irq: u8, entry: u64) {
 /// # Safety
 ///
 /// I/O APIC must be mapped.
-pub unsafe fn ioapic_max_entries() -> u8 {
+pub unsafe fn ioapic_max_entries() -> usize {
     let version = ioapic_read(ioapic::VERSION);
     // Bits 16-23 contain the maximum redirection entry number (0-based)
-    ((version >> 16) & 0xFF) as u8 + 1
+    ((version >> 16) & 0xFF) as usize + 1
 }
 
 /// Initialize the I/O APIC
@@ -1100,7 +1113,7 @@ pub unsafe fn init_ioapic() {
     // Mask all redirection entries
     for irq in 0..max_entries {
         let entry = redir_bits::MASKED;
-        ioapic_write_redir(irq, entry);
+        ioapic_write_redir(irq as u8, entry);
     }
 
     IOAPIC_INITIALIZED.store(true, Ordering::Release);

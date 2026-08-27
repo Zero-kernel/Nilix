@@ -48,6 +48,8 @@ pub struct KeyboardBuffer {
     write_pos: usize,
     /// Number of characters in buffer
     count: usize,
+    /// Characters rejected because the bounded input ring was full.
+    dropped: u64,
     /// Shift key state (true if pressed)
     shift_pressed: bool,
     /// Ctrl key state (true if pressed)
@@ -64,6 +66,7 @@ impl KeyboardBuffer {
             read_pos: 0,
             write_pos: 0,
             count: 0,
+            dropped: 0,
             shift_pressed: false,
             ctrl_pressed: false,
             caps_lock: false,
@@ -86,6 +89,12 @@ impl KeyboardBuffer {
     #[inline]
     pub fn available(&self) -> usize {
         self.count
+    }
+
+    /// Number of input characters dropped due to a full ring.
+    #[inline]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Push a character into the buffer
@@ -202,17 +211,26 @@ impl KeyboardBuffer {
         if let Some(ch) = self.scancode_to_ascii(scancode) {
             // Handle Ctrl+C (SIGINT placeholder - push ETX)
             if self.ctrl_pressed && (ch == b'c' || ch == b'C') {
-                self.push(0x03); // ETX (Ctrl+C)
+                if !self.push(0x03) {
+                    self.dropped = self.dropped.saturating_add(1);
+                }
                 return;
             }
 
             // Handle Ctrl+D (EOF placeholder - push EOT)
             if self.ctrl_pressed && (ch == b'd' || ch == b'D') {
-                self.push(0x04); // EOT (Ctrl+D)
+                if !self.push(0x04) {
+                    self.dropped = self.dropped.saturating_add(1);
+                }
                 return;
             }
 
-            self.push(ch);
+            if !self.push(ch) {
+                // U51-3 FIX: retain explicit loss telemetry for every input
+                // path, including control characters, instead of silently
+                // discarding a keystroke when the bounded ring is full.
+                self.dropped = self.dropped.saturating_add(1);
+            }
         }
     }
 
@@ -343,9 +361,13 @@ static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// * `scancode` - Raw PS/2 Set 1 scancode from port 0x60
 #[inline]
 pub fn push_scancode(scancode: u8) {
-    // Use blocking lock - safe in IRQ context with interrupts disabled
-    let mut buffer = KEYBOARD_BUFFER.lock();
-    buffer.process_scancode(scancode);
+    // U51-4 FIX: make IRQ exclusion explicit at the API boundary.  Hardware
+    // normally enters with IF=0, but callers/tests may invoke this helper from
+    // a soft-interrupt path where that convention is not guaranteed.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut buffer = KEYBOARD_BUFFER.lock();
+        buffer.process_scancode(scancode);
+    });
 }
 
 /// Push a raw ASCII character directly into the keyboard buffer
@@ -368,16 +390,15 @@ pub fn push_scancode(scancode: u8) {
 /// `true` if character was pushed, `false` if buffer full
 #[inline]
 pub fn push_char(ch: u8) -> bool {
-    // Use blocking lock - we're in IRQ context with interrupts disabled,
-    // and consumers use without_interrupts() so no deadlock possible
-    let mut buffer = KEYBOARD_BUFFER.lock();
-    if buffer.push(ch) {
-        true
-    } else {
-        // Buffer full
-        DROPPED_BYTES.fetch_add(1, Ordering::Relaxed);
-        false
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut buffer = KEYBOARD_BUFFER.lock();
+        if buffer.push(ch) {
+            true
+        } else {
+            DROPPED_BYTES.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    })
 }
 
 /// Read characters from the keyboard buffer

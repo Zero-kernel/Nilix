@@ -179,6 +179,22 @@ pub fn require_smap_support() {
     kprintln!("      ✓ SMAP requirement verified (CLAC/STAC safe)");
 }
 
+/// Fail closed when a supported protection could not be enabled.  Continuing
+/// with SMEP/UMIP silently disabled makes the advertised hardening profile
+/// depend on a mutable CR4 write and leaves an avoidable execution/descriptor
+/// attack surface.
+pub fn require_supported_protections(status: CpuProtectionStatus) {
+    if status.smep_supported && !status.smep_enabled {
+        panic!("FATAL: SMEP is supported but could not be enabled");
+    }
+    if status.umip_supported && !status.umip_enabled {
+        panic!("FATAL: UMIP is supported but could not be enabled");
+    }
+    if status.smap_supported && !status.smap_enabled {
+        panic!("FATAL: SMAP is supported but could not be enabled");
+    }
+}
+
 /// CPUID leaf 0x7 subleaf 0 (returns eax, ebx, ecx, edx)
 ///
 /// This leaf contains extended feature flags including SMEP, SMAP, and UMIP.

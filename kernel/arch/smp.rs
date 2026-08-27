@@ -1828,8 +1828,16 @@ pub(crate) unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u6
     }
 
     let total_len = header.length as usize;
+    let header_len = core::mem::size_of::<SdtHeader>();
+    if total_len < header_len {
+        return None;
+    }
+    let body_len = total_len - header_len;
+    if body_len % 4 != 0 {
+        return None;
+    }
     let body = phys_slice(rsdt_phys, total_len)?;
-    let entries = (total_len - core::mem::size_of::<SdtHeader>()) / 4;
+    let entries = body_len / 4;
 
     for i in 0..entries {
         let off = core::mem::size_of::<SdtHeader>() + i * 4;
@@ -1854,8 +1862,16 @@ pub(crate) unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u6
     }
 
     let total_len = header.length as usize;
+    let header_len = core::mem::size_of::<SdtHeader>();
+    if total_len < header_len {
+        return None;
+    }
+    let body_len = total_len - header_len;
+    if body_len % 8 != 0 {
+        return None;
+    }
     let body = phys_slice(xsdt_phys, total_len)?;
-    let entries = (total_len - core::mem::size_of::<SdtHeader>()) / 8;
+    let entries = body_len / 8;
 
     for i in 0..entries {
         let off = core::mem::size_of::<SdtHeader>() + i * 8;
@@ -1882,10 +1898,16 @@ pub(crate) fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
 ///
 /// E.1 HPET: Made pub(crate) so hpet.rs can read ACPI table data.
 pub(crate) fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
-    if phys == 0 || phys + len as u64 > MAX_PHYS_MAPPED {
+    if phys == 0 {
         return None;
     }
-    let virt = (PHYSICAL_MEMORY_OFFSET + phys) as *const u8;
+    let end = phys.checked_add(u64::try_from(len).ok()?)?;
+    if end > MAX_PHYS_MAPPED {
+        return None;
+    }
+    let virt_addr = PHYSICAL_MEMORY_OFFSET.checked_add(phys)?;
+    let _virt_end = virt_addr.checked_add(u64::try_from(len).ok()?)?;
+    let virt = virt_addr as *const u8;
     Some(unsafe { core::slice::from_raw_parts(virt, len) })
 }
 

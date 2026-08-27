@@ -36,6 +36,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 static INVPCID_CACHED: AtomicBool = AtomicBool::new(false);
 static INVPCID_CHECKED: AtomicBool = AtomicBool::new(false);
 
+/// Architectural PCID width is 12 bits (0..=4095).  Keep the check at every
+/// public wrapper rather than relying on callers to uphold an unsafe API
+/// precondition; an invalid value would otherwise raise #GP in ring 0.
+const MAX_PCID: u16 = 0x0fff;
+
+#[inline]
+fn valid_pcid(pcid: u16) -> bool {
+    pcid <= MAX_PCID
+}
+
 /// Check if INVPCID instruction is supported.
 ///
 /// Queries CPUID.(EAX=07H, ECX=0):EBX[10].
@@ -130,6 +140,10 @@ unsafe fn invpcid(desc: &InvpcidDescriptor, typ: u64) {
 /// individual page unmapping.
 #[inline(always)]
 pub unsafe fn invpcid_address(pcid: u16, addr: u64) {
+    if !valid_pcid(pcid) {
+        debug_assert!(false, "INVPCID address PCID exceeds 12-bit range");
+        return;
+    }
     let desc = InvpcidDescriptor {
         pcid: pcid as u64,
         address: addr,
@@ -158,6 +172,10 @@ pub unsafe fn invpcid_address(pcid: u16, addr: u64) {
 /// - Bulk page table changes
 #[inline(always)]
 pub unsafe fn invpcid_single_context(pcid: u16) {
+    if !valid_pcid(pcid) {
+        debug_assert!(false, "INVPCID context PCID exceeds 12-bit range");
+        return;
+    }
     let desc = InvpcidDescriptor {
         pcid: pcid as u64,
         address: 0,
@@ -233,6 +251,10 @@ pub unsafe fn invpcid_all_global() {
 /// - PCID is valid (0-4095)
 /// - All necessary memory barriers are in place
 pub unsafe fn flush_pcid(pcid: u16) {
+    if !valid_pcid(pcid) {
+        debug_assert!(false, "flush_pcid PCID exceeds 12-bit range");
+        return;
+    }
     if invpcid_supported() {
         invpcid_single_context(pcid);
     } else {
@@ -254,6 +276,10 @@ pub unsafe fn flush_pcid(pcid: u16) {
 ///
 /// Caller must ensure the address and PCID are valid.
 pub unsafe fn flush_address(pcid: u16, addr: u64) {
+    if !valid_pcid(pcid) {
+        debug_assert!(false, "flush_address PCID exceeds 12-bit range");
+        return;
+    }
     if invpcid_supported() && pcid != 0 {
         invpcid_address(pcid, addr);
     } else {
@@ -292,5 +318,12 @@ mod tests {
     fn test_invpcid_descriptor_alignment() {
         // Descriptor is packed, no alignment requirement beyond byte
         assert_eq!(core::mem::align_of::<InvpcidDescriptor>(), 1);
+    }
+
+    #[test]
+    fn pcid_validation_rejects_values_that_would_raise_gp() {
+        assert!(valid_pcid(0));
+        assert!(valid_pcid(MAX_PCID));
+        assert!(!valid_pcid(MAX_PCID.saturating_add(1)));
     }
 }

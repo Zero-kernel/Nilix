@@ -88,6 +88,12 @@ static COUNTERS_READY: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static BOOT_PHASE_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// U14-3 FIX: bridge the net crate's allocation-free weak-ISN observation to
+// the tamper-evident audit stream without introducing a dependency cycle.
+fn audit_weak_isn_observation(count: u32) {
+    let _ = audit::emit_weak_isn_observation(count, kernel_core::time::get_ticks());
+}
+
 // 演示模块
 mod demo;
 mod integration_test;
@@ -326,30 +332,53 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 解析 Bootloader 传递的 BootInfo 指针（必须在任何 println! 之前）
     // Bootloader 通过 rdi 寄存器传递 BootInfo 指针（System V AMD64 ABI）
     // 由于 identity mapping 仍然有效，可以直接访问该地址
-    let boot_info: Option<&BootInfo> = if boot_info_ptr != 0 {
-        unsafe { (boot_info_ptr as *const BootInfo).as_ref() }
-    } else {
+    // U53-2b FIX: the pointer is supplied by firmware-facing boot code and
+    // must be validated before even an `as_ref` dereference.  The bootloader
+    // allocates one page below 4 GiB and the early kernel identity map covers
+    // that range; reject null, misaligned, wrapping, or out-of-window values.
+    let boot_info: Option<&BootInfo> = if boot_info_ptr == 0 {
         None
+    } else {
+        let align = core::mem::align_of::<BootInfo>() as u64;
+        let size = core::mem::size_of::<BootInfo>() as u64;
+        let end = boot_info_ptr.checked_add(size);
+        if boot_info_ptr % align != 0
+            || boot_info_ptr < 0x1000
+            || end.is_none_or(|value| value > 0x1_0000_0000)
+        {
+            None
+        } else {
+            unsafe { (boot_info_ptr as *const BootInfo).as_ref() }
+        }
     };
 
     // 初始化 framebuffer 控制台（现代 GOP 方式，必须在第一个 println! 之前）
     if let Some(info) = boot_info {
-        // 转换 mm::memory::FramebufferInfo 到 drivers::framebuffer::FramebufferInfo
-        let fb_info = drivers::framebuffer::FramebufferInfo {
-            base: info.framebuffer.base,
-            size: info.framebuffer.size,
-            width: info.framebuffer.width,
-            height: info.framebuffer.height,
-            stride: info.framebuffer.stride,
-            pixel_format: match info.framebuffer.pixel_format {
-                mm::memory::PixelFormat::Rgb => drivers::framebuffer::PixelFormat::Rgb,
-                mm::memory::PixelFormat::Bgr => drivers::framebuffer::PixelFormat::Bgr,
-                mm::memory::PixelFormat::Unknown => drivers::framebuffer::PixelFormat::Unknown,
-            },
-        };
-        drivers::framebuffer::init(&fb_info);
-        unsafe {
-            serial_write_str("Framebuffer console initialized\n");
+        if !mm::validate_framebuffer_region(&info.framebuffer, &info.memory_map) {
+            // R188-U51-2 FIX: do not trust a GOP pointer solely because its
+            // dimensions fit.  The physical range must also be covered by an
+            // allowed firmware memory descriptor before any pixel write.
+            unsafe {
+                serial_write_str("Framebuffer rejected: not covered by memory map\n");
+            }
+        } else {
+            // 转换 mm::memory::FramebufferInfo 到 drivers::framebuffer::FramebufferInfo
+            let fb_info = drivers::framebuffer::FramebufferInfo {
+                base: info.framebuffer.base,
+                size: info.framebuffer.size,
+                width: info.framebuffer.width,
+                height: info.framebuffer.height,
+                stride: info.framebuffer.stride,
+                pixel_format: match info.framebuffer.pixel_format {
+                    mm::memory::PixelFormat::Rgb => drivers::framebuffer::PixelFormat::Rgb,
+                    mm::memory::PixelFormat::Bgr => drivers::framebuffer::PixelFormat::Bgr,
+                    mm::memory::PixelFormat::Unknown => drivers::framebuffer::PixelFormat::Unknown,
+                },
+            };
+            drivers::framebuffer::init(&fb_info);
+            unsafe {
+                serial_write_str("Framebuffer console initialized\n");
+            }
         }
     }
 
@@ -515,6 +544,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 } else {
                     klog!(Warn, "        ! CSPRNG not ready");
                 }
+                initialize_stack_canary();
                 if report.kptr_guard_active {
                     klog!(Info, "        - kptr guard: active");
                 }
@@ -676,6 +706,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     klog_always!("[2.7/3] Enabling CPU protection features...");
     {
         let cpu_status = arch::cpu_protection::enable_protections();
+        // R188-U32-5 FIX: a supported protection that remains disabled is an
+        // initialization failure, not a warning.  Unsupported CPUs are still
+        // handled explicitly by the helper.
+        arch::cpu_protection::require_supported_protections(cpu_status);
         if cpu_status.smep_enabled {
             klog_always!("        - SMEP: enabled (blocks kernel executing user pages)");
         } else if cpu_status.smep_supported {
@@ -995,6 +1029,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // Phase D: Network Layer
     klog_always!("[7.54/8] Initializing Network Layer...");
+    net::tcp::register_weak_isn_audit_hook(audit_weak_isn_observation);
     let net_devices = net::init(iommu_required);
     if net_devices == 0 {
         klog_always!("      ! No network devices detected");
@@ -1239,15 +1274,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // R106-8: Register OOM killer audit callback for tamper-evident event recording.
             // OOM kill events are now fed into the hash-chained audit ring buffer.
             mm::register_oom_audit_callback(|pid, uid, needed, rss, adj, timestamp| {
+                let pid32 = pid.min(u32::MAX as u64) as u32;
                 let _ = audit::emit(
                     audit::AuditKind::Internal,
                     audit::AuditOutcome::Info,
-                    audit::AuditSubject::new(pid, uid, 0, None),
+                    audit::AuditSubject::new(pid32, uid, 0, None),
                     audit::AuditObject::Process {
-                        pid,
+                        pid: pid32,
                         signal: Some(9),
                     }, // SIGKILL
-                    &[needed, rss, adj as u64],
+                    // Preserve the complete process identity in the payload;
+                    // the fixed AuditSubject/Process ABI carries only u32.
+                    &[needed, rss, adj as u64, pid],
                     0,
                     timestamp,
                 );
@@ -1590,12 +1628,29 @@ fn panic(info: &PanicInfo) -> ! {
 // halts cleanly instead of producing a linker error or undefined behavior.
 // ============================================================================
 
-/// Stack canary guard value.  In production kernels this should be
-/// randomized at boot from the CSPRNG; for now a compile-time constant
-/// provides the symbol the compiler expects.
+/// Stack canary guard value.  It starts with a non-zero bootstrap value so
+/// compiler-instrumented early-boot code remains valid, then is overwritten
+/// from the initialized CSPRNG before any Ring-3 entry.
 #[no_mangle]
 #[used]
-pub static __stack_chk_guard: u64 = 0x595e_9fbd_94fd_a766;
+pub static mut __stack_chk_guard: u64 = 0x595e_9fbd_94fd_a766;
+
+/// Seed the compiler canary once the security RNG is ready.  Volatile access
+/// keeps the symbol ABI-compatible with GCC/LLVM stack-protector loads while
+/// preventing the initialization from being optimized away.
+fn initialize_stack_canary() {
+    let mut bytes = [0u8; core::mem::size_of::<u64>()];
+    let value = if security::fill_random(&mut bytes).is_ok() {
+        u64::from_ne_bytes(bytes)
+    } else {
+        // Balanced/performance profiles may continue after a degraded RNG;
+        // still avoid a boot-wide constant by mixing monotonic early entropy.
+        kernel_core::time::get_ticks() ^ (initialize_stack_canary as *const () as usize as u64)
+    } | 1;
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(__stack_chk_guard), value);
+    }
+}
 
 /// Called by compiler-inserted stack canary checks when corruption is detected.
 #[no_mangle]
