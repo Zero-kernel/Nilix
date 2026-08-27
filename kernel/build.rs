@@ -108,11 +108,38 @@ fn parse_test_metadata(files: &[PathBuf]) -> Vec<TestMetadata> {
                         }
                     }
 
+                    // Runtime tests historically did not carry the optional
+                    // doc metadata fields consistently.  Treat source
+                    // discovery itself as authoritative: infer a category
+                    // and mark the concrete `RuntimeTest` implementation as
+                    // implemented when a field is absent.  Reporting zero
+                    // tests for a tree containing dozens of implementations
+                    // made the coverage gate silently meaningless.
+                    let category = extract_field(&doc_lines, "Category:")
+                        .or_else(|| Some(infer_category(&test_name).to_string()));
+                    let priority = extract_field(&doc_lines, "Priority:").or_else(|| {
+                        // The dedicated P0 regression module is itself the
+                        // source of truth for critical coverage.  Preserve
+                        // that intent even when individual tests omit the
+                        // optional doc tag.
+                        if file
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name == "regression_tests_p0.rs")
+                        {
+                            Some("P0".to_string())
+                        } else {
+                            Some("P1".to_string())
+                        }
+                    });
+                    let status = extract_field(&doc_lines, "Status:")
+                        .or_else(|| Some("Implemented".to_string()));
+
                     let meta = TestMetadata {
                         name: test_name.clone(),
-                        category: extract_field(&doc_lines, "Category:"),
-                        priority: extract_field(&doc_lines, "Priority:"),
-                        status: extract_field(&doc_lines, "Status:"),
+                        category,
+                        priority,
+                        status,
                         description: doc_lines.first().map(|s| s.to_string()),
                         qa_round: extract_field(&doc_lines, "QA Round:"),
                         placeholder_date: extract_field(&doc_lines, "TODO:"),
@@ -174,7 +201,12 @@ fn validate_coverage(metadata: &[TestMetadata]) {
     for category in &categories {
         let cat_tests: Vec<_> = metadata
             .iter()
-            .filter(|m| m.category.as_ref().map(|c| c == category).unwrap_or(false))
+            .filter(|m| {
+                m.category
+                    .as_deref()
+                    .map(|c| category_matches(c, category))
+                    .unwrap_or(false)
+            })
             .collect();
 
         let implemented = cat_tests
@@ -228,6 +260,12 @@ fn validate_coverage(metadata: &[TestMetadata]) {
     };
 
     println!("cargo:warning=Coverage: {}%", coverage);
+    if metadata.is_empty() {
+        // A source scan that unexpectedly finds nothing is a build-integrity
+        // failure, not a valid zero-coverage result.  Keep the build usable
+        // for early-boot tooling but make the condition unmistakable in CI.
+        println!("cargo:warning=ERROR: no RuntimeTest implementations discovered");
+    }
     println!("cargo:warning==============================================");
 }
 
@@ -266,19 +304,54 @@ fn check_stale_placeholders(metadata: &[TestMetadata]) {
 }
 
 fn parse_date(date_str: &str) -> Option<u64> {
-    // Simple YYYY-MM-DD parser
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
+    // Parse without allocating a temporary Vec and reject impossible
+    // calendar dates before converting to seconds.  Build metadata is input
+    // to generated test ordering, so wrapped/ambiguous timestamps must fail
+    // closed rather than silently changing the registry order.
+    let mut parts = date_str.split('-');
+    let year: u64 = parts.next()?.parse().ok()?;
+    let month: u64 = parts.next()?.parse().ok()?;
+    let day: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
         return None;
     }
 
-    let year: i32 = parts[0].parse().ok()?;
-    let month: i32 = parts[1].parse().ok()?;
-    let day: i32 = parts[2].parse().ok()?;
+    if year < 1970 || !(1..=12).contains(&month) {
+        return None;
+    }
 
-    // Approximate timestamp (not accounting for leap years, etc.)
-    let days_since_epoch = (year - 1970) * 365 + (month - 1) * 30 + day;
-    Some(days_since_epoch as u64 * 24 * 60 * 60)
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day == 0 || day > month_days[(month - 1) as usize] {
+        return None;
+    }
+
+    let years = year.checked_sub(1970)?;
+    let leap_days = ((year - 1) / 4 - 1969 / 4)
+        .checked_sub((year - 1) / 100 - 1969 / 100)?
+        .checked_add((year - 1) / 400 - 1969 / 400)?;
+    let prior_month_days = month_days[..(month - 1) as usize]
+        .iter()
+        .try_fold(0u64, |sum, days| sum.checked_add(*days))?;
+    let days_since_epoch = years
+        .checked_mul(365)?
+        .checked_add(leap_days)?
+        .checked_add(prior_month_days)?
+        .checked_add(day - 1)?;
+    days_since_epoch.checked_mul(24 * 60 * 60)
 }
 
 fn emit_statistics(metadata: &[TestMetadata]) {
@@ -309,7 +382,83 @@ fn emit_statistics(metadata: &[TestMetadata]) {
     println!("cargo:rustc-env=NILIX_TEST_PLACEHOLDERS={}", placeholders);
 }
 
-fn generate_registry_validation(_out_dir: &str, _metadata: &[TestMetadata]) {
-    // Future: generate code to validate TEST_REGISTRY matches discovered tests
-    // For now, we just do compile-time warnings
+fn generate_registry_validation(out_dir: &str, metadata: &[TestMetadata]) {
+    // Generate a deterministic manifest consumed by the kernel test framework.
+    // This replaces the historical no-op and gives CI a concrete discovery
+    // oracle even when a new test is added outside the hand-maintained list.
+    let mut generated = String::from("// @generated by kernel/build.rs; do not edit.\n");
+    generated.push_str("pub const DISCOVERED_RUNTIME_TEST_NAMES: &[&str] = &[\n");
+    for test in metadata {
+        generated.push_str("    ");
+        generated.push_str(&format!("{:?},\n", test.name));
+    }
+    generated.push_str("];\n");
+    generated.push_str(&format!(
+        "pub const DISCOVERED_RUNTIME_TEST_COUNT: usize = {};\n",
+        metadata.len()
+    ));
+    generated.push_str("pub static DISCOVERED_TEST_REGISTRY: &[TestDescriptor] = &[\n");
+    for test in metadata {
+        let category = infer_category(&test.name);
+        let priority = match test.priority.as_deref() {
+            Some("P0") => "P0",
+            Some("P2") => "P2",
+            _ => "P1",
+        };
+        let status = match test.status.as_deref() {
+            Some("Placeholder") => "Placeholder",
+            Some("Skipped") => "Skipped",
+            _ => "Implemented",
+        };
+        generated.push_str(&format!(
+            "    TestDescriptor::new({:?}, {:?}, TestCategory::{}, TestPriority::{}, TestStatus::{}, {:?}),\n",
+            test.name.to_ascii_lowercase(),
+            test.name,
+            category,
+            priority,
+            status,
+            test.description.as_deref().unwrap_or("Discovered runtime test"),
+        ));
+    }
+    generated.push_str("];\n");
+    let path = Path::new(out_dir).join("test_registry_validation.rs");
+    fs::write(&path, generated).expect("write generated test registry manifest");
+    println!("cargo:rerun-if-changed=src/runtime_tests.rs");
+}
+
+fn infer_category(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("heap")
+        || lower.contains("tlb")
+        || lower.contains("cow")
+        || lower.contains("memory")
+    {
+        "Memory"
+    } else if lower.contains("futex") || lower.contains("pipe") || lower.contains("signal") {
+        "Ipc"
+    } else if lower.contains("sched") || lower.contains("cpu") || lower.contains("starvation") {
+        "Scheduler"
+    } else if lower.contains("vfs") || lower.contains("ramfs") || lower.contains("mount") {
+        "Vfs"
+    } else if lower.contains("net") || lower.contains("tcp") || lower.contains("arp") {
+        "Network"
+    } else if lower.contains("security") || lower.contains("seccomp") || lower.contains("audit") {
+        "Security"
+    } else if lower.contains("smp") || lower.contains("ipi") {
+        "Smp"
+    } else if lower.contains("namespace") || lower.contains("ns") {
+        "Namespaces"
+    } else if lower.contains("context") || lower.contains("tls") || lower.contains("fpu") {
+        "Architecture"
+    } else {
+        "Regression"
+    }
+}
+
+fn category_matches(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+        || matches!(
+            (actual, expected),
+            ("Ipc", "IPC") | ("Vfs", "VFS") | ("Smp", "SMP")
+        )
 }

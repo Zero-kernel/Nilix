@@ -27,6 +27,11 @@ fuzz_runner = ["mm/fuzz_runner", "kcov"]
 syz_executor = ["mm/syz_executor", "kcov"]
 # Enable kernel code coverage instrumentation for fuzzing
 kcov = ["coverage/kcov", "kernel_core/kcov"]
+# Hosted unit-test harness for the top-level kernel package.  This is a
+# test-only dependency mode: it routes MM and CPU-local state through their
+# host-safe implementations while bare-metal builds retain the production
+# allocator and topology paths.
+host_harness = ["mm/host_harness", "kernel_core/host_harness"]
 
 [dependencies]
 spin = "0.12"

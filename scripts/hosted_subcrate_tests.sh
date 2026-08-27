@@ -9,6 +9,16 @@
 
 set -euo pipefail
 
+# The devbox's non-interactive SSH environment does not load rustup's Cargo
+# export.  Keep this gate self-contained so `make test-hosted-subcrates` is
+# reproducible without an out-of-band wrapper; the branch is inert on the
+# Windows mirror and other hosts that do not have the rustup env file.
+if [[ -f /home/dev/.cargo/env ]]; then
+    # shellcheck disable=SC1091
+    . /home/dev/.cargo/env
+fi
+export PATH="/home/dev/.cargo/bin:/home/dev/.local/bin:${PATH:-}"
+
 if [[ -n "${RUST_TEST_THREADS:-}" ]]; then
     echo "ERROR: RUST_TEST_THREADS is set; hosted CI must exercise Rust's default-parallel scheduler." >&2
     exit 2
@@ -69,12 +79,49 @@ run_check() {
     echo "OK: ${name} hosted test code compiled."
 }
 
+run_standalone_rust_suite() {
+    local name="$1"
+    local expected_passed="$2"
+    local expected_filtered="$3"
+    local source_dir="$4"
+    local source_file="$5"
+
+    local log_file="${log_root}/${name}.log"
+    local suite_target="${target_root}/${name}"
+    local test_binary="${suite_target}/${name}"
+
+    mkdir -p "${suite_target}"
+    echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
+    if ! (
+        cd "${repo_root}/${source_dir}"
+        NILIX_TEST_TOTAL=73 rustc +nightly-2025-12-08 \
+            --edition=2021 --test "${source_file}" -o "${test_binary}"
+        "${test_binary}"
+    ) 2>&1 | tee "${log_file}"; then
+        echo "ERROR: hosted standalone Rust suite '${name}' failed." >&2
+        return 1
+    fi
+
+    local -a summaries=()
+    mapfile -t summaries < <(grep -E '^test result: ' "${log_file}" || true)
+    local expected_prefix="test result: ok. ${expected_passed} passed; 0 failed; 0 ignored; 0 measured; ${expected_filtered} filtered out; finished in "
+    if [[ ${#summaries[@]} -ne 1 || "${summaries[0]:-}" != "${expected_prefix}"?* ]]; then
+        echo "ERROR: hosted standalone Rust suite '${name}' produced an unexpected summary." >&2
+        echo "Expected exactly one summary with prefix: ${expected_prefix}" >&2
+        printf 'Observed summaries (%s):\n' "${#summaries[@]}" >&2
+        printf '  %s\n' "${summaries[@]:-<missing>}" >&2
+        return 1
+    fi
+
+    echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
+}
+
 run_suite audit 15 0 \
     --manifest-path kernel/audit/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
-run_suite mm 24 0 \
+run_suite mm 25 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -102,11 +149,38 @@ run_suite cap-rf186 2 9 \
     --features mm/host_harness \
     --lib --locked -- rf186_23_
 
-run_suite net 110 0 \
+run_suite net 116 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
     --lib --locked
+
+run_suite ipc-robust 4 17 \
+    --manifest-path kernel/ipc/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness \
+    --lib --locked -- robust_
+
+run_suite vfs 22 0 \
+    --manifest-path kernel/vfs/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness \
+    --lib --locked
+
+run_suite kernel-core 29 0 \
+    --manifest-path kernel/kernel_core/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features host_harness \
+    --lib --locked
+
+# Source-discovery/placeholder polarity oracle.  This is intentionally a
+# separate integration target: it validates the same 73 RuntimeTest
+# implementations reported by kernel/build.rs and fails closed on stale P0/P1
+# placeholders or scanner drift.
+# This scanner is pure std source analysis and does not import the kernel.
+# Compile it directly so Cargo never tries to link the no_std kernel binary's
+# panic/allocation handlers into a hosted std test process.
+run_standalone_rust_suite kernel-coverage 3 0 kernel tests/test_coverage.rs
 
 run_check ipc-tests \
     --manifest-path kernel/ipc/Cargo.toml \
@@ -117,13 +191,13 @@ run_check ipc-tests \
 run_check kernel-core-tests \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
-    --features mm/host_harness \
+    --features host_harness \
     --tests --locked
 
 run_check kernel-tests \
     --manifest-path kernel/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
-    --features mm/host_harness \
+    --features host_harness \
     --tests --locked
 
-echo "OK: hosted kernel sub-crate CI gate passed (174 tests; 3 test-code compile checks; default parallelism)."
+echo "OK: hosted kernel sub-crate CI gate passed (239 tests; 3 test-code compile checks; default parallelism)."

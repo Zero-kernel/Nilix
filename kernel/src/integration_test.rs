@@ -110,6 +110,12 @@ pub fn test_syscalls() {
     // RF178-34: shared syscall/IRQ VMA locator boundary and fail-closed cases.
     kernel_core::syscall::run_sigframe_stack_locator_self_test();
     kernel_core::signal::run_signal_self_test();
+    // R188-U09-1/U09-2: IRQ-return signal delivery must use the shared
+    // RFLAGS sanitizer and keep the PCB lock out of faultable usercopy.
+    kernel_core::syscall::run_irq_signal_delivery_self_test();
+    klog_always!(
+        "    ✓ R188 IRQ signal delivery: shared RFLAGS sanitizer + fail-closed redirect guard + sender identity"
+    );
     klog_always!("    ✓ M0 #5 signals (1a): rt_sigframe layout/SROP/MXCSR/round-trip + mask RMW + disposition resolver");
     // M0 #5 (1b-2): SAME-return handler delivery for a blocked-and-resumed syscall —
     // the frame-binding validity predicate + the arch get/set-binding callback wiring
@@ -130,8 +136,12 @@ pub fn test_syscalls() {
     // P2-B: under-lock recheck-before-publish closes the R172 futex compare/
     // enqueue lost-wake class (RF178-8 try_prepare_with_timeout_after).
     ipc::run_futex_lost_wake_prepare_self_test();
+    ipc::run_robust_futex_self_test();
     ipc::run_blocking_sync_failure_self_test();
     klog_always!("    [PASS] RF180-42 blocking sync ENOMEM propagation + mutex invariant");
+    klog_always!(
+        "    [PASS] R188-U34 robust futex: owner-death ABI transition + checked offsets + bounded PID/cycle walk"
+    );
     klog_always!(
         "    ✓ P2-B futex lost-wake: prepare recheck-before-publish (fail→empty, pass→Arm+cancel)"
     );
@@ -263,7 +273,7 @@ fn run_pipe_cap_id_self_test() {
 
     // (3) clone_box carries the SAME CapId; dropping the clone only balances
     // the pipe end count (readers 2→1), never cap state.
-    let cloned = desc.clone_box();
+    let cloned = desc.clone_box().expect("descriptor clone self-test");
     assert!(
         cloned.cap_id() == Some(cid),
         "U.S2-SLICE-3: a dup/fork/transient copy must reference the SAME \
@@ -486,7 +496,7 @@ pub fn test_ext2_write() {
                                     .expect("create probe FileHandle");
                                 assert_eq!(probe.write(b"X"), Ok(1), "create probe write");
                                 let probe_ino = probe.inode.stat().expect("stat create probe").ino;
-                                drop(probe);
+                                let _ = probe;
                                 drop(probe_ops);
                                 let rd = vfs::open(
                                     "/mnt/test/.syz-create-probe.bin",

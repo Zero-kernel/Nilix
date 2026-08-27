@@ -108,6 +108,9 @@ pub trait RuntimeTest {
 /// Test heap allocation works correctly
 struct HeapAllocationTest;
 
+/// Category: Memory
+/// Priority: P0
+/// Status: Implemented
 impl RuntimeTest for HeapAllocationTest {
     fn name(&self) -> &'static str {
         "heap_allocation"
@@ -154,6 +157,9 @@ impl RuntimeTest for HeapAllocationTest {
 /// Test buddy allocator physical page allocation
 struct BuddyAllocatorTest;
 
+/// Category: Memory
+/// Priority: P0
+/// Status: Implemented
 impl RuntimeTest for BuddyAllocatorTest {
     fn name(&self) -> &'static str {
         "buddy_allocator"
@@ -1158,18 +1164,13 @@ impl NetworkLoopbackTest {
         let remote_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
         let remote_ip = Ipv4Addr([10, 0, 0, 2]);
 
-        // Build a valid TCP SYN packet
-        #[rustfmt::skip]
-        let tcp_header: [u8; 20] = [
-            0x30, 0x39,  // src port: 12345
-            0x00, 0x50,  // dst port: 80
-            0x00, 0x00, 0x00, 0x01,  // seq: 1
-            0x00, 0x00, 0x00, 0x00,  // ack: 0
-            0x50, TCP_FLAG_SYN,      // data offset: 5, flags: SYN only
-            0x20, 0x00,  // window: 8192
-            0x00, 0x00,  // checksum (placeholder)
-            0x00, 0x00,  // urgent ptr: 0
-        ];
+        // Build a protocol-valid SYN, including the pseudo-header checksum.
+        // A hand-written header with a zero checksum made this oracle accept
+        // malformed input and failed once the parser's checksum gate became
+        // strict.
+        let tcp_header =
+            net::try_build_tcp_segment(remote_ip, our_ip, 12345, 80, 1, 0, TCP_FLAG_SYN, 8192, &[])
+                .map_err(|e| alloc::format!("TCP SYN build failed: {:?}", e))?;
 
         // Build IPv4 header
         let ip_header = net::build_ipv4_header(
@@ -1199,11 +1200,46 @@ impl NetworkLoopbackTest {
         let result =
             net::process_frame(&frame, our_mac, our_ip, &stats, NamespaceId::new(0), now_ms);
 
-        // Valid SYN should be processed (either handled, replied with RST, or dropped if no listener)
+        // A valid SYN may be accepted by a listener, rejected with a TCP
+        // control response, or denied by the default firewall.  Each outcome
+        // must still satisfy the protocol contract; accepting every enum
+        // variant without inspecting it made this oracle vacuous.
         match result {
-            ProcessResult::Handled => Ok(()),
-            ProcessResult::Reply(_) => Ok(()), // RST reply is acceptable
-            ProcessResult::Dropped(_) => Ok(()), // May be dropped if no matching socket
+            ProcessResult::Handled => {
+                if stats.rx_packets.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+                    return Err(String::from("handled SYN did not reach TCP accounting"));
+                }
+                Ok(())
+            }
+            ProcessResult::Reply(reply) => {
+                if reply.len() < 14 + 20 + 20 {
+                    return Err(String::from("SYN response is shorter than Ethernet+TCP"));
+                }
+                let (response_ip, _, _) = net::parse_ipv4(&reply[14..])
+                    .map_err(|e| alloc::format!("invalid SYN response IPv4 header: {:?}", e))?;
+                if response_ip.protocol != net::Ipv4Proto::Tcp.to_raw()
+                    || response_ip.src != our_ip
+                    || response_ip.dst != remote_ip
+                {
+                    return Err(String::from("SYN response has incorrect TCP endpoints"));
+                }
+                let tcp_offset = 14 + response_ip.header_len();
+                let response_tcp = net::parse_tcp_header(&reply[tcp_offset..])
+                    .map_err(|e| alloc::format!("invalid SYN response TCP header: {:?}", e))?;
+                if response_tcp.flags & (net::TCP_FLAG_RST | net::TCP_FLAG_SYN) == 0 {
+                    return Err(String::from("SYN response lacks RST/SYN control flag"));
+                }
+                Ok(())
+            }
+            ProcessResult::Dropped(reason) => match reason {
+                net::stack::DropReason::Firewall { .. }
+                | net::stack::DropReason::ConntrackExhausted
+                | net::stack::DropReason::ConntrackInvalid => Ok(()),
+                other => Err(alloc::format!(
+                    "valid SYN dropped for protocol error: {:?}",
+                    other
+                )),
+            },
         }
     }
 
@@ -2035,10 +2071,15 @@ impl RuntimeTest for Rf17833SchedulerSmpGateTest {
 // Test Runner
 // ============================================================================
 
-/// Run all runtime tests and return a report
-pub fn run_all_runtime_tests() -> TestReport {
-    // Build test list dynamically to include P0 regression tests
-    let mut all_tests: Vec<&dyn RuntimeTest> = alloc::vec![
+/// Return the single authoritative runtime-test registry.
+///
+/// Both the boot runner and the interactive `test <name>` shell command must
+/// resolve names from the same list.  Keeping this construction in one helper
+/// prevents a selective invocation from silently drifting behind the full
+/// boot suite while still preserving the useful property that `run_test`
+/// executes only the requested test.
+fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
+    let mut all_tests: Vec<&'static dyn RuntimeTest> = alloc::vec![
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &VmaHeapAdmissionTest,
@@ -2095,13 +2136,22 @@ pub fn run_all_runtime_tests() -> TestReport {
         &NetNsPendingFrameTest,
     ];
 
-    // Add 25 P0 regression tests (R172-R174 findings)
+    // Add P0 regression and extended stress tests to the same list used by
+    // `run_all_runtime_tests`; a registry mismatch is a release-build failure
+    // rather than a silently incomplete security suite.
     all_tests.extend(regression_tests_p0::get_all_p0_regression_tests());
-
-    // Add heavy contention & extended runtime stress tests (R175 validation objectives 2 & 3)
     all_tests.extend(heavy_stress::get_all_heavy_stress_tests());
+    assert_eq!(
+        all_tests.len(),
+        crate::test_framework::DISCOVERED_RUNTIME_TEST_COUNT,
+        "runtime test registry drift: discovered source implementations do not all execute"
+    );
+    all_tests
+}
 
-    let tests: Vec<&dyn RuntimeTest> = all_tests;
+/// Run all runtime tests and return a report
+pub fn run_all_runtime_tests() -> TestReport {
+    let tests = runtime_test_registry();
 
     let mut outcomes = Vec::with_capacity(tests.len());
     let mut passed = 0usize;
@@ -2170,67 +2220,17 @@ pub fn run_all_runtime_tests() -> TestReport {
 
 /// Run a single test by name
 pub fn run_test(name: &str) -> Option<TestOutcome> {
-    // Build complete test list including P0 regression tests
-    let mut all_tests: Vec<&dyn RuntimeTest> = alloc::vec![
-        &HeapAllocationTest,
-        &BuddyAllocatorTest,
-        &CapTableLifecycleTest,
-        &StrictSeccompFilterTest,
-        &PledgeSeccompFilterTest,
-        &AuditHashChainTest,
-        &NetworkParsingTest,
-        &NetworkLoopbackTest,
-        &SmpOnlineTest,
-        &IpiPingPongTest,
-        &TlbShootdownCoherencyTest,
-        &CpusetIsolationTest,
-        &SchedulerAffinityTest,
-        &SchedulerStarvationTest,
-        &ProcessCreationTest,
-        &SecuritySubsystemTest,
-        // R74 Security Fix Tests
-        &BuddyPartialFreeTest,
-        &TcpSynFloodLimitTest,
-        &MountNamespaceMaterializeTest,
-        &MultithreadedUnshareTest,
-        &TlbShootdownPcidTest,
-        // F.1 Mount Namespace Tests
-        &MountNamespaceIsolationTest,
-        // F.1 IPC Namespace Tests
-        &IpcNamespaceIsolationTest,
-        // F.1 Network Namespace Tests
-        &NetNamespaceIsolationTest,
-        // D1-ISO TX device-ownership gate (both sinks, A/B/A, stale-ns)
-        &NetNsTxIsolationTest,
-        // D3-NETNS-DATAPLANE per-namespace ARP cache (isolation + fail-closed RX)
-        &NetNsArpIsolationTest,
-        // D3-NETNS-DATAPLANE ARP rate-limiter + NetnsConfig admission exhaustion
-        &NetNsArpExhaustionTest,
-        &NetNsArpSubbudgetTest,
-        &NetNsArpTxLimiterTest,
-        &NetNsArpLruEvictionTest,
-        &NetNsConfigIsolationTest,
-        &NetNsRoutingTest,
-        // D3-NETNS-DATAPLANE RX ingress loop (rx_auth capability + bounded drain)
-        &NetNsRxIngressTest,
-        &NetNsRxPoolLifecycleTest,
-        &NetNsRxEth0SlirpTest,
-        &NetNsArpProbeTxTest,
-    ];
-
-    // Add 25 P0 regression tests
-    all_tests.extend(regression_tests_p0::get_all_p0_regression_tests());
-
-    for test in all_tests {
-        if test.name() == name {
-            return Some(TestOutcome {
-                name: test.name(),
-                result: test.run(),
-            });
-        }
-    }
-
-    None
+    // U59-2 FIX: resolve through the same authoritative registry as the boot
+    // runner, but execute only the requested test.  Running the whole suite
+    // for an interactive lookup can mutate global test fixtures and turn a
+    // harmless diagnostic command into a second boot-style workload.
+    runtime_test_registry()
+        .into_iter()
+        .find(|test| test.name() == name)
+        .map(|test| TestOutcome {
+            name: test.name(),
+            result: test.run(),
+        })
 }
 
 // ============================================================================
@@ -4858,30 +4858,64 @@ impl RuntimeTest for NetNsConfigIsolationTest {
             }
         }
 
-        // Leg 7: TX-path identity proof — needs eth0 for the ownership gate.
-        if net::device_index("eth0").is_none() {
-            return TestResult::Warning(String::from(
-                "legs 1-6 passed; TX-path identity legs skipped — eth0 absent (make test \
+        // Leg 7: TX-path identity proof.  The production TX path deliberately
+        // mints the device-ownership capability BEFORE evaluating the egress
+        // firewall (U13-1), so this leg must grant the child eth0 first.  A
+        // child with no device would be denied at the ownership gate and the
+        // firewall would correctly remain untouched; that is the subject of
+        // netns_tx_isolation, not this source-identity oracle.
+        let eth0_idx = match net::device_index("eth0") {
+            Some(idx) => match u32::try_from(idx) {
+                Ok(idx) => idx,
+                Err(_) => {
+                    return TestResult::Fail(String::from(
+                        "leg 7: eth0 registry index exceeds the ownership key width",
+                    ));
+                }
+            },
+            None => {
+                return TestResult::Warning(String::from(
+                    "legs 1-6 passed; TX-path identity legs skipped — eth0 absent (make test \
                  provides QEMU virtio-net)",
+                ));
+            }
+        };
+        if let Err(e) = child.add_device(eth0_idx) {
+            return TestResult::Fail(alloc::format!(
+                "leg 7: child must own eth0 before the firewall identity probe: {:?}",
+                e
             ));
         }
+        // Rebuild the datagram after leg 5's reconfiguration.  The wire
+        // checksum and source identity must describe the same snapshot that
+        // the firewall and IPv4 encapsulation will authorize.
+        let configured_datagram =
+            match net::build_udp_datagram(re.our_ip, dst, 49_500, 47_600, b"D3-CFG") {
+                Ok(d) => d,
+                Err(e) => {
+                    return TestResult::Fail(alloc::format!(
+                        "leg 7: configured UDP build failed: {:?}",
+                        e
+                    ));
+                }
+            };
         // Positive: a child-table rule keyed on the CHILD's configured
         // source IP must fire. Action Accept (table default stays Drop):
-        // acceptance proves the match AND lets the send proceed to the
-        // ownership gate, so it still errors FirewallDenied (the child owns
-        // no device) — the same attribution trick as netns_tx_isolation.
+        // acceptance proves the match and lets the send reach the owned
+        // device.  The queue result is asserted below; a pre-policy
+        // FirewallDenied would leave the counters unchanged and fail closed.
         let fw2 = fw.stats();
         net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9102)
             .priority(i32::MAX)
             .src_ip(IpCidrMatch::host(re.our_ip))
             .action(FirewallAction::Accept)
             .build()]);
-        match net::transmit_udp_datagram(dst, &datagram, cid) {
-            Err(TxError::FirewallDenied) => {}
+        match net::transmit_udp_datagram(dst, &configured_datagram, cid) {
+            Ok(()) => {}
             other => {
                 return TestResult::Fail(alloc::format!(
-                    "leg 7: configured child TX must pass the src-keyed accept rule and be \
-                     denied at the ownership gate, got {:?}",
+                    "leg 7: configured child TX must pass the src-keyed accept rule and \
+                     reach the owned device, got {:?}",
                     other
                 ));
             }
@@ -4928,7 +4962,7 @@ impl RuntimeTest for NetNsConfigIsolationTest {
             .src_ip(IpCidrMatch::host(global.our_ip))
             .action(FirewallAction::Accept)
             .build()]);
-        match net::transmit_udp_datagram(dst, &datagram, cid) {
+        match net::transmit_udp_datagram(dst, &configured_datagram, cid) {
             Err(TxError::FirewallDenied) => {}
             other => {
                 return TestResult::Fail(alloc::format!(

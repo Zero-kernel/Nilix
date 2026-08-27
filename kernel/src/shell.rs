@@ -448,8 +448,10 @@ impl Shell {
     }
 
     fn cmd_uptime(&self) {
-        let ticks = kernel_core::time::read_tsc();
-        let seconds = ticks / 1_000_000; // Approximate (TSC frequency dependent)
+        // U53-4 FIX: TSC frequency is hardware/VM dependent.  The timer
+        // subsystem's tick counter is calibrated by the interrupt source and
+        // is defined in milliseconds, so it is the stable uptime clock.
+        let seconds = kernel_core::time::get_ticks() / 1000;
         let hours = seconds / 3600;
         let minutes = (seconds % 3600) / 60;
         let secs = seconds % 60;

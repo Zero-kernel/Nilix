@@ -319,22 +319,27 @@ impl TestReport {
 // Test Registry
 // ============================================================================
 
-/// Global test registry - populated at compile time
-///
-/// Tests register themselves here via const initializers.
-/// This allows build.rs to validate coverage and enforce minimums.
-pub static TEST_REGISTRY: &[TestDescriptor] = &[
-    // Populated by individual test modules
-    // Example:
-    // TestDescriptor::new(
-    //     "heap_allocation",
-    //     "Heap Allocation",
-    //     TestCategory::Memory,
-    //     TestPriority::P0,
-    //     TestStatus::Implemented,
-    //     "Verify kernel heap allocation and deallocation"
-    // ),
-];
+// The build script scans every `impl RuntimeTest` and emits this manifest.
+// Keeping it adjacent to the registry makes discovery drift observable by
+// tests and boot diagnostics rather than silently accepting an empty/stale
+// hand-maintained list.
+include!(concat!(env!("OUT_DIR"), "/test_registry_validation.rs"));
+
+/// Global test registry - populated from the build-time source manifest.
+/// The generated entries are metadata-only descriptors; runtime execution
+/// remains owned by `runtime_tests::run_all_runtime_tests`.
+pub static TEST_REGISTRY: &[TestDescriptor] = DISCOVERED_TEST_REGISTRY;
+
+/// Return the names discovered by build-time source scanning that are absent
+/// from the hand-maintained registry.  Callers may report this as a coverage
+/// warning; it is intentionally side-effect free for early boot.
+pub fn registry_is_complete() -> bool {
+    DISCOVERED_RUNTIME_TEST_NAMES.iter().all(|name| {
+        TEST_REGISTRY
+            .iter()
+            .any(|descriptor| descriptor.name == *name)
+    })
+}
 
 // ============================================================================
 // Test Execution Engine

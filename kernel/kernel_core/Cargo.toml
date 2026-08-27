@@ -27,6 +27,9 @@ path = "lib.rs"
 conntrack = ["net/conntrack"]
 sched_debug = []
 kcov = ["coverage"]
+# Hosted unit-test harness: disable the bare-metal MM allocator and use the
+# CPU-local hosted fallbacks so dependency tests can allocate normally.
+host_harness = ["mm/host_harness", "cpu_local/host_harness"]
 
 [dependencies]
 spin = "0.9"
