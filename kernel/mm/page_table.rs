@@ -1057,7 +1057,12 @@ pub unsafe fn recursive_pml4() -> &'static mut PageTable {
 /// 调用者必须确保该 PML4 条目存在且指向有效的 PDPT
 #[inline]
 pub unsafe fn recursive_pdpt(pml4_idx: usize) -> &'static mut PageTable {
-    let addr = RECURSIVE_PDPT_BASE + (pml4_idx as u64) * 0x1000;
+    if pml4_idx >= 512 {
+        panic!("recursive_pdpt index outside page-table bounds");
+    }
+    let addr = RECURSIVE_PDPT_BASE
+        .checked_add((pml4_idx as u64) * 0x1000)
+        .expect("recursive_pdpt address overflow");
     &mut *(addr as *mut PageTable)
 }
 
@@ -1068,7 +1073,13 @@ pub unsafe fn recursive_pdpt(pml4_idx: usize) -> &'static mut PageTable {
 /// 调用者必须确保对应的页表条目存在且有效
 #[inline]
 pub unsafe fn recursive_pd(pml4_idx: usize, pdpt_idx: usize) -> &'static mut PageTable {
-    let addr = RECURSIVE_PD_BASE + (pml4_idx as u64) * 0x20_0000 + (pdpt_idx as u64) * 0x1000;
+    if pml4_idx >= 512 || pdpt_idx >= 512 {
+        panic!("recursive_pd index outside page-table bounds");
+    }
+    let addr = RECURSIVE_PD_BASE
+        .checked_add((pml4_idx as u64) * 0x20_0000)
+        .and_then(|addr| addr.checked_add((pdpt_idx as u64) * 0x1000))
+        .expect("recursive_pd address overflow");
     &mut *(addr as *mut PageTable)
 }
 
@@ -1083,10 +1094,14 @@ pub unsafe fn recursive_pt(
     pdpt_idx: usize,
     pd_idx: usize,
 ) -> &'static mut PageTable {
+    if pml4_idx >= 512 || pdpt_idx >= 512 || pd_idx >= 512 {
+        panic!("recursive_pt index outside page-table bounds");
+    }
     let addr = RECURSIVE_PT_BASE
-        + (pml4_idx as u64) * 0x4000_0000
-        + (pdpt_idx as u64) * 0x20_0000
-        + (pd_idx as u64) * 0x1000;
+        .checked_add((pml4_idx as u64) * 0x4000_0000)
+        .and_then(|addr| addr.checked_add((pdpt_idx as u64) * 0x20_0000))
+        .and_then(|addr| addr.checked_add((pd_idx as u64) * 0x1000))
+        .expect("recursive_pt address overflow");
     &mut *(addr as *mut PageTable)
 }
 

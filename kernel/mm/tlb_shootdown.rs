@@ -917,12 +917,30 @@ fn normalize_range(start: VirtAddr, len: usize) -> RangeOp {
 
 /// Flush a range of pages locally
 fn flush_range_local(start: u64, len: u64) {
-    debug_assert!(len.is_multiple_of(PAGE_SIZE));
-    let mut offset = 0;
-    while offset < len {
-        let addr = VirtAddr::new(start + offset);
+    if len == 0 {
+        return;
+    }
+    // R188-U26-3 FIX: normalize at the callee boundary.  Release callers may
+    // provide an unaligned start/length; a debug-only assertion previously
+    // caused the final partial page to be skipped in production.
+    let aligned_start = start & !(PAGE_SIZE - 1);
+    let Some(end) = start.checked_add(len) else {
+        flush_all_local();
+        return;
+    };
+    let Some(aligned_end) = end.checked_add(PAGE_SIZE - 1) else {
+        flush_all_local();
+        return;
+    };
+    let aligned_end = aligned_end & !(PAGE_SIZE - 1);
+    let mut addr_raw = aligned_start;
+    while addr_raw < aligned_end {
+        let addr = VirtAddr::new(addr_raw);
         tlb::flush(addr);
-        offset += PAGE_SIZE;
+        addr_raw = match addr_raw.checked_add(PAGE_SIZE) {
+            Some(next) => next,
+            None => break,
+        };
     }
 }
 

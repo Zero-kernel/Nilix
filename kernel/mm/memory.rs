@@ -86,6 +86,59 @@ pub struct BootInfo {
     pub kaslr_flags: u64,
 }
 
+/// Validate that a firmware-provided framebuffer range is wholly contained in
+/// one descriptor of the handoff memory map.  GOP may place the framebuffer in
+/// conventional memory or an MMIO descriptor; accepting only those two types
+/// prevents an arbitrary physical pointer from being treated as writable
+/// video memory.  The check is allocation-free and fail-closed on malformed
+/// descriptor strides/ranges.
+pub fn validate_framebuffer_region(
+    framebuffer: &FramebufferInfo,
+    map_info: &MemoryMapInfo,
+) -> bool {
+    if framebuffer.base == 0
+        || framebuffer.size == 0
+        || framebuffer.base % 0x1000 != 0
+        || validate_memory_map(map_info).is_none()
+    {
+        return false;
+    }
+    let fb_end = match framebuffer
+        .base
+        .checked_add(u64::try_from(framebuffer.size).ok().unwrap_or(0))
+    {
+        Some(end) if end > framebuffer.base => end,
+        _ => return false,
+    };
+    let count = map_info.size / map_info.descriptor_size;
+    for index in 0..count {
+        let offset = match index.checked_mul(map_info.descriptor_size) {
+            Some(offset) => offset,
+            None => return false,
+        };
+        let ptr = match map_info.buffer.checked_add(offset as u64) {
+            Some(ptr) => ptr as *const EfiMemoryDescriptor,
+            None => return false,
+        };
+        // SAFETY: validate_memory_map proved the fixed descriptor prefix fits
+        // inside the bounded firmware buffer and the caller has not modified
+        // the handoff map since boot.
+        let descriptor = unsafe { core::ptr::read_unaligned(ptr) };
+        let region_end = match descriptor
+            .phys_start
+            .checked_add(descriptor.page_count.checked_mul(0x1000).unwrap_or(0))
+        {
+            Some(end) if end > descriptor.phys_start => end,
+            _ => continue,
+        };
+        let type_allowed = matches!(descriptor.typ, EFI_CONVENTIONAL_MEMORY | 11 | 12);
+        if type_allowed && framebuffer.base >= descriptor.phys_start && fb_end <= region_end {
+            return true;
+        }
+    }
+    false
+}
+
 impl BootInfo {
     /// True only when a matching bootloader attests that the complete exact-
     /// address candidate order was uniformly randomized. A non-zero slide by
@@ -105,6 +158,44 @@ struct EfiMemoryDescriptor {
     pub virt_start: u64,
     pub page_count: u64,
     pub attribute: u64,
+}
+
+/// Validate the common UEFI memory-map ABI before any descriptor is
+/// dereferenced.  Firmware controls all four fields, so every parser must
+/// enforce the same minimum size, alignment, version, and pointer-range
+/// contract.  Returning the bounded descriptor count keeps callers from
+/// re-implementing subtly different checks.
+#[inline]
+fn validate_memory_map(map_info: &MemoryMapInfo) -> Option<usize> {
+    let descriptor_len = core::mem::size_of::<EfiMemoryDescriptor>();
+    let descriptor_align = core::mem::align_of::<EfiMemoryDescriptor>();
+    if map_info.buffer == 0
+        || map_info.size == 0
+        || map_info.descriptor_version != 1
+        || map_info.descriptor_size < descriptor_len
+        || map_info.descriptor_size % descriptor_align != 0
+    {
+        return None;
+    }
+    let end = map_info
+        .buffer
+        .checked_add(u64::try_from(map_info.size).ok()?)?;
+    let count = map_info.size / map_info.descriptor_size;
+    if count == 0 {
+        return None;
+    }
+    // The final descriptor's fixed-size prefix must fit even when firmware
+    // advertises an extension-sized descriptor stride.
+    let last_offset = (count - 1).checked_mul(map_info.descriptor_size)?;
+    let last_addr = map_info
+        .buffer
+        .checked_add(u64::try_from(last_offset).ok()?)?;
+    let last_end = last_addr.checked_add(u64::try_from(descriptor_len).ok()?)?;
+    if last_end > end {
+        None
+    } else {
+        Some(count)
+    }
 }
 
 /// UEFI 内存类型常量
@@ -600,7 +691,7 @@ fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)>
     let map_info = &boot_info.memory_map;
 
     // Validate memory map is present
-    if map_info.buffer == 0 || map_info.size == 0 || map_info.descriptor_size == 0 {
+    if validate_memory_map(map_info).is_none() {
         return None;
     }
 
@@ -646,7 +737,12 @@ fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)>
 /// 3. It's fully contained within an EFI_CONVENTIONAL_MEMORY region (R167-A:
 ///    Boot-Services regions are no longer treated as usable)
 fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bool {
-    let phys_end = phys_base.saturating_add(len as u64);
+    let Some(desc_count) = validate_memory_map(map_info) else {
+        return false;
+    };
+    let Some(phys_end) = phys_base.checked_add(len as u64) else {
+        return false;
+    };
 
     // Must be within bootloader's direct-map range
     if phys_end > HIGH_HALF_MAP_LIMIT {
@@ -658,10 +754,13 @@ fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bo
         return false;
     }
 
-    let desc_count = map_info.size / map_info.descriptor_size;
-
     for i in 0..desc_count {
-        let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
+        let Some(offset) = i.checked_mul(map_info.descriptor_size) else {
+            return false;
+        };
+        let Some(addr) = map_info.buffer.checked_add(offset as u64) else {
+            return false;
+        };
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
         // R167-A: Only EFI_CONVENTIONAL_MEMORY is a safe home for the heap.
@@ -747,18 +846,15 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
     let map_info = &boot_info.memory_map;
 
     // 验证内存映射有效性
-    if map_info.buffer == 0 || map_info.descriptor_size == 0 || map_info.size == 0 {
-        return None;
-    }
-
-    let desc_count = map_info.size / map_info.descriptor_size;
+    let desc_count = validate_memory_map(map_info)?;
     let mut best: Option<(u64, u64)> = None;
     let mut total_conventional: u64 = 0;
 
     klog_always!("  Scanning UEFI memory map ({} descriptors)...", desc_count);
 
     for i in 0..desc_count {
-        let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
+        let offset = i.checked_mul(map_info.descriptor_size)?;
+        let addr = map_info.buffer.checked_add(offset as u64)?;
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
         // R167-A: 只接纳 EFI_CONVENTIONAL_MEMORY 作为 buddy 分配器内存。
@@ -1203,16 +1299,16 @@ fn add_non_conventional_uefi_reservations(
     builder: &mut ReservedRangeBuilder<'_>,
     map_info: &MemoryMapInfo,
 ) {
-    if map_info.buffer == 0
-        || map_info.size == 0
-        || map_info.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-    {
+    let Some(desc_count) = validate_memory_map(map_info) else {
         return;
-    }
-
-    let desc_count = map_info.size / map_info.descriptor_size;
+    };
     for i in 0..desc_count {
-        let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
+        let Some(offset) = i.checked_mul(map_info.descriptor_size) else {
+            return;
+        };
+        let Some(addr) = map_info.buffer.checked_add(offset as u64) else {
+            return;
+        };
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
         if desc.typ == EFI_CONVENTIONAL_MEMORY || desc.page_count == 0 {
@@ -1559,5 +1655,38 @@ mod tests {
         const BASE: u64 = 0x0300_0000;
         const SIZE: usize = 4 * 1024 * 1024;
         let _ = place_cow_refcount_metadata(BASE, SIZE, &[(BASE, SIZE as u64)]);
+    }
+
+    #[test]
+    fn r188_framebuffer_region_must_be_aligned_and_map_contained() {
+        const BASE: u64 = 0x0400_0000;
+        let descriptors = [descriptor(EFI_CONVENTIONAL_MEMORY, BASE, 16)];
+        let map = MemoryMapInfo {
+            buffer: descriptors.as_ptr() as u64,
+            size: core::mem::size_of_val(&descriptors),
+            descriptor_size: core::mem::size_of::<EfiMemoryDescriptor>(),
+            descriptor_version: 1,
+        };
+        let valid = FramebufferInfo {
+            base: BASE + 0x1000,
+            size: 0x2000,
+            width: 1,
+            height: 1,
+            stride: 4,
+            pixel_format: PixelFormat::Rgb,
+        };
+        assert!(validate_framebuffer_region(&valid, &map));
+
+        let misaligned = FramebufferInfo {
+            base: valid.base + 1,
+            ..valid
+        };
+        assert!(!validate_framebuffer_region(&misaligned, &map));
+        let outside = FramebufferInfo {
+            base: BASE + 0xF000,
+            size: 0x2000,
+            ..valid
+        };
+        assert!(!validate_framebuffer_region(&outside, &map));
     }
 }

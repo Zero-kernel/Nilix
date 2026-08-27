@@ -80,6 +80,17 @@ pub enum FreeError {
     AllocatorPoisoned,
 }
 
+impl FreeError {
+    /// Whether a rejected free proves allocator metadata corruption.  Caller
+    /// misuse (wrong order, duplicate free, or an out-of-range frame) must be
+    /// rejected and logged without poisoning unrelated live allocations; only
+    /// an internally inconsistent ledger warrants quarantine.
+    #[inline]
+    fn is_metadata_corruption(self) -> bool {
+        matches!(self, Self::MetadataCorrupt | Self::AllocatorPoisoned)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FreeBit {
     word_index: usize,
@@ -644,7 +655,24 @@ impl BuddyAllocator {
     /// # Safety
     /// 调用者必须确保该帧确实是之前分配的，且未被双重释放
     pub fn free_pages(&mut self, frame: PhysFrame, order: usize) {
-        let _ = self.try_free_pages(frame, order);
+        if let Err(error) = self.try_free_pages(frame, order) {
+            // R188-U26-2 FIX: never silently discard a failed deallocation.
+            // Quarantine only when the allocator's own metadata is corrupt;
+            // a caller-supplied wrong order/address is a rejected request and
+            // must not strand every otherwise-valid allocation.
+            if error.is_metadata_corruption() {
+                self.poisoned = true;
+            }
+            kprintln!(
+                "[buddy] rejected free_pages: {:?}{}",
+                error,
+                if error.is_metadata_corruption() {
+                    "; allocator quarantined"
+                } else {
+                    "; allocator remains available"
+                }
+            );
+        }
     }
 
     /// 合并相邻的buddy块
@@ -1145,7 +1173,20 @@ pub fn free_physical_pages(frame: PhysFrame, count: usize) {
     let order = pages.trailing_zeros() as usize;
 
     if let Some(allocator) = BUDDY_ALLOCATOR.lock().as_mut() {
-        allocator.free_pages(frame, order);
+        if let Err(error) = allocator.try_free_pages(frame, order) {
+            if error.is_metadata_corruption() {
+                allocator.poisoned = true;
+            }
+            kprintln!(
+                "[buddy] rejected free_physical_pages: {:?}{}",
+                error,
+                if error.is_metadata_corruption() {
+                    "; allocator quarantined"
+                } else {
+                    "; allocator remains available"
+                }
+            );
+        }
     }
 }
 

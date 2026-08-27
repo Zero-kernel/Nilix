@@ -305,6 +305,37 @@ fn commit_reserved(cell: &AtomicU64, bytes: usize) -> Result<(), HeapAdmissionEr
     }
 }
 
+/// Undo a committed transition by moving the bytes back to the reserved
+/// state.  This is used only while completing the two-cell commit transaction;
+/// it ensures a failure in the second cell cannot leave global and per-class
+/// ledgers disagreeing.
+#[inline]
+fn rollback_commit(cell: &AtomicU64, bytes: usize) -> Result<(), HeapAdmissionError> {
+    let bytes = u32::try_from(bytes).map_err(|_| HeapAdmissionError::ArithmeticOverflow)?;
+    loop {
+        let old = cell.load(Ordering::Acquire);
+        let (committed, reserved) = unpack(old);
+        let next_committed = committed
+            .checked_sub(bytes)
+            .ok_or(HeapAdmissionError::CorruptState)?;
+        let next_reserved = reserved
+            .checked_add(bytes)
+            .ok_or(HeapAdmissionError::ArithmeticOverflow)?;
+        if cell
+            .compare_exchange_weak(
+                old,
+                pack(next_committed, next_reserved),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+}
+
 #[inline]
 fn subtract_committed(cell: &AtomicU64, bytes: usize) -> Result<(), HeapAdmissionError> {
     let bytes = u32::try_from(bytes).map_err(|_| HeapAdmissionError::ArithmeticOverflow)?;
@@ -376,10 +407,14 @@ fn commit_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmissionError>
     }
     // Neither transition changes total admitted bytes.  Global first ensures a
     // concurrent global snapshot never observes the bytes as absent.
-    commit_reserved(&GLOBAL_STATE, bytes)
-        .unwrap_or_else(|error| panic!("heap admission global commit corrupt: {error:?}"));
-    commit_reserved(&CLASS_STATES[class.index()], bytes)
-        .unwrap_or_else(|error| panic!("heap admission class commit corrupt: {error:?}"));
+    commit_reserved(&GLOBAL_STATE, bytes)?;
+    if let Err(error) = commit_reserved(&CLASS_STATES[class.index()], bytes) {
+        // Restore the first transition before returning.  If the rollback
+        // itself detects corruption, surface that stronger error; do not
+        // silently leave a split ledger or abort from an allocation path.
+        rollback_commit(&GLOBAL_STATE, bytes)?;
+        return Err(error);
+    }
     Ok(())
 }
 

@@ -42,8 +42,8 @@ type SnapshotFn = fn() -> Option<OomProcessInfo>;
 type KillFn = fn(ProcessId, u64, i32) -> bool;
 type TimestampFn = fn() -> u64;
 /// R106-8: Callback for emitting tamper-evident audit events.
-/// Args: (pid: u32, uid: u32, nr_pages_needed: u64, rss_pages: u64, oom_score_adj: i64, timestamp: u64)
-type AuditEmitFn = fn(u32, u32, u64, u64, i64, u64);
+/// Args: (pid: u64, uid: u32, nr_pages_needed: u64, rss_pages: u64, oom_score_adj: i64, timestamp: u64)
+type AuditEmitFn = fn(u64, u32, u64, u64, i64, u64);
 
 struct Callbacks {
     snapshot: Option<SnapshotFn>,
@@ -291,7 +291,7 @@ fn emit_audit(
     // and verified for integrity via sys_audit_export.
     if let Some(emit) = audit_cb {
         emit(
-            victim.pid as u32,
+            victim.pid as u64,
             victim.uid,
             needed as u64,
             victim.rss_pages,

@@ -62,8 +62,8 @@ pub use heap_budget::{
 };
 pub use memory::{
     emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes, heap_peak_used_bytes,
-    run_emergency_heap_self_test, BootInfo, EmergencyAllocator, FrameAllocator, MemoryMapInfo,
-    EMERGENCY_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
+    run_emergency_heap_self_test, validate_framebuffer_region, BootInfo, EmergencyAllocator,
+    FrameAllocator, MemoryMapInfo, EMERGENCY_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
 };
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,

@@ -805,16 +805,16 @@ impl GlobalPageCache {
 
     /// Mark a page as dirty
     pub fn mark_dirty(&self, page: &PageCacheEntry) {
-        if !page.is_dirty() {
-            page.set_dirty();
+        // Swap, rather than a load followed by a store, so two writers cannot
+        // both increment the global dirty count for the same page.
+        if !page.dirty.swap(true, Ordering::AcqRel) {
             self.nr_dirty.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
         }
     }
 
     /// Clear dirty flag on a page
     pub fn clear_dirty(&self, page: &PageCacheEntry) {
-        if page.is_dirty() {
-            page.clear_dirty();
+        if page.dirty.swap(false, Ordering::AcqRel) {
             self.nr_dirty.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -1123,8 +1123,12 @@ where
     }
 }
 
-/// Write a page to disk (for writeback)
-pub fn writeback_page<F>(page: &PageCacheEntry, write_to_disk: F) -> Result<(), ()>
+/// Write a page from this cache to disk (for writeback).
+pub fn writeback_page_in<F>(
+    cache: &GlobalPageCache,
+    page: &PageCacheEntry,
+    write_to_disk: F,
+) -> Result<(), ()>
 where
     F: FnOnce(&PageCacheEntry) -> Result<(), ()>,
 {
@@ -1147,13 +1151,33 @@ where
     let result = write_to_disk(page);
 
     if result.is_ok() {
-        PAGE_CACHE.clear_dirty(page);
+        cache.clear_dirty(page);
         page.set_state(PageState::Uptodate);
     } else {
         page.set_state(PageState::Error);
     }
 
     result
+}
+
+impl GlobalPageCache {
+    /// Write one page through the cache that owns its dirty counter.  Keeping
+    /// the owner explicit prevents a private/test cache from accidentally
+    /// decrementing the global cache's `nr_dirty` statistic.
+    pub fn writeback_page<F>(&self, page: &PageCacheEntry, write_to_disk: F) -> Result<(), ()>
+    where
+        F: FnOnce(&PageCacheEntry) -> Result<(), ()>,
+    {
+        writeback_page_in(self, page, write_to_disk)
+    }
+}
+
+/// Write a page from the global cache to disk (for legacy callers).
+pub fn writeback_page<F>(page: &PageCacheEntry, write_to_disk: F) -> Result<(), ()>
+where
+    F: FnOnce(&PageCacheEntry) -> Result<(), ()>,
+{
+    writeback_page_in(&PAGE_CACHE, page, write_to_disk)
 }
 
 // ============================================================================
@@ -1532,6 +1556,15 @@ pub fn run_page_cache_policy_self_test() {
             base_allocs + 1
         );
         assert_eq!(cache.allocated_slots.load(Ordering::SeqCst), 1);
+        // R188-U24-2: resident write paths must make the writeback oracle
+        // observable, and repeated dirty notifications must not double-count.
+        cache.mark_dirty(&first);
+        cache.mark_dirty(&first);
+        assert!(first.is_dirty());
+        assert_eq!(cache.stats().nr_dirty, 1);
+        assert!(cache.writeback_page(&first, |_| Ok(())).is_ok());
+        assert!(!first.is_dirty());
+        assert_eq!(cache.stats().nr_dirty, 0);
         assert!(
             !cache.remove_from_cache(2, 0),
             "external Arcs must prevent early slot/accounting release"

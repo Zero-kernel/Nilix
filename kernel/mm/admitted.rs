@@ -681,12 +681,14 @@ impl<T> AdmittedDeque<T> {
         {
             return Err(AdmittedAllocError::CapacityInvariant);
         }
-        // `HeapReservation::commit` only converts already-reserved bytes and
-        // panics on ledger corruption.  It cannot fail for resource pressure.
+        // Admission conversion is fallible when the ledger detects a
+        // corrupted reservation.  Propagate that error so an allocator or
+        // caller mistake cannot turn a recoverable publication failure into a
+        // kernel-wide abort.
         let replacement_charge = prepared
             .reservation
             .commit()
-            .expect("RF180-42 admitted deque commit invariant");
+            .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
         let mut old_values = core::mem::take(&mut self.values);
         while let Some(value) = old_values.pop_front() {
             prepared.values.push_back(value);
@@ -1093,7 +1095,7 @@ impl<K: Ord, V> AdmittedMap<K, V> {
         let replacement_charge = prepared
             .reservation
             .commit()
-            .expect("RF180-43 admitted map commit invariant");
+            .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
         let retired_backing = self
             .map
             .replace_backing_deferred(prepared.backing)
