@@ -91,6 +91,12 @@ pub const RATE_LIMIT_TOKENS: u32 = 128;
 /// Rate limit refill window in milliseconds
 pub const RATE_LIMIT_WINDOW_MS: u64 = 1000;
 
+/// Number of independent fragment mutation lanes.  A lane is selected from
+/// the network-namespace id, so unrelated namespaces can make progress in
+/// parallel while a single namespace still has a serialized transaction
+/// boundary.  The power-of-two size keeps selection allocation-free.
+const FRAGMENT_TRANSACTION_SLOTS: usize = 64;
+
 // ============================================================================
 // Statistics
 // ============================================================================
@@ -461,7 +467,11 @@ impl FragmentQueue {
             // it's an inconsistent/malicious datagram - reject as overlap
             // This catches attacks that try to shrink the packet after data is buffered
             for (&stored_off, stored_data) in self.frags.iter() {
-                let stored_end = stored_off.saturating_add(stored_data.len() as u16);
+                let stored_len =
+                    u16::try_from(stored_data.len()).map_err(|_| FragmentDropReason::TooLarge)?;
+                let stored_end = stored_off
+                    .checked_add(stored_len)
+                    .ok_or(FragmentDropReason::TooLarge)?;
                 if stored_end > frag_end {
                     return Err(FragmentDropReason::Overlap);
                 }
@@ -479,7 +489,11 @@ impl FragmentQueue {
         // RFC 5722: Overlap detection against existing fragments
         // Check previous fragment
         if let Some((&prev_off, prev_data)) = self.frags.range(..=frag_start).next_back() {
-            let prev_end = prev_off.saturating_add(prev_data.len() as u16);
+            let prev_len =
+                u16::try_from(prev_data.len()).map_err(|_| FragmentDropReason::TooLarge)?;
+            let prev_end = prev_off
+                .checked_add(prev_len)
+                .ok_or(FragmentDropReason::TooLarge)?;
             if prev_end > frag_start {
                 return Err(FragmentDropReason::Overlap);
             }
@@ -683,10 +697,11 @@ pub struct FragmentCache {
     /// old bounded-but-infallible BTreeMap-node residual: backing growth is now
     /// admitted and fallible like the queue and per-source indexes.
     per_ns_counts: Mutex<AdmittedMap<u64, PerNsBudget>>,
-    /// One fragmented-datagram transaction at a time. This atomic ownership
-    /// token permits detached allocation and queue mutation without holding a
-    /// cache spin lock; it is never held as an allocator-visible lock.
-    transaction_active: AtomicBool,
+    /// Per-namespace hashed transaction lanes.  The old single global token
+    /// made a slow allocation in one namespace reject traffic in every other
+    /// namespace.  Hash collisions are intentional and conservative; they
+    /// only serialize the colliding lanes and never weaken namespace limits.
+    transaction_slots: [AtomicBool; FRAGMENT_TRANSACTION_SLOTS],
     /// Statistics
     stats: FragmentStats,
 }
@@ -737,6 +752,19 @@ struct FragmentTransactionPermit<'a> {
 impl Drop for FragmentTransactionPermit<'_> {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
+    }
+}
+
+struct FragmentCleanupPermit<'a> {
+    slots: &'a [AtomicBool; FRAGMENT_TRANSACTION_SLOTS],
+    acquired: usize,
+}
+
+impl Drop for FragmentCleanupPermit<'_> {
+    fn drop(&mut self) {
+        for slot in self.slots[..self.acquired].iter().rev() {
+            slot.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -888,18 +916,52 @@ impl FragmentCache {
             queues: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
             per_src_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
             per_ns_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
-            transaction_active: AtomicBool::new(false),
+            transaction_slots: [const { AtomicBool::new(false) }; FRAGMENT_TRANSACTION_SLOTS],
             stats: FragmentStats::new(),
         }
     }
 
-    fn try_transaction(&self) -> Option<FragmentTransactionPermit<'_>> {
-        self.transaction_active
+    #[inline]
+    fn transaction_slot(net_ns_id: u64) -> usize {
+        // Mix the high and low halves before masking.  This avoids the common
+        // case where namespace ids are sequential and differ only in the low
+        // bits while retaining a bounded, lock-free selection operation.
+        let mut x = net_ns_id ^ (net_ns_id >> 32);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x9E37_79B9);
+        (x as usize) & (FRAGMENT_TRANSACTION_SLOTS - 1)
+    }
+
+    fn try_transaction(&self, net_ns_id: u64) -> Option<FragmentTransactionPermit<'_>> {
+        let active = &self.transaction_slots[Self::transaction_slot(net_ns_id)];
+        active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| FragmentTransactionPermit {
-                active: &self.transaction_active,
-            })
+            .map(|_| FragmentTransactionPermit { active })
+    }
+
+    /// Cleanup is a global operation, therefore it must own every lane before
+    /// detaching entries.  Acquisition is deterministic and all-or-nothing;
+    /// a concurrent dataplane transaction causes a bounded deferral rather
+    /// than a partial sweep or a lock-order inversion.
+    fn try_cleanup_transaction(&self) -> Option<FragmentCleanupPermit<'_>> {
+        let mut acquired = 0usize;
+        for slot in &self.transaction_slots {
+            if slot
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                for held in self.transaction_slots[..acquired].iter().rev() {
+                    held.store(false, Ordering::Release);
+                }
+                return None;
+            }
+            acquired += 1;
+        }
+        Some(FragmentCleanupPermit {
+            slots: &self.transaction_slots,
+            acquired,
+        })
     }
 
     /// Process one fragment as a detached cache transaction.
@@ -913,7 +975,7 @@ impl FragmentCache {
         self.stats
             .fragments_received
             .fetch_add(1, Ordering::Relaxed);
-        let _transaction = match self.try_transaction() {
+        let _transaction = match self.try_transaction(net_ns_id) {
             Some(permit) => permit,
             None => {
                 self.stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
@@ -1367,7 +1429,7 @@ impl FragmentCache {
                     retired.queues = Some(
                         queues
                             .install_prepared_deferred(prepared)
-                            .unwrap_or_else(|_| panic!("RF180-41 fragment queue backing rejected")),
+                            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?,
                     );
                 }
             }
@@ -1387,9 +1449,7 @@ impl FragmentCache {
                     retired.per_src = Some(
                         per_src
                             .install_prepared_deferred(prepared)
-                            .unwrap_or_else(|_| {
-                                panic!("RF180-41 fragment source backing rejected")
-                            }),
+                            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?,
                     );
                 }
             }
@@ -1409,9 +1469,7 @@ impl FragmentCache {
                     retired.per_ns = Some(
                         per_ns
                             .install_prepared_deferred(prepared)
-                            .unwrap_or_else(|_| {
-                                panic!("RF180-41 fragment namespace backing rejected")
-                            }),
+                            .map_err(|_| FragmentDropReason::GlobalQueueLimit)?,
                     );
                 }
             }
@@ -1493,7 +1551,7 @@ impl FragmentCache {
     /// each owner is detached. Cleanup remains bounded by the live queue cap;
     /// a busy dataplane simply defers this sweep to the next timer tick.
     pub fn cleanup_expired(&self, now_ms: u64) -> usize {
-        let _transaction = match self.try_transaction() {
+        let _transaction = match self.try_cleanup_transaction() {
             Some(permit) => permit,
             None => return 0,
         };
@@ -1885,5 +1943,26 @@ mod tests {
         assert_eq!(cache.stats.active_queues.load(Ordering::Relaxed), 0);
         assert_eq!(cache.stats.buffered_fragments.load(Ordering::Relaxed), 0);
         assert_eq!(cache.stats.buffered_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn r188_u16_namespace_transaction_lanes_are_independent() {
+        let cache = FragmentCache::new();
+        let first_ns = 1u64;
+        let first_slot = FragmentCache::transaction_slot(first_ns);
+        let second_ns = (2u64..10_000)
+            .find(|candidate| FragmentCache::transaction_slot(*candidate) != first_slot)
+            .expect("hashed fragment lanes must provide a second slot");
+
+        let first = cache
+            .try_transaction(first_ns)
+            .expect("first namespace lane should be available");
+        let second = cache
+            .try_transaction(second_ns)
+            .expect("a different namespace lane must not be globally blocked");
+        assert!(cache.try_transaction(first_ns).is_none());
+        drop(second);
+        drop(first);
+        assert!(cache.try_transaction(first_ns).is_some());
     }
 }

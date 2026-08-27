@@ -543,6 +543,18 @@ impl BufPool {
     /// registered devices) MUST use [`Self::try_free`] instead — freeing a
     /// foreign buffer here corrupts the `in_use()` ledger.
     pub fn free(&self, mut buf: NetBuf) {
+        // U16-3 FIX: keep the public convenience API safe even when a caller
+        // violates the provenance convention.  A foreign buffer must be
+        // dropped, never inserted into this pool: inserting it would make
+        // `available() > total_allocated` and underflow `in_use()`.
+        if self
+            .home
+            .binary_search(&buf.buffer_phys_addr().as_u64())
+            .is_err()
+        {
+            drop(buf);
+            return;
+        }
         buf.reset();
         self.buffers.lock().push(buf);
     }

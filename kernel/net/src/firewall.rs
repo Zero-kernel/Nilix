@@ -612,6 +612,31 @@ fn default_rules() -> Vec<FirewallRule> {
     ]
 }
 
+/// Fallible counterpart used on packet ingress.  The default policy is DROP,
+/// so an allocation failure must result in a dropped packet rather than an
+/// allocator panic from an IRQ/receive path.
+fn default_rules_try() -> Option<Vec<FirewallRule>> {
+    let mut rules = Vec::new();
+    rules.try_reserve_exact(2).ok()?;
+    rules.push(
+        FirewallRule::builder(1)
+            .priority(1000)
+            .ct_state(CtStateMask::INVALID)
+            .action(FirewallAction::Drop)
+            .log(true)
+            .build(),
+    );
+    rules.push(
+        FirewallRule::builder(2)
+            .priority(900)
+            .ct_state(CtStateMask::ESTABLISHED.or(CtStateMask::RELATED))
+            .action(FirewallAction::Accept)
+            .log(false)
+            .build(),
+    );
+    Some(rules)
+}
+
 // ============================================================================
 // Per-Namespace Instances (R121-1 FIX)
 // ============================================================================
@@ -635,27 +660,34 @@ static FIREWALL_TABLES: RwLock<BTreeMap<u64, Arc<FirewallTable>>> = RwLock::new(
 ///
 /// The Arc is cloned so callers can evaluate rules without holding the global
 /// map lock, avoiding contention in the packet processing hot path.
-pub fn firewall_table_for_ns(ns_id: u64) -> Arc<FirewallTable> {
+pub fn try_firewall_table_for_ns(ns_id: u64) -> Option<Arc<FirewallTable>> {
     // Fast path: read lock for existing entry
     {
         let guard = FIREWALL_TABLES.read();
         if let Some(table) = guard.get(&ns_id) {
-            return Arc::clone(table);
+            return Some(Arc::clone(table));
         }
     }
 
     // Slow path: write lock for lazy initialization (double-checked)
     let mut guard = FIREWALL_TABLES.write();
     if let Some(table) = guard.get(&ns_id) {
-        return Arc::clone(table);
+        return Some(Arc::clone(table));
     }
 
-    let table = Arc::new(FirewallTable::new_with_rules(
-        FirewallAction::Drop,
-        default_rules(),
-    ));
+    let rules = default_rules_try()?;
+    let table = Arc::try_new(FirewallTable::new_with_rules(FirewallAction::Drop, rules)).ok()?;
     guard.insert(ns_id, Arc::clone(&table));
-    table
+    Some(table)
+}
+
+/// Infallible compatibility wrapper for administrative/test callers.  Packet
+/// ingress uses [`try_firewall_table_for_ns`] and drops on `None`; this wrapper
+/// retains the historical API for callers that can tolerate a boot-time
+/// allocation failure being fatal.
+pub fn firewall_table_for_ns(ns_id: u64) -> Arc<FirewallTable> {
+    try_firewall_table_for_ns(ns_id)
+        .unwrap_or_else(|| panic!("firewall table admission failed for namespace {ns_id}"))
 }
 
 /// Get the root-namespace (namespace 0) firewall table.

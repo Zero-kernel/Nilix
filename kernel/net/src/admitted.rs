@@ -479,7 +479,7 @@ impl<T> AdmittedVec<T> {
     pub(crate) fn install_prepared_deferred(
         &mut self,
         mut prepared: PreparedAdmittedVecCapacity<T>,
-    ) -> Result<RetiredAdmittedVecCapacity<T>, PreparedAdmittedVecCapacity<T>> {
+    ) -> Result<RetiredAdmittedVecCapacity<T>, AdmittedAllocError> {
         // D3 NETNS-SUBBUDGET-1: a budgeted owner only accepts backing that
         // carries its matching lease, and an unbudgeted owner never accepts
         // a leased one — either mismatch means the dual accounting would
@@ -488,12 +488,15 @@ impl<T> AdmittedVec<T> {
             || prepared.reservation.class() != self.class
             || self.budget.is_some() != prepared.ns_lease.is_some()
         {
-            return Err(prepared);
+            return Err(AdmittedAllocError::CapacityInvariant);
         }
+        // Admission conversion is fallible when the shared ledger detects a
+        // corrupted reservation. Propagate the failure so an attacker cannot
+        // turn a recoverable growth/publication error into a kernel abort.
         let replacement_charge = prepared
             .reservation
             .commit()
-            .expect("RF180-41 admitted Vec ledger invariant");
+            .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
         let mut old_values = core::mem::take(&mut self.values);
         for value in old_values.drain(..) {
             prepared.values.push(value);
@@ -772,20 +775,26 @@ impl<K: Ord, V> AdmittedMap<K, V> {
     pub(crate) fn install_prepared_deferred(
         &mut self,
         prepared: PreparedAdmittedMapCapacity<K, V>,
-    ) -> Result<RetiredAdmittedMapCapacity<K, V>, PreparedAdmittedMapCapacity<K, V>> {
+    ) -> Result<RetiredAdmittedMapCapacity<K, V>, AdmittedAllocError> {
         if prepared.backing.capacity() < self.map.len()
             || prepared.reservation.class() != self.class
         {
-            return Err(prepared);
+            return Err(AdmittedAllocError::CapacityInvariant);
         }
+        // Admission conversion is fallible when the shared ledger detects a
+        // corrupted reservation. Propagate the failure instead of panicking
+        // on a runtime publication path (U15-5/U23-2).
         let replacement_charge = prepared
             .reservation
             .commit()
-            .expect("RF180-41 admitted map ledger invariant");
-        let retired_backing = self
-            .map
-            .replace_backing_deferred(prepared.backing)
-            .unwrap_or_else(|_| panic!("validated admitted map backing rejected"));
+            .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
+        let retired_backing = match self.map.replace_backing_deferred(prepared.backing) {
+            Ok(retired) => retired,
+            Err(_) => {
+                drop(replacement_charge);
+                return Err(AdmittedAllocError::CapacityInvariant);
+            }
+        };
         let old_charge = self.charge.replace(replacement_charge);
         Ok(RetiredAdmittedMapCapacity {
             _backing: retired_backing,

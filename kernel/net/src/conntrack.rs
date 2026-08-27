@@ -588,6 +588,13 @@ pub struct ConntrackTable {
     /// entry/count backing at a time. This is an atomic ownership token, not a
     /// spin lock held across allocation.
     capacity_preparing: AtomicBool,
+    /// Deterministic hosted-test fault injection for the second half of an
+    /// egress replacement transaction. It fires only at namespace-row
+    /// publication, after the new flow has been inserted and a victim may
+    /// already be detached, so rollback tests exercise the real atomicity
+    /// boundary rather than an earlier capacity preflight.
+    #[cfg(test)]
+    fail_next_ns_publication: AtomicBool,
     /// Statistics
     stats: ConntrackStats,
 }
@@ -601,8 +608,32 @@ impl ConntrackTable {
             entries: RwLock::new(AdmittedMap::new(HeapClass::SocketObject)),
             ns_entry_counts: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)),
             capacity_preparing: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_ns_publication: AtomicBool::new(false),
             stats: ConntrackStats::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn fail_next_ns_publication_for_test(&self) {
+        self.fail_next_ns_publication.store(true, Ordering::Release);
+    }
+
+    fn insert_ns_count_reserved(
+        &self,
+        counts: &mut AdmittedMap<u64, usize>,
+        ns_id: u64,
+        count: usize,
+    ) -> bool {
+        #[cfg(test)]
+        if self
+            .fail_next_ns_publication
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return false;
+        }
+        counts.insert_unique_reserved(ns_id, count).is_ok()
     }
 
     fn try_capacity_permit(&self) -> Option<ConntrackCapacityPermit<'_>> {
@@ -1089,9 +1120,17 @@ impl ConntrackTable {
                             return CtEgressResult::Rejected(Self::resource_rejection(dir));
                         }
                         retired_entries =
-                            Some(entries.install_prepared_deferred(candidate).unwrap_or_else(
-                                |_| panic!("RF180-41 conntrack prepared entry backing rejected"),
-                            ));
+                            Some(match entries.install_prepared_deferred(candidate) {
+                                Ok(retired) => retired,
+                                Err(_) => {
+                                    // Prepared capacity is an optimization, not a
+                                    // correctness assertion.  A stale/rejected
+                                    // candidate must become a normal resource
+                                    // rejection instead of halting the kernel.
+                                    self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                                    return CtEgressResult::Rejected(Self::resource_rejection(dir));
+                                }
+                            });
                     }
                 }
 
@@ -1119,27 +1158,30 @@ impl ConntrackTable {
                             self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
                             return CtEgressResult::Rejected(Self::resource_rejection(dir));
                         }
-                        retired_ns = Some(
-                            ns_counts
-                                .install_prepared_deferred(candidate)
-                                .unwrap_or_else(|_| {
-                                    panic!("RF180-41 conntrack prepared namespace backing rejected")
-                                }),
-                        );
+                        retired_ns = Some(match ns_counts.install_prepared_deferred(candidate) {
+                            Ok(retired) => retired,
+                            Err(_) => {
+                                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                                return CtEgressResult::Rejected(Self::resource_rejection(dir));
+                            }
+                        });
                     }
                 }
 
-                let victim = victim_plan.map(|(victim_key, kind)| {
-                    let entry = entries
-                        .remove(&victim_key)
-                        .expect("RF180-41 reserved conntrack victim vanished before detach");
-                    Self::dec_ns_entry_count_locked(&mut ns_counts, victim_key.net_ns_id);
-                    DetachedEgressVictim {
-                        key: victim_key,
-                        entry,
-                        kind,
+                let victim = match victim_plan {
+                    Some((victim_key, kind)) => {
+                        let Some(entry) = entries.remove(&victim_key) else {
+                            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                            return CtEgressResult::Rejected(Self::resource_rejection(dir));
+                        };
+                        Some(DetachedEgressVictim {
+                            key: victim_key,
+                            entry,
+                            kind,
+                        })
                     }
-                });
+                    None => None,
+                };
 
                 let mut entry = ConntrackEntry::new(key, initial_state, now_ms, dir);
                 entry.pending_egress = Some(PendingEgress {
@@ -1151,21 +1193,144 @@ impl ConntrackTable {
                     now_ms,
                     tcp_handshake,
                 });
-                assert!(
-                    entries
-                        .insert_unique_reserved(key, Mutex::new(entry))
-                        .is_ok(),
-                    "RF180-41 provisional conntrack publication invariant violated"
-                );
-                if let Some(count) = ns_counts.get_mut(&key.net_ns_id) {
-                    *count = count
-                        .checked_add(1)
-                        .expect("RF180-41 conntrack namespace counter overflow");
+                if entries
+                    .insert_unique_reserved(key, Mutex::new(entry))
+                    .is_err()
+                {
+                    // The victim's namespace charge has deliberately not been
+                    // changed yet.  Restore the detached entry and leave both
+                    // ledgers byte-for-byte as they were before this
+                    // replacement attempt.
+                    if let Some(victim) = victim {
+                        if entries
+                            .insert_unique_reserved(victim.key, victim.entry)
+                            .is_err()
+                        {
+                            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                            return CtEgressResult::StateLost { queued: false };
+                        }
+                    }
+                    self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                    return CtEgressResult::Rejected(Self::resource_rejection(dir));
+                }
+
+                // Publish namespace accounting as the second half of the
+                // replacement transaction.  The old implementation detached
+                // the victim and decremented its row first; if the new row
+                // publication then failed, removing the new entry leaked the
+                // victim and/or its charge.  Keep the victim charge intact
+                // until the new entry is present, and only use operations that
+                // have an explicit inverse on failure.
+                let requester_ns = key.net_ns_id;
+                let victim_ns = victim.as_ref().map(|item| item.key.net_ns_id);
+                let requester_before = ns_counts.get(&requester_ns).copied();
+                let victim_before = victim_ns.and_then(|ns| ns_counts.get(&ns).copied());
+                let same_namespace = victim_ns == Some(requester_ns);
+
+                let publication_ok = if same_namespace {
+                    // A same-namespace replacement preserves the count.  A
+                    // missing/zero row is an accounting corruption, not a
+                    // reason to publish an uncharged flow.
+                    requester_before.is_some_and(|count| count > 0)
+                } else if let Some(victim_ns) = victim_ns {
+                    if let Some(victim_count) = victim_before.filter(|count| *count > 0) {
+                        if requester_before.is_none() && victim_count == 1 {
+                            // The preflight intentionally skipped an allocation
+                            // because removing the victim row frees the map slot.
+                            ns_counts.remove(&victim_ns);
+                            if self.insert_ns_count_reserved(&mut ns_counts, requester_ns, 1) {
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            let requester_ok = if let Some(count) = ns_counts.get_mut(&requester_ns)
+                            {
+                                count.checked_add(1).map(|next| *count = next).is_some()
+                            } else if self.insert_ns_count_reserved(&mut ns_counts, requester_ns, 1)
+                            {
+                                true
+                            } else {
+                                false
+                            };
+                            if !requester_ok {
+                                false
+                            } else if victim_count == 1 {
+                                ns_counts.remove(&victim_ns);
+                                true
+                            } else if let Some(count) = ns_counts.get_mut(&victim_ns) {
+                                *count -= 1;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else if let Some(count) = ns_counts.get_mut(&requester_ns) {
+                    count.checked_add(1).map(|next| *count = next).is_some()
+                } else if self.insert_ns_count_reserved(&mut ns_counts, requester_ns, 1) {
+                    true
                 } else {
-                    assert!(
-                        ns_counts.insert_unique_reserved(key.net_ns_id, 1).is_ok(),
-                        "RF180-41 provisional namespace publication lacked capacity"
-                    );
+                    false
+                };
+
+                if !publication_ok {
+                    // Undo any namespace mutations first.  Every restoration
+                    // is checked; losing either row is an internal state-loss
+                    // event and must never be reported as a normal rejection.
+                    let requester_restore_ok = match requester_before {
+                        Some(before) => {
+                            if let Some(current) = ns_counts.get_mut(&requester_ns) {
+                                *current = before;
+                                true
+                            } else {
+                                ns_counts
+                                    .insert_unique_reserved(requester_ns, before)
+                                    .is_ok()
+                            }
+                        }
+                        None => {
+                            ns_counts.remove(&requester_ns);
+                            true
+                        }
+                    };
+                    let victim_restore_ok = if let Some(victim_ns) = victim_ns {
+                        match victim_before {
+                            Some(before) => {
+                                if let Some(current) = ns_counts.get_mut(&victim_ns) {
+                                    *current = before;
+                                    true
+                                } else {
+                                    ns_counts.insert_unique_reserved(victim_ns, before).is_ok()
+                                }
+                            }
+                            None => {
+                                ns_counts.remove(&victim_ns);
+                                true
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    let entry_restore_ok = entries.remove(&key).is_some();
+                    let victim_entry_restore_ok = if let Some(victim) = victim {
+                        entries
+                            .insert_unique_reserved(victim.key, victim.entry)
+                            .is_ok()
+                    } else {
+                        true
+                    };
+                    self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                    if requester_restore_ok
+                        && victim_restore_ok
+                        && entry_restore_ok
+                        && victim_entry_restore_ok
+                    {
+                        return CtEgressResult::Rejected(Self::resource_rejection(dir));
+                    }
+                    return CtEgressResult::StateLost { queued: false };
                 }
                 drop(ns_counts);
                 drop(entries);
@@ -1242,21 +1407,25 @@ impl ConntrackTable {
 
         if let Some(victim) = reservation.victim.take() {
             let victim_ns = victim.key.net_ns_id;
-            assert!(
-                entries
-                    .insert_unique_reserved(victim.key, victim.entry)
-                    .is_ok(),
-                "RF180-41 conntrack rollback lost reserved victim slot"
-            );
+            let (victim_key, victim_entry) = (victim.key, victim.entry);
+            if let Err((_key, entry)) = entries.insert_unique_reserved(victim_key, victim_entry) {
+                // Keep the detached owner attached to the reservation so a
+                // caller can retry cleanup; never panic while unwinding a
+                // user-triggered queue failure.
+                reservation.victim = Some(DetachedEgressVictim {
+                    key: victim_key,
+                    entry,
+                    kind: victim.kind,
+                });
+                return false;
+            }
             if let Some(count) = ns_counts.get_mut(&victim_ns) {
-                *count = count
-                    .checked_add(1)
-                    .expect("RF180-41 conntrack rollback namespace overflow");
-            } else {
-                assert!(
-                    ns_counts.insert_unique_reserved(victim_ns, 1).is_ok(),
-                    "RF180-41 conntrack rollback lost namespace capacity"
-                );
+                let Some(next) = count.checked_add(1) else {
+                    return false;
+                };
+                *count = next;
+            } else if ns_counts.insert_unique_reserved(victim_ns, 1).is_err() {
+                return false;
             }
         }
         true
@@ -1516,13 +1685,13 @@ impl ConntrackTable {
                     self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
                     return Self::resource_rejection(dir);
                 }
-                retired_ns = Some(
-                    ns_counts
-                        .install_prepared_deferred(candidate)
-                        .unwrap_or_else(|_| {
-                            panic!("RF180-41 ingress conntrack namespace backing rejected")
-                        }),
-                );
+                retired_ns = Some(match ns_counts.install_prepared_deferred(candidate) {
+                    Ok(retired) => retired,
+                    Err(_) => {
+                        self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                        return Self::resource_rejection(dir);
+                    }
+                });
             }
         }
 
@@ -1544,13 +1713,13 @@ impl ConntrackTable {
                     self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
                     return Self::resource_rejection(dir);
                 }
-                retired_entries = Some(
-                    entries
-                        .install_prepared_deferred(candidate)
-                        .unwrap_or_else(|_| {
-                            panic!("RF180-41 ingress conntrack entry backing rejected")
-                        }),
-                );
+                retired_entries = Some(match entries.install_prepared_deferred(candidate) {
+                    Ok(retired) => retired,
+                    Err(_) => {
+                        self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                        return Self::resource_rejection(dir);
+                    }
+                });
             }
         }
 
@@ -2039,6 +2208,12 @@ impl ConntrackTable {
         // self-healing residual of the socket-table teardown backstop, R170-7.)
         let mut removed: u64 = 0;
         let mut entries = self.entries.write();
+        // Keep the namespace-count ledger under the same entries -> counts
+        // lock order used by every other removal path.  Updating it in the
+        // removal loop is essential: deleting the row only after the loop
+        // loses the distinction between live and provisional entries and
+        // strands one charge per removed flow.
+        let mut ns_counts = self.ns_entry_counts.lock();
         loop {
             let victim = entries
                 .iter()
@@ -2051,6 +2226,7 @@ impl ConntrackTable {
             };
             if entries.remove(&key).is_some() {
                 removed += 1;
+                Self::dec_ns_entry_count_locked(&mut ns_counts, key.net_ns_id);
             }
         }
 
@@ -2059,8 +2235,9 @@ impl ConntrackTable {
         // later teardown drain removes the row once no protected entry remains.
         let provisional_remains = entries.keys().any(|key| key.net_ns_id == ns_id);
         if !provisional_remains {
-            self.ns_entry_counts.lock().remove(&ns_id);
+            ns_counts.remove(&ns_id);
         }
+        drop(ns_counts);
         drop(entries);
 
         if removed > 0 {
@@ -2278,6 +2455,7 @@ where
 /// * `dst_ip` - Destination IP address
 /// * `icmp_type` - ICMP message type
 /// * `icmp_code` - ICMP message code
+/// * `icmp_id` - Echo identifier (zero for non-echo messages)
 /// * `payload_len` - Length of payload
 /// * `now_ms` - Current time in milliseconds
 pub fn ct_process_icmp(
@@ -2286,6 +2464,7 @@ pub fn ct_process_icmp(
     dst_ip: Ipv4Addr,
     icmp_type: u8,
     icmp_code: u8,
+    icmp_id: u16,
     payload_len: usize,
     now_ms: u64,
 ) -> CtUpdateResult {
@@ -2295,8 +2474,11 @@ pub fn ct_process_icmp(
 
     // Use type/code as pseudo-ports for flow tracking
     // This allows tracking echo request/reply pairs
-    let pseudo_src_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
-    let pseudo_dst_port = 0u16;
+    // Include the echo identifier in the flow key.  Type/code alone aliases
+    // every ping stream in a namespace and makes unrelated request/reply
+    // pairs collide under concurrent traffic.
+    let pseudo_src_port = icmp_id;
+    let pseudo_dst_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
 
     let l4 = L4Meta::new(0, payload_len);
 
@@ -2557,5 +2739,84 @@ mod tests {
         ));
         assert!(!queued.get());
         assert_eq!(table.len(), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
+    fn r188_replacement_publication_failure_restores_victim_and_namespace_charge() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+
+        // Fill the bounded global table across four namespaces, keeping the
+        // first entry old enough to be the deterministic LRU victim.  The
+        // requester namespace is intentionally absent, so publication needs
+        // both a victim replacement and a new namespace-count row.
+        let namespaces = [51u64, 52, 53, 54];
+        let mut port = 30_000u16;
+        for (ns_index, ns_id) in namespaces.into_iter().enumerate() {
+            for entry_index in 0..CT_MAX_ENTRIES_PER_NS {
+                let timestamp = if ns_index == 0 && entry_index == 0 {
+                    1
+                } else {
+                    2
+                };
+                let result = table.update_on_packet(
+                    ns_id,
+                    IPPROTO_UDP,
+                    local,
+                    remote,
+                    port,
+                    53,
+                    &L4Meta::new(0, 0),
+                    timestamp,
+                );
+                assert!(!result.resource_exhausted);
+                port = port.wrapping_add(1);
+            }
+        }
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+
+        let victim_key = FlowKey::from_packet(51, IPPROTO_UDP, local, remote, 30_000, 53).0;
+        assert!(table.lookup(&victim_key).is_some());
+        table.fail_next_ns_publication_for_test();
+
+        let outcome = table.update_on_egress_transaction(
+            99,
+            IPPROTO_UDP,
+            local,
+            remote,
+            40_000,
+            53,
+            &L4Meta::new(0, 0),
+            3,
+            || Ok::<(), QueueFault>(()),
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::Rejected(CtUpdateResult {
+                resource_exhausted: true,
+                ..
+            })
+        ));
+
+        let requester_key = FlowKey::from_packet(99, IPPROTO_UDP, local, remote, 40_000, 53).0;
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        assert!(table.lookup(&requester_key).is_none());
+        assert!(
+            table.lookup(&victim_key).is_some(),
+            "failed namespace publication must restore the detached LRU victim"
+        );
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&51).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS),
+            "victim namespace charge must be restored exactly"
+        );
+        assert!(
+            table.ns_entry_counts.lock().get(&99).is_none(),
+            "requester namespace row must not survive a failed publication"
+        );
+
+        for ns_id in namespaces {
+            assert_eq!(table.drain_ns(ns_id), CT_MAX_ENTRIES_PER_NS);
+        }
     }
 }

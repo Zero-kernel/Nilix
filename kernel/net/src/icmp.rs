@@ -360,8 +360,31 @@ pub fn build_echo_reply(request: &[u8]) -> Result<WirePacket, IcmpError> {
 ///
 /// # Returns
 /// Complete ICMP destination unreachable packet
-pub fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> WirePacket {
+// The raw serializer is intentionally private.  Every externally callable
+// response constructor goes through the token bucket below; keeping an
+// unlimited public builder would let a new caller accidentally reintroduce an
+// amplification path (U16-4).
+fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> WirePacket {
     build_error_message(ICMP_TYPE_DEST_UNREACHABLE, code, original_ip_header)
+}
+
+/// Build a destination-unreachable response through the mandatory response
+/// limiter.  Callers that are about to put the packet on the wire should use
+/// this API rather than the raw serializer; the latter remains available for
+/// tests and for code that only needs a packet template.
+pub fn build_dest_unreachable_limited(
+    code: u8,
+    original_ip_header: &[u8],
+    now_ms: u64,
+) -> Result<WirePacket, IcmpError> {
+    if !ICMP_RATE_LIMITER.allow(now_ms) {
+        return Err(IcmpError::RateLimited);
+    }
+    let packet = build_dest_unreachable(code, original_ip_header);
+    if packet.is_empty() {
+        return Err(IcmpError::PayloadTooLarge);
+    }
+    Ok(packet)
 }
 
 /// Build an ICMP time exceeded message.
@@ -372,8 +395,24 @@ pub fn build_dest_unreachable(code: u8, original_ip_header: &[u8]) -> WirePacket
 ///
 /// # Returns
 /// Complete ICMP time exceeded packet
-pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> WirePacket {
+fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> WirePacket {
     build_error_message(ICMP_TYPE_TIME_EXCEEDED, code, original_ip_header)
+}
+
+/// Rate-limited variant of [`build_time_exceeded`].
+pub fn build_time_exceeded_limited(
+    code: u8,
+    original_ip_header: &[u8],
+    now_ms: u64,
+) -> Result<WirePacket, IcmpError> {
+    if !ICMP_RATE_LIMITER.allow(now_ms) {
+        return Err(IcmpError::RateLimited);
+    }
+    let packet = build_time_exceeded(code, original_ip_header);
+    if packet.is_empty() {
+        return Err(IcmpError::PayloadTooLarge);
+    }
+    Ok(packet)
 }
 
 /// Internal: build an ICMP error message.
@@ -703,5 +742,21 @@ mod tests {
             .map(|worker| worker.join().expect("token-bucket worker"))
             .sum();
         assert_eq!(admitted, 1, "one elapsed token must be consumed once");
+    }
+
+    #[test]
+    fn r188_icmp_error_builders_are_rate_limited_before_serialization() {
+        ICMP_RATE_LIMITER.reset();
+        let original = [0u8; 20];
+        for _ in 0..20 {
+            assert!(
+                build_dest_unreachable_limited(ICMP_CODE_PORT_UNREACHABLE, &original, 0,).is_ok()
+            );
+        }
+        assert!(matches!(
+            build_time_exceeded_limited(ICMP_CODE_TTL_EXCEEDED, &original, 0),
+            Err(IcmpError::RateLimited)
+        ));
+        ICMP_RATE_LIMITER.reset();
     }
 }

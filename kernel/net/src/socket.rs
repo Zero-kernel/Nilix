@@ -583,6 +583,12 @@ fn try_charge_port_cgroup(cgid: u64) -> Result<(), SocketError> {
     if cgid == 0 {
         return Ok(());
     }
+    if PORT_UNCHARGE_ACCOUNTING_FAULT.load(Ordering::Acquire) {
+        // Once an accounting event could not be represented, accepting more
+        // non-root charges would make the delete gate and ports.max ledger
+        // unverifiable.  Preserve isolation by failing closed until reboot.
+        return Err(SocketError::QuotaExceeded);
+    }
     match cgroup_port_hooks() {
         Some(h) => h
             .try_charge_ports(cgid, 1)
@@ -2444,7 +2450,19 @@ enum TeardownAction {
 /// so 4096 fixed slots are sufficient for every distinct pending producer,
 /// including churned/deleted-but-still-pinned nodes. This makes IRQ/timer
 /// cleanup allocation-free without reducing any socket or cgroup limit.
-const DEFERRED_PORT_UNCHARGE_SLOTS: usize = 4096;
+// MAX_CGROUPS is 4096; retain one spare slot so a transient teardown can keep
+// every legal cgroup identity plus a concurrently retired identity without
+// converting a queue-pressure condition into a kernel panic.
+const DEFERRED_PORT_UNCHARGE_SLOTS: usize = 4097;
+
+/// Sticky fail-closed latch for an impossible overflow of both deferred
+/// accounting tiers.  A pending charge references a registry-pinned cgroup,
+/// and the registry admits at most 4096 live/pinned identities, so either
+/// 4097-slot tier is already sufficient in a valid state.  The second tier is
+/// defense in depth against representation damage or a future registry-bound
+/// change.  If both reject an event, no new non-root port charge is admitted;
+/// this preserves quota safety instead of silently leaking accounting.
+static PORT_UNCHARGE_ACCOUNTING_FAULT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct DeferredPortUnchargeSlot {
@@ -2487,26 +2505,39 @@ impl DeferredPortUncharges {
         }
     }
 
-    fn enqueue(&mut self, cgid: u64, count: u64) {
+    /// Try to fold an uncharge into this fixed queue.
+    ///
+    /// `false` is returned instead of panicking or dropping the accounting
+    /// event. The owning [`SocketTable`] retries in its emergency tier and
+    /// permanently fails closed if both bounded tiers are exhausted.
+    fn enqueue(&mut self, cgid: u64, count: u64) -> bool {
         if cgid == 0 || count == 0 {
-            return;
+            return true;
         }
         let mut empty = None;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             slot.assert_valid();
             if slot.cgid == cgid {
-                slot.count = slot
-                    .count
-                    .checked_add(count)
-                    .expect("RF180-33 deferred port-uncharge count overflow");
-                return;
+                let Some(next) = slot.count.checked_add(count) else {
+                    // A valid binding table can never produce u64::MAX
+                    // distinct charges for one cgroup. Treat a corrupted
+                    // counter as an explicit queue failure so the caller can
+                    // retain the event in the emergency tier.
+                    return false;
+                };
+                slot.count = next;
+                return true;
             }
             if slot.cgid == 0 && empty.is_none() {
                 empty = Some(index);
             }
         }
-        let index = empty.expect("R180-11 deferred cgroup uncharge slots exhausted");
-        self.slots[index] = DeferredPortUnchargeSlot { cgid, count };
+        if let Some(index) = empty {
+            self.slots[index] = DeferredPortUnchargeSlot { cgid, count };
+            true
+        } else {
+            false
+        }
     }
 
     fn take_one(&mut self) -> Option<(u64, u64)> {
@@ -2761,6 +2792,10 @@ pub struct SocketTable {
     /// scheduler reschedule hook). Pure Level-8 leaf: only appended while a
     /// binding lock is already held, or alone during the process-ctx drain.
     port_uncharge_pending: Mutex<DeferredPortUncharges>,
+    /// Emergency retention tier for U11-3.  It has the same proven capacity as
+    /// the primary queue and is consulted only when the primary representation
+    /// rejects an event; no cgroup accounting event is intentionally dropped.
+    port_uncharge_emergency: Mutex<DeferredPortUncharges>,
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
@@ -2936,6 +2971,7 @@ impl SocketTable {
             per_ns_send_bytes: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-6 FIX
             per_ns_recv_bytes: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-4 FIX
             port_uncharge_pending: Mutex::new(DeferredPortUncharges::new()),      // J2-8/R180-11
+            port_uncharge_emergency: Mutex::new(DeferredPortUncharges::new()),    // R188-U11-3
             time_wait_clock: AtomicU64::new(0),
             timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
@@ -3167,7 +3203,20 @@ impl SocketTable {
             return;
         }
         // R180-11 FIX: fixed slots make timer/RX cleanup allocation-free.
-        self.port_uncharge_pending.lock().enqueue(cgid, n);
+        // R188-U11-3: never panic on count overflow and never silently drop a
+        // full-queue event.  The emergency tier is independently bounded by
+        // the same 4096-cgroup registry invariant.
+        if self.port_uncharge_pending.lock().enqueue(cgid, n) {
+            return;
+        }
+        if self.port_uncharge_emergency.lock().enqueue(cgid, n) {
+            return;
+        }
+        PORT_UNCHARGE_ACCOUNTING_FAULT.store(true, Ordering::Release);
+        kprintln!(
+            "[net] FATAL: deferred port-uncharge accounting exhausted for cgroup {}; new charges disabled",
+            cgid
+        );
     }
 
     /// J2-8: flush the deferred port-uncharge queue in PROCESS context. Snapshot
@@ -3179,7 +3228,13 @@ impl SocketTable {
         // Take one fixed slot at a time and drop the leaf lock before entering
         // cgroup Level 5. No snapshot allocation and no lock-order regression.
         loop {
-            let next = { self.port_uncharge_pending.lock().take_one() };
+            let next = {
+                let primary = self.port_uncharge_pending.lock().take_one();
+                match primary {
+                    Some(item) => Some(item),
+                    None => self.port_uncharge_emergency.lock().take_one(),
+                }
+            };
             match next {
                 Some((cgid, n)) => uncharge_port_cgroup(cgid, n),
                 None => break,
@@ -11156,11 +11211,26 @@ impl SocketTable {
         };
 
         if !payload.is_empty() {
-            child
+            if child
                 .control
                 .recv_buffer
                 .try_extend_from_slice(payload)
-                .expect("RF180-41 passive payload lost pre-reserved capacity");
+                .is_err()
+            {
+                // The capacity reservation above is a proof obligation, not a
+                // reason to trust an infallible API.  If the allocator or a
+                // future buffer implementation disagrees, roll back the
+                // namespace charge and the accept reservation and fail closed.
+                self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+                listen_state.cancel_accept_slot();
+                child.control.state = TcpState::Closed;
+                child.control.pending_reply_token = None;
+                drop(child_guard);
+                drop(listen_guard);
+                sock.mark_closed();
+                self.cleanup_tcp_connection(sock);
+                return None;
+            }
             self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
         }
         self.handle_ack_reconciled(
@@ -11183,22 +11253,55 @@ impl SocketTable {
             TcpState::Established
         };
 
-        let pending = listen_state
-            .take_syn(&syn_key, self)
-            .expect("RF180-41 exact passive SYN entry vanished under listener guard");
-        assert!(
-            Arc::ptr_eq(&pending.sock, sock),
-            "RF180-41 passive SYN identity changed under listener guard"
-        );
+        let Some(pending) = listen_state.take_syn(&syn_key, self) else {
+            // R188-U12-1 FIX: a malformed/stale final ACK must never turn an
+            // attacker-reachable state mismatch into a kernel panic.  The
+            // accept slot and receive charge are rolled back before teardown.
+            self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+            listen_state.cancel_accept_slot();
+            child.control.state = TcpState::Closed;
+            child.control.pending_reply_token = None;
+            drop(child_guard);
+            drop(listen_guard);
+            sock.mark_closed();
+            self.cleanup_tcp_connection(sock);
+            return None;
+        };
+        if !Arc::ptr_eq(&pending.sock, sock) {
+            // The listener lock makes this unreachable in the current tree,
+            // but retaining a checked rollback protects the invariant if a
+            // future lookup path changes its ownership semantics.
+            self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+            listen_state.cancel_accept_slot();
+            child.control.state = TcpState::Closed;
+            child.control.pending_reply_token = None;
+            drop(child_guard);
+            drop(listen_guard);
+            drop(pending);
+            sock.mark_closed();
+            self.cleanup_tcp_connection(sock);
+            return None;
+        }
         let PendingSyn {
             sock: accept_sock,
             syn_ack: retired_syn_ack,
             ..
         } = pending;
-        assert!(
-            listen_state.publish_accept_reserved(accept_sock),
-            "RF180-41 reserved passive accept publication failed"
-        );
+        if !listen_state.publish_accept_reserved(accept_sock) {
+            // R188-U12-1 FIX: publication failure is a normal resource error,
+            // not an invariant worth panicking over.  `publish_accept_reserved`
+            // has already returned the active-connection reservation on this
+            // branch; the SYN reservation was returned by `take_syn` above.
+            self.reconcile_ns_recv(sock.net_ns_id, &mut child.control);
+            child.control.state = TcpState::Closed;
+            child.control.pending_reply_token = None;
+            drop(child_guard);
+            drop(listen_guard);
+            drop(retired_syn_ack);
+            sock.mark_closed();
+            self.cleanup_tcp_connection(sock);
+            return None;
+        }
         listen_state.waiters().wake_one();
 
         let wake_data = !payload.is_empty() || fin;
@@ -13100,6 +13203,30 @@ mod tests {
         assert_eq!(pending.take_one(), Some((7, 5)));
         assert!(pending.is_empty());
         assert_eq!(pending.take_one(), None);
+    }
+
+    #[test]
+    fn r188_deferred_port_uncharge_overflow_is_retained_in_emergency_tier() {
+        let table = SocketTable::new();
+        {
+            let mut primary = table.port_uncharge_pending.lock();
+            for cgid in 1..=DEFERRED_PORT_UNCHARGE_SLOTS as u64 {
+                assert!(primary.enqueue(cgid, 1));
+            }
+            assert!(!primary.enqueue((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64, 1));
+        }
+
+        table.enqueue_port_uncharge((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64, 1);
+        assert_eq!(
+            table
+                .port_uncharge_emergency
+                .lock()
+                .get(&((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64))
+                .copied(),
+            Some(1),
+            "a full primary queue must retain the charge in the emergency tier"
+        );
+        assert!(!PORT_UNCHARGE_ACCOUNTING_FAULT.load(Ordering::Acquire));
     }
 
     #[test]

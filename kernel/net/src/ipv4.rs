@@ -495,7 +495,27 @@ pub fn build_ipv4_header(
     payload_len: u16,
     ttl: u8,
 ) -> [u8; IPV4_HEADER_MIN_LEN] {
-    let total_len = (IPV4_HEADER_MIN_LEN as u16) + payload_len;
+    // Keep the historical infallible API for existing callers, but make an
+    // oversized payload fail closed instead of wrapping the wire length.  A
+    // zeroed header is rejected by the parser and therefore cannot be sent as
+    // a plausible packet; new callers should prefer the checked variant below.
+    let Some(header) = try_build_ipv4_header(src, dst, proto, payload_len, ttl) else {
+        return [0u8; IPV4_HEADER_MIN_LEN];
+    };
+    header
+}
+
+/// Checked IPv4 header builder.  The 16-bit total-length field includes the
+/// fixed header, so payloads larger than `u16::MAX - 20` are invalid and must
+/// be rejected before any arithmetic or transmission occurs.
+pub fn try_build_ipv4_header(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: Ipv4Proto,
+    payload_len: u16,
+    ttl: u8,
+) -> Option<[u8; IPV4_HEADER_MIN_LEN]> {
+    let total_len = (IPV4_HEADER_MIN_LEN as u16).checked_add(payload_len)?;
     let mut hdr = [0u8; IPV4_HEADER_MIN_LEN];
 
     // Version (4) + IHL (5)
@@ -525,7 +545,7 @@ pub fn build_ipv4_header(
     hdr[10] = (checksum >> 8) as u8;
     hdr[11] = (checksum & 0xff) as u8;
 
-    hdr
+    Some(hdr)
 }
 
 // ============================================================================
@@ -545,6 +565,18 @@ mod tests {
 
         assert!(!Ipv4Addr::new(192, 168, 1, 1).is_valid_source() == false);
         assert!(!Ipv4Addr::new(255, 255, 255, 255).is_valid_source());
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected_without_length_wrap() {
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(192, 0, 2, 2);
+        assert!(try_build_ipv4_header(src, dst, Ipv4Proto::Udp, u16::MAX, 64).is_none());
+        assert!(try_build_ipv4_header(src, dst, Ipv4Proto::Udp, u16::MAX - 20, 64).is_some());
+        assert_eq!(
+            build_ipv4_header(src, dst, Ipv4Proto::Udp, u16::MAX, 64),
+            [0; 20]
+        );
     }
 
     #[test]

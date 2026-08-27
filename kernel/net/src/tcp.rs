@@ -1981,6 +1981,14 @@ pub fn update_rtt(tcb: &mut TcpControlBlock, sample_us: u64) {
 pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUpdate {
     let mut update = AckUpdate::default();
 
+    // R188-U14-1 FIX: enforce the RFC 793 acceptability boundary at this
+    // shared helper as well as at callers.  A future or corrupted ACK must not
+    // advance `snd_una` past `snd_nxt` or clear live send-buffer data merely
+    // because a new caller forgot the outer precondition.
+    if seq_gt(ack_num, tcb.snd_nxt) {
+        return update;
+    }
+
     // R148-I3 FIX: Any ACK from the peer (including duplicate ACKs from keepalive
     // responses) proves the connection is alive — reset the keepalive probe count
     // and update last_activity so the idle timer restarts.
@@ -2883,6 +2891,23 @@ static ISN_SECRET_WEAK: AtomicBool = AtomicBool::new(true);
 /// R62-3 FIX: Counter for connections established with weak ISN entropy.
 /// Used for monitoring/auditing purposes.
 static ISN_WEAK_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+static ISN_WEAK_AUDIT_EMITTED: AtomicBool = AtomicBool::new(false);
+static ISN_WEAK_AUDIT_HOOK: Once<fn(u32)> = Once::new();
+
+/// Register the kernel audit bridge for the first weak-entropy ISN event.
+/// The net crate stays independent of the top-level audit crate; the hook is
+/// a one-time, allocation-free publication performed during subsystem init.
+pub fn register_weak_isn_audit_hook(hook: fn(u32)) {
+    ISN_WEAK_AUDIT_HOOK.call_once(|| hook);
+}
+
+/// Number of connections whose ISN was generated before strong entropy was
+/// available.  Exposed for diagnostics and audit consumers rather than
+/// leaving the counter as write-only state (U14-3).
+#[inline]
+pub fn weak_isn_connection_count() -> u32 {
+    ISN_WEAK_CONNECTIONS.load(Ordering::Acquire)
+}
 
 /// Get or initialize the ISN secret key from CSPRNG.
 ///
@@ -3000,7 +3025,18 @@ pub fn generate_isn(
     // R62-3 FIX: Track connections established with weak entropy for auditing
     // This allows monitoring of security posture during early boot
     if ISN_SECRET_WEAK.load(Ordering::Relaxed) {
-        ISN_WEAK_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        let count = ISN_WEAK_CONNECTIONS
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        // Emit one bounded informational record per boot/entropy epoch.  A
+        // per-connection audit record would itself become an allocation/log
+        // amplification vector during SYN floods; the exported counter keeps
+        // the full total available to later snapshots.
+        if !ISN_WEAK_AUDIT_EMITTED.swap(true, Ordering::AcqRel) {
+            if let Some(hook) = ISN_WEAK_AUDIT_HOOK.get() {
+                hook(count);
+            }
+        }
     }
 
     // Pack 4-tuple into 64-bit values for mixing
@@ -3510,6 +3546,15 @@ mod tests {
         // A bit flip must not validate against the known checksum.
         syn[4] ^= 0x01;
         assert!(!verify_tcp_checksum(src, dst, &syn));
+    }
+
+    #[test]
+    fn runtime_syn_fixture_checksum_matches_its_ipv4_endpoints() {
+        let src = Ipv4Addr([10, 0, 0, 2]);
+        let dst = Ipv4Addr([10, 0, 0, 1]);
+        let segment = try_build_tcp_segment(src, dst, 12345, 80, 1, 0, TCP_FLAG_SYN, 8192, &[])
+            .expect("runtime SYN fixture should be buildable");
+        assert!(verify_tcp_checksum(src, dst, &segment));
     }
 
     #[test]

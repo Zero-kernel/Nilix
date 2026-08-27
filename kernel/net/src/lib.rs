@@ -117,20 +117,22 @@ pub use ethernet::{
 };
 pub use firewall::{
     firewall_default_rules, firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match,
-    CtStateMask, FirewallAction, FirewallPacket, FirewallRule, FirewallRuleBuilder, FirewallStats,
-    FirewallStatsSnapshot, FirewallTable, FirewallVerdict, IpCidrMatch, PortRange,
+    try_firewall_table_for_ns, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
+    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
+    IpCidrMatch, PortRange,
 };
 pub use fragment::{
     cleanup_expired_fragments, fragment_cache, process_fragment, FragmentCache, FragmentDropReason,
     FragmentKey, FragmentStats, FRAG_TIMEOUT_MS, MAX_FRAGS_PER_QUEUE, MAX_PACKET_SIZE,
 };
 pub use icmp::{
-    build_echo_reply, parse_icmp, IcmpError, IcmpHeader, TokenBucket, ICMP_RATE_LIMITER,
-    ICMP_TYPE_DEST_UNREACHABLE, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
-    ICMP_TYPE_TIME_EXCEEDED,
+    build_dest_unreachable_limited, build_echo_reply, build_time_exceeded_limited, parse_icmp,
+    IcmpError, IcmpHeader, TokenBucket, ICMP_RATE_LIMITER, ICMP_TYPE_DEST_UNREACHABLE,
+    ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST, ICMP_TYPE_TIME_EXCEEDED,
 };
 pub use ipv4::{
-    build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
+    build_ipv4_header, compute_checksum, parse_ipv4, try_build_ipv4_header, Ipv4Addr, Ipv4Error,
+    Ipv4Header, Ipv4Proto,
 };
 pub use socket::{
     register_cgroup_port_hooks, register_netns_device_hooks, register_socket_wait_hooks,

@@ -47,12 +47,12 @@ use crate::ethernet::{
     build_ethernet_frame_from_parts, parse_ethernet, try_build_ethernet_frame_from_parts, EthAddr,
     EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
-use crate::firewall::{firewall_table_for_ns, FirewallAction, FirewallPacket, FirewallVerdict};
+use crate::firewall::{try_firewall_table_for_ns, FirewallAction, FirewallPacket, FirewallVerdict};
 use crate::fragment::{
     cleanup_expired_fragments, process_fragment as reassemble_fragment, FragmentDropReason,
 };
 use crate::icmp::{
-    build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER,
+    build_dest_unreachable_limited, build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER,
     ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
@@ -725,7 +725,10 @@ fn egress_firewall_allows_prepared(
         ct_state: ct_decision,
     };
 
-    let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
+        return EgressFirewallDecision::Deny;
+    };
+    let fw_verdict = fw_table.evaluate(&fw_pkt);
     crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
 
     if matches!(fw_verdict.action, FirewallAction::Accept) {
@@ -791,7 +794,10 @@ fn egress_firewall_allows_prepared(
         ct_state: None,
     };
 
-    let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
+        return EgressFirewallDecision::Deny;
+    };
+    let fw_verdict = fw_table.evaluate(&fw_pkt);
     crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
 
     if matches!(fw_verdict.action, FirewallAction::Accept) {
@@ -1004,7 +1010,12 @@ fn process_udp(
         dst_port: Some(header.dst_port),
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
+        return ProcessResult::Dropped(DropReason::Firewall {
+            rule_id: None,
+            rejected: false,
+        });
+    };
     let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
@@ -1076,6 +1087,11 @@ fn process_icmp(
             ip_hdr.dst,
             icmp_hdr.icmp_type,
             icmp_hdr.code,
+            if icmp_hdr.is_echo_request() || icmp_hdr.is_echo_reply() {
+                icmp_hdr.echo_id()
+            } else {
+                0
+            },
             packet.len(),
             now_ms,
         ))
@@ -1102,7 +1118,12 @@ fn process_icmp(
         dst_port: None,
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
+        return ProcessResult::Dropped(DropReason::Firewall {
+            rule_id: None,
+            rejected: false,
+        });
+    };
     let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, packet, now_ms)
@@ -1296,7 +1317,12 @@ fn process_tcp(
         dst_port: Some(tcp_hdr.dst_port),
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
+        return ProcessResult::Dropped(DropReason::Firewall {
+            rule_id: None,
+            rejected: false,
+        });
+    };
     let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
@@ -1895,6 +1921,14 @@ fn build_frame_and_transmit(
     // downstream consumer (RF180-41).
     let cfg_pre = tx_net_config(net_ns_id)?;
 
+    // U13-1 FIX: resolve and mint the device-ownership token before any
+    // namespace-specific policy, ARP probing, frame construction, or DMA
+    // allocation.  A namespace that cannot transmit must consume no
+    // allocator/cache resources on a denied path.  The token is retained for
+    // the complete send and is the same device object used by the final
+    // transmit closure, eliminating a check/use gap.
+    let dev = resolve_authorized_tx_device(net_ns_id)?;
+
     // Conntrack-aware ct_state lookup (only with conntrack feature). Keep this
     // coupled to prepared-frame rechecks through one classifier.
     #[cfg(feature = "conntrack")]
@@ -1919,7 +1953,9 @@ fn build_frame_and_transmit(
         dst_port,
         ct_state: ct_decision,
     };
-    let fw_table = firewall_table_for_ns(net_ns_id);
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
+        return Err(TxError::FirewallDenied);
+    };
     let fw_verdict = fw_table.evaluate(&fw_pkt);
     if matches!(
         fw_verdict.action,
@@ -1986,13 +2022,6 @@ fn build_frame_and_transmit(
         }
     };
     data.copy_from_slice(&frame);
-
-    // Transmit via network device.
-    // D1-ISO-NETNS-DATAPLANE FIX: resolution goes through the single
-    // namespace-gated resolver — a netns that does not own the device cannot
-    // egress on it (fail-closed EPERM), closing the policy-only TX isolation
-    // hole where a CLONE_NEWNET child transmitted with the root ns's IP/MAC.
-    let dev = resolve_authorized_tx_device(net_ns_id)?;
 
     #[cfg(feature = "conntrack")]
     {
@@ -2953,15 +2982,6 @@ fn apply_firewall_verdict(
                 }));
             }
 
-            // R64-1 FIX: Rate limit firewall REJECT ICMP responses
-            // Prevents reflection/amplification attacks
-            if !ICMP_RATE_LIMITER.allow(now_ms) {
-                return Some(ProcessResult::Dropped(DropReason::Firewall {
-                    rule_id: verdict.rule_id,
-                    rejected: true,
-                }));
-            }
-
             // R64-5 FIX: For TCP rejections, send a TCP RST per RFC 793 instead of ICMP
             // This is more appropriate for TCP as RST immediately terminates the connection
             // and is the standard response for rejected TCP traffic.
@@ -3046,13 +3066,15 @@ fn apply_firewall_verdict(
                     rejected: true,
                 }));
             }
-            let icmp = build_dest_unreachable(icmp_code, &quoted);
-            if icmp.is_empty() {
-                return Some(ProcessResult::Dropped(DropReason::Firewall {
-                    rule_id: verdict.rule_id,
-                    rejected: true,
-                }));
-            }
+            let icmp = match build_dest_unreachable_limited(icmp_code, &quoted, now_ms) {
+                Ok(packet) => packet,
+                Err(_) => {
+                    return Some(ProcessResult::Dropped(DropReason::Firewall {
+                        rule_id: verdict.rule_id,
+                        rejected: true,
+                    }));
+                }
+            };
             let ip_reply = build_ipv4_header(
                 ip_hdr.dst,
                 ip_hdr.src,
@@ -3833,7 +3855,7 @@ mod tests {
 
     #[test]
     fn rf180_51_malformed_transport_never_collapses_into_firewall_denial() {
-        use crate::firewall::{firewall_remove_ns, FirewallRule};
+        use crate::firewall::{firewall_remove_ns, firewall_table_for_ns, FirewallRule};
 
         // RF186-20 FIX: hosted net tests intentionally register no
         // NetNsDeviceHooks. Non-root identities must therefore fail closed at
@@ -4017,7 +4039,9 @@ mod tests {
         use crate::conntrack::{
             conntrack_table, ct_drain_ns, CtProtoState, FlowKey, TcpCtState, IPPROTO_TCP,
         };
-        use crate::firewall::{firewall_remove_ns, FirewallRule, IpCidrMatch};
+        use crate::firewall::{
+            firewall_remove_ns, firewall_table_for_ns, FirewallRule, IpCidrMatch,
+        };
 
         const NS: u64 = 0x7e57_1804_1002;
         let peer_ip = Ipv4Addr::new(192, 0, 2, 30);
