@@ -316,6 +316,9 @@ use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use spin::Mutex as RawMutex;
 use spin::MutexGuard as RawMutexGuard;
+use spin::RwLock as RawRwLock;
+use spin::RwLockReadGuard as RawRwLockReadGuard;
+use spin::RwLockWriteGuard as RawRwLockWriteGuard;
 
 /// Lock level enumeration for documentation and debugging
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -586,6 +589,191 @@ impl<'a, T> Deref for LockdepMutexGuard<'a, T> {
 }
 
 impl<'a, T> DerefMut for LockdepMutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+// ============================================================================
+// E.4 Lockdep: RwLock Wrapper
+// ============================================================================
+
+/// Lockdep-aware reader/writer lock.
+///
+/// The scheduler's cpuset registry is read from scheduler paths while a
+/// ready-queue/PCB lock may already be held.  Keeping it as a plain `spin::RwLock`
+/// made that ordering invisible to lockdep.  This wrapper records both read and
+/// write acquisitions under one class key, so a future mutation path cannot
+/// silently introduce an ABBA edge.
+pub struct LockdepRwLock<T> {
+    class: LockClassKey,
+    level: LockLevel,
+    inner: RawRwLock<T>,
+}
+
+impl<T> LockdepRwLock<T> {
+    pub const fn new(value: T, class: LockClassKey, level: LockLevel) -> Self {
+        Self {
+            class,
+            level,
+            inner: RawRwLock::new(value),
+        }
+    }
+
+    #[inline]
+    pub fn read(&self) -> LockdepRwLockReadGuard<'_, T> {
+        #[cfg(debug_assertions)]
+        let guard = x86_64::instructions::interrupts::without_interrupts(|| {
+            lock_tracking::check_acquire(self.class, self.level);
+            let guard = self.inner.read();
+            lock_tracking::record_acquire(self.class, self.level);
+            guard
+        });
+        #[cfg(not(debug_assertions))]
+        let guard = self.inner.read();
+        LockdepRwLockReadGuard {
+            lock: self,
+            guard: ManuallyDrop::new(guard),
+        }
+    }
+
+    #[inline]
+    pub fn try_read(&self) -> Option<LockdepRwLockReadGuard<'_, T>> {
+        #[cfg(debug_assertions)]
+        {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                lock_tracking::check_acquire(self.class, self.level);
+                self.inner.try_read().map(|guard| {
+                    lock_tracking::record_acquire(self.class, self.level);
+                    LockdepRwLockReadGuard {
+                        lock: self,
+                        guard: ManuallyDrop::new(guard),
+                    }
+                })
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.inner.try_read().map(|guard| LockdepRwLockReadGuard {
+                lock: self,
+                guard: ManuallyDrop::new(guard),
+            })
+        }
+    }
+
+    #[inline]
+    pub fn write(&self) -> LockdepRwLockWriteGuard<'_, T> {
+        #[cfg(debug_assertions)]
+        let guard = x86_64::instructions::interrupts::without_interrupts(|| {
+            lock_tracking::check_acquire(self.class, self.level);
+            let guard = self.inner.write();
+            lock_tracking::record_acquire(self.class, self.level);
+            guard
+        });
+        #[cfg(not(debug_assertions))]
+        let guard = self.inner.write();
+        LockdepRwLockWriteGuard {
+            lock: self,
+            guard: ManuallyDrop::new(guard),
+        }
+    }
+
+    #[inline]
+    pub fn try_write(&self) -> Option<LockdepRwLockWriteGuard<'_, T>> {
+        #[cfg(debug_assertions)]
+        {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                lock_tracking::check_acquire(self.class, self.level);
+                self.inner.try_write().map(|guard| {
+                    lock_tracking::record_acquire(self.class, self.level);
+                    LockdepRwLockWriteGuard {
+                        lock: self,
+                        guard: ManuallyDrop::new(guard),
+                    }
+                })
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.inner.try_write().map(|guard| LockdepRwLockWriteGuard {
+                lock: self,
+                guard: ManuallyDrop::new(guard),
+            })
+        }
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+}
+
+unsafe impl<T: Send> Send for LockdepRwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for LockdepRwLock<T> {}
+
+pub struct LockdepRwLockReadGuard<'a, T> {
+    lock: &'a LockdepRwLock<T>,
+    guard: ManuallyDrop<RawRwLockReadGuard<'a, T>>,
+}
+
+impl<T> Drop for LockdepRwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let class = self.lock.class;
+            let level = self.lock.level;
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                unsafe { ManuallyDrop::drop(&mut self.guard) };
+                lock_tracking::record_release(class, level);
+            });
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
+    }
+}
+
+impl<T> Deref for LockdepRwLockReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+pub struct LockdepRwLockWriteGuard<'a, T> {
+    lock: &'a LockdepRwLock<T>,
+    guard: ManuallyDrop<RawRwLockWriteGuard<'a, T>>,
+}
+
+impl<T> Drop for LockdepRwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let class = self.lock.class;
+            let level = self.lock.level;
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                unsafe { ManuallyDrop::drop(&mut self.guard) };
+                lock_tracking::record_release(class, level);
+            });
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
+    }
+}
+
+impl<T> Deref for LockdepRwLockWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for LockdepRwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.guard
     }

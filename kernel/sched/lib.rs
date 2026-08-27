@@ -35,7 +35,10 @@ pub mod lock_ordering;
 pub use enhanced_scheduler::Scheduler;
 
 // Re-export lockdep types for use by other modules
-pub use lock_ordering::{LockClassKey, LockLevel, LockdepMutex};
+pub use lock_ordering::{
+    LockClassKey, LockLevel, LockdepMutex, LockdepRwLock, LockdepRwLockReadGuard,
+    LockdepRwLockWriteGuard,
+};
 
 // Re-export cpuset types
 pub use cpuset::{CpusetError, CpusetId, CpusetNode};

@@ -40,10 +40,10 @@
 //! // The process is now restricted to CPUs 0-3
 //! ```
 
+use crate::lock_ordering::{LockClassKey, LockLevel, LockdepMutex, LockdepRwLock};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
 
 /// Unique identifier for a cpuset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -95,7 +95,10 @@ impl CpusetNode {
     /// Set the CPU mask for this cpuset.
     ///
     /// Note: Caller must ensure the new mask is a subset of the parent's mask.
-    pub fn set_cpus(&self, cpus: u64) {
+    /// Internal publication primitive.  Callers outside this module must use
+    /// `cpuset_set_cpus`, which validates online/parent masks and rejects an
+    /// empty set before reaching the atomic store (U40-4).
+    fn set_cpus(&self, cpus: u64) {
         self.cpus_allowed.store(cpus, Ordering::Release);
     }
 
@@ -158,10 +161,15 @@ impl CpusetRegistry {
 }
 
 /// Global cpuset registry protected by RwLock.
-static CPUSET_REGISTRY: RwLock<Option<CpusetRegistry>> = RwLock::new(None);
+static CPUSET_REGISTRY: LockdepRwLock<Option<CpusetRegistry>> = LockdepRwLock::new(
+    None,
+    LockClassKey::new("CPUSET_REGISTRY"),
+    LockLevel::Process,
+);
 
 /// Root cpuset (contains all online CPUs).
-static ROOT_CPUSET: Mutex<Option<Arc<CpusetNode>>> = Mutex::new(None);
+static ROOT_CPUSET: LockdepMutex<Option<Arc<CpusetNode>>> =
+    LockdepMutex::new(None, LockClassKey::new("ROOT_CPUSET"), LockLevel::Process);
 
 /// Initialize the cpuset subsystem.
 ///

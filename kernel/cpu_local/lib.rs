@@ -90,14 +90,20 @@ pub fn set_smp_init_done() {
 /// allocator, lock, or KCOV tracepoint. Nested NMIs are supported.
 #[inline]
 pub fn nmi_enter() {
-    NMI_CONTEXT_COUNT.fetch_add(1, Ordering::AcqRel);
+    NMI_CONTEXT_COUNT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_add(1)
+        })
+        .expect("NMI nesting counter overflow");
 }
 
 /// Leave an NMI context entered through [`nmi_enter`].
 #[inline]
 pub fn nmi_exit() {
-    let old = NMI_CONTEXT_COUNT.fetch_sub(1, Ordering::AcqRel);
-    assert!(old > 0, "nmi_exit called with count already 0");
+    let result = NMI_CONTEXT_COUNT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        count.checked_sub(1)
+    });
+    assert!(result.is_ok(), "nmi_exit called with count already 0");
 }
 
 /// Return whether any CPU is currently executing an NMI handler.

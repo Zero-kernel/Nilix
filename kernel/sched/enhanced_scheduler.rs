@@ -1613,7 +1613,13 @@ impl Scheduler {
                 continue;
             }
             if let Some(pcb) = proc_arc.try_lock() {
-                let Some(effective_mask) = Self::effective_allowed_cpus(&pcb) else {
+                // U40-2 FIX: source ready-queue locks are held while
+                // selecting a victim.  The blocking cpuset registry read
+                // would invert the scheduler/cpuset lock order and can
+                // deadlock against affinity updates.  Use the non-blocking
+                // snapshot; contention simply leaves the task in place for a
+                // later steal attempt.
+                let Some(effective_mask) = Self::try_effective_allowed_cpus(&pcb) else {
                     candidate = Self::select_next_for_migration_locked(
                         &guard,
                         source_cpu,

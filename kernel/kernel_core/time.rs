@@ -27,6 +27,10 @@ static TCP_TIMER_DEFERRED_TS: AtomicU64 = AtomicU64::new(0);
 
 /// R65-6 FIX: Whether TIME_WAIT sweep is deferred.
 static TCP_TIMER_DEFERRED_TW: AtomicBool = AtomicBool::new(false);
+/// Monotonic publication generation for deferred timer work.  A drain may run
+/// concurrently with an IRQ producer; clearing the flag is valid only if no
+/// newer generation was published in the meantime.
+static TCP_TIMER_DEFERRED_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// TCP timer sweep interval in milliseconds (data/FIN retransmission).
 ///
@@ -126,6 +130,11 @@ pub fn on_timer_tick() {
         if run_tw {
             TCP_TIMER_DEFERRED_TW.store(true, Ordering::Relaxed);
         }
+        TCP_TIMER_DEFERRED_GEN
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .ok();
         TCP_TIMER_DEFERRED.store(true, Ordering::Release);
         crate::request_resched_from_irq();
     }
@@ -191,6 +200,7 @@ pub fn drain_deferred_tcp_timers() {
     // Get deferred parameters
     let ts = TCP_TIMER_DEFERRED_TS.load(Ordering::Relaxed);
     let sweep_tw = TCP_TIMER_DEFERRED_TW.load(Ordering::Relaxed);
+    let generation = TCP_TIMER_DEFERRED_GEN.load(Ordering::Acquire);
     let current = if ts == 0 { current_timestamp_ms() } else { ts };
 
     // R151-9 FIX: Drive fragment reassembly cleanup from the slow TCP timer sweep.
@@ -205,8 +215,15 @@ pub fn drain_deferred_tcp_timers() {
     // Use blocking variant which will wait for locks
     let completed = net::socket_table().run_tcp_timers_blocking(current, sweep_tw);
 
-    if completed {
-        TCP_TIMER_DEFERRED.store(false, Ordering::Release);
+    if completed
+        && TCP_TIMER_DEFERRED_GEN.load(Ordering::Acquire) == generation
+        && TCP_TIMER_DEFERRED
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        // The generation check + CAS closes the lost-update window: an IRQ
+        // that publishes newer work either changes the generation before this
+        // point or wins the flag race and leaves it set for the next drain.
         TCP_TIMER_DEFERRED_TW.store(false, Ordering::Relaxed);
         TCP_TIMER_DEFERRED_TS.store(0, Ordering::Relaxed);
     }
