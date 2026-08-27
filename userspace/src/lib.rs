@@ -29,12 +29,17 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod libc;
+pub mod shell_parse;
 pub mod syscall;
 
 /// Panic handler for user-space programs.
 ///
 /// Attempts to print an error message and exits with code 1.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     // Try to print panic message to stderr

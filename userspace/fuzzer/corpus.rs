@@ -104,12 +104,26 @@ impl Corpus {
             // Cull oldest entries if over limit
             if self.entries.len() > self.max_size {
                 // Sort by energy (descending), remove lowest
-                self.entries
-                    .sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap());
+                self.entries.sort_by(|a, b| {
+                    b.energy
+                        .partial_cmp(&a.energy)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                });
                 self.entries.truncate(self.max_size);
             }
 
-            true
+            // The union is a derived view of the retained corpus, not an
+            // append-only event log.  Rebuild it after culling so slots owned
+            // only by evicted entries become eligible for discovery again
+            // (U57-5).
+            self.global_slots.clear();
+            for retained in &self.entries {
+                for &slot in &retained.occupied_slots {
+                    self.global_slots.insert(slot);
+                }
+            }
+
+            !self.entries.is_empty()
         } else {
             false
         }
@@ -238,9 +252,10 @@ fn simple_rand(seed: &mut u64) -> u64 {
 /// Check whether a bitmap snapshot contains previously unoccupied slots.
 pub fn has_new_coverage(occupied_slots: &[u32], global_slots: &BTreeSet<u32>) -> (bool, Vec<u32>) {
     let mut new_slots = Vec::new();
+    let mut seen = BTreeSet::new();
 
     for &slot in occupied_slots {
-        if !global_slots.contains(&slot) {
+        if !global_slots.contains(&slot) && seen.insert(slot) {
             new_slots.push(slot);
         }
     }
@@ -272,5 +287,37 @@ mod tests {
         let (has_new, new_slots) = has_new_coverage(&[3, 7, 31], corpus.get_occupied_slots());
         assert!(has_new);
         assert_eq!(new_slots, alloc::vec![7]);
+
+        let (has_duplicate_new, duplicate_slots) =
+            has_new_coverage(&[7, 7, 8], corpus.get_occupied_slots());
+        assert!(has_duplicate_new);
+        assert_eq!(duplicate_slots, alloc::vec![7, 8]);
+    }
+
+    #[test]
+    fn culled_entries_do_not_leave_stale_global_slots() {
+        let mut corpus = Corpus::new(1);
+        let mut first = CorpusEntry::new(Vec::new(), alloc::vec![11], 1);
+        first.energy = 0.1;
+        assert!(corpus.add(first));
+
+        let mut second = CorpusEntry::new(Vec::new(), alloc::vec![22], 1);
+        second.energy = 1.0;
+        assert!(corpus.add(second));
+        assert_eq!(corpus.len(), 1);
+        assert_eq!(
+            corpus
+                .get_occupied_slots()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            alloc::vec![22]
+        );
+
+        // Slot 11 belonged only to the evicted entry and must be considered
+        // new again instead of being suppressed by stale union state.
+        let reintroduced = CorpusEntry::new(Vec::new(), alloc::vec![11], 1);
+        assert!(corpus.add(reintroduced));
+        assert_eq!(corpus.total_occupied_slots(), 1);
     }
 }

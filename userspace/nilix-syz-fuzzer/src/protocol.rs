@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -129,7 +130,10 @@ pub struct DecodedProgram {
     pub binding: ProgramBinding,
 }
 
-pub fn encode_program(program: &SyscallProgram, identity: &ExecutionIdentity) -> Result<EncodedProgram> {
+pub fn encode_program(
+    program: &SyscallProgram,
+    identity: &ExecutionIdentity,
+) -> Result<EncodedProgram> {
     program.validate()?;
 
     let mut bytes = vec![0u8; PROGRAM_HEADER_SIZE];
@@ -331,7 +335,9 @@ pub fn decode_result(bytes: &[u8], binding: &ProgramBinding) -> Result<DecodedRe
 
     let mut returns = Vec::with_capacity(syscall_count as usize);
     for chunk in bytes[returns_offset..bitmap_offset].chunks_exact(8) {
-        returns.push(i64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")));
+        returns.push(i64::from_le_bytes(
+            chunk.try_into().expect("eight-byte chunk"),
+        ));
     }
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&bytes[tag_offset..]);
@@ -374,9 +380,7 @@ fn encode_argument(bytes: &mut Vec<u8>, arg: &Argument) -> Result<()> {
         Argument::Null => (ARG_NULL, &[][..], 0usize, 0),
         Argument::Buffer(data) => (ARG_INPUT, data.as_slice(), data.len(), 0),
         Argument::Output { capacity } => (ARG_OUTPUT, &[][..], *capacity as usize, 0),
-        Argument::InOut { data, capacity } => {
-            (ARG_INOUT, data.as_slice(), *capacity as usize, 0)
-        }
+        Argument::InOut { data, capacity } => (ARG_INOUT, data.as_slice(), *capacity as usize, 0),
     };
     bytes[start] = kind;
     bytes[start + 1] = 0;
@@ -492,24 +496,15 @@ fn program_digest(bytes: &[u8]) -> Result<[u8; 32]> {
 }
 
 fn hmac_sha256(key: &[u8; 32], domain: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 64;
-    let mut inner_key = [0x36u8; BLOCK_SIZE];
-    let mut outer_key = [0x5cu8; BLOCK_SIZE];
-    for (index, byte) in key.iter().enumerate() {
-        inner_key[index] ^= byte;
-        outer_key[index] ^= byte;
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_key);
-    inner.update(domain);
-    inner.update(message);
-    let inner_digest = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_key);
-    outer.update(inner_digest);
-    outer.finalize().into()
+    // Keep the wire-domain separation while delegating HMAC construction to
+    // the audited RustCrypto implementation (U58-7).  The previous hand
+    // expansion duplicated the primitive and made future maintenance depend
+    // on a textbook implementation remaining flawless.
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key).expect("32-byte HMAC key is valid");
+    mac.update(domain);
+    mac.update(message);
+    mac.finalize().into_bytes().into()
 }
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -663,7 +658,10 @@ mod tests {
         let decoded = decode_program(&encoded.bytes).unwrap();
         assert_eq!(decoded.program, sample_program());
         assert_eq!(decoded.binding.sequence, 7);
-        assert_eq!(decoded.binding.program_digest, encoded.binding.program_digest);
+        assert_eq!(
+            decoded.binding.program_digest,
+            encoded.binding.program_digest
+        );
     }
 
     #[test]
@@ -743,5 +741,14 @@ mod tests {
         coverage[0] = 1;
         let result = encode_result_for_test(&first.binding, &[0, 0], &coverage).unwrap();
         assert!(decode_result(&result, &second.binding).is_err());
+    }
+
+    #[test]
+    fn hmac_domain_separation_changes_authentication_tag() {
+        let key = [0x11u8; 32];
+        let message = b"same message";
+        let program_tag = hmac_sha256(&key, PROGRAM_DOMAIN, message);
+        let result_tag = hmac_sha256(&key, RESULT_DOMAIN, message);
+        assert_ne!(program_tag, result_tag);
     }
 }

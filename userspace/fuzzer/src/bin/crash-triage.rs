@@ -456,8 +456,9 @@ mod tests {
         let other_target =
             keyed_candidate_id(TEST_KEY, "fuzz_memory_ops", "crash", &payload).unwrap();
         let other_key = keyed_candidate_id(OTHER_KEY, "fuzz_syscall", "crash", &payload).unwrap();
-        let other_payload = keyed_candidate_id(TEST_KEY, "fuzz_syscall", "crash", &[0xff, 0x00, 0x80, b'B'])
-            .unwrap();
+        let other_payload =
+            keyed_candidate_id(TEST_KEY, "fuzz_syscall", "crash", &[0xff, 0x00, 0x80, b'B'])
+                .unwrap();
         assert_eq!(first, repeated);
         assert_ne!(first, other_target);
         assert_ne!(first, other_key);
@@ -480,8 +481,7 @@ mod tests {
         for (filename, kind) in findings {
             write_artifact(&input, "fuzz_vfs_path", filename, b"same-payload");
             assert_eq!(artifact_kind(OsStr::new(filename)), Some(kind));
-            let id = keyed_candidate_id(TEST_KEY, "fuzz_vfs_path", kind, b"same-payload")
-                .unwrap();
+            let id = keyed_candidate_id(TEST_KEY, "fuzz_vfs_path", kind, b"same-payload").unwrap();
             assert_keyed_id_shape(&id);
             assert!(ids.insert(id));
         }

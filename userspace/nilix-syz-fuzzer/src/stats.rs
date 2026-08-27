@@ -6,6 +6,7 @@ pub struct FuzzStats {
     pub crashes: u64,
     pub timeouts: u64,
     pub hangs: u64,
+    pub errors: u64,
     pub new_coverage: u64,
     start_time: Instant,
     last_report: Instant,
@@ -20,6 +21,7 @@ impl FuzzStats {
             crashes: 0,
             timeouts: 0,
             hangs: 0,
+            errors: 0,
             new_coverage: 0,
             start_time: now,
             last_report: now,
@@ -31,11 +33,12 @@ impl FuzzStats {
         let exec_per_sec = self.iterations as f64 / elapsed.as_secs_f64();
 
         println!(
-            "[{:>6}s] iters={:<8} exec/s={:<6.1} crashes={:<4} new_cov={:<6} success={:<6} timeout={:<4}",
+            "[{:>6}s] iters={:<8} exec/s={:<6.1} crashes={:<4} errors={:<4} new_cov={:<6} success={:<6} timeout={:<4}",
             elapsed.as_secs(),
             self.iterations,
             exec_per_sec,
             self.crashes,
+            self.errors,
             self.new_coverage,
             self.successes,
             self.timeouts
@@ -51,9 +54,13 @@ impl FuzzStats {
         println!("Crashes:          {}", self.crashes);
         println!("Timeouts:         {}", self.timeouts);
         println!("Hangs:            {}", self.hangs);
+        println!("Errors:           {}", self.errors);
         println!("New coverage:     {}", self.new_coverage);
         println!("Elapsed time:     {}s", elapsed.as_secs());
-        println!("Exec/sec:         {:.1}", self.iterations as f64 / elapsed.as_secs_f64());
+        println!(
+            "Exec/sec:         {:.1}",
+            self.iterations as f64 / elapsed.as_secs_f64()
+        );
     }
 
     pub fn should_report(&self) -> bool {

@@ -1,16 +1,18 @@
 // Crash triage system - deduplication and minimization
 // Phase 7: CI Integration & Continuous Fuzzing
 
-use crate::minimizer::{Minimizer, FailCondition};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::hash::{Hash, Hasher};
+
+macro_rules! klog {
+    ($fmt:expr) => { klog($fmt) };
+    ($fmt:expr, $($arg:tt)*) => { klog(&alloc::format!($fmt, $($arg)*)) };
+}
 
 /// Crash triage system
 pub struct CrashTriageSystem {
     seen_crashes: BTreeMap<CrashSignature, CrashInfo>,
-    minimizer: Minimizer,
 }
 
 /// Crash signature for deduplication
@@ -106,12 +108,33 @@ impl CrashTriageSystem {
     pub fn new() -> Self {
         Self {
             seen_crashes: BTreeMap::new(),
-            minimizer: Minimizer::new(Vec::new(), FailCondition::Crash),
         }
     }
 
     /// Process a crash and determine if it's new or duplicate
     pub fn process_crash(&mut self, crash: CrashInput) -> TriageResult {
+        // The legacy API has no executor callback, so it must not claim that
+        // arbitrary byte deletions still reproduce a crash.  Preserve the
+        // original input; callers with an executor can opt into verified
+        // minimization through `process_crash_with_tester`.
+        self.process_crash_with_tester(crash, |_candidate, _signature| false)
+    }
+
+    /// Process a crash while using a caller-provided reproducer oracle.
+    ///
+    /// The old Phase-7 scaffold attempted to feed raw `Vec<u8>` inputs into
+    /// the syscall-oriented Phase-6 `Minimizer` and referenced a
+    /// non-existent `CrashSignature` condition.  This byte-oriented API keeps
+    /// the phases type-safe and only minimizes when the real executor confirms
+    /// that a candidate still reproduces the same signature (U57-4).
+    pub fn process_crash_with_tester<F>(
+        &mut self,
+        crash: CrashInput,
+        mut tester: F,
+    ) -> TriageResult
+    where
+        F: FnMut(&[u8], &CrashSignature) -> bool,
+    {
         // 1. Extract signature
         let signature = self.extract_signature(&crash.output);
 
@@ -131,23 +154,18 @@ impl CrashTriageSystem {
             };
         }
 
-        // 3. New crash - minimize reproducer
+        // 3. New crash - minimize reproducer only under a verified oracle.
         klog!("[Triage] New crash! Minimizing reproducer...");
 
         let original_size = crash.input.len();
-
-        // Create fail condition that matches this crash signature
-        let fail_condition = FailCondition::CrashSignature(signature.clone());
-
-        // Minimize
-        self.minimizer = Minimizer::new(crash.input.clone(), fail_condition);
-        let minimized = self.minimizer.minimize(|input| {
-            // Execute input and check if it produces same crash
-            self.test_reproducer(input, &signature)
-        });
+        let minimized = minimize_bytes(&crash.input, &signature, &mut tester);
 
         let minimized_size = minimized.len();
-        let reduction = 100.0 * (1.0 - minimized_size as f64 / original_size as f64);
+        let reduction = if original_size == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - minimized_size as f64 / original_size as f64)
+        };
 
         klog!("[Triage] Minimization complete: {} -> {} bytes ({:.1}% reduction)",
             original_size, minimized_size, reduction);
@@ -159,7 +177,7 @@ impl CrashTriageSystem {
             last_seen: current_timestamp(),
             count: 1,
             reproducer: minimized.clone(),
-            reproducer_minimized: true,
+            reproducer_minimized: minimized_size < original_size,
             original_size,
         };
 
@@ -219,7 +237,7 @@ impl CrashTriageSystem {
     /// Hash stack trace for signature
     fn hash_stack_trace(&self, output: &str) -> u64 {
         // Extract first 5 stack frames and hash them
-        let mut frames = Vec::new();
+        let mut frames: Vec<String> = Vec::new();
         let mut in_stack = false;
 
         for line in output.lines() {
@@ -266,14 +284,6 @@ impl CrashTriageSystem {
         hash
     }
 
-    /// Test if input reproduces the same crash
-    fn test_reproducer(&self, input: &[u8], expected_sig: &CrashSignature) -> bool {
-        // Execute input and check if signature matches
-        // In real implementation, would run executor
-        // For now, placeholder that always returns true
-        true
-    }
-
     /// Get statistics
     pub fn stats(&self) -> TriageStats {
         TriageStats {
@@ -296,12 +306,62 @@ impl CrashTriageSystem {
                 count: info.count,
                 reproducer_size: info.reproducer.len(),
                 original_size: info.original_size,
-                reduction_percent: 100.0 * (1.0 - info.reproducer.len() as f64 / info.original_size as f64),
+                reduction_percent: if info.original_size == 0 {
+                    0.0
+                } else {
+                    100.0
+                        * (1.0 - info.reproducer.len() as f64 / info.original_size as f64)
+                },
             });
         }
 
         reports
     }
+}
+
+/// Delta-debug a byte input while preserving a positive oracle result.
+fn minimize_bytes<F>(input: &[u8], signature: &CrashSignature, tester: &mut F) -> Vec<u8>
+where
+    F: FnMut(&[u8], &CrashSignature) -> bool,
+{
+    if input.is_empty() || !tester(input, signature) {
+        return input.to_vec();
+    }
+
+    let mut best = input.to_vec();
+    let mut granularity = 2usize;
+    let mut iterations = 0usize;
+    const MAX_ITERATIONS: usize = 1_000;
+
+    while best.len() > 1 && iterations < MAX_ITERATIONS {
+        let chunk = (best.len() + granularity - 1) / granularity;
+        let mut reduced = false;
+        let mut start = 0usize;
+
+        while start < best.len() && iterations < MAX_ITERATIONS {
+            let end = (start + chunk).min(best.len());
+            let mut candidate = Vec::with_capacity(best.len() - (end - start));
+            candidate.extend_from_slice(&best[..start]);
+            candidate.extend_from_slice(&best[end..]);
+            iterations += 1;
+            if tester(&candidate, signature) {
+                best = candidate;
+                granularity = 2;
+                reduced = true;
+                break;
+            }
+            start = end;
+        }
+
+        if !reduced {
+            if granularity >= best.len() {
+                break;
+            }
+            granularity = (granularity * 2).min(best.len());
+        }
+    }
+
+    best
 }
 
 /// Triage statistics
@@ -330,11 +390,43 @@ fn current_timestamp() -> u64 {
     0
 }
 
-fn klog(msg: &str) {
+fn klog(_msg: &str) {
     // Placeholder - in real implementation would use actual logging
 }
 
-macro_rules! klog {
-    ($fmt:expr) => { klog($fmt) };
-    ($fmt:expr, $($arg:tt)*) => { klog(&alloc::format!($fmt, $($arg)*)) };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_minimization_requires_a_positive_reproducer_oracle() {
+        let mut triage = CrashTriageSystem::new();
+        let result = triage.process_crash(CrashInput {
+            input: alloc::vec![1, 2, 3, 4],
+            output: "PANIC: stable".to_string(),
+            exit_code: 1,
+        });
+        let TriageResult::NewCrash { reproducer, .. } = result else {
+            panic!("first crash must be new");
+        };
+        assert_eq!(reproducer, alloc::vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn verified_minimization_reduces_only_when_the_oracle_accepts() {
+        let mut triage = CrashTriageSystem::new();
+        let result = triage.process_crash_with_tester(
+            CrashInput {
+                input: alloc::vec![9, 8, 7, 6, 5, 4],
+                output: "PANIC: stable".to_string(),
+                exit_code: 1,
+            },
+            |candidate, _| candidate.len() >= 2,
+        );
+        let TriageResult::NewCrash { reproducer, .. } = result else {
+            panic!("first crash must be new");
+        };
+        assert_eq!(reproducer.len(), 2);
+    }
 }

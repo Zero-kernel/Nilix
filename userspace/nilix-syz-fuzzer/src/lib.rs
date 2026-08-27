@@ -1,8 +1,8 @@
-pub mod program;
-pub mod executor;
-pub mod coverage;
-pub mod mutator;
 pub mod corpus;
-pub mod stats;
+pub mod coverage;
 pub mod disk;
+pub mod executor;
+pub mod mutator;
+pub mod program;
 pub mod protocol;
+pub mod stats;

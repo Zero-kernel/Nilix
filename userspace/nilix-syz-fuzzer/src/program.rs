@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -58,15 +59,22 @@ pub enum Argument {
     /// Read-only bytes copied into the guest executor's isolated argument arena.
     Buffer(Vec<u8>),
     /// A zero-filled writable buffer.
-    Output { capacity: u32 },
+    Output {
+        capacity: u32,
+    },
     /// Initial bytes followed by a zero-filled writable tail.
-    InOut { data: Vec<u8>, capacity: u32 },
+    InOut {
+        data: Vec<u8>,
+        capacity: u32,
+    },
     Null,
 }
 
 impl SyscallProgram {
     pub fn new() -> Self {
-        Self { syscalls: Vec::new() }
+        Self {
+            syscalls: Vec::new(),
+        }
     }
 
     pub fn add_syscall(&mut self, syscall: Syscall) -> Result<()> {
@@ -96,9 +104,7 @@ impl SyscallProgram {
             }
         }
         if arena_capacity > MAX_ARENA_CAPACITY {
-            bail!(
-                "program argument arena exceeds {MAX_ARENA_CAPACITY} bytes: {arena_capacity}"
-            );
+            bail!("program argument arena exceeds {MAX_ARENA_CAPACITY} bytes: {arena_capacity}");
         }
         Ok(())
     }
@@ -126,8 +132,8 @@ impl SyscallProgram {
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let data =
+            std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         let program: Self = serde_json::from_slice(&data)
             .with_context(|| format!("invalid program JSON in {}", path.display()))?;
         program.validate()?;
@@ -151,9 +157,7 @@ impl Argument {
 
     pub fn writable_capacity(&self) -> Option<usize> {
         match self {
-            Self::Output { capacity } | Self::InOut { capacity, .. } => {
-                Some(*capacity as usize)
-            }
+            Self::Output { capacity } | Self::InOut { capacity, .. } => Some(*capacity as usize),
             _ => None,
         }
     }
@@ -161,7 +165,10 @@ impl Argument {
 
 pub fn validate_syscall(syscall: &Syscall) -> Result<()> {
     if syscall.args.len() > MAX_ARGS {
-        bail!("syscall {} has more than {MAX_ARGS} arguments", syscall.number);
+        bail!(
+            "syscall {} has more than {MAX_ARGS} arguments",
+            syscall.number
+        );
     }
     for arg in &syscall.args {
         validate_argument(arg)?;
@@ -351,11 +358,21 @@ fn expect_path(arg: &Argument) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .with_context(|| format!("failed to open directory {}", path.display()))?
         .sync_all()
         .with_context(|| format!("failed to sync directory {}", path.display()))
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<()> {
+    // Windows does not expose a portable directory-handle fsync operation;
+    // the file itself was already flushed before publication.  Keep the
+    // durable-directory barrier on Unix while allowing the host regression
+    // harness to exercise the same atomic publication logic on Windows.
+    Ok(())
 }
 
 impl Default for SyscallProgram {
@@ -371,7 +388,10 @@ mod tests {
     #[test]
     fn rejects_destructive_or_executor_control_syscalls() {
         for number in [1, 2, 3, 56, 57, 59, 60, 62, 520, 521, 522, 523, 524] {
-            let syscall = Syscall { number, args: vec![] };
+            let syscall = Syscall {
+                number,
+                args: vec![],
+            };
             assert!(validate_syscall(&syscall).is_err(), "syscall {number}");
         }
     }

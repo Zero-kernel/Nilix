@@ -1,23 +1,12 @@
-// Phase 4: Coverage-guided fuzzer modules
-// Phase 5: Resource-aware fuzzing modules
-// Phase 6: Stateful fuzzing modules
-// Phase 7: CI integration & continuous fuzzing modules
+//! Compatibility module for the historical guest-fuzzer layout.
+//!
+//! The old file re-exported Phase 5/6/7 scaffolds whose signatures no longer
+//! matched the live executor, corpus, and mutator.  Keeping those declarations
+//! here made an accidental `mod mod;` inclusion fail at compile time.  The
+//! maintained host-testable API now lives in `src/lib.rs`; expose only the
+//! repaired crash-triage implementation from this compatibility path.
 
-pub mod corpus;
-pub mod mutator;
-pub mod executor;
-pub mod seeds;
-pub mod resources;
-pub mod constraints;
-pub mod generator;
-pub mod resource_mutator;
-pub mod leak_detector;
-pub mod transactions;
-pub mod state_machine;
-pub mod stateful_coverage;
-pub mod ipc_coordinator;
-pub mod minimizer;
-pub mod continuous;
+extern crate alloc;
+
+#[path = "crash_triage.rs"]
 pub mod crash_triage;
-pub mod corpus_sync;
-pub mod dashboard;

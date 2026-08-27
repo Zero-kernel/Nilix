@@ -80,7 +80,10 @@ fn main() -> ExitCode {
     let program = match SyscallProgram::load_from_file(&args.program_path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("failed to load program {}: {e:#}", args.program_path.display());
+            eprintln!(
+                "failed to load program {}: {e:#}",
+                args.program_path.display()
+            );
             return ExitCode::from(1);
         }
     };
@@ -90,7 +93,10 @@ fn main() -> ExitCode {
         program.to_json().unwrap_or_else(|_| "<unprintable>".into())
     );
     println!("Kernel:  {}", args.kernel.display());
-    println!("Repeat:  {}, per-run timeout: {}s\n", args.repeat, args.timeout);
+    println!(
+        "Repeat:  {}, per-run timeout: {}s\n",
+        args.repeat, args.timeout
+    );
 
     let mut crashes = 0usize;
     let mut timeouts = 0usize;
@@ -119,11 +125,18 @@ fn main() -> ExitCode {
         match executor.execute(&program) {
             Ok(ExecutionResult::Success(cov)) => {
                 successes += 1;
-                println!("[{i}/{}] SUCCESS (coverage {} bytes)", args.repeat, cov.len());
+                println!(
+                    "[{i}/{}] SUCCESS (coverage {} bytes)",
+                    args.repeat,
+                    cov.len()
+                );
             }
             Ok(ExecutionResult::Crash(info)) => {
                 crashes += 1;
-                println!("[{i}/{}] CRASH classification={}", args.repeat, info.classification);
+                println!(
+                    "[{i}/{}] CRASH classification={}",
+                    args.repeat, info.classification
+                );
                 println!("----- serial log -----");
                 println!("{}", info.serial_log);
                 println!("----- qemu stderr -----");
@@ -136,7 +149,10 @@ fn main() -> ExitCode {
             }
             Ok(ExecutionResult::Hang) => {
                 hangs += 1;
-                println!("[{i}/{}] HANG (began but never reached PASS/FAIL)", args.repeat);
+                println!(
+                    "[{i}/{}] HANG (began but never reached PASS/FAIL)",
+                    args.repeat
+                );
             }
             Err(e) => {
                 errors += 1;
@@ -149,5 +165,9 @@ fn main() -> ExitCode {
         "\nSummary over {} runs: success={} crash={} timeout={} hang={} error={}",
         args.repeat, successes, crashes, timeouts, hangs, errors
     );
-    if crashes > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if crashes > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

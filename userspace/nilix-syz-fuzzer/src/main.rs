@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use clap::Parser;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use nilix_syz_fuzzer::executor::{QemuExecutor, ExecutionResult};
-use nilix_syz_fuzzer::program::SyscallProgram;
-use nilix_syz_fuzzer::coverage::CoverageTracker;
-use nilix_syz_fuzzer::mutator::SyscallMutator;
 use nilix_syz_fuzzer::corpus::Corpus;
-use nilix_syz_fuzzer::stats::FuzzStats;
+use nilix_syz_fuzzer::coverage::CoverageTracker;
 use nilix_syz_fuzzer::disk::Ext3Tools;
+use nilix_syz_fuzzer::executor::{ExecutionResult, QemuExecutor};
+use nilix_syz_fuzzer::mutator::SyscallMutator;
+use nilix_syz_fuzzer::program::SyscallProgram;
+use nilix_syz_fuzzer::stats::FuzzStats;
 
 #[derive(Parser, Debug)]
 #[command(name = "nilix-syz-fuzzer")]
@@ -55,10 +58,8 @@ fn main() -> Result<()> {
         anyhow::bail!("Kernel not found: {}", args.kernel.display());
     }
 
-    std::fs::create_dir_all(&args.corpus_dir)
-        .context("Failed to create corpus directory")?;
-    std::fs::create_dir_all(&args.crash_dir)
-        .context("Failed to create crash directory")?;
+    std::fs::create_dir_all(&args.corpus_dir).context("Failed to create corpus directory")?;
+    std::fs::create_dir_all(&args.crash_dir).context("Failed to create crash directory")?;
 
     println!("=== Nilix Syzkaller-Style Fuzzer ===");
     println!("Kernel:       {}", args.kernel.display());
@@ -86,31 +87,79 @@ fn main() -> Result<()> {
 
     let start_time = std::time::Instant::now();
     let deadline = start_time + std::time::Duration::from_secs(args.timeout);
+    // QEMU setup is invariant across iterations.  Construct it once so a
+    // transient per-program failure does not tear down the whole session.
+    let executor = QemuExecutor::new(
+        &args.qemu,
+        &args.kernel,
+        args.ovmf.as_deref(),
+        args.program_timeout,
+        128,
+        Ext3Tools::default(),
+    )?;
+    let mut consecutive_errors = 0u32;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 64;
 
     // Main fuzzing loop
     while std::time::Instant::now() < deadline {
         stats.iterations += 1;
 
         // Select seed from corpus
-        let seed = corpus.select_seed(&stats)?;
+        let seed = match corpus.select_seed(&stats) {
+            Ok(seed) => seed,
+            Err(error) => {
+                stats.errors += 1;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                eprintln!("[!] seed selection failed (continuing): {error:#}");
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    anyhow::bail!("too many consecutive fuzzer errors: {error:#}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+        };
 
         // Mutate to generate new program
-        let program = mutator.mutate(&seed)?;
+        let program = match mutator.mutate(&seed) {
+            Ok(program) => program,
+            Err(error) => {
+                stats.errors += 1;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                eprintln!("[!] mutation failed (continuing): {error:#}");
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    anyhow::bail!("too many consecutive fuzzer errors: {error:#}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+        };
 
-        // Execute in QEMU
-        let executor = QemuExecutor::new(
-            &args.qemu,
-            &args.kernel,
-            args.ovmf.as_deref(),
-            args.program_timeout,
-            128,  // 128 MiB disk
-            Ext3Tools::default(),
-        )?;
+        // A failed execution is normally transient (QEMU startup, transport,
+        // or guest protocol).  Count and continue instead of aborting the
+        // entire fuzzing session on the first such fault (U58-2).
+        let execution = match executor.execute(&program) {
+            Ok(execution) => execution,
+            Err(error) => {
+                stats.errors += 1;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                eprintln!("[!] execution failed (continuing): {error:#}");
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    anyhow::bail!("too many consecutive fuzzer errors: {error:#}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+        };
+        consecutive_errors = 0;
 
-        match executor.execute(&program)? {
+        match execution {
             ExecutionResult::Success(cov) => {
                 if coverage.is_new(&cov) {
-                    corpus.add(program, cov.clone())?;
+                    if let Err(error) = corpus.add(program, cov.clone()) {
+                        stats.errors += 1;
+                        eprintln!("[!] failed to persist new corpus entry: {error:#}");
+                        continue;
+                    }
                     coverage.update(&cov);
                     println!(
                         "[+] New coverage discovered! Total occupied slots: {}",
@@ -122,15 +171,16 @@ fn main() -> Result<()> {
             }
             ExecutionResult::Crash(info) => {
                 println!("[!] CRASH detected: {}", info.classification);
-                let crash_file = args.crash_dir.join(format!(
-                    "crash-{}.bin",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                ));
-                program.save_to_file(&crash_file)?;
-                stats.crashes += 1;
+                match save_crash_program(&args.crash_dir, &program) {
+                    Ok(crash_file) => {
+                        println!("[!] Crash reproducer saved: {}", crash_file.display());
+                        stats.crashes += 1;
+                    }
+                    Err(error) => {
+                        stats.errors += 1;
+                        eprintln!("[!] failed to save crash reproducer (continuing): {error:#}");
+                    }
+                }
             }
             ExecutionResult::Timeout => {
                 stats.timeouts += 1;
@@ -150,10 +200,40 @@ fn main() -> Result<()> {
     println!("\n=== Fuzzing Complete ===");
     stats.print_final();
     println!("Corpus entries: {}", corpus.len());
-    println!(
-        "Total occupied slots: {}",
-        coverage.total_occupied_slots()
-    );
+    println!("Total occupied slots: {}", coverage.total_occupied_slots());
 
     Ok(())
+}
+
+static NEXT_CRASH_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Persist a crash reproducer without ever replacing an existing artifact.
+/// Timestamp seconds are not unique enough for a fast fuzzer; an atomic
+/// sequence plus `create_new` gives both readable names and a race-safe
+/// no-clobber guarantee (U58-3).
+fn save_crash_program(crash_dir: &std::path::Path, program: &SyscallProgram) -> Result<PathBuf> {
+    let data = program.canonical_json()?;
+    let timestamp_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for _ in 0..1024u16 {
+        let sequence = NEXT_CRASH_ID.fetch_add(1, Ordering::Relaxed);
+        let path = crash_dir.join(format!("crash-{timestamp_nanos}-{sequence}.bin"));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            }
+        };
+        file.write_all(&data)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        return Ok(path);
+    }
+
+    anyhow::bail!("could not allocate a unique crash filename")
 }

@@ -44,6 +44,7 @@
 
 use core::{cmp, mem, ptr};
 use userspace::libc::{getchar, print, print_int, println, putchar, strncmp};
+use userspace::shell_parse::ls_args;
 use userspace::syscall::{
     is_error, parse_ipv4, sys_chdir, sys_close, sys_connect, sys_exit, sys_getcwd, sys_getdents64,
     sys_getpid, sys_getppid, sys_open, sys_read, sys_recvfrom, sys_sendto, sys_socket, sys_stat,
@@ -206,7 +207,9 @@ fn execute_command(cmd: &[u8]) {
 
     // Match commands
     unsafe {
-        if strncmp(cmd.as_ptr(), b"help\0".as_ptr(), 4) == 0 && is_end(cmd, 4) {
+        if let Some(args) = ls_args(cmd) {
+            do_ls(args);
+        } else if strncmp(cmd.as_ptr(), b"help\0".as_ptr(), 4) == 0 && is_end(cmd, 4) {
             do_help();
         } else if strncmp(cmd.as_ptr(), b"echo \0".as_ptr(), 5) == 0 {
             do_echo(&cmd[5..]);
@@ -218,10 +221,6 @@ fn execute_command(cmd: &[u8]) {
             do_ppid();
         } else if strncmp(cmd.as_ptr(), b"clear\0".as_ptr(), 5) == 0 && is_end(cmd, 5) {
             do_clear();
-        } else if strncmp(cmd.as_ptr(), b"ls\0".as_ptr(), 2) == 0 && is_end(cmd, 2) {
-            do_ls(&[]);
-        } else if strncmp(cmd.as_ptr(), b"ls \0".as_ptr(), 3) == 0 {
-            do_ls(&cmd[3..]);
         } else if strncmp(cmd.as_ptr(), b"cat \0".as_ptr(), 4) == 0 {
             do_cat(&cmd[4..]);
         } else if strncmp(cmd.as_ptr(), b"cat\0".as_ptr(), 3) == 0 && is_end(cmd, 3) {

@@ -22,6 +22,7 @@ const SYS_KCOV_ENABLE: usize = 521;
 const SYS_KCOV_DISABLE: usize = 522;
 const SYS_KCOV_DUMP: usize = 523;
 const SYS_KCOV_RESET: usize = 524;
+const KCOV_BUFFER_SIZE: usize = 4096;
 
 // Other syscalls
 const SYS_WRITE: usize = 1;
@@ -31,7 +32,7 @@ const SYS_GETPID: usize = 39;
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Initialize KCOV
-    let result = syscall1(SYS_KCOV_INIT, 4096);
+    let result = syscall1(SYS_KCOV_INIT, KCOV_BUFFER_SIZE);
     if result != 0 {
         write_str("KCOV init failed\n");
         exit(1);
@@ -42,7 +43,7 @@ pub extern "C" fn _start() -> ! {
     let mut rng = Rng::new(seed);
 
     // Coverage buffer for results
-    let mut coverage_buf = [0u32; 1024];
+    let mut coverage_buf = [0u8; KCOV_BUFFER_SIZE];
 
     // Run 10 iterations
     for iteration in 0..10 {
@@ -72,7 +73,9 @@ pub extern "C" fn _start() -> ! {
         }
 
         // Enable coverage collection
-        syscall0(SYS_KCOV_ENABLE);
+        if !kcov_control(SYS_KCOV_ENABLE, "enable") {
+            exit(1);
+        }
 
         // Execute the sequence
         write_str("  Executing: ");
@@ -86,22 +89,37 @@ pub extern "C" fn _start() -> ! {
         write_str("\n");
 
         // Disable coverage
-        syscall0(SYS_KCOV_DISABLE);
+        if !kcov_control(SYS_KCOV_DISABLE, "disable") {
+            exit(1);
+        }
 
         // Dump coverage
         let edge_count = syscall3(
             SYS_KCOV_DUMP,
             coverage_buf.as_mut_ptr() as usize,
-            coverage_buf.len() * 4,
+            coverage_buf.len(),
             0,
         );
+
+        if is_error(edge_count)
+            || coverage_buf
+                .iter()
+                .map(|byte| byte.count_ones() as usize)
+                .sum::<usize>()
+                != edge_count
+        {
+            write_str("  KCOV dump failed or count mismatch\n");
+            exit(1);
+        }
 
         write_str("  Coverage: ");
         write_num(edge_count);
         write_str(" edges\n");
 
         // Reset for next iteration
-        syscall0(SYS_KCOV_RESET);
+        if !kcov_control(SYS_KCOV_RESET, "reset") {
+            exit(1);
+        }
     }
 
     write_str("\n=== Fuzzing Complete ===\n");
@@ -172,6 +190,23 @@ fn write_num(mut n: usize) {
 
     let s = core::str::from_utf8(&buf[..i]).unwrap_or("?");
     write_str(s);
+}
+
+#[inline]
+fn is_error(result: usize) -> bool {
+    result > usize::MAX - 4095
+}
+
+fn kcov_control(number: usize, operation: &str) -> bool {
+    let result = syscall0(number);
+    if result != 0 {
+        write_str("KCOV ");
+        write_str(operation);
+        write_str(" failed\n");
+        false
+    } else {
+        true
+    }
 }
 
 // Syscall wrappers

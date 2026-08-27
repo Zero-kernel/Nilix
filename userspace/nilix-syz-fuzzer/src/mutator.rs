@@ -19,14 +19,14 @@ impl SyscallMutator {
 
         // Generate a simple program: getpid, getppid
         program.add_syscall(Syscall {
-            number: 39,  // getpid
+            number: 39, // getpid
             args: vec![],
-        });
+        })?;
 
         program.add_syscall(Syscall {
-            number: 110,  // getppid
+            number: 110, // getppid
             args: vec![],
-        });
+        })?;
 
         Ok(program)
     }
@@ -88,7 +88,9 @@ impl SyscallMutator {
             return Ok(());
         }
 
-        let arg_idx = self.rng.gen_range(0..program.syscalls[syscall_idx].args.len());
+        let arg_idx = self
+            .rng
+            .gen_range(0..program.syscalls[syscall_idx].args.len());
 
         match &mut program.syscalls[syscall_idx].args[arg_idx] {
             Argument::Immediate(val) => {
@@ -111,8 +113,7 @@ impl SyscallMutator {
             }
             Argument::Null => {
                 // Replace with random value
-                program.syscalls[syscall_idx].args[arg_idx] =
-                    Argument::Immediate(self.rng.gen());
+                program.syscalls[syscall_idx].args[arg_idx] = Argument::Immediate(self.rng.gen());
             }
         }
 
@@ -152,14 +153,14 @@ impl SyscallMutator {
         // Argument-bearing syscalls (read/write/open/...) are not in the
         // non-destructive allowlist and would be rejected before execution.
         let syscalls = [
-            24u32,  // sched_yield
-            39,     // getpid
-            102,    // getuid
-            104,    // getgid
-            107,    // geteuid
-            108,    // getegid
-            110,    // getppid
-            186,    // gettid
+            24u32, // sched_yield
+            39,    // getpid
+            102,   // getuid
+            104,   // getgid
+            107,   // geteuid
+            108,   // getegid
+            110,   // getppid
+            186,   // gettid
         ];
 
         let syscall_num = syscalls[self.rng.gen_range(0..syscalls.len())];
@@ -181,14 +182,22 @@ impl SyscallMutator {
 
     fn generate_interesting_integer(&mut self) -> u64 {
         let interesting_values = [
-            0, 1, u64::MAX, u64::MAX - 1,
-            0x7fffffff, 0x80000000,
-            0xffffffff, 0x100000000,
-            4096, 8192, 16384,
+            0,
+            1,
+            u64::MAX,
+            u64::MAX - 1,
+            0x7fffffff,
+            0x80000000,
+            0xffffffff,
+            0x100000000,
+            4096,
+            8192,
+            16384,
         ];
 
         if self.rng.gen_bool(0.3) {
-            *interesting_values.get(self.rng.gen_range(0..interesting_values.len()))
+            *interesting_values
+                .get(self.rng.gen_range(0..interesting_values.len()))
                 .unwrap()
         } else {
             self.rng.gen()

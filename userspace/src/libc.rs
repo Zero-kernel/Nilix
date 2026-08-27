@@ -374,7 +374,7 @@ pub unsafe fn gets_s(buf: *mut u8, size: usize) -> *mut u8 {
 /// # Safety
 ///
 /// `buf` must be valid for writes of at least 21 bytes.
-pub unsafe fn itoa(mut value: i64, buf: *mut u8, base: i32) -> *mut u8 {
+pub unsafe fn itoa(value: i64, buf: *mut u8, base: i32) -> *mut u8 {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
     if base < 2 || base > 36 {
@@ -382,24 +382,44 @@ pub unsafe fn itoa(mut value: i64, buf: *mut u8, base: i32) -> *mut u8 {
         return buf;
     }
 
-    let base = base as i64;
+    let base = base as u64;
     let negative = value < 0;
-    if negative {
-        value = -value;
+    // `-i64::MIN` overflows.  Convert the magnitude in unsigned space so the
+    // complete 19-digit value (and its sign) is emitted (U56-3).
+    let mut magnitude = if negative {
+        value.wrapping_neg() as u64
+    } else {
+        value as u64
+    };
+
+    // The historical API promises a 21-byte decimal buffer (20 digits plus
+    // NUL).  Smaller bases can require more digits (for example, i64::MIN in
+    // binary needs 65 bytes), and this function has no capacity argument with
+    // which to make a larger write safe.  Reject representations that do not
+    // fit instead of overrunning the caller's buffer.
+    let mut required_digits = 1usize;
+    let mut probe = magnitude;
+    while probe >= base {
+        probe /= base;
+        required_digits += 1;
+    }
+    if required_digits + if negative { 1 } else { 0 } > 20 {
+        *buf = 0;
+        return buf;
     }
 
     // Convert digits in reverse order
     let mut i = 20usize;
     *buf.add(i) = 0; // Null terminator
 
-    if value == 0 {
+    if magnitude == 0 {
         i -= 1;
         *buf.add(i) = b'0';
     } else {
-        while value > 0 && i > 0 {
+        while magnitude > 0 && i > 0 {
             i -= 1;
-            *buf.add(i) = DIGITS[(value % base) as usize];
-            value /= base;
+            *buf.add(i) = DIGITS[(magnitude % base) as usize];
+            magnitude /= base;
         }
     }
 
@@ -524,5 +544,40 @@ pub fn print_hex(value: u64) {
         let s = utoa(value, buf.as_mut_ptr(), 16);
         let len = strlen(s);
         sys_write(1, s, len as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn as_str(buffer: &[u8; 21], pointer: *mut u8) -> &str {
+        let offset = pointer as usize - buffer.as_ptr() as usize;
+        let bytes = &buffer[offset..];
+        let end = bytes.iter().position(|byte| *byte == 0).unwrap();
+        core::str::from_utf8(&bytes[..end]).unwrap()
+    }
+
+    #[test]
+    fn itoa_handles_i64_min_without_overflow_or_truncation() {
+        let mut buffer = [0u8; 21];
+        let pointer = unsafe { itoa(i64::MIN, buffer.as_mut_ptr(), 10) };
+        assert_eq!(as_str(&buffer, pointer), "-9223372036854775808");
+    }
+
+    #[test]
+    fn itoa_handles_zero_and_invalid_bases() {
+        let mut buffer = [0u8; 21];
+        let zero = unsafe { itoa(0, buffer.as_mut_ptr(), 10) };
+        assert_eq!(as_str(&buffer, zero), "0");
+        let invalid = unsafe { itoa(123, buffer.as_mut_ptr(), 1) };
+        assert_eq!(as_str(&buffer, invalid), "");
+    }
+
+    #[test]
+    fn itoa_rejects_representations_larger_than_its_documented_buffer() {
+        let mut buffer = [0u8; 21];
+        let pointer = unsafe { itoa(i64::MIN, buffer.as_mut_ptr(), 2) };
+        assert_eq!(as_str(&buffer, pointer), "");
     }
 }

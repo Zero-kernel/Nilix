@@ -5,10 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use crate::protocol::{
-    KCOV_BITMAP_SIZE, MAX_PROGRAM_SIZE, RESULT_HEADER_SIZE, RESULT_TAG_SIZE,
-};
 use crate::program::MAX_SYSCALLS;
+use crate::protocol::{KCOV_BITMAP_SIZE, MAX_PROGRAM_SIZE, RESULT_HEADER_SIZE, RESULT_TAG_SIZE};
 
 const PROGRAM_GUEST_PATH: &str = "/test/syz-program.bin";
 const RESULT_GUEST_PATH: &str = "/test/syz-result.bin";
@@ -92,19 +90,13 @@ impl Ext3Transport {
             &debugfs_args(&disk_path, true, "mkdir /test"),
             "create /test in Ext3 image",
         )?;
-        let inject = format!(
-            "write {} {PROGRAM_GUEST_PATH}",
-            utf8_path(&program_path)?
-        );
+        let inject = format!("write {} {PROGRAM_GUEST_PATH}", utf8_path(&program_path)?);
         run_checked(
             &self.tools.debugfs,
             &debugfs_args(&disk_path, true, &inject),
             "inject syz program into Ext3 image",
         )?;
-        let inject_alloc = format!(
-            "write {} {ALLOC_PROBE_GUEST_PATH}",
-            utf8_path(&alloc_path)?
-        );
+        let inject_alloc = format!("write {} {ALLOC_PROBE_GUEST_PATH}", utf8_path(&alloc_path)?);
         run_checked(
             &self.tools.debugfs,
             &debugfs_args(&disk_path, true, &inject_alloc),
@@ -112,16 +104,14 @@ impl Ext3Transport {
         )?;
         self.repair_image(&disk_path)?;
 
-        let dump = format!(
-            "dump -p {PROGRAM_GUEST_PATH} {}",
-            utf8_path(&verify_path)?
-        );
+        let dump = format!("dump -p {PROGRAM_GUEST_PATH} {}", utf8_path(&verify_path)?);
         run_checked(
             &self.tools.debugfs,
             &debugfs_args(&disk_path, false, &dump),
             "verify injected syz program",
         )?;
-        let verified = std::fs::read(&verify_path).context("failed to read program verification dump")?;
+        let verified =
+            std::fs::read(&verify_path).context("failed to read program verification dump")?;
         if verified != program {
             bail!("Ext3 program verification mismatch");
         }
@@ -136,10 +126,7 @@ impl Ext3Transport {
 
         let output_path = work_dir.join("syz-result.host.bin");
         ensure_debugfs_safe_path(&output_path)?;
-        let dump = format!(
-            "dump -p {RESULT_GUEST_PATH} {}",
-            utf8_path(&output_path)?
-        );
+        let dump = format!("dump -p {RESULT_GUEST_PATH} {}", utf8_path(&output_path)?);
         run_checked(
             &self.tools.debugfs,
             &debugfs_args(disk_path, false, &dump),
@@ -158,7 +145,11 @@ impl Ext3Transport {
     }
 
     fn repair_image(&self, disk_path: &Path) -> Result<()> {
-        let output = run(&self.tools.e2fsck, &e2fsck_args(disk_path), "check Ext3 image")?;
+        let output = run(
+            &self.tools.e2fsck,
+            &e2fsck_args(disk_path),
+            "check Ext3 image",
+        )?;
         match output.status.code() {
             Some(0 | 1) => Ok(()),
             code => bail!(
@@ -180,9 +171,9 @@ pub fn ensure_qemu_safe_path(path: &Path) -> Result<()> {
 fn ensure_debugfs_safe_path(path: &Path) -> Result<()> {
     let value = utf8_path(path)?;
     if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')))
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        })
     {
         bail!("path is unsafe for debugfs command syntax: {value:?}");
     }
@@ -268,10 +259,18 @@ mod tests {
         let image = Path::new("/tmp/nilix-syz/image.img");
         assert_eq!(
             mke2fs_args(image),
-            vec!["-q", "-F", "-t", "ext3", "-b", "4096", image.to_str().unwrap()]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            vec![
+                "-q",
+                "-F",
+                "-t",
+                "ext3",
+                "-b",
+                "4096",
+                image.to_str().unwrap()
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             debugfs_args(image, true, "mkdir /test"),

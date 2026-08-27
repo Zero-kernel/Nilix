@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -114,12 +116,7 @@ impl QemuExecutor {
         ensure_qemu_safe_path(&disk_path)?;
         ensure_qemu_safe_path(&serial_path)?;
 
-        let args = qemu_args(
-            &self.ovmf_path,
-            esp_dir,
-            &disk_path,
-            &serial_path,
-        )?;
+        let args = qemu_args(&self.ovmf_path, esp_dir, &disk_path, &serial_path)?;
         let mut child = Command::new(&self.qemu_path)
             .args(&args)
             .stdin(Stdio::null())
@@ -128,12 +125,8 @@ impl QemuExecutor {
             .spawn()
             .with_context(|| format!("failed to spawn {}", self.qemu_path.display()))?;
 
-        let monitor_result = monitor_execution(
-            &mut child,
-            &serial_path,
-            &encoded.binding,
-            self.timeout,
-        );
+        let monitor_result =
+            monitor_execution(&mut child, &serial_path, &encoded.binding, self.timeout);
         let stop_result = terminate_qemu(&mut child);
         let observation = monitor_result?;
         stop_result.context("failed to stop QEMU cleanly")?;
@@ -143,7 +136,8 @@ impl QemuExecutor {
 
         match observation {
             Observation::Pass(marker) => {
-                let result_bytes = match self.transport.extract_result(&disk_path, temp_dir.path()) {
+                let result_bytes = match self.transport.extract_result(&disk_path, temp_dir.path())
+                {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return Ok(ExecutionResult::Crash(CrashInfo {
@@ -174,13 +168,11 @@ impl QemuExecutor {
                 }
                 Ok(ExecutionResult::Success(decoded.coverage))
             }
-            Observation::GuestFailure { stage, code } => {
-                Ok(ExecutionResult::Crash(CrashInfo {
-                    classification: format!("executor_failure:{stage}:{code}"),
-                    serial_log,
-                    qemu_stderr,
-                }))
-            }
+            Observation::GuestFailure { stage, code } => Ok(ExecutionResult::Crash(CrashInfo {
+                classification: format!("executor_failure:{stage}:{code}"),
+                serial_log,
+                qemu_stderr,
+            })),
             Observation::Crash(classification) => Ok(ExecutionResult::Crash(CrashInfo {
                 classification,
                 serial_log,
@@ -294,9 +286,7 @@ impl<'a> MarkerTracker<'a> {
         }
         if self.began {
             require_identity(fields[1], fields[2], fields[3], self.binding)?;
-        } else if fields[1] != "seq=none"
-            || fields[2] != "run=none"
-            || fields[3] != "program=none"
+        } else if fields[1] != "seq=none" || fields[2] != "run=none" || fields[3] != "program=none"
         {
             bail!("pre-BEGIN FAIL marker must not claim an execution identity");
         }
@@ -408,7 +398,9 @@ fn monitor_execution(
         }
         if let Some(pass) = serial.tracker.pass.clone() {
             std::thread::sleep(PASS_SETTLE_TIME);
-            serial.poll().context("invalid serial protocol after PASS")?;
+            serial
+                .poll()
+                .context("invalid serial protocol after PASS")?;
             if serial.tracker.failure.is_some() {
                 bail!("FAIL marker followed PASS");
             }
@@ -428,7 +420,10 @@ fn monitor_execution(
             if let Some(pass) = serial.tracker.pass.clone() {
                 return Ok(Observation::Pass(pass));
             }
-            return Ok(Observation::Crash(classify_early_exit(status, serial.tracker.began)));
+            return Ok(Observation::Crash(classify_early_exit(
+                status,
+                serial.tracker.began,
+            )));
         }
         if start.elapsed() >= timeout {
             return Ok(Observation::Timeout {
@@ -440,29 +435,36 @@ fn monitor_execution(
 }
 
 fn terminate_qemu(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
+    #[cfg(not(unix))]
+    {
+        if child.try_wait()?.is_none() {
+            child.kill().context("failed to terminate QEMU")?;
+        }
+        child.wait().context("failed to reap QEMU")?;
         return Ok(());
     }
-    let pid = Pid::from_raw(i32::try_from(child.id()).context("QEMU PID exceeds i32")?);
-    let _ = kill(pid, Signal::SIGTERM);
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline {
+
+    #[cfg(unix)]
+    {
         if child.try_wait()?.is_some() {
             return Ok(());
         }
-        std::thread::sleep(POLL_INTERVAL);
+        let pid = Pid::from_raw(i32::try_from(child.id()).context("QEMU PID exceeds i32")?);
+        let _ = kill(pid, Signal::SIGTERM);
+        let deadline = Instant::now() + TERM_GRACE;
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let _ = kill(pid, Signal::SIGKILL);
+        child.wait().context("failed to reap QEMU after SIGKILL")?;
+        Ok(())
     }
-    let _ = kill(pid, Signal::SIGKILL);
-    child.wait().context("failed to reap QEMU after SIGKILL")?;
-    Ok(())
 }
 
-fn qemu_args(
-    ovmf: &Path,
-    esp_dir: &Path,
-    disk: &Path,
-    serial: &Path,
-) -> Result<Vec<String>> {
+fn qemu_args(ovmf: &Path, esp_dir: &Path, disk: &Path, serial: &Path) -> Result<Vec<String>> {
     for path in [ovmf, esp_dir, disk, serial] {
         ensure_qemu_safe_path(path)?;
     }
@@ -522,11 +524,17 @@ fn field_value<'a>(field: &'a str, name: &str) -> Result<&'a str> {
 }
 
 fn parse_hex_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
-    if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         bail!("{label} is not canonical lowercase hexadecimal");
     }
     let decoded = hex::decode(value).with_context(|| format!("invalid {label}"))?;
-    Ok(decoded.try_into().map_err(|_| anyhow::anyhow!("invalid {label} length"))?)
+    Ok(decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid {label} length"))?)
 }
 
 fn classify_early_exit(status: ExitStatus, began: bool) -> String {
@@ -557,13 +565,28 @@ fn utf8_path(path: &Path) -> Result<&str> {
 }
 
 fn read_bounded_text(path: &Path, maximum: usize) -> String {
-    let data = std::fs::read(path).unwrap_or_default();
-    let data = if data.len() > maximum {
-        &data[data.len() - maximum..]
-    } else {
-        &data
+    if maximum == 0 {
+        return String::new();
+    }
+
+    // Do not read an untrusted QEMU log in full just to retain its tail.  Seek
+    // from the end and cap the allocation/read itself at `maximum` (U58-6).
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
     };
-    String::from_utf8_lossy(data).into_owned()
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let start = length.saturating_sub(maximum as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+
+    let mut data = Vec::with_capacity(length.saturating_sub(start).min(maximum as u64) as usize);
+    if file.take(maximum as u64).read_to_end(&mut data).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 #[cfg(test)]
@@ -669,15 +692,23 @@ mod tests {
         let binding = binding();
         let mut tracker = MarkerTracker::new(&binding);
         tracker
-            .process_line(b"NILIX_SYZ_V2_FAIL seq=none run=none program=none stage=read_input code=-5")
+            .process_line(
+                b"NILIX_SYZ_V2_FAIL seq=none run=none program=none stage=read_input code=-5",
+            )
             .unwrap();
         assert_eq!(tracker.failure.unwrap().stage, "read_input");
     }
 
     #[test]
     fn timeout_classification_distinguishes_boot_from_guest_hang() {
-        assert!(matches!(Observation::Timeout { began: false }, Observation::Timeout { began: false }));
-        assert!(matches!(Observation::Timeout { began: true }, Observation::Timeout { began: true }));
+        assert!(matches!(
+            Observation::Timeout { began: false },
+            Observation::Timeout { began: false }
+        ));
+        assert!(matches!(
+            Observation::Timeout { began: true },
+            Observation::Timeout { began: true }
+        ));
     }
 
     #[test]
@@ -689,9 +720,20 @@ mod tests {
             Path::new("/tmp/run/serial.log"),
         )
         .unwrap();
-        assert!(args.iter().any(|arg| arg.contains("id=syzdisk,cache=directsync")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("id=syzdisk,cache=directsync")));
         assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
         assert!(args.iter().any(|arg| arg == "virtio-blk-pci,drive=syzdisk"));
         assert!(!args.iter().any(|arg| arg.contains("virtio-serial")));
+    }
+
+    #[test]
+    fn bounded_diagnostic_reader_only_retains_the_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stderr.log");
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+        assert_eq!(read_bounded_text(&path, 5), "bcdef");
+        assert_eq!(read_bounded_text(&path, 0), "");
     }
 }

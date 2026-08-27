@@ -750,6 +750,19 @@ pub struct Stat {
     pub unused2: i64,
 }
 
+// The kernel's stat syscall copies exactly the Linux x86-64 wire size.  Keep
+// this a compile-time contract so an accidental field or representation change
+// cannot turn a kernel write into a userspace buffer overflow (U56-2).
+const _: [(); 144] = [(); core::mem::size_of::<Stat>()];
+const _: [(); 8] = [(); core::mem::align_of::<Stat>()];
+const _: [(); 0] = [(); core::mem::offset_of!(Stat, dev)];
+const _: [(); 24] = [(); core::mem::offset_of!(Stat, mode)];
+const _: [(); 40] = [(); core::mem::offset_of!(Stat, rdev)];
+const _: [(); 48] = [(); core::mem::offset_of!(Stat, size)];
+const _: [(); 72] = [(); core::mem::offset_of!(Stat, atime_sec)];
+const _: [(); 104] = [(); core::mem::offset_of!(Stat, ctime_sec)];
+const _: [(); 136] = [(); core::mem::offset_of!(Stat, unused2)];
+
 /// Directory entry header returned by getdents64
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -822,6 +835,14 @@ pub struct UtsName {
     pub machine: [u8; 65],
     pub domainname: [u8; 65],
 }
+
+// `uname` writes all six 65-byte fields, including domainname.
+const _: [(); 390] = [(); core::mem::size_of::<UtsName>()];
+const _: [(); 1] = [(); core::mem::align_of::<UtsName>()];
+const _: [(); 0] = [(); core::mem::offset_of!(UtsName, sysname)];
+const _: [(); 65] = [(); core::mem::offset_of!(UtsName, nodename)];
+const _: [(); 260] = [(); core::mem::offset_of!(UtsName, machine)];
+const _: [(); 325] = [(); core::mem::offset_of!(UtsName, domainname)];
 
 impl Default for UtsName {
     fn default() -> Self {

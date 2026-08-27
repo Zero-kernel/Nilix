@@ -4,8 +4,6 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 // Syscall numbers from grammar
@@ -65,7 +63,7 @@ pub extern "C" fn _start() -> ! {
     write_str("=== Phase 3: Random Syscall Sequence Generator ===\n\n");
 
     // Initialize KCOV
-    if syscall1(SYS_KCOV_INIT, 4096) != 0 {
+    if syscall1(SYS_KCOV_INIT, KCOV_BUFFER_SIZE) != 0 {
         write_str("KCOV init failed\n");
         exit(1);
     }
@@ -73,7 +71,7 @@ pub extern "C" fn _start() -> ! {
 
     // Run 5 randomized test sequences
     let iterations = 5;
-    let mut total_edges = 0;
+    let mut total_edges: usize = 0;
 
     for iter in 1..=iterations {
         write_str("\n--- Iteration ");
@@ -81,7 +79,9 @@ pub extern "C" fn _start() -> ! {
         write_str(" ---\n");
 
         // Enable coverage collection
-        syscall0(SYS_KCOV_ENABLE);
+        if !kcov_control(SYS_KCOV_ENABLE, "enable") {
+            exit(1);
+        }
 
         // Generate random sequence (2-5 syscalls)
         let sequence_len = rand_range(2, 5);
@@ -158,32 +158,73 @@ pub extern "C" fn _start() -> ! {
         }
 
         // Disable coverage collection
-        syscall0(SYS_KCOV_DISABLE);
+        if !kcov_control(SYS_KCOV_DISABLE, "disable") {
+            exit(1);
+        }
 
         // Dump coverage
-        let mut coverage_buf = [0u32; 256];
+        // KCOV_DUMP requires the destination length to exactly match the
+        // byte-sized buffer configured by KCOV_INIT.  The old 256-u32 buffer
+        // was only 1024 bytes while init requested 4096, so every dump was
+        // rejected (U57-2).
+        let mut coverage_buf = [0u8; KCOV_BUFFER_SIZE];
         let edge_count = syscall3(
             SYS_KCOV_DUMP,
             coverage_buf.as_mut_ptr() as usize,
-            coverage_buf.len() * 4,
+            coverage_buf.len(),
             0
         );
+
+        if is_error(edge_count) {
+            write_str("  KCOV dump failed: ");
+            write_num(edge_count);
+            write_str("\n");
+            exit(1);
+        }
+        let bitmap_count = coverage_buf
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>();
+        if bitmap_count != edge_count {
+            write_str("  KCOV dump count mismatch\n");
+            exit(1);
+        }
 
         write_str("  Coverage: ");
         write_num(edge_count);
         write_str(" unique edges\n");
 
-        total_edges += edge_count;
+        total_edges = match total_edges.checked_add(edge_count) {
+            Some(total) => total,
+            None => {
+                write_str("  KCOV edge total overflow\n");
+                exit(1);
+            }
+        };
 
-        // Show first 5 edge IDs
+        // Show first 5 occupied bitmap slots.  KCOV returns a bitmap, not an
+        // array of edge IDs; decoding it also keeps the displayed count tied
+        // to the exact buffer that was dumped.
         if edge_count > 0 {
             write_str("  Edge IDs: ");
-            let max_display = if edge_count < 5 { edge_count } else { 5 };
-            for i in 0..max_display {
-                if i > 0 {
-                    write_str(", ");
+            let mut displayed = 0usize;
+            for (byte_index, byte) in coverage_buf.iter().copied().enumerate() {
+                for bit_index in 0..8usize {
+                    if byte & (1u8 << bit_index) == 0 {
+                        continue;
+                    }
+                    if displayed > 0 {
+                        write_str(", ");
+                    }
+                    write_num(byte_index * 8 + bit_index);
+                    displayed += 1;
+                    if displayed >= 5 {
+                        break;
+                    }
                 }
-                write_num(coverage_buf[i] as usize);
+                if displayed >= 5 {
+                    break;
+                }
             }
             if edge_count > 5 {
                 write_str(", ...");
@@ -191,8 +232,11 @@ pub extern "C" fn _start() -> ! {
             write_str("\n");
         }
 
-        // Reset for next iteration
-        syscall0(SYS_KCOV_RESET);
+        // Reset is another KCOV state transition; do not silently continue
+        // with stale coverage if it fails.
+        if !kcov_control(SYS_KCOV_RESET, "reset") {
+            exit(1);
+        }
     }
 
     // Summary
@@ -240,6 +284,30 @@ fn write_num(mut n: usize) {
 
     let s = core::str::from_utf8(&buf[..i]).unwrap_or("?");
     write_str(s);
+}
+
+const KCOV_BUFFER_SIZE: usize = 4096;
+
+#[inline]
+fn is_error(result: usize) -> bool {
+    result > usize::MAX - 4095
+}
+
+/// Execute a KCOV control syscall and report failures to the user.  Control
+/// transitions establish the recorder state for the next operation, so an
+/// ignored error would make the following dump/reset results meaningless.
+fn kcov_control(number: usize, operation: &str) -> bool {
+    let result = syscall0(number);
+    if result != 0 {
+        write_str("KCOV ");
+        write_str(operation);
+        write_str(" failed: ");
+        write_num(result);
+        write_str("\n");
+        false
+    } else {
+        true
+    }
 }
 
 // Syscall wrappers
