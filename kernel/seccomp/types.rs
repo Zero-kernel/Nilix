@@ -952,9 +952,14 @@ impl SeccompState {
         if let Some(prepared) = prepared {
             self.filters.install_prepared(prepared).map_err(|_| ())?;
         }
-        self.filters
-            .push_reserved(filter)
-            .unwrap_or_else(|_| panic!("prepared seccomp chain capacity vanished"));
+        if let Err(filter) = self.filters.push_reserved(filter) {
+            // U44-1 FIX: a stale/corrupt capacity token is a recoverable
+            // publication failure. Drop the newly admitted filter and return
+            // ENOMEM to the syscall caller; never abort while installing a
+            // user-controlled filter chain.
+            drop(filter);
+            return Err(());
+        }
         Ok(())
     }
 

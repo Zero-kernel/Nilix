@@ -261,8 +261,22 @@ impl SampleRing {
             out.push(self.slots[idx].load_stable());
         }
 
-        // Advance tail to head (buffer now empty)
-        self.tail.store(head, Ordering::Release);
+        // Advance tail to the snapshot head without regressing a newer tail
+        // published by a concurrent producer that had to drop old samples.
+        // A plain store here can move tail backwards after an overflow push,
+        // causing duplicate reads and violating the ring's monotonicity.
+        let mut observed = self.tail.load(Ordering::Acquire);
+        while observed < head {
+            match self.tail.compare_exchange_weak(
+                observed,
+                head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
     }
 
     /// Reset the ring buffer (clear all samples).

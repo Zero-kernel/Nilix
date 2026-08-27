@@ -134,6 +134,7 @@ pub use process::{
     register_kpti_cr3_callback,
     // OOM killer support
     register_oom_callbacks,
+    register_robust_futex_cleanup,
     remove_supplementary_group,
     set_current_supplementary_groups,
     set_current_umask,
@@ -226,6 +227,7 @@ pub use syscall::{
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{
+    compare_exchange_user_u32,
     // Type-safe user pointer API (A.1 Security Hardening)
     copy_from_user,
     // Legacy API (for backward compatibility)
@@ -238,6 +240,8 @@ pub use usercopy::{
     // R163-6 FIX: Export for BSP/AP init to call before interrupts enabled.
     force_init_usercopy_locals,
     is_in_usercopy,
+    read_user_u32_atomic,
+    read_user_u64_atomic,
     strncpy_from_user,
     try_handle_usercopy_fault,
     UserAccessGuard,

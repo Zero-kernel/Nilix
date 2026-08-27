@@ -2101,40 +2101,6 @@ pub fn run_cow_refcount_self_test() {
     assert!(!refork_child.flags().contains(cow_readonly_flag()));
 }
 
-/// 查找虚拟地址对应的页表项
-///
-/// R114-3 FIX: DEPRECATED — This function reads PTE flags without holding PT_LOCK, creating
-/// TOCTOU races on SMP. Use `PageTableManager::translate_with_flags()` under PT_LOCK instead.
-/// Retained only for potential future diagnostic use; all production callers must use the
-/// lock-held API.
-#[allow(dead_code)]
-fn find_pte(addr: VirtAddr) -> Option<&'static mut PageTableEntry> {
-    let (root, _) = Cr3::read();
-    let mut table = unsafe { phys_to_virt_table(root.start_address()) };
-
-    let idxs: [usize; 4] = [
-        usize::from(addr.p4_index()),
-        usize::from(addr.p3_index()),
-        usize::from(addr.p2_index()),
-        usize::from(addr.p1_index()),
-    ];
-
-    for (depth, idx) in idxs.iter().copied().enumerate() {
-        let entry = unsafe { &mut *(&mut table[idx] as *mut PageTableEntry) };
-        if entry.is_unused() {
-            return None;
-        }
-        if depth == 3 {
-            return Some(entry);
-        }
-        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return None; // 大页不支持 COW
-        }
-        table = unsafe { phys_to_virt_table(entry.addr()) };
-    }
-    None
-}
-
 /// 将物理地址转换为页表引用
 ///
 /// # Safety

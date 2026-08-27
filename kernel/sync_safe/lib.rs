@@ -62,7 +62,11 @@ impl<T> Mutex<T> {
         // Check if interrupts are disabled
         let rflags: u64;
         unsafe {
-            core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem, nostack));
+            // `pushfq; pop` deliberately uses the architectural stack and
+            // reads memory through RSP.  Do not promise `nostack`/`nomem` to
+            // LLVM: those false promises can reorder or elide the probe and
+            // turn an IRQ-safety check into undefined behaviour.
+            core::arch::asm!("pushfq; pop {}", out(reg) rflags);
         }
 
         const RFLAGS_IF: u64 = 1 << 9; // Interrupt Flag

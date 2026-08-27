@@ -768,39 +768,62 @@ impl CapTable {
     /// they will get a new (higher) generation counter, preventing
     /// stale CapId references from becoming valid again.
     pub fn apply_cloexec(&self) {
-        interrupts::without_interrupts(|| {
-            let mut inner = self.inner.lock();
+        // Remove one revoked slot at a time, but destroy the detached
+        // `CapSlot` only after the cap-table lock is released.  CapEntry
+        // variants may own Arcs whose destructors can allocate or take other
+        // locks; dropping them under this spinlock was the last single-layer
+        // CLOEXEC teardown hazard.
+        loop {
+            let revoked = interrupts::without_interrupts(|| {
+                let mut inner = self.inner.lock();
 
-            // R172-06: INV-CAP-FREELIST-CAP. allocate() now keeps free.capacity() >=
-            // slots.len(), so every free.push below (at most one per slot, total <=
-            // slots.len()) is allocation-free — making this safe PAST exec's point-of-no-return
-            // where apply_cloexec runs. The assert is the tripwire if a future allocate()
-            // change breaks the invariant (it would otherwise re-introduce a fatal OOM panic
-            // in the exec commit window).
-            debug_assert!(
-                inner.free.capacity() >= inner.slots.len(),
-                "R172-06: INV-CAP-FREELIST-CAP violated; apply_cloexec free.push could realloc/panic"
-            );
+                // R172-06: INV-CAP-FREELIST-CAP. allocate() now keeps
+                // free.capacity() >= slots.len(), so every free.push below
+                // is allocation-free past exec's point of no return.
+                debug_assert!(
+                    inner.free.capacity() >= inner.slots.len(),
+                    "R172-06: capability free-list capacity invariant violated"
+                );
 
-            for idx in 0..inner.slots.len() {
-                if let Some(slot) = &inner.slots[idx] {
-                    if !slot.entry.inherits_on_exec() {
-                        // Revoke this capability - slot will get new generation on reuse
-                        if let Some(old_slot) = inner.slots[idx].take() {
-                            // R29-4 FIX: Changed from u32 to u16
-                            inner.free.push(idx as u16);
-                            drop(old_slot);
-                        }
+                let revoked = (0..inner.slots.len()).find_map(|idx| {
+                    let revoke = inner.slots[idx]
+                        .as_ref()
+                        .is_some_and(|slot| !slot.entry.inherits_on_exec());
+                    if !revoke {
+                        return None;
                     }
-                }
-            }
+                    let old_slot = inner.slots[idx].take()?;
+                    inner.free.push(idx as u16);
+                    Some(old_slot)
+                });
+                revoked
+            });
 
-            // If exec removed the final live capability, destroy both retained
-            // vectors before returning their charges.  Keeping the initial
-            // table high-water allocation after a CLOEXEC-only workload would
-            // otherwise let empty processes pin aggregate Capability budget.
-            inner.reclaim_if_unused();
+            let Some(old_slot) = revoked else { break };
+            drop(old_slot);
+        }
+
+        // Reclaim empty backing in a second phase, outside the lock that owns
+        // the vectors.  This keeps allocator/destructor work out of the cap
+        // table critical section while preserving the existing high-water
+        // reclamation policy.
+        self.reclaim_if_unused_outside_lock();
+    }
+
+    fn reclaim_if_unused_outside_lock(&self) {
+        let retired = interrupts::without_interrupts(|| {
+            let mut inner = self.inner.lock();
+            if inner.reserved_allocations != 0 || inner.slots.iter().any(Option::is_some) {
+                return None;
+            }
+            Some((
+                core::mem::take(&mut inner.slots),
+                core::mem::take(&mut inner.free),
+                inner.slots_charge.take(),
+                inner.free_charge.take(),
+            ))
         });
+        drop(retired);
     }
 }
 
@@ -965,10 +988,14 @@ impl CapTableInner {
         assert!(
             self.reserved_allocations != 0
                 && index_usize < self.slots.len()
-                && self.slots[index_usize].is_none()
-                && !self.free.contains(&index),
+                && self.slots[index_usize].is_none(),
             "RF180-37: corrupt prepared capability at install"
         );
+        // Membership is a diagnostic invariant only; the reservation path
+        // removes exactly one index from the free stack.  Keep the O(n) scan
+        // out of the production cap-table lock hold time.
+        #[cfg(debug_assertions)]
+        debug_assert!(!self.free.contains(&index));
         self.slots[index as usize] = Some(CapSlot { generation, entry });
         self.reserved_allocations -= 1;
 
@@ -981,10 +1008,11 @@ impl CapTableInner {
         assert!(
             self.reserved_allocations != 0
                 && index_usize < self.slots.len()
-                && self.slots[index_usize].is_none()
-                && !self.free.contains(&index),
+                && self.slots[index_usize].is_none(),
             "RF180-37: corrupt prepared capability at rollback"
         );
+        #[cfg(debug_assertions)]
+        debug_assert!(!self.free.contains(&index));
         debug_assert!(self.free.capacity() >= self.slots.len());
         self.free.push(index);
         self.reserved_allocations -= 1;

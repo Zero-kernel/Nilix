@@ -540,20 +540,27 @@ impl CapEntry {
     /// U.S2-SLICE-2: Increment reference count (dup/fork).
     #[inline]
     pub fn increment_refcount(&self) {
-        self.refcount.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .refcount
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1));
+        debug_assert!(result.is_ok(), "CapEntry refcount overflow");
     }
 
     /// U.S2-SLICE-2: Decrement reference count (close).
     /// Returns true if refcount reached 0 (should revoke).
     ///
-    /// Zero is terminal. A double-decrement is capability-lifetime corruption,
-    /// so the atomic remains unchanged and every build fails stop.
+    /// Zero is terminal.  A duplicate close is rejected without wrapping the
+    /// counter or aborting the kernel; the debug assertion keeps the lifetime
+    /// bug visible during development while release builds remain fail-safe.
     #[inline]
     pub fn decrement_refcount(&self) -> bool {
         let prev = self
             .refcount
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_sub(1))
-            .unwrap_or_else(|_| panic!("CapEntry refcount underflow: double-decrement detected"));
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                c.checked_sub(1).or(Some(0))
+            })
+            .unwrap_or(0);
+        debug_assert!(prev > 0, "CapEntry refcount underflow: double decrement");
 
         prev == 1
     }

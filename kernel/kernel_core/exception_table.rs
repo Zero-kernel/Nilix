@@ -51,15 +51,18 @@ impl ExceptionTableEntry {
     /// within kernel space (>= KERNEL_VIRT_BASE). This is a defense-in-depth
     /// check — the linker guarantees valid entries, but this catches corruption.
     #[inline]
-    unsafe fn fault_ip(&self) -> usize {
+    unsafe fn fault_ip(&self) -> Option<usize> {
         let base = ptr::addr_of!(self.fault_ip_rel) as usize;
-        let addr = base.wrapping_add(self.fault_ip_rel as isize as usize);
-        debug_assert!(
-            addr as u64 >= KERNEL_VIRT_BASE,
-            "exception table fault_ip {:#x} outside kernel space",
-            addr
-        );
-        addr
+        let addr = if self.fault_ip_rel >= 0 {
+            base.checked_add(self.fault_ip_rel as usize)?
+        } else {
+            base.checked_sub(self.fault_ip_rel.unsigned_abs() as usize)?
+        };
+        if (addr as u64) < KERNEL_VIRT_BASE {
+            debug_assert!(false, "exception table fault_ip outside kernel space");
+            return None;
+        }
+        Some(addr)
     }
 
     /// Compute the absolute fixup address.
@@ -67,15 +70,18 @@ impl ExceptionTableEntry {
     /// `absolute = &self.fixup_ip_rel as usize + self.fixup_ip_rel as isize`
     /// R120-5 FIX: Added debug_assert for kernel-space address validation.
     #[inline]
-    unsafe fn fixup_ip(&self) -> usize {
+    unsafe fn fixup_ip(&self) -> Option<usize> {
         let base = ptr::addr_of!(self.fixup_ip_rel) as usize;
-        let addr = base.wrapping_add(self.fixup_ip_rel as isize as usize);
-        debug_assert!(
-            addr as u64 >= KERNEL_VIRT_BASE,
-            "exception table fixup_ip {:#x} outside kernel space",
-            addr
-        );
-        addr
+        let addr = if self.fixup_ip_rel >= 0 {
+            base.checked_add(self.fixup_ip_rel as usize)?
+        } else {
+            base.checked_sub(self.fixup_ip_rel.unsigned_abs() as usize)?
+        };
+        if (addr as u64) < KERNEL_VIRT_BASE {
+            debug_assert!(false, "exception table fixup_ip outside kernel space");
+            return None;
+        }
+        Some(addr)
     }
 }
 
@@ -112,9 +118,11 @@ pub fn lookup(fault_ip: usize) -> Option<usize> {
     for i in 0..count {
         // SAFETY: `i` is within the exception table range; entry read is aligned (8-byte).
         let entry = unsafe { &*start.add(i) };
-        let abs_fault = unsafe { entry.fault_ip() };
+        let Some(abs_fault) = (unsafe { entry.fault_ip() }) else {
+            continue;
+        };
         if abs_fault == fault_ip {
-            return Some(unsafe { entry.fixup_ip() });
+            return unsafe { entry.fixup_ip() };
         }
     }
 
@@ -128,5 +136,5 @@ pub fn lookup(fault_ip: usize) -> Option<usize> {
 pub fn entry_count() -> usize {
     let start = unsafe { ptr::addr_of!(__ex_table_start) as usize };
     let end = unsafe { ptr::addr_of!(__ex_table_end) as usize };
-    (end - start) / core::mem::size_of::<ExceptionTableEntry>()
+    end.saturating_sub(start) / core::mem::size_of::<ExceptionTableEntry>()
 }
