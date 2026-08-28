@@ -1,8 +1,28 @@
 # Nilix Documentation
 
-Comprehensive documentation for the Nilix kernel project.
+Comprehensive documentation for the Nilix kernel project — the **内容概览** index. This is
+the hub the top-level [README](../README.md) defers to; each entry below links to an
+overview or detail document.
+
+> **Reading order for the architecture:** start with the readable
+> [`architecture.md`](architecture.md) (composition diagram, crate layering & dependency
+> DAG, boot flow, syscall path, core components), then the deep
+> [`overview/architecture/ARCHITECTURE.md`](overview/architecture/ARCHITECTURE.md) for the
+> lock ordering, critical code paths, and historical audit record.
+> **Note:** the `overview/` subtree predates R187 (KCOV, 2026-08-08) and the 2026-08-27 R188
+> standalone-audit remediation; for current audit numbers see
+> [`security-audit-status.md`](security-audit-status.md).
 
 ## Directory Structure
+
+### [architecture.md](architecture.md) · [overview/architecture/](overview/architecture/)
+Workspace layout, the verified crate layering & dependency DAG (Mermaid), the boot flow,
+the syscall path, and the core subsystems (3.1–3.10). The `overview/architecture/` tree
+holds the deep reference (lock ordering, critical code paths, historical findings) and
+per-subsystem deep dives in [`overview/02-architecture/subsystems/`](overview/02-architecture/subsystems/).
+
+- **[architecture.md](architecture.md)** - Readable architecture: composition + DAG + boot + syscall + components
+- **[overview/architecture/ARCHITECTURE.md](overview/architecture/ARCHITECTURE.md)** - Deep subsystem map (lock ordering, critical paths, findings)
 
 ### [architecture/](overview/architecture/)
 Architectural documentation covering all 25 kernel crates, their responsibilities, key abstractions, and interdependencies.
@@ -12,7 +32,7 @@ Architectural documentation covering all 25 kernel crates, their responsibilitie
 ### [review/](review/)
 Security audit reports, fix documentation, and remediation tracking.
 
-- **[audits/](review/audits/)** - QA security audit reports through R186
+- **[audits/](review/audits/)** - QA security audit reports through R187 (R188 standalone audit in [security/](security/))
 - **[fixes/](review/fixes/)** - Fix plans and implementation details for R17x findings
 - **[remediation/](review/remediation/)** - Remediation roadmaps and open findings inventory
 
@@ -43,13 +63,13 @@ Subsystem, architecture, safety, testing, and report documentation.
 
 ### For New Contributors
 1. Read the canonical [contributor guide](../CONTRIBUTING.md) and [governance model](../GOVERNANCE.md)
-2. Start with [architecture/ARCHITECTURE.md](overview/architecture/ARCHITECTURE.md) for subsystem overview
-3. Review the [R186 audit/fix record](review/audits/qa-2026-07-28.md) for current status
-4. Check the [current next-phase plan](review/nextplan/next-phase-plan-2026-07-23-v2.md) for open work
+2. Start with [architecture.md](architecture.md) for the readable overview, then [overview/architecture/ARCHITECTURE.md](overview/architecture/ARCHITECTURE.md) for the deep reference
+3. Review the [security audit status](security-audit-status.md) for current status (R187 latest R-series; R188 standalone)
+4. Check the [current next-phase plan](review/nextplan/) for open work (newest dated snapshot)
 
 ### For Security Auditors
 1. Read the public threat model in [roadmap.md](roadmap.md#32-threat-model) and report vulnerabilities under [SECURITY.md](../SECURITY.md)
-2. Latest audit: [review/audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md) (R186)
+2. Latest R-series audit: [review/audits/qa-2026-08-05.md](review/audits/qa-2026-08-05.md) (R187); standalone full-codebase audit: [security/full-codebase-audit-2026-08-07.md](security/full-codebase-audit-2026-08-07.md) (R188)
 3. Fix history: [review/fixes/](review/fixes/)
 4. Open findings: [review/remediation/](review/remediation/)
 
@@ -85,30 +105,41 @@ Each subdirectory has a README.md providing:
 
 ## Quality Gate Status
 
-Current gate status for 1.0-Preview: **BLOCKED** (authoritative state 2026-07-30)
+Current gate status for 1.0-Preview: **BLOCKED** (authoritative state 2026-08-27). Full
+detail in [`security-audit-status.md`](security-audit-status.md); dated changes in
+[`../CHANGELOG.md`](../CHANGELOG.md); CI/fuzzing detail in [`quality-gates.md`](quality-gates.md).
 
 - ✅ 0 open CRITICAL findings
-- ❌ 1 open HIGH finding (`R186-4`, VMA/MM aggregate admission); zero-HIGH streak 0/3
-- ✅ 16 of 17 actionable R186 findings fully fixed; `R186-4` is the sole open actionable
-- ✅ Authoritative ReviewFix closure: 16 fixes reviewed (2 PASS / 12 PARTIAL / 2 FAIL);
-  all 24 `RF186-*` defects repaired, 0 escalated
-- ✅ Final remote ladder: fmt-check, clippy, lint, build, boot-check, and musl-check PASS;
-  `make test` = **31 passed / 39 deferred / 0 failed**, 0 panic, 0 NX
-- ✅ Focused/default-parallel evidence: capability 2/2, conntrack stress 50/50,
-  and net 110/110
-- ✅ Hosted sub-crate CI: **169 default-parallel tests** (audit/MM/block/seccomp/net +
-  focused RF186 capability lifecycle) with exact-count oracles, plus IPC/kernel_core/kernel
-  test-code compile checks. Privileged suites remain QEMU-only by explicit contract
+- ❌ 1 open HIGH finding (`R186-4`, VMA/MM aggregate admission); zero-HIGH streak **0/3**
+- ✅ R187 KCOV remediation (2026-08-08): 7 findings fixed, 7/7 PASS, 8/8 review-fix defects
+  repaired, 0 escalated — no new open HIGH
+- ✅ R188 standalone full-codebase audit remediated (2026-08-27): 3 HIGH + 24 MEDIUM fixed;
+  residuals `U37-1`/`U55-6`/`U29-3` open; standalone (not R-series), streak unchanged 0/3
+- ✅ R186: 16 of 17 actionables fixed; `R186-4` is the sole open actionable; 24 `RF186-*`
+  defects repaired, 0 escalated
+- ✅ Remote ladder green: fmt/clippy/lint/build/boot-check/musl-check PASS;
+  `make test` = **34 passed / 39 deferred / 0 failed**, 0 panic, 0 NX
+- ✅ Hosted sub-crate CI: **239 hosted tests** (169 default-parallel) with exact-count
+  oracles; privileged suites remain QEMU-only by explicit contract
 
-See the [R186 audit/fix record](review/audits/qa-2026-07-28.md) and the
-[authoritative RF186 review-fix report](review/reviewfix/reviewfix-2026-07-30.md).
+See the [R187 report](review/audits/qa-2026-08-05.md), the
+[RF187 closure](review/reviewfix/reviewfix-2026-08-08.md), the
+[R186 report](review/audits/qa-2026-07-28.md), the
+[RF186 review-fix report](review/reviewfix/reviewfix-2026-07-30.md), and the
+[R188 standalone audit](security/full-codebase-audit-2026-08-07.md) (§13 dispositions).
 
 ## Recent Audit Rounds
 
+- **R188** (Aug 27, 2026): standalone full-codebase audit remediation — 3 HIGH + 24 MEDIUM
+  fixed; residuals `U37-1`/`U55-6`/`U29-3` open; not R-series; streak 0/3 -
+  [security/full-codebase-audit-2026-08-07.md](security/full-codebase-audit-2026-08-07.md)
+- **RF187** (Aug 8, 2026): KCOV review-fix closure — 7/7 PASS, 8/8 defects repaired, 0
+  escalated - [reviewfix/reviewfix-2026-08-08.md](review/reviewfix/reviewfix-2026-08-08.md)
+- **R187** (Aug 8, 2026): KCOV authority/access/topology - [audits/qa-2026-08-05.md](review/audits/qa-2026-08-05.md)
 - **RF186 final** (July 30, 2026): 16 fixes reviewed; 2 PASS / 12 PARTIAL / 2 FAIL;
   24/24 defects repaired, 0 escalated; final environment ladder green -
   [reviewfix/reviewfix-2026-07-30.md](review/reviewfix/reviewfix-2026-07-30.md)
-- **R186** (July 28, 2026): Latest full-codebase audit and fix record - [audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md)
+- **R186** (July 28, 2026): full-codebase audit and fix record - [audits/qa-2026-07-28.md](review/audits/qa-2026-07-28.md)
 - **R185** (July 23, 2026): Clean verification round - [audits/qa-2026-07-23-v2.md](review/audits/qa-2026-07-23-v2.md)
 - **R184** (July 23, 2026): Findings round and review-fix - [audits/qa-2026-07-23.md](review/audits/qa-2026-07-23.md)
 - **R174** (July 2, 2026): Historical comprehensive audit - [audits/qa-2026-07-02-v5.md](review/audits/qa-2026-07-02-v5.md)
