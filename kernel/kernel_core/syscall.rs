@@ -13751,6 +13751,14 @@ fn sys_mmap(
         // Without this check, unlimited PROT_NONE (or normal) mmaps can grow
         // the BTreeMap until alloc_error_handler panics the kernel.
         if mm.mmap_regions.len() >= MAX_MAP_COUNT {
+            // ST-K3 Phase D: permanent debug-build site tag (E1). No addresses,
+            // no data beyond the requested size — R159-17 gating style.
+            #[cfg(debug_assertions)]
+            kprintln!(
+                "[ST-K3] mmap ENOMEM site=E1 stage=max_map_count len={} regions={}",
+                length_aligned,
+                mm.mmap_regions.len()
+            );
             return Err(SyscallError::ENOMEM);
         }
 
@@ -13780,7 +13788,18 @@ fn sys_mmap(
 
         // R147-I1 FIX: Charge cgroup memory BEFORE inserting PENDING_MAP entry.
         if !is_prot_none {
-            if cgroup::try_charge_memory(proc.cgroup_id, length_aligned as u64).is_err() {
+            // ST-K3 Phase D: bind the error so the E2 tag names the variant;
+            // the early-return semantics are unchanged.
+            if let Err(_charge_err) =
+                cgroup::try_charge_memory(proc.cgroup_id, length_aligned as u64)
+            {
+                #[cfg(debug_assertions)]
+                kprintln!(
+                    "[ST-K3] mmap ENOMEM site=E2 stage=cgroup_charge cgroup={} len={} err={:?}",
+                    proc.cgroup_id,
+                    length_aligned,
+                    _charge_err
+                );
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -13807,6 +13826,13 @@ fn sys_mmap(
             if !is_prot_none {
                 cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
             }
+            // ST-K3 Phase D: site tag (E3) — Phase-1 VMA-map heap admission.
+            #[cfg(debug_assertions)]
+            kprintln!(
+                "[ST-K3] mmap ENOMEM site=E3 stage=phase1_admission len={} regions={}",
+                length_aligned,
+                mm.mmap_regions.len()
+            );
             return Err(SyscallError::ENOMEM);
         }
 
@@ -13835,9 +13861,18 @@ fn sys_mmap(
             // PENDING_MAP marker makes concurrent munmap/mprotect/fork bail), so
             // this is an in-place replace that never allocates; map_err keeps the
             // path total even in the impossible-realloc case.
+            // ST-K3 Phase D: site tag (E4) — annotated-unreachable; the tag
+            // exists to FALSIFY that annotation if it ever fires.
             mm.mmap_regions
                 .try_insert(base, len_with_flags)
-                .map_err(|_| SyscallError::ENOMEM)?;
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    kprintln!(
+                        "[ST-K3] mmap ENOMEM site=E4 stage=prot_none_commit len={}",
+                        length_aligned
+                    );
+                    SyscallError::ENOMEM
+                })?;
             if mm.next_mmap_addr < end {
                 mm.next_mmap_addr = end;
             }
@@ -13923,6 +13958,12 @@ fn sys_mmap(
                                     frame_alloc.deallocate_frame(frame);
                                 }
                             }
+                            // ST-K3 Phase D: site tag (E5) — data-frame exhaustion.
+                            #[cfg(debug_assertions)]
+                            kprintln!(
+                                "[ST-K3] mmap ENOMEM site=E5 stage=frame_alloc len={}",
+                                length_aligned
+                            );
                             return Err(SyscallError::ENOMEM);
                         }
                     };
@@ -13963,6 +14004,12 @@ fn sys_mmap(
                                 frame_alloc.deallocate_frame(frame);
                             }
                         }
+                        // ST-K3 Phase D: site tag (E6) — page-table material.
+                        #[cfg(debug_assertions)]
+                        kprintln!(
+                            "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={}",
+                            length_aligned
+                        );
                         return Err(SyscallError::ENOMEM);
                     }
 
@@ -13999,6 +14046,14 @@ fn sys_mmap(
                                 frame_alloc.deallocate_frame(frame);
                             }
                         }
+                        // ST-K3 Phase D: site tag (E7) — kernel-heap OOM on the
+                        // Phase-2 rollback-tracking vec: HEAP-ADMISSION class,
+                        // not frame exhaustion (lens: do not misattribute to E5).
+                        #[cfg(debug_assertions)]
+                        kprintln!(
+                            "[ST-K3] mmap ENOMEM site=E7 stage=phase2_track_reserve len={}",
+                            length_aligned
+                        );
                         return Err(SyscallError::ENOMEM);
                     }
                     mapped.push((page, frame));
@@ -14071,9 +14126,21 @@ fn sys_mmap(
         let mut mm = mm_arc.lock();
         // next-phase #11: `base` is still present from Phase 1 (PENDING_MAP), so
         // this is an in-place replace clearing the flag — no allocation.
+        // ST-K3 Phase D: site tag (E8) — the Phase-3 commit `?` has NO rollback
+        // (PENDING entry, cgroup charge, next_mmap_addr, and mapped frames all
+        // survive an error here); annotated-unreachable, and the tag exists to
+        // falsify that annotation — if it EVER fires, the stuck-PENDING entry
+        // will also fail every later fork via ForkMmReservation.
         mm.mmap_regions
             .try_insert(base, committed_len_with_flags)
-            .map_err(|_| SyscallError::ENOMEM)?;
+            .map_err(|_| {
+                #[cfg(debug_assertions)]
+                kprintln!(
+                    "[ST-K3] mmap ENOMEM site=E8 stage=phase3_commit len={}",
+                    length_aligned
+                );
+                SyscallError::ENOMEM
+            })?;
         // R131-6 FIX: Track per-address-space cgroup DATA charge.
         mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(length_aligned as u64);
         if mm.next_mmap_addr < end {
