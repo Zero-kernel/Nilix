@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -53,7 +53,7 @@ jobs:
         run: make build-syz-fuzzer
 
       - name: Restore fuzzing corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           # The fuzzer runs from userspace/nilix-syz-fuzzer and uses
           # --corpus-dir ./syz-corpus, so the corpus lives here (matching the
@@ -77,7 +77,7 @@ jobs:
             || true
 
       - name: Save fuzzing corpus
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         if: always()
         with:
           path: userspace/nilix-syz-fuzzer/syz-corpus
@@ -103,7 +103,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: syzkaller-crashes-${{ github.run_number }}
           path: userspace/nilix-syz-fuzzer/syz-crashes/
@@ -111,7 +111,7 @@ jobs:
 
       - name: Upload corpus snapshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: syzkaller-corpus-${{ github.run_number }}
           path: userspace/nilix-syz-fuzzer/syz-corpus/
