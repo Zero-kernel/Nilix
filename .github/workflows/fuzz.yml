@@ -33,6 +33,31 @@ on:
       - 'Makefile'
       - '.github/workflows/fuzz.yml'
 
+  # `userspace/fuzzer` and `fuzz` are the only crates in the repository that no
+  # pull-request check compiled: `ci.yml` never touches either, and
+  # `make clippy` / `make fmt-check` cover the bootloader, kernel, and
+  # `userspace` workspaces only — both of these are separate workspaces with
+  # their own lockfiles. Without a `pull_request` trigger they reached `main`
+  # unbuilt, so two Dependabot PRs (hmac 0.13, sha2 0.11) each reported a fully
+  # green run while being individually uncompilable, and either would have
+  # turned `main` red on merge. Only the two fast compile jobs run here; every
+  # heavier job below is gated off `pull_request` by its own `if:`, so a pull
+  # request never starts a fuzz campaign.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'userspace/fuzzer/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+
+# Collapse superseded pull-request runs only. Every other event keeps a
+# run-unique group, so scheduled campaigns, `main` pushes, and manual dispatches
+# retain today's behaviour and can never cancel or queue behind one another.
+concurrency:
+  group: fuzz-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
@@ -68,6 +93,57 @@ jobs:
 
       - name: Lint fuzz tools
         run: cargo clippy --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+
+  # Type-checks the cargo-fuzz crate on pull requests. `cargo-fuzz-targets`
+  # below already compiles it on push and on the nightly schedule, but that job
+  # is far too heavy to gate a pull request on, which left `fuzz/` — including
+  # its dependency bumps — reaching `main` without any pull-request check ever
+  # building it.
+  fuzz-targets-check:
+    name: Fuzz Target Compile Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # Pull-request only: the events that already build this crate for real must
+    # keep their current job set exactly as it is.
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src
+
+      - name: Cache fuzz-target check
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target/
+          key: ${{ runner.os }}-fuzz-check-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-check-
+
+      # `--all-features` is required, not cosmetic: `sha2`, `nix`, `rand`, and
+      # the rest of the QEMU executor dependencies are optional behind
+      # `qemu-executor`, so a default-feature check would silently skip the very
+      # crates a dependency bump changes.
+      #
+      # `--locked` is what makes this a real gate — it asserts the committed
+      # lockfile is exactly what builds. `cargo-fuzz-targets` runs `cargo fuzz
+      # run` without it and therefore re-resolves silently, which is how
+      # `fuzz/Cargo.lock` drifted out of date unnoticed.
+      #
+      # This is a compile check, not a lint gate: the fuzz targets carry
+      # pre-existing dead-code warnings, so no `-D warnings` is applied here.
+      - name: Check fuzz targets
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target x86_64-unknown-linux-gnu
 
   # This is a deterministic executor regression test, not a fuzz campaign. It
   # boots a real Nilix guest and proves that two syscall programs produce
@@ -520,7 +596,11 @@ jobs:
   aggregate-report:
     name: Aggregate Report
     needs: [fuzz-tools-test, kcov-qemu-e2e, fuzz-pipeline-smoke, cargo-fuzz-targets, candidate-reporting]
-    if: ${{ !cancelled() }}
+    # `!cancelled()` deliberately runs this even when needed jobs are skipped,
+    # which on a pull request would mean summarising four skipped jobs and an
+    # empty artifact set. Exclude that event so the only check a pull request
+    # publishes is the one that actually compiled something.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

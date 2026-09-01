@@ -64,9 +64,37 @@ updates:
     commit-message:
       prefix: chore(deps)
     groups:
+      # RustCrypto crates share a `digest` version and must move as a unit.
+      # `crash-triage` builds `Hmac<Sha256>`, so bumping `hmac` and `sha2` in
+      # separate pull requests leaves the lockfile carrying two `digest` majors
+      # and makes that type unsatisfiable — each pull request is individually
+      # uncompilable, which is exactly what happened with hmac 0.13 and
+      # sha2 0.11.
+      #
+      # This group carries no `update-types` filter on purpose. Cargo treats a
+      # leading-zero bump such as 0.12 -> 0.13 as incompatible, so Dependabot
+      # classifies it as semver-major; a minor+patch filter would exclude
+      # precisely the bumps that need grouping.
+      rustcrypto:
+        patterns:
+          - "hmac"
+          - "sha2"
+          - "sha3"
+          - "digest"
+          - "crypto-common"
+          - "block-buffer"
+      # Declared after `rustcrypto` and excluding the same names, so group
+      # membership holds regardless of how group precedence is resolved.
       fuzzer-tools-minor-and-patch:
         patterns:
           - "*"
+        exclude-patterns:
+          - "hmac"
+          - "sha2"
+          - "sha3"
+          - "digest"
+          - "crypto-common"
+          - "block-buffer"
         update-types:
           - minor
           - patch
@@ -84,9 +112,28 @@ updates:
     commit-message:
       prefix: chore(deps)
     groups:
+      # Same coupling rule as `/userspace/fuzzer` above. This directory
+      # currently declares only `sha2` (optional, behind `qemu-executor`), so
+      # today the group holds a single crate; it is declared anyway so adding
+      # any sibling RustCrypto crate cannot reintroduce the split-bump trap.
+      rustcrypto:
+        patterns:
+          - "hmac"
+          - "sha2"
+          - "sha3"
+          - "digest"
+          - "crypto-common"
+          - "block-buffer"
       fuzz-targets-minor-and-patch:
         patterns:
           - "*"
+        exclude-patterns:
+          - "hmac"
+          - "sha2"
+          - "sha3"
+          - "digest"
+          - "crypto-common"
+          - "block-buffer"
         update-types:
           - minor
           - patch
