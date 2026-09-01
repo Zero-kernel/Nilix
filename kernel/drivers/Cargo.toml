@@ -9,5 +9,4 @@ path = "lib.rs"
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
-uart_16550 = "0.3"
 x86_64 = "0.15"
