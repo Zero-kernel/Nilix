@@ -4,5 +4,10 @@
 # methods added in recent nightly (2026-07-10 CI failure). Remote build host (40c-devbox-ts)
 # already runs rustc 1.94.0-nightly (37aa2135b 2025-12-08), which builds clean.
 channel = "nightly-2025-12-08"
-components = ["rust-src", "llvm-tools-preview"]
+# rust-analyzer is pinned alongside the channel on purpose: the VS Code
+# extension's bundled rust-analyzer tracks recent nightlies and refuses to
+# index a toolchain this old ("toolchain too old for the extension shipped
+# rust-analyzer"). Listing the component here makes the extension launch the
+# version-matched `rustup run nightly-2025-12-08 rust-analyzer` instead.
+components = ["rust-src", "llvm-tools-preview", "rust-analyzer"]
 targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]
