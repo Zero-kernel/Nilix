@@ -354,11 +354,23 @@ start_vm() {
     : > "$EVENT_LOG"
     rm -f -- "$QMP_SOCKET"
 
+    # QEMU's virtual FAT is writable (`fat:rw:`) and OVMF stores NvVars on it, so
+    # pointing it straight at $ESP lets the firmware write back into the source
+    # directory -- which mutates BOOTX64.EFI in place. The first boot after a
+    # build then succeeds and every later one dies in BdsDxe with "Load Error".
+    # Hand each boot a pristine throwaway copy instead, mirroring the
+    # already-disposable per-attempt disk image.
+    local esp_copy="$workdir/esp"
+    rm -rf -- "$esp_copy" || return 1
+    mkdir -p "$esp_copy" || return 1
+    cp -r -- "$ESP"/. "$esp_copy"/ || return 1
+    rm -f -- "$esp_copy/NvVars"
+
     local accel_args=()
     [ -z "$STRESS_ACCEL" ] || accel_args=(-accel "$STRESS_ACCEL")
     timeout --signal=TERM --kill-after="${STRESS_SHUTDOWN_GRACE}s" "${guard_seconds}s" \
         "$QEMU" -bios "$OVMF" "${accel_args[@]}" \
-        -drive "format=raw,file=fat:rw:$ESP" \
+        -drive "format=raw,file=fat:rw:$esp_copy" \
         -drive "if=none,file=$disk,format=raw,id=stressdisk,cache=writeback,discard=unmap" \
         -device virtio-blk-pci,drive=stressdisk \
         -netdev user,id=stressnet \
@@ -381,7 +393,11 @@ wait_marker() {
 }
 
 wait_soak_window() {
-    local duration="$1" deadline=$((SECONDS + duration))
+    # Split deliberately: bash expands every word of a `local` invocation before
+    # assigning any of them, so folding these onto one line makes the arithmetic
+    # read `duration` while it is still unset, which is fatal under `set -u`.
+    local duration="$1"
+    local deadline=$((SECONDS + duration))
     while [ "$SECONDS" -lt "$deadline" ]; do
         kill -0 "$ACTIVE_PID" 2>/dev/null || return 1
         if grep -q '^NILIX_STRESS_V2_FAIL ' "$SERIAL_LOG" 2>/dev/null; then

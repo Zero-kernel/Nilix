@@ -61,10 +61,19 @@ Six repository-specific gates catch invariants the compiler cannot prove:
 Nilix has sustained stability, performance, and extended SMP tests beyond the core CI
 gates:
 
-- **QEMU stability soaks** (`scripts/stress_test.sh`) — six repeated boot/runtime profiles
-  covering constrained memory, single/multi-vCPU, SMP, attached storage, and combined
-  configurations over 60–300 seconds. These are stability profiles, not dedicated in-guest
-  pressure workloads. Invoke via `make stress-test` or `make stress-test-extended`.
+- **QEMU stress soaks — stress-v2** (`scripts/stress_test.sh` + `scripts/stress_protocol.py`)
+  — six in-guest pressure profiles (`memory`, `cpu`, `smp`, `process`, `block`, `combined`)
+  driven by a 256-byte `NILSTR2` configuration injected into the ext3 image and validated
+  fail-closed against a `NILIX_STRESS_V2_*` serial marker contract, over 60–300 seconds.
+  Invoke via `make stress-test` or `make stress-test-extended`; the monthly CI job is
+  `.github/workflows/monthly-stress-test.yml`.
+  > **Status: NOT GREEN — do not treat this gate as passing.** It has never completed a
+  > validated run end-to-end. As of 2026-09-01 the build break and two harness defects are
+  > fixed and the in-guest workload (`userspace/stress_runner.c`) is implemented, but every
+  > profile is still blocked on kernel-side gaps (no `fsync`, `mmap` ignoring `MAP_SHARED`,
+  > an in-guest `mmap` ENOMEM, and root-cgroup membership for the init task). Full evidence,
+  > the reconstructed V2 contract, and the open decisions are in
+  > [`docs/stress-gate-status.md`](stress-gate-status.md).
 - **Extended SMP** (`scripts/extended_smp_test.sh`) — validates 8-core and 16-core boot,
   IPI broadcast, and multi-CPU lock contention. Run via `make test-smp-extended`.
 - **Performance regression gate** (`scripts/perf_regression_test.sh`) — framework for
