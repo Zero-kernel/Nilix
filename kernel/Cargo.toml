@@ -37,7 +37,7 @@ host_harness = ["mm/host_harness", "kernel_core/host_harness"]
 spin = "0.12"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "=0.15.4"
-uart_16550 = "0.6"
+uart_16550 = "0.8"
 linked_list_allocator = "0.10"
 arch = { path = "arch" }
 mm = { path = "mm" }
