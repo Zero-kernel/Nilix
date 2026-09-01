@@ -3878,7 +3878,23 @@ mod tests {
         let mut malformed_udp = valid_zero_udp;
         malformed_udp[5] = 0x09; // claims one byte beyond the immutable payload
 
-        firewall_remove_ns(DIRECT_NS);
+        // TEST-ISOLATION FIX: reaching policy evaluation requires a resolvable
+        // TX device, and hosted net tests register none by default. This oracle
+        // silently depended on a SIBLING test
+        // (`d1iso_resolver_gates_tx_by_namespace_ownership`) having registered
+        // "eth0" first; under default-parallel execution that ordering is not
+        // guaranteed, so the valid-datagram transmit below intermittently failed
+        // closed at the device gate with `LinkDown` instead of reaching the
+        // firewall. Register it here so the test is self-sufficient — the
+        // registry rejects duplicate names, so this is a no-op when a parallel
+        // test registered eth0 first, and every assert below is invariant to
+        // WHICH eth0 instance won.
+        let _ = crate::register_device(MockEthDevice);
+
+        // No ns-0 rule reset here on purpose: `firewall_remove_ns(0)` is a
+        // documented no-op (the root table is never removable), so a call would
+        // read as a reset while doing nothing. ns 0 keeps the pristine
+        // default-deny set for the whole process.
         assert_eq!(
             build_frame_and_transmit(Ipv4Proto::Udp, peer_ip, &malformed_udp, DIRECT_NS, None,),
             Err(TxError::InvalidBuffer),
@@ -3889,7 +3905,6 @@ mod tests {
             Err(TxError::FirewallDenied),
             "a structurally valid header-only datagram must reach default-deny"
         );
-        firewall_remove_ns(DIRECT_NS);
 
         firewall_remove_ns(REPLY_NS);
         firewall_table_for_ns(REPLY_NS).replace_rules(alloc::vec![FirewallRule::builder(51)
