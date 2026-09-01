@@ -6,7 +6,7 @@
 //! messages, paths, hashes, stack traces, or previews into its output directory.
 
 use clap::Parser;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::error::Error;
@@ -446,6 +446,28 @@ mod tests {
         ] {
             assert!(!report.contains(forbidden), "leaked field: {forbidden}");
         }
+    }
+
+    /// Absolute pin on the candidate-ID construction.
+    ///
+    /// The sibling test above asserts only RELATIVE properties (repeatable,
+    /// key-scoped, target-scoped, payload-scoped), and `assert_keyed_id_shape`
+    /// checks only the prefix plus 64 hex characters. Nothing pinned the actual
+    /// bytes, so a dependency bump or a reordering of the length-prefixed HMAC
+    /// fields could change every published candidate ID while the whole suite
+    /// stayed green. Candidate IDs are the cross-run dedup key for fuzz
+    /// findings, so they must stay byte-stable across dependency updates.
+    ///
+    /// Cross-checked under hmac 0.12/sha2 0.10 (digest 0.10) and hmac
+    /// 0.13/sha2 0.11 (digest 0.11): identical under both.
+    #[test]
+    fn candidate_id_matches_its_pinned_golden_vector() {
+        let id = keyed_candidate_id(TEST_KEY, "fuzz_syscall", "crash", &[0xde, 0xad, 0xbe, 0xef])
+            .expect("golden-vector candidate ID must be derivable");
+        assert_eq!(
+            id, "hmac-sha256:507b92507406a7382ec62cab4ba57429f8209c21d3284f677bc18b5fd6acc804",
+            "candidate-ID bytes changed: the fuzz dedup key is no longer stable"
+        );
     }
 
     #[test]
