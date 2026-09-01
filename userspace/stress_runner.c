@@ -523,6 +523,42 @@ static void cgroup_stats(CgroupStatsBuf *out) {
     }
 }
 
+/*
+ * ST-K3 Phase D: best-effort cgroup snapshot emitted just before an mmap FAIL
+ * marker. The NILIX_STK3_DIAG prefix is deliberately NOT NILIX_STRESS_V2_* —
+ * the validator's line filter only selects that prefix (stress_protocol.py
+ * protocol_lines) and its FAIL regex requires a bare-integer detail field, so
+ * the diagnosis rides on its own line and the marker stays schema-legal.
+ * This helper must never call fail(): a failing stats syscall here would
+ * consume the failure_emitted latch and swallow the original marker. Both
+ * stats calls are tolerated-failure; rc values are reported so a stats error
+ * is itself visible. Callers pass errno by value BEFORE these syscalls run,
+ * so the reported errno is never clobbered.
+ */
+static void emit_mmap_diag(const char *stage, long errno_value, uint64_t detail) {
+    CgroupStatsBuf run_stats;
+    CgroupStatsBuf root_stats;
+    memset(&run_stats, 0, sizeof(run_stats));
+    memset(&root_stats, 0, sizeof(root_stats));
+    long run_rc = syscall(NILIX_SYS_CGROUP_GET_STATS2, cgroup_id, &run_stats, sizeof(run_stats));
+    long root_rc = syscall(NILIX_SYS_CGROUP_GET_STATS2, 0, &root_stats, sizeof(root_stats));
+    emit("NILIX_STK3_DIAG stage=%s errno=%ld detail=%" PRIu64
+         " run_cg=%" PRIu64 " run_rc=%ld run_mem_cur=%" PRIu64
+         " run_mem_max_events=%" PRIu64 " root_rc=%ld root_mem_cur=%" PRIu64
+         " root_mem_max_events=%" PRIu64,
+         stage, errno_value, detail,
+         cgroup_id, run_rc, run_stats.memory_current, run_stats.memory_events_max,
+         root_rc, root_stats.memory_current, root_stats.memory_events_max);
+}
+
+/* ST-K3 Phase D: fail(), preceded by the diagnosis line for mmap sites. */
+static void fail_with_stats(const char *stage, long errno_value, uint64_t detail) {
+    if (!failure_emitted) {
+        emit_mmap_diag(stage, errno_value, detail);
+    }
+    fail(stage, errno_value, detail);
+}
+
 /* ------------------------------------------------------------------ */
 /* Worker pinning                                                      */
 /* ------------------------------------------------------------------ */
@@ -595,7 +631,7 @@ static void run_in_cgroup_child(void (*body)(ProfileReport *), ProfileReport *ou
     void *mapping = mmap(NULL, sizeof(ProfileReport), PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {
-        fail("report_mmap", errno, sizeof(ProfileReport));
+        fail_with_stats("report_mmap", errno, sizeof(ProfileReport));
     }
     ProfileReport *report = (ProfileReport *)mapping;
     memset(report, 0, sizeof(*report));
@@ -630,7 +666,7 @@ static SharedRegion *shared_region_create(void) {
     void *mapping = mmap(NULL, sizeof(SharedRegion), PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {
-        fail("shared_mmap", errno, sizeof(SharedRegion));
+        fail_with_stats("shared_mmap", errno, sizeof(SharedRegion));
     }
     memset(mapping, 0, sizeof(SharedRegion));
     return (SharedRegion *)mapping;
@@ -733,7 +769,7 @@ static void memory_round_body(ProfileReport *report) {
             if (errno == ENOMEM) {
                 break; /* the configured pressure boundary was reached */
             }
-            fail("memory_mmap", errno, held);
+            fail_with_stats("memory_mmap", errno, held);
         }
         chunks[held++] = mapping;
         ops += 1u;
@@ -952,7 +988,7 @@ static CombinedRoundResult run_combined_round(void) {
     const size_t chunk = config.memory_chunk_bytes != 0u ? (size_t)config.memory_chunk_bytes : PAGE_BYTES;
     void *mapping = mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {
-        fail("combined_mmap", errno, chunk);
+        fail_with_stats("combined_mmap", errno, chunk);
     }
     memset(mapping, 0xa5, PAGE_BYTES);
     checksum = checksum_mix(checksum, (uint64_t)((const uint8_t *)mapping)[0]);
