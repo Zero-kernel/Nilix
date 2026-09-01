@@ -165,9 +165,17 @@ mod tests {
     fn bridge_requires_prebuilt_fuzzer() {
         let kernel = PathBuf::from("esp-kcov/kernel.elf");
         if kernel.exists() {
-            let bridge = SyzBridge::new(&kernel, 5);
+            // Matched rather than unwrapped: `Result::unwrap_err` requires the
+            // `Ok` type to implement `Debug`, and `SyzBridge` does not.
+            // Widening a public type's derives to satisfy one test is the wrong
+            // trade, so destructure instead.
+            let accepted = match SyzBridge::new(&kernel, 5) {
+                Ok(_) => true,
+                Err(err) => err.to_string().contains("not found"),
+            };
             assert!(
-                bridge.is_ok() || bridge.unwrap_err().to_string().contains("not found")
+                accepted,
+                "constructing the bridge must either succeed or report a missing prerequisite"
             );
         }
     }
