@@ -525,7 +525,7 @@ static void cgroup_stats(CgroupStatsBuf *out) {
 
 /*
  * ST-K3 Phase D: best-effort cgroup snapshot emitted just before an mmap FAIL
- * marker. The NILIX_STK3_DIAG prefix is deliberately NOT NILIX_STRESS_V2_* —
+ * marker. The NILIX_MMAP_DIAG prefix is deliberately NOT NILIX_STRESS_V2_* —
  * the validator's line filter only selects that prefix (stress_protocol.py
  * protocol_lines) and its FAIL regex requires a bare-integer detail field, so
  * the diagnosis rides on its own line and the marker stays schema-legal.
@@ -542,7 +542,7 @@ static void emit_mmap_diag(const char *stage, long errno_value, uint64_t detail)
     memset(&root_stats, 0, sizeof(root_stats));
     long run_rc = syscall(NILIX_SYS_CGROUP_GET_STATS2, cgroup_id, &run_stats, sizeof(run_stats));
     long root_rc = syscall(NILIX_SYS_CGROUP_GET_STATS2, 0, &root_stats, sizeof(root_stats));
-    emit("NILIX_STK3_DIAG stage=%s errno=%ld detail=%" PRIu64
+    emit("NILIX_MMAP_DIAG stage=%s errno=%ld detail=%" PRIu64
          " run_cg=%" PRIu64 " run_rc=%ld run_mem_cur=%" PRIu64
          " run_mem_max_events=%" PRIu64 " root_rc=%ld root_mem_cur=%" PRIu64
          " root_mem_max_events=%" PRIu64,
@@ -633,18 +633,26 @@ static void run_in_cgroup_child(void (*body)(ProfileReport *), ProfileReport *ou
     if (mapping == MAP_FAILED) {
         fail_with_stats("report_mmap", errno, sizeof(ProfileReport));
     }
+    /* ST-K3 Phase D step markers: bisect which kernel interaction after the
+     * (historically first-ever successful) anonymous mmap faults the kernel.
+     * NILIX_MMAP_DIAG lines are invisible to the stress validator. */
+    emit("NILIX_MMAP_DIAG step=mapped");
     ProfileReport *report = (ProfileReport *)mapping;
     memset(report, 0, sizeof(*report));
+    emit("NILIX_MMAP_DIAG step=zeroed");
 
     const pid_t child = fork();
     if (child < 0) {
         fail("cgroup_child_fork", errno, 0);
     }
     if (child == 0) {
+        emit("NILIX_MMAP_DIAG step=child_alive");
         cgroup_attach_self();
+        emit("NILIX_MMAP_DIAG step=child_attached");
         body(report);
         _exit(0);
     }
+    emit("NILIX_MMAP_DIAG step=parent_forked");
 
     int status = 0;
     while (waitpid(child, &status, 0) < 0) {
