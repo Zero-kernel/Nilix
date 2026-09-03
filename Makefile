@@ -336,7 +336,7 @@ test-syz: build-kcov build-syz-executor build-syz-fuzzer
 # (q35会将某些BAR放在高于4GB的地址，超出bootloader的identity mapping范围)
 # R39-8 FIX: Add CPU model with SMEP/SMAP/UMIP/RDRAND support
 QEMU_COMMON = -bios $(OVMF_PATH) \
-	-drive format=raw,file=fat:rw:$(QEMU_ESP) \
+	-drive "format=raw,file=fat:rw:$$(sh scripts/esp_run_copy.sh $(QEMU_ESP))" \
 	-m 256M \
 	-vga std \
 	-no-reboot -no-shutdown \
