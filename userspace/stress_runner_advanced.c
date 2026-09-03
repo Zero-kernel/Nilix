@@ -233,7 +233,11 @@ static long wait_one_child(int *status) {
 
     do {
         errno = 0;
-        result = syscall(SYS_wait4, status);
+        /* ST-K3 FIX (wait4 ABI): SYS_wait4 takes (pid, wstatus, options,
+         * rusage) — the status pointer is ARG1 with pid=-1 for any child.
+         * The old single-arg call put the pointer in arg0, which the
+         * repaired kernel reads as a pid selector (immediate ECHILD). */
+        result = syscall(SYS_wait4, -1, status, 0, NULL);
     } while (result == -1 && errno == EINTR);
     return result;
 }

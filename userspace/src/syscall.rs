@@ -508,9 +508,16 @@ pub unsafe fn sys_fork() -> u64 {
 ///
 /// # Returns
 /// Child's PID, or negative error code
+///
+/// ST-K3 FIX (wait4 ABI): syscall 61 is Linux wait4(pid, wstatus, options,
+/// rusage) — the status pointer belongs in ARG1, with pid = -1 for
+/// "any child". The old `syscall1(SYS_WAIT, status)` put the pointer in
+/// arg0, which the repaired kernel now reads as a (huge, nonexistent) pid
+/// selector → immediate ECHILD. Note *status now receives the Linux
+/// wstatus encoding: exit code = (*status >> 8) & 0xff.
 #[inline(always)]
 pub unsafe fn sys_wait(status: *mut i32) -> u64 {
-    syscall1(SYS_WAIT, status as u64)
+    syscall4(SYS_WAIT, -1i64 as u64, status as u64, 0, 0)
 }
 
 /// Voluntarily yield the CPU to other processes
