@@ -798,7 +798,28 @@ pub fn run_heap_admission_self_test() {
 #[cfg(any(feature = "fuzz_runner", feature = "syz_executor"))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 384 * 1024;
 
-#[cfg(not(any(feature = "fuzz_runner", feature = "syz_executor")))]
+/// ST-K3 Phase D (2026-09-02): debug-assertions builds carry additional boot
+/// footprint (assert machinery + un-elided debug paths), and the
+/// release-calibrated 224 KiB ceiling rejected them at the
+/// integration_test.rs D1-RES oracle — measured 244,376 B on the
+/// debug-assertions stress boot, which had silently made EVERY
+/// `#[cfg(debug_assertions)]` kernel path unbootable (and therefore
+/// untestable) under the QEMU harnesses. Same provenance protocol as the
+/// arms above (measured max + ~25%, rounded to the next 32 KiB step):
+/// 244,376 × 1.27 ≈ 303 KiB → 320 KiB. Release and fuzz budgets are
+/// untouched; the oracle stays live for debug boots with a
+/// debug-calibrated ceiling instead of rejecting the build flavor
+/// outright. Re-measure and re-pin if the debug boot profile changes.
+#[cfg(all(
+    debug_assertions,
+    not(any(feature = "fuzz_runner", feature = "syz_executor"))
+))]
+pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 320 * 1024;
+
+#[cfg(all(
+    not(debug_assertions),
+    not(any(feature = "fuzz_runner", feature = "syz_executor"))
+))]
 pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
 
 /// D1-RES R4: fail-closed ceiling on `mm::heap_peak_used_bytes()` at the boot

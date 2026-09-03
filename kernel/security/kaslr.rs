@@ -236,8 +236,10 @@ pub struct BootKaslrState {
 ///
 /// The kernel stack region starts at KSTACK_BASE (0xFFFF_FFFF_0000_0000).
 /// Bounded to avoid overlapping the kernel heap or other reserved high-half regions.
-/// Each process slot is 0x5000 (20 KiB), so even with MAX_PID=65535 processes
-/// the region spans ~1.3 GiB. A 256 MiB slide stays well within the high-half.
+/// ST-K3 FIX (doc-truth): each process slot is now 0x9000 (32 KiB stack +
+/// 4 KiB guard — grown from 0x5000 after the Ring-3 fork double fault), so
+/// with PID_MAX=32,768 slots the region spans ~1.2 GiB; with the 256 MiB
+/// slide it stays within the 2 GiB PDPT[508] window below the kernel image.
 const KSTACK_MAX_SLIDE: u64 = 256 * 1024 * 1024;
 
 /// Kernel stack base slide granularity: 2 MiB.
@@ -283,11 +285,14 @@ fn generate_kstack_slide() -> u64 {
 
 /// Maximum randomized offset for the userspace mmap base: 256 MiB.
 ///
-/// The default mmap base is 0x4000_0000 (1 GiB). We add a random offset in
-/// [0, MMAP_MAX_OFFSET) so the effective base sits in [1 GiB, ~1.25 GiB).
-/// This stays well within the 47-bit canonical userspace range while providing
-/// meaningful entropy against user-mode ASLR bypass attacks.
-const MMAP_MAX_OFFSET: u64 = 256 * 1024 * 1024;
+/// ST-K3 FIX (doc-truth): the default mmap base is now 0x10_0000_0000
+/// (64 GiB — `kernel_core::process::DEFAULT_MMAP_BASE`; the old 1 GiB base
+/// collided with the identity map inherited into user address spaces). We add
+/// a random offset in [0, MMAP_MAX_OFFSET) so the effective base sits in
+/// [64 GiB, ~64.25 GiB). This stays well within the 47-bit canonical
+/// userspace range while providing meaningful entropy against user-mode ASLR
+/// bypass attacks.
+pub const MMAP_MAX_OFFSET: u64 = 256 * 1024 * 1024;
 
 /// Granularity for mmap base randomization: page-aligned (4 KiB).
 const MMAP_OFFSET_GRANULARITY: u64 = 4096;

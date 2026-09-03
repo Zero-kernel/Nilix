@@ -182,7 +182,26 @@ pub type ProcessArc = Arc<Mutex<Process>, ProcessArcAllocator>;
 pub type ProcessWeak = Weak<Mutex<Process>, ProcessArcAllocator>;
 
 /// mmap 默认起始地址
-const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
+// ST-K3 FIX: moved 0x4000_0000 (1 GiB) → 0x10_0000_0000 (64 GiB). The old
+// window [1 GiB, 1.25 GiB) sat INSIDE the 0-4 GiB identity map that
+// `create_fresh_address_space`/`deep_copy_identity_for_user` copy into every
+// user address space as 2 MiB huge supervisor pages (only 4-6 MiB is split
+// for the ELF image), so `map_to` failed with ParentEntryHugePage on EVERY
+// frame-backed anonymous mmap — no userspace mmap had ever succeeded
+// (PROT_NONE reservations skip map_page, which masked it). 64 GiB is far
+// past the identity map's 4 GiB coverage (headroom for future MMIO/identity
+// growth), far below USER_STACK_TOP (0x7FFF_FFFF_E000) and USER_SPACE_TOP
+// (128 TiB); PDPT entries there are unused in the copied table, so map_to
+// builds fresh user-accessible PD/PTs. pub(crate) so the exec reset uses THIS
+// constant instead of a duplicated literal (the two sites can never drift).
+// Diagnosed via the ST-K3 Phase D E6 tag: err=ParentEntryHugePage, booted
+// evidence in docs/review/design/st-k3-mmap-enomem-design.md.
+// Fully pub (not pub(crate)): the boot-time regression test
+// `st_k3_mmap_window_clear` in the `kernel` crate walks a fresh user AS's
+// tables over [DEFAULT_MMAP_BASE, +security::MMAP_MAX_OFFSET] and hard-FAILs
+// if any inherited huge-page parent entry covers the window. The value is a
+// layout constant, not a secret (the KASLR offset is the runtime entropy).
+pub const DEFAULT_MMAP_BASE: usize = 0x10_0000_0000;
 
 /// 页大小
 const PAGE_SIZE: u64 = 0x1000;
@@ -190,11 +209,23 @@ const PAGE_SIZE: u64 = 0x1000;
 /// 每进程内核栈基址（PML4[511]/PDPT[508]，在共享内核空间内）
 pub const KSTACK_BASE: u64 = 0xFFFF_FFFF_0000_0000;
 
-/// 每进程内核栈步长（16KB 栈 + 4KB 守护页 = 20KB）
-pub const KSTACK_STRIDE: u64 = 0x5000;
+/// 每进程内核栈步长（32KB 栈 + 4KB 守护页 = 36KB）
+// ST-K3 FIX (fork double-fault): 16 KiB per-process kernel stacks cannot host
+// the Ring-3 process-creation path — `Process::try_new_pcb` alone reserves a
+// ~12.4 KiB frame (LLVM stack probes `sub $0x1000,%rsp` ×3 + 0xC0; the on-stack
+// `Process` temporary), and the syscall entry + dispatcher + sys_clone +
+// sys_fork + create_process frames sit under it. The third probe touched the
+// guard page → #PF → the handler could not push onto the dead stack → double
+// fault at try_new_pcb+0x36, deterministic (RIP tracked the KASLR slide with
+// constant link offset 0x21BF86). Never seen before because every prior
+// process creation ran on fat boot-context stacks — no Ring-3 fork/clone had
+// ever reached create_process. 32 KiB gives ~2.6× headroom over the measured
+// worst frame; the in-place-PCB-construction refactor that removes the class
+// is tracked separately in the plan.
+pub const KSTACK_STRIDE: u64 = 0x9000;
 
-/// 内核栈页数（16KB = 4 页）
-const KSTACK_PAGES: usize = 4;
+/// 内核栈页数（32KB = 8 页）
+const KSTACK_PAGES: usize = 8;
 
 /// 守护页数
 const KSTACK_GUARD_PAGES: usize = 1;
@@ -659,7 +690,8 @@ pub enum ProcessCreateError {
 ///
 /// Each process gets a kernel stack at KSTACK_BASE + pid * KSTACK_STRIDE.
 /// After this many PIDs, new stacks would overflow into other kernel memory.
-/// Calculation: (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE ≈ 209,715
+/// Calculation: (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE ≈ 116,508
+/// (ST-K3: recomputed for the 0x9000 stride; was ≈209,715 at 0x5000)
 pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as ProcessId;
 
 /// R106-11 (P0-4): User-visible PID upper bound (Linux default: 32768).

@@ -568,6 +568,153 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
 }
 
 // ============================================================================
+// ST-K3: mmap-window clearance (address-space layout collision class)
+// ============================================================================
+
+/// ST-K3 FIX regression gate: the userspace mmap window in a FRESH user
+/// address space must contain no inherited parent entries that block 4 KiB
+/// mappings. The original defect: DEFAULT_MMAP_BASE sat at 1 GiB, inside the
+/// 0-4 GiB identity map that `deep_copy_identity_for_user` copies into every
+/// user AS as 2 MiB huge supervisor pages — so `map_to` failed with
+/// `ParentEntryHugePage` on EVERY frame-backed anonymous mmap (booted E6-tag
+/// evidence, docs/review/design/st-k3-mmap-enomem-design.md). Indices are
+/// DERIVED from the live constants so the gate follows any future window
+/// move. Hard-FAIL polarity (P1-A): a failed AS creation is a red result,
+/// never a Warning.
+struct MmapWindowClearTest;
+
+impl RuntimeTest for MmapWindowClearTest {
+    fn name(&self) -> &'static str {
+        "mmap_window_clear"
+    }
+
+    fn description(&self) -> &'static str {
+        "ST-K3: fresh user AS has no huge-page/present coverage over the mmap window"
+    }
+
+    fn run(&self) -> TestResult {
+        use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+        let (_pml4_frame, memory_space) = match kernel_core::fork::create_fresh_address_space() {
+            Ok(pair) => pair,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "create_fresh_address_space failed: {:?} (required infrastructure)",
+                    e
+                ));
+            }
+        };
+
+        // Window under test: [base, base + KASLR span + 768 MiB slack), so the
+        // gate also covers growth headroom past the randomized base.
+        let base = kernel_core::process::DEFAULT_MMAP_BASE as u64;
+        let span = security::kaslr::MMAP_MAX_OFFSET + 768 * 1024 * 1024;
+        let end = base + span;
+
+        let phys_offset = mm::page_table::get_physical_memory_offset().as_u64();
+        let table_at = |phys: u64| -> &'static PageTable {
+            // Safety: read-only walk of tables we just built for a fresh,
+            // never-activated AS, via the kernel's physical-memory offset
+            // mapping (same access pattern as usermode_test's table dump).
+            unsafe { &*((phys_offset + phys) as *const PageTable) }
+        };
+
+        let mut violation: Option<String> = None;
+        'walk: for gib in (base..end).step_by(1 << 30) {
+            let pml4_idx = ((gib >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((gib >> 30) & 0x1FF) as usize;
+
+            let pml4 = table_at(memory_space as u64);
+            let pml4_e = &pml4[pml4_idx];
+            if pml4_e.is_unused() {
+                continue; // nothing mapped in this 512 GiB — clear by construction
+            }
+            let pdpt = table_at(pml4_e.addr().as_u64());
+            let pdpt_e = &pdpt[pdpt_idx];
+            if pdpt_e.is_unused() {
+                continue; // this 1 GiB is clear
+            }
+            if pdpt_e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                violation = Some(alloc::format!(
+                    "PDPT[{}] is a 1 GiB huge page inside the mmap window",
+                    pdpt_idx
+                ));
+                break 'walk;
+            }
+            let pd = table_at(pdpt_e.addr().as_u64());
+            for pd_idx in 0..512 {
+                let pd_e = &pd[pd_idx];
+                if pd_e.is_unused() {
+                    continue;
+                }
+                if pd_e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    violation = Some(alloc::format!(
+                        "PDPT[{}]/PD[{}] is a 2 MiB huge page inside the mmap window \
+                         (the ParentEntryHugePage class)",
+                        pdpt_idx,
+                        pd_idx
+                    ));
+                    break 'walk;
+                }
+                // Non-huge PD entry: any PRESENT leaf below it would later
+                // yield PageAlreadyMapped — same collision class, keep closed.
+                let pt = table_at(pd_e.addr().as_u64());
+                for pt_idx in 0..512 {
+                    if !pt[pt_idx].is_unused() {
+                        violation =
+                            Some(alloc::format!(
+                            "PDPT[{}]/PD[{}]/PT[{}] pre-mapped 4 KiB leaf inside the mmap window",
+                            pdpt_idx, pd_idx, pt_idx
+                        ));
+                        break 'walk;
+                    }
+                }
+            }
+        }
+
+        // Targeted teardown: free EXACTLY the table frames
+        // `create_fresh_address_space` allocated for this AS — PML4, the
+        // deep-copied PDPT, PDPT[0]'s deep-copied PD, and PD[2]'s deep-copied
+        // PT — leaf-first, WITHOUT recursing any other entry. The generic
+        // `free_address_space` walk recurses shallow-copied identity entries
+        // whose sub-tables are SHARED kernel structures; a boot-suite double
+        // fault (deferred corruption ~18 tests later) implicated that walk for
+        // this never-activated fresh AS, and a test must not depend on
+        // resolving that teardown contract — it frees only what it provably
+        // owns.
+        {
+            use x86_64::structures::paging::PhysFrame;
+            let mut fa = mm::memory::FrameAllocator::new();
+            let pml4 = table_at(memory_space as u64);
+            let pml4_e0 = &pml4[0];
+            if !pml4_e0.is_unused() {
+                let pdpt_phys = pml4_e0.addr();
+                let pdpt = table_at(pdpt_phys.as_u64());
+                let pdpt_e0 = &pdpt[0];
+                if !pdpt_e0.is_unused() && !pdpt_e0.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    let pd_phys = pdpt_e0.addr();
+                    let pd = table_at(pd_phys.as_u64());
+                    let pd_e2 = &pd[2];
+                    if !pd_e2.is_unused() && !pd_e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                        fa.deallocate_frame(PhysFrame::containing_address(pd_e2.addr()));
+                    }
+                    fa.deallocate_frame(PhysFrame::containing_address(pd_phys));
+                }
+                fa.deallocate_frame(PhysFrame::containing_address(pdpt_phys));
+            }
+            fa.deallocate_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(
+                memory_space as u64,
+            )));
+        }
+
+        match violation {
+            Some(msg) => TestResult::Fail(msg),
+            None => TestResult::Pass,
+        }
+    }
+}
+
+// ============================================================================
 // Capability Tests
 // ============================================================================
 
@@ -2085,6 +2232,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &VmaHeapAdmissionTest,
         &VmaHeapAdmissionPressureTest,
         &VmaForkCombinedLoadTest,
+        &MmapWindowClearTest,
         &CapTableLifecycleTest,
         &StrictSeccompFilterTest,
         &PledgeSeccompFilterTest,
