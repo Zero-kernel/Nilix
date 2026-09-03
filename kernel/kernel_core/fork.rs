@@ -55,6 +55,14 @@ pub enum ForkError {
     /// R122-1 FIX: mmap_regions contains in-flight PENDING_MAP/PENDING_UNMAP entries;
     /// fork must be retried after the concurrent mmap/munmap completes.
     MmapTransientState,
+    /// ST-K3 FIX (F1): the forking task's live user frame carries a
+    /// non-user-canonical rsp/rip, so the child context it would seed cannot
+    /// pass `switch_to_user`'s canonicality guard. Building it anyway would let
+    /// unprivileged code turn `fork()` into a Ring-0 `#UD` kernel panic, so the
+    /// fork fails closed instead (mapped to EFAULT — the user supplied the bad
+    /// address). Mirrors the `sys_clone` fail-closed precedent for an
+    /// unusable parent frame.
+    InvalidUserFrame,
     /// A credential writer has closed reader admission; retry after it commits.
     CredentialBusy,
     /// R180-19: LSM rejected the prospective child during PREPARE.
@@ -373,6 +381,9 @@ fn fork_inner(
     // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
     // Lock ordering: Process (held) → MmState — never reverse.
     let _mm_fork_reservation = ForkMmReservation::acquire(Arc::clone(&parent.mm))?;
+    // ST-K3 fork-DF diagnosis: coarse stage tags (debug builds only).
+    #[cfg(debug_assertions)]
+    kprintln!("[FORKDIAG] FD1 reservation");
 
     if let Some(child_process) = get_process(child_pid) {
         let mut child = child_process.lock();
@@ -388,46 +399,118 @@ fn fork_inner(
         // operations complete. If fork_inner fails after the notification,
         // the counter is incremented but never decremented (cpuset DoS).
 
-        // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
-        // 复制父进程内核栈内容以保持返回路径一致
-        let parent_top = parent.kernel_stack_top.as_u64();
-        let parent_rsp = parent.context.rsp;
-        let child_top = child.kernel_stack_top.as_u64();
+        // ST-K3 FIX (fork chimera context): entry-state-keyed child resume model.
+        //
+        // A Ring-3 parent forks from INSIDE a syscall. The child must resume at
+        // the SYSCALL RETURN POINT with the parent's CURRENT user frame and
+        // rax = 0; forcing context.cs/ss to the user selectors below makes the
+        // scheduler's `next_cs & 3 == 3` check select switch_to_user, whose
+        // user-canonical rip/rsp validation the frame now satisfies.
+        //
+        // The previous code built a CHIMERA for this case: user CS from the
+        // STALE parent.context, plus — because `used = kernel_top - user_rsp`
+        // overflowed the copy guard — a KERNEL rsp from the fallback rebase
+        // below. switch_to_user's canonicality guard then executed its ud2 arm
+        // on the child's first dispatch (#UD at switch_to_user+0x18e; observed
+        // on the first Ring-3 fork this kernel ever ran, stress-v2 memory
+        // profile). The kernel-stack copy/rebase model below is retained for
+        // KERNEL-context parents only (their context.cs is a kernel selector,
+        // dispatched via switch_context; with_current_syscall_frame returns
+        // None outside an active syscall window, which is exactly the
+        // entry-state discriminator D1-ARC-ENTRY-STATE prescribes).
+        let ring3_user_frame = crate::syscall::with_current_syscall_frame(|frame| *frame);
 
-        // 计算父进程已使用的栈空间
-        let used = parent_top.saturating_sub(parent_rsp);
-        let parent_stack_size = parent_top.saturating_sub(parent.kernel_stack.as_u64());
-
-        if child_top != 0 && used > 0 && used <= parent_stack_size {
-            // 子进程栈顶减去相同使用量 = 子进程 RSP
-            let child_rsp = child_top - used;
-
-            // 复制父栈内容到子栈
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    parent_rsp as *const u8,
-                    child_rsp as *mut u8,
-                    used as usize,
-                );
+        if let Some(frame) = ring3_user_frame {
+            // ST-K3 FIX (F1): validate BEFORE seeding the child. `frame.rsp` and
+            // `frame.rcx` come straight from the SYSCALL entry stub with no
+            // validation, and the child's first dispatch runs
+            // `switch_to_user`'s canonicality guard, whose failure arm is a
+            // Ring-0 `ud2` -> kernel panic. Unprivileged code could therefore
+            // weaponize `mov rsp, <non-canonical>; syscall` into a kernel kill.
+            // `< USER_SPACE_TOP` (0x0000_8000_0000_0000) is exactly the guard's
+            // condition: below 2^47 implies both canonical and bit47 == 0. A
+            // merely-unmapped (but canonical) user rsp/rip stays allowed — that
+            // faults in Ring 3 and terminates the child with SIGSEGV, which is
+            // correct Linux behavior, not a kernel bug.
+            const USER_ADDR_LIMIT: u64 = crate::usercopy::USER_SPACE_TOP as u64;
+            if frame.rsp >= USER_ADDR_LIMIT || frame.rcx >= USER_ADDR_LIMIT {
+                return Err(ForkError::InvalidUserFrame);
             }
+            // SYSCALL entry saved: rcx = user RIP, r11 = user RFLAGS. Mirror
+            // the exact ABI the parent's own return path exposes (rcx/r11 are
+            // architecturally clobbered by SYSCALL, so userspace already
+            // treats them as such). switch_to_user sanitizes RFLAGS again
+            // (mask + force IF) before the IRETQ — defense in depth.
+            child.context.rax = 0; // fork() returns 0 in the child
+            child.context.rbx = frame.rbx;
+            child.context.rcx = frame.rcx;
+            child.context.rdx = frame.rdx;
+            child.context.rsi = frame.rsi;
+            child.context.rdi = frame.rdi;
+            child.context.rbp = frame.rbp;
+            child.context.rsp = frame.rsp; // user RSP
+            child.context.r8 = frame.r8;
+            child.context.r9 = frame.r9;
+            child.context.r10 = frame.r10;
+            child.context.r11 = frame.r11;
+            child.context.r12 = frame.r12;
+            child.context.r13 = frame.r13;
+            child.context.r14 = frame.r14;
+            child.context.r15 = frame.r15;
+            child.context.rip = frame.rcx; // user return RIP
+            child.context.rflags = frame.r11; // user RFLAGS
+                                              // cs/ss MUST be forced: the parent's saved context.cs is a KERNEL
+                                              // selector (both switch_context and switch_to_user save-halves
+                                              // store the live `mov ax, cs` — i.e. the kernel CS active at
+                                              // save time), so inheriting it routes the child through the
+                                              // scheduler's `next_cs & 3 == 3` check into switch_context, which
+                                              // `ret`s into the USER rsp set above (#PF at RIP=user-stack
+                                              // garbage; observed addr=0x1). Same idiom as the CLONE_VM child
+                                              // path (syscall.rs).
+            child.context.cs = 0x23; // USER_CODE_SELECTOR
+            child.context.ss = 0x1b; // USER_DATA_SELECTOR
+        } else {
+            // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
+            // 复制父进程内核栈内容以保持返回路径一致
+            let parent_top = parent.kernel_stack_top.as_u64();
+            let parent_rsp = parent.context.rsp;
+            let child_top = child.kernel_stack_top.as_u64();
 
-            child.context.rsp = child_rsp;
+            // 计算父进程已使用的栈空间
+            let used = parent_top.saturating_sub(parent_rsp);
+            let parent_stack_size = parent_top.saturating_sub(parent.kernel_stack.as_u64());
 
-            // 调整 RBP（如果它指向父栈范围内）
-            if parent.context.rbp >= parent_rsp && parent.context.rbp <= parent_top {
-                // RBP 相对偏移保持不变
-                let rbp_offset = parent.context.rbp - parent_rsp;
-                child.context.rbp = child_rsp + rbp_offset;
-            } else {
-                // RBP 不在栈范围内，直接使用子栈顶
-                child.context.rbp = child_rsp;
+            if child_top != 0 && used > 0 && used <= parent_stack_size {
+                // 子进程栈顶减去相同使用量 = 子进程 RSP
+                let child_rsp = child_top - used;
+
+                // 复制父栈内容到子栈
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        parent_rsp as *const u8,
+                        child_rsp as *mut u8,
+                        used as usize,
+                    );
+                }
+
+                child.context.rsp = child_rsp;
+
+                // 调整 RBP（如果它指向父栈范围内）
+                if parent.context.rbp >= parent_rsp && parent.context.rbp <= parent_top {
+                    // RBP 相对偏移保持不变
+                    let rbp_offset = parent.context.rbp - parent_rsp;
+                    child.context.rbp = child_rsp + rbp_offset;
+                } else {
+                    // RBP 不在栈范围内，直接使用子栈顶
+                    child.context.rbp = child_rsp;
+                }
+            } else if child_top != 0 {
+                // 无法复制栈，使用子栈顶作为起点
+                child.context.rsp = child_top;
+                child.context.rbp = child_top;
             }
-        } else if child_top != 0 {
-            // 无法复制栈，使用子栈顶作为起点
-            child.context.rsp = child_top;
-            child.context.rbp = child_top;
+            // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
         }
-        // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
 
         // R162-7 FIX: Clone fd_table with bounded fallibility.
         // clone_box() is still infallible (Box::new), but we pre-validate
@@ -784,6 +867,8 @@ fn fork_inner(
 
         let child_cpuset_id = child.cpuset_id;
         drop(child);
+        #[cfg(debug_assertions)]
+        kprintln!("[FORKDIAG] FD3 charged");
 
         // R180-19 FIX: the parent-PTE COW transition is the COMMIT point.
         // Every heap allocation, namespace/capability/credential clone, cgroup
@@ -1028,6 +1113,12 @@ pub unsafe fn copy_page_table_cow(
         // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
         let mut plan = CowClonePlan::new();
         plan_clone_level(parent_pml4, 4, &mut plan)?;
+        #[cfg(debug_assertions)]
+        kprintln!(
+            "[FORKDIAG] FD4 planned leaves={} tables={}",
+            plan.leaf_updates.len(),
+            plan.tables_needed
+        );
 
         // 阶段 2: 预分配所有中间页表帧
         // 若分配失败，此时父进程未被修改，直接返回错误即可
@@ -1048,6 +1139,8 @@ pub unsafe fn copy_page_table_cow(
         );
         debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
         debug_assert!(frame_iter.next().is_none());
+        #[cfg(debug_assertions)]
+        kprintln!("[FORKDIAG] FD5 child-built");
 
         // R180-19 PREPARE: KPTI construction used to happen after parent PTEs
         // were committed.  Build it over the unpublished child tree now.  Any
@@ -1064,6 +1157,8 @@ pub unsafe fn copy_page_table_cow(
         } else {
             0
         };
+        #[cfg(debug_assertions)]
+        kprintln!("[FORKDIAG] FD6 kpti-built");
 
         // RF178-6 / RF178-31: refcount metadata is staged only after the child
         // and KPTI roots are complete, but still before parent mutation.  The
@@ -1076,12 +1171,16 @@ pub unsafe fn copy_page_table_cow(
             rollback_prepared_child_clone(child_pml4, &mut table_frames, &mut frame_alloc);
             return Err(error);
         }
+        #[cfg(debug_assertions)]
+        kprintln!("[FORKDIAG] FD7 refs-staged");
 
         // R180-19 COMMIT: no allocation or fallible operation remains.  Parent
         // leaves are changed from their locked plan in one bounded pass.
         unsafe {
             commit_parent_cow(&plan);
         }
+        #[cfg(debug_assertions)]
+        kprintln!("[FORKDIAG] FD8 committed");
 
         // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
         // 使用 TLB shootdown 机制，为 SMP 支持做准备
