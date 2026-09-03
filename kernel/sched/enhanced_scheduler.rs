@@ -2400,6 +2400,18 @@ impl Scheduler {
         } else {
             (BOOTSTRAP_CONTEXT.with(BootstrapContext::as_mut_ptr), 0, 0)
         };
+        // ST-K3 DIAG (fork chimera family): trap a corrupted kernel-cs context at
+        // DISPATCH, with identities. The asm save-half ud2 guard covers the save
+        // side; if this fires without that ud2 having fired, the PCB context was
+        // clobbered in memory between save and dispatch.
+        #[cfg(debug_assertions)]
+        if next.context.cs & 0x3 == 0 && next.context.rip >> 47 != 0x1ffff {
+            panic!(
+                "SCHED-TRAP: pid {} kernel context rip={:#x} rsp={:#x} rcx={:#x} cs={:#x} old_pid={:?}",
+                next_pid, next.context.rip, next.context.rsp, next.context.rcx, next.context.cs, old_pid
+            );
+        }
+
         let next_ctx_ptr = NEXT_CONTEXT_SHADOW.with(|shadow| shadow.store(&next.context));
         let next_space = next.memory_space;
         let next_user_space = next.user_memory_space;

@@ -1338,6 +1338,36 @@ extern "x86-interrupt" fn page_fault_handler(
         serial_write_str(" RIP=");
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
         serial_write_str("\n");
+        // ST-K3 DIAG: dump the raw kernel stack around the faulting RSP so the
+        // frame chain that led into a wild jump (e.g. `ret` through a clobbered
+        // return-address slot) can be symbolized post-mortem. Kernel-mode
+        // faults only — the slots above RSP are the stale frames of the path
+        // that jumped here.
+        if !is_user_mode {
+            let rsp = stack_frame.stack_pointer.as_u64();
+            serial_write_str("[PF STACK] rsp=");
+            serial_write_hex(rsp);
+            serial_write_str("\n");
+            // ST-K3 FIX (F3): clamp the UPWARD walk to the end of the page
+            // holding rsp. Per-process kernel stacks are [guard page][8 stack
+            // pages] at a 0x9000 stride, so the page just above a stack top is
+            // the NEXT slot's guard page and is never mapped. #PF has no IST,
+            // so an unmapped read here would nest a second #PF inside this
+            // handler and the final panic would report the DUMP's fault instead
+            // of the original one — destroying the diagnosis this dump exists
+            // to provide. The page containing rsp is provably mapped (the CPU
+            // just pushed the exception frame there).
+            let page_end = (rsp | 0xfff) + 1;
+            let mut slot = rsp.wrapping_sub(0x40);
+            while slot < page_end {
+                serial_write_str("  ");
+                serial_write_hex(slot);
+                serial_write_str(": ");
+                serial_write_hex(core::ptr::read_volatile(slot as *const u64));
+                serial_write_str("\n");
+                slot += 8;
+            }
+        }
     }
     #[cfg(not(debug_assertions))]
     unsafe {

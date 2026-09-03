@@ -258,7 +258,19 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov [rdx + 0x20], rax",   // rsi = 0 (caller-saved)
         "mov [rdx + 0x28], rax",   // rdi = 0 (caller-saved)
         "mov [rdx + 0x30], rbp",   // 保存rbp
-        "mov [rdx + 0x38], rsp",   // 保存rsp
+        // ST-K3 FIX (off-by-8 resume): save rsp with AS-IF-RETURNED semantics
+        // (entry rsp + 8, i.e. the return-address slot CONSUMED). The restore
+        // half ends `push ctx.rip; ...; ret`, which consumes only the pushed
+        // copy and leaves rsp == ctx.rsp — so ctx.rsp must be the POST-return
+        // rsp the compiled continuation at ctx.rip expects. Saving the raw
+        // entry rsp resumed every task 8 bytes low; any continuation that
+        // reaches an rsp-arithmetic (frame-pointer-less) epilogue then pops
+        // every callee-saved slot shifted by one and `ret`s into the saved-rbp
+        // slot (observed: parent of the first Ring-3 fork resumed through
+        // reschedule_now's closure and jumped to rbp==1). rax is 0 here
+        // (zeroed above for the rsi/rdi Z-5 save) — free as scratch.
+        "lea rax, [rsp + 8]",
+        "mov [rdx + 0x38], rax",   // 保存rsp（已消费返回地址槽）
         "mov [rdx + 0x40], r8",    // 保存r8
         "mov [rdx + 0x48], r9",    // 保存r9
         "mov [rdx + 0x50], r10",   // 保存r10
@@ -276,10 +288,30 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // No need to save again here
 
         // 保存段寄存器
+        // ST-K3 FIX (F5): zero rax FIRST. `mov ax, cs` writes only the low 16
+        // bits, so without this the saved cs/ss inherit whatever was in the
+        // upper 48 bits (the return address, or the ud2 guard's shifted value)
+        // — i.e. `(garbage & !0xffff) | 0x08`. Every current consumer masks
+        // with &3, but a future `== 0x08` comparison would silently fail. One
+        // zeroing covers both stores (cs leaves rax = 0x8, then ax<-ss).
+        "xor eax, eax",
         "mov ax, cs",
         "mov [rdx + 0x90], rax",
         "mov ax, ss",
         "mov [rdx + 0x98], rax",
+
+        // ST-K3 DIAG/HARDEN: a kernel save MUST record a canonical-high rip
+        // ([rsp] = return address into kernel text). A non-canonical-high value
+        // means the stack top held data, not a return address — resuming such a
+        // context jumps to garbage (observed: parent resumed at rip=0x1 during
+        // the first Ring-3 fork). Trap AT THE SAVE so the QEMU int log captures
+        // the corrupting call site, instead of crashing at the later restore.
+        "mov rax, [rdx + 0x80]",
+        "shr rax, 47",
+        "cmp rax, 0x1ffff",
+        "je 2f",
+        "ud2",
+        "2:",
 
         // R102-3 FIX: Clear per-CPU syscall_active and frame_ptr on switch-out.
         // If the outgoing task was preempted inside a syscall, its syscall_active
@@ -419,7 +451,12 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "mov [rdx + 0x20], rax",       // rsi = 0 (caller-saved)
         "mov [rdx + 0x28], rax",       // rdi = 0 (caller-saved)
         "mov [rdx + 0x30], rbp",
-        "mov [rdx + 0x38], rsp",
+        // ST-K3 FIX (off-by-8 resume): as-if-returned rsp — see the matching
+        // comment in switch_context's save-half. rax is 0 here (Z-5 zeroing
+        // above) — free as scratch. Keeps the save-half byte-identical to
+        // switch_context's.
+        "lea rax, [rsp + 8]",
+        "mov [rdx + 0x38], rax",
         "mov [rdx + 0x40], r8",
         "mov [rdx + 0x48], r9",
         "mov [rdx + 0x50], r10",
@@ -432,10 +469,22 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "mov rax, [rsp]",
         "mov [rdx + 0x80], rax",
         // Truthful kernel segments (this runs in Ring 0).
+        // ST-K3 FIX (F5): zero rax first — see the matching comment in
+        // switch_context's save-half (keeps the halves byte-identical).
+        "xor eax, eax",
         "mov ax, cs",
         "mov [rdx + 0x90], rax",
         "mov ax, ss",
         "mov [rdx + 0x98], rax",
+        // ST-K3 DIAG/HARDEN: same saved-rip canonicality trap as switch_context
+        // (see comment there) — the outgoing kernel context must resume at a
+        // canonical-high kernel address.
+        "mov rax, [rdx + 0x80]",
+        "shr rax, 47",
+        "cmp rax, 0x1ffff",
+        "je 6f",
+        "ud2",
+        "6:",
         // R172-05 / R102-3: clear per-CPU syscall_active + frame_ptr on switch-out.
         "mov qword ptr gs:[{percpu_syscall_active}], 0",
         "mov qword ptr gs:[{percpu_frame_ptr}], 0",
