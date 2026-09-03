@@ -3927,7 +3927,14 @@ pub fn syscall_dispatcher(
             arg1 as *const *const u8, // argv
             arg2 as *const *const u8, // envp
         ),
-        61 => sys_wait(arg0 as *mut i32),
+        // ST-K3 FIX (wait4 ABI): Linux wait4(pid, wstatus, options, rusage) —
+        // the pid SELECTOR is arg0 and the status pointer is arg1. The old
+        // dispatch passed arg0 (the PID) as the status pointer, so musl's
+        // waitpid(pid, &status, 0) hit copy_to_user(pid) = EFAULT on the first
+        // Ring-3 parent that ever reaped a real child (stress-v2 memory
+        // profile, stage=cgroup_child_wait errno=14). rusage (arg3) is
+        // accepted and ignored — Linux permits NULL.
+        61 => sys_wait4(arg0 as i64, arg1 as *mut i32, arg2 as i32),
         39 => sys_getpid(),
         186 => sys_gettid(),
         110 => sys_getppid(),
@@ -4430,6 +4437,8 @@ fn sys_fork() -> SyscallResult {
                 | ForkError::SchedulerAdmissionFailed => Err(SyscallError::EAGAIN),
                 ForkError::SecurityDenied => Err(SyscallError::EPERM),
                 ForkError::NamespaceTranslationFailed => Err(SyscallError::EFAULT),
+                // ST-K3 FIX (F1): unusable parent user frame — fail closed.
+                ForkError::InvalidUserFrame => Err(SyscallError::EFAULT),
                 _ => Err(SyscallError::ENOMEM),
             }
         }
@@ -6670,7 +6679,10 @@ fn exec_from_bytes(
             mm.stack_floor_committed = crate::elf_loader::user_stack_mapped_floor() as usize;
             mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
-            mm.next_mmap_addr = security::randomized_mmap_base(0x4000_0000);
+            // ST-K3 FIX: use the shared constant (was a duplicated 0x4000_0000
+            // literal — the old 1 GiB window collided with the inherited
+            // identity map's huge pages; see process.rs DEFAULT_MMAP_BASE).
+            mm.next_mmap_addr = security::randomized_mmap_base(crate::process::DEFAULT_MMAP_BASE);
 
             // 初始化堆管理（brk）
             // brk_start 和 brk 初始化为 ELF 最高段末尾（页对齐）
@@ -7355,7 +7367,31 @@ pub fn run_exec_disambiguation_self_test() {
 /// * 成功：返回已终止子进程的 PID
 /// * ECHILD：当前进程没有子进程
 /// * EFAULT：status 指针无效
-fn sys_wait(status: *mut i32) -> SyscallResult {
+/// sys_wait4 - Linux-ABI wait4(pid, wstatus, options, rusage)
+///
+/// ST-K3 FIX (wait4 ABI): formerly `sys_wait(status)` with any-child-only
+/// semantics and the RAW exit code written to *status. Now:
+/// - `pid_sel > 0`  → reap only that child (ECHILD if it is not a child);
+/// - `pid_sel == -1` → reap any child (the historical behavior);
+/// - `pid_sel == 0` / `< -1` (process-group selectors) → EINVAL, fail-closed:
+///   the PCB tracks no process groups (D2-ABI census row);
+/// - `WNOHANG` → returns 0 instead of blocking when nothing is reapable;
+///   `WUNTRACED`/`WCONTINUED` are accepted and ignored (no job-control stop
+///   reporting), unknown option bits → EINVAL;
+/// - *wstatus gets the Linux encoding for a normal exit: (code & 0xff) << 8
+///   (WIFEXITED true, WEXITSTATUS = code). Signal deaths surface as this
+///   kernel's unified 128+sig exit code, i.e. as an "exited" status — the
+///   single-exit-code model predates signaled-death wstatus encoding.
+fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
+    const WNOHANG: i32 = 0x1;
+    const WUNTRACED: i32 = 0x2;
+    const WCONTINUED: i32 = 0x8;
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if pid_sel == 0 || pid_sel < -1 {
+        return Err(SyscallError::EINVAL);
+    }
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
@@ -7385,6 +7421,15 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             let mut proc = parent.lock();
             if proc.children.is_empty() {
                 if !proc.children_incomplete {
+                    // ST-K3 FIX (W-1 Blocked-leak class): on iteration >= 2 a
+                    // PREVIOUS iteration published Blocked and
+                    // `force_reschedule` can return WITHOUT switching
+                    // (`reschedule_now` bails on drain/finish_pending_prev
+                    // try_lock contention or !preemptible), so this bail-out
+                    // can run with Blocked still live. Restoring is idempotent
+                    // and unconditionally safe on iteration 1.
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
                     return Err(SyscallError::ECHILD);
                 }
                 // R158-4 Phase 2: children_incomplete is set — do PROCESS_TABLE fallback scan.
@@ -7420,6 +7465,12 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                     if reserve_failed {
                         // Live children may exist; surface ENOMEM and leave the
                         // incomplete flag set so a later wait rescans.
+                        // ST-K3 FIX (W-1): restore Ready — a prior iteration may
+                        // have left Blocked published (PROCESS_TABLE -> parent
+                        // PCB is the canonical order; the table is held here).
+                        let mut proc = parent.lock();
+                        proc.enter_ready_at(crate::get_ticks());
+                        proc.waiting_child = None;
                         return Err(SyscallError::ENOMEM);
                     }
                     // Complete allocation-free scan proved no orphans. The table
@@ -7427,6 +7478,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                     // race with concurrent reparenting.
                     let mut proc = parent.lock();
                     proc.children_incomplete = false;
+                    // ST-K3 FIX (W-1): this path MUTATES children_incomplete, so
+                    // leaving Blocked set would strand the task with the rescan
+                    // marker already cleared.
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
                     return Err(SyscallError::ECHILD);
                 }
                 // R180-14 (iteration-2): any reserve failure means the snapshot is
@@ -7434,6 +7490,10 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 // strand the waiter if the only zombies were among the skipped
                 // matches. Fail closed with ENOMEM; flag stays set for rescan.
                 if reserve_failed {
+                    // ST-K3 FIX (W-1): same restore — see above.
+                    let mut proc = parent.lock();
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
                     return Err(SyscallError::ENOMEM);
                 }
                 drop(table);
@@ -7460,6 +7520,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 // committed yet), then recheck, then commit Blocked + waiting_child.
                 let mut snapshot = Vec::new();
                 if snapshot.try_reserve_exact(proc.children.len()).is_err() {
+                    // ST-K3 FIX (W-1): the "nothing is committed yet" rationale
+                    // holds only on iteration 1; on a re-loop a prior iteration's
+                    // Blocked is still published. Restore before failing.
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
                     return Err(SyscallError::ENOMEM);
                 }
                 if crate::signal::should_abort_pending_block(&proc) {
@@ -7474,6 +7539,54 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             }
         };
 
+        // ST-K3 FIX (wait4 ABI, ns-correct selection): `pid_sel > 0` is the
+        // CALLER's namespace view, while `children`/PROCESS_TABLE hold GLOBAL
+        // pids, so translate ONCE here (mirrors `sys_kill`'s
+        // resolve_pid_in_namespace discipline) and compare globals in the scan.
+        //
+        // The translation must NOT be done from the child's stored
+        // `pid_ns_chain`: `terminate_process` MOVES that chain out of the PCB
+        // (`process.rs`, RF180-16 transfer) before the parent can reap, so
+        // every zombie presents an EMPTY chain — matching against it never
+        // fires and a selective wait would return ECHILD for a reapable child.
+        //
+        // Root namespace: the ns view IS the global pid (`attach_root_pid_
+        // reserved` maps global→global), so no map lookup is needed and zombies
+        // stay reapable. Non-root namespace: resolve via the ns map, which
+        // succeeds for live children and fails closed (ECHILD) for a zombie
+        // whose mapping `detach_pid_chain` already removed — the same
+        // approximation the pre-existing `parent_view_pid` fallback below makes
+        // in the other direction. Full non-root zombie fidelity needs the ns
+        // view retained across teardown (filed, out of ST-K3 scope).
+        let pid_sel_global: Option<ProcessId> = if pid_sel > 0 {
+            let owning = {
+                let proc = parent.lock();
+                crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+            };
+            let resolved = match owning {
+                Some(ns) if !ns.is_root() => {
+                    crate::pid_namespace::resolve_pid_in_namespace(&ns, pid_sel as ProcessId)
+                }
+                _ => Some(pid_sel as ProcessId),
+            };
+            match resolved {
+                Some(global) => Some(global),
+                None => {
+                    // Blocked is already published — restore before bailing.
+                    let mut proc = parent.lock();
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
+                    return Err(SyscallError::ECHILD);
+                }
+            }
+        } else {
+            None
+        };
+        // True when ANY child PCB matching the selector still exists (live,
+        // stopping, or zombie-not-yet-reapable) — the discriminator between
+        // "block and wait" and "ECHILD".
+        let mut selected_exists = false;
+
         // 查找已终止的僵尸子进程
         // F.1 PID Namespace: Also capture the child's namespace chain to derive ns-local PID
         let mut zombie_child: Option<(
@@ -7482,11 +7595,25 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             mm::AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
         )> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
+        // ST-K3 FIX (Blocked-leak): OOM while snapshotting the zombie's ns
+        // chain must not `return` while the child PCB lock is held AND the
+        // parent is still published Blocked — flag it, exit the scan, restore
+        // Ready, THEN fail (lock order stays parent→child; no child lock held
+        // at the restore).
+        let mut scan_oom = false;
 
         for child_pid in child_list.iter() {
+            // ST-K3 FIX (wait4 ABI): selective filter on GLOBAL pids (see the
+            // translation above). Cheap pre-lock skip.
+            if let Some(target) = pid_sel_global {
+                if *child_pid != target {
+                    continue;
+                }
+            }
             match get_process(*child_pid) {
                 Some(child_proc) => {
                     let child = child_proc.lock();
+                    selected_exists = true;
                     // R169-9: only reap a Zombie whose teardown has been published
                     // (teardown_done) — never before its cgroup/ns/futex teardown ran.
                     if child.state == ProcessState::Zombie
@@ -7498,12 +7625,16 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                             .switch_reap_pending
                             .load(core::sync::atomic::Ordering::Acquire)
                     {
-                        let chain = mm::AdmittedVec::try_copy_from_slice(
+                        match mm::AdmittedVec::try_copy_from_slice(
                             mm::HeapClass::CoreProcess,
                             &child.pid_ns_chain,
-                        )
-                        .map_err(|_| SyscallError::ENOMEM)?;
-                        zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), chain));
+                        ) {
+                            Ok(chain) => {
+                                zombie_child =
+                                    Some((*child_pid, child.exit_code.unwrap_or(0), chain));
+                            }
+                            Err(_) => scan_oom = true,
+                        }
                         break;
                     }
                 }
@@ -7518,12 +7649,47 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             }
         }
 
+        // ST-K3 FIX (Blocked-leak): restore Ready before surfacing the scan
+        // OOM — see the scan_oom comment above.
+        if scan_oom {
+            let mut proc = parent.lock();
+            proc.enter_ready_at(crate::get_ticks());
+            proc.waiting_child = None;
+            return Err(SyscallError::ENOMEM);
+        }
+
+        // ST-K3 FIX (wait4 ABI): selective wait with no matching child PCB —
+        // nothing to reap now or ever (a stale entry for the requested pid
+        // means the PCB is already gone). Blocked may be published (this
+        // iteration or a prior one); restore Ready before ECHILD. Every
+        // bail-out in this function now follows that discipline — verified by
+        // enumeration, W-1 repaired the five pre-existing violators.
+        if pid_sel_global.is_some() && !selected_exists {
+            let mut proc = parent.lock();
+            proc.enter_ready_at(crate::get_ticks());
+            proc.waiting_child = None;
+            return Err(SyscallError::ECHILD);
+        }
+
         // 如果找到僵尸子进程，收割并返回
         if let Some((child_pid, exit_code, child_ns_chain)) = zombie_child {
             // 将退出码写入用户空间（如果提供了 status 指针）
             if !status.is_null() {
-                let bytes = exit_code.to_ne_bytes();
-                copy_to_user(status as *mut u8, &bytes)?;
+                // ST-K3 FIX (wait4 ABI): Linux wstatus encoding for a normal
+                // exit — WIFEXITED requires (status & 0x7f) == 0 and
+                // WEXITSTATUS reads bits 8..16, so the raw exit code must be
+                // shifted. Also: a copy failure must restore Ready before
+                // returning (the old `?` leaked the parent in Blocked while
+                // running); the zombie stays reapable, matching Linux EFAULT
+                // semantics.
+                let wstatus: i32 = (exit_code & 0xff) << 8;
+                let bytes = wstatus.to_ne_bytes();
+                if let Err(e) = copy_to_user(status as *mut u8, &bytes) {
+                    let mut proc = parent.lock();
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
+                    return Err(e);
+                }
             }
 
             // F.1 PID Namespace: Translate child's global PID to parent's namespace view
@@ -7583,6 +7749,15 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 proc.waiting_child = None;
                 return Err(SyscallError::ECHILD);
             }
+        }
+
+        // ST-K3 FIX (wait4 ABI): WNOHANG — nothing reapable right now, so
+        // undo the published Blocked state and return 0 instead of blocking.
+        if options & WNOHANG != 0 {
+            let mut proc = parent.lock();
+            proc.enter_ready_at(crate::get_ticks());
+            proc.waiting_child = None;
+            return Ok(0);
         }
 
         // 没有找到僵尸子进程，让出 CPU 等待被唤醒
@@ -13974,7 +14149,11 @@ fn sys_mmap(
                     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
 
                     // 映射页，失败时回滚
-                    if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
+                    // ST-K3 Phase D: bind the MapError variant — it discriminates
+                    // PT-frame exhaustion from mapping-collision defects (E6 payload).
+                    if let Err(_map_err) =
+                        manager.map_page(page, frame, page_flags, &mut frame_alloc)
+                    {
                         frame_alloc.deallocate_frame(frame);
                         // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
                         // R169-L2: +1 page so the prune covers the CURRENT page, whose
@@ -14007,8 +14186,9 @@ fn sys_mmap(
                         // ST-K3 Phase D: site tag (E6) — page-table material.
                         #[cfg(debug_assertions)]
                         kprintln!(
-                            "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={}",
-                            length_aligned
+                            "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={} err={:?}",
+                            length_aligned,
+                            _map_err
                         );
                         return Err(SyscallError::ENOMEM);
                     }
