@@ -68,11 +68,16 @@ gates:
   Invoke via `make stress-test` or `make stress-test-extended`; the monthly CI job is
   `.github/workflows/monthly-stress-test.yml`.
   > **Status: NOT GREEN — do not treat this gate as passing.** It has never completed a
-  > validated run end-to-end. As of 2026-09-01 the build break and two harness defects are
-  > fixed and the in-guest workload (`userspace/stress_runner.c`) is implemented, but every
-  > profile is still blocked on kernel-side gaps (no `fsync`, `mmap` ignoring `MAP_SHARED`,
-  > an in-guest `mmap` ENOMEM, and root-cgroup membership for the init task). Full evidence,
-  > the reconstructed V2 contract, and the open decisions are in
+  > validated run end-to-end. As of 2026-09-02 the build break and two harness defects are
+  > fixed, the in-guest workload (`userspace/stress_runner.c`) is implemented, and the
+  > **nine kernel defects behind the `memory` profile are fixed** (2026-09-02: mmap window
+  > vs identity-map huge pages, debug-boot budget, 16 KiB kernel stacks, fork child
+  > context, child cs/ss, an arch-wide context-switch off-by-8 resume, the wait4 ABI,
+  > two wait-loop blocked-state leaks, and an unvalidated-fork-frame DoS) — the `memory`
+  > profile now runs its full intended shape and stops only at `MAP_SHARED`. Remaining
+  > blockers: `MAP_SHARED` (blocks `memory` + `smp`), no `fsync` (blocks `block`), and
+  > root-cgroup membership for the init task. Full evidence, the reconstructed V2 contract,
+  > the defect table, and the open decisions are in
   > [`docs/stress-gate-status.md`](stress-gate-status.md).
 - **Extended SMP** (`scripts/extended_smp_test.sh`) — validates 8-core and 16-core boot,
   IPI broadcast, and multi-CPU lock contention. Run via `make test-smp-extended`.

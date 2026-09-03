@@ -1,10 +1,13 @@
 # Monthly Stress Gate (stress-v2) — Honest Status
 
-**Date:** 2026-09-01
+**Date:** 2026-09-02 (supersedes the 2026-09-01 revision; see §10 for what changed)
 **Scope:** `.github/workflows/monthly-stress-test.yml`, `scripts/stress_test.sh`,
 `scripts/stress_protocol.py`, `userspace/stress_runner.c`, `Makefile` stress targets
-**Verdict:** the gate has **never passed end-to-end**. Three real defects are now fixed and
-verified; a fully green 6-profile run is still blocked on kernel-side gaps.
+**Verdict:** the gate has **never passed end-to-end**. The three harness defects are fixed
+and verified, and as of 2026-09-02 **nine kernel defects** behind the `memory` profile are
+fixed too — that profile now runs mmap → fork → cgroup attach → 32 successful 1 MiB
+mappings → a *legitimate* cgroup ENOMEM → rollback → child exit → parent reap. A green
+6-profile run is still blocked, now on **one** identified kernel gap (K2, `MAP_SHARED`).
 
 This document exists because the gate's green history is misleading and because the
 scale of the remaining work is larger than a first reading of the code suggests.
@@ -18,11 +21,11 @@ It is written to be picked up cold by the next session.
 |------|-------|
 | `make build-stress` | **FIXED** — was exit 2, now exit 0 |
 | `stress_test.sh` `set -u` crash | **FIXED** — verified |
-| ESP corruption via `fat:rw:` | **FIXED** — verified |
+| ESP corruption via `fat:rw:` | **FIXED** — verified (and applied to `make run`/`run-stress`, ST-5) |
 | `userspace/stress_runner.c` (V2 guest) | **WRITTEN** — builds clean; config/header proven on real hardware |
-| A green `memory` profile run | **BLOCKED** — `mmap` returns ENOMEM in-guest |
-| A green `smp` profile run | **BLOCKED** — no shared memory in the kernel |
-| A green `block` profile run | **BLOCKED** — no `fsync` in the kernel |
+| A green `memory` profile run | **BLOCKED on K2 only** — 9 kernel defects fixed 2026-09-02; the run now reaches its *first real workload* and fails at `stage=no_operations` because the `MAP_SHARED` report page CoW-forks private |
+| A green `smp` profile run | **BLOCKED** — K2, no shared memory in the kernel |
+| A green `block` profile run | **BLOCKED** — K4, no `fsync` in the kernel |
 | `cpu` / `process` / `combined` | **UNVERIFIED** — never reached a full round |
 
 Nothing in this work is committed. The manual-commit rule was observed.
@@ -239,9 +242,9 @@ These were found by *running* the guest, not by reading the syscall table.
 
 | # | Gap | Evidence | Blocks |
 |---|-----|----------|--------|
-| K1 | `sys_cgroup_attach` returns `EIO` for the initial Ring-3 process. `migrate_task_locked` requires the task to already be in its current cgroup's set; nothing inserts PID 1 into root's. | `cgroup.rs:3189` → `TaskNotAttached` → `syscall.rs:19944` | worked around |
-| K2 | `sys_mmap` **ignores its `flags` argument** (`_flags`), so `MAP_SHARED` is silently private. No cross-process shared memory exists. | `syscall.rs:13576` | **smp** (needs a shared contended counter) |
-| K3 | `mmap` returns `ENOMEM` in-guest even for a 4 KiB request, reproducibly. Narrowed to the cgroup charge or frame allocation; **not isolated**. | `stage=report_mmap errno=12`; candidates `syscall.rs:13784`, `syscall.rs:13926` | **memory** |
+| K1 | `sys_cgroup_attach` returns `EIO` for the initial Ring-3 process. `migrate_task_locked` requires the task to already be in its current cgroup's set; nothing inserts PID 1 into root's. | `cgroup.rs:3189` → `TaskNotAttached` → `syscall.rs:19944` | worked around (still open in-kernel; plan item ST-K1) |
+| K2 | `sys_mmap` **ignores its `flags` argument** (`_flags`), so `MAP_SHARED` is silently private. No cross-process shared memory exists. | `syscall.rs:13576`; **runtime proof 2026-09-02**: `COW page fault: pid=2, addr=0x100f9c5000` on the child's first write to the `MAP_SHARED` report page, then `stage=no_operations` because the parent reads its own private copy | **memory** + **smp** |
+| K3 | ~~`mmap` returns `ENOMEM` in-guest even for a 4 KiB request~~ — **RESOLVED 2026-09-02, and the stated cause was wrong.** Not the cgroup charge and not frame exhaustion: `DEFAULT_MMAP_BASE` (0x4000_0000) sat *inside the inherited identity map's 2 MiB huge pages*, so every frame-backed anonymous `mmap` failed with `MapError::ParentEntryHugePage` — **no userspace `mmap` had ever succeeded on this kernel.** Window moved to 0x10_0000_0000 (64 GiB) + a permanent `mmap_window_clear` gating test. Eight further defects had to be fixed before the profile could get past it (§10). | site tag `[ST-K3] mmap ENOMEM site=E6`; now `sys_mmap: pid=1, mapped 4096 bytes at 0x1002e6d000` | ~~memory~~ **closed** |
 | K4 | No `fsync`/`fdatasync`. Slots 74/75/162/277 unbound; `FileSystem::sync` is a default no-op that ext2 never overrides. | `vfs/traits.rs:130` | **block** |
 
 K1 is worked around in userspace: every cgroup-resident phase runs in a forked worker,
@@ -250,12 +253,13 @@ because `fork` **does** attach children to the parent's cgroup (`fork.rs:314`).
 K4 is the smallest of the four: `flush_device()` (`ext2.rs:9104`) already reaches
 `dev.flush()` down to `virtio/blk.rs:1853`, so wiring `sys_fsync` means overriding `sync()`
 in `Ext2Fs` and dispatching fd → inode → filesystem. It is not a from-scratch journaling
-project.
+project. **Note:** the per-inode-writeback framing was *refuted* on 2026-09-01 — ext2 here is
+write-through, so `fsync` is a device-flush barrier, not a dirty-page walk.
 
-K2 is the most structural. Without shared anonymous mappings (or working threads), the
-`smp` profile's "protected counter with real lock contention, `spins > 0`" is
-**unimplementable as specified**. Child→parent reporting can move to pipes, but the
-contended counter cannot.
+K2 is the most structural, and it is now the **sole** blocker for `memory` as well as `smp`.
+Without shared anonymous mappings the `smp` profile's "protected counter with real lock
+contention, `spins > 0`" is **unimplementable as specified**. Child→parent reporting can move
+to pipes, but the contended counter cannot. Design: `docs/review/design/st-k2-map-shared-design.md`.
 
 ---
 
@@ -290,33 +294,111 @@ piped tail, and every file written was md5-compared across both environments.
 
 Long commands were run under `nohup` on the devbox because the SSH helper caps at 30s.
 
-**Uncommitted at time of writing:**
+**Uncommitted at time of writing (2026-09-02):**
 
 | Path | Change |
 |------|--------|
-| `rust-toolchain.toml` | added `rust-analyzer` component (unrelated fix — VS Code) |
-| `userspace/stress_runner.c` | new V2 guest |
-| `scripts/stress_test.sh` | §3.2 + §3.3 fixes |
+| `userspace/stress_runner.c` | V2 guest + `emit_mmap_diag`/`fail_with_stats` bisect markers |
+| `userspace/stress_runner_advanced.c` | wait4 ABI caller repair (§10) |
+| `userspace/src/syscall.rs` | wait4 ABI caller repair (§10) |
+| `scripts/stress_test.sh`, `scripts/esp_run_copy.sh` | §3.2 + §3.3 fixes; ESP copy helper (ST-5) |
+| `Makefile` | ESP-copy fix applied to `make run`/`run-stress` (ST-5, closes old §9 item 5) |
+| `kernel/kernel_core/process.rs` | mmap window → 64 GiB; kstacks 16 → 32 KiB |
+| `kernel/kernel_core/fork.rs` | entry-state-keyed child context + user-frame validation |
+| `kernel/kernel_core/syscall.rs` | `sys_wait4` rewrite; ENOMEM site tags; window constant |
+| `kernel/arch/context_switch.rs` | off-by-8 resume fix + ud2/segment-save hardening |
+| `kernel/arch/interrupts.rs` | debug #PF stack dump (page-clamped) |
+| `kernel/sched/enhanced_scheduler.rs` | debug SCHED-TRAP dispatch guard |
+| `kernel/security/kaslr.rs` | `MMAP_MAX_OFFSET` made `pub` + doc truth |
+| `kernel/mm/heap_admission.rs` | `debug_assertions` boot-footprint arm (320 KiB) |
+| `kernel/src/runtime_tests.rs` | new `mmap_window_clear` gating test |
 | `docs/stress-gate-status.md` | this document |
+
+Earlier revisions also listed `rust-toolchain.toml` (rust-analyzer component); that has
+since been committed.
 
 ---
 
 ## 9. Open decisions for the next session
 
-1. **K3 first.** Isolate the in-guest `mmap` ENOMEM — it gates the `memory` profile and is
-   plausibly small. Cheapest probe: have the guest report its own `CgroupStatsBuf` in the
-   FAIL `detail` field to distinguish the cgroup charge from frame exhaustion.
-2. **Decide K2's disposition.** Either implement shared anonymous mappings (honour
-   `MAP_SHARED`), or accept that `smp` cannot meet its contract and amend the harness rather
-   than let the guest fake a contended counter.
-3. **K4** as previously agreed: `sys_fsync`/`sys_fdatasync` + `Ext2Fs::sync`, then flip the
-   `block` profile on.
+1. ~~**K3 first.**~~ **DONE 2026-09-02** — and the hypothesis in this list was wrong. The
+   ENOMEM was neither the cgroup charge nor frame exhaustion; see K3 in §6 and §10.
+2. **K2 is now the whole ballgame.** It blocks `memory` *and* `smp`. Decide: implement shared
+   anonymous mappings (honour `MAP_SHARED`), or amend the `smp` contract. A design is READY
+   (`docs/review/design/st-k2-map-shared-design.md`, first-toucher-per-page semantics,
+   user-confirmed 2026-09-01). This is the next stress-leg item after the mandatory R188
+   review-fix stage.
+3. **K4** as previously agreed: `sys_fsync`/`sys_fdatasync` + `Ext2Fs::sync` as a **device-flush
+   barrier** (the per-inode-writeback framing was refuted), then flip the `block` profile on.
 4. **K1** — decide whether to keep the userspace fork workaround or fix root-cgroup
-   membership for the init task in the kernel.
-5. **`Makefile:339`** — apply the §3.3 ESP-copy fix to `make run` / `run-stress` too.
+   membership for the init task in the kernel (plan item ST-K1; inherited the hazard analysis
+   from ST-K3's refuted F-A family).
+5. ~~**`Makefile:339`** ESP-copy fix for `make run`/`run-stress`~~ — **DONE** (ST-5, via
+   `scripts/esp_run_copy.sh`). Residual: the helper has no failure gate, so a non-zero exit
+   degrades the flag to `file=fat:rw:` instead of surfacing stderr (filed as F11).
 6. **Interim CI policy.** Until at least one profile is green, decide whether the monthly
    job should keep failing loudly (and commenting on commits) or be gated to
    `workflow_dispatch`. It currently fails every month-end and posts a commit comment.
+7. **NEW — boot-reserved `ROOT_INIT_PID` hardening.** `process.rs:8668` panics with
+   *"ROOT_INIT_PID must be a live reaper (boot-hardening pending)"* whenever PID 1 exits while
+   an orphan exists. Any guest whose init exits non-zero therefore converts a clean profile
+   FAIL into a kernel panic, which the harness reports as `kernel panic detected` and which
+   buries the guest's own FAIL marker. Decide whether to harden before the next profile push.
 
 Do **not** mark this gate green, or advance any release/streak counter on its behalf, until
 a profile has produced a validated `PASS` + `HEARTBEAT` sequence from a booted run.
+
+---
+
+## 10. 2026-09-02 session — nine kernel defects behind the `memory` profile
+
+This section is the honest record of what "isolate the mmap ENOMEM" actually cost. Full
+evidence trail, per-defect, is in `docs/review/design/st-k3-mmap-enomem-design.md`'s
+Deviation & Amendment Log. Method: 8 debug-gated ENOMEM site tags (E1–E8) in the kernel plus
+guest-side bisect markers, then symbolized RIPs (`nm`/`objdump` against a preserved ELF and
+the recorded KASLR slide) for each successive crash.
+
+| # | Defect | Why it was invisible |
+|---|--------|----------------------|
+| 1 | mmap window inside the identity map's 2 MiB huge pages (`ParentEntryHugePage` on **every** frame-backed anon mmap) | no userspace `mmap` had ever succeeded, so nothing had ever exercised the path |
+| 2 | debug-assertions builds could not boot (footprint 244376 B > 229376 B budget) | the diagnosis rig itself was the first debug-assertions boot |
+| 3 | 16 KiB kernel stacks double-fault Ring-3 process creation (`try_new_pcb` alone reserves a ~12.4 KiB frame) | first ever Ring-3 process creation from a real guest |
+| 4 | fork child context was a chimera (user CS from a stale snapshot + kernel RSP from the rebase fallback) → `#UD` at `switch_to_user`'s guard | first ever Ring-3 `fork()` |
+| 5 | child inherited **kernel** `cs`/`ss` (both save-halves store the live `mov ax, cs`), so the scheduler routed it to `switch_context`, which `ret`'d into the user RSP → `#PF` at `RIP=0x1` | ditto |
+| 6 | **arch-wide off-by-8 context-switch resume**: the save-halves stored `ctx.rsp` = entry rsp (return slot *unconsumed*) while the restore ends `push ctx.rip; …; ret`, which consumes only the pushed copy — every save-half resume ran 8 bytes low | masked for ~188 audit rounds because the sole resume continuation had a frame-pointer epilogue; the stress build's `reschedule_now` closure has an rsp-arithmetic epilogue, which exposed it |
+| 7 | **wait4 ABI**: dispatch passed **arg0 (the PID) as the status pointer**, so musl `waitpid(pid,&status,0)` EFAULTed on the first real reap | no Ring-3 parent had ever reaped a child |
+| 8 | five wait bail-outs return without restoring `Ready` ⇒ permanently unschedulable task (reachable because `reschedule_now` can return *without switching* on try_lock contention) | needs loop iteration ≥2; found by adversarial review, not by running |
+| 9 | fork seeded the child from an **unvalidated** user frame ⇒ `mov rsp,<non-canonical>; syscall` was a Ring-3-triggerable Ring-0 `#UD` kernel kill | found by adversarial review |
+
+Two permanent sentinels were added so #6's class cannot silently recur: a `ud2`
+canonical-high guard on the saved rip in both save-halves, and a `debug_assertions`
+SCHED-TRAP in `prepare_switch` rejecting kernel-`cs` contexts with a non-canonical rip.
+
+**Where the `memory` profile now stops:**
+
+```
+sys_mmap: pid=1, mapped 4096 bytes at 0x1002e6d000     <- first successful userspace mmap
+[FORKDIAG] FD1..FD8                                     <- fork transaction stages
+Fork: parent=1, child=2, COW enabled
+NILIX_MMAP_DIAG step=child_alive / child_attached
+sys_mmap: pid=2, mapped 1048576 bytes at ...            <- x32, all succeed
+[ST-K3] mmap ENOMEM site=E2 stage=cgroup_charge err=MemoryLimitExceeded   <- CORRECT: the guest's own limit
+sys_munmap: pid=2, ... x32                              <- clean rollback
+Process 2 terminated with exit code 0
+sys_wait: reaped child 2 (ns_pid=2) with exit code 0    <- first working parent reap
+NILIX_STRESS_V2_FAIL ... stage=no_operations            <- K2: the MAP_SHARED report page CoW-forked
+```
+
+The site-E2 ENOMEM is the cgroup limit behaving correctly, **not** a defect — so ST-K3 does
+**not** fold into the P0-A admission item, and the `memory` profile's remaining blocker is
+exactly K2.
+
+**Gate ladder on the fixed tree:** `make fmt-check` 0 · `make clippy` 0 · `make test`
+**35 passed / 39 deferred / 0 failed** (read from the serial `Test Summary` oracle, not the
+exit code) · `make boot-check` 0 · `make musl-check` 0.
+
+**Two traps this session re-confirmed.** (a) `pkill -f <pattern>` over SSH matches the
+invoking shell's own command line and kills the connection — use bracketed patterns
+(`'make lin[t]'`). (b) The `runtime_tests.rs` blob is CRLF in git but was rewritten LF, which
+inflated the review diff by ~14,800 lines and would have flipped the file's EOL convention on
+commit; normalize before diffing or staging.
