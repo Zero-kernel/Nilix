@@ -94,7 +94,7 @@ run_standalone_rust_suite() {
     echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! (
         cd "${repo_root}/${source_dir}"
-        NILIX_TEST_TOTAL=73 rustc +nightly-2025-12-08 \
+        NILIX_TEST_TOTAL=74 rustc +nightly-2025-12-08 \
             --edition=2021 --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
@@ -174,7 +174,7 @@ run_suite kernel-core 29 0 \
     --lib --locked
 
 # Source-discovery/placeholder polarity oracle.  This is intentionally a
-# separate integration target: it validates the same 73 RuntimeTest
+# separate integration target: it validates the same 74 RuntimeTest
 # implementations reported by kernel/build.rs and fails closed on stale P0/P1
 # placeholders or scanner drift.
 # This scanner is pure std source analysis and does not import the kernel.
