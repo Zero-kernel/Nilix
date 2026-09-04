@@ -37,7 +37,7 @@ kernel_core = { path = "../kernel/kernel_core" }
 # These are optional to avoid requiring syzkaller deps for simple cargo-fuzz runs
 anyhow = { version = "1.0", optional = true }
 tempfile = { version = "3.0", optional = true }
-nix = { version = "0.29", features = ["signal"], optional = true }
+nix = { version = "0.31", features = ["signal"], optional = true }
 hex = { version = "0.4", optional = true }
 sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
