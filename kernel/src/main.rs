@@ -704,14 +704,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             );
         }
     }
-    if ps.kpti_fail_closed && !security::is_kpti_enabled() {
-        klog_force!(
-            "[POLICY] {} profile: KPTI not active — kernel page table isolation \
-             preferred (Meltdown mitigation)",
-            ps.profile.name()
-        );
-        // KPTI is not yet implemented (P2-2), so we warn rather than panic.
-        // Once KPTI is available, this should become a hard panic.
+    if ps.kpti_fail_closed && !security::kaslr::FULL_KPTI_ISOLATION_SUPPORTED {
+        klog_force!("[WARN] {} profile: full KPTI isolation unsupported; dual roots retain kernel data/heap/stacks and low aliases", ps.profile.name());
     }
 
     // Cache INVPCID capability for TLB shootdowns (uses CPUID + PCID state)

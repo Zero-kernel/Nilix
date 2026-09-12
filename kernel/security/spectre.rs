@@ -49,6 +49,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 use x86_64::registers::model_specific::Msr;
 
+#[cfg(feature = "retpoline")]
+compile_error!("retpoline is unsupported: no verified compiler transformation and final-ELF coverage oracle are configured");
+
 /// RF178-23 FIX: Boot policy is authoritative on every CPU and switch path.
 /// Default false prevents AP startup from silently enabling mitigations before
 /// the selected profile has explicitly opted in.
@@ -65,6 +68,7 @@ static MITIGATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
 struct BspSpectreFloor {
     ibrs_supported: bool,
     ibrs_enabled: bool,
+    enhanced_ibrs: bool,
     stibp_supported: bool,
     stibp_enabled: bool,
     ssbd_supported: bool,
@@ -77,6 +81,7 @@ fn publish_bsp_spectre_floor(status: &MitigationStatus) {
     let _ = BSP_SPECTRE_FLOOR.call_once(|| BspSpectreFloor {
         ibrs_supported: status.ibrs_supported,
         ibrs_enabled: status.ibrs_enabled,
+        enhanced_ibrs: status.enhanced_ibrs,
         stibp_supported: status.stibp_supported,
         stibp_enabled: status.stibp_enabled,
         ssbd_supported: status.ssbd_supported,
@@ -97,6 +102,9 @@ fn meets_bsp_spectre_floor(ap: &MitigationStatus) -> bool {
 
     // Capability: AP must not lack a feature the BSP reported as present.
     if floor.ibrs_supported && !ap.ibrs_supported {
+        return false;
+    }
+    if floor.enhanced_ibrs && !ap.enhanced_ibrs {
         return false;
     }
     if floor.stibp_supported && !ap.stibp_supported {
@@ -136,13 +144,15 @@ pub struct MitigationStatus {
     pub ibrs_supported: bool,
     /// IBRS currently enabled
     pub ibrs_enabled: bool,
+    /// Enhanced IBRS capability (IBRS_ALL); legacy IBRS requires entry writes.
+    pub enhanced_ibrs: bool,
     /// IBPB supported by CPU
     pub ibpb_supported: bool,
     /// STIBP supported by CPU
     pub stibp_supported: bool,
     /// STIBP currently enabled
     pub stibp_enabled: bool,
-    /// Compiler retpoline support (compile-time feature)
+    /// Compiler retpoline verified in the final linked kernel (currently unsupported)
     pub retpoline_compiler: bool,
     /// Retpoline required (no hardware mitigation)
     pub retpoline_required: bool,
@@ -165,6 +175,7 @@ impl MitigationStatus {
         MitigationStatus {
             ibrs_supported: false,
             ibrs_enabled: false,
+            enhanced_ibrs: false,
             ibpb_supported: false,
             stibp_supported: false,
             stibp_enabled: false,
@@ -178,20 +189,16 @@ impl MitigationStatus {
         }
     }
 
-    /// Check if at least one mitigation path is active.
-    ///
-    /// Returns true if the system has adequate protection against
-    /// speculative execution attacks.
+    /// Whether an implemented cross-privilege branch protection path is active.
+    /// This is not a claim of complete speculative-execution immunity.
     pub fn hardened(&self) -> bool {
         // Branch prediction protection
-        let branch_protected = self.ibrs_enabled || self.stibp_enabled || self.retpoline_compiler;
-
-        // If retpoline is required but not compiled in, and no hardware fix
-        if self.retpoline_required && !self.retpoline_compiler && !self.ibrs_enabled {
-            return false;
-        }
-
-        branch_protected
+        // STIBP isolates sibling predictors; by itself it does not establish
+        // cross-privilege branch protection.
+        // Legacy IBRS requires a write on each privilege entry; this kernel
+        // currently writes SPEC_CTRL only at CPU initialization. eIBRS permits
+        // the persistent-enable policy, but still needs observed enablement.
+        (self.enhanced_ibrs && self.ibrs_enabled) || self.retpoline_compiler
     }
 
     /// Check if any mitigation was enabled.
@@ -206,7 +213,7 @@ impl MitigationStatus {
     /// Get a human-readable summary.
     pub fn summary(&self) -> &'static str {
         if self.hardened() {
-            "Hardened"
+            "Branch protection active"
         } else if self.any_enabled() {
             "Partial"
         } else {
@@ -272,15 +279,12 @@ pub fn detect() -> MitigationStatus {
     // IA32_ARCH_CAPABILITIES support (bit 29)
     let has_arch_cap = (edx & (1 << 29)) != 0;
 
-    let mut retpoline_required = !ibrs_ibpb;
+    let mut enhanced_ibrs = false;
 
     // Check architecture capabilities for better mitigation info
     if has_arch_cap {
         if let Some(capabilities) = read_arch_capabilities() {
-            // IBRS_ALL means hardware fully mitigates branch prediction attacks
-            if (capabilities & ARCH_CAP_IBRS_ALL) != 0 {
-                retpoline_required = false;
-            }
+            enhanced_ibrs = ibrs_ibpb && capabilities & ARCH_CAP_IBRS_ALL != 0;
             // RDCL_NO means not susceptible to Meltdown
             // SSB_NO means not susceptible to Speculative Store Bypass
             // MDS_NO means not susceptible to Microarchitectural Data Sampling
@@ -290,16 +294,40 @@ pub fn detect() -> MitigationStatus {
     MitigationStatus {
         ibrs_supported: ibrs_ibpb,
         ibrs_enabled: false,
+        enhanced_ibrs,
         ibpb_supported: ibrs_ibpb,
         stibp_supported: stibp,
         stibp_enabled: false,
-        retpoline_compiler: cfg!(feature = "retpoline"),
-        retpoline_required,
+        retpoline_compiler: false,
+        retpoline_required: !enhanced_ibrs,
         ssbd_supported: ssbd,
         ssbd_enabled: false,
         // SWAPGS is unconditional; RSB stuffing is policy-gated.
         swapgs_mitigated: true,
         rsb_stuffing_enabled: policy_enabled(),
+    }
+}
+
+/// Observe enablement on the current CPU. Capability discovery alone reports
+/// no enabled MSR bits. Native observation stays on one CPU with IRQs masked;
+/// hosted builds never execute the privileged reads.
+pub fn current_cpu_status() -> MitigationStatus {
+    #[cfg(target_os = "none")]
+    {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut status = detect();
+            if status.ibrs_supported || status.stibp_supported || status.ssbd_supported {
+                let value = unsafe { Msr::new(IA32_SPEC_CTRL).read() };
+                status.ibrs_enabled = status.ibrs_supported && value & SPEC_CTRL_IBRS != 0;
+                status.stibp_enabled = status.stibp_supported && value & SPEC_CTRL_STIBP != 0;
+                status.ssbd_enabled = status.ssbd_supported && value & SPEC_CTRL_SSBD != 0;
+            }
+            status
+        })
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        detect()
     }
 }
 
@@ -321,10 +349,8 @@ pub fn get_vulnerabilities() -> VulnerabilityInfo {
             info.meltdown_susceptible = (cap & ARCH_CAP_RDCL_NO) == 0;
             info.ssb_susceptible = (cap & ARCH_CAP_SSB_NO) == 0;
             info.mds_susceptible = (cap & ARCH_CAP_MDS_NO) == 0;
-            // IBRS_ALL helps with Spectre v2
-            if (cap & ARCH_CAP_IBRS_ALL) != 0 {
-                info.spectre_v2_susceptible = false;
-            }
+            // IBRS_ALL describes an available mechanism that still requires
+            // enablement; it is not an architectural immunity bit.
         }
     }
 
@@ -398,7 +424,7 @@ pub fn init() -> Result<MitigationStatus, SpectreError> {
     publish_bsp_spectre_floor(&status);
 
     // Check if we have adequate protection
-    if status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled {
+    if !status.hardened() {
         return Err(SpectreError::RetpolineRequired);
     }
 
@@ -478,6 +504,9 @@ pub fn enable_ibrs() -> Result<(), SpectreError> {
         let mut msr = Msr::new(IA32_SPEC_CTRL);
         let current = msr.read();
         msr.write(current | SPEC_CTRL_IBRS);
+        if msr.read() & SPEC_CTRL_IBRS == 0 {
+            return Err(SpectreError::MsrIo("IBRS enable readback failed"));
+        }
     }
 
     Ok(())
@@ -507,6 +536,9 @@ pub fn enable_stibp() -> Result<(), SpectreError> {
         let mut msr = Msr::new(IA32_SPEC_CTRL);
         let current = msr.read();
         msr.write(current | SPEC_CTRL_STIBP);
+        if msr.read() & SPEC_CTRL_STIBP == 0 {
+            return Err(SpectreError::MsrIo("STIBP enable readback failed"));
+        }
     }
 
     Ok(())
@@ -525,6 +557,9 @@ pub fn enable_ssbd() -> Result<(), SpectreError> {
         let mut msr = Msr::new(IA32_SPEC_CTRL);
         let current = msr.read();
         msr.write(current | SPEC_CTRL_SSBD);
+        if msr.read() & SPEC_CTRL_SSBD == 0 {
+            return Err(SpectreError::MsrIo("SSBD enable readback failed"));
+        }
     }
 
     Ok(())
@@ -700,6 +735,7 @@ pub fn context_switch_barrier(address_space_changed: bool) {
 // ============================================================================
 
 /// Read IA32_ARCH_CAPABILITIES MSR if available.
+#[cfg(target_os = "none")]
 fn read_arch_capabilities() -> Option<u64> {
     let (_, _, _, edx) = cpuid_7_0();
     if (edx & (1 << 29)) == 0 {
@@ -710,6 +746,11 @@ fn read_arch_capabilities() -> Option<u64> {
         let msr = Msr::new(IA32_ARCH_CAPABILITIES);
         Some(msr.read())
     }
+}
+
+#[cfg(not(target_os = "none"))]
+fn read_arch_capabilities() -> Option<u64> {
+    None
 }
 
 /// Execute CPUID leaf 7, subleaf 0.
@@ -743,5 +784,40 @@ pub fn read_spec_ctrl() -> u64 {
     unsafe {
         let msr = Msr::new(IA32_SPEC_CTRL);
         msr.read()
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn supported_hardware_does_not_imply_active_protection() {
+        let mut status = MitigationStatus::empty();
+        status.ibrs_supported = true;
+        status.stibp_supported = true;
+        assert!(!status.hardened());
+        status.ibrs_enabled = true;
+        assert!(!status.hardened()); // boot-only legacy IBRS is insufficient
+        status.enhanced_ibrs = true;
+        assert!(status.hardened());
+    }
+
+    #[test]
+    fn sibling_thread_isolation_alone_is_partial() {
+        let mut status = MitigationStatus::empty();
+        status.stibp_supported = true;
+        status.stibp_enabled = true;
+        assert!(status.any_enabled());
+        assert!(!status.hardened());
+        assert_eq!(status.summary(), "Partial");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "none"))]
+    fn hosted_observation_does_not_execute_or_guess_msr_state() {
+        let status = current_cpu_status();
+        assert!(!status.ibrs_enabled && !status.stibp_enabled && !status.ssbd_enabled);
+        assert!(!status.retpoline_compiler);
     }
 }

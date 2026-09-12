@@ -95,6 +95,10 @@ static KASLR_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether KPTI is enabled (future: set during init)
 static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The current user root retains kernel data, heap, stacks and low aliases.
+/// Dual-root switching therefore does not provide full Meltdown isolation.
+pub const FULL_KPTI_ISOLATION_SUPPORTED: bool = false;
+
 /// Whether PCID is enabled (set during init if CPU supports it)
 static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -650,7 +654,7 @@ fn boot_randomization_verified(boot_state: Option<BootKaslrState>, runtime_slide
 #[derive(Debug, Clone, Copy)]
 pub struct KptiContext {
     /// User-mode page table root (physical address of PML4)
-    /// Contains user mappings and trampoline only
+    /// Contains user mappings plus the current broad supervisor entry region
     /// Does NOT include PCID bits
     pub user_cr3: u64,
 
@@ -932,7 +936,7 @@ pub fn current_kpti_context() -> KptiContext {
 /// Switch to kernel CR3 on syscall/interrupt entry
 ///
 /// When KPTI is enabled, this switches from the user page table
-/// (which has minimal kernel mappings) to the kernel page table
+/// (which still has broad supervisor kernel mappings) to the kernel page table
 /// (which has full kernel access).
 ///
 /// # Safety
@@ -966,7 +970,7 @@ pub fn enter_kernel_mode() {
 /// Switch to user CR3 before returning to userspace
 ///
 /// When KPTI is enabled, this switches from the kernel page table
-/// to the user page table (which has only trampoline + user mappings).
+/// to the user page table (which retains the broad supervisor entry region).
 ///
 /// # Safety
 ///
@@ -1500,7 +1504,7 @@ pub fn init(boot_state: Option<BootKaslrState>) {
         layout.text_size
     );
     klog_always!(
-        "  KPTI: {} (stubs installed)",
+        "  Dual-root mechanism: {}; full KPTI isolation unsupported",
         if is_kpti_enabled() {
             "enabled"
         } else {

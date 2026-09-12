@@ -1,0 +1,331 @@
+# Exact v35 generated bodies; instruction bytes and addresses are unchanged.
+# Full disassembly SHA-256: 04224b53e6d07c2f09b8b2e556d29b76f5e4d0a72dd0ef06f615c5cae54ae5e1
+# Captured ELF artifact: .validation/p1-p3-gates-v35/mitigation-recheck/run-3s2boq1u/kernel.elf
+
+ffffffff8011c0f8 <arch::syscall::syscall_entry_stub>:
+ffffffff8011c0f8: 0f 01 ca             	clac
+ffffffff8011c0fb: 48 0f ba e1 2f       	bt	rcx, 0x2f
+ffffffff8011c100: 0f ae e8             	lfence
+ffffffff8011c103: 0f 82 93 02 00 00    	jb	0xffffffff8011c39c <arch::syscall::syscall_entry_stub+0x2a4>
+ffffffff8011c109: 0f 01 f8             	swapgs
+ffffffff8011c10c: 0f ae e8             	lfence
+ffffffff8011c10f: 65 f0 48 0f ba 2c 25 18 00 00 00 00  	lock		bts	qword ptr gs:[0x18], 0x0
+ffffffff8011c11b: 0f 82 57 02 00 00    	jb	0xffffffff8011c378 <arch::syscall::syscall_entry_stub+0x280>
+ffffffff8011c121: 65 48 89 24 25 08 00 00 00   	mov	qword ptr gs:[0x8], rsp
+ffffffff8011c12a: 65 48 8b 24 25 00 00 00 00   	mov	rsp, qword ptr gs:[0x0]
+ffffffff8011c133: fc                   	cld
+ffffffff8011c134: 48 81 ec 80 00 00 00 	sub	rsp, 0x80
+ffffffff8011c13b: 48 89 04 24          	mov	qword ptr [rsp], rax
+ffffffff8011c13f: 48 89 4c 24 08       	mov	qword ptr [rsp + 0x8], rcx
+ffffffff8011c144: 48 89 54 24 10       	mov	qword ptr [rsp + 0x10], rdx
+ffffffff8011c149: 48 89 5c 24 18       	mov	qword ptr [rsp + 0x18], rbx
+ffffffff8011c14e: 65 48 8b 04 25 08 00 00 00   	mov	rax, qword ptr gs:[0x8]
+ffffffff8011c157: 48 89 44 24 20       	mov	qword ptr [rsp + 0x20], rax
+ffffffff8011c15c: 48 89 6c 24 28       	mov	qword ptr [rsp + 0x28], rbp
+ffffffff8011c161: 48 89 74 24 30       	mov	qword ptr [rsp + 0x30], rsi
+ffffffff8011c166: 48 89 7c 24 38       	mov	qword ptr [rsp + 0x38], rdi
+ffffffff8011c16b: 4c 89 44 24 40       	mov	qword ptr [rsp + 0x40], r8
+ffffffff8011c170: 4c 89 4c 24 48       	mov	qword ptr [rsp + 0x48], r9
+ffffffff8011c175: 4c 89 54 24 50       	mov	qword ptr [rsp + 0x50], r10
+ffffffff8011c17a: 4c 89 5c 24 58       	mov	qword ptr [rsp + 0x58], r11
+ffffffff8011c17f: 4c 89 64 24 60       	mov	qword ptr [rsp + 0x60], r12
+ffffffff8011c184: 4c 89 6c 24 68       	mov	qword ptr [rsp + 0x68], r13
+ffffffff8011c189: 4c 89 74 24 70       	mov	qword ptr [rsp + 0x70], r14
+ffffffff8011c18e: 4c 89 7c 24 78       	mov	qword ptr [rsp + 0x78], r15
+ffffffff8011c193: 48 31 c0             	xor	rax, rax
+ffffffff8011c196: 0f 23 f8             	mov	dr7, rax
+ffffffff8011c199: 0f 23 f0             	mov	dr6, rax
+ffffffff8011c19c: 49 89 e4             	mov	r12, rsp
+ffffffff8011c19f: 65 48 8b 04 25 20 00 00 00   	mov	rax, qword ptr gs:[0x20]
+ffffffff8011c1a8: 65 48 3b 04 25 28 00 00 00   	cmp	rax, qword ptr gs:[0x28]
+ffffffff8011c1b1: 74 03                	je	0xffffffff8011c1b6 <arch::syscall::syscall_entry_stub+0xbe>
+ffffffff8011c1b3: 0f 22 d8             	mov	cr3, rax
+ffffffff8011c1b6: e8 b5 f0 02 00       	call	0xffffffff8014b270 <syscall_get_kernel_rsp0>
+ffffffff8011c1bb: 48 89 c4             	mov	rsp, rax
+ffffffff8011c1be: 48 81 ec 00 02 00 00 	sub	rsp, 0x200
+ffffffff8011c1c5: 48 81 ec 80 00 00 00 	sub	rsp, 0x80
+ffffffff8011c1cc: 48 89 e7             	mov	rdi, rsp
+ffffffff8011c1cf: 4c 89 e6             	mov	rsi, r12
+ffffffff8011c1d2: 48 c7 c1 10 00 00 00 	mov	rcx, 0x10
+ffffffff8011c1d9: f3 48 a5             	rep		movsq	qword ptr es:[rdi], qword ptr [rsi]
+ffffffff8011c1dc: 49 89 e4             	mov	r12, rsp
+ffffffff8011c1df: 4c 8d ac 24 80 00 00 00      	lea	r13, [rsp + 0x80]
+ffffffff8011c1e7: 49 0f ae 45 00       	fxsave64	[r13]
+ffffffff8011c1ec: 65 4c 89 24 25 10 00 00 00   	mov	qword ptr gs:[0x10], r12
+ffffffff8011c1f5: fb                   	sti
+ffffffff8011c1f6: 49 8b 3c 24          	mov	rdi, qword ptr [r12]
+ffffffff8011c1fa: 49 8b 74 24 38       	mov	rsi, qword ptr [r12 + 0x38]
+ffffffff8011c1ff: 49 8b 54 24 30       	mov	rdx, qword ptr [r12 + 0x30]
+ffffffff8011c204: 49 8b 4c 24 10       	mov	rcx, qword ptr [r12 + 0x10]
+ffffffff8011c209: 4d 8b 44 24 50       	mov	r8, qword ptr [r12 + 0x50]
+ffffffff8011c20e: 4d 8b 4c 24 40       	mov	r9, qword ptr [r12 + 0x40]
+ffffffff8011c213: 48 83 ec 08          	sub	rsp, 0x8
+ffffffff8011c217: 41 ff 74 24 48       	push	qword ptr [r12 + 0x48]
+ffffffff8011c21c: e8 3f f0 02 00       	call	0xffffffff8014b260 <syscall_dispatcher_bridge>
+ffffffff8011c221: 48 83 c4 10          	add	rsp, 0x10
+ffffffff8011c225: 65 48 c7 04 25 10 00 00 00 00 00 00 00       	mov	qword ptr gs:[0x10], 0x0
+ffffffff8011c232: eb 00                	jmp	0xffffffff8011c234 <arch::syscall::syscall_entry_stub+0x13c>
+ffffffff8011c234: fa                   	cli
+ffffffff8011c235: 49 0f ae 4d 00       	fxrstor64	[r13]
+ffffffff8011c23a: 65 48 c7 04 25 18 00 00 00 00 00 00 00       	mov	qword ptr gs:[0x18], 0x0
+ffffffff8011c247: 65 48 89 04 25 30 00 00 00   	mov	qword ptr gs:[0x30], rax
+ffffffff8011c250: 65 48 8b 04 25 40 00 00 00   	mov	rax, qword ptr gs:[0x40]
+ffffffff8011c259: 48 89 c2             	mov	rdx, rax
+ffffffff8011c25c: 48 c1 ea 20          	shr	rdx, 0x20
+ffffffff8011c260: b9 00 01 00 c0       	mov	ecx, 0xc0000100
+ffffffff8011c265: 0f 30                	wrmsr
+ffffffff8011c267: 65 48 8b 04 25 48 00 00 00   	mov	rax, qword ptr gs:[0x48]
+ffffffff8011c270: 48 89 c2             	mov	rdx, rax
+ffffffff8011c273: 48 c1 ea 20          	shr	rdx, 0x20
+ffffffff8011c277: b9 02 01 00 c0       	mov	ecx, 0xc0000102
+ffffffff8011c27c: 0f 30                	wrmsr
+ffffffff8011c27e: 65 48 8b 04 25 30 00 00 00   	mov	rax, qword ptr gs:[0x30]
+ffffffff8011c287: 49 8b 54 24 08       	mov	rdx, qword ptr [r12 + 0x8]
+ffffffff8011c28c: 48 89 d3             	mov	rbx, rdx
+ffffffff8011c28f: 48 c1 e3 10          	shl	rbx, 0x10
+ffffffff8011c293: 48 c1 fb 10          	sar	rbx, 0x10
+ffffffff8011c297: 48 39 d3             	cmp	rbx, rdx
+ffffffff8011c29a: 0f 85 c0 00 00 00    	jne	0xffffffff8011c360 <arch::syscall::syscall_entry_stub+0x268>
+ffffffff8011c2a0: 48 0f ba e2 2f       	bt	rdx, 0x2f
+ffffffff8011c2a5: 0f 82 b5 00 00 00    	jb	0xffffffff8011c360 <arch::syscall::syscall_entry_stub+0x268>
+ffffffff8011c2ab: 49 8b 54 24 20       	mov	rdx, qword ptr [r12 + 0x20]
+ffffffff8011c2b0: 48 89 d3             	mov	rbx, rdx
+ffffffff8011c2b3: 48 c1 e3 10          	shl	rbx, 0x10
+ffffffff8011c2b7: 48 c1 fb 10          	sar	rbx, 0x10
+ffffffff8011c2bb: 48 39 d3             	cmp	rbx, rdx
+ffffffff8011c2be: 0f 85 9c 00 00 00    	jne	0xffffffff8011c360 <arch::syscall::syscall_entry_stub+0x268>
+ffffffff8011c2c4: 48 0f ba e2 2f       	bt	rdx, 0x2f
+ffffffff8011c2c9: 0f 82 91 00 00 00    	jb	0xffffffff8011c360 <arch::syscall::syscall_entry_stub+0x268>
+ffffffff8011c2cf: 49 8b 4c 24 08       	mov	rcx, qword ptr [r12 + 0x8]
+ffffffff8011c2d4: 49 8b 54 24 10       	mov	rdx, qword ptr [r12 + 0x10]
+ffffffff8011c2d9: 49 8b 5c 24 18       	mov	rbx, qword ptr [r12 + 0x18]
+ffffffff8011c2de: 49 8b 6c 24 28       	mov	rbp, qword ptr [r12 + 0x28]
+ffffffff8011c2e3: 49 8b 74 24 30       	mov	rsi, qword ptr [r12 + 0x30]
+ffffffff8011c2e8: 49 8b 7c 24 38       	mov	rdi, qword ptr [r12 + 0x38]
+ffffffff8011c2ed: 4d 8b 44 24 40       	mov	r8, qword ptr [r12 + 0x40]
+ffffffff8011c2f2: 4d 8b 4c 24 48       	mov	r9, qword ptr [r12 + 0x48]
+ffffffff8011c2f7: 4d 8b 54 24 50       	mov	r10, qword ptr [r12 + 0x50]
+ffffffff8011c2fc: 4d 8b 5c 24 58       	mov	r11, qword ptr [r12 + 0x58]
+ffffffff8011c301: 49 bd ff cf e2 ff ff ff ff ff	movabs	r13, -0x1d3001
+ffffffff8011c30b: 4d 21 eb             	and	r11, r13
+ffffffff8011c30e: 49 81 cb 00 02 00 00 	or	r11, 0x200
+ffffffff8011c315: 4d 8b 6c 24 68       	mov	r13, qword ptr [r12 + 0x68]
+ffffffff8011c31a: 4d 8b 74 24 70       	mov	r14, qword ptr [r12 + 0x70]
+ffffffff8011c31f: 4d 8b 7c 24 78       	mov	r15, qword ptr [r12 + 0x78]
+ffffffff8011c324: 49 8b 64 24 20       	mov	rsp, qword ptr [r12 + 0x20]
+ffffffff8011c329: 4d 8b 64 24 60       	mov	r12, qword ptr [r12 + 0x60]
+ffffffff8011c32e: 65 48 89 14 25 30 00 00 00   	mov	qword ptr gs:[0x30], rdx
+ffffffff8011c337: 65 48 8b 14 25 28 00 00 00   	mov	rdx, qword ptr gs:[0x28]
+ffffffff8011c340: 65 48 3b 14 25 20 00 00 00   	cmp	rdx, qword ptr gs:[0x20]
+ffffffff8011c349: 74 03                	je	0xffffffff8011c34e <arch::syscall::syscall_entry_stub+0x256>
+ffffffff8011c34b: 0f 22 da             	mov	cr3, rdx
+ffffffff8011c34e: 65 48 8b 14 25 30 00 00 00   	mov	rdx, qword ptr gs:[0x30]
+ffffffff8011c357: 0f 01 f8             	swapgs
+ffffffff8011c35a: 0f ae e8             	lfence
+ffffffff8011c35d: 48 0f 07             	sysretq
+ffffffff8011c360: 49 8b 7c 24 08       	mov	rdi, qword ptr [r12 + 0x8]
+ffffffff8011c365: 49 8b 74 24 20       	mov	rsi, qword ptr [r12 + 0x20]
+ffffffff8011c36a: 4d 8b 64 24 60       	mov	r12, qword ptr [r12 + 0x60]
+ffffffff8011c36f: 48 83 ec 08          	sub	rsp, 0x8
+ffffffff8011c373: e8 98 ee 02 00       	call	0xffffffff8014b210 <syscall_bad_return>
+ffffffff8011c378: 48 c7 c0 f0 ff ff ff 	mov	rax, -0x10
+ffffffff8011c37f: 49 ba ff cf e2 ff ff ff ff ff	movabs	r10, -0x1d3001
+ffffffff8011c389: 4d 21 d3             	and	r11, r10
+ffffffff8011c38c: 49 81 cb 00 02 00 00 	or	r11, 0x200
+ffffffff8011c393: 0f 01 f8             	swapgs
+ffffffff8011c396: 0f ae e8             	lfence
+ffffffff8011c399: 48 0f 07             	sysretq
+ffffffff8011c39c: 48 c7 c0 f0 ff ff ff 	mov	rax, -0x10
+ffffffff8011c3a3: 41 53                	push	r11
+ffffffff8011c3a5: 9d                   	popfq
+ffffffff8011c3a6: ff e1                	jmp	rcx
+ffffffff8011c3a8: cc                   	int3
+ffffffff8011c3a9: cc                   	int3
+ffffffff8011c3aa: cc                   	int3
+ffffffff8011c3ab: cc                   	int3
+ffffffff8011c3ac: cc                   	int3
+ffffffff8011c3ad: cc                   	int3
+ffffffff8011c3ae: cc                   	int3
+ffffffff8011c3af: cc                   	int3
+
+ffffffff8011bd9c <arch::interrupts::timer_interrupt_stub>:
+ffffffff8011bd9c: 50                   	push	rax
+ffffffff8011bd9d: 53                   	push	rbx
+ffffffff8011bd9e: 51                   	push	rcx
+ffffffff8011bd9f: 52                   	push	rdx
+ffffffff8011bda0: 56                   	push	rsi
+ffffffff8011bda1: 57                   	push	rdi
+ffffffff8011bda2: 55                   	push	rbp
+ffffffff8011bda3: 41 50                	push	r8
+ffffffff8011bda5: 41 51                	push	r9
+ffffffff8011bda7: 41 52                	push	r10
+ffffffff8011bda9: 41 53                	push	r11
+ffffffff8011bdab: 41 54                	push	r12
+ffffffff8011bdad: 41 55                	push	r13
+ffffffff8011bdaf: 41 56                	push	r14
+ffffffff8011bdb1: 41 57                	push	r15
+ffffffff8011bdb3: 48 8b 84 24 80 00 00 00      	mov	rax, qword ptr [rsp + 0x80]
+ffffffff8011bdbb: a8 03                	test	al, 0x3
+ffffffff8011bdbd: 74 22                	je	0xffffffff8011bde1 <arch::interrupts::timer_interrupt_stub+0x45>
+ffffffff8011bdbf: 0f 01 f8             	swapgs
+ffffffff8011bdc2: 0f ae e8             	lfence
+ffffffff8011bdc5: 65 48 8b 04 25 20 00 00 00   	mov	rax, qword ptr gs:[0x20]
+ffffffff8011bdce: 48 85 c0             	test	rax, rax
+ffffffff8011bdd1: 74 0e                	je	0xffffffff8011bde1 <arch::interrupts::timer_interrupt_stub+0x45>
+ffffffff8011bdd3: 65 48 3b 04 25 28 00 00 00   	cmp	rax, qword ptr gs:[0x28]
+ffffffff8011bddc: 74 03                	je	0xffffffff8011bde1 <arch::interrupts::timer_interrupt_stub+0x45>
+ffffffff8011bdde: 0f 22 d8             	mov	cr3, rax
+ffffffff8011bde1: 48 89 e7             	mov	rdi, rsp
+ffffffff8011bde4: 48 8d 74 24 78       	lea	rsi, [rsp + 0x78]
+ffffffff8011bde9: 48 89 e5             	mov	rbp, rsp
+ffffffff8011bdec: 48 83 e4 f0          	and	rsp, -0x10
+ffffffff8011bdf0: e8 4b 62 02 00       	call	0xffffffff80142040 <arch::interrupts::timer_interrupt_body>
+ffffffff8011bdf5: 48 89 ec             	mov	rsp, rbp
+ffffffff8011bdf8: 48 8b 84 24 80 00 00 00      	mov	rax, qword ptr [rsp + 0x80]
+ffffffff8011be00: a8 03                	test	al, 0x3
+ffffffff8011be02: 74 1f                	je	0xffffffff8011be23 <arch::interrupts::timer_interrupt_stub+0x87>
+ffffffff8011be04: 65 48 8b 04 25 28 00 00 00   	mov	rax, qword ptr gs:[0x28]
+ffffffff8011be0d: 48 85 c0             	test	rax, rax
+ffffffff8011be10: 74 0e                	je	0xffffffff8011be20 <arch::interrupts::timer_interrupt_stub+0x84>
+ffffffff8011be12: 65 48 3b 04 25 20 00 00 00   	cmp	rax, qword ptr gs:[0x20]
+ffffffff8011be1b: 74 03                	je	0xffffffff8011be20 <arch::interrupts::timer_interrupt_stub+0x84>
+ffffffff8011be1d: 0f 22 d8             	mov	cr3, rax
+ffffffff8011be20: 0f 01 f8             	swapgs
+ffffffff8011be23: 41 5f                	pop	r15
+ffffffff8011be25: 41 5e                	pop	r14
+ffffffff8011be27: 41 5d                	pop	r13
+ffffffff8011be29: 41 5c                	pop	r12
+ffffffff8011be2b: 41 5b                	pop	r11
+ffffffff8011be2d: 41 5a                	pop	r10
+ffffffff8011be2f: 41 59                	pop	r9
+ffffffff8011be31: 41 58                	pop	r8
+ffffffff8011be33: 5d                   	pop	rbp
+ffffffff8011be34: 5f                   	pop	rdi
+ffffffff8011be35: 5e                   	pop	rsi
+ffffffff8011be36: 5a                   	pop	rdx
+ffffffff8011be37: 59                   	pop	rcx
+ffffffff8011be38: 5b                   	pop	rbx
+ffffffff8011be39: 58                   	pop	rax
+ffffffff8011be3a: 48 cf                	iretq
+
+ffffffff8011bf4c <arch::context_switch::switch_to_user>:
+ffffffff8011bf4c: 9c                   	pushfq
+ffffffff8011bf4d: 8f 87 88 00 00 00    	pop	qword ptr [rdi + 0x88]
+ffffffff8011bf53: fa                   	cli
+ffffffff8011bf54: 48 89 4f 10          	mov	qword ptr [rdi + 0x10], rcx
+ffffffff8011bf58: 48 89 57 18          	mov	qword ptr [rdi + 0x18], rdx
+ffffffff8011bf5c: 48 89 fa             	mov	rdx, rdi
+ffffffff8011bf5f: 48 89 f1             	mov	rcx, rsi
+ffffffff8011bf62: 48 89 02             	mov	qword ptr [rdx], rax
+ffffffff8011bf65: 48 89 5a 08          	mov	qword ptr [rdx + 0x8], rbx
+ffffffff8011bf69: 48 31 c0             	xor	rax, rax
+ffffffff8011bf6c: 48 89 42 20          	mov	qword ptr [rdx + 0x20], rax
+ffffffff8011bf70: 48 89 42 28          	mov	qword ptr [rdx + 0x28], rax
+ffffffff8011bf74: 48 89 6a 30          	mov	qword ptr [rdx + 0x30], rbp
+ffffffff8011bf78: 48 8d 44 24 08       	lea	rax, [rsp + 0x8]
+ffffffff8011bf7d: 48 89 42 38          	mov	qword ptr [rdx + 0x38], rax
+ffffffff8011bf81: 4c 89 42 40          	mov	qword ptr [rdx + 0x40], r8
+ffffffff8011bf85: 4c 89 4a 48          	mov	qword ptr [rdx + 0x48], r9
+ffffffff8011bf89: 4c 89 52 50          	mov	qword ptr [rdx + 0x50], r10
+ffffffff8011bf8d: 4c 89 5a 58          	mov	qword ptr [rdx + 0x58], r11
+ffffffff8011bf91: 4c 89 62 60          	mov	qword ptr [rdx + 0x60], r12
+ffffffff8011bf95: 4c 89 6a 68          	mov	qword ptr [rdx + 0x68], r13
+ffffffff8011bf99: 4c 89 72 70          	mov	qword ptr [rdx + 0x70], r14
+ffffffff8011bf9d: 4c 89 7a 78          	mov	qword ptr [rdx + 0x78], r15
+ffffffff8011bfa1: 48 8b 04 24          	mov	rax, qword ptr [rsp]
+ffffffff8011bfa5: 48 89 82 80 00 00 00 	mov	qword ptr [rdx + 0x80], rax
+ffffffff8011bfac: 31 c0                	xor	eax, eax
+ffffffff8011bfae: 8c c8                	mov	eax, cs
+ffffffff8011bfb0: 48 89 82 90 00 00 00 	mov	qword ptr [rdx + 0x90], rax
+ffffffff8011bfb7: 8c d0                	mov	eax, ss
+ffffffff8011bfb9: 48 89 82 98 00 00 00 	mov	qword ptr [rdx + 0x98], rax
+ffffffff8011bfc0: 48 8b 82 80 00 00 00 	mov	rax, qword ptr [rdx + 0x80]
+ffffffff8011bfc7: 48 c1 e8 2f          	shr	rax, 0x2f
+ffffffff8011bfcb: 48 3d ff ff 01 00    	cmp	rax, 0x1ffff
+ffffffff8011bfd1: 74 02                	je	0xffffffff8011bfd5 <arch::context_switch::switch_to_user+0x89>
+ffffffff8011bfd3: 0f 0b                	ud2
+ffffffff8011bfd5: 65 48 c7 04 25 18 00 00 00 00 00 00 00       	mov	qword ptr gs:[0x18], 0x0
+ffffffff8011bfe2: 65 48 c7 04 25 10 00 00 00 00 00 00 00       	mov	qword ptr gs:[0x10], 0x0
+ffffffff8011bfef: 0f 20 c0             	mov	rax, cr0
+ffffffff8011bff2: 48 83 c8 08          	or	rax, 0x8
+ffffffff8011bff6: 0f 22 c0             	mov	cr0, rax
+ffffffff8011bff9: 31 c0                	xor	eax, eax
+ffffffff8011bffb: 0f 23 c0             	mov	dr0, rax
+ffffffff8011bffe: 0f 23 c8             	mov	dr1, rax
+ffffffff8011c001: 0f 23 d0             	mov	dr2, rax
+ffffffff8011c004: 0f 23 d8             	mov	dr3, rax
+ffffffff8011c007: 0f 23 f0             	mov	dr6, rax
+ffffffff8011c00a: 0f 23 f8             	mov	dr7, rax
+ffffffff8011c00d: 48 89 cf             	mov	rdi, rcx
+ffffffff8011c010: 48 8b 87 80 00 00 00 	mov	rax, qword ptr [rdi + 0x80]
+ffffffff8011c017: 48 89 c1             	mov	rcx, rax
+ffffffff8011c01a: 48 c1 e1 10          	shl	rcx, 0x10
+ffffffff8011c01e: 48 c1 f9 10          	sar	rcx, 0x10
+ffffffff8011c022: 48 39 c1             	cmp	rcx, rax
+ffffffff8011c025: 0f 85 cb 00 00 00    	jne	0xffffffff8011c0f6 <arch::context_switch::switch_to_user+0x1aa>
+ffffffff8011c02b: 48 0f ba e0 2f       	bt	rax, 0x2f
+ffffffff8011c030: 0f 82 c0 00 00 00    	jb	0xffffffff8011c0f6 <arch::context_switch::switch_to_user+0x1aa>
+ffffffff8011c036: 48 8b 4f 38          	mov	rcx, qword ptr [rdi + 0x38]
+ffffffff8011c03a: 48 89 cb             	mov	rbx, rcx
+ffffffff8011c03d: 48 c1 e3 10          	shl	rbx, 0x10
+ffffffff8011c041: 48 c1 fb 10          	sar	rbx, 0x10
+ffffffff8011c045: 48 39 cb             	cmp	rbx, rcx
+ffffffff8011c048: 0f 85 a8 00 00 00    	jne	0xffffffff8011c0f6 <arch::context_switch::switch_to_user+0x1aa>
+ffffffff8011c04e: 48 0f ba e1 2f       	bt	rcx, 0x2f
+ffffffff8011c053: 0f 82 9d 00 00 00    	jb	0xffffffff8011c0f6 <arch::context_switch::switch_to_user+0x1aa>
+ffffffff8011c059: 48 8b 87 88 00 00 00 	mov	rax, qword ptr [rdi + 0x88]
+ffffffff8011c060: 48 25 ff 8f fe ff    	and	rax, -0x17001
+ffffffff8011c066: 48 0d 00 02 00 00    	or	rax, 0x200
+ffffffff8011c06c: 49 89 c7             	mov	r15, rax
+ffffffff8011c06f: fa                   	cli
+ffffffff8011c070: 48 0f ae 8f c0 00 00 00      	fxrstor64	[rdi + 0xc0]
+ffffffff8011c078: 48 8b 07             	mov	rax, qword ptr [rdi]
+ffffffff8011c07b: 48 8b 5f 08          	mov	rbx, qword ptr [rdi + 0x8]
+ffffffff8011c07f: 48 8b 4f 10          	mov	rcx, qword ptr [rdi + 0x10]
+ffffffff8011c083: 48 8b 57 18          	mov	rdx, qword ptr [rdi + 0x18]
+ffffffff8011c087: 48 8b 77 20          	mov	rsi, qword ptr [rdi + 0x20]
+ffffffff8011c08b: 48 8b 6f 30          	mov	rbp, qword ptr [rdi + 0x30]
+ffffffff8011c08f: 4c 8b 47 40          	mov	r8, qword ptr [rdi + 0x40]
+ffffffff8011c093: 4c 8b 4f 48          	mov	r9, qword ptr [rdi + 0x48]
+ffffffff8011c097: 4c 8b 57 50          	mov	r10, qword ptr [rdi + 0x50]
+ffffffff8011c09b: 4c 8b 5f 58          	mov	r11, qword ptr [rdi + 0x58]
+ffffffff8011c09f: 4c 8b 67 60          	mov	r12, qword ptr [rdi + 0x60]
+ffffffff8011c0a3: 4c 8b 6f 68          	mov	r13, qword ptr [rdi + 0x68]
+ffffffff8011c0a7: 4c 8b 77 70          	mov	r14, qword ptr [rdi + 0x70]
+ffffffff8011c0ab: 6a 1b                	push	0x1b
+ffffffff8011c0ad: ff 77 38             	push	qword ptr [rdi + 0x38]
+ffffffff8011c0b0: 41 57                	push	r15
+ffffffff8011c0b2: 6a 23                	push	0x23
+ffffffff8011c0b4: ff b7 80 00 00 00    	push	qword ptr [rdi + 0x80]
+ffffffff8011c0ba: 4c 8b 7f 78          	mov	r15, qword ptr [rdi + 0x78]
+ffffffff8011c0be: 48 8b 7f 28          	mov	rdi, qword ptr [rdi + 0x28]
+ffffffff8011c0c2: fa                   	cli
+ffffffff8011c0c3: 65 48 89 14 25 30 00 00 00   	mov	qword ptr gs:[0x30], rdx
+ffffffff8011c0cc: 65 48 8b 14 25 28 00 00 00   	mov	rdx, qword ptr gs:[0x28]
+ffffffff8011c0d5: 48 85 d2             	test	rdx, rdx
+ffffffff8011c0d8: 74 0e                	je	0xffffffff8011c0e8 <arch::context_switch::switch_to_user+0x19c>
+ffffffff8011c0da: 65 48 3b 14 25 20 00 00 00   	cmp	rdx, qword ptr gs:[0x20]
+ffffffff8011c0e3: 74 03                	je	0xffffffff8011c0e8 <arch::context_switch::switch_to_user+0x19c>
+ffffffff8011c0e5: 0f 22 da             	mov	cr3, rdx
+ffffffff8011c0e8: 65 48 8b 14 25 30 00 00 00   	mov	rdx, qword ptr gs:[0x30]
+ffffffff8011c0f1: 0f 01 f8             	swapgs
+ffffffff8011c0f4: 48 cf                	iretq
+ffffffff8011c0f6: 0f 0b                	ud2
+
+ffffffff80269080 <zero_mitigation_probe_anchor>:
+ffffffff80269080: 90                   	nop
+ffffffff80269081: c3                   	ret
+ffffffff80269082: cc                   	int3
+ffffffff80269083: cc                   	int3
+ffffffff80269084: cc                   	int3
+ffffffff80269085: cc                   	int3
+ffffffff80269086: cc                   	int3
+ffffffff80269087: cc                   	int3
+ffffffff80269088: cc                   	int3
+ffffffff80269089: cc                   	int3
+ffffffff8026908a: cc                   	int3
+ffffffff8026908b: cc                   	int3
+ffffffff8026908c: cc                   	int3
+ffffffff8026908d: cc                   	int3
+ffffffff8026908e: cc                   	int3
+ffffffff8026908f: cc                   	int3

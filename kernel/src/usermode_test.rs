@@ -209,6 +209,12 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!(env!("ZERO_OS_OPEN_PROB
 #[cfg(all(feature = "mitigation_probe", feature = "open_fault_probe"))]
 compile_error!("mitigation_probe and open_fault_probe select different guest workloads");
 
+/// Dedicated dual-root evidence workload; normal musl fixture bytes stay intact.
+#[cfg(feature = "mitigation_probe")]
+static USER_ELF_ALIGNED: AlignedElfData<
+    { include_bytes!(env!("ZERO_OS_MITIGATION_PROBE_ELF")).len() },
+> = AlignedElfData(*include_bytes!(env!("ZERO_OS_MITIGATION_PROBE_ELF")));
+
 /// Embedded clone syscall test program with proper alignment
 ///
 /// Tests thread creation via clone syscall:
@@ -627,7 +633,7 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
         Info,
         "  KPTI: {}",
         if user_memory_space != 0 {
-            "dual-root (exercised)"
+            "dual roots prepared; full isolation unsupported"
         } else {
             "single-root"
         }

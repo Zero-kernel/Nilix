@@ -2535,6 +2535,10 @@ pub fn create_kpti_user_pml4(
     }
 
     let phys_addr = user_pml4_frame.start_address().as_u64() as usize;
+    #[cfg(feature = "mitigation_probe")]
+    unsafe {
+        crate::mitigation_probe::inspect(kernel_pml4_phys as u64, phys_addr as u64);
+    }
     Ok((user_pml4_frame, phys_addr))
 }
 

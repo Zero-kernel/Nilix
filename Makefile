@@ -19,6 +19,16 @@ MUSL_KERNEL := $(MUSL_TARGET_DIR)/x86_64-unknown-none/release/kernel
 # RF180-59 FIX: the feature artifact's final package/boot input is isolated too.
 MUSL_ESP := $(MUSL_TARGET_DIR)/esp
 MUSL_ESP_DIR := $(CURDIR)/$(MUSL_ESP)/EFI/BOOT
+MITIGATION_TARGET_DIR := kernel-target/mitigation
+MITIGATION_BOOT_TARGET_DIR := bootloader-target/mitigation
+MITIGATION_KERNEL := $(MITIGATION_TARGET_DIR)/x86_64-unknown-none/release/kernel
+MITIGATION_ESP := $(MITIGATION_TARGET_DIR)/esp
+MITIGATION_BUILD_JSON := $(MITIGATION_TARGET_DIR)/build-command.json
+MITIGATION_INPUT_MANIFEST ?=
+MITIGATION_REVISION ?=
+MITIGATION_ARTIFACTS ?= .validation/mitigation
+MITIGATION_TIMEOUT ?= 120
+.PHONY: build-mitigation-probe
 STRESS_TARGET_DIR := kernel-target/stress
 STRESS_KERNEL := $(STRESS_TARGET_DIR)/x86_64-unknown-none/release/kernel
 STRESS_ESP := esp-stress
@@ -779,11 +789,36 @@ test-perf: build
 	@echo "=== Running Performance Regression Gate ==="
 	@bash scripts/perf_regression_test.sh esp
 
-# Security mitigation tests - hardware/compiler-dependent validation
-test-security-mitigations: build
-	@echo "=== Running Security Mitigation Tests ==="
-	@echo "Security tests are integrated into runtime_tests.rs"
-	@echo "Run 'make test' to execute the full test suite including security tests"
+# Build a dedicated workload, kernel and ESP. The recorded argv/env plan is the
+# plan actually executed; status becomes 0 only after builds and packaging match.
+build-mitigation-probe:
+	@mkdir -p "$(MITIGATION_TARGET_DIR)"
+	python3 -c 'import hashlib,json,os,pathlib,subprocess,sys; \
+	root=pathlib.Path(sys.argv[1]); out=(root/sys.argv[2]).resolve(); boot=(root/sys.argv[3]).resolve(); record=root/sys.argv[4]; linker=sys.argv[5]; \
+	guest=out/"mitigation_probe.elf"; kernel=out/"x86_64-unknown-none/release/kernel"; loader=boot/"x86_64-unknown-uefi/release/bootloader.efi"; esp=out/"esp"; \
+	flags="-C link-arg=-T"+linker+" -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort"; \
+	steps=[{"cwd":str(root),"argv":["musl-gcc","-std=c11","-static","-O2","-Wall","-Wextra","-Werror","-o",str(guest),"userspace/mitigation_probe.c"],"env":{}}, \
+	{"cwd":str(root/"bootloader"),"argv":["cargo","+nightly-2025-12-08","build","--release","--target","x86_64-unknown-uefi","--features","kaslr","--locked"],"env":{"CARGO_TARGET_DIR":str(boot),"RUSTFLAGS":"","CARGO_ENCODED_RUSTFLAGS":""}}, \
+	{"cwd":str(root/"kernel"),"argv":["cargo","+nightly-2025-12-08","build","--release","--target","x86_64-unknown-none","-Z","build-std=core,alloc,compiler_builtins","--features","mitigation_probe","--locked"],"env":{"CARGO_TARGET_DIR":str(out),"RUSTFLAGS":flags,"CARGO_ENCODED_RUSTFLAGS":"\x1f".join(flags.split()),"ZERO_OS_MITIGATION_PROBE_ELF":str(guest)}}, \
+	{"cwd":str(root),"argv":["mkdir","-p",str(esp/"EFI/BOOT")],"env":{}}, \
+	{"cwd":str(root),"argv":["cp",str(loader),str(esp/"EFI/BOOT/BOOTX64.EFI")],"env":{}}, \
+	{"cwd":str(root),"argv":["cp",str(kernel),str(esp/"kernel.elf")],"env":{}}, \
+	{"cwd":str(root),"argv":["cmp","-s",str(kernel),str(esp/"kernel.elf")],"env":{}}, \
+	{"cwd":str(root),"argv":["cmp","-s",str(loader),str(esp/"EFI/BOOT/BOOTX64.EFI")],"env":{}}]; \
+	evidence={"target":"build-mitigation-probe","status":None,"steps":steps,"outputs":{}}; record.write_text(json.dumps(evidence,indent=2)+"\n",encoding="utf8"); \
+	[subprocess.run(step["argv"],cwd=step["cwd"],env={**os.environ,**step["env"]},check=True) for step in steps]; \
+	evidence.update(status=0,outputs={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [guest,kernel,loader,esp/"kernel.elf",esp/"EFI/BOOT/BOOTX64.EFI"]}); record.write_text(json.dumps(evidence,indent=2)+"\n",encoding="utf8")' \
+	"$(CURDIR)" "$(MITIGATION_TARGET_DIR)" "$(MITIGATION_BOOT_TARGET_DIR)" "$(MITIGATION_BUILD_JSON)" "$(KERNEL_LD)"
+
+# Optional actual mechanism proof; it does not qualify full KPTI/retpoline.
+test-security-mitigations:
+	@test -n "$(MITIGATION_INPUT_MANIFEST)" && test -n "$(MITIGATION_REVISION)" || { \
+		echo "Set MITIGATION_INPUT_MANIFEST and MITIGATION_REVISION for the exact validation tree." >&2; exit 2; }
+	$(MAKE) build-mitigation-probe
+	python3 scripts/mitigation_check.py --runtime --smp 4 --timeout "$(MITIGATION_TIMEOUT)" \
+		--kernel-elf "$(MITIGATION_KERNEL)" --esp "$(MITIGATION_ESP)" \
+		--input-manifest "$(MITIGATION_INPUT_MANIFEST)" --revision "$(MITIGATION_REVISION)" \
+		--build-command-json "$(MITIGATION_BUILD_JSON)" --artifacts "$(MITIGATION_ARTIFACTS)"
 
 # Melting test - sustained maximum load (real hardware only)
 test-melting:
