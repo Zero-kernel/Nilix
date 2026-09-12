@@ -820,7 +820,15 @@ pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 320 * 1024;
     not(debug_assertions),
     not(any(feature = "fuzz_runner", feature = "syz_executor"))
 ))]
-pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 224 * 1024;
+// 2026-09-10 SMP recalibration: the identical release kernel on three fresh
+// four-CPU/KASLR boots measured 209512 / 237712 / 187840 unledgered bytes.
+// The single-core 224 KiB calibration rejected the middle boot. Apply the
+// existing measured-max + 25%, next-32-KiB-step rule: 237712 * 1.25 = 297140,
+// rounded to 320 KiB. This remains inside the existing fixed-reserve carve-out
+// (heap_budget.rs const proof). Class limits, 64 KiB drift reserve, 1536 KiB
+// peak cap, and physical heap size are unchanged. See the KSA-006 gate design
+// for kernel/log identities and independent calibration review.
+pub const BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES: usize = 320 * 1024;
 
 /// D1-RES R4: fail-closed ceiling on `mm::heap_peak_used_bytes()` at the boot
 /// integration checkpoint — the first PEAK (not endpoint) bound for the boot

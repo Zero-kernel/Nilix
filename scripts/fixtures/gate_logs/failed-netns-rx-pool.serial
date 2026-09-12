@@ -1,0 +1,12 @@
+=== Runtime Functional Tests ===
+4 CPU(s) online
+  [TEST] smp_online... PASS
+  [TEST] r175_d0_cross_2_tlb_fence... PASS
+  [TEST] r175_d0_cross_1_frame_ptr... PASS
+  [TEST] r175_d0_cross_3_sched_atomic... PASS
+  [TEST] rf178_33_sched_smp_gate... PASS
+  [TEST] netns_rx_pool_lifecycle... FAIL: synthetic reproduction of KSA-006
+=== Test Summary: 37 passed, 36 deferred (awaiting syscall infrastructure), 1 failed ===
+[SMP] process-deferred gate complete: 3/3 APs acknowledged
+Hello from Ring 3
+Process 1 exited with code 0

@@ -27,6 +27,11 @@ MIN_CPUS=2
 MIN_R175=3
 EXPECTED_READY_SUMMARY='[SMP] process-deferred gate complete: 1/1 APs acknowledged'
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SMP-TEST BLOCKED: python3 is required for gate-log validation"
+    exit 2
+fi
+
 # OVMF firmware autodetect
 if [ -n "${OVMF_PATH:-}" ] && [ -f "${OVMF_PATH:-}" ]; then
     OVMF="$OVMF_PATH"
@@ -60,9 +65,10 @@ ordered_completion_seen() {
 }
 cleanup() {
     if [ "$keep_logs" = 1 ]; then
-        echo "SMP-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog"
+        echo "SMP-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
     else
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog"
+        rm -rf -- "$ser.inputs"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
     fi
 }
 trap cleanup EXIT
@@ -79,9 +85,13 @@ echo ""
 # RF180-57 FIX: GNU timeout owns, terminates, and reaps QEMU synchronously.
 # Waiting for the full bounded window preserves late-fault coverage without
 # duplicating a numeric-PID process supervisor in this test harness.
+python3 "$ROOT/scripts/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
+    --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
+"$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
+
 LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
     bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
-    -drive format=raw,file=fat:rw:"$ESP" \
+    -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -smp 2 \
     -m 512M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
@@ -149,7 +159,10 @@ echo ""
 echo "Parsed: online_cpus=${online_cpus} deferred_summary=${ready_summary}/1 pid1_exit=${pid1_exits}/1 qemu_exceptions=${fatal_exceptions} smp_online_PASS=${smp_online} r175_d0_cross_PASS=${r175_tests} rf178_33_PASS=${rf178_33}"
 echo ""
 
-rc=0
+python3 "$ROOT/scripts/gate_log.py" --serial "$ser" --intlog "$intlog" \
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+rc=$?
+python3 "$ROOT/scripts/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 if [ "$nx" -gt 0 ]; then
     echo "❌ FAIL: $nx NX-violation #PF detected"
     rc=1
@@ -215,4 +228,5 @@ if [ "$rc" -eq 0 ]; then
     echo "✅ RF178-33 scheduler SMP gate PASSED"
 fi
 
+printf '%s\n' "$rc" > "$ser.gate.status"
 exit "$rc"

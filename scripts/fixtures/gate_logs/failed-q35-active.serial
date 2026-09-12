@@ -1,0 +1,7 @@
+[7.53/8] Initializing IOMMU (DMA isolation)...
+      ✓ IOMMU active: 1 unit(s), DMA translation enabled
+      - IOMMU enabled: true
+=== Runtime Functional Tests ===
+=== Test Summary: 28 passed, 45 deferred (awaiting syscall infrastructure), 1 failed ===
+Hello from Ring 3
+Process 1 exited with code 0
