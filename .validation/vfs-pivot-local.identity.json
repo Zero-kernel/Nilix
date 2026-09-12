@@ -1,0 +1,79 @@
+{
+  "revision": "2873c1415f10981717e223f9b70737a38a3437d1",
+  "environment": "Windows/MSVC hosted; nightly-2025-12-08; kernel x86_64-unknown-none compile",
+  "scope": "VFS pivot implementation local gate identity after successful checks; parent captures full final tree separately",
+  "gates": [
+    {
+      "command": "cargo test -p vfs --target x86_64-pc-windows-msvc --features host_harness --lib --offline -- --nocapture",
+      "status": 0,
+      "passed": 61,
+      "log": ".validation/vfs-pivot-tests.log"
+    },
+    {
+      "command": "cargo check -p kernel --target x86_64-unknown-none --features namespace_probe,musl_test --offline",
+      "status": 0,
+      "log": ".validation/vfs-pivot-kernel.log"
+    },
+    {
+      "command": "python -B -X utf8 scripts/test_outcome_callers_test.py OtherCallerOutcomeTests.test_musl_requires_complete_guest_and_bounded_process_evidence -v",
+      "status": 0,
+      "log": ".validation/vfs-musl-caller-tests.log"
+    },
+    {
+      "command": "bash --noprofile --norc scripts/lint_fallible.sh kernel/vfs",
+      "status": 0
+    },
+    {
+      "command": "git -c core.whitespace=cr-at-eol diff --check -- <affected source/gate paths>",
+      "status": 0
+    },
+    {
+      "command": "local links in the three affected VFS design records",
+      "status": 0
+    }
+  ],
+  "sha256": {
+    "kernel/vfs/allocation_probe.rs": "a1f565912e8b0c7a53859c2eb674313997dbe3a4feb7e9b46dcca52114b85bf3",
+    "kernel/vfs/cgroupfs.rs": "308bf7205b01e36354634ba11531f4b505d53dc53672ece15625fbcbb2fbb7f6",
+    "kernel/vfs/context.rs": "242ac06e5a41ea951b0426d585be36701dec7df40ab33642427203bfb12d515d",
+    "kernel/vfs/devfs.rs": "86a7869872899eb4da0ed2a0051d691eddf0b45e49874908fc13f1435c47e1c1",
+    "kernel/vfs/ext2.rs": "8ec5db97b50bff39b7004883b5a46457fc430df85315f15c848519c335b26ffa",
+    "kernel/vfs/identity.rs": "d714b74822e87527b95b8c3cafed4d25f140b1d30be2bac91899515620c45611",
+    "kernel/vfs/initramfs.rs": "6668c50527e84f8a0cf3b0291ef5628c20e45750007c9ef99e5d71636f77edc6",
+    "kernel/vfs/lib.rs": "3605dfdc04d1ee4cad6abbfba1afab751ea7dd11013e0283da14e16419534e3e",
+    "kernel/vfs/manager.rs": "95f39e38bdf6b9c3ef67148ec9bb87fd2edabea01e55a86b415062d412300172",
+    "kernel/vfs/mount_namespace.rs": "c2a1e5c1e9bfb2c59d433a695635c809f812210064d15e2ede1820aabe1201ed",
+    "kernel/vfs/open_fault_probe.rs": "508d3eadf8980b25c31a3ea05492cf67b6f1cb0ffec31b10093f995b915199a0",
+    "kernel/vfs/operations.rs": "58336fc4c71e70037767b2081aa462c8a99e109a16fc14c37efdd8ad59b74349",
+    "kernel/vfs/path.rs": "d0b039ff836c1e333e9fbda41e0a10c35f09e539f863bf45102d2e8b771bd73b",
+    "kernel/vfs/procfs.rs": "b9872257ae151c1bd3c250f6bd7f88c15ea299303ff19eed8f13b47ea403c575",
+    "kernel/vfs/ramfs.rs": "ad809609be08429304d31ead91382d0866e519f50e753dc25e60536963fe0c83",
+    "kernel/vfs/resource_probe.rs": "f4d7530de00df4733b5349c04bea7c8ced1005486c6415f5ddfc5a713e5f80ea",
+    "kernel/vfs/topology.rs": "d1c93c7334284c904ed6550524fe8910c57b2b2c3785fd9dba98a4fb6bdc2d89",
+    "kernel/vfs/traits.rs": "b824de447937d75c9f2167ab2e33f2468b4f3868f0122ca295c37f6e536aa95a",
+    "kernel/vfs/types.rs": "8dc022c312a93ade4f50b1439ae42cb722dee85e371112dd9d5b9432b4e306d4",
+    "kernel/vfs/Cargo.toml": "933dcf891f7e967cd7c112c63d2970758ffffe875f47f44f775dc6a38e161716",
+    "kernel/kernel_core/fs_context.rs": "51ce83dad29aabeb38943220286f67fe8f57276b012923c59a9636c1791aa8bc",
+    "userspace/vfs_context_probe.c": "21033d1d371e531231daf7cc7727fabbaa69c80459ec6a3ad28b37998f22a3a6",
+    "scripts/musl_check.sh": "cb69b2a93da4e65d6d953c7e36e8f56d751b23d6e3809528cc262360f7cb8f82",
+    "scripts/test_outcome_callers_test.py": "91dad4889ac5d9195e61a594d1ddf0fd679122382ed0b47a7930a013c97b2e7a",
+    "scripts/hosted_subcrate_tests.sh": "216b7992bef984dcbb533609403d364609f755b45788fba06ca7b11679b6bded",
+    "kernel/kernel_core/process.rs": "9ac4faea211fecb0ae8735b0d7d0e44b58e0007947b01a95929d7fc44f983979",
+    "kernel/kernel_core/syscall.rs": "ed6d4a3aa2e68a97d2e35c09ca118c23731cd30213916a44a51f69183662a9f4",
+    "kernel/ipc/lib.rs": "cf180bbde810d660252d0b9e2c9291bc244def9251bbc31a579a877e8200e818",
+    "kernel/Cargo.toml": "a690bf8f38456d64786b96371f3035b3a0c1830dbae79668cfc64382c3b6da7f",
+    "kernel/src/main.rs": "b3be4b3e991289243359f274a5c04154e0841de5046578d6c5f7abe27517f4d7"
+  },
+  "limitations": [
+    "No local Linux C/musl compiler or guest execution; parent owns final synchronized kernel/guest/SMP/resource gates.",
+    "No guest setns producer; hosted and source review evidence only.",
+    "access() preserves existing effective-ID contract; Linux real-ID access behavior is outside this repair."
+  ],
+  "independent_review": {
+    "pivot": "PASS; abi_block_review",
+    "main_context_walker_access": "PASS; outcome_policy_review",
+    "ownership_lifetime": "PASS; abi_block_review; excludes separately reviewed Ext2 authoring",
+    "musl_caller_gate": "PASS; outcome_policy_review",
+    "resource_stack_and_epoch": "PASS; outcome_policy_review plus abi_block_review"
+  }
+}

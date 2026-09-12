@@ -1,0 +1,15 @@
+{
+  "date": "2026-09-11",
+  "scope": "Test-only Ext2 namespace destruction and descriptor lifetime delta after frozen v38; earlier vfs-pivot-local.identity.json is retained as historical v38 evidence.",
+  "environment": "Windows/MSVC nightly-2025-12-08 hosted VFS",
+  "focused_tests": 1,
+  "vfs_tests": 62,
+  "sha256": {
+    "kernel/vfs/devfs.rs": "c881c6f1a479b7b872403ce62920671caa220d8871202fdfa1fed9aefda19944",
+    "kernel/vfs/operations.rs": "93003734ec3c4f8f3a5f86020aa054e71b171f6bdba690118572779fe2700a09",
+    ".validation/vfs-ext2-lifetime-tests.log": "1eb1a9677e11b9e5ed72451a9311bf1c3671c3164f207cb254a45afcd98190de",
+    ".validation/vfs-ext2-lifetime-tests.status": "13bf7b3039c63bf5a50491fa3cfd8eb4e699d1ba1436315aef9cbe5711530354",
+    ".validation/vfs-pivot-tests.log": "9baf611b90fef83bdc79d4b894256048ccaa9de6a20ccefb9373045bd048cce6",
+    ".validation/vfs-pivot-tests.status": "13bf7b3039c63bf5a50491fa3cfd8eb4e699d1ba1436315aef9cbe5711530354"
+  }
+}
