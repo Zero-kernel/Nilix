@@ -53,6 +53,75 @@ use crate::process::{ProcessId, MAX_PID};
 pub const MAX_PID_NS_LEVEL: u8 = 32;
 const PID_PATH_SLOTS: usize = MAX_PID_NS_LEVEL as usize + 1;
 
+/// Numeric exit identity survives removal of the live namespace memberships.
+/// Namespace IDs never wrap/reuse; the PCB owns this snapshot until reap.
+#[derive(Debug)]
+pub(crate) struct ExitPidIdentity {
+    entries: [(u64, ProcessId); PID_PATH_SLOTS],
+    len: usize,
+}
+
+impl ExitPidIdentity {
+    pub const fn empty() -> Self {
+        Self {
+            entries: [(0, 0); PID_PATH_SLOTS],
+            len: 0,
+        }
+    }
+
+    pub fn capture(entries: impl IntoIterator<Item = (u64, ProcessId)>) -> Self {
+        let mut identity = Self::empty();
+        for entry in entries {
+            assert!(
+                identity.len < PID_PATH_SLOTS,
+                "PID namespace chain exceeded its depth bound"
+            );
+            identity.entries[identity.len] = entry;
+            identity.len += 1;
+        }
+        identity
+    }
+
+    pub fn pid_in(&self, namespace_id: u64) -> Option<ProcessId> {
+        self.entries[..self.len]
+            .iter()
+            .find(|entry| entry.0 == namespace_id)
+            .map(|entry| entry.1)
+    }
+}
+
+#[cfg(test)]
+mod exit_identity_tests {
+    use super::*;
+
+    #[test]
+    fn detached_identity_preserves_each_namespace_view() {
+        let mut live = [(0, 700), (21, 17), (32, 2)];
+        let saved = ExitPidIdentity::capture(live);
+        live.fill((0, 0));
+        assert_eq!(saved.pid_in(0), Some(700));
+        assert_eq!(saved.pid_in(21), Some(17));
+        assert_eq!(saved.pid_in(32), Some(2));
+        assert_eq!(saved.pid_in(33), None);
+    }
+
+    #[test]
+    fn maximum_depth_and_unrelated_namespace_are_exact() {
+        let saved =
+            ExitPidIdentity::capture((0..PID_PATH_SLOTS).map(|level| (level as u64, level + 1)));
+        assert_eq!(saved.pid_in(MAX_PID_NS_LEVEL as u64), Some(PID_PATH_SLOTS));
+        assert_eq!(saved.pid_in(PID_PATH_SLOTS as u64), None);
+        assert_eq!(ExitPidIdentity::empty().pid_in(0), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "PID namespace chain exceeded its depth bound")]
+    fn malformed_overdeep_chain_cannot_be_truncated_into_a_valid_identity() {
+        let _ =
+            ExitPidIdentity::capture((0..=PID_PATH_SLOTS).map(|level| (level as u64, level + 1)));
+    }
+}
+
 /// R76-2 FIX: Maximum number of PID namespaces allowed system-wide (including root).
 /// Prevents DoS via namespace exhaustion. Value chosen to allow reasonable containerization
 /// while preventing memory exhaustion attacks.

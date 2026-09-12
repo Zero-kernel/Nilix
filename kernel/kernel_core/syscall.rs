@@ -7684,80 +7684,28 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
             }
         };
 
-        // ST-K3 FIX (wait4 ABI, ns-correct selection): `pid_sel > 0` is the
-        // CALLER's namespace view, while `children`/PROCESS_TABLE hold GLOBAL
-        // pids, so translate ONCE here (mirrors `sys_kill`'s
-        // resolve_pid_in_namespace discipline) and compare globals in the scan.
-        //
-        // The translation must NOT be done from the child's stored
-        // `pid_ns_chain`: `terminate_process` MOVES that chain out of the PCB
-        // (`process.rs`, RF180-16 transfer) before the parent can reap, so
-        // every zombie presents an EMPTY chain — matching against it never
-        // fires and a selective wait would return ECHILD for a reapable child.
-        //
-        // Root namespace: the ns view IS the global pid (`attach_root_pid_
-        // reserved` maps global→global), so no map lookup is needed and zombies
-        // stay reapable. Non-root namespace: resolve via the ns map, which
-        // succeeds for live children and fails closed (ECHILD) for a zombie
-        // whose mapping `detach_pid_chain` already removed — the same
-        // approximation the pre-existing `parent_view_pid` fallback below makes
-        // in the other direction. Full non-root zombie fidelity needs the ns
-        // view retained across teardown (filed, out of ST-K3 scope).
-        let pid_sel_global: Option<ProcessId> = if pid_sel > 0 {
-            let owning = {
-                let proc = parent.lock();
-                crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
-            };
-            let resolved = match owning {
-                Some(ns) if !ns.is_root() => {
-                    crate::pid_namespace::resolve_pid_in_namespace(&ns, pid_sel as ProcessId)
-                }
-                _ => Some(pid_sel as ProcessId),
-            };
-            match resolved {
-                Some(global) => Some(global),
-                None => {
-                    // Blocked is already published — restore before bailing.
-                    let mut proc = parent.lock();
-                    proc.enter_ready_at(crate::get_ticks());
-                    proc.waiting_child = None;
-                    return Err(SyscallError::ECHILD);
-                }
-            }
-        } else {
-            None
+        // Match the caller's view against each child's immutable identity.
+        // Live namespace maps are detached before a zombie becomes reapable.
+        let parent_namespace = {
+            let proc = parent.lock();
+            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+                .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone())
         };
-        // True when ANY child PCB matching the selector still exists (live,
-        // stopping, or zombie-not-yet-reapable) — the discriminator between
-        // "block and wait" and "ECHILD".
         let mut selected_exists = false;
-
-        // 查找已终止的僵尸子进程
-        // F.1 PID Namespace: Also capture the child's namespace chain to derive ns-local PID
-        let mut zombie_child: Option<(
-            ProcessId,
-            i32,
-            mm::AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
-        )> = None;
+        let mut zombie_child: Option<(ProcessId, i32, ProcessId)> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
-        // ST-K3 FIX (Blocked-leak): OOM while snapshotting the zombie's ns
-        // chain must not `return` while the child PCB lock is held AND the
-        // parent is still published Blocked — flag it, exit the scan, restore
-        // Ready, THEN fail (lock order stays parent→child; no child lock held
-        // at the restore).
-        let mut scan_oom = false;
 
         for child_pid in child_list.iter() {
-            // ST-K3 FIX (wait4 ABI): selective filter on GLOBAL pids (see the
-            // translation above). Cheap pre-lock skip.
-            if let Some(target) = pid_sel_global {
-                if *child_pid != target {
-                    continue;
-                }
-            }
             match get_process(*child_pid) {
                 Some(child_proc) => {
                     let child = child_proc.lock();
+                    let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
+                        continue;
+                    };
+                    if pid_sel > 0 && view_pid != pid_sel as ProcessId {
+                        continue;
+                    }
+
                     selected_exists = true;
                     // R169-9: only reap a Zombie whose teardown has been published
                     // (teardown_done) — never before its cgroup/ns/futex teardown ran.
@@ -7770,16 +7718,7 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
                             .switch_reap_pending
                             .load(core::sync::atomic::Ordering::Acquire)
                     {
-                        match mm::AdmittedVec::try_copy_from_slice(
-                            mm::HeapClass::CoreProcess,
-                            &child.pid_ns_chain,
-                        ) {
-                            Ok(chain) => {
-                                zombie_child =
-                                    Some((*child_pid, child.exit_code.unwrap_or(0), chain));
-                            }
-                            Err(_) => scan_oom = true,
-                        }
+                        zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), view_pid));
                         break;
                     }
                 }
@@ -7794,30 +7733,7 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
             }
         }
 
-        // ST-K3 FIX (Blocked-leak): restore Ready before surfacing the scan
-        // OOM — see the scan_oom comment above.
-        if scan_oom {
-            let mut proc = parent.lock();
-            proc.enter_ready_at(crate::get_ticks());
-            proc.waiting_child = None;
-            return Err(SyscallError::ENOMEM);
-        }
-
-        // ST-K3 FIX (wait4 ABI): selective wait with no matching child PCB —
-        // nothing to reap now or ever (a stale entry for the requested pid
-        // means the PCB is already gone). Blocked may be published (this
-        // iteration or a prior one); restore Ready before ECHILD. Every
-        // bail-out in this function now follows that discipline — verified by
-        // enumeration, W-1 repaired the five pre-existing violators.
-        if pid_sel_global.is_some() && !selected_exists {
-            let mut proc = parent.lock();
-            proc.enter_ready_at(crate::get_ticks());
-            proc.waiting_child = None;
-            return Err(SyscallError::ECHILD);
-        }
-
-        // 如果找到僵尸子进程，收割并返回
-        if let Some((child_pid, exit_code, child_ns_chain)) = zombie_child {
+        if let Some((child_pid, exit_code, parent_view_pid)) = zombie_child {
             // 将退出码写入用户空间（如果提供了 status 指针）
             if !status.is_null() {
                 // ST-K3 FIX (wait4 ABI): Linux wstatus encoding for a normal
@@ -7837,33 +7753,6 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
                 }
             }
 
-            // F.1 PID Namespace: Translate child's global PID to parent's namespace view
-            //
-            // Linux semantics: wait() returns the PID as seen from the caller's namespace.
-            //
-            // CRITICAL: We CANNOT use pid_in_namespace() here because terminate_process()
-            // already called detach_pid_chain() which removed the child from namespace maps.
-            // Instead, we derive the ns-local PID from the child's stored pid_ns_chain.
-            //
-            // The child's pid_ns_chain contains entries for all namespaces from root to
-            // its owning namespace. We find the entry that matches the parent's owning
-            // namespace to get the PID as the parent sees it.
-            let parent_view_pid = {
-                let proc = parent.lock();
-                let parent_owning_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain);
-                if let Some(ref parent_ns) = parent_owning_ns {
-                    // Find the child's PID in the parent's owning namespace
-                    child_ns_chain
-                        .iter()
-                        .find(|m| Arc::ptr_eq(&m.ns, parent_ns))
-                        .map(|m| m.pid)
-                        .unwrap_or(child_pid) // Fallback if not visible (shouldn't happen)
-                } else {
-                    child_pid // Root namespace: use global PID
-                }
-            };
-
-            // 从父进程的子进程列表中移除，并恢复 Ready 状态
             {
                 let mut proc = parent.lock();
                 proc.children.retain(|&c| c != child_pid);
@@ -7887,13 +7776,18 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
         // 清理过期的子进程 PID
         if !stale_pids.is_empty() {
             let mut proc = parent.lock();
-            proc.children.retain(|pid| !stale_pids.contains(pid));
-            // 如果清理后没有子进程了，恢复状态并返回 ECHILD
-            if proc.children.is_empty() {
+            if proc.prune_stale_wait_children(&stale_pids) {
                 proc.enter_ready_at(crate::get_ticks());
                 proc.waiting_child = None;
-                return Err(SyscallError::ECHILD);
+                drop(proc);
+                continue; // Recover fallibly unlisted children from PROCESS_TABLE.
             }
+        }
+        if !selected_exists {
+            let mut proc = parent.lock();
+            proc.enter_ready_at(crate::get_ticks());
+            proc.waiting_child = None;
+            return Err(SyscallError::ECHILD);
         }
 
         // ST-K3 FIX (wait4 ABI): WNOHANG — nothing reapable right now, so

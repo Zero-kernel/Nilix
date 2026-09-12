@@ -2094,6 +2094,7 @@ pub struct Process {
     /// The last entry is the owning (leaf) namespace where the process was created.
     /// Root namespace (level 0) uses global PID directly.
     pub pid_ns_chain: AdmittedVec<crate::pid_namespace::PidNamespaceMembership>,
+    exit_pid_identity: crate::pid_namespace::ExitPidIdentity,
 
     /// PID namespace for children
     ///
@@ -2329,6 +2330,26 @@ impl Process {
             self.kernel_stack_top.as_u64() as usize,
         ))
     }
+    /// Prune stale wait entries without losing the fallback for an incomplete
+    /// children list. True requests a full-table retry once the list is empty.
+    pub(crate) fn prune_stale_wait_children(&mut self, stale: &[ProcessId]) -> bool {
+        self.children.retain(|pid| !stale.contains(pid));
+        self.children.is_empty() && self.children_incomplete
+    }
+
+    /// Wait identity is independent of mutable namespace maps and survives exit.
+    pub(crate) fn wait_pid_in_namespace(
+        &self,
+        namespace: &crate::pid_namespace::PidNamespaceArc,
+    ) -> Option<ProcessId> {
+        let id = namespace.id().raw();
+        self.pid_ns_chain
+            .iter()
+            .find(|member| member.ns.id().raw() == id)
+            .map(|member| member.pid)
+            .or_else(|| self.exit_pid_identity.pid_in(id))
+    }
+
     /// 创建新进程
     ///
     /// 默认以root权限运行（uid=0, gid=0），umask为标准0o022
@@ -2703,6 +2724,7 @@ impl Process {
             // F.1: PID namespace - default to root namespace
             // The actual chain will be assigned by create_process after PID allocation
             pid_ns_chain: AdmittedVec::new(HeapClass::CoreProcess),
+            exit_pid_identity: crate::pid_namespace::ExitPidIdentity::empty(),
             pid_ns_for_children: crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
             // F.1: Mount namespace - default to root mount namespace
             // The actual namespace will be assigned by create_process from parent
@@ -8774,6 +8796,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             } // Drop creds read guard before mutable access below
               // RF180-16: transfer the admitted chain; a dying task no longer
               // needs namespace visibility and teardown must not allocate.
+            proc.exit_pid_identity = crate::pid_namespace::ExitPidIdentity::capture(
+                proc.pid_ns_chain
+                    .iter()
+                    .map(|member| (member.ns.id().raw(), member.pid)),
+            );
             pid_ns_chain = core::mem::replace(
                 &mut proc.pid_ns_chain,
                 AdmittedVec::new(HeapClass::CoreProcess),
