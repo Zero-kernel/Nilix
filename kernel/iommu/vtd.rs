@@ -40,7 +40,18 @@ use core::mem::size_of;
 use core::ptr::{self, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
-use x86_64::PhysAddr;
+use x86_64::{PhysAddr, VirtAddr};
+
+#[path = "register_window.rs"]
+pub(crate) mod register_window;
+
+#[cfg(feature = "init_probe")]
+#[path = "init_probes.rs"]
+pub(crate) mod init_probes;
+
+#[cfg(feature = "device_probe")]
+#[path = "device_probe.rs"]
+pub mod device_probe;
 
 use crate::dmar::DrhdEntry;
 use crate::domain::{Domain, DomainId, DomainType};
@@ -118,6 +129,9 @@ const GCMD_QIE: u32 = 1 << 26;
 /// Interrupt Remapping Enable (GCMD.IRE).
 const GCMD_IRE: u32 = 1 << 25;
 
+/// Set Interrupt Remapping Table Pointer (one-shot command).
+const GCMD_SIRTP: u32 = 1 << 24;
+
 /// Translation Enable Status (GSTS.TES).
 const GSTS_TES: u32 = 1 << 31;
 
@@ -129,6 +143,7 @@ const GSTS_WBFS: u32 = 1 << 27;
 
 /// Interrupt Remapping Enable Status (GSTS.IRES).
 const GSTS_IRES: u32 = 1 << 25;
+const GSTS_IRTPS: u32 = 1 << 24;
 
 /// Queued Invalidation Enable Status (GSTS.QIES) — mirror of GCMD.QIE.
 const GSTS_QIES: u32 = 1 << 26;
@@ -184,10 +199,6 @@ const CAP_MGAW_MASK: u64 = 0x3F;
 const CAP_SAGAW_SHIFT: u64 = 8;
 const CAP_SAGAW_MASK: u64 = 0x1F;
 
-/// Fault Recording Register offset (CAP.FRO) - bits 23:20, in 16-byte units.
-const CAP_FRO_SHIFT: u64 = 24;
-const CAP_FRO_MASK: u64 = 0x3FF;
-
 /// Number of Fault Recording Registers (CAP.NFR) - bits 47:40.
 const CAP_NFR_SHIFT: u64 = 40;
 const CAP_NFR_MASK: u64 = 0xFF;
@@ -195,10 +206,6 @@ const CAP_NFR_MASK: u64 = 0xFF;
 // ============================================================================
 // Extended Capability Bits
 // ============================================================================
-
-/// IOTLB Register Offset (ECAP.IRO) - bits 17:8, in 16-byte units.
-const ECAP_IRO_SHIFT: u64 = 8;
-const ECAP_IRO_MASK: u64 = 0x3FF;
 
 /// Queued Invalidation Support (ECAP.QI).
 const ECAP_QI: u64 = 1 << 1;
@@ -257,6 +264,7 @@ const FAULT_SLOT_READY_BASE: u32 = 2;
 const QI_REGISTER_POINTER_MASK: u64 = 0x7_FFF0;
 const QI_COMPLETION_POLL_LIMIT: usize = 1000;
 const QI_DESC_IEC_GLOBAL: u64 = 0x4;
+const QI_ERROR_MASK: u32 = (1 << 4) | (1 << 5) | (1 << 6);
 
 fn qi_decode_pointer(register: u64) -> Option<u16> {
     let pointer = register & QI_REGISTER_POINTER_MASK;
@@ -282,13 +290,17 @@ fn qi_next_tail(tail: u16) -> Option<u16> {
     Some(next as u16)
 }
 
-fn qi_poll_head_exact<F>(expected: u16, mut read_head: F) -> bool
+fn qi_poll_completion<F>(expected: u16, marker: u32, mut read_state: F) -> bool
 where
-    F: FnMut() -> u64,
+    F: FnMut() -> (u64, u32, u32),
 {
     for _ in 0..QI_COMPLETION_POLL_LIMIT {
-        match qi_decode_pointer(read_head()) {
-            Some(observed) if observed == expected => return true,
+        let (head, status, faults) = read_state();
+        if faults & QI_ERROR_MASK != 0 {
+            return false;
+        }
+        match qi_decode_pointer(head) {
+            Some(observed) if observed == expected && status == marker => return true,
             Some(_) => core::hint::spin_loop(),
             None => return false,
         }
@@ -366,8 +378,6 @@ impl ContextEntry {
     const FPD: u64 = 1 << 1;
     /// Translation Type (bits 3:2).
     const TT_SHIFT: u64 = 2;
-    /// Address Width (bits 6:4) - encodes AGAW.
-    const AW_SHIFT: u64 = 4;
     /// Second-level page table pointer mask.
     const SLPTPTR_MASK: u64 = !0xFFF;
     /// Domain ID shift in hi.
@@ -377,8 +387,6 @@ impl ContextEntry {
 
     /// Translation Type: Untranslated requests only.
     const TT_UNTRANSLATED: u64 = 0;
-    /// Translation Type: All requests translated.
-    const TT_ALL: u64 = 1;
     /// Translation Type: Pass-through.
     const TT_PASSTHROUGH: u64 = 2;
 
@@ -393,21 +401,11 @@ impl ContextEntry {
     ///
     /// * `domain_id` - Domain identifier
     /// * `slpt_phys` - Second-level page table physical address
-    /// * `agaw` - Adjusted Guest Address Width (3 = 39-bit, 4 = 48-bit)
+    /// * `agaw` - Adjusted Guest Address Width in bits (39 or 48 for supported domains)
     pub fn new_translated(domain_id: DomainId, slpt_phys: u64, agaw: u8) -> Self {
-        let aw = match agaw {
-            39 => 1, // 3-level page table
-            48 => 2, // 4-level page table
-            57 => 3, // 5-level page table
-            _ => 2,  // Default to 48-bit
-        };
-
-        Self {
-            lo: Self::PRESENT
-                | (Self::TT_ALL << Self::TT_SHIFT)
-                | ((aw as u64) << Self::AW_SHIFT)
-                | (slpt_phys & Self::SLPTPTR_MASK),
-            hi: (domain_id as u64) << Self::DID_SHIFT,
+        match register_window::translated_context(domain_id, slpt_phys, agaw) {
+            Some((lo, hi)) => Self { lo, hi },
+            None => Self::empty(),
         }
     }
 
@@ -493,6 +491,116 @@ pub enum VtdError {
     HardwareInitFailed,
     /// Interrupt remapping table allocation failed.
     InterruptRemapAllocFailed,
+    InvalidRegisterWindow,
+    RegisterMappingFailed,
+}
+
+const VTD_MMIO_VIRT_BASE: u64 = 0xffff_ffff_6000_0000;
+const VTD_MMIO_SLOT_BYTES: u64 = 0x1_0000;
+static VTD_MMIO_SLOTS: Mutex<[Option<(u64, usize)>; crate::MAX_IOMMU_UNITS]> =
+    Mutex::new([None; crate::MAX_IOMMU_UNITS]);
+
+struct VtdRegisterMapping {
+    slot: usize,
+    phys_base: u64,
+    virt_base: u64,
+    mapped_bytes: usize,
+}
+
+impl VtdRegisterMapping {
+    fn new(phys_base: u64) -> Result<Self, VtdError> {
+        if phys_base == 0 || phys_base & (register_window::PAGE_BYTES as u64 - 1) != 0 {
+            return Err(VtdError::InvalidRegisterWindow);
+        }
+        mm::checked_physical_range(phys_base, register_window::PAGE_BYTES as u64)
+            .ok_or(VtdError::InvalidRegisterWindow)?;
+        let slot = {
+            let mut slots = VTD_MMIO_SLOTS.lock();
+            if slots.iter().flatten().any(|&(base, length)| {
+                register_window::ranges_overlap(
+                    phys_base,
+                    register_window::PAGE_BYTES,
+                    base,
+                    length,
+                )
+            }) {
+                return Err(VtdError::InvalidRegisterWindow);
+            }
+            let slot = slots
+                .iter()
+                .position(Option::is_none)
+                .ok_or(VtdError::RegisterMappingFailed)?;
+            slots[slot] = Some((phys_base, register_window::PAGE_BYTES));
+            slot
+        };
+        let mut mapping = Self {
+            slot,
+            phys_base,
+            virt_base: VTD_MMIO_VIRT_BASE + slot as u64 * VTD_MMIO_SLOT_BYTES,
+            mapped_bytes: 0,
+        };
+        mapping.extend(register_window::PAGE_BYTES)?;
+        Ok(mapping)
+    }
+
+    fn extend(&mut self, mapped_bytes: usize) -> Result<(), VtdError> {
+        if mapped_bytes < self.mapped_bytes
+            || mapped_bytes > register_window::MAX_WINDOW_BYTES
+            || mapped_bytes & (register_window::PAGE_BYTES - 1) != 0
+        {
+            return Err(VtdError::InvalidRegisterWindow);
+        }
+        mm::checked_physical_range(self.phys_base, mapped_bytes as u64)
+            .ok_or(VtdError::InvalidRegisterWindow)?;
+        {
+            let mut slots = VTD_MMIO_SLOTS.lock();
+            if slots.iter().enumerate().any(|(index, entry)| {
+                index != self.slot
+                    && entry.is_some_and(|(base, length)| {
+                        register_window::ranges_overlap(self.phys_base, mapped_bytes, base, length)
+                    })
+            }) {
+                return Err(VtdError::InvalidRegisterWindow);
+            }
+            slots[self.slot] = Some((self.phys_base, mapped_bytes));
+        }
+        if mapped_bytes == self.mapped_bytes {
+            return Ok(());
+        }
+        let offset = self.mapped_bytes as u64;
+        let mut frame_allocator = mm::FrameAllocator::new();
+        unsafe {
+            mm::map_mmio(
+                VirtAddr::new(self.virt_base + offset),
+                PhysAddr::new(self.phys_base + offset),
+                mapped_bytes - self.mapped_bytes,
+                &mut frame_allocator,
+            )
+        }
+        .map_err(|_| VtdError::RegisterMappingFailed)?;
+        self.mapped_bytes = mapped_bytes;
+        Ok(())
+    }
+}
+
+impl Drop for VtdRegisterMapping {
+    fn drop(&mut self) {
+        if self.mapped_bytes != 0 {
+            let mut frame_allocator = mm::FrameAllocator::new();
+            if unsafe {
+                mm::unmap_mmio(
+                    VirtAddr::new(self.virt_base),
+                    self.mapped_bytes,
+                    &mut frame_allocator,
+                )
+            }
+            .is_err()
+            {
+                return;
+            }
+        }
+        VTD_MMIO_SLOTS.lock()[self.slot] = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,10 +933,44 @@ struct QiDescriptor {
     hi: u64,
 }
 
+impl QiDescriptor {
+    fn wait(status_phys: u64, marker: u32) -> Self {
+        // WAIT, SW and FN: write status only after earlier invalidations retire,
+        // and fence subsequent descriptors. Completion storage is retained.
+        Self {
+            lo: 0x65 | (u64::from(marker) << 32),
+            hi: status_phys,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CacheInvalidation {
+    ContextDevice(u16),
+    ContextGlobal,
+    IotlbDomain(DomainId),
+    IotlbGlobal,
+}
+
+impl CacheInvalidation {
+    fn descriptor(self) -> QiDescriptor {
+        let lo = match self {
+            Self::ContextDevice(sid) => 0x31 | (u64::from(sid) << 32),
+            Self::ContextGlobal => 0x11,
+            // Drain reads and writes for both IOTLB granularities.
+            Self::IotlbDomain(did) => 0xe2 | (u64::from(did) << 16),
+            Self::IotlbGlobal => 0xd2,
+        };
+        QiDescriptor { lo, hi: 0 }
+    }
+}
+
 struct QueuedInvalidationQueue {
     phys: u64,
     virt: *mut QiDescriptor,
     tail: u16,
+    status: *mut u32,
+    marker: u32,
 }
 
 unsafe impl Send for QueuedInvalidationQueue {}
@@ -838,7 +980,7 @@ impl Drop for QueuedInvalidationQueue {
         if self.phys != 0 {
             buddy_allocator::free_physical_pages(
                 x86_64::structures::paging::PhysFrame::containing_address(PhysAddr::new(self.phys)),
-                1,
+                2,
             );
         }
     }
@@ -964,6 +1106,7 @@ fn fault_interrupt_update_allowed(enable: bool, sticky_overflow_mask: bool) -> b
 ///
 /// Manages a single VT-d IOMMU unit discovered via ACPI DMAR table.
 pub struct VtdUnit {
+    _register_mapping: VtdRegisterMapping,
     /// Register base virtual address.
     reg_base: u64,
 
@@ -1059,15 +1202,20 @@ impl VtdUnit {
     ///
     /// Initialized VT-d unit or error
     pub fn new(drhd: &DrhdEntry) -> Result<Self, VtdError> {
-        let reg_base = drhd.register_base();
+        let mut register_mapping = VtdRegisterMapping::new(drhd.register_base())?;
+        let reg_base = register_mapping.virt_base;
 
         // Read version register
         let ver = unsafe { Self::read_reg32(reg_base, VTD_REG_VER) };
-        let version = ((ver >> 4) as u8, (ver & 0xF) as u8);
 
         // Read capability registers
         let cap = unsafe { Self::read_reg64(reg_base, VTD_REG_CAP) };
         let ecap = unsafe { Self::read_reg64(reg_base, VTD_REG_ECAP) };
+
+        let window =
+            register_window::decode(ver, cap, ecap).ok_or(VtdError::InvalidRegisterWindow)?;
+        register_mapping.extend(window.mapped_bytes)?;
+        let version = window.version;
 
         // Polling is the only wired fault producer today. Explicitly mask the
         // unconfigured fault vector before any later unit publication instead
@@ -1075,12 +1223,10 @@ impl VtdUnit {
         unsafe { crate::fault::set_fault_interrupt_enabled(reg_base, false) };
 
         // Calculate IOTLB register offset
-        let iro = ((ecap >> ECAP_IRO_SHIFT) & ECAP_IRO_MASK) as usize;
-        let iotlb_offset = iro * 16;
+        let iotlb_offset = window.iotlb_offset;
 
         // Calculate fault recording register offset
-        let fro = ((cap >> CAP_FRO_SHIFT) & CAP_FRO_MASK) as usize;
-        let fault_offset = fro * 16;
+        let fault_offset = window.fault_offset;
 
         // Extract device scopes
         let mut device_scopes = AdmittedVec::new(HeapClass::Device);
@@ -1096,6 +1242,7 @@ impl VtdUnit {
         }
 
         Ok(Self {
+            _register_mapping: register_mapping,
             reg_base,
             segment: drhd.segment(),
             include_pci_all: drhd.include_pci_all(),
@@ -1172,7 +1319,7 @@ impl VtdUnit {
     /// Whether invalidation state is known-good for new map/unmap work.
     #[inline]
     pub fn cache_healthy(&self) -> bool {
-        !self.cache_poisoned.load(Ordering::Acquire)
+        !self.cache_poisoned.load(Ordering::Acquire) && !self.qi_poisoned.load(Ordering::Acquire)
     }
 
     /// True when hardware may still dereference an IR table owned by this unit.
@@ -1205,20 +1352,23 @@ impl VtdUnit {
         }
 
         let frame =
-            buddy_allocator::alloc_physical_pages(1).ok_or(VtdError::InterruptRemapAllocFailed)?;
+            buddy_allocator::alloc_physical_pages(2).ok_or(VtdError::InterruptRemapAllocFailed)?;
         let phys = frame.start_address().as_u64();
-        if phys >= MAX_DIRECT_MAP_PHYS {
-            buddy_allocator::free_physical_pages(frame, 1);
+        if phys == 0 || phys > MAX_DIRECT_MAP_PHYS - 2 * QI_QUEUE_BYTES as u64 {
+            buddy_allocator::free_physical_pages(frame, 2);
             return Err(VtdError::InterruptRemapAllocFailed);
         }
         let virt = phys_to_virt(frame.start_address());
-        unsafe { ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, QI_QUEUE_BYTES) };
+        unsafe { ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 2 * QI_QUEUE_BYTES) };
         *slot = Some(QueuedInvalidationQueue {
             phys,
             virt: virt.as_mut_ptr::<QiDescriptor>(),
             tail: 0,
+            status: (virt.as_u64() + QI_QUEUE_BYTES as u64) as *mut u32,
+            marker: 0,
         });
 
+        core::sync::atomic::fence(Ordering::SeqCst);
         unsafe {
             Self::write_reg64(self.reg_base, VTD_REG_IQA, phys);
             Self::write_reg64(self.reg_base, VTD_REG_IQT, 0);
@@ -1238,13 +1388,31 @@ impl VtdUnit {
     }
 
     pub(crate) fn invalidate_interrupt_entry_cache(&self) -> IommuResult<()> {
+        let mut slot = self.qi_queue.lock();
+        let _cmd = self.cmd_lock.lock();
+        let queue = slot.as_mut().ok_or(IommuError::NotInitialized)?;
+        self.submit_qi_locked(
+            queue,
+            QiDescriptor {
+                lo: QI_DESC_IEC_GLOBAL,
+                hi: 0,
+            },
+        )
+    }
+
+    /// Caller holds qi_queue then cmd_lock. Never reuse any descriptor/storage
+    /// after an ambiguous completion; the owning unit remains quarantined.
+    fn submit_qi_locked(
+        &self,
+        queue: &mut QueuedInvalidationQueue,
+        request: QiDescriptor,
+    ) -> IommuResult<()> {
         if self.qi_poisoned.load(Ordering::Acquire) {
             return Err(IommuError::HardwareInitFailed);
         }
-        let mut slot = self.qi_queue.lock();
-        let queue = slot.as_mut().ok_or(IommuError::NotInitialized)?;
         let gsts = unsafe { Self::read_reg32(self.reg_base, VTD_REG_GSTS) };
-        if gsts & GSTS_QIES == 0 {
+        let faults = unsafe { Self::read_reg32(self.reg_base, VTD_REG_FSTS) };
+        if gsts & GSTS_QIES == 0 || faults & QI_ERROR_MASK != 0 {
             self.qi_poisoned.store(true, Ordering::Release);
             return Err(IommuError::HardwareInitFailed);
         }
@@ -1262,26 +1430,90 @@ impl VtdUnit {
             IommuError::HardwareInitFailed
         })?;
         debug_assert!(index < QI_QUEUE_ENTRIES);
+        let wait_tail = qi_next_tail(queue.tail).ok_or(IommuError::HardwareInitFailed)?;
+        let wait_index = qi_descriptor_index(wait_tail).ok_or(IommuError::HardwareInitFailed)?;
+        let next = qi_next_tail(wait_tail).ok_or(IommuError::HardwareInitFailed)?;
+        queue.marker = queue.marker.wrapping_add(1).max(1);
+        let wait = QiDescriptor::wait(queue.phys + QI_QUEUE_BYTES as u64, queue.marker);
         unsafe {
-            let descriptor = queue.virt.add(index);
-            write_volatile(&mut (*descriptor).hi, 0);
-            core::sync::atomic::fence(Ordering::Release);
-            write_volatile(&mut (*descriptor).lo, QI_DESC_IEC_GLOBAL);
+            write_volatile(queue.status, 0);
+            write_volatile(queue.virt.add(index), request);
+            write_volatile(queue.virt.add(wait_index), wait);
         }
         core::sync::atomic::fence(Ordering::SeqCst);
-        let next = qi_next_tail(queue.tail).ok_or_else(|| {
-            self.qi_poisoned.store(true, Ordering::Release);
-            IommuError::HardwareInitFailed
-        })?;
         queue.tail = next;
         unsafe { Self::write_reg64(self.reg_base, VTD_REG_IQT, next as u64) };
-        // RF180-23 FIX: completion is the exact architectural head pointer,
-        // not a masked/ordered approximation. Invalid or timed-out IQH state
-        // quarantines the queue and its hardware-owned storage permanently.
-        let completed = qi_poll_head_exact(next, || unsafe {
-            Self::read_reg64(self.reg_base, VTD_REG_IQH)
+        // P3-2-F1: head consumption alone is not an invalidation completion.
+        let completed = qi_poll_completion(next, queue.marker, || unsafe {
+            (
+                Self::read_reg64(self.reg_base, VTD_REG_IQH),
+                read_volatile(queue.status),
+                Self::read_reg32(self.reg_base, VTD_REG_FSTS),
+            )
         });
+        core::sync::atomic::fence(Ordering::SeqCst);
         qi_complete_or_poison(&self.qi_poisoned, completed)
+    }
+
+    fn invalidate_cache_raw(
+        &self,
+        request: CacheInvalidation,
+        nonblocking: bool,
+    ) -> IommuResult<()> {
+        if !self.translation_enabled.load(Ordering::Acquire) {
+            return Err(IommuError::NotInitialized);
+        }
+        // The mode cannot change between selection and completion. Try callers
+        // acquire every lock with try_lock before any hardware mutation.
+        let mut slot = if nonblocking {
+            self.qi_queue.try_lock().ok_or(IommuError::WouldBlock)?
+        } else {
+            self.qi_queue.lock()
+        };
+        let _cmd = if nonblocking {
+            self.cmd_lock.try_lock().ok_or(IommuError::WouldBlock)?
+        } else {
+            self.cmd_lock.lock()
+        };
+        if self.qi_poisoned.load(Ordering::Acquire) {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        let enabled = unsafe { Self::read_reg32(self.reg_base, VTD_REG_GSTS) } & GSTS_QIES != 0;
+        match (enabled, slot.as_mut()) {
+            (true, Some(queue)) => return self.submit_qi_locked(queue, request.descriptor()),
+            (false, None) => {}
+            _ => {
+                self.qi_poisoned.store(true, Ordering::Release);
+                return Err(IommuError::HardwareInitFailed);
+            }
+        }
+        match request {
+            CacheInvalidation::ContextDevice(_) | CacheInvalidation::ContextGlobal => {
+                self.wait_context_complete()?;
+                let command = match request {
+                    CacheInvalidation::ContextDevice(sid) => {
+                        CCMD_ICC | CCMD_CIRG_DEVICE | (u64::from(sid) << 16)
+                    }
+                    _ => CCMD_ICC | CCMD_CIRG_GLOBAL,
+                };
+                unsafe { Self::write_reg64(self.reg_base, VTD_REG_CCMD, command) };
+                self.wait_context_complete()
+            }
+            CacheInvalidation::IotlbDomain(_) | CacheInvalidation::IotlbGlobal => {
+                self.wait_iotlb_complete()?;
+                let command = IOTLB_IVT
+                    | IOTLB_DR
+                    | IOTLB_DW
+                    | match request {
+                        CacheInvalidation::IotlbDomain(did) => {
+                            IOTLB_IIRG_DOMAIN | (u64::from(did) << 32)
+                        }
+                        _ => IOTLB_IIRG_GLOBAL,
+                    };
+                unsafe { Self::write_reg64(self.reg_base, self.iotlb_offset + 8, command) };
+                self.wait_iotlb_complete()
+            }
+        }
     }
 
     /// Allocation-free state update used by attach/detach rollback paths.
@@ -1384,7 +1616,7 @@ impl VtdUnit {
     /// 1. Check ECAP.IR for hardware support
     /// 2. Allocate interrupt remapping table (256 entries default)
     /// 3. Program IRTA register with table address
-    /// 4. Set GCMD.IRE to enable interrupt remapping
+    /// 4. Set SIRTP and await IRTPS before enabling IRE
     /// 5. Poll GSTS.IRES until set (hardware acknowledgment)
     pub fn setup_interrupt_remapping(&self, required: bool) -> Result<bool, VtdError> {
         // R84-1 FIX: Serialize setup to avoid double-programming IRTA/GCMD
@@ -1399,7 +1631,7 @@ impl VtdUnit {
             // Table presence proves lifetime only; GSTS.IRES is hardware truth.
             let _cmd_guard = self.cmd_lock.lock();
             let gsts = unsafe { Self::read_reg32(self.reg_base, VTD_REG_GSTS) };
-            if gsts & GSTS_IRES != 0 {
+            if gsts & (GSTS_IRES | GSTS_IRTPS) == GSTS_IRES | GSTS_IRTPS {
                 return Ok(true);
             }
             self.ir_poisoned.store(true, Ordering::Release);
@@ -1447,7 +1679,7 @@ impl VtdUnit {
             }
         };
 
-        // Program IRTA and submit IRE while retaining cmd_lock through both the
+        // Program IRTA, SIRTP and IRE while retaining cmd_lock through both the
         // acknowledgement and software-state publication. A timeout is
         // ambiguous: IRES may change later, so never issue a stale-status
         // rollback or free/overwrite the table. Publish it as quarantined and
@@ -1462,8 +1694,12 @@ impl VtdUnit {
         unsafe {
             Self::write_reg64(self.reg_base, VTD_REG_IRTA, irta);
         }
-        let enable_result =
-            self.write_gcmd_and_wait_locked(GcmdUpdate::Set(GCMD_IRE), GcmdAck::Set(GSTS_IRES));
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let enable_result = self
+            .write_gcmd_and_wait_locked(GcmdUpdate::Set(GCMD_SIRTP), GcmdAck::Set(GSTS_IRTPS))
+            .and_then(|()| {
+                self.write_gcmd_and_wait_locked(GcmdUpdate::Set(GCMD_IRE), GcmdAck::Set(GSTS_IRES))
+            });
         *ir_slot = Some(table);
         if let Err(error) = enable_result {
             self.ir_poisoned.store(true, Ordering::Release);
@@ -1778,11 +2014,6 @@ impl VtdUnit {
             DomainType::PageTable => {
                 // R83-4 FIX: Validate domain AGAW against hardware CAP.SAGAW
                 //
-                // SAGAW bits in Capability Register:
-                //   bit 0: 39-bit AGAW (3-level page table)
-                //   bit 1: 48-bit AGAW (4-level page table)
-                //   bit 2: 57-bit AGAW (5-level page table)
-                //
                 // If the domain's address width is not supported by hardware, the context
                 // entry's AW field would be undefined, leading to DMA faults or translation
                 // bypass. Fail-closed to prevent isolation bypass.
@@ -1790,12 +2021,10 @@ impl VtdUnit {
                 // NOTE: This check is only for PageTable domains. Identity domains use
                 // pass-through mode and don't use the AW field.
                 let sagaw_bits = self.supported_agaw();
-                let domain_agaw_bit = match domain.address_width() {
-                    39 => 1u8 << 0,
-                    48 => 1u8 << 1,
-                    57 => 1u8 << 2,
-                    _ => 0u8, // Unknown/invalid address width
-                };
+                let domain_agaw_bit =
+                    register_window::address_width_encoding(domain.address_width())
+                        .map(|encoding| 1u8 << encoding)
+                        .unwrap_or(0);
                 if domain_agaw_bit == 0 || (sagaw_bits & domain_agaw_bit) == 0 {
                     return Err(IommuError::InvalidRange);
                 }
@@ -1817,6 +2046,9 @@ impl VtdUnit {
         // present. Preparing is visible to concurrent map/unmap scans; those
         // invalidations may run early, while the post-publication invalidations
         // below provide the corresponding late-side ordering guarantee.
+        if !ctx_entry.is_present() {
+            return Err(IommuError::InvalidRange);
+        }
         {
             let mut devices = self.attached_devices.lock();
             if devices.records.contains_key(&source_id) {
@@ -2310,46 +2542,14 @@ impl VtdUnit {
     /// successful retry proves this command retired; callers still retain the
     /// global poison unless every ambiguous ownership record is resolved.
     fn invalidate_iotlb_domain_raw(&self, domain_id: DomainId) -> IommuResult<()> {
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-
-        let _cmd = self.cmd_lock.lock();
-        let result = (|| {
-            // Wait for any in-flight command before issuing a new one.
-            self.wait_iotlb_complete()?;
-
-            // Build invalidation command
-            let cmd =
-                IOTLB_IVT | IOTLB_IIRG_DOMAIN | IOTLB_DR | IOTLB_DW | ((domain_id as u64) << 32);
-
-            // Write to IOTLB register
-            unsafe {
-                Self::write_reg64(self.reg_base, self.iotlb_offset + 8, cmd);
-            }
-
-            // Wait for THIS command's completion (IVT bit clears)
-            self.wait_iotlb_complete()
-        })();
-        result
+        self.invalidate_cache_raw(CacheInvalidation::IotlbDomain(domain_id), false)
     }
 
     /// Conservative fallback when attachment ownership is incomplete. A global
     /// invalidation is required because an untracked context may reference any
     /// domain ID; skipping or issuing only the requested DID would be unsound.
     fn invalidate_iotlb_global_raw(&self) -> IommuResult<()> {
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-
-        let _cmd = self.cmd_lock.lock();
-        let result = (|| {
-            self.wait_iotlb_complete()?;
-            let cmd = IOTLB_IVT | IOTLB_IIRG_GLOBAL | IOTLB_DR | IOTLB_DW;
-            unsafe { Self::write_reg64(self.reg_base, self.iotlb_offset + 8, cmd) };
-            self.wait_iotlb_complete()
-        })();
-        result
+        self.invalidate_cache_raw(CacheInvalidation::IotlbGlobal, false)
     }
 
     /// Retire every cached context and translation when software ownership is
@@ -2405,21 +2605,8 @@ impl VtdUnit {
         if !self.cache_healthy() {
             return Err(IommuError::HardwareInitFailed);
         }
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-        let _cmd = self.cmd_lock.try_lock().ok_or(IommuError::WouldBlock)?;
-        // RF180-20 FIX: the pre-submit busy drain is part of the same hardware
-        // transaction as the post-submit acknowledgement. Either timeout is
-        // ambiguous and must poison all later cache-dependent work.
-        let result = (|| {
-            self.wait_iotlb_complete()?;
-            let cmd =
-                IOTLB_IVT | IOTLB_IIRG_DOMAIN | IOTLB_DR | IOTLB_DW | ((domain_id as u64) << 32);
-            unsafe { Self::write_reg64(self.reg_base, self.iotlb_offset + 8, cmd) };
-            self.wait_iotlb_complete()
-        })();
-        if result.is_err() {
+        let result = self.invalidate_cache_raw(CacheInvalidation::IotlbDomain(domain_id), true);
+        if result.is_err() && result != Err(IommuError::WouldBlock) {
             self.cache_poisoned.store(true, Ordering::Release);
         }
         result
@@ -2473,64 +2660,20 @@ impl VtdUnit {
         if !self.cache_healthy() {
             return Err(IommuError::HardwareInitFailed);
         }
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-        let _cmd = self.cmd_lock.try_lock().ok_or(IommuError::WouldBlock)?;
-        // RF180-20 FIX: poison on both the pre-submit and post-submit timeout;
-        // returning early from the initial drain previously left IRQ callers
-        // able to continue after an already-ambiguous command stream.
-        let result = (|| {
-            self.wait_context_complete()?;
-            let cmd = CCMD_ICC | CCMD_CIRG_DEVICE | ((device.source_id() as u64) << 16);
-            unsafe { Self::write_reg64(self.reg_base, VTD_REG_CCMD, cmd) };
-            self.wait_context_complete()
-        })();
-        if result.is_err() {
+        let result =
+            self.invalidate_cache_raw(CacheInvalidation::ContextDevice(device.source_id()), true);
+        if result.is_err() && result != Err(IommuError::WouldBlock) {
             self.cache_poisoned.store(true, Ordering::Release);
         }
         result
     }
 
     fn invalidate_context_device_raw(&self, device: &PciDeviceId) -> IommuResult<()> {
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-
-        let _cmd = self.cmd_lock.lock();
-        let result = (|| {
-            self.wait_context_complete()?;
-
-            // Build context invalidation command for device granularity
-            // CIRG = 11b (device), SID = source_id, FM = 0 (exact match)
-            let source_id = device.source_id() as u64;
-            let cmd = CCMD_ICC | CCMD_CIRG_DEVICE | (source_id << 16);
-
-            // Write to context command register
-            unsafe {
-                Self::write_reg64(self.reg_base, VTD_REG_CCMD, cmd);
-            }
-
-            // Wait for THIS command's completion (ICC bit clears)
-            self.wait_context_complete()
-        })();
-        result
+        self.invalidate_cache_raw(CacheInvalidation::ContextDevice(device.source_id()), false)
     }
 
     fn invalidate_context_global_raw(&self) -> IommuResult<()> {
-        if !self.translation_enabled.load(Ordering::Acquire) {
-            return Err(IommuError::NotInitialized);
-        }
-
-        let _cmd = self.cmd_lock.lock();
-        let result = (|| {
-            self.wait_context_complete()?;
-            unsafe {
-                Self::write_reg64(self.reg_base, VTD_REG_CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
-            }
-            self.wait_context_complete()
-        })();
-        result
+        self.invalidate_cache_raw(CacheInvalidation::ContextGlobal, false)
     }
 
     /// Wait for context cache invalidation to complete.
@@ -2746,6 +2889,11 @@ impl VtdUnit {
             Self::write_reg32(self.reg_base, VTD_REG_GCMD, gcmd);
         }
 
+        #[cfg(feature = "init_probe")]
+        if init_probes::reject_ack(self.reg_base, &update, &ack) {
+            return Err(VtdError::HardwareTimeout);
+        }
+
         match ack {
             GcmdAck::Set(bit) => self.wait_status(bit),
             GcmdAck::Clear(bit) => self.wait_status_clear(bit),
@@ -2840,7 +2988,7 @@ impl VtdUnit {
         let table = slot.as_ref()?.clone();
         let _cmd_guard = self.cmd_lock.lock();
         let gsts = unsafe { Self::read_reg32(self.reg_base, VTD_REG_GSTS) };
-        if gsts & GSTS_IRES == 0 || gsts & GSTS_QIES == 0 {
+        if gsts & GSTS_IRES == 0 || gsts & GSTS_QIES == 0 || gsts & GSTS_IRTPS == 0 {
             self.ir_poisoned.store(true, Ordering::Release);
             self.qi_poisoned.store(true, Ordering::Release);
             return None;
@@ -2977,7 +3125,7 @@ mod tests {
 
     fn test_fault(source_id: u16) -> (FaultRecord, u64, u64) {
         let lo = 0x4000;
-        let hi = (1u64 << 63) | u64::from(source_id) | (5u64 << 52);
+        let hi = (1u64 << 63) | u64::from(source_id) | (5u64 << 32);
         (
             FaultRecord::from_raw(lo, hi).expect("valid test FRCD"),
             lo,
@@ -3072,11 +3220,44 @@ mod tests {
     fn rf180_qi_completion_requires_an_exact_legal_head() {
         assert_eq!(qi_decode_pointer(0x20), Some(0x20));
         assert_eq!(qi_decode_pointer(0x1000), None);
-        assert!(qi_poll_head_exact(0x20, || 0x20));
-        assert!(!qi_poll_head_exact(0x20, || 0x30));
+        assert!(qi_poll_completion(0x20, 1, || (0x20, 1, 0)));
+        assert!(!qi_poll_completion(0x20, 1, || (0x30, 1, 0)));
         // A larger architectural pointer must not be truncated into a false
         // match for this 4 KiB queue.
-        assert!(!qi_poll_head_exact(0, || 0x1000));
+        assert!(!qi_poll_completion(0, 1, || (0x1000, 1, 0)));
+    }
+
+    #[test]
+    fn p3_qi_head_without_status_write_or_with_error_never_completes() {
+        assert!(!qi_poll_completion(32, 7, || (32, 0, 0)));
+        assert!(!qi_poll_completion(32, 7, || (32, 6, 0)));
+        assert!(!qi_poll_completion(32, 7, || (32, 7, 0x10)));
+        let mut polls = 0;
+        assert!(qi_poll_completion(32, 7, || {
+            polls += 1;
+            (32, if polls > 2 { 7 } else { 0 }, 0)
+        }));
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn p3_qi_descriptors_match_legacy_raw_words() {
+        assert_eq!(
+            CacheInvalidation::ContextDevice(0x28).descriptor().lo,
+            0x0000_0028_0000_0031
+        );
+        assert_eq!(CacheInvalidation::ContextGlobal.descriptor().lo, 0x11);
+        assert_eq!(
+            CacheInvalidation::IotlbDomain(0x1234).descriptor().lo,
+            0x1234_00e2
+        );
+        assert_eq!(CacheInvalidation::IotlbGlobal.descriptor().lo, 0xd2);
+        let wait = QiDescriptor::wait(0x1234_5000, 7);
+        assert_eq!((wait.lo, wait.hi), (0x0000_0007_0000_0065, 0x1234_5000));
+        assert_eq!(
+            gsts_to_gcmd(GSTS_IRTPS | GSTS_IRES | GSTS_QIES),
+            GCMD_IRE | GCMD_QIE
+        );
     }
 
     #[test]

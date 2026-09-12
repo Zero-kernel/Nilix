@@ -35,7 +35,7 @@
 //! - **Fail-closed**: If DMAR requires IR but hardware lacks support, fail initialization
 //! - **Source ID validation**: Each IRTE is bound to a specific PCI Source ID
 //! - **Vector isolation**: Devices can only trigger vectors assigned to them
-//! - **x2APIC support**: Extended Interrupt Mode (EIM) for x2APIC destinations
+//! - **Legacy xAPIC destinations**: current setup programs EIME=0
 //!
 //! # References
 //!
@@ -107,22 +107,22 @@ pub const DELIVERY_EXTINT: u64 = 7;
 /// Vector shift (bits 16-23).
 const IRTE_VECTOR_SHIFT: u64 = 16;
 
-/// Source ID (Requester ID) shift (bits 32-47).
-const IRTE_SID_SHIFT: u64 = 32;
+/// Source ID (Requester ID), high qword bits 15:0.
+const IRTE_SID_SHIFT: u64 = 0;
 
-/// Source ID Qualifier (bits 48-49).
+/// Source ID Qualifier (high qword bits 17:16).
 /// 00 = Verify full Source ID
 /// 01 = Verify Source ID up to function mask
 /// 10 = All Source IDs match
 /// 11 = Reserved
-const IRTE_SQ_SHIFT: u64 = 48;
+const IRTE_SQ_SHIFT: u64 = 16;
 
-/// Source Validation Type (bits 50-51).
+/// Source Validation Type (high qword bits 19:18).
 /// 00 = Reserved
 /// 01 = Verify using IRTE.SID and IRTE.SQ
 /// 10 = Reserved
 /// 11 = Reserved
-const IRTE_SVT_VERIFY_SID: u64 = 1 << 50;
+const IRTE_SVT_VERIFY_SID: u64 = 1 << 18;
 
 // ============================================================================
 // IRTE Structure
@@ -145,14 +145,13 @@ const IRTE_SVT_VERIFY_SID: u64 = 1 << 50;
 /// - [15:8]: Reserved (must be 0)
 /// - [23:16]: Vector
 /// - [31:24]: Reserved (must be 0)
-/// - [47:32]: Source ID (Requester ID)
-/// - [49:48]: Source ID Qualifier
-/// - [51:50]: Source Validation Type
-/// - [63:52]: Reserved (must be 0)
+/// - [63:32]: Destination ID (xAPIC ID in field bits 15:8 when EIME=0)
 ///
 /// High 64 bits:
-/// - [31:0]: Reserved (must be 0)
-/// - [63:32]: Destination ID (APIC ID, or x2APIC ID if EIM)
+/// - [15:0]: Source ID (Requester ID)
+/// - [17:16]: Source ID Qualifier
+/// - [19:18]: Source Validation Type
+/// - [63:20]: Reserved (must be 0 in this legacy format)
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct Irte {
@@ -180,13 +179,17 @@ impl Irte {
     /// # Arguments
     ///
     /// * `vector` - Interrupt vector (0-255)
-    /// * `dest_apic_id` - Destination APIC ID (or x2APIC ID)
+    /// * `dest_apic_id` - Legacy xAPIC destination (0-255; EIME=0)
     /// * `source_id` - PCI Source ID (bus << 8 | dev << 3 | func)
     ///
     /// # Returns
     ///
     /// Configured IRTE for edge-triggered, fixed delivery
     pub fn new_msi(vector: u8, dest_apic_id: u32, source_id: u16) -> Self {
+        assert!(
+            dest_apic_id <= 255,
+            "legacy IRTE requires an xAPIC destination"
+        );
         let mut irte = Self::empty();
 
         // Set present
@@ -199,11 +202,11 @@ impl Irte {
         irte.lo |= DELIVERY_FIXED << IRTE_DLVR_SHIFT;
 
         // Set source ID and enable verification
-        irte.lo |= (source_id as u64) << IRTE_SID_SHIFT;
-        irte.lo |= IRTE_SVT_VERIFY_SID;
+        irte.hi |= (source_id as u64) << IRTE_SID_SHIFT;
+        irte.hi |= IRTE_SVT_VERIFY_SID;
 
         // Set destination APIC ID
-        irte.hi |= (dest_apic_id as u64) << 32;
+        irte.lo |= (dest_apic_id as u64) << 40;
 
         irte
     }
@@ -266,13 +269,13 @@ impl Irte {
     /// Get the source ID from this IRTE.
     #[inline]
     pub fn source_id(&self) -> u16 {
-        ((self.lo >> IRTE_SID_SHIFT) & 0xFFFF) as u16
+        ((self.hi >> IRTE_SID_SHIFT) & 0xFFFF) as u16
     }
 
     /// Get the destination APIC ID from this IRTE.
     #[inline]
     pub fn dest_apic_id(&self) -> u32 {
-        (self.hi >> 32) as u32
+        ((self.lo >> 40) & 0xff) as u32
     }
 }
 
@@ -655,8 +658,9 @@ impl IrteHandle {
     /// Returns the value to program into the device's MSI data register
     /// when using interrupt remapping format.
     pub fn msi_data(&self) -> u32 {
-        // Remappable format: subhandle in bits [15:0], format bit [4] = 1
-        ((self.index as u32) & 0x7FFF) | (1 << 4)
+        // SHV=1: this is the subhandle added to the address's IRTE index.
+        // A single-vector handle uses subhandle zero.
+        0
     }
 
     /// Get the interrupt remapping format MSI address (low 32 bits).
@@ -664,7 +668,7 @@ impl IrteHandle {
     /// Returns the value to program into the device's MSI address register.
     pub fn msi_address_lo(&self) -> u32 {
         // Remappable format:
-        // [1:0] = 11 (fixed)
+        // [1:0] = 00 (reserved)
         // [2] = handle[15] (high bit of 16-bit handle)
         // [3] = SHV (subhandle valid) = 1
         // [4] = interrupt format = 1 (remappable)
@@ -674,7 +678,11 @@ impl IrteHandle {
         let handle_hi = (handle >> 15) & 1;
         let handle_lo = handle & 0x7FFF;
 
-        0xFEE00000 | (handle_lo << 5) | (1 << 4) | (1 << 3) | (handle_hi << 2) | 0x3
+        assert!(
+            self.index < MAX_IR_ENTRIES,
+            "MSI handle exceeds legacy index width"
+        );
+        0xFEE00000 | (handle_lo << 5) | (1 << 4) | (1 << 3) | (handle_hi << 2)
     }
 
     /// Get the MSI address high 32 bits (always 0 for standard MSI).
@@ -704,5 +712,33 @@ mod tests {
     fn test_irte_empty() {
         let irte = Irte::empty();
         assert!(!irte.is_present());
+    }
+
+    #[test]
+    fn p3_legacy_irte_literal_words_include_nonzero_destination_and_sid() {
+        let entry = Irte::new_msi(0x31, 0xab, 0x1234);
+        assert_eq!((entry.lo, entry.hi), (0x0000_ab00_0031_0001, 0x0004_1234));
+        let decoded = Irte {
+            lo: 0x0000_0200_0030_0001,
+            hi: 0x0004_0028,
+        };
+        assert_eq!(decoded.vector(), 0x30);
+        assert_eq!(decoded.source_id(), 0x28);
+        assert_eq!(decoded.dest_apic_id(), 2);
+    }
+
+    #[test]
+    fn p3_remappable_msi_literal_words_do_not_add_index_twice() {
+        for (index, address) in [
+            (0, 0xfee0_0018),
+            (1, 0xfee0_0038),
+            (0x8000, 0xfee0_001c),
+            (0xffff, 0xfeef_fffc),
+        ] {
+            let handle = IrteHandle::new(index, 0x28, 0x31);
+            assert_eq!(handle.msi_address_lo(), address);
+            assert_eq!(handle.msi_address_hi(), 0);
+            assert_eq!(handle.msi_data(), 0);
+        }
     }
 }

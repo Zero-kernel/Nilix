@@ -101,6 +101,10 @@ pub enum FaultReason {
     ReadNotPermitted,
     /// Page table entry invalid.
     PageEntryInvalid,
+    /// Root table memory could not be read.
+    RootTableInvalid,
+    /// Context table memory could not be read.
+    ContextTableInvalid,
     /// Root table entry reserved bit set.
     RootEntryReserved,
     /// Context entry reserved bit set.
@@ -125,10 +129,12 @@ impl FaultReason {
             0x5 => Self::WriteToReadOnly,
             0x6 => Self::ReadNotPermitted,
             0x7 => Self::PageEntryInvalid,
-            0x8 => Self::RootEntryReserved,
-            0x9 => Self::ContextEntryReserved,
-            0xA => Self::PageEntryReserved,
-            0xB => Self::InvalidTranslationType,
+            0x8 => Self::RootTableInvalid,
+            0x9 => Self::ContextTableInvalid,
+            0xA => Self::RootEntryReserved,
+            0xB => Self::ContextEntryReserved,
+            0xC => Self::PageEntryReserved,
+            0xD => Self::InvalidTranslationType,
             other => Self::Unknown(other),
         }
     }
@@ -204,21 +210,24 @@ impl FaultRecord {
             return None;
         }
         let source_id = (hi & 0xFFFF) as u16;
-        let is_execute = (hi >> 23) & 1 != 0;
-        let pasid_present = (hi >> 24) & 1 != 0;
-        let fault_type_bits = ((hi >> 28) & 0x3) | (((hi >> 21) & 1) << 2);
-        let pasid = ((hi >> 32) & 0xFFFFF) as u32;
-        let fault_reason = FaultReason::from_code(((hi >> 52) & 0xFF) as u8);
+        // P3-2-F4: supported legacy FRCD has FR at 39:32 and T at 62.
+        // Scalable PASID/execute fields are not part of the accepted format.
+        let reason = ((hi >> 32) & 0xFF) as u8;
+        let fault_reason = FaultReason::from_code(reason);
         Some(Self {
             source_id,
             domain_id: 0,
             fault_reason,
             fault_address: lo & !0xFFF,
-            fault_type: FaultType::from_code(fault_type_bits as u8),
-            is_write: matches!(fault_reason, FaultReason::WriteToReadOnly),
-            is_execute,
-            pasid_present,
-            pasid,
+            fault_type: if (0x20..=0x26).contains(&reason) {
+                FaultType::InterruptRemap
+            } else {
+                FaultType::Primary
+            },
+            is_write: hi & (1 << 62) == 0,
+            is_execute: false,
+            pasid_present: false,
+            pasid: 0,
         })
     }
 
@@ -600,7 +609,7 @@ mod tests {
     fn raw_fault(source_id: u16) -> (u64, u64) {
         (
             0x1234_5000,
-            (1u64 << 63) | u64::from(source_id) | (5u64 << 52),
+            (1u64 << 63) | u64::from(source_id) | (5u64 << 32),
         )
     }
 
@@ -615,6 +624,50 @@ mod tests {
             FaultReason::from_code(0xFF),
             FaultReason::Unknown(0xFF)
         ));
+    }
+
+    #[test]
+    fn p3_legacy_frcd_literal_records_decode_direction_independently_of_reason() {
+        for (hi, reason, write) in [
+            (0x8000_0005_0000_0028, FaultReason::WriteToReadOnly, true),
+            (0xc000_0006_0000_0028, FaultReason::ReadNotPermitted, false),
+            (
+                0x8000_0002_0000_0028,
+                FaultReason::ContextEntryNotPresent,
+                true,
+            ),
+            (
+                0xc000_0002_0000_0028,
+                FaultReason::ContextEntryNotPresent,
+                false,
+            ),
+        ] {
+            let record = FaultRecord::from_raw(0x1234_5678, hi).unwrap();
+            assert_eq!(record.source_id, 0x28);
+            assert_eq!(record.fault_address, 0x1234_5000);
+            assert_eq!(record.fault_reason, reason);
+            assert_eq!(record.is_write, write);
+            assert_eq!(record.fault_type, FaultType::Primary);
+            assert!(!record.pasid_present && !record.is_execute);
+            assert_eq!(record.pasid, 0);
+        }
+        assert!(FaultRecord::from_raw(0, 0x4000_0006_0000_0028).is_none());
+        assert_eq!(
+            FaultRecord::from_raw(0, 0x8000_0022_0000_0028)
+                .unwrap()
+                .fault_type,
+            FaultType::InterruptRemap
+        );
+        for (code, reason) in [
+            (8, FaultReason::RootTableInvalid),
+            (9, FaultReason::ContextTableInvalid),
+            (10, FaultReason::RootEntryReserved),
+            (11, FaultReason::ContextEntryReserved),
+            (12, FaultReason::PageEntryReserved),
+            (13, FaultReason::InvalidTranslationType),
+        ] {
+            assert_eq!(FaultReason::from_code(code), reason);
+        }
     }
 
     #[test]
