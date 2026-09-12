@@ -52,6 +52,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use mm::{arc_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
 use spin::{Lazy, RwLock};
 
+use crate::mount_namespace::namespace_accounting::{
+    NamespaceCountPermit, NamespaceCreateContext, NamespaceCreateError, NamespaceCreateStage,
+};
 use crate::{FileDescriptor, FileOps, SyscallError, VfsStat};
 
 // ============================================================================
@@ -246,55 +249,6 @@ enum MappingKind {
     Gid,
 }
 
-/// RAII guard for atomic namespace count management.
-///
-/// Ensures the namespace count is decremented if creation fails,
-/// preventing count leaks on error paths.
-///
-/// Uses CAS loop to avoid race conditions where multiple concurrent
-/// creators could exceed MAX_USER_NS_COUNT.
-struct NsCountGuard {
-    committed: bool,
-}
-
-impl NsCountGuard {
-    /// Try to increment the namespace count, returning an error if at limit.
-    ///
-    /// Uses compare_exchange loop to atomically check and increment,
-    /// preventing TOCTOU race conditions that could exceed the limit.
-    fn try_new() -> Result<Self, UserNsError> {
-        loop {
-            let current = USER_NS_COUNT.load(Ordering::SeqCst);
-            if current >= MAX_USER_NS_COUNT {
-                return Err(UserNsError::MaxNamespaces);
-            }
-            // Try to atomically increment from current to current+1
-            match USER_NS_COUNT.compare_exchange(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Ok(Self { committed: false }),
-                Err(_) => continue, // Another thread modified count, retry
-            }
-        }
-    }
-
-    /// Mark the guard as committed (namespace successfully created).
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for NsCountGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            USER_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
 // ============================================================================
 // User Namespace
 // ============================================================================
@@ -329,6 +283,8 @@ pub struct UserNamespace {
     /// Flag indicating GID map has been written (single-write semantics).
     gid_map_set: AtomicBool,
 
+    _count_permit: Option<NamespaceCountPermit>,
+
     /// Exact heap charge for the namespace Arc allocation.
     _arc_heap_charge: Option<HeapCharge>,
 }
@@ -361,6 +317,7 @@ impl UserNamespace {
             // Root mapping is implicitly fixed (identity)
             uid_map_set: AtomicBool::new(true),
             gid_map_set: AtomicBool::new(true),
+            _count_permit: None,
             _arc_heap_charge: None,
         }
     }
@@ -380,40 +337,55 @@ impl UserNamespace {
     /// * `MaxDepthExceeded` - Maximum nesting depth reached
     /// * `MaxNamespaces` - System-wide namespace limit reached
     pub fn new_child(parent: Arc<UserNamespace>) -> Result<Arc<Self>, UserNsError> {
+        Self::new_child_with_context(
+            parent,
+            &NamespaceCreateContext::new(&USER_NS_COUNT, &NEXT_USER_NS_ID, MAX_USER_NS_COUNT),
+        )
+    }
+
+    fn new_child_with_context(
+        parent: Arc<UserNamespace>,
+        context: &NamespaceCreateContext,
+    ) -> Result<Arc<Self>, UserNsError> {
         // Check depth limit
         if parent.level >= MAX_USER_NS_LEVEL {
             return Err(UserNsError::MaxDepthExceeded);
         }
 
-        // Check and increment namespace count atomically
-        let guard = NsCountGuard::try_new()?;
+        let (count_permit, id) = context.reserve_id().map_err(|error| match error {
+            NamespaceCreateError::MaxCount => UserNsError::MaxNamespaces,
+            NamespaceCreateError::IdOverflow => UserNsError::NamespaceIdOverflow,
+        })?;
 
-        // Allocate unique ID (R112-2: overflow-safe allocation)
-        let id = NEXT_USER_NS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| {
-                // guard will auto-rollback on drop (R77-5 pattern)
-                UserNsError::NamespaceIdOverflow
-            })?;
-
+        context
+            .check(NamespaceCreateStage::ArcLayout)
+            .map_err(|_| UserNsError::OutOfMemory)?;
         let arc_bytes =
             arc_charge_bytes::<UserNamespace>().map_err(|_| UserNsError::OutOfMemory)?;
+        context
+            .check(NamespaceCreateStage::HeapReserve)
+            .map_err(|_| UserNsError::OutOfMemory)?;
         let arc_reservation = try_reserve_heap(HeapClass::CoreProcess, arc_bytes)
             .map_err(|_| UserNsError::OutOfMemory)?;
-        let mut child = Arc::try_new(Self {
-            id: NamespaceId::new(id),
-            parent: Some(parent.clone()),
-            level: parent.level.saturating_add(1),
-            refcount: AtomicU32::new(1),
-            uid_map: RwLock::new(Vec::new()),
-            gid_map: RwLock::new(Vec::new()),
-            // Child starts with unset mappings
-            uid_map_set: AtomicBool::new(false),
-            gid_map_set: AtomicBool::new(false),
-            _arc_heap_charge: None,
-        })
-        .map_err(|_| UserNsError::OutOfMemory)?;
+        let mut child = context
+            .try_arc(Self {
+                id: NamespaceId::new(id),
+                parent: Some(parent.clone()),
+                level: parent.level.saturating_add(1),
+                refcount: AtomicU32::new(1),
+                uid_map: RwLock::new(Vec::new()),
+                gid_map: RwLock::new(Vec::new()),
+                // Child starts with unset mappings
+                uid_map_set: AtomicBool::new(false),
+                gid_map_set: AtomicBool::new(false),
+                _count_permit: Some(count_permit),
+                _arc_heap_charge: None,
+            })
+            .map_err(|_| UserNsError::OutOfMemory)?;
 
+        context
+            .check(NamespaceCreateStage::HeapCommit)
+            .map_err(|_| UserNsError::OutOfMemory)?;
         let charge = arc_reservation
             .commit()
             .map_err(|_| UserNsError::OutOfMemory)?;
@@ -421,10 +393,15 @@ impl UserNamespace {
             .expect("fresh user namespace Arc must be unique")
             ._arc_heap_charge = Some(charge);
 
-        // Commit the count increment (won't be rolled back)
-        guard.commit();
-
         Ok(child)
+    }
+
+    #[cfg(feature = "namespace_probe")]
+    pub(crate) fn probe_child(context: NamespaceCreateContext) -> Result<Arc<Self>, UserNsError> {
+        Self::new_child_with_context(
+            ROOT_USER_NAMESPACE.clone(),
+            &context.with_id_source(&NEXT_USER_NS_ID),
+        )
     }
 
     /// Get namespace identifier.
@@ -972,15 +949,6 @@ fn range_within_parent(
     false
 }
 
-impl Drop for UserNamespace {
-    fn drop(&mut self) {
-        // Decrement global count for non-root namespaces
-        if self.level > 0 {
-            USER_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
 // ============================================================================
 // Public API
 // ============================================================================
@@ -1124,8 +1092,47 @@ impl FileOps for UserNamespaceFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mount_namespace::namespace_accounting::tests::{
+        check_concurrent, check_constructor, check_depth,
+    };
     use alloc::vec;
 
+    #[test]
+    fn ksa003_user_constructor_failures_and_lifetime() {
+        let root = Arc::new(UserNamespace::new_root());
+        check_constructor(
+            |context| UserNamespace::new_child_with_context(Arc::clone(&root), context),
+            UserNsError::OutOfMemory,
+            UserNsError::MaxNamespaces,
+            UserNsError::NamespaceIdOverflow,
+            &[
+                NamespaceCreateStage::ArcLayout,
+                NamespaceCreateStage::HeapReserve,
+                NamespaceCreateStage::ArcAllocation,
+                NamespaceCreateStage::HeapCommit,
+            ],
+        );
+        assert_eq!(Arc::strong_count(&root), 1);
+    }
+
+    #[test]
+    fn ksa003_user_depth_retains_and_releases_parents() {
+        check_depth(
+            Arc::new(UserNamespace::new_root()),
+            MAX_USER_NS_LEVEL,
+            UserNamespace::new_child_with_context,
+            UserNsError::MaxDepthExceeded,
+        );
+    }
+
+    #[test]
+    fn ksa003_user_concurrent_limit() {
+        let root = Arc::new(UserNamespace::new_root());
+        check_concurrent(|context| {
+            UserNamespace::new_child_with_context(Arc::clone(&root), context)
+        });
+        assert_eq!(Arc::strong_count(&root), 1);
+    }
     #[test]
     fn test_root_namespace_identity() {
         let root = ROOT_USER_NAMESPACE.clone();

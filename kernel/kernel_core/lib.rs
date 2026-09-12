@@ -69,6 +69,8 @@ pub use mm::fallible_map;
 pub mod fork;
 pub mod ipc_namespace;
 pub mod mount_namespace;
+#[cfg(feature = "namespace_probe")]
+pub mod namespace_probe;
 pub mod net_namespace;
 pub mod pid_namespace;
 pub mod poll;

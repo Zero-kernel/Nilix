@@ -207,11 +207,15 @@ impl NsCountGuard {
     ///
     /// Returns error if the count would exceed the limit.
     fn new(counter: &'static AtomicU32, max_count: u32) -> Result<Self, NetNsError> {
-        let prev = counter.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (count guard with immediate rollback)
-        if prev >= max_count {
-            counter.fetch_sub(1, Ordering::SeqCst);
-            return Err(NetNsError::MaxNamespaces);
-        }
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count < max_count {
+                    count.checked_add(1)
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| NetNsError::MaxNamespaces)?;
         Ok(Self {
             counter,
             committed: false,
@@ -1048,6 +1052,54 @@ pub fn test_is_net_ns_initialized() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ksa003_net_guard_rejection_and_rollback() {
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        static FULL: AtomicU32 = AtomicU32::new(u32::MAX);
+        let guard = NsCountGuard::new(&COUNTER, 2).unwrap();
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            NsCountGuard::new(&COUNTER, 2),
+            Err(NetNsError::MaxNamespaces)
+        ));
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+        drop(guard);
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            NsCountGuard::new(&FULL, u32::MAX),
+            Err(NetNsError::MaxNamespaces)
+        ));
+        assert_eq!(FULL.load(Ordering::SeqCst), u32::MAX);
+    }
+
+    #[test]
+    fn ksa003_net_guard_concurrent_limit() {
+        extern crate std;
+        use std::sync::Barrier;
+        use std::thread;
+
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        let barrier = Barrier::new(17);
+        thread::scope(|scope| {
+            for _worker in 0..16 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let guard = NsCountGuard::new(&COUNTER, 4);
+                    barrier.wait();
+                    barrier.wait();
+                    drop(guard);
+                });
+            }
+            barrier.wait();
+            barrier.wait();
+            let count = COUNTER.load(Ordering::SeqCst);
+            barrier.wait();
+            assert_eq!(count, 4);
+        });
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_root_namespace() {

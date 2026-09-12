@@ -32,6 +32,12 @@ use spin::RwLock;
 
 use crate::process::{FileDescriptor, FileOps};
 
+#[path = "namespace_accounting.rs"]
+pub(crate) mod namespace_accounting;
+use namespace_accounting::{
+    NamespaceCountPermit, NamespaceCreateContext, NamespaceCreateError, NamespaceCreateStage,
+};
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -134,7 +140,7 @@ pub struct MountNamespace {
     /// Root mount path for this namespace (usually "/")
     root_path: RwLock<AdmittedString>,
 
-    counted: bool,
+    _count_permit: Option<NamespaceCountPermit>,
 
     /// Lifetime charge for this namespace's Arc allocation.
     _arc_heap_charge: Option<HeapCharge>,
@@ -151,67 +157,64 @@ impl MountNamespace {
                 AdmittedString::try_from_str(HeapClass::CoreProcess, "/")
                     .expect("root mount namespace path admission"),
             ),
-            counted: false,
+            _count_permit: None,
             _arc_heap_charge: None,
         }
     }
 
     /// Create a new child namespace.
     pub fn new_child(parent: Arc<MountNamespace>) -> Result<Arc<Self>, MountNsError> {
+        Self::new_child_with_context(
+            parent,
+            &NamespaceCreateContext::new(&MNT_NS_COUNT, &NEXT_MNT_NS_ID, MAX_MNT_NS_COUNT),
+        )
+    }
+
+    fn new_child_with_context(
+        parent: Arc<MountNamespace>,
+        context: &NamespaceCreateContext,
+    ) -> Result<Arc<Self>, MountNsError> {
         if parent.level >= MAX_MNT_NS_LEVEL {
             return Err(MountNsError::MaxDepthExceeded);
         }
 
-        // R140-3 FIX: Enforce system-wide mount namespace count limit.
-        // CAS loop: atomically increment count only if below MAX_MNT_NS_COUNT.
-        MNT_NS_COUNT
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                if count >= MAX_MNT_NS_COUNT {
-                    None // Reject — limit exceeded
-                } else {
-                    Some(count + 1)
-                }
-            })
-            .map_err(|_| MountNsError::MaxCountExceeded)?;
-
-        let id = NEXT_MNT_NS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| {
-                // R140-3 FIX: Rollback count increment on ID allocation failure.
-                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-                MountNsError::NoMemory
-            })?;
+        let (count_permit, id) = context.reserve_id().map_err(|error| match error {
+            NamespaceCreateError::MaxCount => MountNsError::MaxCountExceeded,
+            NamespaceCreateError::IdOverflow => MountNsError::NoMemory,
+        })?;
 
         // RF180-16 FIX: clone the path through admitted storage and reserve
         // the namespace Arc before either allocation becomes public.
+        context
+            .check(NamespaceCreateStage::RootPath)
+            .map_err(|_| MountNsError::NoMemory)?;
         let root_path = {
             let path = parent.root_path.read();
-            AdmittedString::try_from_str(HeapClass::CoreProcess, path.as_str()).map_err(|_| {
-                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-                MountNsError::NoMemory
-            })?
+            AdmittedString::try_from_str(HeapClass::CoreProcess, path.as_str())
+                .map_err(|_| MountNsError::NoMemory)?
         };
-        let arc_bytes = arc_charge_bytes::<MountNamespace>().map_err(|_| {
-            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-            MountNsError::NoMemory
-        })?;
-        let arc_reservation =
-            try_reserve_heap(HeapClass::CoreProcess, arc_bytes).map_err(|_| {
-                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-                MountNsError::NoMemory
-            })?;
-        let mut child = Arc::try_new(Self {
-            id: NamespaceId::new(id),
-            parent: Some(Arc::clone(&parent)),
-            level: parent.level.saturating_add(1),
-            root_path: RwLock::new(root_path),
-            counted: true,
-            _arc_heap_charge: None,
-        })
-        .map_err(|_| {
-            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-            MountNsError::NoMemory
-        })?;
+        context
+            .check(NamespaceCreateStage::ArcLayout)
+            .map_err(|_| MountNsError::NoMemory)?;
+        let arc_bytes = arc_charge_bytes::<MountNamespace>().map_err(|_| MountNsError::NoMemory)?;
+        context
+            .check(NamespaceCreateStage::HeapReserve)
+            .map_err(|_| MountNsError::NoMemory)?;
+        let arc_reservation = try_reserve_heap(HeapClass::CoreProcess, arc_bytes)
+            .map_err(|_| MountNsError::NoMemory)?;
+        let mut child = context
+            .try_arc(Self {
+                id: NamespaceId::new(id),
+                parent: Some(Arc::clone(&parent)),
+                level: parent.level.saturating_add(1),
+                root_path: RwLock::new(root_path),
+                _count_permit: Some(count_permit),
+                _arc_heap_charge: None,
+            })
+            .map_err(|_| MountNsError::NoMemory)?;
+        context
+            .check(NamespaceCreateStage::HeapCommit)
+            .map_err(|_| MountNsError::NoMemory)?;
         let charge = arc_reservation
             .commit()
             .map_err(|_| MountNsError::NoMemory)?;
@@ -220,6 +223,14 @@ impl MountNamespace {
             ._arc_heap_charge = Some(charge);
 
         Ok(child)
+    }
+
+    #[cfg(feature = "namespace_probe")]
+    pub(crate) fn probe_child(context: NamespaceCreateContext) -> Result<Arc<Self>, MountNsError> {
+        Self::new_child_with_context(
+            ROOT_MNT_NAMESPACE.clone(),
+            &context.with_id_source(&NEXT_MNT_NS_ID),
+        )
     }
 
     /// Get the namespace identifier.
@@ -261,18 +272,6 @@ impl MountNamespace {
         let old = core::mem::replace(&mut *self.root_path.write(), replacement);
         drop(old);
         Ok(())
-    }
-}
-
-/// R140-3 FIX: Decrement mount namespace count when a namespace is dropped.
-/// This ensures the count stays accurate as namespaces are destroyed,
-/// allowing new namespaces to be created up to the MAX_MNT_NS_COUNT limit.
-impl Drop for MountNamespace {
-    fn drop(&mut self) {
-        // Don't decrement for root namespace (it's counted in the initial value)
-        if self.counted {
-            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-        }
     }
 }
 
@@ -379,5 +378,50 @@ impl FileOps for MountNamespaceFd {
 
     fn type_name(&self) -> &'static str {
         "mount_namespace_fd"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use namespace_accounting::tests::{check_concurrent, check_constructor, check_depth};
+
+    #[test]
+    fn ksa003_mount_constructor_failures_and_lifetime() {
+        let root = Arc::new(MountNamespace::new_root());
+        check_constructor(
+            |context| MountNamespace::new_child_with_context(Arc::clone(&root), context),
+            MountNsError::NoMemory,
+            MountNsError::MaxCountExceeded,
+            MountNsError::NoMemory,
+            &[
+                NamespaceCreateStage::RootPath,
+                NamespaceCreateStage::ArcLayout,
+                NamespaceCreateStage::HeapReserve,
+                NamespaceCreateStage::ArcAllocation,
+                NamespaceCreateStage::HeapCommit,
+            ],
+        );
+        assert_eq!(Arc::strong_count(&root), 1);
+        assert_eq!(root.root_path().unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn ksa003_mount_depth_retains_and_releases_parents() {
+        check_depth(
+            Arc::new(MountNamespace::new_root()),
+            MAX_MNT_NS_LEVEL,
+            MountNamespace::new_child_with_context,
+            MountNsError::MaxDepthExceeded,
+        );
+    }
+
+    #[test]
+    fn ksa003_mount_concurrent_limit() {
+        let root = Arc::new(MountNamespace::new_root());
+        check_concurrent(|context| {
+            MountNamespace::new_child_with_context(Arc::clone(&root), context)
+        });
+        assert_eq!(Arc::strong_count(&root), 1);
     }
 }

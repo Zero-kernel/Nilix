@@ -30,6 +30,9 @@
 
 extern crate alloc;
 
+use crate::mount_namespace::namespace_accounting::{
+    NamespaceCountPermit, NamespaceCreateContext, NamespaceCreateError, NamespaceCreateStage,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use cap::NamespaceId;
@@ -82,72 +85,6 @@ pub enum IpcNsError {
 }
 
 // ============================================================================
-// R77-5 FIX: Namespace Count Guard
-// ============================================================================
-
-/// Guard for atomic namespace count management.
-///
-/// # R77-5 FIX
-///
-/// This guard ensures that the global namespace count is correctly maintained
-/// even if `Arc::new()` fails (OOM) after the count has been incremented.
-/// The guard automatically decrements the count on drop unless `commit()` is called.
-///
-/// ## Problem
-///
-/// Previously, the count was incremented before `Arc::new()`:
-/// ```ignore
-/// let prev = IPC_NS_COUNT.fetch_add(1, ...);  // Count incremented
-/// let child = Arc::new(Self { ... });          // If OOM here, count leaks!
-/// ```
-///
-/// ## Solution
-///
-/// Use RAII pattern to ensure automatic rollback:
-/// ```ignore
-/// let guard = NsCountGuard::new(&IPC_NS_COUNT)?;  // Count incremented
-/// let child = Arc::new(Self { ... });              // If OOM, guard drops and rolls back
-/// guard.commit();                                  // Success - prevent rollback
-/// ```
-struct NsCountGuard {
-    counter: &'static AtomicU32,
-    committed: bool,
-}
-
-impl NsCountGuard {
-    /// Create a new guard, incrementing the counter.
-    ///
-    /// Returns error if the count would exceed the limit.
-    fn new(counter: &'static AtomicU32, max_count: u32) -> Result<Self, IpcNsError> {
-        let prev = counter.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (count guard with immediate rollback)
-        if prev >= max_count {
-            counter.fetch_sub(1, Ordering::SeqCst);
-            return Err(IpcNsError::MaxNamespaces);
-        }
-        Ok(Self {
-            counter,
-            committed: false,
-        })
-    }
-
-    /// Commit the count increment, preventing rollback on drop.
-    ///
-    /// Call this after the namespace has been successfully created.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for NsCountGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Allocation failed - roll back the count increment
-            self.counter.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-// ============================================================================
 // Global State
 // ============================================================================
 
@@ -188,6 +125,8 @@ pub struct IpcNamespace {
     /// Next available IPC key within this namespace
     next_key: AtomicU64,
 
+    _count_permit: Option<NamespaceCountPermit>,
+
     /// Exact heap charge for the namespace Arc allocation.
     _arc_heap_charge: Option<HeapCharge>,
 }
@@ -211,47 +150,58 @@ impl IpcNamespace {
             level: 0,
             refcount: AtomicU32::new(1),
             next_key: AtomicU64::new(1),
+            _count_permit: None,
             _arc_heap_charge: None,
         }
     }
 
     /// Create a new child namespace.
     ///
-    /// # R77-5 FIX
-    ///
-    /// Uses `NsCountGuard` to ensure the global namespace count is correctly
-    /// maintained even if `Arc::new()` fails (OOM). The guard automatically
-    /// rolls back the count increment on failure.
+    /// The payload owns its count permit before fallible Arc allocation.
     pub fn new_child(parent: Arc<IpcNamespace>) -> Result<Arc<Self>, IpcNsError> {
+        Self::new_child_with_context(
+            parent,
+            &NamespaceCreateContext::new(&IPC_NS_COUNT, &NEXT_IPC_NS_ID, MAX_IPC_NS_COUNT),
+        )
+    }
+
+    fn new_child_with_context(
+        parent: Arc<IpcNamespace>,
+        context: &NamespaceCreateContext,
+    ) -> Result<Arc<Self>, IpcNsError> {
         if parent.level >= MAX_IPC_NS_LEVEL {
             return Err(IpcNsError::MaxDepthExceeded);
         }
 
-        // R77-5 FIX: Use guard pattern to ensure count rollback on allocation failure.
-        // The guard increments the count and will auto-decrement on drop unless committed.
-        let count_guard = NsCountGuard::new(&IPC_NS_COUNT, MAX_IPC_NS_COUNT)?;
+        let (count_permit, id) = context.reserve_id().map_err(|error| match error {
+            NamespaceCreateError::MaxCount => IpcNsError::MaxNamespaces,
+            NamespaceCreateError::IdOverflow => IpcNsError::NamespaceIdOverflow,
+        })?;
 
-        // R112-2: overflow-safe namespace ID allocation
-        let id = NEXT_IPC_NS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| {
-                // count_guard will auto-rollback on drop (R77-5 pattern)
-                IpcNsError::NamespaceIdOverflow
-            })?;
-
+        context
+            .check(NamespaceCreateStage::ArcLayout)
+            .map_err(|_| IpcNsError::OutOfMemory)?;
         let arc_bytes = arc_charge_bytes::<IpcNamespace>().map_err(|_| IpcNsError::OutOfMemory)?;
+        context
+            .check(NamespaceCreateStage::HeapReserve)
+            .map_err(|_| IpcNsError::OutOfMemory)?;
         let arc_reservation = try_reserve_heap(HeapClass::CoreProcess, arc_bytes)
             .map_err(|_| IpcNsError::OutOfMemory)?;
-        let mut child = Arc::try_new(Self {
-            id: NamespaceId::new(id),
-            parent: Some(parent.clone()),
-            level: parent.level.saturating_add(1),
-            refcount: AtomicU32::new(1),
-            next_key: AtomicU64::new(1),
-            _arc_heap_charge: None,
-        })
-        .map_err(|_| IpcNsError::OutOfMemory)?;
+        let mut child = context
+            .try_arc(Self {
+                id: NamespaceId::new(id),
+                parent: Some(parent.clone()),
+                level: parent.level.saturating_add(1),
+                refcount: AtomicU32::new(1),
+                next_key: AtomicU64::new(1),
+                _count_permit: Some(count_permit),
+                _arc_heap_charge: None,
+            })
+            .map_err(|_| IpcNsError::OutOfMemory)?;
 
+        context
+            .check(NamespaceCreateStage::HeapCommit)
+            .map_err(|_| IpcNsError::OutOfMemory)?;
         let charge = arc_reservation
             .commit()
             .map_err(|_| IpcNsError::OutOfMemory)?;
@@ -259,10 +209,15 @@ impl IpcNamespace {
             .expect("fresh IPC namespace Arc must be unique")
             ._arc_heap_charge = Some(charge);
 
-        // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
-        count_guard.commit();
-
         Ok(child)
+    }
+
+    #[cfg(feature = "namespace_probe")]
+    pub(crate) fn probe_child(context: NamespaceCreateContext) -> Result<Arc<Self>, IpcNsError> {
+        Self::new_child_with_context(
+            ROOT_IPC_NAMESPACE.clone(),
+            &context.with_id_source(&NEXT_IPC_NS_ID),
+        )
     }
 
     /// Get the namespace identifier.
@@ -472,22 +427,49 @@ pub fn test_is_ipc_ns_initialized() -> bool {
     ROOT_IPC_NAMESPACE.id().raw() == 0 && ROOT_IPC_NAMESPACE.is_root()
 }
 
-// ============================================================================
-// R76-2 FIX: Namespace Resource Cleanup
-// ============================================================================
-
-/// R76-2 FIX: Decrement global namespace counter when namespace is destroyed.
-impl Drop for IpcNamespace {
-    fn drop(&mut self) {
-        if self.level > 0 {
-            IPC_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mount_namespace::namespace_accounting::tests::{
+        check_concurrent, check_constructor, check_depth,
+    };
+
+    #[test]
+    fn ksa003_ipc_constructor_failures_and_lifetime() {
+        let root = Arc::new(IpcNamespace::new_root());
+        check_constructor(
+            |context| IpcNamespace::new_child_with_context(Arc::clone(&root), context),
+            IpcNsError::OutOfMemory,
+            IpcNsError::MaxNamespaces,
+            IpcNsError::NamespaceIdOverflow,
+            &[
+                NamespaceCreateStage::ArcLayout,
+                NamespaceCreateStage::HeapReserve,
+                NamespaceCreateStage::ArcAllocation,
+                NamespaceCreateStage::HeapCommit,
+            ],
+        );
+        assert_eq!(Arc::strong_count(&root), 1);
+    }
+
+    #[test]
+    fn ksa003_ipc_depth_retains_and_releases_parents() {
+        check_depth(
+            Arc::new(IpcNamespace::new_root()),
+            MAX_IPC_NS_LEVEL,
+            IpcNamespace::new_child_with_context,
+            IpcNsError::MaxDepthExceeded,
+        );
+    }
+
+    #[test]
+    fn ksa003_ipc_concurrent_limit() {
+        let root = Arc::new(IpcNamespace::new_root());
+        check_concurrent(|context| {
+            IpcNamespace::new_child_with_context(Arc::clone(&root), context)
+        });
+        assert_eq!(Arc::strong_count(&root), 1);
+    }
 
     #[test]
     fn test_root_namespace() {
