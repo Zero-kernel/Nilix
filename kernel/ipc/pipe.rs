@@ -14,12 +14,14 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::any::Any;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass};
 use spin::Mutex;
 
 use crate::sync::{PrepareToWaitCapacityOutcome, WaitQueue};
-use kernel_core::process::{current_pid, wait_should_abort};
+use kernel_core::process::{
+    current_pid, mutable_file_status_bits, wait_should_abort, FILE_STATUS_NONBLOCK,
+};
 use kernel_core::{FileDescriptor, FileOps, PreparedFileDescriptor, SyscallError, VfsStat};
 
 /// 默认管道缓冲区大小（4KB）
@@ -372,6 +374,9 @@ pub struct Pipe {
     id: PipeId,
     /// 内部状态（受锁保护）
     inner: Mutex<PipeInner>,
+    /// Each original end is one open description; duplicates share its status.
+    read_status: AtomicU32,
+    write_status: AtomicU32,
     /// 等待读取的进程队列
     read_wait: WaitQueue,
     /// 等待写入的进程队列
@@ -399,6 +404,8 @@ impl Pipe {
         Pipe {
             id,
             inner: Mutex::new(storage.inner),
+            read_status: AtomicU32::new(0),
+            write_status: AtomicU32::new(0),
             read_wait: WaitQueue::new(HeapClass::Pipe),
             write_wait: WaitQueue::new(HeapClass::Pipe),
             _buffer_charge: storage.buffer_charge,
@@ -935,8 +942,6 @@ pub struct PipeHandle {
     pipe: PipeArc,
     /// 端类型（读/写）
     end_type: PipeEndType,
-    /// 标志
-    flags: PipeFlags,
     /// U.S2-SLICE-3: the CapId allocated for this pipe end at the sys_pipe
     /// install site (`pipe_create_callback`), or `None` for a handle that was
     /// never fd-installed (unit-test pipes, pre-install rollback handles).
@@ -955,20 +960,34 @@ pub struct PipeHandle {
 impl PipeHandle {
     /// 创建读端句柄
     fn new_read(pipe: PipeArc, flags: PipeFlags) -> Self {
+        pipe.read_status.store(
+            if flags.nonblock {
+                FILE_STATUS_NONBLOCK
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
         PipeHandle {
             pipe,
             end_type: PipeEndType::Read,
-            flags,
             cap_id: spin::once::Once::new(),
         }
     }
 
     /// 创建写端句柄
     fn new_write(pipe: PipeArc, flags: PipeFlags) -> Self {
+        pipe.write_status.store(
+            if flags.nonblock {
+                FILE_STATUS_NONBLOCK
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
         PipeHandle {
             pipe,
             end_type: PipeEndType::Write,
-            flags,
             cap_id: spin::once::Once::new(),
         }
     }
@@ -1002,7 +1021,7 @@ impl PipeHandle {
         if self.end_type != PipeEndType::Read {
             return Err(PipeError::InvalidOperation);
         }
-        self.pipe.read(dst, self.flags)
+        self.pipe.read(dst, self.io_flags())
     }
 
     pub fn read_with_commit<E, F>(
@@ -1016,7 +1035,7 @@ impl PipeHandle {
         if self.end_type != PipeEndType::Read {
             return Err(PipeReadTransactionError::Pipe(PipeError::InvalidOperation));
         }
-        self.pipe.read_with_commit(dst, self.flags, commit)
+        self.pipe.read_with_commit(dst, self.io_flags(), commit)
     }
 
     /// 写入数据（仅写端有效）
@@ -1024,17 +1043,37 @@ impl PipeHandle {
         if self.end_type != PipeEndType::Write {
             return Err(PipeError::InvalidOperation);
         }
-        self.pipe.write(src, self.flags)
+        self.pipe.write(src, self.io_flags())
     }
 
     /// 设置非阻塞模式
-    pub fn set_nonblock(&mut self, nonblock: bool) {
-        self.flags.nonblock = nonblock;
+    pub fn set_nonblock(&self, nonblock: bool) {
+        if nonblock {
+            self.shared_status()
+                .fetch_or(FILE_STATUS_NONBLOCK, Ordering::Relaxed);
+        } else {
+            self.shared_status()
+                .fetch_and(!FILE_STATUS_NONBLOCK, Ordering::Relaxed);
+        }
     }
 
     /// 检查是否为非阻塞模式
     pub fn is_nonblock(&self) -> bool {
-        self.flags.nonblock
+        self.shared_status().load(Ordering::Relaxed) & FILE_STATUS_NONBLOCK != 0
+    }
+
+    fn shared_status(&self) -> &AtomicU32 {
+        match self.end_type {
+            PipeEndType::Read => &self.pipe.read_status,
+            PipeEndType::Write => &self.pipe.write_status,
+        }
+    }
+
+    fn io_flags(&self) -> PipeFlags {
+        PipeFlags {
+            nonblock: self.is_nonblock(),
+            cloexec: false, // descriptor-local; never an I/O status flag
+        }
     }
 
     /// 获取管道状态
@@ -1067,7 +1106,6 @@ impl PipeHandle {
         PipeHandle {
             pipe: self.pipe.clone(),
             end_type: self.end_type,
-            flags: self.flags,
             cap_id: new_cap_id,
         }
     }
@@ -1095,8 +1133,7 @@ impl core::fmt::Debug for PipeHandle {
         f.debug_struct("PipeHandle")
             .field("pipe_id", &self.pipe_id())
             .field("end_type", &self.end_type)
-            .field("nonblock", &self.flags.nonblock)
-            .field("cloexec", &self.flags.cloexec)
+            .field("nonblock", &self.is_nonblock())
             .finish()
     }
 }
@@ -1124,6 +1161,21 @@ impl Drop for PipeHandle {
 
 /// 实现 FileOps trait，支持在进程 fd_table 中存储
 impl FileOps for PipeHandle {
+    fn status_flags(&self) -> Result<u32, SyscallError> {
+        let access = if self.end_type == PipeEndType::Read {
+            0
+        } else {
+            1
+        };
+        Ok(access | self.shared_status().load(Ordering::Relaxed))
+    }
+
+    fn set_status_flags(&self, flags: u32) -> Result<(), SyscallError> {
+        let flags = mutable_file_status_bits(flags)?;
+        self.shared_status().store(flags, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_duplicate_descriptor()
     }
@@ -1407,23 +1459,28 @@ mod tests {
 
     #[test]
     fn mixed_pipe_ramfs_consumers_share_the_global_gate() {
+        use vfs::manager::Vfs;
         use vfs::{FileMode, FileSystem, FileType, RamFs};
 
         let _serial = crate::HEAP_TEST_LOCK.lock();
         publish_heap_admission();
+        // Initialize process-independent namespace owners before measuring the
+        // two resource consumers. File creation now uses the VFS transaction.
+        let namespace = kernel_core::ROOT_MNT_NAMESPACE.clone();
+        let _user_namespace = kernel_core::ROOT_USER_NAMESPACE.clone();
         let global_before = mm::heap_admission_snapshot();
         let pipe_before = mm::heap_class_snapshot(HeapClass::Pipe);
         let ramfs_before = mm::heap_class_snapshot(HeapClass::RamFs);
 
         let fs = RamFs::try_new().expect("ramfs fixture admission");
         let root = fs.root_inode();
-        let file = fs
-            .create(
-                &root,
-                "mixed-admission",
-                FileMode::new(FileType::Regular, 0o600),
-            )
+        let vfs = Vfs::new();
+        vfs.mount_in_namespace(&namespace, "/", fs.clone())
+            .expect("ramfs fixture mount");
+        let file = vfs
+            .create_trusted("/mixed-admission", FileMode::new(FileType::Regular, 0o600))
             .expect("ramfs fixture file");
+        drop(vfs);
 
         // Retain enough RAMFS payload that the shared global gate, rather than
         // the independent Pipe class ceiling, becomes the limiting resource.

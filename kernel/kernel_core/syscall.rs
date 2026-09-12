@@ -322,17 +322,11 @@ pub(crate) struct SocketFile {
     cap_id: cap::CapId,
     /// Socket ID in socket_table()
     socket_id: u64,
-    /// Non-blocking flag (SOCK_NONBLOCK)
-    nonblocking: bool,
 }
 
 impl SocketFile {
-    fn new(cap_id: cap::CapId, socket_id: u64, nonblocking: bool) -> Self {
-        Self {
-            cap_id,
-            socket_id,
-            nonblocking,
-        }
+    fn new(cap_id: cap::CapId, socket_id: u64) -> Self {
+        Self { cap_id, socket_id }
     }
 }
 
@@ -340,6 +334,22 @@ impl SocketFile {
 const S_IFSOCK: u32 = 0o140000;
 
 impl crate::process::FileOps for SocketFile {
+    fn status_flags(&self) -> Result<u32, SyscallError> {
+        let socket = net::socket_table()
+            .get(self.socket_id)
+            .ok_or(SyscallError::EBADF)?;
+        Ok(2 | socket.file_status_flags()) // O_RDWR, shared across dup/fork
+    }
+
+    fn set_status_flags(&self, flags: u32) -> Result<(), SyscallError> {
+        let flags = crate::process::mutable_file_status_bits(flags)?;
+        let socket = net::socket_table()
+            .get(self.socket_id)
+            .ok_or(SyscallError::EBADF)?;
+        socket.set_file_status_flags(flags);
+        Ok(())
+    }
+
     fn clone_box(&self) -> Result<crate::process::FileDescriptor, ()> {
         // Increment the SOCKET refcount on clone (for dup/fork POSIX semantics).
         //
@@ -1526,7 +1536,7 @@ pub fn run_fileops_cap_id_self_test() {
     // (1) SocketFile MUST override cap_id() with its live CapId (a socket fd
     // always carries the cap allocated at sys_socket/sys_accept).
     let cid = cap::CapId::from_parts(7, 42);
-    let sock = SocketFile::new(cid, u64::MAX, false);
+    let sock = SocketFile::new(cid, u64::MAX);
     let desc: &dyn FileOps = &sock;
     assert!(
         desc.cap_id() == Some(cid),
@@ -2393,7 +2403,7 @@ where
 /// 管道创建回调类型
 ///
 /// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
-pub type PipeCreateCallback = fn() -> Result<(i32, i32), SyscallError>;
+pub type PipeCreateCallback = fn(flags: u32) -> Result<(i32, i32), SyscallError>;
 
 /// 文件描述符读取回调类型
 ///
@@ -10413,7 +10423,7 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
     };
 
     // 调用管道创建回调
-    let (read_fd, write_fd) = create_fn()?;
+    let (read_fd, write_fd) = create_fn(0)?;
 
     // 将文件描述符写回用户空间
     let fd_array = [read_fd, write_fd];
@@ -10476,57 +10486,10 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // R173-05 PROPER FIX (supersedes the fail-closed EINVAL stopgap): per-fd
-    // CLOEXEC tracking EXISTS (`Process::cloexec_fds` + `set_fd_cloexec`,
-    // drained at exec by `take_cloexec_fds_into`, inherited at fork/clone,
-    // cleared on close by `remove_fd`) — sys_dup3 has used it since R39-4.
-    // The R173 stopgap's premise ("until per-fd CLOEXEC tracking is
-    // implemented") was false; wire the flag exactly like dup3 does.
-
-    // Create pipe
-    let (read_fd, write_fd) = create_fn()?;
-
-    // Mark both ends close-on-exec BEFORE exposing the fds to userspace.
-    // fd_table is per-process (deep-copied even under CLONE_FILES — INV-CG-FD),
-    // so no other task can observe the window between create and mark; the
-    // copy_to_user failure path below closes both fds via remove_fd, which
-    // also clears the CLOEXEC marks (no stale-entry leak).
-    if flags & O_CLOEXEC != 0 {
-        let proc_lookup = current_pid().and_then(get_process);
-        match proc_lookup {
-            Some(process_arc) => {
-                let mut proc = process_arc.lock();
-                let marked = proc
-                    .set_fd_cloexec(read_fd, true)
-                    .and_then(|()| proc.set_fd_cloexec(write_fd, true));
-                if marked.is_err() {
-                    drop(proc);
-                    let close_fn = {
-                        let callback = FD_CLOSE_CALLBACK.lock();
-                        callback.as_ref().copied()
-                    };
-                    if let Some(close) = close_fn {
-                        let _ = close(read_fd);
-                        let _ = close(write_fd);
-                    }
-                    return Err(SyscallError::ENOMEM);
-                }
-            }
-            None => {
-                // No current process (unreachable for a live syscall, but do
-                // not leak the just-created pipe fds if it ever fires).
-                let close_fn = {
-                    let callback = FD_CLOSE_CALLBACK.lock();
-                    callback.as_ref().copied()
-                };
-                if let Some(close) = close_fn {
-                    let _ = close(read_fd);
-                    let _ = close(write_fd);
-                }
-                return Err(SyscallError::ESRCH);
-            }
-        }
-    }
+    // KSA-013: prepare NONBLOCK and both CLOEXEC slots before publication.
+    // The callback reserves both numeric descriptors within soft NOFILE and
+    // rolls back both ends if any preflight resource cannot be acquired.
+    let (read_fd, write_fd) = create_fn(flags as u32)?;
 
     // Write fds to user space
     let fd_array = [read_fd, write_fd];
@@ -10586,20 +10549,15 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // per-fd CLOEXEC tracking exists (Process::cloexec_fds, R39-4) —
             // F_DUPFD_CLOEXEC is F_DUPFD + set_fd_cloexec on the new fd,
             // mirroring sys_dup3's O_CLOEXEC handling.
-            let min_fd = arg as i32;
-            if min_fd < 0 {
-                return Err(SyscallError::EINVAL);
-            }
-            // Linux returns EINVAL when arg is beyond the fd limit (RLIMIT_NOFILE
-            // analog); our hard table cap is MAX_FD. This also bounds the scan.
-            if min_fd >= crate::process::MAX_FD {
-                return Err(SyscallError::EINVAL);
-            }
-
             // Get current process
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let mut proc = process_arc.lock();
+
+            if arg >= proc.effective_fd_limit() as u64 {
+                return Err(SyscallError::EINVAL);
+            }
+            let min_fd = arg as i32;
 
             // Get the source fd
             let source_desc = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
@@ -10679,32 +10637,17 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let proc = process_arc.lock();
 
-            // Check if fd exists
-            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-
-            // TODO: Track O_APPEND, O_NONBLOCK, O_ASYNC per-fd
-            // For now, return 0 (no flags set)
-            Ok(0)
+            let descriptor = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+            descriptor.status_flags().map(|flags| flags as usize)
         }
 
         F_SETFL => {
-            // Set file status flags (only O_APPEND, O_NONBLOCK, O_ASYNC can be changed)
-            // O_APPEND = 0x400, O_NONBLOCK = 0x800, O_ASYNC = 0x2000
-            const SETFL_MASK: i32 = 0x400 | 0x800 | 0x2000;
-            let flags = arg as i32;
-
-            // Silently ignore unsupported flags (Linux behavior)
-            let _supported_flags = flags & SETFL_MASK;
-
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let proc = process_arc.lock();
 
-            // Check if fd exists
-            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-
-            // TODO: Store file status flags per-fd
-
+            let descriptor = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+            descriptor.set_status_flags(arg as u32)?;
             Ok(0)
         }
 
@@ -17606,6 +17549,9 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     // lock inversion (Process → SocketFile::drop → waiters → Process).
     let old_fd_entry = {
         let mut proc = proc_arc.lock();
+        if newfd >= proc.effective_fd_limit() {
+            return Err(SyscallError::EBADF);
+        }
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
         let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert):
@@ -17664,6 +17610,9 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
     // lock inversion (Process → SocketFile::drop → waiters → Process).
     let old_fd_entry = {
         let mut proc = proc_arc.lock();
+        if newfd >= proc.effective_fd_limit() {
+            return Err(SyscallError::EBADF);
+        }
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
         let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert).
@@ -18375,7 +18324,14 @@ fn socket_handle_from_fd(fd: i32) -> Result<(cap::CapId, u64, bool), SyscallErro
         .as_any()
         .downcast_ref::<SocketFile>()
         .ok_or(SyscallError::ENOTSOCK)?;
-    Ok((socket.cap_id, socket.socket_id, socket.nonblocking))
+    let state = net::socket_table()
+        .get(socket.socket_id)
+        .ok_or(SyscallError::EBADF)?;
+    Ok((
+        socket.cap_id,
+        socket.socket_id,
+        state.file_status_flags() & crate::process::FILE_STATUS_NONBLOCK != 0,
+    ))
 }
 
 /// Helper: Resolve socket state from handle.
@@ -18462,7 +18418,7 @@ impl PreparedSocketPublication<'_> {
     fn commit(
         self,
         cap_entry: cap::CapEntry,
-        socket_id: u64,
+        socket: &net::SocketArc,
         nonblocking: bool,
     ) -> (i32, cap::CapId) {
         let Self {
@@ -18471,9 +18427,14 @@ impl PreparedSocketPublication<'_> {
             capability,
             net_ns_id: _,
         } = self;
+        socket.set_file_status_flags(if nonblocking {
+            crate::process::FILE_STATUS_NONBLOCK
+        } else {
+            0
+        });
         let cap_id = capability.cap_id();
         let grant = capability.install(cap_entry);
-        let desc = descriptor.finalize(SocketFile::new(cap_id, socket_id, nonblocking));
+        let desc = descriptor.finalize(SocketFile::new(cap_id, socket.id));
         let fd = match fd_reservation.install(desc) {
             Ok(fd) => fd,
             Err(_desc) => {
@@ -18656,7 +18617,7 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         rights,
         cap::CapFlags::empty(),
     );
-    let (fd, _cap_id) = prepared.commit(cap_entry, socket.id, nonblock);
+    let (fd, _cap_id) = prepared.commit(cap_entry, &socket, nonblock);
 
     Ok(fd as usize)
 }
@@ -18988,7 +18949,7 @@ fn sys_accept_common(
         child_rights,
         cap::CapFlags::empty(),
     );
-    let (new_fd, _new_cap) = prepared.commit(cap_entry, child.id, child_nonblock);
+    let (new_fd, _new_cap) = prepared.commit(cap_entry, &child, child_nonblock);
 
     // R162-11/R180-24: peer-address copy failure is non-fatal after the child
     // descriptor is valid. Copy at most the caller-provided length and report
@@ -21380,7 +21341,7 @@ fn poll_writeback_timespec(ptr: *mut u8, sec: i64, nsec: i64) -> Result<(), Sysc
 /// present and carries the socket id, structurally, with no socket table needed.
 pub fn run_poll_socket_arm_self_test() {
     use crate::process::FileOps;
-    let sf = SocketFile::new(cap::CapId::INVALID, 0xC0FFEE, false);
+    let sf = SocketFile::new(cap::CapId::INVALID, 0xC0FFEE);
     match sf.poll_arm() {
         crate::poll::PollArm::Socket { socket_id, .. } => {
             assert_eq!(

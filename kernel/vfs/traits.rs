@@ -11,16 +11,24 @@ use core::any::Any;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::Deref;
 use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
+use kernel_core::process::{mutable_file_status_bits, FILE_STATUS_MUTABLE};
 use kernel_core::{FileDescriptor, FileOps, PreparedFileDescriptor, SyscallError, VfsStat};
 use mm::{allocation_charge_bytes, try_reserve_heap, HeapCharge, HeapClass};
+
+pub struct DirectoryParent {
+    pub inode: Arc<dyn Inode>,
+    pub name: alloc::string::String,
+    pub attached: bool,
+}
 
 /// Filesystem trait
 ///
 /// Each mounted filesystem implements this trait. The VFS uses these methods
 /// for path resolution and metadata operations.
 pub trait FileSystem: Send + Sync {
-    /// Get unique filesystem ID
+    /// Globally unique, never-reused filesystem instance ID, shared with its inodes.
+    /// Implementations must allocate it through the common VFS identity allocator.
     fn fs_id(&self) -> u64;
 
     /// Get filesystem type name (e.g., "devfs", "ramfs")
@@ -298,6 +306,8 @@ struct SharedFileOffsetInner {
     /// ownership is nonzero, matching Arc's reclamation discipline.
     weak: AtomicUsize,
     value: ManuallyDrop<spin::Mutex<u64>>,
+    /// Mutable status belongs to the same open description as the offset.
+    status: AtomicU32,
     /// Initialized before publication and moved out only by the last weak
     /// owner, immediately before the backing allocation is deallocated.
     charge: MaybeUninit<HeapCharge>,
@@ -326,6 +336,12 @@ unsafe impl Send for WeakSharedFileOffset {}
 unsafe impl Sync for WeakSharedFileOffset {}
 
 impl SharedFileOffset {
+    fn status(&self) -> &AtomicU32 {
+        // SAFETY: this strong owner keeps the complete allocation live for the
+        // returned borrow; AtomicU32 supplies shared access without aliasing writes.
+        unsafe { &self.ptr.as_ref().status }
+    }
+
     fn try_new() -> Result<Self, FsError> {
         let bytes = allocation_charge_bytes(
             core::mem::size_of::<SharedFileOffsetInner>(),
@@ -337,6 +353,7 @@ impl SharedFileOffset {
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
             value: ManuallyDrop::new(spin::Mutex::new(0)),
+            status: AtomicU32::new(0),
             charge: MaybeUninit::uninit(),
         })
         .map_err(|_| FsError::NoMem)?;
@@ -780,6 +797,26 @@ impl FileHandle {
 }
 
 impl FileOps for FileHandle {
+    fn status_flags(&self) -> Result<u32, SyscallError> {
+        let flags = self.flags();
+        let path_flags = OpenFlags::O_PATH | OpenFlags::O_DIRECTORY | OpenFlags::O_NOFOLLOW;
+        let report_mask = if flags.is_path() {
+            path_flags
+        } else {
+            path_flags | OpenFlags::O_ACCMODE | FILE_STATUS_MUTABLE
+        };
+        Ok(flags.0 & report_mask)
+    }
+
+    fn set_status_flags(&self, flags: u32) -> Result<(), SyscallError> {
+        if self.flags.is_path() {
+            return Err(SyscallError::EBADF);
+        }
+        let flags = mutable_file_status_bits(flags)?;
+        self.offset.status().store(flags, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn clone_box(&self) -> Result<FileDescriptor, ()> {
         self.try_clone_descriptor()
     }
@@ -833,12 +870,163 @@ impl FileOps for FileHandle {
 
 #[cfg(test)]
 mod rf180_37_tests {
+    extern crate std;
+
     use super::*;
     use crate::types::{FileType, TimeSpec};
 
-    static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    use crate::HEAP_TEST_LOCK;
 
     struct TestInode;
+
+    struct TestFilesystem {
+        inode: Arc<dyn Inode>,
+    }
+    impl FileSystem for TestFilesystem {
+        fn fs_id(&self) -> u64 {
+            self.inode.fs_id()
+        }
+        fn fs_type(&self) -> &'static str {
+            "test"
+        }
+        fn root_inode(&self) -> Arc<dyn Inode> {
+            self.inode.clone()
+        }
+        fn lookup(&self, _parent: &Arc<dyn Inode>, _name: &str) -> Result<Arc<dyn Inode>, FsError> {
+            Err(FsError::NotFound)
+        }
+    }
+    fn owner(inode: Arc<dyn Inode>) -> Arc<dyn FileSystem> {
+        // lint-fallible: BOUNDED(test-only fixture owns one concrete filesystem; no runtime allocation path)
+        Arc::new(TestFilesystem { inode })
+    }
+
+    fn open_test_file(inode: Arc<dyn Inode>, flags: u32) -> FileDescriptor {
+        PreparedFileHandle::try_new()
+            .unwrap()
+            .bind_filesystem(owner(inode.clone()))
+            .finalize(inode, OpenFlags::new(flags), true)
+    }
+
+    fn file_handle(descriptor: &FileDescriptor) -> &FileHandle {
+        descriptor.as_any().downcast_ref::<FileHandle>().unwrap()
+    }
+
+    #[test]
+    fn ksa013_status_is_shared_without_changing_access_or_creation_state() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let inode = crate::ramfs::RamFsInode::new_file(0x1301, 1, 0o600, 0, 0).unwrap();
+        let original = open_test_file(
+            inode.clone(),
+            OpenFlags::O_CREAT | OpenFlags::O_TRUNC | 0x80000,
+        );
+        let duplicate = original.try_clone().unwrap();
+        let independent = open_test_file(inode, OpenFlags::O_RDWR);
+
+        duplicate
+            .set_status_flags(OpenFlags::O_WRONLY | FILE_STATUS_MUTABLE | 0x80000)
+            .unwrap();
+        assert_eq!(original.status_flags(), Ok(FILE_STATUS_MUTABLE));
+        assert_eq!(independent.status_flags(), Ok(OpenFlags::O_RDWR));
+        assert!(file_handle(&original).flags().is_create());
+        assert!(file_handle(&original).flags().is_truncate());
+        assert_eq!(file_handle(&original).write(b"denied"), Err(FsError::BadFd));
+        assert_eq!(
+            duplicate.set_status_flags(0x2000),
+            Err(SyscallError::EOPNOTSUPP)
+        );
+        assert_eq!(original.status_flags(), Ok(FILE_STATUS_MUTABLE));
+        original.set_status_flags(0).unwrap();
+        assert_eq!(duplicate.status_flags(), Ok(OpenFlags::O_RDONLY));
+    }
+
+    #[test]
+    fn ksa013_append_and_pwrite_follow_status_changes_through_duplicates() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let inode = crate::ramfs::RamFsInode::new_file(0x1302, 1, 0o600, 0, 0).unwrap();
+        let original = open_test_file(inode.clone(), OpenFlags::O_RDWR);
+        let duplicate = original.try_clone().unwrap();
+        let file = file_handle(&original);
+        assert_eq!(file.write(b"a"), Ok(1));
+        file.seek(0, crate::types::SeekWhence::Set).unwrap();
+        duplicate.set_status_flags(OpenFlags::O_APPEND).unwrap();
+        assert_eq!(file.write(b"b"), Ok(1));
+        assert_eq!(*file.offset.lock(), 2);
+        assert_eq!(file_handle(&duplicate).pwrite(0, b"c"), Ok(1));
+        assert_eq!(*file.offset.lock(), 2);
+        original.set_status_flags(0).unwrap();
+        assert_eq!(file_handle(&duplicate).pwrite(0, b"Z"), Ok(1));
+        assert_eq!(*file.offset.lock(), 2);
+        let mut bytes = [0; 3];
+        assert_eq!(inode.read_at(0, &mut bytes), Ok(3));
+        assert_eq!(&bytes, b"Zbc");
+    }
+
+    #[test]
+    fn ksa013_path_descriptions_reject_status_and_io_mutation() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let descriptor = open_test_file(
+            Arc::new(TestInode),
+            OpenFlags::O_PATH | OpenFlags::O_NOFOLLOW | OpenFlags::O_RDWR | FILE_STATUS_MUTABLE,
+        );
+        assert_eq!(
+            descriptor.status_flags(),
+            Ok(OpenFlags::O_PATH | OpenFlags::O_NOFOLLOW)
+        );
+        assert_eq!(descriptor.set_status_flags(0), Err(SyscallError::EBADF));
+        let file = file_handle(&descriptor);
+        assert_eq!(file.read(&mut [0; 1]), Err(FsError::BadFd));
+        assert_eq!(file.write(b"x"), Err(FsError::BadFd));
+        assert_eq!(file.pwrite(0, b"x"), Err(FsError::BadFd));
+    }
+
+    #[test]
+    fn ksa013_concurrent_append_uses_inode_atomicity_after_fcntl_change() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let inode = crate::ramfs::RamFsInode::new_file(0x1303, 1, 0o600, 0, 0).unwrap();
+        let first = open_test_file(inode.clone(), OpenFlags::O_RDWR);
+        let first_duplicate = first.try_clone().unwrap();
+        first_duplicate
+            .set_status_flags(OpenFlags::O_APPEND)
+            .unwrap();
+        let second = open_test_file(inode.clone(), OpenFlags::O_RDWR | OpenFlags::O_APPEND);
+        let first = file_handle(&first).clone();
+        let second = file_handle(&second).clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..128 {
+                assert_eq!(first.write(&[0x11; 8]), Ok(8));
+            }
+        });
+        second_barrier.wait();
+        for _ in 0..128 {
+            assert_eq!(second.write(&[0x22; 8]), Ok(8));
+        }
+        writer.join().unwrap();
+        let mut bytes = [0; 2048];
+        assert_eq!(inode.read_at(0, &mut bytes), Ok(bytes.len()));
+        assert_eq!(inode.stat().unwrap().size, bytes.len() as u64);
+        assert_eq!(
+            bytes
+                .chunks_exact(8)
+                .filter(|record| *record == [0x11; 8])
+                .count(),
+            128
+        );
+        assert_eq!(
+            bytes
+                .chunks_exact(8)
+                .filter(|record| *record == [0x22; 8])
+                .count(),
+            128
+        );
+    }
 
     impl Inode for TestInode {
         fn ino(&self) -> u64 {

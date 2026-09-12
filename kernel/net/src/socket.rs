@@ -1679,6 +1679,9 @@ pub struct SocketState {
     /// Initialized to 1 at creation. Incremented on dup()/fork(), decremented
     /// on close(). Socket is only fully closed when refcount reaches 0.
     refcount: AtomicU64,
+    /// KSA-013: mutable status of this socket's single open file description.
+    /// Descriptor duplicates/fork share this existing admitted allocation.
+    file_status: AtomicU32,
     /// R180-21 FIX: Serializes state-changing userspace operations on a shared
     /// socket handle.  This is the outermost socket-operation lock: bind,
     /// connect, listen auto-bind, UDP send auto-bind, and connect abort hold it
@@ -1759,6 +1762,7 @@ impl SocketState {
             label,
             net_ns_id,
             refcount: AtomicU64::new(1),
+            file_status: AtomicU32::new(0),
             operation: Mutex::new(()),
             close_pending: AtomicBool::new(false),
             close_finalizer_claimed: AtomicBool::new(false),
@@ -1775,6 +1779,17 @@ impl SocketState {
             tcp: Mutex::new(None),
             listen: Mutex::new(None),
         })
+    }
+
+    /// Linux O_APPEND/O_NONBLOCK status; access mode remains O_RDWR at the fd.
+    pub fn file_status_flags(&self) -> u32 {
+        self.file_status.load(Ordering::Relaxed)
+    }
+
+    /// No allocation or socket-operation lock is needed for status publication.
+    pub fn set_file_status_flags(&self, flags: u32) {
+        self.file_status
+            .store(flags & (0x400 | 0x800), Ordering::Relaxed);
     }
 
     /// Check if the socket is closed.
@@ -6685,7 +6700,8 @@ impl SocketTable {
     /// * `sock` - Socket to receive from
     /// * `current` - Current process context
     /// * `cap_id` - Capability used for this operation
-    /// * `timeout_ns` - Timeout in nanoseconds (None for blocking)
+    /// * `timeout_ns` - None blocks; zero polls without waiting; positive values
+    ///   bound the wait in nanoseconds. An empty poll returns WouldBlock.
     ///
     /// # Security
     ///
@@ -6745,6 +6761,11 @@ impl SocketTable {
             }
 
             drop(queue);
+            // KSA-013: an empty nonblocking receive is not a timed-out wait.
+            // Keep queued-packet commit/error behavior above this poll boundary.
+            if timeout_ns == Some(0) {
+                return Err(RecvTransactionError::Socket(SocketError::WouldBlock));
+            }
             match sock.waiters.wait_with_timeout(timeout_ns) {
                 WaitOutcome::Woken => continue,
                 WaitOutcome::TimedOut => {
@@ -7297,6 +7318,11 @@ impl SocketTable {
                 }
             }
 
+            // KSA-013: preserve data/EOF precedence, but do not turn an empty
+            // nonblocking poll into SocketError::Timeout (ETIMEDOUT).
+            if timeout_ns == Some(0) {
+                return Err(RecvTransactionError::Socket(SocketError::WouldBlock));
+            }
             match waiters.wait_with_timeout(timeout_ns) {
                 WaitOutcome::Woken => continue,
                 WaitOutcome::TimedOut => {
@@ -13189,6 +13215,23 @@ mod tests {
     }
 
     #[test]
+    fn ksa013_socket_status_is_shared_and_independent_between_sockets() {
+        let socket = test_socket(0x1301, SocketType::Dgram, SocketProtocol::Udp);
+        let duplicate = socket.clone();
+        let independent = test_socket(0x1302, SocketType::Dgram, SocketProtocol::Udp);
+        socket.set_file_status_flags(0x400);
+        assert_eq!(duplicate.file_status_flags(), 0x400);
+        let writer = thread::spawn(move || {
+            duplicate.set_file_status_flags(0x800 | 2 | 0x80000);
+        });
+        writer.join().unwrap();
+        assert_eq!(socket.file_status_flags(), 0x800);
+        assert_eq!(independent.file_status_flags(), 0);
+        socket.set_file_status_flags(0);
+        assert_eq!(socket.file_status_flags(), 0);
+    }
+
+    #[test]
     fn deferred_port_uncharges_do_not_alias_empty_sentinel() {
         let mut pending = DeferredPortUncharges::new();
 
@@ -15186,6 +15229,52 @@ mod tests {
         assert_eq!(ipv4_to_u64([192, 168, 1, 1]), 0xC0A80101);
         assert_eq!(ipv4_to_u64([0, 0, 0, 0]), 0);
         assert_eq!(ipv4_to_u64([255, 255, 255, 255]), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn nonblocking_receive_reports_would_block_and_preserves_tcp_eof() {
+        let table = SocketTable::new();
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let udp = test_socket(0x1913_01, SocketType::Dgram, SocketProtocol::Udp);
+        let result =
+            table.recv_from_udp_with_commit(&udp, &current, CapId::INVALID, Some(0), |_| {
+                panic!("empty UDP receive must not invoke copyout")
+            });
+        assert!(matches!(
+            result,
+            Err(RecvTransactionError::<()>::Socket(SocketError::WouldBlock))
+        ));
+        assert!(udp.rx_queue.lock().is_empty());
+
+        let tcp = test_socket(0x1913_02, SocketType::Stream, SocketProtocol::Tcp);
+        let mut control = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 1]),
+            1000,
+            Ipv4Addr([10, 0, 0, 2]),
+            2000,
+            1,
+        );
+        control.state = TcpState::Established;
+        tcp.attach_tcp(control)
+            .expect("hosted TCP waiter admission");
+        let result = table.tcp_recv_with_commit(&tcp, &current, CapId::INVALID, 1, Some(0), |_| {
+            panic!("empty TCP receive must not invoke copyout")
+        });
+        assert!(matches!(
+            result,
+            Err(RecvTransactionError::<()>::Socket(SocketError::WouldBlock))
+        ));
+        {
+            let mut guard = tcp.tcp.lock();
+            let state = guard.as_mut().unwrap();
+            state.control.state = TcpState::CloseWait;
+            state.control.fin_received = true;
+        }
+        let result =
+            table.tcp_recv_with_commit::<(), _>(&tcp, &current, CapId::INVALID, 1, Some(0), |_| {
+                panic!("TCP EOF must not invoke copyout")
+            });
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

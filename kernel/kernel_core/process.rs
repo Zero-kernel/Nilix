@@ -416,6 +416,20 @@ pub type KptiCr3UpdateCallback = fn(u64, u64);
 pub const MAX_FD: i32 = 256;
 const FD_RESERVATION_WORDS: usize = (MAX_FD as usize + 63) / 64;
 
+/// Linux mutable open-file-description status bits supported by this kernel.
+pub const FILE_STATUS_APPEND: u32 = 0x400;
+pub const FILE_STATUS_NONBLOCK: u32 = 0x800;
+pub const FILE_STATUS_MUTABLE: u32 = FILE_STATUS_APPEND | FILE_STATUS_NONBLOCK;
+
+/// F_SETFL ignores access/creation bits, but must not pretend to enable SIGIO.
+pub fn mutable_file_status_bits(flags: u32) -> Result<u32, SyscallError> {
+    const O_ASYNC: u32 = 0x2000;
+    if flags & O_ASYNC != 0 {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+    Ok(flags & FILE_STATUS_MUTABLE)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ConsoleFile {
     pub(crate) readable: bool,
@@ -478,6 +492,22 @@ impl FileOps for ConsoleFile {
 /// 由于循环依赖限制，kernel_core 定义此 trait，具体类型（如 PipeHandle）
 /// 在各自的 crate（如 ipc）中实现。
 pub trait FileOps: Send + Sync {
+    /// Current access/status flags for F_GETFL. Namespace descriptors are
+    /// read-only; mutable file, pipe and socket descriptions override this.
+    fn status_flags(&self) -> Result<u32, SyscallError> {
+        Ok(0)
+    }
+
+    /// Update shared description status without allocation or blocking I/O.
+    /// CLOEXEC stays exclusively in the descriptor table. Unsupported kinds
+    /// reject mutable status instead of reporting a successful no-op.
+    fn set_status_flags(&self, flags: u32) -> Result<(), SyscallError> {
+        if mutable_file_status_bits(flags)? != 0 {
+            return Err(SyscallError::EOPNOTSUPP);
+        }
+        Ok(())
+    }
+
     /// Fallibly clone this file descriptor (used by fork/dup).
     ///
     /// An infallible clone API could abort the kernel when descriptor storage
@@ -1667,9 +1697,9 @@ pub const RLIMIT_NOFILE: usize = 7;
 /// not lie (NOFILE soft==hard==MAX_FD; STACK soft == the loader's ACTUAL writable
 /// stack = `USER_STACK_SIZE - USER_STACK_GUARD_SIZE`, i.e. the reserved window minus
 /// the M0-7 permanently-unmapped low guard page). All other limits are RLIM_INFINITY.
-/// **ALL limits are ADVISORY**: stored + reported faithfully but NOT enforced —
-/// `allocate_fd` uses the compile-time `MAX_FD` cap and the loader maps a fixed
-/// writable stack regardless of these values (M0 scope; enforcement is future work).
+/// NOFILE is enforced when reserving or replacing a numeric descriptor; lowering
+/// it does not close existing descriptors or revoke already acquired reservations.
+/// Other limits retain their existing subsystem-specific/advisory behavior.
 pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     let inf = RLimit {
         rlim_cur: RLIM_INFINITY,
@@ -3299,7 +3329,7 @@ impl Process {
         desc: FileDescriptor,
         cloexec: bool,
     ) -> Result<Option<FileDescriptor>, FileDescriptor> {
-        if !(0..MAX_FD).contains(&fd) || self.fd_is_reserved(fd) {
+        if !(0..self.effective_fd_limit()).contains(&fd) || self.fd_is_reserved(fd) {
             return Err(desc);
         }
         let occupied = self.fd_table.contains_key(&fd);
@@ -3377,14 +3407,19 @@ impl Process {
         Ok(displaced)
     }
 
-    /// 查找下一个可用的 fd（从 3 开始）
+    /// Exclusive numeric bound for new descriptors. Existing/inherited entries
+    /// above a lowered soft limit remain usable; reserved commit is infallible.
+    pub fn effective_fd_limit(&self) -> i32 {
+        self.rlimits[RLIMIT_NOFILE].rlim_cur.min(MAX_FD as u64) as i32
+    }
+
     fn next_available_fd_from(&self, min_fd: i32) -> Option<i32> {
-        // 从 3 开始，因为 0/1/2 保留给标准流
-        if !(0..MAX_FD).contains(&min_fd) {
+        let limit = self.effective_fd_limit();
+        if !(0..limit).contains(&min_fd) {
             return None;
         }
         let mut fd = min_fd;
-        while fd < MAX_FD {
+        while fd < limit {
             if !self.fd_table.contains_key(&fd) && !self.fd_is_reserved(fd) {
                 return Some(fd);
             }
