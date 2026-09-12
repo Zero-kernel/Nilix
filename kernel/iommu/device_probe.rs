@@ -153,6 +153,50 @@ fn no_stale_fault(unit: &VtdUnit) {
     }
 }
 
+fn acknowledge_msi_fault(unit: &VtdUnit, index: usize, reason: u8) {
+    // QEMU 8.2 records rejected MSI requests in FRCD; QEMU 6.2 only logs
+    // the rejection. In this terminal probe MSI is disabled, DMA has completed,
+    // and no production fault callbacks exist. Validate the entire record set
+    // before acknowledging only this expected IR fault. Leaving it live would
+    // compress the next rejection (or DMA fault) from the same EDU requester.
+    interrupts::without_interrupts(|| {
+        let status = unsafe { VtdUnit::read_reg32(unit.reg_base, VTD_REG_FSTS) };
+        assert_eq!(status & (1 | QI_ERROR_MASK), 0);
+        assert!(!unit.has_pending_fault_work());
+        let mut fault = None;
+        for slot in 0..unit.num_fault_regs() {
+            let offset = unit.fault_offset + slot * 16;
+            let lo = unsafe { VtdUnit::read_reg64(unit.reg_base, offset) };
+            let hi = unsafe { VtdUnit::read_reg64(unit.reg_base, offset + 8) };
+            if hi >> 63 == 0 {
+                continue;
+            }
+            assert_eq!(lo, (index as u64) << 48, "P3-2 unexpected IR fault index");
+            assert_eq!(
+                hi,
+                (1 << 63) | (u64::from(reason) << 32) | u64::from(DEV.source_id()),
+                "P3-2 unexpected MSI fault reason, requester or flags"
+            );
+            assert!(fault.replace((offset, lo, hi)).is_none());
+        }
+        assert_eq!(status & 2 != 0, fault.is_some());
+        if let Some((offset, lo, hi)) = fault {
+            klog_always!(
+                "KSA-P3-MSI-FAULT sid={:04x} index={} reason={} lo={:#x} hi={:#x}",
+                DEV.source_id(),
+                index,
+                reason,
+                lo,
+                hi
+            );
+            core::sync::atomic::fence(Ordering::SeqCst);
+            // W1C only the validated FRCD F bit; PPF follows the live records.
+            unsafe { VtdUnit::write_reg64(unit.reg_base, offset + 8, 1 << 63) };
+        }
+        no_stale_fault(unit);
+    });
+}
+
 fn disable_msi(cap: u8, control: u16) {
     config_write16(cap + 2, control & !1);
     assert_eq!(
@@ -163,6 +207,7 @@ fn disable_msi(cap: u8, control: u16) {
 }
 
 fn msi(unit: &VtdUnit, irq_count: fn() -> u64, source_iova: u64) {
+    no_stale_fault(unit);
     let mut cap = (config_read(0x34) & 0xfc) as u8;
     let mut found = None;
     for _ in 0..48 {
@@ -217,6 +262,7 @@ fn msi(unit: &VtdUnit, irq_count: fn() -> u64, source_iova: u64) {
     assert_eq!(irq_count(), expected, "wrong SID delivered an interrupt");
     write32(0x64, 1);
     disable_msi(cap, control);
+    acknowledge_msi_fault(unit, index, 0x26);
     assert!(table
         .free_index_with_iec(index, || unit.invalidate_interrupt_entry_cache())
         .unwrap());
@@ -226,6 +272,7 @@ fn msi(unit: &VtdUnit, irq_count: fn() -> u64, source_iova: u64) {
     assert_eq!(irq_count(), expected, "retired IRTE delivered an interrupt");
     write32(0x64, 1);
     disable_msi(cap, control);
+    acknowledge_msi_fault(unit, index, 0x22);
     assert_eq!(table.allocate_index(), Some(index));
     table.set_entry(index, valid);
     unit.invalidate_interrupt_entry_cache().unwrap();

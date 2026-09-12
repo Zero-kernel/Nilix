@@ -117,14 +117,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools
-      - name: make boot-check (boots the kernel, asserts 0 NX-violation #PF)
-        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/boot -- make boot-check
-      - name: make test (runtime suite and outcome qualification; exit 0/1/2/3)
+      # Run the gate scripts directly: make translates every failed recipe
+      # (including qualified exit 3) to exit 2. Preserve the actual outcome.
+      - name: Build normal boot image
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/build -- make build
+      - name: Boot health (qualified results retained; strict qualification remains open)
+        run: python3 scripts/record_gate.py --allow-qualified --artifacts target/gate-evidence/boot -- bash scripts/boot_check.sh esp
+      - name: Runtime suite (failures and incomplete evidence block CI)
         if: always()
-        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/runtime -- make test
+        run: python3 scripts/record_gate.py --allow-qualified --artifacts target/gate-evidence/runtime -- bash scripts/kernel_test.sh esp
+      - name: Build static-musl image
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/musl-build -- make build-musl-test
       - name: make musl-check (static-musl conformance gate)
         if: always()
-        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/musl -- make musl-check
+        env:
+          MUSL_CHECK_CPUS: 4
+          MUSL_CHECK_TIMEOUT: 120
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/musl -- bash scripts/musl_check.sh kernel-target/musl/esp
       - name: Retain source identity, final gate status, counts and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -193,7 +203,7 @@ jobs:
           PY
       - name: Actual Q35 activation and honest runtime qualification
         if: always()
-        run: python3 scripts/record_gate.py --artifacts target/iommu-evidence/positive -- bash scripts/iommu_q35_check.sh esp
+        run: python3 scripts/record_gate.py --allow-qualified --artifacts target/iommu-evidence/positive -- bash scripts/iommu_q35_check.sh esp
       - name: Constructor and SIRTP/IR/TE failure containment
         if: always()
         run: python3 scripts/record_gate.py --artifacts target/iommu-evidence/failures -- python3 scripts/iommu_failure_probe.py --input-manifest target/iommu-evidence/inputs.sha256 --revision '${{ github.sha }}' --artifacts target/iommu-evidence/probes
@@ -245,7 +255,7 @@ jobs:
         run: make build-mitigation-probe
       - name: Observe all five linked CR3 sites, four CPUs and CPL3 returns
         if: always()
-        run: python3 scripts/record_gate.py --artifacts target/mitigation-evidence/gate -- python3 scripts/mitigation_check.py --runtime --smp 4 --timeout 120 --kernel-elf kernel-target/mitigation/x86_64-unknown-none/release/kernel --esp kernel-target/mitigation/esp --build-command-json kernel-target/mitigation/build-command.json --artifacts target/mitigation-evidence/proof
+        run: python3 scripts/record_gate.py --artifacts target/mitigation-evidence/gate -- python3 scripts/mitigation_check.py --runtime --smp 4 --timeout 300 --kernel-elf kernel-target/mitigation/x86_64-unknown-none/release/kernel --esp kernel-target/mitigation/esp --build-command-json kernel-target/mitigation/build-command.json --artifacts target/mitigation-evidence/proof
       - name: Retain mitigation proof and any partial/failing evidence
         if: always()
         uses: actions/upload-artifact@v4

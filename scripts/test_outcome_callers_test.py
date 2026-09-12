@@ -289,18 +289,20 @@ class RecordedGateTests(unittest.TestCase):
         self.kernel.write_bytes(b"synthetic kernel image\n")
         self.artifacts = self.work / "artifacts"
 
-    def run_recorder(self, command):
+    def run_recorder(self, command, *, allow_qualified=False, strict=False):
         before = set(self.artifacts.glob("run-*"))
         environment = os.environ.copy()
         # The recorder probes tool versions; make unavailable tools deterministic
         # without launching QEMU/rustup or depending on the host toolchain.
         environment["PATH"] = str(self.work / "unavailable-tools")
+        environment["ZERO_OS_STRICT_TESTS"] = "1" if strict else "0"
         result = subprocess.run(
             [sys.executable, "-B", "-X", "utf8",
              str(self.work / "scripts" / "record_gate.py"),
              "--artifacts", str(self.artifacts),
              "--input-manifest", str(self.manifest),
-             "--revision", "synthetic-review-revision", "--", *command],
+             "--revision", "synthetic-review-revision",
+             *(["--allow-qualified"] if allow_qualified else []), "--", *command],
             env=environment, capture_output=True, text=True, encoding="utf-8", timeout=10,
         )
         produced = set(self.artifacts.glob("run-*")) - before
@@ -308,6 +310,23 @@ class RecordedGateTests(unittest.TestCase):
         output = produced.pop()
         summary = json.loads((output / "result.json").read_text(encoding="utf-8"))
         return result, output, summary
+
+    def test_diagnostic_ci_accepts_only_qualified_and_preserves_gate_status(self):
+        for strict in (False, True):
+            for status in (0, 1, 2, 3, 7):
+                with self.subTest(strict=strict, status=status):
+                    command = [sys.executable, "-c", f"raise SystemExit({status})"]
+                    result, output, summary = self.run_recorder(
+                        command, allow_qualified=True, strict=strict)
+                    accepted = status == 3 and not strict
+                    self.assertEqual(result.returncode, 0 if accepted else status)
+                    self.assertEqual(summary["status"], status)
+                    self.assertEqual(summary["command_status"], status)
+                    self.assertEqual(summary["qualified_accepted"], accepted)
+                    self.assertEqual((output / "gate.status").read_text().strip(), str(status))
+                    if accepted:
+                        self.assertIn("strict qualification remains open", result.stdout)
+                    self.assert_archive(output)
 
     def assert_archive(self, output):
         index = json.loads((output / "artifacts.sha256.json").read_text(encoding="utf-8"))
