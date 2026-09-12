@@ -469,6 +469,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     unsafe {
         stack_guard::run_rollback_self_test();
     }
+    #[cfg(feature = "iommu_init_probe")]
+    unsafe {
+        mm::page_table::run_mmio_rollback_self_test();
+        iommu::run_register_mapping_probes();
+    }
 
     // 安装内核栈守护页（必须在 mm 初始化后、启用中断前）
     klog_always!("[2.5/3] Installing kernel stack guard pages...");
