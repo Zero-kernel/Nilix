@@ -16,6 +16,148 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#include "wait_signal_probe.c"
+#include "fcntl_limit_probe.c"
+#include "exit_idle_probe.c"
+#include "vfs_context_probe.c"
+#include "tls_context_probe.c"
+
+#ifdef KSA_OPEN_FAULT_PROBE
+#include "open_fault_probe.c"
+#endif
+
+static int fd_exec_check(void) {
+    struct stat st;
+    const int closed[] = {0, 2, 32};
+    for (size_t i = 0; i < sizeof(closed) / sizeof(closed[0]); i++) {
+        errno = 0;
+        if (fcntl(closed[i], F_GETFD) != -1 || errno != EBADF) return 101;
+    }
+    if (fstat(1, &st) || !S_ISREG(st.st_mode)) return 102;
+    if (fcntl(1, F_GETFD) != 0) return 103;
+    return write(1, "ok", 2) == 2 ? 0 : 104;
+}
+
+static int standard_fd_smoke(void) {
+    int saved[3] = {-1, -1, -1}, p[2] = {-1, -1}, file = -1;
+    int held[256], held_count = 0, status = -1, result = 1;
+    const char *stage = "save";
+    char bytes[2];
+    struct stat st;
+    fflush(NULL);
+    for (int i = 0; i < 3; i++) {
+        if ((saved[i] = dup(i)) < 0) goto done;
+    }
+    stage = "close";
+    if (close(0)) goto done;
+    errno = 0;
+    if (fcntl(0, F_GETFD) != -1 || errno != EBADF) goto done;
+    struct pollfd probe = {.fd = 0, .events = POLLIN};
+    if (poll(&probe, 1, 0) != 1 || !(probe.revents & POLLNVAL)) goto done;
+    if (dup2(saved[0], 0) != 0) goto done;
+
+    stage = "pipe redirection";
+    if (pipe(p) || dup2(p[0], 0) != 0 || dup2(p[1], 1) != 1 ||
+        dup2(p[1], 2) != 2) goto done;
+    if (fstat(1, &st) || !S_ISFIFO(st.st_mode)) goto done;
+    if (write(1, "A", 1) != 1 || write(2, "B", 1) != 1) goto done;
+    probe.revents = 0;
+    if (poll(&probe, 1, 0) != 1 || !(probe.revents & POLLIN)) goto done;
+    if (read(0, bytes, 2) != 2 || memcmp(bytes, "AB", 2)) goto done;
+    for (int i = 0; i < 3; i++) if (dup2(saved[i], i) != i) goto done;
+    close(p[0]); close(p[1]); p[0] = p[1] = -1;
+
+    stage = "fork/exec inheritance";
+    file = open("/ksa-fd-file", O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
+    if (file < 0 || dup3(file, 32, O_CLOEXEC) != 32 || dup2(32, 1) != 1 ||
+        close(0) || fcntl(2, F_SETFD, FD_CLOEXEC)) goto done;
+    pid_t child = (pid_t)syscall(SYS_fork);
+    if (child == 0) {
+        errno = 0;
+        if (fcntl(0, F_GETFD) != -1 || errno != EBADF ||
+            fcntl(2, F_GETFD) != FD_CLOEXEC) syscall(SYS_exit, 105);
+        execl("/musl-test", "musl-test", "--fd-exec-check", (char *)NULL);
+        syscall(SYS_exit, 106);
+        __builtin_unreachable();
+    }
+    for (int i = 0; i < 3; i++) if (dup2(saved[i], i) != i) goto done;
+    close(32);
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) goto done;
+    if (pread(file, bytes, 2, 0) != 2 || memcmp(bytes, "ok", 2)) goto done;
+    puts("MUSL-STANDARD-FD-OK");
+
+    stage = "failed O_TRUNC";
+    while (held_count < 256) {
+        int next = dup(saved[1]);
+        if (next < 0) break;
+        held[held_count++] = next;
+    }
+    if (held_count == 256 || errno != EMFILE) goto done;
+    errno = 0;
+    int rejected = open("/ksa-fd-file", O_WRONLY | O_TRUNC);
+    if (rejected >= 0) { close(rejected); goto done; }
+    if (errno != EMFILE || pread(file, bytes, 2, 0) != 2 || memcmp(bytes, "ok", 2)) goto done;
+    while (held_count) close(held[--held_count]);
+    stage = "successful O_TRUNC";
+    int truncated = open("/ksa-fd-file", O_WRONLY | O_TRUNC);
+    if (truncated < 0) goto done;
+    close(truncated);
+    if (fstat(file, &st) || st.st_size != 0) goto done;
+    puts("MUSL-OPEN-TRUNC-OK");
+    result = 0;
+done:
+    while (held_count) close(held[--held_count]);
+    for (int i = 0; i < 3; i++) {
+        if (saved[i] >= 0) { dup2(saved[i], i); close(saved[i]); }
+    }
+    if (p[0] >= 0) close(p[0]);
+    if (p[1] >= 0) close(p[1]);
+    if (file >= 0) close(file);
+    close(32);
+    if (result) printf("MUSL-STANDARD-FD-FAIL stage=%s errno=%d child_status=%d\n", stage, errno, status);
+    return result;
+}
+
+static int robust_usercopy_smoke(void) {
+    for (int mode = 0; mode < 3; mode++) {
+        pid_t child = (pid_t)syscall(SYS_fork);
+        if (child == 0) {
+            char *pages = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            uint32_t *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (pages == MAP_FAILED || word == MAP_FAILED) syscall(SYS_exit, 111);
+            struct robust_head { void *next; long offset; void *pending; } head;
+            head.next = pages;
+            head.offset = (intptr_t)word - (intptr_t)pages;
+            head.pending = NULL;
+            *(void **)pages = &head;
+            *word = (uint32_t)syscall(SYS_gettid);
+            if (syscall(SYS_set_robust_list, &head, sizeof(head))) syscall(SYS_exit, 112);
+            if (mode == 1 && mprotect(word, 4096, PROT_READ)) syscall(SYS_exit, 113);
+            // A separate mapping removes the entire word region while the
+            // list node stays readable, so cleanup must fault on the word.
+            if (mode == 2 && munmap(word, 4096)) syscall(SYS_exit, 114);
+            syscall(SYS_exit, 0);
+            __builtin_unreachable();
+        }
+        int status = -1;
+        if (child < 0 || waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            printf("MUSL-ROBUST-USERCOPY-FAIL mode=%d status=%d errno=%d\n", mode, status, errno);
+            return 1;
+        }
+    }
+    puts("MUSL-ROBUST-USERCOPY-OK");
+    return 0;
+}
 
 // M0-6 poll/select Ring-3 smoke: exercises the real syscall boundary (dispatch
 // arms, PollFd / fd_set copy-in, revents / fd_set write-back, timeout casts) that
@@ -218,6 +360,8 @@ static void uname_abi_smoke(void) {
 }
 
 int main(int argc, char *argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "--vfs-cwd-exec-check") == 0) return vfs_context_exec_check(argc, argv);
+    if (argc == 2 && strcmp(argv[1], "--fd-exec-check") == 0) return fd_exec_check();
     // Test 1: Simple write syscall
     const char *msg = "Hello from musl libc!\n";
     write(1, msg, 22);
@@ -230,9 +374,6 @@ int main(int argc, char *argv[]) {
     int result = 42 * 2;
     printf("42 * 2 = %d\n", result);
 
-    // Test 4: Success message
-    puts("musl libc test passed!");
-
     // Test 5 (M0-6): poll/select/ppoll end-to-end smoke.
     poll_smoke();
 
@@ -244,6 +385,17 @@ int main(int argc, char *argv[]) {
 
     // Test 8 (D2-ABI-STAT-LAYOUT LOW leg): full new_utsname write.
     uname_abi_smoke();
+
+    if (standard_fd_smoke() || robust_usercopy_smoke()) return 1;
+    if (fcntl_limit_smoke()) return 1;
+    if (exit_idle_smoke()) return 1;
+    if (tls_context_smoke()) return 1;
+    if (vfs_context_probe()) return 1;
+    if (wait_namespace_smoke() || blocked_default_signal_smoke()) return 1;
+#ifdef KSA_OPEN_FAULT_PROBE
+    if (open_fault_smoke()) return 1;
+#endif
+    puts("musl libc test passed!");
 
     return 0;
 }
