@@ -79,6 +79,7 @@ extern crate klog;
 pub mod cgroupfs;
 pub mod devfs;
 pub mod ext2;
+mod identity;
 pub mod initramfs;
 pub mod manager;
 pub mod mount_namespace;
