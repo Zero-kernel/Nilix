@@ -262,10 +262,10 @@ pub struct SyscallPerCpu {
     /// writer set — W1: the scheduler before `switch_context`/`switch_to_user`
     /// switch-in; W3: `arch_prctl(SET_FS/SET_GS)`; W4: exec TLS reset — and COMMITTED
     /// (in ASM) by the SYSRET fast-path epilogue with two `wrmsr`, BEFORE user
-    /// RCX/RDX become live and while kernel GS is still active. This closes the
-    /// cross-task TLS leak where a task resumed mid-syscall via the `switch_context`
-    /// branch returned to ring 3 with the PREVIOUS task's FS/GS (the enter_usermode
-    /// IRETQ branch wrote the MSRs directly, but the switch_context branch did not).
+    /// RCX/RDX become live and while kernel GS is still active. The scheduler also
+    /// installs the live pair before every incoming context, including timer IRET
+    /// and kernel continuations that can reblock before reaching this epilogue.
+    /// SYSRET keeps an idempotent boundary commit for the same staged task state.
     /// CR4.FSGSBASE is never enabled, so the PCB (and hence this staged pair) is the
     /// authoritative source for the task's FS/GS. Appended at the struct TAIL so the
     /// existing GS-relative offsets (frame_ptr/syscall_active/kpti_*) are unchanged.
@@ -1214,11 +1214,10 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // this epilogue: they use the register-only paths at labels 7/8.
         "mov qword ptr gs:[{percpu_syscall_active}], 0",  // 释放标志
 
-        // R172-04 FIX: commit the staged per-task FS/GS bases to the MSRs HERE. This is
-        // the sole TLS-restore site for a task RESUMED mid-syscall via the scheduler's
-        // switch_context branch (which, unlike enter_usermode/switch_to_user, does NOT
-        // write the FS/GS MSRs) — without it the resumed task returned to ring 3 with the
-        // PREVIOUS task's FS/GS (cross-task TLS breach). Placed AT label 5: because here:
+        // R172-04 FIX: commit the staged per-task FS/GS bases to the MSRs HERE.
+        // KSA SMP TLS: the scheduler now restores live TLS before every incoming
+        // context, covering timer IRET and reblock before this SYSRET path. Keep
+        // this idempotent user-boundary commit. Placed AT label 5: because here:
         //   * kernel GS is still active (SWAPGS is far below), so gs:[pending_*] resolves
         //     to this CPU's SyscallPerCpu (the correct staged pair);
         //   * RCX/RDX are dead (both reloaded from the frame r12 below), so wrmsr may
