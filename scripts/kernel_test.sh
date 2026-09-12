@@ -1,40 +1,8 @@
 #!/bin/bash
-# ============================================================================
-# Zero-OS kernel runtime suite gate  (P1-C VT-2 / Gate #4 — make test truth)
-# ============================================================================
-# Unlike the historical `make test` one-liner (`timeout 10 qemu ... || true`),
-# which ALWAYS exited 0 even on boot hangs / panics / suite failures, this
-# script's exit code reflects REAL runtime-suite health.
-#
-# It boots the default `make build` ESP under QEMU and asserts ALL of:
-#
-#   1. the kernel emits a parseable Test Summary line
-#        `=== Test Summary: N passed, M deferred (...), K failed ===`
-#      (KEEP IN SYNC with kernel/src/runtime_tests.rs).
-#   2. K (failed) == 0.
-#   3. NO `KERNEL PANIC` on serial.
-#   4. NO NX-violation instruction-fetch #PF (`v=0e e=0011` in the QEMU
-#      `-d int` log — D1-BOOT-NX-KASLR-LAYOUT signature).
-#
-# Deferred/warning counts are informational only — they do NOT fail the gate
-# (the suite intentionally carries placeholders awaiting syscall infrastructure).
-#
-# Exit polarity (RV-8 / Gate #4):
-#   0 = PASS     — summary present, failed==0, no panic, no NX
-#   1 = FAILED   — suite executed with defect (failed>0) OR panic OR NX
-#   2 = NOT-RUN / BLOCKED — missing OVMF/kernel.elf/qemu OR no summary
-#                           within the budget without definitive FAIL evidence
-#
-# Process lesson (D1 + musl_check): health is read from serial + intlog, NEVER
-# from the QEMU exit code (`-no-reboot -no-shutdown` makes timeout the normal
-# end of a healthy run).
-#
-# Usage:   bash scripts/kernel_test.sh [esp_dir]
-# Env:     OVMF_PATH (autodetect fallback if unset)
-#          KERNEL_TEST_TIMEOUT seconds (default 45)
-#          KERNEL_TEST_DISK optional Ext3/JBD2 image; when set, the mounted
-#          production-journal probe marker becomes a mandatory gate condition
-# ============================================================================
+# Runtime suite gate. Exit 0=complete, 1=failed, 2=incomplete, 3=qualified.
+# ZERO_OS_STRICT_TESTS=1 rejects warnings, deferrals and skips.
+# KERNEL_TEST_DISK requires the production JBD2 write probe.
+# KERNEL_TEST_KEEP_LOGS=1 retains serial, process diagnostics and JSON counts.
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -43,30 +11,22 @@ ROOT="$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")"
 
 QEMU=qemu-system-x86_64
 # ESP defaults to <repo>/esp; a relative override is resolved against the repo root
-# (so `bash scripts/kernel_test.sh esp` works the same from anywhere), absolute kept.
+# (so `bash scripts/boot_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
-
-# Default 45s: remote calibration shows the full runtime suite + Ring-3 exit
-# lands under ~35s; 45s leaves CI/load margin without making NOT-RUN ambiguous
-# forever. Override with KERNEL_TEST_TIMEOUT for slow hosts.
 TO="${KERNEL_TEST_TIMEOUT:-45}"
+if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|120)$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 120"
+    exit 2
+fi
+for tool in "$QEMU" timeout python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "KERNEL-TEST BLOCKED: $tool not found in PATH"
+        exit 2
+    fi
+done
 
-# KEEP IN SYNC with kernel/src/runtime_tests.rs summary emitter.
-# Strict form matches the current klog line exactly; loose form tolerates minor
-# deferred-clause wording drift while still requiring three integer fields.
-SUMMARY_RE_STRICT='=== Test Summary: ([0-9]+) passed, ([0-9]+) deferred \(awaiting syscall infrastructure\), ([0-9]+) failed ==='
-SUMMARY_RE_LOOSE='Test Summary: ([0-9]+) passed, ([0-9]+) deferred[^,]*, ([0-9]+) failed'
-PANIC_MARKER='KERNEL PANIC'
-# Exact D1 NX signature (musl_check form). Bare `e=0011` is weaker and can
-# false-match unrelated exceptions.
-NX_RE='v=0e e=0011'
-CPU_RESET_RE='cpu[_ ]reset|CPU Reset'
-SUITE_START_MARKER='=== Runtime Functional Tests ==='
-JOURNAL_PROBE_MARKER='R180-6 production JBD2 write path passed'
-
-# OVMF firmware autodetect (prefers explicit OVMF_PATH, else mirrors the
-# Makefile OVMF_PATH search order including the OVMF_CODE*.fd fallback).
+# OVMF firmware autodetect (mirrors the Makefile OVMF_PATH logic).
 if [ -n "${OVMF_PATH:-}" ] && [ -f "${OVMF_PATH:-}" ]; then
     OVMF="$OVMF_PATH"
 elif [ -f /usr/share/qemu/OVMF.fd ]; then
@@ -76,206 +36,87 @@ elif [ -f /usr/share/ovmf/OVMF.fd ]; then
 elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
     OVMF=/usr/share/OVMF/OVMF_CODE.fd
 else
-    OVMF="$(find /usr/share/OVMF/ -type f -name 'OVMF_CODE*.fd' 2>/dev/null | head -n 1)"
-    if [ -z "$OVMF" ]; then
-        echo "KERNEL-TEST BLOCKED: OVMF firmware not found (set OVMF_PATH)"
-        exit 2
-    fi
+    echo "KERNEL-TEST FAIL: OVMF firmware not found (set OVMF_PATH)"
+    exit 2
 fi
 
 if [ ! -f "$ESP/kernel.elf" ]; then
-    echo "KERNEL-TEST BLOCKED: $ESP/kernel.elf missing — run 'make build' first"
+    echo "KERNEL-TEST FAIL: $ESP/kernel.elf missing — run 'make build' first"
     exit 2
 fi
 
-if ! command -v "$QEMU" >/dev/null 2>&1; then
-    echo "KERNEL-TEST BLOCKED: $QEMU not found in PATH"
-    exit 2
-fi
-
-ser="$(mktemp)"
-intlog="$(mktemp)"
-qpid=""
+ser="$(mktemp)" || exit 2
+intlog="$(mktemp)" || exit 2
+qemuerr="$(mktemp)" || exit 2
+timeoutlog="$(mktemp)" || exit 2
 cleanup() {
-    if [ -n "${qpid:-}" ]; then
-        kill "$qpid" 2>/dev/null || true
-        wait "$qpid" 2>/dev/null || true
+    if [ "${KERNEL_TEST_KEEP_LOGS:-0}" = 1 ]; then
+        echo "KERNEL-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
+    else
+        rm -rf -- "$ser.inputs"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
     fi
-    rm -f "$ser" "$intlog"
 }
 trap cleanup EXIT
-
-echo "=== Kernel Runtime Suite Gate (P1-C VT-2) ==="
-echo "Kernel:  $ESP/kernel.elf"
-echo "OVMF:    $OVMF"
-echo "Timeout: ${TO}s"
-echo ""
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 131' QUIT
+trap 'exit 143' TERM
 
 disk_args=()
-journal_probe_required=0
 if [[ -n "${KERNEL_TEST_DISK:-}" ]]; then
+    logical_block_size="${KERNEL_TEST_BLOCK_SIZE:-512}"
+    if [[ "$logical_block_size" != 512 && "$logical_block_size" != 4096 ]]; then
+        echo "KERNEL-TEST BLOCKED: KERNEL_TEST_BLOCK_SIZE must be 512 or 4096"
+        exit 2
+    fi
     case "$KERNEL_TEST_DISK" in /*) ;; *) KERNEL_TEST_DISK="$ROOT/$KERNEL_TEST_DISK" ;; esac
     if [[ ! -f "$KERNEL_TEST_DISK" ]]; then
         echo "KERNEL-TEST BLOCKED: journaled test disk not found: $KERNEL_TEST_DISK"
         exit 2
     fi
-    journal_probe_required=1
-    disk_args=(
-        -drive "if=none,file=$KERNEL_TEST_DISK,format=raw,id=vdisk0,cache=writeback,discard=unmap"
-        -device virtio-blk-pci,drive=vdisk0
-    )
-    echo "Disk:     $KERNEL_TEST_DISK (Ext3/JBD2 gate)"
+    disk_args=(-drive "if=none,file=$KERNEL_TEST_DISK,format=raw,id=vdisk0,cache=writeback,discard=unmap"
+               -device "virtio-blk-pci,drive=vdisk0,logical_block_size=$logical_block_size,physical_block_size=$logical_block_size")
 fi
 
-# Same proven health surface as boot_check / musl_check:
-# -display none + serial-to-file (never trust -nographic stdio alone)
-# -d int,cpu_reset for the NX signature without changing guest layout
-# single-core (SMP is test-smp's job)
-# D1-ISO: user-mode virtio-net (same device the run* targets attach, romfile=
-# suppresses the PXE option ROM) so the net_ns_tx_isolation runtime test can
-# exercise its driver-reach legs — without it eth0 never registers and the
-# TX device-ownership gate is only Warning-covered. restrict=on isolates the
-# guest from ALL external networking (slirp accepts + drops egress, so virtio
-# descriptor completion still works); ipv6=off silences unsolicited RA noise.
-timeout "$TO" "$QEMU" -bios "$OVMF" \
-    -drive format=raw,file=fat:rw:"$ESP" \
+python3 "$ROOT/scripts/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
+    --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
+"$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
+
+LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
+    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+    -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     "${disk_args[@]}" \
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
     -m 256M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>&1 &
-qpid=$!
+    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+qemu_status=$?
 
-# Full-window observation (musl_check lesson): do NOT kill at first summary.
-# A panic during post-suite teardown can land AFTER the summary line; early-stop
-# would open a false-pass window. Break early ONLY on panic (terminal) or if
-# QEMU dies; otherwise let timeout end the guest and re-grep the FINAL logs.
-for _ in $(seq 1 $((TO * 2))); do
-    sleep 0.5
-    if grep -Fq "$PANIC_MARKER" "$ser" 2>/dev/null; then
-        break
-    fi
-    kill -0 "$qpid" 2>/dev/null || break
-done
-
-kill "$qpid" 2>/dev/null || true
-wait "$qpid" 2>/dev/null || true
-qpid=""
-
-# --- Evaluate FINAL logs only (do not trust poll flags alone) ---
-has_panic=0
-grep -Fq "$PANIC_MARKER" "$ser" 2>/dev/null && has_panic=1
-
-nx=$(grep -cF "$NX_RE" "$intlog" 2>/dev/null)
-nx=${nx:-0}
-resets=$(grep -ciE "$CPU_RESET_RE" "$intlog" 2>/dev/null)
-resets=${resets:-0}
-
-has_suite_start=0
-grep -Fq "$SUITE_START_MARKER" "$ser" 2>/dev/null && has_suite_start=1
-
-journal_probe_passed=0
-grep -Fq "$JOURNAL_PROBE_MARKER" "$ser" 2>/dev/null && journal_probe_passed=1
-
-# Prefer the LAST matching summary line if multiple appear.
-summary_line=""
-if summary_line=$(grep -E "$SUMMARY_RE_STRICT" "$ser" 2>/dev/null | tail -n 1); then
-    :
-elif summary_line=$(grep -E "$SUMMARY_RE_LOOSE" "$ser" 2>/dev/null | tail -n 1); then
-    :
-else
-    summary_line=""
-fi
-
-passed=""
-deferred=""
-failed=""
-has_summary=0
-if [ -n "$summary_line" ]; then
-    # Extract the three integers in order of appearance.
-    # shellcheck disable=SC2001
-    nums=$(echo "$summary_line" | sed -E 's/.*Test Summary: ([0-9]+) passed, ([0-9]+) deferred[^,]*, ([0-9]+) failed.*/\1 \2 \3/')
-    # Validate parse produced exactly three integers.
-    if echo "$nums" | grep -qE '^[0-9]+ [0-9]+ [0-9]+$'; then
-        # shellcheck disable=SC2086
-        set -- $nums
-        passed=$1
-        deferred=$2
-        failed=$3
-        has_summary=1
-    else
-        summary_line=""
-        has_summary=0
-    fi
-fi
-
-echo "=== Parsed Results ==="
-if [ "$has_summary" -eq 1 ]; then
-    echo "Summary: passed=${passed} deferred=${deferred} failed=${failed}"
-    echo "  line: $summary_line"
-else
-    echo "Summary: MISSING (no parseable Test Summary within ${TO}s)"
-fi
-echo "Panic:   $has_panic"
-echo "NX #PF:  $nx (signature '$NX_RE')"
-echo "Suite:   start_marker=${has_suite_start}"
-if [ "$journal_probe_required" -eq 1 ]; then
-    echo "Ext3:    journal_probe=${journal_probe_passed}"
-fi
-if [ "$resets" -gt 0 ]; then
-    echo "INFO:    intlog contains $resets cpu_reset marker(s) (not hard-gated)"
-fi
-echo ""
-
-# --- Classify (RV-8): definitive FAIL first, then NOT-RUN, else PASS ---
-rc=0
-class="PASS"
-
-if [ "$has_panic" -eq 1 ]; then
-    echo "KERNEL-TEST FAIL: kernel panic observed on serial"
+python3 "$ROOT/scripts/gate_log.py" --serial "$ser" --intlog "$intlog" \
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+rc=$?
+python3 "$ROOT/scripts/gate_inputs.py" verify --output "$ser.inputs" || rc=1
+if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'R180-6 production JBD2 write path passed' "$ser"; then
+    echo "KERNEL-TEST FAIL: missing production JBD2 write probe"
     rc=1
-    class="FAILED"
 fi
-if [ "$nx" -gt 0 ]; then
-    echo "KERNEL-TEST FAIL: $nx NX-violation #PF (D1 signature '$NX_RE')"
-    grep -m1 -F "$NX_RE" "$intlog" 2>/dev/null | sed 's/^/    /'
+if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Eq "^KSA-019-BLOCK PASS sector_bytes=$logical_block_size sector=[0-9]+ capacity_sectors=[0-9]+ restored=exact$" "$ser"; then
+    echo "KERNEL-TEST FAIL: missing actual logical-sector round-trip/restoration evidence"
     rc=1
-    class="FAILED"
 fi
-if [ "$has_summary" -eq 1 ] && [ "$failed" -gt 0 ]; then
-    echo "KERNEL-TEST FAIL: runtime suite reported ${failed} failed test(s)"
-    rc=1
-    class="FAILED"
-fi
-if [ "$journal_probe_required" -eq 1 ] \
-    && [ "$has_summary" -eq 1 ] \
-    && [ "$journal_probe_passed" -ne 1 ]; then
-    echo "KERNEL-TEST FAIL: attached Ext3 image did not complete the production JBD2 write probe"
-    rc=1
-    class="FAILED"
-fi
-
-# Incomplete only if no definitive FAIL evidence yet.
-if [ "$rc" -eq 0 ] && [ "$has_summary" -ne 1 ]; then
-    echo "KERNEL-TEST NOT-RUN: no parseable Test Summary within ${TO}s"
-    if [ "$has_suite_start" -eq 1 ]; then
-        echo "    => suite started but did not finish scoring (budget / hang mid-suite)"
-    else
-        echo "    => no suite-start marker either (firmware stall, wrong image, or pre-suite hang)"
-    fi
-    rc=2
-    class="NOT-RUN"
-fi
-
 if [ "$rc" -ne 0 ]; then
+    echo "KERNEL-TEST NOT-PASSED: gate status=$rc (1=failure, 2=incomplete, 3=qualified)"
     echo "--- serial tail ---"
-    tail -40 "$ser" 2>/dev/null | sed 's/^/    /'
-    echo ""
-    echo "KERNEL-TEST ${class} (exit ${rc})"
-else
-    echo "KERNEL-TEST OK: Test Summary present, failed=0, 0 panic, 0 NX (passed=${passed}, deferred=${deferred})"
+    tail -25 "$ser" 2>/dev/null | sed 's/^/    /'
+    echo "--- timeout / QEMU stderr ---"
+    tail -20 "$timeoutlog" "$qemuerr" 2>/dev/null | sed 's/^/    /'
 fi
 
+if [ "$rc" -eq 0 ]; then
+    echo "KERNEL-TEST OK: runtime summary + PID 1 completion, no fatal markers or qualifications"
+fi
+printf '%s\n' "$rc" > "$ser.gate.status"
 exit "$rc"

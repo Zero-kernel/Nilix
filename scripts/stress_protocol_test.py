@@ -48,7 +48,7 @@ def ready(config: protocol.StressConfig, mode: str) -> str:
 
 
 def summary() -> str:
-    return "Test Summary: 42 passed, 0 deferred (hardware unavailable), 0 failed"
+    return "=== Test Summary: 42 passed, 0 deferred (hardware unavailable), 0 failed ==="
 
 
 def smp_round(config: protocol.StressConfig, sequence: int, checksum: str) -> str:

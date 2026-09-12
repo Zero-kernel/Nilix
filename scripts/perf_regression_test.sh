@@ -128,8 +128,8 @@ calculate_regression() {
 
     # Skip if measured is 0 (test skipped or not implemented)
     if [ "$measured" -eq 0 ]; then
-        echo "  ⚠️  SKIP: $name - no measurement available"
-        return 0
+        echo "PERF-CASE name=$name status=deferred owner=scripts/perf_regression_test.sh reason=measurement-workload-unimplemented"
+        return 3
     fi
 
     # Calculate percentage difference
@@ -174,6 +174,7 @@ run_performance_tests() {
     echo ""
 
     local regression_count=0
+    local deferred_count=0
     local total_tests=0
 
     # Test 1: Syscall Overhead
@@ -185,7 +186,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_SYSCALL_NS" "$measured_syscall_ns" "Syscall latency"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -196,7 +201,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_CTX_SWITCH_US" "$measured_ctx_switch_us" "Context switch"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -207,7 +216,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_PAGE_FAULT_US" "$measured_page_fault_us" "Page fault"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -218,7 +231,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_ALLOC_OPS" "$measured_alloc_ops" "Memory allocation"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -229,7 +246,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_VFS_OPS" "$measured_vfs_ops" "VFS operations"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -240,7 +261,11 @@ run_performance_tests() {
     if calculate_regression "$BASELINE_NET_MBPS" "$measured_net_mbps" "Network throughput"; then
         :
     else
-        regression_count=$((regression_count + 1))
+        if [ "$?" -eq 3 ]; then
+            deferred_count=$((deferred_count + 1))
+        else
+            regression_count=$((regression_count + 1))
+        fi
     fi
     total_tests=$((total_tests + 1))
     echo ""
@@ -251,12 +276,17 @@ run_performance_tests() {
     echo "=== Performance Test Summary ==="
     echo "Total tests:  $total_tests"
     echo "Regressions:  $regression_count"
-    echo "Passed:       $((total_tests - regression_count))"
+    echo "Passed:       $((total_tests - regression_count - deferred_count))"
+    echo "Deferred:     $deferred_count"
     echo ""
 
     if [ "$regression_count" -gt 0 ]; then
         echo "❌ PERF-TEST REGRESSION: $regression_count metric(s) exceeded ${REGRESSION_THRESHOLD}% threshold"
         return 1
+    elif [ "$deferred_count" -gt 0 ]; then
+        echo "PERF-TEST QUALIFIED: $deferred_count unimplemented measurement workloads"
+        if [ "${ZERO_OS_STRICT_TESTS:-0}" = 1 ]; then return 1; fi
+        return 3
     else
         echo "✅ PERF-TEST PASS: All metrics within acceptable bounds"
         echo ""

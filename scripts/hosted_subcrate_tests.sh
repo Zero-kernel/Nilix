@@ -35,6 +35,8 @@ trap 'rm -rf -- "${log_root}"' EXIT
 mkdir -p "${target_root}"
 cd "${repo_root}"
 
+passed_unit_tests=0
+
 run_suite() {
     local name="$1"
     local expected_passed="$2"
@@ -62,6 +64,7 @@ run_suite() {
         return 1
     fi
 
+    passed_unit_tests=$((passed_unit_tests + expected_passed))
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
@@ -113,6 +116,7 @@ run_standalone_rust_suite() {
         return 1
     fi
 
+    passed_unit_tests=$((passed_unit_tests + expected_passed))
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
@@ -121,13 +125,28 @@ run_suite audit 15 0 \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
+run_suite cpu-local 11 0 \
+    --manifest-path kernel/cpu_local/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features host_harness \
+    --lib --locked
+
+# Includes the compile-fail oracle preventing a borrowed local slot from escaping.
+CARGO_TARGET_DIR="${target_root}/cpu-local" cargo +nightly-2025-12-08 test \
+    --manifest-path kernel/cpu_local/Cargo.toml \
+    --target x86_64-unknown-linux-gnu --features host_harness --doc --locked
+
+run_suite livepatch 3 0 \
+    --manifest-path kernel/livepatch/Cargo.toml \
+    --target x86_64-unknown-linux-gnu --lib --locked
+
 run_suite mm 25 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
     --lib --locked
 
-run_suite block 9 0 \
+run_suite block 22 0 \
     --manifest-path kernel/block/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -143,13 +162,19 @@ run_suite seccomp 14 0 \
 # test that is invalid in a hosted process. Keep the security-relevant RF186
 # allocator lifecycle pair executable and count-pinned until that legacy test
 # receives an explicit host-harness conversion.
-run_suite cap-rf186 2 9 \
+run_suite cap-rf186 2 10 \
     --manifest-path kernel/cap/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
     --lib --locked -- rf186_23_
 
-run_suite net 116 0 \
+run_suite cap-cloexec 1 11 \
+    --manifest-path kernel/cap/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness \
+    --lib --locked -- ksa005_
+
+run_suite net 118 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -161,13 +186,13 @@ run_suite ipc-robust 4 17 \
     --features mm/host_harness \
     --lib --locked -- robust_
 
-run_suite vfs 22 0 \
+run_suite vfs 62 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
-    --features mm/host_harness \
+    --features host_harness \
     --lib --locked
 
-run_suite kernel-core 29 0 \
+run_suite kernel-core 68 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -181,6 +206,16 @@ run_suite kernel-core 29 0 \
 # Compile it directly so Cargo never tries to link the no_std kernel binary's
 # panic/allocation handlers into a hosted std test process.
 run_standalone_rust_suite kernel-coverage 3 0 kernel tests/test_coverage.rs
+run_standalone_rust_suite iommu-register-window 11 0 kernel/iommu register_window.rs
+run_standalone_rust_suite iommu-init-state 5 0 kernel/iommu init_state.rs
+
+# Legacy VT-d encodings, QI completion/error handling and fault ownership are
+# pure hosted tests. The MM host harness supplies the hosted allocator contract.
+run_suite iommu 67 0 \
+    --manifest-path kernel/iommu/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness \
+    --lib --locked
 
 run_check ipc-tests \
     --manifest-path kernel/ipc/Cargo.toml \
@@ -200,4 +235,4 @@ run_check kernel-tests \
     --features host_harness \
     --tests --locked
 
-echo "OK: hosted kernel sub-crate CI gate passed (239 tests; 3 test-code compile checks; default parallelism)."
+echo "OK: hosted kernel sub-crate CI gate passed (${passed_unit_tests} unit tests; CpuLocal doctests; 3 test-code compile checks; default parallelism)."

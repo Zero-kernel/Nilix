@@ -52,7 +52,12 @@ case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # the clean-exit marker past the old 25s window on a loaded remote. The gate still
 # observes to completion and re-greps the full log, so a wider window never weakens
 # it (it only fails-fast earlier on KERNEL PANIC).
-TO="${MUSL_CHECK_TIMEOUT:-35}"
+TO="${MUSL_CHECK_TIMEOUT:-60}"
+CPUS="${MUSL_CHECK_CPUS:-1}"
+if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|120)$ || ! "$CPUS" =~ ^(1|2|4|8)$ ]]; then
+    echo "MUSL-CHECK BLOCKED: invalid timeout or CPU count (1/2/4/8)"
+    exit 2
+fi
 
 # Serial markers — KEEP IN SYNC with userspace/hello_musl.c.
 # Both musl markers are required (printf path AND the final puts path); checked
@@ -77,7 +82,7 @@ MUSL_STAT_MARKER='MUSL-STAT-OK'
 MUSL_UNAME_MARKER='MUSL-UNAME-OK'
 # Accept both the sys_exit ("exited with code") and reaper ("terminated with
 # exit code") phrasings; the musl Ring-3 path emits the latter.
-EXIT_RE='Process [0-9]+ (exited with code|terminated with exit code) 0'
+EXIT_RE='^Process 1 (exited with code|terminated with exit code) 0$'
 PANIC_MARKER='KERNEL PANIC'
 # The exact D1-BOOT-NX-KASLR-LAYOUT signature. QEMU's `-d int` logs page faults
 # as `v=%02x e=%04x` (vector and error code adjacent), so matching the full
@@ -110,53 +115,45 @@ if [ ! -f "$ESP/kernel.elf" ]; then
     exit 2
 fi
 
-ser="$(mktemp)"
-intlog="$(mktemp)"
-qpid=""
+if [ -n "${MUSL_CHECK_LOG_DIR:-}" ]; then
+    mkdir -p -- "$MUSL_CHECK_LOG_DIR" || exit 2
+    artifact_dir="$(mktemp -d "$MUSL_CHECK_LOG_DIR/musl.XXXXXX")" || exit 2
+    ser="$artifact_dir/serial.log"
+    intlog="$artifact_dir/interrupts.log"
+    echo "MUSL-CHECK ARTIFACTS: $artifact_dir"
+else
+    ser="$(mktemp)"
+    intlog="$(mktemp)"
+fi
+qemuerr="$ser.qemu.stderr"
+timeoutlog="$ser.timeout.stderr"
 cleanup() {
-    if [ -n "${qpid:-}" ]; then
-        kill "$qpid" 2>/dev/null || true
-        wait "$qpid" 2>/dev/null || true
+    if [ -z "${MUSL_CHECK_LOG_DIR:-}" ]; then
+        rm -rf -- "$ser.inputs"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.qemu.status" "$ser.gate.status"
     fi
-    rm -f "$ser" "$intlog"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# `-d int,cpu_reset` is the same proven tracing mode used by boot_check.sh: it
-# perturbs only host-side logging, not the guest binary/layout, so it captures
-# the NX #PF signature without masking a real fault. Single-core, not
-# timing-sensitive.
-timeout "$TO" "$QEMU" -bios "$OVMF" \
-    -drive format=raw,file=fat:rw:"$ESP" \
-    -netdev user,id=net0 \
+# Observe the full window, retaining process status and both diagnostic streams.
+python3 "$ROOT/scripts/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
+    --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
+"$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
+
+LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
+    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+    -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
+    -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
-    -m 256M -vga std -no-reboot -no-shutdown \
+    -m 256M -smp "$CPUS" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>&1 &
-qpid=$!
-
-# Observe the FULL run — do NOT early-stop once the exit marker appears. A panic
-# during process teardown / zombie reap / the return to the idle loop can land
-# AFTER the "exit code 0" line, so stopping at the exit marker would leave a
-# panic false-pass window. We therefore break early ONLY to fail-fast on a panic
-# (terminal) or if QEMU dies on its own; otherwise we let `timeout $TO` end the
-# guest and evaluate the COMPLETE serial + int logs. The musl/exit markers are
-# re-grepped from the final log below — program order guarantees they precede the
-# exit line, so full-window observation cannot miss them.
-# (Safety > Efficiency > Speed: a few seconds of extra wall-clock buys a
-# fail-closed panic guarantee.)
-for _ in $(seq 1 $((TO * 2))); do
-    sleep 0.5
-    if grep -Fq "$PANIC_MARKER" "$ser" 2>/dev/null; then
-        break
-    fi
-    kill -0 "$qpid" 2>/dev/null || break
-done
-
-kill "$qpid" 2>/dev/null || true
-wait "$qpid" 2>/dev/null || true
-qpid=""
+    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+qemu_status=$?
+printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
 # Evaluate the final logs (do not trust only the poll flag).
 has_printf=0;  grep -Fq "$MUSL_PRINTF_MARKER"  "$ser" 2>/dev/null && has_printf=1
@@ -172,6 +169,88 @@ nx=$(grep -cF "$NX_RE" "$intlog" 2>/dev/null); nx=${nx:-0}
 resets=$(grep -ciE "$CPU_RESET_RE" "$intlog" 2>/dev/null); resets=${resets:-0}
 
 rc=0
+python3 "$ROOT/scripts/gate_inputs.py" verify --output "$ser.inputs" || rc=1
+term_events=$(grep -cF 'timeout: sending signal TERM to command' "$timeoutlog" || true)
+kill_events=$(grep -cF 'timeout: sending signal KILL to command' "$timeoutlog" || true)
+if [ "$qemu_status" -ne 124 ] || [ "$term_events" -ne 1 ] || [ "$kill_events" -ne 0 ]; then
+    echo "MUSL-CHECK FAIL: QEMU timeout contract status=$qemu_status TERM=$term_events KILL=$kill_events"
+    rc=1
+fi
+for marker in MUSL-STANDARD-FD-OK MUSL-OPEN-TRUNC-OK MUSL-ROBUST-USERCOPY-OK MUSL-WAIT-NAMESPACE-OK MUSL-BLOCKED-SIGNAL-OK MUSL-FCNTL-LIMIT-OK; do
+    if ! grep -Fxq "$marker" "$ser"; then
+        echo "MUSL-CHECK FAIL: guest regression marker missing ($marker)"
+        rc=1
+    fi
+done
+# The VFS child must finish functional pivot before its parent acknowledges the
+# complete context suite. Require one exact record per stage in execution order;
+# a duplicate, altered scope, deferred pivot, or earlier success cannot pass.
+if ! awk \
+    -v pivot='MUSL-VFS-PIVOT-OK scope=transaction-fork-namespaces-descriptors-repeat' \
+    -v context='MUSL-VFS-CONTEXT-OK scope=cwd-components-dac-ids-chroot' \
+    -v success="$MUSL_SUCCESS_MARKER" -v exiting="$EXIT_RE" '
+    $0 == "MUSL-FCNTL-LIMIT-OK" { f++; fl=NR }
+    index($0, "MUSL-VFS-PIVOT-OK") == 1 { ps++ }
+    index($0, "MUSL-VFS-CONTEXT-OK") == 1 { cs++ }
+    index($0, "MUSL-VFS-PIVOT-DEFERRED") == 1 { invalid++ }
+    $0 == pivot { p++; pl=NR }
+    $0 == context { c++; cl=NR }
+    $0 == success { s++; sl=NR }
+    $0 ~ exiting { e++; el=NR }
+    END { exit !(f == 1 && p == 1 && ps == 1 && c == 1 && cs == 1 &&
+                  s == 1 && e == 1 && invalid == 0 &&
+                  fl < pl && pl < cl && cl < sl && sl < el) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: missing, duplicate, malformed, deferred or unordered VFS completion"
+    rc=1
+fi
+if [ "$CPUS" -gt 1 ] && ! grep -Fxq "MUSL-EXIT-IDLE-OK cases=$(( (CPUS - 1) * 2 ))" "$ser"; then
+    echo "MUSL-CHECK FAIL: missing cross-CPU exit/reap completion"
+    rc=1
+fi
+# KSA SMP TLS: an affinity mask or a skipped/partial probe cannot qualify the
+# IRQ-only migration contract. Require four ordered measurements, alternating
+# distinct actual CPUs, with both exact TLS cookies before the final marker.
+if [ "$CPUS" -ge 3 ]; then
+    if ! awk -v cpus="$CPUS" '
+        index($0, "MUSL-TLS-IRQ-CASE-PASS") == 1 {
+            n++; last=NR;
+            if (NF != 6 || $1 != "MUSL-TLS-IRQ-CASE-PASS" || $2 != "phase=" (n+1) ||
+                $3 !~ /^cpu=[0-9]+$/ || $4 != "fs_cookie=4653544c53000001" ||
+                $5 != "gs_cookie=4753544c53000001" || $6 !~ /^checks=[1-9][0-9]*$/) bad++;
+            split($3, field, "="); cpu=field[2]+0;
+            if (cpu < 0 || cpu >= cpus) bad++;
+            if (n == 1) first=cpu;
+            if (n == 2) second=cpu;
+            if ((n == 2 && first == second) || (n > 2 && cpu != (n % 2 ? first : second))) bad++;
+        }
+        index($0, "MUSL-TLS-IRQ-OK") == 1 { ok++; end=NR; if ($0 != "MUSL-TLS-IRQ-OK migrations=4") bad++ }
+        index($0, "MUSL-TLS-IRQ-SKIP") == 1 { bad++ }
+        END { exit !(n == 4 && ok == 1 && bad == 0 && last < end) }
+    ' "$ser"; then
+        echo "MUSL-CHECK FAIL: missing or invalid exact-TLS IRQ migration evidence"
+        rc=1
+    fi
+elif ! awk '
+    index($0, "MUSL-TLS-IRQ-SKIP") == 1 {
+        n++; if ($0 != "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus") bad++;
+    }
+    /^MUSL-TLS-IRQ-(CASE-PASS|OK)/ { bad++ }
+    END { exit !(n == 1 && bad == 0) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: invalid TLS migration applicability record"
+    rc=1
+fi
+for case_name in regular pipe socket nofile; do
+    if ! grep -Fxq "KSA-013-CASE PASS case=$case_name" "$ser"; then
+        echo "MUSL-CHECK FAIL: missing fcntl/NOFILE case $case_name"
+        rc=1
+    fi
+done
+if grep -Eq '^MUSL-.*-FAIL' "$ser"; then
+    echo "MUSL-CHECK FAIL: guest reported a failed probe"
+    rc=1
+fi
 if [ "$has_printf" -ne 1 ]; then
     echo "MUSL-CHECK FAIL: libc printf marker missing (expected '$MUSL_PRINTF_MARKER')"
     echo "    => musl crt/auxv/stdio did not run to the printf stage (or esp is not the musl_test kernel)"
@@ -202,7 +281,7 @@ if [ "$has_uname" -ne 1 ]; then
     rc=1
 fi
 if [ "$has_exit" -ne 1 ]; then
-    echo "MUSL-CHECK FAIL: no clean exit marker within ${TO}s (expected 'Process N ... exit code 0')"
+    echo "MUSL-CHECK FAIL: PID 1 did not exit successfully within ${TO}s"
     rc=1
 fi
 if [ "$has_panic" -eq 1 ]; then
@@ -229,4 +308,5 @@ else
         echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI markers + clean exit + 0 NX faults)"
     fi
 fi
+printf '%s\n' "$rc" > "$ser.gate.status"
 exit "$rc"

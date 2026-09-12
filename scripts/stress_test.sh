@@ -56,6 +56,7 @@ STRESS_BLOCK_ACTIVE_POLL_US="${STRESS_BLOCK_ACTIVE_POLL_US:-250}"
 
 TEST_PASS=0
 TEST_FAIL=1
+TEST_QUALIFIED=3
 ACTIVE_PID=""
 ACTIVE_MONITOR_PID=""
 VM_STATUS=0
@@ -493,11 +494,17 @@ run_normal_profile() {
         echo "  FAIL: marker monitor exited unexpectedly (status=$MONITOR_STATUS)"
         result=$TEST_FAIL
     fi
-    if ! validate_current_log "$directory/stress.cfg" normal "$STRESS_MIN_HEARTBEATS" "$qmp_required"; then
+    validate_current_log "$directory/stress.cfg" normal "$STRESS_MIN_HEARTBEATS" "$qmp_required"
+    local validation_status=$?
+    if [ "$validation_status" -eq "$TEST_QUALIFIED" ]; then
+        if [ "$result" -eq "$TEST_PASS" ]; then result=$TEST_QUALIFIED; fi
+    elif [ "$validation_status" -ne 0 ]; then
         result=$TEST_FAIL
     fi
     if [ "$result" -eq "$TEST_PASS" ]; then
         echo "  PASS: profile=$profile run=$run_id config_sha256=$digest duration=${STRESS_DURATION}s"
+    elif [ "$result" -eq "$TEST_QUALIFIED" ]; then
+        echo "  QUALIFIED: workload completed; runtime/security prerequisites remain"
     else
         show_failure_logs "$profile"
     fi
@@ -507,7 +514,7 @@ run_normal_profile() {
 run_block_profile() {
     echo
     echo "=== PROFILE: block (real JBD2 crash + exact-disk recovery) ==="
-    local accepted="" attempt offset directory run_id result
+    local accepted="" attempt offset directory run_id result writer_qualified=0
     for ((attempt = 1; attempt <= STRESS_BLOCK_CRASH_ATTEMPTS; attempt++)); do
         offset="${BLOCK_KILL_OFFSETS[attempt - 1]}"
         directory="$SUITE_TMP/block-attempt-$attempt"
@@ -563,7 +570,12 @@ run_block_profile() {
             echo "    rejected: SIGKILL missed the active RECOVER/Zero-Intent/s_start tail"
             result=$TEST_FAIL
         fi
-        if ! validate_current_log "$directory/stress.cfg" writer 0 0 >/dev/null; then
+        validate_current_log "$directory/stress.cfg" writer 0 0 >/dev/null
+        local validation_status=$?
+        writer_qualified=0
+        if [ "$validation_status" -eq "$TEST_QUALIFIED" ]; then
+            writer_qualified=1
+        elif [ "$validation_status" -ne 0 ]; then
             echo "    rejected: writer marker/runtime contract failed"
             result=$TEST_FAIL
         fi
@@ -639,11 +651,17 @@ run_block_profile() {
         echo "  FAIL: JBD2 s_start/Ext3 RECOVER were not cleared after recovery"
         result=$TEST_FAIL
     fi
-    if ! validate_current_log "$directory/stress.cfg" recovery "$STRESS_MIN_HEARTBEATS" 0; then
+    validate_current_log "$directory/stress.cfg" recovery "$STRESS_MIN_HEARTBEATS" 0
+    local recovery_status=$?
+    if [ "$recovery_status" -ne 0 ] && [ "$recovery_status" -ne "$TEST_QUALIFIED" ]; then
         result=$TEST_FAIL
+    elif [ "$result" -eq "$TEST_PASS" ] && { [ "$writer_qualified" -eq 1 ] || [ "$recovery_status" -eq "$TEST_QUALIFIED" ]; }; then
+        result=$TEST_QUALIFIED
     fi
     if [ "$result" -eq "$TEST_PASS" ]; then
         echo "  PASS: active journal recovered on the exact disk; post-recovery writes stopped"
+    elif [ "$result" -eq "$TEST_QUALIFIED" ]; then
+        echo "  QUALIFIED: workload completed; runtime/security prerequisites remain"
     else
         show_failure_logs block-recovery
     fi
@@ -653,6 +671,7 @@ run_block_profile() {
 total=0
 passed=0
 failed=0
+qualified=0
 for profile in "${SELECTED_PROFILES[@]}"; do
     total=$((total + 1))
     if [ "$profile" = block ]; then
@@ -662,6 +681,7 @@ for profile in "${SELECTED_PROFILES[@]}"; do
     fi
     case $? in
         "$TEST_PASS") passed=$((passed + 1)) ;;
+        "$TEST_QUALIFIED") qualified=$((qualified + 1)) ;;
         *) failed=$((failed + 1)) ;;
     esac
 done
@@ -671,9 +691,14 @@ echo "=== Stress-v2 Summary ==="
 echo "Total:  $total"
 echo "Passed: $passed"
 echo "Failed: $failed"
+echo "Qualified: $qualified"
 if [ "$failed" -ne 0 ]; then
     echo "STRESS-TEST UNSTABLE: $failed profile(s) failed"
     exit 1
+fi
+if [ "$qualified" -gt 0 ]; then
+    echo "STRESS-TEST QUALIFIED: $qualified profile(s) completed with runtime qualifications"
+    exit "$TEST_QUALIFIED"
 fi
 echo "STRESS-TEST STABLE: $passed passed"
 exit 0

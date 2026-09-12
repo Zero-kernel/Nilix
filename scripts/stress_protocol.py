@@ -1242,14 +1242,36 @@ SUMMARY_RE = re.compile(
 
 
 def validate_runtime_summary(serial_path: str | os.PathLike[str]) -> tuple[int, int, int]:
+    return tuple(validate_runtime_evidence(serial_path)["legacy_counts"])
+
+
+def validate_runtime_evidence(serial_path: str | os.PathLike[str]) -> dict[str, Any]:
+    from gate_log import SUMMARY, FAILED_TEST, SERIAL_FATAL, WARNING, SKIPPED, outcome_evidence
+
     text = Path(serial_path).read_bytes().decode("utf-8", errors="replace")
-    summaries = [tuple(int(value) for value in match.groups()) for match in SUMMARY_RE.finditer(text)]
-    if not summaries:
-        raise StressProtocolError("no parseable kernel Test Summary was emitted")
-    passed, deferred, failed = summaries[-1]
+    lines = text.splitlines()
+    if FAILED_TEST.search(text) or SERIAL_FATAL.search(text):
+        raise StressProtocolError("runtime serial contains failure/fatal evidence")
+    summaries = [tuple(map(int, match.groups())) for line in lines if (match := SUMMARY.fullmatch(line))]
+    if len(summaries) != 1 or sum("Test Summary" in line for line in lines) != 1:
+        raise StressProtocolError("expected exactly one well-formed kernel Test Summary")
+    passed, deferred, failed = summaries[0]
     if failed != 0:
         raise StressProtocolError(f"kernel runtime summary reported {failed} failed tests")
-    return passed, deferred, failed
+    strict = os.environ.get("ZERO_OS_STRICT_TESTS") == "1"
+    details, errors = outcome_evidence(lines, summaries[0], strict)
+    if errors:
+        raise StressProtocolError("; ".join(errors))
+    runtime_counts = details["suites"].get("RUNTIME")
+    if not sum(runtime_counts.values() if runtime_counts else summaries[0]):
+        raise StressProtocolError("kernel runtime summary contains no tests")
+    if any(suite["failed"] for suite in details["suites"].values()):
+        raise StressProtocolError("structured runtime/security suite reports failure")
+    diagnostics = [line for line in lines if not line.startswith(("RUNTIME-", "SECURITY-"))]
+    qualified = bool(deferred) or any(WARNING.search(line) or SKIPPED.search(line) for line in diagnostics) or any(suite[key] for suite in details["suites"].values() for key in ("warning", "deferred", "skipped"))
+    if strict and qualified:
+        raise StressProtocolError("strict mode rejects qualified runtime/security results")
+    return {"legacy_counts": summaries[0], "status": "qualified" if qualified else "complete", **details}
 
 
 def validate_diagnostics(
@@ -1336,7 +1358,7 @@ def validate_log(
 ) -> dict[str, Any]:
     markers = parse_protocol_log(serial_path)
     validate_header(markers, config, mode)
-    validate_runtime_summary(serial_path)
+    runtime = validate_runtime_evidence(serial_path)
     validate_diagnostics(serial_path, interrupt_path, qemu_stderr_path)
     if mode == "writer":
         commits = validate_writer_markers(markers, config)
@@ -1374,6 +1396,7 @@ def validate_log(
         "run_id": config.run_hex,
         "heartbeats": len(heartbeats),
         "commits": len(commits),
+        "runtime": runtime,
     }
 
 
@@ -1393,7 +1416,7 @@ def command_validate_log(args: argparse.Namespace) -> int:
         qmp_after_path=args.qmp_after,
     )
     print(json.dumps(result, sort_keys=True))
-    return 0
+    return 3 if result["runtime"]["status"] == "qualified" else 0
 
 
 def scan_new_protocol_lines(
