@@ -117,7 +117,8 @@ jobs:
     name: QEMU / boot and SMP
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Three sequential 15-minute observation windows plus setup/reporting.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel

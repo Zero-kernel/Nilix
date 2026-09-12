@@ -52,7 +52,7 @@ and HTML/XML/JSON Python coverage. Set `HOSTED_TEST_LOG_DIR` to retain individua
 Rust suite logs, `hosted.junit.xml`, and its verified count table. Actions publishes each group's
 summary on its run page and retains the full directory as an artifact.
 
-The core CI jobs allow up to 30--45 minutes for build and guest work, with each
+The core CI jobs allow up to 30--60 minutes for build and guest work, with each
 guest evidence collector receiving a 900-second (15-minute) workload window.
 The aggregate report has a 15-minute reporting budget. Extended stress runs use
 900 seconds per profile and a 180-minute job budget; scheduled fuzz campaigns
