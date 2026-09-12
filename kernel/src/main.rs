@@ -655,9 +655,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         klog_always!("      ✓ BSP/AP IST guard pages installed (double-fault + NMI)");
     }
 
-    // R101-4 FIX: Boot-time livepatch ECDSA key validation
-    // P1-1: Use klog_force! — critical security warning must appear in all profiles.
-    if livepatch::has_placeholder_keys() {
+    // KSA-009: report the capability actually available to callers.
+    if !livepatch::SUPPORTED {
+        klog_force!(
+            "      Livepatch: unsupported ({})",
+            livepatch::UNSUPPORTED_REASON
+        );
+    } else if livepatch::has_placeholder_keys() {
         klog_force!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
         klog_force!("      ! Livepatch signature verification is non-functional.");
         klog_force!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");

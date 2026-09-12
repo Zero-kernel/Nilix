@@ -213,10 +213,19 @@ pub trait KernelOps: Sync {
 
 static KERNEL_OPS: Once<&'static dyn KernelOps> = Once::new();
 
+/// KSA-009: live patching is unsupported until kernel hooks, provisioned trust
+/// keys and cross-core patch/rollback validation are supplied together.
+pub const SUPPORTED: bool = false;
+pub const UNSUPPORTED_REASON: &str = "kernel hooks and production trust keys are not provisioned";
+
 /// Initialize the livepatch module and install kernel hooks.
-pub fn init(ops: &'static dyn KernelOps) {
+pub fn init(ops: &'static dyn KernelOps) -> Result<(), Errno> {
+    if !SUPPORTED {
+        return Err(Errno::ENOSYS);
+    }
     let _ = KERNEL_OPS.call_once(|| ops);
     let _ = PATCH_TABLE.call_once(init_patch_table);
+    Ok(())
 }
 
 // ============================================================================
@@ -274,6 +283,9 @@ pub fn has_placeholder_keys() -> bool {
 
 #[inline]
 fn ops() -> Result<&'static dyn KernelOps, Errno> {
+    if !SUPPORTED {
+        return Err(Errno::ENOSYS);
+    }
     KERNEL_OPS.get().copied().ok_or(Errno::ENOSYS)
 }
 
@@ -642,6 +654,9 @@ fn find_slot_by_id(id: u64) -> Option<&'static PatchSlot> {
 
 /// Query current state for a loaded patch id.
 pub fn patch_state(id: u64) -> Option<PatchState> {
+    if !SUPPORTED {
+        return None;
+    }
     find_slot_by_id(id).map(|s| PatchState::from_u8(s.state.load(Ordering::Acquire)))
 }
 
@@ -1436,6 +1451,7 @@ pub fn kpatch_register(patch_bytes: &[u8]) -> Result<u64, Errno> {
 /// P1-4: Before enabling, verifies all declared dependencies are in `Enabled` state.
 /// Returns `ENOENT` if a dependency UID is not loaded, `EBUSY` if not yet enabled.
 pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
+    let _ = ops()?;
     let (slot_index, slot) = find_slot_index_by_id(id).ok_or(Errno::ENOENT)?;
 
     let prev = loop {
@@ -1504,6 +1520,7 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
 /// P1-4: Before disabling, verifies no `Enabled`/`Enabling` patch depends on this one.
 /// Returns `EBUSY` if active dependents exist.
 pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
+    let _ = ops()?;
     let (slot_index, slot) = find_slot_index_by_id(id).ok_or(Errno::ENOENT)?;
 
     let prev = loop {
@@ -2143,6 +2160,58 @@ fn kernel_text_bounds() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_syscalls_fail_before_usercopy_or_patch_state() {
+        struct DisabledOps;
+        impl KernelOps for DisabledOps {
+            fn is_privileged(&self) -> bool {
+                panic!("disabled hook called")
+            }
+            unsafe fn copy_from_user(&self, _: *mut u8, _: usize, _: usize) -> Result<(), Errno> {
+                panic!("disabled hook called")
+            }
+            unsafe fn alloc_exec(&self, _: usize) -> Result<usize, Errno> {
+                panic!("disabled hook called")
+            }
+            unsafe fn seal_exec(&self, _: usize, _: usize) -> Result<(), Errno> {
+                panic!("disabled hook called")
+            }
+            unsafe fn free_exec(&self, _: usize, _: usize) {
+                panic!("disabled hook called")
+            }
+            unsafe fn make_text_writable(&self, _: usize, _: usize) -> Result<(), Errno> {
+                panic!("disabled hook called")
+            }
+            unsafe fn make_text_readonly(&self, _: usize, _: usize) {
+                panic!("disabled hook called")
+            }
+            fn sync_cores(&self) {
+                panic!("disabled hook called")
+            }
+            fn flush_icache(&self, _: usize, _: usize) {
+                panic!("disabled hook called")
+            }
+        }
+        assert!(!SUPPORTED);
+        assert!(matches!(init(&DisabledOps), Err(Errno::ENOSYS)));
+        assert_eq!(
+            sys_kpatch_load(usize::MAX, usize::MAX),
+            Errno::ENOSYS.as_i64()
+        );
+        assert_eq!(sys_kpatch_enable(u64::MAX), Errno::ENOSYS.as_i64());
+        assert_eq!(sys_kpatch_disable(u64::MAX), Errno::ENOSYS.as_i64());
+        assert_eq!(sys_kpatch_unload(u64::MAX), Errno::ENOSYS.as_i64());
+        assert_eq!(sys_kpatch_enable_all(), Errno::ENOSYS.as_i64());
+        assert_eq!(sys_kpatch_disable_all(), Errno::ENOSYS.as_i64());
+        assert!(matches!(kpatch_register(&[]), Err(Errno::ENOSYS)));
+        assert!(matches!(kpatch_enable(u64::MAX), Err(Errno::ENOSYS)));
+        assert!(matches!(kpatch_disable(u64::MAX), Err(Errno::ENOSYS)));
+        assert!(matches!(kpatch_unload(u64::MAX), Err(Errno::ENOSYS)));
+        assert!(patch_state(u64::MAX).is_none());
+        assert!(KERNEL_OPS.get().is_none());
+        assert!(PATCH_TABLE.get().is_none());
+    }
 
     #[test]
     fn r188_retired_state_is_terminal_and_round_trips() {
