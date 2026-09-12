@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 path = "lib.rs"
 
+[features]
+iommu_device_probe = []
+namespace_probe = ["kernel_core/namespace_probe"]
+
 [dependencies]
 kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }

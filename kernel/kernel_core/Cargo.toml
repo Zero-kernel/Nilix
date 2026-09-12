@@ -7,6 +7,7 @@ edition = "2021"
 path = "lib.rs"
 
 [features]
+mitigation_probe = []
 # M5-2: declare kernel_core's own cfg(feature=..) gates so they are not silently
 # always-false (the rustc unexpected_cfgs warning class). BOTH are DEFAULT-OFF.
 # conntrack: gates the outbound-SYN conntrack seed at syscall.rs:11641 (R155-8).
@@ -30,6 +31,9 @@ kcov = ["coverage"]
 # Hosted unit-test harness: disable the bare-metal MM allocator and use the
 # CPU-local hosted fallbacks so dependency tests can allocate normally.
 host_harness = ["mm/host_harness", "cpu_local/host_harness"]
+# Default-off boot probes before any Ring-3 task is scheduled.
+namespace_probe = []
+open_fault_probe = []
 
 [dependencies]
 spin = "0.9"

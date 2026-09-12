@@ -6,6 +6,7 @@ edition = "2021"
 # 移除内核内部 workspace 配置，避免与顶层 workspace 冲突
 
 [features]
+mitigation_probe = ["kernel_core/mitigation_probe", "musl_test"]
 default = []
 # Enable interactive shell instead of hello test program
 shell = []
@@ -32,6 +33,11 @@ kcov = ["coverage/kcov", "kernel_core/kcov"]
 # host-safe implementations while bare-metal builds retain the production
 # allocator and topology paths.
 host_harness = ["mm/host_harness", "kernel_core/host_harness"]
+# Dedicated terminal fault-probe image; never a normal boot configuration.
+iommu_init_probe = ["iommu/init_probe", "mm/mmio_probe"]
+namespace_probe = ["arch/namespace_probe", "kernel_core/namespace_probe", "vfs/namespace_probe"]
+open_fault_probe = ["musl_test", "vfs/open_fault_probe", "kernel_core/open_fault_probe"]
+iommu_device_probe = ["iommu/device_probe", "arch/iommu_device_probe"]
 
 [dependencies]
 spin = "0.12"

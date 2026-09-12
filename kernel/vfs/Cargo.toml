@@ -12,6 +12,10 @@ path = "lib.rs"
 # does not depend on; declared-off keeps them compiled out and silences the
 # unexpected_cfgs warning. Enabling is a separate task (needs the audit dep).
 audit = []
+open_fault_probe = ["kernel_core/open_fault_probe"]
+# Hosted allocator observations for exact retirement/deallocation ordering.
+host_harness = ["mm/host_harness", "kernel_core/host_harness"]
+namespace_probe = ["kernel_core/namespace_probe"]
 
 [dependencies]
 spin = "0.9"

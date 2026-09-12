@@ -9,6 +9,9 @@ path = "lib.rs"
 
 [features]
 default = []
+# Default-off, terminal guest probes for constructor and post-command errors.
+init_probe = ["mm/mmio_probe"]
+device_probe = []
 # Allow identity-mapped VT-d domains using pass-through translation.
 # UNSAFE: Permits devices to DMA into arbitrary physical memory.
 # Intended for debugging only; release builds must not enable this.

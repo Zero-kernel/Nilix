@@ -13,6 +13,8 @@ path = "lib.rs"
 # binary has no kernel boot publication hook. The feature is OFF for the kernel
 # build; see the ALLOCATOR static in memory.rs and cpu_local::current_cpu_id().
 host_harness = ["cpu_local/host_harness"]
+# Actual page-table rollback probes, run only before KPTI/AP startup.
+mmio_probe = []
 
 # fuzz_runner: enable KCOV instrumentation and raise boot heap budget to accommodate
 # the coverage infrastructure overhead. This feature is propagated from the kernel crate.
