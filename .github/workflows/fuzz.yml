@@ -1,284 +1,40 @@
-name: Comprehensive Kernel Fuzzing
+name: Fuzzing
 
 on:
   schedule:
-    - cron: '0 2 * * 0'    # Weekly KCOV guest E2E and pipeline smoke
-    - cron: '0 2 * * *'    # Daily cargo-fuzz targets
-
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Fuzzing mode'
-        required: true
-        default: 'targets'
-        type: choice
-        options:
-          - targets  # Cargo-fuzz libFuzzer targets
-          - smoke    # QEMU KCOV E2E + independent zero-execution simulator smoke
-          - both     # Targets + QEMU KCOV E2E + zero-execution simulator smoke
       timeout:
-        description: 'Seconds per cargo-fuzz target (1-1200)'
-        required: false
+        description: Seconds per target (1-1200)
+        type: string
         default: '600'
 
-  push:
-    branches:
-      - main
-    paths:
-      - 'kernel/**'
-      - 'userspace/fuzz_runner.c'
-      - 'userspace/fuzzer/**'
-      - 'fuzz/**'
-      - 'scripts/fuzz_runner_test.sh'
-      - 'Makefile'
-      - '.github/workflows/fuzz.yml'
-
-  # `userspace/fuzzer` and `fuzz` are the only crates in the repository that no
-  # pull-request check compiled: `ci.yml` never touches either, and
-  # `make clippy` / `make fmt-check` cover the bootloader, kernel, and
-  # `userspace` workspaces only — both of these are separate workspaces with
-  # their own lockfiles. Without a `pull_request` trigger they reached `main`
-  # unbuilt, so two Dependabot PRs (hmac 0.13, sha2 0.11) each reported a fully
-  # green run while being individually uncompilable, and either would have
-  # turned `main` red on merge. Only the two fast compile jobs run here; every
-  # heavier job below is gated off `pull_request` by its own `if:`, so a pull
-  # request never starts a fuzz campaign.
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'userspace/fuzzer/**'
-      - 'fuzz/**'
-      - '.github/workflows/fuzz.yml'
-
-# Collapse superseded pull-request runs only. Every other event keeps a
-# run-unique group, so scheduled campaigns, `main` pushes, and manual dispatches
-# retain today's behaviour and can never cancel or queue behind one another.
-concurrency:
-  group: fuzz-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
-
 permissions: {}
+concurrency:
+  group: fuzz-${{ github.run_id }}
+  cancel-in-progress: false
 
+# Required tool/feature and real guest smoke checks live in CI. This workflow
+# owns private campaigns only; its reporting keeps the existing opaque IDs.
 jobs:
   fuzz-tools-test:
-    name: Fuzz Tool Tests
-    runs-on: ubuntu-latest
+    name: Campaign prerequisites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-kernel
         with:
-          toolchain: nightly-2025-12-08
-          components: clippy
-
-      - name: Cache fuzz-tool build
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            userspace/fuzzer/target/
-          key: ${{ runner.os }}-fuzz-tools-${{ hashFiles('userspace/fuzzer/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-fuzz-tools-
-
-      - name: Test fuzz tools
-        run: cargo test --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu
-
-      - name: Lint fuzz tools
-        run: cargo clippy --locked --manifest-path userspace/fuzzer/Cargo.toml --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
-
-  # Type-checks the cargo-fuzz crate on pull requests. `cargo-fuzz-targets`
-  # below already compiles it on push and on the nightly schedule, but that job
-  # is far too heavy to gate a pull request on, which left `fuzz/` — including
-  # its dependency bumps — reaching `main` without any pull-request check ever
-  # building it.
-  fuzz-targets-check:
-    name: Fuzz Target Compile Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    # Pull-request only: the events that already build this crate for real must
-    # keep their current job set exactly as it is.
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2025-12-08
-          components: rust-src
-
-      - name: Cache fuzz-target check
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            fuzz/target/
-          key: ${{ runner.os }}-fuzz-check-${{ hashFiles('fuzz/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-fuzz-check-
-
-      # `--all-features` is required, not cosmetic: `sha2`, `nix`, `rand`, and
-      # the rest of the QEMU executor dependencies are optional behind
-      # `qemu-executor`, so a default-feature check would silently skip the very
-      # crates a dependency bump changes.
-      #
-      # `--locked` is what makes this a real gate — it asserts the committed
-      # lockfile is exactly what builds. `cargo-fuzz-targets` runs `cargo fuzz
-      # run` without it and therefore re-resolves silently, which is how
-      # `fuzz/Cargo.lock` drifted out of date unnoticed.
-      #
-      # This is a compile check, not a lint gate: the fuzz targets carry
-      # pre-existing dead-code warnings, so no `-D warnings` is applied here.
-      - name: Check fuzz targets
-        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features --target x86_64-unknown-linux-gnu
-
-  # This is a deterministic executor regression test, not a fuzz campaign. It
-  # boots a real Nilix guest and proves that two syscall programs produce
-  # non-zero, distinct, resettable KCOV bitmaps.
-  kcov-qemu-e2e:
-    name: KCOV Guest Executor E2E (QEMU)
-    needs: fuzz-tools-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    if: |
-      github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'both') ||
-      github.event_name == 'push'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2025-12-08
-          components: rust-src
-
-      - name: Install QEMU and guest build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf build-essential musl-tools
-
-      - name: Cache KCOV build
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            bootloader-target/
-            kernel-target/kcov/
-          key: ${{ runner.os }}-cargo-kcov-${{ hashFiles('**/Cargo.lock', 'userspace/fuzz_runner.c') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-kcov-
-
-      - name: Test KCOV host logic and exported macro
-        run: cargo test --locked --manifest-path kernel/coverage/Cargo.toml --features kcov
-
-      - name: Run real-QEMU KCOV executor E2E
-        env:
-          KERNEL_TEST_TIMEOUT: '120'
-        run: make test-kcov
-
-  # The simulator below validates dashboard plumbing only. It performs zero
-  # kernel executions and cannot produce candidate metadata or crash artifacts.
-  fuzz-pipeline-smoke:
-    name: Fuzz-Pipeline Smoke (Zero Kernel Executions)
-    needs: fuzz-tools-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    if: |
-      github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'smoke' || github.event.inputs.mode == 'both')
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2025-12-08
-
-      - name: Cache smoke build
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            userspace/fuzzer/target/
-          key: ${{ runner.os }}-fuzz-smoke-${{ hashFiles('userspace/fuzzer/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-fuzz-smoke-
-
-      - name: Build fuzz-pipeline smoke simulator
-        run: cargo build --locked --release --manifest-path userspace/fuzzer/Cargo.toml --bin fuzz-pipeline-smoke --target x86_64-unknown-linux-gnu
-
-      - name: Run fuzz-pipeline smoke simulator
-        id: run_smoke
-        run: |
-          mkdir -p fuzz-smoke-dashboard
-          set +e
-          userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/fuzz-pipeline-smoke \
-            --dashboard-dir fuzz-smoke-dashboard \
-            --worker-id 1 \
-            --max-iterations 1000 \
-            --iteration-delay-ms 1 \
-            --report-interval 1 \
-            > fuzz-smoke.log 2>&1
-          exit_code=$?
-          set -e
-          if [ "$exit_code" -ne 0 ]; then
-            echo "::error::Fuzz-pipeline smoke failed"
-            exit "$exit_code"
-          fi
-
-      - name: Validate smoke output allowlist
-        run: |
-          actual=$(find fuzz-smoke-dashboard -maxdepth 1 -type f -printf '%f\n' | sort)
-          expected=$(printf 'dashboard.html\ndashboard.json')
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::Smoke simulator produced an unexpected output file"
-            exit 1
-          fi
-          grep -q '"mode": "simulator"' fuzz-smoke-dashboard/dashboard.json
-          grep -q '"kernel_executions": 0' fuzz-smoke-dashboard/dashboard.json
-
-      - name: Upload smoke dashboard
+          cache-key: host-tools
+      - run: bash scripts/ci.sh tools
+      - uses: actions/upload-artifact@v7
         if: always()
-        uses: actions/upload-artifact@v7
         with:
-          name: fuzz-smoke-dashboard
-          path: |
-            fuzz-smoke-dashboard/dashboard.html
-            fuzz-smoke-dashboard/dashboard.json
-          retention-days: 30
-          if-no-files-found: error
-
-      - name: Upload smoke log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-smoke-log
-          path: fuzz-smoke.log
-          retention-days: 7
+          name: fuzz-prerequisites
+          path: target/ci/tools/
           if-no-files-found: error
 
   cargo-fuzz-targets:
@@ -288,18 +44,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    if: |
-      github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'targets' || github.event.inputs.mode == 'both') ||
-      github.event_name == 'push'
-
     strategy:
       fail-fast: false
       matrix:
-        # Pushes use the three host-safe targets that call real kernel parser
-        # code, plus fuzz_syscall_qemu for real kernel execution.
-        # Scheduled/manual runs retain the complete target set.
-        target: ${{ fromJSON(github.event_name == 'push' && '["fuzz_vfs_path","fuzz_network_packet","fuzz_elf_loader","fuzz_syscall_qemu"]' || '["fuzz_syscall","fuzz_vfs_path","fuzz_signal_delivery","fuzz_memory_ops","fuzz_ipc_message","fuzz_scheduler","fuzz_network_packet","fuzz_cgroup_ops","fuzz_elf_loader","fuzz_futex_ops","fuzz_syscall_qemu"]') }}
+        target: [fuzz_syscall, fuzz_vfs_path, fuzz_signal_delivery, fuzz_memory_ops, fuzz_ipc_message, fuzz_scheduler, fuzz_network_packet, fuzz_cgroup_ops, fuzz_elf_loader, fuzz_futex_ops, fuzz_syscall_qemu]
 
     steps:
       - name: Checkout repository
@@ -361,7 +109,7 @@ jobs:
       - name: Run fuzzer privately
         id: run_fuzzer
         env:
-          FUZZ_TIMEOUT: ${{ github.event_name == 'push' && '60' || github.event.inputs.timeout || '600' }}
+          FUZZ_TIMEOUT: ${{ inputs.timeout || '600' }}
         run: |
           timeout="$FUZZ_TIMEOUT"
           if ! [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || [ "$timeout" -gt 1200 ]; then
@@ -594,120 +342,26 @@ jobs:
           done < <(find candidates -type f -name 'candidate-*.txt' -print0)
 
   aggregate-report:
-    name: Aggregate Report
-    needs: [fuzz-tools-test, kcov-qemu-e2e, fuzz-pipeline-smoke, cargo-fuzz-targets, candidate-reporting]
-    # `!cancelled()` deliberately runs this even when needed jobs are skipped,
-    # which on a pull request would mean summarising four skipped jobs and an
-    # empty artifact set. Exclude that event so the only check a pull request
-    # publishes is the one that actually compiled something.
-    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    name: Fuzzing result
+    needs: [fuzz-tools-test, cargo-fuzz-targets, candidate-reporting]
+    if: always()
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-
     steps:
-      - name: Download public artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          path: artifacts/
-
-      - name: Generate aggregate report
+          pattern: fuzz-result-*
+          path: artifacts
+      - run: python3 scripts/ci_report.py artifacts --fuzz --expected-manifests 11
+        if: always()
         env:
-          TOOLS_RESULT: ${{ needs.fuzz-tools-test.result }}
-          KCOV_E2E_RESULT: ${{ needs.kcov-qemu-e2e.result }}
-          SMOKE_RESULT: ${{ needs.fuzz-pipeline-smoke.result }}
-          CARGO_RESULT: ${{ needs.cargo-fuzz-targets.result }}
-          REPORTING_RESULT: ${{ needs.candidate-reporting.result }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_SCHEDULE: ${{ github.event.schedule }}
-          DISPATCH_MODE: ${{ github.event.inputs.mode }}
-        run: |
-          expected_targets=0
-          if [ "$EVENT_NAME" = "push" ]; then
-            expected_targets=4
-          elif [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "0 2 * * *" ]; then
-            expected_targets=11
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && { [ "$DISPATCH_MODE" = "targets" ] || [ "$DISPATCH_MODE" = "both" ]; }; then
-            expected_targets=11
-          fi
-
-          {
-            echo "# Comprehensive Fuzzing Report"
-            echo
-            echo "**Run:** ${{ github.run_id }}"
-            echo "**Commit:** ${{ github.sha }}"
-            echo "**Trigger:** ${{ github.event_name }}"
-            echo
-            echo "## Job status"
-            echo
-            echo "- Fuzz tool tests: $TOOLS_RESULT"
-            echo "- KCOV QEMU executor E2E: $KCOV_E2E_RESULT"
-            echo "- Fuzz-pipeline smoke (zero kernel executions): $SMOKE_RESULT"
-            echo "- Cargo-fuzz matrix: $CARGO_RESULT"
-            echo "- Opaque candidate reporting: $REPORTING_RESULT"
-            echo
-          } > aggregate-report.md
-
-          if [ "$expected_targets" -eq 0 ]; then
-            echo "## Cargo-fuzz targets" >> aggregate-report.md
-            echo "" >> aggregate-report.md
-            echo "Not requested for this run." >> aggregate-report.md
-          elif [ "$CARGO_RESULT" != "success" ]; then
-            echo "## Cargo-fuzz targets: INCOMPLETE" >> aggregate-report.md
-            echo "" >> aggregate-report.md
-            echo "The matrix did not complete successfully; no clean result is claimed." >> aggregate-report.md
-          else
-            mapfile -t result_files < <(find artifacts -type f -name 'fuzz-result.txt' | sort)
-            completed_results=0
-            candidate_count=0
-            malformed=0
-            for result_file in "${result_files[@]}"; do
-              schema=$(grep -m1 -oP '^Schema: \K.*' "$result_file" || true)
-              status=$(grep -m1 -oP '^Status: \K.*' "$result_file" || true)
-              count=$(grep -m1 -oP '^Candidate-Count: \K.*' "$result_file" || true)
-              if [ "$schema" != "nilix-fuzz-result-v1" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
-                malformed=1
-                continue
-              fi
-              if [ "$status" = "completed" ]; then
-                completed_results=$((completed_results + 1))
-              else
-                malformed=1
-              fi
-              candidate_count=$((candidate_count + count))
-            done
-
-            if [ "${#result_files[@]}" -ne "$expected_targets" ] || \
-               [ "$completed_results" -ne "$expected_targets" ] || \
-               [ "$malformed" -ne 0 ] || \
-               [ "$REPORTING_RESULT" != "success" ]; then
-              echo "## Cargo-fuzz targets: INCOMPLETE" >> aggregate-report.md
-              echo "" >> aggregate-report.md
-              echo "Expected $expected_targets complete result manifests; no clean result is claimed." >> aggregate-report.md
-            elif [ "$candidate_count" -gt 0 ]; then
-              echo "## Cargo-fuzz targets: PRIVATE CANDIDATES OBSERVED" >> aggregate-report.md
-              echo "" >> aggregate-report.md
-              echo "$candidate_count opaque candidate(s) were routed through SECURITY.md without public reproducers." >> aggregate-report.md
-            else
-              echo "## Cargo-fuzz targets: COMPLETE" >> aggregate-report.md
-              echo "" >> aggregate-report.md
-              echo "No findings were observed by the selected targets." >> aggregate-report.md
-            fi
-          fi
-
-          echo "" >> aggregate-report.md
-          echo "Raw fuzzer output, findings, and corpora are never uploaded as public artifacts." >> aggregate-report.md
-          cat aggregate-report.md
-
-      - name: Add to step summary
+          CI_JOB_RESULTS: ${{ toJSON(needs) }}
+      - uses: actions/upload-artifact@v7
         if: always()
-        run: cat aggregate-report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload aggregate report
-        if: always()
-        uses: actions/upload-artifact@v7
         with:
-          name: aggregate-report
-          path: aggregate-report.md
-          retention-days: 90
+          name: fuzz-summary
+          path: artifacts/summary.md
+          retention-days: 30
           if-no-files-found: error

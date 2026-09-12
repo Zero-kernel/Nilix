@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from collections import deque
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,7 @@ def main():
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--input-manifest", type=Path)
     parser.add_argument("--revision")
+    parser.add_argument("--name", help="human-readable gate name in reports")
     parser.add_argument("--allow-qualified", action="store_true",
                         help="accept exit 3 for diagnostic CI while retaining its qualified status")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -43,14 +45,17 @@ def main():
         identity = source_identity(root, args.input_manifest, args.revision)
         identity["profile_environment"] = {key: value for key, value in environment.items()
                                            if key.startswith(("ZERO_OS_", "KERNEL_TEST_", "SMP_", "IOMMU_Q35_", "BOOT_CHECK_", "MUSL_CHECK_"))}
-        binaries = ("esp/kernel.elf", "esp/EFI/BOOT/BOOTX64.EFI", "kernel-target/musl/esp/kernel.elf", "kernel-target/musl/esp/EFI/BOOT/BOOTX64.EFI")
+        binaries = tuple(f"{esp}/{name}" for esp in (
+            "esp", "kernel-target/musl/esp", "kernel-target/mitigation/esp", "esp-kcov", "esp-syz", "esp-stress")
+            for name in ("kernel.elf", "EFI/BOOT/BOOTX64.EFI"))
         identity["binaries_before"] = {name: sha256(root / name) for name in binaries if (root / name).is_file()}
         (output / "inputs.json").write_text(json.dumps(identity, indent=2) + "\n")
         for name, version_command in (("qemu", ["qemu-system-x86_64", "--version"]), ("rustc", ["rustc", "-vV"])):
             try:
-                version = subprocess.run(version_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                version = subprocess.run(version_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         env={**environment, "RUSTUP_AUTO_INSTALL": "0"}, timeout=10)
                 (output / (name + ".version")).write_bytes(version.stdout)
-            except FileNotFoundError:
+            except (FileNotFoundError, subprocess.TimeoutExpired):
                 (output / (name + ".version")).write_text("unavailable\n")
         with (output / "gate.log").open("wb") as log:
             result = subprocess.run(command, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT)
@@ -62,6 +67,7 @@ def main():
         status = 2
     (output / "gate.status").write_text(f"{status}\n")
     summary = {"status": status, "command_status": command_status,
+               "name": args.name or args.artifacts.name,
                "scope": "command process; nested make recipe outcomes are in retained gate sidecars/logs",
                "classification": ("incomplete-evidence" if error else "command-complete" if status == 0 else "command-nonzero"),
                "error": error, "elapsed_seconds": time.monotonic() - started}
@@ -74,6 +80,12 @@ def main():
     print(f"GATE-ARTIFACTS {output}: status={status} ({summary['classification']})")
     if error:
         print(error)
+    if status and not qualified_accepted and (output / "gate.log").is_file():
+        print("Last gate diagnostics (full log retained in artifacts):")
+        with (output / "gate.log").open(encoding="utf8", errors="replace") as log:
+            for line in deque(log, maxlen=40):
+                # Prefix output so a child log cannot emit a workflow command.
+                print("  " + line.rstrip()[:2000])
     if qualified_accepted:
         print("GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open")
         return 0

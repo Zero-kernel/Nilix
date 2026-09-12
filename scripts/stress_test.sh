@@ -4,7 +4,8 @@
 # Exit codes:
 #   0 - every selected profile satisfied the guest, QMP, and storage contracts
 #   1 - at least one selected profile failed
-#   3 - a required host prerequisite or suite setting is invalid
+#   2 - a required host prerequisite or suite setting is invalid
+#   3 - workloads completed with runtime/security qualifications
 
 set -uo pipefail
 
@@ -66,7 +67,7 @@ SUITE_TMP=""
 
 blocked() {
     echo "STRESS-TEST BLOCKED: $*" >&2
-    exit 3
+    exit 2
 }
 
 require_positive() {

@@ -29,8 +29,21 @@ target_root="${HOSTED_SUBCRATE_TARGET_DIR:-${CARGO_TARGET_DIR:-${repo_root}/host
 if [[ "${target_root}" != /* ]]; then
     target_root="${repo_root}/${target_root}"
 fi
-log_root="$(mktemp -d "${TMPDIR:-/tmp}/zero-os-hosted-tests.XXXXXX")"
-trap 'rm -rf -- "${log_root}"' EXIT
+if [[ -n "${HOSTED_TEST_LOG_DIR:-}" ]]; then
+    mkdir -p "$HOSTED_TEST_LOG_DIR"
+    log_root="$(cd "$HOSTED_TEST_LOG_DIR" && pwd)"
+else
+    log_root="$(mktemp -d "${TMPDIR:-/tmp}/zero-os-hosted-tests.XXXXXX")"
+    trap 'rm -rf -- "${log_root}"' EXIT
+fi
+profile_flags=()
+rustc_flags=()
+case "${HOSTED_TEST_PROFILE:-debug}" in
+    debug) ;;
+    release) profile_flags=(--release); rustc_flags=(-O) ;;
+    *) echo "Unknown HOSTED_TEST_PROFILE" >&2; exit 2 ;;
+esac
+: > "$log_root/hosted-summary.tsv"
 
 mkdir -p "${target_root}"
 cd "${repo_root}"
@@ -48,7 +61,7 @@ run_suite() {
 
     echo "=== hosted sub-crate: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! CARGO_TARGET_DIR="${suite_target}" \
-        cargo +nightly-2025-12-08 test "$@" 2>&1 | tee "${log_file}"; then
+        cargo +nightly-2025-12-08 test "${profile_flags[@]}" "$@" 2>&1 | tee "${log_file}"; then
         echo "ERROR: hosted sub-crate suite '${name}' failed." >&2
         return 1
     fi
@@ -65,6 +78,7 @@ run_suite() {
     fi
 
     passed_unit_tests=$((passed_unit_tests + expected_passed))
+    printf '%s\t%s\t%s\n' "$name" "$expected_passed" "$expected_filtered" >> "$log_root/hosted-summary.tsv"
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
@@ -75,7 +89,7 @@ run_check() {
     local suite_target="${target_root}/${name}"
     echo "=== hosted test-code compile check: ${name} ==="
     if ! CARGO_TARGET_DIR="${suite_target}" \
-        cargo +nightly-2025-12-08 check "$@"; then
+        cargo +nightly-2025-12-08 check "${profile_flags[@]}" "$@" 2>&1 | tee "$log_root/$name.log"; then
         echo "ERROR: hosted test-code compile check '${name}' failed." >&2
         return 1
     fi
@@ -98,7 +112,7 @@ run_standalone_rust_suite() {
     if ! (
         cd "${repo_root}/${source_dir}"
         NILIX_TEST_TOTAL=74 rustc +nightly-2025-12-08 \
-            --edition=2021 --test "${source_file}" -o "${test_binary}"
+            --edition=2021 "${rustc_flags[@]}" --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
         echo "ERROR: hosted standalone Rust suite '${name}' failed." >&2
@@ -117,6 +131,7 @@ run_standalone_rust_suite() {
     fi
 
     passed_unit_tests=$((passed_unit_tests + expected_passed))
+    printf '%s\t%s\t%s\n' "$name" "$expected_passed" "$expected_filtered" >> "$log_root/hosted-summary.tsv"
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
@@ -132,7 +147,7 @@ run_suite cpu-local 11 0 \
     --lib --locked
 
 # Includes the compile-fail oracle preventing a borrowed local slot from escaping.
-CARGO_TARGET_DIR="${target_root}/cpu-local" cargo +nightly-2025-12-08 test \
+CARGO_TARGET_DIR="${target_root}/cpu-local" cargo +nightly-2025-12-08 test "${profile_flags[@]}" \
     --manifest-path kernel/cpu_local/Cargo.toml \
     --target x86_64-unknown-linux-gnu --features host_harness --doc --locked
 
@@ -216,6 +231,18 @@ run_suite iommu 67 0 \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
     --lib --locked
+
+run_suite mitigation-status 3 13 \
+    --manifest-path kernel/security/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness,cpu_local/host_harness \
+    --lib --locked -- spectre::status_tests
+
+run_suite mitigation-mappings 3 68 \
+    --manifest-path kernel/kernel_core/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features host_harness,mitigation_probe \
+    --lib --locked -- mitigation_probe::tests
 
 run_check ipc-tests \
     --manifest-path kernel/ipc/Cargo.toml \

@@ -73,7 +73,14 @@ stop_qemu() {
 }
 
 cleanup() {
+    local status=$?
     stop_qemu
+    if [ "${KCOV_KEEP_LOGS:-0}" = 1 ]; then
+        printf '%s\n' "$status" > "$temp_dir/gate.status"
+        printf '%s\n' "${qemu_exit_code:-not-started}" > "$temp_dir/qemu.status"
+        echo "KCOV-E2E ARTIFACTS: $temp_dir"
+        return "$status"
+    fi
     rm -f "$serial_log" "$normalized_log" "$interrupt_log" "$qemu_stderr"
     rmdir "$temp_dir" 2>/dev/null || true
 }

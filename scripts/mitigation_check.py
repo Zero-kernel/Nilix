@@ -575,13 +575,22 @@ def verify_workload(serial, cpus):
     require(lines.count(start) == 1 and lines.count(finish) == 1,
             "missing or duplicate workload boundary")
     start_index, finish_index = lines.index(start), lines.index(finish)
-    workers, waits = {}, {}
+    workers, waits, retries = {}, {}, {}
     for index, line in enumerate(lines):
         if line.startswith("MITIGATION-WORKER "):
-            match = re.fullmatch(r"MITIGATION-WORKER (BEGIN|PASS) phase=(fork|exec) cpu=(\d+) pid=(\d+) (.+)", line)
+            match = re.fullmatch(r"MITIGATION-WORKER (BEGIN|PASS|RETRY) phase=(fork|exec) cpu=(\d+) pid=(\d+) (.+)", line)
             require(match is not None, "malformed worker observation")
             state, phase, cpu, pid, fields = match.groups()
             cpu, pid = int(cpu), int(pid)
+            if state == "RETRY":
+                detail = re.fullmatch(r"attempt=(\d+) errno=(\d+)", fields)
+                require(detail is not None and phase == "exec" and int(detail[1]) > 0 and
+                        int(detail[2]) == 12, "malformed transient exec retry")
+                key = (phase, cpu, int(detail[1]))
+                require(key not in retries and 0 <= cpu < cpus and pid > 1,
+                        "duplicate or invalid worker retry")
+                retries[key] = (pid, index)
+                continue
             key = (state, phase, cpu)
             require(key not in workers and 0 <= cpu < cpus and pid > 1,
                     "duplicate or invalid worker identity")
@@ -614,6 +623,21 @@ def verify_workload(serial, cpus):
         order = [start_index] + [index for _, index in observations] + [finish_index]
         require(order == sorted(set(order)), "worker lifecycle observations are out of order")
     require(len(worker_pids) == cpus, "workers do not have distinct process identities")
+    for cpu in range(cpus):
+        attempts = sorted(attempt for phase, retry_cpu, attempt in retries
+                          if phase == "exec" and retry_cpu == cpu)
+        require(attempts == list(range(1, len(attempts) + 1)),
+                "worker retry attempts are not contiguous")
+        expected_pid = workers.get(("BEGIN", "exec", cpu), (None,))[0]
+        require(all(pid == expected_pid for (phase, retry_cpu, _), (pid, _) in retries.items()
+                    if phase == "exec" and retry_cpu == cpu),
+                "worker retry changed process identity")
+        begin_index = workers[("BEGIN", "exec", cpu)][1]
+        pass_index = workers[("PASS", "exec", cpu)][1]
+        require(all(begin_index < index < pass_index
+                    for (phase, retry_cpu, _), (_, index) in retries.items()
+                    if phase == "exec" and retry_cpu == cpu),
+                "worker retry is outside its exec phase")
     exits = [(index, match[1]) for index, line in enumerate(lines)
              if (match := re.fullmatch(r"Process 1 terminated with exit code (\d+)", line))]
     require(len(exits) == 1 and exits[0][1] == "0" and exits[0][0] > finish_index,
@@ -642,20 +666,26 @@ class Remote:
     def __init__(self, connection, deadline):
         self.connection, self.deadline, self.transcript = connection, deadline, []
         self.thread_step_supported = False
+        self.buffer = b""
+        self.buffer_offset = 0
 
     def byte(self):
         while True:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise EvidenceUnavailable("RSP observation deadline expired")
+            if self.buffer_offset < len(self.buffer):
+                value = self.buffer[self.buffer_offset:self.buffer_offset + 1]
+                self.buffer_offset += 1
+                return value
             self.connection.settimeout(min(remaining, 5))
             try:
-                value = self.connection.recv(1)
+                self.buffer = self.connection.recv(65536)
+                self.buffer_offset = 0
             except socket.timeout:
                 continue
-            if not value:
+            if not self.buffer:
                 raise EvidenceUnavailable("QEMU closed its RSP connection")
-            return value
 
     def send(self, text):
         payload = text.encode("ascii")
@@ -904,7 +934,10 @@ def runtime(args, output, sites, expected_kernel, linked, anchor_bytes):
                 after = step_cr3_instruction(remote, site, before, thread, step_attempts,
                                              output / "cr3-step-attempts.json")
                 returned = None
-                if site["direction"] == "user":
+                # Breakpoints are shared by all vCPUs. A pair already verified
+                # still retires and checks its CR3 write, but needs no second
+                # CPL3 epilogue trace while we wait for the remaining CPUs.
+                if site["direction"] == "user" and cpu not in observed_cpus[site["name"]]:
                     for _ in range(128):
                         step = remote.step_thread(thread)
                         require(step.startswith(("T", "S")), "user return did not produce a step stop")

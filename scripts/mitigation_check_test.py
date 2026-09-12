@@ -314,6 +314,17 @@ class ObservationTests(unittest.TestCase):
         lines += ["MITIGATION-WORKLOAD PASS cpus=4 forks=4 execs=4", "Process 1 terminated with exit code 0"]
         serial = "\n".join(lines)
         proof.verify_workload(serial, 4)
+        retry_line = "MITIGATION-WORKER RETRY phase=exec cpu=0 pid=2 attempt=1 errno=12"
+        with_retry = serial.replace(
+            "MITIGATION-WORKER PASS phase=exec cpu=0 pid=2 calls=32 elapsed_ms=250 checksum=123",
+            retry_line + "\nMITIGATION-WORKER PASS phase=exec cpu=0 pid=2 calls=32 elapsed_ms=250 checksum=123")
+        proof.verify_workload(with_retry, 4)
+        for malformed_retry in (with_retry.replace("attempt=1", "attempt=2"),
+                                with_retry.replace("errno=12", "errno=13"),
+                                with_retry.replace("phase=exec cpu=0 pid=2 attempt=1", "phase=fork cpu=0 pid=2 attempt=1"),
+                                with_retry + "\n" + retry_line):
+            with self.assertRaises(proof.ProofFailure):
+                proof.verify_workload(malformed_retry, 4)
         for broken in [serial.replace(lines[3], ""), serial.replace("exit code 0", "exit code 1"),
                        serial + "\n" + lines[1], serial + "\nMITIGATION-WORKLOAD FAIL",
                        serial.replace("pid=3", "pid=2").replace("pid=4", "pid=2").replace("pid=5", "pid=2"),
@@ -493,6 +504,39 @@ class StepProgressTests(unittest.TestCase):
 
 
 class RemoteTests(unittest.TestCase):
+    def test_coalesced_packets_and_fragmented_reads_preserve_framing(self):
+        class BufferedSocket(FakeSocket):
+            def __init__(self, data, chunk):
+                super().__init__(data)
+                self.chunk = chunk
+                self.reads = 0
+
+            def recv(self, length):
+                self.reads += 1
+                result = self.data[:min(length, self.chunk)]
+                self.data = self.data[len(result):]
+                return bytes(result)
+
+        payload = b"+" + packet("O" + b"RIP=1000 ".hex()) + packet("OK") + packet("0f22d8")
+        for chunk in (1, 3, len(payload)):
+            with self.subTest(chunk=chunk):
+                peer = BufferedSocket(payload, chunk)
+                remote = proof.Remote(peer, time.monotonic() + 2)
+                self.assertEqual(remote.monitor("info registers"), "RIP=1000 ")
+                self.assertEqual(remote.memory(0x1000, 3), bytes.fromhex("0f22d8"))
+                if chunk == len(payload):
+                    self.assertEqual(peer.reads, 1)
+
+    def test_buffered_reply_does_not_bypass_deadline_or_checksum(self):
+        remote = proof.Remote(FakeSocket(b""), time.monotonic() - 1)
+        remote.buffer = packet("OK")
+        with self.assertRaisesRegex(proof.EvidenceUnavailable, "deadline"):
+            remote.receive()
+        remote.deadline = time.monotonic() + 2
+        remote.buffer = b"$OK#00"
+        with self.assertRaisesRegex(proof.EvidenceUnavailable, "checksum"):
+            remote.receive()
+
     def remote(self, data):
         return proof.Remote(FakeSocket(data), time.monotonic() + 1)
 

@@ -1,0 +1,36 @@
+name: Extended tests
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: extended-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  extended:
+    name: Extended / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CI_STRESS_SECONDS: '300'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-kernel
+        with:
+          qemu: 'true'
+          cache-key: extended-${{ matrix.os }}
+      - run: bash scripts/ci.sh extended
+      - if: always()
+        run: bash scripts/ci.sh iommu
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: extended-${{ matrix.os }}
+          path: target/ci/
+          if-no-files-found: error

@@ -168,6 +168,8 @@ export AFL_SKIP_CPUFREQ=1
 
 ## CI Integration
 
-See `.github/workflows/afl_fuzz.yml` for weekly AFL++ runs.
+There is no automated AFL++ workflow: AFL QEMU mode cannot execute the bare-metal
+kernel. Use the scheduled `Fuzzing` workflow for supported libFuzzer targets, or
+run this adapter locally after providing a supported userspace target.
 
 Daily libFuzzer runs remain in `.github/workflows/fuzz.yml`.

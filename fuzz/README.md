@@ -196,69 +196,21 @@ cargo +nightly fuzz run fuzz_syscall -- -max_total_time=0
 
 ### Integration with CI
 
-Add to `.github/workflows/fuzz.yml`:
+The checked-in [Fuzzing workflow](../.github/workflows/fuzz.yml) runs the 11
+targets on its daily schedule or through `workflow_dispatch`. The dispatch input
+sets a validated per-target timeout (1–1200 seconds). Required tool, feature and
+QEMU smoke checks run in the main `CI` workflow; this scheduled workflow owns
+only the longer private campaigns and fail-closed result manifests.
 
-```yaml
-name: Fuzz Testing
-
-on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily
-  workflow_dispatch:
-
-jobs:
-  fuzz:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - fuzz_syscall
-          - fuzz_vfs_path
-          - fuzz_signal_delivery
-          - fuzz_memory_ops
-          - fuzz_ipc_message
-          - fuzz_scheduler
-          - fuzz_network_packet
-          - fuzz_cgroup_ops
-          - fuzz_elf_loader
-          - fuzz_futex_ops
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-
-      - name: Run fuzzer
-        run: |
-          cd fuzz
-          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=4096
-        continue-on-error: true
-
-      - name: Upload artifacts
-        if: failure()
-        # v4 required: the v3 artifact actions are shut down and hard-fail the job.
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-artifacts-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}/
-```
-
-> The committed workflow at `.github/workflows/fuzz.yml` is the source of truth;
-> the snippet above is illustrative.
->
-> **What actually runs kernel code:** `fuzz_elf_loader`, `fuzz_network_packet`,
-> and `fuzz_vfs_path` link and drive the real kernel parsers
-> (`kernel_core::validate_elf_image`, `net::parse_*`, `vfs::normalize_path` /
-> `split_path`) — the pure, host-safe validation layers. This is possible because
-> `mm`'s `#[global_allocator]` is compiled out under its `host_harness` feature
-> (see `fuzz/Cargo.toml` and the `ALLOCATOR` static in `kernel/mm/memory.rs`), so
-> the crate graph links against std's allocator. The remaining seven targets model
-> hardware/stateful subsystems that are not host-callable without a mock harness,
-> so they still exercise self-contained input-validation logic.
+**What actually runs kernel code:** `fuzz_elf_loader`, `fuzz_network_packet`,
+and `fuzz_vfs_path` link and drive the real kernel parsers
+(`kernel_core::validate_elf_image`, `net::parse_*`, `vfs::normalize_path` /
+`split_path`) — the pure, host-safe validation layers. This is possible because
+`mm`'s `#[global_allocator]` is compiled out under its `host_harness` feature
+(see `fuzz/Cargo.toml` and the `ALLOCATOR` static in `kernel/mm/memory.rs`), so
+the crate graph links against std's allocator. The remaining seven targets model
+hardware/stateful subsystems that are not host-callable without a mock harness,
+so they still exercise self-contained input-validation logic.
 
 ## Best Practices
 
