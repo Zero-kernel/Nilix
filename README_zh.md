@@ -122,8 +122,8 @@ bash scripts/ci/entrypoint.sh runtime
 bash scripts/ci/entrypoint.sh musl
 ```
 
-boot/runtime/SMP 与 musl 的单次 guest 观察窗口默认 **600 秒**，boot/runtime/SMP
-组会依次运行三个窗口；mitigation、qemu-fuzz 和 extended stress 仍保留更长窗口。
+boot/runtime/SMP 与 musl 的单次 guest 观察窗口默认 **900 秒**，boot/runtime/SMP
+组会依次运行三个窗口；mitigation、qemu-fuzz 和 extended stress 同样保留 900 秒窗口。
 make 非零退出也可能来自 qualified 结果，应查看报告保留的原始 gate 状态；
 默认 CPU/配置不能满足全部安全和硬件测试的前提。
 

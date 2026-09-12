@@ -133,7 +133,7 @@ bash scripts/ci/entrypoint.sh runtime
 bash scripts/ci/entrypoint.sh musl
 ```
 
-Boot/runtime/SMP and musl guest observation windows default to **600 seconds**.
+Boot/runtime/SMP and musl guest observation windows default to **900 seconds**.
 The boot/runtime/SMP group
 has three sequential windows. A nonzero make exit can represent a qualified
 guest result; use the retained group report and original gate status to diagnose

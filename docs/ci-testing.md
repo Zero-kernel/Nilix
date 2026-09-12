@@ -57,10 +57,10 @@ same artifact directory, the report labels the retry, and `retry.log` records th
 decision. Set `CI_GUEST_RETRIES=0` to disable it. Host/build checks remain
 single-shot.
 
-The core CI jobs allow up to 30--60 minutes for build and guest work. Boot,
-runtime/SMP and musl collectors use a 600-second (10-minute) observation window
-per invocation; the runtime group therefore has three sequential 10-minute
-windows. Mitigation, KCOV/fuzz and extended stress keep their 900-second
+The core CI jobs allow up to 30--90 minutes for build and guest work. Boot,
+runtime/SMP and musl collectors use a 900-second (15-minute) observation window
+per invocation; the runtime group therefore has three sequential 15-minute
+windows. Mitigation, KCOV/fuzz and extended stress also keep their 900-second
 (15-minute) workload windows. The aggregate report has a 15-minute reporting
 budget. Extended stress runs use 900 seconds per profile and a 180-minute job
 budget; scheduled fuzz campaigns use up to 900 seconds per target and a
@@ -99,9 +99,9 @@ preserve packet framing, checksum, timeout and thread validation. Duplicate
 site/CPU stops do not require repeated CPL3 proof after that pair was already
 verified. All 17 unique observations and the complete fork/exec workload remain
 required. CI allows a 900-second collector deadline for slower hosted QEMU
-versions; boot/runtime/SMP and musl use the shorter 600-second window because
-their normal completion path is bounded and independently reported. The
-workload emits bounded, per-attempt evidence when concurrent
+versions; boot/runtime/SMP and musl use the same 900-second window because their
+normal completion path is bounded and independently reported. The workload emits
+bounded, per-attempt evidence when concurrent
 fork/exec allocation transiently returns ENOMEM; a non-recovering exec failure
 still fails the gate. Linux QEMU 6.2 validation passes all 17 observations and
 the complete workload, and `mitigation_check_test.py` passes its 48 regression

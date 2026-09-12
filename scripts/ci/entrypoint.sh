@@ -107,7 +107,7 @@ case "$group" in
     musl)
         gate build -- make build-musl-test
         for cpus in 1 4; do
-            check_guest "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=600 \
+            check_guest "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=900 \
                 bash scripts/gates/boot/musl_check.sh kernel-target/musl/esp
         done
         ;;

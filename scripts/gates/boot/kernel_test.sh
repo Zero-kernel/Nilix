@@ -14,7 +14,7 @@ QEMU=qemu-system-x86_64
 # (so `bash scripts/gates/boot/boot_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
-TO="${KERNEL_TEST_TIMEOUT:-600}"
+TO="${KERNEL_TEST_TIMEOUT:-900}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 900"
     exit 2

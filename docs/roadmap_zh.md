@@ -483,7 +483,7 @@ DMAR 在启动时接线。Q35 初始化/构造器/SIRTP/IR/TE 失败与 EDU 翻�
 </table>
 </div>
 
-命令：[CI 指南](ci-testing.md)、[质量门](quality-gates.md)、[脚本图](../scripts/README.md)。boot/runtime/SMP 与 musl 客户机观察单次默认 600 秒；mitigation、qemu-fuzz 与 stress 保留 900 秒。作业预算含顺序窗口/准备/构建/产物。短 mock 单元截止**不**缩短真实客户机执行。
+命令：[CI 指南](ci-testing.md)、[质量门](quality-gates.md)、[脚本图](../scripts/README.md)。boot/runtime/SMP 与 musl 客户机观察单次默认 900 秒；mitigation、qemu-fuzz 与 stress 保留 900 秒。作业预算含顺序窗口/准备/构建/产物。短 mock 单元截止**不**缩短真实客户机执行。
 
 ## 14. 风险与依赖
 

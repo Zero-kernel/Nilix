@@ -414,7 +414,7 @@ efficiency; QEMU IRTE reuse does not qualify general VM passthrough.
 
 Commands: [CI guide](ci-testing.md), [quality gates](quality-gates.md),
 [script map](../scripts/README.md). Boot/runtime/SMP and musl observation windows
-default to 600 seconds; mitigation, qemu-fuzz and stress retain their 900-second
+default to 900 seconds; mitigation, qemu-fuzz and stress retain their 900-second
 budgets. Job budgets include sequential windows/setup/build/artifacts. Short mock unit
 deadlines do not shorten real guest execution.
 

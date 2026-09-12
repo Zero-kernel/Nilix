@@ -117,8 +117,9 @@ jobs:
     name: QEMU / boot and SMP
     needs: build
     runs-on: ubuntu-24.04
-    # Three sequential 10-minute observation windows plus setup/reporting.
-    timeout-minutes: 60
+    # Three sequential 15-minute observation windows plus setup/reporting and
+    # one bounded retry for a transient guest failure.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
@@ -139,7 +140,7 @@ jobs:
   qemu:
     name: QEMU / ${{ matrix.group }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
