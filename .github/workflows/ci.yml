@@ -49,6 +49,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: make build
         run: make build
+      - name: Exact usercopy exception table and fault recovery
+        run: python3 kernel/tests/usercopy_exception_table_test.py --runtime --kernel-elf esp/kernel.elf
 
   lint:
     name: custom lints (grep gates + ABI oracle)
@@ -64,6 +66,23 @@ jobs:
         run: make lint-fallible
       - name: make abi-check (ABI layout oracle — Rust source vs Linux x86-64 reference)
         run: make abi-check
+      - name: Boot/SMP/IOMMU gate parser and harness regression fixtures
+        run: python3 scripts/gate_log_test.py -v
+      - name: Runtime outcome policy and strict qualification fixtures
+        run: python3 scripts/test_outcome_policy_test.py -v
+      - name: Outcome propagation through stress and performance callers
+        run: python3 scripts/test_outcome_callers_test.py -v
+      - name: QEMU fuzz evidence gate fixtures
+        run: python3 scripts/qemu_fuzz_smoke_test.py -v
+      - name: O_TRUNC syscall failure evidence fixtures
+        run: python3 scripts/open_fault_probe_test.py -v
+      - name: Fresh ESP input identity and mitigation evidence fixtures
+        run: |
+          python3 scripts/gate_inputs_test.py -v
+          python3 scripts/mitigation_check_test.py -v
+          python3 scripts/namespace_resource_probe_test.py -v
+          python3 scripts/iommu_failure_probe_test.py -v
+          python3 scripts/iommu_device_probe_test.py -v
 
   hosted-subcrate-tests:
     name: Hosted Kernel Tests
@@ -99,8 +118,140 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools
       - name: make boot-check (boots the kernel, asserts 0 NX-violation #PF)
-        run: make boot-check
-      - name: make test (runtime suite gate; Test Summary + panic/NX; exit 0/1/2)
-        run: make test
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/boot -- make boot-check
+      - name: make test (runtime suite and outcome qualification; exit 0/1/2/3)
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/runtime -- make test
       - name: make musl-check (static-musl conformance gate)
-        run: make musl-check
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/gate-evidence/musl -- make musl-check
+      - name: Retain source identity, final gate status, counts and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-runtime-musl-evidence
+          path: target/gate-evidence/
+          if-no-files-found: error
+
+  qemu-fuzz:
+    name: Real QEMU fuzz adapter and authenticated guest smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU, OVMF, musl and Ext3 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs
+      - name: Executor protocol and real-child failure classification
+        run: cargo test --manifest-path userspace/nilix-syz-fuzzer/Cargo.toml --target x86_64-unknown-linux-gnu --locked --lib
+      - name: Cargo-fuzz adapter decoding
+        run: cargo test --manifest-path fuzz/Cargo.toml --target x86_64-unknown-linux-gnu --locked --features qemu-executor --lib qemu_executor::tests
+      - name: Real guest smoke through the cargo-fuzz adapter
+        run: make fuzz-qemu-smoke
+      - name: Retain revision, hashes, statuses, guest logs and transport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-fuzz-evidence
+          path: target/qemu-fuzz-smoke/
+          if-no-files-found: error
+
+  iommu-evidence:
+    name: Q35 VT-d device evidence and initialization failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Build and capture source inputs
+        run: |
+          make build
+          mkdir -p target/iommu-evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, subprocess
+          names = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          Path('target/iommu-evidence/inputs.sha256').write_text(''.join(
+              hashlib.sha256(Path(name).read_bytes()).hexdigest() + '  ' + name + '\n'
+              for name in names if name and Path(name).is_file()))
+          PY
+      - name: Actual Q35 activation and honest runtime qualification
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/iommu-evidence/positive -- bash scripts/iommu_q35_check.sh esp
+      - name: Constructor and SIRTP/IR/TE failure containment
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/iommu-evidence/failures -- python3 scripts/iommu_failure_probe.py --input-manifest target/iommu-evidence/inputs.sha256 --revision '${{ github.sha }}' --artifacts target/iommu-evidence/probes
+      - name: EDU translated DMA, fault containment and remapped MSI
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/iommu-evidence/device-gate -- python3 scripts/iommu_device_probe.py --input-manifest target/iommu-evidence/inputs.sha256 --revision '${{ github.sha }}' --artifacts target/iommu-evidence/device
+      - name: Retain VT-d source, actual images, tools, serial and status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iommu-q35-evidence
+          path: target/iommu-evidence/
+          if-no-files-found: error
+
+  mitigation-evidence:
+    name: Generated dual-root behavior and four-CPU fork/exec trace
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-12-08
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU, OVMF and musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools
+      - name: Active status and page-table permission fixtures
+        run: |
+          set -o pipefail
+          mkdir -p target/mitigation-evidence
+          cargo test --manifest-path kernel/security/Cargo.toml --target x86_64-unknown-linux-gnu --features mm/host_harness,cpu_local/host_harness --locked --lib spectre::status_tests | tee target/mitigation-evidence/status-tests.log
+          grep -F 'test result: ok. 3 passed; 0 failed;' target/mitigation-evidence/status-tests.log
+          cargo test --manifest-path kernel/kernel_core/Cargo.toml --target x86_64-unknown-linux-gnu --features host_harness,mitigation_probe --locked --lib mitigation_probe::tests | tee target/mitigation-evidence/mapping-tests.log
+          grep -F 'test result: ok. 3 passed; 0 failed;' target/mitigation-evidence/mapping-tests.log
+      - name: Unsupported compiler retpoline cannot be enabled silently
+        run: |
+          set +e
+          cargo check --manifest-path kernel/security/Cargo.toml --target x86_64-unknown-linux-gnu --features retpoline,mm/host_harness,cpu_local/host_harness --locked > target/mitigation-evidence/retpoline-negative.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > target/mitigation-evidence/retpoline-negative.status
+          test "$status" -ne 0
+          grep -F 'retpoline is unsupported: no verified compiler transformation' target/mitigation-evidence/retpoline-negative.log
+      - name: Build the dedicated workload and record executed commands
+        run: make build-mitigation-probe
+      - name: Observe all five linked CR3 sites, four CPUs and CPL3 returns
+        if: always()
+        run: python3 scripts/record_gate.py --artifacts target/mitigation-evidence/gate -- python3 scripts/mitigation_check.py --runtime --smp 4 --timeout 120 --kernel-elf kernel-target/mitigation/x86_64-unknown-none/release/kernel --esp kernel-target/mitigation/esp --build-command-json kernel-target/mitigation/build-command.json --artifacts target/mitigation-evidence/proof
+      - name: Retain mitigation proof and any partial/failing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mitigation-generated-runtime-evidence
+          path: |
+            target/mitigation-evidence/
+            kernel-target/mitigation/build-command.json
+          if-no-files-found: error
