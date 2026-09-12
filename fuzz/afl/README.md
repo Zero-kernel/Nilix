@@ -73,7 +73,7 @@ make fuzz-kernel
 
 ```bash
 # Single instance
-./scripts/afl_fuzz.sh \
+./scripts/fuzz/afl_fuzz.sh \
     --kernel target/x86_64-unknown-none/release/kernel \
     --timeout 5000 \
     --memory 2G \
@@ -81,7 +81,7 @@ make fuzz-kernel
     --output fuzz/afl_findings
 
 # Parallel fuzzing (recommended)
-./scripts/afl_parallel.sh \
+./scripts/fuzz/afl_parallel.sh \
     --instances 4 \
     --kernel target/x86_64-unknown-none/release/kernel
 ```
@@ -95,7 +95,7 @@ afl-whatsup fuzz/afl_findings
 ### 4. Triage Crashes
 
 ```bash
-./scripts/afl_triage.sh fuzz/afl_findings/default/crashes
+./scripts/fuzz/afl_triage.sh fuzz/afl_findings/default/crashes
 ```
 
 ## Seed Corpus
@@ -117,7 +117,7 @@ Seeds are **binary syscall traces**, not random bytes.
 
 ```bash
 # Core affinity (one fuzzer per core)
-./scripts/afl_parallel.sh --instances $(nproc) --pin-cores
+./scripts/fuzz/afl_parallel.sh --instances $(nproc) --pin-cores
 
 # Persistent mode (if kernel supports)
 export AFL_QEMU_PERSISTENT_ADDR=0x...

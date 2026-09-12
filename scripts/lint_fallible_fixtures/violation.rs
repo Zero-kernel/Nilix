@@ -1,6 +1,6 @@
 // D2-ERR-VFS-FALLIBILITY lint self-test — NEGATIVE fixture.
 //
-// NOT COMPILED (lives outside any cargo workspace member). `scripts/lint_fallible.sh`
+// NOT COMPILED (lives outside any cargo workspace member). `scripts/tools/lint_fallible.sh`
 // must flag EXACTLY 22 lines here. The count is pinned in the Makefile
 // `lint-fallible-selftest` target: if you add/remove a candidate alternation or a
 // suppression-bypass case, update BOTH this fixture and that pinned count together.

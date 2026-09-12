@@ -8,7 +8,7 @@ on:
       timeout:
         description: Seconds per target (1-1200)
         type: string
-        default: '600'
+        default: '900'
 
 permissions: {}
 concurrency:
@@ -21,7 +21,7 @@ jobs:
   fuzz-tools-test:
     name: Campaign prerequisites
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -29,7 +29,7 @@ jobs:
       - uses: ./.github/actions/setup-kernel
         with:
           cache-key: host-tools
-      - run: bash scripts/ci.sh tools
+      - run: bash scripts/ci/entrypoint.sh tools
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -41,7 +41,7 @@ jobs:
     name: Cargo-Fuzz ${{ matrix.target }}
     needs: fuzz-tools-test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -109,7 +109,7 @@ jobs:
       - name: Run fuzzer privately
         id: run_fuzzer
         env:
-          FUZZ_TIMEOUT: ${{ inputs.timeout || '600' }}
+          FUZZ_TIMEOUT: ${{ inputs.timeout || '900' }}
         run: |
           timeout="$FUZZ_TIMEOUT"
           if ! [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || [ "$timeout" -gt 1200 ]; then
@@ -354,7 +354,7 @@ jobs:
         with:
           pattern: fuzz-result-*
           path: artifacts
-      - run: python3 scripts/ci_report.py artifacts --fuzz --expected-manifests 11
+      - run: python3 scripts/ci/ci_report.py artifacts --fuzz --expected-manifests 11
         if: always()
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}

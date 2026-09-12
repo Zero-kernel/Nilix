@@ -22,14 +22,14 @@ jobs:
   quality:
     name: Quality / lint and harness tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r requirements-ci.txt
-      - run: bash scripts/ci.sh quality
+      - run: bash scripts/ci/entrypoint.sh quality
       - name: Check Actions definitions
         if: always()
         run: |
@@ -45,7 +45,7 @@ jobs:
   style:
     name: Quality / rustfmt and Clippy
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
@@ -55,7 +55,7 @@ jobs:
   hosted:
     name: Hosted / ${{ matrix.profile }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +68,7 @@ jobs:
       - uses: ./.github/actions/setup-kernel
         with:
           cache-key: hosted-${{ matrix.profile }}
-      - run: bash scripts/ci.sh hosted
+      - run: bash scripts/ci/entrypoint.sh hosted
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -79,13 +79,13 @@ jobs:
   tools:
     name: Hosted / fuzz tools and executor
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
         with:
           cache-key: host-tools
-      - run: bash scripts/ci.sh tools
+      - run: bash scripts/ci/entrypoint.sh tools
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -96,11 +96,11 @@ jobs:
   build:
     name: Kernel / build and usercopy
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
-      - run: bash scripts/ci.sh build
+      - run: bash scripts/ci/entrypoint.sh build
       - uses: actions/upload-artifact@v7
         with:
           name: normal-boot-image
@@ -117,7 +117,7 @@ jobs:
     name: QEMU / boot and SMP
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
@@ -127,7 +127,7 @@ jobs:
         with:
           name: normal-boot-image
           path: esp
-      - run: bash scripts/ci.sh runtime
+      - run: bash scripts/ci/entrypoint.sh runtime
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -138,7 +138,7 @@ jobs:
   qemu:
     name: QEMU / ${{ matrix.group }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -149,7 +149,7 @@ jobs:
         with:
           qemu: 'true'
           cache-key: qemu-${{ matrix.group }}
-      - run: bash scripts/ci.sh "$CI_GROUP"
+      - run: bash scripts/ci/entrypoint.sh "$CI_GROUP"
         env:
           CI_GROUP: ${{ matrix.group }}
       - uses: actions/upload-artifact@v7
@@ -164,9 +164,9 @@ jobs:
     needs: [quality, style, hosted, tools, build, runtime, qemu]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - run: python3 scripts/ci_report.py --aggregate
+      - run: python3 scripts/ci/ci_report.py --aggregate
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}

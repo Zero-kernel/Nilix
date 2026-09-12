@@ -1,7 +1,7 @@
 // D2-ERR-VFS-FALLIBILITY lint self-test — POSITIVE fixture.
 //
 // NOT COMPILED. Every candidate pattern appears here, but each is covered by one
-// suppression path, so `scripts/lint_fallible.sh` must yield ZERO hits. If any line
+// suppression path, so `scripts/tools/lint_fallible.sh` must yield ZERO hits. If any line
 // here is flagged, a suppression rule regressed.
 
 // --- 1. same-line / N-lines-above annotations ---

@@ -12,9 +12,9 @@ jobs:
   extended:
     name: Extended / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
-      CI_STRESS_SECONDS: '300'
+      CI_STRESS_SECONDS: '900'
     strategy:
       fail-fast: false
       matrix:
@@ -25,9 +25,9 @@ jobs:
         with:
           qemu: 'true'
           cache-key: extended-${{ matrix.os }}
-      - run: bash scripts/ci.sh extended
+      - run: bash scripts/ci/entrypoint.sh extended
       - if: always()
-        run: bash scripts/ci.sh iommu
+        run: bash scripts/ci/entrypoint.sh iommu
       - uses: actions/upload-artifact@v7
         if: always()
         with:

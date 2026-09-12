@@ -279,7 +279,7 @@ chmod +x build-isolated.sh
 cd userspace/nilix-syz-fuzzer
 ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
     --kernel ../../esp-kcov/kernel.elf \
-    --timeout 60 --workers 1 --program-timeout 10
+    --timeout 900 --workers 1 --program-timeout 30
 ```
 
 **Crashes detected**:

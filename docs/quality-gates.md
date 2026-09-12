@@ -28,11 +28,11 @@ These QEMU gates have **real exit codes** read from the serial log and the QEMU 
 interrupt log — never from QEMU's own exit code (`-no-reboot -no-shutdown` makes a timeout
 the normal end of a healthy run).
 
-- **`make boot-check`** (`scripts/boot_check.sh`) — boots under QEMU and fails unless the
+- **`make boot-check`** (`scripts/gates/boot/boot_check.sh`) — boots under QEMU and fails unless the
   kernel reaches user space / its idle loop **and** zero NX-violation instruction-fetch
   page faults occurred (the `v=0e e=0011` signature from the D1-BOOT-NX-KASLR-LAYOUT class
   of bugs).
-- **`make test`** (`scripts/kernel_test.sh`, P1-C VT-2 / Gate #4) — boots the default
+- **`make test`** (`scripts/gates/boot/kernel_test.sh`, P1-C VT-2 / Gate #4) — boots the default
   `make build` image and asserts a parseable in-kernel
   `=== Test Summary: N passed, M deferred (...), K failed ===` with `K == 0`, plus zero
   `KERNEL PANIC` and zero NX-violation #PF. Script exit polarity:
@@ -40,7 +40,7 @@ the normal end of a healthy run).
   skips remain non-passing outcomes; `ZERO_OS_STRICT_TESTS=1` rejects them. GNU make
   maps a nonzero recipe to exit 2, so diagnostic CI calls the scripts directly and
   explicitly accepts 3 while retaining counts and the original exit status.
-- **`make musl-check`** (`scripts/musl_check.sh`) — builds with `--features musl_test` so
+- **`make musl-check`** (`scripts/gates/boot/musl_check.sh`) — builds with `--features musl_test` so
   the embedded `hello_musl.elf` is the Ring-3 init program, then asserts **all** of: the
   libc-attributable `printf` marker (`42 * 2 = 84`), the `musl libc test passed!` success
   line, a clean `exit code 0`, zero NX-violation #PF, and no kernel panic. The gate is
@@ -65,10 +65,10 @@ Six repository-specific gates catch invariants the compiler cannot prove:
 Nilix has sustained stability, performance, and extended SMP tests beyond the core CI
 gates:
 
-- **QEMU stress soaks — stress-v2** (`scripts/stress_test.sh` + `scripts/stress_protocol.py`)
+- **QEMU stress soaks — stress-v2** (`scripts/gates/stress/stress_test.sh` + `scripts/gates/stress/stress_protocol.py`)
   — six in-guest pressure profiles (`memory`, `cpu`, `smp`, `process`, `block`, `combined`)
   driven by a 256-byte `NILSTR2` configuration injected into the ext3 image and validated
-  fail-closed against a `NILIX_STRESS_V2_*` serial marker contract, over 60–300 seconds.
+  fail-closed against a `NILIX_STRESS_V2_*` serial marker contract, over 60–900 seconds.
   Invoke via `make stress-test` or `make stress-test-extended`; the weekly/manual
   workflow is `.github/workflows/extended.yml` (Ubuntu 22.04 and 24.04).
   > **Status: NOT GREEN — do not treat this gate as passing.** It has never completed a
@@ -83,15 +83,15 @@ gates:
   > root-cgroup membership for the init task. Full evidence, the reconstructed V2 contract,
   > the defect table, and the open decisions are in
   > [`docs/stress-gate-status.md`](stress-gate-status.md).
-- **Extended SMP** (`scripts/extended_smp_test.sh`) — validates 8-core and 16-core boot,
+- **Extended SMP** (`scripts/gates/boot/extended_smp_test.sh`) — validates 8-core and 16-core boot,
   IPI broadcast, and multi-CPU lock contention. Run via `make test-smp-extended`.
-- **Performance regression gate** (`scripts/perf_regression_test.sh`) — framework for
+- **Performance regression gate** (`scripts/gates/performance/perf_regression_test.sh`) — framework for
   detecting syscall latency, context-switch, and page-fault regressions. Invoked via
   `make test-perf` (benchmarks pending).
 - **Security tests** (`kernel/security/tests.rs`) — nine runtime tests validating W^X, RNG,
   kptr guard, Spectre V1/V2, SMAP, and SMEP mitigations. Integrated into the standard
   `make test` suite.
-- **Melting tests** (`scripts/melting_test.sh`) — sustained maximum-load scenarios (10+
+- **Melting tests** (`scripts/gates/performance/melting_test.sh`) — sustained maximum-load scenarios (10+
   minutes) for bare-metal thermal validation. Framework in place; requires real hardware.
 
 Full documentation lives in [`docs/testing/`](testing/).
@@ -250,7 +250,7 @@ architectural deep-dive).
 ```bash
 # Syzkaller-style coverage-guided fuzzing (Phase 7)
 make build-kcov build-syz-executor build-syz-fuzzer  # Build all components
-make test-syz                                         # 60-second smoke test
+make test-syz                                         # 15-minute smoke test
 make run-syz-fuzz DURATION=3600 WORKERS=4            # Full fuzzing campaign
 
 # Cargo-fuzz QEMU syscall fuzzing

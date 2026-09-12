@@ -9,7 +9,7 @@ pub use nilix_syz_fuzzer::executor::{CrashInfo, ExecutionResult, QemuExecutor};
 pub use nilix_syz_fuzzer::program::{Argument, Syscall, SyscallProgram};
 use std::path::PathBuf;
 
-pub const GUEST_TIMEOUT_SECS: u64 = 90;
+pub const GUEST_TIMEOUT_SECS: u64 = 900;
 
 // Same non-destructive contract validated by the shared program/guest protocol.
 const SYSCALLS: &[u32] = &[

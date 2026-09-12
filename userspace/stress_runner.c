@@ -5,8 +5,8 @@
  *
  * Security > Correctness > Efficiency > Performance
  *
- * The host half of this contract lives in scripts/stress_protocol.py and
- * scripts/stress_test.sh. It injects a 256-byte configuration record into the
+ * The host half of this contract lives in scripts/gates/stress/stress_protocol.py and
+ * scripts/gates/stress/stress_test.sh. It injects a 256-byte configuration record into the
  * ext3 image at /test/stress.cfg (visible here as /mnt/test/stress.cfg), boots
  * this guest, and validates the serial marker stream fail-closed. Every field
  * emitted below is cross-checked host-side, so this file must not "round" or
