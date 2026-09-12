@@ -146,6 +146,22 @@ pub struct MountNamespace {
     _arc_heap_charge: Option<HeapCharge>,
 }
 
+static DESTROY_CALLBACK: spin::Once<fn(NamespaceId)> = spin::Once::new();
+
+pub fn register_destroy_callback(callback: fn(NamespaceId)) {
+    DESTROY_CALLBACK.call_once(|| callback);
+}
+
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        if self.id.raw() != 0 {
+            if let Some(callback) = DESTROY_CALLBACK.get() {
+                callback(self.id);
+            }
+        }
+    }
+}
+
 impl MountNamespace {
     /// Create the root mount namespace.
     fn new_root() -> Self {
