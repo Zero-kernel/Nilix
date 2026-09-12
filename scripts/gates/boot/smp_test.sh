@@ -17,8 +17,8 @@ ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # RF180-52 FIX: the expanded R180 boot/self-test path can reach AP-online at
 # the historical 30-second boundary on the remote CI host. Keep every SMP
-# marker fail-closed, but allow the complete boot a bounded 15-minute window.
-TO="${SMP_TEST_TIMEOUT:-900}"
+# marker fail-closed, but allow the complete boot a bounded 10-minute window.
+TO="${SMP_TEST_TIMEOUT:-600}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "SMP-TEST FAIL: SMP_TEST_TIMEOUT must be an integer from 1 to 900"
     exit 2

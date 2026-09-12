@@ -52,11 +52,14 @@ and HTML/XML/JSON Python coverage. Set `HOSTED_TEST_LOG_DIR` to retain individua
 Rust suite logs, `hosted.junit.xml`, and its verified count table. Actions publishes each group's
 summary on its run page and retains the full directory as an artifact.
 
-The core CI jobs allow up to 30--60 minutes for build and guest work, with each
-guest evidence collector receiving a 900-second (15-minute) workload window.
-The aggregate report has a 15-minute reporting budget. Extended stress runs use
-900 seconds per profile and a 180-minute job budget; scheduled fuzz campaigns
-use up to 900 seconds per target and a 45-minute job budget.
+The core CI jobs allow up to 30--60 minutes for build and guest work. Boot,
+runtime/SMP and musl collectors use a 600-second (10-minute) observation window
+per invocation; the runtime group therefore has three sequential 10-minute
+windows. Mitigation, KCOV/fuzz and extended stress keep their 900-second
+(15-minute) workload windows. The aggregate report has a 15-minute reporting
+budget. Extended stress runs use 900 seconds per profile and a 180-minute job
+budget; scheduled fuzz campaigns use up to 900 seconds per target and a
+45-minute job budget.
 
 Use `CI result` as the single required status check when configuring branch
 protection. No branch-protection settings are changed by this patch.
@@ -91,8 +94,9 @@ preserve packet framing, checksum, timeout and thread validation. Duplicate
 site/CPU stops do not require repeated CPL3 proof after that pair was already
 verified. All 17 unique observations and the complete fork/exec workload remain
 required. CI allows a 900-second collector deadline for slower hosted QEMU
-versions; the musl matrix gives slower single-CPU QEMU runs a 900-second
-completion window. The workload emits bounded, per-attempt evidence when concurrent
+versions; boot/runtime/SMP and musl use the shorter 600-second window because
+their normal completion path is bounded and independently reported. The
+workload emits bounded, per-attempt evidence when concurrent
 fork/exec allocation transiently returns ENOMEM; a non-recovering exec failure
 still fails the gate. Linux QEMU 6.2 validation passes all 17 observations and
 the complete workload, and `mitigation_check_test.py` passes its 48 regression

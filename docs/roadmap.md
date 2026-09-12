@@ -413,8 +413,9 @@ efficiency; QEMU IRTE reuse does not qualify general VM passthrough.
 | Hardware/performance | Named matrix/protocols and future oracles | Physical VT-d/performance/thermal evidence pending |
 
 Commands: [CI guide](ci-testing.md), [quality gates](quality-gates.md),
-[script map](../scripts/README.md). Guest observation defaults to 900 seconds;
-job budgets include sequential windows/setup/build/artifacts. Short mock unit
+[script map](../scripts/README.md). Boot/runtime/SMP and musl observation windows
+default to 600 seconds; mitigation, qemu-fuzz and stress retain their 900-second
+budgets. Job budgets include sequential windows/setup/build/artifacts. Short mock unit
 deadlines do not shorten real guest execution.
 
 ## 14. Risks and dependencies

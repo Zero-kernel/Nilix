@@ -35,7 +35,7 @@
 #
 # Usage:   bash scripts/gates/boot/musl_check.sh [esp_dir]
 # Env:     OVMF_PATH (autodetect fallback if unset)
-#          MUSL_CHECK_TIMEOUT seconds (default 900; CI uses up to 900)
+#          MUSL_CHECK_TIMEOUT seconds (default 600; CI uses 600)
 # ============================================================================
 set -u
 
@@ -48,11 +48,11 @@ QEMU=qemu-system-x86_64
 # (so `bash scripts/gates/boot/musl_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
-# Default 900s: the boot self-test suite + the Ring-3 poll/select smoke (M0-6) push
+# Default 600s: the boot self-test suite + the Ring-3 poll/select smoke (M0-6) push
 # the clean-exit marker past the old 25s window on a loaded remote. The gate still
 # observes to completion and re-greps the full log, so a wider window never weakens
 # it (it only fails-fast earlier on KERNEL PANIC).
-TO="${MUSL_CHECK_TIMEOUT:-900}"
+TO="${MUSL_CHECK_TIMEOUT:-600}"
 CPUS="${MUSL_CHECK_CPUS:-1}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ || ! "$CPUS" =~ ^(1|2|4|8)$ ]]; then
     echo "MUSL-CHECK BLOCKED: invalid timeout or CPU count (timeout 1-900s; CPUs 1/2/4/8)"

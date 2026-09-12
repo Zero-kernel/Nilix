@@ -15,7 +15,7 @@ ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # RF180-52 FIX: match the two-core gate's bounded R180 boot window while
 # retaining the stricter four-CPU topology checks below.
-TO="${SMP_4CORE_TEST_TIMEOUT:-900}"
+TO="${SMP_4CORE_TEST_TIMEOUT:-600}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "SMP-TEST FAIL: SMP_4CORE_TEST_TIMEOUT must be an integer from 1 to 900"
     exit 2
