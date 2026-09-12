@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use kernel_core::user_namespace;
 use kernel_core::FileDescriptor;
 // R29-1 FIX: Import process module for real process information
@@ -27,8 +27,6 @@ use mm::memory::FrameAllocator;
 use mm::page_cache::PAGE_CACHE;
 use mm::{arc_charge_bytes, try_reserve_heap, AdmittedString, AdmittedVec, HeapCharge, HeapClass};
 
-/// Global procfs ID counter
-static NEXT_FS_ID: AtomicU64 = AtomicU64::new(200);
 static FAIL_NEXT_PROCFS_ARC: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -91,9 +89,7 @@ impl ProcFs {
     /// Create a new procfs through fully fallible, admitted Arc publication.
     pub fn try_new() -> Result<Arc<Self>, FsError> {
         // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
-        let fs_id = NEXT_FS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| FsError::NoMem)?;
+        let fs_id = crate::identity::allocate_fs_id()?;
 
         let root = try_new_procfs_arc(|charge| ProcRootInode {
             fs_id,
@@ -148,6 +144,45 @@ impl ProcFs {
 }
 
 impl FileSystem for ProcFs {
+    fn directory_parent(
+        &self,
+        inode: &Arc<dyn Inode>,
+    ) -> Result<Option<crate::traits::DirectoryParent>, FsError> {
+        if inode.fs_id() != self.fs_id {
+            return Err(FsError::CrossDev);
+        }
+        if inode.ino() == 1 {
+            return Ok(None);
+        }
+        if let Some(directory) = inode.as_any().downcast_ref::<ProcPidDirInode>() {
+            if validate_proc_identity_binding(&directory.identity).is_none() {
+                return Err(FsError::NotFound);
+            }
+            return Ok(Some(crate::traits::DirectoryParent {
+                inode: self.root.clone(),
+                name: crate::types::try_dirent_name_from_u64(
+                    directory.identity.display_pid as u64,
+                )?,
+                attached: true,
+            }));
+        }
+        if let Some(directory) = inode.as_any().downcast_ref::<ProcPidFdDirInode>() {
+            if validate_proc_identity_binding(&directory.identity).is_none() {
+                return Err(FsError::NotFound);
+            }
+            let parent = try_new_procfs_arc(|charge| ProcPidDirInode {
+                fs_id: self.fs_id,
+                identity: directory.identity.clone(),
+                _heap_charge: Some(charge),
+            })?;
+            return Ok(Some(crate::traits::DirectoryParent {
+                inode: parent,
+                name: crate::types::try_dirent_name("fd")?,
+                attached: true,
+            }));
+        }
+        Err(FsError::NotDir)
+    }
     fn fs_id(&self) -> u64 {
         self.fs_id
     }
@@ -2383,11 +2418,9 @@ fn generate_uptime() -> Result<AdmittedString, FsError> {
 #[cfg(test)]
 mod id_map_tests {
     use super::*;
+    use crate::HEAP_TEST_LOCK as TEST_LOCK;
     use alloc::string::ToString;
     use kernel_core::process::{Process, ProcessNameSnapshot};
-    use spin::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fixture() -> (ProcPidIdMapInode, ProcessArc) {
         let process = Process::try_new_pcb(

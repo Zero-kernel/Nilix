@@ -28,7 +28,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::cgroup::{
     self, CgroupArc, CgroupControllers, CgroupError, CgroupId, CgroupLimits,
 };
@@ -45,9 +44,6 @@ fn try_new_cgroupfs_arc<T>(build: impl FnOnce(HeapCharge) -> T) -> Result<Arc<T>
     let charge = reservation.commit().map_err(|_| FsError::NoSpace)?;
     Arc::try_new(build(charge)).map_err(|_| FsError::NoSpace)
 }
-
-/// Global cgroupfs ID counter (starts at 300 to avoid collision with other FS types)
-static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
 
 /// R154-2 FIX: Deterministic inode computation replaces unstable NEXT_INO counter.
 /// Inode = (cgroup_id + 1) * STRIDE + file_offset.
@@ -248,9 +244,7 @@ impl CgroupFs {
     /// Create a new cgroupfs mounted at root cgroup
     pub fn new() -> Arc<Self> {
         // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
-        let fs_id = NEXT_FS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .expect("cgroupfs: NEXT_FS_ID overflow");
+        let fs_id = crate::identity::allocate_fs_id().expect("cgroupfs: filesystem IDs exhausted");
 
         // Root directory maps to root cgroup (id=0)
         // R154-2 FIX: Deterministic inode computation
@@ -268,6 +262,34 @@ impl CgroupFs {
 }
 
 impl FileSystem for CgroupFs {
+    fn directory_parent(
+        &self,
+        inode: &Arc<dyn Inode>,
+    ) -> Result<Option<crate::traits::DirectoryParent>, FsError> {
+        if inode.fs_id() != self.fs_id {
+            return Err(FsError::CrossDev);
+        }
+        let directory = inode
+            .as_any()
+            .downcast_ref::<CgroupDirInode>()
+            .ok_or(FsError::NotDir)?;
+        let cgroup = cgroup::lookup_cgroup(directory.cgroup_id).ok_or(FsError::NotFound)?;
+        let Some(parent) = cgroup.parent() else {
+            return Ok(None);
+        };
+        let parent_id = parent.id();
+        let parent_inode = try_new_cgroupfs_arc(|charge| CgroupDirInode {
+            fs_id: self.fs_id,
+            ino: cgroup_dir_ino(parent_id),
+            cgroup_id: parent_id,
+            _heap_charge: Some(charge),
+        })?;
+        Ok(Some(crate::traits::DirectoryParent {
+            inode: parent_inode,
+            name: crate::types::try_dirent_name_from_u64(directory.cgroup_id as u64)?,
+            attached: true,
+        }))
+    }
     fn fs_id(&self) -> u64 {
         self.fs_id
     }
@@ -295,6 +317,7 @@ impl FileSystem for CgroupFs {
         parent: &Arc<dyn Inode>,
         name: &str,
         mode: FileMode,
+        context: &crate::topology::MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
         // Only directories (cgroups) can be created
         if !mode.is_dir() {
@@ -307,7 +330,7 @@ impl FileSystem for CgroupFs {
             .ok_or(FsError::NotDir)?;
 
         // P1-3: Require root or delegated subtree owner on parent cgroup
-        if !is_privileged_or_delegate(dir.cgroup_id) {
+        if !is_privileged_or_delegate(dir.cgroup_id, context.uid) {
             return Err(FsError::PermDenied);
         }
 
@@ -343,6 +366,7 @@ impl FileSystem for CgroupFs {
         name: &str,
         expected_ino: u64,
         must_be_dir: Option<bool>,
+        context: &crate::topology::MutationContext<'_>,
     ) -> Result<(), FsError> {
         let dir = parent
             .as_any()
@@ -363,7 +387,7 @@ impl FileSystem for CgroupFs {
         }
 
         // P1-3: Require root or delegated subtree owner on parent cgroup
-        if !is_privileged_or_delegate(dir.cgroup_id) {
+        if !is_privileged_or_delegate(dir.cgroup_id, context.uid) {
             return Err(FsError::PermDenied);
         }
 
@@ -1274,14 +1298,10 @@ fn effective_owner(cgroup_id: CgroupId) -> u32 {
 ///
 /// R134-2 FIX: Use host-mapped root check and host-mapped euid for delegation
 /// identity. Namespace euid==0 is not equivalent to host root.
-fn is_privileged_or_delegate(cgroup_id: CgroupId) -> bool {
-    if kernel_core::current_is_host_root() {
+fn is_privileged_or_delegate(cgroup_id: CgroupId, euid: u32) -> bool {
+    if euid == 0 {
         return true;
     }
-    let euid = match kernel_core::current_host_euid() {
-        Some(uid) => uid,
-        None => return false,
-    };
     cgroup::lookup_cgroup(cgroup_id)
         .map(|cg| cg.is_delegated_to(euid))
         .unwrap_or(false)

@@ -5,7 +5,7 @@
 //! - Implements FileSystem/Inode; all mutating ops return ReadOnly
 
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
+use crate::topology::{Edge, Retirement};
 use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
 use kernel_core::FileDescriptor;
@@ -26,8 +27,6 @@ const GENERATED_INO_START: u64 = 1 << 32;
 /// R28-9 Fix: Maximum per-file size from initramfs to prevent OOM during boot
 const MAX_INITRAMFS_FILE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
-/// Next filesystem ID
-static NEXT_FS_ID: AtomicU64 = AtomicU64::new(400);
 /// Next generated inode number
 static NEXT_GENERATED_INO: AtomicU64 = AtomicU64::new(GENERATED_INO_START);
 
@@ -138,10 +137,9 @@ impl Initramfs {
     /// Parse a CPIO "newc" archive from a memory buffer
     pub fn from_cpio(buf: &[u8]) -> Result<Arc<Self>, FsError> {
         // R112-2: overflow-safe ID allocation
-        let fs_id = NEXT_FS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| FsError::NoSpace)?;
+        let fs_id = crate::identity::allocate_fs_id()?;
         let now = TimeSpec::now();
+        let retirement = Retirement::try_new(mm::HeapClass::Vfs)?;
 
         // Create root directory with a generated ino to avoid colliding with archive inodes
         let root = InitramfsInode::new_dir(
@@ -152,6 +150,7 @@ impl Initramfs {
             0,
             0,
             now,
+            &retirement,
         );
 
         // Track regular files by the full CPIO identity tuple. Inode numbers
@@ -266,6 +265,7 @@ impl Initramfs {
                         header.uid,
                         header.gid,
                         mtime,
+                        &retirement,
                     ),
                     FileType::Symlink => InitramfsInode::new_symlink(
                         fs_id, header.ino, mode, nlink, header.uid, header.gid, mtime, data,
@@ -291,6 +291,26 @@ impl Initramfs {
 }
 
 impl FileSystem for Initramfs {
+    fn directory_parent(
+        &self,
+        inode: &Arc<dyn Inode>,
+    ) -> Result<Option<crate::traits::DirectoryParent>, FsError> {
+        let inode = self.downcast(inode)?;
+        if !inode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        if inode.ino == self.root.ino {
+            return Ok(None);
+        }
+        let metadata = inode.parent.read();
+        let (parent, name) = metadata.as_ref().ok_or(FsError::NotFound)?;
+        let parent = parent.upgrade().ok_or(FsError::NotFound)?;
+        Ok(Some(crate::traits::DirectoryParent {
+            inode: parent,
+            name: crate::types::try_dirent_name(name.as_str())?,
+            attached: true,
+        }))
+    }
     fn fs_id(&self) -> u64 {
         self.fs_id
     }
@@ -314,6 +334,7 @@ impl FileSystem for Initramfs {
         _parent: &Arc<dyn Inode>,
         _name: &str,
         _mode: FileMode,
+        _context: &crate::topology::MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
         Err(FsError::ReadOnly)
     }
@@ -324,6 +345,7 @@ impl FileSystem for Initramfs {
         _name: &str,
         _expected_ino: u64,
         _must_be_dir: Option<bool>,
+        _context: &crate::topology::MutationContext<'_>,
     ) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
@@ -338,6 +360,7 @@ impl FileSystem for Initramfs {
         _noreplace: bool,
         _expected_src_ino: u64,
         _expected_dest_ino: Option<u64>,
+        _context: &crate::topology::MutationContext<'_>,
     ) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
@@ -362,7 +385,7 @@ struct NodeMeta {
 /// Inode content type
 enum NodeKind {
     Directory {
-        children: RwLock<FallibleOrderedMap<String, Arc<InitramfsInode>>>,
+        children: RwLock<FallibleOrderedMap<String, Edge<InitramfsInode>>>,
     },
     File {
         /// Mutable only while the archive is being assembled. All hardlink
@@ -388,6 +411,9 @@ pub struct InitramfsInode {
     /// every call (U21-4), while the map remains authoritative for lookup.
     readdir_order: RwLock<Vec<String>>,
     kind: NodeKind,
+    self_weak: spin::Once<Weak<InitramfsInode>>,
+    parent: RwLock<Option<(Weak<InitramfsInode>, mm::AdmittedString)>>,
+    retirement: Option<Arc<Retirement<InitramfsInode>>>,
 }
 
 impl InitramfsInode {
@@ -400,9 +426,10 @@ impl InitramfsInode {
         uid: u32,
         gid: u32,
         mtime: TimeSpec,
+        retirement: &Arc<Retirement<InitramfsInode>>,
     ) -> Arc<Self> {
         // lint-fallible: INFALLIBLE-OK(boot CPIO unpack; boot-fatal on OOM by policy)
-        Arc::new(Self {
+        let inode = Arc::new(Self {
             fs_id,
             ino,
             parent_ino: AtomicU64::new(ino),
@@ -420,7 +447,12 @@ impl InitramfsInode {
             kind: NodeKind::Directory {
                 children: RwLock::new(FallibleOrderedMap::new()),
             },
-        })
+            self_weak: spin::Once::new(),
+            parent: RwLock::new(None),
+            retirement: Some(retirement.clone()),
+        });
+        inode.self_weak.call_once(|| Arc::downgrade(&inode));
+        inode
     }
 
     /// Create a new regular file inode
@@ -455,6 +487,9 @@ impl InitramfsInode {
             kind: NodeKind::File {
                 data: RwLock::new(buf),
             },
+            self_weak: spin::Once::new(),
+            parent: RwLock::new(None),
+            retirement: None,
         })
     }
 
@@ -513,15 +548,20 @@ impl InitramfsInode {
             }),
             readdir_order: RwLock::new(Vec::new()),
             kind: NodeKind::Symlink { target },
+            self_weak: spin::Once::new(),
+            parent: RwLock::new(None),
+            retirement: None,
         })
     }
 
     /// Look up a child by name
     fn lookup_child(&self, name: &str) -> Result<Arc<InitramfsInode>, FsError> {
         match &self.kind {
-            NodeKind::Directory { children } => {
-                children.read().get(name).cloned().ok_or(FsError::NotFound)
-            }
+            NodeKind::Directory { children } => children
+                .read()
+                .get(name)
+                .map(|edge| edge.target().clone())
+                .ok_or(FsError::NotFound),
             _ => Err(FsError::NotDir),
         }
     }
@@ -535,6 +575,19 @@ impl InitramfsInode {
         match &self.kind {
             NodeKind::Directory { children } => {
                 child.parent_ino.store(self.ino, Ordering::Release);
+                let metadata = if child.is_dir() {
+                    Some((
+                        self.self_weak.get().ok_or(FsError::NotDir)?.clone(),
+                        mm::AdmittedString::try_from_str(mm::HeapClass::Vfs, name)
+                            .map_err(|_| FsError::NoMem)?,
+                    ))
+                } else {
+                    None
+                };
+                let edge = Edge::try_new(
+                    child.clone(),
+                    self.retirement.as_ref().ok_or(FsError::NotDir)?,
+                )?;
                 let mut order = self.readdir_order.write();
                 if order.iter().any(|existing| existing == name) {
                     // Allow replacing existing entry for hardlink support.
@@ -552,7 +605,8 @@ impl InitramfsInode {
                 let mut key = String::new();
                 key.try_reserve(name.len()).map_err(|_| FsError::NoSpace)?;
                 key.push_str(name);
-                guard.try_insert(key, child).map_err(|_| FsError::NoSpace)?;
+                guard.try_insert(key, edge).map_err(|_| FsError::NoSpace)?;
+                *child.parent.write() = metadata;
                 let position = order
                     .binary_search_by(|existing| existing.as_str().cmp(name))
                     .unwrap_or_else(|position| position);
@@ -592,6 +646,7 @@ fn attach_node(
                     0,
                     0,
                     TimeSpec::now(),
+                    current.retirement.as_ref().ok_or(FsError::NotDir)?,
                 );
                 current.insert_child(segment, dir.clone())?;
                 dir
