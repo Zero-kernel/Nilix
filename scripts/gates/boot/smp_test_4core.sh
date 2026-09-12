@@ -56,7 +56,10 @@ keep_logs="${SMP_4CORE_TEST_KEEP_LOGS:-0}"
 ordered_completion_seen() {
     awk -v summary="$EXPECTED_READY_SUMMARY" '
         $0 == summary { gate = 1; next }
-        gate && $0 == "Process 1 exited with code 0" { complete = 1; exit }
+        # The interactive guest shell may print its prompt (`/ nilix# `) on
+        # the same serial line as the completion marker. Match the semantic
+        # marker while retaining the required post-summary ordering.
+        gate && index($0, "Process 1 exited with code 0") { complete = 1; exit }
         END { exit(complete ? 0 : 1) }
     ' "$ser"
 }
@@ -121,7 +124,9 @@ supervisor_faults=$(grep -cE '\[PF ENTRY\]|\[PAGE FAULT\]|\[DOUBLE FAULT\]|tripl
 supervisor_faults=${supervisor_faults:-0}
 ready_summary=$(grep -xcF "$EXPECTED_READY_SUMMARY" "$ser" 2>/dev/null)
 ready_summary=${ready_summary:-0}
-pid1_exits=$(grep -xcF 'Process 1 exited with code 0' "$ser" 2>/dev/null)
+# The marker can share a line with the interactive shell prompt; count the
+# semantic completion record rather than requiring it to occupy the whole line.
+pid1_exits=$(grep -cF 'Process 1 exited with code 0' "$ser" 2>/dev/null)
 pid1_exits=${pid1_exits:-0}
 # RF180-56 FIX: include fatal exceptions raised in the fixed low-memory AP
 # trampoline (0x8000-0x8fff) before control reaches high-half Rust code. The

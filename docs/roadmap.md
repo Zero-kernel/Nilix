@@ -1,360 +1,440 @@
-﻿# Nilix (Zero-OS) Kernel Roadmap
-
-**Roadmap revision:** 5.4
-**Updated:** 2026-09-10
-**Audit baseline:** 2873c1415f10981717e223f9b70737a38a3437d1, clean on September 6.
-**Current tree:** baseline plus the [v24 handoff manifest](../.tmp-ksa-20260910-resume/inputs-v24.sha256), including unbuilt WIP. Last tested batch is v23. Resume from the [P1/P2/P3 handoff](review/fixes/ksa-2026-09-06-p1-p3-handoff-2026-09-10.md).
-**Roadmap purpose:** record the real current state of the implementation by component, preserve completed work, and order the remaining work from blockers to long-term features.
-
-The current source, executable tests and recorded gate outcomes are authoritative.
-This revision reconciles the [audit](review/audits/qa-2026-09-06.md),
-[current plan](review/nextplan/next-phase-plan-2026-09-06.md) and
-[repair/evidence ledger](review/fixes/ksa-2026-09-06-progress.md). Normal validation
-is bound to v18, final namespace evidence to v19, and O_TRUNC guest evidence to v16
-with corrected v18 host replay. Independent review of the P0-3/P0-4 probes is now
-complete; earlier reviews retain their recorded source scope.
-
-The latest P1/P2/P3 work is recorded in the [batch ledger](review/fixes/ksa-2026-09-06-p1-p3-progress.md).
-Filesystem identity and CpuLocal repairs are source-reviewed; explicit unsupported
-livepatch is implemented and reviewed; outcome-policy changes remain WIP.
-The user requested a new-session handoff before final validation. No additional
-finding is accepted, and no new audit round or plan rollover is claimed.
-
-## Status legend
-
-| Status | Meaning |
-|---|---|
-| **Validated** | Wired into the active path and exercised by a relevant named gate or runtime test. |
-| **Scoped FIXED** | The original finding's applicable validation and independent review are complete within the stated scope. |
-| **Verification pending** | Implementation/evidence exists, but required review or acceptance checks remain incomplete. |
-| **Qualified** | The exercised gate has zero failed tests but retains warnings/deferrals; this is not strict qualification. |
-| **Implemented** | Active implementation exists, but validation is partial or indirect. |
-| **Partial** | A major dependency, contract, lifecycle path, or integration is incomplete. |
-| **Blocked** | A confirmed defect prevents safe use or release qualification. |
-| **Planned** | New implementation is required. |
-| **Needs Verification** | Source inspection found a contract or risk, but a focused runtime, hardware, or disassembly oracle is still required. |
-
-A component is not called complete merely because its files or APIs exist.
-
-## Executive status
-
-Nilix is a buildable x86_64 Rust kernel prototype with substantial kernel, userspace, and validation infrastructure. The current tree is not release-ready.
-
-| Evidence | Result | Roadmap meaning |
-|---|---|---|
-| make build / make lint | v18: both exit 0 | Compilation, fallibility checks and ABI oracle pass. |
-| make test-hosted-subcrates | v18: exit 0, 278 tests plus 3 compile checks | Hosted behavior is validated for exercised paths. |
-| make test | v18: exit 0, 35 passed / 39 deferred / 0 failed | Runtime suite passes with explicit deferrals; no panic/NX. |
-| Static-musl build and guest gate | v18: both exit 0 | Standard-FD redirection/close/fork/exec/CLOEXEC, O_TRUNC and robust-usercopy checks pass. |
-| Four-core SMP | v18: exit 3 qualified, 37 passed / 37 deferred / 0 failed | Four CPUs and all three R175 cross-core checks; strict qualification remains open. |
-| Boot and Q35 IOMMU | v18: each exit 3 qualified, 28 passed / 46 deferred / 0 failed | Q35 translation active; scoped initialization/failure repair accepted on v13. |
-| Namespace resource/SMP probes | v19: 52 boundary/Arc failures, 3 class-budget rejections, 24 four-CPU rounds; separate v15 one-CPU control rejects | Exact count/heap restoration; independent probe review complete. |
-| O_TRUNC syscall-failure probes | Both open families: 32 rejected calls preserve data, 2 controls truncate once | Guest and corrected evidence checks pass; independent probe design/change review complete. |
-| QEMU backend hosted checks | 32 syz tests, 4 adapter tests and 6 evidence fixtures pass | Backend corrections reviewed; hosted checks do not prove successful guest execution. |
-| Latest hosted batch | v23: 296 unit tests, one compile-fail doctest (two ignored examples), three compile checks; exit 0 | Includes identity/CpuLocal and earlier livepatch version; later WIP is unbuilt. |
-| Actual QEMU fuzz guest | v23 syz build 0; smoke 1. First seed PASS slots=3/exit 0, then e2fsck rejects private JBD2 | Identity collision repaired; authenticated host decoding and second seed remain pending. |
-
-The audit has **6 of 20 scoped FIXED findings (30%)**: KSA-001 through KSA-006.
-**14 remain open/pending**: KSA-007 has an unresolved guest failure, and
-KSA-008..020 remain open. The user authorized independent probe review; both
-remaining P0 items passed and all five P0 items are now accepted. The next
-implementation item is **P1-2**, finishing read-only result extraction. Strict platform
-qualification and broad Linux compatibility remain release limitations.
-
-# 1. Kernel Modules
-
-This section records kernel work by subsystem. Historical completed work means the capability is present in the current tree and was previously delivered; it does not erase current defects or missing verification.
-
-## 1.1 Kernel core, architecture, memory, and scheduling
-
-### Historical completed work
-
-- Rust no_std kernel entry and UEFI boot path.
-- Syscall dispatch and userspace return paths.
-- Process table, PCB lifecycle, fork/exec/exit/wait scaffolding.
-- User stack mapping, guard-page handling, ELF loading, copy-in/copy-out helpers.
-- Buddy/page-table/memory-management infrastructure and copy-on-write paths.
-- AP startup, per-CPU data, scheduler queues, IPI/TLB-shootdown paths, RCU and futex-PI infrastructure.
-- Context-switch and Ring-3 bring-up repairs that enabled the current memory/fork/wait guest path.
-- Basic SMEP, SMAP, NX/W^X, UMIP, stack-guard and fault-reporting paths.
-
-### Current state
-
-| Component | State | Evidence and limitation |
-|---|---|---|
-| Syscall dispatch | **Implemented** | The syscall table and userspace wrappers are active; broad ABI completeness is not established. |
-| Process/fork/wait | **Implemented / Needs Verification** | musl fork/re-exec and descriptor inheritance pass after LAPIC mapping/SYSRET-frame repairs. Nested-PID wait after teardown remains open. |
-| Usercopy | **Validated / Scoped FIXED** | KSA-002 exact linked-table/LOCK CMPXCHG checks and writable/read-only/unmapped robust-futex cleanup pass; independent review complete. |
-| Scheduler/SMP | **Implemented / Qualified** | v18 four-core gate: 37 passed / 37 deferred / 0 failed. Failed summaries are rejected; strict warning/deferred qualification remains open. |
-| CpuLocal | **Implemented / Verification pending** | Owner-borrowed access, safe Once ownership, automatic Send/Sync and explicit IRQ buffer mutation; source-reviewed, 11 hosted tests/compile-fail doctest pass. Final normal/IRQ/SMP gates pending. |
-| KPTI | **Partial / Needs Verification** | Dual-CR3 structures and switching stubs exist; complete page-table separation and all entry/exit paths are not proven. |
-| Retpoline | **Needs Verification** | Status is derived from a feature flag; compiler code generation is not proven. |
-
-### Remaining work
-
-- **P1:** preserve PID namespace identity through zombie wait/reap; verify blocked signal behavior against rt_sigprocmask.
-- **P1:** make F_GETFL/F_SETFL stateful and enforce RLIMIT_NOFILE instead of only storing/reporting it.
-- **P2:** complete final normal/IRQ/SMP validation of the reviewed CpuLocal ownership repair.
-- **P3:** prove KPTI and retpoline from generated assembly and page-table mappings.
-
-## 1.2 Security, capabilities, namespaces, cgroups, and isolation
-
-### Historical completed work
-
-- Capability object/table model with generation-aware handles and refcount lifecycle.
-- LSM/MAC hooks, DAC permission checks, seccomp/pledge filtering, audit events and compliance state.
-- PID, mount, user, IPC, network and cgroup-related isolation structures.
-- cgroups v2 controllers and resource accounting infrastructure.
-- Network namespace ownership gates, per-namespace network data structures, ARP/addressing/routing/RX paths and bounded network budgets.
-- FIPS/KAT, RNG, kptr protection, Spectre status, W^X validation and security test framework.
-- DMAR parsing and VT-d/IOMMU driver structure, including domain/fault/invalidation components.
-
-### Current state
-
-| Component | State | Evidence and limitation |
-|---|---|---|
-| Capabilities/LSM/seccomp/audit | **Implemented** | Prepared-open preflight precedes mutation and infallible publication. Rejection probes independently reviewed; broader policy contracts, including KSA-014, remain scoped. |
-| Namespace limits | **Validated / Scoped FIXED** | Move-only permits repair the double decrement. Hosted and real allocator/four-CPU resource probes pass with independent review; KSA-015 mount-table lifecycle remains open. |
-| VFS credentials/DAC | **Partial / Needs Verification** | KSA-014: missing credential snapshots allow access. Reachability from untrusted contexts must be tested. |
-| Network namespace dataplane | **Implemented / Qualified** | The no-NIC/root-MAC prerequisite is explicitly deferred in the tested profile. Full NIC-backed lifecycle coverage remains required. |
-| IOMMU/VT-d | **Validated / Scoped FIXED on Q35** | Checked MMIO mapping, retained-hierarchy rollback and constructor/IR/TE rejection probes pass with independent review. Physical/multi-unit qualification remains open. |
-| Livepatch | **Explicitly unsupported / Verification pending** | Registration, direct lifecycle APIs and syscalls reject with ENOSYS; query is nonallocating and boot reports unsupported. Final correction is reviewed but unbuilt. |
-| Security runtime reporting | **Partial** | Warning is treated as is_ok; many runtime checks remain deferred or placeholders. |
-
-### Remaining work
-
-- **Regression coverage:** retain the accepted [namespace resource/SMP probes](review/design/ksa-003-kernel-resource-probes-design.md); scoped P0 acceptance is complete.
-- **P1:** validate the explicit unsupported livepatch capability; future enablement requires real keys and reviewed cross-core integration.
-- **P1:** separate pass, warning, deferred, skipped and failed security results.
-- **P2:** couple mount namespace lifetime to materialized VFS table reclamation.
-- **P2:** make path resolution symlink/mount-aware and remove credential fail-open behavior.
-- **P3:** establish a VT-d hardware/spec matrix and complete mitigation evidence.
-
-## 1.3 VFS, storage, block, drivers, and IPC
-
-### Historical completed work
-
-- VFS manager and callback boundary, RAMFS, initramfs, procfs, devfs, cgroupfs and ext2-family storage paths.
-- Ext2 journal replay/validation and block-ownership checks.
-- Open/create/stat/read/write/readdir, openat/openat2-related resolution scaffolding, pipes, sockets and futex/IPC primitives.
-- Capability-aware fd publication and fallible open preparation.
-- Virtio-blk and block request abstractions, descriptor validation, timeout/late-completion tracking and filesystem consumers.
-- Keyboard/console/framebuffer and other core QEMU device paths.
-
-### Current state
-
-| Component | State | Evidence and limitation |
-|---|---|---|
-| VFS open/publication | **Validated / Scoped FIXED** | Core transaction and new probe design/change independently reviewed; 32 allocation/LSM/credential rejections preserve bytes and FD reuse, and two controls truncate once. KSA-014 remains separate. |
-| Standard fd behavior | **Validated / Scoped FIXED** | Ordinary console descriptors and object routing; musl redirection, close, fork/exec inheritance and CLOEXEC checks pass with independent review. |
-| Working directory | **Blocked** | KSA-010: getcwd always returns slash; chdir stores no cwd. |
-| Path semantics | **Partial / Needs Verification** | normalize_path removes dot-dot lexically before object resolution; symlink and mount-root behavior is incomplete. |
-| Mount namespace VFS tables | **Partial** | Materialization and rollback exist; normal successful-destruction cleanup was not found. |
-| Block/BIO API | **Implemented / Needs Verification** | Raw buffer pointers and callback ownership do not encode lifetime/write authority or prove callback lock ordering. |
-| Virtio 4K support | **Needs Verification** | Capacity uses 512-byte units while logical sector conversions use negotiated sector_size; consumers need exact boundary tests. |
-| IPC/pipe/futex | **Implemented / Needs Verification** | Pipe redirection and robust-usercopy cleanup pass in musl; broader blocked-signal and lifetime interactions remain scoped. |
-
-### Remaining work
-
-- **P0 acceptance:** independently review the new [O_TRUNC syscall-failure probes](review/design/ksa-004-syscall-failure-probes-design.md); implementation and applicable validation are complete.
-- **P1:** implement cwd state, relative path resolution and fork/chroot/pivot-root behavior.
-- **P2:** reclaim VFS namespace tables, repair component-wise path resolution, and make missing credentials fail closed.
-- **P2:** redesign BIO ownership/callback locking and define one typed unit model for 512-byte capacity versus 4K logical sectors.
-- **P2:** complete ext2/RAMFS UID/GID and user-namespace ownership compatibility tests.
-
-## 1.4 Networking, observability, and operational kernel services
-
-### Historical completed work
-
-- IPv4, ARP, ICMP, UDP, TCP, connection tracking, firewall and virtio-net paths.
-- Namespace-aware RX/TX structures, ARP caches, routing/addressing scaffolding, packet budgets and pending-frame handling.
-- Trace counters, watchdog, profiler, kdump and audit logging infrastructure.
-- Runtime markers used by boot, SMP and stress harnesses.
-
-### Current state
-
-- Network core is **Implemented for exercised paths**. Current SMP gates have zero failures; the missing NIC/root-MAC prerequisite is deferred and does not establish full network lifecycle coverage.
-- Host gates distinguish failed/incomplete/qualified results. Kernel security warning/deferred policy still needs strict qualification work under KSA-008.
-- Bare-metal, real-hardware DMA and broad device-matrix validation remain open.
-
-### Remaining work
-
-- Exercise netns_rx_pool_lifecycle with its configured virtio NIC and root-MAC prerequisites.
-- Complete strict warning/deferred policy while retaining the repaired failed-summary gate behavior.
-- Add longer-running namespace/network resource stress and device fault tests.
-
-# 2. Userspace
-
-## 2.1 Historical completed work
-
-- Static userspace ABI wrappers in userspace/src/syscall.rs.
-- Minimal libc helpers and shell implementation.
-- Ring-3 startup, process creation, fork/wait call paths and userspace test programs.
-- Static musl integration and the make musl-check gate.
-- Stress runners, advanced stress runner, syscall fuzzer executor, nilix-syz-fuzzer protocol/mutator/corpus components.
-- Userspace-facing structures for stat, uname, directory entries, sockets and common syscall arguments.
-- Native capability/fd wiring infrastructure from U.S2 3A/3B, with current integration limitations described in the kernel section.
-
-## 2.2 Current status
-
-| Userspace component | State | Evidence and limitation |
-|---|---|---|
-| Userspace syscall wrappers | **Implemented** | Wrappers are active and musl smoke passes; behavior is limited by kernel contract gaps. |
-| libc and shell | **Implemented / Partial** | Basic commands and musl standard-FD redirection/inheritance work; cwd and fcntl semantics remain incomplete. |
-| Static musl | **Validated for exercised subset** | v18 guest passes descriptor, fork/exec/CLOEXEC, robust-usercopy and existing ABI markers. Dynamic linking and broad glibc compatibility remain open. |
-| Stress programs | **Implemented / Partial** | Scoped namespace resource/SMP probes pass; longer-running and deferred profiles remain incomplete. |
-| Userspace fuzz executors | **Implemented / Extraction unresolved** | First guest PASS/exit 0 reached after identity repair; post-guest fsck rejects private JBD2, preventing authenticated decoding/second seed. |
-| Dynamic linking and vDSO | **Planned** | No complete ld.so/PT_INTERP/PIE/ASLR/vDSO path is established. |
-| glibc and OCI compatibility | **Directional** | Requires the user-mode personality and broader syscall/ABI completion. |
-
-## 2.3 Remaining work
-
-- **P1:** implement cwd, fcntl status flags, wait/signal semantics and NOFILE enforcement required by normal applications.
-- **P1:** define and publish the supported Linux-compatible ABI subset; do not claim byte-complete compatibility beyond tested calls.
-- **P2:** add userspace regression programs for symlink/jail behavior, namespace teardown, 4K storage, lowered descriptor limits and blocked signals.
-- **P3:** implement dynamic linking, vDSO and user-space ASLR only after the current static ABI is coherent.
-- **Long term:** de-privileged Linux personality, glibc compatibility, OCI/container image execution.
-
-# 3. Tests and Fuzzing
-
-## 3.1 Historical completed work
-
-- make build, make lint, fallibility lint, ABI layout oracle and musl-check integration.
-- Hosted subcrate test infrastructure across kernel-core, VFS, IPC, security, block and networking components.
-- Baseline kernel runtime test framework with pass/deferred/fail summaries.
-- Single-core boot and kernel test harnesses with serial/interrupt log collection.
-- SMP and extended SMP harnesses, stress profiles and parser scripts.
-- Fuzz target inventory for scheduler, memory, page tables, ELF, futex, IPC, network, VFS, cgroups, signals and syscall paths.
-- Userspace fuzzer infrastructure: syscall descriptions, mutators, state machines, resource tracking, corpus management, crash triage and offline protocol tests.
-- KCOV/manual tracepoint support and QEMU guest test scaffolding.
-
-## 3.2 Current status
-
-| Test component | State | Evidence and limitation |
-|---|---|---|
-| Build/lint/hosted tests | **Validated** | v18 gates pass, including 278 tests and 3 compile checks; hardware/DMA evidence remains separate. |
-| Baseline runtime tests | **Partial** | 35 pass, 39 deferred, 0 fail; deferred and warning results are not equivalent to pass. |
-| SMP gate | **Scoped FIXED / Qualified platform** | Failed summaries are rejected; v18 four-core guest has zero failures and 37 deferrals. |
-| IOMMU gate | **Qualified platform** | v18 Q35 boots with translation active, zero failures and 46 deferrals; v13 failure probes reviewed. |
-| musl gate | **Validated for exercised subset** | Descriptor/fork/exec/CLOEXEC, O_TRUNC, robust-usercopy and existing ABI markers pass. |
-| Namespace/O_TRUNC probes | **Validated / Scoped FIXED** | Actual resource/SMP and syscall-failure oracles pass with independent design/change review. Seven O_TRUNC evidence regressions pass locally and are registered in CI. |
-| Offline fuzzing | **Validated for utilities** | Stress/userspace/nilix-syz checks pass without QEMU execution. |
-| QEMU fuzz executor | **Implemented / Acceptance blocked** | First guest PASS slots=3/exit 0; host extraction/authentication and second seed pending. |
-| Runtime security test policy | **WIP / Verification pending** | Distinct outcomes, owned reasons and strict structured parser; five policy/15 parser fixtures pass. Build, caller/CI integration and independent review pending. |
-| Coverage quality | **Partial** | KCOV and tracepoints exist; successful fuzz-guest coverage and deferred test execution remain unproven. |
-
-## 3.3 Remaining work
-
-- **Regression coverage:** preserve the five accepted P0 repairs and their namespace/O_TRUNC, usercopy, descriptor and IOMMU oracles.
-- **P1:** finish read-only post-guest extraction, obtain two authenticated successful seeds/coverage, and retain execution/failure classification evidence.
-- **P1:** classify warnings, deferred, skipped and failed tests separately; assign every deferred test an owner and acceptance oracle.
-- **P3:** extend artifact-backed CI across the supported matrix, preserving source/image identity, commands, status and serial/QEMU/interrupt evidence.
-- **P2:** add path, ownership, PID namespace, signal-mask, fcntl, NOFILE, BIO lifetime and 4K virtio test families.
-- **P3:** add disassembly/page-table tests for KPTI and retpoline; establish VT-d emulator/hardware matrix.
-- **Long term:** continuous fuzzing with real guest execution, KCOV feedback validation, corpus retention and performance baselines.
-
-# 4. Cross-component priority and release plan
-
-## P0 — blockers
-
-1. **P0-1 — DONE within Q35 scope:** VT-d MMIO/fail-closed initialization; physical/multi-unit qualification remains P3-2.
-2. **P0-2 — DONE:** exact usercopy fixup and robust-futex recovery.
-3. **P0-3 — DONE:** transactional namespace counters and resource/SMP probes independently reviewed; exact count/heap restoration verified.
-4. **P0-4 — DONE:** O_TRUNC publication and syscall-failure probes independently reviewed; rejection preserves data and successful truncation occurs once.
-5. **P0-5 — DONE:** table-backed standard descriptors and tested inheritance/redirection/CLOEXEC.
-
-## P1 — correctness and validation truth
-
-6. **P1-1 — DONE:** failed-summary parser repair; strict warning/deferred policy remains separate.
-7. **P1-2 — Next implementation:** finish extraction after guest PASS and complete two authenticated seeds/coverage.
-8. **P1-3 — WIP:** integrate/build/review distinct outcomes and strict qualification.
-9. **P1-4 — Verification pending:** explicit unsupported capability, final source-reviewed correction unbuilt.
-10. **P1-5 — Open:** working directory.
-11. **P1-6 — Open:** wait, signal, fcntl and NOFILE contracts.
-
-## P2 — lifecycle and component quality
-
-12. **P2-1/P2-2:** VFS table reclamation and path semantics.
-13. **P2-3:** credential fail-closed behavior and UID/GID compatibility.
-14. **P2-4 — Verification pending:** reviewed CpuLocal ownership repair; final IRQ/SMP gates pending.
-15. **P2-5:** BIO ownership/callback ordering and virtio 4K units.
-16. Execute deferred network lifecycle coverage with its prerequisites and extend namespace stress.
-
-## P3 — hardening and expansion
-
-17. **P3-1:** KPTI/retpoline generated-behavior proof.
-18. **P3-2:** VT-d hardware/spec matrix.
-19. Artifact-backed CI across that matrix and performance baselines.
-20. Dynamic linking/vDSO/ASLR, personality server, glibc and OCI.
-
-## 5. Release gates and acceptance conditions
-
-The 1.0-Preview gate remains **BLOCKED**. Current condition status:
-
-| Condition | Disposition |
-|---|---|
-| P0 repairs and independent review | All five P0 items accepted within their documented scopes; independent probe reviews and source-bound evidence verification complete. |
-| Failed summaries cannot pass relevant gates | Scoped KSA-006 repair accepted, with 23 parser/caller regressions. |
-| Strict warning/deferred security policy | Open KSA-008; qualified platform results are not strict passes. |
-| Q35 initialization and controlled failure handling | Scoped KSA-001 repair accepted; supported release-profile policy and physical/multi-unit matrix remain open. |
-| Operational QEMU fuzz evidence | Open KSA-007: successful authenticated seeds/results/coverage are missing. |
-| Documented, coherent userspace ABI | Standard descriptors validated; cwd, signals, wait, fcntl and rlimits remain incomplete. |
-| Fresh audit with no unresolved Critical/High findings in claimed profiles | Not established; no new full audit or clean streak is claimed. |
-
-Each gate must retain revision, configuration, command, exit status, serial output, QEMU stderr, interrupt logs where applicable, parsed counts and not-run reasons.
-
-## Risk register
-
-| Risk | Severity | State | Owning area | Next action |
-|---|---|---|---|---|
-| VT-d MMIO fault | Critical | Scoped FIXED on Q35 | Kernel Modules | P0-1 closed; P3-2 hardware matrix |
-| Usercopy fixup mismatch | High | Scoped FIXED | Kernel Modules | P0-2 closed; retain regression coverage |
-| Namespace counter undercount | High | Scoped FIXED | Kernel Modules | P0-3 closed; retain resource/SMP regressions |
-| O_TRUNC partial failure | High | Scoped FIXED | Kernel Modules | P0-4 closed; KSA-014 authorization remains separate |
-| Standard fd bypass | High | Scoped FIXED | Kernel Modules/Userspace | P0-5 closed; broader ABI P1-5/P1-6 |
-| False-green SMP gate | High | Scoped FIXED | Tests and Fuzzing | P1-1 closed; strict policy P1-3 |
-| QEMU fuzz host extraction failure | High | First guest PASS; authentication/second seed pending | Tests and Fuzzing | P1-2 |
-| Warning/deferred polarity | High | WIP; final build/review pending | Tests and Fuzzing | P1-3 |
-| Livepatch unsupported capability | High | Implemented/reviewed; final validation pending | Kernel Modules | P1-4 |
-| cwd/fcntl/rlimit/wait/signal gaps | High/Medium | Open | Kernel Modules/Userspace | P1-5/P1-6 |
-| VFS table retention | Medium | Likely open | Kernel Modules | P2-1 |
-| Path and credential semantics | Medium | Open/Needs Verification | Kernel Modules | P2-2/P2-3 |
-| CpuLocal ownership validation | Medium | Implemented/reviewed; normal/IRQ/SMP checks pending | Kernel Modules | P2-4 |
-| BIO/4K contract ambiguity | Medium | Open/Needs Verification | Kernel Modules | P2-5 |
-| KPTI/retpoline proof gap | Low/Medium | Needs Verification | Kernel Modules/Tests | P3-1 |
-
-## Priority-ordered action list
-
-1. Preserve the six scoped accepted KSA repairs and their regression evidence; all five P0 acceptance requirements are complete.
-2. Continue P1-2 from private-JBD2 extraction rejection and obtain two authenticated guests.
-3. Complete strict warning/deferred policy under P1-3.
-4. Close livepatch, cwd, wait, signal, fcntl and NOFILE contracts.
-5. Repair VFS lifecycle/path/ownership, CpuLocal, BIO and 4K contracts.
-6. Add network lifecycle regression and extended resource stress.
-7. Prove KPTI/retpoline and establish hardware/spec matrices.
-8. Resume long-term userspace expansion only after the static ABI is coherent.
-
-## Recommended Next Plan
-
-Resume the full authorized open P1/P2/P3 batch using `kernel-implement` and the
-[current handoff](review/fixes/ksa-2026-09-06-p1-p3-handoff-2026-09-10.md).
-Start with **P1-2/KSA-007** post-guest extraction; retain its earlier
-[executor design](review/design/ksa-007-real-qemu-executor-design.md) and
-[backend review](review/fixes/ksa-007-independent-review.md). Independent reviewer
-agents are already authorized. The [P0 probe acceptance review](review/fixes/ksa-2026-09-06-independent-review.md#p0-3-and-p0-4-acceptance-review)
-is complete. The next review stage is `kernel-security-audit`, with the current
-diff, designs and evidence ledger; this closeout does not run it. Reuse passing revision-bound evidence
-for unchanged inputs and run the affected gates after new runtime changes. The
-current plan retains all remaining P1/P2/P3 items and their acceptance conditions.
-
-## Information, tests, and human decisions required
-
-- Confirm whether q35 VT-d is mandatory for supported release profiles.
-- Future livepatch enablement needs provisioned trust keys and reviewed integration; support is explicitly disabled for this repair.
-- Define the broader supported Linux ABI subset for cwd, signals, wait, fcntl and rlimits; standard-FD semantics are already exercised and scoped accepted.
-- Provide or approve the VT-d, 4K virtio, KPTI and retpoline hardware/toolchain matrix.
-- Establish the NIC/root-MAC and other hardware prerequisites needed to execute deferred tests; failed-summary parser fixtures already cover KSA-006.
-
----
-
-This roadmap is source- and test-grounded. It records historical delivered work but does not treat historical completion summaries as current proof.
+# Nilix (Zero-OS) — Development and Capability Roadmap
+
+**Revision:** 6.0 · **Updated:** 2026-09-12
+**Source baseline:** 3254318c5ef19ee9eb23246e14e9e01582af7e28; runtime CI budget corrected in a84e963.
+**Active plan:** [next-phase-plan-2026-09-12.md](review/nextplan/next-phase-plan-2026-09-12.md).
+
+Nilix is an experimental x86_64 OS kernel with UEFI boot, Ring-3 programs, a
+tested static-musl ABI subset, SMP scheduling, filesystems, IPv4 networking and
+security policy machinery. **1.0-Preview remains blocked.** This roadmap records
+the capabilities, missing contracts and evidence boundaries of the current tree.
+
+Revision 6 restores component detail, trust boundaries, the Linux comparison,
+phase history and release conditions lost in revision 5.4. It incorporates
+September's scoped KSA repairs and restores the older admission, stress and
+feature backlog. Historical roadmaps remain in Git; dated audits retain their
+original evidence.
+
+## 0. How to read status
+
+| Label | Meaning |
+| --- | --- |
+| Tested subset | A named test exercises the stated behavior; other modes are not implied. |
+| Implemented | Active code exists; behavioral qualification is incomplete. |
+| Partial | Useful behavior coexists with identified missing contracts. |
+| Unsupported | Disabled, rejected or unimplemented. |
+| Verification pending | Current-tree, platform or independent-review evidence is missing. |
+| Planned | A future implementation or qualification milestone. |
+
+A scoped audit PASS closes that finding's rubric. Diagnostic CI may accept
+exit 3 while retaining qualified warnings/deferred/skipped results; that is not
+strict release qualification. Source-scanner coverage, host tests and actual
+guest execution measure different things.
+
+## 1. Executive status
+
+| Area | Current state |
+| --- | --- |
+| Composition | 25 kernel library crates plus the entry binary; separate UEFI bootloader, userspace and host tools. Most services execute in Ring 0. |
+| Userspace proof | Static ELF and real musl tests run in Ring 3; fork/exec/wait, descriptors, cwd/jails and several failure paths have guest evidence. |
+| September KSA | KSA-001..020 accepted within recorded rubrics; 17/18 associated plan items complete. P3-2 physical VT-d remains pending. |
+| Hosted gate | 437 counted unit-test executions per debug/release profile, CpuLocal doctests and three test-code compile checks; explicit host-safe allowlist. |
+| Runtime inventory | 74 source-discovered RuntimeTest implementations; actual pass/deferred/warning/skipped/failed counts depend on image/platform. This is not 100% kernel code coverage. |
+| Recent CI | [Run 34696142246](https://github.com/Zero-kernel/Nilix/actions/runs/34696142246), a84e963: ten jobs passed; boot and 1/4-CPU runtime windows were qualified, while the 4-CPU script rejected a shell-prompt-prefixed PID1 completion marker. The parser fix is in this tree; rerun acceptance is pending. |
+| Release gate | BLOCKED: R186-4 admission closure, historical review lineage, strict profile qualification, all six stress profiles and the recorded 0/3 clean-audit streak. |
+
+Acceptance sources: the [historical record ledger](security-audit-status.md#record-provenance)
+identifies the KSA audit, final review-fix and P3-2 QEMU evidence; the public
+[VT-d matrix](vtd-support-matrix.md) defines platform scope. Their manifests
+identify the actual tested trees. Later commits do not retroactively change
+historical acceptance.
+
+## 2. Vision, principles and non-goals
+
+The goal is a Rust OS with a Linux-compatible userspace surface, capability
+authority and explicit resource ownership. The long-term architecture moves
+selected Linux personality services into less-privileged userspace. Today
+scheduler, VFS, network, drivers and Linux syscall semantics are predominantly
+in-kernel; microkernel privilege separation is a future milestone.
+
+**Safety > Correctness > Efficiency > Performance.** Fallible publication,
+symmetric accounting, teardown ownership and IRQ-safe locking precede API
+breadth or optimization. Matching syscall numbers/layouts and passing musl
+smoke do not establish general Linux, pthread, glibc or OCI compatibility.
+Enterprise deployment, certified FIPS operation, universal devices and complete
+speculative-execution protection are qualification goals.
+
+## 3. Architecture and trust boundaries
+
+### 3.1 Current execution and planned personality
+
+Ring 3 → architecture entry/usercopy → seccomp/capability/LSM gates →
+kernel_core → VFS/IPC/network/scheduler → memory/arch/drivers → hardware.
+
+Cargo layering and callbacks break dependency cycles; they do not create
+privilege boundaries. The trusted bootloader supplies the image, memory map and
+ACPI pointer. Credentials/capabilities/LSM authorize supported operations.
+IOMMU mediates device requests only within the supported device matrix. A
+deprivileged Linux personality, reached through native IPC, is planned.
+See [architecture.md](architecture.md) for the composition graph and hot paths.
+
+### 3.2 Threat model
+
+| Actor/input | Existing defenses | Remaining boundary work |
+| --- | --- | --- |
+| Unprivileged process/syscall arguments | Exact usercopy fixups, W^X/address checks, credential snapshots, capability generations, seccomp/pledge and LSM | MM admission closure, partial ABI semantics, failure/concurrency breadth |
+| Tenant/resource pressure | Five namespace types, cgroups/class budgets, transactional constructors and descriptor publication | Shared memory, init membership, delegated device authority, complete container interfaces |
+| Malformed ELF/filesystem/packet | Checked ELF, geometry, path, journal and protocol processing; conntrack/firewall | Recovery corpus, network topology and interoperability |
+| Faulty/hostile device | Owned BIO, virtqueue validation, VT-d mappings/invalidation, remapped MSI and quarantine tested with EDU | Physical DMA, bridge/multi-unit/RMRR/ACCESS_PLATFORM and device breadth |
+| Operator/diagnostic reader | Profile logging, kptr redaction, authorized trace/audit export, hash/HMAC audit | Durable/remote backend, keys and complete Secure-profile qualification |
+| Speculative execution | Hardware-dependent controls/barriers and dual-root transition evidence | Full KPTI and compiler retpoline unsupported; CPU-specific proof required |
+
+## 4. Kernel composition
+
+All 25 library crates are listed. A crate/API's presence is not a completion claim.
+
+| Crate | Role | Qualification/gap |
+| --- | --- | --- |
+| [arch](../kernel/arch/lib.rs) | GDT/IDT, APIC/HPET, IRQs, SYSCALL, context switch, AP boot | UP/SMP evidence; high-core/physical/exception-entry breadth pending |
+| [cpu_local](../kernel/cpu_local/lib.rs) | CPU topology/local storage/FPU ownership | Borrowed lifetime API and TLS migration evidence; 64 CPUs is a ceiling |
+| [tlb_ops](../kernel/tlb_ops/lib.rs) | TLB/INVPCID primitives | Active MM/arch dependency; CPU-feature dependent |
+| [sync_safe](../kernel/sync_safe/lib.rs) | IRQ-safe lock wrappers | Caller lock-order/entry-state obligations remain |
+| [drivers](../kernel/drivers/lib.rs) | VGA/framebuffer, serial, keyboard | Basic console, not a desktop/device-driver ecosystem |
+| [virtio](../kernel/virtio/src/lib.rs) | Shared PCI/MMIO transport/queues | Block/network integration; ACCESS_PLATFORM/device breadth pending |
+| [crypto](../kernel/crypto/lib.rs) | Shared SHA-256 | Narrow primitive, not a general certified provider |
+| [klog](../kernel/klog/lib.rs) | Profile-aware logging | Active lint/macros; full caller/redaction sweep tracked |
+| [mm](../kernel/mm/lib.rs) | Buddy/heap/admission, paging/cache/DMA/OOM/TLB | Anonymous/COW paths; admission/shared/file-mapping gaps |
+| [coverage](../kernel/coverage/lib.rs) | KCOV task bitmap/control | Host-root authority/manual instrumentation; not exhaustive coverage |
+| [cap](../kernel/cap/lib.rs) | Rights, IDs, generations and tables | File/pipe lifecycle integration; native syscall family incomplete |
+| [audit](../kernel/audit/lib.rs) | Hash/HMAC ring and export | Policy/hosted evidence; durable production backend missing |
+| [security](../kernel/security/lib.rs) | W^X/NX, RNG/kptr/KASLR, CPU mitigations | Mechanism/status tests; full KPTI/retpoline unsupported |
+| [lsm](../kernel/lsm/lib.rs) | Process/file/IPC/memory/network hooks | Active policies; future-operation hooks do not implement operations |
+| [seccomp](../kernel/seccomp/lib.rs) | Strict/filter and pledge | Tested subset; TSYNC/Linux parity residuals |
+| [compliance](../kernel/compliance/lib.rs) | Profiles, sticky FIPS state/KAT policy | No certification or complete Secure-platform guarantee |
+| [livepatch](../kernel/livepatch/lib.rs) | Experimental signed patch/lifecycle machinery | Unsupported, ENOSYS; production enablement absent |
+| [block](../kernel/block/src/lib.rs) | Owned BIO/completion/geometry/virtio-blk | Host/guest 512B/4096B evidence; physical matrix pending |
+| [net](../kernel/net/src/lib.rs) | IPv4/TCP/UDP, sockets, conntrack/firewall, virtio-net | Container connectivity/IPv6/interoperability gaps |
+| [trace](../kernel/trace/lib.rs) | Counters/tracepoints/watchdog/profiler/kdump | Diagnostics exist; external collection/performance pending |
+| [iommu](../kernel/iommu/lib.rs) | DMAR/legacy VT-d/domains/remapping/quarantine | Q35/EDU scope tested; physical/topology gaps explicit |
+| [kernel_core](../kernel/kernel_core/lib.rs) | Process/ABI/namespaces/cgroups/signals/RCU/ELF | Active hub; resource/ABI/teardown backlog remains |
+| [vfs](../kernel/vfs/lib.rs) | Path/DAC/mounts, ramfs/ext2/JBD2/procfs/devfs/CPIO/cgroupfs | Tested publication/lifetime; durability/POSIX breadth missing |
+| [ipc](../kernel/ipc/lib.rs) | Pipes/endpoints/messages/futex/sync | Pipes/robust cleanup exercised; native IPC/Linux futex parity pending |
+| [sched](../kernel/sched/lib.rs) | Per-CPU MLFQ/preemption/stealing/affinity/cpuset | UP/four-CPU evidence; long/high-core/performance pending |
+
+The [kernel binary](../kernel/src/main.rs) wires services together; the
+[bootloader](../bootloader/src/main.rs) is separate. [userspace](../userspace/)
+contains libc helpers, shell, musl/stress probes and guest fuzz executors.
+[fuzz](../fuzz/) and [tools/fuzz_executor](../tools/fuzz_executor/) are host tooling.
+
+## 5. Capabilities and missing contracts
+
+### 5.1 Boot, memory and VM
+
+**Available:** UEFI handoff, relocated PIE kernel, high-half/identity maps,
+memory reservations, buddy/global heap, charged fallible containers, guards,
+page cache and OOM machinery. Anonymous mmap/munmap/mprotect/brk, PROT_NONE and
+COW fork have real userspace paths. RF180-20 repaired shared supervisor
+page-table ownership across fork/exec/teardown; the complete four-worker
+mitigation workload exercises this repair.
+
+**Missing:** sys_mmap still takes an unused flags parameter apart from policy
+forwarding; MAP_SHARED/MAP_FIXED semantics are not implemented. File mappings
+return EOPNOTSUPP; mremap returns ENOSYS. Shared-anonymous memory, slab, NUMA,
+swap and THP are not qualified features. Stress MAP_SHARED report pages cannot
+supply the expected fork-shared communication.
+
+**R186-4 remains open:** MmState maps already use AdmittedMap, but fork allocates
+the snapshot before admission, and from_sorted_vec_charged still calls
+shrink_to_fit. Closure requires mechanism review, charge symmetry and live-delta
+tests, not another container-migration claim. Owners: **P0-A, ST-K2-P1/P2,
+U55-6**; [admission design](review/design/p0-a-r186-4-admission-closure-design.md).
+
+### 5.2 Processes, threads, scheduling and teardown
+
+**Available:** isolated address spaces, fork/path-exec/exit/reap, wait4/WNOHANG,
+MLFQ/preemption/stealing/balancing/affinity/cpuset. TLS restoration has UP/SMP
+musl evidence including timer-context migration. KSA-011 exercises namespace
+wait identity and six exit/reap/idle cases.
+
+**Missing:** clone is narrower than Linux threads. CLONE_VM/TLS setup exists;
+general CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND combinations are rejected.
+This is not pthread support. waitid is a stub. Historical fork fallback,
+stack-fragmentation, switch-sentinel and PID1 orphan/reaper questions remain;
+reconcile overlap with newer KSA fixes by original oracle. Owners: **F2, F7,
+F4/F6, ROOT-INIT, F-4**.
+
+### 5.3 IPC, signals, polling and time
+
+**Available:** capability-backed pipes, blocking/wakeup, futex primitives with
+internal PI, robust cleanup, masks, kill/tgkill, rt_sigaction/rt_sigreturn,
+IRQ-return delivery, basic poll/select and startup/time calls. Musl exercises
+blocked signals, robust usercopy and zero-length socket behavior.
+
+**Missing:** endpoint/message types are not complete native synchronous IPC and
+shared memory. Internal futex operations are not full Linux opcode/flag parity.
+SA_RESTART is accepted but interrupted calls can return EINTR; siginfo is
+minimal, sigaltstack absent, queued real-time signals incomplete. No completed
+epoll/eventfd/timerfd surface is claimed. Owners: **F-1c, F-2, F-4, F-10**.
+
+### 5.4 Security framework and operational policy
+
+**Available:** capability rights/generations, credential-bound descriptor
+publication, LSM/seccomp/pledge, tamper-evident audit and profile logs. Namespace
+and O_TRUNC probes test exact rollback/data preservation.
+
+**Missing:** native_cap_op/invoke/spawn and delegated endpoint/event APIs;
+TSYNC is rejected until sibling/clone publication is coherent. Global ADMIN
+is not per-netns authority. Audit persistence is a hook without a production
+durable/remote backend. FIPS policy/KATs are not certification.
+[Livepatch is unsupported](livepatch-support.md): hooks, real keys, cross-core
+synchronization and rollback qualification are prerequisites. Owners:
+**F-1b/F-1c, F-5, F-6, F-9, PO-SEC-01/02**.
+
+### 5.5 Hardware memory and speculative-execution hardening
+
+**Available:** NX/W^X, guards, SMEP/SMAP/UMIP, KASLR, usercopy, RNG/CSPRNG and
+kptr redaction. Mitigation status separates supported from active controls.
+The collector checks generated code, mappings, CR3/CPL3 and the complete
+four-vCPU fork/exec/wait workload.
+
+**Missing:** dual roots retain kernel data/heap/stacks and low aliases.
+FULL_KPTI_ISOLATION_SUPPORTED is false: no full Meltdown isolation. Compiler
+retpoline is unsupported and its feature deliberately fails compilation.
+Early-boot W+X is separate lifecycle debt. Balanced/QEMU success does not qualify
+every Secure field/CPU. Owners: **U37-1b, U55-6, SECURE-MATRIX**. KSA-020 closed
+truthful reporting/proof, not these future features.
+
+### 5.6 VFS, descriptors and storage
+
+**Available:** ramfs, ext2/constrained JBD2, procfs/devfs/CPIO/cgroupfs,
+virtio-blk/owned BIO. fd 0/1/2 are table-backed; dup/close/fork/exec/CLOEXEC,
+shared file status, O_NONBLOCK consumers and numeric RLIMIT_NOFILE have tests.
+Component paths, cwd/root inheritance, chdir/chroot/pivot_root, DAC host IDs,
+Ext2 32-bit UID/GID, mount-table retirement and O_TRUNC rejection have host/guest
+evidence. 512B/4096B logical blocks have dedicated checks.
+
+**Missing:** full ext4/POSIX support. chown/fchown/lchown, statx, hard links and
+general dirfd-relative combinations remain incomplete/stubbed. Symlink/readlink
+already exist: do not re-plan them as entirely absent. fsync/fdatasync/sync/
+sync_file_range are not wired into dispatch. Write-through/JBD2 is not an
+application durability syscall contract. Cache error/dirty/reclaim, unmount
+sync/invalidation and power-loss recovery need separate proof. Owners:
+**ST-K4, F-3, CACHE-DEBT, STORAGE-TESTS**.
+
+### 5.7 Networking
+
+**Available:** virtio-net, Ethernet/ARP/IPv4/reassembly/ICMP/UDP/TCP, retransmission,
+NewReno/window scaling/SYN cookies, sockets, conntrack and stateful default-DROP
+firewall machinery. Process-context RX and namespace-owned buffer/address/ARP
+state exist; current hosted network allowlist has 118 tests.
+
+**Missing:** root device ownership is the operational baseline.
+MOVE_NET_DEVICE_ARMED=false keeps transfer at ENOSYS until namespace-FD
+authority, generations and drain/revocation exist. veth, child RX steering,
+general route-table management, per-netns firewall administration and complete
+loopback delivery remain open. IPv6, wider NIC/control interfaces are missing.
+Deferred NIC/root-MAC tests need runnable profiles; parser/host tests do not
+prove wire connectivity. Owners: **NET-QUAL, F-7/F-9, D3-NETNS**.
+
+### 5.8 SMP, devices and IOMMU
+
+**Available:** APIC/AP boot, per-CPU scheduling, IPI/TLB shootdown, PCID/INVPCID
+helpers, RCU and lock ordering. Four-CPU evidence exists; extended scripts
+define 8/16-CPU runs. CPU-local supports a 64-logical-CPU ceiling; x2APIC is
+unsupported by its current path.
+
+DMAR is wired at boot. Q35 initialization/constructor/SIRTP/IR/TE failures and
+EDU translated DMA, replacement, remapped MSI, invalid requests, quarantine,
+detach and IRTE reuse have scoped QEMU evidence. The old unconnected-DMAR claim
+is obsolete.
+
+**Missing:** physical endpoint/MSI-X, multi-DRHD/bridge/nonzero-segment routing,
+RMRR mappings, scalable mode, ATS/PASID and ACCESS_PLATFORM virtio qualification.
+No-IOMMU boot is not isolated DMA. Mitigation single-thread TCG/four-vCPU proof
+is not host-parallel SMP qualification. Owners: **P3-2, F-7, SMP-QUAL**;
+[device matrix](vtd-support-matrix.md).
+
+### 5.9 Containers and resources
+
+**Available:** PID/mount/IPC/net/user objects/inheritance, transactional
+allocation/retirement, selected CPU/memory/PIDs/I/O/files/ports controllers,
+cpusets and class/namespace budgets. Failure/four-CPU near-limit probes restore
+exact counts/heap; cgroupfs exposes supported controls.
+
+**Missing:** full cgroups-v2/OCI, cgroup namespace/delegation, all namespace
+FD/setns/unshare/clone combinations and container networking. PID1 root-cgroup
+membership remains tracked. Non-NOFILE rlimits are largely advisory; kmem/slab/
+conntrack accounting and ABI exposure need completion. Owners:
+**ST-K1, F-7/F-8/F-9, PO-ISO-01**.
+
+### 5.10 User mode, Linux ABI and tooling
+
+**Available:** Linux-numbered subset/private calls, ELF64 ET_EXEC, SysV
+stack/auxv, static musl, libc helpers and a development shell. Musl tests actual
+Ring-3 behavior; the ABI oracle checks selected layouts against C. The QEMU fuzz
+adapter launches real guests and authenticates two inputs, coverage and disk/
+image identity.
+
+**Missing:** userspace ET_DYN is rejected; ld.so/PT_INTERP, dynamic relocations,
+complete userspace PIE/ASLR/vDSO are not a working chain. No general glibc,
+pthread, BusyBox-distribution, OCI or personality acceptance. Native capability
+syscalls and synchronous IPC precede personality work. Owners:
+**F-1b/F-1c/F-2/F-3/F-4/F-10**.
+
+### 5.11 Observability, testing and performance
+
+**Available:** counters/tracepoints/watchdog/profiler/serial kdump, task KCOV
+with host-root authority, command/input/image identity, Markdown/JUnit and
+Python harness coverage. Debug/release hosted and feature-specific QEMU images
+are separate. Five outcomes and strict rejection are implemented.
+
+**Missing:** durable telemetry and a measured performance envelope. Performance
+scripts defer unmeasured workloads; melting scripts include simulation/framework
+paths, not hardware qualification. Stress block explicitly fails at
+fsync_unsupported; no full six-profile success is accepted. Manual KCOV and
+source-discovered tests are not all-instruction/ABI coverage. Owners:
+**ST-K2/ST-K4, PERF-BASELINE, F-6/F-9**.
+
+## 6. Gap analysis versus Linux
+
+| Domain | Nilix today | Next boundary |
+| --- | --- | --- |
+| Memory | Buddy/heap/charged maps/anonymous/COW | Admission, honest flags, shared/file mapping; later slab/NUMA/swap |
+| Processes | Static programs/fork/exec/wait/restricted clone | Thread/signal/wait fidelity before pthread claims |
+| Storage | ramfs/ext2/JBD2/namespace VFS | Durability/recovery, dirfd/metadata and filesystem breadth |
+| Network | IPv4/TCP/UDP/policy/virtio | Wire tests, namespace links/routes/admin, IPv6/drivers |
+| Containers | Five namespaces/selected controllers | Delegation/shared memory/FS sharing/OCI |
+| Security | Capabilities/LSM/seccomp/mitigation machinery | Isolation profiles/hardware/TSYNC/keys/backends |
+| Userspace | Static-musl subset/shell | Native IPC/personality/dynamic/vDSO/glibc/apps |
+| Operations | Logs/trace/KCOV/CI receipts | Durable audit, reproducible stress/performance, releases |
+
+## 7. Phase chronology (A–U)
+
+Historical phases describe delivered foundations, not full subsystem acceptance.
+
+| Phase | Foundation delivered | Remaining work |
+| --- | --- | --- |
+| A | Entry/usercopy/hardware hardening/audit | Full isolation/platform qualification |
+| B | Capability/LSM/syscall policy | Native API/TSYNC/authority breadth |
+| C | VFS/block/ext2/cache/OOM | Durability/recovery/POSIX breadth |
+| D | IPv4/conntrack/firewall | Wire/namespace/control-plane breadth |
+| E | SMP/scheduler/IPI/TLB/RCU/futex | Long/high-core tests/thread contracts |
+| F | Namespaces/controllers/VT-d | Admission/shared memory/delegation |
+| G | KASLR/dual-root/observability/compliance/patch experiments | Full KPTI/backends; livepatch unsupported |
+| H.0 / H | Structural/ABI audit/isolation hardening | Revalidate changed entry/MM/ownership |
+| I | Policy/DMA/boot/logging hygiene | I.3/I.4/I.5/I.7, netns pre-arming |
+| J | Resource/tenant observability | J.2 kmem/controller extensions |
+| K / L / M | Compatibility/performance/enterprise direction | Downstream backlog |
+| U | Static Ring-3 ABI/partial native cap wiring | IPC/personality/dynamic/application chain |
+
+## 8. 1.0-Preview release gate
+
+**BLOCKED; clean full-audit streak 0/3.** Neither this rollover nor green Actions
+creates a new full clean audit round.
+
+| Requirement | Disposition |
+| --- | --- |
+| R186-4 / P0-A / D1-RES-HEAP-ADMISSION-REOPENED | Open; pre-admission allocation/shrink and acceptance obligations remain |
+| R188 original review lineage | Full original-rubric map absent from newer scoped KSA records; reconcile/review uncovered originals, reuse proven overlap |
+| No unresolved Critical/High in claimed scope; three clean rounds | Not established; streak unchanged |
+| All six stress-v2 profiles | Required by recorded 2026-09-01 user decision; memory/cpu/smp/process/block/combined acceptance pending |
+| Strict security/platform policy | Outcome truth implemented; deferred prerequisites still block qualification |
+| ABI/device/mitigation matrix | Preserve supported/rejected/advisory and physical/full-isolation limits |
+| CI result/retained evidence | Ten jobs passed on a84e963; 4-CPU marker parser correction is pending rerun |
+
+The five KSA P0 repairs and KSA-007..020 rubrics are accepted within scope. They
+are regression obligations, not still-open implementation tasks.
+
+## 9. Current execution — Phase U / static ABI
+
+| Milestone | State | Dependency |
+| --- | --- | --- |
+| U.M0 / U.S1 | Static musl, disjoint path-exec/native image-spawn delivered; scoped fixes accepted | Preserve ELF/usercopy/musl |
+| U.S2 3A/3B | Pipe capability IDs/FileOps wiring delivered | Native syscall family incomplete |
+| U.S2 4/5 (F-1b) | native_cap_op/filter/generation contract pending | Admission/authority gates |
+| U.S2 6/7 (F-1c) | invoke/spawn, endpoint/event pending | U.S3 IPC design |
+| U.S3 (F-2) | Synchronous IPC/shared memory/lifecycle/SMP pending | Capability family/MM ownership |
+| U.S4 (F-10) | Userspace personality planned | U.S3/reviewed trust boundary |
+| U.S5 (F-10) | Dynamic linking/user PIE/ASLR/vDSO planned | Static ABI/ELF/MM contracts |
+| U.S6/U.S7 (F-10) | glibc/application/OCI direction | Dynamic ABI/threads/signals/storage/network |
+
+## 10. Forward roadmap
+
+**Next group:** reconcile R188 review lineage, close R186-4 admission, complete
+ST-K2 Phase 1 flags/report transport and ST-K4 durability/block workload.
+[Current handoff notes](review/design/next-handoff-2026-09-12.md) retain prior
+design choices and identify changed-premise review requirements.
+
+**Then:** shared-anonymous memory, all six stress profiles, strict network/SMP/
+Secure evidence and full-audit qualification. Physical VT-d remains a platform
+dependency; independent software work can continue.
+
+**After qualification:** F-1b..F-10, static ABI residuals, native IPC/personality,
+dynamic linking, container networking, telemetry and measured performance.
+These are capability milestones without unsupported calendar commitments.
+
+## 11. Audit and repair history
+
+| Record | Accepted scope/remaining limit |
+| --- | --- |
+| R186 / RF186 | 16/17 historical actionables repaired; R186-4 admission carried |
+| R187 / RF187 | Seven KCOV findings/eight repair defects closed; carried debt prevents streak credit |
+| R188 standalone | August remediation recorded; residuals/original review lineage separate |
+| KSA-2026-09-06 | 20/20 scoped findings accepted; RF180-20 page-table ownership repaired |
+| P3-2, September 12 | QEMU EDU DMA/MSI/invalidation/fault slice accepted; physical rows pending |
+| September CI cleanup | Shared groups/reports, hosted/harness/real-guest tests, categorized scripts; runtime budget follow-up |
+
+[Security status](security-audit-status.md) separates these histories.
+Historical cumulative totals are not a current vulnerability census. This
+rollover creates no new audit or independent-repair verdict.
+
+## 12. Known debt and conservation
+
+The [active plan](review/nextplan/next-phase-plan-2026-09-12.md) restores the KSA
+queue plus P0-A/P1-A, ST-K1..K4/ST-5/ST-6, F2/F7/F4-F6/F10/F11/wait residuals,
+U37-1a/U37-1b/U55-6/U29-3, D3 network/TSYNC/ARC, R186 design rows, four open PO
+records, P3 tests and F-1b..F-10.
+
+An overlap closes only by rubric: KSA-008 closes outcome accounting, not all
+deferred execution; KSA-011 covers namespace wait identity, not all waiter
+efficiency; QEMU IRTE reuse does not qualify general VM passthrough.
+
+## 13. Testing, CI and fuzzing
+
+| Layer | Evidence | Limit |
+| --- | --- | --- |
+| Source/build | fmt/Clippy/lints/ABI C oracle/build/linked usercopy | Not runtime completeness |
+| Hosted | 437 counted executions/profile, CpuLocal doctests, three compile checks | Host-safe allowlist; privileged paths guest-only |
+| Harness | Python JUnit/coverage, shell syntax, outcome/parser regressions | Host coverage, not kernel instruction coverage |
+| Required QEMU | Boot/runtime/SMP, UP/four-CPU musl, IOMMU/mitigation/KCOV/two-seed smoke | Qualified outcomes/emulator scope retained |
+| Extended | Ubuntu 22.04/24.04, 8/16 CPU, Ext3/JBD2, six stress profiles | Scheduled/manual; stress acceptance incomplete |
+| Campaigns | Eleven scheduled libFuzzer targets, corpus/opaque findings | Sampling is not absence-of-bugs/ABI completeness |
+| Hardware/performance | Named matrix/protocols and future oracles | Physical VT-d/performance/thermal evidence pending |
+
+Commands: [CI guide](ci-testing.md), [quality gates](quality-gates.md),
+[script map](../scripts/README.md). Guest observation defaults to 900 seconds;
+job budgets include sequential windows/setup/build/artifacts. Short mock unit
+deadlines do not shorten real guest execution.
+
+## 14. Risks and dependencies
+
+Primary risks are ownership/accounting under pressure, partial Linux semantics
+mistaken for compatibility, missing strict-profile prerequisites and hardware
+claims broader than measured evidence. Retain exact source/image identity and
+failure/teardown tests. Livepatch, netns device transfer, full-isolation and
+retpoline must not be enabled through documentation changes.
+
+New device/trust-boundary modes need design, negative tests and independent
+review. Reuse accepted designs after checking changed premises; unavailable
+hardware does not block independent software tasks.
+
+## 15. Version history and navigation
+
+| Revision | Change |
+| --- | --- |
+| 4.x | Unified development/enterprise detail and historical phases |
+| 5.4, September 10 | Intermediate KSA snapshot; later acceptance/older backlog not reconciled |
+| 6.0, September 12 | Restored component/phase/release detail, current gaps/evidence and conserved backlog |
+
+[README](../README.md) · [Docs](README.md) · [Architecture](architecture.md) ·
+[Nextplan](next-phase-plan.md) · [Security](security-audit-status.md) · [CI](ci-testing.md)
