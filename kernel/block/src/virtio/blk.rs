@@ -28,7 +28,11 @@ use super::{
     VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
     VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
-use crate::{Bio, BioOp, BioResult, BlockDevice, BlockError};
+use crate::{Bio, BioOp, BioResult, BlockDevice, BlockError, BlockGeometry};
+
+#[path = "completion.rs"]
+mod completion;
+use completion::{copy_read_result, finish_request, CompletedIo, RequestCompletion, RequestKind};
 
 // ============================================================================
 // Constants
@@ -446,10 +450,8 @@ pub struct VirtioBlkDevice {
     virtqueue_dma: DmaBuffer,
     /// Virtqueue for requests.
     queue: VirtQueue,
-    /// Device capacity in sectors.
-    capacity: u64,
-    /// Sector size.
-    sector_size: u32,
+    /// KSA-019: checked byte capacity and logical-sector units.
+    geometry: BlockGeometry,
     /// Read-only flag.
     read_only: bool,
     /// Negotiated features.
@@ -496,32 +498,9 @@ struct RequestMeta {
     /// Size of the request header in bytes.
     header_size: usize,
     /// Request kind (I/O or flush) with data buffer tracking.
-    kind: RequestKind,
+    kind: RequestKind<DmaBuffer>,
     /// Marked when timed out so late completions are treated as stale.
     abandoned: bool,
-}
-
-/// R39-1 FIX: Type of request for proper resource cleanup.
-/// R94-13 Enhancement: Uses DmaBuffer for automatic IOMMU unmapping on drop.
-enum RequestKind {
-    /// Read request with a caller destination for synchronous copy-back.
-    Read {
-        /// DMA buffer for data (with automatic IOMMU mapping).
-        data_dma: DmaBuffer,
-        /// Actual data length in bytes (may be less than data_dma.size() which is page-aligned).
-        /// R94-13 FIX: Must track separately to avoid OOB copy on completion.
-        data_len: usize,
-        /// Pointer to caller's buffer for copy-back on read completion.
-        data_buf: *mut u8,
-    },
-    /// Write request. Caller bytes have already been copied into `data_dma`,
-    /// so no mutable caller pointer is retained across device execution.
-    Write {
-        data_dma: DmaBuffer,
-        data_len: usize,
-    },
-    /// Flush request (no data buffer).
-    Flush,
 }
 
 /// RF178-39 FIX: direction-safe borrowed payload for synchronous I/O.
@@ -544,14 +523,6 @@ impl SyncRequestData<'_> {
     fn is_write(&self) -> bool {
         matches!(self, Self::Write(_))
     }
-}
-
-/// R39-1 FIX: Completion result types.
-enum RequestCompletion {
-    /// I/O request completed with result.
-    Io(Result<usize, BlockError>),
-    /// Flush request completed with result.
-    Flush(Result<(), BlockError>),
 }
 
 // SAFETY: VirtioBlkDevice is designed for single-threaded access
@@ -695,14 +666,16 @@ impl VirtioBlkDevice {
                 Self::reset_probe_transport(transport, pci_id, "block-size window too small")?;
                 return Err(BlockError::NotSupported);
             }
-            let block_size = u32::from_le_bytes(block_size_bytes);
-            if block_size != 0 {
-                block_size
-            } else {
-                512
-            }
+            u32::from_le_bytes(block_size_bytes)
         } else {
             512
+        };
+        let geometry = match BlockGeometry::from_virtio(capacity, sector_size) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::reset_probe_transport(transport, pci_id, "invalid logical block geometry")?;
+                return Err(error);
+            }
         };
         let read_only = driver_features & blk_features::VIRTIO_BLK_F_RO != 0;
 
@@ -865,8 +838,7 @@ impl VirtioBlkDevice {
             pci_id,
             virtqueue_dma,
             queue,
-            capacity,
-            sector_size,
+            geometry,
             read_only,
             features: driver_features,
             lock: Mutex::new(()),
@@ -986,7 +958,7 @@ impl VirtioBlkDevice {
     ///
     /// R94-13 Enhancement: DmaBuffer is now dropped automatically when RequestMeta
     /// goes out of scope, ensuring IOMMU mappings are cleaned up properly.
-    fn complete_used_entry(&self, used: VringUsedElem) -> Option<RequestCompletion> {
+    fn complete_used_entry(&self, used: VringUsedElem) -> Option<RequestCompletion<DmaBuffer>> {
         let mut buffers = self.req_buffers.lock();
 
         // Find the request buffer matching this completion's head descriptor
@@ -1019,6 +991,12 @@ impl VirtioBlkDevice {
             }
         };
 
+        // Detach metadata and release the slot before any DMA owner is dropped.
+        // All callers hold the synchronous device lock, so no new live request
+        // can reuse the slot while this completed chain is retired.
+        buffer.in_use = false;
+        drop(buffers);
+
         let RequestMeta {
             head,
             desc_chain,
@@ -1032,57 +1010,9 @@ impl VirtioBlkDevice {
         // Read status from DMA buffer
         let status = unsafe { core::ptr::read(header_status_dma.virt_ptr().add(header_size)) };
 
-        // Process based on request kind
-        let completion = match kind {
-            RequestKind::Read {
-                data_dma,
-                data_len,
-                data_buf,
-            } => {
-                // For successful reads on non-abandoned requests, copy data back.
-                // R94-13 FIX: Use data_len (actual buffer size) not data_dma.size() (page-aligned)
-                if !abandoned && status == blk_status::VIRTIO_BLK_S_OK && data_len > 0 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(data_dma.virt_ptr(), data_buf, data_len);
-                    }
-                }
-
-                if abandoned {
-                    None
-                } else {
-                    Some(RequestCompletion::Io(match status {
-                        blk_status::VIRTIO_BLK_S_OK => Ok(data_len),
-                        blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
-                        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-                        _ => Err(BlockError::Io),
-                    }))
-                }
-                // data_dma is dropped here, automatically unmapping from IOMMU
-            }
-            RequestKind::Write { data_len, .. } => {
-                if abandoned {
-                    None
-                } else {
-                    Some(RequestCompletion::Io(match status {
-                        blk_status::VIRTIO_BLK_S_OK => Ok(data_len),
-                        blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
-                        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-                        _ => Err(BlockError::Io),
-                    }))
-                }
-            }
-            RequestKind::Flush => {
-                if abandoned {
-                    None
-                } else {
-                    Some(RequestCompletion::Flush(match status {
-                        blk_status::VIRTIO_BLK_S_OK => Ok(()),
-                        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-                        _ => Err(BlockError::Io),
-                    }))
-                }
-            }
-        };
+        // KSA-018: only owned DMA leaves completion. Caller copy-back happens
+        // later through do_request's still-live mutable slice, never a raw address.
+        let completion = finish_request(kind, status, abandoned);
 
         // Free descriptors back to the pool
         for idx in desc_chain.iter().take(desc_count) {
@@ -1091,9 +1021,6 @@ impl VirtioBlkDevice {
 
         // DmaBuffers (header_status_dma and data_dma if I/O) are automatically
         // dropped here, which triggers IOMMU unmapping via DmaBuffer::drop()
-
-        // Release the request buffer slot
-        buffer.in_use = false;
 
         // Handle abandoned requests (late completions)
         if abandoned {
@@ -1312,24 +1239,13 @@ impl VirtioBlkDevice {
                     self.transport.set_status(VIRTIO_STATUS_FAILED);
                     return Err(BlockError::NotSupported);
                 }
-                let block_size = u32::from_le_bytes(block_size_bytes);
-                if block_size == 0 {
-                    512
-                } else {
-                    block_size
-                }
+                u32::from_le_bytes(block_size_bytes)
             } else {
                 512
             };
-            if reset_capacity != self.capacity || reset_sector_size != self.sector_size {
+            if BlockGeometry::from_virtio(reset_capacity, reset_sector_size) != Ok(self.geometry) {
                 self.transport.set_status(VIRTIO_STATUS_FAILED);
-                kprintln!(
-                    "[virtio-blk] U41-3: geometry changed across reset (capacity {}->{}, sector {}->{})",
-                    self.capacity,
-                    reset_capacity,
-                    self.sector_size,
-                    reset_sector_size
-                );
+                kprintln!("[virtio-blk] geometry changed or became invalid across reset");
                 return Err(BlockError::Offline);
             }
 
@@ -1403,47 +1319,11 @@ impl VirtioBlkDevice {
             return Err(BlockError::ReadOnly);
         }
 
-        // R28-2 Fix: Validate buffer alignment and capacity bounds
-        // R32-BLK-1 FIX: Use consistent byte-based bounds checking
-        // VirtIO spec: capacity is always in 512-byte sectors, but blk_size may differ
-        if buf_len == 0 {
-            return Err(BlockError::Invalid);
-        }
-        // R32-BLK-1 additional hardening: prevent u32 wrap in descriptor length
         if buf_len > u32::MAX as usize {
             return Err(BlockError::Invalid);
         }
-        const VIRTIO_CAPACITY_SECTOR_SIZE: u64 = 512;
-        let sector_size = self.sector_size as u64;
-        let buf_len_u64 = buf_len as u64;
-
-        // Buffer must be aligned to logical sector size
-        if buf_len_u64 % sector_size != 0 {
-            return Err(BlockError::Invalid);
-        }
-
-        // Convert to byte offsets for consistent bounds checking
-        let start_byte = sector.checked_mul(sector_size).ok_or(BlockError::Invalid)?;
-        let end_byte = start_byte
-            .checked_add(buf_len_u64)
-            .ok_or(BlockError::Invalid)?;
-        let capacity_bytes = self
-            .capacity
-            .checked_mul(VIRTIO_CAPACITY_SECTOR_SIZE)
-            .ok_or(BlockError::Invalid)?;
-
-        // Start must be aligned to 512-byte boundary for VirtIO header
-        if start_byte % VIRTIO_CAPACITY_SECTOR_SIZE != 0 {
-            return Err(BlockError::Invalid);
-        }
-
-        // End must not exceed device capacity
-        if end_byte > capacity_bytes {
-            return Err(BlockError::Invalid);
-        }
-
-        // Calculate sector in 512-byte units for VirtIO request header
-        let header_sector = start_byte / VIRTIO_CAPACITY_SECTOR_SIZE;
+        // KSA-019: one checked conversion from public logical LBA to wire units.
+        let header_sector = self.geometry.virtio_header_sector(sector, buf_len)?;
 
         let _lock = self.lock.lock();
         // Pair the optimistic fast rejection above with a serialized check.
@@ -1577,7 +1457,6 @@ impl VirtioBlkDevice {
             SyncRequestData::Read(buf) => RequestKind::Read {
                 data_dma,
                 data_len: buf_len,
-                data_buf: buf.as_mut_ptr(),
             },
             SyncRequestData::Write(_) => RequestKind::Write {
                 data_dma,
@@ -1618,7 +1497,22 @@ impl VirtioBlkDevice {
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
                     Some(RequestCompletion::Io(res)) => {
-                        completion = Some(res);
+                        completion = Some(res.and_then(|completed| match (&mut data, completed) {
+                            (
+                                SyncRequestData::Read(destination),
+                                CompletedIo::Read { data_dma, data_len },
+                            ) => {
+                                if data_len > data_dma.size() {
+                                    return Err(BlockError::Io);
+                                }
+                                // SAFETY: the used chain retired before this owned
+                                // buffer was returned; no device/caller alias remains.
+                                let bytes = unsafe { data_dma.as_slice() };
+                                copy_read_result(destination, &bytes[..data_len])
+                            }
+                            (SyncRequestData::Write(_), CompletedIo::Write(count)) => Ok(count),
+                            _ => Err(BlockError::Io),
+                        }));
                         break;
                     }
                     Some(RequestCompletion::Flush(_)) => {
@@ -1684,7 +1578,7 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn sector_size(&self) -> u32 {
-        self.sector_size
+        self.geometry.sector_size()
     }
 
     fn max_sectors_per_bio(&self) -> u32 {
@@ -1693,7 +1587,11 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn capacity_sectors(&self) -> u64 {
-        self.capacity
+        self.geometry.capacity_sectors()
+    }
+
+    fn geometry(&self) -> Result<BlockGeometry, BlockError> {
+        Ok(self.geometry)
     }
 
     fn is_read_only(&self) -> bool {
@@ -1701,6 +1599,14 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn submit_bio(&self, mut bio: Bio) -> Result<(), BlockError> {
+        if let Err(error) = bio.validate(
+            self.sector_size(),
+            self.max_sectors_per_bio(),
+            self.capacity_sectors(),
+        ) {
+            bio.complete(Err(error));
+            return Err(error);
+        }
         // U41-1: a BIO security tag is part of the device boundary, not
         // advisory metadata.  Enforce the same file-permission hook used by
         // VFS before touching DMA buffers or issuing a device request.  A
@@ -1736,19 +1642,19 @@ impl BlockDevice for VirtioBlkDevice {
                     Err(BlockError::Invalid)
                 } else if bio.vecs.len() == 1 {
                     // Single vector - use directly
-                    // SAFETY: Caller ensures the buffer is valid and writable for read data
-                    let buf = unsafe { bio.vecs[0].as_mut_slice() };
+                    // The request exclusively owns its writable destination.
+                    let buf = bio.vecs[0].as_mut_slice();
                     self.do_request(bio.sector, SyncRequestData::Read(buf))
                 } else {
                     // Multi-vector scatter-gather: process sequentially
                     let mut current_sector = bio.sector;
-                    let sector_size = self.sector_size as u64;
+                    let sector_size = u64::from(self.geometry.sector_size());
                     let mut total_bytes = 0usize;
                     let mut err: Option<BlockError> = None;
 
                     for bv in bio.vecs.iter_mut() {
                         // Read len before mutable borrow
-                        let bv_len = bv.len as u64;
+                        let bv_len = bv.len() as u64;
                         let sectors = match bv_len.checked_div(sector_size) {
                             Some(s) if s > 0 => s,
                             _ => {
@@ -1757,8 +1663,8 @@ impl BlockDevice for VirtioBlkDevice {
                             }
                         };
 
-                        // SAFETY: Caller ensures each buffer is valid
-                        let buf = unsafe { bv.as_mut_slice() };
+                        // This vector remains owned by the request across the call.
+                        let buf = bv.as_mut_slice();
                         match self.do_request(current_sector, SyncRequestData::Read(buf)) {
                             Ok(n) => {
                                 total_bytes += n;
@@ -1784,19 +1690,19 @@ impl BlockDevice for VirtioBlkDevice {
                 if bio.vecs.is_empty() {
                     Err(BlockError::Invalid)
                 } else if bio.vecs.len() == 1 {
-                    // SAFETY: Caller ensures the buffer is valid and contains write data.
-                    let buf = unsafe { bio.vecs[0].as_slice() };
+                    // Borrow initialized bytes from the owned vector.
+                    let buf = bio.vecs[0].as_slice();
                     self.do_request(bio.sector, SyncRequestData::Write(buf))
                 } else {
                     // Multi-vector scatter-gather: process sequentially
                     let mut current_sector = bio.sector;
-                    let sector_size = self.sector_size as u64;
+                    let sector_size = u64::from(self.geometry.sector_size());
                     let mut total_bytes = 0usize;
                     let mut err: Option<BlockError> = None;
 
                     for bv in bio.vecs.iter_mut() {
                         // Read len before mutable borrow
-                        let bv_len = bv.len as u64;
+                        let bv_len = bv.len() as u64;
                         let sectors = match bv_len.checked_div(sector_size) {
                             Some(s) if s > 0 => s,
                             _ => {
@@ -1805,8 +1711,8 @@ impl BlockDevice for VirtioBlkDevice {
                             }
                         };
 
-                        // SAFETY: Caller ensures each buffer is valid and readable.
-                        let buf = unsafe { bv.as_slice() };
+                        // Borrow initialized bytes from the owned vector.
+                        let buf = bv.as_slice();
                         match self.do_request(current_sector, SyncRequestData::Write(buf)) {
                             Ok(n) => {
                                 total_bytes += n;

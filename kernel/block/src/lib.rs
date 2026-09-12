@@ -26,7 +26,7 @@
 //!
 //! - [`BlockDevice`]: Trait for block device drivers
 //! - [`Bio`]: Block I/O request structure
-//! - [`BioVec`]: Scatter-gather vector for DMA
+//! - [`BioVec`]: Owned CPU buffers transferred with each BIO
 //! - [`RequestQueue`]: Per-device request queue with FIFO scheduling
 //! - [`BlockDeviceRegistry`]: Global registry for block devices
 //!
@@ -51,16 +51,19 @@ extern crate drivers;
 extern crate klog;
 extern crate mm;
 
+pub mod geometry;
+pub use geometry::BlockGeometry;
+
 pub mod pci;
 pub mod virtio;
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
+use mm::{AdmittedDeque, AdmittedVec, HeapClass};
 use spin::{Mutex, RwLock};
 
 // ============================================================================
@@ -159,145 +162,58 @@ impl fmt::Display for BioOp {
     }
 }
 
-/// Scatter-gather vector for BIO data transfer.
+/// KSA-018: exclusively owned CPU buffer for a BIO transfer.
 ///
-/// Each vector points to a contiguous memory region. For DMA-capable
-/// devices, the physical address should also be provided.
-///
-/// # Safety Invariants
-///
-/// A `BioVec` is valid only if ALL of the following hold:
-/// - `ptr` is non-null and points to a valid, allocated memory region of at least `len` bytes
-/// - `ptr` is properly aligned for `u8` access (trivially true, but stricter alignment may be required by device)
-/// - The memory region `[ptr, ptr + len)` does not wrap around the address space
-/// - The referenced memory remains valid for the lifetime of the `BioVec` and any slices derived from it
-/// - For read operations: the memory is readable
-/// - For write operations: the memory is writable
-/// - For DMA operations: the memory is not concurrently accessed by CPU during device transfer
-/// - If `phys` is `Some`, it must be the correct physical address mapping for `ptr`
-///
-/// **Aliasing hazard:** Creating a mutable slice via `as_mut_slice()` while a DMA device
-/// concurrently accesses the same buffer is undefined behavior. Callers must ensure:
-/// - Device transfer is complete before CPU accesses the buffer, OR
-/// - Appropriate memory barriers/cache invalidation are used
-#[derive(Clone, Copy)]
+/// Slice construction copies bytes into admitted storage. The source may be
+/// changed or dropped immediately; read completion returns this owner to its
+/// callback. DMA drivers own a separate pinned buffer while the device runs.
+#[derive(Debug)]
 pub struct BioVec {
-    /// Virtual address of the buffer.
-    pub ptr: *mut u8,
-    /// Length in bytes (must be sector-aligned for most operations).
-    pub len: usize,
-    /// Physical address for DMA (None if not applicable).
-    pub phys: Option<u64>,
+    data: AdmittedVec<u8>,
 }
-
-// SAFETY: BioVec contains raw pointers but is only used within the kernel
-// where we control memory safety.
-unsafe impl Send for BioVec {}
-unsafe impl Sync for BioVec {}
 
 impl BioVec {
-    /// Create a new BioVec with virtual address only.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure:
-    /// - `ptr` is non-null and points to a valid, allocated memory region of at least `len` bytes
-    /// - The memory region remains valid for the lifetime of the `BioVec` and any derived slices
-    /// - `ptr + len` does not overflow the address space
-    /// - The memory is readable/writable as required by subsequent operations
-    /// - For DMA operations: no concurrent CPU access during device transfer
-    pub const unsafe fn new(ptr: *mut u8, len: usize) -> Self {
-        Self {
-            ptr,
-            len,
-            phys: None,
+    pub fn zeroed(len: usize) -> Result<Self, BlockError> {
+        if len > MAX_BIO_BYTES {
+            return Err(BlockError::TooLarge);
         }
+        let mut data = AdmittedVec::new(HeapClass::BlockingIo);
+        data.try_reserve_exact(len).map_err(|_| BlockError::NoMem)?;
+        for _ in 0..len {
+            data.push_reserved(0).map_err(|_| BlockError::NoMem)?;
+        }
+        Ok(Self { data })
     }
 
-    /// Create a new BioVec with both virtual and physical addresses.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure all invariants from [`BioVec::new`], plus:
-    /// - `phys` is the correct physical address mapping for `ptr`
-    /// - The physical mapping remains stable for the lifetime of the `BioVec`
-    pub const unsafe fn with_phys(ptr: *mut u8, len: usize, phys: u64) -> Self {
-        Self {
-            ptr,
-            len,
-            phys: Some(phys),
+    /// Copy input into writable owned storage; never retain a source pointer.
+    pub fn from_slice(slice: &[u8]) -> Result<Self, BlockError> {
+        if slice.len() > MAX_BIO_BYTES {
+            return Err(BlockError::TooLarge);
         }
+        let data = AdmittedVec::try_copy_from_slice(HeapClass::BlockingIo, slice)
+            .map_err(|_| BlockError::NoMem)?;
+        Ok(Self { data })
     }
 
-    /// Create a BioVec from a byte slice (safe constructor).
-    ///
-    /// This is the preferred constructor when the buffer is already a valid slice.
-    pub fn from_slice(slice: &[u8]) -> Self {
-        Self {
-            ptr: slice.as_ptr() as *mut u8,
-            len: slice.len(),
-            phys: None,
-        }
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 
-    /// Create a BioVec from a mutable byte slice (safe constructor).
-    ///
-    /// This is the preferred constructor when the buffer is already a valid mutable slice.
-    pub fn from_mut_slice(slice: &mut [u8]) -> Self {
-        Self {
-            ptr: slice.as_mut_ptr(),
-            len: slice.len(),
-            phys: None,
-        }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
-    /// Check if the buffer is aligned to the given sector size.
-    #[inline]
+    /// CPU address alignment is irrelevant to the driver's DMA bounce buffer.
     pub fn is_aligned(&self, sector_size: u32) -> bool {
-        let sz = sector_size as usize;
-        (self.len % sz == 0) && ((self.ptr as usize) % sz == 0)
+        sector_size != 0 && self.len() % sector_size as usize == 0
     }
 
-    /// Get the buffer as a byte slice (for read operations).
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure ALL of the following hold:
-    /// - The `BioVec` was constructed with valid pointer and length (see type-level invariants)
-    /// - The referenced memory region is currently valid and readable
-    /// - The memory will remain valid for the lifetime `'a` of the returned slice
-    /// - The memory is properly initialized (contains valid `u8` values)
-    /// - No mutable references to overlapping memory exist during the slice's lifetime
-    /// - If used for DMA: device transfer has completed and appropriate barriers/invalidation performed
-    #[inline]
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        core::slice::from_raw_parts(self.ptr, self.len)
+    pub fn as_slice(&self) -> &[u8] {
+        self.data.as_slice()
     }
 
-    /// Get the buffer as a mutable byte slice (for write operations).
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure ALL of the following hold:
-    /// - The `BioVec` was constructed with valid pointer and length (see type-level invariants)
-    /// - The referenced memory region is currently valid and writable
-    /// - The memory will remain valid for the lifetime `'a` of the returned slice
-    /// - No other references (mutable or immutable) to overlapping memory exist during the slice's lifetime
-    /// - For DMA write (device → memory): CPU must not access the buffer until transfer completes
-    /// - For DMA read (memory → device): the slice content must be initialized before device access
-    #[inline]
-    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        core::slice::from_raw_parts_mut(self.ptr, self.len)
-    }
-}
-
-impl fmt::Debug for BioVec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BioVec")
-            .field("ptr", &format_args!("{:p}", self.ptr))
-            .field("len", &self.len)
-            .field("phys", &self.phys)
-            .finish()
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.data.as_mut_slice()
     }
 }
 
@@ -335,8 +251,8 @@ impl SecurityTag {
 /// BIO completion result.
 pub type BioResult = Result<usize, BlockError>;
 
-/// Asynchronous completion callback for BIO.
-pub type BioComplete = Box<dyn FnOnce(BioResult) + Send + 'static>;
+/// Completion transfers `(result, owned_request)` after driver locks are released.
+pub type BioComplete = Box<dyn FnOnce(BioResult, Bio) + Send + 'static>;
 
 /// Block I/O request.
 ///
@@ -357,9 +273,9 @@ pub struct Bio {
     /// For Read/Write, this is derived from vecs.
     pub num_sectors: u64,
     /// Scatter-gather buffer list.
-    pub vecs: Vec<BioVec>,
+    vecs: AdmittedVec<BioVec>,
     /// Completion callback (called when I/O finishes).
-    pub completion: Option<BioComplete>,
+    completion: Option<BioComplete>,
     /// Security context for LSM.
     pub sec_tag: Option<SecurityTag>,
     /// Device-private data (e.g., virtio descriptor index).
@@ -386,7 +302,7 @@ impl Bio {
             op,
             sector,
             num_sectors: 0,
-            vecs: Vec::new(),
+            vecs: AdmittedVec::new(HeapClass::Device),
             completion: None,
             sec_tag: None,
             private: 0,
@@ -405,7 +321,7 @@ impl Bio {
             op: BioOp::Discard,
             sector,
             num_sectors,
-            vecs: Vec::new(),
+            vecs: AdmittedVec::new(HeapClass::Device),
             completion: None,
             sec_tag: None,
             private: 0,
@@ -425,29 +341,38 @@ impl Bio {
         self
     }
 
-    /// Add a scatter-gather vector to the BIO.
+    /// Add owned storage without allowing payload/count bounds to be bypassed.
     pub fn push_vec(&mut self, bv: BioVec) -> Result<(), BlockError> {
-        if self.vecs.len() >= MAX_BIO_VECS {
+        if self.vecs.len() >= MAX_BIO_VECS
+            || self
+                .total_len()
+                .checked_add(bv.len())
+                .filter(|len| *len <= MAX_BIO_BYTES)
+                .is_none()
+        {
             return Err(BlockError::TooLarge);
         }
-        self.vecs.push(bv);
-        Ok(())
+        self.vecs.try_push(bv).map_err(|_| BlockError::NoMem)
     }
 
-    /// Get the total payload length in bytes.
-    #[inline]
+    pub fn vectors(&self) -> &[BioVec] {
+        self.vecs.as_slice()
+    }
+
+    pub fn vector_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        self.vecs.get_mut(index).map(BioVec::as_mut_slice)
+    }
+
+    /// Private bounded vectors make the total infallible and nonoverflowing.
     pub fn total_len(&self) -> usize {
-        self.vecs.iter().map(|v| v.len).sum()
+        self.vecs.iter().map(BioVec::len).sum()
     }
 
-    /// Get the total number of sectors (rounded up).
-    #[inline]
-    pub fn total_sectors(&self, sector_size: u32) -> u64 {
-        let bytes = self.total_len() as u64;
-        if bytes == 0 {
-            return 0;
+    pub fn total_sectors(&self, sector_size: u32) -> Result<u64, BlockError> {
+        if sector_size == 0 || self.total_len() % sector_size as usize != 0 {
+            return Err(BlockError::Invalid);
         }
-        (bytes + sector_size as u64 - 1) / sector_size as u64
+        Ok((self.total_len() / sector_size as usize) as u64)
     }
 
     /// Validate the BIO against device constraints.
@@ -462,63 +387,53 @@ impl Bio {
         max_sectors: u32,
         device_capacity: u64,
     ) -> Result<(), BlockError> {
-        // Flush operations don't need data buffers or bounds check
+        let geometry = BlockGeometry::from_logical(sector_size, device_capacity)?;
         if self.op == BioOp::Flush {
-            return Ok(());
+            return if self.vecs.is_empty() && self.num_sectors == 0 {
+                Ok(())
+            } else {
+                Err(BlockError::Invalid)
+            };
         }
-
-        // Discard operations use explicit num_sectors
         if self.op == BioOp::Discard {
-            if self.num_sectors == 0 || self.num_sectors > max_sectors as u64 {
+            if !self.vecs.is_empty() || self.num_sectors == 0 {
+                return Err(BlockError::Invalid);
+            }
+            if self.num_sectors > u64::from(max_sectors) {
                 return Err(BlockError::TooLarge);
             }
-            // Bounds check: sector + num_sectors must not overflow or exceed capacity
-            let end_sector = self
+            let end = self
                 .sector
                 .checked_add(self.num_sectors)
                 .ok_or(BlockError::Invalid)?;
-            if end_sector > device_capacity {
-                return Err(BlockError::Invalid);
-            }
-            return Ok(());
+            return if end <= geometry.capacity_sectors() {
+                Ok(())
+            } else {
+                Err(BlockError::Invalid)
+            };
         }
-
-        // Read/Write operations need at least one buffer
-        if self.vecs.is_empty() {
+        if self.num_sectors != 0
+            || self.vecs.is_empty()
+            || self
+                .vecs
+                .iter()
+                .any(|v| v.is_empty() || !v.is_aligned(sector_size))
+        {
             return Err(BlockError::Invalid);
         }
-
-        // Check alignment for all vectors
-        for v in &self.vecs {
-            if !v.is_aligned(sector_size) {
-                return Err(BlockError::Invalid);
-            }
-        }
-
-        // Check total size
-        let sectors = self.total_sectors(sector_size);
-        if sectors == 0 || sectors > max_sectors as u64 {
+        if self.total_sectors(sector_size)? > u64::from(max_sectors) {
             return Err(BlockError::TooLarge);
         }
-
-        // Bounds check: sector + total_sectors must not overflow or exceed capacity
-        let end_sector = self
-            .sector
-            .checked_add(sectors)
-            .ok_or(BlockError::Invalid)?;
-        if end_sector > device_capacity {
-            return Err(BlockError::Invalid);
-        }
-
-        Ok(())
+        geometry
+            .request_start(self.sector, self.total_len())
+            .map(|_| ())
     }
 
-    /// Complete the BIO with the given result.
-    ///
-    /// This consumes the BIO and invokes the completion callback if set.
-    pub fn complete(self, result: BioResult) {
-        if let Some(cb) = self.completion {
-            cb(result);
+    /// Transfer this completed request to its callback after driver locks drop.
+    /// Unsubmitted BIO drop does not invoke completion.
+    pub fn complete(mut self, result: BioResult) {
+        if let Some(cb) = self.completion.take() {
+            cb(result, self);
         }
     }
 
@@ -571,8 +486,13 @@ pub trait BlockDevice: Send + Sync {
         MAX_BIO_SECTORS
     }
 
-    /// Get the total device capacity in sectors.
+    /// Total capacity in logical sectors of `sector_size()` bytes.
     fn capacity_sectors(&self) -> u64;
+
+    /// Checked immutable geometry used by byte-oriented consumers.
+    fn geometry(&self) -> Result<BlockGeometry, BlockError> {
+        BlockGeometry::from_logical(self.sector_size(), self.capacity_sectors())
+    }
 
     /// Check if the device is read-only.
     fn is_read_only(&self) -> bool {
@@ -581,8 +501,9 @@ pub trait BlockDevice: Send + Sync {
 
     /// Submit a BIO for asynchronous processing.
     ///
-    /// The driver should queue the BIO and return immediately.
-    /// When the I/O completes, the driver calls `bio.complete(result)`.
+    /// Implementations may complete synchronously. Every terminal path calls
+    /// `bio.complete(result)` exactly once after releasing driver locks. A driver
+    /// must retire DMA or keep it pinned without caller access before completion.
     fn submit_bio(&self, bio: Bio) -> Result<(), BlockError>;
 
     /// Synchronously read sectors from the device.
@@ -635,10 +556,11 @@ pub trait BlockDevice: Send + Sync {
 /// # Completion Semantics
 ///
 /// On enqueue failure, the BIO's completion callback is automatically invoked
-/// with the error, ensuring callers never hang waiting for completion.
+/// with the error. Pop transfers completion responsibility to the consumer;
+/// dropping the queue completes remaining requests with `Offline`.
 pub struct RequestQueue {
     /// Queued BIOs waiting for processing (VecDeque for O(1) pop).
-    queue: Mutex<VecDeque<Bio>>,
+    queue: Mutex<AdmittedDeque<Bio>>,
     /// Maximum queue depth.
     max_depth: usize,
     /// Sector size for validation.
@@ -659,9 +581,19 @@ pub struct RequestQueue {
 
 impl RequestQueue {
     /// Create a new request queue with the given parameters.
-    pub fn new(sector_size: u32, max_sectors: u32, max_depth: usize, device_capacity: u64) -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::with_capacity(max_depth)),
+    pub fn new(
+        sector_size: u32,
+        max_sectors: u32,
+        max_depth: usize,
+        device_capacity: u64,
+    ) -> Result<Self, BlockError> {
+        BlockGeometry::from_logical(sector_size, device_capacity)?;
+        let mut queue = AdmittedDeque::new(HeapClass::Device);
+        queue
+            .try_reserve_exact(max_depth)
+            .map_err(|_| BlockError::NoMem)?;
+        Ok(Self {
+            queue: Mutex::new(queue),
             max_depth,
             sector_size,
             max_sectors,
@@ -670,7 +602,7 @@ impl RequestQueue {
             stats_completed: AtomicU64::new(0),
             stats_bytes: AtomicU64::new(0),
             stats_rejected: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Enqueue a BIO for processing.
@@ -690,18 +622,24 @@ impl RequestQueue {
         if q.len() >= self.max_depth {
             self.stats_rejected.fetch_add(1, Ordering::Relaxed);
             // Invoke completion with error so caller doesn't hang
+            drop(q);
             bio.complete(Err(BlockError::Busy));
             return Err(BlockError::Busy);
         }
 
+        if let Err(bio) = q.push_back_reserved(bio) {
+            drop(q);
+            self.stats_rejected.fetch_add(1, Ordering::Relaxed);
+            bio.complete(Err(BlockError::NoMem));
+            return Err(BlockError::NoMem);
+        }
         self.stats_submitted.fetch_add(1, Ordering::Relaxed);
-        q.push_back(bio);
         Ok(())
     }
 
     /// Pop the next BIO from the queue (FIFO order, O(1)).
     pub fn pop(&self) -> Option<Bio> {
-        self.queue.lock().pop_front()
+        self.queue.lock().pop_front_retaining_capacity()
     }
 
     /// Get the current queue depth.
@@ -737,6 +675,15 @@ impl RequestQueue {
             bytes_transferred: self.stats_bytes.load(Ordering::Relaxed),
             current_depth: self.len(),
             max_depth: self.max_depth,
+        }
+    }
+}
+
+impl Drop for RequestQueue {
+    fn drop(&mut self) {
+        // Exclusive ownership: no mutex guard or queue lock crosses callbacks.
+        while let Some(bio) = self.queue.get_mut().pop_front_retaining_capacity() {
+            bio.complete(Err(BlockError::Offline));
         }
     }
 }
@@ -900,13 +847,14 @@ lazy_static::lazy_static! {
 
 /// Register a block device.
 pub fn register_device(device: Arc<dyn BlockDevice>) -> Result<u32, BlockError> {
+    let geometry = device.geometry()?;
     let minor = BLOCK_REGISTRY.register(device.clone())?;
     klog!(
         Info,
         "  Block device registered: {} (minor={}, capacity={}MB)",
         device.name(),
         minor,
-        device.capacity_sectors() * device.sector_size() as u64 / (1024 * 1024)
+        geometry.capacity_bytes() / (1024 * 1024)
     );
     Ok(minor)
 }
@@ -1262,7 +1210,11 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
                 Ok(device) => {
                     let capacity = device.capacity_sectors();
                     let sector_size = device.sector_size();
-                    let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
+                    let size_mb = device
+                        .geometry()
+                        .expect("probed virtio geometry validated")
+                        .capacity_bytes()
+                        / (1024 * 1024);
                     klog!(
                         Info,
                         "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
@@ -1305,7 +1257,11 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
             Ok(device) => {
                 let capacity = device.capacity_sectors();
                 let sector_size = device.sector_size();
-                let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
+                let size_mb = device
+                    .geometry()
+                    .expect("probed virtio geometry validated")
+                    .capacity_bytes()
+                    / (1024 * 1024);
                 klog!(Info,
                     "    virtio-blk (pci) /dev/{} @ {:02x}:{:02x}.{}: {} MB ({} sectors x {} bytes)",
                     name,
@@ -1349,6 +1305,8 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    static BIO_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn block_mmio_preflight_rejects_page_above_architectural_width() {
         let above_width = 1u64 << 52;
@@ -1368,20 +1326,6 @@ mod tests {
             block_mmio_windows(&addrs),
             Err(BlockError::Invalid)
         ));
-    }
-
-    /// Host stack alignment is otherwise ABI-dependent. The second 512-byte
-    /// half is always sector-aligned and never 1024-byte aligned, which makes
-    /// the BIO alignment assertions deterministic.
-    #[repr(align(1024))]
-    struct AlignedDmaBuf([u8; 1024]);
-
-    impl AlignedDmaBuf {
-        fn sector_ptr(&self) -> *mut u8 {
-            // SAFETY: the backing is 1024 bytes and the 512-byte offset remains
-            // within the allocation for every 512-byte test vector below.
-            unsafe { self.0.as_ptr().add(512) as *mut u8 }
-        }
     }
 
     struct RollbackTestDevice {
@@ -1471,15 +1415,15 @@ mod tests {
 
     #[test]
     fn test_bio_vec_alignment() {
-        let buf = AlignedDmaBuf([0; 1024]);
-        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
-        let bv = unsafe { BioVec::new(buf.sector_ptr(), 512) };
+        let _serial = BIO_TEST_LOCK.lock();
+        let bv = BioVec::zeroed(512).unwrap();
         assert!(bv.is_aligned(512));
         assert!(!bv.is_aligned(1024));
     }
 
     #[test]
     fn test_bio_creation() {
+        let _serial = BIO_TEST_LOCK.lock();
         let bio = Bio::new(BioOp::Read, 0).unwrap();
         assert!(bio.is_read());
         assert!(!bio.is_write());
@@ -1488,11 +1432,9 @@ mod tests {
 
     #[test]
     fn test_bio_validation() {
+        let _serial = BIO_TEST_LOCK.lock();
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
-        let buf = AlignedDmaBuf([0; 1024]);
-        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
-        bio.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
-            .unwrap();
+        bio.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
 
         // Should pass with matching sector size and sufficient capacity
         assert!(bio.validate(512, 1024, 1000).is_ok());
@@ -1502,18 +1444,17 @@ mod tests {
 
         // Should fail if exceeds device capacity
         let mut bio2 = Bio::new(BioOp::Read, 999).unwrap();
-        bio2.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
-            .unwrap();
+        bio2.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
         assert!(bio2.validate(512, 1024, 1000).is_ok()); // sector 999 + 1 = 1000, OK
 
         let mut bio3 = Bio::new(BioOp::Read, 1000).unwrap();
-        bio3.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
-            .unwrap();
+        bio3.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
         assert!(bio3.validate(512, 1024, 1000).is_err()); // sector 1000 + 1 = 1001, exceeds
     }
 
     #[test]
     fn test_discard_bio() {
+        let _serial = BIO_TEST_LOCK.lock();
         let bio = Bio::new_discard(0, 100).unwrap();
         assert_eq!(bio.op, BioOp::Discard);
         assert_eq!(bio.num_sectors, 100);
@@ -1528,14 +1469,12 @@ mod tests {
 
     #[test]
     fn test_request_queue() {
-        let queue = RequestQueue::new(512, 1024, 16, 10000);
+        let _serial = BIO_TEST_LOCK.lock();
+        let queue = RequestQueue::new(512, 1024, 16, 10000).unwrap();
         assert!(queue.is_empty());
 
         let mut bio = Bio::new(BioOp::Read, 0).unwrap();
-        let buf = AlignedDmaBuf([0; 1024]);
-        // SAFETY: sector_ptr exposes a valid 512-byte suffix.
-        bio.push_vec(unsafe { BioVec::new(buf.sector_ptr(), 512) })
-            .unwrap();
+        bio.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
 
         queue.enqueue(bio).unwrap();
         assert_eq!(queue.len(), 1);
@@ -1543,5 +1482,182 @@ mod tests {
         let popped = queue.pop();
         assert!(popped.is_some());
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn owned_bio_buffer_outlives_and_does_not_alias_its_source() {
+        let _serial = BIO_TEST_LOCK.lock();
+        let mut owned = {
+            let mut source = alloc::vec![3u8; 512];
+            let owned = BioVec::from_slice(&source).unwrap();
+            source.fill(8);
+            owned
+        };
+        assert_eq!(owned.as_slice(), &[3u8; 512]);
+        owned.as_mut_slice().fill(9);
+        assert_eq!(owned.as_slice(), &[9u8; 512]);
+    }
+
+    #[test]
+    fn completion_transfers_read_buffer_once() {
+        let _serial = BIO_TEST_LOCK.lock();
+        let completed = Arc::new(Mutex::new(None));
+        let destination = completed.clone();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        let mut bio =
+            Bio::new(BioOp::Read, 0)
+                .unwrap()
+                .with_completion(Box::new(move |result, bio| {
+                    assert_eq!(result, Ok(512));
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                    *destination.lock() = Some(bio);
+                }));
+        bio.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
+        bio.vector_mut(0).unwrap().fill(0x5a);
+        bio.complete(Ok(512));
+        let returned = completed.lock().take().unwrap();
+        assert_eq!(returned.vectors()[0].as_slice(), &[0x5a; 512]);
+        returned.complete(Ok(512)); // callback was taken before ownership handoff
+        assert_eq!(callbacks.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn full_queue_callback_can_reenter_queue() {
+        let _serial = BIO_TEST_LOCK.lock();
+        let queue = Arc::new(RequestQueue::new(512, 1024, 0, 10000).unwrap());
+        let reentered = queue.clone();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        let bio =
+            Bio::new(BioOp::Flush, 0)
+                .unwrap()
+                .with_completion(Box::new(move |result, _bio| {
+                    assert_eq!(result, Err(BlockError::Busy));
+                    assert_eq!(reentered.len(), 0);
+                    assert_eq!(
+                        reentered.enqueue(Bio::new(BioOp::Flush, 0).unwrap()),
+                        Err(BlockError::Busy)
+                    );
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                }));
+        assert_eq!(queue.enqueue(bio), Err(BlockError::Busy));
+        assert_eq!(callbacks.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_later_vector_rejects_whole_bio_before_publication() {
+        let _serial = BIO_TEST_LOCK.lock();
+        let queue = Arc::new(RequestQueue::new(512, 1024, 1, 10000).unwrap());
+        let reentered = queue.clone();
+        let mut bio =
+            Bio::new(BioOp::Write, 0)
+                .unwrap()
+                .with_completion(Box::new(move |result, bio| {
+                    assert_eq!(result, Err(BlockError::Invalid));
+                    assert_eq!(bio.vectors().len(), 2);
+                    assert!(reentered.pop().is_none());
+                    reentered
+                        .enqueue(Bio::new(BioOp::Flush, 0).unwrap())
+                        .unwrap();
+                }));
+        bio.push_vec(BioVec::from_slice(&[7; 512]).unwrap())
+            .unwrap();
+        bio.push_vec(BioVec::from_slice(&[8; 1]).unwrap()).unwrap();
+        assert_eq!(queue.enqueue(bio), Err(BlockError::Invalid));
+        assert_eq!(queue.pop().unwrap().op, BioOp::Flush);
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.stats().rejected, 1);
+    }
+
+    #[test]
+    fn queue_drop_cancels_every_pending_bio_once() {
+        let _serial = BIO_TEST_LOCK.lock();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        {
+            let queue = RequestQueue::new(512, 1024, 3, 10000).unwrap();
+            for _ in 0..3 {
+                let observed = callbacks.clone();
+                queue
+                    .enqueue(Bio::new(BioOp::Flush, 0).unwrap().with_completion(Box::new(
+                        move |result, _bio| {
+                            assert_eq!(result, Err(BlockError::Offline));
+                            observed.fetch_add(1, AtomicOrdering::SeqCst);
+                        },
+                    )))
+                    .unwrap();
+            }
+        }
+        assert_eq!(callbacks.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    #[test]
+    fn owned_payload_and_vector_limits_are_enforced() {
+        let _serial = BIO_TEST_LOCK.lock();
+        assert!(matches!(
+            BioVec::zeroed(MAX_BIO_BYTES + 1),
+            Err(BlockError::TooLarge)
+        ));
+        let payload_before = mm::heap_class_snapshot(HeapClass::BlockingIo);
+        let control_before = mm::heap_class_snapshot(HeapClass::Device);
+        {
+            let mut bio = Bio::new(BioOp::Write, 0).unwrap();
+            bio.push_vec(BioVec::zeroed(MAX_BIO_BYTES).unwrap())
+                .unwrap();
+            assert_eq!(
+                bio.push_vec(BioVec::zeroed(512).unwrap()),
+                Err(BlockError::TooLarge)
+            );
+            assert_eq!(bio.total_len(), MAX_BIO_BYTES);
+            let queue = RequestQueue::new(4096, 128, 1, 128).unwrap();
+            queue.enqueue(bio).unwrap();
+            assert!(
+                mm::heap_class_snapshot(HeapClass::BlockingIo).committed_bytes
+                    >= payload_before.committed_bytes + MAX_BIO_BYTES
+            );
+            assert!(
+                mm::heap_class_snapshot(HeapClass::Device).committed_bytes
+                    > control_before.committed_bytes
+            );
+            // Queue cancellation must release the maximum payload and both
+            // vector/queue control allocations under real hosted admission.
+        }
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::BlockingIo),
+            payload_before
+        );
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Device), control_before);
+        let mut vectors = Bio::new(BioOp::Read, 0).unwrap();
+        for _ in 0..MAX_BIO_VECS {
+            vectors.push_vec(BioVec::zeroed(512).unwrap()).unwrap();
+        }
+        assert_eq!(
+            vectors.push_vec(BioVec::zeroed(512).unwrap()),
+            Err(BlockError::TooLarge)
+        );
+        assert_eq!(vectors.total_sectors(0), Err(BlockError::Invalid));
+        drop(vectors);
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::BlockingIo),
+            payload_before
+        );
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Device), control_before);
+    }
+
+    #[test]
+    fn queue_construction_rejects_invalid_geometry_and_capacity_overflow() {
+        let _serial = BIO_TEST_LOCK.lock();
+        assert!(matches!(
+            RequestQueue::new(0, 1024, 1, 1),
+            Err(BlockError::Invalid)
+        ));
+        assert!(matches!(
+            RequestQueue::new(4096, 1024, 1, u64::MAX),
+            Err(BlockError::Invalid)
+        ));
+        assert!(matches!(
+            RequestQueue::new(512, 1024, usize::MAX, 1),
+            Err(BlockError::NoMem)
+        ));
     }
 }
