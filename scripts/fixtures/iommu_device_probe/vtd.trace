@@ -1,0 +1,112 @@
+vtd_ir_remap_msi_req addr 0xfee00000 data 0x0
+vtd_reg_ir_root addr 0xbed5000 size 0x100
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x1
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x2
+vtd_dmar_translate dev 00:05.00 iova 0xbedc000 -> gpa 0xbede000 mask 0xfff
+vtd_dmar_translate dev 00:05.00 iova 0xbedb000 -> gpa 0xbedc000 mask 0xfff
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x3
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x4
+vtd_dmar_translate dev 00:05.00 iova 0xbedc000 -> gpa 0xbede000 mask 0xfff
+vtd_dmar_translate dev 00:05.00 iova 0xbedb000 -> gpa 0xbedd000 mask 0xfff
+vtd_inv_desc_iec granularity 0x0 index 0x0 mask 0x0
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x5
+vtd_ir_remap_msi_req addr 0xfee00018 data 0x0
+vtd_ir_remap index 0 trigger 0 vector 49 deliver 0 dest 0x0 mode 0
+vtd_inv_desc_iec granularity 0x0 index 0x0 mask 0x0
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x6
+vtd_ir_remap_msi_req addr 0xfee00018 data 0x0
+vtd_dmar_translate dev 00:05.00 iova 0xbedc000 -> gpa 0xbede000 mask 0xfff
+vtd_inv_desc_iec granularity 0x0 index 0x0 mask 0x0
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x7
+vtd_ir_remap_msi_req addr 0xfee00018 data 0x0
+vtd_dmar_translate dev 00:05.00 iova 0xbedc000 -> gpa 0xbede000 mask 0xfff
+vtd_inv_desc_iec granularity 0x0 index 0x0 mask 0x0
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x8
+vtd_ir_remap_msi_req addr 0xfee00018 data 0x0
+vtd_ir_remap index 0 trigger 0 vector 49 deliver 0 dest 0x0 mode 0
+vtd_inv_desc_iec granularity 0x0 index 0x0 mask 0x0
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x9
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xa
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xb
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb000 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb004 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb008 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb00c write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb010 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb014 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb018 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb01c write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb020 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb024 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb028 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb02c write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb030 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb034 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb038 write 1
+vtd_dmar_fault sid 0x28 fault 5 addr 0xbedb03c write 1
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xc
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xd
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xe
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0xf
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x10
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x11
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb000 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb004 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb008 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb00c write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb010 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb014 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb018 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb01c write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb020 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb024 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb028 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb02c write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb030 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb034 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb038 write 0
+vtd_dmar_fault sid 0x28 fault 6 addr 0xbedb03c write 0
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x12
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x13
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x14
+vtd_inv_desc_iotlb_domain iotlb invalidate whole domain 0x1
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x15
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb000 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb004 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb008 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb00c write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb010 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb014 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb018 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb01c write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb020 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb024 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb028 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb02c write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb030 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb034 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb038 write 1
+vtd_dmar_fault sid 0x28 fault 2 addr 0xbedb03c write 1
+vtd_inv_desc_cc_devices context invalidate devices sid 0x28 fmask 0x0
+vtd_inv_desc_cc_device context invalidate device 00:05.00
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x16
+vtd_inv_desc_wait_sw wait invalidate status write addr 0xbed4000 data 0x17

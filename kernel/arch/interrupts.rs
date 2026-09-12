@@ -413,6 +413,21 @@ impl AtomicInterruptStats {
 /// 全局原子中断统计（避免中断处理程序中的锁争用）
 static INTERRUPT_STATS: AtomicInterruptStats = AtomicInterruptStats::new();
 
+// P3-2: terminal CPL0-only EDU profile; no userspace or DMA driver is launched.
+#[cfg(feature = "iommu_device_probe")]
+static IOMMU_PROBE_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "iommu_device_probe")]
+pub fn iommu_probe_irq_count() -> u64 {
+    IOMMU_PROBE_IRQS.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "iommu_device_probe")]
+extern "x86-interrupt" fn iommu_probe_irq(_frame: InterruptStackFrame) {
+    IOMMU_PROBE_IRQS.fetch_add(1, Ordering::Release);
+    unsafe { crate::apic::lapic_eoi() };
+}
+
 /// Per-CPU flags to track first timer interrupt (for debug output)
 /// MAX_CPUS = 64 to match cpu_local
 static AP_TIMER_SEEN: [AtomicBool; 64] = {
@@ -473,6 +488,8 @@ lazy_static! {
             // IRQ 0: Timer
         }
         idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
+        #[cfg(feature = "iommu_device_probe")]
+        idt[0x31].set_handler_fn(iommu_probe_irq);
         idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
         // IPI handlers (high vectors)

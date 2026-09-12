@@ -1,0 +1,16 @@
+KSA-P3-DEVICE BEGIN version=1
+KSA-P3-SETUP sid=0028 bar=0xc1000000 cap=0xd2008c222f0686 ecap=0xf00f4a gsts=0xc7000000
+KSA-P3-ATTACH BEGIN domain=1
+KSA-P3-DEVICE PASS case=translated iova=0xbedb000 gpa=0xbedc000 source_iova=0xbedc000 source_gpa=0xbede000 bytes=64 canary=unchanged
+KSA-P3-DEVICE PASS case=replacement iova=0xbedb000 old_gpa=0xbedc000 new_gpa=0xbedd000 old=unchanged
+KSA-P3-DEVICE PASS case=msi delivered=2 wrong_sid=denied retired=denied reused=true index=0 lo=0x310001 hi=0x40028
+KSA-P3-DEVICE CASE readonly
+KSA-P3-FAULT sid=0028 iova=0xbedb000 reason=5 write=true lo=0xbedb000 hi=0x8000000500000028
+KSA-P3-DEVICE PASS case=readonly canary=unchanged context=quarantined bme=off
+KSA-P3-DEVICE CASE unmapped
+KSA-P3-FAULT sid=0028 iova=0xbedb000 reason=6 write=false lo=0xbedb000 hi=0xc000000600000028
+KSA-P3-DEVICE PASS case=unmapped canary=unchanged context=quarantined bme=off
+KSA-P3-DEVICE CASE detach
+KSA-P3-FAULT sid=0028 iova=0xbedb000 reason=2 write=true lo=0xbedb000 hi=0x8000000200000028
+KSA-P3-DEVICE PASS case=detach reenabled=probe_only canary=unchanged context=absent bme=off
+KSA-P3-DEVICE COMPLETE cases=6 scratch=retained physical=false

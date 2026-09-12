@@ -998,6 +998,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // R171-G5-01-B: pass the bootloader-provided RSDP so iommu can actually
     // discover the ACPI DMAR table (same source the arch RSDP publish uses).
     let rsdp_phys = boot_info.map(|i| i.rsdp_address).unwrap_or(0);
+    #[cfg(feature = "iommu_device_probe")]
+    unsafe {
+        // Terminal test profile: BSP, boot root, no published DMA drivers or
+        // IOMMU callbacks; every scratch owner lives until the VM is discarded.
+        iommu::vtd::device_probe::run(
+            rsdp_phys,
+            arch::interrupts::iommu_probe_irq_count,
+            arch::apic::bsp_lapic_id(),
+        );
+    }
+    #[cfg(feature = "iommu_init_probe")]
+    iommu::run_init_failure_probe(rsdp_phys);
+
     match iommu::init(rsdp_phys) {
         Ok(units) => {
             // Register the process drain before exposing the IRQ producer.

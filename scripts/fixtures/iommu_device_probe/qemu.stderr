@@ -1,0 +1,7 @@
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.07H:ECX.umip [bit 2]
+qemu-system-x86_64: vtd_irte_get: invalid IRTE SID (index=0, sid=40, source_id=32)
+qemu-system-x86_64: vtd_irte_get: detected non-present IRTE (index=0, high=0x0, low=0x0)
+qemu-system-x86_64: vtd_iova_to_slpte: detected slpte permission error (iova=0xbedb000, level=0x1, slpte=0xbedd001, write=1)
+qemu-system-x86_64: Interrupt Mask set, irq is not generated
+qemu-system-x86_64: vtd_iommu_translate: detected translation failure (dev=00:05:00, iova=0xbedb000)
+qemu-system-x86_64: New fault is not recorded due to compression of faults
