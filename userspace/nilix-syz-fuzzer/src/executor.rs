@@ -45,6 +45,7 @@ pub struct QemuExecutor {
     ovmf_path: PathBuf,
     timeout: Duration,
     transport: Ext3Transport,
+    artifact_dir: Option<PathBuf>,
 }
 
 impl QemuExecutor {
@@ -85,7 +86,15 @@ impl QemuExecutor {
             ovmf_path,
             timeout: Duration::from_secs(timeout_secs),
             transport: Ext3Transport::new(tools, disk_mib)?,
+            artifact_dir: None,
         })
+    }
+
+    /// Retain each execution's inputs, private ESP, disk and logs for a finite
+    /// validation run. Normal campaigns keep the default temporary cleanup.
+    pub fn with_artifact_dir(mut self, directory: PathBuf) -> Self {
+        self.artifact_dir = Some(directory);
+        self
     }
 
     pub fn execute(&self, program: &SyscallProgram) -> Result<ExecutionResult> {
@@ -95,28 +104,59 @@ impl QemuExecutor {
         }
         let encoded = encode_program(program, &ExecutionIdentity::random(sequence))?;
 
-        let temp_dir = tempfile::Builder::new()
-            .prefix("nilix-syz-v2-")
-            .tempdir()
-            .context("failed to create per-execution temporary directory")?;
-        let serial_path = temp_dir.path().join("serial.log");
-        let stderr_path = temp_dir.path().join("qemu.stderr");
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("nilix-syz-v2-");
+        let temp_dir = match &self.artifact_dir {
+            Some(root) => {
+                std::fs::create_dir_all(root).context("failed to create artifact root")?;
+                builder.tempdir_in(root)
+            }
+            None => builder.tempdir(),
+        }
+        .context("failed to create per-execution temporary directory")?;
+        let work_dir = temp_dir.path().to_path_buf();
+        let _auto_cleanup = if self.artifact_dir.is_some() {
+            let _ = temp_dir.keep();
+            eprintln!("NILIX_SYZ_ARTIFACTS {}", work_dir.display());
+            None
+        } else {
+            Some(temp_dir)
+        };
+        let serial_path = work_dir.join("serial.log");
+        let stderr_path = work_dir.join("qemu.stderr");
         File::create(&serial_path).context("failed to create serial log")?;
         let stderr_file = File::create(&stderr_path).context("failed to create QEMU stderr log")?;
         let disk_path = self
             .transport
-            .prepare(temp_dir.path(), &encoded.bytes)
+            .prepare(&work_dir, &encoded.bytes)
             .context("failed to prepare fresh syz Ext3 transport")?;
 
-        let esp_dir = self
+        let source_esp = self
             .kernel_path
             .parent()
             .context("kernel path has no parent directory")?;
-        ensure_qemu_safe_path(esp_dir)?;
+        // QEMU's writable FAT backend/OVMF modifies NvVars. Never share the
+        // source ESP between programs or workers, and never reuse stale state.
+        let esp_dir = work_dir.join("esp");
+        std::fs::create_dir_all(esp_dir.join("EFI/BOOT"))?;
+        std::fs::copy(&self.kernel_path, esp_dir.join("kernel.elf"))
+            .context("failed to copy the guest kernel")?;
+        std::fs::copy(
+            source_esp.join("EFI/BOOT/BOOTX64.EFI"),
+            esp_dir.join("EFI/BOOT/BOOTX64.EFI"),
+        )
+        .context("missing UEFI bootloader; run make build-syz-kcov")?;
+        ensure_qemu_safe_path(&esp_dir)?;
         ensure_qemu_safe_path(&disk_path)?;
         ensure_qemu_safe_path(&serial_path)?;
 
-        let args = qemu_args(&self.ovmf_path, esp_dir, &disk_path, &serial_path)?;
+        let args = qemu_args(&self.ovmf_path, &esp_dir, &disk_path, &serial_path)?;
+        if self.artifact_dir.is_some() {
+            std::fs::write(
+                work_dir.join("qemu-command.json"),
+                serde_json::to_vec(&args)?,
+            )?;
+        }
         let mut child = Command::new(&self.qemu_path)
             .args(&args)
             .stdin(Stdio::null())
@@ -124,20 +164,23 @@ impl QemuExecutor {
             .stderr(Stdio::from(stderr_file))
             .spawn()
             .with_context(|| format!("failed to spawn {}", self.qemu_path.display()))?;
+        if self.artifact_dir.is_some() {
+            eprintln!(
+                "NILIX_SYZ_QEMU_STARTED pid={} artifacts={}",
+                child.id(),
+                work_dir.display()
+            );
+        }
 
-        let monitor_result =
-            monitor_execution(&mut child, &serial_path, &encoded.binding, self.timeout);
-        let stop_result = terminate_qemu(&mut child);
-        let observation = monitor_result?;
-        stop_result.context("failed to stop QEMU cleanly")?;
+        let observation =
+            observe_execution(&mut child, &serial_path, &encoded.binding, self.timeout)?;
 
         let serial_log = read_bounded_text(&serial_path, MAX_SERIAL_LOG as usize);
         let qemu_stderr = read_bounded_text(&stderr_path, MAX_DIAGNOSTIC_LOG);
 
         match observation {
             Observation::Pass(marker) => {
-                let result_bytes = match self.transport.extract_result(&disk_path, temp_dir.path())
-                {
+                let result_bytes = match self.transport.extract_result(&disk_path, &work_dir) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return Ok(ExecutionResult::Crash(CrashInfo {
@@ -317,6 +360,7 @@ struct SerialMonitor<'a> {
     offset: u64,
     partial: Vec<u8>,
     recent: Vec<u8>,
+    fatal: Option<String>,
     tracker: MarkerTracker<'a>,
 }
 
@@ -330,6 +374,7 @@ impl<'a> SerialMonitor<'a> {
             offset: 0,
             partial: Vec::new(),
             recent: Vec::new(),
+            fatal: None,
             tracker: MarkerTracker::new(binding),
         })
     }
@@ -348,35 +393,91 @@ impl<'a> SerialMonitor<'a> {
 
         self.file.seek(SeekFrom::Start(self.offset))?;
         let mut new_bytes = Vec::with_capacity((length - self.offset) as usize);
-        self.file.read_to_end(&mut new_bytes)?;
-        self.offset = length;
+        // QEMU may append after metadata(). Only consume this snapshot, and
+        // advance by bytes actually read so a later poll cannot replay markers.
+        (&mut self.file)
+            .take(length - self.offset)
+            .read_to_end(&mut new_bytes)?;
+        self.offset += new_bytes.len() as u64;
         self.recent.extend_from_slice(&new_bytes);
+        if self.fatal.is_none() {
+            self.fatal = classify_fatal(&self.recent);
+        }
         if self.recent.len() > MAX_DIAGNOSTIC_LOG {
             let excess = self.recent.len() - MAX_DIAGNOSTIC_LOG;
             self.recent.drain(..excess);
         }
         self.partial.extend_from_slice(&new_bytes);
 
-        while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.partial.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            self.tracker.process_line(&line)?;
+        if let Some(newline) = self.partial.iter().rposition(|byte| *byte == b'\n') {
+            for line in self.partial[..newline].split(|byte| *byte == b'\n') {
+                self.tracker.process_line(line)?;
+            }
+            self.partial.drain(..=newline);
         }
         Ok(())
     }
 
     fn crash_classification(&self) -> Option<String> {
-        let text = String::from_utf8_lossy(&self.recent);
-        if text.contains("KERNEL PANIC") || text.contains("kernel panicked") {
-            Some("kernel_panic".to_string())
-        } else if text.contains("triple fault") {
-            Some("triple_fault".to_string())
-        } else if text.contains("page fault") {
-            Some("page_fault".to_string())
-        } else {
-            None
+        self.fatal.clone()
+    }
+}
+
+fn classify_fatal(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    if text.contains("KERNEL PANIC") || text.contains("kernel panicked") {
+        Some("kernel_panic".to_string())
+    } else if text.contains("triple fault") {
+        Some("triple_fault".to_string())
+    } else if text.contains("page fault") {
+        Some("page_fault".to_string())
+    } else {
+        None
+    }
+}
+
+/// Reap first, then validate the complete immutable serial log and exit status.
+/// A provisional PASS never overrides a failure during emulator shutdown.
+fn observe_execution(
+    child: &mut Child,
+    serial_path: &Path,
+    binding: &ProgramBinding,
+    timeout: Duration,
+) -> Result<Observation> {
+    let provisional = monitor_execution(child, serial_path, binding, timeout);
+    let termination = terminate_qemu(child).context("failed to stop QEMU cleanly")?;
+    let provisional = provisional?;
+    let mut final_serial = SerialMonitor::open(serial_path, binding)?;
+    final_serial
+        .poll()
+        .context("invalid serial protocol after QEMU exit")?;
+    if !final_serial.partial.is_empty()
+        && (final_serial.partial.starts_with(b"NILIX_SYZ_V2_")
+            || b"NILIX_SYZ_V2_".starts_with(&final_serial.partial))
+    {
+        bail!("unterminated protocol marker after QEMU exit");
+    }
+    if let Some(reason) = final_serial.crash_classification() {
+        return Ok(Observation::Crash(reason));
+    }
+    if !termination.expected() {
+        return Ok(Observation::Crash(classify_early_exit(
+            termination.status,
+            final_serial.tracker.began,
+        )));
+    }
+    if let Some(failure) = final_serial.tracker.failure {
+        return Ok(Observation::GuestFailure {
+            stage: failure.stage,
+            code: failure.code,
+        });
+    }
+    if let Observation::Pass(ref pass) = provisional {
+        if final_serial.tracker.pass.as_ref() != Some(pass) {
+            bail!("final serial completion differs from the observed PASS");
         }
     }
+    Ok(provisional)
 }
 
 fn monitor_execution(
@@ -396,6 +497,9 @@ fn monitor_execution(
                 code: failure.code,
             });
         }
+        if let Some(classification) = serial.crash_classification() {
+            return Ok(Observation::Crash(classification));
+        }
         if let Some(pass) = serial.tracker.pass.clone() {
             std::thread::sleep(PASS_SETTLE_TIME);
             serial
@@ -404,13 +508,27 @@ fn monitor_execution(
             if serial.tracker.failure.is_some() {
                 bail!("FAIL marker followed PASS");
             }
+            if let Some(classification) = serial.crash_classification() {
+                return Ok(Observation::Crash(classification));
+            }
+            if let Some(status) = child.try_wait().context("failed to poll QEMU after PASS")? {
+                if !status.success() {
+                    return Ok(Observation::Crash(classify_early_exit(status, true)));
+                }
+            }
             return Ok(Observation::Pass(pass));
-        }
-        if let Some(classification) = serial.crash_classification() {
-            return Ok(Observation::Crash(classification));
         }
         if let Some(status) = child.try_wait().context("failed to poll QEMU")? {
             serial.poll().context("invalid final serial protocol")?;
+            if let Some(classification) = serial.crash_classification() {
+                return Ok(Observation::Crash(classification));
+            }
+            if !status.success() {
+                return Ok(Observation::Crash(classify_early_exit(
+                    status,
+                    serial.tracker.began,
+                )));
+            }
             if let Some(failure) = serial.tracker.failure.take() {
                 return Ok(Observation::GuestFailure {
                     stage: failure.stage,
@@ -434,33 +552,71 @@ fn monitor_execution(
     }
 }
 
-fn terminate_qemu(child: &mut Child) -> Result<()> {
+struct Termination {
+    status: ExitStatus,
+    term_sent: bool,
+    kill_sent: bool,
+}
+
+impl Termination {
+    fn expected(&self) -> bool {
+        if self.status.success() {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            (self.term_sent && self.status.signal() == Some(Signal::SIGTERM as i32))
+                || (self.kill_sent && self.status.signal() == Some(Signal::SIGKILL as i32))
+        }
+        #[cfg(not(unix))]
+        {
+            self.kill_sent
+        }
+    }
+}
+
+fn terminate_qemu(child: &mut Child) -> Result<Termination> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Termination {
+            status,
+            term_sent: false,
+            kill_sent: false,
+        });
+    }
     #[cfg(not(unix))]
     {
-        if child.try_wait()?.is_none() {
-            child.kill().context("failed to terminate QEMU")?;
-        }
-        child.wait().context("failed to reap QEMU")?;
-        return Ok(());
+        child.kill().context("failed to terminate QEMU")?;
+        let status = child.wait().context("failed to reap QEMU")?;
+        Ok(Termination {
+            status,
+            term_sent: false,
+            kill_sent: true,
+        })
     }
 
     #[cfg(unix)]
     {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
         let pid = Pid::from_raw(i32::try_from(child.id()).context("QEMU PID exceeds i32")?);
-        let _ = kill(pid, Signal::SIGTERM);
+        let term_sent = kill(pid, Signal::SIGTERM).is_ok();
         let deadline = Instant::now() + TERM_GRACE;
         while Instant::now() < deadline {
-            if child.try_wait()?.is_some() {
-                return Ok(());
+            if let Some(status) = child.try_wait()? {
+                return Ok(Termination {
+                    status,
+                    term_sent,
+                    kill_sent: false,
+                });
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        let _ = kill(pid, Signal::SIGKILL);
-        child.wait().context("failed to reap QEMU after SIGKILL")?;
-        Ok(())
+        let kill_sent = kill(pid, Signal::SIGKILL).is_ok();
+        let status = child.wait().context("failed to reap QEMU after SIGKILL")?;
+        Ok(Termination {
+            status,
+            term_sent,
+            kill_sent,
+        })
     }
 }
 
@@ -476,7 +632,9 @@ fn qemu_args(ovmf: &Path, esp_dir: &Path, disk: &Path, serial: &Path) -> Result<
         "-bios".into(),
         ovmf.into(),
         "-drive".into(),
-        format!("format=raw,file=fat:rw:{esp_dir}"),
+        // OVMF can write to the ESP. Keep those writes in this drive's overlay;
+        // the separate result disk must remain persistent for extraction.
+        format!("format=raw,file=fat:{esp_dir},snapshot=on"),
         "-drive".into(),
         format!("if=none,file={disk},format=raw,id=syzdisk,cache=directsync"),
         "-device".into(),
@@ -699,16 +857,185 @@ mod tests {
         assert_eq!(tracker.failure.unwrap().stage, "read_input");
     }
 
+    #[cfg(unix)]
+    fn markers(binding: &ProgramBinding, pass: bool) -> String {
+        let mut text = format!(
+            "NILIX_SYZ_V2_BEGIN seq={} run={} program={}\n",
+            binding.sequence_hex(),
+            binding.run_hex(),
+            binding.program_hex()
+        );
+        if pass {
+            text.push_str(&format!(
+                "NILIX_SYZ_V2_PASS seq={} run={} program={} slots=1 tag={}\n",
+                binding.sequence_hex(),
+                binding.run_hex(),
+                binding.program_hex(),
+                "11".repeat(32)
+            ));
+        }
+        text
+    }
+
+    // These tests run the production monitor against real host child processes.
+    // Their synthetic serial logs exercise classification, not guest execution.
+    #[cfg(unix)]
+    fn observe_fixture(log: &str, binding: &ProgramBinding, exit: bool) -> Result<Observation> {
+        let directory = tempfile::tempdir()?;
+        let serial = directory.path().join("serial.log");
+        std::fs::write(&serial, log)?;
+        let mut child = Command::new("sh")
+            .args(["-c", if exit { "exit 7" } else { "exec sleep 10" }])
+            .spawn()?;
+        if exit {
+            child.wait()?;
+        }
+        let result = observe_execution(&mut child, &serial, binding, Duration::from_millis(100));
+        assert!(child.try_wait()?.is_some(), "fixture child must be reaped");
+        result
+    }
+
     #[test]
-    fn timeout_classification_distinguishes_boot_from_guest_hang() {
+    #[cfg(unix)]
+    fn real_child_timeout_distinguishes_boot_from_guest_hang() {
+        let binding = binding();
         assert!(matches!(
-            Observation::Timeout { began: false },
+            observe_fixture("", &binding, false).unwrap(),
             Observation::Timeout { began: false }
         ));
         assert!(matches!(
-            Observation::Timeout { began: true },
+            observe_fixture(&markers(&binding, false), &binding, false).unwrap(),
             Observation::Timeout { began: true }
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abnormal_process_exit_never_passes_even_with_a_valid_pass_marker() {
+        let binding = binding();
+        for log in [
+            String::new(),
+            markers(&binding, false),
+            markers(&binding, true),
+        ] {
+            let Observation::Crash(classification) = observe_fixture(&log, &binding, true).unwrap()
+            else {
+                panic!("nonzero process exit must be a crash");
+            };
+            assert!(classification.contains("exit status: 7"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn panic_after_pass_overrides_success_and_live_pass_is_observed() {
+        let binding = binding();
+        let pass = markers(&binding, true);
+        assert!(matches!(
+            observe_fixture(&pass, &binding, false).unwrap(),
+            Observation::Pass(_)
+        ));
+        let log = format!("{pass}KERNEL PANIC\n");
+        assert!(
+            matches!(observe_fixture(&log, &binding, false).unwrap(), Observation::Crash(reason) if reason == "kernel_panic")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn malformed_serial_is_an_error_and_the_process_is_stopped() {
+        let binding = binding();
+        assert!(observe_fixture("NILIX_SYZ_V2_BAD\n", &binding, false).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_panic_and_nonzero_status_override_provisional_pass() {
+        let binding = binding();
+        for (trap, expected) in [
+            ("printf 'KERNEL PANIC\\n' >> \"$1\"; exit 0", "kernel_panic"),
+            ("exit 7", "qemu_exit_after_begin:"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let serial = directory.path().join("serial.log");
+            std::fs::write(&serial, markers(&binding, true)).unwrap();
+            // Pass the trap body separately so nested quotes remain shell data.
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    "trap \"$2\" TERM; printf 'READY\\n' >> \"$1\"; while :; do sleep 0.01; done",
+                    "fixture",
+                ])
+                .arg(&serial)
+                .arg(trap)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !std::fs::read_to_string(&serial).unwrap().contains("READY") {
+                if Instant::now() >= deadline {
+                    let _ = terminate_qemu(&mut child);
+                    panic!("fixture failed to install TERM trap");
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let result =
+                observe_execution(&mut child, &serial, &binding, Duration::from_secs(1)).unwrap();
+            assert!(child.try_wait().unwrap().is_some());
+            assert!(
+                matches!(result, Observation::Crash(reason) if reason.starts_with(expected)),
+                "shutdown failure was accepted"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_final_protocol_tail_cannot_satisfy_success() {
+        let binding = binding();
+        let pass = markers(&binding, true);
+        for partial in [
+            "NILIX_SYZ_V2_FAIL seq=",
+            "NILIX_SYZ_V2_UNKNOWN",
+            "NILIX_SYZ_",
+        ] {
+            assert!(observe_fixture(&format!("{pass}{partial}"), &binding, false).is_err());
+        }
+        assert!(matches!(
+            observe_fixture(&format!("{pass}ordinary diagnostic tail"), &binding, false).unwrap(),
+            Observation::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn serial_offsets_are_exact_and_fatal_evidence_survives_tail_eviction() {
+        use std::io::Write;
+        let binding = binding();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("serial.log");
+        std::fs::write(&path, markers(&binding, false)).unwrap();
+        let mut serial = SerialMonitor::open(&path, &binding).unwrap();
+        serial.poll().unwrap();
+        serial.poll().unwrap();
+        assert!(serial.tracker.began);
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"KERNEL PAN").unwrap();
+        serial.poll().unwrap();
+        writer.write_all(b"IC\n").unwrap();
+        writer
+            .write_all(&vec![b'x'; MAX_DIAGNOSTIC_LOG + 1])
+            .unwrap();
+        serial.poll().unwrap();
+        assert_eq!(serial.offset, writer.metadata().unwrap().len());
+        assert_eq!(serial.recent.len(), MAX_DIAGNOSTIC_LOG);
+        assert_eq!(
+            serial.crash_classification().as_deref(),
+            Some("kernel_panic")
+        );
+        serial.poll().unwrap();
+        assert_eq!(
+            serial.crash_classification().as_deref(),
+            Some("kernel_panic")
+        );
     }
 
     #[test]
@@ -726,6 +1053,13 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
         assert!(args.iter().any(|arg| arg == "virtio-blk-pci,drive=syzdisk"));
         assert!(!args.iter().any(|arg| arg.contains("virtio-serial")));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "format=raw,file=fat:/tmp/esp,snapshot=on"));
+        assert!(!args.iter().any(|arg| arg == "-snapshot"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("id=syzdisk") && arg.contains("snapshot")));
     }
 
     #[test]
