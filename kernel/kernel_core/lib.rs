@@ -67,6 +67,7 @@ pub mod exception_table;
 // resolving unchanged.
 pub use mm::fallible_map;
 pub mod fork;
+pub mod fs_context;
 pub mod ipc_namespace;
 pub mod mount_namespace;
 #[cfg(feature = "namespace_probe")]
