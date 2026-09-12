@@ -77,6 +77,7 @@ extern crate drivers;
 extern crate klog;
 
 pub mod cgroupfs;
+mod context;
 pub mod devfs;
 pub mod ext2;
 mod identity;
