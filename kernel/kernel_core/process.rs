@@ -416,6 +416,58 @@ pub type KptiCr3UpdateCallback = fn(u64, u64);
 pub const MAX_FD: i32 = 256;
 const FD_RESERVATION_WORDS: usize = (MAX_FD as usize + 63) / 64;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ConsoleFile {
+    pub(crate) readable: bool,
+}
+
+impl FileOps for ConsoleFile {
+    fn status_flags(&self) -> Result<u32, SyscallError> {
+        Ok(if self.readable { 0 } else { 1 })
+    }
+
+    fn clone_box(&self) -> Result<FileDescriptor, ()> {
+        FileDescriptor::try_new(*self, HeapClass::CoreProcess)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn type_name(&self) -> &'static str {
+        "ConsoleFile"
+    }
+
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        Ok(VfsStat {
+            dev: 0,
+            ino: 4,
+            nlink: 1,
+            mode: 0o020666,
+            uid: 0,
+            gid: 0,
+            pad0: 0,
+            rdev: 0x501,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
+        })
+    }
+}
+
 /// 文件操作 trait
 ///
 /// 定义文件描述符必须实现的操作，支持：
@@ -2709,7 +2761,6 @@ impl Process {
 
     /// 分配新的文件描述符
     ///
-    /// fd 0/1/2 保留给标准输入/输出/错误，新分配从 3 开始
     ///
     /// # Returns
     ///
@@ -2853,7 +2904,38 @@ impl Process {
     /// before any VFS/socket/pipe side effect. Both insertions are allocation-
     /// free at commit, and cancellation releases the files.max credit exactly.
     pub fn reserve_fd_with_cloexec(&mut self, cloexec: bool) -> Option<i32> {
-        self.reserve_fd_from_with_cloexec(3, cloexec)
+        self.reserve_fd_from_with_cloexec(0, cloexec)
+    }
+
+    fn initialize_standard_fds(&mut self) -> Result<(), ProcessCreateError> {
+        if !self.fd_table.is_empty() || self.fd_reservations_charged_count != 0 {
+            return Err(ProcessCreateError::OutOfMemory);
+        }
+        let descriptors = [true, false, false].map(|readable| {
+            FileDescriptor::try_new(ConsoleFile { readable }, HeapClass::CoreProcess)
+        });
+        if descriptors.iter().any(Result::is_err) {
+            return Err(ProcessCreateError::OutOfMemory);
+        }
+        let mut reserved = 0;
+        for expected_fd in 0..3 {
+            match self.reserve_fd_with_cloexec(false) {
+                Some(fd) => {
+                    assert_eq!(fd, expected_fd);
+                    reserved += 1;
+                }
+                None => {
+                    for fd in 0..reserved {
+                        assert!(self.cancel_fd_reservation(fd));
+                    }
+                    return Err(ProcessCreateError::OutOfMemory);
+                }
+            }
+        }
+        for (fd, descriptor) in descriptors.into_iter().enumerate() {
+            self.commit_reserved_fd(fd as i32, descriptor.expect("prepared console descriptor"));
+        }
+        Ok(())
     }
 
     /// F_DUPFD/F_DUPFD_CLOEXEC reservation: choose the lowest free descriptor
@@ -2884,6 +2966,11 @@ impl Process {
         fd: i32,
         desc: FileDescriptor,
     ) -> Result<(), FileDescriptor> {
+        self.commit_reserved_fd(fd, desc);
+        Ok(())
+    }
+
+    pub(crate) fn commit_reserved_fd(&mut self, fd: i32, desc: FileDescriptor) {
         assert!(
             self.fd_is_reserved(fd) && !self.fd_table.contains_key(&fd),
             "R180-23: invalid or occupied FD reservation at commit"
@@ -2921,7 +3008,6 @@ impl Process {
         assert_eq!(was_cloexec_reserved, cloexec);
         self.fd_reservations_charged_count = next_reserved_count;
         self.fds_charged_count = next_installed_count;
-        Ok(())
     }
 
     /// Cancel one reservation and return its files.max credit. Idempotent false
@@ -2964,7 +3050,7 @@ impl Process {
         desc: FileDescriptor,
         cloexec: bool,
     ) -> Result<i32, FileDescriptor> {
-        self.allocate_fd_from_with_cloexec(desc, 3, cloexec)
+        self.allocate_fd_from_with_cloexec(desc, 0, cloexec)
     }
 
     /// Allocate from a Linux F_DUPFD lower bound with the same admitted table,
@@ -3006,8 +3092,6 @@ impl Process {
         self.remove_cloexec_preserving_reservations(fd);
         let removed = self.remove_fd_entry_preserving_reservations(fd);
         if removed.is_some() {
-            // J2-7: every fd_table entry corresponds to exactly one charge (fds
-            // 0/1/2 are virtual — allocate_fd starts at 3), so uncharge exactly 1.
             crate::cgroup::uncharge_fds(self.cgroup_id, 1);
             self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
         }
@@ -4781,6 +4865,13 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
             return Err(error);
         }
     };
+    if ppid == 0 {
+        let result = process.lock().initialize_standard_fds();
+        if let Err(error) = result {
+            free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
+            return Err(error);
+        }
+    }
 
     // 设置已分配的内核栈
     {
@@ -5011,6 +5102,13 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
             return Err(error);
         }
     };
+    if ppid == 0 {
+        let result = process.lock().initialize_standard_fds();
+        if let Err(error) = result {
+            free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
+            return Err(error);
+        }
+    }
 
     // Set up kernel stack
     {

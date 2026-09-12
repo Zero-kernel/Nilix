@@ -4856,7 +4856,7 @@ fn sys_clone(
         // and cap_table cloning, violating the parent→child lock order
         // used in enforce_lsm_task_fork().
         // R158-7 FIX (LOW): Fallible fd_table snapshot (bounded by MAX_FD).
-        let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> = if flags & CLONE_FILES != 0 {
+        let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> = {
             let mut snap = Vec::new();
             if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
                 drop(parent);
@@ -4881,8 +4881,6 @@ fn sys_clone(
                 return Err(SyscallError::ENOMEM);
             }
             snap
-        } else {
-            Vec::new()
         };
 
         // R169-L1 FIX: Snapshot cloexec_fds under the parent lock too (fallibly,
@@ -4891,7 +4889,7 @@ fn sys_clone(
         // bypass that diverges from fork.rs). Reading parent.cloexec_fds at the
         // child-setup site would re-acquire the parent lock = R133-5 child->parent
         // inversion; the bounded set is rebuilt into the child OUTSIDE the lock.
-        let cloexec_snapshot: Vec<i32> = if flags & CLONE_FILES != 0 {
+        let cloexec_snapshot: Vec<i32> = {
             let mut snap = Vec::new();
             if snap.try_reserve_exact(parent.cloexec_fds.len()).is_err() {
                 drop(parent);
@@ -4900,8 +4898,6 @@ fn sys_clone(
             }
             snap.extend(parent.cloexec_fds.iter().copied());
             snap
-        } else {
-            Vec::new()
         };
 
         let cap_clone = if flags & CLONE_THREAD != 0 {
@@ -5666,7 +5662,7 @@ fn sys_clone(
 
         // R133-5 FIX: Use pre-captured fd_table snapshot instead of re-acquiring
         // parent lock (which would create child→parent lock order inversion).
-        if flags & CLONE_FILES != 0 {
+        {
             // R180-7/R180-19: admit both retained containers before consuming
             // any descriptor clone. Publication below is allocation-free; on
             // refusal the snapshots are dropped only after the PCB lock.
@@ -10722,6 +10718,10 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 ///
 /// Number of bytes read or errno
 fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
+    if lookup_console_file(fd)?.is_some() {
+        return Err(SyscallError::ESPIPE);
+    }
+
     // Validate offset (must be non-negative)
     if offset < 0 {
         return Err(SyscallError::EINVAL);
@@ -10774,6 +10774,10 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResul
 ///
 /// Number of bytes written or errno
 fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallResult {
+    if lookup_console_file(fd)?.is_some() {
+        return Err(SyscallError::ESPIPE);
+    }
+
     // Validate offset (must be non-negative)
     if offset < 0 {
         return Err(SyscallError::EINVAL);
@@ -10811,11 +10815,24 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallRe
 ///
 /// 回调返回的 bytes_read 必须 clamp 到请求的 count，防止恶意/错误回调
 /// 返回超大值导致切片越界 panic。
+fn lookup_console_file(fd: i32) -> Result<Option<crate::process::ConsoleFile>, SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+    let descriptor = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    Ok(descriptor
+        .as_any()
+        .downcast_ref::<crate::process::ConsoleFile>()
+        .copied())
+}
+
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1000); // sys_read entry
     }
+
+    let console = lookup_console_file(fd)?;
 
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
@@ -10830,7 +10847,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // stdin (fd 0): 从键盘缓冲区读取字符
     // R23-5 fix: 阻塞模式 - 如果没有输入则等待
     // 使用 prepare-check-finish 模式避免丢失唤醒竞态
-    if fd == 0 {
+    if let Some(console) = console {
+        if !console.readable {
+            return Err(SyscallError::EBADF);
+        }
         #[cfg(feature = "kcov")]
         {
             coverage::trace_pc(1001); // sys_read stdin path
@@ -10893,15 +10913,6 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         }
     }
 
-    // stdout/stderr 不支持读取
-    if fd == 1 || fd == 2 {
-        #[cfg(feature = "kcov")]
-        {
-            coverage::trace_pc(1002); // sys_read stdout/stderr error path
-        }
-        return Err(SyscallError::EBADF);
-    }
-
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1003); // sys_read fd callback path
@@ -10943,6 +10954,8 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         coverage::trace_pc(1010); // sys_write entry
     }
 
+    let console = lookup_console_file(fd)?;
+
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
         0 => return Ok(0),
@@ -10961,7 +10974,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // stdout(1)/stderr(2): 直接打印
     // R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
     // Display valid UTF-8 as text; replace invalid sequences with U+FFFD.
-    if fd == 1 || fd == 2 {
+    if let Some(console) = console {
+        if console.readable {
+            return Err(SyscallError::EBADF);
+        }
         #[cfg(feature = "kcov")]
         {
             coverage::trace_pc(1011); // sys_write stdout/stderr path
@@ -10994,13 +11010,6 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
             }
         }
         Ok(tmp.len())
-    } else if fd == 0 {
-        #[cfg(feature = "kcov")]
-        {
-            coverage::trace_pc(1012); // sys_write stdin error path
-        }
-        // stdin 不支持写入
-        Err(SyscallError::EBADF)
     } else {
         #[cfg(feature = "kcov")]
         {
@@ -11591,31 +11600,7 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
     }
 
     // 获取 stat 数据
-    let stat = if fd <= 2 {
-        // 标准流返回字符设备模式 (S_IFCHR | 0666)
-        VfsStat {
-            dev: 0,
-            ino: fd as u64,
-            nlink: 1,
-            mode: 0o020000 | 0o666, // S_IFCHR | rw-rw-rw-
-            uid: 0,
-            gid: 0,
-            pad0: 0,
-            rdev: 0,
-            size: 0,
-            blksize: 4096,
-            blocks: 0,
-            atime_sec: 0,
-            atime_nsec: 0,
-            mtime_sec: 0,
-            mtime_nsec: 0,
-            ctime_sec: 0,
-            ctime_nsec: 0,
-            unused0: 0,
-            unused1: 0,
-            unused2: 0,
-        }
-    } else {
+    let stat = {
         // R41-1 FIX: 查询 fd 对象获取真实元数据
         let pid = current_pid().ok_or(SyscallError::ESRCH)?;
         let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -11655,8 +11640,8 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
 /// 成功返回新的偏移位置，失败返回错误码
 fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     // 标准流不支持 seek
-    if fd < 3 {
-        return Err(SyscallError::EINVAL);
+    if lookup_console_file(fd)?.is_some() {
+        return Err(SyscallError::ESPIPE);
     }
 
     // 验证 whence 参数
@@ -11704,14 +11689,6 @@ fn sys_close(fd: i32) -> SyscallResult {
     }
 
     // 标准流不能关闭（简化实现）
-    if fd <= 2 {
-        #[cfg(feature = "kcov")]
-        {
-            coverage::trace_pc(1031); // sys_close stdio error path
-        }
-        return Err(SyscallError::EBADF);
-    }
-
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1032); // sys_close callback path
@@ -11741,20 +11718,7 @@ fn sys_close(fd: i32) -> SyscallResult {
 /// # Returns
 /// 当前始终返回 ENOTTY（不是终端设备）
 fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
-    // 验证 fd 有效性
-    if fd < 0 {
-        return Err(SyscallError::EBADF);
-    }
-
-    // 标准流始终有效，其他 fd 需要检查
-    if fd > 2 {
-        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-        let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-        let proc = process.lock();
-        if proc.get_fd(fd).is_none() {
-            return Err(SyscallError::EBADF);
-        }
-    }
+    let console = lookup_console_file(fd)?;
 
     // M0-6 SLICE 5+: Basic termios support for stdin/stdout/stderr
     // Common ioctl commands for terminal control
@@ -11767,7 +11731,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
     const FIONREAD: u64 = 0x541B; // Bytes available to read
 
     match cmd {
-        TCGETS if fd <= 2 => {
+        TCGETS if console.is_some() => {
             // Return minimal termios structure for stdin/stdout/stderr
             // struct termios is 60 bytes on x86_64
             if arg == 0 {
@@ -11779,7 +11743,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
-        TCSETS | TCSETSW | TCSETSF if fd <= 2 => {
+        TCSETS | TCSETSW | TCSETSF if console.is_some() => {
             // Accept termios settings but don't actually apply them
             // (no real terminal to configure)
             if arg == 0 {
@@ -11791,7 +11755,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
-        TIOCGWINSZ if fd <= 2 => {
+        TIOCGWINSZ if console.is_some() => {
             // Return default window size (80x24)
             // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } = 8 bytes (4 u16s)
             if arg == 0 {
@@ -11805,7 +11769,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
-        TIOCSWINSZ if fd <= 2 => {
+        TIOCSWINSZ if console.is_some() => {
             // Accept window size but don't store it
             if arg == 0 {
                 return Err(SyscallError::EFAULT);
@@ -11815,7 +11779,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
-        FIONREAD if fd == 0 => {
+        FIONREAD if console.is_some_and(|console| console.readable) => {
             // M0-6 poll/select: report the real count of buffered stdin bytes
             // (non-consuming keyboard probe), consistent with poll(fd0, POLLIN).
             if arg == 0 {
@@ -21113,20 +21077,19 @@ struct PollEntry {
     kind: FdKind,
 }
 
-/// Classify one fd under the Process lock. Special-cases 0/1/2 FIRST to match
-/// sys_read (fd 0 → keyboard, syscall.rs) / sys_write (fd 1/2 → console) routing:
-/// those std streams are NOT consulted in fd_table by read/write, so a dup2 onto
-/// 0-2 installs a dead entry — poll must agree with what read/write will do, else
-/// poll could report a dup2'd pipe ready while read(0) blocks on the keyboard.
 fn poll_classify(p: &crate::process::Process, fd: i32) -> FdKind {
     if fd < 0 {
         return FdKind::Skip;
     }
-    if fd == 0 {
-        return FdKind::Stdin;
-    }
-    if fd == 1 || fd == 2 {
-        return FdKind::ConsoleOut;
+    if let Some(console) = p
+        .get_fd(fd)
+        .and_then(|ops| ops.as_any().downcast_ref::<crate::process::ConsoleFile>())
+    {
+        return if console.readable {
+            FdKind::Stdin
+        } else {
+            FdKind::ConsoleOut
+        };
     }
     match p.get_fd(fd) {
         None => FdKind::Nval,

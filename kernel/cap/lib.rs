@@ -785,18 +785,7 @@ impl CapTable {
                     "R172-06: capability free-list capacity invariant violated"
                 );
 
-                let revoked = (0..inner.slots.len()).find_map(|idx| {
-                    let revoke = inner.slots[idx]
-                        .as_ref()
-                        .is_some_and(|slot| !slot.entry.inherits_on_exec());
-                    if !revoke {
-                        return None;
-                    }
-                    let old_slot = inner.slots[idx].take()?;
-                    inner.free.push(idx as u16);
-                    Some(old_slot)
-                });
-                revoked
+                inner.take_cloexec_slot()
             });
 
             let Some(old_slot) = revoked else { break };
@@ -834,6 +823,16 @@ impl Default for CapTable {
 }
 
 impl CapTableInner {
+    fn take_cloexec_slot(&mut self) -> Option<CapSlot> {
+        let index = self.slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| !slot.entry.inherits_on_exec())
+        })?;
+        let old_slot = self.slots[index].take()?;
+        self.free.push(index as u16);
+        Some(old_slot)
+    }
+
     fn try_with_capacity(capacity: usize) -> Result<Self, CapError> {
         let capacity = capacity.min(MAX_CAP_SLOTS);
         let mut slots = prepare_cap_vec::<Option<CapSlot>>(capacity)?;
@@ -1237,6 +1236,52 @@ mod tests {
         fn type_name(&self) -> &'static str {
             "MockFile"
         }
+    }
+
+    #[test]
+    fn ksa005_exec_preserves_unflagged_fd_caps_and_revokes_native_cloexec() {
+        let mut inner = CapTableInner::with_capacity(4);
+        let file = inner
+            .allocate(CapEntry::with_flags(
+                CapObject::RegularFile(RegularFile {
+                    inode_id: 7,
+                    fs_id: 1,
+                }),
+                CapRights::READ,
+                CapFlags::empty(),
+            ))
+            .unwrap();
+        // A delegated regular-file capability can have native CLOEXEC even
+        // without a descriptor. Its object type must not bypass revocation.
+        let native_file = inner
+            .allocate(CapEntry::with_flags(
+                CapObject::RegularFile(RegularFile {
+                    inode_id: 9,
+                    fs_id: 1,
+                }),
+                CapRights::READ,
+                CapFlags::CLOEXEC,
+            ))
+            .unwrap();
+        let non_fd = inner
+            .allocate(CapEntry::with_flags(
+                CapObject::Process(8),
+                CapRights::SIGNAL,
+                CapFlags::CLOEXEC,
+            ))
+            .unwrap();
+        inner.lookup(file).unwrap().increment_refcount();
+        assert!(inner.take_cloexec_slot().is_some());
+        assert!(inner.take_cloexec_slot().is_some());
+        assert!(inner.lookup(native_file).is_err());
+        assert!(inner.lookup(non_fd).is_err());
+        assert!(inner.take_cloexec_slot().is_none());
+        assert_eq!(inner.lookup(file).unwrap().refcount(), 2);
+        assert!(!inner.lookup(file).unwrap().decrement_refcount());
+        assert_eq!(inner.lookup(file).unwrap().refcount(), 1);
+        assert!(inner.lookup(file).unwrap().decrement_refcount());
+        inner.revoke(file).unwrap();
+        assert!(inner.lookup(file).is_err());
     }
 
     #[test]
