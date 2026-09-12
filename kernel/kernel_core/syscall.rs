@@ -11468,6 +11468,13 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 /// buffer is retained as defense-in-depth.
 #[inline]
 fn copy_vfs_stat_to_user(user_dst: *mut VfsStat, stat: &VfsStat) -> Result<(), SyscallError> {
+    let process =
+        get_process(current_pid().ok_or(SyscallError::ESRCH)?).ok_or(SyscallError::ESRCH)?;
+    let namespace = process.lock().user_ns.clone();
+    let mut mapped = *stat;
+    mapped.uid = namespace.map_uid_to_ns(stat.uid).unwrap_or(65534);
+    mapped.gid = namespace.map_gid_to_ns(stat.gid).unwrap_or(65534);
+    let stat = &mapped;
     let mut buf = [0u8; mem::size_of::<VfsStat>()];
 
     macro_rules! put {
@@ -17111,71 +17118,16 @@ fn sys_renameat2(
 ///
 /// mode: R_OK(4) | W_OK(2) | X_OK(1) | F_OK(0)
 fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
+    if mode & !7 != 0 {
+        return Err(SyscallError::EINVAL);
+    }
     if path.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
     let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
     let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
-
-    // 通过回调获取文件状态
-    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    let stat = stat_fn(path_str)?;
-
-    // R130-7 FIX: Invoke LSM MAC hook before DAC permission check.
-    // Without this, a MAC-denied file that is DAC-accessible can be probed
-    // via access() without MAC intervention — inconsistent with enforcement
-    // at real operations (open, read, write, unlink).
-    // R131-7 FIX: LSM hook is now checked for ALL modes including F_OK (mode==0).
-    // Previously, F_OK returned early before reaching this hook, allowing
-    // file existence probes to bypass MAC policy.
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let access_mask = (mode as u32) & 0x7; // R_OK=4, W_OK=2, X_OK=1
-        if let Err(err) = lsm::hook_file_permission(&proc_ctx, stat.ino, access_mask) {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
-
-    // F_OK(0) - 仅检查文件是否存在 (after LSM check)
-    if mode == 0 {
-        return Ok(0);
-    }
-
-    // 获取当前进程凭证
-    // R93-4 FIX: Fail-closed - return ESRCH if credentials unavailable (was unwrap_or(0))
-    // R135-1 FIX: Use host-mapped credentials for DAC checks in sys_access.
-    // Namespace euid/egid must NOT be compared against host inode UIDs/GIDs.
-    let euid = crate::current_host_euid().ok_or(SyscallError::ESRCH)?;
-    let egid = crate::current_host_egid().ok_or(SyscallError::ESRCH)?;
-    let supplementary_match = crate::current_in_host_supplementary_group(stat.gid).unwrap_or(false);
-
-    // root用户拥有所有权限
-    if euid == 0 {
-        return Ok(0);
-    }
-
-    // 计算权限位
-    let perm_bits = if euid == stat.uid {
-        (stat.mode >> 6) & 0o7
-    } else if egid == stat.gid || supplementary_match {
-        (stat.mode >> 3) & 0o7
-    } else {
-        stat.mode & 0o7
-    };
-
-    let need_read = (mode & 4) != 0;
-    let need_write = (mode & 2) != 0;
-    let need_exec = (mode & 1) != 0;
-
-    let ok = (!need_read || (perm_bits & 0o4) != 0)
-        && (!need_write || (perm_bits & 0o2) != 0)
-        && (!need_exec || (perm_bits & 0o1) != 0);
-
-    if ok {
-        Ok(0)
-    } else {
-        Err(SyscallError::EACCES)
-    }
+    (crate::fs_context::callbacks()?.access)(path_str, mode)?;
+    Ok(0)
 }
 
 /// sys_lstat - 获取符号链接状态
