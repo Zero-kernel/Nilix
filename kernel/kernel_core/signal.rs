@@ -398,13 +398,8 @@ pub fn apply_sigprocmask(old: u64, how: i32, set: u64) -> u64 {
     next & !uncatchable_mask()
 }
 
-/// Monotonic global hint: set once ANY process installs a real signal handler. The
-/// per-syscall-return delivery hook reads this LOCK-FREE and skips ALL work while it
-/// is false — and the musl/native-hello gate path never installs a handler, so its
-/// hot path stays a single relaxed atomic load. Monotonic (never reset) so it needs
-/// no fork/exec/exit bookkeeping; the only cost is that after the first handler
-/// install in a boot, every syscall return takes the (uncontended) process lock to
-/// scan for a deliverable signal — acceptable, and never on the no-handler gate.
+/// Monotonic hint for handler-frame preparation only. Default-signal delivery
+/// and temporary-mask restoration must never be skipped based on this hint.
 static ANY_HANDLER_INSTALLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -414,50 +409,174 @@ pub fn note_handler_installed() {
     ANY_HANDLER_INSTALLED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Lock-free fast-path gate for the syscall-return delivery hook.
+/// Lock-free hint for handler-frame preparation only.
 #[inline]
 pub fn any_handler_installed() -> bool {
     ANY_HANDLER_INSTALLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// M0-5 sub-slice 1b: pure predicate — is a HANDLER signal deliverable to a task with this
-/// (pending, blocked, in_handler, sigactions) snapshot? HANDLER-ONLY by design:
-/// * A no-handler catchable signal (e.g. Default(Terminate)) to a blocked task is ALREADY
-///   wake+terminated by the KILL leg (send_signal sets terminate_code -> request_process_exit
-///   flips Blocked->Ready + sets pending_kill -> wait_should_abort fires), so Handler-only is
-///   both correct AND complete — NOT a gap.
-/// * `in_handler` => false: never EINTR-wake (or deliver) while a handler frame is live
-///   (mirrors maybe_deliver_signal's serialize-defer; anti-spurious-EINTR, LOAD-BEARING).
-/// * `& !uncatchable_mask()`: send_signal sets the pending bit for SIGKILL too and SIGKILL is
-///   force-stripped from `blocked`, so a SIGKILL bit IS in `pending & !blocked` — it MUST be
-///   masked out here so it takes the kill leg, never the signal-EINTR leg.
-/// Resolves the LOWEST deliverable bit's disposition (bit-for-bit congruent with
-/// maybe_deliver_signal Phase-1) so the send-side wake and the wait-site epilogue agree.
+#[derive(Clone, Copy)]
+pub(crate) enum DeliveryMode {
+    HandlerOnly,
+    AnyActionable,
+}
+
+/// Select real work without allowing an inert low bit to starve another signal.
+/// Callers supply a coherent PCB-locked snapshot. Handler recursion is deferred;
+/// an unblocked default terminate/stop remains actionable during a handler.
+pub(crate) fn select_for_delivery(
+    pending: u64,
+    blocked: u64,
+    in_handler: bool,
+    sigactions: &[SigAction; NSIG],
+    mode: DeliveryMode,
+) -> Option<Signal> {
+    let mut candidates = pending & !(blocked & !uncatchable_mask());
+    while let Some(signal) = select_lowest_deliverable(candidates) {
+        candidates &= !signal.bit();
+        match resolve_disposition(sigactions, signal) {
+            Disposition::Handler { .. } if !in_handler => return Some(signal),
+            Disposition::Default(SignalAction::Terminate | SignalAction::Stop)
+                if matches!(mode, DeliveryMode::AnyActionable) =>
+            {
+                return Some(signal)
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Revalidate a previously selected default at the PCB-locked commit point.
+/// A concurrent SIGCONT can have cancelled a pending stop since selection.
+pub(crate) fn pending_default_action(
+    pending: u64,
+    blocked: u64,
+    sigactions: &[SigAction; NSIG],
+    signal: Signal,
+) -> Option<SignalAction> {
+    if pending & signal.bit() == 0 || blocked & signal.bit() & !uncatchable_mask() != 0 {
+        return None;
+    }
+    match resolve_disposition(sigactions, signal) {
+        Disposition::Default(action) => Some(action),
+        _ => None,
+    }
+}
+
+pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
+    let mut candidates = proc.pending_signals.bits() & !proc.blocked;
+    while let Some(signal) = select_lowest_deliverable(candidates) {
+        candidates &= !signal.bit();
+        if matches!(
+            resolve_disposition(&proc.sigactions, signal),
+            Disposition::Ignored
+                | Disposition::Default(SignalAction::Ignore | SignalAction::Continue)
+        ) {
+            proc.pending_signals.clear(signal);
+        }
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_defaults_wait_until_unmask_without_any_handler() {
+        let actions = default_sigactions();
+        for sig in [Signal::SIGTERM, Signal::SIGTSTP] {
+            assert_eq!(
+                select_for_delivery(
+                    sig.bit(),
+                    sig.bit(),
+                    false,
+                    &actions,
+                    DeliveryMode::AnyActionable
+                ),
+                None
+            );
+            assert_eq!(
+                select_for_delivery(sig.bit(), 0, false, &actions, DeliveryMode::AnyActionable),
+                Some(sig)
+            );
+        }
+        assert_eq!(
+            apply_sigprocmask(0, SIG_BLOCK, u64::MAX) & uncatchable_mask(),
+            0
+        );
+    }
+
+    #[test]
+    fn ignored_and_default_bits_do_not_starve_irq_handlers() {
+        let mut actions = default_sigactions();
+        actions[0].handler = SIG_IGN;
+        actions[(Signal::SIGUSR1.as_u8() - 1) as usize].handler = 0x400000;
+        let pending = Signal::SIGHUP.bit() | Signal::SIGUSR1.bit() | Signal::SIGKILL.bit();
+        assert_eq!(
+            select_for_delivery(pending, 0, false, &actions, DeliveryMode::HandlerOnly),
+            Some(Signal::SIGUSR1)
+        );
+    }
+
+    #[test]
+    fn live_handler_defers_caught_signal_but_not_unblocked_default() {
+        let mut actions = default_sigactions();
+        actions[(Signal::SIGUSR1.as_u8() - 1) as usize].handler = 0x400000;
+        let pending = Signal::SIGUSR1.bit() | Signal::SIGTERM.bit();
+        assert_eq!(
+            select_for_delivery(pending, 0, true, &actions, DeliveryMode::AnyActionable),
+            Some(Signal::SIGTERM)
+        );
+        assert_eq!(
+            select_for_delivery(
+                pending,
+                Signal::SIGTERM.bit(),
+                true,
+                &actions,
+                DeliveryMode::AnyActionable
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cancelled_or_remasked_stop_is_rejected_at_commit() {
+        let actions = default_sigactions();
+        let stop = Signal::SIGTSTP;
+        assert_eq!(
+            pending_default_action(stop.bit(), 0, &actions, stop),
+            Some(SignalAction::Stop)
+        );
+        assert_eq!(pending_default_action(0, 0, &actions, stop), None);
+        assert_eq!(
+            pending_default_action(stop.bit(), stop.bit(), &actions, stop),
+            None
+        );
+    }
+}
+
+/// A blocked syscall must unwind for caught signals or catchable default
+/// terminate/stop actions. Uncatchables retain their dedicated kill/stop path.
+/// An inert low bit cannot hide later actionable work.
 fn signal_is_deliverable(
     pending: u64,
     blocked: u64,
     in_handler: bool,
     sigactions: &[SigAction; NSIG],
 ) -> bool {
-    if in_handler {
-        return false;
-    }
-    // Site A (R172-P6-F1): mask uncatchables BEFORE the shared pick — a lone pending
-    // SIGKILL/SIGSTOP must NOT be reported deliverable here (it takes the kill / stop leg,
-    // never the handler-EINTR leg). The bit-pick is the SAME primitive Site B uses.
-    let sig = match select_lowest_deliverable(pending & !blocked & !uncatchable_mask()) {
-        Some(s) => s,
-        None => return false,
-    };
-    matches!(
-        resolve_disposition(sigactions, sig),
-        Disposition::Handler { .. }
+    select_for_delivery(
+        pending & !uncatchable_mask(),
+        blocked,
+        in_handler,
+        sigactions,
+        DeliveryMode::AnyActionable,
     )
+    .is_some()
 }
 
-/// M0-5 sub-slice 1b: does `pid` have a deliverable HANDLER signal pending? Called by the
-/// blocking wait sites to decide an EINTR-wake. Lock-free fast-path FIRST (no proc lock on
-/// the no-handler musl/native boot — a single relaxed load), then ONE proc-lock snapshot.
+/// Does this task have an actionable catchable signal that should unwind a
+/// blocking syscall? Includes defaults and caught handlers; snapshots the PCB.
 ///
 /// # Lock Contract (R177-D4)
 ///
@@ -475,9 +594,6 @@ fn signal_is_deliverable(
 ///
 /// See [`has_deliverable_signal_locked`] for the lock-free variant when the guard is already held.
 pub fn has_deliverable_signal(pid: ProcessId) -> bool {
-    if !any_handler_installed() {
-        return false;
-    }
     let arc = match process::get_process(pid) {
         Some(a) => a,
         None => return false,
@@ -486,13 +602,9 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
     has_deliverable_signal_locked(&proc)
 }
 
-/// M0-6 poll/select: the handler-deliverable check over an ALREADY-HELD `&Process`
-/// guard (no re-lock). Mirrors `should_abort_pending_block`'s `&Process` shape so a
-/// caller holding the proc lock — ppoll/pselect6's sigmask restore-or-stash — can
-/// decide WITHOUT the self-deadlocking `get_process().lock()` re-entry of
-/// `has_deliverable_signal`. Handler-only (uncatchables/kills excluded via
-/// `signal_is_deliverable`, in-handler-gated); the monotonic fast-path is kept so
-/// the no-handler caller pays a single relaxed load.
+/// Check actionable catchable signals through an already-held PCB guard.
+/// No additional lock is taken. Defaults remain actionable during a handler;
+/// caught signals follow the existing no-nested-handler-frame policy.
 ///
 /// # Lock Contract (R177-D4)
 ///
@@ -518,9 +630,6 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
 ///
 /// See [`has_deliverable_signal`] for the self-locking variant when no guard is held.
 pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
-    if !any_handler_installed() {
-        return false;
-    }
     signal_is_deliverable(
         proc.pending_signals.bits(),
         proc.blocked,
@@ -822,7 +931,6 @@ fn send_signal_inner(
     let mut needs_reschedule = false;
     let mut terminate_code: Option<i32> = None;
     let mut fatal_post = process::FatalExitPost::None;
-    let mut needs_resume = false;
     let target_generation;
     // M0-5 sub-slice 1b: set when the EINTR-wake flips a blocked target Ready, so we
     // broadcast a reschedule kick AFTER releasing the proc lock.
@@ -879,9 +987,6 @@ fn send_signal_inner(
                 // point and run its handler (otherwise it would be stranded stopped
                 // forever). Resume, but DO NOT clear the pending bit — the handler
                 // needs it.
-                if signal.is_continue() && (proc.stopped || proc.state == ProcessState::Stopped) {
-                    needs_resume = true;
-                }
                 // M0-5 sub-slice 1b: EINTR-wake a target BLOCKED in a syscall so it unwinds
                 // to its syscall-return tail and returns EINTR (the handler then delivers at
                 // its NEXT syscall entry — 1a re-establishes the per-CPU frame there). Routed
@@ -906,6 +1011,12 @@ fn send_signal_inner(
                 // Explicitly ignored — drop it.
                 proc.pending_signals.clear(signal);
             }
+            Disposition::Default(_)
+                if proc.blocked & signal.bit() != 0 && uncatchable_mask() & signal.bit() == 0 =>
+            {
+                // Delivery is deferred. SIGCONT's generation-time resume is
+                // committed below regardless of its mask or disposition.
+            }
             Disposition::Default(default) => match default {
                 SignalAction::Terminate => {
                     let code = signal_exit_code(signal);
@@ -920,30 +1031,26 @@ fn send_signal_inner(
                     // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
                     // Do NOT overwrite Blocked/Sleeping, or we lose the wait condition
                     // and break wait queue invariants (H-34 lost wakeup fix).
-                    let was_running = proc.state == ProcessState::Running;
                     // RF178-35 FIX: a lock-serialized fatal publication wins over
                     // a later stop and cannot be stranded again.
                     if process::try_mark_job_control_stopped_locked(&mut proc) {
-                        if was_running && process::current_pid() == Some(pid) {
+                        if process::current_pid() == Some(pid) {
                             needs_reschedule = true;
                         }
-                    } else {
-                        proc.pending_signals.clear(signal);
                     }
+                    proc.pending_signals.clear(signal);
                 }
                 SignalAction::Continue => {
-                    // R98-1 FIX: Handle SIGCONT via the scheduler resume callback.
-                    // Check (but do not clear) `stopped`; resume_stopped() clears it
-                    // atomically. Check BOTH the orthogonal flag and the legacy state.
-                    if proc.stopped || proc.state == ProcessState::Stopped {
-                        needs_resume = true;
-                    }
+                    // Generation-time resume is committed below under this guard.
                     proc.pending_signals.clear(signal);
                 }
                 SignalAction::Ignore => {
                     proc.pending_signals.clear(signal);
                 }
             },
+        }
+        if signal.is_continue() {
+            needs_kick |= process::resume_job_control_locked(&mut proc, pid, target_generation);
         }
     } // Release process lock before calling scheduler functions
 
@@ -971,21 +1078,18 @@ fn send_signal_inner(
         }
     }
 
-    // Resume the exact resident PCB in place; no PID lookup or queue move.
-    if needs_resume {
-        kernel_resume_stopped(process_arc.clone(), pid, target_generation);
-    }
-
-    // Trigger reschedule if needed
-    if needs_reschedule {
-        crate::scheduler_hook::force_reschedule();
-    }
-
     // M0-5 sub-slice 1b: the EINTR-wake flipped a blocked target Ready on (typically) another
     // CPU. Broadcast a reschedule IPI so the queue-owning CPU re-selects it promptly rather
     // than only at its next timer tick. No-op until the scheduler registers the callback.
     if needs_kick {
         kernel_kick_reschedule();
+    }
+
+    // A single scheduler attempt can return without a switch. In particular,
+    // a just-woken syscall may be Ready+on_cpu; it must not bypass self-stop.
+    drop(process_arc);
+    if needs_reschedule {
+        process::wait_for_job_control_resume(pid, target_generation);
     }
 
     Ok(action)
@@ -1138,10 +1242,8 @@ pub fn run_signal_self_test() {
         "default table is all SIG_DFL"
     );
 
-    // M0-5 sub-slice 1b: signal_is_deliverable decision table. `table` has SIGUSR1=Handler,
-    // SIGUSR2=SIG_IGN; `clean` is all-SIG_DFL. These rows are the build-time guard that the
-    // EINTR-wake predicate stays Handler-only, uncatchable-masked, mask/in-handler-aware, and
-    // lowest-bit-resolving (congruent with maybe_deliver_signal Phase-1).
+    // The production wait predicate includes unblocked catchable defaults,
+    // excludes uncatchables, and applies the non-nested handler-frame policy.
     let clean = default_sigactions();
     let usr1 = Signal::SIGUSR1.bit();
     // (a) in_handler => defer (anti-spurious-EINTR).
@@ -1164,15 +1266,15 @@ pub fn run_signal_self_test() {
         !signal_is_deliverable(Signal::SIGUSR2.bit(), 0, false, &table),
         "SIG_IGN => false"
     );
-    // (e) Default(Terminate) SIGTERM => false (Handler-only scope; the KILL leg handles it).
+    // (e) An unblocked default SIGTERM needs safe-point processing.
     assert!(
-        !signal_is_deliverable(Signal::SIGTERM.bit(), 0, false, &clean),
-        "Default(Terminate) => false"
+        signal_is_deliverable(Signal::SIGTERM.bit(), 0, false, &clean),
+        "Default(Terminate) requires safe-point delivery"
     );
-    // (f) Default(Stop) SIGTSTP => false.
+    // (f) An unblocked default SIGTSTP needs safe-point processing.
     assert!(
-        !signal_is_deliverable(Signal::SIGTSTP.bit(), 0, false, &clean),
-        "Default(Stop) => false"
+        signal_is_deliverable(Signal::SIGTSTP.bit(), 0, false, &clean),
+        "Default(Stop) requires safe-point delivery"
     );
     // (g) Default(Continue) SIGCONT => false.
     assert!(
@@ -1184,12 +1286,10 @@ pub fn run_signal_self_test() {
         !signal_is_deliverable(usr1, usr1, false, &table),
         "blocked handler => false"
     );
-    // (i) lowest-bit precedence: a LOWER default-terminate bit (SIGHUP=1) + a HIGHER handler
-    //     bit (SIGUSR1) resolves the LOW bit (not Handler) => false. Proves the send-side wake
-    //     and the wait-site epilogue agree on the lowest deliverable bit (no socket lost-wakeup).
+    // (i) A lower default-terminate bit is also actionable.
     assert!(
-        !signal_is_deliverable((1u64 << 0) | usr1, 0, false, &table),
-        "lowest-bit precedence: low default bit wins => false"
+        signal_is_deliverable((1u64 << 0) | usr1, 0, false, &table),
+        "lowest default bit remains actionable"
     );
     // (j) a SIGKILL bit IS in pending&!blocked (send_signal sets it; SIGKILL is unblockable),
     //     but the uncatchable mask-out keeps it off the signal-EINTR leg.
@@ -1198,9 +1298,7 @@ pub fn run_signal_self_test() {
         "SIGKILL masked out of the deliverable set"
     );
 
-    // R172-P6-F1: pin the SHARED selector AND the intentional Site-A vs Site-B mask
-    // divergence so a future re-fork fails the suite (the green musl boot can't catch it —
-    // no-handler boot never runs either selector).
+    // The bit primitive and explicit uncatchable filtering remain shared.
     // (k) empty set => None.
     assert!(
         select_lowest_deliverable(0).is_none(),

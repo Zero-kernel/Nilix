@@ -4408,16 +4408,13 @@ pub fn syscall_dispatcher(
         Err(err) => err.as_i64(),
     };
 
-    // M0 item 5 (sub-slice 1a): deliver one pending handler signal at this
-    // syscall-return safe point — STRICTLY AFTER the pending-kill check so SIGKILL
-    // always wins. No-op fast path (a single relaxed atomic load) when the process
-    // has no installed handlers (the musl/native-hello gate path). May not return
-    // (fatal SIGSEGV on an unbuildable frame, or a SIGKILL that raced the commit).
+    // Deliver an actionable signal after pending-kill handling, including
+    // unblocked defaults in tasks that never registered a handler. May not return.
     if let Some(pid) = current_pid() {
         maybe_deliver_signal(pid, ret_val);
         // M0-6 poll/select: restore a ppoll/pselect6 temporary sigmask on every
         // no-delivery path (maybe_deliver_signal consumes the stash when it DOES
-        // deliver). No-op single atomic load when no handler is installed.
+        // deliver). This also covers defaults and tasks without caught handlers.
         poll_restore_sigmask_tail(pid);
     }
 
@@ -8495,31 +8492,48 @@ fn sys_rt_sigreturn() -> SyscallResult {
 /// to default by `rt_sigaction`/`exec` before the safe point drained it. Mirrors
 /// `send_signal_inner`'s send-time default executor.
 fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
-    use crate::signal::{default_action, signal_exit_code, SignalAction};
-    match default_action(sig) {
-        SignalAction::Terminate => {
-            terminate_self_and_halt(pid, signal_exit_code(sig)); // no return
-        }
-        SignalAction::Stop => {
-            let stopped = if let Some(arc) = get_process(pid) {
-                let mut p = arc.lock();
-                // RF178-35 FIX: a fatal request published after the earlier
-                // dispatcher check still dominates this safe-point stop.
-                let stopped = crate::process::try_mark_job_control_stopped_locked(&mut p);
-                p.pending_signals.clear(sig);
-                stopped
-            } else {
-                false
-            };
-            if stopped {
-                crate::scheduler_hook::force_reschedule();
+    use crate::signal::{pending_default_action, signal_exit_code, SignalAction};
+    let Some(arc) = get_process(pid) else { return };
+    let mut stop = false;
+    let mut exit_code = None;
+    let generation;
+    {
+        let mut proc = arc.lock();
+        generation = proc.generation;
+        let Some(action) = pending_default_action(
+            proc.pending_signals.bits(),
+            proc.blocked,
+            &proc.sigactions,
+            sig,
+        ) else {
+            return;
+        };
+        proc.pending_signals.clear(sig);
+        match action {
+            SignalAction::Terminate => {
+                // Self-termination immediately follows after releasing all PCB owners.
+                let _ = crate::process::request_process_exit_locked(
+                    &mut proc,
+                    signal_exit_code(sig),
+                    crate::get_ticks(),
+                );
+                exit_code = Some(
+                    proc.pending_exit_code
+                        .load(core::sync::atomic::Ordering::Acquire),
+                );
             }
-        }
-        SignalAction::Continue | SignalAction::Ignore => {
-            if let Some(arc) = get_process(pid) {
-                arc.lock().pending_signals.clear(sig);
+            SignalAction::Stop => {
+                stop = crate::process::try_mark_job_control_stopped_locked(&mut proc);
             }
+            SignalAction::Continue | SignalAction::Ignore => {}
         }
+    }
+    drop(arc);
+    if let Some(code) = exit_code {
+        terminate_self_and_halt(pid, code);
+    }
+    if stop {
+        crate::process::wait_for_job_control_resume(pid, generation);
     }
 }
 
@@ -8736,13 +8750,7 @@ pub fn run_sigframe_stack_locator_self_test() {
 }
 
 fn maybe_deliver_signal(pid: ProcessId, result: i64) {
-    // Lock-free fast path FIRST: no handler installed anywhere yet => nothing to
-    // deliver. The musl / native-hello gate path takes EXACTLY one relaxed atomic
-    // load and returns — no `get_process`, no lock, zero per-syscall cost on the
-    // no-handler hot path (the global hint never trips on a no-handler boot).
-    if !crate::signal::any_handler_installed() {
-        return;
-    }
+    // Unblocked default actions remain deliverable even before any handler exists.
     let proc_arc = match get_process(pid) {
         Some(a) => a,
         None => return,
@@ -8751,7 +8759,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // Phase 1 (under the lock): select the lowest-numbered deliverable signal and
     // snapshot its disposition + the pre-delivery blocked mask.
     let (sig, handler, restorer, sa_mask, sa_flags, old_blocked) = {
-        let proc = proc_arc.lock();
+        let mut proc = proc_arc.lock();
         // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION (leg enforcement, the single delivery
         // choke point). Delivery here writes a sigframe against the INTERRUPTED user RSP
         // (ctx.rsp). After an exec that just swapped CR3 to the new image, that RSP is valid
@@ -8765,7 +8773,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         // mid-flight — exactly the sigframe-against-stale-RSP-on-the-new-AS corruption class it
         // pins. Fail CLOSED in release (DROP the delivery, leave the pending bit set for a
         // later post-exec attempt) rather than execute the corrupting copy_to_user. Cost: one
-        // bool read on a lock we already hold, only on the rare any_handler_installed() path.
+        // bool read on the held PCB lock before signal processing.
         if proc.exec_in_progress {
             klog_force!(
                 "FATAL-INVARIANT: maybe_deliver_signal reached with exec_in_progress set \
@@ -8779,17 +8787,15 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             );
             return;
         }
-        if proc.in_signal_handler {
-            return; // serialize: one live handler frame at a time (slice 1a).
-        }
-        // Site B (R172-P6-F1): UNMASKED input (no uncatchable mask) — DELIBERATELY, so a lone
-        // pending SIGKILL/SIGSTOP is still selected and routed into the `Default` arm below
-        // (apply_default_at_safepoint -> terminate / stop). Shares the lowest-bit pick with
-        // signal_is_deliverable (the wake-gate) via the single select_lowest_deliverable.
-        let sig = match crate::signal::select_lowest_deliverable(
-            proc.pending_signals.bits() & !proc.blocked,
+        crate::signal::discard_inert_pending(&mut proc);
+        let sig = match crate::signal::select_for_delivery(
+            proc.pending_signals.bits(),
+            proc.blocked,
+            proc.in_signal_handler,
+            &proc.sigactions,
+            crate::signal::DeliveryMode::AnyActionable,
         ) {
-            Some(s) => s,
+            Some(signal) => signal,
             None => return,
         };
         match crate::signal::resolve_disposition(&proc.sigactions, sig) {
@@ -8830,6 +8836,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
                 // (race: reset to SIG_DFL after queueing.) Re-resolve at delivery and
                 // apply the default — NEVER build a frame with a handler of 0.
                 drop(proc);
+                drop(proc_arc);
                 apply_default_at_safepoint(pid, sig); // may not return
                 return;
             }
@@ -9167,14 +9174,15 @@ pub fn try_deliver_signal_on_irq_return(
             return None; // Exec in flight — defer.
         }
 
-        // Select the lowest-priority deliverable handler signal.
-        // Compute the deliverable mask (pending & !blocked, with uncatchables removed).
-        let deliverable = proc_guard.pending_signals.bits()
-            & !proc_guard.blocked
-            & !crate::signal::uncatchable_mask();
-        let sig = match crate::signal::select_lowest_deliverable(deliverable) {
-            Some(s) => s,
-            None => return None, // No deliverable signal.
+        let sig = match crate::signal::select_for_delivery(
+            proc_guard.pending_signals.bits() & !crate::signal::uncatchable_mask(),
+            proc_guard.blocked,
+            proc_guard.in_signal_handler,
+            &proc_guard.sigactions,
+            crate::signal::DeliveryMode::HandlerOnly,
+        ) {
+            Some(signal) => signal,
+            None => return None,
         };
         let index = (sig.as_u8() - 1) as usize;
         let sa = proc_guard.sigactions[index];
@@ -21312,13 +21320,9 @@ fn poll_writeback_revents(fds: u64, entries: &[PollEntry]) -> Result<(), Syscall
 /// analog). Covers every no-delivery path: when the temp mask was left live for a
 /// signal that `maybe_deliver_signal` then did NOT deliver (in_signal_handler,
 /// Ignored/Default disposition race, stale-frame defer), the original mask stashed
-/// in `poll_restore_blocked` is restored here. Gated on the monotonic handler hint
-/// (the stash is only ever set when a handler signal was deliverable), so the
-/// no-handler hot path is a single relaxed atomic load.
+/// in `poll_restore_blocked` is restored here, including a pending default
+/// signal in a process that has never installed a handler.
 fn poll_restore_sigmask_tail(pid: ProcessId) {
-    if !crate::signal::any_handler_installed() {
-        return;
-    }
     if let Some(proc_arc) = get_process(pid) {
         let mut p = proc_arc.lock();
         if let Some(old) = p.poll_restore_blocked.take() {
