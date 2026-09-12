@@ -292,7 +292,7 @@ const LAPIC_CALIBRATION_WINDOW_MS: u32 = 10;
 #[inline]
 pub unsafe fn lapic_read(reg: u32) -> u32 {
     // R169-L7 FIX: read through the single authoritative base in `cpu_local`.
-    let base = cpu_local::lapic_mmio_base() as u64;
+    let base = cpu_local::lapic_mmio_base();
     let addr = (base + reg as u64) as *const u32;
     read_volatile(addr)
 }
@@ -305,7 +305,7 @@ pub unsafe fn lapic_read(reg: u32) -> u32 {
 #[inline]
 pub unsafe fn lapic_write(reg: u32, value: u32) {
     // R169-L7 FIX: write through the single authoritative base in `cpu_local`.
-    let base = cpu_local::lapic_mmio_base() as u64;
+    let base = cpu_local::lapic_mmio_base();
     let addr = (base + reg as u64) as *mut u32;
     write_volatile(addr, value);
 }
@@ -742,7 +742,26 @@ pub unsafe fn publish_lapic_state() {
         "publish_lapic_state: relocated LAPIC base {:#x} is unsupported",
         base
     );
-    cpu_local::set_lapic_mmio_base(base as u32);
+    // Memory initialization publishes a high-half alias. AP initialization
+    // revalidates the physical aperture without reverting that shared address.
+}
+
+/// Install the LAPIC alias inherited by all process kernel address spaces.
+///
+/// # Safety
+///
+/// BSP only, after page-table/allocator initialization and physical LAPIC
+/// validation, before creating peer roots or starting APs. The alias is permanent.
+pub unsafe fn map_lapic_mmio() -> Result<(), mm::MapError> {
+    use mm::page_table::{APIC_MMIO_SIZE, APIC_PHYS_ADDR, APIC_VIRT_ADDR};
+    mm::map_mmio(
+        x86_64::VirtAddr::new(APIC_VIRT_ADDR),
+        x86_64::PhysAddr::new(APIC_PHYS_ADDR),
+        APIC_MMIO_SIZE,
+        &mut mm::FrameAllocator::new(),
+    )?;
+    cpu_local::set_lapic_mmio_base(APIC_VIRT_ADDR);
+    Ok(())
 }
 
 /// Initialize the LAPIC for this CPU

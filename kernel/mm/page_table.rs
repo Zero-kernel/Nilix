@@ -130,8 +130,9 @@ pub struct TrackedTableRollback {
     /// roots copy upper entry-island entries by value, so detaching those tables
     /// without a global root registry would leave stale aliases.
     pub retained_count: usize,
-    /// Every tracked allocation was either reclaimed or proven reachable and
-    /// empty.  `false` requires fail-closed quarantine by the caller.
+    /// Every tracked allocation was either reclaimed or proven reachable with
+    /// no data leaves, including retained child tables. `false` requires
+    /// fail-closed quarantine by the caller.
     pub all_accounted: bool,
 }
 
@@ -584,6 +585,30 @@ impl PageTableManager {
             (0..tracked_len).find(|index| tracked[*index] == Some(frame))
         }
 
+        // KSA-001: a retained parent need not be structurally empty. Prove that
+        // each occupied entry names a retained, leaf-free child from the earlier
+        // pass at the correct level. Never follow or bless an unknown child,
+        // huge leaf, hidden non-present ownership, or a detached frame.
+        fn retained_children_only<const N: usize>(
+            table: &PageTable,
+            tracked: &[Option<PhysFrame<Size4KiB>>; N],
+            tracked_len: usize,
+            retained_levels: &[u8; N],
+            child_level: u8,
+        ) -> bool {
+            table.iter().all(|entry| {
+                entry.is_unused()
+                    || (entry.flags().contains(PageTableFlags::PRESENT)
+                        && !entry.flags().contains(PageTableFlags::HUGE_PAGE)
+                        && tracked_index(
+                            tracked,
+                            tracked_len,
+                            PhysFrame::containing_address(entry.addr()),
+                        )
+                        .is_some_and(|index| retained_levels[index] == child_level))
+            })
+        }
+
         if tracked_len > TRACKED || len == 0 || reclaimed.iter().any(Option::is_some) {
             return TrackedTableRollback {
                 reclaimed_count: 0,
@@ -605,6 +630,13 @@ impl PageTableManager {
                 valid = false;
             }
         }
+        if !valid {
+            return TrackedTableRollback {
+                reclaimed_count: 0,
+                retained_count: 0,
+                all_accounted: false,
+            };
+        }
 
         let start_u = start.as_u64();
         let Some(end_u) = (len as u64)
@@ -619,6 +651,7 @@ impl PageTableManager {
         };
 
         let mut accounted = [false; TRACKED];
+        let mut retained_levels = [0u8; TRACKED];
         let mut reclaimed_count = 0usize;
         let mut retained_count = 0usize;
         let mut detached_any = false;
@@ -646,7 +679,7 @@ impl PageTableManager {
                         let frame = PhysFrame::containing_address(pde.addr());
                         if let Some(index) = tracked_index(tracked, tracked_len, frame) {
                             let pt = &*phys_to_virt(pde.addr()).as_ptr::<PageTable>();
-                            if !empty(pt) {
+                            if accounted[index] || !empty(pt) {
                                 valid = false;
                             } else if let Some(output) =
                                 reclaimed.iter_mut().find(|slot| slot.is_none())
@@ -660,6 +693,7 @@ impl PageTableManager {
                                 // Still fully accounted: it remains reachable
                                 // and empty, and later stack mappings reuse it.
                                 accounted[index] = true;
+                                retained_levels[index] = 1;
                                 retained_count += 1;
                             }
                         }
@@ -691,7 +725,16 @@ impl PageTableManager {
                     let frame = PhysFrame::containing_address(pdpte.addr());
                     if let Some(index) = tracked_index(tracked, tracked_len, frame) {
                         let pd = &*phys_to_virt(pdpte.addr()).as_ptr::<PageTable>();
-                        if empty(pd) {
+                        if empty(pd)
+                            || (!detach_upper_tables
+                                && retained_children_only(
+                                    pd,
+                                    tracked,
+                                    tracked_len,
+                                    &retained_levels,
+                                    1,
+                                ))
+                        {
                             if !accounted[index] {
                                 if detach_upper_tables {
                                     if let Some(output) =
@@ -707,8 +750,11 @@ impl PageTableManager {
                                     }
                                 } else {
                                     accounted[index] = true;
+                                    retained_levels[index] = 2;
                                     retained_count += 1;
                                 }
+                            } else {
+                                valid = false;
                             }
                         } else {
                             valid = false;
@@ -735,7 +781,16 @@ impl PageTableManager {
                 let frame = PhysFrame::containing_address(pml4e.addr());
                 if let Some(index) = tracked_index(tracked, tracked_len, frame) {
                     let pdpt = &*phys_to_virt(pml4e.addr()).as_ptr::<PageTable>();
-                    if !empty(pdpt) {
+                    if !empty(pdpt)
+                        && (detach_upper_tables
+                            || !retained_children_only(
+                                pdpt,
+                                tracked,
+                                tracked_len,
+                                &retained_levels,
+                                2,
+                            ))
+                    {
                         valid = false;
                     } else if !accounted[index] {
                         if detach_upper_tables {
@@ -750,8 +805,11 @@ impl PageTableManager {
                             }
                         } else {
                             accounted[index] = true;
+                            retained_levels[index] = 3;
                             retained_count += 1;
                         }
+                    } else {
+                        valid = false;
                     }
                 }
             }
@@ -1323,10 +1381,24 @@ struct MmioPtRecorder<'a> {
     inner: &'a mut crate::memory::FrameAllocator,
     tracked: &'a mut [Option<PhysFrame<Size4KiB>>; MAX_MMIO_TRACKED_TABLES],
     tracked_len: &'a mut usize,
+    fault: &'a mut MmioMapFault,
+}
+
+#[derive(Default)]
+struct MmioMapFault {
+    fail_after: Option<usize>,
+    allocations: usize,
+    injected: bool,
+    #[cfg(feature = "mmio_probe")]
+    rollback: Option<TrackedTableRollback>,
 }
 
 unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        if self.fault.fail_after == Some(self.fault.allocations) {
+            self.fault.injected = true;
+            return None;
+        }
         let frame = self.inner.allocate_frame()?;
         if *self.tracked_len >= self.tracked.len() {
             self.inner.deallocate_frame(frame);
@@ -1334,6 +1406,7 @@ unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
         }
         self.tracked[*self.tracked_len] = Some(frame);
         *self.tracked_len += 1;
+        self.fault.allocations += 1;
         Some(frame)
     }
 }
@@ -1443,8 +1516,9 @@ fn checked_mmio_page_count(virt: VirtAddr, phys: PhysAddr, size: usize) -> Resul
 ///
 /// RF186-4: this is a strict transaction. Existing/non-present ownership state
 /// is rejected; every leaf mapped by a failed call is removed, every page-table
-/// frame allocated by the call is detached and returned, and remote translation
-/// caches are invalidated before any reclaimed frame can be reused.
+/// frame allocated by the call is reclaimed or retained with a leaf-free
+/// hierarchy proof. Upper tables stay linked for peer-root safety; remote
+/// translation caches are invalidated before reclaimed frames can be reused.
 ///
 /// # Safety
 ///
@@ -1455,6 +1529,24 @@ pub unsafe fn map_mmio(
     phys: PhysAddr,
     size: usize,
     frame_allocator: &mut crate::memory::FrameAllocator,
+) -> Result<(), MapError> {
+    map_mmio_with_fault(
+        virt,
+        phys,
+        size,
+        frame_allocator,
+        &mut MmioMapFault::default(),
+    )
+}
+
+// The production entrypoint always supplies no fault. Keep injection local to
+// this call so unrelated allocators/CPUs cannot observe a global failure switch.
+unsafe fn map_mmio_with_fault(
+    virt: VirtAddr,
+    phys: PhysAddr,
+    size: usize,
+    frame_allocator: &mut crate::memory::FrameAllocator,
+    fault: &mut MmioMapFault,
 ) -> Result<(), MapError> {
     let pages = checked_mmio_page_count(virt, phys, size)?;
     let mapped_len = pages * MMIO_PAGE_BYTES;
@@ -1487,6 +1579,7 @@ pub unsafe fn map_mmio(
                 inner: frame_allocator,
                 tracked: &mut tracked,
                 tracked_len: &mut tracked_len,
+                fault,
             };
             let mut failure = None;
             for index in 0..pages {
@@ -1524,6 +1617,10 @@ pub unsafe fn map_mmio(
                 &mut reclaimed,
                 false,
             );
+            #[cfg(feature = "mmio_probe")]
+            {
+                fault.rollback = Some(rollback);
+            }
             if !rollback.all_accounted {
                 panic!("RF186-4: MMIO page-table rollback accounting failed");
             }
@@ -1543,6 +1640,12 @@ pub unsafe fn map_mmio(
     crate::tlb_shootdown::flush_current_as_range(virt, mapped_len);
     result
 }
+
+#[cfg(feature = "mmio_probe")]
+#[path = "mmio_probes.rs"]
+mod mmio_probes;
+#[cfg(feature = "mmio_probe")]
+pub use mmio_probes::run_mmio_rollback_self_test;
 
 /// Remove a complete MMIO transaction created by [`map_mmio`].
 ///

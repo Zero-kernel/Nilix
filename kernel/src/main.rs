@@ -457,6 +457,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
     klog_always!("      ✓ Page table manager initialized");
 
+    // Forked kernel CR3s inherit high-half mappings, not the bootstrap identity
+    // map. CPU lookup and IRQ acknowledgement must keep working after that switch.
+    unsafe {
+        arch::apic::map_lapic_mmio().expect("LAPIC high-half MMIO mapping failed");
+    }
+
     // RF180-24: prove all guarded-stack data and page-table frames roll back
     // under zero, upper-level, and partial-mapping allocation failures before
     // KPTI creates peer roots that would make upper-table detachment unsafe.

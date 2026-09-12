@@ -148,6 +148,9 @@ pub static PCI_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 /// Whether IOMMU is available and initialized.
 static IOMMU_ENABLED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "init_probe")]
+pub use vtd::init_probes::{run_init_failure_probe, run_register_mapping_probes};
+
 /// Whether IOMMU initialization has been attempted.
 static IOMMU_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -288,43 +291,8 @@ pub enum IommuError {
 /// Result type for IOMMU operations.
 pub type IommuResult<T> = Result<T, IommuError>;
 
-/// RF180-30 FIX: private prepare/commit state for publishing IOMMU readiness.
-/// DMA hooks and the IRQ fault snapshot must both exist before any public
-/// readiness flag can become visible to concurrent allocators or IRQ readers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InitPublicationPhase {
-    PrivateReady,
-    DmaHooksReady,
-    TranslationReady,
-    FaultSnapshotReady,
-}
-
-impl InitPublicationPhase {
-    const fn after_dma_hooks(self) -> Option<Self> {
-        match self {
-            Self::PrivateReady => Some(Self::DmaHooksReady),
-            Self::DmaHooksReady | Self::TranslationReady | Self::FaultSnapshotReady => None,
-        }
-    }
-
-    const fn after_translation(self) -> Option<Self> {
-        match self {
-            Self::DmaHooksReady => Some(Self::TranslationReady),
-            Self::PrivateReady | Self::TranslationReady | Self::FaultSnapshotReady => None,
-        }
-    }
-
-    const fn after_fault_snapshot(self) -> Option<Self> {
-        match self {
-            Self::TranslationReady => Some(Self::FaultSnapshotReady),
-            Self::PrivateReady | Self::DmaHooksReady | Self::FaultSnapshotReady => None,
-        }
-    }
-
-    const fn may_commit_ready(self) -> bool {
-        matches!(self, Self::FaultSnapshotReady)
-    }
-}
+mod init_state;
+use init_state::InitPublicationPhase;
 
 fn install_fail_closed_dma_hooks() -> IommuResult<()> {
     mm::dma::register_iommu_ops(mm::dma::IommuOps {
@@ -523,6 +491,10 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
     }
 
     // Initialize each DRHD (DMA Remapping Hardware Unit)
+    if dmar.drhd_count() == 0 || dmar.drhd_count() > MAX_IOMMU_UNITS {
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        return Err(IommuError::HardwareInitFailed);
+    }
     let mut units = IOMMU_UNITS.write();
     units.try_reserve_exact(dmar.drhd_count()).map_err(|_| {
         IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
@@ -531,14 +503,6 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
     let mut count = 0u32;
 
     for drhd in dmar.drhd_iter() {
-        if count as usize >= MAX_IOMMU_UNITS {
-            klog!(
-                Warn,
-                "[IOMMU] Warning: Too many IOMMU units, ignoring remaining"
-            );
-            break;
-        }
-
         match VtdUnit::try_new_arc(drhd) {
             Ok(unit) => {
                 // F.3: Setup interrupt remapping if supported/required
@@ -563,35 +527,15 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
                         }
                     }
                     Err(e) => {
-                        if ir_required {
-                            // Fail-closed: If IR is required but setup fails, abort
-                            klog!(
-                                Error,
-                                "[IOMMU]   Unit {}: Interrupt remapping required but failed: {:?}",
-                                count,
-                                e
-                            );
-                            if unit.owns_ambiguous_ir_table() {
-                                // IRTA/IRE acknowledgement is ambiguous. Keep
-                                // the unit and its table alive even though init
-                                // fails, or hardware could later dereference a
-                                // freed page. Capacity was admitted up front.
-                                if let Err(unit) = units.push_reserved(unit) {
-                                    core::mem::forget(unit);
-                                }
-                            }
-                            // R90-1 FIX: Mark init as failed before returning
-                            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
-                            return Err(IommuError::HardwareInitFailed);
-                        } else {
-                            klog!(
-                                Info,
-                                "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=unsupported",
-                                count,
-                                drhd.register_base(),
-                                drhd.segment()
-                            );
+                        klog!(Error, "[IOMMU] Unit {} IR setup failed: {:?}", count, e);
+                        // An error is not optional-feature absence. QI/IR may
+                        // already own memory; retain the unit on every setup
+                        // error, including ambiguous IRTA/IRE acknowledgement.
+                        if let Err(unit) = units.push_reserved(unit) {
+                            core::mem::forget(unit);
                         }
+                        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                        return Err(IommuError::HardwareInitFailed);
                     }
                 }
 
@@ -613,12 +557,16 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
                     drhd.register_base(),
                     e
                 );
+                // A working earlier unit cannot cover a rejected DRHD's scope.
+                // Keep already retained hardware owners and abort before TE.
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                return Err(IommuError::HardwareInitFailed);
             }
         }
     }
 
-    if count == 0 {
-        klog!(Error, "[IOMMU] No IOMMU units initialized");
+    if count as usize != dmar.drhd_count() {
+        klog!(Error, "[IOMMU] Incomplete DRHD construction");
         // R90-1 FIX: Mark init as failed to prevent bypass
         IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
         return Err(IommuError::HardwareInitFailed);
@@ -626,21 +574,18 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
 
     // R94-13 FIX: Select a common AGAW (address width) supported by all units.
     // Prefer 48-bit (4-level) when available, fall back to 39-bit (3-level).
-    // CAP.SAGAW bit meanings: bit 0 = 39-bit, bit 1 = 48-bit, bit 2 = 57-bit.
+    // CAP.SAGAW bits use the context AW encoding: bit 1 = 39, bit 2 = 48.
+    // Domain implements only those two widths; do not select an unsupported one.
     let kernel_domain_agaw = {
-        let sagaw = units
-            .iter()
-            .map(|u| u.supported_agaw())
-            .fold(u8::MAX, |acc, bits| acc & bits);
-
-        if (sagaw & (1 << 1)) != 0 {
-            48u8
-        } else if (sagaw & (1 << 0)) != 0 {
-            39u8
-        } else {
-            klog!(Error, "[IOMMU] No common AGAW supported across all units");
-            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
-            return Err(IommuError::HardwareInitFailed);
+        match vtd::register_window::common_kernel_address_width(
+            units.iter().map(|unit| unit.supported_agaw()),
+        ) {
+            Some(width) => width,
+            None => {
+                klog!(Error, "[IOMMU] No common AGAW supported across all units");
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                return Err(IommuError::HardwareInitFailed);
+            }
         }
     };
 
@@ -699,12 +644,16 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
         for (i, unit) in units.iter().enumerate() {
             if let Err(e) = unit.enable_translation() {
                 klog!(
-                    Warn,
-                    "[IOMMU] WARNING: Failed to enable translation on unit {}: {:?}",
+                    Error,
+                    "[IOMMU] Failed to enable translation on unit {}: {:?}",
                     i,
                     e
                 );
-                // Continue with other units - partial enablement is better than none
+                // Earlier units or this ambiguous command may still be active.
+                // Retain all units/domain tables; never free, disable or retry
+                // here. The outer wrapper publishes sticky DMA Failed.
+                IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+                return Err(IommuError::HardwareInitFailed);
             } else {
                 klog_always!("[IOMMU]   Unit {} translation enabled", i);
                 success += 1;
@@ -713,19 +662,11 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
         success
     };
 
-    // R94-13/RF180-30: if every TE command fails, keep the already-installed
-    // fail-closed hooks but never publish readiness. Mapping attempts are then
-    // rejected and freed rather than silently returning unisolated buffers.
-    if translation_success_count == 0 && count > 0 {
-        klog!(
-            Error,
-            "[IOMMU] ERROR: No units could enable translation, IOMMU not operational"
-        );
-        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
-        return Err(IommuError::HardwareInitFailed);
-    }
-
-    publication_phase = match publication_phase.after_translation() {
+    publication_phase = match publication_phase.after_translation(
+        dmar.drhd_count(),
+        count as usize,
+        translation_success_count as usize,
+    ) {
         Some(phase) => phase,
         None => {
             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
@@ -774,8 +715,8 @@ fn init_attempt(rsdp_phys: u64) -> IommuResult<u32> {
 
 /// Check if IOMMU is available and enabled.
 ///
-/// Returns true only if IOMMU hardware is present AND translation is active
-/// on at least one unit.
+/// Readiness is published only after the complete discovered unit set initializes.
+/// At runtime, at least one retained unit must still have translation active.
 #[inline]
 pub fn is_enabled() -> bool {
     if !IOMMU_ENABLED.load(Ordering::Acquire) {
@@ -1890,52 +1831,4 @@ fn dma_unmap_range_hook(
     size: usize,
 ) -> Result<(), mm::dma::DmaError> {
     unmap_range(domain_id, iova, size).map_err(|_| mm::dma::DmaError::IommuUnmapFailed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::InitPublicationPhase;
-
-    #[test]
-    fn rf180_readiness_commit_requires_hooks_translation_then_fault_snapshot() {
-        let phase = InitPublicationPhase::PrivateReady;
-        assert!(!phase.may_commit_ready());
-
-        let phase = phase
-            .after_dma_hooks()
-            .expect("DMA hooks establish fail-closed allocation first");
-        assert!(!phase.may_commit_ready());
-
-        let phase = phase
-            .after_translation()
-            .expect("translation follows fail-closed hooks");
-        assert!(!phase.may_commit_ready());
-
-        let phase = phase
-            .after_fault_snapshot()
-            .expect("fault snapshot completes the prepare phase");
-        assert!(phase.may_commit_ready());
-    }
-
-    #[test]
-    fn rf180_readiness_state_machine_rejects_reordered_or_repeated_prepare_steps() {
-        let private = InitPublicationPhase::PrivateReady;
-        assert_eq!(private.after_translation(), None);
-        assert_eq!(private.after_fault_snapshot(), None);
-
-        let hooks = private.after_dma_hooks().expect("valid hook transition");
-        assert_eq!(hooks.after_dma_hooks(), None);
-        assert_eq!(hooks.after_fault_snapshot(), None);
-
-        let translation = hooks.after_translation().expect("valid TE transition");
-        assert_eq!(translation.after_dma_hooks(), None);
-        assert_eq!(translation.after_translation(), None);
-
-        let snapshot = translation
-            .after_fault_snapshot()
-            .expect("valid snapshot transition");
-        assert_eq!(snapshot.after_dma_hooks(), None);
-        assert_eq!(snapshot.after_translation(), None);
-        assert_eq!(snapshot.after_fault_snapshot(), None);
-    }
 }
