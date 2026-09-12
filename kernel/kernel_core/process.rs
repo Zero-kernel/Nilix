@@ -7025,6 +7025,260 @@ impl Drop for CredentialMutationGuard<'_> {
 }
 
 #[cfg(test)]
+mod standard_fd_tests {
+    use super::*;
+
+    fn fixture() -> Process {
+        mm::publish_heap_budgets();
+        Process::new(0x004005, 1, String::from("standard-fd-test"), 120)
+    }
+
+    #[test]
+    fn ksa013_nofile_bounds_numbers_and_preserves_existing_entries() {
+        let mut process = fixture();
+        process.initialize_standard_fds().unwrap();
+        process.rlimits[RLIMIT_NOFILE].rlim_cur = 2;
+        assert_eq!(process.effective_fd_limit(), 2);
+        assert!(process.reserve_fd().is_none());
+        assert_eq!(process.get_fd(2).unwrap().status_flags(), Ok(1));
+        drop(process.remove_fd(0).unwrap());
+        let reserved = process.reserve_fd_from_with_cloexec(0, true).unwrap();
+        assert_eq!(reserved, 0);
+        assert!(process.reserve_fd().is_none());
+        assert!(process.cancel_fd_reservation(reserved));
+        assert!(process.reserve_fd_from_with_cloexec(2, false).is_none());
+        process.rlimits[RLIMIT_NOFILE].rlim_cur = 0;
+        assert!(process.reserve_fd().is_none());
+        process.rlimits[RLIMIT_NOFILE].rlim_cur = u64::MAX;
+        assert_eq!(process.effective_fd_limit(), MAX_FD);
+        for fd in [1, 2] {
+            drop(process.remove_fd(fd).unwrap());
+        }
+        assert_eq!(process.total_fd_charge_count(), 0);
+    }
+
+    #[test]
+    fn ksa013_reserved_commit_survives_lowering_but_new_replacement_does_not() {
+        let mut process = fixture();
+        let fd = process.reserve_fd_from_with_cloexec(10, true).unwrap();
+        assert_eq!(fd, 10);
+        let descriptor =
+            FileDescriptor::try_new(ConsoleFile { readable: true }, HeapClass::CoreProcess)
+                .unwrap();
+        process.rlimits[RLIMIT_NOFILE].rlim_cur = 1;
+        process.commit_reserved_fd(fd, descriptor);
+        assert_eq!(process.get_fd(fd).unwrap().status_flags(), Ok(0));
+        assert!(process.cloexec_fds.contains(&fd));
+        let before = process.total_fd_charge_count();
+        for target in [1, 10, MAX_FD, i32::MAX, -1] {
+            let rejected =
+                FileDescriptor::try_new(ConsoleFile { readable: false }, HeapClass::CoreProcess)
+                    .unwrap();
+            drop(process.replace_fd_charged(target, rejected).unwrap_err());
+            assert_eq!(process.total_fd_charge_count(), before);
+            assert_eq!(process.get_fd(fd).unwrap().status_flags(), Ok(0));
+            assert!(process.cloexec_fds.contains(&fd));
+        }
+        let low = process.get_fd(fd).unwrap().try_clone_box().unwrap();
+        assert_eq!(process.allocate_fd(low).unwrap(), 0);
+        assert!(process.reserve_fd().is_none());
+        for fd in [0, 10] {
+            drop(process.remove_fd(fd).unwrap());
+        }
+        assert_eq!(process.total_fd_charge_count(), 0);
+    }
+
+    #[test]
+    fn ksa011_stale_children_keep_incomplete_table_fallback() {
+        let mut process = fixture();
+        process.children.try_reserve(1).unwrap();
+        process.children.push_reserved(1234).unwrap();
+        process.children_incomplete = true;
+        assert!(process.prune_stale_wait_children(&[1234]));
+        assert!(process.children.is_empty());
+        assert!(process.children_incomplete);
+        process.children_incomplete = false;
+        assert!(!process.prune_stale_wait_children(&[]));
+    }
+
+    #[test]
+    fn ksa012_locked_job_control_preserves_generation_and_operation_order() {
+        let mut process = fixture();
+        let (pid, generation) = (process.pid, process.generation);
+        process.state = ProcessState::Ready;
+        assert!(try_mark_job_control_stopped_locked(&mut process));
+        assert!(resume_job_control_locked(&mut process, pid, generation));
+        assert!(!process.stopped);
+        assert!(try_mark_job_control_stopped_locked(&mut process));
+        assert!(process.stopped); // CONT followed by STOP stays stopped.
+        assert!(!resume_job_control_locked(
+            &mut process,
+            pid,
+            generation.wrapping_add(1)
+        ));
+        assert!(process.stopped);
+        process.pending_kill.store(true, Ordering::Release);
+        assert!(!try_mark_job_control_stopped_locked(&mut process));
+    }
+
+    #[test]
+    fn ksa012_resume_preserves_blocked_wait_unless_signal_is_actionable() {
+        let mut process = fixture();
+        let (pid, generation) = (process.pid, process.generation);
+        let signal = crate::signal::Signal::SIGTERM;
+        process.state = ProcessState::Blocked;
+        process.stopped = true;
+        process.pending_signals.set(signal);
+        process.blocked = signal.bit();
+        assert!(!resume_job_control_locked(&mut process, pid, generation));
+        assert_eq!(process.state, ProcessState::Blocked);
+        assert!(!process.stopped);
+        process.stopped = true;
+        process.blocked = 0;
+        assert!(resume_job_control_locked(&mut process, pid, generation));
+        assert_eq!(process.state, ProcessState::Ready);
+        assert!(!process.stopped);
+    }
+
+    #[test]
+    fn ksa012_stop_barrier_covers_ready_on_cpu_and_fatal_after_continue() {
+        let mut process = fixture();
+        let (pid, generation) = (process.pid, process.generation);
+        process.on_cpu.store(true, Ordering::Release);
+        for state in [
+            ProcessState::Running,
+            ProcessState::Ready,
+            ProcessState::Blocked,
+            ProcessState::Sleeping,
+            ProcessState::Stopped,
+        ] {
+            process.state = state;
+            process.stopped = true;
+            assert_eq!(
+                stop_barrier_state(&process, pid, generation),
+                StopBarrierState::Wait
+            );
+            assert_eq!(process.state, state);
+        }
+        process.state = ProcessState::Ready;
+        process.stopped = false;
+        assert_eq!(
+            stop_barrier_state(&process, pid, generation),
+            StopBarrierState::Resumed
+        );
+        process.pending_exit_code.store(137, Ordering::Relaxed);
+        process.pending_kill.store(true, Ordering::Release);
+        assert_eq!(
+            stop_barrier_state(&process, pid, generation),
+            StopBarrierState::Fatal(137)
+        );
+        process.stopped = true;
+        assert_eq!(
+            stop_barrier_state(&process, pid, generation),
+            StopBarrierState::Fatal(137)
+        );
+    }
+
+    #[test]
+    fn ksa005_bootstrap_close_and_lowest_free_reservation() {
+        let mut process = fixture();
+        process.initialize_standard_fds().unwrap();
+        assert_eq!(process.total_fd_charge_count(), 3);
+        for fd in 0..3 {
+            let console = process
+                .get_fd(fd)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ConsoleFile>()
+                .unwrap();
+            assert_eq!(console.readable, fd == 0);
+        }
+        drop(process.remove_fd(0).unwrap());
+        let reserved = process.reserve_fd().unwrap();
+        assert_eq!(reserved, 0);
+        assert!(process.get_fd(0).is_none());
+        assert!(process.remove_fd(0).is_none());
+        let descriptor =
+            FileDescriptor::try_new(ConsoleFile { readable: false }, HeapClass::CoreProcess)
+                .unwrap();
+        drop(process.replace_fd_charged(0, descriptor).unwrap_err());
+        assert!(process.cancel_fd_reservation(reserved));
+        let copy = process.get_fd(1).unwrap().try_clone_box().unwrap();
+        assert_eq!(process.allocate_fd(copy).unwrap(), 0);
+        for fd in 0..3 {
+            drop(process.remove_fd(fd).unwrap());
+        }
+        assert_eq!(process.total_fd_charge_count(), 0);
+        assert!(process.get_fd(0).is_none());
+    }
+
+    #[test]
+    fn ksa005_bootstrap_admission_failure_is_atomic() {
+        let mut process = fixture();
+        process.cgroup_id = u64::MAX;
+        assert!(process.initialize_standard_fds().is_err());
+        assert!(process.fd_table.is_empty());
+        assert_eq!(process.total_fd_charge_count(), 0);
+        assert_eq!(process.next_available_fd_from(0), Some(0));
+        process.cgroup_id = 0;
+        process.initialize_standard_fds().unwrap();
+        for fd in 0..3 {
+            drop(process.remove_fd(fd).unwrap());
+        }
+    }
+
+    #[test]
+    fn ksa005_duplicate_inheritance_and_cloexec_are_per_descriptor() {
+        let mut parent = fixture();
+        parent.initialize_standard_fds().unwrap();
+        let copy = parent.get_fd(0).unwrap().try_clone_box().unwrap();
+        drop(
+            parent
+                .replace_fd_charged_with_cloexec(1, copy, true)
+                .unwrap(),
+        );
+        let copy = parent.get_fd(1).unwrap().try_clone_box().unwrap();
+        let duplicate = parent.allocate_fd(copy).unwrap();
+        assert_eq!(duplicate, 3);
+        assert!(!parent.cloexec_fds.contains(&duplicate));
+        drop(parent.remove_fd(2).unwrap());
+
+        let mut child = fixture();
+        assert!(child.fd_table.is_empty());
+        for (&fd, descriptor) in parent.fd_table.iter() {
+            let cloned = descriptor.try_clone_box().unwrap();
+            assert!(child
+                .replace_fd_charged_with_cloexec(fd, cloned, parent.cloexec_fds.contains(&fd))
+                .unwrap()
+                .is_none());
+        }
+        assert!(child.get_fd(2).is_none());
+        let mut removed = Vec::with_capacity(child.cloexec_fds.len());
+        assert_eq!(child.take_cloexec_fds_into(&mut removed), 1);
+        drop(removed);
+        assert!(child.get_fd(1).is_none());
+        assert!(
+            child
+                .get_fd(duplicate)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ConsoleFile>()
+                .unwrap()
+                .readable
+        );
+        assert!(parent.get_fd(1).is_some());
+        for fd in [0, 1, duplicate] {
+            drop(parent.remove_fd(fd).unwrap());
+        }
+        for fd in [0, duplicate] {
+            drop(child.remove_fd(fd).unwrap());
+        }
+        assert_eq!(parent.total_fd_charge_count(), 0);
+        assert_eq!(child.total_fd_charge_count(), 0);
+    }
+}
+
+#[cfg(test)]
 mod credential_gate_tests {
     use super::*;
 
