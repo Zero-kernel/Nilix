@@ -201,7 +201,7 @@ run_suite ipc-robust 4 17 \
     --features mm/host_harness \
     --lib --locked -- robust_
 
-run_suite vfs 62 0 \
+run_suite vfs 63 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

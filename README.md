@@ -16,7 +16,8 @@ goal, not a claim that arbitrary Linux applications or containers already run.
 
 ## Status
 
-**Snapshot: 2026-09-12**, source 3254318; CI job-budget follow-up a84e963.
+**Snapshot: 2026-09-12**, source e127c34; CI job-budget follow-up and runtime
+parser fixes are awaiting the next complete run.
 **1.0-Preview is blocked.** Most services still execute in Ring 0. A deprivileged
 Linux personality and broader application compatibility are planned.
 
@@ -89,7 +90,7 @@ narratives. The roadmap is the current capability/qualification reference.
 
 ## Tests and CI
 
-The current hosted allowlist runs **437 counted unit-test executions per
+The current hosted allowlist runs **438 counted unit-test executions per
 debug/release profile**, CpuLocal doctests and three test-code compile checks.
 The runtime scanner discovers **74 RuntimeTest implementations**; that count
 does not mean 74 guest passes or 100% kernel instruction coverage.

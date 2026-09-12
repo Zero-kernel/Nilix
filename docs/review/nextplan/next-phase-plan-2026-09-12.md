@@ -1,7 +1,8 @@
 # Zero-OS Next-Phase Plan — 2026-09-12
 
 **Version:** 16.0 · **Stage:** kernel-next-phase, full rollover
-**Source:** 3254318c5ef19ee9eb23246e14e9e01582af7e28; CI-only follow-up a84e963.
+**Source:** e127c34; this plan incorporates the runtime parser, transient mount
+and hosted-count follow-ups as verification-pending implementation records.
 **Mode:** source/record reconciliation and documentation; no kernel implementation or new audit.
 **Inputs:** September 11 status addendum, September 6 KSA plan, September 1
 complete queue, August 1 legacy queue, final KSA review-fix and P3-2 QEMU evidence.
@@ -194,9 +195,9 @@ features in a phase are complete.
 | R188 review lineage | Reconciliation/independent uncovered-scope review pending |
 | Zero-HIGH streak | 0/3, unchanged; no fabricated next round number or clean credit |
 | Stress acceptance | All six profiles required by September 1 decision; no accepted full run |
-| Hosted count | 437 counted executions/profile + CpuLocal doctests + three compile checks, from current gate definition |
+| Hosted count | 438 counted executions/profile + CpuLocal doctests + three compile checks, from current gate definition |
 | Runtime scanner | 74 source-discovered implementations; no blanket instruction/behavior coverage claim |
-| CI | a84e963: ten jobs pass; 4-CPU runtime reached 37 passed/37 deferred with no failed test but parser rejected the prompt-prefixed PID1 marker; parser fix awaits rerun |
+| CI | e127c34: hosted vfs reached 63 passed but its expected count was stale at 62; the count correction and QEMU transient/parser fixes await a complete rerun |
 | Velocity | No new audit row/fix-rate inferred; this is a planning rollover |
 
 Release requires no unresolved Critical/High within the supported scope, the

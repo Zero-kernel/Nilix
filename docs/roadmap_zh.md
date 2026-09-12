@@ -1,7 +1,7 @@
 ## Nilix (Zero-OS) — 开发与能力路线图
 
 **修订：** 6.0 · **更新日期：** 2026-09-12
-**源码基线：** `3254318c5ef19ee9eb23246e14e9e01582af7e28`；运行时 CI 预算于 `a84e963` 修正。
+**源码基线：** `e127c34`（运行时解析与挂载瞬态修复）；hosted 计数修复等待下一轮完整 CI。
 **现行计划：** [next-phase-plan-2026-09-12.md](review/nextplan/next-phase-plan-2026-09-12.md)
 
 Nilix 是实验性 x86_64 内核：UEFI 启动、Ring-3 程序、已测 static-musl ABI 子集、SMP 调度、文件系统、IPv4 网络与安全策略机制。**1.0-Preview 仍阻塞。** 本文记录当前树的能力、缺失契约与证据边界。
@@ -69,7 +69,7 @@ Nilix 是实验性 x86_64 内核：UEFI 启动、Ring-3 程序、已测 static-m
     </tr>
     <tr>
       <td style="padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">宿主侧门禁</td>
-      <td style="padding:8px 10px;border-bottom:1px solid var(--border)">debug/release 各 437 次计入的单元测试执行、CpuLocal doctest、三项测试代码编译检查；显式宿主安全白名单。</td>
+      <td style="padding:8px 10px;border-bottom:1px solid var(--border)">debug/release 各 438 次计入的单元测试执行、CpuLocal doctest、三项测试代码编译检查；显式宿主安全白名单。</td>
     </tr>
     <tr>
       <td style="padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">运行时清单</td>
@@ -77,7 +77,7 @@ Nilix 是实验性 x86_64 内核：UEFI 启动、Ring-3 程序、已测 static-m
     </tr>
     <tr>
       <td style="padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">近期 CI</td>
-      <td style="padding:8px 10px;border-bottom:1px solid var(--border)"><a href="https://github.com/Zero-kernel/Nilix/actions/runs/34696142246" style="color:var(--primary)">Run 34696142246</a>，a84e963：10 个作业成功；4 CPU 运行实际得到 37 passed/37 deferred、无测试失败，但脚本因 shell 提示符前缀误拒 PID1 完成标记。本树已修正解析，等待重跑。</td>
+      <td style="padding:8px 10px;border-bottom:1px solid var(--border)"><a href="https://github.com/Zero-kernel/Nilix/actions/runs/34701321475" style="color:var(--primary)">Run 34701321475</a>，e127c34：hosted 的 vfs 实际 63 项全部通过，但白名单仍要求 62；计数修复已在本树，等待完整重跑。</td>
     </tr>
     <tr>
       <td style="padding:8px 10px;vertical-align:top;font-weight:var(--font-chat-strong-weight)">发布门禁</td>
@@ -359,7 +359,7 @@ DMAR 在启动时接线。Q35 初始化/构造器/SIRTP/IR/TE 失败与 EDU 翻�
     </tr>
     <tr>
       <td style="padding:7px 10px;vertical-align:top">CI 结果/保留证据</td>
-      <td style="padding:7px 10px;vertical-align:top">3254318 上 10 个作业通过；运行时总预算修正需重跑验收</td>
+      <td style="padding:7px 10px;vertical-align:top">e127c34 的 hosted vfs 计数修复等待重跑；QEMU 瞬态与解析修复也等待完整运行证据</td>
     </tr>
   </tbody>
 </table>
@@ -473,7 +473,7 @@ DMAR 在启动时接线。Q35 初始化/构造器/SIRTP/IR/TE 失败与 EDU 翻�
   </thead>
   <tbody>
     <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">源码/构建</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">fmt/Clippy/lint/ABI C 判定/构建/已链接 usercopy</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">非运行时完备</td></tr>
-    <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">宿主</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">每配置 437 次计入执行、CpuLocal doctest、三项编译检查</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">宿主安全白名单；特权路径仅客户机</td></tr>
+    <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">宿主</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">每配置 438 次计入执行、CpuLocal doctest、三项编译检查</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">宿主安全白名单；特权路径仅客户机</td></tr>
     <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">Harness</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">Python JUnit/覆盖、shell 语法、结果/解析器回归</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">宿主覆盖，非内核指令覆盖</td></tr>
     <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">必选 QEMU</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">Boot/runtime/SMP、UP/四 CPU musl、IOMMU/缓解/KCOV/两种子 smoke</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">合格结果/模拟器范围保留</td></tr>
     <tr><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-weight:var(--font-chat-strong-weight)">扩展</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">Ubuntu 22.04/24.04、8/16 CPU、Ext3/JBD2、六个压力配置</td><td style="padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top">计划/手工；压力验收不完整</td></tr>

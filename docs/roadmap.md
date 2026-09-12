@@ -1,7 +1,8 @@
 # Nilix (Zero-OS) — Development and Capability Roadmap
 
 **Revision:** 6.0 · **Updated:** 2026-09-12
-**Source baseline:** 3254318c5ef19ee9eb23246e14e9e01582af7e28; runtime CI budget corrected in a84e963.
+**Source baseline:** e127c34 (runtime parser and transient mount follow-up); the
+hosted count update is pending its next complete CI run.
 **Active plan:** [next-phase-plan-2026-09-12.md](review/nextplan/next-phase-plan-2026-09-12.md).
 
 Nilix is an experimental x86_64 OS kernel with UEFI boot, Ring-3 programs, a
@@ -38,9 +39,9 @@ guest execution measure different things.
 | Composition | 25 kernel library crates plus the entry binary; separate UEFI bootloader, userspace and host tools. Most services execute in Ring 0. |
 | Userspace proof | Static ELF and real musl tests run in Ring 3; fork/exec/wait, descriptors, cwd/jails and several failure paths have guest evidence. |
 | September KSA | KSA-001..020 accepted within recorded rubrics; 17/18 associated plan items complete. P3-2 physical VT-d remains pending. |
-| Hosted gate | 437 counted unit-test executions per debug/release profile, CpuLocal doctests and three test-code compile checks; explicit host-safe allowlist. |
+| Hosted gate | 438 counted unit-test executions per debug/release profile, CpuLocal doctests and three test-code compile checks; explicit host-safe allowlist. |
 | Runtime inventory | 74 source-discovered RuntimeTest implementations; actual pass/deferred/warning/skipped/failed counts depend on image/platform. This is not 100% kernel code coverage. |
-| Recent CI | [Run 34696142246](https://github.com/Zero-kernel/Nilix/actions/runs/34696142246), a84e963: ten jobs passed; boot and 1/4-CPU runtime windows were qualified, while the 4-CPU script rejected a shell-prompt-prefixed PID1 completion marker. The parser fix is in this tree; rerun acceptance is pending. |
+| Recent CI | [Run 34701321475](https://github.com/Zero-kernel/Nilix/actions/runs/34701321475), e127c34: hosted suites exposed a stale vfs oracle (actual 63 passed, expected 62); the count fix is in this tree. Runtime QEMU jobs are separately pending/completing. |
 | Release gate | BLOCKED: R186-4 admission closure, historical review lineage, strict profile qualification, all six stress profiles and the recorded 0/3 clean-audit streak. |
 
 Acceptance sources: the [historical record ledger](security-audit-status.md#record-provenance)
@@ -340,7 +341,7 @@ creates a new full clean audit round.
 | All six stress-v2 profiles | Required by recorded 2026-09-01 user decision; memory/cpu/smp/process/block/combined acceptance pending |
 | Strict security/platform policy | Outcome truth implemented; deferred prerequisites still block qualification |
 | ABI/device/mitigation matrix | Preserve supported/rejected/advisory and physical/full-isolation limits |
-| CI result/retained evidence | Ten jobs passed on a84e963; 4-CPU marker parser correction is pending rerun |
+| CI result/retained evidence | e127c34 hosted vfs count correction is pending rerun; QEMU transient/parser fixes are also pending complete-run evidence |
 
 The five KSA P0 repairs and KSA-007..020 rubrics are accepted within scope. They
 are regression obligations, not still-open implementation tasks.
@@ -404,7 +405,7 @@ efficiency; QEMU IRTE reuse does not qualify general VM passthrough.
 | Layer | Evidence | Limit |
 | --- | --- | --- |
 | Source/build | fmt/Clippy/lints/ABI C oracle/build/linked usercopy | Not runtime completeness |
-| Hosted | 437 counted executions/profile, CpuLocal doctests, three compile checks | Host-safe allowlist; privileged paths guest-only |
+| Hosted | 438 counted executions/profile, CpuLocal doctests, three compile checks | Host-safe allowlist; privileged paths guest-only |
 | Harness | Python JUnit/coverage, shell syntax, outcome/parser regressions | Host coverage, not kernel instruction coverage |
 | Required QEMU | Boot/runtime/SMP, UP/four-CPU musl, IOMMU/mitigation/KCOV/two-seed smoke | Qualified outcomes/emulator scope retained |
 | Extended | Ubuntu 22.04/24.04, 8/16 CPU, Ext3/JBD2, six stress profiles | Scheduled/manual; stress acceptance incomplete |

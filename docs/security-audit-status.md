@@ -1,6 +1,6 @@
 # Security Audit and Qualification Status
 
-**Updated:** 2026-09-12 · **Current source:** 3254318 (CI-only follow-up a84e963).
+**Updated:** 2026-09-12 · **Current source:** e127c34; hosted count follow-up is pending.
 **Release:** 1.0-Preview **BLOCKED**; recorded clean full-audit streak **0/3**.
 
 This document separates historical audit closure, scoped repair evidence and
@@ -16,8 +16,8 @@ capabilities are in the [roadmap](roadmap.md); remaining work is in the
 | KSA plan | 17/18 scoped complete; P3-2 partial | Physical VT-d qualification remains unavailable |
 | RF180-20 | Shared supervisor page-table teardown/COW/fresh-exec ownership repaired and independently reviewed | Final v51 workload/source evidence; later changes need affected-path regression |
 | P3-2 QEMU continuation | Q35/EDU nonidentity DMA, mapping replacement, remapped MSI, fault quarantine/detach and IRTE reuse accepted | Physical endpoints, MSI-X and broad topology are separate rows |
-| CI on a84e963 | Ten jobs succeeded; boot and runtime windows ran to completion, but the 4-CPU parser rejected a shell-prompt-prefixed PID1 completion marker | Parser fix is in the current tree; rerun is required |
-| Current hosted definition | 437 counted test executions/profile, CpuLocal doctests and three compile checks | Host-safe allowlist, not full privileged execution or code coverage |
+| CI on e127c34 | Hosted debug/release reached 63 vfs tests but the allowlist still expected 62; QEMU jobs were independently in progress/failed during this run | Count fix is in the current tree; complete rerun is required |
+| Current hosted definition | 438 counted test executions/profile, CpuLocal doctests and three compile checks | Host-safe allowlist, not full privileged execution or code coverage |
 
 The final KSA review (`reviewfix-2026-09-11-v2.md`) records
 14/14 remaining findings PASS scoped, adding to the six previously accepted.
