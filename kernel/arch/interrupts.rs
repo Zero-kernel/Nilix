@@ -58,8 +58,15 @@ const FXSAVE_SIZE: usize = 512;
 /// interrupts concurrently.
 #[repr(C, align(64))]
 struct IrqFpuSaveArea {
-    data: [u8; FXSAVE_SIZE],
+    data: core::cell::UnsafeCell<[u8; FXSAVE_SIZE]>,
 }
+
+// KSA-017: FXSAVE writes behind a shared per-CPU reference. The cell makes
+// that interior mutation explicit. This private type is accessed only by the
+// IRQ save/restore pair and the signal-frame snapshot between save and restore,
+// with interrupts disabled and no CPU migration. The per-CPU nesting counter
+// permits only the outermost pair to save/restore; NMI does not access the buffer.
+unsafe impl Sync for IrqFpuSaveArea {}
 
 /// R66-7 FIX: Per-CPU FPU save areas using CpuLocal.
 ///
@@ -68,7 +75,7 @@ struct IrqFpuSaveArea {
 /// Each CPU exclusively accesses its own FPU save area. The 64-byte
 /// alignment satisfies FXSAVE64/FXRSTOR64 requirements.
 static IRQ_FPU_AREAS: CpuLocal<IrqFpuSaveArea> = CpuLocal::new(|| IrqFpuSaveArea {
-    data: [0; FXSAVE_SIZE],
+    data: core::cell::UnsafeCell::new([0; FXSAVE_SIZE]),
 });
 
 /// R67-7 FIX: Per-CPU nesting depth for IRQ FPU saves.
@@ -147,7 +154,7 @@ unsafe fn irq_save_fpu() {
 
     // Outermost save - actually perform FXSAVE
     IRQ_FPU_AREAS.with(|area| {
-        let ptr = area.data.as_ptr() as *mut u8;
+        let ptr = area.data.get().cast::<u8>();
         core::arch::asm!(
             "fxsave64 [{}]",
             in(reg) ptr,
@@ -194,7 +201,7 @@ unsafe fn irq_restore_fpu() {
     }
     // Outermost restore - actually perform FXRSTOR
     IRQ_FPU_AREAS.with(|area| {
-        let ptr = area.data.as_ptr();
+        let ptr = area.data.get().cast::<u8>();
         core::arch::asm!(
             "fxrstor64 [{}]",
             in(reg) ptr,
@@ -1706,7 +1713,11 @@ unsafe fn capture_irq_sigframe_fpu(pid: usize) -> [u8; 512] {
 
     // Copy from the IRQ FPU save area
     IRQ_FPU_AREAS.with(|area| {
-        core::ptr::copy_nonoverlapping(area.data.as_ptr(), local_irq_area.as_mut_ptr(), 512);
+        core::ptr::copy_nonoverlapping(
+            area.data.get().cast::<u8>(),
+            local_irq_area.as_mut_ptr(),
+            512,
+        );
     });
 
     let ts_was_set = IRQ_FPU_TS_WAS_SET.with(|flag| flag.load(Ordering::Relaxed));

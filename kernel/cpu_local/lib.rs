@@ -26,8 +26,7 @@ compile_error!(
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
+use alloc::vec::Vec;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
@@ -122,9 +121,10 @@ pub fn nmi_active() -> bool {
 /// lapic_write}` read this one atomic, replacing the three previously-duplicated
 /// hard-coded `0xFEE0_0000` copies (the old `apic::LAPIC_BASE` static, the
 /// `current_cpu_id()` literal, and the dead `ipi::LAPIC_BASE` const). `arch::apic`
-/// is the sole publisher — it validates the base against IA32_APIC_BASE at LAPIC
-/// init — so the value is never out of sync with the hardware or the consumers.
-static LAPIC_MMIO_BASE: AtomicU32 = AtomicU32::new(LAPIC_MMIO_DEFAULT_BASE);
+/// validates the physical aperture against IA32_APIC_BASE, then publishes its
+/// permanent high-half mapping after memory initialization. Before publication,
+/// early boot alone uses the identity address.
+static LAPIC_MMIO_BASE: AtomicU64 = AtomicU64::new(LAPIC_MMIO_DEFAULT_BASE as u64);
 
 /// True once the platform is operating the local APIC in x2APIC mode.
 ///
@@ -137,7 +137,7 @@ static X2APIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Read the authoritative LAPIC MMIO base (see [`LAPIC_MMIO_BASE`]).
 #[inline]
-pub fn lapic_mmio_base() -> u32 {
+pub fn lapic_mmio_base() -> u64 {
     LAPIC_MMIO_BASE.load(Ordering::Acquire)
 }
 
@@ -147,8 +147,13 @@ pub fn lapic_mmio_base() -> u32 {
 ///
 /// Panics if `base` is not 4 KiB aligned (a malformed APIC base would desync the
 /// register reads from the page tables).
+///
+/// # Safety
+///
+/// The complete register page must be mapped as supervisor MMIO in every kernel
+/// address space that can execute a consumer. Publish before starting other CPUs.
 #[inline]
-pub fn set_lapic_mmio_base(base: u32) {
+pub unsafe fn set_lapic_mmio_base(base: u64) {
     assert_eq!(
         base & 0xFFF,
         0,
@@ -574,10 +579,11 @@ impl PerCpuData {
 /// Per-CPU storage wrapper
 ///
 /// Stores one instance of T per CPU, lazily initialized on first access.
-/// Safe to use from interrupt context as long as T's operations are safe.
+/// Interrupt users must force initialization before enabling interrupts and use
+/// T's normal synchronization for shared mutable state.
 ///
-/// R91-2 FIX: Slots are heap-allocated via `Box<[MaybeUninit<T>]>` to avoid
-/// placing `[MaybeUninit<T>; MAX_CPUS]` on the stack during `call_once`.
+/// Slots are initialized one at a time in a heap allocation to avoid
+/// placing `[T; MAX_CPUS]` on the stack during `call_once`.
 /// For large per-CPU types like `SampleRing` (~41KB), the previous stack-based
 /// approach would allocate ~2.6MB on the stack (64 * 41KB), causing a
 /// deterministic stack overflow on first access.
@@ -585,12 +591,8 @@ pub struct CpuLocal<T> {
     /// Initialization function for each CPU's slot
     init: fn() -> T,
     /// Per-CPU slots, heap-allocated and initialized lazily via Once
-    slots: Once<UnsafeCell<Box<[MaybeUninit<T>]>>>,
+    slots: Once<Box<[T]>>,
 }
-
-// Safety: CpuLocal is Send+Sync because each CPU only accesses its own slot
-unsafe impl<T: Send> Send for CpuLocal<T> {}
-unsafe impl<T: Send + Sync> Sync for CpuLocal<T> {}
 
 impl<T> CpuLocal<T> {
     /// Create a new per-CPU storage with the given initializer
@@ -607,15 +609,16 @@ impl<T> CpuLocal<T> {
     ///
     /// R91-2 FIX: Allocates on the heap instead of the stack to prevent
     /// stack overflow for large per-CPU types (e.g., SampleRing ~41KB * 64 CPUs).
-    fn get_slots(&self) -> &UnsafeCell<Box<[MaybeUninit<T>]>> {
+    fn get_slots(&self) -> &[T] {
         self.slots.call_once(|| {
-            // Heap-allocate the slot array. Box::new_uninit_slice creates the
-            // allocation directly on the heap without an intermediate stack copy.
-            let mut arr = Box::new_uninit_slice(MAX_CPUS);
-            for slot in arr.iter_mut() {
-                slot.write((self.init)());
+            // KSA-017: Vec owns every initialized T, including during a panic.
+            // Once publishes only the completed slice. Automatic Send/Sync bounds
+            // and owner-scoped borrows enforce ordinary shared-reference rules.
+            let mut slots = Vec::with_capacity(MAX_CPUS);
+            for _ in 0..MAX_CPUS {
+                slots.push((self.init)());
             }
-            UnsafeCell::new(arr)
+            slots.into_boxed_slice()
         })
     }
 
@@ -632,10 +635,8 @@ impl<T> CpuLocal<T> {
 
     /// Access the current CPU's slot immutably
     ///
-    /// # Safety
-    ///
-    /// This is safe because each CPU only accesses its own slot, and we
-    /// use interior mutability (e.g., atomics) for any mutations.
+    /// This selects a slot, without pinning execution or granting exclusivity.
+    /// Mutations through shared references use T's atomics or locks.
     #[inline]
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let id = current_cpu_id();
@@ -646,13 +647,9 @@ impl<T> CpuLocal<T> {
             id,
             MAX_CPUS
         );
-        // Safety: bound check above guarantees the slot exists and was initialized in get_slots()
-        let slot = unsafe {
-            let arr = &*self.get_slots().get();
-            arr.get(id)
-                .expect("CPU slot missing after bounds check")
-                .assume_init_ref()
-        };
+        let slot = self
+            .get_cpu(id)
+            .expect("CPU slot missing after bounds check");
         f(slot)
     }
 
@@ -661,10 +658,7 @@ impl<T> CpuLocal<T> {
     /// Used for cross-CPU operations like TLB shootdown where we need to
     /// access another CPU's mailbox.
     ///
-    /// # Safety
-    ///
-    /// This is safe only when `T` supports concurrent access (e.g., uses atomics).
-    /// The caller must ensure proper synchronization for non-atomic operations.
+    /// Cross-thread access follows T's automatic Send/Sync requirements.
     ///
     /// # Returns
     ///
@@ -675,56 +669,33 @@ impl<T> CpuLocal<T> {
             return None;
         }
 
-        // Safety: slots are initialized in get_slots(); cpu_id bounds checked above
-        let slot = unsafe {
-            let arr = &*self.get_slots().get();
-            match arr.get(cpu_id) {
-                Some(s) => s.assume_init_ref(),
-                None => return None,
-            }
-        };
-        Some(f(slot))
+        self.get_cpu(cpu_id).map(f)
     }
 
-    /// Get a static reference to a specific CPU's slot.
+    /// Borrow a specific CPU's slot for no longer than this storage owner lives.
+    /// Static owners naturally provide static borrows; local owners cannot escape.
     ///
-    /// Unlike `with_cpu`, this returns the reference directly instead of via
-    /// a closure. The returned reference is `'static` because the underlying
-    /// storage is owned by a static `Once` (and the heap allocation is never freed).
+    /// ```compile_fail
+    /// use cpu_local::CpuLocal;
+    /// let dangling = {
+    ///     let local = CpuLocal::new(|| 42usize);
+    ///     local.get_cpu(0).unwrap()
+    /// };
+    /// assert_eq!(*dangling, 42);
+    /// ```
     ///
-    /// # Safety
-    ///
-    /// This is safe only when `T` supports concurrent access (e.g., uses atomics).
-    /// The caller must ensure proper synchronization for non-atomic operations.
+    /// Cross-thread access follows T's automatic Send/Sync requirements.
     ///
     /// # Returns
     ///
     /// None if cpu_id is out of range (>= MAX_CPUS).
     #[inline]
-    pub fn get_cpu(&self, cpu_id: usize) -> Option<&'static T> {
+    pub fn get_cpu(&self, cpu_id: usize) -> Option<&T> {
         if cpu_id >= MAX_CPUS {
             return None;
         }
 
-        // Safety:
-        // - slots are initialized in get_slots() before first access
-        // - cpu_id bounds checked above
-        // - The underlying storage is in a static Once, so references are 'static
-        // - We transmute the lifetime because the storage truly is 'static
-        unsafe {
-            let arr = &*self.get_slots().get();
-            match arr.get(cpu_id) {
-                Some(s) => {
-                    let ref_with_lifetime = s.assume_init_ref();
-                    // Safety: The backing storage is owned by a static Once
-                    // (heap-allocated Box never freed), so the data lives for
-                    // 'static. The borrow checker can't see this, so we
-                    // transmute the lifetime.
-                    Some(core::mem::transmute::<&T, &'static T>(ref_with_lifetime))
-                }
-                None => None,
-            }
-        }
+        self.get_slots().get(cpu_id)
     }
 }
 
@@ -819,9 +790,8 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
 
     // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
     // single authoritative MMIO base shared with `arch::apic::lapic_read`, not a
-    // hard-coded `0xFEE0_0020` literal. The base is validated to be the architected
-    // `LAPIC_MMIO_DEFAULT_BASE` at LAPIC init, so this read targets the same page
-    // the identity-map hardening carve-out preserves.
+    // hard-coded `0xFEE0_0020` literal. After memory initialization this is a
+    // supervisor high-half alias inherited by every process's kernel CR3.
     let apic_id = unsafe {
         let id_reg = (lapic_mmio_base() as usize + 0x20) as *const u32;
         core::ptr::read_volatile(id_reg) >> 24
@@ -985,8 +955,8 @@ pub static PER_CPU_DATA: CpuLocal<PerCpuData> = CpuLocal::new(PerCpuData::new);
 /// Access the current CPU's `PerCpuData`.
 ///
 /// This is the primary way to access per-CPU state. The returned reference
-/// is valid for the duration of the current CPU's execution (i.e., until
-/// migration to another CPU, which is not yet supported).
+/// remains valid for the static storage lifetime. A later CPU migration does
+/// not change which CPU this reference identifies; CPU-local operations must pin.
 ///
 /// # Example
 ///
@@ -1000,12 +970,9 @@ pub static PER_CPU_DATA: CpuLocal<PerCpuData> = CpuLocal::new(PerCpuData::new);
 /// ```
 #[inline]
 pub fn current_cpu() -> &'static PerCpuData {
-    // We use a closure that returns the reference directly since
-    // the underlying storage is static
-    PER_CPU_DATA.with(|d| {
-        // Safety: The PerCpuData is stored in static memory with 'static lifetime
-        unsafe { &*(d as *const PerCpuData) }
-    })
+    PER_CPU_DATA
+        .get_cpu(current_cpu_id())
+        .expect("current CPU slot out of range")
 }
 
 /// Allocation-free guard for the IRQ-return deferred callback drain.
@@ -1388,7 +1355,86 @@ pub fn clear_fpu_owner_all_cpus(pid: usize) {
 
 #[cfg(all(test, feature = "host_harness"))]
 mod host_harness_tests {
+    extern crate std;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn local_storage_drops_each_initialized_value() {
+        static DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        struct Tracked;
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let local = super::CpuLocal::new(|| Tracked);
+        assert!(local.get_cpu(super::MAX_CPUS).is_none());
+        assert_eq!(DROPPED.load(Ordering::Relaxed), 0);
+        local.force_init();
+        assert!(local.get_cpu(0).is_some());
+        drop(local);
+        assert_eq!(DROPPED.load(Ordering::Relaxed), super::MAX_CPUS);
+    }
+
+    #[test]
+    fn concurrent_access_initializes_once_and_shares_atomic_state() {
+        use core::sync::atomic::AtomicUsize;
+        static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+        let local = super::CpuLocal::new(|| {
+            INITIALIZED.fetch_add(1, Ordering::Relaxed);
+            AtomicUsize::new(0)
+        });
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let local = &local;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for cpu in 0..super::MAX_CPUS {
+                        local.get_cpu(cpu).unwrap().fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(INITIALIZED.load(Ordering::Relaxed), super::MAX_CPUS);
+        for cpu in 0..super::MAX_CPUS {
+            assert_eq!(
+                local.with_cpu(cpu, |slot| slot.load(Ordering::Relaxed)),
+                Some(4)
+            );
+        }
+        assert!(local.with_cpu(usize::MAX, |_| ()).is_none());
+    }
+
+    #[test]
+    fn panicking_initializer_drops_partial_slots_and_poison_prevents_access() {
+        use core::sync::atomic::AtomicUsize;
+        static CREATED: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Tracked;
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let local = super::CpuLocal::new(|| {
+            if CREATED.fetch_add(1, Ordering::Relaxed) == 3 {
+                panic!("initializer failure");
+            }
+            Tracked
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| local.force_init())).is_err()
+        );
+        assert_eq!(DROPPED.load(Ordering::Relaxed), 3);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| local.get_cpu(0))).is_err()
+        );
+        drop(local);
+        assert_eq!(DROPPED.load(Ordering::Relaxed), 3);
+        assert_eq!(CREATED.load(Ordering::Relaxed), 4);
+    }
 
     static TOPOLOGY_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
