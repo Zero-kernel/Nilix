@@ -46,6 +46,7 @@ docs/design
 *.md
 *.txt
 *.log
+!scripts/fixtures/iommu_device_probe/serial.log
 *.skill
 .tmp-*/
 core
