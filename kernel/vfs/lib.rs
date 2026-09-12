@@ -75,11 +75,14 @@ extern crate alloc;
 // share this lock even when their fixtures span several filesystem modules.
 #[cfg(test)]
 pub(crate) static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 #[macro_use]
 extern crate drivers;
 #[macro_use]
 extern crate klog;
 
+#[cfg(all(test, feature = "host_harness"))]
+mod allocation_probe;
 pub mod cgroupfs;
 mod context;
 pub mod devfs;
@@ -88,8 +91,10 @@ mod identity;
 pub mod initramfs;
 pub mod manager;
 pub mod mount_namespace;
+mod path;
 pub mod procfs;
 pub mod ramfs;
+mod topology;
 pub mod traits;
 pub mod types;
 

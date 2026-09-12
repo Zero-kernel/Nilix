@@ -1504,6 +1504,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         kernel_core::namespace_probe::run(mask, || {
             arch::ipi::broadcast_ipi(arch::ipi::IpiType::Reschedule);
         });
+        let process = pending_usermode_process
+            .as_ref()
+            .expect("VFS resource probe requires a prepared Ring 3 task");
+        // SAFETY: prepare_usermode_test returned this owned, unscheduled PCB.
+        // No reserve/add/resume call has received it; the first scheduler
+        // admission is the add_process block below, after this borrow returns.
+        // AP selectors only consume their published scheduler queues.
+        unsafe {
+            vfs::manager::run_resource_probe(process);
+        }
+    }
+
     if let Some(process) = pending_usermode_process {
         let pid = process.lock().pid;
         match sched::enhanced_scheduler::Scheduler::add_process(process) {
