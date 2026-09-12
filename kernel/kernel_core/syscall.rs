@@ -3866,20 +3866,20 @@ pub fn syscall_dispatcher(
         // M0 item 5: record this task as the owner of the current syscall frame, so
         // the MUTABLE frame accessor used by signal-handler delivery at the return
         // tail can reject a stale cross-task `frame_ptr` (defense-in-depth + the
-        // invariant the future preemptive-IRQ slice relies on). Gated on the
-        // monotonic global handler hint so the no-handler hot path (musl/native gate)
-        // pays only one relaxed atomic load here. A handler for THIS task is always
+        // invariant the future preemptive-IRQ slice relies on). Exec and raw-image
+        // spawn also need this binding to redirect SYSRET into the replacement
+        // image, even when no signal handler exists. A handler for THIS task is always
         // installed by a PRIOR rt_sigaction syscall (so the hint is already set at a
         // later syscall's entry); a cross-process install that trips the hint mid-
         // syscall is harmless (this task has no handler in its own table, so no frame
         // is ever built and the unset owner is never consulted).
-        if crate::signal::any_handler_installed() {
+        if matches!(syscall_num, 59 | 517) || crate::signal::any_handler_installed() {
             set_syscall_frame_owner(pid);
             // M0 item 5 (1b-2): SNAPSHOT the live syscall-frame binding into the PCB so
             // a blocked-and-resumed return tail can republish it (`switch_context` zeroes
             // the per-CPU `frame_ptr` on a block, which would otherwise fail-close the
-            // delivery accessor and defer the handler to the NEXT syscall). Same handler-
-            // hint gate as the owner-set above, so the no-handler hot path pays nothing.
+            // delivery accessor and defer the handler to the NEXT syscall). The exec
+            // front-ends can also block while loading, so capture their binding here.
             // The binding is owner==pid here (set_syscall_frame_owner just ran); the else
             // arm clears any stale pair if the frame slot is somehow empty (defensive —
             // the syscall ASM always sets `frame_ptr` before this dispatcher runs).
@@ -6305,6 +6305,12 @@ fn exec_from_bytes(
         return Err(SyscallError::ESRCH);
     }
 
+    // The live return frame is on this task's kernel stack, which survives exec
+    // and migration. Reject missing ownership before replacing any user state.
+    if with_current_syscall_frame_mut(process_pid, |_, _| ()).is_none() {
+        return Err(SyscallError::EINVAL);
+    }
+
     // R33-1 FIX: Refuse exec while other threads share this address space.
     // Calling exec in a multithreaded process would free the page tables while
     // sibling threads are still executing, causing UAF/memory corruption.
@@ -6919,10 +6925,8 @@ fn exec_from_bytes(
         // enforcement) can rely on it. See `reset_sigactions_for_exec`.
         reset_sigactions_for_exec(&mut proc.sigactions);
         proc.saved_blocked = 0;
-        // M0 #5 (1b-2): drop any stale syscall-frame binding — exec replaces the
-        // address space; the next handler-bearing syscall re-snapshots a fresh one.
-        proc.saved_frame_ptr = 0;
-        proc.saved_frame_owner = 0;
+        // Keep the active task-owned kernel-stack frame. Exec replaces user
+        // memory, but SYSRET and return-time signal delivery still consume it.
         proc.in_signal_handler = false;
         // M0-6 poll/select: a live ppoll/pselect6 mask stash cannot survive the
         // address-space replacement (the syscall that set it is being replaced).
@@ -6994,6 +6998,34 @@ fn exec_from_bytes(
         load_result.entry,
         final_rsp,
         stack_layout.argc
+    );
+
+    // The syscall stub restores this frame, not proc.context. Returning through
+    // the old RCX/RSP would resume the previous image on the replacement stack.
+    let redirected = with_current_syscall_frame_mut(process_pid, |frame, fx| {
+        *frame = SyscallFrame {
+            rax: 0,
+            rcx: load_result.entry,
+            rdx: 0,
+            rbx: 0,
+            rsp: final_rsp,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0x202,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+        };
+        *fx = default_fxsave_area();
+    });
+    assert!(
+        redirected.is_some(),
+        "exec lost its prevalidated return frame"
     );
 
     // RF178-38 FIX: exec replaces the current task's trust domain without a
