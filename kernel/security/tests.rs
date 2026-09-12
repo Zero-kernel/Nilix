@@ -33,16 +33,20 @@ use crate::{kptr, quick_check, rng, spectre, wxorx, KptrGuard};
 pub enum TestResult {
     /// Test passed successfully
     Pass,
-    /// Test passed with warnings (potential issues)
+    /// Test executed with unresolved warnings (not a pass)
     Warning(&'static str),
+    /// Test could not execute because a prerequisite or fixture is missing.
+    Deferred(&'static str),
+    /// Test explicitly excluded by the selected test policy.
+    Skipped(&'static str),
     /// Test failed (security issue detected)
     Fail(&'static str),
 }
 
 impl TestResult {
-    /// Check if this is a passing result (Pass or Warning).
+    /// Only an unqualified Pass is a passing result.
     pub fn is_ok(&self) -> bool {
-        matches!(self, TestResult::Pass | TestResult::Warning(_))
+        matches!(self, TestResult::Pass)
     }
 
     /// Check if this is a failure.
@@ -56,6 +60,7 @@ impl TestResult {
 pub struct TestOutcome {
     /// Name of the test
     pub name: &'static str,
+    pub owner: &'static str,
     /// Result of the test
     pub result: TestResult,
 }
@@ -69,6 +74,8 @@ pub struct TestReport {
     pub failed: usize,
     /// Number of tests with warnings
     pub warnings: usize,
+    pub deferred: usize,
+    pub skipped: usize,
     /// Individual test outcomes
     pub outcomes: Vec<TestOutcome>,
 }
@@ -80,18 +87,20 @@ impl TestReport {
             passed: 0,
             failed: 0,
             warnings: 0,
+            deferred: 0,
+            skipped: 0,
             outcomes: Vec::new(),
         }
     }
 
-    /// Check if all tests passed (no failures).
+    /// Check if every executed test passed without qualifications.
     pub fn ok(&self) -> bool {
-        self.failed == 0
+        self.is_secure()
     }
 
     /// Check if the system is in a secure state.
     pub fn is_secure(&self) -> bool {
-        self.failed == 0 && self.warnings == 0
+        !self.outcomes.is_empty() && self.outcomes.iter().all(|outcome| outcome.result.is_ok())
     }
 
     /// Print a summary of the test results.
@@ -101,12 +110,46 @@ impl TestReport {
         // Logging handled by caller (lib.rs init function)
         // Access self.passed, self.failed, self.warnings, self.outcomes for details
     }
+
+    /// Emit owned cases and counters for the caller's boot or runtime suite.
+    pub fn emit_evidence(&self, suite: &str) {
+        for outcome in &self.outcomes {
+            let (status, reason) = match &outcome.result {
+                TestResult::Pass => ("pass", ""),
+                TestResult::Warning(reason) => ("warning", *reason),
+                TestResult::Deferred(reason) => ("deferred", *reason),
+                TestResult::Skipped(reason) => ("skipped", *reason),
+                TestResult::Fail(reason) => ("failed", *reason),
+            };
+            klog::klog_always!(
+                "{}-CASE name={} status={} owner={} reason={:?}",
+                suite,
+                outcome.name,
+                status,
+                outcome.owner,
+                reason
+            );
+        }
+        klog::klog_always!(
+            "{}-COUNTS passed={} warning={} deferred={} skipped={} failed={}",
+            suite,
+            self.passed,
+            self.warnings,
+            self.deferred,
+            self.skipped,
+            self.failed
+        );
+    }
 }
 
 /// Trait for implementing security tests.
 pub trait SecurityTest {
     /// Name of the test (for reporting).
     fn name(&self) -> &'static str;
+
+    fn owner(&self) -> &'static str {
+        core::any::type_name::<Self>()
+    }
 
     /// Run the test and return the result.
     fn run(&self, ctx: &TestContext) -> TestResult;
@@ -154,6 +197,8 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut warnings = 0usize;
+    let mut deferred = 0usize;
+    let mut skipped = 0usize;
 
     for test in tests {
         let result = test.run(ctx);
@@ -165,6 +210,8 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
             TestResult::Warning(_) => {
                 warnings += 1;
             }
+            TestResult::Deferred(_) => deferred += 1,
+            TestResult::Skipped(_) => skipped += 1,
             TestResult::Fail(_) => {
                 failed += 1;
             }
@@ -172,6 +219,7 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
 
         outcomes.push(TestOutcome {
             name: test.name(),
+            owner: test.owner(),
             result,
         });
     }
@@ -180,6 +228,8 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
         passed,
         failed,
         warnings,
+        deferred,
+        skipped,
         outcomes,
     }
 }
@@ -202,6 +252,7 @@ pub fn run_test(name: &str, ctx: &TestContext) -> Option<TestOutcome> {
         if test.name() == name {
             return Some(TestOutcome {
                 name: test.name(),
+                owner: test.owner(),
                 result: test.run(ctx),
             });
         }
@@ -230,7 +281,9 @@ impl SecurityTest for QuickValidationTest {
         match quick_check(ctx.phys_offset) {
             Ok(true) => TestResult::Pass,
             Ok(false) => TestResult::Fail("W^X violation detected by quick_check"),
-            Err(_) => TestResult::Warning("quick_check failed to execute"),
+            Err(_) => TestResult::Deferred(
+                "quick_check could not execute; page-table validation prerequisite unavailable",
+            ),
         }
     }
 }
@@ -255,7 +308,7 @@ impl SecurityTest for WxorxFullValidationTest {
             Err(wxorx::WxorxError::PolicyViolation(_)) => {
                 TestResult::Fail("Active page tables violate W^X policy")
             }
-            Err(_) => TestResult::Warning("W^X validation encountered an error"),
+            Err(_) => TestResult::Deferred("W^X validation could not complete its page-table walk"),
         }
     }
 }
@@ -375,13 +428,13 @@ impl SecurityTest for SpectreStatusTest {
     }
 
     fn run(&self, _ctx: &TestContext) -> TestResult {
-        let status = spectre::detect();
+        let status = spectre::current_cpu_status();
 
         // Check if we have any mitigation
         if !status.hardened() {
             // Check if hardware doesn't support mitigations
             if !status.ibrs_supported && !status.stibp_supported {
-                return TestResult::Warning("CPU lacks hardware Spectre mitigations");
+                return TestResult::Deferred("CPU lacks hardware Spectre mitigations");
             }
 
             // Mitigations supported but not enabled
@@ -451,28 +504,9 @@ impl SecurityTest for SpectreV2RetpolineTest {
     }
 
     fn run(&self, _ctx: &TestContext) -> TestResult {
-        let status = spectre::detect();
-
-        // Check if retpoline is enabled via compiler
-        if status.retpoline_compiler {
-            return TestResult::Pass;
-        }
-
-        // Check if hardware mitigations are available
-        if status.ibrs_supported {
-            return TestResult::Pass;
-        }
-
-        // No retpoline and no hardware support - downgrade to warning in test/CI
-        // environments (QEMU qemu64 CPU doesn't support IBRS). Production systems
-        // should either enable retpoline compilation or use CPUs with IBRS support.
-        if status.retpoline_required {
-            return TestResult::Warning(
-                "Retpoline required but not available (acceptable in test/CI)",
-            );
-        }
-
-        TestResult::Warning("No Spectre V2 mitigation detected")
+        TestResult::Deferred(
+            "Compiler retpoline is unsupported; no complete final-ELF transformation proof",
+        )
     }
 }
 
@@ -511,7 +545,7 @@ impl SecurityTest for SmapEnforcementTest {
             }
         }
 
-        TestResult::Warning("SMAP not supported by CPU")
+        TestResult::Deferred("SMAP not supported by CPU")
     }
 }
 
@@ -550,7 +584,7 @@ impl SecurityTest for SmepEnforcementTest {
             }
         }
 
-        TestResult::Warning("SMEP not supported by CPU")
+        TestResult::Deferred("SMEP not supported by CPU")
     }
 }
 

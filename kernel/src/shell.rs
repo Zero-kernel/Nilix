@@ -631,6 +631,12 @@ impl Shell {
                 crate::runtime_tests::TestResult::Warning(msg) => {
                     klog_always!("  [WARN] {}: {}", test_name, msg);
                 }
+                crate::runtime_tests::TestResult::Deferred(msg) => {
+                    klog_always!("  [DEFERRED] {}: {}", test_name, msg);
+                }
+                crate::runtime_tests::TestResult::Skipped(msg) => {
+                    klog_always!("  [SKIPPED] {}: {}", test_name, msg);
+                }
                 crate::runtime_tests::TestResult::Fail(msg) => {
                     klog_always!("  [FAIL] {}: {}", test_name, msg);
                 }

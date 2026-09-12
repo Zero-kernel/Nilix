@@ -220,6 +220,7 @@ pub struct TestStats {
     pub passed: usize,
     pub failed: usize,
     pub warnings: usize,
+    pub deferred: usize,
     pub skipped: usize,
     pub implemented: usize,
     pub placeholders: usize,
@@ -232,15 +233,19 @@ impl TestStats {
 
     pub fn add_outcome(&mut self, result: &TestResult) {
         self.total += 1;
-        self.implemented += 1; // All outcomes are from implemented tests
+        if !matches!(result, TestResult::Deferred(_) | TestResult::Skipped(_)) {
+            self.implemented += 1;
+        }
 
         // Track execution result
         match result {
             TestResult::Pass => self.passed += 1,
-            TestResult::Warning(_) => {
-                self.passed += 1;
-                self.warnings += 1;
+            TestResult::Warning(_) => self.warnings += 1,
+            TestResult::Deferred(_) => {
+                self.deferred += 1;
+                self.placeholders += 1;
             }
+            TestResult::Skipped(_) => self.skipped += 1,
             TestResult::Fail(_) => self.failed += 1,
         }
     }
@@ -304,7 +309,7 @@ impl TestReport {
     }
 
     pub fn ok(&self) -> bool {
-        self.overall.failed == 0
+        self.overall.total > 0 && self.overall.passed == self.overall.total
     }
 
     pub fn category_stats(&self, category: TestCategory) -> Option<&TestStats> {
@@ -379,6 +384,14 @@ pub fn run_tests_by_category(category: TestCategory) -> TestReport {
         warnings: filtered_outcomes
             .iter()
             .filter(|o| matches!(o.result, TestResult::Warning(_)))
+            .count(),
+        deferred: filtered_outcomes
+            .iter()
+            .filter(|o| matches!(o.result, TestResult::Deferred(_)))
+            .count(),
+        skipped: filtered_outcomes
+            .iter()
+            .filter(|o| matches!(o.result, TestResult::Skipped(_)))
             .count(),
         outcomes: filtered_outcomes,
     };

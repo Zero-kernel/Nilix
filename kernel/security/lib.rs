@@ -226,11 +226,7 @@ impl SecurityReport {
     /// R178-L5 FIX: Consider skipped protections and test warnings
     pub fn is_secure(&self) -> bool {
         // Tests must pass (no failures) and have no warnings
-        let tests_ok = self
-            .test_report
-            .as_ref()
-            .map(|t| t.failed == 0 && t.warnings == 0)
-            .unwrap_or(false);
+        let tests_ok = self.test_report.as_ref().map(|t| t.ok()).unwrap_or(false);
 
         // Identity cleanup must not be skipped
         let identity_ok = !matches!(self.identity_cleanup, CleanupOutcome::Skipped);
@@ -319,10 +315,12 @@ impl SecurityReport {
             klog!(Info, "Security Self-Tests:");
             klog!(
                 Info,
-                "  Passed: {}, Failed: {}, Warnings: {}",
+                "  Passed: {}, Failed: {}, Warnings: {}, Deferred: {}, Skipped: {}",
                 tests.passed,
                 tests.failed,
-                tests.warnings
+                tests.warnings,
+                tests.deferred,
+                tests.skipped
             );
         }
 
@@ -498,7 +496,7 @@ pub fn init(
         match spectre::init() {
             Ok(status) => {
                 klog_always!("      Mitigations: {}", status.summary());
-                if status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled {
+                if !status.hardened() {
                     klog!(Warn, "      WARNING: Retpoline required but not available");
                     report.total_violations += 1;
                 }
@@ -531,9 +529,12 @@ pub fn init(
                 test_report.failed
             );
             report.total_violations += test_report.failed;
-        } else {
+        } else if test_report.ok() {
             klog_always!("      All {} tests passed", test_report.passed);
+        } else {
+            klog_always!("      Security tests: {} passed, {} warnings, {} deferred, {} skipped; qualification pending", test_report.passed, test_report.warnings, test_report.deferred, test_report.skipped);
         }
+        test_report.emit_evidence("SECURITY-BOOT");
 
         report.test_report = Some(test_report);
     } else {

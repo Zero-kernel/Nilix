@@ -45,19 +45,33 @@ use core::sync::atomic::Ordering;
 pub enum TestResult {
     /// Test passed successfully
     Pass,
-    /// Test passed with a warning
+    /// Test ran but reported an unresolved warning
     Warning(String),
+    /// Required prerequisite or implementation is missing; see the per-test record.
+    Deferred(String),
+    /// Explicitly excluded by the selected test profile.
+    Skipped(String),
     /// Test failed
     Fail(String),
 }
 
 impl TestResult {
     pub fn is_pass(&self) -> bool {
-        matches!(self, TestResult::Pass | TestResult::Warning(_))
+        matches!(self, TestResult::Pass)
     }
 
     pub fn is_fail(&self) -> bool {
         matches!(self, TestResult::Fail(_))
+    }
+
+    fn record(&self) -> (&'static str, &str) {
+        match self {
+            Self::Pass => ("pass", ""),
+            Self::Warning(reason) => ("warning", reason),
+            Self::Deferred(reason) => ("deferred", reason),
+            Self::Skipped(reason) => ("skipped", reason),
+            Self::Fail(reason) => ("failed", reason),
+        }
     }
 }
 
@@ -74,6 +88,8 @@ pub struct TestReport {
     pub passed: usize,
     pub failed: usize,
     pub warnings: usize,
+    pub deferred: usize,
+    pub skipped: usize,
     pub outcomes: Vec<TestOutcome>,
 }
 
@@ -83,18 +99,28 @@ impl TestReport {
             passed: 0,
             failed: 0,
             warnings: 0,
+            deferred: 0,
+            skipped: 0,
             outcomes: Vec::new(),
         }
     }
 
     pub fn ok(&self) -> bool {
-        self.failed == 0
+        !self.outcomes.is_empty()
+            && self.failed == 0
+            && self.warnings == 0
+            && self.deferred == 0
+            && self.skipped == 0
     }
 }
 
 /// Trait for runtime tests
 pub trait RuntimeTest {
     fn name(&self) -> &'static str;
+    /// Source implementation responsible for the test and any deferred work.
+    fn owner(&self) -> &'static str {
+        core::any::type_name::<Self>()
+    }
     fn run(&self) -> TestResult;
     fn description(&self) -> &'static str {
         "Runtime validation test"
@@ -175,7 +201,7 @@ impl RuntimeTest for BuddyAllocatorTest {
         // Get initial stats
         let stats_before = match buddy_allocator::get_allocator_stats() {
             Some(s) => s,
-            None => return TestResult::Warning(String::from("Buddy allocator not initialized")),
+            None => return TestResult::Deferred(String::from("Buddy allocator not initialized")),
         };
 
         // Allocate a single page
@@ -558,7 +584,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                     ));
                 }
 
-                TestResult::Warning(alloc::format!(
+                TestResult::Deferred(alloc::format!(
                     "Fork admission failed due to capacity constraints: {:?}",
                     error
                 ))
@@ -1583,12 +1609,14 @@ impl RuntimeTest for SecuritySubsystemTest {
         };
 
         let report = run_security_tests(&ctx);
+        klog_always!();
+        report.emit_evidence("SECURITY");
 
         if report.failed > 0 {
             return TestResult::Fail(alloc::format!(
                 "{} security tests failed out of {}",
                 report.failed,
-                report.passed + report.failed + report.warnings
+                report.outcomes.len()
             ));
         }
 
@@ -1596,6 +1624,19 @@ impl RuntimeTest for SecuritySubsystemTest {
             return TestResult::Warning(alloc::format!(
                 "{} security tests had warnings",
                 report.warnings
+            ));
+        }
+
+        if report.deferred > 0 {
+            return TestResult::Deferred(alloc::format!(
+                "{} security tests deferred; see owned SECURITY-CASE records",
+                report.deferred
+            ));
+        }
+        if report.skipped > 0 {
+            return TestResult::Skipped(alloc::format!(
+                "{} security tests skipped; see owned SECURITY-CASE records",
+                report.skipped
             ));
         }
 
@@ -1626,7 +1667,7 @@ impl RuntimeTest for SmpOnlineTest {
         if online > 1 {
             TestResult::Pass
         } else {
-            TestResult::Warning(String::from("Only 1 CPU online; SMP tests will be skipped"))
+            TestResult::Deferred(String::from("Only 1 CPU online; SMP tests will be skipped"))
         }
     }
 }
@@ -1650,7 +1691,9 @@ impl RuntimeTest for IpiPingPongTest {
         use mm::tlb_shootdown::is_cpu_online;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from("Single-core system; skipping IPI ping-pong"));
+            return TestResult::Deferred(String::from(
+                "Single-core system; skipping IPI ping-pong",
+            ));
         }
 
         let self_cpu = current_cpu_id();
@@ -1738,7 +1781,7 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
         use mm::tlb_shootdown::{flush_current_as_all, is_cpu_online};
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core system; skipping TLB coherency test",
             ));
         }
@@ -2023,7 +2066,9 @@ impl RuntimeTest for SchedulerAffinityTest {
         use sched::Scheduler;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from("Single-core system; skipping affinity test"));
+            return TestResult::Deferred(String::from(
+                "Single-core system; skipping affinity test",
+            ));
         }
 
         // Verify cpu_allowed() helper treats 0 as "all CPUs" (R70-3 fix)
@@ -2092,7 +2137,7 @@ impl RuntimeTest for R175TlbShootdownStressTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; D0-CROSS-2 stress requires 2+ CPUs",
             ));
         }
@@ -2122,7 +2167,7 @@ impl RuntimeTest for R175SignalFramePointerTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; D0-CROSS-1 stress requires 2+ CPUs",
             ));
         }
@@ -2151,7 +2196,7 @@ impl RuntimeTest for R175SchedulerAtomicityTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; D0-CROSS-3 stress requires 2+ CPUs",
             ));
         }
@@ -2186,8 +2231,8 @@ impl RuntimeTest for Rf17833SchedulerSmpGateTest {
         let online = num_online_cpus();
         if online <= 1 {
             // P0-B harness fails the suite if this soft-skips under -smp 2.
-            // Still return Warning so single-CPU `make test` stays diagnostic.
-            return TestResult::Warning(String::from(
+            // Return Deferred so single-CPU `make test` stays diagnostic.
+            return TestResult::Deferred(String::from(
                 "Single-core; RF178-33 SMP gate requires 2+ CPUs",
             ));
         }
@@ -2305,6 +2350,8 @@ pub fn run_all_runtime_tests() -> TestReport {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut warnings = 0usize;
+    let mut deferred = 0usize;
+    let mut skipped = 0usize;
 
     klog_always!();
     klog_always!("=== Runtime Functional Tests ===");
@@ -2324,12 +2371,28 @@ pub fn run_all_runtime_tests() -> TestReport {
                 klog_always!("WARN: {}", msg);
                 warnings += 1;
             }
+            TestResult::Deferred(msg) => {
+                klog_always!("DEFERRED: {}", msg);
+                deferred += 1;
+            }
+            TestResult::Skipped(msg) => {
+                klog_always!("SKIPPED: {}", msg);
+                skipped += 1;
+            }
             TestResult::Fail(msg) => {
                 klog_always!("FAIL: {}", msg);
                 failed += 1;
             }
         }
 
+        let (status, reason) = result.record();
+        klog_always!(
+            "RUNTIME-CASE name={} status={} owner={} reason={:?}",
+            test.name(),
+            status,
+            test.owner(),
+            reason
+        );
         outcomes.push(TestOutcome {
             name: test.name(),
             result,
@@ -2338,23 +2401,20 @@ pub fn run_all_runtime_tests() -> TestReport {
 
     klog_always!();
     klog_always!(
-        "=== Test Summary: {} passed, {} deferred (awaiting syscall infrastructure), {} failed ===",
+        "=== Test Summary: {} passed, {} deferred (see per-test reasons), {} failed ===",
         passed,
-        warnings,
+        deferred,
         failed
     );
 
-    if warnings > 0 {
-        klog_always!();
-        klog_always!("Deferred tests are correctly implemented placeholders that will activate");
-        klog_always!("automatically once syscall infrastructure (fork/exec/signals) is complete.");
-        klog_always!("Categories awaiting syscall infrastructure:");
-        klog_always!("  • Architecture tests (5) - context switch, TLS, FPU state");
-        klog_always!("  • Memory tests (5) - COW, PT tracking, stack guards");
-        klog_always!("  • IPC tests (5) - futex, signals, pipes");
-        klog_always!("  • Scheduler tests (5) - work stealing, migration");
-        klog_always!("  • VFS tests (5) - file operations, rename safety");
-    }
+    klog_always!(
+        "RUNTIME-COUNTS passed={} warning={} deferred={} skipped={} failed={}",
+        passed,
+        warnings,
+        deferred,
+        skipped,
+        failed
+    );
 
     klog_always!();
 
@@ -2362,6 +2422,8 @@ pub fn run_all_runtime_tests() -> TestReport {
         passed,
         failed,
         warnings,
+        deferred,
+        skipped,
         outcomes,
     }
 }
@@ -2649,7 +2711,7 @@ impl RuntimeTest for MultithreadedUnshareTest {
         if group_size > 1 {
             // If there were multiple threads, CLONE_NEWNS would be rejected
             // This is the R74-3 fix: prevent namespace divergence
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Multiple threads detected - CLONE_NEWNS would be rejected (R74-3)",
             ));
         }
@@ -2697,7 +2759,7 @@ impl RuntimeTest for TlbShootdownPcidTest {
 
         let cpus = num_online_cpus();
         if cpus < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "TLB shootdown PCID test requires SMP (only 1 CPU online)",
             ));
         }
@@ -3311,7 +3373,7 @@ impl RuntimeTest for NetNsTxIsolationTest {
 
         // Leg 0: preconditions — QEMU virtio-net registers eth0 under `make test`.
         let Some(eth0_idx_usize) = net::device_index("eth0") else {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "eth0 absent — TX-isolation legs need QEMU virtio-net (make test provides it)",
             ));
         };
@@ -3987,7 +4049,7 @@ impl RuntimeTest for NetNsArpExhaustionTest {
             // Could not establish pressure (e.g. the shared global admission
             // pool saturated first) — report honestly instead of asserting a
             // failure the setup never created.
-            return TestResult::Warning(alloc::format!(
+            return TestResult::Deferred(alloc::format!(
                 "leg 2: could not exhaust NetnsConfig headroom (remaining={} B after {} \
                  reservations)",
                 remaining,
@@ -5022,7 +5084,7 @@ impl RuntimeTest for NetNsConfigIsolationTest {
                 }
             },
             None => {
-                return TestResult::Warning(String::from(
+                return TestResult::Deferred(String::from(
                     "legs 1-6 passed; TX-path identity legs skipped — eth0 absent (make test \
                  provides QEMU virtio-net)",
                 ));
@@ -5645,7 +5707,7 @@ impl RuntimeTest for NetNsRxIngressTest {
         // Leg 0: preconditions. QEMU virtio-net registers eth0 under `make
         // test`; the reply-TX leg egresses through it.
         if net::device_index("eth0").is_none() {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "eth0 absent — RX-ingress reply legs need QEMU virtio-net (make test provides it)",
             ));
         }
@@ -6109,6 +6171,14 @@ impl RuntimeTest for NetNsRxPoolLifecycleTest {
     fn run(&self) -> TestResult {
         let _quiesce = net::quiesce_rx_ingress_background();
 
+        // The production drain deliberately refuses stocking until the root
+        // RX owner has an identity. Bare q35 has no supported NIC to supply it.
+        if !matches!(net::tx_net_config(0), Ok(cfg) if cfg.our_mac.0 != [0; 6]) {
+            return TestResult::Deferred(String::from(
+                "RX pool lifecycle requires configured root MAC; kernel/net owner; run make test-smp-4core with virtio-net",
+            ));
+        }
+
         // Leg 0: devices (idempotent — the registry has no removal API).
         let pool_shared = RX_POOL_TEST_SHARED
             .call_once(|| {
@@ -6392,7 +6462,7 @@ impl RuntimeTest for NetNsRxEth0SlirpTest {
         let _quiesce = net::quiesce_rx_ingress_background();
 
         if net::device_index("eth0").is_none() {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "eth0 absent — the SLIRP round trip needs QEMU virtio-net (make test provides it)",
             ));
         }
@@ -6406,7 +6476,7 @@ impl RuntimeTest for NetNsRxEth0SlirpTest {
             return TestResult::Fail(String::from("root MAC still zero with eth0 present"));
         }
         if cfg.gateway_ip != Ipv4Addr([10, 0, 2, 2]) {
-            return TestResult::Warning(alloc::format!(
+            return TestResult::Deferred(alloc::format!(
                 "non-SLIRP topology (gateway {:?}) — the 10.0.2.3 ARP-answer gate only \
                  holds under QEMU user networking",
                 cfg.gateway_ip
@@ -6637,7 +6707,7 @@ impl RuntimeTest for NetNsArpProbeTxTest {
 
         // ---- Live preconditions (mirror the SLIRP test's Warning gates).
         if net::device_index("eth0").is_none() {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "leg A passed; live legs need QEMU virtio-net eth0 (make test provides it)",
             ));
         }
@@ -6651,7 +6721,7 @@ impl RuntimeTest for NetNsArpProbeTxTest {
             return TestResult::Fail(String::from("root MAC still zero with eth0 present"));
         }
         if cfg.subnet_prefix_len > 24 {
-            return TestResult::Warning(alloc::format!(
+            return TestResult::Deferred(alloc::format!(
                 "leg A passed; live-leg fixtures assume a /24-or-wider subnet (prefix {})",
                 cfg.subnet_prefix_len
             ));
@@ -7098,7 +7168,7 @@ impl RuntimeTest for NetNsPendingFrameTest {
         let _quiesce = net::quiesce_rx_ingress_background();
 
         if net::device_index("eth0").is_none() {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "eth0 absent — pending-frame gates need QEMU virtio-net (make test provides it)",
             ));
         }
@@ -7451,10 +7521,12 @@ pub fn generate_coverage_report() {
 
     klog_always!();
     klog_always!(
-        "Total: {} tests, {} passed, {} warnings, {} failed",
-        report.passed + report.failed + report.warnings,
+        "Total: {} tests, {} passed, {} warnings, {} deferred, {} skipped, {} failed",
+        report.outcomes.len(),
         report.passed,
         report.warnings,
+        report.deferred,
+        report.skipped,
         report.failed
     );
     klog_always!();

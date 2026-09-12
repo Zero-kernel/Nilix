@@ -1,5 +1,5 @@
 // Heavy Contention & Extended Runtime Stress Tests
-// These are PLACEHOLDER implementations that will activate when Ring-3 infrastructure is ready.
+// These entries describe guest workloads and oracles that still need implementation.
 // They represent the INTENDED stress test workloads for R175 D0 fix validation.
 
 use crate::runtime_tests::{RuntimeTest, TestResult};
@@ -29,14 +29,14 @@ impl RuntimeTest for HeavyTlbShootdownContentionTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; heavy TLB contention requires 2+ CPUs",
             ));
         }
 
         // PLACEHOLDER: Requires Ring-3 fork/mmap/munmap syscalls
-        TestResult::Warning(String::from(
-            "Heavy TLB contention test requires mmap/munmap syscalls - will activate when available"
+        TestResult::Deferred(String::from(
+            "The 10K mmap/munmap guest contention workload and corruption oracle are not implemented"
         ))
     }
 }
@@ -66,14 +66,14 @@ impl RuntimeTest for RapidSignalMigrationContentionTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; signal migration test requires 2+ CPUs",
             ));
         }
 
         // PLACEHOLDER: Requires Ring-3 fork/signal/migration syscalls
-        TestResult::Warning(String::from(
-            "Rapid signal migration test requires fork/signal syscalls - will activate when available"
+        TestResult::Deferred(String::from(
+            "The concurrent signal and migration guest workload and register oracle are not implemented"
         ))
     }
 }
@@ -102,14 +102,14 @@ impl RuntimeTest for NamespaceTeardownStormTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Single-core; namespace teardown storm requires 2+ CPUs",
             ));
         }
 
         // PLACEHOLDER: Requires Ring-3 unshare/kill syscalls
-        TestResult::Warning(String::from(
-            "Namespace teardown storm test requires unshare/kill syscalls - will activate when available"
+        TestResult::Deferred(String::from(
+            "The concurrent namespace teardown guest workload and lifecycle oracle are not implemented"
         ))
     }
 }
@@ -142,14 +142,14 @@ impl RuntimeTest for ExtendedRuntimeStressTest {
 
         let cpus = num_online_cpus();
         if cpus < 4 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Extended runtime stress test requires 4+ CPUs",
             ));
         }
 
         // PLACEHOLDER: Requires all Ring-3 syscalls + multi-hour runtime
-        TestResult::Warning(String::from(
-            "Extended 1-hour stress test requires full syscall infrastructure - will activate when available"
+        TestResult::Deferred(String::from(
+            "The combined one-hour guest stress workload and failure oracle are not implemented",
         ))
     }
 }

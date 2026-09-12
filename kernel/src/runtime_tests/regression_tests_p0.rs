@@ -1,6 +1,6 @@
 //! P0 Security-Critical Regression Tests
 //!
-//! This module contains 25 production-ready tests covering R172-R174 QA findings.
+//! This module registers 25 checks for R172-R174 QA findings; individual cases may be deferred.
 //! These tests validate critical kernel subsystems that can lead to privilege
 //! escalation, data corruption, or system instability if broken.
 //!
@@ -14,7 +14,7 @@
 //!
 //! # Implementation Status
 //!
-//! All 25 tests are production-ready and follow the existing RuntimeTest pattern.
+//! Each check reports its actual execution status and any missing workload or prerequisite.
 
 extern crate alloc;
 
@@ -42,8 +42,8 @@ impl RuntimeTest for ContextSwitchRipRflagsTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
-            "Test requires syscall infrastructure - placeholder for future implementation",
+        TestResult::Deferred(String::from(
+            "The named guest regression workload and assertion oracle are not implemented",
         ))
     }
 }
@@ -63,8 +63,8 @@ impl RuntimeTest for TlsIsolationTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
-            "Test requires syscall infrastructure - placeholder for future implementation",
+        TestResult::Deferred(String::from(
+            "The named guest regression workload and assertion oracle are not implemented",
         ))
     }
 }
@@ -101,7 +101,7 @@ impl RuntimeTest for SyscallActiveLeakTest {
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Per-CPU infrastructure validated; full test requires process context switching",
         ))
     }
@@ -128,12 +128,12 @@ impl RuntimeTest for WorkStealingOnCpuGateTest {
         // Verify SMP is configured
         let num_cpus = num_online_cpus();
         if num_cpus < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Work-stealing test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(alloc::format!(
+        TestResult::Deferred(alloc::format!(
             "SMP configured ({} CPUs); full test requires process stress testing",
             num_cpus
         ))
@@ -161,7 +161,7 @@ impl RuntimeTest for FpuStateIrqIsolationTest {
         // Test FPU state save/restore infrastructure exists
         // Full test requires IRQ injection during FPU operations (deferred)
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "FPU subsystem placeholder; full isolation test requires IRQ simulation",
         ))
     }
@@ -191,12 +191,12 @@ impl RuntimeTest for CowTlbShootdownTest {
 
         // Requires SMP
         if num_online_cpus() < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "TLB shootdown test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "SMP available; full COW test requires fork + concurrent memory access",
         ))
     }
@@ -232,7 +232,7 @@ impl RuntimeTest for PtChargeTrackingTest {
             return TestResult::Fail(String::from("Buddy allocator reports 0 total pages"));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Buddy allocator operational; full PT charge test requires mmap/munmap operations",
         ))
     }
@@ -253,7 +253,7 @@ impl RuntimeTest for BrkVaReservationToctouTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_brk() concurrent stress testing - placeholder",
         ))
     }
@@ -274,7 +274,7 @@ impl RuntimeTest for StackGuardPageTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires process creation + recursive stack overflow - placeholder",
         ))
     }
@@ -309,7 +309,7 @@ impl RuntimeTest for OomGracefulHandlingTest {
         // Full test requires exhausting memory (dangerous in boot environment)
 
         if stats.free_pages > 0 {
-            TestResult::Warning(alloc::format!(
+            TestResult::Deferred(alloc::format!(
                 "OOM infrastructure present; {} pages available (full test would exhaust memory)",
                 stats.free_pages
             ))
@@ -338,7 +338,7 @@ impl RuntimeTest for FutexWaitWakeCorrectnessTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_futex() with fork - placeholder for future implementation",
         ))
     }
@@ -359,7 +359,7 @@ impl RuntimeTest for FutexLockPiPriorityInheritanceTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_futex(FUTEX_LOCK_PI) with priority manipulation - placeholder",
         ))
     }
@@ -380,7 +380,7 @@ impl RuntimeTest for FutexBucketToctouTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires concurrent sys_futex() stress testing - placeholder",
         ))
     }
@@ -401,7 +401,7 @@ impl RuntimeTest for PipeEintrWakeTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_pipe() + sys_read() + signal delivery - placeholder",
         ))
     }
@@ -422,7 +422,7 @@ impl RuntimeTest for SignalDeliveryToBlockedSyscallTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires signal infrastructure + blocking syscall - placeholder",
         ))
     }
@@ -450,12 +450,12 @@ impl RuntimeTest for SmpWorkStealingSafetyTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Work stealing test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "SMP available; full test requires 100+ concurrent processes with TLS verification",
         ))
     }
@@ -475,7 +475,7 @@ impl RuntimeTest for NonBlockingGetProcessInIrqTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires IRQ context verification - placeholder",
         ))
     }
@@ -499,12 +499,12 @@ impl RuntimeTest for ProcessMigrationSafetyTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Migration test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "SMP available; full test requires forced migration with state verification",
         ))
     }
@@ -527,12 +527,12 @@ impl RuntimeTest for SchedulerLoadBalancingTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Load balancing test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "SMP available; full test requires workload distribution metrics",
         ))
     }
@@ -556,12 +556,12 @@ impl RuntimeTest for CpuAffinityEnforcementTest {
         use arch::num_online_cpus;
 
         if num_online_cpus() < 2 {
-            return TestResult::Warning(String::from(
+            return TestResult::Deferred(String::from(
                 "Affinity test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "SMP available; full test requires sys_sched_setaffinity() + CPU pinning verification",
         ))
     }
@@ -585,7 +585,7 @@ impl RuntimeTest for RamfsBasicOperationsTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_open/write/read/close - placeholder",
         ))
     }
@@ -605,7 +605,7 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_rename() with cycle detection verification - placeholder",
         ))
     }
@@ -626,7 +626,7 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires sys_rename() concurrent stress testing - placeholder",
         ))
     }
@@ -646,7 +646,7 @@ impl RuntimeTest for VfsPathResolutionTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires VFS path lookup with symbolic links - placeholder",
         ))
     }
@@ -667,7 +667,7 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Warning(String::from(
+        TestResult::Deferred(String::from(
             "Test requires concurrent sys_mkdir/rmdir/unlink operations - placeholder",
         ))
     }
