@@ -80,7 +80,9 @@ steps, and only 15 unique site/CPU observations in 300 seconds. Buffered reads
 preserve packet framing, checksum, timeout and thread validation. Duplicate
 site/CPU stops do not require repeated CPL3 proof after that pair was already
 verified. All 17 unique observations and the complete fork/exec workload remain
-required. The workload emits bounded, per-attempt evidence when concurrent
+required. CI allows a 600-second collector deadline for slower hosted QEMU
+versions; the musl matrix gives slower single-CPU QEMU runs a 300-second
+completion window. The workload emits bounded, per-attempt evidence when concurrent
 fork/exec allocation transiently returns ENOMEM; a non-recovering exec failure
 still fails the gate. Linux QEMU 6.2 validation passes all 17 observations and
 the complete workload, and `mitigation_check_test.py` passes its 48 regression

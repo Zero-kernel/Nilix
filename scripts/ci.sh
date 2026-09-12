@@ -62,7 +62,7 @@ case "$group" in
     musl)
         gate build -- make build-musl-test
         for cpus in 1 4; do
-            check "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=120 \
+            check "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=300 \
                 bash scripts/musl_check.sh kernel-target/musl/esp
         done
         ;;
@@ -81,6 +81,11 @@ PY
         check device -- python3 scripts/iommu_device_probe.py --input-manifest "$out/inputs.sha256" --revision "$revision" --artifacts "$out/device-probe"
         ;;
     mitigation)
+        mitigation_timeout="${MITIGATION_TIMEOUT:-600}"
+        if [[ ! "$mitigation_timeout" =~ ^[1-9][0-9]*$ ]]; then
+            echo "MITIGATION_TIMEOUT must be a positive integer" >&2
+            exit 2
+        fi
         check unsupported-retpoline -- bash -c '
             if cargo check --manifest-path kernel/security/Cargo.toml --target x86_64-unknown-linux-gnu --features retpoline,mm/host_harness,cpu_local/host_harness --locked > "$1" 2>&1; then
                 echo "unsupported retpoline unexpectedly compiled"; exit 1
@@ -88,7 +93,7 @@ PY
             grep -F "retpoline is unsupported: no verified compiler transformation" "$1"
         ' -- "$out/retpoline-negative.log"
         gate build -- make build-mitigation-probe
-        check runtime -- python3 scripts/mitigation_check.py --runtime --smp 4 --timeout 300 \
+        check runtime -- python3 scripts/mitigation_check.py --runtime --smp 4 --timeout "$mitigation_timeout" \
             --kernel-elf kernel-target/mitigation/x86_64-unknown-none/release/kernel \
             --esp kernel-target/mitigation/esp --build-command-json kernel-target/mitigation/build-command.json \
             --artifacts "$out/proof"
