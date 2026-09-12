@@ -159,8 +159,8 @@ __zero_os_usercopy_put_u8:
     // fail closed on the latter.
     .global __zero_os_usercopy_cmpxchg_u32
 __zero_os_usercopy_cmpxchg_u32:
-.Lcmpxchg_u32_access:
     mov eax, esi
+.Lcmpxchg_u32_access:
     lock cmpxchg dword ptr [rdi], edx
     ret
 .Lcmpxchg_u32_fixup:
@@ -1684,6 +1684,21 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
 #[cfg(test)]
 mod robust_usercopy_tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ksa002_cmpxchg_mapped_success_and_mismatch() {
+        let mut word = u32::MAX;
+        let observed = unsafe { __zero_os_usercopy_cmpxchg_u32(&mut word, u32::MAX, 17) };
+        assert_eq!(observed, u64::from(u32::MAX));
+        assert_eq!(word, 17);
+        let observed = unsafe { __zero_os_usercopy_cmpxchg_u32(&mut word, 18, u32::MAX) };
+        assert_eq!(observed, 17);
+        assert_eq!(word, 17);
+        let observed = unsafe { __zero_os_usercopy_cmpxchg_u32(&mut word, 17, 0) };
+        assert_eq!(observed, 17);
+        assert_eq!(word, 0);
+    }
 
     #[test]
     fn robust_atomic_helpers_reject_invalid_ranges_before_assembly() {
