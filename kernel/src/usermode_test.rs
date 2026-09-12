@@ -365,6 +365,27 @@ pub fn prepare_usermode_test() -> Option<ProcessArc> {
     klog!(Info, "\n=== Ring 3 Execution Test ===\n");
     klog!(Info, "Embedded ELF size: {} bytes", user_elf().len());
 
+    // The musl guest re-execs the same image to exercise descriptor inheritance
+    // through the real VFS/ELF/exec path. This fixture exists only in that profile.
+    #[cfg(feature = "musl_test")]
+    {
+        let flags = vfs::OpenFlags::new(
+            vfs::OpenFlags::O_CREAT | vfs::OpenFlags::O_WRONLY | vfs::OpenFlags::O_TRUNC,
+        );
+        let prepared = vfs::VFS.open_trusted("/musl-test", flags, 0o755);
+        let written = prepared.and_then(|descriptor| {
+            let file = descriptor
+                .as_any()
+                .downcast_ref::<vfs::FileHandle>()
+                .ok_or(vfs::FsError::BadFd)?;
+            file.write(user_elf())
+        });
+        if written != Ok(user_elf().len()) {
+            klog_always!("MUSL-EXEC-FIXTURE-FAIL: {:?}", written);
+            return None;
+        }
+    }
+
     // Save current CR3 so we can restore it after loading the ELF
     let (saved_cr3_frame, _) = Cr3::read();
     let saved_cr3 = saved_cr3_frame.start_address().as_u64() as usize;

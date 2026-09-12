@@ -199,6 +199,8 @@ impl Default for Stat {
 /// VFS error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
+    /// The operation requires authority the caller does not possess (EPERM).
+    NotPermitted,
     /// Entry not found
     NotFound,
     /// Not a directory
@@ -237,6 +239,8 @@ pub enum FsError {
     SymlinkLoop,
     /// Illegal seek (e.g., on pipe)
     Seek,
+    /// A requested cached-only lookup cannot be completed without I/O/work.
+    Again,
 }
 
 impl FsError {
@@ -254,6 +258,7 @@ impl FsError {
             FsError::Pipe => -32,         // EPIPE
             FsError::BadFd => -9,         // EBADF
             FsError::PermDenied => -13,   // EACCES
+            FsError::NotPermitted => -1,  // EPERM
             FsError::ReadOnly => -30,     // EROFS
             FsError::NoSpace => -28,      // ENOSPC
             FsError::NameTooLong => -36,  // ENAMETOOLONG
@@ -262,6 +267,7 @@ impl FsError {
             FsError::CrossDev => -18,     // EXDEV
             FsError::SymlinkLoop => -40,  // ELOOP
             FsError::Seek => -29,         // ESPIPE
+            FsError::Again => -11,        // EAGAIN
         }
     }
 }
@@ -317,6 +323,7 @@ impl From<FsError> for SyscallError {
         match err {
             FsError::NotFound => SyscallError::ENOENT,
             FsError::PermDenied => SyscallError::EACCES,
+            FsError::NotPermitted => SyscallError::EPERM,
             FsError::Exists => SyscallError::EEXIST,
             FsError::NotDir => SyscallError::ENOTDIR,
             FsError::IsDir => SyscallError::EISDIR,
@@ -331,6 +338,7 @@ impl From<FsError> for SyscallError {
             FsError::Io => SyscallError::EIO,
             FsError::NameTooLong => SyscallError::ENAMETOOLONG,
             FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
+            FsError::Again => SyscallError::EAGAIN,
             FsError::CrossDev => SyscallError::EXDEV,
             FsError::SymlinkLoop => SyscallError::ELOOP,
             FsError::NotSupported => SyscallError::ENOSYS,

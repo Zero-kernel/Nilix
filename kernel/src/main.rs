@@ -1113,7 +1113,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
                 // Phase C: Try to mount as ext2 filesystem
                 match vfs::Ext2Fs::mount(device) {
-                    Ok(fs) => match vfs::mount("/mnt", fs) {
+                    Ok(fs) => match vfs::VFS.mount_in_namespace(
+                        &kernel_core::ROOT_MNT_NAMESPACE,
+                        "/mnt",
+                        fs,
+                    ) {
                         Ok(()) => klog_always!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
                         Err(e) => klog!(
                             Warn,

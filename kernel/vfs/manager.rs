@@ -20,16 +20,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block::BlockDevice;
 use cap::NamespaceId;
-use kernel_core::{
-    current_host_egid, current_host_euid, current_in_host_supplementary_group,
-    current_is_host_root, current_mount_ns, current_umask, FileDescriptor, MountNamespace,
-    SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
-};
+use kernel_core::{FileDescriptor, MountNamespace, SyscallError, VfsStat, ROOT_MNT_NAMESPACE};
 use mm::fallible_map::FallibleOrderedMap;
 use spin::RwLock;
 
 // R25-9 FIX: Import LSM hooks for MAC enforcement
 use lsm::{FileCtx as LsmFileCtx, OpenFlags as LsmOpenFlags, ProcessCtx as LsmProcessCtx};
+
+#[cfg(feature = "open_fault_probe")]
+#[path = "open_fault_probe.rs"]
+mod open_fault_probe;
 
 /// Cryptographic path identifier for LSM contexts.  Policy decisions must not
 /// be keyed by a forgeable FNV hash: an attacker who can choose a colliding
@@ -149,67 +149,9 @@ fn try_join_two(prefix: &str, rest: &str) -> Result<String, FsError> {
     Ok(out)
 }
 
-/// Check if current process has required access permissions on a file
-///
-/// Implements POSIX-style DAC (Discretionary Access Control):
-/// 1. Root (euid == 0) has all permissions
-/// 2. File owner uses owner permission bits (0o700)
-/// 3. File group member (primary or supplementary) uses group permission bits (0o070)
-/// 4. Others use other permission bits (0o007)
-///
-/// # Arguments
-/// * `stat` - File status containing uid, gid, and permission mode
-/// * `need_read` - Whether read access is required
-/// * `need_write` - Whether write access is required
-/// * `need_exec` - Whether execute access is required
-///
-/// # Returns
-/// `true` if access is permitted, `false` otherwise
-fn check_access_permission(
-    stat: &Stat,
-    need_read: bool,
-    need_write: bool,
-    need_exec: bool,
-) -> bool {
-    // R135-1 FIX: Use host-mapped credentials for DAC checks.
-    // Namespace-relative euid/egid must NOT be used because host-stored inode
-    // UIDs/GIDs are in the host ID space. Without host mapping, user namespace
-    // root (ns-euid==0) bypasses ALL permission checks on host inodes.
-    //
-    // If there is no process context (e.g. early boot / kernel init), allow
-    // access — matches the previous "default to root" behavior.
-    let euid = match current_host_euid() {
-        Some(v) => v,
-        None => return true,
-    };
-    let egid = current_host_egid().unwrap_or(65534);
-    // RF180-19 FIX: authorization is borrowed/allocation-free; OOM can no
-    // longer silently turn a valid supplementary-group check into "other".
-    let supplementary_match = current_in_host_supplementary_group(stat.gid).unwrap_or(false);
-    let matching_group = [stat.gid];
-    let supplementary = if supplementary_match {
-        &matching_group[..]
-    } else {
-        &[]
-    };
-    permission_bits_allow(
-        euid,
-        egid,
-        supplementary,
-        stat,
-        need_read,
-        need_write,
-        need_exec,
-    )
-}
-
-/// R172-P6-F5: the PURE DAC permission-bit decision — host-root bypass + owner/group/other
-/// bit selection + the need_read/write/exec checks — with NO credential lookup. Split out of
-/// `check_access_permission` so the +x / DAC-deny logic is DETERMINISTICALLY unit-testable at
-/// boot, where `current_host_euid() == None` would otherwise make the wrapper early-return
-/// `true` and a naive "expect EACCES" test tautologically pass while testing nothing. The
-/// wrapper supplies the live creds; this is behavior-identical to the prior inline logic.
-fn permission_bits_allow(
+/// Pure host-ID DAC decision. OperationContext supplies one stable, explicit
+/// credential snapshot; missing credentials never select a root fallback.
+pub(crate) fn permission_bits_allow(
     euid: u32,
     egid: u32,
     supplementary: &[u32],
@@ -247,1639 +189,21 @@ fn permission_bits_allow(
     true
 }
 
-/// Apply current process umask to requested permission bits
-///
-/// The umask bits are cleared from the requested permissions:
-/// effective_perm = requested_perm & !umask
-///
-/// # Arguments
-/// * `perm` - Requested permission bits (e.g., 0o666 for files, 0o777 for directories)
-///
-/// # Returns
-/// Permission bits after applying umask
-#[inline]
-fn apply_umask(perm: u16) -> u16 {
-    let mask = current_umask().unwrap_or(0) & 0o777;
-    perm & !mask & 0o7777
-}
-
-/// Strip setuid/setgid bits from permission if caller is not root
-///
-/// # Security
-///
-/// Prevents unprivileged users from creating setuid/setgid executables.
-/// - setuid (04000) is always stripped for non-root
-/// - setgid (02000) is stripped for regular files for non-root
-///   (but allowed on directories for proper setgid inheritance)
-///
-/// # Arguments
-/// * `perm` - Permission bits to sanitize
-/// * `is_dir` - Whether the target is a directory
-///
-/// # Returns
-/// Sanitized permission bits
-#[inline]
-fn strip_suid_sgid_if_needed(perm: u16, is_dir: bool) -> u16 {
-    // R135-1 FIX: Use host-mapped root check instead of namespace euid.
-    // Namespace root must NOT be able to create setuid/setgid files on the
-    // host filesystem.
-    if current_is_host_root() {
-        // Host root can create setuid/setgid files
-        return perm;
-    }
-
-    let mut sanitized = perm;
-
-    // Always strip setuid bit for non-root
-    sanitized &= !0o4000;
-
-    // Strip setgid bit for regular files (not directories)
-    // Directories can keep setgid for proper inheritance
-    if !is_dir {
-        sanitized &= !0o2000;
-    }
-
-    sanitized
-}
-
-/// Mount point information
-#[derive(Clone)]
-struct Mount {
-    /// The mounted filesystem
-    fs: Arc<dyn FileSystem>,
-}
-
-// ============================================================================
-// Namespace Mount Table
-// ============================================================================
-
-/// Mount table for a single namespace
-///
-/// Each namespace has its own mount table, allowing filesystem views
-/// to be isolated between namespaces.
-struct NamespaceMountTable {
-    /// Mount points within this namespace: path -> Mount
-    mounts: RwLock<FallibleOrderedMap<String, Mount>>,
-    /// Root filesystem for this namespace
-    root_fs: RwLock<Option<Arc<dyn FileSystem>>>,
-}
-
-impl NamespaceMountTable {
-    /// Create a new empty mount table.
-    fn new() -> Self {
-        Self {
-            mounts: RwLock::new(FallibleOrderedMap::new()),
-            root_fs: RwLock::new(None),
-        }
-    }
-
-    /// Clone mount table from a parent namespace (CLONE_NEWNS semantics).
-    ///
-    /// This creates a copy of all mount points, allowing the child namespace
-    /// to diverge from the parent without affecting it.
-    ///
-    /// R172-22-FOLLOWON: the copy is allocation-FALLIBLE. `FallibleOrderedMap::try_clone` is
-    /// insufficient because its internal `String` key clone is itself infallible, so this does a
-    /// MANUAL deep clone (fallible key copy + Arc value clone). On OOM it returns NoMem and the
-    /// caller (`ensure_namespace_table`) fails the CLONE_NEWNS/unshare with ENOMEM instead of
-    /// aborting the kernel via handle_alloc_error.
-    fn try_clone_from(parent: &NamespaceMountTable) -> Result<Self, FsError> {
-        let src = parent.mounts.read();
-        let mut mounts: FallibleOrderedMap<String, Mount> = FallibleOrderedMap::new();
-        mounts.try_reserve(src.len()).map_err(|_| FsError::NoMem)?;
-        for (k, v) in src.iter() {
-            let mut key = String::new();
-            key.try_reserve(k.len()).map_err(|_| FsError::NoMem)?;
-            key.push_str(k);
-            mounts
-                .try_insert(key, v.clone())
-                .map_err(|_| FsError::NoMem)?;
-        }
-        Ok(Self {
-            mounts: RwLock::new(mounts),
-            root_fs: RwLock::new(parent.root_fs.read().clone()),
-        })
-    }
-}
-
-/// Global VFS state
+/// Global VFS registry; namespace identities own tables through their destruction hook.
 pub struct Vfs {
-    /// Namespace ID -> mount table mapping
-    ///
-    /// Each mount namespace has its own mount table for filesystem isolation.
-    mount_tables: RwLock<FallibleOrderedMap<NamespaceId, Arc<NamespaceMountTable>>>,
-    /// Device filesystem handle for block device registration
+    mount_tables: RwLock<mm::AdmittedMap<NamespaceId, Arc<crate::path::NamespaceMountTable>>>,
     devfs: RwLock<Option<Arc<DevFs>>>,
+    retirement: RwLock<Option<Arc<crate::topology::Retirement<crate::path::Mount>>>>,
 }
 
-impl Vfs {
-    /// Create a new VFS instance
-    pub const fn new() -> Self {
-        Self {
-            mount_tables: RwLock::new(FallibleOrderedMap::new()),
-            devfs: RwLock::new(None),
-        }
-    }
-
-    /// Ensure a mount table exists for the given namespace.
-    ///
-    /// If the namespace doesn't have a table yet:
-    /// - For root namespace: create an empty table
-    /// - For child namespaces: clone from parent (CLONE_NEWNS semantics)
-    ///
-    /// # CLONE_NEWNS Semantics
-    ///
-    /// When a child namespace is created, its mount table is a copy of the parent's.
-    /// This ensures that:
-    /// 1. The child sees all mounts that existed in the parent at creation time
-    /// 2. Subsequent mounts in either namespace are independent
-    fn ensure_namespace_table(
-        &self,
-        ns: &Arc<MountNamespace>,
-    ) -> Result<Arc<NamespaceMountTable>, FsError> {
-        // Fast path: table already exists
-        {
-            let guard = self.mount_tables.read();
-            if let Some(existing) = guard.get(&ns.id()).cloned() {
-                return Ok(existing);
-            }
-        }
-
-        // For child namespaces, ensure parent table exists first (recursive)
-        // This guarantees CLONE_NEWNS semantics: child always inherits from parent
-        if let Some(parent) = ns.parent() {
-            // Recursive call to ensure parent table is materialized
-            // This avoids the case where child gets empty table because parent wasn't created yet
-            self.ensure_namespace_table(&parent)?;
-        }
-
-        // Slow path: create table
-        let mut guard = self.mount_tables.write();
-
-        // Double-check after acquiring write lock
-        if let Some(existing) = guard.get(&ns.id()).cloned() {
-            return Ok(existing);
-        }
-
-        // Create new table.
-        // R172-22-FOLLOWON: the parent copy (try_clone_from) and the table-map insert are
-        // allocation-FALLIBLE (FallibleOrderedMap) so an OOM here returns NoMem (-> ENOMEM at the
-        // clone/unshare callers) instead of aborting the kernel via handle_alloc_error.
-        let table = if let Some(parent) = ns.parent() {
-            // Clone from parent - parent table is guaranteed to exist now
-            guard
-                .get(&parent.id())
-                .cloned()
-                .map(|p| NamespaceMountTable::try_clone_from(p.as_ref()).map(Arc::new))
-                .transpose()?
-                .unwrap_or_else(|| Arc::new(NamespaceMountTable::new()))
-        } else {
-            // Root namespace: create empty table
-            Arc::new(NamespaceMountTable::new())
-        };
-
-        guard
-            .try_insert(ns.id(), table.clone())
-            .map_err(|_| FsError::NoMem)?;
-        Ok(table)
-    }
-
-    /// R74-2 FIX: Force eager materialization of mount namespace table.
-    ///
-    /// This public method ensures that a namespace's mount table is created
-    /// immediately by cloning from its parent at namespace creation time,
-    /// rather than lazily on first VFS access.
-    ///
-    /// # Security Issue Fixed
-    ///
-    /// Without eager materialization, the following vulnerability exists:
-    /// 1. Process calls sys_clone(CLONE_NEWNS) -> creates child namespace
-    /// 2. Mount table is NOT materialized yet (lazy creation)
-    /// 3. Parent makes new mount (e.g., /host/secrets)
-    /// 4. Child makes first VFS access -> ensure_namespace_table() clones
-    ///    parent's CURRENT state (including /host/secrets)
-    /// 5. Child sees mounts added AFTER namespace creation -> isolation bypassed
-    ///
-    /// Fix: Call this method immediately after creating a namespace to snapshot
-    /// the parent's mount table at creation time, not at first use.
-    ///
-    /// # Arguments
-    ///
-    /// * `ns` - The namespace whose mount table should be materialized
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let new_ns = clone_namespace(parent_ns.clone())?;
-    /// VFS.materialize_namespace(&parent_ns);  // Ensure parent is stable
-    /// VFS.materialize_namespace(&new_ns);     // Snapshot parent NOW
-    /// ```
-    pub fn materialize_namespace(&self, ns: &Arc<MountNamespace>) -> Result<(), FsError> {
-        // ensure_namespace_table already performs the snapshot when the
-        // table doesn't exist. Calling it explicitly forces immediate
-        // materialization instead of deferring to first VFS access.
-        // R172-22-FOLLOWON: propagate OOM (NoMem) instead of swallowing it with `let _`. The
-        // clone/unshare callers map it to ENOMEM; a silently-dropped materialization would
-        // reintroduce the R74-2 lazy-materialization namespace-leak, so the failure MUST surface.
-        self.ensure_namespace_table(ns)?;
-        Ok(())
-    }
-
-    /// R180-22 rollback for an eagerly materialized namespace that failed the
-    /// process-publication revalidation. `NamespaceId` is globally monotonic and
-    /// is the table's identity; removing by this exact new namespace cannot
-    /// erase a table belonging to another namespace generation. Drop the table
-    /// after releasing the registry lock because filesystem Arc destructors may
-    /// acquire unrelated VFS locks.
-    pub fn rollback_materialized_namespace(&self, ns: &Arc<MountNamespace>) {
-        let removed = self.mount_tables.write().remove(&ns.id());
-        drop(removed);
-    }
-
-    /// Initialize the VFS with default mounts
-    pub fn init(&self) {
-        // Create ramfs as root filesystem
-        let ramfs = RamFs::try_new().expect("boot: root ramfs admission/allocation failed");
-
-        // Get the root mount namespace and its table
-        let root_ns = ROOT_MNT_NAMESPACE.clone();
-        let root_table = self
-            .ensure_namespace_table(&root_ns)
-            .expect("boot: root mount table OOM");
-
-        // Set ramfs as root in the root namespace's table
-        *root_table.root_fs.write() = Some(ramfs.clone());
-
-        // Mount ramfs at / first (in root namespace)
-        self.mount_in_namespace(&root_ns, "/", ramfs.clone())
-            .expect("Failed to mount ramfs at /");
-
-        // Create mount point directories in root ramfs so they appear in ls
-        // These directories are needed so that readdir("/") shows /dev and /proc
-        let root_inode = ramfs.root_inode();
-        let dir_mode = crate::types::FileMode::new(crate::types::FileType::Directory, 0o755);
-
-        // Create /dev directory entry
-        if let Err(e) = ramfs.create(&root_inode, "dev", dir_mode) {
-            klog!(Warn, "Warning: failed to create /dev mountpoint: {:?}", e);
-        }
-
-        // Create /proc directory entry
-        if let Err(e) = ramfs.create(&root_inode, "proc", dir_mode) {
-            klog!(Warn, "Warning: failed to create /proc mountpoint: {:?}", e);
-        }
-
-        // Create and mount devfs at /dev
-        let devfs = DevFs::new();
-        self.mount_in_namespace(&root_ns, "/dev", devfs.clone())
-            .expect("Failed to mount devfs");
-        *self.devfs.write() = Some(devfs);
-
-        // Create and mount procfs at /proc
-        let procfs = ProcFs::try_new().expect("boot: procfs admission/allocation failed");
-        self.mount_in_namespace(&root_ns, "/proc", procfs)
-            .expect("Failed to mount procfs");
-
-        // Create /sys and /sys/fs/cgroup directory hierarchy for cgroupfs
-        // First create /sys directory
-        if let Err(e) = ramfs.create(&root_inode, "sys", dir_mode) {
-            klog!(Warn, "Warning: failed to create /sys mountpoint: {:?}", e);
-        }
-
-        // Create /sys/fs via sysfs (we mount a ramfs at /sys for now)
-        let sysfs = RamFs::try_new().expect("boot: sysfs ramfs admission/allocation failed");
-        self.mount_in_namespace(&root_ns, "/sys", sysfs.clone())
-            .expect("Failed to mount sysfs");
-
-        // Create /sys/fs directory
-        let sys_root = sysfs.root_inode();
-        if let Err(e) = sysfs.create(&sys_root, "fs", dir_mode) {
-            klog!(Warn, "Warning: failed to create /sys/fs directory: {:?}", e);
-        }
-
-        // Get /sys/fs and create cgroup directory
-        if let Ok(fs_inode) = sysfs.lookup(&sys_root, "fs") {
-            if let Err(e) = sysfs.create(&fs_inode, "cgroup", dir_mode) {
-                klog!(
-                    Warn,
-                    "Warning: failed to create /sys/fs/cgroup directory: {:?}",
-                    e
-                );
-            }
-        }
-
-        // Create and mount cgroupfs at /sys/fs/cgroup
-        let cgroupfs = CgroupFs::new();
-        self.mount_in_namespace(&root_ns, "/sys/fs/cgroup", cgroupfs)
-            .expect("Failed to mount cgroupfs");
-
-        klog_always!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc, cgroupfs at /sys/fs/cgroup");
-    }
-
-    /// Mount a filesystem at the given path (in current process's namespace)
-    ///
-    /// # Security (X-4 fix)
-    ///
-    /// Mount 操作仅限 root 用户（euid == 0）或内核初始化路径。
-    /// 未授权的 mount 可能导致：
-    /// - 攻击者注入恶意文件系统
-    /// - setuid 二进制文件劫持
-    /// - 数据泄露或完整性破坏
-    pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
-        // R135-2 FIX: Only host root can execute mount. Namespace root must NOT
-        // be able to mount filesystems on the host.
-        // current_host_euid() returns None during kernel init (allowed).
-        if current_host_euid().is_some() && !current_is_host_root() {
-            return Err(FsError::PermDenied);
-        }
-
-        let path = normalize_path(path)?;
-
-        // R26-2 FIX: MAC gate for mount operations
-        // LSM policy can block mounts even for root users
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let path_hash = hash_path(&path);
-            lsm::hook_file_mount(&task, 0, path_hash, 0, 0).map_err(|_| FsError::PermDenied)?;
-        }
-
-        // Use current process's namespace if available, otherwise root
-        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
-
-        // Delegate to namespace-aware implementation
-        self.mount_in_namespace(&ns, &path, fs)
-    }
-
-    /// Mount a filesystem in a specific mount namespace.
-    ///
-    /// This is the core implementation without security checks.
-    /// The wrapper methods (mount, mount_in_namespace_checked) should perform
-    /// appropriate security checks before calling this.
-    ///
-    /// # Arguments
-    /// * `ns` - The mount namespace to mount in
-    /// * `path` - Normalized mount path
-    /// * `fs` - Filesystem to mount
-    pub fn mount_in_namespace(
-        &self,
-        ns: &Arc<MountNamespace>,
-        path: &str,
-        fs: Arc<dyn FileSystem>,
-    ) -> Result<(), FsError> {
-        let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns)?;
-        let mut mounts = table.mounts.write();
-
-        if mounts.contains_key(&path) {
-            return Err(FsError::Exists);
-        }
-
-        // R144-5 FIX: Enforce per-namespace mount count limit to prevent
-        // kernel heap exhaustion from a mount storm within a single namespace.
-        if mounts.len() >= crate::mount_namespace::MAX_MOUNTS_PER_NS {
-            return Err(FsError::NoMem);
-        }
-
-        // R172-22-FOLLOWON: try_insert (allocation-fallible) -> NoMem instead of an infallible
-        // BTreeMap::insert that aborts the kernel via handle_alloc_error on OOM. The path String
-        // is MOVED into the map key (the dead Mount.path field was dropped), so capture is_root
-        // first.
-        let is_root = path == "/";
-        mounts
-            .try_insert(path, Mount { fs: fs.clone() })
-            .map_err(|_| FsError::NoMem)?;
-
-        // R152-9 FIX: Update root_fs while still holding mounts lock
-        // to prevent a concurrent find_mount from observing an inconsistent
-        // state between mounts and root_fs.
-        if is_root {
-            *table.root_fs.write() = Some(fs);
-        }
-
-        Ok(())
-    }
-
-    /// Unmount filesystem at path (in current process's namespace)
-    ///
-    /// # Security (X-4 fix)
-    ///
-    /// Umount 操作仅限 root 用户（euid == 0）。
-    /// 未授权的 umount 可能导致 DoS（卸载关键文件系统）。
-    pub fn umount(&self, path: &str) -> Result<(), FsError> {
-        // R135-2 FIX: Only host root can execute umount. Namespace root must NOT
-        // be able to unmount host filesystems.
-        if current_host_euid().is_some() && !current_is_host_root() {
-            return Err(FsError::PermDenied);
-        }
-
-        let path = normalize_path(path)?;
-
-        // R26-2 FIX: MAC gate for umount operations
-        // LSM policy can block unmounts even for root users
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let path_hash = hash_path(&path);
-            lsm::hook_file_umount(&task, path_hash, 0).map_err(|_| FsError::PermDenied)?;
-        }
-
-        // Use current process's namespace if available, otherwise root
-        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
-
-        // Delegate to namespace-aware implementation
-        self.umount_in_namespace(&ns, &path)
-    }
-
-    /// Unmount filesystem at path within a specific mount namespace.
-    ///
-    /// This is the core implementation without security checks.
-    /// The wrapper methods should perform appropriate security checks before calling this.
-    ///
-    /// # Arguments
-    /// * `ns` - The mount namespace to unmount from
-    /// * `path` - Normalized path to unmount
-    pub fn umount_in_namespace(&self, ns: &Arc<MountNamespace>, path: &str) -> Result<(), FsError> {
-        let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns)?;
-        let mut mounts = table.mounts.write();
-
-        if mounts.remove(&path).is_some() {
-            // R152-9 FIX: Update root_fs while holding mounts lock for consistency
-            if path == "/" {
-                *table.root_fs.write() = None;
-            }
-            Ok(())
-        } else {
-            Err(FsError::NotFound)
-        }
-    }
-
-    /// Resolve a path to an inode (default behavior: follow symlinks)
-    ///
-    /// Enforces execute/search permission on each directory component during traversal.
-    /// This prevents unauthorized access to files in directories without "x" permission.
-    pub fn lookup_path(&self, path: &str) -> Result<Arc<dyn Inode>, FsError> {
-        self.lookup_path_with_flags(path, ResolveFlags::empty(), true)
-    }
-
-    /// Resolve a path with optional symlink following and resolve flags
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The path to resolve
-    /// * `resolve_flags` - Flags controlling symlink and mount behavior
-    /// * `follow_final_symlink` - Whether to follow the final path component if it's a symlink
-    ///
-    /// # Security
-    ///
-    /// - Enforces execute/search permission on each directory component
-    /// - Limits symlink resolution to MAX_SYMLINK_DEPTH (40) to prevent loops
-    /// - RESOLVE_NO_SYMLINKS rejects any symlink in the path
-    /// - RESOLVE_BENEATH prevents escaping the starting directory
-    /// - RESOLVE_NO_MAGICLINKS blocks /proc magic symlinks
-    /// - RESOLVE_NO_XDEV prevents crossing mount boundaries
-    pub fn lookup_path_with_flags(
-        &self,
-        path: &str,
-        resolve_flags: ResolveFlags,
-        follow_final_symlink: bool,
-    ) -> Result<Arc<dyn Inode>, FsError> {
-        const MAX_SYMLINK_DEPTH: usize = 40;
-
-        let mut symlink_count: usize = 0;
-        let is_absolute = path.starts_with('/');
-        let mut path_to_resolve = normalize_path(path)?;
-
-        // Capture the starting filesystem for RESOLVE_NO_XDEV
-        let (anchor_mount, anchor_fs, _) = self.find_mount(&path_to_resolve)?;
-        let anchor_fs_id = anchor_fs.fs_id();
-
-        // R41-2 FIX: Reject absolute paths when confinement flags are set
-        //
-        // SECURITY: RESOLVE_BENEATH and RESOLVE_IN_ROOT are designed to confine
-        // path resolution to a directory subtree. For this to work, paths must
-        // be relative to the anchor directory. Absolute paths bypass this
-        // confinement because anchor_mount for "/" makes all paths pass the
-        // starts_with check. This matches Linux's openat2 behavior.
-        if (resolve_flags.beneath() || resolve_flags.in_root())
-            && is_absolute
-            && path_to_resolve != anchor_mount
-        {
-            return Err(FsError::Invalid);
-        }
-
-        // R142-7 FIX: Component-boundary-aware path prefix check.
-        // Plain starts_with() matches "/proc" against "/process" because it
-        // compares bytes, not path components. This function verifies that the
-        // character after the prefix is '/' or end-of-string.
-        fn is_path_within(path: &str, anchor: &str) -> bool {
-            if anchor == "/" {
-                return path.starts_with('/');
-            }
-            let anchor = anchor.trim_end_matches('/');
-            if anchor.is_empty() {
-                return false;
-            }
-            if path == anchor {
-                return true;
-            }
-            path.starts_with(anchor) && path.as_bytes().get(anchor.len()) == Some(&b'/')
-        }
-
-        'resolve: loop {
-            // RESOLVE_BENEATH / RESOLVE_IN_ROOT: check path stays within anchor
-            if (resolve_flags.beneath() || resolve_flags.in_root())
-                && !is_path_within(&path_to_resolve, &anchor_mount)
-            {
-                return Err(FsError::CrossDev);
-            }
-
-            let (mount_path, fs, relative_path) = self.find_mount(&path_to_resolve)?;
-
-            // RESOLVE_NO_XDEV: reject if we crossed a mount boundary
-            if resolve_flags.no_xdev() && fs.fs_id() != anchor_fs_id {
-                return Err(FsError::CrossDev);
-            }
-
-            // R65-20 FIX: Validate execute permission on the mount point before crossing
-            // into the mounted filesystem. This enforces directory traversal permissions
-            // up to and including the mount point itself, preventing permission bypass.
-            //
-            // We must verify traverse permission on the mount point directory in the
-            // parent filesystem before allowing access to the mounted filesystem's contents.
-            if mount_path != "/" {
-                // Split to get parent path and mount point name
-                if let Some(last_slash) = mount_path.rfind('/') {
-                    let parent_path = if last_slash == 0 {
-                        try_string_from_str("/")?
-                    } else {
-                        try_string_from_str(&mount_path[..last_slash])?
-                    };
-                    let mp_name = &mount_path[last_slash + 1..];
-
-                    if !mp_name.is_empty() {
-                        // Resolve the parent directory path
-                        if let Ok((_, parent_fs, parent_relative)) = self.find_mount(&parent_path) {
-                            // Walk to the parent directory in the parent filesystem
-                            let mut parent_inode = parent_fs.root_inode();
-                            for comp in parent_relative.split('/').filter(|s| !s.is_empty()) {
-                                if !parent_inode.is_dir() {
-                                    return Err(FsError::NotDir);
-                                }
-                                let dir_stat = parent_inode.stat()?;
-                                if !check_access_permission(&dir_stat, false, false, true) {
-                                    return Err(FsError::PermDenied);
-                                }
-                                parent_inode = parent_fs.lookup(&parent_inode, comp)?;
-                            }
-
-                            // Check execute permission on parent directory
-                            if !parent_inode.is_dir() {
-                                return Err(FsError::NotDir);
-                            }
-                            let parent_stat = parent_inode.stat()?;
-                            if !check_access_permission(&parent_stat, false, false, true) {
-                                return Err(FsError::PermDenied);
-                            }
-
-                            // Now check the mount point directory itself
-                            if let Ok(mount_inode) = parent_fs.lookup(&parent_inode, mp_name) {
-                                if mount_inode.is_dir() {
-                                    let mount_stat = mount_inode.stat()?;
-                                    if !check_access_permission(&mount_stat, false, false, true) {
-                                        return Err(FsError::PermDenied);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut current = fs.root_inode();
-
-            // Handle empty relative path (mount point itself)
-            if relative_path.is_empty() || relative_path == "/" {
-                return Ok(current);
-            }
-
-            // Track resolved prefix for relative symlink resolution.
-            // P2-C: fallible component collect (was infallible map/to_string).
-            let mut resolved_prefix: Vec<String> = Vec::new();
-            {
-                let parts = mount_path.split('/').filter(|s| !s.is_empty());
-                resolved_prefix
-                    .try_reserve_exact(parts.clone().count())
-                    .map_err(|_| FsError::NoMem)?;
-                for p in parts {
-                    resolved_prefix.push(try_string_from_str(p)?);
-                }
-            }
-
-            let components = relative_path.split('/').filter(|s| !s.is_empty());
-            let component_count = components.clone().count();
-
-            for (idx, component) in components.clone().enumerate() {
-                if !current.is_dir() {
-                    return Err(FsError::NotDir);
-                }
-
-                // R128-2 FIX: Check execute/search permission on EVERY directory before traversing.
-                //
-                // POSIX requires execute (search) permission on each directory component in the
-                // path. The previous condition `(idx < len-1 || len==1)` skipped the execute
-                // check on the parent directory of the final path component for multi-component
-                // paths. For `/restricted_dir/file.txt` (components=["restricted_dir","file.txt"],
-                // len=2), at idx=1 (processing file.txt): `1 < 1` is false, `2 == 1` is false,
-                // so the execute permission check on `restricted_dir` (the current directory at
-                // that iteration) was bypassed. This allowed accessing files inside directories
-                // without execute permission by specifying the filename directly.
-                {
-                    let dir_stat = current.stat()?;
-                    if !check_access_permission(&dir_stat, false, false, true) {
-                        return Err(FsError::PermDenied);
-                    }
-                }
-
-                let next = fs.lookup(&current, component)?;
-                let next_stat = next.stat()?;
-                let is_final = idx + 1 == component_count;
-
-                // Check if this is a symlink
-                if next_stat.mode.file_type == FileType::Symlink {
-                    // RESOLVE_NO_SYMLINKS: reject any symlink
-                    if resolve_flags.no_symlinks() {
-                        return Err(FsError::SymlinkLoop);
-                    }
-
-                    // Final symlink + nofollow: return ELOOP
-                    if is_final && !follow_final_symlink {
-                        return Err(FsError::SymlinkLoop);
-                    }
-
-                    // RESOLVE_NO_MAGICLINKS: block procfs magic symlinks
-                    if resolve_flags.no_magiclinks() && fs.fs_type() == "proc" {
-                        return Err(FsError::SymlinkLoop);
-                    }
-
-                    // Symlink loop detection
-                    symlink_count += 1;
-                    if symlink_count > MAX_SYMLINK_DEPTH {
-                        return Err(FsError::SymlinkLoop);
-                    }
-
-                    // P2-C / D2-ERR-RECOVERY: fallible symlink-target read + path rebuild.
-                    // Bound by PATH_MAX-class 4096; never trust stat.size beyond that.
-                    let target_len = next_stat.size.min(4096) as usize;
-                    let mut buf = try_zeroed_buf(target_len)?;
-                    let read_len = next.read_at(0, &mut buf)?;
-                    if read_len > buf.len() {
-                        // A filesystem callback must never be able to make a
-                        // caller slice beyond its supplied buffer.  Treat an
-                        // impossible count as corruption and fail closed.
-                        return Err(FsError::Invalid);
-                    }
-                    let target = try_string_from_utf8_slice(&buf[..read_len])?;
-
-                    // Build new path based on symlink target
-                    let new_path = if target.starts_with('/') {
-                        // Absolute symlink
-                        if resolve_flags.in_root() && anchor_mount != "/" {
-                            // Reroot absolute symlinks within the anchor
-                            try_join_two(
-                                anchor_mount.trim_end_matches('/'),
-                                target.trim_start_matches('/'),
-                            )?
-                        } else {
-                            target
-                        }
-                    } else {
-                        // Relative symlink: resolve from current directory
-                        let prefix =
-                            try_join_path_iter(resolved_prefix.iter().map(String::as_str))?;
-                        try_join_two(&prefix, &target)?
-                    };
-
-                    // Append remaining path components
-                    let remaining = components.clone().skip(idx + 1);
-                    let full_path = if remaining.clone().next().is_none() {
-                        new_path
-                    } else {
-                        let rem = try_join_path_iter(remaining)?;
-                        // rem is "/a/b"; join onto new_path without double slash
-                        try_join_two(new_path.trim_end_matches('/'), rem.trim_start_matches('/'))?
-                    };
-
-                    path_to_resolve = normalize_path(&full_path)?;
-                    continue 'resolve;
-                }
-
-                current = next;
-                resolved_prefix.try_reserve(1).map_err(|_| FsError::NoMem)?;
-                resolved_prefix.push(try_string_from_str(component)?);
-            }
-
-            return Ok(current);
-        }
-    }
-
-    /// Resolve a path to its FINAL component's inode WITHOUT following that
-    /// component if it is a symbolic link (M0-6 SLICE 3).
-    ///
-    /// This is the primitive `readlink(2)` / `lstat(2)` need: the parent path is
-    /// resolved with full symlink following + per-component `+x` enforcement (via
-    /// `lookup_path`), but the final component is returned verbatim — even when it
-    /// is a symlink (returning the link inode) or dangles (the link exists though
-    /// its target does not). `lookup_path_with_flags(.., follow_final_symlink=false)`
-    /// CANNOT serve this role: it returns `Err(SymlinkLoop)` for a final symlink
-    /// instead of the inode.
-    ///
-    /// # Security
-    /// - Enforces search (`+x`) permission on the parent directory before the
-    ///   final lookup (same gate the traversal loop applies per component).
-    /// - Intermediate symlinks in the parent path ARE followed (POSIX: only the
-    ///   final component is treated no-follow), bounded by MAX_SYMLINK_DEPTH inside
-    ///   `lookup_path`.
-    pub fn lookup_symlink(&self, path: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let normalized = normalize_path(path)?;
-
-        // Root ("/") has no "final component" to treat no-follow; it is always a
-        // directory, never a symlink.
-        if normalized == "/" {
-            return self.lookup_path("/");
-        }
-
-        let (parent_path, name) = split_path(&normalized)?;
-
-        // Resolve the parent with full symlink following + per-component +x.
-        let parent = self.lookup_path(&parent_path)?;
-        if !parent.is_dir() {
-            return Err(FsError::NotDir);
-        }
-
-        // Enforce search permission on the parent directory before the final
-        // lookup (mirrors the per-component gate in lookup_path_with_flags).
-        let parent_stat = parent.stat()?;
-        if !check_access_permission(&parent_stat, false, false, true) {
-            return Err(FsError::PermDenied);
-        }
-
-        // Resolve the final component in the parent's own filesystem WITHOUT
-        // following it.  The parent inode is authoritative: its path may have
-        // crossed a symlink into a different mount, so selecting by the
-        // original string would be a confused-deputy operation (U20-1).
-        let fs = self.filesystem_for_inode(&parent)?;
-        fs.lookup(&parent, name)
-    }
-
-    /// `stat(2)` on the LINK itself, not its target (M0-6 SLICE 3) — the `lstat(2)`
-    /// / `fstatat(AT_SYMLINK_NOFOLLOW)` primitive. Resolves via `lookup_symlink`
-    /// (no-follow final component) then runs the same MAC gate `stat` applies.
-    pub fn stat_nofollow(&self, path: &str) -> Result<Stat, FsError> {
-        let inode = self.lookup_symlink(path)?;
-        let stat = inode.stat()?;
-
-        // R153-2 parity: MAC gate for stat — access_mask 0 = existence/metadata.
-        if let Some(task) = LsmProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, stat.ino, 0).map_err(|_| FsError::PermDenied)?;
-        }
-
-        Ok(stat)
-    }
-
-    /// Open a file by path
-    ///
-    /// Supports O_CREAT for file creation and O_EXCL for exclusive creation.
-    pub fn open(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-        create_mode: u16,
-    ) -> Result<FileDescriptor, FsError> {
-        self.open_with_resolve(path, flags, create_mode, ResolveFlags::empty())
-    }
-
-    /// Open a file by path with resolve flags (openat2-compatible)
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - The path to open
-    /// * `flags` - Open flags (O_RDONLY, O_WRONLY, O_CREAT, O_NOFOLLOW, etc.)
-    /// * `create_mode` - Permission mode for file creation
-    /// * `resolve_flags` - Flags controlling symlink and mount behavior
-    ///
-    /// # Security
-    ///
-    /// - O_NOFOLLOW: Returns ELOOP if final component is a symlink
-    /// - RESOLVE_NO_SYMLINKS: Returns ELOOP for any symlink in path
-    /// - Full DAC and LSM permission checks
-    pub fn open_with_resolve(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-        create_mode: u16,
-        resolve_flags: ResolveFlags,
-    ) -> Result<FileDescriptor, FsError> {
-        self.open_with_resolve_using(
-            path,
-            flags,
-            create_mode,
-            resolve_flags,
-            PreparedFileHandle::try_new,
-        )
-    }
-
-    fn open_with_resolve_using<P>(
-        &self,
-        path: &str,
-        flags: OpenFlags,
-        create_mode: u16,
-        resolve_flags: ResolveFlags,
-        prepare: P,
-    ) -> Result<FileDescriptor, FsError>
-    where
-        P: FnOnce() -> Result<PreparedFileHandle, FsError>,
-    {
-        // R180-4 CLASS FIX: illegal O_ACCMODE must not reach DAC, create, or truncate.
-        flags.validate_access_mode()?;
-
-        let path = normalize_path(path)?;
-        // RF180-37: admit and physically allocate the complete open file
-        // description before lookup can lead to O_CREAT publication. The
-        // prepared object rolls back exactly on every later authorization or
-        // filesystem error; finalization is allocation-free.
-        let prepared = prepare()?;
-
-        // O_NOFOLLOW: don't follow the final symlink
-        let follow_final = !flags.is_nofollow();
-
-        // Resolve existing path or create on demand
-        let inode = match self.lookup_path_with_flags(&path, resolve_flags, follow_final) {
-            Ok(inode) => {
-                // File exists - check O_EXCL
-                if flags.is_create() && flags.is_exclusive() {
-                    return Err(FsError::Exists);
-                }
-                inode
-            }
-            Err(FsError::NotFound) if flags.is_create() => {
-                // File doesn't exist and O_CREAT is set - create it
-                let (parent_path, filename) = split_path(&path)?;
-                // Parent lookup should always follow symlinks (the parent must be a real dir)
-                let parent = self.lookup_path_with_flags(&parent_path, resolve_flags, true)?;
-                if !parent.is_dir() {
-                    return Err(FsError::NotDir);
-                }
-
-                // DAC check: need write+execute on parent directory to create files
-                let parent_stat = parent.stat()?;
-                if !check_access_permission(&parent_stat, false, true, true) {
-                    return Err(FsError::PermDenied);
-                }
-
-                let fs = self.filesystem_for_inode(&parent)?;
-                // Apply umask and strip setuid/setgid bits for non-root
-                let requested = create_mode & 0o7777;
-                let masked = apply_umask(requested);
-                let sanitized = strip_suid_sgid_if_needed(masked, false);
-                let mode = FileMode::regular(sanitized);
-
-                // C.4 FIX: Revalidate permissions just before creation to shrink TOCTOU window
-                let latest_parent_stat = parent.stat()?;
-                if latest_parent_stat.ino != parent_stat.ino
-                    || !check_access_permission(&latest_parent_stat, false, true, true)
-                {
-                    return Err(FsError::PermDenied);
-                }
-
-                // C.4 FIX: If the file appeared after the first lookup, honor O_EXCL but
-                // otherwise fall back to opening the existing file (POSIX semantics)
-                match fs.lookup(&parent, filename) {
-                    Ok(existing) => {
-                        if flags.is_exclusive() {
-                            return Err(FsError::Exists);
-                        }
-                        existing
-                    }
-                    Err(FsError::NotFound) => {
-                        // R26-1 FIX: MAC gate before file creation (using freshest metadata)
-                        if let Some(task) = LsmProcessCtx::from_current() {
-                            let name_hash = hash_path(filename);
-                            lsm::hook_file_create(
-                                &task,
-                                latest_parent_stat.ino,
-                                name_hash,
-                                mode.to_raw(),
-                            )
-                            .map_err(|_| FsError::PermDenied)?;
-                        }
-
-                        fs.create(&parent, filename, mode)?
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(e) => return Err(e),
-        };
-
-        // V-1 fix: Enforce DAC permissions before opening
-        //
-        // Full POSIX-style permission model:
-        // 1. If euid == 0 (root), allow all access
-        // 2. If euid == file owner, check owner bits (0o700)
-        // 3. If egid == file group, check group bits (0o070)
-        // 4. Otherwise, check other bits (0o007)
-        let stat = inode.stat()?;
-
-        // R25-9 FIX: Call LSM hook before DAC check for MAC enforcement
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let file_ctx = LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(&path));
-            lsm::hook_file_open(&task, stat.ino, LsmOpenFlags(flags.0), &file_ctx)
-                .map_err(|_| FsError::PermDenied)?;
-        }
-
-        if !check_access_permission(&stat, flags.is_readable(), flags.is_writable(), false) {
-            return Err(FsError::PermDenied);
-        }
-
-        // Check if opening a directory for writing
-        if inode.is_dir() && flags.is_writable() {
-            return Err(FsError::IsDir);
-        }
-
-        // Ask the already-resolved inode to initialize the prepared descriptor.
-        // This reuses the exact Arc that passed resolution and authorization;
-        // no implementation may manufacture a duplicate inode wrapper.
-        let descriptor = Arc::clone(&inode).open(flags, prepared)?;
-
-        // Handle truncate for writable regular files. The complete descriptor
-        // is live before mutation, so O_TRUNC has no later allocation-failure
-        // edge. A truncate error drops the private descriptor and its charges.
-        // C.4 FIX: Revalidate write permission immediately before truncate
-        if flags.is_truncate() && flags.is_writable() && !inode.is_dir() {
-            let fresh_stat = inode.stat()?;
-            if !check_access_permission(&fresh_stat, flags.is_readable(), true, false) {
-                return Err(FsError::PermDenied);
-            }
-            // R164-9 FIX: Evaluate LSM hook_file_truncate before truncating.
-            // Without this, open(O_TRUNC) bypasses MAC truncation policy —
-            // the ftruncate() path calls this hook but the open path did not.
-            if let Some(task) = LsmProcessCtx::from_current() {
-                lsm::hook_file_truncate(&task, fresh_stat.ino, 0)
-                    .map_err(|_| FsError::PermDenied)?;
-            }
-            inode.truncate(0)?;
-        }
-
-        Ok(descriptor)
-    }
-
-    /// Get file status by path
-    ///
-    /// R153-2 FIX: Enforce MAC via LSM hook before returning stat metadata.
-    /// Without this, attackers can probe file metadata (size, timestamps,
-    /// permissions) even under MAC denial — inconsistent with open()/readdir()
-    /// which already have LSM gates.
-    pub fn stat(&self, path: &str) -> Result<Stat, FsError> {
-        let inode = self.lookup_path(path)?;
-        let stat = inode.stat()?;
-
-        // R153-2 FIX: MAC gate for stat — access_mask 0 = existence/metadata check.
-        if let Some(task) = LsmProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, stat.ino, 0).map_err(|_| FsError::PermDenied)?;
-        }
-
-        Ok(stat)
-    }
-
-    /// M0-4: read an entire regular file by path for exec.
-    ///
-    /// Single path resolution (`lookup_path` follows symlinks + enforces
-    /// per-component +x during traversal); rejects directories (EISDIR) and
-    /// non-regular files (EACCES); runs the LSM `hook_file_open` MAC gate; then
-    /// enforces a DAC check requiring BOTH read AND execute permission — the
-    /// execute bit closes the gap where `open()` (V-1 fix, ~line 932) only checks
-    /// read. The bytes are read from the SAME inode the checks ran on, so the
-    /// caller's LSM hash and `load_elf` cannot diverge via a symlink swap. The
-    /// read loop is incrementally bounded by `max` and NEVER trusts `stat.size`
-    /// (a concurrent grow/shrink TOCTOU), terminating on the first short/zero read.
-    ///
-    /// CONTRACT: the caller (the exec front-end) MUST hold no Process / page-table
-    /// / COW lock — this resolves paths and runs LSM/DAC against the current task.
-    /// The returned buffer is uncharged transient kernel memory bounded by `max`;
-    /// it is NEVER routed through cgroup charging (it is dropped before the new
-    /// image's charges are taken).
-    ///
-    /// Returns `SyscallError` directly (not `FsError`) because the `max` cap must
-    /// surface E2BIG, which `FsError` cannot express; `FsError` cases are mapped
-    /// via the in-module `fs_error_to_syscall`.
-    pub fn read_file_for_exec(&self, path: &str, max: usize) -> Result<Vec<u8>, SyscallError> {
-        let path = normalize_path(path).map_err(fs_error_to_syscall)?;
-        let inode = self.lookup_path(&path).map_err(fs_error_to_syscall)?;
-        let stat = inode.stat().map_err(fs_error_to_syscall)?;
-        if inode.is_dir() {
-            return Err(SyscallError::EISDIR);
-        }
-        if !inode.is_file() {
-            // /proc, /dev, char/block/fifo/socket nodes are not executable images.
-            return Err(SyscallError::EACCES);
-        }
-        // MAC gate (mirrors open() at ~line 926-930).
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let file_ctx = LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(&path));
-            lsm::hook_file_open(&task, stat.ino, LsmOpenFlags(0), &file_ctx)
-                .map_err(|_| SyscallError::EACCES)?;
-        }
-        // DAC: exec requires BOTH read (to load the image) AND execute. open() at
-        // ~line 932 passes need_exec=false; an exec-specific read must demand +x.
-        if !check_access_permission(&stat, true, false, true) {
-            return Err(SyscallError::EACCES);
-        }
-        // Incremental read on the SAME inode; the loop bound is `max`, never stat.size.
-        let mut out: Vec<u8> = Vec::new();
-        let mut off: u64 = 0;
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = inode
-                .read_at(off, &mut chunk)
-                .map_err(fs_error_to_syscall)?;
-            if n == 0 {
-                break; // EOF / short-read terminator
-            }
-            if n > chunk.len() {
-                // A misbehaving filesystem must never make us read past the buffer.
-                return Err(SyscallError::EIO);
-            }
-            if out.len().saturating_add(n) > max {
-                return Err(SyscallError::E2BIG);
-            }
-            out.try_reserve(n).map_err(|_| SyscallError::ENOMEM)?;
-            out.extend_from_slice(&chunk[..n]);
-            off = off.saturating_add(n as u64);
-        }
-        Ok(out)
-    }
-
-    /// Read directory entries
-    pub fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        let inode = self.lookup_path(path)?;
-
-        if !inode.is_dir() {
-            return Err(FsError::NotDir);
-        }
-
-        // 【W-2 安全修复】读取目录需要 read + execute 权限
-        // 仅有 --x 权限的目录允许通过已知文件名访问，但不允许枚举内容
-        // 防止信息泄漏（如枚举 /home 下其他用户的目录名）
-        let dir_stat = inode.stat()?;
-
-        // R37-4 FIX: Enforce MAC via LSM before DAC for directory reads.
-        // Access mask 0x05 = MAY_READ | MAY_EXEC (required to enumerate directory).
-        if let Some(task) = LsmProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, dir_stat.ino, 0x05)
-                .map_err(|_| FsError::PermDenied)?;
-        }
-
-        if !check_access_permission(&dir_stat, true, false, true) {
-            return Err(FsError::PermDenied);
-        }
-
-        let mut entries = Vec::new();
-        let mut offset = 0usize;
-
-        loop {
-            match inode.readdir(offset)? {
-                Some((next_offset, entry)) => {
-                    // D2-ERR-VFS-FALLIBILITY FIX: amortized fallible growth. A
-                    // directory with an attacker-influenced entry count must return
-                    // ENOMEM, never OOM-panic on this recoverable path (ext2
-                    // push_owner house pattern, ext2.rs:3455). This legacy/internal
-                    // readdir has no callers outside vfs; the getdents syscall path
-                    // uses the already-fallible vfs_readdir_callback.
-                    if entries.len() == entries.capacity() {
-                        entries.try_reserve(1).map_err(|_| FsError::NoMem)?;
-                    }
-                    // R186-8: unlike the getdents staging loop, this legacy helper
-                    // returns `Result<Vec<DirEntry>, FsError>` — an all-or-nothing
-                    // API with no partial-result contract to honour, so surfacing
-                    // NoMem here is correct rather than a discarded prefix.
-                    // lint-fallible: PREALLOCATED(capacity ensured directly above)
-                    entries.push(entry);
-                    offset = next_offset;
-                }
-                None => break,
-            }
-        }
-
-        Ok(entries)
-    }
-
-    /// Create a file or directory
-    pub fn create(&self, path: &str, mode: FileMode) -> Result<Arc<dyn Inode>, FsError> {
-        let path = normalize_path(path)?;
-
-        // Get parent directory and filename
-        let (parent_path, filename) = split_path(&path)?;
-
-        // Lookup parent
-        let parent = self.lookup_path(&parent_path)?;
-        if !parent.is_dir() {
-            return Err(FsError::NotDir);
-        }
-
-        // DAC check: need write+execute on parent directory to create entries
-        let parent_stat = parent.stat()?;
-        if !check_access_permission(&parent_stat, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-
-        // The resolved parent, not the lexical path string, selects the
-        // filesystem.  This prevents same-type mount crossings from mixing
-        // inode bookkeeping between filesystem instances (U20-1).
-        let fs = self.filesystem_for_inode(&parent)?;
-
-        // Apply umask and strip setuid/setgid bits for non-root
-        let masked = apply_umask(mode.perm);
-        let sanitized = strip_suid_sgid_if_needed(masked, mode.is_dir());
-        let masked_mode = FileMode::new(mode.file_type, sanitized);
-
-        // C.4 FIX: Revalidate parent permissions and absence right before create
-        let latest_parent_stat = parent.stat()?;
-        if latest_parent_stat.ino != parent_stat.ino
-            || !check_access_permission(&latest_parent_stat, false, true, true)
-        {
-            return Err(FsError::PermDenied);
-        }
-        // Verify target still doesn't exist
-        if fs.lookup(&parent, filename).is_ok() {
-            return Err(FsError::Exists);
-        }
-
-        // R25-9 FIX: Call LSM hook before creating file/directory (using freshest metadata)
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let name_hash = hash_path(filename);
-            if masked_mode.is_dir() {
-                lsm::hook_file_mkdir(
-                    &task,
-                    latest_parent_stat.ino,
-                    name_hash,
-                    masked_mode.to_raw(),
-                )
-                .map_err(|_| FsError::PermDenied)?;
-            } else {
-                lsm::hook_file_create(
-                    &task,
-                    latest_parent_stat.ino,
-                    name_hash,
-                    masked_mode.to_raw(),
-                )
-                .map_err(|_| FsError::PermDenied)?;
-            }
-        }
-
-        // Create the entry with sanitized permissions
-        fs.create(&parent, filename, masked_mode)
-    }
-
-    /// Create a symbolic link at `linkpath` pointing to `target` (M0-6 SLICE 3).
-    ///
-    /// Mirrors `create`'s discipline: namespace-correct filesystem selection via
-    /// `find_mount` (NOT a cross-namespace fs_id scan), parent `+wx` DAC gate,
-    /// C.4 revalidation + existence re-check, and the LSM `hook_file_create` MAC
-    /// gate — all before the fs-level `symlink`. The symlink's own mode is the
-    /// conventional `lrwxrwxrwx` (0o120777); `target` is stored verbatim (POSIX
-    /// does not resolve or validate it at creation).
-    pub fn symlink(&self, linkpath: &str, target: &str) -> Result<(), FsError> {
-        if target.is_empty() {
-            return Err(FsError::Invalid);
-        }
-
-        let path = normalize_path(linkpath)?;
-        let (parent_path, name) = split_path(&path)?;
-
-        // Resolve parent (follows intermediate symlinks + per-component +x).
-        let parent = self.lookup_path(&parent_path)?;
-        if !parent.is_dir() {
-            return Err(FsError::NotDir);
-        }
-
-        // DAC: need write+execute on the parent directory to create entries.
-        let parent_stat = parent.stat()?;
-        if !check_access_permission(&parent_stat, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-
-        // Namespace-correct filesystem selection follows the resolved parent
-        // inode, not the pre-resolution path string (U20-1).
-        let fs = self.filesystem_for_inode(&parent)?;
-
-        // C.4 revalidation: re-check parent identity + perms + absence right
-        // before the mutation.
-        let latest_parent_stat = parent.stat()?;
-        if latest_parent_stat.ino != parent_stat.ino
-            || !check_access_permission(&latest_parent_stat, false, true, true)
-        {
-            return Err(FsError::PermDenied);
-        }
-        if fs.lookup(&parent, name).is_ok() {
-            return Err(FsError::Exists);
-        }
-
-        // LSM MAC gate (S_IFLNK | 0o777 == 0o120777), freshest metadata.
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let name_hash = hash_path(name);
-            lsm::hook_file_create(&task, latest_parent_stat.ino, name_hash, 0o120777)
-                .map_err(|_| FsError::PermDenied)?;
-        }
-
-        fs.symlink(&parent, name, target)?;
-        Ok(())
-    }
-
-    /// Read the literal target of the symbolic link at `path` (M0-6 SLICE 3).
-    ///
-    /// Uses `lookup_symlink` (no-follow final component) so a link-to-file or a
-    /// DANGLING link both resolve to the link inode itself; returns `Invalid`
-    /// (EINVAL) when the final component is not a symlink, matching `readlink(2)`.
-    pub fn readlink(&self, path: &str) -> Result<String, FsError> {
-        let inode = self.lookup_symlink(path)?;
-        if !inode.is_symlink() {
-            return Err(FsError::Invalid);
-        }
-
-        // MAC gate parity with stat (metadata access).
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let ino = inode.stat()?.ino;
-            lsm::hook_file_permission(&task, ino, 0).map_err(|_| FsError::PermDenied)?;
-        }
-
-        // P2-C: fallible PATH_MAX buffer + owned target string (no infallible vec!/to_string).
-        let mut buf = try_zeroed_buf(4096)?;
-        let n = inode.read_at(0, &mut buf)?;
-        if n > buf.len() {
-            return Err(FsError::Invalid);
-        }
-        let target = try_string_from_utf8_slice(&buf[..n])?;
-        Ok(target)
-    }
-
-    /// Remove a file or directory
-    ///
-    /// Enforces sticky-bit semantics: in a directory with sticky bit set (mode & 0o1000),
-    /// only root, the directory owner, or the file owner may delete files.
-    pub fn unlink(&self, path: &str, must_be_dir: Option<bool>) -> Result<(), FsError> {
-        let path = normalize_path(path)?;
-
-        let (parent_path, filename) = split_path(&path)?;
-        let parent = self.lookup_path(&parent_path)?;
-
-        if !parent.is_dir() {
-            return Err(FsError::NotDir);
-        }
-
-        let parent_stat = parent.stat()?;
-
-        // DAC check: need write+execute on parent directory to unlink entries
-        if !check_access_permission(&parent_stat, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-
-        let fs = self.filesystem_for_inode(&parent)?;
-
-        // Look up the child to check sticky bit permissions
-        let child = fs.lookup(&parent, filename)?;
-        let child_ino = child.ino();
-
-        // C.4 FIX: Revalidate parent permissions as close as possible to the destructive op
-        let latest_parent_stat = parent.stat()?;
-        if latest_parent_stat.ino != parent_stat.ino
-            || !check_access_permission(&latest_parent_stat, false, true, true)
-        {
-            return Err(FsError::PermDenied);
-        }
-
-        // C.4 FIX: Ensure the target hasn't been swapped since initial lookup
-        let current = fs.lookup(&parent, filename)?;
-        if current.ino() != child_ino {
-            // Target was replaced by a different inode - reject to prevent wrong deletion
-            return Err(FsError::PermDenied);
-        }
-        let current_stat = current.stat()?;
-
-        // Enforce sticky-bit semantics on the current (revalidated) entry:
-        // If parent directory has sticky bit set, only root, directory owner,
-        // or file owner may delete the file
-        // R135-1 FIX: Use host-mapped euid for sticky bit check.
-        if latest_parent_stat.mode.perm & 0o1000 != 0 {
-            let euid = current_host_euid().unwrap_or(0);
-            if euid != 0 && euid != current_stat.uid && euid != latest_parent_stat.uid {
-                return Err(FsError::PermDenied);
-            }
-        }
-
-        // R25-9 FIX: Call LSM hook before unlinking file/directory (using revalidated metadata)
-        if let Some(task) = LsmProcessCtx::from_current() {
-            let name_hash = hash_path(filename);
-            if current.is_dir() {
-                lsm::hook_file_rmdir(&task, latest_parent_stat.ino, name_hash)
-                    .map_err(|_| FsError::PermDenied)?;
-            } else {
-                lsm::hook_file_unlink(&task, latest_parent_stat.ino, name_hash)
-                    .map_err(|_| FsError::PermDenied)?;
-            }
-        }
-
-        // C.4 FIX: Final TOCTOU guard - ensure the entry still refers to the expected inode
-        // immediately before performing the unlink
-        let final_lookup = fs.lookup(&parent, filename)?;
-        if final_lookup.ino() != child_ino {
-            return Err(FsError::PermDenied);
-        }
-
-        // R172-X-F4-FOLLOWON: pass the C.4-revalidated `child_ino` + the POSIX type gate down so
-        // the fs enforces both ATOMICALLY with the removal (no separate syscall-layer stat()).
-        fs.unlink(&parent, filename, child_ino, must_be_dir)
-    }
-
-    /// M0-6 slice 2: rename / renameat2(RENAME_NOREPLACE). A two-parent atomic move with
-    /// full DAC + dual-end sticky-bit + pre-mutation LSM gating; ALL checks run before any
-    /// mutation (and the ramfs body is itself atomic), so a denied/raced rename never
-    /// half-mutates. `noreplace` rejects an existing destination with EEXIST.
-    pub fn rename(&self, old: &str, new: &str, noreplace: bool) -> Result<(), FsError> {
-        // (1) Trailing-dot guard on the RAW paths: a final '.'/'..' component is EINVAL in
-        // Linux rename, but normalize_path collapses it, so it must be caught pre-normalize.
-        for raw in [old, new] {
-            let last = raw.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-            if last == "." || last == ".." {
-                return Err(FsError::Invalid);
-            }
-        }
-        // (2) Normalize. (A same-path rename is NOT short-circuited here: that would wrongly
-        // return success for a NON-EXISTENT path — Linux returns ENOENT. The genuine
-        // same-inode no-op is handled atomically by ramfs::rename's ptr_eq check, which runs
-        // only AFTER the source is confirmed to exist.)
-        let old_n = normalize_path(old)?;
-        let new_n = normalize_path(new)?;
-        // (3) Split into (parent, name) for both ends.
-        let (op, oname) = split_path(&old_n)?;
-        let (np, nname) = split_path(&new_n)?;
-        // Renaming the root / an empty final name is rejected (covers the only mount root in
-        // a single-mount boot; nested-mount-root rename is a documented residual).
-        if oname.is_empty() || nname.is_empty() {
-            return Err(FsError::Invalid);
-        }
-        // (4) Subtree-loop guard: a directory cannot be moved into its own subtree
-        // (new == old + "/..."), which would detach a cycle. Lexical on normalized paths.
-        if new_n.len() > old_n.len()
-            && new_n.as_bytes().get(old_n.len()) == Some(&b'/')
-            && new_n.starts_with(old_n.as_str())
-        {
-            return Err(FsError::Invalid);
-        }
-        // (4b) R172-14 FIX (Layer-2 fast-path): the symmetric strict-ANCESTOR guard — moving a
-        // directory ONTO its own parent/ancestor (e.g. rename("/a/sub","/a")) overwrites a
-        // parent of the source (orphan/cycle) and, in ramfs, would make the victim resolve to
-        // a held-write-guard parent -> child_count() self-deadlock. Lexical fast-path only; the
-        // AUTHORITATIVE checks are in ramfs (rename_decide's held-guard pointer reject for the
-        // deadlock, and the under-lock ancestry walk for the cycle), which do not trust path
-        // strings. EINVAL matches the descendant guard above and Linux dir-loop semantics.
-        if old_n.len() > new_n.len()
-            && old_n.as_bytes().get(new_n.len()) == Some(&b'/')
-            && old_n.starts_with(new_n.as_str())
-        {
-            return Err(FsError::Invalid);
-        }
-        // (5) Resolve BOTH parents (parent paths follow symlinks — correct; the final
-        // component is looked up non-following below so the link itself is moved).
-        let oparent = self.lookup_path(&op)?;
-        let nparent = self.lookup_path(&np)?;
-        if !oparent.is_dir() || !nparent.is_dir() {
-            return Err(FsError::NotDir);
-        }
-        // (6) EXDEV BEFORE any mutation, via the RESOLVED-INODE fs_id (a symlinked path
-        // cannot defeat this the way a path-string mount comparison could).
-        if oparent.fs_id() != nparent.fs_id() {
-            return Err(FsError::CrossDev);
-        }
-        // (7) DAC pass 1: write+exec on BOTH parents (omitting nparent's check would be a
-        // confused-deputy create into a directory the caller cannot write).
-        let ops = oparent.stat()?;
-        if !check_access_permission(&ops, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-        let nps = nparent.stat()?;
-        if !check_access_permission(&nps, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-        // (8) Single-component (non-following) source + dest lookup; capture inos.
-        let ofs = self.filesystem_for_inode(&oparent)?;
-        let src = ofs.lookup(&oparent, oname)?;
-        let src_ino = src.ino();
-        let src_stat = src.stat()?;
-        let dest_before = ofs.lookup(&nparent, nname).ok();
-        let dest_ino = dest_before.as_ref().map(|d| d.ino());
-        // (9) C.4 TOCTOU revalidation on BOTH ends, immediately before the move: re-stat
-        // both parents (ino-stable + DAC) and re-look-up source (ino-stable) and dest
-        // (still-absent or the SAME inode) — defeats a name-swap between the LSM decision
-        // and the mutation.
-        let latest_ops = oparent.stat()?;
-        if latest_ops.ino != ops.ino || !check_access_permission(&latest_ops, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-        let latest_nps = nparent.stat()?;
-        if latest_nps.ino != nps.ino || !check_access_permission(&latest_nps, false, true, true) {
-            return Err(FsError::PermDenied);
-        }
-        let src_now = ofs.lookup(&oparent, oname)?;
-        if src_now.ino() != src_ino {
-            return Err(FsError::PermDenied);
-        }
-        match (ofs.lookup(&nparent, nname).ok().map(|d| d.ino()), dest_ino) {
-            (Some(now), Some(prev)) if now == prev => {}
-            (None, None) => {}
-            // dest appeared, vanished, or was swapped since the first observation -> reject.
-            _ => return Err(FsError::PermDenied),
-        }
-        // (10) Sticky-bit (+t) on the FRESHEST stats, host-mapped euid, BOTH ends.
-        // SOURCE: a sticky old_parent restricts who may remove the source.
-        if latest_ops.mode.perm & 0o1000 != 0 {
-            let euid = current_host_euid().unwrap_or(0);
-            if euid != 0 && euid != src_stat.uid && euid != latest_ops.uid {
-                return Err(FsError::PermDenied);
-            }
-        }
-        // DEST (only when overwriting): a sticky new_parent restricts who may clobber the
-        // EXISTING dest — keyed on the DEST inode's uid, NOT the source's.
-        if let Some(dest) = &dest_before {
-            if latest_nps.mode.perm & 0o1000 != 0 {
-                let dest_stat = dest.stat()?;
-                let euid = current_host_euid().unwrap_or(0);
-                if euid != 0 && euid != dest_stat.uid && euid != latest_nps.uid {
-                    return Err(FsError::PermDenied);
-                }
-            }
-        }
-        // (11) LSM hook BEFORE the move, with the revalidated parent inos (its first caller).
-        if let Some(task) = LsmProcessCtx::from_current() {
-            lsm::hook_file_rename(
-                &task,
-                latest_ops.ino,
-                hash_path(oname),
-                latest_nps.ino,
-                hash_path(nname),
-            )
-            .map_err(|_| FsError::PermDenied)?;
-        }
-        // (12) Commit: pass the validated source/dest inos so ramfs binds THIS decision to
-        // the inode it actually moves (a create/unlink could swap a name in the gap before
-        // ramfs takes its spanning lock — ramfs fails closed on an identity mismatch). The
-        // ramfs body also re-validates dest type/emptiness under that same lock.
-        ofs.rename(
-            &oparent, oname, &nparent, nname, noreplace, src_ino, dest_ino,
-        )
-    }
-
-    /// Find the mount point for a given path (in current process's namespace)
-    ///
-    /// Uses current_mount_ns() to get the process's namespace, falling back
-    /// to ROOT_MNT_NAMESPACE during kernel initialization or for kernel threads.
-    fn find_mount(&self, path: &str) -> Result<(String, Arc<dyn FileSystem>, String), FsError> {
-        // Use current process's mount namespace if available, otherwise root
-        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
-        self.find_mount_in_namespace(&ns, path)
-    }
-
-    /// Find the mounted filesystem instance that owns a resolved inode.
-    ///
-    /// Path-prefix lookup is insufficient after symlink traversal: `/link/x`
-    /// can resolve to an inode below a mount that is unrelated to the lexical
-    /// `/link` prefix.  All mutating VFS operations use this helper after
-    /// resolving their parent, so a same-type mount can never receive another
-    /// filesystem instance's inode (U20-1).
-    fn filesystem_for_inode(&self, inode: &Arc<dyn Inode>) -> Result<Arc<dyn FileSystem>, FsError> {
-        let fs_id = inode.fs_id();
-        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
-        let table = self.ensure_namespace_table(&ns)?;
-        let mounts = table.mounts.read();
-        for mount in mounts.values() {
-            if mount.fs.fs_id() == fs_id {
-                return Ok(Arc::clone(&mount.fs));
-            }
-        }
-        drop(mounts);
-        let root_fs = table.root_fs.read();
-        if let Some(fs) = root_fs.as_ref() {
-            if fs.fs_id() == fs_id {
-                return Ok(Arc::clone(fs));
-            }
-        }
-        Err(FsError::CrossDev)
-    }
-
-    /// Find the mount point for a given path within a specific mount namespace.
-    ///
-    /// Returns (mount_path, filesystem, relative_path_within_fs).
-    ///
-    /// # Security
-    ///
-    /// Path is normalized to prevent directory traversal attacks (R32-VFS-1).
-    ///
-    /// # Arguments
-    /// * `ns` - The mount namespace to search in
-    /// * `path` - Absolute path to look up
-    pub fn find_mount_in_namespace(
-        &self,
-        ns: &Arc<MountNamespace>,
-        path: &str,
-    ) -> Result<(String, Arc<dyn FileSystem>, String), FsError> {
-        // Normalize path to prevent traversal attacks and ensure consistent matching
-        let path = normalize_path(path)?;
-        let table = self.ensure_namespace_table(ns)?;
-        let mounts = table.mounts.read();
-
-        // Helper to check if path matches mount point with proper boundaries
-        // e.g., /dev matches /dev and /dev/null, but not /device
-        let mount_matches = |target: &str, mount_path: &str| -> bool {
-            if mount_path == "/" {
-                true
-            } else if target == mount_path {
-                true
-            } else {
-                target.starts_with(mount_path)
-                    && target.as_bytes().get(mount_path.len()) == Some(&b'/')
-            }
-        };
-
-        // Find longest matching mount point
-        let mut best_match: Option<(&String, &Mount)> = None;
-
-        for (mount_path, mount) in mounts.iter() {
-            if mount_matches(&path, mount_path.as_str()) {
-                match best_match {
-                    None => best_match = Some((mount_path, mount)),
-                    Some((current_path, _)) => {
-                        if mount_path.len() > current_path.len() {
-                            best_match = Some((mount_path, mount));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some((mount_path, mount)) = best_match {
-            let relative = if path.len() > mount_path.len() {
-                &path[mount_path.len()..]
-            } else {
-                "/"
-            };
-            // P2-C: fallible owned path strings for recoverable lookup.
-            return Ok((
-                try_string_from_str(mount_path)?,
-                Arc::clone(&mount.fs),
-                try_string_from_str(relative)?,
-            ));
-        }
-
-        // Release mounts lock before accessing root_fs
-        drop(mounts);
-
-        // No mount found, check if this namespace has a root fs
-        let root_fs = table.root_fs.read();
-        if let Some(fs) = root_fs.as_ref() {
-            Ok((
-                try_string_from_str("/")?,
-                Arc::clone(fs),
-                try_string_from_str(path.as_str())?,
-            ))
-        } else {
-            Err(FsError::NotFound)
-        }
-    }
-
-    /// Register a block device under /dev
-    ///
-    /// Creates a device node at /dev/{name} for the given block device.
-    /// This enables filesystem mounting and raw device access.
-    ///
-    /// # Arguments
-    /// * `name` - Device name (e.g., "vda", "sda")
-    /// * `device` - Block device implementation
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(FsError::NotFound)` if VFS/devfs not initialized
-    /// * `Err(FsError::Exists)` if device name already exists
-    pub fn register_block_device(
-        &self,
-        name: &str,
-        device: Arc<dyn BlockDevice>,
-    ) -> Result<(), FsError> {
-        // Clone Arc and release lock before calling into DevFs to avoid
-        // holding our lock while DevFs acquires its internal lock
-        let devfs = {
-            let guard = self.devfs.read();
-            guard.as_ref().cloned().ok_or(FsError::NotFound)?
-        };
-        devfs.register_block_device(name, device)
-    }
-}
+#[path = "operations.rs"]
+mod operations;
+
+#[cfg(feature = "namespace_probe")]
+#[path = "resource_probe.rs"]
+mod resource_probe;
+#[cfg(feature = "namespace_probe")]
+pub use resource_probe::run as run_resource_probe;
 
 /// Global VFS instance
 lazy_static::lazy_static! {
@@ -2017,6 +341,7 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
     match e {
         FsError::NotFound => SyscallError::ENOENT,
         FsError::PermDenied => SyscallError::EACCES,
+        FsError::NotPermitted => SyscallError::EPERM,
         FsError::Exists => SyscallError::EEXIST,
         FsError::NotDir => SyscallError::ENOTDIR,
         FsError::IsDir => SyscallError::EISDIR,
@@ -2030,6 +355,7 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::Io => SyscallError::EIO,
         FsError::NameTooLong => SyscallError::ENAMETOOLONG,
         FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
+        FsError::Again => SyscallError::EAGAIN,
         FsError::CrossDev => SyscallError::EXDEV,
         FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,
@@ -2041,12 +367,13 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
 /// VFS open callback for syscall registration
 ///
 /// Called by sys_open to open a file through VFS
-fn vfs_open_callback(path: &str, flags: u32, mode: u32) -> Result<FileDescriptor, SyscallError> {
-    let open_flags = OpenFlags::from_bits(flags);
-    let perm = (mode & 0o7777) as u16;
-
-    VFS.open(path, open_flags, perm)
-        .map_err(fs_error_to_syscall)
+fn vfs_open_callback(
+    path: &str,
+    flags: u32,
+    mode: u32,
+    authorization: &kernel_core::process::CredentialAuthorization,
+) -> Result<kernel_core::syscall::PreparedVfsOpen, SyscallError> {
+    prepare_syscall_open(path, flags, mode, ResolveFlags::empty(), authorization)
 }
 
 /// VFS open with resolve flags callback (openat2 support)
@@ -2057,13 +384,87 @@ fn vfs_open_with_resolve_callback(
     flags: u32,
     mode: u32,
     resolve: u64,
-) -> Result<FileDescriptor, SyscallError> {
-    let open_flags = OpenFlags::from_bits(flags);
-    let resolve_flags = ResolveFlags::from_bits(resolve);
-    let perm = (mode & 0o7777) as u16;
+    authorization: &kernel_core::process::CredentialAuthorization,
+) -> Result<kernel_core::syscall::PreparedVfsOpen, SyscallError> {
+    prepare_syscall_open(
+        path,
+        flags,
+        mode,
+        ResolveFlags::from_bits(resolve),
+        authorization,
+    )
+}
 
-    VFS.open_with_resolve(path, open_flags, perm, resolve_flags)
-        .map_err(fs_error_to_syscall)
+fn prepare_syscall_open(
+    path: &str,
+    flags: u32,
+    mode: u32,
+    resolve_flags: ResolveFlags,
+    authorization: &kernel_core::process::CredentialAuthorization,
+) -> Result<kernel_core::syscall::PreparedVfsOpen, SyscallError> {
+    let open_flags = OpenFlags::from_bits(flags);
+    let perm = (mode & 0o7777) as u16;
+    #[cfg(feature = "open_fault_probe")]
+    let probe = open_fault_probe::select(path, open_flags);
+    #[cfg(feature = "open_fault_probe")]
+    let prepare = || open_fault_probe::prepare(probe);
+    #[cfg(not(feature = "open_fault_probe"))]
+    let prepare = PreparedFileHandle::try_new;
+
+    let descriptor = VFS
+        .open_with_resolve_using(
+            path,
+            open_flags,
+            perm,
+            resolve_flags,
+            prepare,
+            crate::context::OperationContext::current_using(Some(authorization))
+                .map_err(fs_error_to_syscall)?,
+        )
+        .map_err(fs_error_to_syscall)?;
+    #[cfg(feature = "open_fault_probe")]
+    let finalize = open_fault_probe::finalizer(probe);
+    #[cfg(not(feature = "open_fault_probe"))]
+    let finalize = finish_syscall_open;
+    let prepared = kernel_core::syscall::PreparedVfsOpen::new(descriptor, finalize);
+    #[cfg(feature = "open_fault_probe")]
+    let prepared = prepared.with_fault_probe(probe);
+    Ok(prepared)
+}
+
+fn finish_open(descriptor: &dyn kernel_core::process::FileOps) -> Result<(), FsError> {
+    finish_open_using(descriptor, lsm::hook_file_truncate).map(|_| ())
+}
+
+/// The hook result is checked before the only mutation. The boolean identifies
+/// actual truncation for the optional probe; ordinary callers discard it.
+fn finish_open_using(
+    descriptor: &dyn kernel_core::process::FileOps,
+    truncate_hook: fn(&LsmProcessCtx, u64, u64) -> lsm::LsmResult,
+) -> Result<bool, FsError> {
+    let file = descriptor
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .ok_or(FsError::BadFd)?;
+    let context = file.pending_context.lock().take();
+    if !file.flags().is_truncate() || !file.flags().is_writable() {
+        return Ok(false);
+    }
+    let stat = file.inode.stat()?;
+    if stat.mode.file_type != FileType::Regular {
+        return Ok(false);
+    }
+    let context = context.ok_or(FsError::PermDenied)?;
+    if !context.permits(&stat, file.flags().is_readable(), true, false) {
+        return Err(FsError::PermDenied);
+    }
+    truncate_hook(&context.subject, stat.ino, 0).map_err(|_| FsError::PermDenied)?;
+    file.inode.truncate(0)?;
+    Ok(true)
+}
+
+fn finish_syscall_open(descriptor: &dyn kernel_core::process::FileOps) -> Result<(), SyscallError> {
+    finish_open(descriptor).map_err(fs_error_to_syscall)
 }
 
 /// VFS stat callback for syscall registration
@@ -2134,48 +535,50 @@ fn vfs_read_file_callback(path: &str, max: usize) -> Result<Vec<u8>, SyscallErro
 }
 
 /// M0-4: self-test for the exec-read VFS leg (`read_file_for_exec`) — the new VFS
-/// code the pure kernel_core helper tests cannot reach. The error-path checks
-/// (missing => ENOENT, directory => EISDIR) always run and are
-/// privilege-independent (they resolve before any DAC check). The happy path
-/// stages a small file in the root ramfs and reads it back through the exec leg
-/// (proving the incremental read loop + the size cap); if staging fails in the
-/// boot context it SKIPS loudly rather than panic, so it can never destabilize
-/// the boot.
+/// code the pure kernel_core helper tests cannot reach. Explicit boot authority
+/// stages a file on the initialized root RAMFS and exercises the incremental
+/// exec-read path, size cap, and pure host-ID permission decision.
 pub fn run_exec_read_file_self_test() {
     assert!(matches!(
-        VFS.read_file_for_exec("/zeroos_m04_definitely_absent", 4096),
+        VFS.read_file_for_exec_trusted("/zeroos_m04_definitely_absent", 4096),
         Err(SyscallError::ENOENT)
     ));
     assert!(matches!(
-        VFS.read_file_for_exec("/", 4096),
+        VFS.read_file_for_exec_trusted("/", 4096),
         Err(SyscallError::EISDIR)
     ));
 
     let path = "/zeroos_m04_exec_read_test";
     let content: &[u8] = b"\x7FELF M0-4 exec-read self-test payload (one-chunk incremental read)";
     let create = OpenFlags::new(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
-    let staged = VFS.open(path, create, 0o755).is_ok()
-        && VFS
-            .lookup_path(path)
-            .and_then(|ino| ino.write_at(0, content).map(|_| ()))
-            .is_ok();
-    if staged {
+    let descriptor = VFS
+        .open_trusted(path, create, 0o755)
+        .expect("exec-read fixture open");
+    assert_eq!(
+        descriptor
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .expect("VFS descriptor")
+            .write(content)
+            .expect("exec-read fixture payload"),
+        content.len(),
+    );
+    drop(descriptor);
+    {
         let got = VFS
-            .read_file_for_exec(path, 1 << 20)
+            .read_file_for_exec_trusted(path, 1 << 20)
             .expect("read_file_for_exec happy path");
         assert_eq!(got.as_slice(), content);
         // Size cap => E2BIG.
         assert!(matches!(
-            VFS.read_file_for_exec(path, content.len() - 1),
+            VFS.read_file_for_exec_trusted(path, content.len() - 1),
             Err(SyscallError::E2BIG)
         ));
 
-        // R172-P6-F5: pin the DAC +x deny logic via the PRODUCTION permission_bits_allow.
-        // At boot current_host_euid()==None makes check_access_permission early-return true,
-        // so a naive "stage 0o644, expect EACCES" test tautologically passes while testing
-        // NOTHING; the extracted pure fn is the deterministic seam. Perm-relative (robust to
-        // any umask): the decision must EXACTLY match the relevant class's permission bit.
-        if let Ok(xstat) = VFS.lookup_path(path).and_then(|i| i.stat()) {
+        // R172-P6-F5: the pure host-ID DAC function covers unprivileged subjects
+        // even though fixture setup uses explicit boot authority.
+        {
+            let xstat = VFS.stat_trusted(path).expect("exec-read fixture stat");
             let perm = xstat.mode.perm;
             let empty: &[u32] = &[];
             // Fabricated NON-root, NON-owner, NON-group creds => the "others" bits decide.
@@ -2208,14 +611,10 @@ pub fn run_exec_read_file_self_test() {
         klog_always!(
             "    \u{2713} M0 #4 read_file_for_exec: ENOENT/EISDIR + staged read + E2BIG cap + DAC(R172-P6-F5)"
         );
-    } else {
-        klog_always!(
-            "    \u{26a0} M0 #4 read_file_for_exec: ENOENT/EISDIR ok; happy-path SKIPPED (no ramfs stage)"
-        );
     }
 }
 
-/// M0-6 slice 2 self-test (ramfs-staged, stage-or-skip-loudly). The errno-mapper assertions
+/// M0-6 slice 2 self-test with explicit boot authority. The errno-mapper assertions
 /// and the HALF-MUTATION ATOMICITY GUARD are the load-bearing checks: they pin the dual-mapper
 /// errno-fidelity fix and the insert-first/remove-after rewrite (the bug this slice fixes
 /// removed the source BEFORE the add, losing the entry when the add failed).
@@ -2235,35 +634,36 @@ pub fn run_rename_self_test() {
     ));
     // Absent source => ENOENT (holds regardless of staging).
     assert!(matches!(
-        VFS.rename("/zeroos_m06_absent_src", "/zeroos_m06_dst", false),
+        VFS.rename_trusted("/zeroos_m06_absent_src", "/zeroos_m06_dst", false),
         Err(FsError::NotFound)
     ));
 
     // --- Staged behavioral tests ---
     let da = "/zeroos_m06_rn_a";
     let db = "/zeroos_m06_rn_b";
-    let staged = VFS.create(da, FileMode::directory(0o755)).is_ok()
-        && VFS.create(db, FileMode::directory(0o755)).is_ok()
+    let staged = VFS.create_trusted(da, FileMode::directory(0o755)).is_ok()
+        && VFS.create_trusted(db, FileMode::directory(0o755)).is_ok()
         && VFS
-            .create(&(da.to_string() + "/f"), FileMode::regular(0o644))
+            .create_trusted(&(da.to_string() + "/f"), FileMode::regular(0o644))
             .is_ok();
-    if !staged {
-        klog_always!(
-            "    \u{26a0} M0-6 rename: mapper+ENOENT ok; staged path SKIPPED (no ramfs stage)"
-        );
-        return;
-    }
+    assert!(
+        staged,
+        "rename fixture must stage on initialized root RAMFS"
+    );
     let src = da.to_string() + "/f";
     let dst = db.to_string() + "/f";
 
     // (1) HAPPY cross-dir move: old gone, new present.
-    assert!(VFS.rename(&src, &dst, false).is_ok(), "happy rename");
     assert!(
-        matches!(VFS.lookup_path(&src), Err(FsError::NotFound)),
+        VFS.rename_trusted(&src, &dst, false).is_ok(),
+        "happy rename"
+    );
+    assert!(
+        matches!(VFS.stat_trusted(&src), Err(FsError::NotFound)),
         "source gone after rename"
     );
     assert!(
-        VFS.lookup_path(&dst).is_ok(),
+        VFS.stat_trusted(&dst).is_ok(),
         "destination present after rename"
     );
 
@@ -2271,44 +671,45 @@ pub fn run_rename_self_test() {
     // component fails BEFORE any mutation, so the source SURVIVES.
     let overlong = db.to_string() + "/" + &"x".repeat(256);
     assert!(
-        VFS.rename(&dst, &overlong, false).is_err(),
+        VFS.rename_trusted(&dst, &overlong, false).is_err(),
         "over-long new name must fail"
     );
     assert!(
-        VFS.lookup_path(&dst).is_ok(),
+        VFS.stat_trusted(&dst).is_ok(),
         "source must SURVIVE a failed rename (atomicity)"
     );
 
     // (3) RENAME_NOREPLACE: rename onto an existing dest with noreplace => EEXIST; both survive.
     let g = db.to_string() + "/g";
     assert!(
-        VFS.create(&g, FileMode::regular(0o644)).is_ok(),
+        VFS.create_trusted(&g, FileMode::regular(0o644)).is_ok(),
         "stage g for NOREPLACE"
     );
     assert!(
-        matches!(VFS.rename(&dst, &g, true), Err(FsError::Exists)),
+        matches!(VFS.rename_trusted(&dst, &g, true), Err(FsError::Exists)),
         "NOREPLACE onto existing => EEXIST"
     );
     assert!(
-        VFS.lookup_path(&dst).is_ok() && VFS.lookup_path(&g).is_ok(),
+        VFS.stat_trusted(&dst).is_ok() && VFS.stat_trusted(&g).is_ok(),
         "both survive a NOREPLACE rejection"
     );
 
     // (4) ENOTEMPTY: a directory cannot replace a NON-EMPTY directory.
     let d1 = db.to_string() + "/d1";
     let d2 = db.to_string() + "/d2";
-    let ne_ok = VFS.create(&d1, FileMode::directory(0o755)).is_ok()
+    let ne_ok = VFS.create_trusted(&d1, FileMode::directory(0o755)).is_ok()
         && VFS
-            .create(&(d1.clone() + "/c"), FileMode::regular(0o644))
+            .create_trusted(&(d1.clone() + "/c"), FileMode::regular(0o644))
             .is_ok()
-        && VFS.create(&d2, FileMode::directory(0o755)).is_ok();
-    if ne_ok {
+        && VFS.create_trusted(&d2, FileMode::directory(0o755)).is_ok();
+    assert!(ne_ok, "nonempty rename fixture must stage");
+    {
         assert!(
-            matches!(VFS.rename(&d2, &d1, false), Err(FsError::NotEmpty)),
+            matches!(VFS.rename_trusted(&d2, &d1, false), Err(FsError::NotEmpty)),
             "dir over non-empty dir => NotEmpty"
         );
         assert!(
-            VFS.lookup_path(&d2).is_ok(),
+            VFS.stat_trusted(&d2).is_ok(),
             "source dir survives NotEmpty rejection"
         );
     }
@@ -2317,13 +718,16 @@ pub fn run_rename_self_test() {
     // the FallibleOrderedMap migration (test (1) exercised the cross-parent `ng.try_insert`
     // arm). Old name gone, new name present, same directory.
     let g2 = db.to_string() + "/g2";
-    assert!(VFS.rename(&g, &g2, false).is_ok(), "same-parent rename");
     assert!(
-        matches!(VFS.lookup_path(&g), Err(FsError::NotFound)),
+        VFS.rename_trusted(&g, &g2, false).is_ok(),
+        "same-parent rename"
+    );
+    assert!(
+        matches!(VFS.stat_trusted(&g), Err(FsError::NotFound)),
         "same-parent rename: old name gone"
     );
     assert!(
-        VFS.lookup_path(&g2).is_ok(),
+        VFS.stat_trusted(&g2).is_ok(),
         "same-parent rename: new name present"
     );
 
@@ -2367,6 +771,23 @@ pub fn run_symlink_fallible_helpers_self_test() {
 
 /// Register VFS callbacks with kernel_core
 pub fn register_syscall_callbacks() {
+    kernel_core::mount_namespace::register_destroy_callback(|id| VFS.remove_namespace_id(id));
+    kernel_core::fs_context::register_callbacks(kernel_core::fs_context::FsCallbacks {
+        access: |name, mode| VFS.access(name, mode).map_err(fs_error_to_syscall),
+        getcwd: || VFS.getcwd().map_err(fs_error_to_syscall),
+        change_directory: |name, root| {
+            VFS.change_directory(name, root)
+                .map_err(fs_error_to_syscall)
+        },
+        pivot_root: |new_root, put_old| {
+            VFS.pivot_root(new_root, put_old)
+                .map_err(fs_error_to_syscall)
+        },
+        namespace_bindings: |source, target, state| {
+            VFS.namespace_bindings_valid(source, target, state)
+                .map_err(fs_error_to_syscall)
+        },
+    });
     kernel_core::register_vfs_open_callback(vfs_open_callback);
     kernel_core::register_vfs_open_with_resolve_callback(vfs_open_with_resolve_callback);
     kernel_core::register_vfs_stat_callback(vfs_stat_callback);
@@ -2535,7 +956,7 @@ fn vfs_readdir_callback(
 
     // Get inode and the shared offset object from the file handle.
     // FIX: Extract inode Arc and offset to release process lock before I/O
-    let (inode, shared_offset) = {
+    let (inode, shared_offset, _owner) = {
         let proc = proc_arc.lock();
         let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
@@ -2548,23 +969,26 @@ fn vfs_readdir_callback(
         // R131-5 + R180-4 FIX: require a readable (non-O_PATH) description for
         // getdents64. O_PATH and residual non-readable access modes (O_WRONLY,
         // illegal mode 3 if any path skipped open validation) must not enumerate.
-        if !file_handle.flags.allows_readdir() {
+        if !file_handle.flags().allows_readdir() {
             return Err(SyscallError::EBADF);
         }
 
-        if !file_handle.inode.is_dir() {
-            return Err(SyscallError::ENOTDIR);
-        }
-
-        (Arc::clone(&file_handle.inode), file_handle.offset.clone())
+        (
+            Arc::clone(&file_handle.inode),
+            file_handle.offset.clone(),
+            file_handle.clone(),
+        )
     };
     // Process lock released here - safe for procfs operations
+    if !inode.is_dir() {
+        return Err(SyscallError::ENOTDIR);
+    }
 
     // R37-4 FIX (Codex review): Add MAC check for sys_getdents64.
     let dir_stat = inode.stat().map_err(fs_error_to_syscall)?;
-    if let Some(task) = LsmProcessCtx::from_current() {
-        lsm::hook_file_permission(&task, dir_stat.ino, 0x05).map_err(|_| SyscallError::EACCES)?;
-    }
+    let context = crate::context::OperationContext::current().map_err(fs_error_to_syscall)?;
+    lsm::hook_file_permission(&context.subject, dir_stat.ino, 0x05)
+        .map_err(|_| SyscallError::EACCES)?;
 
     // R180-L1: serialize concurrent operations on this open file description.
     // Hold the offset lock through enumeration and user copyout; publish the new
@@ -2731,7 +1155,83 @@ mod readdir_cookie_tests {
 mod rf180_37_open_tests {
     use super::*;
 
-    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    use crate::HEAP_TEST_LOCK as TEST_LOCK;
+
+    #[test]
+    fn ksa004_prepared_open_cancellation_preserves_contents_and_success_truncates() {
+        let _serial = TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let vfs = Vfs::new();
+        let fs = RamFs::try_new().unwrap();
+        let root = fs.root_inode();
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/", fs.clone())
+            .unwrap();
+        let victim = fs
+            .create(
+                &root,
+                "transaction-victim",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        let contents = b"preserve these bytes until publication is ready";
+        victim.write_at(0, contents).unwrap();
+        let flags = OpenFlags::new(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+        let prepared = vfs
+            .open_with_resolve_using(
+                "/transaction-victim",
+                flags,
+                0,
+                ResolveFlags::empty(),
+                PreparedFileHandle::try_new,
+                vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(victim.stat().unwrap().size, contents.len() as u64);
+        drop(kernel_core::syscall::PreparedVfsOpen::new(
+            prepared,
+            finish_syscall_open,
+        ));
+        let mut observed = [0u8; 64];
+        assert_eq!(victim.read_at(0, &mut observed).unwrap(), contents.len());
+        assert_eq!(&observed[..contents.len()], contents);
+        let prepared = vfs
+            .open_with_resolve_using(
+                "/transaction-victim",
+                flags,
+                0,
+                ResolveFlags::empty(),
+                PreparedFileHandle::try_new,
+                vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(victim.stat().unwrap().size, contents.len() as u64);
+        finish_open(prepared.as_ref()).unwrap();
+        assert_eq!(victim.stat().unwrap().size, 0);
+        assert_eq!(victim.read_at(0, &mut observed).unwrap(), 0);
+        victim.write_at(0, contents).unwrap();
+        drop(vfs.open_trusted("/transaction-victim", flags, 0).unwrap());
+        assert_eq!(victim.stat().unwrap().size, 0);
+    }
+
+    #[test]
+    fn ksa004_truncate_does_not_mutate_character_devices() {
+        let _serial = TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let vfs = Vfs::new();
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/", DevFs::new())
+            .unwrap();
+        let descriptor = vfs
+            .open_trusted(
+                "/null",
+                OpenFlags::new(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC),
+                0,
+            )
+            .unwrap();
+        let file = descriptor.as_any().downcast_ref::<FileHandle>().unwrap();
+        assert_eq!(file.stat().unwrap().mode.file_type, FileType::CharDevice);
+        assert_eq!(file.write(b"discard").unwrap(), 7);
+    }
 
     #[test]
     fn preparation_failure_precedes_create_and_truncate_without_vfs_ledger_drift() {
@@ -2745,7 +1245,12 @@ mod rf180_37_open_tests {
             .expect("RF180-37 root mount");
 
         let victim = fs
-            .create(&root, "victim", FileMode::new(FileType::Regular, 0o600))
+            .create(
+                &root,
+                "victim",
+                FileMode::new(FileType::Regular, 0o600),
+                &crate::topology::write().setup(0, 0),
+            )
             .expect("RF180-37 victim creation");
         let contents = b"must survive failed O_TRUNC";
         assert_eq!(
@@ -2761,6 +1266,7 @@ mod rf180_37_open_tests {
                 0o600,
                 ResolveFlags::empty(),
                 || Err(FsError::NoMem),
+                vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap()
             ),
             Err(FsError::NoMem)
         ));
@@ -2777,6 +1283,7 @@ mod rf180_37_open_tests {
                 0,
                 ResolveFlags::empty(),
                 || Err(FsError::NoMem),
+                vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap()
             ),
             Err(FsError::NoMem)
         ));
@@ -2798,59 +1305,23 @@ mod rf180_37_open_tests {
 ///
 /// Called by sys_ftruncate to truncate a file
 fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
-    use kernel_core::current_pid;
-    use kernel_core::get_process;
-
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-
-    // R132-2 FIX: Clone inode Arc and build LSM context under the process lock,
-    // then drop the lock before VFS inode callbacks. Previously, inode.stat() and
-    // inode.truncate() were called while holding proc_arc.lock(). For procfs inodes,
-    // these callbacks may access PROCESS_TABLE, creating a lock ordering inversion:
-    //   vfs_truncate path: Process lock → inode.stat()/truncate() → PROCESS_TABLE
-    //   Normal path:       PROCESS_TABLE → Process lock (signal delivery, get_process)
-    // Same pattern as R131-4 (sys_fstat) and R130-2 (sys_lseek), both now fixed.
-    let (inode, task) = {
-        let proc = proc_arc.lock();
-
+    let context = crate::context::OperationContext::current().map_err(fs_error_to_syscall)?;
+    let process = context.process.as_ref().ok_or(SyscallError::ESRCH)?;
+    let file = {
+        let proc = process.lock();
         let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-
-        // Downcast to FileHandle
-        let file_handle = handle
+        let file = handle
             .as_any()
             .downcast_ref::<FileHandle>()
             .ok_or(SyscallError::ENOSYS)?;
-
-        // R129-1 FIX: POSIX requires ftruncate fd to be open for writing.
-        // Without this check, open(O_RDONLY) + ftruncate() bypasses DAC write permission.
-        if !file_handle.flags.is_writable() {
+        if !file.flags().is_writable() {
             return Err(SyscallError::EINVAL);
         }
-
-        // Clone inode Arc so we can use it after dropping the process lock
-        let inode = file_handle.inode.clone();
-
-        // R26-5 FIX: MAC gate for truncate operations
-        // LSM policy can block file truncation
-        // R131-3 FIX: Build LSM context directly from the locked Process struct instead of
-        // calling from_current(). from_current() triggers current_credentials() which
-        // re-acquires the same Process mutex → deterministic self-deadlock.
-        let task = {
-            let creds = proc.try_credentials_read().ok_or(FsError::Busy)?;
-            LsmProcessCtx::new(
-                proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid,
-            )
-        };
-
-        (inode, task)
+        file.clone()
     };
-    // Process lock released — safe for VFS/procfs inode operations
-
-    let stat = inode.stat().map_err(fs_error_to_syscall)?;
-    lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
-
-    inode.truncate(length).map_err(fs_error_to_syscall)
+    let stat = file.inode.stat().map_err(fs_error_to_syscall)?;
+    lsm::hook_file_truncate(&context.subject, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
+    file.inode.truncate(length).map_err(fs_error_to_syscall)
 }
 
 /// Shared access/seekability gate for pread64 and pwrite64.
@@ -2885,7 +1356,7 @@ fn vfs_pread_callback(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Sys
     // Clone inode Arc under the process lock, drop before I/O (same R132-2/R41-3
     // pattern as vfs_truncate: procfs callbacks may touch PROCESS_TABLE, so
     // holding Process lock across inode.read_at() risks lock inversion).
-    let inode = {
+    let file = {
         let proc = proc_arc.lock();
         let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
@@ -2897,13 +1368,16 @@ fn vfs_pread_callback(fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Sys
 
         // RF180-L1: reject pipes/sockets/character devices before read_at can
         // dequeue input. Console FileHandles are deliberately non-seekable.
-        positioned_io_gate(file_handle.flags.is_readable(), file_handle.seekable)?;
+        positioned_io_gate(file_handle.flags().is_readable(), file_handle.seekable)?;
 
-        file_handle.inode.clone()
+        file_handle.clone()
     };
     // Process lock released before positioned read
 
-    let count = inode.read_at(offset, buf).map_err(fs_error_to_syscall)?;
+    let count = file
+        .inode
+        .read_at(offset, buf)
+        .map_err(fs_error_to_syscall)?;
     if count > buf.len() {
         return Err(SyscallError::EIO);
     }
@@ -2919,8 +1393,8 @@ fn vfs_pwrite_callback(fd: i32, data: &[u8], offset: u64) -> Result<usize, Sysca
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // Clone inode Arc under the process lock, drop before I/O (same pattern).
-    let inode = {
+    // Clone the shared description under Process, release the lock before I/O.
+    let file = {
         let proc = proc_arc.lock();
         let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
@@ -2932,13 +1406,13 @@ fn vfs_pwrite_callback(fd: i32, data: &[u8], offset: u64) -> Result<usize, Sysca
 
         // Keep positioned-write semantics congruent: non-seekable endpoints
         // reject before any externally visible device write.
-        positioned_io_gate(file_handle.flags.is_writable(), file_handle.seekable)?;
+        positioned_io_gate(file_handle.flags().is_writable(), file_handle.seekable)?;
 
-        file_handle.inode.clone()
+        file_handle.clone()
     };
     // Process lock released before positioned write
 
-    let count = inode.write_at(offset, data).map_err(fs_error_to_syscall)?;
+    let count = file.pwrite(offset, data).map_err(fs_error_to_syscall)?;
     if count > data.len() {
         return Err(SyscallError::EIO);
     }

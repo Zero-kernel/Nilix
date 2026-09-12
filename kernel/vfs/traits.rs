@@ -2,6 +2,7 @@
 //!
 //! Core traits for filesystem and inode operations.
 
+use crate::topology::MutationContext;
 use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 use alloc::alloc::{dealloc, Layout};
 use alloc::boxed::Box;
@@ -38,6 +39,40 @@ pub trait FileSystem: Send + Sync {
     /// The child inode or FsError::NotFound
     fn lookup(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<Arc<dyn Inode>, FsError>;
 
+    /// Observe real directory ancestry under the caller's topology guard. The
+    /// generic disk/pseudo implementation uses an identity-bound `..` entry;
+    /// mutable RAMFS overrides this with retained object metadata.
+    fn directory_parent(&self, inode: &Arc<dyn Inode>) -> Result<Option<DirectoryParent>, FsError> {
+        if inode.fs_id() != self.fs_id() {
+            return Err(FsError::CrossDev);
+        }
+        if !inode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        if inode.ino() == self.root_inode().ino() {
+            return Ok(None);
+        }
+        let parent = self.lookup(inode, "..")?;
+        if parent.fs_id() != self.fs_id() || parent.ino() == inode.ino() {
+            return Err(FsError::Invalid);
+        }
+        let mut offset = 0;
+        while let Some((next, entry)) = parent.readdir(offset)? {
+            if next <= offset {
+                return Err(FsError::Io);
+            }
+            offset = next;
+            if entry.ino == inode.ino() && entry.name != "." && entry.name != ".." {
+                return Ok(Some(DirectoryParent {
+                    inode: parent,
+                    name: entry.name,
+                    attached: true,
+                }));
+            }
+        }
+        Err(FsError::NotFound)
+    }
+
     /// Create a new file or directory
     ///
     /// # Arguments
@@ -52,8 +87,9 @@ pub trait FileSystem: Send + Sync {
         parent: &Arc<dyn Inode>,
         name: &str,
         mode: FileMode,
+        context: &MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
-        let _ = (parent, name, mode);
+        let _ = (parent, name, mode, context);
         Err(FsError::NotSupported)
     }
 
@@ -73,8 +109,9 @@ pub trait FileSystem: Send + Sync {
         name: &str,
         expected_ino: u64,
         must_be_dir: Option<bool>,
+        context: &MutationContext<'_>,
     ) -> Result<(), FsError> {
-        let _ = (parent, name, expected_ino, must_be_dir);
+        let _ = (parent, name, expected_ino, must_be_dir, context);
         Err(FsError::NotSupported)
     }
 
@@ -94,6 +131,7 @@ pub trait FileSystem: Send + Sync {
         noreplace: bool,
         expected_src_ino: u64,
         expected_dest_ino: Option<u64>,
+        context: &MutationContext<'_>,
     ) -> Result<(), FsError> {
         let _ = (
             old_parent,
@@ -103,6 +141,7 @@ pub trait FileSystem: Send + Sync {
             noreplace,
             expected_src_ino,
             expected_dest_ino,
+            context,
         );
         Err(FsError::NotSupported)
     }
@@ -121,8 +160,9 @@ pub trait FileSystem: Send + Sync {
         parent: &Arc<dyn Inode>,
         name: &str,
         target: &str,
+        context: &MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
-        let _ = (parent, name, target);
+        let _ = (parent, name, target, context);
         Err(FsError::NotSupported)
     }
 
@@ -140,7 +180,7 @@ pub trait Inode: Send + Sync {
     /// Get inode number (unique within filesystem)
     fn ino(&self) -> u64;
 
-    /// Get filesystem ID this inode belongs to
+    /// Get the owning filesystem instance's globally unique ID.
     fn fs_id(&self) -> u64;
 
     /// Get file metadata
@@ -471,13 +511,50 @@ fn release_shared_offset_weak(ptr: NonNull<SharedFileOffsetInner>) {
 pub struct PreparedFileHandle {
     descriptor: PreparedFileDescriptor<FileHandle>,
     offset: SharedFileOffset,
+    owner: Option<FileLifetime>,
+    context: Option<crate::context::OperationContext>,
+}
+
+#[derive(Clone)]
+enum FileLifetime {
+    Filesystem(Arc<dyn FileSystem>),
+    Mount(Arc<crate::path::Mount>),
+}
+
+impl FileLifetime {
+    fn fs_id(&self) -> u64 {
+        match self {
+            Self::Filesystem(fs) => fs.fs_id(),
+            Self::Mount(mount) => mount.fs.fs_id(),
+        }
+    }
 }
 
 impl PreparedFileHandle {
     pub fn try_new() -> Result<Self, FsError> {
         let descriptor = FileDescriptor::try_prepare(HeapClass::Vfs).map_err(|_| FsError::NoMem)?;
         let offset = SharedFileOffset::try_new()?;
-        Ok(Self { descriptor, offset })
+        Ok(Self {
+            descriptor,
+            offset,
+            owner: None,
+            context: None,
+        })
+    }
+
+    pub fn bind_filesystem(mut self, filesystem: Arc<dyn FileSystem>) -> Self {
+        self.owner = Some(FileLifetime::Filesystem(filesystem));
+        self
+    }
+
+    pub(crate) fn bind_path(
+        mut self,
+        path: &crate::path::ResolvedPath,
+        context: crate::context::OperationContext,
+    ) -> Self {
+        self.owner = Some(FileLifetime::Mount(path.mount.clone()));
+        self.context = Some(context);
+        self
     }
 
     pub fn finalize(
@@ -486,12 +563,27 @@ impl PreparedFileHandle {
         flags: OpenFlags,
         seekable: bool,
     ) -> FileDescriptor {
+        let owner = self
+            .owner
+            .expect("direct inode open must supply its filesystem owner");
+        assert_eq!(
+            owner.fs_id(),
+            inode.fs_id(),
+            "open lifetime owner/inode identity mismatch"
+        );
+        // KSA-013: initialize in the already allocated shared owner. Finalization
+        // must remain infallible after path creation/truncation is committed.
+        self.offset
+            .status()
+            .store(flags.0 & FILE_STATUS_MUTABLE, Ordering::Relaxed);
         self.descriptor.finalize(FileHandle {
             inode,
             offset: self.offset,
             flags,
             seekable,
             cap_id: spin::once::Once::new(), // U.S2 SLICE-3B: born uninitialized; set at install
+            owner,
+            pending_context: spin::Mutex::new(self.context),
         })
     }
 }
@@ -500,10 +592,12 @@ impl PreparedFileHandle {
 pub struct FileHandle {
     /// The underlying inode
     pub inode: Arc<dyn Inode>,
+    owner: FileLifetime,
+    pub(crate) pending_context: spin::Mutex<Option<crate::context::OperationContext>>,
     /// Current file offset (shared via Arc for clone to share offset)
     pub offset: SharedFileOffset,
-    /// Open flags
-    pub flags: OpenFlags,
+    /// Original immutable access/creation flags. Read current status via flags().
+    flags: OpenFlags,
     /// Whether this handle supports seeking
     pub seekable: bool,
     /// U.S2 SLICE-3B: Capability ID for this regular file handle.
@@ -531,12 +625,18 @@ pub struct FileHandle {
 /// (dup/fork children share capability identity). If unset, the clone stays unset.
 impl Clone for FileHandle {
     fn clone(&self) -> Self {
+        assert!(
+            self.pending_context.lock().is_none(),
+            "unfinalized file handle cloned"
+        );
         let cap_id = spin::once::Once::new();
         if let Some(&id) = self.cap_id.poll() {
             cap_id.call_once(|| id);
         }
         Self {
             inode: Arc::clone(&self.inode),
+            owner: self.owner.clone(),
+            pending_context: spin::Mutex::new(None),
             offset: self.offset.clone(),
             flags: self.flags,
             seekable: self.seekable,
@@ -546,6 +646,13 @@ impl Clone for FileHandle {
 }
 
 impl FileHandle {
+    /// Access/creation semantics are immutable; mutable bits are shared by all
+    /// dup/fork/transient copies of this open file description.
+    pub fn flags(&self) -> OpenFlags {
+        let status = self.offset.status().load(Ordering::Relaxed);
+        OpenFlags::new((self.flags.0 & !FILE_STATUS_MUTABLE) | status)
+    }
+
     /// U.S2 SLICE-3B: Get the underlying inode for cap allocation.
     ///
     /// Returns a reference to the Arc<dyn Inode> backing this handle.
@@ -574,7 +681,7 @@ impl FileHandle {
 
     /// Read from current offset
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
-        if !self.flags.is_readable() {
+        if !self.flags().is_readable() {
             return Err(FsError::BadFd);
         }
 
@@ -586,12 +693,13 @@ impl FileHandle {
 
     /// Write to current offset (or end if append mode)
     pub fn write(&self, data: &[u8]) -> Result<usize, FsError> {
-        if !self.flags.is_writable() {
+        let flags = self.flags();
+        if !flags.is_writable() {
             return Err(FsError::BadFd);
         }
 
         // R178-21 FIX: O_APPEND uses inode-level atomic append primitive
-        if self.flags.is_append() {
+        if flags.is_append() {
             // RF178-17 FIX: Keep this open file description's offset lock across
             // EOF selection, I/O, and final offset publication. Independent
             // handles serialize at the inode; clones serialize here.
@@ -605,6 +713,22 @@ impl FileHandle {
         let n = self.inode.write_at(*offset, data)?;
         *offset += n as u64;
         Ok(n)
+    }
+
+    /// Linux pwrite preserves the shared offset even when O_APPEND selects EOF.
+    pub fn pwrite(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let flags = self.flags();
+        if !flags.is_writable() {
+            return Err(FsError::BadFd);
+        }
+        if !self.seekable {
+            return Err(FsError::Seek);
+        }
+        if flags.is_append() {
+            self.inode.append_write(data).map(|(count, _)| count)
+        } else {
+            self.inode.write_at(offset, data)
+        }
     }
 
     /// Seek to new offset
@@ -779,7 +903,9 @@ mod rf180_37_tests {
             .clone()
             .open(
                 OpenFlags::new(OpenFlags::O_RDWR),
-                PreparedFileHandle::try_new().expect("prepare original descriptor"),
+                PreparedFileHandle::try_new()
+                    .expect("prepare original descriptor")
+                    .bind_filesystem(owner(inode.clone())),
             )
             .expect("finalize original descriptor");
         let one_descriptor = mm::heap_class_snapshot(HeapClass::Vfs);

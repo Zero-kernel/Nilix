@@ -71,6 +71,10 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
+// Tests that perturb shared heap admission or assert exact class charges must
+// share this lock even when their fixtures span several filesystem modules.
+#[cfg(test)]
+pub(crate) static HEAP_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 #[macro_use]
 extern crate drivers;
 #[macro_use]

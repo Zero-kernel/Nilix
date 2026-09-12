@@ -402,11 +402,11 @@ pub fn test_ext2_write() {
 
     // Optional mounted-image probe. The deterministic fail-closed production
     // open/cache test above is the RF178-37 acceptance criterion.
-    match vfs::stat("/mnt") {
+    match vfs::VFS.stat_trusted("/mnt") {
         Ok(stat) => {
             let flags = vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY | vfs::OpenFlags::O_DIRECTORY);
-            let first = vfs::open("/mnt", flags, 0);
-            let second = vfs::open("/mnt", flags, 0);
+            let first = vfs::VFS.open_trusted("/mnt", flags, 0);
+            let second = vfs::VFS.open_trusted("/mnt", flags, 0);
             if let (Ok(first), Ok(second)) = (first, second) {
                 let first = first.as_any().downcast_ref::<vfs::FileHandle>();
                 let second = second.as_any().downcast_ref::<vfs::FileHandle>();
@@ -437,7 +437,7 @@ pub fn test_ext2_write() {
                         // may not carry it, in which case the probe skips gracefully
                         // like the not-mounted / not-ext2 / dual-open-failed branches
                         // above rather than kernel-panic via .expect().
-                        match vfs::open("/mnt/test/alloc.bin", alloc_flags, 0) {
+                        match vfs::VFS.open_trusted("/mnt/test/alloc.bin", alloc_flags, 0) {
                             Ok(alloc_file_ops) => {
                                 let alloc_file = alloc_file_ops
                                     .as_any()
@@ -488,7 +488,11 @@ pub fn test_ext2_write() {
                                 | vfs::OpenFlags::O_EXCL
                                 | vfs::OpenFlags::O_NOFOLLOW,
                         );
-                        match vfs::open("/mnt/test/.syz-create-probe.bin", create_flags, 0o600) {
+                        match vfs::VFS.open_trusted(
+                            "/mnt/test/.syz-create-probe.bin",
+                            create_flags,
+                            0o600,
+                        ) {
                             Ok(probe_ops) => {
                                 let probe = probe_ops
                                     .as_any()
@@ -498,12 +502,13 @@ pub fn test_ext2_write() {
                                 let probe_ino = probe.inode.stat().expect("stat create probe").ino;
                                 let _ = probe;
                                 drop(probe_ops);
-                                let rd = vfs::open(
-                                    "/mnt/test/.syz-create-probe.bin",
-                                    vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY),
-                                    0,
-                                )
-                                .expect("reopen create probe O_RDONLY");
+                                let rd = vfs::VFS
+                                    .open_trusted(
+                                        "/mnt/test/.syz-create-probe.bin",
+                                        vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY),
+                                        0,
+                                    )
+                                    .expect("reopen create probe O_RDONLY");
                                 let rd = rd
                                     .as_any()
                                     .downcast_ref::<vfs::FileHandle>()
@@ -522,7 +527,7 @@ pub fn test_ext2_write() {
                                 assert_eq!(buf, *b"X");
                                 assert!(
                                     matches!(
-                                        vfs::open(
+                                        vfs::VFS.open_trusted(
                                             "/mnt/test/.syz-create-probe.bin",
                                             create_flags,
                                             0o600
