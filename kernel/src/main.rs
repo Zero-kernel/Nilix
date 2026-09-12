@@ -199,99 +199,75 @@ fn parse_hardening_profile_from_cmdline(
     result
 }
 
-/// Test block device write/read path end-to-end
-///
-/// Writes a test pattern to the last sectors of the device (safe area outside filesystem),
-/// reads it back, and verifies the data matches. This exercises the full write path
-/// through virtio-blk without requiring filesystem write support.
+/// Test one whole logical sector and restore its original contents.
 fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
-    use alloc::vec;
-
-    // Skip if device is read-only
     if device.is_read_only() {
         klog!(Info, "        [SKIP] Device is read-only");
         return true;
     }
-
-    let capacity = device.capacity_sectors();
-    let sector_size = device.sector_size() as usize;
-
-    // Need at least 2 sectors for test (use last 2 sectors)
-    if capacity < 4 {
+    let geometry = match device.geometry() {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            klog!(Error, "        [FAIL] Invalid block geometry: {:?}", error);
+            return false;
+        }
+    };
+    if geometry.capacity_sectors() < 4 {
         klog!(Info, "        [SKIP] Device too small for write test");
         return true;
     }
-
-    // Use last 2 sectors as scratch area (outside ext2 filesystem)
-    let test_sector = capacity - 2;
-    let test_pattern: [u8; 512] = {
-        let mut pattern = [0u8; 512];
-        for (i, byte) in pattern.iter_mut().enumerate() {
-            // Create a recognizable pattern: 0xDE, 0xAD, 0xBE, 0xEF repeating + offset
-            *byte = match i % 4 {
-                0 => 0xDE,
-                1 => 0xAD,
-                2 => 0xBE,
-                _ => 0xEF,
-            } ^ (i as u8);
+    let sector_size = geometry.sector_size() as usize;
+    let test_sector = geometry.capacity_sectors() - 2;
+    let mut original = alloc::vec::Vec::new();
+    let mut pattern = alloc::vec::Vec::new();
+    let mut actual = alloc::vec::Vec::new();
+    for buffer in [&mut original, &mut pattern, &mut actual] {
+        if buffer.try_reserve_exact(sector_size).is_err() {
+            klog!(Error, "        [FAIL] Block probe buffer allocation");
+            return false;
         }
-        pattern
-    };
-
-    // Write test pattern
+        buffer.resize(sector_size, 0u8);
+    }
+    for (index, byte) in pattern.iter_mut().enumerate() {
+        *byte = [0xde, 0xad, 0xbe, 0xef][index % 4] ^ index as u8;
+    }
+    if device.read_sync(test_sector, &mut original) != Ok(sector_size) {
+        klog!(Error, "        [FAIL] Cannot preserve block probe sector");
+        return false;
+    }
     klog!(
         Info,
-        "        Writing test pattern to sector {}...",
-        test_sector
+        "        Writing test pattern to logical sector {} ({} bytes)...",
+        test_sector,
+        sector_size
     );
-    match device.write_sync(test_sector, &test_pattern) {
-        Ok(n) if n == sector_size => {}
-        Ok(n) => {
-            klog!(
-                Error,
-                "        [FAIL] Write returned {} bytes, expected {}",
-                n,
-                sector_size
-            );
-            return false;
-        }
-        Err(e) => {
-            klog!(Error, "        [FAIL] Write failed: {:?}", e);
-            return false;
-        }
-    }
-
-    // Read back
-    let mut read_buf = vec![0u8; sector_size];
-    match device.read_sync(test_sector, &mut read_buf) {
-        Ok(n) if n == sector_size => {}
-        Ok(n) => {
-            klog!(
-                Error,
-                "        [FAIL] Read returned {} bytes, expected {}",
-                n,
-                sector_size
-            );
-            return false;
-        }
-        Err(e) => {
-            klog!(Error, "        [FAIL] Read failed: {:?}", e);
-            return false;
-        }
-    }
-
-    // Verify
-    if read_buf[..512] == test_pattern {
-        klog!(Info, "        [PASS] Write/read verification successful");
-        true
-    } else {
-        klog!(Error, "        [FAIL] Data mismatch!");
+    let passed = device.write_sync(test_sector, &pattern) == Ok(sector_size)
+        && device.read_sync(test_sector, &mut actual) == Ok(sector_size)
+        && actual == pattern;
+    // Attempt restoration even after a partial/failed write. Never report pass
+    // unless the complete original sector was restored and read back exactly.
+    let restored = device.write_sync(test_sector, &original) == Ok(sector_size)
+        && device.read_sync(test_sector, &mut actual) == Ok(sector_size)
+        && actual == original;
+    if passed && restored {
+        klog_always!(
+            "KSA-019-BLOCK PASS sector_bytes={} sector={} capacity_sectors={} restored=exact",
+            sector_size,
+            test_sector,
+            geometry.capacity_sectors(),
+        );
         klog!(
             Info,
-            "        Expected first 8: {:02x?}",
-            &test_pattern[..8]
+            "        [PASS] Write/read verification successful (original restored)"
         );
-        klog!(Info, "        Got first 8:      {:02x?}", &read_buf[..8]);
+        true
+    } else {
+        klog!(
+            Error,
+            "        [FAIL] Block round-trip={} restoration={}",
+            passed,
+            restored
+        );
         false
     }
 }
