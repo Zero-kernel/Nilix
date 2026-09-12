@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -122,16 +123,37 @@ impl Ext3Transport {
     pub fn extract_result(&self, disk_path: &Path, work_dir: &Path) -> Result<Vec<u8>> {
         ensure_debugfs_safe_path(disk_path)?;
         ensure_debugfs_safe_path(work_dir)?;
-        self.repair_image(disk_path)?;
+        // QEMU has been stopped and reaped by the caller. Successful guest
+        // transactions checkpoint before PASS. Linux e2fsck cannot replay our
+        // private JBD2 feature; preserve the guest disk and read its committed
+        // result without attempting a repair or claiming filesystem health.
+        let disk_before = image_sha256(disk_path)?;
 
         let output_path = work_dir.join("syz-result.host.bin");
         ensure_debugfs_safe_path(&output_path)?;
+        if output_path.exists() {
+            bail!("result extraction output already exists");
+        }
         let dump = format!("dump -p {RESULT_GUEST_PATH} {}", utf8_path(&output_path)?);
-        run_checked(
+        let extraction = run_checked(
             &self.tools.debugfs,
             &debugfs_args(disk_path, false, &dump),
             "extract authenticated syz result",
+        );
+        let disk_after = image_sha256(disk_path)?;
+        write_new_file(
+            &work_dir.join("extraction-disk.sha256"),
+            format!(
+                "before={}\nafter={}\n",
+                hex::encode(disk_before),
+                hex::encode(disk_after)
+            )
+            .as_bytes(),
         )?;
+        if disk_before != disk_after {
+            bail!("guest disk changed during read-only result extraction");
+        }
+        extraction?;
 
         let metadata = std::fs::metadata(&output_path)
             .context("debugfs did not create a result extraction file")?;
@@ -158,6 +180,22 @@ impl Ext3Transport {
             ),
         }
     }
+}
+
+fn image_sha256(path: &Path) -> Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path).context("failed to open guest disk for hashing")?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .context("failed to hash guest disk")?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash.finalize().into())
 }
 
 pub fn ensure_qemu_safe_path(path: &Path) -> Result<()> {
@@ -315,6 +353,42 @@ mod tests {
         let program = b"strict-test-program";
         let image = transport.prepare(temp.path(), program).unwrap();
         assert!(image.exists());
+        let result = b"guest-result-to-be-authenticated-by-executor";
+        let guest_output = temp.path().join("guest-output.bin");
+        write_new_file(&guest_output, result).unwrap();
+        run_checked(
+            &transport.tools.debugfs,
+            &debugfs_args(
+                &image,
+                true,
+                &format!(
+                    "write {} {RESULT_GUEST_PATH}",
+                    utf8_path(&guest_output).unwrap()
+                ),
+            ),
+            "simulate guest result",
+        )
+        .unwrap();
+        let before = image_sha256(&image).unwrap();
+        let read_only_transport = Ext3Transport::new(
+            Ext3Tools {
+                e2fsck: temp.path().join("must-not-run-fsck"),
+                ..Ext3Tools::default()
+            },
+            MIN_DISK_MIB,
+        )
+        .unwrap();
+        assert_eq!(
+            read_only_transport
+                .extract_result(&image, temp.path())
+                .unwrap(),
+            result
+        );
+        assert_eq!(image_sha256(&image).unwrap(), before);
+        // A repeated extraction must not accept a stale host result file.
+        assert!(read_only_transport
+            .extract_result(&image, temp.path())
+            .is_err());
     }
 
     #[cfg(target_os = "linux")]
