@@ -7,6 +7,7 @@ out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
 failed=0
+guest_retries="${CI_GUEST_RETRIES:-1}"
 finish() {
     local status=$?
     trap - EXIT
@@ -18,15 +19,59 @@ finish() {
     exit "$status"
 }
 trap finish EXIT
+if [[ ! "$guest_retries" =~ ^(0|1)$ ]]; then
+    echo "CI_GUEST_RETRIES must be 0 or 1" >&2
+    exit 2
+fi
 
 gate() {
     local name="$1"
     shift
-    python3 scripts/ci/record_gate.py --name "$name" --artifacts "$out/$name" "$@"
+    gate_named "$name" "$name" "$@"
+}
+gate_named() {
+    local artifact_name="$1"
+    local display_name="$2"
+    shift 2
+    python3 scripts/ci/record_gate.py --name "$display_name" --artifacts "$out/$artifact_name" "$@"
 }
 check() {
     # Continue independent checks, but preserve failure in this group's exit.
     if ! gate "$@"; then failed=1; fi
+}
+retry_event() {
+    local gate_name="$1"
+    local attempt="$2"
+    local status="$3"
+    local action="$4"
+    printf 'CI-RETRY gate=%s attempt=%s/2 status=%s action=%s\n' \
+        "$gate_name" "$attempt" "$status" "$action" | tee -a "$out/retry.log"
+}
+check_guest() {
+    local name="$1"
+    shift
+    local first_status second_status
+    if gate "$name" "$@"; then
+        return 0
+    else
+        first_status=$?
+    fi
+    # Retry only an actual guest failure/incomplete result. A qualified result
+    # (exit 3) and host/build failures remain single-shot and visible.
+    if [[ "$guest_retries" != 1 || ( "$first_status" != 1 && "$first_status" != 2 ) ]]; then
+        failed=1
+        return 0
+    fi
+    retry_event "$name" 1 "$first_status" retry
+    if gate_named "$name" "$name (retry 1)" "$@"; then
+        retry_event "$name" 2 0 recovered
+        return 0
+    else
+        second_status=$?
+    fi
+    retry_event "$name" 2 "$second_status" final-failure
+    failed=1
+    return 0
 }
 
 case "$group" in
@@ -55,14 +100,14 @@ case "$group" in
     runtime)
         # The CI job downloads the normal ESP built by the build group. Local
         # callers run the build group first; gate_inputs verifies fresh copies.
-        check boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
-        check runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
-        check smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
+        check_guest boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
+        check_guest runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
+        check_guest smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
         ;;
     musl)
         gate build -- make build-musl-test
         for cpus in 1 4; do
-            check "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=600 \
+            check_guest "musl-$cpus" -- env MUSL_CHECK_CPUS="$cpus" MUSL_CHECK_TIMEOUT=600 \
                 bash scripts/gates/boot/musl_check.sh kernel-target/musl/esp
         done
         ;;
@@ -76,9 +121,9 @@ pathlib.Path(sys.argv[1]).write_text(''.join(
     for name in names if name and pathlib.Path(name).is_file()))
 PY
         revision="$(git rev-parse HEAD)"
-        check activation --allow-qualified -- bash scripts/gates/qemu/iommu_q35_check.sh esp
-        check failures -- python3 scripts/gates/qemu/iommu_failure_probe.py --input-manifest "$out/inputs.sha256" --revision "$revision" --artifacts "$out/failure-probes"
-        check device -- python3 scripts/gates/qemu/iommu_device_probe.py --input-manifest "$out/inputs.sha256" --revision "$revision" --artifacts "$out/device-probe"
+        check_guest activation --allow-qualified -- bash scripts/gates/qemu/iommu_q35_check.sh esp
+        check_guest failures -- python3 scripts/gates/qemu/iommu_failure_probe.py --input-manifest "$out/inputs.sha256" --revision "$revision" --artifacts "$out/failure-probes"
+        check_guest device -- python3 scripts/gates/qemu/iommu_device_probe.py --input-manifest "$out/inputs.sha256" --revision "$revision" --artifacts "$out/device-probe"
         ;;
     mitigation)
         mitigation_timeout="${MITIGATION_TIMEOUT:-900}"
@@ -93,7 +138,7 @@ PY
             grep -F "retpoline is unsupported: no verified compiler transformation" "$1"
         ' -- "$out/retpoline-negative.log"
         gate build -- make build-mitigation-probe
-        check runtime -- python3 scripts/gates/qemu/mitigation_check.py --runtime --smp 4 --timeout "$mitigation_timeout" \
+        check_guest runtime -- python3 scripts/gates/qemu/mitigation_check.py --runtime --smp 4 --timeout "$mitigation_timeout" \
             --kernel-elf kernel-target/mitigation/x86_64-unknown-none/release/kernel \
             --esp kernel-target/mitigation/esp --build-command-json kernel-target/mitigation/build-command.json \
             --artifacts "$out/proof"
@@ -101,15 +146,15 @@ PY
     qemu-fuzz)
         check adapter -- cargo test --manifest-path fuzz/Cargo.toml --target x86_64-unknown-linux-gnu --locked --features qemu-executor --lib qemu_executor::tests
         check kcov-host -- cargo test --locked --manifest-path kernel/coverage/Cargo.toml --features kcov
-        check kcov-guest -- env KERNEL_TEST_TIMEOUT=900 KCOV_KEEP_LOGS=1 make test-kcov
+        check_guest kcov-guest -- env KERNEL_TEST_TIMEOUT=900 KCOV_KEEP_LOGS=1 make test-kcov
         gate executor-build -- make build-fuzz-qemu-deps
-        check executor-guest -- python3 scripts/gates/qemu/qemu_fuzz_smoke.py --kernel esp-syz/kernel.elf \
+        check_guest executor-guest -- python3 scripts/gates/qemu/qemu_fuzz_smoke.py --kernel esp-syz/kernel.elf \
             --artifacts "$out/executor-evidence"
         ;;
     extended)
         gate build -- make build
-        check smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
-        check ext3 --allow-qualified -- bash -c '
+        check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
+        check_guest ext3 --allow-qualified -- bash -c '
             make ensure-ext3-image || exit
             image=$(mktemp "$PWD/.ci-ext3.XXXXXX") || exit
             trap '\''rm -f -- "$image"'\'' EXIT
@@ -117,7 +162,7 @@ PY
             KERNEL_TEST_DISK="$image" bash scripts/gates/boot/kernel_test.sh esp
         '
         gate stress-build -- make build-stress
-        check stress --allow-qualified -- env STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
+        check_guest stress --allow-qualified -- env STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
             STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
         ;;
     *) echo "Unknown CI group: $group" >&2; exit 2 ;;

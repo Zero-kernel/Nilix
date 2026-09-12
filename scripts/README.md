@@ -25,4 +25,6 @@ bash scripts/ci/entrypoint.sh runtime
 Each group writes a fresh receipt directory under `target/ci/<group>/run.*`.
 The receipt contains the command, exit status, duration, source identity and
 raw evidence. Python tests also publish JUnit and coverage files through the
-`quality` group.
+`quality` group. Guest groups retry one exit-1 or exit-2 attempt by default;
+set `CI_GUEST_RETRIES=0` for a single attempt. Retry decisions are recorded in
+the group's `retry.log` and both gate receipts are retained.

@@ -99,6 +99,10 @@ def report(root):
                     ET.SubElement(item, 'failure' if state == 'FAILED' else 'skipped', message=state)
         ET.indent(rust)
         ET.ElementTree(rust).write(path.parent / 'hosted.junit.xml', encoding='utf-8', xml_declaration=True)
+    retry_log = root / 'retry.log'
+    if retry_log.exists():
+        lines.extend(['', '### Guest retry events', '', '```text',
+                      retry_log.read_text(encoding='utf8', errors='replace').rstrip(), '```'])
     lines.extend(['', 'Raw status, commands, source identities and logs are retained in the job artifact.', ''])
     return '\n'.join(lines)
 

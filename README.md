@@ -99,7 +99,8 @@ The shared CI groups run source checks, hosted tests, feature-specific builds,
 boot/SMP, one-/four-CPU musl, IOMMU, mitigation and real KCOV/fuzz guests.
 JUnit, Markdown summaries, logs and source/image identities preserve each
 outcome. Python coverage measures host harness code. Diagnostic qualified
-results remain distinct from strict passes.
+results remain distinct from strict passes. Guest gates retry one failed or
+incomplete QEMU attempt by default and retain both attempts in the report.
 
 Stress runs cover six defined profiles on a weekly/manual workflow, but full
 acceptance is still blocked by kernel/workload gaps. Eleven scheduled fuzz

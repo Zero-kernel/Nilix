@@ -89,7 +89,8 @@ Cargo 模块划分用于组织职责，不代表服务已运行在独立权限�
 
 CI 按 source/hosted/build/boot-SMP/musl/IOMMU/mitigation/KCOV-fuzz 分组。
 JUnit、Markdown、原始日志及源码/镜像身份共同保留实际结果。Python 覆盖率衡量的是
-宿主测试脚本；qualified 的诊断结果与严格 PASS 分开记录。
+宿主测试脚本；qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失败或
+不完整的 QEMU 首次尝试重试一次，并在报告中保留两次结果。
 
 六种 stress 场景通过每周/手动工作流运行，但内核和 workload 缺口仍阻塞完整验收。
 11 个定时 fuzz campaign 补充确定性 smoke，不能替代功能契约或无漏洞证明。

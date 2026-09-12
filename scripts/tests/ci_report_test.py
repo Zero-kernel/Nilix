@@ -67,6 +67,16 @@ class ReportTests(unittest.TestCase):
                          ['alloc::works', 'failed::case'])
         self.assertEqual(len(tree.findall('.//failure')), 1)
 
+    def test_guest_retry_events_are_visible_in_report(self):
+        self.receipt('boot', 0)
+        (self.root / 'retry.log').write_text(
+            'CI-RETRY gate=boot attempt=1/2 status=2 action=retry\n'
+            'CI-RETRY gate=boot attempt=2/2 status=0 action=recovered\n')
+        text = report(self.root)
+        self.assertIn('### Guest retry events', text)
+        self.assertIn('attempt=1/2 status=2 action=retry', text)
+        self.assertIn('attempt=2/2 status=0 action=recovered', text)
+
     def test_fuzz_report_rejects_missing_duplicate_or_malformed_public_results(self):
         needs = {'campaign': {'result': 'success'}}
         valid = 'Schema: nilix-fuzz-result-v1\nStatus: completed\nCandidate-Count: 2\n'

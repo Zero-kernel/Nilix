@@ -49,7 +49,7 @@ def main():
     try:
         identity = source_identity(root, args.input_manifest, args.revision)
         identity["profile_environment"] = {key: value for key, value in environment.items()
-                                           if key.startswith(("ZERO_OS_", "KERNEL_TEST_", "SMP_", "IOMMU_Q35_", "BOOT_CHECK_", "MUSL_CHECK_"))}
+                                           if key.startswith(("ZERO_OS_", "CI_GUEST_", "KERNEL_TEST_", "SMP_", "IOMMU_Q35_", "BOOT_CHECK_", "MUSL_CHECK_"))}
         binaries = tuple(f"{esp}/{name}" for esp in (
             "esp", "kernel-target/musl/esp", "kernel-target/mitigation/esp", "esp-kcov", "esp-syz", "esp-stress")
             for name in ("kernel.elf", "EFI/BOOT/BOOTX64.EFI"))

@@ -22,10 +22,17 @@ class EntryTests(unittest.TestCase):
         shutil.copyfile(Path(__file__).resolve().parents[1] / 'ci' / 'entrypoint.sh', ci / 'entrypoint.sh')
         (ci / 'record_gate.py').write_text('''
 import json, os, sys
+from pathlib import Path
 name = sys.argv[sys.argv.index('--name') + 1]
-with open(os.environ['EVENTS'], 'a') as stream:
+events = Path(os.environ['EVENTS'])
+with events.open('a') as stream:
     stream.write(json.dumps(name) + '\\n')
-raise SystemExit(7 if name == os.environ.get('FAIL_GATE') else 0)
+base = name.split(' (retry', 1)[0]
+attempt = sum(1 for line in events.read_text().splitlines()
+              if json.loads(line).split(' (retry', 1)[0] == base)
+if base == os.environ.get('FAIL_GATE') and attempt <= int(os.environ.get('FAIL_ATTEMPTS', '999')):
+    raise SystemExit(int(os.environ.get('FAIL_STATUS', '7')))
+raise SystemExit(0)
 ''')
         (ci / 'ci_report.py').write_text('''
 import os, pathlib, sys
@@ -57,6 +64,21 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         status, events = self.run_group('quality', FAIL_REPORT='1')
         self.assertEqual(status, 1)
         self.assertEqual(events[-1], 'report')
+
+    def test_guest_failure_retries_once_and_recovers(self):
+        status, events = self.run_group('runtime', FAIL_GATE='boot', FAIL_ATTEMPTS='1', FAIL_STATUS='1')
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'report'])
+
+    def test_guest_failure_after_retry_remains_a_failure(self):
+        status, events = self.run_group('runtime', FAIL_GATE='boot', FAIL_ATTEMPTS='2', FAIL_STATUS='1')
+        self.assertEqual(status, 1)
+        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'report'])
+
+    def test_invalid_retry_setting_keeps_report_and_blocks(self):
+        status, events = self.run_group('quality', CI_GUEST_RETRIES='2')
+        self.assertEqual(status, 2)
+        self.assertEqual(events, ['report'])
 
     def test_missing_stress_prerequisite_cannot_be_accepted_as_qualified(self):
         scripts = Path(__file__).resolve().parents[1]

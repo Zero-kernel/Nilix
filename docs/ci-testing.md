@@ -51,6 +51,11 @@ cached receipts into the current run. Quality also produces native per-test `pyt
 and HTML/XML/JSON Python coverage. Set `HOSTED_TEST_LOG_DIR` to retain individual
 Rust suite logs, `hosted.junit.xml`, and its verified count table. Actions publishes each group's
 summary on its run page and retains the full directory as an artifact.
+Guest/QEMU gates perform one bounded retry after an exit-1 failure or incomplete
+exit-2 result (`CI_GUEST_RETRIES=1`, the default). Both attempts remain under the
+same artifact directory, the report labels the retry, and `retry.log` records the
+decision. Set `CI_GUEST_RETRIES=0` to disable it. Host/build checks remain
+single-shot.
 
 The core CI jobs allow up to 30--60 minutes for build and guest work. Boot,
 runtime/SMP and musl collectors use a 600-second (10-minute) observation window
