@@ -195,9 +195,19 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("syscall_test.elf").len
 /// - Full musl libc startup sequence
 /// - stdio (printf, puts)
 /// - syscalls (write, getpid, exit)
-#[cfg(feature = "musl_test")]
+#[cfg(all(
+    feature = "musl_test",
+    not(any(feature = "open_fault_probe", feature = "mitigation_probe"))
+))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() }> =
     AlignedElfData(*include_bytes!("musl_test.elf"));
+
+#[cfg(all(feature = "open_fault_probe", not(feature = "mitigation_probe")))]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!(env!("ZERO_OS_OPEN_PROBE_ELF")).len() }> =
+    AlignedElfData(*include_bytes!(env!("ZERO_OS_OPEN_PROBE_ELF")));
+
+#[cfg(all(feature = "mitigation_probe", feature = "open_fault_probe"))]
+compile_error!("mitigation_probe and open_fault_probe select different guest workloads");
 
 /// Embedded clone syscall test program with proper alignment
 ///

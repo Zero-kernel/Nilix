@@ -1,0 +1,105 @@
+KSA-004-CASE BEGIN family=open case=allocation attempt=0
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=open case=allocation attempt=0 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=allocation attempt=1
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=open case=allocation attempt=1 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=allocation attempt=2
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=open case=allocation attempt=2 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=allocation attempt=3
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=open case=allocation attempt=3 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=capability attempt=0
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=open case=capability attempt=0 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=capability attempt=1
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=open case=capability attempt=1 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=capability attempt=2
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=open case=capability attempt=2 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=capability attempt=3
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=open case=capability attempt=3 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=lsm attempt=0
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=open case=lsm attempt=0 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=lsm attempt=1
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=open case=lsm attempt=1 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=lsm attempt=2
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=open case=lsm attempt=2 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=lsm attempt=3
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=open case=lsm attempt=3 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=credential attempt=0
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=open case=credential attempt=0 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=credential attempt=1
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=open case=credential attempt=1 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=credential attempt=2
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=open case=credential attempt=2 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=credential attempt=3
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=open case=credential attempt=3 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=open case=success attempt=0
+KSA-004-TRUNCATE DONE
+KSA-004-CASE PASS family=open case=success attempt=0 errno=0 data=truncated fd=reused
+KSA-004-CASE BEGIN family=openat2 case=allocation attempt=0
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=openat2 case=allocation attempt=0 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=allocation attempt=1
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=openat2 case=allocation attempt=1 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=allocation attempt=2
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=openat2 case=allocation attempt=2 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=allocation attempt=3
+KSA-004-INJECT stage=descriptor errno=12 heap=restored
+KSA-004-CASE PASS family=openat2 case=allocation attempt=3 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=capability attempt=0
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=openat2 case=capability attempt=0 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=capability attempt=1
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=openat2 case=capability attempt=1 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=capability attempt=2
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=openat2 case=capability attempt=2 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=capability attempt=3
+KSA-004-INJECT stage=capability errno=12
+KSA-004-CASE PASS family=openat2 case=capability attempt=3 errno=12 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=lsm attempt=0
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=openat2 case=lsm attempt=0 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=lsm attempt=1
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=openat2 case=lsm attempt=1 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=lsm attempt=2
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=openat2 case=lsm attempt=2 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=lsm attempt=3
+KSA-004-INJECT stage=lsm errno=13 cap_reserved=1
+KSA-004-CASE PASS family=openat2 case=lsm attempt=3 errno=13 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=credential attempt=0
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=openat2 case=credential attempt=0 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=credential attempt=1
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=openat2 case=credential attempt=1 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=credential attempt=2
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=openat2 case=credential attempt=2 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=credential attempt=3
+KSA-004-INJECT stage=credential errno=11
+KSA-004-CASE PASS family=openat2 case=credential attempt=3 errno=11 data=preserved fd=reused
+KSA-004-CASE BEGIN family=openat2 case=success attempt=0
+KSA-004-TRUNCATE DONE
+KSA-004-CASE PASS family=openat2 case=success attempt=0 errno=0 data=truncated fd=reused
+KSA-004-PROBES PASS families=2 negative=32 success=2
+musl libc test passed!
+Process 1 terminated with exit code 0

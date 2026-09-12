@@ -12,7 +12,7 @@ use crate::fork::{cow_flag, cow_readonly_flag, PAGE_REF_COUNT};
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
     current_has_cap_rights, current_net_ns_id, current_pid, get_process, terminate_self_and_halt,
-    try_get_process, wait_should_abort, ProcessId, ProcessState,
+    try_get_process, wait_should_abort, FileDescriptor, ProcessId, ProcessState,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -2427,15 +2427,71 @@ pub type FutexCallback = fn(usize, i32, u32, u32, Option<u64>) -> Result<usize, 
 /// 由 vfs 模块注册，处理文件打开
 /// 参数: (path, flags, mode) -> FileOps box 或错误
 /// 返回的 FileOps 由 syscall 模块存入 fd_table
-pub type VfsOpenCallback =
-    fn(&str, u32, u32) -> Result<crate::process::FileDescriptor, SyscallError>;
+#[cfg(feature = "open_fault_probe")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpenFaultProbe {
+    None,
+    DescriptorAllocation,
+    CapabilityAllocation,
+    LsmDenial,
+    StaleCredentials,
+    Success,
+}
+
+pub struct PreparedVfsOpen {
+    descriptor: FileDescriptor,
+    finalize: fn(&dyn crate::process::FileOps) -> Result<(), SyscallError>,
+    #[cfg(feature = "open_fault_probe")]
+    probe: OpenFaultProbe,
+}
+
+impl PreparedVfsOpen {
+    pub fn new(
+        descriptor: FileDescriptor,
+        finalize: fn(&dyn crate::process::FileOps) -> Result<(), SyscallError>,
+    ) -> Self {
+        Self {
+            descriptor,
+            finalize,
+            #[cfg(feature = "open_fault_probe")]
+            probe: OpenFaultProbe::None,
+        }
+    }
+
+    #[cfg(feature = "open_fault_probe")]
+    pub fn with_fault_probe(mut self, probe: OpenFaultProbe) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    fn finish_after<Prepared>(
+        self,
+        preflight: impl FnOnce(&FileDescriptor) -> Result<Prepared, SyscallError>,
+    ) -> Result<(FileDescriptor, Prepared), SyscallError> {
+        let publication = preflight(&self.descriptor)?;
+        (self.finalize)(self.descriptor.as_ref())?;
+        Ok((self.descriptor, publication))
+    }
+}
+
+pub type VfsOpenCallback = fn(
+    &str,
+    u32,
+    u32,
+    &crate::process::CredentialAuthorization,
+) -> Result<PreparedVfsOpen, SyscallError>;
 
 /// VFS 打开文件回调类型（带 resolve 标志，用于 openat2）
 ///
 /// 由 vfs 模块注册，处理带 resolve 标志的文件打开
 /// 参数: (path, flags, mode, resolve_flags) -> FileOps box 或错误
-pub type VfsOpenWithResolveCallback =
-    fn(&str, u32, u32, u64) -> Result<crate::process::FileDescriptor, SyscallError>;
+pub type VfsOpenWithResolveCallback = fn(
+    &str,
+    u32,
+    u32,
+    u64,
+    &crate::process::CredentialAuthorization,
+) -> Result<PreparedVfsOpen, SyscallError>;
 
 /// VFS 获取文件状态回调类型
 ///
@@ -11188,6 +11244,16 @@ struct FdPublicationReservation {
 }
 
 impl FdPublicationReservation {
+    fn commit_with_guard(
+        mut self,
+        process: &mut crate::process::Process,
+        descriptor: FileDescriptor,
+    ) -> i32 {
+        process.commit_reserved_fd(self.fd, descriptor);
+        self.active = false;
+        self.fd
+    }
+
     fn try_new(process: crate::process::ProcessArc, cloexec: bool) -> Result<Self, SyscallError> {
         let fd = process
             .lock()
@@ -11310,134 +11376,86 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
 
     // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
     // RUNG 2: VFS failure auto-rollback via Drop (fd_reservation + PreparedFileHandle)
-    let mut file_ops = open_fn(&path_str, flags as u32, mode)?;
+    let prepared = open_fn(path_str, open_flags, mode, &credential_authorization)?;
+    publish_prepared_open(
+        &process,
+        open_flags,
+        prepared,
+        fd_reservation,
+        credential_authorization,
+        cred_gen_before,
+    )
+}
 
-    // RF186-1: classify before taking the Process lock. `FileHandle::stat()`
-    // performs an LSM current-subject lookup, which re-enters the current PCB;
-    // invoking it under `process.lock()` is a deterministic self-deadlock.
-    const S_IFREG: u32 = 0o100000;
-    let stat = match file_ops.stat() {
-        Ok(stat) => stat,
-        Err(_) => {
-            drop(file_ops);
-            return Err(SyscallError::EIO);
-        }
+fn publish_prepared_open(
+    process: &crate::process::ProcessArc,
+    open_flags: u32,
+    prepared: PreparedVfsOpen,
+    fd_reservation: FdPublicationReservation,
+    authorization: crate::process::CredentialAuthorization,
+    credential_generation: u64,
+) -> SyscallResult {
+    #[cfg(feature = "open_fault_probe")]
+    let probe = prepared.probe;
+    #[cfg(feature = "open_fault_probe")]
+    let credential_generation = if probe == OpenFaultProbe::StaleCredentials {
+        credential_generation.wrapping_add(1)
+    } else {
+        credential_generation
     };
-    let is_regular = (stat.mode & S_IFMT) == S_IFREG;
-
-    // U.S2-SLICE-3B / R186-1 FIX: single-guard two-phase publication transaction.
-    //
-    // PHASE 1 — every fallible step, nothing published: credential re-check, LSM
-    // mediation, and capability-slot RESERVATION. Each failure unwinds through
-    // RAII (`PreparedCapAllocation::drop` returns the slot, the FD reservation's
-    // Drop returns the descriptor number and its files.max credit) leaving no
-    // capability and no descriptor visible.
-    //
-    // PHASE 2 — every irreversible step, under the SAME guard, all infallible:
-    // bind the reserved CapId into the handle, install the descriptor into the
-    // reserved slot, publish the capability entry. Both publications are
-    // allocation-free, so there is no window in which one is observable without
-    // the other, and no failure can strand a cap that no handle references.
-    //
-    // This closes BOTH halves of R186-1: the deterministic self-deadlock (the
-    // guard is never re-acquired — `install_with_guard` borrows it) and the
-    // capability-accounting leak the previous `drop(proc)` shape left behind.
-    let (fd, published_cap) = {
-        let mut proc = process.lock();
-
-        // RUNG 3a / RF186-7: check under a read guard and KEEP that guard
-        // through LSM mediation plus FD/cap publication. A CLONE_THREAD sibling
-        // therefore cannot mutate credentials after the check but before the
-        // authorization result becomes visible.
-        if !proc.credentials_match_authorization(&credential_authorization)
-            || proc.cred_generation() != cred_gen_before
+    let cap_authority = process.lock().capability_table_authority();
+    let (descriptor, prepared_cap) = prepared.finish_after(|descriptor| {
+        let stat = descriptor.stat().map_err(|_| SyscallError::EIO)?;
+        let proc = process.lock();
+        if !proc.credentials_match_authorization(&authorization)
+            || proc.cred_generation() != credential_generation
         {
-            drop(proc);
-            drop(file_ops); // FileHandle Drop outside lock (R170-6)
-            return Err(SyscallError::EAGAIN); // Benign retry signal
+            #[cfg(feature = "open_fault_probe")]
+            if probe == OpenFaultProbe::StaleCredentials {
+                assert!(proc.credentials_match_authorization(&authorization));
+                klog::klog_always!("KSA-004-INJECT stage=credential errno=11");
+            }
+            return Err(SyscallError::EAGAIN);
         }
-
-        // Owned handle to the capability table. Taking it by Arc clone ends the
-        // immutable borrow of `proc` immediately, so the reservation below can
-        // coexist with the `&mut proc` that FD publication needs.
-        let cap_authority = proc.capability_table_authority();
-
-        // RUNG 3b: Cap reservation for regular files only.
-        let prepared_cap = if is_regular {
-            // Derive cap rights from open flags
+        if stat.mode & S_IFMT == 0o100000 {
             let mut rights = cap::CapRights::empty();
-            let acc_mode = open_flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-            if acc_mode == 0 || acc_mode == 2 {
+            let access_mode = open_flags & 0x3;
+            if access_mode == 0 || access_mode == 2 {
                 rights |= cap::CapRights::READ;
             }
-            if acc_mode == 1 || acc_mode == 2 {
+            if access_mode == 1 || access_mode == 2 {
                 rights |= cap::CapRights::WRITE;
             }
-
-            // Derive cap flags from open flags
-            let mut cap_flags = cap::CapFlags::empty();
-            if open_flags & 0x80000 != 0 {
-                // O_CLOEXEC
-                cap_flags |= cap::CapFlags::CLOEXEC;
-            }
-
-            let cap_entry = cap::CapEntry::with_flags(
+            let entry = cap::CapEntry::with_flags(
                 cap::CapObject::RegularFile(cap::RegularFile {
                     inode_id: stat.ino,
                     fs_id: stat.dev,
                 }),
                 rights,
-                cap_flags,
+                cap::CapFlags::empty(),
             );
-
-            match prepare_cap_allocation_authorized(
-                &proc,
-                &cap_authority,
-                credential_authorization.derive(),
-            ) {
-                Ok(reservation) => Some((reservation, cap_entry)),
-                Err(err) => {
-                    drop(proc);
-                    drop(file_ops); // FileHandle Drop outside lock (R170-6)
-                    return Err(err);
-                }
+            #[cfg(feature = "open_fault_probe")]
+            if probe == OpenFaultProbe::CapabilityAllocation {
+                klog::klog_always!("KSA-004-INJECT stage=capability errno=12");
+                return Err(SyscallError::ENOMEM);
             }
+            let reservation =
+                prepare_cap_allocation_authorized(&proc, &cap_authority, authorization.derive())?;
+            descriptor.set_cap_id(reservation.cap_id());
+            Ok(Some((reservation, entry)))
         } else {
-            None
-        };
-
-        // RUNG 4: bind the reserved CapId to the FileHandle via FileOps::set_cap_id()
-        // BEFORE publication. The id is already owned by the reservation, so this
-        // cannot fail and cannot be observed until Phase 2 publishes the entry.
-        if let Some((reservation, _)) = prepared_cap.as_ref() {
-            file_ops.set_cap_id(reservation.cap_id());
+            Ok(None)
         }
-
-        // ---- PHASE 2: publication. No fallible operation may appear below. ----
-        match fd_reservation.install_with_guard(&mut proc, file_ops) {
-            Ok(fd) => {
-                // Publish the capability into its reserved identity (infallible).
-                let published = prepared_cap.map(|(reservation, entry)| reservation.install(entry));
-                (fd, published)
-            }
-            Err(rejected) => {
-                // Defense-in-depth: UNREACHABLE by the reservation contract
-                // (`install_reserved_fd` panics on ledger corruption rather than
-                // returning). Handled anyway so the capability reservation is
-                // released by Drop instead of leaking an unreferenced slot.
-                drop(prepared_cap);
-                drop(proc);
-                drop(rejected); // FileHandle Drop outside lock (R170-6)
-                return Err(SyscallError::EMFILE);
-            }
-        }
+    })?;
+    let (fd, grant) = {
+        let mut proc = process.lock();
+        let fd = fd_reservation.commit_with_guard(&mut proc, descriptor);
+        let grant = prepared_cap.map(|(reservation, entry)| reservation.install(entry));
+        (fd, grant)
     };
-
-    // Audit the capability grant after the Process guard is released.
-    if let Some(grant) = published_cap {
+    if let Some(grant) = grant {
         grant.audit();
     }
-
     Ok(fd as usize)
 }
 
@@ -17536,127 +17554,21 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     let fd_reservation =
         FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
 
-    // Call VFS with resolve flags — VFS enforces LSM hooks
-    let mut file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
-
-    // Classification is security-sensitive. A metadata error cannot select the
-    // capability-free branch for a regular handle.
-    const S_IFREG: u32 = 0o100000; // Regular file type
-    let stat = match file_ops.stat() {
-        Ok(stat) => stat,
-        Err(_) => {
-            drop(file_ops);
-            return Err(SyscallError::EIO);
-        }
-    };
-    if (stat.mode & S_IFMT) == S_IFREG {
-        // Allocate capability for regular file
-        let cap_entry = cap::CapEntry::with_flags(
-            cap::CapObject::RegularFile(cap::RegularFile {
-                inode_id: stat.ino,
-                fs_id: stat.dev,
-            }),
-            {
-                let mut rights = cap::CapRights::empty();
-                let acc_mode = open_flags & 0x3;
-                if acc_mode == 0 || acc_mode == 2 {
-                    rights |= cap::CapRights::READ;
-                }
-                if acc_mode == 1 || acc_mode == 2 {
-                    rights |= cap::CapRights::WRITE;
-                }
-                rights
-            },
-            {
-                let mut cap_flags = cap::CapFlags::empty();
-                if open_flags & 0x80000 != 0 {
-                    cap_flags |= cap::CapFlags::CLOEXEC;
-                }
-                cap_flags
-            },
-        );
-
-        // R184-2 FIX: Hold Process lock across both cap allocation AND set_cap_id
-        // to maintain the allocate_file_cap safety contract (line 2895): "The caller
-        // MUST immediately call `file_handle.set_cap_id(cap_id)` after this returns Ok".
-        //
-        // SAFETY PROOF: The original code released the lock between allocation and
-        // attachment, creating a window where:
-        // 1. Cap is allocated (refcount=1) but not yet attached to the FileHandle
-        // 2. A concurrent CLONE_THREAD could observe the cap without its fd installed
-        // 3. If fd_reservation.install() subsequently fails, the orphaned cap would
-        //    never be decremented (no handle knows about it)
-        //
-        // R186-16: LSM mediates the allocation and the grant is audited.
-        //
-        // R186-1 FIX: the same single-guard two-phase transaction as
-        // `sys_open_internal`. Reserving the capability slot (fallible) strictly
-        // before publishing both the descriptor and the capability entry
-        // (infallible) removes the leak window this comment used to describe as
-        // merely theoretical: a failing `install` no longer strands an allocated,
-        // unreferenced capability.
-        let mut proc_guard = process.lock();
-        if !proc_guard.credentials_match_authorization(&credential_authorization)
-            || proc_guard.cred_generation() != cred_gen_before
-        {
-            drop(proc_guard);
-            drop(file_ops);
-            return Err(SyscallError::EAGAIN);
-        }
-        let cap_authority = proc_guard.capability_table_authority();
-
-        let reservation = match prepare_cap_allocation_authorized(
-            &proc_guard,
-            &cap_authority,
-            credential_authorization.derive(),
-        ) {
-            Ok(reservation) => reservation,
-            Err(err) => {
-                drop(proc_guard);
-                drop(file_ops); // FileHandle Drop outside lock
-                return Err(err);
-            }
-        };
-
-        file_ops.set_cap_id(reservation.cap_id()); // R184-2 FIX: BEFORE publication
-
-        // ---- publication: infallible from here ----
-        let fd = match fd_reservation.install_with_guard(&mut proc_guard, file_ops) {
-            Ok(fd) => fd,
-            Err(rejected) => {
-                drop(reservation);
-                drop(proc_guard);
-                drop(rejected); // FileHandle Drop outside lock
-                return Err(SyscallError::EMFILE);
-            }
-        };
-        let grant = reservation.install(cap_entry);
-        drop(proc_guard);
-
-        grant.audit();
-        return Ok(fd as usize);
-    }
-
-    // Non-regular files carry no capability, but still publish only if the VFS
-    // traversal's credential generation remains current.
-    let mut proc_guard = process.lock();
-    if !proc_guard.credentials_match_authorization(&credential_authorization)
-        || proc_guard.cred_generation() != cred_gen_before
-    {
-        drop(proc_guard);
-        drop(file_ops);
-        return Err(SyscallError::EAGAIN);
-    }
-    let fd = match fd_reservation.install_with_guard(&mut proc_guard, file_ops) {
-        Ok(fd) => fd,
-        Err(rejected) => {
-            drop(proc_guard);
-            drop(rejected);
-            return Err(SyscallError::EMFILE);
-        }
-    };
-
-    Ok(fd as usize)
+    let prepared = open_fn(
+        &resolved_path,
+        open_flags,
+        mode,
+        resolve,
+        &credential_authorization,
+    )?;
+    publish_prepared_open(
+        &process,
+        open_flags,
+        prepared,
+        fd_reservation,
+        credential_authorization,
+        cred_gen_before,
+    )
 }
 
 // ============================================================================
@@ -19115,6 +19027,154 @@ fn sys_accept_common(
     }
 
     Ok(new_fd as usize)
+}
+
+#[cfg(test)]
+mod fd_open_transaction_tests {
+    use super::*;
+    use crate::process::{ConsoleFile, FileOps, Process};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OpenProbe {
+        length: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        deny: bool,
+    }
+
+    impl FileOps for OpenProbe {
+        fn clone_box(&self) -> Result<FileDescriptor, ()> {
+            Err(())
+        }
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+        fn type_name(&self) -> &'static str {
+            "OpenProbe"
+        }
+    }
+
+    fn finish_probe(descriptor: &dyn FileOps) -> Result<(), SyscallError> {
+        let probe = descriptor.as_any().downcast_ref::<OpenProbe>().unwrap();
+        probe
+            .calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .expect("bounded finalization probe counter");
+        if probe.deny {
+            return Err(SyscallError::EACCES);
+        }
+        probe.length.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn prepare_probe(deny: bool) -> (PreparedVfsOpen, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        mm::publish_heap_budgets();
+        let length = Arc::new(AtomicUsize::new(17));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let descriptor = FileDescriptor::try_new(
+            OpenProbe {
+                length: length.clone(),
+                calls: calls.clone(),
+                deny,
+            },
+            mm::HeapClass::CoreProcess,
+        )
+        .unwrap();
+        (
+            PreparedVfsOpen::new(descriptor, finish_probe),
+            length,
+            calls,
+        )
+    }
+
+    #[test]
+    fn ksa013_nofile_rejection_precedes_truncate_finalization() {
+        let (prepared, length, calls) = prepare_probe(false);
+        let mut process = Process::new(0x004013, 1, String::from("nofile-open-test"), 120);
+        process.rlimits[crate::process::RLIMIT_NOFILE].rlim_cur = 0;
+        let result = prepared.finish_after(|_| process.reserve_fd().ok_or(SyscallError::EMFILE));
+        assert!(matches!(result, Err(SyscallError::EMFILE)));
+        assert_eq!(length.load(Ordering::SeqCst), 17);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(process.total_fd_charge_count(), 0);
+    }
+
+    #[test]
+    fn ksa004_publication_preflight_errors_never_truncate() {
+        for error in [
+            SyscallError::ENOMEM,
+            SyscallError::EMFILE,
+            SyscallError::EPERM,
+            SyscallError::EAGAIN,
+            SyscallError::EIO,
+        ] {
+            let (prepared, length, calls) = prepare_probe(false);
+            assert!(
+                matches!(prepared.finish_after(|_| Err::<(), _>(error)), Err(observed) if observed == error)
+            );
+            assert_eq!(length.load(Ordering::SeqCst), 17);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&length), 1);
+        }
+    }
+
+    #[test]
+    fn ksa004_finalization_failure_returns_preflight_ownership() {
+        let (prepared, length, calls) = prepare_probe(true);
+        let resource = Arc::new(());
+        let result = prepared.finish_after(|_| Ok(resource.clone()));
+        assert!(matches!(result, Err(SyscallError::EACCES)));
+        assert_eq!(Arc::strong_count(&resource), 1);
+        assert_eq!(length.load(Ordering::SeqCst), 17);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ksa004_success_truncates_once_after_preflight() {
+        let (prepared, length, calls) = prepare_probe(false);
+        let (descriptor, publication) = prepared
+            .finish_after(|_| {
+                assert_eq!(length.load(Ordering::SeqCst), 17);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                Ok(42)
+            })
+            .unwrap();
+        assert_eq!(publication, 42);
+        assert_eq!(length.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(descriptor);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ksa005_poll_follows_objects_not_standard_fd_numbers() {
+        mm::publish_heap_budgets();
+        let mut process = Process::new(0x004006, 1, String::from("poll-fd-test"), 120);
+        for fd in 0..3 {
+            assert!(matches!(poll_classify(&process, fd), FdKind::Nval));
+        }
+        let console =
+            FileDescriptor::try_new(ConsoleFile { readable: true }, mm::HeapClass::CoreProcess)
+                .unwrap();
+        assert!(process.replace_fd_charged(9, console).unwrap().is_none());
+        assert!(matches!(poll_classify(&process, 9), FdKind::Stdin));
+        let output =
+            FileDescriptor::try_new(ConsoleFile { readable: false }, mm::HeapClass::CoreProcess)
+                .unwrap();
+        assert!(process.replace_fd_charged(0, output).unwrap().is_none());
+        assert!(matches!(poll_classify(&process, 0), FdKind::ConsoleOut));
+        let (ordinary, _, _) = prepare_probe(false);
+        drop(process.replace_fd_charged(0, ordinary.descriptor).unwrap());
+        assert!(matches!(poll_classify(&process, 0), FdKind::AlwaysReady));
+        drop(process.remove_fd(0).unwrap());
+        drop(process.remove_fd(9).unwrap());
+        assert!(matches!(poll_classify(&process, 0), FdKind::Nval));
+        assert_eq!(process.total_fd_charge_count(), 0);
+    }
 }
 
 #[cfg(test)]
