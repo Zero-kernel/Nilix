@@ -18249,7 +18249,11 @@ fn sys_gettimeofday(tv: *mut TimeVal, _tz: usize) -> SyscallResult {
 
 /// sys_uname - 获取系统信息
 fn sys_uname(buf: *mut UtsName) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    coverage::trace_pc(1300); // uname entry (including invalid output pointers)
     if buf.is_null() {
+        #[cfg(feature = "kcov")]
+        coverage::trace_pc(1301); // null destination rejection
         return Err(SyscallError::EFAULT);
     }
 
@@ -18278,6 +18282,9 @@ fn sys_uname(buf: *mut UtsName) -> SyscallResult {
     };
     crate::usercopy::copy_to_user_safe(buf as *mut u8, uts_bytes)
         .map_err(|_| SyscallError::EFAULT)?;
+
+    #[cfg(feature = "kcov")]
+    coverage::trace_pc(1302); // complete UTS copyout
 
     Ok(0)
 }
