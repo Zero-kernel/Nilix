@@ -34,6 +34,9 @@ use spin::{Mutex, RwLock};
 /// Ext2 magic number
 pub const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 
+/// Only the Linux creator layout defines the UID/GID high halves we write.
+const EXT2_OS_LINUX: u32 = 0;
+
 /// Superblock offset from partition start
 pub const SUPERBLOCK_OFFSET: u64 = 1024;
 
@@ -525,7 +528,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             ..Ext2GroupDesc::default()
         });
         let fs = Arc::try_new(Ext2Fs {
-            fs_id: u64::MAX - 179,
+            fs_id: crate::identity::allocate_fs_id().expect("self-test filesystem ID"),
             dev,
             superblock: RwLock::new(superblock),
             group_descs: RwLock::new(group_descs),
@@ -688,7 +691,9 @@ pub fn run_ext2_mutation_scratch_self_test() {
         assert!(matches!(
             inode.clone().open(
                 OpenFlags::new(OpenFlags::O_RDONLY),
-                PreparedFileHandle::try_new().expect("poisoned-open descriptor preparation"),
+                PreparedFileHandle::try_new()
+                    .expect("poisoned-open descriptor preparation")
+                    .bind_filesystem(fs.clone()),
             ),
             Err(FsError::Io)
         ));
@@ -3044,6 +3049,7 @@ pub fn run_ext2_journal_transaction_self_test() {
 mod hosted_journal_tests {
     #[test]
     fn r180_6_ordered_data_crash_boundaries() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
         // Hosted filtering may run this test in isolation, before any sibling
         // publishes the kernel's whole-heap admission budgets.  Keep the crash
         // oracle independent of test order so allocation failure cannot mask a
@@ -3195,9 +3201,6 @@ const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 const EXT2_UNSUPPORTED_WRITE_LAYOUT_FL: u32 =
     EXT2_COMPR_FL | EXT3_JOURNAL_DATA_FL | EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL;
-
-/// Global filesystem ID counter
-static NEXT_FS_ID: AtomicU64 = AtomicU64::new(100);
 
 // ============================================================================
 // Safe On-Disk Data Access Helpers
@@ -3404,6 +3407,30 @@ pub struct Ext2InodeRaw {
     pub size_high_or_dir_acl: u32,
     pub faddr: u32,
     pub osd2: [u8; 12],
+}
+
+impl Ext2InodeRaw {
+    /// Non-Linux legacy images have only their common low 16-bit ownership
+    /// decoded. Their OS-specific tail is never reinterpreted as Linux metadata.
+    fn owner_ids(&self, creator_os: u32) -> (u32, u32) {
+        let (mut uid, mut gid) = (u32::from(self.uid), u32::from(self.gid));
+        if creator_os == EXT2_OS_LINUX {
+            uid |= u32::from(u16::from_le_bytes([self.osd2[4], self.osd2[5]])) << 16;
+            gid |= u32::from(u16::from_le_bytes([self.osd2[6], self.osd2[7]])) << 16;
+        }
+        (uid, gid)
+    }
+
+    fn set_owner_ids(&mut self, creator_os: u32, uid: u32, gid: u32) -> Result<(), FsError> {
+        if creator_os != EXT2_OS_LINUX {
+            return Err(FsError::NotSupported);
+        }
+        self.uid = uid as u16;
+        self.gid = gid as u16;
+        self.osd2[4..6].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+        self.osd2[6..8].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+        Ok(())
+    }
 }
 
 /// Directory entry header (on-disk format)
@@ -4304,7 +4331,7 @@ pub fn run_ext2_inode_cache_self_test() {
     // performs disk I/O or consults this placeholder superblock.
     let superblock: Ext2Superblock = unsafe { core::mem::zeroed() };
     let fs = Arc::try_new(Ext2Fs {
-        fs_id: u64::MAX - 178,
+        fs_id: crate::identity::allocate_fs_id().expect("self-test filesystem ID"),
         dev,
         superblock: RwLock::new(superblock),
         group_descs: RwLock::new(Vec::new()),
@@ -4341,13 +4368,17 @@ pub fn run_ext2_inode_cache_self_test() {
         .clone()
         .open(
             OpenFlags::new(OpenFlags::O_RDONLY),
-            PreparedFileHandle::try_new().expect("first ext2 open preparation"),
+            PreparedFileHandle::try_new()
+                .expect("first ext2 open preparation")
+                .bind_filesystem(fs.clone()),
         )
         .expect("first canonical production open");
     let second_open = same
         .open(
             OpenFlags::new(OpenFlags::O_RDONLY),
-            PreparedFileHandle::try_new().expect("second ext2 open preparation"),
+            PreparedFileHandle::try_new()
+                .expect("second ext2 open preparation")
+                .bind_filesystem(fs.clone()),
         )
         .expect("second canonical production open");
     let first_handle = first_open
@@ -4369,7 +4400,9 @@ pub fn run_ext2_inode_cache_self_test() {
     assert!(matches!(
         rogue.open(
             OpenFlags::new(OpenFlags::O_RDONLY),
-            PreparedFileHandle::try_new().expect("rogue ext2 open preparation"),
+            PreparedFileHandle::try_new()
+                .expect("rogue ext2 open preparation")
+                .bind_filesystem(fs.clone()),
         ),
         Err(FsError::Invalid)
     ));
@@ -4400,6 +4433,15 @@ pub fn run_ext2_create_self_test() {
     }
 
     fn build_image() -> Vec<u8> {
+        build_owned_image(EXT2_OS_LINUX, 0, 0, false)
+    }
+
+    fn build_owned_image(
+        creator_os: u32,
+        parent_uid: u32,
+        parent_gid: u32,
+        setgid: bool,
+    ) -> Vec<u8> {
         let mut image = Vec::new();
         image
             .try_reserve_exact(BLOCKS * BLOCK_SIZE)
@@ -4418,6 +4460,7 @@ pub fn run_ext2_create_self_test() {
         sb.magic = EXT2_SUPER_MAGIC;
         sb.state = 1;
         sb.rev_level = 1;
+        sb.creator_os = creator_os;
         sb.first_ino = 11;
         sb.inode_size = size_of::<Ext2InodeRaw>() as u16;
         sb.feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
@@ -4452,7 +4495,11 @@ pub fn run_ext2_create_self_test() {
 
         // Root inode (ino 2) at inode-table block 5, index 1.
         let mut root = Ext2InodeRaw::default();
-        root.mode = EXT2_S_IFDIR | 0o755;
+        root.mode = EXT2_S_IFDIR | 0o755 | if setgid { 0o2000 } else { 0 };
+        // For non-Linux read fixtures these bytes are an opaque OS tail whose
+        // Linux-looking high halves must not affect the common low-ID view.
+        root.set_owner_ids(EXT2_OS_LINUX, parent_uid, parent_gid)
+            .unwrap();
         root.size_lo = BLOCK_SIZE as u32;
         root.links_count = 2;
         root.blocks_lo = 2;
@@ -4519,16 +4566,21 @@ pub fn run_ext2_create_self_test() {
         operation: AtomicU64,
         fail_at: AtomicU64,
         failed: AtomicBool,
+        read_only: bool,
     }
 
     impl CreateCrashDevice {
         fn new(image: Vec<u8>, fail_at: u64) -> Self {
+            Self::with_read_only(image, fail_at, false)
+        }
+        fn with_read_only(image: Vec<u8>, fail_at: u64, read_only: bool) -> Self {
             Self {
                 live: Mutex::new(image.clone()),
                 durable: Mutex::new(image),
                 operation: AtomicU64::new(0),
                 fail_at: AtomicU64::new(fail_at),
                 failed: AtomicBool::new(false),
+                read_only,
             }
         }
         fn durable_image(&self) -> Vec<u8> {
@@ -4562,7 +4614,7 @@ pub fn run_ext2_create_self_test() {
             (self.live.lock().len() / 512) as u64
         }
         fn is_read_only(&self) -> bool {
-            false
+            self.read_only
         }
         fn submit_bio(&self, _bio: block::Bio) -> Result<(), block::BlockError> {
             Err(block::BlockError::NotSupported)
@@ -4584,6 +4636,9 @@ pub fn run_ext2_create_self_test() {
             Ok(buf.len())
         }
         fn write_sync(&self, sector: u64, buf: &[u8]) -> Result<usize, block::BlockError> {
+            if self.read_only {
+                return Err(block::BlockError::ReadOnly);
+            }
             let start = usize::try_from(sector)
                 .ok()
                 .and_then(|s| s.checked_mul(512))
@@ -4600,6 +4655,9 @@ pub fn run_ext2_create_self_test() {
             Ok(buf.len())
         }
         fn flush(&self) -> Result<(), block::BlockError> {
+            if self.read_only {
+                return Err(block::BlockError::ReadOnly);
+            }
             let _op = self.begin()?;
             let mut live = self.live.lock();
             let mut durable = self.durable.lock();
@@ -4650,9 +4708,45 @@ pub fn run_ext2_create_self_test() {
         let dev: Arc<dyn BlockDevice> = device.clone();
         let fs = Ext2Fs::mount(dev).expect("mount happy-path image");
         let root = fs.root_inode();
-        let new_inode = fs
-            .create(&root, "newfile", FileMode::regular(0o600))
-            .expect("create happy path");
+        // KSA-007: exercise owner routing with a RAMFS root and an Ext2 mount.
+        // Independent per-type ID sequences used to route this parent into RAMFS.
+        let vfs = crate::manager::Vfs::new();
+        let ram = crate::ramfs::RamFs::try_new().expect("mixed filesystem root");
+        assert_ne!(ram.fs_id(), fs.fs_id());
+        ram.create(
+            &ram.root_inode(),
+            "mnt",
+            FileMode::directory(0o755),
+            &crate::topology::write().setup(0, 0),
+        )
+        .expect("mount point");
+        vfs.mount_in_namespace(&kernel_core::ROOT_MNT_NAMESPACE, "/", ram.clone())
+            .unwrap();
+        vfs.mount_in_namespace(&kernel_core::ROOT_MNT_NAMESPACE, "/mnt", fs.clone())
+            .unwrap();
+        let opened = vfs
+            .open_trusted(
+                "/mnt/newfile",
+                OpenFlags::new(
+                    OpenFlags::O_WRONLY
+                        | OpenFlags::O_CREAT
+                        | OpenFlags::O_EXCL
+                        | OpenFlags::O_NOFOLLOW,
+                ),
+                0o600,
+            )
+            .expect("create through mixed-filesystem VFS");
+        let new_inode = opened
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .unwrap()
+            .inode
+            .clone();
+        assert_eq!(new_inode.fs_id(), fs.fs_id());
+        assert!(matches!(
+            ram.lookup(&ram.root_inode(), "newfile"),
+            Err(FsError::NotFound)
+        ));
         assert!(Arc::ptr_eq(
             &new_inode,
             &fs.lookup(&root, "newfile").expect("lookup")
@@ -4673,8 +4767,13 @@ pub fn run_ext2_create_self_test() {
         let fs = Ext2Fs::mount(dev).expect("mount crash-before-commit image");
         let root = fs.root_inode();
         assert!(
-            fs.create(&root, "newfile", FileMode::regular(0o600))
-                .is_err(),
+            fs.create(
+                &root,
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err(),
             "create must fail when the commit write crashes"
         );
         drop(root);
@@ -4701,8 +4800,13 @@ pub fn run_ext2_create_self_test() {
         let fs = Ext2Fs::mount(dev).expect("mount crash-after-commit image");
         let root = fs.root_inode();
         assert!(
-            fs.create(&root, "newfile", FileMode::regular(0o600))
-                .is_err(),
+            fs.create(
+                &root,
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err(),
             "create must fail when the checkpoint write crashes (committed + poison)"
         );
         drop(root);
@@ -4883,7 +4987,12 @@ pub fn run_ext2_create_self_test() {
         let sub = fs.lookup(&root, "sub").expect("lookup sub");
         assert!(sub.is_dir(), "sub is a directory");
         let new_inode = fs
-            .create(&sub, "newfile", FileMode::regular(0o600))
+            .create(
+                &sub,
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
             .expect("coalesced create");
         assert_eq!(new_inode.ino(), NEW_INO as u64, "new inode is 11");
         // New inode (11) and parent (12) both resolve to block 6 → coalesced.
@@ -4924,8 +5033,13 @@ pub fn run_ext2_create_self_test() {
         let root = fs.root_inode();
         let sub = fs.lookup(&root, "sub").expect("lookup sub");
         assert!(
-            fs.create(&sub, "newfile", FileMode::regular(0o600))
-                .is_err(),
+            fs.create(
+                &sub,
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err(),
             "coalesced create must fail when the checkpoint write crashes"
         );
         drop(sub);
@@ -5130,6 +5244,7 @@ pub fn run_ext2_create_self_test() {
             true,
             NEW_INO as u64,
             None,
+            &crate::topology::write().setup(0, 0),
         )
         .expect("rename happy path");
         let new = fs
@@ -5150,7 +5265,8 @@ pub fn run_ext2_create_self_test() {
                 "newfile",
                 true,
                 NEW_INO as u64,
-                None
+                None,
+                &crate::topology::write().setup(0, 0),
             )
             .is_err());
         klog_always!("    Ext2Fs::rename happy path passed");
@@ -5175,7 +5291,8 @@ pub fn run_ext2_create_self_test() {
                 "newfile",
                 true,
                 NEW_INO as u64,
-                None
+                None,
+                &crate::topology::write().setup(0, 0),
             )
             .is_err(),
             "rename must fail when the checkpoint write crashes"
@@ -5189,6 +5306,114 @@ pub fn run_ext2_create_self_test() {
         assert_rename_state(&fs2, true);
         klog_always!("    Ext2Fs::rename crash-after-commit replay passed");
     }
+
+    // KSA-014: real create, descriptor stat, remount and committed-journal replay
+    // must preserve all 32 owner bits, including parent-setgid inheritance.
+    const CREATOR_UID: u32 = 0x0001_fffe;
+    const CREATOR_GID: u32 = 0xffff_0001;
+    const PARENT_UID: u32 = 0x1234_5678;
+    const PARENT_GID: u32 = 0x8765_4321;
+    for inherit_group in [false, true] {
+        for fail_at in [0, 15] {
+            let expected_gid = if inherit_group {
+                PARENT_GID
+            } else {
+                CREATOR_GID
+            };
+            let device = Arc::try_new(CreateCrashDevice::new(
+                build_owned_image(EXT2_OS_LINUX, PARENT_UID, PARENT_GID, inherit_group),
+                fail_at,
+            ))
+            .expect("owner-ID fixture device");
+            let fs = Ext2Fs::mount(device.clone()).expect("mount owner-ID fixture");
+            let parent = fs.root_inode();
+            let parent_stat = parent.stat().expect("parent owner IDs");
+            assert_eq!((parent_stat.uid, parent_stat.gid), (PARENT_UID, PARENT_GID));
+            let created = fs.create(
+                &parent,
+                "owned",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(CREATOR_UID, CREATOR_GID),
+            );
+            if fail_at == 0 {
+                let stat = created
+                    .as_ref()
+                    .expect("create with full host IDs")
+                    .stat()
+                    .unwrap();
+                assert_eq!((stat.uid, stat.gid), (CREATOR_UID, expected_gid));
+                assert_eq!(stat.mode.perm, 0o600);
+            } else {
+                assert!(created.is_err(), "checkpoint fault must be reported");
+            }
+            drop(created);
+            drop(parent);
+            drop(fs);
+            let recovered_device = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+                .expect("owner-ID remount device");
+            let recovered = Ext2Fs::mount(recovered_device).expect("remount/replay full owner IDs");
+            let inode = recovered
+                .lookup(&recovered.root_inode(), "owned")
+                .expect("recovered owned file");
+            let stat = inode.stat().expect("recovered inode stat");
+            assert_eq!((stat.uid, stat.gid), (CREATOR_UID, expected_gid));
+            let descriptor = inode
+                .open(
+                    OpenFlags::new(OpenFlags::O_RDONLY),
+                    PreparedFileHandle::try_new()
+                        .unwrap()
+                        .bind_filesystem(recovered.clone()),
+                )
+                .unwrap();
+            let stat = descriptor.stat().expect("descriptor stat retains host IDs");
+            assert_eq!((stat.uid, stat.gid), (CREATOR_UID, expected_gid));
+            let raw = recovered
+                .read_inode_raw(NEW_INO)
+                .expect("owner-ID disk encoding");
+            assert_eq!(
+                (raw.uid, raw.gid),
+                (CREATOR_UID as u16, expected_gid as u16)
+            );
+            assert_eq!(&raw.osd2[4..6], &((CREATOR_UID >> 16) as u16).to_le_bytes());
+            assert_eq!(
+                &raw.osd2[6..8],
+                &((expected_gid >> 16) as u16).to_le_bytes()
+            );
+        }
+    }
+    klog_always!("    KSA-014 Ext2 full owner IDs/setgid/remount/replay passed");
+
+    // No non-Linux OS tail may be written or upgraded as a Linux inode layout.
+    // Read-only legacy inspection deliberately exposes only the common low IDs.
+    for creator_os in [1, 2, 3, 4, u32::MAX] {
+        let image = build_owned_image(creator_os, PARENT_UID, PARENT_GID, false);
+        let device = Arc::try_new(CreateCrashDevice::new(image.clone(), 0)).unwrap();
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        assert!(matches!(Ext2Fs::mount(dev), Err(FsError::NotSupported)));
+        assert_eq!(device.operation.load(Ordering::Acquire), 0);
+        assert_eq!(device.durable_image(), image);
+        if creator_os <= 2 {
+            let readonly = Arc::try_new(CreateCrashDevice::with_read_only(image, 0, true)).unwrap();
+            let fs = Ext2Fs::mount(readonly.clone()).expect("read-only legacy OS inspection");
+            let parent = fs.root_inode();
+            let stat = parent.stat().unwrap();
+            assert_eq!(
+                (stat.uid, stat.gid),
+                (PARENT_UID & 0xffff, PARENT_GID & 0xffff)
+            );
+            assert!(matches!(
+                fs.create(
+                    &parent,
+                    "denied",
+                    FileMode::regular(0o600),
+                    &crate::topology::write().setup(CREATOR_UID, CREATOR_GID)
+                ),
+                Err(FsError::ReadOnly)
+            ));
+            assert_eq!(readonly.operation.load(Ordering::Acquire), 0);
+        }
+    }
+    klog_always!("    KSA-014 Ext2 unsupported OS writes rejected before mutation");
 }
 
 /// Ext2 filesystem instance
@@ -5286,9 +5511,7 @@ impl Ext2Fs {
         };
 
         // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
-        let fs_id = NEXT_FS_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| FsError::NoSpace)?;
+        let fs_id = crate::identity::allocate_fs_id()?;
 
         let fs = Arc::try_new(Self {
             fs_id,
@@ -5372,6 +5595,11 @@ impl Ext2Fs {
         // Validate magic
         if sb.magic != EXT2_SUPER_MAGIC {
             return Err(FsError::Invalid);
+        }
+        // KSA-014: reject unsupported inode OS tails before any recovery or
+        // mount-time journal write. Read-only legacy inspection uses low IDs.
+        if !dev.is_read_only() && sb.creator_os != EXT2_OS_LINUX {
+            return Err(FsError::NotSupported);
         }
         if sb.feature_incompat & !EXT2_SUPPORTED_INCOMPAT != 0 {
             return Err(FsError::NotSupported);
@@ -5626,6 +5854,7 @@ impl Ext2Fs {
             || recovered.frags_per_group != original.frags_per_group
             || recovered.inodes_per_group != original.inodes_per_group
             || recovered.rev_level != original.rev_level
+            || recovered.creator_os != original.creator_os
             || recovered.first_ino != original.first_ino
             || recovered.feature_compat != original.feature_compat
             || recovered.feature_ro_compat != original.feature_ro_compat
@@ -6529,6 +6758,9 @@ impl Ext2Fs {
         let mut scratch = JournalRecoveryScratch::try_new(self.block_size)?;
         let proposed =
             self.read_virtual_superblock(journal, overlay, post_images, &mut scratch.control)?;
+        if proposed.creator_os != self.superblock.read().creator_os {
+            return Err(FsError::NotSupported);
+        }
         if proposed.inodes_count > MAX_OWNERSHIP_INODES {
             return Err(FsError::NotSupported);
         }
@@ -11242,6 +11474,7 @@ impl FileSystem for Ext2Fs {
         parent: &Arc<dyn Inode>,
         name: &str,
         mode: FileMode,
+        context: &crate::topology::MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
         self.ensure_io_healthy()?;
         if !mode.is_file() {
@@ -11446,6 +11679,13 @@ impl FileSystem for Ext2Fs {
         let now = TimeSpec::now();
         let mut new_inode_raw = Ext2InodeRaw::default();
         new_inode_raw.mode = on_disk_mode as u16;
+        let creator_os = fs.superblock.read().creator_os;
+        let gid = if committed_parent.mode & 0o2000 != 0 {
+            committed_parent.owner_ids(creator_os).1
+        } else {
+            context.gid
+        };
+        new_inode_raw.set_owner_ids(creator_os, context.uid, gid)?;
         new_inode_raw.links_count = 1;
         new_inode_raw.atime = now.sec as u32;
         new_inode_raw.ctime = now.sec as u32;
@@ -11608,6 +11848,7 @@ impl FileSystem for Ext2Fs {
         noreplace: bool,
         expected_src_ino: u64,
         expected_dest_ino: Option<u64>,
+        _context: &crate::topology::MutationContext<'_>,
     ) -> Result<(), FsError> {
         self.ensure_io_healthy()?;
         // Name validation for both ends.
@@ -12427,14 +12668,15 @@ impl Inode for Ext2Inode {
         fs.ensure_io_healthy()?;
         let raw = *self.raw.read();
         let size = self.size.load(Ordering::Acquire);
+        let (uid, gid) = raw.owner_ids(fs.superblock.read().creator_os);
 
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino as u64,
             mode: FileMode::new(self.file_type(), raw.mode & 0o7777),
             nlink: raw.links_count as u32,
-            uid: raw.uid as u32,
-            gid: raw.gid as u32,
+            uid,
+            gid,
             rdev: 0,
             size,
             blksize: fs.block_size,
