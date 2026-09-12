@@ -3393,20 +3393,42 @@ pub fn lsm_process_ctx_from_credentials(
 /// in sys_clone). For fork-based children where fork_inner ran (cpuset joined,
 /// cgroup attached), callers must inline the LSM check and use
 /// `request_process_exit()` + scheduler enqueue instead.
-fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<(), SyscallError> {
-    let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
-    let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+fn enforce_lsm_task_fork(
+    parent_pid: ProcessId,
+    child_pid: ProcessId,
+    child_credentials: &Arc<crate::process::SharedCredentials>,
+) -> Result<(), SyscallError> {
+    enforce_lsm_task_fork_with(parent_pid, child_pid, child_credentials, |parent, child| {
+        lsm::hook_task_fork(parent, child).map_err(lsm_error_to_syscall)
+    })
+}
 
-    let (parent_ctx, child_ctx) = {
-        let parent = parent_arc.lock();
-        let child = child_arc.lock();
-        (
-            lsm_process_ctx_from(&parent)?,
-            lsm_process_ctx_from(&child)?,
-        )
-    };
+fn enforce_lsm_task_fork_with(
+    parent_pid: ProcessId,
+    child_pid: ProcessId,
+    child_credentials: &Arc<crate::process::SharedCredentials>,
+    hook: impl FnOnce(&lsm::ProcessCtx, &lsm::ProcessCtx) -> Result<(), SyscallError>,
+) -> Result<(), SyscallError> {
+    // KSA-010: the prepared Arc is the exact identity installed after scheduler
+    // reservation. Before that boundary the child's default credentials must
+    // neither authorize the clone nor be replaced while its state is Ready.
+    // Every lookup/read/hook error shares the same post-lock cleanup envelope.
+    let result = (|| {
+        let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+        let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+        let (parent_ctx, child_ctx) = {
+            let parent = parent_arc.lock();
+            let child = child_arc.lock();
+            let credentials = child_credentials.try_read().ok_or(SyscallError::EAGAIN)?;
+            (
+                lsm_process_ctx_from(&parent)?,
+                lsm_process_ctx_from_credentials(&child, &credentials),
+            )
+        };
+        hook(&parent_ctx, &child_ctx)
+    })();
 
-    if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
+    if result.is_err() {
         // Rollback: remove child from parent's children list and terminate
         if let Some(parent) = get_process(parent_pid) {
             let mut parent = parent.lock();
@@ -3416,10 +3438,80 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
         // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process to
         // avoid cgroup/cpuset/IPC detach on never-joined subsystems.
         cleanup_unscheduled_process(child_pid);
-        return Err(lsm_error_to_syscall(err));
+    }
+    result
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod clone_credential_lsm_tests {
+    use super::*;
+    use crate::process::{child_creation_test_support::Fixture, Credentials, SharedCredentials};
+
+    fn prospective() -> Arc<SharedCredentials> {
+        Arc::new(SharedCredentials::new(Credentials {
+            uid: 70001,
+            gid: 70002,
+            euid: 70001,
+            egid: 70002,
+            supplementary_groups: mm::AdmittedVec::new(mm::HeapClass::CoreProcess),
+        }))
     }
 
-    Ok(())
+    #[test]
+    fn credential_lifecycle_lsm_checks_prospective_identity() {
+        let fixture = Fixture::new();
+        let (parent_pid, child_pid) = fixture.pids();
+        let selected = prospective();
+        let called = core::cell::Cell::new(false);
+        enforce_lsm_task_fork_with(parent_pid, child_pid, &selected, |parent, child| {
+            assert_eq!((parent.pid, parent.uid), (parent_pid, 65534));
+            assert_eq!((child.pid, child.uid, child.gid), (child_pid, 70001, 70002));
+            assert_eq!(
+                fixture.child.lock().try_credentials_read().unwrap().uid,
+                65534
+            );
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(called.get());
+        assert!(get_process(child_pid).is_some());
+        assert!(fixture.parent.lock().children.contains(&child_pid));
+        assert_eq!(fixture.child.lock().state, ProcessState::Ready);
+    }
+
+    #[test]
+    fn credential_lifecycle_lsm_denial_and_contention_cleanup() {
+        for busy in 0..3 {
+            let fixture = Fixture::new();
+            let (parent_pid, child_pid) = fixture.pids();
+            let selected = prospective();
+            let parent_identity = fixture.parent.lock().shared_credentials();
+            let called = core::cell::Cell::new(false);
+            let check = || {
+                enforce_lsm_task_fork_with(parent_pid, child_pid, &selected, |_, child| {
+                    assert_eq!(child.uid, 70001);
+                    called.set(true);
+                    Err(SyscallError::EPERM)
+                })
+            };
+            let result = match busy {
+                1 => parent_identity.with_hosted_pending_writer(check),
+                2 => selected.with_hosted_pending_writer(check),
+                _ => check(),
+            };
+            assert_eq!(
+                result,
+                Err(if busy == 0 {
+                    SyscallError::EPERM
+                } else {
+                    SyscallError::EAGAIN
+                })
+            );
+            assert_eq!(called.get(), busy == 0);
+            fixture.assert_child_removed();
+        }
+    }
 }
 
 // ============================================================================
@@ -4095,6 +4187,8 @@ pub fn syscall_dispatcher(
         90 => sys_chmod(arg0 as *const u8, arg1 as u32),
         91 => sys_fchmod(arg0 as i32, arg1 as u32),
         95 => sys_umask(arg0 as u32),
+        155 => sys_pivot_root(arg0 as *const u8, arg1 as *const u8),
+        161 => sys_chroot(arg0 as *const u8),
 
         // M0-6: POSIX resource limits (closes the RLIMIT allowed-but-ENOSYS seam).
         // prlimit64 arg order: (pid, resource, NEW=arg2, OLD=arg3) — keep new=arg2/old=arg3.
@@ -4822,6 +4916,7 @@ fn sys_clone(
         parent_gs_base,
         parent_credentials_arc, // R39-3 FIX: 共享凭证 Arc
         parent_umask,
+        parent_fs_context,
         parent_rlimits,    // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
         parent_sigactions, // M0 item 5: inherit signal dispositions (per-task copy)
         parent_blocked,    // M0 item 5: inherit blocked mask
@@ -4955,6 +5050,7 @@ fn sys_clone(
             parent.gs_base,
             parent.shared_credentials(), // R39-3 FIX: 获取凭证 Arc
             parent.umask,
+            parent.fs_context.clone(),
             parent.rlimits, // M0-6: [RLimit; N] is Copy — snapshot under parent lock
             parent.sigactions, // M0 item 5: [SigAction; NSIG] is Copy
             parent.blocked, // M0 item 5: u64 mask
@@ -5343,7 +5439,7 @@ fn sys_clone(
         }
     }
 
-    let mut prepared_private_credentials = if flags & CLONE_THREAD == 0 {
+    let prepared_private_credentials = if flags & CLONE_THREAD == 0 {
         let prepared = (|| {
             let parent = parent_credentials_arc
                 .try_read()
@@ -5598,23 +5694,10 @@ fn sys_clone(
             child.clear_child_tid = child_tid as u64;
         }
 
-        // R39-3 FIX: 复制/共享凭证
-        //
-        // CLONE_THREAD: 共享父进程的凭证 Arc（符合 POSIX 线程语义）
-        // 非 CLONE_THREAD: 克隆凭证到新的 Arc（进程隔离）
-        //
-        // 这确保同一进程的线程共享 setuid/setgid 变更，
-        // 而不同进程保持凭证独立。
-        if flags & CLONE_THREAD != 0 {
-            child.install_shared_credentials_for_clone(Arc::clone(&parent_credentials_arc));
-        } else {
-            let (credentials, reservation) = prepared_private_credentials
-                .take()
-                .expect("private clone credentials must be prepared");
-            child.install_shared_credentials_for_clone(credentials);
-            drop(reservation);
-        }
+        // Credential identity stays prepared until scheduler admission below
+        // establishes Provisioning; the LSM check uses that same prepared Arc.
         child.umask = parent_umask;
+        child.fs_context = parent_fs_context;
         // M0-6: inherit rlimits on the CLONE_VM/THREAD manual-construction path
         // (the non-CLONE_VM path goes through fork_inner, which copies them too).
         // Per-task copy = the documented M0 divergence from thread-group sharing.
@@ -5846,7 +5929,15 @@ fn sys_clone(
     //
     // LSM hook: check if policy allows this fork/clone
     // Must be BEFORE user memory writes and scheduler notification
-    enforce_lsm_task_fork(parent_pid, child_pid)?;
+    // Keep the prepared (Arc, reservation) owner intact across every fallible
+    // step. Tuple fields drop in order: the allocation must be released before
+    // its temporary credit on error. A separately bound reservation would drop
+    // before the earlier Arc local. Installation consumes only this Arc clone.
+    let child_credentials = prepared_private_credentials
+        .as_ref()
+        .map(|(credentials, _reservation)| Arc::clone(credentials))
+        .unwrap_or_else(|| Arc::clone(&parent_credentials_arc));
+    enforce_lsm_task_fork(parent_pid, child_pid, &child_credentials)?;
 
     // R123-2 FIX: Propagate cgroup + cpuset membership for sys_clone tasks.
     //
@@ -5900,20 +5991,25 @@ fn sys_clone(
     // R180-19: reserve scheduler storage before user-visible TID writes and
     // before the final FD charge. The child remains Provisioning in the queue;
     // all later failures cancel the exact slot before tearing the PCB down.
-    let scheduler_permit =
-        match crate::process::prepare_scheduler_add_process(Arc::clone(&child_arc)) {
-            Ok(permit) => permit,
-            Err(_) => {
-                if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-                    let _ = cg.detach_task(child_pid as u64);
-                }
-                if let Some(parent) = get_process(parent_pid) {
-                    parent.lock().children.retain(|&p| p != child_pid);
-                }
-                cleanup_unscheduled_process(child_pid);
-                return Err(SyscallError::EAGAIN);
+    let scheduler_permit = match crate::process::prepare_clone_scheduler_add_process(
+        Arc::clone(&child_arc),
+        child_credentials,
+    ) {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
             }
-        };
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EAGAIN);
+        }
+    };
+    // The PCB's admitted fixed charge now owns the installed credential Arc;
+    // its temporary preparation reservation can be returned after installation.
+    drop(prepared_private_credentials);
 
     // E.5 Cpuset: update task count after successful cgroup attach.
     crate::process::notify_cpuset_task_joined(parent_cpuset_id);
@@ -7174,11 +7270,8 @@ fn sys_execve(
     if orig_path.len() > MAX_EXEC_PATH_LEN {
         return Err(SyscallError::EINVAL);
     }
-    // M0-4 scope note: there is no per-process cwd yet (sys_getcwd is hardcoded to
-    // "/"), so VFS `normalize_path` resolves a RELATIVE pathname from "/" — i.e.
-    // exactly as a cwd of "/" would, which is internally consistent and
-    // Linux-faithful given the fixed cwd. True cwd-relative resolution is deferred
-    // to the per-PCB-cwd slice (it is NOT silently wrong, just rooted at "/").
+    // Preserve relative bytes: VFS resolves them through the process's owned
+    // cwd/root handles, and exec retains those bindings after image replacement.
     let argv_vec = copy_user_str_array(argv)?;
     let envp_vec = copy_user_str_array(envp)?;
     // AT_EXECFN = the ORIGINAL pathname, threaded UNCHANGED through any shebang.
@@ -9675,9 +9768,9 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // Snapshot tgid and current mount namespace before validation/LSM work
-    let (tgid, current_mount_ns) = {
+    let (tgid, current_mount_ns, fs_context) = {
         let proc = proc_arc.lock();
-        (proc.tgid, proc.mount_ns.clone())
+        (proc.tgid, proc.mount_ns.clone(), proc.fs_context.clone())
     };
 
     // R74-3: Early thread-count validation (non-authoritative, just fail-fast)
@@ -9720,6 +9813,16 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
             return Err(SyscallError::EPERM);
         }
     }
+
+    let bindings = (crate::fs_context::callbacks()?.namespace_bindings)(
+        &current_mount_ns,
+        &target_ns,
+        &fs_context,
+    )?;
+    let binding_permit = bindings.permit;
+    // Keep ownership outside the registry closure on every rejected transaction.
+    // The successful publication takes it only after the last fallible check.
+    let mut prepared_fs = Some(bindings.state);
 
     // Get old namespace for audit (from snapshot, avoids re-locking)
     let old_ns_id = current_mount_ns.id().raw();
@@ -9790,7 +9893,10 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         }
 
         // Revalidate the source: identity and the namespace we authorized against.
-        if proc.tgid != tgid || !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns) {
+        if proc.tgid != tgid
+            || !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns)
+            || !proc.fs_context.matches(&fs_context)
+        {
             return Ok(Err(SyscallError::EAGAIN));
         }
 
@@ -9799,7 +9905,11 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         let displaced_self = core::mem::replace(&mut proc.mount_ns, target_ns.clone());
         let displaced_children =
             core::mem::replace(&mut proc.mount_ns_for_children, target_ns.clone());
-        Ok(Ok((displaced_self, displaced_children)))
+        let displaced_fs = core::mem::replace(
+            &mut proc.fs_context,
+            prepared_fs.take().expect("prepared setns filesystem state"),
+        );
+        Ok(Ok((displaced_self, displaced_children, displaced_fs)))
     });
 
     // Contention aborted the observation with nothing mutated.
@@ -9808,6 +9918,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         Ok(Err(err)) => return Err(err),
         Err(_) => return Err(SyscallError::EAGAIN),
     };
+    drop(binding_permit);
     // Old namespace references released outside every registry lock.
     drop(displaced);
 
@@ -16856,41 +16967,51 @@ fn sys_getegid() -> SyscallResult {
 
 /// sys_getcwd - 获取当前工作目录
 ///
-/// 当前实现返回固定值"/"，因为PCB未跟踪工作目录。
+/// Walk the process's owned root/cwd bindings and copy the exact NUL-terminated path.
 fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
     }
-    if size < 2 {
+    let mut cwd = (crate::fs_context::callbacks()?.getcwd)()?;
+    let count = cwd.len().checked_add(1).ok_or(SyscallError::ERANGE)?;
+    if size < count {
         return Err(SyscallError::ERANGE);
     }
-
-    // 当前工作目录固定为根目录
-    let cwd = b"/\0";
-    copy_to_user(buf, cwd)?;
-    Ok(cwd.len())
+    cwd.try_reserve_exact(1).map_err(|_| SyscallError::ENOMEM)?;
+    cwd.push('\0');
+    copy_to_user(buf, cwd.as_bytes())?;
+    Ok(count)
 }
 
-/// sys_chdir - 更改当前工作目录
-///
-/// 当前实现仅验证路径存在，但不真正更改工作目录。
 fn sys_chdir(path: *const u8) -> SyscallResult {
+    sys_change_directory(path, false)
+}
+
+fn sys_chroot(path: *const u8) -> SyscallResult {
+    sys_change_directory(path, true)
+}
+
+fn sys_pivot_root(new_root: *const u8, put_old: *const u8) -> SyscallResult {
+    if new_root.is_null() || put_old.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let new_bytes =
+        crate::usercopy::copy_user_cstring(new_root).map_err(|_| SyscallError::EFAULT)?;
+    let old_bytes =
+        crate::usercopy::copy_user_cstring(put_old).map_err(|_| SyscallError::EFAULT)?;
+    let new_name = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let old_name = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
+    (crate::fs_context::callbacks()?.pivot_root)(new_name, old_name)?;
+    Ok(0)
+}
+
+fn sys_change_directory(path: *const u8, root: bool) -> SyscallResult {
     if path.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
-    // 复制路径
-    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
-
-    // 通过回调获取stat并验证路径存在且是目录
-    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    let stat = stat_fn(path_str)?;
-    if !is_directory_mode(stat.mode) {
-        return Err(SyscallError::ENOTDIR);
-    }
-
-    // TODO: 将cwd存储在PCB中
+    let bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path = core::str::from_utf8(&bytes).map_err(|_| SyscallError::EINVAL)?;
+    (crate::fs_context::callbacks()?.change_directory)(path, root)?;
     Ok(0)
 }
 
@@ -17086,7 +17207,7 @@ fn do_rename_str(old_str: &str, new_str: &str, noreplace: bool) -> SyscallResult
     Ok(0)
 }
 
-/// sys_rename(82) — POSIX rename. Resolves relative paths from "/" (no per-PCB cwd in M0).
+/// sys_rename(82): relative paths use the process's owned cwd.
 fn sys_rename(oldp: *const u8, newp: *const u8) -> SyscallResult {
     let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
     let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
@@ -17094,11 +17215,17 @@ fn sys_rename(oldp: *const u8, newp: *const u8) -> SyscallResult {
     do_rename_str(old_str, new_str, false)
 }
 
-/// Both *at paths must be ABSOLUTE (no per-PCB cwd / dirfd-relative resolution in M0 —
-/// mirrors sys_openat's EOPNOTSUPP for a relative + non-AT_FDCWD path, extended to reject
-/// relative + AT_FDCWD too). Absolute paths ignore dirfd (Linux).
-fn rename_at_paths_absolute(old_str: &str, new_str: &str) -> Result<(), SyscallError> {
-    if !old_str.starts_with('/') || !new_str.starts_with('/') {
+/// Absolute paths ignore dirfd. Relative AT_FDCWD paths use the stored cwd;
+/// other dirfd-relative combinations remain explicitly unsupported.
+fn rename_at_paths_supported(
+    old_dirfd: i32,
+    old_str: &str,
+    new_dirfd: i32,
+    new_str: &str,
+) -> Result<(), SyscallError> {
+    if (!old_str.starts_with('/') && old_dirfd != AT_FDCWD)
+        || (!new_str.starts_with('/') && new_dirfd != AT_FDCWD)
+    {
         return Err(SyscallError::EOPNOTSUPP);
     }
     Ok(())
@@ -17109,7 +17236,7 @@ fn sys_renameat(_olddirfd: i32, oldp: *const u8, _newdirfd: i32, newp: *const u8
     let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
     let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
     let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
-    rename_at_paths_absolute(old_str, new_str)?;
+    rename_at_paths_supported(_olddirfd, old_str, _newdirfd, new_str)?;
     do_rename_str(old_str, new_str, false)
 }
 
@@ -17131,7 +17258,7 @@ fn sys_renameat2(
     let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
     let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
     let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
-    rename_at_paths_absolute(old_str, new_str)?;
+    rename_at_paths_supported(_olddirfd, old_str, _newdirfd, new_str)?;
     do_rename_str(old_str, new_str, noreplace)
 }
 
@@ -17425,46 +17552,20 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // `path_str.clone()` was an infallible String allocation of up to
     // MAX_ARG_STRLEN+1 = 4097 user-controlled bytes — an OOM-time kernel panic.
     // path_str is not used after this if/else, so the move is sound.
-    let resolved_path = if path_str.starts_with('/') {
+    let resolved_path = if path_str.starts_with('/') || dirfd == AT_FDCWD {
         path_str
-    } else if dirfd == AT_FDCWD {
-        if path_str.is_empty() {
-            try_str_to_string("/")?
-        } else {
-            let mut s = String::new();
-            s.try_reserve_exact(1 + path_str.len())
-                .map_err(|_| SyscallError::ENOMEM)?;
-            s.push('/');
-            s.push_str(&path_str);
-            s
-        }
     } else {
-        // R65-22 FIX: Resolve relative path against dirfd
-        // Get the directory fd and resolve path relative to it
-        let dir_path = {
-            let proc_guard = process.lock();
-            let dir_fd = proc_guard.get_fd(dirfd).ok_or(SyscallError::EBADF)?;
-
-            // The fd must be a directory for relative path resolution
-            // Check via file type if available, or defer to VFS for directory check
-            // For now, we require the fd to represent a directory inode
-            if let Some(path_info) = proc_guard.fd_table.get(&dirfd) {
-                // Use the path from the fd if we can extract it
-                // Fall back to requiring explicit directory support
-            }
-            drop(proc_guard);
-
-            // Since we don't have full fd_path tracking yet, return EOPNOTSUPP for
-            // non-AT_FDCWD dirfd with relative paths. This is safer than incorrectly
-            // resolving paths, as it prevents potential sandbox escapes.
-            //
-            // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
-            // ENOSYS. The syscall exists but relative path resolution from dirfd is
-            // not yet implemented.
-            //
-            // TODO: Implement full fd_paths tracking for complete openat2 support
-            return Err(SyscallError::EOPNOTSUPP);
+        let fd = {
+            let proc = process.lock();
+            proc.get_fd(dirfd)
+                .ok_or(SyscallError::EBADF)?
+                .try_clone_box()
+                .map_err(|_| SyscallError::ENOMEM)?
         };
+        if !is_directory_mode(fd.stat()?.mode) {
+            return Err(SyscallError::ENOTDIR);
+        }
+        return Err(SyscallError::EOPNOTSUPP);
     };
 
     // R65-22 FIX: Validate RESOLVE_BENEATH/RESOLVE_IN_ROOT constraints

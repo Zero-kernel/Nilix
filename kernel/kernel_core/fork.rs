@@ -210,55 +210,8 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
             return Err(ForkError::ProcessCreationFailed);
         }
     };
-    let prepared_identity = {
-        let parent = parent_process.lock();
-        let visible_pid = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain)
-            .map(|ns| crate::pid_namespace::pid_in_namespace(&ns, child_pid))
-            .unwrap_or(Some(child_pid));
-        let parent_creds = parent
-            .try_credentials_read()
-            .ok_or(ForkError::CredentialBusy)?;
-        let parent_ctx = lsm::ProcessCtx::new(
-            parent.pid,
-            parent.tgid,
-            parent_creds.uid,
-            parent_creds.gid,
-            parent_creds.euid,
-            parent_creds.egid,
-        );
-        if let Ok(supplementary_groups) = mm::AdmittedVec::try_copy_from_slice(
-            HeapClass::CoreProcess,
-            &parent_creds.supplementary_groups,
-        ) {
-            let child_credentials = crate::process::Credentials {
-                uid: parent_creds.uid,
-                gid: parent_creds.gid,
-                euid: parent_creds.euid,
-                egid: parent_creds.egid,
-                supplementary_groups,
-            };
-            let child_ctx = lsm::ProcessCtx::new(
-                child_pid,
-                child_pid,
-                child_credentials.uid,
-                child_credentials.gid,
-                child_credentials.euid,
-                child_credentials.egid,
-            );
-            Some((parent_ctx, child_ctx, visible_pid, child_credentials))
-        } else {
-            None
-        }
-    };
-    let Some((parent_ctx, child_ctx, parent_view_pid, child_credentials)) = prepared_identity
-    else {
-        parent_process
-            .lock()
-            .children
-            .retain(|&pid| pid != child_pid);
-        cleanup_partial_child(child_pid);
-        return Err(ForkError::MemoryAllocationFailed);
-    };
+    let (parent_ctx, child_ctx, parent_view_pid, child_credentials) =
+        prepare_fork_identity_or_cleanup(&parent_process, child_pid)?;
     let Some(parent_view_pid) = parent_view_pid else {
         parent_process
             .lock()
@@ -353,6 +306,87 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
     drop(parent);
     scheduler_permit.commit();
     Ok((child_pid, parent_view_pid))
+}
+
+/// KSA-010: a published child already exists here. Credential contention and
+/// admission failure must release the parent guard before unlinking/teardown,
+/// just like the later namespace/LSM/scheduler rejection paths.
+fn prepare_fork_identity_or_cleanup(
+    parent_process: &ProcessArc,
+    child_pid: ProcessId,
+) -> Result<
+    (
+        lsm::ProcessCtx,
+        lsm::ProcessCtx,
+        Option<ProcessId>,
+        crate::process::Credentials,
+    ),
+    ForkError,
+> {
+    let result = (|| {
+        let parent = parent_process.lock();
+        let visible_pid = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain)
+            .map(|ns| crate::pid_namespace::pid_in_namespace(&ns, child_pid))
+            .unwrap_or(Some(child_pid));
+        let parent_creds = parent
+            .try_credentials_read()
+            .ok_or(ForkError::CredentialBusy)?;
+        let parent_ctx = lsm::ProcessCtx::new(
+            parent.pid,
+            parent.tgid,
+            parent_creds.uid,
+            parent_creds.gid,
+            parent_creds.euid,
+            parent_creds.egid,
+        );
+        let supplementary_groups = mm::AdmittedVec::try_copy_from_slice(
+            HeapClass::CoreProcess,
+            &parent_creds.supplementary_groups,
+        )
+        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        let child_credentials = crate::process::Credentials {
+            uid: parent_creds.uid,
+            gid: parent_creds.gid,
+            euid: parent_creds.euid,
+            egid: parent_creds.egid,
+            supplementary_groups,
+        };
+        let child_ctx = lsm::ProcessCtx::new(
+            child_pid,
+            child_pid,
+            child_credentials.uid,
+            child_credentials.gid,
+            child_credentials.euid,
+            child_credentials.egid,
+        );
+        Ok((parent_ctx, child_ctx, visible_pid, child_credentials))
+    })();
+    if result.is_err() {
+        parent_process
+            .lock()
+            .children
+            .retain(|&pid| pid != child_pid);
+        cleanup_partial_child(child_pid);
+    }
+    result
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod credential_preparation_tests {
+    use super::*;
+    use crate::process::child_creation_test_support::Fixture;
+
+    #[test]
+    fn credential_lifecycle_fork_contention_cleanup() {
+        let fixture = Fixture::new();
+        let (_, child_pid) = fixture.pids();
+        let credentials = fixture.parent.lock().shared_credentials();
+        let result = credentials.with_hosted_pending_writer(|| {
+            prepare_fork_identity_or_cleanup(&fixture.parent, child_pid)
+        });
+        assert!(matches!(result, Err(ForkError::CredentialBusy)));
+        fixture.assert_child_removed();
+    }
 }
 
 /// Fork 的内部实现，便于错误处理和回滚
@@ -644,6 +678,7 @@ fn fork_inner(
         child.install_shared_credentials_for_clone(credentials);
         drop(credential_arc_reservation);
         child.umask = parent.umask;
+        child.fs_context = parent.fs_context.clone();
 
         // D3-ARC-MM-SHARED: Build the child's independent MmState from the
         // parent's shared mm. This replaces the old per-field copies of

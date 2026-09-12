@@ -220,7 +220,7 @@ pub fn run_pipe_second_cap_failure_self_test() {
 ///   funnel.
 /// - **R170-6**: every rollback `PipeHandle` Drop (close → wake) runs OUTSIDE
 ///   the Process lock via `rollback_outside`.
-fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
+fn pipe_create_callback(flags: u32) -> Result<(i32, i32), SyscallError> {
     use process::{current_pid, get_process};
 
     // 获取当前进程
@@ -228,8 +228,11 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // 创建管道（锁外 — 对象创建没有 cap/fd 副作用）
-    let (read_handle, write_handle) =
-        create_pipe(PipeFlags::default()).map_err(pipe_error_to_syscall)?;
+    let pipe_flags = PipeFlags {
+        nonblock: flags & process::FILE_STATUS_NONBLOCK != 0,
+        cloexec: flags & 0x80000 != 0,
+    };
+    let (read_handle, write_handle) = create_pipe(pipe_flags).map_err(pipe_error_to_syscall)?;
 
     // Admit and physically allocate both exact-lifetime descriptor owners
     // before any cap/fd state is created. Finalization below is infallible.
@@ -278,12 +281,12 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         // Reserve both admitted FD-table slots and files.max charges before
         // allocating either capability. Both later publications are therefore
         // allocation-free and cannot partially fail.
-        let Some(read_fd) = proc.reserve_fd() else {
+        let Some(read_fd) = proc.reserve_fd_with_cloexec(pipe_flags.cloexec) else {
             rollback_outside[0] = read_handle.take();
             rollback_outside[1] = write_handle.take();
             break 'install Err(SyscallError::EMFILE);
         };
-        let Some(write_fd) = proc.reserve_fd() else {
+        let Some(write_fd) = proc.reserve_fd_with_cloexec(pipe_flags.cloexec) else {
             assert!(proc.cancel_fd_reservation(read_fd));
             rollback_outside[0] = read_handle.take();
             rollback_outside[1] = write_handle.take();
@@ -425,12 +428,14 @@ fn fd_read_callback(
 
     // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
-        if file.inode.is_dir() {
-            return Err(SyscallError::EISDIR);
-        }
         let file_clone = file.clone();
         drop(proc); // Release lock before VFS I/O
-        if !file_clone.flags.is_readable() {
+                    // KSA-011/014: even this metadata query can call procfs, which resolves
+                    // the current viewer through its PCB. No inode callback may run under it.
+        if file_clone.inode.is_dir() {
+            return Err(SyscallError::EISDIR);
+        }
+        if !file_clone.flags().is_readable() {
             return Err(SyscallError::EBADF);
         }
 
@@ -545,11 +550,12 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
 
     // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
-        if file.inode.is_dir() {
-            return Err(SyscallError::EISDIR);
-        }
         let file_clone = file.clone();
         drop(proc); // Release lock before VFS I/O
+                    // Match the read path: is_dir() may execute a reentrant inode stat().
+        if file_clone.inode.is_dir() {
+            return Err(SyscallError::EISDIR);
+        }
         return file_clone.write(buf).map_err(fs_error_to_syscall);
     }
 
@@ -658,6 +664,7 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::IsDir => SyscallError::EISDIR,
         FsError::Exists => SyscallError::EEXIST,
         FsError::PermDenied => SyscallError::EACCES,
+        FsError::NotPermitted => SyscallError::EPERM,
         FsError::BadFd => SyscallError::EBADF,
         // M0-6 slice 2: errno fidelity, matching FsError::to_errno + the VFS mappers —
         // ReadOnly=>EROFS, NameTooLong=>ENAMETOOLONG, NotEmpty=>ENOTEMPTY.
@@ -672,6 +679,7 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::Pipe => SyscallError::EPIPE,
         FsError::NotEmpty => SyscallError::ENOTEMPTY,
         FsError::Busy => SyscallError::EBUSY,
+        FsError::Again => SyscallError::EAGAIN,
     }
 }
 

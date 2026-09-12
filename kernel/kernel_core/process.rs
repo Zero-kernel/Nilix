@@ -2048,6 +2048,9 @@ pub struct Process {
     /// 新建文件的权限 = mode & !umask
     pub umask: u16,
 
+    /// KSA-010/014: identity-bound root/cwd, independently inherited on fork.
+    pub fs_context: crate::fs_context::FsContextState,
+
     // ========== OOM Killer 支持 ==========
     /// Nice 值 (-20 到 19)
     /// 负值表示更高优先级，正值表示更低优先级
@@ -2684,6 +2687,7 @@ impl Process {
             // credentials from the parent process via independent clone.
             credentials,
             umask: 0o022,
+            fs_context: crate::fs_context::FsContextState::default(),
             // OOM killer 支持 - 默认中立设置
             nice: 0,
             oom_score_adj: 0,
@@ -6671,6 +6675,25 @@ impl SharedCredentials {
             })
     }
 
+    /// Hosted cross-crate regression seam: pause after the real writer claim
+    /// and cancel it on return, without ever mutating the credential payload.
+    #[cfg(all(feature = "host_harness", not(target_os = "none")))]
+    pub fn with_hosted_pending_writer<T>(&self, body: impl FnOnce() -> T) -> T {
+        struct Cancel<'a>(&'a SharedCredentials);
+        impl Drop for Cancel<'_> {
+            fn drop(&mut self) {
+                let old = self
+                    .0
+                    .authorization_state
+                    .fetch_and(!SharedCredentials::AUTH_WRITER, Ordering::Release);
+                assert_ne!(old & SharedCredentials::AUTH_WRITER, 0);
+            }
+        }
+        assert!(CredentialMutationGuard::try_claim(self));
+        let _cancel = Cancel(self);
+        body()
+    }
+
     fn mutate<T>(
         &self,
         mutation: impl FnOnce(&mut Credentials) -> Result<CredentialMutation<T>, CredentialsError>,
@@ -7736,6 +7759,13 @@ pub fn prepare_scheduler_add_process(
     process: ProcessArc,
 ) -> Result<SchedulerAddPermit, SchedulerAddError> {
     let callbacks = (*SCHEDULER_ADMISSION.lock()).ok_or(SchedulerAddError::Unavailable)?;
+    prepare_scheduler_add_process_with(process, callbacks)
+}
+
+fn prepare_scheduler_add_process_with(
+    process: ProcessArc,
+    callbacks: SchedulerAdmissionCallbacks,
+) -> Result<SchedulerAddPermit, SchedulerAddError> {
     let token = (callbacks.reserve)(process)?;
     Ok(SchedulerAddPermit {
         token: Some(token),
@@ -7743,6 +7773,286 @@ pub fn prepare_scheduler_add_process(
         cancel: callbacks.cancel,
         armed: true,
     })
+}
+
+/// KSA-010: clone selects its prospective credentials before its LSM check, but
+/// may install that identity only after scheduler reservation makes the child
+/// Provisioning. Keep this ordering in one production helper; the returned
+/// permit still owns cancellation through every later usercopy/charge failure.
+pub(crate) fn prepare_clone_scheduler_add_process(
+    process: ProcessArc,
+    credentials: Arc<SharedCredentials>,
+) -> Result<SchedulerAddPermit, SchedulerAddError> {
+    let callbacks = (*SCHEDULER_ADMISSION.lock()).ok_or(SchedulerAddError::Unavailable)?;
+    prepare_clone_scheduler_add_process_with(process, credentials, callbacks)
+}
+
+fn prepare_clone_scheduler_add_process_with(
+    process: ProcessArc,
+    credentials: Arc<SharedCredentials>,
+    callbacks: SchedulerAdmissionCallbacks,
+) -> Result<SchedulerAddPermit, SchedulerAddError> {
+    let permit = prepare_scheduler_add_process_with(Arc::clone(&process), callbacks)?;
+    process
+        .lock()
+        .install_shared_credentials_for_clone(credentials);
+    Ok(permit)
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod clone_credential_admission_tests {
+    extern crate std;
+    use super::*;
+
+    fn identity() -> Arc<SharedCredentials> {
+        Arc::new(SharedCredentials::new(Credentials {
+            uid: 70001,
+            gid: 70002,
+            euid: 70001,
+            egid: 70002,
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+        }))
+    }
+
+    fn child() -> ProcessArc {
+        Process::try_new_pcb(
+            0x4101,
+            1,
+            ProcessNameSnapshot::from_parts("clone-admission", ""),
+            120,
+        )
+        .expect("clone admission fixture")
+    }
+
+    fn reserve(process: ProcessArc) -> Result<SchedulerAddToken, SchedulerAddError> {
+        let (pid, generation, priority) = {
+            let mut child = process.lock();
+            assert_eq!(child.state, ProcessState::Ready);
+            assert_eq!(child.try_credentials_read().unwrap().uid, 65534);
+            child.state = ProcessState::Provisioning;
+            (child.pid, child.generation, child.dynamic_priority)
+        };
+        Ok(SchedulerAddToken {
+            cpu_id: 0,
+            priority,
+            pid,
+            generation,
+            process,
+        })
+    }
+
+    fn commit(token: SchedulerAddToken) {
+        let mut child = token.process.lock();
+        assert_eq!((child.pid, child.generation), (token.pid, token.generation));
+        assert_eq!(child.state, ProcessState::Provisioning);
+        assert_eq!(child.try_credentials_read().unwrap().uid, 70001);
+        child.publish_ready_at(1);
+        child.exit_code = Some(-10); // Observation of this exact callback target.
+    }
+
+    fn cancel(token: SchedulerAddToken) {
+        let mut child = token.process.lock();
+        assert_eq!((child.pid, child.generation), (token.pid, token.generation));
+        assert_eq!(child.state, ProcessState::Provisioning);
+        child.exit_code = Some(-11);
+    }
+
+    fn callbacks() -> SchedulerAdmissionCallbacks {
+        SchedulerAdmissionCallbacks {
+            reserve,
+            commit,
+            cancel,
+        }
+    }
+
+    #[test]
+    fn credential_lifecycle_reserves_before_private_or_shared_install() {
+        let parent_identity = identity();
+        for shared in [false, true] {
+            let child = child();
+            let selected = if shared {
+                Arc::clone(&parent_identity)
+            } else {
+                identity()
+            };
+            assert_eq!(Arc::ptr_eq(&selected, &parent_identity), shared);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    child
+                        .lock()
+                        .install_shared_credentials_for_clone(Arc::clone(&selected));
+                }))
+                .is_err(),
+                "Ready children must reject early installation"
+            );
+            let permit = prepare_clone_scheduler_add_process_with(
+                Arc::clone(&child),
+                Arc::clone(&selected),
+                callbacks(),
+            )
+            .expect("actual reserve-then-install helper");
+            assert_eq!(child.lock().state, ProcessState::Provisioning);
+            assert!(Arc::ptr_eq(&child.lock().shared_credentials(), &selected));
+            assert_eq!(child.lock().exit_code, None);
+            permit.commit();
+            assert_eq!(child.lock().state, ProcessState::Ready);
+            assert_eq!(child.lock().exit_code, Some(-10));
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    child
+                        .lock()
+                        .install_shared_credentials_for_clone(identity());
+                }))
+                .is_err(),
+                "committed children must reject identity replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_lifecycle_refusal_and_cancel_keep_child_unrunnable() {
+        fn refuse(process: ProcessArc) -> Result<SchedulerAddToken, SchedulerAddError> {
+            // A real queue allocation can fail after Ready -> Provisioning.
+            let token = reserve(process)?;
+            drop(token);
+            Err(SchedulerAddError::NoMemory)
+        }
+        let child = child();
+        let original = child.lock().shared_credentials();
+        let mut denied = callbacks();
+        denied.reserve = refuse;
+        assert!(matches!(
+            prepare_clone_scheduler_add_process_with(Arc::clone(&child), identity(), denied,),
+            Err(SchedulerAddError::NoMemory)
+        ));
+        assert!(Arc::ptr_eq(&child.lock().shared_credentials(), &original));
+        assert_eq!(child.lock().state, ProcessState::Provisioning);
+        assert_eq!(child.lock().exit_code, None);
+        drop(child);
+
+        let child = self::child();
+        let selected = identity();
+        let permit = prepare_clone_scheduler_add_process_with(
+            Arc::clone(&child),
+            Arc::clone(&selected),
+            callbacks(),
+        )
+        .unwrap();
+        drop(permit);
+        assert_eq!(child.lock().state, ProcessState::Provisioning);
+        assert_eq!(child.lock().exit_code, Some(-11));
+        assert!(Arc::ptr_eq(&child.lock().shared_credentials(), &selected));
+    }
+}
+
+/// Hosted fixtures use real published PCBs and actual unscheduled teardown;
+/// only physical stacks/address spaces and scheduler registration are absent.
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+pub(crate) mod child_creation_test_support {
+    use super::*;
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct Fixture {
+        pub parent: ProcessArc,
+        pub child: ProcessArc,
+        _serial: spin::MutexGuard<'static, ()>,
+    }
+
+    impl Fixture {
+        pub fn new() -> Self {
+            let serial = SERIAL.lock();
+            let parent_pid = {
+                let table = PROCESS_TABLE.lock();
+                (768..1024)
+                    .find(|pid| {
+                        table.get(*pid).is_none_or(Option::is_none)
+                            && table.get(*pid + 1).is_none_or(Option::is_none)
+                    })
+                    .expect("unused child-creation fixture slots")
+            };
+            let child_pid = parent_pid + 1;
+            let parent = Process::try_new_pcb(
+                parent_pid,
+                1,
+                ProcessNameSnapshot::from_parts("creation-parent", ""),
+                120,
+            )
+            .unwrap();
+            let child = Process::try_new_pcb(
+                child_pid,
+                parent_pid,
+                ProcessNameSnapshot::from_parts("creation-child", ""),
+                120,
+            )
+            .unwrap();
+            {
+                let mut parent = parent.lock();
+                parent.children.try_reserve_exact(1).unwrap();
+                parent.children.push_reserved(child_pid).unwrap();
+            }
+            // At the early fork/clone identity gate descriptors may already be
+            // inherited, but cgroup FD charges have not been acquired. Calling
+            // initialize_standard_fds here would charge a lifecycle phase the
+            // production pre-identity fork cleanup deliberately never undoes.
+            let descriptors: [FileDescriptor; 3] = core::array::from_fn(|fd| {
+                FileDescriptor::try_new(ConsoleFile { readable: fd == 0 }, HeapClass::CoreProcess)
+                    .expect("uncharged inherited descriptor fixture")
+            });
+            {
+                let mut child = child.lock();
+                child
+                    .fd_table
+                    .ensure_capacity_for(descriptors.len())
+                    .unwrap();
+                for (fd, descriptor) in descriptors.into_iter().enumerate() {
+                    child
+                        .fd_table
+                        .insert_unique_reserved(fd as i32, descriptor)
+                        .unwrap_or_else(|_| panic!("prepared inherited descriptor slot"));
+                }
+                assert_eq!(child.total_fd_charge_count(), 0);
+            }
+            {
+                let mut table = PROCESS_TABLE.lock();
+                if table.len() <= child_pid {
+                    let missing = child_pid + 1 - table.len();
+                    table.try_reserve_exact(missing).unwrap();
+                    while table.len() <= child_pid {
+                        table.push_reserved(None).unwrap();
+                    }
+                }
+                assert!(table[parent_pid].is_none() && table[child_pid].is_none());
+                table[parent_pid] = Some(Arc::clone(&parent));
+                table[child_pid] = Some(Arc::clone(&child));
+            }
+            Self {
+                parent,
+                child,
+                _serial: serial,
+            }
+        }
+
+        pub fn pids(&self) -> (ProcessId, ProcessId) {
+            (self.parent.lock().pid, self.child.lock().pid)
+        }
+
+        pub fn assert_child_removed(&self) {
+            let (_, child_pid) = self.pids();
+            assert!(get_process(child_pid).is_none());
+            assert!(!self.parent.lock().children.contains(&child_pid));
+            assert!(self.child.lock().fd_table.is_empty());
+            assert_eq!(self.child.lock().total_fd_charge_count(), 0);
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let (parent_pid, child_pid) = self.pids();
+            self.parent.lock().children.retain(|pid| *pid != child_pid);
+            cleanup_unscheduled_process(child_pid);
+            cleanup_unscheduled_process(parent_pid);
+        }
+    }
 }
 
 /// 通知 futex 唤醒等待者
