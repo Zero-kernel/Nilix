@@ -21,16 +21,27 @@ Tests syscall entry points with focus on R173/R174 fixes:
 - **Clone operations** - R174-A2
 - **Futex operations** - R172-08
 
-### 1b. `fuzz_syscall_qemu` - QEMU-Based Syscall Fuzzing (NEW)
-Real kernel execution with KCOV coverage feedback:
-- **38 syscalls** across File I/O, Memory, IPC, Process/Time
-- **File I/O:** open, read, write, stat, lseek, pread64/pwrite64
-- **Memory Mgmt:** mmap, mprotect, munmap, brk (R168/R171/R174)
-- **IPC:** pipe, select, poll, socketpair (M0-5 EINTR)
-- **Isolation:** QEMU virtualization, tmpfs-only, 16 MiB guest RAM
-- **Performance:** 5-10 exec/sec, coverage-guided sequence generation
+### 1b. `fuzz_syscall_qemu` - QEMU syscall execution
 
-See `docs/fuzzing/EXPANDED_SYSCALL_ALLOWLIST.md` for full allowlist details.
+**Verification status (2026-09-10):** development paused. The real adapter and host
+regressions are implemented; the current guest smoke reaches BEGIN then fails
+`result_open` with `EINVAL`. Successful guest coverage is not yet qualified. See the
+[handoff](../docs/review/fixes/ksa-2026-09-06-handoff-2026-09-10.md) before continuing.
+
+Uses the production `nilix-syz-fuzzer` executor and its 20-syscall allowlist, including
+process identity, read-only filesystem queries, time and bounded output buffers.
+Each accepted input boots `esp-syz/kernel.elf` with 512 MiB guest RAM, a fresh ESP
+and a private 128 MiB Ext3 transport. Authenticated BEGIN/PASS and result data bind
+coverage to the submitted input. Missing prerequisites, process errors, crashes,
+timeouts and hangs fail the invocation. Invalid byte encodings are rejected before
+execution. Guest KCOV is returned; libFuzzer mutation guidance still uses host
+instrumentation. There is no measured executions-per-second claim.
+
+Build with `make build-syz-kcov` and enable `qemu-executor`. Guest startup has a
+90-second bound; use `-timeout=120` or larger for libFuzzer. Optional
+`NILIX_FUZZ_KERNEL`, `NILIX_FUZZ_QEMU`, `OVMF_PATH` and `NILIX_FUZZ_ARTIFACTS`
+override the image, emulator, firmware and retained-evidence directory. Artifact
+retention is intended for finite validation runs because it keeps each guest disk.
 
 ### 2. `fuzz_vfs_path` - VFS Path Operations
 Tests filesystem operations:
@@ -113,7 +124,7 @@ cd fuzz
 cargo +nightly fuzz run fuzz_syscall
 
 # Run QEMU-based syscall fuzzer (real kernel execution)
-cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor
+cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- -timeout=120
 
 # Run with specific timeout and iterations
 cargo +nightly fuzz run fuzz_syscall -- -max_total_time=300 -runs=1000000
@@ -128,7 +139,7 @@ cargo +nightly fuzz run fuzz_syscall -- -dict=dictionaries/syscall.dict
 # Prerequisites: Build KCOV kernel and executor
 make build-fuzz-qemu-deps
 
-# Smoke test (5 minutes)
+# Finite smoke: two valid seeds, real launch/guest evidence, retained artifacts
 make fuzz-qemu-smoke
 
 # Campaign run (1 hour)
@@ -211,7 +222,7 @@ jobs:
           - fuzz_cgroup_ops
           - fuzz_elf_loader
           - fuzz_futex_ops
-    
+
     steps:
       - uses: actions/checkout@v4
 

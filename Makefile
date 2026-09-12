@@ -1091,55 +1091,45 @@ run-syz-kcov: build-syz-kcov
 # === Phase 8: Cargo-Fuzz Integration with QEMU Executor ===
 
 # Build prerequisites for QEMU-based cargo-fuzz
-build-fuzz-qemu-deps: build-kcov build-syz-fuzzer
+build-fuzz-qemu-deps: build-syz-kcov
 	@echo "=== QEMU Fuzzing Prerequisites Ready ==="
 
-# Run cargo-fuzz with QEMU executor (5-minute smoke test)
+# A finite gate must execute known valid inputs and verify process/guest evidence.
 fuzz-qemu-smoke: build-fuzz-qemu-deps
-	@echo "=== Running QEMU-Based Cargo-Fuzz Smoke Test ==="
-	cd fuzz && \
-	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
-		-max_total_time=300 \
-		-timeout=15 \
-		-rss_limit_mb=4096 \
-		-print_final_stats=1
-	@echo "=== Smoke Test Complete ==="
-	@if [ -d fuzz/artifacts/fuzz_syscall_qemu ]; then \
-		CRASHES=$$(find fuzz/artifacts/fuzz_syscall_qemu -name 'crash-*' | wc -l); \
-		echo "Crashes found: $$CRASHES"; \
-		if [ $$CRASHES -gt 0 ]; then \
-			echo "ERROR: Crashes detected!"; \
-			exit 1; \
-		fi; \
-	fi
+	python3 scripts/qemu_fuzz_smoke.py --kernel "$(SYZ_ESP)/kernel.elf"
+
+fuzz-qemu-seeds:
+	cargo +nightly-2025-12-08 run --manifest-path fuzz/Cargo.toml \
+		--target x86_64-unknown-linux-gnu --locked --features qemu-executor \
+		--example qemu_smoke -- fuzz/corpus/fuzz_syscall_qemu
 
 # Run extended QEMU fuzzing campaign (1 hour)
-fuzz-qemu-campaign: build-fuzz-qemu-deps
+fuzz-qemu-campaign: build-fuzz-qemu-deps fuzz-qemu-seeds
 	@echo "=== Running 1-Hour QEMU Fuzzing Campaign ==="
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
 		-max_total_time=3600 \
-		-timeout=12 \
+		-timeout=120 \
 		-rss_limit_mb=4096 \
 		-print_final_stats=1
 
 # Run overnight QEMU fuzzing (8 hours)
-fuzz-qemu-overnight: build-fuzz-qemu-deps
+fuzz-qemu-overnight: build-fuzz-qemu-deps fuzz-qemu-seeds
 	@echo "=== Running Overnight QEMU Fuzzing (8 hours) ==="
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
 		-max_total_time=28800 \
-		-timeout=10 \
+		-timeout=120 \
 		-rss_limit_mb=8192 \
 		-print_final_stats=1
 
 # Parallel QEMU fuzzing with 4 workers (requires 4x memory)
-fuzz-qemu-parallel: build-fuzz-qemu-deps
+fuzz-qemu-parallel: build-fuzz-qemu-deps fuzz-qemu-seeds
 	@echo "=== Running Parallel QEMU Fuzzing (4 workers) ==="
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor --jobs=4 -- \
 		-max_total_time=3600 \
-		-timeout=15 \
+		-timeout=120 \
 		-rss_limit_mb=4096 \
 		-print_final_stats=1
 
