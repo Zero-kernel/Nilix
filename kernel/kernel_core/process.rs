@@ -6350,6 +6350,105 @@ pub(crate) fn try_mark_job_control_stopped_locked(proc: &mut Process) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopBarrierState {
+    Wait,
+    Resumed,
+    Fatal(i32),
+}
+
+fn stop_barrier_state(proc: &Process, pid: ProcessId, generation: u64) -> StopBarrierState {
+    // The executing stack pins this live identity through on_cpu / pending-prev.
+    // Losing it cannot be recovered by returning to its old user frame.
+    assert_eq!((proc.pid, proc.generation), (pid, generation));
+    assert!(!matches!(
+        proc.state,
+        ProcessState::Zombie | ProcessState::Terminated
+    ));
+    if proc.pending_kill.load(Ordering::Acquire) {
+        StopBarrierState::Fatal(proc.pending_exit_code.load(Ordering::Acquire))
+    } else if proc.stopped || proc.state == ProcessState::Stopped {
+        StopBarrierState::Wait
+    } else {
+        StopBarrierState::Resumed
+    }
+}
+
+/// Keep a self-stopped task in process context until CONT or a fatal request.
+/// Call only without locks or transient owners that a no-return exit would leak.
+/// Interrupts may be enabled while waiting; the entry IF state is restored on
+/// return. No scheduler-state rewrite may discard an unrelated I/O wait here.
+pub(crate) fn wait_for_job_control_resume(pid: ProcessId, generation: u64) {
+    use x86_64::instructions::interrupts;
+
+    let entered_with_interrupts = interrupts::are_enabled();
+    let mut attempted_schedule = false;
+    loop {
+        interrupts::disable();
+        assert_eq!(current_pid(), Some(pid));
+        // IF-off lookup and observation are try-only. All Arc/guard temporaries
+        // are gone before either scheduling, HLT, or local fatal termination.
+        let state = match try_get_process(pid) {
+            None => StopBarrierState::Wait,
+            Some(None) => panic!("executing stopped task disappeared"),
+            Some(Some(arc)) => {
+                let observed = match arc.try_lock() {
+                    Some(proc) => stop_barrier_state(&proc, pid, generation),
+                    None => StopBarrierState::Wait,
+                };
+                observed
+            }
+        };
+        match state {
+            StopBarrierState::Resumed => {
+                if entered_with_interrupts {
+                    interrupts::enable();
+                }
+                return;
+            }
+            StopBarrierState::Fatal(code) => terminate_self_and_halt(pid, code),
+            StopBarrierState::Wait => {}
+        }
+        if attempted_schedule {
+            // A scheduler attempt may have returned on contention or no runnable
+            // candidate. The atomic STI/HLT pair admits pending timer/IPI work;
+            // every wake repeats the identity/fatal/stop observation.
+            interrupts::enable_and_hlt();
+            attempted_schedule = false;
+        } else {
+            interrupts::enable();
+            crate::scheduler_hook::force_reschedule();
+            attempted_schedule = true;
+        }
+    }
+}
+
+/// Resume an exact resident PCB while its caller holds the state lock. This is
+/// shared with the scheduler so SIGCONT generation and resume cannot reorder
+/// around a concurrently generated stop. Only the subsequent kick is deferred.
+pub fn resume_job_control_locked(
+    proc: &mut Process,
+    expected_pid: ProcessId,
+    expected_generation: u64,
+) -> bool {
+    if proc.pid != expected_pid
+        || proc.generation != expected_generation
+        || matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
+    {
+        return false;
+    }
+    if !proc.stopped && proc.state != ProcessState::Stopped {
+        return false;
+    }
+    let make_ready = matches!(proc.state, ProcessState::Ready | ProcessState::Stopped)
+        || (proc.state == ProcessState::Blocked && crate::signal::should_abort_pending_block(proc));
+    if make_ready {
+        proc.enter_ready_at(crate::get_ticks());
+    }
+    proc.stopped = false;
+    make_ready
+}
+
 /// Complete a fatal request after all locks have been released.
 pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
     match post {
@@ -8628,14 +8727,11 @@ pub fn drain_deferred_irq_terminates() {
 /// R117-1 FIX: Centralized self-termination primitive.
 ///
 /// Terminates the current process and enters a safe no-return halt loop.
-/// This function guarantees that after self-termination:
-///   1. Interrupts are disabled (no timer IRQ frames on zombie's stack)
-///   2. CR3 is switched to boot page tables (freed user page tables not in TLB)
-///   3. The scheduler is given a chance to pick another task
-///   4. If no task is available, the CPU halts with IF=0 on safe CR3
-///
-/// **DESIGN GOAL (H.0.9 addendum):** No exit path may ever run with IRQs
-/// enabled while still on the exiting task's CR3 or kernel stack.
+/// All teardown temporaries unwind before scheduling. CR3 changes to boot page
+/// tables, then the scheduler saves this task and selects another task or the
+/// CPU's parked bootstrap context. The on_cpu gate keeps this stack alive until
+/// the actual restore has completed on a different stack. Contended handoffs
+/// retry using STI/HLT on boot CR3 while the original stack remains protected.
 ///
 /// # Panics
 ///
@@ -9023,9 +9119,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             }
         }
 
-        // 在释放锁后触发调度，让被唤醒的父进程有机会运行
+        // KSA-011: request scheduling without switching from this frame. Its
+        // Process Arc and detached namespace/child vectors must be dropped
+        // before a terminal switch abandons the current stack permanently.
         if wake_parent {
-            crate::force_reschedule();
+            let _ = crate::signal::kernel_kick_reschedule();
         }
     }
 }

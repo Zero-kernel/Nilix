@@ -385,10 +385,29 @@ const _: () = {
     assert!(align_of::<process::Context>() == align_of::<ArchContext>());
 };
 
-/// Per-CPU first-switch save slot. Concurrent first dispatches on the BSP and
-/// APs must never alias one writable bootstrap context.
+/// Per-CPU no-process context parked while this CPU runs tasks. Its original
+/// AP idle/BSP shell stack lasts for the CPU's lifetime and can receive a
+/// terminal task even when no other task is runnable on this CPU.
 struct BootstrapContext {
     buf: UnsafeCell<ArchContext>,
+    metadata: UnsafeCell<BootstrapMetadata>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BootstrapMetadata {
+    saved: bool,
+    kernel_stack_top: u64,
+    fs_base: u64,
+    gs_base: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapTarget {
+    context: *const ArchContext,
+    kernel_stack_top: u64,
+    fs_base: u64,
+    gs_base: u64,
+    cs: u64,
 }
 
 unsafe impl Send for BootstrapContext {}
@@ -398,13 +417,50 @@ impl BootstrapContext {
     fn new() -> Self {
         Self {
             buf: UnsafeCell::new(ArchContext::new()),
+            metadata: UnsafeCell::new(BootstrapMetadata::default()),
         }
     }
 
-    /// The caller owns this CPU and has IF clear for the complete save window.
+    /// Capture before the incoming task overwrites TSS/TLS. The caller owns this
+    /// CPU with IF clear through the following assembly save. No task can ask
+    /// to restore this slot before that save has completed.
     #[inline]
-    fn as_mut_ptr(&self) -> *mut ArchContext {
+    fn prepare_save(&self, kernel_stack_top: u64, fs_base: u64, gs_base: u64) -> *mut ArchContext {
+        // SAFETY: only this CPU accesses its slot, with interrupts disabled.
+        unsafe {
+            *self.metadata.get() = BootstrapMetadata {
+                saved: true,
+                kernel_stack_top,
+                fs_base,
+                gs_base,
+            };
+        }
         self.buf.get()
+    }
+
+    /// Read a parked context with IF clear. It remains immutable until this
+    /// CPU resumes it and later dispatches another task from current_pid=None.
+    fn target(&self) -> Option<BootstrapTarget> {
+        // SAFETY: per-CPU ownership excludes concurrent access; the preceding
+        // departure saved the context before any task could run on this CPU.
+        let (context, metadata) = unsafe { (&*self.buf.get(), *self.metadata.get()) };
+        if !metadata.saved
+            || metadata.kernel_stack_top == 0
+            || context.rip >> 47 != 0x1ffff
+            || context.rsp == 0
+            || context.cs & 3 != 0
+            || context.ss & 3 != 0
+            || context.rflags & (1 << 9) != 0
+        {
+            return None;
+        }
+        Some(BootstrapTarget {
+            context: self.buf.get().cast_const(),
+            kernel_stack_top: metadata.kernel_stack_top,
+            fs_base: metadata.fs_base,
+            gs_base: metadata.gs_base,
+            cs: context.cs,
+        })
     }
 }
 
@@ -671,6 +727,12 @@ struct PreparedSwitch {
     next_gs_base: u64,
     next_wd_handle: Option<WatchdogHandle>,
     next_kcov_token: usize,
+}
+
+/// An ordinary synchronous teardown must finish before its stack is abandoned.
+/// IRQ-kill handoffs intentionally complete heavy teardown after going off CPU.
+fn terminal_needs_idle(state: ProcessState, teardown_done: bool, irq_kill_pending: bool) -> bool {
+    irq_kill_pending || (state == ProcessState::Zombie && teardown_done)
 }
 
 #[inline]
@@ -2015,28 +2077,7 @@ impl Scheduler {
         expected_pid: Pid,
         expected_generation: u64,
     ) -> bool {
-        if proc.pid != expected_pid
-            || proc.generation != expected_generation
-            || matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
-        {
-            return false;
-        }
-
-        let was_stopped = proc.stopped || proc.state == ProcessState::Stopped;
-        if !was_stopped {
-            return false;
-        }
-
-        let make_ready = matches!(proc.state, ProcessState::Ready | ProcessState::Stopped)
-            || (proc.state == ProcessState::Blocked
-                && kernel_core::signal::should_abort_pending_block(proc));
-        if make_ready {
-            // Keep `stopped` set through enter_ready_at so the Ready residence
-            // starts a fresh starvation-aging epoch.
-            proc.enter_ready_at(kernel_core::get_ticks());
-        }
-        proc.stopped = false;
-        make_ready
+        kernel_core::process::resume_job_control_locked(proc, expected_pid, expected_generation)
     }
 
     pub fn resume_stopped(
@@ -2308,6 +2349,51 @@ impl Scheduler {
         let Some((next_pid, next_pcb, _priority)) = selection.candidate else {
             if let Some(old_pcb) = old_pcb {
                 if let Some(mut old) = old_pcb.try_lock() {
+                    if terminal_needs_idle(
+                        old.state,
+                        old.teardown_done.load(Ordering::Acquire),
+                        process::is_pending_irq_kill(old.pid),
+                    ) {
+                        // KSA-011: an exited task cannot supply its own idle
+                        // stack. Keep on_cpu set until a real restore returns
+                        // to this CPU's permanently parked no-process frame.
+                        assert!(old.on_cpu.load(Ordering::Acquire));
+                        let bootstrap = BOOTSTRAP_CONTEXT
+                            .with(BootstrapContext::target)
+                            .expect("terminal idle handoff lacks a saved kernel context");
+                        let old_pid = old.pid;
+                        let old_generation = old.generation;
+                        let old_space = old.memory_space;
+                        let old_ctx_ptr = &mut old.context as *mut _ as *mut ArchContext;
+                        current_cpu().clear_fpu_owner_if(old_pid);
+                        drop(old);
+                        drop(queue);
+                        *current_guard = None;
+                        CURRENT_GENERATION[local_cpu].store(0, Ordering::Release);
+                        drop(current_guard);
+                        process::set_current_pid(None);
+                        if !selection.complete_cycle {
+                            current_cpu().set_need_resched();
+                        }
+                        if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
+                            stats.total_switches = stats.total_switches.saturating_add(1);
+                        }
+                        return Some(PreparedSwitch {
+                            old_pid,
+                            old_generation,
+                            old_space,
+                            old_ctx_ptr,
+                            next_space: 0,
+                            next_user_space: 0,
+                            next_ctx_ptr: bootstrap.context,
+                            next_kstack_top: bootstrap.kernel_stack_top,
+                            next_cs: bootstrap.cs,
+                            next_fs_base: bootstrap.fs_base,
+                            next_gs_base: bootstrap.gs_base,
+                            next_wd_handle: None,
+                            next_kcov_token: 0,
+                        });
+                    }
                     if old.state == ProcessState::Ready && old.on_cpu.load(Ordering::Acquire) {
                         old.enter_running_at(kernel_core::get_ticks());
                     }
@@ -2398,7 +2484,19 @@ impl Scheduler {
                 old.memory_space,
             )
         } else {
-            (BOOTSTRAP_CONTEXT.with(BootstrapContext::as_mut_ptr), 0, 0)
+            use x86_64::registers::model_specific::Msr;
+            // Capture the original CPU stack/TLS before execute_switch installs
+            // a task's TSS RSP0 and user TLS. default_kernel_stack_top reads the
+            // current TSS value, so it must be captured on this departure.
+            let kernel_stack_top = default_kernel_stack_top();
+            let (fs_base, gs_base) =
+                unsafe { (Msr::new(0xC000_0100).read(), Msr::new(0xC000_0102).read()) };
+            (
+                BOOTSTRAP_CONTEXT
+                    .with(|context| context.prepare_save(kernel_stack_top, fs_base, gs_base)),
+                0,
+                0,
+            )
         };
         // ST-K3 DIAG (fork chimera family): trap a corrupted kernel-cs context at
         // DISPATCH, with identities. The asm save-half ud2 guard covers the save
@@ -2487,14 +2585,21 @@ impl Scheduler {
             .expect("scheduler security switch hook not registered");
         switch_hook(prepared.old_space != prepared.next_space);
 
+        // KSA SMP TLS: saved kernel contexts include timer-return continuations,
+        // which reach IRET without the SYSRET TLS commit. Restore live task TLS
+        // for every incoming context, also before a kernel continuation can
+        // reblock and have its live pair sampled by the next switch-out.
+        // Outgoing TLS was captured in prepare_switch; IF remains clear here.
+        // IA32_GS_BASE still names this CPU's kernel metadata and is untouched.
+        unsafe {
+            use x86_64::registers::model_specific::Msr;
+            Msr::new(0xC000_0100).write(prepared.next_fs_base);
+            Msr::new(0xC000_0102).write(prepared.next_gs_base);
+        }
+
         let next_is_user = (prepared.next_cs & 0x3) == 0x3;
         if next_is_user {
             unsafe {
-                use x86_64::registers::model_specific::Msr;
-                const MSR_FS_BASE: u32 = 0xC000_0100;
-                const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-                Msr::new(MSR_FS_BASE).write(prepared.next_fs_base);
-                Msr::new(MSR_KERNEL_GS_BASE).write(prepared.next_gs_base);
                 process::publish_current_kcov_token(prepared.next_kcov_token);
                 switch_to_user(prepared.old_ctx_ptr, prepared.next_ctx_ptr);
             }
@@ -2601,6 +2706,12 @@ impl Scheduler {
             current_cpu().need_resched.store(false, Ordering::SeqCst);
             if let Some(prepared) = Self::prepare_switch() {
                 Self::execute_switch(prepared);
+                // This line runs on the restored task/bootstrap stack, after
+                // the outgoing save has completed. It is now safe to release
+                // the previous task's on_cpu gate and finish its reaper wake.
+                if !finish_pending_prev() {
+                    current_cpu().set_need_resched();
+                }
             }
         });
     }
@@ -2818,9 +2929,8 @@ pub fn run_bounded_selector_self_test() {
         assert!(scan(&queue, 0, None, &mut cursor, 0, 3).2);
     }
 
-    // Synchronous exit can wait indefinitely for another runnable task while
-    // timer IRQs wake its boot-CR3 retry loop. More than the maximum quantum of
-    // such wakes must never make the Zombie eligible for tick mutation.
+    // A contended terminal handoff can retry while timer IRQs wake its boot-CR3
+    // loop. Such wakes must never make the Zombie eligible for tick mutation.
     let mut exiting = Process::new(
         0x178_3700,
         1,
@@ -2836,6 +2946,58 @@ pub fn run_bounded_selector_self_test() {
     }
     assert_eq!(exiting.state, ProcessState::Zombie);
     assert_eq!(exiting.time_slice, exit_slice);
+
+    // KSA-011: production terminal/idle eligibility never abandons a live
+    // task or incomplete synchronous teardown, and never edits its on_cpu gate.
+    for state in [
+        ProcessState::Provisioning,
+        ProcessState::Running,
+        ProcessState::Ready,
+        ProcessState::Blocked,
+        ProcessState::Sleeping,
+        ProcessState::Stopped,
+        ProcessState::Terminated,
+    ] {
+        assert!(!terminal_needs_idle(state, false, false));
+        assert!(!terminal_needs_idle(state, true, false));
+        assert!(terminal_needs_idle(state, false, true));
+    }
+    assert!(!terminal_needs_idle(ProcessState::Zombie, false, false));
+    assert!(terminal_needs_idle(ProcessState::Zombie, true, false));
+    assert!(exiting.on_cpu.load(Ordering::Acquire));
+
+    // Exercise the actual saved-context validator with isolated CPU-lifetime
+    // storage. Metadata is captured separately from the subsequent asm save.
+    let bootstrap = BootstrapContext::new();
+    assert!(bootstrap.target().is_none());
+    let saved = bootstrap.prepare_save(0xffff_ffff_9000_8000, 0x1234, 0x5678);
+    assert!(bootstrap.target().is_none());
+    // SAFETY: this private fixture has one owner and no concurrent observer.
+    unsafe {
+        *saved = ArchContext::init_for_process(0xffff_ffff_8010_0100, 0x0fff_f000);
+        (*saved).rflags = 2;
+    }
+    let target = bootstrap.target().expect("saved kernel bootstrap context");
+    assert_eq!(target.context, saved.cast_const());
+    assert_eq!(target.kernel_stack_top, 0xffff_ffff_9000_8000);
+    assert_eq!((target.fs_base, target.gs_base), (0x1234, 0x5678));
+    for (cs, ss, rip, rsp, flags) in [
+        (0x23, 0x10, 0xffff_ffff_8010_0100, 0x0fff_f000, 2),
+        (8, 0x1b, 0xffff_ffff_8010_0100, 0x0fff_f000, 2),
+        (8, 0x10, 0x400000, 0x0fff_f000, 2),
+        (8, 0x10, 0xffff_ffff_8010_0100, 0, 2),
+        (8, 0x10, 0xffff_ffff_8010_0100, 0x0fff_f000, 0x202),
+    ] {
+        // SAFETY: only this fixture mutates its private context.
+        unsafe {
+            (*saved).cs = cs;
+            (*saved).ss = ss;
+            (*saved).rip = rip;
+            (*saved).rsp = rsp;
+            (*saved).rflags = flags;
+        }
+        assert!(bootstrap.target().is_none());
+    }
 }
 
 /// RF178-33 / P1-B: executable probe for identity-bound reap cleanup.
@@ -3145,6 +3307,7 @@ fn force_init_sched_locals() {
     READY_QUEUE.force_init();
     CURRENT_PROCESS.force_init();
     NEXT_CONTEXT_SHADOW.force_init();
+    BOOTSTRAP_CONTEXT.force_init(); // KSA-011: idle save/restore never lazily allocates with IF=0.
     PENDING_PREV_ON_CPU.force_init(); // R172-03: per-CPU finish_task_switch slot
 }
 
