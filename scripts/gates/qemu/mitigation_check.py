@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 
+MAX_EXEC_RETRIES = 64
+
 try:
     from qemu_fuzz_smoke import source_identity
 except ModuleNotFoundError:  # direct execution from the repository root
@@ -589,7 +591,8 @@ def verify_workload(serial, cpus):
             if state == "RETRY":
                 detail = re.fullmatch(r"attempt=(\d+) errno=(\d+)", fields)
                 require(detail is not None and phase == "exec" and int(detail[1]) > 0 and
-                        int(detail[2]) == 12, "malformed transient exec retry")
+                        int(detail[1]) <= MAX_EXEC_RETRIES and int(detail[2]) == 12,
+                        "malformed transient exec retry")
                 key = (phase, cpu, int(detail[1]))
                 require(key not in retries and 0 <= cpu < cpus and pid > 1,
                         "duplicate or invalid worker retry")
@@ -636,12 +639,18 @@ def verify_workload(serial, cpus):
         require(all(pid == expected_pid for (phase, retry_cpu, _), (pid, _) in retries.items()
                     if phase == "exec" and retry_cpu == cpu),
                 "worker retry changed process identity")
+        # A transient ENOMEM can be reported either by the forking image before
+        # exec succeeds (between fork PASS and the new image's BEGIN marker) or
+        # by a synthetic monitor fixture after BEGIN. Accept both bounded
+        # positions while rejecting retries outside the worker's lifecycle.
         begin_index = workers[("BEGIN", "exec", cpu)][1]
+        fork_pass_index = workers[("PASS", "fork", cpu)][1]
         pass_index = workers[("PASS", "exec", cpu)][1]
-        require(all(begin_index < index < pass_index
+        require(all((fork_pass_index < index < begin_index) or
+                    (begin_index < index < pass_index)
                     for (phase, retry_cpu, _), (_, index) in retries.items()
                     if phase == "exec" and retry_cpu == cpu),
-                "worker retry is outside its exec phase")
+                "worker retry is outside its exec lifecycle")
     exits = [(index, match[1]) for index, line in enumerate(lines)
              if (match := re.fullmatch(r"Process 1 terminated with exit code (\d+)", line))]
     require(len(exits) == 1 and exits[0][1] == "0" and exits[0][0] > finish_index,

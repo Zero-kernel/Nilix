@@ -319,8 +319,20 @@ class ObservationTests(unittest.TestCase):
             "MITIGATION-WORKER PASS phase=exec cpu=0 pid=2 calls=32 elapsed_ms=250 checksum=123",
             retry_line + "\nMITIGATION-WORKER PASS phase=exec cpu=0 pid=2 calls=32 elapsed_ms=250 checksum=123")
         proof.verify_workload(with_retry, 4)
+        retry_before_exec = serial.replace(
+            "MITIGATION-WORKER BEGIN phase=exec cpu=0 pid=2 affinity=1",
+            retry_line + "\nMITIGATION-WORKER BEGIN phase=exec cpu=0 pid=2 affinity=1",
+        )
+        proof.verify_workload(retry_before_exec, 4)
+        retry_before_fork = serial.replace(
+            "MITIGATION-WORKER BEGIN phase=fork cpu=0 pid=2 affinity=1",
+            retry_line + "\nMITIGATION-WORKER BEGIN phase=fork cpu=0 pid=2 affinity=1",
+        )
+        with self.assertRaises(proof.ProofFailure):
+            proof.verify_workload(retry_before_fork, 4)
         for malformed_retry in (with_retry.replace("attempt=1", "attempt=2"),
                                 with_retry.replace("errno=12", "errno=13"),
+                                with_retry.replace("attempt=1", "attempt=65"),
                                 with_retry.replace("phase=exec cpu=0 pid=2 attempt=1", "phase=fork cpu=0 pid=2 attempt=1"),
                                 with_retry + "\n" + retry_line):
             with self.assertRaises(proof.ProofFailure):
