@@ -1469,6 +1469,11 @@ fn ap_idle_loop() -> ! {
             }
         }
 
+        #[cfg(feature = "namespace_probe")]
+        if process_deferred_ready {
+            kernel_core::namespace_probe::step();
+        }
+
         // R70-1 FIX: narrow race-free window — disable IRQs only for the
         // need_resched check + sti;hlt arming so no IPI can slip in between.
         x86_64::instructions::interrupts::disable();

@@ -1488,6 +1488,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // runs with interrupts enabled and fails closed on a missing/invalid ACK.
     arch::smp::wait_for_process_deferred_acknowledgements();
 
+    #[cfg(feature = "namespace_probe")]
+    {
+        let mask = (0..64)
+            .filter(|&cpu| mm::tlb_shootdown::is_cpu_online(cpu))
+            .fold(0u64, |mask, cpu| mask | (1u64 << cpu));
+        kernel_core::namespace_probe::run(mask, || {
+            arch::ipi::broadcast_ipi(arch::ipi::IpiType::Reschedule);
+        });
     if let Some(process) = pending_usermode_process {
         let pid = process.lock().pid;
         match sched::enhanced_scheduler::Scheduler::add_process(process) {

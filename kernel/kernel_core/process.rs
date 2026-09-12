@@ -2258,6 +2258,22 @@ const _: () = assert!(
 );
 
 impl Process {
+    /// Test-profile support for borrowing an owned, unscheduled syscall stack.
+    /// Queue nonpublication remains the caller's separately audited obligation.
+    #[cfg(feature = "namespace_probe")]
+    pub fn owned_probe_stack_bounds(&self) -> Option<(usize, usize)> {
+        if self.on_cpu.load(Ordering::Acquire)
+            || self.state != ProcessState::Ready
+            || self.kernel_stack_phys.is_none()
+            || self.kernel_stack_rcu.is_none()
+        {
+            return None;
+        }
+        Some((
+            self.kernel_stack.as_u64() as usize,
+            self.kernel_stack_top.as_u64() as usize,
+        ))
+    }
     /// 创建新进程
     ///
     /// 默认以root权限运行（uid=0, gid=0），umask为标准0o022
