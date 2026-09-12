@@ -4169,7 +4169,13 @@ lazy_static::lazy_static! {
     static ref CPUSET_TASK_LEFT: Mutex<Option<CpusetTaskLeftCallback>> = Mutex::new(None);
     /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
-    static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
+static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
+}
+
+/// Return the immutable boot page-table template used to construct fresh
+/// address spaces. Callers must copy the pair and never mutate the root.
+pub(crate) fn boot_cr3_template() -> (PhysFrame<Size4KiB>, Cr3Flags) {
+    *BOOT_CR3
 }
 
 /// Detach the process-table backing when no published PCB remains.
@@ -10298,6 +10304,17 @@ unsafe fn free_page_table_level(
         // the private intermediate page-table frames are reclaimed below.
         let is_leaf = level == 1 || flags.contains(PageTableFlags::HUGE_PAGE);
         if is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            entry.set_unused();
+            continue;
+        }
+
+        // RF180-20 FIX: supervisor-only intermediate entries in the user-half
+        // are shared identity-map tables copied by `deep_copy_identity_for_user`.
+        // They are borrowed by every address space and must never be walked or
+        // returned to the buddy allocator during private user-AS teardown.
+        // User-owned ELF page-table branches retain USER_ACCESSIBLE at every
+        // intermediate level and continue through the recursive cleanup below.
+        if !is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
             entry.set_unused();
             continue;
         }

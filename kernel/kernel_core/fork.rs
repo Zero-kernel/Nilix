@@ -1837,6 +1837,14 @@ fn plan_clone_level(
             continue;
         }
 
+        // RF180-20 FIX: supervisor-only intermediate entries in the identity
+        // map are shared borrow paths, not user-owned COW leaves. Do not plan
+        // private descendants for them; the apply phase preserves the shared
+        // pointer directly. User-accessible branches remain fully planned.
+        if level > 1 && !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+            continue;
+        }
+
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             // 叶子节点：记录到计划中
             plan.record_leaf(entry)?;
@@ -1901,6 +1909,14 @@ fn build_child_clone_level(
     for idx in idx_range {
         let entry = &mut parent[idx];
         if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+
+        // RF180-20 FIX: preserve supervisor-only identity-map intermediates as
+        // shared pointers. Allocating private copies here would make teardown
+        // ambiguous and either corrupt the shared tree or leak the private one.
+        if level > 1 && !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+            child[idx] = entry.clone();
             continue;
         }
 
@@ -2333,7 +2349,10 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
     }
 
     // 获取当前页表根（复制内核映射）
-    let (current_frame, _) = Cr3::read();
+    // RF180-20 FIX: use the immutable boot CR3 template for fresh address
+    // spaces. Cloning the active user CR3 during exec can import private old
+    // image tables as stale supervisor-only aliases.
+    let (current_frame, _) = crate::process::boot_cr3_template();
 
     // 递归页表槽索引 (PML4[510] 指向 PML4 自身)
     const RECURSIVE_INDEX: usize = 510;
@@ -2415,7 +2434,7 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 ///
 /// The user PML4 root frame is privately owned. User-half entries are shared
 /// pointers into the kernel PML4's sub-tables and MUST NOT be recursively freed.
-/// Call `free_kpti_user_pml4()` to release only the root frame.
+/// Call `free_kpti_user_pml4()` to release the private root and entry PDPT.
 ///
 /// # Arguments
 ///
