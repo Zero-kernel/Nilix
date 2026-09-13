@@ -69,6 +69,7 @@ fn scan_test_files(manifest_dir: &str) -> Vec<PathBuf> {
 #[allow(dead_code)]
 struct TestMetadata {
     name: String,
+    runtime_name: Option<String>,
     category: Option<String>,
     priority: Option<String>,
     status: Option<String>,
@@ -90,6 +91,7 @@ fn parse_test_metadata(files: &[PathBuf]) -> Vec<TestMetadata> {
                 // Look for test functions (struct implementing RuntimeTest)
                 if line.contains("impl RuntimeTest for") {
                     let test_name = extract_test_name(line);
+                    let runtime_name = extract_runtime_name(&lines, i);
 
                     // Parse doc comments above this line
                     let mut doc_lines = Vec::new();
@@ -137,6 +139,7 @@ fn parse_test_metadata(files: &[PathBuf]) -> Vec<TestMetadata> {
 
                     let meta = TestMetadata {
                         name: test_name.clone(),
+                        runtime_name,
                         category,
                         priority,
                         status,
@@ -165,6 +168,34 @@ fn extract_test_name(line: &str) -> String {
         }
     }
     "UnknownTest".to_string()
+}
+
+/// Extract the literal returned by the implementation's `RuntimeTest::name`
+/// method. The generated manifest uses this execution name, which lets the
+/// boot registry compare source discovery with the actual hand-maintained
+/// `RuntimeTest` objects instead of comparing a manifest to itself.
+fn extract_runtime_name(lines: &[&str], impl_line: usize) -> Option<String> {
+    let mut in_name = false;
+    for line in lines.iter().skip(impl_line).take(256) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("fn name") {
+            in_name = true;
+            continue;
+        }
+        if !in_name {
+            continue;
+        }
+        if trimmed.starts_with("fn ") || trimmed.starts_with("impl ") {
+            break;
+        }
+        if let Some(start) = trimmed.find('"') {
+            let rest = &trimmed[start + 1..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
 }
 
 fn extract_field(doc_lines: &[&str], field: &str) -> Option<String> {
@@ -390,7 +421,10 @@ fn generate_registry_validation(out_dir: &str, metadata: &[TestMetadata]) {
     generated.push_str("pub const DISCOVERED_RUNTIME_TEST_NAMES: &[&str] = &[\n");
     for test in metadata {
         generated.push_str("    ");
-        generated.push_str(&format!("{:?},\n", test.name));
+        generated.push_str(&format!(
+            "{:?},\n",
+            test.runtime_name.as_deref().unwrap_or(&test.name)
+        ));
     }
     generated.push_str("];\n");
     generated.push_str(&format!(
@@ -412,7 +446,10 @@ fn generate_registry_validation(out_dir: &str, metadata: &[TestMetadata]) {
         };
         generated.push_str(&format!(
             "    TestDescriptor::new({:?}, {:?}, TestCategory::{}, TestPriority::{}, TestStatus::{}, {:?}),\n",
-            test.name.to_ascii_lowercase(),
+            test.runtime_name
+                .as_deref()
+                .unwrap_or(&test.name)
+                .to_ascii_lowercase(),
             test.name,
             category,
             priority,
