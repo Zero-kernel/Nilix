@@ -86,6 +86,8 @@
 //! | PROCESS_TABLE | kernel_core/process.rs | 5 | Array<Option<Arc<Mutex>>> | Global |
 //! | CGROUP_REGISTRY | kernel_core/cgroup.rs | 5 | spin::RwLock<BTreeMap> | Global; NON-reentrant, take-and-drop only; IRQ/scheduler-context readers MUST use `try_lookup_cgroup` (R169-2/R170-1: blocking read vs IRQs-enabled writer = same-CPU self-deadlock) |
 //! | CgroupNode.limits | kernel_core/cgroup.rs | 5 | Mutex<CgroupLimits> | Per-node leaf; snapshot-then-drop, never 2 held; IRQ/scheduler-context readers MUST use `try_lock` (R170-1: `set_limits` holds it IRQs-enabled — `get_effective_cpu_weight`/`charge_cpu_quota`/`cpu_quota_is_throttled` are the converted readers) |
+//! | CPUSET_REGISTRY | sched/cpuset.rs | 5 | LockdepRwLock<Option<CpusetRegistry>> | Global cpuset topology; scheduler paths use only the non-blocking `try_read` form while a ready-queue lock is held |
+//! | ROOT_CPUSET | sched/cpuset.rs | 5 | LockdepMutex<Option<Arc<CpusetNode>>> | Global root pointer; publish once during cpuset init and clone before releasing |
 //! | VFS_ROOT | vfs/lib.rs | 6 | Arc<dyn Fs> | Global |
 //!
 //! ## J2-SHARED-CORE: cgroup charge/uncharge lock invariant
