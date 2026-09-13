@@ -62,6 +62,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(check(FAILED + SUMMARY + "\n").status, 1)
 
     def test_pid1_must_be_exact_unique_success_after_summary(self):
+        self.assertEqual(check(CLEAN.replace(PID1, "/ nilix# " + PID1)).status, 0)
         for replacement in ("", "Process 1 exited", PID1 + "0", PID1 + " trailing", PID1 + "\n" + PID1):
             with self.subTest(replacement=replacement):
                 self.assertNotEqual(check(CLEAN.replace(PID1, replacement)).status, 0)

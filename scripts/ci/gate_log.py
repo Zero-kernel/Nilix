@@ -16,7 +16,10 @@ SUMMARY = re.compile(
     r"=== Test Summary: ([0-9]+) passed, ([0-9]+) deferred"
     r"(?: \([^()\r\n]*\))?, ([0-9]+) failed ==="
 )
-PID1_EXIT = re.compile(r"Process 1 exited with code (-?[1-9][0-9]*|0)")
+# The interactive guest shell may print its prompt before this marker on the
+# same serial line. Accept that prefix, but require the exit record to end the
+# line so appended garbage cannot satisfy completion.
+PID1_EXIT = re.compile(r"Process 1 exited with code (-?[1-9][0-9]*|0)\s*$")
 SERIAL_FATAL = re.compile(
     r"\bKERNEL PANIC\b|\bpanicked at\b|\bPANIC:|"
     r"\[(?:PF ENTRY|PAGE FAULT|DOUBLE FAULT|GPF|#UD|FATAL)\]|\btriple fault\b",
@@ -181,7 +184,7 @@ def evaluate(
     for line_number, line in enumerate(lines):
         if "Process 1 exited" in line:
             exit_candidates.append(line_number)
-        match = PID1_EXIT.fullmatch(line)
+        match = PID1_EXIT.search(line)
         if match:
             exit_status = int(match[1])
             exits.append((line_number, exit_status))

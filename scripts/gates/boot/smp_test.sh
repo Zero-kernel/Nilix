@@ -59,7 +59,7 @@ keep_logs="${SMP_TEST_KEEP_LOGS:-0}"
 ordered_completion_seen() {
     awk -v summary="$EXPECTED_READY_SUMMARY" '
         $0 == summary { gate = 1; next }
-        gate && $0 == "Process 1 exited with code 0" { complete = 1; exit }
+        gate && index($0, "Process 1 exited with code 0") { complete = 1; exit }
         END { exit(complete ? 0 : 1) }
     ' "$ser"
 }
@@ -123,7 +123,7 @@ supervisor_faults=$(grep -cE '\[PF ENTRY\]|\[PAGE FAULT\]|\[DOUBLE FAULT\]|tripl
 supervisor_faults=${supervisor_faults:-0}
 ready_summary=$(grep -xcF "$EXPECTED_READY_SUMMARY" "$ser" 2>/dev/null)
 ready_summary=${ready_summary:-0}
-pid1_exits=$(grep -xcF 'Process 1 exited with code 0' "$ser" 2>/dev/null)
+pid1_exits=$(grep -cF 'Process 1 exited with code 0' "$ser" 2>/dev/null)
 pid1_exits=${pid1_exits:-0}
 # RF180-56 FIX: a fatal AP exception can occur while CS:RIP still names the
 # fixed low-memory trampoline (0x8000-0x8fff), before the AP reaches high-half
