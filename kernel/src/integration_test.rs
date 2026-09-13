@@ -54,6 +54,14 @@ pub fn test_scheduler() {
 pub fn test_fork_framework() {
     klog_always!("  [TEST] Fork System Call Framework...");
     kernel_core::fork::run_cow_refcount_self_test();
+    // ST-K2-P2: this oracle drives copy_page_table_cow to an induced failure over
+    // a deliberately synthetic page-table tree (its entry-island PML4[511] points
+    // at a zeroed PDPT). KPTI is enabled unconditionally (main.rs), so that path
+    // also derives a user root through create_kpti_user_pml4, and the mitigation
+    // proof's probe asserts that the real kernel layout samples (text/data/heap/
+    // stack) resolve in every root it inspects — which a synthetic root cannot
+    // satisfy. Run it in every ordinary guest and skip only that proof build.
+    #[cfg(not(feature = "mitigation_probe"))]
     kernel_core::fork::run_cow_failure_cleanup_self_test();
     kernel_core::syscall::run_cow_mprotect_self_test();
     kernel_core::pid_namespace::run_shutdown_creation_self_test();
