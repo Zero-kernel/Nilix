@@ -402,9 +402,10 @@ impl VirtQueue {
                     elem.id,
                     self.size
                 );
-                // Skip this invalid entry
-                self.last_used_idx
-                    .store(last.wrapping_add(1), Ordering::Relaxed);
+                // The entry cannot be reconciled with request metadata.
+                // Quarantine the queue and leave the cursor unchanged so the
+                // timeout/reset path can reclaim every outstanding request.
+                self.fatal.store(true, Ordering::Release);
                 return None;
             }
 
@@ -427,6 +428,11 @@ impl VirtQueue {
     #[inline]
     fn clear_fatal(&self) {
         self.fatal.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Acquire)
     }
 }
 
@@ -1333,6 +1339,14 @@ impl VirtioBlkDevice {
             return Err(BlockError::Offline);
         }
 
+        // RF188-3 FIX: A malformed used-ring entry poisons the queue even
+        // when no request is currently outstanding. Reset before allocating a
+        // new request so a fatal queue cannot degrade into a permanent Busy
+        // response with no recovery trigger.
+        if self.queue.is_fatal() {
+            self.reset_device(&_lock)?;
+        }
+
         // Get a request buffer
         let buf_idx = {
             let mut buffers = self.req_buffers.lock();
@@ -1769,6 +1783,13 @@ impl BlockDevice for VirtioBlkDevice {
         let _lock = self.lock.lock();
         if self.device_failed.load(Ordering::Acquire) {
             return Err(BlockError::Offline);
+        }
+
+        // RF188-3 FIX: Recover a poisoned queue before issuing a standalone
+        // flush; otherwise a malformed completion with no pending I/O would
+        // leave every later flush permanently Busy.
+        if self.queue.is_fatal() {
+            self.reset_device(&_lock)?;
         }
 
         // Acquire a request buffer slot
