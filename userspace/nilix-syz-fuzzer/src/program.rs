@@ -31,7 +31,7 @@ pub const SYS_SCHED_GETAFFINITY: u32 = 204;
 pub const SYS_CLOCK_GETTIME: u32 = 228;
 pub const SYS_GETRANDOM: u32 = 318;
 
-const PURE_NOARG_SYSCALLS: &[u32] = &[
+pub const PURE_NOARG_SYSCALLS: &[u32] = &[
     SYS_SCHED_YIELD,
     SYS_GETPID,
     SYS_GETUID,

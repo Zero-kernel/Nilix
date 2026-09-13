@@ -1009,6 +1009,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn serial_offsets_are_exact_and_fatal_evidence_survives_tail_eviction() {
         use std::io::Write;
         let binding = binding();
