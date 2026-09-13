@@ -1,6 +1,6 @@
 # Security Audit and Qualification Status
 
-**Updated:** 2026-09-12 · **Current source:** e127c34; hosted count follow-up is pending.
+**Updated:** 2026-09-14 · **Current source:** local P0-A implementation working tree; remote exact-tree gates recorded in the P0-A validation copy.
 **Release:** 1.0-Preview **BLOCKED**; recorded clean full-audit streak **0/3**.
 
 This document separates historical audit closure, scoped repair evidence and
@@ -14,10 +14,11 @@ capabilities are in the [roadmap](roadmap.md); remaining work is in the
 | --- | --- | --- |
 | KSA-2026-09-06 | KSA-001..020 accepted within their original rubrics | Does not close unrelated R186/R188/feature debt or qualify every platform |
 | KSA plan | 17/18 scoped complete; P3-2 partial | Physical VT-d qualification remains unavailable |
+| P0-A/R186-4 implementation | Admission-first fork snapshot, reservation handoff and fallible VMA oracles applied; exact final source remotely verified in `/tmp/zero-os-codex-final-20260913` on `40c-devbox-ts` (MM 26/26, kernel-core 68/68, hosted/build/lint PASS) | Runtime/boot/SMP are zero-failure qualified with deferred checks and musl is incomplete because required guest markers are absent; strict guest/platform qualification remains pending |
 | RF180-20 | Shared supervisor page-table teardown/COW/fresh-exec ownership repaired and independently reviewed | Final v51 workload/source evidence; later changes need affected-path regression |
 | P3-2 QEMU continuation | Q35/EDU nonidentity DMA, mapping replacement, remapped MSI, fault quarantine/detach and IRTE reuse accepted | Physical endpoints, MSI-X and broad topology are separate rows |
 | CI on e127c34 | Hosted debug/release reached 63 vfs tests but the allowlist still expected 62; QEMU jobs were independently in progress/failed during this run | Count fix is in the current tree; complete rerun is required |
-| Current hosted definition | 438 counted test executions/profile, CpuLocal doctests and three compile checks | Host-safe allowlist, not full privileged execution or code coverage |
+| Current hosted definition | Remote validation copy: 438 counted executions/profile, CpuLocal doctest and three compile checks; current local allowlist: 439 after the MM regression and VFS 63-test tree | The remote copy retains a pre-existing VFS 62-test baseline; this is a host-safe allowlist, not full privileged execution or code coverage |
 
 The final KSA review (`reviewfix-2026-09-11-v2.md`) records
 14/14 remaining findings PASS scoped, adding to the six previously accepted.
@@ -28,10 +29,7 @@ public gate definitions or a later exact-tree run.
 
 ## Carried release obligations
 
-- **R186-4 / P0-A / D1-RES-HEAP-ADMISSION-REOPENED:** VMA/PT metadata uses
-  AdmittedMap, but fork still allocates its snapshot before admission and the
-  charged constructor still calls shrink_to_fit. The original mechanism review,
-  charge-symmetry and current live-delta/pressure gates remain open.
+- **R186-4 / P0-A / D1-RES-HEAP-ADMISSION-REOPENED:** The implementation reserves CoreProcess admission before fork snapshot allocation, transfers one reservation into the admitted map, removes infallible `shrink_to_fit`, and preserves ordered backing/reservation cleanup on constructor and map mismatch paths. The induced COW/PT/child-publication oracle passes, with two independent U23 lenses and final remote MM 26/26, kernel-core 68/68, hosted, build and lint verification passing on `/tmp/zero-os-codex-final-20260913` on `40c-devbox-ts`. Runtime/boot/4-core SMP are zero-failure qualified; valid-prefix/KPTI-allocation-failure variants, the bounded CorruptState fail-stop policy, musl markers and strict guest/platform qualification remain explicit limits.
 - **R188 review lineage:** August remediation is recorded, but the newer KSA
   verdicts cover a different rubric. Reconcile original IDs to current source/
   independent review and review uncovered rows. Reuse exact accepted overlaps;
@@ -53,7 +51,7 @@ the carried HIGH is not a guarantee that no other defects exist.
 | --- | --- |
 | R186 / RF186 (source ledger below) | 16/17 actionables repaired; RF186-1..24 repaired; R186-4 carried |
 | R187 / RF187 (source ledger below) | Seven KCOV findings and eight repair defects closed; no carried-debt streak credit |
-| [R188 standalone](security/full-codebase-audit-2026-08-07.md) | August remediation records three HIGH and 24 MEDIUM repairs; original review reconciliation and explicit design residuals retained |
+| [R188 standalone](security/full-codebase-audit-2026-08-07.md) | 2026-09-13 reviewfix maps all 131 originals: 123 PASS, 3 PARTIAL, 5 verification pending; no clean-round credit |
 | KSA audit / final review (source ledger below) | September 20/20 scoped findings accepted; not a new R-series clean round |
 | P3-2 continuation (source ledger below) | QEMU endpoint qualification slice accepted September 12; physical rows pending |
 
@@ -94,7 +92,11 @@ the P3-2 v3 input manifest is
 Those historical input identities differ from the current Git revision.
 The [CI guide](ci-testing.md) and [VT-d matrix](vtd-support-matrix.md) supply
 public reproduction entrypoints and supported-mode boundaries. Missing original
-review artifacts still leave the corresponding R188 mapping rows pending.
+The 2026-09-13 reviewfix report maps all 131 original R188 rows to current source
+and independent review. U16-1 remains partial; U23-1/U23-2 safe API paths now pass two
+independent lenses, with intentional CorruptState fail-stop retained as a policy residual.
+U34-1 and U46-1 remain verification pending for focused live oracles; U37-1, U55-6 and U29-3
+remain explicit design or feature limits.
 
 ## Explicit support limits
 
