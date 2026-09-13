@@ -20487,6 +20487,25 @@ fn sys_cgroup_set_limit(
     }
 
     let cgroup_node = cgroup::lookup_cgroup(cgroup_id).ok_or(SyscallError::ENOENT)?;
+    let previous_limits = cgroup_node.limits();
+    let old_value = match limit_type {
+        CGROUP_LIMIT_CPU_WEIGHT => previous_limits.cpu_weight.map(u64::from).unwrap_or(0),
+        CGROUP_LIMIT_CPU_MAX => previous_limits
+            .cpu_max
+            .map(|(max_us, period_us)| {
+                (max_us.min(u32::MAX as u64) << 32) | period_us.min(u32::MAX as u64)
+            })
+            .unwrap_or(0),
+        CGROUP_LIMIT_MEMORY_MAX => previous_limits.memory_max.unwrap_or(0),
+        CGROUP_LIMIT_MEMORY_HIGH => previous_limits.memory_high.unwrap_or(0),
+        CGROUP_LIMIT_PIDS_MAX => previous_limits.pids_max.unwrap_or(0),
+        CGROUP_LIMIT_IO_MAX_BPS => previous_limits.io_max_bytes_per_sec.unwrap_or(0),
+        CGROUP_LIMIT_IO_MAX_IOPS => previous_limits.io_max_iops_per_sec.unwrap_or(0),
+        CGROUP_LIMIT_FILES_MAX => previous_limits.fds_max.unwrap_or(u64::MAX),
+        CGROUP_LIMIT_PORTS_MAX => previous_limits.ports_max.unwrap_or(u64::MAX),
+        CGROUP_LIMIT_VFS_DIR_MAX => previous_limits.vfs_dir_max.unwrap_or(u64::MAX),
+        _ => return Err(SyscallError::EINVAL),
+    };
 
     let mut limits = cgroup::CgroupLimits::default();
 
@@ -20561,7 +20580,7 @@ fn sys_cgroup_set_limit(
                 get_audit_subject(),
                 audit::AuditCgroupGovernanceOp::SetLimit,
                 cgroup_id,
-                0,
+                old_value,
                 value,
                 limit_type as u64,
                 crate::time::get_ticks(),
