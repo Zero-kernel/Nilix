@@ -1325,6 +1325,11 @@ pub struct MmState {
     /// construction and growth, and uncharges on Drop. This closes the VMA metadata admission gap.
     pub mmap_regions: mm::AdmittedMap<usize, crate::syscall::MmapEntry>,
 
+    /// ST-K2-P2: demand-paged shared-anonymous regions keyed by their VMA
+    /// base.  The Arc is cloned into regular fork children and shared directly
+    /// by CLONE_VM siblings through the enclosing MmState Arc.
+    pub shared_regions: mm::AdmittedMap<usize, Arc<crate::fork::SharedAnonRegion>>,
+
     /// Heap start address (page-aligned end of ELF BSS)
     pub brk_start: usize,
 
@@ -1499,6 +1504,7 @@ impl MmState {
         Self {
             // R186-4 FIX: Initialize with CoreProcess HeapClass for admission control
             mmap_regions: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            shared_regions: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             brk_start: 0,
             brk: 0,
             next_mmap_addr,
@@ -10124,6 +10130,7 @@ fn free_process_resources(
     // still reference this mm — non-last exit must NOT uncharge cgroup memory.
     let mm_shared = Arc::strong_count(&proc.mm) > 1;
     let mut mm = proc.mm.lock();
+    let mut shared_regions_to_drop = None;
 
     let region_count = mm.mmap_regions.len();
     // R123-5 FIX: Mask low-bit flags (PENDING/PROT_NONE) before summing,
@@ -10172,10 +10179,17 @@ fn free_process_resources(
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
     if !keep_address_space && !mm_shared && proc.memory_space != 0 {
         let cgroup_id = proc.cgroup_id;
+        // Detach shared-region metadata now, but defer dropping the Arcs until
+        // after page-table teardown below.  The region pin must outlive every
+        // PTE release so a final refcount decision cannot free a mapped frame.
+        shared_regions_to_drop = Some(core::mem::replace(
+            &mut mm.shared_regions,
+            mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+        ));
         for (_base, len_with_flags) in mm.mmap_regions.iter() {
             // R172-22: annotate value type (opaque iter() + Borrow-generic map).
             let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
-            if len_with_flags.is_prot_none() {
+            if len_with_flags.is_prot_none() || len_with_flags.is_shared() {
                 continue;
             }
             let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
@@ -10326,6 +10340,11 @@ fn free_process_resources(
             proc.memory_space = 0;
         }
     }
+
+    // Drop shared regions only after all address-space leaves have been
+    // detached.  This releases each region pin and first-toucher charge in a
+    // process context, outside the Process/MmState critical section.
+    drop(shared_regions_to_drop);
 
     // R114-1 FIX: IPC endpoint cleanup and cpuset task accounting are now performed
     // by `cleanup_zombie()` AFTER releasing PROCESS_TABLE, to avoid deadlocks from
@@ -10705,7 +10724,7 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .iter()
         .filter_map(
             |(_base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
-                if len_with_flags.is_prot_none() {
+                if len_with_flags.is_prot_none() || len_with_flags.is_shared() {
                     return None;
                 }
                 let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
@@ -11173,8 +11192,8 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
             };
             let rss_bytes = mm_state
                 .mmap_regions
-                .values()
-                .fold(0usize, |total, &entry| {
+                .iter()
+                .fold(0usize, |total, (&base, &entry)| {
                     // U05-1 FIX: PROT_NONE VMAs reserve address space but do
                     // not own resident frames. Counting them as RSS lets a
                     // process win OOM victim selection merely by reserving a
@@ -11182,6 +11201,15 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
                     // cgroup charge invariant and skip non-resident entries.
                     if entry.is_prot_none() {
                         total
+                    } else if entry.is_shared() {
+                        // Shared-anonymous regions are demand-paged; charge
+                        // only materialized resident pages to OOM selection.
+                        let resident = mm_state
+                            .shared_regions
+                            .get(&base)
+                            .map(|region| region.resident_pages())
+                            .unwrap_or(0);
+                        total.saturating_add(resident.saturating_mul(4096))
                     } else {
                         total.saturating_add(crate::syscall::mmap_region_len(entry))
                     }

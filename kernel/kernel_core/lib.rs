@@ -95,7 +95,7 @@ pub use elf_loader::{
 // and the usermode_test boot diagnostic (the real M0 musl gate path).
 pub use fork::{
     create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4, sys_fork, ForkError,
-    ForkResult, PAGE_REF_COUNT,
+    ForkResult, SharedAnonRegion, SharedFaultResult, SharedPage, PAGE_REF_COUNT,
 };
 pub use process::{
     add_supplementary_group,

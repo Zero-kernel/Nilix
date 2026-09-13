@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
-use mm::{arc_charge_bytes, try_reserve_heap, AdmittedMap, HeapClass};
+use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, AdmittedMap, HeapClass};
 use spin::Mutex;
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
@@ -415,6 +415,10 @@ fn fork_inner(
     // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
     // Lock ordering: Process (held) → MmState — never reverse.
     let _mm_fork_reservation = ForkMmReservation::acquire(Arc::clone(&parent.mm))?;
+    // ST-K2-P2: snapshot shared-anonymous ranges while the parent MmState is
+    // already locked below. The admitted temporary vector lives through the
+    // PT transaction and is dropped only after the child view is prepared.
+    let mut shared_ranges = mm::AdmittedVec::<(usize, usize)>::new(HeapClass::CoreProcess);
     // ST-K3 fork-DF diagnosis: coarse stage tags (debug builds only).
     #[cfg(debug_assertions)]
     kprintln!("[FORKDIAG] FD1 reservation");
@@ -718,10 +722,22 @@ fn fork_inner(
                 "fork snapshot must own the shared-MM reservation"
             );
 
+            for (&base, entry) in parent_mm.mmap_regions.iter() {
+                let entry: &crate::syscall::MmapEntry = entry;
+                if entry.is_shared() {
+                    let end = base
+                        .checked_add(crate::syscall::mmap_region_len(*entry))
+                        .ok_or(ForkError::MemoryAllocationFailed)?;
+                    shared_ranges
+                        .try_push((base, end))
+                        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+                }
+            }
+
             let mut charge_bytes = 0u64;
             for (_base, entry) in parent_mm.mmap_regions.iter() {
                 let entry: &crate::syscall::MmapEntry = entry;
-                if !entry.is_prot_none() {
+                if !entry.is_prot_none() && !entry.is_shared() {
                     charge_bytes =
                         charge_bytes.saturating_add(crate::syscall::mmap_region_len(*entry) as u64);
                 }
@@ -743,38 +759,73 @@ fn fork_inner(
             if region_count > crate::syscall::MAX_MAP_COUNT {
                 return Err(ForkError::MemoryAllocationFailed);
             }
-            let mut snap: Vec<(usize, crate::syscall::MmapEntry)> = Vec::new();
-            if snap.try_reserve_exact(region_count).is_err() {
-                return Err(ForkError::MemoryAllocationFailed);
-            }
-            // D2 Phase 2: strip transient flags via the typed accessor (clears
-            // PENDING_*, preserves PROT_NONE + prot bits — load-bearing for the
-            // child's cgroup-charge skip).
-            snap.extend(parent_mm.mmap_regions.iter().map(
-                |(&base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
-                    (base, len_with_flags.fork_stripped())
-                },
-            ));
-
-            // R186-4 FIX: Construct child's mmap_regions with charged admission.
-            // The snap Vec is already allocated and populated; from_sorted_vec_charged
-            // charges the Vec's capacity (not len) to CoreProcess heap class before
-            // constructing the AdmittedMap. On admission failure, the Vec is returned
-            // for cleanup and we return ENOMEM to the fork caller.
-            let child_mmap_regions =
-                match mm::AdmittedMap::from_sorted_vec_charged(snap, mm::HeapClass::CoreProcess) {
+            // R186-4 FIX: reserve the exact snapshot backing before asking the
+            // allocator for it. The reservation is handed to the map constructor
+            // after population, so this path cannot double-reserve or allocate
+            // outside the CoreProcess admission ledger.
+            let child_mmap_regions = if region_count == 0 {
+                // Avoid the published-ledger precondition for a zero-sized map.
+                mm::AdmittedMap::new(mm::HeapClass::CoreProcess)
+            } else {
+                let snapshot_bytes =
+                    vec_charge_bytes::<(usize, crate::syscall::MmapEntry)>(region_count)
+                        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+                let reservation = try_reserve_heap(HeapClass::CoreProcess, snapshot_bytes)
+                    .map_err(|_| ForkError::MemoryAllocationFailed)?;
+                let mut snap: Vec<(usize, crate::syscall::MmapEntry)> = Vec::new();
+                if snap.try_reserve_exact(region_count).is_err() {
+                    // Dropping the armed reservation rolls back both ledger lanes.
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+                // D2 Phase 2: strip transient flags via the typed accessor (clears
+                // PENDING_*, preserves PROT_NONE + prot bits, which are load-bearing
+                // for the child's cgroup-charge skip).
+                snap.extend(parent_mm.mmap_regions.iter().map(
+                    |(&base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
+                        (base, len_with_flags.fork_stripped())
+                    },
+                ));
+                match mm::AdmittedMap::from_sorted_vec_with_reservation(snap, reservation) {
                     Ok(map) => map,
-                    Err((snap, _error)) => {
+                    Err(error) => {
+                        let (snap, reservation, _error) = error.into_parts();
+                        // Release the backing reservation only after the
+                        // returned Vec has been destroyed.
                         drop(snap);
+                        drop(reservation);
                         return Err(ForkError::MemoryAllocationFailed);
                     }
-                };
+                }
+            };
+
+            // ST-K2-P2: shared-anonymous region metadata is a second admitted
+            // map.  Its values are Arc handles to the parent's page slots, so
+            // regular fork inherits the same demand-paged frames and region
+            // pin; CLONE_VM already shares this MmState directly.
+            let mut child_shared_regions = mm::AdmittedMap::new(mm::HeapClass::CoreProcess);
+            if parent_mm.shared_regions.len() > crate::syscall::MAX_MAP_COUNT {
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            if child_shared_regions
+                .try_reserve(parent_mm.shared_regions.len())
+                .is_err()
+            {
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            for (&base, region) in parent_mm.shared_regions.iter() {
+                if child_shared_regions
+                    .try_insert(base, Arc::clone(region))
+                    .is_err()
+                {
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+            }
 
             let child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
                 // child's region map is now a `FallibleOrderedMap`, adopted in
-                // O(1) with NO allocation from the already-sorted, already
-                // try_reserve'd `snap` Vec. The prior infallible
+                // O(1) with NO allocation from the already-sorted, admission-
+                // reserved `snap` Vec. The prior infallible
                 // `BTreeMap::collect()` (which could abort under OOM with up to
                 // MAX_MAP_COUNT entries) is eliminated: every allocation on this
                 // path is now the fallible `try_reserve_exact` on `snap` above,
@@ -782,9 +833,10 @@ fn fork_inner(
                 // strictly key-sorted because it is built from the parent's
                 // ordered `mmap_regions.iter()` (debug-asserted by from_sorted_vec).
                 //
-                // R186-4 FIX: Migrated to AdmittedMap with from_sorted_vec_charged,
+                // R186-4 FIX: Migrated to AdmittedMap with the reservation handoff,
                 // which charges the Vec capacity to CoreProcess before adoption.
                 mmap_regions: child_mmap_regions,
+                shared_regions: child_shared_regions,
                 brk_start: parent_mm.brk_start,
                 brk: parent_mm.brk,
                 next_mmap_addr: parent_mm.next_mmap_addr,
@@ -920,7 +972,11 @@ fn fork_inner(
         }
         let child_memory_space = child_root_frame.start_address().as_u64() as usize;
         let child_user_memory_space = unsafe {
-            match copy_page_table_cow(parent_root, child_memory_space) {
+            match copy_page_table_cow_with_shared(
+                parent_root,
+                child_memory_space,
+                shared_ranges.as_slice(),
+            ) {
                 Ok(user_memory_space) => user_memory_space,
                 Err(error) => {
                     // copy_page_table_cow guarantees the root's user half is
@@ -1127,6 +1183,18 @@ pub unsafe fn copy_page_table_cow(
     parent_page_table: usize,
     child_page_table: usize,
 ) -> Result<usize, ForkError> {
+    copy_page_table_cow_with_shared(parent_page_table, child_page_table, &[])
+}
+
+/// COW clone with a pre-snapshotted set of shared-anonymous virtual ranges.
+/// Shared leaves are copied with their original writable flags and consume one
+/// additional `PAGE_REF_COUNT` mapping reference; all other leaves use private
+/// COW semantics.
+pub unsafe fn copy_page_table_cow_with_shared(
+    parent_page_table: usize,
+    child_page_table: usize,
+    shared_ranges: &[(usize, usize)],
+) -> Result<usize, ForkError> {
     // R67-6 FIX: Hold PT_LOCK during entire COW setup to prevent concurrent
     // mmap/munmap/pagefault from racing with parent PTE modifications.
     with_pt_lock(|| {
@@ -1147,7 +1215,7 @@ pub unsafe fn copy_page_table_cow(
         // Z-8 fix: 两阶段 COW
         // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
         let mut plan = CowClonePlan::new();
-        plan_clone_level(parent_pml4, 4, &mut plan)?;
+        plan_clone_level(parent_pml4, 4, 0, shared_ranges, &mut plan)?;
         #[cfg(debug_assertions)]
         kprintln!(
             "[FORKDIAG] FD4 planned leaves={} tables={}",
@@ -1171,6 +1239,8 @@ pub unsafe fn copy_page_table_cow(
             &plan,
             &mut leaf_cursor,
             4,
+            0,
+            shared_ranges,
         );
         debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
         debug_assert!(frame_iter.next().is_none());
@@ -1522,6 +1592,407 @@ enum CowUniqueClaim {
 /// Teardown treats it as invalid/leak-safe rather than as an untracked frame.
 const COW_UNIQUE_CLAIMED: u32 = u32::MAX;
 
+/// ST-K2-P2: one shared-anonymous mapping's demand-paged ownership state.
+///
+/// The region owns one PAGE_REF_COUNT pin for every materialized frame.  Each
+/// PTE adds one mapping reference; the region pin is released only when the
+/// final address-space metadata Arc is dropped.  Slots are preallocated at
+/// mmap time so the page-fault path never grows a collection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedPage {
+    pub phys_addr: usize,
+    pub owner: crate::cgroup::CgroupId,
+}
+
+/// Result of attempting to resolve a non-present shared-anonymous page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedFaultResult {
+    Handled,
+    Busy,
+    NotShared,
+    Fatal(CowFaultFailure),
+}
+
+/// Fixed-storage frame allocator for the shared #PF path.  Mapping one 4 KiB
+/// leaf can allocate at most three intermediate tables (PDPT/PD/PT), so no
+/// heap-backed bookkeeping is needed while interrupts are disabled.
+struct SharedFaultFrameAllocator<'a> {
+    buddy: &'a mut mm::buddy_allocator::BuddyAllocator,
+    pt_frames: [Option<PhysFrame>; 3],
+    pt_len: usize,
+}
+
+const SHARED_FAULT_PT_PAGES: usize = 3;
+const SHARED_FAULT_PAGE_SIZE: u64 = 0x1000;
+
+impl<'a> SharedFaultFrameAllocator<'a> {
+    fn new(buddy: &'a mut mm::buddy_allocator::BuddyAllocator) -> Self {
+        Self {
+            buddy,
+            pt_frames: [None, None, None],
+            pt_len: 0,
+        }
+    }
+
+    fn allocate_data_frame(&mut self) -> Option<PhysFrame> {
+        self.buddy.alloc_pages(0)
+    }
+
+    fn deallocate_frame(&mut self, frame: PhysFrame) {
+        self.buddy.free_pages(frame, 0);
+    }
+
+    fn pt_bytes(&self) -> u64 {
+        (self.pt_len as u64) * SHARED_FAULT_PAGE_SIZE
+    }
+
+    fn tracked_pt_frames(&self) -> &[Option<PhysFrame>; SHARED_FAULT_PT_PAGES] {
+        &self.pt_frames
+    }
+
+    /// Detach empty page-table frames created by a failed `map_page` call.
+    ///
+    /// `map_to` can publish intermediate tables before it discovers that the
+    /// leaf cannot be installed.  The rollback helper clears only tables that
+    /// are proven empty and leaves upper tables reachable when a peer root may
+    /// alias them.  Any retained frames remain charged in the inherited PT
+    /// basis and are reclaimed with the address space.
+    unsafe fn rollback_pt_tables(
+        &mut self,
+        manager: &mut mm::page_table::PageTableManager,
+        virt: VirtAddr,
+    ) -> usize {
+        let mut reclaimed = [None; SHARED_FAULT_PT_PAGES];
+        let rollback = manager.rollback_tracked_leaf_tables(
+            virt,
+            SHARED_FAULT_PAGE_SIZE as usize,
+            self.tracked_pt_frames(),
+            self.pt_len,
+            &mut reclaimed,
+            false,
+        );
+        if !rollback.all_accounted {
+            // Unknown ownership is quarantined.  Keeping every frame live is
+            // over-accounting, while freeing an unproven frame risks UAF.
+            return self.pt_len;
+        }
+        let mut reclaimed_count = 0;
+        for frame in reclaimed.into_iter().flatten() {
+            self.deallocate_frame(frame);
+            reclaimed_count += 1;
+        }
+        self.pt_len.saturating_sub(reclaimed_count)
+    }
+}
+
+unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for SharedFaultFrameAllocator<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        if self.pt_len == self.pt_frames.len() {
+            return None;
+        }
+        let frame = self.buddy.alloc_pages(0)?;
+        self.pt_frames[self.pt_len] = Some(frame);
+        self.pt_len += 1;
+        Some(frame)
+    }
+}
+
+/// Resolve one demand fault in a shared-anonymous region.  The Process and
+/// MmState guards remain held while the region slot and page table transaction
+/// complete; every lower lock is try-only so contention returns `Busy` and the
+/// faulting instruction is retried by the exception path.
+pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> SharedFaultResult {
+    use crate::cgroup::{FaultChargeError, FaultMemoryCharge};
+    use mm::page_table::try_with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags};
+
+    let Some(process_arc) = crate::process::try_get_process(pid) else {
+        return SharedFaultResult::Busy;
+    };
+    let Some(process_arc) = process_arc else {
+        return SharedFaultResult::NotShared;
+    };
+    let Some(proc) = process_arc.try_lock() else {
+        return SharedFaultResult::Busy;
+    };
+    if proc.pid != pid {
+        return SharedFaultResult::NotShared;
+    }
+    let Some(mut mm_state) = proc.mm.try_lock() else {
+        return SharedFaultResult::Busy;
+    };
+
+    let page_base = fault_addr & !0xfff;
+    let (region_base, region) = match mm_state
+        .shared_regions
+        .iter()
+        .find(|(&base, region)| {
+            page_base >= base
+                && page_base < base.saturating_add(region.page_count.saturating_mul(0x1000))
+        })
+        .map(|(&base, region)| (base, Arc::clone(region)))
+    {
+        Some(found) => found,
+        None => return SharedFaultResult::NotShared,
+    };
+
+    let index = (page_base - region_base) / 0x1000;
+    if index >= region.page_count {
+        return SharedFaultResult::NotShared;
+    }
+
+    let Some(result) = region.with_slots_try(|slots| {
+        let slot = &mut slots[index];
+        let existing = *slot;
+        // Reserve the bounded DATA + PT upper bound before taking PT_LOCK.
+        // `FaultMemoryCharge` updates only the captured atomics in the fault
+        // critical section; no registry or blocking lock is reached below.
+        let data_bytes = if existing.is_none() {
+            SHARED_FAULT_PAGE_SIZE
+        } else {
+            0
+        };
+        let Some(initial_charge) =
+            data_bytes.checked_add((SHARED_FAULT_PT_PAGES as u64) * SHARED_FAULT_PAGE_SIZE)
+        else {
+            return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+        };
+        let mut charge = match FaultMemoryCharge::try_new(proc.cgroup_id, initial_charge) {
+            Ok(receipt) => receipt,
+            Err(FaultChargeError::Contended) => return SharedFaultResult::Busy,
+            Err(FaultChargeError::NotFound) => {
+                return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt)
+            }
+            Err(
+                FaultChargeError::LimitExceeded
+                | FaultChargeError::Overflow
+                | FaultChargeError::Invariant,
+            ) => return SharedFaultResult::Fatal(CowFaultFailure::OutOfMemory),
+            Err(FaultChargeError::Invalid) => {
+                return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt)
+            }
+        };
+
+        let virt = VirtAddr::new(page_base as u64);
+        let flags = {
+            let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+            if region.prot & 0x2 != 0 {
+                flags.insert(PageTableFlags::WRITABLE);
+            }
+            if region.prot & 0x4 == 0 {
+                flags.insert(PageTableFlags::NO_EXECUTE);
+            }
+            flags
+        };
+
+        let mapped = try_with_current_manager(VirtAddr::new(0), |manager| {
+            mm::buddy_allocator::try_with_allocator(|buddy| {
+                let mut allocator = SharedFaultFrameAllocator::new(buddy);
+                let (frame, owns_new_frame) = if let Some(shared) = existing {
+                    let frame =
+                        PhysFrame::containing_address(PhysAddr::new(shared.phys_addr as u64));
+                    if PAGE_REF_COUNT
+                        .acquire_shared_mapping(shared.phys_addr)
+                        .is_err()
+                    {
+                        return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+                    }
+                    (frame, false)
+                } else {
+                    let Some(frame) = allocator.allocate_data_frame() else {
+                        return SharedFaultResult::Fatal(CowFaultFailure::OutOfMemory);
+                    };
+                    let direct = mm::phys_to_virt(frame.start_address());
+                    core::ptr::write_bytes(direct.as_mut_ptr::<u8>(), 0, 0x1000);
+                    let phys_addr = frame.start_address().as_u64() as usize;
+                    if PAGE_REF_COUNT.track_shared_frame(phys_addr).is_err() {
+                        allocator.deallocate_frame(frame);
+                        return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+                    }
+                    if PAGE_REF_COUNT.acquire_shared_mapping(phys_addr).is_err() {
+                        let _ = PAGE_REF_COUNT.release(phys_addr);
+                        allocator.deallocate_frame(frame);
+                        return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+                    }
+                    (frame, true)
+                };
+
+                if manager.translate_addr(virt).is_some() {
+                    let _ = PAGE_REF_COUNT.release(frame.start_address().as_u64() as usize);
+                    if owns_new_frame {
+                        let _ = PAGE_REF_COUNT.release(frame.start_address().as_u64() as usize);
+                        allocator.deallocate_frame(frame);
+                    }
+                    return SharedFaultResult::Fatal(CowFaultFailure::MappingFailed);
+                }
+                if manager
+                    .map_page(Page::containing_address(virt), frame, flags, &mut allocator)
+                    .is_err()
+                {
+                    // `map_page` may have allocated and linked intermediate
+                    // tables before failing.  Detach only proven-empty tables;
+                    // the returned count is the retained PT charge.
+                    let retained_pt_pages = allocator.rollback_pt_tables(manager, virt);
+                    let retained_pt_bytes = (retained_pt_pages as u64) * SHARED_FAULT_PAGE_SIZE;
+                    let _ = PAGE_REF_COUNT.release(frame.start_address().as_u64() as usize);
+                    if owns_new_frame {
+                        let _ = PAGE_REF_COUNT.release(frame.start_address().as_u64() as usize);
+                        allocator.deallocate_frame(frame);
+                    }
+                    let refund = charge.charged_bytes().saturating_sub(retained_pt_bytes);
+                    if charge.refund(refund).is_err() {
+                        // Retain the full reservation on an accounting
+                        // invariant failure; this is conservative and leaves
+                        // no newly linked table uncharged.
+                    }
+                    let committed_pt_bytes = charge.charged_bytes();
+                    if committed_pt_bytes != 0 {
+                        mm_state.pt_charged_bytes =
+                            mm_state.pt_charged_bytes.saturating_add(committed_pt_bytes);
+                        mm_state.pt_inherited_bytes = mm_state
+                            .pt_inherited_bytes
+                            .saturating_add(committed_pt_bytes);
+                    }
+                    charge.commit();
+                    return SharedFaultResult::Fatal(CowFaultFailure::MappingFailed);
+                }
+
+                let pt_bytes = allocator.pt_bytes();
+                let mapped_data_bytes = if owns_new_frame {
+                    SHARED_FAULT_PAGE_SIZE
+                } else {
+                    0
+                };
+                let actual_charge = mapped_data_bytes.saturating_add(pt_bytes);
+                let refund = charge.charged_bytes().saturating_sub(actual_charge);
+                if charge.refund(refund).is_err() {
+                    // Keep the full pre-charge on an invariant failure.  The
+                    // retained accounting is deliberately conservative.
+                }
+                let committed_pt_bytes = charge.charged_bytes().saturating_sub(mapped_data_bytes);
+                if committed_pt_bytes != 0 {
+                    // Fault paths cannot grow the per-AS identity map under
+                    // PT_LOCK.  The fixed inherited basis preserves I' and is
+                    // reclaimed wholesale at munmap/exit.
+                    mm_state.pt_charged_bytes =
+                        mm_state.pt_charged_bytes.saturating_add(committed_pt_bytes);
+                    mm_state.pt_inherited_bytes = mm_state
+                        .pt_inherited_bytes
+                        .saturating_add(committed_pt_bytes);
+                }
+                if owns_new_frame {
+                    *slot = Some(SharedPage {
+                        phys_addr: frame.start_address().as_u64() as usize,
+                        owner: proc.cgroup_id,
+                    });
+                }
+                charge.commit();
+                SharedFaultResult::Handled
+            })
+        });
+
+        match mapped {
+            Some(Some(result)) => result,
+            Some(None) | None => SharedFaultResult::Busy,
+        }
+    }) else {
+        return SharedFaultResult::Busy;
+    };
+    result
+}
+
+/// Shared-anonymous region metadata.  The inner lock is acquired with
+/// `try_lock` by the page-fault path and is never taken under PT_LOCK by
+/// teardown.  The retained heap charges keep metadata admission symmetric with
+/// the existing VMA maps.
+#[derive(Debug)]
+pub struct SharedAnonRegion {
+    pub base: usize,
+    pub page_count: usize,
+    pub prot: i32,
+    pages: Mutex<Vec<Option<SharedPage>>>,
+    _metadata_charge: mm::HeapCharge,
+}
+
+impl SharedAnonRegion {
+    pub fn try_new(base: usize, length: usize, prot: i32) -> Result<Arc<Self>, ()> {
+        let page_count = length.checked_div(0x1000).ok_or(())?;
+        if page_count == 0 || page_count > 1 << 20 {
+            return Err(());
+        }
+
+        // Reserve the complete slot backing before allocation.  The charge is
+        // retained until the region Arc is finally destroyed.
+        let bytes = mm::vec_charge_bytes::<Option<SharedPage>>(page_count).map_err(|_| ())?;
+        let reservation =
+            mm::try_reserve_heap(mm::HeapClass::CoreProcess, bytes).map_err(|_| ())?;
+        let mut pages = Vec::new();
+        if pages.try_reserve_exact(page_count).is_err() {
+            drop(reservation);
+            return Err(());
+        }
+        pages.resize(page_count, None);
+        let mut reservation = reservation;
+        let actual =
+            mm::vec_charge_bytes::<Option<SharedPage>>(pages.capacity()).map_err(|_| ())?;
+        if reservation.resize(actual).is_err() {
+            drop(pages);
+            drop(reservation);
+            return Err(());
+        }
+        let charge = reservation.commit().map_err(|_| ())?;
+        let region = Self {
+            base,
+            page_count,
+            prot,
+            pages: Mutex::new(pages),
+            _metadata_charge: charge,
+        };
+        Arc::try_new(region).map_err(|_| ())
+    }
+
+    #[inline]
+    pub fn slot(&self, index: usize) -> Option<SharedPage> {
+        self.pages.try_lock()?.get(index).copied().flatten()
+    }
+
+    #[inline]
+    pub fn with_slots_try<T>(&self, f: impl FnOnce(&mut [Option<SharedPage>]) -> T) -> Option<T> {
+        let mut pages = self.pages.try_lock()?;
+        Some(f(&mut pages[..]))
+    }
+
+    pub fn resident_pages(&self) -> usize {
+        self.pages
+            .lock()
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    }
+}
+
+impl Drop for SharedAnonRegion {
+    fn drop(&mut self) {
+        // All PTE references must have been removed before this Arc reaches
+        // zero.  Release the region pin and the first-toucher cgroup charge
+        // for each materialized page; invalid metadata fails leak-safe.
+        let mut pages = self.pages.lock();
+        let mut allocator = FrameAllocator::new();
+        for slot in pages.iter_mut() {
+            let Some(page) = slot.take() else { continue };
+            if PAGE_REF_COUNT
+                .release(page.phys_addr)
+                .should_free_unmapped()
+            {
+                allocator.deallocate_frame(PhysFrame::containing_address(PhysAddr::new(
+                    page.phys_addr as u64,
+                )));
+            }
+            crate::cgroup::uncharge_memory(page.owner, 0x1000);
+        }
+    }
+}
+
 impl CowPageRelease {
     /// Ordinary unmap/teardown frees both exclusive untracked pages and the last
     /// tracked page. Invalid metadata fails leak-safe rather than risking a UAF.
@@ -1600,6 +2071,62 @@ impl PhysicalPageRefCount {
             }
             match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(delta),
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    /// Add one mapping reference to an already-admitted shared-anonymous
+    /// frame. Unlike the private COW path, a shared leaf remains writable and
+    /// therefore must not carry either software COW marker.
+    fn stage_shared_slot(slot: &AtomicU32) -> Result<u32, ForkError> {
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 || old == COW_UNIQUE_CLAIMED {
+                return Err(ForkError::PageTableCopyFailed);
+            }
+            let new = old
+                .checked_add(1)
+                .filter(|value| *value != COW_UNIQUE_CLAIMED)
+                .ok_or(ForkError::PageTableCopyFailed)?;
+            match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(1),
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    /// Admit the first mapping reference for a newly allocated shared frame.
+    /// The transition is only valid from the untracked zero state; reusing a
+    /// non-zero or claimed slot would make ownership ambiguous and is rejected.
+    pub fn track_shared_frame(&self, phys_addr: usize) -> Result<(), ForkError> {
+        let Some(slot) = Self::slot(phys_addr) else {
+            return Err(ForkError::PageTableCopyFailed);
+        };
+        slot.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ForkError::PageTableCopyFailed)
+    }
+
+    /// Acquire one additional PTE reference for a shared-anonymous frame.
+    /// Shared frames are never converted to COW, so this operation accepts any
+    /// positive tracked count (including a region-only count of one) and rejects
+    /// the transient unique-claim sentinel or overflow.
+    pub fn acquire_shared_mapping(&self, phys_addr: usize) -> Result<(), ForkError> {
+        let Some(slot) = Self::slot(phys_addr) else {
+            return Err(ForkError::PageTableCopyFailed);
+        };
+        let mut old = slot.load(Ordering::Acquire);
+        loop {
+            if old == 0 || old == COW_UNIQUE_CLAIMED {
+                return Err(ForkError::PageTableCopyFailed);
+            }
+            let new = old
+                .checked_add(1)
+                .filter(|value| *value != COW_UNIQUE_CLAIMED)
+                .ok_or(ForkError::PageTableCopyFailed)?;
+            match slot.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()),
                 Err(actual) => old = actual,
             }
         }
@@ -1708,7 +2235,11 @@ impl PhysicalPageRefCount {
                 self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
                 return Err(ForkError::PageTableCopyFailed);
             };
-            let delta = match Self::stage_slot(slot, flags) {
+            let delta = match if plan.leaf_updates[index].shared {
+                Self::stage_shared_slot(slot)
+            } else {
+                Self::stage_slot(slot, flags)
+            } {
                 Ok(delta) => delta,
                 Err(error) => {
                     self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
@@ -1785,6 +2316,9 @@ struct LeafUpdate {
     /// RF178-6: exact delta already staged in PAGE_REF_COUNT. Zero until
     /// staging succeeds; used to transactionally unwind a failed prefix.
     ref_delta: u32,
+    /// ST-K2-P2: shared-anonymous leaves retain their writable flags in both
+    /// address spaces and use a mapping-reference increment instead of COW.
+    shared: bool,
 }
 
 /// 记录 COW 复制计划
@@ -1806,7 +2340,7 @@ impl CowClonePlan {
     }
 
     // R163-36 FIX: Fallible push to prevent OOM panic during COW planning.
-    fn record_leaf(&mut self, entry: &mut PageTableEntry) -> Result<(), ForkError> {
+    fn record_leaf(&mut self, entry: &mut PageTableEntry, shared: bool) -> Result<(), ForkError> {
         if self.leaf_updates.try_reserve(1).is_err() {
             return Err(ForkError::MemoryAllocationFailed);
         }
@@ -1815,6 +2349,7 @@ impl CowClonePlan {
             original_flags: entry.flags(),
             phys_addr: entry.addr(),
             ref_delta: 0,
+            shared,
         });
         Ok(())
     }
@@ -1826,6 +2361,8 @@ impl CowClonePlan {
 fn plan_clone_level(
     parent: &mut PageTable,
     level: u8,
+    virt_base: usize,
+    shared_ranges: &[(usize, usize)],
     plan: &mut CowClonePlan,
 ) -> Result<(), ForkError> {
     // 只处理用户空间（PML4 的索引 0-255）
@@ -1845,14 +2382,33 @@ fn plan_clone_level(
             continue;
         }
 
+        let shift = match level {
+            4 => 39,
+            3 => 30,
+            2 => 21,
+            1 => 12,
+            _ => return Err(ForkError::PageTableCopyFailed),
+        };
+        let entry_base = virt_base | (idx << shift);
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             // 叶子节点：记录到计划中
-            plan.record_leaf(entry)?;
+            let leaf_len = if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                1usize << shift
+            } else {
+                1usize << 12
+            };
+            let leaf_end = entry_base
+                .checked_add(leaf_len)
+                .ok_or(ForkError::PageTableCopyFailed)?;
+            let shared = shared_ranges
+                .iter()
+                .any(|&(start, end)| entry_base < end && leaf_end > start);
+            plan.record_leaf(entry, shared)?;
         } else {
             // 中间节点：计数并递归
             plan.tables_needed += 1;
             let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
-            plan_clone_level(parent_next, level - 1, plan)?;
+            plan_clone_level(parent_next, level - 1, entry_base, shared_ranges, plan)?;
         }
     }
     Ok(())
@@ -1902,6 +2458,8 @@ fn build_child_clone_level(
     plan: &CowClonePlan,
     leaf_cursor: &mut usize,
     level: u8,
+    virt_base: usize,
+    shared_ranges: &[(usize, usize)],
 ) {
     // 只处理用户空间（PML4 的索引 0-255）
     let idx_range = if level == 4 { 0..256 } else { 0..512 };
@@ -1920,6 +2478,14 @@ fn build_child_clone_level(
             continue;
         }
 
+        let shift = match level {
+            4 => 39,
+            3 => 30,
+            2 => 21,
+            1 => 12,
+            _ => return,
+        };
+        let entry_base = virt_base | (idx << shift);
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             // Leaf: prepare only the child's COW view.  The parent is committed
             // later from the stable plan after KPTI and refcounts are ready.
@@ -1931,6 +2497,19 @@ fn build_child_clone_level(
             debug_assert_eq!(
                 planned.entry_ptr, entry as *mut PageTableEntry,
                 "COW prepare plan pointer mismatch"
+            );
+            let leaf_len = if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                1usize << shift
+            } else {
+                1usize << 12
+            };
+            let leaf_end = entry_base.saturating_add(leaf_len);
+            debug_assert_eq!(
+                planned.shared,
+                shared_ranges
+                    .iter()
+                    .any(|&(start, end)| entry_base < end && leaf_end > start),
+                "shared-range plan drifted between COW passes"
             );
             build_child_leaf(&mut child[idx], planned);
         } else {
@@ -1953,6 +2532,8 @@ fn build_child_clone_level(
                 plan,
                 leaf_cursor,
                 level - 1,
+                entry_base,
+                shared_ranges,
             );
         }
     }
@@ -1963,6 +2544,15 @@ fn cloned_leaf_flags(planned: &LeafUpdate) -> PageTableFlags {
     let mut flags = planned.original_flags;
 
     if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        // ST-K2-P2: shared-anonymous leaves stay writable (when the original
+        // mapping was writable) in both address spaces. They use the plain
+        // PAGE_REF_COUNT mapping reference path and must never acquire either
+        // software COW marker during child construction.
+        if planned.shared {
+            flags.remove(cow_flag());
+            flags.remove(cow_readonly_flag());
+            return flags;
+        }
         if flags.contains(PageTableFlags::WRITABLE) || flags.contains(cow_flag()) {
             flags.remove(PageTableFlags::WRITABLE);
             flags.remove(cow_readonly_flag());
@@ -1986,6 +2576,9 @@ fn build_child_leaf(child_entry: &mut PageTableEntry, planned: &LeafUpdate) {
 /// resource; this pass performs no allocation and has no failure branch.
 unsafe fn commit_parent_cow(plan: &CowClonePlan) {
     for planned in plan.leaf_updates.iter() {
+        if planned.shared {
+            continue;
+        }
         if !planned
             .original_flags
             .contains(PageTableFlags::USER_ACCESSIBLE)
@@ -2030,6 +2623,7 @@ fn apply_leaf(
     if planned
         .original_flags
         .contains(PageTableFlags::USER_ACCESSIBLE)
+        && !planned.shared
     {
         parent_entry.set_addr(planned.phys_addr, cloned_leaf_flags(planned));
     }
@@ -2121,6 +2715,45 @@ pub fn run_cow_refcount_self_test() {
         CowPageRelease::Untracked
     );
 
+    // ST-K2-P2: a shared-anonymous mapping keeps writable PTEs in both
+    // address spaces, so its child fork consumes exactly one plain mapping
+    // reference rather than entering the private COW state machine.
+    let shared_slot = AtomicU32::new(1);
+    assert_eq!(
+        PhysicalPageRefCount::stage_shared_slot(&shared_slot).expect("shared child ref"),
+        1
+    );
+    assert_eq!(shared_slot.load(Ordering::Acquire), 2);
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&shared_slot),
+        CowPageRelease::Remaining(1)
+    );
+    assert_eq!(
+        PhysicalPageRefCount::release_slot(&shared_slot),
+        CowPageRelease::Last
+    );
+
+    // The shared leaf path must preserve the original writable permission in
+    // the unpublished child and must leave the parent untouched at apply time.
+    let mut shared_parent = PageTableEntry::new();
+    let mut shared_child = PageTableEntry::new();
+    shared_parent.set_addr(PhysAddr::new(0x1000), user_writable);
+    let shared_plan = LeafUpdate {
+        entry_ptr: &mut shared_parent,
+        original_flags: user_writable,
+        phys_addr: PhysAddr::new(0x1000),
+        ref_delta: 1,
+        shared: true,
+    };
+    build_child_leaf(&mut shared_child, &shared_plan);
+    assert!(shared_child.flags().contains(PageTableFlags::WRITABLE));
+    assert!(!shared_child.flags().contains(cow_flag()));
+    assert!(!shared_child.flags().contains(cow_readonly_flag()));
+    apply_leaf(&mut shared_parent, &mut shared_child, &shared_plan);
+    assert!(shared_parent.flags().contains(PageTableFlags::WRITABLE));
+    assert!(!shared_parent.flags().contains(cow_flag()));
+    assert!(!shared_parent.flags().contains(cow_readonly_flag()));
+
     let readonly_first =
         PhysicalPageRefCount::stage_slot(&slot, user_readonly).expect("first read-only COW stage");
     assert_eq!(readonly_first, 2);
@@ -2185,6 +2818,7 @@ pub fn run_cow_refcount_self_test() {
             original_flags: flags,
             phys_addr: PhysAddr::new(phys as u64),
             ref_delta: 0,
+            shared: false,
         });
     }
     let staged = x86_64::instructions::interrupts::without_interrupts(|| {
@@ -2203,6 +2837,7 @@ pub fn run_cow_refcount_self_test() {
         original_flags: supervisor_flags,
         phys_addr: PhysAddr::new(base as u64),
         ref_delta: 0,
+        shared: false,
     };
     apply_leaf(
         &mut supervisor_parent,
@@ -2221,6 +2856,7 @@ pub fn run_cow_refcount_self_test() {
         original_flags: user_readonly,
         phys_addr: PhysAddr::new(base as u64),
         ref_delta: 2,
+        shared: false,
     };
     // R180-19 PREPARE must construct the child view without touching parent
     // flags; only the explicit commit helper may add the parent's COW marker.
@@ -2243,6 +2879,7 @@ pub fn run_cow_refcount_self_test() {
         original_flags: write_cow_flags,
         phys_addr: PhysAddr::new(base as u64),
         ref_delta: 1,
+        shared: false,
     };
     apply_leaf(&mut refork_parent, &mut refork_child, &refork_plan);
     assert!(refork_parent.flags().contains(cow_flag()));
@@ -2251,11 +2888,125 @@ pub fn run_cow_refcount_self_test() {
     assert!(!refork_child.flags().contains(cow_readonly_flag()));
 }
 
-/// 将物理地址转换为页表引用
+/// Exercise the complete pre-commit COW failure path with a deliberately
+/// untracked leaf. The child tree is built and its private intermediate frames
+/// are allocated before refcount staging rejects the malformed leaf; this is
+/// the failure ordering that previously had no source-bound oracle.
+pub fn run_cow_failure_cleanup_self_test() {
+    let (base, pages) = mm::memory::managed_physical_page_window()
+        .expect("buddy physical window must precede COW failure probe");
+    let base = usize::try_from(base).expect("physical base fits usize");
+    let invalid_phys = base
+        .checked_add(
+            pages
+                .checked_mul(4096)
+                .expect("managed window size overflow"),
+        )
+        .expect("managed window end fits usize");
+
+    let baseline_stats = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy allocator stats for COW failure probe");
+    let mut frame_alloc = FrameAllocator::new();
+    let parent_root = frame_alloc
+        .allocate_frame()
+        .expect("parent root frame for COW failure probe");
+    let child_root = frame_alloc
+        .allocate_frame()
+        .expect("child root frame for COW failure probe");
+    let parent_pdpt = frame_alloc
+        .allocate_frame()
+        .expect("parent PDPT frame for COW failure probe");
+    let parent_pd = frame_alloc
+        .allocate_frame()
+        .expect("parent PD frame for COW failure probe");
+    let parent_pt = frame_alloc
+        .allocate_frame()
+        .expect("parent PT frame for COW failure probe");
+    let parent_kernel_pdpt = frame_alloc
+        .allocate_frame()
+        .expect("parent entry-island PDPT frame for COW failure probe");
+
+    let branch_flags =
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+    let leaf_flags = branch_flags;
+    unsafe {
+        zero_table(parent_root);
+        zero_table(child_root);
+        zero_table(parent_pdpt);
+        zero_table(parent_pd);
+        zero_table(parent_pt);
+        zero_table(parent_kernel_pdpt);
+
+        let pml4 = phys_to_virt_table(parent_root.start_address());
+        pml4[0].set_addr(parent_pdpt.start_address(), branch_flags);
+        // Keep the normal supervisor entry-island root present so KPTI's
+        // temporary island allocation is linked and therefore covered by its
+        // rollback/free path as it is in a live kernel address space.
+        pml4[511].set_addr(
+            parent_kernel_pdpt.start_address(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        let pdpt = phys_to_virt_table(parent_pdpt.start_address());
+        pdpt[0].set_addr(parent_pd.start_address(), branch_flags);
+        let pd = phys_to_virt_table(parent_pd.start_address());
+        pd[0].set_addr(parent_pt.start_address(), branch_flags);
+        let pt = phys_to_virt_table(parent_pt.start_address());
+        // This address is outside the managed frame window, so refcount
+        // staging must fail after the child tables have already been built.
+        pt[0].set_addr(PhysAddr::new(invalid_phys as u64), leaf_flags);
+    }
+
+    let result = unsafe {
+        copy_page_table_cow(
+            parent_root.start_address().as_u64() as usize,
+            child_root.start_address().as_u64() as usize,
+        )
+    };
+    assert!(
+        matches!(result, Err(ForkError::PageTableCopyFailed)),
+        "invalid COW leaf must fail before publication: {result:?}"
+    );
+
+    unsafe {
+        let parent_pt_view = phys_to_virt_table(parent_pt.start_address());
+        assert_eq!(parent_pt_view[0].addr(), PhysAddr::new(invalid_phys as u64));
+        assert_eq!(parent_pt_view[0].flags(), leaf_flags);
+        assert!(!parent_pt_view[0].flags().contains(cow_flag()));
+        assert!(!parent_pt_view[0].flags().contains(cow_readonly_flag()));
+
+        let child_pml4 = phys_to_virt_table(child_root.start_address());
+        assert!(
+            (0..256).all(|index| child_pml4[index].is_unused()),
+            "failed COW preparation published child user mappings"
+        );
+    }
+
+    // The child root and parent hierarchy belong to this probe. The private
+    // child PDPT/PD/PT frames are owned by copy_page_table_cow's rollback
+    // ledger and must not be released a second time here.
+    frame_alloc.deallocate_frame(parent_pt);
+    frame_alloc.deallocate_frame(parent_pd);
+    frame_alloc.deallocate_frame(parent_pdpt);
+    frame_alloc.deallocate_frame(parent_kernel_pdpt);
+    // Exercise the same teardown entry used by fork error cleanup. The user
+    // half was cleared by the COW rollback above, so this must reclaim only
+    // the private child root and never follow a dangling child branch.
+    free_address_space(child_root.start_address().as_u64() as usize);
+    frame_alloc.deallocate_frame(parent_root);
+
+    let after_stats = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy allocator stats after COW failure probe");
+    assert_eq!(
+        after_stats.free_pages, baseline_stats.free_pages,
+        "COW failure rollback leaked or double-freed physical frames"
+    );
+}
+
+/// Convert a physical address into a page-table view.
 ///
 /// # Safety
 ///
-/// 调用者必须确保物理地址指向有效的页表
+/// The caller must ensure that the physical address points to a valid page table.
 unsafe fn phys_to_virt_table(phys: PhysAddr) -> &'static mut PageTable {
     // 使用高半区直映访问物理内存
     let virt = mm::phys_to_virt(phys);

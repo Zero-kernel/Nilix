@@ -6669,7 +6669,14 @@ fn exec_from_bytes(
     let final_rsp = stack_layout.rsp;
 
     // 更新进程 PCB
-    let (old_space, old_user_space, cloexec_removed, cloexec_cgroup_id, cloexec_closed) = {
+    let (
+        old_space,
+        old_user_space,
+        cloexec_removed,
+        cloexec_cgroup_id,
+        cloexec_closed,
+        old_shared_regions,
+    ) = {
         let mut proc = process.lock();
 
         // R169-4 FIX: Reserve the close-on-exec drop buffer to the CURRENT
@@ -6689,6 +6696,7 @@ fn exec_from_bytes(
 
         let old_space = proc.memory_space;
         let old_user_space = proc.user_memory_space;
+        let old_shared_regions;
         proc.memory_space = new_memory_space;
         // H.3 KPTI: Set user PML4 root (0 if KPTI disabled)
         proc.user_memory_space = new_user_memory_space;
@@ -6743,7 +6751,7 @@ fn exec_from_bytes(
             let cgroup_id = proc.cgroup_id;
             let mut mm = proc.mm.lock();
             for (&_base, &len_with_flags) in mm.mmap_regions.iter() {
-                if len_with_flags.is_prot_none() {
+                if len_with_flags.is_prot_none() || len_with_flags.is_shared() {
                     continue;
                 }
                 let len = mmap_region_len(len_with_flags) as u64;
@@ -6838,6 +6846,10 @@ fn exec_from_bytes(
             // future SLICE-5 grow lowers it; a fork COPIES it (the grown region is
             // COW-inherited). Charged DATA below this floor goes to elf_charged_bytes.
             mm.stack_floor_committed = crate::elf_loader::user_stack_mapped_floor() as usize;
+            old_shared_regions = core::mem::replace(
+                &mut mm.shared_regions,
+                mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            );
             mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
             // ST-K3 FIX: use the shared constant (was a duplicated 0x4000_0000
@@ -6950,6 +6962,7 @@ fn exec_from_bytes(
             cloexec_removed,
             cloexec_cgroup_id,
             cloexec_closed,
+            old_shared_regions,
         )
     };
 
@@ -6990,6 +7003,9 @@ fn exec_from_bytes(
         }
         free_address_space(old_space);
     }
+    // Shared-region pins and first-toucher charges outlive the old page-table
+    // walk and are released only after every leaf has been detached.
+    drop(old_shared_regions);
 
     // R101-2 FIX: Gate exec entry/rsp/argc debug print behind debug_assertions.
     // These leak user entry point and stack pointer addresses.
@@ -11803,6 +11819,53 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
 /// 页大小
 const PAGE_SIZE: usize = 0x1000;
 
+// ST-K2: mmap flag values and the supported private/shared-anonymous shapes.
+// Keep these values in one place so the syscall, its oracle, and the userspace
+// ABI agree on the fail-closed boundary. `addr != 0` remains a validated hint;
+// MAP_FIXED replacement is deliberately not enabled.
+const MAP_SHARED: i32 = 0x01;
+const MAP_PRIVATE: i32 = 0x02;
+const MAP_FIXED: i32 = 0x10;
+const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_SHARED_VALIDATE: i32 = 0x03;
+const SUPPORTED_MMAP_FLAGS: i32 = MAP_PRIVATE | MAP_ANONYMOUS;
+const SUPPORTED_SHARED_MMAP_FLAGS: i32 = MAP_SHARED | MAP_ANONYMOUS;
+
+#[inline]
+fn validate_mmap_flags(flags: i32) -> Result<(), SyscallError> {
+    if flags == SUPPORTED_MMAP_FLAGS || flags == SUPPORTED_SHARED_MMAP_FLAGS {
+        Ok(())
+    } else {
+        Err(SyscallError::EOPNOTSUPP)
+    }
+}
+
+/// ST-K2-P1: pure flag contract oracle used by the hosted/integration gates.
+/// The production path invokes the same validator after the LSM hook, before
+/// any address-space state is changed.
+pub fn run_mmap_flags_self_test() {
+    assert!(validate_mmap_flags(MAP_PRIVATE | MAP_ANONYMOUS).is_ok());
+    assert!(validate_mmap_flags(MAP_SHARED | MAP_ANONYMOUS).is_ok());
+    for flags in [
+        0,
+        MAP_PRIVATE,
+        MAP_SHARED,
+        MAP_SHARED_VALIDATE,
+        MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+        MAP_PRIVATE | MAP_ANONYMOUS | 0x4000,
+        -1,
+    ] {
+        assert_eq!(
+            validate_mmap_flags(flags),
+            Err(SyscallError::EOPNOTSUPP),
+            "unsupported mmap flags must fail closed: {flags:#x}"
+        );
+    }
+    // A non-zero address remains a hint; MAP_FIXED replacement is still outside
+    // the supported set. Address checks stay in sys_mmap's transaction.
+    assert_ne!(MAP_FIXED, 0);
+}
+
 /// 页对齐向上取整
 #[inline]
 fn page_align_up(addr: usize) -> usize {
@@ -11834,6 +11897,9 @@ pub(crate) const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
 pub const MMAP_REGION_FLAG_PROT_READ: usize = 1 << 3;
 pub const MMAP_REGION_FLAG_PROT_WRITE: usize = 1 << 4;
 pub const MMAP_REGION_FLAG_PROT_EXEC: usize = 1 << 5;
+/// ST-K2-P2: committed shared-anonymous mapping.  Bit 7 is outside the
+/// existing transient/protection flags and is preserved across fork.
+pub(crate) const MMAP_REGION_FLAG_SHARED: usize = 1 << 7;
 /// R149-6 / R168-1 FIX: Transient ownership token for an mprotect operation
 /// that drops the MmState lock for page-table work. Path A (PROT_NONE → real)
 /// holds it while allocating + mapping frames; Path B (real → PROT_NONE) holds
@@ -11932,15 +11998,20 @@ impl MmapEntry {
         self.0 & MMAP_REGION_FLAG_PROT_EXEC != 0
     }
 
-    /// 4-char Linux-style "rwxp" permission string for /proc/[pid]/maps.
-    /// All Zero-OS mappings are private, so the 4th char is always 'p'.
+    #[inline]
+    pub const fn is_shared(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_SHARED != 0
+    }
+
+    /// 4-char Linux-style "rwxp"/"rwxs" permission string for /proc/[pid]/maps.
+    /// Shared-anonymous entries use `s`; private entries use `p`.
     #[inline]
     pub fn perms(self) -> [u8; 4] {
         [
             if self.prot_read() { b'r' } else { b'-' },
             if self.prot_write() { b'w' } else { b'-' },
             if self.prot_exec() { b'x' } else { b'-' },
-            b'p',
+            if self.is_shared() { b's' } else { b'p' },
         ]
     }
 
@@ -12068,9 +12139,8 @@ fn mmap_prot_to_flags(prot: i32) -> usize {
     flags
 }
 
-/// R144-2 FIX: Decode mmap region flags back to a 4-char Linux-style permission
-/// string ("rwxp"/"r--p"/etc.).  All Zero-OS mmap regions are private (no shared
-/// mappings), so the 4th character is always 'p'.
+/// R144-2: Decode mmap region flags back to a 4-char Linux-style permission
+/// string ("rwxp"/"rwxs"/etc.).
 pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
     [
         if flags & MMAP_REGION_FLAG_PROT_READ != 0 {
@@ -12088,7 +12158,11 @@ pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
         } else {
             b'-'
         },
-        b'p', // always private
+        if flags & MMAP_REGION_FLAG_SHARED != 0 {
+            b's'
+        } else {
+            b'p'
+        },
     ]
 }
 
@@ -13725,7 +13799,7 @@ fn sys_mmap(
     addr: usize,
     length: usize,
     prot: i32,
-    _flags: i32,
+    flags: i32,
     fd: i32,
     _offset: i64,
 ) -> SyscallResult {
@@ -13759,36 +13833,54 @@ fn sys_mmap(
         return Err(SyscallError::EPERM);
     }
 
-    // 文件映射暂不支持
-    // R72-ENOSYS FIX: Return EOPNOTSUPP instead of ENOSYS. The syscall IS
-    // implemented (for anonymous mappings), but file-backed mappings are not
-    // yet supported.
-    if fd >= 0 {
-        #[cfg(feature = "kcov")]
-        {
-            coverage::trace_pc(1052); // sys_mmap file-backed unsupported
-        }
-        return Err(SyscallError::EOPNOTSUPP);
-    }
-
-    #[cfg(feature = "kcov")]
-    {
-        coverage::trace_pc(1053); // sys_mmap anonymous mapping path
-    }
-
-    // R29-3 FIX: Call LSM hook for anonymous mmap operations
+    // R29-3 FIX: Call the LSM hook before the ST-K2 flag boundary so policy
+    // audit records survive rejected MAP_SHARED/MAP_FIXED/unknown requests.
     if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, _flags as u32)
+        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, flags as u32)
             .is_err()
         {
             return Err(SyscallError::EPERM);
         }
     }
 
+    // ST-K2 FIX: reject every flag shape whose semantics are not implemented.
+    // This includes MAP_SHARED without MAP_ANONYMOUS, MAP_SHARED_VALIDATE,
+    // MAP_FIXED, missing MAP_ANONYMOUS, and unknown bits. The check is before
+    // any VMA/cgroup/page-table mutation and after the LSM hook above.
+    if let Err(error) = validate_mmap_flags(flags) {
+        #[cfg(feature = "kcov")]
+        {
+            coverage::trace_pc(1052); // sys_mmap unsupported flags
+        }
+        return Err(error);
+    }
+
+    // File-backed mappings remain outside this phase even when the flag word is
+    // otherwise valid.  Keep the stable EOPNOTSUPP boundary after LSM/flags.
+    if fd >= 0 {
+        #[cfg(feature = "kcov")]
+        {
+            coverage::trace_pc(1053); // sys_mmap file-backed unsupported
+        }
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    let is_shared = flags == SUPPORTED_SHARED_MMAP_FLAGS;
+
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1054); // sys_mmap anonymous mapping path
+    }
+
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
     let is_prot_none = prot == PROT_NONE;
+    if is_shared && is_prot_none {
+        // A shared PROT_NONE reservation needs the demand-fault region object
+        // from the full Phase-2 design; reject it until that object exists.
+        return Err(SyscallError::EOPNOTSUPP);
+    }
 
     // R32-SC-1 FIX: PROT_NONE (prot=0) should create non-present mapping
     // that faults on access (guard page behavior). Mirror sys_mprotect.
@@ -13820,7 +13912,7 @@ fn sys_mmap(
     let update_next = addr == 0;
 
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
-    let (base, end, cgroup_id, old_next_mmap_addr, mm_arc) = {
+    let (base, end, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
         let mut proc = process.lock();
         let mm_arc = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
@@ -13938,8 +14030,20 @@ fn sys_mmap(
             return Err(SyscallError::EINVAL);
         }
 
+        // ST-K2-P2: shared mappings reserve only bounded region metadata here;
+        // their DATA charge is taken by the first page fault.  Private mappings
+        // retain the eager whole-range charge.
+        let shared_region = if is_shared {
+            Some(
+                crate::fork::SharedAnonRegion::try_new(base, length_aligned, prot)
+                    .map_err(|_| SyscallError::ENOMEM)?,
+            )
+        } else {
+            None
+        };
+
         // R147-I1 FIX: Charge cgroup memory BEFORE inserting PENDING_MAP entry.
-        if !is_prot_none {
+        if !is_prot_none && !is_shared {
             // ST-K3 Phase D: bind the error so the E2 tag names the variant;
             // the early-return semantics are unchanged.
             if let Err(_charge_err) =
@@ -13962,6 +14066,11 @@ fn sys_mmap(
                 MMAP_REGION_FLAG_PROT_NONE
             } else {
                 0
+            }
+            | if is_shared {
+                MMAP_REGION_FLAG_SHARED
+            } else {
+                0
             };
         // next-phase #11: fallible insert. `base` is a new key (overlap-checked
         // above), so this allocates a slot. On OOM, roll back the cgroup charge
@@ -13975,9 +14084,10 @@ fn sys_mmap(
             )
             .is_err()
         {
-            if !is_prot_none {
+            if !is_prot_none && !is_shared {
                 cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
             }
+            drop(shared_region);
             // ST-K3 Phase D: site tag (E3) — Phase-1 VMA-map heap admission.
             #[cfg(debug_assertions)]
             kprintln!(
@@ -13988,6 +14098,18 @@ fn sys_mmap(
             return Err(SyscallError::ENOMEM);
         }
 
+        if let Some(region) = shared_region.as_ref() {
+            if mm
+                .shared_regions
+                .try_insert(base, Arc::clone(region))
+                .is_err()
+            {
+                mm.mmap_regions.remove(&base);
+                drop(shared_region);
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+
         // Advance next_mmap_addr early so concurrent auto-mmaps don't collide.
         let old_next_mmap_addr = mm.next_mmap_addr;
         if update_next && mm.next_mmap_addr < end {
@@ -13996,7 +14118,14 @@ fn sys_mmap(
 
         let cgroup_id = proc.cgroup_id;
         drop(mm);
-        (base, end, cgroup_id, old_next_mmap_addr, mm_arc)
+        (
+            base,
+            end,
+            cgroup_id,
+            old_next_mmap_addr,
+            mm_arc,
+            shared_region,
+        )
     }; // Process lock + MmState lock dropped here — Phase 1 complete
 
     // R123-1 FIX: PROT_NONE is a pure address reservation per POSIX semantics.
@@ -14059,170 +14188,230 @@ fn sys_mmap(
     // J2-9: the closure returns the TOTAL frames allocated (data + page-table) so
     // Phase 3 can charge the page-table-frame kmem AFTER PT_LOCK is dropped (the
     // cgroup charge must never run under PT_LOCK — lock_ordering invariant).
-    let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
-        use x86_64::structures::paging::PhysFrame;
+    // ST-K2-P2: shared-anonymous mappings are demand-paged.  The VMA and side
+    // map were committed in Phase 1; leave leaf PTEs absent until a first
+    // access invokes `handle_shared_page_fault`.
+    let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> =
+        if is_shared {
+            Ok(vec::Vec::new())
+        } else {
+            unsafe {
+                use x86_64::structures::paging::PhysFrame;
 
-        with_current_manager(
-            VirtAddr::new(0),
-            |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                let mut frame_alloc = RecordingFrameAllocator {
-                    inner: FrameAllocator::new(),
-                    pt_frames: vec::Vec::new(),
-                };
-                // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
-                let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
+                with_current_manager(
+                    VirtAddr::new(0),
+                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                        let mut frame_alloc = RecordingFrameAllocator {
+                            inner: FrameAllocator::new(),
+                            pt_frames: vec::Vec::new(),
+                        };
+                        // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
+                        let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
 
-                for offset in (0..length_aligned).step_by(0x1000) {
-                    let page = Page::containing_address(VirtAddr::new((base + offset) as u64));
+                        for offset in (0..length_aligned).step_by(0x1000) {
+                            let page =
+                                Page::containing_address(VirtAddr::new((base + offset) as u64));
 
-                    // 分配物理帧，失败时回滚所有已映射的页
-                    // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
-                    // `allocate_data_frame` (NOT recorded into the PT ledger); only the
-                    // intermediate tables `map_page`/`map_to` pull below are recorded.
-                    let frame = match frame_alloc.allocate_data_frame() {
-                        Some(f) => f,
-                        None => {
-                            // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
-                            let flush_len = mapped.len() * 0x1000;
-                            let mut frames_to_free = vec::Vec::new();
-                            let _ = frames_to_free.try_reserve(mapped.len());
-                            for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                                if manager.unmap_page(cleanup_page).is_ok() {
-                                    if frames_to_free.try_reserve(1).is_ok() {
-                                        frames_to_free.push(cleanup_frame);
-                                    } else {
-                                        mm::flush_current_as_page(cleanup_page.start_address());
-                                        frame_alloc.deallocate_frame(cleanup_frame);
+                            // 分配物理帧，失败时回滚所有已映射的页
+                            // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
+                            // `allocate_data_frame` (NOT recorded into the PT ledger); only the
+                            // intermediate tables `map_page`/`map_to` pull below are recorded.
+                            let frame = match frame_alloc.allocate_data_frame() {
+                                Some(f) => f,
+                                None => {
+                                    // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
+                                    let flush_len = mapped.len() * 0x1000;
+                                    let mut frames_to_free = vec::Vec::new();
+                                    let _ = frames_to_free.try_reserve(mapped.len());
+                                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                                        if manager.unmap_page(cleanup_page).is_ok() {
+                                            let should_free = !is_shared
+                                                || PAGE_REF_COUNT
+                                                    .release(cleanup_frame.start_address().as_u64()
+                                                        as usize)
+                                                    .should_free_unmapped();
+                                            if !should_free {
+                                                continue;
+                                            }
+                                            if frames_to_free.try_reserve(1).is_ok() {
+                                                frames_to_free.push(cleanup_frame);
+                                            } else {
+                                                mm::flush_current_as_page(
+                                                    cleanup_page.start_address(),
+                                                );
+                                                frame_alloc.deallocate_frame(cleanup_frame);
+                                            }
+                                        }
                                     }
+                                    // R169-L2 FIX: reclaim the intermediate PT/PD tables the
+                                    // rolled-back leaves left empty; the frames ride the same
+                                    // flush+free below (3-phase: clear entry, flush, free).
+                                    manager.prune_empty_tables_in_range(
+                                        VirtAddr::new(base as u64),
+                                        flush_len,
+                                        &mut frames_to_free,
+                                    );
+                                    if !frames_to_free.is_empty() {
+                                        mm::flush_current_as_range(
+                                            VirtAddr::new(base as u64),
+                                            flush_len,
+                                        );
+                                        for frame in frames_to_free {
+                                            frame_alloc.deallocate_frame(frame);
+                                        }
+                                    }
+                                    // ST-K3 Phase D: site tag (E5) — data-frame exhaustion.
+                                    #[cfg(debug_assertions)]
+                                    kprintln!(
+                                        "[ST-K3] mmap ENOMEM site=E5 stage=frame_alloc len={}",
+                                        length_aligned
+                                    );
+                                    return Err(SyscallError::ENOMEM);
                                 }
+                            };
+
+                            // 安全：清零新分配的帧，防止泄漏其他进程的数据
+                            // 使用高半区直映访问物理内存
+                            let virt = mm::phys_to_virt(frame.start_address());
+                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
+
+                            // ST-K2-P2: the region owns the first mapping reference
+                            // before the frame becomes reachable through its PTE.
+                            if is_shared
+                                && PAGE_REF_COUNT
+                                    .track_shared_frame(frame.start_address().as_u64() as usize)
+                                    .is_err()
+                            {
+                                frame_alloc.deallocate_frame(frame);
+                                return Err(SyscallError::ENOMEM);
                             }
-                            // R169-L2 FIX: reclaim the intermediate PT/PD tables the
-                            // rolled-back leaves left empty; the frames ride the same
-                            // flush+free below (3-phase: clear entry, flush, free).
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(base as u64),
-                                flush_len,
-                                &mut frames_to_free,
-                            );
-                            if !frames_to_free.is_empty() {
-                                mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
-                                for frame in frames_to_free {
+
+                            // 映射页，失败时回滚
+                            // ST-K3 Phase D: bind the MapError variant — it discriminates
+                            // PT-frame exhaustion from mapping-collision defects (E6 payload).
+                            if let Err(_map_err) =
+                                manager.map_page(page, frame, page_flags, &mut frame_alloc)
+                            {
+                                let should_free = !is_shared
+                                    || PAGE_REF_COUNT
+                                        .release(frame.start_address().as_u64() as usize)
+                                        .should_free_unmapped();
+                                if should_free {
                                     frame_alloc.deallocate_frame(frame);
                                 }
-                            }
-                            // ST-K3 Phase D: site tag (E5) — data-frame exhaustion.
-                            #[cfg(debug_assertions)]
-                            kprintln!(
-                                "[ST-K3] mmap ENOMEM site=E5 stage=frame_alloc len={}",
-                                length_aligned
-                            );
-                            return Err(SyscallError::ENOMEM);
-                        }
-                    };
-
-                    // 安全：清零新分配的帧，防止泄漏其他进程的数据
-                    // 使用高半区直映访问物理内存
-                    let virt = mm::phys_to_virt(frame.start_address());
-                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                    // 映射页，失败时回滚
-                    // ST-K3 Phase D: bind the MapError variant — it discriminates
-                    // PT-frame exhaustion from mapping-collision defects (E6 payload).
-                    if let Err(_map_err) =
-                        manager.map_page(page, frame, page_flags, &mut frame_alloc)
-                    {
-                        frame_alloc.deallocate_frame(frame);
-                        // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
-                        // R169-L2: +1 page so the prune covers the CURRENT page, whose
-                        // intermediate tables map_to may have created before failing.
-                        let flush_len = (mapped.len() + 1) * 0x1000;
-                        let mut frames_to_free = vec::Vec::new();
-                        let _ = frames_to_free.try_reserve(mapped.len());
-                        for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                            if manager.unmap_page(cleanup_page).is_ok() {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(cleanup_frame);
-                                } else {
-                                    mm::flush_current_as_page(cleanup_page.start_address());
-                                    frame_alloc.deallocate_frame(cleanup_frame);
+                                // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
+                                // R169-L2: +1 page so the prune covers the CURRENT page, whose
+                                // intermediate tables map_to may have created before failing.
+                                let flush_len = (mapped.len() + 1) * 0x1000;
+                                let mut frames_to_free = vec::Vec::new();
+                                let _ = frames_to_free.try_reserve(mapped.len());
+                                for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                                    if manager.unmap_page(cleanup_page).is_ok() {
+                                        let should_free = !is_shared
+                                            || PAGE_REF_COUNT
+                                                .release(
+                                                    cleanup_frame.start_address().as_u64() as usize
+                                                )
+                                                .should_free_unmapped();
+                                        if !should_free {
+                                            continue;
+                                        }
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(cleanup_frame);
+                                        } else {
+                                            mm::flush_current_as_page(cleanup_page.start_address());
+                                            frame_alloc.deallocate_frame(cleanup_frame);
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                        manager.prune_empty_tables_in_range(
-                            VirtAddr::new(base as u64),
-                            flush_len,
-                            &mut frames_to_free,
-                        );
-                        if !frames_to_free.is_empty() {
-                            mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
-                            for frame in frames_to_free {
-                                frame_alloc.deallocate_frame(frame);
-                            }
-                        }
-                        // ST-K3 Phase D: site tag (E6) — page-table material.
-                        #[cfg(debug_assertions)]
-                        kprintln!(
-                            "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={} err={:?}",
-                            length_aligned,
-                            _map_err
-                        );
-                        return Err(SyscallError::ENOMEM);
-                    }
-
-                    // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
-                    if mapped.try_reserve(1).is_err() {
-                        if manager.unmap_page(page).is_ok() {
-                            mm::flush_current_as_page(page.start_address());
-                            frame_alloc.deallocate_frame(frame);
-                        }
-                        // R169-L2: +1 page — the current page was mapped then locally
-                        // unmapped above, so its intermediate tables may now be prunable.
-                        let flush_len = (mapped.len() + 1) * 0x1000;
-                        let mut frames_to_free = vec::Vec::new();
-                        let _ = frames_to_free.try_reserve(mapped.len());
-                        for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                            if manager.unmap_page(cleanup_page).is_ok() {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(cleanup_frame);
-                                } else {
-                                    mm::flush_current_as_page(cleanup_page.start_address());
-                                    frame_alloc.deallocate_frame(cleanup_frame);
+                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                                manager.prune_empty_tables_in_range(
+                                    VirtAddr::new(base as u64),
+                                    flush_len,
+                                    &mut frames_to_free,
+                                );
+                                if !frames_to_free.is_empty() {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(base as u64),
+                                        flush_len,
+                                    );
+                                    for frame in frames_to_free {
+                                        frame_alloc.deallocate_frame(frame);
+                                    }
                                 }
+                                // ST-K3 Phase D: site tag (E6) — page-table material.
+                                #[cfg(debug_assertions)]
+                                kprintln!(
+                                    "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={} err={:?}",
+                                    length_aligned,
+                                    _map_err
+                                );
+                                return Err(SyscallError::ENOMEM);
                             }
-                        }
-                        // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                        manager.prune_empty_tables_in_range(
-                            VirtAddr::new(base as u64),
-                            flush_len,
-                            &mut frames_to_free,
-                        );
-                        if !frames_to_free.is_empty() {
-                            mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
-                            for frame in frames_to_free {
-                                frame_alloc.deallocate_frame(frame);
-                            }
-                        }
-                        // ST-K3 Phase D: site tag (E7) — kernel-heap OOM on the
-                        // Phase-2 rollback-tracking vec: HEAP-ADMISSION class,
-                        // not frame exhaustion (lens: do not misattribute to E5).
-                        #[cfg(debug_assertions)]
-                        kprintln!(
-                            "[ST-K3] mmap ENOMEM site=E7 stage=phase2_track_reserve len={}",
-                            length_aligned
-                        );
-                        return Err(SyscallError::ENOMEM);
-                    }
-                    mapped.push((page, frame));
-                }
 
-                // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
-                // (NOT a count). On every Err path above the closure freed its own
-                // frames, so this Vec is meaningful only on the Ok path.
-                Ok(frame_alloc.pt_frames)
-            },
-        )
-    };
+                            // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
+                            if mapped.try_reserve(1).is_err() {
+                                if manager.unmap_page(page).is_ok() {
+                                    mm::flush_current_as_page(page.start_address());
+                                    let should_free = !is_shared
+                                        || PAGE_REF_COUNT
+                                            .release(frame.start_address().as_u64() as usize)
+                                            .should_free_unmapped();
+                                    if should_free {
+                                        frame_alloc.deallocate_frame(frame);
+                                    }
+                                }
+                                // R169-L2: +1 page — the current page was mapped then locally
+                                // unmapped above, so its intermediate tables may now be prunable.
+                                let flush_len = (mapped.len() + 1) * 0x1000;
+                                let mut frames_to_free = vec::Vec::new();
+                                let _ = frames_to_free.try_reserve(mapped.len());
+                                for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                                    if manager.unmap_page(cleanup_page).is_ok() {
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(cleanup_frame);
+                                        } else {
+                                            mm::flush_current_as_page(cleanup_page.start_address());
+                                            frame_alloc.deallocate_frame(cleanup_frame);
+                                        }
+                                    }
+                                }
+                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                                manager.prune_empty_tables_in_range(
+                                    VirtAddr::new(base as u64),
+                                    flush_len,
+                                    &mut frames_to_free,
+                                );
+                                if !frames_to_free.is_empty() {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(base as u64),
+                                        flush_len,
+                                    );
+                                    for frame in frames_to_free {
+                                        frame_alloc.deallocate_frame(frame);
+                                    }
+                                }
+                                // ST-K3 Phase D: site tag (E7) — kernel-heap OOM on the
+                                // Phase-2 rollback-tracking vec: HEAP-ADMISSION class,
+                                // not frame exhaustion (lens: do not misattribute to E5).
+                                #[cfg(debug_assertions)]
+                                kprintln!(
+                                    "[ST-K3] mmap ENOMEM site=E7 stage=phase2_track_reserve len={}",
+                                    length_aligned
+                                );
+                                return Err(SyscallError::ENOMEM);
+                            }
+                            mapped.push((page, frame));
+                        }
+
+                        // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
+                        // (NOT a count). On every Err path above the closure freed its own
+                        // frames, so this Vec is meaningful only on the Ok path.
+                        Ok(frame_alloc.pt_frames)
+                    },
+                )
+            }
+        };
 
     // F.2 Cgroup: If mapping fails, rollback the memory charge and Phase 1
     // reservation to maintain correct accounting.
@@ -14238,12 +14427,18 @@ fn sys_mmap(
                 let proc = process.lock();
                 let mut mm = mm_arc.lock();
                 mm.mmap_regions.remove(&base);
+                if is_shared {
+                    mm.shared_regions.remove(&base);
+                }
                 if update_next && mm.next_mmap_addr == end {
                     mm.next_mmap_addr = old_next_mmap_addr;
                 }
                 proc.cgroup_id
             };
-            cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
+            if !is_shared {
+                cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
+            }
+            drop(shared_region);
             return Err(e);
         }
         Ok(frames) => frames,
@@ -14277,7 +14472,15 @@ fn sys_mmap(
     // over-count-safe / never-under-count direction — it cannot bypass memory.max.
     // R144-2 FIX: Store protection bits so procfs /proc/[pid]/maps shows accurate perms.
     let prot_flags = mmap_prot_to_flags(prot);
-    let committed_len_with_flags = MmapEntry::from_len_flags(length_aligned, prot_flags);
+    let committed_len_with_flags = MmapEntry::from_len_flags(
+        length_aligned,
+        prot_flags
+            | if is_shared {
+                MMAP_REGION_FLAG_SHARED
+            } else {
+                0
+            },
+    );
     {
         let proc = process.lock();
         let mut mm = mm_arc.lock();
@@ -14298,8 +14501,13 @@ fn sys_mmap(
                 );
                 SyscallError::ENOMEM
             })?;
-        // R131-6 FIX: Track per-address-space cgroup DATA charge.
-        mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(length_aligned as u64);
+        // R131-6 FIX: Track per-address-space cgroup DATA charge. Shared
+        // anonymous bytes are charged per materialized page by the fault
+        // receipt and released by the region owner, so they never enter this
+        // eager VMA-length scalar.
+        if !is_shared {
+            mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(length_aligned as u64);
+        }
         if mm.next_mmap_addr < end {
             mm.next_mmap_addr = end;
         }
@@ -14369,6 +14577,10 @@ fn sys_mmap(
     }
 
     // D3-ARC-MM-SHARED: sync_vm_siblings_add_mmap is no longer needed — all
+    // The side-map owns the committed Arc; release this phase-local handle so
+    // unmap/exit can observe the precise last-owner transition.
+    drop(shared_region);
+
     // CLONE_VM siblings share the same MmState via Arc<Mutex<MmState>>.
 
     // Note: Memory is already atomically charged via try_charge_memory() above.
@@ -14596,15 +14808,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         frames: table_frames,
         drained: false,
     };
-
-    // D3-ARC-MM-SHARED + R145-1 + R171-CG1x0 FIX (M2-1 SLICE-0): folded Phase 3 —
-    // ONE Process→MmState critical section (canonical order, matching sys_mmap
-    // Phase 3) so the region removal, the DATA uncharge, AND the per-AS PT-ledger
-    // reconcile all land atomically w.r.t. cgroup migration (which snapshots
-    // compute_cgroup_charged_bytes under the Process lock, R155-5). The cgroup
-    // uncharges run here with PT_LOCK already dropped — lock_ordering sanctions
-    // cgroup helpers under the Process lock; never under PT_LOCK.
-    {
+    let shared_region_to_drop = {
+        // D3-ARC-MM-SHARED + R145-1 + R171-CG1x0 FIX (M2-1 SLICE-0): folded Phase 3 —
+        // ONE Process→MmState critical section (canonical order, matching sys_mmap
+        // Phase 3) so the region removal, the DATA uncharge, AND the per-AS PT-ledger
+        // reconcile all land atomically w.r.t. cgroup migration (which snapshots
+        // compute_cgroup_charged_bytes under the Process lock, R155-5). The cgroup
+        // uncharges run here with PT_LOCK already dropped — lock_ordering sanctions
+        // cgroup helpers under the Process lock; never under PT_LOCK.
         let proc = process.lock();
         let mut mm = mm_arc.lock();
         // Re-read cgroup_id under the lock — migration may have moved us during the
@@ -14614,10 +14825,17 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         // Under shared MmState the first remover wins; a racing CLONE_VM sibling
         // sees the entry gone (the shared Mutex serializes; no double-remove).
         let was_present = mm.mmap_regions.remove(&addr).is_some();
+        let shared_region = if committed_flags & MMAP_REGION_FLAG_SHARED != 0 {
+            mm.shared_regions.remove(&addr)
+        } else {
+            None
+        };
 
         // DATA leg: uncharge the region bytes only on the first remove and only for
         // a charged (non-PROT_NONE) region.
-        if was_present && (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+        if was_present
+            && (committed_flags & (MMAP_REGION_FLAG_PROT_NONE | MMAP_REGION_FLAG_SHARED)) == 0
+        {
             mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(recorded_length as u64);
             cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
         }
@@ -14639,7 +14857,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 cgroup::uncharge_memory(cgroup_id, pt_freed);
             }
         }
-    } // Process + MmState locks dropped here.
+        shared_region
+    };
 
     // R171-CG1x0 FIX (M2-1 SLICE-0): NOW publish the reclaimed table frames to the
     // buddy — STRICTLY AFTER the ledger removal above. In the window a frame becomes
@@ -14654,7 +14873,12 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             fa.deallocate_frame(f);
         }
         reclaim.drained = true;
-    }
+    };
+
+    // Drop the region outside Process/MmState locks and only after the PT
+    // transaction has removed every present leaf. Its Drop releases the region
+    // pin and first-toucher cgroup charges.
+    drop(shared_region_to_drop);
 
     // R102-10 + R159-17 FIX: Gate address-revealing log behind debug_assertions.
     #[cfg(debug_assertions)]
@@ -14804,6 +15028,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
         if mm.fork_in_progress {
             return Err(SyscallError::EAGAIN);
+        }
+
+        // ST-K2-P2 boundary: shared-anonymous permissions are immutable in
+        // this slice. Reject before any boundary split so a failed mprotect
+        // cannot leave partially rewritten shared metadata.
+        if mm.mmap_regions.iter().any(|(&base, &entry)| {
+            let region_len = mmap_region_len(entry);
+            let region_end = base.saturating_add(region_len);
+            entry.is_shared() && base < end && region_end > addr
+        }) {
+            return Err(SyscallError::EOPNOTSUPP);
         }
 
         // R161-10 FIX: Split regions that partially overlap [addr, end) at the

@@ -1260,6 +1260,28 @@ extern "x86-interrupt" fn page_fault_handler(
     //
     // 如果缺页发生在 usercopy 的受控访问指令上（RIP 命中异常表），将 RIP 重定向到
     // fixup 代码，让 usercopy helper 返回错误，从而让 syscall 返回 EFAULT。
+    // ST-K2-P2: demand-install an unfaulted shared-anonymous page. Shared
+    // read-only write violations remain ordinary protection faults; only a
+    // non-present access reaches this arm. Contention retries through IRETQ,
+    // matching the COW fault contract.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+        if let Some(pid) = kernel_core::process::current_pid() {
+            match unsafe { kernel_core::fork::handle_shared_page_fault(pid, fault_addr) } {
+                kernel_core::fork::SharedFaultResult::Handled => return,
+                kernel_core::fork::SharedFaultResult::Busy => return,
+                kernel_core::fork::SharedFaultResult::NotShared => {}
+                kernel_core::fork::SharedFaultResult::Fatal(reason) => {
+                    klog_force!(
+                        "ST-K2: shared fault resolution failed at {:#x} (pid {}): {:?}",
+                        fault_addr,
+                        pid,
+                        reason
+                    );
+                }
+            }
+        }
+    }
+
     if usercopy::try_handle_usercopy_fault(fault_addr) {
         let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
         if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
