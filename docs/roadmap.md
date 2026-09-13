@@ -1,9 +1,9 @@
 # Nilix (Zero-OS) — Development and Capability Roadmap
 
-**Revision:** 6.0 · **Updated:** 2026-09-12
-**Source baseline:** e127c34 (runtime parser and transient mount follow-up); the
-hosted count update is pending its next complete CI run.
-**Active plan:** [next-phase-plan-2026-09-12.md](review/nextplan/next-phase-plan-2026-09-12.md).
+**Revision:** 6.1 — **Updated:** 2026-09-14
+**Source baseline:** local 3.1–3.3 implementation working tree; exact final remote verification copy `/tmp/zero-os-codex-final-20260913` on `40c-devbox-ts`.
+
+**Active plan:** [next-phase-plan-2026-09-13.md](review/nextplan/next-phase-plan-2026-09-13.md) (v16.4).
 
 Nilix is an experimental x86_64 OS kernel with UEFI boot, Ring-3 programs, a
 tested static-musl ABI subset, SMP scheduling, filesystems, IPv4 networking and
@@ -138,17 +138,9 @@ COW fork have real userspace paths. RF180-20 repaired shared supervisor
 page-table ownership across fork/exec/teardown; the complete four-worker
 mitigation workload exercises this repair.
 
-**Missing:** sys_mmap still takes an unused flags parameter apart from policy
-forwarding; MAP_SHARED/MAP_FIXED semantics are not implemented. File mappings
-return EOPNOTSUPP; mremap returns ENOSYS. Shared-anonymous memory, slab, NUMA,
-swap and THP are not qualified features. Stress MAP_SHARED report pages cannot
-supply the expected fork-shared communication.
+**Current state:** sys_mmap validates the complete flags word after the LSM hook, admits private/shared-anonymous forms and rejects unsupported forms before VMA mutation. Shared-anonymous regions use an admitted side-map and first-touch demand faults with `PAGE_REF_COUNT` ownership; report and CPU-worker transport uses pipes. Bounded slab, NUMA, swap and THP primitives are available with integration self-tests. **Remaining:** strict guest/musl qualification, MAP_FIXED/file mappings and mremap, and qualified backend consumers/stress. SMP/combined stress still requires the full shared fault contract.
 
-**R186-4 remains open:** MmState maps already use AdmittedMap, but fork allocates
-the snapshot before admission, and from_sorted_vec_charged still calls
-shrink_to_fit. Closure requires mechanism review, charge symmetry and live-delta
-tests, not another container-migration claim. Owners: **P0-A, ST-K2-P1/P2,
-U55-6**; [admission design](review/design/p0-a-r186-4-admission-closure-design.md).
+**R186-4 final remote verification is complete for the supported scope:** the fork snapshot reserves before allocation and the admitted-map constructor no longer shrinks infallibly. Local charge/cleanup oracles, two independent U23 safe-path reviews, and the exact final remote MM 26/26, kernel-core 68/68, hosted, build and lint gates pass on `40c-devbox-ts` in `/tmp/zero-os-codex-final-20260913`; runtime/boot/4-core SMP are zero-failure qualified. The bounded CorruptState policy, musl markers and strict guest/platform qualification remain. Owners: **ST-K2-P1/P2, U55-6**; [admission design](review/design/p0-a-r186-4-admission-closure-design.md).
 
 ### 5.2 Processes, threads, scheduling and teardown
 
@@ -335,13 +327,13 @@ creates a new full clean audit round.
 
 | Requirement | Disposition |
 | --- | --- |
-| R186-4 / P0-A / D1-RES-HEAP-ADMISSION-REOPENED | Open; pre-admission allocation/shrink and acceptance obligations remain |
+| R186-4 / P0-A / D1-RES-HEAP-ADMISSION-REOPENED | Implemented and final remote verification complete for supported scope; strict guest/platform qualification remains pending |
 | R188 original review lineage | Full original-rubric map absent from newer scoped KSA records; reconcile/review uncovered originals, reuse proven overlap |
 | No unresolved Critical/High in claimed scope; three clean rounds | Not established; streak unchanged |
 | All six stress-v2 profiles | Required by recorded 2026-09-01 user decision; memory/cpu/smp/process/block/combined acceptance pending |
 | Strict security/platform policy | Outcome truth implemented; deferred prerequisites still block qualification |
 | ABI/device/mitigation matrix | Preserve supported/rejected/advisory and physical/full-isolation limits |
-| CI result/retained evidence | e127c34 hosted vfs count correction is pending rerun; QEMU transient/parser fixes are also pending complete-run evidence |
+| CI result/retained evidence | Exact final remote source passes hosted/build/lint and zero-failure qualified QEMU runtime/boot/4-core SMP gates; musl markers remain incomplete; historical e127c34 count/parser notes are retained as provenance |
 
 The five KSA P0 repairs and KSA-007..020 rubrics are accepted within scope. They
 are regression obligations, not still-open implementation tasks.
@@ -361,8 +353,8 @@ are regression obligations, not still-open implementation tasks.
 
 ## 10. Forward roadmap
 
-**Next group:** reconcile R188 review lineage, close R186-4 admission, complete
-ST-K2 Phase 1 flags/report transport and ST-K4 durability/block workload.
+**Next group:** reconcile R188 review lineage and complete strict guest qualification; continue ST-K2/ST-K4 and the six-profile acceptance sequence.
+
 [Current handoff notes](review/design/next-handoff-2026-09-12.md) retain prior
 design choices and identify changed-premise review requirements.
 

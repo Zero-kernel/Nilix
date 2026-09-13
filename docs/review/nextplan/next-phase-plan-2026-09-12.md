@@ -69,7 +69,7 @@ A new blanket re-audit of already accepted, unchanged KSA fixes is unnecessary.
 
 | Order / ID | Priority and state | Work / acceptance | Dependency |
 | --- | --- | --- | --- |
-| 1. R188-RF | Review stage; READY for scoped evidence reconciliation | Map every original R188 actionable to final source, review and applicable gate; independently review uncovered originals, preserve U37-1/U55-6/U29-3 limits; material defects re-enter by severity | August remediation + KSA overlap records |
+| 1. R188-RF | Review stage; verification pending after 2026-09-13 reviewfix | Every original R188 actionable is mapped to current source and independent evidence; U16-1 and U23-1/U23-2 remain partial, U34-1 and U46-1 require focused evidence, and U37-1/U55-6/U29-3 limits are preserved | August remediation + KSA overlap records |
 | 2. P0-A / R186-4 | P0 HIGH; implementation present, closure OPEN | Admission before fork snapshot allocation; no infallible shrink; one amount-symmetric reservation/charge owner; live reserved/committed delta/failure/pressure/reclaim tests and independent mechanism review | R188-RF disposition before closure credit; serialize MM changes |
 | 3. ST-K2-P1 | P1 ABI/stress; planned implementation | Whole mmap flags contract after policy hook; reject unsupported forms; pipe-based stress reports; memory/cpu/process profile evidence with a real cgroup-limit oracle | P0-A integration baseline and completed ST-K3; preserve prior two-phase decision |
 | 4. ST-K4 | P1 durability/stress; design refresh required | fsync/fdatasync/sync/sync_file_range device-flush contract, policy/FD validation, guest block workload and crash/recovery oracle | ST-K2-P1; reconcile current file-object/namespace/BIO contracts |
@@ -192,7 +192,7 @@ features in a phase are complete.
 | KSA findings accepted | 20/20 within original scopes; no new full audit performed here |
 | KSA plan items | 17/18 scoped complete; P3-2 partial |
 | Carried audit HIGH | R186-4 remains open; current-source pre-admission/shrink paths reconfirmed |
-| R188 review lineage | Reconciliation/independent uncovered-scope review pending |
+| R188 review lineage | 2026-09-13 reviewfix written: 123 PASS, 3 PARTIAL, 5 verification pending; no clean-round credit |
 | Zero-HIGH streak | 0/3, unchanged; no fabricated next round number or clean credit |
 | Stress acceptance | All six profiles required by September 1 decision; no accepted full run |
 | Hosted count | 438 counted executions/profile + CpuLocal doctests + three compile checks, from current gate definition |
@@ -230,10 +230,13 @@ local source plans identified by the source ledger rather than deleted.
 
 ## 9. Handoff and review record
 
-The next action is the R188-RF scoped evidence reconciliation using
-kernel-review-fix. Subsequent implementation uses kernel-implement with the
-four-item handoff/design set, current source and preserved acceptance oracles.
-Planning does not start either stage.
+The R188-RF evidence reconciliation is recorded in
+`../reviewfix/reviewfix-2026-09-13.md`. Acceptance remains verification pending:
+focused malformed-device tests, live robust-futex evidence, the U16 lane design,
+and the U23 admission mechanism must be resolved before P0-A closure credit.
+Subsequent implementation uses kernel-implement with the four-item handoff/design
+set, current source and preserved acceptance oracles. Planning does not start
+either stage.
 
 This plan and the documentation need no kernel build. Validate source links,
 component count, current hosted count, exactly one NEXT marker, all 18 KSA IDs,

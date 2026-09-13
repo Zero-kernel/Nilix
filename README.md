@@ -16,23 +16,18 @@ goal, not a claim that arbitrary Linux applications or containers already run.
 
 ## Status
 
-**Snapshot: 2026-09-12**, source e127c34; CI job-budget follow-up and runtime
-parser fixes are awaiting the next complete run.
+**Snapshot: 2026-09-14**, local implementation working tree; exact final source remotely verified on `40c-devbox-ts` in `/tmp/zero-os-codex-final-20260913` for hosted/MM/core/build/lint, with zero-failure qualified runtime/boot/4-core SMP gates.
+
 **1.0-Preview is blocked.** Most services still execute in Ring 0. A deprivileged
 Linux personality and broader application compatibility are planned.
 
-The September KSA audit's 20 findings are accepted within their specific
-rubrics. This includes real QEMU fuzz execution, descriptor/path/credential
-repairs, TLS migration, owned block I/O and truthful mitigation reporting.
-It does not close the older R186-4 admission item or establish complete Linux,
-hardware or security qualification.
+The September KSA audit's 20 findings are accepted within their specific rubrics. R186-4 admission closure, ST-K2 shared-anonymous demand paging and MM 3.3 bounded primitives are implemented; the exact final source passes the remote hosted/MM/core/build/lint gates.
 
-Release work still includes admission closure, reconciliation of original R188
-review obligations, strict supported-profile tests and **all six stress-v2
-profiles**. The recorded clean full-audit streak remains **0/3**. Physical VT-d,
-full KPTI isolation, compiler retpoline and production livepatch are not qualified
-capabilities. See [security status](docs/security-audit-status.md) and the
-[release conditions](docs/roadmap.md#8-10-preview-release-gate).
+The implementation does not establish complete Linux, guest musl/usercopy/teardown, hardware or security qualification.
+
+Release work still includes reconciliation of original R188 review obligations, strict supported-profile tests and **all six stress-v2 profiles**.
+
+The recorded clean full-audit streak remains **0/3**. Physical VT-d, full KPTI isolation, compiler retpoline and production livepatch are not qualified capabilities. See [security status](docs/security-audit-status.md) and the [release conditions](docs/roadmap.md#8-10-preview-release-gate).
 
 ## What works, and what is missing
 
@@ -42,7 +37,7 @@ calling an entire subsystem complete because its API or source files exist.
 | Component | Current capability | Remaining gap / boundary |
 | --- | --- | --- |
 | UEFI and boot | PIE kernel loading/relocation, memory-map handoff, KASLR placement, console initialization | x86_64 platform scope; broader firmware/hardware and early-boot W+X qualification |
-| Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery | R186-4 admission closure; MAP_SHARED/MAP_FIXED semantics, file mappings, mremap; no qualified slab/NUMA/swap/THP |
+| Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions and bounded slab/NUMA/swap/THP primitives | Final remote hosted/MM/core/build/lint verification is complete for this slice; MAP_FIXED/file mappings/mremap and integrated slab/NUMA/swap/THP backends remain unqualified |
 | Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests | waitid, PID1/reaper and remaining failure/stress breadth |
 | Threads and TLS | Restricted CLONE_VM/TLS setup, FS/user-GS restoration tested across SMP migration | General CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND rejected; not pthread compatibility |
 | Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering | High-core/long-run/physical qualification; 64 is a CPU ceiling, not a tested topology claim |
@@ -90,7 +85,7 @@ narratives. The roadmap is the current capability/qualification reference.
 
 ## Tests and CI
 
-The current hosted allowlist runs **438 counted unit-test executions per
+The current hosted allowlist runs **439 counted unit-test executions per
 debug/release profile**, CpuLocal doctests and three test-code compile checks.
 The runtime scanner discovers **74 RuntimeTest implementations**; that count
 does not mean 74 guest passes or 100% kernel instruction coverage.

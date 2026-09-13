@@ -1,6 +1,6 @@
 # Zero-OS Next-Phase Plan
 
-**Current:** [v16.0 — 2026-09-12](review/nextplan/next-phase-plan-2026-09-12.md).
+**Current:** [v16.4 — 2026-09-13](review/nextplan/next-phase-plan-2026-09-13.md)
 
 This complete rollover reconciles the September KSA closeout with the older
 admission, stress, design and feature backlog. Start here for priorities and

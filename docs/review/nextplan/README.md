@@ -1,7 +1,7 @@
 # Next-phase plans
 
-The current complete plan is [v16.0, September 12](next-phase-plan-2026-09-12.md).
-It is published with its [design handoff](../design/next-handoff-2026-09-12.md).
+The current complete plan is [v16.4, September 13](next-phase-plan-2026-09-13.md), with final-tree remote verification recorded on September 14.
+It is published with its [design handoff](../design/next-handoff-2026-09-12.md) and carries the R188 review-fix residuals.
 Use the [roadmap](../../roadmap.md) for component capabilities and gaps.
 
 The maintainer's local archive also retains earlier dated plans. They are inputs
