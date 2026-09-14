@@ -372,6 +372,77 @@ fn prepare_fork_identity_or_cleanup(
 }
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod shared_anon_region_tests {
+    use super::*;
+
+    /// ST-K2-P2 shared-anonymous metadata admission. The page cap is the bound
+    /// that keeps a region's side-table metadata inside the CoreProcess class,
+    /// and it must be enforced BEFORE the backing reservation so a hostile
+    /// length cannot force a large allocation.
+    #[test]
+    fn shared_region_rejects_lengths_outside_the_page_cap() {
+        assert!(
+            SharedAnonRegion::try_new(0x1000, 0, 0x3).is_err(),
+            "a zero-length region must fail closed"
+        );
+        assert!(
+            SharedAnonRegion::try_new(0x1000, 0x1000 - 1, 0x3).is_err(),
+            "a sub-page length is not a whole number of slots"
+        );
+        assert!(
+            SharedAnonRegion::try_new(0x1000, ((1 << 20) + 1) * 0x1000, 0x3).is_err(),
+            "a region above the page cap must be refused before reserving"
+        );
+        // The static page cap is an UPPER bound, not a reachable size: the
+        // CoreProcess heap admission (512 KiB soft) refuses the ~16 MiB
+        // side table needed at the cap. If a future budget change makes the
+        // cap reachable, this assertion flips and should be revisited.
+        assert!(
+            SharedAnonRegion::try_new(0x1000, (1 << 20) * 0x1000, 0x3).is_err(),
+            "admission must bound the side table before the static cap is reached"
+        );
+        assert!(
+            SharedAnonRegion::try_new(0x1000, 4 * 0x1000, 0x3).is_ok(),
+            "an ordinary bounded region must be admissible"
+        );
+    }
+
+    /// Every page of the `MAP_SHARED|MAP_ANONYMOUS` region starts non-resident:
+    /// the metadata exists at map time but no frame is charged until first
+    /// touch, which is the whole point of the demand-paged shared model.
+    #[test]
+    fn shared_region_starts_unpopulated_and_bounds_its_slots() {
+        let page_count = 4usize;
+        let region = SharedAnonRegion::try_new(0x40_0000, page_count * 0x1000, 0x3)
+            .expect("a bounded region must be admissible");
+
+        assert_eq!(region.page_count, page_count);
+        assert_eq!(
+            region.resident_pages(),
+            0,
+            "no shared page may be resident before the first fault"
+        );
+        for index in 0..page_count {
+            assert!(
+                region.slot(index).is_none(),
+                "slot {index} must start empty (uncharged, no frame)"
+            );
+        }
+        assert!(
+            region.slot(page_count).is_none(),
+            "an out-of-range index must read as empty, not panic"
+        );
+
+        // The slot view used by the first-touch path exposes exactly the
+        // admitted window and nothing beyond it.
+        let observed = region
+            .with_slots_try(|slots| (slots.len(), slots.iter().all(|slot| slot.is_none())))
+            .expect("an uncontended region must lend its slots");
+        assert_eq!(observed, (page_count, true));
+    }
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
 mod credential_preparation_tests {
     use super::*;
     use crate::process::child_creation_test_support::Fixture;
@@ -837,6 +908,7 @@ fn fork_inner(
                 // which charges the Vec capacity to CoreProcess before adoption.
                 mmap_regions: child_mmap_regions,
                 shared_regions: child_shared_regions,
+
                 brk_start: parent_mm.brk_start,
                 brk: parent_mm.brk,
                 next_mmap_addr: parent_mm.next_mmap_addr,
