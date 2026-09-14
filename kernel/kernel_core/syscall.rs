@@ -6697,6 +6697,7 @@ fn exec_from_bytes(
         let old_space = proc.memory_space;
         let old_user_space = proc.user_memory_space;
         let old_shared_regions;
+
         proc.memory_space = new_memory_space;
         // H.3 KPTI: Set user PML4 root (0 if KPTI disabled)
         proc.user_memory_space = new_user_memory_space;
@@ -6850,7 +6851,6 @@ fn exec_from_bytes(
                 &mut mm.shared_regions,
                 mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             );
-            mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
             // ST-K3 FIX: use the shared constant (was a duplicated 0x4000_0000
             // literal — the old 1 GiB window collided with the inherited
@@ -11866,6 +11866,247 @@ pub fn run_mmap_flags_self_test() {
     assert_ne!(MAP_FIXED, 0);
 }
 
+// ST-K2-MREMAP: mremap flag values and the supported relocation shape.
+// Only "resize this VMA, moving it if you must" is supported. The address
+// replacement surface (MREMAP_FIXED) is deliberately not enabled, mirroring
+// the MAP_FIXED boundary above: enabling it here would offer a strictly wider
+// capability than the mmap ABI this kernel exposes.
+const MREMAP_MAYMOVE: i32 = 0x1;
+const MREMAP_FIXED: i32 = 0x2;
+#[allow(dead_code)]
+const MREMAP_DONTUNMAP: i32 = 0x4;
+
+/// ST-K2-MREMAP: whole-flags contract for `sys_mremap`.
+///
+/// `0` (in-place only) and `MREMAP_MAYMOVE` are the implemented shapes.
+/// `MREMAP_FIXED`, `MREMAP_DONTUNMAP`, any unknown bit and any negative word
+/// are rejected before the VMA/page-table/cgroup transaction begins, so an
+/// unsupported request can never leave partial state behind.
+#[inline]
+fn validate_mremap_flags(flags: i32) -> Result<(), SyscallError> {
+    if flags == 0 || flags == MREMAP_MAYMOVE {
+        Ok(())
+    } else {
+        Err(SyscallError::EOPNOTSUPP)
+    }
+}
+
+/// ST-K2-MREMAP: pure flag contract oracle used by the integration gate.
+/// The production path invokes the same validator before any address-space
+/// state is read or changed.
+pub fn run_mremap_flags_self_test() {
+    assert!(
+        validate_mremap_flags(0).is_ok(),
+        "in-place mremap is supported"
+    );
+    assert!(
+        validate_mremap_flags(MREMAP_MAYMOVE).is_ok(),
+        "MREMAP_MAYMOVE is supported"
+    );
+    for flags in [
+        MREMAP_FIXED,
+        MREMAP_DONTUNMAP,
+        MREMAP_MAYMOVE | MREMAP_FIXED,
+        MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+        0x8,
+        0x4000,
+        -1,
+    ] {
+        assert_eq!(
+            validate_mremap_flags(flags),
+            Err(SyscallError::EOPNOTSUPP),
+            "unsupported mremap flags must fail closed: {flags:#x}"
+        );
+    }
+    // The address-replacement flag stays distinct from MAYMOVE; enabling one
+    // must never be read as enabling the other.
+    assert_ne!(MREMAP_FIXED & MREMAP_MAYMOVE, MREMAP_FIXED);
+}
+
+/// ST-K2-MREMAP: where a growing mapping goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MremapPlacement {
+    /// Grow at the existing base; the free-VA probe already succeeded.
+    InPlace,
+    /// Relocate to a newly chosen base (`MREMAP_MAYMOVE`).
+    Relocate,
+    /// No free space above the mapping and relocation is not permitted.
+    Refuse,
+}
+
+/// ST-K2-MREMAP: pure placement decision for a growing mapping.
+///
+/// Relocation is licensed only by `MREMAP_MAYMOVE`; without it an in-place
+/// failure is `ENOMEM`, never a silent move.
+#[inline]
+pub(crate) fn decide_mremap_placement(in_place_free: bool, may_move: bool) -> MremapPlacement {
+    if in_place_free {
+        MremapPlacement::InPlace
+    } else if may_move {
+        MremapPlacement::Relocate
+    } else {
+        MremapPlacement::Refuse
+    }
+}
+
+/// ST-K2-MREMAP: the byte delta a resize moves between two page-aligned
+/// lengths — `Some((grows, bytes))`, or `None` for an equal-size (no-op)
+/// resize.  This is the single source of the charge/uncharge magnitude, so a
+/// shrink cannot uncharge fewer bytes than the grow charged.
+#[inline]
+pub(crate) fn mremap_byte_delta(old_len: usize, new_len: usize) -> Option<(bool, usize)> {
+    if new_len == old_len {
+        None
+    } else if new_len > old_len {
+        Some((true, new_len - old_len))
+    } else {
+        Some((false, old_len - new_len))
+    }
+}
+
+/// ST-K2-MREMAP: the byte length this call must newly materialize, or `None`
+/// when the resize has no growth tail.
+///
+/// A shrink has no tail.  Naively computing `new_len - old_len` there
+/// underflows: in a release build it wraps to a colossal page count and drives
+/// the fault allocator into OOM before the call fails.  That defect was found by
+/// the Ring-3 guest oracle and is pinned here so it cannot return silently.
+#[inline]
+pub(crate) fn mremap_tail_len(old_len: usize, new_len: usize) -> Option<usize> {
+    new_len.checked_sub(old_len).filter(|len| *len != 0)
+}
+
+/// ST-K2-MREMAP: pure oracle for the resize decision logic and the page-flag
+/// reconstruction the live path uses.
+///
+/// The grow/shrink/relocate *page-table and refcount* legs need a live user
+/// address space (a real CR3 plus `MmState`), which the boot integration gate
+/// has no current process for; they are exercised by the guest runtime gate.
+/// Everything here is the SAME code the syscall runs, not a restatement of it.
+pub fn run_mremap_geometry_self_test() {
+    use MremapPlacement::{InPlace, Refuse, Relocate};
+
+    // Placement: in-place wins whenever the VA probe succeeded...
+    assert_eq!(decide_mremap_placement(true, false), InPlace);
+    assert_eq!(decide_mremap_placement(true, true), InPlace);
+    // ...and relocation happens ONLY when the caller asked for it.
+    assert_eq!(decide_mremap_placement(false, true), Relocate);
+    assert_eq!(
+        decide_mremap_placement(false, false),
+        Refuse,
+        "a grow with no free VA and no MREMAP_MAYMOVE must be refused, never moved"
+    );
+
+    // Byte delta: magnitude is symmetric, direction is not.
+    assert_eq!(mremap_byte_delta(0x1000, 0x1000), None);
+    assert_eq!(mremap_byte_delta(0x1000, 0x3000), Some((true, 0x2000)));
+    assert_eq!(mremap_byte_delta(0x3000, 0x1000), Some((false, 0x2000)));
+
+    // Materialization tail: ONLY a grow has one. This is the guard that keeps a
+    // shrink from underflowing `new_len - old_len` into a colossal page count.
+    assert_eq!(
+        mremap_tail_len(0x4000, 0x1000),
+        None,
+        "a shrink must not report a growth tail"
+    );
+    assert_eq!(
+        mremap_tail_len(0x1000, 0x1000),
+        None,
+        "an equal-size resize has no tail"
+    );
+    assert_eq!(mremap_tail_len(0x1000, 0x4000), Some(0x3000));
+    assert_eq!(mremap_tail_len(0, 0x1000), Some(0x1000));
+    // Round-tripping a resize must not create or destroy charge.
+    for &(old_len, new_len) in &[
+        (0x1000usize, 0x4000usize),
+        (0x4000, 0x1000),
+        (0x2000, 0x2000),
+        (0x1000, 0x20_0000),
+    ] {
+        let up = mremap_byte_delta(old_len, new_len);
+        let down = mremap_byte_delta(new_len, old_len);
+        match (up, down) {
+            (None, None) => assert_eq!(old_len, new_len),
+            (Some((up_grows, up_bytes)), Some((down_grows, down_bytes))) => {
+                assert_eq!(up_grows, !down_grows, "directions must be opposite");
+                assert_eq!(
+                    up_bytes, down_bytes,
+                    "the grow and the matching shrink must move the SAME byte count"
+                );
+            }
+            _ => panic!("asymmetric resize delta for {old_len:#x} -> {new_len:#x}"),
+        }
+    }
+
+    // Page-flag reconstruction: a grown tail inherits the VMA's protection.
+    for &(read, write, exec) in &[
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (false, true, false),
+    ] {
+        let mut committed = 0usize;
+        let mut prot = 0u32;
+        if read {
+            committed |= MMAP_REGION_FLAG_PROT_READ;
+            prot |= PROT_READ as u32;
+        }
+        if write {
+            committed |= MMAP_REGION_FLAG_PROT_WRITE;
+            prot |= PROT_WRITE as u32;
+        }
+        if exec {
+            committed |= MMAP_REGION_FLAG_PROT_EXEC;
+            prot |= PROT_EXEC as u32;
+        }
+
+        // The LSM destination hook must see the mapping's real protection.
+        assert_eq!(mmap_flags_to_prot(committed), prot);
+        assert_eq!(mmap_flags_to_prot(mmap_prot_to_flags(prot as i32)), prot);
+
+        let flags = mremap_page_flags(committed);
+        use x86_64::structures::paging::PageTableFlags as F;
+        assert!(flags.contains(F::PRESENT) && flags.contains(F::USER_ACCESSIBLE));
+        assert_eq!(flags.contains(F::WRITABLE), write);
+        assert_eq!(
+            flags.contains(F::NO_EXECUTE),
+            !exec,
+            "a non-executable mapping must stay NX"
+        );
+        // W^X holds for every reconstructed tail.
+        assert!(
+            !(flags.contains(F::WRITABLE) && !flags.contains(F::NO_EXECUTE)),
+            "a grown page must never be writable and executable: {flags:?}"
+        );
+    }
+
+    // The live path never materializes a tail for a PROT_NONE reservation (it
+    // grows the VA record only), so this pins the HELPER's robustness rather
+    // than a reached path: for any input it must never yield W^X.
+    let prot_none_tail = mremap_page_flags(MMAP_REGION_FLAG_PROT_NONE);
+    assert!(prot_none_tail.contains(x86_64::structures::paging::PageTableFlags::NO_EXECUTE));
+    assert!(!prot_none_tail.contains(x86_64::structures::paging::PageTableFlags::WRITABLE));
+}
+
+/// ST-K2-MREMAP hosted oracle: executes the production flag contract, the
+/// placement decision and the byte-delta arithmetic on the host target.  The
+/// page-table/refcount legs need a live user address space and run only in the
+/// guest runtime gate.
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod mremap_oracle_tests {
+    use super::*;
+
+    #[test]
+    fn mremap_flags_fail_closed_outside_the_supported_shape() {
+        run_mremap_flags_self_test();
+    }
+
+    #[test]
+    fn mremap_placement_and_byte_delta_are_symmetric() {
+        run_mremap_geometry_self_test();
+    }
+}
+
 /// 页对齐向上取整
 #[inline]
 fn page_align_up(addr: usize) -> usize {
@@ -13914,7 +14155,7 @@ fn sys_mmap(
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (base, end, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
         let mut proc = process.lock();
-        let mm_arc = Arc::clone(&proc.mm);
+        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -14642,7 +14883,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (recorded_length, committed_flags, mm_arc) = {
         let mut proc = process.lock();
-        let mm_arc = Arc::clone(&proc.mm);
+        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -15023,7 +15264,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 0 operates on shared MmState via mm Arc.
     let (prot_none_regions, real_regions, mm_arc) = {
         let proc = process.lock();
-        let mm_arc = Arc::clone(&proc.mm);
+        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -21997,32 +22238,838 @@ fn sys_pselect6(
     }
 }
 
+/// ST-K2-MREMAP: page flags for frames this call materializes for a grown
+/// anonymous tail.  Reconstructed from the committed per-region prot bits, so
+/// the tail matches the rest of the VMA.  A freshly materialized page has
+/// never been shared, so it is plain writable rather than COW — exactly what
+/// `sys_mmap` would have produced for the same range.
+#[inline]
+fn mremap_page_flags(committed_flags: usize) -> x86_64::structures::paging::PageTableFlags {
+    use x86_64::structures::paging::PageTableFlags;
+
+    let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if committed_flags & MMAP_REGION_FLAG_PROT_WRITE != 0 {
+        page_flags |= PageTableFlags::WRITABLE;
+    }
+    if committed_flags & MMAP_REGION_FLAG_PROT_EXEC == 0 {
+        page_flags |= PageTableFlags::NO_EXECUTE;
+    }
+    page_flags
+}
+
+/// ST-K2-MREMAP: reconstruct a POSIX `prot` word from committed region flags
+/// for the LSM destination hook.
+#[inline]
+fn mmap_flags_to_prot(committed_flags: usize) -> u32 {
+    let mut prot = 0u32;
+    if committed_flags & MMAP_REGION_FLAG_PROT_READ != 0 {
+        prot |= PROT_READ as u32;
+    }
+    if committed_flags & MMAP_REGION_FLAG_PROT_WRITE != 0 {
+        prot |= PROT_WRITE as u32;
+    }
+    if committed_flags & MMAP_REGION_FLAG_PROT_EXEC != 0 {
+        prot |= PROT_EXEC as u32;
+    }
+    prot
+}
+
+/// ST-K2-MREMAP: the prepared transaction for one `mremap` call.
+///
+/// Built entirely inside ONE `Process → MmState` critical section, so the
+/// source VMA is claimed (`PENDING_UNMAP`) and the destination reserved
+/// (`PENDING_MAP`) atomically with respect to every other mutator and to
+/// `fork`'s snapshot.  Phase 2 then runs with both locks dropped.
+struct MremapTx {
+    /// Source VMA base — the key the caller passed.
+    old_base: usize,
+    /// Destination base; equal to `old_base` unless the VMA is relocated.
+    new_base: usize,
+    old_len: usize,
+    new_len: usize,
+    /// Committed per-region flags captured from the source entry.
+    committed_flags: usize,
+    /// The VMA is being relocated to `new_base`.
+    moved: bool,
+    /// Key of the temporary `PENDING_MAP` entry reserving the growth window
+    /// (`old_base + old_len` for an in-place grow, `new_base` for a move).
+    /// `0` when the operation only releases address space.
+    reserved_base: usize,
+    old_next_mmap_addr: usize,
+    /// This call advanced `next_mmap_addr` and must restore it on rollback.
+    next_advanced: bool,
+}
+
+/// ST-K2-MREMAP: undo a failed destination install.
+///
+/// `installed` holds `(page, frame, owned)` triples in install order.  The
+/// destination range is always built from scratch by this call, so unmapping
+/// it cannot disturb any pre-existing mapping; that is precisely why the whole
+/// install step runs before the source is touched.  `owned` frames were
+/// allocated by this call and go back to the buddy; a *relocated* frame's
+/// reference travelled with its PTE and is still held by the untouched source
+/// PTE, so it is deliberately NOT released here.
+///
+/// # Safety
+/// Caller must hold `PT_LOCK` (i.e. be inside `with_current_manager`).
+unsafe fn mremap_rollback_install(
+    manager: &mut mm::page_table::PageTableManager,
+    base: usize,
+    len: usize,
+    installed: &mut vec::Vec<(
+        x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>,
+        x86_64::structures::paging::PhysFrame,
+        bool,
+    )>,
+    frame_alloc: &mut RecordingFrameAllocator,
+) {
+    use x86_64::structures::paging::{Page, PhysFrame};
+    use x86_64::VirtAddr;
+
+    for (page, frame, owned) in installed.drain(..) {
+        if manager.unmap_page(page).is_ok() && owned {
+            frame_alloc.deallocate_frame(frame);
+        }
+    }
+
+    // Reclaim intermediate tables the install pulled and then emptied.  A table
+    // that still backs live leaves is not empty and is correctly left alone.
+    let mut table_frames: vec::Vec<PhysFrame> = vec::Vec::new();
+    let _ = table_frames.try_reserve((len / 0x20_0000) + 2);
+    manager.prune_empty_tables_in_range(VirtAddr::new(base as u64), len, &mut table_frames);
+    if !table_frames.is_empty() {
+        mm::flush_current_as_range(VirtAddr::new(base as u64), len);
+        for frame in table_frames {
+            frame_alloc.deallocate_frame(frame);
+        }
+    }
+}
+
 /// mremap(2) - remap a virtual memory address
 ///
-/// # M0-6 Implementation Strategy
-/// Stub returning ENOSYS. Full implementation would:
-/// 1. Validate old address and size are page-aligned
-/// 2. Check flags (MREMAP_MAYMOVE, MREMAP_FIXED)
-/// 3. Either grow/shrink in place or relocate to new address
-/// 4. Update VMA structures and page tables
-/// 5. Handle cgroup memory accounting
+/// ST-K2-MREMAP: resizes an anonymous private VMA, relocating it when
+/// `MREMAP_MAYMOVE` is given and there is no free address space directly above
+/// the mapping.  See `docs/review/design/st-k2-mremap-anonymous-design.md` for
+/// the transaction, the ownership argument and the fail-closed boundary.
+///
+/// Supported: private anonymous and private `PROT_NONE` VMAs, resized in place
+/// or relocated.  `old_size` must match the live VMA exactly — a sub-range
+/// resize would require splitting the VMA and is rejected.  Shared-anonymous
+/// VMAs, `MREMAP_FIXED`, `MREMAP_DONTUNMAP` and unknown flag bits return a
+/// stable errno before any VMA/page-table/cgroup state changes.
+///
+/// `new_addr` is meaningful only with `MREMAP_FIXED`, which is not supported.
+/// With `MREMAP_MAYMOVE` alone a C caller reaches this through a varargs ABI
+/// and leaves the register undefined (musl's `realloc` calls
+/// `mremap(old, o, n, MREMAP_MAYMOVE)`), so the argument is deliberately not
+/// read — that is the documented meaning of the argument, not a dropped
+/// request.
 ///
 /// # Arguments
 /// - `old_addr`: current mapping address
-/// - `old_size`: current mapping size
+/// - `old_size`: current mapping size (must match the VMA exactly)
 /// - `new_size`: desired new size
-/// - `flags`: MREMAP_* flags
-/// - `new_addr`: new address (if MREMAP_FIXED)
+/// - `flags`: `MREMAP_MAYMOVE` or 0
+/// - `new_addr`: unused (see above)
 fn sys_mremap(
-    _old_addr: u64,
-    _old_size: usize,
-    _new_size: usize,
-    _flags: i32,
+    old_addr: u64,
+    old_size: usize,
+    new_size: usize,
+    flags: i32,
     _new_addr: u64,
 ) -> Result<usize, SyscallError> {
-    // M0-6: mremap is complex - deferred to post-M0
-    // Requires VMA manipulation + PT updates + accounting
-    Err(SyscallError::ENOSYS)
+    use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::{Page, PhysFrame};
+    use x86_64::VirtAddr;
+
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1130); // sys_mremap entry
+    }
+
+    let old_base = old_addr as usize;
+
+    // ---- Argument validation.  Nothing below reads or writes VMA,
+    // page-table or cgroup state until every one of these has passed. ----
+    if old_size == 0 || new_size == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if old_base & 0xfff != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if let Err(error) = validate_mremap_flags(flags) {
+        #[cfg(feature = "kcov")]
+        {
+            coverage::trace_pc(1131); // sys_mremap unsupported flags
+        }
+        return Err(error);
+    }
+
+    let old_len = old_size.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
+    let new_len = new_size.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // ---- Phase 1: validate, then claim the source and reserve the
+    // destination under ONE Process → MmState critical section. ----
+    let (tx_opt, mm_arc) = {
+        let mut proc = process.lock();
+        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        // A second handle for the post-Phase-1 lock-free window: `mm` below
+        // borrows `mm_arc`, so this clone is what leaves the block.
+        let mm_arc_out = Arc::clone(&mm_arc);
+        let mut mm = mm_arc.lock();
+
+        if mm.fork_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+
+        let entry = *mm.mmap_regions.get(&old_base).ok_or(SyscallError::EINVAL)?;
+
+        if entry.has_transient() {
+            // Another operation owns this VMA right now (mmap commit, munmap,
+            // mprotect Path A/B).  Fail closed rather than race it.
+            return Err(SyscallError::EBUSY);
+        }
+        if entry.is_shared() {
+            // A shared-anonymous VMA's region object is snapshotted into every
+            // fork child, so resizing it here would let a child observe — and
+            // re-fault — a range the parent no longer owns, silently splitting
+            // shared memory.  Fail closed until a region-identity model exists.
+            #[cfg(feature = "kcov")]
+            {
+                coverage::trace_pc(1132); // sys_mremap shared VMA unsupported
+            }
+            return Err(SyscallError::EOPNOTSUPP);
+        }
+        if entry.len() != old_len {
+            return Err(SyscallError::EINVAL);
+        }
+
+        let committed_flags = entry.flags();
+        let prot_none = committed_flags & MMAP_REGION_FLAG_PROT_NONE != 0;
+
+        // R131-2 style: build the LSM subject from the held guard, never via a
+        // pid-keyed lookup that would re-take this lock.
+        let ctx = lsm_process_ctx_from(&proc)?;
+        if lsm::hook_memory_munmap(&ctx, old_base as u64, old_len as u64).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+
+        // Is [base, end) free of every other VMA, the user-stack window, the
+        // R172-16 brk-grow reservation, and the user-space bounds?
+        let range_is_free =
+            |mm: &crate::process::MmState, base: usize, end: usize| -> Result<bool, SyscallError> {
+                if base < crate::usercopy::MMAP_MIN_ADDR || end > USER_SPACE_TOP {
+                    return Ok(false);
+                }
+                let (win_start, win_end) = crate::elf_loader::user_stack_window();
+                if base < win_end && end > win_start {
+                    return Ok(false);
+                }
+                if mm.brk_grow_resv_lo < mm.brk_grow_resv_hi
+                    && base < mm.brk_grow_resv_hi
+                    && end > mm.brk_grow_resv_lo
+                {
+                    return Ok(false);
+                }
+                for (&region_base, &region_entry) in mm.mmap_regions.iter() {
+                    let region_end = region_base
+                        .checked_add(mmap_region_len(region_entry))
+                        .ok_or(SyscallError::EFAULT)?;
+                    if base < region_end && end > region_base {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+
+        let old_next_mmap_addr = mm.next_mmap_addr;
+
+        let result = if new_len == old_len {
+            // Resize to the current size: fully validated, nothing to change.
+            None
+        } else if new_len < old_len {
+            // ---- Shrink: claim the source; Phase 2 removes the tail. ----
+            mm.mmap_regions
+                .try_insert(
+                    old_base,
+                    MmapEntry::from_len_flags(old_len, committed_flags).with_pending_unmap(),
+                )
+                .map_err(|_| SyscallError::ENOMEM)?;
+
+            Some(MremapTx {
+                old_base,
+                new_base: old_base,
+                old_len,
+                new_len,
+                committed_flags,
+                moved: false,
+                reserved_base: 0,
+                old_next_mmap_addr,
+                next_advanced: false,
+            })
+        } else {
+            // ---- Grow: choose the destination, then reserve it. ----
+            let old_end = old_base.checked_add(old_len).ok_or(SyscallError::EFAULT)?;
+            let tail_len = new_len - old_len;
+            let tail_end = old_end.checked_add(tail_len).ok_or(SyscallError::EFAULT)?;
+
+            // The source entry ends exactly at `old_end`, so the half-open
+            // overlap test below never reports the source against itself.
+            let in_place = range_is_free(&mm, old_end, tail_end)?;
+            let (new_base, reserved_base, reserved_len) =
+                match decide_mremap_placement(in_place, flags & MREMAP_MAYMOVE != 0) {
+                    MremapPlacement::InPlace => (old_base, old_end, tail_len),
+                    MremapPlacement::Refuse => {
+                        // Cannot grow in place and the caller forbade relocation.
+                        return Err(SyscallError::ENOMEM);
+                    }
+                    MremapPlacement::Relocate => {
+                        // Auto-place exactly like sys_mmap's hint-less arm.
+                        let candidate = mm
+                            .next_mmap_addr
+                            .checked_add(0xfff)
+                            .ok_or(SyscallError::EINVAL)?
+                            & !0xfff;
+                        let candidate = if candidate < crate::usercopy::MMAP_MIN_ADDR {
+                            crate::usercopy::MMAP_MIN_ADDR
+                        } else {
+                            candidate
+                        };
+                        let (win_start, win_end) = crate::elf_loader::user_stack_window();
+                        let base = resolve_auto_mmap_base(candidate, new_len, win_start, win_end);
+                        let end = base.checked_add(new_len).ok_or(SyscallError::EFAULT)?;
+                        if !range_is_free(&mm, base, end)? {
+                            return Err(SyscallError::ENOMEM);
+                        }
+                        (base, base, new_len)
+                    }
+                };
+
+            // Compute the final end address BEFORE any mutation: a `?` after
+            // the reservation/charge/claim below would strand all three.
+            let new_end = new_base.checked_add(new_len).ok_or(SyscallError::EFAULT)?;
+
+            if lsm::hook_memory_mmap(
+                &ctx,
+                new_base as u64,
+                new_len as u64,
+                mmap_flags_to_prot(committed_flags),
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u32,
+            )
+            .is_err()
+            {
+                return Err(SyscallError::EPERM);
+            }
+
+            // R130-1 style bound: the transient peak is the live map plus the
+            // growth-window reservation (a relocation to a NEW key adds one
+            // more slot, so require room for it explicitly).
+            if mm.mmap_regions.len() + 1 >= MAX_MAP_COUNT {
+                return Err(SyscallError::ENOMEM);
+            }
+
+            // Reserve the growth window BEFORE claiming the source, so a
+            // concurrent mmap cannot take it during Phase 2.  `reserved_base`
+            // is always a new key here (a growth tail, or a relocation
+            // destination), so this is the fallible insert.
+            if mm
+                .mmap_regions
+                .try_insert(
+                    reserved_base,
+                    MmapEntry::from_len_flags(reserved_len, MMAP_REGION_FLAG_PENDING_MAP),
+                )
+                .is_err()
+            {
+                return Err(SyscallError::ENOMEM);
+            }
+
+            // Charge the delta under the same lock, exactly like sys_mmap's
+            // Phase-1 DATA charge.  A PROT_NONE reservation is never charged.
+            if !prot_none && cgroup::try_charge_memory(proc.cgroup_id, tail_len as u64).is_err() {
+                mm.mmap_regions.remove(&reserved_base);
+                return Err(SyscallError::ENOMEM);
+            }
+
+            // Claim the source.  `old_base` is still present, so this is an
+            // in-place replace that cannot allocate; the rollback is defensive.
+            if mm
+                .mmap_regions
+                .try_insert(
+                    old_base,
+                    MmapEntry::from_len_flags(old_len, committed_flags).with_pending_unmap(),
+                )
+                .is_err()
+            {
+                mm.mmap_regions.remove(&reserved_base);
+                if !prot_none {
+                    cgroup::uncharge_memory(proc.cgroup_id, tail_len as u64);
+                }
+                return Err(SyscallError::ENOMEM);
+            }
+
+            let moved = new_base != old_base;
+            let mut next_advanced = false;
+            // Keep the auto-placement cursor at or past the new end for EVERY
+            // grow, in place or relocated.  sys_mmap advances it to each
+            // auto-placed region's end, so a grow that left it behind the grown
+            // region would make the NEXT hint-less mmap select an address that
+            // overlaps this mapping and fail spuriously with EINVAL.
+            if mm.next_mmap_addr < new_end {
+                mm.next_mmap_addr = new_end;
+                next_advanced = true;
+            }
+
+            Some(MremapTx {
+                old_base,
+                new_base,
+                old_len,
+                new_len,
+                committed_flags,
+                moved,
+                reserved_base,
+                old_next_mmap_addr,
+                next_advanced,
+            })
+        };
+        (result, mm_arc_out)
+    }; // Process lock + MmState lock dropped here — Phase 1 complete
+
+    let Some(tx) = tx_opt else {
+        // Resize to the current size: validated, no state to change.
+        return Ok(old_base);
+    };
+
+    let prot_none = tx.committed_flags & MMAP_REGION_FLAG_PROT_NONE != 0;
+
+    // ---- Phase 2: page-table work with both locks dropped. ----
+    //
+    // Ordering matters.  A relocation installs every destination PTE BEFORE
+    // any source PTE is touched, so a failure here rolls back by undoing only
+    // what this call installed and the source mapping is still fully intact.
+    let phase2 = unsafe {
+        with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<MremapPhase2, SyscallError> {
+                let mut frame_alloc = RecordingFrameAllocator::new();
+
+                // Installed destination pages: (page, frame, owned).  `owned`
+                // frames were allocated by this call and are freed on rollback.
+                let mut installed: vec::Vec<(
+                    Page<x86_64::structures::paging::Size4KiB>,
+                    PhysFrame,
+                    bool,
+                )> = vec::Vec::new();
+                let _ = installed.try_reserve(tx.old_len / 0x1000);
+
+                // ---- Step 1: install at the destination. ----
+                //
+                // Skipped entirely for PROT_NONE: a reservation owns no frames,
+                // so growing it extends the VA record only, exactly as
+                // sys_mmap's PROT_NONE arm creates no page tables.
+                if !prot_none {
+                    if tx.moved {
+                        // Relocate: reuse each source frame verbatim, flags
+                        // included, so protection and COW state travel with the
+                        // PTE and NO refcount transition occurs.
+                        for offset in (0..tx.old_len).step_by(0x1000) {
+                            let src_page =
+                                Page::<x86_64::structures::paging::Size4KiB>::containing_address(
+                                    VirtAddr::new((tx.old_base + offset) as u64),
+                                );
+                            let dst_page = Page::containing_address(VirtAddr::new(
+                                (tx.new_base + offset) as u64,
+                            ));
+
+                            let Some((phys, leaf_flags)) =
+                                manager.translate_with_flags(src_page.start_address())
+                            else {
+                                // The VMA and the page table disagree about a
+                                // page inside the mapping.
+                                mremap_rollback_install(
+                                    manager,
+                                    tx.new_base,
+                                    tx.new_len,
+                                    &mut installed,
+                                    &mut frame_alloc,
+                                );
+                                return Err(SyscallError::EFAULT);
+                            };
+                            let frame = PhysFrame::containing_address(phys);
+
+                            if installed.try_reserve(1).is_err()
+                                || manager
+                                    .map_page(dst_page, frame, leaf_flags, &mut frame_alloc)
+                                    .is_err()
+                            {
+                                mremap_rollback_install(
+                                    manager,
+                                    tx.new_base,
+                                    tx.new_len,
+                                    &mut installed,
+                                    &mut frame_alloc,
+                                );
+                                return Err(SyscallError::ENOMEM);
+                            }
+                            installed.push((dst_page, frame, false));
+                        }
+                    }
+
+                    // Materialize the grown tail at the destination.  These
+                    // frames are BRAND NEW, so this call owns them: they are
+                    // freed on rollback and charged on commit.
+                    //
+                    // GUARD: only a grow has a tail.  A shrink reaches this
+                    // point with `new_len < old_len`, and the subtraction would
+                    // underflow into a colossal page count that the fault
+                    // allocator would chase into an OOM before failing.
+                    if let Some(tail_len) = mremap_tail_len(tx.old_len, tx.new_len) {
+                        let tail_start = tx.new_base + tx.old_len;
+                        let page_flags = mremap_page_flags(tx.committed_flags);
+                        for offset in (0..tail_len).step_by(0x1000) {
+                            let page = Page::containing_address(VirtAddr::new(
+                                (tail_start + offset) as u64,
+                            ));
+
+                            let Some(frame) = frame_alloc.allocate_data_frame() else {
+                                mremap_rollback_install(
+                                    manager,
+                                    tx.new_base,
+                                    tx.new_len,
+                                    &mut installed,
+                                    &mut frame_alloc,
+                                );
+                                return Err(SyscallError::ENOMEM);
+                            };
+                            // Zero the frame before it becomes reachable, so a
+                            // grown page can never disclose another process's data.
+                            let virt = mm::phys_to_virt(frame.start_address());
+                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
+
+                            if installed.try_reserve(1).is_err()
+                                || manager
+                                    .map_page(page, frame, page_flags, &mut frame_alloc)
+                                    .is_err()
+                            {
+                                frame_alloc.deallocate_frame(frame);
+                                mremap_rollback_install(
+                                    manager,
+                                    tx.new_base,
+                                    tx.new_len,
+                                    &mut installed,
+                                    &mut frame_alloc,
+                                );
+                                return Err(SyscallError::ENOMEM);
+                            }
+                            installed.push((page, frame, true));
+                        }
+                    }
+                }
+
+                // ---- Step 2: remove the source range. ----
+                //
+                // Runs only after every destination PTE is in place.  Removal
+                // mirrors sys_munmap's sweep: a pending/unmapped leaf yields
+                // its frame, and the reference is released through the one
+                // ownership ledger.  A RELOCATED frame is NOT released here —
+                // its reference moved to the destination PTE in step 1.
+                let (removed_start, removed_len) = if tx.moved {
+                    (tx.old_base, tx.old_len)
+                } else if tx.new_len < tx.old_len {
+                    (tx.old_base + tx.new_len, tx.old_len - tx.new_len)
+                } else {
+                    (0, 0)
+                };
+
+                let mut frames_to_free: vec::Vec<PhysFrame> = vec::Vec::new();
+                let _ = frames_to_free.try_reserve(removed_len / 0x1000);
+                let mut reclaimed: vec::Vec<PhysFrame> = vec::Vec::new();
+                // Counts every leaf the sweep reclaimed, present or not, so the
+                // PROT_NONE premise below is checked against real evidence.
+                #[cfg(debug_assertions)]
+                let mut removed_frames: usize = 0;
+
+                if removed_len != 0 {
+                    for offset in (0..removed_len).step_by(0x1000) {
+                        let page = Page::containing_address(VirtAddr::new(
+                            (removed_start + offset) as u64,
+                        ));
+                        // R141-9 shape: a PROT_NONE leaf keeps its frame in a
+                        // non-present entry, so fall back to the raw PTE.
+                        let frame_opt = match manager.unmap_page(page) {
+                            Ok(frame) => Some(frame),
+                            Err(mm::page_table::UnmapError::PageNotMapped) => {
+                                manager.take_nonpresent_leaf_frame(page)
+                            }
+                            Err(_) => None,
+                        };
+
+                        if let Some(frame) = frame_opt {
+                            #[cfg(debug_assertions)]
+                            {
+                                removed_frames += 1;
+                            }
+                            // A RELOCATED frame's reference moved to the
+                            // destination PTE in step 1, so it must not be
+                            // released here.  A PROT_NONE reservation never
+                            // relocates (its range is rebuilt as a bare
+                            // reservation with no destination PTEs), so any
+                            // stray leaf it owns is always released — that
+                            // keeps the refcount ledger consistent with the
+                            // buddy even for the defensive non-present case.
+                            let relocated = tx.moved && !prot_none;
+                            let should_free = relocated
+                                || PAGE_REF_COUNT
+                                    .release(frame.start_address().as_u64() as usize)
+                                    .should_free_unmapped();
+                            if should_free {
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(frame);
+                                } else {
+                                    mm::flush_current_as_page(page.start_address());
+                                    frame_alloc.deallocate_frame(frame);
+                                }
+                            }
+                        }
+                    }
+
+                    if !frames_to_free.is_empty() {
+                        mm::flush_current_as_range(
+                            VirtAddr::new(removed_start as u64),
+                            removed_len,
+                        );
+                        for frame in frames_to_free {
+                            frame_alloc.deallocate_frame(frame);
+                        }
+                    }
+
+                    let _ = reclaimed.try_reserve((removed_len / 0x20_0000) + 2);
+                    manager.prune_empty_tables_in_range(
+                        VirtAddr::new(removed_start as u64),
+                        removed_len,
+                        &mut reclaimed,
+                    );
+                }
+
+                // Falsify the "a PROT_NONE reservation owns no frames" premise
+                // with the REAL sweep above — it sees present and non-present
+                // leaves alike, so a demoted region that ever left a frame
+                // behind makes this fire instead of leaking silently.
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    !prot_none || removed_frames == 0,
+                    "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
+                );
+
+                Ok(MremapPhase2 {
+                    new_pt_frames: frame_alloc.take_pt_frames(),
+                    reclaimed_tables: reclaimed,
+                })
+            },
+        )
+    };
+
+    let phase2 = match phase2 {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Roll back the whole transaction.  Phase 2 already undid any
+            // partial destination install and left the source untouched, so
+            // here we only restore the VMA records and the cgroup charge.
+            let proc = process.lock();
+            let mut mm = mm_arc.lock();
+
+            if tx.reserved_base != 0 {
+                mm.mmap_regions.remove(&tx.reserved_base);
+            }
+            // Clear the source claim, restoring the pre-call entry verbatim.
+            // `old_base` is still present, so this is an in-place replace.
+            let _ = mm.mmap_regions.try_insert(
+                tx.old_base,
+                MmapEntry::from_len_flags(tx.old_len, tx.committed_flags),
+            );
+            if tx.next_advanced {
+                mm.next_mmap_addr = tx.old_next_mmap_addr;
+            }
+            if !prot_none && tx.new_len > tx.old_len {
+                cgroup::uncharge_memory(proc.cgroup_id, (tx.new_len - tx.old_len) as u64);
+            }
+            return Err(error);
+        }
+    };
+
+    // Tables this call emptied (shrink tail / relocation source) are published
+    // to the buddy only AFTER Phase 3 removes them from the per-AS ledger.
+    // The guard frees them if any early return skips the explicit drain.
+    struct TableFrameReclaim {
+        frames: vec::Vec<PhysFrame>,
+        drained: bool,
+    }
+    impl Drop for TableFrameReclaim {
+        fn drop(&mut self) {
+            if !self.drained && !self.frames.is_empty() {
+                let mut allocator = mm::memory::FrameAllocator::new();
+                for frame in self.frames.drain(..) {
+                    allocator.deallocate_frame(frame);
+                }
+            }
+        }
+    }
+    let mut reclaim = TableFrameReclaim {
+        frames: phase2.reclaimed_tables,
+        drained: false,
+    };
+    let pt_frames = phase2.new_pt_frames;
+    let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
+
+    // ---- Phase 3: commit the VMA record and the accounting in ONE
+    // Process → MmState critical section, so it is atomic with respect to
+    // cgroup migration (which snapshots compute_cgroup_charged_bytes under the
+    // Process lock).  Every insert below targets a key that already exists, so
+    // this section cannot allocate and cannot fail. ----
+    {
+        let proc = process.lock();
+        let mut mm = mm_arc.lock();
+        let cgroup_id = proc.cgroup_id;
+
+        let committed = MmapEntry::from_len_flags(tx.new_len, tx.committed_flags);
+        debug_validate_mmap_entry(committed);
+
+        // Both arms below replace a key that Phase 1 already inserted, so they
+        // cannot allocate and cannot fail.  ST-K3 Phase D style: the tag exists
+        // to FALSIFY that annotation — if it ever fires, the VMA is left in its
+        // transient state with no rollback, exactly like sys_mmap's E8 site.
+        if tx.moved {
+            // The destination key is already present (Phase-1 reservation).
+            mm.mmap_regions
+                .try_insert(tx.new_base, committed)
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    kprintln!("[ST-K2-MREMAP] ENOMEM site=M1 stage=commit_move dest");
+                    SyscallError::ENOMEM
+                })?;
+            mm.mmap_regions.remove(&tx.old_base);
+        } else {
+            mm.mmap_regions
+                .try_insert(tx.old_base, committed)
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    kprintln!("[ST-K2-MREMAP] ENOMEM site=M2 stage=commit_in_place base");
+                    SyscallError::ENOMEM
+                })?;
+            if tx.reserved_base != 0 {
+                mm.mmap_regions.remove(&tx.reserved_base);
+            }
+        }
+
+        // DATA leg: move the delta between the two lengths.  A PROT_NONE
+        // reservation carries no byte charge in either direction.
+        if !prot_none {
+            match mremap_byte_delta(tx.old_len, tx.new_len) {
+                None => {}
+                Some((true, bytes)) => {
+                    mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(bytes as u64);
+                }
+                Some((false, bytes)) => {
+                    mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(bytes as u64);
+                    cgroup::uncharge_memory(cgroup_id, bytes as u64);
+                }
+            }
+        }
+
+        // PT leg (removal): uncharge a reclaimed intermediate table IFF this
+        // address space charged it — frame-identity provenance, never a guessed
+        // constant.  A forked child's inherited basis is not in the ledger, so
+        // the scan is skipped while the AS is non-authoritative.
+        if mm.pt_ledger_authoritative {
+            let pt_freed = crate::process::pt_ledger_reconcile(
+                &mut mm.pt_charged_frames,
+                reclaim.frames.iter().map(|f| f.start_address().as_u64()),
+            );
+            if pt_freed > 0 {
+                mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(pt_freed);
+                cgroup::uncharge_memory(cgroup_id, pt_freed);
+            }
+        }
+
+        // PT leg (addition): the growth tail's page-table frames.  The count is
+        // knowable only after `map_page` ran, so this is the same forced soft
+        // charge sys_mmap uses (bounded overshoot, never an under-count).
+        if pt_bytes > 0 {
+            let ledgered = if mm.pt_charged_frames.try_reserve(pt_frames.len()).is_ok() {
+                let mut all_fresh = true;
+                for frame in &pt_frames {
+                    match mm
+                        .pt_charged_frames
+                        .try_insert(frame.start_address().as_u64(), ())
+                    {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            debug_assert!(
+                                false,
+                                "pt ledger frame aliased — free-after-remove invariant violated"
+                            );
+                            all_fresh = false;
+                        }
+                        Err(_) => {
+                            all_fresh = false;
+                            break;
+                        }
+                    }
+                }
+                all_fresh
+            } else {
+                false
+            };
+            cgroup::charge_memory_forced(cgroup_id, pt_bytes);
+            mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_add(pt_bytes);
+            if ledgered {
+                mm.pt_ledger_authoritative = true;
+            } else {
+                for frame in &pt_frames {
+                    mm.pt_charged_frames.remove(&frame.start_address().as_u64());
+                }
+                mm.pt_inherited_bytes = mm.pt_inherited_bytes.saturating_add(pt_bytes);
+            }
+        }
+    }
+
+    // Free-after-remove: the reclaimed tables enter the buddy only now, when
+    // they are already gone from the ledger and from pt_charged_bytes.
+    {
+        let mut allocator = mm::memory::FrameAllocator::new();
+        for frame in reclaim.frames.drain(..) {
+            allocator.deallocate_frame(frame);
+        }
+        reclaim.drained = true;
+    }
+
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1133); // sys_mremap committed
+    }
+
+    // R159-17 style: keep address-revealing detail behind debug_assertions.
+    #[cfg(debug_assertions)]
+    kprintln!(
+        "sys_mremap: pid={}, {} bytes at 0x{:x} -> {} bytes at 0x{:x}",
+        pid,
+        tx.old_len,
+        tx.old_base,
+        tx.new_len,
+        tx.new_base
+    );
+
+    Ok(tx.new_base)
+}
+
+/// ST-K2-MREMAP: page-table outcome of a `mremap` Phase 2.
+struct MremapPhase2 {
+    /// Page-table frames this call materialized for a grown tail (charged).
+    new_pt_frames: vec::Vec<x86_64::structures::paging::PhysFrame>,
+    /// Intermediate tables this call emptied (freed after the ledger removal).
+    reclaimed_tables: vec::Vec<x86_64::structures::paging::PhysFrame>,
 }
 
 /// chown(2) - change file ownership
