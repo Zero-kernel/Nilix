@@ -386,9 +386,12 @@ pub fn test_context_switch() {
 /// 测试内存映射
 pub fn test_memory_mapping() {
     kernel_core::syscall::run_mmap_flags_self_test();
+    kernel_core::syscall::run_mremap_flags_self_test();
+    kernel_core::syscall::run_mremap_geometry_self_test();
     mm::run_memory_capability_self_test();
     klog_always!("  [TEST] Memory Mapping...");
     klog_always!("    [PASS] ST-K2-P1 mmap flags fail-closed oracle");
+    klog_always!("    [PASS] ST-K2-MREMAP flags + placement/delta oracle");
     klog_always!("    [PASS] 3.3 slab/NUMA/swap/THP ownership oracles");
     klog_always!("    ✓ mmap system call implemented");
     klog_always!("    ✓ munmap system call implemented");
