@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 boot-check musl-check test-smp test-smp-4core test-smp-extended stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm boot-check musl-check test-smp test-smp-4core test-smp-extended stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -531,6 +531,14 @@ run-both: build
 test: build
 	@echo "=== 启动内核（运行时测试套件门禁）==="
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/kernel_test.sh esp
+
+# ST-K2-MREMAP / ST-K2-P2 ring-3 memory oracle. Boots the `syscall_test` guest
+# (built by `build-syscall-test`) and checks the Ring-3 verdict for the
+# anonymous-resize and shared-anonymous legs. Separate from `test` because that
+# workload demand-faults by design, which `kernel_test.sh` bans outright.
+test-ring3-mm: build-syscall-test
+	@echo "=== Running Ring-3 memory-management oracle ==="
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/ring3_mm_oracle.sh esp
 
 # R180-6 production filesystem gate: attach the reproducibly journaled image
 # so the mounted-image probe exercises real JBD2 transactions.
