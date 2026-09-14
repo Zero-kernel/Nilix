@@ -50,6 +50,9 @@ pub const SYS_MUNMAP: u64 = 11;
 /// Change data segment size
 pub const SYS_BRK: u64 = 12;
 
+/// Remap a virtual memory address (ST-K2-MREMAP)
+pub const SYS_MREMAP: u64 = 25;
+
 /// Yield CPU voluntarily
 pub const SYS_YIELD: u64 = 24;
 
