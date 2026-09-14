@@ -200,9 +200,9 @@ Cargo 分层与回调打破依赖环，**不**创造特权边界。受信任引�
 
 **已有：** UEFI 移交、重定位 PIE 内核、高半/恒等映射、内存保留、buddy/全局堆、计费可失败容器、guard、页缓存与 OOM 机制。匿名 mmap/munmap/mprotect/brk、PROT_NONE 与 COW fork 有真实用户态路径。RF180-20 修复了 fork/exec/拆除间共享监督页表所有权；完整四工人缓解负载已练此修复。
 
-**缺失：** `sys_mmap` 仍接受除策略转发外未使用的 flags 参数；MAP_SHARED/MAP_FIXED 语义未实现。文件映射返回 EOPNOTSUPP；mremap 返回 ENOSYS。共享匿名内存、slab、NUMA、swap 与 THP 不是合格特性。压力 MAP_SHARED 报告页无法提供预期的 fork 共享通信。
+**缺失：** MAP_FIXED 与文件映射未实现（返回 EOPNOTSUPP）；共享匿名 `mremap` 未实现（共享区域会被快照进每个 fork 子进程，扩容/缩容需要按 VMA 的身份模型）。`sys_mremap` 已不再返回 ENOSYS：私有匿名与私有 `PROT_NONE` VMA 可原地扩缩或在 `MREMAP_MAYMOVE` 下搬迁，复用与 mmap/munmap 相同的三阶段 VMA/页表事务（[设计](review/design/st-k2-mremap-anonymous-design.md)）；其页表/引用计数行为分支需要真实用户地址空间，仍待独立评审与 guest 验证，树内 oracle 只覆盖 flags/placement/delta 契约。共享匿名内存、slab、NUMA、swap 与 THP 不是合格特性。压力 MAP_SHARED 报告页无法提供预期的 fork 共享通信。
 
-**R186-4 仍开放：** MmState 映射已用 AdmittedMap，但 fork 在准入前分配快照，且 `from_sorted_vec_charged` 仍调用 `shrink_to_fit`。关闭需要机制评审、计费对称与 live-delta 测试，而非又一次容器迁移声明。责任人：**P0-A、ST-K2-P1/P2、U55-6**；[准入设计](review/design/p0-a-r186-4-admission-closure-design.md)。
+**R186-4 最终远程验证已在受支持范围内完成：** fork 快照先预留后分配，准入映射构造器不再执行不可失败的 `shrink_to_fit`。本地计费/清理 oracle、两轮独立 U23 安全路径评审，以及 `40c-devbox-ts` 上 `/tmp/zero-os-codex-final-20260913` 最终副本的 MM 26/26、kernel-core、hosted、build 与 lint 均通过；runtime/boot/四核 SMP 为零失败合格。有界的 CorruptState 策略、musl 标记与严格 guest/平台验证仍待完成。责任人：**ST-K2-P1/P2、U55-6**；[准入设计](review/design/p0-a-r186-4-admission-closure-design.md)。
 
 ### 5.2 进程、线程、调度与拆除
 

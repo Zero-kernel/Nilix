@@ -37,7 +37,7 @@ fuzz、描述符/路径/凭据、TLS 迁移、BIO 生命周期和缓解状态真
 | 组件 | 当前能力 | 缺失能力与边界 |
 | --- | --- | --- |
 | UEFI 与启动 | PIE 内核加载/重定位、内存图交接、KASLR 放置、基础控制台 | x86_64 平台范围；更多固件/物理平台及早期 W+X 转换验证 |
-| 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制 | R186-4 闭环；MAP_SHARED/MAP_FIXED 语义、文件映射、mremap；无已验收 slab/NUMA/swap/THP |
+| 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | 本切片的远程 MM/core/hosted/build/lint 验证已完成，`mremap` 已远程验证且 Ring-3 oracle 门禁（`make test-ring3-mm`）通过，但独立评审仍待完成；MAP_SHARED/MAP_FIXED 语义、文件映射、共享匿名 `mremap`；无已验收 slab/NUMA/swap/THP |
 | 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试 | waitid、PID1/reaper 及更广的失败/压力路径 |
 | 线程与 TLS | 受限 CLONE_VM/TLS 创建，SMP 迁移时 FS/user-GS 恢复已有 guest 证据 | 通用 CLONE_THREAD/FILES/FS/SIGHAND 组合拒绝；不能宣称 pthread 兼容 |
 | 调度与 SMP | 每 CPU MLFQ、抢占、工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序 | 更高核数/长时间/物理并发验证；64 核是实现上限，不是已验证拓扑 |
