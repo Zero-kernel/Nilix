@@ -6851,6 +6851,15 @@ fn exec_from_bytes(
                 &mut mm.shared_regions,
                 mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             );
+            // exec replaces the whole userspace image, so every VMA the old
+            // image owned must be dropped: the uncharge loop above already
+            // released their cgroup bytes. Leaving the entries behind lets a
+            // stale region describe an address the new image now uses, which
+            // makes sys_brk refuse to grow (overlap check) and makes sys_mmap
+            // fail its Phase-1 overlap test with a spurious ENOMEM. It also
+            // re-uncharges those same bytes on every later exec. `clear()`
+            // drops the entries and returns their admission capacity.
+            mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
             // ST-K3 FIX: use the shared constant (was a duplicated 0x4000_0000
             // literal — the old 1 GiB window collided with the inherited
