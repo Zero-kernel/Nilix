@@ -15,6 +15,9 @@ import tempfile
 import time
 
 MAX_EXEC_RETRIES = 64
+# Repeated stops for an already recorded site/CPU pair only pause the proof
+# while the outstanding CPUs are waited for; they must never be unbounded.
+MAX_PAIR_REPEATS = 4096
 
 try:
     from qemu_fuzz_smoke import source_identity
@@ -925,6 +928,7 @@ def runtime(args, output, sites, expected_kernel, linked, anchor_bytes):
             write_json(output / "runtime-sites.json", sites)
             remaining = {site["address"]: site for site in sites}
             observed_cpus = {site["name"]: set() for site in sites}
+            repeats = 0
             for address in remaining:
                 remote.ok(f"Z1,{address:x},1")
             remote.ok(f"M{relocation['release']:x},1:01")
@@ -940,6 +944,15 @@ def runtime(args, output, sites, expected_kernel, linked, anchor_bytes):
                 site = remaining.get(before["rip"])
                 if site is None:
                     raise ProofFailure(f"unexpected guest stop RIP={before['rip']:x}: {stop}")
+                # QEMU keeps an address-level breakpoint armed for every vCPU
+                # that reaches it, so a site whose remaining CPUs never appear
+                # is revisited without progress. Bound those repeats so the
+                # proof reports the missing observation instead of letting the
+                # run end on an uninformative expired deadline.
+                if cpu in observed_cpus[site["name"]]:
+                    repeats += 1
+                    require(repeats <= MAX_PAIR_REPEATS,
+                            "proof site never reached its remaining CPUs: " + site["name"])
                 prefix = (output / "serial.log").read_bytes()
                 mappings_before = parse_mapping_records(prefix.decode(errors="replace"))
                 # Remove this site's breakpoint before stepping through its instruction.
