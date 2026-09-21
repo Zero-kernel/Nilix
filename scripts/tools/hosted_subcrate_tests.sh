@@ -155,7 +155,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 26 0 \
+run_suite mm 27 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
