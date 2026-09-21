@@ -119,8 +119,18 @@ filesystem correctly reports as a fail-closed I/O error to `open()`/`write()`.
    `... aborted by used-ring quarantine ...`), and the wait no longer holds the
    device lock for the whole budget before the reset.
 
+4. **Unreconcilable completions fail closed (R189-2).** Review of the wait policy
+   found the inner used-ring drain could not terminate for one device-controlled
+   state: an in-bounds `used.id` matching no in-flight request was logged and
+   skipped, and the watchdog budget is charged once per *outer* poll, so a device
+   that keeps publishing such entries would hold the drain (and the device lock)
+   without ever reaching the budget or the reset path. The first such completion
+   now quarantines the queue (`VirtQueue::reject_unknown_completion`), which ends
+   the drain, makes the wait predicate false and hands control to the fail-closed
+   reset path - the policy the existing R66-5 used-ring violations already use.
+
 `scripts/tools/hosted_subcrate_tests.sh` raises the `block` exact-count oracle from
-22 to 24 (watchdog oracle plus used-ring quarantine oracle);
+22 to 25 (watchdog, ring-quarantine and unreconcilable-completion oracles);
 
 ## 4b. The R189-1 predicate regression, and why the watchdog is still a counter (2026-09-21)
 
@@ -184,12 +194,19 @@ under TCG.
 
 | check | result |
 |---|---|
-| `cargo test -p block --features mm/host_harness --lib` | 24/24 pass (`wait_budget_is_monotonic_and_bounded`, `quarantined_queue_stops_draining_and_ends_the_wait`) |
+| `cargo test -p block --features mm/host_harness --lib` | 25/25 pass (`wait_budget_is_monotonic_and_bounded`, `quarantined_queue_stops_draining_and_ends_the_wait`, `unreconcilable_completions_quarantine_instead_of_looping_the_drain`) |
+| oracle sensitivity: predicate inverted back to `!pending` | `quarantined_queue_stops_draining_and_ends_the_wait` FAILS (hosted test exit 101) |
+| oracle sensitivity: budget restored to the pre-fix `1_000_000` | `wait_budget_is_monotonic_and_bounded` FAILS (hosted test exit 101) |
 | `cd kernel && cargo clippy --release --target x86_64-unknown-none -Z build-std=...` | exit 0 (no new errors; the crate's pre-existing warnings are unchanged) |
 | `cd kernel && cargo check --release --target x86_64-unknown-none -Z build-std=...` | exit 0 |
 | `make lint` (remote tree `4c19b99`) | exit 0 (ABI oracle PASS) |
 | `make test-hosted-subcrates` (remote tree `4c19b99`) | exit 0 - 447 unit tests; `block` 24/24 |
 | `make build-syz-kcov` (remote tree `4c19b99`, `kernel/block/src/virtio/blk.rs` sha256 `ee4fae7f293602146ab115136ea27984d9f9934c896234833e4887bbf0ad03d5`) | exit 0 - `esp-syz/kernel.elf` sha256 `95d46b50c3dc2c6036a9228936f053700ed15194c78e6d2ca4c2d1060ab79850` |
+| `make lint` / `make test-hosted-subcrates` (remote tree of the R189-2 revision, `blk.rs` sha256 `d146546a4c11297fc61c529a8a92c624f4f92cec0835f34eeb2a31486e5432c3`) | exit 0 - 448 unit tests; `block` 25/25 |
+| `make build-syz-kcov` (R189-2 revision, same tree) | exit 0 - `esp-syz/kernel.elf` sha256 `53ecb4622703ba694ab20ca2a99bd86b90df713fac19c67f52334d871996b74e` |
+| `qemu_smoke` with the R189-2 kernel (remote, TCG) | `QEMU-FUZZ-SMOKE PASS seeds=2`; both guests `NILIX_SYZ_V2_PASS`; zero `virtio-blk` diagnostics |
+| unreconcilable-completion oracle scope | the strengthened test also publishes a second in-bounds entry after quarantine and pins that the drain yields nothing and the iteration counter still advances (the diagnostic reports one spent poll, not zero) |
+| CI run `35577402201` on the pushed revision | `QEMU / qemu-fuzz` PASS (`Quality`, `Hosted`, `Kernel`, `QEMU / musl`, `QEMU / mitigation`, `QEMU / iommu` also PASS) |
 | `qemu_smoke` with that kernel (remote, TCG) | `QEMU-FUZZ-SMOKE PASS seeds=2`; both guests `NILIX_SYZ_V2_PASS`; zero `virtio-blk` diagnostics on the healthy path |
 | forced short-budget proof (budget temporarily `1_000` polls, same tree) | release serial carries `[virtio-blk] request wait budget expired head=2 sector=40 bytes=4096 spins=1000 ...` plus `R106-3: initiating device reset` / `reset successful`, and the guest fails closed - the attributed diagnostic the 2026-09-21 artifact was missing |
 | instrumentation of the failure site with the R189-1 predicate regression (trees `3b709d4`, `49d0db3`) | `diag budget=50000000 left=50000000 spent=0 head=0`, `diag fatal=false dev_failed=false`, then `request wait budget expired ... spins=0` - proves the wait loop never polled; see section 4b |
