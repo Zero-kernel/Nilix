@@ -533,6 +533,28 @@ impl VirtQueue {
     fn is_fatal(&self) -> bool {
         self.fatal.load(Ordering::Acquire)
     }
+
+    /// R189-2 FIX: reject a used-ring entry that cannot be reconciled with any
+    /// in-flight request and quarantine the queue until `reset_device` rebuilds
+    /// the ring state.
+    ///
+    /// Every legitimate completion echoes a head descriptor this driver
+    /// published, so an in-bounds `used.id` with no matching request is only
+    /// reachable if the device fabricates completions.  Ignoring such an entry
+    /// is not safe: both synchronous waits charge their watchdog budget once per
+    /// *outer* poll and drain the used ring in an inner loop, so a device that
+    /// keeps publishing unreconcilable completions would hold the device lock
+    /// and keep re-emitting the release-visible diagnostic without ever
+    /// reaching the budget or the reset path.
+    fn reject_unknown_completion(&self, used_id: u32) {
+        klog!(
+            Error,
+            "[virtio-blk] R189-2 SECURITY: completion for unknown descriptor head={}; \
+             quarantining the queue until reset",
+            used_id
+        );
+        self.fatal.store(true, Ordering::Release);
+    }
 }
 
 // ============================================================================
@@ -1076,11 +1098,12 @@ impl VirtioBlkDevice {
         }) {
             Some(entry) => entry,
             None => {
-                klog!(
-                    Error,
-                    "[virtio-blk] completion for unknown descriptor head={} ignored",
-                    used.id
-                );
+                // R189-2 FIX: an unreconcilable completion is a device protocol
+                // violation, not something to skip.  Skipping it drains the
+                // inner used-ring loop without charging the watchdog, so a
+                // hostile device could hold this loop (and the device lock)
+                // forever instead of failing closed into the reset path.
+                self.queue.reject_unknown_completion(used.id);
                 return None;
             }
         };
@@ -2272,5 +2295,61 @@ mod tests {
         assert!(!wait_should_continue(true, true, false));
         assert!(!wait_should_continue(true, false, true));
         assert!(!wait_should_continue(false, true, true));
+    }
+
+    #[test]
+    fn unreconcilable_completions_quarantine_instead_of_looping_the_drain() {
+        use crate::virtio::{VringUsed, VringUsedElem};
+
+        // A live ring hands its completion to the drain loop.
+        let (queue, mut used_mem) = queue_with_pending_completion(8, 1, 3);
+        let head = queue
+            .pop_used()
+            .expect("a live ring yields its pending completion")
+            .id;
+        assert_eq!(head, 3);
+        assert!(!queue.is_fatal());
+
+        // The drain's policy for a completion whose head matches no in-flight
+        // request is quarantine.  Skipping it instead was the pre-R189-2
+        // behaviour, and it is not safe: the inner drain charges no watchdog
+        // budget, so a device that keeps publishing in-bounds but unknown heads
+        // keeps the drain, the device lock and the release-visible diagnostic
+        // busy forever instead of failing closed into the reset path.
+        let mut wait = RequestWait::start();
+        queue.reject_unknown_completion(head);
+        assert!(queue.is_fatal());
+
+        // A device that keeps publishing cannot restart the drain: the fatal
+        // short-circuit runs before any device-controlled state is read.
+        // SAFETY: `used_mem` backs this queue's used ring for the whole test and
+        // has room for two entries (size = 8).
+        unsafe {
+            let used = used_mem.as_mut_ptr() as *mut VringUsed;
+            (*used).idx = (*used).idx.wrapping_add(1);
+            (*used)
+                .ring
+                .as_mut_ptr()
+                .add(1)
+                .write(VringUsedElem { id: 7, len: 512 });
+        }
+
+        // Reproduce the production iteration shape: the drain ends without
+        // yielding anything, the iteration is charged once exactly like
+        // `do_request`/`flush` charge after the drain (the real diagnostic
+        // therefore reports one spent iteration, not zero), and the predicate
+        // then ends the wait.
+        let mut drained = 0usize;
+        while queue.pop_used().is_some() {
+            drained += 1;
+            assert!(drained < 2, "a quarantined ring must stop draining");
+        }
+        assert_eq!(drained, 0);
+        assert!(wait.spend());
+        assert_eq!(wait.spins_spent(), 1);
+        assert!(
+            !wait_should_continue(true, queue.is_fatal(), wait.expired()),
+            "an unreconcilable completion must end the wait instead of draining on"
+        );
     }
 }
