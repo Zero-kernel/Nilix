@@ -34,6 +34,8 @@ host_harness = ["mm/host_harness", "cpu_local/host_harness"]
 # Default-off boot probes before any Ring-3 task is scheduled.
 namespace_probe = []
 open_fault_probe = []
+# Guest-only syscall fixture hooks (shared-fault verification oracle).
+syscall_test = []
 
 [dependencies]
 spin = "0.9"

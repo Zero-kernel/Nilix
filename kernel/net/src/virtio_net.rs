@@ -129,6 +129,10 @@ pub struct VirtioNetDevice {
     /// Set only after acknowledged reset; suppresses a second MMIO teardown in
     /// `Drop` after the outer PCI guard has cleared MSE.
     teardown_complete: bool,
+    /// A malformed used-ring entry observed from IRQ context. Recovery is
+    /// deferred until a process-context receive/replenish call can block and
+    /// release DMA owners safely.
+    queue_fault_pending: bool,
 }
 
 /// Network device statistics.
@@ -331,6 +335,7 @@ impl VirtioNetDevice {
             stats: NetStats::default(),
             dma_activated: false,
             teardown_complete: false,
+            queue_fault_pending: false,
         })
     }
 
@@ -620,6 +625,82 @@ impl VirtioNetDevice {
         }
         self.rx_ready.push(buf);
     }
+
+    /// Stop a queue after malformed device-owned ring data and reclaim the
+    /// driver-owned chains once reset has acknowledged quiescence. A fatal
+    /// queue is never reused with stale cursors or metadata.
+    fn quarantine_after_queue_fault(&mut self) {
+        if self.teardown_complete {
+            return;
+        }
+
+        let reset_ok = if self.dma_activated {
+            self.rollback_unpublished()
+        } else {
+            unsafe {
+                self.transport.queue_ready(QUEUE_RX, false);
+                self.transport.queue_ready(QUEUE_TX, false);
+                self.transport
+                    .reset_and_await_ack(PUBLICATION_RESET_ACK_SPINS)
+            }
+        };
+        if !reset_ok {
+            // Keep all DMA owners pinned until a later teardown attempt can
+            // prove reset acknowledgement. Releasing them while the device
+            // may still be bus-mastering would be a use-after-free.
+            kprintln!(
+                "[net] malformed virtio completion; reset not acknowledged, device quarantined"
+            );
+            return;
+        }
+
+        for head in 0..self.tx_queue.size() {
+            if let Some(next) = self.tx_chain_next[head as usize].take() {
+                self.tx_queue.free_desc(next);
+            }
+            self.tx_queue.free_desc(head);
+            self.tx_inflight[head as usize].take();
+        }
+        for head in 0..self.rx_queue.size() {
+            if let Some(next) = self.rx_chain_next[head as usize].take() {
+                self.rx_queue.free_desc(next);
+            }
+            self.rx_queue.free_desc(head);
+        }
+        // RF188-2 FIX: Keep every pool-origin buffer in its existing owner
+        // slot until the next process-context replenish call can return it
+        // through the pool's provenance check. Moving into a new Vec here
+        // could itself OOM on a malformed-device path; dropping would leave
+        // the fixed pool's in_use ledger permanently inflated.
+        self.queue_fault_pending = false;
+        self.link = LinkStatus::DOWN;
+        if !self.dma_activated {
+            // The pre-publication branch has no rollback guard to update, but
+            // reset acknowledgement still proves the transport is terminal.
+            self.teardown_complete = true;
+        }
+        kprintln!("[net] malformed virtio completion; queues reset and device stopped");
+    }
+
+    fn return_quarantined_rx_buffers(&mut self, pool: &BufPool) {
+        for buf in self.rx_recycle.drain(..) {
+            if let Err(buf) = pool.try_free(buf) {
+                drop(buf);
+            }
+        }
+        for buf in self.rx_ready.drain(..) {
+            if let Err(buf) = pool.try_free(buf) {
+                drop(buf);
+            }
+        }
+        for inflight in &mut self.rx_inflight {
+            if let Some(inflight) = inflight.take() {
+                if let Err(buf) = pool.try_free(inflight.buf) {
+                    drop(buf);
+                }
+            }
+        }
+    }
 }
 
 /// R95-7 FIX: Implement Drop to quiesce device before DMA buffers are freed.
@@ -717,6 +798,9 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn transmit(&mut self, buf: NetBuf) -> Result<(), (TxError, NetBuf)> {
+        if self.teardown_complete || self.tx_queue.is_fatal() {
+            return Err((TxError::LinkDown, buf));
+        }
         // Validate buffer
         if buf.headroom() < VIRTIO_NET_HDR_SIZE {
             return Err((TxError::InvalidBuffer, buf));
@@ -780,6 +864,9 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn reclaim_tx(&mut self) -> usize {
+        if self.teardown_complete {
+            return 0;
+        }
         let mut reclaimed = 0;
         let qsize = self.tx_queue.size() as u32;
 
@@ -822,16 +909,36 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn receive(&mut self) -> Result<Option<NetBuf>, RxError> {
+        if self.teardown_complete {
+            return Err(RxError::LinkDown);
+        }
+        if self.queue_fault_pending || self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+            self.quarantine_after_queue_fault();
+            return Err(RxError::LinkDown);
+        }
         // First check if we have buffered packets
         if let Some(buf) = self.rx_ready.pop() {
             return Ok(Some(buf));
         }
 
         // Poll for new packets (no pool for returning buffers in simple receive path)
-        self.pop_rx_used(None)
+        let result = self.pop_rx_used(None);
+        if self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+            self.quarantine_after_queue_fault();
+            return Err(RxError::LinkDown);
+        }
+        result
     }
 
     fn replenish_rx(&mut self, pool: &BufPool, count: usize) -> usize {
+        if self.teardown_complete {
+            self.return_quarantined_rx_buffers(pool);
+            return 0;
+        }
+        if self.queue_fault_pending || self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+            self.quarantine_after_queue_fault();
+            return 0;
+        }
         let mut posted = 0;
 
         for _ in 0..count {
@@ -930,11 +1037,31 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn rx_recycle_pending(&self) -> usize {
-        self.rx_recycle.len()
+        if self.teardown_complete {
+            self.rx_recycle.len()
+                + self.rx_ready.len()
+                + self
+                    .rx_inflight
+                    .iter()
+                    .filter(|entry| entry.is_some())
+                    .count()
+        } else {
+            self.rx_recycle.len()
+        }
     }
 
     fn poll(&mut self) -> bool {
+        if self.teardown_complete {
+            return false;
+        }
         let tx_done = self.reclaim_tx();
+        if self.tx_queue.is_fatal() {
+            // RF188-4 FIX: Once either device-owned ring is malformed, do not
+            // consume entries from the sibling ring before process-context
+            // quarantine runs.
+            self.queue_fault_pending = true;
+            return tx_done > 0;
+        }
         let mut rx_done = 0;
 
         // Process all available RX completions
@@ -952,6 +1079,14 @@ impl NetDevice for VirtioNetDevice {
                     break;
                 }
             }
+        }
+
+        if self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+            // `poll` is also called by `handle_interrupt`; reset/allocator
+            // work is therefore deferred to receive/replenish in process
+            // context rather than running with IRQs disabled.
+            self.queue_fault_pending = true;
+            return tx_done > 0;
         }
 
         tx_done > 0 || rx_done > 0

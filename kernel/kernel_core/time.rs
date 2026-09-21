@@ -148,8 +148,9 @@ pub fn get_ticks() -> u64 {
 
 /// 获取当前时间戳（毫秒）
 ///
-/// 假设时钟中断频率为 1000Hz（每毫秒一次）
-/// 如果实际频率不同，需要相应调整
+/// BSP PIT channel 0 is programmed for a nominal 1000 Hz; AP ticks do not
+/// advance this counter. This is serviced-tick time, not an independent wall
+/// clock: long IRQ-disabled intervals can coalesce hardware ticks.
 #[inline]
 pub fn current_timestamp_ms() -> u64 {
     get_ticks()
@@ -215,17 +216,32 @@ pub fn drain_deferred_tcp_timers() {
     // Use blocking variant which will wait for locks
     let completed = net::socket_table().run_tcp_timers_blocking(current, sweep_tw);
 
-    if completed
-        && TCP_TIMER_DEFERRED_GEN.load(Ordering::Acquire) == generation
-        && TCP_TIMER_DEFERRED
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        // The generation check + CAS closes the lost-update window: an IRQ
-        // that publishes newer work either changes the generation before this
-        // point or wins the flag race and leaves it set for the next drain.
-        TCP_TIMER_DEFERRED_TW.store(false, Ordering::Relaxed);
-        TCP_TIMER_DEFERRED_TS.store(0, Ordering::Relaxed);
+    if completed {
+        // Claim the flag only after taking a generation snapshot, then verify
+        // the generation again after the claim.  A timer IRQ can publish a
+        // newer generation between the first load and the flag CAS; without
+        // this second check that publication could be cleared accidentally.
+        let before = TCP_TIMER_DEFERRED_GEN.load(Ordering::Acquire);
+        if before == generation
+            && TCP_TIMER_DEFERRED
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let after = TCP_TIMER_DEFERRED_GEN.load(Ordering::Acquire);
+            if after == before {
+                // No publisher raced the claim.  Leave the timestamp/TW
+                // metadata untouched: a publisher may begin its metadata
+                // stores immediately after this check, and clearing either
+                // field here would overwrite that newer publication.  The
+                // fields are consumed only while DEFERRED is true and are
+                // refreshed by every producer before it sets that flag.
+            } else {
+                // A publisher raced after the claim.  Keep the work visible;
+                // the publisher may still be between its metadata stores and
+                // the Release flag store, so re-arming here is required.
+                TCP_TIMER_DEFERRED.store(true, Ordering::Release);
+            }
+        }
     }
     // If still incomplete, leave deferred flag set for next opportunity
 }

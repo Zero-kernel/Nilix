@@ -344,13 +344,28 @@ impl FileSystem for CgroupFs {
                 // R154-2 FIX: Deterministic inode from cgroup_id
                 let ino = cgroup_dir_ino(child.id());
                 // lint-fallible: BOUNDED(one inode per mkdir; live cgroup count is pids-controller bounded)
-                try_new_cgroupfs_arc(|charge| CgroupDirInode {
+                match try_new_cgroupfs_arc(|charge| CgroupDirInode {
                     fs_id: self.fs_id,
                     ino,
                     cgroup_id: child.id(),
                     _heap_charge: Some(charge),
-                })
-                .map(|inode| inode as Arc<dyn Inode>)
+                }) {
+                    Ok(inode) => Ok(inode as Arc<dyn Inode>),
+                    Err(error) => {
+                        // The cgroup is published before its directory inode
+                        // can be admitted.  Roll it back on inode OOM so a
+                        // failed mkdir cannot strand an empty cgroup/count
+                        // entry that later blocks deletion.
+                        if let Err(cleanup) = cgroup::delete_cgroup(child.id()) {
+                            klog::kprintln!(
+                                "[cgroupfs] inode admission rollback for cgroup {} failed: {:?}",
+                                child.id(),
+                                cleanup
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             }
             Err(CgroupError::DepthLimit) => Err(FsError::NoSpace),
             Err(CgroupError::CgroupLimit) => Err(FsError::NoSpace),

@@ -34,7 +34,7 @@
           - "kernel/kernel_core/signal.rs"
           - "kernel/kernel_core/signal_frame.rs"
           - "kernel/kernel_core/poll.rs"
-          - "scripts/abi_layout_check.py"
+          - "scripts/tools/abi_layout_oracle.py"
 
 "area: scheduler/concurrency":
   - changed-files:
@@ -101,9 +101,8 @@
       - any-glob-to-any-file:
           - "fuzz/**"
           - "tools/fuzz_executor/**"
-          - "scripts/*fuzz*"
-          - "scripts/*afl*"
-          - "scripts/*kcov*"
+          - "scripts/fuzz/**"
+          - "scripts/gates/qemu/fuzz_runner_test.sh"
 
 "area: tests":
   - changed-files:
@@ -112,9 +111,8 @@
           - "kernel/src/runtime_tests.rs"
           - "kernel/src/test_framework.rs"
           - "kernel/src/integration_test.rs"
-          - "scripts/*test*.sh"
-          - "scripts/boot_check.sh"
-          - "scripts/musl_check.sh"
+          - "scripts/tests/**"
+          - "scripts/gates/**"
 
 documentation:
   - changed-files:

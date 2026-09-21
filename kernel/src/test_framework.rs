@@ -342,7 +342,7 @@ pub fn registry_is_complete() -> bool {
     DISCOVERED_RUNTIME_TEST_NAMES.iter().all(|name| {
         TEST_REGISTRY
             .iter()
-            .any(|descriptor| descriptor.name == *name)
+            .any(|descriptor| descriptor.id == *name)
     })
 }
 

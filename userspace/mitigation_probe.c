@@ -15,7 +15,19 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { PROBE_CPUS = 4, PHASE_MS = 250, WAIT_POLLS = 4000, CLEANUP_POLLS = 400 };
+enum {
+    PROBE_CPUS = 4,
+    PHASE_MS = 250,
+    WAIT_POLLS = 4000,
+    CLEANUP_POLLS = 400,
+    /*
+     * A fork on every vCPU briefly doubles the address-space bookkeeping.
+     * The kernel may therefore return a transient ENOMEM while another
+     * worker is finishing its fork phase. Keep the retry bounded and expose
+     * each retry in the serial proof so a real exec failure still fails shut.
+     */
+    EXEC_RETRIES = 64,
+};
 
 static int emit(const char *format, ...) {
     char line[256];
@@ -159,7 +171,22 @@ int main(int argc, char **argv) {
             int code = worker_phase(cpu, "fork");
             if (code) child_exit(code);
             char cpu_text[2] = {(char)('0' + cpu), '\0'};
-            execl("/musl-test", "mitigation-probe", "--exec-worker", cpu_text, (char *)NULL);
+            char *const arguments[] = {"mitigation-probe", "--exec-worker", cpu_text, NULL};
+            for (unsigned attempt = 1; attempt <= EXEC_RETRIES; ++attempt) {
+                errno = 0;
+                execve("/musl-test", arguments, NULL);
+                int saved_errno = errno;
+                if (saved_errno != ENOMEM || attempt == EXEC_RETRIES) {
+                    errno = saved_errno;
+                    child_exit(failure("execve", cpu, 56));
+                }
+                if (emit("MITIGATION-WORKER RETRY phase=exec cpu=%d pid=%ld attempt=%u errno=%d\n",
+                         cpu, (long)getpid(), attempt, saved_errno)) {
+                    errno = EIO;
+                    child_exit(failure("execve-retry-report", cpu, 56));
+                }
+                pause_poll();
+            }
             child_exit(failure("execve", cpu, 56));
         }
         if (child < 0) {

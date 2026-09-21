@@ -17,6 +17,8 @@ extern crate klog;
 /// R180-7: fallible retained containers bound to the whole-heap byte ledger.
 pub mod admitted;
 pub mod buddy_allocator;
+/// 3.3 bounded slab/NUMA/swap/THP capability primitives.
+pub mod capabilities;
 pub mod dma;
 /// R169-11: `FallibleOrderedMap` lives in `mm` (a leaf crate both `kernel_core`
 /// and `net` depend on) so the `net` fragment reassembler can use it for an
@@ -34,10 +36,16 @@ pub mod page_table;
 pub mod tlb_shootdown;
 
 pub use admitted::{
-    AdmittedAllocError, AdmittedDeque, AdmittedMap, AdmittedSet, AdmittedString, AdmittedVec,
-    AdmittedVecIntoIter, PreparedAdmittedDequeCapacity, PreparedAdmittedMapCapacity,
-    PreparedAdmittedSetCapacity, PreparedAdmittedVecCapacity, RetiredAdmittedDequeCapacity,
-    RetiredAdmittedMapCapacity, RetiredAdmittedSetCapacity, RetiredAdmittedVecCapacity,
+    AdmittedAllocError, AdmittedDeque, AdmittedMap, AdmittedMapBuildError, AdmittedSet,
+    AdmittedString, AdmittedVec, AdmittedVecIntoIter, PreparedAdmittedDequeCapacity,
+    PreparedAdmittedMapCapacity, PreparedAdmittedSetCapacity, PreparedAdmittedVecCapacity,
+    RetiredAdmittedDequeCapacity, RetiredAdmittedMapCapacity, RetiredAdmittedSetCapacity,
+    RetiredAdmittedVecCapacity,
+};
+pub use capabilities::{
+    run_memory_capability_self_test, NumaAllocation, NumaAllocator, NumaError, SlabCache,
+    SlabError, SwapEntry, SwapError, SwapSlotTable, ThpError, ThpMapping, MAX_NUMA_NODES,
+    THP_PAGE_COUNT, THP_SIZE,
 };
 pub use heap_admission::{
     allocation_charge_bytes, arc_charge_bytes, check_coexistence,

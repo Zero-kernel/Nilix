@@ -32,6 +32,9 @@ impl SyscallMutator {
     }
 
     pub fn mutate(&mut self, seed: &SyscallProgram) -> Result<SyscallProgram> {
+        if seed.validate().is_err() {
+            return self.generate_seed();
+        }
         let mut program = seed.clone();
 
         if program.syscalls.is_empty() {
@@ -49,6 +52,12 @@ impl SyscallMutator {
             _ => {}
         }
 
+        // Mutations must never hand an invalid program to the executor.  A
+        // rejected mutation is still useful work for the fuzzer, so retain a
+        // valid seed rather than spending the iteration on an encoder error.
+        if program.validate().is_err() {
+            return self.generate_seed();
+        }
         Ok(program)
     }
 
@@ -101,14 +110,20 @@ impl SyscallMutator {
             }
             Argument::Output { capacity } => {
                 // Mutate output buffer capacity
-                *capacity = self.mutate_integer(*capacity as u64) as u32;
+                let mutated = self.mutate_integer(*capacity as u64) as usize;
+                *capacity = (mutated % crate::program::MAX_BUFFER_CAPACITY + 1) as u32;
             }
             Argument::InOut { data, capacity } => {
                 // Mutate either data or capacity
                 if self.rng.gen_bool(0.5) {
                     self.mutate_buffer(data);
                 } else {
-                    *capacity = self.mutate_integer(*capacity as u64) as u32;
+                    let mutated = self.mutate_integer(*capacity as u64) as usize;
+                    let minimum = data.len().max(1);
+                    *capacity = (minimum
+                        + mutated.saturating_sub(minimum)
+                            % (crate::program::MAX_BUFFER_CAPACITY - minimum + 1))
+                        as u32;
                 }
             }
             Argument::Null => {
@@ -152,18 +167,8 @@ impl SyscallMutator {
         // then exercises its result-publication path: open O_CREAT + renameat2).
         // Argument-bearing syscalls (read/write/open/...) are not in the
         // non-destructive allowlist and would be rejected before execution.
-        let syscalls = [
-            24u32, // sched_yield
-            39,    // getpid
-            102,   // getuid
-            104,   // getgid
-            107,   // geteuid
-            108,   // getegid
-            110,   // getppid
-            186,   // gettid
-        ];
-
-        let syscall_num = syscalls[self.rng.gen_range(0..syscalls.len())];
+        let syscall_num = crate::program::PURE_NOARG_SYSCALLS
+            [self.rng.gen_range(0..crate::program::PURE_NOARG_SYSCALLS.len())];
 
         Syscall {
             number: syscall_num,
@@ -233,7 +238,7 @@ impl SyscallMutator {
             }
             1 => {
                 // Insert byte
-                if buf.len() < 65536 {
+                if buf.len() < crate::program::MAX_BUFFER_CAPACITY {
                     let idx = self.rng.gen_range(0..=buf.len());
                     buf.insert(idx, self.rng.gen());
                 }
@@ -256,5 +261,30 @@ impl SyscallMutator {
 impl Default for SyscallMutator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_mutation_product_is_valid() {
+        let mut mutator = SyscallMutator::new();
+        let seed = mutator.generate_seed().expect("valid seed");
+        let mut current = seed;
+        for _ in 0..256 {
+            current = mutator.mutate(&current).expect("mutation should recover");
+            current.validate().expect("mutator returned invalid program");
+        }
+
+        let invalid = SyscallProgram {
+            syscalls: vec![Syscall {
+                number: 1,
+                args: vec![],
+            }],
+        };
+        let recovered = mutator.mutate(&invalid).expect("invalid seed recovers");
+        recovered.validate().expect("recovery seed is valid");
     }
 }

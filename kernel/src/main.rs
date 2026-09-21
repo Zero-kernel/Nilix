@@ -859,6 +859,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
 
+        // BSP-TIMER-1: calibration only programs channel 2. Program IRQ0's
+        // channel 0 explicitly; firmware commonly leaves it at just 18.2 Hz.
+        unsafe {
+            arch::apic::init_bsp_tick();
+        }
+
         // Initialize BSP's per-CPU data
         // Get kernel stack top from GDT (set during arch::interrupts::init)
         let kernel_stack_top = arch::default_kernel_stack_top() as usize;
@@ -1466,6 +1472,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // runs with interrupts enabled and fails closed on a missing/invalid ACK.
     arch::smp::wait_for_process_deferred_acknowledgements();
 
+    // Measure with IRQs enabled and before any user task becomes runnable.
+    // The mitigation image requires an independent clock-rate witness as well
+    // as its four-CPU entry/return proof; debugger stop counts are not a clock.
+    #[cfg(feature = "mitigation_probe")]
+    integration_test::test_bsp_tick_rate();
+
     #[cfg(feature = "namespace_probe")]
     {
         let mask = (0..64)
@@ -1488,11 +1500,28 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     if let Some(process) = pending_usermode_process {
         let pid = process.lock().pid;
+        #[cfg(feature = "syscall_test")]
+        kernel_core::fork::arm_shared_fault_busy_usercopy_probe();
+        // The syscall oracle exercises real cgroup migration. create_process
+        // prepares this root PCB but leaves membership admission to its caller.
+        #[cfg(feature = "syscall_test")]
+        let fixture_cgroup = {
+            let root = kernel_core::cgroup::root_cgroup();
+            if let Err(error) = root.attach_task(pid as u64) {
+                kernel_core::process::cleanup_unscheduled_process(pid);
+                panic!("Ring-3 cgroup fixture admission failed: {:?}", error);
+            }
+            root
+        };
         match sched::enhanced_scheduler::Scheduler::add_process(process) {
             Ok(()) => {
                 klog_always!("      ✓ Ring 3 test process added to scheduler ready queue");
             }
             Err(error) => {
+                #[cfg(feature = "syscall_test")]
+                fixture_cgroup
+                    .detach_task(pid as u64)
+                    .expect("unscheduled Ring-3 cgroup fixture must detach");
                 kernel_core::process::cleanup_unscheduled_process(pid);
                 klog!(
                     Error,

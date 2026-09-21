@@ -37,6 +37,29 @@ pub const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 /// Only the Linux creator layout defines the UID/GID high halves we write.
 const EXT2_OS_LINUX: u32 = 0;
 
+/// Read one mount metadata buffer while allowing only the block errors that
+/// may be transient during device publication. The closure is deliberately
+/// injected so hosted tests can exercise the retry boundary without a guest.
+fn read_mount_metadata_with_retry<F>(mut read: F, buffer: &mut [u8]) -> Result<(), FsError>
+where
+    F: FnMut(&mut [u8]) -> Result<usize, block::BlockError>,
+{
+    const MOUNT_READ_RETRIES: usize = 3;
+    for attempt in 0..MOUNT_READ_RETRIES {
+        match read(buffer) {
+            Ok(length) if length == buffer.len() => return Ok(()),
+            Ok(_) => return Err(FsError::Io),
+            Err(block::BlockError::Busy | block::BlockError::NoMem | block::BlockError::Io)
+                if attempt + 1 < MOUNT_READ_RETRIES =>
+            {
+                core::hint::spin_loop();
+            }
+            Err(_) => return Err(FsError::Io),
+        }
+    }
+    Err(FsError::Io)
+}
+
 /// Superblock offset from partition start
 pub const SUPERBLOCK_OFFSET: u64 = 1024;
 
@@ -3048,6 +3071,68 @@ pub fn run_ext2_journal_transaction_self_test() {
 #[cfg(test)]
 mod hosted_journal_tests {
     #[test]
+    fn rf_ci_mount_metadata_retry_is_bounded_and_fail_closed() {
+        let mut transient_calls = 0;
+        let mut buffer = [0u8; 8];
+        let result = super::read_mount_metadata_with_retry(
+            |target| {
+                transient_calls += 1;
+                if transient_calls == 1 {
+                    Err(block::BlockError::Io)
+                } else if transient_calls == 2 {
+                    Err(block::BlockError::NoMem)
+                } else {
+                    target.fill(0xA5);
+                    Ok(target.len())
+                }
+            },
+            &mut buffer,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(transient_calls, 3);
+        assert!(buffer.iter().all(|&byte| byte == 0xA5));
+
+        let mut persistent_calls = 0;
+        assert_eq!(
+            super::read_mount_metadata_with_retry(
+                |_| {
+                    persistent_calls += 1;
+                    Err(block::BlockError::Busy)
+                },
+                &mut buffer,
+            ),
+            Err(super::FsError::Io)
+        );
+        assert_eq!(persistent_calls, 3);
+
+        let mut permanent_calls = 0;
+        assert_eq!(
+            super::read_mount_metadata_with_retry(
+                |_| {
+                    permanent_calls += 1;
+                    Err(block::BlockError::Invalid)
+                },
+                &mut buffer,
+            ),
+            Err(super::FsError::Io)
+        );
+        assert_eq!(permanent_calls, 1);
+
+        let mut short_calls = 0;
+        assert_eq!(
+            super::read_mount_metadata_with_retry(
+                |target| {
+                    short_calls += 1;
+                    Ok(target.len() - 1)
+                },
+                &mut buffer,
+            ),
+            Err(super::FsError::Io)
+        );
+        assert_eq!(short_calls, 1);
+    }
+
+    #[test]
     fn r180_6_ordered_data_crash_boundaries() {
         let _serial = crate::HEAP_TEST_LOCK.lock();
         // Hosted filtering may run this test in isolation, before any sibling
@@ -5575,12 +5660,13 @@ impl Ext2Fs {
         buf.try_reserve_exact(read_len)
             .map_err(|_| FsError::NoSpace)?;
         buf.resize(read_len, 0u8);
-        let read = dev
-            .read_sync(start_sector, &mut buf)
-            .map_err(|_| FsError::Io)?;
-        if read != buf.len() {
-            return Err(FsError::Io);
-        }
+        // A newly published virtio device can report a transient queue-full or
+        // DMA-allocation condition for the first metadata request immediately
+        // after its probe. Retry only those explicitly transient block errors;
+        // short reads and all media/device errors remain a mount failure. This
+        // keeps an unavailable or corrupt filesystem fail-closed while avoiding
+        // a one-shot probe race that leaves /mnt on the ramfs fallback.
+        read_mount_metadata_with_retry(|target| dev.read_sync(start_sector, target), &mut buf)?;
 
         // Parse superblock
         // R95-3 FIX: Use read_unaligned to avoid UB on unaligned access.

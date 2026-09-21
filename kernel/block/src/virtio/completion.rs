@@ -21,8 +21,20 @@ pub(super) enum RequestCompletion<B> {
 fn status_result(status: u8) -> Result<(), BlockError> {
     match status {
         blk_status::VIRTIO_BLK_S_OK => Ok(()),
-        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-        _ => Err(BlockError::Io),
+        blk_status::VIRTIO_BLK_S_UNSUPP => {
+            // R189-1: a device-side rejection must be attributable in release
+            // serial logs; `kprintln!` diagnostics are compiled out there.
+            klog!(Error, "[virtio-blk] device rejected request status=UNSUPP");
+            Err(BlockError::NotSupported)
+        }
+        _ => {
+            klog!(
+                Error,
+                "[virtio-blk] device reported request failure status={}",
+                status
+            );
+            Err(BlockError::Io)
+        }
     }
 }
 
