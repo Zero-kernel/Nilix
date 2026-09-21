@@ -14962,6 +14962,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             let mut frames_to_free: Vec<PhysFrame> = Vec::new();
             let _ = frames_to_free.try_reserve(length_aligned / 0x1000);
 
+            let mut removed_leaf = false;
+
             for offset in (0..length_aligned).step_by(0x1000) {
                 let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
 
@@ -14977,6 +14979,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 };
 
                 if let Some(frame) = frame_opt {
+                    removed_leaf = true;
                     let phys_addr = frame.start_address().as_u64() as usize;
 
                     let should_free = PAGE_REF_COUNT
@@ -14994,12 +14997,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 }
             }
 
-            // Batch TLB shootdown then deallocate deferred frames
-            if !frames_to_free.is_empty() {
+            // Shared leaves retain a region pin, so frames_to_free can be empty
+            // even though a peer CPU still caches a removed leaf. Flush before
+            // Phase 3 can drop that pin and reclaim the DATA frame.
+            if removed_leaf {
                 mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
-                for frame in frames_to_free {
-                    frame_alloc.deallocate_frame(frame);
-                }
+            }
+            for frame in frames_to_free {
+                frame_alloc.deallocate_frame(frame);
             }
 
             // R171-CG1x0 FIX (M2-1 SLICE-0): reclaim the now-empty intermediate
