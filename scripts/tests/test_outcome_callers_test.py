@@ -210,7 +210,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
         tls_done = "MUSL-TLS-IRQ-OK migrations=4"
         markers = [
             "42 * 2 = 84", "MUSL-POLL-OK", "MUSL-SOCKET-ZERO-OK", "MUSL-STAT-OK",
-            "MUSL-UNAME-OK", "MUSL-STANDARD-FD-OK", "MUSL-OPEN-TRUNC-OK",
+            "MUSL-UNAME-OK", "MUSL-SHARED-MMAP-OK", "MUSL-STANDARD-FD-OK", "MUSL-OPEN-TRUNC-OK",
             "MUSL-ROBUST-USERCOPY-OK", "MUSL-WAIT-NAMESPACE-OK",
             "MUSL-BLOCKED-SIGNAL-OK", "MUSL-FCNTL-LIMIT-OK",
             *tls_cases, tls_done,
