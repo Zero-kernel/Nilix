@@ -161,7 +161,7 @@ run_suite mm 27 0 \
     --features host_harness \
     --lib --locked
 
-run_suite block 23 0 \
+run_suite block 24 0 \
     --manifest-path kernel/block/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \

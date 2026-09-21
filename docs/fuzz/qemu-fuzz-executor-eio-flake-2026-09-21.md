@@ -2,6 +2,7 @@
 
 **Date:** 2026-09-21
 **Status:** fix implemented and validated locally/remotely (remote tree `bb828d8`); the affected CI job reruns green on the pre-fix revision
+**Independent review:** PENDING — the delegated reviewer did not receive the task payload in this session, so no independent verdict is claimed; the tables below are self-validation plus self-review only
 **Code commit:** `bb828d8` — `fix(block): attribute virtio-blk failures and wait on a TSC deadline`
 **Scope:** `kernel/block` virtio-blk synchronous request path; no filesystem semantics change
 
