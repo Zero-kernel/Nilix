@@ -8,6 +8,8 @@ use crate::process::{
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "syscall_test")]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
@@ -1819,6 +1821,17 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         None => return SharedFaultResult::NotShared,
     };
 
+    #[cfg(feature = "syscall_test")]
+    if crate::usercopy::is_in_usercopy() && FORCE_SHARED_USERCOPY_BUSY.swap(false, Ordering::AcqRel)
+    {
+        // Record only the consuming CPU here. The #PF caller checks saved IF
+        // and reports via its bounded, lock-free serial writer after release
+        // of Process/MmState. Another CPU's ordinary Busy must not steal it.
+        FORCED_SHARED_USERCOPY_BUSY_CPU
+            .store(cpu_local::current_cpu_id() as u32, Ordering::Release);
+        return SharedFaultResult::Busy;
+    }
+
     let index = (page_base - region_base) / 0x1000;
     if index >= region.page_count {
         return SharedFaultResult::NotShared;
@@ -2397,6 +2410,34 @@ impl PhysicalPageRefCount {
 
 /// 全局物理页引用计数器
 pub static PAGE_REF_COUNT: PhysicalPageRefCount = PhysicalPageRefCount::new();
+
+#[cfg(feature = "syscall_test")]
+static FORCE_SHARED_USERCOPY_BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "syscall_test")]
+static FORCED_SHARED_USERCOPY_BUSY_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Arm a one-shot guest oracle that forces the next fresh shared fault from a
+/// guarded usercopy path to return Busy. The exception path must retry through
+/// IRETQ while IF=0; this is test-only and never changes production behavior.
+#[cfg(feature = "syscall_test")]
+pub fn arm_shared_fault_busy_usercopy_probe() {
+    FORCED_SHARED_USERCOPY_BUSY_CPU.store(u32::MAX, Ordering::Release);
+    FORCE_SHARED_USERCOPY_BUSY.store(true, Ordering::Release);
+}
+
+/// Consume this CPU's one-shot hit after the shared-fault helper has returned.
+/// No logger or blocking lock may be used from the page-fault probe.
+#[cfg(feature = "syscall_test")]
+pub fn take_shared_fault_busy_usercopy_probe_hit() -> bool {
+    FORCED_SHARED_USERCOPY_BUSY_CPU
+        .compare_exchange(
+            cpu_local::current_cpu_id() as u32,
+            u32::MAX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
 
 // ============================================================================
 // COW 辅助函数
@@ -3002,6 +3043,74 @@ pub fn run_cow_refcount_self_test() {
     assert!(refork_child.flags().contains(cow_flag()));
     assert!(!refork_parent.flags().contains(cow_readonly_flag()));
     assert!(!refork_child.flags().contains(cow_readonly_flag()));
+    // ST-K2-P2 verification: exercise the real region Drop path with one
+    // managed frame. The PTE reference is released first; Drop must consume
+    // the final region pin, refund its cgroup DATA charge, and return exactly
+    // one frame to the buddy. This does not claim allocator-address reuse.
+    let region =
+        SharedAnonRegion::try_new(0x80_0000, 0x1000, 0x3).expect("shared last-release region");
+    let last_region = Arc::clone(&region);
+    let owner = crate::cgroup::root_cgroup().id();
+    let memory_before = crate::cgroup::get_memory_usage(owner).expect("root memory counter");
+    let free_before = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy stats for shared last-release probe")
+        .free_pages;
+    let mut frame_alloc = FrameAllocator::new();
+    let shared_frame = frame_alloc
+        .allocate_frame()
+        .expect("managed frame for shared last-release probe");
+    let shared_phys = shared_frame.start_address().as_u64() as usize;
+    let shared_slot = PhysicalPageRefCount::slot(shared_phys)
+        .expect("shared probe frame must be inside refcount window");
+    assert_eq!(shared_slot.load(Ordering::Acquire), 0);
+    PAGE_REF_COUNT
+        .track_shared_frame(shared_phys)
+        .expect("track shared probe frame");
+    PAGE_REF_COUNT
+        .acquire_shared_mapping(shared_phys)
+        .expect("acquire shared probe PTE");
+    crate::cgroup::charge_memory_forced(owner, 0x1000);
+    region
+        .with_slots_try(|slots| {
+            slots[0] = Some(SharedPage {
+                phys_addr: shared_phys,
+                owner,
+            });
+        })
+        .expect("shared probe slot lock");
+    assert_eq!(
+        PAGE_REF_COUNT.release(shared_phys),
+        CowPageRelease::Remaining(1)
+    );
+    drop(region);
+    assert_eq!(shared_slot.load(Ordering::Acquire), 1);
+    assert_eq!(
+        mm::buddy_allocator::get_allocator_stats()
+            .unwrap()
+            .free_pages,
+        free_before - 1,
+        "non-final region Arc must keep its DATA frame"
+    );
+    assert_eq!(
+        crate::cgroup::get_memory_usage(owner).expect("root memory counter"),
+        memory_before + 0x1000,
+        "non-final region Arc must keep its DATA charge"
+    );
+    drop(last_region);
+    assert_eq!(shared_slot.load(Ordering::Acquire), 0);
+    let free_after = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy stats after shared last-release probe")
+        .free_pages;
+    assert_eq!(
+        free_after, free_before,
+        "shared DATA frame must be freed exactly once"
+    );
+    assert_eq!(
+        crate::cgroup::get_memory_usage(owner).expect("root memory counter"),
+        memory_before,
+        "shared DATA charge must refund on final region release"
+    );
+    klog_always!("ST-K2-LAST-REGION-RELEASE PASS: refs=0 frames=1 charge=0");
 }
 
 /// Exercise the complete pre-commit COW failure path with a deliberately

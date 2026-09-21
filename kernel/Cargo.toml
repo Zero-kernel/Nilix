@@ -11,7 +11,7 @@ default = []
 # Enable interactive shell instead of hello test program
 shell = []
 # Enable syscall test program
-syscall_test = []
+syscall_test = ["kernel_core/syscall_test", "arch/syscall_test"]
 # Enable musl libc test program
 musl_test = []
 # Enable clone syscall test program

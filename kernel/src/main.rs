@@ -1500,11 +1500,28 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     if let Some(process) = pending_usermode_process {
         let pid = process.lock().pid;
+        #[cfg(feature = "syscall_test")]
+        kernel_core::fork::arm_shared_fault_busy_usercopy_probe();
+        // The syscall oracle exercises real cgroup migration. create_process
+        // prepares this root PCB but leaves membership admission to its caller.
+        #[cfg(feature = "syscall_test")]
+        let fixture_cgroup = {
+            let root = kernel_core::cgroup::root_cgroup();
+            if let Err(error) = root.attach_task(pid as u64) {
+                kernel_core::process::cleanup_unscheduled_process(pid);
+                panic!("Ring-3 cgroup fixture admission failed: {:?}", error);
+            }
+            root
+        };
         match sched::enhanced_scheduler::Scheduler::add_process(process) {
             Ok(()) => {
                 klog_always!("      ✓ Ring 3 test process added to scheduler ready queue");
             }
             Err(error) => {
+                #[cfg(feature = "syscall_test")]
+                fixture_cgroup
+                    .detach_task(pid as u64)
+                    .expect("unscheduled Ring-3 cgroup fixture must detach");
                 kernel_core::process::cleanup_unscheduled_process(pid);
                 klog!(
                     Error,

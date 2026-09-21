@@ -16,7 +16,7 @@
 # require terminal fault outcomes and clean completion instead of the absence of
 # handled faults.
 #
-# Exit: 0 = oracle passed, 1 = oracle failed, 2 = blocked/incomplete.
+# Exit: 0 = oracle passed, 1 = failed, 2 = blocked, 3 = qualified (migration skipped).
 set -u
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
@@ -67,7 +67,8 @@ mremap fail-closed shape matrix
 mremap on a PROT_NONE reservation
 mremap charge symmetry
 MAP_SHARED|MAP_ANONYMOUS fork visibility + mremap boundary
-shared-anon migration: gated on host root, refused
+shared-anon cross-page usercopy first touch
+shared-anon adjacent private PT lifetime
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
@@ -81,6 +82,24 @@ if ! grep -Eq '^Process 1 terminated with exit code 0$' "$serial"; then
     report_fail "PID 1 did not exit 0"
 fi
 
+# 4. The preflight probe is an explicit boundary oracle. Exactly one current
+# SKIP or future PASS is required so removing the probe cannot go unnoticed.
+preflight_skip=$(grep -cF '[SKIP] shared-anon PTE-only preflight remains pending' "$serial" || true)
+preflight_pass=$(grep -cF '[PASS] shared-anon PTE-only preflight accepts lazy buffer' "$serial" || true)
+if [ $((preflight_skip + preflight_pass)) -ne 1 ]; then
+    report_fail "expected exactly one PTE-only preflight SKIP/PASS marker, saw skip=$preflight_skip pass=$preflight_pass"
+fi
+
+# 5. Force exactly one shared Busy return from a guarded usercopy fault. This
+# proves the saved-IF=0 retry path ran; it does not claim remote CPU contention.
+forced_busy=$(grep -cF 'ST-K2-FORCED-BUSY-USERCOPY-IF0' "$serial" || true)
+if [ "$forced_busy" -ne 1 ]; then
+    report_fail "expected exactly one forced Busy/saved-IF=0 usercopy oracle marker, saw $forced_busy"
+fi
+if [ "$(grep -cFx 'ST-K2-LAST-REGION-RELEASE PASS: refs=0 frames=1 charge=0' "$serial" || true)" -ne 1 ]; then
+    report_fail "missing or duplicate exact last-region-release oracle"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "RING3-MM FAIL"
     echo "RING3-MM ARTIFACTS: serial=$serial"
@@ -89,6 +108,15 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
+if grep -Fq '[SKIP] shared-anon migration: requires host-root fixture' "$serial"; then
+    echo "RING3-MM QUALIFIED: executed memory legs passed; cgroup migration not executed"
+    echo "RING3-MM ARTIFACTS: serial=$serial"
+    exit 3
+fi
+if ! grep -Fq '[PASS] shared-anon cgroup ownership across migration' "$serial"; then
+    echo "RING3-MM BLOCKED: missing migration verdict"
+    exit 2
+fi
 echo "RING3-MM OK: Ring-3 memory-management oracle passed (boot harness status was $boot_status)"
 echo "RING3-MM ARTIFACTS: serial=$serial"
 exit 0

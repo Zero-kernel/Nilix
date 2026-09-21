@@ -80,6 +80,7 @@ MUSL_SOCKET_ZERO_MARKER='MUSL-SOCKET-ZERO-OK'
 # fstats as S_IFIFO, and uname fills domainname with "(none)".
 MUSL_STAT_MARKER='MUSL-STAT-OK'
 MUSL_UNAME_MARKER='MUSL-UNAME-OK'
+MUSL_SHARED_MMAP_MARKER='MUSL-SHARED-MMAP-OK'
 # Accept both the sys_exit ("exited with code") and reaper ("terminated with
 # exit code") phrasings; the musl Ring-3 path emits the latter.
 EXIT_RE='^Process 1 (exited with code|terminated with exit code) 0$'
@@ -162,6 +163,7 @@ has_poll=0;    grep -Fq "$MUSL_POLL_MARKER"    "$ser" 2>/dev/null && has_poll=1
 has_socket_zero=0; grep -Fq "$MUSL_SOCKET_ZERO_MARKER" "$ser" 2>/dev/null && has_socket_zero=1
 has_stat=0;    grep -Fq "$MUSL_STAT_MARKER"    "$ser" 2>/dev/null && has_stat=1
 has_uname=0;   grep -Fq "$MUSL_UNAME_MARKER"   "$ser" 2>/dev/null && has_uname=1
+has_shared_mmap=0; grep -Fq "$MUSL_SHARED_MMAP_MARKER" "$ser" 2>/dev/null && has_shared_mmap=1
 has_exit=0;    grep -qE "$EXIT_RE"             "$ser" 2>/dev/null && has_exit=1
 has_panic=0;   grep -Fq "$PANIC_MARKER"        "$ser" 2>/dev/null && has_panic=1
 
@@ -280,6 +282,11 @@ if [ "$has_uname" -ne 1 ]; then
     echo "    => kernel uname did not write the full 390-byte new_utsname incl. domainname (see MUSL-UNAME-FAIL on serial)"
     rc=1
 fi
+if [ "$has_shared_mmap" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: shared-anonymous marker missing (expected '$MUSL_SHARED_MMAP_MARKER')"
+    echo "    => MAP_SHARED|MAP_ANONYMOUS musl consumer did not complete"
+    rc=1
+fi
 if [ "$has_exit" -ne 1 ]; then
     echo "MUSL-CHECK FAIL: PID 1 did not exit successfully within ${TO}s"
     rc=1
@@ -303,9 +310,9 @@ if [ "$rc" -ne 0 ]; then
     tail -40 "$ser" 2>/dev/null | sed 's/^/    /'
 else
     if [ "$resets" -gt 0 ]; then
-        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI markers + clean exit + 0 NX faults; $resets cpu_reset marker(s) observed, not gated)"
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI + shared-mmap markers + clean exit + 0 NX faults; $resets cpu_reset marker(s) observed, not gated)"
     else
-        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI markers + clean exit + 0 NX faults)"
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI + shared-mmap markers + clean exit + 0 NX faults)"
     fi
 fi
 printf '%s\n' "$rc" > "$ser.gate.status"

@@ -1277,6 +1277,17 @@ extern "x86-interrupt" fn page_fault_handler(
                         Some(cpu_local::current_cpu_id()),
                         "same-CPU PT_LOCK reentry during shared fault"
                     );
+                    #[cfg(feature = "syscall_test")]
+                    if kernel_core::fork::take_shared_fault_busy_usercopy_probe_hit() {
+                        assert_eq!(stack_frame.code_segment.0 & 3, 0);
+                        assert!(!stack_frame
+                            .cpu_flags
+                            .contains(x86_64::registers::rflags::RFlags::INTERRUPT_FLAG));
+                        // The test diagnostic must not acquire a console lock
+                        // from #PF. The saved frame, not the handler's IF=0,
+                        // proves IRETQ will retry with interrupts disabled.
+                        unsafe { serial_write_str("ST-K2-FORCED-BUSY-USERCOPY-IF0\n") };
+                    }
                     mm::tlb_shootdown::handle_shootdown_ipi();
                     return;
                 }

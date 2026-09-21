@@ -36,6 +36,7 @@ const MREMAP_FIXED: i32 = 0x2;
 const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 const EOPNOTSUPP: i32 = 95;
+const EFAULT: i32 = 14;
 
 // cgroup syscalls (kernel/kernel_core/syscall.rs dispatch 500/502/504).
 const SYS_CGROUP_CREATE: u64 = 500;
@@ -149,6 +150,11 @@ impl TestResult {
         println(name);
         self.failed += 1;
     }
+
+    fn skip(&mut self, name: &str) {
+        print("[SKIP] ");
+        println(name);
+    }
 }
 
 /// Program entry point
@@ -182,6 +188,9 @@ pub extern "C" fn _start() -> ! {
     test_mremap_prot_none(&mut results);
     test_mremap_charge_symmetry(&mut results);
     test_shared_anon_fork(&mut results);
+    test_shared_anon_usercopy(&mut results);
+    test_shared_anon_pte_preflight(&mut results);
+    test_shared_anon_adjacent_pt(&mut results);
     test_shared_anon_migration(&mut results);
 
     // Print summary
@@ -571,7 +580,7 @@ fn test_shared_anon_fork(results: &mut TestResult) {
             return;
         };
 
-        let s = mmap_anon(PAGE, true);
+        let s = mmap_anon(2 * PAGE, true);
         if s < 0 {
             results.fail("shared-anon: mmap failed");
             return;
@@ -579,7 +588,7 @@ fn test_shared_anon_fork(results: &mut TestResult) {
         let s = s as usize;
         // First touch: a shared region publishes no PTE at map time, so this
         // write is the demand fault that charges the first-toucher's page.
-        *(s as *mut u64) = 0;
+        core::ptr::write_volatile(s as *mut u64, 0x1234_5678);
         let after_touch = read_memory_current().unwrap_or(before);
         if after_touch < before + PAGE as u64 {
             results.fail("shared-anon: the first touch did not charge the page");
@@ -594,17 +603,25 @@ fn test_shared_anon_fork(results: &mut TestResult) {
         if child == 0 {
             // Child: publish through the shared page and leave. It must not
             // touch anything else — the rest of its address space is COW.
-            *(s as *mut u64) = 0x5A5A_1234;
+            if core::ptr::read_volatile(s as *const u64) != 0x1234_5678 {
+                userspace::syscall::sys_exit(1);
+            }
+            core::ptr::write_volatile(s as *mut u64, 0x5A5A_1234);
+            // No PTE existed for this slot at fork: child creates the shared
+            // frame, then the parent must fault in exactly that frame.
+            core::ptr::write_volatile((s + PAGE) as *mut u64, 0xCAFE_4321);
             userspace::syscall::sys_exit(0);
         }
 
         let mut status: i32 = 0;
         let waited = sys_wait(&mut status as *mut i32);
-        if is_error(waited) || waited != child {
+        if is_error(waited) || waited != child || status != 0 {
             results.fail("shared-anon: child was not reaped");
             return;
         }
-        if *(s as *const u64) != 0x5A5A_1234 {
+        if core::ptr::read_volatile(s as *const u64) != 0x5A5A_1234
+            || core::ptr::read_volatile((s + PAGE) as *const u64) != 0xCAFE_4321
+        {
             results.fail("shared-anon: child write is not visible in the parent");
             return;
         }
@@ -612,12 +629,15 @@ fn test_shared_anon_fork(results: &mut TestResult) {
         // A shared region is snapshotted into every fork child, so resizing it
         // would let a child re-fault a range the parent no longer owns. It must
         // fail closed rather than silently split the mapping.
-        if err_of(mremap(s, PAGE, 2 * PAGE, 0)) != EOPNOTSUPP {
+        if err_of(mremap(s, 2 * PAGE, 3 * PAGE, 0)) != EOPNOTSUPP {
             results.fail("shared-anon: mremap on a shared VMA must fail closed");
             return;
         }
 
-        munmap(s, PAGE);
+        if munmap(s, 2 * PAGE) != 0 {
+            results.fail("shared-anon: munmap failed");
+            return;
+        }
         let after_unmap = read_memory_current().unwrap_or(after_touch);
         print("shared ");
         print_int(before as i64);
@@ -626,22 +646,136 @@ fn test_shared_anon_fork(results: &mut TestResult) {
         print("->");
         print_int(after_unmap as i64);
         print(" ");
-        // Last-drop teardown: the region's Drop releases everything the owner
-        // is still charged for on this page — its data frame AND the page-table
-        // frames that materialized it — so the counter must come all the way
-        // back. Measured on this revision: the first touch charges 3 pages
-        // (1 data + 2 page-table) and teardown returns all 3.
-        //
-        // Regression history: the page-table part used to be parked on the
-        // per-AS `pt_inherited_bytes` basis, which is released only at process
-        // exit/exec, so teardown returned 1 of 3 and the residue grew with
-        // every shared mapping a process cycled (recorded as SHARED-PT-RESIDUE).
+        // Region Drop releases DATA; per-AS physical identities release only
+        // tables actually reclaimed by munmap. No PT charge rides on a region.
         if after_unmap > before {
             results.fail("shared-anon: teardown did not release the page charge");
             return;
         }
 
         results.pass("MAP_SHARED|MAP_ANONYMOUS fork visibility + mremap boundary");
+    }
+}
+
+/// Kernel-mode copy_to_user faults both fresh pages without a preceding user
+/// access. uname deliberately uses the controlled usercopy path directly.
+fn test_shared_anon_usercopy(results: &mut TestResult) {
+    print("Testing shared-anon cross-page usercopy first touch... ");
+    unsafe {
+        let base = mmap_anon(2 * PAGE, true);
+        if base < 0 {
+            results.fail("shared usercopy: mmap failed");
+            return;
+        }
+        let base = base as usize;
+        let dest = base + PAGE - 195;
+        // Linux utsname has six 65-byte strings. This straddles the page edge.
+        let result = syscall1(63, dest as u64) as i64;
+        let valid = result == 0
+            && core::ptr::read_volatile(dest as *const u8) != 0
+            && core::ptr::read_volatile((dest + 65) as *const u8) != 0
+            && core::ptr::read_volatile((dest + 4 * 65) as *const u8) != 0
+            && core::ptr::read_volatile((dest - 1) as *const u8) == 0
+            && core::ptr::read_volatile((dest + 390) as *const u8) == 0;
+        let released = munmap(base, 2 * PAGE) == 0;
+        if valid && released {
+            results.pass("shared-anon cross-page usercopy first touch");
+        } else {
+            results.fail("shared-anon cross-page usercopy first touch");
+        }
+    }
+}
+
+/// Syscalls that call `verify_user_memory` still reject a fresh lazy shared page.
+/// Keep this as an explicit qualified probe: direct usercopy first-touch is a
+/// separate path and must not be mistaken for a preflight fix.
+fn test_shared_anon_pte_preflight(results: &mut TestResult) {
+    print("Testing shared-anon PTE-only syscall preflight... ");
+    unsafe {
+        let base = mmap_anon(PAGE, true);
+        if base < 0 {
+            results.fail("shared preflight: mmap failed");
+            return;
+        }
+        let base = base as usize;
+        let result = sys_getrandom(base as *mut u8, PAGE, 0);
+        let observed = err_of(result as i64);
+        let released = munmap(base, PAGE) == 0;
+        if !released {
+            results.fail("shared preflight: munmap failed");
+            return;
+        }
+        if observed == EFAULT {
+            print("observed EFAULT ");
+            results.skip("shared-anon PTE-only preflight remains pending");
+        } else if result == PAGE as u64 {
+            results.pass("shared-anon PTE-only preflight accepts lazy buffer");
+        } else {
+            print("errno=");
+            print_int(observed as i64);
+            print(" ");
+            results.fail("shared preflight: unexpected errno");
+        }
+    }
+}
+/// A shared-created PT must stay charged while its adjacent private leaf is
+/// live. Reusing the same VA also catches inherited-basis drift across cycles.
+fn test_shared_anon_adjacent_pt(results: &mut TestResult) {
+    print("Testing shared-anon adjacent private PT lifetime... ");
+    unsafe {
+        // Above the supervisor identity-map window, in an unused user PD.
+        const BASE: usize = 0x20_0000_0000;
+        for _ in 0..3 {
+            let Some(before) = read_memory_current() else {
+                results.fail("shared PT: missing memory.current");
+                return;
+            };
+            let shared = syscall6(
+                SYS_MMAP,
+                BASE as u64,
+                PAGE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ) as i64;
+            if shared != BASE as i64 {
+                results.fail("shared PT: address hint unavailable");
+                return;
+            }
+            core::ptr::write_volatile(BASE as *mut u64, 0x1234);
+            let private = syscall6(
+                SYS_MMAP,
+                (BASE + PAGE) as u64,
+                PAGE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ) as i64;
+            if private != (BASE + PAGE) as i64 {
+                results.fail("shared PT: adjacent private mmap failed");
+                return;
+            }
+            core::ptr::write_volatile((BASE + PAGE) as *mut u64, 0xDEAD_BEEF);
+            let charged = read_memory_current().unwrap_or(0);
+            if munmap(BASE, PAGE) != 0 {
+                results.fail("shared PT: shared munmap failed");
+                return;
+            }
+            let retained = read_memory_current().unwrap_or(u64::MAX);
+            if retained.checked_add(PAGE as u64) != Some(charged)
+                || core::ptr::read_volatile((BASE + PAGE) as *const u64) != 0xDEAD_BEEF
+            {
+                results.fail("shared PT: early table uncharge or adjacent corruption");
+                return;
+            }
+            if munmap(BASE + PAGE, PAGE) != 0 || read_memory_current() != Some(before) {
+                results.fail("shared PT: last-leaf teardown leaked charge");
+                return;
+            }
+        }
+        results.pass("shared-anon adjacent private PT lifetime");
     }
 }
 
@@ -655,19 +789,32 @@ fn test_shared_anon_migration(results: &mut TestResult) {
     unsafe {
         let created = syscall2(SYS_CGROUP_CREATE, 0, CGROUP_CTRL_MEMORY) as i64;
         if err_of(created) != 0 {
-            print("(cgroup creation unavailable) ");
-            results.pass("shared-anon migration: unavailable in this profile");
+            if matches!(err_of(created), 1 | 13) {
+                results.skip("shared-anon migration: requires host-root fixture");
+            } else {
+                print("errno=");
+                print_int(err_of(created) as i64);
+                print(" ");
+                results.fail("shared migration: unexpected cgroup creation error");
+            }
             return;
         }
         let cg = created as u64;
 
-        // `sys_cgroup_attach` requires host root (`current_is_host_root`). The
-        // boot Ring-3 task carries euid 65534 (`create_process` defaults), so a
-        // run under the boot profile cannot reach the migration path. Assert the
-        // refusal is the DOCUMENTED one rather than forking the gate.
-        if err_of(syscall1(SYS_CGROUP_ATTACH, cg) as i64) != 0 {
-            print("(migration requires host root; refusing as documented) ");
-            results.pass("shared-anon migration: gated on host root, refused");
+        // The dedicated boot fixture is already root (ppid=0) and registers
+        // membership before scheduler publication. Without registration the
+        // migration returns EIO/TaskNotAttached, not a permission refusal.
+        let attach_error = err_of(syscall1(SYS_CGROUP_ATTACH, cg) as i64);
+        if attach_error != 0 {
+            let _ = syscall1(501, cg); // Retire the unused fixture if authorized.
+            if matches!(attach_error, 1 | 13) {
+                results.skip("shared-anon migration: requires host-root fixture");
+            } else {
+                print("errno=");
+                print_int(attach_error as i64);
+                print(" ");
+                results.fail("shared migration: unexpected cgroup attach error");
+            }
             return;
         }
         // Baseline AFTER the move: the task's own charges travel with it, so
@@ -703,15 +850,45 @@ fn test_shared_anon_migration(results: &mut TestResult) {
         print("->");
         print_int(after_move as i64);
         print(" ");
-        if after_move != touched {
+        // Only the resident shared DATA stays with the first toucher. Private
+        // bytes and the AS-owned page tables travel with the migrated task.
+        if after_move != PAGE as u64 {
             results.fail("shared migration: the shared bytes migrated with the task");
             return;
         }
 
-        munmap(s, PAGE);
+        // cgroupfs names children by decimal id. Exercise the actual VFS
+        // rmdir boundary while DATA, but no task, still pins its origin.
+        let mut path = [0u8; 64];
+        let prefix = b"/sys/fs/cgroup/";
+        path[..prefix.len()].copy_from_slice(prefix);
+        let mut digits = [0u8; 20];
+        let mut value = cg;
+        let mut count = 0;
+        while value != 0 {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+        }
+        for index in 0..count {
+            path[prefix.len() + index] = digits[count - index - 1];
+        }
+        if err_of(syscall1(84, path.as_ptr() as u64) as i64) != 16 {
+            results.fail("shared migration: rmdir must return EBUSY while DATA is pinned");
+            return;
+        }
+
+        if munmap(s, PAGE) != 0 {
+            results.fail("shared migration: munmap failed");
+            return;
+        }
         let released = cgroup_memory_current(cg).unwrap_or(u64::MAX);
-        if released > cg_base {
+        if released != 0 {
             results.fail("shared migration: teardown did not release to the owner");
+            return;
+        }
+        if syscall1(84, path.as_ptr() as u64) as i64 != 0 {
+            results.fail("shared migration: rmdir failed after last DATA release");
             return;
         }
 
