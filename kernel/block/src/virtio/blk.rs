@@ -120,15 +120,21 @@ impl RequestWait {
 }
 
 /// R189-1 FIX: continue a synchronous wait only while the request can still be
-/// completed: it has not finished, the used ring is not quarantined, and the
+/// completed: it is still pending, the used ring is not quarantined, and the
 /// no-progress budget is not spent.
+///
+/// The first argument is the *pending* predicate (`completion.is_none()`) at both
+/// call sites. The R189-1 refactor instead named it `completed` and negated it,
+/// so both wait loops skipped their bodies and abandoned every healthy request on
+/// the first poll (instrumented serial: `budget=50000000 left=50000000 spent=0
+/// fatal=false`, then `request wait budget expired ... spins=0`).
 ///
 /// A quarantined queue can never deliver a completion until reset_device
 /// rebuilds the ring, so waiting on one would only hold the device lock and
 /// re-emit the SECURITY diagnostic once per poll iteration.
 #[inline]
-fn wait_should_continue(completed: bool, quarantined: bool, budget_expired: bool) -> bool {
-    !completed && !quarantined && !budget_expired
+fn wait_should_continue(pending: bool, quarantined: bool, budget_expired: bool) -> bool {
+    pending && !quarantined && !budget_expired
 }
 
 /// Release-visible attribution for a synchronous request failure.
@@ -2185,7 +2191,7 @@ mod tests {
         assert_eq!(wait.spins_spent(), REQUEST_WAIT_MAX_SPINS);
 
         // An exhausted budget is terminal for the wait predicate.
-        assert!(!wait_should_continue(false, false, wait.expired()));
+        assert!(!wait_should_continue(true, false, wait.expired()));
 
         // Request kind naming is part of the attribution contract.
         assert_eq!(request_op_name(true), "write");
@@ -2251,13 +2257,19 @@ mod tests {
         queue.fatal.store(true, Ordering::Release);
         assert!(queue.pop_used().is_none());
 
-        // The wait itself must stop as soon as the ring is quarantined instead
-        // of holding the device lock for the whole budget before the reset.
-        assert!(!wait_should_continue(false, true, false));
-        assert!(wait_should_continue(false, false, false));
+        // The wait predicate mirrors its call sites: the first argument is the
+        // *pending* state (`completion.is_none()`). Inverting it would abandon
+        // every healthy request before the first poll, which is exactly the
+        // regression this oracle now pins.
+        assert!(
+            wait_should_continue(true, false, false),
+            "a pending request on a live ring with a fresh budget must keep waiting"
+        );
 
-        // Completion and budget expiry stay terminal conditions.
-        assert!(!wait_should_continue(true, false, false));
-        assert!(!wait_should_continue(false, false, true));
+        // Completion, quarantine and budget expiry are each terminal.
+        assert!(!wait_should_continue(false, false, false));
+        assert!(!wait_should_continue(true, true, false));
+        assert!(!wait_should_continue(true, false, true));
+        assert!(!wait_should_continue(false, true, true));
     }
 }
