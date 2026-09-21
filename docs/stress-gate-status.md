@@ -1,8 +1,13 @@
-# Monthly Stress Gate (stress-v2) — Honest Status
+# Stress Gate (stress-v2) — Historical Status
+
+The active scheduled/manual entrypoint is `Extended tests` in
+`.github/workflows/extended.yml`. This record preserves the earlier month-end
+investigation and its evidence; references to the retired monthly workflow are
+historical context.
 
 **Date:** 2026-09-02 (supersedes the 2026-09-01 revision; see §10 for what changed)
-**Scope:** `.github/workflows/monthly-stress-test.yml`, `scripts/stress_test.sh`,
-`scripts/stress_protocol.py`, `userspace/stress_runner.c`, `Makefile` stress targets
+**Scope:** `.github/workflows/extended.yml`, `scripts/gates/stress/stress_test.sh`,
+`scripts/gates/stress/stress_protocol.py`, `userspace/stress_runner.c`, `Makefile` stress targets
 **Verdict:** the gate has **never passed end-to-end**. The three harness defects are fixed
 and verified, and as of 2026-09-02 **nine kernel defects** behind the `memory` profile are
 fixed too — that profile now runs mmap → fork → cgroup attach → 32 successful 1 MiB
@@ -28,7 +33,8 @@ It is written to be picked up cold by the next session.
 | A green `block` profile run | **BLOCKED** — K4, no `fsync` in the kernel |
 | `cpu` / `process` / `combined` | **UNVERIFIED** — never reached a full round |
 
-Nothing in this work is committed. The manual-commit rule was observed.
+The implementation and CI cleanup described here have since been committed;
+the status and remaining kernel gaps below are retained as an audit record.
 
 ---
 
@@ -37,7 +43,7 @@ Nothing in this work is committed. The manual-commit rule was observed.
 Two commits on **2026-08-04**, the same day:
 
 - **`e7e2cff`** *"test(stress): add comprehensive stress test infrastructure"* — added
-  `scripts/stress_protocol.py` (1593 lines), rewrote `scripts/stress_test.sh` (928 lines),
+  `scripts/gates/stress/stress_protocol.py` (1593 lines), rewrote `scripts/gates/stress/stress_test.sh` (928 lines),
   and added **two** guests: `userspace/stress_runner.c` (635 lines) and
   `userspace/stress_runner_advanced.c` (545 lines).
 - **`4357994`** *"refactor(userspace): enhance syz executor and remove old stress runner"* —
@@ -60,20 +66,20 @@ did:
 
 | Producer | Protocol | Matches harness? |
 |----------|----------|------------------|
-| `scripts/stress_protocol.py` (consumer) | `NILIX_STRESS_V2_*`, config magic `NILSTR2` | — |
+| `scripts/gates/stress/stress_protocol.py` (consumer) | `NILIX_STRESS_V2_*`, config magic `NILSTR2` | — |
 | deleted `stress_runner.c` | `NILIX_STRESS_BEGIN version=1` (**V1**) | no |
 | `stress_runner_advanced.c` | `NILIX_STRESS_ADVANCED_*`, self-contained, no config, no profiles | no |
 
 Before this session, a repo-wide search for a `NILIX_STRESS_V2_*` **producer** returned
 nothing — only the three harness/consumer files referenced those markers. So restoring the
 deleted V1 file would have converted a build failure into a validation failure, not a pass:
-`validate_header` (`scripts/stress_protocol.py:1054`) hard-requires `BEGIN` + `READY` as the
+`validate_header` (`scripts/gates/stress/stress_protocol.py:1054`) hard-requires `BEGIN` + `READY` as the
 first two V2 markers with matching run id, `config_sha256`, `vcpus` and `workers`.
 
 ### 2.2 The green history is an artifact
 
-`monthly-stress-test.yml` runs on cron `0 2 28-31 * *` and gates the real job behind a
-last-day-of-month check. Every "success" in the run list is a **6–8 second skip**:
+The retired monthly workflow ran on cron `0 2 28-31 * *` and gated the real job behind a
+last-day-of-month check. Every "success" in that historical run list is a **6–8 second skip**:
 
 | Run | Date | Duration | What actually happened |
 |-----|------|----------|------------------------|
@@ -95,7 +101,7 @@ A new `userspace/stress_runner.c` was written at the path the `Makefile` already
 so no `Makefile` edit was needed. Verified on the devbox: `make build-stress` → **exit 0**,
 `Stress kernel SHA-256: 0fcac1b0f3452da6adc612f0f823923d5b232fa8f190f1a68fa759d750ab8c53`.
 
-### 3.2 `scripts/stress_test.sh` — `set -u` crash in `wait_soak_window`
+### 3.2 `scripts/gates/stress/stress_test.sh` — `set -u` crash in `wait_soak_window`
 
 ```bash
 local duration="$1" deadline=$((SECONDS + duration))    # BUG
@@ -106,13 +112,13 @@ arithmetic read `duration` while it was still unset. Under the script's
 `set -uo pipefail` (line 9) that aborted the run:
 
 ```
-scripts/stress_test.sh: line 384: duration: unbound variable
+scripts/gates/stress/stress_test.sh: line 384: duration: unbound variable
 ```
 
 Split into two statements. This was the **only** instance of the pattern in the file.
-`scripts/stress_test_test.sh` passes.
+`scripts/tests/stress_test_test.sh` passes.
 
-### 3.3 `scripts/stress_test.sh` — ESP corruption via `fat:rw:`
+### 3.3 `scripts/gates/stress/stress_test.sh` — ESP corruption via `fat:rw:`
 
 `start_vm` pointed QEMU's writable virtual FAT at the **source** ESP directory:
 
@@ -152,7 +158,7 @@ regenerated. Local-environment only; no repo change.
 
 ## 4. The V2 contract (so it need not be re-derived)
 
-Extracted from `scripts/stress_protocol.py`. Recording it here because it is spread across
+Extracted from `scripts/gates/stress/stress_protocol.py`. Recording it here because it is spread across
 ~700 lines of validator and is the expensive part to reconstruct.
 
 **Config record** — 256 bytes, injected by `debugfs` into the ext3 image at `/test/stress.cfg`,
@@ -301,7 +307,7 @@ Long commands were run under `nohup` on the devbox because the SSH helper caps a
 | `userspace/stress_runner.c` | V2 guest + `emit_mmap_diag`/`fail_with_stats` bisect markers |
 | `userspace/stress_runner_advanced.c` | wait4 ABI caller repair (§10) |
 | `userspace/src/syscall.rs` | wait4 ABI caller repair (§10) |
-| `scripts/stress_test.sh`, `scripts/esp_run_copy.sh` | §3.2 + §3.3 fixes; ESP copy helper (ST-5) |
+| `scripts/gates/stress/stress_test.sh`, `scripts/tools/esp_run_copy.sh` | §3.2 + §3.3 fixes; ESP copy helper (ST-5) |
 | `Makefile` | ESP-copy fix applied to `make run`/`run-stress` (ST-5, closes old §9 item 5) |
 | `kernel/kernel_core/process.rs` | mmap window → 64 GiB; kstacks 16 → 32 KiB |
 | `kernel/kernel_core/fork.rs` | entry-state-keyed child context + user-frame validation |
@@ -334,11 +340,12 @@ since been committed.
    membership for the init task in the kernel (plan item ST-K1; inherited the hazard analysis
    from ST-K3's refuted F-A family).
 5. ~~**`Makefile:339`** ESP-copy fix for `make run`/`run-stress`~~ — **DONE** (ST-5, via
-   `scripts/esp_run_copy.sh`). Residual: the helper has no failure gate, so a non-zero exit
+   `scripts/tools/esp_run_copy.sh`). Residual: the helper has no failure gate, so a non-zero exit
    degrades the flag to `file=fat:rw:` instead of surfacing stderr (filed as F11).
-6. **Interim CI policy.** Until at least one profile is green, decide whether the monthly
-   job should keep failing loudly (and commenting on commits) or be gated to
-   `workflow_dispatch`. It currently fails every month-end and posts a commit comment.
+6. **Interim CI policy.** The retired month-end workflow has been replaced by the
+   scheduled/manual `Extended tests` workflow. It remains diagnostic and keeps
+   stress failures visible while the profile blockers above are open; it is not a
+   required push or pull-request check.
 7. **NEW — boot-reserved `ROOT_INIT_PID` hardening.** `process.rs:8668` panics with
    *"ROOT_INIT_PID must be a live reaper (boot-hardening pending)"* whenever PID 1 exits while
    an orphan exists. Any guest whose init exits non-zero therefore converts a clean profile

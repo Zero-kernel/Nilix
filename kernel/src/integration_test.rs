@@ -2,6 +2,48 @@
 //!
 //! 测试所有子系统的集成和功能
 
+/// Independent BSP clock oracle for the dedicated mitigation guest. This must
+/// run after BSP STI/deferred readiness, before user tasks are published.
+#[cfg(feature = "mitigation_probe")]
+pub fn test_bsp_tick_rate() {
+    assert!(x86_64::instructions::interrupts::are_enabled());
+    let Some(info) = arch::hpet::info() else {
+        klog_always!("BSP-TIMER BLOCKED: HPET reference unavailable");
+        panic!("BSP timer rate requires an independent HPET reference");
+    };
+    let start = arch::hpet::read_main_counter().expect("HPET initialized");
+    let ticks = kernel_core::time::get_ticks();
+    let window = info.frequency_hz.div_ceil(4);
+    let mut elapsed = 0;
+    // Bounded even if the reference clock is broken. Do not wait on the clock
+    // under test, nor HLT forever when the PIT is stopped.
+    for _ in 0..50_000_000 {
+        let now = arch::hpet::read_main_counter().expect("HPET initialized");
+        elapsed = if info.counter_64bit {
+            now.wrapping_sub(start)
+        } else {
+            (now as u32).wrapping_sub(start as u32) as u64
+        };
+        if elapsed >= window {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    assert!(elapsed >= window, "HPET observation timed out");
+    let observed = kernel_core::time::get_ticks().wrapping_sub(ticks);
+    let expected = elapsed.saturating_mul(1000) / info.frequency_hz;
+    // Allow IRQ latency/quantization, but reject the firmware's ~18 Hz rate
+    // and duplicate BSP/AP accounting. No serial output inside the window.
+    let passed = observed >= expected * 3 / 4 && observed <= expected * 5 / 4;
+    klog_always!(
+        "BSP-TIMER {}: ticks={} hpet_ms={} tolerance_percent=25",
+        if passed { "PASS" } else { "FAIL" },
+        observed,
+        expected
+    );
+    assert!(passed, "BSP tick rate differs from nominal 1 kHz");
+}
+
 /// 测试页表管理器
 /// R180-12 compile-time cross-crate API guard. Keeping this function in the
 /// top-level `kernel` crate proves that a consumer can pair the public general
@@ -54,6 +96,15 @@ pub fn test_scheduler() {
 pub fn test_fork_framework() {
     klog_always!("  [TEST] Fork System Call Framework...");
     kernel_core::fork::run_cow_refcount_self_test();
+    // ST-K2-P2: this oracle drives copy_page_table_cow to an induced failure over
+    // a deliberately synthetic page-table tree (its entry-island PML4[511] points
+    // at a zeroed PDPT). KPTI is enabled unconditionally (main.rs), so that path
+    // also derives a user root through create_kpti_user_pml4, and the mitigation
+    // proof's probe asserts that the real kernel layout samples (text/data/heap/
+    // stack) resolve in every root it inspects — which a synthetic root cannot
+    // satisfy. Run it in every ordinary guest and skip only that proof build.
+    #[cfg(not(feature = "mitigation_probe"))]
+    kernel_core::fork::run_cow_failure_cleanup_self_test();
     kernel_core::syscall::run_cow_mprotect_self_test();
     kernel_core::pid_namespace::run_shutdown_creation_self_test();
     klog_always!("    ✓ Fork implementation compiled");
@@ -376,7 +427,15 @@ pub fn test_context_switch() {
 
 /// 测试内存映射
 pub fn test_memory_mapping() {
+    kernel_core::process::run_shared_fault_pt_ledger_self_test();
+    kernel_core::syscall::run_mmap_flags_self_test();
+    kernel_core::syscall::run_mremap_flags_self_test();
+    kernel_core::syscall::run_mremap_geometry_self_test();
+    mm::run_memory_capability_self_test();
     klog_always!("  [TEST] Memory Mapping...");
+    klog_always!("    [PASS] ST-K2-P1 mmap flags fail-closed oracle");
+    klog_always!("    [PASS] ST-K2-MREMAP flags + placement/delta oracle");
+    klog_always!("    [PASS] 3.3 slab/NUMA/swap/THP ownership oracles");
     klog_always!("    ✓ mmap system call implemented");
     klog_always!("    ✓ munmap system call implemented");
     klog_always!("    ✓ Memory protection flags supported");

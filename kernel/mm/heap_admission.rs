@@ -391,7 +391,9 @@ fn release_reserved_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmis
         return Ok(());
     }
     // Class first is conservative: the global gate still withholds the bytes
-    // until both counters have been updated.
+    // until both counters have been updated. A CorruptState result here means
+    // a prior owner/ledger invariant was already broken; fail-stop rather than
+    // silently under-counting retained memory.
     subtract_reserved(&CLASS_STATES[class.index()], bytes).unwrap_or_else(|error| {
         panic!("heap admission class reservation release corrupt: {error:?}")
     });
@@ -422,6 +424,9 @@ fn release_committed_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmi
     if bytes == 0 {
         return Ok(());
     }
+    // A committed release is only valid for the exact charge owner. Counter
+    // underflow therefore indicates prior ledger corruption, and the Drop
+    // owner deliberately fail-stops instead of hiding an accounting breach.
     subtract_committed(&CLASS_STATES[class.index()], bytes).unwrap_or_else(|error| {
         panic!("heap admission class committed release corrupt: {error:?}")
     });

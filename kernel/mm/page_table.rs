@@ -1412,6 +1412,26 @@ unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
 }
 
 #[cfg(test)]
+mod pt_lock_tests {
+    use super::{pt_lock_owner_cpu, try_with_current_manager, with_pt_lock};
+    use x86_64::VirtAddr;
+
+    #[test]
+    fn try_manager_rejects_same_cpu_reentry() {
+        assert_eq!(pt_lock_owner_cpu(), None);
+        with_pt_lock(|| {
+            let owner = pt_lock_owner_cpu();
+            assert_eq!(owner, Some(cpu_local::current_cpu_id()));
+            let nested = unsafe { try_with_current_manager(VirtAddr::new(0), |_| ()) };
+            assert!(
+                nested.is_none(),
+                "same-CPU PT lock reentry must be nonblocking"
+            );
+        });
+        assert_eq!(pt_lock_owner_cpu(), None);
+    }
+}
+#[cfg(test)]
 mod physical_range_tests {
     use super::{
         checked_mmio_page_count, checked_physical_range_for_bits, cpu_physical_address_bits,

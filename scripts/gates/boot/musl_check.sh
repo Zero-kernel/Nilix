@@ -1,0 +1,319 @@
+#!/bin/bash
+# ============================================================================
+# Zero-OS musl libc conformance gate  (M0 item 3 — the FIRST real gate)
+# ============================================================================
+# Sibling of `make test` / scripts/gates/boot/kernel_test.sh (runtime suite gate) and
+# boot_check.sh. This script's exit code reflects the REAL health of the
+# user-mode ABI: it proves that a genuine static-musl binary runs end-to-end
+# (crt startup consuming the auxv, musl stdio via printf -> writev, and a
+# clean process exit).
+#
+# It boots the kernel — which MUST be built with `--features musl_test` so the
+# embedded `userspace/hello_musl.elf` is the Ring-3 init program (see
+# `make build-musl-test` / `make musl-check`) — under QEMU and asserts ALL of:
+#
+#   1. the LIBC-ATTRIBUTABLE printf marker "42 * 2 = 84" appears on serial.
+#      It is printf("%d")-formatted arithmetic from userspace/hello_musl.c, so
+#      it can only be produced by musl's stdio path actually running — a raw
+#      write(2) syscall cannot format it. This is the discriminator that makes
+#      the gate FAIL-CLOSED if the esp instead holds the DEFAULT (native Rust
+#      `hello`) kernel, which also exits 0 but never prints this line.
+#   2. the test program reaches its final puts() success marker
+#      "musl libc test passed!" (closes the partial-run false-pass hole where
+#      only the early printf ran).
+#   3. the poll/select and RF180-27 zero-length socket syscall probes each print
+#      their success marker (real Ring-3 dispatch, validation, and copy paths).
+#   4. the process exits CLEANLY: "Process N ... exit code 0" on serial.
+#   5. NO NX-violation instruction-fetch #PF occurred (the
+#      D1-BOOT-NX-KASLR-LAYOUT signature `v=0e e=0011` in the QEMU `-d int` log).
+#   6. NO kernel panic on serial.
+#
+# `cpu_reset` markers are captured for triage but NOT hard-gated: a healthy
+# zero-baseline is not calibrated across QEMU builds (boot_check.sh likewise
+# does not gate on reset). Process lesson (from D1): health MUST be read from
+# the serial log and the QEMU `-d int` log, never from the QEMU exit code.
+#
+# Usage:   bash scripts/gates/boot/musl_check.sh [esp_dir]
+# Env:     OVMF_PATH (autodetect fallback if unset)
+#          MUSL_CHECK_TIMEOUT seconds (default 900; CI uses 900)
+# ============================================================================
+set -u
+
+# Resolve the repo root from this script's own location so it runs from any
+# working directory (CI, the remote build host, a fresh clone) without a `cd`.
+ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
+
+QEMU=qemu-system-x86_64
+# ESP defaults to <repo>/esp; a relative override is resolved against the repo root
+# (so `bash scripts/gates/boot/musl_check.sh esp` works the same from anywhere), absolute kept.
+ESP="${1:-$ROOT/esp}"
+case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
+# Default 900s: the boot self-test suite + the Ring-3 poll/select smoke (M0-6) push
+# the clean-exit marker past the old 25s window on a loaded remote. The gate still
+# observes to completion and re-greps the full log, so a wider window never weakens
+# it (it only fails-fast earlier on KERNEL PANIC).
+TO="${MUSL_CHECK_TIMEOUT:-900}"
+CPUS="${MUSL_CHECK_CPUS:-1}"
+if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ || ! "$CPUS" =~ ^(1|2|4|8)$ ]]; then
+    echo "MUSL-CHECK BLOCKED: invalid timeout or CPU count (timeout 1-900s; CPUs 1/2/4/8)"
+    exit 2
+fi
+
+# Serial markers — KEEP IN SYNC with userspace/hello_musl.c.
+# Both musl markers are required (printf path AND the final puts path); checked
+# as fixed strings (grep -F) so the literal '*' in the arithmetic line is not
+# treated as a regex quantifier.
+MUSL_PRINTF_MARKER='42 * 2 = 84'
+MUSL_SUCCESS_MARKER='musl libc test passed!'
+# M0-6 poll/select Ring-3 smoke marker: printed only if poll/select/ppoll all
+# ran to the expected results end-to-end (dispatch + copy-in/out + timeout casts).
+MUSL_POLL_MARKER='MUSL-POLL-OK'
+# RF180-27/RF180-51 socket marker: printed only after zero-length sendto/recvfrom
+# validate flags/fds/type, unconnected TCP empty send reports ENOTCONN, TCP empty
+# receive succeeds without mutation, missing UDP destination reports
+# EDESTADDRREQ, and a parseable header-only UDP datagram reaches the production
+# default-deny firewall as EPERM rather than malformed-buffer EINVAL.
+MUSL_SOCKET_ZERO_MARKER='MUSL-SOCKET-ZERO-OK'
+# D2-ABI-STAT-LAYOUT markers: printed only if the kernel emits the exact Linux
+# x86-64 struct stat (144B) / new_utsname (390B) wire layouts — stat("/") is
+# S_ISDIR with zeroed pad/reserved bytes (0x5a-prefilled buffer), a pipe fd
+# fstats as S_IFIFO, and uname fills domainname with "(none)".
+MUSL_STAT_MARKER='MUSL-STAT-OK'
+MUSL_UNAME_MARKER='MUSL-UNAME-OK'
+MUSL_SHARED_MMAP_MARKER='MUSL-SHARED-MMAP-OK'
+# Accept both the sys_exit ("exited with code") and reaper ("terminated with
+# exit code") phrasings; the musl Ring-3 path emits the latter.
+EXIT_RE='^Process 1 (exited with code|terminated with exit code) 0$'
+PANIC_MARKER='KERNEL PANIC'
+# The exact D1-BOOT-NX-KASLR-LAYOUT signature. QEMU's `-d int` logs page faults
+# as `v=%02x e=%04x` (vector and error code adjacent), so matching the full
+# `v=0e e=0011` scopes the count to NX instruction-fetch #PF only — a bare
+# `e=0011` could false-match an unrelated exception that happens to carry error
+# code 0x0011. Fixed-string (grep -F) — the tokens contain no regex metachars.
+NX_RE='v=0e e=0011'
+CPU_RESET_RE='cpu[_ ]reset|CPU Reset'
+
+# OVMF firmware autodetect (prefers explicit OVMF_PATH, else mirrors the
+# Makefile OVMF_PATH search order including the OVMF_CODE*.fd fallback).
+if [ -n "${OVMF_PATH:-}" ] && [ -f "${OVMF_PATH:-}" ]; then
+    OVMF="$OVMF_PATH"
+elif [ -f /usr/share/qemu/OVMF.fd ]; then
+    OVMF=/usr/share/qemu/OVMF.fd
+elif [ -f /usr/share/ovmf/OVMF.fd ]; then
+    OVMF=/usr/share/ovmf/OVMF.fd
+elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
+    OVMF=/usr/share/OVMF/OVMF_CODE.fd
+else
+    OVMF="$(find /usr/share/OVMF/ -type f -name 'OVMF_CODE*.fd' 2>/dev/null | head -n 1)"
+    if [ -z "$OVMF" ]; then
+        echo "MUSL-CHECK FAIL: OVMF firmware not found (set OVMF_PATH)"
+        exit 2
+    fi
+fi
+
+if [ ! -f "$ESP/kernel.elf" ]; then
+    echo "MUSL-CHECK FAIL: $ESP/kernel.elf missing — run 'make build-musl-test' first"
+    exit 2
+fi
+
+if [ -n "${MUSL_CHECK_LOG_DIR:-}" ]; then
+    mkdir -p -- "$MUSL_CHECK_LOG_DIR" || exit 2
+    artifact_dir="$(mktemp -d "$MUSL_CHECK_LOG_DIR/musl.XXXXXX")" || exit 2
+    ser="$artifact_dir/serial.log"
+    intlog="$artifact_dir/interrupts.log"
+    echo "MUSL-CHECK ARTIFACTS: $artifact_dir"
+else
+    ser="$(mktemp)"
+    intlog="$(mktemp)"
+fi
+qemuerr="$ser.qemu.stderr"
+timeoutlog="$ser.timeout.stderr"
+cleanup() {
+    if [ -z "${MUSL_CHECK_LOG_DIR:-}" ]; then
+        rm -rf -- "$ser.inputs"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.qemu.status" "$ser.gate.status"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Observe the full window, retaining process status and both diagnostic streams.
+python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
+    --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
+"$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
+
+LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
+    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+    -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
+    -netdev user,id=net0,restrict=on,ipv6=off \
+    -device virtio-net-pci,netdev=net0,romfile= \
+    -m 256M -smp "$CPUS" -vga std -no-reboot -no-shutdown \
+    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -display none -serial "file:$ser" \
+    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+qemu_status=$?
+printf '%s\n' "$qemu_status" > "$ser.qemu.status"
+
+# Evaluate the final logs (do not trust only the poll flag).
+has_printf=0;  grep -Fq "$MUSL_PRINTF_MARKER"  "$ser" 2>/dev/null && has_printf=1
+has_success=0; grep -Fq "$MUSL_SUCCESS_MARKER" "$ser" 2>/dev/null && has_success=1
+has_poll=0;    grep -Fq "$MUSL_POLL_MARKER"    "$ser" 2>/dev/null && has_poll=1
+has_socket_zero=0; grep -Fq "$MUSL_SOCKET_ZERO_MARKER" "$ser" 2>/dev/null && has_socket_zero=1
+has_stat=0;    grep -Fq "$MUSL_STAT_MARKER"    "$ser" 2>/dev/null && has_stat=1
+has_uname=0;   grep -Fq "$MUSL_UNAME_MARKER"   "$ser" 2>/dev/null && has_uname=1
+has_shared_mmap=0; grep -Fq "$MUSL_SHARED_MMAP_MARKER" "$ser" 2>/dev/null && has_shared_mmap=1
+has_exit=0;    grep -qE "$EXIT_RE"             "$ser" 2>/dev/null && has_exit=1
+has_panic=0;   grep -Fq "$PANIC_MARKER"        "$ser" 2>/dev/null && has_panic=1
+
+nx=$(grep -cF "$NX_RE" "$intlog" 2>/dev/null); nx=${nx:-0}
+resets=$(grep -ciE "$CPU_RESET_RE" "$intlog" 2>/dev/null); resets=${resets:-0}
+
+rc=0
+python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
+term_events=$(grep -cF 'timeout: sending signal TERM to command' "$timeoutlog" || true)
+kill_events=$(grep -cF 'timeout: sending signal KILL to command' "$timeoutlog" || true)
+if [ "$qemu_status" -ne 124 ] || [ "$term_events" -ne 1 ] || [ "$kill_events" -ne 0 ]; then
+    echo "MUSL-CHECK FAIL: QEMU timeout contract status=$qemu_status TERM=$term_events KILL=$kill_events"
+    rc=1
+fi
+for marker in MUSL-STANDARD-FD-OK MUSL-OPEN-TRUNC-OK MUSL-ROBUST-USERCOPY-OK MUSL-WAIT-NAMESPACE-OK MUSL-BLOCKED-SIGNAL-OK MUSL-FCNTL-LIMIT-OK; do
+    if ! grep -Fxq "$marker" "$ser"; then
+        echo "MUSL-CHECK FAIL: guest regression marker missing ($marker)"
+        rc=1
+    fi
+done
+# The VFS child must finish functional pivot before its parent acknowledges the
+# complete context suite. Require one exact record per stage in execution order;
+# a duplicate, altered scope, deferred pivot, or earlier success cannot pass.
+if ! awk \
+    -v pivot='MUSL-VFS-PIVOT-OK scope=transaction-fork-namespaces-descriptors-repeat' \
+    -v context='MUSL-VFS-CONTEXT-OK scope=cwd-components-dac-ids-chroot' \
+    -v success="$MUSL_SUCCESS_MARKER" -v exiting="$EXIT_RE" '
+    $0 == "MUSL-FCNTL-LIMIT-OK" { f++; fl=NR }
+    index($0, "MUSL-VFS-PIVOT-OK") == 1 { ps++ }
+    index($0, "MUSL-VFS-CONTEXT-OK") == 1 { cs++ }
+    index($0, "MUSL-VFS-PIVOT-DEFERRED") == 1 { invalid++ }
+    $0 == pivot { p++; pl=NR }
+    $0 == context { c++; cl=NR }
+    $0 == success { s++; sl=NR }
+    $0 ~ exiting { e++; el=NR }
+    END { exit !(f == 1 && p == 1 && ps == 1 && c == 1 && cs == 1 &&
+                  s == 1 && e == 1 && invalid == 0 &&
+                  fl < pl && pl < cl && cl < sl && sl < el) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: missing, duplicate, malformed, deferred or unordered VFS completion"
+    rc=1
+fi
+if [ "$CPUS" -gt 1 ] && ! grep -Fxq "MUSL-EXIT-IDLE-OK cases=$(( (CPUS - 1) * 2 ))" "$ser"; then
+    echo "MUSL-CHECK FAIL: missing cross-CPU exit/reap completion"
+    rc=1
+fi
+# KSA SMP TLS: an affinity mask or a skipped/partial probe cannot qualify the
+# IRQ-only migration contract. Require four ordered measurements, alternating
+# distinct actual CPUs, with both exact TLS cookies before the final marker.
+if [ "$CPUS" -ge 3 ]; then
+    if ! awk -v cpus="$CPUS" '
+        index($0, "MUSL-TLS-IRQ-CASE-PASS") == 1 {
+            n++; last=NR;
+            if (NF != 6 || $1 != "MUSL-TLS-IRQ-CASE-PASS" || $2 != "phase=" (n+1) ||
+                $3 !~ /^cpu=[0-9]+$/ || $4 != "fs_cookie=4653544c53000001" ||
+                $5 != "gs_cookie=4753544c53000001" || $6 !~ /^checks=[1-9][0-9]*$/) bad++;
+            split($3, field, "="); cpu=field[2]+0;
+            if (cpu < 0 || cpu >= cpus) bad++;
+            if (n == 1) first=cpu;
+            if (n == 2) second=cpu;
+            if ((n == 2 && first == second) || (n > 2 && cpu != (n % 2 ? first : second))) bad++;
+        }
+        index($0, "MUSL-TLS-IRQ-OK") == 1 { ok++; end=NR; if ($0 != "MUSL-TLS-IRQ-OK migrations=4") bad++ }
+        index($0, "MUSL-TLS-IRQ-SKIP") == 1 { bad++ }
+        END { exit !(n == 4 && ok == 1 && bad == 0 && last < end) }
+    ' "$ser"; then
+        echo "MUSL-CHECK FAIL: missing or invalid exact-TLS IRQ migration evidence"
+        rc=1
+    fi
+elif ! awk '
+    index($0, "MUSL-TLS-IRQ-SKIP") == 1 {
+        n++; if ($0 != "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus") bad++;
+    }
+    /^MUSL-TLS-IRQ-(CASE-PASS|OK)/ { bad++ }
+    END { exit !(n == 1 && bad == 0) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: invalid TLS migration applicability record"
+    rc=1
+fi
+for case_name in regular pipe socket nofile; do
+    if ! grep -Fxq "KSA-013-CASE PASS case=$case_name" "$ser"; then
+        echo "MUSL-CHECK FAIL: missing fcntl/NOFILE case $case_name"
+        rc=1
+    fi
+done
+if grep -Eq '^MUSL-.*-FAIL' "$ser"; then
+    echo "MUSL-CHECK FAIL: guest reported a failed probe"
+    rc=1
+fi
+if [ "$has_printf" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: libc printf marker missing (expected '$MUSL_PRINTF_MARKER')"
+    echo "    => musl crt/auxv/stdio did not run to the printf stage (or esp is not the musl_test kernel)"
+    rc=1
+fi
+if [ "$has_success" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: libc success marker missing (expected '$MUSL_SUCCESS_MARKER')"
+    rc=1
+fi
+if [ "$has_poll" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: poll/select smoke marker missing (expected '$MUSL_POLL_MARKER')"
+    echo "    => poll(7)/select(23)/pselect6(270)/ppoll(271) Ring-3 smoke failed (see MUSL-POLL-FAIL on serial)"
+    rc=1
+fi
+if [ "$has_socket_zero" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: zero-length socket marker missing (expected '$MUSL_SOCKET_ZERO_MARKER')"
+    echo "    => sendto(44)/recvfrom(45) validation, TCP zero-length semantics, or UDP policy classification failed (see MUSL-SOCKET-ZERO-FAIL on serial)"
+    rc=1
+fi
+if [ "$has_stat" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: stat ABI marker missing (expected '$MUSL_STAT_MARKER')"
+    echo "    => kernel stat/fstat wire layout is not the Linux x86-64 struct stat (see MUSL-STAT-FAIL on serial; finding D2-ABI-STAT-LAYOUT)"
+    rc=1
+fi
+if [ "$has_uname" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: uname ABI marker missing (expected '$MUSL_UNAME_MARKER')"
+    echo "    => kernel uname did not write the full 390-byte new_utsname incl. domainname (see MUSL-UNAME-FAIL on serial)"
+    rc=1
+fi
+if [ "$has_shared_mmap" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: shared-anonymous marker missing (expected '$MUSL_SHARED_MMAP_MARKER')"
+    echo "    => MAP_SHARED|MAP_ANONYMOUS musl consumer did not complete"
+    rc=1
+fi
+if [ "$has_exit" -ne 1 ]; then
+    echo "MUSL-CHECK FAIL: PID 1 did not exit successfully within ${TO}s"
+    rc=1
+fi
+if [ "$has_panic" -eq 1 ]; then
+    echo "MUSL-CHECK FAIL: kernel panic observed on serial"
+    rc=1
+fi
+if [ "$nx" -gt 0 ]; then
+    echo "MUSL-CHECK FAIL: $nx NX-violation #PF (D1 signature '$NX_RE') during the musl run"
+    grep -m1 -F "$NX_RE" "$intlog" 2>/dev/null | sed 's/^/    /'
+    rc=1
+fi
+
+if [ "$rc" -ne 0 ]; then
+    if [ "$resets" -gt 0 ]; then
+        echo "MUSL-CHECK INFO: intlog contains $resets cpu_reset marker(s) (not hard-gated)"
+        grep -im1 -E "$CPU_RESET_RE" "$intlog" 2>/dev/null | sed 's/^/    /'
+    fi
+    echo "--- serial tail ---"
+    tail -40 "$ser" 2>/dev/null | sed 's/^/    /'
+else
+    if [ "$resets" -gt 0 ]; then
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI + shared-mmap markers + clean exit + 0 NX faults; $resets cpu_reset marker(s) observed, not gated)"
+    else
+        echo "MUSL-CHECK OK: static-musl hello ran to exit 0 (libc + poll + socket-zero + stat-ABI + uname-ABI + shared-mmap markers + clean exit + 0 NX faults)"
+    fi
+fi
+printf '%s\n' "$rc" > "$ser.gate.status"
+exit "$rc"

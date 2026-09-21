@@ -242,6 +242,33 @@ impl RuntimeTest for BuddyAllocatorTest {
 }
 
 /// Test R186-4 P0-A: VMA/MM metadata heap admission with CoreProcess coexistence
+fn assert_admission_lanes_at_least(
+    baseline: mm::HeapAdmissionSnapshot,
+    observed: mm::HeapAdmissionSnapshot,
+    expected_committed_delta: usize,
+    context: &str,
+) -> Result<(), String> {
+    if observed.reserved_bytes != baseline.reserved_bytes {
+        return Err(alloc::format!(
+            "{context}: reserved lane changed from {} to {}",
+            baseline.reserved_bytes,
+            observed.reserved_bytes
+        ));
+    }
+    let minimum = baseline
+        .committed_bytes
+        .checked_add(expected_committed_delta)
+        .ok_or_else(|| alloc::format!("{context}: committed delta overflow"))?;
+    if observed.committed_bytes < minimum {
+        return Err(alloc::format!(
+            "{context}: committed lane under-counted (minimum {}, observed {})",
+            minimum,
+            observed.committed_bytes
+        ));
+    }
+    Ok(())
+}
+
 struct VmaHeapAdmissionTest;
 
 impl RuntimeTest for VmaHeapAdmissionTest {
@@ -250,74 +277,64 @@ impl RuntimeTest for VmaHeapAdmissionTest {
     }
 
     fn description(&self) -> &'static str {
-        "R186-4 P0-A: Verify AdmittedMap VMA metadata admission with CoreProcess coexistence"
+        "R186-4 P0-A: Verify VMA metadata admission and charge symmetry"
     }
 
     fn run(&self) -> TestResult {
-        // This test verifies the core implementation of R186-4:
-        // - mmap_regions uses AdmittedMap (not FallibleOrderedMap)
-        // - pt_charged_frames uses AdmittedMap
-        // - All admission control is functioning
-        // - CoreProcess class-cap coexistence is maintained
-
-        // Verify heap budgets are published (P2-A prerequisite)
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budget arbiter not published - P2-A prerequisite missing",
+                "Heap budget arbiter not published - admission precondition missing",
             ));
         }
 
-        let snap_before = mm::heap_budget_snapshot();
+        let class = mm::HeapClass::CoreProcess;
+        let baseline = mm::heap_class_snapshot(class);
+        let result: Result<(), String> = (|| {
+            let mut map: mm::AdmittedMap<usize, usize> = mm::AdmittedMap::new(class);
+            map.try_insert(1, 2)
+                .map_err(|error| alloc::format!("initial admission failed: {error:?}"))?;
+            let during = mm::heap_class_snapshot(class);
+            let map_bytes = mm::vec_charge_bytes::<(usize, usize)>(map.capacity())
+                .map_err(|error| alloc::format!("map charge overflow: {error:?}"))?;
+            assert_admission_lanes_at_least(baseline, during, map_bytes, "initial map")?;
 
-        // P1-A polarity: Verify general residual is above minimum threshold
-        // (not exact-zero check per FA-04)
-        const MIN_RESIDUAL_THRESHOLD: usize = 64 * 1024; // 64 KiB minimum
-        if snap_before.general_residual_bytes < MIN_RESIDUAL_THRESHOLD {
-            return TestResult::Fail(alloc::format!(
-                "General residual {} bytes below threshold {} - coexistence floor insufficient",
-                snap_before.general_residual_bytes,
-                MIN_RESIDUAL_THRESHOLD
-            ));
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(2)
+                .map_err(|_| String::from("failed to allocate constructor input"))?;
+            entries.push((10usize, 20usize));
+            entries.push((30usize, 40usize));
+            let bytes = mm::vec_charge_bytes::<(usize, usize)>(entries.capacity())
+                .map_err(|error| alloc::format!("constructor charge overflow: {error:?}"))?;
+            let before_constructed = mm::heap_class_snapshot(class);
+            let reservation = mm::try_reserve_heap(class, bytes)
+                .map_err(|error| alloc::format!("constructor admission failed: {error:?}"))?;
+            let constructed =
+                mm::AdmittedMap::from_sorted_vec_with_reservation(entries, reservation).map_err(
+                    |error| alloc::format!("constructor handoff failed: {:?}", error.error()),
+                )?;
+            let after_constructed = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(
+                before_constructed,
+                after_constructed,
+                bytes,
+                "constructor handoff",
+            )?;
+            if constructed.get(&10) != Some(&20) || constructed.get(&30) != Some(&40) {
+                return Err(String::from("constructor handoff lost sorted entries"));
+            }
+            drop(constructed);
+            map.clear();
+            drop(map);
+            let after = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(baseline, after, 0, "coexistence cleanup")?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(error) => TestResult::Fail(error),
         }
-
-        // The implementation verification was done at compile time:
-        // - MmState.mmap_regions: AdmittedMap<usize, MmapEntry> (process.rs:~1260)
-        // - MmState.pt_charged_frames: AdmittedMap<PhysAddr, ()> (process.rs:~1263)
-        // - try_insert/remove/range_mut all use admission control
-        // - from_sorted_vec_charged provides atomic fork clone (fork.rs:~646)
-
-        // Runtime verification: heap budgets are consistent
-        let snap_after = mm::heap_budget_snapshot();
-
-        // FA-09: Amount-symmetric check with tolerance for concurrent allocation
-        // (not exact equality which can fail spuriously)
-        const TOLERANCE_BYTES: usize = 4096; // 1 page tolerance
-        let residual_delta =
-            if snap_after.general_residual_bytes > snap_before.general_residual_bytes {
-                snap_after.general_residual_bytes - snap_before.general_residual_bytes
-            } else {
-                snap_before.general_residual_bytes - snap_after.general_residual_bytes
-            };
-
-        if residual_delta > TOLERANCE_BYTES {
-            return TestResult::Fail(alloc::format!(
-                "Heap budget snapshot unstable - residual changed by {} bytes (tolerance: {})",
-                residual_delta,
-                TOLERANCE_BYTES
-            ));
-        }
-
-        // Heap total should be invariant (no tolerance - this is structural)
-        if snap_after.heap_total_bytes != snap_before.heap_total_bytes {
-            return TestResult::Fail(alloc::format!(
-                "Heap total changed: {} -> {} (structural invariant violated)",
-                snap_before.heap_total_bytes,
-                snap_after.heap_total_bytes
-            ));
-        }
-
-        // Success: AdmittedMap infrastructure is in place and heap budgets are consistent
-        TestResult::Pass
     }
 }
 
@@ -330,121 +347,80 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
     }
 
     fn description(&self) -> &'static str {
-        "R186-4 P0-A Extended: Verify AdmittedMap behavior under simulated heap pressure"
+        "R186-4 P0-A Extended: Verify admission failure and capacity reclamation"
     }
 
     fn run(&self) -> TestResult {
-        // This test simulates heap pressure by checking admission control behavior
-        // when approaching capacity limits. It verifies:
-        // - try_reserve correctly pre-checks capacity
-        // - try_insert fails gracefully at capacity
-        // - remove correctly reclaims capacity
-        // - No panic, corruption, or deadlock under pressure
-
-        use mm::AdmittedMap;
-
-        // Create a test AdmittedMap with CoreProcess class
-        let mut test_map: AdmittedMap<usize, usize> = AdmittedMap::new(mm::HeapClass::CoreProcess);
-
-        // Verify initial state
-        if test_map.len() != 0 {
-            return TestResult::Fail(String::from("AdmittedMap not empty at initialization"));
-        }
-
-        // Test 1: Insert entries until we hit capacity
-        let mut inserted_count = 0;
-        let mut hit_capacity = false;
-        for i in 0..1000 {
-            match test_map.try_insert(i, i * 2) {
-                Ok(_) => {
-                    inserted_count += 1;
-                }
-                Err(_) => {
-                    // Hit capacity limit - this is expected behavior
-                    hit_capacity = true;
-                    break;
-                }
-            }
-        }
-
-        if inserted_count == 0 {
-            return TestResult::Fail(String::from(
-                "Could not insert any entries - CoreProcess floor may be zero",
-            ));
-        }
-
-        // Test 2: Verify map length matches inserted count
-        if test_map.len() != inserted_count {
-            return TestResult::Fail(alloc::format!(
-                "Map length mismatch: expected {}, got {}",
-                inserted_count,
-                test_map.len()
-            ));
-        }
-
-        // Test 3: If we hit capacity, verify subsequent insert fails
-        // If we didn't hit capacity (inserted all 1000), this test doesn't apply
-        if hit_capacity {
-            let beyond_capacity_result = test_map.try_insert(9999, 9999);
-            if beyond_capacity_result.is_ok() {
-                return TestResult::Fail(String::from(
-                    "Insert beyond capacity succeeded when it should have failed",
-                ));
-            }
-        }
-
-        // Test 4: Remove half the entries
-        let remove_count = inserted_count / 2;
-        for i in 0..remove_count {
-            match test_map.remove(&i) {
-                Some(val) => {
-                    if val != i * 2 {
-                        return TestResult::Fail(alloc::format!(
-                            "Removed value mismatch at key {}: expected {}, got {}",
-                            i,
-                            i * 2,
-                            val
-                        ));
-                    }
-                }
-                None => {
-                    return TestResult::Fail(alloc::format!("Failed to remove existing key {}", i));
-                }
-            }
-        }
-
-        // Test 5: Verify capacity was reclaimed - should be able to insert again
-        let reclaim_test = test_map.try_insert(10000, 20000);
-        if reclaim_test.is_err() {
-            return TestResult::Fail(String::from(
-                "Could not insert after removing entries - capacity not reclaimed",
-            ));
-        }
-
-        // Test 6: Verify final integrity
-        let final_len = test_map.len();
-        let expected_len = inserted_count - remove_count + 1; // +1 for reclaim_test insert
-        if final_len != expected_len {
-            return TestResult::Fail(alloc::format!(
-                "Final length mismatch: expected {}, got {}",
-                expected_len,
-                final_len
-            ));
-        }
-
-        // Test 7: Verify heap budgets remained stable
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budgets not published after pressure test",
+                "Heap budget arbiter not published - admission precondition missing",
             ));
         }
 
-        // Success: AdmittedMap correctly handles pressure scenarios
-        TestResult::Pass
+        let class = mm::HeapClass::CoreProcess;
+        let baseline = mm::heap_class_snapshot(class);
+        let result: Result<(), String> = (|| {
+            let mut map: mm::AdmittedMap<usize, usize> = mm::AdmittedMap::new(class);
+            let mut inserted = 0usize;
+            let mut admission_failed = false;
+            for key in 0..50_000usize {
+                match map.try_insert(key, key.saturating_mul(2)) {
+                    Ok(_) => inserted += 1,
+                    Err(_) => {
+                        admission_failed = true;
+                        break;
+                    }
+                }
+            }
+            if !admission_failed {
+                return Err(String::from(
+                    "pressure leg never reached the CoreProcess admission limit",
+                ));
+            }
+            if inserted < 16 {
+                return Err(alloc::format!(
+                    "pressure leg admitted only {inserted} entries before failure"
+                ));
+            }
+            if map.len() != inserted || map.get(&0) != Some(&0) {
+                return Err(String::from(
+                    "pressure leg lost an admitted entry before reaching the class limit",
+                ));
+            }
+            let during = mm::heap_class_snapshot(class);
+            let map_bytes = mm::vec_charge_bytes::<(usize, usize)>(map.capacity())
+                .map_err(|error| alloc::format!("pressure charge overflow: {error:?}"))?;
+            assert_admission_lanes_at_least(baseline, during, map_bytes, "pressure leg")?;
+
+            let retained_before = during.committed_bytes;
+            if map.remove_retaining_capacity(&0).is_none() {
+                return Err(String::from(
+                    "retaining removal could not find the first entry",
+                ));
+            }
+            let retained = mm::heap_class_snapshot(class);
+            if retained.reserved_bytes != during.reserved_bytes
+                || retained.committed_bytes < retained_before
+            {
+                return Err(String::from(
+                    "remove_retaining_capacity released live backing or changed reservations",
+                ));
+            }
+            map.clear();
+            drop(map);
+            let after = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(baseline, after, 0, "pressure cleanup")?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(error) => TestResult::Fail(error),
+        }
     }
 }
 
-/// R186-4 P0-A Combined-Load: Fork with maximum VMA count under memory pressure
+/// R186-4 P0-A Combined-Load: Fork with VMA metadata under admission pressure
 struct VmaForkCombinedLoadTest;
 
 impl RuntimeTest for VmaForkCombinedLoadTest {
@@ -453,149 +429,125 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
     }
 
     fn description(&self) -> &'static str {
-        "R186-4 P0-A Combined-Load: Fork under memory pressure with maximum VMA regions"
+        "R186-4 P0-A Combined-Load: Fork snapshot admission and rollback"
     }
 
     fn run(&self) -> TestResult {
-        // This test verifies the complete R186-4 fix under realistic load:
-        // 1. Parent process creates many VMA regions (approaching capacity)
-        // 2. Fork is called (exercises from_sorted_vec_charged with shrink_to_fit fix)
-        // 3. Verify child admission succeeds without capacity amplification
-        // 4. Verify no heap budget leaks on rollback paths
-
-        // Verify prerequisites
         if !mm::heap_budgets_published() {
             return TestResult::Fail(String::from(
-                "Heap budget arbiter not published - cannot test admission",
+                "Heap budget arbiter not published - admission precondition missing",
             ));
         }
 
-        let snap_initial = mm::heap_budget_snapshot();
-
-        // Phase 1: Create a realistic parent map with significant VMA-like entries
-        use mm::AdmittedMap;
-
-        let mut parent_map: AdmittedMap<usize, usize> =
-            AdmittedMap::new(mm::HeapClass::CoreProcess);
-
-        const TARGET_VMA_COUNT: usize = 100; // Realistic VMA count for complex process
-
-        let mut inserted = 0;
-        for i in 0..TARGET_VMA_COUNT {
-            match parent_map.try_insert(i * 4096, i) {
-                Ok(_) => inserted += 1,
-                Err(_) => break, // Hit capacity - continue with what we have
+        let class = mm::HeapClass::CoreProcess;
+        let baseline = mm::heap_class_snapshot(class);
+        let result: Result<(), String> = (|| {
+            let mut parent: mm::AdmittedMap<usize, usize> = mm::AdmittedMap::new(class);
+            for key in 0..128usize {
+                parent
+                    .try_insert(key * 4096, key)
+                    .map_err(|error| alloc::format!("parent admission failed: {error:?}"))?;
             }
-        }
+            let inserted = parent.len();
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(inserted)
+                .map_err(|_| String::from("failed to allocate fork snapshot input"))?;
+            for (key, value) in parent.iter() {
+                entries.push((*key, *value));
+            }
+            let mut entries_with_spare = Vec::new();
+            entries_with_spare
+                .try_reserve_exact(inserted * 2)
+                .map_err(|_| String::from("failed to allocate spare fork capacity"))?;
+            entries_with_spare.extend(entries.iter().copied());
+            let expected_bytes =
+                mm::vec_charge_bytes::<(usize, usize)>(entries_with_spare.capacity())
+                    .map_err(|error| alloc::format!("fork charge overflow: {error:?}"))?;
+            let before_child = mm::heap_class_snapshot(class);
+            let reservation = mm::try_reserve_heap(class, expected_bytes)
+                .map_err(|error| alloc::format!("fork snapshot admission failed: {error:?}"))?;
+            let child =
+                mm::AdmittedMap::from_sorted_vec_with_reservation(entries_with_spare, reservation)
+                    .map_err(|error| {
+                        alloc::format!("fork snapshot handoff failed: {:?}", error.error())
+                    })?;
+            let after_child = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(
+                before_child,
+                after_child,
+                expected_bytes,
+                "fork snapshot handoff",
+            )?;
+            let child_delta = after_child
+                .committed_bytes
+                .checked_sub(before_child.committed_bytes)
+                .ok_or_else(|| String::from("fork child committed delta moved backwards"))?;
+            if child_delta < expected_bytes {
+                return Err(alloc::format!(
+                    "fork child charge under-counted: minimum {expected_bytes}, got {child_delta}"
+                ));
+            }
+            for key in 0..inserted {
+                if child.get(&(key * 4096)) != Some(&key) {
+                    return Err(alloc::format!("fork snapshot entry {key} was corrupted"));
+                }
+            }
+            drop(child);
 
-        if inserted < 10 {
-            return TestResult::Fail(alloc::format!(
-                "Could only insert {} VMAs - CoreProcess floor too low for realistic test",
-                inserted
-            ));
-        }
-
-        // Phase 2: Simulate fork by extracting entries and using from_sorted_vec_charged
-        let mut entries = Vec::new();
-        for (k, v) in parent_map.iter() {
-            entries.push((*k, *v));
-        }
-
-        // Artificially inflate capacity to simulate the amplification scenario
-        let mut entries_with_spare = Vec::with_capacity(entries.len() * 2);
-        entries_with_spare.extend(entries.iter().copied());
-
-        // Verify spare capacity exists (this is the pre-fix amplification vector)
-        let capacity_before = entries_with_spare.capacity();
-        let len_before = entries_with_spare.len();
-        if capacity_before <= len_before {
-            return TestResult::Fail(String::from(
-                "Test setup failed: Vec has no spare capacity to test shrink_to_fit fix",
-            ));
-        }
-
-        // Call from_sorted_vec_charged - should shrink before charging (fix #1)
-        let child_map_result =
-            AdmittedMap::from_sorted_vec_charged(entries_with_spare, mm::HeapClass::CoreProcess);
-
-        match child_map_result {
-            Ok(child_map) => {
-                // Verify child has correct count
-                if child_map.len() != inserted {
-                    return TestResult::Fail(alloc::format!(
-                        "Child map length mismatch: expected {}, got {}",
-                        inserted,
-                        child_map.len()
+            let mut huge_entries = Vec::new();
+            const OVERSIZED_SNAPSHOT_ENTRIES: usize = 40_000;
+            huge_entries
+                .try_reserve_exact(OVERSIZED_SNAPSHOT_ENTRIES)
+                .map_err(|_| String::from("failed to allocate fallible pressure input"))?;
+            for key in 0..OVERSIZED_SNAPSHOT_ENTRIES {
+                huge_entries.push((key, key));
+            }
+            match mm::AdmittedMap::from_sorted_vec_charged(huge_entries, class) {
+                Ok(map) => {
+                    drop(map);
+                    return Err(String::from(
+                        "oversized fork snapshot unexpectedly passed CoreProcess admission",
                     ));
                 }
-
-                // Verify heap budgets are stable (no amplification leak)
-                let snap_after_fork = mm::heap_budget_snapshot();
-
-                if snap_after_fork.heap_total_bytes != snap_initial.heap_total_bytes {
-                    return TestResult::Fail(String::from(
-                        "Heap total changed after fork - structural invariant violated",
-                    ));
-                }
-
-                // Verify entries are intact
-                for i in 0..inserted {
-                    if child_map.get(&(i * 4096)) != Some(&i) {
-                        return TestResult::Fail(alloc::format!(
-                            "Child map data corruption at key {}",
-                            i * 4096
+                Err(error) => {
+                    let (returned, reservation, error) = error.into_parts();
+                    if !matches!(
+                        error,
+                        mm::AdmittedAllocError::Admission(
+                            mm::HeapAdmissionError::ClassLimit
+                                | mm::HeapAdmissionError::GlobalLimit
+                        )
+                    ) {
+                        drop(returned);
+                        drop(reservation);
+                        return Err(alloc::format!(
+                            "oversized snapshot failed for an unexpected reason: {error:?}"
                         ));
                     }
-                }
-
-                // Phase 3: Verify error path doesn't leak (issue #3)
-                let huge_entries: Vec<(usize, usize)> =
-                    (0..100000).map(|i| (i * 4096, i)).collect();
-
-                match AdmittedMap::from_sorted_vec_charged(huge_entries, mm::HeapClass::CoreProcess)
-                {
-                    Ok(_) => {
-                        // Budget is large - not a problem
+                    if returned.len() != OVERSIZED_SNAPSHOT_ENTRIES {
+                        drop(returned);
+                        drop(reservation);
+                        return Err(String::from(
+                            "admission failure did not return the complete snapshot",
+                        ));
                     }
-                    Err((returned_vec, _error)) => {
-                        // Verify the Vec was returned (no leak)
-                        if returned_vec.len() != 100000 {
-                            return TestResult::Fail(String::from(
-                                "Error path didn't return original Vec - potential leak",
-                            ));
-                        }
-                        // Verify heap budgets are still stable
-                        let snap_after_fail = mm::heap_budget_snapshot();
-                        if snap_after_fail.heap_total_bytes != snap_initial.heap_total_bytes {
-                            return TestResult::Fail(String::from(
-                                "Heap total changed after failed fork - leak detected",
-                            ));
-                        }
-                    }
+                    drop(returned);
+                    drop(reservation);
                 }
-
-                TestResult::Pass
             }
-            Err((returned_vec, error)) => {
-                // Fork admission failed - verify no leak
-                if returned_vec.len() != len_before {
-                    return TestResult::Fail(String::from(
-                        "Fork admission failed and Vec length changed - data loss",
-                    ));
-                }
+            drop(parent);
+            let after = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(baseline, after, 0, "fork rollback")?;
+            Ok(())
+        })();
 
-                TestResult::Deferred(alloc::format!(
-                    "Fork admission failed due to capacity constraints: {:?}",
-                    error
-                ))
-            }
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(error) => TestResult::Fail(error),
         }
     }
 }
-
-// ============================================================================
-// ST-K3: mmap-window clearance (address-space layout collision class)
-// ============================================================================
 
 /// ST-K3 FIX regression gate: the userspace mmap window in a FRESH user
 /// address space must contain no inherited parent entries that block 4 KiB
@@ -1303,26 +1255,43 @@ impl NetworkLoopbackTest {
 
         // Get the conntrack table
         let table = conntrack::conntrack_table();
-        let stats = table.stats();
+        let before = table.len();
+        // Derive a unique namespace key from the monotonic creation counter so
+        // rerunning the boot registry cannot accidentally reuse a prior flow.
+        let flow_ns = 0x7E57_0003_0000_0000u64
+            | table
+                .stats()
+                .entries_created
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+        let update = conntrack::ct_process_udp(
+            flow_ns,
+            net::Ipv4Addr([10, 0, 0, 1]),
+            net::Ipv4Addr([10, 0, 0, 2]),
+            12345,
+            8080,
+            16,
+            4000,
+        );
+        if update.decision != conntrack::CtDecision::New {
+            return Err(alloc::format!(
+                "first UDP flow was not classified as NEW: {:?}",
+                update.decision
+            ));
+        }
+        if table.len() <= before {
+            return Err(String::from("conntrack NEW flow did not publish an entry"));
+        }
 
-        // Verify table is operational by checking stats are accessible
-        // (entries_created should be available)
-        let _ = stats
-            .entries_created
-            .load(core::sync::atomic::Ordering::Relaxed);
-
-        // Check that table can perform lookups (doesn't panic)
-        let test_key = conntrack::FlowKey {
-            net_ns_id: 0,
-            ip_lo: [10, 0, 0, 1],
-            ip_hi: [10, 0, 0, 2],
-            port_lo: 80,
-            port_hi: 12345,
-            proto: 17, // UDP
-        };
-
-        // Lookup should complete without panic (result doesn't matter)
-        let _ = table.lookup(&test_key);
+        let (key, _) = conntrack::FlowKey::from_packet(
+            flow_ns,
+            17,
+            net::Ipv4Addr([10, 0, 0, 1]),
+            net::Ipv4Addr([10, 0, 0, 2]),
+            12345,
+            8080,
+        );
+        let _ = table.remove(&key);
 
         Ok(())
     }
@@ -1442,15 +1411,28 @@ impl NetworkLoopbackTest {
             ct_state: Some(conntrack::CtDecision::New),
         };
 
-        // Evaluate should complete without panic
+        let before = table.stats();
         let verdict = table.evaluate(&test_pkt);
 
-        // Verify we get a valid verdict with action field
-        match verdict.action {
-            firewall::FirewallAction::Accept => Ok(()),
-            firewall::FirewallAction::Drop => Ok(()),
-            firewall::FirewallAction::Reject { .. } => Ok(()),
+        // This NEW packet is outside the default established/related allowlist,
+        // so the default-deny policy must produce a concrete DROP and account
+        // for the decision.  Merely accepting any enum variant would make the
+        // oracle vacuous.
+        if verdict.rule_id.is_some() || verdict.action != firewall::FirewallAction::Drop {
+            return Err(alloc::format!(
+                "default firewall did not deny NEW packet: {:?}",
+                verdict
+            ));
         }
+        let after = table.stats();
+        if after.default_hits <= before.default_hits
+            || after.packets_dropped <= before.packets_dropped
+        {
+            return Err(String::from(
+                "firewall DROP was not reflected in statistics",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2339,6 +2321,19 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         crate::test_framework::DISCOVERED_RUNTIME_TEST_COUNT,
         "runtime test registry drift: discovered source implementations do not all execute"
     );
+    for discovered in crate::test_framework::DISCOVERED_RUNTIME_TEST_NAMES {
+        assert!(
+            all_tests.iter().any(|test| test.name() == *discovered),
+            "runtime test discovery has no executable implementation: {discovered}"
+        );
+    }
+    for test in &all_tests {
+        assert!(
+            crate::test_framework::DISCOVERED_RUNTIME_TEST_NAMES.contains(&test.name()),
+            "runtime test implementation is absent from build discovery: {}",
+            test.name()
+        );
+    }
     all_tests
 }
 

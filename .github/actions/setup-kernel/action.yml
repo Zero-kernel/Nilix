@@ -1,0 +1,25 @@
+name: Kernel test environment
+description: Pinned Rust toolchain, isolated Cargo cache and optional QEMU tools
+inputs:
+  qemu:
+    description: Install the VM and static-musl test tools
+    default: 'false'
+  cache-key:
+    description: Separate caches for different test profiles
+    default: kernel
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly-2025-12-08
+        components: rustfmt, clippy, rust-src, llvm-tools-preview
+        targets: x86_64-unknown-none, x86_64-unknown-uefi
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+    - if: inputs.qemu == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs

@@ -5,8 +5,8 @@
  *
  * Security > Correctness > Efficiency > Performance
  *
- * The host half of this contract lives in scripts/stress_protocol.py and
- * scripts/stress_test.sh. It injects a 256-byte configuration record into the
+ * The host half of this contract lives in scripts/gates/stress/stress_protocol.py and
+ * scripts/gates/stress/stress_test.sh. It injects a 256-byte configuration record into the
  * ext3 image at /test/stress.cfg (visible here as /mnt/test/stress.cfg), boots
  * this guest, and validates the serial marker stream fail-closed. Every field
  * emitted below is cross-checked host-side, so this file must not "round" or
@@ -606,7 +606,9 @@ typedef struct {
 
 /*
  * Results a cgroup-resident worker publishes back to the marker-emitting parent.
- * Held in a MAP_SHARED mapping so the child's writes are visible after it exits.
+ * ST-K2-P1 deliberately uses a pipe here: MAP_SHARED is rejected until the
+ * shared-anonymous Phase 2 contract is implemented, while this report transport
+ * only needs one bounded write followed by one exact read.
  */
 typedef struct {
     uint64_t baseline;
@@ -622,36 +624,91 @@ typedef struct {
     uint64_t recovered_forks;
 } ProfileReport;
 
+static void write_all_fd(int fd, const void *buffer, size_t length, const char *stage) {
+    const uint8_t *bytes = (const uint8_t *)buffer;
+    size_t written = 0;
+    while (written < length) {
+        const ssize_t count = write(fd, bytes + written, length - written);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fail(stage, errno, written);
+        }
+        if (count == 0) {
+            fail(stage, EIO, written);
+        }
+        written += (size_t)count;
+    }
+}
+
+static void read_exact_fd(int fd, void *buffer, size_t length, const char *stage) {
+    uint8_t *bytes = (uint8_t *)buffer;
+    size_t received = 0;
+    while (received < length) {
+        const ssize_t count = read(fd, bytes + received, length - received);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fail(stage, errno, received);
+        }
+        if (count == 0) {
+            fail(stage, EPIPE, received);
+        }
+        received += (size_t)count;
+    }
+}
+
+static void assert_pipe_eof(int fd, const char *stage) {
+    uint8_t excess = 0;
+    for (;;) {
+        const ssize_t count = read(fd, &excess, sizeof(excess));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            fail(stage, errno, 0);
+        }
+        if (count != 0) {
+            fail(stage, EOVERFLOW, (uint64_t)count);
+        }
+        return;
+    }
+}
+
 /*
  * Run `body` inside a forked worker that has joined the run's cgroup, and hand
  * back what it published. A worker that fails emits its own FAIL marker before
  * exiting non-zero, so the parent exits quietly rather than emitting a second.
  */
 static void run_in_cgroup_child(void (*body)(ProfileReport *), ProfileReport *out) {
-    void *mapping = mmap(NULL, sizeof(ProfileReport), PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED) {
-        fail_with_stats("report_mmap", errno, sizeof(ProfileReport));
+    int report_pipe[2] = {-1, -1};
+    if (pipe(report_pipe) != 0) {
+        fail_with_stats("report_pipe", errno, sizeof(ProfileReport));
     }
-    /* ST-K3 Phase D step markers: bisect which kernel interaction after the
-     * (historically first-ever successful) anonymous mmap faults the kernel.
-     * NILIX_MMAP_DIAG lines are invisible to the stress validator. */
-    emit("NILIX_MMAP_DIAG step=mapped");
-    ProfileReport *report = (ProfileReport *)mapping;
-    memset(report, 0, sizeof(*report));
-    emit("NILIX_MMAP_DIAG step=zeroed");
 
     const pid_t child = fork();
     if (child < 0) {
+        (void)close(report_pipe[0]);
+        (void)close(report_pipe[1]);
         fail("cgroup_child_fork", errno, 0);
     }
     if (child == 0) {
+        (void)close(report_pipe[0]);
         emit("NILIX_MMAP_DIAG step=child_alive");
         cgroup_attach_self();
         emit("NILIX_MMAP_DIAG step=child_attached");
-        body(report);
+        ProfileReport report;
+        memset(&report, 0, sizeof(report));
+        body(&report);
+        write_all_fd(report_pipe[1], &report, sizeof(report), "report_pipe_write");
+        if (close(report_pipe[1]) != 0) {
+            fail("report_pipe_close", errno, 0);
+        }
         _exit(0);
     }
+    (void)close(report_pipe[1]);
     emit("NILIX_MMAP_DIAG step=parent_forked");
 
     int status = 0;
@@ -661,12 +718,14 @@ static void run_in_cgroup_child(void (*body)(ProfileReport *), ProfileReport *ou
         }
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        (void)close(report_pipe[0]);
         _exit(1);
     }
 
-    *out = *report;
-    if (munmap(mapping, sizeof(ProfileReport)) != 0) {
-        fail("report_munmap", errno, 0);
+    read_exact_fd(report_pipe[0], out, sizeof(*out), "report_pipe_read");
+    assert_pipe_eof(report_pipe[0], "report_pipe_oversized");
+    if (close(report_pipe[0]) != 0) {
+        fail("report_pipe_close", errno, 0);
     }
 }
 
@@ -733,6 +792,130 @@ static void run_workers(SharedRegion *region, uint32_t count, void (*body)(Share
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             fail("worker_exit", 0, index);
         }
+    }
+}
+
+typedef struct {
+    uint64_t result;
+    uint64_t elapsed_ns;
+} CpuWorkerReport;
+
+static void compute_cpu_worker_report(uint32_t index, CpuWorkerReport *report) {
+    const uint64_t started = monotonic_ns();
+    uint64_t accumulator = config.seed ^ ((uint64_t)index + 1u);
+
+    for (uint64_t iteration = 0; iteration < config.cpu_iterations; ++iteration) {
+        accumulator = checksum_mix(accumulator, iteration);
+    }
+
+    report->result = checksum_finalize(accumulator);
+    report->elapsed_ns = monotonic_ns() - started;
+}
+
+/*
+ * ST-K2-P1: CPU workers publish their bounded result through one pipe per
+ * child.  This keeps the CPU profile usable while MAP_SHARED remains an
+ * explicit Phase-2 boundary for the contended SMP/combined profiles.
+ */
+static void run_cpu_workers_via_pipes(uint32_t count, uint64_t *results, uint64_t *elapsed_ns) {
+    int report_pipes[MAX_WORKERS][2];
+    pid_t children[MAX_WORKERS];
+    uint32_t started = 0;
+    for (uint32_t index = 0; index < MAX_WORKERS; ++index) {
+        report_pipes[index][0] = -1;
+        report_pipes[index][1] = -1;
+    }
+
+    for (uint32_t index = 0; index < count; ++index) {
+        if (pipe(report_pipes[index]) != 0) {
+            const int saved = errno;
+            for (uint32_t close_index = 0; close_index <= index; ++close_index) {
+                if (report_pipes[close_index][0] >= 0) {
+                    (void)close(report_pipes[close_index][0]);
+                }
+                if (report_pipes[close_index][1] >= 0) {
+                    (void)close(report_pipes[close_index][1]);
+                }
+            }
+            for (uint32_t reap = 0; reap < started; ++reap) {
+                int ignored;
+                (void)waitpid(children[reap], &ignored, 0);
+            }
+            fail("cpu_report_pipe", saved, index);
+        }
+
+        const pid_t child = fork();
+        if (child < 0) {
+            const int saved = errno;
+            for (uint32_t close_index = 0; close_index <= index; ++close_index) {
+                if (report_pipes[close_index][0] >= 0) {
+                    (void)close(report_pipes[close_index][0]);
+                }
+                if (report_pipes[close_index][1] >= 0) {
+                    (void)close(report_pipes[close_index][1]);
+                }
+            }
+            for (uint32_t reap = 0; reap < started; ++reap) {
+                int ignored;
+                (void)waitpid(children[reap], &ignored, 0);
+            }
+            fail("cpu_worker_fork", saved, index);
+        }
+        if (child == 0) {
+            (void)close(report_pipes[index][0]);
+            for (uint32_t close_index = 0; close_index < index; ++close_index) {
+                if (report_pipes[close_index][0] >= 0) {
+                    (void)close(report_pipes[close_index][0]);
+                }
+                if (report_pipes[close_index][1] >= 0) {
+                    (void)close(report_pipes[close_index][1]);
+                }
+            }
+
+            CpuWorkerReport report = {0, 0};
+            compute_cpu_worker_report(index, &report);
+            write_all_fd(report_pipes[index][1], &report, sizeof(report), "cpu_report_write");
+            if (close(report_pipes[index][1]) != 0) {
+                fail("cpu_report_close", errno, index);
+            }
+            _exit(0);
+        }
+        children[started++] = child;
+        (void)close(report_pipes[index][1]);
+        report_pipes[index][1] = -1;
+    }
+
+    for (uint32_t index = 0; index < started; ++index) {
+        int status = 0;
+        while (waitpid(children[index], &status, 0) < 0) {
+            if (errno != EINTR) {
+                for (uint32_t close_index = 0; close_index < started; ++close_index) {
+                    if (report_pipes[close_index][0] >= 0) {
+                        (void)close(report_pipes[close_index][0]);
+                    }
+                }
+                fail("cpu_worker_wait", errno, index);
+            }
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            for (uint32_t close_index = 0; close_index < started; ++close_index) {
+                if (report_pipes[close_index][0] >= 0) {
+                    (void)close(report_pipes[close_index][0]);
+                }
+            }
+            _exit(1);
+        }
+    }
+
+    for (uint32_t index = 0; index < started; ++index) {
+        CpuWorkerReport report = {0, 0};
+        read_exact_fd(report_pipes[index][0], &report, sizeof(report), "cpu_report_read");
+        assert_pipe_eof(report_pipes[index][0], "cpu_report_oversized");
+        if (close(report_pipes[index][0]) != 0) {
+            fail("cpu_report_close", errno, index);
+        }
+        results[index] = report.result;
+        elapsed_ns[index] = report.elapsed_ns;
     }
 }
 
@@ -837,15 +1020,10 @@ static void emit_memory_marker(uint64_t seq, uint64_t baseline, uint64_t limit, 
 /* ------------------------------------------------------------------ */
 
 static void cpu_worker_body(SharedRegion *region, uint32_t index) {
-    const uint64_t started = monotonic_ns();
-    uint64_t accumulator = config.seed ^ ((uint64_t)index + 1u);
-
-    for (uint64_t iteration = 0; iteration < config.cpu_iterations; ++iteration) {
-        accumulator = checksum_mix(accumulator, iteration);
-    }
-
-    region->results[index] = checksum_finalize(accumulator);
-    region->elapsed_ns[index] = monotonic_ns() - started;
+    CpuWorkerReport report = {0, 0};
+    compute_cpu_worker_report(index, &report);
+    region->results[index] = report.result;
+    region->elapsed_ns[index] = report.elapsed_ns;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1112,18 +1290,20 @@ static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
         break;
     }
     case PROFILE_CPU: {
-        SharedRegion *region = shared_region_create();
+        uint64_t results[MAX_WORKERS];
+        uint64_t elapsed_ns[MAX_WORKERS];
+        memset(results, 0, sizeof(results));
+        memset(elapsed_ns, 0, sizeof(elapsed_ns));
         const uint64_t started = monotonic_ns();
-        run_workers(region, config.workers, cpu_worker_body);
+        run_cpu_workers_via_pipes(config.workers, results, elapsed_ns);
         const uint64_t wall_ns = monotonic_ns() - started;
 
         uint64_t cpu_ns = 0;
         uint64_t accumulator = checksum_mix(config.seed, seq);
         for (uint32_t index = 0; index < config.workers; ++index) {
-            cpu_ns += region->elapsed_ns[index];
-            accumulator = checksum_mix(accumulator, region->results[index]);
+            cpu_ns += elapsed_ns[index];
+            accumulator = checksum_mix(accumulator, results[index]);
         }
-        shared_region_destroy(region);
 
         *cumulative_ops += (uint64_t)config.workers * config.cpu_iterations;
         checksum = checksum_finalize(accumulator);

@@ -78,11 +78,12 @@ See [README §4](README.md#4-build-and-run) for the complete list.
 | `make lint`      | grep-based source gates (println, SMAP, fetch_add, repr(C) copies) |
 | `make boot-check`| boots the kernel under QEMU; asserts zero NX-violation page faults |
 | `make test`      | fail-closed in-kernel runtime test summary, panic, and NX gate |
-| `make test-hosted-subcrates` | count-pinned hosted tests and compile checks |
+| `make test-hosted-subcrates` | count-pinned hosted tests and compile checks (set `HOSTED_TEST_PROFILE=release` for optimized tests) |
 | `make musl-check`| static-musl libc conformance gate |
 
-CI (`.github/workflows/ci.yml`) runs these directly — there is no hidden remote
-machinery. If they pass locally, CI should be green.
+The [CI map](docs/ci-testing.md) lists the required groups, local commands,
+scheduled coverage and report formats. `CI result` aggregates the required jobs;
+qualified runtime results retain their deferred checks and are not strict passes.
 
 ---
 

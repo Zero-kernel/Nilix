@@ -9,6 +9,7 @@ path = "lib.rs"
 [features]
 iommu_device_probe = []
 namespace_probe = ["kernel_core/namespace_probe"]
+syscall_test = ["kernel_core/syscall_test"]
 
 [dependencies]
 kernel_core = { path = "../kernel_core" }

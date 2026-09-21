@@ -269,8 +269,8 @@ impl VirtQueue {
     ///
     /// Returns `None` if no used entries are available.
     ///
-    /// # R44-5 FIX: Validates used.idx jump to prevent reading stale ring slots
-    /// If device jumps used.idx beyond queue size, we resync to prevent permanent stall.
+    /// # R44-5 FIX: Validates used.idx jumps to prevent reading stale ring slots.
+    /// A malformed jump poisons the queue; the owner must reset before reuse.
     pub fn pop_used(&self) -> Option<VringUsedElem> {
         unsafe {
             let used = &*self.used;
@@ -294,13 +294,16 @@ impl VirtQueue {
             //
             // Detection logic:
             // - `available > self.size` indicates an abnormal jump
-            // - If `used_idx < last` (backward move without wrap), drop silently
-            //   and keep last_used_idx unchanged to prevent replay
-            // - If forward jump (wrapped or too far ahead), resync to prevent stall
+            // - If `used_idx < last` (backward move without wrap), poison the
+            //   queue and keep `last_used_idx` unchanged for reset recovery
+            // - If forward jump (wrapped or too far ahead), poison the queue
             if available > self.size {
                 if used_idx < last {
-                    // Backward move: drop entry, do NOT update last_used_idx
-                    // This prevents replaying already-processed slots
+                    // RF188-1 FIX: A rewind is just as unreconcilable as an oversized
+                    // forward jump: retaining the cursor would permanently
+                    // stall the queue while leaving any outstanding chains
+                    // allocated.  Quarantine until the owner resets it.
+                    self.fatal.store(true, Ordering::Release);
                     return None;
                 }
                 // Forward jump: quarantine the queue.  Advancing `last` would
@@ -317,17 +320,23 @@ impl VirtQueue {
             let ring_ptr = used.ring.as_ptr();
             let elem = read_volatile(ring_ptr.add(ring_idx));
 
-            self.last_used_idx
-                .store(last.wrapping_add(1), Ordering::Relaxed);
-
             // R148-I7 FIX: Validate descriptor ID returned by the device.
             // A malicious or buggy device could provide an out-of-bounds ID,
             // causing callers' desc_mut(elem.id) to access memory beyond the
-            // descriptor table. Advance past the invalid entry (no stall)
-            // but don't expose it to the caller.
+            // descriptor table. Poison the queue and leave the cursor
+            // unchanged so the owner can reclaim all outstanding chains.
             if elem.id >= self.size as u32 {
+                // A used entry with an impossible descriptor id cannot be
+                // reconciled with driver-owned inflight metadata. Quarantine the
+                // queue and leave `last_used_idx` unchanged so callers cannot
+                // silently orphan the outstanding chains. The owning driver must
+                // reset and rebuild the queue before reuse.
+                self.fatal.store(true, Ordering::Release);
                 return None;
             }
+
+            self.last_used_idx
+                .store(last.wrapping_add(1), Ordering::Relaxed);
 
             Some(elem)
         }

@@ -245,7 +245,7 @@ Six scenarios, all pass:
 
 Line-ending convention preserved: `kernel/` `.rs` committed **CRLF** (HEAD is
 CRLF; added with `core.autocrlf=false`); `userspace/nilix-syz-fuzzer/` `.rs`
-committed **LF** (that subtree's convention). `scripts/kernel_test.sh` was
+committed **LF** (that subtree's convention). `scripts/gates/boot/kernel_test.sh` was
 temporarily patched to preserve the serial log during debugging and
 reverted to HEAD before commit.
 

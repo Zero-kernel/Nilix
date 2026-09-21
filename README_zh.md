@@ -1,173 +1,161 @@
 # Nilix
 
-[英文 (switch to English)](README.md)
+[English](README.md) · [组件能力与路线图](docs/roadmap.md) · [中文路线图](docs/roadmap_zh.md) ·
+[下一阶段计划](docs/next-phase-plan.md) · [CI 与测试](docs/ci-testing.md)
 
-一个以安全为先的混合微内核操作系统，使用 Rust 编写，面向 x86_64 架构。
+Nilix 是面向 x86_64、主要以 Rust 编写的实验性操作系统内核，提供 Linux 系统调用的
+一个兼容子集，以及 capability/LSM 安全框架。目前能够通过 UEFI 启动，运行 Ring 3
+静态程序和真正的 musl 测试程序，并包含 SMP 调度、文件系统、块设备和 IPv4 网络栈。
 
-> **Nilix** 是一个递归缩写 —— **N**ilix **I**s **L**inux **I**ndependent e**X**istence
-> （“Nilix 是独立于 Linux 的存在”）—— 沿袭 GNU、Linux 的自指命名传统。这个名字也概括了它的定位：
-> 与 Linux **兼容**（字节精确的系统调用 ABI 可原样运行真实的 musl libc 程序），却又**独立**于 Linux
-> （自有的、从零用 Rust 编写的内核，而非分叉）。
+**Nilix** 是 **N**ilix **I**s **L**inux **I**ndependent e**X**istence 的递归缩写。
+项目从零实现，没有派生自 Linux；Linux 兼容性是逐步实现的目标，目前不能据此宣称
+任意 Linux 应用、线程库或容器镜像都能运行。
 
-**设计原则：** 安全性 > 正确性 > 效率 > 性能
-
----
-
-## 什么是 Nilix
-
-Nilix 是一个企业级混合内核，灵感来自 Linux 的模块化设计，并经过 **187 轮持续 R 系列安全审计**，
-以及一次于 2026-08-07 开展、并于 2026-08-27 完成修复的独立全代码库审计加固。它将能力与 LSM
-门控的内核热路径结合起来，并计划逐步演进为去特权化的 Linux 兼容用户态人格。
-
-## 要点
-
-- **内存安全** —— 完全使用 Rust（`no_std`）编写，配合硬件保护（NX、W^X、SMEP/SMAP/UMIP）以及
-  KASLR/KPTI。
-- **进程隔离** —— 每进程独立地址空间、写时复制（COW）fork、用户栈守护页。
-- **SMP** —— 多核启动（最多 64 核）、每 CPU 的 MLFQ 调度、工作窃取负载均衡、IPI 驱动的 TLB
-  shootdown、RCU 与 lockdep。
-- **安全框架** —— 对象能力、LSM 钩子层（40+ 钩子点）、seccomp/pledge 系统调用过滤，以及
-  SHA-256/HMAC 哈希链的防篡改审计日志。
-- **容器** —— 五种命名空间（PID/mount/IPC/net/user）与 cgroups v2（CPU、内存、PID、I/O、FD、
-  端口控制器），以及受每命名空间字节预算约束的每命名空间网络数据平面（隔离的 ARP 缓存、地址与路由）。
-- **网络** —— 完整的软件 TCP/IP 协议栈（TCP 含 NewReno、窗口缩放、SYN cookies、连接跟踪，以及
-  默认 DROP 的有状态防火墙），由有界的进程上下文 RX 入站循环驱动，从 `eth0` 接收真实帧。
-- **Linux ABI** —— 字节精确的 x86-64 系统调用面；一个真正的 **静态链接 musl libc 程序可端到端
-  运行** 于用户态 ABI 之上（Phase U / 里程碑 M0）。
-
-## 架构一览
-
-Nilix 围绕一条清晰的主执行链路组织：
-
-`Ring 3 → 架构入口 → 策略门 → kernel_core → 内核服务层 → 硬件`
-
-<p align="center">
-  <img src="docs/assets/architecture-at-a-glance.svg" alt="Nilix 内核架构图" width="960">
-</p>
-
-实线表示主要调用/数据流，虚线表示横向安全与可观测性依赖。图采用均衡网格布局，方便同时查看
-所有权边界、`kernel_core` 枢纽，以及跨层传递工作的主要函数。
-
-### 主路径
-
-| 路径 | 主要函数 | 做什么 |
-|------|----------|--------|
-| 启动与交接 | [`bootloader::efi_main`](bootloader/src/main.rs#L607) → [`kernel::_start`](kernel/src/main.rs#L321) | 加载 PIE 内核、建立分页与 KASLR、发布 `BootInfo*`，再按依赖顺序初始化内核。 |
-| 系统调用 ABI | [`arch::syscall_entry_stub`](kernel/arch/syscall.rs#L1036) → [`kernel_core::syscall_dispatcher`](kernel/kernel_core/syscall.rs#L3682) → `sys_*` | 从 `SYSCALL` 进入，依次执行 seccomp/LSM/能力门控，分派 Linux 兼容编号，再经 `SYSRET` 返回。 |
-| 进程与内存 | [`fork::sys_fork`](kernel/kernel_core/fork.rs#L155)、[`fork::handle_cow_page_fault`](kernel/kernel_core/fork.rs#L1186)、[`mm::memory::init_with_bootinfo`](kernel/mm/memory.rs#L421) | 建立隔离地址空间、共享 COW 页、计费资源，并在不发布半成品状态的前提下处理缺页。 |
-| 中断与调度 | [`sched::enhanced_scheduler::on_clock_tick`](kernel/sched/enhanced_scheduler.rs#L2107) → [`reschedule_now`](kernel/sched/enhanced_scheduler.rs#L2565) → [`arch::context_switch::switch_context`](kernel/arch/context_switch.rs#L235) | 定时器/IPI 事件更新每 CPU MLFQ，选择可运行任务，并在亲和性与安全钩子约束下切换上下文。 |
-| 网络接收 | [`net::process_frame`](kernel/net/src/stack.rs#L452) → [`rx_ingress_poll`](kernel/net/src/stack.rs#L3583) | 在进程上下文中有界轮询设备，解析 Ethernet/IP/TCP/UDP，应用 conntrack/防火墙策略并唤醒 socket。 |
-| 存储与挂载 | [`vfs::vfs_init`](kernel/vfs/lib.rs#L118) → [`block::probe_devices`](kernel/block/src/lib.rs#L1238) → [`iommu::init`](kernel/iommu/lib.rs#L401) | 启动文件系统根和块设备，经 BIO/virtio 路径发现并挂载存储。 |
-
-<details>
-<summary>按子系统查看主要入口函数</summary>
-
-| 区域 | 主要符号 | 职责 |
-|------|----------|------|
-| 入口 | `bootloader::efi_main`、`kernel::_start`、`arch::syscall_entry_stub` | UEFI 交接、内核启动、寄存器安全的 Ring-3 进出。 |
-| 核心 | `kernel_core::syscall_dispatcher`、`sys_fork`、`sys_clone`、`sys_execve`、`sys_exit` | 分派、进程生命周期、ELF 替换、信号、命名空间和 cgroups。 |
-| 内存 | `mm::memory::init_with_bootinfo`、`PageTableManager::{map_range, unmap_range}`、`handle_cow_page_fault` | 带准入计费的堆/伙伴分配、页表发布、COW 与回收。 |
-| 调度 | `enhanced_scheduler::{init, select_next, on_clock_tick, reschedule_now}` | 每 CPU MLFQ、抢占、工作窃取、亲和性/cpuset 和上下文切换。 |
-| VFS 与块设备 | `vfs::vfs_init`、`FileDescriptor::{read, write}`、`block::{init, probe_devices}` | 文件系统操作、页缓存 I/O、BIO 队列和 virtio-blk 发现。 |
-| 网络 | `net::{process_frame, rx_ingress_poll}`、`tcp::{handle_ack, handle_retransmission_timeout}` | 有界接收、协议状态机、重传、conntrack 和防火墙决策。 |
-| IPC | `ipc::{init, pipe_create_callback, futex_callback}` | 携带能力的管道、带 PI 的 futex 等待/唤醒和可被信号打断的阻塞。 |
-| 安全 | `security::init`、`lsm::{hook_syscall_enter, hook_syscall_exit}`、`seccomp::evaluate_current`、`audit::{emit, export}` | 执行 W^X/KPTI 与策略门控，并将安全决策写入哈希链。 |
-| 平台 | `arch::{interrupts::init, apic::init, smp::start_aps}`、`iommu::init`、`trace::init` | 中断、SMP/IPI、DMA 隔离、看门狗、追踪和 KCOV 接入。 |
-
-</details>
-
-| 子系统 | 状态 | 要点 |
-|-----------|--------|-----------|
-| 启动与内存 | ✅ 完成 | UEFI 静态 PIE 启动、高半区映射、预留感知伙伴分配器、页缓存、COW fork、守护页、OOM killer |
-| 进程与线程 | ✅ 完成 | 每进程地址空间、fork/exec/clone、线程 + TLS、wait/僵尸回收、挂起任务看门狗 |
-| 调度器 | ✅ 完成 | 每 CPU MLFQ、抢占式、工作窃取 + 周期性负载均衡、CPU 亲和性 / cpuset |
-| IPC | ✅ 完成 | 管道、基于能力的消息队列、futex（含优先级继承）、POSIX 信号 |
-| 安全加固 | ✅ 完成 | W^X/NX、SMEP/SMAP/UMIP、KASLR、KPTI、Spectre/Meltdown 缓解、ChaCha20 CSPRNG（加密安全伪随机数）、kptr 守护 |
-| 安全框架 | ✅ 完成 | 能力、LSM（40+ 钩子）、seccomp/pledge、SHA-256/HMAC 哈希链审计、合规配置 |
-| VFS 与存储 | ✅ 完成 | ramfs、ext2、procfs、devfs、initramfs（CPIO）、cgroupfs、DAC + openat2 RESOLVE 标志、virtio-blk |
-| 网络 | ✅ 完成 | virtio-net、ARP、IPv4（含重组）、ICMP、UDP、TCP、conntrack、有状态防火墙、有界 RX 入站循环与 `eth0` 实时接收 |
-| SMP 与并发 | ✅ 完成 | LAPIC/IOAPIC、AP 启动（≤64 核）、IPI TLB shootdown、PCID/INVPCID、RCU、lockdep |
-| 容器 | ✅ 完成 | PID/mount/IPC/net/user 命名空间、cgroups v2（6 个控制器）、每命名空间网络数据平面（ARP/地址/路由，受每 NS 字节预算约束） |
-| IOMMU / VT-d | 🟡 基础设施 | 完整 Intel VT-d 驱动（DMA 隔离、中断重映射、故障处理）；DMAR 发现接线待完成 |
-| 实时补丁 | 🟡 基础设施 | ECDSA P-256 签名的 kpatch、INT3 跳转、失败即关闭的 LSM 门控 |
-| 用户模式与 ABI（Phase U / M0） | 🟡 进行中 | Ring 3、100+ Linux 系统调用、SysV auxv、信号投递、静态 musl libc 端到端运行 |
-| 模糊测试与测试 | ✅ 完成 | Syzkaller 风格覆盖引导模糊测试已运行 + cargo-fuzz QEMU 集成（13 个目标）、KCOV 每任务覆盖、确定性 guest 端到端测试、扩展稳定性/SMP/安全测试套件 |
-| CI 与质量门禁 | ✅ 完成 | GitHub Actions（fmt/clippy、build、lint、boot+musl+fuzz）、自定义 lint 门禁、本地优先且可 SSH 卸载的 pre-push 钩子 |
-
-crate 布局、经验证的分层与依赖 DAG、启动流程、系统调用路径，以及完整的组件叙述详见
-**[docs/architecture.md](docs/architecture.md)**。
+**设计原则：Safety > Correctness > Efficiency > Performance（安全 > 正确性 > 效率 > 性能）。**
 
 ## 当前状态
 
-**里程碑：** 接近 **1.0-Preview** —— Phase A–G 已完成；**Phase U**（用户态 ABI）进行中。当前
-1.0-Preview 发布门禁被一个 HIGH 发现（`R186-4`，VMA/MM 聚合准入）阻塞；零 HIGH 连续记录为
-**0/3**。R187（KCOV 修复，2026-08-08）已干净收尾 —— 7 项发现全部修复、8/8 review-fix 缺陷已修复
-—— 但未推进连续记录（结转债务而非 R187 发现）。2026-08-07 的一次独立全代码库审计（R188）已于
-2026-08-27 完成修复 —— 3 项 HIGH 与 24 项 MEDIUM 发现全部修复，残留
-`U37-1`/`U55-6`/`U29-3` 明确保持开放 —— 但作为独立审计它不属于 R 系列轮次，不推进连续记录。
-完整细节：**[安全审计状态](docs/security-audit-status.md)** 与 **[CHANGELOG](CHANGELOG.md)**。
+**更新日期：2026-09-12**；代码基线 e127c34，CI 总时间预算和运行时解析修复等待下一轮完整验证。
+**1.0-Preview 仍被阻塞。** 大多数服务目前位于 Ring 0，去特权化的 Linux 用户态人格
+服务属于后续架构工作。
+
+九月 KSA 审计的 20 项发现已在各自验收范围内完成修复和独立评审，包括真实 QEMU
+fuzz、描述符/路径/凭据、TLS 迁移、BIO 生命周期和缓解状态真实性。这不等于完成了
+整个内核，也没有自动关闭较早的 R186-4 准入问题。
+
+发布仍需完成 R186-4 准入闭环、R188 原始修复的评审证据核对、严格的平台/安全门禁及
+**全部六种 stress-v2 压力场景**。历史零 HIGH 完整审计连续记录维持 **0/3**。
+物理 VT-d、完整 KPTI 隔离、编译器 retpoline 和生产 livepatch 尚未具备对应支持或
+验收。详情见 [安全状态](docs/security-audit-status.md) 与
+[发布条件](docs/roadmap.md#8-10-preview-release-gate)。
+
+## 当前组件能做什么，还缺什么
+
+下面区分实际可用子集、已接入代码和未完成能力。模块存在、API 可调用或局部测试通过，
+都不能单独作为整个子系统“完成”的依据。
+
+| 组件 | 当前能力 | 缺失能力与边界 |
+| --- | --- | --- |
+| UEFI 与启动 | PIE 内核加载/重定位、内存图交接、KASLR 放置、基础控制台 | x86_64 平台范围；更多固件/物理平台及早期 W+X 转换验证 |
+| 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | 本切片的远程 MM/core/hosted/build/lint 验证已完成，`mremap` 已远程验证且 Ring-3 oracle 门禁（`make test-ring3-mm`）通过，但独立评审仍待完成；MAP_SHARED/MAP_FIXED 语义、文件映射、共享匿名 `mremap`；无已验收 slab/NUMA/swap/THP |
+| 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试 | waitid、PID1/reaper 及更广的失败/压力路径 |
+| 线程与 TLS | 受限 CLONE_VM/TLS 创建，SMP 迁移时 FS/user-GS 恢复已有 guest 证据 | 通用 CLONE_THREAD/FILES/FS/SIGHAND 组合拒绝；不能宣称 pthread 兼容 |
+| 调度与 SMP | 每 CPU MLFQ、抢占、工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序 | 更高核数/长时间/物理并发验证；64 核是实现上限，不是已验证拓扑 |
+| IPC 与信号 | capability 管道、futex 原语/robust 清理、屏蔽/处理/返回、阻塞信号测试、poll/select | 完整原生同步 IPC/共享内存、Linux futex 语义、sigaltstack/RT 队列/重启语义 |
+| 文件描述符 | fd 0/1/2 已表驱动，dup/close/fork/exec/CLOEXEC、共享状态、O_NONBLOCK 消费者、NOFILE 限制 | 更完整 fcntl/rlimit/线程共享语义 |
+| VFS 与路径 | ramfs/ext2/JBD2 子集、procfs/devfs/CPIO/cgroupfs；cwd/root/pivot、symlink/jail、DAC/UID/GID、挂载表回收 | 通用 dirfd、chown/statx/硬链接、真实终端状态、完整 POSIX/文件系统兼容 |
+| 存储与块 I/O | BIO/完成回调所有权、virtio-blk、512B/4096B 几何与 guest I/O 验证 | fsync/fdatasync/sync/sync_file_range 未接线；掉电/恢复/缓存语义待验证 |
+| 网络 | virtio-net、Ethernet/ARP/IPv4/ICMP/UDP/TCP、conntrack/默认 DROP 防火墙、namespace 状态及进程上下文 RX | veth/子 namespace RX/路由管理/防火墙管理/完整 loopback、IPv6、线上互通；设备迁移仍禁用 |
+| namespace 与 cgroup | PID/mount/IPC/net/user 对象；部分 CPU/内存/PID/I/O/FD/端口控制器与资源事务测试 | 完整 cgroups-v2/委派/OCI、init 成员归属、namespace/clone 组合和容器网络 |
+| capability / LSM / seccomp | 带 generation 的权限、凭据绑定发布、策略钩子、过滤与 pledge 子集 | 完整原生 capability syscall、每 namespace 管理权限与 TSYNC |
+| 内存与 CPU 加固 | NX/W^X/保护页/SMEP/SMAP/UMIP、KASLR、RNG/CSPRNG/kptr、精确 usercopy 恢复 | full KPTI=false；双根仍保留内核映射；retpoline 不支持，硬件缓解依赖 CPU |
+| VT-d | DMAR 已接入启动；Q35 初始化失败、EDU 真实 translated DMA/MSI/失效/隔离/复用测试 | 物理验收、MSI-X、多 unit/bridge/RMRR/ACCESS_PLATFORM/现代模式 |
+| Livepatch | 不支持的返回路径已测试，保留实验性解析/签名/生命周期代码 | 修改 API/syscall 返回 ENOSYS；缺少生产 hooks/密钥/SMP 回滚验收 |
+| 审计与可观测性 | hash/HMAC 审计、授权 trace/计数器、分级日志、watchdog/profiler/串口 kdump | 持久/远程后端、密钥运维与真实性能基线；没有 FIPS 认证 |
+| 用户态与 Linux ABI | 原生 libc 辅助/开发 shell、静态 ET_EXEC/musl/SysV auxv、部分布局 oracle | ET_DYN/动态加载器/vDSO、glibc/pthread、通用应用/OCI、用户态人格服务 |
+| 测试与 fuzz | hosted debug/release、Python JUnit/覆盖报告、真实 KCOV/双 seed QEMU、定时 fuzz/extended | deferred guest 场景、六种压力场景和真实性能/热稳定性验收 |
+
+[完整 roadmap](docs/roadmap.md#4-kernel-composition) 恢复了 **25 个内核库 crate**
+的职责和证据入口，以及信任边界、Linux 差距、历史阶段和欠账归属。
+[VT-d 支持矩阵](docs/vtd-support-matrix.md) 与
+[livepatch 状态](docs/livepatch-support.md) 单独说明设备/功能范围。
+
+## 架构与主要执行路径
+
+Ring 3 → 架构入口/usercopy → 策略门 → kernel_core → 内核服务 → 硬件。
+Cargo 模块划分用于组织职责，不代表服务已运行在独立权限域中。
+
+<p align="center">
+  <img src="docs/assets/architecture-at-a-glance.svg" alt="Nilix 内核组件与执行路径" width="960">
+</p>
+
+| 路径 | 源码入口 | 职责 |
+| --- | --- | --- |
+| 启动 | [UEFI](bootloader/src/main.rs)、[kernel _start](kernel/src/main.rs) | 加载/重定位、BootInfo、服务初始化 |
+| 系统调用 | [入口汇编](kernel/arch/syscall.rs)、[dispatcher](kernel/kernel_core/syscall.rs) | 寄存器帧/usercopy、策略、兼容和私有调用 |
+| 进程/内存 | [fork/COW](kernel/kernel_core/fork.rs)、[process](kernel/kernel_core/process.rs)、[paging](kernel/mm/page_table.rs) | 所有权、发布、独立地址空间和回收 |
+| 调度 | [MLFQ](kernel/sched/enhanced_scheduler.rs)、[context switch](kernel/arch/context_switch.rs) | 队列/亲和性、TLS/FPU/入口状态切换 |
+| 存储/VFS | [manager](kernel/vfs/manager.rs)、[Ext2](kernel/vfs/ext2.rs)、[block](kernel/block/src/lib.rs) | 路径授权、文件系统事务、拥有缓冲区的 I/O |
+| 网络 | [stack](kernel/net/src/stack.rs)、[socket](kernel/net/src/socket.rs) | 协议/RX、策略、队列和唤醒 |
+| 安全/设备 | [security](kernel/security/lib.rs)、[LSM](kernel/lsm/lib.rs)、[VT-d](kernel/iommu/lib.rs) | 执行并报告已支持的防护与设备权限 |
+
+分层和流程详见 [architecture.md](docs/architecture.md)，当前功能验收以 roadmap 为准。
+
+## 测试与 CI
+
+当前 hosted allowlist 在 debug/release 下分别执行 **438 次计数受检的单元测试**，
+另有 CpuLocal doctest 和三组测试代码编译检查。源码扫描发现 **74 个 RuntimeTest
+实现**，不代表 74 个 guest 测试都通过，更不代表内核指令覆盖率 100%。
+
+CI 按 source/hosted/build/boot-SMP/musl/IOMMU/mitigation/KCOV-fuzz 分组。
+JUnit、Markdown、原始日志及源码/镜像身份共同保留实际结果。Python 覆盖率衡量的是
+宿主测试脚本；qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失败或
+不完整的 QEMU 首次尝试重试一次，并在报告中保留两次结果。
+
+六种 stress 场景通过每周/手动工作流运行，但内核和 workload 缺口仍阻塞完整验收。
+11 个定时 fuzz campaign 补充确定性 smoke，不能替代功能契约或无漏洞证明。
+[CI 说明](docs/ci-testing.md) · [门禁细节](docs/quality-gates.md) ·
+[脚本目录](scripts/README.md)。
 
 ## 快速开始
 
-### 前置条件
+完整构建/QEMU 测试使用 Linux：
 
-- Rust **nightly**，带 `rust-src` 与 `llvm-tools-preview`（在 `rust-toolchain.toml` 中固定；目标
-  `x86_64-unknown-none` 与 `x86_64-unknown-none-uefi`）
-- 带 OVMF 固件的 QEMU（`qemu-system-x86_64`），用于 UEFI 启动
-- GNU Make
-- `musl-tools`（`musl-gcc`）—— 仅用于 musl 一致性门禁
+- 固定 Rust **nightly-2025-12-08**，rust-src、llvm-tools-preview：
+  [rust-toolchain.toml](rust-toolchain.toml)。
+- 目标：x86_64-unknown-none、**x86_64-unknown-uefi**。
+- GNU Make、QEMU system x86_64、OVMF、C 编译器、e2fsprogs。
+- musl-tools/musl-gcc 用于 musl 和 guest workload。
+- Python 测试依赖：[requirements-ci.txt](requirements-ci.txt)。
 
-### 常用命令
-
-```bash
-make build           # 将引导程序 + 内核构建到 EFI 系统分区（esp/）
-make run             # 在 QEMU 中运行（图形 VGA 窗口）
-make run-serial      # 在终端以串口控制台运行
-make run-shell       # 构建 + 运行交互式 shell（串口）
-make run-blk         # 挂载一个 64 MB 的 ext2 virtio-blk 磁盘
-make run-smp         # 多核启动（SMP_CPUS=N，默认 2）
-make debug           # 启动 QEMU 并暂停，等待 GDB 连接到 :1234
-make clean           # 清理构建产物
+```sh
+make build                 # esp/ 中的 UEFI bootloader 与普通内核
+make run-serial            # 串口控制台
+make run-shell             # 开发 shell
+make run-blk               # 临时 ESP 与配置的 virtio 磁盘
+make run-smp SMP_CPUS=4     # 4 个逻辑 CPU
+make build-musl-test        # 独立 musl 镜像
+bash scripts/ci/entrypoint.sh quality
+bash scripts/ci/entrypoint.sh hosted
+bash scripts/ci/entrypoint.sh build
+bash scripts/ci/entrypoint.sh runtime
+bash scripts/ci/entrypoint.sh musl
 ```
 
-QEMU 以暴露 `+smep,+smap,+umip,+rdrand` 的 CPU 模型启动，因此 SMEP/SMAP/UMIP 与硬件 RNG
-默认即被使用。运行 `make help` 查看完整目标列表。CI、启动/一致性门禁、自定义 lint 与模糊测试
-基础设施详见 **[docs/quality-gates.md](docs/quality-gates.md)**。
+boot/runtime/SMP 与 musl 的单次 guest 观察窗口默认 **900 秒**，boot/runtime/SMP
+组会依次运行三个窗口；mitigation、qemu-fuzz 和 extended stress 同样保留 900 秒窗口。
+make 非零退出也可能来自 qualified 结果，应查看报告保留的原始 gate 状态；
+默认 CPU/配置不能满足全部安全和硬件测试的前提。
 
-## 文档
+## 下一阶段
 
-| 目标 | 文档 |
-|------|----------|
-| 概览与导航 | [docs/README.md](docs/README.md) —— 文档索引 |
-| 架构（布局、DAG、启动、系统调用、组件） | [docs/architecture.md](docs/architecture.md) · 深入：[docs/overview/architecture/ARCHITECTURE.md](docs/overview/architecture/ARCHITECTURE.md) |
-| CI、测试与模糊测试门禁 | [docs/quality-gates.md](docs/quality-gates.md) · [docs/fuzzing/](docs/fuzzing/) · [docs/testing/](docs/testing/) |
-| 安全审计状态 | [docs/security-audit-status.md](docs/security-audit-status.md) · [docs/security/](docs/security/) · [docs/review/audits/](docs/review/audits/) |
-| 近期变更 | [CHANGELOG.md](CHANGELOG.md) |
-| 路线图 | [docs/roadmap.md](docs/roadmap.md) · [docs/roadmap-enterprise.md](docs/roadmap-enterprise.md) |
-| 评审流程 | [docs/review/](docs/review/)（审计、review-fix、下一阶段计划） |
+1. 核对未闭合的 R188 评审证据，完成 R186-4 准入机制和验收。
+2. 修正 mmap flags 语义、压力测试报告传输，落地限定范围的持久化调用和 block workload。
+3. 实现共享匿名内存，验收六种压力场景、严格网络/SMP/安全矩阵及完整审计发布条件。
+4. 恢复原生 capability/IPC、静态 ABI 缺项、personality/动态链接、容器网络和可测量的运维/性能工作。
 
-## 贡献指南
+[当前 nextplan](docs/next-phase-plan.md) 写明依赖、设计和验收 oracle。
+已通过 KSA 验收的修复会保留回归证据，不重新当作未实现功能排期。
 
-社区与维护入口：
+## 文档与贡献
 
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** —— 工具链、内核安全不变量、按风险选择的测试、RFC、提交、
-  PR 与评审流程。
-- **[SUPPORT.md](SUPPORT.md)** —— Bug、提案、性能回归、文档问题和使用问题的提交方式。
-- **[SECURITY.md](SECURITY.md)** —— 私密漏洞报告、威胁范围、证据要求与协调披露。
-- **[GOVERNANCE.md](GOVERNANCE.md)** —— 角色、决策、评审合并、Issue 生命周期与发布门禁。
-- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** —— 项目社区空间的行为规范。
+| 目标 | 入口 |
+| --- | --- |
+| 当前能力/缺口/发布条件 | [Roadmap](docs/roadmap.md) |
+| 优先级与交接 | [Nextplan](docs/next-phase-plan.md) |
+| 架构/文档索引 | [Architecture](docs/architecture.md) · [Docs](docs/README.md) |
+| CI/测试/fuzz | [CI](docs/ci-testing.md) · [Quality gates](docs/quality-gates.md) |
+| 审计证据/变更 | [Security status](docs/security-audit-status.md) · [提交历史](https://github.com/Zero-kernel/Nilix/commits/main/) |
 
-简而言之：拥有本地 Rust 工具链的贡献者在本地完成构建、lint 与测试——与 CI 完全一致。运行核心门禁，并按风险补充验证（ABI、SMP/并发、存储、模糊
-测试、性能和硬件改动分别需要对应证据），架构/信任边界/ABI/依赖/跨子系统实现前先提交 RFC，Bug 与
-安全修复应包含回归测试。Git 提交为手动，不会自动提交或自动推送。
+贡献前阅读 [CONTRIBUTING](CONTRIBUTING.md)、[GOVERNANCE](GOVERNANCE.md) 和
+[CODE_OF_CONDUCT](CODE_OF_CONDUCT.md)。安全问题通过 [SECURITY](SECURITY.md)
+私下报告，其他问题见 [SUPPORT](SUPPORT.md)。改动应包含有效回归和对应风险的验证证据。
 
 ## 许可证
 
 许可证条款目前待定。
 
-## 参考资料
+## 参考
 
-- [OSDev Wiki](https://wiki.osdev.org)
-- [用 Rust 写操作系统](https://os.phil-opp.com)
-- [Linux 内核源码](https://kernel.org)
-- [seL4 微内核](https://sel4.systems)
+[OSDev](https://wiki.osdev.org) · [用 Rust 写操作系统](https://os.phil-opp.com) ·
+[Linux](https://kernel.org) · [seL4](https://sel4.systems)

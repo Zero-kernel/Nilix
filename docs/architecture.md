@@ -1,20 +1,25 @@
 # Nilix Architecture
 
+**Capability status (2026-09-12):** this page describes code organization and
+call paths. Use the [roadmap](roadmap.md) for the current supported subset and
+missing features: full KPTI isolation and compiler retpoline are unsupported,
+livepatch is disabled, and physical VT-d remains verification pending.
+
 This is the readable architecture reference behind the top-level
 [README](../README.md). It covers the workspace layout, the verified crate layering and
 dependency DAG, the boot flow, the syscall path, and the core subsystems. For the deep
 reference — lock ordering, critical code paths, and the historical audit-finding record —
-see [`docs/overview/architecture/ARCHITECTURE.md`](overview/architecture/ARCHITECTURE.md);
-for per-subsystem deep dives see
-[`docs/overview/02-architecture/subsystems/`](overview/02-architecture/subsystems/).
+the maintainer's local archive retains `docs/overview/architecture/ARCHITECTURE.md`
+and `docs/overview/02-architecture/subsystems/`. Those historical records are not
+distributed in a normal clone; the current public capability inventory is the roadmap.
 
-> **Design principle:** Security > Correctness > Efficiency > Performance.
+> **Design principle:** Safety > Correctness > Efficiency > Performance.
 
 ---
 
 ## 1. Workspace layout
 
-Nilix is a Cargo workspace. The kernel is an aggregate **binary** crate that pulls in ~25
+Nilix is a Cargo workspace. The kernel is an aggregate **binary** crate built from 25
 focused sub-crates under `kernel/<subsystem>/`, each owning one concern. The bootloader and
 the host fuzz executor are separate build units.
 
@@ -33,16 +38,16 @@ the host fuzz executor are separate build units.
 | `coverage` | `kernel/coverage/` | KCOV code-coverage infra (per-task bitmap, `record_edge!`) |
 | `cap` | `kernel/cap/` | Capability access control (`CapRights`, `CapTable`, `CapId`) |
 | `audit` | `kernel/audit/` | Security audit: hash-chained (HMAC-SHA256) tamper-evident ring |
-| `security` | `kernel/security/` | Hardening: W^X/NX, KASLR, KPTI, CSPRNG (ChaCha20+RDRAND), kptr guard, Spectre |
+| `security` | `kernel/security/` | W^X/NX, KASLR, dual-root transition machinery (not full KPTI isolation), CSPRNG, kptr and hardware-dependent mitigations |
 | `lsm` | `kernel/lsm/` | Linux-Security-Module-style hook layer + policies |
 | `seccomp` | `kernel/seccomp/` | seccomp/pledge syscall filtering (BPF-like VM) |
 | `compliance` | `kernel/compliance/` | Hardening profiles (Secure/Balanced/Performance) + FIPS PolicySurface |
-| `livepatch` | `kernel/livepatch/` | Signed live patching: INT3 detour + ECDSA/P-256 verify |
+| `livepatch` | `kernel/livepatch/` | Unsupported/ENOSYS; retained experimental INT3 and ECDSA/P-256 machinery, not production patching |
 | `block` | `kernel/block/` | Block layer: `BlockDevice` trait, request queue, virtio-blk driver |
 | `net` | `kernel/net/` | TCP/IP stack: buffers, ARP/IP/TCP/UDP, sockets, conntrack, firewall, net-ns |
 | `trace` | `kernel/trace/` | Observability: tracepoints, per-CPU counters, watchdog, kdump |
 | `iommu` | `kernel/iommu/` | IOMMU/VT-d DMA isolation |
-| `kernel_core` | `kernel/kernel_core/` | **The hub**: PCB, syscall dispatch, fork/COW, signals, RCU, time, usercopy, ELF loader, all namespaces, cgroup v2 |
+| `kernel_core` | `kernel/kernel_core/` | **The hub**: PCB, syscall dispatch, fork/COW, signals, RCU, time, usercopy, ELF loader, five namespace types and selected cgroup controllers |
 | `arch` | `kernel/arch/` | x86_64: GDT/IDT/interrupts, APIC, HPET, SMP, context switch, SYSCALL entry |
 | `vfs` | `kernel/vfs/` | VFS core, ramfs, ext2, procfs, devfs, initramfs, cgroupfs, mount namespace |
 | `ipc` | `kernel/ipc/` | Capability IPC: pipes, endpoints, futex(+PI), shm/timer/socket caps |
@@ -60,7 +65,7 @@ layers, foundation → top:
 |---|---|---|
 | **L0** foundation leaves | `drivers`, `cpu_local`, `tlb_ops`, `virtio`, `crypto`, `sync_safe` | Depended on by many, depend on ~0 kernel crates |
 | **L1** | `klog`, `coverage` | Cross-cutting logging + coverage |
-| **L2** | `mm`, `livepatch` | Memory foundation + signed patching |
+| **L2** | `mm`, `livepatch` | Memory foundation + unsupported patching experiments |
 | **L3** security core | `cap`, `audit`, `security`, `iommu` | Capability, audit, hardening, DMA isolation |
 | **L4** | `lsm`, `seccomp` | Policy hooks + syscall filtering |
 | **L5** | `block`, `net`, `compliance` | Device I/O + network + compliance |
@@ -326,11 +331,13 @@ VFS → page cache → IOMMU → net → block → audit → trace.
 
 ### 6.5 Memory-Safety Hardening
 
-W^X enforcement (no page is both writable and executable), NX on data pages,
-SMEP/SMAP/UMIP, KASLR (kernel heap/stack/mmap + text-relocation infrastructure), KPTI dual
-page-table isolation, Spectre/Meltdown mitigations (IBRS/IBPB/STIBP/SSBD, RSB stuffing,
-SWAPGS+LFENCE), a ChaCha20 CSPRNG seeded from RDRAND/RDSEED, and kernel-pointer
-obfuscation (kptr guard).
+W^X enforcement on supported user mappings, NX on data pages, SMEP/SMAP/UMIP,
+KASLR (kernel heap/stack/mmap + text-relocation infrastructure), hardware-dependent
+IBRS/IBPB/STIBP/SSBD, RSB stuffing and SWAPGS+LFENCE, a ChaCha20 CSPRNG seeded
+from RDRAND/RDSEED, and kernel-pointer obfuscation (kptr guard).
+Dual page-table roots and CR3 transitions exist, but still retain kernel mappings:
+`FULL_KPTI_ISOLATION_SUPPORTED` is false. Compiler retpoline is unsupported.
+Early-boot writable/executable aliases remain separate qualification work.
 
 ### 6.6 VFS & Storage
 
@@ -377,14 +384,15 @@ wiring is the remaining boot step).
 
 ### 6.9 Containers
 
-Five namespaces — PID (cascade init-kill), mount (CoW tables), IPC (System V), network
-(per-NS devices/sockets), and user (UID/GID mapping for unprivileged containers) — driven
-by `clone(2)`/`unshare(2)`/`setns(2)`. Cgroups v2 provide CPU (`cpu.weight`/`cpu.max`),
+Five namespace types — PID, mount, IPC, network and user — have object ownership,
+inheritance and selected `clone(2)`/`unshare(2)`/`setns(2)` paths. Supported cgroup
+controllers provide CPU (`cpu.weight`/`cpu.max`),
 memory (`memory.max`/`memory.high` + OOM events), PIDs, I/O (token-bucket `io.max`), FD,
-and port controllers, exposed via syscalls and a `/sys/fs/cgroup` cgroupfs mount, with
-subtree delegation.
+and port controls, exposed via syscalls and a `/sys/fs/cgroup` cgroupfs mount.
+General namespace/clone combinations, root-init membership, delegation and full
+cgroups-v2/OCI compatibility remain incomplete.
 
-The network namespace owns a real **per-namespace dataplane**, not just a device list. Each
+The network namespace owns address, buffer and ARP state. Each
 namespace (root included) holds its own ARP cache, so the same IP may legitimately map to
 different MACs in different namespaces and neither can poison the other; the net crate
 reaches that state only through a `NetNsDeviceHooks` upcall that hands back the cache
@@ -395,32 +403,36 @@ surfaced to user space as `ENETUNREACH`). Children are born unconfigured and mus
 configured explicitly; root delegates to the global config rather than keeping a second
 copy that could drift. All of this config state is charged both to a global `NetnsConfig`
 heap class and to a **16 KiB per-namespace byte budget**, from which root is deliberately
-*not* exempt, so a leak in one namespace's dataplane cannot consume another's.
+*not* exempt. This supplies resource boundaries for the implemented state;
+complete tenant isolation still requires the broader tests in the roadmap.
+Root-device ownership remains the operational baseline: device transfer is
+disabled, and veth, child RX, routes/admin and loopback delivery remain open.
 
 ### 6.10 User Mode & Linux ABI (Phase U / M0)
 
-Ring-3 execution via SYSCALL/SYSRET, **100+ Linux x86-64 syscalls** (113 dispatched), a full
+Ring-3 execution via SYSCALL/SYSRET, a Linux x86-64 syscall subset, a
 SysV AMD64 `auxv` builder on the initial stack, ELF loading with DoS/corruption guards, `#!`
 shebang resolution, path-based `execve` vs. native image-spawn disambiguation, and signal
 delivery. The headline milestone: **a genuine statically-linked musl libc binary runs
 end-to-end** — crt startup consuming the auxv, musl stdio `printf`→`writev`, and a clean
 `exit(0)` — proven by the `musl-check` conformance gate.
 
-> M0 is foundational and intentionally divergent from full Linux: resource limits are
-> advisory (not yet enforced on `brk`/`mmap`), there is no dynamic linking
-> (`ld.so`/vDSO) or user-space ASLR yet, and `readlink`/`symlink`/`chown` and a few other
-> syscalls are deferred. These are tracked under Phase U in the next-phase plan.
+> M0 is foundational: RLIMIT_NOFILE is enforced, while many other rlimits remain
+> advisory. Dynamic linking (`ld.so`/vDSO), general userspace PIE/ASLR and pthread
+> compatibility are not available. Symlink/readlink/cwd paths exist and have
+> accepted repairs; chown/statx/general dirfd and durability calls remain gaps.
+> These are tracked under Phase U and the stress work in the next-phase plan.
 
 ---
 
 ## 7. Deeper reference
 
-- **[`docs/overview/architecture/ARCHITECTURE.md`](overview/architecture/ARCHITECTURE.md)** —
-  the authoritative deep map: the 10-level lock ordering hierarchy, the critical code paths
+- **Local `docs/overview/architecture/ARCHITECTURE.md` archive** —
+  the historical deep map: the 10-level lock ordering hierarchy, the critical code paths
   (fork / exec / schedule / timer IRQ / page fault), IRQ-context constraints, and the
   historical R166–R172 audit-finding record. *(Note: its status block predates R187/R188;
   see the [security audit status](security-audit-status.md) for current numbers.)*
-- **[`docs/overview/02-architecture/subsystems/`](overview/02-architecture/subsystems/)** —
+- **Local `docs/overview/02-architecture/subsystems/` archive** —
   per-subsystem deep dives (bootloader, arch, memory, scheduler, IPC, kernel-core, VFS,
   networking, security, drivers, LSM/capabilities, observability, cpu-local, userspace,
   kernel-entry).

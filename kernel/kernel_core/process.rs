@@ -1325,6 +1325,11 @@ pub struct MmState {
     /// construction and growth, and uncharges on Drop. This closes the VMA metadata admission gap.
     pub mmap_regions: mm::AdmittedMap<usize, crate::syscall::MmapEntry>,
 
+    /// ST-K2-P2: demand-paged shared-anonymous regions keyed by their VMA
+    /// base.  The Arc is cloned into regular fork children and shared directly
+    /// by CLONE_VM siblings through the enclosing MmState Arc.
+    pub shared_regions: mm::AdmittedMap<usize, Arc<crate::fork::SharedAnonRegion>>,
+
     /// Heap start address (page-aligned end of ELF BSS)
     pub brk_start: usize,
 
@@ -1362,7 +1367,8 @@ pub struct MmState {
     /// counted (bounded, teardown-reclaimed, tracked deferred residual: SLICE-4b/4d).
     ///
     /// R171-CG1x0 FIX (M2-1 SLICE-0): scoped INVARIANT I' now governs this field:
-    ///   `pt_charged_bytes == pt_inherited_bytes + pt_charged_frames.len() * 0x1000`
+    ///   `pt_charged_bytes == pt_inherited_bytes
+    ///       + (pt_charged_frames.len() + shared_fault_pt_frames.len()) * 0x1000`
     /// The frame-identity ledger (`pt_charged_frames`) makes `sys_munmap` uncharge
     /// a reclaimed page-table frame IFF this AS charged it (on mmap or mprotect
     /// Path-A) — defeating the cross-origin `memory.max` bypass (a naive
@@ -1386,6 +1392,11 @@ pub struct MmState {
     /// The map now charges its backing Vec capacity to the per-process heap budget at construction
     /// and growth, and uncharges on Drop. This closes the PT metadata admission gap.
     pub pt_charged_frames: mm::AdmittedMap<u64, ()>,
+    /// First-touch PT identities. Capacity is reserved at shared mmap/fork,
+    /// separately from eager allocations, so #PF can record without allocating.
+    /// These frames belong to the AS, not the shared region (other VMAs may
+    /// keep the same table alive). Both ledgers participate in invariant I'.
+    pub shared_fault_pt_frames: mm::AdmittedMap<u64, ()>,
 
     /// R171-CG1x0 FIX (M2-1 SLICE-0): the portion of `pt_charged_bytes` that is
     /// NOT individually tracked in `pt_charged_frames` and therefore reclaims only
@@ -1499,6 +1510,7 @@ impl MmState {
         Self {
             // R186-4 FIX: Initialize with CoreProcess HeapClass for admission control
             mmap_regions: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            shared_regions: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             brk_start: 0,
             brk: 0,
             next_mmap_addr,
@@ -1509,6 +1521,7 @@ impl MmState {
             // basis, authoritative (INVARIANT I' holds: 0 == 0 + 0).
             // R186-4 FIX: Initialize with CoreProcess HeapClass for admission control
             pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            shared_fault_pt_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
             pt_inherited_bytes: 0,
             pt_ledger_authoritative: true,
             brk_pending_growth: 0,
@@ -1530,7 +1543,7 @@ impl MmState {
     /// `map_to` / `map_page` call just built for an EAGER mapping) into this
     /// address space's frame-identity ledger and bump `pt_charged_bytes`,
     /// preserving INVARIANT I'
-    /// (`pt_charged_bytes == pt_inherited_bytes + pt_charged_frames.len() * 0x1000`).
+    /// (inherited bytes plus both frame-identity ledgers).
     ///
     /// The caller pairs this with `cgroup::charge_memory_forced(cgroup_id,
     /// pt_frames.len() * 0x1000)` under the SAME `Process -> MmState` lock hold
@@ -1592,6 +1605,87 @@ impl MmState {
                 self.pt_charged_frames.remove(&f.start_address().as_u64());
             }
             self.pt_inherited_bytes = self.pt_inherited_bytes.saturating_add(pt_bytes);
+        }
+    }
+
+    /// Upper bound for tables potentially needed by a contiguous shared VMA.
+    pub(crate) fn shared_pt_bound(base: usize, length: usize) -> Option<usize> {
+        let last = base.checked_add(length.checked_sub(1)?)?;
+        [21, 30, 39].into_iter().try_fold(0usize, |total, shift| {
+            total.checked_add((last >> shift) - (base >> shift) + 1)
+        })
+    }
+
+    /// Process-context admission, before publishing the new mapping/child AS.
+    /// Existing identities cover tables retained by other VMAs; live regions
+    /// reserve enough additional slots for all remaining first touches.
+    pub(crate) fn reserve_shared_fault_pt(
+        &mut self,
+        new_region: Option<(usize, usize)>,
+    ) -> Result<(), ()> {
+        let mut additional = 0usize;
+        for (&base, region) in self.shared_regions.iter() {
+            let length = region.page_count.checked_mul(0x1000).ok_or(())?;
+            additional = additional
+                .checked_add(Self::shared_pt_bound(base, length).ok_or(())?)
+                .ok_or(())?;
+        }
+        if let Some((base, length)) = new_region {
+            additional = additional
+                .checked_add(Self::shared_pt_bound(base, length).ok_or(())?)
+                .ok_or(())?;
+        }
+        self.shared_fault_pt_frames
+            .try_reserve(additional)
+            .map_err(|_| ())
+    }
+
+    /// #PF commit: no allocation or blocking locks. Conservative reservation
+    /// surplus (only possible on refund failure) remains in inherited bytes.
+    pub(crate) fn record_shared_fault_pt_charge(
+        &mut self,
+        frames: &[Option<PhysFrame<Size4KiB>>; 3],
+        charged_bytes: u64,
+    ) {
+        let mut ledgered = 0u64;
+        for frame in frames.iter().flatten() {
+            if self
+                .shared_fault_pt_frames
+                .insert_unique_reserved(frame.start_address().as_u64(), ())
+                .is_ok()
+            {
+                ledgered += 0x1000;
+            }
+        }
+        self.pt_charged_bytes = self.pt_charged_bytes.saturating_add(charged_bytes);
+        self.pt_inherited_bytes = self
+            .pt_inherited_bytes
+            .saturating_add(charged_bytes.saturating_sub(ledgered));
+        self.pt_ledger_authoritative = true;
+    }
+
+    /// Reconcile identities from either allocation path before physical reuse.
+    pub(crate) fn reclaim_pt_charges(&mut self, frames: impl Iterator<Item = u64>) -> u64 {
+        let mut bytes = 0u64;
+        for frame in frames {
+            if self.pt_charged_frames.remove(&frame).is_some() {
+                bytes += 0x1000;
+            }
+            if self
+                .shared_fault_pt_frames
+                .remove_retaining_capacity(&frame)
+                .is_some()
+            {
+                bytes += 0x1000;
+            }
+        }
+        self.reclaim_empty_shared_fault_pt_capacity();
+        bytes
+    }
+
+    pub(crate) fn reclaim_empty_shared_fault_pt_capacity(&mut self) {
+        if self.shared_regions.is_empty() {
+            self.shared_fault_pt_frames.reclaim_empty_capacity();
         }
     }
 
@@ -10124,6 +10218,7 @@ fn free_process_resources(
     // still reference this mm — non-last exit must NOT uncharge cgroup memory.
     let mm_shared = Arc::strong_count(&proc.mm) > 1;
     let mut mm = proc.mm.lock();
+    let mut shared_regions_to_drop = None;
 
     let region_count = mm.mmap_regions.len();
     // R123-5 FIX: Mask low-bit flags (PENDING/PROT_NONE) before summing,
@@ -10172,10 +10267,17 @@ fn free_process_resources(
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
     if !keep_address_space && !mm_shared && proc.memory_space != 0 {
         let cgroup_id = proc.cgroup_id;
+        // Detach shared-region metadata now, but defer dropping the Arcs until
+        // after page-table teardown below.  The region pin must outlive every
+        // PTE release so a final refcount decision cannot free a mapped frame.
+        shared_regions_to_drop = Some(core::mem::replace(
+            &mut mm.shared_regions,
+            mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+        ));
         for (_base, len_with_flags) in mm.mmap_regions.iter() {
             // R172-22: annotate value type (opaque iter() + Borrow-generic map).
             let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
-            if len_with_flags.is_prot_none() {
+            if len_with_flags.is_prot_none() || len_with_flags.is_shared() {
                 continue;
             }
             let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
@@ -10224,6 +10326,7 @@ fn free_process_resources(
             mm.pt_charged_bytes = 0;
         }
         mm.pt_charged_frames.clear();
+        mm.shared_fault_pt_frames.clear();
         mm.pt_inherited_bytes = 0;
         mm.pt_ledger_authoritative = true;
     } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
@@ -10326,6 +10429,11 @@ fn free_process_resources(
             proc.memory_space = 0;
         }
     }
+
+    // Drop shared regions only after all address-space leaves have been
+    // detached.  This releases each region pin and first-toucher charge in a
+    // process context, outside the Process/MmState critical section.
+    drop(shared_regions_to_drop);
 
     // R114-1 FIX: IPC endpoint cleanup and cpuset task accounting are now performed
     // by `cleanup_zombie()` AFTER releasing PROCESS_TABLE, to avoid deadlocks from
@@ -10705,7 +10813,7 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .iter()
         .filter_map(
             |(_base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
-                if len_with_flags.is_prot_none() {
+                if len_with_flags.is_prot_none() || len_with_flags.is_shared() {
                     return None;
                 }
                 let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
@@ -10810,6 +10918,56 @@ where
 /// `make boot-check` via the serial log. The full mmap/munmap integration (Phase-3
 /// fold + free-after-remove ordering) is exercised by reaching userspace under
 /// `boot-check`; this asserts the provenance arithmetic the syscall path relies on.
+pub fn run_shared_fault_pt_ledger_self_test() {
+    assert_eq!(MmState::shared_pt_bound(0x1000, 0x1000), Some(3));
+    assert_eq!(MmState::shared_pt_bound(0x1ff000, 0x2000), Some(4));
+    assert_eq!(
+        MmState::shared_pt_bound((1 << 30) - 0x1000, 0x2000),
+        Some(5)
+    );
+    assert_eq!(
+        MmState::shared_pt_bound((1 << 39) - 0x1000, 0x2000),
+        Some(6)
+    );
+    assert_eq!(MmState::shared_pt_bound(usize::MAX - 0xfff, 0x2000), None);
+    assert_eq!(MmState::shared_pt_bound(0x1000, 0), None);
+
+    let mut state = MmState::new(0x400000);
+    let region = crate::fork::SharedAnonRegion::try_new(0x400000, 0x2000, 3).unwrap();
+    state.shared_regions.try_insert(0x400000, region).unwrap();
+    state.reserve_shared_fault_pt(None).unwrap();
+    let capacity = state.shared_fault_pt_frames.capacity();
+    let frames = [
+        Some(PhysFrame::containing_address(PhysAddr::new(0x10000))),
+        Some(PhysFrame::containing_address(PhysAddr::new(0x20000))),
+        None,
+    ];
+    // Simulate refund failure: the extra reservation stays charged, but only
+    // known frames can be reclaimed, never an unrelated uncharged frame.
+    state.record_shared_fault_pt_charge(&frames, 3 * 0x1000);
+    assert_eq!(state.pt_inherited_bytes, 0x1000);
+    assert_eq!(state.pt_charged_bytes, 3 * 0x1000);
+    let freed = state.reclaim_pt_charges([0x10000, 0x30000].into_iter());
+    assert_eq!(freed, 0x1000);
+    state.pt_charged_bytes -= freed;
+    assert_eq!(state.shared_fault_pt_frames.capacity(), capacity);
+    assert_eq!(state.reclaim_pt_charges([0x10000].into_iter()), 0);
+    // Region removal alone cannot refund a table serving an adjacent VMA.
+    state.shared_regions.clear();
+    assert_eq!(state.shared_fault_pt_frames.len(), 1);
+    let freed = state.reclaim_pt_charges([0x20000].into_iter());
+    state.pt_charged_bytes -= freed;
+    assert_eq!(freed, 0x1000);
+    assert_eq!(state.pt_charged_bytes, state.pt_inherited_bytes);
+    assert_eq!(state.shared_fault_pt_frames.capacity(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn shared_fault_pt_provenance_and_capacity() {
+    run_shared_fault_pt_ledger_self_test();
+}
+
 pub fn run_pt_ledger_self_test() {
     use crate::fallible_map::FallibleOrderedMap;
     const PT: u64 = 0x1000;
@@ -11173,8 +11331,8 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
             };
             let rss_bytes = mm_state
                 .mmap_regions
-                .values()
-                .fold(0usize, |total, &entry| {
+                .iter()
+                .fold(0usize, |total, (&base, &entry)| {
                     // U05-1 FIX: PROT_NONE VMAs reserve address space but do
                     // not own resident frames. Counting them as RSS lets a
                     // process win OOM victim selection merely by reserving a
@@ -11182,6 +11340,15 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
                     // cgroup charge invariant and skip non-resident entries.
                     if entry.is_prot_none() {
                         total
+                    } else if entry.is_shared() {
+                        // Shared-anonymous regions are demand-paged; charge
+                        // only materialized resident pages to OOM selection.
+                        let resident = mm_state
+                            .shared_regions
+                            .get(&base)
+                            .map(|region| region.resident_pages())
+                            .unwrap_or(0);
+                        total.saturating_add(resident.saturating_mul(4096))
                     } else {
                         total.saturating_add(crate::syscall::mmap_region_len(entry))
                     }

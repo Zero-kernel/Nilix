@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 boot-check musl-check test-smp test-smp-4core test-smp-extended stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm boot-check musl-check test-smp test-smp-4core test-smp-extended stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -27,7 +27,7 @@ MITIGATION_BUILD_JSON := $(MITIGATION_TARGET_DIR)/build-command.json
 MITIGATION_INPUT_MANIFEST ?=
 MITIGATION_REVISION ?=
 MITIGATION_ARTIFACTS ?= .validation/mitigation
-MITIGATION_TIMEOUT ?= 120
+MITIGATION_TIMEOUT ?= 900
 .PHONY: build-mitigation-probe
 STRESS_TARGET_DIR := kernel-target/stress
 STRESS_KERNEL := $(STRESS_TARGET_DIR)/x86_64-unknown-none/release/kernel
@@ -269,7 +269,7 @@ build-stress: build-stress-runner
 run-stress: QEMU_ESP := $(STRESS_ESP)
 run-stress: build-stress ensure-ext3-image
 	@echo "=== Starting configured combined Ring-3 stress profile ==="
-	@STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 bash scripts/stress_test.sh "$(STRESS_ESP)"
+	@STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 bash scripts/gates/stress/stress_test.sh "$(STRESS_ESP)"
 
 # Compatibility alias for the deterministic KCOV guest executor build.
 build-fuzz-runner: build-kcov
@@ -322,15 +322,14 @@ run-syz-fuzz: build-kcov build-syz-executor build-syz-fuzzer
 test-syz: build-kcov build-syz-executor build-syz-fuzzer
 	@echo "=== Running Syzkaller Infrastructure Smoke Test ==="
 	cd userspace/nilix-syz-fuzzer && \
-	timeout 60 ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
+	timeout 900 ./target/x86_64-unknown-linux-gnu/release/nilix-syz-fuzzer \
 		--kernel ../../$(KCOV_ESP)/kernel.elf \
 		--corpus-dir ./test-corpus \
 		--crash-dir ./test-crashes \
-		--timeout 60 \
+		--timeout 900 \
 		--workers 1 \
-		--program-timeout 10 \
-		--ovmf $(OVMF_PATH) \
-		|| true
+		--program-timeout 30 \
+		--ovmf $(OVMF_PATH)
 	@echo "=== Smoke Test Complete ==="
 	@if [ -d userspace/nilix-syz-fuzzer/test-corpus ]; then \
 		echo "Corpus entries: $$(find userspace/nilix-syz-fuzzer/test-corpus -name 'prog-*.bin' | wc -l)"; \
@@ -346,7 +345,7 @@ test-syz: build-kcov build-syz-executor build-syz-fuzzer
 # (q35会将某些BAR放在高于4GB的地址，超出bootloader的identity mapping范围)
 # R39-8 FIX: Add CPU model with SMEP/SMAP/UMIP/RDRAND support
 QEMU_COMMON = -bios $(OVMF_PATH) \
-	-drive "format=raw,file=fat:rw:$$(sh scripts/esp_run_copy.sh $(QEMU_ESP))" \
+	-drive "format=raw,file=fat:rw:$$(sh scripts/tools/esp_run_copy.sh $(QEMU_ESP))" \
 	-m 256M \
 	-vga std \
 	-no-reboot -no-shutdown \
@@ -528,10 +527,18 @@ run-both: build
 # Runtime suite gate (P1-C VT-2 / Gate #4) — exit code reflects REAL suite health.
 # Historical form was `timeout 10 qemu ... || true` (always green + too short
 # for the full runtime suite). Verdict is now serial Test Summary + panic/NX
-# via scripts/kernel_test.sh (exit 0 PASS / 1 FAILED / 2 NOT-RUN).
+# via scripts/gates/boot/kernel_test.sh (exit 0 PASS / 1 FAILED / 2 NOT-RUN).
 test: build
 	@echo "=== 启动内核（运行时测试套件门禁）==="
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/kernel_test.sh esp
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/kernel_test.sh esp
+
+# ST-K2-MREMAP / ST-K2-P2 ring-3 memory oracle. Boots the `syscall_test` guest
+# (built by `build-syscall-test`) and checks the Ring-3 verdict for the
+# anonymous-resize and shared-anonymous legs. Separate from `test` because that
+# workload demand-faults by design, which `kernel_test.sh` bans outright.
+test-ring3-mm: build-syscall-test
+	@echo "=== Running Ring-3 memory-management oracle ==="
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/ring3_mm_oracle.sh esp
 
 # R180-6 production filesystem gate: attach the reproducibly journaled image
 # so the mounted-image probe exercises real JBD2 transactions.
@@ -544,32 +551,32 @@ test-ext3: build ensure-ext3-image
 		trap 'rm -f "$$test_image"' 0; \
 		trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 131' 3; trap 'exit 143' 15; \
 		cp disk-ext2.img "$$test_image" || exit 1; \
-		OVMF_PATH="$(OVMF_PATH)" KERNEL_TEST_DISK="$$test_image" bash scripts/kernel_test.sh esp
+		OVMF_PATH="$(OVMF_PATH)" KERNEL_TEST_DISK="$$test_image" bash scripts/gates/boot/kernel_test.sh esp
 
 # CI boot-health gate — exit code reflects REAL boot health. Boots under QEMU
 # and asserts the kernel reaches userspace with zero NX-violation #PF. See
-# scripts/boot_check.sh and the D1-BOOT-NX-KASLR-LAYOUT process lesson.
+# scripts/gates/boot/boot_check.sh and the D1-BOOT-NX-KASLR-LAYOUT process lesson.
 boot-check: build
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/boot_check.sh esp
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/boot_check.sh esp
 
 # M0 conformance gate (item 3): prove a REAL static-musl binary runs end-to-end
 # (crt+auxv -> musl stdio printf/writev -> clean exit). Exit code reflects real
 # libc-conformance health (sibling of make test / boot-check). Builds with
 # --features musl_test so the embedded userspace/hello_musl.elf is the Ring-3
-# init program. See scripts/musl_check.sh.
+# init program. See scripts/gates/boot/musl_check.sh.
 musl-check: build-musl-test
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/musl_check.sh "$(MUSL_ESP)"
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/musl_check.sh "$(MUSL_ESP)"
 
 # SMP stress test gates - validate R175 D0 fixes under multi-core operation
 # Exit code reflects real SMP stability (0 = pass, non-zero = fail).
 # 2-core test validates basic SMP operation, 4-core validates scaling.
 test-smp: build
 	@echo "=== Running 2-Core SMP Stress Test ==="
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/smp_test.sh esp
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/smp_test.sh esp
 
 test-smp-4core: build
 	@echo "=== Running 4-Core SMP Stress Test ==="
-	@OVMF_PATH="$(OVMF_PATH)" bash scripts/smp_test_4core.sh esp
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/smp_test_4core.sh esp
 
 # SMP测试模式 - 启用多核支持
 # 使用 -smp 指定CPU数量（默认2个）
@@ -714,7 +721,7 @@ lint-repr-c-copy:
 # bounded string literal / annotation. See docs/design/PO-VFS-01 section 4.2.
 lint-fallible: lint-fallible-selftest
 	@echo "=== Lint: VFS fallibility (infallible alloc on recoverable paths) ==="
-	@HITS=$$(bash scripts/lint_fallible.sh kernel/vfs) ; \
+	@HITS=$$(bash scripts/tools/lint_fallible.sh kernel/vfs) ; \
 	if [ -n "$$HITS" ]; then \
 		echo "ERROR: unguarded infallible-allocation candidates in kernel/vfs:"; \
 		echo "$$HITS"; \
@@ -734,16 +741,16 @@ lint-fallible: lint-fallible-selftest
 # tree. A count drift means a regex alternation regressed or the fixture changed unpinned.
 lint-fallible-selftest:
 	@echo "=== Lint: VFS fallibility self-test (fixtures) ==="
-	@N=$$(bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/violation.rs | grep -c .) ; \
+	@N=$$(bash scripts/tools/lint_fallible.sh scripts/lint_fallible_fixtures/violation.rs | grep -c .) ; \
 	if [ "$$N" -ne 22 ]; then \
 		echo "ERROR: violation fixture caught $$N lines, expected 22."; \
 		echo "  (scanner regressed, OR the fixture changed without updating this count)"; \
 		exit 1; \
 	fi ; \
-	P=$$(bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs | grep -c .) ; \
+	P=$$(bash scripts/tools/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs | grep -c .) ; \
 	if [ "$$P" -ne 0 ]; then \
 		echo "ERROR: annotated_pass fixture produced $$P false positive(s), expected 0."; \
-		bash scripts/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs; \
+		bash scripts/tools/lint_fallible.sh scripts/lint_fallible_fixtures/annotated_pass.rs; \
 		exit 1; \
 	fi ; \
 	echo "OK: lint-fallible self-test (22 caught / 0 false positives)."
@@ -757,8 +764,8 @@ lint-fallible-selftest:
 # toolchain failure (fail closed — no --skip-cc here, so a missing gcc fails the gate).
 abi-check:
 	@echo "=== ABI layout oracle: kernel Rust source vs Linux x86-64 reference ==="
-	python3 scripts/abi_layout_oracle.py --self-test
-	python3 scripts/abi_layout_oracle.py --check --work-dir target/abi-oracle
+	python3 scripts/tools/abi_layout_oracle.py --self-test
+	python3 scripts/tools/abi_layout_oracle.py --check --work-dir target/abi-oracle
 
 # Unified lint target: runs all CI lint checks.
 lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible abi-check
@@ -771,23 +778,23 @@ lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible abi-c
 # before an expensive QEMU run is allowed to start.
 stress-test-selftest:
 	@echo "=== Running Stress-v2 Host Protocol Self-Tests ==="
-	@bash scripts/stress_test_test.sh
+	@bash scripts/tests/stress_test_test.sh
 
 # Stress test suite - catches resource leaks and stability issues
 stress-test: build-stress ensure-ext3-image
 	@echo "=== Running Stress Test Suite ==="
-	@bash scripts/stress_test_test.sh
-	@STRESS_DURATION=60 STRESS_CPUS=4 bash scripts/stress_test.sh "$(STRESS_ESP)"
+	@bash scripts/tests/stress_test_test.sh
+	@STRESS_DURATION=900 STRESS_CPUS=4 bash scripts/gates/stress/stress_test.sh "$(STRESS_ESP)"
 
 stress-test-extended: build-stress ensure-ext3-image
 	@echo "=== Running Extended Stress Test Suite ==="
-	@bash scripts/stress_test_test.sh
-	@STRESS_DURATION=300 STRESS_CPUS=4 bash scripts/stress_test.sh "$(STRESS_ESP)"
+	@bash scripts/tests/stress_test_test.sh
+	@STRESS_DURATION=900 STRESS_CPUS=4 bash scripts/gates/stress/stress_test.sh "$(STRESS_ESP)"
 
 # Performance regression gate - prevents accidental slowdowns
 test-perf: build
 	@echo "=== Running Performance Regression Gate ==="
-	@bash scripts/perf_regression_test.sh esp
+	@bash scripts/gates/performance/perf_regression_test.sh esp
 
 # Build a dedicated workload, kernel and ESP. The recorded argv/env plan is the
 # plan actually executed; status becomes 0 only after builds and packaging match.
@@ -815,7 +822,7 @@ test-security-mitigations:
 	@test -n "$(MITIGATION_INPUT_MANIFEST)" && test -n "$(MITIGATION_REVISION)" || { \
 		echo "Set MITIGATION_INPUT_MANIFEST and MITIGATION_REVISION for the exact validation tree." >&2; exit 2; }
 	$(MAKE) build-mitigation-probe
-	python3 scripts/mitigation_check.py --runtime --smp 4 --timeout "$(MITIGATION_TIMEOUT)" \
+	python3 scripts/gates/qemu/mitigation_check.py --runtime --smp 4 --timeout "$(MITIGATION_TIMEOUT)" \
 		--kernel-elf "$(MITIGATION_KERNEL)" --esp "$(MITIGATION_ESP)" \
 		--input-manifest "$(MITIGATION_INPUT_MANIFEST)" --revision "$(MITIGATION_REVISION)" \
 		--build-command-json "$(MITIGATION_BUILD_JSON)" --artifacts "$(MITIGATION_ARTIFACTS)"
@@ -824,52 +831,52 @@ test-security-mitigations:
 test-melting:
 	@echo "=== Running Melting Test Suite ==="
 	@echo "WARNING: Melting tests should be run on real hardware"
-	@MELT_DURATION=600 bash scripts/melting_test.sh
+	@MELT_DURATION=900 bash scripts/gates/performance/melting_test.sh
 
 # Extended SMP validation - 8-core and 16-core stress
 test-smp-extended: build
 	@echo "=== Running Extended SMP Test Suite ==="
-	@bash scripts/extended_smp_test.sh esp
+	@bash scripts/gates/boot/extended_smp_test.sh esp
 
 # Comprehensive test suite - all test categories
 test-comprehensive: build build-stress ensure-ext3-image
 	@echo "=== Running Comprehensive Test Suite ==="
 	@echo ""
 	@echo "1. Boot health check..."
-	@bash scripts/boot_check.sh esp || exit 1
+	@bash scripts/gates/boot/boot_check.sh esp || exit 1
 	@echo ""
 	@echo "2. Runtime test suite..."
-	@bash scripts/kernel_test.sh esp || exit 1
+	@bash scripts/gates/boot/kernel_test.sh esp || exit 1
 	@echo ""
 	@echo "3. Musl conformance..."
-	@bash scripts/musl_check.sh "$(MUSL_ESP)" || exit 1
+	@bash scripts/gates/boot/musl_check.sh "$(MUSL_ESP)" || exit 1
 	@echo ""
 	@echo "4. SMP 2-core validation..."
-	@bash scripts/smp_test.sh esp || exit 1
+	@bash scripts/gates/boot/smp_test.sh esp || exit 1
 	@echo ""
 	@echo "5. SMP 4-core validation..."
-	@bash scripts/smp_test_4core.sh esp || exit 1
+	@bash scripts/gates/boot/smp_test_4core.sh esp || exit 1
 	@echo ""
 	@echo "6. Extended SMP validation..."
-	@bash scripts/extended_smp_test.sh esp || exit 1
+	@bash scripts/gates/boot/extended_smp_test.sh esp || exit 1
 	@echo ""
 	@echo "7. Ext3/JBD2 production gate..."
-	@bash scripts/kernel_test.sh esp || exit 1
+	@bash scripts/gates/boot/kernel_test.sh esp || exit 1
 	@echo ""
 	@echo "8. Stress test suite..."
-	@bash scripts/stress_test_test.sh || exit 1
-	@STRESS_DURATION=60 bash scripts/stress_test.sh "$(STRESS_ESP)" || exit 1
+	@bash scripts/tests/stress_test_test.sh || exit 1
+	@STRESS_DURATION=900 bash scripts/gates/stress/stress_test.sh "$(STRESS_ESP)" || exit 1
 	@echo ""
 	@echo "9. Performance regression gate..."
-	@bash scripts/perf_regression_test.sh esp || exit 1
+	@bash scripts/gates/performance/perf_regression_test.sh esp || exit 1
 	@echo ""
 	@echo "=== ✅ Comprehensive Test Suite PASSED ==="
 
 # Quick smoke test - essential gates only
 test-quick: build
 	@echo "=== Running Quick Smoke Test ==="
-	@bash scripts/boot_check.sh esp || exit 1
-	@bash scripts/kernel_test.sh esp || exit 1
+	@bash scripts/gates/boot/boot_check.sh esp || exit 1
+	@bash scripts/gates/boot/kernel_test.sh esp || exit 1
 	@echo "=== ✅ Quick Smoke Test PASSED ==="
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -886,7 +893,7 @@ test-quick: build
 # preserves Rust's default-parallel scheduler, isolates Cargo target dirs, and
 # count-pins every suite so a missing registration/filter cannot pass as 0 tests.
 test-hosted-subcrates:
-	@bash scripts/hosted_subcrate_tests.sh
+	@bash scripts/tools/hosted_subcrate_tests.sh
 
 # Enable the repo's pre-push hook (runs fmt-check + clippy before each push).
 hooks:
@@ -937,7 +944,7 @@ clean:
 #       See docs/fuzz/AFL_STATUS.md for alternatives (userspace wrappers or libFuzzer).
 afl-seeds:
 	@echo "=== 生成AFL++种子语料库 ==="
-	python3 scripts/generate_afl_seeds.py
+	python3 scripts/fuzz/generate_afl_seeds.py
 
 afl-fuzz: build afl-seeds
 	@echo "=== 运行AFL++单实例模糊测试 ==="
@@ -945,26 +952,26 @@ afl-fuzz: build afl-seeds
 	@echo "    This will fail with 'Unable to request new process from fork server'."
 	@echo "    See docs/fuzz/AFL_STATUS.md for alternatives (userspace wrappers or libFuzzer)."
 	@echo ""
-	chmod +x scripts/afl_fuzz.sh
-	./scripts/afl_fuzz.sh --kernel kernel-target/x86_64-unknown-none/release/kernel
+	chmod +x scripts/fuzz/afl_fuzz.sh
+	./scripts/fuzz/afl_fuzz.sh --kernel kernel-target/x86_64-unknown-none/release/kernel
 
 afl-fuzz-parallel: build afl-seeds
 	@echo "=== 运行AFL++并行模糊测试 ==="
 	@echo "⚠️  WARNING: AFL++ QEMU mode cannot fuzz bare-metal x86_64-unknown-none kernel."
 	@echo "    See docs/fuzz/AFL_STATUS.md for alternatives."
 	@echo ""
-	chmod +x scripts/afl_parallel.sh
-	./scripts/afl_parallel.sh \
+	chmod +x scripts/fuzz/afl_parallel.sh
+	./scripts/fuzz/afl_parallel.sh \
 		--kernel kernel-target/x86_64-unknown-none/release/kernel \
 		--instances $(INSTANCES)
 
 afl-triage:
 	@echo "=== 分类AFL++崩溃发现 ==="
-	chmod +x scripts/afl_triage.sh
+	chmod +x scripts/fuzz/afl_triage.sh
 	@if [ -d fuzz/afl_findings ]; then \
 		for fuzzer in fuzz/afl_findings/fuzzer*/crashes; do \
 			if [ -d "$$fuzzer" ]; then \
-				./scripts/afl_triage.sh "$$fuzzer"; \
+				./scripts/fuzz/afl_triage.sh "$$fuzzer"; \
 			fi; \
 		done; \
 	else \
@@ -1074,7 +1081,7 @@ run-kcov: build-kcov
 
 # Boot QEMU and validate the deterministic guest executor markers.
 test-kcov: build-kcov
-	bash scripts/fuzz_runner_test.sh "$(KCOV_ESP)"
+	bash scripts/gates/qemu/fuzz_runner_test.sh "$(KCOV_ESP)"
 
 
 # === Syzkaller-Style Executor Kernel (embeds nilix_syz_executor.elf) ===
@@ -1131,7 +1138,7 @@ build-fuzz-qemu-deps: build-syz-kcov
 
 # A finite gate must execute known valid inputs and verify process/guest evidence.
 fuzz-qemu-smoke: build-fuzz-qemu-deps
-	python3 scripts/qemu_fuzz_smoke.py --kernel "$(SYZ_ESP)/kernel.elf"
+	python3 scripts/gates/qemu/qemu_fuzz_smoke.py --kernel "$(SYZ_ESP)/kernel.elf"
 
 fuzz-qemu-seeds:
 	cargo +nightly-2025-12-08 run --manifest-path fuzz/Cargo.toml \
