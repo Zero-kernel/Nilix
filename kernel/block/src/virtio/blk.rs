@@ -65,6 +65,82 @@ pub fn timeout_leaked_count() -> usize {
 }
 
 // ============================================================================
+// Request wait policy (R189-1 FIX)
+// ============================================================================
+//
+// The synchronous request loops below used a fixed 1_000_000-iteration spin
+// count as their only watchdog.  An iteration count is not a wall-clock bound:
+// on an emulated guest (TCG) or a loaded host one iteration costs ~1us, so the
+// budget expired after a few hundred milliseconds while a *healthy* device was
+// still draining a host fsync.  Abandoning the request then reset the device
+// mid-transaction and surfaced `EIO` to the filesystem, which fails the mount
+// closed even though every committed home had already reached the disk.
+//
+// Wait against the monotonic TSC instead.  The budget below is at least ~6s of
+// wall time on any CPU clocked up to 5 GHz (and longer on slower parts), which
+// is far beyond any plausible host I/O latency while still bounding a genuinely
+// wedged device.
+const REQUEST_WAIT_TIMEOUT_CYCLES: u64 = 30_000_000_000;
+
+#[inline]
+fn tsc_now() -> u64 {
+    // SAFETY: RDTSC is unconditionally available on x86_64, has no memory side
+    // effects, and is monotonic across the wait loops in this module.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Wrap-safe expiration test for the monotonic request wait budget.
+#[inline]
+fn wait_budget_expired(start: u64, now: u64) -> bool {
+    now.wrapping_sub(start) >= REQUEST_WAIT_TIMEOUT_CYCLES
+}
+
+/// Monotonic deadline shared by the synchronous request wait loops.
+#[derive(Clone, Copy, Debug)]
+struct WaitDeadline {
+    start: u64,
+}
+
+impl WaitDeadline {
+    fn start() -> Self {
+        Self { start: tsc_now() }
+    }
+
+    fn elapsed_cycles(&self) -> u64 {
+        tsc_now().wrapping_sub(self.start)
+    }
+
+    fn expired(&self) -> bool {
+        wait_budget_expired(self.start, tsc_now())
+    }
+}
+
+/// Release-visible attribution for a synchronous request failure.
+///
+/// `kprintln!` is compiled out of release builds, which left the retained CI
+/// serial log with a bare `EIO` and no device-level explanation.
+fn log_request_failure(op: &str, sector: u64, bytes: usize, error: BlockError) -> BlockError {
+    klog!(
+        Error,
+        "[virtio-blk] {} failed sector={} bytes={} error={:?}",
+        op,
+        sector,
+        bytes,
+        error
+    );
+    error
+}
+
+#[inline]
+fn request_op_name(is_write: bool) -> &'static str {
+    if is_write {
+        "write"
+    } else {
+        "read"
+    }
+}
+
+// ============================================================================
 // DMA Address Translation (R28-1 Fix)
 // ============================================================================
 
@@ -279,7 +355,8 @@ impl VirtQueue {
     fn free_desc(&self, idx: u16) {
         // Bounds check
         if idx >= self.size {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R66-6: free_desc called with OOB index {}",
                 idx
             );
@@ -293,7 +370,8 @@ impl VirtQueue {
         let mut alloc = self.alloc_bitmap.lock();
         let mut free = self.free_list.lock();
         if free.len() >= self.size as usize || free.len() >= free.capacity() {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] descriptor free-list invariant violated for {}",
                 idx
             );
@@ -303,7 +381,8 @@ impl VirtQueue {
             return;
         };
         if !*slot {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
                 idx
             );
@@ -374,7 +453,8 @@ impl VirtQueue {
             // A malicious device could set used_idx to arbitrary values
             if pending > self.size {
                 // Possible attack: device reported too many completions or rolled back
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R66-5 SECURITY: invalid used.idx jump detected! \
                      used_idx={}, last={}, pending={}, size={}",
                     used_idx,
@@ -397,7 +477,8 @@ impl VirtQueue {
 
             // R66-5 FIX: Validate that the returned descriptor ID is within bounds
             if elem.id >= self.size as u32 {
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R66-5 SECURITY: invalid used.id={} exceeds queue size={}",
                     elem.id,
                     self.size
@@ -977,7 +1058,8 @@ impl VirtioBlkDevice {
         }) {
             Some(entry) => entry,
             None => {
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] completion for unknown descriptor head={} ignored",
                     used.id
                 );
@@ -989,7 +1071,8 @@ impl VirtioBlkDevice {
         let meta = match buffer.pending.take() {
             Some(m) => m,
             None => {
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] completion for descriptor head={} without metadata",
                     used.id
                 );
@@ -1034,7 +1117,8 @@ impl VirtioBlkDevice {
             let _ =
                 TIMEOUT_LEAKED_REQUESTS
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
-            kprintln!(
+            klog!(
+                Warn,
                 "[virtio-blk] late completion for abandoned request head={} status={}",
                 head,
                 status
@@ -1060,7 +1144,8 @@ impl VirtioBlkDevice {
         // Block new I/O immediately.
         self.device_failed.store(true, Ordering::Release);
 
-        kprintln!(
+        klog!(
+            Warn,
             "[virtio-blk] R106-3: initiating device reset for {}",
             self.name
         );
@@ -1086,7 +1171,8 @@ impl VirtioBlkDevice {
                     );
                 }
             }
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R180-16: reset not acknowledged for {} — quarantining in-flight DMA",
                 self.name
             );
@@ -1225,7 +1311,10 @@ impl VirtioBlkDevice {
             let status = self.transport.status();
             if status & VIRTIO_STATUS_FEATURES_OK == 0 {
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
-                kprintln!("[virtio-blk] R106-3: FEATURES_OK not accepted after reset");
+                klog!(
+                    Error,
+                    "[virtio-blk] R106-3: FEATURES_OK not accepted after reset"
+                );
                 return Err(BlockError::NotSupported);
             }
 
@@ -1251,7 +1340,10 @@ impl VirtioBlkDevice {
             };
             if BlockGeometry::from_virtio(reset_capacity, reset_sector_size) != Ok(self.geometry) {
                 self.transport.set_status(VIRTIO_STATUS_FAILED);
-                kprintln!("[virtio-blk] geometry changed or became invalid across reset");
+                klog!(
+                    Error,
+                    "[virtio-blk] geometry changed or became invalid across reset"
+                );
                 return Err(BlockError::Offline);
             }
 
@@ -1260,7 +1352,8 @@ impl VirtioBlkDevice {
             if self.queue.size == 0 || self.queue.size > queue_size_max {
                 let status = self.transport.status();
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R106-3: queue size {} exceeds max {} after reset",
                     self.queue.size,
                     queue_size_max
@@ -1295,7 +1388,8 @@ impl VirtioBlkDevice {
                         .set_status(recovered_status | VIRTIO_STATUS_FAILED);
                 }
             }
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] RF180-21: device {} rejected DRIVER_OK after reset (status={:#x})",
                 self.name,
                 recovered_status
@@ -1305,7 +1399,8 @@ impl VirtioBlkDevice {
 
         // Recovery is hardware-acknowledged; only this point may reopen I/O.
         self.device_failed.store(false, Ordering::Release);
-        kprintln!(
+        klog!(
+            Warn,
             "[virtio-blk] R106-3: device {} reset successful, recovered {} abandoned requests",
             self.name,
             recovered_leaked
@@ -1379,7 +1474,12 @@ impl VirtioBlkDevice {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure(
+                    request_op_name(is_write),
+                    sector,
+                    buf_len,
+                    BlockError::NoMem,
+                ));
             }
         };
 
@@ -1404,7 +1504,12 @@ impl VirtioBlkDevice {
             Err(_) => {
                 // header_status_dma is dropped automatically here, unmapping from IOMMU
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure(
+                    request_op_name(is_write),
+                    sector,
+                    buf_len,
+                    BlockError::NoMem,
+                ));
             }
         };
 
@@ -1503,10 +1608,10 @@ impl VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let mut timeout = 1_000_000u32;
+        let wait_deadline = WaitDeadline::start();
         let mut completion: Option<Result<usize, BlockError>> = None;
 
-        while timeout > 0 && completion.is_none() {
+        while completion.is_none() && !wait_deadline.expired() {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -1517,21 +1622,41 @@ impl VirtioBlkDevice {
                                 CompletedIo::Read { data_dma, data_len },
                             ) => {
                                 if data_len > data_dma.size() {
+                                    klog!(
+                                        Error,
+                                        "[virtio-blk] read completion exceeds DMA payload data_len={} dma_size={}",
+                                        data_len,
+                                        data_dma.size()
+                                    );
                                     return Err(BlockError::Io);
                                 }
                                 // SAFETY: the used chain retired before this owned
                                 // buffer was returned; no device/caller alias remains.
                                 let bytes = unsafe { data_dma.as_slice() };
-                                copy_read_result(destination, &bytes[..data_len])
+                                copy_read_result(destination, &bytes[..data_len]).map_err(|error| {
+                                    klog!(
+                                        Error,
+                                        "[virtio-blk] read completion length mismatch data_len={} expected={}",
+                                        data_len,
+                                        destination.len()
+                                    );
+                                    error
+                                })
                             }
                             (SyncRequestData::Write(_), CompletedIo::Write(count)) => Ok(count),
-                            _ => Err(BlockError::Io),
+                            _ => {
+                                klog!(
+                                    Error,
+                                    "[virtio-blk] completion kind does not match the submitted request"
+                                );
+                                Err(BlockError::Io)
+                            }
                         }));
                         break;
                     }
                     Some(RequestCompletion::Flush(_)) => {
                         // Unexpected flush completion during I/O wait
-                        kprintln!(
+                        klog!(Error,
                             "[virtio-blk] unexpected flush completion while waiting for I/O head={}",
                             desc0
                         );
@@ -1546,10 +1671,7 @@ impl VirtioBlkDevice {
                 break;
             }
 
-            if !self.queue.has_used() {
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
+            core::hint::spin_loop();
         }
 
         // R39-1 FIX: Handle timeout by marking request as abandoned
@@ -1564,12 +1686,14 @@ impl VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                kprintln!(
-                    "[virtio-blk] timeout waiting for request head={} sector={} bytes={}, \
+                klog!(
+                    Error,
+                    "[virtio-blk] request wait budget expired head={} sector={} bytes={} cycles={}, \
                      buffers pinned (reset required, total leaked={})",
                     desc0,
                     sector,
                     buf_len,
+                    wait_deadline.elapsed_cycles(),
                     leaked
                 );
                 // Leave req_buffers[buf_idx].in_use = true to prevent reuse until device completes
@@ -1820,7 +1944,7 @@ impl BlockDevice for VirtioBlkDevice {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure("flush", 0, 0, BlockError::NoMem));
             }
         };
 
@@ -1899,10 +2023,10 @@ impl BlockDevice for VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let mut timeout = 1_000_000u32;
+        let wait_deadline = WaitDeadline::start();
         let mut completion: Option<Result<(), BlockError>> = None;
 
-        while timeout > 0 && completion.is_none() {
+        while completion.is_none() && !wait_deadline.expired() {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -1912,7 +2036,7 @@ impl BlockDevice for VirtioBlkDevice {
                     }
                     Some(RequestCompletion::Io(_)) => {
                         // Unexpected I/O completion during flush wait
-                        kprintln!(
+                        klog!(Error,
                             "[virtio-blk] unexpected I/O completion while waiting for flush head={}",
                             desc0
                         );
@@ -1927,10 +2051,7 @@ impl BlockDevice for VirtioBlkDevice {
                 break;
             }
 
-            if !self.queue.has_used() {
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
+            core::hint::spin_loop();
         }
 
         // R39-1 FIX: Handle timeout by marking request as abandoned
@@ -1945,9 +2066,12 @@ impl BlockDevice for VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                kprintln!(
-                    "[virtio-blk] flush timeout head={}, buffers pinned (reset required, total leaked={})",
-                    desc0, leaked
+                klog!(
+                    Error,
+                    "[virtio-blk] flush wait budget expired head={} cycles={}, buffers pinned (reset required, total leaked={})",
+                    desc0,
+                    wait_deadline.elapsed_cycles(),
+                    leaked
                 );
                 // R106-3: Attempt device reset to recover resources.
                 let _ = self.reset_device(&_lock);
@@ -1989,5 +2113,38 @@ impl BlockDevice for VirtioBlkDevice {
         }
 
         Err(BlockError::Offline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_budget_is_monotonic_and_wrap_safe() {
+        // The synchronous request watchdog must not fire before its budget is
+        // spent, must fire once it is spent, and must survive a TSC wrap
+        // between the deadline start and the observation point.
+        let budget = REQUEST_WAIT_TIMEOUT_CYCLES;
+        assert!(
+            budget >= 10_000_000_000,
+            "request watchdog budget must stay a multi-second wall-clock bound"
+        );
+
+        let start = 1_000u64;
+        assert!(!wait_budget_expired(start, start));
+        assert!(!wait_budget_expired(start, start + budget - 1));
+        assert!(wait_budget_expired(start, start + budget));
+        assert!(wait_budget_expired(start, start + budget + 1));
+
+        // TSC wrap: a small "now" shortly after a start near u64::MAX is an
+        // early observation, not an expired budget.
+        let near_wrap = u64::MAX - 5;
+        assert!(!wait_budget_expired(near_wrap, 3));
+        assert!(wait_budget_expired(near_wrap, 9 + budget));
+
+        // Request kind naming is part of the attribution contract.
+        assert_eq!(request_op_name(true), "write");
+        assert_eq!(request_op_name(false), "read");
     }
 }
