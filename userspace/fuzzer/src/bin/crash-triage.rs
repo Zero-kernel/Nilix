@@ -30,6 +30,7 @@ const ALLOWED_TARGETS: &[&str] = &[
     "fuzz_cgroup_ops",
     "fuzz_elf_loader",
     "fuzz_futex_ops",
+    "fuzz_syscall_qemu",
 ];
 
 type HmacSha256 = Hmac<Sha256>;
@@ -358,6 +359,32 @@ mod tests {
         assert!(validate_key(&[]).is_err());
         assert!(validate_key(&[0; MIN_KEY_BYTES - 1]).is_err());
         assert!(validate_key(&[0; MIN_KEY_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn qemu_findings_produce_private_target_scoped_candidates() {
+        let temp = TestDir::new("qemu");
+        let input = temp.path().join("input");
+        write_artifact(&input, "fuzz_syscall_qemu", "crash-a", b"private");
+        write_artifact(&input, "fuzz_syscall_qemu", "crash-b", b"private");
+        write_artifact(&input, "fuzz_syscall", "crash-a", b"private");
+        let summary = run(args(temp.path(), 3), TEST_KEY).unwrap();
+        assert_eq!(summary.accepted_findings, 3);
+        assert_eq!(summary.unique_candidates, 2);
+        for candidate in fs::read_dir(temp.path().join("output")).unwrap() {
+            let report = fs::read_to_string(candidate.unwrap().path()).unwrap();
+            assert_eq!(report.lines().count(), 2);
+            assert!(!report.contains("private"));
+            assert!(!report.contains("fuzz_syscall"));
+            assert_keyed_id_shape(
+                report
+                    .lines()
+                    .nth(1)
+                    .unwrap()
+                    .strip_prefix("Candidate-ID: ")
+                    .unwrap(),
+            );
+        }
     }
 
     #[test]

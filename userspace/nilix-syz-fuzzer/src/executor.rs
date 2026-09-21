@@ -636,7 +636,9 @@ fn qemu_args(ovmf: &Path, esp_dir: &Path, disk: &Path, serial: &Path) -> Result<
         // the separate result disk must remain persistent for extraction.
         format!("format=raw,file=fat:{esp_dir},snapshot=on"),
         "-drive".into(),
-        format!("if=none,file={disk},format=raw,id=syzdisk,cache=directsync"),
+        // Writeback matches the block path used by the kernel runtime gates
+        // and avoids QEMU 8.x direct-I/O alignment differences on Ext3.
+        format!("if=none,file={disk},format=raw,id=syzdisk,cache=writeback"),
         "-device".into(),
         "virtio-blk-pci,drive=syzdisk".into(),
         "-m".into(),
@@ -1007,6 +1009,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn serial_offsets_are_exact_and_fatal_evidence_survives_tail_eviction() {
         use std::io::Write;
         let binding = binding();
@@ -1049,7 +1052,7 @@ mod tests {
         .unwrap();
         assert!(args
             .iter()
-            .any(|arg| arg.contains("id=syzdisk,cache=directsync")));
+            .any(|arg| arg.contains("id=syzdisk,cache=writeback")));
         assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
         assert!(args.iter().any(|arg| arg == "virtio-blk-pci,drive=syzdisk"));
         assert!(!args.iter().any(|arg| arg.contains("virtio-serial")));

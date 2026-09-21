@@ -65,6 +65,105 @@ pub fn timeout_leaked_count() -> usize {
 }
 
 // ============================================================================
+// Request wait policy (R189-1 FIX)
+// ============================================================================
+//
+// The synchronous request loops below bounded every request with a fixed
+// 1_000_000-iteration spin count.  An iteration count is not a wall-clock
+// bound, and the measured TCG cost of one iteration is only ~0.3us, so that
+// budget expired after a few hundred milliseconds while a *healthy* device was
+// still draining a host fsync.  Abandoning the request then reset the device
+// mid-transaction and surfaced `EIO` to the filesystem, which fails the mount
+// closed even though every committed home had already reached the disk.
+//
+// A clock-based deadline was tried first and dropped.  The failure that first
+// looked like a non-monotonic RDTSC turned out to be the inverted wait
+// predicate documented at `wait_should_continue` below (instrumented serial:
+// `budget=50000000 left=50000000 spent=0`), so nothing observed here shows this
+// guest moving RDTSC backwards; the deadline only added a clock assumption.
+//
+// The watchdog kept instead is a monotonic *no-progress* iteration budget: only
+// polls that produced no completion are charged, and 50M of them is ~15s of
+// wall time under TCG (the CI configuration) and ~0.5s on native hardware,
+// where the device is correspondingly faster.
+const REQUEST_WAIT_MAX_SPINS: u32 = 50_000_000;
+
+/// Monotonic no-progress budget for one synchronous request wait.
+#[derive(Clone, Copy, Debug)]
+struct RequestWait {
+    spins_left: u32,
+}
+
+impl RequestWait {
+    fn start() -> Self {
+        Self {
+            spins_left: REQUEST_WAIT_MAX_SPINS,
+        }
+    }
+
+    /// Account one poll iteration; `false` once the budget is spent.
+    #[inline]
+    fn spend(&mut self) -> bool {
+        self.spins_left = self.spins_left.saturating_sub(1);
+        self.spins_left > 0
+    }
+
+    #[inline]
+    fn expired(&self) -> bool {
+        self.spins_left == 0
+    }
+
+    /// Poll iterations spent so far, for the expiration diagnostic.
+    #[inline]
+    fn spins_spent(&self) -> u32 {
+        REQUEST_WAIT_MAX_SPINS - self.spins_left
+    }
+}
+
+/// R189-1 FIX: continue a synchronous wait only while the request can still be
+/// completed: it is still pending, the used ring is not quarantined, and the
+/// no-progress budget is not spent.
+///
+/// The first argument is the *pending* predicate (`completion.is_none()`) at both
+/// call sites. The R189-1 refactor instead named it `completed` and negated it,
+/// so both wait loops skipped their bodies and abandoned every healthy request on
+/// the first poll (instrumented serial: `budget=50000000 left=50000000 spent=0
+/// fatal=false`, then `request wait budget expired ... spins=0`).
+///
+/// A quarantined queue can never deliver a completion until reset_device
+/// rebuilds the ring, so waiting on one would only hold the device lock and
+/// re-emit the SECURITY diagnostic once per poll iteration.
+#[inline]
+fn wait_should_continue(pending: bool, quarantined: bool, budget_expired: bool) -> bool {
+    pending && !quarantined && !budget_expired
+}
+
+/// Release-visible attribution for a synchronous request failure.
+///
+/// `kprintln!` is compiled out of release builds, which left the retained CI
+/// serial log with a bare `EIO` and no device-level explanation.
+fn log_request_failure(op: &str, sector: u64, bytes: usize, error: BlockError) -> BlockError {
+    klog!(
+        Error,
+        "[virtio-blk] {} failed sector={} bytes={} error={:?}",
+        op,
+        sector,
+        bytes,
+        error
+    );
+    error
+}
+
+#[inline]
+fn request_op_name(is_write: bool) -> &'static str {
+    if is_write {
+        "write"
+    } else {
+        "read"
+    }
+}
+
+// ============================================================================
 // DMA Address Translation (R28-1 Fix)
 // ============================================================================
 
@@ -279,7 +378,8 @@ impl VirtQueue {
     fn free_desc(&self, idx: u16) {
         // Bounds check
         if idx >= self.size {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R66-6: free_desc called with OOB index {}",
                 idx
             );
@@ -293,7 +393,8 @@ impl VirtQueue {
         let mut alloc = self.alloc_bitmap.lock();
         let mut free = self.free_list.lock();
         if free.len() >= self.size as usize || free.len() >= free.capacity() {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] descriptor free-list invariant violated for {}",
                 idx
             );
@@ -303,7 +404,8 @@ impl VirtQueue {
             return;
         };
         if !*slot {
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
                 idx
             );
@@ -339,24 +441,19 @@ impl VirtQueue {
         write_volatile(&mut avail.idx, idx.wrapping_add(1));
     }
 
-    /// Check if there are used entries to process.
-    fn has_used(&self) -> bool {
-        if self.fatal.load(Ordering::Acquire) {
-            return false;
-        }
-        unsafe {
-            let used = &*self.used;
-            let used_idx = read_volatile(&used.idx);
-            let last = self.last_used_idx.load(Ordering::Relaxed);
-            used_idx != last
-        }
-    }
-
     /// Pop a used entry.
     /// R66-5 FIX: Validate used.idx to detect malicious device behavior:
     /// - Large jumps (more entries than queue size)
     /// - Rollback attacks (used_idx going backwards)
     fn pop_used(&self) -> Option<VringUsedElem> {
+        // R189-1 FIX: a quarantined queue yields no completions until
+        // reset_device rebuilds the ring state. Short-circuit before touching
+        // the malformed device-controlled state, so a persistent violation
+        // cannot re-emit its SECURITY diagnostic on every poll iteration.
+        if self.fatal.load(Ordering::Acquire) {
+            return None;
+        }
+
         unsafe {
             let used = &*self.used;
             let used_idx = read_volatile(&used.idx);
@@ -374,7 +471,8 @@ impl VirtQueue {
             // A malicious device could set used_idx to arbitrary values
             if pending > self.size {
                 // Possible attack: device reported too many completions or rolled back
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R66-5 SECURITY: invalid used.idx jump detected! \
                      used_idx={}, last={}, pending={}, size={}",
                     used_idx,
@@ -397,14 +495,16 @@ impl VirtQueue {
 
             // R66-5 FIX: Validate that the returned descriptor ID is within bounds
             if elem.id >= self.size as u32 {
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R66-5 SECURITY: invalid used.id={} exceeds queue size={}",
                     elem.id,
                     self.size
                 );
-                // Skip this invalid entry
-                self.last_used_idx
-                    .store(last.wrapping_add(1), Ordering::Relaxed);
+                // The entry cannot be reconciled with request metadata.
+                // Quarantine the queue and leave the cursor unchanged so the
+                // timeout/reset path can reclaim every outstanding request.
+                self.fatal.store(true, Ordering::Release);
                 return None;
             }
 
@@ -427,6 +527,33 @@ impl VirtQueue {
     #[inline]
     fn clear_fatal(&self) {
         self.fatal.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Acquire)
+    }
+
+    /// R189-2 FIX: reject a used-ring entry that cannot be reconciled with any
+    /// in-flight request and quarantine the queue until `reset_device` rebuilds
+    /// the ring state.
+    ///
+    /// Every legitimate completion echoes a head descriptor this driver
+    /// published, so an in-bounds `used.id` with no matching request is only
+    /// reachable if the device fabricates completions.  Ignoring such an entry
+    /// is not safe: both synchronous waits charge their watchdog budget once per
+    /// *outer* poll and drain the used ring in an inner loop, so a device that
+    /// keeps publishing unreconcilable completions would hold the device lock
+    /// and keep re-emitting the release-visible diagnostic without ever
+    /// reaching the budget or the reset path.
+    fn reject_unknown_completion(&self, used_id: u32) {
+        klog!(
+            Error,
+            "[virtio-blk] R189-2 SECURITY: completion for unknown descriptor head={}; \
+             quarantining the queue until reset",
+            used_id
+        );
+        self.fatal.store(true, Ordering::Release);
     }
 }
 
@@ -971,10 +1098,12 @@ impl VirtioBlkDevice {
         }) {
             Some(entry) => entry,
             None => {
-                kprintln!(
-                    "[virtio-blk] completion for unknown descriptor head={} ignored",
-                    used.id
-                );
+                // R189-2 FIX: an unreconcilable completion is a device protocol
+                // violation, not something to skip.  Skipping it drains the
+                // inner used-ring loop without charging the watchdog, so a
+                // hostile device could hold this loop (and the device lock)
+                // forever instead of failing closed into the reset path.
+                self.queue.reject_unknown_completion(used.id);
                 return None;
             }
         };
@@ -983,7 +1112,8 @@ impl VirtioBlkDevice {
         let meta = match buffer.pending.take() {
             Some(m) => m,
             None => {
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] completion for descriptor head={} without metadata",
                     used.id
                 );
@@ -1028,7 +1158,8 @@ impl VirtioBlkDevice {
             let _ =
                 TIMEOUT_LEAKED_REQUESTS
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
-            kprintln!(
+            klog!(
+                Warn,
                 "[virtio-blk] late completion for abandoned request head={} status={}",
                 head,
                 status
@@ -1054,7 +1185,8 @@ impl VirtioBlkDevice {
         // Block new I/O immediately.
         self.device_failed.store(true, Ordering::Release);
 
-        kprintln!(
+        klog!(
+            Warn,
             "[virtio-blk] R106-3: initiating device reset for {}",
             self.name
         );
@@ -1080,7 +1212,8 @@ impl VirtioBlkDevice {
                     );
                 }
             }
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] R180-16: reset not acknowledged for {} — quarantining in-flight DMA",
                 self.name
             );
@@ -1219,7 +1352,10 @@ impl VirtioBlkDevice {
             let status = self.transport.status();
             if status & VIRTIO_STATUS_FEATURES_OK == 0 {
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
-                kprintln!("[virtio-blk] R106-3: FEATURES_OK not accepted after reset");
+                klog!(
+                    Error,
+                    "[virtio-blk] R106-3: FEATURES_OK not accepted after reset"
+                );
                 return Err(BlockError::NotSupported);
             }
 
@@ -1245,7 +1381,10 @@ impl VirtioBlkDevice {
             };
             if BlockGeometry::from_virtio(reset_capacity, reset_sector_size) != Ok(self.geometry) {
                 self.transport.set_status(VIRTIO_STATUS_FAILED);
-                kprintln!("[virtio-blk] geometry changed or became invalid across reset");
+                klog!(
+                    Error,
+                    "[virtio-blk] geometry changed or became invalid across reset"
+                );
                 return Err(BlockError::Offline);
             }
 
@@ -1254,7 +1393,8 @@ impl VirtioBlkDevice {
             if self.queue.size == 0 || self.queue.size > queue_size_max {
                 let status = self.transport.status();
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
-                kprintln!(
+                klog!(
+                    Error,
                     "[virtio-blk] R106-3: queue size {} exceeds max {} after reset",
                     self.queue.size,
                     queue_size_max
@@ -1289,7 +1429,8 @@ impl VirtioBlkDevice {
                         .set_status(recovered_status | VIRTIO_STATUS_FAILED);
                 }
             }
-            kprintln!(
+            klog!(
+                Error,
                 "[virtio-blk] RF180-21: device {} rejected DRIVER_OK after reset (status={:#x})",
                 self.name,
                 recovered_status
@@ -1299,7 +1440,8 @@ impl VirtioBlkDevice {
 
         // Recovery is hardware-acknowledged; only this point may reopen I/O.
         self.device_failed.store(false, Ordering::Release);
-        kprintln!(
+        klog!(
+            Warn,
             "[virtio-blk] R106-3: device {} reset successful, recovered {} abandoned requests",
             self.name,
             recovered_leaked
@@ -1331,6 +1473,14 @@ impl VirtioBlkDevice {
         // request waits for this lock; it must not submit after reset completes.
         if self.device_failed.load(Ordering::Acquire) {
             return Err(BlockError::Offline);
+        }
+
+        // RF188-3 FIX: A malformed used-ring entry poisons the queue even
+        // when no request is currently outstanding. Reset before allocating a
+        // new request so a fatal queue cannot degrade into a permanent Busy
+        // response with no recovery trigger.
+        if self.queue.is_fatal() {
+            self.reset_device(&_lock)?;
         }
 
         // Get a request buffer
@@ -1365,7 +1515,12 @@ impl VirtioBlkDevice {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure(
+                    request_op_name(is_write),
+                    sector,
+                    buf_len,
+                    BlockError::NoMem,
+                ));
             }
         };
 
@@ -1390,7 +1545,12 @@ impl VirtioBlkDevice {
             Err(_) => {
                 // header_status_dma is dropped automatically here, unmapping from IOMMU
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure(
+                    request_op_name(is_write),
+                    sector,
+                    buf_len,
+                    BlockError::NoMem,
+                ));
             }
         };
 
@@ -1489,10 +1649,10 @@ impl VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let mut timeout = 1_000_000u32;
+        let mut wait = RequestWait::start();
         let mut completion: Option<Result<usize, BlockError>> = None;
 
-        while timeout > 0 && completion.is_none() {
+        while wait_should_continue(completion.is_none(), self.queue.is_fatal(), wait.expired()) {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -1503,21 +1663,40 @@ impl VirtioBlkDevice {
                                 CompletedIo::Read { data_dma, data_len },
                             ) => {
                                 if data_len > data_dma.size() {
+                                    klog!(
+                                        Error,
+                                        "[virtio-blk] read completion exceeds DMA payload data_len={} dma_size={}",
+                                        data_len,
+                                        data_dma.size()
+                                    );
                                     return Err(BlockError::Io);
                                 }
                                 // SAFETY: the used chain retired before this owned
                                 // buffer was returned; no device/caller alias remains.
                                 let bytes = unsafe { data_dma.as_slice() };
-                                copy_read_result(destination, &bytes[..data_len])
+                                copy_read_result(destination, &bytes[..data_len]).inspect_err(|error| {
+                                    klog!(
+                                        Error,
+                                        "[virtio-blk] read completion length mismatch data_len={} expected={}",
+                                        data_len,
+                                        destination.len()
+                                    );
+                                })
                             }
                             (SyncRequestData::Write(_), CompletedIo::Write(count)) => Ok(count),
-                            _ => Err(BlockError::Io),
+                            _ => {
+                                klog!(
+                                    Error,
+                                    "[virtio-blk] completion kind does not match the submitted request"
+                                );
+                                Err(BlockError::Io)
+                            }
                         }));
                         break;
                     }
                     Some(RequestCompletion::Flush(_)) => {
                         // Unexpected flush completion during I/O wait
-                        kprintln!(
+                        klog!(Error,
                             "[virtio-blk] unexpected flush completion while waiting for I/O head={}",
                             desc0
                         );
@@ -1532,10 +1711,8 @@ impl VirtioBlkDevice {
                 break;
             }
 
-            if !self.queue.has_used() {
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
+            let _ = wait.spend();
+            core::hint::spin_loop();
         }
 
         // R39-1 FIX: Handle timeout by marking request as abandoned
@@ -1550,14 +1727,30 @@ impl VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                kprintln!(
-                    "[virtio-blk] timeout waiting for request head={} sector={} bytes={}, \
-                     buffers pinned (reset required, total leaked={})",
-                    desc0,
-                    sector,
-                    buf_len,
-                    leaked
-                );
+                let spins_spent = wait.spins_spent();
+                if self.queue.is_fatal() {
+                    klog!(
+                        Error,
+                        "[virtio-blk] request aborted by used-ring quarantine head={} sector={} bytes={} spins={}, \
+                         buffers pinned (reset required, total leaked={})",
+                        desc0,
+                        sector,
+                        buf_len,
+                        spins_spent,
+                        leaked
+                    );
+                } else {
+                    klog!(
+                        Error,
+                        "[virtio-blk] request wait budget expired head={} sector={} bytes={} spins={}, \
+                         buffers pinned (reset required, total leaked={})",
+                        desc0,
+                        sector,
+                        buf_len,
+                        spins_spent,
+                        leaked
+                    );
+                }
                 // Leave req_buffers[buf_idx].in_use = true to prevent reuse until device completes
                 // R106-3: Attempt device reset to recover resources.
                 let _ = self.reset_device(&_lock);
@@ -1771,6 +1964,13 @@ impl BlockDevice for VirtioBlkDevice {
             return Err(BlockError::Offline);
         }
 
+        // RF188-3 FIX: Recover a poisoned queue before issuing a standalone
+        // flush; otherwise a malformed completion with no pending I/O would
+        // leave every later flush permanently Busy.
+        if self.queue.is_fatal() {
+            self.reset_device(&_lock)?;
+        }
+
         // Acquire a request buffer slot
         let buf_idx = {
             let mut buffers = self.req_buffers.lock();
@@ -1799,7 +1999,7 @@ impl BlockDevice for VirtioBlkDevice {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(BlockError::NoMem);
+                return Err(log_request_failure("flush", 0, 0, BlockError::NoMem));
             }
         };
 
@@ -1878,10 +2078,10 @@ impl BlockDevice for VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let mut timeout = 1_000_000u32;
+        let mut wait = RequestWait::start();
         let mut completion: Option<Result<(), BlockError>> = None;
 
-        while timeout > 0 && completion.is_none() {
+        while wait_should_continue(completion.is_none(), self.queue.is_fatal(), wait.expired()) {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -1891,7 +2091,7 @@ impl BlockDevice for VirtioBlkDevice {
                     }
                     Some(RequestCompletion::Io(_)) => {
                         // Unexpected I/O completion during flush wait
-                        kprintln!(
+                        klog!(Error,
                             "[virtio-blk] unexpected I/O completion while waiting for flush head={}",
                             desc0
                         );
@@ -1906,10 +2106,8 @@ impl BlockDevice for VirtioBlkDevice {
                 break;
             }
 
-            if !self.queue.has_used() {
-                core::hint::spin_loop();
-                timeout -= 1;
-            }
+            let _ = wait.spend();
+            core::hint::spin_loop();
         }
 
         // R39-1 FIX: Handle timeout by marking request as abandoned
@@ -1924,10 +2122,24 @@ impl BlockDevice for VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                kprintln!(
-                    "[virtio-blk] flush timeout head={}, buffers pinned (reset required, total leaked={})",
-                    desc0, leaked
-                );
+                let spins_spent = wait.spins_spent();
+                if self.queue.is_fatal() {
+                    klog!(
+                        Error,
+                        "[virtio-blk] flush aborted by used-ring quarantine head={} spins={}, buffers pinned (reset required, total leaked={})",
+                        desc0,
+                        spins_spent,
+                        leaked
+                    );
+                } else {
+                    klog!(
+                        Error,
+                        "[virtio-blk] flush wait budget expired head={} spins={}, buffers pinned (reset required, total leaked={})",
+                        desc0,
+                        spins_spent,
+                        leaked
+                    );
+                }
                 // R106-3: Attempt device reset to recover resources.
                 let _ = self.reset_device(&_lock);
                 return Err(BlockError::Io);
@@ -1968,5 +2180,176 @@ impl BlockDevice for VirtioBlkDevice {
         }
 
         Err(BlockError::Offline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn wait_budget_is_monotonic_and_bounded() {
+        // The synchronous request watchdog is a no-progress iteration budget:
+        // it must not expire before the budget is spent, must expire exactly
+        // when it is spent, must report a monotonic used count, and must never
+        // be revived by a further spend.
+        assert!(
+            REQUEST_WAIT_MAX_SPINS >= 10_000_000,
+            "request watchdog budget must stay far above observed healthy latencies"
+        );
+
+        let mut wait = RequestWait::start();
+        assert_eq!(wait.spins_spent(), 0);
+        assert!(!wait.expired());
+        assert!(wait.spend());
+        assert_eq!(wait.spins_spent(), 1);
+
+        // Spend the remainder; the last iteration is accepted, then the budget
+        // is spent and every later iteration reports exhausted.
+        while wait.spend() {}
+        assert!(wait.expired());
+        assert_eq!(wait.spins_spent(), REQUEST_WAIT_MAX_SPINS);
+        assert!(!wait.spend());
+        assert!(wait.expired());
+        assert_eq!(wait.spins_spent(), REQUEST_WAIT_MAX_SPINS);
+
+        // An exhausted budget is terminal for the wait predicate.
+        assert!(!wait_should_continue(true, false, wait.expired()));
+
+        // Request kind naming is part of the attribution contract.
+        assert_eq!(request_op_name(true), "write");
+        assert_eq!(request_op_name(false), "read");
+    }
+
+    /// Build a queue whose used ring lives in host memory, so the drain policy
+    /// can be exercised without a physical/DMA direct-map.
+    fn queue_with_pending_completion(
+        size: u16,
+        used_idx: u16,
+        first_id: u32,
+    ) -> (VirtQueue, Vec<u64>) {
+        use crate::virtio::{VringUsed, VringUsedElem};
+
+        // VringUsed is a 4-byte header followed by size 8-byte elements;
+        // backing it with u64 keeps the test allocation 8-byte aligned, the
+        // same alignment the DMA-backed ring has in the kernel.
+        let used_bytes = 4 + 8 * size as usize + 2;
+        let mut used_mem = vec![0u64; used_bytes.div_ceil(8)];
+        let used = used_mem.as_mut_ptr() as *mut VringUsed;
+        // SAFETY: used_mem covers the header plus size ring elements and
+        // outlives the returned queue at every call site.
+        unsafe {
+            (*used).idx = used_idx;
+            (*used).ring.as_mut_ptr().write(VringUsedElem {
+                id: first_id,
+                len: 512,
+            });
+        }
+
+        let queue = VirtQueue {
+            size,
+            notify_off: 0,
+            desc: core::ptr::null_mut(),
+            avail: core::ptr::null_mut(),
+            used,
+            free_head: AtomicU16::new(0),
+            free_list: Mutex::new(Vec::new()),
+            alloc_bitmap: Mutex::new(Vec::new()),
+            last_used_idx: AtomicU16::new(0),
+            desc_phys: 0,
+            avail_phys: 0,
+            used_phys: 0,
+            fatal: AtomicBool::new(false),
+        };
+        (queue, used_mem)
+    }
+
+    #[test]
+    fn quarantined_queue_stops_draining_and_ends_the_wait() {
+        // A live ring hands its pending completion to the wait loop.
+        let (queue, _used_mem) = queue_with_pending_completion(8, 1, 3);
+        assert!(!queue.is_fatal());
+        assert_eq!(queue.pop_used().map(|elem| elem.id), Some(3));
+        assert!(queue.pop_used().is_none());
+
+        // R189-1: a quarantined ring must yield nothing to the drain loop.
+        // Otherwise every poll iteration re-reads the malformed
+        // device-controlled state and re-emits its release-visible SECURITY
+        // diagnostic until the budget expires, with the device lock held.
+        let (queue, _used_mem) = queue_with_pending_completion(8, 1, 3);
+        queue.fatal.store(true, Ordering::Release);
+        assert!(queue.pop_used().is_none());
+
+        // The wait predicate mirrors its call sites: the first argument is the
+        // *pending* state (`completion.is_none()`). Inverting it would abandon
+        // every healthy request before the first poll, which is exactly the
+        // regression this oracle now pins.
+        assert!(
+            wait_should_continue(true, false, false),
+            "a pending request on a live ring with a fresh budget must keep waiting"
+        );
+
+        // Completion, quarantine and budget expiry are each terminal.
+        assert!(!wait_should_continue(false, false, false));
+        assert!(!wait_should_continue(true, true, false));
+        assert!(!wait_should_continue(true, false, true));
+        assert!(!wait_should_continue(false, true, true));
+    }
+
+    #[test]
+    fn unreconcilable_completions_quarantine_instead_of_looping_the_drain() {
+        use crate::virtio::{VringUsed, VringUsedElem};
+
+        // A live ring hands its completion to the drain loop.
+        let (queue, mut used_mem) = queue_with_pending_completion(8, 1, 3);
+        let head = queue
+            .pop_used()
+            .expect("a live ring yields its pending completion")
+            .id;
+        assert_eq!(head, 3);
+        assert!(!queue.is_fatal());
+
+        // The drain's policy for a completion whose head matches no in-flight
+        // request is quarantine.  Skipping it instead was the pre-R189-2
+        // behaviour, and it is not safe: the inner drain charges no watchdog
+        // budget, so a device that keeps publishing in-bounds but unknown heads
+        // keeps the drain, the device lock and the release-visible diagnostic
+        // busy forever instead of failing closed into the reset path.
+        let mut wait = RequestWait::start();
+        queue.reject_unknown_completion(head);
+        assert!(queue.is_fatal());
+
+        // A device that keeps publishing cannot restart the drain: the fatal
+        // short-circuit runs before any device-controlled state is read.
+        // SAFETY: `used_mem` backs this queue's used ring for the whole test and
+        // has room for two entries (size = 8).
+        unsafe {
+            let used = used_mem.as_mut_ptr() as *mut VringUsed;
+            (*used).idx = (*used).idx.wrapping_add(1);
+            (*used)
+                .ring
+                .as_mut_ptr()
+                .add(1)
+                .write(VringUsedElem { id: 7, len: 512 });
+        }
+
+        // Reproduce the production iteration shape: the drain ends without
+        // yielding anything, the iteration is charged once exactly like
+        // `do_request`/`flush` charge after the drain (the real diagnostic
+        // therefore reports one spent iteration, not zero), and the predicate
+        // then ends the wait.
+        let mut drained = 0usize;
+        while queue.pop_used().is_some() {
+            drained += 1;
+            assert!(drained < 2, "a quarantined ring must stop draining");
+        }
+        assert_eq!(drained, 0);
+        assert!(wait.spend());
+        assert_eq!(wait.spins_spent(), 1);
+        assert!(
+            !wait_should_continue(true, queue.is_fatal(), wait.expired()),
+            "an unreconcilable completion must end the wait instead of draining on"
+        );
     }
 }

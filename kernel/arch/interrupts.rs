@@ -1218,13 +1218,9 @@ extern "x86-interrupt" fn page_fault_handler(
                     return; // COW resolved, resume execution
                 }
                 kernel_core::fork::CowFaultResult::Busy => {
-                    // PT_LOCK contended. Returning re-executes the faulting
-                    // instruction; the page is still read-only so the write
-                    // re-faults. IRETQ restores IF=1 on the way out, so the
-                    // lock holder's TLB-shootdown IPI is serviced between
-                    // attempts — that is what makes this terminate rather than
-                    // livelock, and it is also why we must NOT spin here with
-                    // interrupts disabled.
+                    // Returning retries the faulting instruction. Ring-3
+                    // restores IF=1; guarded usercopy can restore IF=0, so
+                    // service shootdown progress explicitly below.
                     let cpu = cpu_local::current_cpu_id();
                     if mm::pt_lock_owner_cpu() == Some(cpu) {
                         panic!(
@@ -1232,6 +1228,13 @@ extern "x86-interrupt" fn page_fault_handler(
                             fault_addr, pid
                         );
                     }
+                    // A usercopy SMAP guard saves IF=0. Service this CPU's
+                    // lock-free shootdown mailbox explicitly before retrying:
+                    // the PT_LOCK holder may be waiting for our acknowledgement.
+                    // #PF already cleared AC and keeps IRQs disabled, satisfying
+                    // the mailbox's single-consumer contract. The pending IPI
+                    // will later drain an empty queue and send its normal EOI.
+                    mm::tlb_shootdown::handle_shootdown_ipi();
                     // Ordinary cross-CPU contention is never user-fatal. Return
                     // through IRETQ so interrupts and scheduling make progress,
                     // then retry the still-read-only instruction without a budget.
@@ -1260,6 +1263,47 @@ extern "x86-interrupt" fn page_fault_handler(
     //
     // 如果缺页发生在 usercopy 的受控访问指令上（RIP 命中异常表），将 RIP 重定向到
     // fixup 代码，让 usercopy helper 返回错误，从而让 syscall 返回 EFAULT。
+    // ST-K2-P2: demand-install an unfaulted shared-anonymous page. Shared
+    // read-only write violations remain ordinary protection faults; only a
+    // non-present access reaches this arm. Contention retries through IRETQ,
+    // matching the COW fault contract.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+        if let Some(pid) = kernel_core::process::current_pid() {
+            match unsafe { kernel_core::fork::handle_shared_page_fault(pid, fault_addr) } {
+                kernel_core::fork::SharedFaultResult::Handled => return,
+                kernel_core::fork::SharedFaultResult::Busy => {
+                    assert_ne!(
+                        mm::pt_lock_owner_cpu(),
+                        Some(cpu_local::current_cpu_id()),
+                        "same-CPU PT_LOCK reentry during shared fault"
+                    );
+                    #[cfg(feature = "syscall_test")]
+                    if kernel_core::fork::take_shared_fault_busy_usercopy_probe_hit() {
+                        assert_eq!(stack_frame.code_segment.0 & 3, 0);
+                        assert!(!stack_frame
+                            .cpu_flags
+                            .contains(x86_64::registers::rflags::RFlags::INTERRUPT_FLAG));
+                        // The test diagnostic must not acquire a console lock
+                        // from #PF. The saved frame, not the handler's IF=0,
+                        // proves IRETQ will retry with interrupts disabled.
+                        unsafe { serial_write_str("ST-K2-FORCED-BUSY-USERCOPY-IF0\n") };
+                    }
+                    mm::tlb_shootdown::handle_shootdown_ipi();
+                    return;
+                }
+                kernel_core::fork::SharedFaultResult::NotShared => {}
+                kernel_core::fork::SharedFaultResult::Fatal(reason) => {
+                    klog_force!(
+                        "ST-K2: shared fault resolution failed at {:#x} (pid {}): {:?}",
+                        fault_addr,
+                        pid,
+                        reason
+                    );
+                }
+            }
+        }
+    }
+
     if usercopy::try_handle_usercopy_fault(fault_addr) {
         let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
         if let Some(fixup_ip) = exception_table::lookup(fault_ip) {

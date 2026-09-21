@@ -693,7 +693,9 @@ mod tests {
     }
 
     fn map_b(_: DomainId, _: u64, _: u64, _: usize, _: bool) -> Result<(), DmaError> {
-        Ok(())
+        // Give the conflicting hook different behavior: optimized builds may
+        // merge identical functions, so two names alone do not prove conflict.
+        Err(DmaError::IommuMapRejected)
     }
 
     fn unmap_a(_: DomainId, _: u64, _: usize) -> Result<(), DmaError> {

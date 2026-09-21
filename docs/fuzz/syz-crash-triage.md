@@ -1,6 +1,7 @@
 # Syzkaller-Style Fuzz Crash Triage — 2026-08-16 (run 31930556648)
 
-**Run:** `Syzkaller-Style Fuzzing` workflow_dispatch, commit `da779c4`, all 16 steps green.
+**Historical run:** the retired `Syzkaller-Style Fuzzing` workflow_dispatch at
+commit `da779c4`, all 16 steps green.
 **Crashes observed:** 11 `crash-*.bin` files (artifact `syzkaller-crashes-3`, 1962 B).
 **Verdict: all 11 are SPURIOUS.** They are boot-time kernel integration-test panics,
 not bugs found by the fuzz program. The fuzz program never executed in any crash run.

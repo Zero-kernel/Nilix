@@ -25,7 +25,6 @@
 //! - Linux netfilter/iptables conceptual model
 //! - RFC 5765: Security threats and solutions for connections states
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -33,8 +32,10 @@ use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use spin::RwLock;
 
+use crate::admitted::AdmittedMap;
 use crate::conntrack::CtDecision;
 use crate::ipv4::{Ipv4Addr, Ipv4Proto};
+use mm::HeapClass;
 
 // ============================================================================
 // Firewall Statistics
@@ -648,7 +649,8 @@ fn default_rules_try() -> Option<Vec<FirewallRule>> {
 /// a `NetNamespace` is dropped, so the map size tracks live namespaces, not
 /// cumulative namespace IDs. Each namespace gets its own rule set, ensuring
 /// that DROP/ALLOW rules in one namespace do not affect other namespaces.
-static FIREWALL_TABLES: RwLock<BTreeMap<u64, Arc<FirewallTable>>> = RwLock::new(BTreeMap::new());
+static FIREWALL_TABLES: RwLock<AdmittedMap<u64, Arc<FirewallTable>>> =
+    RwLock::new(AdmittedMap::new(HeapClass::SocketObject));
 
 /// Get (and lazily initialize) the firewall table for a specific network namespace.
 ///
@@ -677,7 +679,10 @@ pub fn try_firewall_table_for_ns(ns_id: u64) -> Option<Arc<FirewallTable>> {
 
     let rules = default_rules_try()?;
     let table = Arc::try_new(FirewallTable::new_with_rules(FirewallAction::Drop, rules)).ok()?;
-    guard.insert(ns_id, Arc::clone(&table));
+    // Reserve and charge map backing before publication.  Ingress therefore
+    // sees `None` under heap pressure instead of an allocator abort from an
+    // infallible BTreeMap insertion.
+    guard.try_insert(ns_id, Arc::clone(&table)).ok()?;
     Some(table)
 }
 

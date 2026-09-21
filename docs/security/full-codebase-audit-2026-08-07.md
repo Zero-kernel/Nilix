@@ -540,3 +540,17 @@ authoritative per-round status remains in `docs/review/audits/`; the live plan i
 **Git:** No commits or pushes performed (manual-only per project policy).
 
 *Authored 2026-08-07. Standalone full-codebase security audit of the Nilix kernel under Safety > Correctness > Efficiency > Performance with mandatory defense-in-depth and fail-closed defaults.*
+
+## 15. R188 review-fix reconciliation (2026-09-13)
+
+The dated review-fix report [`reviewfix-2026-09-13`](../review/reviewfix/reviewfix-2026-09-13.md)
+reconciles all 131 original findings against current source and independent
+review. It records 123 PASS, 3 PARTIAL, no FAIL, and 5 verification-pending
+rows. Four targeted RF188 repairs cover virtio queue and RX recovery paths;
+focused malformed-device tests remain pending. U16-1 retains a
+cross-namespace hashed-lane collision residual. U23-1/U23-2 retain the
+CorruptState admission-ledger/Drop panic concern pending the P0-A mechanism
+review. U34-1 lacks a live robust-futex walk/fault/wakeup oracle. U37-1,
+U55-6, and U29-3 remain the explicit KPTI, early-boot W+X, and future
+VM-passthrough limits. This reconciliation does not advance the R-series clean
+streak or close R186-4/P0-A.

@@ -342,6 +342,39 @@ static void stat_abi_smoke(void) {
     }
 }
 
+// Shared-anonymous demand-paging smoke. This is intentionally a real musl
+// consumer: the parent first-touches page zero, the child writes both the
+// resident page and a previously absent second page, and the parent verifies
+// visibility before unmapping the region.
+static int shared_mmap_smoke(void) {
+    const size_t len = 8192;
+    unsigned char *shared = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("MUSL-SHARED-MMAP-FAIL stage=mmap errno=%d\n", errno);
+        return 1;
+    }
+    shared[0] = 0x11;
+    pid_t child = (pid_t)syscall(SYS_fork);
+    if (child == 0) {
+        if (shared[0] != 0x11) syscall(SYS_exit, 121);
+        shared[0] = 0x22;
+        shared[4096] = 0x33;
+        syscall(SYS_exit, 0);
+        __builtin_unreachable();
+    }
+    int status = -1;
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        shared[0] != 0x22 || shared[4096] != 0x33 || munmap(shared, len) != 0) {
+        printf("MUSL-SHARED-MMAP-FAIL stage=visibility errno=%d status=%d\n",
+               errno, status);
+        if (child > 0) syscall(SYS_exit, 122);
+        return 1;
+    }
+    puts("MUSL-SHARED-MMAP-OK");
+    return 0;
+}
 // D2-ABI-STAT-LAYOUT (LOW leg): the kernel must write the full 390-byte Linux
 // new_utsname INCLUDING domainname ("(none)" default). Before the fix the
 // kernel wrote only 325 bytes, leaving domainname as stale caller memory —
@@ -386,6 +419,7 @@ int main(int argc, char *argv[]) {
     // Test 8 (D2-ABI-STAT-LAYOUT LOW leg): full new_utsname write.
     uname_abi_smoke();
 
+    if (shared_mmap_smoke()) return 1;
     if (standard_fd_smoke() || robust_usercopy_smoke()) return 1;
     if (fcntl_limit_smoke()) return 1;
     if (exit_idle_smoke()) return 1;

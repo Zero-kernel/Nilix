@@ -32,6 +32,32 @@ pub enum AdmittedAllocError {
     CapacityInvariant,
 }
 
+/// Error returned when adopting a pre-allocated map backing fails.
+///
+/// Keeping the reservation alongside the returned backing lets callers drop
+/// the allocation before its admission is released, preserving the global
+/// backing-before-charge ordering on every ordinary constructor error path.
+pub struct AdmittedMapBuildError<K: Ord, V> {
+    /// The detached backing supplied to the constructor.
+    entries: Vec<(K, V)>,
+    /// The armed reservation, when construction failed before commit.
+    reservation: Option<HeapReservation>,
+    /// The construction failure.
+    error: AdmittedAllocError,
+}
+
+impl<K: Ord, V> AdmittedMapBuildError<K, V> {
+    #[inline]
+    pub fn error(&self) -> AdmittedAllocError {
+        self.error
+    }
+
+    #[inline]
+    pub fn into_parts(self) -> (Vec<(K, V)>, Option<HeapReservation>, AdmittedAllocError) {
+        (self.entries, self.reservation, self.error)
+    }
+}
+
 impl From<HeapAdmissionError> for AdmittedAllocError {
     #[inline]
     fn from(error: HeapAdmissionError) -> Self {
@@ -992,52 +1018,96 @@ impl<K: Ord, V> AdmittedMap<K, V> {
         self.map.range_mut(range)
     }
 
-    /// R186-4 FIX: Construct an AdmittedMap from a pre-sorted Vec with upfront heap admission.
+    /// Construct an AdmittedMap from a pre-sorted Vec with upfront heap admission.
     /// This is the charged analogue of FallibleOrderedMap::from_sorted_vec, used by fork to
     /// construct the child's mmap_regions and pt_charged_frames with capacity-based charging.
     ///
     /// The charge is computed as `entries.capacity() * size_of::<(K, V)>()` and reserved from
     /// `class` BEFORE constructing the map. On success, the map owns the charge and will release
-    /// it on Drop. On admission failure, returns the original Vec so the caller can roll back.
+    /// it on Drop. On failure, returns the original Vec and (when still armed)
+    /// its reservation so the caller can destroy the backing before releasing
+    /// admission.
     ///
     /// INVARIANT: `entries` must be sorted strictly-ascending by key (same as from_sorted_vec).
     pub fn from_sorted_vec_charged(
-        mut entries: Vec<(K, V)>,
+        entries: Vec<(K, V)>,
         class: HeapClass,
-    ) -> Result<Self, (Vec<(K, V)>, AdmittedAllocError)> {
-        // FIX: Shrink to fit before charging to prevent fork capacity amplification
-        // (R186-4 convergence issue #1)
-        // This eliminates spare capacity that would be charged but unused in child process.
-        entries.shrink_to_fit();
-
+    ) -> Result<Self, AdmittedMapBuildError<K, V>> {
         let capacity_bytes = match vec_charge_bytes::<(K, V)>(entries.capacity()) {
             Ok(bytes) => bytes,
-            Err(error) => return Err((entries, error.into())),
-        };
-        match try_reserve(class, capacity_bytes) {
-            Ok(reservation) => {
-                // FIX: Propagate error instead of panicking (R186-4 convergence issue #2)
-                let charge = match reservation.commit() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        // Commit failed - return the Vec so caller can clean up
-                        return Err((entries, AdmittedAllocError::CapacityInvariant));
-                    }
-                };
-                let map = FallibleOrderedMap::from_sorted_vec(entries);
-                Ok(Self {
-                    map,
-                    charge: Some(charge),
-                    class,
+            Err(error) => {
+                return Err(AdmittedMapBuildError {
+                    entries,
+                    reservation: None,
+                    error: error.into(),
                 })
             }
+        };
+        let reservation = match try_reserve(class, capacity_bytes) {
+            Ok(reservation) => reservation,
             Err(error) => {
-                // FIX: The reservation was never committed, so no charge to release
-                // (R186-4 convergence issue #3 - original review was incorrect here)
-                // try_reserve fails BEFORE commit, so no leak occurs
-                Err((entries, error.into()))
+                return Err(AdmittedMapBuildError {
+                    entries,
+                    reservation: None,
+                    error: error.into(),
+                })
             }
+        };
+        Self::from_sorted_vec_with_reservation(entries, reservation)
+    }
+
+    /// Adopt a pre-allocated, pre-sorted Vec using a reservation acquired
+    /// before its allocation. The reservation is resized to the allocator's
+    /// actual capacity, then committed exactly once as the map's lifetime
+    /// charge. This hand-off is used by fork so admission precedes the
+    /// snapshot allocation without double-reserving the same backing. Errors
+    /// return an owner containing the Vec and armed reservation; callers must
+    /// drop the Vec before that reservation.
+    pub fn from_sorted_vec_with_reservation(
+        entries: Vec<(K, V)>,
+        mut reservation: HeapReservation,
+    ) -> Result<Self, AdmittedMapBuildError<K, V>> {
+        if entries.windows(2).any(|window| window[0].0 >= window[1].0) {
+            return Err(AdmittedMapBuildError {
+                entries,
+                reservation: Some(reservation),
+                error: AdmittedAllocError::CapacityInvariant,
+            });
         }
+        let capacity_bytes = match vec_charge_bytes::<(K, V)>(entries.capacity()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Err(AdmittedMapBuildError {
+                    entries,
+                    reservation: Some(reservation),
+                    error: error.into(),
+                })
+            }
+        };
+        if let Err(error) = reservation.resize(capacity_bytes) {
+            return Err(AdmittedMapBuildError {
+                entries,
+                reservation: Some(reservation),
+                error: error.into(),
+            });
+        }
+        let class = reservation.class();
+        let charge = match reservation.commit() {
+            Ok(charge) => charge,
+            Err(error) => {
+                return Err(AdmittedMapBuildError {
+                    entries,
+                    reservation: None,
+                    error: error.into(),
+                })
+            }
+        };
+        let map = FallibleOrderedMap::from_sorted_vec(entries);
+        Ok(Self {
+            map,
+            charge: Some(charge),
+            class,
+        })
     }
 
     fn prepare_target(
@@ -1096,10 +1166,22 @@ impl<K: Ord, V> AdmittedMap<K, V> {
             .reservation
             .commit()
             .map_err(|_| AdmittedAllocError::CapacityInvariant)?;
-        let retired_backing = self
-            .map
-            .replace_backing_deferred(prepared.backing)
-            .unwrap_or_else(|_| panic!("validated admitted map backing rejected"));
+        // The capacity/class checks above dominate the fallible map guard for
+        // safe callers, but keep the error path explicit so a corrupted map
+        // cannot turn an allocation-free publication into a kernel panic.
+        // Dropping the replacement charge rolls the committed reservation
+        // back before the unchanged live map is returned to its caller.
+        let retired_backing = match self.map.replace_backing_deferred(prepared.backing) {
+            Ok(retired) => retired,
+            Err(_prepared) => {
+                // Deallocate the detached backing before releasing its
+                // committed charge; the ledger must never under-account live
+                // allocator storage, even on this invariant-failure path.
+                drop(_prepared);
+                drop(replacement_charge);
+                return Err(AdmittedAllocError::CapacityInvariant);
+            }
+        };
         let old_charge = self.charge.take();
         self.charge = Some(replacement_charge);
         Ok(RetiredAdmittedMapCapacity {
@@ -1124,10 +1206,16 @@ impl<K: Ord, V> AdmittedMap<K, V> {
             charge,
             class: _,
         } = retired;
-        let displaced_backing = self
-            .map
-            .replace_backing_deferred(backing)
-            .unwrap_or_else(|_| panic!("validated rollback backing rejected"));
+        let displaced_backing = match self.map.replace_backing_deferred(backing) {
+            Ok(displaced) => displaced,
+            Err(backing) => {
+                return Err(RetiredAdmittedMapCapacity {
+                    backing,
+                    charge,
+                    class: self.class,
+                });
+            }
+        };
         let displaced_charge = core::mem::replace(&mut self.charge, charge);
         Ok(RetiredAdmittedMapCapacity {
             backing: displaced_backing,
@@ -1241,10 +1329,18 @@ impl<K: Ord, V> AdmittedMap<K, V> {
         if !self.map.is_empty() || self.map.capacity() == 0 {
             return None;
         }
-        let retired_backing = self
+        // An empty map always satisfies the backing guard for safe callers.
+        // Keep the unexpected mismatch fail-closed and allocation-free rather
+        // than converting a corrupted ledger/map state into a kernel panic;
+        // retaining the live backing also preserves its charge for a later
+        // recovery or diagnostic path.
+        let retired_backing = match self
             .map
             .replace_backing_deferred(PreparedOrderedMapBacking::empty())
-            .unwrap_or_else(|_| panic!("empty admitted map rejected empty backing"));
+        {
+            Ok(retired) => retired,
+            Err(_empty) => return None,
+        };
         Some(RetiredAdmittedMapCapacity {
             backing: retired_backing,
             charge: self.charge.take(),
@@ -1726,6 +1822,39 @@ mod tests {
             crate::heap_admission::class_snapshot(HeapClass::Scheduler),
             before,
             "safe-context retirement must return the exact lifetime charge"
+        );
+    }
+
+    #[test]
+    fn map_constructor_error_returns_ordered_cleanup_owner() {
+        let _guard = crate::heap_admission::TEST_LEDGER_LOCK.lock();
+        crate::heap_admission::publish();
+        let before = crate::heap_admission::class_snapshot(HeapClass::Procfs);
+
+        let mut entries = alloc::vec::Vec::new();
+        entries.try_reserve_exact(2).expect("constructor input");
+        entries.push((2usize, 20usize));
+        entries.push((1usize, 10usize));
+        let bytes = crate::heap_admission::vec_charge_bytes::<(usize, usize)>(entries.capacity())
+            .expect("constructor charge");
+        let reservation = crate::heap_admission::try_reserve(HeapClass::Procfs, bytes)
+            .expect("constructor reservation");
+
+        let error = match AdmittedMap::from_sorted_vec_with_reservation(entries, reservation) {
+            Ok(_) => panic!("unsorted constructor input unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error(), AdmittedAllocError::CapacityInvariant);
+        let (entries, reservation, _) = error.into_parts();
+        assert!(reservation.is_some());
+        // Preserve the backing-before-charge contract required by the error
+        // owner: destroy the Vec first, then release its reservation.
+        drop(entries);
+        drop(reservation);
+        assert_eq!(
+            crate::heap_admission::class_snapshot(HeapClass::Procfs),
+            before,
+            "constructor error owner must restore admission exactly"
         );
     }
 }

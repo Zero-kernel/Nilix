@@ -260,11 +260,14 @@ const LAPIC_TIMER_DEFAULT_INIT_COUNT: u32 = 0x10000;
 static LAPIC_TIMER_INIT_COUNT: AtomicU32 = AtomicU32::new(LAPIC_TIMER_DEFAULT_INIT_COUNT);
 
 // ============================================================================
-// PIT Channel 2 Calibration Constants
+// PIT runtime clock (channel 0) and calibration reference (channel 2)
 // ============================================================================
 
-/// PIT base frequency (Hz) used for LAPIC calibration
+/// PIT input frequency (Hz).
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
+const PIT_CHANNEL0_DATA_PORT: u16 = 0x40;
+// Nearest divisor: 1000.153 Hz, about 153 ppm above the nominal 1 ms tick.
+const PIT_TICK_DIVISOR: u16 = ((PIT_FREQUENCY_HZ + 500) / 1000) as u16;
 /// PIT command port
 const PIT_COMMAND_PORT: u16 = 0x43;
 /// PIT channel 2 data port (used as gate timer)
@@ -279,6 +282,30 @@ const PIT_CHANNEL2_SPEAKER_BIT: u8 = 1 << 1;
 const PIT_CHANNEL2_OUT_BIT: u8 = 1 << 5;
 /// Calibration window length in milliseconds
 const LAPIC_CALIBRATION_WINDOW_MS: u32 = 10;
+
+/// Establish the BSP's nominal millisecond tick independently of firmware.
+/// Channel 0 continues to use IRQ0 -> PIC -> BSP LINT0 (ExtINT); the BSP's
+/// LAPIC timer stays masked, so each IRQ advances the global clock only once.
+///
+/// # Safety
+/// Call once on the BSP during boot, before AP startup and enabling interrupts.
+/// The caller must have exclusive access to the PIT command/data ports.
+pub unsafe fn init_bsp_tick() {
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "init_bsp_tick: interrupts must be disabled"
+    );
+    let mut command = PortWriteOnly::<u8>::new(PIT_COMMAND_PORT);
+    let mut channel0 = PortWriteOnly::<u8>::new(PIT_CHANNEL0_DATA_PORT);
+    // Channel 0, low byte then high byte, mode 3 periodic, binary counter.
+    command.write(0x36);
+    channel0.write(PIT_TICK_DIVISOR as u8);
+    channel0.write((PIT_TICK_DIVISOR >> 8) as u8);
+    klog_always!(
+        "[BSP-TIMER] PIT channel 0: divisor={}, nominal_hz=1000",
+        PIT_TICK_DIVISOR
+    );
+}
 
 // ============================================================================
 // LAPIC Operations
