@@ -1,9 +1,9 @@
 # QEMU fuzz executor `EIO` flake — 2026-09-21
 
 **Date:** 2026-09-21
-**Status:** fix implemented and validated locally/remotely (remote tree `bb828d8`); the affected CI job reruns green on the pre-fix revision
-**Independent review:** PENDING — the delegated reviewer did not receive the task payload in this session, so no independent verdict is claimed; the tables below are self-validation plus self-review only
-**Code commit:** `bb828d8` — `fix(block): attribute virtio-blk failures and wait on a TSC deadline`
+**Status:** fix implemented and validated on the devbox (remote tree `4c19b99`, QEMU/TCG smoke green); the affected CI job also reruns green on the pre-fix revision
+**Independent review:** PENDING - a delegated read-only reviewer is still running, so no independent verdict is claimed and sections 4-5 are self-validation plus self-review only
+**Code commit:** `4c19b99` - `fix(block): run the synchronous virtio-blk waits again`, on top of `bb828d8` (attribution), `3b709d4` (quarantine short-circuit) and `49d0db3` (no-progress budget)
 **Scope:** `kernel/block` virtio-blk synchronous request path; no filesystem semantics change
 
 ---
@@ -98,36 +98,104 @@ filesystem correctly reports as a fail-closed I/O error to `open()`/`write()`.
 
 `kernel/block/src/virtio/blk.rs`:
 
-1. **Wall-clock watchdogs.** Both synchronous wait loops (`do_request`, `flush`)
-   now poll against a wrap-safe monotonic TSC deadline
-   (`REQUEST_WAIT_TIMEOUT_CYCLES = 30_000_000_000`, i.e. at least ~6 s of real
-   time on any CPU up to 5 GHz and longer on slower/TCG parts). Requests are only
-   abandoned, and the device only reset, after a latency that no plausible host
-   I/O can reach.
+1. **Monotonic no-progress watchdog.** Both synchronous wait loops (`do_request`,
+   `flush`) now poll against a monotonic iteration budget
+   (`REQUEST_WAIT_MAX_SPINS = 50_000_000` no-progress polls, i.e. ~1900x the
+   worst healthy latency measured on the devbox: 26,594 polls for a read/write
+   and 22,653 for a flush). The budget needs no clock. A wall-clock deadline was
+   implemented first and dropped again - see section 4b for why, and for the
+   predicate regression that had to be fixed before either design could work.
 2. **Release-visible attribution.** All 19 driver diagnostics that previously used
    `kprintln!` now use `klog!(Error|Warn, ...)`; the expiry messages additionally
-   carry the elapsed cycle count. `completion.rs` logs the raw device status byte
+   carry the spent poll count. `completion.rs` logs the raw device status byte
    for every non-`OK` completion, and the DMA bounce-buffer allocation failures log
    the request kind, sector and byte count before returning `NoMem`.
+3. **Quarantined-ring short-circuit.** Independent review of `bb828d8` found that
+   the release-visible SECURITY diagnostics in `pop_used` were re-emitted once per
+   poll iteration after a used-ring violation quarantined the queue, and that the
+   same bump removed the last caller of the fatal-aware `has_used()` guard.
+   `pop_used` now returns `None` immediately while `fatal` is set, both
+   synchronous waits end as soon as the queue is quarantined (reporting
+   `... aborted by used-ring quarantine ...`), and the wait no longer holds the
+   device lock for the whole budget before the reset.
 
 `scripts/tools/hosted_subcrate_tests.sh` raises the `block` exact-count oracle from
-22 to 23 for the new unit test;
+22 to 24 (watchdog oracle plus used-ring quarantine oracle);
+
+## 4b. The R189-1 predicate regression, and why the watchdog is still a counter (2026-09-21)
+
+**The regression.** The used-ring quarantine fix (`3b709d4`) factored the wait
+condition into
+
+```rust
+fn wait_should_continue(completed: bool, quarantined: bool, budget_expired: bool) -> bool {
+    !completed && !quarantined && !budget_expired
+}
+```
+
+but kept the call sites passing `completion.is_none()`:
+
+```rust
+while wait_should_continue(completion.is_none(), self.queue.is_fatal(), wait.expired()) {
+```
+
+which is false on entry: `completion.is_none()` is true, and the freshly named
+parameter negates it. Both synchronous wait loops therefore skipped their bodies,
+`completion` stayed `None`, and the timeout path abandoned *every* healthy request
+on the first check, reset the device mid-transaction and returned `EIO`. A devbox
+smoke run on that revision failed with
+
+```text
+[virtio-blk] request wait budget expired head=0 sector=262142 bytes=512 cycles=284024, ...
+[virtio-blk] R106-3: initiating device reset for vda
+[virtio-blk] request wait budget expired head=0 sector=2 bytes=1024 cycles=882, ...
+Registered /dev/vda but failed to initialize ext2: Io
+```
+
+Temporary instrumentation of the failure site gave the decisive reading:
+
+```text
+[virtio-blk] diag budget=50000000 left=50000000 spent=0 head=0
+[virtio-blk] diag fatal=false dev_failed=false head=0
+```
+
+`left == budget` with `spent == 0` and `fatal == false` is only reachable when the
+loop body never ran: the watchdog was never charged and the queue was never
+quarantined. The predicate is now `pending && !quarantined && !budget_expired`
+(the first argument is the *pending* state at both call sites), and the quarantine
+oracle asserts that call-site argument shape, so an inversion fails the hosted gate
+instead of reaching QEMU.
+
+**Withdrawn claim.** An earlier revision of this record blamed the same smoke
+failure on RDTSC moving backwards, because `cycles=882` looked impossible for a
+30e9-cycle budget. That inference was wrong: those cycles are simply the time
+between `WaitDeadline::start()` and the timeout path of a skipped loop, i.e. setup
+time. Nothing in this artifact shows this guest's RDTSC is non-monotonic, and no
+clock-based conclusion should be drawn from it.
+
+**Why the final watchdog is still a counter.** The iteration budget is kept over
+the TSC deadline for narrower reasons: it needs no clock assumption at all (the
+only cheap clock on this path is RDTSC), it is charged by the same loop that polls
+the device, and its spent count is directly observable in the release diagnostic
+(`spins=`). It sits ~1900x above the worst healthy latency measured on this devbox
+under TCG.
 
 ## 5. Validation
 
 | check | result |
 |---|---|
-| `cargo test -p block --features mm/host_harness --lib` | 23/23 pass (new `wait_budget_is_monotonic_and_wrap_safe`) |
-| `cd kernel && cargo clippy --release --target x86_64-unknown-none -Z build-std=...` | exit 0 (no new warnings) |
+| `cargo test -p block --features mm/host_harness --lib` | 24/24 pass (`wait_budget_is_monotonic_and_bounded`, `quarantined_queue_stops_draining_and_ends_the_wait`) |
+| `cd kernel && cargo clippy --release --target x86_64-unknown-none -Z build-std=...` | exit 0 (no new errors; the crate's pre-existing warnings are unchanged) |
 | `cd kernel && cargo check --release --target x86_64-unknown-none -Z build-std=...` | exit 0 |
-| `make lint` (remote tree `bb828d8`) | exit 0 (ABI oracle PASS) |
-| `make test-hosted-subcrates` (remote tree `bb828d8`) | exit 0 — 446 unit tests; `block` 23/23 |
-| `make build-syz-kcov` (remote tree `bb828d8`) | exit 0 — `esp-syz/kernel.elf` sha256 `311d2f2011c4617b3f82bfa1f3a1afc59eb32696d47de416e8f63e84207ec523` |
+| `make lint` (remote tree `4c19b99`) | exit 0 (ABI oracle PASS) |
+| `make test-hosted-subcrates` (remote tree `4c19b99`) | exit 0 - 447 unit tests; `block` 24/24 |
+| `make build-syz-kcov` (remote tree `4c19b99`, `kernel/block/src/virtio/blk.rs` sha256 `ee4fae7f293602146ab115136ea27984d9f9934c896234833e4887bbf0ad03d5`) | exit 0 - `esp-syz/kernel.elf` sha256 `95d46b50c3dc2c6036a9228936f053700ed15194c78e6d2ca4c2d1060ab79850` |
 | `qemu_smoke` with that kernel (remote, TCG) | `QEMU-FUZZ-SMOKE PASS seeds=2`; both guests `NILIX_SYZ_V2_PASS`; zero `virtio-blk` diagnostics on the healthy path |
-| forced short-budget proof (budget temporarily `1_000` cycles, same tree) | release serial log now carries `[virtio-blk] request wait budget expired head=0 sector=2 bytes=1024 cycles=3956 ...` plus `R106-3: initiating device reset` / `reset successful`, and the guest fails closed — the exact attribution that was missing on 2026-09-21 |
+| forced short-budget proof (budget temporarily `1_000` polls, same tree) | release serial carries `[virtio-blk] request wait budget expired head=2 sector=40 bytes=4096 spins=1000 ...` plus `R106-3: initiating device reset` / `reset successful`, and the guest fails closed - the attributed diagnostic the 2026-09-21 artifact was missing |
+| instrumentation of the failure site with the R189-1 predicate regression (trees `3b709d4`, `49d0db3`) | `diag budget=50000000 left=50000000 spent=0 head=0`, `diag fatal=false dev_failed=false`, then `request wait budget expired ... spins=0` - proves the wait loop never polled; see section 4b |
+| remote smoke on the predicate regression (trees `3b709d4`, `49d0db3`) | FAIL - every request abandoned before its first poll, `Registered /dev/vda but failed to initialize ext2: Io` |
 | five repeat smoke runs with the unmodified CI kernel on the devbox | 5/5 PASS (no local reproduction; consistent with a host-latency flake) |
 | CI re-run of the failing job on the same revision (`gh run rerun --failed`) | PASS |
-
 ## 6. Residuals
 
 * The exact expired/aborted operation of the 2026-09-21 failure cannot be attributed
