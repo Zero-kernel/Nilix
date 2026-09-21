@@ -3,7 +3,18 @@
 **Date:** 2026-09-01 (restructured same-day after the lens round; user-confirmed)
 **Plan item / Finding:** ST-K2 (P1, Preview-blocking; Phase 1 hoisted to directly after ST-K3's fix [user order repair]; Phase 2 blocks stress `smp`) — `docs/review/nextplan/next-phase-plan-2026-09-01.md`; origin `docs/stress-gate-status.md` §6 K2
 **Status:** Phase 1 and the shared-anonymous demand path are implemented in the current tree (2026-09-13). Shared VMAs use an admitted side-map with bounded page slots; first user/usercopy faults charge and map a zeroed page; fork inherits region Arcs and writable shared leaves; munmap/exec/exit drop regions after page-table teardown. The exact final source is remotely verified on `40c-devbox-ts` in `/tmp/zero-os-codex-final-20260913`: MM 26/26, kernel-core 68/68, hosted allowlist, build and lint pass; runtime/boot/4-core SMP are zero-failure qualified. Guest usercopy/teardown/failure coverage and musl markers remain explicit limits.
-**Current handoff:** [source refresh](next-handoff-2026-09-12.md#4-st-k2-p1--honest-mmap-flags-and-usable-stress-reports) preserves the two phases and first-toucher decision, while requiring the current RF180-20/COW/usercopy ownership paths to be reconciled before Phase 2.
+**Current follow-up (2026-09-20):** [shared fault lifecycle design](st-k2-shared-fault-lifecycle-design.md)
+supersedes the historical `charged_bytes` amendment below: that claimed repair is absent
+from baseline `6f072978` and would wrongly tie PT accounting to region lifetime. The
+current repair uses an independently reserved per-AS PT identity ledger, VMA transaction
+exclusion, pre-charge repeated-fault recognition, unconditional shootdown for removed
+shared leaves, and a local shootdown-mailbox drain before Busy retry. Both independent
+design/change review and guest oracles (including migration and VFS rmdir) are recorded
+in the follow-up. The 2026-09-21 verification has 13 PASS plus one PTE-only EFAULT SKIP,
+an exact quiescent last-region refcount/buddy/charge probe, local forced Busy/saved-IF=0
+retry and a dedicated shared-mmap musl marker. Full acceptance remains pending for
+preflight repair, actual same-CPU exception/cross-CPU contention, lifetime races and rollback limits.
+**Earlier handoff:** [source refresh](next-handoff-2026-09-12.md#4-st-k2-p1--honest-mmap-flags-and-usable-stress-reports) preserves the two phases and first-toucher decision, while requiring the current RF180-20/COW/usercopy ownership paths to be reconciled before Phase 2.
 **Mode:** MODE S (Codex MCP absent; premise/safety/edge lenses ran 2026-09-01; mechanism amendments folded in)
 **Designed by:** stage 4 next-phase (grilling)
 **User confirmation:** confirmed 2026-09-01 (Q-FINAL; Decision Record rows 1-4 individually confirmed same day)
