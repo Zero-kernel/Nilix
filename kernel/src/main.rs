@@ -859,6 +859,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
 
+        // BSP-TIMER-1: calibration only programs channel 2. Program IRQ0's
+        // channel 0 explicitly; firmware commonly leaves it at just 18.2 Hz.
+        unsafe {
+            arch::apic::init_bsp_tick();
+        }
+
         // Initialize BSP's per-CPU data
         // Get kernel stack top from GDT (set during arch::interrupts::init)
         let kernel_stack_top = arch::default_kernel_stack_top() as usize;

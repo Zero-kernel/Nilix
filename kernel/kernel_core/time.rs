@@ -148,8 +148,9 @@ pub fn get_ticks() -> u64 {
 
 /// 获取当前时间戳（毫秒）
 ///
-/// 假设时钟中断频率为 1000Hz（每毫秒一次）
-/// 如果实际频率不同，需要相应调整
+/// BSP PIT channel 0 is programmed for a nominal 1000 Hz; AP ticks do not
+/// advance this counter. This is serviced-tick time, not an independent wall
+/// clock: long IRQ-disabled intervals can coalesce hardware ticks.
 #[inline]
 pub fn current_timestamp_ms() -> u64 {
     get_ticks()
