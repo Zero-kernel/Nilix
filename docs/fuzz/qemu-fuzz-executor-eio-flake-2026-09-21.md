@@ -1,8 +1,8 @@
 # QEMU fuzz executor `EIO` flake — 2026-09-21
 
 **Date:** 2026-09-21
-**Status:** fix implemented and validated locally/remotely; CI re-run green on the same revision
-**Commit:** `fix(block): attribute virtio-blk failures and wait on a TSC deadline` (hash recorded in the follow-up docs commit)
+**Status:** fix implemented and validated locally/remotely (remote tree `bb828d8`); the affected CI job reruns green on the pre-fix revision
+**Code commit:** `bb828d8` — `fix(block): attribute virtio-blk failures and wait on a TSC deadline`
 **Scope:** `kernel/block` virtio-blk synchronous request path; no filesystem semantics change
 
 ---
@@ -55,8 +55,8 @@ environment/timing dependent, not a deterministic regression.
 | attempt 2 | `s_sequence=5`, `s_start=1` (dirty) | descriptor seq=5 @L1, 4 images, commit seq=5 @L6 |
 | green run | `s_start=0` (clean) | tail commits of seq 7/6/4 |
 
-  The boot probes (R180-6 `alloc.bin` write, create probe, probe write) are
-transactions 1–3, so attempt 1 died inside the executor `open()` transaction
+  Read against the boot probe order (R180-6 `alloc.bin` write, create probe,
+probe write = sequences 1–3), attempt 1 died inside the executor `open()` transaction
 (seq 4) and attempt 2 died inside the first result `write()` transaction (seq 5).
   Both left the journal with a complete descriptor/image/commit chain and an
 uncleared `s_start=1` superblock, i.e. the failure occurred in the *last* phase of
@@ -119,11 +119,13 @@ filesystem correctly reports as a fail-closed I/O error to `open()`/`write()`.
 | `cargo test -p block --features mm/host_harness --lib` | 23/23 pass (new `wait_budget_is_monotonic_and_wrap_safe`) |
 | `cd kernel && cargo clippy --release --target x86_64-unknown-none -Z build-std=...` | exit 0 (no new warnings) |
 | `cd kernel && cargo check --release --target x86_64-unknown-none -Z build-std=...` | exit 0 |
-| `make lint` (devbox, remote tree `800f6b1`) | exit 0 |
-| `make test-hosted-subcrates` (devbox) | pending |
-| `make build-syz-kcov` + `qemu_smoke` with the patched kernel (devbox) | pending |
-| forced short-budget proof that the new diagnostics reach a release serial log | pending |
-| CI re-run of the failing job on the same revision | PASS |
+| `make lint` (remote tree `bb828d8`) | exit 0 (ABI oracle PASS) |
+| `make test-hosted-subcrates` (remote tree `bb828d8`) | exit 0 — 446 unit tests; `block` 23/23 |
+| `make build-syz-kcov` (remote tree `bb828d8`) | exit 0 — `esp-syz/kernel.elf` sha256 `311d2f2011c4617b3f82bfa1f3a1afc59eb32696d47de416e8f63e84207ec523` |
+| `qemu_smoke` with that kernel (remote, TCG) | `QEMU-FUZZ-SMOKE PASS seeds=2`; both guests `NILIX_SYZ_V2_PASS`; zero `virtio-blk` diagnostics on the healthy path |
+| forced short-budget proof (budget temporarily `1_000` cycles, same tree) | release serial log now carries `[virtio-blk] request wait budget expired head=0 sector=2 bytes=1024 cycles=3956 ...` plus `R106-3: initiating device reset` / `reset successful`, and the guest fails closed — the exact attribution that was missing on 2026-09-21 |
+| five repeat smoke runs with the unmodified CI kernel on the devbox | 5/5 PASS (no local reproduction; consistent with a host-latency flake) |
+| CI re-run of the failing job on the same revision (`gh run rerun --failed`) | PASS |
 
 ## 6. Residuals
 
