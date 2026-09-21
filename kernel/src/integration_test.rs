@@ -2,6 +2,48 @@
 //!
 //! 测试所有子系统的集成和功能
 
+/// Independent BSP clock oracle for the dedicated mitigation guest. This must
+/// run after BSP STI/deferred readiness, before user tasks are published.
+#[cfg(feature = "mitigation_probe")]
+pub fn test_bsp_tick_rate() {
+    assert!(x86_64::instructions::interrupts::are_enabled());
+    let Some(info) = arch::hpet::info() else {
+        klog_always!("BSP-TIMER BLOCKED: HPET reference unavailable");
+        panic!("BSP timer rate requires an independent HPET reference");
+    };
+    let start = arch::hpet::read_main_counter().expect("HPET initialized");
+    let ticks = kernel_core::time::get_ticks();
+    let window = info.frequency_hz.div_ceil(4);
+    let mut elapsed = 0;
+    // Bounded even if the reference clock is broken. Do not wait on the clock
+    // under test, nor HLT forever when the PIT is stopped.
+    for _ in 0..50_000_000 {
+        let now = arch::hpet::read_main_counter().expect("HPET initialized");
+        elapsed = if info.counter_64bit {
+            now.wrapping_sub(start)
+        } else {
+            (now as u32).wrapping_sub(start as u32) as u64
+        };
+        if elapsed >= window {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    assert!(elapsed >= window, "HPET observation timed out");
+    let observed = kernel_core::time::get_ticks().wrapping_sub(ticks);
+    let expected = elapsed.saturating_mul(1000) / info.frequency_hz;
+    // Allow IRQ latency/quantization, but reject the firmware's ~18 Hz rate
+    // and duplicate BSP/AP accounting. No serial output inside the window.
+    let passed = observed >= expected * 3 / 4 && observed <= expected * 5 / 4;
+    klog_always!(
+        "BSP-TIMER {}: ticks={} hpet_ms={} tolerance_percent=25",
+        if passed { "PASS" } else { "FAIL" },
+        observed,
+        expected
+    );
+    assert!(passed, "BSP tick rate differs from nominal 1 kHz");
+}
+
 /// 测试页表管理器
 /// R180-12 compile-time cross-crate API guard. Keeping this function in the
 /// top-level `kernel` crate proves that a consumer can pair the public general

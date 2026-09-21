@@ -1472,6 +1472,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // runs with interrupts enabled and fails closed on a missing/invalid ACK.
     arch::smp::wait_for_process_deferred_acknowledgements();
 
+    // Measure with IRQs enabled and before any user task becomes runnable.
+    // The mitigation image requires an independent clock-rate witness as well
+    // as its four-CPU entry/return proof; debugger stop counts are not a clock.
+    #[cfg(feature = "mitigation_probe")]
+    integration_test::test_bsp_tick_rate();
+
     #[cfg(feature = "namespace_probe")]
     {
         let mask = (0..64)

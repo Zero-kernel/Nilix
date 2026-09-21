@@ -579,6 +579,13 @@ def bind_transitions(sites, transitions, mappings, cpus=1):
 
 def verify_workload(serial, cpus):
     lines = serial.splitlines()
+    clock = [line for line in lines if line.startswith("BSP-TIMER ")]
+    require(len(clock) == 1, "missing or duplicate BSP clock observation")
+    rate = re.fullmatch(r"BSP-TIMER PASS: ticks=(\d+) hpet_ms=(\d+) tolerance_percent=25", clock[0])
+    require(rate is not None, "BSP clock reference failed or was unavailable")
+    ticks, elapsed = map(int, rate.groups())
+    require(elapsed >= 250 and elapsed * 3 // 4 <= ticks <= elapsed * 5 // 4,
+            "BSP tick rate is outside the independently measured 1 kHz band")
     start = f"MITIGATION-WORKLOAD BEGIN pid=1 cpus={cpus} forks={cpus} execs={cpus}"
     finish = f"MITIGATION-WORKLOAD PASS cpus={cpus} forks={cpus} execs={cpus}"
     require(lines.count(start) == 1 and lines.count(finish) == 1,

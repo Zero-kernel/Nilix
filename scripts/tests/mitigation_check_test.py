@@ -312,8 +312,16 @@ class ObservationTests(unittest.TestCase):
                     lines.append(f"MITIGATION-WORKER {state} phase={phase} cpu={cpu} pid={cpu + 2} {fields}")
             lines.append(f"MITIGATION-WAIT PASS cpu={cpu} pid={cpu + 2} raw_status=0 code=0")
         lines += ["MITIGATION-WORKLOAD PASS cpus=4 forks=4 execs=4", "Process 1 terminated with exit code 0"]
-        serial = "\n".join(lines)
+        clock = "BSP-TIMER PASS: ticks=250 hpet_ms=250 tolerance_percent=25"
+        serial = clock + "\n" + "\n".join(lines)
         proof.verify_workload(serial, 4)
+        for broken_clock in ("", clock + "\n" + clock, clock.replace("PASS", "FAIL"),
+                             "BSP-TIMER BLOCKED: HPET reference unavailable",
+                             clock.replace("ticks=250", "ticks=5"),
+                             clock.replace("ticks=250", "ticks=500"),
+                             clock.replace("hpet_ms=250", "hpet_ms=1")):
+            with self.assertRaises(proof.ProofFailure):
+                proof.verify_workload(serial.replace(clock, broken_clock), 4)
         retry_line = "MITIGATION-WORKER RETRY phase=exec cpu=0 pid=2 attempt=1 errno=12"
         with_retry = serial.replace(
             "MITIGATION-WORKER PASS phase=exec cpu=0 pid=2 calls=32 elapsed_ms=250 checksum=123",
