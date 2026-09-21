@@ -68,63 +68,67 @@ pub fn timeout_leaked_count() -> usize {
 // Request wait policy (R189-1 FIX)
 // ============================================================================
 //
-// The synchronous request loops below used a fixed 1_000_000-iteration spin
-// count as their only watchdog.  An iteration count is not a wall-clock bound:
-// on an emulated guest (TCG) or a loaded host one iteration costs ~1us, so the
+// The synchronous request loops below bounded every request with a fixed
+// 1_000_000-iteration spin count.  An iteration count is not a wall-clock
+// bound, and the measured TCG cost of one iteration is only ~0.3us, so that
 // budget expired after a few hundred milliseconds while a *healthy* device was
 // still draining a host fsync.  Abandoning the request then reset the device
 // mid-transaction and surfaced `EIO` to the filesystem, which fails the mount
 // closed even though every committed home had already reached the disk.
 //
-// Wait against the monotonic TSC instead.  The budget below is at least ~6s of
-// wall time on any CPU clocked up to 5 GHz (and longer on slower parts), which
-// is far beyond any plausible host I/O latency while still bounding a genuinely
-// wedged device.
-const REQUEST_WAIT_TIMEOUT_CYCLES: u64 = 30_000_000_000;
+// The replacement watchdog must be monotonic and sized for the slowest
+// environment we validate in.  A clock-based deadline was tried first and
+// rejected: the only cheap clock here is RDTSC, and this kernel's QEMU/TCG
+// guest was observed to move it *backwards* by seconds, which expired a
+// 30e9-cycle budget after a handful of polls (`request wait budget expired ...
+// cycles=882`) and failed the ext2 mount.  Use a monotonic no-progress
+// iteration budget instead: 50M polls is ~15s of wall time under TCG (the CI
+// configuration) and ~0.5s on native hardware, where the device is
+// correspondingly faster.
+const REQUEST_WAIT_MAX_SPINS: u32 = 50_000_000;
 
-#[inline]
-fn tsc_now() -> u64 {
-    // SAFETY: RDTSC is unconditionally available on x86_64, has no memory side
-    // effects, and is monotonic across the wait loops in this module.
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
-/// Wrap-safe expiration test for the monotonic request wait budget.
-#[inline]
-fn wait_budget_expired(start: u64, now: u64) -> bool {
-    now.wrapping_sub(start) >= REQUEST_WAIT_TIMEOUT_CYCLES
-}
-
-/// Monotonic deadline shared by the synchronous request wait loops.
+/// Monotonic no-progress budget for one synchronous request wait.
 #[derive(Clone, Copy, Debug)]
-struct WaitDeadline {
-    start: u64,
+struct RequestWait {
+    spins_left: u32,
 }
 
-impl WaitDeadline {
+impl RequestWait {
     fn start() -> Self {
-        Self { start: tsc_now() }
+        Self {
+            spins_left: REQUEST_WAIT_MAX_SPINS,
+        }
     }
 
-    fn elapsed_cycles(&self) -> u64 {
-        tsc_now().wrapping_sub(self.start)
+    /// Account one poll iteration; `false` once the budget is spent.
+    #[inline]
+    fn spend(&mut self) -> bool {
+        self.spins_left = self.spins_left.saturating_sub(1);
+        self.spins_left > 0
     }
 
+    #[inline]
     fn expired(&self) -> bool {
-        wait_budget_expired(self.start, tsc_now())
+        self.spins_left == 0
+    }
+
+    /// Poll iterations spent so far, for the expiration diagnostic.
+    #[inline]
+    fn spins_spent(&self) -> u32 {
+        REQUEST_WAIT_MAX_SPINS - self.spins_left
     }
 }
 
 /// R189-1 FIX: continue a synchronous wait only while the request can still be
 /// completed: it has not finished, the used ring is not quarantined, and the
-/// wall-clock budget is not spent.
+/// no-progress budget is not spent.
 ///
 /// A quarantined queue can never deliver a completion until reset_device
 /// rebuilds the ring, so waiting on one would only hold the device lock and
 /// re-emit the SECURITY diagnostic once per poll iteration.
 #[inline]
-fn wait_should_continue(completed: bool, quarantined: bool, deadline_expired: bool) -> bool {
-    !completed && !quarantined && !deadline_expired
+fn wait_should_continue(completed: bool, quarantined: bool, budget_expired: bool) -> bool {
+    !completed && !quarantined && !budget_expired
 }
 
 /// Release-visible attribution for a synchronous request failure.
@@ -1615,14 +1619,10 @@ impl VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let wait_deadline = WaitDeadline::start();
+        let mut wait = RequestWait::start();
         let mut completion: Option<Result<usize, BlockError>> = None;
 
-        while wait_should_continue(
-            completion.is_none(),
-            self.queue.is_fatal(),
-            wait_deadline.expired(),
-        ) {
+        while wait_should_continue(completion.is_none(), self.queue.is_fatal(), wait.expired()) {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -1681,6 +1681,7 @@ impl VirtioBlkDevice {
                 break;
             }
 
+            let _ = wait.spend();
             core::hint::spin_loop();
         }
 
@@ -1696,27 +1697,27 @@ impl VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                let elapsed_cycles = wait_deadline.elapsed_cycles();
+                let spins_spent = wait.spins_spent();
                 if self.queue.is_fatal() {
                     klog!(
                         Error,
-                        "[virtio-blk] request aborted by used-ring quarantine head={} sector={} bytes={} cycles={}, \
+                        "[virtio-blk] request aborted by used-ring quarantine head={} sector={} bytes={} spins={}, \
                          buffers pinned (reset required, total leaked={})",
                         desc0,
                         sector,
                         buf_len,
-                        elapsed_cycles,
+                        spins_spent,
                         leaked
                     );
                 } else {
                     klog!(
                         Error,
-                        "[virtio-blk] request wait budget expired head={} sector={} bytes={} cycles={}, \
+                        "[virtio-blk] request wait budget expired head={} sector={} bytes={} spins={}, \
                          buffers pinned (reset required, total leaked={})",
                         desc0,
                         sector,
                         buf_len,
-                        elapsed_cycles,
+                        spins_spent,
                         leaked
                     );
                 }
@@ -2047,14 +2048,10 @@ impl BlockDevice for VirtioBlkDevice {
         self.notify();
 
         // R39-1 FIX: Poll for completion using proper request matching
-        let wait_deadline = WaitDeadline::start();
+        let mut wait = RequestWait::start();
         let mut completion: Option<Result<(), BlockError>> = None;
 
-        while wait_should_continue(
-            completion.is_none(),
-            self.queue.is_fatal(),
-            wait_deadline.expired(),
-        ) {
+        while wait_should_continue(completion.is_none(), self.queue.is_fatal(), wait.expired()) {
             // Process all pending completions
             while let Some(used) = self.queue.pop_used() {
                 match self.complete_used_entry(used) {
@@ -2079,6 +2076,7 @@ impl BlockDevice for VirtioBlkDevice {
                 break;
             }
 
+            let _ = wait.spend();
             core::hint::spin_loop();
         }
 
@@ -2094,21 +2092,21 @@ impl BlockDevice for VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                let elapsed_cycles = wait_deadline.elapsed_cycles();
+                let spins_spent = wait.spins_spent();
                 if self.queue.is_fatal() {
                     klog!(
                         Error,
-                        "[virtio-blk] flush aborted by used-ring quarantine head={} cycles={}, buffers pinned (reset required, total leaked={})",
+                        "[virtio-blk] flush aborted by used-ring quarantine head={} spins={}, buffers pinned (reset required, total leaked={})",
                         desc0,
-                        elapsed_cycles,
+                        spins_spent,
                         leaked
                     );
                 } else {
                     klog!(
                         Error,
-                        "[virtio-blk] flush wait budget expired head={} cycles={}, buffers pinned (reset required, total leaked={})",
+                        "[virtio-blk] flush wait budget expired head={} spins={}, buffers pinned (reset required, total leaked={})",
                         desc0,
-                        elapsed_cycles,
+                        spins_spent,
                         leaked
                     );
                 }
@@ -2161,27 +2159,33 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn wait_budget_is_monotonic_and_wrap_safe() {
-        // The synchronous request watchdog must not fire before its budget is
-        // spent, must fire once it is spent, and must survive a TSC wrap
-        // between the deadline start and the observation point.
-        let budget = REQUEST_WAIT_TIMEOUT_CYCLES;
+    fn wait_budget_is_monotonic_and_bounded() {
+        // The synchronous request watchdog is a no-progress iteration budget:
+        // it must not expire before the budget is spent, must expire exactly
+        // when it is spent, must report a monotonic used count, and must never
+        // be revived by a further spend.
         assert!(
-            budget >= 10_000_000_000,
-            "request watchdog budget must stay a multi-second wall-clock bound"
+            REQUEST_WAIT_MAX_SPINS >= 10_000_000,
+            "request watchdog budget must stay far above observed healthy latencies"
         );
 
-        let start = 1_000u64;
-        assert!(!wait_budget_expired(start, start));
-        assert!(!wait_budget_expired(start, start + budget - 1));
-        assert!(wait_budget_expired(start, start + budget));
-        assert!(wait_budget_expired(start, start + budget + 1));
+        let mut wait = RequestWait::start();
+        assert_eq!(wait.spins_spent(), 0);
+        assert!(!wait.expired());
+        assert!(wait.spend());
+        assert_eq!(wait.spins_spent(), 1);
 
-        // TSC wrap: a small "now" shortly after a start near u64::MAX is an
-        // early observation, not an expired budget.
-        let near_wrap = u64::MAX - 5;
-        assert!(!wait_budget_expired(near_wrap, 3));
-        assert!(wait_budget_expired(near_wrap, 9 + budget));
+        // Spend the remainder; the last iteration is accepted, then the budget
+        // is spent and every later iteration reports exhausted.
+        while wait.spend() {}
+        assert!(wait.expired());
+        assert_eq!(wait.spins_spent(), REQUEST_WAIT_MAX_SPINS);
+        assert!(!wait.spend());
+        assert!(wait.expired());
+        assert_eq!(wait.spins_spent(), REQUEST_WAIT_MAX_SPINS);
+
+        // An exhausted budget is terminal for the wait predicate.
+        assert!(!wait_should_continue(false, false, wait.expired()));
 
         // Request kind naming is part of the attribution contract.
         assert_eq!(request_op_name(true), "write");
