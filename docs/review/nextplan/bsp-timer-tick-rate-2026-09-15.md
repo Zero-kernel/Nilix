@@ -3,13 +3,15 @@
 **Date:** 2026-09-15
 **Plan item / Finding:** New. Discovered while diagnosing the `QEMU / mitigation` failure on
 run [34878897944](https://github.com/Zero-kernel/Nilix/actions/runs/34878897944) (commit `e3fbf9b`).
-**Status:** DRAFT — root cause established with source + runtime evidence; the fix touches the
-system-wide time base and has not been designed to completion or independently reviewed.
-The affected gate is **disabled** in CI in the interim (see §5).
-**Scope and authorization:** User authorized (2026-09-15) recording the design and current state
+**Status:** IMPLEMENTED with independently reviewed, passing clock/mitigation proofs
+(2026-09-20). The CI matrix leg is restored. Broader runtime/boot/SMP qualification and
+a new Actions/QEMU 8.2 run remain pending; see the scoped results below.
+**Scope and authorization:** User authorized continued implementation of the timer defect
+and shared-anonymous follow-up on 2026-09-20. Historically, the user authorized (2026-09-15) recording the design and current state
 in `next-plan` and disabling the failing gate. Code changes to the tick source were **not**
-authorized for this round.
-**Designed by:** Claude (session), MODE S self-review only — **no independent review yet**.
+authorized for that earlier round.
+**Designed by:** Original 2026-09-15 Claude record was self-reviewed only. The 2026-09-20
+MODE D implementation and HPET oracle were independently reviewed by `/root/timer_review`.
 **Amendment mode:** normal.
 **Sources:** local `main` @ `aeb7d44`; devbox `40c-devbox-ts` @ `f52da06` + WIP and @ `f516582`;
 CI artifacts for runs 34774724225 (`f52da06`, green) and 34935569381 (`aeb7d44`, red).
@@ -110,11 +112,10 @@ IRQ (keyboard/serial). Rejected for this round as the higher-risk option.
 
 ## 5. Decision Record
 
-Routine technical choice within the authorized scope: **approach A** is the recommendation.
-It was **not implemented**, because the user directed this round to record the design and
-disable the gate instead. Approach A remains the proposed next step.
+The 2026-09-15 recommendation was **approach A**; that round only recorded the design and
+disabled the gate. The 2026-09-20 continuation implements A under the current authorization.
 
-**Interim disposition (this is what is actually in the tree):** `mitigation` is removed from the
+**Historical interim disposition (2026-09-15):** `mitigation` was removed from the
 `.github/workflows/ci.yml` `qemu` matrix, so the flaky gate no longer blocks `CI result`.
 The `mitigation)` branch in `scripts/ci/entrypoint.sh:128` and `make test-security-mitigations`
 are retained, so the proof still runs locally and can be re-enabled with a one-line revert once
@@ -127,30 +128,74 @@ This is a deliberate, recorded scope reduction with a re-enable condition — no
 
 ## 6. Defense in Depth
 
-Once approach A lands, the natural fail-closed check is a boot assertion that the BSP tick rate
-matches the documented rate (e.g. compare `TICK_COUNT` delta against HPET over a window, and
-report a qualification if they diverge). That turns a silent timing skew into an explicit
-signal. Out of scope for this record.
+The dedicated mitigation guest now compares `TICK_COUNT` with HPET and requires a numerical
+rate witness. Ordinary boot retains its HPET-optional contract. This distinguishes nominal
+rate correctness from firmware assumptions without making HPET a new production requirement.
 
 ## 7. Implementation Plan
 
-Not authorized this round. For the record, approach A is: one BSP-side helper in
-`kernel/arch/apic.rs` that programs PIT channel 0, called once from the existing BSP init
-sequence after calibration; no other file changes.
+Authorized 2026-09-20: `apic::init_bsp_tick()` programs channel 0 with command 0x36 and
+divisor 1193 (1000.153 Hz, +153 ppm), after LAPIC calibration and before AP startup/STI.
+An IF=0 assertion enforces the early-boot calling contract. IRQ routing, EOI and the
+single BSP global-counter writer are unchanged; calibration uses channel 2.
+
+The dedicated `mitigation_probe` guest measures the serviced tick count against HPET
+for at least 250 ms, after BSP STI/deferred acknowledgements and before scheduling any
+user task. It handles 32-bit HPET wrap and bounds polling independently of the PIT.
+A 25% rate band distinguishes the defective ~18 Hz source and duplicate accounting
+while allowing IRQ latency. Missing HPET or a failed measurement blocks this dedicated
+guest (diagnostic plus panic); ordinary boot does not require HPET. The host parser
+requires exactly one valid numerical `BSP-TIMER PASS` witness. This checks the nominal
+rate, not uninterrupted wall-clock accuracy: long IF=0 periods can still lose ticks.
 
 ## 8. Test and Verification Plan
 
-- **Precondition:** the mitigation gate must be re-enabled for the fix to be exercised.
-- **Oracle 1:** BSP tick rate. The devbox measured 1 BSP timer interrupt against 34-44 per AP;
-  after the fix the ratio should be ~1:1. This is directly observable from the existing
-  `rsp-transcript.json` per-CPU stop counts — no new instrumentation needed.
-- **Oracle 2:** `current_timestamp_ms()` advance rate against HPET over a known window.
-- **Oracle 3:** the mitigation gate passes **first try, repeatedly** (it currently passes only
-  via the retry — see §9).
-- **Regression:** `make test` (boot/SMP, iommu, musl) plus `make test-ring3-mm`; the tick-rate
+- **Oracle 1:** `current_timestamp_ms()` advance rate against the independent HPET window.
+  Debugger stop counts are NOT a frequency oracle: they sample user-return CR3 sites,
+  and a site's breakpoint disappears once its CPU coverage is complete.
+- **Oracle 2:** mitigation still requires all four CPUs and all 17 transitions. Run the
+  retained local gate directly before deciding to restore its CI matrix entry.
+- **Oracle 3:** the mitigation gate historically passed only via the retry (see the
+  2026-09-15 interim result in §9); the 2026-09-20 implementation now has first-attempt
+  proofs and a zero-retry CI entry.
+- **Regression:** `make build`, `make lint`, `make test`, `make boot-check`,
+  `make test-smp-4core`, `make musl-check`, and `make test-ring3-mm`; the tick-rate
   change affects every ms-granular path, so this needs a full gate pass, not a targeted one.
 
 ## 9. Open Questions and Limitations
+
+### 2026-09-20 execution evidence
+
+Host `40c-devbox-ts` (`bf05c156b9a3`), QEMU 6.2.0, Rust
+`1.94.0-nightly (ba2142a19 2025-12-07)`. Primary isolated tree:
+`/tmp/zero-os-nilix-20260920`, based on `6f072978513f236354b0dde720375fd69d053398`.
+The original remote checkout at `f52da06` plus WIP was not overwritten.
+
+| Gate | Actual result |
+| --- | --- |
+| `make build`, `make lint` | Exit 0; final lint rechecked after the test-fixture amendment |
+| `make test-hosted-subcrates` | Exit 0 after updating both exact-count declarations; 444 unit tests, CpuLocal doctests and 3 compile checks |
+| mitigation parser / CI entry+report tests | 48/48 and 13/13, exit 0 |
+| `make test-security-mitigations` | Exit 0, first attempt; `run-6etxdlko`, 17/17 transitions, timer CPUs 0/1/2/3, 250 ticks / 250 HPET ms |
+| Second direct `mitigation_check.py --runtime --smp 4` | Exit 0, no retry; `run-tjbi0uhw`, 17/17, all timer CPUs, 251 ticks / 250 HPET ms |
+| Final `CI_GUEST_RETRIES=0 bash scripts/ci/entrypoint.sh mitigation` | Exit 0; `.validation/ci-final/run.hfKT07`: build, runtime proof and unsupported-retpoline boundary all PASS; `proof/run-h4b_d1ok` has 17/17, all timer CPUs, 250 ticks / 250 HPET ms |
+| `make test`, `make boot-check`, `make test-smp-4core` | Make exits 2 because the underlying gate exits **3 QUALIFIED**: respectively 35/39/0, 28/46/0, 37/37/0 passed/deferred/failed; not strict passes |
+| `make musl-check` | Exit 0, required libc/poll/socket/stat/uname markers and PID 1 exit 0; not a shared-mmap-specific musl oracle |
+
+The final CI entry runs the merged source including the dedicated `syscall_test`-only
+cgroup fixture amendment. Its `inputs.json`, command records and guest ELF hashes
+are retained under the CI artifact directory. Kernel MM/IRQ source is byte-identical
+across the primary and Ring-3 validation copies; the latter's 13/13 results and remaining
+MM limits are recorded in [the shared follow-up](../design/st-k2-shared-fault-lifecycle-design.md).
+Local evidence is retained in `.tmp-nilix-20260920/` (including the original
+`evidence.tar.gz`, SHA256 `74ecc7346194363687c570a8d4e0bed79d6f76b9b98a2307cc8ffaa7722b53be`).
+The final archive `evidence-final.tar.gz` also includes the final CI entry and tested
+kernel ELFs (SHA256 `a0e9ef322be90187c67c51613c00b05342d4c40c297ef22a379b3ef5f318dc6b`).
+The initial standard-gate failures/qualifications are preserved; no retry converted
+a missing four-CPU clock observation into acceptance.
+
+The matrix re-enable is a working-tree change; no commit/push or new GitHub Actions run
+was performed. The local QEMU evidence does not claim an observed QEMU 8.2 result.
 
 - **The gate failure was previously attributed to `f516582` (the mremap slice) and that
   attribution was wrong.** The last green run at `f52da06` failed its *first* attempt with the
@@ -184,3 +229,4 @@ sequence after calibration; no other file changes.
 | Date | Section | Change and evidence | Safety impact | Review outcome | User decision if required |
 | --- | --- | --- | --- | --- | --- |
 | 2026-09-15 | all | Initial record. Prior attribution to `f516582` withdrawn after the `f52da06` artifact showed attempt 1 failing identically. | None (record only) | Self-review only | User directed: record + disable gate, do not change the tick source yet |
+| 2026-09-20 | 7–9 | Implement approach A and require a numerical HPET oracle; discard breakpoint-count ratios as a frequency assertion. Restore the CI matrix after two first-attempt proofs, then pass the final zero-retry CI entry. | Preserves IRQ route, EOI and BSP-only time ownership; acknowledges coalesced ticks. | Independent `/root/timer_review` design/change review passed; exact execution evidence above. General strict qualification remains open. | Current continuation request authorizes implementation. |

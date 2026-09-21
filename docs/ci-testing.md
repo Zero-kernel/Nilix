@@ -40,7 +40,7 @@ musl-tools and e2fsprogs on Linux. For Python harness tests, install
 | UP boot/runtime and four-CPU SMP | `bash scripts/ci/entrypoint.sh runtime` after the build group |
 | Static musl on one and four CPUs | `bash scripts/ci/entrypoint.sh musl` |
 | Q35 activation, init failures and EDU DMA/MSI | `bash scripts/ci/entrypoint.sh iommu` |
-| Four-CPU CR3/CPL3 proof (disabled in CI) | `bash scripts/ci/entrypoint.sh mitigation` |
+| Four-CPU CR3/CPL3 proof + BSP clock rate | `bash scripts/ci/entrypoint.sh mitigation` |
 | Adapter tests and real KCOV/executor smoke | `bash scripts/ci/entrypoint.sh qemu-fuzz` |
 | Scheduled extended scope | `bash scripts/ci/entrypoint.sh extended` |
 
@@ -107,17 +107,26 @@ still fails the gate. Linux QEMU 6.2 validation passes all 17 observations and
 the complete workload, and `mitigation_check_test.py` passes its 48 regression
 cases.
 
-**Current status (2026-09-15): the `mitigation` leg is disabled.** Those collector
+**Current status (2026-09-20): the `mitigation` leg is restored.** PIT channel 0 is
+programmed with divisor 1193 for nominal 1 kHz. The dedicated guest now measures
+at least 250 ms against HPET; its parser requires a unique numerical rate PASS
+within 25%, in addition to unchanged four-CPU CR3/CPL3 coverage. Two independent
+devbox runs completed on their first attempt with 17/17 transitions and
+250 and 251 ticks respectively over 250 HPET ms. This is local QEMU 6.2 evidence; a new Actions/QEMU 8.2
+run is still needed after publication. The counter remains serviced-tick time,
+so long interrupt-disabled windows can lose ticks.
+
+**Historical diagnosis (2026-09-15):** Those collector
 repairs are not sufficient, because the last observation it needs is not a
 collector problem. `timer_interrupt_stub` is required on all four CPUs, but the
-BSP's tick source is the 8254 PIT, which this kernel never programs — APs get a
+BSP's tick source was the 8254 PIT, which the kernel did not program — APs got a
 calibrated ~1 kHz LAPIC timer and the BSP gets whatever firmware left. Measured
 per-CPU timer stops: 1 on the BSP against 34-44 per AP on the devbox, and 0
 against 4036 on the failing CI run. The gate passed at `f52da06` only because the
 retry recovered: its first attempt failed with the identical `dynamic=blocked`,
 and both proof runs are retained in that run's artifact (17/17 and 15/17). So the
-leg is chronically flaky rather than newly regressed, and it is removed from the
-`qemu` matrix until the tick rate is fixed. The entrypoint branch and
+leg was chronically flaky rather than newly regressed, and it was removed from the
+`qemu` matrix pending the tick-rate repair. The entrypoint branch and
 `make test-security-mitigations` still run it locally. See
 [bsp-timer-tick-rate-2026-09-15.md](review/nextplan/bsp-timer-tick-rate-2026-09-15.md)
 for the evidence, the two candidate fixes and the re-enable condition.
