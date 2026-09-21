@@ -6796,6 +6796,7 @@ fn exec_from_bytes(
             // the basis so the fresh image starts authoritative with no stale frame
             // keys (a reused physical frame in the new AS cannot collide).
             mm.pt_charged_frames.clear();
+            mm.shared_fault_pt_frames.clear();
             mm.pt_inherited_bytes = 0;
             mm.pt_ledger_authoritative = true;
             // M2-1 SLICE-4d: charge + ledger the NEW image's page-table-frame kmem — the
@@ -13049,10 +13050,8 @@ fn sys_brk(addr: usize) -> SyscallResult {
             // inherited basis rides to teardown). The ledger removal happens HERE, strictly
             // before the frames are published to the buddy below (free-after-remove).
             let pt_freed = if mm.pt_ledger_authoritative {
-                let freed = crate::process::pt_ledger_reconcile(
-                    &mut mm.pt_charged_frames,
-                    reclaim.frames.iter().map(|f| f.start_address().as_u64()),
-                );
+                let freed = mm
+                    .reclaim_pt_charges(reclaim.frames.iter().map(|f| f.start_address().as_u64()));
                 if freed > 0 {
                     mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(freed);
                 }
@@ -14284,10 +14283,11 @@ fn sys_mmap(
         // their DATA charge is taken by the first page fault.  Private mappings
         // retain the eager whole-range charge.
         let shared_region = if is_shared {
-            Some(
-                crate::fork::SharedAnonRegion::try_new(base, length_aligned, prot)
-                    .map_err(|_| SyscallError::ENOMEM)?,
-            )
+            let region = crate::fork::SharedAnonRegion::try_new(base, length_aligned, prot)
+                .map_err(|_| SyscallError::ENOMEM)?;
+            mm.reserve_shared_fault_pt(Some((base, length_aligned)))
+                .map_err(|_| SyscallError::ENOMEM)?;
+            Some(region)
         } else {
             None
         };
@@ -14338,6 +14338,7 @@ fn sys_mmap(
                 cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
             }
             drop(shared_region);
+            mm.reclaim_empty_shared_fault_pt_capacity();
             // ST-K3 Phase D: site tag (E3) — Phase-1 VMA-map heap admission.
             #[cfg(debug_assertions)]
             kprintln!(
@@ -14356,6 +14357,7 @@ fn sys_mmap(
             {
                 mm.mmap_regions.remove(&base);
                 drop(shared_region);
+                mm.reclaim_empty_shared_fault_pt_capacity();
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -15098,10 +15100,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         // non-authoritative (a forked child's inherited basis: empty ledger →
         // nothing to remove; the basis rides to teardown, over-count-safe).
         if mm.pt_ledger_authoritative {
-            let pt_freed = crate::process::pt_ledger_reconcile(
-                &mut mm.pt_charged_frames,
-                reclaim.frames.iter().map(|f| f.start_address().as_u64()),
-            );
+            let pt_freed =
+                mm.reclaim_pt_charges(reclaim.frames.iter().map(|f| f.start_address().as_u64()));
             if pt_freed > 0 {
                 mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(pt_freed);
                 cgroup::uncharge_memory(cgroup_id, pt_freed);
@@ -22992,10 +22992,8 @@ fn sys_mremap(
         // constant.  A forked child's inherited basis is not in the ledger, so
         // the scan is skipped while the AS is non-authoritative.
         if mm.pt_ledger_authoritative {
-            let pt_freed = crate::process::pt_ledger_reconcile(
-                &mut mm.pt_charged_frames,
-                reclaim.frames.iter().map(|f| f.start_address().as_u64()),
-            );
+            let pt_freed =
+                mm.reclaim_pt_charges(reclaim.frames.iter().map(|f| f.start_address().as_u64()));
             if pt_freed > 0 {
                 mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(pt_freed);
                 cgroup::uncharge_memory(cgroup_id, pt_freed);

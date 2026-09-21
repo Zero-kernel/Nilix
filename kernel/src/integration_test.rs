@@ -427,6 +427,7 @@ pub fn test_context_switch() {
 
 /// 测试内存映射
 pub fn test_memory_mapping() {
+    kernel_core::process::run_shared_fault_pt_ledger_self_test();
     kernel_core::syscall::run_mmap_flags_self_test();
     kernel_core::syscall::run_mremap_flags_self_test();
     kernel_core::syscall::run_mremap_geometry_self_test();

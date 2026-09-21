@@ -892,7 +892,7 @@ fn fork_inner(
                 }
             }
 
-            let child_mm = crate::process::MmState {
+            let mut child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
                 // child's region map is now a `FallibleOrderedMap`, adopted in
                 // O(1) with NO allocation from the already-sorted, admission-
@@ -933,6 +933,7 @@ fn fork_inner(
                 // R186-4 FIX: Migrated to AdmittedMap; child starts with empty ledger
                 // (AdmittedMap::new charges nothing for zero capacity).
                 pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+                shared_fault_pt_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
                 pt_inherited_bytes: parent_mm.pt_charged_bytes,
                 pt_ledger_authoritative: false,
                 // Transient pending counters reset for child — no in-flight
@@ -960,6 +961,9 @@ fn fork_inner(
                 stack_grow_in_progress: false,
                 fork_in_progress: false,
             };
+            child_mm
+                .reserve_shared_fault_pt(None)
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
             child.mm = Arc::try_new(Mutex::new(child_mm))
                 .map_err(|_| ForkError::MemoryAllocationFailed)?;
             charge_bytes
@@ -1692,17 +1696,19 @@ struct SharedFaultFrameAllocator<'a> {
     buddy: &'a mut mm::buddy_allocator::BuddyAllocator,
     pt_frames: [Option<PhysFrame>; 3],
     pt_len: usize,
+    pt_limit: usize,
 }
 
 const SHARED_FAULT_PT_PAGES: usize = 3;
 const SHARED_FAULT_PAGE_SIZE: u64 = 0x1000;
 
 impl<'a> SharedFaultFrameAllocator<'a> {
-    fn new(buddy: &'a mut mm::buddy_allocator::BuddyAllocator) -> Self {
+    fn new(buddy: &'a mut mm::buddy_allocator::BuddyAllocator, pt_spare: usize) -> Self {
         Self {
             buddy,
             pt_frames: [None, None, None],
             pt_len: 0,
+            pt_limit: pt_spare.min(SHARED_FAULT_PT_PAGES),
         }
     }
 
@@ -1750,6 +1756,11 @@ impl<'a> SharedFaultFrameAllocator<'a> {
         }
         let mut reclaimed_count = 0;
         for frame in reclaimed.into_iter().flatten() {
+            for tracked in self.pt_frames.iter_mut() {
+                if *tracked == Some(frame) {
+                    *tracked = None;
+                }
+            }
             self.deallocate_frame(frame);
             reclaimed_count += 1;
         }
@@ -1759,7 +1770,7 @@ impl<'a> SharedFaultFrameAllocator<'a> {
 
 unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for SharedFaultFrameAllocator<'_> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        if self.pt_len == self.pt_frames.len() {
+        if self.pt_len == self.pt_limit {
             return None;
         }
         let frame = self.buddy.alloc_pages(0)?;
@@ -1859,7 +1870,11 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
 
         let mapped = try_with_current_manager(VirtAddr::new(0), |manager| {
             mm::buddy_allocator::try_with_allocator(|buddy| {
-                let mut allocator = SharedFaultFrameAllocator::new(buddy);
+                let spare = mm_state
+                    .shared_fault_pt_frames
+                    .capacity()
+                    .saturating_sub(mm_state.shared_fault_pt_frames.len());
+                let mut allocator = SharedFaultFrameAllocator::new(buddy, spare);
                 let (frame, owns_new_frame) = if let Some(shared) = existing {
                     let frame =
                         PhysFrame::containing_address(PhysAddr::new(shared.phys_addr as u64));
@@ -1918,13 +1933,10 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
                         // no newly linked table uncharged.
                     }
                     let committed_pt_bytes = charge.charged_bytes();
-                    if committed_pt_bytes != 0 {
-                        mm_state.pt_charged_bytes =
-                            mm_state.pt_charged_bytes.saturating_add(committed_pt_bytes);
-                        mm_state.pt_inherited_bytes = mm_state
-                            .pt_inherited_bytes
-                            .saturating_add(committed_pt_bytes);
-                    }
+                    mm_state.record_shared_fault_pt_charge(
+                        allocator.tracked_pt_frames(),
+                        committed_pt_bytes,
+                    );
                     charge.commit();
                     return SharedFaultResult::Fatal(CowFaultFailure::MappingFailed);
                 }
@@ -1942,16 +1954,10 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
                     // retained accounting is deliberately conservative.
                 }
                 let committed_pt_bytes = charge.charged_bytes().saturating_sub(mapped_data_bytes);
-                if committed_pt_bytes != 0 {
-                    // Fault paths cannot grow the per-AS identity map under
-                    // PT_LOCK.  The fixed inherited basis preserves I' and is
-                    // reclaimed wholesale at munmap/exit.
-                    mm_state.pt_charged_bytes =
-                        mm_state.pt_charged_bytes.saturating_add(committed_pt_bytes);
-                    mm_state.pt_inherited_bytes = mm_state
-                        .pt_inherited_bytes
-                        .saturating_add(committed_pt_bytes);
-                }
+                mm_state.record_shared_fault_pt_charge(
+                    allocator.tracked_pt_frames(),
+                    committed_pt_bytes,
+                );
                 if owns_new_frame {
                     *slot = Some(SharedPage {
                         phys_addr: frame.start_address().as_u64() as usize,
