@@ -76,15 +76,16 @@ pub fn timeout_leaked_count() -> usize {
 // mid-transaction and surfaced `EIO` to the filesystem, which fails the mount
 // closed even though every committed home had already reached the disk.
 //
-// The replacement watchdog must be monotonic and sized for the slowest
-// environment we validate in.  A clock-based deadline was tried first and
-// rejected: the only cheap clock here is RDTSC, and this kernel's QEMU/TCG
-// guest was observed to move it *backwards* by seconds, which expired a
-// 30e9-cycle budget after a handful of polls (`request wait budget expired ...
-// cycles=882`) and failed the ext2 mount.  Use a monotonic no-progress
-// iteration budget instead: 50M polls is ~15s of wall time under TCG (the CI
-// configuration) and ~0.5s on native hardware, where the device is
-// correspondingly faster.
+// A clock-based deadline was tried first and dropped.  The failure that first
+// looked like a non-monotonic RDTSC turned out to be the inverted wait
+// predicate documented at `wait_should_continue` below (instrumented serial:
+// `budget=50000000 left=50000000 spent=0`), so nothing observed here shows this
+// guest moving RDTSC backwards; the deadline only added a clock assumption.
+//
+// The watchdog kept instead is a monotonic *no-progress* iteration budget: only
+// polls that produced no completion are charged, and 50M of them is ~15s of
+// wall time under TCG (the CI configuration) and ~0.5s on native hardware,
+// where the device is correspondingly faster.
 const REQUEST_WAIT_MAX_SPINS: u32 = 50_000_000;
 
 /// Monotonic no-progress budget for one synchronous request wait.
