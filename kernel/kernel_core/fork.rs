@@ -1824,9 +1824,48 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::NotShared;
     }
 
+    // Serialize first-touch with the complete fork/unmap transaction, not just
+    // its PT phase. The side-map outlives PENDING_UNMAP until Phase 3.
+    let Some(entry) = mm_state.mmap_regions.get(&region_base).copied() else {
+        return SharedFaultResult::NotShared;
+    };
+    if mm_state.fork_in_progress || entry.has_transient() {
+        return SharedFaultResult::Busy;
+    }
+    if !entry.is_shared()
+        || entry.is_prot_none()
+        || entry.len() != region.page_count * SHARED_FAULT_PAGE_SIZE as usize
+        || entry.prot_read() != (region.prot & 1 != 0)
+        || entry.prot_write() != (region.prot & 2 != 0)
+        || entry.prot_exec() != (region.prot & 4 != 0)
+    {
+        return SharedFaultResult::NotShared;
+    }
+
     let Some(result) = region.with_slots_try(|slots| {
         let slot = &mut slots[index];
         let existing = *slot;
+        let virt = VirtAddr::new(page_base as u64);
+        // A peer may have resolved this same not-present fault while this CPU
+        // waited. Check before reservation: memory.max may now be exactly full.
+        let resident = try_with_current_manager(VirtAddr::new(0), |manager| {
+            manager.translate_with_flags(virt)
+        });
+        match resident {
+            None => return SharedFaultResult::Busy,
+            Some(Some((phys, flags))) => {
+                let matches = existing.is_some_and(|page| page.phys_addr == phys.as_u64() as usize)
+                    && flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+                    && flags.contains(PageTableFlags::WRITABLE) == (region.prot & 2 != 0)
+                    && flags.contains(PageTableFlags::NO_EXECUTE) == (region.prot & 4 == 0);
+                if matches {
+                    x86_64::instructions::tlb::flush(virt);
+                    return SharedFaultResult::Handled;
+                }
+                return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+            }
+            Some(None) => {}
+        }
         // Reserve the bounded DATA + PT upper bound before taking PT_LOCK.
         // `FaultMemoryCharge` updates only the captured atomics in the fault
         // critical section; no registry or blocking lock is reached below.
@@ -1856,7 +1895,6 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
             }
         };
 
-        let virt = VirtAddr::new(page_base as u64);
         let flags = {
             let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
             if region.prot & 0x2 != 0 {
