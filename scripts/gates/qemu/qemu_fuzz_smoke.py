@@ -49,21 +49,29 @@ def source_identity(root, manifest, revision):
 def check_guest_evidence(artifact_root, output):
     runs = sorted(artifact_root.glob("nilix-syz-v2-*"))
     launched = re.findall(r"^NILIX_SYZ_QEMU_STARTED pid=([1-9][0-9]*) artifacts=(.+)$", output, re.M)
-    if len(runs) != 2 or len(launched) != 2:
-        raise RuntimeError("expected exactly two real QEMU launches and retained runs")
+    if len(runs) != 3 or len(launched) != 3:
+        raise RuntimeError("expected exactly three real QEMU launches and retained runs")
     if {Path(path).resolve() for _, path in launched} != {run.resolve() for run in runs}:
         raise RuntimeError("process launch records do not match the retained runs")
-    if output.count("QEMU-FUZZ-SMOKE PASS seeds=2") != 1:
+    if output.count("QEMU-FUZZ-SMOKE PASS seeds=3") != 1:
         raise RuntimeError("missing or ambiguous adapter completion")
     for seed in ("getpid", "uname"):
         if len(re.findall(rf"^QEMU-FUZZ-SEED PASS name={seed} occupied=[1-9][0-9]*$", output, re.M)) != 1:
             raise RuntimeError(f"missing nonempty authenticated coverage for {seed}")
+    if len(re.findall(r"^QEMU-FUZZ-ZERO-SMOKE PASS name=sched_yield occupied=0$", output, re.M)) != 1:
+        raise RuntimeError("missing zero authenticated coverage for sched_yield")
+    zero_slot_runs = 0
+    nonzero_slot_runs = 0
     for run in runs:
         serial = (run / "serial.log").read_text(errors="replace")
         begins = re.findall(r"^NILIX_SYZ_V2_BEGIN (seq=\w+ run=\w+ program=\w+)\r?$", serial, re.M)
-        passes = re.findall(r"^NILIX_SYZ_V2_PASS (seq=\w+ run=\w+ program=\w+) slots=[1-9][0-9]* tag=[0-9a-f]{64}\r?$", serial, re.M)
-        if len(begins) != 1 or passes != begins:
+        passes = re.findall(r"^NILIX_SYZ_V2_PASS (seq=\w+ run=\w+ program=\w+) slots=([0-9]+) tag=[0-9a-f]{64}\r?$", serial, re.M)
+        if len(begins) != 1 or len(passes) != 1 or passes[0][0] != begins[0]:
             raise RuntimeError(f"missing/mismatched guest completion: {run}")
+        if int(passes[0][1]) == 0:
+            zero_slot_runs += 1
+        else:
+            nonzero_slot_runs += 1
         if "KERNEL PANIC" in serial or "NILIX_SYZ_V2_FAIL" in serial:
             raise RuntimeError(f"guest failure: {run}")
         if not (run / "syz-result.host.bin").is_file():
@@ -72,6 +80,8 @@ def check_guest_evidence(artifact_root, output):
         hashes = re.fullmatch(r"before=([0-9a-f]{64})\nafter=([0-9a-f]{64})\n", disk_evidence)
         if not hashes or hashes[1] != hashes[2] or hashes[2] != sha256(run / "syz-disk.img"):
             raise RuntimeError(f"guest disk changed during or after extraction: {run}")
+    if zero_slot_runs != 1 or nonzero_slot_runs != 2:
+        raise RuntimeError("unexpected zero/nonzero guest coverage distribution")
 
 
 def main():
@@ -115,7 +125,7 @@ def main():
             if sha256(run / "esp/EFI/BOOT/BOOTX64.EFI") != identity["bootloader_sha256"]:
                 raise RuntimeError("executed bootloader identity changed")
         status = 0
-        print("QEMU-FUZZ-GATE PASS: 2 process launches, 2 authenticated guest completions")
+        print("QEMU-FUZZ-GATE PASS: 3 process launches, 3 authenticated guest completions")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"QEMU-FUZZ-GATE FAIL: {error}")
     finally:

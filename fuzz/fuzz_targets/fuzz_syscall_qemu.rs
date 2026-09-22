@@ -19,13 +19,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     match executor.execute(&program) {
-        Ok(ExecutionResult::Success(coverage)) => {
+        Ok(ExecutionResult::Success(_coverage)) => {
             // Guest coverage is authenticated, but libFuzzer currently guides
             // mutations using host instrumentation, not this guest bitmap.
-            assert!(
-                coverage.iter().any(|&byte| byte != 0),
-                "empty guest coverage"
-            );
+            // Zero coverage is valid for allowlisted syscalls that do not reach
+            // a manually instrumented path; qemu_smoke still enforces nonzero
+            // coverage for the seeds that prove the KCOV data path.
         }
         Ok(ExecutionResult::Crash(info)) => {
             eprintln!("{}\n{}", info.serial_log, info.qemu_stderr);

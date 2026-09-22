@@ -23,10 +23,11 @@ Tests syscall entry points with focus on R173/R174 fixes:
 
 ### 1b. `fuzz_syscall_qemu` - QEMU syscall execution
 
-**Verification status (2026-09-10):** development paused. The real adapter and host
-regressions are implemented; the current guest smoke reaches BEGIN then fails
-`result_open` with `EINVAL`. Successful guest coverage is not yet qualified. See the
-[handoff](../docs/review/fixes/ksa-2026-09-06-handoff-2026-09-10.md) before continuing.
+**Verification status (2026-09-22):** the real adapter and authenticated result path
+run against the KCOV guest. `make fuzz-qemu-smoke` covers nonzero coverage for the
+instrumented `getpid`/`uname` seeds and zero coverage for `sched_yield`; full
+campaign acceptance remains verification pending. See the
+[handoff](../docs/review/fixes/ksa-2026-09-06-handoff-2026-09-10.md) for historical context.
 
 Uses the production `nilix-syz-fuzzer` executor and its 20-syscall allowlist, including
 process identity, read-only filesystem queries, time and bounded output buffers.
@@ -35,7 +36,10 @@ and a private 128 MiB Ext3 transport. Authenticated BEGIN/PASS and result data b
 coverage to the submitted input. Missing prerequisites, process errors, crashes,
 timeouts and hangs fail the invocation. Invalid byte encodings are rejected before
 execution. Guest KCOV is returned; libFuzzer mutation guidance still uses host
-instrumentation. There is no measured executions-per-second claim.
+instrumentation. Zero coverage is a valid authenticated result for allowlisted
+syscalls without manual probes; the fuzzer accepts it, while the smoke gate keeps
+nonzero coverage checks for the seeds that prove the KCOV data path. There is no
+measured executions-per-second claim.
 
 Build with `make build-syz-kcov` and enable `qemu-executor`. Guest startup has a
 90-second bound; use `-timeout=120` or larger for libFuzzer. Optional

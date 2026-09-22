@@ -1083,10 +1083,9 @@ static int collect_coverage(
     if ((uint32_t)result != counted_slots) {
         return set_error(error, "kcov_popcount", result);
     }
-    if (counted_slots == 0U) {
-        return set_error(error, "kcov_zero", 0);
-    }
-
+    // Zero occupied slots is valid when the selected syscalls do not reach a
+    // manually instrumented path. The exact successful KCOV dump above still
+    // distinguishes that observation from a KCOV control failure.
     result = invoke_kcov_retry(NILIX_SYS_KCOV_RESET, 0U, 0U);
     if (result != 0) {
         return set_error(error, "kcov_reset_after", result);

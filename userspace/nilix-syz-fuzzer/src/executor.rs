@@ -308,8 +308,8 @@ impl<'a> MarkerTracker<'a> {
         let occupied_slot_count: u32 = slots_text
             .parse()
             .context("invalid PASS occupied-slot count")?;
-        if occupied_slot_count == 0 || occupied_slot_count.to_string() != slots_text {
-            bail!("PASS occupied-slot count is zero or non-canonical");
+        if occupied_slot_count.to_string() != slots_text {
+            bail!("PASS occupied-slot count is non-canonical");
         }
         let tag = parse_hex_array::<32>(field_value(fields[5], "tag")?, "PASS tag")?;
         self.pass = Some(PassMarker {
@@ -797,6 +797,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tracker.pass.unwrap().occupied_slot_count, 3);
+    }
+
+    #[test]
+    fn marker_state_machine_accepts_authenticated_zero_coverage() {
+        let binding = binding();
+        let mut tracker = MarkerTracker::new(&binding);
+        tracker
+            .process_line(
+                format!(
+                    "NILIX_SYZ_V2_BEGIN seq={} run={} program={}",
+                    binding.sequence_hex(),
+                    binding.run_hex(),
+                    binding.program_hex()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        tracker
+            .process_line(
+                format!(
+                    "NILIX_SYZ_V2_PASS seq={} run={} program={} slots=0 tag={}",
+                    binding.sequence_hex(),
+                    binding.run_hex(),
+                    binding.program_hex(),
+                    "22".repeat(32)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(tracker.pass.unwrap().occupied_slot_count, 0);
     }
 
     #[test]

@@ -324,11 +324,9 @@ jobs:
               IFS=$'\t' read -r issue_number issue_state <<< "${matches[0]}"
               if [ "$issue_state" = "CLOSED" ]; then
                 gh issue reopen "$issue_number"
-                gh issue comment "$issue_number" \
-                  --body "The opaque candidate was observed again in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Details remain private under SECURITY.md."
-              else
-                echo "Opaque candidate is already tracked by #${issue_number}"
               fi
+              gh issue comment "$issue_number" \
+                --body "The opaque candidate was observed again in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) at head ${{ github.sha }}. Details remain private under SECURITY.md."
               continue
             fi
 

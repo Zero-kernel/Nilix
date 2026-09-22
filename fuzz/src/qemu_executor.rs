@@ -21,6 +21,11 @@ pub const SMOKE_INPUTS: &[(&str, &[u8])] = &[
     ("uname", &[1, 12, 1, 3, 0x86, 0x01]),
 ];
 
+/// One allowlisted syscall that has no manual KCOV probe. This is the exact
+/// three-byte class found by the bounded campaign at revision `0788e60`;
+/// the header byte 120 maps to `sched_yield` via the target allowlist.
+pub const ZERO_COVERAGE_INPUT: (&str, &[u8]) = ("sched_yield", &[1, 120, 0]);
+
 pub fn configured_executor() -> Result<QemuExecutor> {
     let kernel = std::env::var_os("NILIX_FUZZ_KERNEL")
         .map(PathBuf::from)
@@ -107,6 +112,16 @@ mod tests {
             uname.syscalls[0].args,
             vec![Argument::Output { capacity: 390 }]
         );
+    }
+
+    #[test]
+    fn zero_coverage_seed_maps_to_sched_yield() {
+        let program = parse_fuzzer_input(ZERO_COVERAGE_INPUT.1).unwrap();
+        assert_eq!(program.syscalls[0].number, 24);
+        assert!(program.syscalls[0].args.is_empty());
+        for length in 0..ZERO_COVERAGE_INPUT.1.len() {
+            assert!(parse_fuzzer_input(&ZERO_COVERAGE_INPUT.1[..length]).is_err());
+        }
     }
 
     #[test]

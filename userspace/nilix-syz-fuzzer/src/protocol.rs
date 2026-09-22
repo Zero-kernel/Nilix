@@ -324,9 +324,6 @@ pub fn decode_result(bytes: &[u8], binding: &ProgramBinding) -> Result<DecodedRe
 
     let coverage = bytes[bitmap_offset..tag_offset].to_vec();
     let occupied_slot_popcount: u32 = coverage.iter().map(|byte| byte.count_ones()).sum();
-    if occupied_slot_count == 0 || occupied_slot_popcount == 0 {
-        bail!("result contains zero coverage");
-    }
     if occupied_slot_count != occupied_slot_popcount {
         bail!(
             "KCOV occupied-slot count {occupied_slot_count} does not match bitmap popcount {occupied_slot_popcount}"
@@ -702,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_result_round_trip_rejects_tampering_and_zero_dummy() {
+    fn authenticated_result_round_trip_accepts_zero_and_rejects_tampering() {
         let encoded = encode_program(&sample_program(), &ExecutionIdentity::fixed(9)).unwrap();
         let mut coverage = vec![0u8; KCOV_BITMAP_SIZE];
         coverage[3] = 0b1010_0001;
@@ -719,7 +716,9 @@ mod tests {
 
         let zero = vec![0u8; KCOV_BITMAP_SIZE];
         let zero_result = encode_result_for_test(&encoded.binding, &[0, 0], &zero).unwrap();
-        assert!(decode_result(&zero_result, &encoded.binding).is_err());
+        let zero_decoded = decode_result(&zero_result, &encoded.binding).unwrap();
+        assert_eq!(zero_decoded.coverage, zero);
+        assert_eq!(zero_decoded.occupied_slot_count, 0);
     }
 
     #[test]
