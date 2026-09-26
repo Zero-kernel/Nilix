@@ -1492,7 +1492,28 @@ pub fn assign_pid_chain(
     // This ensures we don't leave init_global_pid set for a namespace whose process
     // failed to allocate PIDs further down the chain.
     for membership in &chain {
-        if !membership.ns.is_root() && membership.pid == 1 {
+        if membership.pid != 1 {
+            continue;
+        }
+
+        if membership.ns.is_root() {
+            // Register the ROOT init too, so `reparent_orphans`' ROOT_INIT_PID
+            // fallback resolves to a real live reaper instead of relying on the
+            // bare numeric constant (the `debug_assert!(false)` boot-hardening
+            // TODO in `reparent_orphans` STEP 3).
+            //
+            // Best-effort, unlike the non-root arm below: `InitAlreadySet` must
+            // NOT fail chain allocation here. `clear_init` runs on detach, so a
+            // recycled root pid 1 normally finds the slot empty; if it does not,
+            // failing the whole PID allocation would be a strictly worse
+            // regression than keeping the existing mapping. Root is also exempt
+            // from the init-death cascade (`handle_namespace_init_death` skips
+            // `is_root()`), so registering it starts no kill cascade.
+            let _ = membership.ns.set_init(global_pid);
+            continue;
+        }
+
+        {
             // Ignore error if init already set (shouldn't happen for fresh namespace)
             if let Err(error) = membership.ns.set_init(global_pid) {
                 rollback(&mapped, &prior_next, &mut retired);

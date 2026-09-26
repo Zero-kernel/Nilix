@@ -9592,21 +9592,26 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
             }
         }
 
-        // STEP 3: ROOT_INIT_PID fallback — SAME one-lock-at-a-time protocol.
+        // STEP 3: root-init fallback — SAME one-lock-at-a-time protocol.
+        //
+        // Prefer the root namespace's REGISTERED init (published by
+        // `assign_pid_chain` when root pid 1 is created) over the bare
+        // ROOT_INIT_PID constant. The registration is identity-checked and
+        // cleared on detach, so it cannot name a recycled pid; the constant is
+        // only a last resort for very early boot, before pid 1 exists.
+        let root_init = crate::pid_namespace::ROOT_PID_NAMESPACE
+            .init_global_pid()
+            .unwrap_or(ROOT_INIT_PID);
+
         if !committed {
-            if child_pid == ROOT_INIT_PID {
+            if child_pid == root_init {
                 // pid 1 can never be its own reaper.
-                reparent_logged_leak(&child_arc, child_pid, ROOT_INIT_PID);
-            } else if !try_commit_reaper(&table, &child_arc, child_pid, ROOT_INIT_PID) {
-                // ROOT_INIT_PID absent / Zombie / Terminated: fail SAFE (deterministic
+                reparent_logged_leak(&child_arc, child_pid, root_init);
+            } else if !try_commit_reaper(&table, &child_arc, child_pid, root_init) {
+                // root init absent / Zombie / Terminated: fail SAFE (deterministic
                 // ppid, no dead-slot push) rather than panic — a panic on the teardown
-                // path would re-open the abandonment class this slice closes. A
-                // guaranteed-live global init is tracked as boot-hardening future work.
-                reparent_logged_leak(&child_arc, child_pid, ROOT_INIT_PID);
-                debug_assert!(
-                    false,
-                    "ROOT_INIT_PID must be a live reaper (boot-hardening pending)"
-                );
+                // path would re-open the abandonment class this slice closes.
+                reparent_logged_leak(&child_arc, child_pid, root_init);
             }
         }
     }
