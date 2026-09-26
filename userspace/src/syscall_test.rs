@@ -12,9 +12,9 @@
 
 use userspace::libc::{print, print_hex, print_int, println};
 use userspace::syscall::{
-    errno, is_error, sys_close, sys_fork, sys_getpid, sys_getrandom, sys_gettid, sys_open,
-    sys_read, sys_set_robust_list, sys_set_tid_address, sys_wait, syscall1, syscall2, syscall3,
-    syscall5, syscall6, SYS_MMAP, SYS_MREMAP, SYS_MUNMAP,
+    errno, is_error, sys_close, sys_fork, sys_getpid, sys_getppid, sys_getrandom, sys_gettid,
+    sys_open, sys_read, sys_set_robust_list, sys_set_tid_address, sys_wait, syscall1, syscall2,
+    syscall3, syscall4, syscall5, syscall6, SYS_MMAP, SYS_MREMAP, SYS_MUNMAP,
 };
 
 /// One 4 KiB page — the granularity of every mapping operation below.
@@ -192,6 +192,22 @@ pub extern "C" fn _start() -> ! {
     test_shared_anon_pte_preflight(&mut results);
     test_shared_anon_adjacent_pt(&mut results);
     test_shared_anon_migration(&mut results);
+
+    // ST-K3-WAITID: the guest leg for syscall 247. Runs after the memory legs
+    // because it forks; it maps nothing, so it cannot perturb their layout.
+    test_waitid(&mut results);
+
+    // ROOT-INIT: this binary runs as root-namespace PID 1, so an orphaned
+    // grandchild must be reparented to *us*. Last, because it forks twice.
+    test_root_init_reparent(&mut results);
+
+    // Fork refusal under cgroup pids.max: a refused fork must leave no
+    // child, no task charge and no consumed PID behind.
+    test_fork_pids_refusal(&mut results);
+
+    // M0-7 stack guard: a lazy-region touch demand-grows, a guard-page touch
+    // kills the toucher with SIGSEGV instead of being mapped.
+    test_user_stack_guard(&mut results);
 
     // Print summary
     println("");
@@ -1070,4 +1086,654 @@ fn test_mremap_charge_symmetry(results: &mut TestResult) {
 
         results.pass("mremap charge symmetry (grow/shrink/unmap)");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ST-K3-WAITID guest leg
+//
+// The hosted oracle (`st_k3_waitid_oracle_tests`) proves the argument contract
+// and the `siginfo_t` encoder in isolation. Nothing there exercises the parts
+// that need a live process tree: a real zombie, a real copyout into Ring-3
+// memory, and WNOWAIT's promise that the child *survives* the observation.
+// This leg drives syscall 247 through the actual dispatch arm.
+// ---------------------------------------------------------------------------
+
+/// `waitid(2)` is syscall 247 on x86_64 Linux; the kernel dispatches it there.
+const SYS_WAITID: u64 = 247;
+/// `waitid` idtypes and options — must match `kernel/kernel_core/syscall.rs`.
+const P_ALL: u64 = 0;
+const P_PID: u64 = 1;
+const P_PGID: u64 = 2;
+const WNOHANG: u64 = 0x1;
+const WUNTRACED: u64 = 0x2;
+const WEXITED: u64 = 0x4;
+const WNOWAIT: u64 = 0x0100_0000;
+/// `si_code` for a child that called exit().
+const CLD_EXITED: i32 = 1;
+const SIGCHLD: i32 = 17;
+const SIGINFO_SIZE: usize = 128;
+/// Poison written over the whole `siginfo_t` before each call, so a field the
+/// kernel forgot to write is caught instead of reading as a lucky zero.
+const POISON: u8 = 0xA5;
+
+/// EINVAL and EFAULT are the file-level constants above; only ECHILD is new.
+const ECHILD: i32 = 10;
+
+/// 128-byte `siginfo_t`, 8-byte aligned like the real one.
+#[repr(C, align(8))]
+struct SigInfo {
+    bytes: [u8; SIGINFO_SIZE],
+}
+
+impl SigInfo {
+    fn poisoned() -> Self {
+        SigInfo {
+            bytes: [POISON; SIGINFO_SIZE],
+        }
+    }
+
+    fn i32_at(&self, off: usize) -> i32 {
+        i32::from_ne_bytes([
+            self.bytes[off],
+            self.bytes[off + 1],
+            self.bytes[off + 2],
+            self.bytes[off + 3],
+        ])
+    }
+
+    fn signo(&self) -> i32 {
+        self.i32_at(0)
+    }
+    fn code(&self) -> i32 {
+        self.i32_at(8)
+    }
+    fn pid(&self) -> i32 {
+        self.i32_at(16)
+    }
+    fn status(&self) -> i32 {
+        self.i32_at(24)
+    }
+}
+
+fn waitid(idtype: u64, id: u64, info: *mut SigInfo, options: u64) -> u64 {
+    unsafe { syscall4(SYS_WAITID, idtype, id, info as u64, options) }
+}
+
+/// Fork a child that exits immediately with `code`. Returns the child's pid as
+/// the parent sees it, or `None` if fork failed.
+fn spawn_exiting_child(code: u64) -> Option<u64> {
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        return None;
+    }
+    if child == 0 {
+        unsafe { userspace::syscall::sys_exit(code) };
+    }
+    Some(child)
+}
+
+/// Last-resort cleanup so a failing sub-check never leaks a zombie into the
+/// legs that run after this one.
+fn reap_quietly(pid: u64) {
+    let mut info = SigInfo::poisoned();
+    let _ = waitid(P_PID, pid, &mut info, WEXITED);
+}
+
+fn test_waitid(results: &mut TestResult) {
+    print("Testing waitid (syscall 247)... ");
+
+    // 1. Validation happens before any state is consulted, so none of these
+    //    needs a child. Each is a claim in §4 of the design.
+    let mut info = SigInfo::poisoned();
+    let bad = [
+        (P_PGID, 1, WEXITED, "P_PGID"),
+        (P_PID, 0, WEXITED, "P_PID with id 0"),
+        (7, 1, WEXITED, "unknown idtype"),
+        (P_ALL, 0, 0, "missing WEXITED"),
+        (P_ALL, 0, WEXITED | WUNTRACED, "WUNTRACED"),
+        (P_ALL, 0, WEXITED | (1 << 20), "unknown option bit"),
+    ];
+    for (idtype, id, opts, what) in bad {
+        let r = waitid(idtype, id, &mut info, opts);
+        if errno(r) != EINVAL {
+            println("");
+            print("  expected EINVAL for ");
+            print(what);
+            print(", got errno ");
+            print_int(errno(r) as i64);
+            println("");
+            results.fail("waitid rejects malformed arguments with EINVAL");
+            return;
+        }
+    }
+
+    // 2. With no children at all the answer is ECHILD — even under WNOHANG,
+    //    which only turns "children exist but none ready" into a non-block.
+    let r = waitid(P_ALL, 0, &mut info, WEXITED | WNOHANG);
+    if errno(r) != ECHILD {
+        println("");
+        print("  no children: expected ECHILD, got errno ");
+        print_int(errno(r) as i64);
+        println("");
+        results.fail("waitid reports ECHILD with no children");
+        return;
+    }
+
+    // 3. A real zombie: the siginfo is written through a Ring-3 copyout.
+    let Some(child) = spawn_exiting_child(42) else {
+        results.fail("waitid: fork failed");
+        return;
+    };
+
+    // WNOWAIT must *observe* the zombie and leave it reapable.
+    let mut peek = SigInfo::poisoned();
+    let r = waitid(P_PID, child, &mut peek, WEXITED | WNOWAIT);
+    if is_error(r) || r != 0 {
+        println("");
+        print("  WNOWAIT peek failed, errno ");
+        print_int(errno(r) as i64);
+        println("");
+        reap_quietly(child);
+        results.fail("waitid WNOWAIT observes the zombie");
+        return;
+    }
+    if peek.signo() != SIGCHLD
+        || peek.code() != CLD_EXITED
+        || peek.pid() as u64 != child
+        || peek.status() != 42
+    {
+        println("");
+        print("  WNOWAIT siginfo: signo=");
+        print_int(peek.signo() as i64);
+        print(" code=");
+        print_int(peek.code() as i64);
+        print(" pid=");
+        print_int(peek.pid() as i64);
+        print(" status=");
+        print_int(peek.status() as i64);
+        println("");
+        reap_quietly(child);
+        results.fail("waitid WNOWAIT reports the correct siginfo");
+        return;
+    }
+
+    // A bad infop must fail with EFAULT *and* leave the zombie reapable:
+    // publication precedes the reap commit. Address 0x10 sits below
+    // MMAP_MIN_ADDR, so the pointer check rejects it before any copy.
+    let r = waitid(P_PID, child, 0x10 as *mut SigInfo, WEXITED);
+    if errno(r) != EFAULT {
+        println("");
+        print("  bad infop: expected EFAULT, got errno ");
+        print_int(errno(r) as i64);
+        println("");
+        reap_quietly(child);
+        results.fail("waitid faulting infop returns EFAULT");
+        return;
+    }
+
+    // The real reap. If WNOWAIT or the EFAULT path had consumed the zombie,
+    // this finds nothing and returns ECHILD.
+    let mut reaped = SigInfo::poisoned();
+    let r = waitid(P_PID, child, &mut reaped, WEXITED);
+    if is_error(r) || reaped.pid() as u64 != child || reaped.status() != 42 {
+        println("");
+        print("  reap after WNOWAIT+EFAULT: errno ");
+        print_int(errno(r) as i64);
+        print(" pid=");
+        print_int(reaped.pid() as i64);
+        print(" status=");
+        print_int(reaped.status() as i64);
+        println("");
+        results.fail("waitid: zombie survives WNOWAIT and a faulting infop");
+        return;
+    }
+
+    // And now it is gone: a second reap has nothing to find.
+    let r = waitid(P_PID, child, &mut reaped, WEXITED);
+    if errno(r) != ECHILD {
+        println("");
+        print("  second reap: expected ECHILD, got errno ");
+        print_int(errno(r) as i64);
+        println("");
+        results.fail("waitid: a reaped child is not reaped twice");
+        return;
+    }
+
+    // 4. The union tail past si_status must be zeroed, not left as poison: the
+    //    kernel writes all 128 bytes so no stale user bytes survive.
+    if reaped.bytes[28..].iter().any(|&b| b != 0) {
+        results.fail("waitid zeroes the siginfo tail past si_status");
+        return;
+    }
+
+    // 5. P_ALL picks up any child, and wait4 still interoperates with the
+    //    shared reap engine after a waitid call.
+    let Some(any_child) = spawn_exiting_child(7) else {
+        results.fail("waitid: second fork failed");
+        return;
+    };
+    let mut any = SigInfo::poisoned();
+    let r = waitid(P_ALL, 0, &mut any, WEXITED);
+    if is_error(r) || any.pid() as u64 != any_child || any.status() != 7 {
+        println("");
+        print("  P_ALL: errno ");
+        print_int(errno(r) as i64);
+        print(" pid=");
+        print_int(any.pid() as i64);
+        println("");
+        reap_quietly(any_child);
+        results.fail("waitid P_ALL reaps any child");
+        return;
+    }
+
+    results.pass("waitid argument contract, WNOWAIT survival, EFAULT-before-reap, P_ALL");
+}
+
+// ---------------------------------------------------------------------------
+// ROOT-INIT guest leg
+//
+// `assign_pid_chain` now registers root-namespace init, and `reparent_orphans`
+// resolves its fallback reaper from that registration. The Ring-3 gate boots
+// this binary as PID 1, which makes the whole path observable from userspace:
+// orphan a grandchild, and the kernel must hand it to us.
+//
+// The proof is not getppid() alone — a stale ppid write would satisfy that.
+// It is that PID 1 can then *reap* the grandchild with P_PID, which succeeds
+// only if the grandchild was actually linked into PID 1's `children` list.
+// ---------------------------------------------------------------------------
+
+/// Bound the grandchild's wait for its parent to die. Each iteration yields,
+/// so this is a scheduling budget, not a busy spin of fixed duration.
+const REPARENT_SPIN_LIMIT: u32 = 200_000;
+/// Grandchild exit codes. Distinct values let the parent tell a reparent that
+/// never happened apart from one that landed on the wrong reaper.
+const GC_REPARENTED_TO_INIT: u64 = 91;
+const GC_REPARENTED_ELSEWHERE: u64 = 92;
+const GC_NEVER_ORPHANED: u64 = 93;
+
+fn test_root_init_reparent(results: &mut TestResult) {
+    print("Testing root-init orphan reparenting... ");
+
+    let me = unsafe { sys_getpid() };
+    if me != 1 {
+        // The claim is specifically about root-namespace init. If this binary
+        // is not PID 1 the premise does not hold; say so instead of passing.
+        print("running as pid ");
+        print_int(me as i64);
+        println("");
+        results.skip("root-init reparent requires the fixture to run as PID 1");
+        return;
+    }
+
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        results.fail("root-init reparent: fork failed");
+        return;
+    }
+
+    if child == 0 {
+        // Middle process: spawn the grandchild, then die so it is orphaned.
+        // Capture our pid *before* forking so the grandchild inherits it. The
+        // grandchild must not sample getppid() to learn its original parent:
+        // if it is first scheduled after we have already exited, that sample
+        // is already 1 and a "did it change?" check can never fire.
+        let mid_pid = unsafe { sys_getpid() };
+        let gc = unsafe { sys_fork() };
+        if is_error(gc) {
+            unsafe { userspace::syscall::sys_exit(1) };
+        }
+        if gc == 0 {
+            // Grandchild: wait until our parent is gone, then report who
+            // adopted us through the exit code. Compared against the known
+            // middle pid, so this holds however the scheduler orders us.
+            let mut spins = 0u32;
+            loop {
+                let now = unsafe { sys_getppid() };
+                if now == 1 {
+                    unsafe { userspace::syscall::sys_exit(GC_REPARENTED_TO_INIT) };
+                }
+                if now != mid_pid {
+                    unsafe { userspace::syscall::sys_exit(GC_REPARENTED_ELSEWHERE) };
+                }
+                spins += 1;
+                if spins >= REPARENT_SPIN_LIMIT {
+                    unsafe { userspace::syscall::sys_exit(GC_NEVER_ORPHANED) };
+                }
+                unsafe { userspace::syscall::sys_yield() };
+            }
+        }
+        // Report the grandchild's pid to PID 1 through our own exit code.
+        // PIDs in this fixture are small, so the low byte is unambiguous;
+        // the parent cross-checks it below rather than trusting it blindly.
+        unsafe { userspace::syscall::sys_exit(gc & 0xff) };
+    }
+
+    // PID 1: reap the middle process and learn the grandchild's pid.
+    let mut mid = SigInfo::poisoned();
+    let r = waitid(P_PID, child, &mut mid, WEXITED);
+    if is_error(r) || mid.pid() as u64 != child {
+        println("");
+        print("  middle reap failed, errno ");
+        print_int(errno(r) as i64);
+        println("");
+        results.fail("root-init reparent: middle process was not reaped");
+        return;
+    }
+    let grandchild = mid.status() as u64;
+    if grandchild == 0 || grandchild == 1 || grandchild == child {
+        println("");
+        print("  implausible grandchild pid ");
+        print_int(grandchild as i64);
+        println("");
+        results.fail("root-init reparent: middle process reported a bad pid");
+        return;
+    }
+
+    // The decisive step: reap the grandchild *by pid*. This can only succeed
+    // if reparent_orphans linked it into PID 1's children. A grandchild left
+    // attached to the dead middle process would yield ECHILD here.
+    let mut gc = SigInfo::poisoned();
+    let r = waitid(P_PID, grandchild, &mut gc, WEXITED);
+    if is_error(r) {
+        println("");
+        print("  grandchild ");
+        print_int(grandchild as i64);
+        print(" not reapable by PID 1, errno ");
+        print_int(errno(r) as i64);
+        println("");
+        results.fail("root-init reparent: orphan was not adopted by PID 1");
+        return;
+    }
+    if gc.pid() as u64 != grandchild {
+        results.fail("root-init reparent: reaped the wrong process");
+        return;
+    }
+    match gc.status() as u64 {
+        GC_REPARENTED_TO_INIT => {}
+        GC_REPARENTED_ELSEWHERE => {
+            results.fail("root-init reparent: orphan's ppid moved but not to PID 1");
+            return;
+        }
+        GC_NEVER_ORPHANED => {
+            results.fail("root-init reparent: orphan never observed a ppid change");
+            return;
+        }
+        other => {
+            println("");
+            print("  unexpected grandchild exit code ");
+            print_int(other as i64);
+            println("");
+            results.fail("root-init reparent: grandchild exited unexpectedly");
+            return;
+        }
+    }
+
+    // Nothing else may be left behind for PID 1.
+    let mut left = SigInfo::poisoned();
+    let r = waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG);
+    if errno(r) != ECHILD {
+        results.fail("root-init reparent: PID 1 still has children afterwards");
+        return;
+    }
+
+    results.pass("root-init adopts an orphaned grandchild and can reap it");
+}
+
+// ---------------------------------------------------------------------------
+// Fork refusal under pids.max
+//
+// `fork::sys_fork` checks `pids.max` before it creates anything and again when
+// it attaches the child, and on refusal releases the child link, cgroup charge,
+// scheduler slot and PCB. This leg pins the observable contract of that path:
+// a refused fork returns EAGAIN and leaves nothing behind — no reapable child,
+// no task counted in the cgroup, and no PID burned.
+//
+// It does not prove which of the two refusal points fired. With one task
+// already in the cgroup and pids.max == 1 the pre-check refuses first, so the
+// attach-time rollback is exercised only indirectly. The distinction is stated
+// in the design notes rather than implied here.
+// ---------------------------------------------------------------------------
+
+const SYS_CGROUP_DESTROY: u64 = 501;
+const SYS_CGROUP_SET_LIMIT: u64 = 503;
+const CGROUP_CTRL_PIDS: u64 = 0x04;
+const CGROUP_LIMIT_PIDS_MAX: u64 = 5;
+/// `nr_tasks` sits after `id: u64, depth: u32, controllers: u32` in the stats
+/// buffer. Must match `CgroupStatsBuf` in `kernel/kernel_core/syscall.rs`.
+const CGROUP_STATS_NR_TASKS_OFFSET: usize = 16;
+const EAGAIN: i32 = 11;
+/// Forks attempted against the full cgroup. Several, so a leak that only shows
+/// up cumulatively (one PID per refusal) is visible in the next PID handed out.
+const REFUSED_FORKS: usize = 4;
+
+unsafe fn cgroup_nr_tasks(id: u64) -> Option<u64> {
+    let mut buf = [0u8; CGROUP_STATS_V1_SIZE];
+    if is_error(syscall2(SYS_CGROUP_GET_STATS, id, buf.as_mut_ptr() as u64)) {
+        return None;
+    }
+    let o = CGROUP_STATS_NR_TASKS_OFFSET;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&buf[o..o + 8]);
+    Some(u64::from_ne_bytes(raw))
+}
+
+fn test_fork_pids_refusal(results: &mut TestResult) {
+    print("Testing fork refusal under pids.max... ");
+
+    unsafe {
+        let created = syscall2(SYS_CGROUP_CREATE, 0, CGROUP_CTRL_PIDS) as i64;
+        if err_of(created) != 0 {
+            if matches!(err_of(created), 1 | 13) {
+                results.skip("fork pids refusal: requires host-root fixture");
+            } else {
+                print("errno=");
+                print_int(err_of(created) as i64);
+                print(" ");
+                results.fail("fork pids refusal: unexpected cgroup creation error");
+            }
+            return;
+        }
+        let cg = created as u64;
+
+        // pids.max == 1 and we are the one task: every fork must be refused.
+        if is_error(syscall3(SYS_CGROUP_SET_LIMIT, cg, CGROUP_LIMIT_PIDS_MAX, 1)) {
+            let _ = syscall1(SYS_CGROUP_DESTROY, cg);
+            results.fail("fork pids refusal: could not set pids.max");
+            return;
+        }
+        if err_of(syscall1(SYS_CGROUP_ATTACH, cg) as i64) != 0 {
+            let _ = syscall1(SYS_CGROUP_DESTROY, cg);
+            results.fail("fork pids refusal: could not attach to the limited cgroup");
+            return;
+        }
+
+        let before = cgroup_nr_tasks(cg);
+        let mut refusal_ok = true;
+        for _ in 0..REFUSED_FORKS {
+            let r = sys_fork();
+            if r == 0 {
+                // A child slipped past the limit. Leave at once; the parent
+                // records the failure and still reaps us below.
+                userspace::syscall::sys_exit(77);
+            }
+            if errno(r) != EAGAIN {
+                print("fork returned ");
+                print_int(r as i64);
+                print(" ");
+                refusal_ok = false;
+            }
+        }
+        let after = cgroup_nr_tasks(cg);
+
+        // Leave the limited cgroup before any further fork, whatever happened.
+        let _ = syscall1(SYS_CGROUP_ATTACH, 0);
+
+        // Nothing may be reapable: a refused fork never produced a child.
+        let mut left = SigInfo::poisoned();
+        let leftover = waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG);
+        let no_child = errno(leftover) == ECHILD;
+        if !no_child {
+            // Reap whatever escaped so later legs start clean.
+            while !is_error(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) && left.pid() != 0 {}
+        }
+
+        // A later fork, now unlimited, must get the very next PID. If each
+        // refused fork had consumed a PID, this one would be pushed forward.
+        let probe = sys_fork();
+        if probe == 0 {
+            userspace::syscall::sys_exit(0);
+        }
+        let mut reaped = SigInfo::poisoned();
+        if !is_error(probe) {
+            let _ = waitid(P_PID, probe, &mut reaped, WEXITED);
+        }
+        let _ = syscall1(SYS_CGROUP_DESTROY, cg);
+
+        if !refusal_ok {
+            results.fail("fork pids refusal: a fork past pids.max did not return EAGAIN");
+            return;
+        }
+        if !no_child {
+            results.fail("fork pids refusal: a refused fork left a reapable child");
+            return;
+        }
+        match (before, after) {
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => {
+                print("nr_tasks ");
+                print_int(b as i64);
+                print("->");
+                print_int(a as i64);
+                print(" ");
+                results.fail("fork pids refusal: refused forks changed the task count");
+                return;
+            }
+            _ => {
+                results.fail("fork pids refusal: cgroup stats unreadable");
+                return;
+            }
+        }
+        if is_error(probe) {
+            results.fail("fork pids refusal: fork failed after leaving the limited cgroup");
+            return;
+        }
+        print("probe pid ");
+        print_int(probe as i64);
+        print(" ");
+        results.pass("fork refused by pids.max leaves no child, task charge or reapable zombie");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M0-7 user-stack guard page
+//
+// The user stack window is fixed (no stack ASLR), so the guard page can be
+// addressed directly instead of provoked by unbounded recursion:
+//
+//   [STACK_BASE, USABLE_BASE)   one unmapped guard page
+//   [USABLE_BASE, EAGER_FLOOR)  lazy region, demand-grown on #PF
+//   [EAGER_FLOOR, STACK_TOP)    mapped at exec
+//
+// Each probe runs in a forked child, because a guard hit is fatal by design.
+// Must match `USER_STACK_TOP/SIZE/GUARD_SIZE/EAGER_SIZE` in
+// `kernel/kernel_core/elf_loader.rs`.
+// ---------------------------------------------------------------------------
+
+const USER_STACK_TOP: usize = 0x0000_7FFF_FFFF_E000;
+const USER_STACK_SIZE: usize = 0x20_0000;
+const USER_STACK_GUARD_SIZE: usize = 0x1000;
+const USER_STACK_EAGER_SIZE: usize = 16 * 1024;
+const STACK_BASE: usize = USER_STACK_TOP - USER_STACK_SIZE;
+const USABLE_BASE: usize = STACK_BASE + USER_STACK_GUARD_SIZE;
+const EAGER_FLOOR: usize = USER_STACK_TOP - USER_STACK_EAGER_SIZE;
+/// Exit code of a task killed by a user-mode #PF: 128 + SIGSEGV(11).
+const SIGSEGV_EXIT: i32 = 139;
+/// Exit code a probe child uses when its access unexpectedly *succeeded*.
+const PROBE_SURVIVED: u64 = 55;
+
+/// Fork a child that writes one byte at `addr` and then exits 0. Returns the
+/// child's exit status as seen by waitid, or None if fork/wait failed.
+fn probe_write(addr: usize) -> Option<i32> {
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        return None;
+    }
+    if child == 0 {
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u8, 0x5A);
+            // Only reached if the store did not fault.
+            let v = core::ptr::read_volatile(addr as *const u8);
+            userspace::syscall::sys_exit(if v == 0x5A { 0 } else { PROBE_SURVIVED + 1 });
+        }
+    }
+    let mut info = SigInfo::poisoned();
+    let r = waitid(P_PID, child, &mut info, WEXITED);
+    if is_error(r) || info.pid() as u64 != child {
+        return None;
+    }
+    Some(info.status())
+}
+
+fn test_user_stack_guard(results: &mut TestResult) {
+    print("Testing user stack guard page... ");
+
+    // Sanity: this frame really lives in the window we are about to probe. If
+    // the layout ever moves, fail loudly instead of probing unrelated memory.
+    let here = &results as *const _ as usize;
+    if !(EAGER_FLOOR..USER_STACK_TOP).contains(&here) {
+        print("stack at ");
+        print_hex(here as u64);
+        print(" ");
+        results.fail("stack guard: fixture stack is not in the expected window");
+        return;
+    }
+
+    // 1. The lowest lazy page (just above the guard) must demand-grow. This is
+    //    the deepest legal access; if it faulted, the guard would be too big.
+    match probe_write(USABLE_BASE) {
+        Some(0) => {}
+        Some(code) => {
+            print("lowest-lazy exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("stack guard: the lowest lazy stack page did not demand-grow");
+            return;
+        }
+        None => {
+            results.fail("stack guard: lazy probe fork/wait failed");
+            return;
+        }
+    }
+
+    // 2. Every byte of the guard page must fault. Probe both ends: an
+    //    off-by-one in the grow bound would map the top of the guard only.
+    for (addr, what) in [
+        (USABLE_BASE - 1, "top byte of the guard page"),
+        (STACK_BASE, "bottom byte of the guard page"),
+    ] {
+        match probe_write(addr) {
+            Some(SIGSEGV_EXIT) => {}
+            Some(code) => {
+                print(what);
+                print(" exit ");
+                print_int(code as i64);
+                print(" ");
+                results.fail("stack guard: a guard-page write did not SIGSEGV");
+                return;
+            }
+            None => {
+                results.fail("stack guard: guard probe fork/wait failed");
+                return;
+            }
+        }
+    }
+
+    // 3. The parent is untouched by its children's faults.
+    let mut left = SigInfo::poisoned();
+    if errno(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) != ECHILD {
+        results.fail("stack guard: probe children were left unreaped");
+        return;
+    }
+
+    results.pass("user stack guard page faults while the lazy region above it grows");
 }

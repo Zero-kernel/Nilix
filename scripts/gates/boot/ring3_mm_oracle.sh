@@ -69,6 +69,10 @@ mremap charge symmetry
 MAP_SHARED|MAP_ANONYMOUS fork visibility + mremap boundary
 shared-anon cross-page usercopy first touch
 shared-anon adjacent private PT lifetime
+waitid argument contract, WNOWAIT survival, EFAULT-before-reap, P_ALL
+root-init adopts an orphaned grandchild and can reap it
+fork refused by pids.max leaves no child, task charge or reapable zombie
+user stack guard page faults while the lazy region above it grows
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
