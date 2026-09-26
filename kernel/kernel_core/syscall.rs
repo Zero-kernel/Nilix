@@ -7593,15 +7593,80 @@ pub fn run_exec_disambiguation_self_test() {
 ///   kernel's unified 128+sig exit code, i.e. as an "exited" status — the
 ///   single-exit-code model predates signaled-death wstatus encoding.
 fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
-    const WNOHANG: i32 = 0x1;
-    const WUNTRACED: i32 = 0x2;
-    const WCONTINUED: i32 = 0x8;
     if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
         return Err(SyscallError::EINVAL);
     }
     if pid_sel == 0 || pid_sel < -1 {
         return Err(SyscallError::EINVAL);
     }
+    let target = if pid_sel > 0 {
+        WaitTarget::Pid(pid_sel as ProcessId)
+    } else {
+        WaitTarget::Any
+    };
+
+    // The wstatus store is the core's `publish` step: it runs at the point the
+    // old inline code wrote it — after a reapable zombie is chosen, before the
+    // child is unlinked and cleaned up — so an EFAULT leaves the zombie
+    // reapable and restores the parent to Ready.
+    let publish = |outcome: &WaitOutcome| -> Result<(), SyscallError> {
+        if status.is_null() {
+            return Ok(());
+        }
+        let wstatus: i32 = (outcome.exit_code & 0xff) << 8;
+        copy_to_user(status as *mut u8, &wstatus.to_ne_bytes())
+    };
+
+    match wait_reap_core(target, options & WNOHANG != 0, false, publish)? {
+        Some(outcome) => Ok(outcome.view_pid),
+        // WNOHANG with nothing reapable.
+        None => Ok(0),
+    }
+}
+
+const WNOHANG: i32 = 0x1;
+const WUNTRACED: i32 = 0x2;
+const WCONTINUED: i32 = 0x8;
+
+/// Which children a wait call will accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitTarget {
+    /// Any child (`wait4(-1, ..)`, `waitid(P_ALL, ..)`).
+    Any,
+    /// Exactly this child, named in the caller's PID namespace.
+    Pid(ProcessId),
+}
+
+/// A reaped child, described both globally and as the caller sees it.
+struct WaitOutcome {
+    global_pid: ProcessId,
+    view_pid: ProcessId,
+    exit_code: i32,
+}
+
+/// Shared blocking reap loop behind `wait4(2)` and `waitid(2)`.
+///
+/// This is the lost-wakeup-critical path: `Blocked` + `waiting_child` are
+/// published BEFORE the child scan so a child exiting in the gap still wakes
+/// the parent, and every exit edge must restore `Ready` and clear
+/// `waiting_child`. Both callers share it so those invariants have one home.
+///
+/// `publish` runs once a reapable zombie is selected and before it is unlinked;
+/// returning `Err` aborts the reap with the child still reapable.
+///
+/// `nowait` implements `WNOWAIT`: the child is reported but left as a reapable
+/// zombie (not unlinked, not cleaned up), so a later wait sees it again.
+///
+/// Returns `Ok(None)` only when `nohang` is set and nothing is reapable yet.
+fn wait_reap_core<W>(
+    target: WaitTarget,
+    nohang: bool,
+    nowait: bool,
+    mut publish: W,
+) -> Result<Option<WaitOutcome>, SyscallError>
+where
+    W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
+{
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
@@ -7767,8 +7832,10 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
                     let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
                         continue;
                     };
-                    if pid_sel > 0 && view_pid != pid_sel as ProcessId {
-                        continue;
+                    if let WaitTarget::Pid(want) = target {
+                        if view_pid != want {
+                            continue;
+                        }
                     }
 
                     selected_exists = true;
@@ -7799,23 +7866,29 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
         }
 
         if let Some((child_pid, exit_code, parent_view_pid)) = zombie_child {
-            // 将退出码写入用户空间（如果提供了 status 指针）
-            if !status.is_null() {
-                // ST-K3 FIX (wait4 ABI): Linux wstatus encoding for a normal
-                // exit — WIFEXITED requires (status & 0x7f) == 0 and
-                // WEXITSTATUS reads bits 8..16, so the raw exit code must be
-                // shifted. Also: a copy failure must restore Ready before
-                // returning (the old `?` leaked the parent in Blocked while
-                // running); the zombie stays reapable, matching Linux EFAULT
-                // semantics.
-                let wstatus: i32 = (exit_code & 0xff) << 8;
-                let bytes = wstatus.to_ne_bytes();
-                if let Err(e) = copy_to_user(status as *mut u8, &bytes) {
-                    let mut proc = parent.lock();
-                    proc.enter_ready_at(crate::get_ticks());
-                    proc.waiting_child = None;
-                    return Err(e);
-                }
+            let outcome = WaitOutcome {
+                global_pid: child_pid,
+                view_pid: parent_view_pid,
+                exit_code,
+            };
+
+            // Report to the caller before committing the reap. A failure here
+            // must restore Ready and leave the zombie reapable, matching Linux
+            // EFAULT semantics for a bad status/siginfo pointer.
+            if let Err(e) = publish(&outcome) {
+                let mut proc = parent.lock();
+                proc.enter_ready_at(crate::get_ticks());
+                proc.waiting_child = None;
+                return Err(e);
+            }
+
+            if nowait {
+                // WNOWAIT: leave the child linked and un-cleaned so a later
+                // wait can reap it. Only the parent's own wait state is undone.
+                let mut proc = parent.lock();
+                proc.waiting_child = None;
+                proc.enter_ready_at(crate::get_ticks());
+                return Ok(Some(outcome));
             }
 
             {
@@ -7835,7 +7908,7 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
                 exit_code
             );
             // F.1: Return namespace-local PID to parent (Linux semantics)
-            return Ok(parent_view_pid);
+            return Ok(Some(outcome));
         }
 
         // 清理过期的子进程 PID
@@ -7856,12 +7929,13 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
         }
 
         // ST-K3 FIX (wait4 ABI): WNOHANG — nothing reapable right now, so
-        // undo the published Blocked state and return 0 instead of blocking.
-        if options & WNOHANG != 0 {
+        // undo the published Blocked state and report "nothing yet" instead of
+        // blocking. wait4 maps this to 0; waitid to a zeroed siginfo.
+        if nohang {
             let mut proc = parent.lock();
             proc.enter_ready_at(crate::get_ticks());
             proc.waiting_child = None;
-            return Ok(0);
+            return Ok(None);
         }
 
         // 没有找到僵尸子进程，让出 CPU 等待被唤醒
@@ -23104,19 +23178,139 @@ fn sys_lchown(_path: *const u8, _uid: u32, _gid: u32) -> Result<usize, SyscallEr
     Err(SyscallError::ENOSYS)
 }
 
-/// waitid(2) - wait for child process to change state
+/// `waitid(2)` idtype: wait for any child.
+const P_ALL: i32 = 0;
+/// `waitid(2)` idtype: wait for one child by PID.
+const P_PID: i32 = 1;
+/// `waitid(2)` idtype: wait for any child in a process group.
+const P_PGID: i32 = 2;
+
+/// `waitid(2)` option: report children that have exited.
+const WEXITED: i32 = 0x4;
+/// `waitid(2)` option: report without reaping — the child stays reapable.
+const WNOWAIT: i32 = 0x0100_0000;
+
+/// `si_code` for a child that exited normally.
+const CLD_EXITED: i32 = 1;
+
+/// Byte offsets into the x86_64 `siginfo_t` fields `waitid` fills.
+/// Layout: si_signo(0) si_errno(4) si_code(8) __pad(12) then the _sigchld
+/// union at 16: si_pid(16) si_uid(20) si_status(24).
+const SI_OFF_SIGNO: usize = 0;
+const SI_OFF_ERRNO: usize = 4;
+const SI_OFF_CODE: usize = 8;
+const SI_OFF_PID: usize = 16;
+const SI_OFF_UID: usize = 20;
+const SI_OFF_STATUS: usize = 24;
+/// Size of `siginfo_t` on x86_64. The whole struct is written so no stale user
+/// bytes remain visible in the padding or the unused union tail.
+const SIGINFO_SIZE: usize = 128;
+
+/// waitid(2) - wait for a child process to change state
 ///
-/// # M0-6 Implementation Strategy
-/// Dispatch-or-stub per plan. More complex than wait4, supports WNOWAIT.
-fn sys_waitid(
-    _idtype: i32,
-    _id: i32,
-    _infop: *mut u8,
-    _options: i32,
-) -> Result<usize, SyscallError> {
-    // M0-6: waitid is like wait4 but with siginfo_t and WNOWAIT support
-    // Current wait4 implementation could be adapted
-    Err(SyscallError::ENOSYS)
+/// Shares the blocking reap loop with [`sys_wait4`] via [`wait_reap_core`], so
+/// the lost-wakeup and `Blocked`-restore invariants have a single home. The
+/// differences from `wait4` are the reporting format and `WNOWAIT`:
+/// - the result is a `siginfo_t` at `infop` rather than a packed wstatus, and
+///   the return value is 0 on success (the PID travels in `si_pid`);
+/// - `WNOWAIT` reports the child but leaves it reapable for a later wait;
+/// - `WEXITED` is required. `WSTOPPED`/`WCONTINUED` are rejected with EINVAL
+///   rather than silently ignored as `wait4` does: this kernel records no
+///   parent-visible stop/continue event, so accepting them would promise
+///   notifications that can never arrive and hang the caller. `wait4` keeps
+///   ignoring them only for backward compatibility.
+/// - `P_PGID` is refused (EINVAL, fail-closed) on the same grounds `wait4`
+///   refuses its process-group selectors: no process-group wait tracking.
+///
+/// A zeroed `siginfo_t` plus a 0 return is the `WNOHANG`-nothing-ready answer,
+/// matching Linux: callers distinguish it by `si_pid == 0`.
+/// Pure `waitid(2)` argument contract: the whole fail-closed decision with no
+/// process state touched, so the hosted oracle can execute the production path
+/// rather than a copy of it.
+fn waitid_validate_args(idtype: i32, id: i32, options: i32) -> Result<WaitTarget, SyscallError> {
+    const KNOWN: i32 = WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT;
+    if options & !KNOWN != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    // No stop/continue event ledger exists, so these can never be satisfied.
+    if options & (WUNTRACED | WCONTINUED) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if options & WEXITED == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    match idtype {
+        P_ALL => Ok(WaitTarget::Any),
+        P_PID => {
+            if id <= 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            Ok(WaitTarget::Pid(id as ProcessId))
+        }
+        P_PGID => Err(SyscallError::EINVAL),
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+/// Pure `siginfo_t` encoder for `waitid`. Always returns the full 128 bytes so
+/// no stale user bytes survive in the padding or the unused union tail; `pid == 0`
+/// is the `WNOHANG`-nothing-ready shape and stays fully zeroed.
+fn waitid_encode_siginfo(pid: ProcessId, uid: u32, code: i32, status: i32) -> [u8; SIGINFO_SIZE] {
+    let mut buf = [0u8; SIGINFO_SIZE];
+    if pid != 0 {
+        buf[SI_OFF_SIGNO..SI_OFF_SIGNO + 4]
+            .copy_from_slice(&crate::signal::Signal::SIGCHLD.as_i32().to_ne_bytes());
+        buf[SI_OFF_ERRNO..SI_OFF_ERRNO + 4].copy_from_slice(&0i32.to_ne_bytes());
+        buf[SI_OFF_CODE..SI_OFF_CODE + 4].copy_from_slice(&code.to_ne_bytes());
+        buf[SI_OFF_PID..SI_OFF_PID + 4].copy_from_slice(&(pid as i32).to_ne_bytes());
+        buf[SI_OFF_UID..SI_OFF_UID + 4].copy_from_slice(&uid.to_ne_bytes());
+        buf[SI_OFF_STATUS..SI_OFF_STATUS + 4].copy_from_slice(&status.to_ne_bytes());
+    }
+    buf
+}
+
+fn sys_waitid(idtype: i32, id: i32, infop: *mut u8, options: i32) -> Result<usize, SyscallError> {
+    let target = waitid_validate_args(idtype, id, options)?;
+
+    let write_siginfo = |pid: ProcessId, uid: u32, code: i32, status: i32| {
+        copy_to_user(infop, &waitid_encode_siginfo(pid, uid, code, status))
+    };
+
+    // Resolved while the zombie is still selected but before it is unlinked:
+    // after cleanup_zombie the PCB is gone and si_uid would be unrecoverable.
+    let publish = |outcome: &WaitOutcome| -> Result<(), SyscallError> {
+        if infop.is_null() {
+            // Linux accepts a NULL infop and reports only via the return value.
+            return Ok(());
+        }
+        // try_read (not read): a blocking credential read here would be taken
+        // while the wait path already holds process state, so a contended
+        // writer could deadlock. uid 0 on contention is the fail-soft answer.
+        let uid = get_process(outcome.global_pid)
+            .map(|p| p.lock().shared_credentials())
+            .and_then(|creds| creds.try_read().map(|c| c.uid))
+            .unwrap_or(0);
+        // si_status carries the raw exit code, NOT the packed wstatus: with
+        // si_code == CLD_EXITED, userspace reads it directly as the exit status.
+        write_siginfo(outcome.view_pid, uid, CLD_EXITED, outcome.exit_code & 0xff)
+    };
+
+    match wait_reap_core(
+        target,
+        options & WNOHANG != 0,
+        options & WNOWAIT != 0,
+        publish,
+    )? {
+        Some(_) => Ok(0),
+        None => {
+            // WNOHANG, nothing ready: zeroed siginfo so si_pid == 0.
+            if !infop.is_null() {
+                write_siginfo(0, 0, 0, 0)?;
+            }
+            Ok(0)
+        }
+    }
 }
 
 // ============================================================================
@@ -23325,6 +23519,93 @@ mod r187_kcov_authorization_tests {
         assert!(!kcov_access_allowed(false, true));
         assert!(kcov_access_allowed(true, false));
         assert!(kcov_access_allowed(true, true));
+    }
+}
+
+/// ST-K3-WAITID hosted oracle: executes the production `waitid(2)` argument
+/// contract and `siginfo_t` encoder on the host target. The reap/unlink,
+/// blocking and WNOWAIT-then-reap legs need live process state and a user
+/// address space, so they run only in the guest runtime gate.
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod st_k3_waitid_oracle_tests {
+    use super::*;
+
+    #[test]
+    fn waitid_selectors_resolve_or_fail_closed() {
+        assert!(matches!(
+            waitid_validate_args(P_ALL, 0, WEXITED),
+            Ok(WaitTarget::Any)
+        ));
+        assert!(matches!(
+            waitid_validate_args(P_PID, 7, WEXITED),
+            Ok(WaitTarget::Pid(7))
+        ));
+        // P_PGID has no process-group wait tracking behind it: refused, never
+        // silently widened to "any child".
+        assert_eq!(
+            waitid_validate_args(P_PGID, 7, WEXITED),
+            Err(SyscallError::EINVAL)
+        );
+        for bad_id in [0, -1] {
+            assert_eq!(
+                waitid_validate_args(P_PID, bad_id, WEXITED),
+                Err(SyscallError::EINVAL)
+            );
+        }
+        assert_eq!(
+            waitid_validate_args(99, 1, WEXITED),
+            Err(SyscallError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn waitid_options_are_validated_before_any_state_change() {
+        // WEXITED is mandatory: a wait that can report nothing is a caller bug.
+        assert_eq!(waitid_validate_args(P_ALL, 0, 0), Err(SyscallError::EINVAL));
+        assert_eq!(
+            waitid_validate_args(P_ALL, 0, WNOHANG),
+            Err(SyscallError::EINVAL)
+        );
+        // Unsatisfiable rather than ignored: no stop/continue ledger exists, so
+        // honouring these would promise a notification that can never arrive.
+        for unsupported in [WUNTRACED, WCONTINUED] {
+            assert_eq!(
+                waitid_validate_args(P_ALL, 0, WEXITED | unsupported),
+                Err(SyscallError::EINVAL)
+            );
+        }
+        // Unknown bits are rejected, so future flags cannot be silently dropped.
+        assert_eq!(
+            waitid_validate_args(P_ALL, 0, WEXITED | 1 << 20),
+            Err(SyscallError::EINVAL)
+        );
+        assert!(waitid_validate_args(P_ALL, 0, WEXITED | WNOHANG | WNOWAIT).is_ok());
+    }
+
+    #[test]
+    fn waitid_siginfo_encodes_the_x86_64_layout() {
+        let buf = waitid_encode_siginfo(4321, 1000, CLD_EXITED, 42);
+        assert_eq!(buf.len(), SIGINFO_SIZE);
+
+        let field = |off: usize| i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
+        assert_eq!(field(SI_OFF_SIGNO), crate::signal::Signal::SIGCHLD.as_i32());
+        assert_eq!(field(SI_OFF_ERRNO), 0);
+        assert_eq!(field(SI_OFF_CODE), CLD_EXITED);
+        assert_eq!(field(SI_OFF_PID), 4321);
+        assert_eq!(field(SI_OFF_UID), 1000);
+        assert_eq!(field(SI_OFF_STATUS), 42);
+
+        // The union tail past si_status must stay zero: user memory is
+        // overwritten in full, so no stale bytes leak back to the caller.
+        assert!(buf[SI_OFF_STATUS + 4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn waitid_nothing_ready_is_a_fully_zeroed_siginfo() {
+        // The WNOHANG-nothing-ready answer. Callers distinguish it by si_pid == 0,
+        // so every other field must be zero too.
+        let buf = waitid_encode_siginfo(0, 1000, CLD_EXITED, 42);
+        assert!(buf.iter().all(|&b| b == 0));
     }
 }
 
