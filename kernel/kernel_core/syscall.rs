@@ -10319,7 +10319,8 @@ const DISPATCHED_PROMISED: &[u64] = &[
     7, 23, 270, 271, // poll select pselect6 ppoll (M0-6 poll/select STDIO wiring)
     9, 10, 11, 12, // mmap mprotect munmap brk (VM promise)
     24, 39, // sched_yield getpid
-    56, 57, 59, 60, 61, 62, // clone fork execve exit wait4 kill
+    56, 57, 59, 60, 61, 62,  // clone fork execve exit wait4 kill
+    247, // waitid (ST-K3, dispatched 2026-09-25)
     82, 83, 84, 87, // rename mkdir rmdir unlink  (82 = M0-6 slice 2)
     90, 91, // chmod fchmod
     97, 160, 302, // getrlimit setrlimit prlimit64  (M0-6 NEW)
@@ -10351,12 +10352,8 @@ const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
         93,
         "fchown: FATTR (post-const-fix), dispatch deferred (M0-6 later slice)",
     ),
-    (
-        247,
-        "waitid: PROC promise, dispatch deferred (M0-6 later slice)",
-    ),
 ];
-const MAX_EXEMPT: usize = 8;
+const MAX_EXEMPT: usize = 7;
 
 /// R172-P6-F3: syscall numbers that are PRIVATE / native dispatch arms (reachable by direct
 /// syscall number) but MUST NEVER appear in the pledge union — there is no seccomp constant
