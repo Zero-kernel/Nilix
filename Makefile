@@ -1003,7 +1003,7 @@ help:
 	@echo "  make run-both     - 图形+串口组合模式"
 	@echo "  make debug        - GDB调试模式（等待GDB连接）"
 	@echo "  make test         - 运行时套件门禁（Test Summary + panic/NX；exit 0/1/2）"
-	@echo "  make test-hosted-subcrates - 主机侧内核子 crate 测试（169 tests + 3 compile checks，默认并行，精确计数门禁）"
+	@echo "  make test-hosted-subcrates - 主机侧内核子 crate 测试（454 tests + 3 compile checks，默认并行，精确计数门禁）"
 	@echo ""
 	@echo "SMP多核模式:"
 	@echo "  make run-smp      - 启用SMP多核模式（默认2核）"

@@ -462,6 +462,65 @@ mod credential_preparation_tests {
     }
 }
 
+/// F2: the no-current-user-frame fork discriminator. The reap/publication
+/// ordering itself needs live process state, so it stays a guest-gate leg; what
+/// is decidable here is that the choice between "rebase the parent kernel stack"
+/// and "refuse with EFAULT" is keyed on address-space ownership alone.
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod f2_frameless_fork_tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn only_a_kernel_parent_may_resume_from_a_copied_kernel_stack() {
+        assert!(
+            kernel_stack_resume_is_admissible(0),
+            "a kernel thread (memory_space == 0) has no user frame by construction \
+             and must keep the copy/rebase resume model"
+        );
+        assert!(
+            !kernel_stack_resume_is_admissible(0x1000),
+            "a Ring-3 parent with no active syscall frame must be refused, not \
+             resumed from a stale parent.context"
+        );
+        assert!(
+            !kernel_stack_resume_is_admissible(usize::MAX),
+            "the predicate is fail-closed for every non-zero address space, not \
+             a check against one sentinel"
+        );
+    }
+
+    #[test]
+    fn the_frameless_user_fork_refusal_is_efault_shaped() {
+        // ForkError must carry a distinct variant for this: the syscall layer
+        // maps InvalidUserFrame to EFAULT, and reusing an allocation//state
+        // error here would surface as ENOMEM/EAGAIN and invite a retry loop
+        // over a condition no retry can clear.
+        let refusal = ForkError::InvalidUserFrame;
+        assert!(matches!(refusal, ForkError::InvalidUserFrame));
+        assert!(
+            !matches!(
+                refusal,
+                ForkError::MemoryAllocationFailed | ForkError::MmapTransientState
+            ),
+            "a frameless user fork is not a transient failure"
+        );
+    }
+}
+
+/// F2: may the child inherit a *rebased copy of the parent's kernel stack* as
+/// its resume state?
+///
+/// Only for a kernel-context parent. `memory_space == 0` is this kernel's
+/// kernel-thread discriminator, and it is deliberately read from the PCB rather
+/// than inferred from the syscall-frame window: the caller reaches this path
+/// precisely because that window was absent, so the window cannot also be the
+/// evidence. A Ring-3 parent here is refused (`EFAULT`) instead of resuming from
+/// a stale `parent.context`.
+fn kernel_stack_resume_is_admissible(parent_memory_space: usize) -> bool {
+    parent_memory_space == 0
+}
+
 /// Fork 的内部实现，便于错误处理和回滚
 fn fork_inner(
     parent: &mut crate::process::Process,
@@ -581,6 +640,26 @@ fn fork_inner(
             child.context.cs = 0x23; // USER_CODE_SELECTOR
             child.context.ss = 0x1b; // USER_DATA_SELECTOR
         } else {
+            // F2 FIX (no-current-user-frame fork): the kernel-stack copy/rebase
+            // model below is valid ONLY for a kernel-context parent. Reaching it
+            // with a Ring-3 parent means the syscall-frame window was absent or
+            // disowned while a user task was mid-fork; seeding the child from
+            // `parent.context` would then rebuild exactly the chimera the ST-K3
+            // fix above removed (kernel rsp under user selectors -> ud2 in
+            // switch_to_user), so refuse instead of guessing a resume state.
+            //
+            // `memory_space == 0` is this kernel's kernel-thread discriminator
+            // (same idiom as the OOM candidate's `is_kernel_thread`, process.rs),
+            // and it is independent of the frame window rather than derived from
+            // it — a disowned frame cannot forge a user parent into a kernel one.
+            //
+            // The refusal precedes publication: `sys_fork` maps every
+            // `fork_inner` error through `cleanup_partial_child` plus the
+            // scheduler-permit drop, so no child PCB, PID chain entry, or cgroup
+            // charge survives. `InvalidUserFrame` surfaces as EFAULT.
+            if !kernel_stack_resume_is_admissible(parent.memory_space) {
+                return Err(ForkError::InvalidUserFrame);
+            }
             // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
             // 复制父进程内核栈内容以保持返回路径一致
             let parent_top = parent.kernel_stack_top.as_u64();

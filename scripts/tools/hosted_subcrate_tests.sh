@@ -207,7 +207,7 @@ run_suite vfs 63 0 \
     --features host_harness \
     --lib --locked
 
-run_suite kernel-core 77 0 \
+run_suite kernel-core 79 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -238,7 +238,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 3 77 \
+run_suite mitigation-mappings 3 79 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \
