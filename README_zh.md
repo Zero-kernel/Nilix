@@ -38,7 +38,7 @@ fuzz、描述符/路径/凭据、TLS 迁移、BIO 生命周期和缓解状态真
 | --- | --- | --- |
 | UEFI 与启动 | PIE 内核加载/重定位、内存图交接、KASLR 放置、基础控制台 | x86_64 平台范围；更多固件/物理平台及早期 W+X 转换验证 |
 | 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | 本切片的远程 MM/core/hosted/build/lint 验证已完成，`mremap` 已远程验证且 Ring-3 oracle 门禁（`make test-ring3-mm`）通过，但独立评审仍待完成；MAP_SHARED/MAP_FIXED 语义、文件映射、共享匿名 `mremap`；无已验收 slab/NUMA/swap/THP |
-| 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试 | waitid、PID1/reaper 及更广的失败/压力路径 |
+| 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试；`waitid`（`P_ALL`/`P_PID`、`WNOHANG`/`WNOWAIT`、`siginfo_t` 回写）与 `wait4` 共用同一套收割引擎；根 PID namespace 的 init 通过正常 PID 链路注册 | `waitid` 的 `P_PGID` 与 `WUNTRACED`/`WCONTINUED` 按失败关闭返回 EINVAL，并非支持；PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径尚无覆盖（waitid 的 WNOWAIT-后续收割、copyout 故障、ROOT-INIT 孤儿收养与 `pids.max` 下的 fork 拒绝已经 guest 验证）；PID1/reaper 竞态及更广的失败/压力路径 |
 | 线程与 TLS | 受限 CLONE_VM/TLS 创建，SMP 迁移时 FS/user-GS 恢复已有 guest 证据 | 通用 CLONE_THREAD/FILES/FS/SIGHAND 组合拒绝；不能宣称 pthread 兼容 |
 | 调度与 SMP | 每 CPU MLFQ、抢占、工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序 | 更高核数/长时间/物理并发验证；64 核是实现上限，不是已验证拓扑 |
 | IPC 与信号 | capability 管道、futex 原语/robust 清理、屏蔽/处理/返回、阻塞信号测试、poll/select | 完整原生同步 IPC/共享内存、Linux futex 语义、sigaltstack/RT 队列/重启语义 |
@@ -83,7 +83,7 @@ Cargo 模块划分用于组织职责，不代表服务已运行在独立权限�
 
 ## 测试与 CI
 
-当前 hosted allowlist 在 debug/release 下分别执行 **438 次计数受检的单元测试**，
+当前 hosted allowlist 在 debug/release 下分别执行 **454 次计数受检的单元测试**，
 另有 CpuLocal doctest 和三组测试代码编译检查。源码扫描发现 **74 个 RuntimeTest
 实现**，不代表 74 个 guest 测试都通过，更不代表内核指令覆盖率 100%。
 

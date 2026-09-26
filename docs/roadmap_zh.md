@@ -208,7 +208,7 @@ Cargo 分层与回调打破依赖环，**不**创造特权边界。受信任引�
 
 **已有：** 隔离地址空间、fork/路径 exec/exit/reap、wait4/WNOHANG、MLFQ/抢占/窃取/均衡/亲和/cpuset。TLS 恢复有含定时器上下文迁移的 UP/SMP musl 证据。KSA-011 练命名空间 wait 身份与六种 exit/reap/idle 情形。
 
-**缺失：** clone 窄于 Linux 线程。CLONE_VM/TLS 设置存在；一般 CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND 组合被拒绝。这**不是** pthread 支持。waitid 是桩。历史 fork 回退、栈碎片、switch-sentinel 与 PID1 孤儿/收割问题仍在；与较新 KSA 修复的重叠须按原始判定标准调和。责任人：**F2、F7、F4/F6、ROOT-INIT、F-4**。
+**缺失：** clone 窄于 Linux 线程。CLONE_VM/TLS 设置存在；一般 CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND 组合被拒绝。这**不是** pthread 支持。waitid 已针对 `P_ALL`/`P_PID` 实现，支持 `WNOHANG`/`WNOWAIT` 与 `siginfo_t` 回写，并与 wait4 共用 `wait_reap_core`；`P_PGID` 与 `WUNTRACED`/`WCONTINUED` 仍按失败关闭返回 EINVAL，其四个宿主判定用例已于 2026-09-25 在 x86_64 Linux 主机上执行通过（79 passed / 0 failed，完整阶梯 454 全绿），且一条 Ring-3 guest 腿以真实 zombie 驱动 syscall 247（`make test-ring3-mm`：14 passed / 0 failed），覆盖 WNOWAIT 存活、EFAULT 先于收割与 `P_ALL`；第二条腿验证了 ROOT-INIT 孤儿收养，其后的腿又验证了 `pids.max` 下的 fork 拒绝与用户栈保护页（17 passed / 0 failed）。PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径仍未覆盖。历史 fork 回退、栈碎片、switch-sentinel 与 PID1 收割竞态问题仍在（ROOT-INIT 注册本身已于 2026-09-25 关闭）；与较新 KSA 修复的重叠须按原始判定标准调和。责任人：**F2、F7、F4/F6、ROOT-INIT、F-4**。
 
 ### 5.3 IPC、信号、轮询与时间
 

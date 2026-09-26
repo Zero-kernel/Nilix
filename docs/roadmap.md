@@ -151,8 +151,18 @@ wait identity and six exit/reap/idle cases.
 
 **Missing:** clone is narrower than Linux threads. CLONE_VM/TLS setup exists;
 general CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND combinations are rejected.
-This is not pthread support. waitid is a stub. Historical fork fallback,
-stack-fragmentation, switch-sentinel and PID1 orphan/reaper questions remain;
+This is not pthread support. waitid is implemented for `P_ALL`/`P_PID` with
+`WNOHANG`/`WNOWAIT` and `siginfo_t` copyout, sharing `wait_reap_core` with wait4;
+`P_PGID` and `WUNTRACED`/`WCONTINUED` remain fail-closed EINVAL, and its four
+hosted oracles passed on an x86_64 Linux host on 2026-09-25 (79 passed, 0
+failed, whole ladder green at 454), and a Ring-3 guest leg drives syscall 247
+against real zombies (`make test-ring3-mm`: 14 passed, 0 failed), covering
+WNOWAIT survival, EFAULT-before-reap and `P_ALL`; a second leg verifies
+ROOT-INIT orphan adoption, and further legs verify fork refusal under
+`pids.max` and the user-stack guard page (17 passed, 0 failed). PID1 exit,
+reaper races and the attach-time/fd-charge rollback paths remain uncovered. Historical fork
+fallback, stack-fragmentation, switch-sentinel and PID1 reaper-race questions
+remain (ROOT-INIT registration itself closed 2026-09-25);
 reconcile overlap with newer KSA fixes by original oracle. Owners: **F2, F7,
 F4/F6, ROOT-INIT, F-4**.
 

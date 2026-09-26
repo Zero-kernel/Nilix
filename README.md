@@ -38,7 +38,7 @@ calling an entire subsystem complete because its API or source files exist.
 | --- | --- | --- |
 | UEFI and boot | PIE kernel loading/relocation, memory-map handoff, KASLR placement, console initialization | x86_64 platform scope; broader firmware/hardware and early-boot W+X qualification |
 | Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions, private-anonymous `mremap` (in-place grow/shrink + `MREMAP_MAYMOVE`) and bounded slab/NUMA/swap/THP primitives | Remote MM/core/hosted/build/lint verification is complete for this slice and `mremap` is remote-validated with the Ring-3 oracle gate (`make test-ring3-mm`) passing, but independent review is still pending; MAP_FIXED/file mappings, shared-anonymous `mremap`, and integrated slab/NUMA/swap/THP backends remain unqualified |
-| Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests | waitid, PID1/reaper and remaining failure/stress breadth |
+| Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests; `waitid` (`P_ALL`/`P_PID`, `WNOHANG`/`WNOWAIT`, `siginfo_t` copyout) sharing one reap engine with `wait4`, and root PID-namespace init registered through the normal PID chain | `waitid` `P_PGID` and `WUNTRACED`/`WCONTINUED` are fail-closed EINVAL, not supported; PID1 exit, reaper races and the attach-time/fd-charge rollback paths are uncovered (waitid WNOWAIT-then-reap, copyout-fault, ROOT-INIT orphan adoption and fork refusal under `pids.max` are guest-verified); PID1/reaper races and remaining failure/stress breadth |
 | Threads and TLS | Restricted CLONE_VM/TLS setup, FS/user-GS restoration tested across SMP migration | General CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND rejected; not pthread compatibility |
 | Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering | High-core/long-run/physical qualification; 64 is a CPU ceiling, not a tested topology claim |
 | IPC and signals | Capability-backed pipes, futex primitives/robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, Linux futex parity, sigaltstack/queued-RT/restart semantics |
@@ -85,7 +85,7 @@ narratives. The roadmap is the current capability/qualification reference.
 
 ## Tests and CI
 
-The current hosted allowlist runs **439 counted unit-test executions per
+The current hosted allowlist runs **454 counted unit-test executions per
 debug/release profile**, CpuLocal doctests and three test-code compile checks.
 The runtime scanner discovers **74 RuntimeTest implementations**; that count
 does not mean 74 guest passes or 100% kernel instruction coverage.
