@@ -225,6 +225,9 @@ pub extern "C" fn _start() -> ! {
     // condition variables use.
     test_futex_requeue(&mut results);
 
+    // GAP-6: the scheduler/RCU counters pressure runs retain.
+    test_proc_schedstat(&mut results);
+
     // Print summary
     println("");
     println("================================");
@@ -2770,4 +2773,116 @@ fn test_futex_requeue(results: &mut TestResult) {
         }
     }
     results.pass("futex requeue wakes a sleeping sibling and bitset ops keep the Linux contract");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-6: /proc/schedstat, the per-CPU scheduler counters and RCU backlog that
+// pressure runs sample into their retained logs.
+// ---------------------------------------------------------------------------
+
+/// Parsed `/proc/schedstat`: online CPUs, per-CPU lines seen, and the summed
+/// context-switch count.
+struct SchedStat {
+    cpus_online: u64,
+    cpu_lines: u64,
+    switches: u64,
+    has_rcu_and_wait: bool,
+}
+
+fn parse_u64_prefix(text: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut seen = 0usize;
+    for &byte in text {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u64);
+        seen += 1;
+    }
+    (seen != 0).then_some(value)
+}
+
+fn read_schedstat() -> Option<SchedStat> {
+    let path = b"/proc/schedstat\0";
+    let fd = unsafe { sys_open(path.as_ptr(), 0, 0) };
+    if is_error(fd) {
+        return None;
+    }
+    let mut buf = [0u8; 2048];
+    let read = unsafe { sys_read(fd, buf.as_mut_ptr(), buf.len() as u64) };
+    let _ = unsafe { sys_close(fd) };
+    if is_error(read) || read as usize >= buf.len() {
+        return None;
+    }
+    let mut stat = SchedStat {
+        cpus_online: 0,
+        cpu_lines: 0,
+        switches: 0,
+        has_rcu_and_wait: false,
+    };
+    let mut rcu = false;
+    let mut wait = false;
+    for line in buf[..read as usize].split(|&byte| byte == b'\n') {
+        if let Some(rest) = line.strip_prefix(b"cpus_online ") {
+            stat.cpus_online = parse_u64_prefix(rest)?;
+        } else if line.starts_with(b"cpu") && line.get(3).is_some_and(u8::is_ascii_digit) {
+            let at = line.windows(9).position(|window| window == b"switches=")?;
+            stat.switches = stat
+                .switches
+                .saturating_add(parse_u64_prefix(&line[at + 9..])?);
+            line.windows(14)
+                .position(|window| window == b"migrations_in=")?;
+            stat.cpu_lines += 1;
+        } else if let Some(rest) = line.strip_prefix(b"rcu_backlog ") {
+            rcu = parse_u64_prefix(rest).is_some();
+        } else if let Some(rest) = line.strip_prefix(b"wait_over_wakes ") {
+            wait = parse_u64_prefix(rest).is_some();
+        }
+    }
+    stat.has_rcu_and_wait = rcu && wait;
+    Some(stat)
+}
+
+fn test_proc_schedstat(results: &mut TestResult) {
+    print("Testing /proc/schedstat... ");
+    let Some(before) = read_schedstat() else {
+        results.fail("schedstat: /proc/schedstat unreadable or malformed");
+        return;
+    };
+    if before.cpus_online == 0
+        || before.cpu_lines != before.cpus_online
+        || before.switches == 0
+        || !before.has_rcu_and_wait
+    {
+        print("cpus ");
+        print_int(before.cpus_online as i64);
+        print(" lines ");
+        print_int(before.cpu_lines as i64);
+        print(" ");
+        results.fail("schedstat: one line per online CPU, RCU backlog and wait counter expected");
+        return;
+    }
+    // Waiting for a child that exits switches away and back at least once.
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        results.fail("schedstat: fork failed");
+        return;
+    }
+    if child == 0 {
+        unsafe { raw_exit(SYS_EXIT, 0) };
+    }
+    if reap_pid(child) != Some(0) {
+        results.fail("schedstat: could not reap the child");
+        return;
+    }
+    match read_schedstat() {
+        Some(after) if after.switches > before.switches => {}
+        _ => {
+            results.fail("schedstat: the context-switch count did not advance");
+            return;
+        }
+    }
+    results.pass("/proc/schedstat reports per-CPU switches and migrations and the RCU backlog");
 }

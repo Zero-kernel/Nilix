@@ -6316,6 +6316,44 @@ pub fn wait_over_wake_count() -> u64 {
     WAIT_OVER_WAKES.load(Ordering::Relaxed)
 }
 
+/// GAP-6: per-CPU scheduler counters kept as pressure-run evidence and read
+/// through `/proc/schedstat`. Statistics only: Relaxed, wrap is harmless.
+static CPU_CONTEXT_SWITCHES: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+static CPU_MIGRATIONS_IN: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+
+/// Record one committed context switch on `cpu` (IRQ-safe, lock-free).
+pub fn note_context_switch(cpu: usize) {
+    if let Some(counter) = CPU_CONTEXT_SWITCHES.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record one ready task moved onto `cpu`'s queue by stealing or balancing.
+pub fn note_task_migration(cpu: usize) {
+    if let Some(counter) = CPU_MIGRATIONS_IN.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The CPUs currently online, as a bit mask (for `/proc/schedstat`).
+pub fn sched_online_cpu_mask() -> u64 {
+    cpu_local::online_cpu_mask()
+}
+
+/// `(context switches, migrations in)` recorded on `cpu` since boot.
+pub fn cpu_sched_counters(cpu: usize) -> (u64, u64) {
+    let load = |counters: &[AtomicU64]| {
+        counters
+            .get(cpu)
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    };
+    (load(&CPU_CONTEXT_SWITCHES), load(&CPU_MIGRATIONS_IN))
+}
+
 /// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).
 ///
 /// Returns the count of active threads in the thread group identified by tgid.

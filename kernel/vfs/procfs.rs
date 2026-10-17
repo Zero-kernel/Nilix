@@ -122,7 +122,14 @@ impl ProcFs {
             "RF180-40 failed procfs inode publication drifted admission"
         );
 
-        for name in ["meminfo", "cpuinfo", "uptime", "version", "waitstat"] {
+        for name in [
+            "meminfo",
+            "cpuinfo",
+            "uptime",
+            "version",
+            "waitstat",
+            "schedstat",
+        ] {
             let inode = fs
                 .lookup(&root, name)
                 .expect("RF180-40 admitted procfs inode publication");
@@ -267,6 +274,10 @@ impl ProcRootInode {
                 fs_id: self.fs_id,
                 _heap_charge: Some(charge),
             })?),
+            "schedstat" => Ok(try_new_procfs_arc(|charge| ProcSchedstatInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
             _ => {
                 // Try to parse as PID
                 if let Ok(ns_pid) = name.parse::<u32>() {
@@ -330,7 +341,13 @@ impl Inode for ProcRootInode {
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         // Static entries
         let static_entries = [
-            "self", "meminfo", "cpuinfo", "uptime", "version", "waitstat",
+            "self",
+            "meminfo",
+            "cpuinfo",
+            "uptime",
+            "version",
+            "waitstat",
+            "schedstat",
         ];
 
         if offset < static_entries.len() {
@@ -1574,6 +1591,99 @@ impl Inode for ProcWaitstatInode {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+// ============================================================================
+// /proc/schedstat
+// ============================================================================
+
+/// GAP-6: per-CPU scheduler counters and the RCU callback backlog, which
+/// pressure runs sample so their retained logs carry migration and backlog
+/// evidence.
+struct ProcSchedstatInode {
+    fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl Inode for ProcSchedstatInode {
+    fn ino(&self) -> u64 {
+        8
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: 8,
+            mode: FileMode::regular(0o444),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let content = generate_schedstat()?;
+        read_from_content(&content, offset, buf)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// One line per online CPU (`cpuN switches=S migrations_in=M`), then the RCU
+/// callback backlog and the W-3 wait over-wake count. Every value is read
+/// lock-free.
+fn generate_schedstat() -> Result<AdmittedString, FsError> {
+    let mut content = AdmittedString::new(HeapClass::Procfs);
+    let online = process::sched_online_cpu_mask();
+    content
+        .write_fmt(format_args!("cpus_online {}\n", online.count_ones()))
+        .map_err(|_| FsError::NoSpace)?;
+    let mut remaining = online;
+    while remaining != 0 {
+        let cpu = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
+        let (switches, migrations_in) = process::cpu_sched_counters(cpu);
+        content
+            .write_fmt(format_args!(
+                "cpu{} switches={} migrations_in={}\n",
+                cpu, switches, migrations_in
+            ))
+            .map_err(|_| FsError::NoSpace)?;
+    }
+    content
+        .write_fmt(format_args!(
+            "rcu_backlog {}\nwait_over_wakes {}\n",
+            kernel_core::rcu::callback_backlog(),
+            process::wait_over_wake_count()
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    Ok(content)
 }
 
 // ============================================================================

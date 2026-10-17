@@ -1855,6 +1855,7 @@ impl Scheduler {
             };
             drop(retired);
             drop(pcb);
+            process::note_task_migration(local_cpu);
             Self::arm_ready_cpu(local_cpu);
             true
         } else {
@@ -1979,6 +1980,7 @@ impl Scheduler {
                     let retired = { src_queue.lock().commit_migration_removal(_priority) };
                     drop(retired);
                     drop(pcb);
+                    process::note_task_migration(target_cpu);
                     Self::arm_ready_cpu(target_cpu);
                 }
                 Err(_) => {
@@ -2456,6 +2458,7 @@ impl Scheduler {
                         CURRENT_GENERATION[local_cpu].store(0, Ordering::Release);
                         drop(current_guard);
                         process::set_current_pid(None);
+                        process::note_context_switch(local_cpu);
                         if !selection.complete_cycle {
                             current_cpu().set_need_resched();
                         }
@@ -2634,6 +2637,7 @@ impl Scheduler {
         CURRENT_GENERATION[local_cpu].store(next_generation, Ordering::Release);
         drop(current_guard);
         process::set_current_pid(Some(next_pid));
+        process::note_context_switch(local_cpu);
         if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
             stats.total_switches = stats.total_switches.saturating_add(1);
         }

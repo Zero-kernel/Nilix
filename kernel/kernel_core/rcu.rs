@@ -1041,6 +1041,12 @@ fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
     count
 }
 
+/// Queued RCU callbacks, read from the lock-free counter (for monitoring
+/// from any context; `pending_callbacks` takes the pool lock).
+pub fn callback_backlog() -> usize {
+    CALLBACK_COUNT.load(Ordering::Relaxed)
+}
+
 /// Get the number of pending callbacks (for debugging/monitoring).
 ///
 /// Reserved slots and the one callback that may currently be Running are not
