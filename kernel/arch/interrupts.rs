@@ -1364,11 +1364,19 @@ extern "x86-interrupt" fn page_fault_handler(
         // Check if this is a stack grow opportunity
         if let Some(pid) = kernel_core::process::current_pid() {
             // P=0 -> P=1 creates no pre-existing valid translation to shoot down;
-            // map_page performs the bounded local invalidation. Any error falls
-            // through to the fatal USER_MODE path, after partial accounting has
-            // already been committed by the helper.
-            if kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr).is_ok() {
-                return;
+            // map_page performs the bounded local invalidation. Any other error
+            // falls through to the fatal USER_MODE path, after partial accounting
+            // has already been committed by the helper.
+            match kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr) {
+                Ok(()) => return,
+                // F14: every lock on this path is try-only, so another CPU
+                // holding PROCESS_TABLE, the PCB, MmState, the cgroup charge or
+                // the page tables yields EAGAIN. That is transient, never a bad
+                // access: the helper has committed whatever it published, so
+                // retry the instruction through IRETQ, as the COW Busy arm does,
+                // instead of killing the task with SIGSEGV.
+                Err(kernel_core::SyscallError::EAGAIN) => return,
+                Err(_) => {}
             }
         }
     }
