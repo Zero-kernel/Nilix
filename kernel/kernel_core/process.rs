@@ -5042,10 +5042,46 @@ pub fn init() {
     klog_always!("  Process subsystem initialized (boot CR3 cached)");
 }
 
+/// GAP-6 pressure soak: PIDs are reused within this window before the
+/// allocator reaches for a higher one. `PROCESS_TABLE` is indexed by PID, so
+/// a forward-only scan to `PID_MAX` made its size follow cumulative forks: each
+/// new highest PID reallocated the whole table, and after about 10,000 forks
+/// that contiguous allocation failed on the fragmented kernel heap (fork
+/// `ENOMEM` in the stress-v2 cpu/smp profiles). With the window the table
+/// follows the peak live population, and a PID is still not reused until at
+/// least this many newer PIDs were handed out.
+const PID_REUSE_WINDOW: ProcessId = 4096;
+
+/// Pick a free PID: first inside the reuse window `[1, window)`, starting at
+/// `start` and wrapping within the window; then, when the window is full or
+/// `extend` is set, anywhere in `[1, pid_max]`.
+fn pick_global_pid(
+    start: ProcessId,
+    window: ProcessId,
+    pid_max: ProcessId,
+    extend: bool,
+    is_free: impl Fn(ProcessId) -> bool,
+) -> Option<ProcessId> {
+    let window = window.clamp(2, pid_max + 1);
+    if !extend {
+        let first = if (1..window).contains(&start) {
+            start
+        } else {
+            1
+        };
+        if let Some(pid) = (first..window).chain(1..first).find(|&pid| is_free(pid)) {
+            return Some(pid);
+        }
+    }
+    let first = start.clamp(1, pid_max);
+    (first..=pid_max).chain(1..first).find(|&pid| is_free(pid))
+}
+
 /// R106-11 (P0-4): Allocate a free global PID with recycling.
 ///
-/// Uses a circular scan starting from `hint`. On wrap-around, scans from PID 1
-/// up to the previous hint. PID 0 is never allocated.
+/// Scans from `hint`, first inside the reuse window and then, when the window
+/// is full or `extend` is set, the whole PID range, wrapping to PID 1 (see
+/// `pick_global_pid`). PID 0 is never allocated.
 ///
 /// # Lock ordering
 ///
@@ -5054,6 +5090,8 @@ pub fn init() {
 fn allocate_global_pid(
     hint: &mut ProcessId,
     table: &[Option<ProcessArc>],
+    table_capacity: usize,
+    extend: bool,
 ) -> Result<ProcessId, ProcessCreateError> {
     let pid_max = PID_MAX.min(MAX_PID);
     // Lock order: NEXT_PID_HINT -> PROCESS_TABLE -> REAPING_PID_BITS.
@@ -5066,28 +5104,16 @@ fn allocate_global_pid(
         n if n > pid_max => 1,
         n => n,
     };
-
-    // Forward scan: [start, pid_max]
-    for pid in start..=pid_max {
-        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
-            && !reaping_pid_is_set(&reaping, pid);
-        if is_free {
-            *hint = if pid == pid_max { 1 } else { pid + 1 };
-            return Ok(pid);
-        }
-    }
-
-    // Wrap-around scan: [1, start)
-    for pid in 1..start {
-        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
-            && !reaping_pid_is_set(&reaping, pid);
-        if is_free {
-            *hint = if pid == pid_max { 1 } else { pid + 1 };
-            return Ok(pid);
-        }
-    }
-
-    Err(ProcessCreateError::PidExhausted)
+    // PIDs below the table's current capacity cost no growth.
+    let window = PID_REUSE_WINDOW.max(table_capacity);
+    let is_free = |pid: ProcessId| {
+        table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
+            && !reaping_pid_is_set(&reaping, pid)
+    };
+    let pid = pick_global_pid(start, window, pid_max, extend, is_free)
+        .ok_or(ProcessCreateError::PidExhausted)?;
+    *hint = if pid == pid_max { 1 } else { pid + 1 };
+    Ok(pid)
 }
 
 /// R158-4 FIX: Reserve a child slot in the parent's children Vec BEFORE allocating
@@ -5250,8 +5276,16 @@ fn publish_process_with_pid_sources(
             }
             ProcessTablePublicationAttempt::NeedCapacity => {
                 drop(prepared.take());
+                // GAP-6: grow geometrically. Growing to exactly `pid + 1`
+                // reallocated and copied the whole table for every new
+                // highest PID.
+                let grown = target_capacity
+                    .checked_next_power_of_two()
+                    .unwrap_or(target_capacity)
+                    .min(PID_MAX + 1)
+                    .max(target_capacity);
                 prepared = Some(
-                    PreparedAdmittedVecCapacity::try_new(HeapClass::CoreProcess, target_capacity)
+                    PreparedAdmittedVecCapacity::try_new(HeapClass::CoreProcess, grown)
                         .map_err(|_| ProcessCreateError::OutOfMemory)?,
                 );
             }
@@ -5326,7 +5360,10 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
-            allocate_global_pid(&mut hint_guard, &table)?
+            // GAP-6: leave the reuse window only after a window's worth of
+            // candidates were busy with deferred stack reclamation.
+            let extend = stack_retries >= PID_REUSE_WINDOW;
+            allocate_global_pid(&mut hint_guard, &table, table.capacity(), extend)?
         };
 
         match allocate_kernel_stack(pid) {
@@ -5569,7 +5606,10 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
-            allocate_global_pid(&mut hint_guard, &table)?
+            // GAP-6: leave the reuse window only after a window's worth of
+            // candidates were busy with deferred stack reclamation.
+            let extend = stack_retries >= PID_REUSE_WINDOW;
+            allocate_global_pid(&mut hint_guard, &table, table.capacity(), extend)?
         };
 
         match allocate_kernel_stack(pid) {
@@ -8762,6 +8802,50 @@ fn prepare_clone_scheduler_add_process_with(
         .lock()
         .install_shared_credentials_for_clone(credentials);
     Ok(permit)
+}
+
+#[cfg(test)]
+mod pid_window_tests {
+    use super::*;
+
+    #[test]
+    fn gap6_pid_allocation_recycles_inside_the_window() {
+        let free_all = |_: ProcessId| true;
+        // Inside the window the hint advances and wraps back to 1.
+        assert_eq!(pick_global_pid(5, 16, 32_768, false, free_all), Some(5));
+        assert_eq!(pick_global_pid(16, 16, 32_768, false, free_all), Some(1));
+        assert_eq!(
+            pick_global_pid(40_000, 16, 32_768, false, free_all),
+            Some(1)
+        );
+        // A busy prefix is skipped; the scan wraps within the window.
+        let busy_below_10 = |pid: ProcessId| pid >= 10;
+        assert_eq!(
+            pick_global_pid(12, 16, 32_768, false, busy_below_10),
+            Some(12)
+        );
+        assert_eq!(
+            pick_global_pid(3, 16, 32_768, false, busy_below_10),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn gap6_pid_allocation_leaves_the_window_only_when_needed() {
+        // Every window PID busy: the next free PID above the window is used.
+        let busy_window = |pid: ProcessId| pid >= 16;
+        assert_eq!(pick_global_pid(3, 16, 32_768, false, busy_window), Some(16));
+        // `extend` scans the full range from the hint even with free window PIDs.
+        let free_all = |_: ProcessId| true;
+        assert_eq!(pick_global_pid(20, 16, 32_768, true, free_all), Some(20));
+        // Exhaustion is reported, not a fake PID.
+        assert_eq!(pick_global_pid(1, 16, 64, false, |_| false), None);
+        // The window never exceeds the PID range.
+        assert_eq!(
+            pick_global_pid(1, 1 << 20, 64, false, |pid| pid == 64),
+            Some(64)
+        );
+    }
 }
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
