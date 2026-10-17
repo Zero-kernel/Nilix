@@ -4232,7 +4232,14 @@ pub fn syscall_dispatcher(
 
         // Futex
         // R39-6 FIX: 传递第4个参数用于超时
-        202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32, arg3 as usize),
+        202 => sys_futex(
+            arg0 as usize,
+            arg1 as i32,
+            arg2 as u32,
+            arg3 as usize,
+            arg4 as usize,
+            arg5 as u32,
+        ),
 
         // 安全/沙箱 (Seccomp/Prctl)
         157 => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
@@ -17218,30 +17225,145 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 // Futex 系统调用
 // ============================================================================
 
+/// GAP-5 slice 4: a decoded Linux futex request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxFutexOp {
+    /// FUTEX_WAIT, or FUTEX_WAIT_BITSET with FUTEX_BITSET_MATCH_ANY; `None`
+    /// waits without a timeout.
+    Wait(Option<FutexTimeoutKind>),
+    /// FUTEX_WAKE, or FUTEX_WAKE_BITSET with FUTEX_BITSET_MATCH_ANY.
+    Wake,
+    /// FUTEX_REQUEUE, or FUTEX_CMP_REQUEUE when `compare` is set.
+    Requeue {
+        nr_requeue: u32,
+        compare: bool,
+    },
+    LockPi,
+    UnlockPi,
+}
+
+/// FUTEX_WAIT takes a relative timeout, FUTEX_WAIT_BITSET an absolute one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutexTimeoutKind {
+    Relative,
+    Absolute,
+}
+
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+
+/// Decode a Linux futex `op` word and its operation-specific arguments.
+///
+/// Futexes here are always private to the thread group (keyed by tgid), so
+/// FUTEX_PRIVATE_FLAG changes nothing. As on Linux, FUTEX_CLOCK_REALTIME is
+/// accepted only with FUTEX_WAIT_BITSET; both clocks read the millisecond
+/// tick that `sys_clock_gettime` reports. A bitset other than MATCH_ANY needs
+/// per-waiter masks, which the wait queues do not keep, so it is refused
+/// rather than served as MATCH_ANY: that would let a targeted wake land on
+/// a waiter of another bitset and leave the intended one asleep.
+fn decode_linux_futex_op(
+    op: i32,
+    val: u32,
+    timeout_arg: usize,
+    val3: u32,
+) -> Result<LinuxFutexOp, SyscallError> {
+    const LINUX_FUTEX_WAIT: i32 = 0;
+    const LINUX_FUTEX_WAKE: i32 = 1;
+    const LINUX_FUTEX_REQUEUE: i32 = 3;
+    const LINUX_FUTEX_CMP_REQUEUE: i32 = 4;
+    const LINUX_FUTEX_LOCK_PI: i32 = 6;
+    const LINUX_FUTEX_UNLOCK_PI: i32 = 7;
+    const LINUX_FUTEX_WAIT_BITSET: i32 = 9;
+    const LINUX_FUTEX_WAKE_BITSET: i32 = 10;
+    const FUTEX_PRIVATE_FLAG: i32 = 128;
+    const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    if op & FUTEX_CLOCK_REALTIME != 0 && cmd != LINUX_FUTEX_WAIT_BITSET {
+        return Err(SyscallError::ENOSYS);
+    }
+    let timeout = |kind| (timeout_arg != 0).then_some(kind);
+    let check_bitset = || match val3 {
+        0 => Err(SyscallError::EINVAL),
+        FUTEX_BITSET_MATCH_ANY => Ok(()),
+        _ => Err(SyscallError::ENOSYS),
+    };
+    match cmd {
+        LINUX_FUTEX_WAIT => Ok(LinuxFutexOp::Wait(timeout(FutexTimeoutKind::Relative))),
+        LINUX_FUTEX_WAKE => Ok(LinuxFutexOp::Wake),
+        LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
+            // Linux reads both counts as ints; the requeue count travels in
+            // the low 32 bits of the timeout argument.
+            let nr_requeue = timeout_arg as u32;
+            if (val as i32) < 0 || (nr_requeue as i32) < 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            Ok(LinuxFutexOp::Requeue {
+                nr_requeue,
+                compare: cmd == LINUX_FUTEX_CMP_REQUEUE,
+            })
+        }
+        LINUX_FUTEX_LOCK_PI => Ok(LinuxFutexOp::LockPi),
+        LINUX_FUTEX_UNLOCK_PI => Ok(LinuxFutexOp::UnlockPi),
+        LINUX_FUTEX_WAIT_BITSET => {
+            check_bitset()?;
+            Ok(LinuxFutexOp::Wait(timeout(FutexTimeoutKind::Absolute)))
+        }
+        LINUX_FUTEX_WAKE_BITSET => {
+            check_bitset()?;
+            Ok(LinuxFutexOp::Wake)
+        }
+        _ => Err(SyscallError::ENOSYS),
+    }
+}
+
 /// sys_futex - 快速用户空间互斥锁操作
 ///
-/// 实现 FUTEX_WAIT 和 FUTEX_WAKE 操作，用于用户空间高效同步。
+/// 实现 Linux futex(2) 的一个子集，用于用户空间高效同步。
 ///
 /// # Arguments
 ///
 /// * `uaddr` - 用户空间 futex 地址（指向 u32）
-/// * `op` - 操作码：0=FUTEX_WAIT, 1=FUTEX_WAKE, 2=FUTEX_WAIT_TIMEOUT
-/// * `val` - FUTEX_WAIT: 期望值；FUTEX_WAKE: 最大唤醒数量
-/// * `timeout_ptr` - R39-6 FIX: 超时结构指针（仅 FUTEX_WAIT_TIMEOUT 使用）
+/// * `op` - Linux 操作码：0=FUTEX_WAIT, 1=FUTEX_WAKE, 3=FUTEX_REQUEUE,
+///   4=FUTEX_CMP_REQUEUE, 6=FUTEX_LOCK_PI, 7=FUTEX_UNLOCK_PI,
+///   9=FUTEX_WAIT_BITSET, 10=FUTEX_WAKE_BITSET（见 `decode_linux_futex_op`）
+/// * `val` - WAIT: 期望值；WAKE/REQUEUE: 最大唤醒数量
+/// * `timeout_ptr` - FUTEX_WAIT: 相对超时 timespec；FUTEX_WAIT_BITSET: 绝对
+///   超时 timespec（均可为 NULL）；REQUEUE: 最大重排数量
+/// * `uaddr2` - REQUEUE 的目标地址
+/// * `val3` - FUTEX_CMP_REQUEUE: 期望值；BITSET 操作: 位掩码
 ///
 /// # Returns
 ///
 /// * FUTEX_WAIT: 成功阻塞并被唤醒返回 0，值不匹配返回 EAGAIN
 /// * FUTEX_WAIT_TIMEOUT: 同上，超时返回 ETIMEDOUT
 /// * FUTEX_WAKE: 返回实际唤醒的进程数量
+/// * FUTEX_REQUEUE/FUTEX_CMP_REQUEUE: 返回唤醒的数量（见下文）
 /// * FUTEX_LOCK_PI: E.4 PI - 带优先级继承的互斥锁加锁
 /// * FUTEX_UNLOCK_PI: E.4 PI - 带优先级继承的互斥锁解锁
-fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResult {
+fn sys_futex(
+    uaddr: usize,
+    op: i32,
+    val: u32,
+    timeout_ptr: usize,
+    uaddr2: usize,
+    val3: u32,
+) -> SyscallResult {
+    // Internal operation codes understood by the IPC futex callback.
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
     const FUTEX_WAIT_TIMEOUT: i32 = 2;
     const FUTEX_LOCK_PI: i32 = 3;
     const FUTEX_UNLOCK_PI: i32 = 4;
+
+    let request = decode_linux_futex_op(op, val, timeout_ptr, val3)?;
+    let (op, timeout_kind) = match request {
+        LinuxFutexOp::Wait(None) => (FUTEX_WAIT, None),
+        LinuxFutexOp::Wait(Some(kind)) => (FUTEX_WAIT_TIMEOUT, Some(kind)),
+        LinuxFutexOp::Wake | LinuxFutexOp::Requeue { .. } => (FUTEX_WAKE, None),
+        LinuxFutexOp::LockPi => (FUTEX_LOCK_PI, None),
+        LinuxFutexOp::UnlockPi => (FUTEX_UNLOCK_PI, None),
+    };
+    let compares_word = matches!(request, LinuxFutexOp::Requeue { compare: true, .. });
 
     // 验证用户指针
     if uaddr == 0 {
@@ -17253,13 +17375,22 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
         return Err(SyscallError::EINVAL);
     }
 
+    // The requeue target is never touched (see the wake below); it only has
+    // to be a well-formed user futex address, as for a Linux private futex.
+    if matches!(request, LinuxFutexOp::Requeue { .. }) {
+        if uaddr2 == 0 {
+            return Err(SyscallError::EFAULT);
+        }
+        if uaddr2 % 4 != 0 {
+            return Err(SyscallError::EINVAL);
+        }
+        validate_user_ptr(uaddr2 as *const u8, core::mem::size_of::<u32>())?;
+    }
+
     // 验证用户内存可访问
     // E.4 PI: FUTEX_LOCK_PI 也需要读取用户内存
-    verify_user_memory(
-        uaddr as *const u8,
-        core::mem::size_of::<u32>(),
-        op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI,
-    )?;
+    let reads_word = op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI;
+    verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), reads_word)?;
 
     // 获取回调函数
     let futex_fn = {
@@ -17267,8 +17398,8 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // 对于 FUTEX_WAIT/FUTEX_WAIT_TIMEOUT/FUTEX_LOCK_PI，需要先读取当前值
-    let current_value = if op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI {
+    // 对于 FUTEX_WAIT/FUTEX_WAIT_TIMEOUT/FUTEX_LOCK_PI/FUTEX_CMP_REQUEUE，需要先读取当前值
+    let current_value = if reads_word || compares_word {
         // 读取 futex 字（安全：已验证用户内存）
         let mut value_bytes = [0u8; 4];
         copy_from_user(&mut value_bytes, uaddr as *const u8)?;
@@ -17277,8 +17408,28 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
         0 // FUTEX_WAKE/FUTEX_UNLOCK_PI 不需要当前值
     };
 
+    // FUTEX_REQUEUE/FUTEX_CMP_REQUEUE. A waiter keeps a reference to the
+    // bucket it sleeps in, so it cannot move to `uaddr2`'s queue here.
+    // Instead, the waiters Linux would requeue are woken. A FUTEX_WAIT may
+    // return 0 spuriously, and requeue users (musl's and glibc's condition
+    // variables) re-check their word and wait again on `uaddr2` if they must,
+    // so the cost is a thundering herd on broadcast, never a lost wake-up.
+    // Returning ENOSYS instead hangs musl's pthread_cond_broadcast: it clears
+    // the next waiter's barrier word and relies on the requeue to wake it.
+    let val = match request {
+        LinuxFutexOp::Requeue { nr_requeue, .. } => {
+            if compares_word && current_value != val3 {
+                return Err(SyscallError::EAGAIN);
+            }
+            // Both counts are at most i32::MAX, so the sum fits in a u32.
+            val + nr_requeue
+        }
+        _ => val,
+    };
+
     // R39-6 FIX: 解析可选超时（纳秒）
-    let timeout_ns = if op == FUTEX_WAIT_TIMEOUT && timeout_ptr != 0 {
+    // `timeout_kind` is set only for a non-NULL timeout pointer.
+    let timeout_ns = if let Some(timeout_kind) = timeout_kind {
         // 验证 timespec 结构可读
         verify_user_memory(
             timeout_ptr as *const u8,
@@ -17300,17 +17451,83 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
         }
 
         // 转换为纳秒
-        Some(
-            (tv_sec as u64)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(tv_nsec as u64),
-        )
+        let timeout_ns = (tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(tv_nsec as u64);
+        Some(match timeout_kind {
+            FutexTimeoutKind::Relative => timeout_ns,
+            // A deadline already passed becomes 0, which times out at once
+            // (after the value check, as on Linux).
+            FutexTimeoutKind::Absolute => timeout_ns
+                .saturating_sub(crate::time::current_timestamp_ms().saturating_mul(1_000_000)),
+        })
     } else {
         None
     };
 
     // 调用 IPC 模块的 futex 实现
     futex_fn(uaddr, op, val, current_value, timeout_ns)
+}
+
+#[cfg(test)]
+mod gap5_futex_abi_tests {
+    use super::*;
+
+    #[test]
+    fn linux_futex_ops_decode_to_served_requests() {
+        use FutexTimeoutKind::{Absolute, Relative};
+        const PRIVATE: i32 = 128;
+        const CLOCK_REALTIME: i32 = 256;
+        let any = FUTEX_BITSET_MATCH_ANY;
+        let decode = decode_linux_futex_op;
+
+        assert_eq!(decode(PRIVATE, 0, 0, 0), Ok(LinuxFutexOp::Wait(None)));
+        assert_eq!(
+            decode(0, 0, 0x1000, 0),
+            Ok(LinuxFutexOp::Wait(Some(Relative)))
+        );
+        assert_eq!(decode(1 | PRIVATE, 1, 0, 0), Ok(LinuxFutexOp::Wake));
+        assert_eq!(
+            decode(3 | PRIVATE, 0, 1, 0),
+            Ok(LinuxFutexOp::Requeue {
+                nr_requeue: 1,
+                compare: false
+            })
+        );
+        // The requeue count is the low 32 bits of the timeout argument.
+        assert_eq!(
+            decode(4, 1, (1 << 32) | i32::MAX as usize, 7),
+            Ok(LinuxFutexOp::Requeue {
+                nr_requeue: i32::MAX as u32,
+                compare: true
+            })
+        );
+        assert_eq!(decode(6, 0, 0, 0), Ok(LinuxFutexOp::LockPi));
+        assert_eq!(decode(7 | PRIVATE, 0, 0, 0), Ok(LinuxFutexOp::UnlockPi));
+        assert_eq!(
+            decode(9 | PRIVATE | CLOCK_REALTIME, 0, 0x1000, any),
+            Ok(LinuxFutexOp::Wait(Some(Absolute)))
+        );
+        assert_eq!(decode(9, 0, 0, any), Ok(LinuxFutexOp::Wait(None)));
+        assert_eq!(decode(10 | PRIVATE, 1, 0, any), Ok(LinuxFutexOp::Wake));
+
+        // Negative counts, an empty bitset and a REALTIME relative wait are
+        // invalid, as on Linux.
+        assert_eq!(decode(3, u32::MAX, 1, 0), Err(SyscallError::EINVAL));
+        assert_eq!(
+            decode(4, 1, u32::MAX as usize, 0),
+            Err(SyscallError::EINVAL)
+        );
+        assert_eq!(decode(9, 0, 0, 0), Err(SyscallError::EINVAL));
+        assert_eq!(decode(10, 1, 0, 0), Err(SyscallError::EINVAL));
+        assert_eq!(decode(CLOCK_REALTIME, 0, 0, 0), Err(SyscallError::ENOSYS));
+        // A partial bitset and the unserved ops are refused, not approximated.
+        assert_eq!(decode(9, 0, 0, 1), Err(SyscallError::ENOSYS));
+        assert_eq!(decode(10, 1, 0, 0x8), Err(SyscallError::ENOSYS));
+        for unserved in [2, 5, 8, 11, 12, 13] {
+            assert_eq!(decode(unserved, 0, 0, any), Err(SyscallError::ENOSYS));
+        }
+    }
 }
 
 // ============================================================================

@@ -77,6 +77,7 @@ user stack guard page faults while the lazy region above it grows
 CLONE_CHILD_CLEARTID clears a .bss tid word at exit
 tkill and tgkill reach exactly the named task
 thread groups share identity and files, exit as one and are reaped once
+futex requeue wakes a sleeping sibling and bitset ops keep the Linux contract
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

@@ -221,6 +221,10 @@ pub extern "C" fn _start() -> ! {
     // thread_preview via the syscall_test feature).
     test_thread_group(&mut results);
 
+    // GAP-5 slice 4: FUTEX_REQUEUE/CMP_REQUEUE and the bitset ops that
+    // condition variables use.
+    test_futex_requeue(&mut results);
+
     // Print summary
     println("");
     println("================================");
@@ -1983,6 +1987,64 @@ unsafe fn raw_clone(
     ret
 }
 
+/// Futex word the blocked child sleeps on; nothing ever wakes it.
+static CLEAR_TID_BLOCK_WORD: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+
+/// Child entry: record the tid the kernel stored, then sleep until killed.
+extern "C" fn clear_tid_blocking_child() -> ! {
+    use core::sync::atomic::Ordering;
+    CLEAR_TID_SEEN.store(CLEAR_TID_WORD.load(Ordering::SeqCst), Ordering::SeqCst);
+    loop {
+        unsafe { futex(&CLEAR_TID_BLOCK_WORD, FUTEX_WAIT_OP, 0, 0, 0, 0) };
+    }
+}
+
+/// The D5 leg: SIGKILL a CLONE_VM child blocked in FUTEX_WAIT; after the reap
+/// its CLONE_CHILD_CLEARTID word must read 0. Reports its own failure.
+fn clear_tid_after_blocked_kill_leg(stack_top: usize) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    // Touch both words in this address space first, so neither write below
+    // is a first-use fault.
+    CLEAR_TID_BLOCK_WORD.0.store(0, Ordering::SeqCst);
+    CLEAR_TID_WORD.store(-1, Ordering::SeqCst);
+    CLEAR_TID_SEEN.store(0, Ordering::SeqCst);
+    let child = unsafe {
+        raw_clone_vm(
+            CLONE_VM | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            stack_top,
+            CLEAR_TID_WORD.as_ptr(),
+            clear_tid_blocking_child,
+        )
+    };
+    if is_error(child) || child == 0 {
+        return Err("clear-tid: clone of the blocking child failed");
+    }
+    // Let the child start and block. If it is still running when the kill
+    // lands, it exits through its own path and the leg still checks the clear.
+    let mut started = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if CLEAR_TID_SEEN.load(Ordering::SeqCst) as u64 == child {
+            started = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    for _ in 0..100 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+    if reap_pid(child) != Some(SIGKILL_EXIT) {
+        return Err("clear-tid: the blocked child was not killed by SIGKILL");
+    }
+    if !started {
+        return Err("clear-tid: the blocking child never ran");
+    }
+    if CLEAR_TID_WORD.load(Ordering::SeqCst) != 0 {
+        return Err("clear-tid: a kill while blocked left the tid word set");
+    }
+    Ok(())
+}
+
 fn test_clone_vm_clear_child_tid(results: &mut TestResult) {
     use core::sync::atomic::Ordering;
     print("Testing CLONE_CHILD_CLEARTID on a .bss word... ");
@@ -2037,6 +2099,14 @@ fn test_clone_vm_clear_child_tid(results: &mut TestResult) {
         print_int(word as i64);
         print(" ");
         results.fail("clear-tid: exit left the .bss tid word set");
+        return;
+    }
+    // Review D5: a kill, not a voluntary exit. The SIGKILL wakes the child
+    // out of FUTEX_WAIT and it is torn down at its next safe point; that
+    // teardown must clear the word too. (The deferred IRQ-kill drain is
+    // reached only by kernel-originated kills such as OOM.)
+    if let Err(reason) = clear_tid_after_blocked_kill_leg(stack_top) {
+        results.fail(reason);
         return;
     }
     results.pass("CLONE_CHILD_CLEARTID clears a .bss tid word at exit");
@@ -2454,4 +2524,250 @@ fn test_thread_group(results: &mut TestResult) {
         return;
     }
     results.pass("thread groups share identity and files, exit as one and are reaped once");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 slice 4: the futex operations condition variables need. musl's
+// pthread_cond_broadcast clears the next waiter's barrier word and requeues
+// that waiter to the mutex with FUTEX_REQUEUE; the kernel wakes it instead
+// (see sys_futex). Runs in a forked host so a stuck waiter cannot take this
+// PID 1 down.
+// ---------------------------------------------------------------------------
+
+const SYS_FUTEX: u64 = 202;
+const FUTEX_WAIT_OP: u64 = 0;
+const FUTEX_WAKE_OP: u64 = 1;
+const FUTEX_REQUEUE_OP: u64 = 3;
+const FUTEX_CMP_REQUEUE_OP: u64 = 4;
+const FUTEX_WAIT_BITSET_OP: u64 = 9;
+const FUTEX_WAKE_BITSET_OP: u64 = 10;
+const FUTEX_PRIVATE: u64 = 128;
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+const FUTEX_BITSET_ANY: u64 = 0xffff_ffff;
+const ENOSYS: i32 = 38;
+const ETIMEDOUT: i32 = 110;
+const SYS_CLOCK_GETTIME: u64 = 228;
+const CLOCK_MONOTONIC: u64 = 1;
+/// Deadline of the lone timed wait below.
+const FUTEX_SLEEP_NS: i64 = 20_000_000;
+/// Host exit status when every check passed.
+const FUTEX_LEG_OK: u64 = 0x33;
+/// What the waiter thread's FUTEX_WAIT returned (u64 syscall result).
+const FUTEX_WAIT_PENDING: u64 = 0xdead;
+
+#[repr(C, align(4))]
+struct FutexWord(core::sync::atomic::AtomicU32);
+static FUTEX_WORD: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static FUTEX_TARGET: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static FUTEX_WAIT_RESULT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(FUTEX_WAIT_PENDING);
+
+/// CLOCK_MONOTONIC in nanoseconds, or None if the clock is unreadable.
+fn monotonic_ns() -> Option<i64> {
+    let mut ts = [0i64; 2];
+    let r = unsafe { syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, ts.as_mut_ptr() as u64) };
+    (r == 0).then(|| ts[0] * 1_000_000_000 + ts[1])
+}
+
+unsafe fn futex(word: &FutexWord, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> u64 {
+    syscall6(
+        SYS_FUTEX,
+        word.0.as_ptr() as u64,
+        op,
+        val,
+        timeout,
+        uaddr2,
+        val3,
+    )
+}
+
+/// Thread entry: sleep on FUTEX_WORD until a requeue wakes it.
+extern "C" fn futex_waiter_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let ret = unsafe { futex(&FUTEX_WORD, FUTEX_WAIT_OP | FUTEX_PRIVATE, 0, 0, 0, 0) };
+    FUTEX_WAIT_RESULT.store(ret, Ordering::SeqCst);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Body of the futex leg's host process; returns its exit status.
+fn futex_requeue_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let target = FUTEX_TARGET.0.as_ptr() as u64;
+    let past = [0i64; 2]; // timespec {0, 0}: an absolute deadline long gone
+    let past = past.as_ptr() as u64;
+    // Touch both words: the kernel refuses a futex word on a page that is not
+    // present yet (EFAULT), and these may be first-use .bss pages.
+    FUTEX_WORD.0.store(0, Ordering::SeqCst);
+    FUTEX_TARGET.0.store(0, Ordering::SeqCst);
+
+    // Argument contract, no waiter involved.
+    unsafe {
+        if errno(futex(&FUTEX_WORD, FUTEX_CMP_REQUEUE_OP, 0, 1, target, 7)) != EAGAIN {
+            return 0x90; // *uaddr != val3
+        }
+        if futex(
+            &FUTEX_WORD,
+            FUTEX_CMP_REQUEUE_OP | FUTEX_PRIVATE,
+            1,
+            1,
+            target,
+            0,
+        ) != 0
+        {
+            return 0x91; // matching value, nobody waiting
+        }
+        if errno(futex(
+            &FUTEX_WORD,
+            FUTEX_REQUEUE_OP,
+            0,
+            0xffff_ffff,
+            target,
+            0,
+        )) != EINVAL
+        {
+            return 0x92; // negative requeue count
+        }
+        if errno(futex(&FUTEX_WORD, FUTEX_REQUEUE_OP, 0, 1, target + 1, 0)) != EINVAL {
+            return 0x93; // misaligned target
+        }
+        if errno(futex(&FUTEX_WORD, FUTEX_WAIT_BITSET_OP, 0, 0, 0, 0)) != EINVAL {
+            return 0x94; // empty bitset
+        }
+        if errno(futex(&FUTEX_WORD, FUTEX_WAIT_BITSET_OP, 0, 0, 0, 1)) != ENOSYS {
+            return 0x95; // partial bitsets are refused, not widened
+        }
+        let realtime = FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME;
+        if errno(futex(&FUTEX_WORD, realtime, 0, past, 0, FUTEX_BITSET_ANY)) != ETIMEDOUT {
+            return 0x96; // absolute deadline already passed
+        }
+        if errno(futex(&FUTEX_WORD, realtime, 1, past, 0, FUTEX_BITSET_ANY)) != EAGAIN {
+            return 0x97; // the value check comes first
+        }
+        if errno(futex(
+            &FUTEX_WORD,
+            FUTEX_WAIT_OP | FUTEX_CLOCK_REALTIME,
+            0,
+            0,
+            0,
+            0,
+        )) != ENOSYS
+        {
+            return 0x98; // CLOCK_REALTIME only with WAIT_BITSET
+        }
+        if futex(&FUTEX_WORD, FUTEX_WAKE_BITSET_OP, 1, 0, 0, FUTEX_BITSET_ANY) != 0 {
+            return 0x99;
+        }
+    }
+
+    // A lone timed wait must sleep until its deadline and report ETIMEDOUT,
+    // not a wake (the F13 contract: a reschedule that returns without a switch
+    // is not a wake). This passes on the pre-fix kernel too, so it pins the
+    // contract but does not reproduce F13; the musl timed-wait leg did.
+    let Some(start) = monotonic_ns() else {
+        return 0x9f;
+    };
+    let deadline_ns = start + FUTEX_SLEEP_NS;
+    let deadline = [deadline_ns / 1_000_000_000, deadline_ns % 1_000_000_000];
+    let r = unsafe {
+        futex(
+            &FUTEX_WORD,
+            FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE,
+            0,
+            deadline.as_ptr() as u64,
+            0,
+            FUTEX_BITSET_ANY,
+        )
+    };
+    if errno(r) != ETIMEDOUT {
+        return 0xa0; // a lone timed wait woke without a waker
+    }
+    match monotonic_ns() {
+        Some(now) if now >= deadline_ns => {}
+        _ => return 0xa1, // returned before its deadline
+    }
+
+    // A sibling thread (same tgid, so the same futex key) sleeps on the word.
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    FUTEX_WAIT_RESULT.store(FUTEX_WAIT_PENDING, Ordering::SeqCst);
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            futex_waiter_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0x9a;
+    }
+    // Until the thread is asleep, a requeue finds nobody and returns 0.
+    let mut moved = 0;
+    for _ in 0..THREAD_POLL_YIELDS {
+        moved = unsafe {
+            futex(
+                &FUTEX_WORD,
+                FUTEX_CMP_REQUEUE_OP | FUTEX_PRIVATE,
+                0,
+                1,
+                target,
+                0,
+            )
+        };
+        if moved != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if moved != 1 {
+        return 0x9b; // the sleeping waiter was not counted exactly once
+    }
+    // On Linux the waiter now sleeps on the target; here it is already awake.
+    // Waking the target keeps the leg valid for both.
+    if is_error(unsafe { futex(&FUTEX_TARGET, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) }) {
+        return 0x9c;
+    }
+    let mut joined = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if GROUP_TID_WORD.load(Ordering::SeqCst) == 0 {
+            joined = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if !joined {
+        return 0x9d;
+    }
+    if FUTEX_WAIT_RESULT.load(Ordering::SeqCst) != 0 {
+        return 0x9e; // the waiter must report a wake, not EAGAIN or an error
+    }
+    FUTEX_LEG_OK
+}
+
+fn test_futex_requeue(results: &mut TestResult) {
+    print("Testing futex requeue and bitset ops... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("futex requeue: fork of the host failed");
+        return;
+    }
+    if host == 0 {
+        let code = futex_requeue_leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(FUTEX_LEG_OK) => {}
+        Some(code) => {
+            print("futex leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("futex requeue: a check failed");
+            return;
+        }
+        None => {
+            results.fail("futex requeue: could not reap the host");
+            return;
+        }
+    }
+    results.pass("futex requeue wakes a sleeping sibling and bitset ops keep the Linux contract");
 }

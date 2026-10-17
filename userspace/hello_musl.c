@@ -27,6 +27,7 @@
 #include "exit_idle_probe.c"
 #include "vfs_context_probe.c"
 #include "tls_context_probe.c"
+#include "pthread_probe.c"
 
 #ifdef KSA_OPEN_FAULT_PROBE
 #include "open_fault_probe.c"
@@ -424,6 +425,7 @@ int main(int argc, char *argv[]) {
     if (fcntl_limit_smoke()) return 1;
     if (exit_idle_smoke()) return 1;
     if (tls_context_smoke()) return 1;
+    if (pthread_smoke()) return 1;
     if (vfs_context_probe()) return 1;
     if (wait_namespace_smoke() || blocked_default_signal_smoke()) return 1;
 #ifdef KSA_OPEN_FAULT_PROBE
