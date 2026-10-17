@@ -39,9 +39,9 @@ calling an entire subsystem complete because its API or source files exist.
 | UEFI and boot | PIE kernel loading/relocation, memory-map handoff, KASLR placement, console initialization | x86_64 platform scope; broader firmware/hardware and early-boot W+X qualification |
 | Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions, private-anonymous `mremap` (in-place grow/shrink + `MREMAP_MAYMOVE`) and bounded slab/NUMA/swap/THP primitives | Remote MM/core/hosted/build/lint verification is complete for this slice and `mremap` is remote-validated with the Ring-3 oracle gate (`make test-ring3-mm`) passing, but independent review is still pending; MAP_FIXED/file mappings, shared-anonymous `mremap`, and integrated slab/NUMA/swap/THP backends remain unqualified |
 | Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests; `waitid` (`P_ALL`/`P_PID`, `WNOHANG`/`WNOWAIT`, `siginfo_t` copyout) sharing one reap engine with `wait4`, and root PID-namespace init registered through the normal PID chain | `waitid` `P_PGID` and `WUNTRACED`/`WCONTINUED` are fail-closed EINVAL, not supported; PID1 exit, reaper races and the attach-time/fd-charge rollback paths are uncovered (waitid WNOWAIT-then-reap, copyout-fault, ROOT-INIT orphan adoption and fork refusal under `pids.max` are guest-verified); PID1/reaper races and remaining failure/stress breadth |
-| Threads and TLS | Restricted CLONE_VM/TLS setup, FS/user-GS restoration tested across SMP migration | General CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND rejected; not pthread compatibility |
-| Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering | High-core/long-run/physical qualification; 64 is a CPU ceiling, not a tested topology claim |
-| IPC and signals | Capability-backed pipes, futex primitives/robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, Linux futex parity, sigaltstack/queued-RT/restart semantics |
+| Threads and TLS | Restricted CLONE_VM/TLS setup, FS/user-GS restoration tested across SMP migration; thread groups (shared signal table, fs context and fd table, group exit and fatal signals, tkill/tgkill, exactly-once reaping) and musl `pthread_create`/`join`/mutex/condition variables/TLS pass in guest-only `thread_preview` test builds on 1-8 CPUs | Default builds still reject CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND; exec from a thread group returns EBUSY; independent review pending, so not pthread compatibility |
+| Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing from every CPU, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering, guard-free SCHED-TRAP and a switch sentinel; `/proc/schedstat` per-CPU switch/migration counters; memory/cpu/smp stress soaks qualify on 4 vCPUs | Process/block/combined soak profiles, physical and longer high-core qualification; 64 CPUs boot in QEMU as a reject ceiling, not a tested workload claim |
+| IPC and signals | Capability-backed pipes, Linux futex op numbering (WAIT/WAKE, REQUEUE/CMP_REQUEUE served by waking, PI lock/unlock, MATCH_ANY bitset ops), robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, FUTEX_WAKE_OP/requeue-PI/partial bitsets, sigaltstack/queued-RT/restart semantics |
 | File descriptors | Ordinary fd 0/1/2, dup/close/fork/exec/CLOEXEC, shared status flags, O_NONBLOCK consumers and NOFILE enforcement | Broader fcntl/rlimit/thread-sharing semantics |
 | VFS and paths | ramfs/ext2/JBD2 subset, procfs/devfs/CPIO/cgroupfs; cwd/root/pivot, symlink/jail resolution, DAC/UID/GID, mount retirement | General dirfd, chown/statx/hard links, terminal fidelity and full POSIX/filesystem compatibility |
 | Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | fsync/fdatasync/sync/sync_file_range not wired; power-loss/recovery/cache qualification |
@@ -52,7 +52,7 @@ calling an entire subsystem complete because its API or source files exist.
 | VT-d | DMAR boot wiring; Q35 init failures and EDU translated DMA/MSI/invalidation/quarantine/reuse tested | Physical qualification, MSI-X, multi-unit/bridge/RMRR/ACCESS_PLATFORM and modern modes |
 | Livepatch | Unsupported behavior tested; experimental parser/signature/lifecycle code retained | All mutation/syscall paths reject ENOSYS; real hooks/keys/SMP rollback required |
 | Audit and observability | Hash/HMAC audit, authorized trace/counters, profile logs, watchdog/profiler/serial kdump | Durable/remote backend, key operations and measured performance; no FIPS certification |
-| Userspace and compatibility | Native libc helpers/development shell, static ET_EXEC/musl/SysV auxv and selected ABI layouts | ET_DYN/dynamic loader/vDSO, glibc/pthread, general application/OCI and userspace personality |
+| Userspace and compatibility | Native libc helpers/development shell, static ET_EXEC/musl/SysV auxv and selected ABI layouts; musl pthreads in the guest test preview | ET_DYN/dynamic loader/vDSO, glibc, pthreads in default builds, general application/OCI and userspace personality |
 | Tests and fuzzing | Hosted debug/release, harness JUnit/coverage, real KCOV/two-seed QEMU smoke, scheduled fuzz/extended groups | Deferred guest tests, six-profile stress acceptance and real performance/thermal evidence |
 
 The [full roadmap](docs/roadmap.md#4-kernel-composition) covers all **25 kernel
@@ -85,7 +85,7 @@ narratives. The roadmap is the current capability/qualification reference.
 
 ## Tests and CI
 
-The current hosted allowlist runs **454 counted unit-test executions per
+The current hosted allowlist runs **468 counted unit-test executions per
 debug/release profile**, CpuLocal doctests and three test-code compile checks.
 The runtime scanner discovers **74 RuntimeTest implementations**; that count
 does not mean 74 guest passes or 100% kernel instruction coverage.

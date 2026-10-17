@@ -208,13 +208,13 @@ Cargo 分层与回调打破依赖环，**不**创造特权边界。受信任引�
 
 **已有：** 隔离地址空间、fork/路径 exec/exit/reap、wait4/WNOHANG、MLFQ/抢占/窃取/均衡/亲和/cpuset。TLS 恢复有含定时器上下文迁移的 UP/SMP musl 证据。KSA-011 练命名空间 wait 身份与六种 exit/reap/idle 情形。
 
-**缺失：** clone 窄于 Linux 线程。CLONE_VM/TLS 设置存在；一般 CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND 组合被拒绝。这**不是** pthread 支持。waitid 已针对 `P_ALL`/`P_PID` 实现，支持 `WNOHANG`/`WNOWAIT` 与 `siginfo_t` 回写，并与 wait4 共用 `wait_reap_core`；`P_PGID` 与 `WUNTRACED`/`WCONTINUED` 仍按失败关闭返回 EINVAL，其四个宿主判定用例已于 2026-09-25 在 x86_64 Linux 主机上执行通过（79 passed / 0 failed，完整阶梯 454 全绿），且一条 Ring-3 guest 腿以真实 zombie 驱动 syscall 247（`make test-ring3-mm`：14 passed / 0 failed），覆盖 WNOWAIT 存活、EFAULT 先于收割与 `P_ALL`；第二条腿验证了 ROOT-INIT 孤儿收养，其后的腿又验证了 `pids.max` 下的 fork 拒绝与用户栈保护页（17 passed / 0 failed）。PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径仍未覆盖。历史 fork 回退、栈碎片、switch-sentinel 与 PID1 收割竞态问题仍在（ROOT-INIT 注册本身已于 2026-09-25 关闭）；与较新 KSA 修复的重叠须按原始判定标准调和。责任人：**F2、F7、F4/F6、ROOT-INIT、F-4**。
+**缺失：** 默认构建中的 clone 窄于 Linux 线程。CLONE_VM/TLS 设置存在；一般 CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND 组合被拒绝。guest 测试构建启用 `thread_preview`，其中真实线程组（共享信号表、fs 上下文与 fd 表；组退出、致命信号与停止；tkill/tgkill；恰好一次收割）由 Ring-3 oracle 与 musl `pthread_create`/`join` 在 1-8 CPU 上验证。线程组内 exec 返回 EBUSY，预览尚无独立评审，因此这**不是** pthread 支持。waitid 已针对 `P_ALL`/`P_PID` 实现，支持 `WNOHANG`/`WNOWAIT` 与 `siginfo_t` 回写，并与 wait4 共用 `wait_reap_core`；`P_PGID` 与 `WUNTRACED`/`WCONTINUED` 仍按失败关闭返回 EINVAL，其四个宿主判定用例已于 2026-09-25 在 x86_64 Linux 主机上执行通过（79 passed / 0 failed，完整阶梯 454 全绿），且一条 Ring-3 guest 腿以真实 zombie 驱动 syscall 247（`make test-ring3-mm`：14 passed / 0 failed），覆盖 WNOWAIT 存活、EFAULT 先于收割与 `P_ALL`；第二条腿验证了 ROOT-INIT 孤儿收养，其后的腿又验证了 `pids.max` 下的 fork 拒绝与用户栈保护页（17 passed / 0 failed）。PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径仍未覆盖。历史 fork 回退、栈碎片与 PID1 收割竞态问题仍在（ROOT-INIT 注册本身已于 2026-09-25 关闭；F4/F6 切换哨兵与锁外 SCHED-TRAP 已随 GAP-6 工作落地，其 SMP 浸泡还修复了会滞留绑核任务的单源工作窃取）；与较新 KSA 修复的重叠须按原始判定标准调和。责任人：**F2、F7、F4/F6、ROOT-INIT、F-4**。
 
 ### 5.3 IPC、信号、轮询与时间
 
-**已有：** 能力支持的管道、阻塞/唤醒、带内部 PI 的 futex 原语、robust 清理、掩码、kill/tgkill、rt_sigaction/rt_sigreturn、IRQ 返回投递、基础 poll/select 与启动/时间调用。musl 练阻塞信号、robust usercopy 与零长度套接字行为。
+**已有：** 能力支持的管道、阻塞/唤醒、带内部 PI 与 Linux 操作编号（WAIT/WAKE、以唤醒实现的 REQUEUE/CMP_REQUEUE、LOCK_PI/UNLOCK_PI、MATCH_ANY 位掩码操作）的 futex 原语、robust 清理、掩码、kill/tgkill、rt_sigaction/rt_sigreturn、IRQ 返回投递、基础 poll/select 与启动/时间调用。musl 练阻塞信号、robust usercopy 与零长度套接字行为。
 
-**缺失：** 端点/消息类型不是完整原生同步 IPC 与共享内存。内部 futex 操作不是完整 Linux opcode/flag 对等。SA_RESTART 被接受但被中断调用可返回 EINTR；siginfo 最小、无 sigaltstack、排队实时信号不完整。未声明完成的 epoll/eventfd/timerfd 表面。责任人：**F-1c、F-2、F-4、F-10**。
+**缺失：** 端点/消息类型不是完整原生同步 IPC 与共享内存。FUTEX_WAKE_OP、requeue-PI 操作与部分位掩码被拒绝，因此 futex 不是完整 Linux opcode/flag 对等。SA_RESTART 被接受但被中断调用可返回 EINTR；siginfo 最小、无 sigaltstack、排队实时信号不完整。未声明完成的 epoll/eventfd/timerfd 表面。责任人：**F-1c、F-2、F-4、F-10**。
 
 ### 5.4 安全框架与操作策略
 

@@ -149,9 +149,14 @@ MLFQ/preemption/stealing/balancing/affinity/cpuset. TLS restoration has UP/SMP
 musl evidence including timer-context migration. KSA-011 exercises namespace
 wait identity and six exit/reap/idle cases.
 
-**Missing:** clone is narrower than Linux threads. CLONE_VM/TLS setup exists;
-general CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND combinations are rejected.
-This is not pthread support. waitid is implemented for `P_ALL`/`P_PID` with
+**Missing:** clone in default builds is narrower than Linux threads. CLONE_VM/TLS
+setup exists; general CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND combinations
+are rejected. Guest test builds enable a `thread_preview` with real thread groups
+(shared signal table, fs context and fd table; group exit, fatal signals and stop;
+tkill/tgkill; exactly-once reaping) that the Ring-3 oracle and musl
+`pthread_create`/`join` exercise on 1-8 CPUs. Exec from a thread group returns
+EBUSY and the preview has no independent review, so this is not pthread support.
+waitid is implemented for `P_ALL`/`P_PID` with
 `WNOHANG`/`WNOWAIT` and `siginfo_t` copyout, sharing `wait_reap_core` with wait4;
 `P_PGID` and `WUNTRACED`/`WCONTINUED` remain fail-closed EINVAL, and its four
 hosted oracles passed on an x86_64 Linux host on 2026-09-25 (79 passed, 0
@@ -161,20 +166,24 @@ WNOWAIT survival, EFAULT-before-reap and `P_ALL`; a second leg verifies
 ROOT-INIT orphan adoption, and further legs verify fork refusal under
 `pids.max` and the user-stack guard page (17 passed, 0 failed). PID1 exit,
 reaper races and the attach-time/fd-charge rollback paths remain uncovered. Historical fork
-fallback, stack-fragmentation, switch-sentinel and PID1 reaper-race questions
-remain (ROOT-INIT registration itself closed 2026-09-25);
+fallback, stack-fragmentation and PID1 reaper-race questions remain (ROOT-INIT
+registration itself closed 2026-09-25; the F4/F6 switch sentinel and guard-free
+SCHED-TRAP landed with the GAP-6 work, whose SMP soak also fixed single-source work
+stealing that stranded a pinned task);
 reconcile overlap with newer KSA fixes by original oracle. Owners: **F2, F7,
 F4/F6, ROOT-INIT, F-4**.
 
 ### 5.3 IPC, signals, polling and time
 
 **Available:** capability-backed pipes, blocking/wakeup, futex primitives with
-internal PI, robust cleanup, masks, kill/tgkill, rt_sigaction/rt_sigreturn,
+internal PI and Linux op numbering (WAIT/WAKE, REQUEUE/CMP_REQUEUE served by
+waking, LOCK_PI/UNLOCK_PI, MATCH_ANY bitset ops), robust cleanup, masks, kill/tgkill, rt_sigaction/rt_sigreturn,
 IRQ-return delivery, basic poll/select and startup/time calls. Musl exercises
 blocked signals, robust usercopy and zero-length socket behavior.
 
 **Missing:** endpoint/message types are not complete native synchronous IPC and
-shared memory. Internal futex operations are not full Linux opcode/flag parity.
+shared memory. FUTEX_WAKE_OP, the requeue-PI ops and partial bitsets are refused,
+so futex is not full Linux opcode/flag parity.
 SA_RESTART is accepted but interrupted calls can return EINTR; siginfo is
 minimal, sigaltstack absent, queued real-time signals incomplete. No completed
 epoll/eventfd/timerfd surface is claimed. Owners: **F-1c, F-2, F-4, F-10**.
