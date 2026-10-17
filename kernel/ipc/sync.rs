@@ -599,8 +599,41 @@ impl WaitQueue {
         }
     }
 
+    /// Yield until the armed wait is resolved: a waker, the timeout or a kill
+    /// has made the task runnable, or a handler signal is pending.
+    ///
+    /// `force_reschedule` can return without a switch while the task is still
+    /// `Blocked`: when nothing else on this CPU can run (the scheduler hands the
+    /// CPU to its idle frame only for an exiting task) or on try-lock
+    /// contention. Taking that return as a wake made a futex wait report a
+    /// wake nobody sent, disarm its timer, and go back to user mode still
+    /// `Blocked` and queued; the next switch away then never re-queued the
+    /// task. A musl `pthread_cond_timedwait` with no other runnable task lost
+    /// PID 1 this way on one CPU. `wait_reap_core` loops for the same reason.
+    ///
+    /// With interrupts off neither the timer nor a cross-CPU wake can resolve
+    /// the wait, so that (invalid) context keeps the single reschedule.
+    fn block_until_resolved(pid: ProcessId) {
+        if !interrupts::are_enabled() {
+            kernel_core::force_reschedule();
+            return;
+        }
+        loop {
+            kernel_core::force_reschedule();
+            let still_blocked = process::get_process(pid)
+                .is_some_and(|process| process.lock().state == ProcessState::Blocked);
+            if !still_blocked
+                || process::wait_should_abort(pid)
+                || kernel_core::signal::has_deliverable_signal(pid)
+            {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     pub(crate) fn finish_prepared(&self, ticket: WaitTicket) -> WaitOutcome {
-        kernel_core::force_reschedule();
+        Self::block_until_resolved(ticket.pid);
         self.disarm_ticket_timer(&ticket);
 
         let outcome = if process::wait_should_abort(ticket.pid)
