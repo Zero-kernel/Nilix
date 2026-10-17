@@ -8,6 +8,7 @@
 //! - /proc/[pid]/stat - Process statistics
 //! - /proc/meminfo - System memory information
 //! - /proc/cpuinfo - CPU information
+//! - /proc/waitstat - wait4/waitid over-wake counter (GAP-6 W-3)
 
 use crate::traits::{FileSystem, Inode, PreparedFileHandle};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
@@ -121,7 +122,7 @@ impl ProcFs {
             "RF180-40 failed procfs inode publication drifted admission"
         );
 
-        for name in ["meminfo", "cpuinfo", "uptime", "version"] {
+        for name in ["meminfo", "cpuinfo", "uptime", "version", "waitstat"] {
             let inode = fs
                 .lookup(&root, name)
                 .expect("RF180-40 admitted procfs inode publication");
@@ -262,6 +263,10 @@ impl ProcRootInode {
                 fs_id: self.fs_id,
                 _heap_charge: Some(charge),
             })?),
+            "waitstat" => Ok(try_new_procfs_arc(|charge| ProcWaitstatInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
             _ => {
                 // Try to parse as PID
                 if let Ok(ns_pid) = name.parse::<u32>() {
@@ -324,7 +329,9 @@ impl Inode for ProcRootInode {
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
         // Static entries
-        let static_entries = ["self", "meminfo", "cpuinfo", "uptime", "version"];
+        let static_entries = [
+            "self", "meminfo", "cpuinfo", "uptime", "version", "waitstat",
+        ];
 
         if offset < static_entries.len() {
             let name = static_entries[offset];
@@ -1494,6 +1501,70 @@ impl Inode for ProcVersionInode {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let content = "Zero-OS version 0.1.0 (rustc)\n";
         read_from_content(content, offset, buf)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
+// /proc/waitstat
+// ============================================================================
+
+/// GAP-6 W-3: exposes the wait over-wake counter so the Ring-3 rubric can
+/// bound it (a pid-targeted wait must not be woken by sibling exits).
+struct ProcWaitstatInode {
+    fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl Inode for ProcWaitstatInode {
+    fn ino(&self) -> u64 {
+        7
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: 7,
+            mode: FileMode::regular(0o444),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let content = try_format_content(format_args!(
+            "over_wakes {}\n",
+            process::wait_over_wake_count()
+        ))?;
+        read_from_content(&content, offset, buf)
     }
 
     fn as_any(&self) -> &dyn Any {

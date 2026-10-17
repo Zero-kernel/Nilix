@@ -200,6 +200,7 @@ pub extern "C" fn _start() -> ! {
     // ROOT-INIT: this binary runs as root-namespace PID 1, so an orphaned
     // grandchild must be reparented to *us*. Last, because it forks twice.
     test_root_init_reparent(&mut results);
+    test_selective_wait_nested_zombie(&mut results);
 
     // Fork refusal under cgroup pids.max: a refused fork must leave no
     // child, no task charge and no consumed PID behind.
@@ -1477,6 +1478,154 @@ fn test_root_init_reparent(results: &mut TestResult) {
     }
 
     results.pass("root-init adopts an orphaned grandchild and can reap it");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-6 W-3/W-4: selective wait against sibling and nested zombies.
+//
+// A pid-targeted wait publishes the target's global pid as its wake filter, so
+// a sibling's exit must neither satisfy it nor be consumed by it. The same
+// contract is checked one generation down (a child reaping its own children by
+// pid) so the translate-once namespace view is exercised for nested zombies.
+// ---------------------------------------------------------------------------
+
+const SELECTIVE_SLOW_YIELDS: u32 = 2_000;
+/// The fast sibling yields a little so the parent is already blocked on the
+/// slow one when it exits: under an any-child wake filter that exit would
+/// over-wake the parent, which /proc/waitstat then records.
+const SELECTIVE_FAST_YIELDS: u32 = 200;
+const SW_FAST: u64 = 11;
+const SW_SLOW: u64 = 22;
+const SW_NESTED_FAST: u64 = 33;
+const SW_NESTED_SLOW: u64 = 44;
+const SW_NESTED_OK: u64 = 55;
+
+fn fork_exit(code: u64, yields: u32) -> u64 {
+    let pid = unsafe { sys_fork() };
+    if pid == 0 {
+        for _ in 0..yields {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        unsafe { userspace::syscall::sys_exit(code) };
+    }
+    pid
+}
+
+/// Reap `pid` by P_PID and return its exit status, or None on any mismatch.
+fn reap_pid(pid: u64) -> Option<u64> {
+    let mut info = SigInfo::poisoned();
+    let r = waitid(P_PID, pid, &mut info, WEXITED);
+    if is_error(r) || info.pid() as u64 != pid {
+        return None;
+    }
+    Some(info.status() as u64)
+}
+
+/// Fast sibling exits first; the slow one is awaited by pid. Returns true when
+/// both are reaped with their own status and nothing is left.
+fn selective_pair(fast_code: u64, slow_code: u64) -> bool {
+    let fast = fork_exit(fast_code, SELECTIVE_FAST_YIELDS);
+    if is_error(fast) {
+        return false;
+    }
+    let slow = fork_exit(slow_code, SELECTIVE_SLOW_YIELDS);
+    if is_error(slow) {
+        let _ = reap_pid(fast);
+        return false;
+    }
+    let slow_ok = reap_pid(slow) == Some(slow_code);
+    let fast_ok = reap_pid(fast) == Some(fast_code);
+    let mut left = SigInfo::poisoned();
+    let drained = errno(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) == ECHILD;
+    slow_ok && fast_ok && drained
+}
+
+/// GAP-6 W-3: read `over_wakes N` from /proc/waitstat.
+fn read_wait_over_wakes() -> Option<u64> {
+    let path = b"/proc/waitstat\0";
+    let fd = unsafe { sys_open(path.as_ptr(), 0, 0) };
+    if is_error(fd) {
+        return None;
+    }
+    let mut buf = [0u8; 48];
+    let read = unsafe { sys_read(fd, buf.as_mut_ptr(), buf.len() as u64) };
+    let _ = unsafe { sys_close(fd) };
+    if is_error(read) {
+        return None;
+    }
+    let text = &buf[..read as usize];
+    let digits = text.strip_prefix(b"over_wakes ")?;
+    let mut value: u64 = 0;
+    let mut seen = 0usize;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u64);
+        seen += 1;
+    }
+    if seen == 0 {
+        return None;
+    }
+    Some(value)
+}
+
+fn test_selective_wait_nested_zombie(results: &mut TestResult) {
+    print("Testing selective wait against sibling/nested zombies... ");
+
+    let Some(wakes_before) = read_wait_over_wakes() else {
+        results.fail("selective wait: /proc/waitstat unreadable");
+        return;
+    };
+    if !selective_pair(SW_FAST, SW_SLOW) {
+        results.fail("selective wait: pid-targeted reap took the wrong sibling");
+        return;
+    }
+    let Some(wakes_after) = read_wait_over_wakes() else {
+        results.fail("selective wait: /proc/waitstat unreadable");
+        return;
+    };
+    if wakes_after != wakes_before {
+        println("");
+        print("  over-wakes during targeted wait: ");
+        print_int(wakes_after.wrapping_sub(wakes_before) as i64);
+        println("");
+        results.fail("selective wait: sibling exit over-woke a pid-targeted wait");
+        return;
+    }
+
+    let mid = unsafe { sys_fork() };
+    if is_error(mid) {
+        results.fail("selective wait: fork of the nested reaper failed");
+        return;
+    }
+    if mid == 0 {
+        let code = if selective_pair(SW_NESTED_FAST, SW_NESTED_SLOW) {
+            SW_NESTED_OK
+        } else {
+            1
+        };
+        unsafe { userspace::syscall::sys_exit(code) };
+    }
+    match reap_pid(mid) {
+        Some(SW_NESTED_OK) => {}
+        Some(other) => {
+            println("");
+            print("  nested reaper exit ");
+            print_int(other as i64);
+            println("");
+            results.fail("selective wait: nested generation reaped the wrong zombie");
+            return;
+        }
+        None => {
+            results.fail("selective wait: nested reaper was not reapable by pid");
+            return;
+        }
+    }
+
+    results.pass("selective wait reaps only its target across sibling and nested zombies");
 }
 
 // ---------------------------------------------------------------------------

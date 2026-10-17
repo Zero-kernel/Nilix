@@ -7669,6 +7669,7 @@ where
 {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let mut resumed_from_block = false;
 
     loop {
         // R171-F3 FIX: a pending kill interrupts wait() with EINTR instead of
@@ -7822,6 +7823,10 @@ where
                 .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone())
         };
         let mut selected_exists = false;
+        let mut selected_global: Option<ProcessId> = None;
+        // A selected zombie whose teardown/switch-out is still in flight: the
+        // wake was genuine, only early (wake_reaper_after_switch follows).
+        let mut selected_zombie_pending = false;
         let mut zombie_child: Option<(ProcessId, i32, ProcessId)> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
@@ -7836,6 +7841,7 @@ where
                         if view_pid != want {
                             continue;
                         }
+                        selected_global = Some(*child_pid);
                     }
 
                     selected_exists = true;
@@ -7852,6 +7858,9 @@ where
                     {
                         zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), view_pid));
                         break;
+                    }
+                    if child.state == ProcessState::Zombie {
+                        selected_zombie_pending = true;
                     }
                 }
                 None => {
@@ -7938,9 +7947,30 @@ where
             return Ok(None);
         }
 
+        // GAP-6 W-3: a pid-targeted wait narrows its published wake filter from
+        // "any child" to the selected child's global pid, so sibling exits no
+        // longer over-wake it. Only narrow while the Some(0) published above is
+        // still in place: a child that exited during the scan already cleared it
+        // (and made us Ready), and the loop below rescans without sleeping.
+        // A resume that rescans into another block found nothing reapable: it
+        // was an over-wake (sibling exit under the old Some(0) filter, or a
+        // zombie still mid-switch). Counted so the rubric can bound it.
+        if resumed_from_block && !selected_zombie_pending {
+            crate::process::note_wait_over_wake();
+        }
+        if let Some(global) = selected_global {
+            let mut proc = parent.lock();
+            if proc.state == ProcessState::Blocked && proc.waiting_child == Some(0) {
+                proc.waiting_child = Some(global);
+            }
+        }
+
         // 没有找到僵尸子进程，让出 CPU 等待被唤醒
         // 状态已在循环开始时设为 Blocked，子进程退出时会将其设为 Ready
         crate::force_reschedule();
+        // A reschedule that bailed (contention / non-preemptible) returns with
+        // Blocked still published: that spin is not a wake, so don't count it.
+        resumed_from_block = parent.lock().state != ProcessState::Blocked;
 
         // 被唤醒后继续循环，检查是否有僵尸子进程
         // 如果是被子进程退出唤醒的，循环会找到 zombie 并返回

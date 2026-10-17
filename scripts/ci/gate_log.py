@@ -233,6 +233,49 @@ def evaluate(
     return GateResult(status, counts, warning_markers, skipped_markers, tuple(reasons), details)
 
 
+INTERRUPT_FATAL_BYTES = re.compile(
+    INTERRUPT_FATAL.pattern.encode(), re.IGNORECASE | re.MULTILINE
+)
+# Every INTERRUPT_FATAL alternative contains one of these lowercase literals.
+INTERRUPT_FATAL_NEEDLES = (b"v=06 ", b"v=08 ", b"v=0d ", b"v=0e ", b"cpu_reset", b"triple fault")
+
+
+def fatal_interrupt_lines(path: Path, limit: int = 64, chunk_size: int = 64 << 20) -> str:
+    # Scan whole line-aligned chunks with the C regex engine; a per-line
+    # Python loop takes many minutes on multi-GiB logs.
+    matches: list[bytes] = []
+    carry = b""
+    with path.open("rb") as stream:
+        while len(matches) < limit:
+            block = stream.read(chunk_size)
+            if not block:
+                data, carry = carry, b""
+            else:
+                data = carry + block
+                cut = data.rfind(b"\n") + 1
+                if cut == 0:
+                    carry = data
+                    continue
+                data, carry = data[:cut], data[cut:]
+            lowered = data.lower()
+            starts = set()
+            for needle in INTERRUPT_FATAL_NEEDLES:
+                at = lowered.find(needle)
+                while at >= 0:
+                    starts.add(lowered.rfind(b"\n", 0, at) + 1)
+                    at = lowered.find(needle, at + len(needle))
+            for start in sorted(starts):
+                end = data.find(b"\n", start)
+                line = data[start : len(data) if end < 0 else end + 1]
+                if INTERRUPT_FATAL_BYTES.search(line):
+                    matches.append(line)
+                    if len(matches) >= limit:
+                        break
+            if not block:
+                break
+    return b"".join(matches).decode("utf-8", errors="replace")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True, type=Path)
@@ -248,6 +291,11 @@ def main() -> int:
     missing = []
     for path in (arguments.serial, arguments.intlog, arguments.qemu_stderr, arguments.timeout_stderr):
         try:
+            if path == arguments.intlog:
+                # `-d int` logs reach several GiB on 4+ CPU runs; only the
+                # line-anchored INTERRUPT_FATAL scan consumes them, so stream.
+                contents.append(fatal_interrupt_lines(path))
+                continue
             contents.append(path.read_text(encoding="utf-8", errors="replace"))
         except OSError as error:
             contents.append("")

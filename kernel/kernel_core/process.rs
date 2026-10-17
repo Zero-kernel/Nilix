@@ -230,6 +230,14 @@ const KSTACK_PAGES: usize = 8;
 /// 守护页数
 const KSTACK_GUARD_PAGES: usize = 1;
 
+/// GAP-6 F7: `try_new_pcb` still builds the `Process` temporary on the calling
+/// kernel stack before `Arc::try_new_in` moves it. Keep that frame bounded to
+/// half of one per-task stack so creation keeps headroom under syscall entry,
+/// dispatch and the clone/fork frames; a larger PCB must move to in-place
+/// construction before this can be raised.
+pub const PCB_STACK_BUDGET: usize = KSTACK_PAGES * PAGE_SIZE as usize / 2;
+const _: () = assert!(core::mem::size_of::<Process>() <= PCB_STACK_BUDGET);
+
 /// `map_to` can request at most three intermediate frames per 4 KiB leaf.
 /// The deliberately conservative per-stack ledger remains tiny and makes all
 /// post-admission mapping/rollback bookkeeping allocation-free.
@@ -1012,8 +1020,8 @@ pub fn allocate_kernel_stack(
             // 映射栈页（守护页不映射，自动触发页错误）
             let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
             // Map with a fixed rollback ledger. `map_range()` uses a heap Vec
-            // after physical allocation; a kernel stack has exactly four pages,
-            // so keep this post-admission path allocation-free.
+            // after physical allocation; a kernel stack has exactly KSTACK_PAGES
+            // pages, so keep this post-admission path allocation-free.
             let mut mapped_pages = 0usize;
             let mut pt_recorder = KernelStackPtRecorder::new(&mut frame_alloc);
             for index in 0..KSTACK_PAGES {
@@ -1025,7 +1033,7 @@ pub fn allocate_kernel_stack(
                     let (tracked_tables, tracked_len) = pt_recorder.into_record();
 
                     // First prove every installed leaf still maps the exact
-                    // order-2 block allocated by this transaction. If proof
+                    // order-3 (KSTACK_PAGES) block allocated by this transaction. If proof
                     // fails, mutate nothing and quarantine both the mapping and
                     // PID-indexed RCU permit.
                     let mut leaves_valid = true;
@@ -5916,6 +5924,20 @@ pub fn current_generation() -> Option<u64> {
     let process = get_process(pid)?;
     let proc = process.lock();
     Some(proc.generation)
+}
+
+/// GAP-6 W-3: wait resumes that rescanned into another block without reaping.
+static WAIT_OVER_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one wait4/waitid resume that found nothing reapable (over-wake).
+pub fn note_wait_over_wake() {
+    // Diagnostic counter only; wrap is harmless. lint-fetch-add: allow
+    WAIT_OVER_WAKES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total over-wakes observed since boot (W-3 rubric counter).
+pub fn wait_over_wake_count() -> u64 {
+    WAIT_OVER_WAKES.load(Ordering::Relaxed)
 }
 
 /// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).

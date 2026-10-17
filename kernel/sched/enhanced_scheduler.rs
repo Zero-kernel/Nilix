@@ -504,6 +504,90 @@ fn stage_prev_on_cpu(pid: u64, generation: u64) {
     });
 }
 
+/// GAP-6 F4/F6: identities of a corrupted dispatch context, captured under the
+/// scheduler locks and formatted only after they are released.
+#[cfg(debug_assertions)]
+struct SchedTrapEvent {
+    pid: Pid,
+    rip: u64,
+    rsp: u64,
+    rcx: u64,
+    cs: u64,
+    old_pid: Option<Pid>,
+}
+
+#[cfg(debug_assertions)]
+impl SchedTrapEvent {
+    #[cold]
+    fn fire(self) -> ! {
+        panic!(
+            "SCHED-TRAP: pid {} kernel context rip={:#x} rsp={:#x} rcx={:#x} cs={:#x} old_pid={:?}",
+            self.pid, self.rip, self.rsp, self.rcx, self.cs, self.old_pid
+        );
+    }
+}
+
+/// GAP-6 F6: compiled (release too) switch/resume sentinel. A resumed task
+/// must find the per-CPU scheduler identity publishing its own pid and
+/// generation on the CPU it is now running on; any mismatch means a context
+/// was resumed under a stale or foreign identity (the fork-chimera family).
+struct SwitchSentinel {
+    pid: Pid,
+    generation: u64,
+    cpu: usize,
+}
+
+/// Last resume verified on each CPU: (pid, generation, departed_cpu).
+static LAST_RESUME: [(AtomicU64, AtomicU64, AtomicU64); cpu_local::max_cpus()] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)) }; cpu_local::max_cpus()];
+
+impl SwitchSentinel {
+    #[inline]
+    fn departing(pid: Pid, generation: u64) -> Self {
+        Self {
+            pid,
+            generation,
+            cpu: current_cpu_id(),
+        }
+    }
+
+    /// Runs with IF clear and no scheduler/PCB lock held, so the mismatch
+    /// report may format directly.
+    #[inline]
+    fn verify_resumed(&self) {
+        // The bootstrap/idle context (pid 0) carries no task identity.
+        if self.pid == 0 {
+            return;
+        }
+        let cpu = current_cpu_id();
+        let current = process::current_pid().unwrap_or(0);
+        let generation = CURRENT_GENERATION[cpu].load(Ordering::Acquire);
+        if current != self.pid || generation != self.generation {
+            Self::mismatch(
+                self.pid,
+                self.generation,
+                self.cpu,
+                cpu,
+                current,
+                generation,
+            );
+        }
+        let slot = &LAST_RESUME[cpu];
+        slot.0.store(self.pid as u64, Ordering::Relaxed);
+        slot.1.store(self.generation, Ordering::Relaxed);
+        slot.2.store(self.cpu as u64, Ordering::Relaxed);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn mismatch(pid: Pid, generation: u64, from: usize, on: usize, cur: Pid, cur_gen: u64) -> ! {
+        panic!(
+            "SWITCH-SENTINEL: resumed pid {} gen {} (departed cpu {}) on cpu {} but cpu publishes pid {} gen {}",
+            pid, generation, from, on, cur, cur_gen
+        );
+    }
+}
+
 /// Complete a reaper wake that could not become final until the exiting task's
 /// context save published `on_cpu=false`.
 fn wake_reaper_after_switch(
@@ -2502,12 +2586,24 @@ impl Scheduler {
         // DISPATCH, with identities. The asm save-half ud2 guard covers the save
         // side; if this fires without that ud2 having fired, the PCB context was
         // clobbered in memory between save and dispatch.
+        // GAP-6 F4/F6: capture a fixed-size event under the locks and format it
+        // only after every scheduler/PCB lock is released, so the panic path
+        // cannot recurse into a held run-queue or PCB lock via the console.
         #[cfg(debug_assertions)]
         if next.context.cs & 0x3 == 0 && next.context.rip >> 47 != 0x1ffff {
-            panic!(
-                "SCHED-TRAP: pid {} kernel context rip={:#x} rsp={:#x} rcx={:#x} cs={:#x} old_pid={:?}",
-                next_pid, next.context.rip, next.context.rsp, next.context.rcx, next.context.cs, old_pid
-            );
+            let event = SchedTrapEvent {
+                pid: next_pid,
+                rip: next.context.rip,
+                rsp: next.context.rsp,
+                rcx: next.context.rcx,
+                cs: next.context.cs,
+                old_pid,
+            };
+            drop(old);
+            drop(next);
+            drop(queue);
+            drop(current_guard);
+            event.fire();
         }
 
         let next_ctx_ptr = NEXT_CONTEXT_SHADOW.with(|shadow| shadow.store(&next.context));
@@ -2705,7 +2801,12 @@ impl Scheduler {
             }
             current_cpu().need_resched.store(false, Ordering::SeqCst);
             if let Some(prepared) = Self::prepare_switch() {
+                // GAP-6 F6: these locals live on the outgoing task's own stack,
+                // so after execute_switch returns they name the task that was
+                // just resumed here, whichever CPU resumed it.
+                let sentinel = SwitchSentinel::departing(prepared.old_pid, prepared.old_generation);
                 Self::execute_switch(prepared);
+                sentinel.verify_resumed();
                 // This line runs on the restored task/bootstrap stack, after
                 // the outgoing save has completed. It is now safe to release
                 // the previous task's on_cpu gate and finish its reaper wake.
