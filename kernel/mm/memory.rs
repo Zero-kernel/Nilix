@@ -219,6 +219,10 @@ const BOOT_INFO_KASLR_RANDOMIZED: u64 = 1 << 0;
 /// bring-up; overflow is logged (never silently truncated).
 const MAX_RESERVED_RANGES: usize = 64;
 
+/// GAP-6 F8: reservation slots kept free for the boot metadata ranges (COW
+/// refcount table and buddy allocator metadata) appended after the builder.
+const BOOT_METADATA_RESERVATIONS: usize = 2;
+
 // ============================================================================
 // 内存配置
 // ============================================================================
@@ -496,6 +500,17 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         place_cow_refcount_metadata(pmm_base, pmm_size, &reserved_ranges[..reserved_count]);
     let reserved_count =
         push_cow_metadata_reservation(&mut reserved_ranges, reserved_count, meta_phys, meta_bytes);
+    // GAP-6 F8: the buddy allocator's own metadata also comes from reserved
+    // frames, placed against the set that now includes the COW table.
+    let (buddy_meta_phys, buddy_meta_bytes) =
+        place_buddy_metadata(pmm_base, pmm_size, &reserved_ranges[..reserved_count]);
+    let reserved_count = push_boot_metadata_reservation(
+        &mut reserved_ranges,
+        reserved_count,
+        buddy_meta_phys,
+        buddy_meta_bytes,
+        BUDDY_METADATA_LABEL,
+    );
     let reserved_ranges = &reserved_ranges[..reserved_count];
 
     // R148-8 FIX: Physical memory region bounds also leak information.
@@ -518,15 +533,27 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         "  COW refcount metadata: {} KB (boot-reserved frames)",
         meta_bytes / 1024
     );
+    klog!(
+        Info,
+        "  Buddy allocator metadata: {} KB (boot-reserved frames)",
+        buddy_meta_bytes / 1024
+    );
 
     // 初始化 Buddy 物理页分配器
-    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges)
-        .unwrap_or_else(|error| {
-            panic!(
-                "buddy allocator metadata initialization failed before publication: {:?}",
-                error
-            )
-        });
+    // SAFETY: placed inside the managed window, reserved above, used only here.
+    let buddy_storage = unsafe { boot_metadata_storage(buddy_meta_phys, buddy_meta_bytes) };
+    buddy_allocator::init_buddy_allocator_in(
+        PhysAddr::new(pmm_base),
+        pmm_size,
+        reserved_ranges,
+        buddy_storage,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "buddy allocator metadata initialization failed before publication: {:?}",
+            error
+        )
+    });
     publish_cow_refcount_table(meta_phys, pmm_size / PAGE_SIZE as usize);
     publish_managed_phys_window(pmm_base, pmm_size);
 
@@ -586,10 +613,26 @@ pub fn init() {
     );
     let reserved_count =
         push_cow_metadata_reservation(&mut reserved_ranges, 1, meta_phys, meta_bytes);
-    buddy_allocator::init_buddy_allocator(
+    // GAP-6 F8: same boot-reserved buddy metadata as the BootInfo path.
+    let (buddy_meta_phys, buddy_meta_bytes) = place_buddy_metadata(
+        FALLBACK_PHYS_MEM_START,
+        FALLBACK_PHYS_MEM_SIZE,
+        &reserved_ranges[..reserved_count],
+    );
+    let reserved_count = push_boot_metadata_reservation(
+        &mut reserved_ranges,
+        reserved_count,
+        buddy_meta_phys,
+        buddy_meta_bytes,
+        BUDDY_METADATA_LABEL,
+    );
+    // SAFETY: placed inside the fallback window, reserved above, used only here.
+    let buddy_storage = unsafe { boot_metadata_storage(buddy_meta_phys, buddy_meta_bytes) };
+    buddy_allocator::init_buddy_allocator_in(
         PhysAddr::new(FALLBACK_PHYS_MEM_START),
         FALLBACK_PHYS_MEM_SIZE,
         &reserved_ranges[..reserved_count],
+        buddy_storage,
     )
     .unwrap_or_else(|error| {
         panic!(
@@ -949,15 +992,57 @@ fn half_open_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) 
 /// Choose a page-aligned physical placement for the COW refcount table that
 /// lies entirely inside the managed window and is disjoint from every existing
 /// boot reservation.
+fn place_cow_refcount_metadata(
+    pmm_base: u64,
+    pmm_size: usize,
+    reservations: &[(u64, u64)],
+) -> (u64, usize) {
+    assert!(pmm_size > 0, "managed window must be non-empty");
+    let managed_pages = pmm_size / PAGE_SIZE as usize;
+    place_boot_metadata(
+        pmm_base,
+        pmm_size,
+        cow_refcount_table_bytes(managed_pages),
+        reservations,
+        COW_METADATA_LABEL,
+    )
+}
+
+const COW_METADATA_LABEL: &str = "COW refcount metadata";
+const BUDDY_METADATA_LABEL: &str = "buddy allocator metadata";
+
+/// GAP-6 F8: place the buddy allocator's per-page state and order bitmaps the
+/// same way as the COW table. Both scale with the managed window; on the 2 MiB
+/// kernel heap the buddy metadata alone approached the boot unledgered ceiling
+/// once a guest had about 1 GiB of RAM.
+fn place_buddy_metadata(
+    pmm_base: u64,
+    pmm_size: usize,
+    reservations: &[(u64, u64)],
+) -> (u64, usize) {
+    let raw = buddy_allocator::BuddyAllocator::metadata_bytes(pmm_size).unwrap_or_else(|error| {
+        panic!(
+            "GAP-6 F8: buddy metadata size for the managed window: {:?}",
+            error
+        )
+    });
+    place_boot_metadata(pmm_base, pmm_size, raw, reservations, BUDDY_METADATA_LABEL)
+}
+
+/// Choose a page-aligned placement for `raw_bytes` of boot metadata that lies
+/// entirely inside the managed window and is disjoint from every existing boot
+/// reservation. Returns the base and the page-rounded length.
 ///
 /// Search downward from the high end to preserve a large low free span. On a
 /// collision, jump below the lowest overlapping reservation rather than walking
 /// page-by-page. The bounded reservation array therefore limits this to at most
 /// `reservations.len() + 1` probes and the early-boot path allocates no heap.
-fn place_cow_refcount_metadata(
+fn place_boot_metadata(
     pmm_base: u64,
     pmm_size: usize,
+    raw_bytes: usize,
     reservations: &[(u64, u64)],
+    label: &str,
 ) -> (u64, usize) {
     assert!(pmm_size > 0, "managed window must be non-empty");
     assert_eq!(pmm_base % PAGE_SIZE, 0, "managed base must be page aligned");
@@ -967,12 +1052,11 @@ fn place_cow_refcount_metadata(
         "managed size must be page aligned"
     );
 
-    let managed_pages = pmm_size / PAGE_SIZE as usize;
-    let meta_bytes_raw = cow_refcount_table_bytes(managed_pages);
-    let meta_bytes = align_up(meta_bytes_raw as u64, PAGE_SIZE) as usize;
+    let meta_bytes = align_up(raw_bytes as u64, PAGE_SIZE) as usize;
     assert!(
         meta_bytes > 0 && meta_bytes < pmm_size,
-        "COW metadata ({} B) must fit strictly inside managed window ({} B)",
+        "{} ({} B) must fit strictly inside managed window ({} B)",
+        label,
         meta_bytes,
         pmm_size
     );
@@ -1019,7 +1103,8 @@ fn place_cow_refcount_metadata(
     }
 
     panic!(
-        "R180-29: cannot place COW refcount metadata ({} KB) inside managed window without colliding with boot reservations",
+        "R180-29: cannot place {} ({} KB) inside managed window without colliding with boot reservations",
+        label,
         meta_bytes / 1024
     );
 }
@@ -1032,18 +1117,29 @@ fn push_cow_metadata_reservation(
     meta_phys: u64,
     meta_bytes: usize,
 ) -> usize {
+    push_boot_metadata_reservation(out, count, meta_phys, meta_bytes, COW_METADATA_LABEL)
+}
+
+/// Append a boot metadata reservation; fail closed if the bounded set is full
+/// or the range overlaps an existing reservation.
+fn push_boot_metadata_reservation(
+    out: &mut [(u64, u64); MAX_RESERVED_RANGES],
+    count: usize,
+    meta_phys: u64,
+    meta_bytes: usize,
+    label: &str,
+) -> usize {
     if count >= MAX_RESERVED_RANGES {
-        panic!("RF178-31: reservation list full; cannot permanently reserve COW metadata");
+        panic!(
+            "RF178-31: reservation list full; cannot permanently reserve {}",
+            label
+        );
     }
-    assert_eq!(
-        meta_phys % PAGE_SIZE,
-        0,
-        "COW metadata must be page aligned"
-    );
-    assert!(meta_bytes > 0, "COW metadata reservation must be non-empty");
+    assert_eq!(meta_phys % PAGE_SIZE, 0, "{} must be page aligned", label);
+    assert!(meta_bytes > 0, "{} reservation must be non-empty", label);
     let meta_end = meta_phys
         .checked_add(meta_bytes as u64)
-        .expect("COW metadata reservation end overflow");
+        .expect("boot metadata reservation end overflow");
     for &(reserved_start, reserved_len) in &out[..count] {
         if reserved_len == 0 {
             continue;
@@ -1051,11 +1147,39 @@ fn push_cow_metadata_reservation(
         let reserved_end = reserved_start.saturating_add(reserved_len);
         assert!(
             !half_open_ranges_overlap(meta_phys, meta_end, reserved_start, reserved_end),
-            "R180-29: COW metadata overlaps an existing boot reservation"
+            "R180-29: {} overlaps an existing boot reservation",
+            label
         );
     }
     out[count] = (meta_phys, meta_bytes as u64);
     count + 1
+}
+
+/// GAP-6 F8: view a boot-reserved metadata range through the direct map.
+///
+/// # Safety
+///
+/// `phys..phys + bytes` must be page aligned, inside the managed window (which
+/// is clamped to the high-half direct map), already in the reservation set
+/// handed to the buddy allocator, and referenced by nothing else. Call once per
+/// range, single-threaded, before any AP starts.
+unsafe fn boot_metadata_storage(phys: u64, bytes: usize) -> &'static mut [u8] {
+    assert_eq!(
+        phys % PAGE_SIZE,
+        0,
+        "boot metadata base must be page aligned"
+    );
+    assert!(
+        phys.checked_add(bytes as u64)
+            .is_some_and(|end| end <= HIGH_HALF_MAP_LIMIT),
+        "boot metadata must lie inside the high-half direct map"
+    );
+    let virt = phys
+        .checked_add(PHYSICAL_MEMORY_OFFSET)
+        .expect("boot metadata direct-map address overflow");
+    // SAFETY: guaranteed by the caller contract above; the range is mapped by
+    // the direct map and exclusively owned from here on.
+    unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, bytes) }
 }
 
 /// Zero and publish the boot-reserved COW refcount table via the direct map.
@@ -1208,7 +1332,9 @@ impl<'a> ReservedRangeBuilder<'a> {
             return; // disjoint from the buddy window
         }
 
-        if self.count >= MAX_RESERVED_RANGES {
+        // GAP-6 F8 review: keep the last slots for the COW and buddy
+        // metadata reservations pushed after this builder finishes.
+        if self.count >= MAX_RESERVED_RANGES - BOOT_METADATA_RESERVATIONS {
             self.overflowed = true;
             return;
         }
@@ -1647,6 +1773,65 @@ mod tests {
 
         let (meta_phys, meta_bytes) = place_cow_refcount_metadata(BASE, SIZE, &reservations);
         assert!(meta_phys + meta_bytes as u64 <= end - PAGE_SIZE);
+    }
+
+    #[test]
+    fn f8_buddy_metadata_is_reserved_beside_cow_metadata() {
+        const BASE: u64 = 0x0500_0000;
+        const SIZE: usize = 16 * 1024 * 1024;
+        let end = BASE + SIZE as u64;
+        let mut reservations = [(0u64, 0u64); MAX_RESERVED_RANGES];
+        reservations[0] = (BASE + 0x20_0000, 0x20_0000);
+        let (cow_phys, cow_bytes) = place_cow_refcount_metadata(BASE, SIZE, &reservations[..1]);
+        let count = push_cow_metadata_reservation(&mut reservations, 1, cow_phys, cow_bytes);
+
+        let (buddy_phys, buddy_bytes) = place_buddy_metadata(BASE, SIZE, &reservations[..count]);
+        let buddy_end = buddy_phys + buddy_bytes as u64;
+        assert_eq!(buddy_phys % PAGE_SIZE, 0);
+        assert!(buddy_bytes >= buddy_allocator::BuddyAllocator::metadata_bytes(SIZE).unwrap());
+        assert!(buddy_phys >= BASE && buddy_end <= end);
+        for &(start, len) in &reservations[..count] {
+            assert!(!half_open_ranges_overlap(
+                buddy_phys,
+                buddy_end,
+                start,
+                start + len
+            ));
+        }
+        let count = push_boot_metadata_reservation(
+            &mut reservations,
+            count,
+            buddy_phys,
+            buddy_bytes,
+            BUDDY_METADATA_LABEL,
+        );
+
+        // An allocator over this window never hands out a metadata frame.
+        let mut allocator = buddy_allocator::BuddyAllocator::new_with_reservations(
+            PhysAddr::new(BASE),
+            SIZE,
+            &reservations[..count],
+        )
+        .expect("allocator over reserved window");
+        let cow_end = cow_phys + cow_bytes as u64;
+        let mut handed_out = 0usize;
+        while let Ok(frame) = allocator.try_alloc_pages(0) {
+            let addr = frame.start_address().as_u64();
+            assert!(!half_open_ranges_overlap(
+                addr,
+                addr + PAGE_SIZE,
+                buddy_phys,
+                buddy_end
+            ));
+            assert!(!half_open_ranges_overlap(
+                addr,
+                addr + PAGE_SIZE,
+                cow_phys,
+                cow_end
+            ));
+            handed_out += 1;
+        }
+        assert!(handed_out > 0);
     }
 
     #[test]

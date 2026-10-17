@@ -99,20 +99,90 @@ struct FreeBit {
     block_idx: usize,
 }
 
-/// Fixed-size, allocation-free-after-init representation of every free buddy
-/// block.  Order `o`, block `b` represents the exact page range
-/// `[b << o, (b + 1) << o)`.  All order bitmaps live in one fallibly allocated
-/// word vector whose length and capacity never change after construction.
-struct FixedFreeMap {
-    words: Vec<u64>,
-    word_base: [usize; ORDER_COUNT + 1],
-    valid_blocks: [usize; ORDER_COUNT],
-    block_count: [usize; ORDER_COUNT],
-    search_cursor: [usize; ORDER_COUNT],
+/// GAP-6 F8: fixed-length buddy metadata storage. A boot allocator uses
+/// frames reserved out of its own managed window (`Boot`), so metadata that
+/// scales with physical memory never occupies the kernel heap. Hosted tests and
+/// the boot self-test own a fallibly allocated vector (`Heap`). Neither form
+/// changes length after construction.
+enum MetadataStore<T: 'static> {
+    Heap(Vec<T>),
+    Boot(&'static mut [T]),
 }
 
-impl FixedFreeMap {
-    fn try_new(total_pages: usize) -> Result<Self, BuddyInitError> {
+impl<T> MetadataStore<T> {
+    fn try_heap(len: usize, fill: T) -> Result<Self, BuddyInitError>
+    where
+        T: Clone,
+    {
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(len)
+            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
+        storage.resize(len, fill);
+        Ok(Self::Heap(storage))
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Heap(storage) => storage.capacity(),
+            Self::Boot(storage) => storage.len(),
+        }
+    }
+}
+
+impl<T> core::ops::Deref for MetadataStore<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Heap(storage) => storage,
+            Self::Boot(storage) => storage,
+        }
+    }
+}
+
+impl<T> core::ops::DerefMut for MetadataStore<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Heap(storage) => storage,
+            Self::Boot(storage) => storage,
+        }
+    }
+}
+
+/// Test snapshots compare metadata by content regardless of where it lives.
+#[cfg(test)]
+impl<T: Clone> Clone for MetadataStore<T> {
+    fn clone(&self) -> Self {
+        Self::Heap(self.to_vec())
+    }
+}
+
+#[cfg(test)]
+impl<T: PartialEq> PartialEq for MetadataStore<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+#[cfg(test)]
+impl<T: core::fmt::Debug> core::fmt::Debug for MetadataStore<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// Per-order bitmap geometry for `total_pages`: word offsets, valid block
+/// counts and the total word count.
+struct FreeMapLayout {
+    word_base: [usize; ORDER_COUNT + 1],
+    valid_blocks: [usize; ORDER_COUNT],
+    total_words: usize,
+}
+
+impl FreeMapLayout {
+    fn new(total_pages: usize) -> Result<Self, BuddyInitError> {
         let mut word_base = [0usize; ORDER_COUNT + 1];
         let mut valid_blocks = [0usize; ORDER_COUNT];
         let mut total_words = 0usize;
@@ -129,17 +199,39 @@ impl FixedFreeMap {
                 .ok_or(BuddyInitError::MetadataSizeOverflow)?;
         }
         word_base[ORDER_COUNT] = total_words;
-
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(total_words)
-            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
-        storage.resize(total_words, 0);
-
         Ok(Self {
-            words: storage,
             word_base,
             valid_blocks,
+            total_words,
+        })
+    }
+}
+
+/// Fixed-size, allocation-free-after-init representation of every free buddy
+/// block.  Order `o`, block `b` represents the exact page range
+/// `[b << o, (b + 1) << o)`.  All order bitmaps live in one word array whose
+/// length never changes after construction.
+struct FixedFreeMap {
+    words: MetadataStore<u64>,
+    word_base: [usize; ORDER_COUNT + 1],
+    valid_blocks: [usize; ORDER_COUNT],
+    block_count: [usize; ORDER_COUNT],
+    search_cursor: [usize; ORDER_COUNT],
+}
+
+impl FixedFreeMap {
+    /// Build over zeroed storage of exactly `layout.total_words` words.
+    fn from_storage(
+        layout: FreeMapLayout,
+        words: MetadataStore<u64>,
+    ) -> Result<Self, BuddyInitError> {
+        if words.len() != layout.total_words || words.iter().any(|word| *word != 0) {
+            return Err(BuddyInitError::MetadataCorrupt);
+        }
+        Ok(Self {
+            words,
+            word_base: layout.word_base,
+            valid_blocks: layout.valid_blocks,
             block_count: [0; ORDER_COUNT],
             search_cursor: [0; ORDER_COUNT],
         })
@@ -328,7 +420,7 @@ pub struct BuddyAllocator {
     /// Exact per-page ownership state: free, reserved, allocation start(order),
     /// or allocation tail(order). This makes interior/wrong-order/double frees
     /// distinguishable without trusting caller-supplied sizes.
-    page_state: Vec<u8>,
+    page_state: MetadataStore<u8>,
 
     /// 内存起始物理地址
     base_addr: PhysAddr,
@@ -380,6 +472,73 @@ impl BuddyAllocator {
         size: usize,
         reserved: &[(u64, u64)],
     ) -> Result<Self, BuddyInitError> {
+        let total_pages = Self::validated_page_count(base_addr, size)?;
+        let layout = FreeMapLayout::new(total_pages)?;
+        let page_state = MetadataStore::try_heap(total_pages, PAGE_FREE)?;
+        let words = MetadataStore::try_heap(layout.total_words, 0u64)?;
+        Self::from_metadata(base_addr, total_pages, reserved, layout, page_state, words)
+    }
+
+    /// GAP-6 F8: bytes of boot storage `new_with_reservations_in` needs for a
+    /// managed window of `size` bytes: one state byte per page, padded to a
+    /// word boundary, followed by the order bitmaps.
+    pub fn metadata_bytes(size: usize) -> Result<usize, BuddyInitError> {
+        let total_pages = size / PAGE_SIZE;
+        let layout = FreeMapLayout::new(total_pages)?;
+        Self::state_bytes(total_pages)?
+            .checked_add(Self::word_bytes(&layout)?)
+            .ok_or(BuddyInitError::MetadataSizeOverflow)
+    }
+
+    /// GAP-6 F8: build the allocator over caller-provided `'static` storage of
+    /// at least `metadata_bytes(size)` bytes, starting 8-byte aligned. Boot
+    /// passes frames it has reserved out of the managed window, so the
+    /// per-page state and order bitmaps never come from the kernel heap. The
+    /// storage contents are overwritten.
+    pub fn new_with_reservations_in(
+        base_addr: PhysAddr,
+        size: usize,
+        reserved: &[(u64, u64)],
+        storage: &'static mut [u8],
+    ) -> Result<Self, BuddyInitError> {
+        let total_pages = Self::validated_page_count(base_addr, size)?;
+        let layout = FreeMapLayout::new(total_pages)?;
+        let state_bytes = Self::state_bytes(total_pages)?;
+        let word_bytes = Self::word_bytes(&layout)?;
+        let required = state_bytes
+            .checked_add(word_bytes)
+            .ok_or(BuddyInitError::MetadataSizeOverflow)?;
+        if storage.len() < required {
+            return Err(BuddyInitError::MetadataAllocationFailed);
+        }
+
+        let (state_region, word_region) = storage.split_at_mut(state_bytes);
+        let page_state = state_region.split_at_mut(total_pages).0;
+        page_state.fill(PAGE_FREE);
+        let word_region = word_region.split_at_mut(word_bytes).0;
+        word_region.fill(0);
+        let word_ptr = word_region.as_mut_ptr();
+        if (word_ptr as usize) % core::mem::align_of::<u64>() != 0 {
+            return Err(BuddyInitError::RegionMisaligned);
+        }
+        // SAFETY: `word_region` is an exclusively owned `'static` byte range of
+        // exactly `total_words * 8` bytes, 8-byte aligned (checked above) and
+        // zero-filled; every bit pattern is a valid `u64`. The byte slice is
+        // not used again, so this is the only reference to the range.
+        let words: &'static mut [u64] =
+            unsafe { core::slice::from_raw_parts_mut(word_ptr.cast::<u64>(), layout.total_words) };
+
+        Self::from_metadata(
+            base_addr,
+            total_pages,
+            reserved,
+            layout,
+            MetadataStore::Boot(page_state),
+            MetadataStore::Boot(words),
+        )
+    }
+
+    fn validated_page_count(base_addr: PhysAddr, size: usize) -> Result<usize, BuddyInitError> {
         if size == 0 {
             return Err(BuddyInitError::EmptyRegion);
         }
@@ -394,17 +553,38 @@ impl BuddyAllocator {
         if region_end == 0 || PhysAddr::try_new(region_end - 1).is_err() {
             return Err(BuddyInitError::AddressOverflow);
         }
+        Ok(size / PAGE_SIZE)
+    }
 
-        let total_pages = size / PAGE_SIZE;
+    /// Page-state bytes rounded up so the bitmap words that follow stay
+    /// 8-byte aligned.
+    fn state_bytes(total_pages: usize) -> Result<usize, BuddyInitError> {
+        total_pages
+            .checked_next_multiple_of(core::mem::size_of::<u64>())
+            .ok_or(BuddyInitError::MetadataSizeOverflow)
+    }
 
-        let mut page_state = Vec::new();
-        page_state
-            .try_reserve_exact(total_pages)
-            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
-        page_state.resize(total_pages, PAGE_FREE);
+    fn word_bytes(layout: &FreeMapLayout) -> Result<usize, BuddyInitError> {
+        layout
+            .total_words
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(BuddyInitError::MetadataSizeOverflow)
+    }
+
+    fn from_metadata(
+        base_addr: PhysAddr,
+        total_pages: usize,
+        reserved: &[(u64, u64)],
+        layout: FreeMapLayout,
+        page_state: MetadataStore<u8>,
+        words: MetadataStore<u64>,
+    ) -> Result<Self, BuddyInitError> {
+        if page_state.len() != total_pages || page_state.iter().any(|state| *state != PAGE_FREE) {
+            return Err(BuddyInitError::MetadataCorrupt);
+        }
 
         let mut allocator = BuddyAllocator {
-            free_map: FixedFreeMap::try_new(total_pages)?,
+            free_map: FixedFreeMap::from_storage(layout, words)?,
             page_state,
             base_addr,
             total_pages,
@@ -1057,7 +1237,28 @@ pub fn init_buddy_allocator(
     reserved: &[(u64, u64)],
 ) -> Result<(), BuddyInitError> {
     let allocator = BuddyAllocator::new_with_reservations(base_addr, size, reserved)?;
+    publish_buddy_allocator(allocator)
+}
+
+/// GAP-6 F8: initialize the global allocator with metadata in boot-reserved
+/// `storage` (see `BuddyAllocator::new_with_reservations_in`) instead of the
+/// kernel heap. `storage` must lie inside a `reserved` range so the allocator
+/// never hands its own metadata frames out.
+pub fn init_buddy_allocator_in(
+    base_addr: PhysAddr,
+    size: usize,
+    reserved: &[(u64, u64)],
+    storage: &'static mut [u8],
+) -> Result<(), BuddyInitError> {
+    let allocator = BuddyAllocator::new_with_reservations_in(base_addr, size, reserved, storage)?;
+    publish_buddy_allocator(allocator)
+}
+
+fn publish_buddy_allocator(allocator: BuddyAllocator) -> Result<(), BuddyInitError> {
     // Snapshot stats before the allocator is moved under the lock.
+    #[cfg(debug_assertions)]
+    let base_addr = allocator.base_addr;
+    let size = allocator.total_pages * PAGE_SIZE;
     let total_pages = allocator.total_pages;
     let reserved_pages = allocator.reserved_pages;
     let free_pages = allocator.free_pages;
@@ -1353,6 +1554,79 @@ mod tests {
         assert_eq!(allocator.free_pages, initial_free);
         assert_eq!(metadata_shape(&allocator), shape);
         assert_eq!(allocator.validate_metadata(), Ok(()));
+    }
+
+    /// Leak `bytes` of 8-byte-aligned storage pre-filled with `fill`, standing
+    /// in for boot-reserved frames reached through the direct map.
+    fn leaked_storage(bytes: usize, fill: u64) -> &'static mut [u8] {
+        let words = bytes.div_ceil(8);
+        let mut backing = Vec::new();
+        backing.try_reserve_exact(words).expect("test storage");
+        backing.resize(words, fill);
+        let backing: &'static mut [u64] = backing.leak();
+        // SAFETY: the leaked words are exclusively owned for 'static and every
+        // byte of a u64 is a valid u8.
+        unsafe { core::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), words * 8) }
+    }
+
+    #[test]
+    fn f8_boot_storage_matches_heap_allocator_and_overwrites_storage() {
+        let base = PhysAddr::new(0x3800_0000);
+        let size = 16 * 1024 * 1024;
+        let reserved = [(0x3800_0000 + 0x10_0000, 0x3000u64)];
+        let bytes = BuddyAllocator::metadata_bytes(size).expect("metadata size");
+        // 4096 pages of state plus the order bitmaps.
+        assert!(bytes >= size / PAGE_SIZE);
+
+        // Garbage-filled storage must be fully reinitialized, not trusted.
+        let storage = leaked_storage(bytes, u64::MAX);
+        let mut boot = BuddyAllocator::new_with_reservations_in(base, size, &reserved, storage)
+            .expect("boot-storage allocator");
+        let mut heap =
+            BuddyAllocator::new_with_reservations(base, size, &reserved).expect("heap allocator");
+        assert!(matches!(boot.page_state, MetadataStore::Boot(_)));
+        assert!(matches!(boot.free_map.words, MetadataStore::Boot(_)));
+        assert_eq!(boot.page_state, heap.page_state);
+        assert_eq!(boot.free_map.words, heap.free_map.words);
+        assert_eq!(boot.free_pages, heap.free_pages);
+        assert_eq!(boot.reserved_pages, heap.reserved_pages);
+
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(32).expect("test frame ledger");
+        for order in [0usize, 3, 10, 0, 5, 1] {
+            let frame = boot.try_alloc_pages(order).expect("boot alloc");
+            assert_eq!(heap.try_alloc_pages(order), Ok(frame));
+            frames.push((frame, order));
+        }
+        for (frame, order) in frames.into_iter().rev() {
+            assert_eq!(boot.try_free_pages(frame, order), Ok(()));
+            assert_eq!(heap.try_free_pages(frame, order), Ok(()));
+        }
+        assert_eq!(boot.page_state, heap.page_state);
+        assert_eq!(boot.free_map.words, heap.free_map.words);
+        assert_eq!(boot.validate_metadata(), Ok(()));
+    }
+
+    #[test]
+    fn f8_boot_storage_rejects_short_or_misaligned_storage() {
+        let base = PhysAddr::new(0x3c00_0000);
+        let size = 2 * 1024 * 1024;
+        let bytes = BuddyAllocator::metadata_bytes(size).expect("metadata size");
+
+        let short = leaked_storage(bytes, 0);
+        let short = short.split_at_mut(bytes - 1).0;
+        assert_eq!(
+            BuddyAllocator::new_with_reservations_in(base, size, &[], short).err(),
+            Some(BuddyInitError::MetadataAllocationFailed)
+        );
+
+        // Shift the start by one byte: the state bytes are still long enough,
+        // but the bitmap words would be misaligned.
+        let shifted = leaked_storage(bytes + 8, 0).split_at_mut(1).1;
+        assert_eq!(
+            BuddyAllocator::new_with_reservations_in(base, size, &[], shifted).err(),
+            Some(BuddyInitError::RegionMisaligned)
+        );
     }
 
     #[test]
