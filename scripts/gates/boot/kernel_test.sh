@@ -3,6 +3,7 @@
 # ZERO_OS_STRICT_TESTS=1 rejects warnings, deferrals and skips.
 # KERNEL_TEST_DISK requires the production JBD2 write probe.
 # KERNEL_TEST_KEEP_LOGS=1 retains serial, process diagnostics and JSON counts.
+# KERNEL_TEST_CPUS=2|4|8|16 boots that many vCPUs (default: QEMU's single CPU).
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -19,6 +20,13 @@ if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 900"
     exit 2
 fi
+CPUS="${KERNEL_TEST_CPUS:-1}"
+if [[ ! "$CPUS" =~ ^(1|2|4|8|16)$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_CPUS must be 1, 2, 4, 8 or 16"
+    exit 2
+fi
+smp_args=()
+[ "$CPUS" = 1 ] || smp_args=(-smp "$CPUS")
 for tool in "$QEMU" timeout python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "KERNEL-TEST BLOCKED: $tool not found in PATH"
@@ -89,7 +97,7 @@ LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" 
     "${disk_args[@]}" \
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
-    -m 256M -vga std -no-reboot -no-shutdown \
+    -m 256M "${smp_args[@]}" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
