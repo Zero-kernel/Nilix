@@ -10009,6 +10009,21 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // in that namespace must be killed (SIGKILL). This is Linux semantics.
         handle_namespace_init_death(pid, &pid_ns_chain);
 
+        // 将孤儿进程重新分配给 init 进程 (PID 1)
+        // R171-S-R170-5-01 FIX (SLICE 3): pass `pid` (the dying process) so
+        // reparent_orphans excludes it as a reaper candidate (it has already
+        // drained its own children list above).
+        //
+        // F15: reparent before the namespace detach below. Until then a child's
+        // ppid names this pid, and once the pid has no namespace mapping the
+        // child's getppid() translates it to 0, which another CPU could observe
+        // (Linux reparents in exit_notify, long before the pid is released).
+        // The init-death cascade above has already marked a dying namespace as
+        // shutting down, so reaper selection is unchanged.
+        if !children_to_reparent.is_empty() {
+            reparent_orphans(&children_to_reparent, pid);
+        }
+
         // F.1: Detach from all namespaces
         crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
 
@@ -10083,14 +10098,6 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     clear_child_tid
                 );
             }
-        }
-
-        // 将孤儿进程重新分配给 init 进程 (PID 1)
-        // R171-S-R170-5-01 FIX (SLICE 3): pass `pid` (the dying process) so
-        // reparent_orphans excludes it as a reaper candidate (it has already
-        // drained its own children list above).
-        if !children_to_reparent.is_empty() {
-            reparent_orphans(&children_to_reparent, pid);
         }
 
         // R169-9 FIX: heavy teardown (cgroup detach / pid-ns detach / clear_child_tid
