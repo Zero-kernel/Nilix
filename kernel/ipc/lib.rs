@@ -148,7 +148,9 @@ pub fn run_pipe_second_cap_failure_self_test() {
         0,
         "second cap-reservation failure leaked an FD/files.max charge"
     );
-    assert!(fixture.get_fd(read_fd).is_none() && fixture.get_fd(write_fd).is_none());
+    // One fd-table guard at a time: `FdRef` holds the table lock.
+    assert!(fixture.get_fd(read_fd).is_none());
+    assert!(fixture.get_fd(write_fd).is_none());
     assert_eq!(fixture.capability_count(), 0);
     assert_eq!(foreign.capability_count(), 0);
 
@@ -417,6 +419,7 @@ fn fd_read_callback(
     // Check for pipe first (needs clone for out-of-lock I/O to avoid deadlock)
     if let Some(pipe_handle) = fd_obj.as_any().downcast_ref::<PipeHandle>() {
         let pipe_clone = pipe_handle.clone();
+        drop(fd_obj); // GAP-5 slice 3: the fd-table guard goes first
         drop(proc); // Release lock before potentially blocking pipe I/O
         return pipe_clone
             .read_with_commit(buf, |bytes| copyout(user_dst, bytes))
@@ -429,6 +432,7 @@ fn fd_read_callback(
     // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
         let file_clone = file.clone();
+        drop(fd_obj); // GAP-5 slice 3: the fd-table guard goes first
         drop(proc); // Release lock before VFS I/O
                     // KSA-011/014: even this metadata query can call procfs, which resolves
                     // the current viewer through its PCB. No inode callback may run under it.
@@ -544,6 +548,7 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     // Check for pipe first (needs clone for out-of-lock I/O to avoid deadlock)
     if let Some(pipe_handle) = fd_obj.as_any().downcast_ref::<PipeHandle>() {
         let pipe_clone = pipe_handle.clone();
+        drop(fd_obj); // GAP-5 slice 3: the fd-table guard goes first
         drop(proc); // Release lock before potentially blocking pipe I/O
         return pipe_clone.write(buf).map_err(pipe_error_to_syscall);
     }
@@ -551,6 +556,7 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
         let file_clone = file.clone();
+        drop(fd_obj); // GAP-5 slice 3: the fd-table guard goes first
         drop(proc); // Release lock before VFS I/O
                     // Match the read path: is_dir() may execute a reentrant inode stat().
         if file_clone.inode.is_dir() {

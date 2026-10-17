@@ -96,3 +96,149 @@ impl core::fmt::Debug for FsContextState {
             .finish()
     }
 }
+
+struct FsShared {
+    state: FsContextState,
+    umask: u16,
+}
+
+/// GAP-5 slice 2: the root/cwd/umask bundle as an explicit handle. Shared by
+/// `Arc` under CLONE_FS, deep-copied otherwise. Lock order PCB -> handle
+/// (leaf); nothing is acquired while the handle is held and no IRQ path
+/// touches it. Displaced directory handles are returned to the caller so their
+/// final drop never runs under the handle lock.
+pub struct FsContextHandle {
+    inner: spin::Mutex<FsShared>,
+}
+
+impl FsContextHandle {
+    pub fn new(state: FsContextState, umask: u16) -> Self {
+        Self {
+            inner: spin::Mutex::new(FsShared { state, umask }),
+        }
+    }
+
+    /// Coherent root/cwd/umask snapshot for one operation.
+    pub fn snapshot(&self) -> (FsContextState, u16) {
+        let shared = self.inner.lock();
+        (shared.state.clone(), shared.umask)
+    }
+
+    pub fn state(&self) -> FsContextState {
+        self.inner.lock().state.clone()
+    }
+
+    pub fn umask(&self) -> u16 {
+        self.inner.lock().umask
+    }
+
+    /// Install `umask`, returning the previous value.
+    pub fn set_umask(&self, umask: u16) -> u16 {
+        core::mem::replace(&mut self.inner.lock().umask, umask)
+    }
+
+    pub fn matches(&self, previous: &FsContextState) -> bool {
+        self.inner.lock().state.matches(previous)
+    }
+
+    /// Publish `replacement` only if the bindings still equal `expected`. The
+    /// check and the store share one critical section, so a sharer's chdir
+    /// cannot slip between them. Returns the displaced state, or hands the
+    /// rejected replacement back.
+    pub fn replace_if_matches(
+        &self,
+        expected: &FsContextState,
+        replacement: FsContextState,
+    ) -> Result<FsContextState, FsContextState> {
+        let mut shared = self.inner.lock();
+        if !shared.state.matches(expected) {
+            return Err(replacement);
+        }
+        Ok(core::mem::replace(&mut shared.state, replacement))
+    }
+
+    /// Unconditional publication (boot and hosted fixtures).
+    pub fn replace(&self, replacement: FsContextState) -> FsContextState {
+        core::mem::replace(&mut self.inner.lock().state, replacement)
+    }
+
+    /// Copy another handle's bindings into this private handle (fork, and a
+    /// clone without CLONE_FS). Source and destination are never held together.
+    pub fn copy_from(&self, source: &FsContextHandle) {
+        if core::ptr::eq(self, source) {
+            return;
+        }
+        let (state, umask) = source.snapshot();
+        let displaced = {
+            let mut shared = self.inner.lock();
+            shared.umask = umask;
+            core::mem::replace(&mut shared.state, state)
+        };
+        drop(displaced);
+    }
+}
+
+impl core::fmt::Debug for FsContextHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FsContextHandle").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    struct Dir;
+    impl FsDirectoryHandle for Dir {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn bound(generation: u64) -> FsContextState {
+        let dir: Arc<dyn FsDirectoryHandle> = Arc::new(Dir);
+        FsContextState {
+            root: Some(dir.clone()),
+            cwd: Some(dir),
+            generation,
+        }
+    }
+
+    #[test]
+    fn shared_handle_publishes_to_every_sharer() {
+        let handle = Arc::new(FsContextHandle::new(bound(0), 0o022));
+        let sibling = Arc::clone(&handle);
+        let before = handle.state();
+        let next = bound(1);
+        assert!(handle.replace_if_matches(&before, next.clone()).is_ok());
+        assert!(sibling.matches(&next));
+        assert_eq!(sibling.set_umask(0o077), 0o022);
+        assert_eq!(handle.umask(), 0o077);
+    }
+
+    #[test]
+    fn stale_snapshot_is_rejected_without_mutation() {
+        let handle = FsContextHandle::new(bound(0), 0o022);
+        let stale = handle.state();
+        let current = bound(1);
+        assert!(handle.replace_if_matches(&stale, current.clone()).is_ok());
+        let rejected = handle.replace_if_matches(&stale, bound(2));
+        assert!(matches!(rejected, Err(ref state) if state.generation == 2));
+        assert!(handle.matches(&current));
+    }
+
+    #[test]
+    fn copy_is_private_to_the_destination() {
+        let parent = FsContextHandle::new(bound(3), 0o027);
+        let child = FsContextHandle::new(FsContextState::default(), 0o022);
+        child.copy_from(&parent);
+        child.copy_from(&child);
+        assert!(child.matches(&parent.state()));
+        assert_eq!(child.umask(), 0o027);
+        let next = bound(4);
+        assert!(child.replace_if_matches(&child.state(), next).is_ok());
+        assert_eq!(child.set_umask(0o002), 0o027);
+        assert_eq!(parent.state().generation, 3);
+        assert_eq!(parent.umask(), 0o027);
+    }
+}

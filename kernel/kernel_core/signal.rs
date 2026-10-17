@@ -11,6 +11,7 @@ use crate::syscall::SyscallError;
 use crate::user_namespace::UserNamespace;
 use alloc::sync::Arc;
 use cap::CapRights;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
 
 /// Maximum signal number supported (1-64)
@@ -322,6 +323,107 @@ pub fn default_sigactions() -> [SigAction; NSIG] {
     [SigAction::default_action(); NSIG]
 }
 
+/// GAP-5 slice 1: the signal-disposition table as an explicit shared handle.
+///
+/// `fork` gives the child a private table whose contents are copied from the
+/// parent; `clone(CLONE_SIGHAND)` shares the parent's `Arc`. Only dispositions
+/// are shared: blocked masks, pending sets, handler scratch state, robust lists
+/// and clear-tid stay per task in `Process`.
+///
+/// Lock contract: `actions` is a LEAF lock ordered after the owning PCB lock
+/// (PCB -> SignalTable); nothing is acquired while it is held. Process context
+/// uses `lock()`; IRQ-return delivery uses only `try_lock()` and defers on
+/// contention, so the lock needs no IRQ masking (an IRQ that interrupts a
+/// same-CPU holder fails its try-lock instead of spinning).
+#[derive(Debug)]
+pub struct SignalTable {
+    actions: Mutex<[SigAction; NSIG]>,
+    /// Bumped on every disposition mutation (rt_sigaction, exec reset,
+    /// SA_RESETHAND). Diagnostic/revalidation aid; not a lock.
+    generation: AtomicU64,
+}
+
+impl SignalTable {
+    pub const fn new() -> Self {
+        Self {
+            actions: Mutex::new([SigAction::default_action(); NSIG]),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Process-context lock. Callers may hold their own PCB lock.
+    #[inline]
+    pub fn lock(&self) -> spin::MutexGuard<'_, [SigAction; NSIG]> {
+        self.actions.lock()
+    }
+
+    /// IRQ-context lock attempt. `None` means defer to a later safe point.
+    #[inline]
+    pub fn try_lock(&self) -> Option<spin::MutexGuard<'_, [SigAction; NSIG]>> {
+        self.actions.try_lock()
+    }
+
+    /// IRQ-context snapshot. `None` means defer to a later safe point.
+    #[inline]
+    pub fn try_snapshot(&self) -> Option<[SigAction; NSIG]> {
+        self.actions.try_lock().map(|actions| *actions)
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> SigAction {
+        self.lock()[index]
+    }
+
+    /// Install `action` at `index`, returning the previous disposition.
+    pub fn replace(&self, index: usize, action: SigAction) -> SigAction {
+        let mut actions = self.lock();
+        let old = core::mem::replace(&mut actions[index], action);
+        self.note_mutation();
+        old
+    }
+
+    /// SA_RESETHAND commit: reset `index` to SIG_DFL only if it still holds
+    /// `expected`, so a sibling's concurrent rt_sigaction is never overwritten.
+    /// Returns whether the reset happened.
+    pub fn reset_if_unchanged(&self, index: usize, expected: SigAction) -> bool {
+        let mut actions = self.lock();
+        if actions[index] != expected {
+            return false;
+        }
+        actions[index] = SigAction::default_action();
+        drop(actions);
+        self.note_mutation();
+        true
+    }
+
+    /// Copy another table's dispositions into this private table (fork).
+    pub fn copy_from(&self, source: &SignalTable) {
+        if core::ptr::eq(self, source) {
+            return;
+        }
+        let snapshot = *source.lock();
+        *self.lock() = snapshot;
+        self.note_mutation();
+    }
+
+    /// Overwrite this table with a previously captured snapshot.
+    pub fn store_all(&self, snapshot: &[SigAction; NSIG]) {
+        *self.lock() = *snapshot;
+        self.note_mutation();
+    }
+
+    #[inline]
+    pub fn note_mutation(&self) {
+        // Diagnostic mutation counter, never an identity. lint-fetch-add: allow
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
 /// The mask of signals that can NEVER be blocked or caught (SIGKILL, SIGSTOP).
 #[inline]
 pub fn uncatchable_mask() -> u64 {
@@ -469,7 +571,7 @@ pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
     while let Some(signal) = select_lowest_deliverable(candidates) {
         candidates &= !signal.bit();
         if matches!(
-            resolve_disposition(&proc.sigactions, signal),
+            resolve_disposition(&proc.sigactions.lock(), signal),
             Disposition::Ignored
                 | Disposition::Default(SignalAction::Ignore | SignalAction::Continue)
         ) {
@@ -603,17 +705,18 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
 }
 
 /// Check actionable catchable signals through an already-held PCB guard.
-/// No additional lock is taken. Defaults remain actionable during a handler;
+/// Only the `SignalTable` leaf lock is taken. Defaults remain actionable during a handler;
 /// caught signals follow the existing no-nested-handler-frame policy.
 ///
 /// # Lock Contract (R177-D4)
 ///
 /// **Use this variant when the Process lock IS already held by the caller.**
 ///
-/// This function does NOT acquire any locks — it reads signal state directly from the provided
-/// `&Process` guard. The caller MUST hold the Process lock for the task being checked, and that
-/// lock MUST cover the entire read of `pending_signals`, `blocked`, `in_signal_handler`, and
-/// `sigactions` to ensure a consistent snapshot (no TOCTOU between fields).
+/// This function does NOT acquire the Process lock — it reads signal state directly from the
+/// provided `&Process` guard. Its only acquisition is the `SignalTable` leaf lock (GAP-5), taken
+/// briefly for the disposition snapshot; the order is always PCB -> SignalTable. The caller MUST
+/// hold the Process lock for the task being checked, and that lock MUST cover the entire read of
+/// `pending_signals`, `blocked` and `in_signal_handler` to ensure a consistent snapshot.
 ///
 /// **When you do NOT hold `&Process`:** Use [`has_deliverable_signal`] instead, which acquires
 /// the lock internally. Calling this function without holding the lock is a **data race** (reads
@@ -634,7 +737,7 @@ pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
         proc.pending_signals.bits(),
         proc.blocked,
         proc.in_signal_handler,
-        &proc.sigactions,
+        &proc.sigactions.lock(),
     )
 }
 
@@ -652,7 +755,7 @@ pub fn should_abort_pending_block(proc: &crate::process::Process) -> bool {
             proc.pending_signals.bits(),
             proc.blocked,
             proc.in_signal_handler,
-            &proc.sigactions,
+            &proc.sigactions.lock(),
         )
 }
 
@@ -727,7 +830,17 @@ pub fn default_action(signal: Signal) -> SignalAction {
 /// - sender.euid == target.uid
 /// - PID 1 (init) is additionally protected: only self can signal
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    send_signal_inner(pid, signal, true)
+    // GAP-5 slice 4 G7: kill() is process-directed; a thread group picks the
+    // member that will take it. Single-task processes are unaffected.
+    let target = process::select_process_directed_target(pid, signal.bit());
+    send_signal_inner(target, signal, true)
+}
+
+/// GAP-5 slice 4 G7: thread-directed delivery (`tkill`, `tgkill`) to exactly
+/// `tid`, with the same POSIX permission checks as `send_signal`. Fatal and
+/// job-control defaults still act on the whole group.
+pub fn send_signal_thread(tid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
+    send_signal_inner(tid, signal, true)
 }
 
 /// R115-2 FIX: Kernel-authoritative signal delivery — bypasses POSIX permission checks.
@@ -739,7 +852,8 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
 ///
 /// MUST NOT be exposed to user-facing syscalls.
 pub fn send_signal_kernel(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    send_signal_inner(pid, signal, false)
+    let target = process::select_process_directed_target(pid, signal.bit());
+    send_signal_inner(target, signal, false)
 }
 
 // R188-U09-3 FIX: User-authorized signal paths require an authenticated current
@@ -935,6 +1049,9 @@ fn send_signal_inner(
     // M0-5 sub-slice 1b: set when the EINTR-wake flips a blocked target Ready, so we
     // broadcast a reschedule kick AFTER releasing the proc lock.
     let mut needs_kick = false;
+    // GAP-5 slice 4 G7: a stop applied here (false) or a SIGCONT (true) is
+    // carried to the rest of the thread group after the lock is released.
+    let mut group_job_control: Option<bool> = None;
 
     {
         let mut proc = process_arc.lock();
@@ -979,7 +1096,9 @@ fn send_signal_inner(
         // here and delivered at the target's next syscall-return safe point
         // (sub-slice 1a does NOT wake a blocked-in-syscall target — that is 1b); its
         // default action is NOT executed at send time.
-        match resolve_disposition(&proc.sigactions, signal) {
+        // GAP-5: resolve under a short table hold; the arms below re-lock it.
+        let disposition = resolve_disposition(&proc.sigactions.lock(), signal);
+        match disposition {
             Disposition::Handler { .. } => {
                 // Leave the signal pending for safe-point delivery. SIGCONT is the one
                 // job-control case that must still take effect even when caught: a
@@ -1000,7 +1119,7 @@ fn send_signal_inner(
                     proc.pending_signals.bits(),
                     proc.blocked,
                     proc.in_signal_handler,
-                    &proc.sigactions,
+                    &proc.sigactions.lock(),
                 );
                 if should_wake && proc.state == ProcessState::Blocked && !proc.stopped {
                     proc.enter_ready_at(crate::get_ticks());
@@ -1026,6 +1145,9 @@ fn send_signal_inner(
                     // only after this guard is released.
                     fatal_post =
                         process::request_process_exit_locked(&mut proc, code, crate::get_ticks());
+                    // GAP-5 slice 4 G2: a fatal default action is process-wide;
+                    // this task's teardown ends the rest of its group.
+                    proc.group_fatal = true;
                 }
                 SignalAction::Stop => {
                     // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
@@ -1034,6 +1156,7 @@ fn send_signal_inner(
                     // RF178-35 FIX: a lock-serialized fatal publication wins over
                     // a later stop and cannot be stranded again.
                     if process::try_mark_job_control_stopped_locked(&mut proc) {
+                        group_job_control = Some(false);
                         if process::current_pid() == Some(pid) {
                             needs_reschedule = true;
                         }
@@ -1051,8 +1174,15 @@ fn send_signal_inner(
         }
         if signal.is_continue() {
             needs_kick |= process::resume_job_control_locked(&mut proc, pid, target_generation);
+            group_job_control = Some(true);
         }
     } // Release process lock before calling scheduler functions
+
+    // GAP-5 slice 4 G7: stop or continue the other members before a self-stop
+    // below parks this task. No lock is held here.
+    if let Some(resume) = group_job_control {
+        needs_kick |= process::propagate_group_job_control(pid, resume);
+    }
 
     // H.0.7 FIX: Cross-CPU-safe fatal signal termination.
     //
@@ -1071,7 +1201,7 @@ fn send_signal_inner(
             drop(process_arc);
             // R117-1 FIX: Use centralized terminate_self_and_halt() which
             // disables interrupts and switches to boot CR3 before halting.
-            process::terminate_self_and_halt(pid, code);
+            process::terminate_group_self_and_halt(pid, code);
         } else {
             // The exact authorized PCB was already posted under its guard.
             let _ = process::finish_process_exit_request(fatal_post);

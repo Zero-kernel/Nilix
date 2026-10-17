@@ -210,6 +210,17 @@ pub extern "C" fn _start() -> ! {
     // kills the toucher with SIGSEGV instead of being mapped.
     test_user_stack_guard(&mut results);
 
+    // GAP-5 slice 4 G3: the exit-time clear of a CLONE_CHILD_CLEARTID word
+    // that lives in .bss rather than an mmap region.
+    test_clone_vm_clear_child_tid(&mut results);
+
+    // GAP-5 slice 4 G7: thread-directed signals (syscalls 200 and 234).
+    test_tkill_tgkill(&mut results);
+
+    // GAP-5 slice 4 step 7 preview: thread groups (kernel built with
+    // thread_preview via the syscall_test feature).
+    test_thread_group(&mut results);
+
     // Print summary
     println("");
     println("================================");
@@ -1885,4 +1896,562 @@ fn test_user_stack_guard(results: &mut TestResult) {
     }
 
     results.pass("user stack guard page faults while the lazy region above it grows");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 slice 4 G3: CLONE_CHILD_CLEARTID on a `.bss` word.
+//
+// The exit-time clear used to run only when the tid word lay inside an mmap
+// region, so a word in `.bss`/`.data` or on a stack kept the child's tid after
+// it exited and any joiner waited forever. The word here is a zero-initialised
+// static, i.e. `.bss`, which is exactly the skipped case.
+// ---------------------------------------------------------------------------
+
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+const SYS_CLONE: u64 = 56;
+const SYS_EXIT: u64 = 60;
+const CLEAR_TID_EXIT: u64 = 0x5a;
+const CLEAR_TID_STACK_BYTES: usize = 16 * 1024;
+
+/// The CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID word (`.bss`).
+static CLEAR_TID_WORD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+/// What the child read from the word, proving CLONE_CHILD_SETTID wrote it.
+static CLEAR_TID_SEEN: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+#[repr(C, align(16))]
+struct CloneStack([u8; CLEAR_TID_STACK_BYTES]);
+static mut CLEAR_TID_STACK: CloneStack = CloneStack([0; CLEAR_TID_STACK_BYTES]);
+
+/// Child entry: runs on `CLEAR_TID_STACK` in the shared address space, records
+/// the tid the kernel stored, then leaves with a raw `exit`.
+extern "C" fn clear_tid_child() -> ! {
+    use core::sync::atomic::Ordering;
+    CLEAR_TID_SEEN.store(CLEAR_TID_WORD.load(Ordering::SeqCst), Ordering::SeqCst);
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_EXIT,
+            in("rdi") CLEAR_TID_EXIT,
+            options(noreturn)
+        );
+    }
+}
+
+/// Raw clone(flags, stack, ptid = 0, ctid, tls = 0). The child resumes on
+/// `stack_top`, which shares no frame with the caller, so it must not return
+/// from here: it calls `entry` (callee-saved r12 is copied into the child) and
+/// never comes back. Returns the parent's result.
+unsafe fn raw_clone_vm(
+    flags: u64,
+    stack_top: usize,
+    ctid: *mut i32,
+    entry: extern "C" fn() -> !,
+) -> u64 {
+    raw_clone(flags, stack_top, core::ptr::null_mut(), ctid, entry)
+}
+
+/// Raw clone with an explicit CLONE_PARENT_SETTID pointer (`ptid`).
+unsafe fn raw_clone(
+    flags: u64,
+    stack_top: usize,
+    ptid: *mut i32,
+    ctid: *mut i32,
+    entry: extern "C" fn() -> !,
+) -> u64 {
+    let ret: u64;
+    core::arch::asm!(
+        "syscall",
+        "test rax, rax",
+        "jnz 2f",
+        "and rsp, -16",
+        "call r12",
+        "ud2",
+        "2:",
+        inlateout("rax") SYS_CLONE => ret,
+        in("rdi") flags,
+        in("rsi") stack_top,
+        in("rdx") ptid,
+        in("r10") ctid,
+        in("r8") 0u64,
+        in("r12") entry,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack)
+    );
+    ret
+}
+
+fn test_clone_vm_clear_child_tid(results: &mut TestResult) {
+    use core::sync::atomic::Ordering;
+    print("Testing CLONE_CHILD_CLEARTID on a .bss word... ");
+
+    CLEAR_TID_WORD.store(-1, Ordering::SeqCst);
+    CLEAR_TID_SEEN.store(0, Ordering::SeqCst);
+    let stack_top = core::ptr::addr_of_mut!(CLEAR_TID_STACK) as usize + CLEAR_TID_STACK_BYTES;
+    let child = unsafe {
+        raw_clone_vm(
+            CLONE_VM | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            stack_top,
+            CLEAR_TID_WORD.as_ptr(),
+            clear_tid_child,
+        )
+    };
+    if is_error(child) || child == 0 {
+        print("clone errno ");
+        print_int(errno(child) as i64);
+        print(" ");
+        results.fail("clear-tid: CLONE_VM|CHILD_SETTID|CHILD_CLEARTID failed");
+        return;
+    }
+
+    // The child is reapable only after terminate_process finished its
+    // teardown, which includes the clear; no polling is needed.
+    match reap_pid(child) {
+        Some(CLEAR_TID_EXIT) => {}
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("clear-tid: child exited with an unexpected status");
+            return;
+        }
+        None => {
+            results.fail("clear-tid: could not reap the CLONE_VM child");
+            return;
+        }
+    }
+
+    let seen = CLEAR_TID_SEEN.load(Ordering::SeqCst);
+    let word = CLEAR_TID_WORD.load(Ordering::SeqCst);
+    if seen as u64 != child {
+        print("seen ");
+        print_int(seen as i64);
+        print(" ");
+        results.fail("clear-tid: CLONE_CHILD_SETTID did not store the child tid");
+        return;
+    }
+    if word != 0 {
+        print("word ");
+        print_int(word as i64);
+        print(" ");
+        results.fail("clear-tid: exit left the .bss tid word set");
+        return;
+    }
+    results.pass("CLONE_CHILD_CLEARTID clears a .bss tid word at exit");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 slice 4 G7: thread-directed signals. Without CLONE_THREAD every task
+// is its own group, so these legs pin the argument contract and that a
+// tkill reaches exactly the named task.
+// ---------------------------------------------------------------------------
+
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const ESRCH: i32 = 3;
+const SIGKILL_NR: u64 = 9;
+/// Exit status of a task killed by SIGKILL: 128 + 9.
+const SIGKILL_EXIT: u64 = 137;
+
+fn test_tkill_tgkill(results: &mut TestResult) {
+    print("Testing tkill/tgkill... ");
+    let pid = unsafe { sys_getpid() };
+    let tid = unsafe { sys_gettid() };
+
+    // Signal 0 is a permission/existence probe on the caller itself.
+    if unsafe { syscall2(SYS_TKILL, tid, 0) } != 0
+        || unsafe { syscall3(SYS_TGKILL, pid, tid, 0) } != 0
+    {
+        results.fail("tkill/tgkill: self probe with signal 0 failed");
+        return;
+    }
+    // Non-positive ids are EINVAL, not a lookup.
+    if errno(unsafe { syscall2(SYS_TKILL, 0, 0) }) != EINVAL
+        || errno(unsafe { syscall3(SYS_TGKILL, 0, tid, 0) }) != EINVAL
+        || errno(unsafe { syscall3(SYS_TGKILL, pid, 0, 0) }) != EINVAL
+    {
+        results.fail("tkill/tgkill: a zero id was not EINVAL");
+        return;
+    }
+
+    // A child that keeps entering the kernel, so a pending kill is consumed.
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        results.fail("tkill/tgkill: fork failed");
+        return;
+    }
+    if child == 0 {
+        loop {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+    }
+
+    // The child's tid does not belong to the caller's group: ESRCH, no signal.
+    if errno(unsafe { syscall3(SYS_TGKILL, pid, child, SIGKILL_NR) }) != ESRCH {
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        reap_quietly(child);
+        results.fail("tkill/tgkill: tgkill with a foreign tgid was not ESRCH");
+        return;
+    }
+    // tgkill naming the child's own group, then tkill, reach it.
+    if unsafe { syscall3(SYS_TGKILL, child, child, 0) } != 0 {
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        reap_quietly(child);
+        results.fail("tkill/tgkill: tgkill(child, child, 0) failed");
+        return;
+    }
+    if unsafe { syscall2(SYS_TKILL, child, SIGKILL_NR) } != 0 {
+        // Clean up with kill(2) so a broken tkill cannot hang the gate.
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        reap_quietly(child);
+        results.fail("tkill/tgkill: tkill(child, SIGKILL) failed");
+        return;
+    }
+    match reap_pid(child) {
+        Some(SIGKILL_EXIT) => {}
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("tkill/tgkill: child was not killed by SIGKILL");
+            return;
+        }
+        None => {
+            results.fail("tkill/tgkill: could not reap the killed child");
+            return;
+        }
+    }
+    results.pass("tkill and tgkill reach exactly the named task");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 slice 4 step 7 (thread preview): CLONE_VM|CLONE_SIGHAND|CLONE_THREAD.
+// Each leg runs in a forked child that hosts the thread group, so a thread
+// defect cannot take this PID 1 down. The parent can reap a group leader only
+// after every other member was auto-reaped (G1), so each successful reap also
+// proves the thread itself was reaped.
+// ---------------------------------------------------------------------------
+
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const SYS_EXIT_GROUP: u64 = 231;
+const THREAD_FLAGS: u64 = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+const THREAD_POLL_YIELDS: u32 = 200_000;
+/// Status a leg's host process exits with when every check passed.
+const GROUP_LEG_OK: u64 = 0x31;
+/// exit_group status used by the group-exit leg.
+const GROUP_EXIT_CODE: u64 = 0x42;
+
+static GROUP_TID_WORD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static GROUP_PARENT_TID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static GROUP_SEEN_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GROUP_SEEN_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GROUP_SEEN_PPID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut GROUP_STACK: CloneStack = CloneStack([0; CLEAR_TID_STACK_BYTES]);
+
+fn group_stack_top() -> usize {
+    core::ptr::addr_of_mut!(GROUP_STACK) as usize + CLEAR_TID_STACK_BYTES
+}
+
+unsafe fn raw_exit(syscall: u64, code: u64) -> ! {
+    core::arch::asm!("syscall", in("rax") syscall, in("rdi") code, options(noreturn));
+}
+
+/// Thread entry: record the identity the kernel reports, then leave the
+/// group with a plain (single-thread) exit.
+extern "C" fn group_identity_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    unsafe {
+        GROUP_SEEN_PID.store(sys_getpid(), Ordering::SeqCst);
+        GROUP_SEEN_TID.store(sys_gettid(), Ordering::SeqCst);
+        GROUP_SEEN_PPID.store(sys_getppid(), Ordering::SeqCst);
+        raw_exit(SYS_EXIT, 0);
+    }
+}
+
+/// Thread entry: end the whole group from a non-leader thread.
+extern "C" fn group_exit_thread() -> ! {
+    for _ in 0..50 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT_GROUP, GROUP_EXIT_CODE) }
+}
+
+/// Thread entry: keep entering the kernel until killed.
+extern "C" fn group_spin_thread() -> ! {
+    loop {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+}
+
+fn spin_forever() -> ! {
+    loop {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+}
+
+/// Body of the identity leg's host process; returns its exit status.
+fn group_identity_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            GROUP_PARENT_TID.as_ptr(),
+            GROUP_TID_WORD.as_ptr(),
+            group_identity_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0x50;
+    }
+    // The clear at the thread's exit is the join signal.
+    let mut joined = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if GROUP_TID_WORD.load(Ordering::SeqCst) == 0 {
+            joined = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if !joined {
+        return 0x51;
+    }
+    let (pid, tid, ppid) = unsafe { (sys_getpid(), sys_gettid(), sys_getppid()) };
+    if GROUP_SEEN_PID.load(Ordering::SeqCst) != pid {
+        return 0x52; // getpid in a thread is the group id
+    }
+    let seen_tid = GROUP_SEEN_TID.load(Ordering::SeqCst);
+    if seen_tid == tid
+        || seen_tid != thread
+        || GROUP_PARENT_TID.load(Ordering::SeqCst) as u64 != thread
+    {
+        return 0x53; // a distinct tid, reported by clone and PARENT_SETTID
+    }
+    if GROUP_SEEN_PPID.load(Ordering::SeqCst) != ppid {
+        return 0x54; // getppid in a thread is the group's parent
+    }
+    // A thread is not its creator's child.
+    let mut info = SigInfo::poisoned();
+    if errno(waitid(P_ALL, 0, &mut info, WEXITED | WNOHANG)) != ECHILD {
+        return 0x55;
+    }
+    GROUP_LEG_OK
+}
+
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const SYS_DUP: u64 = 32;
+const SYS_FCNTL: u64 = 72;
+const F_GETFD: u64 = 1;
+const EBADF: i32 = 9;
+static GROUP_DUP_FD: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(-1);
+
+/// Thread entry: open a descriptor in the shared table, then exit alone.
+extern "C" fn group_files_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let fd = unsafe { syscall1(SYS_DUP, 1) } as i64;
+    GROUP_DUP_FD.store(fd, Ordering::SeqCst);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Body of the shared-table leg's host process (CLONE_FILES|CLONE_FS).
+fn group_files_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    GROUP_DUP_FD.store(-1, Ordering::SeqCst);
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_FILES | CLONE_FS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            group_files_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0x80;
+    }
+    let mut joined = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if GROUP_TID_WORD.load(Ordering::SeqCst) == 0 {
+            joined = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if !joined {
+        return 0x81;
+    }
+    let fd = GROUP_DUP_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        return 0x82; // the thread's dup failed
+    }
+    // The thread's descriptor lives in this task's table, and the thread's
+    // exit closed nothing.
+    if is_error(unsafe { syscall2(SYS_FCNTL, fd as u64, F_GETFD) })
+        || is_error(unsafe { syscall2(SYS_FCNTL, 1, F_GETFD) })
+    {
+        return 0x83;
+    }
+    if is_error(unsafe { sys_close(fd as u64) }) {
+        return 0x84;
+    }
+    if errno(unsafe { syscall2(SYS_FCNTL, fd as u64, F_GETFD) }) != EBADF {
+        return 0x85;
+    }
+    GROUP_LEG_OK
+}
+
+/// Body of the group-exit leg's host process: a thread ends the group.
+fn group_exit_leg() -> ! {
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            group_exit_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, 0x60) };
+    }
+    spin_forever()
+}
+
+/// Body of the kill leg's host process: two members that never exit alone.
+fn group_kill_leg() -> ! {
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            group_spin_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, 0x70) };
+    }
+    spin_forever()
+}
+
+fn test_thread_group(results: &mut TestResult) {
+    print("Testing thread groups (CLONE_THREAD preview)... ");
+
+    // 1. Identity, join through CLONE_CHILD_CLEARTID, thread not a child.
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("thread group: fork of the identity host failed");
+        return;
+    }
+    if host == 0 {
+        let code = group_identity_leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(GROUP_LEG_OK) => {}
+        Some(code) => {
+            print("identity leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("thread group: identity/join leg failed");
+            return;
+        }
+        None => {
+            results.fail("thread group: could not reap the identity host");
+            return;
+        }
+    }
+
+    // 2. exit_group from a non-leader thread ends the group; reaped once.
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("thread group: fork of the exit_group host failed");
+        return;
+    }
+    if host == 0 {
+        group_exit_leg();
+    }
+    match reap_pid(host) {
+        Some(GROUP_EXIT_CODE) => {}
+        Some(code) => {
+            print("exit_group leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("thread group: exit_group from a thread was not the group status");
+            return;
+        }
+        None => {
+            results.fail("thread group: could not reap the exit_group host");
+            return;
+        }
+    }
+
+    // 4. CLONE_FILES|CLONE_FS: one fd table shared by the group; a thread's
+    //    exit leaves it to the remaining member.
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("thread group: fork of the shared-table host failed");
+        return;
+    }
+    if host == 0 {
+        let code = group_files_leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(GROUP_LEG_OK) => {}
+        Some(code) => {
+            print("shared-table leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("thread group: shared fd table leg failed");
+            return;
+        }
+        None => {
+            results.fail("thread group: could not reap the shared-table host");
+            return;
+        }
+    }
+
+    // 3. A process-directed SIGKILL ends every member; reaped once.
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("thread group: fork of the kill host failed");
+        return;
+    }
+    if host == 0 {
+        group_kill_leg();
+    }
+    for _ in 0..100 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { userspace::syscall::sys_kill(host, SIGKILL_NR) };
+    match reap_pid(host) {
+        Some(SIGKILL_EXIT) => {}
+        Some(code) => {
+            print("kill leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("thread group: SIGKILL did not end the group");
+            return;
+        }
+        None => {
+            results.fail("thread group: could not reap the killed group");
+            return;
+        }
+    }
+
+    // Nothing of any leg is left to reap.
+    let mut left = SigInfo::poisoned();
+    if errno(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) != ECHILD {
+        results.fail("thread group: a leg left a reapable task behind");
+        return;
+    }
+    results.pass("thread groups share identity and files, exit as one and are reaped once");
 }

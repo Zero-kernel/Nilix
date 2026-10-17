@@ -34,8 +34,13 @@ host_harness = ["mm/host_harness", "cpu_local/host_harness"]
 # Default-off boot probes before any Ring-3 task is scheduled.
 namespace_probe = []
 open_fault_probe = []
-# Guest-only syscall fixture hooks (shared-fault verification oracle).
-syscall_test = []
+# Guest-only syscall fixture hooks (shared-fault verification oracle). Also
+# turns on the thread preview so the Ring-3 oracle can exercise thread groups.
+syscall_test = ["thread_preview"]
+# GAP-5 slice 4: accept the thread clone flags (CLONE_VM with CLONE_SIGHAND,
+# CLONE_THREAD, CLONE_FS, CLONE_FILES, CLONE_SYSVSEM, CLONE_DETACHED) before the
+# default build does. Guest test builds only.
+thread_preview = []
 
 [dependencies]
 spin = "0.9"

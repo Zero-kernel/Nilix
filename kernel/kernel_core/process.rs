@@ -1858,6 +1858,738 @@ impl TaskKcovState {
     }
 }
 
+/// GAP-5 slice 3 (step 1): file-descriptor table state of one fd table.
+///
+/// Grouped out of `Process` with no behaviour change: every access still goes
+/// through the owning PCB lock. See
+/// `docs/review/design/gap-5-slice3-files-handle-design.md`.
+#[derive(Debug)]
+pub struct FdState {
+    /// 文件描述符表（fd -> 描述符）
+    ///
+    /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
+    pub fd_table: AdmittedMap<i32, FileDescriptor>,
+
+    /// R39-4 FIX: 带 FD_CLOEXEC 标记的文件描述符集合
+    ///
+    /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
+    pub cloexec_fds: AdmittedSet<i32>,
+
+    /// R180-23: FD numbers admitted for an in-progress open transaction but not
+    /// yet published in `fd_table`. Fixed bitmap: reservation cannot allocate,
+    /// competing allocators skip the slot, and guessed use still observes EBADF.
+    pub(crate) fd_reservations: [u64; FD_RESERVATION_WORDS],
+
+    /// Subset of `fd_reservations` whose eventual publication must atomically
+    /// install FD_CLOEXEC. Keeping this in fixed storage lets reservation also
+    /// pre-grow the admitted set before a mutating VFS operation begins.
+    pub(crate) fd_cloexec_reservations: [u64; FD_RESERVATION_WORDS],
+
+    /// `files.max` charges currently held by `fd_reservations`. Kept separate
+    /// from the installed-FD count so both invariants remain auditable at exit.
+    pub(crate) fd_reservations_charged_count: u64,
+
+    /// J2-7: Running count of open file descriptors this process has charged to
+    /// its cgroup's `files.max` budget. Maintained in LOCKSTEP with every
+    /// fd_table mutation (allocate_fd +1, remove_fd −1, apply_fd_cloexec −N,
+    /// fork/clone batch = N, dup2/dup3 net delta) so it is the AUTHORITATIVE
+    /// amount to uncharge at exit — independent of `fd_table.len()`, which can
+    /// diverge on a clone-error child that copied fds but failed before the
+    /// batch charge. INV-CG-FD: `fds_charged_count == fds this process holds
+    /// charged to `charge_cgroup``. The charge belongs to this table (GAP-5
+    /// slice 3): today every table is private (CLONE_FILES deep-copies), so
+    /// exit-uncharge is unconditional; a shared table must uncharge once, at
+    /// last-reference teardown.
+    pub fds_charged_count: u64,
+
+    /// GAP-5 slice 3 step 2: the cgroup every `files.max` charge held by this
+    /// table (installed plus reserved) is booked against. The charge follows
+    /// the table, not the task, so a future shared table keeps one owner. It
+    /// is re-pointed only through `Process::set_cgroup_id`, inside the same
+    /// Process-locked transaction that migrates the charge.
+    pub(crate) charge_cgroup: crate::cgroup::CgroupId,
+
+    /// GAP-5 slice 3 step 2: tasks holding this table. The task whose exit
+    /// drops it to zero closes the descriptors and returns the charge; the
+    /// others leave the table to their siblings.
+    owners: usize,
+}
+
+impl FdState {
+    fn new() -> Self {
+        Self {
+            fd_table: AdmittedMap::new(HeapClass::CoreProcess),
+            cloexec_fds: AdmittedSet::new(HeapClass::CoreProcess),
+            fd_reservations: [0; FD_RESERVATION_WORDS],
+            fd_cloexec_reservations: [0; FD_RESERVATION_WORDS],
+            fd_reservations_charged_count: 0,
+            fds_charged_count: 0, // J2-7: no fds charged at construction
+            charge_cgroup: 0,
+            owners: 1,
+        }
+    }
+}
+
+/// U.S3-B: decrement the CapEntry refcount carried by `desc` (if any) and
+/// revoke the capability at refcount 0. Leaf: see `Process::decrement_fd_cap`.
+fn decrement_fd_cap(cap_table: &CapTable, desc: &dyn FileOps) {
+    if let Some(cap_id) = desc.cap_id() {
+        let should_revoke = cap_table.decrement_refcount(cap_id).unwrap_or(false);
+        if should_revoke {
+            let _ = cap_table.revoke(cap_id);
+        }
+    }
+}
+
+/// GAP-5 slice 3 step 3: one fd table behind its own leaf lock, held as
+/// `Process.files: Arc<FilesTable>`. Private to one task today: fork and
+/// clone give each child its own table (CLONE_FILES deep-copies until the
+/// share branch lands). Lock order: PCB lock -> files lock -> cap-table leaf;
+/// the files lock never takes a PCB, scheduler or VFS lock, and no
+/// `FileDescriptor` is dropped under it (displaced entries are returned).
+#[derive(Debug)]
+pub struct FilesTable {
+    inner: Mutex<FdState>,
+}
+
+impl FilesTable {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(FdState::new()),
+        }
+    }
+
+    /// Process-context lock. Callers may hold their own PCB lock.
+    #[inline]
+    pub fn lock(&self) -> spin::MutexGuard<'_, FdState> {
+        self.inner.lock()
+    }
+}
+
+impl Default for FilesTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// GAP-5 slice 3 step 3: a descriptor borrowed from a locked fd table. It
+/// holds the table lock until dropped.
+pub struct FdRef<'a> {
+    files: spin::MutexGuard<'a, FdState>,
+    fd: i32,
+}
+
+impl core::ops::Deref for FdRef<'_> {
+    type Target = FileDescriptor;
+
+    fn deref(&self) -> &FileDescriptor {
+        self.files
+            .fd_table
+            .get(&self.fd)
+            .expect("FdRef outlived its locked descriptor")
+    }
+}
+
+/// GAP-5 slice 3 step 3: fd-table operations. They run under the table's
+/// own lock (`FilesTable::lock`), so a table shared by several tasks is
+/// updated atomically; per-task inputs (the RLIMIT_NOFILE bound, the
+/// capability table) are passed in by the `Process` wrappers.
+impl FdState {
+    /// 分配新的文件描述符
+    ///
+    ///
+    /// # Returns
+    ///
+    /// 成功返回分配的 fd；失败（fd 上限 / `files.max` 拒绝）返回 `Err(desc)`。
+    ///
+    /// # R170-6 FIX (D2-FD-DROP-UNDER-LOCK)
+    ///
+    /// On failure the un-installed object is handed BACK to the caller instead
+    /// of being dropped inside this `&mut self` (Process-lock-held) scope —
+    /// a `FileOps` Drop can re-enter wake paths / foreign Process locks / the
+    /// L5 cgroup registry (the R154-3/R155-3 inversion family). The caller
+    /// owns the object again and SHOULD let it drop only after releasing the
+    /// Process lock (`sys_pipe` does); callers that deliberately keep today's
+    /// inline-drop timing are tagged `D2-FD-DROP-UNDER-LOCK` at the call site.
+    /// Both failure arms are charge-neutral: the no-slot arm never charged,
+    /// and the charge arm's `try_charge_fds` already failed.
+    #[inline]
+    fn fd_is_reserved(&self, fd: i32) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        self.fd_reservations
+            .get(fd / 64)
+            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
+    }
+
+    #[inline]
+    fn set_fd_reserved(&mut self, fd: i32, reserved: bool) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        let Some(word) = self.fd_reservations.get_mut(fd / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (fd % 64);
+        let was_reserved = *word & mask != 0;
+        if reserved {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+        was_reserved
+    }
+
+    #[inline]
+    fn fd_cloexec_is_reserved(&self, fd: i32) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        self.fd_cloexec_reservations
+            .get(fd / 64)
+            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
+    }
+
+    #[inline]
+    fn set_fd_cloexec_reserved(&mut self, fd: i32, reserved: bool) -> bool {
+        if !(0..MAX_FD).contains(&fd) {
+            return false;
+        }
+        let fd = fd as usize;
+        let Some(word) = self.fd_cloexec_reservations.get_mut(fd / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (fd % 64);
+        let was_reserved = *word & mask != 0;
+        if reserved {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+        was_reserved
+    }
+
+    #[inline]
+    fn pending_fd_reservations(&self) -> Option<usize> {
+        usize::try_from(self.fd_reservations_charged_count).ok()
+    }
+
+    #[inline]
+    fn pending_cloexec_reservations(&self) -> usize {
+        self.fd_cloexec_reservations
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Ensure live admitted backing has room for all existing reservations and
+    /// one additional publication. No externally visible state is changed.
+    fn prepare_fd_reservation_storage(&mut self, cloexec: bool) -> Result<(), ()> {
+        let fd_additional = self
+            .pending_fd_reservations()
+            .ok_or(())?
+            .checked_add(1)
+            .ok_or(())?;
+        self.fd_table
+            .ensure_capacity_for(fd_additional)
+            .map_err(|_| ())?;
+
+        if cloexec {
+            let cloexec_additional = self
+                .pending_cloexec_reservations()
+                .checked_add(1)
+                .ok_or(())?;
+            self.cloexec_fds
+                .ensure_capacity_for(cloexec_additional)
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn remove_fd_entry_preserving_reservations(&mut self, fd: i32) -> Option<FileDescriptor> {
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.remove(&fd)
+        } else {
+            self.fd_table.remove_retaining_capacity(&fd)
+        }
+    }
+
+    #[inline]
+    fn remove_cloexec_preserving_reservations(&mut self, fd: i32) -> bool {
+        if self.pending_cloexec_reservations() == 0 {
+            self.cloexec_fds.remove(&fd)
+        } else {
+            self.cloexec_fds.remove_retaining_capacity(&fd)
+        }
+    }
+
+    fn initialize_standard_fds(&mut self, limit: i32) -> Result<(), ProcessCreateError> {
+        if !self.fd_table.is_empty() || self.fd_reservations_charged_count != 0 {
+            return Err(ProcessCreateError::OutOfMemory);
+        }
+        let descriptors = [true, false, false].map(|readable| {
+            FileDescriptor::try_new(ConsoleFile { readable }, HeapClass::CoreProcess)
+        });
+        if descriptors.iter().any(Result::is_err) {
+            return Err(ProcessCreateError::OutOfMemory);
+        }
+        let mut reserved = 0;
+        for expected_fd in 0..3 {
+            match self.reserve_fd_from_with_cloexec(0, false, limit) {
+                Some(fd) => {
+                    assert_eq!(fd, expected_fd);
+                    reserved += 1;
+                }
+                None => {
+                    for fd in 0..reserved {
+                        assert!(self.cancel_fd_reservation(fd));
+                    }
+                    return Err(ProcessCreateError::OutOfMemory);
+                }
+            }
+        }
+        for (fd, descriptor) in descriptors.into_iter().enumerate() {
+            self.commit_reserved_fd(fd as i32, descriptor.expect("prepared console descriptor"));
+        }
+        Ok(())
+    }
+
+    /// F_DUPFD/F_DUPFD_CLOEXEC reservation: choose the lowest free descriptor
+    /// at or above `min_fd`, including 0..2 when explicitly requested, while
+    /// skipping every in-flight reservation bit.
+    fn reserve_fd_from_with_cloexec(
+        &mut self,
+        min_fd: i32,
+        cloexec: bool,
+        limit: i32,
+    ) -> Option<i32> {
+        let fd = self.next_available_fd_from(min_fd, limit)?;
+        self.prepare_fd_reservation_storage(cloexec).ok()?;
+        crate::cgroup::try_charge_fds(self.charge_cgroup, 1).ok()?;
+        let Some(next_reserved_count) = self.fd_reservations_charged_count.checked_add(1) else {
+            crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+            return None;
+        };
+        if self.set_fd_reserved(fd, true) {
+            panic!("R180-23: free-FD scan selected an already reserved slot");
+        }
+        if cloexec && self.set_fd_cloexec_reserved(fd, true) {
+            panic!("R180-23: CLOEXEC reservation bit duplicated");
+        }
+        self.fd_reservations_charged_count = next_reserved_count;
+        Some(fd)
+    }
+
+    fn commit_reserved_fd(&mut self, fd: i32, desc: FileDescriptor) {
+        assert!(
+            self.fd_is_reserved(fd) && !self.fd_table.contains_key(&fd),
+            "R180-23: invalid or occupied FD reservation at commit"
+        );
+        let next_reserved_count = self
+            .fd_reservations_charged_count
+            .checked_sub(1)
+            .expect("R180-23: reservation charge underflow at commit");
+        let next_installed_count = self
+            .fds_charged_count
+            .checked_add(1)
+            .expect("R180-23: installed FD charge overflow at commit");
+
+        let cloexec = self.fd_cloexec_is_reserved(fd);
+        if let Err((_fd, _desc)) = self.fd_table.insert_unique_reserved(fd, desc) {
+            // The reservation owns an exact map slot. A failure here is ledger
+            // or local-state corruption after an irreversible VFS operation;
+            // returning an ordinary error would violate R180-23 atomicity.
+            panic!("R180-23: reserved FD backing/identity invariant failed at commit");
+        }
+        if cloexec {
+            match self.cloexec_fds.insert_reserved(fd) {
+                Ok(true) => {}
+                Ok(false) => panic!("R180-23: stale CLOEXEC marker preceded FD publication"),
+                Err(_) => panic!("R180-23: reserved CLOEXEC backing invariant failed at commit"),
+            }
+        }
+
+        let was_reserved = self.set_fd_reserved(fd, false);
+        assert!(
+            was_reserved,
+            "R180-23: committed FD lost its reservation bit"
+        );
+        let was_cloexec_reserved = self.set_fd_cloexec_reserved(fd, false);
+        assert_eq!(was_cloexec_reserved, cloexec);
+        self.fd_reservations_charged_count = next_reserved_count;
+        self.fds_charged_count = next_installed_count;
+    }
+
+    /// Cancel one reservation and return its files.max credit. Idempotent false
+    /// on stale/mismatched tokens so a double-cancel cannot undercharge.
+    fn cancel_fd_reservation(&mut self, fd: i32) -> bool {
+        if !self.fd_is_reserved(fd) || self.fd_reservations_charged_count == 0 {
+            return false;
+        }
+        if !self.set_fd_reserved(fd, false) {
+            return false;
+        }
+        let _ = self.set_fd_cloexec_reserved(fd, false);
+        self.fd_reservations_charged_count -= 1;
+        crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.reclaim_empty_capacity();
+        }
+        if self.pending_cloexec_reservations() == 0 {
+            self.cloexec_fds.reclaim_empty_capacity();
+        }
+        true
+    }
+
+    /// Installed plus in-flight open charges. Cgroup migration must move both
+    /// before changing `cgroup_id`, otherwise reservation Drop would uncharge a
+    /// different hierarchy from the one originally charged.
+    pub(crate) fn total_fd_charge_count(&self) -> u64 {
+        self.fds_charged_count
+            .checked_add(self.fd_reservations_charged_count)
+            .expect("FD charge accounting overflow")
+    }
+
+    /// 移除并返回指定 fd 的描述符
+    ///
+    /// 关闭文件描述符时使用，描述符的 Drop 会自动处理资源清理
+    /// R39-4 FIX: 同时清除 CLOEXEC 标记
+    fn remove_fd(&mut self, fd: i32, cap_table: &CapTable) -> Option<FileDescriptor> {
+        if fd < 0 || self.fd_is_reserved(fd) {
+            return None;
+        }
+        self.remove_cloexec_preserving_reservations(fd);
+        let removed = self.remove_fd_entry_preserving_reservations(fd);
+        if removed.is_some() {
+            crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+            self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
+        }
+
+        // U.S2-α FIX: Revoke CapId on close (refcounted; revoke only at 0).
+        // U.S3-B FIX: use the generic `FileOps::cap_id()` accessor instead of a
+        // `SocketFile` downcast, so EVERY cap-bearing fd kind (pipes/files in
+        // U.S2 SLICE-3+) rides this same last-close revocation without touching
+        // this function again. Non-bearing kinds return None (no-op).
+        if let Some(ref desc) = removed {
+            decrement_fd_cap(cap_table, desc.as_ref());
+        }
+
+        removed
+    }
+
+    /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
+    ///
+    /// # Arguments
+    /// * `fd` - 文件描述符
+    /// * `cloexec` - true 设置 CLOEXEC，false 清除
+    fn set_fd_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), ()> {
+        if self.fd_is_reserved(fd) || !self.fd_table.contains_key(&fd) {
+            return Err(());
+        }
+        if cloexec {
+            if self.cloexec_fds.contains(&fd) {
+                return Ok(());
+            }
+            // Do not consume capacity promised to an in-flight O_CLOEXEC open.
+            let additional = self
+                .pending_cloexec_reservations()
+                .checked_add(1)
+                .ok_or(())?;
+            self.cloexec_fds
+                .ensure_capacity_for(additional)
+                .map_err(|_| ())?;
+            match self.cloexec_fds.insert_reserved(fd) {
+                Ok(true) => {}
+                Ok(false) => panic!("CLOEXEC marker appeared during locked publication"),
+                Err(_) => panic!("prepared CLOEXEC capacity disappeared during publication"),
+            }
+        } else {
+            self.remove_cloexec_preserving_reservations(fd);
+        }
+        Ok(())
+    }
+
+    /// R39-4 FIX: 在 exec 期间关闭所有带 FD_CLOEXEC 的文件描述符
+    ///
+    /// SECURITY: 防止敏感句柄（如设备、管道）泄漏到 exec 后的新程序。
+    /// 这是 POSIX close-on-exec 语义的实现。
+    ///
+    /// # R169-4 FIX (HIGH, lock inversion): drop CLOEXEC FDs OUTSIDE the lock
+    ///
+    /// This runs with the Process lock held. The previous version dropped each
+    /// removed `FileDescriptor` INLINE (`fd_table.remove(&fd).is_some()`), so a
+    /// `SocketFile`'s `Drop` ran under the Process lock → socket `close` →
+    /// `wake_all` (re-locks PROCESS_TABLE + a foreign `Process::inner`) and
+    /// `uncharge_port_cgroup` (L5 `CGROUP_REGISTRY`). That is exactly the
+    /// Process→foreign-PCB lock inversion (R154-3/R155-3) that
+    /// `replace_fd_charged` was written to avoid, plus an L5-under-Process-lock
+    /// acquire (D1-CGROUP-IRQ-L5). Two concurrent execs each closing a socket
+    /// that wakes the other could ABBA-deadlock.
+    ///
+    /// Drains the close-on-exec descriptors into the caller-provided `removed`
+    /// buffer and returns the closed count. The CALLER MUST have pre-reserved
+    /// `removed` to at least the current `cloexec_fds.len()` (the exec caller
+    /// snapshots that count under this same lock hold, before any irreversible
+    /// exec mutation, and fails with ENOMEM if the reservation fails). Because
+    /// capacity is guaranteed and the fd table is private here (exec
+    /// must unshare a shared table first; GAP-5 slice 3) so nothing adds cloexec marks in between, every
+    /// `push` here is infallible and **no `FileDescriptor` is ever dropped
+    /// inline under the Process lock** — fully eliminating the lock-inversion
+    /// class for the cloexec-on-exec path, with no fatal-OOM residual.
+    ///
+    /// The `fds_charged_count` decrement is a Process-local field and stays
+    /// under the lock; the caller performs the L5 `uncharge_fds` and the actual
+    /// descriptor drops AFTER releasing the Process lock. The `cloexec_fds` set
+    /// is taken out with `mem::take` (which clears it and lets us iterate it
+    /// while mutating `fd_table`), replacing the prior infallible `.collect()`.
+    fn take_cloexec_fds_into(
+        &mut self,
+        removed: &mut Vec<FileDescriptor>,
+        cap_table: &CapTable,
+    ) -> u64 {
+        let cloexec = core::mem::replace(
+            &mut self.cloexec_fds,
+            AdmittedSet::new(HeapClass::CoreProcess),
+        );
+        debug_assert!(
+            removed.capacity().saturating_sub(removed.len()) >= cloexec.len(),
+            "take_cloexec_fds_into: caller under-reserved the cloexec drop buffer"
+        );
+        let mut closed: u64 = 0;
+        for fd in cloexec.iter().copied() {
+            if let Some(desc) = self.remove_fd_entry_preserving_reservations(fd) {
+                // Stale cloexec entries for already-closed fds contribute 0
+                // (remove() == None), so the uncharge count stays exact.
+                closed += 1;
+                // U.S3-B FIX: decrement the removed fd's cap (revoke at 0).
+                // Without this, an fd marked close-on-exec via F_SETFD *after*
+                // creation (so its CapEntry never carried CapFlags::CLOEXEC)
+                // leaked its refcount at exec — the cap outlived every fd and
+                // the slot was permanently lost (TableFull DoS class, since the
+                // cap_table SURVIVES exec). Safe under the Process lock: leaf
+                // spinlock, plain-data drop (see decrement_fd_cap).
+                decrement_fd_cap(cap_table, desc.as_ref());
+                // Infallible: the caller pre-reserved enough capacity, so this
+                // never reallocates and never drops `desc` inline under the lock.
+                removed.push(desc);
+            }
+        }
+        if closed > 0 {
+            self.fds_charged_count = self.fds_charged_count.saturating_sub(closed);
+        }
+        if self.fd_reservations_charged_count == 0 {
+            self.fd_table.reclaim_empty_capacity();
+        }
+        closed
+    }
+
+    /// Net-aware dup2/dup3 publication with optional atomic CLOEXEC marking.
+    /// Every allocation is prepared before the old descriptor is displaced.
+    fn replace_fd_charged_with_cloexec(
+        &mut self,
+        fd: i32,
+        desc: FileDescriptor,
+        cloexec: bool,
+        limit: i32,
+        cap_table: &CapTable,
+    ) -> Result<Option<FileDescriptor>, FileDescriptor> {
+        if !(0..limit).contains(&fd) || self.fd_is_reserved(fd) {
+            return Err(desc);
+        }
+        let occupied = self.fd_table.contains_key(&fd);
+        let had_cloexec = self.cloexec_fds.contains(&fd);
+        if !occupied {
+            // Net +1 — charge fail-closed BEFORE any mutation.
+            let Some(additional) = self
+                .pending_fd_reservations()
+                .and_then(|pending| pending.checked_add(1))
+            else {
+                return Err(desc);
+            };
+            if self.fd_table.ensure_capacity_for(additional).is_err() {
+                return Err(desc);
+            }
+            if crate::cgroup::try_charge_fds(self.charge_cgroup, 1).is_err() {
+                return Err(desc);
+            }
+        }
+        if cloexec && !had_cloexec {
+            let Some(additional) = self.pending_cloexec_reservations().checked_add(1) else {
+                if !occupied {
+                    crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+                }
+                return Err(desc);
+            };
+            if self.cloexec_fds.ensure_capacity_for(additional).is_err() {
+                if !occupied {
+                    crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+                }
+                return Err(desc);
+            }
+        }
+        // Occupied → insert returns the old entry (its charge is reused, count
+        // unchanged); empty → returns None.
+        let displaced = if occupied {
+            self.fd_table
+                .try_insert(fd, desc)
+                .unwrap_or_else(|_| panic!("occupied FD replacement attempted allocation"))
+        } else {
+            match self.fd_table.insert_unique_reserved(fd, desc) {
+                Ok(()) => {
+                    self.fds_charged_count = self
+                        .fds_charged_count
+                        .checked_add(1)
+                        .expect("installed FD charge count overflow");
+                    None
+                }
+                Err((_fd, desc)) => {
+                    crate::cgroup::uncharge_fds(self.charge_cgroup, 1);
+                    return Err(desc);
+                }
+            }
+        };
+        if cloexec {
+            if !had_cloexec {
+                match self.cloexec_fds.insert_reserved(fd) {
+                    Ok(true) => {}
+                    Ok(false) => panic!("dup CLOEXEC marker appeared without publication"),
+                    Err(_) => panic!("prepared dup CLOEXEC slot disappeared during publication"),
+                }
+            }
+        } else {
+            self.remove_cloexec_preserving_reservations(fd);
+        }
+        // U.S3-B FIX: the DISPLACED entry leaves fd_table here without passing
+        // through remove_fd, so its cap refcount must be decremented (revoke at
+        // 0) or every dup2/dup3 onto an occupied cap-bearing fd leaks a slot
+        // (TableFull DoS class). The displaced Box itself is still returned to
+        // the caller to DROP outside the Process lock (R155-3) — only the leaf
+        // cap accounting happens here.
+        if let Some(ref old) = displaced {
+            decrement_fd_cap(cap_table, old.as_ref());
+        }
+        Ok(displaced)
+    }
+
+    fn next_available_fd_from(&self, min_fd: i32, limit: i32) -> Option<i32> {
+        if !(0..limit).contains(&min_fd) {
+            return None;
+        }
+        let mut fd = min_fd;
+        while fd < limit {
+            if !self.fd_table.contains_key(&fd) && !self.fd_is_reserved(fd) {
+                return Some(fd);
+            }
+            fd = fd.checked_add(1)?;
+        }
+        None // 已达到 fd 上限
+    }
+
+    /// Count a task that now shares this table (CLONE_FILES).
+    pub(crate) fn add_owner(&mut self) {
+        self.owners = self
+            .owners
+            .checked_add(1)
+            .expect("GAP-5: fd table owner count overflow");
+    }
+
+    /// Drop one owner; true when it was the last.
+    fn release_owner(&mut self) -> bool {
+        self.owners = self
+            .owners
+            .checked_sub(1)
+            .expect("GAP-5: fd table owner count underflow");
+        self.owners == 0
+    }
+
+    /// Tasks currently holding this table.
+    pub(crate) fn owners(&self) -> usize {
+        self.owners
+    }
+
+    /// Reserve and publish in one transaction; see `Process::allocate_fd`.
+    fn allocate_fd_from_with_cloexec(
+        &mut self,
+        desc: FileDescriptor,
+        min_fd: i32,
+        cloexec: bool,
+        limit: i32,
+    ) -> Result<i32, FileDescriptor> {
+        let Some(fd) = self.reserve_fd_from_with_cloexec(min_fd, cloexec, limit) else {
+            return Err(desc);
+        };
+        self.commit_reserved_fd(fd, desc);
+        Ok(fd)
+    }
+}
+
+/// GAP-5 slice 4 G1: state shared by every task of one thread group. The `Arc`
+/// identity is the group identity (RF178-35): a tgid is a reusable number.
+#[derive(Debug)]
+pub struct ThreadGroup {
+    /// R153-3: set by exit_group() before sibling marking begins;
+    /// sys_clone(CLONE_THREAD) refuses while it is set.
+    pub exiting: AtomicBool,
+    /// Tasks of this group present in PROCESS_TABLE, leader included. Changed
+    /// only while PROCESS_TABLE is locked.
+    members: AtomicUsize,
+    /// The group's exit has been reported to the leader's parent.
+    parent_notified: AtomicBool,
+}
+
+impl ThreadGroup {
+    pub const fn new() -> Self {
+        Self {
+            exiting: AtomicBool::new(false),
+            members: AtomicUsize::new(1),
+            parent_notified: AtomicBool::new(false),
+        }
+    }
+
+    /// Tasks of this group currently in PROCESS_TABLE.
+    pub fn members(&self) -> usize {
+        self.members.load(Ordering::Acquire)
+    }
+
+    /// Count a newly published member. Caller holds PROCESS_TABLE.
+    pub(crate) fn join_locked(&self) {
+        let previous = self
+            .members
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .expect("GAP-5 G1: thread group member count overflow");
+        assert!(previous >= 1, "GAP-5 G1: thread joined an empty group");
+    }
+
+    /// Drop a member removed from PROCESS_TABLE; returns the remaining count.
+    /// Caller holds PROCESS_TABLE.
+    fn leave_locked(&self) -> usize {
+        let previous = self.members.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous >= 1,
+            "GAP-5 G1: thread group member count underflow"
+        );
+        previous - 1
+    }
+
+    /// Claim the single report of this group's exit to its parent.
+    fn claim_parent_notification(&self) -> bool {
+        self.parent_notified
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+impl Default for ThreadGroup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct Process {
     /// 进程ID（唯一标识，也是 Linux 语义中的 tid）
@@ -1875,6 +2607,12 @@ pub struct Process {
 
     /// 线程组ID（主线程时等于 pid，子线程时等于主线程的 pid）
     pub tgid: ProcessId,
+
+    /// GAP-5 slice 4 G5: the thread group's id in the shared PID namespace,
+    /// cached when a CLONE_THREAD task is created (the leader's namespace
+    /// mapping is removed when the leader exits). 0 for a group leader, which
+    /// translates its own pid instead.
+    pub ns_tgid: ProcessId,
 
     /// 父进程ID
     pub ppid: ProcessId,
@@ -1901,18 +2639,18 @@ pub struct Process {
     // ──────────────────────────────────────────────────────────────────────
     // M0 item 5 (sub-slice 1a): user signal-handler delivery state.
     //
-    // PER-TASK storage (a documented M0 DIVERGENCE from Linux, which shares the
-    // disposition table across a CLONE_SIGHAND thread group — same accepted
-    // pattern as the M0-6 per-task `rlimits`). A future CLONE_SIGHAND slice must
-    // NOT silently swap in a shared `Arc<Mutex<..>>` without a Process→table
-    // lock-ordering review.
+    // GAP-5 slice 1: the disposition table is an explicit shared handle
+    // (`Arc<SignalTable>`, shared under CLONE_SIGHAND, deep-copied by fork).
+    // Lock order PCB -> SignalTable (leaf); IRQ delivery only try-locks it.
+    // The blocked mask, pending set and handler scratch state stay PER TASK.
     // ──────────────────────────────────────────────────────────────────────
     /// Per-task blocked-signal mask (signal `n` → bit `1<<(n-1)`). SIGKILL/SIGSTOP
     /// are structurally never set (`apply_sigprocmask` force-clears them).
     pub blocked: u64,
     /// Per-signal disposition table (index = signum-1). Born-clean = all SIG_DFL;
     /// reset to SIG_DFL for caught signals on exec (SIG_IGN preserved).
-    pub sigactions: [SigAction; NSIG],
+    /// Shared across a CLONE_SIGHAND group; see `crate::signal::SignalTable`.
+    pub sigactions: Arc<crate::signal::SignalTable>,
     /// The blocked mask saved when a handler frame is built; restored by
     /// `rt_sigreturn` from THIS field (never from the user-controlled `uc_sigmask`,
     /// closing a mask-widening SROP). Cleared on exec.
@@ -2046,29 +2784,13 @@ pub struct Process {
     /// Lock ordering: Process → MmState (never reverse).
     pub mm: Arc<Mutex<MmState>>,
 
-    /// 文件描述符表（fd -> 描述符）
-    ///
-    /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
-    pub fd_table: AdmittedMap<i32, FileDescriptor>,
+    /// GAP-5 slice 3: this task's fd table behind its own leaf lock. Private
+    /// today (fork and clone give the child its own table); a CLONE_FILES
+    /// share branch would hand siblings the same `Arc`.
+    pub files: Arc<FilesTable>,
 
-    /// R39-4 FIX: 带 FD_CLOEXEC 标记的文件描述符集合
-    ///
-    /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
-    pub cloexec_fds: AdmittedSet<i32>,
-
-    /// R180-23: FD numbers admitted for an in-progress open transaction but not
-    /// yet published in `fd_table`. Fixed bitmap: reservation cannot allocate,
-    /// competing allocators skip the slot, and guessed use still observes EBADF.
-    fd_reservations: [u64; FD_RESERVATION_WORDS],
-
-    /// Subset of `fd_reservations` whose eventual publication must atomically
-    /// install FD_CLOEXEC. Keeping this in fixed storage lets reservation also
-    /// pre-grow the admitted set before a mutating VFS operation begins.
-    fd_cloexec_reservations: [u64; FD_RESERVATION_WORDS],
-
-    /// `files.max` charges currently held by `fd_reservations`. Kept separate
-    /// from the installed-FD count so both invariants remain auditable at exit.
-    fd_reservations_charged_count: u64,
+    /// This task's owner share of `files` was already released by teardown.
+    files_released: bool,
 
     /// M0-6: POSIX resource limits (getrlimit/setrlimit/prlimit64).
     ///
@@ -2078,17 +2800,6 @@ pub struct Process {
     /// slice must NOT silently swap in a mutable Arc without a Process→MmState
     /// lock-ordering review.
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
-
-    /// J2-7: Running count of open file descriptors this process has charged to
-    /// its cgroup's `files.max` budget. Maintained in LOCKSTEP with every
-    /// fd_table mutation (allocate_fd +1, remove_fd −1, apply_fd_cloexec −N,
-    /// fork/clone batch = N, dup2/dup3 net delta) so it is the AUTHORITATIVE
-    /// amount to uncharge at exit — independent of `fd_table.len()`, which can
-    /// diverge on a clone-error child that copied fds but failed before the
-    /// batch charge. INV-CG-FD: `fds_charged_count == fds this process holds
-    /// charged to `cgroup_id``; fd_table is per-process (deep-copied, never
-    /// Arc-shared even under CLONE_FILES) so exit-uncharge is unconditional.
-    pub fds_charged_count: u64,
 
     /// 能力表（Capability Table，管理进程持有的能力）
     ///
@@ -2103,13 +2814,19 @@ pub struct Process {
     /// 退出码
     pub exit_code: Option<i32>,
 
-    /// R153-3 FIX: Thread-group exiting flag (shared among CLONE_THREAD siblings).
+    /// R153-3 FIX / GAP-5 slice 4 G1: state shared with CLONE_THREAD siblings.
     ///
-    /// Set by exit_group() before sibling marking begins. sys_clone(CLONE_THREAD)
-    /// checks this flag to prevent new threads from being created during
-    /// exit_group(), closing the TOCTOU window where per-thread pending_kill
-    /// has not yet been set.
-    pub thread_group_exiting: Arc<AtomicBool>,
+    /// `exiting` is set by exit_group() before sibling marking begins;
+    /// sys_clone(CLONE_THREAD) checks it so no new thread is created during
+    /// exit_group(). `members` and the parent-notification claim drive group
+    /// reaping.
+    pub thread_group: Arc<ThreadGroup>,
+
+    /// GAP-5 slice 4 G2: this task's fatal outcome (fatal default signal, user
+    /// fault, seccomp kill, OOM) ends its whole thread group. Set under this
+    /// PCB's lock by the poster; `terminate_process` (process context) marks
+    /// the other members. Plain `exit` and exit_group siblings leave it clear.
+    pub(crate) group_fatal: bool,
 
     /// R115-1 FIX: Cross-CPU exit request flag.
     ///
@@ -2176,12 +2893,10 @@ pub struct Process {
     /// 普通 fork 会 clone 凭证到新的 Arc。
     credentials: Arc<SharedCredentials>,
 
-    /// 文件创建掩码 (umask)
-    /// 新建文件的权限 = mode & !umask
-    pub umask: u16,
-
-    /// KSA-010/014: identity-bound root/cwd, independently inherited on fork.
-    pub fs_context: crate::fs_context::FsContextState,
+    /// KSA-010/014 + GAP-5 slice 2: identity-bound root/cwd and the file
+    /// creation mask (new mode = mode & !umask) behind one handle. Shared by
+    /// `Arc` under CLONE_FS, deep-copied on fork. Lock order PCB -> handle.
+    pub fs: Arc<crate::fs_context::FsContextHandle>,
 
     // ========== OOM Killer 支持 ==========
     /// Nice 值 (-20 到 19)
@@ -2490,7 +3205,13 @@ impl Process {
             DEFAULT_MMAP_BASE,
         ))));
         let cap_table = Arc::new(CapTable::new());
-        let thread_group_exiting = Arc::new(AtomicBool::new(false));
+        let thread_group = Arc::new(ThreadGroup::new());
+        let files = Arc::new(FilesTable::new());
+        let sigactions = Arc::new(crate::signal::SignalTable::new());
+        let fs = Arc::new(crate::fs_context::FsContextHandle::new(
+            crate::fs_context::FsContextState::default(),
+            0o022,
+        ));
         let credentials = Arc::new(SharedCredentials::new(Credentials {
             uid: 65534,
             gid: 65534,
@@ -2505,7 +3226,10 @@ impl Process {
             priority,
             mm,
             cap_table,
-            thread_group_exiting,
+            thread_group,
+            files,
+            sigactions,
+            fs,
             credentials,
             None,
         )
@@ -2526,7 +3250,10 @@ impl Process {
         let mut fixed_total = 0usize;
         for bytes in [
             arc_charge_bytes::<Mutex<MmState>>(),
-            arc_charge_bytes::<AtomicBool>(),
+            arc_charge_bytes::<ThreadGroup>(),
+            arc_charge_bytes::<FilesTable>(),
+            arc_charge_bytes::<crate::signal::SignalTable>(),
+            arc_charge_bytes::<crate::fs_context::FsContextHandle>(),
             arc_charge_bytes::<SharedCredentials>(),
         ] {
             let bytes = bytes.map_err(|_| ProcessCreateError::OutOfMemory)?;
@@ -2568,8 +3295,16 @@ impl Process {
         ))))
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let thread_group_exiting =
-            Arc::try_new(AtomicBool::new(false)).map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let thread_group =
+            Arc::try_new(ThreadGroup::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let files = Arc::try_new(FilesTable::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let sigactions = Arc::try_new(crate::signal::SignalTable::new())
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let fs = Arc::try_new(crate::fs_context::FsContextHandle::new(
+            crate::fs_context::FsContextState::default(),
+            0o022,
+        ))
+        .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let credentials = Arc::try_new(SharedCredentials::new(Credentials {
             uid: 65534,
             gid: 65534,
@@ -2588,7 +3323,10 @@ impl Process {
             priority,
             mm,
             cap_table,
-            thread_group_exiting,
+            thread_group,
+            files,
+            sigactions,
+            fs,
             credentials,
             Some(payload_charge),
         );
@@ -2755,7 +3493,10 @@ impl Process {
         priority: Priority,
         mm: Arc<Mutex<MmState>>,
         cap_table: Arc<CapTable>,
-        thread_group_exiting: Arc<AtomicBool>,
+        thread_group: Arc<ThreadGroup>,
+        files: Arc<FilesTable>,
+        sigactions: Arc<crate::signal::SignalTable>,
+        fs: Arc<crate::fs_context::FsContextHandle>,
         credentials: Arc<SharedCredentials>,
         heap_charge: Option<HeapCharge>,
     ) -> Self {
@@ -2764,6 +3505,7 @@ impl Process {
             generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst), // lint-fetch-add: allow (generation counter)
             tid: pid,                                                   // tid == pid (Linux 语义)
             tgid: pid,                                                  // 主线程时 tgid == pid
+            ns_tgid: 0,
             ppid,
             is_thread: false,
             name,
@@ -2773,7 +3515,7 @@ impl Process {
             // M0 item 5: signal-handler state born clean (no handlers, empty mask,
             // no live handler frame).
             blocked: 0,
-            sigactions: crate::signal::default_sigactions(),
+            sigactions,
             saved_blocked: 0,
             // M0 #5 (1b-2): no live syscall-frame binding at birth.
             saved_frame_ptr: 0,
@@ -2803,17 +3545,14 @@ impl Process {
             memory_space: 0,
             user_memory_space: 0,
             mm,
-            fd_table: AdmittedMap::new(HeapClass::CoreProcess),
-            cloexec_fds: AdmittedSet::new(HeapClass::CoreProcess),
-            fd_reservations: [0; FD_RESERVATION_WORDS],
-            fd_cloexec_reservations: [0; FD_RESERVATION_WORDS],
-            fd_reservations_charged_count: 0,
+            files,
+            files_released: false,
             rlimits: default_rlimits(), // M0-6: POSIX resource limits
-            fds_charged_count: 0,       // J2-7: no fds charged at construction
 
             cap_table,
             exit_code: None,
-            thread_group_exiting,
+            thread_group,
+            group_fatal: false,
             pending_kill: AtomicBool::new(false),
             pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
@@ -2839,8 +3578,7 @@ impl Process {
             // to root explicitly by create_process(), and fork()/clone() inherit
             // credentials from the parent process via independent clone.
             credentials,
-            umask: 0o022,
-            fs_context: crate::fs_context::FsContextState::default(),
+            fs,
             // OOM killer 支持 - 默认中立设置
             nice: 0,
             oom_score_adj: 0,
@@ -2917,139 +3655,6 @@ impl Process {
         Ok(task_kcov_switch_token(self))
     }
 
-    /// 分配新的文件描述符
-    ///
-    ///
-    /// # Returns
-    ///
-    /// 成功返回分配的 fd；失败（fd 上限 / `files.max` 拒绝）返回 `Err(desc)`。
-    ///
-    /// # R170-6 FIX (D2-FD-DROP-UNDER-LOCK)
-    ///
-    /// On failure the un-installed object is handed BACK to the caller instead
-    /// of being dropped inside this `&mut self` (Process-lock-held) scope —
-    /// a `FileOps` Drop can re-enter wake paths / foreign Process locks / the
-    /// L5 cgroup registry (the R154-3/R155-3 inversion family). The caller
-    /// owns the object again and SHOULD let it drop only after releasing the
-    /// Process lock (`sys_pipe` does); callers that deliberately keep today's
-    /// inline-drop timing are tagged `D2-FD-DROP-UNDER-LOCK` at the call site.
-    /// Both failure arms are charge-neutral: the no-slot arm never charged,
-    /// and the charge arm's `try_charge_fds` already failed.
-    #[inline]
-    fn fd_is_reserved(&self, fd: i32) -> bool {
-        if !(0..MAX_FD).contains(&fd) {
-            return false;
-        }
-        let fd = fd as usize;
-        self.fd_reservations
-            .get(fd / 64)
-            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
-    }
-
-    #[inline]
-    fn set_fd_reserved(&mut self, fd: i32, reserved: bool) -> bool {
-        if !(0..MAX_FD).contains(&fd) {
-            return false;
-        }
-        let fd = fd as usize;
-        let Some(word) = self.fd_reservations.get_mut(fd / 64) else {
-            return false;
-        };
-        let mask = 1u64 << (fd % 64);
-        let was_reserved = *word & mask != 0;
-        if reserved {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
-        was_reserved
-    }
-
-    #[inline]
-    fn fd_cloexec_is_reserved(&self, fd: i32) -> bool {
-        if !(0..MAX_FD).contains(&fd) {
-            return false;
-        }
-        let fd = fd as usize;
-        self.fd_cloexec_reservations
-            .get(fd / 64)
-            .is_some_and(|word| word & (1u64 << (fd % 64)) != 0)
-    }
-
-    #[inline]
-    fn set_fd_cloexec_reserved(&mut self, fd: i32, reserved: bool) -> bool {
-        if !(0..MAX_FD).contains(&fd) {
-            return false;
-        }
-        let fd = fd as usize;
-        let Some(word) = self.fd_cloexec_reservations.get_mut(fd / 64) else {
-            return false;
-        };
-        let mask = 1u64 << (fd % 64);
-        let was_reserved = *word & mask != 0;
-        if reserved {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
-        was_reserved
-    }
-
-    #[inline]
-    fn pending_fd_reservations(&self) -> Option<usize> {
-        usize::try_from(self.fd_reservations_charged_count).ok()
-    }
-
-    #[inline]
-    fn pending_cloexec_reservations(&self) -> usize {
-        self.fd_cloexec_reservations
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
-    }
-
-    /// Ensure live admitted backing has room for all existing reservations and
-    /// one additional publication. No externally visible state is changed.
-    fn prepare_fd_reservation_storage(&mut self, cloexec: bool) -> Result<(), ()> {
-        let fd_additional = self
-            .pending_fd_reservations()
-            .ok_or(())?
-            .checked_add(1)
-            .ok_or(())?;
-        self.fd_table
-            .ensure_capacity_for(fd_additional)
-            .map_err(|_| ())?;
-
-        if cloexec {
-            let cloexec_additional = self
-                .pending_cloexec_reservations()
-                .checked_add(1)
-                .ok_or(())?;
-            self.cloexec_fds
-                .ensure_capacity_for(cloexec_additional)
-                .map_err(|_| ())?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn remove_fd_entry_preserving_reservations(&mut self, fd: i32) -> Option<FileDescriptor> {
-        if self.fd_reservations_charged_count == 0 {
-            self.fd_table.remove(&fd)
-        } else {
-            self.fd_table.remove_retaining_capacity(&fd)
-        }
-    }
-
-    #[inline]
-    fn remove_cloexec_preserving_reservations(&mut self, fd: i32) -> bool {
-        if self.pending_cloexec_reservations() == 0 {
-            self.cloexec_fds.remove(&fd)
-        } else {
-            self.cloexec_fds.remove_retaining_capacity(&fd)
-        }
-    }
-
     /// R180-23: reserve an FD number and its hierarchical `files.max` charge
     /// before a VFS call is allowed to create or truncate anything. The fixed
     /// bitmap mutation is allocation-free and competing FD operations skip the
@@ -3066,55 +3671,18 @@ impl Process {
     }
 
     fn initialize_standard_fds(&mut self) -> Result<(), ProcessCreateError> {
-        if !self.fd_table.is_empty() || self.fd_reservations_charged_count != 0 {
-            return Err(ProcessCreateError::OutOfMemory);
-        }
-        let descriptors = [true, false, false].map(|readable| {
-            FileDescriptor::try_new(ConsoleFile { readable }, HeapClass::CoreProcess)
-        });
-        if descriptors.iter().any(Result::is_err) {
-            return Err(ProcessCreateError::OutOfMemory);
-        }
-        let mut reserved = 0;
-        for expected_fd in 0..3 {
-            match self.reserve_fd_with_cloexec(false) {
-                Some(fd) => {
-                    assert_eq!(fd, expected_fd);
-                    reserved += 1;
-                }
-                None => {
-                    for fd in 0..reserved {
-                        assert!(self.cancel_fd_reservation(fd));
-                    }
-                    return Err(ProcessCreateError::OutOfMemory);
-                }
-            }
-        }
-        for (fd, descriptor) in descriptors.into_iter().enumerate() {
-            self.commit_reserved_fd(fd as i32, descriptor.expect("prepared console descriptor"));
-        }
-        Ok(())
+        let limit = self.effective_fd_limit();
+        self.files.lock().initialize_standard_fds(limit)
     }
 
     /// F_DUPFD/F_DUPFD_CLOEXEC reservation: choose the lowest free descriptor
     /// at or above `min_fd`, including 0..2 when explicitly requested, while
     /// skipping every in-flight reservation bit.
     pub fn reserve_fd_from_with_cloexec(&mut self, min_fd: i32, cloexec: bool) -> Option<i32> {
-        let fd = self.next_available_fd_from(min_fd)?;
-        self.prepare_fd_reservation_storage(cloexec).ok()?;
-        crate::cgroup::try_charge_fds(self.cgroup_id, 1).ok()?;
-        let Some(next_reserved_count) = self.fd_reservations_charged_count.checked_add(1) else {
-            crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-            return None;
-        };
-        if self.set_fd_reserved(fd, true) {
-            panic!("R180-23: free-FD scan selected an already reserved slot");
-        }
-        if cloexec && self.set_fd_cloexec_reserved(fd, true) {
-            panic!("R180-23: CLOEXEC reservation bit duplicated");
-        }
-        self.fd_reservations_charged_count = next_reserved_count;
-        Some(fd)
+        let limit = self.effective_fd_limit();
+        self.files
+            .lock()
+            .reserve_fd_from_with_cloexec(min_fd, cloexec, limit)
     }
 
     /// Publish a descriptor into a previously reserved slot. This consumes the
@@ -3128,74 +3696,37 @@ impl Process {
         Ok(())
     }
 
+    /// Publish a descriptor into a slot reserved by `reserve_fd*`.
     pub(crate) fn commit_reserved_fd(&mut self, fd: i32, desc: FileDescriptor) {
-        assert!(
-            self.fd_is_reserved(fd) && !self.fd_table.contains_key(&fd),
-            "R180-23: invalid or occupied FD reservation at commit"
-        );
-        let next_reserved_count = self
-            .fd_reservations_charged_count
-            .checked_sub(1)
-            .expect("R180-23: reservation charge underflow at commit");
-        let next_installed_count = self
-            .fds_charged_count
-            .checked_add(1)
-            .expect("R180-23: installed FD charge overflow at commit");
-
-        let cloexec = self.fd_cloexec_is_reserved(fd);
-        if let Err((_fd, _desc)) = self.fd_table.insert_unique_reserved(fd, desc) {
-            // The reservation owns an exact map slot. A failure here is ledger
-            // or local-state corruption after an irreversible VFS operation;
-            // returning an ordinary error would violate R180-23 atomicity.
-            panic!("R180-23: reserved FD backing/identity invariant failed at commit");
-        }
-        if cloexec {
-            match self.cloexec_fds.insert_reserved(fd) {
-                Ok(true) => {}
-                Ok(false) => panic!("R180-23: stale CLOEXEC marker preceded FD publication"),
-                Err(_) => panic!("R180-23: reserved CLOEXEC backing invariant failed at commit"),
-            }
-        }
-
-        let was_reserved = self.set_fd_reserved(fd, false);
-        assert!(
-            was_reserved,
-            "R180-23: committed FD lost its reservation bit"
-        );
-        let was_cloexec_reserved = self.set_fd_cloexec_reserved(fd, false);
-        assert_eq!(was_cloexec_reserved, cloexec);
-        self.fd_reservations_charged_count = next_reserved_count;
-        self.fds_charged_count = next_installed_count;
+        self.files.lock().commit_reserved_fd(fd, desc)
     }
 
     /// Cancel one reservation and return its files.max credit. Idempotent false
     /// on stale/mismatched tokens so a double-cancel cannot undercharge.
     pub fn cancel_fd_reservation(&mut self, fd: i32) -> bool {
-        if !self.fd_is_reserved(fd) || self.fd_reservations_charged_count == 0 {
-            return false;
-        }
-        if !self.set_fd_reserved(fd, false) {
-            return false;
-        }
-        let _ = self.set_fd_cloexec_reserved(fd, false);
-        self.fd_reservations_charged_count -= 1;
-        crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-        if self.fd_reservations_charged_count == 0 {
-            self.fd_table.reclaim_empty_capacity();
-        }
-        if self.pending_cloexec_reservations() == 0 {
-            self.cloexec_fds.reclaim_empty_capacity();
-        }
-        true
+        self.files.lock().cancel_fd_reservation(fd)
     }
 
     /// Installed plus in-flight open charges. Cgroup migration must move both
     /// before changing `cgroup_id`, otherwise reservation Drop would uncharge a
     /// different hierarchy from the one originally charged.
     pub fn total_fd_charge_count(&self) -> u64 {
-        self.fds_charged_count
-            .checked_add(self.fd_reservations_charged_count)
-            .expect("FD charge accounting overflow")
+        self.files.lock().total_fd_charge_count()
+    }
+
+    /// Re-point cgroup membership. The caller has already moved every movable
+    /// charge (including `total_fd_charge_count`) to `cgroup_id` under this
+    /// Process lock, so the fd table's charge owner moves in the same step.
+    /// A shared table is never re-pointed: cgroup migration is refused while
+    /// the address space (and so any CLONE_FILES table) is shared.
+    pub fn set_cgroup_id(&mut self, cgroup_id: crate::cgroup::CgroupId) {
+        self.cgroup_id = cgroup_id;
+        self.files.lock().charge_cgroup = cgroup_id;
+    }
+
+    /// Cgroup that owns this task's `files.max` charges.
+    pub fn fd_charge_cgroup(&self) -> crate::cgroup::CgroupId {
+        self.files.lock().charge_cgroup
     }
 
     pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Result<i32, FileDescriptor> {
@@ -3219,24 +3750,23 @@ impl Process {
         min_fd: i32,
         cloexec: bool,
     ) -> Result<i32, FileDescriptor> {
-        let Some(fd) = self.reserve_fd_from_with_cloexec(min_fd, cloexec) else {
-            return Err(desc);
-        };
-        match self.install_reserved_fd(fd, desc) {
-            Ok(()) => Ok(fd),
-            Err(desc) => {
-                let _ = self.cancel_fd_reservation(fd);
-                Err(desc)
-            }
-        }
+        let limit = self.effective_fd_limit();
+        self.files
+            .lock()
+            .allocate_fd_from_with_cloexec(desc, min_fd, cloexec, limit)
     }
 
     /// 获取指定 fd 对应的描述符引用
-    pub fn get_fd(&self, fd: i32) -> Option<&FileDescriptor> {
-        if fd < 0 || self.fd_is_reserved(fd) {
+    ///
+    /// GAP-5 slice 3: the returned `FdRef` holds the fd-table lock. Use it and
+    /// drop it before calling any other fd method on this task (the lock is
+    /// not reentrant); clone the descriptor (`try_clone_box`) to keep it.
+    pub fn get_fd(&self, fd: i32) -> Option<FdRef<'_>> {
+        let files = self.files.lock();
+        if fd < 0 || files.fd_is_reserved(fd) || !files.fd_table.contains_key(&fd) {
             return None;
         }
-        self.fd_table.get(&fd)
+        Some(FdRef { files, fd })
     }
 
     /// 移除并返回指定 fd 的描述符
@@ -3244,26 +3774,7 @@ impl Process {
     /// 关闭文件描述符时使用，描述符的 Drop 会自动处理资源清理
     /// R39-4 FIX: 同时清除 CLOEXEC 标记
     pub fn remove_fd(&mut self, fd: i32) -> Option<FileDescriptor> {
-        if fd < 0 || self.fd_is_reserved(fd) {
-            return None;
-        }
-        self.remove_cloexec_preserving_reservations(fd);
-        let removed = self.remove_fd_entry_preserving_reservations(fd);
-        if removed.is_some() {
-            crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-            self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
-        }
-
-        // U.S2-α FIX: Revoke CapId on close (refcounted; revoke only at 0).
-        // U.S3-B FIX: use the generic `FileOps::cap_id()` accessor instead of a
-        // `SocketFile` downcast, so EVERY cap-bearing fd kind (pipes/files in
-        // U.S2 SLICE-3+) rides this same last-close revocation without touching
-        // this function again. Non-bearing kinds return None (no-op).
-        if let Some(ref desc) = removed {
-            self.decrement_fd_cap(desc.as_ref());
-        }
-
-        removed
+        self.files.lock().remove_fd(fd, &self.cap_table)
     }
 
     /// U.S3-B: decrement the CapEntry refcount carried by `desc` (if any) and
@@ -3291,116 +3802,23 @@ impl Process {
     /// that re-locks (FileOps-like), the revoke must move outside the Process
     /// lock (R154-3/R169-4 class).
     pub(crate) fn decrement_fd_cap(&self, desc: &dyn FileOps) {
-        if let Some(cap_id) = desc.cap_id() {
-            let should_revoke = self.cap_table.decrement_refcount(cap_id).unwrap_or(false);
-            if should_revoke {
-                let _ = self.cap_table.revoke(cap_id);
-            }
-        }
+        decrement_fd_cap(&self.cap_table, desc)
     }
 
     /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
-    ///
-    /// # Arguments
-    /// * `fd` - 文件描述符
-    /// * `cloexec` - true 设置 CLOEXEC，false 清除
     pub fn set_fd_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), ()> {
-        if self.fd_is_reserved(fd) || !self.fd_table.contains_key(&fd) {
-            return Err(());
-        }
-        if cloexec {
-            if self.cloexec_fds.contains(&fd) {
-                return Ok(());
-            }
-            // Do not consume capacity promised to an in-flight O_CLOEXEC open.
-            let additional = self
-                .pending_cloexec_reservations()
-                .checked_add(1)
-                .ok_or(())?;
-            self.cloexec_fds
-                .ensure_capacity_for(additional)
-                .map_err(|_| ())?;
-            match self.cloexec_fds.insert_reserved(fd) {
-                Ok(true) => {}
-                Ok(false) => panic!("CLOEXEC marker appeared during locked publication"),
-                Err(_) => panic!("prepared CLOEXEC capacity disappeared during publication"),
-            }
-        } else {
-            self.remove_cloexec_preserving_reservations(fd);
-        }
-        Ok(())
+        self.files.lock().set_fd_cloexec(fd, cloexec)
     }
 
-    /// R39-4 FIX: 在 exec 期间关闭所有带 FD_CLOEXEC 的文件描述符
-    ///
-    /// SECURITY: 防止敏感句柄（如设备、管道）泄漏到 exec 后的新程序。
-    /// 这是 POSIX close-on-exec 语义的实现。
-    ///
-    /// # R169-4 FIX (HIGH, lock inversion): drop CLOEXEC FDs OUTSIDE the lock
-    ///
-    /// This runs with the Process lock held. The previous version dropped each
-    /// removed `FileDescriptor` INLINE (`fd_table.remove(&fd).is_some()`), so a
-    /// `SocketFile`'s `Drop` ran under the Process lock → socket `close` →
-    /// `wake_all` (re-locks PROCESS_TABLE + a foreign `Process::inner`) and
-    /// `uncharge_port_cgroup` (L5 `CGROUP_REGISTRY`). That is exactly the
-    /// Process→foreign-PCB lock inversion (R154-3/R155-3) that
-    /// `replace_fd_charged` was written to avoid, plus an L5-under-Process-lock
-    /// acquire (D1-CGROUP-IRQ-L5). Two concurrent execs each closing a socket
-    /// that wakes the other could ABBA-deadlock.
-    ///
-    /// Drains the close-on-exec descriptors into the caller-provided `removed`
-    /// buffer and returns the closed count. The CALLER MUST have pre-reserved
-    /// `removed` to at least the current `cloexec_fds.len()` (the exec caller
-    /// snapshots that count under this same lock hold, before any irreversible
-    /// exec mutation, and fails with ENOMEM if the reservation fails). Because
-    /// capacity is guaranteed and FD state is per-process (never Arc-shared,
-    /// even under `CLONE_FILES`) so nothing adds cloexec marks in between, every
-    /// `push` here is infallible and **no `FileDescriptor` is ever dropped
-    /// inline under the Process lock** — fully eliminating the lock-inversion
-    /// class for the cloexec-on-exec path, with no fatal-OOM residual.
-    ///
-    /// The `fds_charged_count` decrement is a Process-local field and stays
-    /// under the lock; the caller performs the L5 `uncharge_fds` and the actual
-    /// descriptor drops AFTER releasing the Process lock. The `cloexec_fds` set
-    /// is taken out with `mem::take` (which clears it and lets us iterate it
-    /// while mutating `fd_table`), replacing the prior infallible `.collect()`.
+    /// R39-4 / R169-4: drain the close-on-exec descriptors into the caller's
+    /// pre-reserved buffer under the fd-table lock; the caller uncharges and
+    /// drops them after releasing every lock. See `FdState::take_cloexec_fds_into`.
     #[must_use = "the returned closed count must be uncharged from the per-cgroup \
                   FD budget (L5) OUTSIDE the Process lock (R169-4)"]
     pub fn take_cloexec_fds_into(&mut self, removed: &mut Vec<FileDescriptor>) -> u64 {
-        let cloexec = core::mem::replace(
-            &mut self.cloexec_fds,
-            AdmittedSet::new(HeapClass::CoreProcess),
-        );
-        debug_assert!(
-            removed.capacity().saturating_sub(removed.len()) >= cloexec.len(),
-            "take_cloexec_fds_into: caller under-reserved the cloexec drop buffer"
-        );
-        let mut closed: u64 = 0;
-        for fd in cloexec.iter().copied() {
-            if let Some(desc) = self.remove_fd_entry_preserving_reservations(fd) {
-                // Stale cloexec entries for already-closed fds contribute 0
-                // (remove() == None), so the uncharge count stays exact.
-                closed += 1;
-                // U.S3-B FIX: decrement the removed fd's cap (revoke at 0).
-                // Without this, an fd marked close-on-exec via F_SETFD *after*
-                // creation (so its CapEntry never carried CapFlags::CLOEXEC)
-                // leaked its refcount at exec — the cap outlived every fd and
-                // the slot was permanently lost (TableFull DoS class, since the
-                // cap_table SURVIVES exec). Safe under the Process lock: leaf
-                // spinlock, plain-data drop (see decrement_fd_cap).
-                self.decrement_fd_cap(desc.as_ref());
-                // Infallible: the caller pre-reserved enough capacity, so this
-                // never reallocates and never drops `desc` inline under the lock.
-                removed.push(desc);
-            }
-        }
-        if closed > 0 {
-            self.fds_charged_count = self.fds_charged_count.saturating_sub(closed);
-        }
-        if self.fd_reservations_charged_count == 0 {
-            self.fd_table.reclaim_empty_capacity();
-        }
-        closed
+        self.files
+            .lock()
+            .take_cloexec_fds_into(removed, &self.cap_table)
     }
 
     /// J2-7: Install `desc` at a caller-chosen `fd` (dup2/dup3 semantics),
@@ -3431,82 +3849,10 @@ impl Process {
         desc: FileDescriptor,
         cloexec: bool,
     ) -> Result<Option<FileDescriptor>, FileDescriptor> {
-        if !(0..self.effective_fd_limit()).contains(&fd) || self.fd_is_reserved(fd) {
-            return Err(desc);
-        }
-        let occupied = self.fd_table.contains_key(&fd);
-        let had_cloexec = self.cloexec_fds.contains(&fd);
-        if !occupied {
-            // Net +1 — charge fail-closed BEFORE any mutation.
-            let Some(additional) = self
-                .pending_fd_reservations()
-                .and_then(|pending| pending.checked_add(1))
-            else {
-                return Err(desc);
-            };
-            if self.fd_table.ensure_capacity_for(additional).is_err() {
-                return Err(desc);
-            }
-            if crate::cgroup::try_charge_fds(self.cgroup_id, 1).is_err() {
-                return Err(desc);
-            }
-        }
-        if cloexec && !had_cloexec {
-            let Some(additional) = self.pending_cloexec_reservations().checked_add(1) else {
-                if !occupied {
-                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-                }
-                return Err(desc);
-            };
-            if self.cloexec_fds.ensure_capacity_for(additional).is_err() {
-                if !occupied {
-                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-                }
-                return Err(desc);
-            }
-        }
-        // Occupied → insert returns the old entry (its charge is reused, count
-        // unchanged); empty → returns None.
-        let displaced = if occupied {
-            self.fd_table
-                .try_insert(fd, desc)
-                .unwrap_or_else(|_| panic!("occupied FD replacement attempted allocation"))
-        } else {
-            match self.fd_table.insert_unique_reserved(fd, desc) {
-                Ok(()) => {
-                    self.fds_charged_count = self
-                        .fds_charged_count
-                        .checked_add(1)
-                        .expect("installed FD charge count overflow");
-                    None
-                }
-                Err((_fd, desc)) => {
-                    crate::cgroup::uncharge_fds(self.cgroup_id, 1);
-                    return Err(desc);
-                }
-            }
-        };
-        if cloexec {
-            if !had_cloexec {
-                match self.cloexec_fds.insert_reserved(fd) {
-                    Ok(true) => {}
-                    Ok(false) => panic!("dup CLOEXEC marker appeared without publication"),
-                    Err(_) => panic!("prepared dup CLOEXEC slot disappeared during publication"),
-                }
-            }
-        } else {
-            self.remove_cloexec_preserving_reservations(fd);
-        }
-        // U.S3-B FIX: the DISPLACED entry leaves fd_table here without passing
-        // through remove_fd, so its cap refcount must be decremented (revoke at
-        // 0) or every dup2/dup3 onto an occupied cap-bearing fd leaks a slot
-        // (TableFull DoS class). The displaced Box itself is still returned to
-        // the caller to DROP outside the Process lock (R155-3) — only the leaf
-        // cap accounting happens here.
-        if let Some(ref old) = displaced {
-            self.decrement_fd_cap(old.as_ref());
-        }
-        Ok(displaced)
+        let limit = self.effective_fd_limit();
+        self.files
+            .lock()
+            .replace_fd_charged_with_cloexec(fd, desc, cloexec, limit, &self.cap_table)
     }
 
     /// Exclusive numeric bound for new descriptors. Existing/inherited entries
@@ -3517,17 +3863,7 @@ impl Process {
 
     fn next_available_fd_from(&self, min_fd: i32) -> Option<i32> {
         let limit = self.effective_fd_limit();
-        if !(0..limit).contains(&min_fd) {
-            return None;
-        }
-        let mut fd = min_fd;
-        while fd < limit {
-            if !self.fd_table.contains_key(&fd) && !self.fd_is_reserved(fd) {
-                return Some(fd);
-            }
-            fd = fd.checked_add(1)?;
-        }
-        None // 已达到 fd 上限
+        self.files.lock().next_available_fd_from(min_fd, limit)
     }
 
     /// 重置时间片
@@ -4096,22 +4432,22 @@ pub fn run_ready_aging_self_test() {
 /// owned by in-flight open reservations as well as installed descriptors.
 pub fn run_fd_charge_migration_self_test() {
     let mut proc = Process::new(0x180_2301, 1, String::from("r180-23-fd-migration"), 120);
-    proc.fds_charged_count = 3;
-    proc.fd_reservations_charged_count = 2;
+    proc.files.lock().fds_charged_count = 3;
+    proc.files.lock().fd_reservations_charged_count = 2;
     assert_eq!(
         proc.total_fd_charge_count(),
         5,
         "migration must transfer installed and reserved FD charges"
     );
-    proc.fd_reservations_charged_count = 0;
+    proc.files.lock().fd_reservations_charged_count = 0;
     assert_eq!(proc.total_fd_charge_count(), 3);
 
     // F_DUPFD lower-bound scans include 0..2 when explicitly requested and
     // never collide with an in-flight open reservation.
     assert_eq!(proc.next_available_fd_from(0), Some(0));
-    assert!(!proc.set_fd_reserved(4, true));
+    assert!(!proc.files.lock().set_fd_reserved(4, true));
     assert_eq!(proc.next_available_fd_from(4), Some(5));
-    assert!(proc.set_fd_reserved(4, false));
+    assert!(proc.files.lock().set_fd_reserved(4, false));
     assert_eq!(proc.next_available_fd_from(4), Some(4));
     assert_eq!(proc.next_available_fd_from(MAX_FD), None);
 }
@@ -6373,10 +6709,15 @@ pub fn process_table_snapshot() -> Option<alloc::vec::Vec<ProcessId>> {
 /// not a reusable numeric TGID. The table lock still closes clone insertion.
 pub fn request_exit_group_atomic(
     caller_pid: ProcessId,
-    group_exit_token: &Arc<AtomicBool>,
+    group_exit_token: &Arc<ThreadGroup>,
     exit_code: i32,
 ) -> usize {
     let table = PROCESS_TABLE.lock();
+    // GAP-5 slice 4: `members` changes only under this lock and counts the
+    // caller, so a lone member has no sibling to mark and skips the scan.
+    if group_exit_token.members() <= 1 {
+        return 0;
+    }
     let mut marked = 0usize;
     let mut post = FatalExitPost::None;
     let now_tick = crate::get_ticks();
@@ -6387,7 +6728,7 @@ pub fn request_exit_group_atomic(
         }
         if let Some(proc_arc) = slot {
             let mut proc = proc_arc.lock();
-            if Arc::ptr_eq(&proc.thread_group_exiting, group_exit_token)
+            if Arc::ptr_eq(&proc.thread_group, group_exit_token)
                 && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
             {
                 let request = request_process_exit_locked(&mut proc, exit_code, now_tick);
@@ -6621,13 +6962,10 @@ pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
 /// RF178-35 executable state-matrix probe for fatal publication.
 pub fn run_fatal_exit_publication_self_test() {
     let mut proc = Process::new(0x178_3501, 1, String::from("rf178-35-fatal"), 120);
-    let group_token = Arc::clone(&proc.thread_group_exiting);
-    let unrelated_group_token = Arc::new(AtomicBool::new(false));
-    assert!(Arc::ptr_eq(&proc.thread_group_exiting, &group_token));
-    assert!(!Arc::ptr_eq(
-        &proc.thread_group_exiting,
-        &unrelated_group_token,
-    ));
+    let group_token = Arc::clone(&proc.thread_group);
+    let unrelated_group_token = Arc::new(ThreadGroup::new());
+    assert!(Arc::ptr_eq(&proc.thread_group, &group_token));
+    assert!(!Arc::ptr_eq(&proc.thread_group, &unrelated_group_token,));
     let live_states = [
         (ProcessState::Provisioning, false),
         (ProcessState::Provisioning, true),
@@ -7184,7 +7522,7 @@ mod standard_fd_tests {
         process.rlimits[RLIMIT_NOFILE].rlim_cur = 1;
         process.commit_reserved_fd(fd, descriptor);
         assert_eq!(process.get_fd(fd).unwrap().status_flags(), Ok(0));
-        assert!(process.cloexec_fds.contains(&fd));
+        assert!(process.files.lock().cloexec_fds.contains(&fd));
         let before = process.total_fd_charge_count();
         for target in [1, 10, MAX_FD, i32::MAX, -1] {
             let rejected =
@@ -7193,7 +7531,7 @@ mod standard_fd_tests {
             drop(process.replace_fd_charged(target, rejected).unwrap_err());
             assert_eq!(process.total_fd_charge_count(), before);
             assert_eq!(process.get_fd(fd).unwrap().status_flags(), Ok(0));
-            assert!(process.cloexec_fds.contains(&fd));
+            assert!(process.files.lock().cloexec_fds.contains(&fd));
         }
         let low = process.get_fd(fd).unwrap().try_clone_box().unwrap();
         assert_eq!(process.allocate_fd(low).unwrap(), 0);
@@ -7301,7 +7639,7 @@ mod standard_fd_tests {
         process.initialize_standard_fds().unwrap();
         assert_eq!(process.total_fd_charge_count(), 3);
         for fd in 0..3 {
-            let console = process
+            let console = *process
                 .get_fd(fd)
                 .unwrap()
                 .as_any()
@@ -7331,16 +7669,106 @@ mod standard_fd_tests {
     #[test]
     fn ksa005_bootstrap_admission_failure_is_atomic() {
         let mut process = fixture();
-        process.cgroup_id = u64::MAX;
+        process.set_cgroup_id(u64::MAX);
         assert!(process.initialize_standard_fds().is_err());
-        assert!(process.fd_table.is_empty());
+        assert!(process.files.lock().fd_table.is_empty());
         assert_eq!(process.total_fd_charge_count(), 0);
         assert_eq!(process.next_available_fd_from(0), Some(0));
-        process.cgroup_id = 0;
+        process.set_cgroup_id(0);
         process.initialize_standard_fds().unwrap();
         for fd in 0..3 {
             drop(process.remove_fd(fd).unwrap());
         }
+    }
+
+    #[test]
+    fn gap5_fd_charge_owner_follows_membership() {
+        let mut process = fixture();
+        assert_eq!(process.fd_charge_cgroup(), process.cgroup_id);
+        process.set_cgroup_id(u64::MAX);
+        assert_eq!(process.fd_charge_cgroup(), u64::MAX);
+        process.set_cgroup_id(0);
+        process.initialize_standard_fds().unwrap();
+        assert_eq!(process.fd_charge_cgroup(), 0);
+        assert_eq!(process.total_fd_charge_count(), 3);
+        for fd in 0..3 {
+            drop(process.remove_fd(fd).unwrap());
+        }
+        assert_eq!(process.total_fd_charge_count(), 0);
+    }
+
+    #[test]
+    fn gap5_shared_fd_table_is_one_table_with_one_charge() {
+        let mut first = fixture();
+        let mut second = fixture();
+        first.initialize_standard_fds().unwrap();
+        // CLONE_FILES: the second task takes the first one's table.
+        first.files.lock().add_owner();
+        second.files = Arc::clone(&first.files);
+        assert_eq!(first.files.lock().owners(), 2);
+
+        // A descriptor opened by one task is visible to, and closable by, the other.
+        let copy = first.get_fd(0).unwrap().try_clone_box().unwrap();
+        let fd = second.allocate_fd(copy).unwrap();
+        assert_eq!(fd, 3);
+        assert!(first.get_fd(fd).is_some());
+        assert_eq!(first.total_fd_charge_count(), 4);
+        assert_eq!(second.total_fd_charge_count(), 4);
+        drop(first.remove_fd(fd).unwrap());
+        assert!(second.get_fd(fd).is_none());
+        assert_eq!(second.total_fd_charge_count(), 3);
+
+        // Only the last owner tears the table down.
+        assert!(!first.files.lock().release_owner());
+        assert_eq!(second.files.lock().owners(), 1);
+        assert!(second.files.lock().release_owner());
+        second.files.lock().add_owner();
+        for fd in 0..3 {
+            drop(second.remove_fd(fd).unwrap());
+        }
+        assert_eq!(second.total_fd_charge_count(), 0);
+    }
+
+    #[test]
+    fn gap5_fd_charge_conserved_across_copy_drop_and_rollback() {
+        let mut parent = fixture();
+        parent.initialize_standard_fds().unwrap();
+        assert_eq!(parent.total_fd_charge_count(), 3);
+
+        // Copy: the child table is charged independently of the parent's.
+        let mut child = fixture();
+        for fd in 0..3 {
+            let cloned = parent.get_fd(fd).unwrap().try_clone_box().unwrap();
+            assert!(child
+                .replace_fd_charged_with_cloexec(fd, cloned, false)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(child.total_fd_charge_count(), 3);
+        assert_eq!(parent.total_fd_charge_count(), 3);
+
+        // Drop: closing the child's descriptors leaves the parent's charge intact.
+        for fd in 0..3 {
+            drop(child.remove_fd(fd).unwrap());
+        }
+        assert_eq!(child.total_fd_charge_count(), 0);
+        assert_eq!(parent.total_fd_charge_count(), 3);
+
+        // Rollback of a partial copy (failed clone) returns to baseline.
+        let mut failed = fixture();
+        for fd in 0..2 {
+            let cloned = parent.get_fd(fd).unwrap().try_clone_box().unwrap();
+            assert!(failed
+                .replace_fd_charged_with_cloexec(fd, cloned, false)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(failed.total_fd_charge_count(), 2);
+        for fd in 0..2 {
+            drop(failed.remove_fd(fd).unwrap());
+        }
+        assert_eq!(failed.total_fd_charge_count(), 0);
+        assert_eq!(parent.total_fd_charge_count(), 3);
     }
 
     #[test]
@@ -7356,20 +7784,27 @@ mod standard_fd_tests {
         let copy = parent.get_fd(1).unwrap().try_clone_box().unwrap();
         let duplicate = parent.allocate_fd(copy).unwrap();
         assert_eq!(duplicate, 3);
-        assert!(!parent.cloexec_fds.contains(&duplicate));
+        assert!(!parent.files.lock().cloexec_fds.contains(&duplicate));
         drop(parent.remove_fd(2).unwrap());
 
         let mut child = fixture();
-        assert!(child.fd_table.is_empty());
-        for (&fd, descriptor) in parent.fd_table.iter() {
-            let cloned = descriptor.try_clone_box().unwrap();
+        assert!(child.files.lock().fd_table.is_empty());
+        let mut snapshot = Vec::new();
+        {
+            let parent_files = parent.files.lock();
+            for (&fd, descriptor) in parent_files.fd_table.iter() {
+                let cloned = descriptor.try_clone_box().unwrap();
+                snapshot.push((fd, cloned, parent_files.cloexec_fds.contains(&fd)));
+            }
+        }
+        for (fd, cloned, cloexec) in snapshot {
             assert!(child
-                .replace_fd_charged_with_cloexec(fd, cloned, parent.cloexec_fds.contains(&fd))
+                .replace_fd_charged_with_cloexec(fd, cloned, cloexec)
                 .unwrap()
                 .is_none());
         }
         assert!(child.get_fd(2).is_none());
-        let mut removed = Vec::with_capacity(child.cloexec_fds.len());
+        let mut removed = Vec::with_capacity(child.files.lock().cloexec_fds.len());
         assert_eq!(child.take_cloexec_fds_into(&mut removed), 1);
         drop(removed);
         assert!(child.get_fd(1).is_none());
@@ -7860,7 +8295,7 @@ pub fn current_umask() -> Option<u16> {
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
-    Some(proc.umask)
+    Some(proc.fs.umask())
 }
 
 /// 设置当前进程的umask，返回旧的umask
@@ -7869,9 +8304,7 @@ pub fn set_current_umask(new_mask: u16) -> Option<u16> {
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let mut proc = slot.as_ref()?.lock();
-    let old = proc.umask;
-    proc.umask = new_mask & 0o777; // 只保留权限位
-    Some(old)
+    Some(proc.fs.set_umask(new_mask & 0o777)) // 只保留权限位
 }
 
 // ========== 能力表访问 ==========
@@ -8332,6 +8765,78 @@ fn prepare_clone_scheduler_add_process_with(
 }
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod thread_group_tests {
+    use super::*;
+
+    fn pcb(pid: ProcessId, ppid: ProcessId) -> ProcessArc {
+        Process::try_new_pcb(
+            pid,
+            ppid,
+            ProcessNameSnapshot::from_parts("g1-group", ""),
+            120,
+        )
+        .expect("G1 fixture pcb")
+    }
+
+    #[test]
+    fn gap5_g1_membership_and_single_report_claim() {
+        let group = ThreadGroup::new();
+        assert_eq!(group.members(), 1);
+        group.join_locked();
+        group.join_locked();
+        assert_eq!(group.members(), 3);
+        assert_eq!(group.leave_locked(), 2);
+        assert_eq!(group.leave_locked(), 1);
+        assert!(group.claim_parent_notification());
+        assert!(!group.claim_parent_notification());
+    }
+
+    #[test]
+    fn gap5_g1_last_thread_reports_a_torn_down_zombie_leader_once() {
+        mm::publish_heap_budgets();
+        let mut table = AdmittedVec::<Option<ProcessArc>>::new(HeapClass::CoreProcess);
+        table.try_reserve_exact(4).expect("G1 table");
+        for _ in 0..4 {
+            table
+                .push_reserved(None)
+                .unwrap_or_else(|_| panic!("G1 table slot"));
+        }
+        let leader = pcb(1, 7);
+        let thread = pcb(2, 0);
+        let group = Arc::clone(&leader.lock().thread_group);
+        {
+            let mut t = thread.lock();
+            t.tgid = 1;
+            t.thread_group = Arc::clone(&group);
+        }
+        group.join_locked();
+        *table.get_mut(1).unwrap() = Some(leader.clone());
+        *table.get_mut(2).unwrap() = Some(thread.clone());
+
+        // The leader is still running: the last thread leaving reports nothing.
+        assert_eq!(group.leave_locked(), 1);
+        assert_eq!(claim_group_exit_report_locked(&table, 1, &group), None);
+
+        // A zombie leader whose teardown is not published is not reportable.
+        leader.lock().state = ProcessState::Zombie;
+        assert_eq!(claim_group_exit_report_locked(&table, 1, &group), None);
+
+        // Torn down: reported to the leader's parent, exactly once.
+        leader.lock().teardown_done.store(true, Ordering::Release);
+        assert_eq!(claim_group_exit_report_locked(&table, 1, &group), Some(7));
+        assert_eq!(claim_group_exit_report_locked(&table, 1, &group), None);
+
+        // A different group at the leader's pid is never reported.
+        let other = Arc::new(ThreadGroup::new());
+        assert_eq!(claim_group_exit_report_locked(&table, 1, &other), None);
+
+        for pid in 0..4 {
+            *table.get_mut(pid).unwrap() = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
 mod clone_credential_admission_tests {
     extern crate std;
     use super::*;
@@ -8531,16 +9036,19 @@ pub(crate) mod child_creation_test_support {
                     .expect("uncharged inherited descriptor fixture")
             });
             {
-                let mut child = child.lock();
-                child
-                    .fd_table
-                    .ensure_capacity_for(descriptors.len())
-                    .unwrap();
-                for (fd, descriptor) in descriptors.into_iter().enumerate() {
-                    child
+                let child = child.lock();
+                {
+                    let mut files = child.files.lock();
+                    files
                         .fd_table
-                        .insert_unique_reserved(fd as i32, descriptor)
-                        .unwrap_or_else(|_| panic!("prepared inherited descriptor slot"));
+                        .ensure_capacity_for(descriptors.len())
+                        .unwrap();
+                    for (fd, descriptor) in descriptors.into_iter().enumerate() {
+                        files
+                            .fd_table
+                            .insert_unique_reserved(fd as i32, descriptor)
+                            .unwrap_or_else(|_| panic!("prepared inherited descriptor slot"));
+                    }
                 }
                 assert_eq!(child.total_fd_charge_count(), 0);
             }
@@ -8572,7 +9080,7 @@ pub(crate) mod child_creation_test_support {
             let (_, child_pid) = self.pids();
             assert!(get_process(child_pid).is_none());
             assert!(!self.parent.lock().children.contains(&child_pid));
-            assert!(self.child.lock().fd_table.is_empty());
+            assert!(self.child.lock().files.lock().fd_table.is_empty());
             assert_eq!(self.child.lock().total_fd_charge_count(), 0);
         }
     }
@@ -8783,7 +9291,7 @@ pub fn is_pending_irq_kill(pid: ProcessId) -> bool {
 /// briefly in userspace before the drain reaps it (Codex R171 slice-2 finding).
 /// A blocked-in-syscall task is never the target of `defer_irq_terminate` anyway
 /// (that fires from IRQ context against a RUNNING task), so this is also a
-/// no-op-removal in practice. `thread_group_exiting` is excluded for the same
+/// no-op-removal in practice. `thread_group.exiting` is excluded for the same
 /// epilogue-mismatch reason (it would yield a spurious EINTR that never
 /// terminates — a livelock).
 ///
@@ -9147,6 +9655,17 @@ pub fn drain_deferred_irq_terminates() {
 /// # Panics
 ///
 /// This function never returns (`-> !`).
+/// GAP-5 slice 4 G2: terminate the current task for a fatal outcome (fatal
+/// default signal, user fault, seccomp kill, bad signal frame) and end its
+/// whole thread group. Same contract as `terminate_self_and_halt`; plain
+/// `exit` keeps using that one and leaves sibling threads running.
+pub fn terminate_group_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
+    if let Some(process) = get_process(pid) {
+        process.lock().group_fatal = true;
+    }
+    terminate_self_and_halt(pid, exit_code)
+}
+
 pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     terminate_process(pid, exit_code);
 
@@ -9238,6 +9757,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let quota_debt: (crate::cgroup::CgroupId, u64);
         // G.1: Save watchdog handle for unregistration
         let watchdog_handle: Option<WatchdogHandle>;
+        // GAP-5 slice 4 G2: the group to end with this task, if its exit is fatal.
+        let fatal_group: Option<Arc<ThreadGroup>>;
         // RF184-1: Removed mmap_snapshot (allocation-free validation)
 
         {
@@ -9323,6 +9844,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             proc.cpu_quota_debt_ns = 0;
             // G.1: Take watchdog handle (process no longer needs it)
             watchdog_handle = proc.watchdog_handle.take();
+            fatal_group =
+                core::mem::take(&mut proc.group_fatal).then(|| Arc::clone(&proc.thread_group));
 
             // RF184-1 FIX: Removed mmap_snapshot to eliminate infallible allocation on exit.
             // Instead, validate clear_child_tid directly under mm lock at write time (below).
@@ -9345,6 +9868,15 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // pending_kill → defer; the direct terminate callers are
         // never-scheduled-child cleanups that are never deferred).
         clear_irq_kill_nonrunnable(pid);
+
+        // GAP-5 slice 4 G2: a fatal outcome ends the whole thread group. Publish
+        // `exiting` (no new thread can join) and post the same exit to every
+        // other live member, as exit_group does. Process context, no lock held;
+        // a lone member skips the table scan inside request_exit_group_atomic.
+        if let Some(group) = fatal_group {
+            group.exiting.store(true, Ordering::Release);
+            let _ = request_exit_group_atomic(pid, &group, exit_code);
+        }
 
         // HIGH-3 / U34-1: walk and release userspace robust futexes while the
         // dying task's address space is still retained. This callback is
@@ -9398,73 +9930,57 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
         // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
+        //
+        // GAP-5 slice 4 G3: no mmap-region gate. The RF184-1 gate accepted only
+        // words inside `mmap_regions`, but the tid word usually lives in `.bss`,
+        // `.data` or on a stack, so most exits skipped both the clear and the
+        // wake and a joiner waited forever. The write needs no such gate:
+        // - it runs under this task's own root (CR3 switched below), and
+        //   `copy_to_user_safe` validates the user range (MMAP_MIN_ADDR up to
+        //   the user top) before touching it;
+        // - a fault fails the copy through the exception table. A COW word is
+        //   resolved in the active (this task's) page table. Shared-anonymous
+        //   resolution declines when the active root is not the current
+        //   task's own (`handle_shared_page_fault`), because this path may run
+        //   for a task that is not current (deferred IRQ kill drain);
+        // - a concurrent munmap/mmap by a CLONE_VM sibling can only redirect the
+        //   write within that same address space, as on Linux.
+        // The futex wake runs only after the write succeeded.
         if clear_child_tid != 0 && memory_space != 0 {
-            // RF184-1 FIX: Validate clear_child_tid is still mapped before write, checking
-            // directly under mm lock to avoid infallible allocation on exit (R158-10 principle).
-            //
-            // SAFETY PROOF: Without this check, a concurrent munmap (under CLONE_VM) or exec
-            // could unmap the region before the write below. Writing to unmapped memory would:
-            // 1. Page-fault in kernel context (undefined behavior)
-            // 2. Potentially corrupt unrelated memory if remapped to something else
-            // 3. Leak the 0-write to a different process's mapping (privilege violation)
-            //
-            // We acquire the mm lock HERE (not earlier) to validate the address is within
-            // ANY mapped region. The lock is held briefly (O(log n) or O(n) scan), then
-            // released before the CR3 switch and write. A concurrent munmap after validation
-            // but before write is acceptable: worst case is writing 0 to a page about to be
-            // unmapped (still our address space, no cross-process corruption).
-            let addr_is_mapped = {
-                // Acquire Process lock then mm lock to safely read mmap_regions
-                let proc_guard = process.lock();
-                let mm_guard = proc_guard.mm.lock();
-                let addr = clear_child_tid as usize;
-                let result = mm_guard.mmap_regions.iter().any(|(base, entry)| {
-                    let len = crate::syscall::mmap_region_len(*entry);
-                    addr >= *base && addr < base.saturating_add(len)
-                });
-                // Explicitly drop locks before CR3 switch
-                drop(mm_guard);
-                drop(proc_guard);
-                result
+            let tid_addr = clear_child_tid as usize;
+
+            // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
+            // 注意：需要在正确的地址空间中执行
+            let cleared = unsafe {
+                use crate::usercopy::copy_to_user_safe;
+                use x86_64::registers::control::Cr3;
+                use x86_64::structures::paging::PhysFrame;
+                use x86_64::PhysAddr;
+
+                // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
+                // 1. Interrupt handlers running with the wrong page tables
+                // 2. Timer interrupts triggering rescheduling in foreign address space
+                // 3. KPTI context mismatch if interrupts load incorrect CR3
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    // 切换到目标进程的地址空间
+                    let current_cr3 = Cr3::read();
+                    let target_frame =
+                        PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+                    Cr3::write(target_frame, current_cr3.1);
+
+                    // P1-6 FIX: copy_to_user_safe creates its own UserAccessGuard.
+                    let zero = 0i32.to_ne_bytes();
+                    let written = copy_to_user_safe(tid_addr as *mut u8, &zero).is_ok();
+
+                    // 恢复原来的地址空间
+                    Cr3::write(current_cr3.0, current_cr3.1);
+                    written
+                })
             };
 
-            if addr_is_mapped {
-                // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
-                // 注意：需要在正确的地址空间中执行
-                unsafe {
-                    use crate::usercopy::copy_to_user_safe;
-                    use x86_64::registers::control::Cr3;
-                    use x86_64::structures::paging::PhysFrame;
-                    use x86_64::PhysAddr;
-
-                    // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
-                    // 1. Interrupt handlers running with the wrong page tables
-                    // 2. Timer interrupts triggering rescheduling in foreign address space
-                    // 3. KPTI context mismatch if interrupts load incorrect CR3
-                    x86_64::instructions::interrupts::without_interrupts(|| {
-                        // 切换到目标进程的地址空间
-                        let current_cr3 = Cr3::read();
-                        let target_frame =
-                            PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
-                        Cr3::write(target_frame, current_cr3.1);
-
-                        // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
-                        // P1-6 FIX: Removed redundant outer UserAccessGuard —
-                        // copy_to_user_safe creates its own guard internally.
-                        let tid_ptr = clear_child_tid as *mut u8;
-                        if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
-                            let zero = 0i32.to_ne_bytes();
-                            // 忽略写入错误（用户可能已 unmap 该地址）
-                            let _ = copy_to_user_safe(tid_ptr, &zero);
-                        }
-
-                        // 恢复原来的地址空间
-                        Cr3::write(current_cr3.0, current_cr3.1);
-                    });
-                }
-
+            if cleared {
                 // 唤醒等待在 clear_child_tid 地址上的 futex
-                let woken = notify_futex_wake(tgid, clear_child_tid as usize, 1);
+                let woken = notify_futex_wake(tgid, tid_addr, 1);
                 if woken > 0 {
                     // R102-L6 FIX: Gate address-revealing log behind debug_assertions
                     kprintln!(
@@ -9475,13 +9991,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     let _ = woken; // suppress unused warning in release
                 }
             } else {
-                // R184-1 FIX: Address is no longer mapped — skip the write and futex wake.
-                // This is the correct behavior: if the region was unmapped, any futex
-                // waiters on that address are already invalid (futex keys are tied to
-                // the mapping), so there's nothing to wake.
+                // The word is outside user space or the copy faulted (unmapped or
+                // not present): nothing was written, so nothing is woken.
                 #[cfg(debug_assertions)]
                 kprintln!(
-                    "[terminate_process] Skipping clear_child_tid write to unmapped 0x{:x}",
+                    "[terminate_process] clear_child_tid write to 0x{:x} failed; no wake",
                     clear_child_tid
                 );
             }
@@ -9503,39 +10017,262 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // store, every reaper gate (wait_process / cleanup_zombie / sys_wait4) sees
         // `teardown_done == false` and refuses to free the PCB — closing the
         // IRQ-deferred early-reap / teardown-bypass leak (R169-9 BREAK #1).
-        process.lock().teardown_done.store(true, Ordering::Release);
+        let group = {
+            let proc = process.lock();
+            proc.teardown_done.store(true, Ordering::Release);
+            Arc::clone(&proc.thread_group)
+        };
 
-        // R160-16 FIX: Deliver SIGCHLD to parent per POSIX. Previously only
-        // the waitpid wakeup path was used. SIGCHLD enables async notification
-        // for parents using signal handlers instead of blocking waitpid.
-        if parent_pid > 0 {
-            let _ = crate::signal::send_signal_kernel(parent_pid, crate::signal::Signal::SIGCHLD);
+        if tgid == pid {
+            // GAP-5 slice 4 G1: a group is reported once, when its last member
+            // is gone. Decided under PROCESS_TABLE after the teardown_done store
+            // above; `cleanup_zombie` of the last non-leader decides the other
+            // order under the same lock, and the claim makes it exactly once.
+            // A single-task process is its own last member and is reported here,
+            // as before (R160-16 SIGCHLD plus the parent wake).
+            let report = {
+                let _table = PROCESS_TABLE.lock();
+                group.members() == 1 && group.claim_parent_notification()
+            };
+            if report {
+                notify_parent_of_group_exit(parent_pid, pid);
+            }
+        } else {
+            // A non-leader thread has no parent to report to; the deferred
+            // drain reaps it once it has switched out.
+            mark_thread_autoreap(pid);
         }
+        // KSA-011: `group` and the other locals drop before the caller's
+        // terminal switch abandons this stack.
+        drop(group);
+    }
+}
 
-        // 唤醒等待此进程的父进程
-        let mut wake_parent = false;
+/// GAP-5 slice 4 G1: with `PROCESS_TABLE` held and the group's last non-leader
+/// just removed, claim the single report of the group's exit if the leader is a
+/// torn-down zombie of the same group. Returns the leader's parent.
+fn claim_group_exit_report_locked(
+    table: &AdmittedVec<Option<ProcessArc>>,
+    leader_pid: ProcessId,
+    group: &Arc<ThreadGroup>,
+) -> Option<ProcessId> {
+    let leader = table.get(leader_pid)?.as_ref()?;
+    let leader = leader.lock();
+    let reportable = Arc::ptr_eq(&leader.thread_group, group)
+        && leader.state == ProcessState::Zombie
+        && leader.teardown_done.load(Ordering::Acquire);
+    (reportable && group.claim_parent_notification()).then_some(leader.ppid)
+}
 
-        if parent_pid > 0 {
-            if let Some(parent) = get_process(parent_pid) {
-                let mut parent_proc = parent.lock();
-                let waiting = parent_proc.waiting_child;
-                // 父进程正在等待，且等待的是任意子进程(0)或此特定子进程
-                if parent_proc.state == ProcessState::Blocked
-                    && (waiting == Some(0) || waiting == Some(pid))
-                {
-                    parent_proc.enter_ready_at(crate::get_ticks());
-                    parent_proc.waiting_child = None;
-                    wake_parent = true;
+/// GAP-5 slice 4 G1: report a group's exit to `parent_pid` (R160-16 SIGCHLD)
+/// and wake it if it waits for any child or for `leader_pid`. Process context,
+/// no lock held. KSA-011: only requests a reschedule, never switches here.
+fn notify_parent_of_group_exit(parent_pid: ProcessId, leader_pid: ProcessId) {
+    if parent_pid == 0 {
+        return;
+    }
+    let _ = crate::signal::send_signal_kernel(parent_pid, crate::signal::Signal::SIGCHLD);
+
+    let mut wake_parent = false;
+    if let Some(parent) = get_process(parent_pid) {
+        let mut parent_proc = parent.lock();
+        let waiting = parent_proc.waiting_child;
+        // 父进程正在等待，且等待的是任意子进程(0)或此特定子进程
+        if parent_proc.state == ProcessState::Blocked
+            && (waiting == Some(0) || waiting == Some(leader_pid))
+        {
+            parent_proc.enter_ready_at(crate::get_ticks());
+            parent_proc.waiting_child = None;
+            wake_parent = true;
+        }
+    }
+    if wake_parent {
+        let _ = crate::signal::kernel_kick_reschedule();
+    }
+}
+
+/// GAP-5 slice 4 G7: the task of `pid`'s thread group that receives a
+/// process-directed signal whose mask bit is `bit`. Pending sets stay per task,
+/// so the choice is made at generation time: `pid` itself if it does not block
+/// the signal, else another live member that does not, else `pid` if it is
+/// still live (the signal waits there), else any live member. A single-task
+/// group returns `pid` without scanning. Call with no lock held.
+pub fn select_process_directed_target(pid: ProcessId, bit: u64) -> ProcessId {
+    let Some(process) = get_process(pid) else {
+        return pid;
+    };
+    let group = {
+        let proc = process.lock();
+        if proc.thread_group.members() <= 1 {
+            return pid;
+        }
+        Arc::clone(&proc.thread_group)
+    };
+    drop(process);
+
+    let table = PROCESS_TABLE.lock();
+    let mut preferred_live = false;
+    let mut first_unblocked = None;
+    let mut first_live = None;
+    for (member, slot) in table.iter().enumerate() {
+        let Some(arc) = slot else {
+            continue;
+        };
+        let proc = arc.lock();
+        if !Arc::ptr_eq(&proc.thread_group, &group)
+            || matches!(
+                proc.state,
+                ProcessState::Provisioning | ProcessState::Zombie | ProcessState::Terminated
+            )
+        {
+            continue;
+        }
+        let unblocked = proc.blocked & bit == 0;
+        drop(proc);
+        if member == pid {
+            if unblocked {
+                return pid;
+            }
+            preferred_live = true;
+        } else if unblocked && first_unblocked.is_none() {
+            first_unblocked = Some(member);
+        }
+        first_live.get_or_insert(member);
+    }
+    first_unblocked
+        .or(preferred_live.then_some(pid))
+        .or(first_live)
+        .unwrap_or(pid)
+}
+
+/// GAP-5 slice 4 G7: job control is process-wide. Carry a stop applied to `pid`
+/// (`resume == false`) or a SIGCONT resume (`resume == true`) to every other
+/// live member of its group. Returns whether a reschedule kick is needed. A
+/// single-task group does nothing. Call with no lock held.
+pub(crate) fn propagate_group_job_control(pid: ProcessId, resume: bool) -> bool {
+    let Some(process) = get_process(pid) else {
+        return false;
+    };
+    let group = {
+        let proc = process.lock();
+        if proc.thread_group.members() <= 1 {
+            return false;
+        }
+        Arc::clone(&proc.thread_group)
+    };
+    drop(process);
+
+    let table = PROCESS_TABLE.lock();
+    let mut kick = false;
+    for (member, slot) in table.iter().enumerate() {
+        if member == pid {
+            continue;
+        }
+        let Some(arc) = slot else {
+            continue;
+        };
+        let mut proc = arc.lock();
+        if !Arc::ptr_eq(&proc.thread_group, &group)
+            || matches!(
+                proc.state,
+                ProcessState::Provisioning | ProcessState::Zombie | ProcessState::Terminated
+            )
+        {
+            continue;
+        }
+        if resume {
+            let generation = proc.generation;
+            kick |= resume_job_control_locked(&mut proc, member, generation);
+        } else {
+            // A posted fatal exit wins over the stop (RF178-35 precedence).
+            let _ = try_mark_job_control_stopped_locked(&mut proc);
+        }
+    }
+    kick
+}
+
+/// GAP-5 slice 4 G1: one bit per PID for exited non-leader threads awaiting
+/// reap. Nothing else reaps them (`wait*` reaps leaders only), and a PID is not
+/// recycled before it is reaped, so a bit always names the same zombie.
+const THREAD_AUTOREAP_WORDS: usize = PID_MAX / 64 + 1;
+static THREAD_AUTOREAP: [AtomicU64; THREAD_AUTOREAP_WORDS] =
+    [const { AtomicU64::new(0) }; THREAD_AUTOREAP_WORDS];
+static THREAD_AUTOREAP_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn mark_thread_autoreap(pid: ProcessId) {
+    let Some(word) = THREAD_AUTOREAP.get(pid / 64) else {
+        // allocate_global_pid never exceeds PID_MAX; fail loudly in debug and
+        // leave the zombie for diagnosis rather than index out of bounds.
+        debug_assert!(false, "GAP-5 G1: thread pid {} beyond PID_MAX", pid);
+        return;
+    };
+    word.fetch_or(1u64 << (pid % 64), Ordering::AcqRel);
+    THREAD_AUTOREAP_PENDING.store(true, Ordering::Release);
+}
+
+/// GAP-5 slice 4 G1: reap exited non-leader threads. Runs from the
+/// process-context deferred drain (IRQs enabled, no lock held), never on the
+/// dying thread's own stack. A thread still switching out stays marked for the
+/// next drain.
+pub fn drain_thread_autoreap() {
+    if !THREAD_AUTOREAP_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let mut deferred = false;
+    for (word_index, word) in THREAD_AUTOREAP.iter().enumerate() {
+        let mut bits = word.load(Ordering::Acquire);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let mask = 1u64 << bit;
+            let pid = word_index * 64 + bit;
+
+            // A set bit always names a torn-down zombie non-leader: only
+            // terminate_process sets it, and only a drain that claimed it (below)
+            // reaps the task. The fallback arms therefore never clear a bit:
+            // between this check and a clear, the PID could be recycled into a
+            // new thread that sets it again.
+            let generation = match get_process(pid) {
+                None => continue,
+                Some(process) => {
+                    let proc = process.lock();
+                    if proc.tgid == pid || proc.state != ProcessState::Zombie {
+                        continue;
+                    }
+                    let ready = proc.teardown_done.load(Ordering::Acquire)
+                        && !proc.on_cpu.load(Ordering::Acquire)
+                        && !proc.switch_reap_pending.load(Ordering::Acquire);
+                    if !ready {
+                        deferred = true;
+                        continue;
+                    }
+                    proc.generation
                 }
+            };
+
+            // Claim: of several CPUs draining at once, only the one that clears
+            // the bit reaps. A drain whose stale snapshot still shows the bit
+            // must not reap a recycled PID (possibly an unrelated zombie leader
+            // its parent has yet to wait for).
+            if word.fetch_and(!mask, Ordering::AcqRel) & mask == 0 {
+                continue;
+            }
+            cleanup_zombie(pid);
+            // A refused reap leaves this same task (same generation) in place;
+            // mark it again rather than leak it. A different generation means
+            // the PID was reaped and reused, and is not ours to mark.
+            let still_ours = get_process(pid).is_some_and(|process| {
+                let proc = process.lock();
+                proc.generation == generation && proc.state == ProcessState::Zombie
+            });
+            if still_ours {
+                word.fetch_or(mask, Ordering::AcqRel);
+                deferred = true;
             }
         }
-
-        // KSA-011: request scheduling without switching from this frame. Its
-        // Process Arc and detached namespace/child vectors must be dropped
-        // before a terminal switch abandons the current stack permanently.
-        if wake_parent {
-            let _ = crate::signal::kernel_kick_reschedule();
-        }
+    }
+    if deferred {
+        THREAD_AUTOREAP_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -9919,10 +10656,13 @@ pub fn cleanup_zombie(pid: ProcessId) {
                     let proc = process.lock();
                     // R169-9: only a torn-down Zombie (teardown_done published) is
                     // reapable — block the IRQ-deferred early-reap before teardown.
+                    // GAP-5 slice 4 G1: a group leader also waits for its last
+                    // thread to be reaped (members counts the table, under it).
                     if proc.state == ProcessState::Zombie
                         && proc.teardown_done.load(Ordering::Acquire)
                         && !proc.on_cpu.load(Ordering::Acquire)
                         && !proc.switch_reap_pending.load(Ordering::Acquire)
+                        && (proc.tgid != pid || proc.thread_group.members() == 1)
                     {
                         (proc.memory_space, true)
                     } else {
@@ -9985,6 +10725,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
                         let tgid = proc.tgid;
                         let ipc_ns_id = proc.ipc_ns.id();
                         let cpuset_id = proc.cpuset_id;
+                        let group = Arc::clone(&proc.thread_group);
                         // RF180-3: reserve the numeric PID before PROCESS_TABLE
                         // becomes observable as empty.  Phase 2 clears it only
                         // after all raw-PID cleanup and scheduler removal finish.
@@ -9998,6 +10739,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
                             tgid,
                             ipc_ns_id,
                             cpuset_id,
+                            group,
                         ))
                     } else {
                         // Not a zombie anymore (concurrent state change); restore the slot
@@ -10012,25 +10754,42 @@ pub fn cleanup_zombie(pid: ProcessId) {
                 None
             }
         };
+        // GAP-5 slice 4 G1: membership follows the table slot. When the last
+        // non-leader leaves a group whose leader is already a torn-down zombie,
+        // this removal is what makes the group reportable to its parent.
+        let group_report = result
+            .as_ref()
+            .and_then(|(_, _, reaped_pid, _, tgid, _, _, group)| {
+                let remaining = group.leave_locked();
+                if *tgid == *reaped_pid || remaining != 1 {
+                    return None;
+                }
+                claim_group_exit_report_locked(&table, *tgid, group)
+            });
         let retired = result
             .as_ref()
             .and_then(|_| reclaim_empty_process_table(&mut table));
-        (result, retired)
+        (result.map(|info| (info, group_report)), retired)
     };
     // PROCESS_TABLE lock is released here.
     drop(retired_process_table);
 
     // Phase 2: Free resources and run cross-subsystem cleanup WITHOUT holding PROCESS_TABLE.
     if let Some((
-        process,
-        keep_address_space,
-        reaped_pid,
-        reaped_generation,
-        tgid,
-        ipc_ns_id,
-        cpuset_id,
+        (
+            process,
+            keep_address_space,
+            reaped_pid,
+            reaped_generation,
+            tgid,
+            ipc_ns_id,
+            cpuset_id,
+            group,
+        ),
+        group_report,
     )) = reap_info
     {
+        drop(group);
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
         // the table slot was cleared in Phase 1c.
@@ -10063,6 +10822,12 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // independently guarded by create_process's AlreadyMapped retry path.
         finish_reaping_identity(reaped_pid, tgid);
         klog!(Info, "Cleaned up zombie process {}", reaped_pid);
+
+        // GAP-5 slice 4 G1: report the group only after this thread is fully
+        // gone, so the parent's reap of the leader never overlaps it.
+        if let Some(parent_pid) = group_report {
+            notify_parent_of_group_exit(parent_pid, tgid);
+        }
     }
 }
 
@@ -10119,6 +10884,14 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
             if let Some(process) = slot.take() {
                 let mut proc = process.lock();
                 proc.state = ProcessState::Terminated;
+                // GAP-5 slice 4 G1: membership follows the table slot. A
+                // never-run thread leaves a group whose creator is still alive,
+                // so its removal can never be the group's last-member report.
+                let remaining = proc.thread_group.leave_locked();
+                debug_assert!(
+                    proc.tgid == pid || remaining >= 1,
+                    "GAP-5 G1: rolled-back thread emptied its group"
+                );
 
                 let memory_space = proc.memory_space;
                 // RF180-19 defense-in-depth: this is an error/OOM rollback path.
@@ -10374,51 +11147,75 @@ fn free_process_resources(
     // Socket destructors (close → wake_all) can lock other Process PCBs,
     // causing lock inversion if we drop while holding the caller's Process lock.
     // The extracted fds are returned; the caller drops them AFTER releasing the lock.
-    let fd_count = proc.fd_table.len();
-    let extracted_fds =
-        core::mem::replace(&mut proc.fd_table, AdmittedMap::new(HeapClass::CoreProcess));
-    proc.cloexec_fds.clear();
-
-    // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
-    // PCB is torn down. Load-bearing for CLONE_THREAD: the cap_table Arc is
-    // SHARED with surviving siblings, so a thread that exits without paying
-    // back its per-fd refcounts (bumped at the CLONE_FILES install, U.S3-A3)
-    // would strand every shared cap above 0 forever — the siblings' last
-    // close could then never revoke (permanent slot leak → TableFull DoS).
-    // For a non-shared table this is a harmless pre-drop of entries the table
-    // teardown would free anyway. Leaf-safe under the Process lock; the
-    // descriptor Boxes themselves still drop OUTSIDE the lock (R154-3).
-    for desc in extracted_fds.values() {
-        proc.decrement_fd_cap(desc.as_ref());
-    }
-
-    // J2-7: uncharge the per-cgroup FD budget. fd_table is PER-PROCESS (deep-
-    // copied, never Arc-shared even under CLONE_FILES), so this is UNGATED by
-    // keep_address_space/mm_shared (unlike the memory uncharge above). Uncharge
-    // exactly the running charged count — authoritative, and may differ from
-    // fd_count for a clone-error child that copied fds but failed before the
-    // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
-    // zero after, so a second teardown call uncharges nothing.
-    let total_fd_charges = proc
-        .fds_charged_count
-        .checked_add(proc.fd_reservations_charged_count)
-        .expect("FD charge accounting overflow");
-    if total_fd_charges > 0 {
-        crate::cgroup::uncharge_fds(proc.cgroup_id, total_fd_charges);
-    }
-    proc.fds_charged_count = 0;
-    proc.fd_reservations_charged_count = 0;
-    proc.fd_reservations.fill(0);
-    proc.fd_cloexec_reservations.fill(0);
-    // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
-    // to prevent leaking fd count, page table root addresses, and PID in release.
-    if fd_count > 0 {
-        kprintln!(
-            "  Closed {} file descriptors for process {}",
-            fd_count,
-            proc.pid
+    // GAP-5 slice 3: the whole teardown runs under the fd-table lock (leaf
+    // under this PCB lock); the extracted descriptors still drop outside both.
+    let files = Arc::clone(&proc.files);
+    let mut files = files.lock();
+    // GAP-5 slice 3 step 2: only the last task holding the table closes its
+    // descriptors and returns the charge; earlier owners leave both to their
+    // siblings. Decided under the table lock, so exactly one exit tears down.
+    // A repeated teardown of this task releases nothing a second time.
+    let last_owner = if core::mem::replace(&mut proc.files_released, true) {
+        false
+    } else {
+        files.release_owner()
+    };
+    let extracted_fds = if !last_owner {
+        drop(files);
+        AdmittedMap::new(HeapClass::CoreProcess)
+    } else {
+        let fd_count = files.fd_table.len();
+        let extracted_fds = core::mem::replace(
+            &mut files.fd_table,
+            AdmittedMap::new(HeapClass::CoreProcess),
         );
-    }
+        files.cloexec_fds.clear();
+
+        // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
+        // PCB is torn down. Load-bearing for CLONE_THREAD: the cap_table Arc is
+        // SHARED with surviving siblings, so a thread that exits without paying
+        // back its per-fd refcounts (bumped at the CLONE_FILES install, U.S3-A3)
+        // would strand every shared cap above 0 forever — the siblings' last
+        // close could then never revoke (permanent slot leak → TableFull DoS).
+        // For a non-shared table this is a harmless pre-drop of entries the table
+        // teardown would free anyway. Leaf-safe under the Process lock; the
+        // descriptor Boxes themselves still drop OUTSIDE the lock (R154-3).
+        for desc in extracted_fds.values() {
+            decrement_fd_cap(&proc.cap_table, desc.as_ref());
+        }
+
+        // J2-7: uncharge the per-cgroup FD budget. The charge is owned by the fd table
+        // and booked to `files.charge_cgroup`; only its last owner reaches this point
+        // (GAP-5 slice 3), so it is UNGATED by keep_address_space/mm_shared (unlike
+        // the memory uncharge above). Uncharge
+        // exactly the running charged count — authoritative, and may differ from
+        // fd_count for a clone-error child that copied fds but failed before the
+        // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
+        // zero after, so a second teardown call uncharges nothing.
+        debug_assert_eq!(
+            files.charge_cgroup, proc.cgroup_id,
+            "GAP-5: fd charge owner diverged from cgroup membership"
+        );
+        let total_fd_charges = files.total_fd_charge_count();
+        if total_fd_charges > 0 {
+            crate::cgroup::uncharge_fds(files.charge_cgroup, total_fd_charges);
+        }
+        files.fds_charged_count = 0;
+        files.fd_reservations_charged_count = 0;
+        files.fd_reservations.fill(0);
+        files.fd_cloexec_reservations.fill(0);
+        drop(files);
+        // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
+        // to prevent leaking fd count, page table root addresses, and PID in release.
+        if fd_count > 0 {
+            kprintln!(
+                "  Closed {} file descriptors for process {}",
+                fd_count,
+                proc.pid
+            );
+        }
+        extracted_fds
+    };
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
     // R24-1 fix: 检查是否有其他线程共享地址空间，只有在无共享引用时才释放
@@ -11430,6 +12227,11 @@ pub fn oom_kill(pid: ProcessId, generation: u64, exit_code: i32) -> bool {
     }
 
     let post = request_process_exit_locked(&mut proc, exit_code, crate::get_ticks());
+    // GAP-5 slice 4 G2: the threads share the victim's memory, so killing one
+    // frees nothing; its teardown ends the whole group.
+    if post != FatalExitPost::None {
+        proc.group_fatal = true;
+    }
     drop(proc);
     finish_process_exit_request(post)
 }

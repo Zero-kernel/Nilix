@@ -1085,9 +1085,8 @@ impl Vfs {
                 replacement.cwd = Some(handle);
             }
             let process = context.process.as_ref().ok_or(FsError::PermDenied)?;
-            let mut proc = process.lock();
-            if !proc.fs_context.matches(&context.fs)
-                || !Arc::ptr_eq(&proc.mount_ns, &context.namespace)
+            let proc = process.lock();
+            let published = if !Arc::ptr_eq(&proc.mount_ns, &context.namespace)
                 || !Arc::ptr_eq(&proc.user_ns, &context.user_namespace)
                 || !context
                     .authorization
@@ -1095,9 +1094,22 @@ impl Vfs {
                     .map(|auth| proc.credentials_match_authorization(auth))
                     .unwrap_or(false)
             {
-                return Err(FsError::Again);
+                Err(replacement)
+            } else {
+                // GAP-5 slice 2: the snapshot check and the store share one handle
+                // critical section, so a CLONE_FS sharer's chdir cannot interleave.
+                proc.fs.replace_if_matches(&context.fs, replacement)
+            };
+            drop(proc);
+            // Displaced or rejected directory handles are released only after
+            // the PCB lock, so a final directory drop never runs under it.
+            match published {
+                Ok(displaced) => displaced,
+                Err(rejected) => {
+                    drop(rejected);
+                    return Err(FsError::Again);
+                }
             }
-            core::mem::replace(&mut proc.fs_context, replacement)
         };
         drop(old);
         Ok(())
@@ -2213,7 +2225,10 @@ mod tests {
             120,
         )
         .unwrap();
-        process.lock().fs_context = vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap().fs;
+        process
+            .lock()
+            .fs
+            .replace(vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap().fs);
         let credentials = process.lock().shared_credentials();
         let authorization = credentials.begin_authorization();
         credentials.with_hosted_pending_writer(|| {
@@ -2233,11 +2248,14 @@ mod tests {
             .unwrap();
         });
         assert!(OperationContext::from_process(pid, process.clone(), None).is_ok());
-        process.lock().fs_context = kernel_core::fs_context::FsContextState {
-            root: None,
-            cwd: None,
-            generation: 0,
-        };
+        process
+            .lock()
+            .fs
+            .replace(kernel_core::fs_context::FsContextState {
+                root: None,
+                cwd: None,
+                generation: 0,
+            });
         assert!(matches!(
             OperationContext::from_process(pid, process, Some(&authorization)),
             Err(FsError::PermDenied)
@@ -2268,7 +2286,8 @@ mod tests {
         .unwrap();
         {
             let mut proc = process.lock();
-            proc.fs_context = vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap().fs;
+            proc.fs
+                .replace(vfs.trusted_context(&ROOT_MNT_NAMESPACE).unwrap().fs);
             proc.user_ns = namespace.clone();
         }
         assert!(matches!(

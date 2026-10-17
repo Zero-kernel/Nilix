@@ -3933,7 +3933,7 @@ pub fn syscall_dispatcher(
             // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
             // interrupts and switches to boot CR3 before halting, preventing timer
             // IRQ UAF on the zombie's stack/CR3.
-            terminate_self_and_halt(pid, 128 + 31);
+            crate::process::terminate_group_self_and_halt(pid, 128 + 31);
         }
         seccomp::SeccompAction::Trap => {
             increment_counter(TraceCounter::SyscallDenied, 1);
@@ -3959,7 +3959,7 @@ pub fn syscall_dispatcher(
             }
 
             // R117-1 FIX: Use centralized terminate_self_and_halt().
-            terminate_self_and_halt(pid, 128 + 31);
+            crate::process::terminate_group_self_and_halt(pid, 128 + 31);
         }
         seccomp::SeccompAction::Errno(e) => {
             increment_counter(TraceCounter::SyscallDenied, 1);
@@ -4103,6 +4103,9 @@ pub fn syscall_dispatcher(
         218 => sys_set_tid_address(arg0 as *mut i32),
         273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
+        // GAP-5 slice 4 G7: thread-directed signals.
+        200 => sys_tkill(arg0 as i32, arg1 as i32),
+        234 => sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),
         // M0 item 5: signal-handler delivery (sub-slice 1a).
         13 => sys_rt_sigaction(
             arg0 as i32,
@@ -4482,9 +4485,10 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             // R153-3 FIX: Publish thread-group "exiting" flag before marking
             // siblings. This prevents concurrent sys_clone(CLONE_THREAD) from
             // slipping in between this point and the atomic marking scan below.
-            proc.thread_group_exiting
+            proc.thread_group
+                .exiting
                 .store(true, core::sync::atomic::Ordering::Release);
-            (proc.tgid, Arc::clone(&proc.thread_group_exiting))
+            (proc.tgid, Arc::clone(&proc.thread_group))
         };
 
         // R152-10 FIX: Atomically mark all siblings under PROCESS_TABLE lock.
@@ -4616,6 +4620,11 @@ const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 /// 加入同一线程组
 const CLONE_THREAD: u64 = 0x0001_0000;
+/// Share System V semaphore undo state. This kernel has no SysV semaphores,
+/// so there is no undo list to share; accepted for musl's pthread_create.
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+/// Legacy flag, ignored by Linux since 2.6; musl still passes it.
+const CLONE_DETACHED: u64 = 0x0040_0000;
 /// 设置 TLS
 const CLONE_SETTLS: u64 = 0x0008_0000;
 /// 在父进程写入子 TID
@@ -4659,7 +4668,22 @@ const NON_VM_INCOMPATIBLE: u64 = CLONE_NEWNS
     | CLONE_SIGHAND
     | CLONE_THREAD;
 
-const SUPPORTED_CLONE_FLAGS: u64 = CLONE_VM
+#[cfg(not(feature = "thread_preview"))]
+const SUPPORTED_CLONE_FLAGS: u64 = BASE_CLONE_FLAGS;
+
+/// GAP-5 slice 4 step 7 preview: thread groups (CLONE_SIGHAND|CLONE_THREAD,
+/// which sys_clone requires to come with CLONE_VM) plus CLONE_FS and, inside a
+/// thread group only, CLONE_FILES sharing, for guest test builds only.
+#[cfg(feature = "thread_preview")]
+const SUPPORTED_CLONE_FLAGS: u64 = BASE_CLONE_FLAGS
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SYSVSEM
+    | CLONE_DETACHED;
+
+const BASE_CLONE_FLAGS: u64 = CLONE_VM
     | CLONE_SETTLS
     | CLONE_PARENT_SETTID
     | CLONE_CHILD_CLEARTID
@@ -4679,12 +4703,21 @@ fn clone_flags_supported(flags: u64) -> bool {
 mod rf186_clone_contract_tests {
     use super::*;
 
+    #[cfg(not(feature = "thread_preview"))]
     #[test]
     fn unsupported_sharing_flags_fail_closed() {
         for flag in [CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD] {
             assert!(!clone_flags_supported(CLONE_VM | flag));
         }
         assert!(clone_flags_supported(CLONE_VM | CLONE_SETTLS));
+    }
+
+    #[cfg(feature = "thread_preview")]
+    #[test]
+    fn thread_preview_admits_thread_sharing_flags() {
+        assert!(clone_flags_supported(
+            CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_FS | CLONE_FILES
+        ));
     }
 }
 
@@ -4745,6 +4778,13 @@ fn sys_clone(
         return Err(SyscallError::EINVAL);
     }
 
+    // GAP-5 slice 3: a shared fd table must come with the shared capability
+    // table its descriptors' cap ids refer to, which only CLONE_THREAD gives.
+    if flags & CLONE_FILES != 0 && flags & CLONE_THREAD == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let share_files = flags & CLONE_FILES != 0;
+
     // CLONE_THREAD 要求必须同时设置 CLONE_VM 和 CLONE_SIGHAND
     if flags & CLONE_THREAD != 0 {
         if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
@@ -4760,19 +4800,28 @@ fn sys_clone(
         }
 
         // R153-3 FIX: Reject CLONE_THREAD if the thread group is exiting.
-        // The shared thread_group_exiting flag is set by exit_group() BEFORE
+        // The shared thread_group.exiting flag is set by exit_group() BEFORE
         // the per-thread pending_kill scan, closing the TOCTOU window where
         // the caller hasn't been marked yet. Also check pending_kill as a
         // fallback for single-thread exit paths.
         {
             let parent = parent_arc.lock();
             if parent
-                .thread_group_exiting
+                .thread_group
+                .exiting
                 .load(core::sync::atomic::Ordering::Acquire)
                 || parent
                     .pending_kill
                     .load(core::sync::atomic::Ordering::Acquire)
             {
+                return Err(SyscallError::EINVAL);
+            }
+            // GAP-5 slice 4 G6: a thread lives in its group's PID namespace.
+            // After unshare(CLONE_NEWPID), pid_ns_for_children names a new
+            // namespace that cannot translate the group's tgid (Linux: EINVAL).
+            let same_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain)
+                .is_some_and(|ns| Arc::ptr_eq(&ns, &parent.pid_ns_for_children));
+            if !same_ns {
                 return Err(SyscallError::EINVAL);
             }
         }
@@ -4910,7 +4959,7 @@ fn sys_clone(
         parent_space,
         parent_user_memory_space, // H.3 KPTI: user CR3 root for CLONE_VM sharing
         parent_tgid,
-        parent_thread_group_exiting, // R153-3 FIX: shared exiting flag
+        parent_thread_group, // R153-3 FIX / GAP-5 G1: shared thread-group state
         parent_exec_in_progress, // P1-D: mid-exec gate for CLONE_VM (authoritative recheck below)
         parent_name,
         parent_priority,
@@ -4922,11 +4971,10 @@ fn sys_clone(
         parent_fs_base,
         parent_gs_base,
         parent_credentials_arc, // R39-3 FIX: 共享凭证 Arc
-        parent_umask,
-        parent_fs_context,
-        parent_rlimits,    // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
-        parent_sigactions, // M0 item 5: inherit signal dispositions (per-task copy)
-        parent_blocked,    // M0 item 5: inherit blocked mask
+        parent_fs,              // GAP-5 slice 2: root/cwd/umask handle (shared or copied below)
+        parent_rlimits,         // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
+        parent_sigactions,      // GAP-5: parent's disposition handle (shared or copied below)
+        parent_blocked,         // M0 item 5: inherit blocked mask
         parent_seccomp_state,
         parent_seccomp_generation,
         parent_pledge_state,
@@ -4943,6 +4991,7 @@ fn sys_clone(
         parent_fd_table_snapshot,     // R133-5 FIX: fd_table snapshot under parent lock
         parent_cloexec_snapshot,      // R169-L1 FIX: cloexec_fds snapshot under parent lock
         parent_cap_table_clone,       // R133-5 FIX: cap_table clone under parent lock
+        parent_files_table,           // GAP-5 slice 3: shared under CLONE_FILES
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -4958,14 +5007,23 @@ fn sys_clone(
         // and cap_table cloning, violating the parent→child lock order
         // used in enforce_lsm_task_fork().
         // R158-7 FIX (LOW): Fallible fd_table snapshot (bounded by MAX_FD).
+        // GAP-5 slice 3: both snapshots come from one fd-table critical section.
+        let parent_files = parent.files.lock();
         let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> = {
             let mut snap = Vec::new();
-            if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
+            // GAP-5 slice 3: a shared table needs no copy.
+            let source_len = if share_files {
+                0
+            } else {
+                parent_files.fd_table.len()
+            };
+            if snap.try_reserve_exact(source_len).is_err() {
+                drop(parent_files);
                 drop(parent);
                 return Err(SyscallError::ENOMEM);
             }
             let mut clone_failed = false;
-            for (&fd, desc) in parent.fd_table.iter() {
+            for (&fd, desc) in parent_files.fd_table.iter().take(source_len) {
                 let cloned = match desc.try_clone_box() {
                     Ok(cloned) => cloned,
                     Err(()) => {
@@ -4978,6 +5036,7 @@ fn sys_clone(
             if clone_failed {
                 // Socket/FileOps destructors may acquire foreign locks; never
                 // drop already-cloned descriptors under the parent PCB lock.
+                drop(parent_files);
                 drop(parent);
                 drop(snap);
                 return Err(SyscallError::ENOMEM);
@@ -4988,19 +5047,26 @@ fn sys_clone(
         // R169-L1 FIX: Snapshot cloexec_fds under the parent lock too (fallibly,
         // matching fd_snapshot), so a CLONE_FILES child inherits the parent's
         // close-on-exec marks instead of silently losing them (a latent CLOEXEC
-        // bypass that diverges from fork.rs). Reading parent.cloexec_fds at the
+        // bypass that diverges from fork.rs). Reading parent.files.cloexec_fds at the
         // child-setup site would re-acquire the parent lock = R133-5 child->parent
         // inversion; the bounded set is rebuilt into the child OUTSIDE the lock.
         let cloexec_snapshot: Vec<i32> = {
             let mut snap = Vec::new();
-            if snap.try_reserve_exact(parent.cloexec_fds.len()).is_err() {
+            let source_len = if share_files {
+                0
+            } else {
+                parent_files.cloexec_fds.len()
+            };
+            if snap.try_reserve_exact(source_len).is_err() {
+                drop(parent_files);
                 drop(parent);
                 drop(fd_snapshot);
                 return Err(SyscallError::ENOMEM);
             }
-            snap.extend(parent.cloexec_fds.iter().copied());
+            snap.extend(parent_files.cloexec_fds.iter().copied().take(source_len));
             snap
         };
+        drop(parent_files);
 
         let cap_clone = if flags & CLONE_THREAD != 0 {
             // Thread: share parent's cap_table (via Arc)
@@ -5037,8 +5103,8 @@ fn sys_clone(
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
-            parent.thread_group_exiting.clone(), // R153-3 FIX
-            parent_exec_in_progress,             // P1-D: mid-exec gate for CLONE_VM
+            parent.thread_group.clone(), // R153-3 FIX / GAP-5 G1
+            parent_exec_in_progress,     // P1-D: mid-exec gate for CLONE_VM
             crate::process::ProcessNameSnapshot::from_parts(
                 &parent.name,
                 if flags & CLONE_THREAD != 0 {
@@ -5055,11 +5121,10 @@ fn sys_clone(
             parent.user_stack,
             parent.fs_base,
             parent.gs_base,
-            parent.shared_credentials(), // R39-3 FIX: 获取凭证 Arc
-            parent.umask,
-            parent.fs_context.clone(),
+            parent.shared_credentials(),    // R39-3 FIX: 获取凭证 Arc
+            Arc::clone(&parent.fs),         // GAP-5: handle; shared under CLONE_FS
             parent.rlimits, // M0-6: [RLimit; N] is Copy — snapshot under parent lock
-            parent.sigactions, // M0 item 5: [SigAction; NSIG] is Copy
+            Arc::clone(&parent.sigactions), // GAP-5: handle; shared under CLONE_SIGHAND
             parent.blocked, // M0 item 5: u64 mask
             parent
                 .seccomp_state
@@ -5080,6 +5145,7 @@ fn sys_clone(
             fd_snapshot,                        // R133-5 FIX: fd_table snapshot
             cloexec_snapshot,                   // R169-L1 FIX: cloexec_fds snapshot
             cap_clone,                          // R133-5 FIX: cap_table clone
+            Arc::clone(&parent.files),          // GAP-5 slice 3: fd table handle
         )
     };
 
@@ -5379,8 +5445,9 @@ fn sys_clone(
         let parent = parent_arc.lock();
         parent.seccomp_installing
     };
-    let live_group_exiting =
-        parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire);
+    let live_group_exiting = parent_thread_group
+        .exiting
+        .load(core::sync::atomic::Ordering::Acquire);
 
     if (is_shared_space && (parent_seccomp_installing || live_seccomp_installing))
         || ((flags & CLONE_THREAD) != 0 && (parent_seccomp_installing || live_seccomp_installing))
@@ -5429,12 +5496,25 @@ fn sys_clone(
                     || !Arc::ptr_eq(&parent.pid_ns_for_children, &parent_pid_ns_for_children)
                     || parent.tgid != parent_tgid
                     || parent.seccomp_installing
-                    || parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire);
+                    || parent_thread_group
+                        .exiting
+                        .load(core::sync::atomic::Ordering::Acquire);
                 if !stale {
+                    // GAP-5 slice 4 G5: cache the group's namespace-local id;
+                    // the leader's own mapping disappears when it exits.
+                    let ns_tgid = if parent.ns_tgid != 0 {
+                        parent.ns_tgid
+                    } else {
+                        crate::pid_namespace::pid_in_owning_namespace(&parent.pid_ns_chain)
+                            .unwrap_or(0)
+                    };
                     let mut child = child_arc.lock();
                     child.tgid = parent_tgid;
+                    child.ns_tgid = ns_tgid;
                     child.is_thread = true;
-                    child.thread_group_exiting = Arc::clone(&parent_thread_group_exiting);
+                    child.thread_group = Arc::clone(&parent_thread_group);
+                    // GAP-5 slice 4 G1: PROCESS_TABLE is held here.
+                    parent_thread_group.join_locked();
                 }
                 stale
             }
@@ -5499,7 +5579,10 @@ fn sys_clone(
 
             // R153-3: re-check the shared atomic (no table re-entry) after tgid
             // publish — still race-free vs exit_group's set-before-scan protocol.
-            if parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire) {
+            if parent_thread_group
+                .exiting
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
                 child.state = ProcessState::Terminated;
                 drop(child);
                 drop(child_arc);
@@ -5703,20 +5786,35 @@ fn sys_clone(
 
         // Credential identity stays prepared until scheduler admission below
         // establishes Provisioning; the LSM check uses that same prepared Arc.
-        child.umask = parent_umask;
-        child.fs_context = parent_fs_context;
+        // GAP-5 slice 2: CLONE_FS shares the root/cwd/umask handle; otherwise the
+        // child's own admitted handle receives a copy. The displaced private
+        // handle is dropped with `displaced_sigactions`, after the child guard.
+        let displaced_fs = if flags & CLONE_FS != 0 {
+            Some(core::mem::replace(&mut child.fs, Arc::clone(&parent_fs)))
+        } else {
+            child.fs.copy_from(&parent_fs);
+            None
+        };
         // M0-6: inherit rlimits on the CLONE_VM/THREAD manual-construction path
         // (the non-CLONE_VM path goes through fork_inner, which copies them too).
         // Per-task copy = the documented M0 divergence from thread-group sharing.
         child.rlimits = parent_rlimits;
 
-        // M0 item 5: inherit signal dispositions + blocked mask on the manual
-        // CLONE_VM/THREAD path too (the non-CLONE_VM path goes through fork_inner).
-        // Per-task COPY even under CLONE_SIGHAND/CLONE_THREAD = the documented M0
-        // divergence from Linux's thread-group-shared disposition table (a future
-        // CLONE_SIGHAND slice will swap in a shared table). `saved_blocked` /
-        // `in_signal_handler` stay born-clean (handler scratch is never inherited).
-        child.sigactions = parent_sigactions;
+        // GAP-5 slice 1: CLONE_SIGHAND shares the parent's disposition table;
+        // otherwise the child's own (already admitted) table receives a copy.
+        // Only dispositions are shared: the blocked mask is copied per task and
+        // `saved_blocked` / `in_signal_handler` stay born-clean. The displaced
+        // private table is held in `displaced_sigactions` and dropped right
+        // after the child guard below (no final Arc drop under a PCB lock).
+        let displaced_sigactions = if flags & CLONE_SIGHAND != 0 {
+            Some(core::mem::replace(
+                &mut child.sigactions,
+                Arc::clone(&parent_sigactions),
+            ))
+        } else {
+            child.sigactions.copy_from(&parent_sigactions);
+            None
+        };
         child.blocked = parent_blocked;
 
         // RF180-1 FIX: publish the snapshotted sandbox state only while holding
@@ -5726,6 +5824,8 @@ fn sys_clone(
         // `seccomp_installing` was false again while the child still received
         // the stale pre-install filter stack.
         drop(child);
+        drop(displaced_sigactions);
+        drop(displaced_fs);
         let parent = parent_arc.lock();
         if parent.seccomp_installing || parent.seccomp_generation != parent_seccomp_generation {
             drop(parent);
@@ -5750,22 +5850,40 @@ fn sys_clone(
         // installation therefore cannot commit in the snapshot->publish gap.
         drop(parent);
 
+        // GAP-5 slice 3 step 3: CLONE_FILES (inside a thread group) shares the
+        // creator's table; the owner count makes the last exit close it. The
+        // child's own table being displaced is empty and was never published,
+        // so dropping it (at the end of this block) runs no descriptor drop.
+        let displaced_files = if share_files {
+            parent_files_table.lock().add_owner();
+            Some(core::mem::replace(
+                &mut child.files,
+                Arc::clone(&parent_files_table),
+            ))
+        } else {
+            None
+        };
+        drop(parent_files_table);
+
         // R133-5 FIX: Use pre-captured fd_table snapshot instead of re-acquiring
         // parent lock (which would create child→parent lock order inversion).
-        {
+        if !share_files {
             // R180-7/R180-19: admit both retained containers before consuming
             // any descriptor clone. Publication below is allocation-free; on
             // refusal the snapshots are dropped only after the PCB lock.
-            let storage_ready = child
+            let child_files = Arc::clone(&child.files);
+            let mut child_files = child_files.lock();
+            let storage_ready = child_files
                 .fd_table
                 .ensure_capacity_for(parent_fd_table_snapshot.len())
                 .and_then(|()| {
-                    child
+                    child_files
                         .cloexec_fds
                         .ensure_capacity_for(parent_cloexec_snapshot.len())
                 })
                 .is_ok();
             if !storage_ready {
+                drop(child_files);
                 child.state = ProcessState::Terminated;
                 child.memory_space = 0;
                 child.user_memory_space = 0;
@@ -5779,7 +5897,11 @@ fn sys_clone(
                 return Err(SyscallError::ENOMEM);
             }
             for (fd, desc) in parent_fd_table_snapshot {
-                if child.fd_table.insert_unique_reserved(fd, desc).is_err() {
+                if child_files
+                    .fd_table
+                    .insert_unique_reserved(fd, desc)
+                    .is_err()
+                {
                     panic!("prepared CLONE_FILES descriptor slot disappeared");
                 }
             }
@@ -5789,7 +5911,7 @@ fn sys_clone(
             // foreign lock is held. Matches fork.rs, closing the CLOEXEC-bypass
             // parity gap (VD-03) where a CLONE_FILES child silently lost CLOEXEC.
             for fd in parent_cloexec_snapshot {
-                if child.cloexec_fds.insert_reserved(fd).is_err() {
+                if child_files.cloexec_fds.insert_reserved(fd).is_err() {
                     panic!("prepared CLONE_FILES CLOEXEC slot disappeared");
                 }
             }
@@ -5812,8 +5934,10 @@ fn sys_clone(
         // Balanced at thread exit by free_process_resources' per-fd decrement
         // (U.S3-B), and on clone-abort by cleanup_unscheduled_process → the
         // same teardown path.
-        if flags & CLONE_THREAD != 0 {
-            for desc in child.fd_table.values() {
+        // A shared table installs no copies, so it adds no references.
+        if flags & CLONE_THREAD != 0 && !share_files {
+            let child_files = Arc::clone(&child.files);
+            for desc in child_files.lock().fd_table.values() {
                 if let Some(cid) = desc.cap_id() {
                     child.capability_increment_refcount(cid);
                 }
@@ -5980,7 +6104,7 @@ fn sys_clone(
 
     {
         let mut child = child_arc.lock();
-        child.cgroup_id = parent_cgroup_id;
+        child.set_cgroup_id(parent_cgroup_id);
         child.cpuset_id = parent_cpuset_id;
         child.allowed_cpus = parent_allowed_cpus;
     }
@@ -6096,9 +6220,13 @@ fn sys_clone(
     // J2-7: per-cgroup FD budget — batch-charge the child's copied fds. Only
     // CLONE_FILES populates the child fd_table (deep copy); otherwise it is empty
     // (count 0, a no-op). Charge to the child's now-attached cgroup.
-    let child_fd_count = {
+    // GAP-5 slice 3: a shared table is already charged to its owner cgroup.
+    let child_fd_count = if share_files {
+        0
+    } else {
         let child = child_arc.lock();
-        child.fd_table.len() as u64
+        let count = child.files.lock().fd_table.len() as u64;
+        count
     };
     if child_fd_count > 0 {
         // NOTE: This is the ONLY remaining error path after copy_to_user.
@@ -6115,7 +6243,17 @@ fn sys_clone(
             cleanup_unscheduled_process(child_pid);
             return Err(SyscallError::EAGAIN);
         }
-        child_arc.lock().fds_charged_count = child_fd_count;
+        child_arc.lock().files.lock().fds_charged_count = child_fd_count;
+    }
+
+    // GAP-5 slice 4 G1: a thread is not its creator's child. No rollback path
+    // remains (cleanup_unscheduled_process reads `ppid == 0` as "joined a
+    // cpuset", so this must follow the last one), and the child is not yet
+    // runnable. `ppid == 0` keeps it out of SIGCHLD, parent wakes and wait*;
+    // getppid reads the group leader instead.
+    if flags & CLONE_THREAD != 0 {
+        parent_arc.lock().children.retain(|&p| p != child_pid);
+        child_arc.lock().ppid = 0;
     }
 
     // Allocation-free publication of the already-reserved queue entry.
@@ -6316,10 +6454,17 @@ fn exec_from_bytes(
     // sibling threads are still executing, causing UAF/memory corruption.
     // Linux behavior: exec in multithreaded process kills other threads first,
     // but that requires complex thread group handling. For now, reject with EBUSY.
-    let (tgid, current_memory_space) = {
+    let (tgid, current_memory_space, files_owners) = {
         let proc = process.lock();
-        (proc.tgid, proc.memory_space)
+        let files_owners = proc.files.lock().owners();
+        (proc.tgid, proc.memory_space, files_owners)
     };
+    // GAP-5 slice 3: exec drains close-on-exec descriptors from the fd table;
+    // a table another task still holds must not change under it. Linux would
+    // unshare it; until that copy exists, refuse like the thread case below.
+    if files_owners > 1 {
+        return Err(SyscallError::EBUSY);
+    }
     let thread_count = thread_group_size(tgid);
     if thread_count > 1 {
         kprintln!(
@@ -6683,14 +6828,17 @@ fn exec_from_bytes(
         // cloexec-fd count BEFORE any irreversible exec mutation (capability
         // revocation at cap_table.apply_cloexec(), fd close). On allocation
         // failure we return ENOMEM here — nothing has been mutated yet, so the
-        // exec rolls back cleanly via space_guard. FD state is per-process
-        // (never Arc-shared, even under CLONE_FILES) and nothing in this lock
+        // exec rolls back cleanly via space_guard. The fd table is private
+        // (a future shared table is unshared before this; GAP-5 slice 3) and nothing in this lock
         // hold adds cloexec marks, so this capacity is EXACTLY sufficient for
         // take_cloexec_fds_into() below: every push fits without realloc,
         // guaranteeing no FileDescriptor ever drops inline under the Process
         // lock (the R169-4 lock-inversion class) — with no fatal-OOM residual.
         let mut cloexec_removed: Vec<crate::process::FileDescriptor> = Vec::new();
-        if cloexec_removed.try_reserve(proc.cloexec_fds.len()).is_err() {
+        if cloexec_removed
+            .try_reserve(proc.files.lock().cloexec_fds.len())
+            .is_err()
+        {
             return Err(SyscallError::ENOMEM);
         }
 
@@ -6929,7 +7077,7 @@ fn exec_from_bytes(
         // pre-reserved buffer (no inline drop) and capture the closed count +
         // owning cgroup, but DEFER the actual FileDescriptor drops and the L5
         // per-cgroup FD-budget uncharge to OUTSIDE this block (below the `};`).
-        let cloexec_cgroup_id = proc.cgroup_id;
+        let cloexec_cgroup_id = proc.fd_charge_cgroup();
         let cloexec_closed = proc.take_cloexec_fds_into(&mut cloexec_removed);
 
         proc.enter_ready_at(crate::get_ticks());
@@ -6945,7 +7093,16 @@ fn exec_from_bytes(
         // extracted to `reset_sigactions_for_exec` so its self-test is a TRUE witness of the
         // production reset, and the maybe_deliver_signal `exec_in_progress` tripwire (legs a/c
         // enforcement) can rely on it. See `reset_sigactions_for_exec`.
-        reset_sigactions_for_exec(&mut proc.sigactions);
+        // GAP-5: CLONE_SIGHAND implies CLONE_VM, and exec already refused any
+        // other task (zombies included) sharing this address space, so the
+        // disposition table is not shared by a live sibling here. Enabling
+        // CLONE_SIGHAND must add an unshare step before relaxing this assert.
+        debug_assert_eq!(Arc::strong_count(&proc.sigactions), 1);
+        {
+            let mut actions = proc.sigactions.lock();
+            reset_sigactions_for_exec(&mut actions);
+        }
+        proc.sigactions.note_mutation();
         proc.saved_blocked = 0;
         // Keep the active task-owned kernel-stack frame. Exec replaces user
         // memory, but SYSRET and return-time signal delivery still consume it.
@@ -7672,6 +7829,12 @@ where
     let mut resumed_from_block = false;
 
     loop {
+        // GAP-5 slice 4 G1: reap exited non-leader threads first. A group is
+        // reportable only once its last thread is reaped, and on a busy-waiting
+        // single CPU this loop may be the only process context left to run the
+        // drain (it already calls cleanup_zombie, so the context is the same).
+        crate::process::drain_thread_autoreap();
+
         // R171-F3 FIX: a pending kill interrupts wait() with EINTR instead of
         // re-blocking on children. Restore Ready + clear the waiting_child marker
         // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
@@ -7847,6 +8010,10 @@ where
                     selected_exists = true;
                     // R169-9: only reap a Zombie whose teardown has been published
                     // (teardown_done) — never before its cgroup/ns/futex teardown ran.
+                    // GAP-5 slice 4 G1: wait reaps only group leaders (non-leader
+                    // threads are auto-reaped), and a zombie leader only once it
+                    // is the last member. A lone zombie leader cannot gain
+                    // members, so this stays true through cleanup_zombie.
                     if child.state == ProcessState::Zombie
                         && child
                             .teardown_done
@@ -7855,6 +8022,8 @@ where
                         && !child
                             .switch_reap_pending
                             .load(core::sync::atomic::Ordering::Acquire)
+                        && child.tgid == *child_pid
+                        && child.thread_group.members() == 1
                     {
                         zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), view_pid));
                         break;
@@ -7995,11 +8164,20 @@ fn sys_getpid() -> SyscallResult {
 
     let ns_pid = {
         let proc = proc_arc.lock();
-        // F.1: Return the PID from the owning (leaf) namespace
-        // The last entry in pid_ns_chain is the owning namespace
-        // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
-        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
-            .ok_or(SyscallError::EFAULT)?
+        if proc.tgid != proc.pid {
+            // GAP-5 slice 4 G5: a thread reports its group's id, cached at
+            // creation in the shared namespace (0 = translation failed).
+            if proc.ns_tgid == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            proc.ns_tgid
+        } else {
+            // F.1: Return the PID from the owning (leaf) namespace
+            // The last entry in pid_ns_chain is the owning namespace
+            // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+            crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+                .ok_or(SyscallError::EFAULT)?
+        }
     };
 
     #[cfg(feature = "kcov")]
@@ -8021,11 +8199,23 @@ fn sys_getppid() -> SyscallResult {
     coverage::trace_pc(1120); // sys_getppid process resolved
 
     let proc = proc_arc.lock();
-    let parent_global_pid = proc.ppid;
+    let own_ppid = proc.ppid;
+    let tgid = proc.tgid;
+    let is_group_member = tgid != proc.pid;
 
     // F.1: Get owning namespace for translation
     let owning_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain);
     drop(proc); // Release lock before looking up parent
+
+    // GAP-5 slice 4 G5: a thread's parent is its group leader's parent, read
+    // from the leader so a later reparent of the group is visible to every
+    // thread. G1 keeps the leader PCB until the group is empty; if it is
+    // already gone the thread falls back to its own recorded parent.
+    let parent_global_pid = if is_group_member {
+        get_process(tgid).map_or(own_ppid, |leader| leader.lock().ppid)
+    } else {
+        own_ppid
+    };
 
     // If parent_pid is 0, the process has no parent (init)
     if parent_global_pid == 0 {
@@ -8183,26 +8373,77 @@ fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
 ///
 /// F.1 PID Namespace: The pid parameter is interpreted as a namespace-local PID.
 /// It is translated to a global PID using the caller's owning namespace.
+/// GAP-5 slice 4 G7: how a kill-family syscall addresses its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillTarget {
+    /// kill(2): process-directed; a thread group picks the receiving member.
+    Process,
+    /// tkill(2): exactly the named thread.
+    Thread,
+    /// tgkill(2): exactly the named thread, which must belong to this
+    /// thread group (namespace-local id).
+    ThreadInGroup(ProcessId),
+}
+
 fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
-    use crate::signal::{send_signal, signal_name, Signal};
+    kill_common(pid, sig, KillTarget::Process)
+}
+
+/// tkill(2). musl's raise() uses it with the caller's own tid.
+fn sys_tkill(tid: i32, sig: i32) -> SyscallResult {
+    if tid <= 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    kill_common(tid as ProcessId, sig, KillTarget::Thread)
+}
+
+/// tgkill(2).
+fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> SyscallResult {
+    if tgid <= 0 || tid <= 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    kill_common(
+        tid as ProcessId,
+        sig,
+        KillTarget::ThreadInGroup(tgid as ProcessId),
+    )
+}
+
+/// Shared authorization and delivery for kill, tkill and tgkill. Every check
+/// below (namespace translation, init protection, POSIX/user-namespace
+/// permission, LSM) applies to all three; only the final delivery differs.
+fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
+    use crate::signal::{send_signal, send_signal_thread, signal_name, Signal};
 
     let self_global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
     // F.1: Translate namespace-local PID to global PID
-    let target_global_pid = {
+    let owning_ns = {
         let self_proc = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
-        let owning_ns = {
-            let proc = self_proc.lock();
-            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
-        };
-        if let Some(ns) = owning_ns {
+        let proc = self_proc.lock();
+        crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+    };
+    let to_global = |local: ProcessId| -> Result<ProcessId, SyscallError> {
+        match &owning_ns {
             // Translate using caller's namespace
-            crate::pid_namespace::resolve_pid_in_namespace(&ns, pid).ok_or(SyscallError::ESRCH)?
-        } else {
+            Some(ns) => {
+                crate::pid_namespace::resolve_pid_in_namespace(ns, local).ok_or(SyscallError::ESRCH)
+            }
             // No namespace (root or early boot) - use PID directly
-            pid
+            None => Ok(local),
         }
     };
+    let target_global_pid = to_global(pid)?;
+
+    // GAP-5 slice 4 G7: tgkill names the group too; a tid outside it is ESRCH
+    // (it may have been recycled into another process).
+    if let KillTarget::ThreadInGroup(tgid) = mode {
+        let global_tgid = to_global(tgid)?;
+        let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
+        if target.lock().tgid != global_tgid {
+            return Err(SyscallError::ESRCH);
+        }
+    }
 
     // 【安全修复 Z-9】POSIX 权限检查（防御深度）
     // send_signal 也会进行相同检查，这里提前拒绝以提供更清晰的错误
@@ -8363,7 +8604,12 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     let signal = Signal::from_raw(sig)?;
 
     // 发送信号 (using global PID)
-    let _action = send_signal(target_global_pid, signal)?;
+    let _action = match mode {
+        KillTarget::Process => send_signal(target_global_pid, signal)?,
+        KillTarget::Thread | KillTarget::ThreadInGroup(_) => {
+            send_signal_thread(target_global_pid, signal)?
+        }
+    };
 
     // R101-2 FIX: Gate signal dispatch debug print behind debug_assertions.
     // R111-4 FIX: Remove target_global_pid from output to preserve PID namespace
@@ -8546,10 +8792,14 @@ fn sys_rt_sigaction(
     // Install + capture the old disposition. If a real handler is installed, trip the
     // monotonic global delivery hint so the syscall-return hook starts scanning.
     let old = {
-        let mut proc = proc_arc.lock();
-        let old = proc.sigactions[idx];
+        // GAP-5: the table may be shared by a CLONE_SIGHAND group; the table
+        // lock (PCB -> SignalTable leaf) makes read-old/write-new atomic.
+        let proc = proc_arc.lock();
+        let old = match new_act {
+            Some(na) => proc.sigactions.replace(idx, na),
+            None => proc.sigactions.get(idx),
+        };
         if let Some(na) = new_act {
-            proc.sigactions[idx] = na;
             if na.is_handler() {
                 crate::signal::note_handler_installed();
             }
@@ -8582,7 +8832,7 @@ fn sys_rt_sigreturn() -> SyscallResult {
 
     // Gate: must be inside a live handler frame. A forged rt_sigreturn is fatal.
     if !proc_arc.lock().in_signal_handler {
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
 
     // The ucontext VA == the user RSP at rt_sigreturn entry. Also read the live CPU
@@ -8594,7 +8844,7 @@ fn sys_rt_sigreturn() -> SyscallResult {
         (frame.rsp, u32::from_ne_bytes(m))
     }) {
         Some(v) => v,
-        None => terminate_self_and_halt(pid, 139),
+        None => crate::process::terminate_group_self_and_halt(pid, 139),
     };
 
     // One bulk copy of the sigcontext from the user stack; SROP-validate it.
@@ -8603,11 +8853,11 @@ fn sys_rt_sigreturn() -> SyscallResult {
         .unwrap_or(0);
     let mut mc = [0u8; crate::signal_frame::MCONTEXT_SIZE];
     if copy_from_user(&mut mc, mc_va as *const u8).is_err() {
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
     let restored = match crate::signal_frame::parse_and_validate_mcontext(&mc) {
         Ok(r) => r,
-        Err(()) => terminate_self_and_halt(pid, 139),
+        Err(()) => crate::process::terminate_group_self_and_halt(pid, 139),
     };
 
     // One bulk copy of the fpstate from the FIXED offset; mask MXCSR.
@@ -8616,7 +8866,7 @@ fn sys_rt_sigreturn() -> SyscallResult {
         .unwrap_or(0);
     let mut fxbuf = [0u8; 512];
     if copy_from_user(&mut fxbuf, fp_va as *const u8).is_err() {
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
     crate::signal_frame::sanitize_inbound_fxsave(&mut fxbuf, cpu_mxcsr_mask);
 
@@ -8642,7 +8892,7 @@ fn sys_rt_sigreturn() -> SyscallResult {
         fx.copy_from_slice(&fxbuf[..]);
     });
     if committed.is_none() {
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
 
     // Restore the pre-handler blocked mask + clear the handler-live state.
@@ -8675,7 +8925,7 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
         let Some(action) = pending_default_action(
             proc.pending_signals.bits(),
             proc.blocked,
-            &proc.sigactions,
+            &proc.sigactions.lock(),
             sig,
         ) else {
             return;
@@ -8702,7 +8952,7 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
     }
     drop(arc);
     if let Some(code) = exit_code {
-        terminate_self_and_halt(pid, code);
+        crate::process::terminate_group_self_and_halt(pid, code);
     }
     if stop {
         crate::process::wait_for_job_control_resume(pid, generation);
@@ -8930,7 +9180,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
 
     // Phase 1 (under the lock): select the lowest-numbered deliverable signal and
     // snapshot its disposition + the pre-delivery blocked mask.
-    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked) = {
+    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked, delivered_action) = {
         let mut proc = proc_arc.lock();
         // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION (leg enforcement, the single delivery
         // choke point). Delivery here writes a sigframe against the INTERRUPTED user RSP
@@ -8960,17 +9210,20 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             return;
         }
         crate::signal::discard_inert_pending(&mut proc);
+        // GAP-5: one coherent snapshot of the (possibly shared) table for the
+        // whole Phase-1 decision.
+        let actions = *proc.sigactions.lock();
         let sig = match crate::signal::select_for_delivery(
             proc.pending_signals.bits(),
             proc.blocked,
             proc.in_signal_handler,
-            &proc.sigactions,
+            &actions,
             crate::signal::DeliveryMode::AnyActionable,
         ) {
             Some(signal) => signal,
             None => return,
         };
-        match crate::signal::resolve_disposition(&proc.sigactions, sig) {
+        match crate::signal::resolve_disposition(&actions, sig) {
             crate::signal::Disposition::Handler {
                 handler,
                 flags,
@@ -8993,8 +9246,17 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
                 }
                 // R172-P6-F1: recompute the sigaction index from the selected signal (the
                 // former `bit` local was folded into select_lowest_deliverable).
-                let restorer = proc.sigactions[(sig.as_u8() - 1) as usize].restorer;
-                (sig, handler, restorer, mask, flags, proc.blocked)
+                let delivered_action = actions[(sig.as_u8() - 1) as usize];
+                let restorer = delivered_action.restorer;
+                (
+                    sig,
+                    handler,
+                    restorer,
+                    mask,
+                    flags,
+                    proc.blocked,
+                    delivered_action,
+                )
             }
             crate::signal::Disposition::Ignored => {
                 // (race: reset to SIG_IGN after queueing.) Drop the bit and stop.
@@ -9066,7 +9328,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack.layout_floor(ctx.rsp)) {
             Ok(l) => l,
             // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
-            Err(_) => terminate_self_and_halt(pid, 139),
+            Err(_) => crate::process::terminate_group_self_and_halt(pid, 139),
         };
     // D1RES-R1: heap-free staging — assembled in place into a kernel-stack buffer
     // (assemble_sigframe zero-fills it; the zero fill is load-bearing). Removes the
@@ -9084,7 +9346,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     .is_err()
     {
         // Corrupt layout (len mismatch) — same fatal disposition as a failed layout.
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
     // M0-7 SLICE 5: PRE-GROW the user stack to back the sigframe write
     // (Ring-0 writer #1 of 3). The sigframe writes to [frame_base, rsp), which may
@@ -9095,14 +9357,14 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         crate::elf_loader::user_stack_mapped_floor(),
     ) {
         if ensure_stack_backed(pid, layout.frame_base as usize).is_err() {
-            terminate_self_and_halt(pid, 139);
+            crate::process::terminate_group_self_and_halt(pid, 139);
         }
     }
     // A copy_to_user fault (unmapped / over-grown stack) is fatal SIGSEGV — NEVER
     // EFAULT back into the interrupted context, and NEVER a catchable SIGSEGV here
     // (that would recurse). The pending bit is still set; we do not return.
     if copy_to_user(layout.frame_base as *mut u8, &buf).is_err() {
-        terminate_self_and_halt(pid, 139);
+        crate::process::terminate_group_self_and_halt(pid, 139);
     }
 
     // Phase 3: COMMIT — redirect the live frame to the handler. Only AFTER this
@@ -9149,9 +9411,11 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         proc.in_signal_handler = true;
         // SA_RESETHAND (Codex review): a one-shot handler resets to SIG_DFL after
         // this single delivery; the next occurrence takes the default action.
+        // GAP-5: reset only the disposition this delivery used; a sibling's
+        // rt_sigaction installed during the unlocked Phase 2 must survive.
         if sa_flags & crate::signal::SA_RESETHAND != 0 {
-            proc.sigactions[(sig.as_u8() - 1) as usize] =
-                crate::signal::SigAction::default_action();
+            proc.sigactions
+                .reset_if_unchanged((sig.as_u8() - 1) as usize, delivered_action);
         }
     }
 
@@ -9346,18 +9610,24 @@ pub fn try_deliver_signal_on_irq_return(
             return None; // Exec in flight — defer.
         }
 
+        // GAP-5: IRQ context never spins on the (possibly shared) disposition
+        // table; a sibling holding it in process context defers delivery.
+        let Some(actions) = proc_guard.sigactions.try_snapshot() else {
+            crate::request_resched_from_irq();
+            return None;
+        };
         let sig = match crate::signal::select_for_delivery(
             proc_guard.pending_signals.bits() & !crate::signal::uncatchable_mask(),
             proc_guard.blocked,
             proc_guard.in_signal_handler,
-            &proc_guard.sigactions,
+            &actions,
             crate::signal::DeliveryMode::HandlerOnly,
         ) {
             Some(signal) => signal,
             None => return None,
         };
         let index = (sig.as_u8() - 1) as usize;
-        let sa = proc_guard.sigactions[index];
+        let sa = actions[index];
 
         // The IRQ hook is a handler-only fast path.  Default/ignored signals
         // stay on the normal safe-point path, where their default action or
@@ -9504,6 +9774,14 @@ pub fn try_deliver_signal_on_irq_return(
     };
     let index = (sig.as_u8() - 1) as usize;
     let stack_still_matches = resolve_sigframe_stack_irq(interrupted_rsp, &proc) == stack;
+    // GAP-5: hold the table (try-locked; IRQ context) across the recheck and
+    // the SA_RESETHAND commit so a sibling's rt_sigaction cannot interleave.
+    let sigactions = Arc::clone(&proc.sigactions);
+    let Some(mut actions) = sigactions.try_lock() else {
+        drop(proc);
+        crate::request_resched_from_irq();
+        return None;
+    };
     let snapshot_still_valid = proc.pid as u64 == pid
         && proc.generation == generation
         && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
@@ -9514,9 +9792,10 @@ pub fn try_deliver_signal_on_irq_return(
         && !proc.exec_in_progress
         && proc.pending_signals.is_pending(sig)
         && proc.blocked == old_blocked
-        && proc.sigactions[index] == sa
+        && actions[index] == sa
         && stack_still_matches;
     if !snapshot_still_valid {
+        drop(actions);
         // R188-U09-2 FIX: The usercopy completed against a snapshot that is no
         // longer authoritative.  Never redirect with stale signal metadata;
         // leave the pending state untouched and retry at a later IRQ/safe point.
@@ -9533,9 +9812,15 @@ pub fn try_deliver_signal_on_irq_return(
     proc.blocked = newmask & !crate::signal::uncatchable_mask();
     proc.in_signal_handler = true;
     if sa_flags & crate::signal::SA_RESETHAND != 0 {
-        proc.sigactions[(sig.as_u8() - 1) as usize] = crate::signal::SigAction::default_action();
+        actions[index] = crate::signal::SigAction::default_action();
+        drop(actions);
+        sigactions.note_mutation();
+    } else {
+        drop(actions);
     }
     drop(proc);
+    // The PCB still owns a reference, so this is never the final drop.
+    drop(sigactions);
 
     // Return the redirect target: (handler RIP, frame_base RSP, sanitized RFLAGS).
     Some((handler, frame_base, new_rflags))
@@ -9844,7 +10129,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     // Snapshot tgid and current mount namespace before validation/LSM work
     let (tgid, current_mount_ns, fs_context) = {
         let proc = proc_arc.lock();
-        (proc.tgid, proc.mount_ns.clone(), proc.fs_context.clone())
+        (proc.tgid, proc.mount_ns.clone(), proc.fs.state())
     };
 
     // R74-3: Early thread-count validation (non-authoritative, just fail-fast)
@@ -9967,22 +10252,32 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         }
 
         // Revalidate the source: identity and the namespace we authorized against.
-        if proc.tgid != tgid
-            || !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns)
-            || !proc.fs_context.matches(&fs_context)
-        {
+        if proc.tgid != tgid || !Arc::ptr_eq(&proc.mount_ns, &current_mount_ns) {
             return Ok(Err(SyscallError::EAGAIN));
         }
+        // GAP-5 slice 2: a root/cwd handle shared with another task (CLONE_FS)
+        // would carry this switch into it, so refuse like Linux (fs->users > 1).
+        if Arc::strong_count(&proc.fs) > 1 {
+            return Ok(Err(SyscallError::EINVAL));
+        }
+        // Revalidate and publish root/cwd in one handle critical section
+        // (PCB -> handle leaf), before any other field is touched.
+        let displaced_fs = match proc.fs.replace_if_matches(
+            &fs_context,
+            prepared_fs.take().expect("prepared setns filesystem state"),
+        ) {
+            Ok(displaced) => displaced,
+            Err(rejected) => {
+                prepared_fs = Some(rejected);
+                return Ok(Err(SyscallError::EAGAIN));
+            }
+        };
 
         // Publication. Infallible: `Arc::clone` only bumps a refcount, and the
         // displaced Arcs are handed back so their Drop runs outside the table lock.
         let displaced_self = core::mem::replace(&mut proc.mount_ns, target_ns.clone());
         let displaced_children =
             core::mem::replace(&mut proc.mount_ns_for_children, target_ns.clone());
-        let displaced_fs = core::mem::replace(
-            &mut proc.fs_context,
-            prepared_fs.take().expect("prepared setns filesystem state"),
-        );
         Ok(Ok((displaced_self, displaced_children, displaced_fs)))
     });
 
@@ -10719,9 +11014,9 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             let min_fd = arg as i32;
 
             // Get the source fd
-            let source_desc = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-
-            let cloned_desc = source_desc
+            let cloned_desc = proc
+                .get_fd(fd)
+                .ok_or(SyscallError::EBADF)?
                 .try_clone_box()
                 .map_err(|_| SyscallError::ENOMEM)?;
             // One Process transaction chooses the lowest non-published and
@@ -10759,7 +11054,7 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             // Check if fd exists
             proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-            if proc.cloexec_fds.contains(&fd) {
+            if proc.files.lock().cloexec_fds.contains(&fd) {
                 Ok(FD_CLOEXEC as usize)
             } else {
                 Ok(0)
@@ -11733,10 +12028,12 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         // Same clone_box() pattern as R130-2 sys_lseek fix.
         let fd_obj = {
             let proc = process.lock();
-            proc.get_fd(fd)
+            let cloned = proc
+                .get_fd(fd)
                 .ok_or(SyscallError::EBADF)?
                 .try_clone_box()
-                .map_err(|_| SyscallError::ENOMEM)?
+                .map_err(|_| SyscallError::ENOMEM)?;
+            cloned
         };
         // Process lock released here — safe for VFS/procfs operations
         fd_obj.stat()?
@@ -11782,10 +12079,12 @@ fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     // Follows the same pattern as vfs_readdir_callback and vfs_truncate_callback.
     let file_ops = {
         let proc = process.lock();
-        proc.get_fd(fd)
+        let cloned = proc
+            .get_fd(fd)
             .ok_or(SyscallError::EBADF)?
             .try_clone_box()
-            .map_err(|_| SyscallError::ENOMEM)?
+            .map_err(|_| SyscallError::ENOMEM)?;
+        cloned
     };
     // Process lock released here — safe for VFS operations
 
@@ -17977,10 +18276,12 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     } else {
         let fd = {
             let proc = process.lock();
-            proc.get_fd(dirfd)
+            let cloned = proc
+                .get_fd(dirfd)
                 .ok_or(SyscallError::EBADF)?
                 .try_clone_box()
-                .map_err(|_| SyscallError::ENOMEM)?
+                .map_err(|_| SyscallError::ENOMEM)?;
+            cloned
         };
         if !is_directory_mode(fd.stat()?.mode) {
             return Err(SyscallError::ENOTDIR);
@@ -18070,8 +18371,11 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
     let mut proc = proc_arc.lock();
 
-    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-    let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
+    let cloned = proc
+        .get_fd(oldfd)
+        .ok_or(SyscallError::EBADF)?
+        .try_clone_box()
+        .map_err(|_| SyscallError::ENOMEM)?;
     let newfd = match proc.allocate_fd_with_cloexec(cloned, false) {
         Ok(fd) => fd,
         Err(rejected) => {
@@ -18127,8 +18431,11 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         if newfd >= proc.effective_fd_limit() {
             return Err(SyscallError::EBADF);
         }
-        let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-        let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
+        let cloned = proc
+            .get_fd(oldfd)
+            .ok_or(SyscallError::EBADF)?
+            .try_clone_box()
+            .map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert):
         // empty newfd → charge +1 (EMFILE on over-budget, table untouched);
         // occupied newfd → net 0, reuses the replaced entry's charge.
@@ -18188,8 +18495,11 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
         if newfd >= proc.effective_fd_limit() {
             return Err(SyscallError::EBADF);
         }
-        let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-        let cloned = src.try_clone_box().map_err(|_| SyscallError::ENOMEM)?;
+        let cloned = proc
+            .get_fd(oldfd)
+            .ok_or(SyscallError::EBADF)?
+            .try_clone_box()
+            .map_err(|_| SyscallError::ENOMEM)?;
         // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert).
         // replace_fd_charged clears CLOEXEC on newfd; re-set it below if requested.
         // (It also pays back the DISPLACED entry's cap refcount — U.S3-B.)
@@ -20778,7 +21088,7 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         crate::current_timestamp_ms().saturating_mul(1_000_000),
     );
 
-    proc.cgroup_id = cgroup_id;
+    proc.set_cgroup_id(cgroup_id);
     drop(proc);
     let _ = audit::emit_cgroup_governance_event(
         get_audit_subject(),
@@ -21646,10 +21956,11 @@ fn poll_classify(p: &crate::process::Process, fd: i32) -> FdKind {
     if fd < 0 {
         return FdKind::Skip;
     }
-    if let Some(console) = p
-        .get_fd(fd)
-        .and_then(|ops| ops.as_any().downcast_ref::<crate::process::ConsoleFile>())
-    {
+    if let Some(console) = p.get_fd(fd).and_then(|ops| {
+        ops.as_any()
+            .downcast_ref::<crate::process::ConsoleFile>()
+            .copied()
+    }) {
         return if console.readable {
             FdKind::Stdin
         } else {

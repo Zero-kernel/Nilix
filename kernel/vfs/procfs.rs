@@ -2079,11 +2079,12 @@ fn try_format_content(args: core::fmt::Arguments<'_>) -> Result<AdmittedString, 
 /// R29-1 FIX: Now returns actual FD list from process
 fn list_process_fds(process: &BoundProcess) -> Result<AdmittedVec<u32>, FsError> {
     let process = process.lock();
+    let files = process.files.lock();
     let mut snapshot = AdmittedVec::new(HeapClass::Procfs);
     snapshot
-        .try_reserve_exact(process.fd_table.len())
+        .try_reserve_exact(files.fd_table.len())
         .map_err(|_| FsError::NoSpace)?;
-    for fd in process.fd_table.keys().copied() {
+    for fd in files.fd_table.keys().copied() {
         snapshot
             .push_reserved(fd as u32)
             .map_err(|_| FsError::NoSpace)?;
@@ -2096,7 +2097,8 @@ fn list_process_fds(process: &BoundProcess) -> Result<AdmittedVec<u32>, FsError>
 /// R29-1 FIX: Now returns actual FD type from process
 fn get_fd_target(process: &BoundProcess, fd: u32) -> Result<AdmittedString, FsError> {
     let process = process.lock();
-    match process.fd_table.get(&(fd as i32)) {
+    let files = process.files.lock();
+    match files.fd_table.get(&(fd as i32)) {
         Some(fd_obj) => AdmittedString::try_from_str(HeapClass::Procfs, fd_obj.type_name())
             .map_err(|_| FsError::NoSpace),
         None => Ok(AdmittedString::new(HeapClass::Procfs)),
@@ -2141,7 +2143,7 @@ fn generate_status(
         StatusSnap {
             name: AdmittedString::try_from_str(HeapClass::Procfs, process.name.as_str())
                 .map_err(|_| FsError::NoSpace)?,
-            umask: process.umask,
+            umask: process.fs.umask(),
             state_char,
             state_name,
             tgid: process.tgid,

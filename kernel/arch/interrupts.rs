@@ -706,7 +706,8 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
         // tables and kernel stack while this CPU is still executing the IRET path.
         // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
         // interrupts and switches to boot CR3 before halting.
-        kernel_core::process::terminate_self_and_halt(pid, exit_code);
+        // GAP-5 slice 4 G2: a fatal user exception ends the whole thread group.
+        kernel_core::process::terminate_group_self_and_halt(pid, exit_code);
     }
 
     // No current PID despite CS.RPL==3: this is a kernel bug (orphaned user-mode
@@ -1390,7 +1391,8 @@ extern "x86-interrupt" fn page_fault_handler(
             // R117-1 FIX: Use centralized terminate_self_and_halt().
             // SAFETY: USER_MODE proves this page fault crossed from Ring 3.
             unsafe { enter_kernel_state_from_user_exception() };
-            kernel_core::process::terminate_self_and_halt(pid, 139);
+            // GAP-5 slice 4 G2: SIGSEGV ends the whole thread group.
+            kernel_core::process::terminate_group_self_and_halt(pid, 139);
         }
     }
 

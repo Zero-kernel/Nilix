@@ -42,8 +42,8 @@ impl OperationContext {
                 proc.shared_credentials(),
                 proc.mount_ns.clone(),
                 proc.user_ns.clone(),
-                proc.fs_context.clone(),
-                proc.umask,
+                proc.fs.state(),
+                proc.fs.umask(),
                 proc.tgid,
             )
         };
@@ -59,7 +59,7 @@ impl OperationContext {
             if !proc.credentials_match_authorization(&authorization)
                 || !Arc::ptr_eq(&proc.mount_ns, &namespace)
                 || !Arc::ptr_eq(&proc.user_ns, &user_namespace)
-                || !proc.fs_context.matches(&fs)
+                || !proc.fs.matches(&fs)
             {
                 return Err(FsError::PermDenied);
             }
@@ -164,7 +164,7 @@ impl OperationContext {
                 .unwrap_or(false)
                 || !Arc::ptr_eq(&proc.mount_ns, &self.namespace)
                 || !Arc::ptr_eq(&proc.user_ns, &self.user_namespace)
-                || !proc.fs_context.matches(&self.fs)
+                || !proc.fs.matches(&self.fs)
             {
                 return Err(FsError::PermDenied);
             }

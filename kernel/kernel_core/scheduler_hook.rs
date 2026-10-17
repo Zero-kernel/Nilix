@@ -382,6 +382,10 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // R155-6 FIX: Drain deferred IRQ terminations in process context.
     crate::process::drain_deferred_irq_terminates();
 
+    // GAP-5 slice 4 G1: reap exited non-leader threads (process context; a
+    // thread still switching out stays marked for the next pass).
+    crate::process::drain_thread_autoreap();
+
     // E.4 RCU: Drain callbacks in process context.
     crate::rcu::poll();
 

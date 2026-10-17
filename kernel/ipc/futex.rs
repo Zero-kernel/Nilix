@@ -345,19 +345,63 @@ struct FutexPreparePermit {
     tgid: ProcessId,
 }
 
+/// One attempt to claim a preparation gate.
+enum FutexGateClaim {
+    Claimed(FutexPreparePermit),
+    /// Another task of the same TGID is inside its prepare/publish window.
+    SameTgidBusy,
+    /// Every gate is held by some TGID.
+    RegistryFull,
+}
+
+/// GAP-5 slice 4 G4: how long a task yields to a same-TGID sibling that holds
+/// the preparation gate before failing with a resource error (timer ticks,
+/// about 100 ms at the 1 kHz tick). The holder keeps the gate only across
+/// bucket admission and publication, never across the sleep. A deadline rather
+/// than a retry count: on an otherwise idle CPU each yield returns at once.
+const FUTEX_PREPARE_SIBLING_WAIT_TICKS: u64 = 100;
+/// Backstop on yields for contexts whose tick does not advance (the host
+/// harness has no timer).
+const FUTEX_PREPARE_SIBLING_MAX_YIELDS: usize = 1 << 16;
+
 impl FutexPreparePermit {
-    fn try_acquire(tgid: ProcessId) -> Result<Self, FutexError> {
+    fn try_claim(tgid: ProcessId) -> FutexGateClaim {
         let mut gates = FUTEX_PREPARE_GATES.lock();
         if gates.iter().any(|slot| slot.busy && slot.tgid == tgid) {
-            return Err(FutexError::TooManyBuckets);
+            return FutexGateClaim::SameTgidBusy;
         }
-        let (gate, slot) = gates
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| !slot.busy)
-            .ok_or(FutexError::TooManyBuckets)?;
+        let Some((gate, slot)) = gates.iter_mut().enumerate().find(|(_, slot)| !slot.busy) else {
+            return FutexGateClaim::RegistryFull;
+        };
         *slot = FutexPrepareGateSlot { tgid, busy: true };
-        Ok(Self { gate, tgid })
+        FutexGateClaim::Claimed(Self { gate, tgid })
+    }
+
+    fn try_acquire(tgid: ProcessId) -> Result<Self, FutexError> {
+        match Self::try_claim(tgid) {
+            FutexGateClaim::Claimed(permit) => Ok(permit),
+            FutexGateClaim::SameTgidBusy | FutexGateClaim::RegistryFull => {
+                Err(FutexError::TooManyBuckets)
+            }
+        }
+    }
+
+    /// GAP-5 slice 4 G4: claim the gate from a syscall entry. Without this,
+    /// two threads of one group entering FUTEX_WAIT or FUTEX_LOCK_PI together
+    /// failed the second with ENOMEM. A busy sibling is waited out by yielding
+    /// (bounded); a full registry is still an immediate resource failure.
+    /// Callers hold no lock and run in process context with IRQs enabled.
+    fn acquire(tgid: ProcessId) -> Result<Self, FutexError> {
+        let deadline = kernel_core::get_ticks().saturating_add(FUTEX_PREPARE_SIBLING_WAIT_TICKS);
+        for _ in 0..FUTEX_PREPARE_SIBLING_MAX_YIELDS {
+            match Self::try_claim(tgid) {
+                FutexGateClaim::Claimed(permit) => return Ok(permit),
+                FutexGateClaim::RegistryFull => return Err(FutexError::TooManyBuckets),
+                FutexGateClaim::SameTgidBusy if kernel_core::get_ticks() >= deadline => break,
+                FutexGateClaim::SameTgidBusy => kernel_core::force_reschedule(),
+            }
+        }
+        Err(FutexError::TooManyBuckets)
     }
 }
 
@@ -917,7 +961,7 @@ pub fn futex_wait(
 
     // R37-2 FIX: Futex key is scoped by TGID so CLONE_THREAD siblings can wake each other
     let key = (tgid, uaddr);
-    let prepare_permit = FutexPreparePermit::try_acquire(tgid)?;
+    let prepare_permit = FutexPreparePermit::acquire(tgid)?;
 
     // 获取或创建此地址的等待桶
     // R172-07/08 FIX: obtain a LIVE bucket and bump waiter_count under the bucket lock with a
@@ -1075,7 +1119,7 @@ pub fn futex_lock_pi(
 ) -> Result<usize, FutexError> {
     let pid = process::current_pid().ok_or(FutexError::NoProcess)?;
     let key: FutexKey = (tgid, uaddr);
-    let prepare_permit = FutexPreparePermit::try_acquire(tgid)?;
+    let prepare_permit = FutexPreparePermit::acquire(tgid)?;
 
     // 获取当前等待者的优先级
     let waiter_priority = {
@@ -2234,6 +2278,48 @@ mod tests {
             FutexPreparePermit::try_acquire(tgid)
                 .expect("RF180-47 released preparation permit must be reusable"),
         );
+    }
+
+    #[test]
+    fn gap5_futex_sibling_gate_wait_is_bounded_and_full_registry_fails_fast() {
+        use alloc::vec::Vec;
+
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        let tgid = 0x0005_4004;
+
+        // Free gate: claimed on the first attempt.
+        drop(FutexPreparePermit::acquire(tgid).expect("G4 free gate"));
+
+        // A sibling that never releases (no scheduler in the host harness)
+        // must end in a bounded resource error, not a hang.
+        let sibling = FutexPreparePermit::try_acquire(tgid).expect("G4 sibling permit");
+        assert!(matches!(
+            FutexPreparePermit::acquire(tgid),
+            Err(FutexError::TooManyBuckets)
+        ));
+        drop(sibling);
+        drop(FutexPreparePermit::acquire(tgid).expect("G4 gate after sibling release"));
+
+        // Every gate held by other TGIDs: no point waiting.
+        let mut held = Vec::new();
+        held.try_reserve_exact(FUTEX_PREPARE_GATE_COUNT)
+            .expect("G4 permit ledger");
+        for index in 0..FUTEX_PREPARE_GATE_COUNT {
+            held.push(
+                FutexPreparePermit::try_acquire(0x0006_0000 + index as ProcessId)
+                    .expect("G4 fill gate registry"),
+            );
+        }
+        assert!(matches!(
+            FutexPreparePermit::try_claim(tgid),
+            FutexGateClaim::RegistryFull
+        ));
+        assert!(matches!(
+            FutexPreparePermit::acquire(tgid),
+            Err(FutexError::TooManyBuckets)
+        ));
+        drop(held);
+        drop(FutexPreparePermit::acquire(tgid).expect("G4 gate after registry drains"));
     }
 
     #[test]

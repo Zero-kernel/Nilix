@@ -999,7 +999,7 @@ impl CgroupCtrlInode {
                 // Update process's cgroup_id in PCB to keep state synchronized.
                 // Still under process lock — no window for concurrent memory ops
                 // to charge against the wrong cgroup.
-                proc_guard.cgroup_id = self.cgroup_id;
+                proc_guard.set_cgroup_id(self.cgroup_id);
                 Ok(())
             }
             CtrlKind::SubtreeControl => {

@@ -706,32 +706,42 @@ fn fork_inner(
         // clone_box() is still infallible (Box::new), but we pre-validate
         // the fd count fits in memory. With MAX_FD=256, total alloc is ~128KB.
         // If fd_table is excessively large, fail early.
-        if parent.fd_table.len() > crate::process::MAX_FD as usize {
-            return Err(ForkError::MemoryAllocationFailed);
-        }
-        child
-            .fd_table
-            .ensure_capacity_for(parent.fd_table.len())
-            .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        child
-            .cloexec_fds
-            .ensure_capacity_for(parent.cloexec_fds.len())
-            .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        for (&fd, desc) in parent.fd_table.iter() {
-            let cloned = desc
-                .try_clone_box()
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            if child.fd_table.insert_unique_reserved(fd, cloned).is_err() {
-                panic!("fork FD snapshot violated unique reserved publication");
+        // GAP-5 slice 3: both tables are locked for the copy (parent then
+        // child; the child is not yet visible to any other path).
+        {
+            let parent_files = parent.files.lock();
+            let mut child_files = child.files.lock();
+            if parent_files.fd_table.len() > crate::process::MAX_FD as usize {
+                return Err(ForkError::MemoryAllocationFailed);
             }
-        }
+            child_files
+                .fd_table
+                .ensure_capacity_for(parent_files.fd_table.len())
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            child_files
+                .cloexec_fds
+                .ensure_capacity_for(parent_files.cloexec_fds.len())
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            for (&fd, desc) in parent_files.fd_table.iter() {
+                let cloned = desc
+                    .try_clone_box()
+                    .map_err(|_| ForkError::MemoryAllocationFailed)?;
+                if child_files
+                    .fd_table
+                    .insert_unique_reserved(fd, cloned)
+                    .is_err()
+                {
+                    panic!("fork FD snapshot violated unique reserved publication");
+                }
+            }
 
-        // R39-4 FIX: 克隆 close-on-exec 标记集合
-        // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
-        // (~12KB worst case). Accepted risk documented.
-        for &fd in parent.cloexec_fds.iter() {
-            if child.cloexec_fds.insert_reserved(fd).is_err() {
-                panic!("fork CLOEXEC snapshot exceeded prepared capacity");
+            // R39-4 FIX: 克隆 close-on-exec 标记集合
+            // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
+            // (~12KB worst case). Accepted risk documented.
+            for &fd in parent_files.cloexec_fds.iter() {
+                if child_files.cloexec_fds.insert_reserved(fd).is_err() {
+                    panic!("fork CLOEXEC snapshot exceeded prepared capacity");
+                }
             }
         }
 
@@ -745,7 +755,7 @@ fn fork_inner(
         // (a fork inside a handler does NOT carry the parent's live frame state). The
         // "any handler installed" fast-path hint is a monotonic global, so the child
         // inheriting a parent's handler needs no per-task bookkeeping here.
-        child.sigactions = parent.sigactions;
+        child.sigactions.copy_from(&parent.sigactions);
         child.blocked = parent.blocked;
 
         // 克隆能力表（尊重 CLOFORK 标志）
@@ -773,7 +783,8 @@ fn fork_inner(
             let mut child_cap_counts =
                 [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
             let mut child_cap_count_len = 0usize;
-            for desc in child.fd_table.values() {
+            let child_files = child.files.lock();
+            for desc in child_files.fd_table.values() {
                 if let Some(cid) = desc.cap_id() {
                     let Some(slot) = child_cap_counts.get_mut(child_cap_count_len) else {
                         return Err(ForkError::MemoryAllocationFailed);
@@ -782,6 +793,7 @@ fn fork_inner(
                     child_cap_count_len += 1;
                 }
             }
+            drop(child_files);
             child_cap_counts[..child_cap_count_len].sort_unstable_by_key(|entry| entry.0);
             let mut unique_len = 0usize;
             for index in 0..child_cap_count_len {
@@ -833,8 +845,9 @@ fn fork_inner(
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
         child.install_shared_credentials_for_clone(credentials);
         drop(credential_arc_reservation);
-        child.umask = parent.umask;
-        child.fs_context = parent.fs_context.clone();
+        // GAP-5 slice 2: fork deep-copies root/cwd/umask into the child's own
+        // (already admitted) handle; parent and child are never shared.
+        child.fs.copy_from(&parent.fs);
 
         // D3-ARC-MM-SHARED: Build the child's independent MmState from the
         // parent's shared mm. This replaces the old per-field copies of
@@ -1056,7 +1069,7 @@ fn fork_inner(
 
         // F.2: 继承 Cgroup 成员关系
         // 子进程继承父进程的 cgroup，并注册到 cgroup 的任务列表
-        child.cgroup_id = parent.cgroup_id;
+        child.set_cgroup_id(parent.cgroup_id);
         // Note: cgroup task tracking is done after process is fully created
 
         // R93-1 FIX: 继承 IPC/Network/User 命名空间（以及 for_children 默认值）
@@ -1096,7 +1109,7 @@ fn fork_inner(
         // on root-frame, KPTI, or COW-plan failure; after this point there is no
         // unguarded charge and no mismatch between the cloned MmState and its
         // memory.max amount.
-        let child_fd_count = child.fd_table.len() as u64;
+        let child_fd_count = child.files.lock().fd_table.len() as u64;
         let mut charge_guard = ForkChargeGuard::new(parent.cgroup_id);
         if child_fd_count != 0 {
             crate::cgroup::try_charge_fds(parent.cgroup_id, child_fd_count)
@@ -1151,7 +1164,7 @@ fn fork_inner(
         // The admission charge becomes owned by the child at the same commit.
         // No error path exists below this assignment; normal exit now performs
         // the exact matching uncharge.
-        child.fds_charged_count = child_fd_count;
+        child.files.lock().fds_charged_count = child_fd_count;
         charge_guard.commit();
 
         // R163-4 FIX: All fallible operations above have succeeded. Safe to
@@ -1198,6 +1211,11 @@ fn cleanup_partial_child(child_pid: ProcessId) {
         if let Some(slot) = table.get_mut(child_pid) {
             if let Some(process) = slot.take() {
                 let mut proc = process.lock();
+                // GAP-5 slice 3: take the table contents under its own lock.
+                let extracted_fds = core::mem::replace(
+                    &mut proc.files.lock().fd_table,
+                    AdmittedMap::new(HeapClass::CoreProcess),
+                );
                 (
                     if proc.kernel_stack.as_u64() != 0 {
                         Some((
@@ -1229,10 +1247,7 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                     ),
                     // R171-F5 FIX: take the fd_table OUT so FileDescriptor
                     // destructors run explicitly after PROCESS_TABLE is released.
-                    core::mem::replace(
-                        &mut proc.fd_table,
-                        AdmittedMap::new(HeapClass::CoreProcess),
-                    ),
+                    extracted_fds,
                     // RF180-16 defense-in-depth: retain the whole PCB across the
                     // table unlock. Process field destructors include namespace
                     // Arcs whose final Drop may take lifecycle/parent locks; PID
@@ -1880,6 +1895,24 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::Busy;
     };
     if proc.pid != pid {
+        return SharedFaultResult::NotShared;
+    }
+    // GAP-5 slice 4 review (D1): resolve only inside `pid`'s own address space.
+    // Exit-time writes for another task (`terminate_process` clear_child_tid,
+    // the robust-list walk) run under that task's CR3 while `pid` is whoever
+    // is current. Installing `pid`'s shared frame there would map one
+    // process's memory into another and charge the wrong cgroup. Declining
+    // lets the usercopy fixup fail the copy. A Ring-3 fault may still run on
+    // the KPTI user root, which shares the user-half tables, so either root of
+    // this task qualifies.
+    let active_root = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64() as usize;
+    let own_root = proc.memory_space != 0
+        && (active_root == proc.memory_space
+            || (proc.user_memory_space != 0 && active_root == proc.user_memory_space));
+    if !own_root {
         return SharedFaultResult::NotShared;
     }
     let Some(mut mm_state) = proc.mm.try_lock() else {
