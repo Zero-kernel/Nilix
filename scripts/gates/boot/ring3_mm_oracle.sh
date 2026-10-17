@@ -8,8 +8,9 @@
 # WHY THIS IS A SEPARATE GATE
 # `scripts/gates/boot/kernel_test.sh` treats ANY `[PF ENTRY]` line as fatal. That
 # ban is right for its own fixture (`hello.elf`), which never demand-faults. It
-# is inapplicable here: the shared-anonymous model IS demand paging, so
-# exercising it necessarily announces `[PF ENTRY]` on handled faults. This gate
+# is inapplicable here: legs end tasks with deliberate faults (the stack guard
+# page leg's SIGSEGV), and the kernel traces every such unresolved fault with
+# `[PF ENTRY]` (a debug kernel traces handled demand faults too). This gate
 # therefore reuses the boot harness for everything mechanical (firmware, ESP,
 # artifacts, QEMU invocation) and applies the fault-tolerant verdict the same
 # way `scripts/gates/qemu/open_fault_probe.py` does for the musl workload:
@@ -30,7 +31,7 @@ BOOT_LOG="$(mktemp)" || exit 2
 trap 'rm -f -- "$BOOT_LOG"' EXIT
 
 # The boot gate's own status is NOT this gate's verdict: it will report failure
-# solely because of the handled `[PF ENTRY]` lines. Everything mechanical is
+# solely because of those `[PF ENTRY]` lines. Everything mechanical is
 # still reused, and its summary is printed for the record.
 KERNEL_TEST_KEEP_LOGS=1 bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
 boot_status=$?

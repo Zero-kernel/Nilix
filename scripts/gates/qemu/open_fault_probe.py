@@ -13,8 +13,9 @@ import tempfile
 from iommu_failure_probe import digest
 
 
-# musl exercises COW and robust-usercopy recovery, which announce [PF ENTRY]
-# even when the fault is handled. Require terminal fault outcomes and clean
+# musl exercises COW and robust-usercopy recovery; a debug kernel announces
+# [PF ENTRY] even when such a fault is handled (a release kernel only for faults
+# that end in a kill or panic). Require terminal fault outcomes and clean
 # completion; the boot/SMP parser's ban on all page-fault entries is inapplicable.
 FATAL = re.compile(
     r"\bKERNEL PANIC\b|\bpanicked at\b|\bPANIC:|"

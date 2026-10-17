@@ -1143,6 +1143,27 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     panic!("General protection fault");
 }
 
+/// F12: the release-build `[PF ENTRY]` trace, for a fault that will not
+/// resolve (it ends in a kill or a panic). Error code only (X-8: CR2 could
+/// leak a kernel pointer).
+///
+/// Resolved faults are not traced in release builds. Under a fork-heavy load
+/// copy-on-write faults are routine, and the serial port has no lock, so a
+/// trace from one CPU split console lines that another CPU was writing (the
+/// stress protocol rejected runs on split markers). Debug builds still trace
+/// every fault at entry.
+#[inline(always)]
+fn trace_unresolved_page_fault(error_code: PageFaultErrorCode) {
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        serial_write_str("\n[PF ENTRY] err=");
+        serial_write_hex(error_code.bits());
+        serial_write_str("\n");
+    }
+    #[cfg(debug_assertions)]
+    let _ = error_code;
+}
+
 /// #PF - Page Fault (页错误)
 ///
 /// 处理缺页异常：
@@ -1187,13 +1208,8 @@ extern "x86-interrupt" fn page_fault_handler(
         serial_write_hex(error_code.bits());
         serial_write_str("\n");
     }
-    #[cfg(not(debug_assertions))]
-    unsafe {
-        // X-8: Only show error code in release builds, not CR2 (pointer leak)
-        serial_write_str("\n[PF ENTRY] err=");
-        serial_write_hex(error_code.bits());
-        serial_write_str("\n");
-    }
+    // Release builds trace only faults that do not resolve; see
+    // `trace_unresolved_page_fault`.
 
     INTERRUPT_STATS.page_fault.fetch_add(1, Ordering::Relaxed);
     // G.1: Track page faults in per-CPU observability counters
@@ -1317,6 +1333,7 @@ extern "x86-interrupt" fn page_fault_handler(
             return;
         }
 
+        trace_unresolved_page_fault(error_code);
         // Fallback: no exception-table entry for this RIP.
         // Keep old kill behavior to avoid a user-triggerable kernel panic
         // if a non-annotated access slips in.
@@ -1380,6 +1397,10 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
     }
+
+    // Every resolving path (copy-on-write, shared-anonymous and stack demand
+    // faults, usercopy fixups) has returned by now.
+    trace_unresolved_page_fault(error_code);
 
     // 【安全修复 S-3】检查是否为用户态触发的用户空间缺页
     // USER_MODE 标志表示 CPU 在 Ring 3（用户态）时触发了缺页
