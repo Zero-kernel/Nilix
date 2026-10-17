@@ -451,7 +451,21 @@ static int write_all(int fd, const uint8_t *data, size_t length, int64_t *error_
 }
 
 static int write_marker(const char *marker, size_t length) {
+    /*
+     * The host parser reads markers only at the start of a line, and the
+     * kernel shell launches this program right after its prompt, with no
+     * newline. Start the first marker on a fresh line instead of relying on
+     * other console output (a release kernel used to print a page-fault
+     * trace here) to end the prompt line.
+     */
+    static bool line_started = false;
     int64_t ignored_code = 0;
+    if (!line_started) {
+        line_started = true;
+        if (write_all(STDOUT_FILENO, (const uint8_t *)"\n", 1, &ignored_code) != 0) {
+            return -1;
+        }
+    }
     return write_all(STDOUT_FILENO, (const uint8_t *)marker, length, &ignored_code);
 }
 

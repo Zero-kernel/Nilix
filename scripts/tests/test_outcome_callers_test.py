@@ -214,6 +214,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             "MUSL-ROBUST-USERCOPY-OK", "MUSL-WAIT-NAMESPACE-OK",
             "MUSL-BLOCKED-SIGNAL-OK", "MUSL-FCNTL-LIMIT-OK",
             *tls_cases, tls_done,
+            "MUSL-PTHREAD-OK",
             "MUSL-VFS-PIVOT-OK scope=transaction-fork-namespaces-descriptors-repeat",
             "MUSL-VFS-CONTEXT-OK scope=cwd-components-dac-ids-chroot",
             "musl libc test passed!",
