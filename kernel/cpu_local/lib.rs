@@ -1495,6 +1495,9 @@ mod host_harness_tests {
 
     #[test]
     fn non_task_context_classifier_rejects_irq_and_interrupt_masking() {
+        // The IRQ/NMI legs below change the shared host CPU's context state,
+        // which the soft-progress test observes; serialize with it.
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
         assert!(!super::is_non_task_context(false, false, true));
         assert!(super::is_non_task_context(true, false, true));
         assert!(super::is_non_task_context(false, true, true));
