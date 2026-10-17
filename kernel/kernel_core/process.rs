@@ -6316,6 +6316,50 @@ pub fn wait_over_wake_count() -> u64 {
     WAIT_OVER_WAKES.load(Ordering::Relaxed)
 }
 
+/// GAP-6 F11 diagnostic (stress builds only): tick of the last console write.
+/// The stress runner writes a marker every round, so a long silence means the
+/// guest stopped making progress.
+#[cfg(feature = "stall_dump")]
+pub static LAST_CONSOLE_WRITE_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// GAP-6 F11 diagnostic: print every task's wait and reapability state. Uses
+/// try-locks only and prints whatever it can reach; called once per stall.
+#[cfg(feature = "stall_dump")]
+pub fn dump_tasks_for_stall() {
+    let Some(table) = PROCESS_TABLE.try_lock() else {
+        klog_always!("STALL-DUMP tasks: PROCESS_TABLE busy");
+        return;
+    };
+    for (pid, slot) in table.iter().enumerate() {
+        let Some(process) = slot else {
+            continue;
+        };
+        let Some(proc) = process.try_lock() else {
+            klog_always!("STALL-DUMP task pid={} <PCB locked>", pid);
+            continue;
+        };
+        let shown = proc.children.len().min(8);
+        klog_always!(
+            "STALL-DUMP task pid={} gen={} ppid={} tgid={} state={:?} waiting_child={:?} on_cpu={} switch_reap_pending={} teardown_done={} members={} pending_kill={} allowed_cpus={:#x} cpuset={:?} children={} {:?}",
+            pid,
+            proc.generation,
+            proc.ppid,
+            proc.tgid,
+            proc.state,
+            proc.waiting_child,
+            proc.on_cpu.load(Ordering::Acquire),
+            proc.switch_reap_pending.load(Ordering::Acquire),
+            proc.teardown_done.load(Ordering::Acquire),
+            proc.thread_group.members(),
+            proc.pending_kill.load(Ordering::Acquire),
+            proc.allowed_cpus,
+            proc.cpuset_id,
+            proc.children.len(),
+            &proc.children[..shown]
+        );
+    }
+}
+
 /// GAP-6: per-CPU scheduler counters kept as pressure-run evidence and read
 /// through `/proc/schedstat`. Statistics only: Relaxed, wrap is harmless.
 static CPU_CONTEXT_SWITCHES: [AtomicU64; cpu_local::max_cpus()] =

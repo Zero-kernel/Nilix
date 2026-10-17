@@ -18,8 +18,9 @@ syscall_test = ["kernel_core/syscall_test", "arch/syscall_test"]
 musl_test = ["kernel_core/thread_preview"]
 # Enable clone syscall test program
 clone_test = []
-# Enable the bounded monthly Ring-3 stress workload
-stress_runner = []
+# Enable the bounded monthly Ring-3 stress workload. It also turns on the
+# GAP-6 F11 stall dump (stress builds only).
+stress_runner = ["kernel_core/stall_dump", "sched/stall_dump"]
 # Enable KCOV fuzz runner test program (Phase 2 completion)
 fuzz_runner = ["mm/fuzz_runner", "kcov"]
 # Enable the syzkaller-style guest executor as the Ring-3 boot program. Unlike

@@ -11426,6 +11426,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
                 }
             }
         }
+        // GAP-6 F11 diagnostic: console output is the stress runner's progress.
+        #[cfg(feature = "stall_dump")]
+        crate::process::LAST_CONSOLE_WRITE_TICK
+            .store(crate::get_ticks(), core::sync::atomic::Ordering::Relaxed);
         Ok(tmp.len())
     } else {
         #[cfg(feature = "kcov")]

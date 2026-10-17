@@ -491,6 +491,66 @@ static PENDING_PREV_ON_CPU: CpuLocal<PrevOnCpu> = CpuLocal::new(|| PrevOnCpu {
     generation: AtomicU64::new(0),
 });
 
+/// GAP-6 F11 diagnostic (stress builds only): once the guest console has been
+/// silent for `STALL_TICKS`, print every online CPU's current task, published
+/// generation and pending-previous slot, then the task table. Process context
+/// with interrupts enabled; every read is an atomic load or a try-lock.
+#[cfg(feature = "stall_dump")]
+fn stall_dump_if_silent() {
+    const STALL_TICKS: u64 = 10_000;
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    let last = process::LAST_CONSOLE_WRITE_TICK.load(Ordering::Relaxed);
+    let now = kernel_core::get_ticks();
+    if last == 0 || now.saturating_sub(last) < STALL_TICKS || DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    klog_always!(
+        "STALL-DUMP begin: console silent for {} ticks, dumping from cpu {}",
+        now - last,
+        current_cpu_id()
+    );
+    for cpu in Scheduler::online_cpu_ids() {
+        let current = CURRENT_PROCESS
+            .get_cpu(cpu)
+            .and_then(|slot| slot.try_lock().map(|pid| *pid));
+        let pending = PENDING_PREV_ON_CPU.get_cpu(cpu).map(|slot| {
+            (
+                slot.pid.load(Ordering::Acquire),
+                slot.generation.load(Ordering::Relaxed),
+            )
+        });
+        let need_resched = PER_CPU_DATA
+            .get_cpu(cpu)
+            .map(|data| data.need_resched.load(Ordering::Acquire));
+        klog_always!(
+            "STALL-DUMP cpu={} current={:?} current_gen={} pending_prev={:?} need_resched={:?}",
+            cpu,
+            current,
+            CURRENT_GENERATION[cpu].load(Ordering::Acquire),
+            pending,
+            need_resched
+        );
+        match Scheduler::ready_queue_for_cpu(cpu).and_then(|queue| queue.try_lock()) {
+            Some(queue) => {
+                klog_always!("STALL-DUMP queue cpu={} len={}", cpu, queue.len());
+                for (priority, pid) in queue
+                    .values()
+                    .flat_map(|bucket| {
+                        let priority = bucket.priority;
+                        bucket.iter().map(move |(pid, _)| (priority, *pid))
+                    })
+                    .take(16)
+                {
+                    klog_always!("STALL-DUMP queue cpu={} prio={} pid={}", cpu, priority, pid);
+                }
+            }
+            None => klog_always!("STALL-DUMP queue cpu={} <locked>", cpu),
+        }
+    }
+    process::dump_tasks_for_stall();
+    klog_always!("STALL-DUMP end");
+}
+
 /// R172-03: record the outgoing (pid, generation) to be cleared at the next
 /// `reschedule_now` on this CPU. Called (IRQs off) right before the actual switch.
 /// `pid == 0` (the bootstrap path) stages nothing.
@@ -1709,7 +1769,15 @@ impl Scheduler {
         Some((pid, removed, membership_priority))
     }
 
-    /// Try to steal a ready process from another CPU
+    /// Try to steal a ready process from another CPU.
+    ///
+    /// GAP-6 F11: every other online CPU with queued work is a source, tried
+    /// from the most to the least loaded. Trying only the most loaded queue
+    /// stranded a task pinned to this CPU anywhere else: a stress worker that
+    /// pinned itself to CPU 3 while running on CPU 2 was re-queued on CPU 2,
+    /// which may not run it, while CPU 3 kept probing CPU 0 (longer only
+    /// because it also held a Blocked task) and idled forever. Queue lengths
+    /// count Blocked members, so the longest queue need not hold a candidate.
     fn steal_one(
         current_pid: Option<Pid>,
     ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
@@ -1719,25 +1787,33 @@ impl Scheduler {
             return None;
         }
 
-        // Find the most loaded CPU (potential victim)
-        let mut source_cpu = None;
-        let mut source_len = 0usize;
+        // `online_cpu_ids` covers at most 64 CPUs.
+        let mut sources = [(0usize, 0usize); 64];
+        let mut count = 0usize;
         for cpu_id in Self::online_cpu_ids() {
-            if cpu_id == local_cpu {
+            if cpu_id == local_cpu || count == sources.len() {
                 continue;
             }
             let len = Self::queue_len_for_cpu(cpu_id);
-            if len > source_len {
-                source_len = len;
-                source_cpu = Some(cpu_id);
+            if len > 0 {
+                sources[count] = (len, cpu_id);
+                count += 1;
             }
         }
+        let sources = &mut sources[..count];
+        sources.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        sources
+            .iter()
+            .find_map(|&(_, source_cpu)| Self::steal_from(source_cpu, local_cpu, current_pid))
+    }
 
-        let source_cpu = source_cpu?;
-        if source_len == 0 {
-            return None;
-        }
-
+    /// Steal one ready task that may run on `local_cpu` from `source_cpu`'s
+    /// queue, removing it from that queue.
+    fn steal_from(
+        source_cpu: usize,
+        local_cpu: usize,
+        current_pid: Option<Pid>,
+    ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
         let queue = Self::ready_queue_for_cpu(source_cpu)?;
         let mut guard = Self::lock_ready_queue_or_defer(queue)?;
         let mut retries = 0usize;
@@ -2784,6 +2860,8 @@ impl Scheduler {
         // context. The actual claim/save transaction below is shared with IRQ
         // return and is entirely try-only once IF is cleared.
         if origin == kernel_core::ReschedOrigin::Process && interrupts::are_enabled() {
+            #[cfg(feature = "stall_dump")]
+            stall_dump_if_silent();
             if BALANCE_DUE.swap(false, Ordering::Relaxed) {
                 Self::balance_queues();
             }

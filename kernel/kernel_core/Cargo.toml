@@ -27,6 +27,9 @@ mitigation_probe = []
 # kcov: enables KCOV coverage collection syscalls (sys_kcov_*) and per-process coverage buffers
 conntrack = ["net/conntrack"]
 sched_debug = []
+# GAP-6 F11 diagnostic (stress builds only): track console progress and dump
+# the task table when the scheduler reports a stall.
+stall_dump = []
 kcov = ["coverage"]
 # Hosted unit-test harness: disable the bare-metal MM allocator and use the
 # CPU-local hosted fallbacks so dependency tests can allocate normally.

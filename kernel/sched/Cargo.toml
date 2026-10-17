@@ -11,6 +11,9 @@ default = []
 # Enable lock dependency graph for cycle detection (debug builds only)
 # This tracks edges between lock classes and detects potential deadlock cycles
 lockdep_graph = []
+# GAP-6 F11 diagnostic, stress builds only: dump task and per-CPU switch state
+# once when the guest console has been silent for 10 s.
+stall_dump = ["kernel_core/stall_dump"]
 
 [dependencies]
 spin = "0.9"
