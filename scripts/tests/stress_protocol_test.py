@@ -12,7 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# scripts/tests/<this file>: parents[2] is the repository root that holds
+# the `scripts` package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.gates.stress import stress_protocol as protocol  # noqa: E402
 
@@ -266,6 +268,46 @@ class MarkerStateMachineTests(unittest.TestCase):
         stalled["cpus"][1]["ticks"] = 200
         with self.assertRaises(protocol.StressProtocolError):
             protocol.validate_qmp_progress(valid_before, stalled, 2)
+
+
+class RuntimeFatalPatternTests(unittest.TestCase):
+    def test_handled_fault_trace_is_not_terminal(self) -> None:
+        self.assertIsNone(
+            protocol.STRESS_TERMINAL_FATAL.search("    [PF ENTRY] err=0x0000000000000007")
+        )
+
+    def test_terminal_outcomes_are_fatal(self) -> None:
+        for line in (
+            "KERNEL PANIC: kernel/src/main.rs:1",
+            "panicked at kernel/src/main.rs:1:1:",
+            "[PAGE FAULT] error=0x0000000000000002",
+            "[DOUBLE FAULT]",
+            "[GPF] at rip",
+            "[#UD] at rip",
+            "triple fault",
+        ):
+            self.assertIsNotNone(protocol.STRESS_TERMINAL_FATAL.search(line), line)
+
+
+class LiveProtocolLineTests(unittest.TestCase):
+    def test_live_poll_leaves_a_marker_caught_mid_write(self) -> None:
+        config = make_config("smp")
+        with tempfile.TemporaryDirectory() as tmp:
+            serial = Path(tmp) / "serial.log"
+            serial.write_text(begin(config) + "\n" + ready(config, "normal")[:30])
+            self.assertEqual(protocol.protocol_lines(serial, live=True), [begin(config)])
+            serial.write_text(begin(config) + "\n" + ready(config, "normal") + "\n")
+            self.assertEqual(
+                protocol.protocol_lines(serial, live=True),
+                [begin(config), ready(config, "normal")],
+            )
+
+    def test_final_parse_still_sees_an_unterminated_line(self) -> None:
+        config = make_config("smp")
+        with tempfile.TemporaryDirectory() as tmp:
+            serial = Path(tmp) / "serial.log"
+            serial.write_text(begin(config) + "\n" + ready(config, "normal")[:30])
+            self.assertEqual(len(protocol.protocol_lines(serial)), 2)
 
 
 class BlockRecoveryTests(unittest.TestCase):

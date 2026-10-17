@@ -965,8 +965,16 @@ def parse_marker(line: str) -> Marker:
     raise StressProtocolError(f"malformed or unknown stress-v2 marker: {line!r}")
 
 
-def protocol_lines(path: str | os.PathLike[str]) -> list[str]:
+def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[str]:
+    """Marker lines of a serial log.
+
+    `live` is for a log the guest may still be writing: the serial port emits a
+    line byte by byte, so an unterminated final line can be a marker caught
+    mid-write and is left for the next poll instead of failing to parse.
+    """
     raw = Path(path).read_bytes()
+    if live:
+        raw = raw[: raw.rfind(b"\n") + 1]
     text = raw.decode("utf-8", errors="replace")
     return [line.rstrip("\r") for line in text.splitlines() if line.startswith("NILIX_STRESS_V2_")]
 
@@ -1245,12 +1253,32 @@ def validate_runtime_summary(serial_path: str | os.PathLike[str]) -> tuple[int, 
     return tuple(validate_runtime_evidence(serial_path)["legacy_counts"])
 
 
+# Terminal fault outcomes only. gate_log.SERIAL_FATAL also bans `[PF ENTRY]`,
+# which is right for the boot fixture (it never faults) but wrong here. The
+# release kernel prints that trace for a fault that does not resolve, including
+# the deliberate user faults some profiles use to end workers, and a debug
+# kernel prints it for every fault, including the copy-on-write and demand
+# faults of every fork-heavy profile. A fault that is not handled still reaches
+# `[PAGE FAULT]`, a panic, or a fatal user-mode exit. Same rule as
+# scripts/gates/boot/ring3_mm_oracle.sh and scripts/gates/qemu/open_fault_probe.py.
+STRESS_TERMINAL_FATAL = re.compile(
+    r"\bKERNEL PANIC\b|\bpanicked at\b|\bPANIC:|"
+    r"\[(?:PAGE FAULT|DOUBLE FAULT|GPF|#UD|FATAL)\]|\btriple fault\b",
+    re.IGNORECASE,
+)
+
+
 def validate_runtime_evidence(serial_path: str | os.PathLike[str]) -> dict[str, Any]:
-    from gate_log import SUMMARY, FAILED_TEST, SERIAL_FATAL, WARNING, SKIPPED, outcome_evidence
+    # gate_log lives in scripts/ci; this module runs as a script from
+    # scripts/gates/stress, so that directory is not on sys.path by default.
+    ci_dir = str(Path(__file__).resolve().parents[2] / "ci")
+    if ci_dir not in sys.path:
+        sys.path.insert(0, ci_dir)
+    from gate_log import SUMMARY, FAILED_TEST, WARNING, SKIPPED, outcome_evidence
 
     text = Path(serial_path).read_bytes().decode("utf-8", errors="replace")
     lines = text.splitlines()
-    if FAILED_TEST.search(text) or SERIAL_FATAL.search(text):
+    if FAILED_TEST.search(text) or STRESS_TERMINAL_FATAL.search(text):
         raise StressProtocolError("runtime serial contains failure/fatal evidence")
     summaries = [tuple(map(int, match.groups())) for line in lines if (match := SUMMARY.fullmatch(line))]
     if len(summaries) != 1 or sum("Test Summary" in line for line in lines) != 1:
@@ -1496,7 +1524,7 @@ def command_wait_marker(args: argparse.Namespace) -> int:
             except PermissionError:
                 pass
         try:
-            lines = protocol_lines(args.serial)
+            lines = protocol_lines(args.serial, live=True)
         except FileNotFoundError:
             lines = []
         for line in lines:

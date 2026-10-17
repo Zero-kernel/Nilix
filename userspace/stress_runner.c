@@ -321,6 +321,48 @@ static void emit(const char *format, ...) {
 }
 
 /*
+ * GAP-6: copy /proc/schedstat (per-CPU context switches and migrations, the
+ * RCU callback backlog) into the serial log, so the retained artifacts carry
+ * scheduler evidence for the run. These are plain lines, not protocol
+ * markers: the host parser reads only NILIX_STRESS_V2_ lines. Best effort; an
+ * unreadable file prints nothing.
+ */
+#define SCHEDSTAT_SAMPLE_ROUNDS 256u
+
+static void emit_schedstat(uint64_t seq) {
+    char buffer[4096];
+    size_t total = 0;
+    const int fd = open("/proc/schedstat", O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    while (total < sizeof(buffer) - 1u) {
+        const ssize_t got = read(fd, buffer + total, sizeof(buffer) - 1u - total);
+        if (got <= 0) {
+            break;
+        }
+        total += (size_t)got;
+    }
+    (void)close(fd);
+    buffer[total] = '\0';
+
+    char *line = buffer;
+    while (*line != '\0') {
+        char *end = strchr(line, '\n');
+        if (end != NULL) {
+            *end = '\0';
+        }
+        if (*line != '\0') {
+            emit("NILIX_SCHEDSTAT run=%016" PRIx64 " seq=%" PRIu64 " %s", config.run_id, seq, line);
+        }
+        if (end == NULL) {
+            break;
+        }
+        line = end + 1;
+    }
+}
+
+/*
  * Fail-closed exit. `seq` may be zero (the FAIL marker permits it), `errno_value`
  * is reported verbatim so the host log names the failing syscall.
  */
@@ -597,11 +639,12 @@ typedef struct {
     uint32_t lock;
     uint32_t done_low;
     uint32_t done_high;
-    uint32_t padding;
+    uint32_t start_ready; /* smp start barrier: workers that have arrived */
     uint64_t counter;
     uint64_t spins;
     uint64_t results[MAX_WORKERS];
     uint64_t elapsed_ns[MAX_WORKERS];
+    uint32_t contended; /* smp: set once any lock acquire has failed */
 } SharedRegion;
 
 /*
@@ -748,6 +791,7 @@ static void shared_region_destroy(SharedRegion *region) {
 static void spin_lock_acquire(SharedRegion *region, uint64_t *local_spins) {
     while (__atomic_exchange_n(&region->lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
         *local_spins += 1u;
+        __atomic_store_n(&region->contended, 1u, __ATOMIC_RELEASE);
         sched_yield();
     }
 }
@@ -767,7 +811,11 @@ static void run_workers(SharedRegion *region, uint32_t count, void (*body)(Share
     for (uint32_t index = 0; index < count; ++index) {
         const pid_t child = fork();
         if (child < 0) {
-            /* Reap what we already started before failing, so no zombie leaks. */
+            /* Open the smp start barrier and the contention seed so the
+             * started workers can finish, then reap them before failing, so
+             * no zombie leaks. */
+            __atomic_store_n(&region->start_ready, UINT32_MAX, __ATOMIC_RELEASE);
+            __atomic_store_n(&region->contended, 1u, __ATOMIC_RELEASE);
             for (uint32_t reap = 0; reap < started; ++reap) {
                 int ignored;
                 (void)waitpid(children[reap], &ignored, 0);
@@ -1034,7 +1082,43 @@ static void smp_worker_body(SharedRegion *region, uint32_t index) {
     uint64_t local_spins = 0;
     uint64_t accumulator = config.seed ^ ((uint64_t)index + 0x9e37u);
 
-    for (uint64_t iteration = 0; iteration < config.contention_iterations; ++iteration) {
+    /*
+     * Contention seed. Even with the start barrier below, about 1% of rounds
+     * saw no failed acquire (the vCPUs did not overlap), and the protocol
+     * rejects a round without contention. Worker 0 therefore takes the lock
+     * BEFORE it arrives at the barrier and holds it until another worker has
+     * failed to take it. No other worker can run an iteration without the
+     * lock, so once the barrier opens at least one of them fails an acquire
+     * while worker 0 still holds it, and the wait always ends. (Taking it
+     * after the barrier deadlocked when the others finished first.) Counter
+     * and checksum are unchanged: this is worker 0's iteration 0.
+     */
+    const int seed_contention = index == 0u && config.workers >= 2u;
+    if (seed_contention) {
+        spin_lock_acquire(region, &local_spins);
+    }
+
+    /*
+     * Start barrier. Workers are forked one at a time, so without it the first
+     * can finish its iterations before the last one exists, and the round
+     * reports no contention (spins=0), which the protocol rejects.
+     */
+    __atomic_fetch_add(&region->start_ready, 1u, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&region->start_ready, __ATOMIC_ACQUIRE) < config.workers) {
+        sched_yield();
+    }
+
+    uint64_t iteration = 0;
+    if (seed_contention) {
+        while (!__atomic_load_n(&region->contended, __ATOMIC_ACQUIRE)) {
+            sched_yield();
+        }
+        region->counter += 1u;
+        spin_lock_release(region);
+        accumulator = checksum_mix(accumulator, iteration);
+        ++iteration;
+    }
+    for (; iteration < config.contention_iterations; ++iteration) {
         spin_lock_acquire(region, &local_spins);
         region->counter += 1u;
         spin_lock_release(region);
@@ -1447,5 +1531,8 @@ int main(void) {
         emit("NILIX_STRESS_V2_HEARTBEAT run=%016" PRIx64 " profile=%s seq=%" PRIu64 " cycles=%" PRIu64
              " ops=%" PRIu64 " checksum=%016" PRIx64,
              config.run_id, profile_name(), seq, cycles, cumulative_ops, checksum);
+        if (seq % SCHEDSTAT_SAMPLE_ROUNDS == 1u) {
+            emit_schedstat(seq);
+        }
     }
 }
