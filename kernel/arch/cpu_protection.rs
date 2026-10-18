@@ -19,6 +19,16 @@
 //!
 //! When SMAP is enabled, intentional kernel access to user pages must be wrapped
 //! with STAC (Set AC flag) and CLAC (Clear AC flag) instructions.
+//!
+//! # CR4.FSGSBASE must stay disabled (R190-5)
+//!
+//! The kernel keeps the user FS/GS bases in the PCB and installs them with
+//! `wrmsr` (scheduler switch-in, `arch_prctl`, exec reset and the SYSRET
+//! epilogue). With CR4.FSGSBASE set, ring 3 could run `wrfsbase`/`wrgsbase`
+//! and bypass the `arch_prctl` user-half check, and the PCB would stop being
+//! the authoritative copy. [`enable_protections`] therefore clears the bit
+//! and [`require_supported_protections`] fails boot if it is still set. APs
+//! copy the BSP's CR4 in the SMP trampoline, so the BSP check covers them.
 
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
@@ -134,6 +144,9 @@ pub fn enable_protections() -> CpuProtectionStatus {
         cr4.insert(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
     }
 
+    // R190-5 FIX: user FS/GS bases are kernel-mediated (see module docs).
+    cr4.remove(Cr4Flags::FSGSBASE);
+
     // Write back only if changes were made
     if cr4 != original_cr4 {
         unsafe { Cr4::write(cr4) };
@@ -192,6 +205,9 @@ pub fn require_supported_protections(status: CpuProtectionStatus) {
     }
     if status.smap_supported && !status.smap_enabled {
         panic!("FATAL: SMAP is supported but could not be enabled");
+    }
+    if Cr4::read().contains(Cr4Flags::FSGSBASE) {
+        panic!("FATAL: CR4.FSGSBASE is set; user FS/GS bases must stay kernel-mediated");
     }
 }
 

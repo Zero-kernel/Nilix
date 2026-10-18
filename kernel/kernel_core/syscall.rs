@@ -17091,6 +17091,23 @@ fn is_canonical(addr: u64) -> bool {
     sign_extended == 0 || sign_extended == 0x1FFFF
 }
 
+/// R190-5 FIX: validate a user FS/GS base for `arch_prctl(ARCH_SET_FS/GS)`.
+///
+/// Canonical form alone admitted the kernel half: an unprivileged caller could
+/// load a kernel address into FS/GS base, gaining a fault-versus-no-fault probe
+/// of kernel mappings and, were CR4.FSGSBASE ever enabled, a kernel pointer
+/// readable by `rdfsbase`. Like Linux `do_arch_prctl_64` (`>= TASK_SIZE_MAX`),
+/// every base outside the user half fails with EPERM. Non-canonical values are
+/// all at or above `USER_SPACE_TOP`, so they fail here too.
+#[inline]
+fn validate_user_segment_base(addr: u64) -> Result<(), SyscallError> {
+    if addr >= USER_SPACE_TOP as u64 {
+        Err(SyscallError::EPERM)
+    } else {
+        Ok(())
+    }
+}
+
 /// sys_arch_prctl - 设置/获取架构相关的线程状态
 ///
 /// 主要用于 TLS (Thread Local Storage) 支持，设置 FS/GS segment base。
@@ -17120,10 +17137,7 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 
     match code {
         ARCH_SET_FS => {
-            // 验证地址是 canonical
-            if !is_canonical(addr) {
-                return Err(SyscallError::EINVAL);
-            }
+            validate_user_segment_base(addr)?;
 
             // R102-10 FIX: Gate TLS base address log behind debug_assertions.
             // Leaks userspace TLS base which aids exploitation.
@@ -17172,10 +17186,7 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
         }
 
         ARCH_SET_GS => {
-            // 验证地址是 canonical
-            if !is_canonical(addr) {
-                return Err(SyscallError::EINVAL);
-            }
+            validate_user_segment_base(addr)?;
 
             // 更新进程 PCB 中的 gs_base
             let fs_base = {
@@ -17222,6 +17233,35 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
         }
 
         _ => Err(SyscallError::EINVAL),
+    }
+}
+
+#[cfg(test)]
+mod r190_5_segment_base_tests {
+    use super::*;
+
+    #[test]
+    fn segment_base_must_stay_in_user_half() {
+        assert_eq!(validate_user_segment_base(0), Ok(()));
+        assert_eq!(validate_user_segment_base(0x7fff_ffff_f000), Ok(()));
+        assert_eq!(
+            validate_user_segment_base((USER_SPACE_TOP - 1) as u64),
+            Ok(())
+        );
+        for kernel_or_noncanonical in [
+            USER_SPACE_TOP as u64,
+            0x0000_8000_0000_1000,
+            0xffff_8000_0000_0000,
+            0xffff_ffff_8000_0000,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                validate_user_segment_base(kernel_or_noncanonical),
+                Err(SyscallError::EPERM),
+                "base {:#x} must be rejected",
+                kernel_or_noncanonical
+            );
+        }
     }
 }
 
