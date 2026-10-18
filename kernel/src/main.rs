@@ -1343,8 +1343,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // (when heap is available), not in alloc_error_handler where it could recurse.
     increment_counter(TraceCounter::Custom0, 0); // no-op increment to trigger init
     COUNTERS_READY.store(true, core::sync::atomic::Ordering::Release);
-    // Install read guard for metrics export (CAP_TRACE_READ or root)
-    let _ = trace::install_read_guard(|| {
+    // Install read guard for metrics export (CAP_TRACE_READ or root).
+    // R190-9 FIX: export is fail-closed until this guard exists, and a guard
+    // installed by anyone else first would be an unreviewed policy, so a
+    // failed install halts boot instead of being ignored.
+    let guard_install = trace::install_read_guard(|| {
         // R109-4 FIX: Only allow credential-less access during the boot phase.
         let creds = current_credentials();
         if creds.is_none() {
@@ -1360,6 +1363,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
         false
     });
+    if guard_install.is_err() {
+        panic!("R190-9: trace metrics read guard was already installed");
+    }
     klog_always!("      ✓ Trace capability gate registered (CAP_TRACE_READ)");
 
     klog_always!("[8/8] Verifying memory management...");

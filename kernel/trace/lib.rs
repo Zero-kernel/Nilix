@@ -458,8 +458,8 @@ static TRACE_REGISTRY: Mutex<TraceRegistry> = Mutex::new(TraceRegistry::new());
 /// Read guard for gating metric export paths.
 ///
 /// When installed, all snapshot/listing functions call the guard before
-/// returning data. If the guard returns false, [`TraceError::AccessDenied`]
-/// is returned.
+/// returning data. If the guard returns false, or no guard is installed
+/// (R190-9), [`TraceError::AccessDenied`] is returned.
 /// R89-3: Store as usize (raw bits) for CHERI/MPK compatibility.
 static READ_GUARD: AtomicUsize = AtomicUsize::new(0);
 
@@ -493,12 +493,18 @@ pub fn install_read_guard(guard: TraceGuardFn) -> Result<(), TraceError> {
     }
 }
 
-/// Check the read guard allows access. Returns Ok if no guard is installed
-/// or the guard returns true.
+/// Check the read guard allows access.
+///
+/// R190-9 FIX: fail closed. With no guard installed every export is denied,
+/// matching the audit subsystem's read gate. The previous fail-open default
+/// would have exposed counters and `snapshot_profiler` raw RIP samples (kernel
+/// addresses) to any caller if boot ever skipped or reordered
+/// [`install_read_guard`]. No in-kernel caller reads metrics before the guard
+/// is installed, so the boot path needs no exemption.
 pub(crate) fn ensure_metrics_read_allowed() -> Result<(), TraceError> {
     let raw = READ_GUARD.load(Ordering::Acquire);
     if raw == 0 {
-        return Ok(());
+        return Err(TraceError::AccessDenied);
     }
     // R89-3 FIX: Transmute from usize (not data pointer) to fn pointer
     // Safety: value originated from a valid `TraceGuardFn` fn pointer
