@@ -365,6 +365,7 @@ dependencies = [
 name = "drivers"
 version = "0.1.0"
 dependencies = [
+ "cpu_local",
  "lazy_static",
  "spin",
  "x86_64",
@@ -687,6 +688,7 @@ name = "net"
 version = "0.1.0"
 dependencies = [
  "cap",
+ "cpu_local",
  "drivers",
  "iommu",
  "klog",
