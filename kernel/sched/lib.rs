@@ -41,7 +41,7 @@ pub use lock_ordering::{
 };
 
 // Re-export cpuset types
-pub use cpuset::{CpusetError, CpusetId, CpusetNode};
+pub use cpuset::{CpusetAdmin, CpusetError, CpusetId, CpusetNode};
 
 pub fn init() {
     klog_always!("Scheduler module initialized");

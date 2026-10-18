@@ -484,6 +484,19 @@ pub trait LsmPolicy: Send + Sync {
     }
 
     // ========================================================================
+    // Scheduler Isolation Hooks (R190-4)
+    // ========================================================================
+
+    /// R190-4: called for every cpuset management operation (`cpuset_op`).
+    ///
+    /// The kernel has already required host root or `CapRights::ADMIN`
+    /// (`sched::cpuset::CpusetAdmin`), as it does for cgroup management, so
+    /// the default allows. Policies may impose further restrictions.
+    fn sched_cpuset(&self, task: &ProcessCtx, op: u32, cpuset_id: u64, cpus: u64) -> LsmResult {
+        Ok(())
+    }
+
+    // ========================================================================
     // Livepatch Hooks (R102-13)
     // ========================================================================
 
@@ -825,6 +838,10 @@ impl LsmPolicy for DenyAllPolicy {
     }
 
     // Livepatch hooks (R102-13)
+    fn sched_cpuset(&self, _task: &ProcessCtx, _op: u32, _cpuset_id: u64, _cpus: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
     fn kpatch_load(&self, _task: &ProcessCtx, _patch_len: usize) -> LsmResult {
         Err(LsmError::Denied)
     }

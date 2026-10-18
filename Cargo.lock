@@ -560,6 +560,7 @@ dependencies = [
  "kernel_core",
  "klog",
  "lazy_static",
+ "lsm",
  "mm",
  "spin 0.9.9",
  "trace",

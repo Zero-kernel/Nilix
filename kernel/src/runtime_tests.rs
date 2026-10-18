@@ -1821,12 +1821,22 @@ impl RuntimeTest for CpusetIsolationTest {
     }
 
     fn run(&self) -> TestResult {
-        use sched::cpuset::{self, CpusetError, CpusetId};
+        use sched::cpuset::{self, CpusetAdmin, CpusetError, CpusetId};
 
         // Step 1: Verify root cpuset is initialized
         let root = match cpuset::root_cpuset() {
             Some(root) => root,
             None => return TestResult::Fail(String::from("Cpuset subsystem not initialized")),
+        };
+        // R190-4: management requires the privileged, LSM-mediated proof.
+        let admin = match CpusetAdmin::authorize() {
+            Ok(admin) => admin,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "boot context not authorized for cpusets: {:?}",
+                    e
+                ))
+            }
         };
 
         let online = cpuset::online_cpu_mask();
@@ -1848,10 +1858,10 @@ impl RuntimeTest for CpusetIsolationTest {
         let first_mask = 1u64 << first_cpu;
 
         // Step 2: Test invalid parent rejection
-        match cpuset::cpuset_create(first_mask, CpusetId(9999)) {
+        match cpuset::cpuset_create(&admin, first_mask, CpusetId(9999)) {
             Err(CpusetError::InvalidParent) => {}
             Ok(id) => {
-                let _ = cpuset::cpuset_destroy(id);
+                let _ = cpuset::cpuset_destroy(&admin, id);
                 return TestResult::Fail(String::from(
                     "cpuset_create succeeded with invalid parent",
                 ));
@@ -1865,10 +1875,10 @@ impl RuntimeTest for CpusetIsolationTest {
         }
 
         // Step 3: Test empty mask rejection
-        match cpuset::cpuset_create(0, CpusetId::ROOT) {
+        match cpuset::cpuset_create(&admin, 0, CpusetId::ROOT) {
             Err(CpusetError::EmptyMask) => {}
             Ok(id) => {
-                let _ = cpuset::cpuset_destroy(id);
+                let _ = cpuset::cpuset_destroy(&admin, id);
                 return TestResult::Fail(String::from("cpuset_create allowed empty mask"));
             }
             Err(e) => {
@@ -1884,10 +1894,10 @@ impl RuntimeTest for CpusetIsolationTest {
         if offline_bits != 0 {
             let bad_cpu = offline_bits.trailing_zeros() as usize;
             let invalid_mask = online | (1u64 << bad_cpu);
-            match cpuset::cpuset_create(invalid_mask, CpusetId::ROOT) {
+            match cpuset::cpuset_create(&admin, invalid_mask, CpusetId::ROOT) {
                 Err(CpusetError::InvalidMask) => {}
                 Ok(id) => {
-                    let _ = cpuset::cpuset_destroy(id);
+                    let _ = cpuset::cpuset_destroy(&admin, id);
                     return TestResult::Fail(alloc::format!(
                         "cpuset_create accepted CPU {} outside parent mask",
                         bad_cpu
@@ -1922,7 +1932,7 @@ impl RuntimeTest for CpusetIsolationTest {
         };
 
         // Step 5: Create parent cpuset
-        let parent_id = match cpuset::cpuset_create(parent_mask, CpusetId::ROOT) {
+        let parent_id = match cpuset::cpuset_create(&admin, parent_mask, CpusetId::ROOT) {
             Ok(id) => id,
             Err(e) => {
                 return TestResult::Fail(alloc::format!("Failed to create parent cpuset: {:?}", e))
@@ -1931,10 +1941,10 @@ impl RuntimeTest for CpusetIsolationTest {
         created.push(parent_id);
 
         // Step 6: Create child cpuset (subset of parent)
-        let child_id = match cpuset::cpuset_create(first_mask, parent_id) {
+        let child_id = match cpuset::cpuset_create(&admin, first_mask, parent_id) {
             Ok(id) => id,
             Err(e) => {
-                let _ = cpuset::cpuset_destroy(parent_id);
+                let _ = cpuset::cpuset_destroy(&admin, parent_id);
                 return TestResult::Fail(alloc::format!("Failed to create child cpuset: {:?}", e));
             }
         };
@@ -2014,7 +2024,7 @@ impl RuntimeTest for CpusetIsolationTest {
 
         // Step 8: Cleanup - destroy cpusets in reverse order
         for id in created.into_iter().rev() {
-            if let Err(e) = cpuset::cpuset_destroy(id) {
+            if let Err(e) = cpuset::cpuset_destroy(&admin, id) {
                 return TestResult::Fail(alloc::format!(
                     "Failed to destroy cpuset {:?}: {:?}",
                     id,

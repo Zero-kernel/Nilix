@@ -139,6 +139,16 @@ pub mod cap_op {
     pub const DELEGATE: u32 = 3;
 }
 
+/// R190-4 FIX: cpuset management operation codes for [`hook_sched_cpuset`].
+pub mod cpuset_op {
+    /// Create a child cpuset.
+    pub const CREATE: u32 = 1;
+    /// Destroy an empty cpuset.
+    pub const DESTROY: u32 = 2;
+    /// Replace a cpuset's CPU mask.
+    pub const SET_CPUS: u32 = 3;
+}
+
 // ============================================================================
 // Hook Coverage Census (R190-1, INV-SEC-02 / INV-SEC-03)
 // ============================================================================
@@ -1931,6 +1941,40 @@ pub fn hook_net_device_move(
     #[cfg(not(feature = "lsm"))]
     {
         let _ = (task, device_idx, from_ns_id, to_ns_id);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Scheduler Isolation Hooks (R190-4)
+// ============================================================================
+
+/// Hook: cpuset management (create, destroy, set CPU mask).
+///
+/// R190-4 FIX: `sched::cpuset` calls this from every management entry point,
+/// after its own host-root/`CapRights::ADMIN` gate (`CpusetAdmin`). A future
+/// cpuset syscall therefore inherits MAC mediation without extra wiring.
+///
+/// # Arguments
+///
+/// * `task` - Authorized subject (kernel context uses the kernel subject)
+/// * `op` - One of [`cpuset_op`]
+/// * `cpuset_id` - Target cpuset (the parent for `CREATE`)
+/// * `cpus` - Requested CPU mask (`0` for `DESTROY`)
+#[inline]
+pub fn hook_sched_cpuset(task: &ProcessCtx, op: u32, cpuset_id: u64, cpus: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().sched_cpuset(task, op, cpuset_id, cpus);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "sched_cpuset", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, op, cpuset_id, cpus);
         Ok(())
     }
 }

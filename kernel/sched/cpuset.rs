@@ -31,8 +31,9 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! // Create a cpuset limited to CPUs 0-3
-//! let id = cpuset_create(0b1111)?;
+//! // Create a cpuset limited to CPUs 0-3 (management needs a CpusetAdmin)
+//! let admin = CpusetAdmin::authorize()?;
+//! let id = cpuset_create(&admin, 0b1111, CpusetId::ROOT)?;
 //!
 //! // Attach a process to this cpuset
 //! cpuset_attach(pid, id)?;
@@ -223,16 +224,70 @@ pub fn get_cpuset(id: CpusetId) -> Option<Arc<CpusetNode>> {
     CPUSET_REGISTRY.read().as_ref()?.sets.get(&id).cloned()
 }
 
+/// R190-4 FIX: proof that the caller passed the cpuset management gate.
+///
+/// Cpuset create/destroy/set_cpus repartition CPUs for every task in the
+/// subtree, a host-global effect like cgroup management. They used to be bare
+/// `pub fn`s with no authorization layer, leaving the whole check to a syscall
+/// wrapper that does not exist yet. Each management entry point now requires
+/// a `CpusetAdmin`, which only [`CpusetAdmin::authorize`] constructs, and also
+/// calls `lsm::hook_sched_cpuset`. A future syscall therefore cannot reach
+/// them without the privilege check and MAC mediation.
+pub struct CpusetAdmin {
+    subject: lsm::ProcessCtx,
+}
+
+impl CpusetAdmin {
+    /// Authorize the current context for cpuset management.
+    ///
+    /// A task must be host root (user-namespace-mapped euid 0) or hold
+    /// `CapRights::ADMIN`, the same gate as `sys_cgroup_create` (R93-17,
+    /// R133-1). A context with no current task is kernel context (boot
+    /// self-tests, kernel threads) and acts as the kernel subject. A task
+    /// whose credentials cannot be read fails closed. The token is not bound
+    /// to a task: authorize in the requesting task's own context, never in a
+    /// deferred worker acting on its behalf.
+    pub fn authorize() -> Result<Self, CpusetError> {
+        match lsm::ProcessCtx::from_current() {
+            Some(subject) => {
+                if kernel_core::current_is_host_root()
+                    || kernel_core::current_has_cap_rights(kernel_core::CapRights::ADMIN)
+                {
+                    Ok(Self { subject })
+                } else {
+                    Err(CpusetError::PermissionDenied)
+                }
+            }
+            None if kernel_core::current_pid().is_none() => Ok(Self {
+                subject: lsm::ProcessCtx::new(0, 0, 0, 0, 0, 0),
+            }),
+            None => Err(CpusetError::PermissionDenied),
+        }
+    }
+
+    /// MAC-mediate one management operation.
+    fn mediate(&self, op: u32, cpuset_id: CpusetId, cpus: u64) -> Result<(), CpusetError> {
+        lsm::hook_sched_cpuset(&self.subject, op, u64::from(cpuset_id.0), cpus)
+            .map_err(|_| CpusetError::PermissionDenied)
+    }
+}
+
 /// Create a new cpuset with the specified CPU mask.
 ///
 /// # Arguments
+/// * `admin` - Proof of the cpuset management privilege (R190-4)
 /// * `cpus` - Bitmask of CPUs to allow (must be subset of root)
 /// * `parent_id` - Parent cpuset ID (or ROOT for top-level)
 ///
 /// # Returns
 /// * `Ok(CpusetId)` - ID of the new cpuset
 /// * `Err(CpusetError)` - If creation fails
-pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetError> {
+pub fn cpuset_create(
+    admin: &CpusetAdmin,
+    cpus: u64,
+    parent_id: CpusetId,
+) -> Result<CpusetId, CpusetError> {
+    admin.mediate(lsm::cpuset_op::CREATE, parent_id, cpus)?;
     let mut registry_guard = CPUSET_REGISTRY.write();
     let registry = registry_guard.as_mut().ok_or(CpusetError::NotInitialized)?;
 
@@ -279,11 +334,13 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
 
 /// Destroy a cpuset.
 ///
-/// The cpuset must have no attached tasks and no child cpusets.
-pub fn cpuset_destroy(id: CpusetId) -> Result<(), CpusetError> {
+/// The cpuset must have no attached tasks and no child cpusets. `admin` is
+/// the R190-4 management proof.
+pub fn cpuset_destroy(admin: &CpusetAdmin, id: CpusetId) -> Result<(), CpusetError> {
     if id == CpusetId::ROOT {
         return Err(CpusetError::CannotDestroyRoot);
     }
+    admin.mediate(lsm::cpuset_op::DESTROY, id, 0)?;
 
     let mut registry_guard = CPUSET_REGISTRY.write();
     let registry = registry_guard.as_mut().ok_or(CpusetError::NotInitialized)?;
@@ -315,9 +372,11 @@ pub fn cpuset_destroy(id: CpusetId) -> Result<(), CpusetError> {
 /// Update the CPU mask of a cpuset.
 ///
 /// # Arguments
+/// * `admin` - Proof of the cpuset management privilege (R190-4)
 /// * `id` - Cpuset ID
 /// * `cpus` - New CPU mask (must be subset of parent)
-pub fn cpuset_set_cpus(id: CpusetId, cpus: u64) -> Result<(), CpusetError> {
+pub fn cpuset_set_cpus(admin: &CpusetAdmin, id: CpusetId, cpus: u64) -> Result<(), CpusetError> {
+    admin.mediate(lsm::cpuset_op::SET_CPUS, id, cpus)?;
     let registry_guard = CPUSET_REGISTRY.read();
     let registry = registry_guard.as_ref().ok_or(CpusetError::NotInitialized)?;
 

@@ -26,3 +26,5 @@ x86_64 = "0.15"
 trace = { path = "../trace" }
 klog = { path = "../klog" }
 mm = { path = "../mm" }
+# R190-4: cpuset management is MAC-mediated (hook_sched_cpuset).
+lsm = { path = "../lsm" }
