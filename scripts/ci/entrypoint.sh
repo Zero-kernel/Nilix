@@ -82,6 +82,10 @@ case "$group" in
             --cov-report=term-missing --cov-report="xml:$out/coverage.xml" \
             --cov-report="json:$out/coverage.json" --cov-report="html:$out/coverage-html"
         check shell-syntax -- bash -c 'while IFS= read -r -d "" script; do bash -n "$script" || exit; done < <(find scripts .githooks -type f -name "*.sh" -print0)'
+        # The tracked Ext3 fixture must stay host-checkable. A copy that a kernel
+        # mounted read-write carries the private journal incompat bit (RF180-50)
+        # and breaks ensure-ext3-image, the ext3 gate and every stress profile.
+        check ext3-fixture -- e2fsck -fn disk-ext2.img
         ;;
     hosted)
         export HOSTED_TEST_LOG_DIR="$out/suites"

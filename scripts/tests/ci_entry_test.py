@@ -53,7 +53,7 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
     def test_independent_failure_does_not_skip_checks_or_turn_success(self):
         status, events = self.run_group('quality', FAIL_GATE='lint')
         self.assertEqual(status, 1)
-        self.assertEqual(events, ['lint', 'python', 'shell-syntax', 'report'])
+        self.assertEqual(events, ['lint', 'python', 'shell-syntax', 'ext3-fixture', 'report'])
 
     def test_build_failure_prevents_guest_launch_but_keeps_report(self):
         status, events = self.run_group('musl', FAIL_GATE='build')
