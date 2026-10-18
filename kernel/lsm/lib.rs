@@ -140,6 +140,127 @@ pub mod cap_op {
 }
 
 // ============================================================================
+// Hook Coverage Census (R190-1, INV-SEC-02 / INV-SEC-03)
+// ============================================================================
+
+/// R190-1: one dormant hook family (see [`FEATURE_ABSENT_HOOKS`]).
+pub struct FeatureAbsentHook {
+    /// The `hook_*` function name.
+    pub hook: &'static str,
+    /// x86-64 syscall numbers that would expose the feature. The hosted
+    /// kernel-core dispatcher test requires each to have no dispatch arm, or
+    /// only an arm whose handler is a known fixed-errno stub.
+    pub syscalls: &'static [u64],
+    /// Why the feature is unreachable today.
+    pub reason: &'static str,
+}
+
+/// R190-1 FIX: hook families that have no caller because the kernel feature
+/// they mediate does not exist yet.
+///
+/// INV-SEC-02: every `pub fn hook_*` in this crate either has a production
+/// caller outside `kernel/lsm` or is listed here with the boundary that keeps
+/// the feature unreachable. Two hosted gates enforce the boundary:
+/// - `kernel/tests/lsm_hook_census.rs` fails if a hook is neither wired nor
+///   listed, if a listed hook is referenced from production code, or if a
+///   guarded private API (capability delegation, IPC endpoints) gains a caller
+///   that does not name its hook.
+/// - The kernel-core `r190_11_dispatch_parity_tests` fail if any syscall
+///   number below gains a dispatch arm, unless the arm is a known fixed-errno
+///   stub.
+///
+/// So adding, for example, `setuid` or `shmget` as a dispatch arm, or giving
+/// a pinned fixed-errno stub (chmod, chown, link) a real body, requires
+/// removing the entry, and then the census requires the hook to be called.
+/// Entries with no syscall numbers (file-backed mmap inside `sys_mmap`;
+/// livepatch, which is closed by `SUPPORTED=false` and the KernelOps
+/// default-deny) are closed by the boundary in `reason`, not by a mechanical
+/// gate. INV-SEC-03: a policy may implement these methods, but its
+/// documentation must call them dormant (see `SecureBaselinePolicy`).
+pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
+    FeatureAbsentHook {
+        hook: "hook_file_chmod",
+        syscalls: &[90, 91, 268, 452],
+        reason: "chmod/fchmod are fixed EOPNOTSUPP stubs (R72); no fchmodat/fchmodat2 arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_file_chown",
+        syscalls: &[92, 93, 94, 260],
+        reason: "chown/fchown/lchown are fixed ENOSYS stubs; no fchownat arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_file_link",
+        syscalls: &[86, 265],
+        reason: "link is a fixed EPERM stub (R173-09); no linkat arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_file_mmap",
+        syscalls: &[],
+        reason: "sys_mmap returns EOPNOTSUPP for fd >= 0 before any mapping",
+    },
+    FeatureAbsentHook {
+        hook: "hook_ipc_recv",
+        syscalls: &[70, 243],
+        reason: "no syscall reaches IPC endpoint receive (census API scan); no msgrcv/mq_timedreceive arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_ipc_send",
+        syscalls: &[68, 69, 71, 240, 241, 242, 244, 245],
+        reason: "no syscall reaches IPC endpoint send (census API scan); no SysV msg*/POSIX mq_* arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_ipc_shm",
+        syscalls: &[29, 30, 31, 67],
+        reason: "no shmget/shmat/shmctl/shmdt arms",
+    },
+    FeatureAbsentHook {
+        hook: "hook_kpatch_disable",
+        syscalls: &[],
+        reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
+    },
+    FeatureAbsentHook {
+        hook: "hook_kpatch_enable",
+        syscalls: &[],
+        reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
+    },
+    FeatureAbsentHook {
+        hook: "hook_kpatch_load",
+        syscalls: &[],
+        reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
+    },
+    FeatureAbsentHook {
+        hook: "hook_kpatch_unload",
+        syscalls: &[],
+        reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
+    },
+    FeatureAbsentHook {
+        hook: "hook_net_setsockopt",
+        syscalls: &[54, 55],
+        reason: "no setsockopt/getsockopt arms",
+    },
+    FeatureAbsentHook {
+        hook: "hook_ptrace",
+        syscalls: &[101, 310, 311, 312, 438],
+        reason: "no ptrace/process_vm_readv/process_vm_writev/kcmp/pidfd_getfd arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_task_setgroups",
+        syscalls: &[116],
+        reason: "no setgroups arm",
+    },
+    FeatureAbsentHook {
+        hook: "hook_task_setresuid",
+        syscalls: &[113, 114, 117, 119],
+        reason: "no setreuid/setregid/setresuid/setresgid arms",
+    },
+    FeatureAbsentHook {
+        hook: "hook_task_setuid",
+        syscalls: &[105, 106, 122, 123],
+        reason: "no setuid/setgid/setfsuid/setfsgid arms",
+    },
+];
+
+// ============================================================================
 // Context Provider Callbacks
 // ============================================================================
 
@@ -481,6 +602,18 @@ fn emit_denial_audit(
 // ============================================================================
 
 /// Static reference to the permissive policy for default.
+///
+/// # Threat model of the permissive default (D2-ARC-1)
+///
+/// Balanced and Performance profiles run with this policy: every hook except
+/// the livepatch family (PermissivePolicy allows those, while `SECURE_BASELINE`
+/// keeps the trait's default deny) returns `Ok(())`. This is a deliberate
+/// zero-overhead choice. In these profiles MAC adds no confinement, and
+/// security rests on the primary checks the hooks sit behind: DAC credentials,
+/// capability rights, seccomp/pledge, namespaces and resource admission. The
+/// hooks still run, so audit and a future enforcing policy see the full
+/// mediated surface. The Secure profile installs `SECURE_BASELINE` and
+/// fail-closes boot if it did not take effect.
 static PERMISSIVE: PermissivePolicy = PermissivePolicy;
 
 /// Wrapper to hold the fat pointer atomically.

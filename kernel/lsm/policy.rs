@@ -878,10 +878,13 @@ fn deny_user_wx(prot: u32) -> LsmResult {
 ///    are called from the mmap/mprotect syscall handlers
 ///    (`kernel_core/syscall.rs`). No simultaneous PROT_WRITE|PROT_EXEC user
 ///    mapping; kernel mappings are covered separately by `strict_wxorx`.
-/// 2. **Livepatch** — LIVE TODAY via the livepatch ops delegation (R102-13):
-///    inherits the trait's R104-6 default-DENY for all `kpatch_*` hooks — the
-///    Secure profile keeps kernel live-patching denied even for root (unlike
-///    PermissivePolicy, which overrides to allow).
+/// 2. **Livepatch** — TRAIT-COMPLETE, dormant (R190-1 correction): inherits
+///    the trait's R104-6 default-DENY for all `kpatch_*` hooks, so the Secure
+///    profile would keep live-patching denied even for root (unlike
+///    PermissivePolicy, which overrides to allow). No production
+///    `livepatch::KernelOps` implementor exists to call these hooks, so today
+///    livepatch is closed by `SUPPORTED=false` and the KernelOps fail-closed
+///    defaults, not by this policy. The census lists the family as feature-absent.
 /// 3. **Root-minting** (`task_setuid`/`task_setresuid`) — TRAIT-COMPLETE,
 ///    dormant: the kernel has no setuid-family syscalls yet, so these hooks
 ///    currently have no caller. The arms are implemented now so the second
@@ -890,6 +893,10 @@ fn deny_user_wx(prot: u32) -> LsmResult {
 /// 4. **Ptrace confinement** (Yama-like) — TRAIT-COMPLETE, dormant for the
 ///    same reason (no ptrace syscall yet): a non-root tracer may only trace
 ///    same-euid targets and never a root process.
+///
+/// The dormant families above (setuid, setresuid, ptrace and livepatch) are
+/// all listed in `crate::FEATURE_ABSENT_HOOKS`. The hosted hook census proves
+/// every unlisted hook has a production caller (INV-SEC-02/03).
 ///
 /// Everything else stays `Ok(())` — the policy is honest about being minimal:
 /// it denies only classes with a second independent check or with no

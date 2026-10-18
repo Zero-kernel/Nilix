@@ -708,7 +708,11 @@ pub fn get_mount(ns: &Arc<MountNamespace>, path: &str) -> Option<Mount> {
 ///
 /// # Security
 ///
-/// Caller must have already verified CAP_SYS_ADMIN or equivalent capability.
+/// Caller must have already passed the VFS mount privilege gate. D2-ARC-1:
+/// that gate is `OperationContext::uid == 0` (see `manager` mount, umount and
+/// chroot), which is stricter than a CAP_SYS_ADMIN capability check. No
+/// capability-based delegation exists, and this function has no in-tree
+/// caller today.
 /// Path is normalized before insertion to prevent duplicate/malformed entries.
 pub fn add_mount(
     ns: &Arc<MountNamespace>,

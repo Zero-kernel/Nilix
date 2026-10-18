@@ -196,6 +196,8 @@ pub enum ArpError {
     CacheConflict,
     /// Aggregate heap admission failed before cache publication.
     NoMemory,
+    /// R190-1: the LSM control-plane hook (`hook_net_control`) denied it.
+    PolicyDenied,
 }
 
 // ============================================================================
@@ -1493,6 +1495,38 @@ pub enum ArpResult {
 /// # Returns
 ///
 /// `ArpResult` indicating what action to take.
+/// R190-1 FIX: mediate an ARP control-plane action through the LSM.
+///
+/// `hook_net_control` (R62-7) existed with no caller, so ARP learning and
+/// ARP replies, which bypass the socket layer, were invisible to policy.
+/// Addresses follow the mediated action, like the ICMP sites: a learn reports
+/// the received packet (sender -> target), and a reply reports the reply we
+/// would send (`src_ip` -> requester), with `proto_data` the ARP opcode.
+#[inline]
+fn arp_control_allowed(
+    op: lsm::NetControlOp,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    opcode: u32,
+) -> bool {
+    lsm::hook_net_control(&lsm::NetControlCtx {
+        op,
+        src_ip: u32::from_be_bytes(src_ip.0),
+        dst_ip: u32::from_be_bytes(dst_ip.0),
+        proto_data: opcode,
+    })
+    .is_ok()
+}
+
+/// ARP opcode on the wire.
+#[inline]
+fn arp_opcode(op: ArpOp) -> u32 {
+    match op {
+        ArpOp::Request => 1,
+        ArpOp::Reply => 2,
+    }
+}
+
 pub fn process_arp(
     payload: &[u8],
     our_mac: EthAddr,
@@ -1588,6 +1622,14 @@ pub fn process_arp(
         ArpOp::Reply => {
             // Learn from replies addressed to us or allowed gratuitous
             if for_us || allow_gratuitous {
+                if !arp_control_allowed(
+                    lsm::NetControlOp::ArpLearn,
+                    pkt.sender_ip,
+                    pkt.target_ip,
+                    arp_opcode(pkt.op),
+                ) {
+                    return ArpResult::Dropped(ArpError::PolicyDenied);
+                }
                 if let Err(e) =
                     cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms)
                 {
@@ -1600,6 +1642,14 @@ pub fn process_arp(
             // Only allow gratuitous/self-refresh to update cache; ignore other requests.
             // Normal requests should only trigger a reply, not learn the sender's mapping.
             if allow_gratuitous {
+                if !arp_control_allowed(
+                    lsm::NetControlOp::ArpLearn,
+                    pkt.sender_ip,
+                    pkt.target_ip,
+                    arp_opcode(pkt.op),
+                ) {
+                    return ArpResult::Dropped(ArpError::PolicyDenied);
+                }
                 if let Err(e) =
                     cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms)
                 {
@@ -1627,6 +1677,15 @@ pub fn process_arp(
             if !cache.tx_rate_limiter.allow(now_ms) || !ARP_TX_RATE_LIMITER.allow(now_ms) {
                 stats.inc_rx_rate_limited();
                 return ArpResult::Dropped(ArpError::RateLimited);
+            }
+
+            if !arp_control_allowed(
+                lsm::NetControlOp::ArpReply,
+                our_ip,
+                pkt.sender_ip,
+                arp_opcode(ArpOp::Reply),
+            ) {
+                return ArpResult::Dropped(ArpError::PolicyDenied);
             }
 
             // Build and return reply

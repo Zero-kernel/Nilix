@@ -3772,58 +3772,6 @@ pub fn run_authorized_cap_grant_audit_self_test() {
     assert!(authorization_dropped.get());
 }
 
-/// Revoke a capability with LSM check and audit logging.
-///
-/// # Security
-///
-/// 1. Calls LSM hook_task_cap_modify before revocation
-/// 2. If LSM denies, returns EPERM without revoking
-/// 3. On success, emits audit event for tracking
-///
-/// # Arguments
-///
-/// * `cap_table` - The capability table to revoke from
-/// * `cap_id` - The capability ID to revoke
-/// * `proc_ctx` - Process context for LSM check
-///
-/// # Returns
-///
-/// * `Ok(CapEntry)` - The revoked capability entry
-/// * `Err(SyscallError)` - LSM denied or revocation failed
-fn cap_revoke_with_lsm(
-    cap_table: &cap::CapTable,
-    cap_id: cap::CapId,
-    proc_ctx: &lsm::ProcessCtx,
-) -> Result<cap::CapEntry, SyscallError> {
-    // LSM hook: check permission before revocation
-    if let Err(err) = lsm::hook_task_cap_modify(proc_ctx, cap_id, lsm::cap_op::REVOKE) {
-        return Err(lsm_error_to_syscall(err));
-    }
-
-    // Perform the revocation
-    let entry = cap_table.revoke(cap_id).map_err(cap_error_to_syscall)?;
-
-    // Emit audit event on success
-    let subject = audit::AuditSubject::new(
-        proc_ctx.pid as u32,
-        proc_ctx.uid,
-        proc_ctx.gid,
-        proc_ctx.cap.map(|c| c.raw()),
-    );
-    let timestamp = crate::time::get_ticks();
-    let _ = audit::emit_capability_event(
-        audit::AuditOutcome::Success,
-        subject,
-        cap_id.raw(),
-        audit::AuditCapOperation::Revoke,
-        None,
-        0,
-        timestamp,
-    );
-
-    Ok(entry)
-}
-
 /// 系统调用分发器
 ///
 /// 根据系统调用号和参数执行相应的系统调用
@@ -4056,9 +4004,11 @@ pub fn syscall_dispatcher(
         231 => sys_exit_group(arg0 as i32),
         // M2-1 SLICE-2 INVARIANT (vfork / syscall 58 scope boundary):
         // There is intentionally NO `58 =>` arm here. vfork is in the default
-        // seccomp allowlist (seccomp/lib.rs:279, seccomp/types.rs:1131 under
-        // PledgePromises::PROC) but has no dispatch, so syscall 58 falls through
-        // to `_ => Err(ENOSYS)` (line ~2491). vfork is therefore ENOSYS and
+        // seccomp allowlist (`pledge_syscall_list` / `promise_allows_syscall`
+        // under PledgePromises::PROC) but has no dispatch, so syscall 58 falls
+        // through to the `_ => Err(ENOSYS)` default arm below. It is listed as
+        // `UndispatchedKind::NoArm` in INTENTIONAL_UNDISPATCHED, and the hosted
+        // R190-11 parity test fails if an arm appears. vfork is therefore ENOSYS and
         // CHARGE-NEUTRAL today: it creates no process and no address space, so
         // it can never pin/charge cgroup memory and cannot strand a mem_pinned
         // residual (no path exists). If a FUTURE slice wires vfork to real Linux
@@ -10642,50 +10592,63 @@ fn sys_prlimit64(
 // M0-6: seccomp pledge <-> dispatch DIVERGENCE-PREVENTION (the class fix)
 // ============================================================================
 
-/// Pledge-promised syscalls that HAVE a dispatcher arm (hand-verified against the
-/// syscall_dispatcher match). With INTENTIONAL_UNDISPATCHED this must PARTITION the
-/// pledge union, so a newly-promised-but-undispatched syscall (allowed-but-ENOSYS)
-/// fails the parity self-test at `make test`.
+/// Pledge-promised syscalls that HAVE a functional dispatcher arm (a handler
+/// that is not a fixed ENOSYS stub; deliberate non-ENOSYS errnos such as
+/// chmod's EOPNOTSUPP or link's EPERM count as dispatched). With
+/// INTENTIONAL_UNDISPATCHED this must PARTITION the pledge union, so a
+/// newly-promised-but-undispatched syscall (allowed-but-ENOSYS) fails the
+/// parity self-test at `make test`.
+///
+/// R190-11 FIX: this list and INTENTIONAL_UNDISPATCHED were hand-verified and
+/// had drifted. mremap, link, symlink and readlink were dispatched while still
+/// listed as undispatched. The hosted `r190_11_dispatch_parity_tests` now parse
+/// the real `syscall_dispatcher` match and fail on any disagreement.
 const DISPATCHED_PROMISED: &[u64] = &[
     0, 1, 2, 3, 4, 5, 6, 8, // read write open close stat fstat lstat lseek
     7, 23, 270, 271, // poll select pselect6 ppoll (M0-6 poll/select STDIO wiring)
-    9, 10, 11, 12, // mmap mprotect munmap brk (VM promise)
+    9, 10, 11, 12, 25, // mmap mprotect munmap brk mremap (VM promise)
     24, 39, // sched_yield getpid
     56, 57, 59, 60, 61, 62,  // clone fork execve exit wait4 kill
     247, // waitid (ST-K3, dispatched 2026-09-25)
     82, 83, 84, 87, // rename mkdir rmdir unlink  (82 = M0-6 slice 2)
-    90, 91, // chmod fchmod
+    86, 88, 89, // link (fixed EPERM, R173-09) symlink readlink
+    90, 91, // chmod fchmod (fixed EOPNOTSUPP, R72)
     97, 160, 302, // getrlimit setrlimit prlimit64  (M0-6 NEW)
     102, 104, 107, 108, 110, // getuid getgid geteuid getegid getppid
     202, 217, 218, // futex getdents64 set_tid_address
     228, 231, 257, 318, // clock_gettime exit_group openat getrandom
 ];
 
+/// How an intentionally undispatched pledge syscall reaches ENOSYS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UndispatchedKind {
+    /// No dispatcher arm: the number falls to the `_ => ENOSYS` default.
+    NoArm,
+    /// A dispatcher arm whose handler is a fixed ENOSYS stub.
+    EnosysStub,
+}
+
 /// Pledge-promised syscalls deliberately NOT dispatched (ENOSYS), each with a
 /// reason. Bounded by MAX_EXEMPT, which every future M0-6 slice MUST lower — so
 /// this list can never permanently hide divergence.
-const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
-    (
-        25,
-        "mremap: VM promise, dispatch deferred (M0-6 later slice)",
-    ),
+const INTENTIONAL_UNDISPATCHED: &[(u64, UndispatchedKind, &str)] = &[
     (
         58,
+        UndispatchedKind::NoArm,
         "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)",
     ),
-    (86, "link: CPATH, deferred (needs FileSystem::link)"),
-    (88, "symlink: WPATH, deferred (needs FileSystem::symlink)"),
     (
-        89,
-        "readlink: RPATH, deferred to VFS-META (lookup-resolver fix needed)",
+        92,
+        UndispatchedKind::EnosysStub,
+        "chown: FATTR, ENOSYS stub arm (M0-6 later slice)",
     ),
-    (92, "chown: FATTR, dispatch deferred (M0-6 later slice)"),
     (
         93,
-        "fchown: FATTR (post-const-fix), dispatch deferred (M0-6 later slice)",
+        UndispatchedKind::EnosysStub,
+        "fchown: FATTR (post-const-fix), ENOSYS stub arm (M0-6 later slice)",
     ),
 ];
-const MAX_EXEMPT: usize = 7;
+const MAX_EXEMPT: usize = 3;
 
 /// R172-P6-F3: syscall numbers that are PRIVATE / native dispatch arms (reachable by direct
 /// syscall number) but MUST NEVER appear in the pledge union — there is no seccomp constant
@@ -10703,7 +10666,7 @@ const MAX_EXEMPT: usize = 7;
 const PRIVATE_NEVER_PLEDGED: &[u64] = &[262, 264, 316, 437, 517];
 
 fn rlimit_is_exempt(nr: u64) -> bool {
-    INTENTIONAL_UNDISPATCHED.iter().any(|&(n, _)| n == nr)
+    INTENTIONAL_UNDISPATCHED.iter().any(|&(n, _, _)| n == nr)
 }
 
 /// M0-6: the divergence-prevention parity self-test. Asserts the pledge allowlist
@@ -10737,7 +10700,7 @@ pub fn run_pledge_dispatch_parity_self_test() {
             nr
         );
     }
-    for &(nr, _) in INTENTIONAL_UNDISPATCHED {
+    for &(nr, _, _) in INTENTIONAL_UNDISPATCHED {
         assert!(
             union.contains(&nr),
             "M0-6: exemption {} is not pledge-promised (stale)",
@@ -10802,6 +10765,169 @@ pub fn run_pledge_semantic_parity_self_test() {
             seccomp::pledge_syscall_list(bit).len() > base,
             "M0-6: list-bearing promise contributes no syscalls (vacuous)"
         );
+    }
+}
+
+/// R190-11 FIX: bind the hand-written pledge partition to the real dispatch
+/// table. The boot parity self-test only compared lists with each other, so
+/// it stayed green while six of seven "undispatched" entries had live arms.
+#[cfg(test)]
+mod r190_11_dispatch_parity_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// `(number, handler)` for every `N => handler(...)` arm of the
+    /// `syscall_dispatcher` match, parsed from this file. Any other arm form
+    /// in the match (or-patterns, named constants, guards, blocks) fails the
+    /// parse, so a new arm cannot hide from the checks below.
+    fn dispatcher_arms() -> Vec<(u64, String)> {
+        let source = include_str!("syscall.rs");
+        let start = source
+            .find("    let result = match syscall_num {")
+            .expect("syscall_dispatcher match not found");
+        let body = &source[start + "    let result = match syscall_num {".len()..];
+        let end = body
+            .find("        _ => Err(SyscallError::ENOSYS),")
+            .expect("syscall_dispatcher default arm not found");
+        let mut arms = Vec::new();
+        for line in body[..end].lines() {
+            let line = line.trim_start();
+            if line.starts_with("//") || !line.contains("=>") {
+                continue;
+            }
+            let (number, rest) = line
+                .split_once(" => ")
+                .unwrap_or_else(|| panic!("unparsable dispatcher arm: {line}"));
+            let number = number
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("dispatcher arm must be one integer literal: {line}"));
+            let handler = rest
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or_default();
+            assert!(
+                handler.starts_with("sys_"),
+                "dispatcher arm must call a sys_ handler: {line}"
+            );
+            arms.push((number, String::from(handler)));
+        }
+        arms
+    }
+
+    /// Call a known fixed-errno stub handler with inert arguments and return
+    /// `(result, pinned errno)`. None of these touches process state or user
+    /// memory. The errno is pinned: a stub that gains a real body returns
+    /// something else for these inputs (EBADF for fd -1, EFAULT for pointer 1),
+    /// which fails the checks below.
+    fn probe_fixed_errno_stub(handler: &str) -> Option<(SyscallResult, SyscallError)> {
+        let inert = 1 as *const u8;
+        match handler {
+            "sys_chmod" => Some((sys_chmod(inert, 0), SyscallError::EOPNOTSUPP)),
+            "sys_fchmod" => Some((sys_fchmod(-1, 0), SyscallError::EOPNOTSUPP)),
+            "sys_chown" => Some((sys_chown(inert, 0, 0), SyscallError::ENOSYS)),
+            "sys_fchown" => Some((sys_fchown(-1, 0, 0), SyscallError::ENOSYS)),
+            "sys_lchown" => Some((sys_lchown(inert, 0, 0), SyscallError::ENOSYS)),
+            "sys_link" => Some((sys_link(inert, inert), SyscallError::EPERM)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pledge_partition_matches_dispatch_table() {
+        let arms = dispatcher_arms();
+        assert!(
+            arms.len() > 100,
+            "dispatcher parse found only {} arms",
+            arms.len()
+        );
+        let handler_of = |nr: u64| {
+            arms.iter()
+                .find(|(number, _)| *number == nr)
+                .map(|(_, handler)| handler.as_str())
+        };
+        for (index, (nr, _)) in arms.iter().enumerate() {
+            assert!(
+                !arms[..index].iter().any(|(other, _)| other == nr),
+                "duplicate dispatcher arm {}",
+                nr
+            );
+        }
+
+        for &nr in DISPATCHED_PROMISED {
+            let handler = handler_of(nr)
+                .unwrap_or_else(|| panic!("DISPATCHED_PROMISED {} has no dispatcher arm", nr));
+            if let Some((result, pinned)) = probe_fixed_errno_stub(handler) {
+                assert_eq!(result, Err(pinned), "{} stub errno drifted", handler);
+                assert_ne!(
+                    pinned,
+                    SyscallError::ENOSYS,
+                    "DISPATCHED_PROMISED {} is an ENOSYS stub ({})",
+                    nr,
+                    handler
+                );
+            }
+        }
+        for &(nr, kind, _) in INTENTIONAL_UNDISPATCHED {
+            match (kind, handler_of(nr)) {
+                (UndispatchedKind::NoArm, None) => {}
+                (UndispatchedKind::NoArm, Some(handler)) => {
+                    panic!(
+                        "exemption {} claims no arm but dispatches to {}",
+                        nr, handler
+                    )
+                }
+                (UndispatchedKind::EnosysStub, None) => {
+                    panic!("exemption {} claims a stub arm but has none", nr)
+                }
+                (UndispatchedKind::EnosysStub, Some(handler)) => {
+                    let (result, _) = probe_fixed_errno_stub(handler).unwrap_or_else(|| {
+                        panic!("exemption {}: no stub probe for {}", nr, handler)
+                    });
+                    assert_eq!(
+                        result,
+                        Err(SyscallError::ENOSYS),
+                        "{} must be ENOSYS",
+                        handler
+                    );
+                }
+            }
+        }
+        for &nr in PRIVATE_NEVER_PLEDGED {
+            assert!(
+                handler_of(nr).is_some(),
+                "private syscall {} lost its arm",
+                nr
+            );
+        }
+
+        // R190-1: a syscall that would expose a feature-absent LSM hook family
+        // has no arm, or only a fixed-errno stub. Wiring it for real requires
+        // removing the census entry, which then requires a hook caller.
+        for entry in lsm::FEATURE_ABSENT_HOOKS {
+            for &nr in entry.syscalls {
+                if let Some(handler) = handler_of(nr) {
+                    let (result, pinned) = probe_fixed_errno_stub(handler).unwrap_or_else(|| {
+                        panic!(
+                            "syscall {} ({}) reaches feature-absent {}: wire the hook \
+                                 and drop the FEATURE_ABSENT_HOOKS entry",
+                            nr, handler, entry.hook
+                        )
+                    });
+                    assert_eq!(
+                        result,
+                        Err(pinned),
+                        "{} is no longer its fixed-errno stub but {} is still \
+                         feature-absent: wire the hook and drop the entry",
+                        handler,
+                        entry.hook
+                    );
+                }
+            }
+        }
+
+        // The boot self-test itself must also hold on the corrected lists.
+        run_pledge_dispatch_parity_self_test();
     }
 }
 
@@ -17415,6 +17541,7 @@ fn sys_futex(
     const FUTEX_LOCK_PI: i32 = 3;
     const FUTEX_UNLOCK_PI: i32 = 4;
 
+    let linux_op = op as u32;
     let request = decode_linux_futex_op(op, val, timeout_ptr, val3)?;
     let (op, timeout_kind) = match request {
         LinuxFutexOp::Wait(None) => (FUTEX_WAIT, None),
@@ -17451,6 +17578,12 @@ fn sys_futex(
     // E.4 PI: FUTEX_LOCK_PI 也需要读取用户内存
     let reads_word = op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI;
     verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), reads_word)?;
+
+    // R190-1 FIX: MAC-mediate the futex operation (raw Linux op word) after
+    // argument validation and before any word read, wait or wake. Unreadable
+    // credentials fail closed with EPERM, as at syscall entry.
+    let lsm_ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_ipc_futex(&lsm_ctx, uaddr, linux_op).map_err(lsm_error_to_syscall)?;
 
     // 获取回调函数
     let futex_fn = {

@@ -37,7 +37,7 @@ mod open_fault_probe;
 /// the canonical SHA-256 digest retain the existing u64 ABI while removing the
 /// practical collision attack.
 #[inline]
-fn hash_path(path: &str) -> u64 {
+pub(crate) fn hash_path(path: &str) -> u64 {
     let digest = kernel_crypto::sha256::Sha256::digest(path.as_bytes());
     u64::from_le_bytes(
         digest[..8]

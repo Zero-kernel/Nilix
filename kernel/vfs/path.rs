@@ -617,6 +617,16 @@ pub(crate) fn resolve(
             cursor = end;
             continue;
         }
+        // R190-1 FIX: per-component MAC mediation. `hook_file_lookup` had no
+        // caller, so the walk itself (as opposed to the final operation) was
+        // invisible to policy. It runs after the DAC search check and before
+        // the filesystem lookup, keyed like the other file hooks.
+        lsm::hook_file_lookup(
+            &context.subject,
+            current.inode.ino(),
+            crate::manager::hash_path(component),
+        )
+        .map_err(|_| FsError::PermDenied)?;
         let inode = match current.mount.fs.lookup(&current.inode, component) {
             Ok(inode) => inode,
             Err(FsError::NotFound) if allow_missing && is_last && !trailing_slash => {

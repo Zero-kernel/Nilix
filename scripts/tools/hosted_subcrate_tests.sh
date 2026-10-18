@@ -215,7 +215,7 @@ run_suite vfs 63 0 \
     --features host_harness \
     --lib --locked
 
-run_suite kernel-core 91 0 \
+run_suite kernel-core 92 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -229,6 +229,8 @@ run_suite kernel-core 91 0 \
 # Compile it directly so Cargo never tries to link the no_std kernel binary's
 # panic/allocation handlers into a hosted std test process.
 run_standalone_rust_suite kernel-coverage 3 0 kernel tests/test_coverage.rs
+# R190-1: every LSM hook has a production caller or a feature-absent entry.
+run_standalone_rust_suite lsm-hook-census 3 0 kernel tests/lsm_hook_census.rs
 run_standalone_rust_suite iommu-register-window 11 0 kernel/iommu register_window.rs
 run_standalone_rust_suite iommu-init-state 5 0 kernel/iommu init_state.rs
 
@@ -246,7 +248,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 3 91 \
+run_suite mitigation-mappings 3 92 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

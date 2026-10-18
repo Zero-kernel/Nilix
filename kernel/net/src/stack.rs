@@ -53,7 +53,7 @@ use crate::fragment::{
 };
 use crate::icmp::{
     build_dest_unreachable_limited, build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER,
-    ICMP_TYPE_ECHO_REQUEST,
+    ICMP_TYPE_DEST_UNREACHABLE, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
@@ -414,6 +414,28 @@ pub enum DropReason {
         rule_id: Option<u32>,
         rejected: bool,
     },
+    /// R190-1: the LSM control-plane hook (`hook_net_control`) denied a
+    /// kernel-generated control reply (ICMP echo reply or error).
+    PolicyDenied,
+}
+
+/// R190-1 FIX: mediate a kernel-generated ICMP reply through the LSM
+/// control-plane hook. `src_ip`/`dst_ip` are the reply's addresses.
+#[inline]
+fn icmp_control_allowed(
+    op: lsm::NetControlOp,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    icmp_type: u8,
+    icmp_code: u8,
+) -> bool {
+    lsm::hook_net_control(&lsm::NetControlCtx {
+        op,
+        src_ip: u32::from_be_bytes(src_ip.0),
+        dst_ip: u32::from_be_bytes(dst_ip.0),
+        proto_data: (u32::from(icmp_type) << 8) | u32::from(icmp_code),
+    })
+    .is_ok()
 }
 
 // ============================================================================
@@ -1150,6 +1172,16 @@ fn process_icmp(
         if !ICMP_RATE_LIMITER.allow(now_ms) {
             stats.inc_rate_limited();
             return ProcessResult::Dropped(DropReason::RateLimited);
+        }
+
+        if !icmp_control_allowed(
+            lsm::NetControlOp::IcmpEchoReply,
+            our_ip,
+            ip_hdr.src,
+            ICMP_TYPE_ECHO_REPLY,
+            0,
+        ) {
+            return ProcessResult::Dropped(DropReason::PolicyDenied);
         }
 
         // Build ICMP echo reply
@@ -3075,6 +3107,17 @@ fn apply_firewall_verdict(
                     }));
                 }
             };
+            // Mediated after the ICMP rate limiter (inside the builder), so a
+            // denying policy cannot be driven into unthrottled audit records.
+            if !icmp_control_allowed(
+                lsm::NetControlOp::IcmpError,
+                ip_hdr.dst,
+                ip_hdr.src,
+                ICMP_TYPE_DEST_UNREACHABLE,
+                icmp_code,
+            ) {
+                return Some(ProcessResult::Dropped(DropReason::PolicyDenied));
+            }
             let ip_reply = build_ipv4_header(
                 ip_hdr.dst,
                 ip_hdr.src,

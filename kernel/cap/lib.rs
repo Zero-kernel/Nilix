@@ -22,8 +22,13 @@
 //! - Call `lsm::hook_task_cap_modify()` BEFORE capability operations for user-initiated requests
 //! - Call `audit::emit_capability_event()` AFTER successful operations
 //!
-//! The syscall handlers (`sys_cap_allocate`, `sys_cap_revoke`, etc.) already do this.
-//! Internal kernel paths (fork, exec) are allowed to bypass these hooks.
+//! Capability allocation for user-visible handles goes through the
+//! LSM/audit-composed `AuthorizedCapReservation` in `kernel_core`. No syscall
+//! exposes [`CapTable::revoke`] or [`CapTable::delegate`] today: revocation
+//! happens only on internal paths (fd close refcount release, self-tests).
+//! R190-10/R190-1: a future user-initiated revoke or delegate syscall must
+//! call `lsm::hook_task_cap_modify` with `cap_op::REVOKE`/`cap_op::DELEGATE`
+//! first. Internal kernel paths (fork, exec, fd teardown) may bypass the hooks.
 //!
 //! # Architecture
 //!
@@ -473,6 +478,13 @@ impl CapTable {
     /// * `Err(CapError::InvalidCapId)` - Source CapId is invalid
     /// * `Err(CapError::DelegationDenied)` - Source has NOXFER flag
     /// * `Err(CapError::TableFull)` - No slots available
+    ///
+    /// # Security
+    ///
+    /// R190-1: no production caller exists. A user-reachable caller must first
+    /// call `lsm::hook_task_cap_modify(.., cap_op::DELEGATE)`; the LSM hook
+    /// census (`kernel/tests/lsm_hook_census.rs`) rejects a production
+    /// `.delegate(` call in a file that never names `cap_op::DELEGATE`.
     pub fn delegate(
         &self,
         cap_id: CapId,

@@ -229,6 +229,11 @@ fn pipe_create_callback(flags: u32) -> Result<(i32, i32), SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
+    // R190-1 FIX: MAC-mediate pipe creation (both pipe and pipe2 land here)
+    // before any pipe object, capability or descriptor exists.
+    let subject = kernel_core::lsm_process_ctx_from(&process.lock())?;
+    lsm::hook_ipc_pipe(&subject).map_err(kernel_core::lsm_error_to_syscall)?;
+
     // 创建管道（锁外 — 对象创建没有 cap/fd 副作用）
     let pipe_flags = PipeFlags {
         nonblock: flags & process::FILE_STATUS_NONBLOCK != 0,
