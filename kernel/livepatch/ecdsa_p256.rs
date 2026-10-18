@@ -284,8 +284,10 @@ fn run_kat() -> bool {
 
 /// Verify an ECDSA P-256 signature over a SHA-256 prehash (digest).
 ///
-/// This is the raw verification function WITHOUT KAT gate. Use `verify_prehash()`
-/// for production code, which enforces the KAT gate.
+/// This is the raw verification function WITHOUT KAT gate; only the KAT uses it.
+/// Production code uses [`verify_prehash_any`], which enforces the KAT gate and
+/// the multi-key rotation semantics. R190-12: the former single-key public
+/// verifier was removed so no caller can silently narrow key rotation.
 fn verify_prehash_unchecked(
     pubkey_uncompressed: &[u8; 65],
     digest: &[u8; 32],
@@ -314,33 +316,6 @@ fn verify_prehash_unchecked(
 // ============================================================================
 // Public API
 // ============================================================================
-
-/// Verify an ECDSA P-256 signature over a SHA-256 prehash (digest).
-///
-/// This function is KAT-gated: it returns `Err(KatFailed)` until the FIPS
-/// Known Answer Test passes. After KAT passes, verification is performed.
-///
-/// # Arguments
-///
-/// * `pubkey_uncompressed` - SEC1 uncompressed public key (65 bytes, 0x04 prefix)
-/// * `digest` - SHA-256 digest of the message (32 bytes)
-/// * `sig_rs` - IEEE P1363 fixed-size signature (64 bytes, r||s big-endian)
-///
-/// # Returns
-///
-/// * `Ok(())` - Signature is valid.
-/// * `Err(VerifyError)` - Signature verification failed for the specified reason.
-#[allow(dead_code)]
-pub fn verify_prehash(
-    pubkey_uncompressed: &[u8; 65],
-    digest: &[u8; 32],
-    sig_rs: &[u8; 64],
-) -> Result<(), VerifyError> {
-    if !ensure_kat() {
-        return Err(VerifyError::KatFailed);
-    }
-    verify_prehash_unchecked(pubkey_uncompressed, digest, sig_rs)
-}
 
 /// Verify an ECDSA P-256 signature against multiple trusted public keys.
 ///
