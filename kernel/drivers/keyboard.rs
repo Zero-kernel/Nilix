@@ -50,6 +50,11 @@ pub struct KeyboardBuffer {
     count: usize,
     /// Characters rejected because the bounded input ring was full.
     dropped: u64,
+    /// R190-3 FIX: consumer generation, advanced by every operation that
+    /// removes bytes. Producers only append and never move `read_pos`, so an
+    /// unchanged generation proves a previously peeked prefix is still the
+    /// front of the ring.
+    consumed: u64,
     /// Shift key state (true if pressed)
     shift_pressed: bool,
     /// Ctrl key state (true if pressed)
@@ -67,6 +72,7 @@ impl KeyboardBuffer {
             write_pos: 0,
             count: 0,
             dropped: 0,
+            consumed: 0,
             shift_pressed: false,
             ctrl_pressed: false,
             caps_lock: false,
@@ -120,6 +126,7 @@ impl KeyboardBuffer {
         let ch = self.buffer[self.read_pos];
         self.read_pos = (self.read_pos + 1) % BUFFER_SIZE;
         self.count -= 1;
+        self.consumed = self.consumed.wrapping_add(1);
         Some(ch)
     }
 
@@ -157,19 +164,31 @@ impl KeyboardBuffer {
         let count = count.min(self.count);
         self.read_pos = (self.read_pos + count) % BUFFER_SIZE;
         self.count -= count;
+        self.consumed = self.consumed.wrapping_add(1);
     }
 
-    fn read_with_commit<E, F>(&mut self, buf: &mut [u8], commit: F) -> Result<usize, E>
-    where
-        F: FnOnce(&[u8]) -> Result<(), E>,
-    {
-        let count = self.peek(buf);
-        if count == 0 {
-            return Ok(0);
+    /// R190-3 FIX: peek like [`Self::peek`] and return the consumer generation
+    /// that [`Self::consume_if_generation`] later validates.
+    fn peek_with_generation(&self, buf: &mut [u8]) -> (usize, u64) {
+        (self.peek(buf), self.consumed)
+    }
+
+    /// R190-3 FIX: consume a prefix peeked at `generation` only if no other
+    /// reader removed bytes in between. Returns whether the prefix was taken.
+    fn consume_if_generation(&mut self, count: usize, generation: u64) -> bool {
+        if self.consumed != generation {
+            return false;
         }
-        commit(&buf[..count])?;
         self.consume(count);
-        Ok(count)
+        true
+    }
+
+    /// Drop all buffered input.
+    fn clear(&mut self) {
+        self.read_pos = 0;
+        self.write_pos = 0;
+        self.count = 0;
+        self.consumed = self.consumed.wrapping_add(1);
     }
 
     /// Process a PS/2 Set 1 scancode
@@ -334,9 +353,37 @@ impl KeyboardBuffer {
 lazy_static! {
     /// Global keyboard input buffer
     ///
-    /// Protected by a spin lock for IRQ-safe access.
+    /// Protected by a spin lock for IRQ-safe access. Access it only through
+    /// [`with_buffer`].
     static ref KEYBOARD_BUFFER: Mutex<KeyboardBuffer> = Mutex::new(KeyboardBuffer::new());
 }
+
+/// R190-3 FIX: the only way to touch `KEYBOARD_BUFFER`.
+///
+/// The keyboard and serial IRQ handlers spin on this lock. That is sound on SMP
+/// only if every holder runs with IRQs masked on its own CPU and does bounded,
+/// non-faulting work. The closure receives only the ring (copying at most
+/// `BUFFER_SIZE` kernel bytes). User copyout always runs after the guard is
+/// dropped and IRQs are restored (see [`read_buf_with_commit`]). Before this,
+/// `read_buf_with_commit` ran `copy_to_user` under the lock, so an IRQ handler
+/// on another CPU could spin for as long as a user page fault took.
+#[inline]
+fn with_buffer<R>(f: impl FnOnce(&mut KeyboardBuffer) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut KEYBOARD_BUFFER.lock()))
+}
+
+/// R190-3 FIX: serializes keyboard consumers. IRQ producers never take it.
+///
+/// Every operation that removes bytes holds this lock outside `with_buffer`
+/// (lock order: `KEYBOARD_CONSUMER` before `KEYBOARD_BUFFER`). In
+/// [`read_buf_with_commit`] it spans peek, user copyout and consume, so the
+/// commit runs exactly once (the VFS read transaction rejects a second
+/// commit) and no other reader can take the peeked prefix. Holding a spin lock
+/// across a faultable copyout is bounded: every consumer runs in process
+/// context, the kernel does not preempt kernel-mode code, and page-fault
+/// resolution never sleeps (it retries or fixes up). IRQs stay enabled while
+/// the lock is held, and producers never contend for it.
+static KEYBOARD_CONSUMER: Mutex<()> = Mutex::new(());
 
 /// Counter for dropped bytes due to buffer full or lock contention
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -351,23 +398,19 @@ static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// It decodes the PS/2 Set 1 scancode and pushes any resulting
 /// character into the keyboard buffer.
 ///
-/// Uses blocking lock - safe because:
-/// 1. IRQ handler has interrupts disabled on this CPU
-/// 2. Consumer (read_buf) uses without_interrupts() before locking
-/// 3. Lock hold time is very short in both cases
+/// Uses a blocking lock, which is safe because every holder goes through
+/// [`with_buffer`]: IRQs are masked on the holder's CPU and the critical section
+/// is a bounded ring operation with no user copyout (R190-3).
 ///
 /// # Arguments
 ///
 /// * `scancode` - Raw PS/2 Set 1 scancode from port 0x60
 #[inline]
 pub fn push_scancode(scancode: u8) {
-    // U51-4 FIX: make IRQ exclusion explicit at the API boundary.  Hardware
-    // normally enters with IF=0, but callers/tests may invoke this helper from
-    // a soft-interrupt path where that convention is not guaranteed.
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        buffer.process_scancode(scancode);
-    });
+    // U51-4 FIX: IRQ exclusion stays explicit at the API boundary (in
+    // `with_buffer`). Hardware enters with IF=0, but callers/tests may invoke
+    // this helper from a soft-interrupt path where that is not guaranteed.
+    with_buffer(|buffer| buffer.process_scancode(scancode));
 }
 
 /// Push a raw ASCII character directly into the keyboard buffer
@@ -376,10 +419,7 @@ pub fn push_scancode(scancode: u8) {
 /// for `-nographic` mode input. The character is already ASCII,
 /// no scancode conversion is needed.
 ///
-/// Uses blocking lock - safe because:
-/// 1. IRQ handler has interrupts disabled on this CPU
-/// 2. Consumer (read_buf) uses without_interrupts() before locking
-/// 3. Lock hold time is very short in both cases
+/// Uses a blocking lock; see [`push_scancode`] for why that is bounded.
 ///
 /// # Arguments
 ///
@@ -390,15 +430,11 @@ pub fn push_scancode(scancode: u8) {
 /// `true` if character was pushed, `false` if buffer full
 #[inline]
 pub fn push_char(ch: u8) -> bool {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        if buffer.push(ch) {
-            true
-        } else {
-            DROPPED_BYTES.fetch_add(1, Ordering::Relaxed);
-            false
-        }
-    })
+    let pushed = with_buffer(|buffer| buffer.push(ch));
+    if !pushed {
+        DROPPED_BYTES.fetch_add(1, Ordering::Relaxed);
+    }
+    pushed
 }
 
 /// Read characters from the keyboard buffer
@@ -418,24 +454,34 @@ pub fn push_char(ch: u8) -> bool {
 /// Interrupts are disabled while holding the buffer lock to prevent
 /// deadlock with the keyboard/serial interrupt handlers.
 pub fn read_buf(buf: &mut [u8]) -> usize {
-    // Disable interrupts to prevent deadlock with IRQ handlers
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        buffer.read(buf)
-    })
+    let _consumer = KEYBOARD_CONSUMER.lock();
+    with_buffer(|buffer| buffer.read(buf))
 }
 
-/// R180-L1: perform copyout before consuming keyboard bytes. The lock and
-/// interrupt exclusion cover the bounded callback, so another reader cannot
-/// steal the peeked prefix between validation and commit.
+/// R180-L1: perform copyout before consuming keyboard bytes, so a failed
+/// copyout loses nothing.
+///
+/// R190-3 FIX: the copyout no longer runs under the IRQ-shared buffer lock.
+/// The prefix is peeked into the caller's kernel staging buffer, that lock is
+/// dropped and IRQs are restored, `commit` copies to user memory (and may
+/// fault), and the prefix is then consumed. `KEYBOARD_CONSUMER` is held
+/// throughout, so `commit` runs exactly once and the prefix cannot change.
+/// The consumer generation re-checks that invariant.
 pub fn read_buf_with_commit<E, F>(buf: &mut [u8], commit: F) -> Result<usize, E>
 where
     F: FnOnce(&[u8]) -> Result<(), E>,
 {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        buffer.read_with_commit(buf, commit)
-    })
+    let _consumer = KEYBOARD_CONSUMER.lock();
+    let (count, generation) = with_buffer(|buffer| buffer.peek_with_generation(buf));
+    if count == 0 {
+        return Ok(0);
+    }
+    commit(&buf[..count])?;
+    let consumed = with_buffer(|buffer| buffer.consume_if_generation(count, generation));
+    // Unreachable unless a consumer bypasses KEYBOARD_CONSUMER. Leaving the
+    // bytes queued is the non-destructive outcome.
+    debug_assert!(consumed, "keyboard consumer bypassed KEYBOARD_CONSUMER");
+    Ok(count)
 }
 
 /// Read a single character from the keyboard buffer
@@ -446,10 +492,8 @@ where
 ///
 /// The next character, or None if buffer empty
 pub fn read_char() -> Option<u8> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        buffer.pop()
-    })
+    let _consumer = KEYBOARD_CONSUMER.lock();
+    with_buffer(|buffer| buffer.pop())
 }
 
 /// Check if keyboard input is available
@@ -458,30 +502,20 @@ pub fn read_char() -> Option<u8> {
 ///
 /// true if there is at least one character in the buffer
 pub fn has_input() -> bool {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let buffer = KEYBOARD_BUFFER.lock();
-        !buffer.is_empty()
-    })
+    with_buffer(|buffer| !buffer.is_empty())
 }
 
 /// Get number of characters available in the buffer
 pub fn available() -> usize {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let buffer = KEYBOARD_BUFFER.lock();
-        buffer.available()
-    })
+    with_buffer(|buffer| buffer.available())
 }
 
 /// Clear all buffered keyboard input
 ///
 /// Useful for flushing stale input after mode switches.
 pub fn clear() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buffer = KEYBOARD_BUFFER.lock();
-        buffer.read_pos = 0;
-        buffer.write_pos = 0;
-        buffer.count = 0;
-    })
+    let _consumer = KEYBOARD_CONSUMER.lock();
+    with_buffer(|buffer| buffer.clear())
 }
 
 /// Get number of characters dropped due to buffer full or lock contention
@@ -531,17 +565,46 @@ mod tests {
         assert!(buffer.push(b'y'));
         let mut staging = [0u8; 2];
 
-        let failed = buffer.read_with_commit(&mut staging, |_bytes| Err::<(), _>(()));
-        assert!(failed.is_err());
+        // A failed copyout never reaches the consume step.
+        let (count, generation) = buffer.peek_with_generation(&mut staging);
+        assert_eq!(count, 2);
         assert_eq!(buffer.available(), 2);
 
-        let copied = buffer
-            .read_with_commit(&mut staging, |bytes| {
-                assert_eq!(bytes, b"xy");
-                Ok::<(), ()>(())
-            })
-            .expect("retry must see the same keyboard bytes");
-        assert_eq!(copied, 2);
+        let (retry, retry_generation) = buffer.peek_with_generation(&mut staging);
+        assert_eq!((retry, retry_generation), (count, generation));
+        assert_eq!(&staging, b"xy");
+        assert!(buffer.consume_if_generation(retry, retry_generation));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn r190_3_concurrent_consumer_invalidates_peeked_prefix() {
+        let mut buffer = KeyboardBuffer::new();
+        for &ch in b"abc" {
+            assert!(buffer.push(ch));
+        }
+        let mut first = [0u8; 2];
+        let (count, generation) = buffer.peek_with_generation(&mut first);
+        assert_eq!(&first, b"ab");
+
+        // A producer append keeps the peeked prefix valid.
+        assert!(buffer.push(b'd'));
+        // Another reader takes 'a' before the first reader commits.
+        assert_eq!(buffer.pop(), Some(b'a'));
+        assert!(
+            !buffer.consume_if_generation(count, generation),
+            "stale prefix must not be consumed"
+        );
+        assert_eq!(buffer.available(), 3);
+
+        let mut retry = [0u8; 2];
+        let (count, generation) = buffer.peek_with_generation(&mut retry);
+        assert_eq!(&retry, b"bc");
+        assert!(buffer.consume_if_generation(count, generation));
+        assert_eq!(buffer.pop(), Some(b'd'));
+
+        let generation = buffer.peek_with_generation(&mut retry).1;
+        buffer.clear();
+        assert!(!buffer.consume_if_generation(0, generation));
     }
 }

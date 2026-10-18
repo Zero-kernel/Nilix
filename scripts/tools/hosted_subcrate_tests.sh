@@ -140,9 +140,9 @@ run_suite audit 16 0 \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
-# R190-13: the serial control-character sanitizer and the keyboard ring
-# tests are pure logic over the drivers crate.
-run_suite drivers 3 0 \
+# R190-3/R190-13: keyboard ring generation protocol and the serial
+# control-character sanitizer are pure logic over the drivers crate.
+run_suite drivers 4 0 \
     --manifest-path kernel/drivers/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features cpu_local/host_harness \
