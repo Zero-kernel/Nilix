@@ -3402,7 +3402,9 @@ impl RuntimeTest for NetNsTxIsolationTest {
                     let _ = self.child.remove_device(self.eth0_idx);
                 }
                 if self.root_rules_dirty {
-                    net::firewall_table().replace_rules(net::firewall_default_rules());
+                    net::firewall_table()
+                        .replace_rules(net::firewall_default_rules())
+                        .expect("fixture rules fit MAX_FIREWALL_RULES");
                 }
             }
         }
@@ -3439,10 +3441,12 @@ impl RuntimeTest for NetNsTxIsolationTest {
                 e
             ));
         }
-        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9001)
-            .priority(i32::MAX)
-            .action(FirewallAction::Accept)
-            .build()]);
+        net::firewall_table_for_ns(cid)
+            .replace_rules(alloc::vec![FirewallRule::builder(9001)
+                .priority(i32::MAX)
+                .action(FirewallAction::Accept)
+                .build()])
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         let mut guard = TxIsoGuard {
             child: child.clone(),
             eth0_idx,
@@ -3660,7 +3664,9 @@ impl RuntimeTest for NetNsTxIsolationTest {
                 .action(FirewallAction::Accept)
                 .build(),
         );
-        net::firewall_table().replace_rules(root_rules);
+        net::firewall_table()
+            .replace_rules(root_rules)
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         let s6 = match Self::snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
@@ -3681,7 +3687,9 @@ impl RuntimeTest for NetNsTxIsolationTest {
                 Self::enq_delta(&s6, &s7)
             ));
         }
-        net::firewall_table().replace_rules(net::firewall_default_rules());
+        net::firewall_table()
+            .replace_rules(net::firewall_default_rules())
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         guard.root_rules_dirty = false;
 
         // Leg 6: ownership truth table + stale-ns fail-closure. The guard is
@@ -5110,11 +5118,13 @@ impl RuntimeTest for NetNsConfigIsolationTest {
         // device.  The queue result is asserted below; a pre-policy
         // FirewallDenied would leave the counters unchanged and fail closed.
         let fw2 = fw.stats();
-        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9102)
-            .priority(i32::MAX)
-            .src_ip(IpCidrMatch::host(re.our_ip))
-            .action(FirewallAction::Accept)
-            .build()]);
+        net::firewall_table_for_ns(cid)
+            .replace_rules(alloc::vec![FirewallRule::builder(9102)
+                .priority(i32::MAX)
+                .src_ip(IpCidrMatch::host(re.our_ip))
+                .action(FirewallAction::Accept)
+                .build()])
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         match net::transmit_udp_datagram(dst, &configured_datagram, cid) {
             Ok(()) => {}
             other => {
@@ -5162,11 +5172,13 @@ impl RuntimeTest for NetNsConfigIsolationTest {
         }
         // Negative control: the same rule keyed on the ROOT's IP must MISS
         // (default-deny fires) — the firewall never saw the root's identity.
-        net::firewall_table_for_ns(cid).replace_rules(alloc::vec![FirewallRule::builder(9103)
-            .priority(i32::MAX)
-            .src_ip(IpCidrMatch::host(global.our_ip))
-            .action(FirewallAction::Accept)
-            .build()]);
+        net::firewall_table_for_ns(cid)
+            .replace_rules(alloc::vec![FirewallRule::builder(9103)
+                .priority(i32::MAX)
+                .src_ip(IpCidrMatch::host(global.our_ip))
+                .action(FirewallAction::Accept)
+                .build()])
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         match net::transmit_udp_datagram(dst, &configured_datagram, cid) {
             Err(TxError::FirewallDenied) => {}
             other => {
@@ -6605,7 +6617,9 @@ struct RootFwRestore;
 
 impl Drop for RootFwRestore {
     fn drop(&mut self) {
-        net::firewall_table().replace_rules(net::firewall_default_rules());
+        net::firewall_table()
+            .replace_rules(net::firewall_default_rules())
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
     }
 }
 
@@ -6761,7 +6775,9 @@ impl RuntimeTest for NetNsArpProbeTxTest {
                 .action(FirewallAction::Accept)
                 .build(),
         );
-        net::firewall_table().replace_rules(fixture_rules);
+        net::firewall_table()
+            .replace_rules(fixture_rules)
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         let _fw_restore = RootFwRestore;
 
         let ingress_stats = net::rx_ingress_net_stats();
@@ -7212,7 +7228,9 @@ impl RuntimeTest for NetNsPendingFrameTest {
                 .action(FirewallAction::Accept)
                 .build(),
         );
-        net::firewall_table_for_ns(cid).replace_rules(fixture_rules.clone());
+        net::firewall_table_for_ns(cid)
+            .replace_rules(fixture_rules.clone())
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
 
         let ingress_stats = net::rx_ingress_net_stats();
 
@@ -7343,7 +7361,9 @@ impl RuntimeTest for NetNsPendingFrameTest {
             ));
         }
 
-        net::firewall_table_for_ns(cid).replace_rules(net::firewall_default_rules());
+        net::firewall_table_for_ns(cid)
+            .replace_rules(net::firewall_default_rules())
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
         let sr0 = match NetNsRxIngressTest::eth0_snapshot() {
             Ok(s) => s,
             Err(fail) => return fail,
@@ -7368,7 +7388,9 @@ impl RuntimeTest for NetNsPendingFrameTest {
                 ctrs_after_revoke.retx_failures
             ));
         }
-        net::firewall_table_for_ns(cid).replace_rules(fixture_rules.clone());
+        net::firewall_table_for_ns(cid)
+            .replace_rules(fixture_rules.clone())
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
 
         // Leg 3: expiry-before-ready drops frame (TTL=3s, wait 3.5s).
         let target3 = Ipv4Addr([10, 88, 0, 11]);

@@ -3907,11 +3907,13 @@ mod tests {
         );
 
         firewall_remove_ns(REPLY_NS);
-        firewall_table_for_ns(REPLY_NS).replace_rules(alloc::vec![FirewallRule::builder(51)
-            .priority(i32::MAX)
-            .proto(Ipv4Proto::Udp)
-            .action(FirewallAction::Drop)
-            .build(),]);
+        firewall_table_for_ns(REPLY_NS)
+            .replace_rules(alloc::vec![FirewallRule::builder(51)
+                .priority(i32::MAX)
+                .proto(Ipv4Proto::Udp)
+                .action(FirewallAction::Drop)
+                .build(),])
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
 
         let make_reply = |udp: &[u8]| {
             let ip = build_ipv4_header(local_ip, peer_ip, Ipv4Proto::Udp, udp.len() as u16, 64);
@@ -4070,22 +4072,24 @@ mod tests {
         ct_drain_ns(NS);
         firewall_remove_ns(NS);
         let firewall = firewall_table_for_ns(NS);
-        firewall.replace_rules(alloc::vec![
-            FirewallRule::builder(41)
-                .priority(200)
-                .src_ip(IpCidrMatch::host(local_ip))
-                .dst_ip(IpCidrMatch::host(peer_ip))
-                .proto(Ipv4Proto::Tcp)
-                .action(FirewallAction::Drop)
-                .build(),
-            FirewallRule::builder(42)
-                .priority(100)
-                .src_ip(IpCidrMatch::host(peer_ip))
-                .dst_ip(IpCidrMatch::host(local_ip))
-                .proto(Ipv4Proto::Tcp)
-                .action(FirewallAction::Accept)
-                .build(),
-        ]);
+        firewall
+            .replace_rules(alloc::vec![
+                FirewallRule::builder(41)
+                    .priority(200)
+                    .src_ip(IpCidrMatch::host(local_ip))
+                    .dst_ip(IpCidrMatch::host(peer_ip))
+                    .proto(Ipv4Proto::Tcp)
+                    .action(FirewallAction::Drop)
+                    .build(),
+                FirewallRule::builder(42)
+                    .priority(100)
+                    .src_ip(IpCidrMatch::host(peer_ip))
+                    .dst_ip(IpCidrMatch::host(local_ip))
+                    .proto(Ipv4Proto::Tcp)
+                    .action(FirewallAction::Accept)
+                    .build(),
+            ])
+            .expect("fixture rules fit MAX_FIREWALL_RULES");
 
         let syn = build_tcp_segment(
             peer_ip,

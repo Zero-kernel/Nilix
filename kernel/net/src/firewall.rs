@@ -423,6 +423,21 @@ pub struct FirewallVerdict {
 // Firewall Table
 // ============================================================================
 
+/// R190-15 FIX: Maximum rules in one firewall table.
+///
+/// [`FirewallTable::evaluate`] walks the rule vector linearly for every packet
+/// on the RX path, under the table's read lock, so the rule count bounds
+/// per-packet work. Tables are admin-written today; the cap is enforced now so
+/// any future netlink/ioctl-style exposure cannot install an unbounded vector.
+pub const MAX_FIREWALL_RULES: usize = 4096;
+
+/// Firewall table administration errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirewallError {
+    /// The rule vector exceeds [`MAX_FIREWALL_RULES`].
+    TooManyRules,
+}
+
 /// The firewall rule table.
 ///
 /// Thread-safe container for firewall rules with atomic replacement support.
@@ -434,20 +449,40 @@ pub struct FirewallTable {
 
 impl FirewallTable {
     /// Create a new firewall table with default action and initial rules.
-    pub fn new_with_rules(default_action: FirewallAction, mut rules: Vec<FirewallRule>) -> Self {
+    ///
+    /// Fails with [`FirewallError::TooManyRules`] above [`MAX_FIREWALL_RULES`].
+    pub fn new_with_rules(
+        default_action: FirewallAction,
+        mut rules: Vec<FirewallRule>,
+    ) -> Result<Self, FirewallError> {
+        Self::check_rule_count(&rules)?;
         Self::sort_rules(&mut rules);
-        Self {
+        Ok(Self {
             rules: RwLock::new(rules),
             default_action,
             stats: FirewallStats::new(),
-        }
+        })
     }
 
     /// Atomically replace all rules.
-    pub fn replace_rules(&self, mut rules: Vec<FirewallRule>) {
+    ///
+    /// R190-15 FIX: an oversized vector is rejected before sorting or taking
+    /// the write lock, so the previous rule set stays in force.
+    pub fn replace_rules(&self, mut rules: Vec<FirewallRule>) -> Result<(), FirewallError> {
+        Self::check_rule_count(&rules)?;
         Self::sort_rules(&mut rules);
         let mut guard = self.rules.write();
         *guard = rules;
+        Ok(())
+    }
+
+    #[inline]
+    fn check_rule_count(rules: &[FirewallRule]) -> Result<(), FirewallError> {
+        if rules.len() > MAX_FIREWALL_RULES {
+            Err(FirewallError::TooManyRules)
+        } else {
+            Ok(())
+        }
     }
 
     /// Get the number of rules.
@@ -678,7 +713,8 @@ pub fn try_firewall_table_for_ns(ns_id: u64) -> Option<Arc<FirewallTable>> {
     }
 
     let rules = default_rules_try()?;
-    let table = Arc::try_new(FirewallTable::new_with_rules(FirewallAction::Drop, rules)).ok()?;
+    let table = FirewallTable::new_with_rules(FirewallAction::Drop, rules).ok()?;
+    let table = Arc::try_new(table).ok()?;
     // Reserve and charge map backing before publication.  Ingress therefore
     // sees `None` under heap pressure instead of an allocator abort from an
     // infallible BTreeMap insertion.
@@ -846,6 +882,41 @@ mod tests {
         assert!(range.matches(200));
         assert!(!range.matches(79));
         assert!(!range.matches(444));
+    }
+
+    #[test]
+    fn r190_15_replace_rules_is_bounded_and_atomic() {
+        let rule = |id| {
+            FirewallRule::builder(id)
+                .action(FirewallAction::Accept)
+                .build()
+        };
+        let table = FirewallTable::new_with_rules(FirewallAction::Drop, alloc::vec![rule(1)])
+            .expect("one rule fits");
+
+        let mut oversized = Vec::new();
+        oversized.resize_with(MAX_FIREWALL_RULES + 1, || rule(2));
+        assert_eq!(
+            table.replace_rules(oversized),
+            Err(FirewallError::TooManyRules)
+        );
+        assert_eq!(
+            table.rule_count(),
+            1,
+            "rejected replace must keep old rules"
+        );
+
+        let mut at_limit = Vec::new();
+        at_limit.resize_with(MAX_FIREWALL_RULES, || rule(3));
+        assert_eq!(table.replace_rules(at_limit), Ok(()));
+        assert_eq!(table.rule_count(), MAX_FIREWALL_RULES);
+
+        let mut oversized = Vec::new();
+        oversized.resize_with(MAX_FIREWALL_RULES + 1, || rule(4));
+        assert!(matches!(
+            FirewallTable::new_with_rules(FirewallAction::Drop, oversized),
+            Err(FirewallError::TooManyRules)
+        ));
     }
 
     #[test]

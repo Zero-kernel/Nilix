@@ -117,9 +117,9 @@ pub use ethernet::{
 };
 pub use firewall::{
     firewall_default_rules, firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match,
-    try_firewall_table_for_ns, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
-    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
-    IpCidrMatch, PortRange,
+    try_firewall_table_for_ns, CtStateMask, FirewallAction, FirewallError, FirewallPacket,
+    FirewallRule, FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable,
+    FirewallVerdict, IpCidrMatch, PortRange, MAX_FIREWALL_RULES,
 };
 pub use fragment::{
     cleanup_expired_fragments, fragment_cache, process_fragment, FragmentCache, FragmentDropReason,
