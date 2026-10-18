@@ -2,6 +2,13 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R190 Fixes (October 2026)
+
+- **[R190-fix-summary.md](R190-fix-summary.md)** - full-tree audit remediation: 16/16
+  findings repaired or documented (1 HIGH, 4 MEDIUM, 11 LOW) plus D2-ARC-1/D3-RES-1;
+  hosted LSM hook census and dispatcher parity gates added; MODE S with two independent
+  review lenses and re-review; stage-3 review-fix pending.
+
 ## R188 standalone audit remediation (August 2026)
 
 - **[R188-fix-summary.md](R188-fix-summary.md)** - remediation record for

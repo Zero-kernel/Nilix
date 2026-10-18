@@ -11,6 +11,8 @@ keyboard-IRQ lock, R190-4 cpuset privilege layer, R190-5 arch_prctl FS/GS high-h
 7 LOW, plus design findings D2-ARC-1 and D3-RES-1. No new memory-safety defects in any
 partition; cross-partition driver verification falsified two agent-proposed MEDIUMs
 (IOMMU direct-map, DMA gate transition). 12 leads carried to next scoped round.
+Fix stage 2026-10-18: 16/16 repaired or documented, pending review-fix
+([R190 fix summary](../fixes/R190-fix-summary.md)).
 ## Audit Summaries
 
 - **[qa-2026-07-02-summary.md](qa-2026-07-02-summary.md)** - Executive summary of R174 findings
