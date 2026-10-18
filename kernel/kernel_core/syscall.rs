@@ -11232,6 +11232,17 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallRe
 ///
 /// 回调返回的 bytes_read 必须 clamp 到请求的 count，防止恶意/错误回调
 /// 返回超大值导致切片越界 panic。
+/// Resolve `fd` and report whether it names the console.
+///
+/// R190-16: the result is a snapshot taken at syscall entry, the equivalent of
+/// Linux `fdget()`. `ConsoleFile` is a stateless handle onto the one global
+/// console, so finishing an in-flight read/write/ioctl on the console after
+/// another thread `close`s or `dup2`s the descriptor is the same file-lifetime
+/// behavior Linux gives a file reference taken at entry. Non-console
+/// descriptors are re-resolved by the fd callbacks. `close(0/1/2)` has no
+/// special case: `sys_close` removes the console entry like any other
+/// descriptor (EBADF if absent), and later console I/O on that number fails
+/// with EBADF.
 fn lookup_console_file(fd: i32) -> Result<Option<crate::process::ConsoleFile>, SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -12123,7 +12134,9 @@ fn sys_close(fd: i32) -> SyscallResult {
         coverage::trace_pc(1030); // sys_close entry
     }
 
-    // 标准流不能关闭（简化实现）
+    // R190-16: standard streams are ordinary fd-table entries (ConsoleFile).
+    // The close callback removes them like any other descriptor and returns
+    // EBADF for an unused number; there is no console special case.
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1032); // sys_close callback path
