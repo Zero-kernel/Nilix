@@ -11402,24 +11402,27 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         // R162-17 FIX: Avoid infallible from_utf8_lossy which can allocate ~3x
         // input size on all-invalid bytes. Print in chunks using from_utf8
         // on valid spans and individual replacement chars for invalid bytes.
+        // R190-13: user stdout is TTY data, written byte-exact to the serial
+        // console (kernel diagnostics use the sanitizing `print!`).
+        use drivers::vga_buffer::console_write_str;
         match core::str::from_utf8(&tmp) {
-            Ok(s) => print!("{}", s),
+            Ok(s) => console_write_str(s),
             Err(_) => {
                 let mut i = 0;
                 while i < tmp.len() {
                     match core::str::from_utf8(&tmp[i..]) {
                         Ok(s) => {
-                            print!("{}", s);
+                            console_write_str(s);
                             break;
                         }
                         Err(e) => {
                             let valid_end = e.valid_up_to();
                             if valid_end > 0 {
                                 if let Ok(valid) = core::str::from_utf8(&tmp[i..i + valid_end]) {
-                                    print!("{}", valid);
+                                    console_write_str(valid);
                                 }
                             }
-                            print!("\u{FFFD}");
+                            console_write_str("\u{FFFD}");
                             i += valid_end + e.error_len().unwrap_or(1);
                         }
                     }

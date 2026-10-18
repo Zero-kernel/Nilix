@@ -200,6 +200,7 @@ dependencies = [
 name = "drivers"
 version = "0.1.0"
 dependencies = [
+ "cpu_local",
  "lazy_static",
  "spin 0.9.9",
  "x86_64",

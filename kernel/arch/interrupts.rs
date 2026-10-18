@@ -435,13 +435,6 @@ extern "x86-interrupt" fn iommu_probe_irq(_frame: InterruptStackFrame) {
     unsafe { crate::apic::lapic_eoi() };
 }
 
-/// Per-CPU flags to track first timer interrupt (for debug output)
-/// MAX_CPUS = 64 to match cpu_local
-static AP_TIMER_SEEN: [AtomicBool; 64] = {
-    const INIT: AtomicBool = AtomicBool::new(false);
-    [INIT; 64]
-};
-
 lazy_static! {
     /// 全局中断描述符表
     static ref IDT: InterruptDescriptorTable = {
@@ -1879,50 +1872,11 @@ extern "C" fn timer_interrupt_body(
     let cpu_id = cpu_local::current_cpu_id();
     let is_bsp = cpu_id == 0;
 
-    // Debug: Mark first timer interrupt on each AP via direct serial output (lock-free)
-    // This avoids console lock contention in IRQ context
-    if !is_bsp && cpu_id < 64 {
-        if !AP_TIMER_SEEN[cpu_id].swap(true, Ordering::Relaxed) {
-            // Write directly to serial port 0x3F8 without locking
-            // Format: "[T:X]" where X is CPU ID
-            //
-            // R155-14 FIX: Bound UART busy-wait to avoid infinite loop in
-            // hard IRQ context on dead/unresponsive UART. Matches the
-            // bounded MAX_WAIT pattern used in kernel/trace/.
-            unsafe {
-                let port = 0x3F8u16;
-                const MAX_WAIT: u32 = 1000;
-                // Helper: Poll LSR bit 5 (THR empty) with bounded loop
-                macro_rules! uart_wait_thr {
-                    () => {
-                        for _ in 0..MAX_WAIT {
-                            if (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5)
-                                .read()
-                                & 0x20)
-                                != 0
-                            {
-                                break;
-                            }
-                        }
-                    };
-                }
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'[');
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'T');
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port)
-                    .write(b'0' + (cpu_id as u8));
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
-                uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'\n');
-            }
-        }
-    }
-
+    // R190-6 FIX: no UART output from timer IRQ context. The former first-tick
+    // "[T:X]" marker wrote THR from hard IRQ context without exclusion, so it
+    // interleaved with console output on other CPUs and spent up to six bounded
+    // LSR polls per AP inside the handler. Nothing consumed it. AP timer
+    // liveness is visible through INTERRUPT_STATS and the per-CPU counters.
     // Only BSP should increment global tick count to avoid time advancing N× faster
     // APs get their own LAPIC timer interrupts but don't maintain wall-clock time
     let timestamp_ms = if is_bsp {

@@ -5,6 +5,7 @@
 
 use core::fmt;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// Physical memory offset for high-half mapping
@@ -416,8 +417,15 @@ impl fmt::Write for FramebufferWriter {
     }
 }
 
-/// Global framebuffer writer
+/// Global framebuffer writer.
+///
+/// R190-7: lock it only inside `vga_buffer::with_display`, which masks IRQs
+/// and detects same-CPU re-entry.
 pub static WRITER: Mutex<FramebufferWriter> = Mutex::new(FramebufferWriter::new());
+
+/// R190-7 FIX: lock-free mirror of `WRITER.initialized`, so every print no
+/// longer takes the writer lock just to choose a backend.
+static FB_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Framebuffer physical base address (for security module to query)
 static mut FRAMEBUFFER_PHYS_BASE: u64 = 0;
@@ -441,19 +449,24 @@ pub fn get_framebuffer_region() -> Option<(u64, usize)> {
 
 /// Initialize framebuffer console with info from bootloader
 pub fn init(info: &FramebufferInfo) {
-    WRITER.lock().init(info);
+    let initialized = crate::vga_buffer::with_display(|| {
+        let mut writer = WRITER.lock();
+        writer.init(info);
+        writer.is_initialized()
+    });
+    FB_INITIALIZED.store(initialized == Some(true), Ordering::Release);
 }
 
 /// Check if framebuffer is initialized
 pub fn is_initialized() -> bool {
-    WRITER.lock().is_initialized()
+    FB_INITIALIZED.load(Ordering::Acquire)
 }
 
-/// Print function used by macros
-#[doc(hidden)]
-pub fn _print(args: fmt::Arguments) {
+/// Render formatted text. The caller holds the display (`with_display`).
+pub(crate) fn write_args(args: fmt::Arguments) {
     use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
+    // A formatting error must not panic while the display is held.
+    let _ = WRITER.lock().write_fmt(args);
 }
 
 // ============================================================================

@@ -10,3 +10,5 @@ path = "lib.rs"
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "0.15"
+# R190-7: names the CPU that owns the console display writer.
+cpu_local = { path = "../cpu_local" }
