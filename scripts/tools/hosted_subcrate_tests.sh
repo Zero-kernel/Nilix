@@ -189,7 +189,7 @@ run_suite cap-cloexec 1 11 \
     --features mm/host_harness \
     --lib --locked -- ksa005_
 
-run_suite net 119 0 \
+run_suite net 120 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \

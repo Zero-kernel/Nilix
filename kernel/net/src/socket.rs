@@ -27,7 +27,8 @@
 //! 1. **Capability Checks**: Each syscall validates CapId and rights
 //! 2. **LSM Hooks**: create/bind/send/recv pass through hook_net_*
 //! 3. **Socket Labels**: Creator credentials captured for MAC decisions
-//! 4. **Queue Limits**: MAX_RX_QUEUE prevents memory exhaustion
+//! 4. **Queue Limits**: MAX_RX_QUEUE (depth), MAX_RX_QUEUE_BYTES (per socket)
+//!    and MAX_GLOBAL_UDP_QUEUED_BYTES (aggregate) bound UDP receive memory
 //! 5. **Port Validation**: Privileged ports require root or capability
 //!
 //! # Example Flow
@@ -751,12 +752,30 @@ impl Default for WaitQueue {
 /// new datagrams are dropped (not an error - normal network behavior).
 const MAX_RX_QUEUE: usize = 64;
 
-/// R132-4 FIX: Maximum aggregate UDP payload bytes queued across all sockets.
+/// R190-2 FIX: Maximum UDP payload bytes queued on one socket.
 ///
-/// Prevents memory exhaustion when many UDP sockets each buffer large datagrams.
-/// 16 MiB is a conservative cap: enough for normal traffic (~250 full-size
-/// datagrams) but prevents unbounded kernel heap growth from UDP flooding.
-const MAX_GLOBAL_UDP_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// The 64-datagram depth cap alone let one socket pin 64 reassembled
+/// datagrams of up to 64 KiB each, which is more than the whole SocketPayload
+/// heap class. Senders could then starve every other socket's receive path,
+/// TCP included. 128 KiB still admits one maximal datagram on an empty socket.
+const MAX_RX_QUEUE_BYTES: usize = 128 * 1024;
+
+/// R132-4 / R190-2 FIX: Maximum aggregate UDP payload bytes queued across all
+/// sockets.
+///
+/// D3-RES-1 FIX: the previous 16 MiB value was 16 times the SocketPayload
+/// class ceiling, so it could never bind and the real limit was incidental
+/// heap-class admission failure. The cap is now half of that class, leaving
+/// the other half for TCP payload and datagram-queue backing. It is a logical
+/// cap subordinate to admission: the class ledger still charges the exact
+/// allocations (INV-RES-02).
+const MAX_GLOBAL_UDP_QUEUED_BYTES: usize = HeapClass::SocketPayload.limit_bytes() / 2;
+
+// INV-RES-02: declared UDP byte budgets fit the admitting heap class, and one
+// maximal datagram fits an empty socket.
+const _: () = assert!(MAX_GLOBAL_UDP_QUEUED_BYTES <= HeapClass::SocketPayload.limit_bytes());
+const _: () = assert!(MAX_RX_QUEUE_BYTES <= MAX_GLOBAL_UDP_QUEUED_BYTES);
+const _: () = assert!(MAX_RX_QUEUE_BYTES >= crate::udp::UDP_MAX_PAYLOAD);
 
 /// R132-4 FIX: Global accounting of UDP payload bytes currently queued.
 ///
@@ -1704,6 +1723,9 @@ pub struct SocketState {
     meta: Mutex<SocketMeta>,
     /// Received datagram queue
     rx_queue: Mutex<AdmittedVec<PendingDatagram>>,
+    /// R190-2 FIX: payload bytes currently in `rx_queue`. Written only while
+    /// `rx_queue` is held, so it always equals the sum of queued payloads.
+    rx_queued_bytes: AtomicUsize,
     /// Wait queue for blocking recv
     waiters: WaitQueue,
     /// Socket closed flag
@@ -1768,6 +1790,7 @@ impl SocketState {
             close_finalizer_claimed: AtomicBool::new(false),
             meta: Mutex::new(SocketMeta::new()),
             rx_queue: Mutex::new(AdmittedVec::new(HeapClass::SocketPayload)),
+            rx_queued_bytes: AtomicUsize::new(0),
             waiters: WaitQueue::new(HeapClass::SocketObject),
             closed: AtomicBool::new(false),
             counted_in_active: AtomicBool::new(false),
@@ -2108,6 +2131,17 @@ impl SocketState {
             return false;
         }
 
+        // R190-2 FIX: per-socket byte cap, checked before the global cap and
+        // before any payload allocation.
+        let socket_queued = self.rx_queued_bytes.load(Ordering::Relaxed);
+        let socket_total = match socket_queued.checked_add(pkt_len) {
+            Some(total) if total <= MAX_RX_QUEUE_BYTES => total,
+            _ => {
+                self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+
         // R180-11 FIX: reserve queue backing before payload allocation or
         // logical publication. The retained capacity remains globally charged
         // and reusable if this datagram is rejected later.
@@ -2155,6 +2189,7 @@ impl SocketState {
             self.rx_dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        self.rx_queued_bytes.store(socket_total, Ordering::Relaxed);
         self.rx_bytes.fetch_add(pkt_len as u64, Ordering::Relaxed);
         self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
         drop(queue);
@@ -2167,7 +2202,14 @@ impl SocketState {
     ///
     /// R132-4 FIX: Decrements GLOBAL_UDP_QUEUED_BYTES on dequeue.
     fn pop_rx(&self) -> Option<PendingDatagram> {
-        let pkt = self.rx_queue.lock().pop_front();
+        let pkt = {
+            let mut queue = self.rx_queue.lock();
+            let pkt = queue.pop_front();
+            if let Some(ref pkt) = pkt {
+                self.release_rx_queued_bytes(pkt.data.len());
+            }
+            pkt
+        };
         if let Some(ref pkt) = pkt {
             // R146-NET-4 FIX: Saturating decrement prevents underflow wrap
             // in case of hypothetical double-dequeue, which would permanently
@@ -2179,6 +2221,16 @@ impl SocketState {
             );
         }
         pkt
+    }
+
+    /// R190-2 FIX: return a dequeued datagram's bytes to the per-socket cap.
+    /// Caller holds `rx_queue`.
+    #[inline]
+    fn release_rx_queued_bytes(&self, bytes: usize) {
+        let queued = self.rx_queued_bytes.load(Ordering::Relaxed);
+        debug_assert!(bytes <= queued, "rx_queued_bytes underflow");
+        self.rx_queued_bytes
+            .store(queued.saturating_sub(bytes), Ordering::Relaxed);
     }
 
     /// Get socket statistics.
@@ -6752,6 +6804,7 @@ impl SocketTable {
                 if removed.is_none() {
                     return Err(RecvTransactionError::Socket(SocketError::InvalidState));
                 }
+                sock.release_rx_queued_bytes(packet_len);
                 let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -15275,6 +15328,52 @@ mod tests {
                 panic!("TCP EOF must not invoke copyout")
             });
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn r190_2_udp_rx_queue_is_byte_capped_per_socket() {
+        let sock = test_socket(190, SocketType::Dgram, SocketProtocol::Udp);
+        let src = Ipv4Addr([10, 19, 0, 2]);
+        let big = alloc::vec![0x42u8; crate::udp::UDP_MAX_PAYLOAD];
+        assert!(
+            sock.enqueue_rx(src, 4000, &big, 1),
+            "one maximal datagram must fit"
+        );
+        assert_eq!(sock.rx_queued_bytes.load(Ordering::Relaxed), big.len());
+
+        let rest = MAX_RX_QUEUE_BYTES - big.len();
+        let filler = alloc::vec![0x24u8; rest];
+        assert!(
+            sock.enqueue_rx(src, 4001, &filler, 2),
+            "fill to the exact cap"
+        );
+        assert!(
+            !sock.enqueue_rx(src, 4002, b"x", 3),
+            "the per-socket byte cap must reject before the depth cap"
+        );
+        assert_eq!(sock.rx_queue.lock().len(), 2);
+        assert_eq!(
+            sock.rx_queued_bytes.load(Ordering::Relaxed),
+            MAX_RX_QUEUE_BYTES
+        );
+
+        let popped = sock.pop_rx().expect("front datagram");
+        assert_eq!(popped.data.len(), big.len());
+        assert_eq!(sock.rx_queued_bytes.load(Ordering::Relaxed), rest);
+        assert!(
+            sock.enqueue_rx(src, 4003, b"y", 4),
+            "released bytes are reusable"
+        );
+
+        let table = SocketTable::new();
+        let current = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        while table
+            .recv_from_udp_with_commit(&sock, &current, CapId::INVALID, Some(0), |packet| {
+                Ok::<usize, ()>(packet.data.len())
+            })
+            .is_ok()
+        {}
+        assert_eq!(sock.rx_queued_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
