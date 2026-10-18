@@ -224,3 +224,23 @@ pub mod sha256 {
         }
     }
 }
+
+/// Constant-time byte-slice equality for MACs, digests and other authenticators.
+///
+/// R190-8 FIX: one shared helper instead of per-crate copies. The loop always
+/// visits every byte and folds differences with OR, so the running time
+/// depends only on the lengths, never on where the first mismatch is.
+/// `black_box` keeps the optimizer from turning the fold into an early exit.
+/// Lengths are not secret here (fixed-size digests), so a length mismatch
+/// returns immediately.
+#[inline(never)]
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= core::hint::black_box(x ^ y);
+    }
+    core::hint::black_box(diff) == 0
+}

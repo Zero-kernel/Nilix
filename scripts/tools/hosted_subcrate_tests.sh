@@ -135,7 +135,7 @@ run_standalone_rust_suite() {
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
-run_suite audit 15 0 \
+run_suite audit 16 0 \
     --manifest-path kernel/audit/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --lib --locked

@@ -2933,17 +2933,28 @@ pub fn verify_chain(events: &[AuditEvent]) -> bool {
 
     for (i, event) in events.iter().enumerate() {
         let expected_hash = hash_event(event.prev_hash, event);
-        if event.hash != expected_hash {
-            return false;
-        }
-
-        // Verify chain continuity (except for first event)
-        if i > 0 && event.prev_hash != events[i - 1].hash {
+        if !chain_link_valid(events, i, &expected_hash) {
             return false;
         }
     }
 
     true
+}
+
+/// R190-8 FIX: compare one event's recorded hash and chain link without a
+/// data-dependent early exit. Both comparisons always run and use the shared
+/// constant-time helper, so timing reveals at most which event failed, never
+/// how many leading digest bytes matched.
+#[inline]
+fn chain_link_valid(events: &[AuditEvent], index: usize, expected_hash: &[u8; 32]) -> bool {
+    let event = &events[index];
+    let hash_ok = kernel_crypto::ct_eq(&event.hash, expected_hash);
+    // The first event's prev_hash is the batch boundary, checked by callers.
+    let link_ok = match index.checked_sub(1) {
+        Some(previous) => kernel_crypto::ct_eq(&event.prev_hash, &events[previous].hash),
+        None => true,
+    };
+    hash_ok & link_ok
 }
 
 /// Verify the hash chain of a sequence of events using HMAC-SHA256.
@@ -2992,12 +3003,7 @@ pub fn verify_chain_hmac(events: &[AuditEvent], key: &[u8]) -> bool {
 
     for (i, event) in events.iter().enumerate() {
         let expected_hash = hash_event_prefixed(event.prev_hash, event, Some(key));
-        if event.hash != expected_hash {
-            return false;
-        }
-
-        // Verify chain continuity (except for first event)
-        if i > 0 && event.prev_hash != events[i - 1].hash {
+        if !chain_link_valid(events, i, &expected_hash) {
             return false;
         }
     }
@@ -3070,6 +3076,44 @@ mod tests {
         assert_eq!(batch.batch_first_prev_hash, ZERO_HASH);
         assert_eq!(batch.tail_hash, batch.events.last().unwrap().hash);
         assert!(verify_chain_hmac(&batch.events, &key));
+    }
+
+    #[test]
+    fn r190_8_chain_verifiers_reject_any_tampered_byte() {
+        let mut events = Vec::new();
+        let mut prev = ZERO_HASH;
+        for timestamp in 1..=3 {
+            let mut event = private_test_event(timestamp);
+            event.prev_hash = prev;
+            event.hash = hash_event(prev, &event);
+            prev = event.hash;
+            events.push(event);
+        }
+        assert!(verify_chain(&events));
+        for byte in [0usize, 31] {
+            let mut tampered = events.clone();
+            tampered[1].hash[byte] ^= 1;
+            assert!(!verify_chain(&tampered), "hash byte {} flip accepted", byte);
+            let mut relinked = events.clone();
+            relinked[2].prev_hash[byte] ^= 1;
+            assert!(!verify_chain(&relinked), "link byte {} flip accepted", byte);
+        }
+
+        let key = [0x33u8; 32];
+        let mut keyed = events.clone();
+        let mut prev = ZERO_HASH;
+        for event in keyed.iter_mut() {
+            event.prev_hash = prev;
+            event.hash = hash_event_prefixed(prev, event, Some(&key));
+            prev = event.hash;
+        }
+        assert!(verify_chain_hmac(&keyed, &key));
+        assert!(!verify_chain_hmac(&keyed, &[0x34u8; 32]));
+        keyed[2].hash[31] ^= 1;
+        assert!(!verify_chain_hmac(&keyed, &key));
+
+        assert!(kernel_crypto::ct_eq(b"", b""));
+        assert!(!kernel_crypto::ct_eq(b"ab", b"abc"));
     }
 
     #[test]
