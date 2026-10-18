@@ -13,6 +13,8 @@ mm = { path = "../mm" }
 virtio = { path = "../virtio" }
 drivers = { path = "../drivers" }
 x86_64 = "0.15"
+# R190-14: IRQ-context precondition check on the UDP delivery path.
+cpu_local = { path = "../cpu_local" }
 cap = { path = "../cap" }
 lsm = { path = "../lsm" }
 security = { path = "../security" }

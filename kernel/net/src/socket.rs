@@ -7416,6 +7416,24 @@ impl SocketTable {
     /// Packet delivery is scoped to the caller's network namespace.
     /// Only sockets bound to the same namespace can receive the packet.
     ///
+    /// # R190-14: execution context and lock chain
+    ///
+    /// The only production caller is the RX ingress drain
+    /// (`rx_ingress_poll` from the process-context deferred-work drain, whose
+    /// IRQs-enabled contract is a `debug_assert!`, R169-5). Lock chain: `udp_bindings`
+    /// is released before the LSM hook, and `rx_queue` is then taken alone in
+    /// `enqueue_rx`, so the two are never nested. The receive side holds
+    /// `rx_queue` across its user copyout. That is bounded because the kernel
+    /// does not preempt kernel-mode code and every page-fault resolution path
+    /// is try-only and never sleeps. It is not IRQ-safe: an IRQ-context
+    /// delivery on the holder's CPU would spin forever. The assert below makes
+    /// "not in a hard IRQ" a checked precondition (boot self-tests run before
+    /// `sti` with IF clear, so IF itself is not the predicate; the NMI handler
+    /// is fixed code that never reaches the network stack, and the NMI counter
+    /// is global, so it is not consulted). Any future IRQ/softirq
+    /// delivery must use `try_lock` and drop on contention (template:
+    /// `drain_ns_counters`), or stop holding `rx_queue` across the copyout.
+    ///
     /// # Returns
     ///
     /// `true` if delivered to a socket, `false` if no listener.
@@ -7428,6 +7446,11 @@ impl SocketTable {
         data: &[u8],
         now_ticks: u64,
     ) -> bool {
+        // R190-14 FIX: never from a hard IRQ (see the lock-chain note above).
+        assert!(
+            !cpu_local::current_cpu().in_irq(),
+            "deliver_udp must not run in hard IRQ context"
+        );
         // R75-1 FIX: Look up bound socket within the specified namespace
         let binding_key = (net_ns_id, dst_port);
         let target = {
@@ -7436,8 +7459,8 @@ impl SocketTable {
                 Some(sock) => Some(sock),
                 None => {
                     // R47-3 FIX: Clean up stale binding if upgrade failed.
-                    // J2-8: this is the UDP RX path (IRQ/softirq-reachable by
-                    // contract) and removes under the binding lock — so the
+                    // J2-8: this is the UDP RX path (process context today,
+                    // R190-14; kept IRQ-conservative) and removes under the binding lock — so the
                     // stored charge is ENQUEUED for deferred uncharge, never
                     // uncharged inline (L5 under L8 / in IRQ is forbidden). No
                     // expect_ptr: the entry is already known dead.

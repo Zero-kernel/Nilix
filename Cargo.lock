@@ -447,6 +447,7 @@ name = "net"
 version = "0.1.0"
 dependencies = [
  "cap",
+ "cpu_local",
  "drivers",
  "iommu",
  "klog",
