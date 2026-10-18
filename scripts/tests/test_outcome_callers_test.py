@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,43 @@ class StressOutcomeTests(unittest.TestCase):
                         self.assertNotIn("STRESS-TEST STABLE:", result.stdout)
                     if expected == 3:
                         self.assertIn("STRESS-TEST QUALIFIED:", result.stdout)
+
+
+class StressSocketPathTests(unittest.TestCase):
+    def test_qmp_socket_is_isolated_from_long_artifact_paths(self):
+        source = (ROOT / "scripts" / "gates" / "stress" / "stress_test.sh").read_text(encoding="utf-8")
+        self.assertIn('QMP_TMP_BASE="${STRESS_QMP_TMPDIR:-/tmp}"', source)
+        self.assertIn('QMP_SOCKET="$QMP_TMP/qmp.sock"', source)
+        self.assertNotIn('QMP_SOCKET="$workdir/qmp.sock"', source)
+        self.assertIn('QMP_SOCKET_BYTES', source)
+        self.assertIn('at most 103', source)
+
+        # Execute the real initialization block with a deliberately long TMPDIR.
+        start = source.index('TMP_BASE="${TMPDIR:-/tmp}"')
+        end = source.index("\nIFS=',' read -r -a REQUESTED_PROFILES", start)
+        setup = source[start:end]
+        with tempfile.TemporaryDirectory(prefix="long-stress-artifacts-") as directory:
+            long_tmp = Path(directory) / ("nested/" * 20)
+            long_tmp.mkdir(parents=True)
+            # Use the platform's short public temp root. This proves that the
+            # production default keeps the socket short even when TMPDIR is long.
+            script = (
+                "set -euo pipefail\n"
+                "blocked() { echo \"STRESS-TEST BLOCKED: $*\" >&2; exit 2; }\n"
+                f"TMPDIR={shlex.quote(shell_path(long_tmp))}\n"
+                "unset STRESS_QMP_TMPDIR\n"
+                + setup
+                + '\nprintf \"%s\\n\" \"$QMP_SOCKET\"\n'
+            )
+            result = subprocess.run([BASH, "--noprofile", "--norc", "-c", script],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            socket = Path(result.stdout.strip())
+            self.assertTrue(socket.parent.name.startswith("nilix-qmp-v2."))
+            self.assertEqual(socket.parent.parent, Path("/tmp").resolve())
+            self.assertLessEqual(len(os.fsencode(socket)), 103)
+            self.assertGreater(len(os.fsencode(long_tmp / "combined/run/qmp.sock")), 103)
+            shutil.rmtree(socket.parent)
 
 
 class StressEvidenceTests(unittest.TestCase):

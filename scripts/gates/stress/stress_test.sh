@@ -64,6 +64,8 @@ VM_STATUS=0
 MONITOR_STATUS=0
 RUN_END_NS=0
 SUITE_TMP=""
+QMP_TMP=""
+QMP_SOCKET=""
 
 blocked() {
     echo "STRESS-TEST BLOCKED: $*" >&2
@@ -80,16 +82,25 @@ require_nonnegative() {
     [[ "$value" =~ ^[0-9]+$ ]] || blocked "$name must be a non-negative integer"
 }
 
-safe_remove_suite_tmp() {
-    [ -n "${SUITE_TMP:-}" ] || return 0
-    [ -d "$SUITE_TMP" ] || return 0
+safe_remove_temp_dir() {
+    local directory="$1" prefix="$2"
+    [ -n "$directory" ] || return 0
+    [ -d "$directory" ] || return 0
     local resolved base_resolved
-    resolved="$(realpath "$SUITE_TMP" 2>/dev/null)" || return 1
-    base_resolved="$(realpath "${TMPDIR:-/tmp}" 2>/dev/null)" || return 1
+    resolved="$(realpath "$directory" 2>/dev/null)" || return 1
+    base_resolved="$(realpath "${3:-/tmp}" 2>/dev/null)" || return 1
     case "$resolved" in
-        "$base_resolved"/nilix-stress-v2.*) rm -rf -- "$resolved" ;;
+        "$base_resolved"/"$prefix".*) rm -rf -- "$resolved" ;;
         *) echo "Refusing to remove unexpected temporary path: $resolved" >&2; return 1 ;;
     esac
+}
+
+safe_remove_suite_tmp() {
+    safe_remove_temp_dir "${SUITE_TMP:-}" nilix-stress-v2 "${TMPDIR:-/tmp}"
+}
+
+safe_remove_qmp_tmp() {
+    safe_remove_temp_dir "${QMP_TMP:-}" nilix-qmp-v2 "${STRESS_QMP_TMPDIR:-/tmp}"
 }
 
 stop_monitor() {
@@ -128,6 +139,10 @@ cleanup() {
     local status=$?
     trap - EXIT INT TERM
     stop_vm TERM
+    if [ -n "${QMP_SOCKET:-}" ]; then
+        rm -f -- "$QMP_SOCKET"
+    fi
+    safe_remove_qmp_tmp || status=1
     if [ "$STRESS_KEEP_ARTIFACTS" = 1 ] && [ -n "${SUITE_TMP:-}" ]; then
         echo "Stress artifacts retained at: $SUITE_TMP" >&2
     else
@@ -163,7 +178,7 @@ require_nonnegative STRESS_HEARTBEAT_GRACE_MS "$STRESS_HEARTBEAT_GRACE_MS"
 [ "$STRESS_KEEP_ARTIFACTS" = 0 ] || [ "$STRESS_KEEP_ARTIFACTS" = 1 ] \
     || blocked "STRESS_KEEP_ARTIFACTS must be 0 or 1"
 
-for tool in "$QEMU" "$PYTHON" timeout mktemp realpath debugfs e2fsck sha256sum stat cp grep tail sed; do
+for tool in "$QEMU" "$PYTHON" timeout mktemp realpath debugfs e2fsck sha256sum stat cp grep tail sed wc; do
     command -v "$tool" >/dev/null 2>&1 || blocked "$tool is required"
 done
 [ -f "$PROTOCOL" ] || blocked "$PROTOCOL is missing"
@@ -188,6 +203,24 @@ TMP_BASE="${TMPDIR:-/tmp}"
 SUITE_TMP="$(mktemp -d "$TMP_BASE/nilix-stress-v2.XXXXXXXX")" \
     || blocked "unable to create suite temporary directory"
 case "$SUITE_TMP" in *[[:space:]]*) blocked "temporary path contains whitespace unsupported by debugfs" ;; esac
+
+# Unix-domain socket paths are shorter than normal filesystem paths. Linux's
+# sockaddr_un allows 107 bytes; reserve the portable 103-byte Darwin bound so
+# local macOS runs fail closed too. record_gate.py intentionally puts TMPDIR
+# below the CI artifact directory, so nesting the socket there exceeds the
+# limit in Actions. Keep only the socket in short private staging; durable
+# evidence stays in SUITE_TMP.
+QMP_TMP_BASE="${STRESS_QMP_TMPDIR:-/tmp}"
+case "$QMP_TMP_BASE" in *[[:space:]]*) blocked "STRESS_QMP_TMPDIR must not contain whitespace" ;; esac
+[[ "$QMP_TMP_BASE" = /* ]] || blocked "STRESS_QMP_TMPDIR must be an absolute path"
+QMP_TMP_BASE="$(realpath "$QMP_TMP_BASE" 2>/dev/null)" \
+    || blocked "STRESS_QMP_TMPDIR does not exist"
+QMP_TMP="$(mktemp -d "$QMP_TMP_BASE/nilix-qmp-v2.XXXXXXXX")" \
+    || blocked "unable to create QMP temporary directory"
+QMP_SOCKET="$QMP_TMP/qmp.sock"
+QMP_SOCKET_BYTES="$(printf '%s' "$QMP_SOCKET" | wc -c)"
+[ "$QMP_SOCKET_BYTES" -le 103 ] \
+    || blocked "QMP socket path is $QMP_SOCKET_BYTES bytes; portable Unix sockets require at most 103"
 
 IFS=',' read -r -a REQUESTED_PROFILES <<< "$STRESS_PROFILES"
 SELECTED_PROFILES=()
@@ -347,7 +380,6 @@ start_vm() {
     INTERRUPT_LOG="$workdir/interrupt.log"
     QEMU_STDERR="$workdir/qemu.stderr"
     EVENT_LOG="$workdir/events.jsonl"
-    QMP_SOCKET="$workdir/qmp.sock"
     QMP_BEFORE="$workdir/qmp-before.json"
     QMP_AFTER="$workdir/qmp-after.json"
     : > "$SERIAL_LOG"
