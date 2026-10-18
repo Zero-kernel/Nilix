@@ -4,14 +4,13 @@ This directory contains all QA security audit reports for the Zero-OS kernel.
 
 ## Latest Audit
 
-**[qa-2026-07-28.md](qa-2026-07-28.md)** - R186 audit/fix record:
-16/17 actionables fixed, 0 partial, `R186-4` sole open HIGH. The
-[authoritative Stage-3 source and environment closure](../reviewfix/reviewfix-2026-07-30.md)
-records `R186-18` fixed and review-verified, `RF186-1`…`RF186-24`
-repaired, and 0 escalations. Focused/default-parallel checks and the complete final
-remote ladder are green (net 110/110; conntrack stress 50/50; `make test`
-31/39/0; boot and musl PASS).
-
+**[qa-2026-10-18.md](qa-2026-10-18.md)** - R190 full-tree audit (first
+since R187/KSA closeout): 0 CRITICAL, 1 HIGH (R190-1: 19 of 54 LSM hooks unwired,
+incl. the live IPC family), 4 MEDIUM (R190-2 UDP per-socket byte cap, R190-3 SMP
+keyboard-IRQ lock, R190-4 cpuset privilege layer, R190-5 arch_prctl FS/GS high-half),
+7 LOW, plus design findings D2-ARC-1 and D3-RES-1. No new memory-safety defects in any
+partition; cross-partition driver verification falsified two agent-proposed MEDIUMs
+(IOMMU direct-map, DMA gate transition). 12 leads carried to next scoped round.
 ## Audit Summaries
 
 - **[qa-2026-07-02-summary.md](qa-2026-07-02-summary.md)** - Executive summary of R174 findings
@@ -29,6 +28,8 @@ Audits are organized chronologically by date. Each audit represents a full-codeb
 
 ### 2026 Audits
 
+- **R190** (October 18): first full-tree audit since R187; 5-partition line-by-line review + driver cross-verification - [qa-2026-10-18.md](qa-2026-10-18.md)
+- **R187/R188/KSA** (Aug-Sep 2026): R187 audit, R188 standalone review-fix, KSA-2026-09-06 P1/P2/P3 closeout (20/20 scoped accepted) - [qa-2026-08-05.md](qa-2026-08-05.md), [qa-2026-09-06.md](qa-2026-09-06.md)
 - **R186** (July 28): full-codebase findings and remediation record - [qa-2026-07-28.md](qa-2026-07-28.md)
 - **R185** (July 23): clean caller/lock-context verification round - [qa-2026-07-23-v2.md](qa-2026-07-23-v2.md)
 - **R184** (July 23): findings round - [qa-2026-07-23.md](qa-2026-07-23.md), with review-fix records in [../reviewfix/](../reviewfix/)
