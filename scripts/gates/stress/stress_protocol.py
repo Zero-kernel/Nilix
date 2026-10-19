@@ -965,18 +965,34 @@ def parse_marker(line: str) -> Marker:
     raise StressProtocolError(f"malformed or unknown stress-v2 marker: {line!r}")
 
 
+SHELL_PROMPT_PREFIX = "/ nilix# "
+
+
 def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[str]:
     """Marker lines of a serial log.
 
     `live` is for a log the guest may still be writing: the serial port emits a
     line byte by byte, so an unterminated final line can be a marker caught
     mid-write and is left for the next poll instead of failing to parse.
+
+    The interactive shell prints its prompt without a trailing newline. A Ring-3
+    workload can start on another CPU while that prompt is being emitted, so the
+    first marker may legitimately be prefixed by the exact boot prompt. Accept
+    only that known prompt; arbitrary text before a marker remains invisible and
+    therefore cannot fabricate a valid protocol line.
     """
     raw = Path(path).read_bytes()
     if live:
         raw = raw[: raw.rfind(b"\n") + 1]
     text = raw.decode("utf-8", errors="replace")
-    return [line.rstrip("\r") for line in text.splitlines() if line.startswith("NILIX_STRESS_V2_")]
+    lines = []
+    for line in text.splitlines():
+        line = line.rstrip("\r")
+        if line.startswith(SHELL_PROMPT_PREFIX):
+            line = line[len(SHELL_PROMPT_PREFIX):]
+        if line.startswith("NILIX_STRESS_V2_"):
+            lines.append(line)
+    return lines
 
 
 def parse_protocol_log(path: str | os.PathLike[str]) -> list[Marker]:

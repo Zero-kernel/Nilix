@@ -309,6 +309,20 @@ class LiveProtocolLineTests(unittest.TestCase):
             serial.write_text(begin(config) + "\n" + ready(config, "normal")[:30])
             self.assertEqual(len(protocol.protocol_lines(serial)), 2)
 
+    def test_exact_shell_prompt_prefix_is_accepted_but_arbitrary_prefix_is_not(self) -> None:
+        config = make_config("smp")
+        with tempfile.TemporaryDirectory() as tmp:
+            serial = Path(tmp) / "serial.log"
+            serial.write_text(
+                "/ nilix# " + begin(config) + "\n" + ready(config, "normal") + "\n"
+                + "untrusted " + begin(config) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                protocol.protocol_lines(serial),
+                [begin(config), ready(config, "normal")],
+            )
+
 
 class BlockRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
