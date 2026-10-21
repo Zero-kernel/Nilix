@@ -147,15 +147,17 @@ mitigation workload exercises this repair.
 **Available:** isolated address spaces, fork/path-exec/exit/reap, wait4/WNOHANG,
 MLFQ/preemption/stealing/balancing/affinity/cpuset. TLS restoration has UP/SMP
 musl evidence including timer-context migration. KSA-011 exercises namespace
-wait identity and six exit/reap/idle cases.
+wait identity and six exit/reap/idle cases. Since 2026-10-20 every build accepts
+thread groups (CLONE_VM|CLONE_SIGHAND|CLONE_THREAD, with CLONE_FILES/CLONE_FS):
+shared signal table with a group pending set, fs context and fd table; group exit,
+fatal signals and stop; tkill/tgkill; exactly-once reaping and group-wide children;
+exec from the leader or any thread; procfs `task/` lists. The Ring-3 oracle and musl
+`pthread_create`/`join`/signal legs exercise them on 1-16 CPUs
+([design](review/design/gap-5-slice4-thread-group-design.md)).
 
-**Missing:** clone in default builds is narrower than Linux threads. CLONE_VM/TLS
-setup exists; general CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND combinations
-are rejected. Guest test builds enable a `thread_preview` with real thread groups
-(shared signal table, fs context and fd table; group exit, fatal signals and stop;
-tkill/tgkill; exactly-once reaping) that the Ring-3 oracle and musl
-`pthread_create`/`join` exercise on 1-8 CPUs. Exec from a thread group returns
-EBUSY and the preview has no independent review, so this is not pthread support.
+**Missing:** a handler signal for a thread blocked in LOCK_PI waits until the call
+returns (no restart); no sigaltstack or rt_tgsigqueueinfo; sigframes only on the
+main or an mmap'd stack; the reviewed D3-D5 thread debt listed in the design.
 waitid is implemented for `P_ALL`/`P_PID` with
 `WNOHANG`/`WNOWAIT` and `siginfo_t` copyout, sharing `wait_reap_core` with wait4;
 `P_PGID` and `WUNTRACED`/`WCONTINUED` remain fail-closed EINVAL, and its four
@@ -175,9 +177,9 @@ F4/F6, ROOT-INIT, F-4**.
 
 ### 5.3 IPC, signals, polling and time
 
-**Available:** capability-backed pipes, blocking/wakeup, futex primitives with
-internal PI and Linux op numbering (WAIT/WAKE, REQUEUE/CMP_REQUEUE served by
-waking, LOCK_PI/UNLOCK_PI, MATCH_ANY bitset ops), robust cleanup, masks, kill/tgkill, rt_sigaction/rt_sigreturn,
+**Available:** capability-backed pipes, blocking/wakeup, futexes keyed by address
+space with Linux ops (WAIT/WAKE, true REQUEUE/CMP_REQUEUE, WAKE_OP, partial bitsets,
+LOCK_PI/TRYLOCK_PI/UNLOCK_PI with priority inheritance, requeue-PI), robust cleanup, masks, kill/tgkill, rt_sigaction/rt_sigreturn,
 IRQ-return delivery, basic poll/select and startup/time calls. Musl exercises
 blocked signals, robust usercopy and zero-length socket behavior.
 

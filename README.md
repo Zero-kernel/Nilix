@@ -25,7 +25,7 @@ The September KSA audit's 20 findings are accepted within their specific rubrics
 
 The implementation does not establish complete Linux, guest musl/usercopy/teardown, hardware or security qualification.
 
-Release work still includes reconciliation of original R188 review obligations, strict supported-profile tests and **all six stress-v2 profiles**.
+Release work still includes reconciliation of original R188 review obligations, strict supported-profile tests and **all seven stress-v2 profiles**.
 
 The recorded clean full-audit streak remains **0/3**. Physical VT-d, full KPTI isolation, compiler retpoline and production livepatch are not qualified capabilities. See [security status](docs/security-audit-status.md) and the [release conditions](docs/roadmap.md#8-10-preview-release-gate).
 
@@ -39,9 +39,9 @@ calling an entire subsystem complete because its API or source files exist.
 | UEFI and boot | PIE kernel loading/relocation, memory-map handoff, KASLR placement, console initialization | x86_64 platform scope; broader firmware/hardware and early-boot W+X qualification |
 | Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions, private-anonymous `mremap` (in-place grow/shrink + `MREMAP_MAYMOVE`) and bounded slab/NUMA/swap/THP primitives | Remote MM/core/hosted/build/lint verification is complete for this slice and `mremap` is remote-validated with the Ring-3 oracle gate (`make test-ring3-mm`) passing, but independent review is still pending; MAP_FIXED/file mappings, shared-anonymous `mremap`, and integrated slab/NUMA/swap/THP backends remain unqualified |
 | Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests; `waitid` (`P_ALL`/`P_PID`, `WNOHANG`/`WNOWAIT`, `siginfo_t` copyout) sharing one reap engine with `wait4`, and root PID-namespace init registered through the normal PID chain | `waitid` `P_PGID` and `WUNTRACED`/`WCONTINUED` are fail-closed EINVAL, not supported; PID1 exit, reaper races and the attach-time/fd-charge rollback paths are uncovered (waitid WNOWAIT-then-reap, copyout-fault, ROOT-INIT orphan adoption and fork refusal under `pids.max` are guest-verified); PID1/reaper races and remaining failure/stress breadth |
-| Threads and TLS | Restricted CLONE_VM/TLS setup, FS/user-GS restoration tested across SMP migration; thread groups (shared signal table, fs context and fd table, group exit and fatal signals, tkill/tgkill, exactly-once reaping) and musl `pthread_create`/`join`/mutex/condition variables/TLS pass in guest-only `thread_preview` test builds on 1-8 CPUs | Default builds still reject CLONE_THREAD/CLONE_FILES/CLONE_FS/CLONE_SIGHAND; exec from a thread group returns EBUSY; independent review pending, so not pthread compatibility |
+| Threads and TLS | Thread groups in every build (CLONE_VM/SIGHAND/THREAD/FILES/FS): shared signal table with a group pending set, fs context and fd table; group exit, fatal signals and stop; tkill/tgkill; exactly-once reaping and group-wide children; exec from the leader or any thread; procfs `task/` lists. FS/user-GS restoration across SMP migration. musl `pthread_create`/`join`/mutex/condition variables/TLS/signals pass on 1-16 CPUs | A handler signal waits while a thread is blocked in LOCK_PI (no restart); no sigaltstack or rt_tgsigqueueinfo; sigframes only on the main or an mmap'd stack; reviewed D3-D5 debt in the [design](docs/review/design/gap-5-slice4-thread-group-design.md) |
 | Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing from every CPU, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering, guard-free SCHED-TRAP and a switch sentinel; `/proc/schedstat` per-CPU switch/migration counters; memory/cpu/smp stress soaks qualify on 4 vCPUs | Process/block/combined soak profiles, physical and longer high-core qualification; 64 CPUs boot in QEMU as a reject ceiling, not a tested workload claim |
-| IPC and signals | Capability-backed pipes, Linux futex op numbering (WAIT/WAKE, REQUEUE/CMP_REQUEUE served by waking, PI lock/unlock, MATCH_ANY bitset ops), robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, FUTEX_WAKE_OP/requeue-PI/partial bitsets, sigaltstack/queued-RT/restart semantics |
+| IPC and signals | Capability-backed pipes, Linux futex ops (WAIT/WAKE, true REQUEUE/CMP_REQUEUE, WAKE_OP, partial bitsets, PI lock/trylock/unlock with priority inheritance, requeue-PI) keyed by address space, robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, sigaltstack/queued-RT/restart semantics, PI ABBA `EDEADLK` detection |
 | File descriptors | Ordinary fd 0/1/2, dup/close/fork/exec/CLOEXEC, shared status flags, O_NONBLOCK consumers and NOFILE enforcement | Broader fcntl/rlimit/thread-sharing semantics |
 | VFS and paths | ramfs/ext2/JBD2 subset, procfs/devfs/CPIO/cgroupfs; cwd/root/pivot, symlink/jail resolution, DAC/UID/GID, mount retirement | General dirfd, chown/statx/hard links, terminal fidelity and full POSIX/filesystem compatibility |
 | Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | fsync/fdatasync/sync/sync_file_range not wired; power-loss/recovery/cache qualification |
@@ -85,7 +85,7 @@ narratives. The roadmap is the current capability/qualification reference.
 
 ## Tests and CI
 
-The current hosted allowlist runs **468 counted unit-test executions per
+The current hosted allowlist runs **515 counted unit-test executions per
 debug/release profile**, CpuLocal doctests and three test-code compile checks.
 The runtime scanner discovers **74 RuntimeTest implementations**; that count
 does not mean 74 guest passes or 100% kernel instruction coverage.
@@ -97,7 +97,8 @@ outcome. Python coverage measures host harness code. Diagnostic qualified
 results remain distinct from strict passes. Guest gates retry one failed or
 incomplete QEMU attempt by default and retain both attempts in the report.
 
-Stress runs cover six defined profiles on a weekly/manual workflow, but full
+Stress runs cover seven defined profiles (including a pthread `thread` profile) on a
+weekly/manual workflow, but full
 acceptance is still blocked by kernel/workload gaps. Eleven scheduled fuzz
 campaigns complement deterministic smoke; sampling is not proof of completeness.
 [CI guide](docs/ci-testing.md) · [Quality gates](docs/quality-gates.md) ·
@@ -139,7 +140,7 @@ it. The default CPU/profile cannot satisfy every security/hardware test.
 1. Reconcile outstanding R188 review lineage and close R186-4 admission.
 2. Make mmap flags honest, replace stress report-page assumptions and implement
    the scoped durability/block workload.
-3. Add shared-anonymous memory and qualify all six stress profiles, supported
+3. Add shared-anonymous memory and qualify all seven stress profiles, supported
    network/SMP/security matrices and fresh full-audit release conditions.
 4. Resume native capability/IPC, static ABI residuals, personality/dynamic
    linking, container networking and measured operations/performance.

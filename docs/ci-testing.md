@@ -14,7 +14,7 @@ same grouped commands are available locally.
 | Entry | When | Coverage and result |
 | --- | --- | --- |
 | `CI` | Push/PR to main; manual | Quality, hosted debug/release, tools, kernel build, boot/SMP, musl, IOMMU, KCOV/executor; one `CI result` |
-| `Extended tests` | Sunday 03:00 UTC; manual | Ubuntu 22.04/24.04, 8/16 CPU SMP, Ext3/JBD2, six 900-second stress profiles, IOMMU compatibility |
+| `Extended tests` | Sunday 03:00 UTC; manual | Ubuntu 22.04/24.04, 8/16 CPU SMP, Ext3/JBD2, seven 900-second stress profiles, IOMMU compatibility |
 | `Fuzzing` | Daily 02:00 UTC; manual | 11 private libFuzzer campaigns, opaque candidate handling, validated public result manifests |
 
 The disabled AFL QEMU workflow could not execute a bare-metal kernel. The old

@@ -24,7 +24,7 @@ fuzz、描述符/路径/凭据、TLS 迁移、BIO 生命周期和缓解状态真
 整个内核，也没有自动关闭较早的 R186-4 准入问题。
 
 发布仍需完成 R186-4 准入闭环、R188 原始修复的评审证据核对、严格的平台/安全门禁及
-**全部六种 stress-v2 压力场景**。历史零 HIGH 完整审计连续记录维持 **0/3**。
+**全部七种 stress-v2 压力场景**。历史零 HIGH 完整审计连续记录维持 **0/3**。
 物理 VT-d、完整 KPTI 隔离、编译器 retpoline 和生产 livepatch 尚未具备对应支持或
 验收。详情见 [安全状态](docs/security-audit-status.md) 与
 [发布条件](docs/roadmap.md#8-10-preview-release-gate)。
@@ -39,9 +39,9 @@ fuzz、描述符/路径/凭据、TLS 迁移、BIO 生命周期和缓解状态真
 | UEFI 与启动 | PIE 内核加载/重定位、内存图交接、KASLR 放置、基础控制台 | x86_64 平台范围；更多固件/物理平台及早期 W+X 转换验证 |
 | 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | 本切片的远程 MM/core/hosted/build/lint 验证已完成，`mremap` 已远程验证且 Ring-3 oracle 门禁（`make test-ring3-mm`）通过，但独立评审仍待完成；MAP_SHARED/MAP_FIXED 语义、文件映射、共享匿名 `mremap`；无已验收 slab/NUMA/swap/THP |
 | 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试；`waitid`（`P_ALL`/`P_PID`、`WNOHANG`/`WNOWAIT`、`siginfo_t` 回写）与 `wait4` 共用同一套收割引擎；根 PID namespace 的 init 通过正常 PID 链路注册 | `waitid` 的 `P_PGID` 与 `WUNTRACED`/`WCONTINUED` 按失败关闭返回 EINVAL，并非支持；PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径尚无覆盖（waitid 的 WNOWAIT-后续收割、copyout 故障、ROOT-INIT 孤儿收养与 `pids.max` 下的 fork 拒绝已经 guest 验证）；PID1/reaper 竞态及更广的失败/压力路径 |
-| 线程与 TLS | 受限 CLONE_VM/TLS 创建，SMP 迁移时 FS/user-GS 恢复已有 guest 证据；线程组（共享信号表、fs 上下文与 fd 表，组退出与致命信号，tkill/tgkill，恰好一次收割）与 musl `pthread_create`/`join`/互斥量/条件变量/TLS 已在仅限 guest 测试构建的 `thread_preview` 中于 1-8 CPU 通过 | 默认构建仍拒绝 CLONE_THREAD/FILES/FS/SIGHAND；线程组内 exec 返回 EBUSY；独立评审待完成，不能宣称 pthread 兼容 |
+| 线程与 TLS | 所有构建均支持线程组（CLONE_VM/SIGHAND/THREAD/FILES/FS）：共享信号表与组级待决集、fs 上下文与 fd 表；组退出、致命信号与停止；tkill/tgkill；恰好一次收割与组共享子进程；leader 或任一线程 exec；procfs `task/` 列表。SMP 迁移时 FS/user-GS 恢复。musl `pthread_create`/`join`/互斥量/条件变量/TLS/信号于 1-16 CPU 通过 | 阻塞在 LOCK_PI 中的线程要等调用返回才运行信号处理函数（无重启）；无 sigaltstack 与 rt_tgsigqueueinfo；信号帧仅限主栈或 mmap 栈；已评审的 D3-D5 债务见[设计](docs/review/design/gap-5-slice4-thread-group-design.md) |
 | 调度与 SMP | 每 CPU MLFQ、抢占、从所有 CPU 工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序、锁外格式化的 SCHED-TRAP 与切换哨兵；`/proc/schedstat` 每 CPU 切换/迁移计数；memory/cpu/smp 压力浸泡在 4 vCPU 上合格 | process/block/combined 浸泡配置、物理与更长时间高核数验证；64 核可在 QEMU 启动且为拒绝上限，不是已验证负载 |
-| IPC 与信号 | capability 管道、Linux futex 操作编号（WAIT/WAKE、以唤醒实现的 REQUEUE/CMP_REQUEUE、PI 加解锁、MATCH_ANY 位掩码操作）、robust 清理、屏蔽/处理/返回、阻塞信号测试、poll/select | 完整原生同步 IPC/共享内存、FUTEX_WAKE_OP/requeue-PI/部分位掩码、sigaltstack/RT 队列/重启语义 |
+| IPC 与信号 | capability 管道、按地址空间取键的 Linux futex 操作（WAIT/WAKE、真正的 REQUEUE/CMP_REQUEUE、WAKE_OP、部分位掩码、带优先级继承的 PI 加锁/尝试加锁/解锁、requeue-PI）、robust 清理、屏蔽/处理/返回、阻塞信号测试、poll/select | 完整原生同步 IPC/共享内存、sigaltstack/RT 队列/重启语义、PI ABBA `EDEADLK` 检测 |
 | 文件描述符 | fd 0/1/2 已表驱动，dup/close/fork/exec/CLOEXEC、共享状态、O_NONBLOCK 消费者、NOFILE 限制 | 更完整 fcntl/rlimit/线程共享语义 |
 | VFS 与路径 | ramfs/ext2/JBD2 子集、procfs/devfs/CPIO/cgroupfs；cwd/root/pivot、symlink/jail、DAC/UID/GID、挂载表回收 | 通用 dirfd、chown/statx/硬链接、真实终端状态、完整 POSIX/文件系统兼容 |
 | 存储与块 I/O | BIO/完成回调所有权、virtio-blk、512B/4096B 几何与 guest I/O 验证 | fsync/fdatasync/sync/sync_file_range 未接线；掉电/恢复/缓存语义待验证 |
@@ -83,7 +83,7 @@ Cargo 模块划分用于组织职责，不代表服务已运行在独立权限�
 
 ## 测试与 CI
 
-当前 hosted allowlist 在 debug/release 下分别执行 **468 次计数受检的单元测试**，
+当前 hosted allowlist 在 debug/release 下分别执行 **515 次计数受检的单元测试**，
 另有 CpuLocal doctest 和三组测试代码编译检查。源码扫描发现 **74 个 RuntimeTest
 实现**，不代表 74 个 guest 测试都通过，更不代表内核指令覆盖率 100%。
 
@@ -92,7 +92,7 @@ JUnit、Markdown、原始日志及源码/镜像身份共同保留实际结果。
 宿主测试脚本；qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失败或
 不完整的 QEMU 首次尝试重试一次，并在报告中保留两次结果。
 
-六种 stress 场景通过每周/手动工作流运行，但内核和 workload 缺口仍阻塞完整验收。
+七种 stress 场景（含 pthread `thread` 场景）通过每周/手动工作流运行，但内核和 workload 缺口仍阻塞完整验收。
 11 个定时 fuzz campaign 补充确定性 smoke，不能替代功能契约或无漏洞证明。
 [CI 说明](docs/ci-testing.md) · [门禁细节](docs/quality-gates.md) ·
 [脚本目录](scripts/README.md)。

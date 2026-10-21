@@ -4697,13 +4697,10 @@ const NON_VM_INCOMPATIBLE: u64 = CLONE_NEWNS
     | CLONE_SIGHAND
     | CLONE_THREAD;
 
-#[cfg(not(feature = "thread_preview"))]
-const SUPPORTED_CLONE_FLAGS: u64 = BASE_CLONE_FLAGS;
-
-/// GAP-5 slice 4 step 7 preview: thread groups (CLONE_SIGHAND|CLONE_THREAD,
-/// which sys_clone requires to come with CLONE_VM) plus CLONE_FS and, inside a
-/// thread group only, CLONE_FILES sharing, for guest test builds only.
-#[cfg(feature = "thread_preview")]
+/// GAP-5 slice 4 step 7: thread groups (CLONE_SIGHAND|CLONE_THREAD, which
+/// sys_clone requires to come with CLONE_VM) plus CLONE_FS and, inside a thread
+/// group only, CLONE_FILES sharing. Enabled by default on 2026-10-20 once every
+/// known thread-group gap was closed (design: gap-5-slice4-thread-group-design.md).
 const SUPPORTED_CLONE_FLAGS: u64 = BASE_CLONE_FLAGS
     | CLONE_SIGHAND
     | CLONE_THREAD
@@ -4732,21 +4729,16 @@ fn clone_flags_supported(flags: u64) -> bool {
 mod rf186_clone_contract_tests {
     use super::*;
 
-    #[cfg(not(feature = "thread_preview"))]
     #[test]
-    fn unsupported_sharing_flags_fail_closed() {
-        for flag in [CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_THREAD] {
-            assert!(!clone_flags_supported(CLONE_VM | flag));
-        }
-        assert!(clone_flags_supported(CLONE_VM | CLONE_SETTLS));
-    }
-
-    #[cfg(feature = "thread_preview")]
-    #[test]
-    fn thread_preview_admits_thread_sharing_flags() {
+    fn thread_sharing_flags_are_supported_and_others_fail_closed() {
         assert!(clone_flags_supported(
             CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_FS | CLONE_FILES
         ));
+        assert!(clone_flags_supported(CLONE_VM | CLONE_SETTLS));
+        // CLONE_PTRACE, CLONE_VFORK and CLONE_PARENT stay outside the set.
+        for flag in [0x0000_2000, 0x0000_4000, 0x0000_8000] {
+            assert!(!clone_flags_supported(CLONE_VM | flag));
+        }
     }
 }
 

@@ -12,10 +12,9 @@ default = []
 shell = []
 # Enable syscall test program
 syscall_test = ["kernel_core/syscall_test", "arch/syscall_test"]
-# Enable musl libc test program
-# GAP-5 slice 4: the musl guest runs a pthread workload, so its kernel
-# accepts the thread clone flags (guest test builds only).
-musl_test = ["kernel_core/thread_preview"]
+# Enable musl libc test program (its pthread workload needs the thread
+# clone flags, which every build accepts since GAP-5 slice 4 step 7)
+musl_test = []
 # Enable clone syscall test program
 clone_test = []
 # Enable the bounded monthly Ring-3 stress workload. It also turns on the
