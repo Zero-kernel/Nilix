@@ -230,10 +230,6 @@ struct PipeInner {
     /// lock-held callback protocol and keeps usercopy/page faults out of the
     /// pipe spinlock.
     read_inflight: bool,
-    /// 读端引用计数
-    readers: usize,
-    /// 写端引用计数
-    writers: usize,
 }
 
 impl PipeInner {
@@ -252,8 +248,6 @@ impl PipeInner {
             read_pos: 0,
             len: 0,
             read_inflight: false,
-            readers: 1,
-            writers: 1,
         })
     }
 
@@ -372,11 +366,24 @@ impl PipeInner {
 pub struct Pipe {
     /// 管道ID
     id: PipeId,
-    /// 内部状态（受锁保护）
+    /// 内部状态（受锁保护）. Lock-order invariant: never taken with a PCB held.
+    /// Its holders arm and wake wait queues, which take PROCESS_TABLE, so a
+    /// PCB -> `inner` edge would close a cycle with any PROCESS_TABLE -> PCB
+    /// scan (the reason the end counts live outside it).
     inner: Mutex<PipeInner>,
     /// Each original end is one open description; duplicates share its status.
     read_status: AtomicU32,
     write_status: AtomicU32,
+    /// Open read and write ends (读端/写端引用计数). Lock-order fix (2026-10-21):
+    /// atomics outside `inner`, so `duplicate` (reached with a PCB held, and in
+    /// fork with two PCBs and both fd tables held) never takes the pipe lock,
+    /// whose holders call into wait queues that take PROCESS_TABLE (a three-way
+    /// deadlock with any PROCESS_TABLE -> PCB scan). A duplicate starts from a
+    /// live end, so the count only goes from >= 1 to >= 2 there and needs no
+    /// wake. The decrement and every zero check stay under `inner`, so EOF and
+    /// EPIPE keep their ordering against blocked readers and writers.
+    readers: AtomicUsize,
+    writers: AtomicUsize,
     /// 等待读取的进程队列
     read_wait: WaitQueue,
     /// 等待写入的进程队列
@@ -406,6 +413,8 @@ impl Pipe {
             inner: Mutex::new(storage.inner),
             read_status: AtomicU32::new(0),
             write_status: AtomicU32::new(0),
+            readers: AtomicUsize::new(1),
+            writers: AtomicUsize::new(1),
             read_wait: WaitQueue::new(HeapClass::Pipe),
             write_wait: WaitQueue::new(HeapClass::Pipe),
             _buffer_charge: storage.buffer_charge,
@@ -439,9 +448,13 @@ impl Pipe {
     /// 这样即使写者在释放锁后立即唤醒，由于读者已在队列中，
     /// 唤醒信号不会丢失。
     pub fn read(&self, dst: &mut [u8], flags: PipeFlags) -> Result<usize, PipeError> {
+        let mut waited = false;
         loop {
             if let Some(pid) = current_pid() {
                 if wait_should_abort(pid) || kernel_core::signal::has_deliverable_signal(pid) {
+                    if waited {
+                        self.pass_on_read_wake();
+                    }
                     return Err(PipeError::Interrupted);
                 }
             }
@@ -453,10 +466,13 @@ impl Pipe {
                 if inner.len > 0 {
                     let count = inner.read(dst);
                     drop(inner);
-                    self.write_wait.wake_one();
+                    self.write_wait.wake_all();
+                    if waited {
+                        self.pass_on_read_wake();
+                    }
                     return Ok(count);
                 }
-                if inner.writers == 0 {
+                if self.writers.load(Ordering::Acquire) == 0 {
                     return Ok(0);
                 }
                 if flags.nonblock {
@@ -482,10 +498,13 @@ impl Pipe {
                 if inner.len > 0 {
                     let count = inner.read(dst);
                     drop(inner);
-                    self.write_wait.wake_one();
+                    self.write_wait.wake_all();
+                    if waited {
+                        self.pass_on_read_wake();
+                    }
                     return Ok(count);
                 }
-                if inner.writers == 0 {
+                if self.writers.load(Ordering::Acquire) == 0 {
                     return Ok(0);
                 }
                 if flags.nonblock {
@@ -497,7 +516,10 @@ impl Pipe {
             drop(capacity);
 
             match arm {
-                PrepareToWaitCapacityOutcome::Prepared(true) => self.read_wait.finish_wait(),
+                PrepareToWaitCapacityOutcome::Prepared(true) => {
+                    self.read_wait.finish_wait();
+                    waited = true;
+                }
                 PrepareToWaitCapacityOutcome::RetryCapacity => continue,
                 PrepareToWaitCapacityOutcome::Prepared(false) => {
                     if current_pid().is_none() {
@@ -510,11 +532,31 @@ impl Pipe {
                         if wait_should_abort(pid)
                             || kernel_core::signal::has_deliverable_signal(pid)
                         {
+                            if waited {
+                                self.pass_on_read_wake();
+                            }
                             return Err(PipeError::Interrupted);
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// GAP-6: a read wake goes to one reader (`write` and a failed commit wake
+    /// one). A reader that leaves bytes behind passes it on, so a reader that
+    /// slept behind it, or behind a read transaction, does not wait for the
+    /// next write: after a read that waited or held a transaction, and when a
+    /// woken reader returns Interrupted. Writers need no such chain: a read
+    /// wakes all of them (an atomic writer may need more space than one read
+    /// freed, while a smaller writer could proceed).
+    fn pass_on_read_wake(&self) {
+        let data_left = {
+            let inner = self.inner.lock();
+            inner.len > 0 && !inner.read_inflight
+        };
+        if data_left {
+            self.read_wait.wake_one();
         }
     }
 
@@ -530,9 +572,13 @@ impl Pipe {
     where
         F: FnMut(&[u8]) -> Result<(), E>,
     {
+        let mut waited = false;
         loop {
             if let Some(pid) = current_pid() {
                 if wait_should_abort(pid) || kernel_core::signal::has_deliverable_signal(pid) {
+                    if waited {
+                        self.pass_on_read_wake();
+                    }
                     return Err(PipeReadTransactionError::Pipe(PipeError::Interrupted));
                 }
             }
@@ -550,7 +596,9 @@ impl Pipe {
                         Ok(()) => {
                             inner.finish_read_transaction(count, true);
                             drop(inner);
-                            self.write_wait.wake_one();
+                            self.write_wait.wake_all();
+                            // Another reader may have slept on the reservation.
+                            self.pass_on_read_wake();
                             return Ok(count);
                         }
                         Err(error) => {
@@ -565,7 +613,7 @@ impl Pipe {
                         }
                     }
                 }
-                if inner.writers == 0 {
+                if self.writers.load(Ordering::Acquire) == 0 {
                     return Ok(0);
                 }
                 if flags.nonblock {
@@ -590,7 +638,9 @@ impl Pipe {
                         Ok(()) => {
                             inner.finish_read_transaction(count, true);
                             drop(inner);
-                            self.write_wait.wake_one();
+                            self.write_wait.wake_all();
+                            // Another reader may have slept on the reservation.
+                            self.pass_on_read_wake();
                             return Ok(count);
                         }
                         Err(error) => {
@@ -601,7 +651,7 @@ impl Pipe {
                         }
                     }
                 }
-                if inner.writers == 0 {
+                if self.writers.load(Ordering::Acquire) == 0 {
                     return Ok(0);
                 }
                 if flags.nonblock {
@@ -613,7 +663,10 @@ impl Pipe {
             drop(capacity);
 
             match arm {
-                PrepareToWaitCapacityOutcome::Prepared(true) => self.read_wait.finish_wait(),
+                PrepareToWaitCapacityOutcome::Prepared(true) => {
+                    self.read_wait.finish_wait();
+                    waited = true;
+                }
                 PrepareToWaitCapacityOutcome::RetryCapacity => continue,
                 PrepareToWaitCapacityOutcome::Prepared(false) => {
                     if current_pid().is_none() {
@@ -626,6 +679,9 @@ impl Pipe {
                         if wait_should_abort(pid)
                             || kernel_core::signal::has_deliverable_signal(pid)
                         {
+                            if waited {
+                                self.pass_on_read_wake();
+                            }
                             return Err(PipeReadTransactionError::Pipe(PipeError::Interrupted));
                         }
                     }
@@ -670,7 +726,7 @@ impl Pipe {
 
             {
                 let mut inner = self.inner.lock();
-                if inner.readers == 0 {
+                if self.readers.load(Ordering::Acquire) == 0 {
                     return if total_written > 0 {
                         Ok(total_written)
                     } else {
@@ -703,7 +759,7 @@ impl Pipe {
             };
             let arm = {
                 let mut inner = self.inner.lock();
-                if inner.readers == 0 {
+                if self.readers.load(Ordering::Acquire) == 0 {
                     return if total_written > 0 {
                         Ok(total_written)
                     } else {
@@ -773,7 +829,7 @@ impl Pipe {
 
             {
                 let mut inner = self.inner.lock();
-                if inner.readers == 0 {
+                if self.readers.load(Ordering::Acquire) == 0 {
                     return Err(PipeError::BrokenPipe);
                 }
                 if inner.space() >= src.len() {
@@ -794,7 +850,7 @@ impl Pipe {
                 .map_err(|_| PipeError::NoMemory)?;
             let arm = {
                 let mut inner = self.inner.lock();
-                if inner.readers == 0 {
+                if self.readers.load(Ordering::Acquire) == 0 {
                     return Err(PipeError::BrokenPipe);
                 }
                 if inner.space() >= src.len() {
@@ -836,32 +892,32 @@ impl Pipe {
 
     /// 关闭读端
     fn close_read(&self) {
-        let mut inner = self.inner.lock();
-        inner.readers = inner.readers.saturating_sub(1);
+        // Under `inner`, where every zero check runs.
+        let _inner = self.inner.lock();
+        saturating_step(&self.readers, false);
         // 唤醒所有写者，让它们检测到EPIPE
         self.write_wait.wake_all();
     }
 
     /// 关闭写端
     fn close_write(&self) {
-        let mut inner = self.inner.lock();
-        inner.writers = inner.writers.saturating_sub(1);
+        // Under `inner`, where every zero check runs.
+        let _inner = self.inner.lock();
+        saturating_step(&self.writers, false);
         // 唤醒所有读者，让它们检测到EOF
         self.read_wait.wake_all();
     }
 
     /// 增加读端引用
     fn add_reader(&self) {
-        let mut inner = self.inner.lock();
-        // R161-14 FIX: Use saturating_add for consistency with saturating_sub on decrement.
-        inner.readers = inner.readers.saturating_add(1);
+        // R161-14 FIX: saturating, like the decrement. No `inner`: see `readers`.
+        saturating_step(&self.readers, true);
     }
 
     /// 增加写端引用
     fn add_writer(&self) {
-        let mut inner = self.inner.lock();
-        // R161-14 FIX: Use saturating_add for consistency with saturating_sub on decrement.
-        inner.writers = inner.writers.saturating_add(1);
+        // R161-14 FIX: saturating, like the decrement. No `inner`: see `writers`.
+        saturating_step(&self.writers, true);
     }
 
     /// 获取管道状态
@@ -870,10 +926,21 @@ impl Pipe {
         PipeStatus {
             available: inner.available(),
             space: inner.space(),
-            readers: inner.readers,
-            writers: inner.writers,
+            readers: self.readers.load(Ordering::Acquire),
+            writers: self.writers.load(Ordering::Acquire),
         }
     }
+}
+
+/// Saturating increment or decrement of an end count (R161-14).
+fn saturating_step(count: &AtomicUsize, up: bool) {
+    let _ = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        Some(if up {
+            n.saturating_add(1)
+        } else {
+            n.saturating_sub(1)
+        })
+    });
 }
 
 /// M0-6 poll/select: non-consuming readiness probe for a pipe.
@@ -1224,7 +1291,7 @@ impl FileOps for PipeHandle {
     /// M0-6 poll/select: hand the poll layer a probe over the shared Pipe Arc.
     ///
     /// `self.pipe.clone()` is an `Arc` refcount bump only — it does NOT touch
-    /// `PipeInner.readers`/`writers` (that is `duplicate()`/`clone_box`, which also
+    /// `Pipe.readers`/`writers` (that is `duplicate()`/`clone_box`, which also
     /// fire close-time wakes on drop). The raw owned probe keeps the original
     /// charged allocator token and reconstructs that exact Arc on drop; no
     /// allocation or allocator erasure occurs. `write_end` selects the end.

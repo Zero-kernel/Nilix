@@ -5556,6 +5556,12 @@ impl SocketTable {
             return false;
         }
 
+        // Lock-order fix (2026-10-21): the wake takes PROCESS_TABLE, and the
+        // fd paths take `sockets` for reading with a PCB held (PROCESS_TABLE ->
+        // PCB scans close that cycle). Release the registry and the connection
+        // table first; the listen guard still owns `accept_waiters`.
+        drop(conns);
+        drop(sockets);
         listen_state.accept_waiters.wake_one();
         true
     }

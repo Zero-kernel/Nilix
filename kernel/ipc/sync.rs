@@ -1063,9 +1063,31 @@ impl WaitQueue {
     ///
     /// 必须在 `prepare_to_wait()` 返回 true 之后调用。
     /// 在调用此函数之前应释放相关锁。
+    ///
+    /// GAP-6 (F13 class): a reschedule that returns without a switch is not a
+    /// wake. Returning then left the task `Blocked` and queued while callers
+    /// that found their condition true on the re-check (a pipe read that takes
+    /// data another reader was woken for, a KMutex/semaphore CAS that wins, a
+    /// condvar reacquire) went on to run, and returned to user mode, still
+    /// `Blocked`; the next switch away dropped the task until some later wake.
+    /// Wait like `finish_prepared` until a waker, a kill or a handler signal
+    /// resolves the wait. Every producer of these queues wakes them.
     pub fn finish_wait(&self) {
-        // 触发调度，让出CPU
-        kernel_core::force_reschedule();
+        match process::current_pid() {
+            Some(pid) => {
+                Self::block_until_resolved(pid, false);
+                // A kill or handler signal ended the wait while this task was
+                // still queued. Drop the entry, as `finish_prepared` does: a
+                // later `wake_one` must not be spent on a task that left (it
+                // may be blocked elsewhere by then) while a real waiter sleeps.
+                if process::wait_should_abort(pid)
+                    || kernel_core::signal::has_deliverable_signal(pid)
+                {
+                    self.cancel_wait();
+                }
+            }
+            None => kernel_core::force_reschedule(),
+        }
         self.reclaim_empty_waiter_capacity();
     }
 

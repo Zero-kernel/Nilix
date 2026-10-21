@@ -286,7 +286,7 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
         cgroup_attached = true;
     }
 
-    match fork_inner(&mut parent, child_pid, parent_root, child_credentials) {
+    match fork_inner(&mut parent, &child_process, parent_root, child_credentials) {
         Ok(()) => {}
         Err(error) => {
             parent.children.retain(|&pid| pid != child_pid);
@@ -524,7 +524,7 @@ fn kernel_stack_resume_is_admissible(parent_memory_space: usize) -> bool {
 /// Fork 的内部实现，便于错误处理和回滚
 fn fork_inner(
     parent: &mut crate::process::Process,
-    child_pid: ProcessId,
+    child_process: &ProcessArc,
     parent_root: usize,
     child_credentials: crate::process::Credentials,
 ) -> Result<(), ForkError> {
@@ -555,632 +555,632 @@ fn fork_inner(
     #[cfg(debug_assertions)]
     kprintln!("[FORKDIAG] FD1 reservation");
 
-    if let Some(child_process) = get_process(child_pid) {
-        let mut child = child_process.lock();
+    // GAP-5 stress fix: the caller passes the child it already holds. Looking it
+    // up here took PROCESS_TABLE under the parent PCB guard (PCB -> PROCESS_TABLE,
+    // the reverse of the canonical order) and deadlocked against a path that
+    // holds the table while it locks this parent: a child's group-exit report
+    // (`notify_parent_of_group_exit`) while the parent forks the next child.
+    let mut child = child_process.lock();
 
-        // 复制 CPU 上下文（RAX 在下方置 0）
-        child.context = parent.context;
-        // Lazy FPU: inherit parent's FPU usage flag
-        // If parent used FPU, the state in context.fx is valid and child inherits it
-        child.fpu_used = parent.fpu_used;
-        child.user_stack = parent.user_stack;
-        // SMP affinity and cpuset were snapshotted before scheduler admission.
-        // R163-4 FIX: Defer notify_cpuset_task_joined until after all fallible
-        // operations complete. If fork_inner fails after the notification,
-        // the counter is incremented but never decremented (cpuset DoS).
+    // 复制 CPU 上下文（RAX 在下方置 0）
+    child.context = parent.context;
+    // Lazy FPU: inherit parent's FPU usage flag
+    // If parent used FPU, the state in context.fx is valid and child inherits it
+    child.fpu_used = parent.fpu_used;
+    child.user_stack = parent.user_stack;
+    // SMP affinity and cpuset were snapshotted before scheduler admission.
+    // R163-4 FIX: Defer notify_cpuset_task_joined until after all fallible
+    // operations complete. If fork_inner fails after the notification,
+    // the counter is incremented but never decremented (cpuset DoS).
 
-        // ST-K3 FIX (fork chimera context): entry-state-keyed child resume model.
-        //
-        // A Ring-3 parent forks from INSIDE a syscall. The child must resume at
-        // the SYSCALL RETURN POINT with the parent's CURRENT user frame and
-        // rax = 0; forcing context.cs/ss to the user selectors below makes the
-        // scheduler's `next_cs & 3 == 3` check select switch_to_user, whose
-        // user-canonical rip/rsp validation the frame now satisfies.
-        //
-        // The previous code built a CHIMERA for this case: user CS from the
-        // STALE parent.context, plus — because `used = kernel_top - user_rsp`
-        // overflowed the copy guard — a KERNEL rsp from the fallback rebase
-        // below. switch_to_user's canonicality guard then executed its ud2 arm
-        // on the child's first dispatch (#UD at switch_to_user+0x18e; observed
-        // on the first Ring-3 fork this kernel ever ran, stress-v2 memory
-        // profile). The kernel-stack copy/rebase model below is retained for
-        // KERNEL-context parents only (their context.cs is a kernel selector,
-        // dispatched via switch_context; with_current_syscall_frame returns
-        // None outside an active syscall window, which is exactly the
-        // entry-state discriminator D1-ARC-ENTRY-STATE prescribes).
-        let ring3_user_frame = crate::syscall::with_current_syscall_frame(|frame| *frame);
+    // ST-K3 FIX (fork chimera context): entry-state-keyed child resume model.
+    //
+    // A Ring-3 parent forks from INSIDE a syscall. The child must resume at
+    // the SYSCALL RETURN POINT with the parent's CURRENT user frame and
+    // rax = 0; forcing context.cs/ss to the user selectors below makes the
+    // scheduler's `next_cs & 3 == 3` check select switch_to_user, whose
+    // user-canonical rip/rsp validation the frame now satisfies.
+    //
+    // The previous code built a CHIMERA for this case: user CS from the
+    // STALE parent.context, plus — because `used = kernel_top - user_rsp`
+    // overflowed the copy guard — a KERNEL rsp from the fallback rebase
+    // below. switch_to_user's canonicality guard then executed its ud2 arm
+    // on the child's first dispatch (#UD at switch_to_user+0x18e; observed
+    // on the first Ring-3 fork this kernel ever ran, stress-v2 memory
+    // profile). The kernel-stack copy/rebase model below is retained for
+    // KERNEL-context parents only (their context.cs is a kernel selector,
+    // dispatched via switch_context; with_current_syscall_frame returns
+    // None outside an active syscall window, which is exactly the
+    // entry-state discriminator D1-ARC-ENTRY-STATE prescribes).
+    let ring3_user_frame = crate::syscall::with_current_syscall_frame(|frame| *frame);
 
-        if let Some(frame) = ring3_user_frame {
-            // ST-K3 FIX (F1): validate BEFORE seeding the child. `frame.rsp` and
-            // `frame.rcx` come straight from the SYSCALL entry stub with no
-            // validation, and the child's first dispatch runs
-            // `switch_to_user`'s canonicality guard, whose failure arm is a
-            // Ring-0 `ud2` -> kernel panic. Unprivileged code could therefore
-            // weaponize `mov rsp, <non-canonical>; syscall` into a kernel kill.
-            // `< USER_SPACE_TOP` (0x0000_8000_0000_0000) is exactly the guard's
-            // condition: below 2^47 implies both canonical and bit47 == 0. A
-            // merely-unmapped (but canonical) user rsp/rip stays allowed — that
-            // faults in Ring 3 and terminates the child with SIGSEGV, which is
-            // correct Linux behavior, not a kernel bug.
-            const USER_ADDR_LIMIT: u64 = crate::usercopy::USER_SPACE_TOP as u64;
-            if frame.rsp >= USER_ADDR_LIMIT || frame.rcx >= USER_ADDR_LIMIT {
-                return Err(ForkError::InvalidUserFrame);
-            }
-            // SYSCALL entry saved: rcx = user RIP, r11 = user RFLAGS. Mirror
-            // the exact ABI the parent's own return path exposes (rcx/r11 are
-            // architecturally clobbered by SYSCALL, so userspace already
-            // treats them as such). switch_to_user sanitizes RFLAGS again
-            // (mask + force IF) before the IRETQ — defense in depth.
-            child.context.rax = 0; // fork() returns 0 in the child
-            child.context.rbx = frame.rbx;
-            child.context.rcx = frame.rcx;
-            child.context.rdx = frame.rdx;
-            child.context.rsi = frame.rsi;
-            child.context.rdi = frame.rdi;
-            child.context.rbp = frame.rbp;
-            child.context.rsp = frame.rsp; // user RSP
-            child.context.r8 = frame.r8;
-            child.context.r9 = frame.r9;
-            child.context.r10 = frame.r10;
-            child.context.r11 = frame.r11;
-            child.context.r12 = frame.r12;
-            child.context.r13 = frame.r13;
-            child.context.r14 = frame.r14;
-            child.context.r15 = frame.r15;
-            child.context.rip = frame.rcx; // user return RIP
-            child.context.rflags = frame.r11; // user RFLAGS
-                                              // cs/ss MUST be forced: the parent's saved context.cs is a KERNEL
-                                              // selector (both switch_context and switch_to_user save-halves
-                                              // store the live `mov ax, cs` — i.e. the kernel CS active at
-                                              // save time), so inheriting it routes the child through the
-                                              // scheduler's `next_cs & 3 == 3` check into switch_context, which
-                                              // `ret`s into the USER rsp set above (#PF at RIP=user-stack
-                                              // garbage; observed addr=0x1). Same idiom as the CLONE_VM child
-                                              // path (syscall.rs).
-            child.context.cs = 0x23; // USER_CODE_SELECTOR
-            child.context.ss = 0x1b; // USER_DATA_SELECTOR
-        } else {
-            // F2 FIX (no-current-user-frame fork): the kernel-stack copy/rebase
-            // model below is valid ONLY for a kernel-context parent. Reaching it
-            // with a Ring-3 parent means the syscall-frame window was absent or
-            // disowned while a user task was mid-fork; seeding the child from
-            // `parent.context` would then rebuild exactly the chimera the ST-K3
-            // fix above removed (kernel rsp under user selectors -> ud2 in
-            // switch_to_user), so refuse instead of guessing a resume state.
-            //
-            // `memory_space == 0` is this kernel's kernel-thread discriminator
-            // (same idiom as the OOM candidate's `is_kernel_thread`, process.rs),
-            // and it is independent of the frame window rather than derived from
-            // it — a disowned frame cannot forge a user parent into a kernel one.
-            //
-            // The refusal precedes publication: `sys_fork` maps every
-            // `fork_inner` error through `cleanup_partial_child` plus the
-            // scheduler-permit drop, so no child PCB, PID chain entry, or cgroup
-            // charge survives. `InvalidUserFrame` surfaces as EFAULT.
-            if !kernel_stack_resume_is_admissible(parent.memory_space) {
-                return Err(ForkError::InvalidUserFrame);
-            }
-            // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
-            // 复制父进程内核栈内容以保持返回路径一致
-            let parent_top = parent.kernel_stack_top.as_u64();
-            let parent_rsp = parent.context.rsp;
-            let child_top = child.kernel_stack_top.as_u64();
-
-            // 计算父进程已使用的栈空间
-            let used = parent_top.saturating_sub(parent_rsp);
-            let parent_stack_size = parent_top.saturating_sub(parent.kernel_stack.as_u64());
-
-            if child_top != 0 && used > 0 && used <= parent_stack_size {
-                // 子进程栈顶减去相同使用量 = 子进程 RSP
-                let child_rsp = child_top - used;
-
-                // 复制父栈内容到子栈
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        parent_rsp as *const u8,
-                        child_rsp as *mut u8,
-                        used as usize,
-                    );
-                }
-
-                child.context.rsp = child_rsp;
-
-                // 调整 RBP（如果它指向父栈范围内）
-                if parent.context.rbp >= parent_rsp && parent.context.rbp <= parent_top {
-                    // RBP 相对偏移保持不变
-                    let rbp_offset = parent.context.rbp - parent_rsp;
-                    child.context.rbp = child_rsp + rbp_offset;
-                } else {
-                    // RBP 不在栈范围内，直接使用子栈顶
-                    child.context.rbp = child_rsp;
-                }
-            } else if child_top != 0 {
-                // 无法复制栈，使用子栈顶作为起点
-                child.context.rsp = child_top;
-                child.context.rbp = child_top;
-            }
-            // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
+    if let Some(frame) = ring3_user_frame {
+        // ST-K3 FIX (F1): validate BEFORE seeding the child. `frame.rsp` and
+        // `frame.rcx` come straight from the SYSCALL entry stub with no
+        // validation, and the child's first dispatch runs
+        // `switch_to_user`'s canonicality guard, whose failure arm is a
+        // Ring-0 `ud2` -> kernel panic. Unprivileged code could therefore
+        // weaponize `mov rsp, <non-canonical>; syscall` into a kernel kill.
+        // `< USER_SPACE_TOP` (0x0000_8000_0000_0000) is exactly the guard's
+        // condition: below 2^47 implies both canonical and bit47 == 0. A
+        // merely-unmapped (but canonical) user rsp/rip stays allowed — that
+        // faults in Ring 3 and terminates the child with SIGSEGV, which is
+        // correct Linux behavior, not a kernel bug.
+        const USER_ADDR_LIMIT: u64 = crate::usercopy::USER_SPACE_TOP as u64;
+        if frame.rsp >= USER_ADDR_LIMIT || frame.rcx >= USER_ADDR_LIMIT {
+            return Err(ForkError::InvalidUserFrame);
         }
-
-        // R162-7 FIX: Clone fd_table with bounded fallibility.
-        // clone_box() is still infallible (Box::new), but we pre-validate
-        // the fd count fits in memory. With MAX_FD=256, total alloc is ~128KB.
-        // If fd_table is excessively large, fail early.
-        // GAP-5 slice 3: both tables are locked for the copy (parent then
-        // child; the child is not yet visible to any other path).
-        {
-            let parent_files = parent.files.lock();
-            let mut child_files = child.files.lock();
-            if parent_files.fd_table.len() > crate::process::MAX_FD as usize {
-                return Err(ForkError::MemoryAllocationFailed);
-            }
-            child_files
-                .fd_table
-                .ensure_capacity_for(parent_files.fd_table.len())
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            child_files
-                .cloexec_fds
-                .ensure_capacity_for(parent_files.cloexec_fds.len())
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            for (&fd, desc) in parent_files.fd_table.iter() {
-                let cloned = desc
-                    .try_clone_box()
-                    .map_err(|_| ForkError::MemoryAllocationFailed)?;
-                if child_files
-                    .fd_table
-                    .insert_unique_reserved(fd, cloned)
-                    .is_err()
-                {
-                    panic!("fork FD snapshot violated unique reserved publication");
-                }
-            }
-
-            // R39-4 FIX: 克隆 close-on-exec 标记集合
-            // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
-            // (~12KB worst case). Accepted risk documented.
-            for &fd in parent_files.cloexec_fds.iter() {
-                if child_files.cloexec_fds.insert_reserved(fd).is_err() {
-                    panic!("fork CLOEXEC snapshot exceeded prepared capacity");
-                }
-            }
+        // SYSCALL entry saved: rcx = user RIP, r11 = user RFLAGS. Mirror
+        // the exact ABI the parent's own return path exposes (rcx/r11 are
+        // architecturally clobbered by SYSCALL, so userspace already
+        // treats them as such). switch_to_user sanitizes RFLAGS again
+        // (mask + force IF) before the IRETQ — defense in depth.
+        child.context.rax = 0; // fork() returns 0 in the child
+        child.context.rbx = frame.rbx;
+        child.context.rcx = frame.rcx;
+        child.context.rdx = frame.rdx;
+        child.context.rsi = frame.rsi;
+        child.context.rdi = frame.rdi;
+        child.context.rbp = frame.rbp;
+        child.context.rsp = frame.rsp; // user RSP
+        child.context.r8 = frame.r8;
+        child.context.r9 = frame.r9;
+        child.context.r10 = frame.r10;
+        child.context.r11 = frame.r11;
+        child.context.r12 = frame.r12;
+        child.context.r13 = frame.r13;
+        child.context.r14 = frame.r14;
+        child.context.r15 = frame.r15;
+        child.context.rip = frame.rcx; // user return RIP
+        child.context.rflags = frame.r11; // user RFLAGS
+                                          // cs/ss MUST be forced: the parent's saved context.cs is a KERNEL
+                                          // selector (both switch_context and switch_to_user save-halves
+                                          // store the live `mov ax, cs` — i.e. the kernel CS active at
+                                          // save time), so inheriting it routes the child through the
+                                          // scheduler's `next_cs & 3 == 3` check into switch_context, which
+                                          // `ret`s into the USER rsp set above (#PF at RIP=user-stack
+                                          // garbage; observed addr=0x1). Same idiom as the CLONE_VM child
+                                          // path (syscall.rs).
+        child.context.cs = 0x23; // USER_CODE_SELECTOR
+        child.context.ss = 0x1b; // USER_DATA_SELECTOR
+    } else {
+        // F2 FIX (no-current-user-frame fork): the kernel-stack copy/rebase
+        // model below is valid ONLY for a kernel-context parent. Reaching it
+        // with a Ring-3 parent means the syscall-frame window was absent or
+        // disowned while a user task was mid-fork; seeding the child from
+        // `parent.context` would then rebuild exactly the chimera the ST-K3
+        // fix above removed (kernel rsp under user selectors -> ud2 in
+        // switch_to_user), so refuse instead of guessing a resume state.
+        //
+        // `memory_space == 0` is this kernel's kernel-thread discriminator
+        // (same idiom as the OOM candidate's `is_kernel_thread`, process.rs),
+        // and it is independent of the frame window rather than derived from
+        // it — a disowned frame cannot forge a user parent into a kernel one.
+        //
+        // The refusal precedes publication: `sys_fork` maps every
+        // `fork_inner` error through `cleanup_partial_child` plus the
+        // scheduler-permit drop, so no child PCB, PID chain entry, or cgroup
+        // charge survives. `InvalidUserFrame` surfaces as EFAULT.
+        if !kernel_stack_resume_is_admissible(parent.memory_space) {
+            return Err(ForkError::InvalidUserFrame);
         }
+        // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
+        // 复制父进程内核栈内容以保持返回路径一致
+        let parent_top = parent.kernel_stack_top.as_u64();
+        let parent_rsp = parent.context.rsp;
+        let child_top = child.kernel_stack_top.as_u64();
 
-        // M0-6: inherit POSIX resource limits across fork (POSIX: child inherits
-        // the parent's rlimits). `[RLimit; N]` is Copy — a trivial value copy.
-        child.rlimits = parent.rlimits;
+        // 计算父进程已使用的栈空间
+        let used = parent_top.saturating_sub(parent_rsp);
+        let parent_stack_size = parent_top.saturating_sub(parent.kernel_stack.as_u64());
 
-        // M0 item 5: inherit signal dispositions + blocked mask across fork (POSIX).
-        // `[SigAction; NSIG]` and `u64` are Copy. `saved_blocked`/`in_signal_handler`
-        // are handler scratch state and intentionally stay born-clean in the child
-        // (a fork inside a handler does NOT carry the parent's live frame state). The
-        // "any handler installed" fast-path hint is a monotonic global, so the child
-        // inheriting a parent's handler needs no per-task bookkeeping here.
-        child.sigactions.copy_from(&parent.sigactions);
-        child.blocked = parent.blocked;
+        if child_top != 0 && used > 0 && used <= parent_stack_size {
+            // 子进程栈顶减去相同使用量 = 子进程 RSP
+            let child_rsp = child_top - used;
 
-        // 克隆能力表（尊重 CLOFORK 标志）
-        //
-        // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
-        // 并保持生成计数器的单调性以防止 wrap 攻击。
-        // R161-4 FIX: Use fallible try_clone_for_fork to avoid OOM panic
-        //
-        // U.S3-SLICE-2 FIX: reconcile the child cap_table refcounts to match the
-        // child's ACTUAL fd count when the parent is a CLONE_THREAD thread sharing
-        // its cap_table Arc with siblings. CapSlot::clone copies refcounts VERBATIM
-        // (U.S3-A1), but fork's fd_table copy (loop above) copies ONLY the forking
-        // thread's fds, not sibling fds. So the child's cap refcounts include
-        // sibling-held references → over-count → child-local slot leak (TableFull
-        // DoS class, fail-safe: revoke-too-late, never premature). Reconciliation:
-        // COUNT the child's actual per-cap fd references and OVERWRITE each
-        // CapEntry.refcount to match. Safe under parent lock; child not visible yet.
-        // Reconcile only if parent's cap_table Arc::strong_count > 1 (shared).
-        // A non-shared parent (standalone process or the last survivor of a thread
-        // group) has cap refcounts that already equal its own fd count, so the
-        // verbatim copy is correct. Checking `> 1` avoids the O(fds × caps) scan
-        // on the common non-threaded fork path.
-        let cap_table = if parent.capability_table_is_shared() {
-            // Build a histogram: CapId → count of child fds carrying it.
-            let mut child_cap_counts =
-                [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
-            let mut child_cap_count_len = 0usize;
-            let child_files = child.files.lock();
-            for desc in child_files.fd_table.values() {
-                if let Some(cid) = desc.cap_id() {
-                    let Some(slot) = child_cap_counts.get_mut(child_cap_count_len) else {
-                        return Err(ForkError::MemoryAllocationFailed);
-                    };
-                    *slot = (cid, 1);
-                    child_cap_count_len += 1;
-                }
-            }
-            drop(child_files);
-            child_cap_counts[..child_cap_count_len].sort_unstable_by_key(|entry| entry.0);
-            let mut unique_len = 0usize;
-            for index in 0..child_cap_count_len {
-                let (cid, count) = child_cap_counts[index];
-                if unique_len != 0 && child_cap_counts[unique_len - 1].0 == cid {
-                    child_cap_counts[unique_len - 1].1 = child_cap_counts[unique_len - 1]
-                        .1
-                        .checked_add(count)
-                        .ok_or(ForkError::MemoryAllocationFailed)?;
-                } else {
-                    child_cap_counts[unique_len] = (cid, count);
-                    unique_len += 1;
-                }
-            }
-            parent
-                .try_clone_capability_table_for_fork(Some(&child_cap_counts[..unique_len]))
-                .map_err(|_| ForkError::MemoryAllocationFailed)?
-        } else {
-            parent
-                .try_clone_capability_table_for_fork(None)
-                .map_err(|_| ForkError::MemoryAllocationFailed)?
-        };
-
-        child.install_capability_table(cap_table);
-
-        child.time_slice = parent.time_slice;
-        child.cpu_time = 0;
-
-        // E.4 Priority Inheritance: 继承基础动态优先级
-        //
-        // 子进程继承父进程的 base_dynamic_priority（未应用 PI 的优先级基线）。
-        // 但不继承 pi_boosts（父进程持有的 futex 相关），子进程从空开始。
-        // waiting_on_futex 也不继承（子进程未阻塞在任何 futex 上）。
-        child.base_dynamic_priority = parent.base_dynamic_priority;
-        // pi_boosts 和 waiting_on_futex 在 Process::new() 中已初始化为空
-
-        // R39-3 FIX: 继承父进程的凭证（fork 创建独立副本）
-        //
-        // fork() 创建的子进程获得父进程凭证的克隆副本（独立 Arc）。
-        // 这意味着子进程后续的 setuid/setgid 不会影响父进程。
-        // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
-        let credential_arc_reservation = try_reserve_heap(
-            HeapClass::CoreProcess,
-            arc_charge_bytes::<crate::process::SharedCredentials>()
-                .map_err(|_| ForkError::MemoryAllocationFailed)?,
-        )
-        .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        let credentials = Arc::try_new(crate::process::SharedCredentials::new(child_credentials))
-            .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        child.install_shared_credentials_for_clone(credentials);
-        drop(credential_arc_reservation);
-        // GAP-5 slice 2: fork deep-copies root/cwd/umask into the child's own
-        // (already admitted) handle; parent and child are never shared.
-        child.fs.copy_from(&parent.fs);
-
-        // D3-ARC-MM-SHARED: Build the child's independent MmState from the
-        // parent's shared mm. This replaces the old per-field copies of
-        // brk_start, brk, elf_charged_bytes, mmap_regions, and next_mmap_addr.
-        //
-        // R138-1 FIX: Inherit parent's ELF loader charges so the child's cgroup
-        // accounting is complete under worst-case COW semantics.  The exact
-        // charge is derived from this same locked snapshot and reserved below,
-        // before the parent-PTE commit.
-        //
-        // R122-1 FIX: Strip transient PENDING_* flags when cloning committed
-        // regions into the child, preserving persistent per-region flags (e.g.
-        // PROT_NONE) so the child inherits correct region metadata.
-        //
-        // R157-3 FIX: Fallible pre-allocation — BTreeMap::collect() uses
-        // infallible allocation; 65536 entries can exhaust the 1 MiB kernel heap.
-        // We pre-allocate into a Vec first to detect OOM early.
-        //
-        // Lock ordering: Process (held) → MmState — never reverse.
-        let fork_charge_bytes = {
-            let parent_mm = parent.mm.lock();
-
-            // Re-check every transient at the actual snapshot point.  The early
-            // check rejects quickly; this one prevents a CLONE_VM sibling from
-            // opening a prepare window before the metadata/charge snapshot.
-            if parent_mm
-                .mmap_regions
-                .values()
-                .any(|entry: &crate::syscall::MmapEntry| entry.has_transient())
-                || parent_mm.brk_in_progress
-                || parent_mm.stack_grow_in_progress
-            {
-                return Err(ForkError::MmapTransientState);
-            }
-            debug_assert!(
-                parent_mm.fork_in_progress,
-                "fork snapshot must own the shared-MM reservation"
-            );
-
-            for (&base, entry) in parent_mm.mmap_regions.iter() {
-                let entry: &crate::syscall::MmapEntry = entry;
-                if entry.is_shared() {
-                    let end = base
-                        .checked_add(crate::syscall::mmap_region_len(*entry))
-                        .ok_or(ForkError::MemoryAllocationFailed)?;
-                    shared_ranges
-                        .try_push((base, end))
-                        .map_err(|_| ForkError::MemoryAllocationFailed)?;
-                }
+            // 复制父栈内容到子栈
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    parent_rsp as *const u8,
+                    child_rsp as *mut u8,
+                    used as usize,
+                );
             }
 
-            let mut charge_bytes = 0u64;
-            for (_base, entry) in parent_mm.mmap_regions.iter() {
-                let entry: &crate::syscall::MmapEntry = entry;
-                if !entry.is_prot_none() && !entry.is_shared() {
-                    charge_bytes =
-                        charge_bytes.saturating_add(crate::syscall::mmap_region_len(*entry) as u64);
-                }
-            }
-            const PAGE_SIZE: usize = 0x1000;
-            let brk_aligned = parent_mm.brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            let brk_start_aligned =
-                parent_mm.brk_start.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            charge_bytes = charge_bytes
-                .saturating_add(brk_aligned.saturating_sub(brk_start_aligned) as u64)
-                .saturating_add(parent_mm.elf_charged_bytes)
-                .saturating_add(parent_mm.pt_charged_bytes);
+            child.context.rsp = child_rsp;
 
-            let region_count = parent_mm.mmap_regions.len();
-            // R165-14: Re-assert the MAX_MAP_COUNT bound before cloning. mmap()
-            // already enforces it on insert, but checking here keeps the child's
-            // infallible BTreeMap build (below) bounded even if a future path
-            // grows mmap_regions past the limit.
-            if region_count > crate::syscall::MAX_MAP_COUNT {
-                return Err(ForkError::MemoryAllocationFailed);
-            }
-            // R186-4 FIX: reserve the exact snapshot backing before asking the
-            // allocator for it. The reservation is handed to the map constructor
-            // after population, so this path cannot double-reserve or allocate
-            // outside the CoreProcess admission ledger.
-            let child_mmap_regions = if region_count == 0 {
-                // Avoid the published-ledger precondition for a zero-sized map.
-                mm::AdmittedMap::new(mm::HeapClass::CoreProcess)
+            // 调整 RBP（如果它指向父栈范围内）
+            if parent.context.rbp >= parent_rsp && parent.context.rbp <= parent_top {
+                // RBP 相对偏移保持不变
+                let rbp_offset = parent.context.rbp - parent_rsp;
+                child.context.rbp = child_rsp + rbp_offset;
             } else {
-                let snapshot_bytes =
-                    vec_charge_bytes::<(usize, crate::syscall::MmapEntry)>(region_count)
-                        .map_err(|_| ForkError::MemoryAllocationFailed)?;
-                let reservation = try_reserve_heap(HeapClass::CoreProcess, snapshot_bytes)
+                // RBP 不在栈范围内，直接使用子栈顶
+                child.context.rbp = child_rsp;
+            }
+        } else if child_top != 0 {
+            // 无法复制栈，使用子栈顶作为起点
+            child.context.rsp = child_top;
+            child.context.rbp = child_top;
+        }
+        // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
+    }
+
+    // R162-7 FIX: Clone fd_table with bounded fallibility.
+    // clone_box() is still infallible (Box::new), but we pre-validate
+    // the fd count fits in memory. With MAX_FD=256, total alloc is ~128KB.
+    // If fd_table is excessively large, fail early.
+    // GAP-5 slice 3: both tables are locked for the copy (parent then
+    // child; the child is not yet visible to any other path).
+    {
+        let parent_files = parent.files.lock();
+        let mut child_files = child.files.lock();
+        if parent_files.fd_table.len() > crate::process::MAX_FD as usize {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+        child_files
+            .fd_table
+            .ensure_capacity_for(parent_files.fd_table.len())
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        child_files
+            .cloexec_fds
+            .ensure_capacity_for(parent_files.cloexec_fds.len())
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        for (&fd, desc) in parent_files.fd_table.iter() {
+            let cloned = desc
+                .try_clone_box()
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            if child_files
+                .fd_table
+                .insert_unique_reserved(fd, cloned)
+                .is_err()
+            {
+                panic!("fork FD snapshot violated unique reserved publication");
+            }
+        }
+
+        // R39-4 FIX: 克隆 close-on-exec 标记集合
+        // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
+        // (~12KB worst case). Accepted risk documented.
+        for &fd in parent_files.cloexec_fds.iter() {
+            if child_files.cloexec_fds.insert_reserved(fd).is_err() {
+                panic!("fork CLOEXEC snapshot exceeded prepared capacity");
+            }
+        }
+    }
+
+    // M0-6: inherit POSIX resource limits across fork (POSIX: child inherits
+    // the parent's rlimits). `[RLimit; N]` is Copy — a trivial value copy.
+    child.rlimits = parent.rlimits;
+
+    // M0 item 5: inherit signal dispositions + blocked mask across fork (POSIX).
+    // `[SigAction; NSIG]` and `u64` are Copy. `saved_blocked`/`in_signal_handler`
+    // are handler scratch state and intentionally stay born-clean in the child
+    // (a fork inside a handler does NOT carry the parent's live frame state). The
+    // "any handler installed" fast-path hint is a monotonic global, so the child
+    // inheriting a parent's handler needs no per-task bookkeeping here.
+    child.sigactions.copy_from(&parent.sigactions);
+    child.blocked = parent.blocked;
+
+    // 克隆能力表（尊重 CLOFORK 标志）
+    //
+    // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
+    // 并保持生成计数器的单调性以防止 wrap 攻击。
+    // R161-4 FIX: Use fallible try_clone_for_fork to avoid OOM panic
+    //
+    // U.S3-SLICE-2 FIX: reconcile the child cap_table refcounts to match the
+    // child's ACTUAL fd count when the parent is a CLONE_THREAD thread sharing
+    // its cap_table Arc with siblings. CapSlot::clone copies refcounts VERBATIM
+    // (U.S3-A1), but fork's fd_table copy (loop above) copies ONLY the forking
+    // thread's fds, not sibling fds. So the child's cap refcounts include
+    // sibling-held references → over-count → child-local slot leak (TableFull
+    // DoS class, fail-safe: revoke-too-late, never premature). Reconciliation:
+    // COUNT the child's actual per-cap fd references and OVERWRITE each
+    // CapEntry.refcount to match. Safe under parent lock; child not visible yet.
+    // Reconcile only if parent's cap_table Arc::strong_count > 1 (shared).
+    // A non-shared parent (standalone process or the last survivor of a thread
+    // group) has cap refcounts that already equal its own fd count, so the
+    // verbatim copy is correct. Checking `> 1` avoids the O(fds × caps) scan
+    // on the common non-threaded fork path.
+    let cap_table = if parent.capability_table_is_shared() {
+        // Build a histogram: CapId → count of child fds carrying it.
+        let mut child_cap_counts = [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
+        let mut child_cap_count_len = 0usize;
+        let child_files = child.files.lock();
+        for desc in child_files.fd_table.values() {
+            if let Some(cid) = desc.cap_id() {
+                let Some(slot) = child_cap_counts.get_mut(child_cap_count_len) else {
+                    return Err(ForkError::MemoryAllocationFailed);
+                };
+                *slot = (cid, 1);
+                child_cap_count_len += 1;
+            }
+        }
+        drop(child_files);
+        child_cap_counts[..child_cap_count_len].sort_unstable_by_key(|entry| entry.0);
+        let mut unique_len = 0usize;
+        for index in 0..child_cap_count_len {
+            let (cid, count) = child_cap_counts[index];
+            if unique_len != 0 && child_cap_counts[unique_len - 1].0 == cid {
+                child_cap_counts[unique_len - 1].1 = child_cap_counts[unique_len - 1]
+                    .1
+                    .checked_add(count)
+                    .ok_or(ForkError::MemoryAllocationFailed)?;
+            } else {
+                child_cap_counts[unique_len] = (cid, count);
+                unique_len += 1;
+            }
+        }
+        parent
+            .try_clone_capability_table_for_fork(Some(&child_cap_counts[..unique_len]))
+            .map_err(|_| ForkError::MemoryAllocationFailed)?
+    } else {
+        parent
+            .try_clone_capability_table_for_fork(None)
+            .map_err(|_| ForkError::MemoryAllocationFailed)?
+    };
+
+    child.install_capability_table(cap_table);
+
+    child.time_slice = parent.time_slice;
+    child.cpu_time = 0;
+
+    // E.4 Priority Inheritance: 继承基础动态优先级
+    //
+    // 子进程继承父进程的 base_dynamic_priority（未应用 PI 的优先级基线）。
+    // 但不继承 pi_boosts（父进程持有的 futex 相关），子进程从空开始。
+    // waiting_on_futex 也不继承（子进程未阻塞在任何 futex 上）。
+    child.base_dynamic_priority = parent.base_dynamic_priority;
+    // pi_boosts 和 waiting_on_futex 在 Process::new() 中已初始化为空
+
+    // R39-3 FIX: 继承父进程的凭证（fork 创建独立副本）
+    //
+    // fork() 创建的子进程获得父进程凭证的克隆副本（独立 Arc）。
+    // 这意味着子进程后续的 setuid/setgid 不会影响父进程。
+    // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
+    let credential_arc_reservation = try_reserve_heap(
+        HeapClass::CoreProcess,
+        arc_charge_bytes::<crate::process::SharedCredentials>()
+            .map_err(|_| ForkError::MemoryAllocationFailed)?,
+    )
+    .map_err(|_| ForkError::MemoryAllocationFailed)?;
+    let credentials = Arc::try_new(crate::process::SharedCredentials::new(child_credentials))
+        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+    child.install_shared_credentials_for_clone(credentials);
+    drop(credential_arc_reservation);
+    // GAP-5 slice 2: fork deep-copies root/cwd/umask into the child's own
+    // (already admitted) handle; parent and child are never shared.
+    child.fs.copy_from(&parent.fs);
+
+    // D3-ARC-MM-SHARED: Build the child's independent MmState from the
+    // parent's shared mm. This replaces the old per-field copies of
+    // brk_start, brk, elf_charged_bytes, mmap_regions, and next_mmap_addr.
+    //
+    // R138-1 FIX: Inherit parent's ELF loader charges so the child's cgroup
+    // accounting is complete under worst-case COW semantics.  The exact
+    // charge is derived from this same locked snapshot and reserved below,
+    // before the parent-PTE commit.
+    //
+    // R122-1 FIX: Strip transient PENDING_* flags when cloning committed
+    // regions into the child, preserving persistent per-region flags (e.g.
+    // PROT_NONE) so the child inherits correct region metadata.
+    //
+    // R157-3 FIX: Fallible pre-allocation — BTreeMap::collect() uses
+    // infallible allocation; 65536 entries can exhaust the 1 MiB kernel heap.
+    // We pre-allocate into a Vec first to detect OOM early.
+    //
+    // Lock ordering: Process (held) → MmState — never reverse.
+    let fork_charge_bytes = {
+        let parent_mm = parent.mm.lock();
+
+        // Re-check every transient at the actual snapshot point.  The early
+        // check rejects quickly; this one prevents a CLONE_VM sibling from
+        // opening a prepare window before the metadata/charge snapshot.
+        if parent_mm
+            .mmap_regions
+            .values()
+            .any(|entry: &crate::syscall::MmapEntry| entry.has_transient())
+            || parent_mm.brk_in_progress
+            || parent_mm.stack_grow_in_progress
+        {
+            return Err(ForkError::MmapTransientState);
+        }
+        debug_assert!(
+            parent_mm.fork_in_progress,
+            "fork snapshot must own the shared-MM reservation"
+        );
+
+        for (&base, entry) in parent_mm.mmap_regions.iter() {
+            let entry: &crate::syscall::MmapEntry = entry;
+            if entry.is_shared() {
+                let end = base
+                    .checked_add(crate::syscall::mmap_region_len(*entry))
+                    .ok_or(ForkError::MemoryAllocationFailed)?;
+                shared_ranges
+                    .try_push((base, end))
                     .map_err(|_| ForkError::MemoryAllocationFailed)?;
-                let mut snap: Vec<(usize, crate::syscall::MmapEntry)> = Vec::new();
-                if snap.try_reserve_exact(region_count).is_err() {
-                    // Dropping the armed reservation rolls back both ledger lanes.
+            }
+        }
+
+        let mut charge_bytes = 0u64;
+        for (_base, entry) in parent_mm.mmap_regions.iter() {
+            let entry: &crate::syscall::MmapEntry = entry;
+            if !entry.is_prot_none() && !entry.is_shared() {
+                charge_bytes =
+                    charge_bytes.saturating_add(crate::syscall::mmap_region_len(*entry) as u64);
+            }
+        }
+        const PAGE_SIZE: usize = 0x1000;
+        let brk_aligned = parent_mm.brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let brk_start_aligned =
+            parent_mm.brk_start.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        charge_bytes = charge_bytes
+            .saturating_add(brk_aligned.saturating_sub(brk_start_aligned) as u64)
+            .saturating_add(parent_mm.elf_charged_bytes)
+            .saturating_add(parent_mm.pt_charged_bytes);
+
+        let region_count = parent_mm.mmap_regions.len();
+        // R165-14: Re-assert the MAX_MAP_COUNT bound before cloning. mmap()
+        // already enforces it on insert, but checking here keeps the child's
+        // infallible BTreeMap build (below) bounded even if a future path
+        // grows mmap_regions past the limit.
+        if region_count > crate::syscall::MAX_MAP_COUNT {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+        // R186-4 FIX: reserve the exact snapshot backing before asking the
+        // allocator for it. The reservation is handed to the map constructor
+        // after population, so this path cannot double-reserve or allocate
+        // outside the CoreProcess admission ledger.
+        let child_mmap_regions = if region_count == 0 {
+            // Avoid the published-ledger precondition for a zero-sized map.
+            mm::AdmittedMap::new(mm::HeapClass::CoreProcess)
+        } else {
+            let snapshot_bytes =
+                vec_charge_bytes::<(usize, crate::syscall::MmapEntry)>(region_count)
+                    .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            let reservation = try_reserve_heap(HeapClass::CoreProcess, snapshot_bytes)
+                .map_err(|_| ForkError::MemoryAllocationFailed)?;
+            let mut snap: Vec<(usize, crate::syscall::MmapEntry)> = Vec::new();
+            if snap.try_reserve_exact(region_count).is_err() {
+                // Dropping the armed reservation rolls back both ledger lanes.
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            // D2 Phase 2: strip transient flags via the typed accessor (clears
+            // PENDING_*, preserves PROT_NONE + prot bits, which are load-bearing
+            // for the child's cgroup-charge skip).
+            snap.extend(parent_mm.mmap_regions.iter().map(
+                |(&base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
+                    (base, len_with_flags.fork_stripped())
+                },
+            ));
+            match mm::AdmittedMap::from_sorted_vec_with_reservation(snap, reservation) {
+                Ok(map) => map,
+                Err(error) => {
+                    let (snap, reservation, _error) = error.into_parts();
+                    // Release the backing reservation only after the
+                    // returned Vec has been destroyed.
+                    drop(snap);
+                    drop(reservation);
                     return Err(ForkError::MemoryAllocationFailed);
                 }
-                // D2 Phase 2: strip transient flags via the typed accessor (clears
-                // PENDING_*, preserves PROT_NONE + prot bits, which are load-bearing
-                // for the child's cgroup-charge skip).
-                snap.extend(parent_mm.mmap_regions.iter().map(
-                    |(&base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
-                        (base, len_with_flags.fork_stripped())
-                    },
-                ));
-                match mm::AdmittedMap::from_sorted_vec_with_reservation(snap, reservation) {
-                    Ok(map) => map,
-                    Err(error) => {
-                        let (snap, reservation, _error) = error.into_parts();
-                        // Release the backing reservation only after the
-                        // returned Vec has been destroyed.
-                        drop(snap);
-                        drop(reservation);
-                        return Err(ForkError::MemoryAllocationFailed);
-                    }
-                }
-            };
-
-            // ST-K2-P2: shared-anonymous region metadata is a second admitted
-            // map.  Its values are Arc handles to the parent's page slots, so
-            // regular fork inherits the same demand-paged frames and region
-            // pin; CLONE_VM already shares this MmState directly.
-            let mut child_shared_regions = mm::AdmittedMap::new(mm::HeapClass::CoreProcess);
-            if parent_mm.shared_regions.len() > crate::syscall::MAX_MAP_COUNT {
-                return Err(ForkError::MemoryAllocationFailed);
             }
+        };
+
+        // ST-K2-P2: shared-anonymous region metadata is a second admitted
+        // map.  Its values are Arc handles to the parent's page slots, so
+        // regular fork inherits the same demand-paged frames and region
+        // pin; CLONE_VM already shares this MmState directly.
+        let mut child_shared_regions = mm::AdmittedMap::new(mm::HeapClass::CoreProcess);
+        if parent_mm.shared_regions.len() > crate::syscall::MAX_MAP_COUNT {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+        if child_shared_regions
+            .try_reserve(parent_mm.shared_regions.len())
+            .is_err()
+        {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+        for (&base, region) in parent_mm.shared_regions.iter() {
             if child_shared_regions
-                .try_reserve(parent_mm.shared_regions.len())
+                .try_insert(base, Arc::clone(region))
                 .is_err()
             {
                 return Err(ForkError::MemoryAllocationFailed);
             }
-            for (&base, region) in parent_mm.shared_regions.iter() {
-                if child_shared_regions
-                    .try_insert(base, Arc::clone(region))
-                    .is_err()
-                {
-                    return Err(ForkError::MemoryAllocationFailed);
-                }
-            }
+        }
 
-            let mut child_mm = crate::process::MmState {
-                // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
-                // child's region map is now a `FallibleOrderedMap`, adopted in
-                // O(1) with NO allocation from the already-sorted, admission-
-                // reserved `snap` Vec. The prior infallible
-                // `BTreeMap::collect()` (which could abort under OOM with up to
-                // MAX_MAP_COUNT entries) is eliminated: every allocation on this
-                // path is now the fallible `try_reserve_exact` on `snap` above,
-                // and `from_sorted_vec` consumes that Vec verbatim. `snap` is
-                // strictly key-sorted because it is built from the parent's
-                // ordered `mmap_regions.iter()` (debug-asserted by from_sorted_vec).
-                //
-                // R186-4 FIX: Migrated to AdmittedMap with the reservation handoff,
-                // which charges the Vec capacity to CoreProcess before adoption.
-                mmap_regions: child_mmap_regions,
-                shared_regions: child_shared_regions,
+        let mut child_mm = crate::process::MmState {
+            // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
+            // child's region map is now a `FallibleOrderedMap`, adopted in
+            // O(1) with NO allocation from the already-sorted, admission-
+            // reserved `snap` Vec. The prior infallible
+            // `BTreeMap::collect()` (which could abort under OOM with up to
+            // MAX_MAP_COUNT entries) is eliminated: every allocation on this
+            // path is now the fallible `try_reserve_exact` on `snap` above,
+            // and `from_sorted_vec` consumes that Vec verbatim. `snap` is
+            // strictly key-sorted because it is built from the parent's
+            // ordered `mmap_regions.iter()` (debug-asserted by from_sorted_vec).
+            //
+            // R186-4 FIX: Migrated to AdmittedMap with the reservation handoff,
+            // which charges the Vec capacity to CoreProcess before adoption.
+            mmap_regions: child_mmap_regions,
+            shared_regions: child_shared_regions,
 
-                brk_start: parent_mm.brk_start,
-                brk: parent_mm.brk,
-                next_mmap_addr: parent_mm.next_mmap_addr,
-                vm_charged_bytes: parent_mm.vm_charged_bytes,
-                elf_charged_bytes: parent_mm.elf_charged_bytes,
-                // J2-9 FIX: inherit the page-table-frame kmem charge. The child
-                // builds its OWN page tables (so the value, like elf, is a copy of
-                // the parent's) and its last-exit uncharges this; the matching
-                // charge to the parent cgroup is folded into fork_charge_bytes.
-                pt_charged_bytes: parent_mm.pt_charged_bytes,
-                // R171-CG1x0 FIX (M2-1 SLICE-0): the child's whole inherited PT
-                // basis lives in `pt_inherited_bytes` with an EMPTY frame ledger —
-                // the child's page tables are freshly built at DIFFERENT physical
-                // addresses, so cloning the parent's frame keys would risk a
-                // cross-AS uncharge. Non-authoritative until the child's first own
-                // mmap. INVARIANT I' holds at birth: pt_charged_bytes(=P) ==
-                // pt_inherited_bytes(=P) + 0. The child's munmap of an inherited
-                // region therefore uncharges 0 (the basis rides to last-exit,
-                // over-count-safe), preserving today's +P(parent)/-P(child exit)
-                // fork balance with zero new fork PT-recording surface.
-                //
-                // R186-4 FIX: Migrated to AdmittedMap; child starts with empty ledger
-                // (AdmittedMap::new charges nothing for zero capacity).
-                pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
-                shared_fault_pt_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
-                pt_inherited_bytes: parent_mm.pt_charged_bytes,
-                pt_ledger_authoritative: false,
-                // Transient pending counters reset for child — no in-flight
-                // operations can be inherited across fork.
-                brk_pending_growth: 0,
-                mprotect_pending_bytes: 0,
-                exec_pending_bytes: 0,
-                // R165-1 FIX: child starts with no brk reservation (fork is
-                // rejected above while a brk is in flight).
-                brk_in_progress: false,
-                // R172-16: child inherits no brk-grow VA reservation — fork EAGAINs while
-                // brk_in_progress, so this path is never reached mid-grow; zero defensively.
-                brk_grow_resv_lo: 0,
-                brk_grow_resv_hi: 0,
-                // M0-7 item7 SLICE 4: the child inherits no in-flight stack grow nor its
-                // reservation — fork EAGAINs while stack_grow_in_progress, so this path is
-                // never reached mid-grow; zero defensively. The COMMITTED watermark IS
-                // copied: the grown stack region is COW-inherited (this is an independent
-                // address space built by copying the parent's page tables), so the child's
-                // committed floor matches the parent's, and the inherited grow DATA already
-                // rides in elf_charged_bytes (copied above + charged to the parent cgroup
-                // via fork_charge_bytes), so the child's last-exit uncharges it symmetrically.
-                stack_grow_pending_bytes: 0,
-                stack_floor_committed: parent_mm.stack_floor_committed,
-                stack_grow_in_progress: false,
-                fork_in_progress: false,
-            };
-            child_mm
-                .reserve_shared_fault_pt(None)
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            child.mm = Arc::try_new(Mutex::new(child_mm))
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            charge_bytes
+            brk_start: parent_mm.brk_start,
+            brk: parent_mm.brk,
+            next_mmap_addr: parent_mm.next_mmap_addr,
+            vm_charged_bytes: parent_mm.vm_charged_bytes,
+            elf_charged_bytes: parent_mm.elf_charged_bytes,
+            // J2-9 FIX: inherit the page-table-frame kmem charge. The child
+            // builds its OWN page tables (so the value, like elf, is a copy of
+            // the parent's) and its last-exit uncharges this; the matching
+            // charge to the parent cgroup is folded into fork_charge_bytes.
+            pt_charged_bytes: parent_mm.pt_charged_bytes,
+            // R171-CG1x0 FIX (M2-1 SLICE-0): the child's whole inherited PT
+            // basis lives in `pt_inherited_bytes` with an EMPTY frame ledger —
+            // the child's page tables are freshly built at DIFFERENT physical
+            // addresses, so cloning the parent's frame keys would risk a
+            // cross-AS uncharge. Non-authoritative until the child's first own
+            // mmap. INVARIANT I' holds at birth: pt_charged_bytes(=P) ==
+            // pt_inherited_bytes(=P) + 0. The child's munmap of an inherited
+            // region therefore uncharges 0 (the basis rides to last-exit,
+            // over-count-safe), preserving today's +P(parent)/-P(child exit)
+            // fork balance with zero new fork PT-recording surface.
+            //
+            // R186-4 FIX: Migrated to AdmittedMap; child starts with empty ledger
+            // (AdmittedMap::new charges nothing for zero capacity).
+            pt_charged_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            shared_fault_pt_frames: mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
+            pt_inherited_bytes: parent_mm.pt_charged_bytes,
+            pt_ledger_authoritative: false,
+            // Transient pending counters reset for child — no in-flight
+            // operations can be inherited across fork.
+            brk_pending_growth: 0,
+            mprotect_pending_bytes: 0,
+            exec_pending_bytes: 0,
+            // R165-1 FIX: child starts with no brk reservation (fork is
+            // rejected above while a brk is in flight).
+            brk_in_progress: false,
+            // R172-16: child inherits no brk-grow VA reservation — fork EAGAINs while
+            // brk_in_progress, so this path is never reached mid-grow; zero defensively.
+            brk_grow_resv_lo: 0,
+            brk_grow_resv_hi: 0,
+            // M0-7 item7 SLICE 4: the child inherits no in-flight stack grow nor its
+            // reservation — fork EAGAINs while stack_grow_in_progress, so this path is
+            // never reached mid-grow; zero defensively. The COMMITTED watermark IS
+            // copied: the grown stack region is COW-inherited (this is an independent
+            // address space built by copying the parent's page tables), so the child's
+            // committed floor matches the parent's, and the inherited grow DATA already
+            // rides in elf_charged_bytes (copied above + charged to the parent cgroup
+            // via fork_charge_bytes), so the child's last-exit uncharges it symmetrically.
+            stack_grow_pending_bytes: 0,
+            stack_floor_committed: parent_mm.stack_floor_committed,
+            stack_grow_in_progress: false,
+            fork_in_progress: false,
         };
-
-        // 复制 TLS 状态（FS/GS base）
-        child.fs_base = parent.fs_base;
-        child.gs_base = parent.gs_base;
-
-        // F.2: 继承 Cgroup 成员关系
-        // 子进程继承父进程的 cgroup，并注册到 cgroup 的任务列表
-        child.set_cgroup_id(parent.cgroup_id);
-        // Note: cgroup task tracking is done after process is fully created
-
-        // R93-1 FIX: 继承 IPC/Network/User 命名空间（以及 for_children 默认值）
-        // 防止 fork() 产生的子进程意外回落到 root namespace 造成隔离逃逸
-        // 注：PID namespace 和 Mount namespace 已在 create_process() 中继承
-        child.ipc_ns = parent.ipc_ns.clone();
-        child.ipc_ns_for_children = parent.ipc_ns_for_children.clone();
-        child.net_ns = parent.net_ns.clone();
-        child.net_ns_for_children = parent.net_ns_for_children.clone();
-        child.user_ns = parent.user_ns.clone();
-        child.user_ns_for_children = parent.user_ns_for_children.clone();
-
-        // 继承 Seccomp/Pledge 沙箱状态
-        // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝
-        // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
-        // - pledge_state: 包含 promises 和 exec_promises（exec 后生效）
-        // R162-6 FIX: Use fallible try_clone to avoid OOM panic (R161-3 regression)
-        child.seccomp_state = parent
-            .seccomp_state
-            .try_clone()
+        child_mm
+            .reserve_shared_fault_pt(None)
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        child.pledge_state = parent.pledge_state.clone();
+        child.mm =
+            Arc::try_new(Mutex::new(child_mm)).map_err(|_| ForkError::MemoryAllocationFailed)?;
+        charge_bytes
+    };
 
-        // Finish every infallible PCB field before scheduler admission. The
-        // reserved queue entry is non-runnable until its permit is committed.
-        child.clear_child_tid = 0;
-        child.set_child_tid = 0;
-        child.robust_list_head = 0;
-        child.robust_list_len = 0;
-        child.socket_timeout_marker.store(0, Ordering::Relaxed);
-        child.wq_timeout_marker.store(0, Ordering::Relaxed);
-        child.active_wait_seq.store(0, Ordering::Relaxed);
-        child.context.rax = 0;
+    // 复制 TLS 状态（FS/GS base）
+    child.fs_base = parent.fs_base;
+    child.gs_base = parent.gs_base;
 
-        // R180-19 PREPARE: reserve the exact resources represented by the
-        // already-built child state.  The RAII guard rolls both controllers back
-        // on root-frame, KPTI, or COW-plan failure; after this point there is no
-        // unguarded charge and no mismatch between the cloned MmState and its
-        // memory.max amount.
-        let child_fd_count = child.files.lock().fd_table.len() as u64;
-        let mut charge_guard = ForkChargeGuard::new(parent.cgroup_id);
-        if child_fd_count != 0 {
-            crate::cgroup::try_charge_fds(parent.cgroup_id, child_fd_count)
-                .map_err(|_| ForkError::CgroupFilesLimitExceeded)?;
-            charge_guard.fd_count = child_fd_count;
-        }
-        if fork_charge_bytes != 0 {
-            crate::cgroup::try_charge_memory(parent.cgroup_id, fork_charge_bytes)
-                .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            charge_guard.memory_bytes = fork_charge_bytes;
-        }
+    // F.2: 继承 Cgroup 成员关系
+    // 子进程继承父进程的 cgroup，并注册到 cgroup 的任务列表
+    child.set_cgroup_id(parent.cgroup_id);
+    // Note: cgroup task tracking is done after process is fully created
 
-        let child_cpuset_id = child.cpuset_id;
-        drop(child);
-        #[cfg(debug_assertions)]
-        kprintln!("[FORKDIAG] FD3 charged");
+    // R93-1 FIX: 继承 IPC/Network/User 命名空间（以及 for_children 默认值）
+    // 防止 fork() 产生的子进程意外回落到 root namespace 造成隔离逃逸
+    // 注：PID namespace 和 Mount namespace 已在 create_process() 中继承
+    child.ipc_ns = parent.ipc_ns.clone();
+    child.ipc_ns_for_children = parent.ipc_ns_for_children.clone();
+    child.net_ns = parent.net_ns.clone();
+    child.net_ns_for_children = parent.net_ns_for_children.clone();
+    child.user_ns = parent.user_ns.clone();
+    child.user_ns_for_children = parent.user_ns_for_children.clone();
 
-        // R180-19 FIX: the parent-PTE COW transition is the COMMIT point.
-        // Every heap allocation, namespace/capability/credential clone, cgroup
-        // charge, and child metadata build above has already succeeded.  The
-        // page-table transaction also prepares KPTI before touching the parent,
-        // so nothing below this call can return an error after parent PTEs have
-        // become read-only.
-        let mut frame_alloc = FrameAllocator::new();
-        let child_root_frame = frame_alloc
-            .allocate_frame()
-            .ok_or(ForkError::MemoryAllocationFailed)?;
-        unsafe {
-            zero_table(child_root_frame);
-        }
-        let child_memory_space = child_root_frame.start_address().as_u64() as usize;
-        let child_user_memory_space = unsafe {
-            match copy_page_table_cow_with_shared(
-                parent_root,
-                child_memory_space,
-                shared_ranges.as_slice(),
-            ) {
-                Ok(user_memory_space) => user_memory_space,
-                Err(error) => {
-                    // copy_page_table_cow guarantees the root's user half is
-                    // empty on failure, so the generic teardown releases only
-                    // the private root and never touches parent-owned leaves.
-                    free_address_space(child_memory_space);
-                    return Err(error);
-                }
-            }
-        };
-        let mut child = child_process.lock();
-        child.memory_space = child_memory_space;
-        child.user_memory_space = child_user_memory_space;
+    // 继承 Seccomp/Pledge 沙箱状态
+    // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝
+    // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
+    // - pledge_state: 包含 promises 和 exec_promises（exec 后生效）
+    // R162-6 FIX: Use fallible try_clone to avoid OOM panic (R161-3 regression)
+    child.seccomp_state = parent
+        .seccomp_state
+        .try_clone()
+        .map_err(|_| ForkError::MemoryAllocationFailed)?;
+    child.pledge_state = parent.pledge_state.clone();
 
-        // The admission charge becomes owned by the child at the same commit.
-        // No error path exists below this assignment; normal exit now performs
-        // the exact matching uncharge.
-        child.files.lock().fds_charged_count = child_fd_count;
-        charge_guard.commit();
+    // Finish every infallible PCB field before scheduler admission. The
+    // reserved queue entry is non-runnable until its permit is committed.
+    child.clear_child_tid = 0;
+    child.set_child_tid = 0;
+    child.robust_list_head = 0;
+    child.robust_list_len = 0;
+    child.socket_timeout_marker.store(0, Ordering::Relaxed);
+    child.wq_timeout_marker.store(0, Ordering::Relaxed);
+    child.active_wait_seq.store(0, Ordering::Relaxed);
+    child.context.rax = 0;
 
-        // R163-4 FIX: All fallible operations above have succeeded. Safe to
-        // commit the cpuset counter increment now — no error path can leak it.
-        let committed_child_pid = child.pid;
-        drop(child);
-        crate::process::notify_cpuset_task_joined(child_cpuset_id);
-        kprintln!(
-            "Fork: parent={}, child={}, COW enabled",
-            parent.pid,
-            committed_child_pid
-        );
-        Ok(())
-    } else {
-        Err(ForkError::ProcessNotFound)
+    // R180-19 PREPARE: reserve the exact resources represented by the
+    // already-built child state.  The RAII guard rolls both controllers back
+    // on root-frame, KPTI, or COW-plan failure; after this point there is no
+    // unguarded charge and no mismatch between the cloned MmState and its
+    // memory.max amount.
+    let child_fd_count = child.files.lock().fd_table.len() as u64;
+    let mut charge_guard = ForkChargeGuard::new(parent.cgroup_id);
+    if child_fd_count != 0 {
+        crate::cgroup::try_charge_fds(parent.cgroup_id, child_fd_count)
+            .map_err(|_| ForkError::CgroupFilesLimitExceeded)?;
+        charge_guard.fd_count = child_fd_count;
     }
+    if fork_charge_bytes != 0 {
+        crate::cgroup::try_charge_memory(parent.cgroup_id, fork_charge_bytes)
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        charge_guard.memory_bytes = fork_charge_bytes;
+    }
+
+    let child_cpuset_id = child.cpuset_id;
+    drop(child);
+    #[cfg(debug_assertions)]
+    kprintln!("[FORKDIAG] FD3 charged");
+
+    // R180-19 FIX: the parent-PTE COW transition is the COMMIT point.
+    // Every heap allocation, namespace/capability/credential clone, cgroup
+    // charge, and child metadata build above has already succeeded.  The
+    // page-table transaction also prepares KPTI before touching the parent,
+    // so nothing below this call can return an error after parent PTEs have
+    // become read-only.
+    let mut frame_alloc = FrameAllocator::new();
+    let child_root_frame = frame_alloc
+        .allocate_frame()
+        .ok_or(ForkError::MemoryAllocationFailed)?;
+    unsafe {
+        zero_table(child_root_frame);
+    }
+    let child_memory_space = child_root_frame.start_address().as_u64() as usize;
+    let child_user_memory_space = unsafe {
+        match copy_page_table_cow_with_shared(
+            parent_root,
+            child_memory_space,
+            shared_ranges.as_slice(),
+        ) {
+            Ok(user_memory_space) => user_memory_space,
+            Err(error) => {
+                // copy_page_table_cow guarantees the root's user half is
+                // empty on failure, so the generic teardown releases only
+                // the private root and never touches parent-owned leaves.
+                free_address_space(child_memory_space);
+                return Err(error);
+            }
+        }
+    };
+    let mut child = child_process.lock();
+    child.memory_space = child_memory_space;
+    child.user_memory_space = child_user_memory_space;
+
+    // The admission charge becomes owned by the child at the same commit.
+    // No error path exists below this assignment; normal exit now performs
+    // the exact matching uncharge.
+    child.files.lock().fds_charged_count = child_fd_count;
+    charge_guard.commit();
+
+    // R163-4 FIX: All fallible operations above have succeeded. Safe to
+    // commit the cpuset counter increment now — no error path can leak it.
+    let committed_child_pid = child.pid;
+    drop(child);
+    crate::process::notify_cpuset_task_joined(child_cpuset_id);
+    kprintln!(
+        "Fork: parent={}, child={}, COW enabled",
+        parent.pid,
+        committed_child_pid
+    );
+    Ok(())
 }
 
 /// 清理失败的 fork 创建的部分子进程

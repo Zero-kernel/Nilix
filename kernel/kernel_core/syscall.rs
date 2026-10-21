@@ -19376,6 +19376,12 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
         if !cpu_still_allowed {
             current_cpu().set_need_resched();
         }
+    } else if target_pid != caller_pid && old_mask != new_mask {
+        // GAP-6: another task may be running, or queued, on a CPU it may no
+        // longer use. Kick every CPU so that CPU re-selects now (its pick skips
+        // the disallowed task) and an allowed CPU steals it, rather than both
+        // waiting for the next tick. Only a privileged caller reaches here.
+        let _ = crate::signal::kernel_kick_reschedule();
     }
 
     // Log if mask changed (for debugging)
