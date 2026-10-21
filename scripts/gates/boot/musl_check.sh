@@ -54,8 +54,8 @@ case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # it (it only fails-fast earlier on KERNEL PANIC).
 TO="${MUSL_CHECK_TIMEOUT:-900}"
 CPUS="${MUSL_CHECK_CPUS:-1}"
-if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ || ! "$CPUS" =~ ^(1|2|4|8)$ ]]; then
-    echo "MUSL-CHECK BLOCKED: invalid timeout or CPU count (timeout 1-900s; CPUs 1/2/4/8)"
+if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ || ! "$CPUS" =~ ^(1|2|4|8|16)$ ]]; then
+    echo "MUSL-CHECK BLOCKED: invalid timeout or CPU count (timeout 1-900s; CPUs 1/2/4/8/16)"
     exit 2
 fi
 
@@ -181,7 +181,7 @@ if [ "$qemu_status" -ne 124 ] || [ "$term_events" -ne 1 ] || [ "$kill_events" -n
     echo "MUSL-CHECK FAIL: QEMU timeout contract status=$qemu_status TERM=$term_events KILL=$kill_events"
     rc=1
 fi
-for marker in MUSL-STANDARD-FD-OK MUSL-OPEN-TRUNC-OK MUSL-ROBUST-USERCOPY-OK MUSL-WAIT-NAMESPACE-OK MUSL-BLOCKED-SIGNAL-OK MUSL-FCNTL-LIMIT-OK; do
+for marker in MUSL-STANDARD-FD-OK MUSL-OPEN-TRUNC-OK MUSL-ROBUST-USERCOPY-OK MUSL-WAIT-NAMESPACE-OK MUSL-BLOCKED-SIGNAL-OK MUSL-FCNTL-LIMIT-OK MUSL-PTHREAD-SIGNAL-OK; do
     if ! grep -Fxq "$marker" "$ser"; then
         echo "MUSL-CHECK FAIL: guest regression marker missing ($marker)"
         rc=1

@@ -217,13 +217,37 @@ pub extern "C" fn _start() -> ! {
     // GAP-5 slice 4 G7: thread-directed signals (syscalls 200 and 234).
     test_tkill_tgkill(&mut results);
 
-    // GAP-5 slice 4 step 7 preview: thread groups (kernel built with
-    // thread_preview via the syscall_test feature).
+    // GAP-5 G8: a timer-interrupt kill beside a user-mode spinner.
+    test_kill_beside_user_spinner(&mut results);
+
+    // GAP-5 slice 4: thread groups.
     test_thread_group(&mut results);
+
+    // GAP-5 G8: a group's last thread exits beside a user-mode spinner.
+    test_group_exit_beside_user_spinner(&mut results);
+
+    // GAP-5 slice 4, exec steps 1 and 2: exec from the leader or from any other
+    // member ends the other members and runs under the group's PID.
+    test_thread_group_exec(&mut results);
+
+    // GAP-5 G8: group-wide wait, children of an exiting thread, getppid of a
+    // thread's child, get_robust_list.
+    test_thread_group_children(&mut results);
+
+    // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
+    test_proc_thread_listing(&mut results);
 
     // GAP-5 slice 4: FUTEX_REQUEUE/CMP_REQUEUE and the bitset ops that
     // condition variables use.
     test_futex_requeue(&mut results);
+
+    // GAP-5 futex parity: FUTEX_WAKE_OP, a requeue that moves a sleeper,
+    // partial bitsets and futex keys shared with a CLONE_VM child.
+    test_futex_parity(&mut results);
+
+    // GAP-5 PI parity: PI futexes under the Linux user-word protocol, owner
+    // death and requeue-PI.
+    test_futex_pi(&mut results);
 
     // GAP-6: the scheduler/RCU counters pressure runs retain.
     test_proc_schedstat(&mut results);
@@ -2002,6 +2026,64 @@ extern "C" fn clear_tid_blocking_child() -> ! {
     }
 }
 
+/// A page of its own for the COW clear-tid leg, so nothing else written by
+/// this process breaks the copy-on-write sharing before the clear does.
+#[repr(C, align(4096))]
+struct CowTidPage([core::sync::atomic::AtomicI32; 1024]);
+static COW_TID_PAGE: CowTidPage =
+    CowTidPage([const { core::sync::atomic::AtomicI32::new(0) }; 1024]);
+
+/// Child entry: spin in user mode without syscalls until killed.
+extern "C" fn clear_tid_spinning_child() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The D4/D5 leg: SIGKILL a CLONE_VM child spinning in user mode whose
+/// CLONE_CHILD_CLEARTID word is on a copy-on-write page; after the reap the
+/// word must read 0. Reports its own failure.
+fn clear_tid_after_spinning_kill_leg(stack_top: usize) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let word = &COW_TID_PAGE.0[0];
+    // Own the page, then fork a keeper so the page is shared copy-on-write
+    // until the keeper exits. Nothing writes the page again before the clear.
+    word.store(-1, Ordering::SeqCst);
+    let keeper = unsafe { sys_fork() };
+    if keeper == 0 {
+        spin_forever();
+    }
+    if is_error(keeper) {
+        return Err("clear-tid: fork of the COW keeper failed");
+    }
+    let child = unsafe {
+        raw_clone_vm(
+            CLONE_VM | CLONE_CHILD_CLEARTID,
+            stack_top,
+            word.as_ptr(),
+            clear_tid_spinning_child,
+        )
+    };
+    let outcome = if is_error(child) || child == 0 {
+        Err("clear-tid: CLONE_VM|CHILD_CLEARTID spinning child failed")
+    } else {
+        for _ in 0..50 {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        if reap_pid(child) != Some(SIGKILL_EXIT) {
+            Err("clear-tid: could not reap the killed spinning child")
+        } else if word.load(Ordering::SeqCst) != 0 {
+            Err("clear-tid: the drain left a copy-on-write tid word set")
+        } else {
+            Ok(())
+        }
+    };
+    unsafe { userspace::syscall::sys_kill(keeper, SIGKILL_NR) };
+    let _ = reap_pid(keeper);
+    outcome
+}
+
 /// The D5 leg: SIGKILL a CLONE_VM child blocked in FUTEX_WAIT; after the reap
 /// its CLONE_CHILD_CLEARTID word must read 0. Reports its own failure.
 fn clear_tid_after_blocked_kill_leg(stack_top: usize) -> Result<(), &'static str> {
@@ -2106,9 +2188,16 @@ fn test_clone_vm_clear_child_tid(results: &mut TestResult) {
     }
     // Review D5: a kill, not a voluntary exit. The SIGKILL wakes the child
     // out of FUTEX_WAIT and it is torn down at its next safe point; that
-    // teardown must clear the word too. (The deferred IRQ-kill drain is
-    // reached only by kernel-originated kills such as OOM.)
+    // teardown must clear the word too.
     if let Err(reason) = clear_tid_after_blocked_kill_leg(stack_top) {
+        results.fail(reason);
+        return;
+    }
+    // Review D4/D5: a child spinning in user mode has no syscall safe point,
+    // so its SIGKILL is taken at interrupt return and the deferred IRQ-kill
+    // drain tears it down, possibly from the idle loop. Its tid word sits on
+    // a copy-on-write page, so the drain's clear needs COW resolution.
+    if let Err(reason) = clear_tid_after_spinning_kill_leg(stack_top) {
         results.fail(reason);
         return;
     }
@@ -2197,6 +2286,52 @@ fn test_tkill_tgkill(results: &mut TestResult) {
         }
     }
     results.pass("tkill and tgkill reach exactly the named task");
+}
+
+/// Child entry: spin in user mode without syscalls until killed.
+fn spin_in_user_mode() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// GAP-5 G8: a task killed at a timer interrupt is ended by a deferred drain
+/// that runs only in process context. On one CPU the victim's handoff must not
+/// go straight to a bystander that never enters the kernel, or the waiting
+/// parent is never woken.
+fn test_kill_beside_user_spinner(results: &mut TestResult) {
+    print("Testing SIGKILL beside a user-mode spinner... ");
+    let bystander = unsafe { sys_fork() };
+    if bystander == 0 {
+        spin_in_user_mode();
+    }
+    if is_error(bystander) {
+        results.fail("kill beside a spinner: fork of the bystander failed");
+        return;
+    }
+    let victim = unsafe { sys_fork() };
+    if victim == 0 {
+        spin_in_user_mode();
+    }
+    if is_error(victim) {
+        unsafe { userspace::syscall::sys_kill(bystander, SIGKILL_NR) };
+        reap_quietly(bystander);
+        results.fail("kill beside a spinner: fork of the victim failed");
+        return;
+    }
+    // Let both reach user mode, so the kill is taken at a timer interrupt.
+    for _ in 0..10 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { userspace::syscall::sys_kill(victim, SIGKILL_NR) };
+    let outcome = reap_pid(victim);
+    unsafe { userspace::syscall::sys_kill(bystander, SIGKILL_NR) };
+    reap_quietly(bystander);
+    if outcome != Some(SIGKILL_EXIT) {
+        results.fail("kill beside a spinner: the killed spinner was not reaped");
+        return;
+    }
+    results.pass("a spinner killed at a timer interrupt is reaped while another spinner runs");
 }
 
 // ---------------------------------------------------------------------------
@@ -2529,11 +2664,910 @@ fn test_thread_group(results: &mut TestResult) {
     results.pass("thread groups share identity and files, exit as one and are reaped once");
 }
 
+/// Exit status of the late-exit leg's leader, which the parent sees (Linux
+/// reports the leader's own status when its last thread exits after it).
+const GROUP_LATE_EXIT_CODE: u64 = 0x2a;
+/// Exit status of the late-exit leg's thread, which nobody sees.
+const GROUP_LATE_THREAD_CODE: u64 = 0x2b;
+
+/// Thread entry: outlive the leader's plain exit, then exit alone.
+extern "C" fn group_late_exit_thread() -> ! {
+    for _ in 0..20 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, GROUP_LATE_THREAD_CODE) }
+}
+
+/// Body of the late-exit leg's host process: start a thread, then leave with
+/// a plain exit so the thread is the group's last member.
+fn group_late_exit_leg() -> ! {
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            group_late_exit_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, 0x90) };
+    }
+    unsafe { raw_exit(SYS_EXIT, GROUP_LATE_EXIT_CODE) }
+}
+
+/// GAP-5 G8: an exited non-leader thread is reaped by a deferred drain that
+/// runs only in process context, and its group is reported to the parent only
+/// then. On one CPU the thread's last switch must not go straight to a
+/// bystander that never enters the kernel.
+fn test_group_exit_beside_user_spinner(results: &mut TestResult) {
+    print("Testing a thread group's last exit beside a user-mode spinner... ");
+    let bystander = unsafe { sys_fork() };
+    if bystander == 0 {
+        spin_in_user_mode();
+    }
+    if is_error(bystander) {
+        results.fail("group exit beside a spinner: fork of the bystander failed");
+        return;
+    }
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        group_late_exit_leg();
+    }
+    if is_error(host) {
+        unsafe { userspace::syscall::sys_kill(bystander, SIGKILL_NR) };
+        reap_quietly(bystander);
+        results.fail("group exit beside a spinner: fork of the host failed");
+        return;
+    }
+    let outcome = reap_pid(host);
+    unsafe { userspace::syscall::sys_kill(bystander, SIGKILL_NR) };
+    reap_quietly(bystander);
+    match outcome {
+        Some(GROUP_LATE_EXIT_CODE) => {}
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("group exit beside a spinner: wrong group status");
+            return;
+        }
+        None => {
+            results.fail("group exit beside a spinner: could not reap the host");
+            return;
+        }
+    }
+    results.pass(
+        "a group whose leader exited is reported when its last thread exits beside a spinner",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 G8: procfs thread listing. A forked host with one extra CLONE_THREAD
+// member checks that /proc lists the host but not the thread, that the thread
+// id still resolves, that /proc/<host>/task lists exactly the host and the
+// thread (leader first), and that the thread's task status names the host as
+// its Tgid with two threads. The host ends with exit_group, which also ends
+// the spinning thread.
+// ---------------------------------------------------------------------------
+
+const PROC_O_DIRECTORY: i32 = 0o200000;
+/// Status the procfs leg's host exits with when every check passed.
+const PROC_TASK_LEG_OK: u64 = 0x34;
+
+/// A short NUL-terminated byte string built without allocation. Text past
+/// the capacity is dropped, so an over-long path simply fails to open.
+struct SmallText {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl SmallText {
+    fn new() -> Self {
+        SmallText {
+            bytes: [0; 64],
+            len: 0,
+        }
+    }
+
+    fn push(mut self, text: &[u8]) -> Self {
+        for &byte in text {
+            // Keep the final byte as the NUL terminator.
+            if self.len + 1 < self.bytes.len() {
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            }
+        }
+        self
+    }
+
+    fn push_u64(self, mut value: u64) -> Self {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push(&digits[at..])
+    }
+
+    fn text(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn c_str(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+}
+
+/// An all-digit directory entry name.
+fn parse_decimal(text: &[u8]) -> Option<u64> {
+    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    parse_u64_prefix(text)
+}
+
+/// Call `visit` for every numeric entry of the directory at `path`. Returns
+/// false when the directory cannot be opened or a record is malformed.
+fn for_each_numeric_entry(path: &SmallText, mut visit: impl FnMut(u64)) -> bool {
+    use userspace::syscall::DIRENT64_NAME_OFFSET;
+    let fd = unsafe { sys_open(path.c_str(), PROC_O_DIRECTORY, 0) };
+    if is_error(fd) {
+        return false;
+    }
+    let mut buf = [0u8; 1024];
+    let mut ok = true;
+    'read: loop {
+        let read =
+            unsafe { userspace::syscall::sys_getdents64(fd as i32, buf.as_mut_ptr(), buf.len()) };
+        if is_error(read) {
+            ok = false;
+            break;
+        }
+        let read = read as usize;
+        if read == 0 {
+            break;
+        }
+        let mut at = 0usize;
+        while at < read {
+            // d_reclen is the u16 at offset 16 of the linux_dirent64 header.
+            if read - at <= DIRENT64_NAME_OFFSET {
+                ok = false;
+                break 'read;
+            }
+            let reclen = u16::from_ne_bytes([buf[at + 16], buf[at + 17]]) as usize;
+            if reclen <= DIRENT64_NAME_OFFSET || reclen > read - at {
+                ok = false;
+                break 'read;
+            }
+            let name = &buf[at + DIRENT64_NAME_OFFSET..at + reclen];
+            let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+            if let Some(id) = parse_decimal(name) {
+                visit(id);
+            }
+            at += reclen;
+        }
+    }
+    let _ = unsafe { sys_close(fd) };
+    ok
+}
+
+/// Read a small procfs file whole; None if it cannot be read or does not fit.
+fn read_small_file(path: &SmallText, buf: &mut [u8]) -> Option<usize> {
+    let fd = unsafe { sys_open(path.c_str(), 0, 0) };
+    if is_error(fd) {
+        return None;
+    }
+    let read = unsafe { sys_read(fd, buf.as_mut_ptr(), buf.len() as u64) };
+    let _ = unsafe { sys_close(fd) };
+    if is_error(read) || read as usize >= buf.len() {
+        return None;
+    }
+    Some(read as usize)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Body of the procfs leg's host process; returns its exit status.
+fn proc_task_leg() -> u64 {
+    let host = unsafe { sys_getpid() };
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            group_spin_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0x90;
+    }
+
+    // 1. /proc lists the group leader and hides the thread.
+    let (mut host_listed, mut thread_listed) = (false, false);
+    let root = SmallText::new().push(b"/proc");
+    if !for_each_numeric_entry(&root, |id| {
+        host_listed |= id == host;
+        thread_listed |= id == thread;
+    }) {
+        return 0x91;
+    }
+    if !host_listed {
+        return 0x92;
+    }
+    if thread_listed {
+        return 0x93;
+    }
+
+    // 2. The hidden thread id still resolves, as on Linux.
+    let mut text = [0u8; 512];
+    let hidden = SmallText::new()
+        .push(b"/proc/")
+        .push_u64(thread)
+        .push(b"/status");
+    if read_small_file(&hidden, &mut text).is_none() {
+        return 0x94;
+    }
+
+    // 3. /proc/<host>/task lists exactly the leader, then the thread.
+    let mut ids = [0u64; 4];
+    let mut count = 0usize;
+    let task_dir = SmallText::new()
+        .push(b"/proc/")
+        .push_u64(host)
+        .push(b"/task");
+    if !for_each_numeric_entry(&task_dir, |id| {
+        if count < ids.len() {
+            ids[count] = id;
+        }
+        count += 1;
+    }) {
+        return 0x95;
+    }
+    if count != 2 || ids[0] != host || ids[1] != thread {
+        return 0x96;
+    }
+
+    // 4. The thread's task status: Tgid is the host, two live threads.
+    let status = SmallText::new()
+        .push(b"/proc/")
+        .push_u64(host)
+        .push(b"/task/")
+        .push_u64(thread)
+        .push(b"/status");
+    let Some(len) = read_small_file(&status, &mut text) else {
+        return 0x97;
+    };
+    let text = &text[..len];
+    if !contains_bytes(
+        text,
+        SmallText::new()
+            .push(b"Tgid:\t")
+            .push_u64(host)
+            .push(b"\n")
+            .text(),
+    ) {
+        return 0x98;
+    }
+    if !contains_bytes(
+        text,
+        SmallText::new()
+            .push(b"Pid:\t")
+            .push_u64(thread)
+            .push(b"\n")
+            .text(),
+    ) {
+        return 0x99;
+    }
+    if !contains_bytes(text, b"Threads:\t2\n") {
+        return 0x9a;
+    }
+    PROC_TASK_LEG_OK
+}
+
+fn test_proc_thread_listing(results: &mut TestResult) {
+    print("Testing procfs thread listing... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("procfs threads: fork of the host failed");
+        return;
+    }
+    if host == 0 {
+        let code = proc_task_leg();
+        // exit_group also ends the spinning thread.
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(PROC_TASK_LEG_OK) => {}
+        Some(code) => {
+            print("procfs leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("procfs threads: thread listing leg failed");
+            return;
+        }
+        None => {
+            results.fail("procfs threads: could not reap the host");
+            return;
+        }
+    }
+    results.pass("procfs lists group leaders and /proc/<pid>/task members with Tgid and Threads");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 exec from a thread group (Linux de_thread). Step 1: exec from the
+// leader ends every other member first, then replaces the image. Step 2: exec
+// from any other member is handed to the leader, which runs it under the
+// group's PID wherever it is (blocked in FUTEX_WAIT, spinning in user mode,
+// asleep in nanosleep); the exec'ing thread and every other member end.
+// ---------------------------------------------------------------------------
+
+/// Exit status of the minimal image the group execs.
+const EXEC_IMAGE_EXIT: u64 = 0x5c;
+/// ELF header (64) + one program header (56) + 18 bytes of code.
+const EXEC_IMAGE_LEN: usize = 0x78 + 18;
+
+static EXEC_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EXEC_BLOCK_WORD: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+/// Step 2: set by the leader just before it parks.
+static EXEC_LEADER_PARKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// CLONE_CHILD_CLEARTID words of the two siblings: each is zeroed in the old
+/// address space while its thread is ended, before the leader's exec.
+static EXEC_TID_WORDS: [core::sync::atomic::AtomicI32; 2] = [
+    core::sync::atomic::AtomicI32::new(0),
+    core::sync::atomic::AtomicI32::new(0),
+];
+static mut EXEC_STACK: CloneStack = CloneStack([0; CLEAR_TID_STACK_BYTES]);
+
+/// A minimal static ELF64 executable: one R+X PT_LOAD of the whole file at
+/// 0x400000 whose entry runs `code`.
+#[repr(C, align(8))]
+struct ExecImage([u8; EXEC_IMAGE_LEN]);
+/// mov edi, EXEC_IMAGE_EXIT; mov eax, 60 (exit); syscall; ud2
+static EXEC_EXIT_IMAGE: ExecImage = ExecImage(exec_image([
+    0xbf,
+    EXEC_IMAGE_EXIT as u8,
+    0,
+    0,
+    0,
+    0xb8,
+    60,
+    0,
+    0,
+    0,
+    0x0f,
+    0x05,
+    0x0f,
+    0x0b,
+    0x0f,
+    0x0b,
+    0x0f,
+    0x0b,
+]));
+/// mov eax, 39 (getpid); syscall; mov edi, eax; mov eax, 60 (exit); syscall; ud2
+/// The parent compares the status with the host's pid: a handed-over exec
+/// must run under the group's PID.
+static EXEC_GETPID_IMAGE: ExecImage = ExecImage(exec_image([
+    0xb8, 39, 0, 0, 0, 0x0f, 0x05, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+]));
+
+const fn put_le(
+    mut image: [u8; EXEC_IMAGE_LEN],
+    offset: usize,
+    value: u64,
+    bytes: usize,
+) -> [u8; EXEC_IMAGE_LEN] {
+    let mut i = 0;
+    while i < bytes {
+        image[offset + i] = (value >> (8 * i)) as u8;
+        i += 1;
+    }
+    image
+}
+
+const fn exec_image(code: [u8; 18]) -> [u8; EXEC_IMAGE_LEN] {
+    const BASE: u64 = 0x40_0000;
+    const CODE: usize = 0x78;
+    let mut image = [0u8; EXEC_IMAGE_LEN];
+    // e_ident: magic, ELFCLASS64, little endian, EV_CURRENT.
+    image[0] = 0x7f;
+    image[1] = b'E';
+    image[2] = b'L';
+    image[3] = b'F';
+    image[4] = 2;
+    image[5] = 1;
+    image[6] = 1;
+    image = put_le(image, 0x10, 2, 2); // e_type: ET_EXEC
+    image = put_le(image, 0x12, 0x3e, 2); // e_machine: x86-64
+    image = put_le(image, 0x14, 1, 4); // e_version
+    image = put_le(image, 0x18, BASE + CODE as u64, 8); // e_entry
+    image = put_le(image, 0x20, 0x40, 8); // e_phoff
+    image = put_le(image, 0x34, 64, 2); // e_ehsize
+    image = put_le(image, 0x36, 56, 2); // e_phentsize
+    image = put_le(image, 0x38, 1, 2); // e_phnum
+    image = put_le(image, 0x3a, 64, 2); // e_shentsize
+    image = put_le(image, 0x40, 1, 4); // p_type: PT_LOAD
+    image = put_le(image, 0x44, 5, 4); // p_flags: R+X
+    image = put_le(image, 0x50, BASE, 8); // p_vaddr
+    image = put_le(image, 0x58, BASE, 8); // p_paddr
+    image = put_le(image, 0x60, EXEC_IMAGE_LEN as u64, 8); // p_filesz
+    image = put_le(image, 0x68, EXEC_IMAGE_LEN as u64, 8); // p_memsz
+    image = put_le(image, 0x70, 0x1000, 8); // p_align
+
+    let mut i = 0;
+    while i < code.len() {
+        image[CODE + i] = code[i];
+        i += 1;
+    }
+    image
+}
+
+unsafe fn spawn_image(image: &ExecImage) -> u64 {
+    syscall4(
+        userspace::syscall::SYS_SPAWN_IMAGE,
+        image.0.as_ptr() as u64,
+        EXEC_IMAGE_LEN as u64,
+        0,
+        0,
+    )
+}
+
+fn exec_stack_top() -> usize {
+    core::ptr::addr_of_mut!(EXEC_STACK) as usize + CLEAR_TID_STACK_BYTES
+}
+
+/// Thread entry: spin in user mode, without syscalls, so the exec ends this
+/// thread from an interrupt.
+extern "C" fn exec_sibling_spin_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    EXEC_READY.fetch_add(1, Ordering::SeqCst);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Thread entry: sleep in FUTEX_WAIT until the leader's exec ends this thread.
+extern "C" fn exec_sibling_block_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    EXEC_READY.fetch_add(1, Ordering::SeqCst);
+    loop {
+        unsafe { futex(&EXEC_BLOCK_WORD, FUTEX_WAIT_OP | FUTEX_PRIVATE, 0, 0, 0, 0) };
+    }
+}
+
+/// Step 2 thread entry: once the other sibling is up and the leader parked,
+/// exec the marker image. Returns from the exec only on failure.
+extern "C" fn exec_handoff_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    EXEC_READY.fetch_add(1, Ordering::SeqCst);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if EXEC_READY.load(Ordering::SeqCst) == 2 && EXEC_LEADER_PARKED.load(Ordering::SeqCst) == 1
+        {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    // Let the leader reach its wait.
+    for _ in 0..100 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    let ret = unsafe { spawn_image(&EXEC_GETPID_IMAGE) };
+    print("non-leader exec returned errno ");
+    print_int(errno(ret) as i64);
+    print(" ");
+    unsafe { raw_exit(SYS_EXIT_GROUP, 0x98) }
+}
+
+/// Where the leader is while a non-leader execs.
+#[derive(Clone, Copy)]
+enum LeaderPark {
+    FutexWait,
+    Spin,
+    Sleep,
+}
+
+/// Body of a step-2 host process. Returns only when setup fails; the handed
+/// exec ends the host with its own pid (low byte) as the status.
+fn group_handoff_leg(park: LeaderPark) -> u64 {
+    use core::sync::atomic::Ordering;
+    EXEC_READY.store(0, Ordering::SeqCst);
+    EXEC_BLOCK_WORD.0.store(0, Ordering::SeqCst);
+    EXEC_LEADER_PARKED.store(0, Ordering::SeqCst);
+    // The exec'ing thread has its own fd table and fs context, which the
+    // leader takes over; the other sibling shares the leader's.
+    let threads: [(u64, usize, extern "C" fn() -> !); 2] = [
+        (
+            THREAD_FLAGS | CLONE_FILES | CLONE_FS | CLONE_CHILD_CLEARTID,
+            exec_stack_top(),
+            exec_sibling_block_thread,
+        ),
+        (
+            THREAD_FLAGS | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            exec_handoff_thread,
+        ),
+    ];
+    for (index, (flags, stack_top, entry)) in threads.into_iter().enumerate() {
+        EXEC_TID_WORDS[index].store(-1, Ordering::SeqCst);
+        let thread = unsafe {
+            raw_clone(
+                flags,
+                stack_top,
+                core::ptr::null_mut(),
+                EXEC_TID_WORDS[index].as_ptr(),
+                entry,
+            )
+        };
+        if is_error(thread) || thread == 0 {
+            return 0x94;
+        }
+    }
+    let mut ready = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if EXEC_READY.load(Ordering::SeqCst) == 2 {
+            ready = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if !ready {
+        return 0x95;
+    }
+    EXEC_LEADER_PARKED.store(1, Ordering::SeqCst);
+    match park {
+        LeaderPark::FutexWait => loop {
+            unsafe { futex(&EXEC_BLOCK_WORD, FUTEX_WAIT_OP | FUTEX_PRIVATE, 0, 0, 0, 0) };
+        },
+        LeaderPark::Spin => loop {
+            core::hint::spin_loop();
+        },
+        LeaderPark::Sleep => loop {
+            let pause = [10i64, 0];
+            unsafe { syscall2(SYS_NANOSLEEP, pause.as_ptr() as u64, 0) };
+        },
+    }
+}
+
+/// Body of the step-1 host process. Returns only when a check fails; a
+/// successful exec ends the host with EXEC_IMAGE_EXIT.
+fn group_exec_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    EXEC_READY.store(0, Ordering::SeqCst);
+    EXEC_BLOCK_WORD.0.store(0, Ordering::SeqCst);
+    // The siblings also share the fd table, which exec must then own alone.
+    let flags = THREAD_FLAGS | CLONE_FILES | CLONE_FS | CLONE_CHILD_CLEARTID;
+    let threads: [(usize, extern "C" fn() -> !); 2] = [
+        (group_stack_top(), exec_sibling_spin_thread),
+        (exec_stack_top(), exec_sibling_block_thread),
+    ];
+    for (index, (stack_top, entry)) in threads.into_iter().enumerate() {
+        // Touch the word first so the exit-time clear is not a first write.
+        EXEC_TID_WORDS[index].store(-1, Ordering::SeqCst);
+        let thread = unsafe {
+            raw_clone(
+                flags,
+                stack_top,
+                core::ptr::null_mut(),
+                EXEC_TID_WORDS[index].as_ptr(),
+                entry,
+            )
+        };
+        if is_error(thread) || thread == 0 {
+            return 0x90;
+        }
+    }
+    let mut ready = false;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if EXEC_READY.load(Ordering::SeqCst) == 2 {
+            ready = true;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if !ready {
+        return 0x91;
+    }
+    // Let the futex thread reach its wait.
+    for _ in 0..100 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    let ret = unsafe { spawn_image(&EXEC_EXIT_IMAGE) };
+    print("leader exec returned errno ");
+    print_int(errno(ret) as i64);
+    print(" ");
+    0x93
+}
+
+fn test_thread_group_exec(results: &mut TestResult) {
+    print("Testing exec from a thread group... ");
+    let legs: [(Option<LeaderPark>, &str); 4] = [
+        (None, "the leader"),
+        (
+            Some(LeaderPark::FutexWait),
+            "a non-leader, leader in FUTEX_WAIT",
+        ),
+        (Some(LeaderPark::Spin), "a non-leader, leader spinning"),
+        (Some(LeaderPark::Sleep), "a non-leader, leader in nanosleep"),
+    ];
+    for (park, what) in legs {
+        let host = unsafe { sys_fork() };
+        if is_error(host) {
+            results.fail("thread group exec: fork of the host failed");
+            return;
+        }
+        if host == 0 {
+            let code = match park {
+                None => group_exec_leg(),
+                Some(park) => group_handoff_leg(park),
+            };
+            unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+        }
+        // The host's PID runs the new image whichever thread called exec.
+        let expected = if park.is_none() {
+            EXEC_IMAGE_EXIT
+        } else {
+            host & 0xff
+        };
+        match reap_pid(host) {
+            Some(code) if code == expected => {}
+            Some(code) => {
+                print("exec from ");
+                print(what);
+                print(": exit ");
+                print_int(code as i64);
+                print(" ");
+                results.fail("thread group exec: the group did not exec the new image");
+                return;
+            }
+            None => {
+                results.fail("thread group exec: could not reap the host");
+                return;
+            }
+        }
+        // The ended members were auto-reaped; nothing is left for this parent.
+        let mut left = SigInfo::poisoned();
+        if errno(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) != ECHILD {
+            print("exec from ");
+            print(what);
+            print(" ");
+            results.fail("thread group exec: the leg left a reapable task behind");
+            return;
+        }
+    }
+    results.pass(
+        "exec from a thread group ends the other members: from the leader, and from a non-leader while the leader waits, spins or sleeps",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 G8: a multi-threaded process's children belong to the process. Any
+// thread waits for the children of every thread; a thread that exits hands its
+// children to a surviving thread; a thread's child sees the process as its
+// parent; get_robust_list reads a sibling's registration.
+// ---------------------------------------------------------------------------
+
+const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_GET_ROBUST_LIST: u64 = 274;
+const SYS_NANOSLEEP: u64 = 35;
+const G8_CHILD_OK: u64 = 0x44;
+const G8_ORPHAN_OK: u64 = 0x46;
+
+static G8_HOST_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static G8_CHILD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static G8_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static G8_ROBUST_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// struct robust_list_head { list, futex_offset, list_op_pending }; an empty
+/// list points at itself, which the kernel never needs to walk here.
+#[repr(C, align(8))]
+struct RobustHead([u64; 3]);
+static mut G8_ROBUST_HEAD: RobustHead = RobustHead([0; 3]);
+
+fn g8_robust_head() -> u64 {
+    core::ptr::addr_of_mut!(G8_ROBUST_HEAD) as u64
+}
+
+/// In a thread's forked child: report whether getppid() names the process.
+fn g8_child_exit(ok: u64, bad: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let code = if unsafe { sys_getppid() } == G8_HOST_PID.load(Ordering::SeqCst) {
+        ok
+    } else {
+        bad
+    };
+    unsafe { raw_exit(SYS_EXIT_GROUP, code) }
+}
+
+/// Thread entry: read the leader's robust list, fork a child, and stay alive
+/// until the leader has reaped it (so the leader's wait runs while the group
+/// has two members).
+extern "C" fn g8_wait_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let mut head: u64 = 0;
+    let mut len: u64 = 0;
+    let r = unsafe {
+        syscall3(
+            SYS_GET_ROBUST_LIST,
+            G8_HOST_PID.load(Ordering::SeqCst),
+            &mut head as *mut u64 as u64,
+            &mut len as *mut u64 as u64,
+        )
+    };
+    let robust_ok = r == 0 && head == g8_robust_head() && len == 24;
+    G8_ROBUST_OK.store(robust_ok as u32, Ordering::SeqCst);
+    let child = unsafe { sys_fork() };
+    if child == 0 {
+        g8_child_exit(G8_CHILD_OK, G8_CHILD_OK + 1);
+    }
+    G8_CHILD.store(
+        if is_error(child) { u64::MAX } else { child },
+        Ordering::SeqCst,
+    );
+    while G8_DONE.load(Ordering::SeqCst) == 0 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Thread entry: fork a child that outlives this thread, then exit at once.
+extern "C" fn g8_orphan_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let child = unsafe { sys_fork() };
+    if child == 0 {
+        let pause = [0i64, 50_000_000]; // 50 ms: the thread is gone by then
+        unsafe { syscall2(SYS_NANOSLEEP, pause.as_ptr() as u64, 0) };
+        g8_child_exit(G8_ORPHAN_OK, G8_ORPHAN_OK + 1);
+    }
+    G8_CHILD.store(
+        if is_error(child) { u64::MAX } else { child },
+        Ordering::SeqCst,
+    );
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn g8_join_thread() -> bool {
+    use core::sync::atomic::Ordering;
+    for _ in 0..THREAD_POLL_YIELDS {
+        if GROUP_TID_WORD.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+/// Body of the G8 leg's host process; returns its exit status.
+fn group_children_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    G8_HOST_PID.store(unsafe { sys_getpid() }, Ordering::SeqCst);
+    if is_error(unsafe { syscall2(SYS_SET_ROBUST_LIST, g8_robust_head(), 24) }) {
+        return 0xa0;
+    }
+
+    // 1. The child of a live thread is reaped by the leader's wait4(-1).
+    G8_CHILD.store(0, Ordering::SeqCst);
+    G8_DONE.store(0, Ordering::SeqCst);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            g8_wait_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0xa1;
+    }
+    let mut child = 0;
+    for _ in 0..THREAD_POLL_YIELDS {
+        child = G8_CHILD.load(Ordering::SeqCst);
+        if child != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if child == 0 || child == u64::MAX {
+        G8_DONE.store(1, Ordering::SeqCst);
+        return 0xa2;
+    }
+    let mut info = SigInfo::poisoned();
+    let r = waitid(P_ALL, 0, &mut info, WEXITED);
+    G8_DONE.store(1, Ordering::SeqCst);
+    if is_error(r) || info.pid() as u64 != child {
+        return 0xa3;
+    }
+    if info.status() as u64 != G8_CHILD_OK {
+        return 0xa4; // the child saw its forking thread, not the process
+    }
+    if !g8_join_thread() {
+        return 0xa5;
+    }
+    if G8_ROBUST_OK.load(Ordering::SeqCst) != 1 {
+        return 0xa6;
+    }
+
+    // 2. A thread exits before its child: the child passes to the leader.
+    G8_CHILD.store(0, Ordering::SeqCst);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            g8_orphan_thread,
+        )
+    };
+    if is_error(thread) || thread == 0 {
+        return 0xa7;
+    }
+    if !g8_join_thread() {
+        return 0xa8;
+    }
+    let child = G8_CHILD.load(Ordering::SeqCst);
+    if child == 0 || child == u64::MAX {
+        return 0xa9;
+    }
+    let mut info = SigInfo::poisoned();
+    let r = waitid(P_ALL, 0, &mut info, WEXITED);
+    if is_error(r) || info.pid() as u64 != child {
+        return 0xaa; // ECHILD here: the child went to init, not to the leader
+    }
+    if info.status() as u64 != G8_ORPHAN_OK {
+        return 0xab;
+    }
+    let mut left = SigInfo::poisoned();
+    if errno(waitid(P_ALL, 0, &mut left, WEXITED | WNOHANG)) != ECHILD {
+        return 0xac;
+    }
+    GROUP_LEG_OK
+}
+
+fn test_thread_group_children(results: &mut TestResult) {
+    print("Testing thread group children... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("thread group children: fork of the host failed");
+        return;
+    }
+    if host == 0 {
+        let code = group_children_leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(GROUP_LEG_OK) => {}
+        Some(code) => {
+            print("children leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("thread group children: a G8 check failed");
+            return;
+        }
+        None => {
+            results.fail("thread group children: could not reap the host");
+            return;
+        }
+    }
+    results.pass("a thread group shares its children: any thread waits for them and a dying thread hands them on");
+}
+
 // ---------------------------------------------------------------------------
 // GAP-5 slice 4: the futex operations condition variables need. musl's
 // pthread_cond_broadcast clears the next waiter's barrier word and requeues
-// that waiter to the mutex with FUTEX_REQUEUE; the kernel wakes it instead
-// (see sys_futex). Runs in a forked host so a stuck waiter cannot take this
+// that waiter to the mutex with FUTEX_REQUEUE (moved, not woken, since GAP-5
+// futex parity). Runs in a forked host so a stuck waiter cannot take this
 // PID 1 down.
 // ---------------------------------------------------------------------------
 
@@ -2584,7 +3618,8 @@ unsafe fn futex(word: &FutexWord, op: u64, val: u64, timeout: u64, uaddr2: u64, 
     )
 }
 
-/// Thread entry: sleep on FUTEX_WORD until a requeue wakes it.
+/// Thread entry: sleep on FUTEX_WORD until a requeue moves it and the
+/// target is woken.
 extern "C" fn futex_waiter_thread() -> ! {
     use core::sync::atomic::Ordering;
     let ret = unsafe { futex(&FUTEX_WORD, FUTEX_WAIT_OP | FUTEX_PRIVATE, 0, 0, 0, 0) };
@@ -2636,8 +3671,8 @@ fn futex_requeue_leg() -> u64 {
         if errno(futex(&FUTEX_WORD, FUTEX_WAIT_BITSET_OP, 0, 0, 0, 0)) != EINVAL {
             return 0x94; // empty bitset
         }
-        if errno(futex(&FUTEX_WORD, FUTEX_WAIT_BITSET_OP, 0, 0, 0, 1)) != ENOSYS {
-            return 0x95; // partial bitsets are refused, not widened
+        if errno(futex(&FUTEX_WORD, FUTEX_WAIT_BITSET_OP, 1, 0, 0, 1)) != EAGAIN {
+            return 0x95; // a partial bitset is served; the value check comes first
         }
         let realtime = FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME;
         if errno(futex(&FUTEX_WORD, realtime, 0, past, 0, FUTEX_BITSET_ANY)) != ETIMEDOUT {
@@ -2725,8 +3760,8 @@ fn futex_requeue_leg() -> u64 {
     if moved != 1 {
         return 0x9b; // the sleeping waiter was not counted exactly once
     }
-    // On Linux the waiter now sleeps on the target; here it is already awake.
-    // Waking the target keeps the leg valid for both.
+    // The waiter now sleeps on the target, as on Linux; waking the target
+    // releases it.
     if is_error(unsafe { futex(&FUTEX_TARGET, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) }) {
         return 0x9c;
     }
@@ -2772,7 +3807,1471 @@ fn test_futex_requeue(results: &mut TestResult) {
             return;
         }
     }
-    results.pass("futex requeue wakes a sleeping sibling and bitset ops keep the Linux contract");
+    results.pass("futex requeue moves a sleeping sibling and bitset ops keep the Linux contract");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 futex parity: FUTEX_WAKE_OP, a requeue that moves a sleeper without
+// waking it, partial-bitset wakes, and futex keys shared by a CLONE_VM child
+// that is not a thread, each with real sleepers. Every check also holds on
+// Linux. Runs in a forked host so a stuck sleeper cannot take PID 1 down.
+// ---------------------------------------------------------------------------
+
+/// Linux FUTEX_WAKE_OP (5). (`FUTEX_WAKE_OP` above names the FUTEX_WAKE op, 1.)
+const FUTEX_WAKE_OP_CMD: u64 = 5;
+const FUTEX_OP_SET: u32 = 0;
+const FUTEX_OP_ADD: u32 = 1;
+const FUTEX_OP_OR: u32 = 2;
+const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+const FUTEX_OP_CMP_EQ: u32 = 0;
+const FUTEX_OP_CMP_GT: u32 = 4;
+/// "Every waiter" for wake and requeue counts (INT_MAX).
+const FUTEX_ALL: u64 = i32::MAX as u64;
+/// Host exit status when every parity check passed.
+const FUTEX_PARITY_OK: u64 = 0x35;
+
+/// Linux `FUTEX_OP(op, oparg, cmp, cmparg)`.
+const fn futex_op_word(op: u32, oparg: u32, cmp: u32, cmparg: u32) -> u64 {
+    (((op & 0xf) << 28) | ((cmp & 0xf) << 24) | ((oparg & 0xfff) << 12) | (cmparg & 0xfff)) as u64
+}
+
+static PARITY_WORD_A: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PARITY_WORD_B: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PARITY_WORD_C: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PARITY_WORD_D: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PARITY_WORD_E: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PARITY_WORD_F: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+
+/// What one sleeper waits on and what its wait returned.
+struct ParitySleeper {
+    word: core::sync::atomic::AtomicU64,
+    value: core::sync::atomic::AtomicU64,
+    /// 0: plain FUTEX_WAIT; otherwise the FUTEX_WAIT_BITSET mask.
+    bitset: core::sync::atomic::AtomicU64,
+    result: core::sync::atomic::AtomicU64,
+    /// CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID word: 0 once it exited.
+    tid: core::sync::atomic::AtomicI32,
+}
+
+impl ParitySleeper {
+    const fn new() -> Self {
+        use core::sync::atomic::{AtomicI32, AtomicU64};
+        Self {
+            word: AtomicU64::new(0),
+            value: AtomicU64::new(0),
+            bitset: AtomicU64::new(0),
+            result: AtomicU64::new(FUTEX_WAIT_PENDING),
+            tid: AtomicI32::new(0),
+        }
+    }
+}
+
+static PARITY_SLEEPERS: [ParitySleeper; 2] = [ParitySleeper::new(), ParitySleeper::new()];
+static mut PARITY_STACKS: [CloneStack; 2] = [
+    CloneStack([0; CLEAR_TID_STACK_BYTES]),
+    CloneStack([0; CLEAR_TID_STACK_BYTES]),
+];
+
+fn parity_sleep(slot: &ParitySleeper) -> ! {
+    use core::sync::atomic::Ordering;
+    let word = slot.word.load(Ordering::SeqCst);
+    let value = slot.value.load(Ordering::SeqCst);
+    let bitset = slot.bitset.load(Ordering::SeqCst);
+    let ret = unsafe {
+        if bitset == 0 {
+            syscall6(
+                SYS_FUTEX,
+                word,
+                FUTEX_WAIT_OP | FUTEX_PRIVATE,
+                value,
+                0,
+                0,
+                0,
+            )
+        } else {
+            syscall6(
+                SYS_FUTEX,
+                word,
+                FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE,
+                value,
+                0,
+                0,
+                bitset,
+            )
+        }
+    };
+    slot.result.store(ret, Ordering::SeqCst);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+extern "C" fn parity_sleeper_0() -> ! {
+    parity_sleep(&PARITY_SLEEPERS[0])
+}
+
+extern "C" fn parity_sleeper_1() -> ! {
+    parity_sleep(&PARITY_SLEEPERS[1])
+}
+
+/// Start sleeper `index` on `word` (expected `value`, mask `bitset`, 0 for a
+/// plain wait) as a task of the given clone `flags`. Returns its tid.
+fn parity_spawn(
+    index: usize,
+    word: &FutexWord,
+    value: u32,
+    bitset: u32,
+    flags: u64,
+) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let slot = &PARITY_SLEEPERS[index];
+    slot.word.store(word.0.as_ptr() as u64, Ordering::SeqCst);
+    slot.value.store(value as u64, Ordering::SeqCst);
+    slot.bitset.store(bitset as u64, Ordering::SeqCst);
+    slot.result.store(FUTEX_WAIT_PENDING, Ordering::SeqCst);
+    slot.tid.store(-1, Ordering::SeqCst);
+    let entry: extern "C" fn() -> ! = if index == 0 {
+        parity_sleeper_0
+    } else {
+        parity_sleeper_1
+    };
+    let stack_top =
+        unsafe { core::ptr::addr_of_mut!(PARITY_STACKS[index]) as usize + CLEAR_TID_STACK_BYTES };
+    let tid = unsafe {
+        raw_clone(
+            flags | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            stack_top,
+            core::ptr::null_mut(),
+            slot.tid.as_ptr(),
+            entry,
+        )
+    };
+    (!is_error(tid) && tid != 0).then_some(tid)
+}
+
+/// Tasks sleeping on `word`: a CMP_REQUEUE of the word onto itself counts
+/// them and moves or wakes none (on Linux as here).
+fn parity_sleepers(word: &FutexWord) -> u64 {
+    use core::sync::atomic::Ordering;
+    let value = word.0.load(Ordering::SeqCst) as u64;
+    let target = word.0.as_ptr() as u64;
+    let r = unsafe {
+        futex(
+            word,
+            FUTEX_CMP_REQUEUE_OP | FUTEX_PRIVATE,
+            0,
+            FUTEX_ALL,
+            target,
+            value,
+        )
+    };
+    if is_error(r) {
+        u64::MAX
+    } else {
+        r
+    }
+}
+
+fn parity_await_sleepers(word: &FutexWord, count: u64) -> bool {
+    for _ in 0..THREAD_POLL_YIELDS {
+        if parity_sleepers(word) == count {
+            return true;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+/// Give a sleeper that should stay asleep plenty of chances to run.
+fn parity_settle() {
+    for _ in 0..100 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+}
+
+fn parity_pending(index: usize) -> bool {
+    PARITY_SLEEPERS[index]
+        .result
+        .load(core::sync::atomic::Ordering::SeqCst)
+        == FUTEX_WAIT_PENDING
+}
+
+/// Wait for thread `index` to exit (its clear-tid word drops to 0) and
+/// require that its wait returned 0.
+fn parity_join_woken(index: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let slot = &PARITY_SLEEPERS[index];
+    for _ in 0..THREAD_POLL_YIELDS {
+        if slot.tid.load(Ordering::SeqCst) == 0 {
+            return slot.result.load(Ordering::SeqCst) == 0;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+unsafe fn wake_op(nr_wake: u64, nr_wake2: u64, uaddr2: u64, op: u64) -> u64 {
+    futex(
+        &PARITY_WORD_A,
+        FUTEX_WAKE_OP_CMD | FUTEX_PRIVATE,
+        nr_wake,
+        nr_wake2,
+        uaddr2,
+        op,
+    )
+}
+
+/// Body of the parity leg's host process; returns its exit status.
+fn futex_parity_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    // Touch every word: the kernel refuses a futex word on a page that is
+    // not present yet (EFAULT), and these may be first-use .bss pages.
+    for word in [
+        &PARITY_WORD_A,
+        &PARITY_WORD_B,
+        &PARITY_WORD_C,
+        &PARITY_WORD_D,
+        &PARITY_WORD_E,
+        &PARITY_WORD_F,
+    ] {
+        word.0.store(0, Ordering::SeqCst);
+    }
+    let word_b = PARITY_WORD_B.0.as_ptr() as u64;
+
+    // FUTEX_WAKE_OP argument contract, nobody waiting.
+    PARITY_WORD_B.0.store(5, Ordering::SeqCst);
+    unsafe {
+        let add3_if_5 = futex_op_word(FUTEX_OP_ADD, 3, FUTEX_OP_CMP_EQ, 5);
+        if wake_op(1, 1, word_b, add3_if_5) != 0 {
+            return 0xb0;
+        }
+        if PARITY_WORD_B.0.load(Ordering::SeqCst) != 8 {
+            return 0xb1; // the operation must update the word
+        }
+        if errno(wake_op(
+            1,
+            1,
+            word_b,
+            futex_op_word(5, 0, FUTEX_OP_CMP_EQ, 0),
+        )) != ENOSYS
+        {
+            return 0xb2; // unknown operation
+        }
+        // SET 8 leaves the word as it is, so this holds whether or not the
+        // kernel applies the operation before rejecting the comparison.
+        if errno(wake_op(1, 1, word_b, futex_op_word(FUTEX_OP_SET, 8, 6, 0))) != ENOSYS {
+            return 0xb3; // unknown comparison
+        }
+        if PARITY_WORD_B.0.load(Ordering::SeqCst) != 8 {
+            return 0xb4;
+        }
+        if errno(wake_op(1, 1, word_b + 1, add3_if_5)) != EINVAL {
+            return 0xb5; // misaligned second word
+        }
+        if errno(wake_op(1, 1, 0, add3_if_5)) != EFAULT {
+            return 0xb6; // missing second word
+        }
+    }
+
+    // WAKE_OP wakes a sleeper on the second word only when the comparison of
+    // the old value holds.
+    if parity_spawn(0, &PARITY_WORD_B, 8, 0, THREAD_FLAGS).is_none() {
+        return 0xb7;
+    }
+    if !parity_await_sleepers(&PARITY_WORD_B, 1) {
+        return 0xb8;
+    }
+    unsafe {
+        // ADD 1: 8 -> 9; 8 > 100 is false, so nobody is woken.
+        if wake_op(
+            1,
+            1,
+            word_b,
+            futex_op_word(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_GT, 100),
+        ) != 0
+        {
+            return 0xb9;
+        }
+    }
+    if PARITY_WORD_B.0.load(Ordering::SeqCst) != 9 {
+        return 0xba;
+    }
+    parity_settle();
+    if !parity_pending(0) || parity_sleepers(&PARITY_WORD_B) != 1 {
+        return 0xbb; // a false comparison must not wake the sleeper
+    }
+    unsafe {
+        // OR (1 << 4): 9 -> 25; 9 == 9 holds, so the sleeper is woken.
+        let or_bit4_if_9 = futex_op_word(FUTEX_OP_OR | FUTEX_OP_OPARG_SHIFT, 4, FUTEX_OP_CMP_EQ, 9);
+        if wake_op(1, 1, word_b, or_bit4_if_9) != 1 {
+            return 0xbc;
+        }
+    }
+    if PARITY_WORD_B.0.load(Ordering::SeqCst) != 25 {
+        return 0xbd;
+    }
+    if !parity_join_woken(0) {
+        return 0xbe;
+    }
+
+    // A requeued sleeper is moved, not woken: it keeps sleeping on the
+    // target until the target is woken.
+    let word_d = PARITY_WORD_D.0.as_ptr() as u64;
+    if parity_spawn(0, &PARITY_WORD_C, 0, 0, THREAD_FLAGS).is_none() {
+        return 0xc0;
+    }
+    let mut moved = 0;
+    for _ in 0..THREAD_POLL_YIELDS {
+        moved = unsafe {
+            futex(
+                &PARITY_WORD_C,
+                FUTEX_CMP_REQUEUE_OP | FUTEX_PRIVATE,
+                0,
+                1,
+                word_d,
+                0,
+            )
+        };
+        if moved != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if moved != 1 {
+        return 0xc1; // the sleeper was not counted exactly once
+    }
+    unsafe {
+        if futex(
+            &PARITY_WORD_C,
+            FUTEX_WAKE_OP | FUTEX_PRIVATE,
+            FUTEX_ALL,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            return 0xc2; // nobody is left on the source word
+        }
+    }
+    if parity_sleepers(&PARITY_WORD_D) != 1 {
+        return 0xc3; // the sleeper now waits on the target
+    }
+    parity_settle();
+    if !parity_pending(0) {
+        return 0xc4; // the requeue must not have woken it
+    }
+    unsafe {
+        if futex(&PARITY_WORD_D, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) != 1 {
+            return 0xc5;
+        }
+    }
+    if !parity_join_woken(0) {
+        return 0xc6;
+    }
+
+    // A partial-bitset wake wakes only the sleeper whose mask intersects.
+    if parity_spawn(0, &PARITY_WORD_E, 0, 0x1, THREAD_FLAGS).is_none()
+        || parity_spawn(1, &PARITY_WORD_E, 0, 0x2, THREAD_FLAGS).is_none()
+    {
+        return 0xd0;
+    }
+    if !parity_await_sleepers(&PARITY_WORD_E, 2) {
+        return 0xd1;
+    }
+    unsafe {
+        if futex(
+            &PARITY_WORD_E,
+            FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE,
+            FUTEX_ALL,
+            0,
+            0,
+            0x4,
+        ) != 0
+        {
+            return 0xd2; // a mask that intersects nobody
+        }
+        if futex(
+            &PARITY_WORD_E,
+            FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE,
+            FUTEX_ALL,
+            0,
+            0,
+            0x2,
+        ) != 1
+        {
+            return 0xd3;
+        }
+    }
+    if !parity_join_woken(1) {
+        return 0xd4;
+    }
+    parity_settle();
+    if !parity_pending(0) || parity_sleepers(&PARITY_WORD_E) != 1 {
+        return 0xd5; // the other mask's sleeper must still be asleep
+    }
+    unsafe {
+        if futex(
+            &PARITY_WORD_E,
+            FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE,
+            1,
+            0,
+            0,
+            0x1,
+        ) != 1
+        {
+            return 0xd6;
+        }
+    }
+    if !parity_join_woken(0) {
+        return 0xd7;
+    }
+
+    // A CLONE_VM child that is not a thread shares the address space, so it
+    // shares the futex keys: the host sees and wakes its sleeper.
+    let Some(child) = parity_spawn(0, &PARITY_WORD_F, 0, 0, CLONE_VM) else {
+        return 0xe0;
+    };
+    if !parity_await_sleepers(&PARITY_WORD_F, 1) {
+        let _ = unsafe { futex(&PARITY_WORD_F, FUTEX_WAKE_OP, 1, 0, 0, 0) };
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        let _ = reap_pid(child);
+        return 0xe1; // its sleeper is invisible to the host's key space
+    }
+    if unsafe { futex(&PARITY_WORD_F, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) } != 1 {
+        unsafe { userspace::syscall::sys_kill(child, SIGKILL_NR) };
+        let _ = reap_pid(child);
+        return 0xe2;
+    }
+    if reap_pid(child) != Some(0) {
+        return 0xe3;
+    }
+    if PARITY_SLEEPERS[0].result.load(Ordering::SeqCst) != 0 {
+        return 0xe4; // the child's wait must report the wake
+    }
+    FUTEX_PARITY_OK
+}
+
+fn test_futex_parity(results: &mut TestResult) {
+    print("Testing futex WAKE_OP, requeue, bitsets and address-space keys... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("futex parity: fork of the host failed");
+        return;
+    }
+    if host == 0 {
+        let code = futex_parity_leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(FUTEX_PARITY_OK) => {}
+        Some(code) => {
+            print("futex parity leg exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("futex parity: a check failed");
+            return;
+        }
+        None => {
+            results.fail("futex parity: could not reap the host");
+            return;
+        }
+    }
+    results.pass("futex WAKE_OP, requeue, partial bitsets and CLONE_VM keys match Linux");
+}
+
+// ---------------------------------------------------------------------------
+// GAP-5 PI parity: PI futexes under the Linux user-word protocol (the owner's
+// TID in the word, FUTEX_WAITERS and FUTEX_OWNER_DIED kept by the kernel) and
+// requeue-PI. Each leg runs in a forked host so a stuck waiter cannot take
+// PID 1 down. Every check also holds on Linux.
+// ---------------------------------------------------------------------------
+
+const FUTEX_LOCK_PI_OP: u64 = 6;
+const FUTEX_UNLOCK_PI_OP: u64 = 7;
+const FUTEX_TRYLOCK_PI_OP: u64 = 8;
+const FUTEX_WAIT_REQUEUE_PI_OP: u64 = 11;
+const FUTEX_CMP_REQUEUE_PI_OP: u64 = 12;
+const FUTEX_LOCK_PI2_OP: u64 = 13;
+const FUTEX_WAITERS_BIT: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED_BIT: u32 = 0x4000_0000;
+const FUTEX_TID_BITS: u32 = 0x3fff_ffff;
+const EPERM: i32 = 1;
+const EDEADLK: i32 = 35;
+const CLOCK_REALTIME_ID: u64 = 0;
+/// Host exit status when every check of a PI leg passed.
+const FUTEX_PI_OK: u64 = 0x36;
+/// A TID no task has: the PID space ends far below it.
+const FUTEX_PI_NO_TID: u32 = 0x3fff_fff0;
+
+static PI_WORD_A: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PI_WORD_B: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PI_COND: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static PI_OTHER: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+
+/// One PI helper thread: what it locks (or, for requeue-PI, waits on) and
+/// what its calls returned.
+struct PiThread {
+    /// The PI word's address.
+    word: core::sync::atomic::AtomicU64,
+    /// FUTEX_WAIT_REQUEUE_PI's source word (expected value 0), or 0 for a
+    /// plain FUTEX_LOCK_PI.
+    cond: core::sync::atomic::AtomicU64,
+    /// The PI word right after the lock call returned.
+    seen: core::sync::atomic::AtomicU32,
+    /// The lock call's result.
+    ret: core::sync::atomic::AtomicU64,
+    /// Host -> thread: release the lock now.
+    go: core::sync::atomic::AtomicU32,
+    /// FUTEX_UNLOCK_PI's result.
+    unlock_ret: core::sync::atomic::AtomicU64,
+    /// CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID word: 0 once it exited.
+    tid: core::sync::atomic::AtomicI32,
+}
+
+impl PiThread {
+    const fn new() -> Self {
+        use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
+        Self {
+            word: AtomicU64::new(0),
+            cond: AtomicU64::new(0),
+            seen: AtomicU32::new(0),
+            ret: AtomicU64::new(FUTEX_WAIT_PENDING),
+            go: AtomicU32::new(0),
+            unlock_ret: AtomicU64::new(FUTEX_WAIT_PENDING),
+            tid: AtomicI32::new(0),
+        }
+    }
+}
+
+static PI_THREADS: [PiThread; 2] = [PiThread::new(), PiThread::new()];
+/// Two lockers and one owner that dies holding the lock.
+static mut PI_STACKS: [CloneStack; 3] = [
+    CloneStack([0; CLEAR_TID_STACK_BYTES]),
+    CloneStack([0; CLEAR_TID_STACK_BYTES]),
+    CloneStack([0; CLEAR_TID_STACK_BYTES]),
+];
+
+fn pi_stack_top(index: usize) -> usize {
+    unsafe { core::ptr::addr_of_mut!(PI_STACKS[index]) as usize + CLEAR_TID_STACK_BYTES }
+}
+
+unsafe fn pi_futex(word: u64, op: u64, timeout: u64) -> u64 {
+    syscall6(SYS_FUTEX, word, op | FUTEX_PRIVATE, 0, timeout, 0, 0)
+}
+
+fn word_addr(word: &FutexWord) -> u64 {
+    word.0.as_ptr() as u64
+}
+
+fn pi_thread_body(slot: &PiThread) -> ! {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let word = slot.word.load(Ordering::SeqCst);
+    let cond = slot.cond.load(Ordering::SeqCst);
+    let ret = unsafe {
+        if cond == 0 {
+            pi_futex(word, FUTEX_LOCK_PI_OP, 0)
+        } else {
+            syscall6(
+                SYS_FUTEX,
+                cond,
+                FUTEX_WAIT_REQUEUE_PI_OP | FUTEX_PRIVATE,
+                0,
+                0,
+                word,
+                0,
+            )
+        }
+    };
+    // SAFETY: `word` is the address of one of this program's static words.
+    let seen = unsafe { (*(word as *const AtomicU32)).load(Ordering::SeqCst) };
+    slot.seen.store(seen, Ordering::SeqCst);
+    slot.ret.store(ret, Ordering::SeqCst);
+    if ret == 0 {
+        while slot.go.load(Ordering::SeqCst) == 0 {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        let r = unsafe { pi_futex(word, FUTEX_UNLOCK_PI_OP, 0) };
+        slot.unlock_ret.store(r, Ordering::SeqCst);
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+extern "C" fn pi_thread_0() -> ! {
+    pi_thread_body(&PI_THREADS[0])
+}
+
+extern "C" fn pi_thread_1() -> ! {
+    pi_thread_body(&PI_THREADS[1])
+}
+
+/// Start PI thread `index` (a CLONE_THREAD sibling): FUTEX_LOCK_PI on
+/// `word`, or FUTEX_WAIT_REQUEUE_PI on `cond` towards `word`. Returns its tid.
+fn pi_spawn(index: usize, word: &FutexWord, cond: Option<&FutexWord>) -> Option<u32> {
+    pi_spawn_on(index, word, cond, pi_stack_top(index))
+}
+
+/// `pi_spawn` on the stack whose top is `stack_top`.
+fn pi_spawn_on(
+    index: usize,
+    word: &FutexWord,
+    cond: Option<&FutexWord>,
+    stack_top: usize,
+) -> Option<u32> {
+    use core::sync::atomic::Ordering;
+    let slot = &PI_THREADS[index];
+    slot.word.store(word_addr(word), Ordering::SeqCst);
+    slot.cond.store(cond.map_or(0, word_addr), Ordering::SeqCst);
+    slot.seen.store(0, Ordering::SeqCst);
+    slot.ret.store(FUTEX_WAIT_PENDING, Ordering::SeqCst);
+    slot.go.store(0, Ordering::SeqCst);
+    slot.unlock_ret.store(FUTEX_WAIT_PENDING, Ordering::SeqCst);
+    slot.tid.store(-1, Ordering::SeqCst);
+    let entry: extern "C" fn() -> ! = if index == 0 { pi_thread_0 } else { pi_thread_1 };
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            stack_top,
+            core::ptr::null_mut(),
+            slot.tid.as_ptr(),
+            entry,
+        )
+    };
+    (!is_error(tid) && tid != 0).then_some(tid as u32)
+}
+
+fn pi_await(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..THREAD_POLL_YIELDS {
+        if done() {
+            return true;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+/// The thread's lock call returned; Some(result).
+fn pi_returned(index: usize) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let slot = &PI_THREADS[index];
+    pi_await(|| slot.ret.load(Ordering::SeqCst) != FUTEX_WAIT_PENDING)
+        .then(|| slot.ret.load(Ordering::SeqCst))
+}
+
+/// Let thread `index` unlock and exit; its unlock must succeed.
+fn pi_release_and_join(index: usize) -> bool {
+    use core::sync::atomic::Ordering;
+    let slot = &PI_THREADS[index];
+    slot.go.store(1, Ordering::SeqCst);
+    pi_await(|| slot.tid.load(Ordering::SeqCst) == 0) && slot.unlock_ret.load(Ordering::SeqCst) == 0
+}
+
+/// Give a thread that should be queued in the kernel plenty of chances.
+fn pi_settle() {
+    for _ in 0..200 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+}
+
+fn realtime_ns() -> Option<i64> {
+    let mut ts = [0i64; 2];
+    let r = unsafe { syscall2(SYS_CLOCK_GETTIME, CLOCK_REALTIME_ID, ts.as_mut_ptr() as u64) };
+    (r == 0).then(|| ts[0] * 1_000_000_000 + ts[1])
+}
+
+/// Body of the PI contract leg's host process; returns its exit status.
+fn futex_pi_contract_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let a = &PI_WORD_A;
+    let a_addr = word_addr(a);
+    let b_addr = word_addr(&PI_WORD_B);
+    let cond_addr = word_addr(&PI_COND);
+    // Touch every word: a futex word on a page not present yet is EFAULT.
+    for word in [&PI_WORD_A, &PI_WORD_B, &PI_COND, &PI_OTHER] {
+        word.0.store(0, Ordering::SeqCst);
+    }
+    let lock = |op: u64| unsafe { pi_futex(a_addr, op, 0) };
+    let word = || a.0.load(Ordering::SeqCst);
+
+    // The user-space fast path takes a free lock with a CAS 0 -> tid; the
+    // kernel then sees the caller as the owner.
+    if a.0
+        .compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return 0x10;
+    }
+    if errno(lock(FUTEX_LOCK_PI_OP)) != EDEADLK || errno(lock(FUTEX_TRYLOCK_PI_OP)) != EDEADLK {
+        return 0x11;
+    }
+    // The owner's unlock with nobody waiting stores 0.
+    if lock(FUTEX_UNLOCK_PI_OP) != 0 || word() != 0 {
+        return 0x12;
+    }
+    // Only the task the word names may unlock.
+    if errno(lock(FUTEX_UNLOCK_PI_OP)) != EPERM {
+        return 0x13;
+    }
+    a.0.store(FUTEX_PI_NO_TID, Ordering::SeqCst);
+    if errno(lock(FUTEX_UNLOCK_PI_OP)) != EPERM {
+        return 0x14;
+    }
+    // A word naming no task: ESRCH, after FUTEX_WAITERS was set.
+    if errno(lock(FUTEX_LOCK_PI_OP)) != ESRCH {
+        return 0x15;
+    }
+    if word() != FUTEX_PI_NO_TID | FUTEX_WAITERS_BIT {
+        return 0x16;
+    }
+    if errno(lock(FUTEX_TRYLOCK_PI_OP)) != ESRCH {
+        return 0x17;
+    }
+    // The kernel takes a free lock for its caller.
+    for op in [FUTEX_LOCK_PI_OP, FUTEX_LOCK_PI2_OP, FUTEX_TRYLOCK_PI_OP] {
+        a.0.store(0, Ordering::SeqCst);
+        if lock(op) != 0 || word() != me {
+            return 0x18;
+        }
+        if lock(FUTEX_UNLOCK_PI_OP) != 0 || word() != 0 {
+            return 0x19;
+        }
+    }
+    // A stale FUTEX_WAITERS bit with no kernel waiter: taken over, and the
+    // owner's kernel unlock clears the whole word.
+    a.0.store(FUTEX_WAITERS_BIT, Ordering::SeqCst);
+    if lock(FUTEX_LOCK_PI_OP) != 0 || word() != me {
+        return 0x1a;
+    }
+    a.0.store(me | FUTEX_WAITERS_BIT, Ordering::SeqCst);
+    if lock(FUTEX_UNLOCK_PI_OP) != 0 || word() != 0 {
+        return 0x1b;
+    }
+    // TID 0 with OWNER_DIED (a dead robust owner): taken over, OWNER_DIED
+    // kept for user space to report EOWNERDEAD; the call itself returns 0.
+    a.0.store(FUTEX_OWNER_DIED_BIT, Ordering::SeqCst);
+    if lock(FUTEX_LOCK_PI_OP) != 0 || word() != FUTEX_OWNER_DIED_BIT | me {
+        return 0x1c;
+    }
+    if lock(FUTEX_UNLOCK_PI_OP) != 0 || word() != 0 {
+        return 0x1d;
+    }
+    // FUTEX_CLOCK_REALTIME: refused with LOCK_PI (always CLOCK_REALTIME) and
+    // TRYLOCK_PI, accepted with LOCK_PI2. A deadline already passed does not
+    // stop an uncontended take: the word is tried first.
+    if errno(lock(FUTEX_LOCK_PI_OP | FUTEX_CLOCK_REALTIME)) != ENOSYS
+        || errno(lock(FUTEX_TRYLOCK_PI_OP | FUTEX_CLOCK_REALTIME)) != ENOSYS
+    {
+        return 0x1e;
+    }
+    let past = [0i64; 2];
+    let r = unsafe {
+        pi_futex(
+            a_addr,
+            FUTEX_LOCK_PI2_OP | FUTEX_CLOCK_REALTIME,
+            past.as_ptr() as u64,
+        )
+    };
+    if r != 0 || word() != me || lock(FUTEX_UNLOCK_PI_OP) != 0 {
+        return 0x1f;
+    }
+
+    // Requeue-PI argument contract.
+    unsafe {
+        let wait_rq = FUTEX_WAIT_REQUEUE_PI_OP | FUTEX_PRIVATE;
+        let cmp_rq = FUTEX_CMP_REQUEUE_PI_OP | FUTEX_PRIVATE;
+        if errno(futex(&PI_COND, wait_rq, 0, 0, cond_addr, 0)) != EINVAL {
+            return 0x20; // the same word twice
+        }
+        if errno(futex(&PI_COND, wait_rq, 1, 0, b_addr, 0)) != EAGAIN {
+            return 0x21; // *uaddr != val
+        }
+        if errno(futex(&PI_COND, cmp_rq, 2, 1, b_addr, 0)) != EINVAL {
+            return 0x22; // nr_wake must be 1
+        }
+        if errno(futex(&PI_COND, cmp_rq, 1, 1, cond_addr, 0)) != EINVAL {
+            return 0x23; // the same word twice
+        }
+        if errno(futex(&PI_COND, cmp_rq, 1, 1, b_addr, 7)) != EAGAIN {
+            return 0x24; // *uaddr != val3
+        }
+        if futex(&PI_COND, cmp_rq, 1, 1, b_addr, 0) != 0 {
+            return 0x25; // nobody waiting
+        }
+        // A requeue-PI wait whose absolute deadline passed times out before
+        // any requeue.
+        if errno(futex(&PI_COND, wait_rq, 0, past.as_ptr() as u64, b_addr, 0)) != ETIMEDOUT {
+            return 0x26;
+        }
+    }
+    if PI_WORD_B.0.load(Ordering::SeqCst) != 0 {
+        return 0x27; // nothing touched the PI word
+    }
+    FUTEX_PI_OK
+}
+
+/// Body of the PI hand-off leg's host process; returns its exit status.
+fn futex_pi_handoff_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let a = &PI_WORD_A;
+    let a_addr = word_addr(a);
+    a.0.store(0, Ordering::SeqCst);
+    let word = || a.0.load(Ordering::SeqCst);
+
+    // Taken in user space; a CLONE_THREAD sibling's contended LOCK_PI sets
+    // FUTEX_WAITERS and sleeps.
+    if a.0
+        .compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return 0x40;
+    }
+    let Some(first) = pi_spawn(0, a, None) else {
+        return 0x41;
+    };
+    if !pi_await(|| word() == me | FUTEX_WAITERS_BIT) {
+        return 0x42;
+    }
+    let Some(second) = pi_spawn(1, a, None) else {
+        return 0x43;
+    };
+    pi_settle();
+    // UNLOCK_PI hands the lock to the oldest waiter: its TID, with
+    // FUTEX_WAITERS (the kernel keeps it set after a hand-off).
+    if unsafe { pi_futex(a_addr, FUTEX_UNLOCK_PI_OP, 0) } != 0 {
+        return 0x44;
+    }
+    if word() != first | FUTEX_WAITERS_BIT {
+        return 0x45;
+    }
+    if pi_returned(0) != Some(0)
+        || PI_THREADS[0].seen.load(Ordering::SeqCst) != first | FUTEX_WAITERS_BIT
+    {
+        return 0x46;
+    }
+    // The old owner no longer owns it; a trylock finds it held; a timed
+    // lock (absolute CLOCK_REALTIME deadline) times out at its deadline.
+    if errno(unsafe { pi_futex(a_addr, FUTEX_UNLOCK_PI_OP, 0) }) != EPERM {
+        return 0x47;
+    }
+    if errno(unsafe { pi_futex(a_addr, FUTEX_TRYLOCK_PI_OP, 0) }) != EAGAIN {
+        return 0x48;
+    }
+    let Some(start) = realtime_ns() else {
+        return 0x49;
+    };
+    let deadline_ns = start + FUTEX_SLEEP_NS;
+    let deadline = [deadline_ns / 1_000_000_000, deadline_ns % 1_000_000_000];
+    let r = unsafe { pi_futex(a_addr, FUTEX_LOCK_PI_OP, deadline.as_ptr() as u64) };
+    if errno(r) != ETIMEDOUT {
+        return 0x4a;
+    }
+    match realtime_ns() {
+        Some(now) if now >= deadline_ns => {}
+        _ => return 0x4b, // returned before its deadline
+    }
+    if word() != first | FUTEX_WAITERS_BIT {
+        return 0x4c;
+    }
+    // The first owner's unlock hands the lock to the second waiter.
+    if !pi_release_and_join(0) {
+        return 0x4d;
+    }
+    if pi_returned(1) != Some(0)
+        || PI_THREADS[1].seen.load(Ordering::SeqCst) & FUTEX_TID_BITS != second
+    {
+        return 0x4e;
+    }
+    if !pi_release_and_join(1) {
+        return 0x4f;
+    }
+    // Nobody left: the last unlock stored 0.
+    if word() != 0 {
+        return 0x50;
+    }
+    FUTEX_PI_OK
+}
+
+/// A robust PI mutex: the futex word, then the robust-list node
+/// (`futex_offset` is -8).
+#[repr(C, align(8))]
+struct PiRobustMutex {
+    word: FutexWord,
+    _pad: core::sync::atomic::AtomicU32,
+    next: core::sync::atomic::AtomicU64,
+}
+
+static PI_ROBUST_MUTEX: PiRobustMutex = PiRobustMutex {
+    word: FutexWord(core::sync::atomic::AtomicU32::new(0)),
+    _pad: core::sync::atomic::AtomicU32::new(0),
+    next: core::sync::atomic::AtomicU64::new(0),
+};
+
+/// struct robust_list_head { list, futex_offset, list_op_pending }.
+#[repr(C, align(8))]
+struct PiRobustHead([core::sync::atomic::AtomicU64; 3]);
+
+static PI_ROBUST_HEAD: PiRobustHead = PiRobustHead([
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+]);
+/// An empty robust list (it points at itself): an owner without the mutex
+/// on its list.
+static PI_EMPTY_HEAD: PiRobustHead = PiRobustHead([
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+]);
+
+/// Owner thread: 1 = register the mutex on its robust list.
+static PI_OWNER_ROBUST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Owner thread -> host: 1 locked, 2 failed.
+static PI_OWNER_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Host -> owner thread: exit now, holding the lock.
+static PI_OWNER_DIE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PI_OWNER_TID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+fn pi_robust_head(robust: bool) -> u64 {
+    let head = if robust {
+        &PI_ROBUST_HEAD
+    } else {
+        &PI_EMPTY_HEAD
+    };
+    head as *const PiRobustHead as u64
+}
+
+/// Owner thread: register a robust list, take the PI mutex in user space,
+/// then exit holding it.
+extern "C" fn pi_owner_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let robust = PI_OWNER_ROBUST.load(Ordering::SeqCst) != 0;
+    let registered = unsafe { syscall2(SYS_SET_ROBUST_LIST, pi_robust_head(robust), 24) } == 0;
+    let me = unsafe { sys_gettid() } as u32;
+    let locked = registered
+        && PI_ROBUST_MUTEX
+            .word
+            .0
+            .compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+    PI_OWNER_STATE.store(if locked { 1 } else { 2 }, Ordering::SeqCst);
+    while PI_OWNER_DIE.load(Ordering::SeqCst) == 0 {
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Start an owner thread that takes the robust mutex (on its robust list
+/// when `robust`, tagged as a PI futex as glibc does). Returns its tid once
+/// it holds the lock.
+fn pi_spawn_owner(robust: bool) -> Option<u32> {
+    use core::sync::atomic::Ordering;
+    let word = PI_ROBUST_MUTEX.word.0.as_ptr() as u64;
+    let node = PI_ROBUST_MUTEX.next.as_ptr() as u64;
+    let head = pi_robust_head(true);
+    PI_ROBUST_MUTEX.word.0.store(0, Ordering::SeqCst);
+    // One node, linked back to the head; bit 0 of the pointer to it marks a
+    // PI futex.
+    PI_ROBUST_MUTEX.next.store(head, Ordering::SeqCst);
+    PI_ROBUST_HEAD.0[0].store(node | 1, Ordering::SeqCst);
+    PI_ROBUST_HEAD.0[1].store(word.wrapping_sub(node), Ordering::SeqCst);
+    PI_ROBUST_HEAD.0[2].store(0, Ordering::SeqCst);
+    let empty = pi_robust_head(false);
+    PI_EMPTY_HEAD.0[0].store(empty, Ordering::SeqCst);
+    PI_EMPTY_HEAD.0[1].store(0, Ordering::SeqCst);
+    PI_EMPTY_HEAD.0[2].store(0, Ordering::SeqCst);
+    PI_OWNER_ROBUST.store(robust as u32, Ordering::SeqCst);
+    PI_OWNER_STATE.store(0, Ordering::SeqCst);
+    PI_OWNER_DIE.store(0, Ordering::SeqCst);
+    PI_OWNER_TID.store(-1, Ordering::SeqCst);
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            pi_stack_top(2),
+            core::ptr::null_mut(),
+            PI_OWNER_TID.as_ptr(),
+            pi_owner_thread,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        return None;
+    }
+    (pi_await(|| PI_OWNER_STATE.load(Ordering::SeqCst) != 0)
+        && PI_OWNER_STATE.load(Ordering::SeqCst) == 1)
+        .then_some(tid as u32)
+}
+
+/// Let the owner thread exit holding the lock, and wait for its clear-tid.
+fn pi_kill_owner() -> bool {
+    use core::sync::atomic::Ordering;
+    PI_OWNER_DIE.store(1, Ordering::SeqCst);
+    pi_await(|| PI_OWNER_TID.load(Ordering::SeqCst) == 0)
+}
+
+/// Body of the PI owner-death leg's host process; returns its exit status.
+fn futex_pi_owner_death_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let mutex = &PI_ROBUST_MUTEX.word;
+    let mutex_addr = word_addr(mutex);
+    let word = || mutex.0.load(Ordering::SeqCst);
+
+    // A robust owner dies with a waiter: its robust walk sets OWNER_DIED
+    // (clearing its TID, keeping WAITERS) and the lock goes to the waiter,
+    // which finds its TID, WAITERS and OWNER_DIED in the word.
+    let Some(owner) = pi_spawn_owner(true) else {
+        return 0x60;
+    };
+    let Some(waiter) = pi_spawn(0, mutex, None) else {
+        return 0x61;
+    };
+    if !pi_await(|| word() == owner | FUTEX_WAITERS_BIT) {
+        return 0x62;
+    }
+    pi_settle();
+    if !pi_kill_owner() {
+        return 0x63;
+    }
+    if pi_returned(0) != Some(0) {
+        return 0x64;
+    }
+    if PI_THREADS[0].seen.load(Ordering::SeqCst)
+        != waiter | FUTEX_WAITERS_BIT | FUTEX_OWNER_DIED_BIT
+    {
+        return 0x65;
+    }
+    // The heir's unlock clears the word (it made no waiter wait).
+    if !pi_release_and_join(0) || word() != 0 {
+        return 0x66;
+    }
+
+    // A robust owner dies with nobody waiting: the word keeps OWNER_DIED
+    // with TID 0, and the next LOCK_PI takes it over with OWNER_DIED kept.
+    if pi_spawn_owner(true).is_none() {
+        return 0x67;
+    }
+    if !pi_kill_owner() {
+        return 0x68;
+    }
+    if !pi_await(|| word() == FUTEX_OWNER_DIED_BIT) {
+        return 0x69;
+    }
+    if unsafe { pi_futex(mutex_addr, FUTEX_LOCK_PI_OP, 0) } != 0
+        || word() != FUTEX_OWNER_DIED_BIT | me
+    {
+        return 0x6a;
+    }
+    if unsafe { pi_futex(mutex_addr, FUTEX_UNLOCK_PI_OP, 0) } != 0 || word() != 0 {
+        return 0x6b;
+    }
+
+    // An owner that dies without the mutex on a robust list leaves its TID:
+    // once its exit is complete nobody owns what the word names (ESRCH).
+    let Some(gone) = pi_spawn_owner(false) else {
+        return 0x6c;
+    };
+    if !pi_kill_owner() {
+        return 0x6d;
+    }
+    if word() != gone {
+        return 0x6e;
+    }
+    if errno(unsafe { pi_futex(mutex_addr, FUTEX_LOCK_PI_OP, 0) }) != ESRCH {
+        return 0x6f;
+    }
+    FUTEX_PI_OK
+}
+
+/// Body of the requeue-PI leg's host process; returns its exit status.
+fn futex_pi_requeue_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let mutex = &PI_WORD_B;
+    let mutex_addr = word_addr(mutex);
+    let other_addr = word_addr(&PI_OTHER);
+    for word in [&PI_WORD_B, &PI_COND, &PI_OTHER] {
+        word.0.store(0, Ordering::SeqCst);
+    }
+    let word = || mutex.0.load(Ordering::SeqCst);
+    let cmp_requeue_pi = |uaddr2: u64| unsafe {
+        futex(
+            &PI_COND,
+            FUTEX_CMP_REQUEUE_PI_OP | FUTEX_PRIVATE,
+            1,
+            1,
+            uaddr2,
+            0,
+        )
+    };
+    // A requeue-PI waiter sleeps on the condition word: a plain FUTEX_WAKE
+    // there is refused (EINVAL) while it does.
+    let rq_waiter_on_cond =
+        || errno(unsafe { futex(&PI_COND, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) }) == EINVAL;
+
+    let Some(first) = pi_spawn(0, mutex, Some(&PI_COND)) else {
+        return 0x80;
+    };
+    if !pi_await(rq_waiter_on_cond) {
+        return 0x81;
+    }
+    // Only waiters that named this PI futex move; a plain requeue refuses
+    // a requeue-PI waiter. Neither touches it.
+    if errno(cmp_requeue_pi(other_addr)) != EINVAL {
+        return 0x82;
+    }
+    let plain = unsafe {
+        futex(
+            &PI_COND,
+            FUTEX_CMP_REQUEUE_OP | FUTEX_PRIVATE,
+            0,
+            1,
+            other_addr,
+            0,
+        )
+    };
+    if errno(plain) != EINVAL || !rq_waiter_on_cond() {
+        return 0x83;
+    }
+    // The PI futex is free: it is taken for the top waiter, which wakes as
+    // the owner. WAITERS is set because more waiters may follow it.
+    if cmp_requeue_pi(mutex_addr) != 1 {
+        return 0x84;
+    }
+    if word() != first | FUTEX_WAITERS_BIT {
+        return 0x85;
+    }
+    if pi_returned(0) != Some(0)
+        || PI_THREADS[0].seen.load(Ordering::SeqCst) != first | FUTEX_WAITERS_BIT
+    {
+        return 0x86;
+    }
+
+    // With the PI futex held, the next waiter is requeued onto it and keeps
+    // waiting there, no longer on the condition word.
+    let Some(second) = pi_spawn(1, mutex, Some(&PI_COND)) else {
+        return 0x87;
+    };
+    if !pi_await(rq_waiter_on_cond) {
+        return 0x88;
+    }
+    if cmp_requeue_pi(mutex_addr) != 1 {
+        return 0x89;
+    }
+    pi_settle();
+    if PI_THREADS[1].ret.load(Ordering::SeqCst) != FUTEX_WAIT_PENDING {
+        return 0x8a; // a requeued waiter does not return before it owns
+    }
+    if unsafe { futex(&PI_COND, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) } != 0 {
+        return 0x8b;
+    }
+    if word() != first | FUTEX_WAITERS_BIT {
+        return 0x8c;
+    }
+    // The owner's unlock hands the lock to the requeued waiter.
+    if !pi_release_and_join(0) {
+        return 0x8d;
+    }
+    if pi_returned(1) != Some(0)
+        || PI_THREADS[1].seen.load(Ordering::SeqCst) != second | FUTEX_WAITERS_BIT
+    {
+        return 0x8e;
+    }
+    if !pi_release_and_join(1) || word() != 0 {
+        return 0x8f;
+    }
+    FUTEX_PI_OK
+}
+
+/// The PI word of the copy-on-write leg, alone on its page. The test process
+/// writes it before it forks the leg's host, so in the host the page stays
+/// copy-on-write until a write fault: the host itself only reads it.
+#[repr(C, align(4096))]
+struct PiCowPage {
+    word: FutexWord,
+    _rest: [u8; 4092],
+}
+
+static PI_COW_PAGE: PiCowPage = PiCowPage {
+    word: FutexWord(core::sync::atomic::AtomicU32::new(0)),
+    _rest: [0; 4092],
+};
+
+/// Fork a child that exits at once and reap it. Every private page of the
+/// caller, the copy-on-write leg's word included, is copy-on-write again
+/// afterwards: its next write faults.
+fn pi_fork_and_reap() -> bool {
+    let child = fork_exit(0, 0);
+    !is_error(child) && reap_pid(child) == Some(0)
+}
+
+/// Body of the copy-on-write PI leg's host process; returns its exit status.
+/// GAP-5 PI review D2-1: the kernel's CASes on a PI word made under the
+/// bucket lock meet a copy-on-write page. They report the fault instead of
+/// resolving it under the lock, fault the word in with the lock dropped and
+/// retry; the calls behave as if the page were writable.
+fn futex_pi_cow_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let word = &PI_COW_PAGE.word;
+    let addr = word_addr(word);
+    // Reads do not break copy-on-write.
+    let value = || word.0.load(Ordering::SeqCst);
+    if value() != 0 {
+        return 0xa0;
+    }
+    // LOCK_PI takes the free word: the take's CAS meets the copy-on-write
+    // page the fork left.
+    if unsafe { pi_futex(addr, FUTEX_LOCK_PI_OP, 0) } != 0 || value() != me {
+        return 0xa1;
+    }
+    // A sibling's contended LOCK_PI queues behind the host.
+    let Some(waiter) = pi_spawn(0, word, None) else {
+        return 0xa2;
+    };
+    if !pi_await(|| value() == me | FUTEX_WAITERS_BIT) {
+        return 0xa3;
+    }
+    pi_settle();
+    // A fork makes the page copy-on-write again; UNLOCK_PI's hand-off CAS
+    // meets it.
+    if !pi_fork_and_reap() {
+        return 0xa4;
+    }
+    if unsafe { pi_futex(addr, FUTEX_UNLOCK_PI_OP, 0) } != 0 {
+        return 0xa5;
+    }
+    if value() != waiter | FUTEX_WAITERS_BIT {
+        return 0xa6;
+    }
+    if pi_returned(0) != Some(0)
+        || PI_THREADS[0].seen.load(Ordering::SeqCst) != waiter | FUTEX_WAITERS_BIT
+    {
+        return 0xa7;
+    }
+    // Copy-on-write once more for the new owner's unlock. With no waiter
+    // left this unlock takes the no-bucket path, whose CAS runs with no futex
+    // lock held and resolves the fault directly.
+    if !pi_fork_and_reap() {
+        return 0xa8;
+    }
+    if !pi_release_and_join(0) || value() != 0 {
+        return 0xa9;
+    }
+    FUTEX_PI_OK
+}
+
+const SYS_RT_SIGACTION: u64 = 13;
+const SIGUSR1_NR: u64 = 10;
+const SA_RESTORER_FLAG: u64 = 0x0400_0000;
+/// Handler runs of the signal leg's SIGUSR1.
+static PI_SIGNALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// The signal leg's SA_RESTORER trampoline: the handler returns here, which
+// issues rt_sigreturn (15).
+core::arch::global_asm!(
+    ".pushsection .text",
+    ".global pi_sigreturn_trampoline",
+    "pi_sigreturn_trampoline:",
+    "    mov eax, 15",
+    "    syscall",
+    "    ud2",
+    ".popsection",
+);
+
+extern "C" {
+    fn pi_sigreturn_trampoline();
+}
+
+extern "C" fn pi_signal_handler(_signo: i32) {
+    PI_SIGNALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Body of the PI signal leg's host process; returns its exit status.
+/// GAP-5 PI review D2-2: a handler signal for a task blocked in LOCK_PI
+/// must not end the call: glibc takes EINTR or EAGAIN from it for
+/// "acquired". Linux restarts the call after running the handler; this
+/// kernel keeps the task waiting and runs the handler when the call returns.
+/// Either way the call returns 0 owning the lock, and the handler runs.
+fn futex_pi_signal_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let tgid = unsafe { sys_getpid() };
+    let a = &PI_WORD_A;
+    let a_addr = word_addr(a);
+    a.0.store(0, Ordering::SeqCst);
+    let word = || a.0.load(Ordering::SeqCst);
+
+    // struct sigaction { handler, flags, restorer, mask } (shared by the
+    // CLONE_SIGHAND siblings).
+    let act: [u64; 4] = [
+        pi_signal_handler as extern "C" fn(i32) as usize as u64,
+        SA_RESTORER_FLAG,
+        pi_sigreturn_trampoline as unsafe extern "C" fn() as usize as u64,
+        0,
+    ];
+    if unsafe { syscall4(SYS_RT_SIGACTION, SIGUSR1_NR, act.as_ptr() as u64, 0, 8) } != 0 {
+        return 0xb0;
+    }
+    PI_SIGNALS.store(0, Ordering::SeqCst);
+    if a.0
+        .compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return 0xb1;
+    }
+    // The kernel builds a signal frame only on the main stack or an mmap'd
+    // one (RF178-34), as threads made by a libc have; a static stack would
+    // turn the handler signal into SIGSEGV.
+    const SIGNAL_STACK_BYTES: usize = 16 * 1024;
+    let stack = unsafe { mmap_anon(SIGNAL_STACK_BYTES, false) };
+    if stack < 0 {
+        return 0xbb;
+    }
+    let Some(waiter) = pi_spawn_on(0, a, None, stack as usize + SIGNAL_STACK_BYTES) else {
+        return 0xb2;
+    };
+    if !pi_await(|| word() == me | FUTEX_WAITERS_BIT) {
+        return 0xb3;
+    }
+    pi_settle();
+    // Two handler signals for the sleeping locker: its LOCK_PI goes on.
+    for _ in 0..2 {
+        if unsafe { syscall3(SYS_TGKILL, tgid, waiter as u64, SIGUSR1_NR) } != 0 {
+            return 0xb4;
+        }
+        pi_settle();
+        if PI_THREADS[0].ret.load(Ordering::SeqCst) != FUTEX_WAIT_PENDING {
+            return 0xb5;
+        }
+    }
+    if word() & FUTEX_TID_BITS != me {
+        return 0xb6;
+    }
+    // The unlock hands the lock over: LOCK_PI returns 0 with the waiter's
+    // TID in the word, and the handler has run.
+    if unsafe { pi_futex(a_addr, FUTEX_UNLOCK_PI_OP, 0) } != 0 {
+        return 0xb7;
+    }
+    if pi_returned(0) != Some(0)
+        || PI_THREADS[0].seen.load(Ordering::SeqCst) & FUTEX_TID_BITS != waiter
+    {
+        return 0xb8;
+    }
+    if !pi_await(|| PI_SIGNALS.load(Ordering::SeqCst) != 0) {
+        return 0xb9;
+    }
+    if !pi_release_and_join(0) || word() != 0 {
+        return 0xba;
+    }
+    FUTEX_PI_OK
+}
+
+/// Body of the PI non-robust owner-death leg's host process; returns its
+/// exit status. GAP-5 PI review D5: an owner that took the lock without a
+/// robust list dies with a waiter. Its exit hands the lock to the waiter
+/// (Linux `exit_pi_state_list`), which stores its TID with WAITERS and,
+/// as Linux's fixup does whenever the owner died, OWNER_DIED.
+fn futex_pi_nonrobust_heir_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let mutex = &PI_ROBUST_MUTEX.word;
+    let word = || mutex.0.load(Ordering::SeqCst);
+    let Some(owner) = pi_spawn_owner(false) else {
+        return 0xc0;
+    };
+    let Some(waiter) = pi_spawn(0, mutex, None) else {
+        return 0xc1;
+    };
+    if !pi_await(|| word() == owner | FUTEX_WAITERS_BIT) {
+        return 0xc2;
+    }
+    pi_settle();
+    if !pi_kill_owner() {
+        return 0xc3;
+    }
+    if pi_returned(0) != Some(0) {
+        return 0xc4;
+    }
+    if PI_THREADS[0].seen.load(Ordering::SeqCst)
+        != waiter | FUTEX_WAITERS_BIT | FUTEX_OWNER_DIED_BIT
+    {
+        return 0xc5;
+    }
+    if !pi_release_and_join(0) || word() != 0 {
+        return 0xc6;
+    }
+    FUTEX_PI_OK
+}
+
+/// Run one PI leg in a forked host and report it.
+fn run_futex_pi_leg(results: &mut TestResult, leg: fn() -> u64, pass: &str, fail: &str) {
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("futex PI: fork of the host failed");
+        return;
+    }
+    if host == 0 {
+        let code = leg();
+        unsafe { raw_exit(SYS_EXIT_GROUP, code) };
+    }
+    match reap_pid(host) {
+        Some(FUTEX_PI_OK) => results.pass(pass),
+        Some(code) => {
+            print("futex PI leg exit ");
+            print_hex(code);
+            print(" ");
+            results.fail(fail);
+        }
+        None => results.fail("futex PI: could not reap the host"),
+    }
+}
+
+fn test_futex_pi(results: &mut TestResult) {
+    print("Testing PI futexes (Linux user-word protocol) and requeue-PI... ");
+    run_futex_pi_leg(
+        results,
+        futex_pi_contract_leg,
+        "futex PI: user-space CAS fast path, kernel take-over and EDEADLK/EPERM/ESRCH contracts",
+        "futex PI: a word or argument contract check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_handoff_leg,
+        "futex PI: UNLOCK_PI hands the lock to the oldest waiter as tid|FUTEX_WAITERS; TRYLOCK_PI is EAGAIN while it is held",
+        "futex PI: a hand-off check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_owner_death_leg,
+        "futex PI: a dead robust owner leaves OWNER_DIED and its waiter inherits the lock",
+        "futex PI: an owner-death check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_requeue_leg,
+        "futex PI: CMP_REQUEUE_PI wakes one waiter as owner and requeues one that is later handed the lock",
+        "futex PI: a requeue-PI check failed",
+    );
+    // Written here, before the fork, so the host finds the page
+    // copy-on-write.
+    PI_COW_PAGE
+        .word
+        .0
+        .store(0, core::sync::atomic::Ordering::SeqCst);
+    run_futex_pi_leg(
+        results,
+        futex_pi_cow_leg,
+        "futex PI: LOCK_PI and UNLOCK_PI update a copy-on-write word after a fork",
+        "futex PI: a copy-on-write word check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_signal_leg,
+        "futex PI: a handler signal does not end LOCK_PI, which returns 0 owning the lock",
+        "futex PI: a signal-during-LOCK_PI check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_nonrobust_heir_leg,
+        "futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED",
+        "futex PI: a non-robust owner-death check failed",
+    );
 }
 
 // ---------------------------------------------------------------------------

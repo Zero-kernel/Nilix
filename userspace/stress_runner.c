@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -130,6 +131,7 @@ _Static_assert(offsetof(CgroupStatsBuf, pids_events_max) == 56, "pids_events_max
 #define PROFILE_PROCESS 4u
 #define PROFILE_BLOCK 5u
 #define PROFILE_COMBINED 6u
+#define PROFILE_THREAD 7u
 
 #define FLAG_REQUIRE_OOM (1u << 0)
 #define FLAG_PIN_WORKERS (1u << 1)
@@ -169,7 +171,7 @@ typedef struct {
 } StressConfig;
 
 static const char *const PROFILE_NAMES[] = {
-    NULL, "memory", "cpu", "smp", "process", "block", "combined",
+    NULL, "memory", "cpu", "smp", "process", "block", "combined", "thread",
 };
 
 /* Emitted at most once; the validator treats any FAIL as fatal. */
@@ -305,7 +307,7 @@ static void sha256_final(Sha256 *ctx, uint8_t digest[32]) {
 /* ------------------------------------------------------------------ */
 
 static const char *profile_name(void) {
-    if (config.profile >= 1u && config.profile <= 6u) {
+    if (config.profile >= 1u && config.profile <= PROFILE_THREAD) {
         return PROFILE_NAMES[config.profile];
     }
     return "memory";
@@ -367,8 +369,8 @@ static void emit_schedstat(uint64_t seq) {
  * is reported verbatim so the host log names the failing syscall.
  */
 static void fail(const char *stage, long errno_value, uint64_t detail) {
-    if (!failure_emitted) {
-        failure_emitted = 1;
+    /* Atomic: the thread profile can fail from several threads at once. */
+    if (__atomic_exchange_n(&failure_emitted, 1, __ATOMIC_SEQ_CST) == 0) {
         emit("NILIX_STRESS_V2_FAIL run=%016" PRIx64 " profile=%s seq=0 stage=%s errno=%ld detail=%" PRIu64,
              config.run_id, profile_name(), stage, errno_value, detail);
     }
@@ -510,7 +512,7 @@ static void load_config(void) {
     config.io_writes_per_round = load_u32(raw, 104);
     config.reclaim_percent = load_u32(raw, 108);
 
-    if (config.profile < 1u || config.profile > 6u) {
+    if (config.profile < 1u || config.profile > PROFILE_THREAD) {
         fail("config_profile", 0, config.profile);
     }
     if (config.workers == 0u || config.workers > MAX_WORKERS) {
@@ -1348,6 +1350,197 @@ static CombinedRoundResult run_combined_round(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Profile: thread                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * GAP-5 thread lifecycle under pressure.
+ * Each round forks a child that runs churn_waves waves of `workers` pthreads.
+ * Every thread takes one mutex contention_iterations times, then meets the
+ * others at a condition-variable barrier whose broadcast is musl's requeue
+ * chain, checks its __thread value and is joined. The child then exits with
+ * one more thread parked in pthread_cond_wait, so the group ends with a live
+ * member. The parent reaps the child once and reads its report only after the
+ * whole group is gone: the pipe reaches EOF when the shared fd table closes.
+ */
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t barrier;
+    uint64_t counter;
+    uint32_t arrived;
+    uint32_t parties;
+    uint32_t generation;
+    uint32_t errors;
+    /* Set under `lock` by the parked thread right before it waits. */
+    int parked;
+} ThreadWave;
+
+typedef struct {
+    ThreadWave *wave;
+    uint32_t index;
+} ThreadWorkerArg;
+
+typedef struct {
+    uint64_t created;
+    uint64_t joined;
+    uint64_t counter;
+    uint64_t checksum;
+} ThreadRoundReport;
+
+#define THREAD_TLS_TAG 0x7448524400000000ull
+
+static __thread uint64_t thread_tls_value;
+
+static void *thread_worker_body(void *opaque) {
+    const ThreadWorkerArg *arg = (const ThreadWorkerArg *)opaque;
+    ThreadWave *wave = arg->wave;
+    thread_tls_value = THREAD_TLS_TAG | arg->index;
+    uint32_t errors = 0;
+    for (uint64_t step = 0; step < config.contention_iterations; ++step) {
+        errors += pthread_mutex_lock(&wave->lock) != 0;
+        wave->counter += 1u;
+        errors += pthread_mutex_unlock(&wave->lock) != 0;
+    }
+    errors += pthread_mutex_lock(&wave->lock) != 0;
+    const uint32_t generation = wave->generation;
+    wave->arrived += 1u;
+    if (wave->arrived == wave->parties) {
+        wave->generation += 1u;
+        errors += pthread_cond_broadcast(&wave->barrier) != 0;
+    } else {
+        while (wave->generation == generation) {
+            if (pthread_cond_wait(&wave->barrier, &wave->lock) != 0) {
+                errors += 1u;
+                break;
+            }
+        }
+    }
+    wave->errors += errors;
+    errors += pthread_mutex_unlock(&wave->lock) != 0;
+    if (errors != 0u || thread_tls_value != (THREAD_TLS_TAG | arg->index)) {
+        return NULL;
+    }
+    return (void *)(uintptr_t)(arg->index + 1u);
+}
+
+static void *thread_parked_body(void *opaque) {
+    ThreadWave *wave = (ThreadWave *)opaque;
+    (void)pthread_mutex_lock(&wave->lock);
+    __atomic_store_n(&wave->parked, 1, __ATOMIC_RELEASE);
+    for (;;) {
+        (void)pthread_cond_wait(&wave->barrier, &wave->lock);
+    }
+    return NULL;
+}
+
+static void thread_wave_init(ThreadWave *wave, uint32_t parties) {
+    memset(wave, 0, sizeof(*wave));
+    if (pthread_mutex_init(&wave->lock, NULL) != 0 || pthread_cond_init(&wave->barrier, NULL) != 0) {
+        fail("thread_sync_init", 0, parties);
+    }
+    wave->parties = parties;
+}
+
+/* Runs in the forked child; never returns. */
+static void thread_round_child(int report_fd, uint64_t seq) {
+    static ThreadWave parked;
+    pthread_t threads[MAX_WORKERS];
+    ThreadWorkerArg args[MAX_WORKERS];
+    ThreadRoundReport report = {0, 0, 0, 0};
+    uint64_t accumulator = checksum_mix(config.seed, seq);
+
+    for (uint32_t wave_index = 0; wave_index < config.churn_waves; ++wave_index) {
+        ThreadWave wave;
+        thread_wave_init(&wave, config.workers);
+        for (uint32_t index = 0; index < config.workers; ++index) {
+            args[index].wave = &wave;
+            args[index].index = index;
+            const int rc = pthread_create(&threads[index], NULL, thread_worker_body, &args[index]);
+            if (rc != 0) {
+                fail("thread_create", rc, report.created);
+            }
+            report.created += 1u;
+        }
+        for (uint32_t index = 0; index < config.workers; ++index) {
+            void *result = NULL;
+            const int rc = pthread_join(threads[index], &result);
+            if (rc != 0) {
+                fail("thread_join", rc, report.joined);
+            }
+            if ((uintptr_t)result != (uintptr_t)index + 1u) {
+                fail("thread_worker_result", 0, (uint64_t)(uintptr_t)result);
+            }
+            report.joined += 1u;
+            accumulator = checksum_mix(accumulator, (uint64_t)(uintptr_t)result);
+        }
+        if (wave.errors != 0u) {
+            fail("thread_sync_error", 0, wave.errors);
+        }
+        if (wave.counter != (uint64_t)config.workers * config.contention_iterations) {
+            fail("thread_wave_counter", 0, wave.counter);
+        }
+        report.counter += wave.counter;
+        accumulator = checksum_mix(accumulator, wave.counter);
+        (void)pthread_cond_destroy(&wave.barrier);
+        (void)pthread_mutex_destroy(&wave.lock);
+    }
+
+    thread_wave_init(&parked, 1u);
+    pthread_t parked_thread;
+    const int rc = pthread_create(&parked_thread, NULL, thread_parked_body, &parked);
+    if (rc != 0) {
+        fail("thread_create_parked", rc, 0);
+    }
+    /* The flag is set under the lock, and pthread_cond_wait releases the lock
+     * only once the thread waits, so taking it here means the thread is parked. */
+    while (!__atomic_load_n(&parked.parked, __ATOMIC_ACQUIRE)) {
+        (void)sched_yield();
+    }
+    if (pthread_mutex_lock(&parked.lock) != 0 || pthread_mutex_unlock(&parked.lock) != 0) {
+        fail("thread_parked_sync", 0, 0);
+    }
+    report.checksum = checksum_finalize(accumulator);
+    write_all_fd(report_fd, &report, sizeof(report), "thread_report_write");
+    /* exit_group with the parked thread still alive. */
+    _exit(0);
+}
+
+static ThreadRoundReport run_thread_round(uint64_t seq) {
+    int report_pipe[2] = {-1, -1};
+    if (pipe(report_pipe) != 0) {
+        fail("thread_report_pipe", errno, 0);
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        fail("thread_child_fork", errno, 0);
+    }
+    if (child == 0) {
+        (void)close(report_pipe[0]);
+        thread_round_child(report_pipe[1], seq);
+    }
+    (void)close(report_pipe[1]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            fail("thread_child_wait", errno, 0);
+        }
+    }
+    /* A failing child emitted its own FAIL marker. */
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        _exit(1);
+    }
+
+    ThreadRoundReport report = {0, 0, 0, 0};
+    read_exact_fd(report_pipe[0], &report, sizeof(report), "thread_report_read");
+    assert_pipe_eof(report_pipe[0], "thread_report_oversized");
+    if (close(report_pipe[0]) != 0) {
+        fail("thread_report_close", errno, 0);
+    }
+    return report;
+}
+
+/* ------------------------------------------------------------------ */
 /* Round driver                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1454,6 +1647,30 @@ static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
              " checksum=%016" PRIx64,
              config.run_id, seq, result.memory_ops, result.cpu_ops, result.smp_ops,
              result.process_ops, result.io_ops, checksum);
+        break;
+    }
+    case PROFILE_THREAD: {
+        const uint64_t started = monotonic_ns();
+        const ThreadRoundReport result = run_thread_round(seq);
+        const uint64_t wall_ns = monotonic_ns() - started;
+
+        const uint64_t threads = (uint64_t)config.workers * config.churn_waves;
+        const uint64_t expected = threads * config.contention_iterations;
+        if (result.created != threads || result.joined != threads) {
+            fail("thread_join_count", 0, result.joined);
+        }
+        if (result.counter != expected) {
+            fail("thread_counter_mismatch", 0, result.counter);
+        }
+        *cumulative_ops += result.joined + result.counter;
+        checksum = result.checksum;
+
+        emit("NILIX_STRESS_V2_THREAD run=%016" PRIx64 " seq=%" PRIu64 " workers=%" PRIu32
+             " waves=%" PRIu32 " iterations=%" PRIu64 " created=%" PRIu64 " joined=%" PRIu64
+             " counter=%" PRIu64 " expected=%" PRIu64 " wall_ns=%" PRIu64 " checksum=%016" PRIx64,
+             config.run_id, seq, config.workers, config.churn_waves, config.contention_iterations,
+             result.created, result.joined, result.counter, expected, wall_ns != 0u ? wall_ns : 1u,
+             checksum);
         break;
     }
     case PROFILE_BLOCK:

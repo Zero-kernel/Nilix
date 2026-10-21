@@ -40,6 +40,7 @@ PROFILE_IDS = {
     "process": 4,
     "block": 5,
     "combined": 6,
+    "thread": 7,
 }
 PROFILE_NAMES = {value: key for key, value in PROFILE_IDS.items()}
 
@@ -200,7 +201,7 @@ class StressConfig:
 
     def validate(self) -> None:
         if self.profile not in PROFILE_NAMES:
-            raise StressProtocolError("profile must be in the range 1..6")
+            raise StressProtocolError("profile must be in the range 1..7")
         if self.flags & ~KNOWN_FLAGS:
             raise StressProtocolError("configuration contains unknown flag bits")
         checked_u64(self.run_id, "run_id")
@@ -234,6 +235,7 @@ class StressConfig:
                 "io_writes_per_round",
                 "reclaim_percent",
             },
+            "thread": {"contention_iterations", "churn_waves"},
         }[self.profile_name]
         always = {"vcpus", "workers", "heartbeat_max_ms", "rounds_per_heartbeat"}
         for name in KNOB_NAMES:
@@ -280,6 +282,16 @@ class StressConfig:
                 raise StressProtocolError("churn_waves must be in the range 1..1024")
             checked_mul_u64(knobs.churn_fanout, knobs.churn_waves, "process child count")
 
+        if self.profile_name == "thread":
+            if knobs.workers < 2:
+                raise StressProtocolError("thread profile requires at least two threads per wave")
+            if not 1 <= knobs.contention_iterations <= 10**9:
+                raise StressProtocolError("contention_iterations must be in the range 1..10^9")
+            if not 1 <= knobs.churn_waves <= 1024:
+                raise StressProtocolError("churn_waves must be in the range 1..1024")
+            threads = checked_mul_u64(knobs.workers, knobs.churn_waves, "thread count")
+            checked_mul_u64(threads, knobs.contention_iterations, "thread expected count")
+
         if self.profile_name in {"block", "combined"}:
             if knobs.io_block_bytes != PAGE_BYTES:
                 raise StressProtocolError("io_block_bytes must be exactly 4096")
@@ -302,6 +314,7 @@ class StressConfig:
                 | FLAG_HOST_TERMINATED
                 | FLAG_REQUIRE_QMP_VCPUS
             ),
+            "thread": FLAG_HOST_TERMINATED,
         }[self.profile_name]
         if self.flags & ~allowed_flags:
             raise StressProtocolError(f"irrelevant flag set for profile {self.profile_name}")
@@ -429,6 +442,14 @@ DEFAULT_KNOBS: dict[str, dict[str, int]] = {
         "io_writes_per_round": 16,
         "reclaim_percent": 100,
     },
+    "thread": {
+        "vcpus": 4,
+        "workers": 4,
+        "heartbeat_max_ms": 15000,
+        "rounds_per_heartbeat": 1,
+        "contention_iterations": 2_000,
+        "churn_waves": 8,
+    },
 }
 
 DEFAULT_FLAGS = {
@@ -440,6 +461,7 @@ DEFAULT_FLAGS = {
     "combined": (
         FLAG_REQUIRE_OOM | FLAG_PIN_WORKERS | FLAG_HOST_TERMINATED | FLAG_REQUIRE_QMP_VCPUS
     ),
+    "thread": FLAG_HOST_TERMINATED,
 }
 
 
@@ -820,7 +842,7 @@ UINT_RE = r"(?:0|[1-9][0-9]{0,19})"
 POS_UINT_RE = r"(?:[1-9][0-9]{0,19})"
 HEX16_RE = r"[0-9a-f]{16}"
 HEX64_RE = r"[0-9a-f]{64}"
-PROFILE_RE = r"(?:memory|cpu|smp|process|block|combined)"
+PROFILE_RE = r"(?:memory|cpu|smp|process|block|combined|thread)"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -909,6 +931,15 @@ MARKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         rf"memory_ops=(?P<memory_ops>{POS_UINT_RE}) cpu_ops=(?P<cpu_ops>{POS_UINT_RE}) "
         rf"smp_ops=(?P<smp_ops>{POS_UINT_RE}) process_ops=(?P<process_ops>{POS_UINT_RE}) "
         rf"io_ops=(?P<io_ops>{POS_UINT_RE}) checksum=(?P<checksum>{HEX16_RE})",
+    ),
+    marker_pattern(
+        "thread",
+        rf"NILIX_STRESS_V2_THREAD run=(?P<run>{HEX16_RE}) seq=(?P<seq>{POS_UINT_RE}) "
+        rf"workers=(?P<workers>{POS_UINT_RE}) waves=(?P<waves>{POS_UINT_RE}) "
+        rf"iterations=(?P<iterations>{POS_UINT_RE}) created=(?P<created>{POS_UINT_RE}) "
+        rf"joined=(?P<joined>{POS_UINT_RE}) counter=(?P<counter>{UINT_RE}) "
+        rf"expected=(?P<expected>{POS_UINT_RE}) wall_ns=(?P<wall_ns>{POS_UINT_RE}) "
+        rf"checksum=(?P<checksum>{HEX16_RE})",
     ),
     marker_pattern(
         "block_baseline",
@@ -1071,6 +1102,17 @@ def validate_profile_marker(marker: Marker, config: StressConfig) -> None:
             total = checked_u64(total + fields[name], "combined operation count")
         if total == 0:
             raise StressProtocolError("combined profile reported no subsystem operations")
+    elif marker.kind == "thread":
+        threads = checked_mul_u64(knobs.workers, knobs.churn_waves, "thread count")
+        expected = checked_mul_u64(threads, knobs.contention_iterations, "thread expected")
+        if fields["workers"] != knobs.workers or fields["waves"] != knobs.churn_waves:
+            raise StressProtocolError("thread marker does not match configured workers/waves")
+        if fields["iterations"] != knobs.contention_iterations:
+            raise StressProtocolError("thread marker iteration count mismatch")
+        if fields["created"] != threads or fields["joined"] != threads:
+            raise StressProtocolError("thread round did not create and join the exact thread set")
+        if fields["expected"] != expected or fields["counter"] != expected:
+            raise StressProtocolError("thread mutex-protected counter/expected mismatch")
     else:
         raise StressProtocolError(f"unexpected profile marker kind {marker.kind}")
 

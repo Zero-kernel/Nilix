@@ -1445,6 +1445,9 @@ mod host_harness_tests {
 
     #[test]
     fn strict_cpu_pin_is_registered_online_and_restores_preemption() {
+        // Reads the shared host CPU's IRQ/NMI context and preempt count, which
+        // the classifier tests change; serialize with them.
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
         assert_eq!(super::try_current_registered_cpu_id(), Some(0));
         assert_eq!(super::try_current_registered_online_cpu_id(), Some(0));
         assert_eq!(

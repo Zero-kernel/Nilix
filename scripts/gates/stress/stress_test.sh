@@ -21,8 +21,8 @@ STRESS_CPUS="${STRESS_CPUS:-4}"
 STRESS_MEM="${STRESS_MEM:-256M}"
 STRESS_CONSTRAINED_MEM="${STRESS_CONSTRAINED_MEM:-192M}"
 STRESS_DISK_IMAGE="${STRESS_DISK_IMAGE:-$ROOT/disk-ext2.img}"
-STRESS_PROFILE_LIMIT="${STRESS_PROFILE_LIMIT:-6}"
-STRESS_PROFILES="${STRESS_PROFILES:-memory,cpu,smp,process,block,combined}"
+STRESS_PROFILE_LIMIT="${STRESS_PROFILE_LIMIT:-7}"
+STRESS_PROFILES="${STRESS_PROFILES:-memory,cpu,smp,thread,process,block,combined}"
 STRESS_BOOT_TIMEOUT="${STRESS_BOOT_TIMEOUT:-900}"
 STRESS_SHUTDOWN_GRACE="${STRESS_SHUTDOWN_GRACE:-10}"
 STRESS_HEARTBEAT_MAX_MS="${STRESS_HEARTBEAT_MAX_MS:-15000}"
@@ -49,6 +49,9 @@ STRESS_COMBINED_CONTENTION_ITERATIONS="${STRESS_COMBINED_CONTENTION_ITERATIONS:-
 STRESS_COMBINED_CHURN_FANOUT="${STRESS_COMBINED_CHURN_FANOUT:-4}"
 STRESS_COMBINED_CHURN_WAVES="${STRESS_COMBINED_CHURN_WAVES:-2}"
 STRESS_COMBINED_IO_WRITES_PER_ROUND="${STRESS_COMBINED_IO_WRITES_PER_ROUND:-16}"
+# thread: pthread waves per round and mutex acquisitions per thread.
+STRESS_THREAD_WAVES="${STRESS_THREAD_WAVES:-8}"
+STRESS_THREAD_ITERATIONS="${STRESS_THREAD_ITERATIONS:-2000}"
 
 STRESS_BLOCK_CRASH_ATTEMPTS="${STRESS_BLOCK_CRASH_ATTEMPTS:-12}"
 STRESS_BLOCK_KILL_OFFSETS_MS="${STRESS_BLOCK_KILL_OFFSETS_MS:-0,1,2,3,4,6,8,12,16,24,32,48}"
@@ -164,7 +167,8 @@ for numeric in \
     STRESS_COMBINED_MEMORY_LIMIT_DELTA STRESS_COMBINED_MEMORY_CHUNK_BYTES \
     STRESS_COMBINED_CPU_ITERATIONS STRESS_COMBINED_CONTENTION_ITERATIONS \
     STRESS_COMBINED_CHURN_FANOUT STRESS_COMBINED_CHURN_WAVES \
-    STRESS_COMBINED_IO_WRITES_PER_ROUND STRESS_BLOCK_CRASH_ATTEMPTS \
+    STRESS_COMBINED_IO_WRITES_PER_ROUND STRESS_THREAD_WAVES STRESS_THREAD_ITERATIONS \
+    STRESS_BLOCK_CRASH_ATTEMPTS \
     STRESS_BLOCK_ACTIVE_WAIT_MS STRESS_BLOCK_ACTIVE_POLL_US; do
     require_positive "$numeric" "${!numeric}"
 done
@@ -174,7 +178,7 @@ require_nonnegative STRESS_HEARTBEAT_GRACE_MS "$STRESS_HEARTBEAT_GRACE_MS"
 [[ "$STRESS_CONSTRAINED_MEM" =~ ^[1-9][0-9]*[KMG]?$ ]] \
     || blocked "STRESS_CONSTRAINED_MEM must be a QEMU memory size such as 192M"
 [ "$STRESS_CPUS" -le 64 ] || blocked "STRESS_CPUS must not exceed 64"
-[ "$STRESS_PROFILE_LIMIT" -le 6 ] || blocked "STRESS_PROFILE_LIMIT must not exceed 6"
+[ "$STRESS_PROFILE_LIMIT" -le 7 ] || blocked "STRESS_PROFILE_LIMIT must not exceed 7"
 [ "$STRESS_KEEP_ARTIFACTS" = 0 ] || [ "$STRESS_KEEP_ARTIFACTS" = 1 ] \
     || blocked "STRESS_KEEP_ARTIFACTS must be 0 or 1"
 
@@ -226,7 +230,7 @@ IFS=',' read -r -a REQUESTED_PROFILES <<< "$STRESS_PROFILES"
 SELECTED_PROFILES=()
 declare -A SEEN_PROFILES=()
 for profile in "${REQUESTED_PROFILES[@]}"; do
-    case "$profile" in memory|cpu|smp|process|block|combined) ;; *) blocked "unknown profile: $profile" ;; esac
+    case "$profile" in memory|cpu|smp|process|block|combined|thread) ;; *) blocked "unknown profile: $profile" ;; esac
     [ -z "${SEEN_PROFILES[$profile]:-}" ] || blocked "duplicate profile: $profile"
     SEEN_PROFILES[$profile]=1
     SELECTED_PROFILES+=("$profile")
@@ -268,7 +272,12 @@ profile_vcpus() {
 }
 
 profile_workers() {
-    case "$1" in memory|process|block) echo 1 ;; *) echo "$STRESS_CPUS" ;; esac
+    case "$1" in
+        memory|process|block) echo 1 ;;
+        # A thread wave needs two threads even on one vCPU.
+        thread) if [ "$STRESS_CPUS" -lt 2 ]; then echo 2; else echo "$STRESS_CPUS"; fi ;;
+        *) echo "$STRESS_CPUS" ;;
+    esac
 }
 
 profile_memory() {
@@ -293,6 +302,10 @@ create_config() {
             ;;
         cpu) args+=(--cpu-iterations "$STRESS_CPU_ITERATIONS") ;;
         smp) args+=(--contention-iterations "$STRESS_CONTENTION_ITERATIONS") ;;
+        thread)
+            args+=(--contention-iterations "$STRESS_THREAD_ITERATIONS"
+                --churn-waves "$STRESS_THREAD_WAVES")
+            ;;
         process)
             args+=(--churn-fanout "$STRESS_CHURN_FANOUT" --churn-waves "$STRESS_CHURN_WAVES")
             ;;

@@ -77,8 +77,21 @@ fork refused by pids.max leaves no child, task charge or reapable zombie
 user stack guard page faults while the lazy region above it grows
 CLONE_CHILD_CLEARTID clears a .bss tid word at exit
 tkill and tgkill reach exactly the named task
+a spinner killed at a timer interrupt is reaped while another spinner runs
 thread groups share identity and files, exit as one and are reaped once
-futex requeue wakes a sleeping sibling and bitset ops keep the Linux contract
+a group whose leader exited is reported when its last thread exits beside a spinner
+exec from a thread group ends the other members: from the leader, and from a non-leader while the leader waits, spins or sleeps
+a thread group shares its children: any thread waits for them and a dying thread hands them on
+procfs lists group leaders and /proc/<pid>/task members with Tgid and Threads
+futex requeue moves a sleeping sibling and bitset ops keep the Linux contract
+futex WAKE_OP, requeue, partial bitsets and CLONE_VM keys match Linux
+futex PI: user-space CAS fast path, kernel take-over and EDEADLK/EPERM/ESRCH contracts
+futex PI: UNLOCK_PI hands the lock to the oldest waiter as tid|FUTEX_WAITERS; TRYLOCK_PI is EAGAIN while it is held
+futex PI: a dead robust owner leaves OWNER_DIED and its waiter inherits the lock
+futex PI: CMP_REQUEUE_PI wakes one waiter as owner and requeues one that is later handed the lock
+futex PI: LOCK_PI and UNLOCK_PI update a copy-on-write word after a fork
+futex PI: a handler signal does not end LOCK_PI, which returns 0 owning the lock
+futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED
 /proc/schedstat reports per-CPU switches and migrations and the RCU backlog
 LEGS
 

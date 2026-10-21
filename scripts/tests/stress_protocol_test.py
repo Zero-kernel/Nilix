@@ -270,6 +270,82 @@ class MarkerStateMachineTests(unittest.TestCase):
             protocol.validate_qmp_progress(valid_before, stalled, 2)
 
 
+def thread_round(
+    config: protocol.StressConfig, sequence: int, checksum: str, *, counter: int | None = None
+) -> str:
+    knobs = config.knobs
+    threads = knobs.workers * knobs.churn_waves
+    expected = threads * knobs.contention_iterations
+    return (
+        f"NILIX_STRESS_V2_THREAD run={config.run_hex} seq={sequence} "
+        f"workers={knobs.workers} waves={knobs.churn_waves} "
+        f"iterations={knobs.contention_iterations} created={threads} joined={threads} "
+        f"counter={expected if counter is None else counter} expected={expected} "
+        f"wall_ns=12345 checksum={checksum}"
+    )
+
+
+class ThreadProfileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = make_config(
+            "thread", vcpus=1, workers=2, heartbeat_max_ms=1000,
+            contention_iterations=5, churn_waves=3,
+        )
+        self.log = self.root / "serial.log"
+        self.events = self.root / "events.jsonl"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def validate(self, round1: str) -> None:
+        # Each round joins 6 threads and counts 30 acquisitions.
+        hb1 = heartbeat(self.config, 1, 36, CHECKSUM_A)
+        hb2 = heartbeat(self.config, 2, 72, CHECKSUM_B)
+        ready_line = ready(self.config, "normal")
+        lines = [
+            begin(self.config),
+            ready_line,
+            round1,
+            common_pass(self.config, 36, CHECKSUM_A),
+            hb1,
+            thread_round(self.config, 2, CHECKSUM_B),
+            hb2,
+        ]
+        write_log(self.log, lines)
+        write_events(
+            self.events,
+            [(1_000_000_000, ready_line), (1_500_000_000, hb1), (2_000_000_000, hb2)],
+        )
+        protocol.validate_log(
+            config=self.config,
+            serial_path=str(self.log),
+            mode="normal",
+            minimum_heartbeats=2,
+            events_path=str(self.events),
+            end_ns=2_500_000_000,
+            heartbeat_grace_ms=0,
+            qmp_before_path=None,
+            qmp_after_path=None,
+        )
+
+    def test_exact_thread_rounds_are_accepted(self) -> None:
+        self.validate(thread_round(self.config, 1, CHECKSUM_A))
+
+    def test_lost_increment_or_unjoined_thread_is_rejected(self) -> None:
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate(thread_round(self.config, 1, CHECKSUM_A, counter=29))
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate(thread_round(self.config, 1, CHECKSUM_A).replace("joined=6", "joined=5"))
+
+    def test_config_requires_two_threads_and_rejects_foreign_knobs(self) -> None:
+        with self.assertRaises(protocol.StressProtocolError):
+            make_config("thread", workers=1)
+        with self.assertRaises(protocol.StressProtocolError):
+            make_config("thread", cpu_iterations=10)
+
+
 class RuntimeFatalPatternTests(unittest.TestCase):
     def test_handled_fault_trace_is_not_terminal(self) -> None:
         self.assertIsNone(
