@@ -528,11 +528,12 @@ pub fn parse_dmar_table(rsdp_phys: u64) -> Result<DmarTable, DmarError> {
     unsafe { parse_dmar_at(table.ptr, table.len) }
 }
 
-/// R171-G5-01-B FIX: bound a firmware-advertised physical region to the kernel
-/// direct map and return a CPU-readable high-half pointer, or `None` if it is not
-/// fully inside `[0, 1 GiB)`. EVERY read of a firmware-controlled ACPI address goes
-/// through this so a malformed/out-of-range table can never fault the kernel or be
-/// blindly dereferenced. `None` for an address the firmware CLAIMS exists is the
+/// R171-G5-01-B FIX: return a CPU-readable pointer to a firmware-advertised
+/// physical region: the high-half direct-map address inside `[0, 1 GiB)`, else
+/// (F9) a bounded copy made by `mm::read_firmware_bytes`. `None` when neither is
+/// possible. EVERY read of a firmware-controlled ACPI address goes through this
+/// so a malformed/out-of-range table can never fault the kernel or be blindly
+/// dereferenced. `None` for an address the firmware CLAIMS exists is the
 /// caller's signal to fail CLOSED (`InvalidStructure`).
 fn phys_window(phys: u64, len: usize) -> Option<*const u8> {
     if phys == 0 {
@@ -540,7 +541,10 @@ fn phys_window(phys: u64, len: usize) -> Option<*const u8> {
     }
     let end = phys.checked_add(len as u64)?; // no u64 wrap
     if end > MAX_DIRECT_MAP_PHYS {
-        return None; // above the 1 GiB direct map
+        // F9: a table above the 1 GiB direct map (UEFI puts ACPI near the top
+        // of low RAM) is copied through the bounded firmware reader; a copy
+        // that cannot be made stays `None`, the fail-closed signal.
+        return mm::read_firmware_bytes(phys, len).map(<[u8]>::as_ptr);
     }
     Some((PHYSICAL_MEMORY_OFFSET + phys) as *const u8)
 }

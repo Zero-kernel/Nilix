@@ -48,6 +48,12 @@ const KASLR_SLIDE_GRANULARITY: u64 = 64 * 1024;
 /// Physical window covered by the initial high-half 1 GiB mapping.
 const KERNEL_PHYS_WINDOW_END: u64 = 1024 * 1024 * 1024;
 
+/// F9: highest address of a page the kernel reaches through its 1 GiB direct
+/// map (page-table frames, BootInfo, the memory-map copy). UEFI allocates
+/// top-down, so with 2 GiB of RAM or more an unbounded allocation landed above
+/// the window and the kernel's first page-table walk faulted.
+const DIRECT_MAP_MAX_ADDRESS: u64 = KERNEL_PHYS_WINDOW_END - 1;
+
 /// Defensive upper bound for the kernel file read.  The UEFI file metadata is
 /// untrusted input; refusing an absurd length keeps a corrupt directory entry
 /// from turning the bootloader's initial allocation into an unbounded request.
@@ -1063,9 +1069,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // 分配 BootInfo 结构的内存（在低于 4GiB 的位置，便于恒等映射访问）
     let boot_info_ptr = {
         let boot_services = system_table.boot_services();
+        // F9: inside the kernel's 1 GiB direct map as well.
         let boot_info_page = boot_services
             .allocate_pages(
-                AllocateType::MaxAddress(0xFFFF_FFFF),
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
                 MemoryType::LOADER_DATA,
                 1,
             )
@@ -1081,7 +1088,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     };
 
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
-    let (_pml4_frame, entry_point_to_jump) = unsafe {
+    let (pml4_frame, entry_point_to_jump) = unsafe {
         // 最早的 VGA 写入 - 在任何其他操作之前
         let vga = 0xb8000 as *mut u8;
         let msg = b"SETUP";
@@ -1090,8 +1097,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             *vga.offset(80 * 22 * 2 + i as isize * 2 + 1) = 0x09;
         }
         use x86_64::{
-            registers::control::Cr3,
-            structures::paging::{PageTable, PageTableFlags as Flags, PhysFrame},
+            structures::paging::{PageTable, PageTableFlags as Flags},
             PhysAddr,
         };
 
@@ -1099,21 +1105,33 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 分配并清零 PML4
         let pml4_frame = boot_services
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_DATA,
+                1,
+            )
             .expect("Failed to allocate PML4");
         let pml4_ptr = pml4_frame as *mut PageTable;
         core::ptr::write_bytes(pml4_ptr as *mut u8, 0, 4096);
 
         // 分配并清零 PDPT（高半区）
         let pdpt_high_frame = boot_services
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_DATA,
+                1,
+            )
             .expect("Failed to allocate PDPT");
         let pdpt_high_ptr = pdpt_high_frame as *mut PageTable;
         core::ptr::write_bytes(pdpt_high_ptr as *mut u8, 0, 4096);
 
         // 分配并清零 PD
         let pd_frame = boot_services
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_DATA,
+                1,
+            )
             .expect("Failed to allocate PD");
         let pd_ptr = pd_frame as *mut PageTable;
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
@@ -1165,7 +1183,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let bucket_start = (i as u64) * 0x200000;
             if i >= start_pd_idx && i <= end_pd_idx {
                 let pt_frame = boot_services
-                    .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+                    .allocate_pages(
+                        AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                        MemoryType::LOADER_DATA,
+                        1,
+                    )
                     .expect("Failed to allocate kernel permission PT");
                 let pt_ptr = pt_frame as *mut PageTable;
                 core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
@@ -1213,7 +1235,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 建立恒等映射以防止切换页表时崩溃
         let pdpt_low_frame = boot_services
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_DATA,
+                1,
+            )
             .expect("Failed to allocate low PDPT");
         let pdpt_low_ptr = pdpt_low_frame as *mut PageTable;
         core::ptr::write_bytes(pdpt_low_ptr as *mut u8, 0, 4096);
@@ -1227,7 +1253,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // - 这是一个已知的启动阶段安全妥协
         for pdpt_idx in 0..4usize {
             let pd_low_frame = boot_services
-                .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+                .allocate_pages(
+                    AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                    MemoryType::LOADER_DATA,
+                    1,
+                )
                 .expect("Failed to allocate low PD");
             let pd_low_ptr = pd_low_frame as *mut PageTable;
             core::ptr::write_bytes(pd_low_ptr as *mut u8, 0, 4096);
@@ -1268,27 +1298,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
         );
 
-        // 在切换前写 VGA 测试
-        let vga = 0xb8000 as *mut u8;
-        let msg1 = b"B4CR3";
-        for (i, &byte) in msg1.iter().enumerate() {
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2), byte);
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2 + 1), 0x0A);
-        }
-
-        // 加载新的页表
-        Cr3::write(
-            PhysFrame::containing_address(PhysAddr::new(pml4_frame)),
-            Cr3::read().1,
-        );
-
-        // 在切换后写 VGA 测试
-        let msg2 = b"AFCR3";
-        for (i, &byte) in msg2.iter().enumerate() {
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2), byte);
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1), 0x0C);
-        }
-
+        // F9: the new tables are loaded only after ExitBootServices (below).
+        // Boot services run on the active CR3, and OVMF's memory protection
+        // edits it (it splits huge pages and allocates the new tables top-down,
+        // above the kernel's 1 GiB direct map once the guest has 2 GiB).
         (pml4_frame, entry_point)
     };
 
@@ -1337,10 +1350,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // 64-page assumption.  The exact firmware-reported size is checked below.
     let (memory_map_copy_ptr, memory_map_copy_len) = {
         let pages = MEMORY_MAP_COPY_PAGES;
+        // F9: the kernel reads this copy through its 1 GiB direct map.
         let addr = system_table
             .boot_services()
             .allocate_pages(
-                AllocateType::MaxAddress(0xFFFF_FFFF),
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
                 MemoryType::LOADER_DATA,
                 pages,
             )
@@ -1401,6 +1415,33 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);
+    }
+
+    // 加载新的页表. F9: only now, with boot services gone, so the firmware
+    // never runs on (or edits) the kernel's tables. The bootloader's code,
+    // stack and data are below 4 GiB and stay reachable through the identity map.
+    unsafe {
+        use x86_64::{registers::control::Cr3, structures::paging::PhysFrame, PhysAddr};
+
+        // 在切换前写 VGA 测试
+        let vga = 0xb8000 as *mut u8;
+        let msg1 = b"B4CR3";
+        for (i, &byte) in msg1.iter().enumerate() {
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2), byte);
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2 + 1), 0x0A);
+        }
+
+        Cr3::write(
+            PhysFrame::containing_address(PhysAddr::new(pml4_frame)),
+            Cr3::read().1,
+        );
+
+        // 在切换后写 VGA 测试
+        let msg2 = b"AFCR3";
+        for (i, &byte) in msg2.iter().enumerate() {
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2), byte);
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1), 0x0C);
+        }
     }
 
     // 跳转到内核入口点 - 使用内联汇编确保正确跳转

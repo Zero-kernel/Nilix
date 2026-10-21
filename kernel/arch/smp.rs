@@ -70,8 +70,10 @@ const AP_STACK_SIZE: usize = AP_STACK_PAGES * 4096;
 /// Physical memory offset for high-half kernel mapping
 const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
 
-/// Maximum physical address covered by high-half direct map
-const MAX_PHYS_MAPPED: u64 = 0x1_0000_0000; // 4GB
+/// Maximum physical address covered by the high-half direct map. F9: the
+/// direct map is 1 GiB (PDPT[510] only); the old 4 GiB bound let addresses in
+/// [1 GiB, 4 GiB) compute unmapped virtual addresses.
+const MAX_PHYS_MAPPED: u64 = 1 << 30;
 
 /// Start of BIOS RSDP search region
 const RSDP_SEARCH_START: u64 = 0xE0000;
@@ -1899,21 +1901,14 @@ pub(crate) fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
     Some(unsafe { ptr::read_unaligned(slice.as_ptr() as *const SdtHeader) })
 }
 
-/// Get a slice of physical memory via high-half mapping.
+/// Get a slice of firmware (ACPI) memory.
 ///
 /// E.1 HPET: Made pub(crate) so hpet.rs can read ACPI table data.
+/// F9: tables above the 1 GiB direct map (UEFI places them near the top of low
+/// RAM, so a 2 GiB guest has them there) are copied through
+/// `mm::read_firmware_bytes`; `None` still means unreadable.
 pub(crate) fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
-    if phys == 0 {
-        return None;
-    }
-    let end = phys.checked_add(u64::try_from(len).ok()?)?;
-    if end > MAX_PHYS_MAPPED {
-        return None;
-    }
-    let virt_addr = PHYSICAL_MEMORY_OFFSET.checked_add(phys)?;
-    let _virt_end = virt_addr.checked_add(u64::try_from(len).ok()?)?;
-    let virt = virt_addr as *const u8;
-    Some(unsafe { core::slice::from_raw_parts(virt, len) })
+    mm::read_firmware_bytes(phys, len)
 }
 
 /// Validate ACPI checksum (sum of all bytes must be 0).

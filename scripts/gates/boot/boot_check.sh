@@ -17,6 +17,7 @@
 # Usage:   bash scripts/gates/boot/boot_check.sh [esp_dir]
 # Env:     OVMF_PATH (default /usr/share/qemu/OVMF.fd)
 #          BOOT_CHECK_TIMEOUT seconds (default 900, range 1..900)
+#          BOOT_CHECK_MEM guest RAM (default 256M; e.g. 2G for the F9 boot)
 #          BOOT_CHECK_KEEP_LOGS=1 retains all evidence files
 # ============================================================================
 set -u
@@ -33,6 +34,11 @@ case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 TO="${BOOT_CHECK_TIMEOUT:-900}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "BOOT-CHECK BLOCKED: BOOT_CHECK_TIMEOUT must be an integer from 1 to 900"
+    exit 2
+fi
+MEM="${BOOT_CHECK_MEM:-256M}"
+if [[ ! "$MEM" =~ ^[1-9][0-9]{0,4}[MG]$ ]]; then
+    echo "BOOT-CHECK BLOCKED: BOOT_CHECK_MEM must be a QEMU size such as 256M or 2G"
     exit 2
 fi
 for tool in "$QEMU" timeout python3; do
@@ -89,7 +95,7 @@ python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser
 LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
     bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
-    -m 256M -vga std -no-reboot -no-shutdown \
+    -m "$MEM" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"

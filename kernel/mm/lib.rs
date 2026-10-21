@@ -25,6 +25,8 @@ pub mod dma;
 /// allocation-fallible per-fragment map without a `net -> kernel_core` dependency
 /// cycle. Re-exported from `kernel_core::fallible_map` for source compatibility.
 pub mod fallible_map;
+/// F9: firmware (ACPI) table reads outside the 1 GiB direct map.
+pub mod firmware;
 /// R180-7..13: whole-kernel heap reservation and lifetime accounting.
 pub mod heap_admission;
 /// P2-A: single registry of kernel-heap hard floors / transient peaks / headroom.
@@ -47,6 +49,7 @@ pub use capabilities::{
     SlabError, SwapEntry, SwapError, SwapSlotTable, ThpError, ThpMapping, MAX_NUMA_NODES,
     THP_PAGE_COUNT, THP_SIZE,
 };
+pub use firmware::read_firmware_bytes;
 pub use heap_admission::{
     allocation_charge_bytes, arc_charge_bytes, check_coexistence,
     class_snapshot as heap_class_snapshot, run_heap_admission_boundary_self_test,

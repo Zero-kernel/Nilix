@@ -423,6 +423,9 @@ const HIGH_HALF_MAP_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 /// Heap base is now validated against the UEFI memory map before selection,
 /// ensuring the chosen address falls within EFI_CONVENTIONAL_MEMORY regions.
 pub fn init_with_bootinfo(boot_info: &BootInfo) {
+    // F9 (review D4): remember which physical ranges hold firmware tables, so
+    // ACPI reads above the direct map are confined to them.
+    record_firmware_ranges(boot_info);
     // R72-4 FIX: Select heap base with UEFI memory map validation FIRST
     // This ensures the heap doesn't overlap with reserved ACPI/runtime regions
     let (heap_base, randomized, validated) =
@@ -880,6 +883,33 @@ fn rdrand_supported_early() -> bool {
         );
     }
     (ecx & (1 << 30)) != 0
+}
+
+/// F9 (review D4): record the firmware-table ranges of the boot memory map.
+fn record_firmware_ranges(boot_info: &BootInfo) {
+    let map_info = &boot_info.memory_map;
+    let Some(desc_count) = validate_memory_map(map_info) else {
+        return;
+    };
+    for i in 0..desc_count {
+        let Some(offset) = i.checked_mul(map_info.descriptor_size) else {
+            return;
+        };
+        let Some(addr) = map_info.buffer.checked_add(offset as u64) else {
+            return;
+        };
+        // SAFETY: validate_memory_map proved every descriptor prefix fits.
+        let desc = unsafe { core::ptr::read_unaligned(addr as *const EfiMemoryDescriptor) };
+        if !crate::firmware::is_firmware_table_range(desc.typ, desc.attribute) {
+            continue;
+        }
+        let Some(bytes) = desc.page_count.checked_mul(PAGE_SIZE) else {
+            continue;
+        };
+        if let Some(end) = desc.phys_start.checked_add(bytes) {
+            crate::firmware::record_firmware_range(desc.phys_start, end);
+        }
+    }
 }
 
 /// 从 BootInfo 选择最大的可用内存区域
