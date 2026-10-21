@@ -220,4 +220,24 @@ for history and generated release notes.
 Commits are **manual** — repository automation never commits or pushes contributor
 code.
 
+---
+
+## 8. Licensing
+
+Nilix is licensed per component; [COPYRIGHT](COPYRIGHT) maps every path to one license:
+
+| Component | License |
+| --- | --- |
+| Kernel, bootloader and the rest of the Rust code | Apache-2.0 |
+| GNU-related code: C programs built with GCC/musl-gcc, and the Makefile | GPL-3.0-or-later |
+| Test, stress, fuzz and CI scaffolding | AGPL-3.0-or-later |
+| Documentation and images | CC-BY-4.0 |
+
+Unless you explicitly state otherwise, a contribution you intentionally submit for
+inclusion is licensed under the license that COPYRIGHT assigns to the files it
+changes, without any additional terms or conditions. A new file takes the license of
+the rule its path matches; if no rule fits, say so in the pull request so that
+COPYRIGHT can be updated in the same change. New crates set the matching SPDX
+expression in the `license` field of their `Cargo.toml`.
+
 Welcome aboard, and thanks for helping make Nilix better.

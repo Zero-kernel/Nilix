@@ -1,0 +1,72 @@
+Nilix is licensed per component, in the manner of the Rust project's COPYRIGHT
+file. Each file is covered by exactly one of the licenses below, chosen by the
+first rule in this list that matches its path. Copyright 2025-2026 the Nilix
+contributors.
+
+The full license texts are in this directory:
+
+  Apache-2.0         LICENSE-APACHE   Apache License, Version 2.0
+  GPL-3.0-or-later   LICENSE-GPL      GNU General Public License, version 3
+                                      or (at your option) any later version
+  AGPL-3.0-or-later  LICENSE-AGPL     GNU Affero General Public License,
+                                      version 3 or (at your option) any later
+                                      version
+  CC-BY-4.0          LICENSE-CC-BY    Creative Commons Attribution 4.0
+                                      International
+
+
+1. License texts
+   The LICENSE-* files are the licenses themselves and carry their own terms.
+
+2. Documentation and images: CC-BY-4.0
+   - every Markdown file (*.md), wherever it is
+   - everything under docs/, including the logo and diagrams in docs/assets/
+
+3. GNU-related code: GPL-3.0-or-later
+   Code written against GNU interfaces or tooling:
+   - every C source file (*.c): the guest test, stress and fuzz programs in
+     userspace/ and the host probe in kernel/tests/, built with GCC or
+     musl-gcc
+   - the top-level Makefile (GNU Make)
+   - the prebuilt images built from those C sources:
+     kernel/src/musl_test.elf, kernel/src/clone_test.elf,
+     kernel/src/fuzz_runner.elf, kernel/src/nilix_syz_executor.elf and every
+     userspace/*.elf
+   These images are statically linked with musl libc, which remains under its
+   own MIT license, and with parts of the GCC runtime, which remain under the
+   GCC Runtime Library Exception.
+
+4. Test, stress, fuzz and CI scaffolding: AGPL-3.0-or-later
+   - scripts/, fuzz/, tools/ and kernel/tests/
+   - userspace/fuzzer/ and userspace/nilix-syz-fuzzer/
+   - userspace/src/syscall_test.rs, userspace/fuzz_executor.rs,
+     userspace/syscall_fuzzer.rs and userspace/kcov_test.rs
+   - kernel/src/syscall_test.elf (built from userspace/src/syscall_test.rs)
+   - the test fixture disk-ext2.img
+   - .github/, .githooks/, .validation/, pytest.ini, requirements-ci.txt and
+     .coveragerc
+
+5. Everything else, including the kernel: Apache-2.0
+   - kernel/ (all kernel crates, kernel.ld, kernel/src/shell.elf and
+     kernel/src/hello.elf) and bootloader/
+   - the rest of userspace/ (the native libc helpers, shell and hello
+     programs, and userspace.ld)
+   - esp-kcov/kernel.elf
+   - the workspace files: Cargo.toml, Cargo.lock, rust-toolchain.toml,
+     rustfmt.toml, .gitignore and .gitattributes
+
+
+Kernel images built with a test feature (for example the syscall_test,
+musl_test or KCOV builds, including esp-kcov/kernel.elf) carry a guest program
+from rule 3 or 4 as a separate program that runs in Ring 3. Each part keeps its
+own license.
+
+CODE_OF_CONDUCT.md is adapted from the Contributor Covenant, which is licensed
+under CC-BY-4.0; its attribution is kept in that file.
+
+Third-party Rust crates are fetched by Cargo and are not part of this
+repository; each is covered by its own license.
+
+Unless you explicitly state otherwise, a contribution you intentionally submit
+for inclusion in Nilix is licensed under the license that the rules above
+assign to the files it changes, without any additional terms or conditions.

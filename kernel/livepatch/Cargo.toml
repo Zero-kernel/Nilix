@@ -2,6 +2,7 @@
 name = "livepatch"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Zero-OS G.2 live patching: INT3 detour + signature verification"
 
 [lib]

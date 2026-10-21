@@ -2,6 +2,7 @@
 name = "crypto"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Shared cryptographic primitives for Zero-OS kernel (no_std)"
 
 [lib]

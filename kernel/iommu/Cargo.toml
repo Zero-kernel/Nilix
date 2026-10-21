@@ -2,6 +2,7 @@
 name = "iommu"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "IOMMU/VT-d support for DMA isolation"
 
 [lib]
