@@ -2,7 +2,10 @@
 //!
 //! Provides /proc virtual filesystem with process information:
 //! - /proc/self - Symlink to current process directory
-//! - /proc/[pid]/ - Per-process directory
+//! - /proc/thread-self - Symlink to the calling task's `<tgid>/task/<tid>`
+//! - /proc/[pid]/ - Per-process directory (listed for thread-group leaders;
+//!   any task id resolves)
+//! - /proc/[pid]/task/[tid]/ - Per-task directories of pid's thread group
 //! - /proc/[pid]/status - Process status
 //! - /proc/[pid]/cmdline - Command line
 //! - /proc/[pid]/stat - Process statistics
@@ -189,6 +192,40 @@ impl FileSystem for ProcFs {
                 attached: true,
             }));
         }
+        // GAP-5 G8: /proc/[pid]/task → /proc/[pid]
+        if let Some(directory) = inode.as_any().downcast_ref::<ProcPidTaskDirInode>() {
+            if validate_proc_identity_binding(&directory.identity).is_none() {
+                return Err(FsError::NotFound);
+            }
+            let parent = try_new_procfs_arc(|charge| ProcPidDirInode {
+                fs_id: self.fs_id,
+                identity: directory.identity.clone(),
+                _heap_charge: Some(charge),
+            })?;
+            return Ok(Some(crate::traits::DirectoryParent {
+                inode: parent,
+                name: crate::types::try_dirent_name("task")?,
+                attached: true,
+            }));
+        }
+        // GAP-5 G8: /proc/[pid]/task/[tid] → /proc/[pid]/task
+        if let Some(directory) = inode.as_any().downcast_ref::<ProcTaskTidDirInode>() {
+            if validate_proc_identity_binding(&directory.task).is_none()
+                || validate_proc_identity_binding(&directory.group).is_none()
+            {
+                return Err(FsError::NotFound);
+            }
+            let parent = try_new_procfs_arc(|charge| ProcPidTaskDirInode {
+                fs_id: self.fs_id,
+                identity: directory.group.clone(),
+                _heap_charge: Some(charge),
+            })?;
+            return Ok(Some(crate::traits::DirectoryParent {
+                inode: parent,
+                name: crate::types::try_dirent_name_from_u64(directory.task.display_pid as u64)?,
+                attached: true,
+            }));
+        }
         Err(FsError::NotDir)
     }
     fn fs_id(&self) -> u64 {
@@ -229,6 +266,19 @@ impl FileSystem for ProcFs {
             return fd_dir.lookup_child(name);
         }
 
+        // GAP-5 G8: /proc/[pid]/task and /proc/[pid]/task/[tid]
+        if let Some(task_dir) = parent.as_any().downcast_ref::<ProcPidTaskDirInode>() {
+            return task_dir.lookup_child(name);
+        }
+        if let Some(tid_dir) = parent.as_any().downcast_ref::<ProcTaskTidDirInode>() {
+            return task_entry_lookup(self.fs_id, &tid_dir.task, name);
+        }
+
+        // Traverse /proc/thread-self/<...> like /proc/self above.
+        if let Some(link) = parent.as_any().downcast_ref::<ProcThreadSelfSymlink>() {
+            return task_entry_lookup(self.fs_id, &link.identity, name);
+        }
+
         Err(FsError::NotFound)
     }
 }
@@ -247,10 +297,35 @@ impl ProcRootInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         match name {
             "self" => {
-                let identity = bind_current_proc_identity(get_current_pid())?;
+                // GAP-5 G8: Linux `/proc/self` names the caller's thread group
+                // (getpid()), not the calling thread. A leader that cannot be
+                // bound (already a zombie, or refused by DAC) falls back to the
+                // calling task itself.
+                let current = get_current_pid();
+                let identity = match current_group_leader_pid() {
+                    Some(leader) => bind_current_proc_identity(leader)
+                        .or_else(|_| bind_current_proc_identity(current))?,
+                    None => bind_current_proc_identity(current)?,
+                };
                 Ok(try_new_procfs_arc(|charge| ProcSelfSymlink {
                     fs_id: self.fs_id,
                     identity,
+                    _heap_charge: Some(charge),
+                })?)
+            }
+            "thread-self" => {
+                let identity = bind_current_proc_identity(get_current_pid())?;
+                let task = validate_proc_identity_binding(&identity).ok_or(FsError::NotFound)?;
+                let group_display = task_group_fields(&identity, &task)?.ns_tgid;
+                drop(task);
+                let group_display = u32::try_from(group_display)
+                    .ok()
+                    .filter(|&id| id != 0)
+                    .ok_or(FsError::NotFound)?;
+                Ok(try_new_procfs_arc(|charge| ProcThreadSelfSymlink {
+                    fs_id: self.fs_id,
+                    identity,
+                    group_display,
                     _heap_charge: Some(charge),
                 })?)
             }
@@ -339,7 +414,8 @@ impl Inode for ProcRootInode {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
-        // Static entries
+        // Static entries. `thread-self` is last so the older entries keep
+        // their offsets and inode numbers (offset + 2).
         let static_entries = [
             "self",
             "meminfo",
@@ -348,11 +424,12 @@ impl Inode for ProcRootInode {
             "version",
             "waitstat",
             "schedstat",
+            "thread-self",
         ];
 
         if offset < static_entries.len() {
             let name = static_entries[offset];
-            let file_type = if name == "self" {
+            let file_type = if matches!(name, "self" | "thread-self") {
                 FileType::Symlink
             } else {
                 FileType::Regular
@@ -371,6 +448,8 @@ impl Inode for ProcRootInode {
         }
 
         // R31-1 FIX: List PIDs filtered by access control (self/root/same owner/gid)
+        // GAP-5 G8: only thread-group leaders are listed; other task ids stay
+        // reachable by lookup and are listed under /proc/<pid>/task.
         let pids = list_pids()?;
         let pid_offset = offset - static_entries.len();
 
@@ -513,8 +592,140 @@ impl Inode for ProcSelfSymlink {
 }
 
 // ============================================================================
+// /proc/thread-self Symlink (GAP-5 G8)
+// ============================================================================
+
+/// `/proc/thread-self` → `<tgid>/task/<tid>` for the calling task, both ids
+/// in the caller's PID namespace.
+struct ProcThreadSelfSymlink {
+    fs_id: u64,
+    /// The calling task.
+    identity: ProcIdentity,
+    /// Its thread group's id, captured with `identity` in the same view.
+    group_display: u32,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl ProcThreadSelfSymlink {
+    fn target(&self) -> Result<AdmittedString, FsError> {
+        try_format_content(format_args!(
+            "{}/task/{}",
+            self.group_display, self.identity.display_pid
+        ))
+    }
+}
+
+impl Inode for ProcThreadSelfSymlink {
+    fn ino(&self) -> u64 {
+        // Offset 7 of the /proc root listing (offset + 2).
+        9
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        let target = self.target()?;
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino(),
+            mode: FileMode::new(FileType::Symlink, 0o777),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: target.len() as u64,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        _flags: OpenFlags,
+        _prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        Err(FsError::Invalid)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let target = self.target()?;
+        read_from_content(&target, offset, buf)
+    }
+
+    fn is_dir(&self) -> bool {
+        false
+    }
+
+    fn is_symlink(&self) -> bool {
+        true
+    }
+
+    fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        // Same contract as /proc/self: revalidate, then list the task entries.
+        if validate_proc_identity(&self.identity).is_none() {
+            return Err(FsError::PermDenied);
+        }
+        pid_dir_readdir(
+            task_tid_dir_ino(self.group_display, self.identity.display_pid),
+            &TASK_TID_DIR_ENTRIES,
+            offset,
+        )
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
 // /proc/[pid]/ Directory
 // ============================================================================
+
+/// Entries of /proc/[pid]/. `task` is last so the older entries keep their
+/// offsets.
+const PID_DIR_ENTRIES: [&str; 8] = [
+    "status", "cmdline", "stat", "maps", "uid_map", "gid_map", "fd", "task",
+];
+
+/// Entries of /proc/[pid]/task/[tid]/: the per-pid entries without `task`,
+/// as on Linux.
+const TASK_TID_DIR_ENTRIES: [&str; 7] = [
+    "status", "cmdline", "stat", "maps", "uid_map", "gid_map", "fd",
+];
+
+/// One fixed entry of a per-pid or per-task directory.
+fn pid_dir_readdir(
+    dir_ino: u64,
+    entries: &[&str],
+    offset: usize,
+) -> Result<Option<(usize, DirEntry)>, FsError> {
+    let Some(&name) = entries.get(offset) else {
+        return Ok(None);
+    };
+    let file_type = if matches!(name, "fd" | "task") {
+        FileType::Directory
+    } else {
+        FileType::Regular
+    };
+    Ok(Some((
+        offset + 1,
+        DirEntry {
+            // R186-8: bounded is not fallible (see the /proc root readdir).
+            name: crate::types::try_dirent_name(name)?,
+            ino: dir_ino.wrapping_mul(10).wrapping_add(offset as u64),
+            file_type,
+        },
+    )))
+}
 
 struct ProcPidDirInode {
     fs_id: u64,
@@ -571,6 +782,11 @@ impl ProcPidDirInode {
                 _heap_charge: Some(charge),
             })?),
             "fd" => Ok(try_new_procfs_arc(|charge| ProcPidFdDirInode {
+                fs_id: self.fs_id,
+                identity: self.identity.clone(),
+                _heap_charge: Some(charge),
+            })?),
+            "task" => Ok(try_new_procfs_arc(|charge| ProcPidTaskDirInode {
                 fs_id: self.fs_id,
                 identity: self.identity.clone(),
                 _heap_charge: Some(charge),
@@ -641,29 +857,7 @@ impl Inode for ProcPidDirInode {
         if validate_proc_identity_for_id_map(&self.identity).is_none() {
             return Err(FsError::PermDenied);
         }
-        let entries = [
-            "status", "cmdline", "stat", "maps", "uid_map", "gid_map", "fd",
-        ];
-
-        if offset < entries.len() {
-            let name = entries[offset];
-            let file_type = if name == "fd" {
-                FileType::Directory
-            } else {
-                FileType::Regular
-            };
-            return Ok(Some((
-                offset + 1,
-                DirEntry {
-                    // R186-8: bounded is not fallible (see the /proc root readdir).
-                    name: crate::types::try_dirent_name(name)?,
-                    ino: self.ino() * 10 + offset as u64,
-                    file_type,
-                },
-            )));
-        }
-
-        Ok(None)
+        pid_dir_readdir(self.ino(), &PID_DIR_ENTRIES, offset)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1294,6 +1488,230 @@ impl Inode for ProcPidFdSymlink {
 }
 
 // ============================================================================
+// /proc/[pid]/task/ and /proc/[pid]/task/[tid]/ (GAP-5 G8)
+// ============================================================================
+
+/// Inode numbers of the task directories sit at or above 2^48, clear of
+/// every older procfs number (below 2^32 for ids under `PID_MAX`), so a task
+/// directory never shares an inode number with a pid directory or file.
+const TASK_DIR_INO_BASE: u64 = 1 << 48;
+const TASK_TID_DIR_INO_BASE: u64 = 2 << 48;
+
+fn task_dir_ino(group_display: u32) -> u64 {
+    TASK_DIR_INO_BASE | u64::from(group_display)
+}
+
+/// Task ids are below `PID_MAX` (2^15), so 24 bits per id keep the pair
+/// unique.
+fn task_tid_dir_ino(group_display: u32, tid_display: u32) -> u64 {
+    TASK_TID_DIR_INO_BASE | (u64::from(group_display) << 24) | u64::from(tid_display)
+}
+
+/// /proc/[pid]/task: one directory per live member of pid's thread group.
+struct ProcPidTaskDirInode {
+    fs_id: u64,
+    /// The task named by [pid]; any member names the same group.
+    identity: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl ProcPidTaskDirInode {
+    fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+        let group = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let ns_tid: u32 = name.parse().map_err(|_| FsError::NotFound)?;
+        // The binding re-checks DAC and the viewer namespace for the member
+        // itself, exactly as a /proc/[tid] lookup does.
+        let task = bind_named_proc_identity(ns_tid)?;
+        let bound = validate_proc_identity_binding(&task).ok_or(FsError::NotFound)?;
+        // Membership is the identity of the shared group object; a tgid
+        // number alone could name a recycled group.
+        if !same_thread_group(&group, &bound) {
+            return Err(FsError::NotFound);
+        }
+        drop(bound);
+        drop(group);
+        Ok(try_new_procfs_arc(|charge| ProcTaskTidDirInode {
+            fs_id: self.fs_id,
+            group: self.identity.clone(),
+            task,
+            _heap_charge: Some(charge),
+        })?)
+    }
+}
+
+impl Inode for ProcPidTaskDirInode {
+    fn ino(&self) -> u64 {
+        task_dir_ino(self.identity.display_pid)
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process)?;
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino(),
+            mode: FileMode::directory(0o555),
+            nlink: 2,
+            uid,
+            gid,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
+    }
+
+    fn is_dir(&self) -> bool {
+        true
+    }
+
+    fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        let process = validate_proc_identity(&self.identity).ok_or(FsError::PermDenied)?;
+        // Snapshot per call, as the /proc root listing does: the cookie is
+        // an index into the leader-first member order.
+        let mut members = AdmittedVec::new(HeapClass::Procfs);
+        scan_thread_group(
+            &process,
+            self.identity.viewer_ns.as_ref(),
+            Some(&mut members),
+        )?;
+        drop(process);
+        order_task_members(members.as_mut_slice());
+        let Some(member) = members.get(offset).copied() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            offset + 1,
+            DirEntry {
+                name: crate::types::try_dirent_name_from_u64(member.display_tid as u64)?,
+                ino: task_tid_dir_ino(self.identity.display_pid, member.display_tid),
+                file_type: FileType::Directory,
+            },
+        )))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// /proc/[pid]/task/[tid]: the per-pid files, describing thread [tid].
+struct ProcTaskTidDirInode {
+    fs_id: u64,
+    /// The directory this one was found in (its `..`).
+    group: ProcIdentity,
+    /// The member this directory describes.
+    task: ProcIdentity,
+    _heap_charge: Option<HeapCharge>,
+}
+
+/// Look up one per-task file of `task` through the per-pid implementation;
+/// a task directory has no nested `task` directory.
+fn task_entry_lookup(
+    fs_id: u64,
+    task: &ProcIdentity,
+    name: &str,
+) -> Result<Arc<dyn Inode>, FsError> {
+    if !TASK_TID_DIR_ENTRIES.contains(&name) {
+        return Err(FsError::NotFound);
+    }
+    let alias_dir = ProcPidDirInode {
+        fs_id,
+        identity: task.clone(),
+        _heap_charge: None,
+    };
+    alias_dir.lookup_child(name)
+}
+
+impl Inode for ProcTaskTidDirInode {
+    fn ino(&self) -> u64 {
+        task_tid_dir_ino(self.group.display_pid, self.task.display_pid)
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        // As /proc/[pid]: traversal to uid_map/gid_map stats this directory
+        // under the narrowly-scoped map validator.
+        let process = validate_proc_identity_for_id_map(&self.task).ok_or(FsError::PermDenied)?;
+        let (uid, gid) = get_process_owner(&process)?;
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino(),
+            mode: FileMode::directory(0o555),
+            nlink: 2,
+            uid,
+            gid,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
+    }
+
+    fn is_dir(&self) -> bool {
+        true
+    }
+
+    fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        if validate_proc_identity_for_id_map(&self.task).is_none() {
+            return Err(FsError::PermDenied);
+        }
+        pid_dir_readdir(self.ino(), &TASK_TID_DIR_ENTRIES, offset)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
 // /proc/meminfo
 // ============================================================================
 
@@ -1845,7 +2263,7 @@ fn bind_proc_identity(
     if !ordinary_access && id_map_parent.is_none() {
         return Err(FsError::PermDenied);
     }
-    let (generation, display_pid, state) = {
+    let (generation, display_pid, visible) = {
         let target = process.lock();
         let display_pid = match viewer_ns.as_ref() {
             Some(ns) => target
@@ -1856,9 +2274,9 @@ fn bind_proc_identity(
                 .ok_or(FsError::NotFound)?,
             None => pid,
         };
-        (target.generation, display_pid, target.state)
+        (target.generation, display_pid, proc_task_visible(&target))
     };
-    if matches!(state, ProcessState::Zombie | ProcessState::Terminated) {
+    if !visible {
         return Err(FsError::NotFound);
     }
     if expected_display_pid
@@ -1910,12 +2328,7 @@ fn validate_proc_identity_binding(identity: &ProcIdentity) -> Option<BoundProces
     }
     let namespace_matches = {
         let target = process.lock();
-        if target.generation != identity.generation
-            || matches!(
-                target.state,
-                ProcessState::Zombie | ProcessState::Terminated
-            )
-        {
+        if target.generation != identity.generation || !proc_task_visible(&target) {
             return None;
         }
         match identity.viewer_ns.as_ref() {
@@ -2097,7 +2510,12 @@ fn list_pids() -> Result<AdmittedVec<u32>, FsError> {
             continue;
         };
         let p = proc_arc.lock();
-        if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+        if !proc_task_visible(&p) {
+            continue;
+        }
+        // GAP-5 G8: as on Linux, readdir of /proc lists thread-group leaders
+        // only; a non-leader task id stays reachable by lookup.
+        if !is_thread_group_leader(p.pid, p.tgid) {
             continue;
         }
         if caller_ns
@@ -2111,6 +2529,242 @@ fn list_pids() -> Result<AdmittedVec<u32>, FsError> {
             .map_err(|_| FsError::NoSpace)?;
     }
     Ok(snapshot)
+}
+
+// ============================================================================
+// GAP-5 G8: thread-group membership for /proc/[pid]/task and Threads:
+// ============================================================================
+
+/// GAP-5 G8: whether procfs shows a task. A zombie is hidden, except a group
+/// leader whose group still has live threads: as on Linux, its id keeps naming
+/// the process (the kernel keeps its PID-namespace identity until then). A
+/// task still being created is hidden too, as Linux attaches a new task's ids
+/// only when it is complete.
+fn proc_task_visible(task: &kernel_core::process::Process) -> bool {
+    match task.state {
+        ProcessState::Provisioning | ProcessState::Terminated => false,
+        ProcessState::Zombie => {
+            is_thread_group_leader(task.pid, task.tgid) && task.thread_group.live() > 0
+        }
+        _ => true,
+    }
+}
+
+/// A task is listed in /proc when it leads its thread group.
+fn is_thread_group_leader(pid: usize, tgid: usize) -> bool {
+    pid == tgid
+}
+
+/// One live member of a thread group, named for one procfs viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskMember {
+    /// Global (kernel) task id.
+    tid: u32,
+    /// Task id in the viewer's PID namespace.
+    display_tid: u32,
+    /// The member leads the group (`tgid == pid`).
+    leader: bool,
+}
+
+/// Group-wide facts gathered by one `scan_thread_group` pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ThreadGroupFacts {
+    /// Members procfs shows (`proc_task_visible`): the live ones, and a
+    /// zombie leader while its group has live threads, which Linux still
+    /// lists and counts.
+    live: usize,
+    /// Global pid of the leader's parent while the leader is in the table
+    /// (a zombie leader stays there until its group is empty).
+    leader_ppid: Option<usize>,
+    /// The leader's id in the viewer's namespace while its PID chain is
+    /// attached (the chain is detached when the leader exits).
+    leader_display: Option<u32>,
+}
+
+/// Scan PROCESS_TABLE once for the members of `bound`'s thread group.
+///
+/// Lock order is PROCESS_TABLE, then one PCB at a time; no PCB lock is held
+/// when PROCESS_TABLE is taken. A task is a member iff its `thread_group` is
+/// the same `Arc` as `bound`'s (a tgid is a reusable number). The scan covers
+/// at most the table length (`PID_MAX`). When `members` is given it receives
+/// every live member visible in `viewer_ns`, in table (global id) order. Its
+/// capacity is reserved, fallibly and before PROCESS_TABLE is taken, from the
+/// group's reference count: every member PCB holds one reference, so the
+/// count bounds the member PCBs. A group that grows before the scan only
+/// makes the push below grow the vector, still fallibly.
+fn scan_thread_group(
+    bound: &BoundProcess,
+    viewer_ns: Option<&kernel_core::PidNamespaceArc>,
+    mut members: Option<&mut AdmittedVec<TaskMember>>,
+) -> Result<ThreadGroupFacts, FsError> {
+    if let Some(out) = members.as_deref_mut() {
+        let references = Arc::strong_count(&bound.lock().thread_group);
+        out.try_reserve_exact(references.min(process::PID_MAX))
+            .map_err(|_| FsError::NoSpace)?;
+    }
+    let table = PROCESS_TABLE.lock();
+    // Read under PROCESS_TABLE: the CLONE_THREAD commit installs a new
+    // member's group while holding it.
+    let group = Arc::clone(&bound.lock().thread_group);
+    let mut facts = ThreadGroupFacts::default();
+    for (pid, slot) in table.iter().enumerate().skip(1) {
+        let Some(task) = slot.as_ref() else {
+            continue;
+        };
+        let task = task.lock();
+        if !Arc::ptr_eq(&task.thread_group, &group) {
+            continue;
+        }
+        let display = match viewer_ns {
+            Some(ns) => task
+                .pid_ns_chain
+                .iter()
+                .find(|membership| Arc::ptr_eq(&membership.ns, ns))
+                .and_then(|membership| u32::try_from(membership.pid).ok()),
+            None => u32::try_from(pid).ok(),
+        };
+        let leader = is_thread_group_leader(task.pid, task.tgid);
+        if leader {
+            facts.leader_ppid = Some(task.ppid);
+            facts.leader_display = display;
+        }
+        if !proc_task_visible(&task) {
+            continue;
+        }
+        facts.live += 1;
+        if let (Some(out), Some(display_tid)) = (members.as_deref_mut(), display) {
+            let member = TaskMember {
+                tid: u32::try_from(pid).map_err(|_| FsError::Invalid)?,
+                display_tid,
+                leader,
+            };
+            // Normally within the reservation; any growth stays fallible.
+            out.try_push(member).map_err(|_| FsError::NoSpace)?;
+        }
+    }
+    drop(table);
+    drop(group);
+    Ok(facts)
+}
+
+/// Order a task listing as Linux does: the leader first, then the other
+/// members in their existing (table) order.
+fn order_task_members(members: &mut [TaskMember]) {
+    if let Some(leader) = members.iter().position(|member| member.leader) {
+        members[..=leader].rotate_right(1);
+    }
+}
+
+/// Whether two bound tasks share one thread group (`Arc` identity). The two
+/// PCB locks are taken one after the other, never nested.
+fn same_thread_group(a: &BoundProcess, b: &BoundProcess) -> bool {
+    let group = Arc::clone(&a.lock().thread_group);
+    let same = Arc::ptr_eq(&b.lock().thread_group, &group);
+    drop(group);
+    same
+}
+
+/// The group-derived identity of one task as its procfs viewer sees it. On
+/// Linux a thread's Tgid is its group's id, its PPid is the group leader's
+/// parent, and `Threads:` (stat field 20) counts the group's live members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskGroupFields {
+    /// Thread-group id in the viewer's namespace (0 if it has no name there).
+    ns_tgid: usize,
+    /// The group's parent in the viewer's namespace (0 if none or hidden).
+    ns_ppid: usize,
+    /// Live members of the group.
+    threads: usize,
+}
+
+fn task_group_fields(
+    identity: &ProcIdentity,
+    bound: &BoundProcess,
+) -> Result<TaskGroupFields, FsError> {
+    let viewer = identity.viewer_ns.as_ref();
+    let (tgid, pid, own_ppid, cached_ns_tgid, owned_by_viewer, alone) = {
+        let task = bound.lock();
+        let owned_by_viewer = match (viewer, task.pid_ns_chain.last()) {
+            (Some(ns), Some(owning)) => Arc::ptr_eq(ns, &owning.ns),
+            _ => false,
+        };
+        (
+            task.tgid,
+            task.pid,
+            task.ppid,
+            task.ns_tgid,
+            owned_by_viewer,
+            // Each member PCB holds one reference to the group, so a count
+            // of one proves no other task shares it; every single-threaded
+            // process takes this path and skips the table scan.
+            Arc::strong_count(&task.thread_group) == 1,
+        )
+    };
+    let leader = is_thread_group_leader(pid, tgid);
+    let (threads, group_ppid, leader_display) = if alone {
+        (1, own_ppid, None)
+    } else {
+        let facts = scan_thread_group(bound, viewer, None)?;
+        // A thread is outside the process tree (ppid 0); its group's parent
+        // is the leader's.
+        let group_ppid = if leader {
+            own_ppid
+        } else {
+            facts.leader_ppid.unwrap_or(own_ppid)
+        };
+        (facts.live, group_ppid, facts.leader_display)
+    };
+    // PID-namespace lookups run with no PROCESS_TABLE or PCB lock held.
+    let ns_tgid = match viewer {
+        None => tgid,
+        Some(_) if leader => identity.display_pid as usize,
+        Some(ns) => leader_display
+            .map(|id| id as usize)
+            // G5 cache: the group id in the thread's own namespace.
+            .or_else(|| (owned_by_viewer && cached_ns_tgid != 0).then_some(cached_ns_tgid))
+            .or_else(|| kernel_core::pid_in_namespace(ns, tgid))
+            .unwrap_or(0),
+    };
+    let ns_ppid = match viewer {
+        Some(ns) => kernel_core::pid_in_namespace(ns, group_ppid).unwrap_or(0),
+        None => group_ppid,
+    };
+    Ok(TaskGroupFields {
+        ns_tgid,
+        ns_ppid,
+        threads,
+    })
+}
+
+/// The global pid `/proc/self` should name for a non-leader caller: its
+/// group's leader while that is still a live task of the caller's group.
+/// `None` for a leader (it names itself) or when no live leader remains.
+fn current_group_leader_pid() -> Option<u32> {
+    let table = PROCESS_TABLE.lock();
+    let current = process::current_pid()?;
+    let task = table.get(current)?.as_ref()?;
+    let (tgid, pid, group) = {
+        let task = task.lock();
+        (task.tgid, task.pid, Arc::clone(&task.thread_group))
+    };
+    if is_thread_group_leader(pid, tgid) {
+        return None;
+    }
+    let leader = table.get(tgid)?.as_ref()?;
+    let live_leader = {
+        let leader = leader.lock();
+        leader.pid == tgid
+            && is_thread_group_leader(leader.pid, leader.tgid)
+            && Arc::ptr_eq(&leader.thread_group, &group)
+            && proc_task_visible(&leader)
+    };
+    drop(table);
+    drop(group);
+    if live_leader {
+        u32::try_from(tgid).ok()
+    } else {
+        None
+    }
 }
 
 /// Get process owner (uid, gid)
@@ -2228,9 +2882,6 @@ fn generate_status(
         umask: u16,
         state_char: char,
         state_name: &'static str,
-        tgid: usize,
-        pid_val: usize,
-        ppid: usize,
         uid: u32,
         euid: u32,
         gid: u32,
@@ -2256,31 +2907,17 @@ fn generate_status(
             umask: process.fs.umask(),
             state_char,
             state_name,
-            tgid: process.tgid,
-            pid_val: process.pid,
-            ppid: process.ppid,
             uid: creds.uid,
             euid: creds.euid,
             gid: creds.gid,
             egid: creds.egid,
         }
     };
+    // GAP-5 G8: Tgid, PPid and Threads describe the task's thread group.
+    let group = task_group_fields(identity, bound)?;
 
     {
         let s = snap;
-        let (ns_tgid, ns_ppid) = if let Some(ref ns) = identity.viewer_ns {
-            (
-                if s.tgid == s.pid_val {
-                    identity.display_pid as usize
-                } else {
-                    kernel_core::pid_in_namespace(ns, s.tgid).unwrap_or(0)
-                },
-                kernel_core::pid_in_namespace(ns, s.ppid).unwrap_or(0),
-            )
-        } else {
-            (s.tgid, s.ppid)
-        };
-
         let mut output = AdmittedString::new(HeapClass::Procfs);
         write!(
             &mut output,
@@ -2292,14 +2929,14 @@ fn generate_status(
                  PPid:\t{}\n\
                  Uid:\t{}\t{}\t{}\t{}\n\
                  Gid:\t{}\t{}\t{}\t{}\n\
-                 Threads:\t1\n",
+                 Threads:\t{}\n",
             s.name,
             s.umask,
             s.state_char,
             s.state_name,
-            ns_tgid,
+            group.ns_tgid,
             identity.display_pid,
-            ns_ppid,
+            group.ns_ppid,
             s.uid,
             s.euid,
             s.uid,
@@ -2308,6 +2945,7 @@ fn generate_status(
             s.egid,
             s.gid,
             s.gid,
+            group.threads,
         )
         .map_err(|_| FsError::NoSpace)?;
         Ok(output)
@@ -2330,7 +2968,6 @@ fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> Result<Admitt
             ProcessState::Provisioning | ProcessState::Blocked | ProcessState::Sleeping => 'S',
         };
         (
-            process.ppid,
             AdmittedString::try_from_str(HeapClass::Procfs, process.name.as_str())
                 .map_err(|_| FsError::NoSpace)?,
             state_char,
@@ -2338,28 +2975,64 @@ fn generate_stat(identity: &ProcIdentity, bound: &BoundProcess) -> Result<Admitt
         )
     };
 
-    let (raw_ppid, name, state_char, priority) = snapshot;
-
-    let ns_ppid = if let Some(ref ns) = identity.viewer_ns {
-        kernel_core::pid_in_namespace(ns, raw_ppid).unwrap_or(0)
-    } else {
-        raw_ppid
-    };
+    let (name, state_char, priority) = snapshot;
+    // GAP-5 G8: the parent, process group and num_threads of a thread are
+    // its group's.
+    let group = task_group_fields(identity, bound)?;
 
     let mut output = AdmittedString::new(HeapClass::Procfs);
-    write!(
+    write_stat_line(
         &mut output,
-        "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        identity.display_pid,
-        name,
-        state_char,
-        ns_ppid,
-        identity.display_pid,
-        identity.display_pid,
-        priority,
+        &StatLine {
+            pid: identity.display_pid as usize,
+            comm: name.as_str(),
+            state: state_char,
+            ppid: group.ns_ppid,
+            pgrp: group.ns_tgid,
+            session: group.ns_tgid,
+            priority,
+            num_threads: group.threads,
+        },
     )
     .map_err(|_| FsError::NoSpace)?;
     Ok(output)
+}
+
+/// The fields of one proc(5) `/proc/[pid]/stat` line this kernel tracks.
+struct StatLine<'a> {
+    pid: usize,
+    comm: &'a str,
+    state: char,
+    ppid: usize,
+    pgrp: usize,
+    session: usize,
+    priority: u8,
+    num_threads: usize,
+}
+
+/// Fields 21..=52 of proc(5) (itrealvalue .. exit_code); none is tracked.
+const STAT_UNTRACKED_TAIL_FIELDS: usize = 32;
+
+/// Write one 52-field Linux stat line. Untracked fields are 0 (tpgid -1).
+/// Fields 1-20: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt
+/// cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads.
+fn write_stat_line(out: &mut impl Write, line: &StatLine<'_>) -> core::fmt::Result {
+    write!(
+        out,
+        "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 {} 0 {}",
+        line.pid,
+        line.comm,
+        line.state,
+        line.ppid,
+        line.pgrp,
+        line.session,
+        line.priority,
+        line.num_threads,
+    )?;
+    for _ in 0..STAT_UNTRACKED_TAIL_FIELDS {
+        out.write_str(" 0")?;
+    }
+    out.write_char('\n')
 }
 
 /// R117-2 FIX: Maximum number of mmap entries to emit in /proc/[pid]/maps.
@@ -2780,5 +3453,292 @@ mod id_map_tests {
         drop(target);
         drop(other);
         drop(child_user_ns);
+    }
+}
+
+#[cfg(test)]
+mod thread_listing_tests {
+    use super::*;
+    use crate::HEAP_TEST_LOCK as TEST_LOCK;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+    use kernel_core::process::{Process, ProcessNameSnapshot};
+
+    fn member(tid: u32, leader: bool) -> TaskMember {
+        TaskMember {
+            tid,
+            display_tid: tid,
+            leader,
+        }
+    }
+
+    #[test]
+    fn gap5_g8_task_listing_puts_the_leader_first() {
+        let mut members = [member(3, false), member(5, true), member(7, false)];
+        order_task_members(&mut members);
+        let expected = [member(5, true), member(3, false), member(7, false)];
+        assert_eq!(members, expected);
+        // A leader already first, or no live leader: table order is kept.
+        order_task_members(&mut members);
+        assert_eq!(members, expected);
+        let mut orphans = [member(3, false), member(7, false)];
+        order_task_members(&mut orphans);
+        assert_eq!(orphans, [member(3, false), member(7, false)]);
+        // Only a leader is listed in the /proc root.
+        assert!(is_thread_group_leader(5, 5));
+        assert!(!is_thread_group_leader(6, 5));
+        // Task-directory inode numbers never alias each other.
+        assert_ne!(task_tid_dir_ino(5, 6), task_tid_dir_ino(6, 5));
+        assert_ne!(task_dir_ino(5), task_tid_dir_ino(5, 5));
+    }
+
+    #[test]
+    fn gap5_g8_stat_line_reports_num_threads_as_field_20() {
+        let mut line = String::new();
+        write_stat_line(
+            &mut line,
+            &StatLine {
+                pid: 6,
+                comm: "worker",
+                state: 'S',
+                ppid: 1,
+                pgrp: 5,
+                session: 5,
+                priority: 120,
+                num_threads: 3,
+            },
+        )
+        .expect("stat line");
+        assert!(line.ends_with('\n'));
+        let fields: Vec<&str> = line.trim_end().split(' ').collect();
+        assert_eq!(fields.len(), 52, "proc(5) stat has 52 fields");
+        assert_eq!(fields[0], "6");
+        assert_eq!(fields[1], "(worker)");
+        assert_eq!(fields[2], "S");
+        assert_eq!(fields[3], "1", "field 4: ppid");
+        assert_eq!(fields[4], "5", "field 5: pgrp");
+        assert_eq!(fields[5], "5", "field 6: session");
+        assert_eq!(fields[7], "-1", "field 8: tpgid");
+        assert_eq!(fields[17], "120", "field 18: priority");
+        assert_eq!(fields[18], "0", "field 19: nice");
+        assert_eq!(fields[19], "3", "field 20: num_threads");
+    }
+
+    // lint-fallible-fn: INFALLIBLE-OK(hosted test helper; at most 512 bytes)
+    fn read_all(inode: &Arc<dyn Inode>) -> String {
+        let mut buf = [0u8; 512];
+        let len = inode.read_at(0, &mut buf).expect("procfs read");
+        String::from(core::str::from_utf8(&buf[..len]).expect("procfs text"))
+    }
+
+    // lint-fallible-fn: INFALLIBLE-OK(hosted test helper over a small fixture table)
+    fn names(dir: &Arc<dyn Inode>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while let Some((next, entry)) = dir.readdir(offset).expect("procfs readdir") {
+            assert!(next > offset, "readdir cookies advance");
+            out.push(entry.name);
+            offset = next;
+        }
+        out
+    }
+
+    #[test]
+    fn gap5_g8_root_lists_leaders_and_task_dir_lists_members() {
+        let _serial = TEST_LOCK.lock();
+        let root_user_ns = user_namespace::root_user_namespace();
+
+        // Four free consecutive slots: a leader, two threads of its group, and
+        // an unrelated task whose numeric tgid names the leader.
+        let base = {
+            let table = PROCESS_TABLE.lock();
+            (64..(64 + 256))
+                .find(|&base| {
+                    (base..base + 4).all(|pid| table.get(pid).is_none_or(Option::is_none))
+                })
+                .expect("free process-table slots for the thread-listing fixture")
+        };
+        let (leader_pid, thread_pid, second_pid, impostor_pid) =
+            (base, base + 1, base + 2, base + 3);
+        let pcb = |pid: usize, ppid: usize, name: &str| {
+            let process =
+                Process::try_new_pcb(pid, ppid, ProcessNameSnapshot::from_parts(name, ""), 120)
+                    .expect("thread-listing fixture pcb");
+            {
+                let mut guard = process.lock();
+                guard.state = ProcessState::Ready;
+                guard.user_ns = root_user_ns.clone();
+                guard.user_ns_for_children = root_user_ns.clone();
+            }
+            process
+        };
+        let leader = pcb(leader_pid, 1, "g8-leader");
+        let thread = pcb(thread_pid, 0, "g8-thread");
+        let second = pcb(second_pid, 0, "g8-second");
+        let impostor = pcb(impostor_pid, 1, "g8-impostor");
+        let group = Arc::clone(&leader.lock().thread_group);
+        for member in [&thread, &second] {
+            let mut guard = member.lock();
+            guard.tgid = leader_pid;
+            guard.is_thread = true;
+            guard.thread_group = Arc::clone(&group);
+        }
+        // Same tgid number, different group object: never a member.
+        impostor.lock().tgid = leader_pid;
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let needed = impostor_pid + 1;
+            if table.len() < needed {
+                let missing = needed - table.len();
+                table
+                    .try_reserve_exact(missing)
+                    .expect("process-table test capacity");
+                while table.len() < needed {
+                    table
+                        .push_reserved(None)
+                        .expect("reserved process-table test slot");
+                }
+            }
+            for (pid, process) in [
+                (leader_pid, &leader),
+                (thread_pid, &thread),
+                (second_pid, &second),
+                (impostor_pid, &impostor),
+            ] {
+                assert!(table[pid].is_none());
+                table[pid] = Some(process.clone());
+            }
+        }
+
+        process::set_current_pid(Some(leader_pid));
+        let fs = ProcFs::try_new().expect("procfs fixture");
+        let root = fs.root_inode();
+
+        // The root lists the leader, not its threads; a thread id resolves.
+        let listed = names(&root);
+        assert!(listed.contains(&leader_pid.to_string()));
+        assert!(!listed.contains(&thread_pid.to_string()));
+        assert!(!listed.contains(&second_pid.to_string()));
+        assert!(listed.iter().any(|name| name == "thread-self"));
+        let thread_dir = fs
+            .lookup(&root, &thread_pid.to_string())
+            .expect("a non-leader task id stays reachable by lookup");
+
+        // /proc/<pid>/task lists every live member, leader first; any
+        // member's directory names the same group.
+        let leader_dir = fs
+            .lookup(&root, &leader_pid.to_string())
+            .expect("leader directory");
+        assert!(names(&leader_dir).iter().any(|name| name == "task"));
+        let task_dir = fs.lookup(&leader_dir, "task").expect("task directory");
+        let all = [
+            leader_pid.to_string(),
+            thread_pid.to_string(),
+            second_pid.to_string(),
+        ];
+        assert_eq!(names(&task_dir), all);
+        let via_thread = fs.lookup(&thread_dir, "task").expect("thread's task dir");
+        assert_eq!(names(&via_thread), all);
+        assert!(matches!(
+            fs.lookup(&task_dir, &impostor_pid.to_string()),
+            Err(FsError::NotFound)
+        ));
+
+        // /proc/<pid>/task/<tid> describes the thread with group fields.
+        let tid_dir = fs
+            .lookup(&task_dir, &thread_pid.to_string())
+            .expect("per-task directory");
+        assert!(!names(&tid_dir).iter().any(|name| name == "task"));
+        assert!(matches!(
+            fs.lookup(&tid_dir, "task"),
+            Err(FsError::NotFound)
+        ));
+        let status = read_all(&fs.lookup(&tid_dir, "status").expect("task status"));
+        assert!(
+            status.contains(&format!("Tgid:\t{leader_pid}\n")),
+            "{status}"
+        );
+        assert!(
+            status.contains(&format!("Pid:\t{thread_pid}\n")),
+            "{status}"
+        );
+        assert!(status.contains("PPid:\t1\n"), "{status}");
+        assert!(status.contains("Threads:\t3\n"), "{status}");
+        let stat = read_all(&fs.lookup(&tid_dir, "stat").expect("task stat"));
+        let fields: Vec<&str> = stat.trim_end().split(' ').collect();
+        assert_eq!(fields[0], thread_pid.to_string());
+        assert_eq!(fields[3], "1");
+        assert_eq!(fields[4], leader_pid.to_string());
+        assert_eq!(fields[19], "3");
+        let leader_status = read_all(&fs.lookup(&leader_dir, "status").expect("status"));
+        assert!(leader_status.contains("Threads:\t3\n"), "{leader_status}");
+
+        // `..` walks back up the new directories.
+        let up = fs
+            .directory_parent(&tid_dir)
+            .expect("task entry parent")
+            .expect("attached");
+        assert_eq!(up.name, thread_pid.to_string());
+        assert_eq!(up.inode.ino(), task_dir.ino());
+        let up = fs
+            .directory_parent(&task_dir)
+            .expect("task dir parent")
+            .expect("attached");
+        assert_eq!(up.name, "task");
+        assert_eq!(up.inode.ino(), leader_dir.ino());
+
+        // From the thread, /proc/self names the group and thread-self the task.
+        process::set_current_pid(Some(thread_pid));
+        let self_link = fs.lookup(&root, "self").expect("self");
+        assert_eq!(read_all(&self_link), leader_pid.to_string());
+        let thread_self = fs.lookup(&root, "thread-self").expect("thread-self");
+        assert_eq!(
+            read_all(&thread_self),
+            format!("{leader_pid}/task/{thread_pid}")
+        );
+
+        // A zombie member leaves the listing and the count.
+        process::set_current_pid(Some(leader_pid));
+        second.lock().state = ProcessState::Zombie;
+        assert_eq!(
+            names(&task_dir),
+            [leader_pid.to_string(), thread_pid.to_string()]
+        );
+        let leader_status = read_all(&fs.lookup(&leader_dir, "status").expect("status"));
+        assert!(leader_status.contains("Threads:\t2\n"), "{leader_status}");
+
+        // A member still being created is neither listed nor reachable.
+        second.lock().state = ProcessState::Provisioning;
+        assert_eq!(
+            names(&task_dir),
+            [leader_pid.to_string(), thread_pid.to_string()]
+        );
+        assert!(matches!(
+            fs.lookup(&task_dir, &second_pid.to_string()),
+            Err(FsError::NotFound)
+        ));
+
+        // A zombie leader whose thread lives on stays listed and counted, as
+        // on Linux.
+        leader.lock().state = ProcessState::Zombie;
+        assert_eq!(
+            names(&task_dir),
+            [leader_pid.to_string(), thread_pid.to_string()]
+        );
+        let thread_status = read_all(&fs.lookup(&thread_dir, "status").expect("status"));
+        assert!(thread_status.contains("Threads:\t2\n"), "{thread_status}");
+        leader.lock().state = ProcessState::Ready;
+
+        process::set_current_pid(None);
+        drop((self_link, thread_self, up, tid_dir, via_thread, task_dir));
+        drop((leader_dir, thread_dir, root, fs));
+        let detached = {
+            let mut table = PROCESS_TABLE.lock();
+            [leader_pid, thread_pid, second_pid, impostor_pid].map(|pid| table[pid].take())
+        };
+        drop(detached);
+        drop(group);
+        drop((leader, thread, second, impostor));
     }
 }

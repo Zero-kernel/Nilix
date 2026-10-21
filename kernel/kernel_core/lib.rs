@@ -347,6 +347,11 @@ fn lsm_get_pid() -> Option<lsm::ProcessId> {
     current_pid()
 }
 
+/// GAP-5 G8: Adapter: current thread-group id for LSM subjects
+fn lsm_get_tgid() -> Option<lsm::ProcessId> {
+    process::current_tgid()
+}
+
 /// Adapter: Get current credentials for LSM
 fn lsm_get_credentials() -> Option<lsm::Credentials> {
     current_credentials().map(|c| lsm::Credentials {
@@ -368,6 +373,7 @@ pub fn init() {
 
     // Register LSM context providers (must be after process::init)
     lsm::register_context_provider(lsm_get_pid, lsm_get_credentials, lsm_get_ticks);
+    lsm::register_tgid_provider(lsm_get_tgid);
 
     // R29-2 FIX: Register seccomp current-process evaluation callbacks
     // This bridges the seccomp module to the process module for filter evaluation

@@ -292,6 +292,15 @@ pub type GetTicksCallback = fn() -> u64;
 static CTX_GET_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CTX_GET_CREDENTIALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CTX_GET_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// GAP-5 G8: current task's thread-group id (registered separately; absent means
+/// "use the pid", the pre-thread behaviour).
+static CTX_GET_TGID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GAP-5 G8: register the callback that reports the current task's thread-group
+/// id, so subjects carry the real tgid instead of the task id.
+pub fn register_tgid_provider(get_tgid: GetPidCallback) {
+    CTX_GET_TGID.store(get_tgid as u64, core::sync::atomic::Ordering::Release);
+}
 
 /// Register callbacks for getting current process context.
 ///
@@ -317,6 +326,18 @@ fn current_pid() -> Option<ProcessId> {
     }
     let f: GetPidCallback = unsafe { core::mem::transmute(ptr) };
     f()
+}
+
+/// Current task's thread-group id; `pid` when no provider is registered or the
+/// lookup fails.
+#[inline]
+fn current_tgid(pid: ProcessId) -> ProcessId {
+    let ptr = CTX_GET_TGID.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return pid;
+    }
+    let f: GetPidCallback = unsafe { core::mem::transmute(ptr) };
+    f().unwrap_or(pid)
 }
 
 #[inline]
@@ -375,7 +396,7 @@ impl SyscallCtx {
 
         Some(Self {
             pid,
-            tgid: pid, // TODO: get actual tgid when threading is full
+            tgid: current_tgid(pid),
             uid: creds.uid,
             gid: creds.gid,
             euid: creds.euid,
@@ -414,7 +435,7 @@ impl ProcessCtx {
 
         Some(Self {
             pid,
-            tgid: pid,
+            tgid: current_tgid(pid),
             uid: creds.uid,
             gid: creds.gid,
             euid: creds.euid,

@@ -949,6 +949,14 @@ pub const fn user_stack_mapped_floor() -> u64 {
     eager_floor as u64
 }
 
+/// GAP-5 exec step 2: the range user mappings (`mmap`, `mremap`) must stay
+/// out of: the stack window plus the page just above it, where a non-leader
+/// exec maps the leader's trampoline (`syscall.rs`, `EXEC_STUB_VA`).
+pub const fn user_mapping_reserved_window() -> (usize, usize) {
+    let (start, end) = user_stack_window();
+    (start, end + PAGE_SIZE)
+}
+
 /// R178-13 FIX: the lowest VA that COULD be mapped (guard-exclusive, the usable base).
 ///
 /// This is the absolute lower bound for `try_grow_user_stack` — a fault below this

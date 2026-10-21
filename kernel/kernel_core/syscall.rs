@@ -2030,6 +2030,7 @@ pub enum SyscallNumber {
     GetPPid = 110,       // 获取父进程ID
     SetTidAddress = 218, // 设置 clear_child_tid
     SetRobustList = 273, // 设置 robust_list
+    GetRobustList = 274, // GAP-5 G8: 读取 robust_list
     Kill = 62,           // 发送信号
 
     // 文件I/O
@@ -3806,11 +3807,8 @@ pub fn syscall_dispatcher(
     // We use take_pending_process_exit() (which atomically clears the flag) and
     // terminate_self_and_halt() so the thread actually dies rather than looping
     // on EINTR indefinitely.
+    let mut exec_handoff = false;
     if let Some(pid) = crate::process::current_pid() {
-        if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
-            increment_counter(TraceCounter::SyscallExit, 1);
-            terminate_self_and_halt(pid, exit_code);
-        }
         // M0 item 5: record this task as the owner of the current syscall frame, so
         // the MUTABLE frame accessor used by signal-handler delivery at the return
         // tail can reject a stale cross-task `frame_ptr` (defense-in-depth + the
@@ -3821,33 +3819,44 @@ pub fn syscall_dispatcher(
         // later syscall's entry); a cross-process install that trips the hint mid-
         // syscall is harmless (this task has no handler in its own table, so no frame
         // is ever built and the unset owner is never consulted).
-        if matches!(syscall_num, 59 | 517) || crate::signal::any_handler_installed() {
-            set_syscall_frame_owner(pid);
-            // M0 item 5 (1b-2): SNAPSHOT the live syscall-frame binding into the PCB so
-            // a blocked-and-resumed return tail can republish it (`switch_context` zeroes
-            // the per-CPU `frame_ptr` on a block, which would otherwise fail-close the
-            // delivery accessor and defer the handler to the NEXT syscall). The exec
-            // front-ends can also block while loading, so capture their binding here.
-            // The binding is owner==pid here (set_syscall_frame_owner just ran); the else
-            // arm clears any stale pair if the frame slot is somehow empty (defensive —
-            // the syscall ASM always sets `frame_ptr` before this dispatcher runs).
-            let (frame_ptr, owner) = current_syscall_frame_binding();
-            if let Some(proc_arc) = get_process(pid) {
-                let mut proc = proc_arc.lock();
-                if is_valid_frame_binding(frame_ptr, owner, pid) {
-                    proc.saved_frame_ptr = frame_ptr;
-                    proc.saved_frame_owner = owner;
-                } else {
-                    proc.saved_frame_ptr = 0;
-                    proc.saved_frame_owner = 0;
-                }
+        set_syscall_frame_owner(pid);
+        // M0 item 5 (1b-2): SNAPSHOT the live syscall-frame binding into the PCB so
+        // a blocked-and-resumed return tail can republish it (`switch_context` zeroes
+        // the per-CPU `frame_ptr` on a block, which would otherwise fail-close the
+        // delivery accessor and defer the handler to the NEXT syscall). The exec
+        // front-ends can also block while loading, so capture their binding here.
+        // The binding is owner==pid here (set_syscall_frame_owner just ran); an
+        // invalid pair is stored as cleared (defensive — the syscall ASM always sets
+        // `frame_ptr` before this dispatcher runs).
+        //
+        // GAP-5 exec step 2: the same PCB lock consumes a posted fatal exit first
+        // (R154-I1: such a thread must not run one more syscall) and reports an exec
+        // handed to this group leader. A member of a multi-member group always
+        // snapshots: a non-leader's exec may run on this frame at syscall return.
+        let (frame_ptr, owner) = current_syscall_frame_binding();
+        let binding = is_valid_frame_binding(frame_ptr, owner, pid).then_some((frame_ptr, owner));
+        let want_snapshot =
+            matches!(syscall_num, 59 | 517) || crate::signal::any_handler_installed();
+        match crate::process::syscall_entry_safe_point(pid, binding, want_snapshot) {
+            crate::process::SyscallSafePoint::Exit(exit_code) => {
+                increment_counter(TraceCounter::SyscallExit, 1);
+                terminate_self_and_halt(pid, exit_code);
             }
+            crate::process::SyscallSafePoint::ExecHandoff => exec_handoff = true,
+            crate::process::SyscallSafePoint::Continue => {}
         }
     }
 
     // Evaluate seccomp/pledge filters before dispatch
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
-    let verdict = crate::process::evaluate_seccomp(syscall_num, &args);
+    // GAP-5 exec step 2: a handed-over exec replaces this call, so the leader's
+    // own filter does not judge the call it skips; the exec'ing thread's seccomp
+    // state is installed with the handoff instead.
+    let verdict = if exec_handoff {
+        seccomp::SeccompVerdict::allow()
+    } else {
+        crate::process::evaluate_seccomp(syscall_num, &args)
+    };
 
     match verdict.action {
         seccomp::SeccompAction::Kill => {
@@ -3981,7 +3990,13 @@ pub fn syscall_dispatcher(
             return SyscallError::EPERM.as_i64();
         }
     };
-    if let Err(err) = lsm::hook_syscall_enter(&lsm_ctx) {
+    // GAP-5 exec step 2: the handed-over exec runs its own LSM exec hook.
+    let enter_verdict = if exec_handoff {
+        Ok(())
+    } else {
+        lsm::hook_syscall_enter(&lsm_ctx)
+    };
+    if let Err(err) = enter_verdict {
         increment_counter(TraceCounter::SyscallDenied, 1);
         // LSM denied the syscall - call exit hook and return error
         let errno = lsm_error_to_syscall(err);
@@ -3989,6 +4004,13 @@ pub fn syscall_dispatcher(
         let _ = lsm::hook_syscall_exit(&lsm_ctx, ret as isize);
         increment_counter(TraceCounter::SyscallExit, 1);
         return ret;
+    }
+
+    // GAP-5 exec step 2: the exec a non-leader handed to this leader replaces
+    // the call.
+    if exec_handoff {
+        let result = run_exec_handoff();
+        return finish_syscall(syscall_num, &args, timestamp, &lsm_ctx, result, false);
     }
 
     let result = match syscall_num {
@@ -4052,6 +4074,7 @@ pub fn syscall_dispatcher(
         108 => sys_getegid(),
         218 => sys_set_tid_address(arg0 as *mut i32),
         273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
+        274 => sys_get_robust_list(arg0 as i32, arg1 as *mut u64, arg2 as *mut u64),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
         // GAP-5 slice 4 G7: thread-directed signals.
         200 => sys_tkill(arg0 as i32, arg1 as i32),
@@ -4330,9 +4353,38 @@ pub fn syscall_dispatcher(
         _ => Err(SyscallError::ENOSYS),
     };
 
+    finish_syscall(syscall_num, &args, timestamp, &lsm_ctx, result, true)
+}
+
+/// The syscall return path shared by every dispatched call: audit, the LSM
+/// exit hook, the return safe point, signal delivery and rescheduling.
+/// `dispatched` is false for a call skipped for a handed-over exec: its enter
+/// hook did not run, and the exec audits itself (as `execve`).
+fn finish_syscall(
+    syscall_num: u64,
+    args: &[u64; 6],
+    timestamp: u64,
+    lsm_ctx: &lsm::SyscallCtx,
+    mut result: SyscallResult,
+    dispatched: bool,
+) -> i64 {
+    if dispatched {
+        audit_syscall_exit(syscall_num, args, timestamp, lsm_ctx, &result);
+    }
+    finish_syscall_tail(result)
+}
+
+/// Audit record and LSM exit hook for a dispatched call.
+fn audit_syscall_exit(
+    syscall_num: u64,
+    args: &[u64; 6],
+    timestamp: u64,
+    lsm_ctx: &lsm::SyscallCtx,
+    result: &SyscallResult,
+) {
     // Emit audit event for syscall completion
     // Note: This is after the syscall so we capture the outcome
-    let (outcome, errno) = match &result {
+    let (outcome, errno) = match result {
         Ok(_) => (AuditOutcome::Success, 0),
         Err(e) => (AuditOutcome::Error, e.as_i64() as i32),
     };
@@ -4344,28 +4396,47 @@ pub fn syscall_dispatcher(
         outcome,
         get_audit_subject(),
         AuditObject::None,
-        &[syscall_num, arg0, arg1, arg2, arg3, arg4, arg5],
+        &[
+            syscall_num,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        ],
         errno,
         timestamp,
     );
 
     // LSM hook: notify security policy of syscall exit
-    let ret = match &result {
+    let ret = match result {
         Ok(val) => *val as isize,
         Err(e) => e.as_i64() as isize,
     };
-    let _ = lsm::hook_syscall_exit(&lsm_ctx, ret);
+    let _ = lsm::hook_syscall_exit(lsm_ctx, ret);
+}
 
+/// Return safe point, signal delivery and rescheduling for every syscall.
+fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
     // R115-1 FIX: Honor cross-CPU exit requests at syscall return.
     //
     // exit_group() may request sibling threads to exit while they are running on
     // other CPUs. Those threads cannot be terminated remotely (UAF risk), so they
     // check the pending-kill flag here — the earliest safe point where the thread
     // is guaranteed to not be in the middle of a kernel operation.
+    //
+    // GAP-5 exec step 2: the same gate runs an exec handed to this leader while
+    // it was in this call (its wait returned EINTR for it). The exec's result
+    // replaces the call's.
     if let Some(pid) = current_pid() {
-        if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
-            // R117-1 FIX: Use centralized terminate_self_and_halt().
-            terminate_self_and_halt(pid, exit_code);
+        match crate::process::syscall_return_safe_point(pid) {
+            crate::process::SyscallSafePoint::Exit(exit_code) => {
+                // R117-1 FIX: Use centralized terminate_self_and_halt().
+                terminate_self_and_halt(pid, exit_code);
+            }
+            crate::process::SyscallSafePoint::ExecHandoff => result = run_exec_handoff(),
+            crate::process::SyscallSafePoint::Continue => {}
         }
     }
 
@@ -4756,17 +4827,15 @@ fn sys_clone(
             return Err(SyscallError::EINVAL);
         }
 
-        // R153-3 FIX: Reject CLONE_THREAD if the thread group is exiting.
+        // R153-3 FIX: Reject CLONE_THREAD if the thread group is exiting (or,
+        // GAP-5 leader exec, draining for exec: `closed()`).
         // The shared thread_group.exiting flag is set by exit_group() BEFORE
         // the per-thread pending_kill scan, closing the TOCTOU window where
         // the caller hasn't been marked yet. Also check pending_kill as a
         // fallback for single-thread exit paths.
         {
             let parent = parent_arc.lock();
-            if parent
-                .thread_group
-                .exiting
-                .load(core::sync::atomic::Ordering::Acquire)
+            if parent.thread_group.closed()
                 || parent
                     .pending_kill
                     .load(core::sync::atomic::Ordering::Acquire)
@@ -5402,9 +5471,8 @@ fn sys_clone(
         let parent = parent_arc.lock();
         parent.seccomp_installing
     };
-    let live_group_exiting = parent_thread_group
-        .exiting
-        .load(core::sync::atomic::Ordering::Acquire);
+    // GAP-5 leader exec: a group draining for exec is closed like an exiting one.
+    let live_group_exiting = parent_thread_group.closed();
 
     if (is_shared_space && (parent_seccomp_installing || live_seccomp_installing))
         || ((flags & CLONE_THREAD) != 0 && (parent_seccomp_installing || live_seccomp_installing))
@@ -5453,9 +5521,7 @@ fn sys_clone(
                     || !Arc::ptr_eq(&parent.pid_ns_for_children, &parent_pid_ns_for_children)
                     || parent.tgid != parent_tgid
                     || parent.seccomp_installing
-                    || parent_thread_group
-                        .exiting
-                        .load(core::sync::atomic::Ordering::Acquire);
+                    || parent_thread_group.closed();
                 if !stale {
                     // GAP-5 slice 4 G5: cache the group's namespace-local id;
                     // the leader's own mapping disappears when it exits.
@@ -5469,7 +5535,12 @@ fn sys_clone(
                     child.tgid = parent_tgid;
                     child.ns_tgid = ns_tgid;
                     child.is_thread = true;
-                    child.thread_group = Arc::clone(&parent_thread_group);
+                    let displaced = core::mem::replace(
+                        &mut child.thread_group,
+                        Arc::clone(&parent_thread_group),
+                    );
+                    let freed = crate::process::drop_displaced(displaced);
+                    child.release_displaced_charge(freed);
                     // GAP-5 slice 4 G1: PROCESS_TABLE is held here.
                     parent_thread_group.join_locked();
                 }
@@ -5536,10 +5607,7 @@ fn sys_clone(
 
             // R153-3: re-check the shared atomic (no table re-entry) after tgid
             // publish — still race-free vs exit_group's set-before-scan protocol.
-            if parent_thread_group
-                .exiting
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
+            if parent_thread_group.closed() {
                 child.state = ProcessState::Terminated;
                 drop(child);
                 drop(child_arc);
@@ -5582,11 +5650,19 @@ fn sys_clone(
             // exec cannot arm/commit between Arc::clone and child.memory_space
             // publication. Order: parent → child (canonical).
             let parent = parent_arc.lock();
+            // GAP-5 leader exec: a non-thread CLONE_VM child of a group whose
+            // leader is draining it for exec would keep the old address space
+            // shared. Checked under the child lock that publishes the space:
+            // the drain claims its flag before it scans PCBs for such sharers,
+            // so either that scan sees this child or this check sees the claim.
+            let mut child = child_arc.lock();
             if parent.exec_in_progress
+                || (flags & CLONE_THREAD == 0 && parent.thread_group.exec_draining())
                 || parent.memory_space != parent_space
                 || parent.user_memory_space != parent_user_memory_space
                 || parent.memory_space == 0
             {
+                drop(child);
                 drop(parent);
                 // Parent mid-exec or AS changed since snapshot — abort the
                 // never-scheduled child. memory_space is still 0 (default), so
@@ -5604,10 +5680,11 @@ fn sys_clone(
             }
             // Fresh Arc::clone under the held parent lock.
             let live_mm = Arc::clone(&parent.mm);
-            let mut child = child_arc.lock();
             child.memory_space = parent_space;
             child.user_memory_space = parent_user_memory_space;
-            child.mm = live_mm;
+            let displaced_mm = core::mem::replace(&mut child.mm, live_mm);
+            let freed = crate::process::drop_displaced(displaced_mm);
+            child.release_displaced_charge(freed);
             // Parent still held until here → share_count now sees the child;
             // concurrent exec's recheck/arm will EBUSY.
             drop(parent);
@@ -5781,8 +5858,12 @@ fn sys_clone(
         // `seccomp_installing` was false again while the child still received
         // the stale pre-install filter stack.
         drop(child);
-        drop(displaced_sigactions);
-        drop(displaced_fs);
+        // GAP-5 (review D4): return the displaced tables' charge to the child.
+        let freed = displaced_sigactions.map_or(0, crate::process::drop_displaced)
+            + displaced_fs.map_or(0, crate::process::drop_displaced);
+        if freed != 0 {
+            child_arc.lock().release_displaced_charge(freed);
+        }
         let parent = parent_arc.lock();
         if parent.seccomp_installing || parent.seccomp_generation != parent_seccomp_generation {
             drop(parent);
@@ -5821,6 +5902,11 @@ fn sys_clone(
             None
         };
         drop(parent_files_table);
+        // GAP-5 (review D4): the empty displaced table is freed here.
+        if let Some(displaced) = displaced_files {
+            let freed = crate::process::drop_displaced(displaced);
+            child.release_displaced_charge(freed);
+        }
 
         // R133-5 FIX: Use pre-captured fd_table snapshot instead of re-acquiring
         // parent lock (which would create child→parent lock order inversion).
@@ -6338,6 +6424,428 @@ fn sys_clone(
     Ok(parent_view_pid)
 }
 
+/// Keeps a thread group closed to new threads from the exec drain until
+/// `exec_from_bytes` returns, on success and on every rollback.
+struct ExecDrainGuard(Arc<crate::process::ThreadGroup>);
+
+impl Drop for ExecDrainGuard {
+    fn drop(&mut self) {
+        self.0.end_exec_drain();
+    }
+}
+
+impl ExecDrainGuard {
+    /// GAP-5 exec step 2: pass the claim to the leader's exec, whose own guard
+    /// releases it, without releasing it here.
+    fn hand_over(self) {
+        let guard = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `guard` is never used or dropped again, so the group handle
+        // is moved out exactly once.
+        drop(unsafe { core::ptr::read(&guard.0) });
+    }
+}
+
+/// GAP-5 slice 4, exec step 1 (leader exec): end every other member of the
+/// caller's thread group before exec replaces its image, as Linux `de_thread`
+/// does. A lone task returns `Ok(None)`. Otherwise:
+/// - a non-leader gets `EBUSY` (it would have to take over the group's PID);
+/// - a task outside the group that shares the address space (a `CLONE_VM`
+///   child that is not a thread) gets `EBUSY` before anyone is ended;
+/// - in a group that is already exiting, or when a fatal exit is posted to
+///   the caller while it waits, the caller waits for its own posted exit and
+///   gets `EINTR`; the syscall epilogue then ends it.
+///
+/// The wait holds no lock and is interrupted only by a fatal exit, like
+/// Linux's killable wait. It ends once the caller is the only member, owns the
+/// fd table alone, and no reaped sibling is still in its Phase-2 cleanup,
+/// which releases the fd table and reads the shared `MmState` that exec then
+/// rewrites. Siblings ran their clear-tid writes and robust-list walks before
+/// their reap, while the old address space was still live.
+///
+/// GAP-5 exec step 2: with `via_handoff` the leader runs an exec a non-leader
+/// handed it. That thread already holds the drain claim, which this guard now
+/// owns and releases even if the group is already down to this task.
+fn drain_thread_group_for_exec(
+    process: &crate::process::ProcessArc,
+    pid: ProcessId,
+    via_handoff: bool,
+) -> Result<Option<ExecDrainGuard>, SyscallError> {
+    use crate::process::{
+        address_space_foreign_sharers, request_exit_group_atomic, tgid_reap_in_flight,
+    };
+
+    let (tgid, memory_space, group, files) = {
+        let proc = process.lock();
+        (
+            proc.tgid,
+            proc.memory_space,
+            Arc::clone(&proc.thread_group),
+            Arc::clone(&proc.files),
+        )
+    };
+    let guard = if via_handoff {
+        ExecDrainGuard(Arc::clone(&group))
+    } else {
+        if group.members() <= 1 {
+            return Ok(None);
+        }
+        if tgid != pid {
+            // Non-leaders hand their exec to the leader before reaching here.
+            return Err(SyscallError::EBUSY);
+        }
+        wait_for_posted_group_exit(&group, pid)?;
+        claim_exec_drain(&group, pid)?
+    };
+    wait_for_posted_group_exit(&group, pid)?;
+
+    // Claimed before this scan: a non-thread CLONE_VM clone checks the claim
+    // under the child lock that publishes the child's address space, so either
+    // the scan sees that child or the clone sees the claim and aborts.
+    if address_space_foreign_sharers(memory_space, &group) > 0 {
+        return Err(SyscallError::EBUSY);
+    }
+
+    // The drain flag is published before this scan takes PROCESS_TABLE, and
+    // clone checks it at publication under the same lock: a thread published
+    // earlier is a member this scan ends, a later one aborts its clone.
+    let _ = request_exit_group_atomic(
+        pid,
+        &group,
+        crate::signal::signal_exit_code(crate::signal::Signal::SIGKILL),
+    );
+
+    loop {
+        crate::process::run_blocked_wait_drains();
+        if wait_should_abort(pid) {
+            return Err(SyscallError::EINTR);
+        }
+        if group.members() == 1 && files.lock().owners() == 1 && !tgid_reap_in_flight(tgid) {
+            return Ok(Some(guard));
+        }
+        yield_and_halt();
+    }
+}
+
+/// exit_group and a group-fatal exit publish `exiting` before they post the
+/// exit to this task; wait for that post rather than return EINTR to user
+/// mode first (the syscall epilogue then ends the task).
+fn wait_for_posted_group_exit(
+    group: &crate::process::ThreadGroup,
+    pid: ProcessId,
+) -> Result<(), SyscallError> {
+    if !group.exiting.load(core::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    loop {
+        if wait_should_abort(pid) {
+            return Err(SyscallError::EINTR);
+        }
+        yield_and_halt();
+    }
+}
+
+/// Take the group's exec drain claim. While another exec holds it, wait
+/// (killably) until it is released: that exec either ends this task or fails
+/// and lets this one proceed. A leader whose wait ends for a handoff returns
+/// `EINTR`, and its syscall return runs the handed-over exec instead.
+fn claim_exec_drain(
+    group: &Arc<crate::process::ThreadGroup>,
+    pid: ProcessId,
+) -> Result<ExecDrainGuard, SyscallError> {
+    loop {
+        if group.try_begin_exec_drain() {
+            return Ok(ExecDrainGuard(Arc::clone(group)));
+        }
+        if wait_should_abort(pid) {
+            return Err(SyscallError::EINTR);
+        }
+        yield_and_halt();
+    }
+}
+
+/// GAP-5 exec step 2: the trampoline a leader with a pending handoff is sent
+/// to from a timer interrupt: `mov eax, 39; syscall; ud2`. Any syscall entry
+/// takes the handoff, so the `getpid` never runs; the `ud2` is reached only if
+/// the handoff vanished, which no path does without a fatal exit.
+const EXEC_STUB_CODE: [u8; 9] = [0xB8, 0x27, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x0F, 0x0B];
+
+/// The page just above the main stack. Its page table always exists (the
+/// eager stack pages share it), the KPTI user root shares it, and `mmap` and
+/// `mremap` never place a user mapping there (`user_mapping_reserved_window`),
+/// so a present page there is a stub left by an earlier, abandoned handoff.
+const EXEC_STUB_VA: u64 = crate::elf_loader::USER_STACK_TOP;
+
+/// Make sure the stub is mapped read-only and executable at `EXEC_STUB_VA` in
+/// the current (shared) address space. A newly mapped frame is an ordinary
+/// untracked user page: teardown and exec free it, fork copies it like any
+/// read-only page. Fails without side effects.
+fn ensure_exec_stub() -> Result<(), SyscallError> {
+    use x86_64::structures::paging::{FrameAllocator, Page, PhysFrame, Size4KiB};
+
+    // The page table exists, so a map that needs a table frame is refused.
+    struct NoTableFrames;
+    // SAFETY: never hands out a frame.
+    unsafe impl FrameAllocator<Size4KiB> for NoTableFrames {
+        fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+            None
+        }
+    }
+
+    let frame = mm::memory::FrameAllocator::new()
+        .allocate_frame()
+        .ok_or(SyscallError::ENOMEM)?;
+    // SAFETY: a fresh frame owned by this function, reached through the
+    // direct map.
+    unsafe {
+        let page = mm::phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(page, 0, 0x1000);
+        // lint-repr-c-copy: allow (a byte array of code, no struct padding)
+        core::ptr::copy_nonoverlapping(EXEC_STUB_CODE.as_ptr(), page, EXEC_STUB_CODE.len());
+    }
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(EXEC_STUB_VA));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // SAFETY: PT_LOCK-guarded walk and edit of the current address space; the
+    // page is not mapped, and a not-present entry has no TLB entry to flush on
+    // other CPUs.
+    let mapped = unsafe {
+        mm::page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+            if mgr.translate_addr(page.start_address()).is_some() {
+                return Ok(false);
+            }
+            if mgr
+                .translate_addr(VirtAddr::new(EXEC_STUB_VA - 0x1000))
+                .is_none()
+            {
+                return Err(SyscallError::EBUSY);
+            }
+            mgr.map_page(page, frame, flags, &mut NoTableFrames)
+                .map(|()| true)
+                .map_err(|_| SyscallError::EBUSY)
+        })
+    };
+    if mapped != Ok(true) {
+        mm::memory::FrameAllocator::new().deallocate_frame(frame);
+    }
+    mapped.map(|_| ())
+}
+
+/// How `exec_from_bytes` was entered.
+enum ExecEntry {
+    /// `execve`/`spawn_image` by the calling task, with the front-end's staging
+    /// admission (held until the exec returns, or handed to the leader).
+    Caller(mm::TransientPeakGuard),
+    /// The group leader running an exec a non-leader handed it.
+    Handoff,
+}
+
+/// GAP-5 exec step 2, the exec'ing non-leader T (design: "Non-leader exec
+/// design"). Claims the drain, maps the trampoline, hands the image, its
+/// staging admission and T's own state to the leader, ends the other members
+/// and waits until the leader has taken the handoff. Past the point of no
+/// return it posts its own exit and returns `EINTR`, so the syscall return
+/// path ends it after every caller has unwound; `EBUSY` if the leader died
+/// before taking the handoff.
+fn begin_exec_handoff(
+    process: &crate::process::ProcessArc,
+    pid: ProcessId,
+    elf_data: Vec<u8>,
+    argv_vec: Vec<Vec<u8>>,
+    envp_vec: Vec<Vec<u8>>,
+    execfn: Vec<u8>,
+    peak: mm::TransientPeakGuard,
+) -> SyscallResult {
+    use crate::process::{
+        address_space_foreign_sharers, discard_exec_handoff, poll_exec_handoff,
+        publish_exec_handoff, ExecHandoff, HandoffPoll, HandoffRefusal, HandoffThreadState,
+    };
+    use crate::signal::{signal_exit_code, Signal};
+
+    let (tgid, memory_space, group) = {
+        let proc = process.lock();
+        (proc.tgid, proc.memory_space, Arc::clone(&proc.thread_group))
+    };
+    wait_for_posted_group_exit(&group, pid)?;
+    let claim = claim_exec_drain(&group, pid)?;
+    if address_space_foreign_sharers(memory_space, &group) > 0 {
+        return Err(SyscallError::EBUSY);
+    }
+    // A zombie or exiting leader cannot take the exec (a deviation: Linux
+    // would take over its PID). The publish re-checks under the lock.
+    let leader = get_process(tgid).ok_or(SyscallError::EBUSY)?;
+    let (leader_files, leader_fs) = {
+        let leader = leader.lock();
+        if !Arc::ptr_eq(&leader.thread_group, &group)
+            || !leader.group_live
+            || matches!(
+                leader.state,
+                ProcessState::Zombie | ProcessState::Terminated
+            )
+        {
+            return Err(SyscallError::EBUSY);
+        }
+        (Arc::clone(&leader.files), Arc::clone(&leader.fs))
+    };
+    // Mapped before the point of no return; a stub left in place by a failed
+    // attempt is harmless (only this code maps that page) and is reused.
+    ensure_exec_stub()?;
+    let thread = {
+        let mut proc = process.lock();
+        // GAP-5 G7 (review D3): group signals this task claimed but has not
+        // delivered stay with the group (the leader takes them after the
+        // exec); only its own thread-directed signals travel in the handoff,
+        // so its exit cannot return them a second time.
+        let _ = proc.return_claimed_signals(u64::MAX);
+        let seccomp_state = proc
+            .seccomp_state
+            .try_clone()
+            .map_err(|_| SyscallError::ENOMEM)?;
+        let files = (!Arc::ptr_eq(&proc.files, &leader_files)).then(|| {
+            // The handoff's own owner count (see HandoffThreadState::files).
+            proc.files.lock().add_owner();
+            Arc::clone(&proc.files)
+        });
+        HandoffThreadState {
+            blocked: proc.blocked,
+            pending: proc.pending_signals.bits(),
+            rlimits: proc.rlimits,
+            allowed_cpus: proc.allowed_cpus,
+            seccomp_state,
+            seccomp_generation: proc.seccomp_generation,
+            pledge_state: proc.pledge_state.clone(),
+            pid_ns_for_children: proc.pid_ns_for_children.clone(),
+            files,
+            fs: (!Arc::ptr_eq(&proc.fs, &leader_fs)).then(|| Arc::clone(&proc.fs)),
+        }
+    };
+    drop(leader_files);
+    drop(leader_fs);
+    let owned_files = thread.files.clone();
+    let handoff = match ExecHandoff::try_new(
+        elf_data,
+        argv_vec,
+        envp_vec,
+        execfn,
+        thread,
+        Some(peak),
+        EXEC_STUB_VA,
+    ) {
+        Ok(handoff) => handoff,
+        Err(_) => {
+            // The owner count taken above goes back with the table handle.
+            if let Some(files) = owned_files {
+                crate::process::give_back_files_owner(process, &files);
+            }
+            return Err(SyscallError::ENOMEM);
+        }
+    };
+    drop(owned_files);
+
+    // Point of no return: the leader holds the handoff and every other member
+    // has a posted fatal exit.
+    let leader = match publish_exec_handoff(
+        pid,
+        tgid,
+        &group,
+        handoff,
+        signal_exit_code(Signal::SIGKILL),
+    ) {
+        Ok(leader) => leader,
+        Err((handoff, refusal)) => {
+            discard_exec_handoff(process, handoff);
+            drop(claim);
+            if refusal == HandoffRefusal::GroupExiting {
+                wait_for_posted_group_exit(&group, pid)?;
+            }
+            return Err(SyscallError::EBUSY);
+        }
+    };
+    // Wait until the leader has taken the handoff, or this task is killed.
+    loop {
+        match poll_exec_handoff(&leader) {
+            HandoffPoll::Taken => break,
+            HandoffPoll::Abandoned(handoff) => {
+                // The leader exited first. The other members stay ended.
+                if let Some(handoff) = handoff {
+                    discard_exec_handoff(process, handoff);
+                }
+                drop(claim);
+                return Err(SyscallError::EBUSY);
+            }
+            HandoffPoll::Pending => {}
+        }
+        if wait_should_abort(pid) {
+            break;
+        }
+        yield_and_halt();
+    }
+    // The leader's exec owns the claim now; its guard releases it.
+    claim.hand_over();
+    // Exit through the syscall return safe point rather than from here, so the
+    // callers' frames unwind first (this task's PCB handle and anything else a
+    // front-end holds). A fatal exit posted meanwhile keeps its own code.
+    let _ = crate::process::request_process_exit_if_unposted(process, 0);
+    Err(SyscallError::EINTR)
+}
+
+/// GAP-5 exec step 2, the leader: run the exec a non-leader handed over, on
+/// this syscall's frame (bound at entry), under the exec'ing thread's staging
+/// admission. It is audited as an `execve`. A failure after the point of no
+/// return ends the group: a posted fatal exit wins with its own code,
+/// otherwise `SIGSEGV`, as Linux `force_fatal_sig` does past `de_thread`.
+fn run_exec_handoff() -> SyscallResult {
+    use crate::signal::{signal_exit_code, Signal};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    // Only this task takes its handoff, and the publisher reclaims it only
+    // from a dead leader, so the gate's report still holds. Stay defensive:
+    // without it the skipped call simply reports EINTR.
+    let Some(taken) = crate::process::take_exec_handoff(&process) else {
+        return Err(SyscallError::EINTR);
+    };
+    let peak = taken.peak;
+    let result = exec_from_bytes(
+        process,
+        taken.elf_data,
+        taken.argv,
+        taken.envp,
+        taken.execfn,
+        ExecEntry::Handoff,
+    );
+    drop(peak);
+    let (outcome, errno) = match &result {
+        Ok(_) => (AuditOutcome::Success, 0),
+        Err(e) => (AuditOutcome::Error, e.as_i64() as i32),
+    };
+    let _ = audit::emit(
+        AuditKind::Syscall,
+        outcome,
+        get_audit_subject(),
+        AuditObject::None,
+        &[59, 0, 0, 0, 0, 0, 0],
+        errno,
+        crate::time::get_ticks(),
+    );
+    if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
+        terminate_self_and_halt(pid, exit_code);
+    }
+    if result.is_err() {
+        crate::process::terminate_group_self_and_halt(pid, signal_exit_code(Signal::SIGSEGV));
+    }
+    result
+}
+
+/// One step of a killable kernel-side wait: yield, then halt until the next
+/// interrupt (the `nanosleep` pattern).
+fn yield_and_halt() {
+    yield_with_deferred_work();
+    if x86_64::instructions::interrupts::are_enabled() {
+        x86_64::instructions::hlt();
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
 /// sys_exec - 执行新程序
 ///
 /// 将当前进程的地址空间替换为新的 ELF 可执行映像
@@ -6380,6 +6888,7 @@ fn exec_from_bytes(
     argv_vec: Vec<Vec<u8>>,
     envp_vec: Vec<Vec<u8>>,
     execfn: Vec<u8>,
+    entry: ExecEntry,
 ) -> SyscallResult {
     use crate::elf_loader::load_elf;
     use crate::fork::create_fresh_address_space;
@@ -6406,11 +6915,70 @@ fn exec_from_bytes(
         return Err(SyscallError::EINVAL);
     }
 
+    // R41-4 FIX: LSM hook uses SHA-256 of ELF content instead of argv[0]
+    //
+    // SECURITY: Previously used argv[0] (user-controlled) for policy checks,
+    // allowing attackers to bypass MAC by setting argv[0] to an allowed program.
+    // Now we hash the actual binary content to ensure policy is checked against
+    // what will actually be executed.
+    //
+    // GAP-5 leader exec: this and the two checks below run before the thread
+    // group drain, so an LSM denial, a name allocation failure or a header
+    // pre-flight failure ends no sibling. Segment checks (range, filesz/memsz,
+    // stack overlap) run in load_elf, after the drain.
+    let bin_hash = audit::hash_binary_prefix(&elf_data, EXEC_HASH_WINDOW);
+
+    // GAP-5 exec step 2 (review F4): a handed-over exec was already checked
+    // by the exec'ing thread for this image and the group's shared
+    // credentials; the hook runs once per exec, as on Linux.
+    let via_handoff = matches!(entry, ExecEntry::Handoff);
+    if !via_handoff {
+        if let Some(exec_ctx) = lsm_current_process_ctx() {
+            if let Err(err) = lsm::hook_task_exec(&exec_ctx, bin_hash) {
+                return Err(lsm_error_to_syscall(err));
+            }
+        }
+    }
+
+    // M0-4 (gap g1, Codex Fix): build the comm-style process name HERE — BEFORE
+    // the point of no return — so its fallible allocation can fail cleanly
+    // (ENOMEM) rather than panic in the post-CR3 "no fallible ops" commit window.
+    // It is moved (no allocation) into proc.name during the commit.
+    let comm_name = crate::process::PreparedProcessName::try_new(exec_comm_name(&execfn))
+        .map_err(|_| SyscallError::ENOMEM)?;
+
+    // The loader's pure header and program-header pre-flight (load_elf repeats it).
+    crate::elf_loader::validate_elf_image(&elf_data).map_err(|_| SyscallError::ENOEXEC)?;
+
+    // GAP-5 exec step 2: a non-leader hands the exec to its group leader, which
+    // runs it under the group's PID (`ExecEntry::Handoff`).
+    let _peak = match entry {
+        ExecEntry::Caller(peak) if process.lock().tgid != process_pid => {
+            drop(comm_name);
+            return begin_exec_handoff(
+                &process,
+                process_pid,
+                elf_data,
+                argv_vec,
+                envp_vec,
+                execfn,
+                peak,
+            );
+        }
+        ExecEntry::Caller(peak) => Some(peak),
+        ExecEntry::Handoff => None,
+    };
+
+    // GAP-5 slice 4 (exec step 1): a group leader ends every other member first,
+    // as Linux de_thread does. The guard keeps the group closed to new threads
+    // until this function returns; it drops after the exec guards below.
+    let _exec_drain = drain_thread_group_for_exec(&process, process_pid, via_handoff)?;
+
     // R33-1 FIX: Refuse exec while other threads share this address space.
     // Calling exec in a multithreaded process would free the page tables while
     // sibling threads are still executing, causing UAF/memory corruption.
-    // Linux behavior: exec in multithreaded process kills other threads first,
-    // but that requires complex thread group handling. For now, reject with EBUSY.
+    // The drain above already ended a leader's siblings; these gates refuse a
+    // non-drained share (a non-leader's group or a racing CLONE_VM child).
     let (tgid, current_memory_space, files_owners) = {
         let proc = process.lock();
         let files_owners = proc.files.lock().owners();
@@ -6468,27 +7036,6 @@ fn exec_from_bytes(
     // file via VFS + resolves `#!` shebangs), so the confused-deputy where
     // arg0 could be EITHER a path or an image is gone — arg0's type is fixed per
     // syscall number.
-
-    // R41-4 FIX: LSM hook uses SHA-256 of ELF content instead of argv[0]
-    //
-    // SECURITY: Previously used argv[0] (user-controlled) for policy checks,
-    // allowing attackers to bypass MAC by setting argv[0] to an allowed program.
-    // Now we hash the actual binary content to ensure policy is checked against
-    // what will actually be executed.
-    let bin_hash = audit::hash_binary_prefix(&elf_data, EXEC_HASH_WINDOW);
-
-    if let Some(exec_ctx) = lsm_current_process_ctx() {
-        if let Err(err) = lsm::hook_task_exec(&exec_ctx, bin_hash) {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
-
-    // M0-4 (gap g1, Codex Fix): build the comm-style process name HERE — BEFORE
-    // the point of no return — so its fallible allocation can fail cleanly
-    // (ENOMEM) rather than panic in the post-CR3 "no fallible ops" commit window.
-    // It is moved (no allocation) into proc.name during the commit.
-    let comm_name = crate::process::PreparedProcessName::try_new(exec_comm_name(&execfn))
-        .map_err(|_| SyscallError::ENOMEM)?;
 
     // H.3 KPTI: User PML4 creation is deferred until AFTER load_elf() and stack
     // setup populate user-space page table entries. create_kpti_user_pml4() snapshots
@@ -7051,10 +7598,11 @@ fn exec_from_bytes(
         // production reset, and the maybe_deliver_signal `exec_in_progress` tripwire (legs a/c
         // enforcement) can rely on it. See `reset_sigactions_for_exec`.
         // GAP-5: CLONE_SIGHAND implies CLONE_VM, and exec already refused any
-        // other task (zombies included) sharing this address space, so the
-        // disposition table is not shared by a live sibling here. Enabling
-        // CLONE_SIGHAND must add an unshare step before relaxing this assert.
-        debug_assert_eq!(Arc::strong_count(&proc.sigactions), 1);
+        // other task (zombies included) sharing this address space, so no live
+        // task shares the disposition table here. After the leader-exec drain
+        // a reaped sibling's PCB may still hold the table during its final
+        // drop; it never reads it again, so the table is reset in place.
+        debug_assert_eq!(proc.thread_group.members(), 1);
         {
             let mut actions = proc.sigactions.lock();
             reset_sigactions_for_exec(&mut actions);
@@ -7072,6 +7620,10 @@ fn exec_from_bytes(
         // cannot dereference stale or newly-reused virtual memory.
         proc.robust_list_head = 0;
         proc.robust_list_len = 0;
+        // The set_tid_address word is address-space-local too (Linux clears
+        // it in exec_mm_release). Without this, an exit after an exec that did
+        // not re-register zeroes and futex-wakes an address in the new image.
+        proc.clear_child_tid = 0;
 
         // M0-4 (gap g1): refresh the process name to the exec'd program's
         // basename (Linux `comm` semantics, <=15 chars). The pre-M0-4 exec path
@@ -7384,7 +7936,7 @@ fn sys_spawn_image(
     }
     // P2-A: single-holder transient-peak admission — concurrent exec staging
     // must not stack N * EXEC_IMAGE_PEAK_BYTES on top of full hard floors.
-    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
+    let peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
     // R151-1 FIX: fallible allocation (the global alloc_error_handler panics).
     let mut elf_data: Vec<u8> = Vec::new();
     elf_data
@@ -7407,7 +7959,14 @@ fn sys_spawn_image(
     // so it is unbypassable on every entry path. Peak guard lives until this
     // function returns (staging buffer moved into exec_from_bytes and dropped
     // after load, or on error).
-    exec_from_bytes(process, elf_data, argv_vec, envp_vec, execfn)
+    exec_from_bytes(
+        process,
+        elf_data,
+        argv_vec,
+        envp_vec,
+        execfn,
+        ExecEntry::Caller(peak),
+    )
 }
 
 /// sys_execve (syscall 59) — real path-based `execve(pathname, argv, envp)`.
@@ -7438,7 +7997,7 @@ fn sys_execve(
         return Err(SyscallError::EFAULT);
     }
     validate_user_ptr(pathname, 1)?;
-    let _peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
+    let peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
 
     // FRONT-HALF user copy — runs EXACTLY ONCE; after this, kernel buffers only.
     let path_bytes = copy_user_cstring(pathname)?; // NULL ptr => EFAULT
@@ -7465,7 +8024,14 @@ fn sys_execve(
     // at the leaf — so the PONR-once-at-leaf discipline is unchanged.
     let (elf_bytes, cur_argv) = resolve_exec_chain(orig_path, argv_vec, exec_read_file)?;
 
-    exec_from_bytes(process, elf_bytes, cur_argv, envp_vec, execfn)
+    exec_from_bytes(
+        process,
+        elf_bytes,
+        cur_argv,
+        envp_vec,
+        execfn,
+        ExecEntry::Caller(peak),
+    )
 }
 
 /// R172-P6-F5: resolve the `#!` shebang interpreter chain to the FINAL image bytes + the
@@ -7785,13 +8351,17 @@ where
     let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
     let mut resumed_from_block = false;
 
-    loop {
-        // GAP-5 slice 4 G1: reap exited non-leader threads first. A group is
-        // reportable only once its last thread is reaped, and on a busy-waiting
-        // single CPU this loop may be the only process context left to run the
-        // drain (it already calls cleanup_zombie, so the context is the same).
-        crate::process::drain_thread_autoreap();
+    // GAP-5 G8: a thread of a multi-threaded process waits for the children of
+    // every thread in its group.
+    let group = {
+        let proc = parent.lock();
+        (proc.thread_group.members() > 1).then(|| Arc::clone(&proc.thread_group))
+    };
+    if let Some(group) = group {
+        return wait_reap_group(target, nohang, nowait, publish, pid, &parent, &group);
+    }
 
+    loop {
         // R171-F3 FIX: a pending kill interrupts wait() with EINTR instead of
         // re-blocking on children. Restore Ready + clear the waiting_child marker
         // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
@@ -7810,6 +8380,16 @@ where
             proc.waiting_child = None;
             return Err(SyscallError::EINTR);
         }
+        // GAP-5 slice 4 G1: reap exited non-leader threads before the scan. A
+        // group is reportable only once its last thread is reaped, and on a
+        // busy-waiting single CPU this loop may be the only process context left
+        // to run the drain (it already calls cleanup_zombie, so the context is
+        // the same). The same holds for a child killed at a timer interrupt: it
+        // stays non-runnable until the deferred IRQ-kill drain ends it. The
+        // Blocked recheck below still runs before the scan, so a SIGCHLD with a
+        // handler that this drain posts ends the wait with EINTR (pre-existing;
+        // Linux scans first and reports the child).
+        crate::process::run_blocked_wait_drains();
         // 【关键修复】先标记为等待状态，再扫描子进程，避免 lost wake-up
         // 如果子进程在我们标记之后、扫描之前退出，terminate_process 会看到我们的等待状态
         // 如果子进程在我们扫描时/之后退出，我们会在扫描中发现它的 Zombie 状态
@@ -7954,6 +8534,14 @@ where
             match get_process(*child_pid) {
                 Some(child_proc) => {
                     let child = child_proc.lock();
+                    // GAP-5 G8 (review D2): an entry whose child now has another
+                    // parent (or whose pid was reused) is stale.
+                    if child.ppid != pid {
+                        if stale_pids.try_reserve(1).is_ok() {
+                            stale_pids.push(*child_pid);
+                        }
+                        continue;
+                    }
                     let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
                         continue;
                     };
@@ -8007,10 +8595,26 @@ where
                 exit_code,
             };
 
+            // GAP-5 G8: the group may have gained a thread that waits too; one
+            // waiter claims the zombie. A loser rescans once the winner's reap
+            // has removed the child.
+            if !nowait && !crate::process::claim_wait_reap(child_pid) {
+                {
+                    let mut proc = parent.lock();
+                    proc.enter_ready_at(crate::get_ticks());
+                    proc.waiting_child = None;
+                }
+                crate::force_reschedule();
+                continue;
+            }
+
             // Report to the caller before committing the reap. A failure here
             // must restore Ready and leave the zombie reapable, matching Linux
             // EFAULT semantics for a bad status/siginfo pointer.
             if let Err(e) = publish(&outcome) {
+                if !nowait {
+                    crate::process::release_wait_reap(child_pid);
+                }
                 let mut proc = parent.lock();
                 proc.enter_ready_at(crate::get_ticks());
                 proc.waiting_child = None;
@@ -8104,6 +8708,193 @@ where
     }
 }
 
+/// GAP-5 G8: `wait_reap_core` for a caller whose thread group has more than one
+/// member. Children of every member are candidates (a full table scan, which
+/// also needs no `children_incomplete` fallback). One waiter claims a zombie
+/// before reporting it (`claim_wait_reap`).
+///
+/// Sleeping (review D3; it polled once per tick before): the caller counts
+/// itself as a group child waiter, reads the group's child-report count before
+/// its scan and re-reads it under its PCB lock before it publishes `Blocked`.
+/// A report bumps the count first and then wakes every sleeping member
+/// (`wake_group_child_waiters`), so a report either lands before the re-read
+/// (the caller rescans) or finds the caller `Blocked`. A candidate that is a
+/// zombie still finishing its exit, or one another waiter claimed, makes the
+/// caller poll instead, since those transitions send no report.
+fn wait_reap_group<W>(
+    target: WaitTarget,
+    nohang: bool,
+    nowait: bool,
+    mut publish: W,
+    pid: ProcessId,
+    caller: &crate::process::ProcessArc,
+    group: &Arc<crate::process::ThreadGroup>,
+) -> Result<Option<WaitOutcome>, SyscallError>
+where
+    W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
+{
+    struct ChildWaiter<'a>(&'a crate::process::ThreadGroup);
+    impl Drop for ChildWaiter<'_> {
+        fn drop(&mut self) {
+            self.0.note_child_waiter(false);
+        }
+    }
+
+    let parent_namespace = {
+        let proc = caller.lock();
+        crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+            .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone())
+    };
+    group.note_child_waiter(true);
+    let _waiter = ChildWaiter(group);
+    loop {
+        if wait_should_abort(pid) || crate::signal::has_deliverable_signal(pid) {
+            return Err(SyscallError::EINTR);
+        }
+        // After the signal checks, so the scan reports a child this pass ends.
+        crate::process::run_blocked_wait_drains();
+        let events = group.child_events();
+
+        let mut members: Vec<ProcessId> = Vec::new();
+        members
+            .try_reserve_exact(group.members().saturating_add(1))
+            .map_err(|_| SyscallError::ENOMEM)?;
+        let mut selected_exists = false;
+        let mut grew = false;
+        // A candidate that becomes reapable without a report: poll for it.
+        let mut transient = false;
+        // (child, exit code, view pid)
+        let mut found: Option<(ProcessId, i32, ProcessId)> = None;
+        'scan: {
+            let table = crate::process::PROCESS_TABLE.lock();
+            for (slot_pid, slot) in table.iter().enumerate() {
+                let Some(arc) = slot else { continue };
+                if Arc::ptr_eq(&arc.lock().thread_group, group) {
+                    if members.len() == members.capacity() {
+                        // The group grew since the reserve; size again.
+                        grew = true;
+                        break 'scan;
+                    }
+                    members.push(slot_pid);
+                }
+            }
+            for (child_pid, slot) in table.iter().enumerate() {
+                let Some(arc) = slot else { continue };
+                let child = arc.lock();
+                if !members.contains(&child.ppid) || members.contains(&child_pid) {
+                    continue;
+                }
+                let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
+                    continue;
+                };
+                if let WaitTarget::Pid(want) = target {
+                    if view_pid != want {
+                        continue;
+                    }
+                }
+                selected_exists = true;
+                // A zombie leader whose group is empty is reported once its
+                // teardown is published and it has switched out for good.
+                let reportable = child.state == ProcessState::Zombie
+                    && child.tgid == child_pid
+                    && child.thread_group.members() == 1;
+                let reapable = reportable
+                    && child
+                        .teardown_done
+                        .load(core::sync::atomic::Ordering::Acquire)
+                    && !child.on_cpu.load(core::sync::atomic::Ordering::Acquire)
+                    && !child
+                        .switch_reap_pending
+                        .load(core::sync::atomic::Ordering::Acquire);
+                if !reapable {
+                    transient |= reportable;
+                    continue;
+                }
+                if !nowait
+                    && child
+                        .wait_claimed
+                        .compare_exchange(
+                            false,
+                            true,
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_err()
+                {
+                    transient = true;
+                    continue;
+                }
+                found = Some((child_pid, child.exit_code.unwrap_or(0), view_pid));
+                break;
+            }
+        }
+        if grew {
+            continue;
+        }
+
+        if let Some((child_pid, exit_code, view_pid)) = found {
+            let outcome = WaitOutcome {
+                global_pid: child_pid,
+                view_pid,
+                exit_code,
+            };
+            if let Err(e) = publish(&outcome) {
+                if !nowait {
+                    crate::process::release_wait_reap(child_pid);
+                }
+                return Err(e);
+            }
+            if nowait {
+                return Ok(Some(outcome));
+            }
+            // GAP-5 G8 (review D2): the child may have been reparented since
+            // the scan (its parent thread exited). Unlink it from its current
+            // parent; reparenting runs under the same table lock.
+            {
+                let table = crate::process::PROCESS_TABLE.lock();
+                let parent_pid = table
+                    .get(child_pid)
+                    .and_then(Option::as_ref)
+                    .map(|child| child.lock().ppid);
+                if let Some(parent) = parent_pid.and_then(|p| table.get(p).and_then(Option::as_ref))
+                {
+                    parent.lock().children.retain(|&c| c != child_pid);
+                }
+            }
+            cleanup_zombie(child_pid);
+            return Ok(Some(outcome));
+        }
+        if !selected_exists {
+            return Err(SyscallError::ECHILD);
+        }
+        if nohang {
+            return Ok(None);
+        }
+        if transient {
+            yield_and_halt();
+            continue;
+        }
+        {
+            let mut proc = caller.lock();
+            if crate::signal::should_abort_pending_block(&proc) {
+                return Err(SyscallError::EINTR);
+            }
+            if group.child_events() != events {
+                continue;
+            }
+            proc.enter_blocked_at(crate::get_ticks());
+            proc.waiting_child = Some(0);
+        }
+        crate::force_reschedule();
+        // Ready again, whether woken or not switched out at all.
+        let mut proc = caller.lock();
+        if proc.state == ProcessState::Blocked {
+            proc.enter_ready_at(crate::get_ticks());
+        }
+        proc.waiting_child = None;
+    }
+}
+
 /// sys_getpid - 获取当前进程ID
 ///
 /// F.1 PID Namespace: Returns the PID as seen from the process's owning namespace,
@@ -8181,6 +8972,23 @@ fn sys_getppid() -> SyscallResult {
         return Ok(0);
     }
 
+    // GAP-5 G8: a parent that is a non-leader thread (it forked this task, or
+    // took it over from an exiting sibling) is reported as its process, as
+    // Linux reports real_parent->tgid. The group's cached id in its own
+    // namespace covers a leader whose mapping is already gone.
+    let (parent_global_pid, parent_group) = match get_process(parent_global_pid) {
+        Some(parent) => {
+            let parent = parent.lock();
+            if parent.tgid != parent.pid {
+                let parent_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
+                (parent.tgid, Some((parent.ns_tgid, parent_ns)))
+            } else {
+                (parent_global_pid, None)
+            }
+        }
+        None => (parent_global_pid, None),
+    };
+
     // Try to translate parent's global PID to namespace-local PID
     if let Some(ns) = owning_ns {
         // Look up parent's PID in our namespace
@@ -8188,6 +8996,11 @@ fn sys_getppid() -> SyscallResult {
             #[cfg(feature = "kcov")]
             coverage::trace_pc(1122); // sys_getppid parent visible
             return Ok(ns_ppid);
+        }
+        if let Some((ns_tgid, Some(parent_ns))) = parent_group {
+            if ns_tgid != 0 && Arc::ptr_eq(&parent_ns, &ns) {
+                return Ok(ns_tgid);
+            }
         }
         // Parent not visible in our namespace - return 0 (orphan semantics)
         // This happens when parent is in an ancestor namespace
@@ -8256,6 +9069,62 @@ fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
 
     // 返回当前 TID (namespace-local)
     Ok(ns_tid)
+}
+
+/// sys_get_robust_list - GAP-5 G8: report a task's robust-list registration.
+///
+/// `pid` 0 names the caller. Another task must belong to the caller's thread
+/// group, or the caller must hold ADMIN or be host root (a conservative stand-in
+/// for Linux's ptrace-read check). `pid` is namespace-local. Writes the length
+/// (24 when registered, else 0) to `len_ptr` and the head address to `head_ptr`.
+fn sys_get_robust_list(pid: i32, head_ptr: *mut u64, len_ptr: *mut u64) -> SyscallResult {
+    if pid < 0 {
+        return Err(SyscallError::ESRCH);
+    }
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (caller_group, caller_ns) = {
+        let proc_arc = get_process(caller).ok_or(SyscallError::ESRCH)?;
+        let proc = proc_arc.lock();
+        (
+            Arc::clone(&proc.thread_group),
+            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain),
+        )
+    };
+    let target = if pid == 0 {
+        caller
+    } else if let Some(ns) = caller_ns {
+        crate::pid_namespace::resolve_pid_in_namespace(&ns, pid as ProcessId)
+            .ok_or(SyscallError::ESRCH)?
+    } else {
+        pid as ProcessId
+    };
+    let (head, len, same_group) = {
+        let target_arc = get_process(target).ok_or(SyscallError::ESRCH)?;
+        let t = target_arc.lock();
+        if matches!(t.state, ProcessState::Zombie | ProcessState::Terminated) {
+            return Err(SyscallError::ESRCH);
+        }
+        (
+            t.robust_list_head,
+            // Linux always reports sizeof(struct robust_list_head), 24.
+            24u64,
+            Arc::ptr_eq(&t.thread_group, &caller_group),
+        )
+    };
+    if !same_group
+        && !current_has_cap_rights(cap::CapRights::ADMIN)
+        && !crate::current_is_host_root()
+    {
+        return Err(SyscallError::EPERM);
+    }
+    if head_ptr.is_null() || len_ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    crate::usercopy::copy_to_user_safe(len_ptr as *mut u8, &len.to_ne_bytes())
+        .map_err(|_| SyscallError::EFAULT)?;
+    crate::usercopy::copy_to_user_safe(head_ptr as *mut u8, &head.to_ne_bytes())
+        .map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
 }
 
 /// sys_set_robust_list - 注册 robust_list 头指针
@@ -8412,8 +9281,20 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
     // namespace init.  The authoritative, pinned-Arc check remains in
     // `send_signal`; this probe only avoids doing the DAC/LSM work for the
     // common container-local SIGKILL case.
+    //
+    // GAP-5 (review D1): init is a process, so both checks name the target's
+    // thread group. Checked per task, any non-leader thread of an init could
+    // be signalled (and a fatal default ends the whole group).
+    let self_tgid = get_process(self_global_pid)
+        .ok_or(SyscallError::ESRCH)?
+        .lock()
+        .tgid;
+    let target_tgid = get_process(target_global_pid)
+        .ok_or(SyscallError::ESRCH)?
+        .lock()
+        .tgid;
     let mut namespace_init_supervisor = false;
-    if self_global_pid != target_global_pid {
+    if self_tgid != target_tgid {
         let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
         let (target_init_ns, target_user_ns) = {
             let target_proc = target.lock();
@@ -8422,9 +9303,7 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
                     .pid_ns_chain
                     .iter()
                     .rev()
-                    .find(|membership| {
-                        membership.pid == 1 || membership.ns.is_init(target_global_pid)
-                    })
+                    .find(|membership| membership.pid == 1 || membership.ns.is_init(target_tgid))
                     .map(|membership| membership.ns.clone()),
                 target_proc.user_ns.clone(),
             )
@@ -8469,7 +9348,7 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
         }
     }
 
-    if target_global_pid == 1 && self_global_pid != 1 {
+    if target_tgid == 1 && self_tgid != 1 {
         return Err(SyscallError::EPERM);
     }
 
@@ -8658,14 +9537,21 @@ fn sys_rt_sigprocmask(
     }
 
     // Apply under the lock; capture the previous mask for oldset.
-    let old = {
+    let (old, retarget) = {
         let mut proc = proc_arc.lock();
         let old = proc.blocked;
         if let Some(s) = new_set {
             proc.blocked = crate::signal::apply_sigprocmask(old, how, s);
         }
-        old
+        // GAP-5 G7 (review D3): group signals this task now blocks are left
+        // to another member, which is woken if it waits.
+        let retarget = (new_set.is_some() && proc.recalc_shared_signals(true))
+            .then(|| Arc::clone(&proc.thread_group));
+        (old, retarget)
     };
+    if let Some(group) = retarget {
+        crate::process::retarget_shared_signals(pid, &group);
+    }
 
     if !oldset.is_null() {
         copy_to_user(oldset, &old.to_ne_bytes())?;
@@ -8880,14 +9766,18 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
         let mut proc = arc.lock();
         generation = proc.generation;
         let Some(action) = pending_default_action(
-            proc.pending_signals.bits(),
+            proc.pending_bits(),
             proc.blocked,
             &proc.sigactions.lock(),
             sig,
         ) else {
             return;
         };
-        proc.pending_signals.clear(sig);
+        // GAP-5 G7: consume one instance, own set first, else the group's.
+        if !proc.claim_pending(sig) {
+            return;
+        }
+        proc.consume_own_pending(sig);
         match action {
             SignalAction::Terminate => {
                 // Self-termination immediately follows after releasing all PCB owners.
@@ -8912,6 +9802,8 @@ fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
         crate::process::terminate_group_self_and_halt(pid, code);
     }
     if stop {
+        // GAP-5 G7 (review D2): a stop stops the whole group, as at send time.
+        let _ = crate::process::propagate_group_job_control(pid, false);
         crate::process::wait_for_job_control_resume(pid, generation);
     }
 }
@@ -9166,12 +10058,32 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             );
             return;
         }
+        // GAP-5 G7 (review D3): a mask change since the last return (sigreturn,
+        // a handler's mask, a ppoll mask) may block group signals this task was
+        // chosen for; another member takes them over.
+        if proc.recalc_shared_signals(false) {
+            let group = Arc::clone(&proc.thread_group);
+            drop(proc);
+            crate::process::retarget_shared_signals(pid, &group);
+            proc = proc_arc.lock();
+        }
+        // GAP-5 G7 (review D3): a task with a posted fatal exit never takes a
+        // group signal; a live member gets it. The exit runs here instead.
+        if proc.pending_kill.load(AtomicOrdering::Acquire) {
+            drop(proc);
+            // The PCB reference must not outlive the abandoned stack.
+            drop(proc_arc);
+            if let Some(code) = crate::process::take_pending_process_exit(pid) {
+                terminate_self_and_halt(pid, code);
+            }
+            return;
+        }
         crate::signal::discard_inert_pending(&mut proc);
         // GAP-5: one coherent snapshot of the (possibly shared) table for the
         // whole Phase-1 decision.
         let actions = *proc.sigactions.lock();
         let sig = match crate::signal::select_for_delivery(
-            proc.pending_signals.bits(),
+            proc.pending_bits(),
             proc.blocked,
             proc.in_signal_handler,
             &actions,
@@ -9180,6 +10092,11 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             Some(signal) => signal,
             None => return,
         };
+        // GAP-5 G7: a group-wide signal moves into this task's own set before
+        // the frame is built and committed, so no other member delivers it too.
+        if !proc.claim_pending(sig) {
+            return;
+        }
         match crate::signal::resolve_disposition(&actions, sig) {
             crate::signal::Disposition::Handler {
                 handler,
@@ -9219,7 +10136,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
                 // (race: reset to SIG_IGN after queueing.) Drop the bit and stop.
                 drop(proc);
                 if let Some(a) = get_process(pid) {
-                    a.lock().pending_signals.clear(sig);
+                    a.lock().consume_own_pending(sig);
                 }
                 return;
             }
@@ -9285,7 +10202,11 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack.layout_floor(ctx.rsp)) {
             Ok(l) => l,
             // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
-            Err(_) => crate::process::terminate_group_self_and_halt(pid, 139),
+            // GAP-5 review: no PCB reference may outlive the abandoned stack.
+            Err(_) => {
+                drop(proc_arc);
+                crate::process::terminate_group_self_and_halt(pid, 139)
+            }
         };
     // D1RES-R1: heap-free staging — assembled in place into a kernel-stack buffer
     // (assemble_sigframe zero-fills it; the zero fill is load-bearing). Removes the
@@ -9303,6 +10224,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     .is_err()
     {
         // Corrupt layout (len mismatch) — same fatal disposition as a failed layout.
+        drop(proc_arc);
         crate::process::terminate_group_self_and_halt(pid, 139);
     }
     // M0-7 SLICE 5: PRE-GROW the user stack to back the sigframe write
@@ -9314,6 +10236,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         crate::elf_loader::user_stack_mapped_floor(),
     ) {
         if ensure_stack_backed(pid, layout.frame_base as usize).is_err() {
+            drop(proc_arc);
             crate::process::terminate_group_self_and_halt(pid, 139);
         }
     }
@@ -9321,6 +10244,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // EFAULT back into the interrupted context, and NEVER a catchable SIGSEGV here
     // (that would recurse). The pending bit is still set; we do not return.
     if copy_to_user(layout.frame_base as *mut u8, &buf).is_err() {
+        drop(proc_arc);
         crate::process::terminate_group_self_and_halt(pid, 139);
     }
 
@@ -9344,9 +10268,9 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         return;
     }
 
-    {
+    let retarget = {
         let mut proc = proc_arc.lock();
-        proc.pending_signals.clear(sig);
+        proc.consume_own_pending(sig);
         // M0-6 poll/select: if a ppoll/pselect6 left its ORIGINAL mask stashed
         // (temp mask still live so THIS signal became deliverable), that original
         // mask — not the live temp mask (`old_blocked`) — is what rt_sigreturn must
@@ -9374,10 +10298,18 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             proc.sigactions
                 .reset_if_unchanged((sig.as_u8() - 1) as usize, delivered_action);
         }
+        // GAP-5 G7 (review D3): the handler's mask may block group signals
+        // this task was chosen for; another member takes them over.
+        proc.recalc_shared_signals(false)
+            .then(|| Arc::clone(&proc.thread_group))
+    };
+    if let Some(group) = retarget {
+        crate::process::retarget_shared_signals(pid, &group);
     }
 
     // smp-toctou: a SIGKILL could have raced in during the interrupt-enabled build
     // window. Re-check the pending-kill flag AFTER commit — SIGKILL still wins.
+    drop(proc_arc);
     if let Some(code) = crate::process::take_pending_process_exit(pid) {
         terminate_self_and_halt(pid, code);
     }
@@ -9522,7 +10454,7 @@ pub fn try_deliver_signal_on_irq_return(
     };
 
     // FIX A: try_lock instead of blocking .lock().
-    let proc_guard = match proc_arc.try_lock() {
+    let mut proc_guard = match proc_arc.try_lock() {
         Some(g) => g,
         None => {
             // Process lock contended — defer.
@@ -9574,7 +10506,7 @@ pub fn try_deliver_signal_on_irq_return(
             return None;
         };
         let sig = match crate::signal::select_for_delivery(
-            proc_guard.pending_signals.bits() & !crate::signal::uncatchable_mask(),
+            proc_guard.pending_bits() & !crate::signal::uncatchable_mask(),
             proc_guard.blocked,
             proc_guard.in_signal_handler,
             &actions,
@@ -9590,6 +10522,11 @@ pub fn try_deliver_signal_on_irq_return(
         // stay on the normal safe-point path, where their default action or
         // pending-bit cleanup is applied with the full syscall context.
         if !sa.is_handler() {
+            return None;
+        }
+        // GAP-5 G7: take a group-wide signal into this task's own set before
+        // the frame is built; another member that already took it delivers it.
+        if !proc_guard.claim_pending(sig) {
             return None;
         }
 
@@ -9760,7 +10697,10 @@ pub fn try_deliver_signal_on_irq_return(
         crate::request_resched_from_irq();
         return None;
     }
-    proc.pending_signals.clear(sig);
+    // The mask raised below may block group signals this task was chosen
+    // for; its next syscall return hands them on (`recalc_shared_signals`),
+    // since the IRQ path cannot take PROCESS_TABLE.
+    proc.consume_own_pending(sig);
     proc.saved_blocked = old_blocked;
     let mut newmask = old_blocked | sa_mask;
     if sa_flags & crate::signal::SA_NODEFER == 0 {
@@ -14744,7 +15684,7 @@ fn sys_mmap(
             // later small auto-mmap would get a FALSE ENOMEM while the tail gap
             // [USER_STACK_TOP, USER_SPACE_TOP) is still free. Jump past the window; an
             // over-large request is still rejected by the USER_SPACE_TOP check below.
-            let (win_start, win_end) = crate::elf_loader::user_stack_window();
+            let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
             resolve_auto_mmap_base(candidate, length_aligned, win_start, win_end)
         } else {
             addr
@@ -14787,7 +15727,7 @@ fn sys_mmap(
             // auto-placement arm (addr==0) cannot reach this: `resolve_auto_mmap_base`
             // already skipped the window above, so `base` is either below win_start or at
             // win_end (==USER_STACK_TOP, not `< win_end`). Half-open intersection test.
-            let (win_start, win_end) = crate::elf_loader::user_stack_window();
+            let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
             if base < win_end && end > win_start {
                 return Err(SyscallError::EINVAL);
             }
@@ -22753,9 +23693,20 @@ fn sys_ppoll(
     // Mask swap = the LAST op before the wait; hold this Arc across the wait
     // (never re-lookup by pid — a None lookup would silently skip the restore).
     let old_mask: Option<u64> = new_mask.map(|m| {
-        let mut p = proc_arc.lock();
-        let old = p.blocked;
-        p.blocked = crate::signal::apply_sigprocmask(old, SIG_SETMASK, m);
+        let (old, retarget) = {
+            let mut p = proc_arc.lock();
+            let old = p.blocked;
+            p.blocked = crate::signal::apply_sigprocmask(old, SIG_SETMASK, m);
+            // GAP-5 G7 (review D2): a group signal the temporary mask lets
+            // through ends the wait at once, as Linux set_user_sigmask does.
+            let retarget = p
+                .recalc_shared_signals(true)
+                .then(|| Arc::clone(&p.thread_group));
+            (old, retarget)
+        };
+        if let Some(group) = retarget {
+            crate::process::retarget_shared_signals(pid, &group);
+        }
         old
     });
 
@@ -23036,9 +23987,20 @@ fn sys_pselect6(
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     let old_mask: Option<u64> = new_mask.map(|m| {
-        let mut p = proc_arc.lock();
-        let old = p.blocked;
-        p.blocked = crate::signal::apply_sigprocmask(old, SIG_SETMASK, m);
+        let (old, retarget) = {
+            let mut p = proc_arc.lock();
+            let old = p.blocked;
+            p.blocked = crate::signal::apply_sigprocmask(old, SIG_SETMASK, m);
+            // GAP-5 G7 (review D2): a group signal the temporary mask lets
+            // through ends the wait at once, as Linux set_user_sigmask does.
+            let retarget = p
+                .recalc_shared_signals(true)
+                .then(|| Arc::clone(&p.thread_group));
+            (old, retarget)
+        };
+        if let Some(group) = retarget {
+            crate::process::retarget_shared_signals(pid, &group);
+        }
         old
     });
 
@@ -23300,7 +24262,7 @@ fn sys_mremap(
                 if base < crate::usercopy::MMAP_MIN_ADDR || end > USER_SPACE_TOP {
                     return Ok(false);
                 }
-                let (win_start, win_end) = crate::elf_loader::user_stack_window();
+                let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
                 if base < win_end && end > win_start {
                     return Ok(false);
                 }
@@ -23374,7 +24336,8 @@ fn sys_mremap(
                         } else {
                             candidate
                         };
-                        let (win_start, win_end) = crate::elf_loader::user_stack_window();
+                        let (win_start, win_end) =
+                            crate::elf_loader::user_mapping_reserved_window();
                         let base = resolve_auto_mmap_base(candidate, new_len, win_start, win_end);
                         let end = base.checked_add(new_len).ok_or(SyscallError::EFAULT)?;
                         if !range_is_free(&mm, base, end)? {

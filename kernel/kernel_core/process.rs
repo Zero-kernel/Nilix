@@ -901,6 +901,16 @@ fn finish_reaping_identity(pid: ProcessId, tgid: ProcessId) {
     }
 }
 
+/// GAP-5 leader exec: whether a reaped member of `tgid` is still in its Phase-2
+/// cleanup (`free_process_resources` and the raw-PID callbacks).
+pub(crate) fn tgid_reap_in_flight(tgid: ProcessId) -> bool {
+    REAPING_PID_STATE
+        .lock()
+        .tgid_inflight
+        .get(tgid)
+        .is_some_and(|inflight| *inflight > 0)
+}
+
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
 /// 返回 Ok((栈底, 栈顶))，栈向下生长，栈顶用于 TSS.rsp0
@@ -2535,25 +2545,122 @@ pub struct ThreadGroup {
     /// R153-3: set by exit_group() before sibling marking begins;
     /// sys_clone(CLONE_THREAD) refuses while it is set.
     pub exiting: AtomicBool,
+    /// The leader is killing the other members before exec. Unlike `exiting`
+    /// it is cleared again when exec returns.
+    exec_draining: AtomicBool,
     /// Tasks of this group present in PROCESS_TABLE, leader included. Changed
     /// only while PROCESS_TABLE is locked.
     members: AtomicUsize,
     /// The group's exit has been reported to the leader's parent.
     parent_notified: AtomicBool,
+    /// G7: process-directed pending signals (one bit per signal), visible to
+    /// every member. Members claim a bit into their own set before delivery.
+    shared_pending: AtomicU64,
+    /// G8: members that have not begun exiting. Each task leaves exactly once
+    /// (`Process.group_live`); the task that takes it to zero is the group's
+    /// last live member and runs the process-wide exit work (namespace-init
+    /// cascade).
+    live: AtomicUsize,
+    /// G8 (review D3): counts children of members that became reportable. A
+    /// member waiting for children re-reads it under its PCB lock before it
+    /// sleeps, so a report between its scan and its sleep is never missed.
+    child_events: AtomicU64,
+    /// G8 (review D3): members inside a group-wide wait for children; a
+    /// report scans for sleeping members only while this is non-zero.
+    child_waiters: AtomicUsize,
 }
 
 impl ThreadGroup {
     pub const fn new() -> Self {
         Self {
             exiting: AtomicBool::new(false),
+            exec_draining: AtomicBool::new(false),
             members: AtomicUsize::new(1),
             parent_notified: AtomicBool::new(false),
+            shared_pending: AtomicU64::new(0),
+            live: AtomicUsize::new(1),
+            child_events: AtomicU64::new(0),
+            child_waiters: AtomicUsize::new(0),
         }
+    }
+
+    /// G8 (review D3): the child-report count a group-wide wait compares
+    /// before it sleeps.
+    pub(crate) fn child_events(&self) -> u64 {
+        self.child_events.load(Ordering::SeqCst)
+    }
+
+    /// G8 (review D3): a member starts (`true`) or ends (`false`) a group-wide
+    /// wait for children. Start before the first child-report read.
+    pub(crate) fn note_child_waiter(&self, waiting: bool) {
+        if waiting {
+            // lint-fetch-add: allow (bounded by the group's members)
+            self.child_waiters.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let previous = self.child_waiters.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(previous >= 1, "GAP-5 G8: child waiter count underflow");
+        }
+    }
+
+    /// G8: members that have not begun exiting.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// G8: a member begins exiting; true for the last live member.
+    pub(crate) fn leave_live(&self) -> bool {
+        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous >= 1, "GAP-5 G8: live member count underflow");
+        previous == 1
+    }
+
+    /// G7: the group's process-directed pending set.
+    pub fn shared_pending(&self) -> u64 {
+        self.shared_pending.load(Ordering::Acquire)
+    }
+
+    /// G7: queue a process-directed signal for the whole group.
+    pub(crate) fn queue_shared(&self, bit: u64) {
+        self.shared_pending.fetch_or(bit, Ordering::AcqRel);
+    }
+
+    /// G7: drop `mask` from the group set.
+    pub(crate) fn discard_shared(&self, mask: u64) {
+        self.shared_pending.fetch_and(!mask, Ordering::AcqRel);
+    }
+
+    /// G7: take `bit` out of the group set; true for exactly one caller.
+    pub(crate) fn claim_shared(&self, bit: u64) -> bool {
+        self.shared_pending.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
 
     /// Tasks of this group currently in PROCESS_TABLE.
     pub fn members(&self) -> usize {
         self.members.load(Ordering::Acquire)
+    }
+
+    /// No thread may join: the group is exiting, or its leader is draining
+    /// the other members for exec. sys_clone(CLONE_THREAD) checks this at
+    /// publication under PROCESS_TABLE.
+    pub fn closed(&self) -> bool {
+        self.exiting.load(Ordering::Acquire) || self.exec_draining.load(Ordering::Acquire)
+    }
+
+    /// The leader is ending the other members for exec.
+    pub fn exec_draining(&self) -> bool {
+        self.exec_draining.load(Ordering::Acquire)
+    }
+
+    /// Claim the exec drain. Fails when another drain holds it.
+    pub(crate) fn try_begin_exec_drain(&self) -> bool {
+        self.exec_draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release a drain claimed by `try_begin_exec_drain`.
+    pub(crate) fn end_exec_drain(&self) {
+        self.exec_draining.store(false, Ordering::Release);
     }
 
     /// Count a newly published member. Caller holds PROCESS_TABLE.
@@ -2563,6 +2670,9 @@ impl ThreadGroup {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .expect("GAP-5 G1: thread group member count overflow");
         assert!(previous >= 1, "GAP-5 G1: thread joined an empty group");
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .expect("GAP-5 G8: live member count overflow");
     }
 
     /// Drop a member removed from PROCESS_TABLE; returns the remaining count.
@@ -2827,6 +2937,25 @@ pub struct Process {
     /// PCB's lock by the poster; `terminate_process` (process context) marks
     /// the other members. Plain `exit` and exit_group siblings leave it clear.
     pub(crate) group_fatal: bool,
+    /// GAP-5 G8: this task still counts in its group's live members; cleared
+    /// exactly once when it begins exiting (or is rolled back unscheduled).
+    pub(crate) group_live: bool,
+    /// GAP-5 G8: a waiter has claimed this zombie for reaping. Several threads
+    /// of the parent's group may wait at once; exactly one reports and reaps.
+    pub(crate) wait_claimed: AtomicBool,
+    /// GAP-5 exec step 2: an exec a non-leader handed to this group leader.
+    /// Stored and taken only on the leader; see `publish_exec_handoff`.
+    pub(crate) exec_handoff: Option<Box<ExecHandoff>>,
+    /// GAP-5 G7: process-directed signals this task moved out of the group set
+    /// (`claim_pending`) that are still in its own set. They go back to the
+    /// group if this task exits or blocks them before delivering them.
+    pub(crate) group_claimed: u64,
+    /// GAP-5 G7: the group signals this task was chosen to act on (Linux sets
+    /// TIF_SIGPENDING on the chosen thread only; one bit per signal here, so
+    /// a choice for one signal never interrupts a wait for another). Only
+    /// these group signals interrupt its waits; any member still takes any
+    /// group signal at a safe point.
+    pub(crate) shared_chosen: u64,
 
     /// R115-1 FIX: Cross-CPU exit request flag.
     ///
@@ -3553,6 +3682,11 @@ impl Process {
             exit_code: None,
             thread_group,
             group_fatal: false,
+            group_live: true,
+            wait_claimed: AtomicBool::new(false),
+            exec_handoff: None,
+            group_claimed: 0,
+            shared_chosen: 0,
             pending_kill: AtomicBool::new(false),
             pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
@@ -4284,6 +4418,103 @@ impl Process {
     }
 
     #[inline]
+    /// GAP-5 (review D4): return the payload-charge share of an object this task
+    /// allocated and then gave up for its creator's shared one (`drop_displaced`).
+    pub(crate) fn release_displaced_charge(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(charge) = self._heap_charge.as_mut() {
+            charge
+                .release_after_deallocation(bytes)
+                .expect("GAP-5: displaced object charge exceeds the PCB payload");
+        }
+    }
+
+    /// GAP-5 G7: the pending set this task can act on: its own (thread-directed)
+    /// signals plus its group's process-directed ones.
+    pub fn pending_bits(&self) -> u64 {
+        self.pending_signals.bits() | self.thread_group.shared_pending()
+    }
+
+    /// GAP-5 G7: make sure this task holds `signal` in its own set before acting
+    /// on it. A signal only in the group set is moved here atomically, so of
+    /// several members that selected it exactly one gets it. Returns false when
+    /// another member already took it.
+    pub(crate) fn claim_pending(&mut self, signal: crate::signal::Signal) -> bool {
+        if self.pending_signals.is_pending(signal) {
+            return true;
+        }
+        if self.thread_group.claim_shared(signal.bit()) {
+            self.pending_signals.set(signal);
+            self.group_claimed |= signal.bit();
+            return true;
+        }
+        false
+    }
+
+    /// GAP-5 G7: drop `signal` from this task's own set and its group's set.
+    pub(crate) fn discard_pending(&mut self, signal: crate::signal::Signal) {
+        self.pending_signals.clear(signal);
+        self.group_claimed &= !signal.bit();
+        self.thread_group.discard_shared(signal.bit());
+    }
+
+    /// GAP-5 G7: the pending set that interrupts this task's waits: its own
+    /// signals, plus the group signals it is the member chosen for.
+    pub fn wait_pending_bits(&self) -> u64 {
+        self.pending_signals.bits() | (self.thread_group.shared_pending() & self.shared_chosen)
+    }
+
+    /// GAP-5 G7: this task delivered or consumed `signal`; it is no longer
+    /// pending here and no longer a claimed group signal to hand back.
+    pub(crate) fn consume_own_pending(&mut self, signal: crate::signal::Signal) {
+        self.pending_signals.clear(signal);
+        self.group_claimed &= !signal.bit();
+    }
+
+    /// GAP-5 G7 (review D3, Linux `recalc_sigpending` with
+    /// `retarget_shared_pending`): run after this task's mask or handler state
+    /// changed. Claimed group signals it now blocks go back to the group, and
+    /// it stays chosen only for group signals it can take now: unblocked ones,
+    /// and none while it runs a handler (frames do not nest here, so a caught
+    /// signal waits until the handler returns). With `mark` (a mask the task
+    /// itself installs: `rt_sigprocmask`, `ppoll`, `pselect6`) it also becomes
+    /// chosen for every group signal it can take, as Linux `set_current_blocked`
+    /// does, so a wait that opens the mask for an already queued signal returns
+    /// at once. Returns whether another member must be chosen for signals this
+    /// task gave up or handed back: call `retarget_shared_signals` after the
+    /// lock is released.
+    pub(crate) fn recalc_shared_signals(&mut self, mark: bool) -> bool {
+        let returned = self.return_claimed_signals(self.blocked);
+        let shared = self.thread_group.shared_pending();
+        let takeable = if self.in_signal_handler {
+            0
+        } else {
+            shared & !self.blocked
+        };
+        let given_up = self.shared_chosen & shared & !takeable;
+        self.shared_chosen = if mark {
+            takeable
+        } else {
+            self.shared_chosen & takeable
+        };
+        returned != 0 || given_up != 0
+    }
+
+    /// GAP-5 G7 (review D3): put claimed-but-undelivered group signals in
+    /// `mask` back into the group set. Returns the bits moved.
+    pub(crate) fn return_claimed_signals(&mut self, mask: u64) -> u64 {
+        let back = self.pending_signals.bits() & self.group_claimed & mask;
+        self.group_claimed &= !mask;
+        if back != 0 {
+            self.pending_signals
+                .replace_bits(self.pending_signals.bits() & !back);
+            self.thread_group.queue_shared(back);
+        }
+        back
+    }
+
     pub(crate) fn apply_capability_cloexec(&mut self) {
         self.cap_table.apply_cloexec();
     }
@@ -6451,6 +6682,29 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .count()
 }
 
+/// GAP-5 leader exec: tasks outside `group` that share `memory_space`, such as
+/// a `CLONE_VM` child that is not a thread. Zombies count, as in
+/// `address_space_share_count`. Call with no lock held.
+pub(crate) fn address_space_foreign_sharers(
+    memory_space: usize,
+    group: &Arc<ThreadGroup>,
+) -> usize {
+    if memory_space == 0 {
+        return 0;
+    }
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .flatten()
+        .filter(|process| {
+            let p = process.lock();
+            p.memory_space == memory_space
+                && p.state != ProcessState::Terminated
+                && !Arc::ptr_eq(&p.thread_group, group)
+        })
+        .count()
+}
+
 /// R181-3 FIX: lock-order-safe CLONE_VM share re-count for callers that HOLD a
 /// Process::inner lock (the cgroupfs/attach migration window). The blocking
 /// `address_space_share_count` takes PROCESS_TABLE then locks every
@@ -6871,6 +7125,404 @@ pub fn request_exit_group_atomic(
     marked
 }
 
+/// GAP-5 exec step 2: an exec that a non-leader T hands its group leader L,
+/// which runs it under the group's PID (the PID fixes the kernel stack and
+/// every PID-keyed registration, so T cannot take it over). Built by T,
+/// stored only in L's PCB, taken only by L.
+pub struct ExecHandoff {
+    pub(crate) elf_data: Vec<u8>,
+    pub(crate) argv: Vec<Vec<u8>>,
+    pub(crate) envp: Vec<Vec<u8>>,
+    pub(crate) execfn: Vec<u8>,
+    pub(crate) thread: HandoffThreadState,
+    /// The exec front-end's staging admission; held until L's exec returns.
+    pub(crate) peak: Option<mm::TransientPeakGuard>,
+    /// User address of T's trampoline (mapped before the handoff is built).
+    stub_va: u64,
+}
+
+impl core::fmt::Debug for ExecHandoff {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExecHandoff")
+            .field("image_len", &self.elf_data.len())
+            .field("thread", &self.thread)
+            .field("stub_va", &self.stub_va)
+            .finish_non_exhaustive()
+    }
+}
+
+/// GAP-5 exec step 2: handoffs stored in some leader's PCB, so the timer-IRQ
+/// hook can skip its lookup on the common path.
+static EXEC_HANDOFFS_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Take the handoff out of `proc` (caller holds its guard).
+fn take_handoff_locked(proc: &mut Process) -> Option<Box<ExecHandoff>> {
+    let handoff = proc.exec_handoff.take()?;
+    EXEC_HANDOFFS_PENDING.fetch_sub(1, Ordering::AcqRel);
+    Some(handoff)
+}
+
+/// T's own state that Linux keeps across exec and that can differ from L's
+/// here. Everything else a thread has is shared with L (credentials, the
+/// capability table, dispositions) or fixed for the group (cgroup, the
+/// namespaces `unshare`/`setns` refuse to change in a group).
+#[derive(Debug)]
+pub struct HandoffThreadState {
+    pub(crate) blocked: u64,
+    /// T's thread-directed pending signals; they replace L's own.
+    pub(crate) pending: u64,
+    pub(crate) rlimits: [RLimit; RLIMIT_NLIMITS],
+    pub(crate) allowed_cpus: u64,
+    pub(crate) seccomp_state: SeccompState,
+    pub(crate) seccomp_generation: u64,
+    pub(crate) pledge_state: Option<PledgeState>,
+    pub(crate) pid_ns_for_children: crate::pid_namespace::PidNamespaceArc,
+    /// T's fd table and fs context, when they are not L's
+    /// (`CLONE_FILES` and `CLONE_FS` are optional for threads). The handoff
+    /// holds its own owner count on the table (`add_owner` when built), so
+    /// T's exit cannot close it first; L inherits that count, and a handoff
+    /// that never runs gives it back (`discard_exec_handoff`).
+    pub(crate) files: Option<Arc<FilesTable>>,
+    pub(crate) fs: Option<Arc<crate::fs_context::FsContextHandle>>,
+}
+
+impl ExecHandoff {
+    pub(crate) fn try_new(
+        elf_data: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+        execfn: Vec<u8>,
+        thread: HandoffThreadState,
+        peak: Option<mm::TransientPeakGuard>,
+        stub_va: u64,
+    ) -> Result<Box<Self>, AllocError> {
+        Box::try_new(Self {
+            elf_data,
+            argv,
+            envp,
+            execfn,
+            thread,
+            peak,
+            stub_va,
+        })
+    }
+}
+
+/// Drop a handoff that will not run, giving back the fd-table owner count it
+/// holds. `holder` is any live task of the group (its capability table and
+/// cgroup are the group's); the extracted descriptors drop after its lock.
+pub fn discard_exec_handoff(holder: &ProcessArc, handoff: Box<ExecHandoff>) {
+    if let Some(files) = handoff.thread.files.as_ref() {
+        give_back_files_owner(holder, files);
+    }
+    drop(handoff);
+}
+
+/// Give back one owner count of `files` that was taken for `holder`'s group;
+/// a last owner closes the table, its descriptors dropping after the lock.
+pub fn give_back_files_owner(holder: &ProcessArc, files: &Arc<FilesTable>) {
+    let released = {
+        let proc = holder.lock();
+        release_files_owner_locked(&proc, files)
+    };
+    drop(released);
+}
+
+/// Why `publish_exec_handoff` refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffRefusal {
+    /// `exit_group` or a group-fatal exit is under way.
+    GroupExiting,
+    /// The leader is gone, a zombie, already exiting, or about to be killed.
+    LeaderGone,
+}
+
+/// Make a parked leader runnable for its handoff and clear a job-control stop,
+/// the way a fatal post does (the exec'ing thread was running, so the process
+/// it becomes is not stopped). Caller holds `proc`'s guard.
+fn ready_for_exec_handoff_locked(proc: &mut Process, now_tick: u64) {
+    let actively_running = proc.on_cpu.load(Ordering::Acquire)
+        && matches!(proc.state, ProcessState::Running | ProcessState::Ready);
+    let needs_ready = proc.state != ProcessState::Provisioning
+        && !actively_running
+        && proc.state != ProcessState::Ready;
+    if needs_ready || (proc.state == ProcessState::Ready && proc.stopped) {
+        proc.enter_ready_at(now_tick);
+    }
+    proc.stopped = false;
+}
+
+/// True when `leader` can accept a handoff from a member of `group`.
+fn leader_accepts_exec_handoff(
+    leader: &Process,
+    leader_pid: ProcessId,
+    group: &Arc<ThreadGroup>,
+) -> bool {
+    Arc::ptr_eq(&leader.thread_group, group)
+        && leader.tgid == leader_pid
+        && leader.group_live
+        && !matches!(
+            leader.state,
+            ProcessState::Zombie | ProcessState::Terminated
+        )
+        && !leader.pending_kill.load(Ordering::Acquire)
+        && leader.exec_handoff.is_none()
+}
+
+/// GAP-5 exec step 2, the point of no return. Under `PROCESS_TABLE`: store
+/// `handoff` in the leader's PCB and wake it, then post a fatal exit to every
+/// other member except the leader and `caller_pid`. `exit_group` publishes
+/// `exiting` before its own scan takes this lock, so either it is seen here
+/// (refused) or its scan comes later and ends the leader too.
+pub fn publish_exec_handoff(
+    caller_pid: ProcessId,
+    leader_pid: ProcessId,
+    group: &Arc<ThreadGroup>,
+    handoff: Box<ExecHandoff>,
+    exit_code: i32,
+) -> Result<ProcessArc, (Box<ExecHandoff>, HandoffRefusal)> {
+    let table = PROCESS_TABLE.lock();
+    if group.exiting.load(Ordering::Acquire) {
+        return Err((handoff, HandoffRefusal::GroupExiting));
+    }
+    let Some(leader_arc) = table.get(leader_pid).and_then(Option::as_ref).cloned() else {
+        return Err((handoff, HandoffRefusal::LeaderGone));
+    };
+    let now_tick = crate::get_ticks();
+    {
+        let mut leader = leader_arc.lock();
+        if !leader_accepts_exec_handoff(&leader, leader_pid, group) {
+            drop(leader);
+            return Err((handoff, HandoffRefusal::LeaderGone));
+        }
+        leader.exec_handoff = Some(handoff);
+        // lint-fetch-add: allow (at most one pending handoff per group)
+        EXEC_HANDOFFS_PENDING.fetch_add(1, Ordering::AcqRel);
+        ready_for_exec_handoff_locked(&mut leader, now_tick);
+    }
+    for (pid, slot) in table.iter().enumerate() {
+        if pid == caller_pid || pid == leader_pid {
+            continue;
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if Arc::ptr_eq(&proc.thread_group, group)
+                && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
+            {
+                let _ = request_process_exit_locked(&mut proc, exit_code, now_tick);
+            }
+        }
+    }
+    // RF178-35: never send an IPI while PROCESS_TABLE or a PCB is held.
+    drop(table);
+    let _ = finish_process_exit_request(FatalExitPost::Kick);
+    Ok(leader_arc)
+}
+
+/// State of a published handoff, seen by the thread that published it.
+#[derive(Debug)]
+pub enum HandoffPoll {
+    Pending,
+    /// The leader took it.
+    Taken,
+    /// The leader is exiting or gone. The handoff comes back to the caller
+    /// unless the leader's exit already discarded it.
+    Abandoned(Option<Box<ExecHandoff>>),
+}
+
+/// Checked in this order because a leader's exit discards a handoff it never
+/// took: an empty slot means "taken" only while the leader is live. (A leader
+/// that took the handoff and then died also reads as abandoned; its death ends
+/// the caller as well, so the caller never acts on it.)
+pub fn poll_exec_handoff(leader: &ProcessArc) -> HandoffPoll {
+    let mut proc = leader.lock();
+    if !proc.group_live || matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+        return HandoffPoll::Abandoned(take_handoff_locked(&mut proc));
+    }
+    if proc.exec_handoff.is_none() {
+        return HandoffPoll::Taken;
+    }
+    HandoffPoll::Pending
+}
+
+/// The parts of a handoff the leader's exec consumes, after its thread state
+/// has been installed.
+pub struct TakenExecHandoff {
+    pub elf_data: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+    pub envp: Vec<Vec<u8>>,
+    pub execfn: Vec<u8>,
+    /// The exec'ing thread's staging admission; drop after the exec.
+    pub peak: Option<mm::TransientPeakGuard>,
+}
+
+/// Take the leader's pending handoff and install T's thread state (design
+/// step 5). Old handles are dropped, and an fd table this leader was the last
+/// owner of is closed, after the PCB lock is released.
+pub fn take_exec_handoff(process: &ProcessArc) -> Option<TakenExecHandoff> {
+    let (taken, released_fds, old_files, old_fs, old_seccomp, old_pledge, old_pid_ns, kick) = {
+        let mut proc = process.lock();
+        let handoff = take_handoff_locked(&mut proc)?;
+        let ExecHandoff {
+            elf_data,
+            argv,
+            envp,
+            execfn,
+            thread,
+            peak,
+            ..
+        } = *handoff;
+        proc.blocked = thread.blocked;
+        // GAP-5 G7 (review D3): group signals the leader claimed but had not
+        // delivered go back to the group before its own set is replaced, so
+        // the new image still receives them.
+        let _ = proc.return_claimed_signals(u64::MAX);
+        proc.pending_signals.replace_bits(thread.pending);
+        proc.rlimits = thread.rlimits;
+        let kick = proc.allowed_cpus != thread.allowed_cpus;
+        proc.allowed_cpus = thread.allowed_cpus;
+        let old_seccomp = core::mem::replace(&mut proc.seccomp_state, thread.seccomp_state);
+        // Strictly newer than either task's, so no saved snapshot of L's old
+        // state can match the installed one.
+        proc.seccomp_generation = proc
+            .seccomp_generation
+            .max(thread.seccomp_generation)
+            .wrapping_add(1);
+        let old_pledge = core::mem::replace(&mut proc.pledge_state, thread.pledge_state);
+        let old_pid_ns =
+            core::mem::replace(&mut proc.pid_ns_for_children, thread.pid_ns_for_children);
+        let (released_fds, old_files) = match thread.files {
+            Some(files) => {
+                // The handoff's owner count becomes L's.
+                let old = core::mem::replace(&mut proc.files, files);
+                let released = release_files_owner_locked(&proc, &old);
+                (released, Some(old))
+            }
+            None => (AdmittedMap::new(HeapClass::CoreProcess), None),
+        };
+        let old_fs = thread.fs.map(|fs| core::mem::replace(&mut proc.fs, fs));
+        (
+            TakenExecHandoff {
+                elf_data,
+                argv,
+                envp,
+                execfn,
+                peak,
+            },
+            released_fds,
+            old_files,
+            old_fs,
+            old_seccomp,
+            old_pledge,
+            old_pid_ns,
+            kick,
+        )
+    };
+    // R154-3: descriptors and handles drop with no PCB lock held.
+    drop(released_fds);
+    drop(old_files);
+    drop(old_fs);
+    drop(old_seccomp);
+    drop(old_pid_ns);
+    if kick {
+        let _ = crate::signal::kernel_kick_reschedule();
+    }
+    Some(taken)
+}
+
+/// What a syscall safe point must do for the current task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallSafePoint {
+    Continue,
+    /// A posted fatal exit, consumed; the caller terminates with this code.
+    Exit(i32),
+    /// Run the exec handed to this leader.
+    ExecHandoff,
+}
+
+/// Decision shared by both syscall safe points; caller holds `proc`'s guard.
+/// A posted fatal exit always wins over a handoff.
+fn syscall_safe_point_locked(proc: &mut Process, frame_bound: bool) -> SyscallSafePoint {
+    if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+        proc.pending_kill.store(false, Ordering::Relaxed);
+        return SyscallSafePoint::Continue;
+    }
+    if proc.pending_kill.swap(false, Ordering::AcqRel) {
+        return SyscallSafePoint::Exit(proc.pending_exit_code.load(Ordering::Acquire));
+    }
+    if proc.exec_handoff.is_some() && frame_bound {
+        SyscallSafePoint::ExecHandoff
+    } else {
+        SyscallSafePoint::Continue
+    }
+}
+
+/// Syscall-entry safe point: consume a posted fatal exit, snapshot the live
+/// frame binding (`binding`, `None` when invalid) when the caller asks for it
+/// or the task is in a group with more than one member (a non-leader's exec
+/// may need this frame), and report a pending handoff. One PCB lock.
+pub fn syscall_entry_safe_point(
+    pid: ProcessId,
+    binding: Option<(u64, u64)>,
+    want_snapshot: bool,
+) -> SyscallSafePoint {
+    let Some(proc_arc) = get_process(pid) else {
+        return SyscallSafePoint::Continue;
+    };
+    let mut proc = proc_arc.lock();
+    let decision = syscall_safe_point_locked(&mut proc, binding.is_some());
+    if let SyscallSafePoint::Exit(_) = decision {
+        return decision;
+    }
+    let multi_member = proc.thread_group.members() > 1;
+    if want_snapshot || proc.exec_handoff.is_some() || multi_member {
+        let (frame_ptr, owner) = binding.unwrap_or((0, 0));
+        proc.saved_frame_ptr = frame_ptr;
+        proc.saved_frame_owner = owner;
+    }
+    // GAP-5 G7 (review D3): a handler entered from an interrupt raised the
+    // mask without a recalculation (that path cannot take PROCESS_TABLE). Hand
+    // group signals it can no longer take to another member before this call
+    // can block.
+    let retarget =
+        (multi_member && proc.recalc_shared_signals(false)).then(|| Arc::clone(&proc.thread_group));
+    drop(proc);
+    if let Some(group) = retarget {
+        retarget_shared_signals(pid, &group);
+    }
+    decision
+}
+
+/// Syscall-return safe point: like `take_pending_process_exit`, and reports a
+/// pending handoff when the frame binding saved at entry belongs to `pid`.
+pub fn syscall_return_safe_point(pid: ProcessId) -> SyscallSafePoint {
+    let Some(proc_arc) = get_process(pid) else {
+        return SyscallSafePoint::Continue;
+    };
+    let mut proc = proc_arc.lock();
+    let frame_bound = proc.saved_frame_ptr != 0 && proc.saved_frame_owner == pid as u64;
+    syscall_safe_point_locked(&mut proc, frame_bound)
+}
+
+/// Timer-interrupt return to ring 3 (try-lock only): the trampoline address
+/// when this task has a ready handoff and no posted fatal exit.
+pub fn try_exec_handoff_stub(pid: ProcessId) -> Option<u64> {
+    if EXEC_HANDOFFS_PENDING.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let Some(Some(proc_arc)) = try_get_process(pid) else {
+        return None;
+    };
+    let proc = proc_arc.try_lock()?;
+    if proc.pending_kill.load(Ordering::Acquire) {
+        return None;
+    }
+    proc.exec_handoff
+        .as_ref()
+        .map(|handoff| handoff.stub_va)
+        .filter(|&stub_va| stub_va != 0)
+}
+
 /// R115-1 FIX: Request that a remote process terminates itself at a safe point.
 ///
 /// Used by `exit_group()` to avoid cross-CPU UAF: sibling threads may be running
@@ -6886,6 +7538,19 @@ pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
     };
 
     request_process_exit_arc(&proc_arc, exit_code)
+}
+
+/// GAP-5 exec step 2: post an exit to `proc_arc` unless one is already
+/// pending, so a concurrent fatal post keeps its own exit code.
+pub fn request_process_exit_if_unposted(proc_arc: &ProcessArc, exit_code: i32) -> bool {
+    let post = {
+        let mut proc = proc_arc.lock();
+        if proc.pending_kill.load(Ordering::Acquire) {
+            return true;
+        }
+        request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
+    };
+    finish_process_exit_request(post)
 }
 
 /// RF178-14 FIX: Post a fatal-exit request against an already-authorized
@@ -6962,8 +7627,16 @@ pub(crate) fn request_process_exit_locked(
 
 /// Apply a job-control stop while preserving fatal-exit precedence.
 /// The caller must hold this exact PCB's guard.
+///
+/// GAP-5 exec (review F2): while the group drains for an exec, or this leader
+/// holds a handed-over exec, a stop is dropped (Linux ignores group stops while
+/// `group_exec_task` is set); a stopped leader would hold up the exec and the
+/// exec'ing thread's staging admission indefinitely.
 pub(crate) fn try_mark_job_control_stopped_locked(proc: &mut Process) -> bool {
-    if proc.pending_kill.load(Ordering::Acquire) {
+    if proc.pending_kill.load(Ordering::Acquire)
+        || proc.exec_handoff.is_some()
+        || proc.thread_group.exec_draining()
+    {
         return false;
     }
     proc.stopped = true;
@@ -8055,6 +8728,16 @@ pub fn current_credentials() -> Option<CredentialIds> {
     })
 }
 
+/// GAP-5 G8: the current task's thread-group id (its pid for a lone task).
+/// The PCB is locked after the table is released: LSM hooks call this from
+/// many paths, and holding the table while waiting for a live task's PCB
+/// deadlocks against any PCB -> PROCESS_TABLE nesting.
+pub fn current_tgid() -> Option<ProcessId> {
+    let pid = current_pid()?;
+    let tgid = get_process(pid)?.lock().tgid;
+    Some(tgid)
+}
+
 /// 获取当前进程的有效用户ID
 pub fn current_euid() -> Option<u32> {
     current_credentials().map(|c| c.euid)
@@ -9000,6 +9683,410 @@ mod thread_group_tests {
             *table.get_mut(pid).unwrap() = None;
         }
     }
+
+    #[test]
+    fn gap5_g8_last_live_member_and_zombie_leader_reaper_redirect() {
+        // The live count picks exactly one last member.
+        let counted = ThreadGroup::new();
+        counted.join_locked();
+        assert_eq!(counted.live(), 2);
+        assert!(!counted.leave_live());
+        assert!(counted.leave_live());
+
+        mm::publish_heap_budgets();
+        let mut table = AdmittedVec::<Option<ProcessArc>>::new(HeapClass::CoreProcess);
+        table.try_reserve_exact(4).expect("G8 table");
+        for _ in 0..4 {
+            table
+                .push_reserved(None)
+                .unwrap_or_else(|_| panic!("G8 table slot"));
+        }
+        let leader = pcb(1, 7);
+        let thread = pcb(2, 0);
+        let group = Arc::clone(&leader.lock().thread_group);
+        {
+            let mut t = thread.lock();
+            t.tgid = 1;
+            t.thread_group = Arc::clone(&group);
+        }
+        group.join_locked();
+        *table.get_mut(1).unwrap() = Some(leader.clone());
+        *table.get_mut(2).unwrap() = Some(thread.clone());
+
+        // A live candidate adopts itself.
+        assert_eq!(resolve_reaper_locked(&table, 1), Some(1));
+
+        // A leader that exited before its thread hands adoption to the thread.
+        leader.lock().state = ProcessState::Zombie;
+        assert!(!group.leave_live());
+        assert_eq!(live_group_member_locked(&table, &group, 1), Some(2));
+        assert_eq!(resolve_reaper_locked(&table, 1), Some(2));
+
+        // Once the last thread has begun exiting there is no reaper here.
+        thread.lock().state = ProcessState::Zombie;
+        assert!(group.leave_live());
+        assert_eq!(live_group_member_locked(&table, &group, 1), None);
+        assert_eq!(resolve_reaper_locked(&table, 1), None);
+        assert_eq!(resolve_reaper_locked(&table, 3), None);
+
+        for pid in 0..4 {
+            *table.get_mut(pid).unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn gap5_g7_group_signal_is_claimed_by_exactly_one_member() {
+        let leader = pcb(1, 7);
+        let thread = pcb(2, 0);
+        let group = Arc::clone(&leader.lock().thread_group);
+        thread.lock().thread_group = Arc::clone(&group);
+        let usr1 = crate::signal::Signal::SIGUSR1;
+        let usr2 = crate::signal::Signal::SIGUSR2;
+
+        // A process-directed signal is visible to every member.
+        group.queue_shared(usr1.bit());
+        assert_eq!(leader.lock().pending_bits(), usr1.bit());
+        assert_eq!(thread.lock().pending_bits(), usr1.bit());
+
+        // Exactly one member takes it, into its own set.
+        assert!(thread.lock().claim_pending(usr1));
+        assert!(!leader.lock().claim_pending(usr1));
+        assert_eq!(group.shared_pending(), 0);
+        assert!(thread.lock().pending_signals.is_pending(usr1));
+        assert_eq!(leader.lock().pending_bits(), 0);
+
+        // A task's own instance is claimed in place, without touching the group.
+        group.queue_shared(usr2.bit());
+        assert!(thread.lock().claim_pending(usr1));
+        assert_eq!(group.shared_pending(), usr2.bit());
+
+        // Discarding drops the signal from the task and the group.
+        thread.lock().pending_signals.set(usr2);
+        thread.lock().discard_pending(usr2);
+        assert_eq!(group.shared_pending(), 0);
+        assert!(!thread.lock().pending_signals.is_pending(usr2));
+    }
+
+    #[test]
+    fn gap5_g7_claimed_signals_go_back_and_the_chosen_member_hands_on() {
+        let leader = pcb(1, 7);
+        let thread = pcb(2, 0);
+        let group = Arc::clone(&leader.lock().thread_group);
+        thread.lock().thread_group = Arc::clone(&group);
+        let usr1 = crate::signal::Signal::SIGUSR1;
+        let usr2 = crate::signal::Signal::SIGUSR2;
+
+        // Only the member chosen for a group signal aborts its waits for it.
+        group.queue_shared(usr1.bit());
+        thread.lock().shared_chosen = usr1.bit();
+        assert_eq!(thread.lock().wait_pending_bits(), usr1.bit());
+        assert_eq!(leader.lock().wait_pending_bits(), 0);
+
+        // A claimed signal the task then blocks goes back to the group, and the
+        // task stops being the chosen member: another one must be chosen.
+        {
+            let mut t = thread.lock();
+            assert!(t.claim_pending(usr1));
+            assert_eq!(t.group_claimed, usr1.bit());
+            t.blocked = usr1.bit();
+            assert!(t.recalc_shared_signals(false));
+            assert_eq!(t.shared_chosen, 0);
+            assert_eq!(t.group_claimed, 0);
+            assert!(!t.pending_signals.is_pending(usr1));
+        }
+        assert_eq!(group.shared_pending(), usr1.bit());
+
+        // A thread-directed instance stays with its task.
+        {
+            let mut t = thread.lock();
+            t.pending_signals.set(usr2);
+            t.blocked |= usr2.bit();
+            assert!(!t.recalc_shared_signals(false));
+            assert!(t.pending_signals.is_pending(usr2));
+        }
+        assert_eq!(group.shared_pending(), usr1.bit());
+
+        // A member that installs a mask letting a queued group signal through
+        // becomes chosen for it (Linux set_current_blocked), and gives it up
+        // while it runs a handler. Without `mark` nothing new is chosen.
+        {
+            let mut l = leader.lock();
+            assert!(!l.recalc_shared_signals(false));
+            assert_eq!(l.shared_chosen, 0);
+            assert!(!l.recalc_shared_signals(true));
+            assert_eq!(l.shared_chosen, usr1.bit());
+            assert_eq!(l.wait_pending_bits(), usr1.bit());
+            l.in_signal_handler = true;
+            assert!(l.recalc_shared_signals(false));
+            assert_eq!(l.shared_chosen, 0);
+            l.in_signal_handler = false;
+            assert!(!l.recalc_shared_signals(true));
+        }
+
+        // A claim that is delivered leaves nothing to hand back at exit, and
+        // the chosen member with nothing left to take stops aborting waits.
+        {
+            let mut l = leader.lock();
+            assert!(l.claim_pending(usr1));
+            assert!(!l.recalc_shared_signals(false));
+            assert_eq!(l.shared_chosen, 0);
+            l.consume_own_pending(usr1);
+            assert_eq!(l.group_claimed, 0);
+            assert_eq!(l.return_claimed_signals(u64::MAX), 0);
+        }
+        assert_eq!(group.shared_pending(), 0);
+    }
+
+    #[test]
+    fn gap5_exec_handoff_gate_order_and_thread_state() {
+        mm::publish_heap_budgets();
+        let leader = pcb(1, 7);
+        let thread = pcb(2, 0);
+        let usr1 = crate::signal::Signal::SIGUSR1;
+        let usr2 = crate::signal::Signal::SIGUSR2;
+        let (thread_files, state) = {
+            let mut t = thread.lock();
+            t.blocked = usr2.bit();
+            t.pending_signals.set(usr1);
+            t.rlimits[0].rlim_cur = 77;
+            t.seccomp_generation = 5;
+            // The handoff holds its own owner count of the table.
+            t.files.lock().add_owner();
+            let state = HandoffThreadState {
+                blocked: t.blocked,
+                pending: t.pending_signals.bits(),
+                rlimits: t.rlimits,
+                allowed_cpus: t.allowed_cpus,
+                seccomp_state: t.seccomp_state.try_clone().expect("seccomp clone"),
+                seccomp_generation: t.seccomp_generation,
+                pledge_state: None,
+                pid_ns_for_children: t.pid_ns_for_children.clone(),
+                files: Some(Arc::clone(&t.files)),
+                fs: Some(Arc::clone(&t.fs)),
+            };
+            (Arc::clone(&t.files), state)
+        };
+        {
+            let mut l = leader.lock();
+            l.pending_signals.set(usr2);
+            assert_eq!(
+                syscall_safe_point_locked(&mut l, true),
+                SyscallSafePoint::Continue
+            );
+            assert!(!wait_abort_locked(&l));
+            l.exec_handoff = Some(
+                ExecHandoff::try_new(
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    state,
+                    None,
+                    0x7FFF_FFFF_E000,
+                )
+                .expect("handoff"),
+            );
+            // lint-fetch-add: allow (at most one pending handoff per group)
+            EXEC_HANDOFFS_PENDING.fetch_add(1, Ordering::AcqRel);
+            // A pending handoff interrupts waits, and runs only on a bound frame.
+            assert!(wait_abort_locked(&l));
+            assert_eq!(
+                syscall_safe_point_locked(&mut l, false),
+                SyscallSafePoint::Continue
+            );
+            assert_eq!(
+                syscall_safe_point_locked(&mut l, true),
+                SyscallSafePoint::ExecHandoff
+            );
+            // A posted fatal exit always wins, and is consumed once.
+            l.pending_exit_code.store(137, Ordering::Relaxed);
+            l.pending_kill.store(true, Ordering::Release);
+            assert_eq!(
+                syscall_safe_point_locked(&mut l, true),
+                SyscallSafePoint::Exit(137)
+            );
+            assert_eq!(
+                syscall_safe_point_locked(&mut l, true),
+                SyscallSafePoint::ExecHandoff
+            );
+            // A stop cannot park a leader that holds a handoff.
+            assert!(!try_mark_job_control_stopped_locked(&mut l));
+            assert!(!l.stopped);
+        }
+        assert!(matches!(poll_exec_handoff(&leader), HandoffPoll::Pending));
+
+        // Taking it installs the exec'ing thread's state and fd table.
+        let taken = take_exec_handoff(&leader).expect("pending handoff");
+        assert!(taken.elf_data.is_empty());
+        assert!(matches!(poll_exec_handoff(&leader), HandoffPoll::Taken));
+        assert!(take_exec_handoff(&leader).is_none());
+        {
+            let l = leader.lock();
+            assert!(!wait_abort_locked(&l));
+            assert_eq!(l.blocked, usr2.bit());
+            assert_eq!(l.pending_signals.bits(), usr1.bit());
+            assert_eq!(l.rlimits[0].rlim_cur, 77);
+            // Bumped past both tasks' generations, never back (review F9).
+            assert_eq!(l.seccomp_generation, 6);
+            assert!(Arc::ptr_eq(&l.files, &thread_files));
+        }
+        assert_eq!(thread_files.lock().owners(), 2);
+    }
+
+    #[test]
+    fn gap5_exec_handoff_returns_to_the_publisher_when_the_leader_dies() {
+        mm::publish_heap_budgets();
+        let leader = pcb(1, 7);
+        let state = {
+            let l = leader.lock();
+            HandoffThreadState {
+                blocked: 0,
+                pending: 0,
+                rlimits: l.rlimits,
+                allowed_cpus: l.allowed_cpus,
+                seccomp_state: l.seccomp_state.try_clone().expect("seccomp clone"),
+                seccomp_generation: 0,
+                pledge_state: None,
+                pid_ns_for_children: l.pid_ns_for_children.clone(),
+                files: None,
+                fs: None,
+            }
+        };
+        let group = Arc::clone(&leader.lock().thread_group);
+        {
+            let mut l = leader.lock();
+            assert!(leader_accepts_exec_handoff(&l, 1, &group));
+            l.exec_handoff = Some(
+                ExecHandoff::try_new(
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    state,
+                    None,
+                    0x7FFF_FFFF_E000,
+                )
+                .expect("handoff"),
+            );
+            // lint-fetch-add: allow (at most one pending handoff per group)
+            EXEC_HANDOFFS_PENDING.fetch_add(1, Ordering::AcqRel);
+            // One handoff at a time; none for a leader that is leaving.
+            assert!(!leader_accepts_exec_handoff(&l, 1, &group));
+            l.group_live = false;
+        }
+        match poll_exec_handoff(&leader) {
+            HandoffPoll::Abandoned(Some(_)) => {}
+            other => panic!("expected the handoff back, got {:?}", other),
+        }
+        assert!(leader.lock().exec_handoff.is_none());
+        assert!(!leader_accepts_exec_handoff(&leader.lock(), 1, &group));
+    }
+
+    #[test]
+    fn gap5_exec_drain_closes_the_group_until_released() {
+        let group = ThreadGroup::new();
+        assert!(!group.closed());
+        assert!(group.try_begin_exec_drain());
+        assert!(group.closed());
+        // One drain at a time.
+        assert!(!group.try_begin_exec_drain());
+        group.end_exec_drain();
+        assert!(!group.closed());
+        // Ending a drain never reopens an exiting group.
+        assert!(group.try_begin_exec_drain());
+        group.exiting.store(true, Ordering::Release);
+        group.end_exec_drain();
+        assert!(group.closed());
+    }
+
+    #[test]
+    fn gap5_process_directed_signal_skips_a_dying_sibling() {
+        mm::publish_heap_budgets();
+        let mut table = AdmittedVec::<Option<ProcessArc>>::new(HeapClass::CoreProcess);
+        table.try_reserve_exact(4).expect("G7 table");
+        for _ in 0..4 {
+            table
+                .push_reserved(None)
+                .unwrap_or_else(|_| panic!("G7 table slot"));
+        }
+        const BIT: u64 = 1 << 9;
+        let leader = pcb(1, 7);
+        let dying = pcb(2, 0);
+        let live = pcb(3, 0);
+        let group = Arc::clone(&leader.lock().thread_group);
+        for thread in [&dying, &live] {
+            let mut t = thread.lock();
+            t.tgid = 1;
+            t.thread_group = Arc::clone(&group);
+            group.join_locked();
+        }
+        leader.lock().blocked = BIT;
+        dying.lock().pending_kill.store(true, Ordering::Release);
+        *table.get_mut(1).unwrap() = Some(leader.clone());
+        *table.get_mut(2).unwrap() = Some(dying.clone());
+        *table.get_mut(3).unwrap() = Some(live.clone());
+
+        // The leader blocks the signal: the live sibling gets it, not the one
+        // with a posted fatal exit that precedes it in the table.
+        assert_eq!(
+            select_process_directed_target_locked(&table, 1, &group, BIT),
+            3
+        );
+
+        // Every other member is dying: the signal waits on the named leader.
+        live.lock().pending_kill.store(true, Ordering::Release);
+        assert_eq!(
+            select_process_directed_target_locked(&table, 1, &group, BIT),
+            1
+        );
+
+        // A named task that does not block the signal keeps it.
+        leader.lock().blocked = 0;
+        assert_eq!(
+            select_process_directed_target_locked(&table, 1, &group, BIT),
+            1
+        );
+
+        // A named sibling with a posted exit is passed over too.
+        assert_eq!(
+            select_process_directed_target_locked(&table, 2, &group, BIT),
+            1
+        );
+
+        // During the exec drain only the leader is chosen, even when it blocks
+        // the signal and a named sibling (not yet marked) does not.
+        live.lock().pending_kill.store(false, Ordering::Release);
+        leader.lock().blocked = BIT;
+        assert!(group.try_begin_exec_drain());
+        assert_eq!(
+            select_process_directed_target_locked(&table, 3, &group, BIT),
+            1
+        );
+        group.end_exec_drain();
+        assert_eq!(
+            select_process_directed_target_locked(&table, 3, &group, BIT),
+            3
+        );
+
+        // A named member inside a handler cannot take a caught signal until it
+        // returns: a member that can is preferred, and with none the named
+        // member still keeps it.
+        leader.lock().blocked = 0;
+        live.lock().in_signal_handler = true;
+        assert_eq!(
+            select_process_directed_target_locked(&table, 3, &group, BIT),
+            1
+        );
+        leader.lock().in_signal_handler = true;
+        assert_eq!(
+            select_process_directed_target_locked(&table, 3, &group, BIT),
+            3
+        );
+
+        for pid in 0..4 {
+            *table.get_mut(pid).unwrap() = None;
+        }
+    }
 }
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
@@ -9461,13 +10548,26 @@ pub fn is_pending_irq_kill(pid: ProcessId) -> bool {
 /// epilogue-mismatch reason (it would yield a spurious EINTR that never
 /// terminates — a livelock).
 ///
+/// GAP-5 exec step 2: a group leader's own pending exec handoff also aborts.
+/// Unlike `exiting`, the epilogue consumes it: `syscall_return_safe_point`
+/// runs the exec on the frame saved at entry, and failing that the next
+/// syscall entry does. The leader takes the handoff out of its PCB before its
+/// exec drain, so its own drain wait does not see it.
+///
 /// Process-context ONLY: it takes PROCESS_TABLE via `get_process`. NEVER call it
 /// from IRQ / timer-tick context (use `try_get_process` there instead).
 pub fn wait_should_abort(pid: ProcessId) -> bool {
     match get_process(pid) {
-        Some(arc) => arc.lock().pending_kill.load(Ordering::Acquire),
+        Some(arc) => wait_abort_locked(&arc.lock()),
         None => false,
     }
+}
+
+/// `wait_should_abort` through an already-held PCB guard: a posted fatal
+/// exit, or an exec handed to this leader. Also the arm check of waits that
+/// ignore handler signals (killable PI futex waits).
+pub fn wait_abort_locked(proc: &Process) -> bool {
+    proc.pending_kill.load(Ordering::Acquire) || proc.exec_handoff.is_some()
 }
 
 /// M4-1b: pack a wait generation into a per-PCB timeout marker.
@@ -9925,6 +11025,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let watchdog_handle: Option<WatchdogHandle>;
         // GAP-5 slice 4 G2: the group to end with this task, if its exit is fatal.
         let fatal_group: Option<Arc<ThreadGroup>>;
+        // GAP-5 G8: this task's group, and whether it is the group's last live member.
+        let own_group: Arc<ThreadGroup>;
+        let last_live: bool;
+        let mut dropped_handoff: Option<Box<ExecHandoff>> = None;
+        let retarget_group: Option<Arc<ThreadGroup>>;
+        let mut handoff_fds = AdmittedMap::new(HeapClass::CoreProcess);
         // RF184-1: Removed mmap_snapshot (allocation-free validation)
 
         {
@@ -9995,10 +11101,39 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     .iter()
                     .map(|member| (member.ns.id().raw(), member.pid)),
             );
-            pid_ns_chain = core::mem::replace(
-                &mut proc.pid_ns_chain,
-                AdmittedVec::new(HeapClass::CoreProcess),
-            );
+            // GAP-5 G8: leave the live set exactly once. A leader that exits
+            // before its last thread keeps its PID-namespace identity (its tgid
+            // stays resolvable for kill(2), a namespace init stays the init);
+            // the group's last live member detaches it (see below).
+            last_live = if core::mem::take(&mut proc.group_live) {
+                proc.thread_group.leave_live()
+            } else {
+                true
+            };
+            // GAP-5 G7 (review D3): group signals this task claimed but never
+            // delivered go back to the group, and if it was the member chosen
+            // for them another one is chosen below.
+            let returned = proc.return_claimed_signals(u64::MAX);
+            let chosen = core::mem::take(&mut proc.shared_chosen) != 0;
+            retarget_group = (returned != 0 || chosen).then(|| Arc::clone(&proc.thread_group));
+            // GAP-5 exec step 2 (review F5/F6): a handoff this leader never
+            // took is dropped now, not when the zombie is reaped; its fd-table
+            // owner count goes back first (descriptors drop after the lock).
+            if let Some(handoff) = take_handoff_locked(&mut proc) {
+                if let Some(files) = handoff.thread.files.as_ref() {
+                    handoff_fds = release_files_owner_locked(&proc, files);
+                }
+                dropped_handoff = Some(handoff);
+            }
+            own_group = Arc::clone(&proc.thread_group);
+            pid_ns_chain = if !last_live && proc.tgid == pid {
+                AdmittedVec::new(HeapClass::CoreProcess)
+            } else {
+                core::mem::replace(
+                    &mut proc.pid_ns_chain,
+                    AdmittedVec::new(HeapClass::CoreProcess),
+                )
+            };
             // F.2: Copy cgroup_id for detachment
             cgroup_id = proc.cgroup_id;
             // R170-3 FIX: take (read + zero) the deferred quota debt in this
@@ -10016,6 +11151,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // RF184-1 FIX: Removed mmap_snapshot to eliminate infallible allocation on exit.
             // Instead, validate clear_child_tid directly under mm lock at write time (below).
             // This is allocation-free and preserves TOCTOU protection.
+        }
+        drop(dropped_handoff);
+        drop(handoff_fds);
+        if let Some(group) = retarget_group {
+            retarget_shared_signals(pid, &group);
         }
 
         // R170-5 FIX: drop the pid from the IRQ-kill non-runnable set NOW —
@@ -10085,11 +11225,28 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         klog_always!("Process {} terminated with exit code {}", pid, exit_code);
 
+        // GAP-5 G8: the group's last live member takes over a leader identity
+        // the leader left behind when it exited first.
+        let leader_chain = if last_live && tgid != pid {
+            take_deferred_leader_chain(tgid, &own_group)
+        } else {
+            AdmittedVec::new(HeapClass::CoreProcess)
+        };
+
         // F.1 PID Namespace: Handle init death cascade
         //
         // If this process is the init (PID 1) of any namespace, all other processes
         // in that namespace must be killed (SIGKILL). This is Linux semantics.
-        handle_namespace_init_death(pid, &pid_ns_chain);
+        // GAP-5 G8: the cascade belongs to the init *process*: it runs when its
+        // last live member exits, under the group id (an init is always a group
+        // leader), never when the first of several threads does.
+        if last_live {
+            if tgid == pid {
+                handle_namespace_init_death(pid, &pid_ns_chain);
+            } else {
+                handle_namespace_init_death(tgid, &leader_chain);
+            }
+        }
 
         // 将孤儿进程重新分配给 init 进程 (PID 1)
         // R171-S-R170-5-01 FIX (SLICE 3): pass `pid` (the dying process) so
@@ -10103,11 +11260,15 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // The init-death cascade above has already marked a dying namespace as
         // shutting down, so reaper selection is unchanged.
         if !children_to_reparent.is_empty() {
-            reparent_orphans(&children_to_reparent, pid);
+            reparent_orphans(&children_to_reparent, pid, &own_group);
         }
 
         // F.1: Detach from all namespaces
         crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
+        if !leader_chain.is_empty() {
+            crate::pid_namespace::detach_pid_chain(&leader_chain, tgid);
+        }
+        drop(leader_chain);
 
         // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
         // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
@@ -10208,7 +11369,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 group.members() == 1 && group.claim_parent_notification()
             };
             if report {
-                notify_parent_of_group_exit(parent_pid, pid);
+                notify_parent_of_group_exit(parent_pid, pid, &group);
             }
         } else {
             // A non-leader thread has no parent to report to; the deferred
@@ -10237,10 +11398,41 @@ fn claim_group_exit_report_locked(
     (reportable && group.claim_parent_notification()).then_some(leader.ppid)
 }
 
-/// GAP-5 slice 4 G1: report a group's exit to `parent_pid` (R160-16 SIGCHLD)
+/// GAP-5 slice 4 G1: report a group's exit to its parent (R160-16 SIGCHLD)
 /// and wake it if it waits for any child or for `leader_pid`. Process context,
 /// no lock held. KSA-011: only requests a reschedule, never switches here.
-fn notify_parent_of_group_exit(parent_pid: ProcessId, leader_pid: ProcessId) {
+///
+/// GAP-5 G8 (review D2): `reported_parent` was read when the report was
+/// claimed; the parent may have exited since and handed the zombie leader on.
+/// The leader's current parent is read under PROCESS_TABLE, where reparenting
+/// runs; that parent's thread group (whose members may wait for it; immutable)
+/// is read after the table is released. `reported_parent` is used only when
+/// the leader is already gone.
+fn notify_parent_of_group_exit(
+    reported_parent: ProcessId,
+    leader_pid: ProcessId,
+    leader_group: &Arc<ThreadGroup>,
+) {
+    let (parent_pid, parent_arc) = {
+        let table = PROCESS_TABLE.lock();
+        let current = table
+            .get(leader_pid)
+            .and_then(Option::as_ref)
+            .and_then(|leader| {
+                let leader = leader.lock();
+                Arc::ptr_eq(&leader.thread_group, leader_group).then_some(leader.ppid)
+            });
+        let parent_pid = current.unwrap_or(reported_parent);
+        let parent_arc = table
+            .get(parent_pid)
+            .and_then(Option::as_ref)
+            .map(Arc::clone);
+        (parent_pid, parent_arc)
+    };
+    // The leader is a torn-down zombie, but the parent is a live task that may
+    // hold its own PCB while it takes the table (the fork path did): lock it
+    // only after the table is released (GAP-5 stress fix, cpu soak deadlock).
+    let parent_group = parent_arc.map(|parent| Arc::clone(&parent.lock().thread_group));
     if parent_pid == 0 {
         return;
     }
@@ -10259,9 +11451,45 @@ fn notify_parent_of_group_exit(parent_pid: ProcessId, leader_pid: ProcessId) {
             wake_parent = true;
         }
     }
+    // GAP-5 G8 (review D3): any member of the parent's group may wait for it.
+    if let Some(group) = parent_group {
+        wake_parent |= wake_group_child_waiters(&group, leader_pid);
+    }
     if wake_parent {
         let _ = crate::signal::kernel_kick_reschedule();
     }
+}
+
+/// GAP-5 G8 (review D3): a child of a member of `group` became reportable.
+/// Count the report, and wake every member sleeping in a wait for any child or
+/// for `child_pid`. Returns whether one was woken (the caller kicks). Process
+/// context, no lock held; scans the table only while a member waits.
+fn wake_group_child_waiters(group: &Arc<ThreadGroup>, child_pid: ProcessId) -> bool {
+    // lint-fetch-add: allow (a change counter, compared only for inequality)
+    group.child_events.fetch_add(1, Ordering::SeqCst);
+    if group.child_waiters.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let mut woke = false;
+    let table = PROCESS_TABLE.lock();
+    let now_tick = crate::get_ticks();
+    for slot in table.iter() {
+        let Some(arc) = slot else {
+            continue;
+        };
+        let mut proc = arc.lock();
+        if !Arc::ptr_eq(&proc.thread_group, group) {
+            continue;
+        }
+        let waiting = proc.waiting_child;
+        if proc.state == ProcessState::Blocked && (waiting == Some(0) || waiting == Some(child_pid))
+        {
+            proc.enter_ready_at(now_tick);
+            proc.waiting_child = None;
+            woke = true;
+        }
+    }
+    woke
 }
 
 /// GAP-5 slice 4 G7: the task of `pid`'s thread group that receives a
@@ -10284,6 +11512,22 @@ pub fn select_process_directed_target(pid: ProcessId, bit: u64) -> ProcessId {
     drop(process);
 
     let table = PROCESS_TABLE.lock();
+    select_process_directed_target_locked(&table, pid, &group, bit)
+}
+
+/// The scan behind `select_process_directed_target`, with PROCESS_TABLE held.
+/// A member that already has a posted fatal exit (exit_group, a group kill,
+/// the exec drain) is about to die, named or not, and is never chosen: the
+/// signal would be lost with it. While the leader drains the group for exec,
+/// only the leader is chosen, since every other member is being ended (and
+/// may already have consumed its posted exit on the way out).
+fn select_process_directed_target_locked(
+    table: &AdmittedVec<Option<ProcessArc>>,
+    pid: ProcessId,
+    group: &Arc<ThreadGroup>,
+    bit: u64,
+) -> ProcessId {
+    let draining = group.exec_draining();
     let mut preferred_live = false;
     let mut first_unblocked = None;
     let mut first_live = None;
@@ -10292,15 +11536,19 @@ pub fn select_process_directed_target(pid: ProcessId, bit: u64) -> ProcessId {
             continue;
         };
         let proc = arc.lock();
-        if !Arc::ptr_eq(&proc.thread_group, &group)
+        if !Arc::ptr_eq(&proc.thread_group, group)
             || matches!(
                 proc.state,
                 ProcessState::Provisioning | ProcessState::Zombie | ProcessState::Terminated
             )
+            || (draining && proc.tgid != member)
+            || proc.pending_kill.load(Ordering::Acquire)
         {
             continue;
         }
-        let unblocked = proc.blocked & bit == 0;
+        // A member inside a handler cannot take a caught signal until the
+        // handler returns (review D3): prefer one that can.
+        let unblocked = proc.blocked & bit == 0 && !proc.in_signal_handler;
         drop(proc);
         if member == pid {
             if unblocked {
@@ -10364,6 +11612,58 @@ pub(crate) fn propagate_group_job_control(pid: ProcessId, resume: bool) -> bool 
     kick
 }
 
+/// GAP-5 G7 (review D3, Linux `retarget_shared_pending`): choose another live
+/// member of `pid`'s group that does not block one of the group's pending
+/// signals, mark it as the chosen member and wake it if it waits. Called when
+/// the chosen task exits or blocks the signals it was chosen for. A member
+/// inside a handler is not chosen (it cannot take a caught signal until the
+/// handler returns, and takes it then by itself).
+pub(crate) fn retarget_shared_signals(pid: ProcessId, group: &Arc<ThreadGroup>) {
+    // A lone task has no one to hand to; skip the table scan.
+    if group.exiting.load(Ordering::Acquire) || group.members() <= 1 {
+        return;
+    }
+    let pending = group.shared_pending();
+    if pending == 0 {
+        return;
+    }
+    let mut kick = false;
+    {
+        let table = PROCESS_TABLE.lock();
+        let now_tick = crate::get_ticks();
+        for (member, slot) in table.iter().enumerate() {
+            if member == pid {
+                continue;
+            }
+            let Some(arc) = slot else {
+                continue;
+            };
+            let mut proc = arc.lock();
+            if !Arc::ptr_eq(&proc.thread_group, group)
+                || !proc.group_live
+                || proc.pending_kill.load(Ordering::Acquire)
+                || matches!(
+                    proc.state,
+                    ProcessState::Provisioning | ProcessState::Zombie | ProcessState::Terminated
+                )
+                || proc.in_signal_handler
+                || pending & !proc.blocked == 0
+            {
+                continue;
+            }
+            proc.shared_chosen |= pending & !proc.blocked;
+            if proc.state == ProcessState::Blocked && !proc.stopped {
+                proc.enter_ready_at(now_tick);
+                kick = true;
+            }
+            break;
+        }
+    }
+    if kick {
+        let _ = crate::signal::kernel_kick_reschedule();
+    }
+}
+
 /// GAP-5 slice 4 G1: one bit per PID for exited non-leader threads awaiting
 /// reap. Nothing else reaps them (`wait*` reaps leaders only), and a PID is not
 /// recycled before it is reaped, so a bit always names the same zombie.
@@ -10383,12 +11683,40 @@ fn mark_thread_autoreap(pid: ProcessId) {
     THREAD_AUTOREAP_PENDING.store(true, Ordering::Release);
 }
 
+/// Whether `pid` is an exited non-leader thread waiting for
+/// `drain_thread_autoreap` (lock-free; the scheduler asks at a switch).
+pub fn is_thread_autoreap_marked(pid: ProcessId) -> bool {
+    THREAD_AUTOREAP
+        .get(pid / 64)
+        .is_some_and(|word| word.load(Ordering::Acquire) & (1u64 << (pid % 64)) != 0)
+}
+
+/// GAP-5 stress fix (ring3-mm on one CPU, 2026-10-21): a task that waits
+/// `Blocked` with nothing else runnable keeps its CPU (the scheduler hands only
+/// a terminal task to the idle context), so the idle loop's process-context
+/// drains never run while it spins, and it may be waiting for exactly that
+/// work: a task killed at a timer interrupt sits in the IRQ-kill non-runnable
+/// set until `drain_deferred_irq_terminates` ends it, and an exited thread
+/// waits for `drain_thread_autoreap`. The scheduler hands a timer-killed task
+/// to the idle context, whose next pass ends it, but a pass that finds it still
+/// on its CPU leaves it for later. The wait4/waitid loops, the exec drain and
+/// `WaitQueue::block_until_resolved` run this on every pass (process context,
+/// IRQs enabled, no lock held, as at syscall return).
+pub fn run_blocked_wait_drains() {
+    drain_deferred_irq_terminates();
+    drain_thread_autoreap();
+}
+
 /// GAP-5 slice 4 G1: reap exited non-leader threads. Runs from the
 /// process-context deferred drain (IRQs enabled, no lock held), never on the
 /// dying thread's own stack. A thread still switching out stays marked for the
 /// next drain.
 pub fn drain_thread_autoreap() {
-    if !THREAD_AUTOREAP_PENDING.swap(false, Ordering::AcqRel) {
+    // Blocked waits call this on every pass: read before the swap so an idle
+    // pass does not take the shared line exclusive.
+    if !THREAD_AUTOREAP_PENDING.load(Ordering::Acquire)
+        || !THREAD_AUTOREAP_PENDING.swap(false, Ordering::AcqRel)
+    {
         return;
     }
     let mut deferred = false;
@@ -10454,7 +11782,76 @@ pub fn drain_thread_autoreap() {
 /// Orphans are reparented to the init process of their owning PID namespace,
 /// not necessarily global PID 1. This ensures getppid() returns a valid PID
 /// that is visible within the process's namespace.
-fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
+/// GAP-5 G8: the PID-namespace chain a group leader left in its PCB because it
+/// exited before the group's last live member (the caller). Empty when the
+/// leader detached its chain itself. Call with no lock held.
+fn take_deferred_leader_chain(
+    tgid: ProcessId,
+    group: &Arc<ThreadGroup>,
+) -> AdmittedVec<crate::pid_namespace::PidNamespaceMembership> {
+    let empty = AdmittedVec::new(HeapClass::CoreProcess);
+    let Some(leader) = get_process(tgid) else {
+        return empty;
+    };
+    let mut leader = leader.lock();
+    if !Arc::ptr_eq(&leader.thread_group, group) || leader.state != ProcessState::Zombie {
+        return empty;
+    }
+    core::mem::replace(&mut leader.pid_ns_chain, empty)
+}
+
+/// GAP-5 G8: a live (not provisioning, exiting or reaped) member of `group`
+/// other than `exclude`, preferring none in particular. Caller holds
+/// PROCESS_TABLE and no PCB lock; each member is locked one at a time.
+fn live_group_member_locked(
+    table: &[Option<ProcessArc>],
+    group: &Arc<ThreadGroup>,
+    exclude: ProcessId,
+) -> Option<ProcessId> {
+    if group.live() == 0 {
+        return None;
+    }
+    for (member, slot) in table.iter().enumerate() {
+        if member == exclude {
+            continue;
+        }
+        let Some(arc) = slot else {
+            continue;
+        };
+        let proc = arc.lock();
+        if Arc::ptr_eq(&proc.thread_group, group)
+            && !matches!(
+                proc.state,
+                ProcessState::Provisioning | ProcessState::Zombie | ProcessState::Terminated
+            )
+        {
+            return Some(member);
+        }
+    }
+    None
+}
+
+/// GAP-5 G8: the task that should adopt orphans for candidate reaper `cand`:
+/// `cand` itself if live, or, when `cand` is a group leader that exited before
+/// its group's last thread (a multi-threaded namespace init), a live member of
+/// its group, as Linux moves `child_reaper` to a surviving thread. Caller holds
+/// PROCESS_TABLE and no PCB lock.
+fn resolve_reaper_locked(table: &[Option<ProcessArc>], cand: ProcessId) -> Option<ProcessId> {
+    let arc = table.get(cand)?.as_ref()?;
+    let group = {
+        let proc = arc.lock();
+        match proc.state {
+            ProcessState::Zombie if proc.tgid == cand && proc.thread_group.live() > 0 => {
+                Arc::clone(&proc.thread_group)
+            }
+            ProcessState::Zombie | ProcessState::Terminated => return None,
+            _ => return Some(cand),
+        }
+    };
+    live_group_member_locked(table, &group, cand)
+}
+
+fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &Arc<ThreadGroup>) {
     const ROOT_INIT_PID: ProcessId = 1;
     // Bound on namespace nesting (root + MAX_PID_NS_LEVEL levels) ⇒ heap-free
     // candidate buffer, so this teardown-path function never allocates.
@@ -10481,11 +11878,26 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
     // touched; namespaces that are shutting down are skipped.
     let table = PROCESS_TABLE.lock();
 
+    // GAP-5 G8: a thread's children go to a surviving thread of its group
+    // first (Linux find_alive_thread), so they stay the process's children.
+    let sibling = live_group_member_locked(&table, dying_group, dying_pid);
+
     for &child_pid in orphans {
         let child_arc = match table.get(child_pid).and_then(|s| s.clone()) {
             Some(arc) => arc,
             None => continue,
         };
+        // GAP-5 G8 (review D2): a thread of the group may have reaped this
+        // child after the snapshot, and its pid may have been reused. Only a
+        // child that still names the dying task is ours to move.
+        if child_arc.lock().ppid != dying_pid {
+            continue;
+        }
+        if let Some(sibling) = sibling {
+            if sibling != child_pid && try_commit_reaper(&table, &child_arc, child_pid, sibling) {
+                continue;
+            }
+        }
 
         // STEP 1: heap-free candidate snapshot (leaf → root); child lock dropped
         // before any adopter is resolved.
@@ -10518,7 +11930,15 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
             if cand == child_pid || cand == dying_pid {
                 continue;
             }
-            if try_commit_reaper(&table, &child_arc, child_pid, cand) {
+            // GAP-5 G8: a multi-threaded init whose leader already exited is
+            // still the reaper; one of its live threads adopts.
+            let Some(reaper) = resolve_reaper_locked(&table, cand) else {
+                continue;
+            };
+            if reaper == child_pid || reaper == dying_pid {
+                continue;
+            }
+            if try_commit_reaper(&table, &child_arc, child_pid, reaper) {
                 committed = true;
                 break;
             }
@@ -10539,7 +11959,11 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
             if child_pid == root_init {
                 // pid 1 can never be its own reaper.
                 reparent_logged_leak(&child_arc, child_pid, root_init);
-            } else if !try_commit_reaper(&table, &child_arc, child_pid, root_init) {
+            } else if !resolve_reaper_locked(&table, root_init).is_some_and(|reaper| {
+                reaper != child_pid
+                    && reaper != dying_pid
+                    && try_commit_reaper(&table, &child_arc, child_pid, reaper)
+            }) {
                 // root init absent / Zombie / Terminated: fail SAFE (deterministic
                 // ppid, no dead-slot push) rather than panic — a panic on the teardown
                 // path would re-open the abandonment class this slice closes.
@@ -10742,6 +12166,42 @@ fn force_remote_kill(
         request_process_exit_locked(&mut proc, exit_code, crate::get_ticks())
     };
     let _ = finish_process_exit_request(post);
+}
+
+/// GAP-5 G8: claim zombie `pid` for one waiter; false when another waiter of
+/// the parent's group already holds it. Released by `release_wait_reap` when
+/// the report fails, so the zombie stays reapable.
+pub(crate) fn claim_wait_reap(pid: ProcessId) -> bool {
+    get_process(pid).is_some_and(|child| {
+        child
+            .lock()
+            .wait_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
+}
+
+/// GAP-5 G8: undo `claim_wait_reap` after a failed report.
+pub(crate) fn release_wait_reap(pid: ProcessId) {
+    if let Some(child) = get_process(pid) {
+        child.lock().wait_claimed.store(false, Ordering::Release);
+    }
+}
+
+/// GAP-5 (review D4): drop a child's own object that a sharing clone replaced
+/// with its creator's, and return its `arc_charge_bytes` when this drop freed it
+/// (the clone held the only reference), else 0. The caller returns the bytes to
+/// the child's payload charge (`release_displaced_charge`), so a thread is not
+/// charged for tables it gave up; the shared table stays charged to the task
+/// that allocated it, the leader, which G1 frees last.
+pub(crate) fn drop_displaced<T>(displaced: Arc<T>) -> usize {
+    let sole = Arc::strong_count(&displaced) == 1 && Arc::weak_count(&displaced) == 0;
+    drop(displaced);
+    if sole {
+        arc_charge_bytes::<T>().unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 /// 等待子进程
@@ -10962,6 +12422,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
         group_report,
     )) = reap_info
     {
+        let report_group = group_report.map(|_| Arc::clone(&group));
         drop(group);
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
@@ -10998,8 +12459,8 @@ pub fn cleanup_zombie(pid: ProcessId) {
 
         // GAP-5 slice 4 G1: report the group only after this thread is fully
         // gone, so the parent's reap of the leader never overlaps it.
-        if let Some(parent_pid) = group_report {
-            notify_parent_of_group_exit(parent_pid, tgid);
+        if let (Some(parent_pid), Some(group)) = (group_report, report_group) {
+            notify_parent_of_group_exit(parent_pid, tgid, &group);
         }
     }
 }
@@ -11065,6 +12526,10 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
                     proc.tgid == pid || remaining >= 1,
                     "GAP-5 G1: rolled-back thread emptied its group"
                 );
+                // GAP-5 G8: a task that never ran leaves the live set here.
+                if core::mem::take(&mut proc.group_live) {
+                    let _ = proc.thread_group.leave_live();
+                }
 
                 let memory_space = proc.memory_space;
                 // RF180-19 defense-in-depth: this is an error/OOM rollback path.
@@ -11160,6 +12625,73 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 
         klog!(Info, "Cleaned up unscheduled process {}", pid);
     }
+}
+
+/// Drop `proc`'s ownership of `files`. GAP-5 slice 3 step 2: only the last
+/// task holding the table closes its descriptors and returns the charge;
+/// earlier owners leave both to their siblings. Decided under the table lock,
+/// so exactly one owner tears down. The extracted descriptors must be dropped
+/// after the caller releases the PCB lock (R154-3: socket destructors can lock
+/// other PCBs).
+fn release_files_owner_locked(
+    proc: &Process,
+    files: &Arc<FilesTable>,
+) -> AdmittedMap<i32, FileDescriptor> {
+    let mut files = files.lock();
+    if !files.release_owner() {
+        return AdmittedMap::new(HeapClass::CoreProcess);
+    }
+    let fd_count = files.fd_table.len();
+    let extracted_fds = core::mem::replace(
+        &mut files.fd_table,
+        AdmittedMap::new(HeapClass::CoreProcess),
+    );
+    files.cloexec_fds.clear();
+
+    // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
+    // PCB is torn down. Load-bearing for CLONE_THREAD: the cap_table Arc is
+    // SHARED with surviving siblings, so a thread that exits without paying
+    // back its per-fd refcounts (bumped at the CLONE_FILES install, U.S3-A3)
+    // would strand every shared cap above 0 forever — the siblings' last
+    // close could then never revoke (permanent slot leak → TableFull DoS).
+    // For a non-shared table this is a harmless pre-drop of entries the table
+    // teardown would free anyway. Leaf-safe under the Process lock; the
+    // descriptor Boxes themselves still drop OUTSIDE the lock (R154-3).
+    for desc in extracted_fds.values() {
+        decrement_fd_cap(&proc.cap_table, desc.as_ref());
+    }
+
+    // J2-7: uncharge the per-cgroup FD budget. The charge is owned by the fd table
+    // and booked to `files.charge_cgroup`; only its last owner reaches this point
+    // (GAP-5 slice 3), so it is UNGATED by keep_address_space/mm_shared (unlike
+    // the memory uncharge above). Uncharge
+    // exactly the running charged count — authoritative, and may differ from
+    // fd_count for a clone-error child that copied fds but failed before the
+    // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
+    // zero after, so a second teardown call uncharges nothing.
+    debug_assert_eq!(
+        files.charge_cgroup, proc.cgroup_id,
+        "GAP-5: fd charge owner diverged from cgroup membership"
+    );
+    let total_fd_charges = files.total_fd_charge_count();
+    if total_fd_charges > 0 {
+        crate::cgroup::uncharge_fds(files.charge_cgroup, total_fd_charges);
+    }
+    files.fds_charged_count = 0;
+    files.fd_reservations_charged_count = 0;
+    files.fd_reservations.fill(0);
+    files.fd_cloexec_reservations.fill(0);
+    drop(files);
+    // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
+    // to prevent leaking fd count, page table root addresses, and PID in release.
+    if fd_count > 0 {
+        kprintln!(
+            "  Closed {} file descriptors for process {}",
+            fd_count,
+            proc.pid
+        );
+    }
+    extracted_fds
 }
 
 /// 释放进程持有的内核资源
@@ -11322,72 +12854,12 @@ fn free_process_resources(
     // The extracted fds are returned; the caller drops them AFTER releasing the lock.
     // GAP-5 slice 3: the whole teardown runs under the fd-table lock (leaf
     // under this PCB lock); the extracted descriptors still drop outside both.
-    let files = Arc::clone(&proc.files);
-    let mut files = files.lock();
-    // GAP-5 slice 3 step 2: only the last task holding the table closes its
-    // descriptors and returns the charge; earlier owners leave both to their
-    // siblings. Decided under the table lock, so exactly one exit tears down.
     // A repeated teardown of this task releases nothing a second time.
-    let last_owner = if core::mem::replace(&mut proc.files_released, true) {
-        false
-    } else {
-        files.release_owner()
-    };
-    let extracted_fds = if !last_owner {
-        drop(files);
+    let extracted_fds = if core::mem::replace(&mut proc.files_released, true) {
         AdmittedMap::new(HeapClass::CoreProcess)
     } else {
-        let fd_count = files.fd_table.len();
-        let extracted_fds = core::mem::replace(
-            &mut files.fd_table,
-            AdmittedMap::new(HeapClass::CoreProcess),
-        );
-        files.cloexec_fds.clear();
-
-        // U.S3-B FIX: decrement each extracted fd's cap (revoke at 0) BEFORE the
-        // PCB is torn down. Load-bearing for CLONE_THREAD: the cap_table Arc is
-        // SHARED with surviving siblings, so a thread that exits without paying
-        // back its per-fd refcounts (bumped at the CLONE_FILES install, U.S3-A3)
-        // would strand every shared cap above 0 forever — the siblings' last
-        // close could then never revoke (permanent slot leak → TableFull DoS).
-        // For a non-shared table this is a harmless pre-drop of entries the table
-        // teardown would free anyway. Leaf-safe under the Process lock; the
-        // descriptor Boxes themselves still drop OUTSIDE the lock (R154-3).
-        for desc in extracted_fds.values() {
-            decrement_fd_cap(&proc.cap_table, desc.as_ref());
-        }
-
-        // J2-7: uncharge the per-cgroup FD budget. The charge is owned by the fd table
-        // and booked to `files.charge_cgroup`; only its last owner reaches this point
-        // (GAP-5 slice 3), so it is UNGATED by keep_address_space/mm_shared (unlike
-        // the memory uncharge above). Uncharge
-        // exactly the running charged count — authoritative, and may differ from
-        // fd_count for a clone-error child that copied fds but failed before the
-        // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
-        // zero after, so a second teardown call uncharges nothing.
-        debug_assert_eq!(
-            files.charge_cgroup, proc.cgroup_id,
-            "GAP-5: fd charge owner diverged from cgroup membership"
-        );
-        let total_fd_charges = files.total_fd_charge_count();
-        if total_fd_charges > 0 {
-            crate::cgroup::uncharge_fds(files.charge_cgroup, total_fd_charges);
-        }
-        files.fds_charged_count = 0;
-        files.fd_reservations_charged_count = 0;
-        files.fd_reservations.fill(0);
-        files.fd_cloexec_reservations.fill(0);
-        drop(files);
-        // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
-        // to prevent leaking fd count, page table root addresses, and PID in release.
-        if fd_count > 0 {
-            kprintln!(
-                "  Closed {} file descriptors for process {}",
-                fd_count,
-                proc.pid
-            );
-        }
-        extracted_fds
+        let files = Arc::clone(&proc.files);
+        release_files_owner_locked(proc, &files)
     };
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧

@@ -227,6 +227,13 @@ impl PendingSignals {
     pub fn clear_all(&mut self) {
         self.bits = 0;
     }
+
+    /// GAP-5 exec step 2: take over another task's set (`bits` comes from
+    /// that task's own `PendingSignals`).
+    #[inline]
+    pub(crate) fn replace_bits(&mut self, bits: u64) {
+        self.bits = bits;
+    }
 }
 
 impl Default for PendingSignals {
@@ -567,7 +574,7 @@ pub(crate) fn pending_default_action(
 }
 
 pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
-    let mut candidates = proc.pending_signals.bits() & !proc.blocked;
+    let mut candidates = proc.pending_bits() & !proc.blocked;
     while let Some(signal) = select_lowest_deliverable(candidates) {
         candidates &= !signal.bit();
         if matches!(
@@ -575,7 +582,7 @@ pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
             Disposition::Ignored
                 | Disposition::Default(SignalAction::Ignore | SignalAction::Continue)
         ) {
-            proc.pending_signals.clear(signal);
+            proc.discard_pending(signal);
         }
     }
 }
@@ -695,13 +702,23 @@ fn signal_is_deliverable(
 /// - Signal delivery epilogues — guard held to update in_signal_handler / blocked / pending
 ///
 /// See [`has_deliverable_signal_locked`] for the lock-free variant when the guard is already held.
+///
+/// GAP-5 G7 (review D3): this is the wait-abort check, so group signals count
+/// only for the member chosen for them (`wait_pending_bits`); the others would
+/// return a spurious EINTR for a signal another member takes.
 pub fn has_deliverable_signal(pid: ProcessId) -> bool {
     let arc = match process::get_process(pid) {
         Some(a) => a,
         None => return false,
     };
     let proc = arc.lock();
-    has_deliverable_signal_locked(&proc)
+    let actions = proc.sigactions.lock();
+    signal_is_deliverable(
+        proc.wait_pending_bits(),
+        proc.blocked,
+        proc.in_signal_handler,
+        &actions,
+    )
 }
 
 /// Check actionable catchable signals through an already-held PCB guard.
@@ -734,7 +751,7 @@ pub fn has_deliverable_signal(pid: ProcessId) -> bool {
 /// See [`has_deliverable_signal`] for the self-locking variant when no guard is held.
 pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
     signal_is_deliverable(
-        proc.pending_signals.bits(),
+        proc.pending_bits(),
         proc.blocked,
         proc.in_signal_handler,
         &proc.sigactions.lock(),
@@ -748,11 +765,17 @@ pub fn has_deliverable_signal_locked(proc: &crate::process::Process) -> bool {
 /// state-flip wake (which fires only on state==Blocked) would otherwise be missed, stranding
 /// the task indefinitely (signals, unlike kills, have no deferred-kill-cascade backstop).
 /// Takes `&Process` so the caller can re-use its already-held guard (no re-lock / deadlock).
+///
+/// GAP-5 exec step 2 (review F1): it also reports an exec handed to this
+/// leader, matching `wait_should_abort`. A publish that lands between a wait's
+/// loop-top check and this commit-time check does not wake a running leader,
+/// so without it the leader could commit `Blocked` and hold up the exec.
 pub fn should_abort_pending_block(proc: &crate::process::Process) -> bool {
     proc.pending_kill
         .load(core::sync::atomic::Ordering::Acquire)
+        || proc.exec_handoff.is_some()
         || signal_is_deliverable(
-            proc.pending_signals.bits(),
+            proc.wait_pending_bits(),
             proc.blocked,
             proc.in_signal_handler,
             &proc.sigactions.lock(),
@@ -832,15 +855,34 @@ pub fn default_action(signal: Signal) -> SignalAction {
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
     // GAP-5 slice 4 G7: kill() is process-directed; a thread group picks the
     // member that will take it. Single-task processes are unaffected.
-    let target = process::select_process_directed_target(pid, signal.bit());
-    send_signal_inner(target, signal, true)
+    send_process_signal(pid, signal, true)
+}
+
+/// GAP-5 G7 (review D3): the member is chosen without its lock, so it can
+/// exit before the signal is queued. Choose again rather than report ESRCH for
+/// a live process (a chosen member that is gone makes the next choice skip it).
+fn send_process_signal(
+    pid: ProcessId,
+    signal: Signal,
+    enforce_permissions: bool,
+) -> Result<SignalAction, SignalError> {
+    const ATTEMPTS: usize = 4;
+    let mut last = Err(SignalError::NoSuchProcess);
+    for _ in 0..ATTEMPTS {
+        let target = process::select_process_directed_target(pid, signal.bit());
+        last = send_signal_inner(target, signal, enforce_permissions, SignalScope::Process);
+        if last != Err(SignalError::NoSuchProcess) || target == pid {
+            return last;
+        }
+    }
+    last
 }
 
 /// GAP-5 slice 4 G7: thread-directed delivery (`tkill`, `tgkill`) to exactly
 /// `tid`, with the same POSIX permission checks as `send_signal`. Fatal and
 /// job-control defaults still act on the whole group.
 pub fn send_signal_thread(tid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    send_signal_inner(tid, signal, true)
+    send_signal_inner(tid, signal, true, SignalScope::Thread)
 }
 
 /// R115-2 FIX: Kernel-authoritative signal delivery — bypasses POSIX permission checks.
@@ -852,8 +894,16 @@ pub fn send_signal_thread(tid: ProcessId, signal: Signal) -> Result<SignalAction
 ///
 /// MUST NOT be exposed to user-facing syscalls.
 pub fn send_signal_kernel(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    let target = process::select_process_directed_target(pid, signal.bit());
-    send_signal_inner(target, signal, false)
+    send_process_signal(pid, signal, false)
+}
+
+/// GAP-5 G7: where a generated signal is queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalScope {
+    /// Process-directed: the thread group's shared set; any member may take it.
+    Process,
+    /// Thread-directed (`tkill`, `tgkill`): the target task's own set.
+    Thread,
 }
 
 // R188-U09-3 FIX: User-authorized signal paths require an authenticated current
@@ -919,6 +969,7 @@ fn send_signal_inner(
     pid: ProcessId,
     signal: Signal,
     enforce_permissions: bool,
+    scope: SignalScope,
 ) -> Result<SignalAction, SignalError> {
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
@@ -942,6 +993,13 @@ fn send_signal_inner(
         // and intentionally bypass this branch.
         let sender_pid = require_signal_sender_pid(process::current_pid())?;
         let mut namespace_init_supervisor = false;
+        // GAP-5 (review D1): init is a process; name the target's and the
+        // sender's thread groups, not the selected task.
+        let target_tgid = process_arc.lock().tgid;
+        let sender_tgid = process::get_process(sender_pid)
+            .ok_or(SignalError::NoSuchProcess)?
+            .lock()
+            .tgid;
 
         // R188-U02-2: namespace init is a namespace-wide failure boundary.
         // Re-check this relationship at the single delivery choke point so a
@@ -949,7 +1007,7 @@ fn send_signal_inner(
         // SIGKILL/SIGSTOP cascade.  Ancestor PID namespaces retain supervisor
         // authority; an ADMIN-capable ancestor user namespace is accepted as a
         // defense-in-depth escape for a task that stayed in the same PID ns.
-        if sender_pid != pid {
+        if sender_tgid != target_tgid {
             let sender_arc = process::get_process(sender_pid).ok_or(SignalError::NoSuchProcess)?;
             let (target_user_ns, target_init_ns) = {
                 let target = process_arc.lock();
@@ -957,7 +1015,7 @@ fn send_signal_inner(
                     .pid_ns_chain
                     .iter()
                     .rev()
-                    .find(|membership| membership.pid == 1 || membership.ns.is_init(target.pid))
+                    .find(|membership| membership.pid == 1 || membership.ns.is_init(target_tgid))
                     .map(|membership| Arc::clone(&membership.ns));
                 (Arc::clone(&target.user_ns), init_ns)
             };
@@ -1005,7 +1063,7 @@ fn send_signal_inner(
         }
 
         // PID 1 (init) 保护：只有 init 自己可以向自己发信号
-        if pid == 1 && sender_pid != 1 {
+        if target_tgid == 1 && sender_tgid != 1 {
             return Err(SignalError::PermissionDenied);
         }
 
@@ -1052,6 +1110,9 @@ fn send_signal_inner(
     // GAP-5 slice 4 G7: a stop applied here (false) or a SIGCONT (true) is
     // carried to the rest of the thread group after the lock is released.
     let mut group_job_control: Option<bool> = None;
+    // GAP-5 G7 (review D3): a process-directed signal the selected member
+    // cannot take now is offered to another member after the lock is released.
+    let mut retarget_group: Option<Arc<process::ThreadGroup>> = None;
 
     {
         let mut proc = process_arc.lock();
@@ -1070,7 +1131,22 @@ fn send_signal_inner(
         }
 
         // Queue the signal (always — delivery/clear decisions follow).
-        proc.pending_signals.set(signal);
+        // GAP-5 G7: process-directed signals go to the group's shared set, so
+        // they survive the exit of the member chosen to be woken.
+        match scope {
+            SignalScope::Process => {
+                proc.thread_group.queue_shared(signal.bit());
+                // This member was chosen for it: its waits now abort for it
+                // (unless it cannot take it; see the retarget below).
+                proc.shared_chosen |= signal.bit();
+            }
+            SignalScope::Thread => {
+                proc.pending_signals.set(signal);
+                // A thread-directed instance is this task's own, not a
+                // claimed group signal to hand back.
+                proc.group_claimed &= !signal.bit();
+            }
+        }
 
         // POSIX job-control mutual exclusion (Codex review): generating SIGCONT
         // DISCARDS any pending stop signals, and generating a stop signal discards a
@@ -1079,12 +1155,12 @@ fn send_signal_inner(
         // cleared) could be re-applied at a later syscall-return safe point once the
         // delivery scan is active, spuriously re-stopping a resumed task.
         if signal.is_continue() {
-            proc.pending_signals.clear(Signal::SIGSTOP);
-            proc.pending_signals.clear(Signal::SIGTSTP);
-            proc.pending_signals.clear(Signal::SIGTTIN);
-            proc.pending_signals.clear(Signal::SIGTTOU);
+            proc.discard_pending(Signal::SIGSTOP);
+            proc.discard_pending(Signal::SIGTSTP);
+            proc.discard_pending(Signal::SIGTTIN);
+            proc.discard_pending(Signal::SIGTTOU);
         } else if signal.is_stop() {
-            proc.pending_signals.clear(Signal::SIGCONT);
+            proc.discard_pending(Signal::SIGCONT);
         }
 
         // M0 item 5 (sub-slice 1a): resolve the disposition.
@@ -1116,7 +1192,7 @@ fn send_signal_inner(
                 // this). Bare state flip — the PCB stays in the scheduler; select_next re-picks
                 // it on `== Ready`. Idempotent vs a racing data-wake (the `== Blocked` guard).
                 let should_wake = signal_is_deliverable(
-                    proc.pending_signals.bits(),
+                    proc.pending_bits(),
                     proc.blocked,
                     proc.in_signal_handler,
                     &proc.sigactions.lock(),
@@ -1128,7 +1204,7 @@ fn send_signal_inner(
             }
             Disposition::Ignored => {
                 // Explicitly ignored — drop it.
-                proc.pending_signals.clear(signal);
+                proc.discard_pending(signal);
             }
             Disposition::Default(_)
                 if proc.blocked & signal.bit() != 0 && uncatchable_mask() & signal.bit() == 0 =>
@@ -1161,14 +1237,14 @@ fn send_signal_inner(
                             needs_reschedule = true;
                         }
                     }
-                    proc.pending_signals.clear(signal);
+                    proc.discard_pending(signal);
                 }
                 SignalAction::Continue => {
                     // Generation-time resume is committed below under this guard.
-                    proc.pending_signals.clear(signal);
+                    proc.discard_pending(signal);
                 }
                 SignalAction::Ignore => {
-                    proc.pending_signals.clear(signal);
+                    proc.discard_pending(signal);
                 }
             },
         }
@@ -1176,7 +1252,23 @@ fn send_signal_inner(
             needs_kick |= process::resume_job_control_locked(&mut proc, pid, target_generation);
             group_job_control = Some(true);
         }
+        // GAP-5 G7 (review D3): the selection read this member's mask without
+        // its lock held, and a member inside a handler cannot take a caught
+        // signal; if the queued signal is still waiting and this member cannot
+        // take it now, another member is chosen.
+        if matches!(scope, SignalScope::Process)
+            && proc.thread_group.shared_pending() & signal.bit() != 0
+            && (proc.blocked & signal.bit() != 0
+                || (proc.in_signal_handler && matches!(disposition, Disposition::Handler { .. })))
+        {
+            proc.shared_chosen &= !signal.bit();
+            retarget_group = Some(Arc::clone(&proc.thread_group));
+        }
     } // Release process lock before calling scheduler functions
+
+    if let Some(group) = retarget_group {
+        process::retarget_shared_signals(pid, &group);
+    }
 
     // GAP-5 slice 4 G7: stop or continue the other members before a self-stop
     // below parks this task. No lock is held here.
@@ -1229,7 +1321,7 @@ fn send_signal_inner(
 pub fn has_pending_signals(pid: ProcessId) -> bool {
     if let Some(process_arc) = process::get_process(pid) {
         let proc = process_arc.lock();
-        proc.pending_signals.has_pending()
+        proc.pending_bits() != 0
     } else {
         false
     }

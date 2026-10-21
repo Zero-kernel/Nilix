@@ -1971,7 +1971,30 @@ extern "C" fn timer_interrupt_body(
         // (e.g. an atomic flag checked here + set by maybe_deliver_signal Phase 2)
         // becomes MANDATORY to prevent double-delivery (IRQ hook + syscall-path both
         // mid-build). Today the RPL==3 + in_signal_handler exclusion is airtight.
-        if !retry_pending_exit && kernel_core::signal::any_handler_installed() {
+        //
+        // GAP-5 exec step 2: a group leader holding an exec handed over by a
+        // non-leader is sent to the trampoline instead (after the pending-exit
+        // deferral above, so a fatal exit wins; before signal delivery, whose
+        // handler would run in the image being replaced). Its next instruction
+        // enters a syscall, whose entry runs the exec. TF/AC/DF are cleared so
+        // the trampoline cannot trap before it gets there.
+        let handoff_stub = if retry_pending_exit {
+            None
+        } else {
+            kernel_core::process::current_pid()
+                .and_then(kernel_core::process::try_exec_handoff_stub)
+        };
+        if let Some(stub_va) = handoff_stub {
+            stack_frame.instruction_pointer = x86_64::VirtAddr::new(stub_va);
+            let mut flags = stack_frame.cpu_flags;
+            flags.remove(
+                x86_64::registers::rflags::RFlags::TRAP_FLAG
+                    | x86_64::registers::rflags::RFlags::ALIGNMENT_CHECK
+                    | x86_64::registers::rflags::RFlags::DIRECTION_FLAG,
+            );
+            stack_frame.cpu_flags = flags;
+            kernel_core::request_resched_from_irq();
+        } else if !retry_pending_exit && kernel_core::signal::any_handler_installed() {
             if let Some(pid) = kernel_core::process::current_pid() {
                 // Extract scalar user context from arch-local types.
                 if let Some((
