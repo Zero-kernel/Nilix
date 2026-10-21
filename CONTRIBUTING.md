@@ -65,7 +65,7 @@ make run-smp         # multi-core boot (SMP_CPUS=N, default 2)
 make help            # full target list
 ```
 
-See [README §4](README.md#4-build-and-run) for the complete list.
+See [README: Build and run](README.md#build-and-run) for the complete list.
 
 ---
 
