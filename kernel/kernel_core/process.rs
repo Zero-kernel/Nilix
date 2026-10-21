@@ -8021,18 +8021,44 @@ impl SharedCredentials {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    fn try_acquire_read_admission(&self) -> Option<CredentialReadAdmission<'_>> {
-        let state = self.authorization_state.load(Ordering::Acquire);
-        if state & Self::AUTH_WRITER != 0 {
-            return None;
+    /// Add one reader unit unless a writer has claimed admission.
+    ///
+    /// GAP-5 thread-soak fix: a failed compare-exchange means only that the
+    /// word changed: another reader came or went (retry), or a writer claimed
+    /// (the next pass sees the bit and fails). A single attempt failed on
+    /// reader-reader races, and since a thread group shares one identity and
+    /// every LSM-checked syscall reads it, a sibling's syscall could make this
+    /// task's FUTEX_REQUEUE fail with EPERM (musl ignores the result, so its
+    /// waiter slept forever) or its clone fail with EAGAIN.
+    fn try_admit_reader(&self) -> bool {
+        let mut state = self.authorization_state.load(Ordering::Acquire);
+        loop {
+            if state & Self::AUTH_WRITER != 0 {
+                return false;
+            }
+            let next = state
+                .checked_add(Self::AUTH_READER)
+                .expect("credential reader count overflow");
+            match self.authorization_state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => state = observed,
+            }
         }
-        let next = state
-            .checked_add(Self::AUTH_READER)
-            .expect("credential reader count overflow");
-        self.authorization_state
-            .compare_exchange(state, next, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| CredentialReadAdmission { identity: self })
+    }
+
+    fn try_acquire_read_admission(&self) -> Option<CredentialReadAdmission<'_>> {
+        // Build the admission only once a unit is held: dropping it releases
+        // one, so an eagerly built value would release a unit never taken.
+        if self.try_admit_reader() {
+            Some(CredentialReadAdmission { identity: self })
+        } else {
+            None
+        }
     }
 
     /// Nonblocking read-only access for lock-held and recovery paths. Ordinary
@@ -8074,23 +8100,13 @@ impl SharedCredentials {
         }
     }
 
-    /// Single-attempt admission for callers that cannot yield because they
+    /// Nonblocking admission for callers that cannot yield because they
     /// already hold an outer transaction lock. A queued writer wins; callers
     /// fail closed and may retry the syscall.
     pub fn try_begin_authorization(self: &Arc<Self>) -> Option<CredentialAuthorization> {
-        let state = self.authorization_state.load(Ordering::Acquire);
-        if state & Self::AUTH_WRITER != 0 {
-            return None;
-        }
-        let next = state
-            .checked_add(Self::AUTH_READER)
-            .expect("credential authorization reader count overflow");
-        self.authorization_state
-            .compare_exchange(state, next, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| CredentialAuthorization {
-                identity: Arc::clone(self),
-            })
+        self.try_admit_reader().then(|| CredentialAuthorization {
+            identity: Arc::clone(self),
+        })
     }
 
     /// Hosted cross-crate regression seam: pause after the real writer claim
@@ -8240,18 +8256,14 @@ struct CredentialMutationGuard<'a> {
 }
 
 impl<'a> CredentialMutationGuard<'a> {
+    /// Set the writer bit unless another writer owns it. Reader churn cannot
+    /// fail the claim, so a writer is not starved by busy sibling threads.
     fn try_claim(identity: &'a SharedCredentials) -> bool {
-        let state = identity.authorization_state.load(Ordering::Acquire);
-        state & SharedCredentials::AUTH_WRITER == 0
-            && identity
-                .authorization_state
-                .compare_exchange(
-                    state,
-                    state | SharedCredentials::AUTH_WRITER,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
+        identity
+            .authorization_state
+            .fetch_or(SharedCredentials::AUTH_WRITER, Ordering::AcqRel)
+            & SharedCredentials::AUTH_WRITER
+            == 0
     }
 
     fn acquire(identity: &'a SharedCredentials) -> Self {
@@ -8697,6 +8709,90 @@ mod credential_gate_tests {
         drop(CredentialMutationGuard {
             identity: identity.as_ref(),
         });
+    }
+
+    #[test]
+    fn gap5_concurrent_readers_never_fail_admission_without_a_writer() {
+        extern crate std;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const READERS: usize = 4;
+        const ROUNDS: usize = 20_000;
+        let identity = Arc::new(test_identity());
+        let start = Arc::new(Barrier::new(READERS));
+        let workers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let identity = Arc::clone(&identity);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        assert_eq!(identity.try_read().expect("ordinary reader").uid, 1000);
+                        drop(identity.try_begin_authorization().expect("authorization"));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(identity.authorization_state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn gap5_writer_claim_excludes_concurrent_readers() {
+        extern crate std;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const READERS: usize = 3;
+        const WRITERS: usize = 2;
+        const ROUNDS: usize = 5_000;
+        let identity = Arc::new(test_identity());
+        let readers_inside = Arc::new(AtomicUsize::new(0));
+        let writer_inside = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(READERS + WRITERS));
+        let mut workers = Vec::new();
+        for index in 0..READERS + WRITERS {
+            let identity = Arc::clone(&identity);
+            let readers_inside = Arc::clone(&readers_inside);
+            let writer_inside = Arc::clone(&writer_inside);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    if index < WRITERS {
+                        // `acquire` without its scheduler yield.
+                        while !CredentialMutationGuard::try_claim(&identity) {
+                            core::hint::spin_loop();
+                        }
+                        while identity.authorization_state.load(Ordering::Acquire)
+                            != SharedCredentials::AUTH_WRITER
+                        {
+                            core::hint::spin_loop();
+                        }
+                        let guard = CredentialMutationGuard {
+                            identity: &identity,
+                        };
+                        assert!(!writer_inside.swap(true, Ordering::SeqCst));
+                        assert_eq!(readers_inside.load(Ordering::SeqCst), 0);
+                        writer_inside.store(false, Ordering::SeqCst);
+                        drop(guard);
+                    } else if let Some(reader) = identity.try_read() {
+                        // lint-fetch-add: allow (test occupancy counter)
+                        readers_inside.fetch_add(1, Ordering::SeqCst);
+                        assert!(!writer_inside.load(Ordering::SeqCst));
+                        readers_inside.fetch_sub(1, Ordering::SeqCst);
+                        drop(reader);
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(identity.authorization_state.load(Ordering::Acquire), 0);
     }
 }
 
