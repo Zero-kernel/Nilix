@@ -57,9 +57,11 @@ pub use pipe::{
 };
 
 pub use futex::{
-    active_futex_count, cleanup_process_futexes, exit_robust_futexes, futex_lock_pi,
-    futex_unlock_pi, futex_wait, futex_wake, run_robust_futex_self_test, FutexError, FutexTable,
-    FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
+    active_futex_count, cleanup_process_futexes, exit_robust_futexes, futex_cmp_requeue_pi,
+    futex_drop_space, futex_lock_pi, futex_requeue, futex_unlock_pi, futex_wait,
+    futex_wait_requeue_pi, futex_wake, futex_wake_bitset, futex_wake_op,
+    run_robust_futex_self_test, FutexError, FutexSpace, FutexTable, PiCaller,
+    FUTEX_BITSET_MATCH_ANY,
 };
 
 /// Reserve both unpublished pipe capability identities as one rollback-safe
@@ -696,20 +698,17 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
 
 /// Futex 操作回调
 ///
-/// 根据操作码执行 FUTEX_WAIT / FUTEX_WAIT_TIMEOUT / FUTEX_WAKE
+/// 执行 `sys_futex` 解码后的请求（见 `kernel_core::syscall::FutexRequest`）。
 ///
 /// # Arguments
 ///
 /// * `uaddr` - 用户空间 futex 地址
-/// * `op` - 操作码 (FUTEX_WAIT=0, FUTEX_WAKE=1, FUTEX_WAIT_TIMEOUT=2)
-/// * `val` - FUTEX_WAIT 时为期望值，FUTEX_WAKE 时为唤醒数量
-/// * `current_value` - 调用者从用户空间读取的当前值（仅 FUTEX_WAIT 使用）
-/// * `timeout_ns` - R39-6 FIX: 可选超时时间（纳秒），仅 FUTEX_WAIT_TIMEOUT 使用
+/// * `request` - 解码后的操作及其参数
 ///
 /// # Returns
 ///
-/// FUTEX_WAIT/FUTEX_WAIT_TIMEOUT: 成功返回 0，值不匹配返回 EAGAIN，超时返回 ETIMEDOUT
-/// FUTEX_WAKE: 返回实际唤醒的进程数量
+/// WAIT: 成功返回 0，值不匹配返回 EAGAIN，超时返回 ETIMEDOUT
+/// WAKE/REQUEUE/WAKE_OP: 返回唤醒（及重排）的进程数量
 ///
 /// # Security (R32-IPC-2 fix)
 ///
@@ -717,11 +716,9 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
 /// This prevents using kernel addresses or unmapped memory as futex keys.
 fn futex_callback(
     uaddr: usize,
-    op: i32,
-    val: u32,
-    current_value: u32,
-    timeout_ns: Option<u64>,
+    request: kernel_core::syscall::FutexRequest,
 ) -> Result<usize, SyscallError> {
+    use kernel_core::syscall::FutexRequest;
     use mm::page_table::{with_current_manager, PHYSICAL_MEMORY_OFFSET};
     use process::current_pid;
     use x86_64::structures::paging::PageTableFlags;
@@ -763,67 +760,132 @@ fn futex_callback(
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
-    // R37-2 FIX: Use TGID so futex keys are shared across CLONE_THREAD siblings.
-    // This ensures pthread mutexes/condvars work correctly in multi-threaded programs.
-    let tgid = {
+    // GAP-5 futex parity: key futexes by the caller's address space (Linux
+    // keys private futexes by mm). CLONE_THREAD siblings still share keys
+    // (R37-2: a thread group has one address space), and so does a CLONE_VM
+    // child that is not a thread.
+    //
+    // GAP-5 PI parity: a PI request also needs the caller's TID as user space
+    // sees it (what `gettid` returns, which user space stores in the word) and
+    // the PID namespace a TID read from the word is resolved in.
+    let is_pi = matches!(
+        request,
+        FutexRequest::LockPi { .. }
+            | FutexRequest::UnlockPi
+            | FutexRequest::WaitRequeuePi { .. }
+            | FutexRequest::CmpRequeuePi { .. }
+    );
+    let (space, pi_caller) = {
         let proc_arc = process::get_process(pid).ok_or(SyscallError::ESRCH)?;
         let proc = proc_arc.lock();
-        proc.tgid
+        let pi_caller = if is_pi {
+            let tid = kernel_core::pid_in_owning_namespace(&proc.pid_ns_chain)
+                .ok_or(SyscallError::ESRCH)?;
+            Some(futex::PiCaller {
+                pid,
+                tid: u32::try_from(tid).map_err(|_| SyscallError::ESRCH)?,
+                ns: kernel_core::owning_namespace(&proc.pid_ns_chain),
+            })
+        } else {
+            None
+        };
+        (futex::FutexSpace::of_process(&proc), pi_caller)
     };
 
-    match op {
-        // R39-6 FIX: FUTEX_WAIT 和 FUTEX_WAIT_TIMEOUT 统一处理
-        futex::FUTEX_WAIT | futex::FUTEX_WAIT_TIMEOUT => {
-            // FUTEX_WAIT 使用 None（无限等待），FUTEX_WAIT_TIMEOUT 使用传入的超时
-            let effective_timeout = if op == futex::FUTEX_WAIT_TIMEOUT {
-                timeout_ns
-            } else {
-                None
-            };
-            futex_wait(tgid, uaddr, val, current_value, effective_timeout).map_err(|e| match e {
-                FutexError::WouldBlock => SyscallError::EAGAIN,
-                FutexError::Fault => SyscallError::EFAULT,
-                FutexError::NoProcess => SyscallError::ESRCH,
-                FutexError::InvalidOperation => SyscallError::EINVAL,
-                FutexError::TimedOut => SyscallError::ETIMEDOUT,
-                FutexError::OwnerDied => SyscallError::EOWNERDEAD,
-                // R171-F3: pending kill interrupted the futex wait -> EINTR.
-                FutexError::Interrupted => SyscallError::EINTR,
-                // R172-23: per-tgid futex-bucket budget exhausted -> ENOMEM.
-                FutexError::TooManyBuckets => SyscallError::ENOMEM,
-            })
+    let result = match request {
+        FutexRequest::Wait {
+            expected,
+            current,
+            timeout_ns,
+            bitset,
+        } => futex_wait(&space, uaddr, expected, current, timeout_ns, bitset),
+        FutexRequest::Wake { count, bitset } => {
+            futex_wake_bitset(space.id(), uaddr, count as usize, bitset)
         }
-        futex::FUTEX_WAKE => Ok(futex_wake(tgid, uaddr, val as usize)),
-        // E.4 PI: FUTEX_LOCK_PI - 带优先级继承的互斥锁加锁
-        futex::FUTEX_LOCK_PI => {
-            futex_lock_pi(tgid, uaddr, current_value).map_err(|e| match e {
-                FutexError::WouldBlock => SyscallError::EAGAIN,
-                FutexError::Fault => SyscallError::EFAULT,
-                FutexError::NoProcess => SyscallError::ESRCH,
-                FutexError::InvalidOperation => SyscallError::EINVAL,
-                FutexError::TimedOut => SyscallError::ETIMEDOUT,
-                FutexError::OwnerDied => SyscallError::EOWNERDEAD,
-                // R171-F3: pending kill interrupted the futex wait -> EINTR.
-                FutexError::Interrupted => SyscallError::EINTR,
-                // R172-23: per-tgid futex-bucket budget exhausted -> ENOMEM.
-                FutexError::TooManyBuckets => SyscallError::ENOMEM,
-            })
-        }
-        // E.4 PI: FUTEX_UNLOCK_PI - 带优先级继承的互斥锁解锁
-        futex::FUTEX_UNLOCK_PI => futex_unlock_pi(tgid, uaddr).map_err(|e| match e {
-            FutexError::WouldBlock => SyscallError::EAGAIN,
-            FutexError::Fault => SyscallError::EFAULT,
-            FutexError::NoProcess => SyscallError::ESRCH,
-            FutexError::InvalidOperation => SyscallError::EINVAL,
-            FutexError::TimedOut => SyscallError::ETIMEDOUT,
-            FutexError::OwnerDied => SyscallError::EOWNERDEAD,
-            // R171-F3: pending kill interrupted the futex wait -> EINTR.
-            FutexError::Interrupted => SyscallError::EINTR,
-            // R172-23: per-tgid futex-bucket budget exhausted -> ENOMEM (unreachable on the
-            // UNLOCK path — it never creates a bucket — but the match must be exhaustive).
-            FutexError::TooManyBuckets => SyscallError::ENOMEM,
-        }),
-        _ => Err(SyscallError::EINVAL),
+        FutexRequest::Requeue {
+            nr_wake,
+            nr_requeue,
+            uaddr2,
+            compare,
+        } => futex_requeue(
+            &space,
+            uaddr,
+            uaddr2,
+            nr_wake as usize,
+            nr_requeue as usize,
+            compare,
+        ),
+        FutexRequest::WakeOp {
+            nr_wake,
+            nr_wake2,
+            uaddr2,
+            op,
+        } => futex_wake_op(
+            space.id(),
+            uaddr,
+            uaddr2,
+            nr_wake as usize,
+            nr_wake2 as usize,
+            op,
+        ),
+        // E.4 PI / GAP-5 PI parity: the Linux PI user-word protocol.
+        FutexRequest::LockPi {
+            timeout_ns,
+            trylock,
+        } => match pi_caller.as_ref() {
+            Some(caller) => futex_lock_pi(&space, uaddr, caller, timeout_ns, trylock),
+            None => Err(FutexError::NoProcess),
+        },
+        FutexRequest::UnlockPi => match pi_caller.as_ref() {
+            Some(caller) => futex_unlock_pi(space.id(), uaddr, caller),
+            None => Err(FutexError::NoProcess),
+        },
+        FutexRequest::WaitRequeuePi {
+            expected,
+            current,
+            timeout_ns,
+            uaddr2,
+        } => match pi_caller.as_ref() {
+            Some(caller) => {
+                futex_wait_requeue_pi(&space, uaddr, expected, current, timeout_ns, uaddr2, caller)
+            }
+            None => Err(FutexError::NoProcess),
+        },
+        FutexRequest::CmpRequeuePi {
+            nr_requeue,
+            uaddr2,
+            expected,
+        } => match pi_caller.as_ref() {
+            Some(caller) => {
+                futex_cmp_requeue_pi(&space, uaddr, uaddr2, nr_requeue as usize, expected, caller)
+            }
+            None => Err(FutexError::NoProcess),
+        },
+    };
+    // The namespace reference the PI caller holds is dropped here, with no
+    // lock held.
+    drop(pi_caller);
+    result.map_err(futex_error_to_syscall)
+}
+
+fn futex_error_to_syscall(error: FutexError) -> SyscallError {
+    match error {
+        FutexError::WouldBlock => SyscallError::EAGAIN,
+        FutexError::Fault => SyscallError::EFAULT,
+        FutexError::NoProcess => SyscallError::ESRCH,
+        FutexError::InvalidOperation => SyscallError::EINVAL,
+        FutexError::TimedOut => SyscallError::ETIMEDOUT,
+        FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+        // R171-F3: pending kill interrupted the futex wait -> EINTR.
+        FutexError::Interrupted => SyscallError::EINTR,
+        // R172-23: per-space futex-bucket budget exhausted -> ENOMEM.
+        FutexError::TooManyBuckets => SyscallError::ENOMEM,
+        // GAP-5 PI parity: FUTEX_UNLOCK_PI by a task the word does not name.
+        FutexError::NotOwner => SyscallError::EPERM,
+        FutexError::Deadlock => SyscallError::EDEADLK,
+        // GAP-5 PI review D2-1: internal (fault the word in and retry); never
+        // expected here.
+        FutexError::WordFault => SyscallError::EFAULT,
     }
 }
 
@@ -854,12 +916,12 @@ fn ipc_cleanup(
 
 /// Futex 唤醒回调（用于线程退出时的 clear_child_tid 机制）
 ///
-/// 唤醒等待在指定地址上的进程。使用 TGID 作为键，以便线程组内的
-/// 线程能够互相唤醒，保持 pthread 语义。
+/// 唤醒等待在指定地址上的进程，键为退出任务的地址空间（GAP-5 futex
+/// parity），所以线程组内的线程和共享地址空间的 CLONE_VM 子进程都能被唤醒。
 ///
 /// # Arguments
 ///
-/// * `tgid` - 线程组ID（R37-2 FIX: 用于定位 futex 表，确保线程间互操作）
+/// * `tgid` - 退出任务的线程组ID，用于找到它的地址空间
 /// * `uaddr` - 用户空间 futex 地址
 /// * `max_wake` - 最大唤醒数量
 ///
@@ -867,8 +929,17 @@ fn ipc_cleanup(
 ///
 /// 实际唤醒的进程数量
 fn futex_wake_callback(tgid: process::ProcessId, uaddr: usize, max_wake: usize) -> usize {
-    // R37-2: 使用 tgid 作为键唤醒等待者，确保 CLONE_THREAD 兄弟可以互相唤醒
-    futex_wake(tgid, uaddr, max_wake)
+    // The process subsystem calls this from `terminate_process` for a task
+    // that may not be current (a deferred kill), passing only its TGID. The
+    // group leader shares the task's address space and stays in the process
+    // table while any member lives (GAP-5 G1: a zombie leader is reaped only
+    // as the last member), and RF180-3 keeps the TGID number pinned, so the
+    // leader's `mm` names the exiting task's key space.
+    let space = match process::get_process(tgid) {
+        Some(leader) => futex::FutexSpace::id_of_mm(&leader.lock().mm),
+        None => return 0,
+    };
+    futex_wake(space, uaddr, max_wake)
 }
 
 /// 初始化IPC子系统
@@ -889,6 +960,9 @@ pub fn init() {
 
     // 注册 futex 唤醒回调，用于线程退出时的 clear_child_tid 机制
     process::register_futex_wake(futex_wake_callback);
+
+    // GAP-5 futex parity (review F7): exec drops the old image's buckets.
+    process::register_futex_exec(futex::futex_drop_space);
 
     // 注册系统调用回调
     kernel_core::register_pipe_callback(pipe_create_callback);

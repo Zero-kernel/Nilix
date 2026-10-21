@@ -68,6 +68,10 @@ pub(crate) struct WaitTicket {
     pid: ProcessId,
     generation: u64,
     wait_seq: Option<u64>,
+    /// GAP-5 PI parity (review D2-2): only a kill or an exec handoff to this
+    /// task (review D2-A) ends this wait; a handler signal neither aborts the
+    /// arm nor ends the sleep (Linux `TASK_KILLABLE`).
+    killable: bool,
 }
 
 pub(crate) enum PrepareWait {
@@ -422,7 +426,51 @@ impl WaitQueue {
     pub(crate) fn try_prepare_with_timeout_after<F, E>(
         &self,
         timeout_ns: Option<u64>,
+        check: F,
+    ) -> Result<Result<PrepareWait, E>, AdmittedAllocError>
+    where
+        F: FnMut() -> Result<(), E>,
+    {
+        self.try_prepare_inner(timeout_ns, check, false)
+    }
+
+    /// GAP-5 PI parity (review D2-2): [`Self::try_prepare_with_timeout_after`]
+    /// for a wait that only a kill or an exec handoff may end (Linux
+    /// `TASK_KILLABLE`, as the
+    /// rt-mutex wait behind FUTEX_LOCK_PI behaves once its restart is taken
+    /// into account). A pending handler signal neither aborts the arm nor ends
+    /// the sleep; [`Self::finish_prepared`] reports `Interrupted` only for a
+    /// kill or an exec handoff. The handler runs when the task next returns to
+    /// user mode.
+    pub(crate) fn try_prepare_killable_with_timeout_after<F, E>(
+        &self,
+        timeout_ns: Option<u64>,
+        check: F,
+    ) -> Result<Result<PrepareWait, E>, AdmittedAllocError>
+    where
+        F: FnMut() -> Result<(), E>,
+    {
+        self.try_prepare_inner(timeout_ns, check, true)
+    }
+
+    /// Whether an arm must give up instead of publishing `Blocked`. Called
+    /// under the PCB lock at the Blocked-commit point.
+    fn arm_must_abort(proc: &process::Process, killable: bool) -> bool {
+        if killable {
+            // GAP-5 PI review D2-A: an exec handed to this leader also ends a
+            // killable wait; a publish that lands between the loop-top check
+            // and this arm finds the leader still running and wakes nobody.
+            process::wait_abort_locked(proc)
+        } else {
+            kernel_core::signal::should_abort_pending_block(proc)
+        }
+    }
+
+    fn try_prepare_inner<F, E>(
+        &self,
+        timeout_ns: Option<u64>,
         mut check: F,
+        killable: bool,
     ) -> Result<Result<PrepareWait, E>, AdmittedAllocError>
     where
         F: FnMut() -> Result<(), E>,
@@ -500,7 +548,7 @@ impl WaitQueue {
                     }
 
                     let mut proc = process.lock();
-                    if kernel_core::signal::should_abort_pending_block(&proc) {
+                    if Self::arm_must_abort(&proc, killable) {
                         Self::retire_empty_queue_locked(&mut queue, &mut capacity.queue);
                         Self::retire_empty_timer_locked(&mut timers, &mut capacity);
                         return ArmAttempt::Complete(Ok(PrepareWait::Immediate(
@@ -538,10 +586,11 @@ impl WaitQueue {
                         pid,
                         generation,
                         wait_seq: Some(seq),
+                        killable,
                     })))
                 } else {
                     let mut proc = process.lock();
-                    if kernel_core::signal::should_abort_pending_block(&proc) {
+                    if Self::arm_must_abort(&proc, killable) {
                         Self::retire_empty_queue_locked(&mut queue, &mut capacity.queue);
                         return ArmAttempt::Complete(Ok(PrepareWait::Immediate(
                             WaitOutcome::Interrupted,
@@ -562,6 +611,7 @@ impl WaitQueue {
                         pid,
                         generation,
                         wait_seq: None,
+                        killable,
                     })))
                 }
             });
@@ -613,18 +663,25 @@ impl WaitQueue {
     ///
     /// With interrupts off neither the timer nor a cross-CPU wake can resolve
     /// the wait, so that (invalid) context keeps the single reschedule.
-    fn block_until_resolved(pid: ProcessId) {
+    ///
+    /// A `killable` wait (GAP-5 PI parity) is not resolved by a pending
+    /// handler signal, only by a waker, the timeout, a kill or an exec
+    /// handoff.
+    fn block_until_resolved(pid: ProcessId, killable: bool) {
         if !interrupts::are_enabled() {
             kernel_core::force_reschedule();
             return;
         }
         loop {
             kernel_core::force_reschedule();
+            // A reschedule with nothing else runnable leaves this task on the
+            // CPU, so run the idle loop's drains it may be waiting for.
+            process::run_blocked_wait_drains();
             let still_blocked = process::get_process(pid)
                 .is_some_and(|process| process.lock().state == ProcessState::Blocked);
             if !still_blocked
                 || process::wait_should_abort(pid)
-                || kernel_core::signal::has_deliverable_signal(pid)
+                || (!killable && kernel_core::signal::has_deliverable_signal(pid))
             {
                 return;
             }
@@ -633,11 +690,11 @@ impl WaitQueue {
     }
 
     pub(crate) fn finish_prepared(&self, ticket: WaitTicket) -> WaitOutcome {
-        Self::block_until_resolved(ticket.pid);
+        Self::block_until_resolved(ticket.pid, ticket.killable);
         self.disarm_ticket_timer(&ticket);
 
         let outcome = if process::wait_should_abort(ticket.pid)
-            || kernel_core::signal::has_deliverable_signal(ticket.pid)
+            || (!ticket.killable && kernel_core::signal::has_deliverable_signal(ticket.pid))
         {
             interrupts::without_interrupts(|| {
                 self.remove_waiter_exact(ticket.pid, ticket.generation);
@@ -840,8 +897,20 @@ impl WaitQueue {
     ///
     /// 如果成功唤醒该进程返回 true，否则返回 false
     pub fn wake_specific(&self, pid: ProcessId) -> bool {
+        self.wake_specific_if(pid, || true)
+    }
+
+    /// GAP-5 futex parity: [`Self::wake_specific`], but only if `still_wanted`,
+    /// evaluated under this queue's waiters lock, returns true. A futex waker
+    /// that readies a task after dropping the bucket lock passes a check of
+    /// the task's wake mark: a wait that the task starts later clears the mark
+    /// before it arms under this same lock, so a late wake cannot end it.
+    pub fn wake_specific_if(&self, pid: ProcessId, still_wanted: impl FnOnce() -> bool) -> bool {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
+            if !still_wanted() {
+                return false;
+            }
             if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 let entry_gen = waiters[pos].1;
                 waiters.remove_retaining_capacity(pos);

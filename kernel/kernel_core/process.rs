@@ -398,6 +398,11 @@ impl Drop for SchedulerAddPermit {
 /// 参数: (tgid, uaddr, max_wake_count) -> 实际唤醒数量
 pub type FutexWakeCallback = fn(ProcessId, usize, usize) -> usize;
 
+/// GAP-5 futex parity (review F7): drop the futex buckets of an address space
+/// whose image exec replaced. Parameter: the space id (the `mm` object's
+/// address). Returns how many buckets still had waiters and were kept.
+pub type FutexExecCallback = fn(usize) -> usize;
+
 /// E.5 Cpuset: Callback for task joining a cpuset
 ///
 /// Called when a new process is created (fork/clone) to update cpuset task count.
@@ -4832,6 +4837,8 @@ lazy_static::lazy_static! {
     static ref SCHEDULER_ADMISSION: Mutex<Option<SchedulerAdmissionCallbacks>> = Mutex::new(None);
     /// Futex 唤醒回调（用于 clear_child_tid）
     static ref FUTEX_WAKE: Mutex<Option<FutexWakeCallback>> = Mutex::new(None);
+    /// GAP-5 futex parity (review F7): exec's futex key-space drop.
+    static ref FUTEX_EXEC: Mutex<Option<FutexExecCallback>> = Mutex::new(None);
     /// E.5 Cpuset: Task joined callback (for fork/clone)
     static ref CPUSET_TASK_JOINED: Mutex<Option<CpusetTaskJoinedCallback>> = Mutex::new(None);
     /// E.5 Cpuset: Task left callback (for process exit)
@@ -9480,6 +9487,22 @@ pub fn register_futex_wake(callback: FutexWakeCallback) {
     *FUTEX_WAKE.lock() = Some(callback);
 }
 
+/// Register the futex key-space drop that exec runs (GAP-5 review F7).
+pub fn register_futex_exec(callback: FutexExecCallback) {
+    *FUTEX_EXEC.lock() = Some(callback);
+}
+
+/// GAP-5 futex parity (review F7): the `mm` object, and so its futex key
+/// space, survives exec. Buckets keyed by the old image's addresses, PI owner
+/// state included, must not meet the new image's waiters. Call with no PCB or
+/// futex lock held.
+pub(crate) fn notify_futex_exec(space: usize) {
+    let callback = *FUTEX_EXEC.lock();
+    if let Some(cb) = callback {
+        let _ = cb(space);
+    }
+}
+
 /// 通知调度器进程已被移除
 ///
 /// RF178-33 / P1-B: generation is load-bearing. Call only with the reaped
@@ -10933,6 +10956,16 @@ pub fn terminate_group_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
 }
 
 pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
+    // GAP-5 PI review D2-1: run the teardown with interrupts enabled, as
+    // `sys_exit` does. Exception exits (user #PF, #GP, ..., the #NM/#DB
+    // pending-kill exits) and the stop barrier arrive with IF=0, and the
+    // teardown's futex exit work spins on futex, wait-queue, table and PCB
+    // locks: with IF=0 this CPU could not acknowledge a TLB shootdown whose
+    // initiator waits for it while it, or a task it waits for, holds one of
+    // those locks. Kernel code is not preempted (the timer reschedules only
+    // on a return to user mode), and the halt loop below enables interrupts
+    // anyway; the teardown never returns to the interrupted context.
+    x86_64::instructions::interrupts::enable();
     terminate_process(pid, exit_code);
 
     // R117-1 FIX: Disable interrupts immediately after marking Zombie.

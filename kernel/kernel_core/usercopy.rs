@@ -237,6 +237,9 @@ struct UserCopyState {
     start: AtomicUsize,
     /// Exclusive end address of the current user buffer
     end: AtomicUsize,
+    /// GAP-5 PI parity (review D2-1): the active access must not have its
+    /// fault resolved (Linux `pagefault_disable`); see [`nofault_usercopy_fault`].
+    nofault: AtomicBool,
 }
 
 impl UserCopyState {
@@ -248,6 +251,7 @@ impl UserCopyState {
             remaining: AtomicUsize::new(0),
             start: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
+            nofault: AtomicBool::new(false),
         }
     }
 }
@@ -498,6 +502,8 @@ impl UserCopyGuard {
             s.start.store(buffer_start, Ordering::SeqCst);
             s.end
                 .store(buffer_start.saturating_add(len), Ordering::SeqCst);
+            // GAP-5 PI review D2-1: faults resolve unless the helper opts out.
+            s.nofault.store(false, Ordering::SeqCst);
             s.active.store(true, Ordering::SeqCst);
         });
         UserCopyGuard { cpu_id, pid }
@@ -530,6 +536,7 @@ impl Drop for UserCopyGuard {
                     s.remaining.store(0, Ordering::SeqCst);
                     s.start.store(0, Ordering::SeqCst);
                     s.end.store(0, Ordering::SeqCst);
+                    s.nofault.store(false, Ordering::SeqCst);
                     true
                 })
                 .unwrap_or(false);
@@ -555,6 +562,7 @@ impl Drop for UserCopyGuard {
             s.remaining.store(0, Ordering::SeqCst);
             s.start.store(0, Ordering::SeqCst);
             s.end.store(0, Ordering::SeqCst);
+            s.nofault.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -793,6 +801,21 @@ pub fn copy_to_user_addr(dst: UserAddr, src: &[u8]) -> Result<(), ()> {
 /// performs no page-table lookup and takes no blocking lock, so callers may use
 /// it while holding a futex wait-queue lock with interrupts already disabled.
 pub fn read_user_u32_atomic(src: UserAddr) -> Result<u32, ()> {
+    read_user_u32_atomic_inner(src, false)
+}
+
+/// GAP-5 PI parity (review D2-1): [`read_user_u32_atomic`] whose fault is
+/// never resolved (Linux `pagefault_disable` around `get_futex_value_locked`).
+/// A futex holding its bucket lock, or `FUTEX_TABLE`, must not run the
+/// copy-on-write or demand-fault paths (PT_LOCK, frame allocation, TLB
+/// shootdown waits). Any fault returns `Err(())`; the caller drops its futex
+/// locks, faults the page in with [`read_user_u32_atomic`] or
+/// [`compare_exchange_user_u32`], and retries.
+pub fn read_user_u32_atomic_nofault(src: UserAddr) -> Result<u32, ()> {
+    read_user_u32_atomic_inner(src, true)
+}
+
+fn read_user_u32_atomic_inner(src: UserAddr, nofault: bool) -> Result<u32, ()> {
     let addr = src.as_usize();
     if addr & (core::mem::align_of::<u32>() - 1) != 0
         || !validate_user_range(addr, core::mem::size_of::<u32>())
@@ -804,7 +827,8 @@ pub fn read_user_u32_atomic(src: UserAddr) -> Result<u32, ()> {
     let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
     USER_COPY_STATE.with(|s| {
         s.remaining
-            .store(core::mem::size_of::<u32>(), Ordering::SeqCst)
+            .store(core::mem::size_of::<u32>(), Ordering::SeqCst);
+        s.nofault.store(nofault, Ordering::SeqCst);
     });
 
     let mut value = 0u32;
@@ -858,6 +882,27 @@ pub fn read_user_u64_atomic(src: UserAddr) -> Result<u64, ()> {
 /// failed the range/alignment checks.  Callers must bound retries on `false` and
 /// abort their walk on `Err(())`.
 pub fn compare_exchange_user_u32(dst: UserAddr, expected: u32, desired: u32) -> Result<bool, ()> {
+    compare_exchange_user_u32_inner(dst, expected, desired, false)
+}
+
+/// GAP-5 PI parity (review D2-1): [`compare_exchange_user_u32`] whose fault
+/// (a copy-on-write word, a page not present) is never resolved, for use under
+/// a futex lock (Linux `cmpxchg_futex_value_locked`). `Err(())` on any fault;
+/// see [`read_user_u32_atomic_nofault`].
+pub fn compare_exchange_user_u32_nofault(
+    dst: UserAddr,
+    expected: u32,
+    desired: u32,
+) -> Result<bool, ()> {
+    compare_exchange_user_u32_inner(dst, expected, desired, true)
+}
+
+fn compare_exchange_user_u32_inner(
+    dst: UserAddr,
+    expected: u32,
+    desired: u32,
+    nofault: bool,
+) -> Result<bool, ()> {
     let addr = dst.as_usize();
     if addr & (core::mem::align_of::<u32>() - 1) != 0
         || !validate_user_range(addr, core::mem::size_of::<u32>())
@@ -869,7 +914,8 @@ pub fn compare_exchange_user_u32(dst: UserAddr, expected: u32, desired: u32) -> 
     let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
     USER_COPY_STATE.with(|s| {
         s.remaining
-            .store(core::mem::size_of::<u32>(), Ordering::SeqCst)
+            .store(core::mem::size_of::<u32>(), Ordering::SeqCst);
+        s.nofault.store(nofault, Ordering::SeqCst);
     });
 
     let observed = unsafe {
@@ -1078,6 +1124,16 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
     // H-26 FIX: No longer set a fault flag.
     // Exception table fixup in page_fault_handler will rewrite RIP.
     true
+}
+
+/// GAP-5 PI parity (review D2-1): whether a kernel-mode fault at `fault_addr`
+/// belongs to this CPU's active no-fault user access
+/// ([`read_user_u32_atomic_nofault`], [`compare_exchange_user_u32_nofault`]).
+/// The page-fault handler then takes the exception-table fixup at once,
+/// without resolving copy-on-write or demand faults.
+pub fn nofault_usercopy_fault(fault_addr: usize) -> bool {
+    try_handle_usercopy_fault(fault_addr)
+        && USER_COPY_STATE.with(|s| s.nofault.load(Ordering::SeqCst))
 }
 
 /// Maximum length for user-space C strings (paths, arguments)

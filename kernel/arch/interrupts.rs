@@ -1211,13 +1211,38 @@ extern "x86-interrupt" fn page_fault_handler(
     // 获取导致缺页的地址
     let fault_addr = fault_addr_raw as usize;
 
+    // GAP-5 PI parity (review D2-1): a futex-word access made under a futex
+    // lock never resolves its fault (Linux `pagefault_disable`): take the
+    // exception-table fixup at once. The futex code drops its locks, faults
+    // the page in and retries, so the COW and demand paths below (PT_LOCK,
+    // frame allocation, TLB-shootdown waits) never run under a futex lock.
+    if !error_code.contains(PageFaultErrorCode::USER_MODE)
+        && usercopy::nofault_usercopy_fault(fault_addr)
+    {
+        let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
+        if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
+            unsafe {
+                stack_frame.as_mut().update(|frame| {
+                    frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
+                });
+            }
+            return;
+        }
+    }
+
     // 检查是否为写入导致的保护违规缺页（可能是 COW）
     // PROTECTION_VIOLATION 表示页面存在但权限不足，区别于页面不存在的情况
     // 必须先处理 COW，因为 usercopy 写入 COW 页面是合法操作
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
         && error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
     {
-        if let Some(pid) = kernel_core::process::current_pid() {
+        // GAP-5 (review D4): COW resolution works on the active page table and
+        // global frame refcounts; the pid only names the task in logs. The
+        // deferred IRQ-kill drain writes a dying task's clear-tid word under
+        // that task's CR3 and may run from the idle loop with no current task;
+        // requiring one left a COW tid word set and its joiner unwoken.
+        {
+            let pid = kernel_core::process::current_pid().unwrap_or(0);
             // R186-10 FIX: act on the exact disposition. The previous shape
             // treated every non-success as fatal, so transient page-table
             // contention terminated valid, unrelated writers (cross-process DoS).
