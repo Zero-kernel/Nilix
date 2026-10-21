@@ -10892,7 +10892,10 @@ pub fn run_timeout_marker_self_test() {
 }
 
 pub fn drain_deferred_irq_terminates() {
-    if !DEFERRED_IRQ_KILL_PENDING.swap(false, Ordering::AcqRel) {
+    // Read before the swap, as in `drain_thread_autoreap`.
+    if !DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire)
+        || !DEFERRED_IRQ_KILL_PENDING.swap(false, Ordering::AcqRel)
+    {
         return;
     }
     let mut still_running = false;

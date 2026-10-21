@@ -217,6 +217,12 @@ impl Shell {
                 // uncharges) and yield to any Ready user process before
                 // halting until the next interrupt.
                 kernel_core::reschedule_if_needed();
+                // GAP-5 G8: a task that exits or is killed while another is
+                // Ready hands the CPU back here with need_resched set; loop to
+                // the drain and that task at once instead of waiting a tick.
+                if arch::current_cpu().need_resched.load(Ordering::Acquire) {
+                    continue;
+                }
                 unsafe {
                     core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
                 }

@@ -2508,7 +2508,24 @@ impl Scheduler {
         };
 
         let selection = Self::select_next_result_locked(&queue, local_cpu, local_cpu, old_pid);
-        let Some((next_pid, next_pcb, _priority)) = selection.candidate else {
+        // GAP-5 G8: a task ended at a timer interrupt is terminated, and an
+        // exited non-leader thread is reaped, by deferred drains that run only
+        // in process context (syscall return, nanosleep, blocked waits, the idle
+        // loop). Switching straight to a Ready task that spins in user mode would
+        // postpone that drain, and the wake of a parent waiting for this task or
+        // its group, until some task enters the kernel. Hand off to the idle
+        // context instead: once this context is saved, its next pass drains the
+        // task and then schedules normally.
+        let old_needs_drain = old_pid
+            .map(|pid| process::is_pending_irq_kill(pid) || process::is_thread_autoreap_marked(pid))
+            .unwrap_or(false);
+        let candidate_deferred = old_needs_drain && selection.candidate.is_some();
+        let candidate = if old_needs_drain {
+            None
+        } else {
+            selection.candidate
+        };
+        let Some((next_pid, next_pcb, _priority)) = candidate else {
             if let Some(old_pcb) = old_pcb {
                 if let Some(mut old) = old_pcb.try_lock() {
                     if terminal_needs_idle(
@@ -2535,7 +2552,7 @@ impl Scheduler {
                         drop(current_guard);
                         process::set_current_pid(None);
                         process::note_context_switch(local_cpu);
-                        if !selection.complete_cycle {
+                        if !selection.complete_cycle || candidate_deferred {
                             current_cpu().set_need_resched();
                         }
                         if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
