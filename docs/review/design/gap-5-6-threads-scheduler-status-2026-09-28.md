@@ -6,22 +6,23 @@ Tree: branch `gap5-6-threads-scheduler` on top of `cb503cf`, one commit per feat
 
 ## Summary
 
-Updated 2026-10-17. "Preview" means the `thread_preview` cargo feature, which only the
-guest test builds (`syscall_test`, `musl_test`) enable; default and production builds
-still refuse `CLONE_SIGHAND|CLONE_THREAD|CLONE_FS|CLONE_FILES`.
+Updated 2026-10-20 (fourth batch, below): every build accepts
+`CLONE_SIGHAND|CLONE_THREAD|CLONE_FS|CLONE_FILES`, and the `thread_preview` cargo feature is
+gone. Earlier text that says "preview" describes the staged phase, when only the guest test
+builds (`syscall_test`, `musl_test`) enabled the flags.
 
 | Item | Status | Evidence |
 |------|--------|----------|
-| §5 slice 1: shared `SignalTable` handle | Implemented; shared for real in the preview | Lock order PCB → table (leaf); IRQ delivery try-locks. Sharing is exercised by the ring3-mm thread legs and the musl pthread workload |
-| §5 slice 2: shared `FsContextHandle` (root/cwd/umask) | Implemented; shared for real in the preview | Hosted tests; ring3-mm `CLONE_FS` shared-table leg |
-| §5 slice 3: `FilesHandle` → `FilesTable` | Steps 1-3 implemented, verification pending | `Process.files: Arc<FilesTable>` behind its own leaf lock, an owner count so only the last owner closes descriptors and returns the charge, and a `CLONE_FILES` branch inside a thread group. Three hosted tests; ring3-mm shared-table leg; musl threads `dup` into the shared table. Exec while shared returns `EBUSY` (unshare open) |
-| §5 slice 4: thread groups (`CLONE_VM`+`CLONE_SIGHAND`+`CLONE_THREAD`) | Steps 1-6 implemented, step 7 staged (preview), verification pending | [Slice 4 design](gap-5-slice4-thread-group-design.md): G1 `ThreadGroup` membership, auto-reap and exactly-once leader report; G2 group death; G3 clear-tid without the mmap gate (was a live bug); G4 futex prepare waits out a sibling; G5/G6 identity and namespace check; G7 process-directed target selection, `tkill`/`tgkill`, group stop/continue. Review D1 fixed. g58 and g60 (final kernel): the ring3-mm thread legs pass on 1/2/4/8 CPUs (15 boots) and the musl pthread workload on 1/2/4/8 CPUs (11 runs); 16 CPUs not run. Default enablement waits for exec-from-a-thread semantics and an independent review of G1/G2/G7 and the shared fd table |
+| §5 slice 1: shared `SignalTable` handle | Implemented; shared in every build since 2026-10-20 | Lock order PCB → table (leaf); IRQ delivery try-locks. Sharing is exercised by the ring3-mm thread legs and the musl pthread workload |
+| §5 slice 2: shared `FsContextHandle` (root/cwd/umask) | Implemented; shared in every build since 2026-10-20 | Hosted tests; ring3-mm `CLONE_FS` shared-table leg |
+| §5 slice 3: `FilesHandle` → `FilesTable` | Steps 1-3 implemented; enabled 2026-10-20 | `Process.files: Arc<FilesTable>` behind its own leaf lock, an owner count so only the last owner closes descriptors and returns the charge, and a `CLONE_FILES` branch inside a thread group. Three hosted tests; ring3-mm shared-table leg; musl threads `dup` into the shared table. Exec from a group first ends the other members, so the table has one owner (fourth batch) |
+| §5 slice 4: thread groups (`CLONE_VM`+`CLONE_SIGHAND`+`CLONE_THREAD`) | Steps 1-7 done; enabled by default 2026-10-20 (fourth batch) | [Slice 4 design](gap-5-slice4-thread-group-design.md): G1 `ThreadGroup` membership, auto-reap and exactly-once leader report; G2 group death; G3 clear-tid without the mmap gate (was a live bug); G4 futex prepare waits out a sibling; G5/G6 identity and namespace check; G7 process-directed target selection, `tkill`/`tgkill`, group stop/continue. Review D1 fixed. g58 and g60 (final kernel): the ring3-mm thread legs pass on 1/2/4/8 CPUs (15 boots) and the musl pthread workload on 1/2/4/8 CPUs (11 runs); 16 CPUs not run at the time. Fourth batch: the G7 shared pending set, G8 group-wide children, exec from any thread, and independent reviews with no open D0-D2 |
 | §5 TLS before runnable | Verified in source and guest | `fs_base`/`gs_base` written under the child lock before scheduler admission; the musl workload checks `__thread` values per thread |
 | §5 `exit_group` shared exit state | Implemented, verification pending | `ThreadGroup.exiting` is set before `request_exit_group_atomic` wakes the siblings; a new group gets a new `Arc`, so the handle itself is the generation. ring3-mm: `exit_group` from a non-leader ends the group with its status |
-| §5 futex operations for pthreads | Implemented 2026-10-17; g58 and g60 gates pass; independent review pending | Linux op decoding; `FUTEX_REQUEUE`/`CMP_REQUEUE` served by waking the would-be requeued waiters (musl's `pthread_cond_broadcast` hung on `ENOSYS`); `WAIT_BITSET`/`WAKE_BITSET` with MATCH_ANY. Hosted decoder test; ring3-mm requeue leg; musl broadcast and timed-wait legs |
+| §5 futex operations for pthreads | Implemented 2026-10-17; parity and PI added 2026-10-20 (fourth batch), reviewed | Linux op decoding; `FUTEX_REQUEUE`/`CMP_REQUEUE` served by waking the would-be requeued waiters (musl's `pthread_cond_broadcast` hung on `ENOSYS`); `WAIT_BITSET`/`WAKE_BITSET` with MATCH_ANY. Since 2026-10-20: a true requeue, `FUTEX_WAKE_OP`, partial bitsets, keys by address space, the PI user-word protocol and requeue-PI. Hosted decoder and futex tests; ring3-mm requeue, parity and seven PI legs; musl broadcast and timed-wait legs |
 | §5 pthread-like static workload | Passes (g58 6/6 and g60 5/5 musl-check on 1/2/4/8 CPUs, with the broadcast and timed-wait legs) | musl `pthread_create`/`join`, mutex contention, TLS, shared fd table: `MUSL-PTHREAD-OK` |
 | §5 robust futex list per thread | Per task by construction | `set_robust_list` state lives in each task's PCB and the exit walk runs per task; no thread-specific guest leg |
-| §5 exec from a thread group | Open | Returns `EBUSY`; Linux kills the other threads and unshares the fd table |
+| §5 exec from a thread group | Leader and non-leader exec implemented 2026-10-20, reviewed (no open D0-D2) | The leader ends the other members and waits until it alone owns the address space and fd table, then execs ([design](gap-5-slice4-thread-group-design.md), "Leader exec design"). A non-leader hands the exec to the leader, which keeps the PID ("Non-leader exec design", fourth batch) |
 | §6 W-3 selective-wait over-wake | Implemented, guest-asserted | Ring-3 leg reads `/proc/waitstat` before/after the targeted wait and requires zero over-wakes |
 | §6 W-4 nested-zombie rubric | Guest-verified | `test_selective_wait_nested_zombie` passes |
 | §6 F4/F6 locked diagnostics and switch sentinel | Implemented | 2/4/8/16-CPU QUALIFIED with 0 failures; reviewed clean |
@@ -29,7 +30,7 @@ still refuse `CLONE_SIGHAND|CLONE_THREAD|CLONE_FS|CLONE_FILES`.
 | §6 2/4/8/16-CPU qualification | QUALIFIED (not strict), 0 failures, on every tree through the final one (g58 and g60: 2/4/8/16 QUALIFIED 37/37/0) | See gate tables |
 | §6 64-CPU reject ceiling | Guest-verified (2026-10-16) | 64 CPUs: 64/64 online, 0 failed. 65 CPUs: MADT rejected, BSP-only fallback, 0 failed |
 | §6 F8 (new): buddy metadata on the boot heap | Fixed (QUALIFIED gates, 0 failed; reviewed) | Metadata in boot-reserved frames beside the COW table; `-m 1G` boots |
-| §6 F9 (new): boots with 2 GiB of RAM or more panic | Open, recorded | Pre-existing; early-boot direct-map limit (bootloader/mm work, outside §6) |
+| §6 F9 (new): boots with 2 GiB of RAM or more panic | Fixed 2026-10-20; 2G/4G boot-check QUALIFIED 28/46/0, 4/4 CPUs online at 2G/4G | Three causes: bootloader page tables allocated above the 1 GiB direct map; the bootloader loaded its CR3 before ExitBootServices, so OVMF split huge pages and put new tables near 2 GiB; ACPI tables above 1 GiB read through unmapped high-half addresses. See "Third batch" |
 | §6 F10 (new, pressure soak): `fork` `ENOMEM` after about 10,000 process creations | Fixed; soak-verified | PID reuse window and geometric table growth. The cpu profile then completed its window twice (g56x1: 6,733 rounds, g56x2: 6,689 rounds, about 27,000 forks each) |
 | §6 F11 (new, pressure soak): a ready task pinned to one CPU was stranded in another CPU's queue | Root cause found and fixed; soak-verified (g60 cpu 7,079 and g63 smp 6,630 rounds, no stall); independent review pending | A stall dump (stress builds only) caught it: a worker pinned to CPU 3 sat in CPU 2's queue, CPU 3 idled, and `steal_one` only ever probed the single longest queue (CPU 0, longer because it also held the Blocked runner). Stealing now tries every other CPU, longest first. Earlier reading of the symptom as a lost exit wake was wrong. See "F11 root cause" |
 | §6 F12 (new, pressure soak): `[PF ENTRY]` traces split console lines | Fixed in the kernel; the g58b/g60/g63 soaks print no trace and split no marker; independent review pending | The release kernel now traces only page faults that do not resolve (kill or panic); the serial port has no lock, and copy-on-write traces from one CPU split other CPUs' lines |
@@ -56,7 +57,7 @@ disposition array behind its own lock. The field is `Process.sigactions: Arc<Sig
 - The generation counter is a diagnostic mutation count (`signal.rs:403`), never an identity.
 - Blocked, pending and handler-scratch state stay per task.
 
-**Preview, not default (2026-10-17).** Default builds still omit
+**Preview, not default (2026-10-17; superseded 2026-10-20, fourth batch: every build admits the flags).** Default builds still omit
 `CLONE_SIGHAND | CLONE_THREAD | CLONE_FILES | CLONE_FS` from `SUPPORTED_CLONE_FLAGS`, so
 those flags return `EINVAL`. The `thread_preview` feature (enabled only by the guest test
 builds) admits them together with `CLONE_SYSVSEM` and `CLONE_DETACHED`, so the ring3-mm
@@ -87,6 +88,7 @@ thread legs and musl's own `pthread_create` exercise every shared handle for rea
    legs (via `KERNEL_TEST_CPUS`) and the musl workload pass on 1/2/4/8 CPUs. Open: a
    16-CPU run, exec from a thread group (`de_thread`/`unshare_files`; sketch in the slice-4
    design), and an independent lifetime/lock review of G1/G2/G7 and the shared fd table.
+   All three done 2026-10-20 (third and fourth batches).
 
 ## §6 Scheduler, SMP, pressure
 
@@ -352,10 +354,10 @@ One independent read-only review. G1 landed during the review and is not covered
 | Finding | Severity | Resolution |
 |---------|----------|------------|
 | `handle_shared_page_fault` resolves against the *current* task's `shared_regions` and installs into the *active* page table. Exit-time writes for a non-current task (the G3 clear-tid write from the deferred IRQ-kill drain, and the pre-existing robust-list walk) run under that task's CR3, so a not-present fault could map the current task's shared frame into another address space, write into it and charge the wrong cgroup | D1 (widened by G3; narrower form pre-existing) | Fixed: the resolver declines unless the active root is the current task's `memory_space` or KPTI `user_memory_space` (`fork.rs`); the usercopy fixup then fails the copy. G3 comment corrected |
-| A COW tid word is not cleared when the drain runs from the idle loop (`current_pid() == None` skips the COW arm) | D4 | Open, tracked; the word is left set, no wake |
+| A COW tid word is not cleared when the drain runs from the idle loop (`current_pid() == None` skips the COW arm) | D4 | Fixed 2026-10-20: the COW arm no longer requires a current task (the pid only names the task in logs; resolution uses the active page table) |
 | One more metadata reservation turns a 63-range memory map from booting into a panic | D4 | Fixed: the reservation builder keeps two slots for the metadata ranges |
 | G4 bounded by retries, not time; an idle CPU burns them instantly | D4 | Fixed: 100-tick deadline plus a yield backstop for the host harness |
-| Ring-3 clear-tid leg covers only self-exit, not the drain path | D5 | Open: add a SIGKILL-while-spinning leg |
+| Ring-3 clear-tid leg covers only self-exit, not the drain path | D5 | Fixed 2026-10-20: `clear_tid_after_spinning_kill_leg` kills a thread spinning in user mode (IRQ-kill drain) whose tid word sits on a COW page |
 | Redundant clear-tid range pre-check | D5 | Fixed: `copy_to_user_safe` validates the range |
 
 Checked clean: F8 slice construction, alignment, reinitialization, reservation and
@@ -631,26 +633,187 @@ anything. The ring3-mm boots had finished first. The interrupt logs of this sess
 were deleted (serial logs and the cited stress artifacts kept) and the failed steps rerun as
 g58b; those first-pass failures are environmental and count neither way.
 
+## Third batch (2026-10-20): leader exec, thread soak, F9, wait/pipe wakes
+
+Changes (working tree on `a5f9441`, not committed):
+
+- **Leader exec** (slice-4 exec step 1): `drain_thread_group_for_exec`, `ThreadGroup.exec_draining`
+  and `closed()`, clone checks under the publishing locks, process-directed signals routed
+  to the leader while draining, exec clears `clear_child_tid`. Ring-3 leg
+  `test_thread_group_exec`; two hosted tests.
+- **Item 5, `WaitQueue::finish_wait`**: now waits like `finish_prepared` (F13 class) and drops
+  its own queue entry when a kill or handler signal ends the wait. Pipe readers pass a
+  read wake on when they leave bytes behind or return Interrupted; reads wake all writers.
+- **Item 6, affinity**: `sched_setaffinity` on another task kicks every CPU so the old CPU
+  re-selects and an allowed CPU steals now. Balancing (`balance_queues`) is unchanged.
+- **F9**: the bootloader allocates every page-table frame, BootInfo and the memory-map copy
+  below 1 GiB, and loads its CR3 only after ExitBootServices. `mm::read_firmware_bytes`
+  copies ACPI tables above 1 GiB through a transient read-only page into a 64 KiB static
+  arena; `smp::phys_slice` (RSDP, RSDT/XSDT, MADT, HPET) and DMAR use it. `boot_check.sh`
+  takes `BOOT_CHECK_MEM`.
+- **Thread soak**: stress profile `thread` (id 7). Each round forks a child that runs
+  `churn_waves` waves of `workers` pthreads (mutex contention, a condition-variable barrier
+  ending in a broadcast, `__thread` check, join), then exits with one thread parked in
+  `pthread_cond_wait`. The stress kernel enables `thread_preview`. `musl_check.sh` accepts
+  16 CPUs.
+- **Other**: a hosted `cpu_local` test raced the IRQ-context tests (same class as
+  `b7a3420`) and now takes `TOPOLOGY_TEST_LOCK`; hosted total 482 (kernel-core 94).
+
+Review: one independent reviewer, four passes (leader exec; its fixes; pipe/F9/stress;
+their fixes). No D0-D2 finding remains. Dispositions are in the slice-4 design ("Review
+(2026-10-20)") and below.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| Pipe: a reader asleep on a read transaction, or behind a woken reader that returned Interrupted, missed data until the next write | D3 (pre-existing) | Fixed (wake pass-on) |
+| `finish_wait` left a stale queue entry after a signal; a later `wake_one` could be spent on it | D3 (pre-existing) | Fixed (`cancel_wait`) |
+| F9 alone left ACPI unreadable above 1 GiB | D2 | Fixed (`read_firmware_bytes`) |
+| `read_firmware_bytes` maps any firmware-supplied physical address write-back (a corrupt XSDT entry could name MMIO) | D4 | Fixed in the fourth batch: ACPI reclaim/NVS and runtime-services ranges, reserved ranges only with `EFI_MEMORY_WB` |
+| Firmware arena is boot-only (never reclaimed); `Pipe::read` ignores `read_inflight` (tests only); stress `fail_with_stats` reads `failure_emitted` non-atomically | D5 | Tracked |
+| Process-directed signal queued on a sibling before the exec drain is lost | D3 | Fixed later the same day by the G7 shared pending set (fourth batch) |
+
+Validation on nilix-dev. Trees `/tmp/nilix-exec-1020` (a), `/tmp/nilix-final-b` (b) and
+`/tmp/nilix-exec-1020b` (c-f), all hash-verified against the local working tree (408
+tracked non-doc files plus `kernel/mm/firmware.rs`; `disk-ext2.img` is regenerated by
+`ensure-ext3-image`). Batches a-c ran before the CR3-switch move; d-f rerun the boot-path
+gates with it. Logs `/tmp/nilix-final-{a..f}-logs`.
+
+| Gate | Result |
+|------|--------|
+| fmt-check, build, lint, clippy | OK |
+| hosted | 482 unit tests + CpuLocal doctests + 3 compile checks, OK |
+| `make test` | QUALIFIED 35/39/0 (a and d) |
+| boot-check 256M / 1G | QUALIFIED 28/46/0 |
+| boot-check 2G / 4G | a: FAIL (page fault in the W^X walk: OVMF-allocated table at 0x7EC03000); d, after the CR3 move: QUALIFIED 28/46/0. Manual 2G/4G `-smp 4` boots: HPET up, 4/4 CPUs online, 0 panics |
+| SMP 2 / 4 / extended 8+16 | QUALIFIED 37/37/0, 0 QEMU exceptions (a); SMP 4 again in d |
+| ring3-mm 1/2/4 (a), 8/16 (b), 1 (f) | RING3-MM OK; `exec from a thread group leader ends its siblings; a non-leader exec is EBUSY` passes at every CPU count (siblings end with 137, the host is reaped once with the new image's 0x5c) |
+| musl-check 1/2/4/8 (b), 1 and 16 (e) | MUSL-CHECK OK. The first 16-CPU run (b) failed only the `42 * 2 = 84` marker after `musl libc test passed!` and PID 1 exit 0; the serial showed kernel lines split by other CPUs' prints. Rerun (e) passed. Recorded as intermittent console interleaving at 16 CPUs (not confirmed; that serial was not kept) |
+| Soaks, 900 s each, 4 vCPUs (c) | QUALIFIED: memory 3,165, cpu 6,672, smp 5,802, thread 887 rounds; 0 STALL-DUMP, 0 FAIL, 0 panics, RCU backlog 0. An earlier thread soak on the pre-review tree: 1,012 rounds (32,384 threads), same result |
+
+
+## Fourth batch (2026-10-20): every known thread gap closed, flags enabled by default
+
+Changes (working tree on `a5f9441`, not committed). Details are in the
+[slice-4 design](gap-5-slice4-thread-group-design.md) section named in each item.
+
+- **G7 shared pending set** ("G7 shared pending set"): a process-directed signal stays in
+  the group's shared set until a member claims it (`claim_pending`, `group_claimed`). A
+  per-signal chosen mask (`shared_chosen`) marks the members a signal may interrupt, as
+  Linux's `TIF_SIGPENDING` does. Mask changes recalculate it (`recalc_shared_signals`) and
+  hand signals on (`retarget_shared_signals`); exit and the exec handoff return claimed bits.
+- **G8** ("G8 process-wide children"): a group `wait4` sleeps on `child_events` /
+  `child_waiters` instead of scanning the table per tick. Any member waits for the group's
+  children, a dying member hands its children on, and the group-exit report goes to the
+  parent current at report time.
+- **procfs** ("procfs thread listing"): `/proc/<pid>/task` lists members; provisioning and
+  terminated tasks are hidden.
+- **Non-leader exec** ("Non-leader exec design"): the exec is handed to the leader, which
+  keeps the PID (`ExecHandoff`, a stub page at `USER_STACK_TOP`, `EXEC_HANDOFFS_PENDING`;
+  the staging admission moves with the handoff).
+- **Futex parity** ("Futex parity"): a true requeue, `FUTEX_WAKE_OP`, partial bitsets and
+  keys by address space; `futex_drop_space` runs at exec (F7).
+- **PI futexes** ("PI futex user-word protocol and requeue-PI"): the Linux user-word
+  protocol for `LOCK_PI`/`LOCK_PI2`/`TRYLOCK_PI`/`UNLOCK_PI` and
+  `WAIT_REQUEUE_PI`/`CMP_REQUEUE_PI`, priority inheritance with a chain walk, no-fault
+  user-word access under futex locks (fault in and retry), killable waits.
+- **Firmware memory type** (third-batch D4): `read_firmware_bytes` maps ACPI reclaim/NVS
+  and runtime-services ranges, and reserved ranges only with `EFI_MEMORY_WB`.
+- **Clear-tid residue** (2026-10-16 review D4/D5, see "Review of the 2026-10-16 batch"):
+  the COW arm clears a tid word when the kill drain runs from the idle loop; a Ring-3 leg
+  kills a thread spinning in user mode whose tid word is on a COW page.
+- **Fork deadlock** (found by the cpu soak, 2026-10-21; slice-4 design, G8 "Fork
+  deadlock"): `fork_inner` took `PROCESS_TABLE` under the parent's PCB (pre-existing
+  inversion), and the new group-exit report held the table while it locked that parent.
+  The cpu soak stalled in five of five runs. `sys_fork` now passes the child's `Arc`;
+  the report and `current_tgid` no longer lock a live task's PCB under the table. A
+  follow-up lock-order audit fixed two indirect cycles through `pipe.inner` (end counts
+  are atomics; `duplicate` takes no lock) and `sockets` (the SYN-cookie accept wake runs
+  after the registry is released). The final ladder then found a pre-existing 1-CPU
+  livelock (a waiter that cannot switch away never ran the deferred IRQ-kill drain its
+  victim needed, two of five one-CPU ring3-mm runs); the busy-wait loops now run that
+  drain. Its review found the same hang with a user-mode bystander (D2), and a second
+  review the same gap for an exited thread (D3): the scheduler now hands a task killed at
+  a timer interrupt, and an exited thread awaiting auto-reap, to the idle context, which
+  drains it before it schedules; two new ring3-mm legs cover them (slice-4 design, "1-CPU
+  kill livelock", "Review of the livelock fix" and "Second review").
+- **Credential admission** (found by thread soaks, 2026-10-21; slice-4 design, "Shared
+  credential admission"): extra thread soaks stalled in 14 of 27 runs with a condvar
+  waiter asleep for good. `SharedCredentials` reader admission (R186) failed when
+  another reader of the same identity came or went at the same moment; thread-group
+  members share that identity, so a sibling's syscall made musl's `FUTEX_REQUEUE` fail
+  with `EPERM` (musl ignores the result) and `clone` with `EAGAIN`. Readers now retry and
+  fail only on a writer claim; the writer claim is a `fetch_or`. The stress-only futex
+  trace and syscall-error logging used to find it were removed.
+- **PI third pass** (slice-4 design, "Second PI review"): F1, a `LOCK_PI` waiter publishes
+  its live priority; comment and inlining fixes.
+- **Enablement** (slice-4 step 7): `thread_preview` removed; `SUPPORTED_CLONE_FLAGS` always
+  includes the thread flags; `rf186_clone_contract_tests` updated.
+- **Tests**: ring3-mm legs for non-leader exec, group children, procfs, futex parity (2),
+  PI (7), and a timer-interrupt kill and a group's last thread exit beside a user-mode
+  spinner; musl `MUSL-PTHREAD-SIGNAL-OK` (a group signal wakes a `nanosleep` member; a
+  `pselect` mask opening takes a pending group signal); hosted total 515 (kernel-core
+  105, vfs 66, ipc `robust_ futex_parity_ futex_pi_` 23 run / 17 filtered), including
+  concurrent credential readers and a writer claim among readers.
+
+Reviews (independent; dispositions in the slice-4 design): non-leader exec implementation
+(F1-F10), a second pass over those fixes plus G7/G8/procfs, the PI work (D2-1, D2-2, D3,
+two D4s, D5s) and the PI fix delta (D2-A, D3-B fixed; D3-A, D4-A and D5s open as debt). No
+D0-D2 is open.
+
+Validation on nilix-dev. The final tree is `src22` (364 files hash-verified in every
+tree before any gate ran). Earlier trees found the failures recorded here: `src8` (before
+D2-A/D3-B, the lint markers and the PI signal-leg stack fix), `src9`/`src10` (before the
+fork deadlock fix: the cpu soak stalled in five of five runs), `src11` (fork fix only),
+`src12` to `src16` (the one-CPU livelock and its review fixes; `src16` passed the full
+ladder), `src12` to `src19` (extra thread soaks stalled in 14 of 27 runs: the credential
+admission bug; `src17` to `src19` carried the stress-only futex trace and syscall-error
+logging that found it) and `src20` (the first form of the admission fix; the hosted vfs
+suite aborted, see the slice-4 design). Trees `/tmp/nilix-{g1,g2,g3,h1..h10}`; logs
+`/tmp/nilix-Z{1..13}-logs`.
+
+| Gate | Result on `src22` |
+|------|--------|
+| fmt-check, build, lint (with `abi-check`), clippy, py-tests, stress self-test | OK |
+| hosted | OK, 515 unit tests + CpuLocal doctests + 3 compile checks (run before the guest lanes and again in the ladder) |
+| `make test` | QUALIFIED 35/39/0 |
+| boot-check 256M, 1G, 2G, 4G | QUALIFIED 28/46/0 each |
+| SMP 2 / 4 / extended 8+16 | QUALIFIED 37/37/0 each, 0 failed |
+| ring3-mm 1/2/4/8/16 | RING3-MM OK (31 pinned PASS lines) |
+| musl-check 1/2/4/16 | MUSL-CHECK OK |
+| musl-check 8 | **FAIL, three of three** (one run under the 13-lane load, two repeats on an idle host), each on console interleaving only: PID 1's markers land inside the BSP's "Entering interactive shell" line and banner (`42 * 2 = 84` split twice, `MUSL-POLL-OK` once); the guest printed `musl libc test passed!` and PID 1 exited 0 each time. Not a CI gate (the default is 1 CPU). Needs the serial lock (residual risk) |
+| Soak thread (seven runs, 4 vCPUs, 900 s, 13 lanes sharing the host) | QUALIFIED, 462 / 478 / 588 / 467 / 555 / 451 / 595 rounds; 0 STALL-DUMP, 0 FAIL |
+| Soak cpu, smp, memory | QUALIFIED, 3,617 / 3,084 / 2,811 rounds; 0 STALL-DUMP, 0 FAIL |
+
 ## Residual risk
 
-- Thread sharing (signal table, fs context, fd table, thread group) runs only in the
-  guest test builds; it passes on 1/2/4/8 CPUs (g58) but has not run at 16 CPUs or under a
-  pressure soak.
-  The lifetime/lock argument for G1/G2/G7 and `FilesTable` has had no independent review
-  (a review started on 2026-10-17 was stopped before it reported).
-- `FUTEX_REQUEUE` wakes instead of moving waiters: correct for retrying users, but a
-  broadcast wakes every waiter at once (thundering herd).
-- Exec from a thread group returns `EBUSY` instead of Linux's kill-siblings-and-unshare.
+- Thread sharing (signal table, fs context, fd table, thread group) runs in every build
+  since 2026-10-20. The G1/G2/G7 and `FilesTable` code was covered by the R190 full-tree
+  audit (2026-10-18); the exec, G7 shared pending, G8 and PI work had dedicated reviews.
+- A failure after the exec drain leaves the leader single-threaded with its old image
+  (Linux kills the process).
+- PI futexes (slice-4 design, "Second PI review"): a handler signal for a thread blocked in
+  `LOCK_PI`/`WAIT_REQUEUE_PI` runs only when the call returns, so a runtime that holds a PI
+  mutex and waits for every thread's handler can hang (D3-A); past 16 waiters lockers poll
+  without FIFO order or donation (D4-A); exec runs no `exit_pi_state_list` equivalent (D5).
+- Sigframes are refused on a static (`.bss`/`.data`) stack (RF178-34; Linux allows any
+  writable stack); the PI handler-signal leg uses an mmap'd stack.
 - F11 fix (multi-source stealing) is verified by the g60 gates and the g60/g63 soaks only.
   Load balancing (`balance_queues`) still picks one busiest and one idlest CPU, and
   `sched_setaffinity` does not move a task off a CPU it may no longer use; stealing now
   covers both, but neither was changed.
 - The soak profiles qualify (not strictly pass); process, block and combined profiles
   still fail on features outside §5/§6 (`RLIMIT_NPROC`, `fsync`, `open` mode).
-- `WaitQueue::finish_wait` keeps the single-reschedule shape that F13 removed from
-  `finish_prepared`; its callers loop, but it was not re-reviewed.
+- `sched_setaffinity` only kicks CPUs; it does not migrate a running task synchronously,
+  and there is no `getcpu` syscall to assert placement from Ring 3.
 - F12 trade-off: a release kernel that hangs inside fault resolution leaves no
   `[PF ENTRY]` trace; debug builds keep the entry trace.
 - W-3 bounds wait wakes, not general wait-queue work.
 - F7 contiguous-stack fragmentation under memory pressure is unmeasured.
-- F9: guests with 2 GiB of RAM or more panic in early boot (pre-existing).
+- F9 is fixed for UEFI/OVMF guests up to 4 GiB; RAM above 1 GiB is still not given to the
+  buddy allocator (the direct map stays 1 GiB).
+- musl-check fails on markers split by concurrent console output: once at 16 CPUs and
+  once in three runs at 8 on src16, and in all three runs at 8 on src22 (`42 * 2 = 84`,
+  `MUSL-POLL-OK`). Kept serials show PID 1's first markers landing inside the
+  "Entering interactive shell" line and banner the BSP prints at the same time; the
+  guest ran to exit 0 each time. The serial port has no lock, so the 8-CPU musl lane
+  stays red until it gets one.

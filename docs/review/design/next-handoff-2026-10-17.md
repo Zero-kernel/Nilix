@@ -112,4 +112,5 @@ Ordered by what blocks default enablement of threads first.
 
 | Date | Change |
 | --- | --- |
+| 2026-10-20 | Steps 2, 3 and parts of 5 executed; step 1 waived by the user (R190 full-tree audit). Superseded by [next-handoff-2026-10-20](next-handoff-2026-10-20.md). |
 | 2026-10-17 | Handoff written after the GAP-5/6 series landed on `main`. The first CI run on `fec4178` failed two jobs: the quality harness test still fed `musl_check.sh` a guest log without `MUSL-PTHREAD-OK`, and the qemu-fuzz executor gate rejected its run because F12 removed the page-fault trace that used to end the shell-prompt line, leaving `NILIX_SYZ_V2_BEGIN` behind the prompt. Both are fixed in `bd487f0`, verified on nilix-dev before the push. |
