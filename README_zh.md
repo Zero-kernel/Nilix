@@ -270,7 +270,9 @@ qualified 结果与严格通过分开记录，并且 make 会以非零状态退�
 
 ## 许可证
 
-Nilix 参照 Rust 项目的方式按组件授权，[COPYRIGHT](COPYRIGHT) 为每个路径指定唯一的许可证：
+Nilix 参照 Rust 项目的方式按组件授权：[COPYRIGHT](COPYRIGHT) 说明每种许可证覆盖哪些文件，
+[REUSE.toml](REUSE.toml) 是供 [`reuse lint`](https://reuse.software) 检查的机器可读映射，
+许可证全文按 SPDX 标识放在 [LICENSES/](LICENSES)。
 
 | 组件 | 许可证 |
 | --- | --- |

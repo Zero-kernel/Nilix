@@ -1,0 +1,106 @@
+version = 1
+
+# Machine-readable license map for Nilix (see COPYRIGHT for the prose version).
+#
+# REUSE (https://reuse.software) reads this file to find the copyright and
+# license of every file in the tree. When several annotations match a file,
+# the last one in this file wins, so the tables run from the default to the
+# most specific: Apache-2.0 for everything, then AGPL scaffolding, then GPL C
+# code and the images built from it, then CC-BY documentation.
+#
+# Check the tree with `reuse lint` (reuse-tool 5 or later). The license texts
+# are in LICENSES/, named by SPDX identifier.
+
+# Default: the kernel, the bootloader and the rest of the Rust code.
+[[annotations]]
+path = "**"
+precedence = "override"
+SPDX-FileCopyrightText = "The Nilix Contributors (see the version control history)"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Test, stress, fuzz and CI scaffolding.
+[[annotations]]
+path = [
+    "scripts/**",
+    "fuzz/**",
+    "tools/**",
+    "kernel/tests/**",
+    "userspace/fuzzer/**",
+    "userspace/nilix-syz-fuzzer/**",
+    "userspace/src/syscall_test.rs",
+    "userspace/fuzz_executor.rs",
+    "userspace/syscall_fuzzer.rs",
+    "userspace/kcov_test.rs",
+    "kernel/src/syscall_test.elf",
+    "disk-ext2.img",
+    ".github/**",
+    ".githooks/**",
+    ".validation/**",
+    "pytest.ini",
+    "requirements-ci.txt",
+    ".coveragerc",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Nilix Contributors (see the version control history)"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# GNU-related code: C programs built with GCC or musl-gcc, and the GNU Make
+# Makefile.
+[[annotations]]
+path = [
+    "**/*.c",
+    "Makefile",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Nilix Contributors (see the version control history)"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Prebuilt images of those C programs. They are statically linked with musl
+# libc and parts of the GCC runtime.
+[[annotations]]
+path = [
+    "kernel/src/musl_test.elf",
+    "kernel/src/clone_test.elf",
+    "kernel/src/fuzz_runner.elf",
+    "kernel/src/nilix_syz_executor.elf",
+    "userspace/*.elf",
+]
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "The Nilix Contributors (see the version control history)",
+    "2005-2020 Rich Felker, et al. (musl libc)",
+    "Free Software Foundation, Inc. (GCC runtime)",
+]
+SPDX-License-Identifier = "GPL-3.0-or-later AND MIT AND GPL-3.0-or-later WITH GCC-exception-3.1"
+
+# The prebuilt KCOV kernel embeds the fuzz runner image as a separate Ring-3
+# program; each part keeps its own license.
+[[annotations]]
+path = "esp-kcov/kernel.elf"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "The Nilix Contributors (see the version control history)",
+    "2005-2020 Rich Felker, et al. (musl libc)",
+    "Free Software Foundation, Inc. (GCC runtime)",
+]
+SPDX-License-Identifier = "Apache-2.0 AND GPL-3.0-or-later AND MIT AND GPL-3.0-or-later WITH GCC-exception-3.1"
+
+# Documentation and images.
+[[annotations]]
+path = [
+    "**/*.md",
+    "docs/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "The Nilix Contributors (see the version control history)"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# Adapted from the Contributor Covenant.
+[[annotations]]
+path = "CODE_OF_CONDUCT.md"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "The Nilix Contributors (see the version control history)",
+    "Contributor Covenant (https://www.contributor-covenant.org)",
+]
+SPDX-License-Identifier = "CC-BY-4.0"

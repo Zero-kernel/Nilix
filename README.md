@@ -292,7 +292,10 @@ regressions and evidence that matches their risk. Report vulnerabilities private
 ## License
 
 Nilix is licensed per component, in the style of the Rust project.
-[COPYRIGHT](COPYRIGHT) maps every path to exactly one license:
+[COPYRIGHT](COPYRIGHT) explains which license covers which files, and
+[REUSE.toml](REUSE.toml) is the machine-readable map that
+[`reuse lint`](https://reuse.software) checks. The license texts are in
+[LICENSES/](LICENSES), named by SPDX identifier.
 
 | Component | License |
 | --- | --- |

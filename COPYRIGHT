@@ -1,72 +1,92 @@
-Nilix is licensed per component, in the manner of the Rust project's COPYRIGHT
-file. Each file is covered by exactly one of the licenses below, chosen by the
-first rule in this list that matches its path. Copyright 2025-2026 the Nilix
-contributors.
+Short version for non-lawyers:
 
-The full license texts are in this directory:
+Nilix is licensed per component. Each file is covered by exactly one license
+(or one SPDX expression):
 
-  Apache-2.0         LICENSE-APACHE   Apache License, Version 2.0
-  GPL-3.0-or-later   LICENSE-GPL      GNU General Public License, version 3
-                                      or (at your option) any later version
-  AGPL-3.0-or-later  LICENSE-AGPL     GNU Affero General Public License,
-                                      version 3 or (at your option) any later
-                                      version
-  CC-BY-4.0          LICENSE-CC-BY    Creative Commons Attribution 4.0
-                                      International
+  Component                                    License            Text
+  -------------------------------------------  -----------------  --------------
+  Kernel, bootloader and the rest of the        Apache-2.0         LICENSE-APACHE
+  Rust code
+  GNU-related code: C programs built with       GPL-3.0-or-later   LICENSE-GPL
+  GCC or musl-gcc, and the Makefile
+  Test, stress, fuzz and CI scaffolding         AGPL-3.0-or-later  LICENSE-AGPL
+  Documentation and images                      CC-BY-4.0          LICENSE-CC-BY
 
+It is Copyright (c) The Nilix Contributors.
 
-1. License texts
-   The LICENSE-* files are the licenses themselves and carry their own terms.
-
-2. Documentation and images: CC-BY-4.0
-   - every Markdown file (*.md), wherever it is
-   - everything under docs/, including the logo and diagrams in docs/assets/
-
-3. GNU-related code: GPL-3.0-or-later
-   Code written against GNU interfaces or tooling:
-   - every C source file (*.c): the guest test, stress and fuzz programs in
-     userspace/ and the host probe in kernel/tests/, built with GCC or
-     musl-gcc
-   - the top-level Makefile (GNU Make)
-   - the prebuilt images built from those C sources:
-     kernel/src/musl_test.elf, kernel/src/clone_test.elf,
-     kernel/src/fuzz_runner.elf, kernel/src/nilix_syz_executor.elf and every
-     userspace/*.elf
-   These images are statically linked with musl libc, which remains under its
-   own MIT license, and with parts of the GCC runtime, which remain under the
-   GCC Runtime Library Exception.
-
-4. Test, stress, fuzz and CI scaffolding: AGPL-3.0-or-later
-   - scripts/, fuzz/, tools/ and kernel/tests/
-   - userspace/fuzzer/ and userspace/nilix-syz-fuzzer/
-   - userspace/src/syscall_test.rs, userspace/fuzz_executor.rs,
-     userspace/syscall_fuzzer.rs and userspace/kcov_test.rs
-   - kernel/src/syscall_test.elf (built from userspace/src/syscall_test.rs)
-   - the test fixture disk-ext2.img
-   - .github/, .githooks/, .validation/, pytest.ini, requirements-ci.txt and
-     .coveragerc
-
-5. Everything else, including the kernel: Apache-2.0
-   - kernel/ (all kernel crates, kernel.ld, kernel/src/shell.elf and
-     kernel/src/hello.elf) and bootloader/
-   - the rest of userspace/ (the native libc helpers, shell and hello
-     programs, and userspace.ld)
-   - esp-kcov/kernel.elf
-   - the workspace files: Cargo.toml, Cargo.lock, rust-toolchain.toml,
-     rustfmt.toml, .gitignore and .gitattributes
+REUSE.toml is the authoritative, machine-readable form of this file: it maps
+every path to its license, and `reuse lint` checks that no file is left out.
 
 
-Kernel images built with a test feature (for example the syscall_test,
-musl_test or KCOV builds, including esp-kcov/kernel.elf) carry a guest program
-from rule 3 or 4 as a separate program that runs in Ring 3. Each part keeps its
-own license.
+Longer version:
 
-CODE_OF_CONDUCT.md is adapted from the Contributor Covenant, which is licensed
-under CC-BY-4.0; its attribution is kept in that file.
+Copyrights in Nilix are retained by their contributors. No copyright
+assignment is required to contribute to Nilix. For full authorship
+information, see the version control history.
 
-Third-party Rust crates are fetched by Cargo and are not part of this
-repository; each is covered by its own license.
+Except as otherwise noted below, Nilix is licensed under the Apache License,
+Version 2.0 <LICENSE-APACHE> or <https://www.apache.org/licenses/LICENSE-2.0>.
+This covers kernel/ (every kernel crate, kernel.ld, and the shell.elf and
+hello.elf images), bootloader/, the native userspace library, shell and hello
+programs in userspace/, and the workspace files (Cargo.toml, Cargo.lock,
+rust-toolchain.toml, rustfmt.toml, .gitignore, .gitattributes, COPYRIGHT).
 
-Unless you explicitly state otherwise, a contribution you intentionally submit
-for inclusion in Nilix is licensed under the license that the rules above
-assign to the files it changes, without any additional terms or conditions.
+The following are licensed under the GNU General Public License, version 3
+or (at your option) any later version <LICENSE-GPL> or
+<https://www.gnu.org/licenses/gpl-3.0.html>:
+
+* every C source file (*.c), wherever it is: the guest test, stress and fuzz
+  programs in userspace/ and the host probe in kernel/tests/;
+* the top-level Makefile.
+
+The prebuilt images of those C programs (kernel/src/musl_test.elf,
+kernel/src/clone_test.elf, kernel/src/fuzz_runner.elf,
+kernel/src/nilix_syz_executor.elf and userspace/*.elf) are covered by the GPL
+as well, and are statically linked with musl libc, which keeps its MIT license
+<LICENSES/MIT.txt>, and with parts of the GCC runtime, which keep the GCC
+Runtime Library Exception 3.1 <LICENSES/GCC-exception-3.1.txt>.
+
+The following are licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version <LICENSE-AGPL> or
+<https://www.gnu.org/licenses/agpl-3.0.html>:
+
+* scripts/, fuzz/, tools/ and kernel/tests/ (except C sources);
+* userspace/fuzzer/ and userspace/nilix-syz-fuzzer/;
+* userspace/src/syscall_test.rs, userspace/fuzz_executor.rs,
+  userspace/syscall_fuzzer.rs, userspace/kcov_test.rs and the image built from
+  the first of these, kernel/src/syscall_test.elf;
+* the test fixture disk-ext2.img;
+* .github/, .githooks/, .validation/, pytest.ini, requirements-ci.txt and
+  .coveragerc.
+
+The following are licensed under the Creative Commons Attribution 4.0
+International license <LICENSE-CC-BY> or
+<https://creativecommons.org/licenses/by/4.0/>:
+
+* every Markdown file (*.md), wherever it is, including the README files;
+* everything under docs/, including the logo and diagrams in docs/assets/.
+
+CODE_OF_CONDUCT.md is adapted from the Contributor Covenant, which is also
+licensed under CC-BY-4.0; its attribution is kept in that file.
+
+When more than one of these rules matches a file, documentation wins over
+everything else, and C sources win over scaffolding. For example, fuzz/README.md
+is CC-BY-4.0 and kernel/tests/usercopy_fault_probe.c is GPL-3.0-or-later.
+
+The prebuilt KCOV kernel, esp-kcov/kernel.elf, and any kernel image built with
+a test feature (such as syscall_test or musl_test) carry a guest program from
+the GPL or AGPL parts above as a separate program that runs in Ring 3. Each
+part keeps its own license.
+
+We track licenses for Nilix in two ways:
+
+* We use REUSE <https://reuse.software> for every file in the tree. See
+  REUSE.toml; the license texts are in LICENSES/, named by SPDX identifier.
+* We use Cargo for out-of-tree dependencies. Every crate declares its SPDX
+  expression in its Cargo.toml, and third-party crates fetched by Cargo keep
+  their own licenses.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in Nilix is licensed under the license that the rules
+above assign to the files it changes, without any additional terms or
+conditions.

@@ -45,6 +45,7 @@ docs/design
 *.backup
 *.md
 *.txt
+!LICENSES/*.txt
 *.log
 !scripts/fixtures/iommu_device_probe/serial.log
 *.skill

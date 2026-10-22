@@ -224,7 +224,8 @@ code.
 
 ## 8. Licensing
 
-Nilix is licensed per component; [COPYRIGHT](COPYRIGHT) maps every path to one license:
+Nilix is licensed per component. [COPYRIGHT](COPYRIGHT) explains which license covers
+which files; [REUSE.toml](REUSE.toml) is the authoritative, machine-readable map:
 
 | Component | License |
 | --- | --- |
@@ -236,8 +237,10 @@ Nilix is licensed per component; [COPYRIGHT](COPYRIGHT) maps every path to one l
 Unless you explicitly state otherwise, a contribution you intentionally submit for
 inclusion is licensed under the license that COPYRIGHT assigns to the files it
 changes, without any additional terms or conditions. A new file takes the license of
-the rule its path matches; if no rule fits, say so in the pull request so that
-COPYRIGHT can be updated in the same change. New crates set the matching SPDX
-expression in the `license` field of their `Cargo.toml`.
+the REUSE.toml rule its path matches; if no rule fits, update REUSE.toml and COPYRIGHT
+in the same change. New crates set the matching SPDX expression in the `license` field
+of their `Cargo.toml`. Run [`reuse lint`](https://reuse.software) (for example
+`uvx --from 'reuse[charset-normalizer]' reuse lint`) to check that every file is
+covered.
 
 Welcome aboard, and thanks for helping make Nilix better.
