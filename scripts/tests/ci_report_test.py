@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from scripts.ci.ci_report import aggregate, fuzz_report, report
+from scripts.ci.ci_report import aggregate, fuzz_report, planned_jobs, report
 
 
 class ReportTests(unittest.TestCase):
@@ -55,6 +55,27 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(aggregate({'build': {'result': 'success'}})[1], 0)
         with self.assertRaises(ValueError):
             aggregate({})
+
+    def test_only_jobs_outside_the_plan_may_be_skipped(self):
+        docs_only = {'changes': {'result': 'success'}, 'license': {'result': 'success'},
+                     'build': {'result': 'skipped'}, 'runtime': {'result': 'skipped'}}
+        text, status = aggregate(docs_only, {'license'})
+        self.assertEqual(status, 0)
+        self.assertIn('not needed for this change', text)
+        # A selected job that is skipped (or fails) still blocks the check.
+        for state in ('skipped', 'failure', 'cancelled'):
+            with self.subTest(state=state):
+                self.assertEqual(aggregate({**docs_only, 'build': {'result': state}},
+                                           {'license', 'build'})[1], 1)
+        # The selector itself must succeed, and an unplanned job must not run.
+        self.assertEqual(aggregate({**docs_only, 'changes': {'result': 'failure'}}, {'license'})[1], 1)
+        self.assertEqual(aggregate({**docs_only, 'build': {'result': 'failure'}}, {'license'})[1], 1)
+
+    def test_a_missing_or_malformed_plan_is_rejected(self):
+        self.assertEqual(planned_jobs('["license", "build"]'), {'license', 'build'})
+        for raw in ('', '[]', '{}', '["license", 3]', 'license'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                planned_jobs(raw)
 
     def test_rust_test_names_and_failures_reach_junit(self):
         suites = self.root / 'suites'

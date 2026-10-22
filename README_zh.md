@@ -181,7 +181,7 @@ bash scripts/ci/entrypoint.sh musl      # 1 与 4 CPU 的 musl guest
 
 | 工作流 | 触发 | 覆盖 |
 | --- | --- | --- |
-| `CI` | 推送或 PR 到 main；手动 | quality、hosted debug/release、工具、内核构建、boot/SMP、musl、IOMMU、KCOV/executor；汇总为一个 `CI result` |
+| `CI` | 推送或 PR 到 main；手动 | 许可证（REUSE）、quality、hosted debug/release、工具、内核构建、boot/SMP、musl、IOMMU、KCOV/executor；每次改动只运行它可能影响的任务（[选择规则](docs/ci-testing.md#change-based-job-selection)）；汇总为一个 `CI result` |
 | `Extended tests` | 每周日 03:00 UTC；手动 | Ubuntu 22.04/24.04、8/16 CPU SMP、Ext3/JBD2、七种 900 秒压力场景、IOMMU 兼容性 |
 | `Fuzzing` | 每天 02:00 UTC；手动 | 11 个私有 libFuzzer campaign，发布经过校验的公开结果清单 |
 

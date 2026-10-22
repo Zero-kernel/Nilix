@@ -13,7 +13,7 @@ same grouped commands are available locally.
 
 | Entry | When | Coverage and result |
 | --- | --- | --- |
-| `CI` | Push/PR to main; manual | Quality, hosted debug/release, tools, kernel build, boot/SMP, musl, IOMMU, KCOV/executor; one `CI result` |
+| `CI` | Push/PR to main; manual | License (REUSE), quality, hosted debug/release, tools, kernel build, boot/SMP, musl, IOMMU, KCOV/executor, selected per change; one `CI result` |
 | `Extended tests` | Sunday 03:00 UTC; manual | Ubuntu 22.04/24.04, 8/16 CPU SMP, Ext3/JBD2, seven 900-second stress profiles, IOMMU compatibility |
 | `Fuzzing` | Daily 02:00 UTC; manual | 11 private libFuzzer campaigns, opaque candidate handling, validated public result manifests |
 
@@ -22,6 +22,26 @@ standalone syzkaller workflow duplicated the shared QEMU executor and swallowed
 process failures. Both workflow files are retired; executor code and local
 development commands remain available. Simulator plumbing is exercised by
 the required fuzz-tool regression suite.
+
+### Change-based job selection
+
+The first `CI` job, `Changes / select jobs`, runs
+[`scripts/ci/select_jobs.py`](../scripts/ci/select_jobs.py) on the files a push or
+pull request changes and starts only the jobs that can be affected. The first rule
+that matches a path decides its jobs:
+
+| Changed paths | Jobs |
+| --- | --- |
+| Python harness: `scripts/tests/`, `scripts/fixtures/`, `pytest.ini`, `requirements-ci.txt`, `.coveragerc` | quality, license |
+| Documentation: every `*.md`, `docs/`, `LICENSES/`, `LICENSE-*`, `COPYRIGHT`, `REUSE.toml`, `.gitignore`, `.github/ISSUE_TEMPLATE/`, `.github/CODEOWNERS`, `.validation/` | license |
+| Fuzz tools: `fuzz/`, `tools/`, `userspace/fuzzer/`, `userspace/nilix-syz-fuzzer/` | tools, qemu, license |
+| Anything else: the kernel, bootloader, guest programs, Makefile, Cargo files, gate and CI scripts, workflows | every job |
+
+The license check runs on every change. A manual run, a new branch, a base commit
+that cannot be found (for example after a force push) or an empty change runs every
+job, so the selection only drops work it knows to be irrelevant. `CI result` accepts
+a skipped job only when the selection left it out: a selected job that is skipped,
+cancelled or failed, or a failed selection, still fails the check.
 
 ## Local commands and reports
 
@@ -32,6 +52,8 @@ musl-tools and e2fsprogs on Linux. For Python harness tests, install
 | Group | Command |
 | --- | --- |
 | Source gates and every Python harness regression | `bash scripts/ci/entrypoint.sh quality` |
+| Every file has a license (`reuse` 6.2.0 on `PATH`) | `bash scripts/ci/entrypoint.sh license` |
+| Jobs a change selects | `python3 scripts/ci/select_jobs.py --files PATH...` |
 | Rust format/lint | `make fmt-check` and `make clippy` |
 | Kernel hosted allowlist | `make test-hosted-subcrates` |
 | Optimized hosted allowlist | `HOSTED_TEST_PROFILE=release make test-hosted-subcrates` |

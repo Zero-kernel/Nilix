@@ -2,7 +2,7 @@
 # Shared local/Actions entrypoint. Each group owns a single artifact directory.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-group="${1:?usage: bash scripts/ci/entrypoint.sh quality|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended}"
+group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended}"
 out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
@@ -86,6 +86,10 @@ case "$group" in
         # mounted read-write carries the private journal incompat bit (RF180-50)
         # and breaks ensure-ext3-image, the ext3 gate and every stress profile.
         check ext3-fixture -- e2fsck -fn disk-ext2.img
+        ;;
+    license)
+        # Every file must have a license and copyright rule (REUSE.toml, COPYRIGHT).
+        check reuse -- reuse lint
         ;;
     hosted)
         export HOSTED_TEST_LOG_DIR="$out/suites"

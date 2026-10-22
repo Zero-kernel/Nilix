@@ -19,8 +19,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Pick the jobs this change needs (scripts/ci/select_jobs.py): documentation
+  # gets only the license check, the harness and fuzz tools get their own jobs,
+  # and anything that can affect the kernel, its images or CI runs every job.
+  changes:
+    name: Changes / select jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      jobs: ${{ steps.select.outputs.jobs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - id: select
+        run: python3 scripts/ci/select_jobs.py
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  license:
+    name: Quality / REUSE license check
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'license')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'reuse[charset-normalizer]==6.2.0'
+      - run: bash scripts/ci/entrypoint.sh license
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ci-license
+          path: target/ci/license/
+          if-no-files-found: error
+
   quality:
     name: Quality / lint and harness tests
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'quality')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -44,6 +87,8 @@ jobs:
 
   style:
     name: Quality / rustfmt and Clippy
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'style')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -54,6 +99,8 @@ jobs:
 
   hosted:
     name: Hosted / ${{ matrix.profile }}
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'hosted')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -78,6 +125,8 @@ jobs:
 
   tools:
     name: Hosted / fuzz tools and executor
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'tools')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -95,6 +144,8 @@ jobs:
 
   build:
     name: Kernel / build and usercopy
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'build')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -115,7 +166,8 @@ jobs:
 
   runtime:
     name: QEMU / boot and SMP
-    needs: build
+    needs: [changes, build]
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'runtime')
     runs-on: ubuntu-24.04
     # Three sequential 15-minute observation windows plus setup/reporting and
     # one bounded retry for a transient guest failure.
@@ -139,6 +191,8 @@ jobs:
 
   qemu:
     name: QEMU / ${{ matrix.group }}
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.jobs), 'qemu')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -165,12 +219,14 @@ jobs:
 
   result:
     name: CI result
-    needs: [quality, style, hosted, tools, build, runtime, qemu]
+    needs: [changes, license, quality, style, hosted, tools, build, runtime, qemu]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      # A job the change did not select must be skipped; a selected one must pass.
       - run: python3 scripts/ci/ci_report.py --aggregate
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}
+          CI_PLANNED_JOBS: ${{ needs.changes.outputs.jobs }}

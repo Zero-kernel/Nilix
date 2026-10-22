@@ -107,14 +107,32 @@ def report(root):
     return '\n'.join(lines)
 
 
-def aggregate(needs):
+def aggregate(needs, planned=None):
+    """Summarize job results. `planned` lists the jobs the change selected
+    (scripts/ci/select_jobs.py); a job outside it must be skipped, not run."""
     if not needs:
         raise ValueError('required job results are missing')
     lines = ['## CI overview', '', '| Required group | Result |', '| --- | --- |']
+    failed = False
     for name, value in sorted(needs.items()):
-        lines.append(f'| {cell(name)} | {cell(value["result"])} |')
-    # No skipped/cancelled prerequisites can satisfy the stable required check.
-    return '\n'.join(lines) + '\n', int(any(value['result'] != 'success' for value in needs.values()))
+        result = value['result']
+        if planned is None or name == 'changes' or name in planned:
+            # No skipped/cancelled prerequisite can satisfy the stable required check.
+            failed |= result != 'success'
+            shown = result
+        else:
+            failed |= result != 'skipped'
+            shown = 'not needed for this change' if result == 'skipped' else f'{result} (unplanned)'
+        lines.append(f'| {cell(name)} | {cell(shown)} |')
+    return '\n'.join(lines) + '\n', int(failed)
+
+
+def planned_jobs(raw):
+    """Parse the selector's JSON job list; a malformed plan is an error."""
+    jobs = json.loads(raw)
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(job, str) for job in jobs):
+        raise ValueError(f'invalid job plan: {raw!r}')
+    return set(jobs)
 
 
 def fuzz_report(root, expected, needs):
@@ -151,7 +169,13 @@ def main():
         text, status = fuzz_report(args.artifacts, args.expected_manifests, json.loads(os.environ['CI_JOB_RESULTS']))
         (args.artifacts / 'summary.md').write_text(text, encoding='utf8')
     elif args.aggregate:
-        text, status = aggregate(json.loads(os.environ['CI_JOB_RESULTS']))
+        planned = os.environ.get('CI_PLANNED_JOBS')
+        try:
+            planned = None if planned is None else planned_jobs(planned)
+        except ValueError:
+            # No usable plan (the selector failed): every job must succeed.
+            planned = None
+        text, status = aggregate(json.loads(os.environ['CI_JOB_RESULTS']), planned)
     else:
         if args.artifacts is None:
             parser.error('artifacts directory is required')
