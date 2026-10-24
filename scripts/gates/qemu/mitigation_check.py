@@ -29,7 +29,8 @@ TOOLCHAIN = "nightly-2025-12-08"
 PHYSICAL = 0x000FFFFFFFFFF000
 STUBS = ("syscall_entry_stub", "timer_interrupt_stub", "switch_to_user")
 DORMANT_ENTRY = "enter_usermode"
-USER_FLAGS_MASK = 0xFFFFFFFFFFE2CFFF
+# R192-6: ~RFLAGS_USER_CLEAR (0x1F7000: IOPL, NT, RF, VM, AC, VIF, VIP).
+USER_FLAGS_MASK = 0xFFFFFFFFFFE08FFF
 ANCHOR = "zero_mitigation_probe_anchor"
 RELEASE = "ZERO_MITIGATION_PROBE_RELEASE"
 

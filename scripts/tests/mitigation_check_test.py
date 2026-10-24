@@ -32,7 +32,7 @@ def fixture():
 
 def mapping(kernel=0x1000, user=0x2000):
     return (f"MITIGATION-MAP PASS kernel={kernel:x} user={user:x} " +
-            " ".join(f"{key}={value}" for key, value in proof.MAP_FIELDS.items()) + " low_alias=true")
+            " ".join(f"{key}={value}" for key, value in proof.MAP_FIELDS.items()) + " low_alias=false")
 
 
 def transition(site, kernel=0x1000, user=0x2000):

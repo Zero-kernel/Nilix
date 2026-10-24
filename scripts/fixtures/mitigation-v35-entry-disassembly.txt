@@ -106,7 +106,7 @@ ffffffff8011c2ed: 4d 8b 44 24 40       	mov	r8, qword ptr [r12 + 0x40]
 ffffffff8011c2f2: 4d 8b 4c 24 48       	mov	r9, qword ptr [r12 + 0x48]
 ffffffff8011c2f7: 4d 8b 54 24 50       	mov	r10, qword ptr [r12 + 0x50]
 ffffffff8011c2fc: 4d 8b 5c 24 58       	mov	r11, qword ptr [r12 + 0x58]
-ffffffff8011c301: 49 bd ff cf e2 ff ff ff ff ff	movabs	r13, -0x1d3001
+ffffffff8011c301: 49 bd ff 8f e0 ff ff ff ff ff	movabs	r13, -0x1f7001
 ffffffff8011c30b: 4d 21 eb             	and	r11, r13
 ffffffff8011c30e: 49 81 cb 00 02 00 00 	or	r11, 0x200
 ffffffff8011c315: 4d 8b 6c 24 68       	mov	r13, qword ptr [r12 + 0x68]
@@ -129,7 +129,7 @@ ffffffff8011c36a: 4d 8b 64 24 60       	mov	r12, qword ptr [r12 + 0x60]
 ffffffff8011c36f: 48 83 ec 08          	sub	rsp, 0x8
 ffffffff8011c373: e8 98 ee 02 00       	call	0xffffffff8014b210 <syscall_bad_return>
 ffffffff8011c378: 48 c7 c0 f0 ff ff ff 	mov	rax, -0x10
-ffffffff8011c37f: 49 ba ff cf e2 ff ff ff ff ff	movabs	r10, -0x1d3001
+ffffffff8011c37f: 49 ba ff 8f e0 ff ff ff ff ff	movabs	r10, -0x1f7001
 ffffffff8011c389: 4d 21 d3             	and	r11, r10
 ffffffff8011c38c: 49 81 cb 00 02 00 00 	or	r11, 0x200
 ffffffff8011c393: 0f 01 f8             	swapgs
