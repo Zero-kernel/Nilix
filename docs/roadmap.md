@@ -99,7 +99,7 @@ All 25 library crates are listed. A crate/API's presence is not a completion cla
 | [arch](../kernel/arch/lib.rs) | GDT/IDT, APIC/HPET, IRQs, SYSCALL, context switch, AP boot | UP/SMP evidence; high-core/physical/exception-entry breadth pending |
 | [cpu_local](../kernel/cpu_local/lib.rs) | CPU topology/local storage/FPU ownership | Borrowed lifetime API and TLS migration evidence; 64 CPUs is a ceiling |
 | [tlb_ops](../kernel/tlb_ops/lib.rs) | TLB/INVPCID primitives | Active MM/arch dependency; CPU-feature dependent |
-| [sync_safe](../kernel/sync_safe/lib.rs) | IRQ-safe lock wrappers | Caller lock-order/entry-state obligations remain |
+| [sync_safe](../kernel/sync_safe/lib.rs) | IRQ-safe lock wrappers | Dormant since R192-8: not linked into the kernel, so its debug check never runs |
 | [drivers](../kernel/drivers/lib.rs) | VGA/framebuffer, serial, keyboard | Basic console, not a desktop/device-driver ecosystem |
 | [virtio](../kernel/virtio/src/lib.rs) | Shared PCI/MMIO transport/queues | Block/network integration; ACCESS_PLATFORM/device breadth pending |
 | [crypto](../kernel/crypto/lib.rs) | Shared SHA-256 | Narrow primitive, not a general certified provider |

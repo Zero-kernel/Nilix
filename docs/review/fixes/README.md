@@ -2,6 +2,27 @@
 
 This directory contains fix plans, implementation details, and summaries for security audit findings.
 
+## R192 Fixes (October 2026)
+
+- **[R192-fix-summary.md](R192-fix-summary.md)** - full-tree audit remediation: the
+  supervisor identity map in every user address space (R192-1 CRITICAL usercopy, R192-2
+  HIGH VMA/page-table, D0-ISO-1) closed at its chokepoints per the
+  [D0-ISO-1 design](../design/d0-iso-1-user-identity-map-boundary-design.md); R192-3
+  mitigated; R192-4 (root conntrack) partial; R192-5..R192-9 repaired; MODE S with two
+  independent reviewers over three rounds. A same-day follow-up (§8) repaired R192-4's
+  remainders, removed the identity map from user address spaces (Approach A), mirrored
+  the KPTI user root and fixed four leads. R192-RES-2 followed (§9): eager population
+  in bounded, all-or-nothing page-table holds, and five pre-existing defects its reviews
+  found, one of them a CRITICAL `mremap` use-after-free. Stage-3 review-fix pending.
+
+## R191 Fixes (October 2026)
+
+- **[R191-fix-summary.md](R191-fix-summary.md)** - scoped thread/futex/F9 audit
+  remediation: R191-1 (MEDIUM, PI owner must be a user task of the futex's address
+  space) and R191-3 (LOW, `get_robust_list` under `hook_ptrace`; `PARTIALLY_WIRED_HOOKS`)
+  repaired, R191-4 documented, R191-2 deferred with a recorded limit; D3-ARC-1/D4-SEC-1
+  amended; MODE S with one independent reviewer; stage-3 review-fix pending.
+
 ## R190 Fixes (October 2026)
 
 - **[R190-fix-summary.md](R190-fix-summary.md)** - full-tree audit remediation: 16/16

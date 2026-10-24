@@ -4,15 +4,14 @@ This directory contains all QA security audit reports for the Zero-OS kernel.
 
 ## Latest Audit
 
-**[qa-2026-10-18.md](qa-2026-10-18.md)** - R190 full-tree audit (first
-since R187/KSA closeout): 0 CRITICAL, 1 HIGH (R190-1: 19 of 54 LSM hooks unwired,
-incl. the live IPC family), 4 MEDIUM (R190-2 UDP per-socket byte cap, R190-3 SMP
-keyboard-IRQ lock, R190-4 cpuset privilege layer, R190-5 arch_prctl FS/GS high-half),
-7 LOW, plus design findings D2-ARC-1 and D3-RES-1. No new memory-safety defects in any
-partition; cross-partition driver verification falsified two agent-proposed MEDIUMs
-(IOMMU direct-map, DMA gate transition). 12 leads carried to next scoped round.
-Fix stage 2026-10-18: 16/16 repaired or documented, pending review-fix
-([R190 fix summary](../fixes/R190-fix-summary.md)).
+**[qa-2026-10-23.md](qa-2026-10-23.md)** - R192 full-tree audit (first since
+R190): 1 CRITICAL, 1 HIGH, 2 MEDIUM, 4 LOW, 1 INFO, plus design findings
+D0-ISO-1, D2-RES-1, D4-SEC-2, D4-OPS-1 and D5-ARC-1. The CRITICAL (R192-1) is a
+range-only usercopy check over the supervisor identity map present in every user
+address space; the HIGH (R192-2) is `mmap(PROT_NONE)`+`munmap`/`brk` unmapping
+supervisor identity-map pages. **1.0-Preview remains BLOCKED; 0-HIGH streak
+0/3.** No business code was modified; the only dynamic evidence is the report's
+focused Ring-3 probe of the R192-1 read primitive.
 ## Audit Summaries
 
 - **[qa-2026-07-02-summary.md](qa-2026-07-02-summary.md)** - Executive summary of R174 findings
@@ -30,6 +29,8 @@ Audits are organized chronologically by date. Each audit represents a full-codeb
 
 ### 2026 Audits
 
+- **R192** (October 23): full-tree audit; 1 CRITICAL (supervisor identity-map usercopy), 1 HIGH (`mmap(PROT_NONE)`/`munmap`/`brk` unmap), 2 MEDIUM, 4 LOW, 1 INFO + D0/D2/D4/D5; remediation in [R192-fix-summary.md](../fixes/R192-fix-summary.md) - [qa-2026-10-23.md](qa-2026-10-23.md)
+- **R191** (October 22): scoped audit of the thread-group/futex/F9 batch; 1 MEDIUM (PI owner identity), 2 LOW, 1 INFO + D3/D4; remediation in [R191-fix-summary.md](../fixes/R191-fix-summary.md) - [qa-2026-10-22.md](qa-2026-10-22.md)
 - **R190** (October 18): first full-tree audit since R187; 5-partition line-by-line review + driver cross-verification - [qa-2026-10-18.md](qa-2026-10-18.md)
 - **R187/R188/KSA** (Aug-Sep 2026): R187 audit, R188 standalone review-fix, KSA-2026-09-06 P1/P2/P3 closeout (20/20 scoped accepted) - [qa-2026-08-05.md](qa-2026-08-05.md), [qa-2026-09-06.md](qa-2026-09-06.md)
 - **R186** (July 28): full-codebase findings and remediation record - [qa-2026-07-28.md](qa-2026-07-28.md)

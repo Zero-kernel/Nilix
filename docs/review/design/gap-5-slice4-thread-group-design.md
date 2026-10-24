@@ -208,7 +208,12 @@ The G8 procfs item, in `kernel/vfs/procfs.rs` only (kernel_core is unchanged).
   reference count (each member PCB holds one) and capped at `PID_MAX`, and it grows
   only through `try_push`. A task whose group has one reference skips the scan, so
   single-threaded `status`/`stat` reads cost what they did. As in the root listing,
-  each readdir step rescans the table.
+  each readdir step rescans the table. R191-2 (2026-10-22, LOW, deferred): a
+  `status`/`stat` read of a task whose group has more than one member also scans the
+  whole table under `PROCESS_TABLE`, one PCB lock per task. This is the same cost as
+  each `/proc` root readdir step (`list_pids`, reachable by any task), so it adds no new
+  contention primitive; the limit is bounded (`PID_MAX`, fallible allocation) and stays
+  until procfs gets a per-group/per-namespace member index that serves both scans.
 - **Visibility** (`proc_task_visible`). A zombie leader whose group still has live
   threads stays visible, as on Linux: it is listed in `/proc`, `/proc/<tgid>`
   resolves, and `/proc/<pid>/task` lists it (first) and `Threads:` counts it (review
@@ -870,7 +875,9 @@ mutex.
   - Otherwise: CAS `WAITERS` in, then attach to the owner the word names. That TID must
     still be the one resolved before the lock, else the attempt retries. Owner liveness is
     checked under the bucket lock (bucket -> `PROCESS_TABLE` -> PCB):
-    - live: it becomes `pi_owner`;
+    - live and a user task of the futex's address space: it becomes `pi_owner`;
+    - live but a kernel task (`memory_space == 0`) or a task of another address space:
+      `EPERM` (R191-1 amendment, 2026-10-22, below);
     - exiting: wait for its exit work (Linux `wait_for_owner_exiting`), then retry;
     - gone or unresolvable: `ESRCH`, unless the word changed meanwhile (retry; Linux
       `handle_exit_race`).
@@ -968,8 +975,8 @@ reschedules only on a return to user mode), and the halt loop enabled interrupts
     `futex_proxy_trylock_atomic`; `WAITERS` set when `nr_requeue > 0`):
     - If taken, the record is popped, the waiter is granted (deferred wake on the source
       queue) and counted.
-    - If the take fails (`EDEADLK`, `ESRCH`, `EINVAL`, `EFAULT`), the operation fails and
-      nothing moves.
+    - If the take fails (`EDEADLK`, `ESRCH`, `EPERM` for an owner outside the address
+      space (R191-1), `EINVAL`, `EFAULT`), the operation fails and nothing moves.
   - Then move up to `nr_requeue` records, one more when the lock was not taken, oldest
     first:
     - A record that is not for `uaddr2` stops the pass with `EINVAL`.
@@ -1259,9 +1266,44 @@ stack or an mmap VMA; Linux allows any writable stack), and the host died with
 `SIGSEGV`. The leg now gives the waiter an mmap'd stack (`pi_spawn_on`); the static-stack
 refusal is recorded as a deviation.
 
-**Status.** Hosted pins: `robust_ futex_parity_ futex_pi_` runs 23 and filters 17 (40 ipc
-lib tests); `kernel-core` 103. The seven PI PASS lines are pinned in
-`ring3_mm_oracle.sh`. `futex_drop_space` runs at exec (F7). Gate results for the final
+**R191-1 amendment (2026-10-22): PI-owner identity (D3-ARC-1, INV-SEC-04).** The premises
+above made TID resolution and owner liveness the whole attach check and cited only Linux
+`find_get_task_by_vpid`. The R191 audit ([qa-2026-10-22](../audits/qa-2026-10-22.md))
+found that any task could name any task of its PID namespace in its own word and make the
+kernel attach a PI state to it and boost it. The implementation followed the design, so
+the design lacked the clause.
+
+- **Clause.** A live owner must be a user task (`memory_space != 0`) whose `mm` is the
+  futex's key space (`FutexSpace::id_of_mm(&owner.mm) == key.0`); otherwise the attach
+  fails with `EPERM` (`FutexError::NotOwner`) and no `pi_owner` or boost names the task.
+  It is checked in `pi_owner_liveness`, under the bucket lock and the owner's PCB lock,
+  for `LOCK_PI`, `LOCK_PI2`, `TRYLOCK_PI` and the `CMP_REQUEUE_PI` proxy lock (every
+  caller of `pi_take_or_attach_locked`). The identity of an exiting owner is not checked:
+  teardown may have cleared its `memory_space`, and it is only waited for.
+- **Linux deviation.** Linux `attach_to_pi_owner` rejects only `PF_KTHREAD`, because its
+  shared futexes let tasks of several address spaces use one PI word. Every futex here is
+  keyed by address space (`FUTEX_PRIVATE_FLAG` changes nothing), so a task of another
+  address space reaches the word through another key and could never unlock through this
+  state. A CLONE_VM task shares the key space, thread or not, and still attaches. If
+  shared (inode- or page-keyed) futexes are added, the clause must be revisited for them.
+- **Sub-items of the audit's suggested fix.** INV-SEC-06 (no foreign-space boost, also
+  across dead-space and exec cleanup) now holds by construction: a granted owner is always
+  a PI waiter of the same key, an attached owner passes the clause, and a same-space owner
+  holds the space's `mm`, so the space cannot die (dead-space unlink) while the owner
+  lives; exec unlinks only when the caller is the space's sole user. A generation in
+  `PiOwner` was not added: an owner's PID is not recycled before the reap-time
+  `cleanup_process_futexes` (RF180-3/R180-5) has repeated `release_pi_states_of`, which
+  clears every PI state naming it.
+- **Tests.** Hosted `futex_pi_owner_must_be_a_user_task_of_the_futex_address_space`
+  (the predicate, including the kernel-task case, which no Ring-3 task can name) and the
+  guest leg `futex_pi_owner_identity_leg` (`EPERM` with `WAITERS` set for `LOCK_PI`,
+  `LOCK_PI2`, `TRYLOCK_PI` and `CMP_REQUEUE_PI` naming the host's parent; no stale state;
+  a CLONE_VM non-thread child still waits behind the host and inherits the lock).
+- **Review and gates.** Recorded in the [R191 fix summary](../fixes/R191-fix-summary.md).
+
+**Status.** Hosted pins: `robust_ futex_parity_ futex_pi_` runs 24 and filters 17 (41 ipc
+lib tests; 23 of 40 before the R191-1 test); `kernel-core` 103. The PI PASS lines (seven,
+eight with the R191-1 owner-identity leg) are pinned in `ring3_mm_oracle.sh`. `futex_drop_space` runs at exec (F7). Gate results for the final
 tree are in the status record ("Fourth batch").
 
 **Residual risks** (besides the open rows above):

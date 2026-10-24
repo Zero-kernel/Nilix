@@ -1,8 +1,10 @@
 # ST-K2-P2 — Shared fault lifecycle and PT accounting follow-up
 
 **Date:** 2026-09-20; verification follow-up 2026-09-21
-**Status:** IMPLEMENTED; scoped lifecycle review passed. Current Ring-3 result is
-13 PASS, 0 FAIL and 1 explicit PTE-only preflight SKIP (observed EFAULT).
+**Status:** IMPLEMENTED; scoped lifecycle review passed. The PTE-only preflight SKIP
+(observed EFAULT) is repaired by ST-K2-P2a on 2026-10-23 (see the
+[ST-K2-P2a design](st-k2-p2a-lazy-preflight-design.md)); its Ring-3 leg now PASSes with the
+exact byte count.
 Final-region refcount/buddy/charge and local forced Busy/saved-IF=0 probes execute;
 the dedicated shared-mmap musl gate passes. Complete race/failure qualification remains pending.
 **Authorization:** Continue the two user-named Nilix issues, including shared-anonymous
@@ -205,7 +207,8 @@ All 22 recorded source/binary hashes match the local mirror after copying back t
 tested fixtures: syscall ELF `3e0f713f0e6859e3647af7009d5ed6ef059734ce11c07ca3d867fcef09ee0e4b`,
 musl ELF `dae47a424c1999773ff6c10f6d3c0c50ec24bbe52ef9f6546711cc643183ba4b`.
 
-Next scoped work: repair PTE-only preflight with safe caller locking; reconcile generic
+Next scoped work: ~~repair PTE-only preflight with safe caller locking~~ (done 2026-10-23
+as ST-K2-P2a, [design](st-k2-p2a-lazy-preflight-design.md)); reconcile generic
 private rollback table reclamation; add actual same-CPU exception and cross-CPU
 PT-lock/shootdown/ACK probes, parent-first-unmap and concurrent final-owner oracles;
 repair the standalone stress gate's imports/fault-outcome policy. File-backed mmap and

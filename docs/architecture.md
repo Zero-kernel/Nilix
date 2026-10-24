@@ -32,7 +32,7 @@ the host fuzz executor are separate build units.
 | `tlb_ops` | `kernel/tlb_ops/` | Low-level TLB/INVPCID primitives (dependency-free) |
 | `virtio` | `kernel/virtio/` | Shared VirtIO transport: virtqueues, MMIO/PCI |
 | `crypto` | `kernel/crypto/` | Shared no_std crypto (SHA-256) for audit/livepatch/vfs |
-| `sync_safe` | `kernel/sync_safe/` | IRQ-context-safe wrappers around `spin` primitives |
+| `sync_safe` | `kernel/sync_safe/` | Dormant (R192-8): not linked into the kernel; its debug `Mutex::lock` check would reject the IRQ-masked locking that IRQ-shared locks require |
 | `klog` | `kernel/klog/` | Profile-aware, security-conscious kernel logging |
 | `mm` | `kernel/mm/` | Memory: buddy allocator, heap admission ledger, page tables, page cache, DMA, OOM killer, TLB shootdown, fallible containers |
 | `coverage` | `kernel/coverage/` | KCOV code-coverage infra (per-task bitmap, `record_edge!`) |
@@ -63,7 +63,7 @@ layers, foundation → top:
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0** foundation leaves | `drivers`, `cpu_local`, `tlb_ops`, `virtio`, `crypto`, `sync_safe` | Depended on by many, depend on ~0 kernel crates |
+| **L0** foundation leaves | `drivers`, `cpu_local`, `tlb_ops`, `virtio`, `crypto` | Depended on by many, depend on ~0 kernel crates |
 | **L1** | `klog`, `coverage` | Cross-cutting logging + coverage |
 | **L2** | `mm`, `livepatch` | Memory foundation + unsupported patching experiments |
 | **L3** security core | `cap`, `audit`, `security`, `iommu` | Capability, audit, hardening, DMA isolation |
@@ -76,7 +76,7 @@ layers, foundation → top:
 | **L10** binary | `kernel` (`.elf`) | Top of the DAG, with `bootloader` as the sole upstream producer |
 
 **Leaf crates** (no outgoing kernel edges): `drivers`, `cpu_local`, `tlb_ops`, `virtio`,
-`crypto`, `sync_safe`. **Hub:** `kernel_core` (14 kernel deps). **Top:** the `kernel`
+`crypto`. **Hub:** `kernel_core` (14 kernel deps). **Top:** the `kernel`
 binary. Anti-cycle constraints are deliberate: `cap`/`lsm`/`audit` Cargo.tomls document that
 `kernel_core`/`vfs` were removed to avoid cycles, and `ipc/Cargo.toml` records the invariant.
 
@@ -90,7 +90,7 @@ also has an ASCII form; this Mermaid version is the readable one.)
 ```mermaid
 flowchart LR
   subgraph L0["L0 foundation leaves"]
-    drv[drivers] cpu[cpu_local] tlb[tlb_ops] vio[virtio] cry[crypto] ssf[sync_safe]
+    drv[drivers] cpu[cpu_local] tlb[tlb_ops] vio[virtio] cry[crypto]
   end
   subgraph L1["L1"]
     klog[klog] cov[coverage]
@@ -143,7 +143,7 @@ flowchart LR
   vfs-->kc; vfs-->drv; vfs-->lsm; vfs-->blk; vfs-->mm; vfs-->cap; vfs-->klog; vfs-->cry
   sch-->kc; sch-->drv; sch-->arch; sch-->cpu; sch-->trc; sch-->klog; sch-->mm
   ipc-->kc; ipc-->drv; ipc-->mm; ipc-->vfs; ipc-->trc; ipc-->klog; ipc-->cap; ipc-->lsm; ipc-->aud
-  krn-->arch; krn-->mm; krn-->sch; krn-->ipc; krn-->drv; krn-->kc; krn-->sec; krn-->vfs; krn-->aud; krn-->cap; krn-->lsm; krn-->scc; krn-->blk; krn-->net; krn-->iommu; krn-->trc; krn-->cmp; krn-->lp; krn-->klog; krn-->ssf; krn-->cov
+  krn-->arch; krn-->mm; krn-->sch; krn-->ipc; krn-->drv; krn-->kc; krn-->sec; krn-->vfs; krn-->aud; krn-->cap; krn-->lsm; krn-->scc; krn-->blk; krn-->net; krn-->iommu; krn-->trc; krn-->cmp; krn-->lp; krn-->klog; krn-->cov
   boot-. "UEFI handoff (BootInfo* in rdi)" .-> krn
 ```
 
