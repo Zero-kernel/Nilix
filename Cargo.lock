@@ -330,7 +330,6 @@ dependencies = [
  "seccomp",
  "security",
  "spin 0.12.3",
- "sync_safe",
  "trace",
  "vfs",
  "x86_64",
@@ -674,13 +673,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "sync_safe"
-version = "0.1.0"
-dependencies = [
- "spin 0.9.9",
 ]
 
 [[package]]

@@ -44,7 +44,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::smp::{
     find_rsdp, find_table_rsdt, find_table_xsdt, phys_slice, read_sdt_header, validate_checksum,
-    SdtHeader,
+    SdtHeader, MAX_ACPI_CHILD_TABLE_BYTES,
 };
 
 // ============================================================================
@@ -326,7 +326,8 @@ unsafe fn init_internal() -> Result<HpetInfo, HpetInitError> {
     }
 
     let total_len = header.length as usize;
-    if total_len < core::mem::size_of::<HpetTable>() {
+    // R192-9 FIX: bound the firmware length before reading the table.
+    if total_len < core::mem::size_of::<HpetTable>() || total_len > MAX_ACPI_CHILD_TABLE_BYTES {
         return Err(HpetInitError::InvalidLength);
     }
 

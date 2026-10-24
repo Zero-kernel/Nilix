@@ -652,8 +652,8 @@ impl RuntimeTest for MmapWindowClearTest {
 
         // Targeted teardown: free EXACTLY the table frames
         // `create_fresh_address_space` allocated for this AS — PML4, the
-        // deep-copied PDPT, PDPT[0]'s deep-copied PD, and PD[2]'s deep-copied
-        // PT — leaf-first, WITHOUT recursing any other entry. The generic
+        // skeleton PDPT, PDPT[0]'s PD, and PD[2]'s PT — leaf-first, WITHOUT
+        // recursing any other entry. The generic
         // `free_address_space` walk recurses shallow-copied identity entries
         // whose sub-tables are SHARED kernel structures; a boot-suite double
         // fault (deferred corruption ~18 tests later) implicated that walk for
@@ -1585,9 +1585,10 @@ impl RuntimeTest for SecuritySubsystemTest {
         use security::tests::{run_security_tests, TestContext};
         use x86_64::VirtAddr;
 
-        // Create test context with physical offset 0 (identity mapping for low memory)
+        // Page tables are below 1 GiB: read them through the high-half direct
+        // map, which every root has (D0-ISO-1: user roots have no identity map).
         let ctx = TestContext {
-            phys_offset: VirtAddr::new(0),
+            phys_offset: VirtAddr::new(mm::page_table::PHYSICAL_MEMORY_OFFSET),
         };
 
         let report = run_security_tests(&ctx);

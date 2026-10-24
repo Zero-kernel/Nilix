@@ -1185,12 +1185,15 @@ unsafe fn map_block_pci_mmio(
 /// A pending device guard if found. Dropping it resets/quarantines the device.
 pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
     // Known virtio-mmio addresses to try (used by some VMs)
-    // These use identity mapping (virt == phys for first 4GB)
     const VIRTIO_MMIO_BASES: [u64; 2] = [
         0x10001000, // Common virtio-mmio base
         0x10002000, // Secondary virtio-mmio base
     ];
-    let mmio_virt_offset = 0u64; // Identity mapped for low addresses
+    // D0-ISO-1 Approach A (R192-RES-1): reach them through the high-half direct
+    // map (physical 0-1 GiB), never the identity map: a device found here is
+    // driven at run time under process roots, which carry no identity map.
+    const _: () = assert!(VIRTIO_MMIO_BASES[1] + 0x1000 <= 0x4000_0000);
+    let mmio_virt_offset = mm::page_table::PHYSICAL_MEMORY_OFFSET;
 
     // R171-G5-01-C FIX: the virtio-MMIO block transport allocates DMA buffers
     // (probe_mmio) with NO IOMMU attach/isolation path, so in the Secure profile

@@ -13,3 +13,7 @@ spin = "0.9"
 
 [features]
 default = []
+
+# R192-8: dormant and no longer a dependency of any workspace member, so it
+# is its own workspace root (see README.md).
+[workspace]

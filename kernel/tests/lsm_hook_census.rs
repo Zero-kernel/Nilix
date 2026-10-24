@@ -9,6 +9,9 @@
 //! against the dispatcher by kernel-core `r190_11_dispatch_parity_tests`.
 //! Limits: one call site counts as wired (per-emitter coverage is review's
 //! job), and calls through function pointers are not seen.
+//! R192 adds two source pins: the families in `lsm::PARTIALLY_WIRED_HOOKS`
+//! keep every fenced syscall listed (R192-7), and no production subject
+//! lookup skips its hook when the subject is `None` (R192-5).
 //! Pure std source analysis, run from the `kernel/` directory by the hosted
 //! gate (`scripts/tools/hosted_subcrate_tests.sh`).
 
@@ -18,8 +21,10 @@ mod lsm_hook_census_tests {
     use std::path::{Path, PathBuf};
 
     /// Upper bound on dormant hook families. Lower it whenever a family is
-    /// wired; never raise it to admit a new unwired hook.
-    const MAX_FEATURE_ABSENT: usize = 16;
+    /// wired; never raise it to admit a new unwired hook. 15 since R191-3
+    /// wired `hook_ptrace` (get_robust_list; the rest of the family is in
+    /// `lsm::PARTIALLY_WIRED_HOOKS`).
+    const MAX_FEATURE_ABSENT: usize = 15;
 
     fn kernel_root() -> PathBuf {
         for candidate in [".", "kernel"] {
@@ -473,6 +478,315 @@ mod lsm_hook_census_tests {
             "LSM hook census failed:\n  {}",
             failures.join("\n  ")
         );
+    }
+
+    /// R192-7: every syscall of each partially wired hook family. The
+    /// kernel-core dispatcher test fences what `lsm::PARTIALLY_WIRED_HOOKS`
+    /// lists; this pins the list itself, so deleting or narrowing an entry
+    /// fails here instead of silently lifting the fence. Moving a syscall from
+    /// `absent` to `wired` keeps it listed.
+    const PARTIALLY_WIRED_FAMILIES: &[(&str, &[u64])] =
+        &[("hook_ptrace", &[101, 274, 310, 311, 312, 438])];
+
+    /// `(hook, wired and absent syscalls)` of each `PARTIALLY_WIRED_HOOKS` entry.
+    fn partially_wired(lsm_lib: &str) -> Vec<(String, Vec<u64>)> {
+        let start = lsm_lib
+            .find("pub const PARTIALLY_WIRED_HOOKS")
+            .expect("PARTIALLY_WIRED_HOOKS table missing");
+        let body = &lsm_lib[start..];
+        let end = body
+            .find("}];")
+            .expect("PARTIALLY_WIRED_HOOKS table not closed");
+        body[..end]
+            .split("hook: \"")
+            .skip(1)
+            .map(|entry| {
+                let name = entry[..entry.find('"').expect("hook name")].to_string();
+                let mut syscalls = Vec::new();
+                for field in ["wired: &[", "absent: &["] {
+                    let list = &entry[entry.find(field).expect(field) + field.len()..];
+                    for number in list[..list.find(']').expect("list end")].split(',') {
+                        let number = number.trim();
+                        if !number.is_empty() {
+                            syscalls.push(number.parse().expect("syscall number"));
+                        }
+                    }
+                }
+                syscalls.sort_unstable();
+                (name, syscalls)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partially_wired_families_stay_listed() {
+        let root = kernel_root();
+        let lsm_lib = fs::read_to_string(root.join("lsm/lib.rs")).expect("read lsm/lib.rs");
+        let table = partially_wired(&lsm_lib);
+        assert_eq!(
+            table.len(),
+            PARTIALLY_WIRED_FAMILIES.len(),
+            "PARTIALLY_WIRED_HOOKS has {:?}; update the R192-7 pin deliberately",
+            table
+        );
+        for &(hook, syscalls) in PARTIALLY_WIRED_FAMILIES {
+            let listed = table
+                .iter()
+                .find(|(name, _)| name == hook)
+                .unwrap_or_else(|| panic!("{hook} left PARTIALLY_WIRED_HOOKS: its fence is gone"));
+            assert_eq!(
+                listed.1, syscalls,
+                "{hook}: a fenced syscall left PARTIALLY_WIRED_HOOKS"
+            );
+        }
+        let sample = "pub const PARTIALLY_WIRED_HOOKS: &[PartiallyWiredHook] = &[\r\n    \
+                      PartiallyWiredHook {\r\n        hook: \"hook_x\",\r\n        \
+                      wired: &[3],\r\n        absent: &[2, 1],\r\n        reason: \"r\",\r\n    \
+                      }];\r\n";
+        assert_eq!(
+            partially_wired(sample),
+            [("hook_x".to_string(), vec![1, 2, 3])]
+        );
+    }
+
+    /// R192-5: the LSM subject lookups and whether a bare `?` already fails
+    /// closed (they return `Result`). A `None` or `Err` from them means the
+    /// task's credentials are being written or its PCB is gone, never "no
+    /// policy applies". Limits (review): the scan sees these spellings only, so
+    /// a type alias, a wrapper that turns the error into `Ok`, or a `?` inside
+    /// a discarded closure is not seen; a fail-closed `let .. else { return
+    /// Err(..) }` or `match .. { Err(e) => return Err(e), .. }` is flagged and
+    /// must be written with `.ok_or(..)?` or `?`.
+    const SUBJECT_LOOKUPS: &[(&str, bool)] = &[
+        ("ProcessCtx::from_current()", false),
+        ("Self::from_current()", false),
+        ("ProcessCtx::current_task()", false),
+        ("SyscallCtx::from_current(", false),
+        ("SocketLabel::from_current(", false),
+        ("lsm_current_process_ctx()", false),
+        ("lsm_process_ctx_from(", true),
+    ];
+
+    /// Reviewed lookups that handle the missing subject themselves:
+    /// `(file suffix, text in the 200 bytes before the call, text the 3000
+    /// bytes after it must contain (whitespace-insensitive), why)`. Each entry
+    /// must match exactly once, so a moved, deleted or weakened site fails.
+    const SUBJECT_LOOKUP_SITES: &[(&str, &str, &str, &str)] = &[
+        (
+            "kernel_core/syscall.rs",
+            "fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {",
+            "",
+            "the wrapper; its callers are scanned",
+        ),
+        (
+            "kernel_core/syscall.rs",
+            "let lsm_ctx = lsm::",
+            "increment_counter(TraceCounter::SyscallExit, 1); \
+             return SyscallError::EPERM.as_i64(); } };",
+            "syscall entry: the None arm returns EPERM (R184-U01-1)",
+        ),
+        (
+            "kernel_core/syscall.rs",
+            "let foreign_target = if Arc::ptr_eq(&t.thread_group, &caller_group) {",
+            "let target_ctx = target_ctx?;",
+            "get_robust_list target snapshot; propagated after the DAC check (R191-3)",
+        ),
+        (
+            "net/src/socket.rs",
+            "pub fn from_current(secmark: u64) -> Option<Self> {",
+            "",
+            "the SocketLabel wrapper; its callers are scanned",
+        ),
+        (
+            "sched/cpuset.rs",
+            "pub fn authorize() -> Result<Self, CpusetError> {",
+            "None => Err(CpusetError::PermissionDenied),",
+            "None fails closed unless there is no current task (kernel context)",
+        ),
+        (
+            "lsm/lib.rs",
+            "pub fn current_task() -> Result<Option<Self>, MissingSubject> {",
+            ".map(Some).ok_or(MissingSubject)",
+            "the current_task wrapper; its callers are scanned",
+        ),
+    ];
+
+    /// The end of the parenthesized group opening at `open`, if balanced.
+    fn group_end(code: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, c) in code[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether the lookup ending at `after` fails closed right there: it is
+    /// immediately converted to an error and propagated,
+    /// `.ok_or(..)?`, `.ok_or_else(..)?` or `.map_err(..)?`, or (for a lookup
+    /// returning `Result`) propagated with a bare `?`.
+    fn fails_closed_at(code: &str, after: usize, bare_question: bool) -> bool {
+        let rest = code[after..].trim_start();
+        if bare_question && rest.starts_with('?') {
+            return true;
+        }
+        let rest_at = code.len() - rest.len();
+        for method in [".ok_or(", ".ok_or_else(", ".map_err("] {
+            if rest.starts_with(method) {
+                let open = rest_at + method.len() - 1;
+                return group_end(code, open)
+                    .is_some_and(|end| code[end..].trim_start().starts_with('?'));
+            }
+        }
+        false
+    }
+
+    fn char_floor(code: &str, mut index: usize) -> usize {
+        while !code.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    /// A lookup in `code` that does not fail closed where it is made.
+    struct OpenLookup {
+        call: String,
+        /// The 200 bytes before the call.
+        before: String,
+        /// The 3000 bytes after it, whitespace collapsed.
+        after: String,
+    }
+
+    fn collapse(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn fail_open_lookups(code: &str) -> Vec<OpenLookup> {
+        let mut found = Vec::new();
+        for &(lookup, bare_question) in SUBJECT_LOOKUPS {
+            let mut from = 0;
+            while let Some(offset) = code[from..].find(lookup) {
+                let at = from + offset;
+                let mut after = at + lookup.len();
+                if lookup.ends_with('(') {
+                    after = group_end(code, after - 1).unwrap_or(after);
+                }
+                // A definition (`fn lsm_current_process_ctx()`) is no call.
+                let definition = code[..at].trim_end().ends_with("fn");
+                if !definition && !fails_closed_at(code, after, bare_question) {
+                    let head = char_floor(code, at.saturating_sub(200));
+                    let tail = char_floor(code, (after + 3000).min(code.len()));
+                    found.push(OpenLookup {
+                        call: code[at..after].split_whitespace().collect(),
+                        before: code[head..at].to_string(),
+                        after: collapse(&code[after..tail]),
+                    });
+                }
+                from = after.max(at + 1);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn lsm_subject_lookups_fail_closed() {
+        let open = [
+            "if let Some(ctx) =\n lsm::ProcessCtx::from_current() { hook(); }",
+            "let t = ProcessCtx::from_current(); if let Some(t) = t { hook(); }",
+            "let t = ProcessCtx::current_task().unwrap_or(None);",
+            "let Some(t) = ProcessCtx::from_current() else { return Ok(()) };",
+            "match lsm_current_process_ctx() { None => return Ok(()), Some(c) => hook(c) }",
+            "ProcessCtx::from_current().map_or(Ok(()), |c| hook(c))?;",
+            "let c = lsm_current_process_ctx().ok_or(E).unwrap_or_default();",
+            "let s = SocketLabel::from_current(mark);",
+            "let c = SyscallCtx::from_current(nr, &args);",
+            "if let Some(c) = Self::from_current() { hook(c); }",
+            "if let Ok(c) = lsm_process_ctx_from(&proc) { hook(&c); }",
+            "let c = lsm_process_ctx_from(&proc).ok();",
+        ];
+        for probe in open {
+            assert_eq!(fail_open_lookups(probe).len(), 1, "missed: {probe}");
+        }
+        let closed = [
+            "let c = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;",
+            "let t = lsm::ProcessCtx::current_task().map_err(|_| E::EACCES)?;",
+            "let c = ProcessCtx::from_current()\n .ok_or_else(|| err(f(1)))?\n .uid;",
+            "let c = SyscallCtx::from_current(nr, &args).ok_or(E)?;",
+            "let c = lsm_process_ctx_from(&proc.lock())?;",
+            "fn lsm_current_process_ctx() -> Option<X> { None }",
+            "pub fn lsm_process_ctx_from(p: &P) -> Result<X, E> { todo!() }",
+        ];
+        for probe in closed {
+            assert!(fail_open_lookups(probe).is_empty(), "flagged: {probe}");
+        }
+
+        let root = kernel_root();
+        let mut sources = production_sources(&root);
+        sources.extend(lsm_crate_sources(&root));
+        let mut failures = Vec::new();
+        let mut site_uses = vec![0usize; SUBJECT_LOOKUP_SITES.len()];
+        for source in &sources {
+            for open in fail_open_lookups(&source.exact) {
+                let site = SUBJECT_LOOKUP_SITES
+                    .iter()
+                    .position(|(file, marker, _, _)| {
+                        source.path.ends_with(file) && open.before.contains(marker)
+                    });
+                match site {
+                    Some(index) => {
+                        site_uses[index] += 1;
+                        let required = collapse(SUBJECT_LOOKUP_SITES[index].2);
+                        if !open.after.contains(&required) {
+                            failures.push(format!(
+                                "{}: reviewed {} no longer has `{required}` after it",
+                                source.path.display(),
+                                open.call
+                            ));
+                        }
+                    }
+                    None => failures.push(format!("{}: {}", source.path.display(), open.call)),
+                }
+            }
+        }
+        for (uses, (file, marker, _, _)) in site_uses.iter().zip(SUBJECT_LOOKUP_SITES) {
+            if *uses != 1 {
+                failures.push(format!(
+                    "{file}: reviewed site `{marker}` matched {uses} times"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "LSM subject lookups must fail closed where they are made (`.ok_or(..)?`, \
+             `.ok_or_else(..)?`, `.map_err(..)?`) or be a reviewed site:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The LSM crate's own sources: policy code there must fail closed too
+    /// (`ProcessCtx::current_task` is a reviewed site).
+    fn lsm_crate_sources(root: &Path) -> Vec<Source> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(root.join("lsm")).expect("read lsm dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let code = code_only(&fs::read_to_string(&path).expect("read source"));
+                out.push(Source {
+                    broad: strip_test_items(&code, Strip::Broad),
+                    exact: strip_test_items(&code, Strip::Exact),
+                    path,
+                });
+            }
+        }
+        out
     }
 
     /// `(API call, token the calling file must contain, defining file)`.

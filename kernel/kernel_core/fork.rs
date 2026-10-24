@@ -1383,6 +1383,16 @@ pub unsafe fn copy_page_table_cow_with_shared(
         for i in 256..512 {
             child_pml4[i] = parent_pml4[i].clone();
         }
+        // The recursive slot names its own root, as in
+        // `create_fresh_address_space`; the copy above named the parent's root,
+        // a frame freed and reused once the parent exits or execs.
+        const RECURSIVE_INDEX: usize = 510;
+        if !child_pml4[RECURSIVE_INDEX].is_unused() {
+            child_pml4[RECURSIVE_INDEX].set_frame(
+                child_root,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+            );
+        }
 
         // Z-8 fix: 两阶段 COW
         // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
@@ -3358,8 +3368,8 @@ unsafe fn zero_table(frame: PhysFrame) {
 }
 
 /// RF178-15 FIX: private-frame rollback ledger for fresh address spaces.
-/// Copied identity-map leaves are shared and must never be recursively freed.
-/// The constructor allocates at most root + PDPT + PD + PT.
+/// The constructor allocates at most root + PDPT + PD + PT (the `PML4[0]`
+/// skeleton); the copied higher-half entries are shared and never freed here.
 struct FreshSpaceGuard {
     frames: [Option<PhysFrame<Size4KiB>>; 4],
     len: usize,
@@ -3449,20 +3459,10 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
         let current_pml4 = phys_to_virt_table(current_frame.start_address());
         let new_pml4 = phys_to_virt_table(new_pml4_frame.start_address());
 
-        // 【关键修复】深拷贝 PML4[0] 并为用户空间准备 4KB 页映射
-        //
-        // PML4[0] 包含恒等映射（0-4GB），使用 2MB 大页。
-        // 用户空间需要 4KB 页映射，所以我们需要：
-        // 1. 深拷贝 PML4[0] 路径上的页表（避免影响内核的恒等映射）
-        // 2. 将用户空间区域（0x400000 附近）的 2MB 大页拆分为 4KB 页
-        if !current_pml4[0].is_unused() {
-            deep_copy_identity_for_user(
-                current_pml4,
-                new_pml4,
-                &mut frame_alloc,
-                &mut construction_guard,
-            )?;
-        }
+        // D0-ISO-1 Approach A (R192-RES-1): PML4[0] gets a private, empty
+        // skeleton down to the ELF window's page table; the boot identity map
+        // of physical 0-4 GiB is not copied into user address spaces.
+        build_user_low_skeleton(new_pml4, &mut frame_alloc, &mut construction_guard)?;
 
         // 复制内核高半区映射（索引 256-511）
         // 这些映射在所有进程间共享
@@ -3588,9 +3588,9 @@ pub fn create_kpti_user_pml4(
         // ── Share user-half entries (PML4[0..255]) ──
         //
         // These are raw pointer copies — the user PML4 shares the same PDPT/PD/PT
-        // frames as the kernel PML4. Any PML4-level change to user mappings must
-        // update both roots (currently only create_fresh_address_space modifies
-        // PML4[0], and we mirror it here).
+        // frames as the kernel PML4. A PML4 entry created later reaches this
+        // root through `mm::page_table`'s mirror (LEAD-KPTI-PML4-1), which runs
+        // after every page-table edit of the running address space.
         for i in 0..USER_HALF_END {
             user_pml4[i] = kernel_pml4[i].clone();
         }
@@ -3683,173 +3683,45 @@ pub fn free_kpti_user_pml4(user_memory_space: usize) {
     frame_alloc.deallocate_frame(root_frame);
 }
 
-/// 深拷贝恒等映射 PML4[0]，并为用户空间准备 4KB 页映射
+/// D0-ISO-1 Approach A (R192-RES-1): give a fresh user address space a
+/// private, empty skeleton for PML4[0]: PDPT, PDPT[0]'s PD and the empty page
+/// table at PD[2], the ELF window at 4-6 MiB. Every entry is P|W|U (the leaf
+/// decides access) and nothing is shared with the kernel.
 ///
-/// 用户空间起始地址 0x400000 (4MB) 落在：
-/// - PML4[0] (0-512GB)
-/// - PDPT[0] (0-1GB)
-/// - PD[2] (4MB-6MB，因为每个 PD entry 覆盖 2MB)
-///
-/// 我们需要：
-/// 1. 为新页表分配独立的 PDPT（深拷贝）
-/// 2. 为 PDPT[0] 分配独立的 PD（深拷贝）
-/// 3. 将 PD[2] 的 2MB 大页拆分为 4KB PT（如果需要）
-///
-/// 这样用户空间可以使用 4KB 页，而内核的恒等映射不受影响。
-///
-/// # R93-7 FIX: USER_ACCESSIBLE Propagation
-///
-/// When copying page table entries, we must ensure USER_ACCESSIBLE is set on
-/// all entries in the path from PML4 down to the leaf page tables that user
-/// space might traverse. Previously, only specific indices were modified,
-/// leaving other entries as supervisor-only which caused spurious #PF.
-unsafe fn deep_copy_identity_for_user(
-    current_pml4: &mut PageTable,
+/// This replaces `deep_copy_identity_for_user`, which copied the boot identity
+/// map of physical 0-4 GiB into every user address space as supervisor
+/// entries: ring 0 could be steered through it (R192-1/R192-2), and under KPTI
+/// the user root carried it as well, so all low physical memory, kernel frames
+/// included, stayed mapped while ring 3 ran. The kernel reaches physical memory
+/// through the high-half direct map, MMIO through high-half windows, and the BSP
+/// runs on a high-half stack; the identity map now exists in the boot page
+/// table only.
+unsafe fn build_user_low_skeleton(
     new_pml4: &mut PageTable,
     frame_alloc: &mut FrameAllocator,
     construction_guard: &mut FreshSpaceGuard,
 ) -> Result<(), ForkError> {
-    // 用户空间起始地址对应的页表索引
-    const USER_BASE: usize = 0x400000; // 4MB
-    const PDPT_IDX: usize = 0; // 0-1GB 在 PDPT[0]
-    const PD_IDX: usize = 2; // 4MB-6MB 在 PD[2] (4MB / 2MB = 2)
+    const PDPT_IDX: usize = 0; // 0-1 GiB
+    const PD_IDX: usize = 2; // 4-6 MiB: the ELF window
+    let parent =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
-    let current_pml4_0 = &current_pml4[0];
-    if current_pml4_0.is_unused() {
-        return Ok(()); // 没有恒等映射，无需处理
-    }
-
-    // Step 1: 分配新的 PDPT
-    let new_pdpt_frame = frame_alloc
-        .allocate_frame()
-        .ok_or(ForkError::MemoryAllocationFailed)?;
-    construction_guard.track(new_pdpt_frame)?;
-    zero_table(new_pdpt_frame);
-
-    // 复制 PDPT 条目
-    // R93-7 FIX (revised): Only PDPT[0] needs USER_ACCESSIBLE for user space.
-    // Other PDPT entries (1-511) are identity map for physical memory beyond 1GB.
-    // Setting USER_ACCESSIBLE on those would expose kernel memory and break SMAP.
-    // We copy them as supervisor-only to maintain isolation.
-    // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on all non-PDPT_IDX entries.
-    // Defense-in-depth: prevent propagation even if parent has corrupted flags.
-    let current_pdpt = phys_to_virt_table(current_pml4_0.addr());
-    let new_pdpt = phys_to_virt_table(new_pdpt_frame.start_address());
-    for i in 0..512 {
-        new_pdpt[i] = current_pdpt[i].clone();
-        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE except for PDPT_IDX
-        if i != PDPT_IDX && !new_pdpt[i].is_unused() {
-            let addr = new_pdpt[i].addr();
-            let mut flags = new_pdpt[i].flags();
-            flags.remove(PageTableFlags::USER_ACCESSIBLE);
-            new_pdpt[i].set_addr(addr, flags);
-        }
-    }
-
-    // 更新新 PML4[0] 指向新 PDPT
-    // 【关键修复】添加 USER_ACCESSIBLE 以允许用户态访问
-    let mut pml4_flags = current_pml4_0.flags();
-    pml4_flags.insert(PageTableFlags::USER_ACCESSIBLE);
-    new_pml4[0].set_addr(new_pdpt_frame.start_address(), pml4_flags);
-
-    // Step 2: 检查 PDPT[0]（0-1GB 区域）
-    let current_pdpt_0 = &current_pdpt[PDPT_IDX];
-    if current_pdpt_0.is_unused() {
-        return Ok(()); // 0-1GB 未映射
-    }
-
-    // 如果 PDPT[0] 是 1GB 大页，我们不支持拆分（太复杂）
-    if current_pdpt_0.flags().contains(PageTableFlags::HUGE_PAGE) {
-        kprintln!("WARNING: 1GB huge page at PDPT[0], cannot split for user space");
-        return Err(ForkError::PageTableCopyFailed);
-    }
-
-    // Step 3: 分配新的 PD
-    let new_pd_frame = frame_alloc
-        .allocate_frame()
-        .ok_or(ForkError::MemoryAllocationFailed)?;
-    construction_guard.track(new_pd_frame)?;
-    zero_table(new_pd_frame);
-
-    // 复制 PD 条目
-    // R93-7 FIX (revised): Only PD[2] (4MB-6MB region) needs USER_ACCESSIBLE.
-    // Other PD entries are identity-mapped kernel memory (0-4MB, 6MB-1GB).
-    // Setting USER_ACCESSIBLE on those would:
-    // 1. Break SMAP - kernel can't access "user" pages without STAC
-    // 2. Expose kernel memory to user space
-    // We copy them as supervisor-only; USER_ACCESSIBLE is set on PD[2] below.
-    // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on all non-PD_IDX entries.
-    // Defense-in-depth: prevent propagation even if parent has corrupted flags.
-    let current_pd = phys_to_virt_table(current_pdpt_0.addr());
-    let new_pd = phys_to_virt_table(new_pd_frame.start_address());
-    for i in 0..512 {
-        new_pd[i] = current_pd[i].clone();
-        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE except for PD_IDX
-        if i != PD_IDX && !new_pd[i].is_unused() {
-            let addr = new_pd[i].addr();
-            let mut flags = new_pd[i].flags();
-            flags.remove(PageTableFlags::USER_ACCESSIBLE);
-            new_pd[i].set_addr(addr, flags);
-        }
-    }
-
-    // 更新新 PDPT[0] 指向新 PD
-    // 【关键修复】添加 USER_ACCESSIBLE 以允许用户态访问
-    let mut pdpt_flags = current_pdpt_0.flags();
-    pdpt_flags.insert(PageTableFlags::USER_ACCESSIBLE);
-    new_pdpt[PDPT_IDX].set_addr(new_pd_frame.start_address(), pdpt_flags);
-
-    // Step 4: 检查并拆分 PD[2]（4MB-6MB 区域）的 2MB 大页
-    let current_pd_entry = &new_pd[PD_IDX];
-    if current_pd_entry.is_unused() {
-        return Ok(()); // 4MB-6MB 未映射
-    }
-
-    if current_pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-        // 这是 2MB 大页，需要拆分为 4KB PT
-        // 但我们不填充 PT 条目，而是留空让 ELF loader 创建新映射
-        // 用户进程不需要 identity mapping，它会有自己的物理帧
-
-        // 分配新的 PT
-        let new_pt_frame = frame_alloc
+    let mut fresh_table = || -> Result<PhysFrame<Size4KiB>, ForkError> {
+        let frame = frame_alloc
             .allocate_frame()
             .ok_or(ForkError::MemoryAllocationFailed)?;
-        construction_guard.track(new_pt_frame)?;
-        zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
+        construction_guard.track(frame)?;
+        zero_table(frame);
+        Ok(frame)
+    };
+    let pdpt_frame = fresh_table()?;
+    let pd_frame = fresh_table()?;
+    let pt_frame = fresh_table()?;
 
-        // 更新 PD[2] 指向新的空 PT（不再是大页）
-        // 【关键修复】添加 USER_ACCESSIBLE，移除 NO_EXECUTE 以允许用户代码执行
-        // NX 位会被 ELF loader 在 PT 级别按需设置
-        let mut pd_flags = current_pd_entry.flags();
-        pd_flags.remove(PageTableFlags::HUGE_PAGE);
-        pd_flags.remove(PageTableFlags::DIRTY); // DIRTY 是叶子页专有
-        pd_flags.remove(PageTableFlags::NO_EXECUTE); // 允许子页按需设置执行权限
-        pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
-        new_pd[PD_IDX].set_addr(new_pt_frame.start_address(), pd_flags);
-    } else {
-        // R94-5 FIX: Always allocate a fresh empty PT for the user base region.
-        //
-        // Even if the boot mapping already uses a 4KB PT at PD[2], reusing it risks
-        // sharing page-table pages with the kernel identity map (cross-process corruption
-        // and potential USER_ACCESSIBLE flag escalation).
-        //
-        // Previous code: reused pd_addr from current_pd_entry, which shared the PT
-        // page with the kernel. Now we allocate a fresh empty PT instead.
-        //
-        // Leave the PT empty: ELF loader will populate user mappings.
-        let new_pt_frame = frame_alloc
-            .allocate_frame()
-            .ok_or(ForkError::MemoryAllocationFailed)?;
-        construction_guard.track(new_pt_frame)?;
-        zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
-
-        // 【关键修复】添加 USER_ACCESSIBLE，移除 NO_EXECUTE 以允许用户代码执行
-        // NX 位会被 ELF loader 在 PT 级别按需设置
-        let mut pd_flags = current_pd_entry.flags();
-        pd_flags.remove(PageTableFlags::NO_EXECUTE); // 允许子页按需设置执行权限
-        pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
-        new_pd[PD_IDX].set_addr(new_pt_frame.start_address(), pd_flags);
-    }
-
+    let pdpt = phys_to_virt_table(pdpt_frame.start_address());
+    let pd = phys_to_virt_table(pd_frame.start_address());
+    pd[PD_IDX].set_frame(pt_frame, parent);
+    pdpt[PDPT_IDX].set_frame(pd_frame, parent);
+    new_pml4[0].set_frame(pdpt_frame, parent);
     Ok(())
 }

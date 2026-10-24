@@ -32,7 +32,11 @@ const PAGE_SIZE: usize = 4096;
 /// A single 4 KiB mapping can allocate at most one frame at each of the three
 /// intermediate levels below PML4. Keep a fixed provenance ledger so rollback
 /// never needs a heap allocation after physical frames are committed.
-const MAX_GUARDED_STACK_PAGES: usize = arch::KERNEL_STACK_SIZE / PAGE_SIZE;
+const MAX_GUARDED_STACK_PAGES: usize = if BSP_STACK_SIZE > arch::KERNEL_STACK_SIZE {
+    BSP_STACK_SIZE / PAGE_SIZE
+} else {
+    arch::KERNEL_STACK_SIZE / PAGE_SIZE
+};
 const STACK_PT_LEDGER_CAPACITY: usize = MAX_GUARDED_STACK_PAGES * 3;
 const _: () = assert!(arch::KERNEL_STACK_SIZE % PAGE_SIZE == 0);
 const _: () = assert!(arch::DOUBLE_FAULT_STACK_SIZE % PAGE_SIZE == 0);
@@ -120,6 +124,16 @@ const KERNEL_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_7000_0000;
 /// 双重错误栈区域基址
 /// 同样位于 PML4[511] 的未映射 PDPT 槽位中
 const DOUBLE_FAULT_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_6F00_0000;
+
+/// D0-ISO-1 Approach A: the BSP's boot, shell and idle stack (guard page
+/// first). It is in PDPT[509], which the KPTI entry island shares.
+const BSP_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_6E00_0000;
+/// The firmware stack the BSP used to keep was 128 KiB under OVMF; boot runs
+/// every runtime test on this stack, so leave headroom.
+const BSP_STACK_SIZE: usize = 64 * PAGE_SIZE;
+const _: () = assert!(
+    BSP_STACK_REGION_BASE + (PAGE_SIZE + BSP_STACK_SIZE) as u64 <= DOUBLE_FAULT_STACK_REGION_BASE
+);
 
 /// 栈守护页安装错误
 #[derive(Debug)]
@@ -338,6 +352,25 @@ pub unsafe fn install() -> Result<(), GuardPageError> {
         );
 
         Ok(())
+    })
+}
+
+/// D0-ISO-1 Approach A (R192-RES-1): map the BSP's guarded high-half stack and
+/// return its top. The BSP used to run on the firmware stack for its whole life,
+/// an identity-mapped address that user address spaces no longer carry.
+///
+/// # Safety
+///
+/// Called once, on the BSP, before SMP bring-up and before `sti`.
+pub unsafe fn install_bsp_stack() -> Result<VirtAddr, GuardPageError> {
+    mm::with_current_manager(VirtAddr::new(0), |mgr| {
+        let mut frame_alloc = mm::FrameAllocator::new();
+        map_guarded_stack(
+            mgr,
+            &mut frame_alloc,
+            VirtAddr::new(BSP_STACK_REGION_BASE),
+            BSP_STACK_SIZE,
+        )
     })
 }
 

@@ -88,6 +88,11 @@ static COUNTERS_READY: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static BOOT_PHASE_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// R192-6 FIX (D5-ARC-1): the SYSRET/IRET user RFLAGS clear set and the
+// signal-return sanitizer must agree; neither crate depends on the other.
+const _: () =
+    assert!(arch::syscall::RFLAGS_USER_CLEAR == kernel_core::signal_frame::RFLAGS_USER_CLEAR);
+
 // U14-3 FIX: bridge the net crate's allocation-free weak-ISN observation to
 // the tamper-evident audit stream without introducing a dependency cycle.
 fn audit_weak_isn_observation(count: u32) {
@@ -307,26 +312,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 解析 Bootloader 传递的 BootInfo 指针（必须在任何 println! 之前）
     // Bootloader 通过 rdi 寄存器传递 BootInfo 指针（System V AMD64 ABI）
-    // 由于 identity mapping 仍然有效，可以直接访问该地址
-    // U53-2b FIX: the pointer is supplied by firmware-facing boot code and
-    // must be validated before even an `as_ref` dereference.  The bootloader
-    // allocates one page below 4 GiB and the early kernel identity map covers
-    // that range; reject null, misaligned, wrapping, or out-of-window values.
-    let boot_info: Option<&BootInfo> = if boot_info_ptr == 0 {
-        None
-    } else {
-        let align = core::mem::align_of::<BootInfo>() as u64;
-        let size = core::mem::size_of::<BootInfo>() as u64;
-        let end = boot_info_ptr.checked_add(size);
-        if boot_info_ptr % align != 0
-            || boot_info_ptr < 0x1000
-            || end.is_none_or(|value| value > 0x1_0000_0000)
-        {
-            None
-        } else {
-            unsafe { (boot_info_ptr as *const BootInfo).as_ref() }
-        }
-    };
+    let boot_info = boot_info_from_ptr(boot_info_ptr);
 
     // 初始化 framebuffer 控制台（现代 GOP 方式，必须在第一个 println! 之前）
     if let Some(info) = boot_info {
@@ -438,6 +424,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     unsafe {
         arch::apic::map_lapic_mmio().expect("LAPIC high-half MMIO mapping failed");
     }
+    relocate_framebuffer();
 
     // RF180-24: prove all guarded-stack data and page-table frames roll back
     // under zero, upper-level, and partial-mapping allocation failures before
@@ -464,6 +451,106 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
     }
+
+    // D0-ISO-1 Approach A (R192-RES-1): leave the firmware stack. It is an
+    // identity-mapped address, and user address spaces carry no identity map,
+    // so the BSP must not be on it when it first loads a process root.
+    let bsp_stack_top = unsafe { stack_guard::install_bsp_stack() }
+        .expect("D0-ISO-1: the BSP's high-half boot stack could not be mapped");
+    klog_always!(
+        "      ✓ BSP moved to its guarded high-half stack (top 0x{:x})",
+        bsp_stack_top.as_u64()
+    );
+    // SAFETY: the stack is mapped, 16-byte aligned at its top, and owned by
+    // this CPU; interrupts are off, and nothing on the firmware stack is
+    // referenced after the switch (`kernel_main` re-derives `boot_info`).
+    unsafe { continue_on_stack(bsp_stack_top.as_u64(), boot_info_ptr) }
+}
+
+/// U53-2b FIX: the BootInfo pointer is supplied by firmware-facing boot code
+/// and must be validated before even an `as_ref` dereference. The bootloader
+/// allocates one page below 4 GiB, which the boot page table identity-maps;
+/// reject null, misaligned, wrapping, or out-of-window values.
+fn boot_info_from_ptr(boot_info_ptr: u64) -> Option<&'static BootInfo> {
+    if boot_info_ptr == 0 {
+        return None;
+    }
+    let align = core::mem::align_of::<BootInfo>() as u64;
+    let size = core::mem::size_of::<BootInfo>() as u64;
+    let end = boot_info_ptr.checked_add(size);
+    if boot_info_ptr % align != 0
+        || boot_info_ptr < 0x1000
+        || end.is_none_or(|value| value > 0x1_0000_0000)
+    {
+        None
+    } else {
+        unsafe { (boot_info_ptr as *const BootInfo).as_ref() }
+    }
+}
+
+/// D0-ISO-1 Approach A: the framebuffer's high-half window, in PDPT[509]
+/// between the VT-d probe window and the BSP stack.
+const FRAMEBUFFER_VIRT_BASE: u64 = 0xFFFF_FFFF_6400_0000;
+const FRAMEBUFFER_VIRT_SIZE: usize = 0x0A00_0000;
+
+/// D0-ISO-1 Approach A (R192-RES-1): a framebuffer above the 1 GiB direct map
+/// (OVMF puts it at 2 GiB) was drawn through the identity map, which user
+/// address spaces no longer carry. Map it in the high half before the first
+/// process root exists; without such a mapping the console is turned off.
+fn relocate_framebuffer() {
+    // Map what the console draws (stride x height), not the whole aperture GOP
+    // reports, which can be all of VRAM.
+    let Some((phys, drawn)) = drivers::framebuffer::get_drawn_region() else {
+        return;
+    };
+    if phys
+        .checked_add(drawn as u64)
+        .is_some_and(|end| end <= 0x4000_0000)
+    {
+        return; // drawn through the high-half direct map already
+    }
+    let mapped = drawn <= FRAMEBUFFER_VIRT_SIZE
+        && unsafe {
+            mm::map_mmio(
+                x86_64::VirtAddr::new(FRAMEBUFFER_VIRT_BASE),
+                x86_64::PhysAddr::new(phys),
+                drawn,
+                &mut mm::FrameAllocator::new(),
+            )
+        }
+        .is_ok();
+    if mapped {
+        drivers::framebuffer::relocate(FRAMEBUFFER_VIRT_BASE, drawn);
+        klog_always!("      ✓ Framebuffer mapped in the high half");
+    } else {
+        drivers::framebuffer::disable();
+        klog_always!("      ! Framebuffer console off: no high-half mapping");
+    }
+}
+
+/// Switch to `stack_top` and continue boot in [`kernel_main`].
+///
+/// # Safety
+///
+/// `stack_top` must be the 16-byte-aligned top of a mapped stack this CPU
+/// owns, with interrupts off.
+unsafe fn continue_on_stack(stack_top: u64, boot_info_ptr: u64) -> ! {
+    core::arch::asm!(
+        "mov rsp, {top}",
+        "xor ebp, ebp",
+        "call {main}",
+        "ud2",
+        top = in(reg) stack_top,
+        main = sym kernel_main,
+        in("rdi") boot_info_ptr,
+        options(noreturn),
+    );
+}
+
+/// The rest of boot, on the BSP's high-half stack; it never returns (the BSP
+/// ends in the shell or idle loop).
+extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
+    let boot_info = boot_info_from_ptr(boot_info_ptr);
 
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
     // G.3 Compliance: Use HardeningProfile to configure security settings
@@ -629,6 +716,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // before SMP startup.
         arch::gdt::install_ist_guard_pages_before_smp(&mut frame_allocator);
         klog_always!("      ✓ BSP/AP IST guard pages installed (double-fault + NMI)");
+
+        // R192-2: the page-table manager refuses the identity map (map,
+        // unmap, reprotect), proven on the boot root before any user space.
+        if unsafe { mm::page_table::run_kernel_owned_guard_self_test() } {
+            klog_always!("      ✓ R192 page-table guards refuse the kernel-owned lower half");
+        } else {
+            klog_always!("      - R192 page-table guard self-test skipped: no boot identity map");
+        }
     }
 
     // KSA-009: report the capability actually available to callers.

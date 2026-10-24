@@ -1,6 +1,14 @@
 # sync_safe — IRQ-Safe Synchronization Primitives
 
-**Defense-in-Depth Layer 2: Runtime Detection**  
+> **Status (R192-8, 2026-10-23): dormant.** No kernel crate depends on or
+> imports this crate, so the "Layer 2" runtime check below never runs in a
+> built kernel. The kernel's dependency on it was removed rather than wired in:
+> `Mutex::lock()` panics when `RFLAGS.IF=0`, but task-context code that shares a
+> lock with an IRQ handler must take it with interrupts masked, so wiring the
+> wrapper into those locks would reject the correct pattern. IRQ-context lock
+> safety is enforced by review and by the IRQ-shared lock designs instead.
+
+**Defense-in-Depth Layer 2: Runtime Detection** (not active; see the status above)  
 Part of R173 defense strategy to prevent IRQ-context deadlocks
 
 ---

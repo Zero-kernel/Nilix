@@ -424,6 +424,8 @@ def parse_mapping_records(serial):
         require(all(fields[key] == value for key, value in MAP_FIELDS.items()),
                 "mapping record contradicts partial-isolation contract")
         require(fields["low_alias"] in ("true", "false"), "invalid low_alias observation")
+        # D0-ISO-1 Approach A: user roots carry no low identity alias any more.
+        require(fields["low_alias"] == "false", "low identity alias present in a user root")
         require(all(re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", fields[key]) for key in ("kernel", "user")),
                 "invalid physical root value")
         kernel, user = int(fields["kernel"], 16), int(fields["user"], 16)

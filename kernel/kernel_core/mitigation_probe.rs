@@ -103,7 +103,9 @@ pub(crate) unsafe fn inspect(kernel: u64, user: u64) {
         !low_mapping.is_some_and(|(_, accessible)| accessible),
         "low identity alias became user accessible"
     );
-    let low_alias = low_mapping.is_some();
+    // D0-ISO-1 Approach A: a supervisor translation here is the identity alias;
+    // a user page a task mapped at 1 MiB is not.
+    let low_alias = low_mapping.is_some_and(|(_, accessible)| !accessible);
     klog::klog_always!("MITIGATION-MAP PASS kernel={:x} user={:x} shared_user=true recursive_absent=true private_island=true lower_island_absent=true text_retained=true data_retained=true heap_retained=true stack_retained=true low_alias={} full_isolation=false", kernel, user, low_alias);
     if !RENDEZVOUS_STARTED.swap(true, Ordering::AcqRel) {
         zero_mitigation_probe_anchor();

@@ -29,8 +29,16 @@
 //! the authoritative copy. [`enable_protections`] therefore clears the bit
 //! and [`require_supported_protections`] fails boot if it is still set. APs
 //! copy the BSP's CR4 in the SMP trampoline, so the BSP check covers them.
+//!
+//! # CR0.WP must be set (R192)
+//!
+//! Ring 0 must honor read-only PTEs, so a kernel write to a read-only or
+//! copy-on-write user page faults into the #PF path; the usercopy write rule
+//! relies on it. The AP trampoline sets CR0.WP itself (R171-G1-1); the BSP
+//! inherits CR0 from the firmware and bootloader, so [`enable_protections`]
+//! sets it and [`require_supported_protections`] fails boot without it.
 
-use x86_64::registers::control::{Cr4, Cr4Flags};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 /// Detected and enabled status for CPU protection features
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +160,13 @@ pub fn enable_protections() -> CpuProtectionStatus {
         unsafe { Cr4::write(cr4) };
     }
 
+    // R192 FIX (D0-ISO-1): supervisor write protection (see module docs).
+    let cr0 = Cr0::read();
+    if !cr0.contains(Cr0Flags::WRITE_PROTECT) {
+        klog_always!("      CR0.WP was clear at entry; enabling supervisor write protection");
+        unsafe { Cr0::write(cr0 | Cr0Flags::WRITE_PROTECT) };
+    }
+
     // Re-read to report final state
     check_cpu_features()
 }
@@ -208,6 +223,9 @@ pub fn require_supported_protections(status: CpuProtectionStatus) {
     }
     if Cr4::read().contains(Cr4Flags::FSGSBASE) {
         panic!("FATAL: CR4.FSGSBASE is set; user FS/GS bases must stay kernel-mediated");
+    }
+    if !Cr0::read().contains(Cr0Flags::WRITE_PROTECT) {
+        panic!("FATAL: CR0.WP is clear; ring 0 would ignore read-only PTEs");
     }
 }
 

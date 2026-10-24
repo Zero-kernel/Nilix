@@ -163,7 +163,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 30 0 \
+run_suite mm 34 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -197,7 +197,7 @@ run_suite cap-cloexec 1 11 \
     --features mm/host_harness \
     --lib --locked -- ksa005_
 
-run_suite net 120 0 \
+run_suite net 127 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -206,7 +206,7 @@ run_suite net 120 0 \
 # Robust-list and futex decision tests only: the remaining ipc tests reach
 # wakes or other privileged paths (one pipe admission test crashes a hosted
 # process at HEAD too). Futex parity/PI tests defer every wake.
-run_suite ipc-robust-futex 23 17 \
+run_suite ipc-robust-futex 24 17 \
     --manifest-path kernel/ipc/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -218,7 +218,7 @@ run_suite vfs 66 0 \
     --features host_harness \
     --lib --locked
 
-run_suite kernel-core 105 0 \
+run_suite kernel-core 112 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -233,7 +233,7 @@ run_suite kernel-core 105 0 \
 # panic/allocation handlers into a hosted std test process.
 run_standalone_rust_suite kernel-coverage 3 0 kernel tests/test_coverage.rs
 # R190-1: every LSM hook has a production caller or a feature-absent entry.
-run_standalone_rust_suite lsm-hook-census 3 0 kernel tests/lsm_hook_census.rs
+run_standalone_rust_suite lsm-hook-census 5 0 kernel tests/lsm_hook_census.rs
 run_standalone_rust_suite iommu-register-window 11 0 kernel/iommu register_window.rs
 run_standalone_rust_suite iommu-init-state 5 0 kernel/iommu init_state.rs
 
@@ -251,7 +251,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 3 105 \
+run_suite mitigation-mappings 3 112 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

@@ -3027,10 +3027,81 @@ fn validate_user_ptr_mut(ptr: *mut u8, len: usize) -> Result<(), SyscallError> {
     validate_user_ptr(ptr as *const u8, len)
 }
 
+/// ST-K2-P2a: page-table state of one user page for [`verify_user_memory`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserPageState {
+    /// Present, user-accessible and, for a write, writable or copy-on-write.
+    Ready,
+    /// No present translation; a demand fault may still resolve it.
+    NotPresent,
+    /// Present but not usable as requested; no fault resolution changes that.
+    Denied,
+}
+
+/// Classify one page from its leaf translation flags (`None`: not mapped).
+fn classify_user_page(flags: Option<PageTableFlags>, require_write: bool) -> UserPageState {
+    let Some(flags) = flags else {
+        return UserPageState::NotPresent;
+    };
+    if !flags.contains(PageTableFlags::PRESENT) {
+        return UserPageState::NotPresent;
+    }
+    // 检查页是否用户可访问（低端恒等映射是 supervisor-only 的）
+    if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        return UserPageState::Denied;
+    }
+    // 如果需要写入权限，检查 WRITABLE 或 BIT_9 (COW) 标志
+    // COW 页面标记为只读但有 BIT_9，写入时会触发 #PF 并由 COW 处理器创建可写副本
+    // 真正的只读页面（如代码段）没有这两个标志，应该拒绝写入
+    if require_write
+        && !flags.contains(PageTableFlags::WRITABLE)
+        && !flags.contains(PageTableFlags::BIT_9)
+    {
+        return UserPageState::Denied;
+    }
+    UserPageState::Ready
+}
+
+/// ST-K2-P2a: the bounded preflight loop over the pages of `[start, end)`.
+///
+/// `first_unready(page, require_write)` walks from `page` and returns the
+/// first page below `end` that is not present, `None` once every remaining
+/// page is ready, or EFAULT for a denied page. Each not-present page is
+/// resolved once through `fault_in(page, require_write)` and then walked
+/// again, so it must end up ready like any other page. A page still absent
+/// after its resolution (a concurrent unmap) fails the call instead of being
+/// retried, which bounds the work by the page count.
+fn preflight_user_pages(
+    start: usize,
+    end: usize,
+    require_write: bool,
+    mut first_unready: impl FnMut(usize, bool) -> Result<Option<usize>, SyscallError>,
+    mut fault_in: impl FnMut(usize, bool) -> Result<(), ()>,
+) -> Result<(), SyscallError> {
+    let mut page = start & !0xfff;
+    let mut resolved = None;
+    while let Some(missing) = first_unready(page, require_write)? {
+        if missing < page || missing >= end || missing & 0xfff != 0 || resolved == Some(missing) {
+            return Err(SyscallError::EFAULT);
+        }
+        fault_in(missing, require_write).map_err(|_| SyscallError::EFAULT)?;
+        resolved = Some(missing);
+        page = missing;
+    }
+    Ok(())
+}
+
 /// 验证用户空间地址是否已映射且具备所需权限
 ///
 /// 通过页表遍历验证地址范围内的每一页都已映射且具有正确的权限标志。
 /// 这比 validate_user_ptr 更严格，可以防止访问未映射内存导致的内核崩溃。
+///
+/// ST-K2-P2a: a page that is not present yet (a never-touched shared-anonymous
+/// page) is resolved through the same guarded access path that the syscall's
+/// later usercopy takes, then checked like every other page, so the preflight
+/// accepts exactly the buffers that access would. The result is advisory: the
+/// later access must still be fault tolerant. Callers must hold no lock that
+/// page-fault resolution takes; see [`crate::usercopy::fault_in_user_page`].
 ///
 /// # Arguments
 /// * `ptr` - 用户空间缓冲区起始地址
@@ -3038,52 +3109,270 @@ fn validate_user_ptr_mut(ptr: *mut u8, len: usize) -> Result<(), SyscallError> {
 /// * `require_write` - 是否需要写入权限
 ///
 /// # Returns
-/// 如果所有页都已正确映射返回 Ok(()), 否则返回 EFAULT
+/// 如果所有页都已正确映射（或按需装入后已正确映射）返回 Ok(()), 否则返回 EFAULT
 fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result<(), SyscallError> {
-    // 先进行基本的边界检查
+    // 先进行基本的边界检查（拒绝零长度）
     validate_user_ptr(ptr, len)?;
-
-    if len == 0 {
-        return Ok(());
-    }
 
     let start = ptr as usize;
     let end = start.checked_add(len).ok_or(SyscallError::EFAULT)?;
 
-    // 遍历页表验证映射
-    unsafe {
-        mm::page_table::with_current_manager(
-            VirtAddr::new(0),
-            |manager| -> Result<(), SyscallError> {
-                let mut page_addr = start & !0xfff; // 对齐到页边界
-                while page_addr < end {
-                    // 查询页表获取映射信息和标志
-                    let (_, flags) = manager
-                        .translate_with_flags(VirtAddr::new(page_addr as u64))
-                        .ok_or(SyscallError::EFAULT)?;
-
-                    // 检查页是否存在且用户可访问
-                    if !flags.contains(PageTableFlags::PRESENT)
-                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
-                    {
-                        return Err(SyscallError::EFAULT);
+    preflight_user_pages(
+        start,
+        end,
+        require_write,
+        // 遍历页表验证映射，停在第一个尚未装入的页
+        |from, write| unsafe {
+            mm::page_table::with_current_manager(
+                VirtAddr::new(0),
+                |manager| -> Result<Option<usize>, SyscallError> {
+                    let mut page_addr = from;
+                    while page_addr < end {
+                        let flags = manager
+                            .translate_with_flags(VirtAddr::new(page_addr as u64))
+                            .map(|(_, flags)| flags);
+                        match classify_user_page(flags, write) {
+                            UserPageState::Ready => {}
+                            UserPageState::NotPresent => return Ok(Some(page_addr)),
+                            UserPageState::Denied => return Err(SyscallError::EFAULT),
+                        }
+                        page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
                     }
+                    Ok(None)
+                },
+            )
+        },
+        // The walk has released PT_LOCK before the probe faults.
+        |page, write| {
+            crate::usercopy::fault_in_user_page(crate::usercopy::UserAddr::new(page), write)
+        },
+    )
+}
 
-                    // 如果需要写入权限，检查 WRITABLE 或 BIT_9 (COW) 标志
-                    // COW 页面标记为只读但有 BIT_9，写入时会触发 #PF 并由 COW 处理器创建可写副本
-                    // 真正的只读页面（如代码段）没有这两个标志，应该拒绝写入
-                    if require_write
-                        && !flags.contains(PageTableFlags::WRITABLE)
-                        && !flags.contains(PageTableFlags::BIT_9)
-                    {
-                        return Err(SyscallError::EFAULT);
+#[cfg(test)]
+mod st_k2_p2a_preflight_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    const PAGE: usize = 0x1000;
+    const BASE: usize = 0x10_0000_0000;
+
+    /// One page of a modeled address space and what resolving it does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Page {
+        Ready,
+        /// Present but supervisor-only (the low identity map, before Approach A).
+        Supervisor,
+        /// Present, user, read-only and not copy-on-write.
+        ReadOnly,
+        /// Not present; resolving it installs a writable user page.
+        Lazy,
+        /// Not present; the access succeeds but a racing unmap removes it again.
+        Vanishing,
+        /// Not present; the access faults (nothing is mapped).
+        Unmapped,
+        /// Not present; resolving it installs a page the walk then denies.
+        LazySupervisor,
+        /// Not present, in a read-only region: resolving it installs a
+        /// read-only page, and a write probe then faults on it.
+        LazyReadOnly,
+    }
+
+    fn flags_of(page: Page) -> Option<PageTableFlags> {
+        let user = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        match page {
+            Page::Ready => Some(user | PageTableFlags::WRITABLE),
+            Page::Supervisor => Some(PageTableFlags::PRESENT | PageTableFlags::WRITABLE),
+            Page::ReadOnly => Some(user),
+            _ => None,
+        }
+    }
+
+    /// Run the preflight loop over `pages` (page 0 at `BASE`) with the real
+    /// classifier. Both callbacks act on the intent the loop hands them, not
+    /// on `write`. Returns the result, the probed addresses and the final pages.
+    fn run(
+        pages: &[Page],
+        start: usize,
+        len: usize,
+        write: bool,
+    ) -> (Result<(), SyscallError>, Vec<usize>, Vec<Page>) {
+        let space = RefCell::new(pages.to_vec());
+        let probes = RefCell::new(Vec::new());
+        let end = start + len;
+        let result = preflight_user_pages(
+            start,
+            end,
+            write,
+            |from, intent| {
+                let space = space.borrow();
+                let mut page = from;
+                while page < end {
+                    match classify_user_page(flags_of(space[(page - BASE) / PAGE]), intent) {
+                        UserPageState::Ready => {}
+                        UserPageState::NotPresent => return Ok(Some(page)),
+                        UserPageState::Denied => return Err(SyscallError::EFAULT),
                     }
-
-                    page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
+                    page += PAGE;
+                }
+                Ok(None)
+            },
+            |page, intent| {
+                probes.borrow_mut().push(page);
+                let mut space = space.borrow_mut();
+                let slot = &mut space[(page - BASE) / PAGE];
+                match *slot {
+                    Page::Lazy => *slot = Page::Ready,
+                    Page::LazySupervisor => *slot = Page::Supervisor,
+                    Page::LazyReadOnly => {
+                        *slot = Page::ReadOnly;
+                        if intent {
+                            return Err(());
+                        }
+                    }
+                    Page::Vanishing => {}
+                    Page::Unmapped => return Err(()),
+                    present => panic!("probed a present page: {:?}", present),
                 }
                 Ok(())
             },
-        )
+        );
+        (result, probes.into_inner(), space.into_inner())
+    }
+
+    #[test]
+    fn page_classification_matches_the_access_contract() {
+        let user = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        for write in [false, true] {
+            assert_eq!(classify_user_page(None, write), UserPageState::NotPresent);
+            assert_eq!(
+                classify_user_page(Some(PageTableFlags::USER_ACCESSIBLE), write),
+                UserPageState::NotPresent
+            );
+            assert_eq!(
+                classify_user_page(
+                    Some(PageTableFlags::PRESENT | PageTableFlags::WRITABLE),
+                    write
+                ),
+                UserPageState::Denied
+            );
+            assert_eq!(
+                classify_user_page(Some(user | PageTableFlags::WRITABLE), write),
+                UserPageState::Ready
+            );
+            assert_eq!(
+                classify_user_page(Some(user | PageTableFlags::BIT_9), write),
+                UserPageState::Ready
+            );
+        }
+        assert_eq!(classify_user_page(Some(user), false), UserPageState::Ready);
+        assert_eq!(classify_user_page(Some(user), true), UserPageState::Denied);
+    }
+
+    #[test]
+    fn present_pages_are_never_probed() {
+        let (result, probes, _) = run(&[Page::Ready; 3], BASE + 0x10, 2 * PAGE, true);
+        assert_eq!(result, Ok(()));
+        assert!(probes.is_empty());
+        // A denied page fails before any later lazy page is touched.
+        for denied in [Page::Supervisor, Page::ReadOnly] {
+            let pages = [Page::Ready, denied, Page::Lazy];
+            let (result, probes, _) = run(&pages, BASE, 3 * PAGE, true);
+            assert_eq!(result, Err(SyscallError::EFAULT));
+            assert!(probes.is_empty());
+        }
+    }
+
+    #[test]
+    fn lazy_pages_are_resolved_once_at_their_page_base() {
+        let pages = [Page::Ready, Page::Lazy, Page::Lazy];
+        let (result, probes, space) = run(&pages, BASE + PAGE - 8, PAGE + 16, true);
+        assert_eq!(result, Ok(()));
+        assert_eq!(probes, [BASE + PAGE, BASE + 2 * PAGE]);
+        assert_eq!(space, [Page::Ready; 3]);
+        // A buffer starting mid-page probes that page's base word.
+        let (result, probes, _) = run(&[Page::Lazy], BASE + 0x123, 4, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(probes, [BASE]);
+        // The probe count is bounded by the page count.
+        let (result, probes, _) = run(&[Page::Lazy; 64], BASE, 64 * PAGE, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(probes.len(), 64);
+    }
+
+    #[test]
+    fn pages_outside_the_range_are_never_probed() {
+        let (result, probes, _) = run(&[Page::Ready, Page::Unmapped], BASE, PAGE, true);
+        assert_eq!(result, Ok(()));
+        assert!(probes.is_empty());
+    }
+
+    #[test]
+    fn unresolved_or_denied_pages_fail_after_one_probe() {
+        for (pages, expected_probes) in [
+            ([Page::Lazy, Page::Vanishing, Page::Lazy], 2),
+            ([Page::Unmapped, Page::Lazy, Page::Lazy], 1),
+            ([Page::LazySupervisor, Page::Lazy, Page::Lazy], 1),
+        ] {
+            let (result, probes, _) = run(&pages, BASE, 3 * PAGE, true);
+            assert_eq!(result, Err(SyscallError::EFAULT));
+            assert_eq!(probes.len(), expected_probes);
+        }
+    }
+
+    #[test]
+    fn the_probe_carries_the_requested_access() {
+        // A read-only region resolves for a read and stays EFAULT for a write.
+        let (result, probes, space) = run(&[Page::LazyReadOnly, Page::Lazy], BASE, 2 * PAGE, false);
+        assert_eq!(result, Ok(()));
+        assert_eq!(probes, [BASE, BASE + PAGE]);
+        assert_eq!(space, [Page::ReadOnly, Page::Ready]);
+        let (result, probes, space) = run(&[Page::LazyReadOnly, Page::Lazy], BASE, 2 * PAGE, true);
+        assert_eq!(result, Err(SyscallError::EFAULT));
+        assert_eq!(probes, [BASE]);
+        assert_eq!(space, [Page::ReadOnly, Page::Lazy]);
+        // Both callbacks receive the caller's intent on every call.
+        for write in [false, true] {
+            let seen = RefCell::new(Vec::new());
+            let lazy = core::cell::Cell::new(true);
+            let result = preflight_user_pages(
+                BASE,
+                BASE + PAGE,
+                write,
+                |_, intent| {
+                    seen.borrow_mut().push(intent);
+                    Ok(lazy.get().then_some(BASE))
+                },
+                |_, intent| {
+                    seen.borrow_mut().push(intent);
+                    lazy.set(false);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(seen.into_inner(), [write; 3]);
+        }
+    }
+
+    #[test]
+    fn walker_answers_outside_the_range_fail_closed() {
+        let end = BASE + 2 * PAGE;
+        for bogus in [BASE - PAGE, end, BASE + 8] {
+            let mut probes = 0;
+            let result = preflight_user_pages(
+                BASE,
+                end,
+                true,
+                |_, _| Ok(Some(bogus)),
+                |_, _| {
+                    probes += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(SyscallError::EFAULT));
+            assert_eq!(probes, 0);
+        }
     }
 }
 
@@ -3961,13 +4250,11 @@ pub fn syscall_dispatcher(
     // LSM hook: check syscall entry with security policy
     // Build context before dispatch; on denial, return EPERM
     let lsm_ctx = lsm::SyscallCtx::from_current(syscall_num, &args);
-    // R142-4 FIX: Defense-in-depth assertion — a user syscall without LSM context
-    // means current_pid() or current_credentials() returned None, which is a kernel
-    // bug (SYSCALL requires Ring 3 → requires a running process with valid PID).
-    debug_assert!(
-        lsm_ctx.is_some(),
-        "R142-4: LSM context missing for user syscall — kernel bug"
-    );
+    // R192-5 / TD-LSM-1 FIX: the R142-4 `debug_assert!(lsm_ctx.is_some())` that
+    // stood here called a missing context a kernel bug, but `from_current`
+    // returns None whenever a sibling thread holds the shared credentials for
+    // writing (`try_read`), so a debug kernel panicked on a legitimate race.
+    // The R184 arm below is the contract: fail closed, never panic.
     let lsm_ctx = match lsm_ctx {
         Some(ctx) => ctx,
         None => {
@@ -3975,8 +4262,7 @@ pub fn syscall_dispatcher(
             // consistency failure, never an implicit allow.  `from_current`
             // may legitimately fail while another CPU updates credentials;
             // dispatching in that window would bypass every MAC hook.  Fail
-            // closed and leave the debug assertion above as a development
-            // tripwire for impossible kernel-entry paths.
+            // closed.
             increment_counter(TraceCounter::SyscallDenied, 1);
             let subject = get_audit_subject();
             let _ = audit::emit_lsm_denial(
@@ -6926,10 +7212,10 @@ fn exec_from_bytes(
     // credentials; the hook runs once per exec, as on Linux.
     let via_handoff = matches!(entry, ExecEntry::Handoff);
     if !via_handoff {
-        if let Some(exec_ctx) = lsm_current_process_ctx() {
-            if let Err(err) = lsm::hook_task_exec(&exec_ctx, bin_hash) {
-                return Err(lsm_error_to_syscall(err));
-            }
+        // R192-5 / TD-LSM-1 FIX: a missing subject fails closed, never skips.
+        let exec_ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+        if let Err(err) = lsm::hook_task_exec(&exec_ctx, bin_hash) {
+            return Err(lsm_error_to_syscall(err));
         }
     }
 
@@ -7293,9 +7579,10 @@ fn exec_from_bytes(
     //
     // Now that load_elf() and stack setup have populated all user-space page table
     // entries (code/data at PML4[0], stack at PML4[255], etc.), snapshot the kernel
-    // PML4's user half into the KPTI user PML4.  This must happen AFTER all user
-    // mappings are established, because create_kpti_user_pml4() copies PML4[0..255]
-    // entries by value — any entries created later would be invisible under user CR3.
+    // PML4's user half into the KPTI user PML4. create_kpti_user_pml4() copies
+    // PML4[0..255] by value; entries created after the dual activation reach the
+    // user root through `mm::page_table`'s mirror (LEAD-KPTI-PML4-1), and nothing
+    // maps between this snapshot and that activation.
     let new_user_memory_space = if security::is_kpti_enabled() {
         let (_user_frame, user_phys) = crate::fork::create_kpti_user_pml4(new_memory_space)
             .map_err(|_| SyscallError::ENOMEM)?;
@@ -9072,8 +9359,9 @@ fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
 ///
 /// `pid` 0 names the caller. Another task must belong to the caller's thread
 /// group, or the caller must hold ADMIN or be host root (a conservative stand-in
-/// for Linux's ptrace-read check). `pid` is namespace-local. Writes the length
-/// (24 when registered, else 0) to `len_ptr` and the head address to `head_ptr`.
+/// for Linux's ptrace-read check) and pass the LSM ptrace-access hook. `pid` is
+/// namespace-local. Writes the length (24 when registered, else 0) to `len_ptr`
+/// and the head address to `head_ptr`.
 fn sys_get_robust_list(pid: i32, head_ptr: *mut u64, len_ptr: *mut u64) -> SyscallResult {
     if pid < 0 {
         return Err(SyscallError::ESRCH);
@@ -9095,24 +9383,40 @@ fn sys_get_robust_list(pid: i32, head_ptr: *mut u64, len_ptr: *mut u64) -> Sysca
     } else {
         pid as ProcessId
     };
-    let (head, len, same_group) = {
+    let (head, len, foreign_target) = {
         let target_arc = get_process(target).ok_or(SyscallError::ESRCH)?;
         let t = target_arc.lock();
         if matches!(t.state, ProcessState::Zombie | ProcessState::Terminated) {
             return Err(SyscallError::ESRCH);
         }
+        // R191-3: the hook's object, a snapshot of the target's current
+        // credentials taken under its PCB lock; none for a group member,
+        // which Linux's ptrace_may_access admits before the LSM check. A busy
+        // credential lock (EAGAIN) is reported only after the DAC check.
+        let foreign_target = if Arc::ptr_eq(&t.thread_group, &caller_group) {
+            None
+        } else {
+            Some(lsm_process_ctx_from(&t))
+        };
         (
             t.robust_list_head,
             // Linux always reports sizeof(struct robust_list_head), 24.
             24u64,
-            Arc::ptr_eq(&t.thread_group, &caller_group),
+            foreign_target,
         )
     };
-    if !same_group
-        && !current_has_cap_rights(cap::CapRights::ADMIN)
-        && !crate::current_is_host_root()
-    {
-        return Err(SyscallError::EPERM);
+    if let Some(target_ctx) = foreign_target {
+        if !current_has_cap_rights(cap::CapRights::ADMIN) && !crate::current_is_host_root() {
+            return Err(SyscallError::EPERM);
+        }
+        let target_ctx = target_ctx?;
+        // R191-3 FIX (D4-SEC-1): a cross-group read is a ptrace-read access,
+        // mediated by the LSM after the DAC check, as Linux's
+        // `ptrace_may_access` calls `security_ptrace_access_check`. Fail
+        // closed when the subject cannot be described. No PCB lock is held.
+        let tracer_ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+        lsm::hook_ptrace(&tracer_ctx, &target_ctx, lsm::ptrace_op::READ)
+            .map_err(lsm_error_to_syscall)?;
     }
     if head_ptr.is_null() || len_ptr.is_null() {
         return Err(SyscallError::EFAULT);
@@ -9415,15 +9719,15 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
     // R161-2 FIX + R162-1-1 FIX: Invoke LSM hook_signal_send BEFORE sig==0
     // check so MAC policy can deny process existence probes across security
     // domains (matching Linux SELinux/AppArmor behavior).
-    if let Some(task_ctx) = lsm_current_process_ctx() {
-        let sig_ctx = lsm::SignalCtx {
-            target_pid: target_global_pid,
-            sig,
-            cap: None,
-        };
-        if let Err(err) = lsm::hook_signal_send(&task_ctx, &sig_ctx) {
-            return Err(lsm_error_to_syscall(err));
-        }
+    // R192-5 / TD-LSM-1 FIX: a missing subject fails closed, never skips.
+    let task_ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    let sig_ctx = lsm::SignalCtx {
+        target_pid: target_global_pid,
+        sig,
+        cap: None,
+    };
+    if let Err(err) = lsm::hook_signal_send(&task_ctx, &sig_ctx) {
+        return Err(lsm_error_to_syscall(err));
     }
 
     // R161-I6 FIX: POSIX kill(pid, 0) — permission check without delivery.
@@ -11752,6 +12056,26 @@ mod r190_11_dispatch_parity_tests {
         arms
     }
 
+    /// R191-3: whether the body of `fn handler` in this file calls
+    /// `lsm::hook(` on a line that is not a `//` comment. A top-level item's
+    /// body ends at the first line that is just its closing brace. A text
+    /// match: a call in dead code still counts (review's job, as in the
+    /// census).
+    fn handler_calls(handler: &str, hook: &str) -> bool {
+        let source = include_str!("syscall.rs");
+        let signature = alloc::format!("\nfn {}(", handler);
+        let Some(start) = source.find(&signature) else {
+            panic!("handler {} not found as a top-level fn", handler);
+        };
+        let body = &source[start + signature.len()..];
+        let end = body.find("\n}").expect("handler body not closed");
+        let call = alloc::format!("lsm::{}(", hook);
+        body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains(&call))
+    }
+
     /// Call a known fixed-errno stub handler with inert arguments and return
     /// `(result, pinned errno)`. None of these touches process state or user
     /// memory. The errno is pinned: a stub that gains a real body returns
@@ -11841,25 +12165,86 @@ mod r190_11_dispatch_parity_tests {
         // R190-1: a syscall that would expose a feature-absent LSM hook family
         // has no arm, or only a fixed-errno stub. Wiring it for real requires
         // removing the census entry, which then requires a hook caller.
+        let fence_absent = |nr: u64, hook: &str| {
+            if let Some(handler) = handler_of(nr) {
+                let (result, pinned) = probe_fixed_errno_stub(handler).unwrap_or_else(|| {
+                    panic!(
+                        "syscall {} ({}) reaches feature-absent {}: wire the hook \
+                             and drop the FEATURE_ABSENT_HOOKS entry",
+                        nr, handler, hook
+                    )
+                });
+                assert_eq!(
+                    result,
+                    Err(pinned),
+                    "{} is no longer its fixed-errno stub but {} is still \
+                     feature-absent: wire the hook and drop the entry",
+                    handler,
+                    hook
+                );
+            }
+        };
         for entry in lsm::FEATURE_ABSENT_HOOKS {
             for &nr in entry.syscalls {
-                if let Some(handler) = handler_of(nr) {
-                    let (result, pinned) = probe_fixed_errno_stub(handler).unwrap_or_else(|| {
-                        panic!(
-                            "syscall {} ({}) reaches feature-absent {}: wire the hook \
-                                 and drop the FEATURE_ABSENT_HOOKS entry",
-                            nr, handler, entry.hook
-                        )
-                    });
-                    assert_eq!(
-                        result,
-                        Err(pinned),
-                        "{} is no longer its fixed-errno stub but {} is still \
-                         feature-absent: wire the hook and drop the entry",
-                        handler,
-                        entry.hook
-                    );
-                }
+                fence_absent(nr, entry.hook);
+            }
+        }
+
+        // R192-7 FIX: pin the partially wired families independently of the
+        // table that drives the loop below, so deleting or narrowing an entry
+        // fails here instead of silently lifting its fence (the census pins the
+        // same family from the source text).
+        let pinned: &[(&str, &[u64], &[u64])] =
+            &[("hook_ptrace", &[274], &[101, 310, 311, 312, 438])];
+        assert_eq!(
+            lsm::PARTIALLY_WIRED_HOOKS.len(),
+            pinned.len(),
+            "PARTIALLY_WIRED_HOOKS changed: update the R192-7 pin deliberately"
+        );
+        for &(hook, wired, absent) in pinned {
+            let entry = lsm::PARTIALLY_WIRED_HOOKS
+                .iter()
+                .find(|entry| entry.hook == hook)
+                .unwrap_or_else(|| panic!("{} left PARTIALLY_WIRED_HOOKS", hook));
+            assert_eq!(entry.wired, wired, "{} wired set changed", hook);
+            assert_eq!(entry.absent, absent, "{} fenced set changed", hook);
+        }
+
+        // R191-3: a partially wired family. Its wired syscalls' handlers call
+        // the hook; its other syscalls are fenced as above.
+        for entry in lsm::PARTIALLY_WIRED_HOOKS {
+            assert!(
+                !lsm::FEATURE_ABSENT_HOOKS
+                    .iter()
+                    .any(|absent| absent.hook == entry.hook),
+                "{} is both partially wired and feature-absent",
+                entry.hook
+            );
+            assert!(
+                !entry.wired.is_empty(),
+                "{} lists no wired syscall",
+                entry.hook
+            );
+            for &nr in entry.wired {
+                let handler = handler_of(nr).unwrap_or_else(|| {
+                    panic!("{} wired syscall {} has no dispatcher arm", entry.hook, nr)
+                });
+                assert!(
+                    handler_calls(handler, entry.hook),
+                    "{} (syscall {}) does not call {}",
+                    handler,
+                    nr,
+                    entry.hook
+                );
+            }
+            for &nr in entry.absent {
+                assert!(
+                    !entry.wired.contains(&nr),
+                    "{} lists syscall {} as wired and absent",
+                    entry.hook,
+                    nr
+                );
+                fence_absent(nr, entry.hook);
             }
         }
 
@@ -14093,6 +14478,22 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     return Ok(old_brk_val);
                 }
             }
+            // R192-2/R192-3 FIX (D0-ISO-1): the heap starts in the ELF window
+            // (4-6 MiB) and the identity map's supervisor 2 MiB leaves begin
+            // right above it. The grow loop used to skip their present pages as
+            // "already mapped", adopting kernel leaves into the heap (a later
+            // shrink unmapped them) and walking up to 4 GiB of identity pages
+            // under PT_LOCK with interrupts off. Refuse a grow that reaches any
+            // translation the VMA check above did not account for (kernel
+            // leaves, ELF pages): unchanged break, as for an overlap.
+            if mm::page_table::first_occupied_user_page(
+                old_top_val as u64,
+                (new_top_val - old_top_val) as u64,
+            )
+            .is_some()
+            {
+                return Ok(old_brk_val);
+            }
             // R172-16 + R174-B4: No overlap detected; arm the VA reservation atomically.
             // sys_mmap's Phase-1 overlap check will reject any [base,end) intersecting
             // this reservation, preventing double VMA ownership.
@@ -14175,6 +14576,19 @@ fn sys_brk(addr: usize) -> SyscallResult {
                         | PageTableFlags::NO_EXECUTE;
                     let mut mapped_pages: Vec<Page<x86_64::structures::paging::Size4KiB>> =
                         Vec::new();
+
+                    // R192-3 FIX: every heap page is backed eagerly, so a grow
+                    // larger than the free frames cannot succeed. Refuse it
+                    // before the first allocation instead of draining the
+                    // allocator (other tasks' allocations fail meanwhile) and
+                    // rolling back. The span is already bounded to user-owned
+                    // pages above; the remaining loop is bounded by free memory.
+                    // Read here, in the data-frame allocation's own context.
+                    if mm::buddy_allocator::get_allocator_stats()
+                        .is_some_and(|stats| grow_size / PAGE_SIZE > stats.free_pages)
+                    {
+                        return Err(SyscallError::ENOMEM);
+                    }
 
                     for offset in (0..grow_size).step_by(PAGE_SIZE) {
                         let vaddr = VirtAddr::new((old_top + offset) as u64);
@@ -15574,12 +15988,10 @@ fn sys_mmap(
 
     // R29-3 FIX: Call the LSM hook before the ST-K2 flag boundary so policy
     // audit records survive rejected MAP_SHARED/MAP_FIXED/unknown requests.
-    if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, flags as u32)
-            .is_err()
-        {
-            return Err(SyscallError::EPERM);
-        }
+    // R192-5 FIX: a missing subject fails closed, never skips the hook.
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, flags as u32).is_err() {
+        return Err(SyscallError::EPERM);
     }
 
     // ST-K2 FIX: reject every flag shape whose semantics are not implemented.
@@ -15766,6 +16178,19 @@ fn sys_mmap(
             && base < mm.brk_grow_resv_hi
             && end > mm.brk_grow_resv_lo
         {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // R192-2 FIX (D0-ISO-1) + LEAD-MMAP-OWN-1: nothing in mmap_regions
+        // records the ELF image or the committed heap (nor, before Approach A,
+        // the low identity map that every user address space carried). A VMA
+        // over any of them would let munmap/mprotect/mremap/exit treat those
+        // pages as this mapping's (a PROT_NONE reservation followed by munmap
+        // removed the shared framebuffer leaves, or the task's own text). The
+        // overlap checks above passed, so any translation in the range belongs
+        // to one of them: reject it with the EINVAL of the other occupied-range
+        // arms. Lock-free walk (see `first_occupied_user_page`).
+        if mm::page_table::first_occupied_user_page(base as u64, length_aligned as u64).is_some() {
             return Err(SyscallError::EINVAL);
         }
 
@@ -16751,10 +17176,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     }
 
     // R29-3 FIX: Call LSM hook for mprotect operations
-    if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_mprotect(&ctx, addr as u64, len_aligned as u64, prot as u32).is_err() {
-            return Err(SyscallError::EPERM);
-        }
+    // R192-5 FIX: a missing subject fails closed, never skips the hook.
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    if lsm::hook_memory_mprotect(&ctx, addr as u64, len_aligned as u64, prot as u32).is_err() {
+        return Err(SyscallError::EPERM);
     }
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -24772,6 +25197,17 @@ fn sys_mremap(
                     if base < region_end && end > region_base {
                         return Ok(false);
                     }
+                }
+                // R192-2 FIX (D0-ISO-1) + LEAD-MMAP-OWN-1: nor may it reach a
+                // translation no VMA records: the identity map, the ELF image
+                // or the heap (see sys_mmap).
+                if mm::page_table::first_occupied_user_page(
+                    base as u64,
+                    end.saturating_sub(base) as u64,
+                )
+                .is_some()
+                {
+                    return Ok(false);
                 }
                 Ok(true)
             };

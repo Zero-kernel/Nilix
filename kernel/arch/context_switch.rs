@@ -522,7 +522,7 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "jne 3f",
         "bt rcx, 47",
         "jc 3f",
-        // Sanitize RFLAGS (clear IOPL/NT/RF, force IF) -> stash in r15.
+        // Sanitize RFLAGS (clear IOPL/NT/RF/VM/AC/VIF/VIP, force IF) -> stash in r15.
         "mov rax, [rdi + 0x88]",
         "and rax, {rflags_user_mask}",
         "or  rax, {rflags_if}",
@@ -614,13 +614,11 @@ pub const USER_DATA_SELECTOR: u64 = 0x1B; // GDT index 3 with RPL=3
 
 /// RFLAGS 安全掩码常量
 const RFLAGS_IF: u64 = 1 << 9; // 中断使能位
-const RFLAGS_IOPL: u64 = 0b11 << 12; // I/O 特权级
-const RFLAGS_NT: u64 = 1 << 14; // 嵌套任务标志
-const RFLAGS_RF: u64 = 1 << 16; // 恢复标志
 
 /// 用户态 RFLAGS 安全掩码
-/// 清除 IOPL/NT/RF 等特权位，只保留用户可控位
-const RFLAGS_USER_MASK: u64 = !(RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF);
+/// R192-6 FIX (D5-ARC-1): the IRET paths share the SYSRET clear set
+/// (IOPL/NT/RF/VM/AC/VIF/VIP); this mask used to omit VM, VIF, VIP and AC.
+const RFLAGS_USER_MASK: u64 = crate::syscall::RFLAGS_USER_MASK;
 
 /// 进入用户态（首次）
 ///
@@ -696,7 +694,7 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         // ========================================
         // Y-6 安全修复：RFLAGS 清理
         // ========================================
-        // 清除 IOPL/NT/RF 等特权位，确保 IF 置位
+        // 清除 IOPL/NT/RF/VM/AC/VIF/VIP 等特权位，确保 IF 置位 (R192-6)
         "mov rax, [rdi + 0x88]",      // 加载用户 RFLAGS
         "and rax, {rflags_user_mask}", // 清除特权位
         "or  rax, {rflags_if}",        // 确保中断使能

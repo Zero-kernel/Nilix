@@ -907,12 +907,15 @@ fn deny_user_wx(prot: u32) -> LsmResult {
 ///    currently have no caller. The arms are implemented now so the second
 ///    layer exists the day the syscalls land (a DAC bypass bug then still
 ///    cannot mint root); the self-test pins their semantics.
-/// 4. **Ptrace confinement** (Yama-like) — TRAIT-COMPLETE, dormant for the
-///    same reason (no ptrace syscall yet): a non-root tracer may only trace
-///    same-euid targets and never a root process.
+/// 4. **Ptrace confinement** (Yama-like) — LIVE for `get_robust_list` (R191-3):
+///    a non-root tracer may only inspect same-euid targets and never a root
+///    process. The syscall calls the hook for a target outside the caller's
+///    thread group after its ADMIN/host-root DAC check, so the arm is a second
+///    layer there. The ptrace, process_vm_readv/writev, kcmp and pidfd_getfd
+///    syscalls do not exist yet; `crate::PARTIALLY_WIRED_HOOKS` fences them.
 ///
-/// The dormant families above (setuid, setresuid, ptrace and livepatch) are
-/// all listed in `crate::FEATURE_ABSENT_HOOKS`. The hosted hook census proves
+/// The dormant families above (setuid, setresuid and livepatch) are all
+/// listed in `crate::FEATURE_ABSENT_HOOKS`. The hosted hook census proves
 /// every unlisted hook has a production caller (INV-SEC-02/03).
 ///
 /// Everything else stays `Ok(())` — the policy is honest about being minimal:

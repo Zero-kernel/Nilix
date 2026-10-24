@@ -51,6 +51,7 @@ docs/design
 *.skill
 .tmp-*/
 core
+.DS_Store
 
 !README.md
 !README_zh.md

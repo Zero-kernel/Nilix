@@ -861,7 +861,10 @@ impl FileOps for FileHandle {
         let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
         // D2-ABI-STAT-LAYOUT: oversized size/blocks fail closed as EOVERFLOW.
         let vfs_stat = VfsStat::try_from(inode_stat)?;
-        if let Some(task) = lsm::ProcessCtx::from_current() {
+        // R192-5 FIX: a running task whose subject cannot be built fails
+        // closed; only kernel context (no task) has no subject to check.
+        let task = lsm::ProcessCtx::current_task().map_err(|_| SyscallError::EACCES)?;
+        if let Some(task) = task {
             lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
         }
         Ok(vfs_stat)

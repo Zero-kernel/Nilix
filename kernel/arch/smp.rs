@@ -1668,6 +1668,15 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
     // Validate MADT header
     let header = read_sdt_header(madt_phys)?;
     let total_len = header.length as usize;
+    // R192-9 FIX: bound the firmware length before reading the table.
+    if total_len > MAX_ACPI_CHILD_TABLE_BYTES {
+        klog_always!(
+            "[SMP] rejecting oversized MADT (length={}, cap={})",
+            total_len,
+            MAX_ACPI_CHILD_TABLE_BYTES
+        );
+        return None;
+    }
     let table = phys_slice(madt_phys, total_len)?;
 
     if !validate_checksum(table) {
@@ -1836,7 +1845,8 @@ pub(crate) unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u6
 
     let total_len = header.length as usize;
     let header_len = core::mem::size_of::<SdtHeader>();
-    if total_len < header_len {
+    // R192-9 FIX: bound the firmware length before reading the table.
+    if total_len < header_len || total_len > MAX_ACPI_ROOT_TABLE_BYTES {
         return None;
     }
     let body_len = total_len - header_len;
@@ -1870,7 +1880,8 @@ pub(crate) unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u6
 
     let total_len = header.length as usize;
     let header_len = core::mem::size_of::<SdtHeader>();
-    if total_len < header_len {
+    // R192-9 FIX: bound the firmware length before reading the table.
+    if total_len < header_len || total_len > MAX_ACPI_ROOT_TABLE_BYTES {
         return None;
     }
     let body_len = total_len - header_len;
@@ -1910,6 +1921,15 @@ pub(crate) fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
 pub(crate) fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
     mm::read_firmware_bytes(phys, len)
 }
+
+/// R192-9 FIX: upper bound on an RSDT/XSDT `header.length` (mirrors
+/// `iommu::dmar::MAX_ACPI_ROOT_TABLE_BYTES`). Below 1 GiB `read_firmware_bytes`
+/// returns a direct-map slice of whatever length the header claims, so the
+/// arena cap does not bound it.
+pub(crate) const MAX_ACPI_ROOT_TABLE_BYTES: usize = 1024 * 1024;
+/// R192-9 FIX: upper bound on a MADT/HPET `header.length` (64 KiB holds a
+/// MADT of about 4000 16-byte x2APIC entries).
+pub(crate) const MAX_ACPI_CHILD_TABLE_BYTES: usize = 64 * 1024;
 
 /// Validate ACPI checksum (sum of all bytes must be 0).
 ///

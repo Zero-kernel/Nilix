@@ -103,6 +103,13 @@ pub const CT_MAX_ENTRIES: usize = CT_HEAP_BUDGET_BYTES / CT_FLOW_CHARGE_BYTES;
 /// Prevents a single namespace from monopolizing the global conntrack table.
 /// Set to 1/4 of global limit as a fair-share heuristic.
 const CT_MAX_ENTRIES_PER_NS: usize = CT_MAX_ENTRIES / 4;
+/// R192-RES-4: the root (host) namespace.
+const CT_ROOT_NS: u64 = 0;
+/// R192-RES-4: slots tenants together must leave to the root namespace. Root is
+/// not held to the per-namespace share (only the global cap), tenants are, and
+/// together they may hold at most `CT_MAX_ENTRIES - CT_ROOT_RESERVE` flows.
+const CT_ROOT_RESERVE: usize = CT_MAX_ENTRIES_PER_NS;
+const _: () = assert!(CT_ROOT_RESERVE < CT_MAX_ENTRIES);
 
 // P2-A: 256 KiB / 1024 B = 256 entries (was 512 under the old HEAP/2 claim).
 const _: () = assert!(CT_MAX_ENTRIES == 256);
@@ -127,6 +134,9 @@ pub const CT_TCP_TIMEOUT_CLOSE_MS: u64 = 10_000;
 /// UDP timeout values (milliseconds)
 pub const CT_UDP_TIMEOUT_UNREPLIED_MS: u64 = 30_000;
 pub const CT_UDP_TIMEOUT_REPLIED_MS: u64 = 180_000; // 3 minutes
+/// R192-4: a replied UDP flow is a stream (protected from replacement) once it
+/// has carried traffic for this long, as Linux marks UDP assured.
+const CT_UDP_STREAM_MS: u64 = 2_000;
 
 /// ICMP timeout values (milliseconds)
 pub const CT_ICMP_TIMEOUT_MS: u64 = 30_000;
@@ -382,6 +392,9 @@ pub struct ConntrackEntry {
     /// Provisional egress transition. Ingress encountering this token fails
     /// closed until the lock-free device callback resolves it.
     pending_egress: Option<PendingEgress>,
+    /// R192-RES-4: created by this host's egress (an outbound SYN, a DNS
+    /// query), not by a remote peer. Victim selection takes these last.
+    local_origin: bool,
 }
 
 impl ConntrackEntry {
@@ -412,6 +425,7 @@ impl ConntrackEntry {
             initiator_dir,
             tcp_local_handshake: TcpLocalHandshake::None,
             pending_egress: None,
+            local_origin: false,
         }
     }
 
@@ -419,6 +433,33 @@ impl ConntrackEntry {
     pub fn is_expired(&self, now_ms: u64) -> bool {
         let timeout = self.state.timeout_ms();
         now_ms.saturating_sub(self.last_seen_ms) > timeout
+    }
+
+    /// R192-4 FIX (D2-RES-1): may a new flow replace this one when the table
+    /// or its namespace is full? Only a flow that is not an established
+    /// session, like Linux's `early_drop` of a non-assured flow: TCP before
+    /// Established or after it closed, UDP that is unreplied or replied within
+    /// `CT_UDP_STREAM_MS` of its first packet (a single request and answer),
+    /// ICMP and other protocols. A TCP connection from Established until it
+    /// closes and a UDP stream are never replaced, so a burst of new tuples
+    /// cannot tear down live sessions. (SYN-ACK alone does not protect a flow,
+    /// so a SYN flood to a listening port creates only replaceable flows.)
+    fn replaceable(&self) -> bool {
+        match self.state {
+            CtProtoState::Tcp(state) => !matches!(
+                state,
+                TcpCtState::Established
+                    | TcpCtState::FinWait
+                    | TcpCtState::FinWait2
+                    | TcpCtState::CloseWait
+                    | TcpCtState::LastAck
+            ),
+            CtProtoState::Udp(UdpCtState::Unreplied) => true,
+            CtProtoState::Udp(UdpCtState::Replied) => {
+                self.last_seen_ms.saturating_sub(self.created_ms) < CT_UDP_STREAM_MS
+            }
+            CtProtoState::Icmp(_) | CtProtoState::Other => true,
+        }
     }
 
     /// Update statistics for a packet.
@@ -453,6 +494,17 @@ pub enum CtDecision {
     Related,
     /// Invalid state transition - should be dropped
     Invalid,
+}
+
+/// R192-RES-4: where a new flow takes its slot from (`admission_locked`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Below every limit: a new slot.
+    Free,
+    /// Replace this replaceable flow.
+    Replace(FlowKey),
+    /// No replaceable flow in scope: reject.
+    Full,
 }
 
 /// Result of conntrack update.
@@ -872,22 +924,26 @@ impl ConntrackTable {
                     if existing_live {
                         Ok((None, None))
                     } else {
-                        let victim_plan = if replacing_expired {
-                            Some(key)
-                        } else if entries.len() >= CT_MAX_ENTRIES {
-                            Self::lru_victim_locked(&entries)
+                        let mut ns_counts = self.ns_entry_counts.lock();
+                        let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
+                        // R192-4 FIX (D2-RES-1, R192-RES-4): see `admission_locked`.
+                        let admission = if replacing_expired {
+                            Admission::Replace(key)
                         } else {
-                            None
+                            Self::admission_locked(&entries, &ns_counts, key.net_ns_id)
                         };
-                        if entries.len() >= CT_MAX_ENTRIES && victim_plan.is_none() {
+                        let victim_plan = match admission {
+                            Admission::Replace(victim) => Some(victim),
+                            Admission::Free | Admission::Full => None,
+                        };
+                        if admission == Admission::Full {
                             Ok((None, None))
                         } else {
-                            let mut ns_counts = self.ns_entry_counts.lock();
-                            let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
                             let victim_in_requester_ns =
                                 victim_plan.is_some_and(|victim| victim.net_ns_id == key.net_ns_id);
-                            if ns_count.saturating_sub(usize::from(victim_in_requester_ns))
-                                >= CT_MAX_ENTRIES_PER_NS
+                            if key.net_ns_id != CT_ROOT_NS
+                                && ns_count.saturating_sub(usize::from(victim_in_requester_ns))
+                                    >= CT_MAX_ENTRIES_PER_NS
                             {
                                 Ok((None, None))
                             } else {
@@ -989,13 +1045,21 @@ impl ConntrackTable {
                         ConntrackDir::Reply
                     };
                     let tcp_handshake = self.egress_tcp_handshake(&entry, state_dir, proto, l4);
-                    let (new_state, decision) = self.transition_state_with_handshake(
+                    let (mut new_state, decision) = self.transition_state_with_handshake(
                         &entry,
                         state_dir,
                         proto,
                         l4,
                         tcp_handshake,
                     );
+                    // R192 FIX (R192-RES-4): an RST this host sends ends the
+                    // connection. R145-4 ignores RST because ingress cannot
+                    // validate it; our own is authoritative. Close makes the
+                    // flow replaceable and short-lived instead of pinning a
+                    // slot for the established timeout.
+                    if proto == IPPROTO_TCP && l4.is_rst() {
+                        new_state = CtProtoState::Tcp(TcpCtState::Close);
+                    }
                     if decision == CtDecision::Invalid {
                         self.stats
                             .invalid_transitions
@@ -1061,33 +1125,37 @@ impl ConntrackTable {
                     TcpLocalHandshake::None
                 };
 
-                let victim_plan = if replacing_expired {
-                    Some((key, EgressVictimKind::Expired))
-                } else if entries.len() >= CT_MAX_ENTRIES {
-                    match Self::lru_victim_locked(&entries) {
-                        Some(victim_key) => Some((victim_key, EgressVictimKind::Evicted)),
-                        None => {
-                            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
-                            return CtEgressResult::Rejected(CtUpdateResult {
-                                decision: CtDecision::Invalid,
-                                state: CtProtoState::Other,
-                                dir,
-                                resource_exhausted: true,
-                            });
-                        }
-                    }
-                } else {
-                    None
-                };
-
                 let mut ns_counts = self.ns_entry_counts.lock();
                 let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
+                // R192-4 FIX (D2-RES-1, R192-RES-4): see `admission_locked`;
+                // with no replaceable flow in its scope the flow is rejected
+                // before the device queue.
+                let admission = if replacing_expired {
+                    Admission::Free
+                } else {
+                    Self::admission_locked(&entries, &ns_counts, key.net_ns_id)
+                };
+                let victim_plan = match admission {
+                    Admission::Free if replacing_expired => Some((key, EgressVictimKind::Expired)),
+                    Admission::Free => None,
+                    Admission::Replace(victim_key) => Some((victim_key, EgressVictimKind::Evicted)),
+                    Admission::Full => {
+                        self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                        return CtEgressResult::Rejected(CtUpdateResult {
+                            decision: CtDecision::Invalid,
+                            state: CtProtoState::Other,
+                            dir,
+                            resource_exhausted: true,
+                        });
+                    }
+                };
+
                 let victim_in_requester_ns = victim_plan
                     .map(|(victim_key, _)| victim_key.net_ns_id == key.net_ns_id)
                     .unwrap_or(false);
                 let effective_ns_count =
                     ns_count.saturating_sub(usize::from(victim_in_requester_ns));
-                if effective_ns_count >= CT_MAX_ENTRIES_PER_NS {
+                if key.net_ns_id != CT_ROOT_NS && effective_ns_count >= CT_MAX_ENTRIES_PER_NS {
                     self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
                     return CtEgressResult::Rejected(CtUpdateResult {
                         decision: CtDecision::Invalid,
@@ -1184,6 +1252,7 @@ impl ConntrackTable {
                 };
 
                 let mut entry = ConntrackEntry::new(key, initial_state, now_ms, dir);
+                entry.local_origin = true;
                 entry.pending_egress = Some(PendingEgress {
                     token,
                     new_state: initial_state,
@@ -1656,17 +1725,23 @@ impl ConntrackTable {
         // store before eviction or publication. Requester quota is deliberately
         // checked first so a saturated namespace cannot evict another tenant.
         let mut ns_counts = self.ns_entry_counts.lock();
+        // R192-4 FIX (D2-RES-1, R192-RES-4): see `admission_locked`. The victim
+        // is removed only after the namespace row is in place, so a metadata
+        // failure rejects the new flow without having evicted one.
+        let victim = match Self::admission_locked(&entries, &ns_counts, key.net_ns_id) {
+            Admission::Free => None,
+            Admission::Replace(victim) => Some(victim),
+            Admission::Full => {
+                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                return CtUpdateResult {
+                    decision: CtDecision::Invalid,
+                    state: CtProtoState::Other,
+                    dir,
+                    resource_exhausted: true,
+                };
+            }
+        };
         let ns_row_exists = ns_counts.get(&key.net_ns_id).is_some();
-        let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
-        if ns_count >= CT_MAX_ENTRIES_PER_NS {
-            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
-            return CtUpdateResult {
-                decision: CtDecision::Invalid,
-                state: CtProtoState::Other,
-                dir,
-                resource_exhausted: true,
-            };
-        }
 
         if !ns_row_exists {
             let plan = match ns_counts.capacity_plan_for(1) {
@@ -1693,6 +1768,11 @@ impl ConntrackTable {
                     }
                 });
             }
+        }
+
+        if victim.is_some() && !self.evict_victim_locked(&mut entries, &mut ns_counts, victim) {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return Self::resource_rejection(dir);
         }
 
         let table_full = entries.len() >= CT_MAX_ENTRIES;
@@ -1723,10 +1803,11 @@ impl ConntrackTable {
             }
         }
 
-        // At the hard cap, removal retains the ordered map's backing capacity,
-        // so the replacement insert is allocation-free. The O(n) scan is bounded
-        // by CT_MAX_ENTRIES and avoids a second attacker-amplified LRU structure.
-        if table_full && !self.evict_lru_locked(&mut entries, &mut ns_counts) {
+        // At the hard cap admission has already replaced a flow (removal
+        // retains the ordered map's backing capacity, so the insert is
+        // allocation-free) or rejected; a full table here would be a ledger
+        // inconsistency, so fail closed.
+        if table_full {
             self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
             return CtUpdateResult {
                 decision: CtDecision::Invalid,
@@ -2026,6 +2107,38 @@ impl ConntrackTable {
         true
     }
 
+    /// R192 FIX (R192-RES-4): the socket layer accepted an RST for this
+    /// connection (RFC 5961: exact sequence match), so the flow is over. Mark
+    /// it Close: short-lived and replaceable. Conntrack itself still ignores
+    /// RST (R145-4), since it cannot validate the sequence number.
+    pub fn commit_tcp_ingress_reset(
+        &self,
+        net_ns_id: u64,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> bool {
+        let (key, _) =
+            FlowKey::from_packet(net_ns_id, IPPROTO_TCP, src_ip, dst_ip, src_port, dst_port);
+        let entries = self.entries.read();
+        let Some(entry_lock) = entries.get(&key) else {
+            return false;
+        };
+        let mut entry = entry_lock.lock();
+        if !matches!(entry.state, CtProtoState::Tcp(_)) {
+            return false;
+        }
+        let close = CtProtoState::Tcp(TcpCtState::Close);
+        // A segment of ours may be queued (`pending_egress`): its commit must
+        // not bring the connection back; a rollback leaves `state` as set here.
+        if let Some(pending) = entry.pending_egress.as_mut() {
+            pending.new_state = close;
+        }
+        entry.state = close;
+        true
+    }
+
     /// Remove an entry by key.
     pub fn remove(&self, key: &FlowKey) -> bool {
         let mut entries = self.entries.write();
@@ -2069,21 +2182,13 @@ impl ConntrackTable {
         }
     }
 
-    /// `true` if an entry was evicted, `false` if the table is empty.
-    /// RF178-7 FIX: The direct LRU scan is allocation-free and bounded by the
-    /// heap-derived `CT_MAX_ENTRIES` cap.
-    ///
-    /// This prevents table exhaustion attacks where an attacker fills the table
-    /// with long-lived UDP or half-open TCP connections to block legitimate traffic.
-    ///
-    /// # Returns
-    /// `true` if an entry was evicted, `false` if table is empty.
-    fn evict_lru_locked(
+    fn evict_victim_locked(
         &self,
         entries: &mut AdmittedMap<FlowKey, Mutex<ConntrackEntry>>,
         counts: &mut AdmittedMap<u64, usize>,
+        victim: Option<FlowKey>,
     ) -> bool {
-        let Some(victim_key) = Self::lru_victim_locked(entries) else {
+        let Some(victim_key) = victim else {
             return false;
         };
         if entries.remove(&victim_key).is_none() {
@@ -2097,19 +2202,76 @@ impl ConntrackTable {
         true
     }
 
-    /// Select the deterministic least-recently-seen victim without mutating
-    /// the table. Transactional egress uses this to reserve a replacement plan
-    /// before the device queue operation, then removes the same key only after
-    /// queue acceptance while the write guard still excludes competitors.
-    fn lru_victim_locked(entries: &AdmittedMap<FlowKey, Mutex<ConntrackEntry>>) -> Option<FlowKey> {
-        let mut victim: Option<(FlowKey, u64)> = None;
+    /// R192-4 FIX (D2-RES-1, R192-RES-4): where a new flow of namespace `ns`
+    /// takes its slot from. RF178-7/R63-3: the scans are allocation-free and
+    /// bounded by the heap-derived `CT_MAX_ENTRIES` cap.
+    ///
+    /// The per-namespace share was checked before an eviction that ran only at
+    /// the global cap, so a namespace at its share (64 flows a peer keeps
+    /// refreshed) rejected every new flow while the table had room, and the
+    /// root namespace's ingress hard-dropped. Now:
+    /// - a tenant at its share, or with the tenants together at
+    ///   `CT_MAX_ENTRIES - CT_ROOT_RESERVE`, replaces its own oldest
+    ///   replaceable flow, so it can neither evict another namespace nor take
+    ///   root's reserve;
+    /// - root has no share of its own, only the global cap;
+    /// - at the global cap, root replaces its own oldest replaceable flow, and
+    ///   a tenant below its limits takes root's oldest replaceable flow (root
+    ///   then holds more than its reserve), never another tenant's.
+    ///
+    /// Only replaceable flows are victims, so an established session is never
+    /// evicted to admit a flow; with none in scope the flow is rejected.
+    fn admission_locked(
+        entries: &AdmittedMap<FlowKey, Mutex<ConntrackEntry>>,
+        ns_counts: &AdmittedMap<u64, usize>,
+        ns: u64,
+    ) -> Admission {
+        let table_len = entries.len();
+        let ns_count = ns_counts.get(&ns).copied().unwrap_or(0);
+        let root_count = ns_counts.get(&CT_ROOT_NS).copied().unwrap_or(0);
+        let tenant_total = table_len.saturating_sub(root_count);
+        let scope = if ns != CT_ROOT_NS
+            && (ns_count >= CT_MAX_ENTRIES_PER_NS
+                || tenant_total >= CT_MAX_ENTRIES - CT_ROOT_RESERVE)
+        {
+            ns
+        } else if table_len >= CT_MAX_ENTRIES {
+            CT_ROOT_NS
+        } else {
+            return Admission::Free;
+        };
+        match Self::lru_victim_in_ns_locked(entries, scope) {
+            Some(victim) => Admission::Replace(victim),
+            None => Admission::Full,
+        }
+    }
+
+    /// The least-recently-seen replaceable flow of namespace `ns`
+    /// (`ConntrackEntry::replaceable`), preferring a flow a remote peer created
+    /// over one this host initiated, so a flood of new tuples replaces its own
+    /// flows before an outbound handshake or query waiting for its reply.
+    /// Deterministic; a flow with pending egress is never a victim.
+    fn lru_victim_in_ns_locked(
+        entries: &AdmittedMap<FlowKey, Mutex<ConntrackEntry>>,
+        ns: u64,
+    ) -> Option<FlowKey> {
+        let mut remote: Option<(FlowKey, u64)> = None;
+        let mut local: Option<(FlowKey, u64)> = None;
         for (flow_key, entry_lock) in entries.iter() {
-            let entry = entry_lock.lock();
-            if entry.pending_egress.is_some() {
+            if flow_key.net_ns_id != ns {
                 continue;
             }
+            let entry = entry_lock.lock();
+            if entry.pending_egress.is_some() || !entry.replaceable() {
+                continue;
+            }
+            let best = if entry.local_origin {
+                &mut local
+            } else {
+                &mut remote
+            };
             let last_seen_ms = entry.last_seen_ms;
-            let replace = match victim {
+            let replace = match *best {
                 None => true,
                 Some((victim_key, victim_last_seen)) => {
                     last_seen_ms < victim_last_seen
@@ -2117,10 +2279,10 @@ impl ConntrackTable {
                 }
             };
             if replace {
-                victim = Some((*flow_key, last_seen_ms));
+                *best = Some((*flow_key, last_seen_ms));
             }
         }
-        victim.map(|(key, _)| key)
+        remote.or(local).map(|(key, _)| key)
     }
 
     /// Sweep expired entries.
@@ -2387,6 +2549,17 @@ pub fn ct_commit_tcp_ingress_handshake(
     conntrack_table().commit_tcp_ingress_handshake(net_ns_id, src_ip, dst_ip, src_port, dst_port)
 }
 
+/// R192 FIX (R192-RES-4): report an RST the socket layer accepted (RFC 5961).
+pub fn ct_commit_tcp_ingress_reset(
+    net_ns_id: u64,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+) -> bool {
+    conntrack_table().commit_tcp_ingress_reset(net_ns_id, src_ip, dst_ip, src_port, dst_port)
+}
+
 /// Process a UDP packet through conntrack.
 /// R107-2 FIX: Namespace-isolated conntrack processing.
 pub fn ct_process_udp(
@@ -2525,7 +2698,7 @@ pub fn ct_drain_ns(ns_id: u64) -> usize {
 /// timer sweep reclaims an expired flow (`ct_sweep`, now wired into
 /// `net::handle_timer_tick`), and (2) namespace-teardown drain (`ct_drain_ns`)
 /// removes ALL of a namespace's flows and drops its per-ns counter row, and (3)
-/// requester quota failure is explicitly marked for hard-drop. Panics on failure
+/// a namespace at its share replaces its own oldest flow (R192-4). Panics on failure
 /// → caught by `make test`. Uses high, otherwise-unused test namespace ids so it
 /// never perturbs real traffic.
 pub fn run_conntrack_reclaim_self_test() {
@@ -2567,18 +2740,21 @@ pub fn run_conntrack_reclaim_self_test() {
         "conntrack: ns drain must be idempotent"
     );
 
-    // (3) A saturated requester fails before publishing another flow, and the
-    // caller receives the explicit fail-closed resource signal.
+    // (3) R192-4: a namespace at its share replaces its own least-recently-seen
+    // replaceable flow (here SYN-only TCP) instead of hard-dropping every new
+    // one while the table has room.
     let ns_quota: u64 = 0x7E57_0003;
     for p in 0..CT_MAX_ENTRIES_PER_NS as u16 {
-        let result = ct_process_tcp(ns_quota, ip_a, ip_b, 30000 + p, 443, SYN, 0, far_future);
+        // The first flow is the oldest, so it is the deterministic victim.
+        let seen = if p == 0 { far_future - 1 } else { far_future };
+        let result = ct_process_tcp(ns_quota, ip_a, ip_b, 30000 + p, 443, SYN, 0, seen);
         assert!(
             !result.resource_exhausted,
             "conntrack: entries within the namespace quota must be admitted"
         );
     }
-    let before_reject = table.len();
-    let rejected = ct_process_tcp(
+    let before_replace = table.len();
+    let replaced = ct_process_tcp(
         ns_quota,
         ip_a,
         ip_b,
@@ -2589,13 +2765,18 @@ pub fn run_conntrack_reclaim_self_test() {
         far_future,
     );
     assert!(
-        rejected.resource_exhausted,
-        "conntrack: quota exhaustion must request an ingress hard drop"
+        !replaced.resource_exhausted,
+        "conntrack: a namespace at its share must replace its own LRU flow"
     );
     assert_eq!(
         table.len(),
-        before_reject,
-        "conntrack: rejected admission must not publish a partial flow"
+        before_replace,
+        "conntrack: a same-namespace replacement keeps the table size"
+    );
+    let oldest = FlowKey::from_packet(ns_quota, IPPROTO_TCP, ip_a, ip_b, 30000, 443).0;
+    assert!(
+        table.lookup(&oldest).is_none(),
+        "conntrack: the namespace's oldest flow is the one replaced"
     );
     assert_eq!(
         ct_drain_ns(ns_quota),
@@ -2715,6 +2896,10 @@ mod tests {
             assert!(!result.resource_exhausted);
         }
 
+        // R192-4: a namespace at its share now replaces its own LRU flow, so
+        // the admission rejection under test is a busy capacity permit (another
+        // publication is preparing); it must still precede the device queue.
+        let _permit = table.try_capacity_permit().expect("idle table");
         let queued = Cell::new(false);
         let outcome = table.update_on_egress_transaction(
             43,
@@ -2742,19 +2927,584 @@ mod tests {
     }
 
     #[test]
+    fn r192_4_namespace_at_its_share_replaces_its_own_lru_flow() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        // Tenant 5 fills its share; its first flow is its oldest.
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            let seen = if index == 0 { 2 } else { 3 };
+            let port = 10_000 + index as u16;
+            let result =
+                table.update_on_packet(5, IPPROTO_UDP, local, remote, port, 53, &udp, seen);
+            assert!(!result.resource_exhausted);
+        }
+        // Another tenant's flows are older still: a global LRU would pick them.
+        for port in 20_000..20_008u16 {
+            let result = table.update_on_packet(7, IPPROTO_UDP, local, remote, port, 53, &udp, 1);
+            assert!(!result.resource_exhausted);
+        }
+        let total = table.len();
+        assert!(total < CT_MAX_ENTRIES, "the global table still has room");
+        let own_flow = |port| FlowKey::from_packet(5, IPPROTO_UDP, local, remote, port, 53).0;
+        let other_untouched = || {
+            (20_000..20_008u16).all(|port| {
+                let key = FlowKey::from_packet(7, IPPROTO_UDP, local, remote, port, 53).0;
+                table.lookup(&key).is_some()
+            })
+        };
+
+        // Ingress: the new flow replaces the tenant's own oldest flow.
+        let ingress = table.update_on_packet(5, IPPROTO_UDP, local, remote, 11_000, 53, &udp, 4);
+        assert!(
+            !ingress.resource_exhausted,
+            "a namespace at its share was hard-dropped"
+        );
+        assert_eq!(table.len(), total);
+        assert!(table.lookup(&own_flow(11_000)).is_some());
+        assert!(table.lookup(&own_flow(10_000)).is_none());
+        assert!(other_untouched());
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert_eq!(table.ns_entry_counts.lock().get(&7).copied(), Some(8));
+
+        // Egress: the transactional path replaces an own flow the same way.
+        let queued = Cell::new(false);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_UDP,
+            local,
+            remote,
+            12_000,
+            53,
+            &udp,
+            5,
+            || {
+                queued.set(true);
+                Ok::<(), QueueFault>(())
+            },
+        );
+        assert!(matches!(outcome, CtEgressResult::Committed(_)));
+        assert!(queued.get());
+        assert_eq!(table.len(), total);
+        assert!(table.lookup(&own_flow(12_000)).is_some());
+        assert!(other_untouched());
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.drain_ns(7), 8);
+    }
+
+    /// Drive one UDP flow of `ns` (local `port` to remote port 53): its first
+    /// packet at `t`, and with `stream` a reply at `t + 500` and one more packet
+    /// at `t + CT_UDP_STREAM_MS`, which makes it a stream.
+    fn udp_flow(table: &ConntrackTable, ns: u64, port: u16, t: u64, stream: bool) {
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        let first = table.update_on_packet(ns, IPPROTO_UDP, local, remote, port, 53, &udp, t);
+        assert!(!first.resource_exhausted);
+        if stream {
+            let reply =
+                table.update_on_packet(ns, IPPROTO_UDP, remote, local, 53, port, &udp, t + 500);
+            assert_eq!(reply.decision, CtDecision::Established);
+            let next = t + CT_UDP_STREAM_MS;
+            table.update_on_packet(ns, IPPROTO_UDP, local, remote, port, 53, &udp, next);
+        }
+    }
+
+    #[test]
+    fn r192_4_established_sessions_are_never_replaced_at_the_share() {
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        let own_flow = |port| FlowKey::from_packet(5, IPPROTO_UDP, local, remote, port, 53).0;
+        let entry = |state| ConntrackEntry::new(own_flow(1), state, 0, ConntrackDir::Original);
+        for state in [
+            TcpCtState::Established,
+            TcpCtState::FinWait,
+            TcpCtState::FinWait2,
+            TcpCtState::CloseWait,
+            TcpCtState::LastAck,
+        ] {
+            assert!(!entry(CtProtoState::Tcp(state)).replaceable());
+        }
+        for state in [
+            TcpCtState::None,
+            TcpCtState::SynSent,
+            TcpCtState::SynRecv,
+            TcpCtState::TimeWait,
+            TcpCtState::Close,
+        ] {
+            assert!(entry(CtProtoState::Tcp(state)).replaceable());
+        }
+        assert!(entry(CtProtoState::Udp(UdpCtState::Unreplied)).replaceable());
+        // A single request and answer stays replaceable; a stream does not.
+        let mut answered = entry(CtProtoState::Udp(UdpCtState::Replied));
+        answered.last_seen_ms = CT_UDP_STREAM_MS - 1;
+        assert!(answered.replaceable());
+        answered.last_seen_ms = CT_UDP_STREAM_MS;
+        assert!(!answered.replaceable());
+        assert!(entry(CtProtoState::Icmp(IcmpCtState::EchoReply)).replaceable());
+        assert!(entry(CtProtoState::Other).replaceable());
+
+        let table = ConntrackTable::new();
+        let last = CT_MAX_ENTRIES_PER_NS - 1;
+        // Tenant 5 fills its share with streams, then one answered request.
+        for index in 0..last {
+            udp_flow(&table, 5, 10_000 + index as u16, 1_000, true);
+        }
+        let answered = 10_000 + last as u16;
+        udp_flow(&table, 5, answered, 3_100, false);
+        let reply =
+            table.update_on_packet(5, IPPROTO_UDP, remote, local, 53, answered, &udp, 3_200);
+        assert_eq!(reply.decision, CtDecision::Established);
+        let streams_untouched =
+            || (0..last).all(|index| table.lookup(&own_flow(10_000 + index as u16)).is_some());
+
+        // The answered request is replaced, although it is the newest flow.
+        let ingress =
+            table.update_on_packet(5, IPPROTO_UDP, local, remote, 11_000, 53, &udp, 3_300);
+        assert!(!ingress.resource_exhausted);
+        assert!(table.lookup(&own_flow(answered)).is_none());
+        assert!(table.lookup(&own_flow(11_000)).is_some());
+        assert!(streams_untouched());
+        let reply = table.update_on_packet(5, IPPROTO_UDP, remote, local, 53, 11_000, &udp, 3_400);
+        assert_eq!(reply.decision, CtDecision::Established);
+        table.update_on_packet(5, IPPROTO_UDP, local, remote, 11_000, 53, &udp, 5_300);
+
+        // Every flow is a stream now: a new flow is rejected, none is evicted,
+        // and the egress rejection precedes the device queue.
+        let ingress =
+            table.update_on_packet(5, IPPROTO_UDP, local, remote, 11_001, 53, &udp, 5_400);
+        assert!(ingress.resource_exhausted);
+        assert!(table.lookup(&own_flow(11_001)).is_none());
+        let queued = Cell::new(false);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_UDP,
+            local,
+            remote,
+            12_000,
+            53,
+            &udp,
+            5_500,
+            || {
+                queued.set(true);
+                Ok::<(), QueueFault>(())
+            },
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::Rejected(CtUpdateResult {
+                resource_exhausted: true,
+                ..
+            })
+        ));
+        assert!(!queued.get());
+        assert!(streams_untouched());
+        assert!(table.lookup(&own_flow(11_000)).is_some());
+        assert_eq!(table.len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
+    fn r192_res_4_root_keeps_its_reserve_and_tenants_borrow_only_its_surplus() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        let flow = |ns, port| FlowKey::from_packet(ns, IPPROTO_UDP, local, remote, port, 53).0;
+        let count = |ns| table.ns_entry_counts.lock().get(&ns).copied().unwrap_or(0);
+        let tenant_room = CT_MAX_ENTRIES - CT_ROOT_RESERVE;
+        // Tenants fill their combined limit with replaceable (unreplied) flows.
+        let tenants = [61u64, 62, 63];
+        assert_eq!(tenants.len() * CT_MAX_ENTRIES_PER_NS, tenant_room);
+        let mut port = 20_000u16;
+        for &ns in &tenants {
+            for _ in 0..CT_MAX_ENTRIES_PER_NS {
+                udp_flow(&table, ns, port, 1, false);
+                port += 1;
+            }
+        }
+        assert_eq!(table.len(), tenant_room);
+
+        // A new tenant gets no slot from the tenants or from root's reserve.
+        let refused = table.update_on_packet(70, IPPROTO_UDP, local, remote, 30_000, 53, &udp, 10);
+        assert!(refused.resource_exhausted);
+        assert_eq!(table.len(), tenant_room);
+        assert_eq!(count(70), 0);
+        // A tenant at its share still replaces its own oldest flow.
+        let own = table.update_on_packet(61, IPPROTO_UDP, local, remote, 30_001, 53, &udp, 10);
+        assert!(!own.resource_exhausted);
+        assert!(table.lookup(&flow(61, 20_000)).is_none());
+        assert_eq!(table.len(), tenant_room);
+
+        // Root is not held to a per-namespace share: it fills the reserve.
+        for index in 0..CT_ROOT_RESERVE {
+            udp_flow(&table, CT_ROOT_NS, 40_000 + index as u16, 20, false);
+        }
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        assert_eq!(count(CT_ROOT_NS), CT_ROOT_RESERVE);
+        // At the full table root replaces its own oldest flow, never a tenant's.
+        let root =
+            table.update_on_packet(CT_ROOT_NS, IPPROTO_UDP, local, remote, 41_000, 53, &udp, 30);
+        assert!(!root.resource_exhausted);
+        assert!(table.lookup(&flow(CT_ROOT_NS, 40_000)).is_none());
+        assert_eq!(count(CT_ROOT_NS), CT_ROOT_RESERVE);
+        for &ns in &tenants {
+            assert_eq!(count(ns), CT_MAX_ENTRIES_PER_NS);
+        }
+
+        // With one tenant gone root grows past its reserve; that surplus is
+        // what a tenant below its limits may borrow at the full table.
+        let gone = tenants[tenants.len() - 1];
+        assert_eq!(table.drain_ns(gone), CT_MAX_ENTRIES_PER_NS);
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            udp_flow(&table, CT_ROOT_NS, 42_000 + index as u16, 40, false);
+        }
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        let root_before = count(CT_ROOT_NS);
+        assert_eq!(root_before, CT_ROOT_RESERVE + CT_MAX_ENTRIES_PER_NS);
+        let borrowed = table.update_on_packet(70, IPPROTO_UDP, local, remote, 30_002, 53, &udp, 50);
+        assert!(!borrowed.resource_exhausted);
+        assert_eq!(count(70), 1);
+        assert_eq!(count(CT_ROOT_NS), root_before - 1);
+        assert!(
+            table.lookup(&flow(CT_ROOT_NS, 40_001)).is_none(),
+            "root's oldest flow"
+        );
+        for &ns in &tenants[..tenants.len() - 1] {
+            assert_eq!(count(ns), CT_MAX_ENTRIES_PER_NS);
+        }
+
+        for ns in tenants.into_iter().chain([70, CT_ROOT_NS]) {
+            table.drain_ns(ns);
+        }
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn r192_4_global_eviction_spares_established_sessions() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        let flow = |ns, port| FlowKey::from_packet(ns, IPPROTO_UDP, local, remote, port, 53).0;
+        // Two tenants fill their shares with streams; root fills the rest with
+        // streams, except one unreplied flow, which is the newest in the table.
+        let mut port = 20_000u16;
+        for ns in [61u64, 62] {
+            for _ in 0..CT_MAX_ENTRIES_PER_NS {
+                udp_flow(&table, ns, port, 1_000, true);
+                port += 1;
+            }
+        }
+        let root_flows = CT_MAX_ENTRIES - 2 * CT_MAX_ENTRIES_PER_NS;
+        let unreplied = port + 7;
+        for _ in 0..root_flows {
+            let stream = port != unreplied;
+            udp_flow(
+                &table,
+                CT_ROOT_NS,
+                port,
+                if stream { 1_000 } else { 3_050 },
+                stream,
+            );
+            port += 1;
+        }
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        let streams_untouched = || {
+            (20_000..port).filter(|&p| p != unreplied).all(|p| {
+                let ns = match (p - 20_000) / CT_MAX_ENTRIES_PER_NS as u16 {
+                    0 => 61,
+                    1 => 62,
+                    _ => CT_ROOT_NS,
+                };
+                table.lookup(&flow(ns, p)).is_some()
+            })
+        };
+
+        // A new tenant below its limits replaces the only replaceable flow of
+        // root's surplus, not the older streams.
+        let first = table.update_on_packet(70, IPPROTO_UDP, local, remote, 30_000, 53, &udp, 3_100);
+        assert!(!first.resource_exhausted);
+        assert!(table.lookup(&flow(CT_ROOT_NS, unreplied)).is_none());
+        assert!(streams_untouched());
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&CT_ROOT_NS).copied(),
+            Some(root_flows - 1)
+        );
+
+        // Once that flow is a stream too, nothing is replaceable: rejected,
+        // for a tenant and for root alike.
+        let reply = table.update_on_packet(70, IPPROTO_UDP, remote, local, 53, 30_000, &udp, 3_200);
+        assert_eq!(reply.decision, CtDecision::Established);
+        table.update_on_packet(70, IPPROTO_UDP, local, remote, 30_000, 53, &udp, 5_100);
+        let second =
+            table.update_on_packet(71, IPPROTO_UDP, local, remote, 30_001, 53, &udp, 5_200);
+        assert!(second.resource_exhausted);
+        let root = table.update_on_packet(
+            CT_ROOT_NS,
+            IPPROTO_UDP,
+            local,
+            remote,
+            30_002,
+            53,
+            &udp,
+            5_200,
+        );
+        assert!(root.resource_exhausted);
+        assert!(table.lookup(&flow(70, 30_000)).is_some());
+        assert!(streams_untouched());
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        for ns in [61u64, 62, 70, CT_ROOT_NS] {
+            table.drain_ns(ns);
+        }
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn r192_res_4_victims_prefer_flows_a_remote_peer_created() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        let flow = |ns, port| FlowKey::from_packet(ns, IPPROTO_UDP, local, remote, port, 53).0;
+        let egress = |ns, port, t| {
+            table.update_on_egress_transaction(
+                ns,
+                IPPROTO_UDP,
+                local,
+                remote,
+                port,
+                53,
+                &udp,
+                t,
+                || Ok::<(), QueueFault>(()),
+            )
+        };
+        // Tenant 5: two outbound queries (the oldest flows), then flows a
+        // remote peer opened, up to the share.
+        assert!(matches!(egress(5, 10_000, 1), CtEgressResult::Committed(_)));
+        assert!(matches!(egress(5, 10_001, 1), CtEgressResult::Committed(_)));
+        for index in 2..CT_MAX_ENTRIES_PER_NS {
+            udp_flow(&table, 5, 10_000 + index as u16, 5, false);
+        }
+        assert!(table
+            .lookup(&flow(5, 10_000))
+            .is_some_and(|entry| entry.local_origin));
+        assert!(table
+            .lookup(&flow(5, 10_002))
+            .is_some_and(|entry| !entry.local_origin));
+
+        // A new remote flow replaces the oldest remote-created flow, although
+        // the outbound queries are older.
+        let first = table.update_on_packet(5, IPPROTO_UDP, local, remote, 11_000, 53, &udp, 6);
+        assert!(!first.resource_exhausted);
+        assert!(table.lookup(&flow(5, 10_002)).is_none());
+        assert!(table.lookup(&flow(5, 10_000)).is_some());
+        assert!(table.lookup(&flow(5, 10_001)).is_some());
+
+        // Tenant 6 holds only its own outbound flows: they are replaced, oldest
+        // first, rather than the namespace refusing every new flow.
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            let t = if index == 0 { 1 } else { 2 };
+            assert!(matches!(
+                egress(6, 12_000 + index as u16, t),
+                CtEgressResult::Committed(_)
+            ));
+        }
+        let second = table.update_on_packet(6, IPPROTO_UDP, local, remote, 13_000, 53, &udp, 3);
+        assert!(!second.resource_exhausted);
+        assert!(table.lookup(&flow(6, 12_000)).is_none());
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.drain_ns(6), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
+    fn r192_res_4_a_validated_or_local_reset_retires_an_established_flow() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let syn = L4Meta::new(0x02, 0);
+        let tcp_flow = |port| FlowKey::from_packet(5, IPPROTO_TCP, local, remote, port, 443).0;
+        let establish = |port| {
+            let result = table.update_on_packet(5, IPPROTO_TCP, local, remote, port, 443, &syn, 1);
+            assert!(!result.resource_exhausted);
+            let entries = table.entries.read();
+            entries.get(&tcp_flow(port)).expect("flow").lock().state =
+                CtProtoState::Tcp(TcpCtState::Established);
+        };
+        let state = |port| table.lookup(&tcp_flow(port)).map(|entry| entry.state);
+        let established = Some(CtProtoState::Tcp(TcpCtState::Established));
+        let closed = Some(CtProtoState::Tcp(TcpCtState::Close));
+
+        // An RST conntrack sees on ingress is not validated: ignored (R145-4).
+        establish(40_000);
+        let rst = L4Meta::new(0x04, 0);
+        table.update_on_packet(5, IPPROTO_TCP, remote, local, 443, 40_000, &rst, 2);
+        assert_eq!(state(40_000), established);
+        // The socket layer accepted it (RFC 5961): the flow closes.
+        assert!(table.commit_tcp_ingress_reset(5, remote, local, 443, 40_000));
+        assert_eq!(state(40_000), closed);
+        assert!(table
+            .lookup(&tcp_flow(40_000))
+            .is_some_and(|entry| entry.replaceable()));
+        // Unknown flows and other namespaces are untouched.
+        assert!(!table.commit_tcp_ingress_reset(5, remote, local, 443, 40_009));
+        establish(40_001);
+        assert!(!table.commit_tcp_ingress_reset(6, remote, local, 443, 40_001));
+        assert_eq!(state(40_001), established);
+
+        // An RST this host sends closes the flow when it is queued.
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_TCP,
+            local,
+            remote,
+            40_001,
+            443,
+            &rst,
+            3,
+            || Ok::<(), QueueFault>(()),
+        );
+        assert!(matches!(outcome, CtEgressResult::Committed(_)));
+        assert_eq!(state(40_001), closed);
+        // A failed queue leaves the established state in place.
+        establish(40_002);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_TCP,
+            local,
+            remote,
+            40_002,
+            443,
+            &rst,
+            4,
+            || Err(QueueFault::Full),
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::QueueFailed(QueueFault::Full)
+        ));
+        assert_eq!(state(40_002), established);
+        // A validated RST that lands while our own segment is queued wins over
+        // that segment's commit.
+        let ack = L4Meta::new(0x10, 0);
+        let reset_in_flight = Cell::new(false);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_TCP,
+            local,
+            remote,
+            40_002,
+            443,
+            &ack,
+            5,
+            || {
+                reset_in_flight.set(table.commit_tcp_ingress_reset(5, remote, local, 443, 40_002));
+                Ok::<(), QueueFault>(())
+            },
+        );
+        assert!(matches!(outcome, CtEgressResult::Committed(_)));
+        assert!(reset_in_flight.get());
+        assert_eq!(state(40_002), closed);
+        // When the queued segment then fails, its rollback keeps the reset.
+        establish(40_003);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_TCP,
+            local,
+            remote,
+            40_003,
+            443,
+            &ack,
+            6,
+            || {
+                assert!(table.commit_tcp_ingress_reset(5, remote, local, 443, 40_003));
+                Err(QueueFault::Full)
+            },
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::QueueFailed(QueueFault::Full)
+        ));
+        assert_eq!(state(40_003), closed);
+        assert_eq!(table.drain_ns(5), 4);
+    }
+
+    #[test]
+    fn r192_4_same_namespace_replacement_queue_failure_restores_the_victim() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            let seen = if index == 0 { 2 } else { 3 };
+            let port = 10_000 + index as u16;
+            let result =
+                table.update_on_packet(5, IPPROTO_UDP, local, remote, port, 53, &udp, seen);
+            assert!(!result.resource_exhausted);
+        }
+        let victim = FlowKey::from_packet(5, IPPROTO_UDP, local, remote, 10_000, 53).0;
+        let requested = FlowKey::from_packet(5, IPPROTO_UDP, local, remote, 12_000, 53).0;
+        let before = table.lookup(&victim).expect("victim present");
+
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_UDP,
+            local,
+            remote,
+            12_000,
+            53,
+            &udp,
+            4,
+            || Err(QueueFault::Full),
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::QueueFailed(QueueFault::Full)
+        ));
+        let after = table
+            .lookup(&victim)
+            .expect("victim restored after QueueFull");
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.last_seen_ms, before.last_seen_ms);
+        assert_eq!(after.packets_orig, before.packets_orig);
+        assert!(table.lookup(&requested).is_none());
+        assert_eq!(table.len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
     fn r188_replacement_publication_failure_restores_victim_and_namespace_charge() {
         let table = ConntrackTable::new();
         let (local, remote) = endpoints();
 
-        // Fill the bounded global table across four namespaces, keeping the
-        // first entry old enough to be the deterministic LRU victim.  The
-        // requester namespace is intentionally absent, so publication needs
-        // both a victim replacement and a new namespace-count row.
-        let namespaces = [51u64, 52, 53, 54];
+        // Fill the bounded global table: two tenants at their shares and root
+        // with the rest, keeping root's first entry old enough to be the
+        // deterministic victim (R192-RES-4: a tenant below its limits borrows
+        // root's surplus).  The requester namespace is intentionally absent,
+        // so publication needs both a victim replacement and a new
+        // namespace-count row.
+        let namespaces = [51u64, 52, CT_ROOT_NS];
+        let root_flows = CT_MAX_ENTRIES - 2 * CT_MAX_ENTRIES_PER_NS;
         let mut port = 30_000u16;
-        for (ns_index, ns_id) in namespaces.into_iter().enumerate() {
-            for entry_index in 0..CT_MAX_ENTRIES_PER_NS {
-                let timestamp = if ns_index == 0 && entry_index == 0 {
+        for ns_id in namespaces {
+            let flows = if ns_id == CT_ROOT_NS {
+                root_flows
+            } else {
+                CT_MAX_ENTRIES_PER_NS
+            };
+            for entry_index in 0..flows {
+                let timestamp = if ns_id == CT_ROOT_NS && entry_index == 0 {
                     1
                 } else {
                     2
@@ -2775,7 +3525,9 @@ mod tests {
         }
         assert_eq!(table.len(), CT_MAX_ENTRIES);
 
-        let victim_key = FlowKey::from_packet(51, IPPROTO_UDP, local, remote, 30_000, 53).0;
+        let victim_port = 30_000 + 2 * CT_MAX_ENTRIES_PER_NS as u16;
+        let victim_key =
+            FlowKey::from_packet(CT_ROOT_NS, IPPROTO_UDP, local, remote, victim_port, 53).0;
         assert!(table.lookup(&victim_key).is_some());
         table.fail_next_ns_publication_for_test();
 
@@ -2806,8 +3558,8 @@ mod tests {
             "failed namespace publication must restore the detached LRU victim"
         );
         assert_eq!(
-            table.ns_entry_counts.lock().get(&51).copied(),
-            Some(CT_MAX_ENTRIES_PER_NS),
+            table.ns_entry_counts.lock().get(&CT_ROOT_NS).copied(),
+            Some(root_flows),
             "victim namespace charge must be restored exactly"
         );
         assert!(
@@ -2815,8 +3567,34 @@ mod tests {
             "requester namespace row must not survive a failed publication"
         );
 
-        for ns_id in namespaces {
-            assert_eq!(table.drain_ns(ns_id), CT_MAX_ENTRIES_PER_NS);
-        }
+        // The same replacement failing at the device queue restores the victim
+        // and both namespace rows as well.
+        let outcome = table.update_on_egress_transaction(
+            99,
+            IPPROTO_UDP,
+            local,
+            remote,
+            40_000,
+            53,
+            &L4Meta::new(0, 0),
+            4,
+            || Err(QueueFault::Full),
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::QueueFailed(QueueFault::Full)
+        ));
+        assert_eq!(table.len(), CT_MAX_ENTRIES);
+        assert!(table.lookup(&requester_key).is_none());
+        assert!(table.lookup(&victim_key).is_some());
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&CT_ROOT_NS).copied(),
+            Some(root_flows)
+        );
+        assert!(table.ns_entry_counts.lock().get(&99).is_none());
+
+        assert_eq!(table.drain_ns(51), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.drain_ns(52), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.drain_ns(CT_ROOT_NS), root_flows);
     }
 }

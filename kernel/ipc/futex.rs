@@ -26,6 +26,9 @@
 //! serializes it with the other kernel updates of that word. Under a futex
 //! lock a word access never resolves a page fault ([`LockedWord`]): the
 //! operation drops its locks, faults the word in and retries (review D2-1).
+//! A PI state's owner is a user task of the futex's address space; a word
+//! naming any other live task is refused with EPERM (R191-1,
+//! [`pi_owner_in_space`]).
 //!
 //! # Plain waiters (GAP-5 futex parity)
 //!
@@ -116,6 +119,8 @@ pub enum FutexError {
     /// heap-derived global/per-space bucket budget and fallible queue/PI metadata growth.
     TooManyBuckets,
     /// GAP-5 PI parity: FUTEX_UNLOCK_PI by a task the word does not name -> EPERM.
+    /// R191-1: also a PI word naming a task that cannot own the PI state (a
+    /// kernel task, or a task of another address space) -> EPERM.
     NotOwner,
     /// GAP-5 PI parity: the PI word already names the locking task (or, for
     /// FUTEX_CMP_REQUEUE_PI, the waiter it acts for) -> EDEADLK.
@@ -2610,18 +2615,40 @@ fn cas_user_u32(uaddr: usize, expected: u32, new: u32) -> Result<bool, FutexErro
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PiOwnerLiveness {
     Live,
+    /// R191-1: alive, but it cannot own a PI state of the futex's key space
+    /// ([`pi_owner_in_space`]).
+    Foreign,
     /// Zombie, futex exit work (robust walk and PI hand-off) not yet done.
     Exiting,
     /// Gone, recycled, or its exit work is done.
     Dead,
 }
 
-/// Called under a bucket lock (bucket -> PROCESS_TABLE -> PCB). A task's
-/// exit callback (robust walk, then [`release_pi_states_of`]) runs after it
-/// publishes `Zombie` and before it publishes `teardown_done`, so a task seen
-/// alive here has not run its PI hand-off yet, and the hand-off takes this
-/// bucket's lock after the caller releases it.
-fn pi_owner_liveness(pid: ProcessId, generation: u64) -> PiOwnerLiveness {
+/// R191-1 FIX (D3-ARC-1, INV-SEC-04): whether a live task whose page-table
+/// root is `memory_space` and whose key space is `owner_space` may own a PI
+/// state of key space `space`. Every futex key is private to one address
+/// space ([`FutexSpace`]), so the owner must be a user task (a kernel task
+/// has no page table of its own) of the caller's address space: a CLONE_VM
+/// task shares it, thread or not. Linux rejects only kernel threads
+/// (`attach_to_pi_owner`, `PF_KTHREAD`) and has no address-space check; its
+/// shared futexes let tasks of several address spaces use one PI word. Here
+/// every key is private, so a task of another address space reaches the word
+/// through another key and could never unlock through this state; attaching
+/// to it would only boost an unrelated task.
+fn pi_owner_in_space(memory_space: usize, owner_space: usize, space: usize) -> bool {
+    memory_space != 0 && owner_space == space
+}
+
+/// Called under a bucket lock (bucket -> PROCESS_TABLE -> PCB), for a PI
+/// state of key space `space`. A task's exit callback (robust walk, then
+/// [`release_pi_states_of`]) runs after it publishes `Zombie` and before it
+/// publishes `teardown_done`, so a task seen alive here has not run its PI
+/// hand-off yet, and the hand-off takes this bucket's lock after the caller
+/// releases it. The identity of an exiting task is not checked: it is only
+/// waited for, and its exit work then hands off or drops every PI state it
+/// owns. (Its `memory_space` is cleared only after it leaves the table, or,
+/// for a clone aborted before it ran, while it is `Terminated`.)
+fn pi_owner_liveness(pid: ProcessId, generation: u64, space: usize) -> PiOwnerLiveness {
     let Some(proc_arc) = process::get_process(pid) else {
         return PiOwnerLiveness::Dead;
     };
@@ -2637,6 +2664,9 @@ fn pi_owner_liveness(pid: ProcessId, generation: u64) -> PiOwnerLiveness {
                 PiOwnerLiveness::Exiting
             }
         }
+        _ if !pi_owner_in_space(proc.memory_space, FutexSpace::id_of_mm(&proc.mm), space) => {
+            PiOwnerLiveness::Foreign
+        }
         _ => PiOwnerLiveness::Live,
     }
 }
@@ -2648,11 +2678,12 @@ fn pi_owner_liveness(pid: ProcessId, generation: u64) -> PiOwnerLiveness {
 fn wait_for_pi_owner_exit(
     owner: ProcessId,
     generation: u64,
+    space: usize,
     waiter: ProcessId,
     deadline: Option<u64>,
 ) -> Result<(), FutexError> {
     let mut round = 0usize;
-    while pi_owner_liveness(owner, generation) == PiOwnerLiveness::Exiting {
+    while pi_owner_liveness(owner, generation, space) == PiOwnerLiveness::Exiting {
         pi_pause(waiter, deadline, &mut round, false)?;
     }
     Ok(())
@@ -2670,13 +2701,16 @@ enum PiTake {
     OwnerExiting(ProcessId, u64),
 }
 
-/// Under the PI bucket lock: Linux `futex_lock_pi_atomic` for the task
-/// `taker_pid`/`taker_tid`. `named` is the owner TID the word held before the
-/// lock was taken and `resolved` the task it named then. A word access that
-/// faults returns [`FutexError::WordFault`] (review D2-1).
+/// Under the PI bucket lock of a futex of key space `space`: Linux
+/// `futex_lock_pi_atomic` for the task `taker_pid`/`taker_tid`. `named` is
+/// the owner TID the word held before the lock was taken and `resolved` the
+/// task it named then. A word access that faults returns
+/// [`FutexError::WordFault`] (review D2-1).
+#[allow(clippy::too_many_arguments)]
 fn pi_take_or_attach_locked(
     bucket: &mut FutexBucket,
     word: &dyn LockedWord,
+    space: usize,
     taker_pid: ProcessId,
     taker_tid: u32,
     set_waiters: bool,
@@ -2715,7 +2749,10 @@ fn pi_take_or_attach_locked(
                     // The word names the taker under another namespace's TID.
                     return Err(FutexError::Deadlock);
                 }
-                return match pi_owner_liveness(owner, generation) {
+                // R191-1 FIX: the owner's identity is checked with its
+                // liveness, under this bucket's lock and the owner's PCB lock,
+                // before any PI state or boost names it.
+                return match pi_owner_liveness(owner, generation, space) {
                     PiOwnerLiveness::Live => {
                         bucket.pi_owner = Some(PiOwner {
                             pid: owner,
@@ -2724,6 +2761,7 @@ fn pi_take_or_attach_locked(
                         });
                         Ok(PiTake::Attached)
                     }
+                    PiOwnerLiveness::Foreign => Err(FutexError::NotOwner),
                     PiOwnerLiveness::Exiting => Ok(PiTake::OwnerExiting(owner, generation)),
                     PiOwnerLiveness::Dead => pi_owner_gone(word, current),
                 };
@@ -2845,7 +2883,7 @@ fn lock_pi_attempts(
                 false
             }
             PiLockAttempt::OwnerExiting(owner, generation) => {
-                wait_for_pi_owner_exit(owner, generation, caller.pid, deadline)?;
+                wait_for_pi_owner_exit(owner, generation, key.0, caller.pid, deadline)?;
                 false
             }
             // Past the per-futex waiter bound: poll for a slot once a tick.
@@ -2919,7 +2957,7 @@ fn pi_lock_attempt(
         let mut b = bucket.lock();
         let outcome = pi_lock_locked(
             &mut b,
-            key.1,
+            key,
             &LockedUserWord(key.1),
             caller,
             priority,
@@ -2959,7 +2997,7 @@ fn pi_lock_attempt(
 #[allow(clippy::too_many_arguments)]
 fn pi_lock_locked(
     b: &mut FutexBucket,
-    uaddr: usize,
+    key: FutexKey,
     word: &dyn LockedWord,
     caller: &PiCaller,
     priority: Priority,
@@ -2985,7 +3023,9 @@ fn pi_lock_locked(
             PiLocked::Retry
         });
     }
-    match pi_take_or_attach_locked(b, word, caller.pid, caller.tid, false, named, resolved)? {
+    match pi_take_or_attach_locked(
+        b, word, key.0, caller.pid, caller.tid, false, named, resolved,
+    )? {
         PiTake::Taken => return Ok(PiLocked::Acquired),
         PiTake::Retry => return Ok(PiLocked::Retry),
         PiTake::OwnerExiting(owner, generation) => {
@@ -3025,7 +3065,7 @@ fn pi_lock_locked(
     let priority = process::get_process(caller.pid)
         .map_or(priority, |proc_arc| proc_arc.lock().dynamic_priority);
     let waiter = PiWaiter {
-        origin: uaddr,
+        origin: key.1,
         seq: b.next_pi_seq(),
         tid: caller.tid,
         priority,
@@ -3628,7 +3668,7 @@ pub fn futex_cmp_requeue_pi(
             RequeuePiStep::Done(result) => Some(result),
             RequeuePiStep::Retry => None,
             RequeuePiStep::OwnerExiting(owner, generation) => {
-                wait_for_pi_owner_exit(owner, generation, caller.pid, None)
+                wait_for_pi_owner_exit(owner, generation, space.id, caller.pid, None)
                     .err()
                     .map(Err)
             }
@@ -3754,7 +3794,7 @@ fn cmp_requeue_pi_pass(
         &mut src,
         key1.1,
         &mut tgt,
-        (key2.1, &LockedUserWord(key2.1)),
+        (key2, &LockedUserWord(key2.1)),
         nr_requeue,
         (named, resolved),
         &mut lookup,
@@ -3773,12 +3813,13 @@ fn requeue_pi_locked(
     src: &mut FutexBucket,
     uaddr1: usize,
     tgt: &mut FutexBucket,
-    (uaddr2, word2): (usize, &dyn LockedWord),
+    (key2, word2): (FutexKey, &dyn LockedWord),
     nr_requeue: usize,
     (named, resolved): (u32, Option<(ProcessId, u64)>),
     info: &mut dyn FnMut(ProcessId, bool) -> Option<(u32, Priority)>,
     deferred: &mut FutexDeferredWakes,
 ) -> RequeuePiStep {
+    let uaddr2 = key2.1;
     let (top_pid, top_tid, top_priority) = match requeue_pi_top_locked(src, uaddr2, info) {
         Ok(Some(top)) => top,
         Ok(None) => return RequeuePiStep::Done(Ok(0)),
@@ -3786,10 +3827,12 @@ fn requeue_pi_locked(
     };
 
     // Linux futex_proxy_trylock_atomic: take `uaddr2` for the top waiter,
-    // setting WAITERS when more waiters may follow it.
+    // setting WAITERS when more waiters may follow it. R191-1: the proxy
+    // attach checks the owner's identity like FUTEX_LOCK_PI.
     let take = pi_take_or_attach_locked(
         tgt,
         word2,
+        key2.0,
         top_pid,
         top_tid,
         nr_requeue > 0,
@@ -5791,6 +5834,22 @@ mod tests {
     }
 
     #[test]
+    fn futex_pi_owner_must_be_a_user_task_of_the_futex_address_space() {
+        // R191-1 (INV-SEC-04): the task a PI word names may own the PI
+        // state only if it shares the futex's key space (a CLONE_VM task
+        // does, thread or not) and has a page table of its own. A task of
+        // another address space and a kernel task are refused (EPERM); the
+        // guest PI owner-identity leg covers the locked attach paths.
+        const SPACE: usize = 0x7a00_0000;
+        const OTHER: usize = 0x7b00_0000;
+        const ROOT: usize = 0x0010_0000;
+        assert!(pi_owner_in_space(ROOT, SPACE, SPACE));
+        assert!(!pi_owner_in_space(ROOT, OTHER, SPACE));
+        assert!(!pi_owner_in_space(0, SPACE, SPACE));
+        assert!(!pi_owner_in_space(0, OTHER, SPACE));
+    }
+
+    #[test]
     fn futex_pi_unlock_step_checks_the_word_then_the_state() {
         const PID: ProcessId = 0x7810;
         const TID: u32 = 0x31;
@@ -5980,7 +6039,7 @@ mod tests {
         let _serial = crate::HEAP_TEST_LOCK.lock();
         mm::publish_heap_budgets();
         let before = mm::heap_class_snapshot(HeapClass::Futex);
-        const WORD_ADDR: usize = 0xb200;
+        const WORD_KEY: FutexKey = (0x7870_0000, 0xb200);
         const OWNER_TID: u32 = 0x77;
         let other_owner: ProcessId = 0x7871;
         let caller = pi_caller(0x7870, 0x70);
@@ -5995,14 +6054,18 @@ mod tests {
             let word = TestWord::new(0);
             word.fault.set(true);
             assert!(matches!(
-                pi_take_or_attach_locked(&mut b, &word, caller.pid, caller.tid, false, 0, None),
+                pi_take_or_attach_locked(
+                    &mut b, &word, WORD_KEY.0, caller.pid, caller.tid, false, 0, None,
+                ),
                 Err(FutexError::WordFault)
             ));
             assert_eq!(word.value.get(), 0);
             assert!(b.pi_owner.is_none());
             word.fault.set(false);
             assert!(matches!(
-                pi_take_or_attach_locked(&mut b, &word, caller.pid, caller.tid, false, 0, None),
+                pi_take_or_attach_locked(
+                    &mut b, &word, WORD_KEY.0, caller.pid, caller.tid, false, 0, None,
+                ),
                 Ok(PiTake::Taken)
             ));
             assert_eq!(word.value.get(), caller.tid);
@@ -6018,7 +6081,7 @@ mod tests {
             word.value.set(OWNER_TID | FUTEX_WAITERS);
             let full = pi_lock_locked(
                 &mut b,
-                WORD_ADDR,
+                WORD_KEY,
                 &word,
                 &caller,
                 9,
@@ -6047,7 +6110,7 @@ mod tests {
             word.fault.set(true);
             let faulted = pi_lock_locked(
                 &mut b,
-                WORD_ADDR,
+                WORD_KEY,
                 &word,
                 &caller,
                 9,
@@ -6061,7 +6124,7 @@ mod tests {
             word.fault.set(false);
             let fixed = pi_lock_locked(
                 &mut b,
-                WORD_ADDR,
+                WORD_KEY,
                 &word,
                 &caller,
                 9,

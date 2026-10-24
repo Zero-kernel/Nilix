@@ -184,7 +184,7 @@ pub type ProcessWeak = Weak<Mutex<Process>, ProcessArcAllocator>;
 /// mmap 默认起始地址
 // ST-K3 FIX: moved 0x4000_0000 (1 GiB) → 0x10_0000_0000 (64 GiB). The old
 // window [1 GiB, 1.25 GiB) sat INSIDE the 0-4 GiB identity map that
-// `create_fresh_address_space`/`deep_copy_identity_for_user` copy into every
+// `create_fresh_address_space`/`deep_copy_identity_for_user` copied into every
 // user address space as 2 MiB huge supervisor pages (only 4-6 MiB is split
 // for the ELF image), so `map_to` failed with ParentEntryHugePage on EVERY
 // frame-backed anonymous mmap — no userspace mmap had ever succeeded
@@ -13272,9 +13272,10 @@ unsafe fn free_page_table_level(
         }
 
         // RF180-20 FIX: supervisor-only intermediate entries in the user-half
-        // are shared identity-map tables copied by `deep_copy_identity_for_user`.
-        // They are borrowed by every address space and must never be walked or
-        // returned to the buddy allocator during private user-AS teardown.
+        // are shared kernel tables (until D0-ISO-1 Approach A, the identity map
+        // `deep_copy_identity_for_user` copied in; user address spaces now have
+        // none). Such an entry is never walked or returned to the buddy
+        // allocator during private user-AS teardown.
         // User-owned ELF page-table branches retain USER_ACCESSIBLE at every
         // intermediate level and continue through the recursive cleanup below.
         if !is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
@@ -13303,21 +13304,19 @@ unsafe fn free_page_table_level(
 
         // 检查是否是大页 (2MB 或 1GB)
         //
-        // R49-2 FIX: Previously this code skipped huge pages entirely, causing
-        // memory leaks if user-space ever used huge pages. While user-space
-        // typically doesn't use huge pages currently, we should:
-        // 1. Clear the page table entry (defense-in-depth)
-        // 2. Attempt to free the physical memory
-        //
-        // Note: Buddy allocator only tracks 4KB frames. For huge pages, we
-        // release the base frame which may not fully reclaim the memory.
-        // Future improvement: Extend buddy allocator for multi-page frees.
-        if flags.contains(PageTableFlags::HUGE_PAGE) {
-            // Release the huge page physical memory to prevent leak
-            let huge_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
-            frame_alloc.deallocate_frame(huge_frame);
-
-            // Clear the page table entry for defense-in-depth
+        // R192 FIX (LEAD-TEARDOWN-HUGE-1), superseding R49-2: no path maps a
+        // user huge page (every user mapping is 4 KiB, and fork refuses a USER
+        // huge leaf), so one here is an anomaly, such as a supervisor identity
+        // leaf that gained USER through `map_to`'s parent-flag OR before the
+        // R192-2 guard. Its frames are not this address space's: freeing the
+        // base frame (R49-2) could hand a live kernel or MMIO frame to the
+        // allocator. Drop the entry and leak the frame, failing safe.
+        // Bit 7 of a PT entry is PAT, not a page size: only levels 2-3 map huge.
+        if level > 1 && flags.contains(PageTableFlags::HUGE_PAGE) {
+            klog_force!(
+                "[MM] teardown: dropped an unexpected USER huge leaf (level {}); frame not freed",
+                level
+            );
             entry.set_unused();
             continue;
         }

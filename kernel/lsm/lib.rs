@@ -149,6 +149,13 @@ pub mod cpuset_op {
     pub const SET_CPUS: u32 = 3;
 }
 
+/// R191-3 FIX: ptrace-access modes for [`hook_ptrace`], with Linux's
+/// `PTRACE_MODE_*` values.
+pub mod ptrace_op {
+    /// Read another task's state (`PTRACE_MODE_READ`), as `get_robust_list` does.
+    pub const READ: u32 = 0x01;
+}
+
 // ============================================================================
 // Hook Coverage Census (R190-1, INV-SEC-02 / INV-SEC-03)
 // ============================================================================
@@ -182,6 +189,8 @@ pub struct FeatureAbsentHook {
 /// So adding, for example, `setuid` or `shmget` as a dispatch arm, or giving
 /// a pinned fixed-errno stub (chmod, chown, link) a real body, requires
 /// removing the entry, and then the census requires the hook to be called.
+/// A family wired for some of its syscalls only moves to
+/// [`PARTIALLY_WIRED_HOOKS`], which keeps the rest fenced (R191-3).
 /// Entries with no syscall numbers (file-backed mmap inside `sys_mmap`;
 /// livepatch, which is closed by `SUPPORTED=false` and the KernelOps
 /// default-deny) are closed by the boundary in `reason`, not by a mechanical
@@ -249,11 +258,6 @@ pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
         reason: "no setsockopt/getsockopt arms",
     },
     FeatureAbsentHook {
-        hook: "hook_ptrace",
-        syscalls: &[101, 310, 311, 312, 438],
-        reason: "no ptrace/process_vm_readv/process_vm_writev/kcmp/pidfd_getfd arm",
-    },
-    FeatureAbsentHook {
         hook: "hook_task_setgroups",
         syscalls: &[116],
         reason: "no setgroups arm",
@@ -269,6 +273,39 @@ pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
         reason: "no setuid/setgid/setfsuid/setfsgid arms",
     },
 ];
+
+/// R191-3: a wired hook family that some of its syscalls do not reach yet
+/// (see [`PARTIALLY_WIRED_HOOKS`]).
+pub struct PartiallyWiredHook {
+    /// The `hook_*` function name. It has a production caller, so it is not
+    /// in [`FEATURE_ABSENT_HOOKS`].
+    pub hook: &'static str,
+    /// Dispatched syscall numbers whose handler calls `hook`.
+    pub wired: &'static [u64],
+    /// Syscall numbers that would expose the family through an entry point
+    /// that does not exist yet, fenced like the feature-absent ones.
+    pub absent: &'static [u64],
+    /// What is wired and why the rest is unreachable.
+    pub reason: &'static str,
+}
+
+/// R191-3 FIX (D4-SEC-1, INV-SEC-05): hook families wired for some syscalls
+/// and feature-absent for the others.
+///
+/// Once a hook has one production caller the census counts it as wired, so
+/// listing the family here keeps the other syscalls fenced. The kernel-core
+/// `r190_11_dispatch_parity_tests` require the handler of every `wired`
+/// syscall to call the hook, and treat every `absent` syscall exactly like a
+/// [`FEATURE_ABSENT_HOOKS`] syscall: no dispatch arm, or a known fixed-errno
+/// stub. Giving an absent syscall an arm requires moving it to `wired`, which
+/// requires its handler to call the hook.
+pub const PARTIALLY_WIRED_HOOKS: &[PartiallyWiredHook] = &[PartiallyWiredHook {
+    hook: "hook_ptrace",
+    wired: &[274],
+    absent: &[101, 310, 311, 312, 438],
+    reason: "get_robust_list (274) checks cross-group reads; no ptrace/process_vm_readv/\
+             process_vm_writev/kcmp/pidfd_getfd arm",
+}];
 
 // ============================================================================
 // Context Provider Callbacks
@@ -427,6 +464,10 @@ pub struct ProcessCtx {
     pub cap: Option<CapId>,
 }
 
+/// R192-5 FIX: a task is running but its LSM subject cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingSubject;
+
 impl ProcessCtx {
     /// Create a process context from current process state.
     pub fn from_current() -> Option<Self> {
@@ -442,6 +483,20 @@ impl ProcessCtx {
             egid: creds.egid,
             cap: None,
         })
+    }
+
+    /// R192-5 FIX: the subject for a MAC check that may also run in kernel
+    /// context. `Ok(None)` means no current task (a kernel thread or early
+    /// boot), which is not a MAC subject. `Err(MissingSubject)` means a task is
+    /// running but its credentials cannot be read (a writer holds them, or its
+    /// process-table slot is already gone), and the caller must fail closed
+    /// rather than skip the hook. Syscall paths,
+    /// which always have a task, use `from_current().ok_or(..)` directly.
+    pub fn current_task() -> Result<Option<Self>, MissingSubject> {
+        if current_pid().is_none() {
+            return Ok(None);
+        }
+        Self::from_current().map(Some).ok_or(MissingSubject)
     }
 
     /// Create a process context with explicit values.
@@ -1681,7 +1736,10 @@ pub fn hook_signal_send(task: &ProcessCtx, ctx: &SignalCtx) -> LsmResult {
     }
 }
 
-/// Hook: ptrace operation.
+/// Hook: ptrace access to another task (Linux `security_ptrace_access_check`).
+/// `op` is a [`ptrace_op`] mode. R191-3: `get_robust_list` calls it for a
+/// target outside the caller's thread group once the DAC check passed; the
+/// family's other syscalls are fenced by [`PARTIALLY_WIRED_HOOKS`].
 #[inline]
 pub fn hook_ptrace(tracer: &ProcessCtx, target: &ProcessCtx, op: u32) -> LsmResult {
     #[cfg(feature = "lsm")]

@@ -62,6 +62,7 @@ while IFS= read -r leg; do
         report_fail "missing oracle leg: $leg"
     fi
 done <<'LEGS'
+R192 identity map: user address spaces carry none; the low 4 GiB faults, maps and grows like free memory; user buffers still copy
 mremap grow-in-place + shrink
 mremap MREMAP_MAYMOVE relocation
 mremap fail-closed shape matrix
@@ -69,6 +70,9 @@ mremap on a PROT_NONE reservation
 mremap charge symmetry
 MAP_SHARED|MAP_ANONYMOUS fork visibility + mremap boundary
 shared-anon cross-page usercopy first touch
+shared-anon PTE-only preflight accepts lazy buffer
+lazy shared buffers pass the getrandom, pipe2, fstat, rt_sigprocmask and futex preflights; read-only, PROT_NONE and unmapped buffers stay EFAULT
+the syscall preflight maps frames a fork child filled and keeps the words in front of the buffers
 shared-anon adjacent private PT lifetime
 waitid argument contract, WNOWAIT survival, EFAULT-before-reap, P_ALL
 root-init adopts an orphaned grandchild and can reap it
@@ -92,12 +96,20 @@ futex PI: CMP_REQUEUE_PI wakes one waiter as owner and requeues one that is late
 futex PI: LOCK_PI and UNLOCK_PI update a copy-on-write word after a fork
 futex PI: a handler signal does not end LOCK_PI, which returns 0 owning the lock
 futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED
+futex PI: a word naming a task of another address space is EPERM for LOCK_PI and CMP_REQUEUE_PI; a CLONE_VM owner still attaches
 /proc/schedstat reports per-CPU switches and migrations and the RCU backlog
+KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"
+fi
+# LEAD-KPTI-PML4-1: the mirror resyncs a KPTI user root that diverged from its
+# kernel root and says so; on a correct kernel that never happens (a ring-3
+# fault that built tables in the user root only would show up here).
+if grep -q 'KPTI user root .* diverged' "$serial"; then
+    report_fail "a KPTI user root diverged from its kernel root"
 fi
 if ! grep -Eq '^  Results: [0-9]+ passed, 0 failed$' "$serial"; then
     report_fail "missing or non-zero 'Results: N passed, 0 failed' summary"
@@ -106,12 +118,13 @@ if ! grep -Eq '^Process 1 terminated with exit code 0$' "$serial"; then
     report_fail "PID 1 did not exit 0"
 fi
 
-# 4. The preflight probe is an explicit boundary oracle. Exactly one current
-# SKIP or future PASS is required so removing the probe cannot go unnoticed.
-preflight_skip=$(grep -cF '[SKIP] shared-anon PTE-only preflight remains pending' "$serial" || true)
+# 4. ST-K2-P2a: the syscall preflight resolves a lazy shared buffer. Exactly
+# one PASS (getrandom returned the full page) and no leftover SKIP from the
+# pre-repair probe, so a duplicated or reverted probe cannot go unnoticed.
+preflight_skip=$(grep -cF '[SKIP] shared-anon PTE-only preflight' "$serial" || true)
 preflight_pass=$(grep -cF '[PASS] shared-anon PTE-only preflight accepts lazy buffer' "$serial" || true)
-if [ $((preflight_skip + preflight_pass)) -ne 1 ]; then
-    report_fail "expected exactly one PTE-only preflight SKIP/PASS marker, saw skip=$preflight_skip pass=$preflight_pass"
+if [ "$preflight_pass" -ne 1 ] || [ "$preflight_skip" -ne 0 ]; then
+    report_fail "expected exactly one lazy-buffer preflight PASS and no SKIP, saw pass=$preflight_pass skip=$preflight_skip"
 fi
 
 # 5. Force exactly one shared Busy return from a guarded usercopy fault. This

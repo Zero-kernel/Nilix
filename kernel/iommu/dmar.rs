@@ -534,7 +534,9 @@ pub fn parse_dmar_table(rsdp_phys: u64) -> Result<DmarTable, DmarError> {
 /// possible. EVERY read of a firmware-controlled ACPI address goes through this
 /// so a malformed/out-of-range table can never fault the kernel or be blindly
 /// dereferenced. `None` for an address the firmware CLAIMS exists is the
-/// caller's signal to fail CLOSED (`InvalidStructure`).
+/// caller's signal to fail CLOSED (`InvalidStructure`). R191-4: as in
+/// `mm::read_firmware_bytes`, an address below 1 GiB is not checked against
+/// the UEFI firmware ranges (firmware input at boot, never user-reachable).
 fn phys_window(phys: u64, len: usize) -> Option<*const u8> {
     if phys == 0 {
         return None;

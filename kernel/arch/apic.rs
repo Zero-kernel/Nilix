@@ -1236,6 +1236,8 @@ pub unsafe fn init() {
     init_lapic();
     // I/O APIC init is optional for now - we still use 8259 PIC
     // init_ioapic();
+    // D0-ISO-1: IOAPIC_BASE is an identity address, absent from user address
+    // spaces; map it with `mm::map_mmio` before this path is ever enabled.
 }
 
 /// Print APIC status information

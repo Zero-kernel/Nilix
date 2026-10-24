@@ -86,11 +86,19 @@ const SI_USER: u32 = 0;
 /// The red zone skipped below the interrupted RSP (SysV AMD64 §3.2.2).
 const RED_ZONE: u64 = 128;
 
-/// RFLAGS sanitize mask: identical to the SYSRET path's `rflags_user_mask`
-/// (`arch/syscall.rs`), ADDITIONALLY clearing TF (0x100) and DF (0x400). The SYSRET
-/// mask keeps DF/TF; a freshly-entered SysV handler requires DF=0, and TF must never
-/// be force-set into a handler. IF (0x200) is always forced on.
-const RFLAGS_SANITIZE_AND: u64 = 0xFFFF_FFFF_FFE2_CFFF & !0x100 & !0x400;
+/// R192-6 FIX (D5-ARC-1): the RFLAGS bits no user context carries back to
+/// Ring 3: IOPL(12-13), NT(14), RF(16), VM(17), AC(18), VIF(19), VIP(20). The
+/// literal this replaces (`~0x1D3000`) cleared AC but kept NT and VM, contrary
+/// to its own comment. Must equal `arch::syscall::RFLAGS_USER_CLEAR`, which the
+/// kernel crate asserts (this crate does not depend on `arch`).
+pub const RFLAGS_USER_CLEAR: u64 =
+    (0b11 << 12) | (1 << 14) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+
+/// RFLAGS sanitize mask: the SYSRET path's clear set (`RFLAGS_USER_CLEAR`),
+/// ADDITIONALLY clearing TF (0x100) and DF (0x400). The SYSRET mask keeps DF/TF; a
+/// freshly-entered SysV handler requires DF=0, and TF must never be force-set into
+/// a handler. IF (0x200) is always forced on.
+const RFLAGS_SANITIZE_AND: u64 = !RFLAGS_USER_CLEAR & !0x100 & !0x400;
 const RFLAGS_IF: u64 = 0x200;
 /// Flags that are never valid at the first instruction of a SysV signal handler.
 pub const HANDLER_ENTRY_FORBIDDEN_RFLAGS: u64 = (1u64 << 8) | (1u64 << 10); // TF | DF
@@ -367,7 +375,7 @@ pub fn is_canonical_user_addr(addr: u64) -> bool {
 }
 
 /// Sanitize a user-provided RFLAGS for resumption: clear all privileged/dangerous
-/// bits (IOPL/NT/RF/VM/VIF/VIP via the SYSRET mask, plus TF and DF) and force IF on.
+/// bits (IOPL/NT/RF/VM/AC/VIF/VIP via the SYSRET clear set, plus TF and DF) and force IF on.
 /// Both syscall-return and IRQ-return signal delivery MUST use this helper so
 /// handler-entry flags cannot diverge between the two paths.
 #[inline]
@@ -610,6 +618,24 @@ fn selftest_mxcsr_and_rflags() {
     assert_eq!(clean & 0x400, 0, "DF must be cleared");
     assert_eq!(clean & 0x3000, 0, "IOPL must be cleared");
     assert_eq!(clean & 0x1, 0x1, "user CF preserved");
+    // R192-6: NT, RF, VM, AC, VIF and VIP are cleared too (the old mask kept NT/VM).
+    for (bit, name) in [
+        (14, "NT"),
+        (16, "RF"),
+        (17, "VM"),
+        (18, "AC"),
+        (19, "VIF"),
+        (20, "VIP"),
+    ] {
+        let flag = 1u64 << bit;
+        assert_eq!(
+            sanitize_user_rflags(flag) & flag,
+            0,
+            "{} must be cleared",
+            name
+        );
+    }
+    assert_eq!(RFLAGS_USER_CLEAR, 0x1F_7000, "documented clear set");
     assert!(
         is_safe_handler_entry_rflags(clean),
         "sanitized handler-entry flags must pass the shared safety predicate"

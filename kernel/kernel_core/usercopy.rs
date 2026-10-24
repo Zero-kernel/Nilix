@@ -671,6 +671,31 @@ fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
     validate_user_range(ptr, len) && is_aligned(ptr, align)
 }
 
+/// R192-1 FIX (D0-ISO-1): may the kernel access the user page holding `addr`
+/// on the caller's behalf?
+///
+/// The range checks above admit any lower-half address. User address spaces
+/// used to hold the boot identity map of physical 0-4 GiB there as
+/// supervisor-only entries (gone since D0-ISO-1 Approach A; the check stays as
+/// defense in depth), which ring 0 reads and writes whatever their U/S
+/// bit (SMAP only guards U/S=1 pages, and the access guard sets AC anyway).
+/// Every helper below therefore checks each page before its first byte: a
+/// kernel-owned page is refused (EFAULT), a page that is not present is left to
+/// the #PF path, and a write to a present user page that is neither writable
+/// nor copy-on-write is refused as its protection fault would be.
+#[inline]
+fn user_page_permits(addr: usize, write: bool) -> bool {
+    use mm::page_table::UserPageAccess;
+    match mm::page_table::user_page_access(x86_64::VirtAddr::new_truncate(addr as u64)) {
+        UserPageAccess::NotPresent => true,
+        UserPageAccess::User {
+            writable,
+            copy_on_write,
+        } => !write || writable || copy_on_write,
+        UserPageAccess::Kernel => false,
+    }
+}
+
 // ============================================================================
 // R102-I4 FIX: UserAddr — Provenance-Safe User-Space Address Wrapper
 // ============================================================================
@@ -824,6 +849,9 @@ fn read_user_u32_atomic_inner(src: UserAddr, nofault: bool) -> Result<u32, ()> {
     }
 
     let _smap_guard = UserAccessGuard::new();
+    if !user_page_permits(addr, false) {
+        return Err(());
+    }
     let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
     USER_COPY_STATE.with(|s| {
         s.remaining
@@ -858,6 +886,9 @@ pub fn read_user_u64_atomic(src: UserAddr) -> Result<u64, ()> {
     }
 
     let _smap_guard = UserAccessGuard::new();
+    if !user_page_permits(addr, false) {
+        return Err(());
+    }
     let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u64>());
     USER_COPY_STATE.with(|s| {
         s.remaining
@@ -911,6 +942,9 @@ fn compare_exchange_user_u32_inner(
     }
 
     let _smap_guard = UserAccessGuard::new();
+    if !user_page_permits(addr, true) {
+        return Err(());
+    }
     let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
     USER_COPY_STATE.with(|s| {
         s.remaining
@@ -926,6 +960,32 @@ fn compare_exchange_user_u32_inner(
         Err(())
     } else {
         Ok(observed as u32 == expected)
+    }
+}
+
+/// ST-K2-P2a: make the user page holding `addr` present for a later read or,
+/// with `write`, write access, without changing its contents.
+///
+/// One guarded access to the page's first word goes through the ordinary #PF
+/// path, which demand-installs a shared-anonymous page or breaks copy-on-write
+/// exactly as it would for the caller's own copy; a fault it cannot resolve
+/// returns `Err(())` through the exception table. A write uses
+/// `lock cmpxchg` of 0 with 0 (as `fault_in_word` in the futex code does): it
+/// needs write permission like any store, stores back the value it read, and is
+/// atomic against concurrent user writers. The word is in the same page as
+/// `addr`, so the same mapping and permissions govern it.
+///
+/// The caller must hold no lock that fault resolution takes (`PROCESS_TABLE`,
+/// the current PCB, `MmState`, a shared region's slots, `PT_LOCK`, the buddy
+/// allocator, a cgroup charge): a contended resolution is retried until it
+/// succeeds, so a lock held on this CPU would never be released.
+pub fn fault_in_user_page(addr: UserAddr, write: bool) -> Result<(), ()> {
+    debug_assert_ne!(mm::pt_lock_owner_cpu(), Some(current_cpu_id()));
+    let page = UserAddr::new(addr.as_usize() & !0xfff);
+    if write {
+        compare_exchange_user_u32(page, 0, 0).map(|_| ())
+    } else {
+        read_user_u32_atomic(page).map(|_| ())
     }
 }
 
@@ -996,6 +1056,12 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         for i in offset..chunk_end {
             // SAFETY: user range validated; dst is a kernel slice
             let user_src = (src as usize).wrapping_add(i) as *const u8;
+            // R192-1 FIX: check each page before its first byte.
+            if (i == offset || user_src as usize & 0xfff == 0)
+                && !user_page_permits(user_src as usize, false)
+            {
+                return Err(());
+            }
             unsafe { copy_byte_from_user(dst_ptr.add(i), user_src) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
@@ -1056,6 +1122,12 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         // R102-I4 FIX: Use integer arithmetic for user pointer (dst) offset.
         for i in offset..chunk_end {
             let user_dst = (dst as usize).wrapping_add(i) as *mut u8;
+            // R192-1 FIX: check each page before its first byte.
+            if (i == offset || user_dst as usize & 0xfff == 0)
+                && !user_page_permits(user_dst as usize, true)
+            {
+                return Err(());
+            }
             unsafe { write_byte_to_user(user_dst, src[i]) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
@@ -1226,6 +1298,10 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
                     Some(addr) if addr < USER_SPACE_TOP => addr,
                     _ => return Err(()),
                 };
+                // R192-1 FIX: check each page before its first byte.
+                if (i == offset || byte_addr & 0xfff == 0) && !user_page_permits(byte_addr, false) {
+                    return Err(());
+                }
 
                 // H-26 FIX: Read using exception-safe helper
                 let mut byte = 0u8;
@@ -1709,6 +1785,10 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
                 Some(addr) if addr < USER_SPACE_TOP => addr,
                 _ => return Err(UsercopyError),
             };
+            // R192-1 FIX: check each page before its first byte.
+            if (i == offset || byte_addr & 0xfff == 0) && !user_page_permits(byte_addr, false) {
+                return Err(UsercopyError);
+            }
 
             // H-26 FIX: Read using exception-safe helper
             unsafe { copy_byte_from_user(dst_ptr.add(i), byte_addr as *const u8) }

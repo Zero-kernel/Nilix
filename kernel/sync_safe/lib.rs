@@ -4,6 +4,9 @@
 //
 // Defense-in-Depth Layer 2: Runtime Detection
 // Part of R173 defense strategy to prevent IRQ-context deadlocks
+//
+// R192-8: dormant. No kernel crate depends on this crate, so the check below
+// never runs in a built kernel; see README.md for why it was not wired in.
 
 #![no_std]
 

@@ -902,5 +902,7 @@ fn map_error_to_hardening(err: MapError) -> HardeningError {
         MapError::PageAlreadyMapped => HardeningError::InconsistentTopology,
         // R32-MM-2 FIX: Handle InvalidRange error from overflow-checked page table operations
         MapError::InvalidRange => HardeningError::InvalidAddress,
+        // R192-2: hardening never maps into the lower half through `map_page`.
+        MapError::KernelOwned => HardeningError::InconsistentTopology,
     }
 }

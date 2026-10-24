@@ -14,7 +14,8 @@ use userspace::libc::{print, print_hex, print_int, println};
 use userspace::syscall::{
     errno, is_error, sys_close, sys_fork, sys_getpid, sys_getppid, sys_getrandom, sys_gettid,
     sys_open, sys_read, sys_set_robust_list, sys_set_tid_address, sys_wait, syscall1, syscall2,
-    syscall3, syscall4, syscall5, syscall6, SYS_MMAP, SYS_MREMAP, SYS_MUNMAP,
+    syscall3, syscall4, syscall5, syscall6, SYS_BRK, SYS_FSTAT, SYS_MMAP, SYS_MREMAP, SYS_MUNMAP,
+    SYS_READ, SYS_WRITE,
 };
 
 /// One 4 KiB page — the granularity of every mapping operation below.
@@ -180,6 +181,10 @@ pub extern "C" fn _start() -> ! {
     // Test 4: getrandom
     test_getrandom(&mut results);
 
+    // R192-1/R192-2: the supervisor identity map in the user half. First of
+    // the memory legs: it relies on an unused mmap window and an untouched heap.
+    test_identity_map_boundary(&mut results);
+
     // ST-K2-MREMAP / ST-K2-P2: anonymous memory resize and shared-anonymous
     // behavior. These run last because they fork and consume address space.
     test_mremap_resize(&mut results);
@@ -188,8 +193,13 @@ pub extern "C" fn _start() -> ! {
     test_mremap_prot_none(&mut results);
     test_mremap_charge_symmetry(&mut results);
     test_shared_anon_fork(&mut results);
+    // The boot-armed one-shot forced Busy goes to the first guarded usercopy
+    // that takes a shared fault, and the preflight probes below are guarded
+    // accesses too: keep the uname leg the first to fault a shared page.
     test_shared_anon_usercopy(&mut results);
     test_shared_anon_pte_preflight(&mut results);
+    test_shared_anon_lazy_preflight_shapes(&mut results);
+    test_shared_anon_preflight_preserves_contents(&mut results);
     test_shared_anon_adjacent_pt(&mut results);
     test_shared_anon_migration(&mut results);
 
@@ -252,6 +262,10 @@ pub extern "C" fn _start() -> ! {
     // GAP-6: the scheduler/RCU counters pressure runs retain.
     test_proc_schedstat(&mut results);
 
+    // LEAD-KPTI-PML4-1: last, because its hinted mappings move the automatic
+    // mmap base past 1 TiB.
+    test_kpti_fresh_pml4_slots(&mut results);
+
     // Print summary
     println("");
     println("================================");
@@ -267,6 +281,286 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         userspace::syscall::sys_exit(exit_code);
     }
+}
+
+/// R192-1: addresses in the supervisor-only identity map of physical 0-4 GiB
+/// that every user address space used to carry; the R192 audit's guest probe
+/// read all eight through `write(pipe, addr, 8)`. D0-ISO-1 Approach A removed
+/// that map from user address spaces, so they are unmapped user addresses now.
+const R192_IDMAP_ADDRS: [usize; 8] = [
+    0x1_0000,
+    0x10_0000,
+    0x20_0000,
+    0x60_0000,
+    0x80_0000,
+    0x100_0000,
+    0x4000_0000,
+    0x8000_0000,
+];
+/// Legacy VGA text memory, once a writable supervisor identity page. A
+/// regressed kernel would write the probe's 8 bytes there, which is harmless.
+const R192_VGA_TEXT: usize = 0xB_8000;
+/// The ELF window. The heap starts in it; the identity map's supervisor 2 MiB
+/// leaves used to follow it and stop the heap at its end.
+const R192_ELF_WINDOW_END: usize = 0x60_0000;
+/// A free hint above the identity map (4 GiB) and below the randomized
+/// automatic mmap base (at least 64 GiB), so the PROT_NONE mapping never
+/// advances `next_mmap_addr` (a hint past it moves every later automatic
+/// mapping; LEAD-KPTI-PML4-1 has its own leg, run last).
+const R192_FREE_HINT: usize = 0x8_0000_0000;
+
+/// R192-1/R192-2, D0-ISO-1 Approach A: the identity map is gone from user
+/// address spaces. Its old addresses fault in usercopy, and the low 4 GiB maps
+/// and grows like any free range, while ordinary user buffers keep working.
+fn test_identity_map_boundary(results: &mut TestResult) {
+    let name = "R192 identity map: user address spaces carry none; the low 4 GiB faults, maps and grows like free memory; user buffers still copy";
+    match unsafe { identity_map_boundary() } {
+        Ok(()) => results.pass(name),
+        Err(reason) => {
+            print("  identity-map leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+unsafe fn identity_map_boundary() -> Result<(), &'static str> {
+    let mut fds = [-1i32; 2];
+    if syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, 0) != 0 {
+        return Err("pipe2");
+    }
+    let result = identity_map_copies(fds[0] as u64, fds[1] as u64);
+    for fd in fds {
+        let _ = sys_close(fd as u64);
+    }
+    result?;
+    identity_map_mappings()?;
+    identity_map_brk()
+}
+
+/// The kernel copying from (`write`) and into (`read`) user memory.
+unsafe fn identity_map_copies(read_fd: u64, write_fd: u64) -> Result<(), &'static str> {
+    let control = *b"r192-ok!";
+    let mut buf = [0u8; 8];
+    if syscall3(SYS_WRITE, write_fd, control.as_ptr() as u64, 8) != 8 {
+        return Err("control write");
+    }
+    if syscall3(SYS_READ, read_fd, buf.as_mut_ptr() as u64, 8) != 8 || buf != control {
+        return Err("control read");
+    }
+    for addr in R192_IDMAP_ADDRS {
+        if err_of(syscall3(SYS_WRITE, write_fd, addr as u64, 8) as i64) != EFAULT {
+            return Err("write(pipe, identity-map address) was not EFAULT");
+        }
+    }
+    // Queue bytes so the read below returns at once, then aim it at VGA text.
+    if syscall3(SYS_WRITE, write_fd, control.as_ptr() as u64, 8) != 8 {
+        return Err("second control write");
+    }
+    if err_of(syscall3(SYS_READ, read_fd, R192_VGA_TEXT as u64, 8) as i64) != EFAULT {
+        return Err("read(pipe, VGA text) was not EFAULT");
+    }
+    if err_of(sys_getrandom(0x10_0000 as *mut u8, 8, 0) as i64) != EFAULT {
+        return Err("getrandom(identity-map address) was not EFAULT");
+    }
+    Ok(())
+}
+
+/// Where the identity map was (the framebuffer at 2 GiB, low RAM at 1 MiB,
+/// the leaves above the ELF window), user mappings now come and go: munmap of
+/// such a range tears down only this process's pages, and the kernel and its
+/// console keep running.
+unsafe fn identity_map_mappings() -> Result<(), &'static str> {
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    for (addr, len) in [
+        (0x8000_0000usize, 0x20_0000usize),
+        (0x10_0000, PAGE),
+        (0x60_0000, PAGE),
+    ] {
+        let got = syscall6(
+            SYS_MMAP,
+            addr as u64,
+            len as u64,
+            PROT_READ | PROT_WRITE,
+            flags,
+            u64::MAX,
+            0,
+        );
+        if got != addr as u64 {
+            return Err("mmap where the identity map was");
+        }
+        fill_pattern(addr, PAGE);
+        if !pattern_holds(addr, PAGE) {
+            return Err("a low mapping lost its pattern");
+        }
+        if munmap(addr, len) != 0 {
+            return Err("munmap where the identity map was");
+        }
+    }
+    let got = syscall6(
+        SYS_MMAP,
+        R192_FREE_HINT as u64,
+        PAGE as u64,
+        PROT_NONE,
+        flags,
+        u64::MAX,
+        0,
+    );
+    if got != R192_FREE_HINT as u64 {
+        return Err("hinted PROT_NONE mmap in the mmap window");
+    }
+    if munmap(R192_FREE_HINT, PAGE) != 0 {
+        return Err("munmap of the hinted mapping");
+    }
+    Ok(())
+}
+
+/// The heap starts in the ELF window and now grows past it, where the
+/// identity map's supervisor leaves used to stop it.
+unsafe fn identity_map_brk() -> Result<(), &'static str> {
+    let start = syscall1(SYS_BRK, 0) as usize;
+    if !(0x40_0000..R192_ELF_WINDOW_END).contains(&start) {
+        return Err("the heap does not start in the ELF window");
+    }
+    let past = R192_ELF_WINDOW_END + PAGE;
+    if syscall1(SYS_BRK, past as u64) as usize != past {
+        return Err("brk past the ELF window");
+    }
+    core::ptr::write_volatile(R192_ELF_WINDOW_END as *mut u8, 0x5a);
+    if core::ptr::read_volatile(R192_ELF_WINDOW_END as *const u8) != 0x5a {
+        return Err("the heap page past the ELF window");
+    }
+    if syscall1(SYS_BRK, start as u64) as usize != start {
+        return Err("brk shrink back");
+    }
+    Ok(())
+}
+
+/// LEAD-KPTI-PML4-1: one fresh 512 GiB slot per path that maps user memory.
+/// Each mapping needs a PML4 entry that the KPTI user root, copied when exec
+/// built the address space, did not have; ring 3 used to fault on it (err=0x6).
+const KPTI_SLOT_PRIVATE: usize = 0x100_0000_0000; // PML4[2]
+const KPTI_SLOT_MPROTECT: usize = 0x180_0000_0000; // PML4[3]
+const KPTI_SLOT_SHARED: usize = 0x200_0000_0000; // PML4[4]
+const KPTI_SLOT_READ_FIRST: usize = 0x280_0000_0000; // PML4[5]
+const KPTI_MPROTECT_WORD: u64 = 0x4B50_5449_4D50_524F;
+const KPTI_SHARED_WORD: u64 = 0x4B50_5449_5348_4152;
+const KPTI_CHILD_WORD: u64 = 0x4B50_5449_4348_4C44;
+
+fn test_kpti_fresh_pml4_slots(results: &mut TestResult) {
+    print("Testing mappings in fresh PML4 slots under KPTI... ");
+    let name = "KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them";
+    match unsafe { kpti_fresh_pml4_slots() } {
+        Ok(()) => results.pass(name),
+        Err(reason) => {
+            print("  KPTI leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+/// `mmap` at exactly `addr` (a hint the kernel must honour: the slot is free).
+unsafe fn mmap_at(addr: usize, len: usize, prot: u64, flags: u64) -> bool {
+    syscall6(SYS_MMAP, addr as u64, len as u64, prot, flags, u64::MAX, 0) == addr as u64
+}
+
+unsafe fn kpti_fresh_pml4_slots() -> Result<(), &'static str> {
+    let rw = PROT_READ | PROT_WRITE;
+    let private = MAP_PRIVATE | MAP_ANONYMOUS;
+    // mmap populates a private mapping in syscall context, on the kernel root.
+    if !mmap_at(KPTI_SLOT_PRIVATE, 2 * PAGE, rw, private) {
+        return Err("hinted private mmap in a fresh slot");
+    }
+    fill_pattern(KPTI_SLOT_PRIVATE, 2 * PAGE);
+    if !pattern_holds(KPTI_SLOT_PRIVATE, 2 * PAGE) {
+        return Err("private slot lost its pattern");
+    }
+    // PROT_NONE installs no table; mprotect populates the slot later.
+    if !mmap_at(KPTI_SLOT_MPROTECT, PAGE, PROT_NONE, private) {
+        return Err("hinted PROT_NONE mmap in a fresh slot");
+    }
+    if syscall3(SYS_MPROTECT, KPTI_SLOT_MPROTECT as u64, PAGE as u64, rw) != 0 {
+        return Err("mprotect of the PROT_NONE slot");
+    }
+    core::ptr::write_volatile(KPTI_SLOT_MPROTECT as *mut u64, KPTI_MPROTECT_WORD);
+    // A shared mapping installs nothing until ring 3 touches it: that fault
+    // runs on the user root and must still build the kernel root's tables.
+    if !mmap_at(KPTI_SLOT_SHARED, PAGE, rw, MAP_SHARED | MAP_ANONYMOUS) {
+        return Err("hinted shared mmap in a fresh slot");
+    }
+    core::ptr::write_volatile(KPTI_SLOT_SHARED as *mut u64, KPTI_SHARED_WORD);
+    kpti_kernel_copies()?;
+    // A read-only page creates the slot's tables; a writable page beside it
+    // must not need their PML4 entry changed (it is created final, P|W|U).
+    if !mmap_at(KPTI_SLOT_READ_FIRST, PAGE, PROT_READ, private)
+        || !mmap_at(KPTI_SLOT_READ_FIRST + PAGE, PAGE, rw, private)
+    {
+        return Err("read-only then writable mmap in a fresh slot");
+    }
+    if core::ptr::read_volatile(KPTI_SLOT_READ_FIRST as *const u64) != 0 {
+        return Err("a fresh read-only page is not zero");
+    }
+    core::ptr::write_volatile((KPTI_SLOT_READ_FIRST + PAGE) as *mut u64, KPTI_CHILD_WORD);
+
+    let child = sys_fork();
+    if is_error(child) {
+        return Err("fork");
+    }
+    if child == 0 {
+        let seen = pattern_holds(KPTI_SLOT_PRIVATE, 2 * PAGE)
+            && core::ptr::read_volatile(KPTI_SLOT_MPROTECT as *const u64) == KPTI_MPROTECT_WORD
+            && core::ptr::read_volatile(KPTI_SLOT_SHARED as *const u64) == KPTI_SHARED_WORD;
+        // A copy-on-write break in the private slot, and a shared write back.
+        core::ptr::write_volatile(KPTI_SLOT_PRIVATE as *mut u64, KPTI_CHILD_WORD);
+        core::ptr::write_volatile((KPTI_SLOT_SHARED + 16) as *mut u64, KPTI_CHILD_WORD);
+        userspace::syscall::sys_exit(if seen { 0 } else { 1 });
+    }
+    let mut status: i32 = 0;
+    let waited = sys_wait(&mut status as *mut i32);
+    if is_error(waited) || waited != child || status != 0 {
+        return Err("the fork child did not see all three slots");
+    }
+    if !pattern_holds(KPTI_SLOT_PRIVATE, 2 * PAGE) {
+        return Err("the child's write reached the parent's private slot");
+    }
+    if core::ptr::read_volatile((KPTI_SLOT_SHARED + 16) as *const u64) != KPTI_CHILD_WORD {
+        return Err("the child's shared write is not visible");
+    }
+    for (addr, len) in [
+        (KPTI_SLOT_PRIVATE, 2 * PAGE),
+        (KPTI_SLOT_MPROTECT, PAGE),
+        (KPTI_SLOT_SHARED, PAGE),
+        // Two mappings, so two calls: munmap takes one whole mapping.
+        (KPTI_SLOT_READ_FIRST, PAGE),
+        (KPTI_SLOT_READ_FIRST + PAGE, PAGE),
+    ] {
+        if munmap(addr, len) != 0 {
+            return Err("munmap of a fresh-slot mapping");
+        }
+    }
+    Ok(())
+}
+
+/// The kernel reads and writes the shared slot through its own root.
+unsafe fn kpti_kernel_copies() -> Result<(), &'static str> {
+    let mut fds = [-1i32; 2];
+    if syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, 0) != 0 {
+        return Err("pipe2");
+    }
+    let (read_fd, write_fd) = (fds[0] as u64, fds[1] as u64);
+    let copied = syscall3(SYS_WRITE, write_fd, KPTI_SLOT_SHARED as u64, 8) == 8
+        && syscall3(SYS_READ, read_fd, (KPTI_SLOT_SHARED + 8) as u64, 8) == 8;
+    for fd in fds {
+        let _ = sys_close(fd as u64);
+    }
+    if !copied {
+        return Err("write/read through the shared slot");
+    }
+    if core::ptr::read_volatile((KPTI_SLOT_SHARED + 8) as *const u64) != KPTI_SHARED_WORD {
+        return Err("the kernel's copy into the shared slot is missing");
+    }
+    Ok(())
 }
 
 /// Test gettid syscall
@@ -745,11 +1039,12 @@ fn test_shared_anon_usercopy(results: &mut TestResult) {
     }
 }
 
-/// Syscalls that call `verify_user_memory` still reject a fresh lazy shared page.
-/// Keep this as an explicit qualified probe: direct usercopy first-touch is a
-/// separate path and must not be mistaken for a preflight fix.
+/// ST-K2-P2a: a syscall whose preflight walks the page tables
+/// (`verify_user_memory`) accepts a fresh, never-touched shared page: the
+/// preflight resolves the demand fault the way the following usercopy would.
+/// `getrandom` must return exactly the requested byte count and fill the page.
 fn test_shared_anon_pte_preflight(results: &mut TestResult) {
-    print("Testing shared-anon PTE-only syscall preflight... ");
+    print("Testing shared-anon lazy buffer syscall preflight... ");
     unsafe {
         let base = mmap_anon(PAGE, true);
         if base < 0 {
@@ -758,24 +1053,262 @@ fn test_shared_anon_pte_preflight(results: &mut TestResult) {
         }
         let base = base as usize;
         let result = sys_getrandom(base as *mut u8, PAGE, 0);
-        let observed = err_of(result as i64);
+        let filled = result == PAGE as u64
+            && (0..PAGE).any(|i| core::ptr::read_volatile((base + i) as *const u8) != 0);
         let released = munmap(base, PAGE) == 0;
         if !released {
             results.fail("shared preflight: munmap failed");
-            return;
-        }
-        if observed == EFAULT {
-            print("observed EFAULT ");
-            results.skip("shared-anon PTE-only preflight remains pending");
-        } else if result == PAGE as u64 {
+        } else if filled {
             results.pass("shared-anon PTE-only preflight accepts lazy buffer");
         } else {
-            print("errno=");
-            print_int(observed as i64);
+            print("result=");
+            print_int(result as i64);
             print(" ");
-            results.fail("shared preflight: unexpected errno");
+            results.fail("shared preflight: lazy buffer rejected or not filled");
         }
     }
+}
+
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SYS_PIPE2: u64 = 293;
+
+/// `rt_sigprocmask(how, set, oldset, 8)`: 0, or a negative errno.
+unsafe fn sigprocmask(how: u64, set: u64, oldset: u64) -> i64 {
+    syscall4(SYS_RT_SIGPROCMASK, how, set, oldset, 8) as i64
+}
+/// `st_mode` offset in the x86-64 `struct stat` (after dev, ino, nlink).
+const STAT_MODE_OFFSET: usize = 24;
+const S_IFMT: u32 = 0o170000;
+const S_IFIFO: u32 = 0o010000;
+
+/// ST-K2-P2a: the other preflight shapes on fresh shared pages, and the
+/// buffers that must stay EFAULT.
+fn test_shared_anon_lazy_preflight_shapes(results: &mut TestResult) {
+    print("Testing lazy-buffer preflight shapes... ");
+    match unsafe { lazy_preflight_shapes() } {
+        Ok(()) => results.pass(
+            "lazy shared buffers pass the getrandom, pipe2, fstat, rt_sigprocmask and futex preflights; read-only, PROT_NONE and unmapped buffers stay EFAULT",
+        ),
+        Err(why) => {
+            print(why);
+            print(" ");
+            results.fail("lazy-buffer preflight shapes");
+        }
+    }
+}
+
+unsafe fn lazy_preflight_shapes() -> Result<(), &'static str> {
+    // Six fresh pages: a pair for the cross-page case, then one per caller.
+    let base = mmap_anon(6 * PAGE, true);
+    if base < 0 {
+        return Err("mmap failed");
+    }
+    let base = base as usize;
+    let accepted = lazy_preflight_accepts(base);
+    if munmap(base, 6 * PAGE) != 0 {
+        return Err("munmap failed");
+    }
+    accepted?;
+    lazy_preflight_denies()
+}
+
+/// Write intent across a page edge (`getrandom`), into an fd pair (`pipe2`),
+/// a stat buffer (`fstat`) and an old signal mask (`rt_sigprocmask`); read
+/// intent on a futex word (`FUTEX_WAKE`, whose callback checks the word's PTE
+/// again). Every page starts untouched.
+unsafe fn lazy_preflight_accepts(base: usize) -> Result<(), &'static str> {
+    let byte = |addr: usize| core::ptr::read_volatile(addr as *const u8);
+    let edge = base + PAGE - 8;
+    if sys_getrandom(edge as *mut u8, 16, 0) != 16 {
+        return Err("cross-page getrandom");
+    }
+    if byte(edge - 1) != 0 || byte(edge + 16) != 0 || (0..16).all(|i| byte(edge + i) == 0) {
+        return Err("cross-page getrandom bytes");
+    }
+
+    let fds = base + 2 * PAGE;
+    if syscall2(SYS_PIPE2, fds as u64, 0) != 0 {
+        return Err("pipe2");
+    }
+    let read_fd = core::ptr::read_volatile(fds as *const i32);
+    let write_fd = core::ptr::read_volatile((fds + 4) as *const i32);
+    let mut result = Ok(());
+    if read_fd < 0 || write_fd < 0 || read_fd == write_fd {
+        result = Err("pipe2 descriptors");
+    } else {
+        let stat = base + 3 * PAGE;
+        if syscall2(SYS_FSTAT, read_fd as u64, stat as u64) != 0 {
+            result = Err("fstat");
+        } else if core::ptr::read_volatile((stat + STAT_MODE_OFFSET) as *const u32) & S_IFMT
+            != S_IFIFO
+        {
+            result = Err("fstat mode");
+        }
+    }
+    for fd in [read_fd, write_fd] {
+        if fd >= 0 {
+            let _ = sys_close(fd as u64);
+        }
+    }
+    result?;
+
+    // SIG_BLOCK with no new set only reports the current mask.
+    let oldset = base + 4 * PAGE;
+    if sigprocmask(SIG_BLOCK, 0, oldset as u64) != 0 {
+        return Err("rt_sigprocmask");
+    }
+    let word = (base + 5 * PAGE) as u64;
+    let woken = syscall6(SYS_FUTEX, word, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0);
+    if woken != 0 {
+        return Err("futex wake");
+    }
+    Ok(())
+}
+
+/// A never-touched read-only shared page is denied for writing and left
+/// unchanged; a PROT_NONE reservation has nothing to resolve; an unmapped
+/// buffer stays unmapped.
+unsafe fn lazy_preflight_denies() -> Result<(), &'static str> {
+    let read_only = mmap_anon_prot(PAGE, PROT_READ, true);
+    if read_only < 0 {
+        return Err("read-only mmap");
+    }
+    let read_only = read_only as usize;
+    let denied = err_of(sys_getrandom(read_only as *mut u8, 8, 0) as i64) == EFAULT;
+    let unchanged = core::ptr::read_volatile(read_only as *const u64) == 0;
+    if munmap(read_only, PAGE) != 0 {
+        return Err("read-only munmap");
+    }
+    if !denied {
+        return Err("read-only page accepted for writing");
+    }
+    if !unchanged {
+        return Err("read-only page changed");
+    }
+
+    let reserved = mmap_anon_prot(PAGE, PROT_NONE, false);
+    if reserved < 0 {
+        return Err("PROT_NONE mmap");
+    }
+    let reserved = reserved as usize;
+    let denied = err_of(sys_getrandom(reserved as *mut u8, 8, 0) as i64) == EFAULT;
+    // The preflight fails before any change: blocking SIGUSR1 with an
+    // unusable old-mask buffer is EFAULT and leaves the mask as it was.
+    let usr1: u64 = 1 << (SIGUSR1_NR - 1);
+    let set = &usr1 as *const u64 as u64;
+    let mask_denied = err_of(sigprocmask(SIG_BLOCK, set, reserved as u64)) == EFAULT;
+    let mut mask: u64 = 0;
+    let mask_read = sigprocmask(SIG_BLOCK, 0, &mut mask as *mut u64 as u64) == 0;
+    if mask & usr1 != 0 {
+        let _ = sigprocmask(SIG_UNBLOCK, set, 0);
+    }
+    if munmap(reserved, PAGE) != 0 {
+        return Err("PROT_NONE munmap");
+    }
+    if !denied {
+        return Err("PROT_NONE page accepted");
+    }
+    if !mask_denied || !mask_read || mask & usr1 != 0 {
+        return Err("rt_sigprocmask changed the mask before its EFAULT");
+    }
+    if err_of(sys_getrandom(reserved as *mut u8, 8, 0) as i64) != EFAULT {
+        return Err("unmapped buffer accepted");
+    }
+    Ok(())
+}
+
+/// ST-K2-P2a: the preflight probe writes back what it read. A fork child fills
+/// the pages of a shared region the parent never touched, so the parent has
+/// no PTE for them. The parent's preflights (write intent for `getrandom` and
+/// `pipe2`, read intent for `FUTEX_WAKE`) probe each page's first word, in
+/// front of their buffers: they must map the child's frames and leave those
+/// words as the child wrote them.
+fn test_shared_anon_preflight_preserves_contents(results: &mut TestResult) {
+    print("Testing lazy-buffer preflight content preservation... ");
+    match unsafe { lazy_preflight_preserves() } {
+        Ok(()) => results.pass(
+            "the syscall preflight maps frames a fork child filled and keeps the words in front of the buffers",
+        ),
+        Err(why) => {
+            print(why);
+            print(" ");
+            results.fail("lazy-buffer preflight content preservation");
+        }
+    }
+}
+
+/// Written by the child at the first word of each page, plus the page index.
+/// Its low half is non-zero, so a write probe sees a mismatch.
+const PRESERVE_SENTINEL: u64 = 0x5EED_0000_A11C_E5ED;
+/// Written by the child where the parent's buffers start (offset 64).
+const PRESERVE_MARKER: u64 = 0x77;
+
+unsafe fn lazy_preflight_preserves() -> Result<(), &'static str> {
+    let base = mmap_anon(3 * PAGE, true);
+    if base < 0 {
+        return Err("mmap failed");
+    }
+    let base = base as usize;
+    let preserved = lazy_preflight_preserves_in(base);
+    if munmap(base, 3 * PAGE) != 0 {
+        return Err("munmap failed");
+    }
+    preserved
+}
+
+unsafe fn lazy_preflight_preserves_in(base: usize) -> Result<(), &'static str> {
+    let child = sys_fork();
+    if is_error(child) {
+        return Err("fork failed");
+    }
+    if child == 0 {
+        // The child's first touches create the region's frames.
+        for page in 0..3 {
+            let first = base + page * PAGE;
+            core::ptr::write_volatile(first as *mut u64, PRESERVE_SENTINEL + page as u64);
+            core::ptr::write_volatile((first + 64) as *mut u64, PRESERVE_MARKER);
+        }
+        userspace::syscall::sys_exit(0);
+    }
+    let mut status: i32 = 0;
+    let waited = sys_wait(&mut status as *mut i32);
+    if is_error(waited) || waited != child || status != 0 {
+        return Err("child was not reaped");
+    }
+
+    if sys_getrandom((base + 64) as *mut u8, 16, 0) != 16 {
+        return Err("getrandom");
+    }
+    let fds = base + PAGE + 64;
+    if syscall2(SYS_PIPE2, fds as u64, 0) != 0 {
+        return Err("pipe2");
+    }
+    for fd in [fds, fds + 4] {
+        let fd = core::ptr::read_volatile(fd as *const i32);
+        if fd >= 0 {
+            let _ = sys_close(fd as u64);
+        }
+    }
+    let word = (base + 2 * PAGE + 64) as u64;
+    let woken = syscall6(SYS_FUTEX, word, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0);
+    if woken != 0 {
+        return Err("futex wake");
+    }
+
+    for page in 0..3 {
+        let first = core::ptr::read_volatile((base + page * PAGE) as *const u64);
+        if first != PRESERVE_SENTINEL + page as u64 {
+            return Err("a probed word changed");
+        }
+    }
+    // Nothing wrote the futex page's buffer: it still holds the child's
+    // marker, so the parent mapped the child's frame, not a fresh one.
+    if core::ptr::read_volatile((base + 2 * PAGE + 64) as *const u64) != PRESERVE_MARKER {
+        return Err("the child's frame was not mapped");
+    }
+    Ok(())
 }
 /// A shared-created PT must stay charged while its adjacent private leaf is
 /// live. Reusing the same VA also catches inherited-basis drift across cycles.
@@ -4281,7 +4814,8 @@ fn test_futex_parity(results: &mut TestResult) {
 // GAP-5 PI parity: PI futexes under the Linux user-word protocol (the owner's
 // TID in the word, FUTEX_WAITERS and FUTEX_OWNER_DIED kept by the kernel) and
 // requeue-PI. Each leg runs in a forked host so a stuck waiter cannot take
-// PID 1 down. Every check also holds on Linux.
+// PID 1 down. Every check also holds on Linux, except the owner-identity
+// leg's refusal of an owner in another address space (R191-1).
 // ---------------------------------------------------------------------------
 
 const FUTEX_LOCK_PI_OP: u64 = 6;
@@ -4415,6 +4949,18 @@ fn pi_spawn_on(
     cond: Option<&FutexWord>,
     stack_top: usize,
 ) -> Option<u32> {
+    pi_spawn_with(index, word, cond, stack_top, THREAD_FLAGS)
+}
+
+/// `pi_spawn_on` with clone `flags`: a CLONE_THREAD sibling, or a CLONE_VM
+/// child that is not a thread (the caller reaps it).
+fn pi_spawn_with(
+    index: usize,
+    word: &FutexWord,
+    cond: Option<&FutexWord>,
+    stack_top: usize,
+    flags: u64,
+) -> Option<u32> {
     use core::sync::atomic::Ordering;
     let slot = &PI_THREADS[index];
     slot.word.store(word_addr(word), Ordering::SeqCst);
@@ -4427,7 +4973,7 @@ fn pi_spawn_on(
     let entry: extern "C" fn() -> ! = if index == 0 { pi_thread_0 } else { pi_thread_1 };
     let tid = unsafe {
         raw_clone(
-            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            flags | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
             stack_top,
             core::ptr::null_mut(),
             slot.tid.as_ptr(),
@@ -5199,6 +5745,139 @@ fn futex_pi_nonrobust_heir_leg() -> u64 {
     FUTEX_PI_OK
 }
 
+/// Body of the PI owner-identity leg's host process; returns its exit
+/// status. R191-1: a PI word may name only a user task of the caller's
+/// address space. The host's parent lives in another one (it waits for the
+/// host meanwhile): every lock operation naming it, and the requeue-PI proxy
+/// lock, fails with EPERM after setting FUTEX_WAITERS, as the ESRCH case
+/// does, and leaves no PI state behind. A CLONE_VM child that is not a thread
+/// shares the address space, so it still waits behind the host and inherits
+/// the lock. Linux, whose shared futexes span address spaces, would attach a
+/// PI state to the parent instead.
+fn futex_pi_owner_identity_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let me = unsafe { sys_gettid() } as u32;
+    let parent = unsafe { userspace::syscall::sys_getppid() } as u32;
+    let a = &PI_WORD_A;
+    let a_addr = word_addr(a);
+    let b_addr = word_addr(&PI_WORD_B);
+    for word in [&PI_WORD_A, &PI_WORD_B, &PI_COND] {
+        word.0.store(0, Ordering::SeqCst);
+    }
+    let word = || a.0.load(Ordering::SeqCst);
+    let mutex = || PI_WORD_B.0.load(Ordering::SeqCst);
+    if parent == 0 || parent == me || parent & !FUTEX_TID_BITS != 0 {
+        return 0xd0;
+    }
+
+    // Every lock operation refuses an owner of another address space. The
+    // refusal comes before any sleep; the deadline that has already passed
+    // turns a kernel that attached instead into ETIMEDOUT, not a host blocked
+    // on its waiting parent.
+    let past = [0i64; 2];
+    for op in [FUTEX_LOCK_PI_OP, FUTEX_LOCK_PI2_OP, FUTEX_TRYLOCK_PI_OP] {
+        a.0.store(parent, Ordering::SeqCst);
+        if errno(unsafe { pi_futex(a_addr, op, past.as_ptr() as u64) }) != EPERM {
+            return 0xd1;
+        }
+        if word() != parent | FUTEX_WAITERS_BIT {
+            return 0xd2;
+        }
+    }
+    // No PI state names the parent: once the word is free the host takes the
+    // lock, and its unlock (no kernel state, no waiter) stores 0.
+    a.0.store(0, Ordering::SeqCst);
+    if unsafe { pi_futex(a_addr, FUTEX_LOCK_PI_OP, 0) } != 0 || word() != me {
+        return 0xd3;
+    }
+    if unsafe { pi_futex(a_addr, FUTEX_UNLOCK_PI_OP, 0) } != 0 || word() != 0 {
+        return 0xd4;
+    }
+
+    // The requeue-PI proxy lock refuses it too; the waiter keeps waiting on
+    // the condition word, and is requeued once the PI futex is free.
+    let cmp_requeue_pi = || unsafe {
+        futex(
+            &PI_COND,
+            FUTEX_CMP_REQUEUE_PI_OP | FUTEX_PRIVATE,
+            1,
+            1,
+            b_addr,
+            0,
+        )
+    };
+    let rq_waiter_on_cond =
+        || errno(unsafe { futex(&PI_COND, FUTEX_WAKE_OP | FUTEX_PRIVATE, 1, 0, 0, 0) }) == EINVAL;
+    PI_WORD_B.0.store(parent, Ordering::SeqCst);
+    let Some(waiter) = pi_spawn(0, &PI_WORD_B, Some(&PI_COND)) else {
+        return 0xd5;
+    };
+    if !pi_await(rq_waiter_on_cond) {
+        return 0xd6;
+    }
+    if errno(cmp_requeue_pi()) != EPERM {
+        return 0xd7;
+    }
+    if mutex() != parent | FUTEX_WAITERS_BIT || !rq_waiter_on_cond() {
+        return 0xd8;
+    }
+    if PI_THREADS[0].ret.load(Ordering::SeqCst) != FUTEX_WAIT_PENDING {
+        return 0xd9;
+    }
+    PI_WORD_B.0.store(0, Ordering::SeqCst);
+    if cmp_requeue_pi() != 1 {
+        return 0xda;
+    }
+    if pi_returned(0) != Some(0)
+        || PI_THREADS[0].seen.load(Ordering::SeqCst) != waiter | FUTEX_WAITERS_BIT
+    {
+        return 0xdb;
+    }
+    if !pi_release_and_join(0) || mutex() != 0 {
+        return 0xdc;
+    }
+
+    // A CLONE_VM child that is not a thread shares the address space: its
+    // LOCK_PI attaches to the host, and the host's unlock hands it the lock.
+    if a.0
+        .compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return 0xdd;
+    }
+    let Some(child) = pi_spawn_with(0, a, None, pi_stack_top(0), CLONE_VM) else {
+        return 0xde;
+    };
+    // The child is a process of its own: the host's exit would not end it.
+    let abandon = |code: u64| {
+        unsafe { userspace::syscall::sys_kill(child as u64, SIGKILL_NR) };
+        let _ = reap_pid(child as u64);
+        code
+    };
+    if !pi_await(|| word() == me | FUTEX_WAITERS_BIT) {
+        return abandon(0xdf);
+    }
+    pi_settle();
+    if PI_THREADS[0].ret.load(Ordering::SeqCst) != FUTEX_WAIT_PENDING {
+        return abandon(0xe0); // refused instead of waiting
+    }
+    if unsafe { pi_futex(a_addr, FUTEX_UNLOCK_PI_OP, 0) } != 0
+        || word() != child | FUTEX_WAITERS_BIT
+    {
+        return abandon(0xe1);
+    }
+    if pi_returned(0) != Some(0) {
+        return abandon(0xe2);
+    }
+    if !pi_release_and_join(0) || word() != 0 {
+        return abandon(0xe3);
+    }
+    if reap_pid(child as u64) != Some(0) {
+        return 0xe4;
+    }
+    FUTEX_PI_OK
+}
+
 /// Run one PI leg in a forked host and report it.
 fn run_futex_pi_leg(results: &mut TestResult, leg: fn() -> u64, pass: &str, fail: &str) {
     let host = unsafe { sys_fork() };
@@ -5271,6 +5950,12 @@ fn test_futex_pi(results: &mut TestResult) {
         futex_pi_nonrobust_heir_leg,
         "futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED",
         "futex PI: a non-robust owner-death check failed",
+    );
+    run_futex_pi_leg(
+        results,
+        futex_pi_owner_identity_leg,
+        "futex PI: a word naming a task of another address space is EPERM for LOCK_PI and CMP_REQUEUE_PI; a CLONE_VM owner still attaches",
+        "futex PI: an owner-identity check failed",
     );
 }
 

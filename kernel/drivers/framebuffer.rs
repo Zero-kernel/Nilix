@@ -133,7 +133,7 @@ impl FramebufferWriter {
         // Note: Framebuffer physical address is typically:
         // - 0x80000000 (2GB) for QEMU/OVMF
         // - Could be higher on real hardware
-        self.fb_base = if info.base < 0x4000_0000 {
+        self.fb_base = if info.base.saturating_add(required_size as u64) <= 0x4000_0000 {
             // Within first 1GB - can use high-half mapping
             info.base + PHYS_OFFSET
         } else {
@@ -159,6 +159,7 @@ impl FramebufferWriter {
         unsafe {
             FRAMEBUFFER_PHYS_BASE = info.base;
             FRAMEBUFFER_SIZE = info.size;
+            FRAMEBUFFER_DRAWN_SIZE = required_size;
         }
 
         // Clear screen with background color
@@ -290,9 +291,12 @@ impl FramebufferWriter {
         let src_start = self.fb_base + line_bytes as u64;
         let dst_start = self.fb_base;
 
-        // R24-8 fix: Validate that operations stay within framebuffer bounds
-        let total_needed = (self.max_row * line_bytes).saturating_add(line_bytes);
-        if total_needed > self.fb_size {
+        // R24-8 fix: Validate that operations stay within framebuffer bounds.
+        // The copy reads rows 1..max_row and the clear writes row max_row - 1,
+        // so max_row lines are touched (a relocated console maps exactly the
+        // drawn region, stride x height).
+        let total_needed = self.max_row.saturating_mul(line_bytes);
+        if self.max_row == 0 || total_needed > self.fb_size {
             // Framebuffer too small for scroll operation, skip
             return;
         }
@@ -431,6 +435,8 @@ static FB_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut FRAMEBUFFER_PHYS_BASE: u64 = 0;
 /// Framebuffer size in bytes
 static mut FRAMEBUFFER_SIZE: usize = 0;
+/// Bytes the console draws (stride x height), at most `FRAMEBUFFER_SIZE`.
+static mut FRAMEBUFFER_DRAWN_SIZE: usize = 0;
 
 /// Get the framebuffer physical memory region
 ///
@@ -445,6 +451,41 @@ pub fn get_framebuffer_region() -> Option<(u64, usize)> {
             None
         }
     }
+}
+
+/// D0-ISO-1 Approach A (R192-RES-1): draw through `virt`, a high-half mapping
+/// of the first `mapped_len` bytes of the framebuffer (at least the drawn
+/// region). Its identity address exists only in the boot page table; user
+/// address spaces carry no identity map.
+pub fn relocate(virt: u64, mapped_len: usize) {
+    crate::vga_buffer::with_display(|| {
+        let mut writer = WRITER.lock();
+        if writer.initialized {
+            writer.fb_base = virt;
+            writer.fb_size = writer.fb_size.min(mapped_len);
+        }
+    });
+}
+
+/// The drawn part of the framebuffer, `(physical base, stride x height bytes)`:
+/// what a relocated console must map. `None` without a framebuffer console.
+pub fn get_drawn_region() -> Option<(u64, usize)> {
+    unsafe {
+        if FRAMEBUFFER_PHYS_BASE != 0 && FRAMEBUFFER_DRAWN_SIZE != 0 {
+            Some((FRAMEBUFFER_PHYS_BASE, FRAMEBUFFER_DRAWN_SIZE))
+        } else {
+            None
+        }
+    }
+}
+
+/// Turn the framebuffer console off (output stays on serial and VGA text):
+/// no high-half mapping of it could be made.
+pub fn disable() {
+    crate::vga_buffer::with_display(|| {
+        WRITER.lock().initialized = false;
+        FB_INITIALIZED.store(false, Ordering::Release);
+    });
 }
 
 /// Initialize framebuffer console with info from bootloader

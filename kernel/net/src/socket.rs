@@ -8390,6 +8390,19 @@ impl SocketTable {
 
                         self.cleanup_tcp_connection(&sock);
                         sock.wake_tcp_waiters();
+
+                        // R192 FIX (R192-RES-4): the RST passed RFC 5961
+                        // validation and closed the TCB; let conntrack retire
+                        // the flow too (it ignores RST itself, R145-4), so a
+                        // reset connection no longer pins its slot.
+                        #[cfg(feature = "conntrack")]
+                        crate::conntrack::ct_commit_tcp_ingress_reset(
+                            net_ns_id.0,
+                            src_ip,
+                            dst_ip,
+                            header.src_port,
+                            header.dst_port,
+                        );
                     }
                 }
             }

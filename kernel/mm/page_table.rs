@@ -114,6 +114,365 @@ pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
     VirtAddr::new(phys.as_u64() + PHYSICAL_MEMORY_OFFSET)
 }
 
+/// Physical memory the [`PHYSICAL_MEMORY_OFFSET`] direct map covers (the
+/// bootloader allocates every page-table frame below it).
+const DIRECT_MAP_LIMIT: u64 = 1 << 30;
+/// Physical-address field of a page-table entry (bits 12..=51).
+const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+/// End of the lower canonical half, the user half of every address space.
+const USER_HALF_END: u64 = 0x0000_8000_0000_0000;
+
+/// R192-1/R192-2 FIX (D0-ISO-1): who owns the translation of a lower-half page.
+///
+/// User address spaces used to keep the boot identity map of physical 0-4 GiB
+/// as supervisor-only entries in the lower half; since D0-ISO-1 Approach A only
+/// the boot page table has it, and this check stays as defense in depth. Ring 0
+/// may use a supervisor leaf whatever its U/S bit. An address below
+/// the user-space top therefore proves nothing; only the U/S bit of every present
+/// entry on the walk does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserPageAccess {
+    /// No present translation: an access faults and the #PF path decides.
+    NotPresent,
+    /// Present with `USER_ACCESSIBLE` at every level; the leaf's `WRITABLE`
+    /// and copy-on-write (`BIT_9`) flags.
+    User { writable: bool, copy_on_write: bool },
+    /// Reached through a present entry without `USER_ACCESSIBLE` (the identity
+    /// map and the MMIO leaves split out of it), outside the user half, or not
+    /// walkable through the direct map. No user request may read, write, map,
+    /// remap, reprotect or unmap it.
+    Kernel,
+}
+
+/// Classify `addr` in the hierarchy rooted at the PML4 frame `root`, reading
+/// entry `index` of the table at physical `table` with `read`. Also returns
+/// the end of the span the deciding entry covers, so a range walk skips an
+/// absent or kernel-owned subtree in one step.
+fn classify_user_page<R>(root: u64, addr: u64, read: &R) -> (UserPageAccess, u64)
+where
+    R: Fn(u64, usize) -> Option<u64>,
+{
+    let page_end = (addr & !0xfff).saturating_add(0x1000);
+    if addr >= USER_HALF_END {
+        return (UserPageAccess::Kernel, page_end);
+    }
+    let mut table = root;
+    for (level, shift) in [(4u8, 39u32), (3, 30), (2, 21), (1, 12)] {
+        let span_end = (addr | ((1u64 << shift) - 1)).saturating_add(1);
+        let Some(raw) = read(table, ((addr >> shift) & 0x1ff) as usize) else {
+            return (UserPageAccess::Kernel, page_end);
+        };
+        let flags = PageTableFlags::from_bits_truncate(raw);
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return (UserPageAccess::NotPresent, span_end);
+        }
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return (UserPageAccess::Kernel, span_end);
+        }
+        if level == 1 || (level < 4 && flags.contains(PageTableFlags::HUGE_PAGE)) {
+            let access = UserPageAccess::User {
+                writable: flags.contains(PageTableFlags::WRITABLE),
+                copy_on_write: flags.contains(PageTableFlags::BIT_9),
+            };
+            return (access, span_end);
+        }
+        table = raw & PTE_ADDR_MASK;
+    }
+    (UserPageAccess::Kernel, page_end)
+}
+
+/// First page of `[start, start + len)` whose classification `stop` accepts,
+/// skipping each deciding span in one step.
+fn first_page_in<R, S>(root: u64, start: u64, len: u64, read: &R, stop: S) -> Option<u64>
+where
+    R: Fn(u64, usize) -> Option<u64>,
+    S: Fn(UserPageAccess) -> bool,
+{
+    let end = start.saturating_add(len);
+    let mut cursor = start & !0xfff;
+    while cursor < end {
+        let (access, next) = classify_user_page(root, cursor, read);
+        if stop(access) || next <= cursor {
+            return Some(cursor);
+        }
+        cursor = next;
+    }
+    None
+}
+
+/// First page of `[start, start + len)` that `classify_user_page` reports as
+/// kernel-owned, skipping absent and user subtrees span by span.
+fn first_kernel_owned_in<R>(root: u64, start: u64, len: u64, read: &R) -> Option<u64>
+where
+    R: Fn(u64, usize) -> Option<u64>,
+{
+    first_page_in(root, start, len, read, |access| {
+        access == UserPageAccess::Kernel
+    })
+}
+
+/// First page of `[start, start + len)` with any translation (user or kernel),
+/// skipping absent subtrees span by span.
+fn first_occupied_in<R>(root: u64, start: u64, len: u64, read: &R) -> Option<u64>
+where
+    R: Fn(u64, usize) -> Option<u64>,
+{
+    first_page_in(root, start, len, read, |access| {
+        access != UserPageAccess::NotPresent
+    })
+}
+
+/// Entry `index` of the page table at physical `table`, read through the
+/// direct map; `None` (fail closed) for a frame the direct map does not cover.
+fn read_direct_map_entry(table: u64, index: usize) -> Option<u64> {
+    if table >= DIRECT_MAP_LIMIT || index >= 512 {
+        return None;
+    }
+    let entry = (PHYSICAL_MEMORY_OFFSET + table + index as u64 * 8) as *const u64;
+    // SAFETY: `table` is a 4 KiB-aligned frame below the direct-map limit, so
+    // the entry is mapped kernel memory. Another CPU may rewrite it; a volatile
+    // word load observes one value (see `user_page_access`).
+    Some(unsafe { core::ptr::read_volatile(entry) })
+}
+
+fn active_root() -> u64 {
+    use x86_64::registers::control::Cr3;
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// PML4 entries of the lower (user) half.
+const USER_PML4_ENTRIES: usize = 256;
+
+/// LEAD-KPTI-PML4-1 FIX: the (kernel root, user root) pair this CPU registered
+/// for the address space it runs, when KPTI gave that space two roots.
+///
+/// `activate_memory_space` writes the pair on this CPU only, with interrupts
+/// off, so a reader with interrupts off never races the writer; a write in
+/// progress means this CPU interrupted it, and the pair is unusable.
+fn kpti_root_pair() -> Option<(u64, u64)> {
+    let pcpu = cpu_local::current_cpu();
+    let seq = pcpu.kpti_seq.load(Ordering::Acquire);
+    let user = pcpu.kpti_user_cr3.load(Ordering::Acquire) & PTE_ADDR_MASK;
+    let kernel = pcpu.kpti_kernel_cr3.load(Ordering::Acquire) & PTE_ADDR_MASK;
+    if seq & 1 != 0 || pcpu.kpti_seq.load(Ordering::Acquire) != seq {
+        return None;
+    }
+    let usable = |root: u64| root != 0 && root < DIRECT_MAP_LIMIT;
+    (usable(kernel) && usable(user) && kernel != user).then_some((kernel, user))
+}
+
+/// LEAD-KPTI-PML4-1 FIX: the root an edit of the running address space goes
+/// to. The kernel root is the master copy of the lower half: munmap, fork and
+/// teardown walk it. A ring-3 page fault runs on the user root, and tables it
+/// built there were invisible to all of them.
+fn edit_root(pair: Option<(u64, u64)>) -> u64 {
+    let cr3 = active_root();
+    match pair {
+        Some((kernel, user)) if cr3 == user => kernel,
+        _ => cr3,
+    }
+}
+
+/// The PML4 at physical `root`, through the direct map.
+///
+/// # Safety
+///
+/// `root` must be a live PML4 below [`DIRECT_MAP_LIMIT`], and the caller must
+/// hold `PT_LOCK` for as long as it edits the table.
+unsafe fn table_at(root: u64) -> &'static mut PageTable {
+    &mut *((PHYSICAL_MEMORY_OFFSET + root) as *mut PageTable)
+}
+
+/// What [`mirror_user_half`] changed in a user root.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MirrorOutcome {
+    /// Entries the user root lacked: a PDPT created after it was built.
+    linked: usize,
+    /// Same PDPT, new permission bits.
+    updated: usize,
+    /// Entries that pointed elsewhere or vanished from the kernel root.
+    diverged: usize,
+}
+
+/// The bits of a PML4 entry that decide a translation; the accessed bit the
+/// hardware sets in each copy, and the software bits, do not.
+fn link_bits(entry: &PageTableEntry) -> (PhysAddr, PageTableFlags) {
+    let decisive = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::WRITE_THROUGH
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
+    (entry.addr(), entry.flags() & decisive)
+}
+
+/// LEAD-KPTI-PML4-1 FIX: make the user root's lower half match the kernel
+/// root's.
+///
+/// Both roots share every lower-half PDPT; only their PML4 entries are copies,
+/// taken when the user root was built (`create_kpti_user_pml4`). An entry an
+/// edit created afterwards existed in the kernel root alone, so ring 3 faulted
+/// (err=0x6) on every page under it, e.g. a mapping past PML4[0]. A changed or
+/// vanished entry would mean a lower-half PDPT was replaced while the space is
+/// live, which nothing does; the kernel root still wins, and it is reported.
+fn mirror_user_half(kernel: &PageTable, user: &mut PageTable) -> MirrorOutcome {
+    let mut outcome = MirrorOutcome::default();
+    for index in 0..USER_PML4_ENTRIES {
+        let (want_addr, want_flags) = link_bits(&kernel[index]);
+        let (have_addr, have_flags) = link_bits(&user[index]);
+        if (want_addr, want_flags) == (have_addr, have_flags) {
+            continue;
+        }
+        let present = PageTableFlags::PRESENT;
+        if user[index].is_unused() && want_flags.contains(present) {
+            outcome.linked += 1;
+        } else if want_addr == have_addr
+            && want_flags.contains(present)
+            && have_flags.contains(present)
+        {
+            outcome.updated += 1;
+        } else {
+            outcome.diverged += 1;
+        }
+        user[index] = kernel[index].clone();
+    }
+    outcome
+}
+
+/// LEAD-KPTI-PML4-1 FIX: after an edit of `edited`, bring the KPTI user root
+/// of the running address space in line, if `edited` is its kernel root.
+///
+/// No shootdown is needed for a new entry: no CPU caches a non-present one.
+/// Lower-half user parents are created final (`map_page`), so a rights change
+/// means a regression, and is reported like a replaced or vanished entry; it
+/// only ever adds rights, so a CPU holding the old entry takes one more fault.
+///
+/// # Safety
+///
+/// The caller holds `PT_LOCK` with interrupts off.
+unsafe fn sync_kpti_user_root(edited: u64, pair: Option<(u64, u64)>) {
+    let Some((kernel, user)) = pair else {
+        return;
+    };
+    if edited != kernel {
+        return;
+    }
+    let outcome = mirror_user_half(table_at(kernel), table_at(user));
+    if outcome.updated != 0 || outcome.diverged != 0 {
+        klog_always!(
+            "[MM] KPTI user root 0x{:x} diverged from kernel root 0x{:x}: {} rights changes, {} replaced or vanished lower-half PML4 entries; resynced",
+            user,
+            kernel,
+            outcome.updated,
+            outcome.diverged
+        );
+    }
+}
+
+/// R192-1 FIX (D0-ISO-1): lock-free classification of the lower-half page at
+/// `addr` in the active address space, for the user-memory primitives.
+///
+/// It takes no lock, so it is usable under any lock and with interrupts off. A
+/// concurrent unmap may free and reuse a *user* page-table frame this walk is
+/// reading, which can misreport a user translation but cannot hide a
+/// kernel-owned one: every entry on the path to a kernel-owned translation is in
+/// tables built with the address space (the identity map), which the guards
+/// below keep any user request from changing or freeing, and runtime MMIO is
+/// mapped in the higher half. The caller's access still goes through the MMU
+/// and the exception table.
+pub fn user_page_access(addr: VirtAddr) -> UserPageAccess {
+    classify_user_page(active_root(), addr.as_u64(), &read_direct_map_entry).0
+}
+
+/// R192-2 FIX (D0-ISO-1): the address of the first kernel-owned page of
+/// `[start, start + len)` in the active address space, or `None`. A user
+/// mapping, heap or remap target must not contain one. Lock-free, with the same
+/// argument as [`user_page_access`].
+pub fn first_kernel_owned_user_page(start: u64, len: u64) -> Option<u64> {
+    first_kernel_owned_in(active_root(), start, len, &read_direct_map_entry)
+}
+
+/// R192 FIX (LEAD-MMAP-OWN-1): the address of the first page of
+/// `[start, start + len)` that has any translation in the active address
+/// space, or `None`. A new mapping, heap grow or remap target is checked
+/// against the VMA records first; a translation the records do not cover is
+/// the ELF image, the committed heap, the stack or the kernel's identity map,
+/// none of which a new VMA may claim (`munmap` would then remove it). Lock-free,
+/// with the same argument as [`user_page_access`]: a stale walk can only
+/// misreport pages of user tables, and the caller holds the VMA lock that
+/// orders user mappings of this range.
+pub fn first_occupied_user_page(start: u64, len: u64) -> Option<u64> {
+    first_occupied_in(active_root(), start, len, &read_direct_map_entry)
+}
+
+/// R192-2: boot self-test of the `PageTableManager` guards on the boot root,
+/// whose whole lower half is the supervisor identity map. Probes are chosen so
+/// a kernel without the guards fails with a different, harmless error instead
+/// of changing the map: `map_page` with `PRESENT` alone at a present identity
+/// page (no flag to OR in; `PageAlreadyMapped` or `ParentEntryHugePage`), and
+/// `unmap_page`/`update_flags` at 64 GiB, which the boot root does not map.
+/// Returns `false` without probing when the boot root has no lower-half map
+/// (an identity-unmap hardening profile); panics on failure.
+///
+/// # Safety
+///
+/// Call on the BSP during boot, with the boot root active and no user address
+/// space loaded.
+pub unsafe fn run_kernel_owned_guard_self_test() -> bool {
+    const IDENTITY: u64 = 0x60_0000;
+    const UNMAPPED_LOW: u64 = 0x10_0000_0000;
+    if user_page_access(VirtAddr::new(IDENTITY)) == UserPageAccess::NotPresent {
+        return false;
+    }
+    assert_eq!(
+        user_page_access(VirtAddr::new(IDENTITY)),
+        UserPageAccess::Kernel,
+        "R192: the boot identity map must classify as kernel-owned"
+    );
+    assert_eq!(
+        user_page_access(VirtAddr::new(UNMAPPED_LOW)),
+        UserPageAccess::Kernel,
+        "R192: the boot root's supervisor PML4[0] must own its whole span"
+    );
+    assert_eq!(
+        first_kernel_owned_user_page(0x40_0000, 0x40_0000),
+        Some(0x40_0000)
+    );
+    // The probes allocate no table: the guard refuses first, and without it
+    // every parent of the identity page already exists.
+    struct NoFrames;
+    unsafe impl FrameAllocator<Size4KiB> for NoFrames {
+        fn allocate_frame(&mut self) -> Option<PhysFrame> {
+            None
+        }
+    }
+    let (mapped, unmapped, updated) = with_current_manager(VirtAddr::new(0), |manager| {
+        let mapped = manager.map_page(
+            Page::containing_address(VirtAddr::new(IDENTITY)),
+            PhysFrame::containing_address(PhysAddr::new(IDENTITY)),
+            PageTableFlags::PRESENT,
+            &mut NoFrames,
+        );
+        let low = Page::containing_address(VirtAddr::new(UNMAPPED_LOW));
+        let unmapped = manager.unmap_page(low).map(|_| ());
+        let updated = manager.update_flags(low, PageTableFlags::PRESENT);
+        (mapped, unmapped, updated)
+    });
+    assert!(
+        matches!(mapped, Err(MapError::KernelOwned)),
+        "R192: map_page under the identity map returned {mapped:?}"
+    );
+    assert!(
+        matches!(unmapped, Err(UnmapError::KernelOwned)),
+        "R192: unmap_page in a supervisor span returned {unmapped:?}"
+    );
+    assert!(
+        matches!(updated, Err(UpdateFlagsError::KernelOwned)),
+        "R192: update_flags in a supervisor span returned {updated:?}"
+    );
+    true
+}
+
 /// 页表管理器
 pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
@@ -164,11 +523,14 @@ where
     // R32-MM-1 FIX: Disable interrupts to prevent CR3 switch during page table operations
     interrupts::without_interrupts(|| {
         let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
-        let phys_offset = get_phys_offset();
-        let level_4_table = active_level_4_table(phys_offset);
-        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+                                        // LEAD-KPTI-PML4-1 FIX: edit the kernel root, then mirror it.
+        let pair = kpti_root_pair();
+        let root = edit_root(pair);
+        let mapper = OffsetPageTable::new(table_at(root), get_phys_offset());
         let mut manager = PageTableManager { mapper };
-        f(&mut manager)
+        let result = f(&mut manager);
+        sync_kpti_user_root(root, pair);
+        result
     })
 }
 
@@ -188,11 +550,15 @@ where
     let _pt_guard = try_lock_pt()?;
     Some(interrupts::without_interrupts(|| {
         let _ = physical_memory_offset;
-        let phys_offset = get_phys_offset();
-        let level_4_table = active_level_4_table(phys_offset);
-        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+        // LEAD-KPTI-PML4-1 FIX: a ring-3 fault runs on the user root; edit the
+        // kernel root, then mirror it.
+        let pair = kpti_root_pair();
+        let root = edit_root(pair);
+        let mapper = OffsetPageTable::new(table_at(root), get_phys_offset());
         let mut manager = PageTableManager { mapper };
-        f(&mut manager)
+        let result = f(&mut manager);
+        sync_kpti_user_root(root, pair);
+        result
     }))
 }
 
@@ -209,6 +575,43 @@ impl PageTableManager {
         let mapper = OffsetPageTable::new(level_4_table, phys_offset);
 
         PageTableManager { mapper }
+    }
+
+    /// R192-2 FIX (D0-ISO-1): whether `page` is in the lower half and owned by
+    /// the kernel in this manager's hierarchy. The user-range operations below
+    /// refuse such a page: no syscall may map a user page under, reprotect,
+    /// unmap or reclaim the identity map shared with the kernel.
+    fn lower_half_kernel_owned(&mut self, page: Page) -> bool {
+        let addr = page.start_address().as_u64();
+        // The mapper reaches its PML4 through the direct map (`active_level_4_table`).
+        let root = (self.mapper.level_4_table_mut() as *mut PageTable as u64)
+            .wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+        addr < USER_HALF_END
+            && classify_user_page(root, addr, &read_direct_map_entry).0 == UserPageAccess::Kernel
+    }
+
+    /// Whether a present 1 GiB or 2 MiB leaf maps `page`. A table the direct
+    /// map cannot reach counts as one (fail closed).
+    fn under_huge_leaf(&mut self, page: Page) -> bool {
+        const PRESENT: u64 = 1;
+        const HUGE: u64 = 1 << 7;
+        let addr = page.start_address().as_u64();
+        let mut table = (self.mapper.level_4_table_mut() as *mut PageTable as u64)
+            .wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+        for (level, shift) in [(4u8, 39u32), (3, 30), (2, 21)] {
+            let index = ((addr >> shift) & 0x1ff) as usize;
+            let Some(entry) = read_direct_map_entry(table, index) else {
+                return true;
+            };
+            if entry & PRESENT == 0 {
+                return false;
+            }
+            if level < 4 && entry & HUGE != 0 {
+                return true;
+            }
+            table = entry & PTE_ADDR_MASK;
+        }
+        false
     }
 
     /// 映射虚拟页到物理帧
@@ -285,9 +688,44 @@ impl PageTableManager {
     ) -> Result<(), MapError> {
         use x86_64::structures::paging::mapper::MapToError;
 
+        // R192-2 FIX: `map_to` ORs the leaf's flags into every existing parent
+        // entry before it checks for a huge page, so a map under the identity
+        // map would make its supervisor entries (or a 2 MiB leaf) user-accessible
+        // or writable, and could install the leaf into a page table shared with
+        // the kernel. Every legitimate caller maps user pages outside it or
+        // kernel pages in the higher half; the hardening code edits the
+        // identity map's entries directly.
+        if self.lower_half_kernel_owned(page) {
+            return Err(MapError::KernelOwned);
+        }
+
+        // LEAD-KPTI-PML4-1 FIX: a lower-half user page's parents are created
+        // final (P|W|U; the leaf decides access, as on Linux). `map_to` ORs the
+        // leaf's W/U into an existing parent instead, and a read-only page
+        // followed by a writable one in the same 512 GiB slot then changed a
+        // PML4 entry the KPTI user root holds a copy of, and that other CPUs
+        // may cache.
+        let mut parent_flags = flags
+            & (PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE);
+        if page.start_address().as_u64() < USER_HALF_END
+            && flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            // `map_to` ORs the parent flags into a huge leaf before it reports
+            // `ParentEntryHugePage`; with W forced, that would make a read-only
+            // huge leaf writable. Refuse first.
+            if self.under_huge_leaf(page) {
+                return Err(MapError::ParentEntryHugePage);
+            }
+            parent_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
+        }
+
         unsafe {
             self.mapper
-                .map_to(page, frame, flags, frame_allocator)
+                .map_to_with_table_flags(page, frame, flags, parent_flags, frame_allocator)
                 .map_err(|e| match e {
                     MapToError::FrameAllocationFailed => MapError::FrameAllocationFailed,
                     MapToError::ParentEntryHugePage => MapError::ParentEntryHugePage,
@@ -302,6 +740,11 @@ impl PageTableManager {
     /// 取消映射虚拟页
     pub fn unmap_page(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
         use x86_64::structures::paging::mapper::UnmapError as X64UnmapError;
+
+        // R192-2 FIX: never clear an identity-map or split-MMIO leaf.
+        if self.lower_half_kernel_owned(page) {
+            return Err(UnmapError::KernelOwned);
+        }
 
         let (frame, flush) = self.mapper.unmap(page).map_err(|e| match e {
             X64UnmapError::PageNotMapped => UnmapError::PageNotMapped,
@@ -327,6 +770,11 @@ impl PageTableManager {
     ///
     /// Must be called while PT_LOCK is held (i.e. inside `with_current_manager`).
     pub fn take_nonpresent_leaf_frame(&mut self, page: Page) -> Option<PhysFrame> {
+        // R192-2 FIX: a non-present entry under a supervisor parent is kernel
+        // state, not a frame a user mapping left behind.
+        if self.lower_half_kernel_owned(page) {
+            return None;
+        }
         let addr = page.start_address();
         let pml4_idx = usize::from(addr.p4_index());
         let pdpt_idx = usize::from(addr.p3_index());
@@ -448,6 +896,16 @@ impl PageTableManager {
             table.iter().all(|entry| entry.is_unused())
         }
 
+        // R192-2 FIX (D0-ISO-1): every caller prunes a user range. A table
+        // reached through a supervisor-only entry belongs to the kernel's
+        // identity map, which other address spaces share; freeing it would
+        // leave their entries pointing at a reused frame. Only tables whose
+        // whole path is USER_ACCESSIBLE are candidates.
+        #[inline]
+        fn user_parent(flags: PageTableFlags) -> bool {
+            flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+        }
+
         let start_u = start.as_u64();
         let end_u = start_u.saturating_add((len as u64).saturating_sub(1));
         // Set when any parent entry is collapsed; drives the post-pass full flush.
@@ -466,18 +924,14 @@ impl PageTableManager {
             let p2 = usize::from(addr.p2_index());
 
             let pml4e = &pml4[p4];
-            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+            if user_parent(pml4e.flags()) {
                 let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
                 let pdpte_flags = pdpt[p3].flags();
-                if pdpte_flags.contains(PageTableFlags::PRESENT)
-                    && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
-                {
+                if user_parent(pdpte_flags) && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE) {
                     let pd = &mut *phys_to_virt(pdpt[p3].addr()).as_mut_ptr::<PageTable>();
                     let pde = &mut pd[p2];
                     let pde_flags = pde.flags();
-                    if pde_flags.contains(PageTableFlags::PRESENT)
-                        && !pde_flags.contains(PageTableFlags::HUGE_PAGE)
-                    {
+                    if user_parent(pde_flags) && !pde_flags.contains(PageTableFlags::HUGE_PAGE) {
                         let pt = &*phys_to_virt(pde.addr()).as_ptr::<PageTable>();
                         if table_empty(pt) && frames_to_free.try_reserve(1).is_ok() {
                             frames_to_free.push(PhysFrame::containing_address(pde.addr()));
@@ -502,13 +956,11 @@ impl PageTableManager {
             let p3 = usize::from(addr.p3_index());
 
             let pml4e = &pml4[p4];
-            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+            if user_parent(pml4e.flags()) {
                 let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
                 let pdpte = &mut pdpt[p3];
                 let pdpte_flags = pdpte.flags();
-                if pdpte_flags.contains(PageTableFlags::PRESENT)
-                    && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
-                {
+                if user_parent(pdpte_flags) && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE) {
                     let pd = &*phys_to_virt(pdpte.addr()).as_ptr::<PageTable>();
                     if table_empty(pd) && frames_to_free.try_reserve(1).is_ok() {
                         frames_to_free.push(PhysFrame::containing_address(pdpte.addr()));
@@ -863,6 +1315,11 @@ impl PageTableManager {
     ) -> Result<(), UpdateFlagsError> {
         use x86_64::structures::paging::mapper::FlagUpdateError;
 
+        // R192-2 FIX: never reprotect an identity-map or split-MMIO leaf.
+        if self.lower_half_kernel_owned(page) {
+            return Err(UpdateFlagsError::KernelOwned);
+        }
+
         unsafe {
             self.mapper
                 .update_flags(page, flags)
@@ -1025,6 +1482,8 @@ pub enum MapError {
     PageAlreadyMapped,
     /// R32-MM-2 FIX: Invalid range (overflow in size or offset calculation)
     InvalidRange,
+    /// R192-2 FIX: a leaf under a kernel-owned (supervisor) lower-half entry.
+    KernelOwned,
 }
 
 /// 页表取消映射错误
@@ -1035,6 +1494,8 @@ pub enum UnmapError {
     InvalidFrameAddress,
     /// R35-MM-2 FIX: Overflow or invalid range in unmap_range offset calculation
     InvalidRange,
+    /// R192-2 FIX: a kernel-owned (supervisor) lower-half translation.
+    KernelOwned,
 }
 
 /// 更新标志位错误
@@ -1042,6 +1503,8 @@ pub enum UnmapError {
 pub enum UpdateFlagsError {
     PageNotMapped,
     ParentEntryHugePage,
+    /// R192-2 FIX: a kernel-owned (supervisor) lower-half translation.
+    KernelOwned,
 }
 
 lazy_static::lazy_static! {
@@ -1431,6 +1894,199 @@ mod pt_lock_tests {
         assert_eq!(pt_lock_owner_cpu(), None);
     }
 }
+#[cfg(test)]
+mod user_page_access_tests {
+    use super::{
+        classify_user_page, first_kernel_owned_in, first_occupied_in, UserPageAccess,
+        DIRECT_MAP_LIMIT, USER_HALF_END,
+    };
+    use alloc::collections::BTreeMap;
+    use x86_64::structures::paging::PageTableFlags as F;
+
+    const ROOT: u64 = 0x1000;
+    const PDPT: u64 = 0x2000;
+    const PD_LOW: u64 = 0x3000;
+    const PD_SHARED: u64 = 0x4000;
+    const PT_SPLIT: u64 = 0x5000;
+    const PT_USER: u64 = 0x6000;
+    const BEYOND_DIRECT_MAP: u64 = DIRECT_MAP_LIMIT;
+
+    /// The pre-Approach-A R192 layout of a user address space (the boot root
+    /// still looks like this): PML4[0] and PDPT[0] are
+    /// user-accessible branches; the rest of the low identity map is
+    /// supervisor-only (a split 4 KiB PT, 2 MiB leaves, a supervisor PDPT entry
+    /// whose shared PD leaves say USER), and PD[2] is the ELF window's user PT.
+    fn layout() -> BTreeMap<(u64, usize), u64> {
+        let p = F::PRESENT | F::WRITABLE;
+        let u = p | F::USER_ACCESSIBLE;
+        let mut tables = BTreeMap::new();
+        let mut set = |table: u64, index: usize, value: u64, flags: F| {
+            tables.insert((table, index), value | flags.bits());
+        };
+        set(ROOT, 0, PDPT, u);
+        set(PDPT, 0, PD_LOW, u);
+        set(PDPT, 1, PD_SHARED, p);
+        set(PDPT, 2, PD_SHARED, p);
+        set(PDPT, 3, BEYOND_DIRECT_MAP, u);
+        set(PD_LOW, 0, PT_SPLIT, p);
+        set(PD_LOW, 1, 0x20_0000, p | F::HUGE_PAGE);
+        set(PD_LOW, 2, PT_USER, u);
+        set(PD_LOW, 3, 0x60_0000, p | F::HUGE_PAGE);
+        set(PD_SHARED, 0, 0x4000_0000, u | F::HUGE_PAGE);
+        set(PT_SPLIT, 0x100, 0x10_0000, p);
+        set(PT_USER, 0, 0x7000, u);
+        set(
+            PT_USER,
+            1,
+            0x8000,
+            F::PRESENT | F::USER_ACCESSIBLE | F::BIT_9,
+        );
+        tables
+    }
+
+    fn reader(tables: &BTreeMap<(u64, usize), u64>) -> impl Fn(u64, usize) -> Option<u64> + '_ {
+        move |table, index| {
+            if table >= DIRECT_MAP_LIMIT {
+                return None;
+            }
+            Some(tables.get(&(table, index)).copied().unwrap_or(0))
+        }
+    }
+
+    #[test]
+    fn r192_lower_half_ownership_follows_every_level() {
+        let tables = layout();
+        let read = reader(&tables);
+        let access = |addr: u64| classify_user_page(ROOT, addr, &read).0;
+        assert_eq!(
+            access(0x40_0000),
+            UserPageAccess::User {
+                writable: true,
+                copy_on_write: false
+            }
+        );
+        assert_eq!(
+            access(0x40_1234),
+            UserPageAccess::User {
+                writable: false,
+                copy_on_write: true
+            }
+        );
+        assert_eq!(access(0x40_2000), UserPageAccess::NotPresent);
+        // Split identity PT, 2 MiB identity leaf, and a supervisor PDPT entry
+        // whose shared PD leaf carries USER: all kernel-owned.
+        assert_eq!(access(0x10_0000), UserPageAccess::Kernel);
+        assert_eq!(access(0x0B_8000), UserPageAccess::Kernel);
+        assert_eq!(access(0x20_0000), UserPageAccess::Kernel);
+        assert_eq!(access(0x4000_0000), UserPageAccess::Kernel);
+        // A table the direct map cannot reach fails closed.
+        assert_eq!(access(0xC000_0000), UserPageAccess::Kernel);
+        // Fresh user regions (the 64 GiB mmap window, the stack PML4 slot).
+        assert_eq!(access(0x10_0000_0000), UserPageAccess::NotPresent);
+        assert_eq!(access(0x7FFF_FFFF_E000), UserPageAccess::NotPresent);
+        assert_eq!(access(USER_HALF_END), UserPageAccess::Kernel);
+    }
+
+    #[test]
+    fn r192_range_walk_reports_the_first_kernel_owned_page() {
+        let tables = layout();
+        let read = reader(&tables);
+        let first = |start: u64, len: u64| first_kernel_owned_in(ROOT, start, len, &read);
+        assert_eq!(first(0x40_0000, 0x20_0000), None);
+        assert_eq!(first(0x40_0000, 0x20_0001), Some(0x60_0000));
+        assert_eq!(first(0x5F_F000, 0x1000_0000), Some(0x60_0000));
+        assert_eq!(first(0x8000_0000, 0x20_0000), Some(0x8000_0000));
+        assert_eq!(first(0x10_0000, 1), Some(0x10_0000));
+        assert_eq!(first(0x40_0000, 0), None);
+        // Absent subtrees are skipped span by span: a 64 TiB walk terminates.
+        assert_eq!(first(0x10_0000_0000, 0x4000_0000_0000), None);
+        assert_eq!(first(USER_HALF_END - 0x2000, 0x4000), Some(USER_HALF_END));
+
+        // LEAD-MMAP-OWN-1: any translation occupies a page, user or kernel.
+        let occupied = |start: u64, len: u64| first_occupied_in(ROOT, start, len, &read);
+        assert_eq!(occupied(0x40_0000, 0x1000), Some(0x40_0000));
+        assert_eq!(occupied(0x40_1000, 0x1000), Some(0x40_1000));
+        assert_eq!(occupied(0x40_2000, 0x1F_E000), None);
+        assert_eq!(occupied(0x40_2000, 0x1F_E001), Some(0x60_0000));
+        assert_eq!(occupied(0x10_0000_0000, 0x4000_0000_0000), None);
+    }
+}
+
+#[cfg(test)]
+mod kpti_mirror_tests {
+    use super::{mirror_user_half, MirrorOutcome};
+    use x86_64::structures::paging::{PageTable, PageTableFlags as F};
+    use x86_64::PhysAddr;
+
+    fn root(entries: &[(usize, u64, F)]) -> PageTable {
+        let mut table = PageTable::new();
+        for &(index, addr, flags) in entries {
+            table[index].set_addr(PhysAddr::new(addr), flags);
+        }
+        table
+    }
+
+    #[test]
+    fn lead_kpti_pml4_1_mirror_links_new_slots_and_ignores_accessed_bits() {
+        let parent = F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE;
+        // The user root was copied with PML4[0] and the stack slot.
+        let mut user = root(&[(0, 0x1000, parent), (255, 0x2000, parent)]);
+        // Since then the kernel root gained PML4[1] (an mmap at 512 GiB) and
+        // PML4[192]; the hardware set the accessed bit in its PML4[0] copy.
+        let kernel = root(&[
+            (0, 0x1000, parent | F::ACCESSED),
+            (1, 0x3000, parent),
+            (192, 0x4000, parent),
+            (255, 0x2000, parent),
+            // The upper half is the entry island's business, never mirrored.
+            (300, 0x5000, F::PRESENT | F::WRITABLE),
+        ]);
+        let outcome = mirror_user_half(&kernel, &mut user);
+        assert_eq!(
+            outcome,
+            MirrorOutcome {
+                linked: 2,
+                updated: 0,
+                diverged: 0
+            }
+        );
+        assert_eq!(user[1].addr(), PhysAddr::new(0x3000));
+        assert_eq!(user[192].flags(), parent);
+        assert!(!user[0].flags().contains(F::ACCESSED), "copy left alone");
+        assert!(user[300].is_unused());
+        // A second pass finds nothing to do.
+        assert_eq!(
+            mirror_user_half(&kernel, &mut user),
+            MirrorOutcome::default()
+        );
+    }
+
+    #[test]
+    fn lead_kpti_pml4_1_mirror_follows_rights_and_reports_divergence() {
+        let read_only = F::PRESENT | F::USER_ACCESSIBLE;
+        let parent = read_only | F::WRITABLE;
+        let mut user = root(&[
+            (1, 0x3000, read_only),
+            (2, 0x6000, parent),
+            (3, 0x7000, parent),
+        ]);
+        // PML4[1] gained W; PML4[2] points at another PDPT; PML4[3] vanished.
+        let kernel = root(&[(1, 0x3000, parent), (2, 0x8000, parent)]);
+        let outcome = mirror_user_half(&kernel, &mut user);
+        assert_eq!(
+            outcome,
+            MirrorOutcome {
+                linked: 0,
+                updated: 1,
+                diverged: 2
+            }
+        );
+        assert_eq!(user[1].flags(), parent);
+        assert_eq!(user[2].addr(), PhysAddr::new(0x8000));
+        assert!(user[3].is_unused(), "the kernel root wins");
+    }
+}
+
 #[cfg(test)]
 mod physical_range_tests {
     use super::{

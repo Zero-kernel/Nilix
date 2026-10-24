@@ -18,8 +18,18 @@
 //!
 //! Only ranges the UEFI memory map marks as firmware-owned (reserved,
 //! runtime-services data, ACPI reclaim, ACPI NVS) are copied from outside the
-//! direct map, so a corrupt table pointer naming device memory is refused
-//! rather than read through a write-back alias.
+//! direct map, so a corrupt table pointer naming device memory above 1 GiB is
+//! refused rather than read through a write-back alias.
+//!
+//! R191-4: bytes inside the direct map are NOT checked against those ranges.
+//! Every caller reads firmware-supplied pointers (RSDP, RSDT/XSDT entries,
+//! MADT, HPET, DMAR) at boot, and the legacy-BIOS RSDP scan (the fallback
+//! when the bootloader supplies no valid RSDP) reads `0xE0000..0x100000`,
+//! which a UEFI memory map need not describe as firmware-owned; refusing an
+//! unlisted low range would break that boot path. A corrupt table pointer
+//! below 1 GiB is therefore read through the direct map as before F9. That is
+//! firmware input, which already controls the boot image; no user-reachable
+//! path may pass an address to this reader.
 
 use core::cell::UnsafeCell;
 
@@ -121,6 +131,7 @@ pub fn read_firmware_bytes(phys: u64, len: usize) -> Option<&'static [u8]> {
     }
     let end = phys.checked_add(u64::try_from(len).ok()?)?;
     if end <= DIRECT_MAP_LIMIT {
+        // R191-4: no firmware-range check here (see the module documentation).
         let virt = (PHYSICAL_MEMORY_OFFSET + phys) as *const u8;
         // SAFETY: the range lies inside the always-present direct map.
         return Some(unsafe { core::slice::from_raw_parts(virt, len) });

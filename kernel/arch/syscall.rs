@@ -72,6 +72,25 @@ const RFLAGS_IOPL: u64 = 0b11 << 12;
 const RFLAGS_NT: u64 = 1 << 14;
 /// RFLAGS RF 位 (恢复标志)
 const RFLAGS_RF: u64 = 1 << 16;
+/// RFLAGS VM 位 (virtual-8086 mode)
+const RFLAGS_VM: u64 = 1 << 17;
+/// RFLAGS VIF 位 (virtual interrupt flag)
+const RFLAGS_VIF: u64 = 1 << 19;
+/// RFLAGS VIP 位 (virtual interrupt pending)
+const RFLAGS_VIP: u64 = 1 << 20;
+
+/// R192-6 FIX (D5-ARC-1): RFLAGS bits a user context never carries back to
+/// Ring 3 on SYSRET or IRET: IOPL(12-13), NT(14), RF(16), VM(17), AC(18),
+/// VIF(19), VIP(20). R67-9 documented IOPL/NT/RF/VM/VIF/VIP, but its literal
+/// `~0x1D3000` cleared AC (bit 18) in place of NT and VM. AC stays cleared, as
+/// it has been since R67-9, so user AC does not survive a kernel entry (Linux
+/// preserves it). `kernel_core::signal_frame::RFLAGS_USER_CLEAR` must equal
+/// this (the kernel crate asserts it).
+pub const RFLAGS_USER_CLEAR: u64 =
+    RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF | RFLAGS_VM | RFLAGS_AC | RFLAGS_VIF | RFLAGS_VIP;
+/// R192-6 FIX: the SYSRET/IRET user RFLAGS mask (`!RFLAGS_USER_CLEAR`).
+pub const RFLAGS_USER_MASK: u64 = !RFLAGS_USER_CLEAR;
+const _: () = assert!(RFLAGS_USER_CLEAR == 0x1F_7000);
 
 /// 用户代码段选择子 (SYSRET/IRET 回退用)
 const USER_CODE_SELECTOR: u64 = 0x23;
@@ -1273,9 +1292,9 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov r10, [r12 + {off_r10}]",
 
         // R67-9 FIX: Mask RFLAGS to remove privileged bits before SYSRET
-        // Clear: IOPL(12-13), NT(14), RF(16), VM(17), VIF(19), VIP(20)
+        // R192-6: clear RFLAGS_USER_CLEAR = IOPL(12-13), NT(14), RF(16), VM(17),
+        // AC(18), VIF(19), VIP(20); mask ~0x1F7000 = 0xFFFFFFFFFFE08FFF
         // Set: IF(9) to enable interrupts in user mode
-        // Mask value: ~0x1D3000 = 0xFFFFFFFFFFE2CFFF
         // Note: x86-64 AND r64,imm only accepts 32-bit sign-extended immediates,
         // so we must load the mask into a register first (use r13 as scratch)
         "mov r11, [r12 + {off_r11}]",               // 用户 RFLAGS
@@ -1381,10 +1400,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         frame_qwords = const SYSCALL_FRAME_QWORDS,
         fpu_save_size = const FPU_SAVE_AREA_SIZE,
         // R67-9 FIX: RFLAGS mask to clear privileged bits
-        // Clear: IOPL(12-13), NT(14), RF(16), VM(17), VIF(19), VIP(20)
-        // Bit positions: 12,13,14,16,17,19,20 = 0x1D3000
-        // Full 64-bit mask: ~0x1D3000 = 0xFFFFFFFFFFE2CFFF
-        rflags_user_mask = const 0xFFFF_FFFF_FFE2_CFFFu64,
+        // R192-6 FIX: the named clear set; the old literal ~0x1D3000 kept NT/VM.
+        rflags_user_mask = const RFLAGS_USER_MASK,
         // Ensure IF is set for user mode
         rflags_if = const 0x200u64,
         off_rax = const OFF_RAX,
